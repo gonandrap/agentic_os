@@ -445,8 +445,12 @@ def test_only_the_round_machine_collects_evidence():
     names = {".evidence", "jarvis.evidence"}
     importers = [p.name for p in sorted(src.glob("*.py"))
                  if p.name != "evidence.py" and _imports(p) & names]
-    assert importers == ["daemon.py", "landing.py", "ops.py", "validation.py"]
+    assert importers == ["autoreview.py", "daemon.py", "landing.py", "ops.py",
+                         "validation.py"]
     assert "collect_work_order" not in (src / "landing.py").read_text()
+    # `autoreview` is `landing`'s case: it TRIMS a packet the daemon collected, reusing
+    # `_sections` and `_truncate` so there is one file-boundary truncator and not two.
+    assert "collect_work_order" not in (src / "autoreview.py").read_text()
 
 
 # ------------------------------------------------- the per-file digest map (file_shas)
@@ -512,3 +516,31 @@ def test_the_map_covers_a_file_whose_patch_was_DROPPED_by_truncation(env):
     after = env.collect(diff_chars=900)
     assert dropped in after.dropped_files and dropped not in after.diff
     assert dict(after.file_shas)[dropped] != shas[dropped]
+
+
+# -- which commit a round judged -------------------------------------------------------
+
+
+def _packet(**over) -> evidence.EvidencePacket:
+    base = dict(unit="work_order", subject_id="wo-1", title="t", description="d",
+                summary="s", declared="ran the tests", pr_url="", base="main",
+                head="abc1234", stat="", files=(), diff="", diff_truncated=False,
+                dropped_files=(), diff_sha="")
+    return evidence.EvidencePacket(**{**base, **over})
+
+
+def test_judged_head_answers_for_a_feature_and_still_fails_closed_for_a_work_order():
+    """§5(a) of
+    docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md.
+
+    PAIRED, because the field means different things per path: on the feature path `head`
+    is `default_branch_head`'s resolved sha, which IS the commit the seats read; on a work
+    order's it is `headRefName` or a local HEAD, so `""` must stay the fail-closed answer
+    there or auto-merge moves.
+    """
+    assert evidence.judged_head(_packet(unit="feature", head="f" * 40)) == "f" * 40
+    assert evidence.judged_head(_packet(unit="feature", head="")) == ""
+    assert evidence.judged_head(_packet()) == ""
+    assert evidence.judged_head(
+        _packet(source="pull_request", head="a-branch",
+                pr={"head_sha": "a" * 40})) == "a" * 40

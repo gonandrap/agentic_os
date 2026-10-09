@@ -23,6 +23,7 @@ from jarvis import invariants, ops, schedule
 from jarvis.catalog import CatalogError, ScheduleConfig, load_catalog, parse_catalog
 from jarvis.daemon import Daemon
 from jarvis.project_store import TERMINAL_STATUSES, WO_ORIGINS, ProjectStore
+from jarvis.testing import make_git_project, with_origin
 
 HOUR = 3600.0
 DAY = 24 * HOUR
@@ -600,6 +601,94 @@ def test_os_owner_falls_back_to_one_project_and_always_the_same_one(tmp_path):
     assert schedule.os_owner([("a", a), ("b", b)]) == "a"
     assert schedule.os_owner([("a", a), ("b", b)]) == "a"
     assert schedule.os_owner([]) is None
+
+
+def test_fallback_false_never_picks_an_arbitrary_project(tmp_path):
+    """"Which project IS the OS" has no arbitrary answer: §4, §5."""
+    from pathlib import Path
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    assert schedule.os_owner([("a", a), ("b", b)], fallback=False) is None
+    pkg_root = Path(schedule.__file__).resolve().parents[2]
+    assert schedule.os_owner([("a", a), ("mine", pkg_root)], fallback=False) == "mine"
+
+
+# -- which project IS the OS -------------------------------------------------------------
+#
+# Issue 956: `os_owner` answers "who runs the fleet checks" and is allowed an arbitrary
+# answer; `os_project` answers "which project IS the OS" and must have none. Real
+# repositories with real remotes, because the whole point is that identity comes from
+# `origin` and a fake would let path containment pass.
+
+#: This repository, as both its checkouts spell it.
+OS_ORIGIN = "gonandrap/agentic_os"
+
+
+def _checkout(root, name, origin=OS_ORIGIN):
+    return with_origin(make_git_project(root, name), origin)
+
+
+def test_os_project_resolves_the_production_two_checkout_layout(tmp_path, origins):
+    """THE DEFECT, six times over: in production the release guards were all inert.
+
+    The running package is in the deployed checkout while the catalog's `jarvis_os` path
+    is the dev checkout, so NO project contains the install and `os_owner` answers with
+    its first-in-catalog fallback — a project that is not the OS. Both checkouts share
+    one `origin`, because a release tag is a checkout of this repository.
+    """
+    other = _checkout(tmp_path, "shared_schedule", "gonandrap/shared_schedule")
+    dev = _checkout(tmp_path, "dev")
+    install = _checkout(tmp_path / "production", "jarvis_os") / "src" / "jarvis"
+    install.mkdir(parents=True)
+    catalog = [("shared_schedule", other), ("jarvis_os", dev)]
+
+    assert not install.is_relative_to(dev) and not install.is_relative_to(other)
+    assert schedule.os_owner(catalog) == "shared_schedule", "the fallback, for contrast"
+
+    assert schedule.os_project(catalog, install=install) == "jarvis_os"
+
+
+def test_os_project_resolves_the_dev_checkout_too(tmp_path, origins):
+    """Same answer where the install IS inside the catalog's path, so dev and production
+    do not need two mechanisms."""
+    dev = _checkout(tmp_path, "dev")
+    install = dev / "src" / "jarvis"
+    install.mkdir(parents=True)
+
+    assert schedule.os_project([("jarvis_os", dev)], install=install) == "jarvis_os"
+
+
+def test_two_projects_sharing_an_origin_name_no_os(tmp_path, origins):
+    """A worktree listed beside its checkout: ambiguity grants the OS's authority over
+    its release path and its config to nothing at all."""
+    dev = _checkout(tmp_path, "dev")
+    twin = _checkout(tmp_path, "worktree")
+
+    assert schedule.os_project([("jarvis_os", dev), ("jarvis_os_wt", twin)],
+                               install=dev) is None
+
+
+def test_os_project_is_none_with_no_match_and_with_no_origin(tmp_path, origins):
+    """None on every doubt: a catalog holding no checkout of this repository, and an
+    install under a repository whose origin names nothing (a pip-installed OS).
+
+    The install is a `git init` with NO remote, on purpose. A bare directory would not
+    do: `github.origin_repo` shells out to `git -C <dir> remote get-url origin`, and git
+    WALKS UP — so its answer is the ENCLOSING repository's, not the directory's, and a
+    plain `tmp_path/site-packages` inherits whatever repository pytest's basetemp sits
+    in. Under `--basetemp=.pytest-tmp` inside this very checkout that is the OS's own
+    origin, and resolving it is correct. An initialised repository with no remote is
+    where the walk STOPS and where the question genuinely has no answer.
+    """
+    other = _checkout(tmp_path, "other", "gonandrap/shared_schedule")
+    dev = _checkout(tmp_path, "dev")
+    nowhere = make_git_project(tmp_path, "site-packages") / "jarvis"
+    nowhere.mkdir(parents=True)
+
+    assert schedule.os_project([("other", other)], install=dev) is None
+    assert schedule.os_project([("jarvis_os", dev)], install=nowhere) is None
+    assert schedule.os_project([], install=dev) is None
 
 
 def test_the_daily_run_repairs():

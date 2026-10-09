@@ -297,6 +297,25 @@ def test_a_verdict_the_os_cannot_form_records_nothing_and_leaves_it_pending(
     nothing_settled(store, wo["id"])
 
 
+def test_an_override_in_the_early_pass_records_why_the_os_escalated(started,
+                                                                   no_settling):
+    """Neo ANSWERED and the OS re-marked the question, so without a cause this escalation
+    renders "not recorded" for ever — docs/superpowers/specs/2026-10-01-neo-observability.md §1."""
+    store, _wo = running(started, assumptions=(f"FORCE_ACCEPT_HIGH — {ROUTINE}",))
+
+    ask(started, store)
+    (q,) = questions()
+    drain(started)
+
+    neo_store = NeoStore()
+    try:
+        row = neo_store.get(q["id"])
+    finally:
+        neo_store.close()
+    assert row["status"] == "escalated"
+    assert row["escalation_cause"] == "stakes-high"
+
+
 def test_a_worker_that_finishes_while_neo_thinks_does_not_turn_the_ruling_into_a_settle(
         started, no_settling):
     """THE RACE, and it is why the pass that asked is read off the record rather than
@@ -332,6 +351,24 @@ def test_a_high_stakes_assumption_mid_run_is_never_asked_about_at_all(started):
     assert "withheld" in asked[0]["question"]
     (held,) = events(store, wo["id"], "autoreview_held")
     assert held["code"] == autoreview.HELD_HIGH_STAKES
+
+
+def test_the_early_pass_never_touches_a_confirmation_link(started):
+    """§10.5 of docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-hold-an-
+    assumption-for-ever.md: the regression guard that §4's clear and §6's split live on
+    the CONFIRMATION path alone. The early pass files no confirmation, so it can produce
+    neither new code and has no link to clear."""
+    store, wo = running(started, assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
+
+    ask(started, store)
+    drain(started)
+
+    row = store.all_assumptions(wo["id"])[0]
+    assert row["provisional_verdict"] == "accept"
+    assert row["confirm_question_id"] is None
+    codes = [e["code"] for e in events(store, wo["id"], "autoreview_held")]
+    assert autoreview.HELD_CONFIRM_SPENT not in codes
+    assert autoreview.HELD_ROUND_OPEN not in codes
 
 
 def test_a_project_that_has_not_opted_in_is_never_judged_early(started):

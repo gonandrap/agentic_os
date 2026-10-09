@@ -447,3 +447,71 @@ def test_nothing_here_nudges_a_worker(project):
 
     assert store.queued_messages(wo["id"]) == []
     assert store.get_work_order(wo["id"])["status"] == "running"
+
+
+# -- 2b: a head the OS has already judged is not an undelivered one ---------------------
+
+#: The commit the passing round judged. wo-3312682f's shape: the head never moved.
+JUDGED = "1f2e3d4c5b6a7980112233445566778899aabbcc"
+
+
+def _judged_then_replied(store: ProjectStore, monkeypatch, *, head: str,
+                         judged: str) -> dict:
+    """wo-3312682f: delivered, judged green, then a reply turn the OS itself opened.
+
+    The reply is a GATE DISMISSAL, which is not a PR repair — so `PR_REPAIR_SOURCES`
+    cannot excuse it and only head equality can.
+    """
+    restore = _rewind(monkeypatch, 4 * LONG_ENOUGH)
+    wo = store.create_work_order("delivered behind a pull request")
+    first = store.create_turn(wo["id"], "dispatch", "do it")
+    store.finish_turn(first["id"], "done", result="opened the PR")
+    store.add_event(wo["id"], "finished", {"summary": "opened the PR"})
+    round_ = store.open_validation_round(wo_id=wo["id"], fingerprint="fp")
+    store.set_validation_head(round_["id"], judged)
+    store.close_validation_round(round_["id"], "passed", "green")
+    msg = store.queue_message(wo["id"], "the gate request was dismissed", source="gate",
+                              status="delivered")
+    reply = store.create_turn(wo["id"], "message", "it was dismissed", msg_id=msg)
+    store.finish_turn(reply["id"], "done", result="noted, nothing to do")
+    store.set_status(wo["id"], "needs_review", pr_url="https://example/pull/1",
+                     pr_head_oid=head, pr_head_seen_at=db.now())
+    restore()
+    return store.get_work_order(wo["id"])
+
+
+def test_a_reply_turn_on_an_already_judged_head_is_not_a_stale_finish(project,
+                                                                     monkeypatch):
+    """Spec §2b. The head the panel passed IS the head GitHub reports, so nothing is
+    undelivered — whatever opened the turn."""
+    store = ProjectStore(project)
+    wo = _judged_then_replied(store, monkeypatch, head=JUDGED, judged=JUDGED)
+
+    assert parked_reason(store, wo, now=_later(store, wo["id"])) is None
+
+
+def test_a_round_that_recorded_no_commit_is_no_excuse(project, monkeypatch):
+    """Spec §2b: an EMPTY head is never read as equal. Pre-0.10.0 rounds recorded none,
+    so the check degrades to exactly what it did before."""
+    store = ProjectStore(project)
+    wo = _judged_then_replied(store, monkeypatch, head="", judged="")
+
+    assert parked_reason(store, wo, now=_later(store, wo["id"])) == STALE_FINISH_BLOCKER
+
+
+def test_a_head_that_moved_past_the_judged_commit_still_reports_the_stale_finish(
+        project, monkeypatch):
+    """The worker pushed after the round passed: that IS something undeclared."""
+    store = ProjectStore(project)
+    wo = _judged_then_replied(store, monkeypatch, head="0" * 40, judged=JUDGED)
+
+    assert parked_reason(store, wo, now=_later(store, wo["id"])) == STALE_FINISH_BLOCKER
+
+
+def test_the_merged_head_excuses_it_too(project, monkeypatch):
+    """The other member of the judged set: the newest `pr_merged` event's `head_oid`."""
+    store = ProjectStore(project)
+    wo = _judged_then_replied(store, monkeypatch, head=JUDGED, judged="")
+    store.add_event(wo["id"], "pr_merged", {"head_oid": JUDGED})
+
+    assert parked_reason(store, wo, now=_later(store, wo["id"])) is None

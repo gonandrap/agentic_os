@@ -311,7 +311,7 @@ def test_a_round_that_recorded_no_commit_is_diagnosed_in_its_own_words(
 
 
 def test_forcing_the_round_from_the_page_is_what_lets_the_merge_arm(
-        fleet, project, fake_gh):
+        fleet, project, fake_gh, local_base):
     """End to end, from the button: the diagnosis is on the page, the press opens the
     round, the panel passes it, and the condition that held the merge is satisfied. The
     recovery the user has been asking an operator for, without an operator."""

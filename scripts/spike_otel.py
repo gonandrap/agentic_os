@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """What does Claude Code's OpenTelemetry export ACTUALLY emit?
 
-Hand-run only. §9 of docs/specs/2026-09-24-order-observability.md asks six questions
+Hand-run only. §9 of docs/superpowers/specs/2026-09-24-order-observability.md asks six questions
 about what arrives when `CLAUDE_CODE_ENABLE_TELEMETRY=1` and an OTLP endpoint are set
 around a real headless turn, and says the listener must "record everything and interpret
 nothing". This script is that listener plus one scratch turn. It prints MEASUREMENTS

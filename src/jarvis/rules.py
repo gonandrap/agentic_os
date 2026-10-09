@@ -1,6 +1,6 @@
 """The registry the OS uses to recognise its own recurring gaps — grammar and evaluator.
 
-docs/specs/2026-09-27-self-evolution.md §3. This module is the LEAF of that
+docs/superpowers/specs/2026-09-27-self-evolution.md §3. This module is the LEAF of that
 feature: the condition grammar, the pure evaluator, the `Facts` shape, the lookup
 contract `resolve`, and the five seed rows. It holds no store, fires nothing and acts on
 nothing.
@@ -209,6 +209,9 @@ FACT_FIELDS: dict[str, FactField] = _fields(
     # `ops.state_durations`. Everything here is derived from the timeline, so it is the
     # source that makes "has been like this for an hour" expressible at all.
     ("seconds_in_status", NUM, "state_durations", "since the last status change"),
+    ("seconds_in_status_active", NUM, "state_durations",
+     "since the last status change, minus every interval `holds` says the order was not "
+     "permitted to run"),
     ("seconds_since_activity", NUM, "state_durations", "since the newest timeline event"),
     ("lifetime_seconds", NUM, "state_durations", "since the order was created"),
     ("last_activity_kind", STR, "state_durations", "the newest timeline event's kind"),

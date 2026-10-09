@@ -9,6 +9,9 @@
 <p class="kv" style="margin-top:18px">
   Neo answers worker questions on your behalf. Review every answer it gives — approvals
   confirm its instincts, corrections become learnings it applies next time.
+  {# §6 of docs/superpowers/specs/2026-10-01-neo-observability.md: the aggregate is its own page, so
+     no statistics block sits among these review forms. #}
+  <a href="/neo/stats">what Neo is doing →</a>
 </p>
 
 {% set digested = (escalated + unreviewed) | selectattr('digest_view') | list %}

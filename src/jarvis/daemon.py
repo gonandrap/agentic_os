@@ -52,19 +52,22 @@ import signal
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import (background, bugreport, bus, claude_cli, db, fleet, holds, inspection,
-               notify, worker_session)
+               notify, release, worker_session)
 from . import budget as budget_mod
 from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import CentralStore
 from .dispatch import dispatch_work_order
 from . import invariants as invariants_mod
 from .invariants import PR_REPAIR_STATUSES, RETRY_HELD_RESTATE
+from .neo_store import QuestionTooLargeError
 from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import (
+    COUNTED_VALIDATION_OUTCOMES,
     FO_OPEN_STATUSES,
     FO_TERMINAL_STATUSES,
     MAX_MESSAGE_DELIVERY_ATTEMPTS,
@@ -104,6 +107,11 @@ SECONDS_PER_HOUR = 3600    # a unit, not a setting
 #: limit. Not catalog-configurable on purpose: a knob nobody will tune is a knob that
 #: only ever gets set wrong.
 PR_POLL_EVERY_TICKS = 24
+
+#: How often orders that have stopped moving are swept is `fleet_health.sweep_every_ticks`
+#: — A PER-PROJECT CATALOG CONFIG AND NOT A CONSTANT HERE, per Neo 1086, which overrides §5
+#: of the spec and the `PR_POLL_EVERY_TICKS` rule above. The shipped 60 (5 minutes at the
+#: default 5s interval) lives in `catalog.DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS`.
 
 #: Which work orders' pull requests get asked about. EVERY STATUS WHERE A PULL REQUEST
 #: CAN SIT WITH NOBODY MOVING IT — issue #224: `waiting_pr_merge` alone left a work order
@@ -169,7 +177,8 @@ RETRY_EVERY_TICKS = 2
 LANDING_SWEEP_EVERY_TICKS = 720
 
 #: How many open orders one `rules_tick` will look at, per project, per reconcile tick.
-#: §5.2 of docs/specs/2026-09-27-self-evolution.md: "cap the work explicitly".
+#: §5.2 of docs/superpowers/specs/2026-09-27-self-evolution.md:
+#: "cap the work explicitly".
 #:
 #: 200 because that is what `ProjectStore.list_work_orders` already defaults to, so the
 #: cap is the one a reader of that function already has in their head rather than a
@@ -198,6 +207,21 @@ EVAL_MAX_SECONDS = 5.0
 #: AT ALL for a project that has not switched the scheduler on, which is every project by
 #: default (`catalog.ScheduleConfig`).
 SCHEDULE_EVERY_TICKS = 12
+
+#: The status each kind of family RUNS in, per `feature_orders.kind` (§4 of
+#: docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md). A feature runs
+#: its children in `executing`; an improvement or investigation order runs its one child
+#: in `planning` and settles out of it directly, so `executing` is a status those two
+#: lifecycles never enter — it would render raw and lie about the phase.
+#:
+#: One table, read twice: it selects what the budget pass looks at and where a topped-up
+#: family is restored to. So the status a family is parked FROM is the status it is
+#: restored TO, by construction.
+_FAMILY_RUNNING_STATUS = {
+    "feature": "executing",
+    "improvement": "planning",
+    "investigation": "planning",
+}
 
 #: Walk the transcript tree for one-hour cache writes every N ticks — six hours at the
 #: default 5s interval. ITS OWN CADENCE BECAUSE IT IS BY FAR THE DEAREST READ IN THE
@@ -229,6 +253,14 @@ CACHE_TTL_TICK_OFFSET = 60
 #: rate of a few a day.
 DIGEST_BATCH = 5
 
+#: What `_confirmation_evidence` collects, and it is a MEMORY bound rather than a prompt
+#: budget: this text never reaches a model — `autoreview.confirm_evidence` trims it to
+#: `validation.confirm_diff_chars` per assumption — and it exists only so that trimmer can
+#: state an honest total in its truncation marker, which `EvidencePacket` cannot supply
+#: (it carries `diff_sha`, not a pre-truncation length). Ruled by Neo, question 945 on
+#: wo-604b5b99; spec docs/superpowers/specs/2026-09-26-bounded-model-inputs.md § 2.
+CONFIRM_COLLECT_CHARS = 1_000_000
+
 #: THE VALIDATION SEAM. A validator is any callable of
 #:
 #:     (ProjectStore, the round row, the evidence packet) -> {
@@ -256,6 +288,33 @@ REVIEW_FEEDBACK = """REVIEW FEEDBACK (round {n} of {max})
 
 Address this and then run `jarvis wo finish {wo_id} --summary "..." --evidence "..."`
 again. Re-submitting without changed code or new evidence will end the review."""
+
+#: THE SAME REJECTION ON A ROUND NOBODY WAS CHARGED FOR. "round 5 of 3" is false on a
+#: rebind — the row's number is past the budget and its own bound held it — and a
+#: submitter told it had spent a round it had not would ration itself against a budget
+#: that is untouched. Shaped on `ops.BOUNCE_FEEDBACK`, which already has to say that
+#: (spec docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.4).
+REBIND_FEEDBACK = """REVIEW FEEDBACK (re-judgement {used} of {max}, no round spent)
+{reason}
+
+This is not one of your {max_rounds} review rounds. The OS asked you to merge the base
+branch in, your resolution changed what this pull request contributes, and a seat has
+read it. Fix what is above and run
+`jarvis wo finish {wo_id} --summary "..." --evidence "..."` again."""
+
+#: THE SAME REJECTION ON THE ROUND A USER REJECTION BOUGHT. No round was spent here
+#: either, but nothing about a rebind is true of it: nobody merged anything, and there
+#: is no "re-judgement 1 of 2" — the bound is one free round per USER rejection, so a
+#: number out of two would name a cap that does not exist (Neo question 973, live case
+#: wo-299daf2e). The last sentence is the one the rebind wording does not need: the
+#: NEXT attempt is charged like any other.
+USER_REWORK_FEEDBACK = """REVIEW FEEDBACK (no round spent)
+{reason}
+
+This is not one of your {max_rounds} review rounds. The user rejected this on review and
+asked for the rework, so it was judged outside the budget. Fix what is above and run
+`jarvis wo finish {wo_id} --summary "..." --evidence "..."` again — that next round is a
+charged one."""
 
 #: THE SAME REJECTION, ADDRESSED TO A DIFFERENT JOB. A manager does not fix code — it
 #: files work orders that do — so the closing instruction cannot be the implementor's, and
@@ -291,6 +350,16 @@ FEATURE_MANAGER_SILENT = (
 FEATURE_MANAGER_STALLED = (
     "its manager was told the work orders it filed after round {n} had landed and did "
     "not resubmit the feature — `jarvis fo submit {fo_id}` is what it was asked to run")
+
+#: And the third, which is not a manager that did nothing but a manager that is not there
+#: — every feature released before the manager existed, or one whose row was deleted. A
+#: replacement would be briefed on nothing and would answer a round of feedback blind, so
+#: the OS names the situation instead of building one. Spec §(c), docs/superpowers/specs/
+#: 2026-10-07-a-settled-features-live-children-must-have-a-manager-or-a-hold.md
+FEATURE_MANAGER_MISSING = (
+    "it has no project manager work order at all, so nothing will ever resubmit it — a "
+    "replacement would be briefed on none of this feature's history; decide what has to "
+    "change, or close it (`jarvis fo cancel {fo_id}`)")
 
 #: `kind` of the event that records what the handoff did, and the only memory it has.
 #: Each payload carries the `round` and the `children` the action was about, because THAT
@@ -483,14 +552,35 @@ def _landing_deferred(store: ProjectStore, wo_id: str) -> int | None:
     return None if done == owed else int(owed)
 
 
+@dataclass(frozen=True)
+class CarryOutcome:
+    """What `Daemon._carry_catch_up` learned, which is three states and not two.
+
+    `carried` is the verdict now covering the live head — the caller re-decides on it.
+    `rebind` is the other answer worth having: proof (a) held and proof (b) did not, so
+    the merge the OS asked for resolved a conflict and the round that judges it must not
+    be charged to the worker's rework budget (spec
+    docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.2).
+    """
+
+    carried: bool
+    rebind: bool
+
+
 class Daemon:
     def __init__(self, catalog: Catalog, poll_interval: float = 5.0):
         self.catalog = catalog
+        # Daemon boot arms the transport backstop too, for the catalog it was HANDED —
+        # spec §4, docs/superpowers/specs/2026-09-26-bounded-model-inputs.md.
+        claude_cli.set_max_os_prompt_chars(catalog.os.max_os_prompt_chars)
         self.poll_interval = poll_interval
         self.central = CentralStore()
         self.stores: dict[str, ProjectStore] = {}
         self.stop_requested = False
         self.tick_count = 0
+        #: Tick each project was last swept for stuck orders on — Neo 1086's per-project
+        #: cadence, which a single modulus cannot honour once two projects disagree.
+        self.stuck_swept: dict[str, int] = {}
         # Neo drains its queue on ONE thread: answering in FIFO order back-to-back
         # keeps the shared persona+learnings prefix inside the prompt-cache TTL.
         self.neo_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="neo")
@@ -764,6 +854,9 @@ class Daemon:
         state = fleet.read(self.catalog.os.max_in_flight, self._fleet_stores())
         if fleet.announce(self.central, state):
             log.warning("fleet held: %s", state.blocked())
+        # AFTER `announce`, which is what records a reopen: the ramp it starts has to be
+        # in force on the very tick the backlog comes due (issue #843).
+        fleet.attach(state, self.central)
         # The roster is a subprocess, and tracking injected sessions is the only thing
         # left that reads it. With nothing injected there is nothing to track, so the
         # common case — a project driven entirely by dispatched work orders — pays
@@ -808,7 +901,7 @@ class Daemon:
                 # waiting a whole poll interval for the next pass. With no envelope ever
                 # posted this is one indexed lookup that finds nothing.
                 self.deliver_envelopes(project, store)
-                self.deliver_messages(project, store)
+                self.deliver_messages(project, store, state)
                 # After delivery, not before: an envelope this round machine posted on
                 # an earlier tick is already on its way to the worker, so the work order
                 # it rejected has left `validating` and is not looked at again here.
@@ -861,12 +954,20 @@ class Daemon:
                     # the only other thing that changes the answer — the reconcile beat
                     # would be too slow to save the worker turn this exists to save.
                     self.settle_shipped_releases(project, store)
+                    # Immediately after it, never before: issue #945 spec §2.1.
+                    self.refile_dropped_fixes(project, store)
                 # After the pull-request poll, so the merge that completes a feature's
                 # last child settles the feature in the same tick rather than the next
                 # one — but outside the `if`, because a child can also finish without
                 # ever opening a pull request.
                 self.settle_features(project, store)
                 if reconcile:
+                    # Immediately after the settlement above, because the merge that
+                    # clears the subject's last blocker is settled on that same tick — so
+                    # an investigation's WAITING_ON_USER flag goes down on the tick its
+                    # cause goes away rather than one interval later. Reconcile cadence:
+                    # one read per flagged investigation, and nothing waits on it (§2.5).
+                    self.clear_answered_investigations(project, store)
                     # The agents roster holds ONLY the user's own sessions: workers are
                     # headless and never enter it. Jarvis looks at the ones it was
                     # handed and no others.
@@ -876,6 +977,9 @@ class Daemon:
                     # this tick — the evidence a bill is built from starts expiring the
                     # moment the work stops.
                     self.seal_bills(project, store)
+                    # Immediately after it: the same argument, about the same evidence —
+                    # transcripts that start expiring the moment the work stops (§3).
+                    self.seal_autopsies(project, store)
                     # Before the invariants, because it is a fact about work that is
                     # still RUNNING rather than about state that has settled.
                     self.check_burning_turns(project, store)
@@ -904,7 +1008,7 @@ class Daemon:
                     # Last: check the state everything above just produced.
                     self.check_invariants(project, store, sweep_landings=sweep_landings)
                     # AFTER the invariants, and the position is the whole argument
-                    # (docs/specs/2026-09-27-self-evolution.md §5.1):
+                    # (docs/superpowers/specs/2026-09-27-self-evolution.md §5.1):
                     # `check_project(repair=True)` REPAIRS what is unambiguous on this
                     # same tick, so a detector pass running BEFORE it would fire on
                     # conditions the OS was about to fix itself — a false positive
@@ -935,7 +1039,16 @@ class Daemon:
         # that raised on this tick is judged on the next one, which is the cadence §4
         # designs for — the sweep answers "is something wrong", the review answers
         # "does the user need to know".
-        self.health_tick()
+        # Carrying this tick's ONE fleet reading, the same value `validation_tick` gets
+        # and for the same reason: the account's window is a fleet fact, read once.
+        self.health_tick(state)
+        # Immediately after it, sharing that reading, and INLINE: this pass makes no model
+        # call, so it needs no pool (§5 of docs/superpowers/specs/2026-09-30-an-order-that-
+        # stops-moving-gets-investigated.md).
+        if self.tick_count % self.stuck_cadence() == 1:
+            due = self.stuck_due_projects()
+            if due:
+                self.stuck_tick(state, projects=due)
         # Last of the three, and never merged into the review: a proposal filed above
         # cannot be applied on the tick that filed it (its gate is `pending`), so the two
         # only ever meet across ticks — and that separation is what keeps the deciding
@@ -995,6 +1108,53 @@ class Daemon:
                     {"error": "this bill could not be computed when the order settled"}),
                     feature=True)
 
+    def seal_autopsies(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Freeze the ANATOMY of every settled order that has none yet — §3 of
+        docs/superpowers/specs/2026-09-27-order-autopsy-durability.md.
+
+        Beside `seal_bills`, on the same cadence, for the same reason and with the same
+        three properties: a bounded batch, ONE hoisted `usage.index_sessions()` for it, and
+        an ERROR payload on exception rather than an offender parked at the head of the
+        queue for ever. Its queue is its own: a bill that cannot be computed must not stop
+        an autopsy, which is why `unsealed_autopsy_orders` is not `unsealed_terminal_orders`.
+
+        A SECOND bounded queue follows it in the same step: seals whose payload predates
+        `autopsy.PAYLOAD_VERSION`. The WRITER owns re-sealing end to end, so a stale seal
+        repairs itself on a tick rather than waiting for a reader to happen by.
+
+        Every order in BOTH queues is gated on its observability level (§5): every level
+        but `off` seals. The level is resolved ONCE per order and used TWICE — as that gate
+        and as the level `seal` records — because without the second use `full` would seal
+        as `normal` and the level the user chose would never reach a payload. The stale
+        queue needs the gate only: an upgrade takes its level from the stored payload.
+        """
+        from . import autopsy as autopsy_mod, db, observability, usage
+
+        resolved = [(order, observability.level_for(order, project.observability))
+                    for order in store.unsealed_autopsy_orders()]
+        pending = [pair for pair in resolved if pair[1] != observability.OFF]
+        if pending:
+            index = usage.index_sessions()
+            for order, level in pending:
+                try:
+                    autopsy_mod.seal(project.name, project.path, order, index=index,
+                                     level=level)
+                except Exception:  # noqa: BLE001 — an autopsy must never stall the tick
+                    log.exception("sealing the autopsy for %s failed", order["id"])
+                    store.seal_autopsy(order["id"], db.to_json(
+                        {"error":
+                         "this autopsy could not be read when the order settled"}))
+        # No second `usage.index_sessions()` is hoisted for the queue below: an upgrade
+        # re-derives from the STORED payload and never touches a transcript.
+        for order in store.stale_autopsy_orders(autopsy_mod.PAYLOAD_VERSION):
+            if not autopsy_mod.records_autopsy(order, project.observability):
+                continue
+            sealed = autopsy_mod.unseal(order)
+            if sealed is None:  # an ERROR payload: there is nothing to re-derive from
+                continue
+            # None back means the old seal stands — not a failure, and nothing to retry.
+            autopsy_mod._upgrade_seal(project.name, project.path, order, sealed)
+
     # -- 4. dispatch -------------------------------------------------------------
 
     def dispatch_pending(self, project: ProjectSpec, store: ProjectStore,
@@ -1012,10 +1172,14 @@ class Daemon:
         leaves `pending` and nothing is written at all — the same nothing a
         dependency-blocked order costs, and why neither raises attention.
         """
+        # The user's pause is per order, so it narrows the CLAIM rather than stopping it:
+        # only allow-listed ids are claimable while the fleet is paused (issue #843).
+        only = (state.pause.allow if state is not None and state.pause is not None
+                else None)
         while store.count_active() < project.max_concurrent:
-            if state is not None and state.blocked():
+            if state is not None and (state.shut() or state.capacity_cause()):
                 return
-            wo = store.claim_next_pending()
+            wo = store.claim_next_pending(only=only)
             if wo is None:
                 return
             log.info("[%s] dispatching %s: %s", project.name, wo["id"], wo["title"])
@@ -1078,6 +1242,10 @@ class Daemon:
         than one loop over both kinds, because `list_feature_orders` filters kind
         POSITIVELY (§2.4 of the improvement-orders spec) and a shared loop would have to
         undo that. See §3.1.
+
+        An INVESTIGATION order gets a third one, identical in shape: one work order,
+        `kind='investigator'`, the `why` verbatim, and `pending` left last (§2.7 of
+        docs/superpowers/specs/2026-09-27-investigation-orders.md).
         """
         for fo in store.list_feature_orders(statuses=("pending",)):
             try:
@@ -1114,6 +1282,30 @@ class Daemon:
             store.update_feature_order(fo["id"], plan_wo_id=wo["id"])
             store.set_feature_status(fo["id"], "planning")
             log.info("[%s] analysing %s: opened %s", project.name, fo["id"], wo["id"])
+
+        # §2.7 of docs/superpowers/specs/2026-09-27-investigation-orders.md: a third
+        # sibling loop, for the same reason as the second — `list_feature_orders` filters
+        # kind POSITIVELY and a shared loop would have to undo that.
+        for fo in store.list_feature_orders(statuses=("pending",),
+                                            kind="investigation"):
+            try:
+                wo = store.create_work_order(
+                    title=f"Investigate: {fo['title']}"[:200],
+                    # The `why` verbatim; the investigator CONTRACT is composed at
+                    # dispatch (dispatch._investigator_prompt), as the analyst's is.
+                    description=fo["description"],
+                    origin="jarvis", kind="investigator", parent_id=fo["id"],
+                )
+            except Exception:  # noqa: BLE001 — one bad investigation must not stop the rest
+                log.exception("[%s] could not open an investigator for %s", project.name,
+                              fo["id"])
+                continue
+            store.update_feature_order(fo["id"], plan_wo_id=wo["id"])
+            # LAST, which is what makes a crashed tick re-file rather than strand an
+            # investigation with no investigator.
+            store.set_feature_status(fo["id"], "planning")
+            log.info("[%s] investigating %s: opened %s", project.name, fo["id"],
+                     wo["id"])
 
     def refresh_plan_specs(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Re-ask any plan review whose spec has been committed over. Thin, like its
@@ -1177,26 +1369,46 @@ class Daemon:
             dead_feature_children,
         )
 
-        # THE FAMILY BUDGET IS ASKED ON A WIDER SET than the rest of this method, and
-        # `budget_exhausted` is in it so a topped-up feature can leave the state the same
-        # way it entered it. A feature runs no session of its own, so nothing else here
-        # would ever re-derive the status back to `executing`.
-        for fo in store.list_feature_orders(
-                statuses=("executing", budget_mod.FO_EXHAUSTED)):
-            pool = budget_mod.feature_exhaustion(store, self.central, fo)
-            if pool is not None:
-                budget_mod.escalate_feature(store, fo, pool)
-                continue
-            if fo["status"] == budget_mod.FO_EXHAUSTED:
-                # Topped up: back to work. Its children are still parked in their own
-                # `budget_exhausted` until each is topped up, which is the honest shape —
-                # the family has money again, and which child gets it is the user's call.
-                # `jarvis wo budget <child>` is what re-cuts that child's slice out of
-                # the new money; nothing here writes a reservation, because doing it from
-                # this end would have to guess the split.
-                store.set_feature_status(fo["id"], "executing")
-                store.clear_feature_attention(fo["id"])
-                continue
+        # PASS ONE: THE FAMILY BUDGET, EVERY KIND, ONE KIND AT A TIME. §4 of
+        # docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md: an
+        # improvement or investigation family IS a `feature_orders` row and runs in
+        # `planning` — it never enters `executing` at all — so a feature-only,
+        # `executing`-only pass meant no non-feature family could ever escalate to, or
+        # leave, `budget_exhausted`.
+        #
+        # PER KIND BECAUSE A FAMILY CAN ONLY BE PARKED FROM THE ONE STATUS IT RUNS IN, so
+        # the status it is parked from and the status it is restored to are the same
+        # `_FAMILY_RUNNING_STATUS` entry. A FEATURE IN `planning` IS DELIBERATELY OUT:
+        # `budget.family` counts its planner, and a planner overspending must not park
+        # the feature. Writing `executing` onto such a row would put it past plan
+        # approval with no approved plan and no children. `budget_exhausted` is in each
+        # set so a topped-up family leaves the state the same way it entered it. A family
+        # runs no session of its own, so nothing else here re-derives its status.
+        for kind, running in _FAMILY_RUNNING_STATUS.items():
+            for fo in store.list_feature_orders(
+                    statuses=(running, budget_mod.FO_EXHAUSTED), kind=kind):
+                pool = budget_mod.feature_exhaustion(store, self.central, fo)
+                if pool is not None:
+                    budget_mod.escalate_feature(store, fo, pool)
+                    continue
+                if fo["status"] == budget_mod.FO_EXHAUSTED:
+                    # Topped up: back to work. Its children are still parked in their own
+                    # `budget_exhausted` until each is topped up, which is the honest
+                    # shape — the family has money again, and which child gets it is the
+                    # user's call. `jarvis wo budget <child>` is what re-cuts that child's
+                    # slice out of the new money; nothing here writes a reservation,
+                    # because doing it from this end would have to guess the split.
+                    store.set_feature_status(fo["id"], running)
+                    store.clear_feature_attention(fo["id"])
+
+        # PASS TWO: THE CHILD SETTLEMENT, FEATURE-ONLY BY LIFECYCLE, `kind='feature'`
+        # WRITTEN OUT. An investigation settles from its verdict (`ops.submit_verdict`)
+        # and an improvement order from its findings review, so running
+        # `dead_feature_children` or "all children completed" over them would settle them
+        # wrongly and could destroy a verdict in flight. The correctness used to rest on
+        # the `kind` default, and a reader cannot tell a deliberate feature-only pass
+        # from a leak — which is how this bug got here.
+        for fo in store.list_feature_orders(statuses=("executing",), kind="feature"):
             children = store.feature_children(fo["id"])
             if not children:
                 continue  # released with nothing in it; nothing to settle against
@@ -1207,7 +1419,7 @@ class Daemon:
             # A feature whose every child is superseded therefore completes, which is
             # right: nothing is outstanding.
             live = [c for c in children if not c["superseded"]]
-            dead = dead_feature_children(children)
+            dead = dead_feature_children(store, children)
             if dead:
                 first = dead[0]
                 template = (FEATURE_CHILD_FAILED if first["status"] == "failed"
@@ -1223,6 +1435,75 @@ class Daemon:
                 self._complete_feature(store, fo)
                 log.info("[%s] feature %s completed (%d work orders)", project.name,
                          fo["id"], len(children))
+
+    def clear_answered_investigations(self, project: ProjectSpec,
+                                      store: ProjectStore) -> None:
+        """Take down a `WAITING_ON_USER` flag once its subject owes the user nothing.
+
+        §2.5 of docs/superpowers/specs/2026-10-01-a-submitted-verdict-must-settle-its-
+        investigator.md, GitHub issue 906: the flag was raised once at the transition
+        (`ops.submit_verdict`) and nothing was ever written to lower it, so the warning
+        sign stayed up after the user acted and the subject merged.
+
+        **CLEAR-ONLY. A tick may lower this flag; a tick may NEVER raise it.** That
+        asymmetry is the whole design and it is what keeps kn-089de524 satisfied: a flag
+        re-derived every tick overwrites the user's own `jarvis wo ack` and re-notifies
+        for ever. The raise stays at the transition, and this pass is the only reader that
+        writes.
+
+        Flagged once by construction, `settle_features`' argument run in reverse: the
+        clear leaves the row out of the population, so the event is written once however
+        many ticks follow.
+
+        `invariants.true_blockers` answers the subject half, because it is the single
+        source of truth for "what does this order want from me" and already subtracts what
+        the user acknowledged. A subject that no longer exists owes nothing.
+        """
+        from . import ops
+
+        for fo in store.list_feature_orders(statuses=("completed",),
+                                            kind="investigation"):
+            if not fo["needs_attention"]:
+                continue
+            plan = db.from_json(fo.get("plan"), {}) or {}
+            if plan.get("classification") != "WAITING_ON_USER":
+                continue
+            subject = str((db.from_json(fo.get("metadata"), {}) or {}).get(
+                ops.SUBJECT_KEY) or "")
+            try:
+                if not self._subject_is_clear(store, subject):
+                    continue
+            except Exception:  # noqa: BLE001 — one investigation must not stop the rest
+                log.exception("[%s] could not read %s's subject", project.name, fo["id"])
+                continue
+            store.clear_feature_attention(fo["id"])
+            # The investigator carries the record: `ops.feature_event` is manager-only and
+            # an investigation has no manager (`carrier_for_feature` is the general rule).
+            carrier = store.carrier_for_feature(fo["id"])
+            if carrier is not None:
+                store.add_event(carrier["id"], "investigation_attention_cleared", {
+                    "investigation": fo["id"], "subject": subject,
+                    "why": f"{subject or 'the subject'} no longer needs the user",
+                })
+            log.info("[%s] %s: the user has dealt with %s", project.name, fo["id"],
+                     subject)
+
+    @staticmethod
+    def _subject_is_clear(store: ProjectStore, subject: str) -> bool:
+        """Does the investigated order still owe the user anything? §2.5's predicate.
+
+        A work order is asked through `true_blockers`; a feature or improvement order has
+        no such derivation, so its own `needs_attention` is the equivalent read.
+        """
+        if not subject:
+            return True
+        try:
+            if subject.startswith("wo-"):
+                return not invariants_mod.true_blockers(store,
+                                                        store.get_work_order(subject))
+            return not store.get_feature_order(subject)["needs_attention"]
+        except KeyError:
+            return True   # gone, so nothing is owed on it
 
     def _route_to_validation(self, project: ProjectSpec, store: ProjectStore,
                              fo: dict) -> bool:
@@ -1247,6 +1528,13 @@ class Daemon:
         no sender and the feature parked for ever. `_manager_handoff` is that half, and it
         belongs here because this is the branch that knows the whole precondition.
 
+        THE THIRD CASE IS A DEFERRAL: a child has merged but its commit is not yet in the
+        head a round would be collected over, so no round is opened and the feature stays
+        `executing` for the next tick to ask again. `True` is the only safe answer there —
+        `False` would complete the feature unjudged — and only the daemon can defer at
+        all, because only the daemon has a next tick (§2 of
+        docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md).
+
         Both switches are read here rather than in the round machine, for the reason the
         whole design turns on: `enabled` gates OPENING a round and never settling one, so
         a user who turns the panel off at three in the morning drains what is open and
@@ -1264,9 +1552,16 @@ class Daemon:
             # only tick that knows it can make one (issue #480).
             self._manager_handoff(project, store, fo)
             return True
+        if self._defer_unintegrated_children(project, store, fo, cfg):
+            return True
         try:
             round_row = ops.submit_feature_for_validation(
                 store, project.path, fo, declared="", summary="", cfg=cfg)
+        except ops.UnintegratedChild as e:
+            # §2: never the arm below, which completes the feature unjudged.
+            log.info("[%s] feature %s: %s", project.name, fo["id"], e)
+            self._defer_for(project, store, fo["id"], e.child_id, e.commit, e.head, cfg)
+            return True
         except Exception:  # noqa: BLE001 — one feature must not cost the tick the rest
             log.exception("[%s] could not open a validation round for %s",
                           project.name, fo["id"])
@@ -1274,6 +1569,101 @@ class Daemon:
         log.info("[%s] feature %s -> validating (round %d)", project.name, fo["id"],
                  round_row["round"])
         return True
+
+    #: §3: one row per distinct deferral state, on the feature's own timeline.
+    VALIDATION_DEFER_EVENT = "validation_defer"
+
+    def _defer_unintegrated_children(self, project: ProjectSpec, store: ProjectStore,
+                                     fo: dict, cfg: Any) -> bool:
+        """Is a merged child's commit still missing from the head a round would judge?
+
+        True means defer: open no round, leave the feature `executing`, and ask again next
+        tick. The collector silently assumes this precondition, and when it does not hold
+        the panel reports the child's work as missing and rejects — a false blocker that
+        spends a round (§2 of
+        docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md).
+
+        ITS OWN FAILURES DEFER TOO. Anything this cannot answer reads as "not proven",
+        never as "fine". The catch-all is also load-bearing: this runs BEFORE
+        `_route_to_validation`'s `try:`, so an escaping raise would abort `settle_features`
+        for every feature in the project, not just this one.
+        """
+        try:
+            return self._unintegrated_child(project, store, fo, cfg)
+        except Exception:  # noqa: BLE001 — §2: cannot prove it is integrated, so wait
+            log.exception("[%s] could not check %s's children against the default "
+                          "branch head", project.name, fo["id"])
+            return True
+
+    def _unintegrated_child(self, project: ProjectSpec, store: ProjectStore,
+                            fo: dict, cfg: Any) -> bool:
+        """`_defer_unintegrated_children` without the catch-all. See its docstring."""
+        from . import branchproof, ops
+        from . import evidence as evidence_mod
+
+        # §2: the head is read AFTER a fetch, so the check and the collection agree.
+        ref = evidence_mod.base_ref(project.path)
+        if ref:
+            branchproof.fetch(project.path, ref)
+        head = evidence_mod.default_branch_head(project.path)
+        if not head:
+            return False  # no default branch: the collector resolves no head either
+        missing = ops.unintegrated_children(
+            project.path, store, fo["id"], head,
+            lambda child: self._merge_commit_of(project, store, child))
+        if not missing:
+            return False
+        child, sha = missing[0]
+        self._defer_for(project, store, fo["id"], child["id"], sha, head, cfg)
+        return True
+
+    def _defer_for(self, project: ProjectSpec, store: ProjectStore, fo_id: str,
+                   child_id: str, sha: str, head: str, cfg: Any) -> None:
+        """Record one deferral: the timeline event, and the user on expiry.
+
+        Shared by the daemon's own precondition and the `ops.UnintegratedChild` arm, which
+        reach the same state down two paths (§2/§3 of
+        docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md).
+        """
+        from .invariants import FEATURE_CHILD_NOT_INTEGRATED
+
+        waited = self._minutes_since_merge(store, {"id": child_id})
+        expired = waited >= int(cfg.feature_merge_wait_minutes)
+        self._record_defer(store, fo_id, {
+            "child": child_id, "commit": sha, "head": head,
+            "waited_minutes": round(waited, 1), "expired": expired})
+        if expired:
+            # §3: a child merged into a sibling branch never becomes an ancestor, and an
+            # unbounded deferral parks the feature silently.
+            store.flag_feature_attention(fo_id, FEATURE_CHILD_NOT_INTEGRATED.format(
+                id=child_id, commit=sha, head=head))
+        log.info("[%s] feature %s: %s's merge %s is not in %s after %.0f min — no round "
+                 "opened%s", project.name, fo_id, child_id, sha[:12], head[:12],
+                 waited, " (asking the user)" if expired else "")
+
+    def _minutes_since_merge(self, store: ProjectStore, child: dict) -> float:
+        """How long ago this child's merge was recorded. §3: minutes, never ticks — a
+        bound in ticks silently changes meaning when the reconcile interval does."""
+        for kind in ("pr_merged", self.MERGE_COMMIT_EVENT):
+            rows = store.events_of_kind(child["id"], kind)
+            if rows:
+                return max(0.0, (time.time() - float(rows[-1]["ts"])) / 60)
+        return 0.0
+
+    def _record_defer(self, store: ProjectStore, fo_id: str,
+                      payload: dict[str, Any]) -> None:
+        """One event per distinct `(child, commit, expired)`. §3: a per-tick event would
+        write a row a minute for fifteen minutes and then for ever."""
+        from . import ops
+
+        state = (payload["child"], payload["commit"], payload["expired"])
+        prior = ops.feature_events_of_kind(store, fo_id, self.VALIDATION_DEFER_EVENT)
+        if prior:
+            last = db.from_json(prior[-1]["payload"], {})
+            if (last.get("child"), last.get("commit"),
+                    bool(last.get("expired"))) == state:
+                return
+        ops.feature_event(store, fo_id, self.VALIDATION_DEFER_EVENT, payload)
 
     def _manager_handoff(self, project: ProjectSpec, store: ProjectStore,
                          fo: dict) -> None:
@@ -1321,7 +1711,35 @@ class Daemon:
         if not last or last["outcome"] in RUNNABLE_VALIDATION_OUTCOMES:
             return  # a round is in flight or being retried: not the manager's turn yet
         manager = store.manager_work_order(fo_id)
-        if not manager or manager["status"] != "idle":
+        if manager is None:
+            # NEVER A SILENT RETURN, and never a replacement manager either: a fresh one
+            # would answer this round's feedback briefed on none of the feature's history.
+            # The dedupe rides on `carrier_for_feature` — the GENERAL carrier rule, of
+            # which `ops.feature_event`'s manager-only one is the narrow case — because
+            # this is the one branch with no manager to carry the event. Spec §(c).
+            reason = FEATURE_MANAGER_MISSING.format(fo_id=fo_id)
+            carrier = store.carrier_for_feature(fo_id)
+            said = (store.events_of_kind(carrier["id"], FEATURE_HANDOFF_EVENT)
+                    if carrier else [])
+            if any(db.from_json(e["payload"], {}).get("reason") == reason
+                   for e in said):
+                return
+            store.flag_feature_attention(fo_id, reason)
+            if carrier is not None:
+                store.add_event(carrier["id"], FEATURE_HANDOFF_EVENT,
+                                {"round": int(last["round"]), "action": "flagged",
+                                 "reason": reason, "children": [],
+                                 "feature_order": fo_id})
+            # No session at all — a feature nobody has planned — so there is nothing to
+            # dedupe on and this reading flags once per tick it is reached.
+            log.info("[%s] feature %s flagged: %s", project.name, fo_id, reason)
+            return
+        # A manager that is SETTLED is revived and this branch goes on to its nudge or its
+        # flag; one that is genuinely busy — running, or mid-turn — returns as it always
+        # did, because it has not finished reacting. Spec §(c).
+        if (manager["status"] != "idle"
+                and ops.revive_feature_manager(store, fo_id, why="manager handoff")
+                is None):
             return
         if store.queued_messages(manager["id"]):
             return
@@ -1547,7 +1965,7 @@ class Daemon:
         """
         budget = project.max_concurrent - store.count_active()
         for wo in store.list_work_orders(statuses=RETRY_SWEEP_STATUSES):
-            held = state.blocked() if state is not None else ""
+            held = state.blocked(wo["id"]) if state is not None else ""
             if wo["origin"] in UNGOVERNED_ORIGINS:
                 continue  # the user's own session; Jarvis does not drive it
             try:
@@ -1560,16 +1978,20 @@ class Daemon:
             # BELOW the filter above, so only an order that was going to be relaunched
             # on this pass is ever recorded — nothing else is being held.
             if held:
-                shut = state is not None and state.shut()
-                figures = {"in_flight": state.in_flight, "cap": state.cap}
-                if shut:
+                assert state is not None  # `held` is only ever set from a reading
+                cause = state.hold_cause(wo["id"]) or "fleet_cap"
+                figures: dict[str, Any] = {"in_flight": state.in_flight, "cap": state.cap}
+                if cause == "fleet_outage":
                     # Not relabelled a cap: `invariants.fleet_hold_note` owns the words
                     # for an outage (issue #714), and the event exists for the invariant
                     # suppression, which an outage hold needs exactly as a cap hold does.
                     figures["reopens_at"] = state.outage.reopens_at
-                self._record_retry_held(
-                    store, wo, pause,
-                    cause="fleet_outage" if shut else "fleet_cap", figures=figures)
+                elif cause == "fleet_ramp":
+                    figures.update(cap=state.ramp.cap, until=state.ramp.until,
+                                   since=state.ramp.since)
+                elif cause == "fleet_paused":
+                    figures["since"] = state.pause.since
+                self._record_retry_held(store, wo, pause, cause=cause, figures=figures)
                 continue
             takes_a_slot = resume_spends_slot(wo)
             if takes_a_slot and budget <= 0:
@@ -1579,7 +2001,15 @@ class Daemon:
                              "max_concurrent": project.max_concurrent})
                 continue
             try:
-                turn = worker_session.retry(store, project, wo, pause)
+                # COLD, AND LARGE: compact first (issue #843). A pause outlives the cache,
+                # so the plain relaunch re-writes the whole conversation at the
+                # cache-WRITE rate — 100-170k tokens a worker, all due on the same tick.
+                # `compact_then_resume` queues the relaunch as an ordinary message, so the
+                # pause is not erased and the delivery path sends it into the compacted,
+                # warm conversation on the tick after the compaction settles.
+                turn = worker_session.compact_before_relaunch(
+                    store, project, wo, self.catalog.os.compact_min_context,
+                    pause=pause) or worker_session.retry(store, project, wo, pause)
             except budget_mod.BudgetExhausted as e:
                 # `NOT_RETRIED` already keeps this sweep off an order already parked in
                 # `budget_exhausted`; this is the order that ran out BETWEEN the last
@@ -1663,7 +2093,8 @@ class Daemon:
 
     # -- 3. message delivery ----------------------------------------------------------
 
-    def deliver_messages(self, project: ProjectSpec, store: ProjectStore) -> None:
+    def deliver_messages(self, project: ProjectSpec, store: ProjectStore,
+                         state: fleet.Fleet | None = None) -> None:
         """Send queued user messages into their work orders' conversations.
 
         No roster lookup any more, and no thread pool: a turn is a detached process, so
@@ -1725,13 +2156,22 @@ class Daemon:
         budget = project.max_concurrent - store.count_active()
         for wo_id, msgs in pending.items():
             wo = store.get_work_order(wo_id)
+            # UNDER THE FLEET TOO (issue #843). A delivery starts a turn exactly as a
+            # dispatch or a resume does, so the user's pause, the post-reopen ramp and
+            # the account-wide cap bind it the same way. Held, the messages stay queued.
+            held = state.blocked(wo_id) if state is not None else ""
+            if held:
+                log.debug("[%s] holding %s message(s) for %s: %s",
+                          project.name, len(msgs), wo_id, held)
+                continue
             if resume_spends_slot(wo):
                 if budget <= 0:
                     log.debug("[%s] holding %s message(s) for %s: all %s slots are full",
                               project.name, len(msgs), wo_id, project.max_concurrent)
                     continue
                 budget -= 1
-            self._deliver(project, store, wo, msgs)
+            if self._deliver(project, store, wo, msgs) and state is not None:
+                state.launched()
 
     def deliver_envelopes(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Route every queued envelope, oldest first (src/jarvis/bus.py).
@@ -1799,6 +2239,9 @@ class Daemon:
             wo_id = wo["id"]
             if wo_id in self.validating:
                 continue  # its round is in flight; a second tick must not start another
+            if state is not None and state.pause is not None \
+                    and not state.pause.allows(wo_id):
+                continue  # the user paused the fleet; the panel spends on this too (#843)
             round_row = store.latest_validation_round(wo_id=wo_id)
             if round_row is None:  # pragma: no cover - the query selected on this round
                 continue
@@ -1914,6 +2357,34 @@ class Daemon:
                 return
             cfg = self._round_config(project, round_row)
             n, max_rounds = int(round_row["round"]), int(cfg.max_rounds)
+            # WHICH BUDGET THIS ROUND CAME OUT OF. A rebind's NUMBER can sit past
+            # `max_rounds` while its own bound has room, and routing on the number
+            # would send it to the user for being numbered 5 (spec
+            # 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.4).
+            # `rebinds` counts the round being settled, so `<` means "another one left".
+            #
+            # `pos` is the ORDINARY arm's budget position, and it is not `n` either: a
+            # rebind spends a row number without spending budget, so after one the rows
+            # run ahead of the budget and routing on `n` would escalate a submission
+            # with a round still in hand (and tell it "round 3 of 3"). Same counter
+            # `ops.rejudge_moved_head` budgets off — the round being settled is still
+            # open, so it is not in `COUNTED_VALIDATION_OUTCOMES` yet and adding it back
+            # is this `+ 1`.
+            uncounted = bool(round_row["uncounted"])
+            # WHICH EXEMPTION, not merely that there was one. A rework the USER asked
+            # for is bounded by the user's own rejections — one free round each — so a
+            # rejected one falls back to the ORDINARY rule and `REBIND_MAX` never reads
+            # it (Neo question 973, live case wo-299daf2e). An uncounted row with NO
+            # cause predates the column and could only have been a rebind, which is why
+            # the filter drops to unfiltered there.
+            cause = str(round_row["uncounted_cause"] or "")
+            as_rebind = uncounted and cause != ops.USER_REWORK_CAUSE
+            rebinds = store.uncounted_validation_rounds(
+                wo_id=wo_id, cause=cause or None) if as_rebind else 0
+            pos = store.counted_validation_rounds(wo_id=wo_id) + (
+                0 if str(round_row["outcome"] or "") in COUNTED_VALIDATION_OUTCOMES
+                else 1)
+            goes_back = (rebinds < ops.REBIND_MAX) if as_rebind else (pos < max_rounds)
             packet = evidence_mod.collect_work_order(
                 project.path, wo, declared=str(round_row["evidence"] or ""),
                 diff_chars=cfg.diff_chars, spec=specs.spec_of(store, wo),
@@ -2046,6 +2517,14 @@ class Daemon:
                 log.info("[%s] %s: round %d held until Claude Code can authenticate",
                          project.name, wo_id, n)
                 return
+            if isinstance(failure, claude_cli.PromptTooLargeError):
+                # BEFORE the generic outage below — a `ClaudeCliError` subclass, so a
+                # clause after it is never reached — and it must not spend one of the
+                # three RETRYABLE attempts: the OS built this prompt past its own
+                # ceiling, so the next two would be built identically. Spec §4:
+                # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+                self._validation_refused(store, project, wo, round_id, n, failure)
+                return
             if failure is not None:
                 self._validation_outage(store, wo, round_id, n, failure)
                 return
@@ -2089,14 +2568,16 @@ class Daemon:
                                      "outcome": "passed"})
                 log.info("[%s] %s passed review in round %d -> %s",
                          project.name, wo_id, n, status)
-            elif outcome == "rejected" and n < max_rounds:
+            elif outcome == "rejected" and goes_back:
                 # The inadmissible follow-ups ride along HERE and nowhere else: a stale
                 # docstring or a missing test costs nothing in a session that is going
                 # back anyway, and is not a tracker item (`ops.follow_up_feedback`).
                 self._reject(store, wo, round_id, n, max_rounds, reason,
-                             note=ops.follow_up_feedback(follow_ups))
+                             note=ops.follow_up_feedback(follow_ups), budget_round=pos,
+                             rebind=(rebinds, ops.REBIND_MAX) if as_rebind else None,
+                             uncounted_cause=cause)
                 log.info("[%s] %s rejected in round %d of %d",
-                         project.name, wo_id, n, max_rounds)
+                         project.name, wo_id, n if uncounted else pos, max_rounds)
             elif outcome == "rejected":
                 # The last round it had, and it was refused. Sending feedback now would
                 # ask for a resubmission there is no round left to judge — and the loop
@@ -2191,7 +2672,9 @@ class Daemon:
 
     @staticmethod
     def _reject(store: ProjectStore, wo: dict, round_id: int, n: int, max_rounds: int,
-                reason: str, *, note: str = "") -> None:
+                reason: str, *, note: str = "", budget_round: int | None = None,
+                rebind: tuple[int, int] | None = None,
+                uncounted_cause: str = "") -> None:
         """Close the round and send the feedback back — OVER THE BUS, never directly.
 
         The round machine does not call `queue_message` and never names a work order as
@@ -2204,18 +2687,53 @@ class Daemon:
         panel's verdict; the findings that were not admissible as tracker issues are an
         aside to whoever is fixing this, and writing them into the outcome would restate
         on every surface that prints a round.
+
+        `rebind` is `(used, ops.REBIND_MAX)` and swaps the wording for `REBIND_FEEDBACK`:
+        the round was not charged to the submitter, so it may not be told it was (spec
+        2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.4).
+
+        `uncounted_cause` is the round's OWN exemption and it picks the wording: a round
+        a USER rejection bought is not a rebind and may not be described as one — no
+        merge, and no "re-judgement 1 of 2" cap (Neo question 973). It rides on the
+        event too, so every surface can tell the two uncounted causes apart.
+
+        `budget_round` is this round's BUDGET POSITION, which after a rebind is behind
+        its row number, and it is what the ordinary feedback names — a submitter told
+        "round 3 of 3" on its second charged round would ration itself out of a round it
+        still has (same spec §4.4).
+
+        `"round"` in the event stays the ROW NUMBER: `holds.py` correlates it with
+        `validation_submitted`'s, and a budget position there leaves the VALIDATION hold
+        open for ever. The position rides beside it as `budget_round`.
         """
+        from . import ops
+
         wo_id = wo["id"]
+        rework = uncounted_cause == ops.USER_REWORK_CAUSE
         store.close_validation_round(round_id, "rejected", reason)
-        store.add_event(wo_id, "validation_rejected",
-                        {"round": n, "round_id": round_id, "of": max_rounds})
+        used, of = rebind or (0, max_rounds)
+        pos = n if budget_round is None else budget_round
+        # `of` is the bound this round was actually held by, so no surface prints
+        # "round 5 of 3" (spec 2026-09-27 §4.4).
+        event: dict[str, Any] = {"round": n, "round_id": round_id, "of": of,
+                                 "budget_round": pos}
+        if rebind is not None or rework:
+            event["uncounted"] = True
+        if uncounted_cause:
+            event["uncounted_cause"] = uncounted_cause
+        store.add_event(wo_id, "validation_rejected", event)
+        if rework:
+            text = USER_REWORK_FEEDBACK.format(max_rounds=max_rounds,
+                                               reason=reason + note, wo_id=wo_id)
+        elif rebind is not None:
+            text = REBIND_FEEDBACK.format(used=used, max=of, max_rounds=max_rounds,
+                                          reason=reason + note, wo_id=wo_id)
+        else:
+            text = REVIEW_FEEDBACK.format(n=pos, max=max_rounds, reason=reason + note,
+                                          wo_id=wo_id)
         bus.post(store, subject=bus.Subject(wo_id=wo_id),
                  from_role="reviewer", to_role="implementor",
-                 payload=bus.ReviewFeedback(
-                     round=n, outcome="rejected",
-                     reason=REVIEW_FEEDBACK.format(n=n, max=max_rounds,
-                                                   reason=reason + note,
-                                                   wo_id=wo_id)))
+                 payload=bus.ReviewFeedback(round=n, outcome="rejected", reason=text))
 
     @staticmethod
     def _void(store: ProjectStore, wo: dict, round_id: int, n: int,
@@ -2387,6 +2905,38 @@ class Daemon:
                          "reopens_at": reopens, "attempt": attempt,
                          "error": auth.message[:500]})
 
+    def _validation_refused(self, store: ProjectStore, project: ProjectSpec, wo: dict,
+                            round_id: int, n: int,
+                            error: claude_cli.PromptTooLargeError) -> None:
+        """The OS refused its own seat prompt. ESCALATE ONCE — never retry.
+
+        `_validation_outage`'s opposite in the one respect that matters: an outage is
+        a blip worth three attempts, and this is deterministic, so the three would be
+        three identical refusals and a quarter of an hour of silence before the user
+        heard anything. Spec §4:
+        docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+
+        The give-up goes through `_escalate` like every other, so the round, the status
+        and the notification are the ones the user already knows. The flag is then
+        REWRITTEN to the refusal's own sentence, which `invariants.true_blockers`
+        re-derives above VALIDATION_STUCK_BLOCKER: "the panel could not be satisfied"
+        would point the user at the work, and the cause is a prompt nobody ever sent.
+        """
+        central = CentralStore()          # thread-local, as `_round_config` opens its own
+        try:
+            said = self._note_prompt_refusal(central, store, project.name, wo["id"],
+                                             f"validation round {n}", error)
+        finally:
+            central.close()
+        self._escalate(
+            store, wo, round_id, n,
+            f"the review could not be run: the OS built a {said['total']}-char prompt "
+            f"for it, over the {said['ceiling']}-char ceiling ({said['setting']}), so "
+            f"it was never sent. Nobody has judged the work.")
+        from . import invariants
+
+        store.flag_attention(wo["id"], invariants.os_prompt_refused_blocker(said))
+
     def _validation_outage(self, store: ProjectStore, wo: dict, round_id: int, n: int,
                            error: Exception) -> None:
         """The validator could not be reached. That is a transport failure, NOT a
@@ -2501,6 +3051,9 @@ class Daemon:
             fo_id = fo["id"]
             if fo_id in self.validating:
                 continue  # its round is in flight; a second tick must not start another
+            if state is not None and state.pause is not None \
+                    and not state.pause.allows(fo_id):
+                continue  # the user paused the fleet (#843)
             round_row = store.latest_validation_round(fo_id=fo_id)
             if round_row is None:
                 # In `validating` with no round at all: nothing this machine can judge.
@@ -2555,6 +3108,13 @@ class Daemon:
                 store, project.path, fo, declared=str(round_row["evidence"] or ""),
                 summary=str(round_row["summary"] or ""), cfg=cfg,
                 history=ops.prior_round_history(store, fo_id=fo_id, before=n))
+            # WHICH COMMIT THIS ROUND IS JUDGING, in the same position and for the same
+            # reason as the work-order path: a fact about the packet, written before any
+            # verdict exists, so an escalation can still say what it was about. NO FETCH
+            # HERE, deliberately — not fetching is what keeps this head equal to the one
+            # the round was fingerprinted against (§5b of
+            # docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md).
+            store.set_validation_head(round_id, evidence_mod.judged_head(packet))
 
             validator = (self.validator if self.validator is not None
                          else self._validator(cfg))
@@ -2644,6 +3204,12 @@ class Daemon:
                 self._feature_auth_held(store, fo, round_id, n, e.auth)
                 log.info("[%s] feature %s: round %d held until Claude Code can "
                          "authenticate", project.name, fo_id, n)
+                return
+            except claude_cli.PromptTooLargeError as e:
+                # BEFORE the generic clause — a `ClaudeCliError` subclass — and
+                # refused once rather than retried three times, the work-order twin's
+                # reasoning verbatim (`_validation_refused`).
+                self._feature_refused(store, project, fo, round_id, n, e)
                 return
             except claude_cli.ClaudeCliError as e:
                 self._feature_outage(store, fo, round_id, n, e)
@@ -2843,6 +3409,44 @@ class Daemon:
                            "reopens_at": reopens, "attempt": attempt,
                            "error": auth.message[:500], "feature_order": fo_id})
 
+    def _feature_refused(self, store: ProjectStore, project: ProjectSpec, fo: dict,
+                         round_id: int, n: int,
+                         error: claude_cli.PromptTooLargeError) -> None:
+        """`_validation_refused` for a feature round — read that one; this is its twin.
+
+        The carrier differs for `_feature_outage`'s reason: these events live on the
+        MANAGER's timeline, because `wo_events.wo_id` is a foreign key into
+        `work_orders`. The inbox row therefore carries the FEATURE id in its title and
+        no `wo_id`, exactly as `_escalate_feature`'s notification does — naming the
+        manager would point every sink at a session rather than at the rounds.
+        """
+        from . import ops
+        from .project_store import OS_PROMPT_REFUSED_EVENT
+
+        fo_id = fo["id"]
+        said = self.prompt_refusal_payload(f"feature validation round {n}", error)
+        ops.feature_event(store, fo_id, OS_PROMPT_REFUSED_EVENT,
+                          {**said, "round": n, "feature_order": fo_id})
+        central = CentralStore()
+        try:
+            central.add_inbox(
+                project=project.name, level="critical",
+                title=f"An OS model call for {fo_id} was refused: the prompt was too "
+                      f"large",
+                body=f"Call: {said['call']}\nPrompt {said['prompt_chars']} chars + "
+                     f"system prompt {said['system_prompt_chars']} chars = "
+                     f"{said['total']}, over the {said['ceiling']}-char ceiling "
+                     f"({said['setting']}).\nNOBODY HAS JUDGED THIS: the call was "
+                     f"never made, and no retry can help.\nRaise {said['setting']} in "
+                     f"the catalog, or shrink what that call carries.")
+        finally:
+            central.close()
+        self._escalate_feature(
+            store, fo, round_id, n,
+            f"the review could not be run: the OS built a {said['total']}-char prompt "
+            f"for it, over the {said['ceiling']}-char ceiling ({said['setting']}), so "
+            f"it was never sent. Nobody has judged the work.")
+
     def _feature_outage(self, store: ProjectStore, fo: dict, round_id: int, n: int,
                         error: Exception) -> None:
         """The validator could not be reached. A transport failure, NOT a verdict.
@@ -2894,23 +3498,24 @@ class Daemon:
         did before this shipped.
         """
         try:
-            due = worker_session.compaction_due(
-                store, wo, self.catalog.os.compact_min_context)
-            if due is None:
+            turn = worker_session.compact_before_relaunch(
+                store, project, wo, self.catalog.os.compact_min_context)
+            if turn is None:
                 return False
-            turn = worker_session.compact(store, project, wo, due)
         except budget_mod.BudgetExhausted:
             return False  # `_deliver` raises and escalates on the same call; let it
         except Exception:  # noqa: BLE001 — a saving must never cost a delivery
             log.exception("[%s] could not compact %s before its next prompt",
                           project.name, wo["id"])
             return False
-        log.info("[%s] compacting %s before its next prompt (turn %s): %s",
-                 project.name, wo["id"], turn["seq"], due.why)
+        # The reason is on the `compacting` event `worker_session.compact` wrote.
+        log.info("[%s] compacting %s before its next prompt (turn %s)",
+                 project.name, wo["id"], turn["seq"])
         return True
 
     def _deliver(self, project: ProjectSpec, store: ProjectStore, wo: dict,
-                 msgs: list[dict[str, Any]]) -> None:
+                 msgs: list[dict[str, Any]]) -> bool:
+        """True when a turn was launched — the delivery itself, or a compaction first."""
         ids = [m["id"] for m in msgs]
         anchor = ids[0]  # the ASK this turn is charged to — see the note below
         # COMPACT FIRST IF THE CACHE HAS GONE. The messages stay QUEUED — nothing about
@@ -2918,7 +3523,7 @@ class Daemon:
         # that is both summarised and warm again. Deliberately before the `delivering`
         # event, so the record does not claim a delivery that a compaction preempted.
         if self._compacted_first(project, store, wo):
-            return
+            return True
         # WHY THE LAST TURN STALLED, CARRIED INTO THIS ONE. A resume of a work order
         # whose last turn died on a background job used to re-enter the identical turn
         # shape knowing nothing, and the worker backgrounded and signed off again —
@@ -2947,7 +3552,7 @@ class Daemon:
             # user raising the budget is exactly what sends them. `delivery_hold` keeps
             # the next tick from re-attempting, so this runs once per exhaustion.
             budget_mod.escalate(store, wo, e.exhausted)
-            return
+            return False
         except claude_cli.ClaudeCliError as e:
             # THE USER'S WORDS ARE NOT THE OS'S TO DROP. Held, with the attempt spent,
             # and only surfaced once the retries are genuinely gone — spec
@@ -2964,7 +3569,7 @@ class Daemon:
                     f"a message could not be delivered to this work order after "
                     f"{MAX_MESSAGE_DELIVERY_ATTEMPTS} attempts — the worker never "
                     f"received it: {e}")
-            return
+            return False
         # Every message in the turn is delivered, not just the one the turn row names:
         # a message left `queued` here would be re-sent on the next tick, so the worker
         # would read it twice and pay a second boundary for the privilege.
@@ -2979,6 +3584,7 @@ class Daemon:
         if wo["status"] != "running":
             store.set_status(wo["id"], "running")
             store.clear_attention(wo["id"])
+        return True
 
     # -- 5. Neo (answer worker questions) --------------------------------------------
 
@@ -3078,6 +3684,88 @@ class Daemon:
             finally:
                 pstore.close()
 
+    @staticmethod
+    def prompt_refusal_payload(
+            call: str,
+            error: claude_cli.PromptTooLargeError | QuestionTooLargeError,
+    ) -> dict[str, Any]:
+        """What a refusal is allowed to say about itself. Spec §4:
+        docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+
+        NUMBERS AND IDENTIFIERS ONLY — no head, no tail, no ellipsised middle of the
+        prompt. This payload becomes an inbox row the user reads and the digest model
+        is then sent, which is one of the places this feature exists to keep the
+        payload out of.
+
+        ONE renderer for both refusals: the transport measures prompt + system prompt,
+        `neo_store.ask` measures question + context, and those two ARE the prompt the
+        refused call would have been built from. `total` is the combined size in both
+        cases.
+        """
+        prompt_chars = int(getattr(error, "prompt_chars", 0)
+                           or getattr(error, "question_chars", 0))
+        system_prompt_chars = int(getattr(error, "system_prompt_chars", 0)
+                                  or getattr(error, "context_chars", 0))
+        return {"call": call, "prompt_chars": prompt_chars,
+                "system_prompt_chars": system_prompt_chars,
+                "total": prompt_chars + system_prompt_chars,
+                "ceiling": error.ceiling, "setting": "os.max_os_prompt_chars"}
+
+    def _note_prompt_refusal(self, central: CentralStore, store: ProjectStore,
+                             project: str, wo_id: str, call: str,
+                             error: claude_cli.PromptTooLargeError
+                             | QuestionTooLargeError) -> dict[str, Any]:
+        """The OS refused its own prompt. Say so ONCE, durably, and flag the order.
+
+        The event is what makes the flag survive a reconcile tick: `flag_attention`
+        alone is rewritten by INV-ATTENTION-REASON, so the fact is written down and
+        `invariants.true_blockers` re-derives the same sentence from it every tick
+        (`ProjectStore.os_prompt_refusal_open`, kn-78346a2d's rule).
+        """
+        from . import invariants
+        from .project_store import OS_PROMPT_REFUSED_EVENT
+
+        said = self.prompt_refusal_payload(call, error)
+        store.add_event(wo_id, OS_PROMPT_REFUSED_EVENT, said)
+        central.add_inbox(
+            project=project, level="critical",
+            title=f"An OS model call for {wo_id} was refused: the prompt was too large",
+            body=f"Call: {said['call']}\n"
+                 f"Prompt {said['prompt_chars']} chars + system prompt "
+                 f"{said['system_prompt_chars']} chars = {said['total']}, over the "
+                 f"{said['ceiling']}-char ceiling ({said['setting']}).\n"
+                 f"NOBODY HAS JUDGED THIS: the call was never made, so nothing was "
+                 f"decided and no retry can help — the same prompt is built the same "
+                 f"way every time.\n"
+                 f"Raise {said['setting']} in the catalog, or shrink what that call "
+                 f"carries.",
+            wo_id=wo_id)
+        store.flag_attention(wo_id, invariants.os_prompt_refused_blocker(said))
+        return said
+
+    def _note_confirmation_refused(self, project: ProjectSpec, store: ProjectStore,
+                                   wo: dict, assumption: dict,
+                                   error: QuestionTooLargeError) -> None:
+        """A confirmation question the store would not hold. ONCE, then log and move on.
+
+        ONCE IS THE WHOLE GUARD. `autoreview.propose_confirmation` asks before it links,
+        so the assumption stays pending with a NULL `confirm_question_id` and this pass
+        reaches the same row on every reconcile tick — an unguarded write would put a
+        critical row in the inbox every few seconds for ever. Spec §4:
+        docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+        """
+        if store.os_prompt_refusal_open(wo["id"]) is not None:
+            log.info("[%s] %s: assumption #%s is still too large to confirm: %s",
+                     project.name, wo["id"], assumption.get("n"), error)
+            return
+        central = CentralStore()          # thread-local, as `_validation_refused` opens
+        try:
+            self._note_prompt_refusal(
+                central, store, project.name, wo["id"],
+                f"assumption #{assumption.get('n')} confirmation", error)
+        finally:
+            central.close()
+
     def _neo_drain(self) -> None:
         """Answer every queued question in order (runs on the single neo thread)."""
         from . import invariants
@@ -3165,12 +3853,34 @@ class Daemon:
                 if pstore:
                     pstore.close()
 
+        def refused(q: dict, error: claude_cli.PromptTooLargeError) -> None:
+            """The OS built a prompt past its own ceiling (spec §4). One row, one flag,
+            no retry — and never `_note_question_unreachable`, whose sentence says the
+            retries are spent when none was ever made."""
+            ppath = paths.get(q["project"])
+            if not (ppath and ppath.is_dir() and q.get("wo_id")):
+                # A `triage` question has no work order behind it, so there is nothing
+                # to flag; the user is still told (issue #240's rule).
+                central.add_inbox(
+                    project=q["project"], level="critical",
+                    title="An OS model call was refused: the prompt was too large",
+                    body=str(error), wo_id=None)
+                return
+            pstore = ProjectStore(ppath)
+            try:
+                self._note_prompt_refusal(
+                    central, pstore, q["project"], q["wo_id"],
+                    f"neo {q.get('kind') or 'question'}", error)
+            finally:
+                pstore.close()
+
         try:
             results = neo_mod.drain_queue(
                 store, model=cfg.model, learnings_limit=cfg.learnings_limit,
                 deliver=deliver, answer=self._panel_answer(cfg),
                 unreachable=lambda q, detail: self._note_question_unreachable(
                     central, q, detail),
+                refused=refused,
             )
             if results:
                 log.info("neo drained %d question(s)", len(results))
@@ -3230,6 +3940,7 @@ class Daemon:
                 try:
                     view = digest_mod.summarise(
                         q["question"], model=model,
+                        max_chars=self.catalog.os.neo.digest_max_question_chars,
                         # The question knows which work order it came from, and the
                         # transport does not — so the attribution is bound here.
                         on_usage=agent_usage.recorder(
@@ -3341,6 +4052,7 @@ class Daemon:
         a nine-node dependency graph with no read on it, which is the most expensive
         thing to review unaided.
         """
+        from . import autoreview
         from . import db as db_mod
         from . import plans
 
@@ -3382,8 +4094,11 @@ class Daemon:
                       f"Neo's reading: {verdict.get('verdict', '?')} — {reason}")
             # Neo answered, but the answer is not what happens. Re-marking the question
             # keeps `jarvis neo list` and `jarvis status` telling the same story: this
-            # is now the user's to decide.
-            neo_store.mark(q["id"], "escalated", reason=reason)
+            # is now the user's to decide — with WHICH fact overrode it, so the report
+            # can group it (§1 of docs/superpowers/specs/2026-10-01-neo-observability.md).
+            neo_store.mark(q["id"], "escalated", reason=reason,
+                           cause=autoreview.escalation_cause(
+                               over_cap=True, escalate=bool(verdict["escalate"])))
         pstore.flag_feature_attention(fo["id"], f"plan needs your review: {reason[:160]}")
         central.add_inbox(
             project=q["project"], level="warning",
@@ -3634,14 +4349,21 @@ class Daemon:
                       if p.supervisor.remedies.enabled]
         if not supervised or self.remedy_applying:
             return
-        ready: list[tuple[ProjectSpec, str]] = []
+        from . import remedies as remedies_mod
+
+        ready: list[tuple[ProjectSpec, str | None, int | None]] = []
         for project in supervised:
             store = self.store_for(project)
             for alarm in store.alarms_across(statuses=("proposed",)):
                 approval_id = alarm.get("remedy_approval_id")
                 approval = store.get_approval(int(approval_id)) if approval_id else None
                 if approval is not None and approval["status"] == "approved":
-                    ready.append((project, alarm["id"]))
+                    ready.append((project, alarm["id"], int(approval["id"])))
+            # §11 of docs/superpowers/specs/2026-09-24-order-observability.md: a USER-INITIATED fix has
+            # no alarm row, so the scan above would never see it and an approved grant
+            # would sit unspent for ever. Same pool, same `remedies.enabled` gate.
+            for grant in remedies_mod.user_grants(store):
+                ready.append((project, None, int(grant["id"])))
         if not ready:
             return
         self.remedy_applying = True
@@ -3649,7 +4371,8 @@ class Daemon:
         future.add_done_callback(
             lambda f: setattr(self, "remedy_applying", False))
 
-    def _apply_remedies(self, ready: list[tuple[ProjectSpec, str]]) -> None:
+    def _apply_remedies(self,
+                        ready: list[tuple[ProjectSpec, str | None, int | None]]) -> None:
         """Run each approved remedy on the supervisor thread. Re-reads every row.
 
         Re-read rather than carried: the tick chose these under a snapshot taken before
@@ -3660,24 +4383,42 @@ class Daemon:
 
         central = CentralStore()
         try:
-            for project, alarm_id in ready:
+            for project, alarm_id, approval_id in ready:
                 pstore = ProjectStore(project.path)
+                subject_of_log = alarm_id or f"gate request {approval_id}"
                 try:
-                    self._apply_one_remedy(project, pstore, central, alarm_id, remedies)
+                    self._apply_one_remedy(project, pstore, central, alarm_id, remedies,
+                                           approval_id)
                 except remedies.RemedyRefused as exc:
                     log.warning("[%s] remedy for %s refused: %s", project.name,
-                                alarm_id, exc)
+                                subject_of_log, exc)
                 except Exception:  # noqa: BLE001 — one alarm must not stop the rest
                     log.exception("[%s] applying the remedy for %s failed",
-                                  project.name, alarm_id)
+                                  project.name, subject_of_log)
                 finally:
                     pstore.close()
         finally:
             central.close()
 
     def _apply_one_remedy(self, project: ProjectSpec, pstore: ProjectStore,
-                          central: CentralStore, alarm_id: str,
-                          remedies: Any) -> None:
+                          central: CentralStore, alarm_id: str | None,
+                          remedies: Any, approval_id: int | None = None) -> None:
+        if alarm_id is None:
+            # §11's alarm-less grant. Re-read like the alarm path, and refuse rather than
+            # guess when the subject has been deleted since the tick chose it.
+            approval = pstore.get_approval(int(approval_id))  # type: ignore[arg-type]
+            if approval is None:
+                return
+            subject = remedies.subject_of_grant(pstore, approval)
+            if subject is None:
+                log.warning("[%s] gate request %s names a subject that is gone",
+                            project.name, approval_id)
+                return
+            result = remedies.apply(pstore, central, project.name, approval, None,
+                                    subject)
+            log.info("[%s] user fix applied on %s: %s", project.name, subject["id"],
+                     result)
+            return
         alarm = pstore.get_alarm(alarm_id)
         if alarm["status"] != "proposed":
             return
@@ -3767,19 +4508,25 @@ class Daemon:
                 and p.path.is_dir()
                 and self.tick_count % p.supervisor.health_every_ticks == 1]
 
-    def health_tick(self) -> None:
+    def health_tick(self, state: fleet.Fleet | None = None) -> None:
         """Kick a sweep when a unit is due and none is running.
 
         Modelled on `supervisor_tick`, including the guard: a sweep still in flight must
         never have a second one queued behind it, because the candidate list would be
         computed against state the first one is still writing. With no project swept it
         opens no store and reads no row.
+
+        `state` is the tick's ONE `fleet` reading, passed in for the reason
+        `validation_tick` takes it: the account's window is read once per tick, and a
+        sweep that bought a refusal per project would learn the same fact per project.
+        It is threaded into `_health_sweep`, which runs on the health thread — nothing
+        is opened here.
         """
         due = self._health_projects()
         if not due or self.health_sweeping:
             return
         self.health_sweeping = True
-        future = self.health_pool.submit(self._health_sweep, due)
+        future = self.health_pool.submit(self._health_sweep, due, state)
         future.add_done_callback(lambda f: setattr(self, "health_sweeping", False))
 
     def _health_candidates(self, pstore: ProjectStore,
@@ -3814,16 +4561,26 @@ class Daemon:
             # and counts it. `due` compares the fingerprint against the first and floors
             # the spend on the second — see issue #216.
             attempt = pstore.last_health_attempt_ts(subject["kind"], row["id"])
+            # The blocker is computed BESIDE the fingerprint and passed in: `due` is the
+            # whole spend decision and reads no state itself (see its docstring).
             trigger = health.due(last, health.fingerprint(pstore, subject), cfg, now,
                                  float(row.get("created_at") or 0.0),
-                                 last_attempt=attempt)
+                                 last_attempt=attempt,
+                                 blocker=health.blocker(pstore, subject, cfg))
             if trigger:
                 out.append((float(last["ts"]) if last else 0.0, subject, trigger))
         out.sort(key=lambda c: c[0])
         return out
 
-    def _health_sweep(self, projects: list[ProjectSpec]) -> None:
-        """Sweep each project's due units, capped (on the health thread)."""
+    def _health_sweep(self, projects: list[ProjectSpec],
+                      state: fleet.Fleet | None = None) -> None:
+        """Sweep each project's due units, capped (on the health thread).
+
+        TWO HOLDS ARE READ BEFORE ANY CALL IS BOUGHT, one per account and one per
+        project — a recorded hold that nobody reads is just a quieter retry storm (spec
+        docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §3).
+        """
+        from . import health
         from . import supervisor as supervisor_mod
         from .neo_store import NeoStore
 
@@ -3833,8 +4590,28 @@ class Daemon:
                 cfg = project.supervisor
                 pstore = ProjectStore(project.path)
                 try:
-                    for _, subject, trigger in self._health_candidates(
-                            pstore, cfg)[:cfg.health_max_units_per_tick]:
+                    if state is not None and state.shut():
+                        self._hold_sweep_for_outage(project, pstore, state)
+                        continue
+                    hold = pstore.health_sweep_hold()
+                    if hold is not None:
+                        # Nothing is swept, no candidates are derived, no row is
+                        # written: the hold row that exists is the record.
+                        log.debug("[%s] health sweep held until %s: %s",
+                                  project.name, hold[0], hold[1])
+                        continue
+                    candidates = self._health_candidates(pstore, cfg)
+                    # THE CAP BOUNDS SPEND, so it bounds the PAID triggers only and every
+                    # due re-assertion is processed. Otherwise a mostly-parked project
+                    # would spend its whole cap on free rows and starve the paid looks
+                    # the cap's rotation exists to guarantee.
+                    free = [c for c in candidates if c[2] == health.REASSERT]
+                    paid = [c for c in candidates
+                            if c[2] != health.REASSERT][:cfg.health_max_units_per_tick]
+                    for _, subject, trigger in free + paid:
+                        if trigger == health.REASSERT:
+                            supervisor_mod.reassert_health(pstore, project.name, subject)
+                            continue
                         supervisor_mod.review_health(
                             pstore, neo_store, project.name, subject, cfg.probes, cfg,
                             trigger, inspect_cfg=project.inspect)
@@ -3845,6 +4622,218 @@ class Daemon:
         finally:
             neo_store.close()
 
+    @staticmethod
+    def _hold_sweep_for_outage(project: ProjectSpec, pstore: ProjectStore,
+                               state: fleet.Fleet) -> None:
+        """Write down that the ACCOUNT's window — not this project — is why nobody swept.
+
+        ONCE PER WINDOW, not once per tick, and deduped on the MOMENT: at a 5s tick a
+        three-hour window would otherwise write two thousand identical rows per project.
+        `_hold_rounds_for_outage`'s rule verbatim.
+
+        RECORDED rather than merely skipped (kn-22ba6087): this row is the only place the
+        account fact becomes readable to a per-project invariant, which cannot see the
+        fleet object at all.
+        """
+        reopens = state.outage.reopens_at  # type: ignore[union-attr]
+        hold = pstore.health_sweep_hold()
+        if hold is not None and hold[0] >= reopens:
+            return
+        pstore.record_health_review(
+            "account", "", fingerprint="", trigger="account-window", outcome="held",
+            detail=state.outage.message[:500],  # type: ignore[union-attr]
+            reopens_at=reopens)
+        log.info("[%s] health sweep held by the account's usage window until %s",
+                 project.name, reopens)
+
+    # -- 5e. the stuck sweep: an order that stops moving gets investigated -------------
+    #
+    # §5 of docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-
+    # investigated.md. NO MODEL CALL ANYWHERE IN THE DECISION: the pass is arithmetic over
+    # rows the OS already writes, and the spend it authorises is the investigation it
+    # opens, not the deciding.
+
+    #: The run row, newest only. One `os_state` key rather than a table, on
+    #: `CentralStore.set_base_health`'s precedent for a fleet-shaped fact (§8).
+    STUCK_RUN_KEY = "stuck_sweep_run"
+
+    def stuck_cadence(self) -> int:
+        """Ticks between two entries into `stuck_tick` — the FINEST cadence any enabled
+        project asked for (Neo 1086). Each project is then swept on its own, below."""
+        from .catalog import DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS
+
+        asked = [p.fleet_health.sweep_every_ticks for p in self.catalog.projects
+                 if p.fleet_health.enabled]
+        return min(asked) if asked else DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS
+
+    def _stuck_projects(self) -> list[ProjectSpec]:
+        """Every project the stuck sweep covers at all: enabled and on disk."""
+        return [p for p in self.catalog.projects
+                if p.fleet_health.enabled and p.path.is_dir()]
+
+    def stuck_tick(self, state: fleet.Fleet | None = None,
+                   projects: list[ProjectSpec] | None = None) -> None:
+        """Investigate every open order past its per-status threshold, capped and cooled.
+
+        ON THE MAIN THREAD, no pool: `health_tick` needs `self.health_pool` because a sweep
+        makes model calls, and this one makes none — its whole cost is indexed reads — so it
+        runs inline on `schedule_tick`'s pattern.
+
+        `state` is the tick's ONE `fleet` reading, taken for the reason `health_tick` takes
+        it: the account's window is a fleet fact read once per tick.
+
+        The run row is written whatever happens, exception text included, because one
+        broken project must not stop the rest (`fleet.read`'s per-order rule) and because a
+        sweep that wrote nothing is indistinguishable from one that never ran (§8).
+        """
+        projects = projects if projects is not None else self._stuck_projects()
+        if not projects:
+            return
+        now = db.now()
+        run: dict[str, Any] = {"ts": now, "scanned": 0, "candidates": 0, "opened": 0,
+                               "skipped": {}, "excluded": "", "error": ""}
+        errors: list[str] = []
+        try:
+            run["excluded"] = self._stuck_exclusion(state)
+            # COUNTED OVER EVERY ENABLED PROJECT, not over `projects` — the cap is
+            # fleet-wide while the scan is per-project (Neo 1086's `sweep_every_ticks`),
+            # so a tick sweeping one project must still see what the others filed today.
+            opened_today = sum(
+                self.store_for(p).count_feature_orders(
+                    "investigation", "fleet_health", now - 86400.0)
+                for p in self._stuck_projects())
+            candidates: list[dict[str, Any]] = []
+            for project in projects:
+                try:
+                    candidates += self._stuck_candidates(project, state, now, run)
+                except Exception as e:  # noqa: BLE001 — see `fleet.read`'s per-order rule
+                    log.exception("the stuck sweep failed for %s", project.name)
+                    errors.append(f"{project.name}: {type(e).__name__}: {e}")
+            # MOST OVERDUE FIRST — the opposite sort to `_health_candidates`', on purpose:
+            # that cap is a rotation and this one is a daily spend cap, so the cap must cut
+            # the least broken order rather than starve the worst.
+            candidates.sort(key=lambda c: c["verdict"].threshold_seconds
+                            - c["verdict"].active_seconds)
+            run["candidates"] = len(candidates)
+            if not run["excluded"]:
+                self._open_investigations(candidates, opened_today, now, run)
+        except Exception as e:  # noqa: BLE001 — the row carries it; see the docstring
+            log.exception("the stuck sweep failed")
+            errors.append(f"{type(e).__name__}: {e}")
+        run["error"] = "; ".join(errors)[:500]
+        self.central.set_state(self.STUCK_RUN_KEY, db.to_json(run))
+
+    def stuck_due_projects(self) -> list[ProjectSpec]:
+        """Which projects this tick may sweep — each on its OWN `sweep_every_ticks`.
+
+        Neo 1086's cadence is per project, so `stuck_cadence` is the finest of them and
+        this is what keeps a coarser project on the number it asked for. Called from
+        `tick()` alone: `stuck_tick` given no projects sweeps every enabled one, which is
+        what a direct call (a test, `jarvis doctor`) means by asking for a sweep.
+        """
+        due = []
+        for project in self._stuck_projects():
+            last = self.stuck_swept.get(project.name)
+            if last is not None \
+                    and self.tick_count - last < project.fleet_health.sweep_every_ticks:
+                continue
+            self.stuck_swept[project.name] = self.tick_count
+            due.append(project)
+        return due
+
+    @staticmethod
+    def _stuck_exclusion(state: fleet.Fleet | None) -> str:
+        """The fleet-wide hold that stops the sweep FILING, or `""`. §2, Neo 1074.
+
+        A paused fleet must not have the sweep filing orders, and the same holds for the
+        post-reopen ramp: nothing is wrong in either case and both resume by themselves.
+        The reads still happen and the run is still recorded — that is what keeps §8's
+        invariant from calling a deliberately quiet sweep dark.
+        """
+        if state is None:
+            return ""
+        if state.shut():
+            return "fleet_outage"
+        if state.pause is not None:
+            return "fleet_paused"
+        if state.ramp is not None and state.at < state.ramp.until:
+            return "fleet_ramp"
+        return ""
+
+    def _stuck_candidates(self, project: ProjectSpec, state: fleet.Fleet | None,
+                          now: float, run: dict[str, Any]) -> list[dict[str, Any]]:
+        """Every open order of one project that `stuck.assess` calls stuck.
+
+        The expensive step of the tick and the last one: one `ops.state_durations` and one
+        `holds.held` per open order, all of them indexed reads.
+
+        THE DERIVATION ITSELF IS `ops.stuck_scan` — shared with `ops.stuck_report`, so the
+        surfaces and the spend decision can never disagree about a duration (§7).
+        """
+        from . import ops
+
+        pstore = self.store_for(project)
+        # PROJECT-WIDE, read once rather than once per candidate — `health_sweep_hold`'s
+        # own docstring — and the fleet half beside it, per §2.1.
+        window = bool(pstore.health_sweep_hold()) or (state is not None and state.shut())
+        scanned, out = ops.stuck_scan(pstore, project.name, project.fleet_health, now,
+                                      window=window)
+        run["scanned"] += scanned
+        return out
+
+    def _open_investigations(self, candidates: list[dict[str, Any]], opened_today: int,
+                             now: float, run: dict[str, Any]) -> None:
+        """File one investigation per candidate, under the three rate limits of §6."""
+        from . import ops, stuck
+
+        cap = self.catalog.os.fleet_health.max_per_day
+        for seen, candidate in enumerate(candidates):
+            if opened_today + run["opened"] >= cap:
+                run["skipped"]["daily_cap"] = len(candidates) - seen
+                return
+            wo, project = candidate["wo"], candidate["project"]
+            verdict = candidate["verdict"]
+            fingerprint = stuck.fingerprint(str(wo["status"]), candidate["since"],
+                                            candidate["blocker"], candidate["events"])
+            if ops.live_investigation(project, wo["id"]):
+                run["skipped"]["live"] = run["skipped"].get("live", 0) + 1
+                continue
+            if self._stuck_cooled(project, wo["id"], fingerprint, now):
+                run["skipped"]["cooldown"] = run["skipped"].get("cooldown", 0) + 1
+                continue
+            # A DIRECT PYTHON CALL, never a subprocess shelling out to `jarvis`: §2.7 of
+            # the investigation-orders spec built this seam for this caller. And NO
+            # `budget_usd` — `worker.investigation_budget_usd` is the only per-session
+            # ceiling (§4, Neo's one condition on 1073).
+            inv = ops.create_investigation_order(
+                project, wo["id"],
+                why=stuck.WHY.format(
+                    subject=wo["id"], status_label=candidate["status_label"],
+                    status_age=f"{(now - candidate['since']) / 3600:.1f}h",
+                    activity_age=f"{(now - candidate['activity']) / 3600:.1f}h",
+                    reason=verdict.reason, blocker=candidate["blocker"]),
+                origin="fleet_health", fingerprint=fingerprint)
+            run["opened"] += 1
+            log.info("[%s] %s is stuck: %s — %s", project, wo["id"], verdict.reason,
+                     inv["id"])
+
+    def _stuck_cooled(self, project: str, wo_id: str, fingerprint: str,
+                      now: float) -> bool:
+        """Is this subject still inside its cooldown, or unchanged since last time? §6b.
+
+        EITHER refuses. So an order whose state and blocker have not changed is never
+        re-investigated however long it has been, and one that HAS changed still waits out
+        the cooldown, because "it moved" and "it is better" are not the same claim.
+        """
+        from . import ops
+
+        last = ops.last_stuck_investigation(project, wo_id)
+        if last is None:
+            return False
+        cooldown = self.catalog.os.fleet_health.cooldown_minutes * 60.0
+        return (now - float(last.get("updated_at") or 0.0) < cooldown
+                or last[ops.STUCK_FINGERPRINT_KEY] == fingerprint)
+
     # -- 6b. the scheduler: work orders nobody typed ---------------------------------------
 
     def _os_owner(self) -> str | None:
@@ -3852,6 +4841,18 @@ class Daemon:
         from . import schedule
 
         return schedule.os_owner((p.name, p.path) for p in self.catalog.projects)
+
+    def _os_project(self) -> str | None:
+        """Which project IS the OS — `schedule.os_project`, per tick.
+
+        NOT `_os_owner`, and the difference is issue 956: that one resolves by path
+        containment and answers with an arbitrary project when nothing contains the
+        install, which is every production deployment. Callers granting the OS's own
+        authority — the release path — ask this and do nothing on None.
+        """
+        from . import schedule
+
+        return schedule.os_project((p.name, p.path) for p in self.catalog.projects)
 
     @staticmethod
     def _schedule_blocker(store: ProjectStore, state: dict[str, Any]) -> dict[str, Any] | None:
@@ -4003,7 +5004,10 @@ class Daemon:
                          f"{wo_id}: " if wo_id else "", invariant)
 
         for v in violations:
-            if not store.open_violation_report(v.invariant, v.wo_id):
+            # `level` and `detail` ride along so a standing CRITICAL one can reach the
+            # attention list from state alone — Neo 1084, `ops.os_status`.
+            if not store.open_violation_report(v.invariant, v.wo_id, level=v.level,
+                                               detail=v.detail):
                 continue
             log.warning("[%s] %s", project.name, v)
             if v.wo_id:
@@ -4016,14 +5020,16 @@ class Daemon:
                 store.add_notification(
                     title=f"OS invariant violated: {v.invariant}",
                     body=f"{v.detail}" + (f" ({v.wo_id})" if v.wo_id else ""),
-                    level="warning", wo_id=v.wo_id, source="invariants",
+                    # The violation's OWN level: most are `warning`, and one that must
+                    # not arrive beside a stale attention flag says `critical`.
+                    level=v.level, wo_id=v.wo_id, source="invariants",
                 )
 
     def rules_tick(self, project: ProjectSpec, store: ProjectStore) -> dict[str, Any]:
         """Evaluate the rule registry against this project's open orders. RECORDS ONLY.
 
-        §5 of docs/specs/2026-09-27-self-evolution.md. Called from the reconcile block
-        IMMEDIATELY AFTER `check_invariants`, and that position is the argument, not a
+        §5 of docs/superpowers/specs/2026-09-27-self-evolution.md. Called from the
+        reconcile block IMMEDIATELY AFTER `check_invariants`, and that position is the argument, not a
         convenience: the invariants REPAIR what is unambiguously wrong on the same tick,
         so a detector pass running before them fires on conditions the OS was about to
         fix itself. Those would be false positives manufactured purely by ordering, and
@@ -4466,7 +5472,7 @@ class Daemon:
 
     def settle_work_order(self, project: ProjectSpec, store: ProjectStore,
                           wo: dict) -> None:
-        from .invariants import awaiting_neo, something_is_out, true_blockers
+        from .invariants import something_is_out, true_blockers, user_facing_wait
 
         # OUT OF MONEY, asked before the turn is looked at but AFTER the round machine's
         # claim below. The budget governs the order's WHOLE bill, so what spends the last
@@ -4566,9 +5572,34 @@ class Daemon:
             if pause and not pause.exhausted:
                 return
             if wo["status"] != "failed":
+                # THE ORDER IS `failed` EITHER WAY — the turn died mid-duration, and
+                # `needs_review` is the queue the user works through to decide on
+                # DELIVERED work. What a session killed after delivery leaves behind is a
+                # pull request and assumptions nobody can take back, and the EVENT below
+                # is what records that: `dead_feature_children` reads it and exempts this
+                # child, so its feature is not failed off it (fo-ac00376e, off a delivered
+                # wo-604b5b99). Load-bearing, not decoration. Spec §(a),
+                # docs/superpowers/specs/2026-10-07-a-settled-features-live-children-must-
+                # have-a-manager-or-a-hold.md
+                delivered = invariants_mod.has_delivered(store, wo)
                 store.set_status(wo["id"], "failed")
-                store.flag_attention(wo["id"],
-                                     "worker turn failed — review and retry")
+                if delivered:
+                    store.add_event(
+                        wo["id"], invariants_mod.TURN_DIED_AFTER_DELIVERY_EVENT,
+                        {"error": turn.get("error"),
+                         **({"attempts": pause.attempts, "reason": pause.reason,
+                             "message": pause.message} if pause else {})})
+                    # ONLY IF THERE IS A BLOCKER TO FLAG. An UNGOVERNED order — one the
+                    # user injected — derives nothing from `failed` at all, because the
+                    # arm is behind `governed`, and asking it for nothing is correct
+                    # (`retire_ungoverned`).
+                    fresh_row = store.get_work_order(wo["id"])
+                    blockers = invariants_mod.true_blockers(store, fresh_row)
+                    if blockers:
+                        store.flag_attention(wo["id"], blockers[0])
+                else:
+                    store.flag_attention(wo["id"],
+                                         invariants_mod.WORKER_FAILED_BLOCKER)
                 if pause:
                     # Retried until the OS ran out of patience. Say so plainly: the
                     # message the user needs is "this is not going to fix itself", and
@@ -4579,13 +5610,31 @@ class Daemon:
                                     {"attempts": pause.attempts,
                                      "reason": pause.reason,
                                      "error": pause.message})
-                store.add_notification(
-                    title=(f"{wo['id']} still failing after {pause.attempts} "
-                           f"{worker_session.PAUSE_NOUN[pause.reason]} retries" if pause
-                           else f"{wo['id']} worker turn failed"),
-                    body=(turn.get("error") or "no error recorded")[:500],
-                    level="warning", wo_id=wo["id"], source="reconciler",
-                )
+                if delivered:
+                    # THE PHONE HAS TO SAY WHICH FAILURE THIS IS. "worker turn failed"
+                    # about an order that had already delivered reads as a bug in the
+                    # work and sends the user looking for one — GitHub issue 881, where
+                    # it read as if the order were completed. ONE notification, never two:
+                    # this replaces the generic line rather than following it.
+                    title = f"{wo['id']} delivered, then its session died"
+                    said = ["The work was delivered and is on record; the order is "
+                            "`failed` because the turn never finished."]
+                    if wo.get("pr_url"):
+                        said.append(f"Pull request: {wo['pr_url']}.")
+                    n = len(store.all_assumptions(wo["id"]))
+                    if n:
+                        said.append(f"{n} assumption{'s' if n != 1 else ''} on record.")
+                    said.append(f"`jarvis wo retry {wo['id']}` resumes the session where "
+                                f"it died; `jarvis wo done {wo['id']}` closes it.")
+                    said.append(turn.get("error") or "no error recorded")
+                    body = " ".join(said)
+                else:
+                    title = (f"{wo['id']} still failing after {pause.attempts} "
+                             f"{worker_session.PAUSE_NOUN[pause.reason]} retries" if pause
+                             else f"{wo['id']} worker turn failed")
+                    body = (turn.get("error") or "no error recorded")[:500]
+                store.add_notification(title=title, body=body[:500], level="warning",
+                                       wo_id=wo["id"], source="reconciler")
             return
 
         # The turn is done. Everything below decides what the work order does next.
@@ -4658,10 +5707,18 @@ class Daemon:
                 # and this ran a tick later and completed the order it had just held.
                 # A gate-only `pr_url` comes here too, and lands `completed`.
                 ops_mod.land_finished(store, fresh)
-        elif store.pending_approvals(wo["id"]) or awaiting_neo(wo["id"]):
+        elif wo.get("kind") != "manager" and something_is_out(store, wo["id"]):
             # Parked on the delegate — a privileged-action gate awaiting a verdict, or a
             # question awaiting an answer. Either way the worker was TOLD to end its turn
             # and wait, so an idle worker here is compliance, not abandonment.
+            #
+            # THE WHOLE PREDICATE, and a manager is excluded from it: `something_is_out`
+            # adds `held_approvals`, which is what keeps an idle worker holding an
+            # unargued gate out of the `else` below and off the user's list (fix 2 of
+            # docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md), and
+            # the exclusion is what keeps the manager branch below reachable exactly as
+            # before. The WRITE stays conditional on the wait being outward-facing: a
+            # held request is the worker's own move, so it parks nothing.
             #
             # The question half was missing, and the `else` below caught those instead:
             # a `jarvis wo ask` whose answer had not landed by the time the turn settled
@@ -4669,7 +5726,8 @@ class Daemon:
             # the user, for a worker doing exactly what the contract asks of it (GitHub
             # issue 100). Only the tightness of the Neo drain loop kept that rare; a
             # slow or disabled Neo makes it every `wo ask`.
-            if fresh["status"] != "waiting_input":
+            if (user_facing_wait(store, wo["id"])
+                    and fresh["status"] != "waiting_input"):
                 store.set_status(wo["id"], "waiting_input")
         elif wo.get("kind") == "manager":
             # A project manager order is idle BY DESIGN: it acts on a message and ends
@@ -4702,21 +5760,22 @@ class Daemon:
             feature = store.get_feature_order(parent) if parent else None
             if feature and feature["status"] in FO_TERMINAL_STATUSES:
                 self._close_feature_manager(store, str(parent))
-            elif something_is_out(store, wo["id"]):
+            elif user_facing_wait(store, wo["id"]):
                 # HOLD IT WHERE IT IS. `waiting_input` is the only carrier of the fact
                 # that this manager ASKED for something, and re-statusing it `idle` would
                 # say the opposite — nothing to act on — about an order waiting for a
                 # verdict: muted, out of FEATURED_STATUSES, and refused a nudge.
                 #
-                # NOT LEFT TO THE BRANCH ORDER ABOVE, which is two thirds of the same
-                # question and looks like all of it. That `elif` reads `pending_approvals`
-                # and misses `awaiting_case` — a gate request the worker filed by running
-                # the command before arguing it, which `gates.file_request` parks here
-                # just the same. Under the old code missing it cost nothing, because this
-                # branch's write was `waiting_input` either way; since issue #264 it is a
-                # rewrite, so the predicate has to be the whole one. `something_is_out` is
-                # that predicate, shared with `invariants.end_wait_if_nothing_is_out` so
-                # the two cannot drift (kn-4ea33fe6).
+                # THE BRANCH ABOVE NOW COVERS THE REST, and a manager is excluded from it
+                # on purpose so this one stays reachable: `something_is_out` there is the
+                # whole predicate, including `awaiting_case`. What is left here is the
+                # narrower question — is somebody ELSE holding this — because a HELD gate
+                # request is the manager's own move and is owed by nobody. A manager
+                # holding only one falls through to `idle`, which is the truthful label:
+                # its feature is what wakes it. Fix 2 of
+                # docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md.
+                # `user_facing_wait` lives beside `something_is_out` so the pair cannot
+                # drift (kn-4ea33fe6).
                 pass
             elif fresh["status"] != "idle":
                 store.set_status(wo["id"], "idle")
@@ -5073,6 +6132,14 @@ class Daemon:
             except Exception:  # noqa: BLE001 — never let one work order stall the rest
                 log.exception("[%s] polling %s failed", project.name, wo["id"])
                 continue
+            # THE HEAD, CACHED. Spec §2b of
+            # docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md:
+            # `invariants.parked_reason` runs per order per tick and may not go to the
+            # network, and this poll already holds the answer. Written only when it
+            # MOVED, so the green common case keeps its no-write budget.
+            if pr.head_oid and pr.head_oid != str(wo.get("pr_head_oid") or ""):
+                store.update_work_order(wo["id"], pr_head_oid=pr.head_oid,
+                                        pr_head_seen_at=db.now())
             try:
                 if pr.merged:
                     # THE ROUND FIRST, if one is open: the pull request has landed, so
@@ -5345,7 +6412,7 @@ class Daemon:
         not be merged must leave the work order exactly where it was, and "exactly where
         it was" is the behaviour the whole feature is an optimisation over.
         """
-        from . import automerge, ops
+        from . import automerge, branchproof, ops
 
         cfg = project.validation
         if not (cfg.enabled and cfg.auto_merge):
@@ -5367,11 +6434,20 @@ class Daemon:
         # §2.4). Nothing is poked when it clears: the next poll re-decides from scratch.
         hold = store.plan_hold(wo)
         plan_assumptions = str((hold or {}).get("planner_id") or "")
+        # Spec 2026-09-28 §3.2. NO FETCH PER TICK, and `pr.base_oid` on purpose. That read
+        # is wrong in BOTH directions: it UNDER-reports while GitHub's cache lags, and it
+        # OVER-reports for ever on a checkout that does not have `pr.base_oid` at all
+        # (ancestry unanswerable reads as behind). So this hold is a cheap early stop and
+        # never the safety property. The safety property is the pair that fetches — the
+        # pre-propose catch-up and `automerge.apply`'s precondition — and no merge reaches
+        # GitHub without passing the second.
+        base_behind = (automerge.BaseBehind(base=pr.base_ref, base_oid=pr.base_oid)
+                       if ops.catch_up_needed(pr, repo=project.path) else None)
         decision = automerge.decide(
             round_row, wo, pr, cfg,
             validated_head=store.validated_head(round_row),
             pending_assumptions=pending, plan_assumptions=plan_assumptions,
-            base_red=base_red)
+            base_red=base_red, base_behind=base_behind)
         if not decision.armed:
             # A CATCH-UP WITH THE BASE COSTS NO ROUND (spec
             # docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md
@@ -5379,28 +6455,83 @@ class Daemon:
             # event describing a stall that lasted microseconds, and before the re-judge,
             # so the round machine never sees a head that moved for a reason no seat needs
             # to read. A refused carry falls through to both, untouched.
-            if (not record_only and decision.code == automerge.HELD_SHA_MOVED
-                    and self._carry_catch_up(project, store, wo, pr, decision)):
+            outcome = CarryOutcome(False, False)
+            if not record_only and decision.code == automerge.HELD_SHA_MOVED:
+                outcome = self._carry_catch_up(project, store, wo, pr, decision)
+            if outcome.carried:
                 round_row = store.latest_validation_round(wo_id=wo_id)
                 decision = automerge.decide(
                     round_row, wo, pr, cfg,
                     validated_head=store.validated_head(round_row),
                     pending_assumptions=pending, plan_assumptions=plan_assumptions)
+            if not decision.armed and not record_only \
+                    and decision.code == automerge.HELD_BASE_MOVED:
+                # THE HOLD IS WHERE THE CATCH-UP HANGS NOW (spec 2026-09-28 §3.2, §3.6):
+                # the base fact outranks every condition below it, so the armed path can
+                # no longer be reached while the branch is behind. Both ways of being
+                # behind arrive here — GitHub's own `BEHIND`, and the ancestry answer it
+                # reports CLEAN for. The hold is written from the OUTCOME rather than
+                # from `decision`, so it says which guard refused.
+                caught = self._catch_up_with_base(project, store, wo, pr)
+                if caught.outcome == ops.CATCH_UP_NOT_NEEDED:
+                    # THE FETCHED READ WINS, AND NOT DECIDING HERE WOULD STALL FOR EVER.
+                    # The pre-`decide` fact is unfetched, so a checkout that does not have
+                    # `pr.base_oid` at all cannot answer the ancestry question and reads as
+                    # BEHIND on every tick (`ops.catch_up_needed`) — a persistent
+                    # OVER-report, not the transient under-report §3.2 assumed. Returning
+                    # on it held a mergeable pull request for ever, silently.
+                    #
+                    # AND THE CHEAP FACT IS DROPPED WITH IT: §3.6's supersede below reads
+                    # it, so leaving it set withdraws a healthy pending request.
+                    base_behind = None
+                    log.debug("[%s] %s: the fetched base contradicts the poll's reading "
+                              "— base_oid %s, behind=%s, and the head already contains "
+                              "the tip; deciding without it", project.name, wo_id,
+                              str(getattr(pr, "base_oid", "") or "")[:10] or "unknown",
+                              bool(getattr(pr, "behind", False)))
+                    decision = automerge.decide(
+                        round_row, wo, pr, cfg,
+                        validated_head=store.validated_head(round_row),
+                        pending_assumptions=pending, plan_assumptions=plan_assumptions,
+                        base_red=base_red)
+                else:
+                    # A PENDING REQUEST IS WITHDRAWN (spec §3.6): it was filed against a
+                    # base that has moved, so its CI evidence no longer describes what the
+                    # merge would land on. Superseded, never answered — and its command
+                    # names the old sha, so the catch-up orphans nothing that could still
+                    # have landed (§3.1). AFTER the outcome, so a base that turned out not
+                    # to have moved withdraws nothing.
+                    #
+                    # A FETCHED BASE FACT OR NONE AT ALL, and a deferral is retried rather
+                    # than withdrawn (spec 2026-09-28 §3.6 / Amendment E).
+                    moved = bool(caught.base_tip) and ops.catch_up_needed(
+                        pr, repo=project.path, base_tip=caught.base_tip)
+                    judged = store.validated_head(round_row) or ""
+                    filed = (store.latest_approval_for(
+                        wo_id, automerge.GATE_KIND,
+                        automerge.merge_command(str(wo.get("pr_url") or ""), judged))
+                        if judged else None)
+                    if (moved and caught.outcome != ops.CATCH_UP_DEFERRED
+                            and filed is not None
+                            and filed["status"] in ("pending", "awaiting_case")):
+                        self._supersede_stale_request(store, filed, pr,
+                                                      base_tip=caught.base_tip)
+                    # The FETCHED tip, never `pr.base_oid` — spec 2026-09-28 §3.1.
+                    self._note_automerge_held(
+                        store, wo_id,
+                        automerge.held_base_moved(caught, pr, caught.base_tip))
+                    return
             if not decision.armed:
                 self._note_automerge_held(store, wo_id, decision)
-                if (not record_only
-                        and decision.code == automerge.HELD_MERGE_STATE_UNCLEAN
-                        and str(getattr(pr, "merge_state", "") or "").upper() == "BEHIND"):
-                    # GitHub said BEHIND outright — the rarer half of §5.1, and the only
-                    # one `decide` can see. The commoner one reports CLEAN and is caught
-                    # on the armed path below, by ancestry.
-                    self._catch_up_with_base(project, store, wo, pr)
-                    return
                 if (not record_only and decision.code == automerge.HELD_SHA_MOVED
                         and automerge.only_the_head_moved(
                             round_row, wo, pr, cfg, pending_assumptions=pending,
                             plan_assumptions=plan_assumptions)):
-                    self._rejudge_moved_head(project, store, wo, decision)
+                    # `rebind` is the carry's reading of the two proofs, and the guard
+                    # above still holds it: a rebind is free of the round budget, not
+                    # of five seats (spec 2026-09-27 §4.2).
+                    self._rejudge_moved_head(project, store, wo, decision,
+                                             rebind=outcome.rebind)
                 return
         if record_only:
             return          # unreachable: a repairing pull request cannot arm, see above
@@ -5414,10 +6545,25 @@ class Daemon:
             # live grant would orphan a permission Neo already gave and silently ask for
             # another. A head the OS moved is not decided on this tick: the next one
             # re-reads it, waits out its CI and carries the verdict across (§3).
-            caught_up = self._catch_up_with_base(project, store, wo, pr)
-            if caught_up.head_oid != pr.head_oid:
+            #
+            # ANYTHING BUT "NOT NEEDED" HOLDS (spec 2026-09-28 §3.4). The old test was
+            # `caught_up.head_oid != pr.head_oid`, which read a guard's refusal as "already
+            # up to date" and fell through to `propose` — gate 308's defect.
+            caught = self._catch_up_with_base(project, store, wo, pr)
+            if caught.outcome != ops.CATCH_UP_NOT_NEEDED:
+                # The FETCHED tip, never `pr.base_oid` — spec 2026-09-28 §3.1.
+                self._note_automerge_held(
+                    store, wo_id,
+                    automerge.held_base_moved(caught, pr, caught.base_tip))
                 return
         if approval is not None and approval["status"] != "approved":
+            # A PENDING REQUEST WHOSE BASE HAS MOVED IS SUPERSEDED, NEVER ANSWERED (spec
+            # 2026-09-28 §3.6): the CI evidence in it no longer describes what the merge
+            # would land on, so nothing is authorised and nothing is refused.
+            if (approval["status"] in ("pending", "awaiting_case")
+                    and base_behind is not None):
+                self._supersede_stale_request(store, approval, pr)
+                return
             # Filed and not granted: pending with Neo, escalated to the user, denied,
             # expired. Every one of those is somebody's business and none of them is
             # this loop's — and `propose` would refuse anyway, after opening a NeoStore
@@ -5439,7 +6585,9 @@ class Daemon:
                 automerge.propose(store, neo_store, project.name, wo, decision,
                                   # Whole, with each conclusion — spec 2026-09-24 fix 2.
                                   checks=pr.checks,
-                                  protection=self._protection_fact(project, pr))
+                                  protection=self._protection_fact(project, pr),
+                                  # The base it was filed against — spec 2026-09-28 §3.5.
+                                  pr=pr)
             finally:
                 neo_store.close()
             return
@@ -5448,7 +6596,23 @@ class Daemon:
         # `automerge.attempts` for why spec §8's counter would enforce nothing.
         try:
             merged = automerge.apply(store, wo, decision.judged_sha, approval,
-                                     cwd=project.path)
+                                     cwd=project.path, base_ref=pr.base_ref)
+        except automerge.StaleBase as exc:
+            # THE BASE MOVED UNDER THE JUDGED COMMIT (spec 2026-09-28 §3.1). News, unlike
+            # its parent: recorded once per (head, base tip) and answered with a catch-up.
+            # No grant was spent — the check ran before `gates.open_gate`.
+            log.info("[%s] auto-merge of %s refused: %s", project.name, wo_id, exc)
+            tip = branchproof.tip(project.path, f"origin/{pr.base_ref}")
+            if tip not in ops.stale_base_bases(store, wo_id, decision.judged_sha):
+                store.add_event(wo_id, ops.MERGE_BASE_STALE_EVENT, {
+                    "head_sha": decision.judged_sha, "base": pr.base_ref,
+                    "base_oid": tip, "round": decision.round_n,
+                    "approval_id": approval["id"],
+                    "reason": str(exc), "pr_url": wo.get("pr_url")})
+            caught = self._catch_up_with_base(project, store, wo, pr)
+            self._note_automerge_held(store, wo_id,
+                                      automerge.held_base_moved(caught, pr, tip))
+            return
         except automerge.MergeFailed as exc:
             # It reached GitHub and GitHub said no. Counted, recorded and — once per
             # commit — reported.
@@ -5553,6 +6717,13 @@ class Daemon:
         candidates: list[tuple[dict, list[dict], bool]] = []
         for early, status in ((False, "needs_review"), (True, "running")):
             for wo in store.list_work_orders(statuses=(status,)):
+                if wo.get("kind") == "investigator":
+                    # A diagnosis is not a submission and nothing is gated on it: §2.3 of
+                    # docs/superpowers/specs/2026-10-01-a-submitted-verdict-must-settle-
+                    # its-investigator.md. Here rather than in `decide`/`decide_early`,
+                    # which would be two hold codes and a third `_holds_not_recorded`
+                    # entry for one rule.
+                    continue
                 rows = store.all_assumptions(wo["id"])
                 if any(a["status"] == "pending"
                        and not (early and a.get("provisional_verdict"))
@@ -5714,16 +6885,44 @@ class Daemon:
         `autoreview`, which is pure by contract; `ops._unreachable_asks` is the read-side
         twin for the surfaces.
         """
+        return self._question_liveness(neo_store, assumptions)[0]
+
+    def _question_liveness(self, neo_store: Any,
+                           assumptions: list[dict]) -> tuple[set[int], set[int]]:
+        """`(dead, open)` for every question these rows link to. ONE READ PER LINK.
+
+        Two facts off one row, because they are read on the same tick by two gates and a
+        second pass over `neo.db` would buy nothing (2026-09-28 spec §6). They are
+        DIFFERENT predicates and deliberately not each other's complement:
+
+        * DEAD is `status == 'failed'` and nothing else — the retry ladder is spent, so
+          the link is an outage rather than a question in flight, and the pass asks again
+          (2026-09-26 spec §4, and `_unreachable_question_ids` above is this half);
+        * OPEN is `neo_store.NEO_HELD_Q_STATUSES` — Neo still holds it. `escalated` and
+          `answered` are NOT open: Neo is finished either way, and an escalated
+          confirmation is a decision handed back to the user. What `decide_confirm` tells
+          `confirming` from `confirm_spent` with.
+        """
+        from .neo_store import NEO_HELD_Q_STATUSES
+
         dead: set[int] = set()
+        live: set[int] = set()
+        seen: set[int] = set()
         for a in assumptions:
             for column in ("neo_question_id", "confirm_question_id"):
                 qid = int(a.get(column) or 0)
-                if not qid or qid in dead:
+                if not qid or qid in seen:
                     continue
+                seen.add(qid)
                 q = neo_store.get(qid)
-                if q and str(q["status"] or "") == "failed":
+                if q is None:
+                    continue
+                status = str(q["status"] or "")
+                if status == "failed":
                     dead.add(qid)
-        return dead
+                if status in NEO_HELD_Q_STATUSES:
+                    live.add(qid)
+        return dead, live
 
     def _review_assumptions_of(self, project: ProjectSpec, store: ProjectStore,
                                neo_store: Any, wo: dict, cfg: Any,
@@ -5741,6 +6940,10 @@ class Daemon:
         kinds at once — §5 judges what it can while the worker runs — so that branch is
         per assumption and not per order. **The confirmation branch belongs to the parked
         pass only**: until the work is delivered there is no result to confirm against.
+
+        A row that is no longer `pending` is SKIPPED, whichever branch it would take:
+        docs/superpowers/specs/2026-10-01-a-confirmation-is-not-re-run-on-a-settled-
+        assumption.md §3.1.
         """
         from . import autoreview, ops
 
@@ -5756,12 +6959,20 @@ class Daemon:
         round_n = int((latest or {}).get("round") or 0)
         round_reason = str((latest or {}).get("reason") or "")
         answered = ops.refusal_answered(store, wo["id"])
+        # ...and WHICH unanswered refusal this is. Spec §2c of
+        # docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
+        # Read once per list for `answered`'s reason, and only when there is a hold to
+        # word — an answered refusal cannot reach the sentence.
+        undeclared = not answered and invariants_mod.undeclared_delivery(store, wo)
         objecting = bool(store.outstanding_objections(wo["id"]))
-        dead_questions = self._unreachable_question_ids(neo_store, assumptions)
+        dead_questions, open_questions = self._question_liveness(neo_store, assumptions)
         packet = None
         rule = autoreview.decide_early if early else autoreview.decide
         suppress = _holds_not_recorded(early)
         for a in assumptions:
+            # 2026-10-01-a-confirmation-is-not-re-run-on-a-settled-assumption.md §3.1.
+            if str(a.get("status") or "") != "pending":
+                continue
             # `not early` is the third guard on this branch, after `auto_review`'s
             # candidate filter and `decide_early`'s `HELD_JUDGED` (spec §7).
             if not early and str(a.get("provisional_verdict") or ""):
@@ -5770,7 +6981,11 @@ class Daemon:
                         a, wo, cfg, round_outcome=outcome, round_n=round_n,
                         round_reason=round_reason, refusal_answered=answered,
                         objections_outstanding=objecting,
-                        unreachable_question_ids=dead_questions, stakes=stakes_verdict)
+                        unreachable_question_ids=dead_questions,
+                        # 2026-09-28 spec §6: is Neo still holding the confirmation?
+                        confirmation_open=int(a.get("confirm_question_id") or 0)
+                        in open_questions,
+                        stakes=stakes_verdict)
 
                 decision = self._stakes_reviewed(project, store, wo, cfg, a,
                                                  confirm(), confirm)
@@ -5781,23 +6996,40 @@ class Daemon:
                 # LAZILY, and once per work order: collecting evidence runs git and may
                 # reach GitHub, and an order whose every row holds must not pay for it.
                 if packet is None:
-                    packet = self._confirmation_evidence(project, wo, cfg)
+                    packet = self._confirmation_evidence(project, wo)
+                # Trimmed PER ASSUMPTION, and the collection above stays one `git diff`:
+                # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md § 2.
+                ce = autoreview.confirm_evidence(
+                    packet, a, cfg.confirm_diff_chars,
+                    collect_limit=CONFIRM_COLLECT_CHARS)
                 # THE SECOND GATE, over the EVIDENCE rather than the row, and it runs
-                # before `neo.ask` PERSISTS the diff as a question row (kn-deef42ea).
+                # before `neo.ask` PERSISTS the diff as a question row (kn-deef42ea). It
+                # reads the TRIMMED text because that is what is persisted and sent, and
+                # the WHOLE rendered block of it: docs/superpowers/specs/
+                # 2026-09-26-bounded-model-inputs.md § 2.
                 evidence_ok = autoreview.decide_evidence(
-                    a, packet[0], packet[1], summary=str(wo.get("result_summary") or ""))
+                    a, ce.stat, ce.what_changed(),
+                    summary=str(wo.get("result_summary") or ""))
                 if not evidence_ok.armed:
                     self._note_autoreview_held(store, wo["id"], evidence_ok,
                                                suppress=suppress)
                     continue
-                autoreview.propose_confirmation(store, neo_store, project.name, wo, a,
-                                                assumptions, stat=packet[0],
-                                                diff=packet[1])
+                try:
+                    autoreview.propose_confirmation(store, neo_store, project.name, wo,
+                                                    a, assumptions, evidence=ce, cfg=cfg)
+                except QuestionTooLargeError as e:
+                    # The store refused to hold the question, so nothing was asked and
+                    # nothing was linked. Say so and carry on to the next assumption:
+                    # the outer handler would abandon this work order's whole pass over
+                    # one row. Spec §4:
+                    # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+                    self._note_confirmation_refused(project, store, wo, a, e)
                 continue
             def judge(stakes_verdict=None, a=a):
                 return rule(a, wo, cfg, round_outcome=outcome, round_n=round_n,
                             round_reason=round_reason,
                             refusal_answered=answered,
+                            undeclared_delivery=undeclared,
                             unreachable_question_ids=dead_questions,
                             stakes=stakes_verdict)
 
@@ -5807,7 +7039,7 @@ class Daemon:
                                            suppress=suppress)
                 continue
             autoreview.propose(store, neo_store, project.name, wo, a, assumptions,
-                               early=early)
+                               early=early, cfg=cfg)
 
     def _stakes_reviewed(self, project: ProjectSpec, store: ProjectStore, wo: dict,
                          cfg: Any, a: dict, decision: Any,
@@ -5948,9 +7180,9 @@ class Daemon:
             "classifier_high": high, "category": verdict.category,
             "reason": verdict.reason, "model": verdict.model, "parsed": verdict.parsed})
 
-    def _confirmation_evidence(self, project: ProjectSpec, wo: dict,
-                               cfg: Any) -> tuple[str, str]:
-        """The diff the confirmation question carries. `(stat, diff)`, never raising.
+    def _confirmation_evidence(self, project: ProjectSpec,
+                               wo: dict) -> "evidence.EvidencePacket | None":
+        """The evidence the confirmation question is built from. The packet, or `None`.
 
         `evidence.collect_work_order` does not raise by contract, and this wraps it
         anyway: one unreadable repository must not cost the work order its pass, and the
@@ -5960,19 +7192,19 @@ class Daemon:
         pass had, and refusing to confirm because git said nothing would leave a settled
         verdict unusable on exactly the orders that are hardest to read.
 
-        `cfg.diff_chars` is the project's resolved validation config — the same value and
-        the same spelling `ops.submit_for_validation` passes.
+        Collected at `CONFIRM_COLLECT_CHARS`, NOT at the panel's `validation.diff_chars`:
+        `autoreview.confirm_evidence` trims this per assumption to
+        `validation.confirm_diff_chars`, and no caller here reads the panel's number.
         """
         from . import evidence
 
         try:
-            packet = evidence.collect_work_order(
-                project.path, wo, declared="", diff_chars=cfg.diff_chars)
-            return str(packet.stat or ""), str(packet.diff or "")
+            return evidence.collect_work_order(
+                project.path, wo, declared="", diff_chars=CONFIRM_COLLECT_CHARS)
         except Exception:  # noqa: BLE001 — an unreadable repo is not a reason to park
             log.exception("[%s] evidence for confirming %s's assumptions failed",
                           project.name, wo["id"])
-            return "", ""
+            return None
 
     def _note_autoreview_held(self, store: ProjectStore, wo_id: str,
                               decision: Any, *, settling: bool = False,
@@ -6028,12 +7260,16 @@ class Daemon:
         # would write nothing, the stored payload would still say round 2, and
         # `ops._panel_hold_is_stale` would then drop a hold that is TRUE. Every other code
         # carries 0 on both sides, so their dedupe is what it was.
+        # THE REASON TEXT IS PART OF THE KEY TOO (issue #975): `HELD_REFUSAL_UNANSWERED`
+        # renders two different sentences, so a code-only key suppressed the second and
+        # left the first rendered as a claim about now that had stopped being true.
         key = (int(decision.assumption_id or 0), str(decision.code or ""),
-               int(decision.round or 0))
+               int(decision.round or 0), str(decision.reason or ""))
         if not _hold_is_news(store, wo_id, "autoreview_held", key,
                              lambda p: (int(p.get("assumption_id") or 0),
                                         str(p.get("code") or ""),
-                                        int(p.get("round") or 0))):
+                                        int(p.get("round") or 0),
+                                        str(p.get("reason") or ""))):
             return
         store.add_event(wo_id, "autoreview_held", {
             "code": decision.code, "reason": decision.reason,
@@ -6055,6 +7291,13 @@ class Daemon:
         PENDING".** `autoreview.decide` is asked twice: once to justify spending a model
         call, and once, against freshly read state, to justify the settle it came back
         to do. Only the second one is guarding anything irreversible.
+
+        **THE ONLY PLACE THAT THROWS AWAY A RULING THE OS PAID FOR, so it is also the
+        only place that can say the link to the question is spent** (2026-09-28 spec §4,
+        issue #833). A CONFIRMATION dropped for a transient reason clears
+        `confirm_question_id` and supersedes the question, and the next parked tick
+        confirms against the final delivered diff; every other reason means the row is the
+        user's and stays linked.
 
         A ruling that does not accept is NOT an inbox row. The work order is already on
         the user's attention list carrying "assumptions pending review" — the state it was
@@ -6117,8 +7360,10 @@ class Daemon:
                 # the user's to decide — `_deliver_plan_verdict`'s over-cap branch, for
                 # the same reason. Both shapes reach here: a `deny` (there is no machine
                 # rejection, so it becomes an escalation) and an acceptance this module
-                # overrode on stakes.
-                neo_store.mark(q["id"], "escalated", reason=ruling.reason)
+                # overrode on stakes — and WHICH of the two, as the groupable cause.
+                neo_store.mark(q["id"], "escalated", reason=ruling.reason,
+                               cause=autoreview.escalation_cause(
+                                   ruling, escalate=bool(verdict.get("escalate"))))
             payload = {
                 "assumption_id": assumption["id"], "n": numbered.get("n"),
                 "reason": ruling.reason, "stakes": ruling.stakes,
@@ -6158,6 +7403,7 @@ class Daemon:
             round_n=int((latest or {}).get("round") or 0),
             round_reason=str((latest or {}).get("reason") or ""),
             refusal_answered=ops.refusal_answered(pstore, wo["id"]),
+            undeclared_delivery=invariants_mod.undeclared_delivery(pstore, wo),
             # On a CONFIRMATION the question being delivered is not the one condition 6
             # would trip on: `neo_question_id` still points at the early question, so
             # that is the id to exclude, or every confirmed assumption would be dropped
@@ -6171,18 +7417,57 @@ class Daemon:
             # None, which is the regex, which is what decided the ask under both.
             stakes=self._settle_stakes(project, wo, numbered))
         if not still.armed:
-            # Escalated rather than left `answered`: the assumption is the user's again,
-            # and `/neo` and `jarvis neo list` have to say so — the same re-mark the
-            # non-acceptance branch above does, for the same reason. The hold event is
-            # what puts the WHY on the work order, where `ops.autoreview_state` renders
-            # it as the one `⚙ auto-review:` line.
-            neo_store.mark(q["id"], "escalated", reason=still.reason)
+            # A CONFIRMATION DROPPED FOR A TRANSIENT REASON IS ASKED AGAIN — issue #833
+            # and docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-hold-
+            # an-assumption-for-ever.md §4. Every code in `TRANSIENT_DROPS` is a fact that
+            # clears with the user doing nothing and says nothing about whose decision
+            # this is, so leaving the link set held the assumption for the life of the
+            # work order: pending for the user, and suppressed from their attention list
+            # as a confirmation in flight. Everything else means the row is THEIRS and
+            # stays linked (§4.2) — re-asking would lobby them once per reconcile tick.
+            retry = confirming and still.code in autoreview.TRANSIENT_DROPS
+            if not retry:
+                # Escalated rather than left `answered`: the assumption is the user's
+                # again, and `/neo` and `jarvis neo list` have to say so — the same
+                # re-mark the non-acceptance branch above does, for the same reason. The
+                # hold event is what puts the WHY on the work order, where
+                # `ops.autoreview_state` renders it as the one `⚙ auto-review:` line.
+                #
+                # AND THE CAUSE COMES OUT NULL, which `escalation_cause` below DERIVES
+                # rather than this site omitting. Neo's ruling ACCEPTED here — that is the
+                # branch this is inside — so nothing in its reply caused this escalation:
+                # the condition table re-running at the settle did, and `still.code` is
+                # where that fact is recorded, on the work order. `escalation_cause`
+                # returns `""` for an acceptance and the NULL is the honest answer; a
+                # member of the enum would claim a stakes word or a denial that did not
+                # happen (§1's rule that a guessed label is worse than none).
+                neo_store.mark(q["id"], "escalated", reason=still.reason,
+                               cause=autoreview.escalation_cause(
+                                   ruling, escalate=bool(verdict.get("escalate"))))
             self._note_autoreview_held(pstore, wo["id"], still, settling=True)
             pstore.add_event(wo["id"], "autoreview_escalated", {
                 "assumption_id": assumption["id"], "n": numbered.get("n"),
                 "reason": still.reason, "stakes": ruling.stakes,
                 "model": ruling.model, "neo_question_id": q["id"],
                 "overridden": False, "dropped": still.code})
+            if retry:
+                # §4.3, IN THIS ORDER and after the record of the drop is complete. NOT
+                # `mark(escalated)`: `escalated` means the user must answer, and after the
+                # clear below nobody can. A ruling that reached here was already recorded
+                # `answered` by `neo.drain_queue`, so `supersede`'s OPEN_Q_STATUSES guard
+                # makes this a no-op on that path and a real close on any other — either
+                # way the row is off `ops._neo_attention`, which is what §4.3 requires.
+                # SUPERSEDE FIRST: clearing the link makes the question unresolvable
+                # through `assumption_for_question`, and
+                # `invariants._stale_assumption_question` deliberately leaves an
+                # unresolvable row alone — so an `escalated` question plus a cleared link
+                # would sit in `ops._neo_attention` for ever.
+                neo_store.supersede(
+                    q["id"],
+                    f"SUPERSEDED — the OS dropped its own ruling: {still.reason}. A "
+                    f"fresh confirmation will be asked against the delivered result.",
+                    still.reason)
+                pstore.clear_assumption_confirmation(assumption["id"])
             log.info("auto-review dropped its ruling on assumption #%s of %s: %s",
                      numbered.get("n"), wo["id"], still.reason)
             return
@@ -6271,8 +7556,11 @@ class Daemon:
         if not (ruling.accept or objected):
             if not verdict.get("escalate"):
                 # `_deliver_assumption_verdict`'s branch, for its reason: Neo answered and
-                # the answer is not what happens, so the record has to say whose this is.
-                neo_store.mark(q["id"], "escalated", reason=ruling.reason)
+                # the answer is not what happens, so the record has to say whose this
+                # is — and which fact made it theirs.
+                neo_store.mark(q["id"], "escalated", reason=ruling.reason,
+                               cause=autoreview.escalation_cause(
+                                   ruling, escalate=bool(verdict.get("escalate"))))
             pstore.add_event(wo["id"], "autoreview_escalated", {
                 "assumption_id": assumption["id"], "n": assumption.get("n"),
                 "reason": ruling.reason, "stakes": ruling.stakes,
@@ -6291,12 +7579,21 @@ class Daemon:
                  "accept" if ruling.accept else "object", ruling.reason)
 
     def _carry_catch_up(self, project: ProjectSpec, store: ProjectStore, wo: dict,
-                        pr: Any, decision: Any) -> bool:
+                        pr: Any, decision: Any) -> CarryOutcome:
         """Prove this head added no unjudged commit, and carry the verdict onto it.
 
         docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §3.4.
-        True when the verdict now covers the live head, so the caller may re-decide on the
-        same tick. False is the ordinary answer and writes nothing but the refusal.
+        `carried` when the verdict now covers the live head, so the caller may re-decide
+        on the same tick. Not carried is the ordinary answer and writes nothing but the
+        refusal.
+
+        `rebind` is the SECOND answer, for the case the predecessor spec left open: the
+        merge the OS asked for resolved a conflict, so proof (b) fails on content nobody
+        judged and the round that reads it is the OS's own doing (spec
+        docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.2).
+        The chain is walked on that branch ONLY when `ops.rebind_possible` says a rebind
+        could be opened — the walk is up to `ci.CHAIN_LIMIT` `gh api` calls on a pull
+        request polled every couple of minutes, and no other tick may pay it.
 
         `_rejudge_moved_head`'s division of labour: the `gh` and the `git` are here, the
         rule is `ops.carry_merge_chain`, and NAMING THE PROOF THAT FAILED is this method's
@@ -6315,21 +7612,22 @@ class Daemon:
         waiting for it would defer the carry into exactly the window where a round gets
         spent. Whether the pull request merges is still `decide`'s six conditions, re-asked.
         """
-        from . import branchproof, ci, github, ops
+        from . import branchproof, ops
 
         judged = str(getattr(decision, "judged_sha", "") or "")
         head = str(getattr(decision, "head_sha", "") or "")
         base = str(getattr(pr, "base_ref", "") or "")
         pr_url = str(wo.get("pr_url") or "")
         if not judged or not head or head == judged or not base or not pr_url:
-            return False
+            return CarryOutcome(False, False)
 
-        def refuse(proof: str, detail: str, chain: tuple[str, ...] = ()) -> bool:
+        def refuse(proof: str, detail: str,
+                   chain: tuple[str, ...] = ()) -> CarryOutcome:
             if ops.record_carry_refusal(store, wo, judged=judged, head_sha=head,
                                         proof=proof, detail=detail, chain=chain):
                 log.info("[%s] %s: not carrying round %s onto %s — %s", project.name,
                          wo["id"], getattr(decision, "round_n", 0), head[:10], detail)
-            return False
+            return CarryOutcome(False, False)
 
         pull_ref = f"refs/pull/{pr_url.rsplit('/', 1)[-1]}/head"
         if not branchproof.fetch(project.path, base, pull_ref):
@@ -6343,20 +7641,35 @@ class Daemon:
                           "the diff this branch adds on top of its merge base could not "
                           "be computed locally")
         if before != after:
-            return refuse(ops.PROOF_PATCH_ID,
-                          f"the diff on {head[:10]} is not the diff round "
-                          f"{getattr(decision, 'round_n', 0)} read, so the merge resolved "
-                          f"content nobody judged")
-        try:
-            chain = ci.base_merge_chain(pr_url, judged, head, base_ref=base,
-                                        cwd=project.path)
-        except github.GitHubError as exc:
-            return refuse(ops.PROOF_READ,
-                          f"GitHub would not say what {head[:10]} merged ({exc})")
-        except Exception:  # noqa: BLE001 — a parked pull request stays parked
-            log.exception("[%s] could not read the chain behind %s", project.name,
-                          wo["id"])
-            return False
+            # THE REFUSAL IS UNCHANGED, `(head, proof)` dedupe and all: the diff really
+            # did change and it is still said once. What follows it is the rebind
+            # question — asked cheaply first, walked only if it could be answered yes
+            # (spec 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.2).
+            refuse(ops.PROOF_PATCH_ID,
+                   f"the diff on {head[:10]} is not the diff round "
+                   f"{getattr(decision, 'round_n', 0)} read, so the merge resolved "
+                   f"content nobody judged")
+            if not ops.rebind_possible(store, wo, head=head, project=project.name,
+                                       cfg=project.validation):
+                return CarryOutcome(False, False)
+            def unreadable(exc: Exception) -> CarryOutcome:
+                log.info("[%s] %s: GitHub would not say what %s merged (%s)",
+                         project.name, wo["id"], head[:10], exc)
+                return CarryOutcome(False, False)
+
+            chain, failed = self._merge_chain(project, wo, pr_url=pr_url, judged=judged,
+                                              head=head, base=base,
+                                              github_error=unreadable)
+            if failed is not None:
+                return failed
+            return CarryOutcome(False, bool(chain))
+        chain, failed = self._merge_chain(
+            project, wo, pr_url=pr_url, judged=judged, head=head, base=base,
+            github_error=lambda exc: refuse(
+                ops.PROOF_READ,
+                f"GitHub would not say what {head[:10]} merged ({exc})"))
+        if failed is not None:
+            return failed
         if not chain:
             return refuse(ops.PROOF_CHAIN,
                           f"{head[:10]} is not {judged[:10]} plus merges of {base} or "
@@ -6374,11 +7687,38 @@ class Daemon:
         log.info("[%s] %s: round %s passed on %s and now covers %s — %d merge(s), %d of "
                  "%s, no round spent", project.name, wo["id"], carried["round"],
                  judged[:10], head[:10], len(chain), len(bases), base)
-        return True
+        return CarryOutcome(True, False)
+
+    @staticmethod
+    def _merge_chain(project: ProjectSpec, wo: dict, *, pr_url: str, judged: str,
+                     head: str, base: str,
+                     github_error: Callable[[Exception], CarryOutcome],
+                     ) -> tuple[tuple[tuple[str, str, bool], ...] | None,
+                                CarryOutcome | None]:
+        """Walk `ci.base_merge_chain`, or say why it could not be walked.
+
+        `(chain, None)` on success and `(None, outcome)` on failure — ONE copy of the
+        walk for `_carry_catch_up`'s two branches, which asked GitHub the same question
+        and differed only in what a `GitHubError` means. That is `github_error`'s job:
+        the rebind branch has already written its refusal and only logs, the main path
+        refuses with `ops.PROOF_READ`. Anything else is a parked pull request staying
+        parked, which is the same answer on both.
+        """
+        from . import ci, github
+
+        try:
+            return ci.base_merge_chain(pr_url, judged, head, base_ref=base,
+                                       cwd=project.path), None
+        except github.GitHubError as exc:
+            return None, github_error(exc)
+        except Exception:  # noqa: BLE001 — a parked pull request stays parked
+            log.exception("[%s] could not read the chain behind %s", project.name,
+                          wo["id"])
+            return None, CarryOutcome(False, False)
 
     def _catch_up_with_base(self, project: ProjectSpec, store: ProjectStore, wo: dict,
                             pr: Any) -> Any:
-        """Merge the base into this branch, when it is behind. Returns the head to decide on.
+        """Merge the base into this branch, when it is behind. Returns an `ops.CatchUp`.
 
         docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §5. The
         OS's own gate reviewer refuses a merge whose CI ran against a base behind `main`,
@@ -6386,10 +7726,24 @@ class Daemon:
         exactly that reason — so the move is compulsory and the OS may as well make it,
         now that §3's carry means it costs no round.
 
-        **RETURNS THE RE-READ `PullRequest`**, `heal_inherited_failure`'s contract and for
-        its reason: the caller must decide against the head the update produced, not the
-        one it replaced. The pull request it was given comes back unchanged whenever
-        nothing happened, which is the ordinary answer.
+        **IT RETURNS AN OUTCOME AND NOT A PULL REQUEST** (spec 2026-09-28 §3.4, issue
+        #837). The old return type could not tell "already up to date" from "behind and I
+        could not fix it this tick", so the caller's `head_oid` comparison read every
+        refusal as up to date and fell straight through to `automerge.propose` — which is
+        how gate 308 asked Neo to merge a commit that did not contain `main`'s tip.
+        `CatchUp.pr` is the pull request to decide against: the one it was given, unchanged
+        unless the update ran (`heal_inherited_failure`'s contract, for its reason).
+
+        **THE BASE TIP IS READ LOCALLY, AFTER THE FETCH, AND IT IS THE KEY** (Amendment B).
+        `pr.base_oid` is GitHub's cached `baseRefOid`; on the measured incident it lagged
+        the real tip of `main` by three commits and 5.3 hours, so the ancestry test said
+        "up to date" and `ops.base_heal_spent` was keyed on a commit that was not the base.
+        Every one of the three now uses the freshly-read tip.
+
+        The guard order differs from §3.4's table in one place, and deliberately: "not
+        needed" is judged BEFORE the two spending guards. Keyed on the fresh tip, a branch
+        that is already up to date must never read as `EXHAUSTED` — that outcome never
+        clears on its own and would park a mergeable pull request for ever.
 
         **THE SEVEN GUARDS ARE §5.3 AND EVERY ONE OF THEM DEFERS RATHER THAN DROPS.** In
         order, cheapest first: a turn in flight or an undelivered message (never move the
@@ -6411,25 +7765,36 @@ class Daemon:
         wo_id = wo["id"]
         base = str(getattr(pr, "base_ref", "") or "")
         pr_url = str(wo.get("pr_url") or "")
-        base_oid = str(getattr(pr, "base_oid", "") or "")
         if not base or not pr_url:
-            return pr
+            return ops.CatchUp(pr, ops.CATCH_UP_FAILED,
+                               "the work order records no pull request or no base branch")
         if (worker_session.busy(store, wo_id) or store.queued_messages(wo_id)
                 or store.validation_round_open(wo_id)):
             log.debug("[%s] %s is in flight — catching up with %s deferred",
                       project.name, wo_id, base)
-            return pr
+            return ops.CatchUp(pr, ops.CATCH_UP_DEFERRED,
+                               "the turn, message or validation round in flight")
+        pull_ref = f"refs/pull/{pr_url.rsplit('/', 1)[-1]}/head"
+        if not branchproof.fetch(project.path, base, pull_ref):
+            # logged there, with the refs it asked for
+            return ops.CatchUp(pr, ops.CATCH_UP_FAILED,
+                               f"the checkout could not fetch `{base}`")
+        base_oid = branchproof.tip(project.path, f"origin/{base}")
+        # Every return from here down carries the FETCHED tip — the caller's reasons quote
+        # it and never `pr.base_oid` (spec 2026-09-28 §3.1).
+        if not ops.catch_up_needed(pr, repo=project.path, base_tip=base_oid):
+            return ops.CatchUp(pr, ops.CATCH_UP_NOT_NEEDED, "", base_tip=base_oid)
         if base_oid and ops.base_heal_spent(store, wo_id, base_oid):
-            return pr
+            return ops.CatchUp(pr, ops.CATCH_UP_EXHAUSTED,
+                               f"this branch has already been rebuilt against "
+                               f"{base_oid[:10]} once", base_tip=base_oid)
         if ops.catch_up_attempts(store, wo_id) >= ops.CATCH_UP_MAX:
             log.debug("[%s] %s has been caught up with %s %d times — leaving it held",
                       project.name, wo_id, base, ops.CATCH_UP_MAX)
-            return pr
-        pull_ref = f"refs/pull/{pr_url.rsplit('/', 1)[-1]}/head"
-        if not branchproof.fetch(project.path, base, pull_ref):
-            return pr           # logged there, with the refs it asked for
-        if not ops.catch_up_needed(pr, repo=project.path):
-            return pr
+            return ops.CatchUp(pr, ops.CATCH_UP_EXHAUSTED,
+                               f"it has already been caught up {ops.CATCH_UP_MAX} time(s),"
+                               f" which is the cap ({ops.CATCH_UP_MAX})",
+                               base_tip=base_oid)
 
         # GUARD 6, and it is `heal_inherited_failure`'s review-round-1 note: `pr` was read
         # at the top of the poll, and a worker turn can end and push in the meantime. The
@@ -6440,13 +7805,16 @@ class Daemon:
         except github.GitHubError as e:
             log.debug("[%s] could not re-read %s before catching it up: %s",
                       project.name, pr_url, e)
-            return pr
+            return ops.CatchUp(pr, ops.CATCH_UP_FAILED,
+                               f"the OS could not re-read the pull request: {e.reason}",
+                               base_tip=base_oid)
         judged = ProjectStore.validated_head(
             store.latest_validation_round(wo_id=wo_id)) or ""
         head_before = fresh.head_oid
         if not head_before or head_before != judged:
-            return fresh
-        base_oid = fresh.base_oid or base_oid
+            return ops.CatchUp(fresh, ops.CATCH_UP_DEFERRED,
+                               "the push that moved the head off the judged commit",
+                               base_tip=base_oid)
         try:
             ci.update_branch(pr_url, cwd=project.path)
         except github.GitHubError as e:
@@ -6455,7 +7823,7 @@ class Daemon:
             ops.record_base_update_failed(store, wo, base=base, base_sha=base_oid,
                                           reason=e.reason,
                                           cause=ops.BASE_UPDATE_BEHIND)
-            return fresh
+            return ops.CatchUp(fresh, ops.CATCH_UP_FAILED, e.reason, base_tip=base_oid)
         try:
             fresh = github.pr_view(pr_url, cwd=project.path)
         except github.GitHubError as e:
@@ -6470,10 +7838,10 @@ class Daemon:
         log.info("[%s] %s was behind %s (%s) — caught it up, %s is now %s",
                  project.name, pr_url, base, base_oid[:10], head_before[:10],
                  fresh.head_oid[:10])
-        return fresh
+        return ops.CatchUp(fresh, ops.CATCH_UP_DONE, "", base_tip=base_oid)
 
     def _rejudge_moved_head(self, project: ProjectSpec, store: ProjectStore,
-                            wo: dict, decision: Any) -> None:
+                            wo: dict, decision: Any, *, rebind: bool = False) -> None:
         """Re-open a round on a head the OS's own repair loop moved. Usually: nothing.
 
         The policy is `ops.rejudge_moved_head` and lives there, testable without a
@@ -6488,16 +7856,24 @@ class Daemon:
 
         try:
             out = ops.rejudge_moved_head(store, project.path, wo, project=project.name,
-                                         cfg=project.validation, decision=decision)
+                                         cfg=project.validation, decision=decision,
+                                         rebind=rebind)
         except Exception:  # noqa: BLE001 — a parked pull request stays parked
             log.exception("[%s] could not re-judge %s", project.name, wo["id"])
             return
         if out is None:
             return
         if out["declined"]:
-            log.info("[%s] %s: the head moved to %s and round %s would be the last — "
-                     "leaving it for the user", project.name, wo["id"],
-                     out["head_sha"][:10], out["next_round"])
+            # Two causes, two sentences: `next_round` is on the budget decline only
+            # (spec 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.3).
+            if out.get("cause") == ops.REBIND_EXHAUSTED:
+                log.info("[%s] %s: the head moved to %s and the OS has re-judged this "
+                         "merge %s time(s) — leaving it for the user", project.name,
+                         wo["id"], out["head_sha"][:10], out["rebinds"])
+            else:
+                log.info("[%s] %s: the head moved to %s and round %s would be the "
+                         "last — leaving it for the user", project.name, wo["id"],
+                         out["head_sha"][:10], out["next_round"])
         else:
             log.info("[%s] %s: the head moved from %s to %s — re-judging it as round %s",
                      project.name, wo["id"], out["judged_sha"][:10],
@@ -6525,6 +7901,45 @@ class Daemon:
                      pr.base_ref, exc)
             protection = automerge.PROTECTION_UNREADABLE
         return automerge.protection_fact(protection, pr.base_ref)
+
+    def _supersede_stale_request(self, store: ProjectStore, approval: dict,
+                                 pr: Any, *, base_tip: str = "") -> None:
+        """Close a pending merge request whose base has moved. Spec 2026-09-28 §3.6.
+
+        `base_tip` is a tip read LOCALLY, after a fetch, and the reason names a commit
+        only when one is passed: `pr.base_oid` is the cached read this whole spec
+        establishes is untrustworthy, so it is never quoted. `approval["base_oid"]` still
+        is — that one is a recorded fact about the request.
+
+        NEVER A VERDICT: nothing is authorised and nothing is refused, because the CI
+        evidence in the request stopped describing what the merge would land on. The
+        command string stays blocked, so the next tick catches the branch up and files a
+        fresh request on the new commit.
+
+        `supersede_approval` is a NO-OP on anything already decided, which is what makes
+        the race safe: Neo can answer between the read and the write, and then
+        `automerge.apply`'s precondition is what stops the merge instead. A Neo question
+        that was already answered returns False from `supersede` for the same reason —
+        `gates.open_gate` is the precedent.
+        """
+        from .neo_store import NeoStore
+
+        base = str(getattr(pr, "base_ref", "") or "the base")
+        moved = f" to {base_tip[:10]}" if base_tip else ""
+        reason = (f"`{base}` has moved{moved} "
+                  f"since this request was filed against "
+                  f"{str(approval['base_oid'] or '')[:10] or 'an unrecorded base'}; the "
+                  f"CI evidence in it no longer describes what this merge would land on. "
+                  f"Nothing is authorised and nothing is refused — the OS catches the "
+                  f"branch up and files a fresh request on the new commit.")
+        store.supersede_approval(approval["id"], reason)
+        if approval["neo_question_id"]:
+            neo_store = NeoStore()
+            try:
+                neo_store.supersede(approval["neo_question_id"],
+                                    f"SUPERSEDED — `{base}` moved", reason)
+            finally:
+                neo_store.close()
 
     def _note_automerge_held(self, store: ProjectStore, wo_id: str,
                              decision: Any) -> None:
@@ -6929,10 +8344,14 @@ class Daemon:
         order is on it and closed when that work lands — without which the tracker is a
         thing only a human maintains, which is the whole of the issue.
 
-        **A COMPARISON, NOT A SCHEDULE OF POKES.** `issues.desired_state` derives where
-        the issue belongs from the work order, `issue_state` records where the OS last
-        put it, and nothing is sent while the two agree. So the common case — every
-        tracked work order already reconciled — costs ONE indexed query for the whole
+        **A LATCHED COMPARISON, NOT A SCHEDULE OF POKES.** `issues.desired_state` derives
+        where the issue belongs from the work order, `issue_state` records where the OS
+        last put it, and `issues.needs_sync` answers whether anything may still be done —
+        the comparison, plus the terminal case a bare comparison could never converge on,
+        a column latched at CLOSED (issue #961,
+        docs/superpowers/specs/2026-10-07-a-closed-issue-the-os-cannot-move-converges.md).
+        Nothing is sent while it says no. So the common case — every tracked work order
+        already reconciled — costs ONE indexed query for the whole
         project and no subprocess at all, and a project that has never filed a bug does
         not even pay that (the query returns nothing).
 
@@ -6947,9 +8366,9 @@ class Daemon:
         from . import github, issues
 
         for wo in tracked:
-            want = issues.desired_state(store, wo)
-            if want == (wo.get("issue_state") or ""):
+            if not issues.needs_sync(store, wo):
                 continue
+            was = (wo.get("issue_state") or "")
             try:
                 applied = issues.record_applied(store, wo, project.bugs.label)
             except github.GitHubError as e:
@@ -6981,7 +8400,9 @@ class Daemon:
             # order carries an honest low/medium rating or none at all, so the rating
             # column alone could never see that they asked for this in production now
             # (2026-09-27 spec §2).
-            if (applied == issues.CLOSED
+            # `was` is what makes the one-shot contract TRUE instead of assumed: issue
+            # #961's replay re-read the same closed issue and re-filed the release.
+            if (applied == issues.CLOSED and was != issues.CLOSED
                     and ops_mod.routes_on_pull_request(store, wo)
                     and (issues.dispatches(wo.get("issue_priority") or "")
                          or issues.was_expedited(wo))):
@@ -7055,10 +8476,11 @@ class Daemon:
                 continue
 
     #: The key under a work order's `metadata` that says "this order exists to ship
-    #: fixes, and these are the ones it is shipping". The batch lives HERE rather than in
-    #: a column because it is a list that grows while the order waits, and because
-    #: nothing outside this file has a reason to query it.
-    RELEASE_BATCH_KEY = "release_for_issues"
+    #: fixes, and these are the ones it is shipping". The batch lives in `metadata`
+    #: rather than in a column because it is a list that grows while the order waits.
+    #: An ALIAS since 2026-09-29 spec §1 — `release.BATCH_KEY` is the literal's home now
+    #: that `ops` reads it too.
+    RELEASE_BATCH_KEY = release.BATCH_KEY
 
     #: What the release work order is told to do. It runs the ORDINARY release path —
     #: `scripts/shipit.sh --stage`, through the gate, exactly as a human-filed release
@@ -7076,15 +8498,18 @@ carrying them:
 
 Run the ordinary release path and nothing else:
 
-    scripts/shipit.sh --stage --wo {wo_id}
+    scripts/shipit.sh --stage --wo {wo_id} --base <sha>
 
 That is a PRIVILEGED ACTION and it will be gated — that is correct and expected. Make \
 your case first (`jarvis gate request`), and read `jarvis brief gates` before you do. Do \
 NOT invent a second release path, do not restart any service by hand, and do not drop \
-`--stage`: an inline restart kills your own session mid-turn.
+`--stage`: an inline restart kills your own session mid-turn. Dropping or changing \
+`--base` after approval invalidates the grant: the approved string names the commit.
 
-Check `main` is green before you ask. If it is not, say so and stop — a release is not \
-the place to fix a red build."""
+Resolve `<sha>` BEFORE you ask, so the reviewer and the command name one commit: the \
+newest commit on `origin/main` that carries every fix listed above and whose CI is \
+green, written out in full (40 characters). If that base is red, or you cannot read \
+CI's verdict on it, say so and stop — a release is not the place to fix a red build."""
 
     def ensure_release(self, project: ProjectSpec, store: ProjectStore,
                        wo: dict) -> str:
@@ -7098,10 +8523,25 @@ the place to fix a red build."""
 
         Idempotent for the same reason the rest of the lifecycle is — a fix already in
         the batch is not added twice, so a sweep that runs again changes nothing.
+
+        **A candidate whose worker has DELIVERED ships nothing more** (issue #945, Neo
+        question 1335): `OPEN_STATUSES` answers "is this order settled", and four of its
+        names are reached only after a delivery, so wo-29f44978 grew a batch three minutes
+        after its turn ended and no tag ever carried the fix. The `finished` event is the
+        discriminator, and the already-present url is read BEFORE any write so the §2
+        sweep is never raced by a second order filed here.
+
+        **Except for a payload production is ALREADY RUNNING** (issue #934, Neo question
+        1329 option A): batching against open orders alone meant every fix landing after
+        the previous release settled earned a tag whose only commit was its own version
+        bump. `release.overtaken_by` answers that at filing time, where
+        `settle_shipped_releases` answers it a tick too late to beat dispatch.
         """
         from . import db, issues
         from .project_store import OPEN_STATUSES
 
+        if self._already_live(project, store, wo):
+            return ""
         url = wo.get("issue_url") or ""
         # Expedited first: an order can be both, and the user's scheduling act is the
         # one that is never contingent on a verdict (spec §4).
@@ -7110,22 +8550,32 @@ the place to fix a red build."""
         line = (f"- {url} — fixed by `{wo['id']}`"
                 + (f" ({wo['pr_url']})" if wo.get("pr_url") else "")
                 + f" — {reason}")
+        candidates: list[tuple[dict[str, Any], dict[str, Any], list]] = []
         for candidate in store.list_work_orders(statuses=OPEN_STATUSES,
                                                 include_hidden=True):
             meta = db.from_json(candidate.get("metadata"), {}) or {}
             batch = meta.get(self.RELEASE_BATCH_KEY)
-            if not isinstance(batch, list):
+            if isinstance(batch, list):
+                candidates.append((candidate, meta, batch))
+        # §1.3, pass one over the one read: an url already batched anywhere is never added
+        # twice and never earns a second order, finished holder or not.
+        for candidate, _meta, batch in candidates:
+            if url in batch:
+                return str(candidate["id"])
+        # §1.1-1.2: `finished` is written by `jarvis wo finish`, which every delivery goes
+        # through. Skip and keep looking; no candidate falls through to a fresh order.
+        for candidate, meta, batch in candidates:
+            if store.events_of_kind(candidate["id"], "finished"):
                 continue
-            if url not in batch:
-                store.update_work_order(
-                    candidate["id"],
-                    metadata=db.to_json({**meta,
-                                         self.RELEASE_BATCH_KEY: [*batch, url]}),
-                    description=f"{candidate.get('description') or ''}\n{line}")
-                store.add_event(candidate["id"], "release_batched",
-                                {"issue_url": url, "wo_id": wo["id"]})
-                log.info("[%s] %s joins the pending release %s", project.name, url,
-                         candidate["id"])
+            store.update_work_order(
+                candidate["id"],
+                metadata=db.to_json({**meta,
+                                     self.RELEASE_BATCH_KEY: [*batch, url]}),
+                description=f"{candidate.get('description') or ''}\n{line}")
+            store.add_event(candidate["id"], "release_batched",
+                            {"issue_url": url, "wo_id": wo["id"]})
+            log.info("[%s] %s joins the pending release %s", project.name, url,
+                     candidate["id"])
             return str(candidate["id"])
 
         # The brief names the work order's OWN id (`shipit.sh --wo`), which does not
@@ -7142,6 +8592,48 @@ the place to fix a red build."""
         log.info("[%s] %s landed — filed release %s", project.name, url, fresh["id"])
         return str(fresh["id"])
 
+    #: Said on the FIXING order when no release was filed because a live tag already
+    #: carries the fix (issue #934). A SIBLING of `OVERTAKEN_EVENT`, not a reuse: that one
+    #: is a note on a release order that still exists, this one records a release that was
+    #: never filed, and one kind meaning both would make the timelines unreadable.
+    ALREADY_SHIPPED_EVENT = "release_already_shipped"
+
+    def _already_live(self, project: ProjectSpec, store: ProjectStore,
+                      wo: dict) -> bool:
+        """Is this landed fix already in production — so there is nothing left to ship.
+
+        Checked BEFORE the batch loop: an already-live fix must neither file a fresh order
+        nor join an open batch, which would keep that order waiting on work already out.
+
+        **EVERY DOUBT FILES.** The call is one-shot: `sync_issues` fires it only when the
+        `issue_state` column actually CHANGED to CLOSED, a check and no longer an
+        assumption (issue #961). So an unreadable repository or production
+        checkout falling through is mandatory, not merely safe. Tag but not live falls
+        through too, and keeps reaching `settle_shipped_releases`' not-live path.
+        """
+        from . import release
+
+        # `overtaken_by` reads `jarvis-*` tags and the OS's own production checkout, so
+        # the scope is the project that IS the OS, by origin. Issue 956: asked by path
+        # containment this never matched in production — the install is in the deployed
+        # checkout, which no catalog path contains — and six fixes already live were
+        # filed for release again.
+        if project.name != self._os_project():
+            return False
+        sha = self._merge_commit_of(project, store, wo)
+        if not sha:
+            return False
+        found = release.overtaken_by(project.path, [sha])
+        if found.error or not (found.tag and found.live):
+            return False
+        store.add_event(str(wo["id"]), self.ALREADY_SHIPPED_EVENT, {
+            "tag": found.tag, "shas": [sha], "deployed": found.deployed,
+            "detail": (f"{found.tag} already carries this fix and production runs "
+                       f"{found.deployed} — no release filed")})
+        log.info("[%s] %s is already live in %s — no release filed", project.name,
+                 wo["id"], found.deployed)
+        return True
+
     #: How long a red base defers a release order's dispatch. Only a RE-CHECK INTERVAL:
     #: a fixed `main` ships within five minutes, so being wrong about the number is
     #: cheap, and it is deliberately not a config key until someone wants a different one.
@@ -7151,13 +8643,25 @@ the place to fix a red build."""
     #: (2026-09-27 spec §5.2).
     RED_HOLD_EVENT = "release_held_red_base"
 
+    #: How long `main` may stay red before a release order stops waiting and asks the
+    #: user. Measured from the FIRST red hold on that order, so the pending-dispatch hold
+    #: (#807) and the mid-run re-park (`ops.defer_red_release`) share one clock. Six
+    #: hours: a red `main` here is repaired by a work-order round trip, which is hours and
+    #: not minutes, and an hour would ask the user about a break the fleet was already
+    #: fixing (2026-09-29 spec §3).
+    RED_PARK_AFTER_SECONDS = 6 * 3600
+
     def hold_red_release(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Keep a pending release order out of dispatch while the base branch is red.
 
         **THE HOLD IS ON DISPATCH, NEVER ON FILING** (Neo question 794). `ensure_release`
-        fires only on the issue-state TRANSITION, so a release skipped because `main`
-        was red would never be filed again and the fix would drop out of every future
-        batch. The order is always created; this defers it until the base is buildable.
+        fires only on a REAL issue-state transition — `sync_issues` compares the column
+        before and after the pass (issue #961) — so a release skipped because `main` was
+        red would never be filed again and the fix would drop out of every future batch.
+        The order is always created — the one exception is a payload production
+        already runs (#934), where there is nothing left to ship, and that one-shot call
+        is why every other case there falls through and files. This defers dispatch until
+        the base is buildable.
 
         Now that an expedited `low` ships on landing, releases go out unattended and
         routinely, and the only thing standing between a red `main` and a release was a
@@ -7172,13 +8676,17 @@ the place to fix a red build."""
         indexed listing when it owns no pending release, and a `gh` call only once a
         hold has lapsed — an in-force hold IS the rate limit.
 
+        Also where the hold STOPS: past `RED_PARK_AFTER_SECONDS` the release asks the
+        user instead (2026-09-29 spec §3).
+
         docs/superpowers/specs/2026-09-27-an-expedited-order-that-lands-ships-a-release.md §5
         """
-        from . import ci, evidence, github
+        from . import ci, evidence, github, ops
 
         # Same scope as `settle_shipped_releases`: the release path is the OS's own
-        # release script and the production checkout, both facts about this repository.
-        if project.name != self._os_owner():
+        # release script and the production checkout, both facts about this repository —
+        # so the project that IS the OS, by origin and not by path containment (956).
+        if project.name != self._os_project():
             return
         due: list[dict[str, Any]] = []
         for candidate in store.list_work_orders(statuses=("pending",),
@@ -7213,6 +8721,18 @@ the place to fix a red build."""
                 if wo.get("retry_after") is not None and not int(
                         wo.get("dispatch_attempts") or 0):
                     store.hold_dispatch(wo_id, until=None)
+                continue
+            # §3's threshold, HERE: this tick is the only step that visits a release
+            # already held in `pending`, so `ops.defer_red_release`'s check — which runs
+            # only when a worker delivers — can never fire for one. `_say_base_is_red`
+            # below is what writes RED_HOLD_EVENT, so on the FIRST red tick there is no
+            # clock yet and nothing parks; and a parked order is `needs_review`, which
+            # the `statuses=("pending",)` selection above stops returning.
+            first = ops.first_red_hold(store, wo_id)
+            if first is not None and db.now() - first >= self.RED_PARK_AFTER_SECONDS:
+                ops.park_red_release(store, wo_id, {
+                    "base": base, "head_sha": red.head_sha, "workflow": red.workflow,
+                    "run_id": red.run_id, "run_url": getattr(red, "run_url", "") or ""})
                 continue
             until = max(float(wo.get("retry_after") or 0),
                         db.now() + self.RED_HOLD_SECONDS)
@@ -7263,6 +8783,17 @@ the place to fix a red build."""
     #: read from GitHub once for a pull request that merged before the poller recorded it.
     MERGE_COMMIT_EVENT = "pr_merge_commit_recorded"
 
+    #: On the DROPPER: one url of its batch that no `jarvis-*` tag carried, re-filed by
+    #: `refile_dropped_fixes` (issue #945 spec §2.4). Also its per-url dedupe marker.
+    RELEASE_REFILED_EVENT = "release_refiled"
+
+    #: The other end, on the TARGET: where this entry of its batch came from.
+    RELEASE_REFILED_FROM_EVENT = "release_refiled_from"
+
+    #: Every url of a settled order's batch is accounted for, so later passes do zero git
+    #: and zero `gh` work (§2.2).
+    RELEASE_BATCH_CLEARED_EVENT = "release_batch_cleared"
+
     def settle_shipped_releases(self, project: ProjectSpec,
                                 store: ProjectStore) -> None:
         """End a release order whose fixes another release already shipped — issue #784.
@@ -7290,7 +8821,9 @@ the place to fix a red build."""
 
         # §8: the test reads `paths.production_code_dir()` and globs `jarvis-*`, both
         # facts about the OS's own release path. Another project keeps today's behaviour.
-        if project.name != self._os_owner():
+        # The project that IS the OS, by origin: path containment answers this wrong in
+        # production, where the install is in the deployed checkout (956).
+        if project.name != self._os_project():
             return
         orders: list[tuple[dict[str, Any], list[str]]] = []
         for candidate in store.list_work_orders(statuses=OPEN_STATUSES,
@@ -7412,6 +8945,97 @@ the place to fix a red build."""
         store.add_event(fix["id"], self.MERGE_COMMIT_EVENT,
                         {"pr_url": pr_url, "merge_commit": pr.merge_commit_oid})
         return pr.merge_commit_oid
+
+    def refile_dropped_fixes(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Re-file a fix a SETTLED release order dropped — issue #945 §2.
+
+        A batch entry has no post-condition. `_release_payload` and
+        `_settle_shipped_release` ask whether a tag carries a batch in order to CLOSE an
+        order; nothing ever asked whether a settled order's batch was carried, so every
+        route to a drop — a batch grown after the worker finished, a release that failed
+        holding fixes — was permanent and silent. Issue 903's merge commit `667bd494` is in
+        no tag because of it.
+
+        `ensure_release` fires only on the issue-state TRANSITION, so the landing signal is
+        spent once and nothing re-files: the tags are the only remaining witness. Pure
+        catch-up on the `poll_prs` beat, scoped like both its neighbours.
+
+        docs/superpowers/specs/2026-10-06-a-landed-fix-batched-into-a-release-order-that-already-finished.md
+        """
+        # §2.1: it reads `jarvis-*` tags and `paths.production_code_dir()`, facts about
+        # this repository and not about a project.
+        if project.name != self._os_owner():
+            return
+        # §2.2: the window is this project's claim about its release cadence.
+        since = db.now() - int(project.release.refile_window_days) * 86400
+        for wo in store.settled_release_orders(since):
+            try:
+                self._refile_dropped_batch(project, store, wo)
+            except Exception:  # noqa: BLE001 — one order must not stall the tick
+                log.exception("[%s] re-filing %s's dropped fixes failed", project.name,
+                              wo["id"])
+                continue
+
+    def _refile_dropped_batch(self, project: ProjectSpec, store: ProjectStore,
+                              wo: dict[str, Any]) -> None:
+        """One settled order, one decision per url — §2.3.
+
+        `_release_payload` is NOT reused: it returns None when ONE entry is unresolvable,
+        which is right for completing an order and wrong here, where an unreadable entry
+        must not hide a genuine drop in the entries beside it.
+        """
+        from . import release
+
+        wo_id = str(wo["id"])
+        if store.events_of_kind(wo_id, self.RELEASE_BATCH_CLEARED_EVENT):
+            return
+        meta = db.from_json(wo.get("metadata"), {}) or {}
+        batch = [str(u) for u in (meta.get(self.RELEASE_BATCH_KEY) or [])]
+        fixers = {}
+        for event in store.events_of_kind(wo_id, "release_batched"):
+            said = db.from_json(event["payload"], {})
+            fixers[said.get("issue_url")] = said.get("wo_id")
+        done = {db.from_json(e["payload"], {}).get("issue_url")
+                for e in store.events_of_kind(wo_id, self.RELEASE_REFILED_EVENT)}
+        accounted = True
+        for url in batch:
+            if url in done:
+                continue
+            fix = None
+            fix_id = fixers.get(url)
+            if fix_id:
+                try:
+                    fix = store.get_work_order(str(fix_id))
+                except KeyError:
+                    fix = None
+            sha = self._merge_commit_of(project, store, fix) if fix else ""
+            if not fix or not sha:
+                accounted = False  # §2.3.4: unresolved blocks the clear, so it is re-read
+                continue
+            found = release.overtaken_by(project.path, [sha])
+            # The TAG first: a tag read fine is not an unreadable tag list, whatever
+            # production is running — that is the deploy question (§2.3.3).
+            if found.tag:
+                continue
+            if found.error:
+                log.debug("[%s] %s: cannot tell whether %s shipped: %s", project.name,
+                          wo_id, url, found.error)
+                accounted = False
+                continue
+            target = self.ensure_release(project, store, fix)
+            if not target:
+                # `ensure_release` filing nothing is not a re-file (§2.3.4).
+                accounted = False
+                continue
+            store.add_event(wo_id, self.RELEASE_REFILED_EVENT, {
+                "issue_url": url, "release_wo_id": target, "fix_wo_id": str(fix["id"])})
+            store.add_event(target, self.RELEASE_REFILED_FROM_EVENT, {
+                "issue_url": url, "dropped_by": wo_id})
+            log.info("[%s] %s was dropped by %s and no tag carries it — re-filed as %s",
+                     project.name, url, wo_id, target)
+        if accounted:
+            store.add_event(wo_id, self.RELEASE_BATCH_CLEARED_EVENT,
+                            {"batch": batch})
 
     def _warn_issue_sync_broken(self, project: ProjectSpec, store: ProjectStore,
                                 error: Exception) -> None:

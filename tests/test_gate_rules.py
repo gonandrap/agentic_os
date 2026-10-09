@@ -765,6 +765,19 @@ def test_a_heredoc_handed_to_an_interpreter_is_a_canary():
     assert shape.position == gate_rules.HEREDOC and not shape.exemptible
 
 
+def test_a_pinned_release_command_still_gates():
+    """2026-10-01 spec §7: the pinned command is the only release command the OS asks
+    for, and it is the most argument-shaped of the group — the shape a learned exemption
+    about "a long quoted argument" would most plausibly clear by accident."""
+    command = ("scripts/shipit.sh --stage --wo wo-1234abcd "
+               "--base 442729f0c1e4b7a9d3f5068b2c4e7a1d9b0f3c58")
+    assert command in [c for _, c in gate_rules.SEED_CANARIES]
+    seeded = gate_rules.RuleSet.from_seeds()
+    action = classify(command, seeded)
+    assert action is not None and action.kind == "release"
+    assert seeded.check_canaries() == []
+
+
 def test_learning_the_commit_shape_does_not_clear_an_interpreter_heredoc(central):
     learn(central, HEREDOC_COMMIT)
     after = gate_rules.RuleSet.load(central)

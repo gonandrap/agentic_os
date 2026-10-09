@@ -307,3 +307,59 @@ def test_any_other_oserror_is_still_classified(monkeypatch, tmp_path) -> None:
         claude_cli.run_headless("hi", cwd=tmp_path)
 
     assert not isinstance(caught.value, claude_cli.InputTooLargeError)
+
+
+# -- how big was the prompt we sent? ---------------------------------------------------
+
+
+def test_the_input_size_lands_on_the_result_and_in_the_envelope(fake_claude,
+                                                                tmp_path) -> None:
+    """Measurement only, no cap. Spec §3,
+    docs/superpowers/specs/2026-09-26-bounded-model-inputs.md.
+
+    BOTH places, because both are read: `agent_usage.record` takes the sizes off a
+    `HeadlessResult` when a caller hands it one, and off the plain `usage` dict when the
+    caller passes `usage=result.usage` — which is what every seat, the panel and
+    `worker_session` do.
+    """
+    result = claude_cli.run_headless_result("hello there", system_prompt="be brief",
+                                            cwd=tmp_path)
+
+    assert (result.prompt_chars, result.system_prompt_chars) == (11, 8)
+    assert result.usage["prompt_chars"] == 11
+    assert result.usage["system_prompt_chars"] == 8
+
+
+def test_the_call_is_timed_and_the_latency_rides_on_both(fake_claude, tmp_path) -> None:
+    """The only latency the OS records on a default fleet (the panel ships disabled), so
+    it is measured here, one layer below every caller. Spec §3,
+    docs/superpowers/specs/2026-10-01-neo-observability.md.
+
+    BOTH places for `prompt_chars`' reason: `agent_usage.record` reads the dataclass when
+    a caller hands it one and the envelope when the caller passes `usage=result.usage`.
+    """
+    result = claude_cli.run_headless_result("hello there", cwd=tmp_path)
+
+    assert result.latency_ms is not None and result.latency_ms >= 0
+    assert result.usage["latency_ms"] == result.latency_ms
+
+
+def test_no_system_prompt_measures_zero_not_none(fake_claude, tmp_path) -> None:
+    """`len(system_prompt or "")`: a call with no system prompt sent no system prompt."""
+    result = claude_cli.run_headless_result("hi", cwd=tmp_path)
+
+    assert result.system_prompt_chars == 0 and result.prompt_chars == 2
+
+
+def test_output_that_is_not_json_still_carries_the_sizes(fake_claude, monkeypatch,
+                                                         tmp_path) -> None:
+    """The fallback path builds its own `HeadlessResult` and would otherwise report 0 —
+    the input was measured before the call, so nothing about the reply can unmeasure it.
+    """
+    monkeypatch.setattr(claude_cli, "_run", lambda *a, **k: "not json at all")
+
+    result = claude_cli.run_headless_result("hello there", system_prompt="be brief",
+                                            cwd=tmp_path)
+
+    assert result.usage is None                       # nothing to account
+    assert (result.prompt_chars, result.system_prompt_chars) == (11, 8)

@@ -209,6 +209,28 @@ def held(store: ProjectStore, wo_id: str, *,
     return _merge(spans, now)
 
 
+def held_family(store: ProjectStore, wo_ids: Sequence[str], *,
+                now: float | None = None) -> list[Hold]:
+    """Every interval NO member of this family could run — a feature order's hold.
+
+    A feature has no timeline of its own (`wo_events.wo_id` is a foreign key into
+    `work_orders`), so its hold is its family's, exactly as `ops._last_activity` reads its
+    activity. The three steps are not interchangeable: the raw `_episodes` of every member
+    are clipped against the UNION of every member's turns — a child held by the usage limit
+    while a sibling types is not a held feature — and only then merged, so two children
+    held by the same fleet limit count once. Spec §1 of
+    docs/superpowers/specs/2026-09-30-time-in-state-counts-a-usage-limit-hold-as-running.md
+    """
+    now = time.time() if now is None else now
+    episodes: list[Hold] = []
+    turns: list[dict[str, Any]] = []
+    for wo_id in wo_ids:
+        episodes.extend(_episodes(store.list_events(wo_id, limit=_EVENT_LIMIT)))
+        turns.extend(store.list_turns(wo_id))
+    episodes.sort(key=lambda h: h.started)
+    return _merge(_outside(episodes, _working(turns, now), now), now)
+
+
 #: Enough timeline for any conversation the fleet has run. `list_events` takes the OLDEST
 #: `limit` rows, so a cap that bit would drop the RECENT holds — the ones a live alarm is
 #: judged against — and report a busy work order as never held at all.
@@ -218,6 +240,24 @@ _EVENT_LIMIT = 10_000
 def _key(payload: dict[str, Any], field: str | None) -> Any:
     return None if field is None else payload.get(field)
 
+
+
+#: What ends a hold `_episodes` synthesised for a held round. The keyed `VALIDATION`
+#: closers plus the two resubmissions: every one of them is a round the hold cannot
+#: outlive. Spec §2d1.
+_SYNTHESIS_CLOSERS = frozenset({
+    "validation_submitted", "validation_forced", "validation_passed",
+    "validation_rejected", "validation_escalated", "validation_void",
+    "validation_failed",
+})
+
+
+def _close_synthesised(open_holds: dict[tuple[str, Any], Hold], done: list[Hold],
+                       cause: str, ts: float) -> None:
+    """End the unkeyed hold synthesised for a held round, if one is open."""
+    hold = open_holds.pop((cause, None), None)
+    if hold is not None:
+        done.append(Hold(hold.cause, hold.started, max(ts, hold.started)))
 
 
 def _episodes(events: Sequence[dict[str, Any]]) -> list[Hold]:
@@ -247,24 +287,27 @@ def _episodes(events: Sequence[dict[str, Any]]) -> list[Hold]:
                     hold = open_holds.pop((cause, key))
                     done.append(Hold(hold.cause, hold.started,
                                      max(ts, hold.started)))
+        # Every terminal of a held round ends the synthesised hold, not only the
+        # resubmission — spec §2d1 of
+        # docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
+        if kind in _SYNTHESIS_CLOSERS:
+            for synthesised in (PAUSE_USAGE_LIMIT, PAUSE_AUTH):
+                _close_synthesised(open_holds, done, synthesised, ts)
         # A round the panel could not run because the usage window was spent closes the
         # round and holds the WORK ORDER until the window reopens — a usage-limit hold
         # with no `turn_paused` behind it, because no worker turn was ever launched into
         # it. Ended by the next submission, which is the OS reopening the round itself.
         if kind == "validation_failed" and payload.get("cause") == VALIDATION_HELD_CAUSE:
+            # The unkeyed slot never loses an episode silently — spec §2d1 point 2.
+            _close_synthesised(open_holds, done, PAUSE_USAGE_LIMIT, ts)
             open_holds[(PAUSE_USAGE_LIMIT, None)] = Hold(PAUSE_USAGE_LIMIT, ts)
             continue
         # The same synthesis for a round whose seats could not authenticate — spec
         # docs/superpowers/specs/2026-09-26-the-panel-must-not-mistake-an-auth-failure-for-a-verdict.md §7.
         if kind == "validation_failed" and payload.get("cause") == VALIDATION_AUTH_CAUSE:
+            _close_synthesised(open_holds, done, PAUSE_AUTH, ts)
             open_holds[(PAUSE_AUTH, None)] = Hold(PAUSE_AUTH, ts)
             continue
-        if kind in ("validation_submitted", "validation_forced"):
-            for synthesised in (PAUSE_USAGE_LIMIT, PAUSE_AUTH):
-                reopened = open_holds.pop((synthesised, None), None)
-                if reopened is not None:
-                    done.append(Hold(reopened.cause, reopened.started,
-                                     max(ts, reopened.started)))
         opener = _OPEN.get(kind)
         if opener is None:
             continue

@@ -16,8 +16,9 @@ import stat
 import subprocess
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import pytest
 
@@ -140,6 +141,13 @@ def gate_environment(root: Path) -> dict[str, str]:
         # entire subject of that check (issue #202). Pointed at a directory inside the
         # sandbox holding no checkout: "no production deployment on this machine".
         paths.PRODUCTION_ROOT_ENV: str(root / "production"),
+        # The developer's own ~/.local/bin, which `INV-PROD-CLI` reads. Same trap as the
+        # two entries above: left ambient, `jarvis doctor` in a test passes or fails on
+        # whether the human has run install_prod_cli.sh — and it fails, which is the
+        # subject of that check. Pointed at an empty directory inside the sandbox: no
+        # wrapper installed, and PRODUCTION_ROOT_ENV above already means "no production
+        # deployment", so the check is silent either way.
+        release.CLI_BIN_DIR_ENV: str(root / "cli-bin"),
         # The production units export `JARVIS_ENV=production` and it OVERRIDES the
         # location check above, so a suite run BY A JARVIS WORKER inherits it from the
         # daemon and every test of the dev badge fails on a machine where the OS is
@@ -727,6 +735,20 @@ elif "-p" in argv and "--resume" not in argv:
         # nothing, and every "no alarm was raised" assertion passes for the wrong reason.
         # Claimed on the CHECKLIST, which only a sweep's system prompt carries.
         if "# The symptom checklist" in system:
+            # THE USAGE LIMIT, on the sweep's own call: the result-JSON shape
+            # `claude_cli.usage_limit` parses, so the test drives the REAL classifier
+            # into a real `UsageLimitError` (spec
+            # docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md).
+            if os.environ.get("FAKE_HEALTH_REFUSE"):
+                reset = os.environ.get("FAKE_CLAUDE_LIMIT_RESET",
+                                       "11:50pm (America/Los_Angeles)")
+                print(json.dumps({
+                    "type": "result", "subtype": "success", "is_error": True,
+                    "num_turns": 1, "total_cost_usd": 0, "duration_api_ms": 0,
+                    "terminal_reason": "api_error", "api_error_status": 429,
+                    "result": "You've hit your session limit · resets " + reset,
+                }))
+                sys.exit(1)
             if "FORCE_HEALTH_FAIL" in prompt:
                 sys.stderr.write("health sweep failed (test-forced)\n"); sys.exit(1)
             if "FORCE_HEALTH_GARBAGE" in prompt:
@@ -1235,6 +1257,13 @@ elif argv[:2] == ["pr", "view"]:
         sys.exit(1)
     fields = argv[argv.index("--json") + 1].split(",") if "--json" in argv else []
     print(json.dumps({k: v for k, v in pr.items() if not fields or k in fields}))
+elif argv[:2] == ["pr", "list"]:
+    # `gh pr list --head <branch> --state open --json url`, keyed by BRANCH: an
+    # unregistered branch answers an EMPTY ARRAY, which is gh's own answer and the fact
+    # `ops.submit_plan`'s refusal is built on. Registered by `set_open_pr`.
+    branch = argv[argv.index("--head") + 1] if "--head" in argv else ""
+    rows = json.loads(os.environ.get("FAKE_GH_OPEN_PRS", "{}")).get(branch, [])
+    print(json.dumps([{"url": u} for u in rows]))
 elif argv[:2] == ["run", "list"]:
     # The BASE branch's CI history. Keyed by branch, because the whole recogniser turns
     # on "was main red when this check ran", and a fake that answered one list for every
@@ -1878,6 +1907,18 @@ def fake_gh(tmp_path, monkeypatch):
             rows[repo] = branch
             path.write_text(json.dumps(rows))
 
+        open_prs: dict[str, list[str]] = {}
+
+        def set_open_pr(self, branch: str, *urls: str) -> None:
+            """What `gh pr list --head <branch> --state open` answers.
+
+            Keyed by branch and NOT taken from the `pr view` roster: that one carries no
+            `headRefName` for `set_pr`, so a fixture derived from it could not say "this
+            branch has an open pull request" without also registering a whole artifact.
+            """
+            self.open_prs[branch] = list(urls)
+            monkeypatch.setenv("FAKE_GH_OPEN_PRS", json.dumps(self.open_prs))
+
         def set_protection(self, branch: str, checks: list[str]) -> None:
             """Protect `branch`, requiring `checks`. Unregistered branches answer the
             404 GitHub answers for a branch nobody protects — the default, because that
@@ -2151,6 +2192,21 @@ def fake_claude(tmp_path, monkeypatch):
             monkeypatch.setenv("FAKE_CLAUDE_LIMIT_RESET", reset)
             monkeypatch.setenv("FAKE_CLAUDE_TURN", "rate_limit")
 
+        def health_rate_limited(self, reset: str = "11:50pm (America/Los_Angeles)"
+                                ) -> None:
+            """Refuse every subsequent HEALTH SWEEP for the usage limit.
+
+            `turns_rate_limited`'s sibling on the other call the OS makes: a sweep is a
+            `claude -p` with no session, so the turn path's refusal never reaches it.
+            Emits the same result-JSON shape, so the test drives the real classifier.
+            """
+            monkeypatch.setenv("FAKE_HEALTH_REFUSE", "1")
+            monkeypatch.setenv("FAKE_CLAUDE_LIMIT_RESET", reset)
+
+        def health_recover(self) -> None:
+            """Reopen the window — what the sweep is waiting for."""
+            monkeypatch.delenv("FAKE_HEALTH_REFUSE", raising=False)
+
         def turns_api_error(self, status: int = 500) -> None:
             """Break every subsequent turn with an API error, AFTER it has run.
 
@@ -2243,7 +2299,7 @@ def settle_turns():
 #: `design_doc`. Every plan must stand on one, so without a real file here each test that
 #: submits a plan would have to write one first. See §7 of
 #: docs/superpowers/specs/2026-08-23-the-work-order-record.md.
-FIXTURE_DESIGN_DOC = "docs/specs/exporter.md"
+FIXTURE_DESIGN_DOC = "docs/superpowers/specs/exporter.md"
 
 #: How many numbered sections the fixture document carries. A plan is refused unless every
 #: child names a section that resolves AND no two children name the same one, so a fixture
@@ -2402,6 +2458,55 @@ def signin(tmp_path, monkeypatch):
     return sign_in
 
 
+#: The commit `origin/<base>` is at, for every fixture that fakes the local checkout.
+FIXTURE_BASE_TIP = "ba5e11d000000000000000000000000000000f00"
+
+
+@pytest.fixture()
+def local_base(monkeypatch):
+    """What the local checkout answers about the base. Returns the state, to be changed.
+
+    Spec docs/superpowers/specs/2026-09-28-a-merge-checks-the-base-it-lands-on.md §3.1:
+    a merge re-reads `origin/<base>` and refuses if the judged head does not contain it.
+    The `project` fixture has no `origin`, so real git refuses and NOTHING would ever
+    merge in a test — this is the fresh, up-to-date base that used to be implied.
+
+    THE ONE FAKE OF `branchproof` FOR THE WHOLE SUITE — every test that needs the local
+    checkout's answers builds on this rather than re-patching the three functions.
+    `contains` is what the judged head carries: empty is a branch behind its base, which
+    is the incident's shape. `base_ancestors` is proof (a) item 6's other question — was
+    this a BASE merge — and None means yes to all of them.
+    """
+    from . import branchproof
+
+    state = {"fetch": True, "tip": FIXTURE_BASE_TIP, "contains": {FIXTURE_BASE_TIP},
+             "base_ancestors": None}
+
+    def is_ancestor(repo, ancestor, descendant):
+        if str(descendant).startswith("origin/"):
+            return state["base_ancestors"] is None or ancestor in state["base_ancestors"]
+        return ancestor in state["contains"]
+
+    monkeypatch.setattr(branchproof, "fetch", lambda repo, *refs: state["fetch"])
+    monkeypatch.setattr(branchproof, "tip", lambda repo, ref: state["tip"])
+    monkeypatch.setattr(branchproof, "is_ancestor", is_ancestor)
+    return state
+
+
+@pytest.fixture()
+def origins():
+    """Empty `schedule._ORIGIN_CACHE` around a test that creates or rewrites a remote.
+
+    The cache exists because `origin` does not move under a running daemon, which is the
+    one assumption a test adding a remote to a fresh repository breaks.
+    """
+    from . import schedule
+
+    schedule._ORIGIN_CACHE.clear()
+    yield
+    schedule._ORIGIN_CACHE.clear()
+
+
 @pytest.fixture()
 def project(tmp_path, claude_json):
     p = make_git_project(tmp_path, "proj_a")
@@ -2471,6 +2576,55 @@ def a_finding(key: str = "first-turn-reads", **overrides: Any) -> dict[str, Any]
     }
     finding.update(overrides)
     return finding
+
+
+def a_verdict(classification: str = "GAP", subject: str = "wo-11111111",
+              **overrides: Any) -> dict[str, Any]:
+    """One verdict `verdicts.parse_verdict` accepts, for any classification.
+
+    §2.4 of docs/superpowers/specs/2026-09-27-investigation-orders.md: the payload is
+    classification-dependent, so the helper carries EXACTLY the fields that
+    classification requires and none it forbids — a test that wants a rejection adds or
+    breaks one field and nothing else drags the document down with it.
+
+    Shared with the ops tests rather than re-declared per file, for `a_report`'s reason.
+    """
+    doc: dict[str, Any] = {
+        "subject": subject,
+        "classification": classification,
+        "gap_class": "stale-hold",
+        "root_cause": (f"The panel's give-up hold on {subject} is written once and never "
+                       f"re-derived, so the order stays parked after the cause clears."),
+        "evidence": [
+            {"source": f"jarvis wo show {subject}",
+             "quote": "validating — the panel gave up after 3 rounds (round 3, 6h ago)"},
+        ],
+    }
+    if classification == "GAP":
+        doc["proposed_fix"] = {
+            "title": "a stale panel hold parks an order after its cause has cleared",
+            "description": ("The hold the panel writes when it gives up is never "
+                            "re-derived, so an order whose pull request has since been "
+                            "updated stays parked for ever. Re-derive it on the "
+                            "reconcile tick that reads the pull request."),
+            "expected": "the hold clears on the next tick once the pull request moves",
+            "actual": "the order stays parked until a human runs `jarvis wo done`",
+            "priority": "high",
+            "detector": ("a reconciler invariant over state: an order in `validating` "
+                         "whose hold names a commit that is no longer the pull request's "
+                         "head"),
+            "remedy": "unblock",
+        }
+    elif classification == "WAITING_ON_USER":
+        doc["user_owes"] = f"assumption as-4 on {subject} is still pending review"
+    elif classification == "TRANSIENT":
+        doc["unsticks"] = {"what": "the reconciler re-reads the pull request and clears "
+                                   "the hold",
+                           "when": "next reconcile tick, within two minutes"}
+    elif classification == "ALREADY_TRACKED":
+        doc["duplicate_of"] = "#790"
+    doc.update(overrides)
+    return doc
 
 
 def a_report(**overrides: Any) -> dict[str, Any]:
@@ -2635,6 +2789,216 @@ class FaultyAnswerer:
             return dict(self.verdict)
         raise_fault(self.fault, self.reset_at)
         raise AssertionError(f"{self.fault} did not raise")
+
+
+class FleetCostFixture:
+    """Synthetic fleet state for `jarvis.fleetcost` — chosen timestamps, no real agent.
+
+    Every writer goes through the real schema (`ProjectStore`, `CentralStore`,
+    `NeoStore`) and then rewrites the timestamp columns, because the stores stamp
+    `db.now()` and a distribution report is entirely about WHEN a turn ran. The report
+    itself never opens any of these stores: it reads the same files `mode=ro`, which is
+    what `test_read_only` asserts.
+
+    Spec §7 of docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md.
+    """
+
+    def __init__(self, home: Path, project_path: Path, root: Path, catalog: Path,
+                 name: str = "proj_a") -> None:
+        self.home = home
+        self.project_path = project_path
+        self.transcript_root = root
+        self.catalog_path = catalog
+        self.name = name
+        self.db = paths.project_db_path(project_path)
+        self.os_db = paths.central_db_path()
+
+    # -- the project store ------------------------------------------------------
+
+    def _store(self) -> Any:
+        from .project_store import ProjectStore
+
+        return ProjectStore(self.project_path)
+
+    def order(self, title: str = "an order", *, status: str = "completed",
+              session_id: str = "", wo_id: str | None = None) -> str:
+        store = self._store()
+        try:
+            wo = store.create_work_order(title, "", wo_id=wo_id, status=status)
+            store.conn.execute("UPDATE work_orders SET session_id=? WHERE id=?",
+                               (session_id, wo["id"]))
+            store.conn.commit()
+            return str(wo["id"])
+        finally:
+            store.close()
+
+    def turn(self, wo_id: str, *, started_at: float, ended_at: float | None = None,
+             kind: str = "dispatch", cost_usd: float | None = None,
+             cost_source: str | None = "envelope",
+             usage: dict[str, Any] | None = None, state: str = "done") -> int:
+        """One settled (or still-running, with `ended_at=None`) turn at a chosen time."""
+        store = self._store()
+        try:
+            seq = store.conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 AS n FROM wo_turns WHERE wo_id=?",
+                (wo_id,)).fetchone()["n"]
+            cur = store.conn.execute(
+                """INSERT INTO wo_turns (wo_id, seq, kind, prompt, state, started_at,
+                                         ended_at, cost_usd, cost_source, usage_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (wo_id, seq, kind, "go", state, started_at, ended_at, cost_usd,
+                 cost_source if cost_usd is not None else None,
+                 json.dumps(usage) if usage else None))
+            store.conn.commit()
+            return int(cur.lastrowid or 0)
+        finally:
+            store.close()
+
+    def validation_round(self, wo_id: str, *, ts: float, round: int = 1) -> None:
+        store = self._store()
+        try:
+            store.conn.execute(
+                """INSERT INTO validation_rounds (wo_id, round, ts, fingerprint)
+                   VALUES (?,?,?,?)""", (wo_id, round, ts, f"fp-{round}"))
+            store.conn.commit()
+        finally:
+            store.close()
+
+    # -- the central and neo stores ---------------------------------------------
+
+    def os_call(self, kind: str, *, ts: float, wo_id: str = "", cost_usd: float = 0.0,
+                label: str = "", model: str = "claude-opus-5",
+                project: str | None = None) -> None:
+        from .central_store import CentralStore
+
+        central = CentralStore()
+        try:
+            central.conn.execute(
+                """INSERT INTO agent_calls (ts, project, wo_id, kind, label, model, ok,
+                                            cost_usd, input, cache_write, cache_read,
+                                            output)
+                   VALUES (?,?,?,?,?,?,1,?,0,0,0,0)""",
+                (ts, self.name if project is None else project, wo_id, kind, label,
+                 model, cost_usd))
+            central.conn.commit()
+        finally:
+            central.close()
+
+    def neo_question(self, wo_id: str, *, ts: float, question: str = "which way?") -> None:
+        from .neo_store import NeoStore
+
+        neo = NeoStore()
+        try:
+            neo.conn.execute(
+                "INSERT INTO questions (ts, project, wo_id, question) VALUES (?,?,?,?)",
+                (ts, self.name, wo_id, question))
+            neo.conn.commit()
+        finally:
+            neo.close()
+
+    def set_cost(self, **keys: Any) -> None:
+        """Override `os.cost.*` in the catalog this fixture registered.
+
+        The cap on orders walked and the row cap of the tool table are catalog settings
+        (Neo's rider: no module constant for anything tunable), so a test that wants to
+        see the cap BITE has to write one.
+        """
+        data = json.loads(self.catalog_path.read_text())
+        data["os"].setdefault("cost", {}).update(keys)
+        self.catalog_path.write_text(json.dumps(data))
+
+    # -- transcripts ------------------------------------------------------------
+
+    def call_row(self, *, at: float, read: int = 0, write: int = 0, out: int = 0,
+                 input: int = 0, mid: str = "", model: str = "claude-opus-5",
+                 tools: Sequence[tuple[str, str, dict]] = ()) -> dict:
+        """One assistant message — `usage.calls_of` reads one API call per row.
+
+        `tools` is (tool_use_id, name, input) triples, and SEVERAL on one row is how
+        Claude Code writes a parallel tool call: that is the case the char-proportional
+        split of one exact context delta exists for (§10.2).
+        """
+        return {
+            "type": "assistant",
+            "timestamp": (datetime.fromtimestamp(at, tz=timezone.utc)
+                          .isoformat().replace("+00:00", "Z")),
+            "message": {"id": mid or f"m-{at}-{read}-{write}", "model": model,
+                        "usage": {"input_tokens": input,
+                                  "cache_creation_input_tokens": write,
+                                  "cache_read_input_tokens": read,
+                                  "output_tokens": out},
+                        "content": [{"type": "tool_use", "id": tid, "name": name,
+                                     "input": arguments}
+                                    for tid, name, arguments in tools]},
+        }
+
+    def result_row(self, *results: tuple[str, str], at: float,
+                   is_error: bool = False) -> dict:
+        """One user row carrying `tool_result` blocks — (tool_use_id, text) pairs.
+
+        A `user` row, which is why `usage._assistant_messages` never saw one: it has no
+        `usage` object, so the ledger keyed by API call has no place to charge it.
+        """
+        return {
+            "type": "user",
+            "timestamp": (datetime.fromtimestamp(at, tz=timezone.utc)
+                          .isoformat().replace("+00:00", "Z")),
+            "message": {"content": [{"type": "tool_result", "tool_use_id": tid,
+                                     "content": text, "is_error": is_error}
+                                    for tid, text in results]},
+        }
+
+    def compact_row(self, *, at: float, pre: int = 200_000, post: int = 5_000) -> dict:
+        return {
+            "type": "system", "subtype": "compact_boundary",
+            "timestamp": (datetime.fromtimestamp(at, tz=timezone.utc)
+                          .isoformat().replace("+00:00", "Z")),
+            "compactMetadata": {"trigger": "manual", "preTokens": pre,
+                                "postTokens": post},
+        }
+
+    def transcript(self, session_id: str, rows: Sequence[dict],
+                   subagents: Sequence[Sequence[dict]] = ()) -> None:
+        directory = self.transcript_root / "-proj"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{session_id}.jsonl").write_text(
+            "".join(json.dumps(r) + "\n" for r in rows))
+        for i, sub in enumerate(subagents):
+            sub_dir = directory / session_id / "subagents"
+            sub_dir.mkdir(parents=True, exist_ok=True)
+            (sub_dir / f"agent-{i}.jsonl").write_text(
+                "".join(json.dumps(r) + "\n" for r in sub))
+
+
+@pytest.fixture()
+def fleet_fixture(jarvis_home, tmp_path, monkeypatch, claude_json):
+    """A registered project, a catalog, an `os.db` and a transcript root — all empty.
+
+    In `jarvis.testing` rather than a conftest so the eval and browser suites can reuse
+    it (mem:testing). The catalog is not decoration: classifying a cold boundary needs
+    `os.cold_prefix_floor`, which has no default anywhere.
+    """
+    from .central_store import CentralStore
+
+    project_path = make_git_project(tmp_path, "proj_a")
+    claude_json(project_path)
+    root = tmp_path / "transcripts"
+    (root / "-proj").mkdir(parents=True)
+    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
+
+    catalog = tmp_path / "catalog.json"
+    catalog.write_text(json.dumps({
+        "os": {"cold_prefix_floor": 5_000},
+        "projects": [{"name": "proj_a", "path": str(project_path)}],
+    }))
+    central = CentralStore()
+    try:
+        central.upsert_project("proj_a", str(project_path), "test project")
+        central.set_state("catalog_path", str(catalog))
+        central.conn.commit()
+    finally:
+        central.close()
+    return FleetCostFixture(jarvis_home, project_path, root, catalog)
 
 
 class Recorder:

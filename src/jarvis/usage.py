@@ -86,11 +86,12 @@ surfaces reading the same rows then disagree about the same tokens — see
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 TRANSCRIPT_ROOT_ENV = "JARVIS_TRANSCRIPT_ROOT"
 
@@ -237,6 +238,13 @@ class Usage:
     #: compacted across. The rest moved the prefix.
     boundaries_ttl: int = 0
     boundaries_compact: int = 0
+    #: Boundaries whose TTL-vs-prefix split was left OPEN — the caller had no
+    #: `os.cold_prefix_floor`. Counted in `resume_boundaries` and in no write bucket.
+    boundaries_undecided: int = 0
+    #: Messages a WINDOW could not place: `timestamp` missing or malformed. Excluded
+    #: from every figure above and counted here, never dropped silently and never
+    #: counted as in-window. Always 0 with no window — nothing was excluded.
+    undated_messages: int = 0
     cost_by_model: dict[str, float] = field(default_factory=dict)
     #: The TTL split of `cache_write`, where the source reported one. Their sum can be
     #: LESS than `cache_write` (a partial sample) and is zero when nothing is known —
@@ -281,6 +289,9 @@ class Usage:
                                    + other.rewrite_compact_write),
             boundaries_ttl=self.boundaries_ttl + other.boundaries_ttl,
             boundaries_compact=self.boundaries_compact + other.boundaries_compact,
+            boundaries_undecided=(self.boundaries_undecided
+                                  + other.boundaries_undecided),
+            undated_messages=self.undated_messages + other.undated_messages,
             cost_by_model=merged,
             cache_1h=self.cache_1h + other.cache_1h,
             cache_5m=self.cache_5m + other.cache_5m,
@@ -366,6 +377,8 @@ class Usage:
             "rewrite_ttl_excess": self.rewrite_ttl_excess,
             "boundaries_ttl": self.boundaries_ttl,
             "boundaries_compact": self.boundaries_compact,
+            "boundaries_undecided": self.boundaries_undecided,
+            "undated_messages": self.undated_messages,
             "rewrite_compact_write": self.rewrite_compact_write,
             "list_cost_usd": round(self.list_cost_usd, 2),
             "rewrite_cost_usd": round(self.rewrite_cost_usd, 2),
@@ -713,6 +726,80 @@ def calls_of(path: Path | str) -> list[Call]:
     ]
 
 
+#: Why one cache boundary happened. `UNDECIDED` is the TTL-vs-prefix split left OPEN
+#: because the caller could not reach `os.cold_prefix_floor` — it is never produced when a
+#: floor was passed, and it is not a fourth cause.
+BOUNDARY_COMPACTED = "compacted"
+BOUNDARY_TTL = "ttl"
+BOUNDARY_PREFIX = "prefix"
+BOUNDARY_UNDECIDED = "undecided"
+
+
+@dataclass
+class Boundary:
+    """One place a conversation was re-written, and what re-wrote it."""
+
+    ts: float          # the call that paid for it
+    cause: str
+    cache_write: int   # that call's own write
+    cache_read: int
+    gap: float         # seconds since the previous call, 0.0 for the first
+
+
+def classify_boundaries(calls: Sequence[Call], *, compactions: Sequence[float] = (),
+                        cold_prefix_floor: int | None = None) -> list[Boundary]:
+    """Every cold boundary in a run of calls, with the cause each is attributed to.
+
+    THE OS'S ONE IMPLEMENTATION of "a cache read that went backwards is a boundary, and
+    here is what caused it". Lifted out of `_usage_of` so every surface that needs the
+    judgement reads the same one rather than restating it — `inspection.Turn.usage`
+    reported a structural zero on every turn of every order for want of it (issue #867).
+
+    ONE RUN OF CALLS, and the caller decides what a run is. `_usage_of` passes ONE FILE:
+    `session_calls` concatenates every segment of a session, so a session-wide run sees
+    an extra boundary between the last call of segment 1 and the first of segment 2 where
+    a per-file run sees none.
+
+    `cold_prefix_floor=None` yields `BOUNDARY_UNDECIDED` for anything the TTL test would
+    have decided. Rules 1 and 2 need no floor, so a boundary is still COUNTED and a
+    compacted one still LABELLED; the split is left open rather than guessed, for the
+    reason stated where the threshold is not defaulted (see `TTL_BREAK_EVEN` above).
+    """
+    found: list[Boundary] = []
+    previous_read: int | None = None
+    previous_ts: float | None = None
+    for call in calls:
+        read = call.cache_read
+        ts = call.ts or None
+        # A turn boundary shows up as the cache going BACKWARDS: this call read less
+        # of the prefix than the one before it did. Counting the drops rather than
+        # thresholding the write size keeps this free of magic numbers, and it lands
+        # on exactly (turns - 1) for every work order measured.
+        if previous_read is not None and read < previous_read:
+            # Expired, or the prefix moved: findings/2026-08-30-where-the-800-dollars-went.md
+            gap = (ts - previous_ts) if (ts and previous_ts) else None
+            expired = (gap is not None and gap >= WRITE_TTL_SECONDS
+                       and cold_prefix_floor is not None
+                       and read <= cold_prefix_floor)
+            # Tested FIRST: a compacted boundary reads the static head seconds after
+            # the summary landed, which is indistinguishable from a prefix miss by the
+            # gap-and-read test alone. See `Usage.rewrite_compact_write`.
+            if ts and previous_ts and any(previous_ts < c <= ts for c in compactions):
+                cause = BOUNDARY_COMPACTED
+            elif expired:
+                cause = BOUNDARY_TTL
+            elif cold_prefix_floor is None:
+                cause = BOUNDARY_UNDECIDED
+            else:
+                cause = BOUNDARY_PREFIX
+            found.append(Boundary(ts=call.ts, cause=cause,
+                                  cache_write=call.cache_write, cache_read=read,
+                                  gap=gap or 0.0))
+        previous_read = read
+        previous_ts = ts
+    return found
+
+
 def session_calls(session_id: str, root: Path | None = None,
                   index: dict[str, list[Path]] | None = None) -> list[Call]:
     """The LEAD agent's API calls for one session, across every segment of it.
@@ -813,17 +900,48 @@ def last_compaction(session_id: str, *, since: float = 0.0,
     return max(found, key=lambda c: c["ts"]) if found else None
 
 
-def _usage_of(path: Path, cold_prefix_floor: int) -> Usage:
+def _call_of(message: dict[str, Any]) -> Call:
+    return Call(ts=message.get("ts") or 0.0, model=message.get("model") or "",
+                input=message.get("input_tokens", 0),
+                cache_write=message.get("cache_creation_input_tokens", 0),
+                cache_read=message.get("cache_read_input_tokens", 0),
+                output=message.get("output_tokens", 0),
+                cache_1h=message.get("ephemeral_1h_input_tokens", 0),
+                cache_5m=message.get("ephemeral_5m_input_tokens", 0))
+
+
+def _inside(ts: float, since: float | None, until: float | None) -> bool:
+    """Half-open, like every other window in the OS."""
+    return not ((since is not None and ts < since) or (until is not None and ts >= until))
+
+
+def _in_window(messages: list[dict[str, Any]], since: float | None,
+               until: float | None) -> tuple[list[dict[str, Any]], int]:
+    """The messages inside the window, and how many could not be PLACED.
+
+    A message whose `timestamp` was missing or malformed has `ts == 0.0` (`parse_stamp`)
+    and is EXCLUDED AND COUNTED when a window is given — never silently dropped and
+    never counted as in-window, which would attribute spend to a window on no evidence.
+    With no window nothing is excluded, so there is nothing to disclose and the list is
+    returned unchanged (§5c of the window-selector spec).
+    """
+    if since is None and until is None:
+        return messages, 0
+    inside = [m for m in messages if m.get("ts") and _inside(m["ts"], since, until)]
+    return inside, sum(1 for m in messages if not m.get("ts"))
+
+
+def _usage_of(path: Path, cold_prefix_floor: int, *, since: float | None = None,
+              until: float | None = None) -> Usage:
     messages = _assistant_messages(path)
     if not messages:
         return Usage()
     compactions = compaction_stamps(path)
-    usage = Usage(messages=len(messages))
-    previous_read: int | None = None
-    previous_ts: float | None = None
-    for message in messages:
+    windowed, undated = _in_window(messages, since, until)
+    usage = Usage(messages=len(windowed), undated_messages=undated)
+    calls: list[Call] = []
+    for message in windowed:
         model = message.get("model") or ""
-        ts = message.get("ts") or None
         plain = message.get("input_tokens", 0)
         write = message.get("cache_creation_input_tokens", 0)
         read = message.get("cache_read_input_tokens", 0)
@@ -842,29 +960,7 @@ def _usage_of(path: Path, cold_prefix_floor: int) -> Usage:
                             ("cache_1h", hour), ("cache_5m", five)):
             counts[name] = counts.get(name, 0) + value
         usage.context_peak = max(usage.context_peak, plain + write + read)
-        # A turn boundary shows up as the cache going BACKWARDS: this call read less
-        # of the prefix than the one before it did. Counting the drops rather than
-        # thresholding the write size keeps this free of magic numbers, and it lands
-        # on exactly (turns - 1) for every work order measured.
-        if previous_read is not None and read < previous_read:
-            usage.resume_boundaries += 1
-            # Expired, or the prefix moved: findings/2026-08-30-where-the-800-dollars-went.md
-            gap = (ts - previous_ts) if (ts and previous_ts) else None
-            expired = (gap is not None and gap >= WRITE_TTL_SECONDS
-                       and read <= cold_prefix_floor)
-            # Tested FIRST: a compacted boundary reads the static head seconds after
-            # the summary landed, which is indistinguishable from a prefix miss by the
-            # gap-and-read test alone. See `Usage.rewrite_compact_write`.
-            if ts and previous_ts and any(previous_ts < c <= ts for c in compactions):
-                usage.rewrite_compact_write += write
-                usage.boundaries_compact += 1
-            elif expired:
-                usage.rewrite_ttl_write += write
-                usage.boundaries_ttl += 1
-            else:
-                usage.rewrite_prefix_write += write
-        previous_read = read
-        previous_ts = ts
+        calls.append(_call_of(message))
         # Per MESSAGE, where the TTL split is exact rather than a sample — which is the
         # most accurate this estimate can be made without the CLI's own figure.
         classes = class_costs(model, input=plain, cache_write=write, cache_read=read,
@@ -875,8 +971,45 @@ def _usage_of(path: Path, cold_prefix_floor: int) -> Usage:
         cost = sum(classes.values())
         if cost:
             usage.cost_by_model[model] = usage.cost_by_model.get(model, 0.0) + cost
+    # ONE FILE at a time, which is what keeps this an exact refactor: a session-wide run
+    # would see a boundary between two segments where this walk sees none
+    # (`classify_boundaries`' own note). `read_session` calls this per path.
+    #
+    # CLASSIFIED OVER EVERY CALL IN THE FILE AND FILTERED AFTERWARDS: the classifier
+    # compares a call with its PREDECESSOR, so filtering the calls first would lose the
+    # boundary at the window's left edge — usually a cold start, the dearest event in it
+    # (§5c of docs/superpowers/specs/2026-10-07-cost-window-selector.md).
+    boundaries = classify_boundaries(
+        calls if windowed is messages else [_call_of(m) for m in messages],
+        compactions=compactions, cold_prefix_floor=cold_prefix_floor)
+    if windowed is not messages:
+        boundaries = [b for b in boundaries if _inside(b.ts, since, until)]
+    fold_boundaries(usage, boundaries)
     usage.rewrite_excess = max(0, usage.cache_write - usage.context_peak)
     return usage
+
+
+def fold_boundaries(usage: Usage, boundaries: Sequence[Boundary]) -> None:
+    """Add a classified run of boundaries into a `Usage`'s six boundary fields.
+
+    Beside the classifier rather than in each caller: `_usage_of` and
+    `inspection.Turn.usage` fill the same keys, and two spellings of the fold is how one
+    key comes to mean two things on two surfaces. An `UNDECIDED` boundary lands in
+    `resume_boundaries` and in NO write bucket — `rewrite_ttl_share` then returns None,
+    which the renderers are already required not to print as 0%.
+    """
+    for boundary in boundaries:
+        usage.resume_boundaries += 1
+        if boundary.cause == BOUNDARY_COMPACTED:
+            usage.rewrite_compact_write += boundary.cache_write
+            usage.boundaries_compact += 1
+        elif boundary.cause == BOUNDARY_TTL:
+            usage.rewrite_ttl_write += boundary.cache_write
+            usage.boundaries_ttl += 1
+        elif boundary.cause == BOUNDARY_UNDECIDED:
+            usage.boundaries_undecided += 1
+        else:
+            usage.rewrite_prefix_write += boundary.cache_write
 
 
 def priced(model: str, *, input: int = 0, cache_write: int = 0, cache_read: int = 0,
@@ -935,11 +1068,16 @@ def index_sessions(root: Path | None = None) -> dict[str, list[Path]]:
 
 def read_session(session_id: str, cold_prefix_floor: int,
                  root: Path | None = None,
-                 index: dict[str, list[Path]] | None = None) -> SessionUsage:
+                 index: dict[str, list[Path]] | None = None,
+                 *, since: float | None = None,
+                 until: float | None = None) -> SessionUsage:
     """Spend for one session id, subagents included but reported separately.
 
     `cold_prefix_floor` is `os.cold_prefix_floor` and is REQUIRED: a caller that cannot
     reach a catalog must fail rather than classify against a guessed threshold.
+
+    `since`/`until` are the half-open window a cost report was asked for, additive and
+    defaulted: a bill asks for the WHOLE order and must never pass them (§5c).
     """
     result = SessionUsage(session_id=session_id)
     if index is None:
@@ -949,14 +1087,15 @@ def read_session(session_id: str, cold_prefix_floor: int,
         return result
     result.found = True
     for path in sorted(paths):
-        result.main = result.main + _usage_of(path, cold_prefix_floor)
+        result.main = result.main + _usage_of(path, cold_prefix_floor, since=since,
+                                              until=until)
         # Claude Code writes each subagent's own transcript beside the parent's, under
         # a directory named for the parent session — beside whichever segment the
         # subagent was spawned from.
         subagent_dir = path.with_suffix("") / "subagents"
         if subagent_dir.is_dir():
             for sub in sorted(subagent_dir.glob("*.jsonl")):
-                sub_usage = _usage_of(sub, cold_prefix_floor)
+                sub_usage = _usage_of(sub, cold_prefix_floor, since=since, until=until)
                 if sub_usage.messages:
                     result.subagents = result.subagents + sub_usage
                     result.subagent_count += 1
@@ -966,3 +1105,289 @@ def read_session(session_id: str, cold_prefix_floor: int,
     # see (it never compares across files).
     result.main.resume_boundaries += len(paths) - 1
     return result
+
+
+# --- Tool results -----------------------------------------------------------------
+#
+# WHAT A TOOL COST, which the rest of this module cannot see. The ledger above is keyed
+# by API CALL, and a tool result is not a call: it is a payload that rides along inside
+# every SUBSEQUENT call's prefix. `_usage_of` walks `_assistant_messages`, which
+# pre-filters the file on the needle `'"usage"'`, and a `tool_result` block lives on a
+# `user` row with no `usage` object — so the module that owns token accounting has never
+# read a tool result at all. The walk below is that reading, and nothing more: pairing
+# and sizing, no prices, no rollup, no catalog. The aggregation (classification by
+# command shape, the carried-cost arithmetic, the fleet denominators) is `fleetcost`'s,
+# which may import this; this must never import that.
+#
+# Spec: docs/superpowers/specs/2026-10-06-fleet-cost-per-tool.md §10.2-§10.3.
+
+#: How a result's size was arrived at. The transcript carries NO per-result token count
+#: — token counts exist only in `message.usage` on `assistant` rows — so every size here
+#: is derived, and which way is reported per result rather than averaged away.
+BASIS_CONTEXT_DELTA = "context-delta"
+BASIS_CHARS = "chars"
+
+#: The caller of a tool call is THE FILE ITS ROW CAME FROM, which is `read_session`'s
+#: own split and not a second mechanism: Claude Code writes each subagent's transcript
+#: under `<segment>/subagents/*.jsonl`, and that is what makes `SessionUsage.subagents`
+#: separable from `main` one level up.
+CALLER_MAIN = "main"
+CALLER_SUBAGENT = "subagent"
+
+#: `background.ERROR_PREFIX`, duplicated rather than imported: this module is a leaf and
+#: `background` is not one. The text check is the LAST of the three error signals, after
+#: `is_error` on the block and `is_error`/`isError` on the sibling `toolUseResult`.
+_RESULT_ERROR_PREFIX = "Error: "
+
+
+@dataclass
+class ToolResult:
+    """ONE tool call and what came back, as the transcript records it.
+
+    Sizes are tokens, like everything else in this module, and `token_basis` says which
+    estimator produced them. An UNMATCHED call — the turn was killed between the
+    `tool_use` and its result, the case `inspection.ToolSpan.ended == 0.0` models — is
+    returned with `matched=False`, no tokens and no basis. It is never zero-filled: a
+    call that produced nothing must not pull a tool's average down as though it had.
+    """
+
+    tool_use_id: str
+    name: str
+    input: dict[str, Any] = field(default_factory=dict)
+    caller: str = CALLER_MAIN
+    #: When the model ASKED (the `tool_use` row) and when the result LANDED. The second
+    #: is what bounds "every later call this result rode along in".
+    call_ts: float = 0.0
+    ts: float = 0.0
+    chars: int = 0
+    tokens: int = 0
+    token_basis: str = ""
+    is_error: bool = False
+    matched: bool = False
+
+
+def tool_results(path: Path | str, *, chars_per_token: float = 4.0,
+                 ) -> list[ToolResult]:
+    """Every tool call in one transcript, paired with its result and sized.
+
+    ONE unfiltered pass, `rows(path)` with no needle. The needle `'"tool_'` would catch
+    both block types, but the sizing below also needs the `assistant` usage rows, the
+    prompt rows and the `compact_boundary` rows from the SAME ordered walk — the things
+    collected here are defined by their position relative to each other, exactly as
+    `inspection.read_transcript` is, and one unfiltered pass beats four filtered ones.
+
+    Returned in `tool_use` order, which makes the walk reproducible run to run.
+
+    `chars_per_token` is the divisor of the `chars` fallback and is `cost.chars_per_token`
+    FROM THE CATALOG (default 4.0): a model-family property the OS does not control and
+    therefore configuration, not a constant. It is a parameter because this module is a
+    leaf and must not import the catalog — the caller supplies it. Refused at or below
+    zero, the same rule the catalog applies, rather than inventing a size.
+    """
+    if chars_per_token <= 0:
+        raise ValueError("chars_per_token must be > 0")
+    path = Path(path)
+    caller = CALLER_SUBAGENT if path.parent.name == "subagents" else CALLER_MAIN
+    found: list[ToolResult] = []
+    pending: dict[str, ToolResult] = {}
+    # The results that landed since the last API call: the ones the NEXT call's context
+    # growth paid for.
+    group: list[ToolResult] = []
+    calls: dict[str, Call] = {}
+    previous: Call | None = None
+    # A prompt row or a compaction between two calls means the context grew (or shrank)
+    # for a reason that is not the tool, so the exact basis is off for this group.
+    interrupted = False
+
+    for row in rows(path):
+        kind = row.get("type")
+        if kind == "system" and row.get("subtype") == "compact_boundary":
+            interrupted = True
+            continue
+        if _is_prompt_row(row):
+            interrupted = True
+            continue
+        if kind == "assistant":
+            call, mid = _call_of_row(row)
+            if call is not None:
+                seen = calls.get(mid)
+                if seen is not None:
+                    # THE STREAMING DUPLICATE: one assistant message is written several
+                    # times as its text grows, every copy repeating the input counts and
+                    # climbing toward the final `output_tokens`. Merge by max into the
+                    # call already placed, the same rule `_assistant_messages` applies —
+                    # summing the copies would triple the context.
+                    _merge_call(seen, call)
+                else:
+                    _size_group(group, previous, call, interrupted, chars_per_token)
+                    group = []
+                    interrupted = False
+                    calls[mid] = call
+                    previous = call
+            for block in blocks_of(row, "tool_use"):
+                tool_id = str(block.get("id") or "")
+                if not tool_id or tool_id in pending:
+                    continue
+                arguments = block.get("input")
+                item = ToolResult(
+                    tool_use_id=tool_id, name=str(block.get("name") or ""),
+                    input=arguments if isinstance(arguments, dict) else {},
+                    caller=caller, call_ts=parse_stamp(row.get("timestamp")))
+                pending[tool_id] = item
+                found.append(item)
+            continue
+        for block in blocks_of(row, "tool_result"):
+            item = pending.pop(str(block.get("tool_use_id") or ""), None)
+            if item is None:
+                # A result for a call this file never recorded. Ignored rather than
+                # invented: there is no name to charge it to.
+                continue
+            item.matched = True
+            item.ts = parse_stamp(row.get("timestamp"))
+            item.chars = len(_result_text(block.get("content")))
+            item.is_error = _result_failed(block, row.get("toolUseResult"))
+            group.append(item)
+    # A result after the LAST call of the session has no delta to be measured against.
+    _size_group(group, previous, None, True, chars_per_token)
+    return found
+
+
+def _is_prompt_row(row: dict[str, Any]) -> bool:
+    """Whether this row is the USER talking, rather than the agent's own loop.
+
+    `inspection._prompt_of`'s rule, reduced to the boolean this walk needs: of the three
+    kinds of `user` row only one is a prompt — a tool result is the loop, and an
+    `isMeta` row is Claude Code talking to itself (a skill's base directory, a hook's
+    output). Charging either to a tool is how the user's typing lands on a `Read`.
+    """
+    if row.get("type") != "user":
+        return False
+    if row.get("promptSource") != "sdk" and (
+            row.get("isMeta") or blocks_of(row, "tool_result")):
+        return False
+    content = (row.get("message") or {}).get("content")
+    text = content if isinstance(content, str) else " ".join(
+        b.get("text", "") for b in blocks_of(row, "text"))
+    return bool(text.strip())
+
+
+def _call_of_row(row: dict[str, Any]) -> tuple[Call | None, str]:
+    """The API call one assistant row stands for, with its message id, or (None, "").
+
+    The same two rejections `_assistant_messages` makes — no `usage` object, and
+    `_is_api_call` — so the calls this walk measures a delta between are exactly the
+    calls the rest of the module bills.
+    """
+    message = row.get("message") or {}
+    counts, mid = message.get("usage"), message.get("id")
+    if not isinstance(counts, dict) or not mid:
+        return (None, "")
+    entry: dict[str, Any] = {"model": message.get("model") or ""}
+    for key, value in counts.items():
+        if isinstance(value, int):
+            entry[key] = value
+    creation = counts.get("cache_creation")
+    if isinstance(creation, dict):
+        for key in ("ephemeral_1h_input_tokens", "ephemeral_5m_input_tokens"):
+            value = creation.get(key)
+            if isinstance(value, int):
+                entry[key] = value
+    if not _is_api_call(entry):
+        return (None, "")
+    return (Call(ts=parse_stamp(row.get("timestamp")), model=entry["model"],
+                 input=entry.get("input_tokens", 0),
+                 cache_write=entry.get("cache_creation_input_tokens", 0),
+                 cache_read=entry.get("cache_read_input_tokens", 0),
+                 output=entry.get("output_tokens", 0),
+                 cache_1h=entry.get("ephemeral_1h_input_tokens", 0),
+                 cache_5m=entry.get("ephemeral_5m_input_tokens", 0)), str(mid))
+
+
+def _merge_call(into: Call, other: Call) -> None:
+    """Fold a repeated copy of one assistant message into the call already placed."""
+    into.input = max(into.input, other.input)
+    into.cache_write = max(into.cache_write, other.cache_write)
+    into.cache_read = max(into.cache_read, other.cache_read)
+    into.output = max(into.output, other.output)
+    into.cache_1h = max(into.cache_1h, other.cache_1h)
+    into.cache_5m = max(into.cache_5m, other.cache_5m)
+
+
+def _size_group(group: list[ToolResult], previous: Call | None, nxt: Call | None,
+                interrupted: bool, chars_per_token: float) -> None:
+    """Charge one batch of results with the tokens the next call carried them as.
+
+    `context-delta`, token-exact where it applies:
+
+        appended = context(N+1) - context(N) - output(N)
+
+    `Call.context` is the full prompt size of one API call, so the growth between two
+    consecutive calls of the same chain is what was appended between them — the results
+    of this group, plus the assistant message N itself, which `output(N)` removes. Split
+    across the group in proportion to characters, because parallel tool calls put
+    several results between one pair of calls and the transcript says nothing about
+    which of them was the big one.
+
+    Falls back to `chars` whenever the delta is not evidence: a prompt row or a
+    compaction between the two calls (`interrupted`), no next call, or a delta that did
+    not grow. The estimate is visible in `token_basis`, never silently mixed in.
+    """
+    if not group:
+        return
+    delta = 0
+    if previous is not None and nxt is not None and not interrupted:
+        delta = nxt.context - previous.context - previous.output
+    if delta > 0:
+        for item, share in zip(group, _split_by_chars(delta,
+                                                      [i.chars for i in group])):
+            item.tokens = share
+            item.token_basis = BASIS_CONTEXT_DELTA
+        return
+    for item in group:
+        item.tokens = math.ceil(item.chars / chars_per_token)
+        item.token_basis = BASIS_CHARS
+
+
+def _split_by_chars(total: int, weights: list[int]) -> list[int]:
+    """Split an exact total in proportion to character counts, losing nothing.
+
+    Largest remainder, ties to the earlier result: the parts MUST sum to `total`, since
+    the total is the one token-exact figure in this walk and a per-result rounding that
+    dropped its remainder would under-report every parallel call in the fleet. Equal
+    shares when nothing has any characters — an empty result still rode along.
+    """
+    count = len(weights)
+    if total <= 0 or count == 0:
+        return [0] * count
+    denominator = sum(weights) or count
+    scale = weights if sum(weights) else [1] * count
+    parts = [total * weight // denominator for weight in scale]
+    remainders = sorted(range(count),
+                        key=lambda i: (-(total * scale[i] % denominator), i))
+    for index in remainders[:total - sum(parts)]:
+        parts[index] += 1
+    return parts
+
+
+def _result_text(content: Any) -> str:
+    """A `tool_result` block's text: a bare string, or a list of text blocks."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(str(b.get("text") or "") for b in content
+                        if isinstance(b, dict))
+    return ""
+
+
+def _result_failed(block: dict[str, Any], result: Any) -> bool:
+    """Whether this result reports an ERROR — `background._failed`'s precedence.
+
+    Kept apart rather than dropped: a refused call returns a two-line refusal, and
+    averaging it in with a 20k-token file dump moves the number a reader acts on.
+    """
+    if block.get("is_error"):
+        return True
+    if isinstance(result, dict):
+        return bool(result.get("is_error") or result.get("isError"))
+    text = result if isinstance(result, str) else _result_text(block.get("content"))
+    return text.startswith(_RESULT_ERROR_PREFIX)

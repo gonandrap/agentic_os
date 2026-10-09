@@ -460,7 +460,7 @@ re-proposes them mid-feature.
 
 **OTEL is DECLINED, on a measurement and not on the prior.** A real headless turn on CLI
 2.1.282 exported to a recording listener (`scripts/spike_otel.py`, findings in
-`docs/specs/2026-09-25-otel-export-measured.md`) and carried none of the three things this
+`docs/superpowers/specs/2026-09-25-otel-export-measured.md`) and carried none of the three things this
 tree needs: `tool_result` gives `tool_input_size_bytes` and never the input, so §4 is
 unserved; cache tokens arrive as flat `cache_read_tokens` / `cache_creation_tokens` with no
 `ephemeral_5m` / `ephemeral_1h` and no `modelUsage`, so `classify_writes`'s cause is
@@ -573,7 +573,7 @@ this repository — read it before you start.
 6. What does it cost to run: process count, port, failure modes with many concurrent
    headless workers.
 
-**The deliverable** is a findings document under `docs/specs/`, one knowledge-base entry
+**The deliverable** is a findings document under `docs/superpowers/specs/`, one knowledge-base entry
 via `jarvis learn add --project jarvis_os --topic observability`, and a pull request
 containing both. **Write no production code.** If the finding is that OTEL adds something
 the transcript does not, the deliverable is still the finding — file the integration as a
@@ -595,8 +595,9 @@ functions that exist: wrapping `ops.live_report`, `ops.inspect_report`, `ops.con
 and `ops.diagnose` in ONE place, once they are all in the tree, beats four separate workers
 each remembering to instrument their own — one of them would forget, and a meter with a
 hole in it reports a number lower than the truth, which is worse than no number at all. The
-gate has exactly one consumer, §5's per-turn write, and switching that off is a single
-guard this section adds to code §5 already landed, not a contract §5 has to be built
+gate has two consumers — §5's per-turn write, and the autopsy seal, which resolves its level
+through this section's own function and carries its own guard. Switching either off is a
+guard over code that already landed, not a contract its writer has to be built
 against. So nothing waits on §10: §§3, 4, 5, 6 and 9 have no dependency on each other or on
 this section, and §7 and §10 both follow the first four. Section order in this spec is
 still reading order and still not build order — it just now runs the other way from what a
@@ -616,9 +617,11 @@ the user left on this feature order, quoted verbatim as the source.
 
 The first comment is the METER; the second is the GATE. **They are two separate things and
 this section keeps them apart, because conflating them is what makes the rest of the text
-read as a contradiction.** The gate governs exactly one write, §5's per-turn ingredient
-row. The meter observes all five paths, four of which are reads, and it is never switched
-off: a meter the user can disable cannot answer the question the meter exists to answer.
+read as a contradiction.** The gate governs two writes: §5's per-turn ingredient row, and
+the sealed autopsy (`autopsy.records_autopsy`, §5 of
+`docs/superpowers/specs/2026-09-27-order-autopsy-durability.md`). The meter observes all five paths,
+four of which are reads, and it is never switched off: a meter the user can disable cannot
+answer the question the meter exists to answer.
 
 **The gate.** A new `ObservabilityConfig` dataclass, added to the fleet-level config
 dataclass AND the project-level one, exactly the way `InspectConfig` already appears in
@@ -629,31 +632,40 @@ of `off`, `normal`, `full`. A per-order override lives in a new `work_orders` co
 following `budget_usd`'s precedent in `ProjectStore.ADDED_COLUMNS` — nullable, and NULL
 means "this order has no answer", which is **not** the same as `off`. Precedence is stated
 as a rule and tested as one: the order column, else the project config, else the fleet
-config. Default `normal`.
+config. Default `normal`, and a project declines with `jarvis config set <project>
+observability.level off`.
 
-**What the gate actually governs, and what it must not.** Only WRITING. §§3, 4, 6 and 7 are
-arithmetic over files Claude Code already wrote — they collect nothing, and gating a
-read-only computation would buy the user nothing while costing them the very view they
-opened. §5's per-turn ingredient row is the one real collection this feature adds, and it
-is the thing `off` switches off — this section retrofits that guard into the write path §5
-already landed, and §5 itself is written with no knowledge of the config. Say it plainly,
-on the surface and in the config's own docstring: `off` does not disable `jarvis watch`,
-`jarvis inspect`, `jarvis wo why` or the debug page.
+**What the gate actually governs, and what it must not.** Only WRITING, and exactly two
+writes. §§3, 4, 6 and 7 are arithmetic over files Claude Code already wrote — they collect
+nothing, and gating a read-only computation would buy the user nothing while costing them
+the very view they opened. The first gated write is §5's per-turn ingredient row, the one
+real collection this feature adds: this section retrofits that guard into the write path §5
+already landed, and §5 itself is written with no knowledge of the config. The second is the
+autopsy seal — the same predicate over the same resolver, added by the autopsy spec's §5,
+which also passes the resolved level into `to_seal`. Say it plainly, on the surface and in
+the config's own docstring: `off` stops the autopsy being SEALED, and `off` does not disable
+`jarvis watch`, `jarvis inspect`, `jarvis wo why` or the debug page. Those two facts
+together are the whole of what `off` means, and a reader who learns one without the other
+draws the wrong conclusion. The autopsy READING stays unconditional at every level, because
+it is read-time arithmetic over the transcript like everything else in §§3, 4, 6 and 7. What
+`off` withholds is the seal that makes it survive the transcript being pruned.
 
 **Where the level guard goes.** Apply it to `context.record` ITSELF, or to both of its
 call sites — `dispatch.dispatch_work_order` and `worker_session.start` — and NOT only to
 the `dispatch.py` call: guarding only `dispatch.py` leaves the `worker_session.start`
 path writing at level `off` (Neo, question 681 on wo-3a7d9bda, 2026-09-25).
 
-**The three levels, concretely.** `off` means §5 writes no per-turn ingredient row, and
-changes NOTHING else. The consequence a user notices: an order run at `off` has no context
-ledger afterwards, so `jarvis wo context` reports it as not recorded — §5's forward-only
-wording, now for a second reason — and every other surface is unaffected. `normal` is the
-default and records that row. `full` records it and additionally records whatever the child
-determines is worth recording beyond the ingredient list; if that turns out to be nothing,
-`full` and `normal` collapse, and the child says so rather than inventing a difference to
-justify a third level. The meter below is not on this scale at all: it records at every
-level.
+**The three levels, concretely.** `off` means §5 writes no per-turn ingredient row and
+nothing seals an autopsy, and changes NOTHING else. The consequence a user notices: an order
+run at `off` has no context ledger afterwards, so `jarvis wo context` reports it as not
+recorded — §5's forward-only wording, now for a second reason — and its autopsy can be read
+only for as long as its transcript survives; every other surface is unaffected. `normal` is
+the default: it records that row, and it seals. `full` records and seals too, and adds the
+retained content of the autopsy spec's §6 — verbatim tool `params`, and nested subagent
+anatomies with their params. That retained content is the whole of what `full` buys, and it
+is gated because those are redacted file contents and Bash command lines in a store that
+does NOT expire, not because of bytes. The meter below is not on this scale at all: it
+records at every level.
 
 **The meter.** `src/jarvis/observability.py`, which is also where the precedence resolver
 lives. Every observability payload — `ops.live_report`, `ops.inspect_report`,

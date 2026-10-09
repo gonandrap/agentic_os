@@ -756,7 +756,10 @@ Output STRICT JSON, nothing else:
   {"escalate": false, "verdict": "dismiss",  "reason": "<one line: why this command \
 performs no privileged action>", "exempt_pattern": "<regex for the family, or omit>"}
   {"escalate": true,  "verdict": "deny",     "reason": "<one line: why the user must \
-decide>"}"""
+decide>"}
+An escalation may carry one optional label, which is grouped and reported:
+  "cause": "<on an escalation, name the cause from this list; omit it if none fits: \
+privileged-action | evidence-insufficient>\""""
 
 
 HISTORY_LIMIT = 8
@@ -973,8 +976,11 @@ def file_request(store: ProjectStore, neo: Any, project: str, wo: dict[str, Any]
     however it was reached.
 
     `hold` is what makes the two differ in the one way they must. The hook has no case to
-    pass on, so it files `AWAITING_CASE`: recorded, the worker parked, and NO Neo question
-    yet, because the case is still coming. `queue_for_review` is the only way out.
+    pass on, so it files `AWAITING_CASE`: recorded, the command blocked, and NO Neo
+    question yet, because the case is still coming. `queue_for_review` is the only way
+    out. It does NOT park the work order — fix 2 of
+    docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md; see the status
+    write below.
 
     The request rides the existing Neo queue rather than a parallel review pipeline,
     which is what gives it escalation-to-user, `jarvis neo list` and answer delivery
@@ -989,14 +995,11 @@ def file_request(store: ProjectStore, neo: Any, project: str, wo: dict[str, Any]
         agent_type=agent_type, status=AWAITING_CASE if hold else "pending",
         contested=contested,
     )
+    # The park rides with `queue_for_review`, which is the ONLY door to `pending` — so
+    # the worker is parked exactly when a reviewer is holding it, however that road was
+    # reached (here, or `jarvis gate request` on a row this filed held).
     question = None if hold else queue_for_review(store, neo, project, wo, action,
                                                   approval)
-    # The worker has nothing to do until a verdict lands. Saying so keeps the reconciler
-    # from reading the idle session as "finished without `jarvis wo finish`" and filing
-    # it for review — a gate request is a wait, not an abandonment. True of a held request
-    # too: what it waits for is the worker's own next command.
-    if wo.get("status") in ("running", "dispatching"):
-        store.set_status(wo["id"], "waiting_input")
     return approval, question
 
 
@@ -1026,6 +1029,14 @@ def queue_for_review(store: ProjectStore, neo: Any, project: str, wo: dict[str, 
     The single door from `AWAITING_CASE` to `pending`, and the single place a reviewer's
     question text is first written — so "no reviewer ever reads a request nobody argued
     for" is a property of one function rather than a convention six callers must keep.
+
+    …and, since fix 2 of
+    docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md, the single place
+    the work order is PARKED. `waiting_input` renders "Waiting on you" everywhere, which
+    is true of a request under review and false of a held one, whose only exit is the
+    worker's own next command. Being the one door, this parks exactly the orders
+    somebody else is holding, whichever road reached it — the hook's `file_request`, or
+    `jarvis gate request` attaching a case to a row filed held.
     """
     question = neo.ask(
         project, wo["id"], question_text(store, wo, action, approval),
@@ -1038,6 +1049,12 @@ def queue_for_review(store: ProjectStore, neo: Any, project: str, wo: dict[str, 
         kind="approval",
     )
     store.start_review(approval["id"], question["id"])
+    # The worker has nothing to do until a verdict lands. Saying so keeps the reconciler
+    # from reading the idle session as "finished without `jarvis wo finish`" and filing
+    # it for review — a request under review is a wait, not an abandonment. Read from the
+    # STORE, not from `wo`, which a caller may have been holding since before the hold.
+    if store.get_work_order(wo["id"])["status"] in ("running", "dispatching"):
+        store.set_status(wo["id"], "waiting_input")
     return question
 
 

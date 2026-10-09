@@ -535,6 +535,13 @@ def _stub_bin(tmp_path: Path, name: str) -> Path:
     return d
 
 
+def _head_sha(repo: Path) -> str:
+    """The commit a staged run ships. Required since the 2026-10-01 spec §1: a release
+    approval is scoped to the command string, so the sha has to be in it."""
+    return subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                          check=True, capture_output=True, text=True).stdout.strip()
+
+
 def _run_script(repo: Path, tmp_path: Path, *args: str,
                 dry_run: bool = True) -> subprocess.CompletedProcess[str]:
     env = {**os.environ,
@@ -550,7 +557,8 @@ def _run_script(repo: Path, tmp_path: Path, *args: str,
 
 def test_stage_skips_restarts_and_notify(tmp_path):
     repo = _make_repo(tmp_path)
-    r = _run_script(repo, tmp_path, "--stage", "0.2.0", "--wo", "wo-abc123")
+    r = _run_script(repo, tmp_path, "--stage", "0.2.0", "--wo", "wo-abc123",
+                    "--base", _head_sha(repo))
     assert r.returncode == 0, r.stdout + r.stderr
     out = r.stdout
     assert "pending_release.json" in out
@@ -562,7 +570,8 @@ def test_stage_skips_restarts_and_notify(tmp_path):
 def test_stage_still_deploys_the_tag(tmp_path):
     """Every existing step short of the restarts: push, prod checkout, uv sync."""
     repo = _make_repo(tmp_path)
-    r = _run_script(repo, tmp_path, "--stage", "0.2.0", "--wo", "wo-abc123")
+    r = _run_script(repo, tmp_path, "--stage", "0.2.0", "--wo", "wo-abc123",
+                    "--base", _head_sha(repo))
     assert r.returncode == 0, r.stdout + r.stderr
     out = r.stdout
     assert "push origin 'refs/tags/jarvis-0.2.0'" in out
@@ -583,7 +592,7 @@ def test_stage_writes_the_marker_for_real(tmp_path):
     repo = _make_repo(tmp_path)
     before = int(time.time())
     r = _run_script(repo, tmp_path, "--stage", "0.2.0", "--wo", "wo-abc123",
-                    dry_run=False)
+                    "--base", _head_sha(repo), dry_run=False)
     assert r.returncode == 0, r.stdout + r.stderr
 
     marker_file = tmp_path / "jarvis-home" / "run" / "pending_release.json"
@@ -591,7 +600,8 @@ def test_stage_writes_the_marker_for_real(tmp_path):
     marker = json.loads(marker_file.read_text())
     assert marker == {
         "wo_id": "wo-abc123", "project": "jarvis_os", "version": "0.2.0",
-        "tag": "jarvis-0.2.0", "staged_at": marker["staged_at"], "state": "staged",
+        "tag": "jarvis-0.2.0", "base": _head_sha(repo),
+        "staged_at": marker["staged_at"], "state": "staged",
     }
     assert before <= marker["staged_at"] <= time.time() + 1
     # This tag carries no scripts/install_prod_service.sh, so step 5a cannot re-render

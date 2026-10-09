@@ -37,6 +37,7 @@ from typing import Any, Callable
 
 from . import claude_cli, structured
 from .bootstrap import ASSETS
+from .catalog import DEFAULT_DIGEST_MAX_QUESTION_CHARS
 
 #: The vendored output style. DELIBERATELY NOT under `assets/agents/` or
 #: `assets/skills/`: `bootstrap._rebuild` copytrees both of those into every project, so
@@ -64,6 +65,27 @@ MAX_OPTIONS = 5
 #: How much of a long field survives. Generous — this is a guard against a model that
 #: pasted the question back, not a style rule.
 MAX_FIELD_CHARS = 600
+
+#: How much of the question the model is SHOWN. `MAX_FIELD_CHARS` bounds only the reply,
+#: so q722 bought up to two digest calls at 151,700 chars each. The digest is
+#: display-only — the full text is on the record — which is why clipping is right here
+#: and refusing is right in `neo_store.ask`. Default measured in
+#: `catalog.DEFAULT_DIGEST_MAX_QUESTION_CHARS`. Spec §4:
+#: docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+MAX_QUESTION_CHARS = DEFAULT_DIGEST_MAX_QUESTION_CHARS
+
+#: The clip is LABELLED and the label is INSIDE the prompt the model reads, so the
+#: headline it writes is honest about what it saw (same spec section).
+CLIP_NOTICE = ("\n\n[clipped for this summary: {cut} characters of the question were "
+               "cut here. The full question is on the work-order record — summarise "
+               "only what you were shown, and say it is partial.]")
+
+
+def clip(question: str, max_chars: int = MAX_QUESTION_CHARS) -> str:
+    """The question as the digest model sees it: whole, or clipped and labelled."""
+    if len(question) <= max_chars:
+        return question
+    return question[:max_chars] + CLIP_NOTICE.format(cut=len(question) - max_chars)
 
 INSTRUCTIONS = f"""
 # Your task here
@@ -168,6 +190,7 @@ def validate(data: dict[str, Any]) -> dict[str, Any]:
 
 def summarise(question: str, *, model: str, timeout: int = 120,
               call: Callable[..., Any] = CALL,
+              max_chars: int = MAX_QUESTION_CHARS,
               on_usage: Callable[[Any], None] | None = None) -> dict[str, Any]:
     """One digest for one question. Raises rather than returning a broken shape.
 
@@ -180,7 +203,8 @@ def summarise(question: str, *, model: str, timeout: int = 120,
     from .paths import ensure_home
 
     return structured.request(
-        question,
+        # Clipped and labelled before it becomes the prompt — see `clip`.
+        clip(question, max_chars),
         validate=validate,
         system_prompt=build_system_prompt(),
         model=model,

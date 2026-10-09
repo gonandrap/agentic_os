@@ -12,7 +12,7 @@ The two properties these tests exist to pin:
 
 The CLI derives no number: it prints what `ops` returned.
 
-Spec: docs/specs/2026-09-27-self-evolution.md §3.4.
+Spec: docs/superpowers/specs/2026-09-27-self-evolution.md §3.4.
 """
 
 from __future__ import annotations
@@ -32,8 +32,8 @@ COND = {"all": [{"field": "status", "op": "eq", "value": "needs_review"},
 def store(jarvis_home):
     s = CentralStore()
     # THE FIVE BUILTIN SEED ROWS ARE CLEARED. `CentralStore` seeds them on every open
-    # (docs/specs/2026-09-27-self-evolution.md §5.3), and this file is about the TABLE
-    # MECHANICS — a row round-tripping, an insert being refused, a retraction never
+    # (docs/superpowers/specs/2026-09-27-self-evolution.md §5.3), and this file is about
+    # the TABLE MECHANICS — a row round-tripping, an insert being refused, a retraction never
     # deleting — every assertion of which is written as "and the table stays empty". The
     # seeds themselves are proved in `tests/test_rules_tick.py`, which is the section that
     # owns their call site; asserting them here too would be two files disagreeing about
@@ -164,6 +164,22 @@ def test_dry_run_without_an_order_lists_what_the_condition_reads(store, register
     assert set(data["fields"]) == {"status", "seconds_in_status"}
     assert set(data["sources"]) == {"work_order", "state_durations"}
     assert data["condition_prose"]
+
+
+def test_the_active_basis_field_reads_the_same_source(store):
+    """Spec §6 of
+    docs/superpowers/specs/2026-09-30-time-in-state-counts-a-usage-limit-hold-as-running.md
+    """
+    det = store.add_detector(
+        "held-too-long",
+        {"all": [{"field": "seconds_in_status_active", "op": "gte", "value": 3600}]},
+        project="proj_a", summary="really working an hour", source="io")
+
+    data = ops.rules_dry_run(det["id"])
+
+    assert data["readable"] is True
+    assert set(data["fields"]) == {"seconds_in_status_active"}
+    assert set(data["sources"]) == {"state_durations"}
 
 
 def test_dry_run_on_an_order_whose_snapshot_cannot_be_built_decides_nothing(

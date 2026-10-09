@@ -1,6 +1,6 @@
 """What Jarvis put in the worker's context window, per turn, and what changed.
 
-§5 of docs/specs/2026-09-24-order-observability.md. Nothing on disk answers "how much of
+§5 of docs/superpowers/specs/2026-09-24-order-observability.md. Nothing on disk answers "how much of
 this context is system prompt, how much is skills, how much is the knowledge block", so
 this module measures the ingredients JARVIS ITSELF supplies at the moment a turn is
 launched, and `record` stores one payload per turn on `wo_turns.context_json`.
@@ -94,16 +94,22 @@ def _file_bytes(path: Path) -> tuple[int | None, str]:
         return None, f"could not be read ({e.__class__.__name__}: {e})"
 
 
-def _worktree_cwd(project: Any, wo: dict[str, Any]) -> Path:
+def _worktree_cwd(project: Any, wo: dict[str, Any], turn: dict[str, Any]) -> Path:
     """The directory the turn runs in — where Claude Code resolves CLAUDE.md from.
 
     Derived here rather than from `worker_session.worktree_path` to keep this module off
     that import (cycle); the fallback to the project root is the same one `send` makes.
+
+    PREDICTED on the seq-1 dispatch turn, which runs before the `--worktree` flag has
+    created the tree — measured there, the walk was a directory too high. Later turns
+    keep the check, because `send` really does fall back to the root when the worktree
+    is gone. Spec docs/superpowers/specs/2026-09-29-one-copy-of-the-projects-claude-md.md
+    §4.
     """
     name = wo.get("worktree")
     if name:
         path = Path(project.path) / ".claude" / "worktrees" / str(name)
-        if path.is_dir():
+        if path.is_dir() or (turn.get("kind") == "dispatch" and turn.get("seq") == 1):
             return path
     return Path(project.path)
 
@@ -225,18 +231,20 @@ def measure(project: Any, wo: dict[str, Any], turn: dict[str, Any],
     rows.append(_row("worker_settings", size, detail={"path": str(settings)},
                      note=why or "the --settings file: hooks, permissions, env"))
 
-    rows.append(_memory_row(project, wo))
+    rows.append(_memory_row(project, wo, turn))
     rows.append(_agent_row(briefing))
     rows.append(_add_dirs_row(briefing))
     rows.append(_mcp_row(project))
     return rows
 
 
-def _memory_row(project: Any, wo: dict[str, Any]) -> dict[str, Any]:
+def _memory_row(project: Any, wo: dict[str, Any],
+                turn: dict[str, Any]) -> dict[str, Any]:
     from . import hooks
 
-    cwd = _worktree_cwd(project, wo)
+    cwd = _worktree_cwd(project, wo, turn)
     try:
+        excluded = [str(p) for p in hooks.claude_md_excludes(Path(project.path), cwd)]
         paths = hooks.memory_files(Path(project.path), cwd)
     except OSError as e:
         return _absent("memory_files", f"the memory walk could not be read ({e})")
@@ -248,9 +256,17 @@ def _memory_row(project: Any, wo: dict[str, Any]) -> dict[str, Any]:
             continue
         total += min(size, max(0, MAX_BYTES - total))
         counted.append(str(path))
+    # `excluded` names the dropped ancestor copies: absent and zero are different (module
+    # docstring), so a reader can see the duplicate was DROPPED and not never found. Spec
+    # docs/superpowers/specs/2026-09-29-one-copy-of-the-projects-claude-md.md §5.
     return _row("memory_files", total,
-                detail={"paths": counted, "count": len(counted), "cwd": str(cwd)},
-                note="the CLAUDE.md-shaped files Claude Code loads, nearest first")
+                detail={"paths": counted, "count": len(counted), "cwd": str(cwd),
+                        "excluded": excluded},
+                note="the CLAUDE.md-shaped files Claude Code loads, nearest first — in "
+                     "EVERY request's window for the life of the conversation (served "
+                     "from cache when warm), unlike `knowledge_index` and "
+                     "`worker_prompt`, which are listed on the turn that introduced "
+                     "them")
 
 
 def _agent_row(briefing: dict[str, Any]) -> dict[str, Any]:
@@ -293,7 +309,7 @@ def payload(project: Any, wo: dict[str, Any], turn: dict[str, Any],
 # The meter wraps the WHOLE function, gate guard included: an order running at `off` still
 # records a near-zero row, so the meter has no hole. A meter with a hole reports a number
 # lower than the truth, which is worse than no number (§10 of
-# docs/specs/2026-09-24-order-observability.md). The gate below is never its switch.
+# docs/superpowers/specs/2026-09-24-order-observability.md). The gate below is never its switch.
 @observability.metered(OBSERVE_CONTEXT_WRITE, target="wo", project="project")
 def record(store: Any, project: Any, wo: dict[str, Any], turn: dict[str, Any],
            briefing: dict[str, Any], knowledge: Any = None) -> None:

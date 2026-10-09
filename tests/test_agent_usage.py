@@ -103,6 +103,69 @@ def test_a_call_with_no_usage_is_still_recorded_as_a_call(jarvis_home):
     assert (row["input"], row["output"], row["cost_usd"]) == (0, 0, None)
 
 
+def test_the_input_size_is_taken_off_a_headless_result(jarvis_home):
+    """How big the OS's own prompt was, recorded with the call. Spec §3,
+    docs/superpowers/specs/2026-09-26-bounded-model-inputs.md — measurement, no cap."""
+    result = claude_cli.HeadlessResult(text="{}", usage={"output": 9},
+                                       model="claude-haiku-4-5",
+                                       prompt_chars=120_000,
+                                       system_prompt_chars=9_000)
+    agent_usage.record("digest", usage=result, wo_id="wo-size-1")
+
+    (row,) = calls(wo_id="wo-size-1")
+    assert (row["prompt_chars"], row["system_prompt_chars"]) == (120_000, 9_000)
+
+
+def test_the_input_size_is_taken_off_a_plain_envelope_too(jarvis_home):
+    """The load-bearing half: the seats, the panel and `worker_session` pass
+    `usage=result.usage`, a plain dict, and would otherwise record zero."""
+    agent_usage.record("panel_seat", usage={"output": 9, "prompt_chars": 4_200,
+                                            "system_prompt_chars": 700},
+                       wo_id="wo-size-2")
+
+    (row,) = calls(wo_id="wo-size-2")
+    assert (row["prompt_chars"], row["system_prompt_chars"]) == (4_200, 700)
+
+
+def test_the_latency_is_taken_off_a_headless_result(jarvis_home):
+    """How long the model took, recorded with the call. Spec §3,
+    docs/superpowers/specs/2026-10-01-neo-observability.md."""
+    result = claude_cli.HeadlessResult(text="{}", usage={"output": 9},
+                                       model="claude-haiku-4-5", latency_ms=2_400)
+    agent_usage.record("neo_answer", usage=result, wo_id="wo-lat-1")
+
+    (row,) = calls(wo_id="wo-lat-1")
+    assert row["latency_ms"] == 2_400
+
+
+def test_the_latency_is_taken_off_a_plain_envelope_too(jarvis_home):
+    """The load-bearing half: `structured.request` and `panel._record` pass
+    `usage=result.usage`, a plain dict, and would otherwise record nothing."""
+    agent_usage.record("panel_seat", usage={"output": 9, "latency_ms": 1_750},
+                       wo_id="wo-lat-2")
+
+    (row,) = calls(wo_id="wo-lat-2")
+    assert row["latency_ms"] == 1_750
+
+
+def test_a_call_nobody_timed_records_no_latency_at_all(jarvis_home):
+    """NULL, never 0: the report must not print "0 ms" for a call that was not measured."""
+    agent_usage.record("neo_answer", usage={"output": 9}, wo_id="wo-lat-3")
+    agent_usage.record("neo_answer", usage=None, wo_id="wo-lat-4")
+
+    assert [row["latency_ms"] for row in calls(wo_id="wo-lat-3")] == [None]
+    assert [row["latency_ms"] for row in calls(wo_id="wo-lat-4")] == [None]
+
+
+def test_a_call_with_no_usage_records_no_size_and_keeps_its_failure(jarvis_home):
+    """0/0 is what "not measured" reads as, and `ok=False` still says the call failed."""
+    agent_usage.record("neo_answer", usage=None, wo_id="wo-size-3", ok=False)
+
+    (row,) = calls(wo_id="wo-size-3")
+    assert (row["prompt_chars"], row["system_prompt_chars"]) == (0, 0)
+    assert row["ok"] == 0
+
+
 def test_recording_never_raises(jarvis_home, monkeypatch):
     """Accounting is an observer. A work order must not fail because a row could not be
     written — so a broken store costs a row, and nothing else."""
@@ -300,7 +363,7 @@ def test_deleting_a_work_order_takes_its_os_spend_with_it(asked):
 
 # -- the meter over the observability paths --------------------------------------------
 #
-# §10 of docs/specs/2026-09-24-order-observability.md. A THIRD CLASS beside the worker's
+# §10 of docs/superpowers/specs/2026-09-24-order-observability.md. A THIRD CLASS beside the worker's
 # turns and Jarvis's overhead: what the user spent LOOKING at an order. Its dollars are a
 # measured zero, and the measured zero is the point — "debugging is mechanical" becomes a
 # number instead of an assertion, and a path that ever gains a model call stops reading

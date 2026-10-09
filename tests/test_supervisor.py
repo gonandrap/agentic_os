@@ -877,6 +877,90 @@ def test_the_work_order_packet_is_byte_for_byte_what_it_has_always_been(
     assert packet == EXPECTED_WORK_ORDER_PACKET.format(wo_id=wo["id"])
 
 
+def test_the_work_order_packet_names_a_blocker_and_stays_silent_without_one(
+        started, monkeypatch, tmp_path):
+    """WHAT ALARM al-4bb82f7e ASKED FOR: an order correctly waiting on a dependency used
+    to read as unexplained, because the packet never stated a reason the OS already held.
+
+    The silent half is the pin: `blocker: none` would be a claim the judge weighs, and it
+    would reprice every cached review — so an unblocked order's packet keeps its bytes.
+    """
+    daemon = started()
+    monkeypatch.setattr(db, "now", lambda: FIXED_NOW)
+    inspect_cfg = daemon.catalog.projects[0].inspect
+
+    wo = ops.create_work_order("proj_a", "write the design doc")
+    store = ProjectStore(ops.find_work_order(wo["id"])[1])
+    try:
+        plain = supervisor.build_evidence(store, _wo_subject(store, wo["id"]), None,
+                                          CFG, inspect_cfg)
+        waits_on = store.create_work_order("the thing it waits on",
+                                           status="running")["id"]
+        blocked = store.create_work_order("the blocked one",
+                                          depends_on=[waits_on])["id"]
+        packet = supervisor.build_evidence(store, _wo_subject(store, blocked), None,
+                                           CFG, inspect_cfg)
+    finally:
+        store.close()
+
+    assert not [line for line in plain.splitlines() if line.startswith("blocked")]
+    (line,) = [line for line in packet.splitlines() if line.startswith("blocked:")]
+    assert line == f"blocked: {supervisor.BLOCKED_SENTENCES['dependency']}"
+    assert packet.splitlines().index(line) == \
+           packet.splitlines().index(next(l for l in packet.splitlines()
+                                          if l.startswith("this session is"))) + 1
+
+
+def test_each_transport_blocker_reads_its_sentence_from_the_hold_cause():
+    """Three ids, three sentences, and the words come from `holds.HOLD_CAUSES` — the one
+    place the OS says what a hold IS. Re-typed here they would drift from the hold line
+    the same packet shows (Neo q1241)."""
+    from jarvis import health, holds
+
+    for blocker_id, cause in health.transport_blockers().items():
+        assert holds.HOLD_CAUSES[cause] in supervisor.BLOCKED_SENTENCES[blocker_id]
+    assert len({supervisor.BLOCKED_SENTENCES[b]
+                for b in health.transport_blockers()}) == 3
+    assert set(supervisor.BLOCKED_SENTENCES) == {*health.BLOCKERS, health.CHILDREN}
+
+
+def test_the_packet_says_when_it_was_read_from_a_seal_and_says_nothing_when_it_was_not(
+        started, monkeypatch, tmp_path):
+    """§4 of docs/superpowers/specs/2026-09-27-order-autopsy-durability.md: every surface PRINTS which
+    reading answered — but ONLY the sealed case, because the derived one is the packet
+    above, byte for byte, and the judge reading it must not be told about a seal that was
+    never consulted (Neo q1080)."""
+    from jarvis import autopsy
+
+    daemon = started()
+    root = tmp_path / "projects"
+    (root / "-proj").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
+    monkeypatch.setattr(db, "now", lambda: FIXED_NOW)
+
+    wo = ops.create_work_order("proj_a", "write the design doc")
+    name, path, _row = ops.find_work_order(wo["id"])
+    store = ProjectStore(path)
+    try:
+        _fixed_transcript(root / "-proj" / f"{wo['id']}.jsonl")
+        store.update_work_order(wo["id"], status="completed", session_id=wo["id"],
+                                model="claude-opus-5")
+        inspect_cfg = daemon.catalog.projects[0].inspect
+        derived = supervisor._session_lines(store.get_work_order(wo["id"]), inspect_cfg,
+                                            store)
+        autopsy.seal(name, path, store.get_work_order(wo["id"]))
+        (root / "-proj" / f"{wo['id']}.jsonl").unlink()
+        sealed = supervisor._session_lines(store.get_work_order(wo["id"]), inspect_cfg,
+                                           store)
+    finally:
+        store.close()
+
+    assert not any("SEALED" in line for line in derived)
+    assert "SEALED autopsy" in sealed[0] and autopsy.NORMAL in sealed[0]
+    # The turns themselves are the same reading: the seal is a substitute, not a summary.
+    assert sealed[1:] == derived
+
+
 # -- the evidence packet for a FEATURE order -------------------------------------------
 
 
@@ -1099,13 +1183,18 @@ def test_the_supervisor_never_names_a_command_that_acts_on_a_work_order():
     named |= {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
     assert not (named & forbidden), sorted(named & forbidden)
 
-    imported: list[str] = []
+    # `worker_session` is the machinery that LAUNCHES AND KILLS turns, and none of it
+    # belongs here. Its rate-limit fallback DELAY is the one exception: a number, no
+    # behaviour, and the same import `neo.drain_queue` takes for the same hold (spec
+    # docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §2).
+    allowed = {"RATE_LIMIT_FALLBACK_DELAY"}
     for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imported += [a.name for a in node.names]
-        elif isinstance(node, ast.ImportFrom):
-            imported += [a.name for a in node.names] + [node.module or ""]
-    assert not any("worker_session" in name.split(".") for name in imported), imported
+        names = ([a.name for a in node.names] if isinstance(node, ast.Import)
+                 else [a.name for a in node.names] + [node.module or ""]
+                 if isinstance(node, ast.ImportFrom) else [])
+        if any("worker_session" in name.split(".") for name in names):
+            assert isinstance(node, ast.ImportFrom), ast.dump(node)
+            assert {a.name for a in node.names} <= allowed, [a.name for a in node.names]
 
 
 def test_the_pin_would_catch_the_move_it_forbids():

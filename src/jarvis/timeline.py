@@ -98,6 +98,12 @@ STATUS_LABEL = {
 }
 
 
+#: What the OS read off disk when a turn died without writing a result. A SIGNAL kind and
+#: deliberately not in `DEBUG_KINDS`: it is the only statement about the WORK that a
+#: failed turn leaves behind (spec docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md §5).
+TURN_HARVESTED = "turn_harvested"
+
+
 def event_level(kind: str) -> str:
     """"debug" for plumbing, "signal" for anything the user should see by default.
 
@@ -218,8 +224,37 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         return STATUS_LABEL.get(status, status or "Status changed"), ""
     if kind == "dispatched":
         return "Worker dispatched", p.get("worktree") or ""
+    if kind == "dispatch_deferred_for_compaction":
+        # The prompt is QUEUED, not sent: the audit trail is this, then `compacted`,
+        # then `message_delivered` (spec 2026-09-29 §3.6).
+        return ("Dispatch held behind a compaction",
+                "the prompt goes out once the conversation is summarised")
+    # §7: the verdict on THIS order, written here because the investigator's own work
+    # order is not what a reader of this one opens.
+    if kind == "investigation_verdict":
+        return (f"Investigated: {p.get('classification') or 'no classification'}",
+                " · ".join(x for x in (p.get("investigation"), p.get("filed")) if x))
     if kind == "turn_failed":
         return "Worker turn failed", (p.get("error") or "")[:200]
+    if kind == TURN_HARVESTED:
+        # §5 of docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md.
+        if p.get("empty"):
+            return ("Nothing to harvest",
+                    "the worktree was clean and the turn said nothing")
+        authored = p.get("authored") or {}
+        commits = int(authored.get("commits") or 0)
+        dirty = list(authored.get("dirty") or ())
+        parts = []
+        if commits:
+            parts.append(f"{commits} commit{'s' if commits != 1 else ''}")
+        if dirty:
+            parts.append(f"{len(dirty)} uncommitted file"
+                         f"{'s' if len(dirty) != 1 else ''}"
+                         + (f" checkpointed as {p['checkpoint']}"
+                            if p.get("checkpoint") else " left uncommitted"))
+        if p.get("said"):
+            parts.append("its last message")
+        return "Harvested what the turn left behind", ", ".join(parts)
     # The self-healing trio. Deliberately NOT filed under "Worker turn failed": nothing
     # about the WORK went wrong — the transport did, either by refusing the turn (the
     # usage window) or by dropping it (the API) — and the OS puts itself right. What the
@@ -334,11 +369,20 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         # entry and `remedy_applied` sit next to each other on a settled order, and a
         # reader who takes the first for the act goes looking for an effect only the
         # second one had.
-        return ("The supervisor asked permission to act",
-                f"{p.get('remedy') or 'a remedy'}: {p.get('argument') or ''}")
+        #
+        # NO `alarm_id` MEANS THE USER ASKED (§11 of
+        # docs/superpowers/specs/2026-09-24-order-observability.md): `remedies.propose_fix` writes no
+        # alarm row because none was raised, and naming the supervisor here would credit a
+        # judgement nobody made.
+        detail = f"{p.get('remedy') or 'a remedy'}: {p.get('argument') or ''}"
+        if not p.get("alarm_id"):
+            return ("A fix you asked for needs permission", detail)
+        return ("The supervisor asked permission to act", detail)
     if kind == "remedy_applied":
-        return ("The supervisor acted",
-                f"{p.get('remedy') or 'a remedy'}: {p.get('result') or ''}")
+        detail = f"{p.get('remedy') or 'a remedy'}: {p.get('result') or ''}"
+        if not p.get("alarm_id"):
+            return ("The OS applied the fix you asked for", detail)
+        return ("The supervisor acted", detail)
     if kind == "remedy_refused":
         # Two payload shapes arrive here — the catalog refusing to file the proposal at
         # all, and a reviewer denying it — and `by` is what tells them apart (§5).
@@ -529,8 +573,20 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         # person asked for must not read afterwards as one they did.
         rnd, was = p.get("round"), p.get("was")
         who = "by the OS" if str(p.get("by") or "") == "os" else "by hand"
-        return (f"Validation forced {who} — round {rnd}" if rnd
-                else f"Validation forced {who}",
+        # A REBIND says so beside the number: round 4 under `max_rounds` 3 reads as a
+        # spent budget otherwise (spec 2026-09-27 §4.3).
+        #
+        # ...AND SO DOES THE OTHER UNCOUNTED CAUSE, which is NOT a rebind: nobody merged
+        # anything, the user asked for the rework, and the line has to say so. `cause`
+        # is `ops.USER_REWORK_CAUSE` / `ops.REBIND_CAUSE`, quoted as a literal like
+        # "patch_id" below because this module imports nothing from `jarvis`. A row
+        # written before the cause existed carries only `rebind`, and reads as one.
+        cause = str(p.get("cause") or ("rebind" if p.get("rebind") else ""))
+        spent = (", no round spent — the rework you asked for"
+                 if cause == "user_rework"                  # ops.USER_REWORK_CAUSE
+                 else ", no round spent" if cause else "")
+        return (f"Validation forced {who} — round {rnd}{spent}" if rnd
+                else f"Validation forced {who}{spent}",
                 f"{p.get('reason') or ''}"
                 + (f" (was {was})" if was else ""))
     if kind == "validation_head_carried":
@@ -570,8 +626,16 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "validation_rejudge_declined":
         # The one moved head the OS will NOT re-judge: the round it would open is the
         # last one, and that one is the user's (same spec, §4).
+        # ...and the OTHER decline, which `max_rounds` cannot answer: the OS re-judged
+        # the merge it asked for as often as it may (spec
+        # 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.5).
+        head = str(p.get("head_sha") or "")[:10]
+        if str(p.get("cause") or "") == "rebind_exhausted":     # ops.REBIND_EXHAUSTED
+            return ("Left for you to re-judge",
+                    f"the head is now {head} and the OS has already re-judged this "
+                    f"merge {p.get('rebinds')} time(s) — the limit")
         return ("Left for you to re-judge",
-                f"the head is now {str(p.get('head_sha') or '')[:10]} and round "
+                f"the head is now {head} and round "
                 f"{p.get('next_round')} of {p.get('max_rounds')} would be the last")
     if kind == "validation_follow_ups_filed":
         # A SEVENTH kind, and the only one that is not a verdict: the round's
@@ -615,6 +679,14 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "validation_rejected":
         # The reason IS the ask the worker has to answer, so unlike the "answered"
         # kinds above it is shown here: nothing else in the timeline carries it.
+        #
+        # A REJECTED USER-REWORK ROUND SAYS NO ROUND WAS SPENT, for the reason the
+        # forced line above does: the row number runs past `max_rounds` and a reader
+        # counting it against the budget concludes it is gone when it is untouched
+        # (Neo question 973). "user_rework" is `ops.USER_REWORK_CAUSE`.
+        if str(p.get("uncounted_cause") or "") == "user_rework":
+            return ("Validation rejected — sent back, no round spent (the rework you "
+                    "asked for)", p.get("reason") or "")
         return "Validation rejected — sent back", p.get("reason") or ""
     if kind == "validation_bounced":
         # NO ROUND WAS SPENT and the line has to say so, or a reader counts this against
@@ -733,6 +805,16 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "automerge_command_unfinished":
         return ("The merge command never finished — GitHub says the merge landed",
                 (p.get("reason") or "")[:200])
+    # Spec 2026-09-28 §3.1: the OS refused before GitHub heard anything.
+    if kind == "automerge_base_stale":
+        head = str(p.get("head_sha") or "")
+        base = str(p.get("base") or "the base")
+        oid = str(p.get("base_oid") or "")
+        return ("Merge refused — the base moved under it",
+                f"round {p.get('round') or '?'} passed on "
+                f"{head[:10] or 'an unknown commit'}, and {base} is now "
+                f"at {oid[:10] or 'a commit the OS could not read'}, which that commit "
+                f"does not contain — catching the branch up instead")
     # THE TRACKER SIDE OF THE RECORD (issue #240). `issues.record_applied` writes one of
     # these three after — and only after — GitHub accepted the change, so each is the
     # evidence that a claim on the public tracker is now true. The timeline is their only
@@ -760,6 +842,17 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         # On the RELEASE order: the base is red, so the ship is deferred rather than
         # attempted. Deduped per head sha, so one line per broken commit.
         return ("Holding the release — the base branch is red",
+                p.get("detail") or (p.get("base") or ""))
+    if kind == "release_deferred_red_base":
+        # On the RELEASE order, mid-run: it delivered no release because the base is not
+        # buildable, so it waits rather than asking the user (2026-09-29 spec §1). Same
+        # head-sha dedupe as the hold above, one line per broken commit.
+        return ("Waiting to ship — the base branch is not buildable",
+                p.get("detail") or (p.get("base") or ""))
+    if kind == "release_park_red_base":
+        # ...and the end of that wait: past `Daemon.RED_PARK_AFTER_SECONDS` the release
+        # asks the user, once per episode (§3).
+        return ("Stopped waiting for the base branch and asked you",
                 p.get("detail") or (p.get("base") or ""))
     if kind == "release_completed":
         # The ending itself, whichever path reached it: `why` is which one (release.py
@@ -797,6 +890,11 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         # The user closed it, not the worker — worth telling apart on the record.
         return "Marked done by you", (
             "the worker's turn was stopped" if p.get("session_stopped") else "")
+    if kind == "retry_requested":
+        # §8 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+        return ("You retried this order",
+                "with your message" if p.get("authored")
+                else "the OS's own relaunch note — you sent no message")
     if kind == "hidden":
         return ("Hidden" if p.get("hidden") else "Unhidden"), ""
     if kind == "invariant":
@@ -816,7 +914,11 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
 #: The third is `background.SOURCE`: the note a resume carries when the last turn ended
 #: on a background job the OS caught dying with it (§4 of
 #: docs/superpowers/specs/2026-09-22-a-dead-background-job-is-not-a-live-one.md).
-UNAUTHORED_SOURCES = frozenset({"pr-conflict", "pr-checks", "background-orphan"})
+#: The fourth is `worker_session.RESUME_SOURCE`: the relaunch queued behind a compaction
+#: (§3.5 of
+#: docs/superpowers/specs/2026-09-29-one-compaction-decision-on-every-relaunch.md).
+UNAUTHORED_SOURCES = frozenset({"pr-conflict", "pr-checks", "background-orphan",
+                                "relaunch"})
 
 #: `remedies.MESSAGE_SOURCE`, spelled out here for the reason `ALARM_KINDS` is: this
 #: module is a leaf and opens nothing. A test pins the two equal. Deliberately NOT a

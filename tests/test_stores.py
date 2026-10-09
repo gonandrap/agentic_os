@@ -327,15 +327,17 @@ def test_only_the_documented_outcomes_and_statuses_are_accepted(project):
         store.record_validation_opinion(rnd["id"], "architect", verdict="approve")
 
 
-def test_the_manager_and_the_analyst_are_the_only_other_work_order_kinds(project):
+def test_the_manager_the_analyst_and_the_investigator_are_the_other_kinds(project):
     store = ProjectStore(project)
-    assert WO_KINDS == ("worker", "planner", "manager", "analyst")
+    assert WO_KINDS == ("worker", "planner", "manager", "analyst", "investigator")
 
     manager = store.create_work_order("own the feature", kind="manager")
     analyst = store.create_work_order("plan the improvement", kind="analyst")
+    investigator = store.create_work_order("diagnose wo-1", kind="investigator")
 
     assert store.get_work_order(manager["id"])["kind"] == "manager"
     assert store.get_work_order(analyst["id"])["kind"] == "analyst"
+    assert store.get_work_order(investigator["id"])["kind"] == "investigator"
     with pytest.raises(AssertionError):
         store.create_work_order("x", kind="supervisor")
 
@@ -443,9 +445,32 @@ def test_only_db_write_transaction_opens_a_transaction():
         "docstring says what a deferred one costs")
 
 
+def test_approvals_of_kind_is_not_bounded_by_the_generic_listings_window(project):
+    """`list_approvals` answers the 200 NEWEST rows of every kind, so one kind's row can
+    fall out of the window behind ordinary gate traffic. This query is per kind and per
+    status, so it cannot."""
+    # Fixture commands stay non-commands: a real `gh pr merge …` literal here trips the
+    # privileged-action recogniser on every write of this file and gates the session.
+    store = ProjectStore(project)
+    wo = store.create_work_order("x")
+    wanted = store.add_approval(wo["id"], "self_heal", "fix wo-1", status="pending")
+    store.decide_approval(wanted["id"], "approved", "go on", "test")
+    for i in range(250):
+        other = store.add_approval(wo["id"], "other_kind", f"some command {i}",
+                                   status="pending")
+        store.decide_approval(other["id"], "approved", "go on", "test")
+
+    assert wanted["id"] not in [a["id"] for a in
+                               store.list_approvals(statuses=("approved",))]
+    found = store.approvals_of_kind("self_heal", "approved")
+    assert [a["id"] for a in found] == [wanted["id"]]
+    # One status only: the approved list never carries a pending row.
+    assert store.approvals_of_kind("self_heal", "pending") == []
+
+
 # -- the per-order observability override ----------------------------------------------
 #
-# §10 of docs/specs/2026-09-24-order-observability.md, on `budget_usd`'s precedent:
+# §10 of docs/superpowers/specs/2026-09-24-order-observability.md, on `budget_usd`'s precedent:
 # nullable, and NULL is "this order has no answer" and not `off`.
 
 
@@ -482,3 +507,31 @@ def test_a_row_that_predates_the_column_has_no_answer_and_is_not_off(project):
     assert row["observability"] is None
     assert observability.level_for(row, ObservabilityConfig(level="full")) == "full"
     assert observability.records_context(row, ObservabilityConfig()) is True
+
+
+def test_an_uncounted_round_records_why_it_is_uncounted(project):
+    """Two causes now open a round outside the budget — the OS's own merge rebind and
+    the rework a USER asked for — and each has its own bound, so a counter that could
+    not tell them apart would let one spend the other's budget (spec
+    docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md,
+    Neo question 973)."""
+    from jarvis import ops
+
+    store = ProjectStore(project)
+    wo = store.create_work_order("x")
+    ordinary = store.open_validation_round(wo_id=wo["id"], fingerprint="f1")
+    rebind = store.open_validation_round(wo_id=wo["id"], fingerprint="f2",
+                                         uncounted=True,
+                                         uncounted_cause=ops.REBIND_CAUSE)
+    rework = store.open_validation_round(wo_id=wo["id"], fingerprint="f3",
+                                         uncounted=True,
+                                         uncounted_cause=ops.USER_REWORK_CAUSE)
+
+    assert ordinary["uncounted_cause"] == ""
+    assert rebind["uncounted_cause"] == ops.REBIND_CAUSE
+    assert rework["uncounted_cause"] == ops.USER_REWORK_CAUSE
+    assert store.uncounted_validation_rounds(wo_id=wo["id"]) == 2
+    assert store.uncounted_validation_rounds(
+        wo_id=wo["id"], cause=ops.REBIND_CAUSE) == 1
+    assert store.uncounted_validation_rounds(
+        wo_id=wo["id"], cause=ops.USER_REWORK_CAUSE) == 1

@@ -92,7 +92,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from . import claude_cli, seats, structured
@@ -834,11 +834,19 @@ def cited_paths(found: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
     both questions with one comparison (spec
     docs/superpowers/specs/2026-09-22-a-round-must-answer-the-list.md §4).
 
-    Title AND detail: a seat states the file in whichever it please, and reading only one
-    would silently halve the citations.
+    ANCHOR FIRST, PER FINDING: a blocker's `file` key is the file the seat says it
+    rejects, and its prose is an argument that may quote any path at all — wo-5ef5f42c
+    round 2 anchored the real spec and illustrated it with `sed -n '40,80p'
+    docs/superpowers/specs/x.md`. Only a finding with no anchor falls back to the regex, where title
+    AND detail are read: a seat states the file in whichever it please, and reading only
+    one would silently halve the citations.
     """
     seen: dict[str, None] = {}
     for f in found:
+        anchor = str(f.get("file") or "").strip()
+        if anchor:
+            seen.setdefault(anchor, None)
+            continue
         for text in (str(f.get("title") or ""), str(f.get("detail") or "")):
             for m in _CITED_PATH.finditer(text):
                 seen.setdefault(m.group(1), None)
@@ -848,7 +856,10 @@ def cited_paths(found: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
 def unanswered_submission(previous: Mapping[str, Any] | None,
                           blockers_raised: Sequence[Mapping[str, Any]],
                           before: Mapping[str, str],
-                          now: Mapping[str, str]) -> tuple[str, ...] | None:
+                          now: Mapping[str, str],
+                          *,
+                          exists: Callable[[str], bool] | None = None,
+                          ) -> tuple[str, ...] | None:
     """Did this submission touch NOTHING the previous round asked about? The paths it
     asked about if so, else None.
 
@@ -864,11 +875,24 @@ def unanswered_submission(previous: Mapping[str, Any] | None,
     and blockers that cited no path at all — in each case this cannot tell, and the cost
     of guessing wrong is bouncing work that was really done. The cost of failing open is
     one panel round, which is what happens today.
+
+    A CITATION THAT NAMES NO REAL FILE IS NOT A LIST. `exists` is the caller's
+    filesystem — `before`/`now` are maps of CHANGED paths, never a repo tree, so this
+    module cannot look for itself and stays pure (Neo question 1382). A path kept by
+    none of the three sources is dropped, and a list that empties returns None: the same
+    fail-open as "cited no path at all". Only the FILTERED paths are returned, because
+    they are what the submitter is shown.
     """
     if previous is None or str(previous.get("outcome") or "") != "rejected":
         return None
     cited = cited_paths(blockers_raised)
     if not cited or not before or not now:
+        return None
+    was, is_now = frozenset(before), frozenset(now)
+    cited = tuple(p for p in cited
+                  if (exists is not None and exists(p))
+                  or _touched(p, was) or _touched(p, is_now))
+    if not cited:
         return None
     from .evidence import changed_since
 
@@ -977,6 +1001,7 @@ def decide(store: ProjectStore, round_row: dict[str, Any], packet: EvidencePacke
             missing.append(seats.Opinion(seat=seat, raw=str(e), status="failed",
                                          replied=False, unavailable=True))
 
+    _refuse_oversized_seats(prompts)
     models = {seat: seat_model(seat, cfg) for seat in prompts}
     # WITHOUT THIS THE ROUND STILL PAYS FIVE WRITES. `run_blind` submits every seat
     # before reading any result — that is what makes it blind — so on a cold cache none
@@ -1067,6 +1092,36 @@ def decide(store: ProjectStore, round_row: dict[str, Any], packet: EvidencePacke
     # FAILS TOWARD THE USER, never toward a pass.
     return _out("escalated", reason or "the review could not reach a verdict on this "
                                        "submission.", opinions, round_no=round_no)
+
+
+def _refuse_oversized_seats(prompts: Mapping[str, tuple[str, str]]) -> None:
+    """Raise `claude_cli.PromptTooLargeError` for the largest seat past the ceiling.
+
+    PRE-FLIGHT, on the calling thread and before the priming call, because
+    `seats._run_seat` cannot do it: it documents "Never raises", runs on a pool thread
+    and touches no store, so the refusal there has nowhere to go — it becomes an
+    abstention that shrinks the quorum and
+    `Daemon._validate_work_order`'s `isinstance(failure, claude_cli.PromptTooLargeError)`
+    branch is never reached. The `prefix` is SHARED by every seat, so one seat over the
+    ceiling means every seat is: there is no partial panel worth running, and the
+    priming call must not be spent either.
+
+    The LARGEST offending seat, so the reported numbers are the true worst case. NUMBERS
+    AND IDENTIFIERS ONLY — never a fragment of the prompt. Spec §4:
+    docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+    """
+    ceiling = claude_cli.MAX_OS_PROMPT_CHARS
+    over = [(len(prefix) + len(user), seat, len(prefix), len(user))
+            for seat, (prefix, user) in prompts.items()
+            if len(prefix) + len(user) > ceiling]
+    if not over:
+        return
+    total, seat, system_chars, prompt_chars = max(over, key=lambda row: row[0])
+    raise claude_cli.PromptTooLargeError(
+        f"refused the validation seat {seat}: prompt {prompt_chars} chars + system "
+        f"prompt {system_chars} chars = {total}, over the {ceiling}-char ceiling "
+        f"(os.max_os_prompt_chars)",
+        prompt_chars=prompt_chars, system_prompt_chars=system_chars, ceiling=ceiling)
 
 
 def _out(outcome: str, reason: str, opinions: Sequence[seats.Opinion], *,

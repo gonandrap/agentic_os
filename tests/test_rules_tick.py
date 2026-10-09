@@ -1,6 +1,6 @@
 """The evaluation pass: `Daemon.rules_tick`, the fact snapshot, and the five seed rules.
 
-docs/specs/2026-09-27-self-evolution.md §5.
+docs/superpowers/specs/2026-09-27-self-evolution.md §5.
 
 **THE SITUATIONS HERE ARE SYNTHESISED, NOT REPLAYED.** The five seed rules each came out
 of a real incident with an issue behind it (#786, #788, #806, #793, #784), and the
@@ -17,7 +17,11 @@ Four properties beyond the ten seed tests:
 
 1. **Laziness is asserted by NAME.** `holds.held` walks up to `holds._EVENT_LIMIT` events
    per order; the call-count tests below wrap that exact function, so a later refactor
-   that reintroduces the walk fails loudly rather than quietly (spec §5.2.3).
+   that reintroduces the walk fails loudly rather than quietly (spec §5.2.3). Since
+   docs/superpowers/specs/2026-09-30-time-in-state-counts-a-usage-limit-hold-as-running.md
+   the `state_durations` source reads the holds too, so the claim is the pair the tests
+   make: NO walk when the live conditions name neither a hold field nor a time field, and
+   AT MOST ONE walk per order when they name both.
 2. **`armed` is inert in this release.** Nothing in the pass branches on
    `detectors.status`, so an armed detector reaching it before §6 lands records a fire
    and touches NOTHING else — no alarm, no message, no flag, no gate, and no event on the
@@ -144,14 +148,25 @@ def fires_for(central, detector_id: str, order_id: str = "") -> list[dict]:
 # -- 1. the fact snapshot is built LAZILY, and `holds.held` is named ---------------------
 
 
-def test_holds_are_never_read_when_no_live_detector_names_a_hold_field(
+def test_holds_are_never_read_when_no_live_detector_names_a_hold_or_time_field(
         started, spec, store, central, monkeypatch):
     """Spec §5.2.3, the white-box assertion it asks for by name.
 
-    `holds.held` walks up to `holds._EVENT_LIMIT` events per order. None of the five seed
-    conditions mentions `hold_cause` or `hold_seconds`, so a whole tick over a real order
-    must not call it once.
+    `holds.held` walks up to `holds._EVENT_LIMIT` events per order, so a tick whose live
+    conditions can be answered from the work order's own row must not call it once.
+
+    THE SEED CONDITIONS DO REACH IT, and that is not this pass being wasteful: every
+    reading of `ops.state_durations` reads the holds, because
+    docs/superpowers/specs/2026-09-30-time-in-state-counts-a-usage-limit-hold-as-running.md
+    made the active basis part of the reading itself, and four of the five seed rules ask
+    about time in status. The test below pins the part this pass does control — that the
+    walk happens AT MOST ONCE per order, however many sources name it.
     """
+    for det in central.list_detectors():
+        central.retract_detector(det["id"], "not under test")
+    central.add_detector("status-only", {"field": "status", "op": "eq",
+                                         "value": "needs_review"},
+                         project="proj_a", source="user")
     calls = []
     real = holds.held
     monkeypatch.setattr(holds, "held",
@@ -162,8 +177,29 @@ def test_holds_are_never_read_when_no_live_detector_names_a_hold_field(
 
     tick(started, spec, store)
 
-    assert calls == [], ("a tick whose live detectors name no hold field called "
-                         "holds.held — the snapshot is no longer lazy")
+    assert calls == [], ("a tick whose live detectors name no hold field and no time "
+                         "field called holds.held — the snapshot is no longer lazy")
+
+
+def test_the_holds_walk_happens_at_most_once_per_order(
+        started, spec, store, central, monkeypatch):
+    """Both the `holds` source and the `state_durations` source need the same reading, so
+    the snapshot shares one. Two walks per order per tick is the regression this pins."""
+    central.add_detector("hold-watch", {"all": [
+        {"field": "hold_cause", "op": "eq", "value": "gate"},
+        {"field": "seconds_in_status", "op": "gte", "value": 60}]},
+        project="proj_a", source="user")
+    calls = []
+    real = holds.held
+    monkeypatch.setattr(holds, "held",
+                        lambda *a, **k: (calls.append(1), real(*a, **k))[1])
+
+    wo = store.create_work_order("an ordinary order", status="running")
+    store.add_event(wo["id"], "dispatched", {})
+
+    tick(started, spec, store)
+
+    assert len(calls) == 1, f"holds.held was walked {len(calls)} times for one order"
 
 
 def test_holds_are_read_when_a_live_detector_names_a_hold_field(
@@ -205,6 +241,25 @@ def test_a_null_column_is_absent_and_a_budget_of_none_is_not_a_budget_of_zero(st
     assert "pr_url" not in facts.values
     assert "attention_reason" not in facts.values
     assert facts.values["needs_attention"] is False   # the FLAG is recorded, and is a bool
+
+
+def test_the_active_basis_subtracts_a_hold_from_the_reading_it_already_has(store):
+    """`seconds_in_status_active` landed on main while this branch was open, under the
+    `state_durations` source. The subtraction is off the holds THAT reading already
+    carries, so naming the field costs no walk beyond the one `state_durations` makes.
+    """
+    wo = store.create_work_order("an order that was held", status="running")
+    store.add_event(wo["id"], "hold_started", {"cause": "usage_limit"})
+    store.add_event(wo["id"], "hold_cleared", {"cause": "usage_limit"})
+    backdate_status(store, wo["id"], 4 * HOUR)
+    backdate_events(store, wo["id"], 3 * HOUR)
+
+    facts = ops.rule_facts(store, store.get_work_order(wo["id"]), now=db.now(),
+                           sources=frozenset({"state_durations"}), project="proj_a")
+
+    assert facts.values["seconds_in_status"] >= 4 * HOUR - 60
+    assert (facts.values["seconds_in_status_active"]
+            <= facts.values["seconds_in_status"])
 
 
 def test_rules_facts_delegates_to_the_reader_that_owns_the_sources(store):

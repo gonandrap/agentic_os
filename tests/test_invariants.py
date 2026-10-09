@@ -946,3 +946,1002 @@ def test_it_is_a_doctor_check_not_a_reconcile_tick_check():
     against a checkout, which is not something the reconcile loop should do every tick."""
     assert invariants.check_production_clean in invariants.OS_INVARIANTS
     assert invariants.check_production_clean not in invariants.INVARIANTS
+
+
+# -- INV-OS-HEALTH-SWEEP-DARK: the OS's own sweep must be alive -------------------------
+#
+# docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §5. USER RULE,
+# 2026-09-28 (kn-7312c7de): the OS's own project must ALWAYS have the health sweep on and
+# producing judgements.
+
+def _register_catalog(tmp_path, projects: list[dict], enabled=True, health=True) -> None:
+    import json
+
+    from jarvis.central_store import CentralStore
+
+    path = tmp_path / "dark-catalog.json"
+    path.write_text(json.dumps({
+        "os": {"supervisor": {"enabled": enabled, "health_enabled": health},
+               "notifications": {"sinks": ["log"]}},
+        "projects": projects,
+    }))
+    central = CentralStore()
+    try:
+        central.set_state("catalog_path", str(path))
+    finally:
+        central.close()
+
+
+def _dark(store) -> list:
+    return [v for v in invariants.check_os_health_sweep_alive(store)]
+
+
+def _owning(monkeypatch, tmp_path, project, **kw) -> ProjectStore:
+    """A project IS the OS only by sharing an `origin` with the running install — by
+    origin since issue 956, and still with no first-in-catalog fallback (spec §3).
+
+    Through the cache rather than a real remote: a remote on a fixture project arms every
+    other origin-gated path in the daemon. Real `git remote get-url` is
+    `test_scheduler`'s job.
+    """
+    from jarvis import schedule
+
+    install = str(Path(schedule.__file__).resolve().parent)
+    monkeypatch.setitem(schedule._ORIGIN_CACHE, install, ("gonandrap", "agentic_os"))
+    monkeypatch.setitem(schedule._ORIGIN_CACHE, str(project),
+                        ("gonandrap", "agentic_os"))
+    _register_catalog(tmp_path, [{"name": "proj_a", "path": str(project),
+                                  "description": "the OS's own"}], **kw)
+    return ProjectStore(project)
+
+
+def test_the_os_sweep_switched_off_is_reported_critical(monkeypatch, tmp_path, project):
+    store = _owning(monkeypatch, tmp_path, project, health=False)
+
+    (violation,) = _dark(store)
+
+    assert violation.invariant == "INV-OS-HEALTH-SWEEP-DARK"
+    assert violation.level == "critical"
+    assert not violation.repaired, "re-enabling it would be the OS editing the catalog"
+    assert "DISABLED" in violation.detail
+    assert "health_enabled" in violation.detail
+    store.close()
+
+
+def test_the_supervisor_switch_takes_the_sweep_dark_too(monkeypatch, tmp_path, project):
+    """Two switches, either of which is fatal: `_health_projects` requires both."""
+    store = _owning(monkeypatch, tmp_path, project, enabled=False)
+
+    (violation,) = _dark(store)
+
+    assert "supervisor.enabled" in violation.detail
+    store.close()
+
+
+def test_an_enabled_sweep_that_has_never_run_is_reported(monkeypatch, tmp_path, project):
+    store = _owning(monkeypatch, tmp_path, project)
+
+    (violation,) = _dark(store)
+
+    assert "never run" in violation.detail
+    assert violation.level == "critical"
+    store.close()
+
+
+def test_a_failing_sweep_names_the_failure(monkeypatch, tmp_path, project):
+    store = _owning(monkeypatch, tmp_path, project)
+    store.record_health_review("work_order", "wo-1", fingerprint="fp",
+                               trigger="first-look", outcome="failed",
+                               detail="unreadable health sweep output: {...}")
+
+    (violation,) = _dark(store)
+
+    assert "FAILED" in violation.detail
+    assert "unreadable health sweep output" in violation.detail
+    store.close()
+
+
+def test_a_sweep_that_judged_recently_is_not_dark(monkeypatch, tmp_path, project):
+    store = _owning(monkeypatch, tmp_path, project)
+    store.record_health_review("work_order", "wo-1", fingerprint="fp",
+                               trigger="first-look", outcome="clear")
+
+    assert _dark(store) == []
+    store.close()
+
+
+def test_a_usage_limit_window_is_not_darkness(monkeypatch, tmp_path, project):
+    """A sweep that is silent only because the ACCOUNT was is not dark: the elapsed
+    clock excludes time spent inside a hold."""
+    from jarvis import db
+    from jarvis.invariants import OS_HEALTH_SWEEP_DARK_MINUTES
+
+    store = _owning(monkeypatch, tmp_path, project)
+    window = OS_HEALTH_SWEEP_DARK_MINUTES * 60
+    started_at = db.now() - window - 600
+    store.conn.execute(
+        "INSERT INTO health_reviews (ts, subject_kind, subject_id, fingerprint, "
+        "trigger, outcome, findings, detail, reopens_at) VALUES (?,?,?,?,?,?,?,?,?)",
+        (started_at, "work_order", "wo-1", "fp", "first-look", "clear", 0, "", 0.0))
+    store.conn.execute(
+        "INSERT INTO health_reviews (ts, subject_kind, subject_id, fingerprint, "
+        "trigger, outcome, findings, detail, reopens_at) VALUES (?,?,?,?,?,?,?,?,?)",
+        (started_at + 1, "account", "", "", "account-window", "held", 0,
+         "You've hit your session limit", db.now() + 600))
+
+    assert _dark(store) == [], "the account was asleep, not the sweep"
+    store.close()
+
+
+def test_a_project_that_does_not_run_the_os_is_never_reported(monkeypatch, tmp_path,
+                                                              project):
+    """Every state above, on a project that is not the owner."""
+    from jarvis import schedule
+
+    other = tmp_path / "other"
+    (other / ".jarvis").mkdir(parents=True)
+    install = str(Path(schedule.__file__).resolve().parent)
+    monkeypatch.setitem(schedule._ORIGIN_CACHE, install, ("gonandrap", "agentic_os"))
+    monkeypatch.setitem(schedule._ORIGIN_CACHE, str(project),
+                        ("gonandrap", "agentic_os"))
+    _register_catalog(tmp_path, [
+        {"name": "proj_a", "path": str(project), "description": "the OS's own"},
+        {"name": "proj_b", "path": str(other), "description": "an ordinary one"},
+    ], health=False)
+    store = ProjectStore(other)
+
+    assert _dark(store) == []
+
+    store.record_health_review("work_order", "wo-1", fingerprint="fp",
+                               trigger="first-look", outcome="failed", detail="boom")
+    assert _dark(store) == []
+    store.close()
+
+
+def test_a_catalog_with_no_checkout_of_this_repository_owns_nothing(tmp_path, project):
+    """§5: no first-in-catalog fallback. A project sharing no `origin` with the install
+    is not the OS, however it is listed."""
+    _register_catalog(tmp_path, [{"name": "proj_a", "path": str(project),
+                                  "description": "an ordinary one"}], health=False)
+    store = ProjectStore(project)
+
+    assert _dark(store) == []
+    store.close()
+
+
+def test_an_unreadable_catalog_yields_no_violation(project):
+    """An invariant must never be the thing that raises — `_validation_timeout`'s rule."""
+    store = ProjectStore(project)
+    assert _dark(store) == []
+    store.close()
+
+
+def test_the_dark_check_runs_every_tick(tmp_path, project):
+    """A liveness check that runs hourly is a liveness check with an hour of blind
+    spot."""
+    assert invariants.check_os_health_sweep_alive in invariants.INVARIANTS
+    assert invariants.check_os_health_sweep_alive not in invariants.SLOW_INVARIANTS
+
+
+# -- INV-OS-IDENTITY: the OS's own project must be identifiable -------------------------
+#
+# Issue 956. `schedule.os_project` returning None makes three release guards, the
+# health-sweep invariant and the config refusal all silently inert — the failure that went
+# unnoticed for six duplicate release orders.
+
+OS_ORIGIN = "gonandrap/agentic_os"
+
+
+def _os_checkout(root, name, origin=OS_ORIGIN):
+    from jarvis.testing import make_git_project, with_origin
+
+    return with_origin(make_git_project(root, name), origin)
+
+
+def _install_in(checkout: Path, monkeypatch) -> None:
+    """Run as if the `jarvis` package being executed lived in this checkout."""
+    from jarvis import schedule
+
+    pkg = checkout / "src" / "jarvis"
+    pkg.mkdir(parents=True)
+    monkeypatch.setattr(schedule, "__file__", str(pkg / "schedule.py"))
+
+
+def test_an_ambiguous_os_identity_is_reported(tmp_path, monkeypatch, origins):
+    """Two catalog projects on one origin — a worktree listed beside its checkout. The
+    OS is in the catalog, so None here is a defect and not a deployment without one."""
+    dev = _os_checkout(tmp_path, "jarvis_os")
+    twin = _os_checkout(tmp_path, "jarvis_os_worktree")
+    _register_catalog(tmp_path, [
+        {"name": "jarvis_os", "path": str(dev), "description": "the OS's own"},
+        {"name": "jarvis_os_wt", "path": str(twin), "description": "its worktree"},
+    ])
+    _install_in(dev, monkeypatch)
+
+    (violation,) = list(invariants.check_os_identity())
+
+    assert violation.invariant == "INV-OS-IDENTITY"
+    assert violation.level == "critical"
+    assert not violation.repaired, "which project is the OS is not the OS's to decide"
+    assert violation.context["candidates"] == ["jarvis_os", "jarvis_os_wt"]
+    assert "release" in violation.detail
+
+
+def test_a_deployment_that_drives_no_checkout_of_this_repository_is_silent(
+        tmp_path, monkeypatch, origins):
+    """A pip-installed OS whose catalog holds only other people's projects. None is the
+    right answer there, so firing would be an alarm about a correct deployment."""
+    other = _os_checkout(tmp_path, "shared_schedule", "gonandrap/shared_schedule")
+    elsewhere = _os_checkout(tmp_path, "install")
+    _register_catalog(tmp_path, [{"name": "shared_schedule", "path": str(other),
+                                  "description": "not the OS"}])
+    _install_in(elsewhere, monkeypatch)
+
+    assert list(invariants.check_os_identity()) == []
+
+
+def test_identity_resolved_to_one_project_is_silent(tmp_path, monkeypatch, origins):
+    dev = _os_checkout(tmp_path, "jarvis_os")
+    other = _os_checkout(tmp_path, "shared_schedule", "gonandrap/shared_schedule")
+    _register_catalog(tmp_path, [
+        {"name": "shared_schedule", "path": str(other), "description": "not the OS"},
+        {"name": "jarvis_os", "path": str(dev), "description": "the OS's own"},
+    ])
+    _install_in(dev, monkeypatch)
+
+    assert list(invariants.check_os_identity()) == []
+
+
+def test_the_identity_check_is_an_os_level_one():
+    assert invariants.check_os_identity in invariants.OS_INVARIANTS
+
+
+def test_the_notification_carries_the_violations_own_level(tmp_path, project,
+                                                           monkeypatch, catalog_file):
+    """`Daemon.check_invariants` passed the literal `"warning"`, which would file this
+    one beside a stale attention flag."""
+    from jarvis.catalog import load_catalog
+    from jarvis.daemon import Daemon
+
+    ops.start_os(str(catalog_file), foreground=True)
+    daemon = Daemon(load_catalog(catalog_file))
+    spec = daemon.catalog.projects[0]
+    store = ProjectStore(spec.path)
+    monkeypatch.setattr(invariants, "check_project", lambda *a, **k: [
+        invariants.Violation(invariant="INV-MADE-UP-CRITICAL", detail="the loud one",
+                             level="critical"),
+        invariants.Violation(invariant="INV-MADE-UP-ORDINARY", detail="the usual one"),
+    ])
+
+    daemon.check_invariants(spec, store)
+
+    levels = {n["title"].split(": ")[-1]: n["level"]
+              for n in store.unrouted_notifications() if n["source"] == "invariants"}
+    assert levels["INV-MADE-UP-CRITICAL"] == "critical"
+    assert levels["INV-MADE-UP-ORDINARY"] == "warning", "every existing one is additive"
+
+
+# -- a dropped confirmation is the user's again ----------------------------------------
+#
+# §7 and §10.4 of docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-hold-
+# an-assumption-for-ever.md. `_os_is_confirming` suppressed the blocker on
+# `provisional_verdict == 'accept'` alone, so an abandoned confirmation left the order
+# unflagged AND unclosable — the worst of both (§1.3).
+
+from jarvis.neo_store import NeoStore                                     # noqa: E402
+from tests.test_autoreview import ROUTINE, ask, park, started             # noqa: E402,F401
+from tests.test_autoreview_confirm import provisional, with_diff          # noqa: E402,F401
+
+ASSUMPTION_BLOCKER = "1 assumption pending your review"
+
+
+def _confirming(started, catalog_file):
+    """A parked order with one pending assumption the OS has an early ACCEPT on."""
+    store, wo = park(started, auto_review=True)
+    # AFTER `park`, which keeps the catalog FILE's `validation.enabled` false on purpose:
+    # `ops.auto_review_at` re-reads the file, and it reads BOTH halves of the switch.
+    for key in ("validation.enabled", "validation.auto_review"):
+        ops.set_config(key, True, project="proj_a",
+                       reason="the panel has been right for a month",
+                       catalog_path=str(catalog_file))
+    (row,) = store.all_assumptions(wo["id"])
+    store.record_provisional(row["id"], verdict="accept", reason="r", model="sonnet")
+    return store, wo, row["id"]
+
+
+def test_a_confirmation_in_flight_suppresses_the_blocker_and_a_dropped_one_does_not(
+        started, catalog_file):
+    """THE SAME ROW, walked from in-flight to spent. Asserting the suppression alone
+    passes against today's code, which suppresses for ever."""
+    store, wo, aid = _confirming(started, catalog_file)
+    neo = NeoStore()
+    try:
+        q = neo.ask("proj_a", wo["id"], "confirm it?", kind="assumption")
+        store.link_assumption_confirmation(aid, q["id"])
+
+        # queued: Neo has it, and the user owes nothing
+        assert ASSUMPTION_BLOCKER not in true_blockers(store,
+                                                       store.get_work_order(wo["id"]))
+        # ...and so is a link that is not there at all — a confirmation still to come
+        store.clear_assumption_confirmation(aid)
+        assert ASSUMPTION_BLOCKER not in true_blockers(store,
+                                                       store.get_work_order(wo["id"]))
+        store.link_assumption_confirmation(aid, q["id"])
+
+        neo.mark(q["id"], "escalated", reason="yours")
+    finally:
+        neo.close()
+
+    blockers = true_blockers(store, store.get_work_order(wo["id"]))
+    assert ASSUMPTION_BLOCKER in blockers
+
+    # ...and INV-ATTENTION-REASON then names it, instead of agreeing with the lie.
+    store.flag_attention(wo["id"], IDLE_NOTIFICATION)
+    violations = [v for v in invariants.check_attention_reason_is_true(store)]
+    assert [v.invariant for v in violations] == ["INV-ATTENTION-REASON"]
+    assert store.get_work_order(wo["id"])["attention_reason"] == ASSUMPTION_BLOCKER
+
+
+def test_a_confirmation_link_nobody_can_resolve_does_not_suppress(started, catalog_file):
+    """FAIL TOWARD THE USER (§7): an unreadable question is not evidence of a confirmation
+    in flight, and the failure direction `check_blocked_work_is_surfaced` calls dangerous
+    is the silent one."""
+    store, wo, aid = _confirming(started, catalog_file)
+
+    store.link_assumption_confirmation(aid, 999_999)      # no such question, ever
+
+    assert ASSUMPTION_BLOCKER in true_blockers(store, store.get_work_order(wo["id"]))
+
+
+def test_a_transient_drop_strands_no_question_in_neo_attention(started):
+    """§4.3's PAIR, and the reason the drop site supersedes BEFORE it clears: a cleared
+    link makes the question unresolvable through `assumption_for_question`, and
+    unresolvable is deliberately left alone — so an `escalated` question plus a cleared
+    link would sit in `ops._neo_attention` for ever, which is INV-NEO-ESCALATION-STALE's
+    exact failure re-introduced by the fix."""
+    from jarvis.neo_store import USER_HELD_Q_STATUSES
+
+    store, wo = with_diff(started, assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
+    provisional(store, wo)
+    ask(started, store)
+    store.set_status(wo["id"], "running", trigger="test")
+
+    started._neo_drain()                                  # noqa: SLF001
+
+    assert store.all_assumptions(wo["id"])[0]["confirm_question_id"] is None
+    neo = NeoStore()
+    try:
+        held = neo.list_questions(statuses=USER_HELD_Q_STATUSES)
+    finally:
+        neo.close()
+    assert [q["id"] for q in held if q["kind"] == "assumption"] == []
+    assert list(invariants.check_neo_escalations_are_live(store)) == []
+
+
+# -- a rebind: the round the OS's own merge costs nobody -------------------------------
+# spec docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.5
+
+
+def _declined_on_a_moved_head(store: ProjectStore, *, cause: str,
+                              head: str = "bbbb1111bbbb2222",
+                              judged: str = "aaaa1111aaaa2222") -> dict:
+    """A pull request parked on a head the OS refused to re-judge, for `cause`."""
+    wo = store.create_work_order("add feature X")
+    store.update_work_order(wo["id"], pr_url="https://github.com/acme/proj/pull/7")
+    row = store.open_validation_round(wo_id=wo["id"], fingerprint="fp")
+    store.set_validation_head(row["id"], judged)
+    store.close_validation_round(row["id"], "passed", "")
+    store.set_status(wo["id"], "waiting_pr_merge")
+    store.add_event(wo["id"], invariants.REJUDGE_DECLINED_EVENT,
+                    {"head_sha": head, "judged_sha": judged, "cause": cause})
+    store.add_event(wo["id"], "automerge_held",
+                    {"code": invariants.HELD_SHA_MOVED, "head_sha": head})
+    return store.get_work_order(wo["id"])
+
+
+def test_a_rebind_decline_is_not_a_spent_round_budget(project):
+    """The two declines mean different things and only one is answered by
+    `validation.max_rounds` — so each derivation reads only its own."""
+    from jarvis import ops
+
+    store = ProjectStore(project)
+    spent = _declined_on_a_moved_head(store, cause=ops.REBIND_EXHAUSTED)
+
+    assert invariants.rejudge_exhausted(store, spent) is False
+    assert invariants.rebind_exhausted(store, spent) is True
+    blockers = true_blockers(store, spent)
+    assert invariants.REBIND_EXHAUSTED_BLOCKER in blockers
+    assert invariants.SHA_MOVED_BLOCKER not in blockers
+
+
+def test_a_budget_decline_still_reads_as_one(project):
+    from jarvis import ops
+
+    store = ProjectStore(project)
+    budget = _declined_on_a_moved_head(store, cause=ops.REJUDGE_BUDGET_SPENT)
+
+    assert invariants.rejudge_exhausted(store, budget) is True
+    assert invariants.rebind_exhausted(store, budget) is False
+    blockers = true_blockers(store, budget)
+    assert invariants.SHA_MOVED_BLOCKER in blockers
+    assert invariants.REBIND_EXHAUSTED_BLOCKER not in blockers
+
+
+def test_a_decline_written_before_the_cause_existed_is_a_budget_decline(project):
+    """The migration reading: a payload with no `cause` is every row there was."""
+    store = ProjectStore(project)
+    old = _declined_on_a_moved_head(store, cause="")
+
+    assert invariants.rejudge_exhausted(store, old) is True
+    assert invariants.rebind_exhausted(store, old) is False
+
+
+# -- a panel give-up that survived into `waiting_pr_merge` ----------------------------
+# docs/superpowers/specs/2026-10-01-an-escalated-round-on-a-parked-order-raises-nothing.md
+
+
+def _parked_on_an_escalation(store: ProjectStore, *, outcome: str = "escalated",
+                             hold: str | None = invariants.HELD_NOT_PASSED,
+                             status: str = "waiting_pr_merge") -> dict:
+    """A work order parked behind its pull request with the panel's last word on it."""
+    wo = store.create_work_order("add feature X")
+    store.update_work_order(wo["id"], pr_url="https://github.com/acme/proj/pull/7",
+                            result_summary="opened a PR")
+    row = store.open_validation_round(wo_id=wo["id"], fingerprint="fp")
+    store.set_validation_head(row["id"], "aaaa1111aaaa2222")
+    store.close_validation_round(row["id"], outcome, "")
+    store.set_status(wo["id"], status)
+    if hold is not None:
+        store.add_event(wo["id"], "automerge_held", {"code": hold, "round": 1})
+    return store.get_work_order(wo["id"])
+
+
+def test_a_give_up_parked_behind_a_held_merge_is_the_users(project):
+    """Row 1: the live stall on wo-3615faf7 — nothing automatic is left and the OS said
+    nothing for 47h."""
+    store = ProjectStore(project)
+    wo = _parked_on_an_escalation(store)
+
+    assert invariants.parked_on_a_give_up(store, wo) is True
+    assert invariants.PARKED_GIVE_UP_BLOCKER in true_blockers(store, wo)
+    # DERIVED, never written at the hold site (kn-089de524).
+    assert not wo["needs_attention"]
+    list(invariants.check_blocked_work_is_surfaced(store))
+    row = store.get_work_order(wo["id"])
+    assert row["needs_attention"]
+    assert row["attention_reason"] == invariants.PARKED_GIVE_UP_BLOCKER
+
+
+def test_a_hold_with_another_cause_is_not_this_stall(project):
+    """Row 2: the merge is held by something with its own machinery behind it."""
+    store = ProjectStore(project)
+    wo = _parked_on_an_escalation(store, hold="checks_running")  # any other code
+
+    assert invariants.parked_on_a_give_up(store, wo) is False
+    assert invariants.PARKED_GIVE_UP_BLOCKER not in true_blockers(store, wo)
+
+
+def test_a_project_merging_by_hand_is_not_flagged_at_all(project):
+    """Row 3: `auto_merge` off writes no hold ever, and there the pull request merges on
+    GitHub — flagging it would be reporting a working flow as the user's problem."""
+    store = ProjectStore(project)
+    wo = _parked_on_an_escalation(store, hold=None)
+
+    assert invariants.parked_on_a_give_up(store, wo) is False
+    assert invariants.PARKED_GIVE_UP_BLOCKER not in true_blockers(store, wo)
+
+
+def test_a_round_still_open_owes_nobody_anything(project):
+    """Row 4: `validation_escalated` is False while the panel is still deliberating."""
+    store = ProjectStore(project)
+    wo = _parked_on_an_escalation(store, outcome="pending")
+
+    assert invariants.parked_on_a_give_up(store, wo) is False
+    assert invariants.PARKED_GIVE_UP_BLOCKER not in true_blockers(store, wo)
+
+
+def test_a_passed_round_held_for_some_other_reason_is_not_a_give_up(project):
+    """Row 5."""
+    store = ProjectStore(project)
+    wo = _parked_on_an_escalation(store, outcome="passed")
+
+    assert invariants.parked_on_a_give_up(store, wo) is False
+    assert invariants.PARKED_GIVE_UP_BLOCKER not in true_blockers(store, wo)
+
+
+def test_a_later_round_that_passes_clears_it_without_a_new_hold(project):
+    """Row 6: self-clearing on fact 1 alone, on the same tick — it does not wait for the
+    next `automerge_held` event to be rewritten."""
+    store = ProjectStore(project)
+    wo = _parked_on_an_escalation(store)
+    assert invariants.PARKED_GIVE_UP_BLOCKER in true_blockers(store, wo)
+
+    later = store.open_validation_round(wo_id=wo["id"], fingerprint="fp2")
+    store.set_validation_head(later["id"], "bbbb1111bbbb2222")
+    store.close_validation_round(later["id"], "passed", "")
+
+    row = store.get_work_order(wo["id"])
+    assert invariants.parked_on_a_give_up(store, row) is False
+    assert invariants.PARKED_GIVE_UP_BLOCKER not in true_blockers(store, row)
+
+
+def test_an_ack_of_a_parked_give_up_stays_down(project):
+    """Row 7: kn-089de524 — the hold is rewritten every poll, so a flag written there
+    would overwrite `jarvis wo ack` for ever."""
+    store = ProjectStore(project)
+    wo = _parked_on_an_escalation(store)
+    list(invariants.check_blocked_work_is_surfaced(store))
+    row = store.get_work_order(wo["id"])
+    store.ack_attention(row["id"], true_blockers(store, row))
+
+    row = store.get_work_order(wo["id"])
+    assert invariants.PARKED_GIVE_UP_BLOCKER not in true_blockers(store, row)
+    list(invariants.check_attention_reason_is_true(store))
+    list(invariants.check_blocked_work_is_surfaced(store))
+    assert not store.get_work_order(wo["id"])["needs_attention"]
+
+
+def test_the_needs_review_arm_is_untouched(project):
+    """Row 8: the upstream sentence still answers the status it was written for, and the
+    parked twin does not double up on it."""
+    store = ProjectStore(project)
+    wo = _parked_on_an_escalation(store, status="needs_review")
+
+    blockers = true_blockers(store, wo)
+    assert VALIDATION_STUCK_BLOCKER in blockers
+    assert invariants.PARKED_GIVE_UP_BLOCKER not in blockers
+
+
+def test_a_moved_head_decline_is_the_other_sentence_and_only_that(project):
+    """Row 9: one newest hold carries one code, so the two can never co-occur."""
+    from jarvis import ops as ops_mod
+
+    store = ProjectStore(project)
+    moved = _declined_on_a_moved_head(store, cause=ops_mod.REJUDGE_BUDGET_SPENT)
+
+    blockers = true_blockers(store, moved)
+    assert invariants.SHA_MOVED_BLOCKER in blockers
+    assert invariants.PARKED_GIVE_UP_BLOCKER not in blockers
+# -- is somebody ELSE holding this, or is anything out at all? -------------------------
+# Fix 2 of docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md: two
+# questions, two resolvers, side by side so they cannot drift (kn-4ea33fe6).
+
+
+def test_a_held_gate_is_out_but_is_not_a_user_facing_wait(project):
+    store = ProjectStore(project)
+    wo = store.create_work_order("ship it")
+    store.add_approval(wo["id"], "release", "scripts/deploy.sh 0.5.4",
+                       status="awaiting_case")
+
+    assert invariants.something_is_out(store, wo["id"])
+    assert not invariants.user_facing_wait(store, wo["id"])
+    store.close()
+
+
+def test_a_pending_gate_is_both(project):
+    store = ProjectStore(project)
+    wo = store.create_work_order("ship it")
+    store.add_approval(wo["id"], "release", "scripts/deploy.sh 0.5.4")
+
+    assert invariants.something_is_out(store, wo["id"])
+    assert invariants.user_facing_wait(store, wo["id"])
+    store.close()
+
+
+def test_nothing_out_is_neither(project):
+    store = ProjectStore(project)
+    wo = store.create_work_order("ship it")
+
+    assert not invariants.something_is_out(store, wo["id"])
+    assert not invariants.user_facing_wait(store, wo["id"])
+    store.close()
+# -- §2c: an undeclared delivery, as a predicate on its own -----------------------------
+
+PUSHED = "9999999999999999999999999999999999999999"
+DELIVERED = "1111111111111111111111111111111111111111"
+
+
+def _refused_then_pushed(store: ProjectStore, *, head: str, judged: str,
+                         description: str = "") -> dict:
+    """wo-dbea82cf: delivered, judged, the user refused an assumption, then commits.
+
+    `description` is for the callers that drive the supervisor: the brief is in the
+    evidence packet, which is how the fake `claude` is asked for a verdict.
+    """
+    wo = store.create_work_order("the refused one", description=description)
+    store.add_event(wo["id"], "finished", {"summary": "opened a PR"})
+    round_ = store.open_validation_round(wo_id=wo["id"], fingerprint="fp")
+    store.set_validation_head(round_["id"], judged)
+    store.close_validation_round(round_["id"], "passed", "green")
+    store.add_event(wo["id"], "reviewed", {"accepted": False})
+    store.set_status(wo["id"], "needs_review", pr_url="https://example/pull/2",
+                     pr_head_oid=head, pr_head_seen_at=time.time())
+    return store.get_work_order(wo["id"])
+
+
+def test_commits_past_the_judged_head_with_no_finish_are_an_undeclared_delivery(project):
+    """Spec §2c. `ops.refusal_answered` stays False here — this round predates the
+    refusal and is not a user-rework round — and the OS gets a detector."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+
+    assert not ops.refusal_answered(store, wo["id"])
+    assert invariants.undeclared_delivery(store, wo)
+
+
+def test_a_head_still_at_the_judged_commit_is_not_an_undeclared_delivery(project):
+    """Nothing moved: the refusal is simply unanswered, which is today's sentence."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head=DELIVERED, judged=DELIVERED)
+
+    assert not invariants.undeclared_delivery(store, wo)
+
+
+def test_no_recorded_head_is_never_an_undeclared_delivery(project):
+    """Empty is "not recorded", never "different" — the same rule as §2b."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head="", judged=DELIVERED)
+
+    assert not invariants.undeclared_delivery(store, wo)
+
+
+def test_a_finish_after_the_refusal_answers_it_and_ends_the_detection(project):
+    """The worker declared them, so there is nothing undeclared left to nudge for."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+    store.add_event(wo["id"], "finished", {"summary": "here is what I pushed"})
+    wo = store.get_work_order(wo["id"])
+
+    assert ops.refusal_answered(store, wo["id"])
+    assert not invariants.undeclared_delivery(store, wo)
+
+
+def test_the_detector_raises_a_finding_once_and_never_an_alarm(project):
+    """`add_finding`, not `add_alarm`: the cost path's dedupe is what `add_alarm`'s one
+    call site is fenced by, and it does not fence this."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+
+    check_project(store)
+    check_project(store)
+
+    raised = [a for a in store.alarms_of(wo["id"])
+              if a["kind"] == "undeclared_delivery"]
+    assert len(raised) == 1
+    assert raised[0]["source"] == "invariant"
+
+
+def test_a_doctor_run_without_repair_reports_the_finding_and_writes_none(project):
+    """`jarvis doctor` with no `--repair` must not write, and must still SAY it.
+
+    `check_neo_escalations_are_live` is the shape: the repair that cannot be intercepted
+    by the read-only proxy is skipped by the checker itself, and the violation is
+    reported as proposed. Returning early instead loses the report as well as the write,
+    which is a doctor that cannot see the thing it exists to see."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+
+    reported = [v for v in check_project(store, repair=False)
+                if v.invariant == "INV-UNDECLARED-DELIVERY"]
+
+    assert [v.wo_id for v in reported] == [wo["id"]]
+    assert not reported[0].repaired
+    assert reported[0].repair.startswith("would raise")
+    assert store.alarms_of(wo["id"]) == []
+
+
+# -- INV-STUCK-SWEEP-DARK: the stuck sweep's own failures are a first-class alarm -------
+#
+# §8 of docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md.
+
+def _sweep_run(tmp_path, project, *, projects=None, os_extra=None, **row) -> Path:
+    """A registered catalog at `fleet_health`'s shipped defaults, plus one run row."""
+    import json
+
+    from jarvis import db
+    from jarvis.central_store import CentralStore
+    from jarvis.daemon import Daemon
+
+    path = tmp_path / "stuck-catalog.json"
+    path.write_text(json.dumps({
+        "os": {"notifications": {"sinks": ["log"]}, **(os_extra or {})},
+        "projects": projects or [
+            {"name": "proj_a", "path": str(project), "description": "test"}],
+    }))
+    central = CentralStore()
+    try:
+        central.set_state("catalog_path", str(path))
+        if row:
+            central.set_state(Daemon.STUCK_RUN_KEY, db.to_json(
+                {"ts": time.time(), "scanned": 0, "candidates": 0, "opened": 0,
+                 "skipped": {}, "excluded": "", "error": "", **row}))
+    finally:
+        central.close()
+    return path
+
+
+def _own_the_os(monkeypatch, project) -> None:
+    """Make `project` the OS-OWNING project. Identity is BY GIT ORIGIN since issue 956
+    (`schedule.os_project`), so the install and this path share one `_ORIGIN_CACHE`
+    entry — `tests/test_config_console.py`'s `os_project` fixture, verbatim in mechanism."""
+    from jarvis import schedule
+
+    install = str(Path(schedule.__file__).resolve().parent)
+    for key in {install, str(project), str(Path(project).resolve())}:
+        monkeypatch.setitem(schedule._ORIGIN_CACHE, key, ("gonandrap", "agentic_os"))
+
+
+def _stuck_dark(store) -> list:
+    return [v for v in invariants.check_stuck_sweep_alive(store)
+            if v.invariant == "INV-STUCK-SWEEP-DARK"]
+
+
+def test_sweep_error_raises_the_invariant_once(jarvis_home, tmp_path, project,
+                                               monkeypatch):
+    """§8: the run row carries the error, and the row is what the check reads."""
+    _own_the_os(monkeypatch, project)
+    _sweep_run(tmp_path, project, error="OperationalError: database is locked")
+    store = ProjectStore(project)
+
+    (violation,) = _stuck_dark(store)
+    assert violation.level == "critical" and not violation.repaired
+    assert violation.context["cause"] == "failing"
+    assert "database is locked" in violation.detail
+    # The STATE, not an event: a second read of the same row says the same thing.
+    assert [v.context["cause"] for v in _stuck_dark(store)] == ["failing"]
+
+    _sweep_run(tmp_path, project, error="")
+    assert _stuck_dark(store) == []
+    store.close()
+
+
+def test_sweep_dark_raises_after_the_window(jarvis_home, tmp_path, project, monkeypatch):
+    """§8: the window is six sweep intervals, so one capped tick cannot trip it."""
+    import jarvis.catalog as catalog_mod
+
+    _own_the_os(monkeypatch, project)
+    window = catalog_mod.DEFAULT_FLEET_HEALTH_SWEEP_DARK_MINUTES
+    _sweep_run(tmp_path, project, ts=time.time() - (window + 1) * 60)
+    store = ProjectStore(project)
+
+    (violation,) = _stuck_dark(store)
+    assert violation.context["cause"] == "dark"
+    assert window == 180
+
+    _sweep_run(tmp_path, project, ts=time.time() - (window - 1) * 60)
+    assert _stuck_dark(store) == []
+    store.close()
+
+
+def test_the_fleet_catalog_value_is_what_the_check_judges_by(
+        jarvis_home, tmp_path, project, monkeypatch):
+    """`sweep_dark_minutes` is a CATALOG setting, not a module constant: a silence the
+    180-minute default would not report fires once the fleet number is turned down."""
+    _own_the_os(monkeypatch, project)
+    silence = 20 * 60  # 20 minutes — well inside the shipped 180
+    _sweep_run(tmp_path, project, ts=time.time() - silence)
+    store = ProjectStore(project)
+    assert _stuck_dark(store) == []
+
+    _sweep_run(tmp_path, project, ts=time.time() - silence,
+               os_extra={"fleet_health": {"sweep_dark_minutes": 10}})
+    (violation,) = _stuck_dark(store)
+    assert violation.context["cause"] == "dark"
+    assert violation.context["dark_minutes"] == 20
+    store.close()
+
+
+def test_the_stuck_check_is_registered_where_it_can_push(tmp_path, project):
+    """Review round 1: in `OS_INVARIANTS` only `jarvis doctor` ran it, so a failing
+    sweep never reached the attention list. `check_os_health_sweep_alive`'s placement."""
+    assert invariants.check_stuck_sweep_alive in invariants.INVARIANTS
+    assert invariants.check_stuck_sweep_alive not in invariants.OS_INVARIANTS
+    assert invariants.check_stuck_sweep_alive not in invariants.SLOW_INVARIANTS
+
+
+def test_the_fleet_wide_sweep_is_reported_once_not_once_per_project(
+        jarvis_home, tmp_path, project, monkeypatch):
+    """One run row, one report: every project but the owner short-circuits."""
+    other = tmp_path / "other"
+    (other / ".jarvis").mkdir(parents=True)
+    _own_the_os(monkeypatch, project)
+    _sweep_run(tmp_path, project, error="boom", projects=[
+        {"name": "proj_a", "path": str(project), "description": "the OS's own"},
+        {"name": "proj_b", "path": str(other), "description": "an ordinary one"},
+    ])
+    owner, ordinary = ProjectStore(project), ProjectStore(other)
+
+    assert [v.context["cause"] for v in _stuck_dark(owner)] == ["failing"]
+    assert _stuck_dark(ordinary) == []
+    owner.close()
+    ordinary.close()
+
+
+def test_a_failing_sweep_reaches_the_attention_list(jarvis_home, tmp_path, project,
+                                                    monkeypatch):
+    """Review round 1: the push surface. A check the daemon runs per project writes a
+    `violation_reports` row, and that row is what `ops.os_status` reads (Neo 1084)."""
+    from jarvis import ops as ops_module
+    from jarvis.catalog import load_catalog
+    from jarvis.daemon import Daemon
+
+    _own_the_os(monkeypatch, project)
+    path = _sweep_run(tmp_path, project)
+    ops.start_os(str(path), foreground=True)
+    clean_scan = ops_module.stuck_scan
+
+    def boom(*a, **k):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(ops_module, "stuck_scan", boom)
+    catalog = load_catalog(path)
+    daemon, store = Daemon(catalog), ProjectStore(project)
+    try:
+        daemon.stuck_tick()
+        daemon.check_invariants(catalog.projects[0], store)
+
+        items = _stuck_attention(catalog)
+        assert len(items) == 1
+        assert "database is locked" in items[0]["reason"]
+        assert not ops.os_status(catalog)["healthy"]
+
+        daemon.stuck_tick()
+        daemon.check_invariants(catalog.projects[0], store)
+        assert len(_stuck_attention(catalog)) == 1, "one item, not one per tick"
+
+        # A CLEAN sweep clears it — but `check_invariants` only closes reports on a
+        # sweep tick, so the clean pass must be invoked with `sweep_landings=True`.
+        monkeypatch.setattr(ops_module, "stuck_scan", clean_scan)
+        daemon.stuck_tick()
+        daemon.check_invariants(catalog.projects[0], store, sweep_landings=True)
+        assert _stuck_attention(catalog) == []
+    finally:
+        store.close()
+
+
+def _stuck_attention(catalog) -> list:
+    return [i for i in ops.os_status(catalog)["attention"]
+            if i.get("invariant") == "INV-STUCK-SWEEP-DARK"]
+
+
+# -- Neo 1084: a standing critical violation is ONE attention item ----------------------
+
+
+def test_a_standing_critical_violation_reaches_the_attention_list(
+        jarvis_home, project, catalog_file, monkeypatch):
+    """Neo 1084: `jarvis status` read HEALTHY over a standing critical violation."""
+    from jarvis.catalog import load_catalog
+    from jarvis.daemon import Daemon
+
+    ops.start_os(str(catalog_file), foreground=True)
+    wo = ops.create_work_order("proj_a", "the subject")
+    violation = invariants.Violation(
+        invariant="INV-TEST-CRITICAL", detail="a standing break", level="critical",
+        wo_id=wo["id"])
+    monkeypatch.setattr(invariants, "check_project", lambda *a, **k: [violation])
+    catalog = load_catalog(catalog_file)
+    daemon, store = Daemon(catalog), ProjectStore(project)
+    try:
+        daemon.check_invariants(catalog.projects[0], store)
+        daemon.check_invariants(catalog.projects[0], store)  # ONE item, not one per tick
+    finally:
+        store.close()
+
+    status = ops.os_status(catalog)
+    items = [i for i in status["attention"] if i.get("invariant") == "INV-TEST-CRITICAL"]
+    assert len(items) == 1
+    assert items[0]["reason"] == "a standing break"
+    assert status["attention"] == items, "nothing else is asking, so this is why"
+    assert not status["healthy"]
+
+    # ...and the report row is also what takes it away again.
+    closed = ProjectStore(project)
+    try:
+        assert closed.close_violation_report("INV-TEST-CRITICAL", wo["id"])
+    finally:
+        closed.close()
+    assert ops.os_status(catalog)["attention"] == [], "the row is also the removal"
+
+
+# -- a passed forced round answers a refusal --------------------------------------------
+# docs/superpowers/specs/2026-10-08-a-passed-forced-round-answers-a-refusal.md
+
+FORCED = "2222222222222222222222222222222222222222"
+
+
+def _forced_round(store: ProjectStore, wo_id: str, *, outcome: str = "passed",
+                  cause: str | None = None, head: str = FORCED,
+                  carried: str = "") -> dict:
+    """The one round `ops.user_rework_pending` grants, opened after the refusal."""
+    row = store.open_validation_round(
+        wo_id=wo_id, fingerprint="fp2", uncounted=True,
+        uncounted_cause=ops.USER_REWORK_CAUSE if cause is None else cause)
+    if head:
+        store.set_validation_head(row["id"], head)
+    store.close_validation_round(row["id"], outcome, "green")
+    if carried:
+        store.carry_round_head(row["id"], carried, "base merge")
+    return store.latest_validation_round(wo_id=wo_id)
+
+
+def test_a_passed_user_rework_round_answers_the_refusal_and_lands(project):
+    """Spec §The predicate (b): the user forcing that round IS the declaration."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+    _forced_round(store, wo["id"])
+
+    assert ops.refusal_answered(store, wo["id"])
+    assert ops.land_when_cleared(store, store.get_work_order(wo["id"]),
+                                 "https://example/pull/2") == "waiting_pr_merge"
+
+
+def test_a_rejected_user_rework_round_leaves_the_refusal_unanswered(project):
+    """Spec §What does NOT change: (b) requires `passed`."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+    _forced_round(store, wo["id"], outcome="rejected")
+
+    assert not ops.refusal_answered(store, wo["id"])
+    assert ops.land_when_cleared(store, store.get_work_order(wo["id"]),
+                                 "https://example/pull/2") == "needs_review"
+
+
+def test_a_rebind_round_never_answers_a_refusal(project):
+    """Spec §What does NOT change: the OS demanded that merge, not the user."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+    _forced_round(store, wo["id"], cause=ops.REBIND_CAUSE)
+
+    assert not ops.refusal_answered(store, wo["id"])
+
+
+def test_an_unmoved_judged_head_does_not_answer_the_refusal(project):
+    """Spec §The head guard: a pass on the refused commit is the back door."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+    _forced_round(store, wo["id"], head=DELIVERED)
+
+    assert not ops.refusal_answered(store, wo["id"])
+
+
+def test_an_unrecorded_head_on_either_round_still_answers(project):
+    """Spec §The head guard: "" is never a match — the pre-0.10.0 population."""
+    store = ProjectStore(project)
+    forced_blank = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+    _forced_round(store, forced_blank["id"], head="")
+    prior_blank = _refused_then_pushed(store, head=PUSHED, judged="")
+    _forced_round(store, prior_blank["id"], head=DELIVERED)
+
+    assert ops.refusal_answered(store, forced_blank["id"])
+    assert ops.refusal_answered(store, prior_blank["id"])
+
+
+def test_a_round_settled_before_the_refusal_does_not_answer_it(project):
+    """Spec §The predicate: the newest counted round must be newer than the cut."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+
+    assert not ops.refusal_answered(store, wo["id"])
+
+
+def test_a_carried_head_equal_to_the_refused_one_does_not_answer(project):
+    """Spec §The head guard: `validated_head` is the read, so the carry is the head."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+    _forced_round(store, wo["id"], head=FORCED, carried=DELIVERED)
+
+    assert not ops.refusal_answered(store, wo["id"])
+
+
+def test_the_undeclared_delivery_detector_follows_the_widened_predicate(project):
+    """Spec §`invariants.undeclared_delivery`: it keeps CALLING the predicate, so an
+    answered refusal stops the nudge. A rejected forced round leaves the refusal
+    unanswered (asserted above) but records no `validated_head`, so `judged_heads` is
+    empty and the detector's own empty-set guard answers first — the True half is
+    `test_commits_past_the_judged_head_with_no_finish_are_an_undeclared_delivery`."""
+    store = ProjectStore(project)
+    answered = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+    _forced_round(store, answered["id"])
+
+    assert not invariants.undeclared_delivery(store, store.get_work_order(
+        answered["id"]))

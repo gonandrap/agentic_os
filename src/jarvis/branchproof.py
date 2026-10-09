@@ -54,20 +54,43 @@ def _env() -> dict[str, str]:
             "GIT_CONFIG_NOSYSTEM": "1", "GCM_INTERACTIVE": "never"}
 
 
-def _git(repo: Path, *args: str, stdin: str | None = None) -> str | None:
-    """`git -C repo args`, or None on any failure. Never raises."""
+def attempt(repo: Path, *args: str, stdin: str | None = None) -> tuple[str | None, str]:
+    """`run`, with GIT'S OWN STDERR beside the stdout — (stdout or None, stderr).
+
+    Exists because `run` logs the reason a command failed and returns None, so a caller
+    that has to RECORD the refusal had nothing to record: `harvest._checkpoint` writes
+    git's words into `checkpoint_skipped` (spec
+    docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md §7). Same `_env()`, same
+    `GIT_TIMEOUT`, never raises; `run` delegates here so there is one subprocess block.
+    `""` when the process could not run at all, or when it succeeded.
+    """
     try:
         proc = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
                               text=True, errors="replace", timeout=GIT_TIMEOUT,
                               check=False, env=_env(), input=stdin)
     except (OSError, subprocess.TimeoutExpired) as exc:
         log.warning("git %s in %s could not run: %s", args[0], repo, exc)
-        return None
+        return None, ""
     if proc.returncode != 0:
         log.debug("git %s in %s exited %d: %s", " ".join(args), repo, proc.returncode,
                   proc.stderr.strip()[:200])
-        return None
-    return proc.stdout
+        return None, proc.stderr.strip()
+    return proc.stdout, ""
+
+
+def run(repo: Path, *args: str, stdin: str | None = None) -> str | None:
+    """`git -C repo args`, or None on any failure. Never raises.
+
+    PUBLIC because `harvest` runs on the daemon's tick and needs exactly this one's two
+    properties — the timeout and the non-interactive `_env()` — rather than a fourth copy
+    of the `subprocess.run` block (spec docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md
+    §2). `_git` stays as the in-module alias so no existing call site changes.
+    """
+    return attempt(repo, *args, stdin=stdin)[0]
+
+
+#: The in-module name, unchanged: every existing call site reads `_git`.
+_git = run
 
 
 def _git_bytes(repo: Path, *args: str) -> bytes | None:
@@ -217,3 +240,23 @@ def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
         log.debug("not asking whether %r is an ancestor of %r", ancestor, descendant)
         return False
     return _git(repo, "merge-base", "--is-ancestor", ancestor, descendant) is not None
+
+
+def tip(repo: Path, ref: str) -> str:
+    """What commit is `ref` at, locally, right now? `""` when git cannot say.
+
+    Spec docs/superpowers/specs/2026-09-28-a-merge-checks-the-base-it-lands-on.md §3.1.
+    THE BASE TIP IS THE FACT NOTHING IN THE OS READ FRESH: `pr.base_oid` is GitHub's own
+    cached `baseRefOid`, which lagged the real tip of `main` by three commits and 5.3
+    hours on the measured incident (issue #837, gate 308). A reading of the ref the caller
+    has just fetched cannot lag anything.
+
+    Needed as a function of its own because `is_ancestor` refuses a ref name for its
+    `ancestor` argument — `SHA_RE` — so "is the base's tip in this head" has nothing to
+    ask with until the ref is resolved to a commit.
+    """
+    if not REF_RE.match(ref or ""):
+        log.debug("not resolving %r in %s", ref, repo)
+        return ""
+    out = _git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}")
+    return (out or "").strip()

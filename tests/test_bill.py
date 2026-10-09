@@ -704,6 +704,21 @@ def test_a_corrected_seal_says_what_it_corrected_rather_than_what_it_added(
     assert "the whole session's running total" in printed
 
 
+def test_the_bills_provenance_renderer_is_not_the_autopsys(store, wo, capsys):
+    """TWO FUNCTIONS, TWO NAMES. `read_session` exists twice across two modules and cost
+    §4 of 2026-09-27-order-autopsy-durability.md a whole AST pin; a second
+    `_print_provenance` inside ONE module would be that trap with no pin at all, because
+    Python would simply bind the later definition over this one.
+    """
+    from jarvis import cli
+
+    cli._print_provenance({"sealed_at": 1_000.0, "gaps": [], "complete": True})
+    printed = capsys.readouterr().out
+
+    assert "sealed when this order settled" in printed
+    assert cli._print_provenance is not cli._print_autopsy_provenance
+
+
 def test_a_seal_stands_when_the_shrink_is_a_transcript_that_was_pruned(
         store, wo, transcripts, tmp_path):
     """The other way a bill gets smaller, and it must not pass for a correction.
@@ -1212,7 +1227,7 @@ def test_a_catalog_that_cannot_be_parsed_fails_the_bill_too(store, wo, transcrip
 
 # -- the observability class -------------------------------------------------------------
 #
-# §10 of docs/specs/2026-09-24-order-observability.md. Money spent LOOKING at the order,
+# §10 of docs/superpowers/specs/2026-09-24-order-observability.md. Money spent LOOKING at the order,
 # reported as its own class for `WORKER_SUBPROCESS`'s reason: mixing it with what was spent
 # DOING the order answers neither question. Zero dollars beside a non-zero count and wall
 # clock is the honest rendering of a mechanical path, not a bug.
@@ -1306,6 +1321,86 @@ def test_a_metered_look_has_no_reading_so_it_discloses_no_under_reading(store, w
         central.close()
     envelope = json.loads(row["usage_json"])
     assert envelope["wall_ms"] == 12 and "usage_v" not in envelope
+
+
+# -- the re-write tax, labelled by side (spec 2026-10-02 §1.5) ------------------------
+
+
+def two_sided(store, wo, transcripts) -> None:
+    """A session whose MAIN side pays a re-write tax and whose subagent cannot.
+
+    Main: three writes against a context peak smaller than their sum, with one cache
+    read going backwards. Subagent: monotonic reads far above what it wrote, which is
+    every real subagent — so its excess and its boundaries are 0 BY ARITHMETIC.
+    """
+    give_session(store, wo["id"], "sess-sides")
+    transcripts(
+        "sess-sides",
+        [assistant_row("m1", write=60_000, read=50_000, out=10, at=1_001),
+         assistant_row("m2", write=60_000, read=1_000, out=10, at=1_002),
+         assistant_row("m3", write=60_000, read=2_000, out=10, at=1_003)],
+        subagents=[[assistant_row("s1", write=5_000, read=100_000, out=5, at=1_005),
+                    assistant_row("s2", write=5_000, read=120_000, out=5, at=1_006)]])
+    turn = add_turn(store, wo["id"], dict(recorded_usage(0.05), input=0,
+                                          cache_write=190_000, cache_read=273_000,
+                                          output=40))
+    at(store, turn["id"], 1_000.0, 1_060.0)
+
+
+def test_the_rewrite_tax_names_the_subagent_side_and_its_zero(store, wo, transcripts):
+    """The unlabelled rollup read as "subagent cache spend is negligible". It is not
+    negligible; it was unattributable from that number."""
+    two_sided(store, wo, transcripts)
+
+    rewrite = ops.bill(wo["id"], live=True)["rewrite"]
+    side = rewrite["by_side"]
+
+    assert side["main"]["tokens"] == rewrite["tokens"] > 0
+    assert side["main"]["boundaries"] == rewrite["boundaries"] == 1
+    assert side["subagent"]["tokens"] == 0
+    assert side["subagent"]["boundaries"] == 0
+    assert side["subagent"]["cache_write"] == 10_000
+    assert side["subagent"]["count"] == 1
+    assert side["subagent"]["structural_zero"] is True
+    # The TOTAL is untouched: `jarvis cost`'s headline arithmetic must not move.
+    assert rewrite["cache_write"] == (side["main"]["cache_write"]
+                                      + side["subagent"]["cache_write"])
+
+
+def test_the_structural_zero_is_printed_with_what_the_subagents_wrote(store, wo,
+                                                                      transcripts,
+                                                                      capsys):
+    from jarvis import cli
+
+    two_sided(store, wo, transcripts)
+
+    cli._print_bill(ops.bill(wo["id"], live=True))
+    out = capsys.readouterr().out
+
+    assert "a STRUCTURAL zero" in out and "10,000" in out
+    assert "1 subagent(s) still wrote" in out
+
+
+def test_a_non_zero_subagent_side_prints_the_two_sides_and_no_note(store, wo,
+                                                                  transcripts, capsys):
+    """A real finding, so the sentence above would be a lie about it (§1.5).
+
+    The subagent side is hand-set on a REAL bill rather than a hand-built payload: the
+    arithmetic cannot produce this case, and the renderer must still be right if some
+    future measurement does.
+    """
+    from jarvis import cli
+
+    two_sided(store, wo, transcripts)
+    payload = ops.bill(wo["id"], live=True)
+    payload["rewrite"]["by_side"]["subagent"].update(
+        tokens=400, boundaries=1, structural_zero=False)
+
+    cli._print_bill(payload)
+    out = capsys.readouterr().out
+
+    assert "a STRUCTURAL zero" not in out
+    assert "main " in out and "subagent 400" in out
 
 
 def test_the_absent_sentences_have_one_source(store, wo):

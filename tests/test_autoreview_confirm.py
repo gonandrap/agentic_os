@@ -22,11 +22,12 @@ Four properties carry the section, and each gets its own block:
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 
 import pytest
 
-from jarvis import autoreview, ops
+from jarvis import autoreview, daemon as daemon_mod, evidence, ops
 from jarvis.daemon import Daemon
 from jarvis.project_store import ProjectStore
 
@@ -153,6 +154,88 @@ def test_the_set_reaches_the_conditions_decide_owns_too():
     assert confirm(assumption=a, unreachable_question_ids=(77, 41)).armed
 
 
+# -- a dropped confirmation must not hold an assumption for ever -----------------------
+#
+# docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-hold-an-assumption-
+# for-ever.md. §4 clears the link at the settle site on a TRANSIENT drop, §5 holds the
+# pass while a round is open, §6 splits `confirming` from `confirm_spent`.
+
+
+def test_the_transient_drop_list_is_an_allowlist_of_exactly_three_codes():
+    """§4.1, asserted WHOLE so a fourth code is a visible edit rather than an accident.
+
+    The two rejected candidates are named too: `settled` has no reader (the drop site
+    returns earlier) and `evidence_secret` says the assumption is the user's."""
+    assert autoreview.TRANSIENT_DROPS == frozenset({
+        autoreview.HELD_STATUS,
+        autoreview.HELD_REFUSAL_UNANSWERED,
+        autoreview.HELD_OBJECTION_IN_FLIGHT,
+    })
+    for code in (autoreview.HELD_HIGH_STAKES, autoreview.HELD_PANEL_GAVE_UP,
+                 autoreview.HELD_DISABLED, autoreview.HELD_EVIDENCE_SECRET,
+                 autoreview.HELD_SETTLED):
+        assert code not in autoreview.TRANSIENT_DROPS
+
+
+def test_a_confirmation_question_nobody_is_answering_any_more_is_the_users():
+    """§6: the link is set and the question is closed, so nothing is in flight and the
+    hold has to say so — with the question id IN THE TEXT (§8 row 9)."""
+    a = judged(confirm_question_id=920)
+
+    spent = confirm(assumption=a, confirmation_open=False)
+
+    assert spent.code == autoreview.HELD_CONFIRM_SPENT
+    assert "920" in spent.reason and "is yours" in spent.reason
+
+
+def test_a_confirmation_genuinely_in_flight_still_reads_as_the_pass_working():
+    """The default keeps every existing caller on today's suppressed code."""
+    a = judged(confirm_question_id=920)
+
+    assert confirm(assumption=a).code == autoreview.HELD_CONFIRMING
+    assert confirm(assumption=a, confirmation_open=True).code == autoreview.HELD_CONFIRMING
+
+
+def test_a_row_neo_already_settled_is_never_told_its_confirmation_is_spent():
+    """§3.2 of docs/superpowers/specs/2026-10-01-a-confirmation-is-not-re-run-on-a-
+    settled-assumption.md: the guard `decide` and `decide_early` open with, ahead of the
+    four gates — the `confirm_question_id` gate is what short-circuits on the defect's
+    own path. The pending sibling says where the guard does NOT reach."""
+    settled = judged(status="accepted", confirm_question_id=920)
+    pending = judged(confirm_question_id=920)
+
+    assert confirm(assumption=settled,
+                   confirmation_open=False).code == autoreview.HELD_SETTLED
+    assert confirm(assumption=pending,
+                   confirmation_open=False).code == autoreview.HELD_CONFIRM_SPENT
+
+
+def test_a_dead_question_is_re_asked_rather_than_reported_as_spent():
+    """§6: `unreachable_question_ids` is checked FIRST — a `failed` question is an outage
+    (2026-09-26 spec §4), not a decision handed back."""
+    a = judged(confirm_question_id=920)
+
+    assert confirm(assumption=a, confirmation_open=False,
+                   unreachable_question_ids=(920,)).armed
+
+
+def test_a_validation_round_still_open_holds_the_confirmation():
+    """§5.1: the result this confirms against may be about to be sent back. The round
+    travels on the decision, because it is part of the dedupe key (§5.3)."""
+    held = confirm(round_n=2, round_outcome="pending")
+
+    assert held.code == autoreview.HELD_ROUND_OPEN and held.round == 2
+    assert "round 2" in held.reason
+    assert confirm(round_n=2, round_outcome="").code == autoreview.HELD_ROUND_OPEN
+
+
+def test_a_resolved_round_and_no_round_at_all_both_arm():
+    """The pair: a project with validation off has no round, and must behave exactly as
+    it does today."""
+    assert confirm(round_n=2, round_outcome="passed").armed
+    assert confirm(round_n=0, round_outcome="").armed
+
+
 # -- the daemon: asking the second question --------------------------------------------
 
 
@@ -214,7 +297,20 @@ def with_diff(started, **kw):
     return store, store.get_work_order(wo["id"])
 
 
-def stub_evidence(monkeypatch, stat: str, diff: str) -> None:
+def packet_of(stat: str, diff: str, *, pr_url: str = PR,
+              source: str = "pull_request", head: str = "wo-branch",
+              diff_truncated: bool = False,
+              dropped_files: tuple[str, ...] = ()) -> evidence.EvidencePacket:
+    """A real packet over a stated diff — `files` read off the `diff --git` headers."""
+    files = tuple(new or old for new, old, _ in evidence._sections(diff) if new or old)
+    return evidence.EvidencePacket(
+        unit="work_order", subject_id="wo-1", title="t", description="d", summary="s",
+        declared="", pr_url=pr_url, base="main", head=head, stat=stat, files=files,
+        diff=diff, diff_truncated=diff_truncated, dropped_files=dropped_files,
+        diff_sha="sha", source=source)
+
+
+def stub_evidence(monkeypatch, stat: str, diff: str, **packet) -> None:
     """Drive the pass through a chosen `(stat, diff)`, the seam that method exists for.
 
     A test about what the question CONTAINS should state the diff it means. Deriving it
@@ -225,7 +321,7 @@ def stub_evidence(monkeypatch, stat: str, diff: str) -> None:
     question.
     """
     monkeypatch.setattr(Daemon, "_confirmation_evidence",
-                        lambda self, project, wo, cfg: (stat, diff))
+                        lambda self, project, wo: packet_of(stat, diff, **packet))
 
 
 def added(path: str, body: str) -> tuple[str, str]:
@@ -395,6 +491,150 @@ def test_a_confirmed_assumption_settles_exactly_as_an_ordinary_acceptance_does(s
     assert event["neo_question_id"] == confirmation["id"]
     assert event["provisional_reason"] == PROVISIONAL_REASON
     assert event["provisional_verdict"] == "accept"
+
+
+def test_a_confirmation_dropped_because_the_status_flipped_is_asked_again(started):
+    """THE #833 SHAPE — wo-9b70ddec, wo-3312682f, wo-672bd388. The panel rejected the
+    round 19 seconds after the confirmation was filed, the settle site dropped the ruling
+    on `status`, and the link it left behind held the assumption for ever (§1.1).
+
+    §4: a transient drop clears the link and leaves the spent question CLOSED — never
+    `escalated`, which is what keeps it off `/neo` once nothing can resolve it back to an
+    assumption (§4.3) — and the next parked tick confirms against the FINAL delivered
+    diff. `neo.drain_queue` has already recorded Neo's real answer by the time the settle
+    site re-checks, so `supersede`'s open-status guard leaves that verdict alone: the
+    claim here is the STATUS, not who is credited with the answer.
+    """
+    store, wo = with_diff(started, assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
+    provisional(store, wo)
+    ask(started, store)
+    (first,) = questions()
+    store.set_status(wo["id"], "running", trigger="test")
+
+    drain(started)
+
+    assert store.all_assumptions(wo["id"])[0]["confirm_question_id"] is None
+    spent = next(q for q in questions() if q["id"] == first["id"])
+    assert spent["status"] == "answered"
+    assert spent["status"] not in ("escalated", "queued", "answering")
+    (escalated,) = events(store, wo["id"], "autoreview_escalated")
+    assert escalated["dropped"] == autoreview.HELD_STATUS
+
+    store.set_status(wo["id"], "needs_review", trigger="test")
+    ask(started, store)
+
+    (second,) = [q for q in questions() if q["id"] != first["id"]]
+    assert "opened a PR" in second["question"]          # the delivered result, again
+    assert store.all_assumptions(wo["id"])[0]["confirm_question_id"] == second["id"]
+
+    drain(started)
+
+    row = store.all_assumptions(wo["id"])[0]
+    assert row["status"] == "accepted" and row["decided_by"] == "neo"
+    (confirmed,) = events(store, wo["id"], "autoreview_confirmed")
+    assert confirmed["neo_question_id"] == second["id"]
+
+
+def test_a_high_stakes_drop_keeps_its_link_and_reads_as_the_users(started):
+    """§4.2: the drop says the assumption is the USER'S, so re-asking would lobby them
+    once per reconcile tick. The link stays, the question stays `escalated`, and §6's
+    visible hold is what stops the record showing the stale settle-site sentence."""
+    store, wo = with_diff(started, assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
+    row = provisional(store, wo)
+    ask(started, store)
+    (first,) = questions()
+    # Condition 7 is re-run against the row AS IT STANDS when the ruling lands.
+    store.conn.execute("UPDATE assumptions SET content=? WHERE id=?",
+                       (SECRET, row["id"]))
+
+    drain(started)
+
+    assert store.all_assumptions(wo["id"])[0]["confirm_question_id"] == first["id"]
+    assert next(q for q in questions() if q["id"] == first["id"])["status"] == "escalated"
+
+    ask(started, store)
+    ask(started, store)
+
+    assert [q["id"] for q in questions()] == [first["id"]]
+    held = events(store, wo["id"], "autoreview_held")
+    assert held[-1]["code"] == autoreview.HELD_CONFIRM_SPENT
+    assert str(first["id"]) in held[-1]["reason"]
+    assert "not waiting on a review" not in held[-1]["reason"]
+    # §8 rows 2 and 3: both surfaces show the new sentence, and the question id is in the
+    # prose because a hold payload carries no `neo_question_id` for the template to link.
+    enriched = ops.assumptions_with_rulings(store, wo["id"])[0]
+    line = ops.assumption_ruling_line(enriched)
+    assert str(first["id"]) in line and "not waiting on a review" not in line
+    state = ops.autoreview_state(store, store.get_work_order(wo["id"]))["line"]
+    assert str(first["id"]) in state and "not waiting on a review" not in state
+
+    before = len(held)
+    ask(started, store)
+    assert len(events(store, wo["id"], "autoreview_held")) == before
+
+
+def test_a_validation_round_still_open_files_no_confirmation_at_the_daemon_either(started):
+    """§5: the confirmation reads the DIFF, and an open round means that diff may be about
+    to be sent back. Recorded rather than suppressed (§5.3), and asked once it resolves."""
+    store, wo = with_diff(started, outcome="",
+                          assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
+    provisional(store, wo)
+
+    ask(started, store)
+
+    assert questions() == []
+    (held,) = events(store, wo["id"], "autoreview_held")
+    assert held["code"] == autoreview.HELD_ROUND_OPEN and held["round"] == 1
+
+    store.close_validation_round(
+        store.latest_validation_round(wo_id=wo["id"])["id"], "passed", "")
+    ask(started, store)
+
+    assert len(questions()) == 1
+
+
+def test_a_confirmation_nothing_flips_under_settles_on_one_ask(started):
+    """THE wo-7c7347e1 CONTRAST (§1.4): the path that always worked pays nothing for any
+    of this — one confirmation question, no hold of either new code."""
+    store, wo = with_diff(started, assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
+    provisional(store, wo)
+    ask(started, store)
+
+    drain(started)
+
+    asked = events(store, wo["id"], "autoreview_asked")
+    assert [e.get("confirm") for e in asked] == [True]
+    codes = held_codes(store, wo["id"])
+    assert autoreview.HELD_CONFIRM_SPENT not in codes
+    assert autoreview.HELD_ROUND_OPEN not in codes
+    assert store.all_assumptions(wo["id"])[0]["status"] == "accepted"
+
+
+def test_the_parked_pass_writes_no_hold_about_the_row_it_already_accepted(started):
+    """§3.1 of docs/superpowers/specs/2026-10-01-a-confirmation-is-not-re-run-on-a-
+    settled-assumption.md: one pending row drags every accepted sibling through the pass,
+    and an accepted row keeps its `provisional_verdict`, so the confirmation branch was
+    entered on it for ever. The pending sibling is asserted too: the skip is per row and
+    not a dead pass."""
+    store, wo = with_diff(started, assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
+    provisional(store, wo)
+    ask(started, store)
+    # The sibling arrives after the confirmation is filed, so one drain settles one row
+    # and leaves the order at `needs_review` with something still pending — the shape of
+    # wo-764454c5, wo-8fd40f1a and wo-9f00e3b5.
+    still_pending = store.add_assumption(wo["id"], "put the helper at the bottom")
+
+    drain(started)
+
+    accepted = store.all_assumptions(wo["id"])[0]
+    assert accepted["status"] == "accepted" and accepted["confirm_question_id"]
+
+    ask(started, store)
+
+    held = events(store, wo["id"], "autoreview_held")
+    assert [h for h in held if h.get("assumption_id") == accepted["id"]] == []
+    asked = events(store, wo["id"], "autoreview_asked")
+    assert [a["assumption_id"] for a in asked if a["assumption_id"] == still_pending]
 
 
 def test_a_verdict_that_does_not_confirm_leaves_the_assumption_with_the_user(started):
@@ -760,6 +1000,37 @@ def test_decide_evidence_arms_on_an_ordinary_summary():
     assert d.armed
 
 
+def test_the_confirmation_packet_carries_the_decision_record_too():
+    """Test 7's mirror. Both passes rule on the same assumption, so a record present on
+    one and absent on the other is #832 on every confirmation.
+
+    docs/superpowers/specs/2026-09-28-an-assumption-review-reads-the-orders-own-rulings.md.
+    """
+    from tests.test_autoreview import RECORD_HEADER, FakeNeo, FakeStore, qrow
+
+    neo_ = FakeNeo(qrow(answered_by="user", answer="build NO kill remedy"))
+
+    autoreview.propose_confirmation(
+        FakeStore(), neo_, "p", WO, judged(), [judged()],
+        evidence=autoreview.ConfirmEvidence(stat=" render.py | 2 +-",
+                                            diff="+    return 1\n"))
+
+    (packet,) = neo_.asked
+    assert RECORD_HEADER in packet
+    assert "Q887" in packet and "answered by user" in packet
+    assert packet.index("do not rule on these") < packet.index(RECORD_HEADER)
+    assert packet.index(RECORD_HEADER) < packet.index("You are CONFIRMING")
+
+
+def test_the_confirmation_packet_says_when_there_is_no_record():
+    """The empty case on this pass too: `record=""` renders the section, never omits it."""
+    packet = autoreview._confirm_question(   # noqa: SLF001
+        "p", WO, judged(), [],
+        autoreview.ConfirmEvidence(stat=" render.py | 2 +-", diff="+    return 1\n"))
+
+    assert "(no prior decisions recorded)" in packet
+
+
 def test_decide_evidence_holds_and_carries_the_row_it_is_about():
     """`assumption_id` and `n` so `_note_autoreview_held` dedupes per assumption, as
     every other hold does — otherwise one work order records this every tick."""
@@ -767,3 +1038,322 @@ def test_decide_evidence_holds_and_carries_the_row_it_is_about():
     assert d.code == autoreview.HELD_EVIDENCE_SECRET
     assert d.assumption_id == 3 and d.n == 2
     assert SECRET_VALUE not in d.reason
+
+
+# -- the question the store refuses to hold ---------------------------------------------
+
+#: Planted in every CHANGED PATH, so the refusal really is about text carrying it.
+#: Nothing the user reads may repeat it. Spec §4:
+#: docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+DIFF_MARKER = "PASTED-DIFF-MARKER-7b2d"
+
+
+def _path(i: int) -> str:
+    return f"render_{DIFF_MARKER}_{i:05d}.py"
+
+
+def _huge_stat() -> tuple[str, str]:
+    """A delivery of tens of thousands of files: the stat and the file list alone carry
+    the question past `claude_cli.MAX_OS_PROMPT_CHARS`, with the diff BODY well inside
+    `validation.confirm_diff_chars`.
+
+    § 2 budgets the diff body and NOTHING else — `_what_changed` interpolates `ev.stat`
+    whole and never truncates `ev.files`, both on purpose — so §4 is the backstop over
+    exactly the parts § 2 does not own:
+    docs/superpowers/specs/2026-09-26-bounded-model-inputs.md § 2 and §4.
+    """
+    from jarvis import claude_cli
+
+    # One stat line plus one file-list entry per file: what the question pays per file.
+    per_file = len(f" {_path(0)} | 1 +\n") + len(f"  {_path(0)}\n")
+    n = claude_cli.MAX_OS_PROMPT_CHARS // per_file + 500
+    stat = "".join(f" {_path(i)} | 1 +\n" for i in range(n))
+    stat += f" {n} files changed, {n} insertions(+)\n"
+    diff = "".join(
+        f"diff --git a/{_path(i)} b/{_path(i)}\nnew file mode 100644\n"
+        f"--- /dev/null\n+++ b/{_path(i)}\n@@ -0,0 +1,1 @@\n+    pass\n"
+        for i in range(n))
+    return stat, diff
+
+
+def _refusals(store, wo_id: str) -> list[dict]:
+    from jarvis.project_store import OS_PROMPT_REFUSED_EVENT
+
+    return events(store, wo_id, OS_PROMPT_REFUSED_EVENT)
+
+
+def _refusal_inbox(wo_id: str) -> list[dict]:
+    from jarvis.central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        return [r for r in central.unacked_inbox()
+                if r["wo_id"] == wo_id and "too large" in r["title"]]
+    finally:
+        central.close()
+
+
+def _oversized_confirmation(started, monkeypatch):
+    """A parked order whose confirmation question is past the ceiling. TICKS TWICE.
+
+    Twice is the whole point: `propose_confirmation` asks BEFORE it links, so the
+    assumption is still pending with a NULL `confirm_question_id` and every later tick
+    arrives here again.
+    """
+    store, wo = park(started, auto_review=True)
+    stub_evidence(monkeypatch, *_huge_stat())
+    provisional(store, wo)
+
+    ask(started, store)
+    ask(started, store)
+    return store, wo
+
+
+def test_a_confirmation_too_large_to_store_does_not_take_the_tick_down(
+        started, monkeypatch):
+    """`neo_store.ask` refuses before it persists, and the refusal is a `ValueError`
+    nothing on this path used to catch — so it escaped the per-assumption loop and took
+    the whole reconcile tick with it."""
+    store, wo = _oversized_confirmation(started, monkeypatch)
+
+    row = store.all_assumptions(wo["id"])[0]
+    assert row["status"] == "pending"
+    assert row["confirm_question_id"] is None
+    assert questions() == [], "an oversized question was persisted after all"
+
+
+def test_the_confirmation_refusal_is_written_down_exactly_once(started, monkeypatch):
+    """THE ONCE-GUARD. This loop runs on every reconcile tick, so an unguarded write
+    would put a critical row in the inbox every few seconds for ever."""
+    store, wo = _oversized_confirmation(started, monkeypatch)
+
+    assert len(_refusals(store, wo["id"])) == 1
+    rows = _refusal_inbox(wo["id"])
+    assert len(rows) == 1 and rows[0]["level"] == "critical"
+
+
+def test_the_confirmation_refusal_repeats_no_byte_of_the_question(started, monkeypatch):
+    """NUMBERS AND IDENTIFIERS ONLY, on every surface the user reads."""
+    store, wo = _oversized_confirmation(started, monkeypatch)
+
+    (said,) = _refusals(store, wo["id"])
+    assert said["total"] > said["ceiling"], (
+        "nothing was over the ceiling, so the rule below is vacuous")
+    (row,) = _refusal_inbox(wo["id"])
+    assert "os.max_os_prompt_chars" in row["body"]
+    assert DIFF_MARKER not in row["title"]
+    assert DIFF_MARKER not in row["body"]
+    fresh = store.get_work_order(wo["id"])
+    assert DIFF_MARKER not in str(fresh["attention_reason"])
+    assert "os.max_os_prompt_chars" in str(fresh["attention_reason"])
+
+
+# -- the confirmation question's own diff budget (spec § 2) -----------------------------
+
+#: One file's section, and every file below is this size: equal-length names make the
+#: budget arithmetic in these tests exact rather than approximate.
+MOD_BODY = "def f():\n    return 1\n"
+MOD_SECTION = len(added("mod00.py", MOD_BODY)[1])
+
+
+def mods(n: int) -> tuple[str, str]:
+    """`(stat, diff)` for `n` equal-sized added files, `mod00.py` upward."""
+    pairs = [added(f"mod{i:02d}.py", MOD_BODY) for i in range(n)]
+    return "".join(p[0] for p in pairs), "".join(p[1] for p in pairs)
+
+
+def budget(started, chars: int) -> None:
+    """The project's `validation.confirm_diff_chars`, which is what the pass trims to."""
+    started.catalog.project("proj_a").validation.confirm_diff_chars = chars
+
+
+def build(stat: str, diff: str, limit: int, *, content: str = ROUTINE,
+          **packet) -> autoreview.ConfirmEvidence:
+    return autoreview.confirm_evidence(
+        packet_of(stat, diff, **packet), assumption(content=content), limit,
+        collect_limit=daemon_mod.CONFIRM_COLLECT_CHARS)
+
+
+def test_a_diff_inside_the_budget_is_carried_whole_and_claims_no_truncation(
+        started, monkeypatch):
+    """The pairing that stops an unconditionally appended marker passing."""
+    store, wo = park(started, auto_review=True)
+    stub_evidence(monkeypatch, *added("render.py", DEFAULT_FILES["render.py"]))
+    provisional(store, wo)
+
+    ask(started, store)
+
+    (confirmation,) = questions()
+    assert "def _render_row():" in confirmation["question"]
+    assert "diff truncated" not in confirmation["question"]
+
+
+def test_a_diff_over_the_budget_is_cut_at_a_file_boundary_and_says_what_is_missing(
+        started, monkeypatch):
+    """The marker names the kept size, the exact total, the exact count and the names."""
+    stat, diff = mods(5)
+    ce = build(stat, diff, 2 * MOD_SECTION)
+    assert ce.diff_truncated and len(ce.diff) == 2 * MOD_SECTION
+    assert ce.full_chars == 5 * MOD_SECTION
+    assert ce.dropped_files == ("mod02.py", "mod03.py", "mod04.py")
+    assert ce.diff.endswith("+    return 1\n") and "mod02.py" not in ce.diff
+
+    store, wo = park(started, auto_review=True)
+    budget(started, 2 * MOD_SECTION)
+    stub_evidence(monkeypatch, stat, diff)
+    provisional(store, wo)
+
+    ask(started, store)
+
+    (confirmation,) = questions()
+    assert (f"[diff truncated — {2 * MOD_SECTION:,} of {5 * MOD_SECTION:,} chars; "
+            f"3 file(s) not shown: mod02.py, mod03.py, mod04.py; "
+            f"full diff: {PR}]") in confirmation["question"]
+    assert confirmation["question"].count("diff --git") == 2
+    assert ("Escalate rather than judge on what you cannot see."
+            in confirmation["question"])
+
+
+def test_the_stat_and_the_file_list_survive_a_budget_that_keeps_no_hunk(
+        started, monkeypatch):
+    """evidence.py's rule 3: `files` is never truncated at any limit."""
+    stat, diff = mods(5)
+    store, wo = park(started, auto_review=True)
+    budget(started, 1)
+    stub_evidence(monkeypatch, stat, diff)
+    provisional(store, wo)
+
+    ask(started, store)
+
+    (confirmation,) = questions()
+    assert confirmation["question"].count("diff --git") == 0
+    for i in range(5):
+        assert f"mod{i:02d}.py" in confirmation["question"]
+    assert (f"[diff truncated — 0 of {5 * MOD_SECTION:,} chars; "
+            f"5 file(s) not shown: ") in confirmation["question"]
+
+
+def test_the_reference_rides_on_an_untruncated_question_too(started, monkeypatch):
+    """Neo, question 753: truncated or not, the question carries the reference."""
+    store, wo = park(started, auto_review=True)
+    stub_evidence(monkeypatch, *added("render.py", DEFAULT_FILES["render.py"]))
+    provisional(store, wo)
+
+    ask(started, store)
+
+    (confirmation,) = questions()
+    assert "diff truncated" not in confirmation["question"]
+    assert f"pull request: {PR}" in confirmation["question"]
+    assert "head branch: wo-branch" in confirmation["question"]
+
+
+def test_a_sha_is_labelled_a_sha_and_a_branch_a_branch(started):
+    """The false-reference trap: `head` means different things per `source`."""
+    stat, diff = added("render.py", DEFAULT_FILES["render.py"])
+    tree = build(stat, diff, MOD_SECTION * 9, source="worktree", head="a" * 40)
+    pr = build(stat, diff, MOD_SECTION * 9, source="pull_request", head="wo-branch")
+
+    from_tree = autoreview._confirm_question("proj_a", WO, judged(), [], tree)
+    from_pr = autoreview._confirm_question("proj_a", WO, judged(), [], pr)
+
+    assert f"head sha: {'a' * 40}" in from_tree and "head branch" not in from_tree
+    assert "head branch: wo-branch" in from_pr and "head sha" not in from_pr
+
+
+def test_a_file_the_assumption_names_is_kept_even_when_diff_order_would_drop_it():
+    """Prefer the hunks that matter: the named file moves to the front of the budget."""
+    stat, diff = mods(5)
+    ce = build(stat, diff, MOD_SECTION, content="renamed the helper in mod04.py")
+
+    assert "diff --git a/mod04.py" in ce.diff
+    assert len(ce.diff) == MOD_SECTION
+    assert set(ce.dropped_files) == {f"mod{i:02d}.py" for i in range(4)}
+    assert build(stat, diff, MOD_SECTION).dropped_files[0] == "mod01.py"
+
+
+def test_a_collection_that_was_itself_truncated_never_states_a_false_total():
+    """Neo, question 945: the total is unknown, so the marker says `more than`."""
+    stat, diff = mods(5)
+    ce = build(stat, diff, 2 * MOD_SECTION, diff_truncated=True,
+               dropped_files=("later.py",))
+    text = autoreview._confirm_question("proj_a", WO, judged(), [], ce)
+
+    assert ce.collect_truncated and "later.py" in ce.dropped_files
+    assert (f"{2 * MOD_SECTION:,} of more than "
+            f"{daemon_mod.CONFIRM_COLLECT_CHARS:,} chars") in text
+    assert f"of {5 * MOD_SECTION:,} chars" not in text
+
+
+def test_the_secret_net_reads_the_trimmed_text_and_not_the_collection(
+        started, monkeypatch):
+    """`decide_evidence` scans what is persisted and sent — both directions asserted."""
+    prose = added("render.py", PROSE_BODY)
+    secret = added("settings.py", SECRET_BODY)
+    stat, diff = prose[0] + secret[0], prose[1] + secret[1]
+
+    store, wo = park(started, auto_review=True)
+    budget(started, len(prose[1]))
+    stub_evidence(monkeypatch, stat, diff)
+    provisional(store, wo)
+
+    ask(started, store)
+
+    (confirmation,) = questions()
+    assert SECRET_VALUE not in confirmation["question"]
+    assert autoreview.HELD_EVIDENCE_SECRET not in held_codes(store, wo["id"])
+
+    # The other direction: the same secret in a KEPT hunk files nothing at all.
+    store_b, wo_b = park(started, auto_review=True)
+    budget(started, len(diff))
+    provisional(store_b, wo_b)
+
+    ask(started, store_b)
+
+    assert len(questions()) == 1
+    assert held_codes(store_b, wo_b["id"]) == [autoreview.HELD_EVIDENCE_SECRET]
+
+
+def test_a_failed_collection_still_asks_with_an_empty_evidence_block(started, monkeypatch):
+    """`Daemon._confirmation_evidence` returning `None` — collection failed — must still
+    ask, with no diff fabricated and no truncation claimed."""
+    store, wo = park(started, auto_review=True)
+    monkeypatch.setattr(Daemon, "_confirmation_evidence", lambda self, project, wo: None)
+    provisional(store, wo)
+
+    ask(started, store)
+
+    (confirmation,) = questions()
+    assert "diff --git" not in confirmation["question"]
+    assert "diff truncated" not in confirmation["question"]
+    assert "pull request: (none)\nhead: (unknown)" in confirmation["question"]
+
+
+def what_changed_section(question: str) -> str:
+    """The question's `# What changed` block, heading to the next `# ` heading."""
+    head = "# What changed"
+    start = question.index(head)
+    nxt = re.compile(r"^# ", re.M).search(question, start + len(head))
+    return question[start:nxt.start() if nxt else len(question)].rstrip("\n")
+
+
+def test_every_byte_of_the_evidence_block_went_through_the_net(started, monkeypatch):
+    """The trim goes BEFORE the net, so no byte reaches `neo_store.ask` unscanned."""
+    stat, diff = mods(5)
+    seen: list[str] = []
+    real = autoreview.decide_evidence
+
+    def recorder(a, stat_text, diff_text, summary=""):
+        seen.append("\n".join([stat_text, diff_text, summary]))
+        return real(a, stat_text, diff_text, summary=summary)
+
+    monkeypatch.setattr(autoreview, "decide_evidence", recorder)
+    store, wo = park(started, auto_review=True)
+    budget(started, 2 * MOD_SECTION)
+    stub_evidence(monkeypatch, stat, diff)
+    provisional(store, wo)
+
+    ask(started, store)
+
+    (confirmation,) = questions()
+    assert len(seen) == 1
+    assert what_changed_section(confirmation["question"]) in seen[0]

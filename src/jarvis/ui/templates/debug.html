@@ -4,7 +4,7 @@
 {% block content %}
 
 {# One page for all four readings of one order — spec §7 of
-   docs/specs/2026-09-24-order-observability.md. The blocks are in the order §1 ranks the
+   docs/superpowers/specs/2026-09-24-order-observability.md. The blocks are in the order §1 ranks the
    questions and each was fetched INDEPENDENTLY, so one that could not be read is a note
    and never an error page. #}
 <h2><a href="/project/{{ project }}">{{ project }}</a> /
@@ -18,6 +18,7 @@
 </div>
 
 {% include "_debug_diagnosis.html" %}
+{% include "_debug_fix.html" %}
 {% include "_debug_live.html" %}
 {% include "_debug_anatomy.html" %}
 {% include "_debug_context.html" %}

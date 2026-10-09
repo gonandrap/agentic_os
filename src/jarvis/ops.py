@@ -26,6 +26,7 @@ log = logging.getLogger("jarvis.ops")
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from . import landing
+    from .holds import Hold
 
 from .bootstrap import BootstrapReport, bootstrap_project, settings_drift
 from .catalog import (
@@ -38,12 +39,14 @@ from .catalog import (
     parse_catalog,
     worker_stalls_on_prompts,
 )
-from . import budget, bus, config_version, db, fleet, health, invariants, observability, timeline
+from . import (budget, bus, config_version, db, fleet, harvest, health, invariants,
+               observability, release, timeline)
+from .release import RED_DEFER_EVENT, RED_PARK_EVENT
 from .agent_usage import (
     OBSERVE_CONTEXT, OBSERVE_INSPECT, OBSERVE_LIVE, OBSERVE_WHY,
 )
 from .sections import QUESTION_MAX_CHARS, QUESTION_WARN_CHARS
-from .central_store import CentralStore
+from .central_store import MISSED_MIN_WORDS, CentralStore
 from .daemon import daemon_running
 from .github import GitHubError
 from .invariants import PR_CLOSED_BLOCKER, UNLANDED_BLOCKER, true_blockers
@@ -51,6 +54,7 @@ from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import (
     ASSUMPTION_DECIDER_OS,
     ASSUMPTION_DECIDER_USER,
+    COUNTED_VALIDATION_OUTCOMES,
     FO_OPEN_STATUSES,
     FO_STATUSES,
     FO_TERMINAL_STATUSES,
@@ -176,6 +180,68 @@ def _spawn_daemon(catalog_path: str, poll_interval: float) -> subprocess.Popen:
         stdout=out, stderr=out, stdin=subprocess.DEVNULL,
         start_new_session=True,  # detach from the terminal
     )
+
+
+def fleet_summary(central: CentralStore) -> dict[str, Any]:
+    """The user's pause and the post-reopen ramp, for `jarvis status` (issue #843)."""
+    pause = fleet.load_pause(central)
+    ramp = fleet.ramp(central)
+    return {
+        "paused": pause is not None,
+        "since": pause.since if pause else None,
+        "reason": pause.reason if pause else "",
+        "allow": sorted(pause.allow) if pause else [],
+        "ramp": ({"since": ramp.since, "until": ramp.until, "cap": ramp.cap,
+                  "tripped": ramp.tripped} if ramp else None),
+    }
+
+
+def pause_fleet(reason: str = "", allow: list[str] | None = None) -> dict[str, Any]:
+    """`jarvis pause`: no work order starts a turn unless it is allow-listed.
+
+    Turns already in flight finish; nothing is killed and nothing is lost. Dispatch,
+    paused-turn resumes, message deliveries and validation rounds all wait, and each
+    waiting order says why. `jarvis resume <wo-id>` lets orders through one at a time;
+    `jarvis resume --all` lifts the pause.
+    """
+    central = CentralStore()
+    try:
+        ids = [_resolve_order_id(i) for i in (allow or [])]
+        pause = fleet.pause(central, reason=reason, allow=ids)
+        return {"paused": True, "since": pause.since, "reason": pause.reason,
+                "allow": sorted(pause.allow)}
+    finally:
+        central.close()
+
+
+def resume_fleet(order_ids: list[str] | None = None,
+                 everything: bool = False) -> dict[str, Any]:
+    """`jarvis resume`: let named orders through a pause, or lift it with `--all`."""
+    central = CentralStore()
+    try:
+        if everything:
+            fleet.unpause(central)
+            return {"paused": False}
+        if not order_ids:
+            raise OpsError("name the work orders to let through, or pass --all to lift "
+                           "the pause for the whole fleet")
+        try:
+            pause = fleet.allow(central, [_resolve_order_id(i) for i in order_ids])
+        except ValueError as e:
+            raise OpsError(str(e)) from e
+        return {"paused": True, "since": pause.since, "reason": pause.reason,
+                "allow": sorted(pause.allow)}
+    finally:
+        central.close()
+
+
+def _resolve_order_id(order_id: str) -> str:
+    """A work or feature order id that exists — a typo must not silently allow nothing."""
+    if order_id.startswith("fo-"):
+        find_feature_order(order_id)
+    else:
+        find_work_order(order_id)
+    return order_id
 
 
 def stop_os() -> dict[str, Any]:
@@ -450,7 +516,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
         try:
             _cat = catalog or resolve_catalog()
             mode_by_project = {ps.name: ps.worker.permission_mode for ps in _cat.projects}
-            fleet_state = fleet.current(_cat)
+            fleet_state = fleet.current(_cat, central=central)
         except (OpsError, CatalogError):
             mode_by_project = {}
             # `_cat` stays None and `_held_jobs` resolves the catalog itself, landing on
@@ -540,7 +606,14 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                         if mode and worker_stalls_on_prompts(mode):
                             item["resume_auto"] = f"jarvis wo resume-auto {wo['id']}"
                     attention.append(item)
-                features = store.list_feature_orders(statuses=FO_OPEN_STATUSES)
+                # `kind=None`: KIND-AGNOSTIC PATH, so it names the argument rather than
+                # leaving the default (§5 of
+                # docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md).
+                # The attention strip below already sees every kind through
+                # `flagged_feature_orders`, so a feature-only read here is what produced
+                # four attention items against an empty listing.
+                features = store.list_feature_orders(statuses=FO_OPEN_STATUSES,
+                                                     kind=None)
                 # Which feature orders get a line: the open ones, plus any that is asking
                 # for the user or holds a flagged child. Both additions are about the same
                 # status — `failed` is SETTLED, and it is also the one a feature order
@@ -596,9 +669,20 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                     "name": p["name"], "path": p["path"],
                     "description": p["description"],
                     "summary": summary,
+                    # ONE MERGED LIST WITH A `kind` LABEL, not three keys: three means
+                    # every consumer must learn three and the next kind breaks each one
+                    # again, whereas `kind` is already how the attention strip carries
+                    # this and how the rows are discriminated in the database. The label
+                    # and not the raw status, through the same single mapping: `planning`
+                    # means "analysing" for an io and "investigating" for an inv, and a
+                    # payload saying `planning` for all three is the leak in another
+                    # shape.
                     "feature_orders": [
                         {**{k: fo[k] for k in ("id", "title", "status",
                                                "needs_attention", "attention_reason")},
+                         "kind": fo.get("kind") or "feature",
+                         "status_label": feature_status_label(fo.get("kind"),
+                                                              fo["status"]),
                          "progress": feature_progress(store, fo)}
                         for fo in features
                     ],
@@ -636,6 +720,20 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                         "project": p["name"], "wo_id": None,
                         "title": "settings drift", "status": "config",
                         "reason": f".claude/settings.json: {drift}",
+                    })
+                # A STANDING CRITICAL VIOLATION IS AN ATTENTION ITEM — Neo 1084. Until
+                # this, a violation reached the inbox and nothing else, and `healthy`
+                # below is computed from attention alone: `jarvis status` read HEALTHY
+                # over a critical post-condition that was false. ONE item for as long as
+                # it stands, because the report row is the dedupe (`open_violation_report`)
+                # and `close_violation_reports` is what takes it away again.
+                for report in store.standing_violations(level="critical"):
+                    attention.append({
+                        "project": p["name"], "wo_id": report["wo_id"] or None,
+                        "title": f"OS invariant violated: {report['invariant']}",
+                        "status": "invariant", "invariant": report["invariant"],
+                        "reason": report["detail"] or report["invariant"],
+                        "decide": f"jarvis doctor {p['name']}",
                     })
                 mode = mode_by_project.get(p["name"])
                 if mode and worker_stalls_on_prompts(mode):
@@ -725,6 +823,9 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                 "pid": pid,
                 "catalog": central.get_state("catalog_path"),
             },
+            # The user's brake and the reopen ramp (issue #843). Read straight off the
+            # central store so a paused fleet says so even when the catalog cannot load.
+            "fleet": fleet_summary(central),
             "ui": ui,
             "projects": projects,
             "attention": attention,
@@ -828,7 +929,7 @@ def create_work_order(project_name: str, title: str, description: str = "",
                         else budget.default_for(_spec_or_none(project_name))),
             # Stamped, never resolved against the catalog here: NULL means "this order
             # has no answer" and the project config is read at write time
-            # (`observability.level_for`) — docs/specs/2026-09-24-order-observability.md §10.
+            # (`observability.level_for`) — docs/superpowers/specs/2026-09-24-order-observability.md §10.
             observability=observability,
         )
         # AT CREATION, from the brief the order is actually given — the only moment at
@@ -1096,6 +1197,9 @@ def send_message(wo_id: str, content: str, source: str = "jarvis",
     if wo["status"] in ("completed", "failed", "cancelled"):
         # Still allowed — resuming a finished session is fine — but tell the user.
         note = f"note: work order is {wo['status']}; the session will be revived"
+        # §9.3 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+        if wo["status"] == "failed":
+            note += f" (`jarvis wo retry {wo_id}` is the named form of this)"
     else:
         note = None
     store = ProjectStore(path)
@@ -1115,6 +1219,174 @@ def send_message(wo_id: str, content: str, source: str = "jarvis",
         store.close()
     return {"project": name, "wo_id": wo_id, "msg_id": msg_id, "note": note,
             "delivery": "jarvisd delivers when the worker is idle"}
+
+
+#: What a message-less `jarvis wo retry` puts on the queue. §3 of
+#: docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+RETRY_NOTE = (
+    "The OS is relaunching this work order because the user asked for it. Its last turn "
+    "ended without a result, so the OS recorded it as failed — nothing about the work was "
+    "judged wrong. Say where you got to, then carry on from there; do not start again. "
+    "Finish with `jarvis wo finish` when the work is done."
+)
+
+#: §5: no status write, so the order really is still `failed` until the turn goes out.
+RETRY_QUEUED = ("queued as message {msg}; jarvisd launches the turn on its next tick. The "
+                "order stays `failed` — and stays flagged — until that turn starts.")
+
+
+def retry_refusal(wo: dict[str, Any]) -> str | None:
+    """Why this work order CANNOT be retried, in the sentence that refuses it — or None.
+
+    THE ONE HOME OF THE RULE, with three callers: `retry` raises it, `_diagnose_commands`
+    mirrors it so `jarvis wo why` never offers a command that would be refused, and
+    `retry_state` renders it beside the dashboard control. `_diagnose_commands`' own rule,
+    quoted: "Every predicate here MIRRORS the refusal of the command it offers rather than
+    restating it … a second copy of a predicate passes every behavioural test and drifts
+    anyway (kn-4ea33fe6)." Same structure as `force_validation_refusal` and `ack_refusal`.
+
+    Pure over the row: §4 of
+    docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    """
+    wo_id = str(wo["id"])
+    status = str(wo["status"] or "")
+    if status != "failed":
+        return (f"{wo_id} is {status}, not failed — `wo retry` relaunches an order whose "
+                f"worker died without delivering. Carry on a {status} one with "
+                f"`jarvis wo send {wo_id} \"…\"`.")
+    if not str(wo.get("session_id") or ""):
+        return (f"{wo_id} failed before it ever opened a conversation, so there is no "
+                f"session to relaunch — a message queued here would sit undelivered "
+                f"(`worker_session.delivery_hold` holds it: \"it has no session to "
+                f"resume\"). Nothing here can be retried; file the work again.")
+    return None
+
+
+def retry_queued_notice(msg_id: int) -> str:
+    """`RETRY_QUEUED` for a page that has just redirected after a retry —
+    `fix_filed_notice`'s rule, one authority along: "REBUILT FROM THE ID, never carried
+    across the redirect as text. A note the query string supplies renders as the OS
+    speaking about what happened to an order, so a crafted link could state a false fact
+    about an ACT." The id selects the words; it cannot author them.
+    """
+    return RETRY_QUEUED.format(msg=msg_id)
+
+
+def retry_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
+    """What the work-order page's retry control shows, or None — `force_validation_state`'s
+    shape, including its None convention.
+
+    None — no control at all — on any order that is not `failed`: a permanently disabled
+    box on every page is noise for a mechanism that does not apply there. §7b of
+    docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    """
+    if str(wo["status"] or "") != "failed":
+        return None
+    refusal = retry_refusal(wo)
+    return {"can_retry": refusal is None, "refusal": refusal,
+            "assumptions": len(store.pending_assumptions(str(wo["id"])))}
+
+
+def harvest_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
+    """What the OS read off disk when this order's latest turn died, or None.
+
+    `retry_state`'s shape and its None convention, and it is THE single render contract:
+    `jarvis wo show` and the work-order page both read this, so the two cannot disagree
+    about what was saved. None — no line anywhere — when that turn was never harvested,
+    which is every turn that did not die without a result. §5 of
+    docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md.
+    """
+    payload = harvest.of_turn(store, wo)
+    if not payload:
+        return None
+    authored = payload.get("authored") or {}
+    dirty = list(authored.get("dirty") or ())
+    commits = int(authored.get("commits") or 0)
+    jobs = int(payload.get("jobs") or 0)
+    if payload.get("empty"):
+        line = "nothing — the worktree was clean and the turn said nothing"
+    else:
+        parts = []
+        if commits:
+            # PLAIN PROSE, no markdown: this one string is rendered by the HTML page as
+            # well as by the terminal, and the page has no markdown (spec §5).
+            parts.append(f"{commits} commit{'s' if commits != 1 else ''} on "
+                         f"{authored.get('branch') or 'its branch'}")
+        if dirty:
+            parts.append(f"{len(dirty)} uncommitted file"
+                         f"{'s' if len(dirty) != 1 else ''}"
+                         + (f" checkpointed as {payload['checkpoint']}"
+                            if payload.get("checkpoint") else " NOT checkpointed"
+                            + (f" ({payload['checkpoint_skipped']})"
+                               if payload.get("checkpoint_skipped") else "")))
+        if payload.get("said"):
+            parts.append("its last message")
+        if jobs:
+            parts.append(f"{jobs} orphaned background job"
+                         f"{'s' if jobs != 1 else ''}")
+        line = ", ".join(parts) or "nothing"
+    return {"seq": payload.get("seq"), "empty": bool(payload.get("empty")),
+            "line": line, "said": str(payload.get("said") or ""),
+            "branch": str(authored.get("branch") or ""),
+            "base": str(authored.get("base") or ""),
+            "commits": commits, "dirty": dirty,
+            "turn_commits": list(payload.get("turn_commits") or ()),
+            "since": str(payload.get("since") or ""),
+            "checkpoint": str(payload.get("checkpoint") or ""),
+            "checkpoint_skipped": str(payload.get("checkpoint_skipped") or ""),
+            "detached": bool(payload.get("detached")),
+            "upstream": str(payload.get("upstream") or ""),
+            "unpushed": int(payload.get("unpushed") or 0),
+            "pr_url": str(payload.get("pr_url") or ""), "jobs": jobs,
+            "unreadable": str(payload.get("unreadable") or "")}
+
+
+def retry(wo_id: str, message: str | None = None, project_name: str | None = None,
+          relay: bool = False) -> dict[str, Any]:
+    """`jarvis wo retry` — relaunch a `failed` work order in its own session.
+
+    The named form of the revive `ops.send_message` has always done as a side effect, and
+    it DELEGATES to it rather than extracting a shared helper: the revival is not code in
+    either function but the queue row plus `Daemon._deliver`'s `set_status`, and a second
+    queueing path would falsify `project_store.queue_message`'s rule that `send_message`
+    is the only caller that ever passes `MESSAGE_AUTHOR_USER`.
+
+    MANUAL ONLY — the automatic half is declined (Neo q1108: a turn that ends with no
+    result is exactly the replay risk kn-3d8fa23a excludes), and the shape is Neo q1107's.
+    Design: docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+
+    `failed` only, and it writes no status: until the daemon launches the turn the order
+    really is `failed`. Pending assumptions do NOT refuse it — a retry buries nothing, so
+    the payload carries the count instead of blocking on it.
+    """
+    name, path, wo = find_work_order(wo_id, project_name)
+    refusal = retry_refusal(wo)
+    if refusal is not None:
+        raise OpsError(refusal)
+    # §6 of docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md: what the OS read off disk
+    # beats asking the worker to re-derive it. Its own connection, closed before the
+    # delegated send opens one.
+    brief_store = ProjectStore(path)
+    try:
+        text = (message if message is not None
+                else (harvest.retry_brief(brief_store, wo) or RETRY_NOTE))
+    finally:
+        brief_store.close()
+    # §3: an OS literal must never carry the user's stamp, whatever the surface said.
+    sent = send_message(wo_id, text, source="retry", project_name=name,
+                        relay=relay and message is not None)
+    store = ProjectStore(path)
+    try:
+        # After the delegated send, so a crash between them leaves a queued message and
+        # no claim about who asked — `resume_feature_order`'s ordering reasoning (§8).
+        store.add_event(wo_id, "retry_requested",
+                        {"msg_id": sent["msg_id"], "authored": bool(message)})
+        pending = store.pending_assumptions(wo_id)
+    finally:
+        store.close()
+    return {"project": name, "wo_id": wo_id, "msg_id": sent["msg_id"],
+            "status": "failed", "authored": bool(message),
+            "note": retry_queued_notice(sent["msg_id"]), "assumptions": len(pending)}
 
 
 def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
@@ -1168,7 +1440,14 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
                           f"comes the OS abandons it unreviewed on the "
                           f"`gates.case_ttl_seconds` timer"}
     question = awaiting_neo(wo_id)
-    if question is not None:
+    # The worker's own escalated question on an order parked for review falls through to
+    # the status arm: the review is what the user owes. Spec §2a of
+    # docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
+    outranked = (question is not None
+                 and question["status"] in USER_HELD_Q_STATUSES
+                 and question["kind"] == "question"
+                 and wo["status"] == "needs_review")
+    if question is not None and not outranked:
         if question["status"] in USER_HELD_Q_STATUSES:
             return {"what": "neo_escalated", "stalled": False,
                     "detail": neo_question_blocker(question)}
@@ -1241,7 +1520,12 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
                 "detail": f"its feature's plan is waiting on you — {hold['n']} "
                           f"assumption(s) on {hold['planner_id']}; "
                           f"`jarvis wo review {hold['planner_id']}`"}
-    if wo["status"] in ("completed", "cancelled", "failed", "waiting_pr_merge",
+    # §6 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    if wo["status"] == "failed":
+        return {"what": "failed", "stalled": False,
+                "detail": f"the worker died without delivering — `jarvis wo retry {wo_id}` "
+                          f"relaunches it in the same session; nothing is running to nudge"}
+    if wo["status"] in ("completed", "cancelled", "waiting_pr_merge",
                         "needs_review"):
         return {"what": wo["status"], "stalled": False,
                 "detail": f"the work order is {wo['status']} — nothing is running to "
@@ -1468,6 +1752,12 @@ TRIGGER_WINDOW = 120.0
 NO_ACTIVITY_NOTE = ("nothing has happened to this order on the record, so there is no "
                     "last activity to date — absent, not zero")
 SETTLED_NOTE = "this order has settled, so it has no current status age"
+#: Said when the open span and the order's `status` column disagree: the column is the
+#: status, and the span is history that stops short of it. No elapsed time in it — the
+#: sentence can become an `attention_reason`, which `ack_attention` stores verbatim.
+#: Spec §2d2 of
+#: docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
+SPANS_BEHIND_NOTE = "the recorded spans do not reach this order's current status"
 FO_APPROXIMATE_NOTE = ("approximate — a feature order keeps no event trail, so this is one "
                        "coarse span from its creation")
 #: What a renderer prints for a transition nothing was written about. Never a guess and
@@ -1518,6 +1808,11 @@ class StateDurations:
     #: a caller names none — so `.as_dict()` on the CLI path and `.as_dict(now)` in a test
     #: are the same document.
     asof: float = 0.0
+    #: Every interval `holds` says the order was not permitted to run. The `Hold` objects
+    #: and not pre-computed seconds, because neither this dataclass nor `Hold` bakes in a
+    #: `now`. Spec §1 of
+    #: docs/superpowers/specs/2026-09-30-time-in-state-counts-a-usage-limit-hold-as-running.md
+    holds: tuple[Hold, ...] = ()
 
     def label(self, status: str) -> str:
         if self.order_kind == "fo":
@@ -1532,15 +1827,52 @@ class StateDurations:
             end = self.spans[-1].left
         lifetime = max(0.0, end - self.spans[0].entered) if self.spans else 0.0
 
+        # Spec §1: the subtraction is the READER's, per span, off the holds this reading
+        # already carries.
+        from . import holds as holds_mod
+
+        def held_in(start: float, end: float) -> float:
+            return sum(h.overlap(start, end, now) for h in self.holds)
+
+        def held_of(span: Span) -> float:
+            return held_in(span.entered, now if span.left is None else span.left)
+
+        total_held = held_in(self.spans[0].entered, end) if self.spans else 0.0
+        lifetime_active = max(0.0, lifetime - total_held)
+
         def share(seconds: float) -> float:
             return round(seconds / lifetime, 4) if lifetime else 0.0
+
+        # Spec §4: `share` stays wall over wall, because the Gantt's offsets are wall
+        # positions; `active_share` is the active basis, internally consistent on its own.
+        def active_share(seconds: float) -> float:
+            return round(seconds / lifetime_active, 4) if lifetime_active else 0.0
+
+        def by_cause(windows: Sequence[tuple[float, float]]) -> list[dict[str, Any]]:
+            """Biggest cause first — summed per window, so a re-entered status counts each
+            of its own spans and nothing between them (spec §2)."""
+            totals: dict[str, float] = {}
+            for start, stop in windows:
+                for cause, seconds in holds_mod.by_cause(self.holds, start, stop,
+                                                         now=now).items():
+                    totals[cause] = totals.get(cause, 0.0) + seconds
+            return [{"cause": cause, "phrase": holds_mod.HOLD_CAUSES.get(cause, cause),
+                     "seconds": round(seconds, 2), "seconds_human": ago_phrase(seconds)}
+                    for cause, seconds in sorted(totals.items(), key=lambda kv: -kv[1])]
+
+        def basis(seconds: float, held: float) -> dict[str, Any]:
+            active = max(0.0, seconds - held)
+            return {"held_seconds": round(held, 2), "held_human": ago_phrase(held),
+                    "active_seconds": round(active, 2),
+                    "active_human": ago_phrase(active),
+                    "active_share": active_share(active)}
 
         spans = [{"status": s.status, "label": self.label(s.status), "entered": s.entered,
                   "left": s.left, "open": s.left is None,
                   "seconds": round(s.seconds(now), 2),
                   "seconds_human": ago_phrase(s.seconds(now)),
                   "share": share(s.seconds(now)), "trigger": s.trigger,
-                  "approximate": s.approximate}
+                  "approximate": s.approximate, **basis(s.seconds(now), held_of(s))}
                  for s in self.spans]
         totals = []
         for status in order:
@@ -1548,13 +1880,27 @@ class StateDurations:
             if not mine:
                 continue
             seconds = round(sum(s.seconds(now) for s in mine), 2)
+            # Summed per span and never over a synthetic window: a status entered twice
+            # must not claim a hold that sits between its entries (spec §2).
+            held = sum(held_of(s) for s in mine)
             totals.append({"status": status, "label": self.label(status),
                            "seconds": seconds, "seconds_human": ago_phrase(seconds),
-                           "entries": len(mine), "share": share(seconds)})
+                           "entries": len(mine), "share": share(seconds),
+                           **basis(seconds, held),
+                           "held_by": by_cause([(s.entered,
+                                                 now if s.left is None else s.left)
+                                                for s in mine])})
         age = (round(now - self.current_status_since, 2)
                if self.current_status_since is not None else None)
         idle = (round(max(0.0, now - self.last_activity_ts), 2)
                 if self.last_activity_ts is not None else None)
+        # The current status' own hold, and the open one if there is one: `None` and never
+        # a zero-filled dict, because a missing figure is not a zero (issue #227).
+        since = self.current_status_since
+        status_held = round(held_in(since, now), 2) if since is not None else None
+        active_age = (None if age is None or status_held is None
+                      else round(max(0.0, age - status_held), 2))
+        open_hold = ([h for h in self.holds if h.open] or [None])[-1]
         return {
             "order_id": self.order_id, "order_kind": self.order_kind, "now": now,
             "approximate": self.approximate,
@@ -1570,6 +1916,21 @@ class StateDurations:
             "last_activity_age": idle,
             "last_activity_age_human": None if idle is None else ago_phrase(idle),
             "notes": list(self.notes),
+            "lifetime_held_seconds": round(total_held, 2),
+            "lifetime_active_seconds": round(lifetime_active, 2),
+            "lifetime_active_human": ago_phrase(lifetime_active),
+            "current_status_held_seconds": status_held,
+            "current_status_active_age": active_age,
+            "current_status_active_age_human": (None if active_age is None
+                                                else ago_phrase(active_age)),
+            "held_now": (None if open_hold is None else {
+                "cause": open_hold.cause, "phrase": open_hold.phrase,
+                "since": open_hold.started,
+                "seconds": round(open_hold.finish(now) - open_hold.started, 2),
+                "seconds_human": ago_phrase(open_hold.finish(now)
+                                            - open_hold.started)}),
+            "current_status_held_by": ([] if since is None
+                                       else by_cause([(since, now)])),
         }
 
 
@@ -1585,12 +1946,53 @@ def _derived_trigger(store: ProjectStore, wo_id: str, entered: float) -> str:
     return str(row["kind"]) if row else ""
 
 
+def _transcript_activity(store: ProjectStore, wo_id: str) -> list[tuple[float, str]]:
+    """The last write to the worker's transcript and to the subagent files beside it.
+
+    Spec: docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md fix 4. A
+    LEAD's transcript is quiet for the whole time its implementer types, so the subagent
+    files are the source that matters. `stat()` mtime, never a parsed last row: the
+    question is "did anything happen recently", not "what", and seeking a multi-megabyte
+    JSONL on every render would break `state_durations`' one-cheap-read contract.
+
+    ABSENT CONTRIBUTES NOTHING — no tuple, never a `0.0`, because `NO_ACTIVITY_NOTE` and
+    the view distinguish "nothing on the record at all" from "old".
+    """
+    from . import claude_cli, inspection
+    try:
+        wo = store.get_work_order(wo_id)
+        session_id = str(wo.get("session_id") or "")
+        if not session_id:
+            return []
+        # `worker_session.worktree_path`'s own computation, without the ProjectSpec
+        # import: `ops` must not load the catalog for a read this cheap.
+        worktree = wo.get("worktree")
+        cwd = (store.project_path / ".claude" / "worktrees" / str(worktree)
+               if worktree else store.project_path)
+        path = claude_cli.session_transcript_path(cwd, session_id)
+        stamps = []
+        for p in [path, *inspection._subagent_transcripts(path)]:
+            # `stat()` and not `exists()`: `exists()` swallows a PermissionError into
+            # False, and a lead whose file is merely GONE must not hide its subagents'.
+            try:
+                stamps.append(p.stat().st_mtime)
+            except FileNotFoundError:
+                continue
+    except (OSError, KeyError):
+        return []
+    return [(max(stamps), "transcript")] if stamps else []
+
+
 def _activity_of(store: ProjectStore, wo_id: str) -> list[tuple[float, str]]:
     """Every moment the record says something happened TO one work order. Spec §4.
 
     All five tables, though every activity class in today's code also writes a `wo_events`
     row: the union costs four cheap indexed `MAX()`es and cannot under-report, while the
     events-only read is one future writer away from calling a busy order idle.
+
+    Plus a sixth source off the record entirely — the session transcript's last write
+    (`_transcript_activity`), which is the only thing that moves while a worker's subagent
+    types.
     """
     quiet = _quiet_kinds()
     marks = ", ".join("?" for _ in quiet)
@@ -1611,7 +2013,26 @@ def _activity_of(store: ProjectStore, wo_id: str) -> list[tuple[float, str]]:
         stamps = [float(v) for v in tuple(got or ()) if v is not None]
         if stamps:
             found.append((max(stamps), source))
+    found.extend(_transcript_activity(store, wo_id))
     return found
+
+
+def _family_of(store: ProjectStore, fo_id: str) -> list[str]:
+    """Every work order a feature is made of: its children, its planner, its manager.
+
+    ONE walk, read by both `_last_activity` and `state_durations`' holds, so the two can
+    never disagree about what a feature is (spec §1 of
+    docs/superpowers/specs/2026-09-30-time-in-state-counts-a-usage-limit-hold-as-running.md
+    and trap 3 of kn-b7591ab3: never `carrier_for_feature`).
+    """
+    family = [c["id"] for c in store.feature_children(fo_id)]
+    fo = store.get_feature_order(fo_id)
+    if fo.get("plan_wo_id"):
+        family.append(str(fo["plan_wo_id"]))
+    manager = store.manager_work_order(fo_id)
+    if manager:
+        family.append(str(manager["id"]))
+    return family
 
 
 def _last_activity(store: ProjectStore, kind: str, order_id: str) -> tuple[float, str]:
@@ -1624,14 +2045,8 @@ def _last_activity(store: ProjectStore, kind: str, order_id: str) -> tuple[float
     if kind == "wo":
         found = _activity_of(store, order_id)
     else:
-        family = [c["id"] for c in store.feature_children(order_id)]
-        fo = store.get_feature_order(order_id)
-        if fo.get("plan_wo_id"):
-            family.append(str(fo["plan_wo_id"]))
-        manager = store.manager_work_order(order_id)
-        if manager:
-            family.append(str(manager["id"]))
-        found = [seen for child in family for seen in _activity_of(store, child)]
+        found = [seen for child in _family_of(store, order_id)
+                 for seen in _activity_of(store, child)]
         row = store.conn.execute(
             "SELECT MAX(ts) FROM validation_rounds WHERE fo_id=?", (order_id,)).fetchone()
         if row and row[0] is not None:
@@ -1648,17 +2063,30 @@ def state_durations(store: ProjectStore, *, wo_id: str = "", fo_id: str = "",
     Discriminated by keyword exactly as `validation_rounds` is — one of the two, `OpsError`
     on both or neither. `now` is a parameter because every figure here is a present-tense
     claim computed at read time from immutable rows (kn-96f47efb): un-cacheable, and
-    injectable by a test. One indexed read per table, no model, nothing written.
+    injectable by a test. One indexed read per table plus one `stat()` per transcript
+    file, no model, nothing written.
     """
     if bool(wo_id) == bool(fo_id):
         raise OpsError("state_durations takes exactly one of wo_id= or fo_id=")
+    from . import holds as holds_mod
+
     now = time.time() if now is None else now
     kind = "wo" if wo_id else "fo"
     order_id = wo_id or fo_id
+    # THE READER SUBTRACTS, not its five callers: an optional `spans=` would reproduce
+    # issue 887 for every caller that forgot to opt in (spec §1).
+    episodes = (holds_mod.held(store, order_id, now=now) if kind == "wo"
+                else holds_mod.held_family(store, _family_of(store, order_id), now=now))
     terminal = TERMINAL_STATUSES if kind == "wo" else FO_TERMINAL_STATUSES
     row_kind = ""
+    # The order's own row, for `wo` too now: its `status` column is the status, and the
+    # spans are a record that can stop short of it. Spec §2d2 of
+    # docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
+    row = (store.get_feature_order(order_id) if kind == "fo"
+           else store.get_work_order(order_id))
     if kind == "fo":
-        row_kind = str(store.get_feature_order(order_id).get("kind") or "feature")
+        row_kind = str(row.get("kind") or "feature")
+    column_status = str(row.get("status") or "")
 
     rows = store.state_spans(order_id)
     spans: list[Span] = []
@@ -1678,6 +2106,10 @@ def state_durations(store: ProjectStore, *, wo_id: str = "", fo_id: str = "",
                           approximate=bool(row["approximate"])))
 
     open_span = spans[-1] if spans and spans[-1].left is None else None
+    # A span that disagrees with the column is not a present-tense claim: report the
+    # column, with no age at all rather than the stale span's.
+    behind = (open_span is not None and column_status
+              and open_span.status != column_status)
     activity_ts, activity_kind = _last_activity(store, kind, order_id)
     approximate = any(s.approximate for s in spans)
     notes: list[str] = []
@@ -1687,13 +2119,17 @@ def state_durations(store: ProjectStore, *, wo_id: str = "", fo_id: str = "",
         notes.append(NO_ACTIVITY_NOTE)
     if spans and open_span is None:
         notes.append(SETTLED_NOTE)
+    if behind:
+        notes.append(SPANS_BEHIND_NOTE)
     return StateDurations(
         order_id=order_id, order_kind=kind, spans=tuple(spans),
-        current_status=open_span.status if open_span else "",
-        current_status_since=open_span.entered if open_span else None,
+        current_status=(column_status if behind
+                        else (open_span.status if open_span else "")),
+        current_status_since=(open_span.entered
+                              if open_span is not None and not behind else None),
         last_activity_ts=activity_ts if activity_kind else None,
         last_activity_kind=activity_kind, approximate=approximate,
-        notes=tuple(notes), row_kind=row_kind, asof=now,
+        notes=tuple(notes), row_kind=row_kind, asof=now, holds=tuple(episodes),
     )
 
 #: Pinned rule `kn-40db1828`, applied with full force (spec §6.4). A call that errored,
@@ -1754,22 +2190,20 @@ def _diagnose_clock(store: ProjectStore, wo_id: str, now: float) -> dict[str, An
 def _diagnose_holds(store: ProjectStore, wo: dict[str, Any],
                     project: str, now: float) -> dict[str, Any]:
     """Every episode the record says held this order, plus the honest residual."""
+    from . import autopsy
     from . import holds as holds_mod
-    from . import inspection
 
     episodes = holds_mod.held(store, wo["id"], now=now)
     by_cause = {cause: round(seconds, 2) for cause, seconds
                 in holds_mod.by_cause(episodes, float("-inf"), now, now=now).items()}
-    session = str(wo.get("session_id") or "")
-    # Exactly `inspect_report`'s inner `unit()` shape, and it takes the SAME two
-    # arguments for the same reason: `read_session` has never opened the OS's database,
-    # so the spans are passed in. The walk itself is not touched here — this report reads
-    # one number off it (Neo, question 680).
-    anatomy = (inspection.read_session(session, inspect_config(project),
-                                       spans=list(episodes),
-                                       turn_starts=store.turn_starts(wo["id"]))
-               if session else None)
-    if anatomy is not None and anatomy.found:
+    # Exactly `inspect_report`'s inner `unit()` shape, and through §4's chokepoint for
+    # the same reason: one definition of "this order's anatomy", preferring the seal and
+    # saying which reading answered. The walk itself is not touched here — this report
+    # reads one number off it (Neo, question 680).
+    anatomy, provenance = autopsy.anatomy_for(
+        wo, inspect_config(project), spans=list(episodes),
+        turn_starts=store.turn_starts(wo["id"]))
+    if anatomy.found:
         unexplained = {"seconds": round(anatomy.unexplained, 2),
                        "seconds_human": ago_phrase(anatomy.unexplained),
                        "residual": True, "note": UNEXPLAINED_NOTE}
@@ -1782,7 +2216,8 @@ def _diagnose_holds(store: ProjectStore, wo: dict[str, Any],
             for h in episodes]
     return {"episodes": rows, "by_cause": by_cause,
             "open": next((r for r in reversed(rows) if r["open"]), None),
-            "unexplained": unexplained}
+            # Beside the one figure it attributes: which reading the residual came from.
+            "unexplained": unexplained, "provenance": provenance}
 
 
 def _diagnose_os_calls(wo_id: str, limit: int = OS_CALLS_LIMIT,
@@ -1846,6 +2281,15 @@ def _diagnose_commands(store: ProjectStore, wo: dict[str, Any], *, project: str,
     out: list[dict[str, str]] = []
     refusals: list[str] = []
 
+    # FIRST — §7 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    retry_no = retry_refusal(wo)
+    if retry_no is None:
+        out.append({"command": f"jarvis wo retry {wo_id}",
+                    "why": "relaunch the worker in its own session from where it died — "
+                           "nothing about the work was judged wrong"})
+    elif wo["status"] == "failed":
+        refusals.append(retry_no)
+
     refusal = force_validation_refusal(store, wo, project=project,
                                        cfg=validation_config(project))
     if refusal is None:
@@ -1897,13 +2341,13 @@ def _diagnose_commands(store: ProjectStore, wo: dict[str, Any], *, project: str,
 
 
 # Metered at the DEFINITION, which is why §7's dashboard routes need no edit: they call
-# this same function (§10 of docs/specs/2026-09-24-order-observability.md).
+# this same function (§10 of docs/superpowers/specs/2026-09-24-order-observability.md).
 @observability.metered(OBSERVE_WHY, target="wo_id", project="project_name")
 def diagnose(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
     """Why is this order not moving, and what do I type — `jarvis wo why`.
 
     PURE COMPOSITION, AND THAT IS THE POINT (spec §6 of
-    docs/specs/2026-09-24-order-observability.md). Every part of the answer already
+    docs/superpowers/specs/2026-09-24-order-observability.md). Every part of the answer already
     existed and was scattered over three surfaces that each showed a slice; this puts
     them in one payload and rewrites none of them. A diagnosis that disagrees with the
     status label is worse than no diagnosis, so where `waiting_on` and `true_blockers`
@@ -1983,6 +2427,505 @@ def _disagreements(blocker: dict[str, Any], needs_you: list[str]) -> list[str]:
             f"true_blockers` says nothing here needs you"
         )
     return out
+
+
+#: The `waiting_on` answers that are NOT A BLOCKER: something is coming by itself, or the
+#: order has settled. They are answered in words and offered nothing — handing back
+#: `detail` as the user's command would invent a move out of a sentence that describes a
+#: wait, and offering an empty list of proposals reads as "nothing to do" when the truth is
+#: "nothing is wrong" (issue #227).
+#:
+#: THE RULE THIS MEMBERSHIP FOLLOWS, which `manager_idle` proved: a slug whose `detail`
+#: NAMES NO COMMAND belongs here. `FIX_UNCOVERED`'s other arm hands `detail` back labelled
+#: with whose move it is (`FIX_YOURS_TO_RUN`, or `FIX_WORKERS_TO_RUN` for the closed set
+#: `FIX_WORKER_MOVE` names) — so a description of a wait reaching it is
+#: the OS inventing a move the user cannot make, on top of calling a healthy order blocked.
+#: The slugs that DO name a command in their own detail are enumerated in `FIX_USERS_MOVE`
+#: and `FIX_WORKER_MOVE`, one per whose move it is. Adding a `waiting_on` answer means
+#: deciding it into one of those three sets — and a slug in none of them now reaches
+#: `_fix_match`'s default arm, which files for a remedy to be WRITTEN (Neo q839).
+FIX_NOTHING_TO_CLEAR: tuple[str, ...] = (
+    "turn_running", "validating", "retry_pending", "neo_question", "gate_with_neo",
+    "queued_message", "pending", "manager_idle", "completed", "cancelled", "failed",
+    "waiting_pr_merge", "needs_review",
+)
+
+#: Said of a blocker no shipped remedy covers AND whose way through somebody can type —
+#: `FIX_USERS_MOVE` and `FIX_WORKER_MOVE`, and only those. The way through is §6's own
+#: pre-validated sentence, labelled with whose it is to run.
+#:
+#: IT IS NO LONGER THE ANSWER FOR AN UNCLASSIFIED SLUG. It used to be, and the user rejected
+#: that (Neo q839): "it should not auto-match with known blockers, because doing that it
+#: will never learn about new bugs or gaps in the OS." A slug none of the four sets names is
+#: a gap CLASS, and `_fix_match`'s default arm opens or points to an INVESTIGATION of it
+#: (the user's later design addition, superseding Neo q839's own default arm, which used to
+#: offer a work order guessing at a new remedy — `wo-4beada49`'s order kind now registers
+#: one instead, through fo-69ba1cc4's registry).
+FIX_UNCOVERED = ("no shipped remedy covers this blocker ({what}) — the OS is not offering "
+                 "to act on it")
+FIX_YOURS_TO_RUN = ("this is yours to run: the OS is not offering to take it, and nothing "
+                    "here has been filed")
+#: The same hand-back, labelled for the slugs whose way through the USER MAY NOT RUN.
+FIX_WORKERS_TO_RUN = ("this is the WORKER's to run in its own worktree, not yours: the OS "
+                      "is not offering to take it, and nothing here has been filed")
+#: CLOSED SET, `gate_held` its only member today. A held gate's two exits — `jarvis gate
+#: request` and `jarvis gate contest` — are refused from anyone but the worker whose
+#: worktree the case belongs to (spec 2026-09-12 §8), so `FIX_YOURS_TO_RUN` on that detail
+#: sends the user at a command the OS will not accept from them.
+#:
+#: It is closed because membership is a fact about WHO MAY RUN the command the slug's own
+#: `detail` names, decided one slug at a time against the command's own rule — never
+#: inferred from the wording, which is how a slug ends up mislabelled in the first place.
+#: Adding a `waiting_on` answer means deciding it here, exactly as `FIX_NOTHING_TO_CLEAR`
+#: above must be decided.
+FIX_WORKER_MOVE: frozenset[str] = frozenset({"gate_held"})
+
+#: CLOSED SET: the slugs whose own `detail` names a command THE USER MAY RUN. This was the
+#: DEFAULT arm until Neo q839; it is a membership list now, because "everything else is
+#: yours to type" hid the case the user actually cares about — a blocker the OS has no
+#: remedy for and never learns it needs one. Each member is decided against the command its
+#: own `waiting_on` detail names, never inferred from the wording:
+#:
+#: * `signin` — `/login`, which only the user can type;
+#: * `assumptions` and `plan_assumptions` — `jarvis wo review`, the user's ruling and
+#:   nobody else's (the second one on its feature's PLANNER);
+#: * `gate_escalated` — `jarvis gate approve` / `deny`, escalated to the user BY NAME;
+#: * `neo_escalated` — `jarvis neo answer`, a question Neo could not settle;
+#: * `message_stuck` — `jarvis wo show`, then `jarvis wo done` if the order is finished
+#:   with it.
+#:
+#: `gate_held` is deliberately NOT here: its two exits are refused from anyone but the
+#: worker, which is what `FIX_WORKER_MOVE` exists to say.
+FIX_USERS_MOVE: frozenset[str] = frozenset({
+    "signin", "assumptions", "plan_assumptions", "gate_escalated", "neo_escalated",
+    "message_stuck",
+})
+FIX_NOTHING = "nothing here for a remedy to clear — {detail}"
+FIX_LIVE_EDGES = ("every dependency edge it waits on is still LIVE, so the `unblock` "
+                  "remedy would cut nothing and is not offered — only `--all` cuts a live "
+                  "edge, and it then runs without the work it was told to build on")
+
+#: What `confirm=False` has and has not done. Printed beside the remedy's own `blast`, so
+#: the user reads the cost and the next step in one place.
+FIX_APPROVING = ("nothing has been done and nothing has been filed. `jarvis wo fix "
+                 "{wo_id} --remedy {remedy} --confirm` files a gate request for it; a "
+                 "reviewer decides, and the OS applies it only after the gate opens")
+FIX_OFFERED = ("one shipped remedy covers this blocker and this project has it armed — "
+               "read what it touches before you confirm it")
+
+#: `propose_fix`'s `reason`: WHY the OS is asking, in the reviewer's hands and in the
+#: nudge the worker may receive. The user reached this off §6, so the diagnosis is the
+#: whole case and it travels verbatim.
+FIX_REASON = "the user asked for this off `jarvis wo why {wo_id}`, which reported: {detail}"
+
+#: The `argument` each matched remedy carries when the caller named none. OS-authored, and
+#: per remedy rather than one line: the nudge's argument is read by a worker mid-task and
+#: `unblock`'s is read only by the reviewer.
+FIX_ARGUMENTS = {
+    "nudge": ("Say where you are. The OS's own diagnosis could not account for why this "
+              "order has not moved, and nobody can see inside your turn."),
+    "unblock": ("Cut the dependency edges that can never clear, so this order can be "
+                "dispatched."),
+}
+
+#: THE DEFAULT ARM's answer for a slug `remedies.resolve` claims for nobody: a GAP CLASS,
+#: not a blocker to guess a fix for. Supersedes Neo q839's `FIX_NEW_REMEDY_BRIEF` (the
+#: user's later design addition): the registry is DATA rows fo-69ba1cc4 builds, keyed by
+#: `gap_class`, so the gap ends in a REGISTERED REMEDY through an INVESTIGATION —
+#: `wo-4beada49`'s order kind, whose analyst adds the row and its mechanical detector — and
+#: never in a work order guessing at one.
+#:
+#: OS-AUTHORED, and the only interpolation is the `waiting_on` slug: text the OS wrote
+#: (`diagnose`'s boundary, kn-1791a5e6).
+FIX_GAP_NO_INVESTIGATION = (
+    "no registered remedy covers this blocker ({what}) — that gap class has no "
+    "investigation open yet. Opening one on this order is the move that ends it: an "
+    "analyst reads the gap and registers a remedy that clears `{what}` wherever it "
+    "appears next, rather than a one-off fix for this order alone"
+)
+#: The same gap, but a LIVE improvement order already names this work order OR THIS GAP
+#: CLASS as evidence — the POINT half of the fallback, widened by Neo q863: the class is
+#: the unit of work an investigation ends, so a second investigation of the same class is
+#: duplicated effort even when it names a different order. The two interpolations are the
+#: slug and the `io-` id, both OS-computed.
+FIX_GAP_INVESTIGATING = (
+    "no registered remedy covers this blocker ({what}) — {io_id} is already investigating "
+    "this gap class. Read it with `jarvis io show {io_id}`"
+)
+
+#: Neo q863(a): TITLE and BRIEF for the investigation `_fix_gap_note` opens on `confirm=True`
+#: with no live one covering the class. OS-authored — the only interpolations are the slug,
+#: this order's id, and §6's own `detail` (the evidence the analyst starts from), never an
+#: exception tail, a gate command, a prompt or a transcript line (`diagnose`'s boundary,
+#: kn-1791a5e6).
+FIX_GAP_INVESTIGATION_TITLE = (
+    "Investigate the `{what}` gap class: no registered remedy clears it"
+)
+#: Neo's ruling condition on q863: the brief MUST end by filing a work order for a new
+#: REUSABLE remedy in src/jarvis/remedies.py — tests, a `SHIPPED_REMEDIES` update, and the
+#: remedy left OFF `RemedyConfig`'s allow-list by default, so it ships disarmed. Stating
+#: that requirement here is what makes q863's condition binding on the analyst rather than
+#: a preference this module remembered and nobody else can see.
+FIX_GAP_INVESTIGATION_BRIEF = (
+    "`jarvis wo fix` found blocker `{what}` on {wo_id} with no registered remedy to clear "
+    "it. `jarvis wo why {wo_id}` reported: {detail}\n\n"
+    "End this investigation by filing a work order for a new REUSABLE remedy in "
+    "src/jarvis/remedies.py: it needs tests, a `SHIPPED_REMEDIES` entry, and it must ship "
+    "OFF `RemedyConfig`'s allow-list by default so the remedy arrives disarmed."
+)
+#: The just-opened case's own note — distinct from `FIX_GAP_INVESTIGATING`'s "already
+#: investigating" because nobody has read this one yet; naming the io id and the gap class
+#: so the user's next move is `jarvis io show {io_id}`, same as the point half.
+FIX_GAP_OPENED = (
+    "no registered remedy covers this blocker ({what}) — {io_id} is now open to "
+    "investigate this gap class. Read it with `jarvis io show {io_id}`"
+)
+#: A FAILURE IS NEVER A VERDICT (kn-40db1828): `create_improvement_order` can raise
+#: `OpsError` (unregistered project, or its own no-description/no-refs refusals, neither
+#: reachable here since this call always supplies both). NO `{error}` SLOT — the exception
+#: string stays in the `log.warning` and never reaches the payload (`FIX_UNREACHABLE`'s
+#: precedent, same file).
+FIX_GAP_FILING_FAILED = (
+    "no registered remedy covers this blocker ({what}) — an investigation could not be "
+    "opened, and nothing was filed. Nothing was decided either: run this again"
+)
+
+#: A proposal the reviewer has been asked about, and one nobody could be asked about.
+#: UNREACHABLE IS NOT A VERDICT (kn-40db1828): the grant stays pending and is answerable by
+#: number, and the OS says so rather than reporting a decision nobody took.
+FIX_FILED = ("gate request {approval} is filed and a reviewer decides it. The act happens "
+             "only after the gate opens — `jarvis gate show {approval}`")
+#: NO `{error}` SLOT. The payload carries only text the OS wrote (`diagnose`'s docstring,
+#: kn-1791a5e6) and an exception string can carry a path; it stays in the `log.warning`.
+FIX_UNREACHABLE = ("the OS could not reach Neo to put this request to a reviewer, so "
+                   "nothing was decided")
+FIX_STILL_PENDING = ("gate request {approval} is filed and still pending, and no reviewer "
+                     "has been asked yet — nothing was applied. Answer it yourself with "
+                     "`jarvis gate approve {approval} --reason \"…\"`, or run this again "
+                     "once Neo is reachable")
+FIX_UNREACHABLE_NO_ROW = ("nothing was filed and nothing was applied — run it again once "
+                          "Neo is reachable")
+
+
+def remedy_config(project: str | None = None) -> Any:
+    """The `supervisor.remedies` settings in force for `project` — `validation_config`'s
+    shape and its reasons.
+
+    A missing, moved or unparseable catalog answers the SHIPPED DEFAULT rather than
+    raising, and the shipped default is off with an empty allow-list: a surface that cannot
+    read the catalog must offer less, never more.
+    """
+    from .catalog import RemedyConfig
+
+    try:
+        catalog = resolve_catalog()
+        spec: Any = catalog.os if project is None else catalog.project(project)
+        return spec.supervisor.remedies
+    except (OpsError, CatalogError, OSError, ValueError):
+        return RemedyConfig()
+
+
+def _fix_gap_note(project: str, wo_id: str, what: str, detail: str, confirm: bool) -> str:
+    """§11's fallback for a slug `remedies.resolve` claims for nobody — the user's design
+    addition superseding Neo q839's own default arm. POINTS at a LIVE improvement order
+    that already evidences this gap class, or on `confirm=True` OPENS one (Neo q863(a)).
+    `confirm=False` stays read-only (issue #227 still applies — the gap reads as a gap, in
+    words, never as an empty list).
+
+    Reads the evidence through `evidence_refs`, the one home for that read — see its own
+    docstring for why this function does not know the metadata shape itself. Matches on
+    EITHER this work order's id OR the slug itself (Neo q863's whole reason for the second
+    evidence ref): the class is the unit of work an investigation ends, so a second
+    investigation of the same class is duplicated effort even filed against a different
+    order — `FIX_GAP_INVESTIGATING`'s "already investigating this gap class" is equally
+    true either way.
+    """
+    for io in list_improvement_orders(project, include_settled=False):
+        refs = evidence_refs(io)
+        if wo_id in refs or what in refs:
+            return FIX_GAP_INVESTIGATING.format(what=what, io_id=io["id"])
+    if not confirm:
+        return FIX_GAP_NO_INVESTIGATION.format(what=what)
+    # NO GATE (Neo q863(a), in Neo's own terms): the user pressing `--confirm` IS the
+    # authorisation, and an investigation only OBSERVES — it reaches no session, changes no
+    # status, alters nothing — unlike `file_work_order`, which is gated because it FILES
+    # WORK. REFS ARE THE WO ID *AND* THE GAP-CLASS SLUG, in that order, so a later
+    # investigation can dedupe by CLASS and not only by order — the loop above, widened.
+    try:
+        io = create_improvement_order(
+            project,
+            FIX_GAP_INVESTIGATION_TITLE.format(what=what),
+            FIX_GAP_INVESTIGATION_BRIEF.format(what=what, wo_id=wo_id, detail=detail),
+            refs=[wo_id, what],
+            # `WO_ORIGINS` (project_store.py) is a CLOSED set and this is the right
+            # member of it, not the default nobody chose: a `jarvis` command the user ran
+            # filed this, the same bucket `jarvis bug report` uses — as against a direct DB
+            # insert (`manual`), a clock (`schedule`) or Neo's own writes (`neo`). `fix()`
+            # is one function behind both the CLI and the debug-page button, so there is no
+            # narrower bucket to hand it and inventing one would widen a closed set.
+            origin="jarvis")
+    except OpsError as exc:
+        # A FAILURE IS NEVER A VERDICT (kn-40db1828): the exception text stays here, never
+        # in the payload — `FIX_UNREACHABLE`'s precedent, same file.
+        log.warning("could not open an investigation of the %s gap class on %s: %s",
+                    what, wo_id, exc)
+        return FIX_GAP_FILING_FAILED.format(what=what)
+    return FIX_GAP_OPENED.format(what=what, io_id=io["id"])
+
+
+def _fix_match(store: ProjectStore, wo: dict[str, Any], blocker: dict[str, Any],
+               asked: str | None, project: str, confirm: bool
+               ) -> tuple[str | None, str | None, dict[str, str] | None, str | None]:
+    """`(remedy, note, your_move, argument)` for one blocker — the matching rule, and it is
+    the REGISTRY's rather than this module's (Neo q839, and the user's later design
+    addition that the registry is DATA rows fo-69ba1cc4 builds, resolved through
+    `remedies.resolve`).
+
+    `argument` is the matched row's own `params["argument"]` when it has one and None
+    everywhere else, so a caller's `--argument` still wins and the shipped `FIX_ARGUMENTS`
+    default still applies when neither is given (`fix`'s own precedence comment).
+
+    Reads only, EXCEPT the gap arm on `confirm=True`, which may open an investigation
+    (`_fix_gap_note`, Neo q863(a)) — every other arm here still writes nothing. The
+    predicates are the ones `_diagnose_commands` calls, not copies of them (kn-4ea33fe6),
+    and the `NUDGE_IS_WRONG` arm mirrors `resume_in_auto`'s refusal in that mapping's own
+    words rather than restating why.
+    """
+    from . import remedies as remedies_mod
+
+    wo_id = str(wo["id"])
+    what = str(blocker["what"])
+    # ASKED THE REGISTRY, not a table here: one home per rule, so a remedy shipped later is
+    # reachable without an edit to this function (`remedies.resolve`).
+    match = None if asked is not None else remedies_mod.resolve(what)
+    matched = asked if asked is not None else (match.remedy if match else None)
+    # THE MAPPING OWNS THE RULE, on the asked path too: there is no `--force` here, and an
+    # OS proposing a nudge its own mapping calls wrong is asking a reviewer to approve a
+    # known no-op.
+    if matched == "nudge" and what in NUDGE_IS_WRONG:
+        return None, f"{NUDGE_IS_WRONG[what]} {blocker['detail']}", None, None
+    if asked is not None:
+        return asked, None, None, None
+    if matched == "unblock":
+        edges = store.unfinished_dependencies(wo_id)
+        if not edges:
+            return None, FIX_NOTHING.format(detail=blocker["detail"]), None, None
+        if not invariants.dead_dependencies(store, wo):
+            return None, FIX_LIVE_EDGES, {
+                "detail": f"jarvis wo unblock {wo_id} --all",
+                "note": FIX_YOURS_TO_RUN}, None
+    if matched is not None:
+        assert match is not None
+        return matched, None, None, match.params.get("argument")
+    if what in FIX_NOTHING_TO_CLEAR:
+        return None, FIX_NOTHING.format(detail=blocker["detail"]), None, None
+    if what in FIX_USERS_MOVE or what in FIX_WORKER_MOVE:
+        return None, FIX_UNCOVERED.format(what=what), {
+            # §6's sentence, which the function that diagnosed the blocker wrote and which
+            # is already pre-validated against what the OS would accept right now.
+            "detail": blocker["detail"],
+            # WHOSE move it is — `FIX_WORKER_MOVE`'s reason.
+            "note": (FIX_WORKERS_TO_RUN if what in FIX_WORKER_MOVE
+                     else FIX_YOURS_TO_RUN)}, None
+    # A SLUG NO REMEDY RESOLVES IS A GAP CLASS, and this arm is the whole point of the
+    # change (Neo q839, overriding §11's "add no remedy" — and now the user's design
+    # addition, overriding Neo q839's own answer in turn): it ends in a registered remedy
+    # through an INVESTIGATION (`wo-4beada49`'s order kind), never a work order guessing
+    # at a fix. No new authority: this arm never guesses a remedy, and on `confirm=False`
+    # it still files nothing. On `confirm=True` with no live investigation, it opens ONE —
+    # Neo q863(a): the user's own press is the authorisation, so this is not the exception
+    # to "`fix` files nothing without `confirm=True`" above, it is that rule applied.
+    gap = _fix_gap_note(project, wo_id, what, blocker["detail"], confirm)
+    return None, gap, None, None
+
+
+def _file_fix(store: ProjectStore, project: str, wo: dict[str, Any], remedy_id: str,
+              argument: str, reason: str, cfg: Any) -> dict[str, Any]:
+    """File one proposal through `remedies.propose_fix` and report what came back.
+
+    A TRANSPORT FAILURE IS NOT A VERDICT (kn-40db1828, and
+    docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §2). `propose_fix`
+    writes the grant before it asks, so a Neo that cannot be reached leaves a PENDING
+    request nobody has been asked about — reported as unreachable, by number, and never as
+    decided, escalated or refused.
+    """
+    from . import remedies
+    from .neo_store import NeoStore
+
+    command = remedies.user_intent(str(wo["id"]), remedy_id, argument)
+    try:
+        neo = NeoStore()
+    except Exception as exc:  # noqa: BLE001 — see docstring: never a synthesised verdict
+        return _fix_unreachable(store, wo, command, exc)
+    try:
+        outcome = remedies.propose_fix(store, neo, project, wo, remedy_id, argument, cfg,
+                                       reason=reason)
+    except Exception as exc:  # noqa: BLE001 — same
+        return _fix_unreachable(store, wo, command, exc)
+    finally:
+        neo.close()
+    approval = outcome["approval"]
+    question = outcome["question"]
+    return {
+        "proposed": bool(outcome["proposed"]), "reason": outcome["reason"],
+        # IDS AND NOT THE ROWS. The number is what the user needs to answer the request,
+        # and the row carries the gate's `command` column — text this payload's boundary
+        # keeps out (`diagnose`'s docstring, kn-1791a5e6).
+        "approval": approval["id"] if approval else None,
+        "question": question["id"] if question else None,
+        "unreachable": False,
+        "note": (FIX_FILED.format(approval=approval["id"]) if outcome["proposed"]
+                 else outcome["reason"]),
+    }
+
+
+def _fix_unreachable(store: ProjectStore, wo: dict[str, Any], command: str,
+                     exc: Exception) -> dict[str, Any]:
+    """`_file_fix`'s answer when nobody could be asked. The request is named if it exists:
+    a pending grant the user can answer themselves is the one thing that gets them
+    unstuck, and a re-run would otherwise refuse as a duplicate without saying why."""
+    pending = next((row for row in store.pending_approvals(str(wo["id"]))
+                    if row["command"] == command), None)
+    log.warning("could not put a %s fix on %s to a reviewer: %s", command, wo["id"], exc)
+    return {
+        "proposed": False, "reason": FIX_UNREACHABLE,
+        "approval": pending["id"] if pending else None, "question": None,
+        "unreachable": True,
+        "note": (FIX_STILL_PENDING.format(approval=pending["id"]) if pending
+                 else FIX_UNREACHABLE_NO_ROW),
+    }
+
+
+def fix(wo_id: str, project_name: str | None = None, *, remedy: str | None = None,
+        argument: str | None = None, confirm: bool = False) -> dict[str, Any]:
+    """Clear the blocker §6 just named — `jarvis wo fix`, §11 of
+    docs/superpowers/specs/2026-09-24-order-observability.md.
+
+    IT ADDS NO AUTHORITY AND THAT IS THE WHOLE DESIGN. Every remedy is resolved through
+    `remedies.resolve` — CODE today, and DATA rows fo-69ba1cc4 builds tomorrow, keyed by
+    the same slug — the allow-list ships off, and every act rides an approved `self_heal`
+    grant a reviewer opened. THERE IS NO RUNTIME AUTHORING OF A REMEDY EITHER WAY: a
+    blocker `resolve` claims for nobody is a GAP CLASS, and this function points at a LIVE
+    investigation already evidencing it or offers to open one — `wo-4beada49`'s order
+    kind, whose analyst adds the registry row and its mechanical detector (the user's
+    design addition, superseding Neo q839's `file_work_order`/`FIX_NEW_REMEDY_BRIEF`
+    answer to the same gap — that ruling's OWN point stands: auto-matching against a
+    closed table means the OS never learns which blockers it has no remedy for). The entry
+    point is still the only new thing here: a shipped remedy reachable from the diagnosis
+    the user is already looking at. Every exclusion `remedies.py` names is inherited
+    verbatim: no cancelling a turn, no `set_status`, no `wo done`, no `fo resume`, no
+    killing a process, and nothing here does one of those under another name.
+
+    `confirm=False` WRITES NOTHING AT ALL — it returns the proposal and the user reads it.
+    `confirm=True` files it through `remedies.propose_fix` and stops there; `Daemon.
+    remedy_tick` applies an approved grant, so filing and acting stay two facts. THE ONE
+    EXCEPTION is the gap arm (Neo q863(a)): with no registered remedy and no live
+    investigation, `confirm=True` opens an improvement order directly, UNGATED — the
+    user's own press is the authorisation, and an investigation only OBSERVES, unlike
+    `file_work_order` which files WORK and so is gated.
+
+    THE BLOCKER IS `waiting_on`'S, called and never re-derived (kn-4ea33fe6), and it
+    travels verbatim so this payload and `jarvis wo why`'s cannot disagree. Every sentence
+    in the payload is one the OS wrote: no gate command, no prompt, no transcript line, no
+    error tail — `diagnose`'s boundary, for its security reason.
+
+    ABSENT IS NEVER ZERO (issue #227). No blocker, remedies off for the project, a remedy
+    not in the allow-list, a blocker whose way through is somebody's to type: each says so
+    in words and offers nothing. There is no list of proposals to come back empty.
+    """
+    from . import remedies as remedies_mod
+
+    name, path, wo = find_work_order(wo_id, project_name)
+    cfg = remedy_config(name)
+    store = ProjectStore(path)
+    try:
+        blocker = waiting_on(store, wo)
+        matched, note, your_move, offered = _fix_match(store, wo, blocker, remedy, name,
+                                                       confirm)
+        # PRECEDENCE: the CALLER'S `--argument` wins, then the matched row's own
+        # `params["argument"]` (what a data row's parameters will supply, fo-69ba1cc4),
+        # then the shipped `FIX_ARGUMENTS` default. Resolved before the refusals below
+        # because `file_work_order`'s own refusal is about whether there IS an argument.
+        arg = (argument or "").strip() or offered or FIX_ARGUMENTS.get(matched or "", "")
+        if matched is not None:
+            # THE CATALOG FIRST, `_config_refusal`'s own ordering: the user must never be
+            # shown something their own catalog forbids, let alone asked to approve it.
+            # Called rather than restated — one home for the rule, whoever asked.
+            note = remedies_mod._config_refusal(
+                matched, remedies_mod.subject_kind_of(wo), cfg)
+            if note is None and matched == "file_work_order" and not arg:
+                # `_apply_file_work_order`'s refusal, stated before a grant is filed
+                # instead of after one was spent.
+                note = remedies_mod.NO_ARGUMENT.format(origin=str(wo["id"]))
+            if note is not None:
+                matched = None
+        payload: dict[str, Any] = {
+            "wo_id": str(wo["id"]), "project": name, "title": wo["title"],
+            "status": wo["status"], "blocker": blocker,
+            "remedy": matched, "proposal": None, "your_move": your_move,
+            "filed": None, "note": note or FIX_OFFERED,
+        }
+        if matched is None:
+            return payload
+        remedy_row = remedies_mod.REMEDIES[matched]
+        payload["proposal"] = {
+            "remedy": matched,
+            # VERBATIM OFF THE REGISTRY. The words the user weighs and the words the
+            # reviewer rules on are one string, or the two are ruling on different acts.
+            "headline": remedy_row.headline, "blast": remedy_row.blast,
+            "subject": str(wo["id"]), "argument": arg,
+            "approving": FIX_APPROVING.format(wo_id=wo["id"], remedy=matched),
+        }
+        if confirm:
+            payload["filed"] = _file_fix(
+                store, name, wo, matched, arg,
+                FIX_REASON.format(wo_id=wo["id"], detail=blocker["detail"]), cfg)
+        return payload
+    finally:
+        store.close()
+
+
+#: The bounded flags a surface may carry back when NOTHING WAS FILED, mapped to the
+#: sentence `ops` wrote for that case. A fixed enum and never free text: see
+#: `fix_filed_notice` for why.
+FIX_FLAG_NOTICES = {"unreachable": FIX_UNREACHABLE}
+
+#: The other bounded shape a surface may carry back: `pending-<digits>`, for an unreachable
+#: press that left a request the user can answer. A prefix plus an INTEGER and nothing else.
+FIX_PENDING_PREFIX = "pending-"
+
+
+def fix_filed_notice(approval_id: int) -> str:
+    """`FIX_FILED` for a page that has just redirected after filing a fix —
+    `forced_round_notice`'s rule, one authority along.
+
+    REBUILT FROM THE ID, never carried across the redirect as text. A note the query
+    string supplies renders as the OS speaking about what happened to an order, so a
+    crafted link could state a false fact about an ACT — which is what §11's wording rules
+    exist to prevent (autoescaping only stops it being script). The id selects the words;
+    it cannot author them. Here rather than in the route so the CLI's sentence and the
+    page's are one string and cannot drift.
+    """
+    return FIX_FILED.format(approval=approval_id)
+
+
+def fix_pending_notice(approval_id: int) -> str:
+    """`fix_filed_notice` for the press nobody could be asked about, where the grant EXISTS.
+
+    `propose_fix` writes the request before it asks, so an unreachable Neo leaves a pending
+    request the user can answer themselves — the one thing that gets them unstuck, and the
+    number `FIX_UNREACHABLE` alone drops. Both facts, in `FIX_UNREACHABLE`'s and
+    `FIX_STILL_PENDING`'s own words: the transport failed AND the request is answerable by
+    number. The id selects the words; it cannot author them.
+    """
+    return f"{FIX_UNREACHABLE} — {FIX_STILL_PENDING.format(approval=approval_id)}"
+
+
+def fix_flag_notice(flag: str) -> str | None:
+    """`fix_filed_notice` for the cases with no id to name — nothing was filed, or nobody
+    could be asked. The flag is matched against a closed map and an unknown one renders
+    NOTHING, so the page never claims a request exists."""
+    return FIX_FLAG_NOTICES.get(flag)
 
 
 def assume(wo_id: str, content: str) -> dict[str, Any]:
@@ -2066,7 +3009,13 @@ def round_line(rnd: dict[str, Any]) -> str:
     # THE WORD, not the raw outcome: `failed` is three different facts and only
     # `validation_standing` knows which one this row is (GitHub issue #581).
     word, _tone, _icon = validation_standing(rnd)
-    return (f"round {rnd['round']} · {rnd['fingerprint']} · {word}"
+    # A REBIND, marked where the number is: round 4 under `max_rounds` 3 reads as the
+    # defect unless the line says nobody was charged for it (spec
+    # 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.3).
+    cause = str(rnd.get("uncounted_cause") or "")
+    uncounted = (f" · uncounted ({cause})" if cause
+                 else " · uncounted") if rnd.get("uncounted") else ""
+    return (f"round {rnd['round']}{uncounted} · {rnd['fingerprint']} · {word}"
             f" · config {rnd.get('config_version') or 'not recorded'}"
             f" · commit {sha[:10] or 'not recorded'}"
             + note
@@ -2838,9 +3787,13 @@ def validation_rounds(store: ProjectStore, *, wo_id: str | None = None,
     read to answer "how many times, and what came back", not to re-read the submission.
     """
     filed = filed_follow_ups(store, wo_id=wo_id, fo_id=fo_id)
+    # `uncounted` is in the tuple because `round_line` must mark a rebind: a round
+    # numbered past `max_rounds` otherwise reads as the defect the spec is about
+    # (2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.3).
     return [{**{k: r[k] for k in ("id", "round", "ts", "fingerprint", "outcome",
                                   "reason", "pr_url", "config_version", "head_sha",
-                                  "forced_reason", "hold_cause")},
+                                  "forced_reason", "hold_cause", "uncounted",
+                                  "uncounted_cause")},
              # ALWAYS PRESENT, even empty — the rule this key list, `assumptions` and
              # `alarms` already follow. `jarvis wo show`, `jarvis fo show` and both
              # dashboard pages read THIS projection, so a key that came and went would
@@ -3222,7 +4175,8 @@ def _automerge_hold_is_stale(wo: dict[str, Any], latest_round: dict[str, Any] | 
 
 
 def _panel_hold_is_stale(latest_round: dict[str, Any] | None,
-                         payload: dict[str, Any], status: str = "") -> bool:
+                         payload: dict[str, Any], status: str = "",
+                         assumption: dict[str, Any] | None = None) -> bool:
     """Has the round this `panel_gave_up` hold is about been overtaken?
 
     docs/superpowers/specs/2026-09-26-a-panel-gave-up-hold-says-which-round-and-stops-
@@ -3251,9 +4205,20 @@ def _panel_hold_is_stale(latest_round: dict[str, Any] | None,
     hold from either is dropped once the order reaches either status. Both mis-drops lose a
     stale sentence about a pass that no longer owns the row, while the pass that does own
     it writes its own events on the next tick — never a lost live one.
+
+    THE ASSUMPTION CLAUSE IS CODE-AGNOSTIC AND IS TESTED FIRST
+    (docs/superpowers/specs/2026-10-01-a-confirmation-is-not-re-run-on-a-settled-
+    assumption.md §3.3, Neo question 1196 Option A): a hold naming a row that is no longer
+    `pending` is stale whatever its code, because every per-assumption code claims
+    something about that row. `assumption` is the row the payload names, or `None` — a
+    payload with no `assumption_id` is an ORDER-LEVEL hold and this clause cannot answer
+    about it.
     """
     from . import autoreview
 
+    if int(payload.get("assumption_id") or 0) and assumption is not None:
+        if str(assumption.get("status") or "") != "pending":
+            return True
     if str(payload.get("code") or "") == autoreview.HELD_STATUS:
         return status in autoreview.REVIEW_PASS_STATUSES
     if str(payload.get("code") or "") != autoreview.HELD_PANEL_GAVE_UP:
@@ -3274,26 +4239,38 @@ def _stale_panel_hold(store: ProjectStore, wo_id: str, *, status: str | None = N
     the row passes it rather than making this read the row again, and one that holds only
     the id (`assumptions_with_rulings`) leaves it to be read here, once, and only if a hold
     of that code turns up.
+
+    The assumption rows are cached BY `assumption_id` and read only when a hold naming one
+    turns up (2026-10-01-a-confirmation-is-not-re-run-on-a-settled-assumption.md §3.3): one
+    closure is built per order and run over every row's events, so a single slot would
+    answer the second assumption with the first one's status.
     """
     from . import autoreview
 
     cache: dict[str, Any] = {}
+    rows: dict[int, dict[str, Any] | None] = {}
     codes = (autoreview.HELD_PANEL_GAVE_UP, autoreview.HELD_STATUS)
 
     def stale(kind: str, payload: dict[str, Any]) -> bool:
         if kind != "autoreview_held":
             return False
         code = str(payload.get("code") or "")
+        aid = int(payload.get("assumption_id") or 0)
+        if aid and aid not in rows:
+            rows[aid] = store.get_assumption(aid)
+        row = rows.get(aid)
+        # The `codes` gate is the ROUND/STATUS clauses' alone: spec §3.3 of
+        # 2026-10-01-a-confirmation-is-not-re-run-on-a-settled-assumption.md.
         if code not in codes:
-            return False
+            return _panel_hold_is_stale(None, payload, "", row)
         if "status" not in cache:
             cache["status"] = (status if status is not None
                               else str(store.get_work_order(wo_id)["status"] or ""))
         if code == autoreview.HELD_STATUS:
-            return _panel_hold_is_stale(None, payload, cache["status"])
+            return _panel_hold_is_stale(None, payload, cache["status"], row)
         if "round" not in cache:
             cache["round"] = store.latest_validation_round(wo_id=wo_id)
-        return _panel_hold_is_stale(cache["round"], payload, cache["status"])
+        return _panel_hold_is_stale(cache["round"], payload, cache["status"], row)
 
     return stale
 
@@ -4083,6 +5060,135 @@ def park_unlanded(store: ProjectStore, wo: dict[str, Any],
     return "needs_review"
 
 
+def defer_red_release(store: ProjectStore, project_name: str,
+                      wo: dict[str, Any]) -> str | None:
+    """Hold a release order that delivered NO release while the base is unbuildable.
+
+    `park_unlanded`'s sibling, one state along: hold a work order that would otherwise
+    land, and SAY SO. The live case is wo-fc61d0cd — gate 310 approved, the staged
+    release running, `main` red under it (5a4e14d, #829) while it waited for CI. The
+    worker refused to ship an older green commit, which is correct, and the order settled
+    `needs_review`: a release seconds from shipping became a decision the user owed, and
+    the expedited fix sat on `main` unreleased until a human typed something. Returns the
+    status when it took the order, None to fall through to today's behaviour.
+
+    #807 already defers a release's DISPATCH while the base is red, but that step visits
+    `pending` rows only; an order that goes red MID-RUN is `running`, has spent its gate
+    approval, and has no path back. This is that path — and from here
+    `Daemon.hold_red_release` owns it unchanged, because `pending` with
+    `release_for_issues` in the metadata is exactly the population it selects.
+
+    **THE READING IS THE STORED ONE** (`CentralStore.base_health`, written per tick by
+    `Daemon.poll_default_branch`) and never a live `gh` call in the worker's finish turn:
+    a delivery's outcome must not depend on GitHub being reachable in that second, and
+    the OS has one rate-limited reader already.
+
+    **ONLY A FRESH GREEN READING PARKS ON THE USER** (Neo, question 1010). An absent,
+    unparseable or stale fact is not evidence that `main` is fine; the daemon's next tick
+    writes a real one, and re-parking costs one dispatch that a green base makes succeed.
+    The freshness test is `Daemon._base_red`'s verbatim.
+
+    **ANY release effect counts as delivered**, verified or not: a claim unverified only
+    because the restart has not happened yet must not be re-dispatched into a second run
+    of the release script.
+
+    docs/superpowers/specs/2026-09-29-a-release-blocked-by-a-red-main-retries-itself.md §1
+    """
+    from .central_store import BASE_HEALTH_FRESH_SECONDS
+    from .daemon import Daemon
+
+    wo_id = str(wo["id"])
+    if not release.is_release_order(wo) or _release_effects(store, wo_id):
+        return None
+    fact = _stored_base_health(project_name)
+    checked = fact.get("checked_at")
+    # `db.now()` for both clocks in this function, `Daemon._base_red`'s freshness test
+    # over the same epoch seconds the fact carries.
+    fresh = (isinstance(checked, (int, float))
+             and db.now() - float(checked) <= BASE_HEALTH_FRESH_SECONDS)
+    if fresh and not fact.get("red"):
+        return None
+    first = first_red_hold(store, wo_id)
+    if first is not None and db.now() - first >= Daemon.RED_PARK_AFTER_SECONDS:
+        return park_red_release(store, wo_id, fact)
+    # `hold_dispatch` writes `retry_after` ONLY: `dispatch_attempts` is
+    # `release_dispatch_claim`'s ladder, and a deferral for a reason outside the order
+    # must not spend a launch. NO attention flag and no notification — a red base for a
+    # few minutes is ordinary, `_say_base_is_red`'s rule.
+    store.set_status(wo_id, "pending", trigger="release_red_base")
+    store.hold_dispatch(wo_id, until=db.now() + Daemon.RED_HOLD_SECONDS)
+    said = _red_base_said(fact)
+    # One event per BROKEN COMMIT, deduped on the head sha exactly as `_say_base_is_red`
+    # does: a code per condition is also a code per world (kn-7b122cd9).
+    if not any(db.from_json(e["payload"], {}).get("head_sha") == said["head_sha"]
+               for e in store.events_of_kind(wo_id, RED_DEFER_EVENT)):
+        store.add_event(wo_id, RED_DEFER_EVENT, {**said, "was": wo["status"]})
+    return "pending"
+
+
+def _stored_base_health(project_name: str) -> dict[str, Any]:
+    """The stored reading, or `{}` — which re-parks, exactly as a red one does."""
+    from .central_store import CentralStore
+
+    try:
+        central = CentralStore()
+    except Exception:  # noqa: BLE001 — an unreadable fact is not a green base
+        return {}
+    try:
+        return central.base_health(project_name)
+    except Exception:  # noqa: BLE001 — ditto
+        return {}
+    finally:
+        central.close()
+
+
+def _red_base_said(fact: dict[str, Any]) -> dict[str, Any]:
+    """What the timeline carries about the run that is holding this release."""
+    base = str(fact.get("base") or "main")
+    head = str(fact.get("head_sha") or "")
+    workflow = str(fact.get("workflow") or "ci")
+    where = f" at {head[:10]}" if head else ""
+    return {"base": base, "head_sha": head, "workflow": workflow,
+            "run_url": str(fact.get("run_url") or ""),
+            "run_id": fact.get("run_id") or 0,
+            "detail": (f"{base} is not buildable{where} ({workflow}) — this release "
+                       f"delivered no release and waits for the base to go green")}
+
+
+def first_red_hold(store: ProjectStore, wo_id: str) -> float | None:
+    """When this order was FIRST held on a red base, by either path — §3's one clock.
+
+    The pending-dispatch hold (#807, `Daemon.RED_HOLD_EVENT`) and the mid-run re-park
+    write different kinds and both count. Public: `Daemon.hold_red_release` calls it.
+    """
+    from .daemon import Daemon
+
+    stamps = [float(e["ts"])
+              for kind in (Daemon.RED_HOLD_EVENT, RED_DEFER_EVENT)
+              for e in store.events_of_kind(wo_id, kind)]
+    return min(stamps) if stamps else None
+
+
+def park_red_release(store: ProjectStore, wo_id: str, fact: dict[str, Any]) -> str:
+    """Past the threshold the release stops waiting and asks the user (§3).
+
+    ONCE PER EPISODE, `park_unlanded`'s discipline and kn-7b122cd9's: the event and the
+    flag are written only while no park is open, so nothing renotifies.
+
+    Two callers, both required: this path (a worker delivering onto a base red past the
+    threshold) and `Daemon.hold_red_release`'s tick, which is the ONLY step that visits
+    a release already held in `pending`. `fact` is `base_health`-shaped either way.
+    """
+    if store.release_red_park_open(wo_id):
+        store.set_status(wo_id, "needs_review", trigger="release_red_repark")
+        return "needs_review"
+    said = _red_base_said(fact)
+    store.add_event(wo_id, RED_PARK_EVENT, said)
+    store.set_status(wo_id, "needs_review")
+    store.flag_attention(wo_id, invariants.release_base_red_blocker(said))
+    return "needs_review"
+
+
 def land_when_cleared(store: ProjectStore, wo: dict[str, Any],
                       pr_url: str | None = None, *,
                       panel_cleared: bool = False,
@@ -4149,16 +5255,68 @@ def refusal_answered(store: ProjectStore, wo_id: str) -> bool:
     the round in the meantime would land the very decision the user turned down. Only
     reachable because the two gates now run in parallel (spec §5).
 
-    The boundary is the `finished` event, which is the same one
+    One boundary is the `finished` event, which is the same one
     `ProjectStore.review_assumption`'s round rule is read against (kn-82d853ca) — and
     why `finish` records it BEFORE it settles anything.
+
+    The other is a PASSED user-rework round: the one round `user_rework_pending` grants
+    per refusal, which the user themselves forced, guarded on the judged head having
+    moved off the commit the refused decision sat on (spec
+    docs/superpowers/specs/2026-10-08-a-passed-forced-round-answers-a-refusal.md).
     """
     refusals = [e for e in store.events_of_kind(wo_id, "reviewed")
                 if not db.from_json(e["payload"], {}).get("accepted", True)]
     if not refusals:
         return True
+    cut = float(refusals[-1]["ts"])
     delivered = store.events_of_kind(wo_id, "finished")
-    return bool(delivered) and float(delivered[-1]["ts"]) > float(refusals[-1]["ts"])
+    if delivered and float(delivered[-1]["ts"]) > cut:
+        return True
+    # One read of the rows, like `validated_head`'s one-read rule: the guard needs the
+    # prior counted row from the same list (spec §The predicate).
+    counted = [r for r in store.validation_rounds(wo_id=wo_id)
+               if str(r["outcome"] or "") in COUNTED_VALIDATION_OUTCOMES]
+    if not counted:
+        return False
+    newest = counted[-1]
+    # `validation_rounds.ts` is the round's OPEN time and nothing writes a settle one;
+    # `user_rework_pending` compares against the same column (spec §The predicate).
+    if (str(newest["outcome"] or "") != "passed"
+            or str(newest.get("uncounted_cause") or "") != USER_REWORK_CAUSE
+            or float(newest["ts"] or 0) <= cut):
+        return False
+    forced_head = ProjectStore.validated_head(newest) or ""
+    before = [r for r in counted[:-1] if float(r["ts"] or 0) <= cut]
+    prior = before[-1] if before else None
+    prior_head = ((ProjectStore.validated_head(prior) or str(prior["head_sha"] or ""))
+                  if prior is not None else "")
+    # Spec §The head guard on (b): an unmoved head is the refused decision landing by
+    # the back door; an unrecorded one is never a match.
+    return not (forced_head and forced_head == prior_head)
+
+
+def user_rework_pending(store: ProjectStore, wo_id: str) -> bool:
+    """Is this work order carrying a rework the USER asked for and nobody has judged?
+
+    THE SECOND UNCOUNTED CAUSE (Neo question 973, live case wo-299daf2e). Rounds bound
+    the worker-versus-panel rejection loop; a rejection the USER wrote is not part of
+    that loop, so the rework it asked for must be judged whatever the budget says — and
+    wo-299daf2e, whose rounds 1 and 2 passed and whose user-requested rework was then
+    declined on `max_rounds`, is what happens when it is not.
+
+    True when the newest `reviewed` event with `accepted` false is NEWER than the newest
+    SETTLED round. That self-terminates and so grants EXACTLY ONE free round per user
+    rejection: the moment the user-rework round settles it is itself the newest settled
+    round, and this reads False again until the user rejects once more.
+
+    Store reads only — no network, no `gh` — because both call sites ask it on a tick.
+    """
+    refusals = [e for e in store.events_of_kind(wo_id, "reviewed")
+                if not db.from_json(e["payload"], {}).get("accepted", True)]
+    if not refusals:
+        return False
+    judged = store.last_judged_round(wo_id=wo_id)
+    return judged is None or float(refusals[-1]["ts"]) > float(judged["ts"] or 0)
 
 
 #: HOW MANY TIMES RUNNING a submitter may be sent back without the panel before the OS
@@ -4212,8 +5370,38 @@ def escalate_validation_round(store: ProjectStore, wo: dict[str, Any], round_id:
     )
 
 
-def unanswered_paths(store: ProjectStore, wo_id: str,
-                     packet: Any) -> tuple[dict[str, Any], tuple[str, ...]] | None:
+def _worktree_file_test(project_path: Path,
+                        wo: Mapping[str, Any]) -> Callable[[str], bool] | None:
+    """`exists` for `validation.unanswered_submission`, or None when no worktree resolves.
+
+    The filesystem that pure module may not have (spec
+    docs/superpowers/specs/2026-09-22-a-round-must-answer-the-list.md §5).
+    """
+    from . import evidence as evidence_mod
+    from . import worker_session
+
+    # type: ignore — `ProjectRef` carries the one attribute that helper reads.
+    worktree = worker_session.worktree_path(
+        evidence_mod.ProjectRef(project_path), dict(wo))  # type: ignore[arg-type]
+    if worktree is None:
+        return None
+
+    def present(path: str) -> bool:
+        candidate = Path(path)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            return False
+        try:
+            return (worktree / candidate).is_file()
+        except (OSError, ValueError):
+            return False
+
+    return present
+
+
+def unanswered_paths(store: ProjectStore, wo_id: str, packet: Any, *,
+                     project_path: Path,
+                     wo: Mapping[str, Any],
+                     ) -> tuple[dict[str, Any], tuple[str, ...]] | None:
     """`(the round that asked, the paths it asked about)` when this submission answers
     none of them, else None.
 
@@ -4222,6 +5410,8 @@ def unanswered_paths(store: ProjectStore, wo_id: str,
     read through `validation.blockers(validation.findings(...))`, the SAME pair
     `prior_round_history` reads, because a second classifier is a second answer to what
     the submitter was told.
+
+    Also the filesystem half: `exists` is the work order's own worktree (spec §5).
     """
     from . import validation
 
@@ -4233,7 +5423,7 @@ def unanswered_paths(store: ProjectStore, wo_id: str,
         raised += validation.blockers(validation.findings(op))
     cited = validation.unanswered_submission(
         previous, raised, ProjectStore.validation_file_shas(previous),
-        dict(packet.file_shas))
+        dict(packet.file_shas), exists=_worktree_file_test(project_path, wo))
     return (previous, cited) if cited is not None else None
 
 
@@ -4251,7 +5441,9 @@ def consecutive_bounces(store: ProjectStore, wo_id: str, after_round: int) -> in
 
 def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str, Any],
                           *, declared: str, cfg: Any,
-                          forced_reason: str = "") -> dict[str, Any] | None:
+                          forced_reason: str = "",
+                          uncounted: bool = False,
+                          uncounted_cause: str = "") -> dict[str, Any] | None:
     """Open a validation round over what this work order has produced, or bounce it.
 
     Collects the evidence, fingerprints it, opens the round and parks the work order in
@@ -4261,7 +5453,13 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
     **The round number is COUNTED, not derived from the row count** — a submission that
     is retried while its round is still open, or one that follows a transport outage,
     reuses the number it already has. The insert is idempotent per (work order, round),
-    so two callers racing here produce one round rather than two.
+    so two callers racing here produce one round rather than two. SETTLED rounds, not
+    counted ones: a rebind (`uncounted=True`, `rejudge_moved_head`'s) spends a number and
+    no budget, and numbering off the budget would hand the next submission its row.
+
+    `uncounted` is also DERIVED when the caller did not ask for it: a submission whose
+    last settled round was a REJECTED rebind is the fix that rebind asked for, and is a
+    rebind too (§4.4, and the block below).
 
     `forced_reason` is `force_validation`'s and nobody else's: it is stamped on the round
     and changes NOTHING about how the round is numbered, judged or settled. A forced
@@ -4295,14 +5493,37 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
     from . import evidence as evidence_mod
     from . import specs
 
+    # A FIX ASKED FOR BY A REBIND IS ITSELF A REBIND (spec 2026-09-27-a-conflict-
+    # resolution-the-os-asked-for-costs-no-round §4.4). The worker was sent back by a
+    # round nobody charged it for, so charging it for the re-judge would take a round
+    # off a budget the rebind exists to protect. `REBIND_MAX` is what bounds the pair:
+    # rebind 1 is the OS's re-judge of its own merge, rebind 2 is the fix, and a second
+    # rejection has spent them both and routes to the user.
+    if not uncounted:
+        previous = store.last_judged_round(wo_id=str(wo["id"]))
+        if (previous is not None and int(previous["uncounted"] or 0)
+                and str(previous["outcome"] or "") == "rejected"
+                # REBIND ONLY. A fix after a rejected USER-REWORK round is an ORDINARY
+                # counted round: the bound there is one round per USER rejection, not a
+                # pair, and the user has not rejected again (Neo question 973).
+                and str(previous["uncounted_cause"] or "") == REBIND_CAUSE):
+            uncounted, uncounted_cause = True, REBIND_CAUSE
+        elif user_rework_pending(store, str(wo["id"])):
+            # The worker's own re-delivery of a rework the USER asked for, through
+            # `jarvis wo finish`. Same free round as the moved-head route: the rework is
+            # the user's whichever way the panel is re-opened.
+            uncounted, uncounted_cause = True, USER_REWORK_CAUSE
     packet = evidence_mod.collect_work_order(
         project_path, wo, declared=declared, diff_chars=cfg.diff_chars,
         spec=specs.spec_of(store, wo), side_effects=side_effects_of(store, str(wo["id"])),
         # The store read is the caller's: `evidence` may not touch a database (spec §4).
         assumptions=store.all_assumptions(wo["id"]))
-    nxt = store.counted_validation_rounds(wo_id=wo["id"]) + 1
+    # The NUMBER, not the budget position: a rebind spends one without spending the
+    # other (spec 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.1).
+    nxt = store.numbered_validation_rounds(wo_id=wo["id"]) + 1
     unanswered = (None if forced_reason.strip()
-                  else unanswered_paths(store, str(wo["id"]), packet))
+                  else unanswered_paths(store, str(wo["id"]), packet,
+                                        project_path=project_path, wo=wo))
     if unanswered is not None:
         previous, cited = unanswered
         if consecutive_bounces(store, str(wo["id"]),
@@ -4334,7 +5555,8 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
         wo_id=wo["id"], fingerprint=evidence_mod.fingerprint(packet),
         summary=str(wo.get("result_summary") or ""), evidence=declared,
         pr_url=wo.get("pr_url"), round=nxt,
-        config_version=current_config_version(), forced_reason=forced_reason)
+        config_version=current_config_version(), forced_reason=forced_reason,
+        uncounted=uncounted, uncounted_cause=uncounted_cause)
     store.set_status(wo["id"], "validating")
     # No attention flag: a unit under review is the system working. Only the give-up
     # transition flags anyone.
@@ -4509,6 +5731,61 @@ REJUDGE_FORCED_REASON = ("the OS re-judged this itself: round {n} passed on {jud
 #: is every row written before this existed and every `jarvis validation force` since.
 REJUDGE_BY_OS = "os"
 
+#: The `forced_reason` a REBIND carries: the round the OS opens on a merge it demanded
+#: itself, whose conflict resolution changed content no seat has read. Rendered verbatim
+#: by `round_line` and by `timeline._describe`, so it has to answer "why is there another
+#: round on this, and why is it not in the budget?" on its own (spec
+#: docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.3).
+REBIND_FORCED_REASON = (
+    "the OS re-judged this itself, outside the round budget: round {n} passed on "
+    "{judged}, and the head is now {head} — the merge the OS asked for resolved a "
+    "conflict, so the content changed and a seat has to read it. This round does not "
+    "count against validation.max_rounds (rebind {used} of {max})")
+
+#: The `forced_reason` a USER-REWORK round carries: the work the user asked for when
+#: they rejected on review, which the round budget must never refuse to judge. Its own
+#: wording and not the rebind's — nobody merged anything here, and a sentence about a
+#: conflict resolution would misdescribe the record (Neo question 973, wo-299daf2e).
+USER_REWORK_FORCED_REASON = (
+    "the OS re-judged this itself, outside the round budget: the USER rejected this on "
+    "review, round {n} judged {judged}, and the head is now {head} — the rework they "
+    "asked for has to be judged. Rounds bound the worker-versus-panel loop and this is "
+    "not part of it, so this round does not count against validation.max_rounds")
+
+#: `cause` on `REJUDGE_DECLINED_EVENT`, one value per condition — the `PROOF_*`
+#: discipline, so a reader can tell "the rebind bound is spent" from "the round budget
+#: is spent". Written on BOTH declines: a payload without one is a pre-change row.
+REBIND_EXHAUSTED = "rebind_exhausted"
+REJUDGE_BUDGET_SPENT = "budget"
+
+
+def rebind_possible(store: ProjectStore, wo: dict[str, Any], *, head: str,
+                    project: str, cfg: Any) -> bool:
+    """Could a REBIND be opened on this head right now? Store reads only, no network.
+
+    ASKED BEFORE THE CHAIN WALK, which is the whole reason it exists: proving the merge
+    added nothing unjudged costs up to `ci.CHAIN_LIMIT` `gh api` calls on a pull request
+    polled every couple of minutes, and paying that for a rebind that could not be opened
+    is a bill with no answer at the end of it (spec
+    docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.2).
+
+    The same guards `rejudge_moved_head` applies, asked one step earlier and on a
+    possibly stale read; that call remains the authoritative pass.
+    """
+    from . import worker_session
+
+    wo_id = str(wo["id"])
+    if not head or head in rejudged_heads(store, wo_id):
+        return False
+    if head in rejudged_heads(store, wo_id, declined=True):
+        return False
+    if worker_session.busy(store, wo_id) or store.queued_messages(wo_id):
+        return False
+    if force_validation_refusal(store, wo, project=project, cfg=cfg) is not None:
+        return False
+    return store.uncounted_validation_rounds(
+        wo_id=wo_id, cause=REBIND_CAUSE) < REBIND_MAX
+
 
 def rejudged_heads(store: ProjectStore, wo_id: str, *, declined: bool = False
                    ) -> set[str]:
@@ -4538,9 +5815,25 @@ def rejudged_heads(store: ProjectStore, wo_id: str, *, declined: bool = False
     return seen
 
 
+def stale_base_bases(store: ProjectStore, wo_id: str, head_sha: str) -> set[str]:
+    """The base tips a merge of THIS commit has already been refused against.
+
+    `rejudged_heads`' shape and its reason (spec 2026-09-28 §3.1): a parked pull request
+    reaches the precondition every two minutes, so the event is written once per (head,
+    base tip) and a base that moves again is news.
+    """
+    seen = set()
+    for event in store.events_of_kind(wo_id, MERGE_BASE_STALE_EVENT):
+        payload = db.from_json(event["payload"], {}) or {}
+        if str(payload.get("head_sha") or "") == head_sha:
+            seen.add(str(payload.get("base_oid") or ""))
+    return seen
+
+
 def rejudge_moved_head(store: ProjectStore, project_path: Path, wo: dict[str, Any], *,
                        project: str, cfg: Any,
-                       decision: Any) -> dict[str, Any] | None:
+                       decision: Any,
+                       rebind: bool = False) -> dict[str, Any] | None:
     """The OS re-opening a round on a pull request whose head moved out from under its
     verdict. `force_validation`'s act, with a machine for an operator.
 
@@ -4563,6 +5856,17 @@ def rejudge_moved_head(store: ProjectStore, project_path: Path, wo: dict[str, An
     it is not final: raising `max_rounds` makes the next tick re-judge the same commit,
     so the user's remedy for the one stall this cannot heal is a config change rather
     than a command they have to remember to run.
+
+    **EXCEPT ON A REBIND** (`rebind=True`, the caller's reading of proofs (a) and (b)):
+    the merge was the OS's own demand, so `cfg.max_rounds` is not consulted at all on
+    that arm and `REBIND_MAX` bounds it instead (spec
+    docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.3).
+
+    **AND EXCEPT ON A REWORK THE USER ASKED FOR** (`user_rework_pending`), where no bound
+    is consulted at all: each user rejection buys exactly one uncounted round, and
+    wo-299daf2e — rounds 1 and 2 passed, the user rejected, the worker reworked, the
+    re-judge was declined on `max_rounds` — is what the absence of that arm costs (Neo
+    question 973).
     """
     from . import worker_session
 
@@ -4578,25 +5882,63 @@ def rejudge_moved_head(store: ProjectStore, project_path: Path, wo: dict[str, An
         return None
     judged = str(getattr(decision, "judged_sha", "") or "")
     round_n = int(getattr(decision, "round_n", 0) or 0)
-    nxt = store.counted_validation_rounds(wo_id=wo_id) + 1
-    if nxt >= int(cfg.max_rounds):
+    # THE BUDGET POSITION, never a row number: after the rebind the two can differ, and
+    # the sentence this feeds ("round N of M would be the last") is about the budget.
+    budget_nxt = store.counted_validation_rounds(wo_id=wo_id) + 1
+    # THE REBIND BOUND COUNTS REBINDS AND NOTHING ELSE: a user-rework round that spent
+    # one of these would be the same defect one level along (Neo question 973).
+    used = store.uncounted_validation_rounds(wo_id=wo_id, cause=REBIND_CAUSE)
+    # A REWORK THE USER ASKED FOR IS JUDGED WHATEVER THE BUDGET SAYS, and this is asked
+    # BEFORE either decline. Independent of `rebind`: when both would apply the user
+    # rework wins, because it is the one the ruling protects and the rebind budget must
+    # stay for the OS's own merges. wo-299daf2e is exactly the arm below it.
+    rework = user_rework_pending(store, wo_id)
+    if rework:
+        pass                            # no bound at all: one free round per rejection
+    elif rebind:
+        if used >= REBIND_MAX:
+            if head in rejudged_heads(store, wo_id, declined=True):
+                return None             # said once per commit, not once per tick
+            store.add_event(wo_id, invariants.REJUDGE_DECLINED_EVENT,
+                            {"head_sha": head, "judged_sha": judged, "round": round_n,
+                             "cause": REBIND_EXHAUSTED, "rebinds": used,
+                             "rebind_max": REBIND_MAX})
+            return {"wo_id": wo_id, "declined": True, "cause": REBIND_EXHAUSTED,
+                    "head_sha": head, "judged_sha": judged, "rebinds": used,
+                    "rebind_max": REBIND_MAX}
+    elif budget_nxt >= int(cfg.max_rounds):
         if head in rejudged_heads(store, wo_id, declined=True):
             return None                 # said once per commit, not once per tick
         store.add_event(wo_id, invariants.REJUDGE_DECLINED_EVENT,
                         {"head_sha": head, "judged_sha": judged, "round": round_n,
-                         "next_round": nxt, "max_rounds": int(cfg.max_rounds)})
-        return {"wo_id": wo_id, "declined": True, "head_sha": head,
-                "judged_sha": judged, "next_round": nxt,
+                         "cause": REJUDGE_BUDGET_SPENT,
+                         "next_round": budget_nxt, "max_rounds": int(cfg.max_rounds)})
+        return {"wo_id": wo_id, "declined": True, "cause": REJUDGE_BUDGET_SPENT,
+                "head_sha": head, "judged_sha": judged, "next_round": budget_nxt,
                 "max_rounds": int(cfg.max_rounds)}
     was = str(wo["status"] or "")
-    reason = REJUDGE_FORCED_REASON.format(n=round_n, judged=judged[:10],
-                                          head=head[:10])
+    if rework:
+        reason = USER_REWORK_FORCED_REASON.format(n=round_n, judged=judged[:10],
+                                                  head=head[:10])
+    elif rebind:
+        reason = REBIND_FORCED_REASON.format(n=round_n, judged=judged[:10],
+                                             head=head[:10], used=used + 1,
+                                             max=REBIND_MAX)
+    else:
+        reason = REJUDGE_FORCED_REASON.format(n=round_n, judged=judged[:10],
+                                              head=head[:10])
+    cause = USER_REWORK_CAUSE if rework else (REBIND_CAUSE if rebind else "")
     round_row = submit_for_validation(store, project_path, wo,
                                       declared=declared_evidence(store, wo_id),
-                                      cfg=cfg, forced_reason=reason)
+                                      cfg=cfg, forced_reason=reason,
+                                      uncounted=bool(cause), uncounted_cause=cause)
     store.add_event(wo_id, "validation_forced",
                     {"round": round_row["round"], "round_id": round_row["id"],
                      "reason": reason, "was": was, "by": REJUDGE_BY_OS,
+                     # THE CAUSE, and `rebind` beside it for the rows written before it
+                     # existed — a reader that only knows the bool must not read a user
+                     # rework as a conflict resolution (Neo question 973).
+                     "cause": cause, "rebind": cause == REBIND_CAUSE,
                      "head_sha": head, "judged_sha": judged})
     return {"wo_id": wo_id, "declined": False, "round": round_row["round"],
             "round_id": round_row["id"], "head_sha": head, "judged_sha": judged,
@@ -4736,6 +6078,70 @@ def prior_round_history(store: ProjectStore, *, wo_id: str | None = None,
     return out
 
 
+#: The daemon's own back-fill row (`Daemon.MERGE_COMMIT_EVENT`), named here because the
+#: ancestry check reads it from both sides.
+MERGE_COMMIT_EVENT = "pr_merge_commit_recorded"
+
+
+class UnintegratedChild(Exception):
+    """A completed child's merge commit is not in the head a round would be judged over.
+
+    RAISED, never deferred: `ops` has no next tick, so the only honest answers it has are
+    "open the round" and "refuse" (Neo question 1394). The daemon catches this explicitly
+    and defers; `jarvis fo submit` lets it reach the manager.
+    """
+
+    def __init__(self, child_id: str, commit: str, head: str) -> None:
+        super().__init__(invariants.FEATURE_CHILD_NOT_INTEGRATED.format(
+            id=child_id, commit=commit, head=head))
+        self.child_id = child_id
+        self.commit = commit
+        self.head = head
+
+
+def recorded_merge_commit(store: ProjectStore, child: dict[str, Any]) -> str:
+    """The commit this child put on the default branch, from the RECORD alone.
+
+    No `gh` call: the one-off back-fill belongs to the daemon, which has somewhere to
+    write the answer back to.
+    """
+    for kind in ("pr_merged", MERGE_COMMIT_EVENT):
+        rows = store.events_of_kind(child["id"], kind)
+        if rows:
+            sha = db.from_json(rows[-1]["payload"], {}).get("merge_commit") or ""
+            if sha:
+                return str(sha)
+    return ""
+
+
+def unintegrated_children(project_path: Path, store: ProjectStore, fo_id: str, head: str,
+                          merge_commit: Callable[[dict[str, Any]], str],
+                          ) -> list[tuple[dict[str, Any], str]]:
+    """Which of this feature's completed children are missing from `head`.
+
+    ONE copy of the check, called by both the daemon's deferral and
+    `submit_feature_for_validation`'s refusal — two that drifted apart is the defect being
+    fixed, one level up (§2 of
+    docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md).
+    `merge_commit` is how the caller resolves a child's commit, which is where the two
+    differ: the daemon may spend a `gh` call, `ops` may not.
+
+    `is_ancestor` is `False` when git cannot answer, which reads as "not proven".
+    """
+    from . import branchproof
+
+    missing: list[tuple[dict[str, Any], str]] = []
+    for child in store.feature_children(fo_id):
+        # The children `settle_features` counted. One with no pull request and no merge
+        # event contributes nothing to check.
+        if child["superseded"] or child["status"] != "completed":
+            continue
+        sha = merge_commit(child)
+        if sha and not branchproof.is_ancestor(project_path, sha, head):
+            missing.append((child, sha))
+    return missing
+
+
 def collect_feature_evidence(store: ProjectStore, project_path: Path,
                              fo: dict[str, Any], *, declared: str, summary: str,
                              cfg: Any,
@@ -4784,13 +6190,39 @@ def submit_feature_for_validation(store: ProjectStore, project_path: Path,
     the last child lands, and `jarvis fo submit` opens every round after that. Neither
     reads the kill switch here; both read it before calling, which is the rule the whole
     design turns on (see `finish`).
+
+    THE FETCH IS HERE, at the point those two callers share, because neither has any
+    reason to want a stale head: in the daemon alone it would leave `jarvis fo submit`
+    judging a stale one for ever, which is the common case for rounds 2+. §1 of
+    docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md.
+
+    A FAILED fetch raises `UnintegratedChild` when a completed child's merge is missing
+    from the local head, and opens no round. It never defers (Neo question 1394).
     """
+    from . import branchproof
     from . import evidence as evidence_mod
 
+    # §1: the same ladder the collector resolves its head with, so the fetch cannot bring
+    # down a different branch than the one judged. A failed fetch is not fatal.
+    ref = evidence_mod.base_ref(project_path)
+    if ref and not branchproof.fetch(project_path, ref):
+        log.warning("could not fetch %s in %s — %s is being judged on the local ref as "
+                    "it stands", ref, project_path, fo["id"])
+        # §2 + Neo 1394: a stale local ref is exactly how a round gets opened over a head
+        # that predates a child's merge, so refuse rather than judge it.
+        head = evidence_mod.default_branch_head(project_path)
+        missing = unintegrated_children(
+            project_path, store, fo["id"], head,
+            lambda child: recorded_merge_commit(store, child)) if head else []
+        if missing:
+            child, sha = missing[0]
+            raise UnintegratedChild(child["id"], sha, head)
     packet = collect_feature_evidence(store, project_path, fo, declared=declared,
                                       summary=summary, cfg=cfg)
     fo_id = fo["id"]
-    nxt = store.counted_validation_rounds(fo_id=fo_id) + 1
+    # One expression for "how a round is numbered", not two that agree by accident
+    # (spec 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.1).
+    nxt = store.numbered_validation_rounds(fo_id=fo_id) + 1
     round_row = store.open_validation_round(
         fo_id=fo_id, fingerprint=evidence_mod.fingerprint(packet), summary=summary,
         evidence=declared, round=nxt, config_version=current_config_version())
@@ -5067,8 +6499,17 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
                 # written above, `work_abandoned` reads it, the alert is clear; a settled
                 # order's status is not this command's to move.
                 return {"project": name, "wo_id": wo_id, "status": _wo["status"]}
+        # AFTER the `finished` event, so `refusal_answered` still dates correctly, and
+        # after the `abandon` branch: 2026-09-29 spec §1.
+        deferred = defer_red_release(store, name, fresh)
+        if deferred is not None:
+            return {"project": name, "wo_id": wo_id, "status": deferred,
+                    **({"pr_url": pr_url} if pr_url else {})}
         opened = bounced = None
-        if cfg is not None and cfg.enabled:
+        # The overlay: `pr_url` is not written until `land_when_cleared` below (2026-10-01
+        # spec §2, a-release-that-authored-files-is-judged-like-any-other).
+        submits = validation_applies(cfg, {**fresh, "pr_url": pr_url}, store)
+        if submits:
             opened = submit_for_validation(store, path, fresh, declared=evidence,
                                            cfg=cfg)
             # None means BOUNCED, and only here: with validation off no submission was
@@ -5084,7 +6525,10 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
             # ...and the status is the JOIN's to decide, not this branch's — but a
             # BOUNCE is told to it rather than re-derived from the latest round, which
             # is not the row the bounce read. See `land_when_cleared`'s `panel_open`.
-            status = land_when_cleared(store, fresh, pr_url, panel_open=bool(bounced))
+            # An exempt submission opened no round at all, so the join is TOLD rather than
+            # left to re-read one that was never opened (2026-10-01 spec §3).
+            status = land_when_cleared(store, fresh, pr_url, panel_open=bool(bounced),
+                                       panel_cleared=not submits)
     finally:
         store.close()
     return {"project": name, "wo_id": wo_id, "status": status,
@@ -5662,6 +7106,57 @@ BASE_UPDATE_BASE_RED = "base_red"
 #: a fresh update, so a busy day would have the OS chasing the base for ever (§5.3 guard 5).
 CATCH_UP_MAX = 3
 
+#: A merge the OS refused because the base moved under the judged commit — spec
+#: 2026-09-28 §3.1. Deduped per (head sha, base tip): a parked pull request reaches the
+#: precondition every two minutes, and a row per tick would bury the rows that mean
+#: something (`rejudged_heads`' shape).
+MERGE_BASE_STALE_EVENT = "automerge_base_stale"
+
+#: WHAT A CATCH-UP DID, and the reason `CatchUp` exists: the old return type could not
+#: tell "already up to date" from "behind and I could not fix it this tick", so every one
+#: of the seven guards fell through to `propose` and filed a stale-base merge request
+#: (spec 2026-09-28 §3.4). Two of them never clear on their own, and `EXHAUSTED` is named
+#: apart for exactly that: a user reading "deferred" for ever is the bug this prevents.
+CATCH_UP_NOT_NEEDED = "not_needed"
+CATCH_UP_DONE = "done"
+CATCH_UP_DEFERRED = "deferred"
+CATCH_UP_EXHAUSTED = "exhausted"
+CATCH_UP_FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class CatchUp:
+    """What `Daemon._catch_up_with_base` did, as data its caller can branch on.
+
+    `pr` is the pull request to decide against — the one it was given, unchanged, unless
+    the update ran. `reason` is one sentence per guard, for the user. `base_tip` is
+    `origin/<base>` read LOCALLY after the fetch, the only base fact spec 2026-09-28 §3.1
+    trusts — empty when the helper refused before it read one.
+    """
+
+    pr: Any
+    outcome: str
+    reason: str = ""
+    base_tip: str = ""
+
+
+#: How many times the OS may RE-JUDGE a merge it asked for itself, outside the round
+#: budget. A constant and not a config key: every bound on a loop the OS runs on itself
+#: is one, and `validation.max_rounds` is what a PROJECT decides (spec
+#: docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.6).
+#: 2, not 3: each rebind is a full five-seat panel outside the budget the user
+#: configured, and two is the smallest number that still allows one worker fix turn
+#: after the first rejection.
+REBIND_MAX = 2
+
+#: The two reasons a round may be `uncounted`, written on the round as `uncounted_cause`.
+#: SEPARATE BOUNDS, which is the whole reason the column exists: `REBIND_MAX` bounds the
+#: OS re-judging its own merge and NOTHING else, and each user rejection buys exactly one
+#: `USER_REWORK_CAUSE` round (Neo question 973). An unfiltered count would let a merge
+#: re-judge spend the round a user's rework needs — wo-299daf2e.
+REBIND_CAUSE = "rebind"
+USER_REWORK_CAUSE = "user_rework"
+
 #: `proof` on `CARRY_REFUSED_EVENT`, one value per condition — the `automerge` hold-code
 #: discipline, so a reader can tell "someone resolved a conflict" from "the daemon could
 #: not reach GitHub" (spec §4).
@@ -5775,7 +7270,7 @@ def catch_up_attempts(store: ProjectStore, wo_id: str) -> int:
     return n
 
 
-def catch_up_needed(pr: Any, *, repo: Path) -> bool:
+def catch_up_needed(pr: Any, *, repo: Path, base_tip: str = "") -> bool:
     """Is this pull request behind its base? `.behind` ALONE IS NOT THE QUESTION.
 
     Spec 2026-09-27 §5.1. `PullRequest.behind` is `mergeStateStatus == "BEHIND"`, and on a
@@ -5788,12 +7283,21 @@ def catch_up_needed(pr: Any, *, repo: Path) -> bool:
     Asked of the LOCAL checkout (`branchproof.is_ancestor`) after the fetch proof (b)
     needs anyway. A checkout that cannot answer reads as BEHIND — the caller's seven
     guards then decide whether to spend an update, and every one of them is bounded.
+
+    **`base_tip` IS AUTHORITATIVE WHEN GIVEN, and `pr.base_oid` is then not read at all**
+    (spec 2026-09-28 Amendment B, issue #837). `pr.base_oid` is not a reading of the base:
+    it is GitHub's cached `baseRefOid`, and on gate 308 it lagged the real tip of `main` by
+    three commits and 5.3 hours — so the ancestry test answered "already up to date" on a
+    stale fact and none of the seven guards ever fired. A caller that has just fetched
+    passes the tip it read; one that has not keeps today's behaviour exactly, so no hidden
+    network call appears inside a helper the daemon runs every poll tick. `pr.behind` stays
+    a positive short-circuit in both arms (kn-907c9a61).
     """
     from . import branchproof
 
     if getattr(pr, "behind", False):
         return True
-    base_oid = str(getattr(pr, "base_oid", "") or "")
+    base_oid = base_tip or str(getattr(pr, "base_oid", "") or "")
     head = str(getattr(pr, "head_oid", "") or "")
     if not base_oid or not head:
         return False        # GitHub answered no base commit: nothing to be behind of
@@ -6331,8 +7835,59 @@ def _validates_on_review(store: ProjectStore, wo_id: str, cfg: Any) -> bool:
     parked in `needs_review` when it shipped do not, and deleting this would send them to
     the merge queue unjudged.
     """
-    return (cfg is not None and cfg.enabled
+    return (validation_applies(cfg, store.get_work_order(wo_id), store)
             and store.latest_validation_round(wo_id=wo_id) is None)
+
+
+def exempt_from_validation(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """Is this submission one no panel round may open over? ONE body, three call sites.
+
+    §2.4 of docs/superpowers/specs/2026-10-01-a-submitted-verdict-must-settle-its-
+    investigator.md, shape ruled by Neo question 1195 on the precedent of 1169: the KIND
+    narrows who may claim the exemption and the PREMISE still has to hold, which is what
+    `release.is_release_order` already does one line below. An investigator with its
+    verdict filed has submitted no diff, so `evidence.nothing_to_judge` would escalate the
+    round with "nothing to review" and `autoreview.HELD_PANEL_GAVE_UP` would put a hold
+    not even Neo could clear; one still working has filed nothing and claims nothing.
+
+    Spent at all three sites and not just at `validation_applies`, because
+    `land_when_cleared` re-READS the latest round when `panel_cleared` is false: an order
+    for which no round was ever opened would park in `validating` for ever or land on a
+    stale verdict (kn-9256fcb9's lockstep trap).
+    """
+    from . import verdicts
+
+    return wo.get("kind") == "investigator" and verdicts.verdict_stored(store, wo)
+
+
+def validation_applies(cfg: Any, wo: dict[str, Any], store: ProjectStore) -> bool:
+    """Does a validation round open over THIS submission? One predicate, two call sites.
+
+    `os.validation.enabled` is read at the submission sites only (`finish`'s docstring),
+    and a RELEASE ORDER THAT DELIVERED NO PULL REQUEST is never one of them: it authors no
+    files and stages no tag, so `evidence.nothing_to_judge` escalated it with "nothing to
+    review" and `autoreview.HELD_PANEL_GAVE_UP` put a hold even Neo could not clear. The
+    post-condition such a release owes already exists and is a machine check
+    (`Daemon.settle_shipped_releases`: a `jarvis-*` tag containing every payload commit
+    AND production running it), so a seat reading a release worker's prose adds nothing
+    to it (2026-09-29 spec §2).
+
+    THE EXEMPTION'S GROUND IS THE ABSENT PULL REQUEST, and `is_release_order` only
+    narrows which orders may claim it. One that finished with `--pr` submits like any
+    code-bearing order — wo-33e1d0b4 changed `scripts/shipit.sh` under the old kind-keyed
+    predicate, reached no panel, and could never clear `automerge`'s `validated_head`
+    condition. `wo["pr_url"]` is the one source: a second argument would be a second
+    answer to "was there a diff". Callers holding a dict whose column is not yet written
+    overlay it (`finish`).
+
+    docs/superpowers/specs/2026-10-01-a-release-that-authored-files-is-judged-like-any-other.md §1
+
+    An INVESTIGATOR is the second exclusion, and for a stricter reason: it authors nothing
+    at all. See `exempt_from_validation`.
+    """
+    return (cfg is not None and cfg.enabled
+            and not (release.is_release_order(wo) and not str(wo.get("pr_url") or ""))
+            and not exempt_from_validation(store, wo))
 
 
 def _land_after_acceptance(store: ProjectStore, path: Path, wo_id: str,
@@ -6359,11 +7914,14 @@ def _land_after_acceptance(store: ProjectStore, path: Path, wo_id: str,
     # says why.
     if not _awaiting_merge(fresh):
         fresh = {**fresh, "pr_url": ""}
+    # Told, not re-read: an exempt submission opened no round here either, release or
+    # investigator — the two move in lockstep (2026-10-01 spec §3, kn-9256fcb9).
+    cleared = not validation_applies(cfg, store.get_work_order(wo_id), store)
     # The assumption gate has cleared; whether the work order lands now is the panel's
     # half of the join to answer. NOTE that landing through `land_finished` also CLOSES
     # THE BACKLOG ITEM on the `completed` branch, which the inline landing this replaced
     # did not — that omission was the drift `land_finished` exists to prevent.
-    return land_when_cleared(store, fresh)
+    return land_when_cleared(store, fresh, panel_cleared=cleared)
 
 
 def accept_assumption(store: ProjectStore, project_path: Path, wo: dict[str, Any],
@@ -6641,11 +8199,16 @@ def feature_order_budget(fo_id: str, project_name: str | None = None) -> dict[st
         p = budget.pool(store, central, fo)
         spend = budget.feature_spent(store, central, fo)
         live = budget.feature_in_flight(store, fo)  # display only; see `budget.spent`
+        # `budget.family` for the same reason as the set path's `exhausted_children`:
+        # the totals beside this list are family totals, so a breakdown off the
+        # `kind='worker'` children alone does not add up to them — and is EMPTY for an
+        # improvement order or an investigation, whose one child is the family's
+        # `plan_wo_id` (Neo question 1198).
         children = [
             {"wo_id": c["id"], "status": c["status"],
              "reserved_usd": c.get("budget_reserved_usd"),
              "spent_usd": budget.spent(store, central, c["id"]).total_usd}
-            for c in store.feature_children(fo_id)
+            for c in budget.family(store, fo)
         ]
     finally:
         central.close()
@@ -6721,7 +8284,23 @@ def list_feature_orders(project_name: str | None = None,
         store = ProjectStore(path)
         try:
             statuses = None if include_settled else FO_OPEN_STATUSES
-            for fo in store.list_feature_orders(statuses=statuses, kind=kind):
+            rows = store.list_feature_orders(statuses=statuses, kind=kind)
+            if not include_settled:
+                # THE DEFAULT LISTING IS THE OPEN ONES PLUS ANY FLAGGED ROW WHATEVER ITS
+                # STATUS (§6 of
+                # docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md).
+                # `flagged_feature_orders`' own docstring is the argument: `failed` is a
+                # SETTLED status and also the one a feature order raises its flag in, and
+                # a `WAITING_ON_USER` investigation is `completed` AND flagged in one
+                # transaction. A flag nobody can list is a flag nobody can act on.
+                # Here and not in `ProjectStore`: each of its two methods is honest about
+                # one question, and `--all` is still the way to see settled quiet rows.
+                seen = {fo["id"] for fo in rows}
+                rows += [fo for fo in store.flagged_feature_orders()
+                         if fo["id"] not in seen
+                         and (kind is None or (fo.get("kind") or "feature") == kind)]
+                rows.sort(key=lambda fo: fo["created_at"], reverse=True)
+            for fo in rows:
                 out.append({"project": name, **fo,
                             "status_label": feature_status_label(kind, fo["status"]),
                             "progress": feature_progress(store, fo)})
@@ -6741,6 +8320,20 @@ def list_feature_orders(project_name: str | None = None,
 #: about the OS's records, not a CLI error (§2.6).
 EVIDENCE_REFS_KEY = "evidence_refs"
 
+
+def evidence_refs(fo: dict[str, Any]) -> list[str]:
+    """The evidence an improvement order was filed with, off one row.
+
+    ONE HOME FOR THE READ and not just for the key (kn-4ea33fe6): `show_improvement_order`
+    renders these and `_fix_gap_note` asks whether one of them names a work order, and a
+    second place that knows the metadata is JSON under `EVIDENCE_REFS_KEY` is how the two
+    come to disagree about which order an investigation is evidence for. Defensive at every
+    step: a row written before §2.1 of the improvement-orders spec carries no metadata at
+    all, and absent is not an error here — it is an order with no refs recorded.
+    """
+    metadata = db.from_json(fo.get("metadata"), {}) or {}
+    return list(metadata.get(EVIDENCE_REFS_KEY) or [])
+
 #: `work_orders.metadata`/`feature_orders.metadata` key on an order FILED FROM a finding:
 #: the improvement order it came from. The back-link's machine-readable half — the human
 #: half is the first line of the description (§5.3.1). A filed order is never a child:
@@ -6758,9 +8351,38 @@ def _require_kind(fo: dict[str, Any], kind: str, verb: str) -> None:
     actual = fo.get("kind") or "feature"
     if actual == kind:
         return
-    other = "an improvement order" if actual == "improvement" else "a feature order"
-    raise OpsError(f"{fo['id']} is {other}, not {'an' if kind[0] == 'i' else 'a'} "
+    # A TABLE, not a derivation from two kinds: a third kind read as "a feature order"
+    # is a message that names the wrong surface — §2.1 of
+    # docs/superpowers/specs/2026-09-27-investigation-orders.md.
+    other = _KIND_PHRASES.get(actual, "a feature order")
+    raise OpsError(f"{fo['id']} is {other}, not {'an' if kind[0] in 'aeiou' else 'a'} "
                    f"{kind} order — use `{verb} {fo['id']}` instead")
+
+
+#: How each `feature_orders.kind` reads in a refusal.
+_KIND_PHRASES = {
+    "feature": "a feature order",
+    "improvement": "an improvement order",
+    "investigation": "an investigation order",
+}
+
+#: Per kind: how the FAMILY reads in prose, and the command that raises its budget. A
+#: TABLE for `_require_kind`'s own reason — a third kind read as "a feature order" is a
+#: message that names the wrong surface, and `jarvis fo budget` on an `io-`/`inv-` row
+#: refuses. §2 of
+#: docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md. Here beside
+#: `_KIND_PHRASES` and not in the budgets section: a second kind table down there is the
+#: one that goes stale when a fourth kind lands.
+_KIND_FAMILY = {
+    "feature": ("feature", "jarvis fo budget"),
+    "improvement": ("improvement order", "jarvis io budget"),
+    "investigation": ("investigation", "jarvis investigate budget"),
+}
+
+
+def family_prose(kind: str | None) -> tuple[str, str]:
+    """`(what the family is called, the command that raises its budget)` for one kind."""
+    return _KIND_FAMILY.get(kind or "feature", _KIND_FAMILY["feature"])
 
 
 def create_improvement_order(project_name: str, title: str, description: str = "",
@@ -6850,7 +8472,7 @@ def show_improvement_order(io_id: str, project_name: str | None = None) -> dict[
         "report": report if isinstance(report, dict) else {},
         "filed_orders": _filed_orders(findings),
         "observation": fo["description"],
-        "evidence_refs": list(metadata.get(EVIDENCE_REFS_KEY) or []),
+        "evidence_refs": evidence_refs(fo),
         "analyst": analyst,
         "status_label": feature_status_label("improvement", fo["status"]),
         "alarms": alarms,
@@ -6899,6 +8521,29 @@ def cancel_improvement_order(io_id: str, project_name: str | None = None
     _, _, fo = find_feature_order(io_id, project_name)
     _require_kind(fo, "improvement", "jarvis fo cancel")
     return cancel_feature_order(io_id, project_name)
+
+
+def improvement_order_budget(io_id: str, project_name: str | None = None
+                             ) -> dict[str, Any]:
+    """`jarvis io budget`, read-only. The feature-order arithmetic unchanged: the family
+    here is the order plus its analyst (§2.6 of the improvement-orders spec).
+
+    THE GUARD IS HERE AND NOT IN THE CLI, like every other `io` verb's — `jarvis io
+    budget` was the one that routed straight to the feature-order function, so `/api` and
+    every future caller got no guard at all (§3 of
+    docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md).
+    """
+    _, _, fo = find_feature_order(io_id, project_name)
+    _require_kind(fo, "improvement", "jarvis fo budget")
+    return feature_order_budget(io_id, project_name)
+
+
+def set_improvement_budget(io_id: str, amount: float | None,
+                           project_name: str | None = None) -> dict[str, Any]:
+    """`jarvis io budget <amount>`. Guard, then delegate — see the read above."""
+    _, _, fo = find_feature_order(io_id, project_name)
+    _require_kind(fo, "improvement", "jarvis fo budget")
+    return set_feature_budget(io_id, amount, project_name)
 
 
 def submit_findings(io_id: str, doc: Any,
@@ -7183,6 +8828,603 @@ def review_findings(io_id: str, accept: Sequence[str] = (),
             "learnings": learnings, "rejected": sorted(rejections), "errors": errors}
 
 
+# -- investigation orders --------------------------------------------------------------
+#
+# docs/superpowers/specs/2026-09-27-investigation-orders.md. An investigation order is a
+# `feature_orders` row with `kind='investigation'` plus exactly one read-only child of
+# `kind='investigator'`, so everything here that can be the feature-order function IS the
+# feature-order function, kind-guarded — the improvement order's arrangement, one kind on.
+#
+# What is NOT shared is who decides: an improvement order files nothing until the user
+# decides each finding, and an investigation SETTLES ITSELF. Which is why the duplicate
+# check and the filing live here, in `ops`, where they have a failing test, rather than in
+# the investigator's prompt, where they would have the diligence #792 already disproved.
+
+#: `feature_orders.metadata` key: the id this investigation is about. The
+#: `EVIDENCE_REFS_KEY` pattern — resolved at creation (unlike an improvement order's refs)
+#: because both of this order's refusals are about the subject (§2.7).
+SUBJECT_KEY = "subject"
+
+#: `feature_orders.metadata` key: `stuck.fingerprint` of the situation this investigation
+#: was opened on, which is the cooldown's memory (§6b of
+#: docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md). On
+#: the row beside `SUBJECT_KEY` rather than in a table of its own, for the reason that key
+#: is there: one more key is no migration, and `jarvis investigate show` can render it.
+STUCK_FINGERPRINT_KEY = "stuck_fingerprint"
+
+
+def create_investigation_order(project_name: str | None, subject: str, why: str,
+                               budget_usd: float | None = None,
+                               origin: str = "jarvis",
+                               fingerprint: str = "") -> dict[str, Any]:
+    """Open an investigation into one stuck order. Nothing runs here.
+
+    A thin `ops` function holding all the logic, because the CLI is not its main caller:
+    the companion fleet-health order calls this from the daemon and never by shelling out
+    to `jarvis` (§2.7). `project_name=None` resolves it from the SUBJECT — the id already
+    names one project, so `jarvis investigate wo-x` needs no second answer and the CLI
+    holds no rule of its own (§2.7).
+
+    Two refusals of its own, both at this level rather than in a prompt:
+
+    * **At most one live investigation per subject.** Without it the companion order opens
+      one per tick. A SETTLED investigation does not block a new one — the subject being
+      stuck again is a new question (§6).
+    * **An investigation never investigates an investigation.** Diagnosing the
+      diagnostician is a loop with a budget attached.
+    """
+    paths = registered_project_paths()
+    if project_name is not None and project_name not in paths:
+        raise OpsError(f"project {project_name!r} not registered "
+                       f"(known: {sorted(paths)}). Run `jarvis start` first.")
+    subject = (subject or "").strip()
+    if not subject:
+        raise OpsError("an investigation needs a subject — the wo-/fo-/io- id that is "
+                       "not progressing")
+    if not (why or "").strip():
+        raise OpsError(
+            f"an investigation needs a `why`: the investigator's first reader is a fresh "
+            f"session with no memory of the conversation that produced it. Say what you "
+            f"saw — `jarvis investigate {subject} --why \"...\"`."
+        )
+    project_name, title, kind = _subject_identity(subject, project_name)
+    if kind in ("investigation", "investigator"):
+        raise OpsError(
+            f"{subject} is an {kind} — an investigation never investigates the "
+            f"diagnostician. Investigate the subject it was opened on instead."
+        )
+    live = live_investigation(project_name, subject)
+    if live:
+        raise OpsError(
+            f"{live} is already investigating {subject} — `jarvis investigate show "
+            f"{live}`. One live investigation per subject; open a new one once that has "
+            f"settled."
+        )
+    store = ProjectStore(paths[project_name])
+    try:
+        return store.create_feature_order(
+            title=f"investigate {subject}: {title}"[:200], description=why,
+            origin=origin, kind="investigation",
+            metadata={SUBJECT_KEY: subject,
+                      **({STUCK_FINGERPRINT_KEY: fingerprint} if fingerprint else {})},
+            # The family is this order plus its one investigator, so the family
+            # arithmetic is already correct — `create_improvement_order`'s reasoning. The
+            # fallback is NOT "no ceiling": the caller is a daemon loop, not a human
+            # typing, and an uncapped default there is an uncapped loop (§2.8).
+            budget_usd=(budget_usd if budget_usd is not None
+                        else budget.investigation_default_for(
+                            _spec_or_none(project_name))))
+    finally:
+        store.close()
+
+
+def _subject_identity(subject: str,
+                      project_name: str | None) -> tuple[str, str, str]:
+    """The subject's project, title and kind, or an `OpsError` naming that it does not
+    exist.
+
+    Resolved at creation, unlike an improvement order's `--ref` strings, which are stored
+    verbatim on purpose: a ref that does not resolve is a FINDING there. Here the subject
+    is what both refusals are about, so an unresolvable one is a bad order.
+    """
+    if is_feature_order_id(subject):
+        name, _p, fo = find_feature_order(subject, project_name)
+        return name, str(fo["title"]), str(fo.get("kind") or "feature")
+    name, _p, wo = find_work_order(subject, project_name)
+    return name, str(wo["title"]), str(wo.get("kind") or "worker")
+
+
+def live_investigation(project_name: str, subject: str) -> str:
+    """The id of the non-terminal investigation already on this subject, or `""`.
+
+    PUBLIC because the fleet-health sweep asks it BEFORE attempting a creation (§6a): an
+    exception per already-investigated order per sweep is a log the operator learns to
+    ignore, and it is indistinguishable from a real failure on the run row. The refusal
+    inside `create_investigation_order` stays exactly as it is — it is the floor for every
+    other caller.
+    """
+    paths = registered_project_paths()
+    store = ProjectStore(paths[project_name])
+    try:
+        for row in store.list_feature_orders(statuses=FO_OPEN_STATUSES,
+                                             kind="investigation"):
+            metadata = db.from_json(row.get("metadata"), {}) or {}
+            if metadata.get(SUBJECT_KEY) == subject:
+                return str(row["id"])
+    finally:
+        store.close()
+    return ""
+
+
+#: The name every caller before §6a used. Kept as an alias rather than renamed at the call
+#: sites: the two are one function and a second spelling must not become a second body.
+_live_investigation = live_investigation
+
+
+def last_stuck_investigation(project_name: str, subject: str) -> dict[str, Any] | None:
+    """The newest investigation of ANY status on this subject that carries a fingerprint.
+
+    What the cooldown is read from (§6b). Any status, because a SETTLED one is exactly the
+    case the cooldown is about — `live_investigation` answers the other one.
+    """
+    paths = registered_project_paths()
+    store = ProjectStore(paths[project_name])
+    try:
+        for row in store.list_feature_orders(statuses=None, kind="investigation"):
+            metadata = db.from_json(row.get("metadata"), {}) or {}
+            if metadata.get(SUBJECT_KEY) == subject \
+                    and metadata.get(STUCK_FINGERPRINT_KEY):
+                return {**row, STUCK_FINGERPRINT_KEY: str(
+                    metadata[STUCK_FINGERPRINT_KEY])}
+    finally:
+        store.close()
+    return None
+
+
+def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
+               window: bool = False,
+               stuck_only: bool = True) -> tuple[int, list[dict[str, Any]]]:
+    """Every open order of one project, judged by `stuck.assess`. §7's ONE derivation.
+
+    `Daemon._stuck_candidates` and `stuck_report` both call it, so a duration or a
+    threshold is computed in exactly one place. `stuck_only` is what the sweep passes: the
+    surfaces want every row, the tick wants the over-threshold ones and must not pay for
+    the detail of the rest.
+
+    `window` is the PROJECT-WIDE usage hold, read once by the caller rather than once per
+    candidate (`health_sweep_hold`'s own docstring).
+    """
+    from . import holds, stuck
+    from .health import observer_kinds
+    from .project_store import FO_ID_PREFIXES, UNGOVERNED_ORIGINS
+    from .worker_session import PAUSE_USAGE_LIMIT
+
+    thresholds = {s: cfg.threshold_seconds(s) for s in cfg.thresholds}
+    scanned, out = 0, []
+    for wo in pstore.list_work_orders(statuses=OPEN_STATUSES):
+        if wo["origin"] in UNGOVERNED_ORIGINS:
+            continue  # the user's own session — `_health_candidates`' rule
+        # AN INVESTIGATION IS NEVER A SUBJECT. `create_investigation_order` refuses it
+        # too, and the refusal must not be how the sweep learns it (§6).
+        if wo.get("kind") in ("investigation", "investigator") \
+                or str(wo.get("parent_id") or "").startswith(
+                    f'{FO_ID_PREFIXES["investigation"]}-'):
+            continue
+        scanned += 1
+        durations = state_durations(pstore, wo_id=wo["id"], now=now)
+        if durations.current_status_since is None:
+            continue  # no present-tense claim to judge — `state_durations`' own rule
+        spans = holds.held(pstore, wo["id"], now=now)
+        since = durations.current_status_since
+        usage = [h for h in spans if h.cause == PAUSE_USAGE_LIMIT]
+        discounted = holds.by_cause(usage, since, now, now).get(PAUSE_USAGE_LIMIT, 0.0)
+        verdict = stuck.assess(
+            str(wo["status"]), now - since, now - (durations.last_activity_ts or since),
+            discounted, thresholds, cfg.fallback_minutes * 60.0,
+            excluded_cause=(PAUSE_USAGE_LIMIT
+                            if window or any(h.open for h in usage) else ""))
+        if stuck_only and not verdict.stuck:
+            continue
+        blocker = true_blockers(pstore, wo, now=now)
+        out.append({
+            "project": project_name, "wo": wo, "verdict": verdict,
+            "blocker": blocker[0] if blocker else "nothing the record can name",
+            "status_label": invariants.status_label(pstore, wo),
+            "since": since, "activity": durations.last_activity_ts or since,
+            "discounted": discounted,
+            "seconds_in_status": now - since,
+            "seconds_since_activity": now - (durations.last_activity_ts or since),
+            "events": pstore.count_events(wo["id"], exclude=observer_kinds()),
+        })
+    return scanned, out
+
+
+def stuck_report(project_name: str | None = None,
+                 now: float | None = None) -> list[dict[str, Any]]:
+    """Every open order and how the sweep judges it. §7: ONE reader, two renderers.
+
+    `jarvis stuck` and `/stuck` both read this and neither computes a duration or a
+    threshold — `jarvis wo why`'s rule. Pure and write-free, most overdue first, and
+    ONLY the projects `fleet_health.enabled` covers, so what it shows is what the sweep
+    would act on rather than arithmetic nobody will ever apply.
+    """
+    from . import stuck
+
+    now = time.time() if now is None else now
+    catalog = resolve_catalog()
+    paths = registered_project_paths()
+    rows: list[dict[str, Any]] = []
+    for spec in catalog.projects:
+        if not spec.fleet_health.enabled or spec.name not in paths:
+            continue
+        if project_name and spec.name != project_name:
+            continue
+        pstore = ProjectStore(paths[spec.name])
+        try:
+            _scanned, judged = stuck_scan(
+                pstore, spec.name, spec.fleet_health, now,
+                window=bool(pstore.health_sweep_hold()), stuck_only=False)
+        finally:
+            pstore.close()
+        for row in judged:
+            wo, verdict = row["wo"], row["verdict"]
+            rows.append({
+                "id": wo["id"], "project": spec.name, "title": wo["title"],
+                "status": wo["status"], "status_label": row["status_label"],
+                "seconds_in_status": row["seconds_in_status"],
+                "seconds_since_activity": row["seconds_since_activity"],
+                "discounted_seconds": row["discounted"],
+                "active_seconds": verdict.active_seconds,
+                "threshold_seconds": verdict.threshold_seconds,
+                "clock": verdict.clock, "stuck": verdict.stuck,
+                "excluded": verdict.excluded, "reason": verdict.reason,
+                "blocker": row["blocker"],
+                "fingerprint": stuck.fingerprint(str(wo["status"]), row["since"],
+                                                 row["blocker"], row["events"]),
+                "investigation": _stuck_investigation(spec.name, wo["id"]),
+            })
+    rows.sort(key=lambda r: r["threshold_seconds"] - r["active_seconds"])
+    return rows
+
+
+def _stuck_investigation(project_name: str, wo_id: str) -> dict[str, Any] | None:
+    """The live or last investigation of this subject, with its verdict when settled."""
+    live = live_investigation(project_name, wo_id)
+    last = last_stuck_investigation(project_name, wo_id)
+    row = None
+    if live:
+        _n, _p, row = find_feature_order(live, project_name)
+    elif last is not None:
+        row = last
+    if row is None:
+        return None
+    plan = db.from_json(row.get("plan"), {}) or {}
+    return {"id": row["id"], "status": row["status"],
+            "classification": str(plan.get("classification") or "")}
+
+
+def list_investigation_orders(project_name: str | None = None,
+                              include_settled: bool = False) -> list[dict[str, Any]]:
+    """`jarvis investigate list`. The feature-order listing with the other kind asked
+    for — behaviour is identical, so a copy would only be a second thing to keep in
+    step."""
+    return list_feature_orders(project_name, include_settled=include_settled,
+                              kind="investigation")
+
+
+def show_investigation_order(inv_id: str, project_name: str | None = None
+                             ) -> dict[str, Any]:
+    """`jarvis investigate show` — THE CLASSIFICATION AND THE SUBJECT FIRST, then the
+    root cause, the evidence, and what was filed or why nothing was.
+
+    The single resolution the dashboard route renders too (§2.9): a second one there
+    would make the page and this verb two answers to one question.
+    """
+    name, path, fo = find_feature_order(inv_id, project_name)
+    _require_kind(fo, "investigation", "jarvis fo show")
+    # `plan` is NULL until the verdict is submitted, which is the NORMAL state here — so
+    # every read of it is defensive rather than trusting.
+    verdict = db.from_json(fo.get("plan"), None) or {}
+    if not isinstance(verdict, dict):
+        verdict = {}
+    metadata = db.from_json(fo.get("metadata"), {}) or {}
+    store = ProjectStore(path)
+    try:
+        investigator = None
+        if fo.get("plan_wo_id"):
+            try:
+                row = store.get_work_order(fo["plan_wo_id"])
+                investigator = {k: row[k] for k in ("id", "title", "status",
+                                                    "result_summary")}
+            except KeyError:
+                investigator = None  # deleted out from under it; the link was released
+        alarms = store.alarms_for_feature(inv_id)
+    finally:
+        store.close()
+    return {
+        "project": name, **fo,
+        "subject": metadata.get(SUBJECT_KEY) or "",
+        "why": fo["description"],
+        "verdict": verdict,
+        "classification": verdict.get("classification") or "",
+        "filed": verdict.get("filed") or None,
+        "filing_error": verdict.get("filing_error") or "",
+        "investigator": investigator,
+        "status_label": feature_status_label("investigation", fo["status"]),
+        "alarms": alarms,
+    }
+
+
+def cancel_investigation_order(inv_id: str, project_name: str | None = None
+                               ) -> dict[str, Any]:
+    """`jarvis investigate cancel`. The feature-order path unchanged: it stops every
+    non-terminal work order the row owns — here just the investigator — and settles it."""
+    _, _, fo = find_feature_order(inv_id, project_name)
+    _require_kind(fo, "investigation", "jarvis fo cancel")
+    return cancel_feature_order(inv_id, project_name)
+
+
+def investigation_order_budget(inv_id: str, project_name: str | None = None
+                               ) -> dict[str, Any]:
+    """`jarvis investigate budget`, read-only — THE SECOND STEP OF THE TOP-UP.
+
+    §3 of docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md: the
+    command a parked child's note names has to exist. The family is the order plus its
+    one investigator, so the feature-order arithmetic is already correct (§2.6 of the
+    improvement-orders spec) and nothing is reimplemented. Guard here, as every other
+    `investigate` verb's is.
+    """
+    _, _, fo = find_feature_order(inv_id, project_name)
+    _require_kind(fo, "investigation", "jarvis fo budget")
+    return feature_order_budget(inv_id, project_name)
+
+
+def set_investigation_budget(inv_id: str, amount: float | None,
+                             project_name: str | None = None) -> dict[str, Any]:
+    """`jarvis investigate budget <amount>`. Guard, then delegate — see the read above.
+
+    Raising it takes the investigation out of `budget_exhausted` on the next reconcile
+    tick, back to `planning` — the status its lifecycle actually runs in
+    (`Daemon.settle_features`).
+    """
+    _, _, fo = find_feature_order(inv_id, project_name)
+    _require_kind(fo, "investigation", "jarvis fo budget")
+    return set_feature_budget(inv_id, amount, project_name)
+
+
+def submit_verdict(inv_id: str, doc: Any,
+                   project_name: str | None = None) -> dict[str, Any]:
+    """(Investigators) hand back the verdict. The investigator's terminal action.
+
+    Modelled step for step on `submit_findings`, AND THE ORDER OF THE STEPS IS THE DESIGN
+    (§2.5). The verdict is validated first, so a bad one costs the investigator one
+    revision and nothing else — nothing stored, no attention spent, no state to unwind.
+    Then the duplicate check and the filing. Only then is the order settled and the
+    investigator finished: `jarvis investigate verdict` IS its `jarvis wo finish`.
+
+    Three things this does that `submit_findings` does not, each a consequence of the
+    order settling ITSELF rather than parking for the user:
+
+    * **The duplicate check happens HERE**, before anything is filed. A prompt
+      instruction cannot be verified and a search in `ops` can be tested; #792
+      duplicating #790 is the standing proof that the diligent version fails.
+    * **A GAP files an EXPEDITED bug** — `bugreport.report_bug(..., expedite=True)`,
+      called as a Python function and not by an agent shelling out, so the route cannot
+      skip the check above. THE CASCADE IS INTENDED and is the highest-consequence thing
+      in this feature: per kn-efaad866 and kn-ffb94e3a that files the issue, dispatches a
+      work order on it and ships a release when the fix lands. A fix that lands without
+      shipping leaves production broken, which is what every issue in §1.1 was.
+    * **Attention for `WAITING_ON_USER` only**, raised HERE at the transition and never
+      re-derived on a tick (kn-089de524). A FILING FAILURE also raises it, and is not a
+      classification: `gh` unreachable keeps the order `planning` so the verdict can be
+      resubmitted. `Daemon.clear_answered_investigations` is the only thing that takes it
+      down, and it may only ever take it down.
+
+    **THE INVESTIGATOR IS SETTLED HERE, with `close_out` and never `finish`** — §2.1 of
+    docs/superpowers/specs/2026-10-01-a-submitted-verdict-must-settle-its-investigator.md,
+    GitHub issue 906. `finish` is the contract for an order that authored code: it opens a
+    validation round, joins on the landing and leaves the worker typing, and all three
+    re-decide something this function has already decided. Nothing is left to judge, to
+    land or to defer, so the three things wanted are exactly `close_out`'s — stop the
+    session, write `completed`, clear the flag.
+
+    UNCONDITIONAL ON STATUS, and inside the `try` so it shares this connection. A row
+    already `completed` costs one event and a stop of a session already gone, which is
+    cheaper than a status race; the only case skipped is a DELETED row. A PENDING
+    ASSUMPTION stays `pending` and holds nothing: only the user or Neo decides one, and
+    settling over it would be the silent acceptance `mark_done` refuses.
+    """
+    from . import bugreport, verdicts
+
+    name, path, fo = find_feature_order(inv_id, project_name)
+    _require_kind(fo, "investigation", "jarvis fo plan")
+    if fo["status"] != "planning":
+        raise OpsError(
+            f"{inv_id} is {fo['status']}, so it is not waiting for a verdict. There is "
+            f"no review round for an investigation — the verdict settles the order, and "
+            f"a second one is refused here rather than by a special case."
+        )
+    metadata = db.from_json(fo.get("metadata"), {}) or {}
+    subject = str(metadata.get(SUBJECT_KEY) or "")
+    try:
+        verdict = verdicts.parse_verdict(doc, subject=subject)
+    except verdicts.VerdictError as e:
+        raise OpsError(
+            f"the verdict was not accepted, and nothing was stored. Fix all of these and "
+            f"resubmit:\n  - " + "\n  - ".join(e.problems)
+        ) from e
+
+    verdict["classified_by"] = "investigator"
+    verdict["filed"] = None
+    filing_error = ""
+    if verdict["classification"] == "GAP":
+        try:
+            duplicate = _verdict_duplicate(name, subject, verdict, fo)
+        except Exception as e:  # noqa: BLE001 — an unreadable tracker is the §2.5 case
+            filing_error = f"the duplicate check could not read the tracker: {e}"
+            duplicate = ""
+        if not filing_error and duplicate:
+            # RECORDED AS `ops`' DECISION, and the submitted classification is kept: the
+            # record must never read as though the investigator classified it this way,
+            # and never as though it was wrong — finding the duplicate was never its job.
+            verdict["submitted_classification"] = "GAP"
+            verdict["classification"] = "ALREADY_TRACKED"
+            verdict["classified_by"] = "ops"
+            verdict["duplicate_of"] = duplicate
+        elif not filing_error:
+            try:
+                filed = bugreport.report_bug(
+                    title=verdict["proposed_fix"]["title"],
+                    description=verdict["proposed_fix"]["description"],
+                    expected=verdict["proposed_fix"]["expected"],
+                    actual=verdict["proposed_fix"]["actual"],
+                    priority=verdict["proposed_fix"]["priority"],
+                    project=name, wo_id=fo.get("plan_wo_id") or "",
+                    expedite=True)
+            except Exception as e:  # noqa: BLE001 — same case, one step later
+                filing_error = f"the bug could not be filed: {e}"
+            else:
+                verdict["filed"] = {
+                    "issue_url": filed.get("url"),
+                    "wo_id": (filed.get("pickup") or {}).get("wo_id"),
+                    "expedited": True,
+                }
+
+    if filing_error:
+        return _verdict_filing_failed(name, path, fo, inv_id, verdict, filing_error)
+
+    classification = verdict["classification"]
+    store = ProjectStore(path)
+    try:
+        store.update_feature_order(inv_id, plan=db.to_json(verdict))
+        store.set_feature_status(inv_id, "completed")
+        # THE ONE CLASSIFICATION THAT SPENDS ATTENTION, raised at the transition and
+        # nowhere else (§2.5 step 6). The other three settle silently, which is the whole
+        # difference from an improvement order.
+        if classification == "WAITING_ON_USER":
+            store.flag_feature_attention(inv_id,
+                                         verdicts.settle_headline(inv_id, verdict))
+        else:
+            store.clear_feature_attention(inv_id)
+        # …AND ON THE SUBJECT'S OWN TIMELINE (§7): the line above is the INVESTIGATOR's
+        # work order, which nobody reading the stuck order will open. `KeyError` like the
+        # `plan_wo_id` reads below, since a subject can be deleted under it.
+        if subject and not is_feature_order_id(subject):
+            try:
+                store.add_event(subject, "investigation_verdict", {
+                    "investigation": inv_id, "classification": classification,
+                    "filed": (verdict.get("filed") or {}).get("issue_url"),
+                })
+            except (KeyError, sqlite3.IntegrityError):
+                pass  # not this project's work order any more
+        settled: dict[str, Any] | None = None
+        if fo.get("plan_wo_id"):
+            store.add_event(fo["plan_wo_id"], "verdict_submitted", {
+                "investigation": inv_id, "classification": classification,
+                "classified_by": verdict["classified_by"],
+                "filed": (verdict.get("filed") or {}).get("issue_url"),
+            })
+            try:
+                investigator = store.get_work_order(fo["plan_wo_id"])
+            except KeyError:
+                investigator = None  # deleted; the link was released
+            if investigator is not None:
+                summary = f"submitted a {classification} verdict for {inv_id}"
+                store.update_work_order(fo["plan_wo_id"], result_summary=summary)
+                settled = close_out(
+                    store, investigator, "verdict_submitted_settled", why=summary,
+                    payload={"investigation": inv_id,
+                             "classification": classification})
+    finally:
+        store.close()
+
+    out: dict[str, Any] = {
+        "project": name, "inv_id": inv_id, "status": "completed",
+        "classification": classification, "filed": verdict.get("filed"),
+        "classified_by": verdict["classified_by"],
+        "note": "the investigation is settled — end your turn.",
+    }
+    if settled is not None:
+        out["investigator"] = {"wo_id": fo["plan_wo_id"], "status": "completed",
+                               "session_stopped": settled["stopped"]}
+    return out
+
+
+def _verdict_duplicate(project: str, subject: str, verdict: dict[str, Any],
+                       fo: dict[str, Any]) -> str:
+    """What already covers this GAP — a tracker issue url or a live order id — or `""`.
+
+    THE TRACKER FIRST, because "has this already been filed" is a question about the
+    destination — `issues.follow_ups_filed`'s reasoning, and `--state all` is load-bearing
+    for its reason too: a closed duplicate that drops out of the answer is re-filed for
+    ever.
+
+    THE TWO HALVES KEY ON DIFFERENT THINGS, and that asymmetry is the point.
+
+    The tracker keys on THE CAUSE — the proposed fix's title — and never on the subject
+    id. Issues whose body names an order id are common and usually about some OTHER
+    cause: every validation follow-up the panel filed on that order, every earlier
+    investigation's filing. Keying the tracker on the id turned each of those into a
+    duplicate, downgraded a real GAP to ALREADY_TRACKED and filed nothing. The cost of
+    keying on the cause is the opposite error: `gh` search is token-AND, so an existing
+    issue about the same cause in different words is missed and a duplicate gets filed.
+    That is the right direction to fail in — a duplicate issue is visible and closable, a
+    GAP that was never filed is not.
+
+    Live orders key on THE SUBJECT ID and never on the proposed title. `db.score_sql` is
+    word-OR (kn-c6e8fbf0), so a title search would match half the project on a shared word
+    and downgrade nearly every GAP — a duplicate check that never files is worse than
+    none, because it reads as one that works. The subject id is weighted and exact, and
+    "an order is already open about this subject" is the question worth asking anyway.
+    """
+    from . import bugreport, issues, search as search_mod
+
+    title = (verdict.get("proposed_fix") or {}).get("title") or ""
+    repo = bugreport.bug_repo()
+    if title:
+        for row in issues.issues_mentioning(repo, title):
+            return str(row["url"])
+    ours = {subject, fo["id"], fo.get("plan_wo_id") or ""}
+    for hit in search_mod.search(subject, project=project,
+                                 kinds=("work_order", "feature_order")):
+        if hit["id"] in ours or hit.get("status") in TERMINAL_STATUSES:
+            continue
+        return str(hit["id"])
+    return ""
+
+
+def _verdict_filing_failed(name: str, path: Path, fo: dict[str, Any], inv_id: str,
+                           verdict: dict[str, Any], error: str) -> dict[str, Any]:
+    """§2.5's one attention case that is not a classification: `gh` was unreachable.
+
+    An error is not a verdict, so this does NOT touch the "attention only for
+    WAITING_ON_USER" ruling. `review_findings`' `stuck` path, verbatim in shape: record
+    the error on the document, KEEP the order in `planning` so the verdict can be
+    resubmitted, flag attention naming the error and the retry command, and reach the
+    user's sinks rather than only a return value nobody reads.
+    """
+    verdict["filing_error"] = error
+    reason = (f"{inv_id}: the verdict could not be filed — {error} — retry with "
+              f"`jarvis investigate verdict {inv_id} --from-file verdict.json`")
+    store = ProjectStore(path)
+    try:
+        store.update_feature_order(inv_id, plan=db.to_json(verdict))
+        store.flag_feature_attention(inv_id, reason)
+    finally:
+        store.close()
+    central = CentralStore()
+    try:
+        central.add_inbox(
+            project=name, level="warning",
+            title=f"{inv_id}: an investigation's verdict could not be filed",
+            body=reason, wo_id=fo.get("plan_wo_id") or None)
+    finally:
+        central.close()
+    return {"project": name, "inv_id": inv_id, "status": fo["status"],
+            "classification": verdict["classification"], "filed": None,
+            "filing_error": error, "note": reason}
+
+
 def show_feature_order(fo_id: str, project_name: str | None = None) -> dict[str, Any]:
     """The feature order, its plan and its children — the tree, in one call."""
     from . import plans
@@ -7262,6 +9504,74 @@ def _spec_branch(path: Path, planner_wo: dict[str, Any] | None) -> str:
     worktree = landing.worktree_of(path, planner_wo) if planner_wo else None
     branch = landing.authored(worktree).branch if worktree else ""
     return branch or evidence.base_ref(path) or "the default branch"
+
+
+def _record_spec_pull_request(path: Path, fo_id: str,
+                              planner_wo: dict[str, Any] | None,
+                              design_doc: str) -> None:
+    """The planner's spec pull request, onto its own record — or refuse the submission.
+
+    §2-§5 of
+    docs/superpowers/specs/2026-09-27-a-planner-submits-behind-its-spec-pull-request.md.
+    `work_orders.pr_url` had two writers and the `jarvis fo plan` route reached neither,
+    so every planner that committed a spec was refused by the trailing `finish()` with a
+    remedy (`--pr`) that is not a flag of the command it was printed to (issue #822).
+
+    NON-DECLARATIVE, exactly as `gates._record_pull_request` writes it: `pr_url_recorded`
+    with no `finished {pr_url}` behind it makes `routes_on_pull_request` false, so the
+    planner settles `completed` instead of parking in `waiting_pr_merge` and putting every
+    spec pull request in front of a validation panel (ruling 877). `source` distinguishes
+    the two writers on the record and is read by no router.
+
+    Called BEFORE the first write, so a submission defect costs a revision and nothing
+    else — `submit_plan`'s own rule, and the half-state kn-03b735b4 records is what
+    refusing at the tail produced.
+    """
+    from . import github
+
+    if not planner_wo:
+        return
+    store = ProjectStore(path)
+    try:
+        recorded = store.get_work_order(planner_wo["id"])
+        if recorded is None or recorded.get("pr_url"):
+            return
+        work = authorship(store, planner_wo)
+        if not work.produced:
+            return
+        branch = work.branch or _spec_branch(path, planner_wo)
+        try:
+            pr_url = github.open_pull_request_for_branch(branch, path)
+        except github.GhUnavailable as e:
+            raise OpsError(
+                f"{fo_id}'s plan was not stored: the `gh` CLI is not installed where the "
+                f"OS can reach it, so the planner's pull request cannot be confirmed. "
+                f"Resubmit once `gh` works.\n{e}"
+            ) from e
+        except github.GitHubError as e:
+            raise OpsError(
+                f"{fo_id}'s plan was not stored: the pull request on `{branch}` could "
+                f"not be confirmed — {e.reason}. Nothing is being abandoned; resubmit "
+                f"once `gh` works."
+            ) from e
+        if not pr_url:
+            raise OpsError(
+                f"{fo_id}'s planner has committed `{design_doc}` on `{branch}`, and "
+                f"there is no OPEN pull request on that branch — so the spec would stay "
+                f"on the branch and nothing would ever land it. Push the branch and open "
+                f"a pull request, then run `jarvis fo plan` again: the plan is not stored "
+                f"until this passes.\n"
+                f"  git push -u origin {branch} && gh pr create --fill\n"
+                f"If the spec has already merged, reset the branch onto `origin/main` — "
+                f"confirm the files diff empty against it first — rather than opening a "
+                f"second pull request."
+            )
+        store.update_work_order(planner_wo["id"], pr_url=pr_url)
+        store.add_event(planner_wo["id"], "pr_url_recorded",
+                        {"pr_url": pr_url, "feature_order": fo_id,
+                         "source": "plan_submit"})
+    finally:
+        store.close()
 
 
 def _ask_plan_review(name: str, fo: dict[str, Any], plan: dict[str, Any],
@@ -7358,6 +9668,10 @@ def submit_plan(fo_id: str, doc: Any,
             f"resubmit:\n  - " + "\n  - ".join(spec_problems)
         )
 
+    # §3: after the committed-copy check, which is what proves a commit exists and names
+    # the branch, and before the first write.
+    _record_spec_pull_request(path, fo_id, planner_wo, plan["design_doc"])
+
     # The planner is who Neo's question hangs off: it is a real work order, it is who
     # receives a rejection, and it is what `jarvis neo list` can link back to. A feature
     # order whose planner was deleted still submits — the question just names the feature
@@ -7387,11 +9701,41 @@ def submit_plan(fo_id: str, doc: Any,
     if fo.get("plan_wo_id"):
         # The planner has no more to say until the review lands, and a work order left
         # `running` with no turn in flight is what the reconciler calls idle.
-        out["planner"] = finish(
-            fo["plan_wo_id"],
-            f"submitted a plan for {fo_id}: {len(plan['children'])} work orders",
-        )
+        summary = f"submitted a plan for {fo_id}: {len(plan['children'])} work orders"
+        try:
+            out["planner"] = finish(fo["plan_wo_id"], summary)
+        except OpsError as e:
+            # docs/superpowers/specs/2026-09-27-a-planner-submits-behind-its-spec-pull-request.md
+            out["warning"] = _planner_unsettled(path, fo_id, fo["plan_wo_id"],
+                                                summary, e)
     return out
+
+
+def _planner_unsettled(path: Path, fo_id: str, planner_id: str, summary: str,
+                       refusal: OpsError) -> str:
+    """The plan IS stored; only the planner could not settle. Ruling 903, issue #822.
+
+    ONLY `OpsError` reaches here — every other exception propagates, because an
+    `OpsError` is a refusal this module wrote and anything else is a defect nobody has
+    read. The refusal to expect is `finish`'s open-gate one (`gate_still_open`): planners
+    do file merge gates (kn-ae871d91). The class being closed is the shared exit code —
+    an `error:` over a command whose every write succeeded is what the reporter retried
+    three times, asking a fresh Neo review question each time.
+    """
+    store = ProjectStore(path)
+    try:
+        ids = [str(a["id"]) for a in store.open_approvals(planner_id)]
+    finally:
+        store.close()
+    blocker = (f"gate request{'s' if len(ids) > 1 else ''} {', '.join(ids)} still open"
+               if ids else "it could not be settled")
+    return (
+        f"{fo_id}'s plan IS stored and queued for review — nothing here needs "
+        f"resubmitting, and resubmitting would ask Neo a second time about the same "
+        f"plan. Only its planner {planner_id} is unsettled: {blocker}. Clear that, then "
+        f"settle the planner:\n"
+        f"    jarvis wo finish {planner_id} --summary \"{summary}\"\n\n{refusal}"
+    )
 
 
 def refresh_plan_spec(fo_id: str,
@@ -7716,6 +10060,67 @@ def cancel_feature_order(fo_id: str, project_name: str | None = None) -> dict[st
 FIX_TITLE_CHARS = 120
 
 
+def revive_feature_manager(store: ProjectStore, fo_id: str,
+                           why: str) -> dict[str, Any] | None:
+    """Give an `executing` feature back the manager its settlement closed.
+
+    THE ONE SITE manager liveness is derived at, and that is the point: it was written
+    once at a transition (`Daemon._close_feature_manager`) and never derived, so all three
+    paths that reverse that transition — `resume_feature_order`,
+    INV-FEATURE-FALSE-FAILURE's repair and `Daemon._manager_handoff` — had to remember to
+    undo it, and none of them did. Spec §(c), docs/superpowers/specs/2026-10-07-a-settled-
+    features-live-children-must-have-a-manager-or-a-hold.md
+
+    `idle`, the manager's designed steady state since issue #264: `_manager_handoff` tests
+    for it and `invariants.true_blockers` derives nothing from it but MESSAGE_STUCK_BLOCKER,
+    so a revived manager asks the user for nothing.
+
+    Returns the manager row, or None when there is no manager row at all, when the manager
+    is already open, or when the feature is not `executing` — the callers need to tell
+    those apart.
+    """
+    try:
+        feature = store.get_feature_order(fo_id)
+    except KeyError:
+        return None
+    if feature["status"] != "executing":
+        return None
+    manager = store.manager_work_order(fo_id)
+    if manager is None or manager["status"] in OPEN_STATUSES:
+        return None
+    store.set_status(manager["id"], "idle")
+    store.clear_attention(manager["id"])
+    # The exact mirror of `_close_feature_manager`'s `feature_settled`, so the manager's
+    # timeline reads as a pair.
+    store.add_event(manager["id"], "manager_revived",
+                    {"feature_order": fo_id, "was": manager["status"], "why": why})
+    return store.get_work_order(manager["id"])
+
+
+def lower_settled_feature_holds(store: ProjectStore,
+                                children: list[dict[str, Any]]) -> list[str]:
+    """Take down the hold a child carried while its feature was settled.
+
+    TWO CALLERS, in two modules — `resume_feature_order` below and
+    INV-FEATURE-FALSE-FAILURE's repair — and that is why it is public: both paths reopen a
+    feature, so both owe the children the same clear.
+
+    SETTLED_FEATURE_BLOCKER is derived, so the reopening makes it untrue — and nothing
+    re-derives a flag already stored, so the stale sentence would stand until the child
+    settled. The same rule `_carry_round_onto` states for its own flag: lowered only when
+    `true_blockers` is EMPTY, so another blocker is somebody else's reason and is left
+    exactly as it was, and only while the flag is up, which makes it idempotent.
+    """
+    lowered = []
+    for child in children:
+        fresh = store.get_work_order(child["id"])
+        if not fresh["needs_attention"] or true_blockers(store, fresh):
+            continue
+        store.clear_attention(fresh["id"])
+        lowered.append(fresh["id"])
+    return lowered
+
+
 def resume_feature_order(fo_id: str, fix: str = "",
                          project_name: str | None = None) -> dict[str, Any]:
     """`jarvis fo resume` — put a failed feature order back to work.
@@ -7756,11 +10161,15 @@ def resume_feature_order(fo_id: str, fix: str = "",
     store = ProjectStore(path)
     try:
         children = store.feature_children(fo_id)
-        dead = dead_feature_children(children)
+        dead = dead_feature_children(store, children)
         if dead:
             store.supersede_children(fo_id, [c["id"] for c in dead], note=fix)
         store.set_feature_status(fo_id, "executing")
         store.clear_feature_attention(fo_id)
+        # BEFORE the `--fix` child is filed, so a crash between them leaves a live manager
+        # rather than a child with no addressee.
+        revive_feature_manager(store, fo_id, why="jarvis fo resume")
+        lower_settled_feature_holds(store, children)
         child = None
         if fix.strip():
             title = " ".join(fix.split())[:FIX_TITLE_CHARS]
@@ -7826,7 +10235,7 @@ def ask_question(wo_id: str, question: str, project_name: str | None = None) -> 
     worker's next user turn via the normal message-delivery path.
 
     A question is one paragraph that may reference a design artifact section in-text
-    (`from section 3 of design doc "docs/specs/x.md"`). The reference is resolved HERE,
+    (`from section 3 of design doc "docs/superpowers/specs/x.md"`). The reference is resolved HERE,
     at ask time: the section — and only the section — is snapshotted into the question's
     context, so Neo reads exactly the design context the paragraph argues from while the
     recorded question stays a paragraph.
@@ -7840,7 +10249,7 @@ def ask_question(wo_id: str, question: str, project_name: str | None = None) -> 
             f"{QUESTION_MAX_CHARS}. A question to Neo is one paragraph — the decision, "
             f"the options, your recommendation — arguing from a design artifact it "
             f"references in-text, e.g. `from section 3 of design doc "
-            f"\"docs/specs/feature.md\": …`. The referenced section is delivered to "
+            f"\"docs/superpowers/specs/feature.md\": …`. The referenced section is delivered to "
             f"whoever answers, alongside your paragraph; you do not need to paste it."
         )
 
@@ -8629,7 +11038,7 @@ def retract_gate_rule(rule_id: str, reason: str) -> dict[str, Any]:
 
 # -- the self-evolution registry (detectors and remedy rules; see rules.py) --------------
 #
-# docs/specs/2026-09-27-self-evolution.md §3.4. Every one of these returns a
+# docs/superpowers/specs/2026-09-27-self-evolution.md §3.4. Every one of these returns a
 # PLAIN DICT the CLI and the dashboard both consume verbatim; neither of them derives a
 # number, so the two surfaces cannot disagree about what the registry says.
 #
@@ -8872,6 +11281,11 @@ def rule_facts(store: ProjectStore, wo: dict[str, Any], *, now: float,
 
     wo_id = str(wo["id"])
     values: dict[str, Any] = {}
+    # READ ONCE PER ORDER AND SHARED. `ops.state_durations` itself reads `holds.held` —
+    # it has to, since docs/superpowers/specs/2026-09-30-time-in-state-counts-a-usage-
+    # limit-hold-as-running.md made the active basis part of every reading — so a
+    # snapshot that named both sources used to walk the same timeline twice.
+    hold_rows: list[Any] | None = None
 
     def put(name: str, value: Any) -> None:
         """Record a field, or leave it ABSENT. Empty strings and None are absent; `0`,
@@ -8891,8 +11305,19 @@ def rule_facts(store: ProjectStore, wo: dict[str, Any], *, now: float,
 
     if need("state_durations"):
         durations = state_durations(store, wo_id=wo_id, now=now)
+        hold_rows = list(durations.holds)
         if durations.current_status_since is not None:
-            put("seconds_in_status", max(0.0, now - durations.current_status_since))
+            since = durations.current_status_since
+            put("seconds_in_status", max(0.0, now - since))
+            # THE ACTIVE BASIS, spec §6 of docs/superpowers/specs/2026-09-30-time-in-
+            # state-counts-a-usage-limit-hold-as-running.md: the same subtraction
+            # `StateDurations.as_dict` makes, off the holds THIS READING ALREADY CARRIES.
+            # So the field costs no second walk of the timeline and stays inside the
+            # `state_durations` source it is declared under — reading it from
+            # `holds.held` instead would make every condition about time in status pay
+            # for the expensive source.
+            held = sum(h.overlap(since, now, now) for h in durations.holds)
+            put("seconds_in_status_active", max(0.0, now - since - held))
         if durations.last_activity_ts is not None:
             put("seconds_since_activity", max(0.0, now - durations.last_activity_ts))
         if durations.spans:
@@ -8903,7 +11328,9 @@ def rule_facts(store: ProjectStore, wo: dict[str, Any], *, now: float,
         # THE EXPENSIVE ONE. The MERGED open hold is what a condition asks about — the
         # same object every other surface renders — so `holds.held`'s merge is used
         # rather than a second reading of the timeline.
-        open_holds = [h for h in holds_mod.held(store, wo_id, now=now) if h.open]
+        if hold_rows is None:
+            hold_rows = list(holds_mod.held(store, wo_id, now=now))
+        open_holds = [h for h in hold_rows if h.open]
         if open_holds:
             hold = open_holds[-1]
             put("hold_cause", hold.cause)
@@ -9162,6 +11589,21 @@ APPLY_RULES: tuple[tuple[str, str], ...] = (
     ("*.model", "next-dispatch"),
     ("*.effort", "next-dispatch"),
     ("*.permission_mode", "next-dispatch"),
+    # Read once per spawn into the worker's settings file, and a running worker's session
+    # already holds the system prompt it was launched with. Spec §1:
+    # docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md
+    ("*.bash_first", "next-dispatch"),
+    # Read once per spawn into the worker's settings file, and a running worker's
+    # tool list cannot change mid-conversation. Spec §4:
+    # docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md
+    ("*.tool_search", "next-dispatch"),
+    # Read once per spawn into the worker's settings file, which is where the hook reads
+    # it. Spec §6: docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md
+    ("*.py_nav_hook", "next-dispatch"),
+    # Both read once per spawn into the worker's settings file, which is where the hook
+    # reads them. Spec §5: docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md
+    ("*.doc_nav_hook", "next-dispatch"),
+    ("*.doc_read_limit_lines", "next-dispatch"),
     ("*.autocompact_window", "next-dispatch"),
     ("*.append_system_prompt", "next-dispatch"),
     # Read once per spawn, into the settings file that spawn passes to `--settings`
@@ -9174,6 +11616,11 @@ APPLY_RULES: tuple[tuple[str, str], ...] = (
     # was launched with, and nothing re-reads the catalog at it — the hook must not,
     # since it runs on every Bash command.
     ("*.concision.*", "next-dispatch"),
+    # `jarvis cost --fleet` reads the catalog on every invocation, so a change is in
+    # force on the next run — stated rather than left to fall through, even though the
+    # fall-through answer is the same one. Spec §6.2:
+    # docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md
+    ("*.cost.*", "hot"),
 )
 
 APPLY_NOTES = {
@@ -9317,6 +11764,63 @@ def parse_config_value(text: str) -> Any:
 def _project_names(document: dict[str, Any]) -> list[str]:
     return [p["name"] for p in document.get("projects", [])
             if isinstance(p, dict) and isinstance(p.get("name"), str)]
+
+
+#: The OS-owning project's own health sweep is not a setting the user may turn off —
+#: USER RULE 2026-09-28, kn-7312c7de. Checked on the RESOLVED document, so it holds
+#: however the value was spelled: at the project level, on the `os.` block it inherits
+#: from, or by unsetting a key whose default is False.
+OS_SWEEP_KEYS = ("supervisor.enabled", "supervisor.health_enabled")
+
+
+def _refuse_os_sweep_off(key: str, document: dict[str, Any],
+                         resolved: dict[str, Any], file: Path) -> None:
+    """Refuse a write that would leave the OS's own health sweep off.
+
+    In `ops` so the CLI (`jarvis config set/unset`) and the dashboard's config console
+    inherit the refusal from one place — neither has its own validation layer. Called
+    against the document the write WOULD commit, before `_commit_document`, so nothing
+    is written on a refusal.
+
+    The OS project is DERIVED, never hardcoded: `schedule.os_project`, so a renamed or
+    relocated checkout produces the right sentence with no edit. BY GIT ORIGIN, and
+    deliberately not `os_owner`'s path containment (issue 956): a project that merely
+    happens to be listed first is not the OS and may not be refused this write, and in
+    production nothing contains the running install at all. No OS project in the catalog
+    means there is nothing to protect.
+
+    JUDGED ON THE KEY THE WRITE TOUCHES, and on that key's RESOLVED value afterwards —
+    so every spelling is covered (the project's own key, the `os.` block it inherits
+    from, an unset back to a False default) while an unrelated setting is never refused
+    for a switch it does not move. `health_enabled` ships False, so a rule that read both
+    keys on every write would refuse `os.ui.port` on a fresh catalog and, worse, refuse
+    turning the first of the two switches back on.
+    """
+    from . import schedule
+
+    suffix = next((k for k in OS_SWEEP_KEYS if key == k or key.endswith(f".{k}")), None)
+    if suffix is None:
+        return
+    projects = [p for p in document.get("projects", [])
+                if isinstance(p, dict) and isinstance(p.get("name"), str)]
+    try:
+        owner = schedule.os_project(
+            (p["name"], Path(str(p.get("path") or file.parent))) for p in projects)
+    except (OSError, ValueError):       # an unreadable path is not an authorisation
+        return
+    if owner is None:
+        return
+    # A write scoped to ANOTHER project cannot move the owner's resolved value; only its
+    # own keys and the `os.` block it inherits from can. §4 stops the OS's project opting
+    # out and nothing else — every other project opts in and out freely.
+    if key.startswith("projects.") and not key.startswith(f"projects.{owner}."):
+        return
+    if not resolved.get(f"projects.{owner}.{suffix}"):
+        raise OpsError(
+            f"projects.{owner}.{suffix} would leave the health sweep of {owner} OFF, "
+            f"and that project runs the OS itself — its sweep must always be on and "
+            f"producing judgements (user rule, 2026-09-28). Change it on another "
+            f"project, or turn the sweep off nowhere.")
 
 
 def _key_path(path: str, project: str | None, document: dict[str, Any]) -> str:
@@ -9508,6 +12012,7 @@ def set_config(path: str, value: Any, project: str | None = None, *, reason: str
     container[leaf] = value
 
     after = _resolved_of(document, file)
+    _refuse_os_sweep_off(key, document, after, file)
     changes = _one_change(key, before, after, doc_before, value, existed)
     _require_reason(changes, reason,
                     _retry("set", path, project, json.dumps(value, ensure_ascii=False)))
@@ -9537,6 +12042,7 @@ def unset_config(path: str, project: str | None = None, *, reason: str = "",
     doc_before = container.pop(leaf)
 
     after = _resolved_of(document, file)
+    _refuse_os_sweep_off(key, document, after, file)
     changes = _one_change(key, before, after, doc_before, after.get(key), True,
                           removed=True)
     _require_reason(changes, reason, _retry("unset", path, project))
@@ -10057,7 +12563,7 @@ def _partition_calls(
         # calls at all (zero tokens, zero dollars — `observability.metered`), so counting
         # one as an OS call would report two calls where Jarvis made one. Money spent
         # LOOKING at an order is reported by `bill.py`, in its own class
-        # (docs/specs/2026-09-24-order-observability.md §10).
+        # (docs/superpowers/specs/2026-09-24-order-observability.md §10).
         if agent_usage.is_observability(kind):
             continue
         target = worker_side if agent_usage.is_subprocess(kind) else os_side
@@ -10125,6 +12631,7 @@ def _call_spend(groups: Sequence[dict[str, Any]], prefix: str) -> dict[str, Any]
     by_kind: dict[str, dict[str, Any]] = {}
     calls = failed = 0
     exact = 0.0
+    largest_input = 0
     for g in groups:
         u = _priced_group(usage_mod, g)
         total = total + u
@@ -10134,12 +12641,19 @@ def _call_spend(groups: Sequence[dict[str, Any]], prefix: str) -> dict[str, Any]
         kind = g.get("kind") or "other"
         entry = by_kind.setdefault(kind, {"kind": kind, "label": agent_usage.describe(kind),
                                           "calls": 0, "cost_usd": 0.0,
-                                          "billed_input": 0, "output": 0})
+                                          "billed_input": 0, "output": 0,
+                                          "max_input_chars": 0})
         entry["calls"] += g.get("calls") or 0
         entry["cost_usd"] = round(entry["cost_usd"] + u.list_cost_usd, 4)
         entry["billed_input"] += u.billed_input
         entry["output"] += u.output
+        # A MAX of one call's TOTAL input, prompt plus system prompt, where 0 means NOT
+        # MEASURED (spec §3, docs/superpowers/specs/2026-09-26-bounded-model-inputs.md).
+        biggest = g.get("max_input_chars") or 0
+        entry["max_input_chars"] = max(entry["max_input_chars"], biggest)
+        largest_input = max(largest_input, biggest)
     return {
+        f"{prefix}_max_input_chars": largest_input,
         f"{prefix}_calls": calls,
         f"{prefix}_failed_calls": failed,
         f"{prefix}_cost_usd": round(total.list_cost_usd, 4),
@@ -10158,7 +12672,9 @@ def _call_spend(groups: Sequence[dict[str, Any]], prefix: str) -> dict[str, Any]
 
 def _unit_row(name: str, wo: dict[str, Any], index: dict[str, list[Path]],
               turn_rows: Sequence[dict[str, Any]] = (),
-              os_groups: Sequence[dict[str, Any]] = ()) -> dict[str, Any]:
+              os_groups: Sequence[dict[str, Any]] = (),
+              *, since: float | None = None,
+              until: float | None = None) -> dict[str, Any]:
     """One work order's spend, flattened for a table.
 
     The transcript figures stay the body of the row (they are the only source with a
@@ -10179,7 +12695,7 @@ def _unit_row(name: str, wo: dict[str, Any], index: dict[str, list[Path]],
     from .bill import _cold_prefix_floor
 
     session = usage_mod.read_session(wo.get("session_id") or "", _cold_prefix_floor(),
-                                     index=index)
+                                     index=index, since=since, until=until)
     total = session.total
     provenance, recorded, settled, rec_totals = _turn_summary(list(turn_rows))
     os_groups_only, subproc_groups = _partition_calls(list(os_groups))
@@ -10249,8 +12765,53 @@ def bill(target: str, project: str | None = None, *,
     return build(target, project, live=live)
 
 
+def fleet_cost(**kwargs: Any) -> dict[str, Any]:
+    """What a TYPICAL order costs, over a window — see `jarvis.fleetcost`.
+
+    `cost_report` says which orders cost the MOST and has no place to put a population
+    statistic; this says what normal looks like, so "is this order an outlier" and "did
+    last week get dearer" become answerable. One thin wrapper rather than a second
+    import path, exactly like `bill` above, so the CLI and the dashboard reach it the way
+    they reach everything else in the OS.
+
+    Imported lazily because `fleetcost` must never touch `ProjectStore` — it opens every
+    database `mode=ro` — and keeping it out of this module's import graph is what keeps
+    that true.
+    """
+    from . import fleetcost
+
+    return fleetcost.report(**kwargs)
+
+
+def cost_window(**kwargs: Any) -> dict[str, Any]:
+    """Which window a cost surface is reporting over — see `fleetcost.resolve_window`.
+
+    Resolved ONCE per surface and handed to both payload builders, so the two halves of
+    a page cannot disagree. Lazy import for `fleet_cost`'s reason: §6 of
+    docs/superpowers/specs/2026-10-07-cost-window-selector.md.
+    """
+    from . import fleetcost
+
+    project = kwargs.pop("project", None)
+    kwargs.setdefault("cfg", fleetcost.cost_config(project))
+    return fleetcost.resolve_window(**kwargs)
+
+
+def cost_zone(tz: str | None = None, project: str | None = None) -> str:
+    """Which zone a cost surface DISPLAYS in — see `fleetcost.resolve_zone`.
+
+    Its own wrapper because the page needs the zone before it can parse the custom
+    form's naive datetimes: §11 of
+    docs/superpowers/specs/2026-10-07-cost-window-selector.md.
+    """
+    from . import fleetcost
+
+    return fleetcost.resolve_zone(tz, fleetcost.cost_config(project))
+
+
 def cost_report(project: str | None = None, target: str | None = None,
-                limit: int = 50, include_hidden: bool = True) -> dict[str, Any]:
+                limit: int = 50, include_hidden: bool = True,
+                window: dict[str, Any] | None = None) -> dict[str, Any]:
     """What the fleet's work has cost in tokens, read back from Claude Code's transcripts.
 
     `target` is a work-order or feature-order id for a single unit — a feature order
@@ -10281,6 +12842,12 @@ def cost_report(project: str | None = None, target: str | None = None,
     work order. The marker is unconditional on purpose: a heuristic that tried to guess
     whether any escaped would be blind in exactly the cases it was meant to catch, and a
     flat statement is always true and costs one line (ruled on wo-76e021aa, issue #103).
+
+    `window` is a dict `fleetcost.resolve_window` returned, and this ONLY FILTERS with
+    it — the boundary arithmetic is `fleetcost`'s (§5 of
+    docs/superpowers/specs/2026-10-07-cost-window-selector.md). `None` keeps the
+    whole-history behaviour, and a window is NEVER applied to `target=`: one order's
+    bill is the whole order, and truncating it would make the bill stop reconciling.
     """
     from . import usage as usage_mod
 
@@ -10291,7 +12858,9 @@ def cost_report(project: str | None = None, target: str | None = None,
     if target:
         return _cost_for_target(target, project, index)
 
-    os_groups = _os_groups(project)
+    since = window["since"] if window else None
+    until = window["until"] if window else None
+    os_groups = _os_groups(project, since=since, until=until)
     scope = {project: paths[project]} if project else paths
     units: list[dict[str, Any]] = []
     for name, path in sorted(scope.items()):
@@ -10299,20 +12868,38 @@ def cost_report(project: str | None = None, target: str | None = None,
             continue
         store = ProjectStore(path)
         try:
-            for wo in store.list_work_orders(limit=limit, include_hidden=include_hidden):
+            rows = store.list_work_orders(
+                limit=limit, include_hidden=include_hidden,
+                active_between=(since, until) if window else None)
+            # An order whose only in-window activity is an `agent_call` — Neo answered
+            # it between turns — has no in-window turn and is added by id (§5a).
+            seen = {wo["id"] for wo in rows}
+            for wo_id in _os_only_ids(os_groups, name, seen) if window else ():
+                try:
+                    extra = store.get_work_order(wo_id)
+                except KeyError:
+                    continue            # a legacy row naming no project: not this one's
+                if include_hidden or not extra["hidden"]:
+                    rows.append(extra)
+            for wo in rows:
                 units.append(_unit_row(name, wo, index, _turn_rows(store, wo["id"]),
-                                       os_groups.get(wo["id"], ())))
+                                       os_groups.get(wo["id"], ()),
+                                       since=since, until=until))
         finally:
             store.close()
     # Dearest first, counting what Jarvis spent on the order as part of what it cost —
     # otherwise a work order that asked Neo twenty questions sorts as though it were cheap.
     units.sort(key=lambda u: u["total_cost_usd"], reverse=True)
-    return {"scope": project or "fleet", "units": units,
+    # ADDITIVE, and the version is not bumped: the existing `measured`/`unmeasured`/
+    # `totals` keys describe a different POPULATION when a window is given, and this is
+    # how a consumer tells (§7).
+    return {"scope": project or "fleet", "units": units, "window": window,
             **_rollup(units), "os_unattributed": _os_unattributed(os_groups),
             "floor": True, "floor_reason": COST_FLOOR_NOTE}
 
 
-def _os_groups(project: str | None = None) -> dict[str, list[dict[str, Any]]]:
+def _os_groups(project: str | None = None, *, since: float | None = None,
+               until: float | None = None) -> dict[str, list[dict[str, Any]]]:
     """Every work order's OS-side call groups, in one query. See `_os_spend`.
 
     One read of `os.db` for the whole fleet rather than one per work order: this report
@@ -10321,11 +12908,27 @@ def _os_groups(project: str | None = None) -> dict[str, list[dict[str, Any]]]:
     central = CentralStore()
     try:
         groups: dict[str, list[dict[str, Any]]] = {}
-        for row in central.agent_call_totals(project):
+        for row in central.agent_call_totals(project, since=since, until=until):
             groups.setdefault(row["wo_id"] or "", []).append(row)
         return groups
     finally:
         central.close()
+
+
+def _os_only_ids(groups: dict[str, list[dict[str, Any]]], project: str,
+                 seen: set[str]) -> list[str]:
+    """Ids whose only in-window activity was an OS call, NARROWED TO ONE PROJECT.
+
+    `_os_groups` is read fleet-wide and `ProjectStore.get_work_order` raises on an id
+    its database does not hold, so the `agent_calls.project` column is what keeps a
+    fleet-wide report from asking proj_a for proj_b's order (§5a of
+    docs/superpowers/specs/2026-10-07-cost-window-selector.md). A row that names NO
+    project is a candidate everywhere and is placed by the guarded lookup instead.
+    """
+    return sorted(
+        wo_id for wo_id, rows in groups.items()
+        if wo_id and wo_id not in seen
+        and any((r.get("project") or "") in ("", project) for r in rows))
 
 
 def _os_unattributed(groups: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
@@ -10369,6 +12972,10 @@ def _rollup(units: list[dict[str, Any]]) -> dict[str, Any]:
                 sum(u.get("os_recorded_cost_usd") or 0 for u in units), 2),
             "os_calls": sum(u.get("os_calls") or 0 for u in units),
             "os_billed_input": sum(u.get("os_billed_input") or 0 for u in units),
+            # The biggest OS-side input on the whole report; MAX, not a sum (spec §3,
+            # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md).
+            "os_max_input_chars": max(
+                [u.get("os_max_input_chars") or 0 for u in units], default=0),
             "os_output": sum(u.get("os_output") or 0 for u in units),
             "subproc_cost_usd": subproc_cost,
             "subproc_recorded_cost_usd": round(
@@ -10383,6 +12990,9 @@ def _rollup(units: list[dict[str, Any]]) -> dict[str, Any]:
             "subagent_cost_usd": round(sum(u["subagent_cost_usd"] for u in measured), 2),
             "output": sum(u["output"] for u in measured),
             "billed_input": sum(u["billed_input"] for u in measured),
+            # Over ALL units: what a window could not place is disclosed whether or not
+            # the order it belongs to was measurable (§5c).
+            "undated_messages": sum(u.get("undated_messages") or 0 for u in units),
             **_write_ttl(measured, units),
         },
     }
@@ -10483,6 +13093,344 @@ def inspect_config(project: str | None = None) -> Any:
                 else catalog.project(project).inspect)
     except (OpsError, CatalogError, OSError, ValueError):
         return InspectConfig()
+
+
+def navigation_config(project: str | None = None) -> Any:
+    """The `jarvis navigation` settings in force for `project` — or the OS's — or defaults.
+
+    `ops.inspect_config`'s shape and its reasoning: best-effort, because a report over
+    files on disk must not fail because a catalog has moved, and falling back to
+    `NavigationConfig()` rather than to None because every default here is a pattern list
+    with a measured justification (§2.3 of the 2026-10-02 navigation spec).
+    """
+    from .catalog import NavigationConfig
+
+    try:
+        catalog = resolve_catalog()
+        return (catalog.os.navigation if project is None
+                else catalog.project(project).navigation)
+    except (OpsError, CatalogError, OSError, ValueError):
+        return NavigationConfig()
+
+
+#: Why a no-argument `jarvis navigation` refuses. `~/.claude/projects` is 2.7G with
+#: 11,889 lead transcripts, so the wide scope is opt-in and windowed (§2.1).
+NAVIGATION_NEEDS_SCOPE = (
+    "name a work order, a feature order or a project — or pass --fleet. A no-argument "
+    "run would walk every transcript Claude Code has ever written (2.7G, 11,889 lead "
+    "files on this box) to answer a question that is usually about one order."
+)
+
+
+#: Why `jarvis navigation --days 0` refuses. `days=0` used to read as "no window" and
+#: therefore walked the whole 2.7G the window exists to bound — the opposite of what
+#: narrowing a window asks for (PR 927 review).
+NAVIGATION_DAYS_POSITIVE = (
+    "--days must be a positive number of days. `--days 0` would REMOVE the window "
+    "rather than narrow it, and walk every transcript Claude Code has ever written "
+    "(2.7G, 11,889 lead files on this box). Omit --days for the project's configured "
+    "window."
+)
+
+
+#: What `_resolve_report_target` returns in the first slot. `_TARGET_PROJECT` is the
+#: sentinel for "no id at all" — only `jarvis navigation` can read a target that way.
+_TARGET_FEATURE = "feature_order"
+_TARGET_WORK = "work_order"
+_TARGET_PROJECT = "<project>"
+
+#: How an order id is spelled, taken from `_resolve_order_id` (ops.py:239) and
+#: `create_investigation`'s "the wo-/fo-/io- id" rather than invented here.
+_ORDER_ID_PREFIXES = ("wo-", "fo-")
+
+
+def _resolve_report_target(target: str, project: str | None = None, *,
+                           project_fallback: bool = False,
+                           ) -> tuple[str, str | None, str | None,
+                                      dict[str, Any] | None]:
+    """What one id means to a report: `(kind, project name, project path, record)`.
+
+    Feature order FIRST, then work order, written once so `jarvis inspect` and `jarvis
+    navigation` can never disagree about an id. The ONLY difference between them is
+    `project_fallback`: `navigation` has a third reading for a target that is no id at
+    all (a project name), and a time report has none, so there the work-order lookup's
+    OpsError is the answer, unchanged.
+
+    A target that LOOKS like an order id takes the lookup's error even under the flag: a
+    mistyped `jarvis navigation wo-deadbeef` used to answer "no project named
+    'wo-deadbeef'", which names the wrong record entirely (PR 927 review).
+    """
+    try:
+        name, path, fo = find_feature_order(target, project)
+    except OpsError:
+        pass
+    else:
+        return _TARGET_FEATURE, name, path, fo
+    try:
+        name, path, wo = find_work_order(target, project)
+    except OpsError:
+        if not project_fallback or target.startswith(_ORDER_ID_PREFIXES):
+            raise
+        return _TARGET_PROJECT, None, None, None
+    return _TARGET_WORK, name, path, wo
+
+
+def navigation_report(target: str | None = None, project: str | None = None, *,
+                      fleet: bool = False, days: int | None = None) -> dict[str, Any]:
+    """How an order, a project or the fleet NAVIGATED code — `jarvis navigation`.
+
+    Resolves a target the way `inspect_report` does, feature order first and for the same
+    reason, so the two commands agree about what an id means. Read-only, no paid call:
+    everything comes from transcripts already on disk.
+
+    A PROJECT or `--fleet` reads the transcript TREE and honours `days`: a project's
+    worker sessions are not enumerable from the record alone once a worktree is gone,
+    which is `usage.index_sessions`' reason, so a wide scope is a walk and therefore
+    windowed.
+    """
+    from . import nav_volume
+    from . import usage as usage_mod
+
+    if not target and not project and not fleet:
+        raise OpsError(NAVIGATION_NEEDS_SCOPE)
+    if days is not None and days <= 0:
+        raise OpsError(NAVIGATION_DAYS_POSITIVE)
+
+    scope_project = project
+    session_ids: list[tuple[str, str]] = []     # (label, session id)
+    if target:
+        # The one resolver `inspect_report` uses, plus the project reading only this
+        # command has.
+        kind, name, path, record = _resolve_report_target(
+            target, project, project_fallback=True)
+        if kind == _TARGET_FEATURE:
+            store = ProjectStore(path)
+            try:
+                ids = []
+                planner_id = record.get("plan_wo_id")
+                if planner_id:
+                    try:
+                        ids.append(store.get_work_order(planner_id))
+                    except KeyError:
+                        pass
+                ids.extend(store.feature_children(record["id"]))
+            finally:
+                store.close()
+            scope_project = scope_project or name
+            session_ids = [(wo["id"], wo.get("session_id") or "") for wo in ids]
+            scope = record["id"]
+        elif kind == _TARGET_WORK:
+            scope_project = scope_project or name
+            session_ids = [(record["id"], record.get("session_id") or "")]
+            scope = record["id"]
+        else:
+            scope_project = target
+            session_ids = []
+            scope = target
+    else:
+        scope = scope_project or "fleet"
+
+    cfg = navigation_config(scope_project)
+    window = cfg.window_days if days is None else days
+
+    if session_ids:
+        index = usage_mod.index_sessions()
+        rolled = nav_volume.NavigationVolume(scope=scope)
+        for _label, session in session_ids:
+            if not session:
+                continue
+            rolled.fold(nav_volume.read_session(session, cfg, index=index))
+        return rolled.as_dict()
+
+    # A project or the fleet: the tree, within the window. A project is scoped by the
+    # slug Claude Code derives from the cwd — a worker's worktree lives under the project
+    # path, so the project's slug is a prefix of its workers'. A project the catalog does
+    # not name is refused rather than silently answered with the whole fleet.
+    prefix = ""
+    siblings: list[str] = []
+    if scope_project:
+        catalog = resolve_catalog()
+        prefix = nav_volume.slug_of(project_spec(catalog, scope_project).path)
+        # The OTHER projects' slugs: `slug_of` is not injective, so `/ws/jarvis_os`
+        # slugifies to `/ws/jarvis`'s slug plus a dash and cannot be told from a
+        # subdirectory without them (`nav_volume.in_slug_scope`, PR 927 review).
+        siblings = [nav_volume.slug_of(spec.path) for spec in catalog.projects
+                    if spec.name != scope_project]
+    volume = nav_volume.read_tree(None, cfg, days=window, slug_prefix=prefix,
+                                  slug_exclude=siblings)
+    payload = volume.as_dict()
+    payload["scope"] = scope
+    return payload
+
+
+def _spec_scope(project: str | None) -> tuple[str, Path]:
+    """Which project's tree `jarvis spec` reads, and never more than one — §4.2.
+
+    ONE project at a time, resolved through the registry, so an unknown name exits
+    naming it and scans nothing; a comma-separated `a,b` is simply such a name (Neo
+    ruling, q1372). A cwd no project owns is an error naming the fix and NEVER a silent
+    fall back to the cwd: a scan rooted wherever the shell happened to be is a different
+    answer from the one the caller asked for.
+    """
+    paths = registered_project_paths()
+    if project:
+        if project not in paths:
+            known = ", ".join(sorted(paths)) or "no project is registered"
+            raise OpsError(
+                f"no registered project named {project!r} — `jarvis spec` scans one "
+                f"project at a time, never a list. Registered: {known}"
+            )
+        return project, paths[project]
+    cwd = os.getcwd()
+    name = _project_for_cwd(cwd, paths)
+    if not name:
+        raise OpsError(
+            f"no registered project owns {cwd} — pass --project <name> to say which "
+            f"tree to read"
+        )
+    return name, paths[name]
+
+
+def _spec_file(root: Path, path: str) -> tuple[Path, str]:
+    """A document inside `root`, or an OpsError naming the root it refused to leave.
+
+    BOTH SIDES RESOLVED before the containment test (§4.2, revised): a string-prefix or
+    `..`-counting test is passed by a symlink inside the tree whose target is outside it,
+    which is the whole shape of the bug.
+
+    A RELATIVE PATH IS RELATIVE TO THE CWD, as the shell says and never to the root:
+    every worker runs in a git worktree under the registered root, so a root-relative
+    base silently hands it MAIN's copy of the file it is editing on its branch — a
+    different document under the same name, the failure this verb exists to prevent.
+    """
+    candidate = Path(path)
+    target = candidate if candidate.is_absolute() else Path(os.getcwd()) / candidate
+    resolved = target.resolve()
+    base = root.resolve()
+    if not resolved.is_relative_to(base):
+        raise OpsError(
+            f"{path!r} resolves to {resolved}, outside {base} — `jarvis spec` refuses to "
+            f"leave the project root"
+        )
+    if not resolved.is_file():
+        raise OpsError(f"no such file in {base}: {path}")
+    return resolved, resolved.relative_to(base).as_posix()
+
+
+def _spec_callable_path(resolved: Path) -> str:
+    """A path string that opens `resolved` FROM THE CALLER'S CWD, for the printed command.
+
+    `_spec_file` reads a relative path from the cwd, so the ROOT-RELATIVE string the
+    payload displays opens a different file — or none at all — from any cwd but the root,
+    and §4.2's "exact command that shows it" is the whole point of the payload. Relative
+    while it stays under the cwd, absolute the moment it would need a `..` component: a
+    worker runs in a git worktree, where a `.jarvis/features/…` hit does not exist and a
+    `docs/…` hit would silently open the worktree's own copy of the document.
+    """
+    rel = os.path.relpath(resolved, os.getcwd())
+    return str(resolved) if ".." in Path(rel).parts else rel
+
+
+def _spec_command(path: str, ref: str, project: str | None = None) -> str:
+    """The exact command that shows one row — the way `jarvis search` prints one per hit.
+
+    §4.2: that is what makes the output navigable rather than a dump with extra steps.
+    A match above the first heading has no section ref, so the next step is the toc.
+    `path` must be callable from the cwd (`_spec_callable_path`); and when the caller
+    NAMED a project the command names it too, because without `--project` it re-resolves
+    the scope from the cwd and refuses wherever no registered project owns it.
+    """
+    import shlex
+
+    scope = f" --project {shlex.quote(project)}" if project is not None else ""
+    return f"jarvis spec section{scope} {shlex.quote(path)} {shlex.quote(ref)}" if ref \
+        else f"jarvis spec toc{scope} {shlex.quote(path)}"
+
+
+def spec_toc(path: str, project: str | None = None) -> dict[str, Any]:
+    """What is in this document and how big each part is — `jarvis spec toc` (§4.2).
+
+    `tokens_estimate` carries the word estimate in the key, because §4.1's number is
+    chars // 4: an unlabelled wrong number is worse than a labelled approximate one.
+    """
+    from . import spec_index
+
+    name, root = _spec_scope(project)
+    resolved, rel = _spec_file(root, path)
+    text = resolved.read_text(encoding="utf-8", errors="replace")
+    callable_path = _spec_callable_path(resolved)
+    rows = []
+    for s in spec_index.toc(text):
+        ref = s.number or s.name
+        rows.append({"number": s.number, "name": s.name, "level": s.level,
+                     "line": s.line, "tokens_estimate": s.tokens, "ref": ref,
+                     "command": _spec_command(callable_path, ref, project)})
+    return {"project": name, "root": str(root), "path": rel, "sections": rows,
+            "tokens_estimate": len(text) // 4}
+
+
+def spec_section(path: str, which: str, project: str | None = None) -> dict[str, Any]:
+    """One section of one document — `jarvis spec section` (§4.2).
+
+    A `which` that resolves to nothing names the headings that DO exist, the courtesy
+    `feature_spec` already gives: naming them is the difference between one more call and
+    reading the whole file to find the ref.
+    """
+    from . import spec_index
+
+    name, root = _spec_scope(project)
+    resolved, rel = _spec_file(root, path)
+    text = resolved.read_text(encoding="utf-8", errors="replace")
+    content = spec_index.section(text, which)
+    if content is None:
+        names = [s.name for s in spec_index.toc(text)]
+        headings = ", ".join(names[:12]) + ("…" if len(names) > 12 else "")
+        raise OpsError(
+            f"{which!r} matches no section of {rel}. It carries: "
+            f"{headings or 'no headings at all'}"
+        )
+    return {"project": name, "root": str(root), "path": rel, "which": which,
+            "content": content, "tokens_estimate": len(content) // 4,
+            "command": _spec_command(_spec_callable_path(resolved), which, project)}
+
+
+def spec_search(words: str, project: str | None = None,
+                limit: int = 40) -> dict[str, Any]:
+    """Which SECTIONS of one project's documents match — `jarvis spec search` (§4.2).
+
+    One project's tree and never a union: a scan whose cost grows with the fleet would be
+    a different feature, and the caller who wants two projects runs the command twice.
+    """
+    from . import spec_index
+
+    name, root = _spec_scope(project)
+    hits = spec_index.search(root, words, limit=limit)
+    # `h.path` is root-relative for DISPLAY; the command needs one callable from the cwd.
+    base = root.resolve()
+    rows = [{"path": h.path, "section": h.section, "line": h.line, "context": h.context,
+             "command": _spec_command(_spec_callable_path((base / h.path).resolve()),
+                                      h.section, project)} for h in hits]
+    return {"project": name, "root": str(root), "words": words, "limit": limit,
+            "count": len(rows), "truncated": len(rows) >= limit, "hits": rows}
+
+
+def cold_prefix_floor(project: str | None = None) -> int | None:
+    """`os.cold_prefix_floor` if a catalog can be reached, else None.
+
+    `ops.inspect_config`'s shape and its reasoning: best-effort, because a report over
+    files on disk must not fail because a catalog has moved. Unlike it this falls back to
+    None and NOT to a number — `bill._cold_prefix_floor` has already settled that there is
+    no defensible default for this threshold, so a reader without a catalog is told the
+    boundary split was not measured (`usage.BOUNDARY_UNDECIDED`) rather than shown a
+    finding the configuration never produced.
+
+    `project` is accepted for `inspect_config`'s symmetry; the setting is an `os.*` one
+    and no project may override it (spec of 2026-09-29, rejected alternative 3).
+    """
+    try:
+        return resolve_catalog().os.cold_prefix_floor
+    except (OpsError, CatalogError, OSError, ValueError):
+        return None
 
 
 def inspect_config_at(project_path: Path) -> Any:
@@ -10595,7 +13543,8 @@ def messaging_config_at(project_path: Path) -> Any:
 @observability.metered(OBSERVE_INSPECT, target="target", project="project")
 def inspect_report(target: str, project: str | None = None, *,
                    write_floor: int | None = None,
-                   join_floor: int | None = None) -> dict[str, Any]:
+                   join_floor: int | None = None,
+                   with_navigation: bool = False) -> dict[str, Any]:
     """Where a work order's or a feature order's TIME went — `jarvis cost`'s other half.
 
     Resolves the target exactly the way `_cost_for_target` does, feature order first and
@@ -10606,13 +13555,33 @@ def inspect_report(target: str, project: str | None = None, *,
     unit whose transcript has expired is reported with `found: false`, the same honest
     gap `jarvis cost` reports, because an unmeasurable clock and an idle one are
     different answers.
+
+    `with_navigation` adds the per-order navigation volume, and is OFF by default
+    because it is a SECOND pass over every transcript of every unit: `inspection` has
+    already opened them for the anatomy, and on a feature order with many children that
+    doubled the disk read of a report the dashboard's debugging page never rendered (PR
+    927 review). `cli.cmd_inspect` asks for it — it prints the section — and the
+    dashboard does not. The key's shape when asked for is unchanged:
+    `nav_volume.NavigationVolume.as_dict()`.
     """
     from dataclasses import replace
 
-    from . import holds, inspection
+    from . import autopsy, holds, nav_volume
     from . import usage as usage_mod
 
     index = usage_mod.index_sessions()
+    # One reader, two surfaces (q1216): the per-order navigation section is a key on
+    # this report as well as `jarvis navigation`'s own answer, so the two cannot
+    # disagree. Per project and cached, like the inspect settings below.
+    nav_configs: dict[str, Any] = {}
+
+    def nav_settings(project_name: str) -> Any:
+        if project_name not in nav_configs:
+            nav_configs[project_name] = navigation_config(project_name)
+        return nav_configs[project_name]
+    # Resolved ONCE for the whole report, beside the index and best-effort for the same
+    # reason: an `os.*` setting, so it is the same value for every unit.
+    floor = cold_prefix_floor()
     # The catalog decides the floors and the flags override them for one invocation:
     # a project's setting is what the report means by "large" day to day, and `--writes
     # -over` is someone asking a different question of the same session once.
@@ -10636,24 +13605,36 @@ def inspect_report(target: str, project: str | None = None, *,
         # The OS's own record of what it was holding this order for, so the report can
         # state both clocks and name the difference (`holds`). Two indexed reads.
         spans = holds.held(store, wo["id"])
-        # Spec 2026-09-27 §3: the turns are numbered with the OS's own `wo_turns.seq`.
-        anatomy = (inspection.read_session(session, cfg, index=index, spans=spans,
-                                           turn_starts=store.turn_starts(wo["id"]))
-                   if session
-                   else inspection.Anatomy(session_id="", holds=list(spans),
-                                           write_floor=cfg.report_write_floor,
-                                           join_floor=cfg.report_join_floor))
+        # Spec 2026-09-27 §4: the ONE chokepoint, which prefers the seal and says which
+        # reading answered. Per UNIT and never one key on the report: a feature's planner
+        # and each of its children have a seal each (Neo q1080).
+        anatomy, provenance = autopsy.anatomy_for(
+            wo, cfg, spans=spans, index=index,
+            turn_starts=store.turn_starts(wo["id"]), cold_prefix_floor=floor)
         payload = anatomy.as_dict()
-        payload.update(wo_id=wo["id"], project=project_name, title=wo["title"],
-                       status=wo["status"], kind=wo.get("kind") or "worker")
+        if with_navigation:
+            # §2.2: the per-order navigation volume, same reader as `jarvis
+            # navigation`'s. Read from the transcript, so an order whose session is gone
+            # reports `found: false` rather than zeros. A SECOND pass over every
+            # transcript, so only when a caller asks (see the docstring).
+            payload["navigation"] = nav_volume.read_session(
+                session, nav_settings(project_name), index=index).as_dict()
+        payload.update(provenance=provenance,
+                       wo_id=wo["id"], project=project_name, title=wo["title"],
+                       status=wo["status"], kind=wo.get("kind") or "worker",
+                       # The biggest input Jarvis itself sent on this order's behalf
+                       # (spec §3,
+                       # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md).
+                       largest_os_input=_largest_os_input(wo["id"]))
         return payload
 
-    try:
-        name, path, fo = find_feature_order(target, project)
-    except OpsError:
-        name, wo_path, wo = find_work_order(target, project)
+    # The one resolver `jarvis navigation` uses; no project reading here, so a target
+    # that is no id at all is the work-order lookup's error.
+    kind, name, path, record = _resolve_report_target(target, project)
+    if kind == _TARGET_WORK:
+        wo = record
         cfg = settings(name)
-        store = ProjectStore(wo_path)
+        store = ProjectStore(path)
         try:
             payload = unit(name, wo, store)
         finally:
@@ -10662,6 +13643,7 @@ def inspect_report(target: str, project: str | None = None, *,
                 "write_floor": cfg.report_write_floor,
                 "join_floor": cfg.report_join_floor, "units": [payload]}
 
+    fo = record
     store = ProjectStore(path)
     try:
         units = []
@@ -10748,7 +13730,7 @@ def context_report(wo_id: str, project: str | None = None, *,
                    turn: int | None = None) -> dict[str, Any]:
     """What Jarvis put in each of a work order's context windows, and the delta.
 
-    §5 of docs/specs/2026-09-24-order-observability.md. ALL the arithmetic lives here and
+    §5 of docs/superpowers/specs/2026-09-24-order-observability.md. ALL the arithmetic lives here and
     the renderers compute nothing: the residual subtraction, the per-turn delta and the
     sentence naming a prefix break are keys of this payload.
 
@@ -10758,8 +13740,8 @@ def context_report(wo_id: str, project: str | None = None, *,
     binds every transcript turn to a `wo_turns.seq` (spec 2026-09-27 §3) — so this join
     is no longer a workaround for a sequence that meant something else.
     """
+    from . import autopsy, inspection
     from . import context as context_mod
-    from . import inspection
     from . import usage as usage_mod
 
     name, path, wo = find_work_order(wo_id, project)
@@ -10771,12 +13753,12 @@ def context_report(wo_id: str, project: str | None = None, *,
         session = wo.get("session_id") or ""
         cfg = inspect_config(name)
         # Spec 2026-09-27 §3: the same rows this report already read, reused to bind
-        # inspect's numbering to `wo_turns.seq`.
-        anatomy = (inspection.read_session(
-                       session, cfg, index=usage_mod.index_sessions(),
-                       turn_starts=[(int(r["seq"]), float(r["started_at"]))
-                                    for r in rows])
-                   if session else None)
+        # inspect's numbering to `wo_turns.seq`. §4: through the chokepoint, and `spans=[]`
+        # because this report has never read the holds and states no hold-derived figure.
+        anatomy, provenance = autopsy.anatomy_for(
+            wo, cfg, spans=[], index=usage_mod.index_sessions(),
+            turn_starts=[(int(r["seq"]), float(r["started_at"])) for r in rows],
+            cold_prefix_floor=cold_prefix_floor())
         if turn is not None and not any(r["seq"] == turn for r in rows):
             raise OpsError(f"{wo_id} has no turn {turn} "
                            f"(it has {len(rows)}: "
@@ -10816,6 +13798,8 @@ def context_report(wo_id: str, project: str | None = None, *,
     return {
         "wo_id": wo["id"], "project": name, "title": wo["title"],
         "recorded": bool(recorded),
+        # Which reading the residual and the prefix joins above came from (§4).
+        "provenance": provenance,
         "note": "" if recorded else NOT_RECORDED,
         "turns": [t for t in out if turn is None or t["seq"] == turn],
     }
@@ -11373,8 +14357,31 @@ def _os_calls_detail(wo_id: str, limit: int = 200) -> list[dict[str, Any]]:
             "billed_input": u.billed_input,
             "api_calls": envelope.get("api_calls"),
             "context_peak": envelope.get("context_peak") or 0,
+            # How big the OS's own input to this call was (spec §3,
+            # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md). 0 = not
+            # measured, which is what every row written before the columns existed says.
+            "prompt_chars": row["prompt_chars"],
+            "system_prompt_chars": row["system_prompt_chars"],
         })
     return out
+
+
+def _largest_os_input(wo_id: str) -> dict[str, Any] | None:
+    """The biggest OS-side input recorded for one work order, or None if none was.
+
+    None rather than a zero-sized row: a call recorded before the sizes were measured
+    reads 0, and reporting that as "the biggest input" would be a fabricated number
+    (spec §3, docs/superpowers/specs/2026-09-26-bounded-model-inputs.md).
+    """
+    sized = [r for r in _os_calls_detail(wo_id)
+             if (r["prompt_chars"] or 0) + (r["system_prompt_chars"] or 0)]
+    if not sized:
+        return None
+    biggest = max(sized, key=lambda r: r["prompt_chars"] + r["system_prompt_chars"])
+    return {"kind": biggest["kind"], "label": biggest["label"],
+            "model": biggest["model"], "prompt_chars": biggest["prompt_chars"],
+            "system_prompt_chars": biggest["system_prompt_chars"],
+            "ts": biggest["ts"]}
 
 
 def _subproc_detail(groups: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -11406,10 +14413,10 @@ def _subproc_detail(groups: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
 
 # -- what the knowledge base costs, and who actually reads it -----------------------------
 
-#: How much of a work order's own title has to survive into a search for the "it could
-#: have looked" signal to mean anything. Below this the query is words like "fix the",
-#: which match half the base and would manufacture a miss for every silent order.
-MISSED_MIN_WORDS = 3
+#: `MISSED_MIN_WORDS` — how much of a work order's own title has to survive into a search
+#: for a title match to mean anything — is defined in `central_store` and imported at the
+#: top of this module: the dispatch hint tier applies the same rule to the same query, and
+#: two copies of that threshold would drift.
 
 
 def _index_cost(central: CentralStore, name: str, path: Path) -> dict[str, Any]:
@@ -11849,6 +14856,297 @@ def knowledge_usage_report(project: str | None = None, days: int | None = None,
     }
 
 
+def _local_day(ts: float) -> str:
+    """The same bucket SQLite's `strftime(..., 'localtime')` produces, in Python.
+
+    Used only to fill the days inside a window that have NO rows: the buckets themselves
+    are SQL's, and two different spellings of "which day is this" would disagree at a
+    boundary.
+    """
+    from datetime import datetime
+
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+
+
+#: What `by_kind` cannot say, carried beside it rather than left for a reader to assume —
+#: §"What this does NOT do" of docs/superpowers/specs/2026-10-01-neo-observability.md.
+NEO_ASSUMPTION_KIND_NOTE = (
+    "`assumption` covers BOTH auto-review passes: which pass filed one is only on the "
+    "project store's `autoreview_asked` event, and splitting on it means opening every "
+    "project database and walking events per question"
+)
+
+#: THE ESCALATION CLASS THESE COUNTS CANNOT SHOW, named rather than left to vanish —
+#: Neo's ruling on question 1170. `stakes.HIGH_UNREACHABLE` / `HIGH_UNPARSEABLE` reach
+#: `autoreview.HELD_HIGH_STAKES`, which holds the review before a Neo question row exists,
+#: so the two `classifier-*` members were dropped from the enum. Worded as what the reader
+#: cannot see here and NOT as a zero: a zero would be a measured figure, and this
+#: population is simply absent from the table.
+NEO_ESCALATION_INVISIBLE_NOTE = (
+    "an assumption the OS held because the stakes classifier could not be reached, or "
+    "could not be read, never became a Neo question at all — so those are not in these "
+    "counts, in any class"
+)
+
+
+def _escalation_rate(answered: int, escalated: int, failed: int) -> float | None:
+    """`escalated` ALONE over SETTLED questions, `None` — never `0.0` — with no denominator.
+
+    UNREACHABLE IS NEVER BLENDED IN and is reported as its own figure
+    (`_unreachable_rate`), because a crash is not a decision: a question Neo was never
+    reached for reads as unreachable and never as escalated (cli.py:1577-1584, cli.py:4526).
+    Open questions have no outcome yet, and including them would make the rate fall
+    whenever the queue is busy. Absent is not zero (spec §4's zero rule).
+    """
+    settled = answered + escalated + failed
+    if not settled:
+        return None
+    return round(escalated / settled, 4)
+
+
+def _unreachable_rate(answered: int, escalated: int, failed: int) -> float | None:
+    """`_escalation_rate`'s sibling: `failed` over the same settled denominator."""
+    settled = answered + escalated + failed
+    if not settled:
+        return None
+    return round(failed / settled, 4)
+
+
+def _neo_outcome_bucket() -> dict[str, Any]:
+    return {"asked": 0, "answered": 0, "escalated": 0, "failed": 0,
+            "escalation_rate": None, "unreachable_rate": None}
+
+
+def _neo_spend_bucket() -> dict[str, Any]:
+    return {"calls": 0, "input": 0, "cache_write": 0, "cache_read": 0, "output": 0,
+            "recorded_cost_usd": 0.0, "list_cost_usd": 0.0}
+
+
+def _percentile(sorted_values: list[int], fraction: float) -> int | None:
+    """Nearest-rank percentile over a sample, or None when the sample is empty.
+
+    In Python because SQLite has none, and the row count is bounded by the window (spec
+    §4). None, not 0: a kind nobody timed has no percentile.
+    """
+    if not sorted_values:
+        return None
+    index = min(len(sorted_values) - 1,
+                max(0, int(round(fraction * (len(sorted_values) - 1)))))
+    return int(sorted_values[index])
+
+
+def neo_stats_report(project: str | None = None, days: int | None = None,
+                     limit: int = 20) -> dict[str, Any]:
+    """Neo's volume, outcomes, escalation causes, spend and latency — spec §4,
+    docs/superpowers/specs/2026-10-01-neo-observability.md.
+
+    `knowledge_usage_report`'s shape above: `project` + `days` in, one plain dict out, no
+    rendering — the CLI and the dashboard render the same dict, so neither can show a
+    figure the other cannot.
+
+    Reads BOTH databases, which is the only way the question can be answered: `neo.db`
+    holds the questions and `os.db` holds what answering them cost.
+
+    THE ZERO RULE IS TWO RULES. `questions` is a census, so a count of zero is measured
+    and prints `0`; every RATIO is `None` when its denominator is empty and renders "not
+    recorded". `spend` and `latency` are a floored sample — `agent_usage.record` never
+    raises, so a missing row is possible — and `latency.unmeasured` says how much of the
+    window predates §3's measurement.
+
+    `limit` bounds the day SERIES (the newest `limit` days of it), not the counts: every
+    total above is over the whole window.
+    """
+    from . import agent_usage
+    from . import usage as usage_mod
+    from .neo_store import (ESCALATION_CAUSES_CHOSEN, ESCALATION_CAUSES_FAILED,
+                            ESCALATION_CAUSES_OVERRIDDEN, NEO_HELD_Q_STATUSES,
+                            NeoStore)
+
+    since = db.now() - days * 86400 if days else None
+    paths = registered_project_paths()
+    if project and project not in paths:
+        raise OpsError(f"project {project!r} not registered (known: {sorted(paths)})")
+    scope = {project: paths[project]} if project else paths
+
+    questions = {"asked": 0, "answered": 0, "escalated": 0, "failed": 0, "open": 0,
+                 "superseded": 0, "escalation_rate": None, "unreachable_rate": None}
+    by_kind: dict[str, dict[str, Any]] = {}
+    by_project: dict[str, dict[str, Any]] = {}
+    by_day: dict[str, dict[str, Any]] = {}
+
+    neo = NeoStore()
+    try:
+        outcomes = neo.question_outcomes(project or "", since)
+        cause_rows = neo.escalation_cause_counts(project or "", since)
+        order_rows = neo.questions_per_order(project or "", since)
+    finally:
+        neo.close()
+
+    for row in outcomes:
+        n = int(row["n"] or 0)
+        kind = row["kind"] or "question"
+        buckets = [questions,
+                   by_kind.setdefault(kind, _neo_outcome_bucket()),
+                   by_project.setdefault(row["project"] or "", _neo_outcome_bucket()),
+                   by_day.setdefault(row["day"], {**_neo_outcome_bucket(),
+                                                  "day": row["day"]})]
+        for bucket in buckets:
+            bucket["asked"] += n
+        if row["status"] == "answered" and row["answered_by"] == "neo":
+            for bucket in buckets:
+                bucket["answered"] += n
+        elif row["status"] == "answered" and row["answered_by"] == "os":
+            # `NeoStore.supersede`: decided somewhere else, so neither Neo answering nor
+            # Neo handing back. Out of the rate's denominator.
+            questions["superseded"] += n
+        elif row["status"] in ("escalated", "failed"):
+            for bucket in buckets:
+                bucket[row["status"]] += n
+        if row["status"] in NEO_HELD_Q_STATUSES:
+            questions["open"] += n
+
+    for bucket in (questions, *by_kind.values(), *by_project.values(),
+                   *by_day.values()):
+        bucket["escalation_rate"] = _escalation_rate(
+            bucket["answered"], bucket["escalated"], bucket["failed"])
+        bucket["unreachable_rate"] = _unreachable_rate(
+            bucket["answered"], bucket["escalated"], bucket["failed"])
+
+    # A day inside the window with no questions is a measured zero and appears; days
+    # outside it do not (spec §4).
+    if since is not None:
+        for step in range(int(days or 0) + 1):
+            day = _local_day(since + step * 86400)
+            by_day.setdefault(day, {**_neo_outcome_bucket(), "day": day,
+                                    "escalation_rate": None,
+                                    "unreachable_rate": None})
+    question_days = [by_day[day] for day in sorted(by_day)][-limit:]
+
+    chosen: dict[str, int] = {}
+    overridden_causes: dict[str, int] = {}
+    failed_causes: dict[str, int] = {}
+    not_recorded = 0
+    for row in cause_rows:
+        cause, n = row["cause"], int(row["n"] or 0)
+        if cause in ESCALATION_CAUSES_CHOSEN:
+            chosen[cause] = chosen.get(cause, 0) + n
+        elif cause in ESCALATION_CAUSES_OVERRIDDEN:
+            # The third answer to "who decided": Neo answered and the OS did not take it.
+            overridden_causes[cause] = overridden_causes.get(cause, 0) + n
+        elif cause in ESCALATION_CAUSES_FAILED:
+            failed_causes[cause] = failed_causes.get(cause, 0) + n
+        else:
+            # NULL, '' or a member a later release removed. Counted here rather than
+            # given a bucket of its own: an invented bucket reads as a cause.
+            not_recorded += n
+
+    central = CentralStore()
+    try:
+        groups = central.agent_call_totals_by_day(
+            project, since, kinds=sorted(agent_usage.NEO_KINDS))
+        latency_rows = central.agent_call_latencies(
+            project, since, kinds=sorted(agent_usage.NEO_KINDS))
+    finally:
+        central.close()
+
+    spend_totals = _neo_spend_bucket()
+    spend_by_kind: dict[str, dict[str, Any]] = {}
+    spend_by_project: dict[str, dict[str, Any]] = {}
+    spend_by_day: dict[str, dict[str, Any]] = {}
+    for g in groups:
+        # Priced PER MODEL GROUP through the same path `cost_report` uses: a digest on
+        # Haiku is not Opus waste, and a blended rate would hide it.
+        priced = _priced_group(usage_mod, g)
+        targets = [spend_totals,
+                   spend_by_kind.setdefault(g["kind"], _neo_spend_bucket()),
+                   spend_by_project.setdefault(g["project"] or "",
+                                               _neo_spend_bucket()),
+                   spend_by_day.setdefault(g["day"], {**_neo_spend_bucket(),
+                                                      "day": g["day"]})]
+        for bucket in targets:
+            bucket["calls"] += int(g["calls"] or 0)
+            for token in ("input", "cache_write", "cache_read", "output"):
+                bucket[token] += int(g[token] or 0)
+            bucket["recorded_cost_usd"] = round(
+                bucket["recorded_cost_usd"] + (g["cost_usd"] or 0.0), 6)
+            bucket["list_cost_usd"] = round(
+                bucket["list_cost_usd"] + priced.list_cost_usd, 6)
+
+    latency_by_kind: dict[str, dict[str, Any]] = {}
+    samples: dict[str, list[int]] = {}
+    unmeasured = 0
+    for row in latency_rows:
+        kind = row["kind"]
+        entry = latency_by_kind.setdefault(
+            kind, {"calls": 0, "measured": 0, "p50_ms": None, "p90_ms": None,
+                   "max_ms": None})
+        entry["calls"] += 1
+        if row["latency_ms"] is None:
+            unmeasured += 1
+            continue
+        entry["measured"] += 1
+        samples.setdefault(kind, []).append(int(row["latency_ms"]))
+    for kind, entry in latency_by_kind.items():
+        values = sorted(samples.get(kind, []))
+        entry["p50_ms"] = _percentile(values, 0.5)
+        entry["p90_ms"] = _percentile(values, 0.9)
+        entry["max_ms"] = max(values) if values else None
+
+    asked_by_wo = {(row["project"], row["wo_id"]): int(row["n"] or 0)
+                   for row in order_rows}
+    work_orders = feature_orders = 0
+    wo_questions = fo_questions = 0
+    for name, path in sorted(scope.items()):
+        store = ProjectStore(path)
+        try:
+            orders = [wo for wo in store.list_work_orders(limit=10_000,
+                                                          include_hidden=True)
+                      if since is None or (wo["created_at"] or 0) >= since]
+            features = [fo for fo in store.list_feature_orders(kind="feature",
+                                                               limit=10_000)
+                        if since is None or (fo["created_at"] or 0) >= since]
+        finally:
+            store.close()
+        # Hidden orders INCLUDED, `cost_report`'s reason: hiding is a gesture about
+        # attention, and the order still asked its questions.
+        work_orders += len(orders)
+        feature_orders += len(features)
+        feature_ids = {fo["id"] for fo in features}
+        # A feature order's questions are its planner's and its children's — those are
+        # the sessions that ask anything.
+        family = {fo["plan_wo_id"] for fo in features if fo.get("plan_wo_id")}
+        for wo in orders:
+            asked = asked_by_wo.get((name, wo["id"]), 0)
+            wo_questions += asked
+            if wo.get("parent_id") in feature_ids or wo["id"] in family:
+                fo_questions += asked
+    per_order = {
+        "work_orders": work_orders,
+        "questions_per_wo": (round(wo_questions / work_orders, 2)
+                             if work_orders else None),
+        "feature_orders": feature_orders,
+        "questions_per_fo": (round(fo_questions / feature_orders, 2)
+                             if feature_orders else None),
+    }
+
+    return {
+        "scope": project or "fleet", "days": days, "since": since,
+        "questions": questions,
+        "by_kind": by_kind, "by_kind_note": NEO_ASSUMPTION_KIND_NOTE,
+        "by_project": by_project,
+        "by_day": question_days,
+        "causes": {"chosen": chosen, "overridden": overridden_causes,
+                   "failed": failed_causes, "not_recorded": not_recorded},
+        "causes_note": NEO_ESCALATION_INVISIBLE_NOTE,
+        "per_order": per_order,
+        "spend": {"totals": spend_totals, "by_kind": spend_by_kind,
+                  "by_project": spend_by_project,
+                  "by_day": [spend_by_day[day] for day in sorted(spend_by_day)][-limit:]},
+        "latency": {"by_kind": latency_by_kind, "unmeasured": unmeasured},
+        "floor": True, "floor_reason": COST_FLOOR_NOTE,
+    }
+
+
 # -- budgets -----------------------------------------------------------------------
 #
 # The verbs behind `jarvis wo budget` and `jarvis fo budget`. Setting a budget is an
@@ -11870,13 +15168,25 @@ def work_order_budget(wo_id: str, project_name: str | None = None) -> dict[str, 
         # reader can (issue #471, Neo question 469). Added for DISPLAY only, and it
         # never reaches `cap`.
         live = budget.in_flight(store, wo_id)
-        parent_pool = None
-        if wo.get("parent_id"):
-            try:
-                parent_pool = budget.pool(store, central,
-                                          store.get_feature_order(wo["parent_id"]))
-            except KeyError:
-                parent_pool = None
+        parent = _parent_of(store, wo)
+        parent_pool = budget.pool(store, central, parent) if parent else None
+        # WHAT THE FAMILY IS CALLED, for the surfaces that render these numbers.
+        # `Ceiling.source == 'feature'` is the allocator's word for "the family's cap"
+        # and is NOT a claim that the parent is a feature order, so a card reading it
+        # raw told an investigation's child about "its feature's slice". Same
+        # `family_prose` table as the note, so card and note agree.
+        family = family_prose(parent["kind"])[0] if parent else None
+        # THE SAME SENTENCE THE SET PATH RETURNS (§1 of
+        # docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md): four
+        # numbers the reader has to assemble themselves is what made a raise look
+        # accepted and inert. Only when the FAMILY's slice is what binds — an order
+        # stopped by its own number needs no explanation beyond the number. Through
+        # `_feature_unreserved`, the set path's own read, so the two strings are one
+        # string and not two that agree today.
+        note = ""
+        if cap is not None and cap.source == "feature" and cap.exhausted:
+            note = _still_capped_note(cap, spend.total_usd, parent,
+                                      _feature_unreserved(store, central, wo))
     finally:
         central.close()
         store.close()
@@ -11897,6 +15207,8 @@ def work_order_budget(wo_id: str, project_name: str | None = None) -> dict[str, 
         "remaining_usd": cap.remaining_usd if cap else None,
         "live_remaining_usd": (cap.cap_usd - spend.total_usd - live) if cap else None,
         "feature_unreserved_usd": parent_pool.unreserved_usd if parent_pool else None,
+        "family": family,
+        "note": note,
     }
 
 
@@ -11946,12 +15258,9 @@ def set_work_order_budget(wo_id: str, amount: float | None,
         spend = budget.spent(store, central, wo_id)
         if fresh["status"] == budget.EXHAUSTED:
             if cap is not None and cap.exhausted:
-                note = (f"still over its ceiling — {budget.format_usd(spend.total_usd)} "
-                        f"spent against {budget.format_usd(cap.cap_usd)}")
-                if cap.source == "feature":
-                    note += (" (its feature's slice, and the feature has "
-                             f"{budget.format_usd(_feature_unreserved(store, central, fresh))}"
-                             " unreserved — raise the feature with `jarvis fo budget`)")
+                note = _still_capped_note(
+                    cap, spend.total_usd, _parent_of(store, fresh),
+                    _feature_unreserved(store, central, fresh))
             else:
                 resumed, note = _resume_after_budget(store, name, fresh)
     finally:
@@ -11960,6 +15269,45 @@ def set_work_order_budget(wo_id: str, amount: float | None,
     return {"project": name, "wo_id": wo_id, "title": wo["title"],
             "budget_usd": amount, "previous_usd": wo.get("budget_usd"),
             "spent_usd": spend.total_usd, "resumed": resumed, "note": note}
+
+
+def _still_capped_note(cap: budget.Ceiling, spent_usd: float,
+                       parent: dict[str, Any] | None,
+                       unreserved_usd: float) -> str:
+    """Why a raised budget changed nothing — ONE WORDING, for the set path and the show
+    path.
+
+    §1 of docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md. The
+    reporter had `budget_usd=10`, `cap_usd=2.0036`, `cap_source='feature'` and
+    `feature_unreserved_usd=0.0` and could not assemble them. Two wordings of this is how
+    a user reading the dashboard and a user reading the CLI come to believe different
+    things, so `work_order_budget` and `set_work_order_budget` both say it from here.
+
+    Here and not in `budget.py`: the sentence names CLI COMMANDS, and the allocator knows
+    nothing about surfaces.
+    """
+    spent, cap_usd = budget.format_usd(spent_usd), budget.format_usd(cap.cap_usd)
+    if cap.source != "feature":
+        return f"still over its ceiling — {spent} spent against {cap_usd}"
+    family, verb = family_prose((parent or {}).get("kind"))
+    # `format_money`, not `format_usd`: the remainder being NOTHING is the entire
+    # condition for this sentence, and the dash would read as "unknown". The parent's
+    # budget keeps `format_usd`: a family cap always has one.
+    return (f"still over its ceiling: {spent} spent against {cap_usd}, which is its "
+            f"{family}'s slice. The {family} has "
+            f"{budget.format_money(unreserved_usd)} unreserved of "
+            f"its {budget.format_usd((parent or {}).get('budget_usd'))} budget, so "
+            f"raise the {family} with `{verb}`.")
+
+
+def _parent_of(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
+    """The feature-order row this work order belongs to, or None."""
+    if not wo.get("parent_id"):
+        return None
+    try:
+        return store.get_feature_order(wo["parent_id"])
+    except KeyError:
+        return None
 
 
 def _feature_unreserved(store: ProjectStore, central: CentralStore,
@@ -12000,7 +15348,8 @@ def _resume_after_budget(store: ProjectStore, project_name: str,
         store.clear_attention(wo["id"])
         return True, "back on the dispatch queue"
     try:
-        spec = project_spec(resolve_catalog(), project_name)
+        catalog = resolve_catalog()
+        spec = project_spec(catalog, project_name)
     except OpsError as e:
         store.set_status(wo["id"], "pending")
         store.clear_attention(wo["id"])
@@ -12015,8 +15364,17 @@ def _resume_after_budget(store: ProjectStore, project_name: str,
     )
     store.set_status(wo["id"], "running")
     store.clear_attention(wo["id"])
+    # A RELAUNCH THIS ORDER IS ALREADY HOLDING IS THE RESUME. It got here once before,
+    # compacted, and the queued relaunch is what `Daemon.deliver_messages` sends on the
+    # next tick — retrying now would put the same lost turn in front of the worker twice
+    # (spec 2026-09-29-one-compaction-decision-on-every-relaunch.md §3.5).
+    if any(m["source"] == worker_session.RESUME_SOURCE
+           for m in store.queued_messages(wo["id"])):
+        return True, "its queued relaunch goes out on the next tick"
     try:
-        fresh = worker_session.retry(store, spec, wo, pause)
+        turn_row = worker_session.compact_before_relaunch(
+            store, spec, wo, catalog.os.compact_min_context, pause=pause)
+        fresh = turn_row or worker_session.retry(store, spec, wo, pause)
     except budget.BudgetExhausted as e:
         budget.escalate(store, store.get_work_order(wo["id"]), e.exhausted)
         return False, "still has no headroom — it stopped again immediately"
@@ -12024,7 +15382,10 @@ def _resume_after_budget(store: ProjectStore, project_name: str,
         store.set_status(wo["id"], "pending")
         return False, f"budget raised, but the relaunch failed ({e})"
     store.add_event(wo["id"], "budget_resumed",
-                    {"budget_usd": wo.get("budget_usd"), "turn": fresh["seq"]})
+                    # The seq is the COMPACTION's when one won; without this the
+                    # timeline reads as if the worker resumed directly.
+                    {"budget_usd": wo.get("budget_usd"), "turn": fresh["seq"],
+                     "compacted": turn_row is not None})
     return True, f"resumed at turn {fresh['seq']}"
 
 
@@ -12049,7 +15410,13 @@ def set_feature_budget(fo_id: str, amount: float | None,
     try:
         store.update_feature_order(fo_id, budget_usd=amount)
         p = budget.pool(store, central, store.get_feature_order(fo_id))
-        stuck = [c["id"] for c in store.feature_children(fo_id)
+        # `budget.family`, NOT `store.feature_children`: the budget is enforced over the
+        # family, and the worker children are a strict subset of it that an improvement
+        # order's analyst and an investigation's investigator are never in (§3 of
+        # docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md, Neo
+        # question 1198). Reported off the enforced set, this list can never be empty
+        # where a child is in fact parked.
+        stuck = [c["id"] for c in budget.family(store, store.get_feature_order(fo_id))
                  if c["status"] == budget.EXHAUSTED]
     finally:
         central.close()

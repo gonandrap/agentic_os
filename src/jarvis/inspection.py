@@ -88,6 +88,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from . import navigation
 from . import usage as usage_mod
 from .catalog import (DEFAULT_INSPECT_REPORT_JOIN_FLOOR,
                       DEFAULT_INSPECT_REPORT_WRITE_FLOOR, InspectConfig)
@@ -105,10 +106,17 @@ TTL_5M = 300.0
 TTL_1H = 3600.0
 
 #: Tools whose span is the lead agent WAITING rather than working: it has dispatched
-#: something and is blocked on the result with no API call in flight. Only `TaskOutput`
-#: today — `Agent` itself returns immediately when the subagent is backgrounded, and the
-#: wait it defers is exactly what `TaskOutput` later collects.
+#: something and is blocked on the result with no API call in flight. ALWAYS a wait,
+#: backgrounded or not — `TaskOutput` exists to collect a result.
 JOIN_TOOLS = ("TaskOutput",)
+
+#: Tools whose span is the lead DELEGATING and then waiting for the result. A foreground
+#: call blocks the lead until the subagent returns; only `run_in_background: true` makes
+#: `Agent` return immediately, and that is what `TaskOutput` later collects. Counting a
+#: foreground delegation as a tool the lead RAN is what made `jarvis inspect` report
+#: "blocked on a subagent 0%" for every delegation the fleet has ever made (issue #845,
+#: docs/superpowers/specs/2026-09-29-a-runaway-tool-call-is-not-a-slow-subagent.md §1).
+DELEGATION_TOOLS = ("Agent", "Task")
 
 #: Tools whose span NAMES a subagent, and the only evidence a subagent is attached on
 #: (spec §4b). `Agent` spawns it and `TaskOutput` collects it; a subagent no span names
@@ -473,13 +481,21 @@ class ToolSpan:
     detail: str = ""
     #: The tool's whole `input`, redacted and capped (`_params_of`). ADDITIVE: `detail`
     #: above is unchanged and stays the one-line answer every renderer already prints —
-    #: spec §4a, `docs/specs/2026-09-24-order-observability.md`.
+    #: spec §4a, `docs/superpowers/specs/2026-09-24-order-observability.md`.
     params: dict[str, str] = field(default_factory=dict)
     #: Keys shortened to `ParamCaps.per_value`, and keys left out because the span or
     #: turn budget ran out. Separate lists: "cut short" and "not printed" are different
     #: facts about the same key and a reader acts on them differently.
     params_truncated: list[str] = field(default_factory=list)
     params_dropped: list[str] = field(default_factory=list)
+    #: `run_in_background: true` on the call that opened this span. Read from the RAW
+    #: `tool_use` input, never from `params`: those are redacted strings capped by
+    #: `ParamCaps`, so a dropped key would silently reclassify a join (spec §1).
+    backgrounded: bool = False
+    #: Does this Bash call read or search SOURCE? TRI-STATE, and `None` is the reading
+    #: that could not be taken: no command text was available, so the call is
+    #: UNCLASSIFIED and never a measured False (§3, Neo q1237, kn-4d32fe12).
+    navigates_source: bool | None = None
 
     @property
     def finished(self) -> bool:
@@ -491,7 +507,9 @@ class ToolSpan:
 
     @property
     def is_join(self) -> bool:
-        return self.name in JOIN_TOOLS
+        if self.name in JOIN_TOOLS:
+            return True
+        return self.name in DELEGATION_TOOLS and not self.backgrounded
 
     def as_dict(self) -> dict[str, Any]:
         return {"name": self.name, "tool_id": self.tool_id, "started": self.started,
@@ -576,6 +594,10 @@ class Turn:
     triggers: list[Prompt] = field(default_factory=list)
     spans: list[ToolSpan] = field(default_factory=list)
     calls: list[usage_mod.Call] = field(default_factory=list)
+    #: The cold boundaries that fell in THIS turn, classified once over the whole session
+    #: and attributed here (`_attach_boundaries`). Classifying per turn would open every
+    #: turn with a boundary it did not necessarily have — spec of 2026-09-29, Neo q1048.
+    boundaries: list[usage_mod.Boundary] = field(default_factory=list)
     #: The intervals of THIS turn the OS's own record says it was held (`holds.held`),
     #: already clipped to it. Empty when nothing held it, and empty for a reading taken
     #: without a store — a report that cannot see the record must say a turn was held
@@ -689,12 +711,28 @@ class Turn:
 
     @property
     def usage(self) -> usage_mod.Usage:
+        """This turn's tokens, priced — AND classified, which `priced` cannot do.
+
+        `usage.priced` deliberately classifies nothing (it prices counts a caller already
+        holds), so summing it left every boundary and context key of every turn at zero
+        while the turn's own `cache_write` ran to six figures (issue #867). The three
+        properties below are filled from what this turn actually has: its own boundaries,
+        its own calls, and `context_peak` — the SAME number `as_dict` emits at the top
+        level, which is the point of filling it here.
+        """
         total = usage_mod.Usage()
         for call in self.calls:
             total = total + usage_mod.priced(
                 call.model, messages=1, input=call.input,
                 cache_write=call.cache_write, cache_read=call.cache_read,
                 output=call.output, cache_1h=call.cache_1h, cache_5m=call.cache_5m)
+        total.context_peak = self.context_peak
+        # `usage`'s definition at this grain, the arithmetic `Anatomy.rewrite_excess`
+        # already does for the session: in a perfectly cached turn every token is written
+        # once, so what was written above the largest context reached was sent twice.
+        total.rewrite_excess = max(
+            0, sum(c.cache_write for c in self.calls) - self.context_peak)
+        usage_mod.fold_boundaries(total, self.boundaries)
         return total
 
     def share(self) -> dict[str, float]:
@@ -741,6 +779,33 @@ class Turn:
         }
 
 
+def _rewrite_block(boundaries: Sequence[usage_mod.Boundary], *,
+                   written: int, excess: int) -> dict[str, int | None]:
+    """A boundary census, keyed to `jarvis cost`'s own `rewrite` block.
+
+    ONE SPELLING of that dict, called by `Anatomy.rewrite` and `SubagentAnatomy.rewrite`
+    both (spec 2026-10-02 §1.1): two is how one key comes to mean two things on two
+    surfaces, the rule `usage.fold_boundaries` was factored out under.
+    """
+    def count(cause: str) -> int:
+        return sum(1 for b in boundaries if b.cause == cause)
+
+    def written_at(cause: str) -> int:
+        return sum(b.cache_write for b in boundaries if b.cause == cause)
+
+    return {
+        "boundaries": len(boundaries),
+        "ttl_boundaries": count(usage_mod.BOUNDARY_TTL),
+        "compact_boundaries": count(usage_mod.BOUNDARY_COMPACTED),
+        "undecided_boundaries": count(usage_mod.BOUNDARY_UNDECIDED),
+        "ttl_write": written_at(usage_mod.BOUNDARY_TTL),
+        "prefix_write": written_at(usage_mod.BOUNDARY_PREFIX),
+        "compact_write": written_at(usage_mod.BOUNDARY_COMPACTED),
+        "cache_write": written,
+        "tokens": excess,
+    }
+
+
 @dataclass
 class SubagentAnatomy:
     """One subagent's OWN anatomy: its turns, its cache writes, its context peak.
@@ -761,6 +826,30 @@ class SubagentAnatomy:
     writes: list[Write] = field(default_factory=list)
     #: Subagents of THIS subagent, counted and not read — see `SUBAGENT_DEPTH_READ`.
     deeper: int = 0
+    #: THRESHOLD-FREE, and the reason this class needed more than `writes`: a subagent
+    #: that wrote 334,427 tokens in 115 writes none of which reached the floor had an
+    #: empty `writes` list and rendered as "no large writes" (wo-fb7c0fc2, a8e11a7e).
+    #:
+    #: `None` AND NEVER 0 WHEN IT WAS NOT MEASURED — `SideVolume.code_nav_share()`'s
+    #: rule: a zero share is a finding and an unmeasured one is not. Every order sealed
+    #: before these fields existed carries no key at all, and defaulting those to 0 made
+    #: the renderer say `wrote nothing to the cache` about that same 334,427.
+    total_written: int | None = None
+    #: The largest single write, floor-free — the number that EXPLAINS an empty `writes`
+    #: list, and the only one that distinguishes "under the floor" from "wrote nothing".
+    max_write: int | None = None
+    #: The floor `writes` was built at, carried so a renderer never has to consult the
+    #: config to word an absence (`Anatomy.write_floor`'s rule).
+    write_floor: int | None = None
+    #: `usage.classify_boundaries` over THIS subagent's calls — the threshold-free
+    #: census q1215 requires. One run of calls per transcript, which is the grain
+    #: `classify_boundaries` documents.
+    boundaries: list[usage_mod.Boundary] = field(default_factory=list)
+    #: Calls, carried as a count so `total_written` can be read as a rate. A FIELD and
+    #: not `api_calls`: a transcript with no prompt row has no turns at all
+    #: (`read_transcript` opens one only at a prompt), so the property counts 0 over the
+    #: calls that were made, and the two must not disagree. `None` is absent, as above.
+    api_call_count: int | None = None
 
     @property
     def wall(self) -> float:
@@ -782,6 +871,20 @@ class SubagentAnatomy:
             totals[write.cause] = totals.get(write.cause, 0) + write.written
         return totals
 
+    def rewrite(self) -> dict[str, int | None] | None:
+        """This subagent's own boundary census, same keys as `Anatomy.rewrite()`.
+
+        `None` WHEN THE FIGURES WERE NEVER MEASURED, because the census is derived from
+        them: `cache_write` is `total_written` and `tokens` is its excess over the peak,
+        so a block built over an absence would be a dict of zeros claiming "no re-write
+        tax" about a subagent nobody counted. An empty `boundaries` list cannot say
+        which, so the absence is carried on the scalar.
+        """
+        if self.total_written is None:
+            return None
+        return _rewrite_block(self.boundaries, written=self.total_written,
+                              excess=max(0, self.total_written - self.context_peak))
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "task_id": self.task_id, "label": self.label,
@@ -791,7 +894,37 @@ class SubagentAnatomy:
             "context_peak": self.context_peak,
             "wall": round(self.wall, 2), "api_calls": self.api_calls,
             "deeper": self.deeper, "depth_read": SUBAGENT_DEPTH_READ,
+            # THRESHOLD-FREE, beside the floored list and never instead of it (spec
+            # 2026-10-02 §1.1): `writes_by_cause` empty means "nothing at that floor",
+            # and only these can say so.
+            "total_written": self.total_written, "max_write": self.max_write,
+            "write_floor": self.write_floor,
+            "api_call_count": self.api_call_count,
+            # The CENSUS, not the rows: the per-turn `boundaries` key already exists at
+            # the parent grain and a renderer needs the counts. `None` when unmeasured,
+            # and the key is still EMITTED: an omitted key is exactly what an old seal
+            # looks like, which is the bug, so absence is said rather than left out.
+            "rewrite": self.rewrite(),
         }
+
+
+#: The navigation reading's WORDING, in ONE place: `jarvis inspect` and the debug page
+#: both render from here, so the two cannot disagree about one figure (kn-77a8431d).
+NAV_LABELS = {"symbol_calls": "symbol", "source_nav_calls": "source nav",
+              "unclassified": "unclassified"}
+
+
+def nav_line(nav: dict[str, int]) -> str:
+    """The three counts as three SEPARATE numbers — §3.
+
+    `unclassified` is printed only when there IS one: a `0 unclassified` would read as a
+    measured zero, which is the claim the tri-state exists to avoid (issue #227).
+    """
+    line = (f"navigation — {nav.get('symbol_calls', 0)} {NAV_LABELS['symbol_calls']}, "
+            f"{nav.get('source_nav_calls', 0)} {NAV_LABELS['source_nav_calls']}")
+    if nav.get("unclassified"):
+        line += f", {nav['unclassified']} {NAV_LABELS['unclassified']}"
+    return line
 
 
 @dataclass
@@ -807,6 +940,11 @@ class Anatomy:
     found: bool = False
     turns: list[Turn] = field(default_factory=list)
     writes: list[Write] = field(default_factory=list)
+    #: Every cold boundary in the session, classified ONCE (`usage.classify_boundaries`)
+    #: and also attributed to the turn each fell in. Not `writes`: that list answers
+    #: "which large writes should this report show, and why" and is cut by
+    #: `report_write_floor`, where a boundary census has no threshold at all.
+    boundaries: list[usage_mod.Boundary] = field(default_factory=list)
     #: The thresholds this reading was taken at, carried so every rendering of it can
     #: state them. A report that shows "3 large writes" without saying what large meant
     #: is not reproducible, and these are per-project settings (`catalog.InspectConfig`).
@@ -892,6 +1030,27 @@ class Anatomy:
             row["mean"] = row["seconds"] / timed if timed else 0.0
         return sorted(by_name.values(), key=lambda r: r["seconds"], reverse=True)
 
+    def nav_profile(self) -> dict[str, int]:
+        """How this session navigated code: symbol calls, source-navigation Bash calls.
+
+        §3's CONTRACT — these three key names are read by other surfaces. A SIBLING of
+        `tool_profile()` and never a replacement for it. A span that is neither a symbol
+        call nor Bash (`Read`, `Write`, `Edit`, `Task`, `Grep`, `Glob`) is in none of the
+        three, and `search_for_pattern` is text search rather than a symbol call.
+
+        `unclassified` is Bash spans whose command text was not available, kept apart
+        from a measured zero: absent is not zero (issue #227, kn-4d32fe12).
+        """
+        profile = {"symbol_calls": 0, "source_nav_calls": 0, "unclassified": 0}
+        for span in self.spans:
+            if navigation.is_symbol_call(span.name):
+                profile["symbol_calls"] += 1
+            elif span.navigates_source is True:
+                profile["source_nav_calls"] += 1
+            elif span.name == "Bash" and span.navigates_source is None:
+                profile["unclassified"] += 1
+        return profile
+
     def partition(self) -> dict[str, float]:
         """The whole session's clock, summed over its turns.
 
@@ -933,8 +1092,33 @@ class Anatomy:
         peak = max((t.context_peak for t in self.turns), default=0)
         return max(0, written - peak)
 
+    def rewrite(self) -> dict[str, int | None]:
+        """The session's re-write total, keyed to `jarvis cost`'s own `rewrite` block.
+
+        Same keys as `bill._worker_extras`' wherever the field means the same thing, so
+        the two payloads can be laid side by side — which is what #867's reporter could
+        not do. Summed from the boundaries `read_session` classified and the calls already
+        in hand: nothing is re-read and nothing is re-classified.
+
+        NO `list_usd` and no `ttl_share`. `jarvis cost` is the money surface; a second
+        dollar figure here invites two answers to one question, and the share is a ratio
+        of the numbers below.
+
+        `undecided_boundaries` is why this is safe to read with an unknown floor:
+        `ttl_write` and `prefix_write` at 0 beside a non-zero one of these is "not
+        measured", never "no TTL expiry".
+        """
+        # ONE spelling of the dict, shared with `SubagentAnatomy.rewrite` (§1.1). The
+        # excess is CALLED, not recomputed, so the top-level `rewrite_excess` key and
+        # this one cannot drift.
+        return _rewrite_block(
+            self.boundaries,
+            written=sum(c.cache_write for t in self.turns for c in t.calls),
+            excess=self.rewrite_excess())
+
     def as_dict(self) -> dict[str, Any]:
         part = self.partition()
+        nav = self.nav_profile()
         wall = part["wall"] or 1.0
         return {
             "session_id": self.session_id,
@@ -954,11 +1138,18 @@ class Anatomy:
             "hold_causes": HOLD_CAUSES,
             "context_peak": max((t.context_peak for t in self.turns), default=0),
             "rewrite_excess": self.rewrite_excess(),
+            # ADDITIVE, and the session-level figure #846 needs: `rewrite_excess` above
+            # stays the same number, and `rewrite["tokens"]` IS it.
+            "rewrite": self.rewrite(),
             "cache_ttl": self.cache_ttl(),
             "turns": [t.as_dict() for t in self.turns],
             "writes": [w.as_dict() for w in self.writes],
             "joins": [s.as_dict() for s in self.joins()],
             "tools": self.tool_profile(),
+            # ADDITIVE and a SIBLING of `tools` above: §3's three-key contract, and its
+            # one wording carried WITH the reading (`hold_causes`' rule, kn-77a8431d).
+            "nav": nav,
+            "nav_line": nav_line(nav),
             # ADDITIVE, and `subagent_depth_read` is stated for the reason the floors and
             # the caps are: silence here would read as "there were none deeper".
             "unattached_subagents": [s.as_dict()
@@ -970,6 +1161,21 @@ class Anatomy:
 
 
 # -- reading a transcript --------------------------------------------------------------
+
+
+def _navigates(block: dict[str, Any]) -> bool | None:
+    """Does this `tool_use` block read or search source? None when it cannot be said.
+
+    §3: read from the RAW input, the same read `backgrounded` does. A non-`Bash` call is
+    None here and is classified by TOOL NAME in `Anatomy.nav_profile`; a `Bash` call with
+    no command text is UNCLASSIFIED rather than False (issue #227).
+    """
+    if str(block.get("name") or "") != "Bash":
+        return None
+    command = str((block.get("input") or {}).get("command") or "")
+    if not command:
+        return None
+    return navigation.navigates_source(command, navigation.SOURCE_SUFFIXES)
 
 
 def _detail_of(payload: Any, limit: int) -> str:
@@ -985,7 +1191,11 @@ def _detail_of(payload: Any, limit: int) -> str:
     """
     if not isinstance(payload, dict):
         return ""
-    for key in ("description", "command", "task_id", "file_path", "pattern", "skill"):
+    # `substring_pattern` is Serena `search_for_pattern`'s own parameter name, and the
+    # only field that says WHAT hung when that call runs away (issue #845, spec §2c —
+    # which assumed `pattern` covered it; the tool does not use that name).
+    for key in ("description", "command", "task_id", "file_path", "pattern",
+                "substring_pattern", "skill"):
         value = payload.get(key)
         if isinstance(value, str) and value:
             return _first_line(redact_param(value), limit)
@@ -1023,8 +1233,10 @@ def _prompt_of(row: dict[str, Any], ts: float, limit: int) -> Prompt | None:
     text = _prompt_text(row)
     if not text.strip():
         return None
-    return Prompt(ts=ts, kind=_trigger_kind(text), quote=_first_line(text, limit),
-                  source=source)
+    # REDACTED BEFORE IT IS CUT, as `_detail_of` is: the quote is sealed, so an
+    # unredacted one outlives the transcript (autopsy durability spec §3).
+    return Prompt(ts=ts, kind=_trigger_kind(text),
+                  quote=_first_line(redact_param(text), limit), source=source)
 
 
 def _subagent_labels(path: Path) -> dict[str, str]:
@@ -1110,7 +1322,14 @@ def read_transcript(path: Path | str,
                             detail=_detail_of(block.get("input"),
                                               cfg.quote_chars),
                             params=params, params_truncated=truncated,
-                            params_dropped=dropped)
+                            params_dropped=dropped,
+                            # The RAW block, the same read `background._scan_calls` does
+                            # and for the same reason (spec §1).
+                            backgrounded=bool((block.get("input") or {}).get(
+                                "run_in_background")),
+                            # §3: the RAW command, never `detail` (prose) or `params`
+                            # (capped) — and None when there is no command to read.
+                            navigates_source=_navigates(block))
             pending[tool_id] = span
             # Charged to the turn that ASKED for it. A span whose result lands after the
             # next turn starts still belongs to the turn that spent the seconds.
@@ -1206,7 +1425,8 @@ def read_session(session_id: str, cfg: InspectConfig | None = None, *,
                  root: Path | None = None,
                  index: dict[str, list[Path]] | None = None,
                  spans: Sequence[Hold] = (),
-                 turn_starts: Sequence[tuple[int, float]] = ()) -> Anatomy:
+                 turn_starts: Sequence[tuple[int, float]] = (),
+                 cold_prefix_floor: int | None = None) -> Anatomy:
     """Take one session apart, across every segment file it left behind.
 
     Segments are read in path order and their turns concatenated by start time, then
@@ -1224,6 +1444,12 @@ def read_session(session_id: str, cfg: InspectConfig | None = None, *,
     reason. Left empty the turns are numbered 1..N as they always were; passed, they
     carry the OS's own numbers, so an alarm and `jarvis inspect` stop naming one turn two
     different ways (spec 2026-09-27 §3).
+
+    `cold_prefix_floor` is `os.cold_prefix_floor` and is passed in for the same reason,
+    best-effort: left out, boundaries are still counted and a compacted one still
+    labelled, and the TTL-vs-prefix split of the rest is reported as UNDECIDED rather
+    than guessed (`usage.classify_boundaries`). Required here would mean `jarvis inspect`
+    failing over a moved catalog, which is exactly when someone needs it.
     """
     cfg = cfg or InspectConfig()
     anatomy = Anatomy(session_id=session_id, write_floor=cfg.report_write_floor,
@@ -1248,6 +1474,12 @@ def read_session(session_id: str, cfg: InspectConfig | None = None, *,
                    for c in usage_mod.compaction_stamps(path)]
     anatomy.writes = classify_writes(calls, cfg.report_write_floor,
                                      sorted(compactions))
+    # ONCE over the whole session, then attributed — Neo q1048. Classified per turn,
+    # every turn would open with a boundary it did not necessarily have and the per-turn
+    # counts would not sum to the session's.
+    anatomy.boundaries = usage_mod.classify_boundaries(
+        calls, compactions=sorted(compactions), cold_prefix_floor=cold_prefix_floor)
+    _attach_boundaries(turns, anatomy.boundaries)
     _attach_calls(turns, calls)
     _close_turns(turns)
     _name_joins(turns, anatomy.subagent_labels)
@@ -1256,7 +1488,7 @@ def read_session(session_id: str, cfg: InspectConfig | None = None, *,
     # order of these two is not a trap for the next reader (spec §4b).
     anatomy.unattached_subagents = _attach_subagents(
         turns,
-        [_read_subagent(sub, cfg, anatomy.subagent_labels)
+        [_read_subagent(sub, cfg, anatomy.subagent_labels, cold_prefix_floor)
          for path in sorted(paths) for sub in _subagent_transcripts(path)])
     # AFTER `_close_turns`, which is the only thing that knows where a turn ends: a hold
     # attached before it would be measured against a turn whose `ended` was still its
@@ -1307,27 +1539,47 @@ def _close_turns(turns: Sequence[Turn]) -> None:
                                                           or turn.ended)
 
 
-def _attach_calls(turns: Sequence[Turn], calls: Iterable[usage_mod.Call]) -> None:
-    """Put each API call in the turn that was running when it landed.
+def _turn_at(ordered: Sequence[Turn], ts: float) -> Turn | None:
+    """Which turn was running when something landed, or None if nothing had started.
 
     The same last-turn-started-by-then rule the bill uses (`bill._turn_locator`), so the
     two accountings cut the session at identical points and a reader can lay one beside
-    the other.
+    the other. ONE locator for the calls and the boundaries: two spellings of "which turn
+    was this in" is how two numbers on one payload come to disagree.
+
+    `ordered` must be sorted by `started` — the loop stops at the first turn that had not.
     """
+    home: Turn | None = None
+    for turn in ordered:
+        if turn.started <= ts:
+            home = turn
+        else:
+            break
+    return home
+
+
+def _attach_calls(turns: Sequence[Turn], calls: Iterable[usage_mod.Call]) -> None:
+    """Put each API call in the turn that was running when it landed."""
     ordered = sorted(turns, key=lambda t: t.started)
     for call in calls:
-        home: Turn | None = None
-        for turn in ordered:
-            if turn.started <= call.ts:
-                home = turn
-            else:
-                break
+        home = _turn_at(ordered, call.ts)
         if home is not None:
             home.calls.append(call)
 
 
+def _attach_boundaries(turns: Sequence[Turn],
+                       boundaries: Iterable[usage_mod.Boundary]) -> None:
+    """Put each classified boundary in the turn that was running when it was paid for."""
+    ordered = sorted(turns, key=lambda t: t.started)
+    for boundary in boundaries:
+        home = _turn_at(ordered, boundary.ts)
+        if home is not None:
+            home.boundaries.append(boundary)
+
+
 def _read_subagent(path: Path, cfg: InspectConfig,
-                   labels: dict[str, str]) -> SubagentAnatomy:
+                   labels: dict[str, str],
+                   cold_prefix_floor: int | None = None) -> SubagentAnatomy:
     """One subagent transcript, taken apart the way `read_session` takes the parent apart.
 
     The task id is the stem minus its `agent-` prefix — the same join `_subagent_labels`
@@ -1341,11 +1593,47 @@ def _read_subagent(path: Path, cfg: InspectConfig,
     calls = usage_mod.calls_of(path)
     _attach_calls(turns, calls)
     _close_turns(turns)
+    compactions = sorted(usage_mod.compaction_stamps(path))
     return SubagentAnatomy(
         task_id=task_id, label=labels.get(task_id, ""), turns=turns,
-        writes=classify_writes(calls, cfg.report_write_floor,
-                               sorted(usage_mod.compaction_stamps(path))),
-        deeper=len(_subagent_transcripts(path)))
+        writes=classify_writes(calls, cfg.report_write_floor, compactions),
+        deeper=len(_subagent_transcripts(path)),
+        # THRESHOLD-FREE, from the calls already in hand (spec 2026-10-02 §1.2). THE ONE
+        # PLACE a subagent transcript is opened, so the one place these are filled.
+        total_written=sum(c.cache_write for c in calls),
+        max_write=max((c.cache_write for c in calls), default=0),
+        write_floor=cfg.report_write_floor,
+        api_call_count=len(calls),
+        # REUSED, never a second classifier: the OS has one judgement about a cache read
+        # that went backwards, and `cold_prefix_floor=None` leaves the split UNDECIDED
+        # rather than reporting 0 prefix misses.
+        boundaries=usage_mod.classify_boundaries(
+            calls, compactions=compactions, cold_prefix_floor=cold_prefix_floor))
+
+
+def hung_subagent_call(subs: Sequence[SubagentAnatomy], now: float, older_than: float,
+                       *, since: float = 0.0) -> tuple[SubagentAnatomy, ToolSpan] | None:
+    """The first (subagent, span) whose LAST span is an unfinished tool call older than
+    `older_than` seconds. `None` when every subagent is working normally.
+
+    THIS NAMES THE SUBAGENT IT FOUND AND CLAIMS NO PARENTAGE. It scans the session's
+    anatomies and does not assert that the one it returns is the child of any particular
+    delegation span — an `Agent` span carries a `description` and no task id, so the
+    record does not say. `since` keeps a previous turn's leftovers out by requiring the
+    hung span to have started at or after that moment; it is a time WINDOW and not an
+    attribution, which is why `_attach_subagents` still refuses a timestamp fallback
+    (the issue-227 rule: a REPORT names a parent only where the record does — spec §2b).
+
+    "Last span" is the thing the subagent is doing right now. An unfinished span EARLIER
+    in its transcript is a killed call it already moved past, not a hang.
+    """
+    for sub in subs:
+        span = next((t.spans[-1] for t in reversed(sub.turns) if t.spans), None)
+        if span is None or span.finished or span.started < since:
+            continue
+        if now - span.started >= older_than:
+            return sub, span
+    return None
 
 
 def _names(span: ToolSpan, task_id: str) -> bool:
@@ -1448,7 +1736,8 @@ ALARM_KINDS = {
                  "billed (historical: nothing raises this now, spec of 2026-09-27)",
     SLOW_RESPONSE_ALARM: "a request has been in flight this long with no completed "
                          "content block — the model is answering slowly",
-    JOIN_ALARM: "a join open past the cache TTL — the wait is paid for twice",
+    JOIN_ALARM: "a wait that is costing more than it buys — a `TaskOutput` open past "
+                "the cache TTL, or a delegation whose subagent has a tool call hung",
     WRITE_ALARM: "the conversation sent again, at the cache-write rate",
     # The two aggregate kinds. Worded as a share of a PROJECT rather than of a turn, so a
     # reader of the legend cannot take them for another reading of `big-rewrite`.
@@ -1613,8 +1902,26 @@ def alarms(anatomy: Anatomy, cfg: InspectConfig, wo_id: str = "",
                 f"{held_note(wall, holding)} with nothing completed yet; the model is "
                 f"answering slowly, and this is not a stall{hint}")))
     for span in turn.spans:
-        if span.is_join and not span.finished and now and \
-                now - span.started >= cfg.alarm_join_seconds:
+        if not span.is_join or span.finished or not now:
+            continue
+        # A DELEGATION is judged on HANG EVIDENCE and never on elapsed wait (spec §2b):
+        # at `alarm_join_seconds` the literal reading fires on 43 of the fleet's 272
+        # foreground delegations, nearly all of them real subagent work, and an alarm
+        # that fires on normal work is trained away — the standing argument above.
+        if span.name in DELEGATION_TOOLS:
+            found = hung_subagent_call(
+                [*turn.subagents, *anatomy.unattached_subagents], now,
+                cfg.alarm_subagent_tool_minutes * 60, since=span.started)
+            if found is None:
+                continue
+            sub, hung = found
+            called = f"{hung.name} ({hung.detail})" if hung.detail else hung.name
+            raised.append(Alarm(JOIN_ALARM, (
+                f"subagent {sub.label or sub.task_id} blocked "
+                f"{_hours(now - hung.started)} in {called} — long enough to lose the "
+                f"prompt cache, so the wait will be paid for twice{hint}")))
+            break
+        if now - span.started >= cfg.alarm_join_seconds:
             waited = int((now - span.started) // 60)
             raised.append(Alarm(JOIN_ALARM, (
                 f"blocked {waited}m waiting on {span.detail or span.tool_id} with no "

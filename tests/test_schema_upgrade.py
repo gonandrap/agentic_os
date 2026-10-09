@@ -178,6 +178,111 @@ def test_the_central_database_from_the_live_release_upgrades_in_full(
     }
 
 
+def test_the_input_size_columns_arrive_on_an_existing_agent_calls_table(tmp_path):
+    """`agent_calls` predates them, so `CREATE TABLE IF NOT EXISTS` is a no-op on a live
+    `os.db` and only `ADDED_COLUMNS` reaches one. Spec §3,
+    docs/superpowers/specs/2026-09-26-bounded-model-inputs.md.
+
+    0 on a pre-existing row means NOT MEASURED, never "an empty prompt".
+    """
+    path = tmp_path / "legacy-os.db"
+    old = sqlite3.connect(path)
+    old.executescript(SHIPPED_CENTRAL_SCHEMA.read_text())
+    old.execute("""CREATE TABLE IF NOT EXISTS agent_calls (
+                       id INTEGER PRIMARY KEY AUTOINCREMENT,
+                       ts REAL NOT NULL, project TEXT NOT NULL DEFAULT '',
+                       wo_id TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL,
+                       label TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '',
+                       question_id INTEGER, ok INTEGER NOT NULL DEFAULT 1,
+                       cost_usd REAL, input INTEGER NOT NULL DEFAULT 0,
+                       cache_write INTEGER NOT NULL DEFAULT 0,
+                       cache_read INTEGER NOT NULL DEFAULT 0,
+                       output INTEGER NOT NULL DEFAULT 0, usage_json TEXT)""")
+    old.execute("INSERT INTO agent_calls (ts, kind, wo_id) VALUES (1.0, 'neo_answer',"
+                " 'wo-old')")
+    old.commit()
+    before = schema_of(old)
+    old.close()
+    assert "prompt_chars" not in before["agent_calls"]
+
+    store = CentralStore(path)         # the upgrade
+    try:
+        assert {"prompt_chars", "system_prompt_chars"} <= schema_of(
+            store.conn)["agent_calls"]
+        (legacy,) = store.agent_calls(wo_id="wo-old")
+        assert (legacy["prompt_chars"], legacy["system_prompt_chars"]) == (0, 0)
+        # and the upgraded table takes a measured write
+        store.add_agent_call("neo_answer", wo_id="wo-new", prompt_chars=12_000,
+                             system_prompt_chars=800)
+        (fresh,) = store.agent_calls(wo_id="wo-new")
+        assert (fresh["prompt_chars"], fresh["system_prompt_chars"]) == (12_000, 800)
+    finally:
+        store.close()
+
+
+def test_the_latency_column_arrives_on_an_existing_agent_calls_table(tmp_path):
+    """NULLABLE, unlike `prompt_chars` beside it: a sub-millisecond call rounds to 0, so
+    0 cannot mean "not measured" here. Spec §3, docs/superpowers/specs/2026-10-01-neo-observability.md.
+    """
+    path = tmp_path / "legacy-latency.db"
+    old = sqlite3.connect(path)
+    old.executescript(SHIPPED_CENTRAL_SCHEMA.read_text())
+    old.execute("""CREATE TABLE IF NOT EXISTS agent_calls (
+                       id INTEGER PRIMARY KEY AUTOINCREMENT,
+                       ts REAL NOT NULL, project TEXT NOT NULL DEFAULT '',
+                       wo_id TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL,
+                       label TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '',
+                       question_id INTEGER, ok INTEGER NOT NULL DEFAULT 1,
+                       cost_usd REAL, input INTEGER NOT NULL DEFAULT 0,
+                       cache_write INTEGER NOT NULL DEFAULT 0,
+                       cache_read INTEGER NOT NULL DEFAULT 0,
+                       output INTEGER NOT NULL DEFAULT 0, usage_json TEXT)""")
+    old.execute("INSERT INTO agent_calls (ts, kind, wo_id) VALUES (1.0, 'neo_answer',"
+                " 'wo-old')")
+    old.commit()
+    before = schema_of(old)
+    old.close()
+    assert "latency_ms" not in before["agent_calls"]
+
+    store = CentralStore(path)         # the upgrade
+    try:
+        assert "latency_ms" in schema_of(store.conn)["agent_calls"]
+        (legacy,) = store.agent_calls(wo_id="wo-old")
+        assert legacy["latency_ms"] is None, "an untimed call is absent, never 0 ms"
+        store.add_agent_call("neo_answer", wo_id="wo-new", latency_ms=1234)
+        (fresh,) = store.agent_calls(wo_id="wo-new")
+        assert fresh["latency_ms"] == 1234
+    finally:
+        store.close()
+
+
+def test_the_escalation_cause_column_arrives_on_an_existing_questions_table(tmp_path):
+    """NULL on every pre-existing row, and NOT `NOT NULL DEFAULT ''`: the column is read
+    by a GROUP BY, where an empty-string bucket reads as a ninth cause. Spec §1,
+    docs/superpowers/specs/2026-10-01-neo-observability.md — and NO backfill from prose.
+    """
+    path = tmp_path / "legacy-cause.db"
+    old = sqlite3.connect(path)
+    old.executescript(SHIPPED_NEO_SCHEMA.read_text())
+    old.execute("INSERT INTO questions (ts, project, wo_id, question, status, "
+                "answer_reason) VALUES (1.0, 'proj_a', 'wo-old', 'which?', 'escalated',"
+                " 'the user must decide: this touches production')")
+    old.commit()
+    assert "escalation_cause" not in schema_of(old)["questions"]
+    old.close()
+
+    store = NeoStore(path)              # the upgrade
+    try:
+        assert "escalation_cause" in schema_of(store.conn)["questions"]
+        (legacy,) = [q for q in store.list_questions() if q["wo_id"] == "wo-old"]
+        assert legacy["escalation_cause"] is None
+        q = store.ask("proj_a", "wo-1", "and this?")
+        store.mark(q["id"], "escalated", reason="yours", cause="high-stakes")
+        assert store.get(q["id"])["escalation_cause"] == "high-stakes"
+    finally:
+        store.close()
+
+
 def test_the_config_version_ledger_and_its_index_arrive_on_a_central_upgrade(tmp_path):
     """`schema_of` returns `{table: {columns}}`, so an index is invisible to every
     column comparison in this file — including the one directly above, which would pass
@@ -238,6 +343,30 @@ def test_the_usage_json_column_reaches_a_database_that_already_has_wo_turns(tmp_
         store.finish_turn(turn["id"], "done", result="ok",
                           usage_json='{"input": 2, "output": 941}')
         assert store.latest_turn(wo["id"])["usage_json"] == '{"input": 2, "output": 941}'
+    finally:
+        store.close()
+
+
+def test_reopens_at_reaches_a_database_that_already_has_health_reviews(tmp_path):
+    """`health_reviews` already ships, so the hold's moment cannot arrive with the
+    `CREATE TABLE` — spec 2026-09-28-a-usage-limit-is-not-a-failed-sweep §1."""
+    proj = tmp_path / "legacy-health"
+    (proj / ".jarvis").mkdir(parents=True)
+    store = ProjectStore(proj)
+    store.record_health_review("work_order", "wo-1", fingerprint="fp",
+                               trigger="first-look", outcome="failed", detail="old")
+    store.close()
+    conn = sqlite3.connect(proj / ".jarvis" / "jarvis.db")
+    conn.execute("ALTER TABLE health_reviews DROP COLUMN reopens_at")
+    conn.commit()
+    conn.close()
+
+    store = ProjectStore(proj)                      # the upgrade
+    try:
+        assert "reopens_at" in schema_of(store.conn)["health_reviews"]
+        (old,) = store.health_reviews_of("work_order", "wo-1")
+        assert old["reopens_at"] == 0.0
+        assert store.health_sweep_hold() is None
     finally:
         store.close()
 
@@ -530,6 +659,41 @@ def test_a_turn_that_predates_the_context_ledger_reads_as_not_recorded(tmp_path,
     assert [t["seq"] for t in out["turns"]] == [1]
     assert out["turns"][0]["recorded"] is False and out["turns"][0]["ingredients"] == []
     assert "not recorded" in out["turns"][0]["note"]
+
+
+def test_an_order_that_predates_the_autopsy_column_reads_as_never_sealed(tmp_path):
+    """kn-c712a5d6's other half for `autopsy_json`: `tests/test_autopsy.py` writes the
+    column, and this reads a row that PREDATES it.
+
+    The frozen 0.1.11 asset has no autopsy pair at all, so the migration is what must add
+    it. NULL is the honest answer for an order that settled before the seal existed — never
+    an empty payload, which would read as "this order did nothing" — and such a row stays
+    on the queue, which is exactly how the backlog of already-settled orders gets read
+    while their transcripts are still on disk.
+    """
+    from jarvis import autopsy
+
+    proj = tmp_path / "legacy-autopsy"
+    (proj / ".jarvis").mkdir(parents=True)
+    old = sqlite3.connect(proj / ".jarvis" / "jarvis.db")
+    old.executescript(SHIPPED_SCHEMA.read_text())
+    old.execute("INSERT INTO work_orders (id, title, description, status, created_at, "
+                "updated_at) VALUES ('wo-old', 'ran before the autopsy', 'd', "
+                "'completed', 1.0, 1.0)")
+    old.commit()
+    old.close()
+
+    store = ProjectStore(proj)                                 # the upgrade
+    try:
+        assert {"autopsy_json", "autopsy_sealed_at"} <= schema_of(store.conn)[
+            "work_orders"]
+        row = store.get_work_order("wo-old")
+        assert row["autopsy_json"] is None                     # never sealed, not "{}"
+        assert row["autopsy_sealed_at"] is None
+        assert autopsy.unseal(row) is None
+        assert [o["id"] for o in store.unsealed_autopsy_orders()] == ["wo-old"]
+    finally:
+        store.close()
 
 
 #: An arbitrary epoch the backfill fixtures hang off.
