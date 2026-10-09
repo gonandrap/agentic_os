@@ -57,9 +57,9 @@ Three prohibitions, from the feature order, which apply to every section below:
 
 Every section from 3 onward builds on or consumes this. It is specified once, here.
 
-```python
-# src/jarvis/ops.py
+In `src/jarvis/ops.py`:
 
+```python
 @dataclass(frozen=True)
 class Actor:
     pass_name: str   # "Daemon.retry_paused_turns" — the daemon method, exactly as spelled
@@ -150,10 +150,18 @@ reason, pinned by a test.
 
 Delivers `ops.scheduled_actor`, the `Actor` type, the registry, each pass's call-site
 rewrite, and `tests/test_scheduled_actor.py`. **No reader is rewired here and no
-behaviour changes** — after this section `jarvis` can name an actor for eight of the nine
-statuses and nothing acts on the answer yet.
+behaviour changes** — after this section the answer exists and nothing acts on it yet.
 
 `pending` is NOT in this section; it is section 4.
+
+### The count, stated so the pin's table is not a guess
+
+Of the nine, **six get a real `Actor` naming a daemon pass** — `dispatching`, `running`,
+`idle`, `waiting_input`, `validating`, `waiting_pr_merge` — **one comes from section 4**
+(`pending`), and **two get a documented `None`**: `needs_review` and `budget_exhausted`
+have no daemon pass, by design, and their coverage comes entirely from `true_blockers`'
+existing lines. Write that split into the registry explicitly. "No pass, and here is why"
+is a registry entry; a missing key is not.
 
 ### Per status: the pass, and the predicate to import
 
@@ -200,9 +208,16 @@ and becomes public in this section.
 
 **`validating` — `Daemon.validation_tick`** (`daemon.py:2352`) and
 **`Daemon.poll_pull_requests`** (`PR_POLL_STATUSES = PR_REPAIR_STATUSES + ("validating",)`,
-`daemon.py:184`). Importable already: `store.work_orders_awaiting_validation()`
-(`project_store.py:5035`), which is `OPEN_STATUSES`-bounded and keyed off the ROUND, not
-the status, plus `invariants.validation_hold_until(...)` for the per-round window.
+`daemon.py:184`). The eligibility is keyed off the ROUND, not the status.
+
+> **Do NOT reach it through `ProjectStore.work_orders_awaiting_validation`**
+> (`project_store.py:5035`). That takes no `wo_id`: it is a project-wide list query, and
+> `scheduled_actor` is called from `true_blockers` for every work order on every reconcile
+> tick, so using it is O(n) project-wide queries per tick. It breaks section 2's cost
+> budget. Read THIS ROW's own validation rounds, plus
+> `project_store.validation_hold_until(events, round_no)` (`project_store.py:201-227`),
+> which already takes ROWS rather than a store for exactly this reason.
+
 `Daemon.validating` (the in-memory set) is unreachable and is treated as "a round is in
 flight, so an actor exists" — see section 2's "what it cannot see".
 
@@ -246,18 +261,61 @@ the budget blocker first. Already correct — register it, do not change it.
 - `Daemon.stuck_tick` (`daemon.py:4824`) — an OBSERVER. **Counting it as an actor would
   make every stuck order claim an owner and defeat this entire feature.**
 
+### Origin is part of the predicates, not a guard around them
+
+Several passes already decide on origin themselves: `Daemon.settle_turns`
+(`daemon.py:5422`) and `Daemon.retry_paused_turns` (`daemon.py:2119`) both `continue` on
+`wo["origin"] in UNGOVERNED_ORIGINS`. So an `adhoc` order in `running` or `dispatching`
+genuinely has no actor from either pass — correctly, per `Daemon.retire_ungoverned` and
+INV-ADHOC-LEGACY-RETIRED.
+
+That means origin belongs INSIDE each imported predicate and **`scheduled_actor` must NOT
+carry a blanket `if origin in UNGOVERNED_ORIGINS: return None` guard**. Such a guard would
+reach the same answer for the wrong reason and would hide the next case.
+
+`injected` is NOT the same as `adhoc` here. `Daemon.track_injected_sessions`
+(`daemon.py:9131`) follows `origin == "injected"` rows in `("running", "waiting_input")` —
+a real named pass — and `true_blockers`' `waiting_input` arm is not gated on `governed`, so
+an injected `waiting_input` row raises its line anyway.
+
+But `track_injected_sessions`' eligibility keys on the live `claude_cli` agents view
+(`sessions_by_cwd`), which is not a row read and is not cheap. **By section 2's predicate
+rule that is a finding to RECORD, not a case to hard-code.** Record it with
+`jarvis wo assume`, stating that this pass's eligibility is not a row predicate and why.
+Register `injected`'s `running` / `waiting_input` actor only if a row-only predicate can
+honestly be extracted; otherwise the pair goes in the pin's exemption table carrying that
+sentence as its reason.
+
 ### The coverage pin
 
-New file `tests/test_scheduled_actor.py`. Parametrised over
-`project_store.OPEN_STATUSES` AND over origin (governed vs `UNGOVERNED_ORIGINS`): per
-case, build the minimal row and assert that `scheduled_actor(...) is not None` or
-`true_blockers(...) != []` — **never both false**, with the ungoverned exemption named in
-the expected table rather than hidden in a skip.
+New file `tests/test_scheduled_actor.py`. Parametrised over the PAIR
+`(status, origin)` — `project_store.OPEN_STATUSES` × `("jarvis", "injected", "adhoc")`:
+per case, build the minimal row and assert that `scheduled_actor(...) is not None` or
+`true_blockers(...) != []`, **never both false**.
 
-Two pins, same file:
+The exemptions live in a module-level table, not in a skip and not in a guard inside
+`scheduled_actor`:
 
-1. The population pin above. It fails on the day a status is added to `OPEN_STATUSES`,
-   which is the whole point.
+```python
+#: (status, origin) pairs that correctly derive NEITHER an actor nor a blocker,
+#: each mapped to the one sentence saying why.
+EXPECT_NEITHER: dict[tuple[str, str], str] = {...}
+```
+
+The table **bites in both directions**: for a pair in `EXPECT_NEITHER` the test asserts
+both sides are empty AND FAILS if either side starts deriving something. An exemption that
+quietly became a real answer must break the test, or the table rots into a list of names —
+which is the defect this feature exists to delete, one level up.
+
+`pending` is section 4's, so in this section its parameter is marked
+`pytest.mark.xfail(strict=True, reason="pending's actor lands in the claim-SQL child")`.
+Strict, not `skip`: section 4 removing the marker is part of section 4's done, and a
+`skip` left behind would rot silently.
+
+Two more pins, same file:
+
+1. The population pin above. It fails on the day a status OR an origin is added, which is
+   the whole point.
 2. An AST-or-import pin holding the predicate rule from section 2: each registry entry's
    `predicate` must resolve to a symbol IMPORTED from the pass's own module, not a lambda
    or a condition defined in `ops`. `tests/test_remedies.py` already does this kind of AST
@@ -364,16 +422,23 @@ elapsed time, per section 2.
 `invariants.check_blocked_work_is_surfaced` / INV-ATTENTION-MISSING
 (`invariants.py:2460-2484`) selects `statuses=BLOCKED_STATUSES` (`invariants.py:77-96`),
 and `validating` is ABSENT from that tuple. So a blocker derived correctly for a
-`validating` order is **never surfaced**, and `tests/test_invariants.py:578` asserts the
-absence outright.
+`validating` order is **never surfaced**, and
+`tests/test_invariants.py:579` — `assert "validating" not in BLOCKED_STATUSES`, inside
+`test_a_validating_work_order_is_silent_until_the_panel_gives_up` at
+`tests/test_invariants.py:563` — asserts the absence outright.
 
 The gate becomes `project_store.OPEN_STATUSES` plus `failed`, and the list is DELETED. Its
 own comment (`invariants.py:74-76`) stated the invariant it kept breaking; after this there
 is no second list to keep in step, so there is nothing to break.
 
-`tests/test_invariants.py:578` is rewritten to assert the opposite of what it asserts
-today: that a `validating` order with no round IS surfaced. That edit is expected and is
-this section's headline, not an accident to be worked around.
+Line 579 is rewritten to assert the opposite of what it asserts today: that a `validating`
+order with no round IS surfaced. That edit is expected and is this section's headline, not
+an accident to be worked around.
+
+**Line 578 is a DIFFERENT assertion and must stay green verbatim**:
+`true_blockers(...) == []` for a `validating` row WITH an open round. The pairing of the
+two lines IS the test, as its docstring says — deleting the wrong half would remove the
+only thing stopping this feature from flagging every order the panel is actively judging.
 
 ### 5d. End to end
 
@@ -437,10 +502,17 @@ status.
 
 ### Three constraints, each a reason this is not a rider on another section
 
-1. **The packet's bytes are a cached prompt prefix.** `build_evidence`'s docstring says so
-   and warns against a second implementation. Changing a cache prefix inside a child that
-   also edits attention logic mixes a spend change with a correctness change, under one
-   review.
+1. **The packet's bytes are a cached prompt prefix, and this is a FULL invalidation, not a
+   marginal one.** Most open orders have an actor, so a positive line changes the packet
+   for nearly all of them. `build_evidence`'s docstring warns against a second
+   implementation, and `tests/test_supervisor.py:852`
+   `test_the_work_order_packet_is_byte_for_byte_what_it_has_always_been` holds
+   `EXPECTED_WORK_ORDER_PACKET` as a literal precisely so this cannot happen by accident.
+   That literal is updated ONCE, in this section and nowhere else, and the new line sits at
+   a FIXED index relative to the `this session is …` line — the precedent is
+   `tests/test_supervisor.py:909-911` — so the prefix stays cacheable across reviews.
+   Mixing a cache-prefix change into a child that also edits attention logic would put a
+   spend change and a correctness change under one review.
 2. **`health.blocker` must stay PURE** (`health.py:152-154`). It also feeds dedupe and
    `due`, so a verdict added here changes what RE-ASSERTS. That has to be reasoned about on
    its own.
@@ -450,8 +522,11 @@ status.
    and why" when an actor EXISTS, and says NOTHING — emits no line at all — when
    `scheduled_actor` returns `None`. Never `scheduled_actor: none`.
 
-This section does NOT re-rank `health.BLOCKERS` and does not touch
-`health_reassert_blockers` (`health.py:172`). That is backlogged.
+This section does NOT re-rank `health.BLOCKERS`, does not touch
+`health_reassert_blockers` (`health.py:172`), and does not widen
+`supervisor.BLOCKED_SENTENCES` — `tests/test_supervisor.py:914` asserts
+`set(BLOCKED_SENTENCES) == {*health.BLOCKERS, health.CHILDREN}`, so the new line is its
+own thing and not a blocker sentence. The catalog rework is backlogged.
 
 ## 8. Out of scope
 
