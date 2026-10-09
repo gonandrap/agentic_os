@@ -23,11 +23,18 @@ exception message is. Timestamps are local time, matching `notifications.log` an
 
 Both files rotate at `MAX_BYTES` into a single `.1` sibling, so a dashboard stuck in a
 crash loop cannot fill the state directory.
+
+Two more files live here, for the failure that writes NO error: `ui-stacks.log` and
+`ui-wedge.json`, the dashboard's dump of its own threads and the stamp the daemon and
+`jarvis doctor` read back when its threadpool wedges. They are separate files on purpose
+— the `[ERROR]` format above is a parsed contract and a wedge is not an exception. See
+`stack_dump_path`.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import time
@@ -90,6 +97,36 @@ def access_log_path() -> Path:
     return logs_dir() / "ui-access.log"
 
 
+#: `os_state` keys the wedge self-heal keeps (spec §4). HERE, in the leaf module both
+#: readers already import, so the daemon that writes them and the doctor check that
+#: reports them cannot drift onto two spellings — and so neither has to import the other.
+#: `UI_HEALTHZ_OK_AT` is the "this dashboard was once serving" sighting that stops a
+#: machine with no `jarvis ui` being restarted every tick.
+UI_HEALTHZ_OK_AT = "ui_healthz_ok_at"
+UI_WEDGE_RESTARTS = "ui_wedge_restarts"
+UI_WEDGE_CAPPED_AT = "ui_wedge_capped_at"
+
+
+def stack_dump_path() -> Path:
+    """Every thread's Python stack, written by the dashboard about ITSELF.
+
+    §3 of
+    docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md:
+    the wedge produced no exception, so there was nothing for `record_error` to write and
+    `py-spy` could not attach (ptrace not permitted) — a self-dump is the only way to get
+    the frames at all. A FILE OF ITS OWN rather than a record in `ui.log`: the `[ERROR]`
+    format there is a parsed contract with three readers (kn-57fb4919), and a wedge is
+    not an unhandled exception.
+    """
+    return logs_dir() / "ui-stacks.log"
+
+
+def wedge_stamp_path() -> Path:
+    """The small JSON the daemon and `jarvis doctor` read back: when the dashboard first
+    tripped, the limiter figures at that moment, and where the stacks are."""
+    return logs_dir() / "ui-wedge.json"
+
+
 # -- writing ------------------------------------------------------------------------
 
 def _append(path: Path, text: str) -> None:
@@ -130,6 +167,88 @@ def record_access(method: str, path: str, status: int, duration_ms: float) -> No
     stamp = time.strftime(_STAMP, time.localtime())
     _append(access_log_path(),
             f"{stamp} [{status}] {method} {path} {duration_ms:.0f}ms\n")
+
+
+def dump_stacks(note: str = "") -> Path | None:
+    """Append every live thread's Python stack to `stack_dump_path()`.
+
+    `faulthandler.dump_traceback(all_threads=True)` needs a real file descriptor, so the
+    file is opened rather than handed a buffer; `sys._current_frames` is the fallback for
+    an environment where faulthandler cannot write (a captured stdout, a closed fd).
+
+    Never raises — `_append`'s rule (a logger that can take the dashboard down is worse
+    than no logger), and here it is load-bearing: a failed dump must still leave the 503
+    answerable. Rotates at `MAX_BYTES` into one `.1` sibling, so a flapping wedge cannot
+    fill the state directory.
+    """
+    path = stack_dump_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size >= MAX_BYTES:
+            path.replace(path.with_name(path.name + ".1"))
+        stamp = time.strftime(_STAMP, time.localtime())
+        with path.open("a") as f:
+            f.write(f"\n{stamp} [WEDGE] {note}\n")
+            f.flush()
+            try:
+                import faulthandler
+
+                faulthandler.dump_traceback(file=f, all_threads=True)
+            except Exception:  # noqa: BLE001 — fall back to the pure-Python dump
+                import sys
+
+                for ident, frame in sys._current_frames().items():
+                    f.write(f"\nThread {ident}:\n")
+                    f.write("".join(traceback.format_stack(frame)))
+        return path
+    except Exception:  # noqa: BLE001 — see above
+        return None
+
+
+def record_wedge(*, limiter: dict[str, int], uptime_seconds: float,
+                 version: str = "") -> dict[str, object]:
+    """Dump the stacks and (re)write the wedge stamp. Returns the stamp as written.
+
+    `since` is the FIRST trip's time: a wedge that keeps failing keeps dumping, and the
+    useful fact is when the dashboard stopped serving, not when it last said so. Never
+    raises, for `dump_stacks`' reason.
+    """
+    stamp: dict[str, object] = {
+        "since": time.time(), "at": time.time(), "limiter": dict(limiter),
+        "uptime_seconds": round(uptime_seconds, 1), "version": version,
+        "dump": str(stack_dump_path()),
+    }
+    previous = read_wedge()
+    if previous and previous.get("since"):
+        stamp["since"] = previous["since"]
+    note = (f"pool wedged — limiter borrowed={limiter.get('borrowed')} "
+            f"available={limiter.get('available')} total={limiter.get('total')} "
+            f"waiting={limiter.get('waiting')} uptime={int(uptime_seconds)}s "
+            f"version={version or 'unknown'}")
+    dump = dump_stacks(note)
+    if dump is None:
+        stamp["dump"] = ""
+    try:
+        path = wedge_stamp_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(stamp, indent=2) + "\n")
+        tmp.replace(path)
+    except Exception:  # noqa: BLE001 — a failed stamp must not break the 503
+        pass
+    return stamp
+
+
+def read_wedge() -> dict[str, object] | None:
+    """The wedge stamp, or None when the dashboard has never tripped.
+
+    Corrupt JSON reads as None, `release.read_marker`'s rule: no reader should act on
+    garbage, and the doctor check is what reports the file itself being wrong.
+    """
+    try:
+        return json.loads(wedge_stamp_path().read_text())
+    except (OSError, ValueError):
+        return None
 
 
 # -- reading ------------------------------------------------------------------------

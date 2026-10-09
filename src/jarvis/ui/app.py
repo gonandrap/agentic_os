@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import time
 from collections import Counter
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote, urlencode
@@ -273,7 +274,10 @@ def _in_zone(raw: str, zone: str) -> float | str:
 #: 15-second refresh poll — left in, it is ~95% of the lines and buries the thing the
 #: access log exists to show: which pages the *user* actually opened. Failures are logged
 #: whatever the path, so a broken poll still leaves a trace.
-QUIET_PATHS = ("/api/status",)
+#: `/healthz` is the daemon's liveness poll (spec §1) and is quiet for `/api/status`'
+#: reason: a 5-second poll would bury the user's navigation. A FAILING probe still logs,
+#: because `access_log` logs any status >= 400.
+QUIET_PATHS = ("/api/status", "/healthz")
 
 #: The same rule for polls whose path carries an id, so an exact match cannot express it:
 #: `/api/wo/{project}/{wo_id}/live` fires every two seconds while a debugging page is
@@ -286,6 +290,198 @@ QUIET_SUFFIXES = ("/live",)
 def _quiet(path: str) -> bool:
     """Is a SUCCESSFUL request on this path beneath the access log's notice? See above."""
     return path in QUIET_PATHS or path.endswith(QUIET_SUFFIXES)
+
+
+# -- the dashboard's own liveness (spec §1, §2, §3 of
+# docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md)
+
+
+def _routed(request) -> bool:
+    """Does this request match a route? The measured fault's own discriminator: unrouted
+    paths answered 404 in 1ms while every routed page hung, so counting them would make a
+    stream of 404s read as a wedge (spec §1). Starlette 1.3.1: `route.matches(scope)`
+    returns `(Match, scope)` and only `Match.FULL` is a hit."""
+    from starlette.routing import Match
+
+    try:
+        for route in request.app.routes:
+            if route.matches(request.scope)[0] == Match.FULL:
+                return True
+    except Exception:  # noqa: BLE001 — never raise on the request path
+        return False
+    return False
+
+
+def _pool_ping() -> bool:
+    """The probe's whole job in the thread: return. No I/O, no lock, nothing that can
+    fail for a reason other than the pool itself."""
+    return True
+
+
+class PoolProbe:
+    """Is the one anyio threadpool every page handler runs in still serving?
+
+    The dashboard wedged for ~4 minutes with `systemctl` reporting `active (running)`,
+    the event loop healthy (unrouted paths answered 404 in 1ms) and every routed page
+    silent, because every page handler is a sync `def` and they all share this pool. No
+    error was raised, so every existing surface — `uilog.record_error`, the access log,
+    `Daemon.check_ui_log`, `invariants.check_ui_healthy` — stayed silent: the OS had a
+    negative liveness signal only, and it was never written. This is the positive one.
+
+    WHY THE PROBE CANNOT MAKE THINGS WORSE: a token is only taken once the limiter grants
+    it, so cancelling an acquire that is still *waiting* releases nothing, because nothing
+    was borrowed. The shielded hold at `anyio/_backends/_asyncio.py:2558-2559` applies to
+    a token already granted — to a job already running in a thread — and this probe's job
+    is a `return`, so it never sits there. Worst case under a wedge: one more waiter,
+    timed out and cancelled. A rig on anyio 4.14.1 measured `borrowed_tokens 0 /
+    available 40` after 120 cancellations of exactly this shape.
+
+    All state is in process memory. Nothing here writes to a database, and nothing on the
+    request path reads one.
+    """
+
+    def __init__(self) -> None:
+        from .. import bugreport
+        from ..catalog import UiHealthConfig
+
+        self.started_at = time.time()
+        # The settings the probe last resolved. `/healthz` reads THIS rather than the
+        # catalog: resolving one would be a filesystem read on the event loop, in the
+        # endpoint whose contract is that it touches nothing (spec §1).
+        self.cfg = UiHealthConfig()
+        self.last_ok: float | None = None
+        self.consecutive_failures = 0
+        self.wedged_since: float | None = None
+        self.stack_dump: str | None = None
+        # Routed requests in flight, keyed by a counter: a monotonic start time and a
+        # label. Registered on the EVENT LOOP by `access_log`, where a wedged pool cannot
+        # hide them — the shipped probe saw a saturated limiter only, and production was
+        # never saturated (spec §1, kn-5b1be5c3).
+        self._inflight: dict[int, tuple[float, str]] = {}
+        self._inflight_seq = 0
+        self.probe_failure_reason = ""
+        # Resolved once, here: `jarvis_version` shells out to git on its first call, and
+        # `/healthz` must never be the request that pays for that. Swallowed, for the
+        # reason `instance_badge` swallows it: a version string must not be why the app
+        # fails to build.
+        try:
+            self.version = bugreport.jarvis_version()
+        except Exception:  # noqa: BLE001
+            self.version = ""
+
+    @staticmethod
+    def limiter_figures() -> dict[str, int]:
+        """The anyio capacity limiter every sync handler queues on. `available_tokens`
+        is on the limiter; `tasks_waiting` only on its statistics — checked against the
+        installed anyio 4.14.1 rather than taken from prose."""
+        import anyio.to_thread
+
+        try:
+            limiter = anyio.to_thread.current_default_thread_limiter()
+            stats = limiter.statistics()
+            return {"borrowed": int(stats.borrowed_tokens),
+                    "available": int(limiter.available_tokens),
+                    "total": int(stats.total_tokens),
+                    "waiting": int(stats.tasks_waiting)}
+        except Exception:  # noqa: BLE001 — no loop, or an anyio that moved
+            return {"borrowed": 0, "available": 0, "total": 0, "waiting": 0}
+
+    def begin(self, method: str, path: str) -> int:
+        """Register one routed request. Dict writes only: this is on the request path and
+        may never raise (spec §1)."""
+        self._inflight_seq += 1
+        key = self._inflight_seq
+        self._inflight[key] = (time.monotonic(), f"{method} {path}")
+        return key
+
+    def end(self, key: int) -> None:
+        self._inflight.pop(key, None)
+
+    def oldest_inflight(self) -> tuple[float, str] | None:
+        """Age in seconds and label of the longest-running routed request, or None."""
+        entries = list(self._inflight.values())
+        if not entries:
+            return None
+        started, label = min(entries, key=lambda e: e[0])
+        return (time.monotonic() - started, label)
+
+    @property
+    def pool_healthy(self) -> bool:
+        """The last probe ROUND passed — the pool round-trip AND the in-flight check,
+        whichever of the two would have failed. A probe that has never run reads as
+        healthy: silence from a probe that was never started is not evidence of a wedge."""
+        return self.consecutive_failures == 0
+
+    def wedged(self, trip_threshold: int) -> bool:
+        """Failed often enough to be a wedge rather than one slow moment. This, and not
+        the HTTP status, is what the daemon acts on."""
+        return self.consecutive_failures >= trip_threshold
+
+    def payload(self, cfg) -> dict:
+        now = time.time()
+        oldest = self.oldest_inflight()
+        # No `version` and no `stack_dump`: `/healthz` is unauthenticated (review round 1).
+        return {
+            "pool_healthy": self.pool_healthy,
+            "wedged": self.wedged(cfg.trip_threshold),
+            "enabled": cfg.enabled,
+            "limiter": self.limiter_figures(),
+            "last_ok_age_seconds": (None if self.last_ok is None
+                                    else round(now - self.last_ok, 3)),
+            "consecutive_failures": self.consecutive_failures,
+            "uptime_seconds": round(now - self.started_at, 1),
+            "wedged_since": self.wedged_since,
+            "inflight": len(self._inflight),
+            "oldest_inflight_seconds": (None if oldest is None else round(oldest[0], 3)),
+            "probe_failure_reason": self.probe_failure_reason,
+        }
+
+    async def step(self, cfg) -> bool:
+        """One round, two checks: the pool round-trip, and whether any routed request has
+        been in flight longer than the timeout (spec §1)."""
+        import anyio
+
+        try:
+            with anyio.fail_after(cfg.probe_timeout_seconds):
+                await anyio.to_thread.run_sync(_pool_ping)
+        except TimeoutError:
+            return self._fail("pool_timeout", cfg)
+        oldest = self.oldest_inflight()
+        if oldest is not None and oldest[0] > cfg.probe_timeout_seconds:
+            return self._fail("inflight_stall", cfg)
+        self.last_ok = time.time()
+        self.consecutive_failures = 0
+        self.probe_failure_reason = ""
+        return True
+
+    def _fail(self, reason: str, cfg) -> bool:
+        self.probe_failure_reason = reason
+        self.consecutive_failures += 1
+        if self.wedged(cfg.trip_threshold):
+            self._trip()
+        return False
+
+    def _trip(self) -> None:
+        """Dump this process's stacks — the only way to get the frames at all, since
+        py-spy could not attach. Every trip dumps, so a wedge that stays wedged keeps
+        producing evidence; `uilog` rotates the file so it cannot fill the directory."""
+        stamp = uilog.record_wedge(limiter=self.limiter_figures(),
+                                   uptime_seconds=time.time() - self.started_at,
+                                   version=self.version)
+        self.wedged_since = stamp.get("since")
+        self.stack_dump = stamp.get("dump") or None
+
+    async def run(self) -> None:
+        """The lifespan task: probe, sleep, repeat. Cancelled on shutdown."""
+        import anyio
+
+        while True:
+            # Re-resolved every round, so `jarvis config set os.ui_health.…` is in force
+            # without restarting the dashboard (`ops.APPLY_RULES` calls these `hot`).
+            self.cfg = ops.ui_health_config()
+            if self.cfg.enabled:
+                await self.step(self.cfg)
+            await anyio.sleep(max(1, self.cfg.probe_interval_seconds))
 
 
 def _stale_link_hint(name: str, wo_id: str) -> str:
@@ -825,7 +1021,47 @@ def wiring_groups(scope: str, *, refresh: bool = False) -> dict[str, object]:
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="Jarvis", docs_url=None, redoc_url=None)
+    probe = PoolProbe()
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        """Owns the liveness probe task (spec §2).
+
+        A lifespan rather than `cli.cmd_ui`, so it starts for ANY server of this app and
+        for `TestClient` used as a context manager, and is cancelled on shutdown instead
+        of outliving the server. A `TestClient` built WITHOUT the context manager runs no
+        lifespan, so the probe never starts and leaves no stray task — `/healthz` then
+        reports a pool it has no evidence against, which is what the 18 tests in
+        tests/test_ui.py see.
+        """
+        import anyio
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(probe.run)
+            try:
+                yield
+            finally:
+                tg.cancel_scope.cancel()
+
+    app = FastAPI(title="Jarvis", docs_url=None, redoc_url=None, lifespan=lifespan)
+    app.state.pool_probe = probe
+
+    @app.get("/healthz")
+    async def healthz() -> JSONResponse:
+        """Does the dashboard still serve? (spec §1)
+
+        `async def`, and that is the whole point: a sync `def` would be queued onto the
+        very pool it reports on and would hang exactly when it is needed. It touches no
+        store, no catalog read on the request path, no template and not `render()` (which
+        opens a `NeoStore` per request) — everything it reports is already in process
+        memory, written by the probe task.
+
+        503 when the last round-trip failed, for a human with `curl`. The daemon reads
+        the PAYLOAD and treats "times out" and "reports wedged" identically, so the
+        status code is never the only signal.
+        """
+        body = probe.payload(probe.cfg)
+        return JSONResponse(body, status_code=200 if body["pool_healthy"] else 503)
 
     @app.middleware("http")
     async def no_store(request: Request, call_next):
@@ -962,20 +1198,29 @@ def create_app() -> FastAPI:
         server error" impossible to place in time.
         """
         t0 = time.perf_counter()
+        # Runs on the event loop, before `call_next` queues a sync handler onto the pool:
+        # the one place a wedged request is still visible (spec §1).
+        key = (probe.begin(request.method, request.url.path)
+               if request.url.path != "/healthz" and _routed(request) else None)
         try:
-            response = await call_next(request)
-        except Exception:
-            # The handler above renders the page, but it runs *outside* this middleware
-            # (ServerErrorMiddleware is outermost), so this is the only place that sees
-            # both the failure and the elapsed time.
-            uilog.record_access(request.method, _rel_url(request), 500,
-                                (time.perf_counter() - t0) * 1000)
-            raise
-        if response.status_code >= 400 or not _quiet(request.url.path):
-            uilog.record_access(request.method, _rel_url(request),
-                                response.status_code,
-                                (time.perf_counter() - t0) * 1000)
-        return response
+            try:
+                response = await call_next(request)
+            except Exception:
+                # The handler above renders the page, but it runs *outside* this middleware
+                # (ServerErrorMiddleware is outermost), so this is the only place that sees
+                # both the failure and the elapsed time.
+                uilog.record_access(request.method, _rel_url(request), 500,
+                                    (time.perf_counter() - t0) * 1000)
+                raise
+            if response.status_code >= 400 or not _quiet(request.url.path):
+                uilog.record_access(request.method, _rel_url(request),
+                                    response.status_code,
+                                    (time.perf_counter() - t0) * 1000)
+            return response
+        finally:
+            # A 500 and a cancellation both clean up (spec §1).
+            if key is not None:
+                probe.end(key)
 
     # -- pages ------------------------------------------------------------------
 
