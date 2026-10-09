@@ -1050,7 +1050,14 @@ def test_a_live_hold_buys_no_second_refusal_and_expires_by_the_clock(
     """A recorded hold nobody reads is a quieter retry storm."""
     _enable(catalog_file)
     _wo(store, status="running", description="FORCE_HEALTH_CLEAR")
-    fake_claude.health_rate_limited(reset="11:50pm (America/Los_Angeles)")
+    # THE RELATIVE FORM, and that is what makes this test deterministic. `reset_at` is
+    # resolved against the REAL clock (`claude_cli.usage_limit`), while the hold is read
+    # against this file's hand-advanced `db.now` — so a wall-clock reset time put the
+    # second sweep 4 fake minutes past a real deadline, and the assertion below failed
+    # for every run that started between 23:46 and 23:50 America/Los_Angeles. "in 5h" is
+    # longer than the 4 minutes before the second sweep and shorter than the 25 hours
+    # before the third, which is exactly what the three phases need.
+    fake_claude.health_rate_limited(reset="in 5h")
     daemon = started()
 
     _sweep(daemon, clock)
@@ -1202,6 +1209,200 @@ def test_the_tick_hands_the_health_sweep_the_reading_it_already_took(
     while daemon.health_sweeping and time.monotonic() < deadline:
         time.sleep(0.01)
     assert seen["state"] is shut
+
+
+# -- the STUCK sweep: §§1-2 of docs/superpowers/specs/2026-09-30-an-order-that-stops-
+# moving-gets-investigated.md.
+#
+# Its own section and its own fixtures rather than the sweep's above: this pass ships
+# ENABLED and runs with `supervisor.enabled` off, so `_enable` has nothing to do with it.
+# The helpers are shared with tests/test_investigation_orders.py, tests/test_fleet_pause.py
+# and tests/test_budget.py, which import them by name.
+
+HOUR = 3600.0
+
+
+def stuck_catalog(tmp_path, projects: list[dict],
+                  name: str = "stuck-catalog.json", **os_extra):
+    """A REGISTERED catalog carrying `fleet_health` at its shipped defaults.
+
+    Registration is half of it: `ops.create_investigation_order` resolves a project
+    through the central store, so a catalog file alone would leave the sweep with
+    nowhere to file (`test_cost_report.registered`'s shape).
+    """
+    from jarvis.central_store import CentralStore
+
+    path = tmp_path / name
+    path.write_text(json.dumps({
+        "os": {"defaults": {"model": "sonnet", "max_in_flight": 50},
+               "notifications": {"sinks": ["log"]}, **os_extra},
+        "projects": projects,
+    }))
+    central = CentralStore()
+    try:
+        for p in projects:
+            central.upsert_project(p["name"], p["path"], p["name"])
+        central.set_state("catalog_path", str(path))
+        central.conn.commit()
+    finally:
+        central.close()
+    return path
+
+
+@pytest.fixture()
+def stuck_os(jarvis_home, project, tmp_path):
+    cat = stuck_catalog(tmp_path, [{"name": "proj_a", "path": str(project),
+                                    "description": "test project"}])
+    store = ProjectStore(project)
+    try:
+        yield {"daemon": Daemon(load_catalog(cat)), "store": store, "path": cat}
+    finally:
+        store.close()
+
+
+def park_order(store, wo_id: str, status: str, hours: float) -> float:
+    """Back-date one order into `status` `hours` ago, on every clock the sweep reads.
+
+    SQL rather than an API for `tests/test_active_time.py::Record`'s reason: the store
+    stamps `db.now()` and there is no back-dating call.
+    """
+    store.set_status(wo_id, status)
+    at = time.time() - hours * HOUR
+    rows = store.conn.execute("SELECT id FROM wo_state_spans WHERE order_id=? "
+                              "ORDER BY id", (wo_id,)).fetchall()
+    for n, row in enumerate(reversed(rows)):
+        store.conn.execute("UPDATE wo_state_spans SET ts=? WHERE id=?",
+                           (at - n, row["id"]))
+    store.conn.execute("UPDATE wo_events SET ts=? WHERE wo_id=?", (at, wo_id))
+    store.conn.execute("UPDATE work_orders SET created_at=?, updated_at=? WHERE id=?",
+                       (at, at, wo_id))
+    store.conn.commit()
+    return at
+
+
+def usage_hold(store, wo_id: str, started: float, ended: float | None = None) -> None:
+    """One usage-limit hold on this order's timeline, open unless `ended` is given."""
+    from jarvis.worker_session import PAUSE_USAGE_LIMIT
+
+    events = [("turn_paused", {"reason": PAUSE_USAGE_LIMIT, "seq": 1}, started)]
+    if ended is not None:
+        events.append(("turn_resumed", {"retried_seq": 1}, ended))
+    for kind, payload, at in events:
+        store.add_event(wo_id, kind, payload)
+        store.conn.execute(
+            "UPDATE wo_events SET ts=? WHERE id=(SELECT MAX(id) FROM wo_events)", (at,))
+    store.conn.commit()
+
+
+def test_usage_limit_hold_is_not_stuck(stuck_os):
+    """§2: the account's window is the one hold that excludes an order outright."""
+    from jarvis import stuck
+    from jarvis.worker_session import PAUSE_USAGE_LIMIT
+
+    store = stuck_os["store"]
+    wo = ops.create_work_order("proj_a", "parked behind the window")
+    at = park_order(store, wo["id"], "waiting_pr_merge", hours=5)
+    usage_hold(store, wo["id"], started=at)
+
+    stuck_os["daemon"].stuck_tick(None)
+
+    assert ops.list_investigation_orders("proj_a", include_settled=True) == []
+    thresholds = {"waiting_pr_merge": 3 * HOUR}
+    judged = stuck.assess("waiting_pr_merge", 5 * HOUR, 5 * HOUR, 5 * HOUR,
+                          thresholds, 4 * HOUR, excluded_cause=PAUSE_USAGE_LIMIT)
+    assert judged.excluded == PAUSE_USAGE_LIMIT and not judged.stuck
+    # The same wall clock with nothing holding it IS stuck: the hold is the whole
+    # difference, which is what stops this passing on a threshold that can never fire.
+    assert stuck.assess("waiting_pr_merge", 5 * HOUR, 5 * HOUR, 0.0,
+                        thresholds, 4 * HOUR).stuck
+
+
+def test_held_seconds_do_not_count(stuck_os):
+    """§2: the threshold is on ACTIVE seconds, so a reopened window still discounts."""
+    import jarvis.catalog as catalog_mod
+    from jarvis import stuck
+
+    store, daemon = stuck_os["store"], stuck_os["daemon"]
+    # Held for all but half the shipped threshold, so `active_seconds` is what decides.
+    threshold = catalog_mod.DEFAULT_FLEET_HEALTH_THRESHOLDS["waiting_pr_merge"] * 60
+    wo = ops.create_work_order("proj_a", "held for almost all of its five hours")
+    at = park_order(store, wo["id"], "waiting_pr_merge", hours=5)
+    usage_hold(store, wo["id"], started=at, ended=at + 5 * HOUR - threshold / 2)
+
+    daemon.stuck_tick(None)
+    assert ops.list_investigation_orders("proj_a", include_settled=True) == []
+    judged = stuck.assess("waiting_pr_merge", 5 * HOUR, 5 * HOUR, 4 * HOUR,
+                          {"waiting_pr_merge": 3 * HOUR}, 4 * HOUR)
+    assert judged.active_seconds == HOUR and not judged.stuck
+
+    # Eight hours in status, the same four held: `active_seconds` alone now passes.
+    at = park_order(store, wo["id"], "waiting_pr_merge", hours=8)
+    usage_hold(store, wo["id"], started=at, ended=at + 4 * HOUR)
+    daemon.stuck_tick(None)
+    assert len(ops.list_investigation_orders("proj_a", include_settled=True)) == 1
+
+
+def test_assess_is_pure():
+    """§1: the predicate reaches no store, no model and not even the clock."""
+    import ast
+    from pathlib import Path
+
+    from jarvis import stuck
+
+    names: set[str] = set()
+    for node in ast.walk(ast.parse(Path(stuck.__file__).read_text())):
+        if isinstance(node, ast.Import):
+            names.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            names.add((node.module or "").lstrip(".").split(".")[0])
+            names.update(a.name for a in node.names)
+    forbidden = {"ops", "daemon", "claude_cli", "time"}
+    assert not names & forbidden, sorted(names & forbidden)
+    assert not [n for n in names if n.endswith("_store")], sorted(names)
+
+
+def test_a_projects_own_cadence_is_honoured(jarvis_home, project, tmp_path):
+    """Neo 1086 OVERRIDES §5: the cadence is a per-project catalog config. Neo 1148 set
+    the default to 60 ticks — 5 minutes at the default 5s poll interval, because a
+    30-minute cadence cannot see a 5-minute idle."""
+    import jarvis.catalog as catalog_mod
+    from jarvis import db
+    from jarvis.central_store import CentralStore
+
+    assert catalog_mod.DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS == 60
+    cat = load_catalog(stuck_catalog(
+        tmp_path, [{"name": "proj_a", "path": str(project),
+                    "fleet_health": {"sweep_every_ticks": 12}}],
+        name="stuck-cadence.json"))
+    assert cat.os.fleet_health.sweep_every_ticks == \
+        catalog_mod.DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS
+    cfg = cat.projects[0].fleet_health
+    assert cfg.sweep_every_ticks == 12
+    assert cfg.cooldown_minutes == catalog_mod.DEFAULT_FLEET_HEALTH_COOLDOWN_MINUTES
+
+    daemon = Daemon(cat)
+    assert daemon.stuck_cadence() == 12
+
+    def due(tick: int) -> list:
+        daemon.tick_count = tick
+        return [p.name for p in daemon.stuck_due_projects()]
+
+    assert due(1) == ["proj_a"]
+    assert due(2) == [], "not due again until its own 12 ticks have passed"
+    assert due(13) == ["proj_a"]
+
+    store = ProjectStore(project)
+    try:
+        wo = ops.create_work_order("proj_a", "parked")
+        park_order(store, wo["id"], "waiting_pr_merge", hours=5)
+    finally:
+        store.close()
+    daemon.stuck_tick(None)
+    central = CentralStore()
+    try:
+        assert db.from_json(central.get_state(Daemon.STUCK_RUN_KEY), {})["scanned"] == 1
+    finally:
+        central.close()
 
 
 # -- the free re-assertion: a stale look at a unit the OS can already explain -----------
