@@ -26,7 +26,7 @@
     <div class="sub">{{ r.reason }}</div>
     <div class="sub">what the record says blocks it: {{ r.blocker }}</div>
     {% if r.investigation %}
-    <div class="sub"><a href="/fo/{{ r.project }}/{{ r.investigation.id }}"
+    <div class="sub"><a href="{{ order_path(r.project, r.investigation.id) }}"
       class="mono">{{ r.investigation.id }}</a> · {{ r.investigation.status }}
       {%- if r.investigation.classification %} ·
       {{ r.investigation.classification }}{% endif %}</div>
@@ -58,7 +58,7 @@
       <td class="mono">{{ r.clock }}</td>
       <td class="mono">{{ r.excluded or '—' }}</td>
       <td class="mono">{% if r.investigation %}<a
-        href="/fo/{{ r.project }}/{{ r.investigation.id }}">{{ r.investigation.id }}</a>
+        href="{{ order_path(r.project, r.investigation.id) }}">{{ r.investigation.id }}</a>
         {{ r.investigation.classification }}{% else %}—{% endif %}</td>
     </tr>
     {% else %}

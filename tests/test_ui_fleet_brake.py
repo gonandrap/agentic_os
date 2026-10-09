@@ -167,6 +167,34 @@ def test_let_through_when_not_paused_is_flashed(client, project):
     assert _pause() is None
 
 
+@pytest.mark.parametrize("kind,segment", [("feature", "fo"), ("improvement", "io"),
+                                          ("investigation", "inv")])
+def test_the_allow_list_links_each_order_kind_to_its_own_page(client, project, kind,
+                                                              segment):
+    """Issue #997 in the banner: the strip branched on `fo-`, so an allow-listed
+    `io-`/`inv-` id fell through to `find_work_order`, resolved to None and lost its
+    link entirely."""
+    from jarvis.ui.app import _order_href
+
+    store = ProjectStore(project)
+    try:
+        row = store.create_feature_order("held by the brake", kind=kind)
+    finally:
+        store.close()
+
+    assert _order_href(row["id"]) == f"/{segment}/proj_a/{row['id']}"
+    ops.pause_fleet(reason="spend", allow=[row["id"]])
+    assert f'href="/{segment}/proj_a/{row["id"]}"' in client.get("/").text
+
+
+def test_an_order_that_no_longer_resolves_has_no_link(client):
+    """The function VALIDATES existence — a stale allow-list entry is text, not a 404."""
+    from jarvis.ui.app import _order_href
+
+    assert _order_href("io-nosuch00") is None
+    assert _order_href("wo-nosuch00") is None
+
+
 def test_resume_all_lifts_the_pause(client, project):
     ops.pause_fleet(reason="x")
     r = client.post("/fleet/resume", data={"next": "/project/proj_a"})

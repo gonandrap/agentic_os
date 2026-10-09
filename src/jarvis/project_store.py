@@ -494,6 +494,32 @@ def is_feature_order_id(unit_id: str) -> bool:
     spec above, which exists because three sites had grown their own `fo-` literal."""
     return unit_id.startswith(("fo-", "io-", "inv-"))
 
+
+#: The URL segment each order id prefix is rendered under. DERIVED from the prefixes the
+#: store mints (`FO_ID_PREFIXES`) rather than written out again: a fifth kind must not be
+#: able to get a page and still link to `/fo/`. The segment IS the prefix for every kind,
+#: which is why this is a set and not a map.
+ORDER_SEGMENTS = {"wo", "fo", *FO_ID_PREFIXES.values()}
+
+
+def order_path(project: str, order_id: str) -> str:
+    """The page that renders this order, from its id PREFIX.
+
+    The ONE derivation every surface links through — here, beside the prefixes it reads
+    and the shared id predicate above, because `search.py` needs it too and must not
+    import the FastAPI module. GitHub issue #997: three templates built
+    `/fo/<project>/<id>` for whatever they had, so an `io-`/`inv-` id rendered with the
+    feature template — "Release this plan?", an empty child tree — and the decision the
+    user owed was only on its own page.
+    """
+    prefix = order_id.split("-", 1)[0]
+    # Unknown prefix: the FEATURE page, never `/wo/`. An id that names no kind we know is
+    # a `feature_orders` row far more often than a work order, and that page refuses by
+    # kind; `/wo/` would 404 with nothing to say.
+    segment = prefix if prefix in ORDER_SEGMENTS else "fo"
+    return f"/{segment}/{project}/{order_id}"
+
+
 # Work-order metadata key: this work order was authorised by whoever filed it, so the
 # worker must not spend a round trip asking whether it may do the thing it was sent to
 # do. Value: {"by": "neo", "scope": "<what is pre-approved, in words>", ...}.

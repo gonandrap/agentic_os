@@ -164,6 +164,31 @@ def test_every_hit_is_actionable_from_either_surface(started):
     assert seen == set(search.KINDS)
 
 
+@pytest.mark.parametrize("kind,segment,verb", [
+    ("feature", "fo", "jarvis fo show"),
+    ("improvement", "io", "jarvis io show"),
+    ("investigation", "inv", "jarvis investigate show"),
+])
+def test_a_feature_orders_hit_points_at_its_own_kind(started, project, kind, segment,
+                                                     verb):
+    """Issue #997, the search surface: every `feature_orders` row printed `/fo/` and
+    `jarvis fo show`, so an improvement order named a command that refuses the id."""
+    store = ProjectStore(project)
+    try:
+        row = store.create_feature_order("rebuild the login spinner", "a big one",
+                                         kind=kind)
+    finally:
+        store.close()
+
+    hits = [h for h in search.search("login spinner") if h["id"] == row["id"]]
+
+    assert len(hits) == 1
+    assert hits[0]["url"] == f"/{segment}/proj_a/{row['id']}"
+    assert hits[0]["ref"] == f"{verb} {row['id']}"
+    parser = build_parser()
+    parser.parse_args(hits[0]["ref"].split()[1:])
+
+
 def test_kind_filter_and_unknown_kind(started):
     _wo("fix the login spinner")
     assert search.search("login", kinds=("backlog",)) == []
