@@ -19,7 +19,7 @@ import json
 
 import pytest
 
-from jarvis import agent_usage, bill as bill_mod, ops, usage
+from jarvis import agent_usage, bill as bill_mod, ops, project_store, usage
 from jarvis.central_store import CentralStore
 from jarvis.project_store import ProjectStore
 
@@ -1414,3 +1414,165 @@ def test_the_absent_sentences_have_one_source(store, wo):
     assert set(keys) == {bill_mod.WORKER, bill_mod.JARVIS, bill_mod.SUBPROC}
     assert set(bill_mod.ABSENT_NOTES) == {bill_mod.WORKER, bill_mod.JARVIS,
                                           bill_mod.SUBPROC, bill_mod.OBSERVE}
+
+
+# -- a compaction is counted once ------------------------------------------------------
+# docs/superpowers/specs/2026-10-08-count-a-compaction-once.md
+
+
+def compact_turn(store, wo_id: str, usage: dict | None, state: str = "done") -> dict:
+    """A `compact` turn row: the OS's `/compact`, recorded as a turn like any other."""
+    turn = store.create_turn(wo_id, kind=project_store.COMPACT_TURN, prompt="/compact")
+    if state == "running":
+        return store.get_turn(turn["id"])
+    store.finish_turn(turn["id"], state, result="r",
+                      cost_usd=usage["total_cost_usd"] if usage else None,
+                      num_turns=1,
+                      usage_json=json.dumps(usage) if usage else None)
+    return store.get_turn(turn["id"])
+
+
+def compaction_call(wo_id: str, ts: float | None = None, cost: float = 0.3) -> None:
+    os_call(wo_id, agent_usage.COMPACTION, label="compaction", ts=ts, cost=cost,
+            question_id=None)
+
+
+COMPACTION_TOKENS = 10 + 5_000 + 20_000 + 900
+TURN_TOKENS = 2 + 2_558 + 45_689 + 941
+
+
+def test_compaction_is_not_charged_to_the_worker(store, wo):
+    """One compaction, one charge: on the Jarvis half, never on both."""
+    add_turn(store, wo["id"], recorded_usage(0.05))
+    add_turn(store, wo["id"], recorded_usage(0.07))
+    compact_turn(store, wo["id"], recorded_usage(0.3))
+    compaction_call(wo["id"])
+
+    b = ops.bill(wo["id"])
+    actors = {line["key"]: line for line in b["actors"]}
+
+    assert b["total"]["tokens"]["total"] == 2 * TURN_TOKENS + COMPACTION_TOKENS
+    assert actors["worker"]["tokens"]["total"] == 2 * TURN_TOKENS
+    assert actors["jarvis"]["tokens"]["total"] == COMPACTION_TOKENS
+
+
+def test_compaction_keeps_its_turn_line(store, wo):
+    """The turn does not disappear from the by-turn table; it changes actor."""
+    first = add_turn(store, wo["id"], recorded_usage(0.05))
+    at(store, first["id"], 1_000, 1_090)
+    compact = compact_turn(store, wo["id"], recorded_usage(0.3))
+    at(store, compact["id"], 1_100, 1_190)
+    compaction_call(wo["id"], ts=1_150)
+
+    b = ops.bill(wo["id"])
+    line = next(line for line in b["turns"] if line["key"] == str(compact["seq"]))
+
+    assert [child["key"] for child in line["children"]] \
+        == [f"{compact['seq']}/{bill_mod.JARVIS}"]
+    assert line["tokens"]["total"] == COMPACTION_TOKENS
+
+
+def test_compaction_does_not_mask_a_transcript_gap(store, wo, transcripts):
+    """`recorded` inflated by a compaction swallowed a real gap under `max(0, …)`."""
+    give_session(store, wo["id"], "sess-compact-gap")
+    transcripts("sess-compact-gap",
+                [assistant_row("m1", write=20_000, read=45_689, out=941)])
+    add_turn(store, wo["id"], recorded_usage(0.05))
+    add_turn(store, wo["id"], None)
+    compact_turn(store, wo["id"], dict(recorded_usage(0.3), cache_write=100_000))
+
+    b = ops.bill(wo["id"])
+    labels = {leaf["label"]: leaf for leaf in leaves({"children": b["actors"]})}
+
+    gap = labels["turns with no result JSON left"]
+    assert gap["tokens"]["cache_write"] == 20_000 - 2_558
+
+
+def test_in_flight_compaction_does_not_mislabel_the_gap(store, wo, transcripts):
+    """A running compact turn is not one of the worker's unrecorded turns."""
+    give_session(store, wo["id"], "sess-compact-live")
+    transcripts("sess-compact-live",
+                [assistant_row("m1", write=50_000, out=2_000, at=1_005)])
+    lost = add_turn(store, wo["id"], None)
+    at(store, lost["id"], 1_000, 1_090)
+    running = compact_turn(store, wo["id"], None, state="running")
+    store.conn.execute("UPDATE wo_turns SET started_at=? WHERE id=?",
+                       (1_100.0, running["id"]))
+    store.conn.commit()
+
+    b = ops.bill(wo["id"])
+    labels = {leaf["label"]: leaf for leaf in leaves({"children": b["actors"]})}
+
+    gap = labels["turns with no result JSON left"]
+    assert gap["calls"] == 1
+
+
+def test_only_compact_turns_reads_as_no_turns_on_record(store, wo, transcripts):
+    """An order whose only row is a compaction has no worker turns at all."""
+    give_session(store, wo["id"], "sess-compact-only")
+    transcripts("sess-compact-only",
+                [assistant_row("m1", write=50_000, read=1_000, out=2_000)])
+    compact_turn(store, wo["id"], recorded_usage(0.3))
+
+    b = ops.bill(wo["id"])
+    labels = {leaf["label"]: leaf for leaf in leaves({"children": b["actors"]})}
+
+    assert "the conversation, from its transcript" in labels
+    assert "turns with no result JSON left" not in labels
+
+
+def _double_counted(*, worker_child: bool, jarvis_child: bool) -> dict:
+    """A payload shaped like the defect: a compact turn with one or both children."""
+    seq = 3
+    children = []
+    if worker_child:
+        children.append(bill_mod._line(f"{seq}/{bill_mod.WORKER}", "the worker"))
+    if jarvis_child:
+        jarvis = bill_mod._line(f"{seq}/{bill_mod.JARVIS}", "jarvis")
+        jarvis["children"].append(bill_mod._line(
+            f"{seq}/{bill_mod.JARVIS}/{agent_usage.describe(agent_usage.COMPACTION)}",
+            agent_usage.describe(agent_usage.COMPACTION)))
+        children.append(jarvis)
+    line = bill_mod._line(str(seq), f"turn {seq}")
+    line["children"] = children
+    return {
+        "total": bill_mod._line("total", "total"),
+        "turns": [line],
+        "actors": [],
+        "turn_rows": [{"seq": seq, "kind": project_store.COMPACT_TURN,
+                       "recorded": True}],
+    }
+
+
+def test_double_counted_compaction_fails_reconcile():
+    """A check the fold invariants cannot make: `wo_turns` against `agent_calls`."""
+    both = bill_mod.reconcile(_double_counted(worker_child=True, jarvis_child=True))
+
+    assert not both["balanced"]
+    assert any("turn 3" in p and "counted twice" in p for p in both["problems"])
+    # The worker child alone is a pruned `agent_calls` row; the Jarvis child alone is
+    # the fixed state. Neither is a double count.
+    for kwargs in ({"worker_child": True, "jarvis_child": False},
+                   {"worker_child": False, "jarvis_child": True}):
+        checks = bill_mod.reconcile(_double_counted(**kwargs))
+        assert checks["balanced"], checks["problems"]
+
+
+def test_shortfall_check_survives_a_compaction(store, wo, transcripts):
+    """A compaction sets no `calls_cover`, which disabled the shortfall check whole."""
+    give_session(store, wo["id"], "sess-compact-short")
+    compact = compact_turn(store, wo["id"], recorded_usage(0.3))
+    at(store, compact["id"], 1_000, 1_090)
+    inflated = add_turn(store, wo["id"], dict(recorded_usage(2.5), usage_v=3, input=0,
+                                              cache_write=500_000,
+                                              cache_read=9_000_000, output=36_000,
+                                              cache_1h=0, cache_5m=500_000))
+    at(store, inflated["id"], 1_200, 1_290)
+    transcripts("sess-compact-short", [
+        assistant_row("m1", write=100_000, read=1_000_000, out=6_000, at=1_205),
+    ])
+
+    b = ops.bill(wo["id"])
+
+    assert not b["checks"]["balanced"]
+    assert any("everything inside it" in p for p in b["checks"]["problems"])
