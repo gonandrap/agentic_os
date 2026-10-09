@@ -152,6 +152,11 @@
     {{ tools.totals.token_basis.chars }} estimated from characters ·
     {{ tools.excluded.sessions_walked }}
     transcript{{ 's' if tools.excluded.sessions_walked != 1 }} read
+    {# What the window hid, from the same payload key the CLI prints. Silent when zero:
+       nothing was hidden, so there is nothing to disclose. #}
+    {%- if tools.excluded.outside_window %} ·
+    {{ tools.excluded.outside_window }} tool results outside the window, excluded
+    {%- endif %}
   </p>
   {% for note in tools.notes %}
   <p class="sub" style="margin: 4px 0 0;">{{ note[0]|upper }}{{ note[1:] }}.</p>

@@ -37,6 +37,7 @@ from jarvis.catalog import CatalogError, parse_catalog
 from jarvis.claude_cli import turn_args
 from jarvis.daemon import Daemon
 from jarvis.project_store import (
+    COMPACT_TURN,
     FO_OPEN_STATUSES,
     FO_STATUSES,
     NOT_RETRIED,
@@ -122,15 +123,23 @@ def worker_calls(fake_claude) -> list[dict]:
                                       or "--resume" in c["argv"])]
 
 
-def bill_the_turn(store: ProjectStore, wo_id: str, usd: float) -> None:
+def bill_the_turn(store: ProjectStore, wo_id: str, usd: float, *,
+                  kind: str = "message", usage_v: int | None = None,
+                  outfile: str = "") -> None:
     """Charge a settled turn `usd`, the way a reaped turn's envelope would.
 
     Writes the column `budget.spent` sums rather than going through a fake turn, so a
     test about the ARITHMETIC of the ceiling is not also a test of the transport.
     """
-    turn = store.create_turn(wo_id, kind="message", prompt="work")
+    turn = store.create_turn(wo_id, kind=kind, prompt="work")
+    if outfile:
+        store.conn.execute("UPDATE wo_turns SET outfile=? WHERE id=?",
+                           (outfile, turn["id"]))
+    envelope: dict = {"total_cost_usd": usd}
+    if usage_v is not None:
+        envelope["usage_v"] = usage_v
     store.finish_turn(turn["id"], "done", result="done", cost_usd=usd,
-                      usage_json=json.dumps({"total_cost_usd": usd}))
+                      usage_json=json.dumps(envelope))
 
 
 # -- the flag, and what the CLI does with it ------------------------------------------
@@ -218,6 +227,36 @@ def test_the_ceiling_counts_both_halves_of_the_bill(started, store):
     assert spend.jarvis_usd == 1.0
     assert cap is not None
     assert cap.remaining_usd == 6.0
+
+
+def test_a_compaction_is_counted_once_against_the_ceiling(started, store):
+    """docs/superpowers/specs/2026-10-08-count-a-compaction-once.md §2."""
+    from jarvis.central_store import CentralStore
+
+    wo = ops.create_work_order("proj_a", "compacted", description="do it",
+                               budget_usd=10.0)
+    bill_the_turn(store, wo["id"], 3.0)
+    bill_the_turn(store, wo["id"], 1.5, kind=COMPACT_TURN)
+    central = CentralStore()
+    try:
+        central.add_agent_call("compaction", label="compaction", model="sonnet",
+                               project="proj_a", wo_id=wo["id"], ok=True,
+                               usage={"total_cost_usd": 1.5})
+        spend = budget.spent(store, central, wo["id"])
+    finally:
+        central.close()
+    assert spend.worker_usd == 3.0
+    assert spend.jarvis_usd == 1.5
+    assert spend.total_usd == 4.5
+
+
+def test_a_stale_compact_turn_still_fires_the_repair(started, store):
+    """The staleness aggregate must keep seeing every row, compact ones included."""
+    wo = ops.create_work_order("proj_a", "stale compact", description="do it")
+    bill_the_turn(store, wo["id"], 1.5, kind=COMPACT_TURN, usage_v=2,
+                  outfile="/nonexistent/turn.json")
+
+    assert budget._worker_row(store, wo["id"])["stale"] == 1
 
 
 def test_a_ceiling_re_reads_turns_counted_as_the_whole_session(started, store,
@@ -1054,6 +1093,35 @@ def test_the_post_condition_exempts_the_window_the_settler_declines(started, sto
     store.set_status(wo["id"], "running")
     assert [v.invariant for v in check_budgets_are_enforced(store)] == [
         "INV-BUDGET-OVERSPENT"]
+
+
+@pytest.mark.parametrize("knob", [None, 7.5])
+def test_no_second_budget_knob(jarvis_home, project, tmp_path, knob):
+    """Neo's one condition on 1073: the stuck sweep passes NO `budget_usd`, so the only
+    per-session ceiling is `worker.investigation_budget_usd` (§4 of
+    docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md)."""
+    from test_health_sweep import park_order, stuck_catalog
+
+    from jarvis.catalog import load_catalog
+    from jarvis.daemon import Daemon
+
+    spec = {"name": "proj_a", "path": str(project)}
+    if knob is not None:
+        spec["worker"] = {"investigation_budget_usd": knob}
+    cat = load_catalog(stuck_catalog(tmp_path, [spec]))
+    store = ProjectStore(project)
+    try:
+        wo = ops.create_work_order("proj_a", "parked")
+        park_order(store, wo["id"], "waiting_pr_merge", hours=5)
+        Daemon(cat).stuck_tick(None)
+        opened = ops.list_investigation_orders("proj_a", include_settled=True)
+        assert len(opened) == 1
+        assert opened[0]["budget_usd"] == budget.investigation_default_for(
+            cat.project("proj_a"))
+        if knob is not None:
+            assert opened[0]["budget_usd"] == knob
+    finally:
+        store.close()
 
 
 # -- a family that is not a feature ----------------------------------------------------

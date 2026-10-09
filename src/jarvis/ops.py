@@ -721,6 +721,20 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                         "title": "settings drift", "status": "config",
                         "reason": f".claude/settings.json: {drift}",
                     })
+                # A STANDING CRITICAL VIOLATION IS AN ATTENTION ITEM — Neo 1084. Until
+                # this, a violation reached the inbox and nothing else, and `healthy`
+                # below is computed from attention alone: `jarvis status` read HEALTHY
+                # over a critical post-condition that was false. ONE item for as long as
+                # it stands, because the report row is the dedupe (`open_violation_report`)
+                # and `close_violation_reports` is what takes it away again.
+                for report in store.standing_violations(level="critical"):
+                    attention.append({
+                        "project": p["name"], "wo_id": report["wo_id"] or None,
+                        "title": f"OS invariant violated: {report['invariant']}",
+                        "status": "invariant", "invariant": report["invariant"],
+                        "reason": report["detail"] or report["invariant"],
+                        "decide": f"jarvis doctor {p['name']}",
+                    })
                 mode = mode_by_project.get(p["name"])
                 if mode and worker_stalls_on_prompts(mode):
                     attention.append({
@@ -6825,11 +6839,38 @@ requires it not to be before a merge; while you are in there, merge `origin/{bas
 (do not rebase) so the checks re-run against what would actually land."""
 
 
+#: THE ONE REPAIR THAT INVERTS THE OTHER TWO: those work orders already declared
+#: themselves, so they end "do NOT call `jarvis wo finish` again"; this one's entire
+#: purpose is that the worker MUST call it. Same four things in the same order — what is
+#: wrong, what to do, what NOT to do, attempts left — and no format field beyond
+#: `url`/`attempt`/`max_attempts`. Spec
+#: docs/superpowers/specs/2026-10-07-an-undeclared-delivery-must-heal-itself.md §2.2.
+#:
+#: Names the REFUSAL and not the branch: the worker's own reading of why it was woken has
+#: to match the record. TARGETED_TESTS_LINE rides in the `--evidence` clause, because
+#: that is the clause that asks what was run and this turn does not inherit the dispatch
+#: brief that states the same rule.
+PR_UNDECLARED_NUDGE = """\
+The user REFUSED an assumption on this work order, and you pushed commits since. The \
+head of {url} is one nothing has declared, so the panel may not judge it and nobody is \
+reading it. Nobody typed this message — Jarvis noticed while polling the pull request.
+
+Declare it: run `jarvis wo finish <wo-id> --summary "..." --pr {url} --evidence "..."`. \
+Say in the summary what the refusal asked for and what you changed, and in the evidence \
+state what you ran; """ + TARGETED_TESTS_LINE + """.
+
+Then END YOUR TURN. Do NOT push anything new to answer this message — the declaration \
+is the whole ask, and the commits are already there.
+
+This is attempt {attempt} of {max_attempts}. After {max_attempts} the work order stops \
+trying and asks the user."""
+
+
 @dataclass(frozen=True)
 class PrRepair:
     """One thing a poll can ask a worker to fix on its own pull request.
 
-    Two of them, and everything else is shared: the same attempt cap, the same three
+    Three of them, and everything else is shared: the same attempt cap, the same three
     guards in `Daemon.heal_pull_request`, the same episode arithmetic, the same
     unauthored message source. They differ only in what is wrong and what to say about
     it, which is the whole reason this is a descriptor and not a second copy of the
@@ -6858,11 +6899,13 @@ PR_CONFLICT = PrRepair(invariants.PR_CONFLICT_REPAIR, PR_CONFLICT_NUDGE,
                        invariants.PR_CONFLICT_BLOCKER)
 PR_CHECKS = PrRepair(invariants.PR_CHECKS_REPAIR, PR_CHECKS_NUDGE,
                      invariants.PR_CHECKS_BLOCKER)
+PR_UNDECLARED = PrRepair(invariants.PR_UNDECLARED_REPAIR, PR_UNDECLARED_NUDGE,
+                         invariants.PR_UNDECLARED_BLOCKER)
 
 #: Newest episode first is not a thing here — `pr_repair_origin` compares timestamps —
 #: but every repair that can hold a work order out of its status has to be in this
 #: tuple, or `Daemon.settle_work_order` will park its repair turn in the merge queue.
-PR_REPAIRS = (PR_CONFLICT, PR_CHECKS)
+PR_REPAIRS = (PR_CONFLICT, PR_CHECKS, PR_UNDECLARED)
 
 
 def nudge_pr_repair(store: ProjectStore, wo: dict[str, Any], repair: PrRepair,
@@ -8831,10 +8874,18 @@ def review_findings(io_id: str, accept: Sequence[str] = (),
 #: because both of this order's refusals are about the subject (§2.7).
 SUBJECT_KEY = "subject"
 
+#: `feature_orders.metadata` key: `stuck.fingerprint` of the situation this investigation
+#: was opened on, which is the cooldown's memory (§6b of
+#: docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md). On
+#: the row beside `SUBJECT_KEY` rather than in a table of its own, for the reason that key
+#: is there: one more key is no migration, and `jarvis investigate show` can render it.
+STUCK_FINGERPRINT_KEY = "stuck_fingerprint"
+
 
 def create_investigation_order(project_name: str | None, subject: str, why: str,
                                budget_usd: float | None = None,
-                               origin: str = "jarvis") -> dict[str, Any]:
+                               origin: str = "jarvis",
+                               fingerprint: str = "") -> dict[str, Any]:
     """Open an investigation into one stuck order. Nothing runs here.
 
     A thin `ops` function holding all the logic, because the CLI is not its main caller:
@@ -8871,7 +8922,7 @@ def create_investigation_order(project_name: str | None, subject: str, why: str,
             f"{subject} is an {kind} — an investigation never investigates the "
             f"diagnostician. Investigate the subject it was opened on instead."
         )
-    live = _live_investigation(project_name, subject)
+    live = live_investigation(project_name, subject)
     if live:
         raise OpsError(
             f"{live} is already investigating {subject} — `jarvis investigate show "
@@ -8883,7 +8934,8 @@ def create_investigation_order(project_name: str | None, subject: str, why: str,
         return store.create_feature_order(
             title=f"investigate {subject}: {title}"[:200], description=why,
             origin=origin, kind="investigation",
-            metadata={SUBJECT_KEY: subject},
+            metadata={SUBJECT_KEY: subject,
+                      **({STUCK_FINGERPRINT_KEY: fingerprint} if fingerprint else {})},
             # The family is this order plus its one investigator, so the family
             # arithmetic is already correct — `create_improvement_order`'s reasoning. The
             # fallback is NOT "no ceiling": the caller is a daemon loop, not a human
@@ -8911,8 +8963,15 @@ def _subject_identity(subject: str,
     return name, str(wo["title"]), str(wo.get("kind") or "worker")
 
 
-def _live_investigation(project_name: str, subject: str) -> str:
-    """The id of the non-terminal investigation already on this subject, or `""`."""
+def live_investigation(project_name: str, subject: str) -> str:
+    """The id of the non-terminal investigation already on this subject, or `""`.
+
+    PUBLIC because the fleet-health sweep asks it BEFORE attempting a creation (§6a): an
+    exception per already-investigated order per sweep is a log the operator learns to
+    ignore, and it is indistinguishable from a real failure on the run row. The refusal
+    inside `create_investigation_order` stays exactly as it is — it is the floor for every
+    other caller.
+    """
     paths = registered_project_paths()
     store = ProjectStore(paths[project_name])
     try:
@@ -8924,6 +8983,153 @@ def _live_investigation(project_name: str, subject: str) -> str:
     finally:
         store.close()
     return ""
+
+
+#: The name every caller before §6a used. Kept as an alias rather than renamed at the call
+#: sites: the two are one function and a second spelling must not become a second body.
+_live_investigation = live_investigation
+
+
+def last_stuck_investigation(project_name: str, subject: str) -> dict[str, Any] | None:
+    """The newest investigation of ANY status on this subject that carries a fingerprint.
+
+    What the cooldown is read from (§6b). Any status, because a SETTLED one is exactly the
+    case the cooldown is about — `live_investigation` answers the other one.
+    """
+    paths = registered_project_paths()
+    store = ProjectStore(paths[project_name])
+    try:
+        for row in store.list_feature_orders(statuses=None, kind="investigation"):
+            metadata = db.from_json(row.get("metadata"), {}) or {}
+            if metadata.get(SUBJECT_KEY) == subject \
+                    and metadata.get(STUCK_FINGERPRINT_KEY):
+                return {**row, STUCK_FINGERPRINT_KEY: str(
+                    metadata[STUCK_FINGERPRINT_KEY])}
+    finally:
+        store.close()
+    return None
+
+
+def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
+               window: bool = False,
+               stuck_only: bool = True) -> tuple[int, list[dict[str, Any]]]:
+    """Every open order of one project, judged by `stuck.assess`. §7's ONE derivation.
+
+    `Daemon._stuck_candidates` and `stuck_report` both call it, so a duration or a
+    threshold is computed in exactly one place. `stuck_only` is what the sweep passes: the
+    surfaces want every row, the tick wants the over-threshold ones and must not pay for
+    the detail of the rest.
+
+    `window` is the PROJECT-WIDE usage hold, read once by the caller rather than once per
+    candidate (`health_sweep_hold`'s own docstring).
+    """
+    from . import holds, stuck
+    from .health import observer_kinds
+    from .project_store import FO_ID_PREFIXES, UNGOVERNED_ORIGINS
+    from .worker_session import PAUSE_USAGE_LIMIT
+
+    thresholds = {s: cfg.threshold_seconds(s) for s in cfg.thresholds}
+    scanned, out = 0, []
+    for wo in pstore.list_work_orders(statuses=OPEN_STATUSES):
+        if wo["origin"] in UNGOVERNED_ORIGINS:
+            continue  # the user's own session — `_health_candidates`' rule
+        # AN INVESTIGATION IS NEVER A SUBJECT. `create_investigation_order` refuses it
+        # too, and the refusal must not be how the sweep learns it (§6).
+        if wo.get("kind") in ("investigation", "investigator") \
+                or str(wo.get("parent_id") or "").startswith(
+                    f'{FO_ID_PREFIXES["investigation"]}-'):
+            continue
+        scanned += 1
+        durations = state_durations(pstore, wo_id=wo["id"], now=now)
+        if durations.current_status_since is None:
+            continue  # no present-tense claim to judge — `state_durations`' own rule
+        spans = holds.held(pstore, wo["id"], now=now)
+        since = durations.current_status_since
+        usage = [h for h in spans if h.cause == PAUSE_USAGE_LIMIT]
+        discounted = holds.by_cause(usage, since, now, now).get(PAUSE_USAGE_LIMIT, 0.0)
+        verdict = stuck.assess(
+            str(wo["status"]), now - since, now - (durations.last_activity_ts or since),
+            discounted, thresholds, cfg.fallback_minutes * 60.0,
+            excluded_cause=(PAUSE_USAGE_LIMIT
+                            if window or any(h.open for h in usage) else ""))
+        if stuck_only and not verdict.stuck:
+            continue
+        blocker = true_blockers(pstore, wo, now=now)
+        out.append({
+            "project": project_name, "wo": wo, "verdict": verdict,
+            "blocker": blocker[0] if blocker else "nothing the record can name",
+            "status_label": invariants.status_label(pstore, wo),
+            "since": since, "activity": durations.last_activity_ts or since,
+            "discounted": discounted,
+            "seconds_in_status": now - since,
+            "seconds_since_activity": now - (durations.last_activity_ts or since),
+            "events": pstore.count_events(wo["id"], exclude=observer_kinds()),
+        })
+    return scanned, out
+
+
+def stuck_report(project_name: str | None = None,
+                 now: float | None = None) -> list[dict[str, Any]]:
+    """Every open order and how the sweep judges it. §7: ONE reader, two renderers.
+
+    `jarvis stuck` and `/stuck` both read this and neither computes a duration or a
+    threshold — `jarvis wo why`'s rule. Pure and write-free, most overdue first, and
+    ONLY the projects `fleet_health.enabled` covers, so what it shows is what the sweep
+    would act on rather than arithmetic nobody will ever apply.
+    """
+    from . import stuck
+
+    now = time.time() if now is None else now
+    catalog = resolve_catalog()
+    paths = registered_project_paths()
+    rows: list[dict[str, Any]] = []
+    for spec in catalog.projects:
+        if not spec.fleet_health.enabled or spec.name not in paths:
+            continue
+        if project_name and spec.name != project_name:
+            continue
+        pstore = ProjectStore(paths[spec.name])
+        try:
+            _scanned, judged = stuck_scan(
+                pstore, spec.name, spec.fleet_health, now,
+                window=bool(pstore.health_sweep_hold()), stuck_only=False)
+        finally:
+            pstore.close()
+        for row in judged:
+            wo, verdict = row["wo"], row["verdict"]
+            rows.append({
+                "id": wo["id"], "project": spec.name, "title": wo["title"],
+                "status": wo["status"], "status_label": row["status_label"],
+                "seconds_in_status": row["seconds_in_status"],
+                "seconds_since_activity": row["seconds_since_activity"],
+                "discounted_seconds": row["discounted"],
+                "active_seconds": verdict.active_seconds,
+                "threshold_seconds": verdict.threshold_seconds,
+                "clock": verdict.clock, "stuck": verdict.stuck,
+                "excluded": verdict.excluded, "reason": verdict.reason,
+                "blocker": row["blocker"],
+                "fingerprint": stuck.fingerprint(str(wo["status"]), row["since"],
+                                                 row["blocker"], row["events"]),
+                "investigation": _stuck_investigation(spec.name, wo["id"]),
+            })
+    rows.sort(key=lambda r: r["threshold_seconds"] - r["active_seconds"])
+    return rows
+
+
+def _stuck_investigation(project_name: str, wo_id: str) -> dict[str, Any] | None:
+    """The live or last investigation of this subject, with its verdict when settled."""
+    live = live_investigation(project_name, wo_id)
+    last = last_stuck_investigation(project_name, wo_id)
+    row = None
+    if live:
+        _n, _p, row = find_feature_order(live, project_name)
+    elif last is not None:
+        row = last
+    if row is None:
+        return None
+    plan = db.from_json(row.get("plan"), {}) or {}
+    return {"id": row["id"], "status": row["status"],
+            "classification": str(plan.get("classification") or "")}
 
 
 def list_investigation_orders(project_name: str | None = None,
@@ -9129,6 +9335,17 @@ def submit_verdict(inv_id: str, doc: Any,
                                          verdicts.settle_headline(inv_id, verdict))
         else:
             store.clear_feature_attention(inv_id)
+        # …AND ON THE SUBJECT'S OWN TIMELINE (§7): the line above is the INVESTIGATOR's
+        # work order, which nobody reading the stuck order will open. `KeyError` like the
+        # `plan_wo_id` reads below, since a subject can be deleted under it.
+        if subject and not is_feature_order_id(subject):
+            try:
+                store.add_event(subject, "investigation_verdict", {
+                    "investigation": inv_id, "classification": classification,
+                    "filed": (verdict.get("filed") or {}).get("issue_url"),
+                })
+            except (KeyError, sqlite3.IntegrityError):
+                pass  # not this project's work order any more
         settled: dict[str, Any] | None = None
         if fo.get("plan_wo_id"):
             store.add_event(fo["plan_wo_id"], "verdict_submitted", {
@@ -9872,6 +10089,67 @@ def cancel_feature_order(fo_id: str, project_name: str | None = None) -> dict[st
 FIX_TITLE_CHARS = 120
 
 
+def revive_feature_manager(store: ProjectStore, fo_id: str,
+                           why: str) -> dict[str, Any] | None:
+    """Give an `executing` feature back the manager its settlement closed.
+
+    THE ONE SITE manager liveness is derived at, and that is the point: it was written
+    once at a transition (`Daemon._close_feature_manager`) and never derived, so all three
+    paths that reverse that transition — `resume_feature_order`,
+    INV-FEATURE-FALSE-FAILURE's repair and `Daemon._manager_handoff` — had to remember to
+    undo it, and none of them did. Spec §(c), docs/superpowers/specs/2026-10-07-a-settled-
+    features-live-children-must-have-a-manager-or-a-hold.md
+
+    `idle`, the manager's designed steady state since issue #264: `_manager_handoff` tests
+    for it and `invariants.true_blockers` derives nothing from it but MESSAGE_STUCK_BLOCKER,
+    so a revived manager asks the user for nothing.
+
+    Returns the manager row, or None when there is no manager row at all, when the manager
+    is already open, or when the feature is not `executing` — the callers need to tell
+    those apart.
+    """
+    try:
+        feature = store.get_feature_order(fo_id)
+    except KeyError:
+        return None
+    if feature["status"] != "executing":
+        return None
+    manager = store.manager_work_order(fo_id)
+    if manager is None or manager["status"] in OPEN_STATUSES:
+        return None
+    store.set_status(manager["id"], "idle")
+    store.clear_attention(manager["id"])
+    # The exact mirror of `_close_feature_manager`'s `feature_settled`, so the manager's
+    # timeline reads as a pair.
+    store.add_event(manager["id"], "manager_revived",
+                    {"feature_order": fo_id, "was": manager["status"], "why": why})
+    return store.get_work_order(manager["id"])
+
+
+def lower_settled_feature_holds(store: ProjectStore,
+                                children: list[dict[str, Any]]) -> list[str]:
+    """Take down the hold a child carried while its feature was settled.
+
+    TWO CALLERS, in two modules — `resume_feature_order` below and
+    INV-FEATURE-FALSE-FAILURE's repair — and that is why it is public: both paths reopen a
+    feature, so both owe the children the same clear.
+
+    SETTLED_FEATURE_BLOCKER is derived, so the reopening makes it untrue — and nothing
+    re-derives a flag already stored, so the stale sentence would stand until the child
+    settled. The same rule `_carry_round_onto` states for its own flag: lowered only when
+    `true_blockers` is EMPTY, so another blocker is somebody else's reason and is left
+    exactly as it was, and only while the flag is up, which makes it idempotent.
+    """
+    lowered = []
+    for child in children:
+        fresh = store.get_work_order(child["id"])
+        if not fresh["needs_attention"] or true_blockers(store, fresh):
+            continue
+        store.clear_attention(fresh["id"])
+        lowered.append(fresh["id"])
+    return lowered
+
+
 def resume_feature_order(fo_id: str, fix: str = "",
                          project_name: str | None = None) -> dict[str, Any]:
     """`jarvis fo resume` — put a failed feature order back to work.
@@ -9912,11 +10190,15 @@ def resume_feature_order(fo_id: str, fix: str = "",
     store = ProjectStore(path)
     try:
         children = store.feature_children(fo_id)
-        dead = dead_feature_children(children)
+        dead = dead_feature_children(store, children)
         if dead:
             store.supersede_children(fo_id, [c["id"] for c in dead], note=fix)
         store.set_feature_status(fo_id, "executing")
         store.clear_feature_attention(fo_id)
+        # BEFORE the `--fix` child is filed, so a crash between them leaves a live manager
+        # rather than a child with no addressee.
+        revive_feature_manager(store, fo_id, why="jarvis fo resume")
+        lower_settled_feature_holds(store, children)
         child = None
         if fix.strip():
             title = " ".join(fix.split())[:FIX_TITLE_CHARS]

@@ -736,6 +736,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--project")
     sp.add_argument("--json", action="store_true")
 
+    # §7 of docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-
+    # investigated.md — `cmd_alarms` in shape, over `ops.stuck_report`.
+    sp = sub.add_parser(
+        "stuck", help="open orders judged on time in status, most overdue first")
+    sp.add_argument("project", nargs="?", help="one project (default: the whole fleet)")
+    sp.add_argument("--limit", type=int, default=50, help="rows to show (default: 50)")
+    sp.add_argument("--json", action="store_true")
+
     # the supervisor's own settings, as opposed to what it decided —
     # docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md §2.
     sup = sub.add_parser(
@@ -2921,6 +2929,50 @@ def cmd_alarms(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_stuck(args: argparse.Namespace) -> int:
+    """The dashboard's `/stuck` page in the terminal. §7, and `cmd_alarms` in shape.
+
+    Over-threshold rows are marked `!` and come first; the rest are the record. Every
+    number comes from `ops.stuck_report` — nothing here computes a duration or a
+    threshold.
+    """
+    from . import ops
+
+    rows = ops.stuck_report(args.project)
+    if args.json:
+        _print(rows, True)
+        return 0
+    if not rows:
+        print("no open order is being judged — `fleet_health.enabled` is off, or there "
+              "is nothing open")
+        return 0
+    over = [r for r in rows if r["stuck"]]
+    print(f"{len(over)} past its threshold · {len(rows) - len(over)} on the record\n")
+    for row in rows[:args.limit]:
+        mark = "!" if row["stuck"] else " "
+        print(f"{mark} {row['id']}  {row['project']}  {row['status_label']}")
+        print(f"    {_hours(row['seconds_in_status'])} in status · "
+              f"{_hours(row['seconds_since_activity'])} since activity · "
+              f"threshold {_hours(row['threshold_seconds'])} on the "
+              f"{row['clock']} clock")
+        print(f"    {row['reason']}")
+        # Parity with `ui/templates/stuck.html`, worded the same (§7).
+        print(f"    what the record says blocks it: {row['blocker']}")
+        inv = row["investigation"]
+        if inv:
+            print(f"    {inv['id']}  {inv['status']}"
+                  f"{'  ' + inv['classification'] if inv['classification'] else ''}")
+    if over:
+        print("\nread one with: jarvis investigate show <inv-id>")
+    # TEXT, not a link: the Evolution view is fo-69ba1cc4's and has no route yet (§7).
+    print("the gap classes behind these: jarvis rules list")
+    return 0
+
+
+def _hours(seconds: float) -> str:
+    return f"{seconds / 3600:.1f}h"
+
+
 def cmd_alarms_show(args: argparse.Namespace) -> int:
     """One alarm in full, the terminal's half of `/alarms/<project>/<al-id>`."""
     from . import ops
@@ -3236,10 +3288,13 @@ def _print_tool_cost(tools: dict) -> None:
     basis = totals["token_basis"]
     excluded = tools["excluded"]
     walked = excluded["sessions_walked"]
+    # Silent when zero: nothing was hidden, so there is nothing to disclose.
+    late = excluded["outside_window"]
     print(f"  {basis['context_delta']:,} result sizes measured exactly, "
           f"{basis['chars']:,} estimated from characters · "
           f"{walked:,} transcript{'s' if walked != 1 else ''} read · "
-          f"{excluded['unmatched_calls']:,} calls with no result, excluded")
+          f"{excluded['unmatched_calls']:,} calls with no result, excluded"
+          + (f" · {late:,} tool results outside the window, excluded" if late else ""))
 
 
 def _print_fleet(fleet: dict) -> None:
@@ -5428,6 +5483,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_watch(args)
         if args.cmd == "alarms":
             return cmd_alarms(args)
+        if args.cmd == "stuck":
+            return cmd_stuck(args)
         if args.cmd == "search":
             return cmd_search(args)
         if args.cmd == "spec":
