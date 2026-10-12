@@ -84,7 +84,10 @@ def test_the_exports_are_the_units_environment_values(prod, tmp_path):
         ["bash", str(SERVICE_SCRIPT), "--dry-run", "--unit-dir", str(units)],
         capture_output=True, text=True, check=False,
         env={"PATH": BASE_PATH, "HOME": str(tmp_path / "home"),
-             "PRODUCTION_CODE": str(prod), "USER": os.environ.get("USER", "t")})
+             "PRODUCTION_CODE": str(prod), "USER": os.environ.get("USER", "t"),
+             # the systemd unit is what `_unit_environment` parses; on a Mac the
+             # installer would otherwise render launchd plists
+             "JARVIS_SERVICE_MANAGER": "systemd"})
     assert svc.returncode == 0, svc.stderr
 
     wrapper = _exports((tmp_path / "bin" / "jarvis").read_text())
