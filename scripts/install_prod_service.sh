@@ -123,7 +123,7 @@ fi
 # session this script may descend from the daemon's job, and launchd takes the job's
 # whole process group down with it.
 if [ "$MANAGER" = launchd ]; then
-  DOMAIN="gui/$(id -u)"
+  DOMAIN="gui/$UID"
   if [ "$DRY_RUN" = 1 ]; then
     for label in com.jarvis.daemon com.jarvis.ui; do
       echo "[dry-run] launchctl bootout $DOMAIN/$label (ignored if not loaded)"
