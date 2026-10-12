@@ -197,10 +197,14 @@ and both `install_prod_service.sh` and `shipit.sh` read that one knob.
 | `EnvironmentFile=` | the agent sources `secrets/jarvis.env` itself before `exec` |
 | linger | not needed: agents survive logout, start at login |
 
-Not ported: the **staged** (`--stage`) restart in `src/jarvis/release.py` still calls
-`systemctl`, and worker turns run on the direct `Popen` transport (no `systemd-run`), so
-a daemon restart on a Mac still takes a running turn with it. A plain `shipit` from your
-own shell is the supported path there.
+The Python half reads the same knob through `src/jarvis/service_manager.py`: the daemon
+restarts `com.jarvis.ui` and `com.jarvis.daemon` with `launchctl kickstart -k`, verifies a
+staged (`--stage`) release from `launchctl print` plus `ps -o etime=`, and tells a wedged
+dashboard from a stopped one.
+
+Not ported, and only this: the **per-turn transient unit**. Worker turns run on the direct
+`Popen` transport on a Mac (no `systemd-run`), so a daemon restart still takes a running
+turn with it.
 
 ### The unit's PATH is the whole fleet's PATH
 

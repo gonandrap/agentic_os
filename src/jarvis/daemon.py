@@ -2092,15 +2092,17 @@ class Daemon:
         `jarvis-ui.service` on every tick it could.
 
         A unit that is not ACTIVE is `down`, not wedged: `systemctl --user stop
-        jarvis-ui` leaves the port refusing connections, which is indistinguishable from
-        a dead loop over HTTP alone. The measured fault had the unit `active (running)`,
-        so that is the discriminator — and without it the OS would restart the dashboard
-        the user had just stopped, three times, and tell them about it each time.
+        jarvis-ui` (`launchctl bootout gui/$UID/com.jarvis.ui` on a Mac) leaves the port
+        refusing connections, which is indistinguishable from a dead loop over HTTP
+        alone. The measured fault had the unit `active (running)`, so that is the
+        discriminator — and without it the OS would restart the dashboard the user had
+        just stopped, three times, and tell them about it each time. Which manager is
+        asked is `service_manager`'s question, not this method's.
 
         Returns what happened, for the log and the tests: `off`, `down`, `unseen`,
         `healthy`, `cooldown`, `capped`, `restarted` or `restart_failed`.
         """
-        from . import release, systemd_units, uilog
+        from . import release, service_manager, uilog
         from .notify import ui_base_url
 
         cfg = self.catalog.os.ui_health
@@ -2119,7 +2121,7 @@ class Daemon:
             return "healthy"
         # Deliberately stopped, not wedged. The sighting is LEFT ALONE: the dashboard did
         # serve, and starting it again must not have to earn that back.
-        if not systemd_units.unit_active(release.UI_UNIT):
+        if not service_manager.unit_active(release.UI_UNIT):
             return "down"
         if not (self.central.get_state(UI_HEALTHZ_OK_AT) or "").strip():
             return "unseen"
@@ -2151,7 +2153,7 @@ class Daemon:
                 )
             return "capped"
 
-        runner = self.release_runner or release.SystemdRunner()
+        runner = self.release_runner or release.service_runner()
         # ATTEMPTED BEFORE IT IS ANNOUNCED, and the attempt is recorded whether or not it
         # raised. The other order claims a restart that may not have happened, and — with
         # no timestamp written — leaves no cooldown, so the next tick five seconds later
@@ -2181,7 +2183,7 @@ class Daemon:
                       f"restarted",
                 body=(f"The restart was attempted and FAILED: {error}. The dashboard is "
                       f"still wedged and the OS cannot heal it — restart it by hand "
-                      f"(`systemctl --user restart {release.UI_UNIT}`).\n"
+                      f"(`{service_manager.restart_hint(release.UI_UNIT)}`).\n"
                       f"The attempt counts against `ui_health.max_restarts_per_day`, so "
                       f"this is said once rather than on every tick.\n"
                       f"{evidence}"),

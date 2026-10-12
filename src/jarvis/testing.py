@@ -22,7 +22,7 @@ from typing import Any, Sequence
 
 import pytest
 
-from . import agent_usage, paths, release, systemd_units, usage
+from . import agent_usage, paths, release, service_manager, systemd_units, usage
 from .bugreport import GH_BIN_ENV
 from .claude_cli import CLAUDE_BIN_ENV, CREDENTIALS_ENV
 from .notify import DISABLE_EXTERNAL_SINKS_ENV
@@ -122,6 +122,14 @@ def gate_environment(root: Path) -> dict[str, str]:
         # systemd path is exercised by pointing `JARVIS_SYSTEMD_RUN_BIN` at a fake, which
         # is the same shape as the `claude` and `gh` stubs above.
         systemd_units.TRANSPORT_ENV: systemd_units.DIRECT,
+        # And the two PRODUCTION services stay systemd's for the whole suite, for the
+        # same reason one level up. Left ambient, a run on a Mac resolves `launchd`,
+        # `release.service_runner()` hands back a `LaunchdRunner`, the two tests that
+        # monkeypatch `release.SystemdRunner` patch a class nobody constructs — and the
+        # run `launchctl kickstart -k`s the HUMAN'S OWN dashboard. The launchd path is
+        # exercised by pointing `JARVIS_LAUNCHCTL_BIN` at a fake (`fake_launchd`), the
+        # same shape as every stub above.
+        service_manager.MANAGER_ENV: service_manager.SYSTEMD,
         # The developer's own Claude Code sign-in, which `worker_session._auth_retry_at`
         # reads to decide whether an auth-paused turn may go again. Left ambient, a suite
         # run on a machine whose credentials were refreshed a second ago would resume
@@ -1623,6 +1631,107 @@ def fake_systemd(tmp_path, monkeypatch):
         def fail(self, message: str = "fake systemd-run: refused") -> None:
             """Make every subsequent spawn fail, so the direct fallback is exercised."""
             monkeypatch.setenv("FAKE_SYSTEMD_FAIL", message)
+
+    return Handle()
+
+
+FAKE_LAUNCHCTL = r"""#!/usr/bin/env python3
+'''Fake `launchctl` for tests: answers about the two PRODUCTION service labels.
+
+Only the two verbs `service_manager` uses — `print <target>` and `kickstart -k <target>`.
+Both output shapes are copied verbatim from the live production Mac (the spec's "The
+problem"); an invented output would make the parser pass against fiction.
+
+An unknown label is the stopped/booted-out case, not an error: it writes the real
+"Could not find service" line to stderr and exits non-zero, which is what a `launchctl
+bootout` leaves behind.
+'''
+import json, os, sys
+
+state_dir = os.environ["FAKE_LAUNCHD_DIR"]
+jobs_dir = os.path.join(state_dir, "jobs")
+argv = sys.argv[1:]
+with open(os.path.join(state_dir, "ctl-calls.jsonl"), "a") as f:
+    f.write(json.dumps({"argv": argv}) + "\n")
+
+def load(label):
+    try:
+        with open(os.path.join(jobs_dir, label + ".json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+def missing(label):
+    sys.stderr.write(
+        'Could not find service "%s" in domain for user gui: %s\n' % (label, os.getuid()))
+    sys.exit(113)
+
+if argv[:1] == ["print"] and len(argv) == 2:
+    label = argv[1].rsplit("/", 1)[-1]
+    rec = load(label)
+    if rec is None:
+        missing(label)
+    print("%s = {" % label)
+    print("\tstate = %s" % rec.get("state", "running"))
+    if rec.get("pid") is not None:
+        print("\tpid = %s" % rec["pid"])
+    print("\tlast exit code = %s" % rec.get("exit", 0))
+    print("}")
+elif argv[:2] == ["kickstart", "-k"] and len(argv) == 3:
+    label = argv[2].rsplit("/", 1)[-1]
+    rec = load(label)
+    if rec is None:
+        missing(label)
+    # The pid changes: a test can prove the restart happened AND that it was a new process.
+    rec["pid"] = int(rec.get("pid") or 0) + 1
+    rec["state"] = "running"
+    with open(os.path.join(jobs_dir, label + ".json"), "w") as f:
+        json.dump(rec, f)
+else:
+    sys.stderr.write("fake launchctl: unhandled argv %s\n" % argv); sys.exit(2)
+"""
+
+
+@pytest.fixture()
+def fake_launchd(tmp_path, monkeypatch):
+    """Put the two production services on the launchd path, against a fake `launchctl`.
+
+    The isolation gate pins every run to `systemd` (see `gate_environment`), so a test
+    that wants the launchd path has to say so — which is this fixture. Nothing here
+    depends on whether the machine running the suite is a Mac, and nothing here can reach
+    the human's own `com.jarvis.ui`.
+    """
+    ldir = tmp_path / "fake-launchd"
+    (ldir / "jobs").mkdir(parents=True)
+    ctl_bin = ldir / "launchctl"
+    ctl_bin.write_text(FAKE_LAUNCHCTL)
+    ctl_bin.chmod(ctl_bin.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("FAKE_LAUNCHD_DIR", str(ldir))
+    monkeypatch.setenv(service_manager.LAUNCHCTL_BIN_ENV, str(ctl_bin))
+    monkeypatch.setenv(service_manager.MANAGER_ENV, service_manager.LAUNCHD)
+
+    class Handle:
+        dir = ldir
+
+        @property
+        def calls(self) -> list[list[str]]:
+            path = ldir / "ctl-calls.jsonl"
+            return ([json.loads(ln)["argv"] for ln in path.read_text().splitlines()]
+                    if path.exists() else [])
+
+        @property
+        def jobs(self) -> dict[str, dict]:
+            return {p.stem: json.loads(p.read_text())
+                    for p in (ldir / "jobs").glob("*.json")}
+
+        def load(self, label: str, state: str = "running", pid: int | None = 4242,
+                 exit_code: int = 0) -> None:
+            """Make `label` a job launchd knows about. Absent = booted out."""
+            (ldir / "jobs" / f"{label}.json").write_text(
+                json.dumps({"state": state, "pid": pid, "exit": exit_code}))
+
+        def bootout(self, label: str) -> None:
+            (ldir / "jobs" / f"{label}.json").unlink(missing_ok=True)
 
     return Handle()
 

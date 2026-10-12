@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import json
+import os
 import threading
 import time
 
@@ -19,7 +20,7 @@ pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from jarvis import daemon as daemon_mod  # noqa: E402
-from jarvis import invariants, ops, release, systemd_units, uilog  # noqa: E402
+from jarvis import invariants, ops, release, service_manager, uilog  # noqa: E402
 from jarvis.catalog import UiHealthConfig  # noqa: E402
 from jarvis.catalog import load_catalog  # noqa: E402
 from jarvis.central_store import CentralStore  # noqa: E402
@@ -659,13 +660,16 @@ HEALTHY = {
 
 @pytest.fixture()
 def ui_unit(monkeypatch):
-    """`jarvis-ui.service` as systemd sees it — `active` unless a test says otherwise.
+    """`jarvis-ui.service` as its init system sees it — `active` unless a test says so.
 
     Patched in every test that can reach the check: the suite must never ask the real
-    user manager, where the machine's OWN dashboard may be running.
+    user manager, where the machine's OWN dashboard may be running. The patch is on
+    `service_manager`, which is what `check_ui_health` asks since
+    2026-10-12-service-queries-on-a-mac.md §4 — `systemd_units.unit_active` is a function
+    it no longer calls.
     """
     state = {"active": True}
-    monkeypatch.setattr(systemd_units, "unit_active", lambda unit: state["active"])
+    monkeypatch.setattr(service_manager, "unit_active", lambda unit: state["active"])
     return state
 
 
@@ -798,11 +802,62 @@ def test_a_failed_restart_says_so_once_and_still_spends_the_cooldown(wedged,
     assert "could not be restarted" in items[0]["title"]
     assert "dbus: connection refused" in items[0]["body"]
     assert WEDGED["stack_dump"] in items[0]["body"]
+    # The one instruction the user acts on by hand names the command THIS host has.
+    assert f"systemctl --user restart {release.UI_UNIT}" in items[0]["body"]
 
     # The attempt IS recorded, so the cooldown holds and nothing is said again.
     assert d.check_ui_health(now=1010.0) == "cooldown"
     assert len(_inbox()) == 1
     assert len(runner.calls) == 1
+
+
+@pytest.fixture()
+def wedged_on_a_mac(started, catalog_file, monkeypatch, fake_launchd):
+    """The same wedge, on the host this defect was reported from — no `systemctl`
+    anywhere, `com.jarvis.ui` answered by the stub."""
+    answers = [HEALTHY]
+    monkeypatch.setattr(daemon_mod, "fetch_healthz", lambda url, timeout: answers[0])
+    fake_launchd.load("com.jarvis.ui", state="running", pid=73299)
+    d = Daemon(load_catalog(catalog_file))
+    d.release_runner = _FakeRunner()
+    d.check_ui_health(now=0.0)              # one healthy sighting first
+    answers[0] = WEDGED
+    return d, d.release_runner, fake_launchd
+
+
+def test_under_launchd_a_running_label_plus_a_wedge_is_restarted(wedged_on_a_mac):
+    """THE DEFECT, end to end: `systemd_units.unit_active` swallowed the missing-binary
+    `OSError`, returned "" and made every wedge read `down` — so the whole of the
+    2026-10-08 self-heal spec was dead code on this host."""
+    d, runner, _ = wedged_on_a_mac
+
+    assert d.check_ui_health(now=1000.0) == "restarted"
+    assert runner.calls == [("restart_unit", release.UI_UNIT)]
+
+
+def test_under_launchd_an_absent_label_is_down_and_nothing_is_restarted(
+        wedged_on_a_mac):
+    """`launchctl bootout gui/$UID/com.jarvis.ui` makes the label unfindable, which is
+    the deliberately-stopped case `down` exists for."""
+    d, runner, fake_launchd = wedged_on_a_mac
+    fake_launchd.bootout("com.jarvis.ui")
+
+    assert d.check_ui_health(now=1000.0) == "down"
+    assert runner.calls == []
+    assert _inbox() == []
+
+
+def test_under_launchd_a_failed_restart_names_the_launchctl_command(wedged_on_a_mac,
+                                                                    monkeypatch):
+    """`systemctl --user restart jarvis-ui.service` is not a command this host has."""
+    d, runner, _ = wedged_on_a_mac
+    monkeypatch.setattr(runner, "restart_unit",
+                        lambda unit: (_ for _ in ()).throw(OSError("no launchctl")))
+
+    assert d.check_ui_health(now=1000.0) == "restart_failed"
+    body = _inbox()[0]["body"]
+    assert f"launchctl kickstart -k gui/{os.getuid()}/com.jarvis.ui" in body
+    assert "systemctl" not in body
 
 
 def test_the_ui_health_check_is_off_when_the_catalog_says_so(started, catalog_file,

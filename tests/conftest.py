@@ -5,6 +5,7 @@ from jarvis.testing import (  # noqa: F401
     claude_json,
     fake_claude,
     fake_gh,
+    fake_launchd,
     fake_systemd,
     fleet_fixture,
     improvement_order,
