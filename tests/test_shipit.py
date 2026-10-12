@@ -86,10 +86,22 @@ def _dry_run(repo: Path, prod: Path, *args: str) -> subprocess.CompletedProcess[
                            # `gh` must not decide if the release page is planned
     env = {**os.environ,
            "PRODUCTION_CODE": str(prod),
+           # Pinned: the restart assertions below describe the Linux branch and must
+           # hold on a macOS developer machine too, where the default is launchd.
+           "JARVIS_SERVICE_MANAGER": os.environ.get("TEST_SERVICE_MANAGER", "systemd"),
            "PATH": f"{stub_bin}{os.pathsep}{os.environ['PATH']}"}
     return subprocess.run(
         ["bash", str(repo / "scripts" / "shipit.sh"), "--dry-run", *args],
         cwd=str(repo), env=env, capture_output=True, text=True)
+
+
+def _dry_run_launchd(repo: Path, prod: Path, *args: str,
+                     ) -> subprocess.CompletedProcess[str]:
+    os.environ["TEST_SERVICE_MANAGER"] = "launchd"
+    try:
+        return _dry_run(repo, prod, *args)
+    finally:
+        del os.environ["TEST_SERVICE_MANAGER"]
 
 
 def test_version_derives_from_latest_tag_not_pyproject(tmp_path):
@@ -835,3 +847,40 @@ def test_notify_never_echoes_the_bot_token(tmp_path):
     assert _FAKE_TOKEN not in out, out
     assert "<redacted>" in out, out
     assert "rc=0" in out, out
+
+
+# -- launchd: shipping on a macOS production host --------------------------------
+
+
+def test_on_launchd_the_services_are_restarted_with_launchctl_not_systemctl(tmp_path):
+    repo = _make_repo(tmp_path)
+    r = _dry_run_launchd(repo, _deployed(tmp_path), "0.2.0")
+    assert r.returncode == 0, r.stderr
+    out = r.stdout
+    assert "systemctl" not in out and "systemd-run" not in out
+    assert "launchctl kickstart -k gui/" in out
+    assert "com.jarvis.ui" in out and "com.jarvis.daemon" in out
+
+
+def test_on_launchd_the_daemon_restart_is_still_detached_and_last(tmp_path):
+    """The 0.5.0 trap does not care which init system kills the script."""
+    repo = _make_repo(tmp_path)
+    r = _dry_run_launchd(repo, _deployed(tmp_path), "0.2.0")
+    out = r.stdout
+    ui = out.index("com.jarvis.ui")
+    daemon = out.index("com.jarvis.daemon")
+    assert ui < daemon
+    assert out.lower().index("telegram") < daemon
+    assert out.index("install_prod_service.sh") < ui
+    assert "detached" in out[daemon - 300:daemon + 300]
+
+
+def test_an_unknown_service_manager_refuses_to_ship(tmp_path):
+    repo = _make_repo(tmp_path)
+    os.environ["TEST_SERVICE_MANAGER"] = "upstart"
+    try:
+        r = _dry_run(repo, _deployed(tmp_path), "0.2.0")
+    finally:
+        del os.environ["TEST_SERVICE_MANAGER"]
+    assert r.returncode != 0
+    assert "JARVIS_SERVICE_MANAGER" in r.stderr

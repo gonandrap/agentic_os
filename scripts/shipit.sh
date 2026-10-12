@@ -47,10 +47,13 @@
 #                                     # the one running this script.
 #
 # Env:
-#   PRODUCTION_CODE   production root (default: ~/workspace/production)
-#                     the --stage marker goes under its `state/`, the production
-#                     daemon's JARVIS_HOME (deploy/jarvis.service.template), NOT under
-#                     whatever JARVIS_HOME this shell happens to carry (issue #1206)
+#   PRODUCTION_CODE         production root (default: ~/workspace/production)
+#                           the --stage marker goes under its `state/`, the production
+#                           daemon's JARVIS_HOME (deploy/jarvis.service.template), NOT under
+#                           whatever JARVIS_HOME this shell happens to carry (issue #1206)
+#   JARVIS_SERVICE_MANAGER  systemd | launchd — which init system runs production's
+#                           services (default: launchd on Darwin, else systemd). The
+#                           same knob scripts/install_prod_service.sh reads.
 set -euo pipefail
 
 DRY_RUN=0
@@ -93,6 +96,17 @@ PROD_ROOT="$PRODUCTION_CODE"
 PROD_DIR="$PROD_ROOT/jarvis_os"
 PROD_CONFIG="$PROD_ROOT/config/catalog.json"
 PROD_SECRETS="$PROD_ROOT/secrets/jarvis.env"
+
+MANAGER="${JARVIS_SERVICE_MANAGER:-}"
+if [ -z "$MANAGER" ]; then
+  case "$(uname -s 2>/dev/null)" in Darwin) MANAGER=launchd ;; *) MANAGER=systemd ;; esac
+fi
+case "$MANAGER" in
+  systemd|launchd) ;;
+  *) printf '\033[1;31m✗ %s\033[0m\n' \
+       "JARVIS_SERVICE_MANAGER must be systemd or launchd, not '$MANAGER'" >&2; exit 1 ;;
+esac
+LAUNCHD_DOMAIN="gui/$(id -u)"
 
 say()  { printf '\033[1;36m▶ %s\033[0m\n' "$*"; }
 run()  { if [ "$DRY_RUN" = 1 ]; then printf '  [dry-run] %s\n' "$*"; else eval "$*"; fi; }
@@ -416,11 +430,20 @@ fi
 # has never had. Before 5b on purpose — the staged path restarts later, into these.
 unit_installed() {  # unit_installed <unit>; a dry run always prints the full plan
   if [ "$DRY_RUN" = 1 ]; then return 0; fi
-  systemctl --user list-unit-files "$1" 2>/dev/null | grep -q "$1"
+  if [ "$MANAGER" = launchd ]; then
+    launchctl print "$LAUNCHD_DOMAIN/$1" >/dev/null 2>&1
+  else
+    systemctl --user list-unit-files "$1" 2>/dev/null | grep -q "$1"
+  fi
 }
 
-UI_SVC="jarvis-ui.service"
-DAEMON_SVC="jarvis.service"
+if [ "$MANAGER" = launchd ]; then
+  UI_SVC="com.jarvis.ui"
+  DAEMON_SVC="com.jarvis.daemon"
+else
+  UI_SVC="jarvis-ui.service"
+  DAEMON_SVC="jarvis.service"
+fi
 
 INSTALLER="$PROD_DIR/scripts/install_prod_service.sh"
 if ! unit_installed "$DAEMON_SVC" && ! unit_installed "$UI_SVC"; then
@@ -432,8 +455,8 @@ elif [ ! -f "$INSTALLER" ]; then
   say "NOTE: $INSTALLER is missing in $TAG — units NOT re-rendered, and they may be"
   say "      stale. Check with: jarvis doctor (INV-SERVICE-PATH)"
 else
-  say "re-rendering the systemd units from $TAG"
-  run "'$INSTALLER' --no-restart"
+  say "re-rendering the $MANAGER units from $TAG"
+  run "JARVIS_SERVICE_MANAGER='$MANAGER' '$INSTALLER' --no-restart"
 fi
 
 # --- 5a2. re-render the `jarvis` wrapper from the tag being shipped --------------
@@ -518,9 +541,15 @@ any_installed=0
 if unit_installed "$UI_SVC"; then
   any_installed=1
   say "restarting $UI_SVC"
-  run "systemctl --user restart '$UI_SVC'"
-  [ "$DRY_RUN" = 1 ] || sleep 2
-  run "systemctl --user --no-pager --lines=0 status '$UI_SVC' || true"
+  if [ "$MANAGER" = launchd ]; then
+    run "launchctl kickstart -k '$LAUNCHD_DOMAIN/$UI_SVC'"
+    [ "$DRY_RUN" = 1 ] || sleep 2
+    run "launchctl print '$LAUNCHD_DOMAIN/$UI_SVC' | grep -E '^\s+(state|pid) =' || true"
+  else
+    run "systemctl --user restart '$UI_SVC'"
+    [ "$DRY_RUN" = 1 ] || sleep 2
+    run "systemctl --user --no-pager --lines=0 status '$UI_SVC' || true"
+  fi
 fi
 if unit_installed "$DAEMON_SVC"; then any_installed=1; fi
 if [ "$any_installed" = 0 ]; then
@@ -592,7 +621,13 @@ say "shipped $TAG → $PROD_DIR"
 # outside our cgroup, so it completes whether or not we survive; the short sleep lets
 # this script print its last line and exit cleanly first.
 if unit_installed "$DAEMON_SVC"; then
-  if [ "$DRY_RUN" != 1 ] && ! command -v systemd-run >/dev/null 2>&1; then
+  if [ "$MANAGER" = launchd ]; then
+    # No transient units on launchd: a nohup'd subshell outlives this script, and
+    # `kickstart -k` is what restarts a loaded agent.
+    say "restarting $DAEMON_SVC (detached — this script may descend from its job)"
+    run "nohup /bin/sh -c 'sleep 3; launchctl kickstart -k $LAUNCHD_DOMAIN/$DAEMON_SVC' >/dev/null 2>&1 &"
+    say "  queued: $DAEMON_SVC restarts in ~3s — check with: launchctl print $LAUNCHD_DOMAIN/$DAEMON_SVC"
+  elif [ "$DRY_RUN" != 1 ] && ! command -v systemd-run >/dev/null 2>&1; then
     say "systemd-run unavailable — restarting $DAEMON_SVC inline (this script may be killed)"
     run "systemctl --user restart '$DAEMON_SVC'"
   else

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install_prod_service — render and install the Jarvis OS systemd --user services.
+# install_prod_service — render and install the Jarvis OS production services.
 #
 # One-time (idempotent) setup for production. Installs two units:
 #   jarvis.service      — the orchestrator daemon (jarvis start --foreground)
@@ -7,12 +7,18 @@
 # Both get a runtime PATH that finds uv, claude, node, gh, and the prod venv, then are
 # enabled + started with auto-restart recovery.
 #
+# On macOS the same two services are launchd agents, com.jarvis.daemon and
+# com.jarvis.ui under ~/Library/LaunchAgents, and `systemctl --user` becomes
+# `launchctl`. Everything else — the PATH, the env, the restart order — is identical.
+#
 # Env:
-#   PRODUCTION_CODE   production root (default: ~/workspace/production)
+#   PRODUCTION_CODE         production root (default: ~/workspace/production)
+#   JARVIS_SERVICE_MANAGER  systemd | launchd (default: launchd on Darwin, else systemd)
 #
 # Flags:
-#   --dry-run           render the units and print the plan; touch no systemd state
-#   --unit-dir <dir>    where the units go (default: ~/.config/systemd/user)
+#   --dry-run           render the units and print the plan; touch no service state
+#   --unit-dir <dir>    where the units go (default: ~/.config/systemd/user, or
+#                       ~/Library/LaunchAgents under launchd)
 #   --no-restart        render, reload and enable, then stop — the caller restarts.
 #                       scripts/shipit.sh uses this: it re-renders the units on every
 #                       release and already owns the restart order (UI inline, daemon
@@ -21,7 +27,7 @@ set -euo pipefail
 
 DRY_RUN=0
 NO_RESTART=0
-UNIT_DIR="$HOME/.config/systemd/user"
+UNIT_DIR=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run)    DRY_RUN=1; shift ;;
@@ -36,6 +42,18 @@ PRODUCTION_CODE="${PRODUCTION_CODE:-$HOME/workspace/production}"
 PROD_ROOT="$PRODUCTION_CODE"
 PROD_DIR="$PROD_ROOT/jarvis_os"
 PROD_CONFIG="$PROD_ROOT/config/catalog.json"
+
+# Which init system owns the services. Same knob scripts/shipit.sh reads, so the two
+# never disagree about what to restart.
+MANAGER="${JARVIS_SERVICE_MANAGER:-}"
+if [ -z "$MANAGER" ]; then
+  case "$(uname -s 2>/dev/null)" in Darwin) MANAGER=launchd ;; *) MANAGER=systemd ;; esac
+fi
+case "$MANAGER" in
+  systemd) : "${UNIT_DIR:=$HOME/.config/systemd/user}" ;;
+  launchd) : "${UNIT_DIR:=$HOME/Library/LaunchAgents}" ;;
+  *) echo "JARVIS_SERVICE_MANAGER must be systemd or launchd, not '$MANAGER'" >&2; exit 2 ;;
+esac
 
 [ -x "$PROD_DIR/.venv/bin/jarvis" ] || {
   echo "production not deployed yet ($PROD_DIR/.venv/bin/jarvis missing) — run scripts/shipit.sh first" >&2
@@ -70,14 +88,20 @@ render() {  # render <template> <unit-name>
       -e "s#@PROD_CONFIG@#$PROD_CONFIG#g" \
       -e "s#@PATH@#$RUNTIME_PATH#g" \
       -e "s#@UI_PORT@#$UI_PORT#g" \
+      -e "s#@HOME@#$HOME#g" \
       "$tmpl" > "$unit"
   echo "installed $unit"
 }
 
 mkdir -p "$UNIT_DIR"
-render jarvis.service.template    jarvis.service
-render jarvis-ui.service.template jarvis-ui.service
-echo "PATH=$RUNTIME_PATH  UI_PORT=$UI_PORT"
+if [ "$MANAGER" = launchd ]; then
+  render com.jarvis.daemon.plist.template com.jarvis.daemon.plist
+  render com.jarvis.ui.plist.template     com.jarvis.ui.plist
+else
+  render jarvis.service.template    jarvis.service
+  render jarvis-ui.service.template jarvis-ui.service
+fi
+echo "PATH=$RUNTIME_PATH  UI_PORT=$UI_PORT  manager=$MANAGER"
 
 # Say it out loud when the rendered PATH cannot reach `gh`. Silence here is what made
 # issue #90 take a release to notice: the units install fine, and the only symptom is a
@@ -90,6 +114,48 @@ else
   echo "      fallback list in this script and re-run it." >&2
 fi
 
+# --- launchd ---------------------------------------------------------------------
+#
+# `launchctl bootstrap` loads an agent and starts it (RunAtLoad); bootstrapping a label
+# that is already loaded is an error, so each is bootout-ed first and a never-loaded
+# label's error is ignored. `kickstart -k` is the restart. The daemon's restart is
+# detached for the reason the systemd branch gives below: run from a Jarvis-spawned
+# session this script may descend from the daemon's job, and launchd takes the job's
+# whole process group down with it.
+if [ "$MANAGER" = launchd ]; then
+  DOMAIN="gui/$(id -u)"
+  if [ "$DRY_RUN" = 1 ]; then
+    for label in com.jarvis.daemon com.jarvis.ui; do
+      echo "[dry-run] launchctl bootout $DOMAIN/$label (ignored if not loaded)"
+      echo "[dry-run] launchctl bootstrap $DOMAIN $UNIT_DIR/$label.plist"
+    done
+    if [ "$NO_RESTART" = 1 ]; then
+      echo "[dry-run] (--no-restart) restarts left to the caller"
+    else
+      echo "[dry-run] launchctl kickstart -k $DOMAIN/com.jarvis.ui"
+      echo "[dry-run] launchctl kickstart -k $DOMAIN/com.jarvis.daemon (detached, in ~3s)"
+    fi
+    exit 0
+  fi
+  mkdir -p "$PROD_ROOT/state/logs"
+  for label in com.jarvis.daemon com.jarvis.ui; do
+    launchctl bootout "$DOMAIN/$label" 2>/dev/null || true
+    launchctl bootstrap "$DOMAIN" "$UNIT_DIR/$label.plist"
+  done
+  if [ "$NO_RESTART" = 1 ]; then
+    echo "agents re-rendered and loaded — restarts left to the caller (--no-restart)"
+    exit 0
+  fi
+  launchctl kickstart -k "$DOMAIN/com.jarvis.ui"
+  sleep 2
+  launchctl print "$DOMAIN/com.jarvis.ui" 2>/dev/null | grep -E "^\s+(state|pid) =" || true
+  nohup /bin/sh -c "sleep 3; launchctl kickstart -k '$DOMAIN/com.jarvis.daemon'" \
+    >/dev/null 2>&1 &
+  echo "queued: com.jarvis.daemon restarts in ~3s (detached) — check with: launchctl print $DOMAIN/com.jarvis.daemon"
+  exit 0
+fi
+
+# --- systemd ---------------------------------------------------------------------
 if [ "$DRY_RUN" = 1 ]; then
   echo "[dry-run] systemctl --user daemon-reload"
   echo "[dry-run] systemctl --user enable jarvis.service jarvis-ui.service"
