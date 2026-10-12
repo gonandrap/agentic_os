@@ -43,6 +43,9 @@ def fleet(jarvis_home, fake_claude, catalog_file, project):
     # catalog may go below. Lowered on the loaded object rather than in the file, so
     # the parser's own rule stays under test in `test_the_floor_has_a_floor`.
     daemon.catalog.os.compact_min_context = BIG
+    # The clock tests below age a turn by `usage.WRITE_TTL_SECONDS`, the five-minute
+    # write; the hour's clock is `tests/test_cache_ttl_compaction.py`'s subject.
+    catalog.projects[0].worker.cache_ttl = "5m"
     return {"daemon": daemon, "project": catalog.projects[0],
             "store": ProjectStore(project), "catalog": catalog}
 

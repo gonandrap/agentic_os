@@ -308,7 +308,9 @@ def _write_call_record(finished=None):
                    "prompt": resolved_prompt(),
                    "started_at": _started, "finished_at": finished,
                    "cache_env": {k: os.environ[k] for k in
-                                 ("FORCE_PROMPT_CACHING_5M", "ENABLE_PROMPT_CACHING_1H")
+                                 ("FORCE_PROMPT_CACHING_5M", "ENABLE_PROMPT_CACHING_1H",
+                                  "CLAUDE_CODE_PROMPT_CACHE_TTL",
+                                  "CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL")
                                  if k in os.environ}}, f)
     # Renamed into place: `Handle.calls` polls this directory while processes are still
     # running, and a half-written record it cannot parse is a call it silently drops.

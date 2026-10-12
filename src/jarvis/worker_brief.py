@@ -28,6 +28,7 @@ Two invariants inherited from the knowledge base work:
 
 from __future__ import annotations
 
+from .claude_cli import cache_rhythm
 from .concision import DEFAULT_SUMMARY_MAX_WORDS as SUMMARY_MAX_WORDS
 
 WO_PLACEHOLDER = "<wo-id>"
@@ -176,7 +177,8 @@ def render_section(name: str, *, wo_id: str | None = None,
                    project: str | None = None,
                    gates_enabled: tuple[str, ...] | None = None,
                    serena: bool = True,
-                   tool_search: str = "cli") -> str:
+                   tool_search: str = "cli",
+                   cache_ttl: str | None = None) -> str:
     """One full section, rendered with real ids when the caller has them.
 
     Read-only and total: every listed name renders non-empty text with placeholders
@@ -190,7 +192,7 @@ def render_section(name: str, *, wo_id: str | None = None,
     if name == "gates":
         return gates_section(wo, enabled=gates_enabled)
     if name == "record":
-        return record_section(wo)
+        return record_section(wo, cache_ttl=cache_ttl)
     if name == "navigation":
         return navigation_section(serena, tool_search=tool_search)
     if name == "concision":
@@ -204,7 +206,7 @@ def render_section(name: str, *, wo_id: str | None = None,
 
 def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
                   gate_names: tuple[str, ...] = (),
-                  kind: str = "worker") -> list[str]:
+                  kind: str = "worker", cache_ttl: str | None = None) -> list[str]:
     """The compressed operating contract: only the invariants a worker cannot be
     allowed to discover by fetching.
 
@@ -214,6 +216,7 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
     last-message-is-the-record rule are behaviourally load-bearing and stay in the
     opening prompt. Everything explanatory moved behind `jarvis brief`.
     """
+    rhythm = cache_rhythm(cache_ttl)
     lines = [
         "# Operating contract",
         "You MUST follow it. This is the compressed core; the full contract with "
@@ -268,12 +271,14 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
             f"command (full protocol: `jarvis brief gates --wo {wo_id}`).",
         ] if gate_names else []),
         f"- **A turn is one-shot and NOTHING wakes you when a background job "
-        f"ends.** Long work — a whole-suite run, a CI watcher, a "
-        f"`jarvis-implementer` or `jarvis-spec-writer` seat — runs in the BACKGROUND "
+        f"ends.** Long work — a whole-suite run, a CI watcher"
+        f"{'' if rhythm.seconds >= 3600 else ', a `jarvis-implementer` or `jarvis-spec-writer` seat'}"
+        f" — runs in the BACKGROUND "
         f"(`run_in_background: true`); the FOREGROUND call is REFUSED. Collect it "
-        f"with `BashOutput`/`TaskOutput` every 3-4 minutes, never one call past 240 "
-        f"seconds: your prompt cache lives 5 minutes and a call after it re-sends "
-        f"this whole conversation. Nothing else may be backgrounded, and never END a "
+        f"with `BashOutput`/`TaskOutput` every {rhythm.poll_every}, never one call "
+        f"past {rhythm.cap_seconds} seconds: your prompt cache lives "
+        f"{rhythm.minutes} minutes and a call after it re-sends this whole "
+        f"conversation. Nothing else may be backgrounded, and never END a "
         f"turn with a task uncollected — the Stop hook refuses it — or claim you "
         f"will be re-invoked.",
         f"- **Point, do not explain; say each thing ONCE.** A code comment is one "
@@ -451,8 +456,9 @@ def contract_section(wo_id: str = WO_PLACEHOLDER,
     return "\n".join(lines)
 
 
-def record_section(wo_id: str = WO_PLACEHOLDER) -> str:
+def record_section(wo_id: str = WO_PLACEHOLDER, cache_ttl: str | None = None) -> str:
     """What the outside world sees, plus the finishing protocol in full."""
+    rhythm = cache_rhythm(cache_ttl)
     lines = [
         "# What the outside world sees",
         "The work order record IS this conversation, as far as anyone else is "
@@ -537,14 +543,16 @@ def record_section(wo_id: str = WO_PLACEHOLDER) -> str:
         "a verdict on a gate you requested, a message the user sends you.",
         "",
         "So work that outlasts one command runs in the BACKGROUND and you POLL it: "
-        "`run_in_background: true`, then `BashOutput` / `TaskOutput` every 3-4 "
-        "minutes until it reports finished, and no single call blocking longer than "
-        "240 seconds. The reason is the clock, not taste — your prompt cache lives "
-        "5 minutes, so a call more than 300 seconds after the previous one re-sends "
-        "this whole conversation at the 1.25x write rate, where a check-in inside "
+        f"`run_in_background: true`, then `BashOutput` / `TaskOutput` every "
+        f"{rhythm.poll_every} until it reports finished, and no single call blocking "
+        f"longer than {rhythm.cap_seconds} seconds. The reason is the clock, not taste "
+        f"— your prompt cache lives {rhythm.minutes} minutes, so a call more than "
+        f"{rhythm.seconds} seconds after the previous one re-sends this whole "
+        f"conversation at the {rhythm.write_rate} write rate, where a check-in inside "
         "the window is a 0.1x read. This is the ONLY work that may be backgrounded: "
-        "a whole-suite test run, a CI watcher, a `jarvis-implementer` or "
-        "`jarvis-spec-writer` seat, a long wait. The FOREGROUND call is refused for "
+        "a whole-suite test run, a CI watcher, "
+        f"{'' if rhythm.seconds >= 3600 else 'a `jarvis-implementer` or `jarvis-spec-writer` seat, '}"
+        "a long wait. The FOREGROUND call is refused for "
         "those and backgrounding anything else still is. You may also split it "
         "into pieces that each fit inside a turn. If it fits in neither, say so and "
         "ask — a turn that ends on a question is a turn the "

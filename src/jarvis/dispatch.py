@@ -239,13 +239,16 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         # import `catalog` (see its module docstring).
         concision.STANDING_PROMPT_ENV: (wo.get("append_system_prompt")
                                         or project.worker.append_system_prompt or ""),
-        # Buy the 5-minute prompt cache (write 1.25x) instead of the 1-hour one (2x),
-        # which Claude Code would otherwise pick for a headless session. Taken from
+        # The prompt-cache TTL the lead buys and the one its crew buys. Taken from
         # `claude_cli` rather than spelled again: the settings file and the spawn
         # environment must not be able to disagree about what TTL Jarvis buys.
-        # Measurements and the reversal criteria: kn-f94abf34, and docs/superpowers/
-        # specs/2026-08-22-the-five-minute-write-everywhere.md.
-        **claude_cli.PROMPT_CACHE_5M_ENV,
+        # Findings: docs/superpowers/findings/
+        # 2026-10-11-the-lead-buys-the-hour-the-crew-does-not.md.
+        **claude_cli.cache_env(lead=project.worker.cache_ttl,
+                               subagent=project.worker.subagent_cache_ttl),
+        # The lead's TTL again, for the hooks and `jarvis brief` — separate processes
+        # that size the foreground cap and the polling rhythm from it.
+        claude_cli.CACHE_TTL_ENV: project.worker.cache_ttl,
         # WHAT A TURN IS, for every hook that would otherwise assume it. Taken from
         # `claude_cli` for the reason the cache flag above is: the launcher and the
         # settings file must not be able to disagree. §3 of docs/superpowers/specs/
@@ -481,7 +484,8 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         "",
         *worker_brief.core_contract(wo["id"], wo["title"], project.name,
                                     bool(knowledge), live_gates,
-                                    kind=str(wo.get("kind") or "worker")),
+                                    kind=str(wo.get("kind") or "worker"),
+                                    cache_ttl=project.worker.cache_ttl),
         "",
         *worker_brief.section_index(wo["id"], gated=bool(project.gates),
                                     serena=wiring.serena_wired(project.wiring)),

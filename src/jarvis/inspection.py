@@ -98,8 +98,9 @@ from .holds import HOLD_CAUSES, Hold, by_cause
 #: durations Anthropic's prompt cache actually offers (kn-f94abf34), not a policy Jarvis
 #: gets to hold an opinion about. Making them settable would let a catalog declare that
 #: the cache lives for an hour when it does not, and every `ttl-expiry` label downstream
-#: would then be wrong. The 5-minute one is what every Jarvis call buys since
-#: `claude_cli.PROMPT_CACHE_5M_ENV` shipped (kn-5dd784f5); the hour is what older
+#: would then be wrong. The 5-minute one is what Jarvis's own calls and every crew
+#: subagent buy; the hour is what a worker's LEAD buys by default (`worker.cache_ttl`,
+#: findings/2026-10-11-the-lead-buys-the-hour-the-crew-does-not.md) and what older
 #: transcripts were charged for, and a write's own `cache_1h` split is what says which
 #: of the two a LATER call had to beat.
 TTL_5M = 300.0
@@ -2101,7 +2102,8 @@ def one_hour_writes(since: float, *, root: Path | None = None,
 
 #: The one line that fixes the foreign half, quoted verbatim because the alarm's whole
 #: job is to make the work order behind it writable without a second investigation.
-#: `claude_cli.PROMPT_CACHE_5M_ENV` is the same flag, applied where Jarvis CAN apply it.
+#: `claude_cli.cache_env` pins the same flag (off, so its own TTL pair decides) where
+#: Jarvis CAN.
 REMEDY_LINE = '"env": {"FORCE_PROMPT_CACHING_5M": "1"}  in ~/.claude/settings.json'
 
 #: Said on the foreign alarm and on nothing else. THE HONEST CON, recorded in finding 3
@@ -2142,18 +2144,21 @@ def _name_sessions(found: Sequence[HourWrites], attr: str) -> str:
 
 
 def hour_alarms(found: Sequence[HourWrites], cfg: InspectConfig, *,
-                days: int) -> list[Alarm]:
+                days: int, hour_bought: bool = False) -> list[Alarm]:
     """What is standing-wrong with the fleet's cache TTL, one alarm per CAUSE.
 
     The dispatched one first, because it is the more serious finding by far and `alarms`'
     ordering contract is most-actionable-first: one is a defect in this repository and the
     other is a note to a person about their own machine.
+
+    `hour_bought`: some project's leads buy the hour on purpose (`worker.cache_ttl`), so
+    a dispatched 1h write is the policy and not a breach — the foreign half stands.
     """
     dispatched = sum(e.dispatched for e in found)
     foreign = sum(e.foreign for e in found)
     window = f"in the last {days} days"
     raised: list[Alarm] = []
-    if dispatched >= cfg.alarm_cache_1h_dispatched_tokens:
+    if dispatched >= cfg.alarm_cache_1h_dispatched_tokens and not hour_bought:
         raised.append(Alarm(CACHE_1H_DISPATCHED_ALARM, (
             f"{dispatched:,} tokens were written at the ONE-HOUR cache TTL {window} by "
             f"turns JARVIS ITSELF dispatched — about "

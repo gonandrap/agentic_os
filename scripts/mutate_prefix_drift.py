@@ -63,9 +63,11 @@ MUTATIONS: list[tuple[str, str, list[tuple[str, str]], set[str]]] = [
      [('    settings["includeGitInstructions"] = False',
        '    settings["includeGitInstructions"] = True')],
      {EVAL}),
-    ("the 5-minute cache flag is dropped from the worker settings",
+    ("the cache TTL pins are dropped from the worker settings",
      "src/jarvis/dispatch.py",
-     [("        **claude_cli.PROMPT_CACHE_5M_ENV,\n", "")],
+     [("        **claude_cli.cache_env(lead=project.worker.cache_ttl,\n"
+       "                               subagent=project.worker.subagent_cache_ttl),\n",
+       "")],
      {EVAL}),
     ("a generated skill file varies between rebuilds",
      "src/jarvis/bootstrap.py",

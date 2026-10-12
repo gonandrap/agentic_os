@@ -230,14 +230,18 @@ def test_a_stopped_units_pid_does_not_outlive_the_unit(
 
 def test_the_turn_in_a_unit_still_buys_the_five_minute_cache_write(
         fake_claude, fake_systemd, tmp_path, monkeypatch) -> None:
-    """`--setenv` is now the only way the flag reaches a worker, so the property
+    """`--setenv` is now the only way the pins reach a worker, so the property
     `tests/test_prompt_cache_ttl.py` guards has to be re-proved on this transport."""
-    monkeypatch.delenv("FORCE_PROMPT_CACHING_5M", raising=False)
+    for var in ("FORCE_PROMPT_CACHING_5M", "CLAUDE_CODE_PROMPT_CACHE_TTL",
+                "CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL"):
+        monkeypatch.delenv(var, raising=False)
     _spawn(tmp_path, unit="jarvis-turn-wo-1-1.service")
 
     calls = fake_claude.wait_calls(lambda c: "-p" in c["argv"])
     assert calls, "the fake claude was never invoked"
-    assert calls[-1]["cache_env"] == {"FORCE_PROMPT_CACHING_5M": "1"}
+    assert calls[-1]["cache_env"] == {"FORCE_PROMPT_CACHING_5M": "0",
+                                      "CLAUDE_CODE_PROMPT_CACHE_TTL": "5m",
+                                      "CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL": "5m"}
 
 
 def test_a_systemd_that_refuses_still_gets_the_turn_started(
@@ -449,7 +453,7 @@ def test_worker_settings_declare_headless_transport(project, jarvis_home) -> Non
 
 
 def test_transport_value_comes_from_claude_cli_constant(project, jarvis_home) -> None:
-    """The argument the file already makes for `PROMPT_CACHE_5M_ENV`: the launcher and
+    """The argument the file already makes for `cache_env`: the launcher and
     the settings file must not be able to disagree about what a turn is."""
     import inspect
 

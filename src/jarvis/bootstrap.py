@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import claude_cli
 from .catalog import ProjectSpec
 from .paths import project_state_dir
 
@@ -63,7 +64,7 @@ from .paths import project_state_dir
 # a PreToolUse check now refuses an oversized `jarvis wo send` / `wo assume` body, a
 # question over 4000 chars and a `$(git diff …)` substitution, so every managed repo's
 # contract has to say what to pass instead before a worker is refused.
-TEMPLATE_VERSION = 14
+TEMPLATE_VERSION = 15
 ASSETS = Path(__file__).parent / "assets"
 
 
@@ -318,11 +319,18 @@ def operation_specifics(text: str) -> str:
 def render_operation_md(project: ProjectSpec,
                         specifics: str = DEFAULT_SPECIFICS) -> str:
     """The contract exactly as it belongs on disk, rendered but not written."""
+    rhythm = claude_cli.cache_rhythm(project.worker.cache_ttl)
     return (ASSETS / "OPERATION.md.tmpl").read_text().format(
         template_version=TEMPLATE_VERSION,
         project_name=project.name,
         project_specifics=specifics,
         gates_section=_gates_section(project),
+        poll_every=rhythm.poll_every,
+        foreground_cap_seconds=rhythm.cap_seconds,
+        cache_ttl_minutes=rhythm.minutes,
+        cache_ttl_seconds=rhythm.seconds,
+        long_seats_clause=("" if rhythm.seconds >= 3600
+                           else ", a `jarvis-implementer` or `jarvis-spec-writer` call"),
     )
 
 

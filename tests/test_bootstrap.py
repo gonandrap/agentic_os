@@ -430,15 +430,18 @@ def test_the_template_does_not_prescribe_the_foreground_for_long_work(project):
 
     assert "runs in the *foreground* and you wait for it" not in template
     assert "in the FOREGROUND and wait" not in template
-    for rhythm in ("run_in_background", "BashOutput", "3-4 minutes", "240 seconds",
-                   "uncollected"):
+    for rhythm in ("run_in_background", "BashOutput", "every {poll_every}",
+                   "{foreground_cap_seconds}", "uncollected"):
         assert rhythm in template, rhythm
     # Still true, and still there: nothing about backgrounding changes what starts the
     # next turn, or what a turn ending on a promise costs.
     assert "Exactly three things start your next turn" in template
     assert "I'll pick this up when the background run finishes" in template
-    # …and the rendered contract carries it, which is the copy a worker reads.
-    assert "3-4 minutes" in _rendered_operation(project)
+    # …and the rendered contract carries it, which is the copy a worker reads, with the
+    # numbers of the TTL this project's leads buy.
+    from jarvis.claude_cli import cache_rhythm
+    rendered = _rendered_operation(project)
+    assert cache_rhythm(spec(project).worker.cache_ttl).poll_every in rendered
 
 
 def test_this_repos_committed_operation_md_matches_its_generator():

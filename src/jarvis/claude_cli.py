@@ -22,7 +22,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from zoneinfo import ZoneInfo
 
 from . import systemd_units
@@ -34,13 +34,45 @@ log = logging.getLogger("jarvisd.claude")
 #: fake; the test-isolation gate points it at a stub that refuses to run.
 CLAUDE_BIN_ENV = "JARVIS_CLAUDE_BIN"
 
-#: Buy the 5-minute prompt cache (write 1.25x) rather than the one-hour one (2x), on
-#: EVERY `claude` process Jarvis starts — `_run` and `spawn_turn` are the only two that
-#: do, and both apply it. The value matters as much as the key: the CLI accepts exactly
-#: "1"/"true"/"yes"/"on". Why it is forced rather than left to the CLI's default, and
-#: what would reverse the decision:
-#: docs/superpowers/specs/2026-08-22-the-five-minute-write-everywhere.md
-PROMPT_CACHE_5M_ENV = {"FORCE_PROMPT_CACHING_5M": "1"}
+#: The prompt-cache TTL, pinned on EVERY `claude` process Jarvis starts — `_run` and
+#: `spawn_turn` are the only two that do, and both apply `cache_env`. The CLI decides
+#: the TTL per request from TWO variables, one for the main thread and one for every
+#: other request in the process (subagents, helpers), and `FORCE_PROMPT_CACHING_5M`
+#: short-circuits both — so all three are written, and the force flag is written OFF
+#: with a value the CLI reads as false (it accepts exactly "1"/"true"/"yes"/"on").
+#: A value outside `CACHE_TTLS` falls through to the CLI's own default, silently, which
+#: is why `cache_env` refuses one. Why the lead and its crew are bought different
+#: TTLs, and the measurements: docs/superpowers/findings/
+#: 2026-10-11-the-lead-buys-the-hour-the-crew-does-not.md
+PROMPT_CACHE_FORCE_5M_ENV = "FORCE_PROMPT_CACHING_5M"
+PROMPT_CACHE_TTL_ENV = "CLAUDE_CODE_PROMPT_CACHE_TTL"
+SUBAGENT_PROMPT_CACHE_TTL_ENV = "CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL"
+CACHE_TTLS = ("5m", "1h")
+#: What a launch path that resolved no catalog gets: the cheap write on both threads,
+#: never the CLI's default — the direction a mistake must fail in.
+DEFAULT_CACHE_TTL = "5m"
+
+
+class CacheRhythm(NamedTuple):
+    ttl: str
+    seconds: int
+    minutes: int
+    cap_seconds: int
+    poll_every: str
+    write_rate: str
+
+
+_RHYTHMS = {
+    "5m": CacheRhythm("5m", 300, 5, 240, "3-4 minutes", "1.25x"),
+    "1h": CacheRhythm("1h", 3600, 60, 2880, "30-40 minutes", "2x"),
+}
+
+
+def cache_rhythm(ttl: str | None) -> CacheRhythm:
+    """The numbers a worker is told about its cache, from the TTL its lead bought.
+    `hooks` spells the same arithmetic rather than importing it (import cost on every
+    Bash call); `tests/test_cache_ttl_brief.py` pins the two together."""
+    return _RHYTHMS.get(ttl or "", _RHYTHMS[DEFAULT_CACHE_TTL])
 
 
 #: WHICH TRANSPORT this session's turns run on, declared rather than assumed. Every rule
@@ -50,19 +82,29 @@ PROMPT_CACHE_5M_ENV = {"FORCE_PROMPT_CACHING_5M": "1"}
 #: tells its own workers. §3 of
 #: docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md
 TURN_TRANSPORT_ENV = "JARVIS_TURN_TRANSPORT"
+#: The lead's prompt-cache TTL as the hooks and `jarvis brief` see it (`"5m"`/`"1h"`),
+#: written beside the CLI's own pins so the cap they size and the TTL the lead bought
+#: cannot disagree. See `hooks.cache_ttl_seconds`.
+CACHE_TTL_ENV = "JARVIS_CACHE_TTL"
 TRANSPORT_HEADLESS = "headless"      # spawn_turn: `claude -p`, one-shot
 TRANSPORT_BACKGROUND = "background"  # spawn_background: `claude --bg`, supervisor-owned
 
 
-def cache_env(explicit: dict[str, str] | None = None) -> dict[str, str]:
-    """The 5-minute cache flag, overlaid by whatever a caller asked for EXPLICITLY.
+def cache_env(explicit: dict[str, str] | None = None, *,
+              lead: str = DEFAULT_CACHE_TTL,
+              subagent: str = DEFAULT_CACHE_TTL) -> dict[str, str]:
+    """The TTL pins, overlaid by whatever a caller asked for EXPLICITLY.
 
     Three levels of precedence: the ambient environment loses, this default sits above
     it, an explicit `env_extra` above that. Callers therefore merge the result in
-    opposite directions depending on which they hold — see the spec's "where the flag
-    lives" section.
+    opposite directions depending on which they hold — see the 2026-08-22 spec's
+    "where the flag lives" section.
     """
-    return {**PROMPT_CACHE_5M_ENV, **(explicit or {})}
+    for value in (lead, subagent):
+        if value not in CACHE_TTLS:
+            raise ValueError(f"prompt-cache TTL {value!r} not in {CACHE_TTLS}")
+    return {PROMPT_CACHE_FORCE_5M_ENV: "0", PROMPT_CACHE_TTL_ENV: lead,
+            SUBAGENT_PROMPT_CACHE_TTL_ENV: subagent, **(explicit or {})}
 
 
 #: Above this many BYTES a system prompt goes to the CLI in a file rather than in argv.
@@ -954,8 +996,10 @@ def spawn_turn(prompt: str, cwd: Path, session_id: str, outfile: Path,
     promptfile = outfile.with_suffix(".prompt") if big else None
     if promptfile is not None:
         promptfile.write_text(prompt, encoding="utf-8")
+    ttl = kwargs.pop("cache_ttl", None) or DEFAULT_CACHE_TTL
+    subagent_ttl = kwargs.pop("subagent_cache_ttl", None) or DEFAULT_CACHE_TTL
     args = turn_args(prompt, session_id, resume, prompt_via_stdin=big, **kwargs)
-    env = {**os.environ, **cache_env()}
+    env = {**os.environ, **cache_env(lead=ttl, subagent=subagent_ttl)}
     if unit and systemd_units.use_transient_units():
         prefix = systemd_units.run_prefix(
             unit, cwd=cwd, outfile=outfile, errfile=errfile, env=env,

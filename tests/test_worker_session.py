@@ -404,23 +404,31 @@ def test_opting_out_emits_no_flag_at_all(fleet, fake_claude, settle_turns):
     assert _autocompact_of(fake_claude.calls[-1]["argv"]) is None
 
 
-def test_workers_buy_the_five_minute_cache_not_the_one_hour_one(fleet, settle_turns):
+def test_the_lead_buys_the_hour_and_its_crew_the_five_minute_write(
+        fleet, settle_turns, fake_claude, monkeypatch):
     """A cache WRITE costs 1.25x base input at the 5-minute TTL and 2x at the 1-hour one.
 
-    Claude Code opts a headless session into the 1h TTL by default. Measured across
-    every transcript on the machine, 98.1% of cache-READ tokens land within five
-    minutes of the previous call, so the longer window is bought and almost never
-    used — and the gap it exists to cover (a turn boundary) is cold anyway because
-    git status moves in the system prompt (kn-625e79f1).
-
-    Asserting the literal, not a constant: this is a cost decision, and it should
-    take a deliberate edit and a fresh measurement to reverse.
+    The lead idles while its crew works and pays the hour only on what it appends; a
+    subagent is never resumed and writes its whole prefix cold. Both pins ride in the
+    settings file AND the spawn environment, and the CLI's own short-circuit flag is
+    pinned off so a user's `~/.claude/settings.json` cannot overrule the catalog.
+    Asserting the literals, not constants: this is a cost decision and it should take a
+    deliberate edit and a fresh measurement to reverse. Findings:
+    docs/superpowers/findings/2026-10-11-the-lead-buys-the-hour-the-crew-does-not.md
     """
+    for var in ("FORCE_PROMPT_CACHING_5M", "CLAUDE_CODE_PROMPT_CACHE_TTL",
+                "CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL"):
+        monkeypatch.delenv(var, raising=False)
     store, project = fleet["store"], fleet["project"]
     wo = _wo(fleet)
     worker_session.start(store, project, wo, "go")
     assert settle_turns(store)
 
+    expected = {"FORCE_PROMPT_CACHING_5M": "0", "CLAUDE_CODE_PROMPT_CACHE_TTL": "1h",
+                "CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL": "5m"}
     settings = json.loads(
         (fleet["path"] / ".jarvis" / "worker-settings" / f"{wo['id']}.json").read_text())
-    assert settings["env"]["FORCE_PROMPT_CACHING_5M"] == "1"
+    assert {k: settings["env"][k] for k in expected} == expected
+    assert settings["env"]["JARVIS_CACHE_TTL"] == "1h"
+    calls = fake_claude.wait_calls(lambda c: "-p" in c["argv"])
+    assert calls[-1]["cache_env"] == expected
