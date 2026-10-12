@@ -732,6 +732,31 @@ def release_base_red_blocker(said: dict[str, Any]) -> str:
         run_url=said.get("run_url") or "")
 
 
+def pr_pending_blocker(wo_id: str, park: dict[str, Any]) -> str:
+    """The branch is pushed, nothing is on GitHub yet, and only the user can open it.
+
+    §5 of docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-
+    state.md. `release_base_red_blocker`'s shape: one renderer, filled from the park
+    event, so the line `ops.park_pr_pending` flags and the one `true_blockers` re-derives
+    every tick are the same string.
+
+    A FUNCTION OF THE PAYLOAD ONLY, which is the load-bearing part: INV-ATTENTION-REASON
+    rewrites anything it cannot re-derive, so a sentence that read the live worktree
+    would be byte-identical today and different once the worktree is reclaimed — the
+    relabelling this spec is fixing, one level up.
+
+    With no compare URL — a non-github.com origin, an unreadable one, or an event written
+    before this shipped — it degrades to the branch, the base and the command.
+    """
+    branch = str(park.get("branch") or "its branch")
+    base = str(park.get("base") or "the default branch")
+    url = str(park.get("compare_url") or "")
+    where = (f"open it at {url} (base `{base}`)" if url
+             else f"open one against `{base}`")
+    return (f"branch `{branch}` is pushed and has no pull request — {where}, then "
+            f"`jarvis wo pr {wo_id} <url>`")
+
+
 #: §9: the objection the OS sent about an assumption died on the way to the worker — its
 #: message spent its retries, or its envelope ended in a terminal state that is not
 #: `delivered`. Nobody but the user can move it now, because the worker was never told.
@@ -1195,6 +1220,15 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     if wo["status"] == "waiting_pr_merge" and parked_on_a_give_up(store, wo):
         blockers.append(PARKED_GIVE_UP_BLOCKER)
     if governed and wo["status"] == "needs_review":
+        # THE BRANCH IS PUSHED AND NOBODY HAS OPENED THE PULL REQUEST. Spec
+        # docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-
+        # state.md §5: its own `if` above the triage, so it ranks BELOW the assumptions
+        # line and ABOVE `UNLANDED_BLOCKER`, and UNGUARDED by `pending` on
+        # PR_CLOSED_BLOCKER's precedent — a pushed branch nobody can open is a fact
+        # about the outside world, independent of any decision the user still owes.
+        pr_pending = store.pr_pending_open(wo["id"])
+        if pr_pending is not None:
+            blockers.append(pr_pending_blocker(wo["id"], pr_pending))
         # THREE WAYS TO ARRIVE AT `needs_review`, ranked, and each asking the user for
         # something different. The `not pending` guards are PER LINE and not on the
         # branch head, which is the whole subtlety here: only ONE of the three can be
@@ -1242,7 +1276,11 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         # 4. Nothing more specific: the worker stopped without finishing. Guarded,
         #    because a `needs_review` holding a pending assumption is doing exactly what
         #    that status is for, and this line would call it a worker that gave up.
-        elif not pending:
+        #
+        #    AND NOT OVER A PUSHED BRANCH EITHER (2026-10-12 spec §5): that park always
+        #    follows a `finished` event, so "stopped without finishing" is false there
+        #    and the two lines would be one state said twice.
+        elif not pending and pr_pending is None:
             blockers.append(IDLE_NO_FINISH_BLOCKER)
     # A message the user sent that the worker will never see (GitHub issue 43). Derived
     # here rather than flagged at the delivery site because `deliver_messages` never runs

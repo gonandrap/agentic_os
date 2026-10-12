@@ -75,6 +75,7 @@ from .project_store import (
     FO_TERMINAL_STATUSES,
     MAX_MESSAGE_DELIVERY_ATTEMPTS,
     OPEN_STATUSES,
+    PR_PENDING_EVENT,
     PRE_APPROVED_KEY,
     RETRY_SWEEP_STATUSES,
     RUNNABLE_VALIDATION_OUTCOMES,
@@ -1116,6 +1117,10 @@ class Daemon:
                     # (spec 2026-09-26-a-red-default-branch-raises-itself.md §1).
                     self.poll_default_branch(project, store)
                     self.poll_pull_requests(project, store)
+                    # AFTER the poll and on its cadence: an order parked on a pushed
+                    # branch has no `pr_url` for the poll to read, and this is what can
+                    # give it one (2026-10-12 spec §9).
+                    self.attach_pull_requests(project, store)
                     # AFTER the poll, in the same tick: a merge that just completed a
                     # work order is what closes its issue, and making the tracker wait
                     # a second poll interval for news the OS already has is the gap
@@ -6783,6 +6788,66 @@ class Daemon:
             except Exception:  # noqa: BLE001
                 log.exception("[%s] settling %s against its PR failed", project.name,
                               wo["id"])
+
+    def attach_pull_requests(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Find the pull request the user opened for a parked pushed branch, and record
+        it.
+
+        §9 of
+        docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md.
+        HERE AND NOT IN `invariants.true_blockers`, which is the load-bearing choice:
+        that function runs for every work order on every tick and its contract is
+        "derived from state alone", so a sentence built on a network read would render
+        differently whenever the network was down. The daemon already owns every `gh`
+        read and its rate budget.
+
+        THE BRANCH COMES OFF THE EPISODE PAYLOAD, never off a worktree: these orders
+        outlive the branch they are about.
+
+        The attached URL ROUTES (§8.2) — `source: "auto"` is a declaration, because this
+        only runs over an order that said it is undertaking to land, it searches on that
+        order's own branch, and `--state open` means the pull request has not merged. An
+        attach that did NOT route would be strictly worse than doing nothing: it would
+        silence the blocker while taking the order out of the merge queue.
+
+        Degrades silently, `poll_pull_requests`' treatment of the same two exceptions.
+        """
+        from . import github, ops
+
+        # ONE BULK STATEMENT PER STEP, `poll_pull_requests`' shape: a `pr_pending` event
+        # is rare, so only the ids it names pay for the episode arithmetic.
+        candidates = [wo for wo in store.list_work_orders(statuses=("needs_review",),
+                                                          include_hidden=True)
+                      if not wo.get("pr_url")]
+        if not candidates:
+            return
+        ever = store.work_orders_with_event(PR_PENDING_EVENT,
+                                            [wo["id"] for wo in candidates])
+        parked = [(wo, park) for wo in candidates if wo["id"] in ever
+                  and (park := store.pr_pending_open(wo["id"])) is not None]
+        if not parked:
+            return
+        for wo, park in parked:
+            branch = str(park.get("branch") or "")
+            if not branch:
+                continue
+            try:
+                url = github.open_pull_request_for_branch(branch, cwd=project.path)
+            except github.GitHubError as e:
+                log.debug("[%s] could not look for %s's pull request: %s", project.name,
+                          wo["id"], e)
+                return
+            if not url:
+                continue
+            try:
+                ops.record_pull_request(wo["id"], url, project_name=project.name,
+                                        source="auto")
+            except ops.OpsError:
+                log.exception("[%s] could not attach %s to %s", project.name, url,
+                              wo["id"])
+                continue
+            log.info("[%s] attached %s to %s — found open on %s", project.name, url,
+                     wo["id"], branch)
 
     def refresh_landings(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Ask GitHub what became of the pull request each COMPLETED order recorded.

@@ -151,6 +151,145 @@ def test_a_missing_worktree_is_unreadable_not_produced(repo):
     assert gone.unreadable == "no worktree on disk"
 
 
+# -- a pushed branch with no pull request is a state ------------------------------------
+#
+# docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md.
+# `pushed` is read LOCALLY, off the remote-tracking ref the worktree's own `git push`
+# wrote, because this predicate runs inside a worker's finish turn and a settling must
+# never fail for want of a network (§1).
+
+
+def _push(repo: Repo, wt: Path, branch: str) -> None:
+    """What the worker does: push the branch, which writes `refs/remotes/origin/…`."""
+    _git(wt, "push", "-q", "origin", branch)
+
+
+def test_a_branch_nobody_pushed_is_not_pushed(repo):
+    wt = repo.worktree(WO)
+    repo.commit(wt, "src/feature.py", _feature("coder"))
+
+    work = landing.authored(wt)
+
+    assert work.produced is True
+    assert work.pushed is False
+
+
+def test_a_branch_whose_every_commit_is_on_the_remote_is_pushed(repo):
+    wt = repo.worktree(WO)
+    repo.commit(wt, "src/feature.py", _feature("coder"))
+    _push(repo, wt, f"worktree-{WO}")
+
+    work = landing.authored(wt)
+
+    assert work.produced is True
+    assert work.pushed is True
+
+
+def test_a_remote_behind_the_branch_is_not_pushed(repo):
+    """One commit made after the push. The remote does NOT carry every commit HEAD has."""
+    wt = repo.worktree(WO)
+    repo.commit(wt, "src/feature.py", _feature("coder"))
+    _push(repo, wt, f"worktree-{WO}")
+    repo.commit(wt, "src/more.py", _feature("more"), message="more")
+
+    assert landing.authored(wt).pushed is False
+
+
+def test_uncommitted_files_are_never_pushed(repo):
+    """§1: the worker is the only one who can commit them, so that case keeps today's
+    refusal verbatim."""
+    wt = repo.worktree(WO)
+    repo.commit(wt, "src/feature.py", _feature("coder"))
+    _push(repo, wt, f"worktree-{WO}")
+    (wt / "src" / "never_added.py").write_text(_feature("orphan"))
+
+    work = landing.authored(wt)
+
+    assert work.dirty
+    assert work.pushed is False
+
+
+def test_the_fixtures_local_origin_yields_no_compare_url_and_still_reads_as_pushed(repo):
+    """THE REGRESSION TEST FOR §3's HOST CHECK, and the reason it is this fixture.
+
+    `origin` here is a bare repo at a temp path. `github.origin_repo` does not fail on
+    that — it returns a pair parsed out of the path — so a derivation that did not read
+    the HOST would build a plausible github.com URL out of nonsense and print it at the
+    user. The park still happens: an empty compare URL degrades the blocker, it does not
+    unmake the state.
+    """
+    wt = repo.worktree(WO)
+    repo.commit(wt, "src/feature.py", _feature("coder"))
+    _push(repo, wt, f"worktree-{WO}")
+
+    work = landing.authored(wt)
+
+    assert work.pushed is True
+    assert work.compare_url == ""
+
+
+def test_the_record_round_trips_both_new_facts(repo):
+    """`record()` -> JSON -> `authored_in()`. The two are joined by dict keys, and a key
+    that did not match would silently un-derive the state the park is built on."""
+    import json
+
+    original = landing.Authored(branch="worktree-wo-abc12345", base="origin/trunk",
+                                commits=2, dirty=(), pushed=True,
+                                compare_url="https://github.com/acme/proj/compare/"
+                                            "trunk...worktree-wo-abc12345?expand=1")
+
+    read_back = landing.authored_in(json.loads(json.dumps(original.record())))
+
+    assert read_back == original
+
+
+def test_an_event_written_before_this_shipped_reads_as_not_pushed():
+    """§3's backward compatibility, by construction: not-pushed is the safe direction."""
+    legacy = landing.authored_in({"branch": "worktree-wo-abc12345",
+                                  "base": "origin/trunk", "commits": 1, "dirty": []})
+
+    assert legacy is not None
+    assert legacy.pushed is False
+    assert legacy.compare_url == ""
+
+
+# -- the compare URL itself: local git only, and github.com only -----------------------
+
+
+def _repo_with_origin(tmp_path: Path, remote: str) -> Path:
+    path = make_git_project(tmp_path, "withorigin")
+    _git(path, "remote", "add", "origin", remote)
+    return path
+
+
+def test_the_compare_url_is_built_from_the_origin_and_the_stripped_base(tmp_path):
+    from jarvis import github
+
+    path = _repo_with_origin(tmp_path, "https://github.com/Acme/Proj.git")
+
+    assert github.compare_url(path, "origin/trunk", "worktree-wo-abc12345") == (
+        "https://github.com/acme/proj/compare/trunk...worktree-wo-abc12345?expand=1")
+
+
+def test_a_non_github_origin_has_no_compare_url(tmp_path):
+    """§3: `origin_repo` discards the host, so a GitLab checkout would otherwise yield a
+    github.com URL pointing at a page that does not exist."""
+    from jarvis import github
+
+    path = _repo_with_origin(tmp_path, "git@gitlab.com:acme/proj.git")
+
+    assert github.compare_url(path, "origin/main", "worktree-wo-abc12345") is None
+
+
+def test_an_unreadable_origin_has_no_compare_url(tmp_path):
+    from jarvis import github
+
+    path = make_git_project(tmp_path, "noorigin")
+
+    assert github.compare_url(path, "origin/main", "b") is None
+    assert github.compare_url(tmp_path / "nowhere", "origin/main", "b") is None
+
+
 # -- the audit: what GitHub says about the pull request the order recorded --------------
 
 

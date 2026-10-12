@@ -159,27 +159,84 @@ def checked_pr_url(url: str, cwd: Path | None = None) -> str:
     return url
 
 
+def _origin_url(cwd: Path | None) -> str:
+    """This checkout's `origin` remote URL, or "" if it could not be read.
+
+    ONE invocation site for the one local git command this module declares, so the AST
+    test's `LOCAL_GIT_READS` audit keeps reading a single literal however many questions
+    are asked of the remote.
+    """
+    if cwd is None or not Path(cwd).is_dir():
+        return ""
+    try:
+        proc = subprocess.run(["git", "-C", str(cwd), "remote", "get-url", "origin"],
+                              capture_output=True, text=True, timeout=GH_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return (proc.stdout or "").strip()
+
+
 def origin_repo(cwd: Path | None) -> tuple[str, str] | None:
     """`(owner, repo)` lowercased for this checkout's `origin`, or None if unreadable.
 
     Both remote spellings, because a project cloned over ssh and one cloned over https
     are the same repository and only one of them looks like a URL:
     `git@host:owner/repo.git` and `https://host/owner/repo.git`.
+
+    THE HOST IS DISCARDED, which is safe for `checked_pr_url`'s comparison and is not
+    safe for building a URL — see `compare_url`.
     """
-    if cwd is None or not Path(cwd).is_dir():
+    remote = _origin_url(cwd).removesuffix(".git")
+    if not remote:
         return None
-    try:
-        proc = subprocess.run(["git", "-C", str(cwd), "remote", "get-url", "origin"],
-                              capture_output=True, text=True, timeout=GH_TIMEOUT)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if proc.returncode != 0:
-        return None
-    remote = (proc.stdout or "").strip().removesuffix(".git")
     parts = remote.replace(":", "/").rstrip("/").split("/")
     if len(parts) < 2 or not parts[-1] or not parts[-2]:
         return None
     return parts[-2].lower(), parts[-1].lower()
+
+
+def origin_host(cwd: Path | None) -> str:
+    """The HOST `origin` points at, lowercased, or "" if there is none to read.
+
+    A local path remote — a bare repo on disk, which is what every git fixture in the
+    suite has — yields "", so it is distinguishable from a real forge rather than
+    parsing into one.
+    """
+    remote = _origin_url(cwd)
+    if not remote:
+        return ""
+    # scheme, then userinfo (`https://x-access-token:TOKEN@host/…`), then the authority.
+    authority = remote.split("://", 1)[-1].split("@", 1)[-1]
+    return authority.split("/", 1)[0].split(":", 1)[0].lower()
+
+
+#: The one host whose URLs this OS assembles. See `compare_url`.
+GITHUB_HOST = "github.com"
+
+
+def compare_url(cwd: Path | None, base: str, branch: str) -> str | None:
+    """`https://github.com/{owner}/{repo}/compare/{base}...{branch}?expand=1`, or None.
+
+    §3 of
+    docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md.
+    `blob_url`'s rule exactly: LOCAL GIT ONLY, None at every unreadable step, and the
+    caller omits the link rather than guessing.
+
+    THE HOST IS READ, which `blob_url` does not do: `origin_repo` parses an `(owner,
+    repo)` pair out of a local path or a GitLab remote just as happily as out of a
+    github.com one, and this URL is printed at the user as somewhere to click.
+    """
+    if cwd is None or not base or not branch:
+        return None
+    if origin_host(cwd) != GITHUB_HOST:
+        return None
+    origin = origin_repo(cwd)
+    if origin is None:
+        return None
+    return (f"https://{GITHUB_HOST}/{origin[0]}/{origin[1]}/compare/"
+            f"{base.removeprefix('origin/')}...{branch}?expand=1")
 
 
 def blob_url(cwd: Path | None, repo_path: str) -> str | None:

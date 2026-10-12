@@ -1221,6 +1221,15 @@ def test_no_param_value_reaches_the_rendered_attention_sentence():
         assert slots == (), f"{key} declares a slot; widen this test with it"
 
 
+def test_the_pushed_branch_blocker_is_not_a_template_key():
+    """§6 of docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-
+    a-state.md, PINNED rather than remembered. That sentence carries a compare URL, which
+    is derived state and not rule data — passing one through a rule row is exactly the
+    path this table exists to break, and no rule has an episode payload to read it from
+    anyway. The asymmetry is deliberate: do not "fix" it by adding the key."""
+    assert "pr_pending" not in remedies.ATTENTION_TEMPLATES
+
+
 def test_attention_slots_interpolate_validated_ids_only(monkeypatch):
     """V1 DECLARES NO SLOTS — every template above is `slots=()` — so this grades the
     MACHINERY on a synthetic template, which is what the next template with an id in it

@@ -49,7 +49,12 @@ from .sections import QUESTION_MAX_CHARS, QUESTION_WARN_CHARS
 from .central_store import MISSED_MIN_WORDS, CentralStore
 from .daemon import daemon_running
 from .github import GitHubError
-from .invariants import PR_CLOSED_BLOCKER, UNLANDED_BLOCKER, true_blockers
+from .invariants import (
+    PR_CLOSED_BLOCKER,
+    UNLANDED_BLOCKER,
+    pr_pending_blocker,
+    true_blockers,
+)
 from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import (
     ASSUMPTION_DECIDER_OS,
@@ -62,6 +67,7 @@ from .project_store import (
     OPEN_STATUSES,
     FORCEABLE_STATUSES,
     OPEN_VALIDATION_OUTCOMES,
+    PR_PENDING_EVENT,
     TERMINAL_STATUSES,
     WO_STATUSES,
     ProjectStore,
@@ -4883,6 +4889,13 @@ def land_finished(store: ProjectStore, wo: dict[str, Any],
     if not pr_url and not store.work_abandoned(wo_id):
         stranding = unlanded_work(store, wo)
         if stranding.produced:
+            # ONE BRANCH, ONE SITE, and the choice is made here rather than in `finish`
+            # because every route to `completed` passes through this function — a second
+            # parker would need a third copy on the accept path. Spec
+            # docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-
+            # is-a-state.md §2.
+            if stranding.pushed:
+                return park_pr_pending(store, wo, stranding)
             return park_unlanded(store, wo, stranding)
     status = "waiting_pr_merge" if pr_url else "completed"
     store.set_status(wo_id, status)
@@ -4894,6 +4907,12 @@ def land_finished(store: ProjectStore, wo: dict[str, Any],
         finally:
             central.close()
     return status
+
+
+#: The `pr_url_recorded` sources that ASSERT this order's delivery sits behind that pull
+#: request, so the column may move the work order. `"gate"` is deliberately absent —
+#: see `declared_pull_request`.
+DECLARING_SOURCES = ("user", "auto")
 
 
 def declared_pull_request(store: ProjectStore, wo: dict[str, Any]) -> str:
@@ -4917,10 +4936,25 @@ def declared_pull_request(store: ProjectStore, wo: dict[str, Any]) -> str:
     `pr_url`: `review_work_order` hands its landing a copy with the column deliberately
     BLANKED once the poll has settled that pull request, and returning a URL out of the
     timeline there would put a closed pull request back in the merge queue.
+
+    **THE THIRD SOURCE IS `jarvis wo pr`, AND IT ROUTES** — re-entering the merge poll is
+    the whole point of the command, and without this it would be inert while looking
+    like it worked (spec 2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md
+    §8.1). So a `pr_url_recorded` whose `source` is the user's or the OS's auto-attach
+    (§8.2) is a declaration; the gate's stays inert, unchanged.
     """
-    for event in reversed(store.events_of_kind(wo["id"], "finished")):
-        declared = str(db.from_json(event["payload"], {}).get("pr_url") or "")
-        if declared:
+    # NEWEST FIRST, with the read order as the tiebreaker: two events sharing a
+    # timestamp must resolve the way the single-kind walk this replaced did — the later
+    # row wins.
+    events = [(float(e["ts"]), seq, kind, db.from_json(e["payload"], {}))
+              for seq, (kind, e) in enumerate(
+                  (kind, e) for kind in ("finished", "pr_url_recorded")
+                  for e in store.events_of_kind(wo["id"], kind))]
+    for _ts, _seq, kind, payload in sorted(events, key=lambda e: e[:2], reverse=True):
+        declared = str(payload.get("pr_url") or "")
+        if not declared:
+            continue
+        if kind == "finished" or str(payload.get("source") or "") in DECLARING_SOURCES:
             return declared
     return ""
 
@@ -5067,6 +5101,34 @@ def park_unlanded(store: ProjectStore, wo: dict[str, Any],
     store.add_event(wo["id"], "work_unlanded", {**work.record(), "was": wo["status"]})
     store.set_status(wo["id"], "needs_review")
     store.flag_attention(wo["id"], UNLANDED_BLOCKER)
+    return "needs_review"
+
+
+def park_pr_pending(store: ProjectStore, wo: dict[str, Any],
+                    work: landing.Authored) -> str:
+    """Hold a work order whose branch is PUSHED and carries no pull request, and say so.
+
+    `park_unlanded`'s sibling for the state the OS had no value for: pushed, undertaken
+    to land, not yet landed. Spec
+    docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md
+    §2 and §4 — the `gh` account is read-only, so the worker pushed and only the user can
+    open the pull request.
+
+    EVERYTHING IS ON THE EVENT — branch, base, commits, dirty, pushed and the compare URL
+    — because `invariants.pr_pending_blocker` rebuilds the sentence from the payload
+    alone, and a work order in this state outlives its worktree.
+
+    ONCE PER EPISODE, `park_unlanded`'s discipline verbatim and for its reason:
+    `Daemon.settle_work_order` re-derives the same ending from the same done turn every
+    tick, and the flag is left to `true_blockers` so `jarvis wo ack` is not overwritten.
+    """
+    if store.pr_pending_open(wo["id"]):
+        store.set_status(wo["id"], "needs_review", trigger="pr_pending_repark")
+        return "needs_review"
+    park = {**work.record(), "was": wo["status"]}
+    store.add_event(wo["id"], PR_PENDING_EVENT, park)
+    store.set_status(wo["id"], "needs_review")
+    store.flag_attention(wo["id"], pr_pending_blocker(wo["id"], park))
     return "needs_review"
 
 
@@ -6469,7 +6531,13 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
         # what this same read saw rather than re-running git against a tree that has
         # moved.
         stranding = unlanded_work(store, _wo, pr_url or "")
-        if stranding.produced and not abandon:
+        # A PUSHED BRANCH IS AN UNDERTAKING TO LAND, so it is not refused: there is a URL
+        # that shows the user the code, and `land_finished` parks the order on it. The
+        # refusal stands byte-identical for everything else — an unpushed commit or an
+        # uncommitted file has nowhere anyone could look. Spec
+        # docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-
+        # state.md §2. NO PARK HERE: one parker, in `land_finished`.
+        if stranding.produced and not stranding.pushed and not abandon:
             raise OpsError(unlanded_refusal(wo_id, summary, stranding))
         # `stranding` is the REFUSAL's reading and is deliberately empty for an order
         # carrying a pull request; `base` is what says a worktree was actually read. The
@@ -6553,6 +6621,64 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
         store.close()
     return {"project": name, "wo_id": wo_id, "status": status,
             **({"pr_url": pr_url} if pr_url else {})}
+
+
+def record_pull_request(wo_id: str, url: str, project_name: str | None = None,
+                        source: str = "user") -> dict[str, Any]:
+    """The pull request the WORKER COULD NOT OPEN, declared by the party that could.
+
+    §8 of
+    docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md.
+    The receiver `pr_pending_blocker` names: it records `pr_url`, closes the episode and
+    puts the order back in the merge queue.
+
+    DELIBERATELY NOT "re-run `jarvis wo finish --pr`": `finish` is a worker verb — it
+    opens a validation round and writes a `finished` event — and a settled order refuses
+    it. This asserts one fact and writes one event.
+
+    THE STATUS MOVES ONLY WHEN NOTHING ELSE HOLDS `needs_review`, probed through
+    `true_blockers` before anything is written to the column, `resettle_after_repair`'s
+    pattern. With an assumption still pending the URL is recorded and the order stays
+    where it is; the accept path then lands it through `land_finished`, which now sees a
+    routing `pr_url`.
+    """
+    from . import github
+
+    name, path, wo = find_work_order(wo_id, project_name)
+    store = ProjectStore(path)
+    try:
+        # A DECLARATION IS NEVER OVERWRITTEN — `gates._record_pull_request`'s fourth
+        # condition, and the same reasoning: the record already names one.
+        if wo.get("pr_url"):
+            raise OpsError(
+                f"{wo_id} already records {wo['pr_url']}. A pull request is declared "
+                f"once; if that one is wrong, close the order with `jarvis wo done`.")
+        if store.pr_pending_open(wo_id) is None:
+            owed = true_blockers(store, wo)
+            waiting = owed[0] if owed else f"{wo['status']}, with nothing owed"
+            raise OpsError(
+                f"{wo_id} has no pushed branch waiting on a pull request. "
+                f"What it is waiting on: {waiting}.")
+        try:
+            url = github.checked_pr_url(url, store.project_path)
+        except github.UntrustedPullRequest as e:
+            raise OpsError(str(e)) from e
+        store.update_work_order(wo_id, pr_url=url)
+        store.add_event(wo_id, "pr_url_recorded", {"pr_url": url, "source": source})
+        fresh = store.get_work_order(wo_id)
+        status = fresh["status"]
+        # JUDGE THE ROW IT WOULD BECOME BEFORE WRITING THE STATUS: an assumption, an
+        # escalated gate or a give-up still owes the user something, and the merge poll
+        # acts on the status rather than on the flag.
+        probe = {**fresh, "status": "waiting_pr_merge"}
+        if status == "needs_review" and not true_blockers(store, probe):
+            store.set_status(wo_id, "waiting_pr_merge")
+            store.clear_attention(wo_id)
+            status = "waiting_pr_merge"
+        return {"project": name, "wo_id": wo_id, "pr_url": url, "source": source,
+                "status": status}
+    finally:
+        store.close()
 
 
 def mark_done(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
@@ -8150,6 +8276,17 @@ def review_work_order(wo_id: str, accept: bool = True,
 
     out = {"project": name, "wo_id": wo_id, "reviewed": len(pending), "accepted": accept,
            "status": status}
+    # §7 of the 2026-10-12 spec: an accept that PARKED says what is still waiting — the
+    # branch, the base and where to open the pull request — rather than reading as a
+    # landing that happened.
+    store = ProjectStore(path)
+    try:
+        park = store.pr_pending_open(wo_id)
+    finally:
+        store.close()
+    if park is not None:
+        out["pr_pending"] = {k: park.get(k) or ""
+                             for k in ("branch", "base", "compare_url")}
     if not feedback:
         return out
 

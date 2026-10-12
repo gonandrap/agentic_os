@@ -231,6 +231,28 @@ jarvis wo done <id>                        # the user closing it: the work is fi
                                            # three failed, and then the attention line
                                            # says so and the timeline shows what was
                                            # tried.
+jarvis wo pr <wo-id> <url>                 # RECORDS A PULL REQUEST THE USER OPENED BY
+                                           # HAND, on a work order whose branch is pushed
+                                           # and that carries none. That is the
+                                           # `needs_review` park a worker lands in when
+                                           # it pushed a branch and could not open the
+                                           # pull request (the `gh` account is
+                                           # read-only); the attention line names the
+                                           # compare URL and this command. Recording it
+                                           # closes the park, puts the order back into
+                                           # `waiting_pr_merge`, and the merge poll
+                                           # watches it merge and completes it. NOT a
+                                           # re-run of `jarvis wo finish`, a worker verb
+                                           # a settled order refuses. The daemon tries
+                                           # this itself first: a read-only `gh pr list
+                                           # --head <branch>` that finds an open pull
+                                           # request on that branch attaches it with no
+                                           # user action, so this is the manual fallback.
+                                           # Refuses when the order already records a
+                                           # `pr_url` (that wants `jarvis wo done`), when
+                                           # no pushed-branch park is open, and on a URL
+                                           # that is not a pull request on this project's
+                                           # own origin.
 jarvis wo hide <id> / unhide <id>          # declutter: keeps the record, drops it from
                                            # listings, the summary and the attention list
 jarvis wo delete <id> --yes                # irreversible: erases the WO and its whole

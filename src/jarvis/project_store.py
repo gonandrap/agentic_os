@@ -68,6 +68,11 @@ OPEN_STATUSES = ("pending", "dispatching", "running", "idle", "waiting_input",
 # project's history, so listings collapse them behind a count rather than printing them.
 TERMINAL_STATUSES = ("completed", "cancelled", "failed")
 
+#: The branch is pushed, the work is undertaken to land, and no pull request exists yet.
+#: Spec docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-
+#: state.md §4. Payload is `Authored.record()` plus `was`; see `pr_pending_open`.
+PR_PENDING_EVENT = "pr_pending"
+
 #: An OS-built prompt for this work order was past `claude_cli.MAX_OS_PROMPT_CHARS`, so
 #: the call was never made and nothing judged the work. The payload carries NUMBERS AND
 #: IDENTIFIERS ONLY. Spec §4:
@@ -3954,6 +3959,29 @@ class ProjectStore:
         since = float(parked[-1]["ts"])
         closed = any(float(e["ts"]) > since
                      for kind in ("finished", "abandoned", "release_completed")
+                     for e in self.events_of_kind(wo_id, kind))
+        return None if closed else db.from_json(parked[-1]["payload"], {})
+
+    def pr_pending_open(self, wo_id: str) -> dict[str, Any] | None:
+        """The open pushed-branch-no-pull-request park on this order, or None.
+
+        §4 of docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-
+        a-state.md. `release_red_park_open`'s shape, and the PAYLOAD for its reason:
+        `invariants.true_blockers` rebuilds the sentence from the branch, the base and
+        the compare URL, and no constant can carry a URL.
+
+        Closed by a re-delivery (`finished`), an abandonment, the pull request being
+        recorded (`jarvis wo pr`, or the daemon's auto-attach) or its merge.
+        `work_unlanded` is deliberately NOT a closer: that is the other episode, and the
+        two are mutually exclusive anyway.
+        """
+        parked = self.events_of_kind(wo_id, PR_PENDING_EVENT)
+        if not parked:
+            return None
+        since = float(parked[-1]["ts"])
+        closed = any(float(e["ts"]) > since
+                     for kind in ("finished", "abandoned", "pr_url_recorded",
+                                  "pr_merged")
                      for e in self.events_of_kind(wo_id, kind))
         return None if closed else db.from_json(parked[-1]["payload"], {})
 

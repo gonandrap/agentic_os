@@ -188,6 +188,12 @@ class Authored:
     dirty: tuple[str, ...] = ()
     #: Why there is no answer, when there is none. "" when the worktree was read.
     unreadable: str = ""
+    #: Does the remote carry every commit HEAD has, with nothing uncommitted? §1 of
+    #: docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-
+    #: state.md — the third value `unlanded_work` never had.
+    pushed: bool = False
+    #: Where the user would open the pull request. "" is not a failure (§3).
+    compare_url: str = ""
 
     @property
     def produced(self) -> bool:
@@ -212,7 +218,8 @@ class Authored:
         it is read from is deleted long before anyone audits (`authored_in`).
         """
         return {"branch": self.branch, "base": self.base, "commits": self.commits,
-                "dirty": list(self.dirty)}
+                "dirty": list(self.dirty), "pushed": self.pushed,
+                "compare_url": self.compare_url}
 
     def describe(self) -> str:
         """One clause naming what exists, for the refusal that quotes it."""
@@ -253,10 +260,14 @@ def authored_in(payload: dict[str, object]) -> Authored | None:
         return None
     dirty = payload.get("dirty")
     count = payload.get("commits")
+    # `pushed` and `compare_url` default, so an event written before the 2026-10-12 spec
+    # reads as NOT pushed — the safe direction, which is today's refusal.
     return Authored(branch=str(payload.get("branch") or ""),
                     base=str(payload.get("base") or ""),
                     commits=count if isinstance(count, int) else 0,
-                    dirty=tuple(str(f) for f in dirty) if isinstance(dirty, list) else ())
+                    dirty=tuple(str(f) for f in dirty) if isinstance(dirty, list) else (),
+                    pushed=bool(payload.get("pushed")),
+                    compare_url=str(payload.get("compare_url") or ""))
 
 
 def latest_authorship(events: list[tuple[float, dict[str, object]]]) -> Authored | None:
@@ -316,9 +327,43 @@ def authored(worktree: Path | None) -> Authored:
     if branch is None or count is None or status is None:
         return Authored(unreadable="git could not read the worktree")
     dirty = tuple(line[3:] for line in status.splitlines() if line[3:])
-    return Authored(branch=branch.strip(), base=base,
+    branch = branch.strip()
+    pushed = not dirty and _pushed(worktree, branch)
+    return Authored(branch=branch, base=base,
                     commits=int(count.strip()) if count.strip().isdigit() else 0,
-                    dirty=dirty)
+                    dirty=dirty, pushed=pushed,
+                    compare_url=_compare_url(worktree, base, branch) if pushed else "")
+
+
+def _pushed(worktree: Path, branch: str) -> bool:
+    """Does `origin/<branch>` exist and carry every commit HEAD has? §1 of
+    docs/superpowers/specs/2026-10-12-a-pushed-branch-with-no-pull-request-is-a-state.md.
+
+    LOCAL, NEVER THE NETWORK: the remote-tracking ref was written by the `git push` this
+    same worktree ran, so for the case the spec is about it is exact — and a push made
+    from somewhere else reads as not-pushed, which is the existing refusal.
+
+    Two more `_git` calls, and either one failing is False for `_git`'s own reason: a
+    worker must never be stranded by a read, and the safe direction here is the refusal.
+    """
+    if not branch or branch == "HEAD":
+        return False
+    remote = f"refs/remotes/origin/{branch}"
+    if not (_git(worktree, "rev-parse", "--verify", "--quiet", remote) or "").strip():
+        return False
+    ahead = _git(worktree, "rev-list", "--count", f"{remote}..HEAD")
+    return ahead is not None and ahead.strip() == "0"
+
+
+def _compare_url(worktree: Path, base: str, branch: str) -> str:
+    """Where the user would open the pull request, or "" — §3's function-body import.
+
+    `github`'s, not a second copy of "which repository is this"; both directions lazy,
+    for the reason `github.blob_url` imports `landing.base_ref` the same way.
+    """
+    from .github import compare_url
+
+    return compare_url(worktree, base, branch) or ""
 
 
 def committed_text(project_path: Path, planner_wo: dict[str, Any] | None,
