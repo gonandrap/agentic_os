@@ -11,8 +11,9 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol
 
+from . import service_manager
 from .paths import production_code_dir, run_dir
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -174,10 +175,38 @@ class SystemdRunner:
         return boot_epoch + usec / 1e6
 
 
+class LaunchdRunner:
+    """`SystemdRunner`'s three questions, asked of launchd via `service_manager`"""
+
+    def restart_unit(self, unit: str) -> None:
+        service_manager.restart(unit)
+
+    def restart_unit_detached(self, unit: str, tag: str) -> None:
+        service_manager.restart_detached(unit, tag)
+
+    def unit_start_time(self, unit: str) -> float | None:
+        return service_manager.start_time(unit)
+
+
+class ServiceRunner(Protocol):
+    """What `maybe_restart` and `verify_on_boot` need of a runner, fakes included"""
+
+    def restart_unit(self, unit: str) -> None: ...
+    def restart_unit_detached(self, unit: str, tag: str) -> None: ...
+    def unit_start_time(self, unit: str) -> float | None: ...
+
+
+def service_runner() -> ServiceRunner:
+    """The runner for this host's init system — classes looked up at call time so tests can rebind them"""
+    if service_manager.manager() == service_manager.LAUNCHD:
+        return LaunchdRunner()
+    return SystemdRunner()
+
+
 # -- the reconcile-tick half
 
 
-def maybe_restart(store_for: StoreLookup, runner: SystemdRunner | None = None,
+def maybe_restart(store_for: StoreLookup, runner: ServiceRunner | None = None,
                   now: float | None = None) -> str | None:
     """Apply a staged release once its shipping worker has settled"""
     marker = read_marker()
@@ -203,7 +232,7 @@ def maybe_restart(store_for: StoreLookup, runner: SystemdRunner | None = None,
     marker["restart_at"] = now if now is not None else time.time()
     write_marker(marker)  # before any unit moves: the daemon may not survive this
 
-    runner = runner or SystemdRunner()
+    runner = runner or service_runner()
     runner.restart_unit(UI_UNIT)  # never hosts us; safe inline (kn-58429229 ordering)
     runner.restart_unit_detached(DAEMON_UNIT, tag)
     log.info("release %s: restarted %s, queued detached restart of %s",
@@ -214,7 +243,7 @@ def maybe_restart(store_for: StoreLookup, runner: SystemdRunner | None = None,
 # -- the boot half
 
 
-def verify_on_boot(store_for: StoreLookup, runner: SystemdRunner | None = None,
+def verify_on_boot(store_for: StoreLookup, runner: ServiceRunner | None = None,
                    now: float | None = None) -> dict[str, Any] | None:
     """Prove a restarting (or long-stranded staged) release actually applied"""
     marker = read_marker()
@@ -234,7 +263,7 @@ def verify_on_boot(store_for: StoreLookup, runner: SystemdRunner | None = None,
     wo_id = marker.get("wo_id") or ""
     version = marker.get("version") or ""
     tag = marker.get("tag") or f"jarvis-{version}"
-    runner = runner or SystemdRunner()
+    runner = runner or service_runner()
 
     problems: list[str] = []
     prod_version = _production_version()

@@ -1628,7 +1628,7 @@ class Daemon:
 
     def check_ui_health(self, now: float | None = None) -> str:
         """Is the dashboard still serving, and restart it if it is not (docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md)"""
-        from . import db, release, systemd_units, uilog
+        from . import db, release, service_manager, uilog
         from .notify import ui_base_url
 
         cfg = self.catalog.os.ui_health
@@ -1646,16 +1646,16 @@ class Daemon:
             self.central.set_state(UI_WEDGE_CAPPED_AT, "")
             return "healthy"
         # Deliberately stopped, not wedged
-        if not systemd_units.unit_active(release.UI_UNIT):
+        if not service_manager.unit_active(release.UI_UNIT):
             return "down"
         # Still booting after a release restart, not wedged (issue #1189)
         if body is None:
             # The STOP phase of that restart: uptime still holds the OLD start (issue #1194)
-            if systemd_units.unit_transitioning(release.UI_UNIT):
+            if service_manager.unit_transitioning(release.UI_UNIT):
                 log.info("dashboard not answering while %s is mid-restart — "
                          "not wedged", release.UI_UNIT)
                 return "restarting"
-            age = systemd_units.uptime_seconds(release.UI_UNIT)
+            age = service_manager.uptime_seconds(release.UI_UNIT)
             if age is not None and age < cfg.boot_grace_seconds:
                 log.info("dashboard not answering %.1fs after %s started — booting, "
                          "not wedged", age, release.UI_UNIT)
@@ -1687,7 +1687,7 @@ class Daemon:
                 )
             return "capped"
 
-        runner = self.release_runner or release.SystemdRunner()
+        runner = self.release_runner or release.service_runner()
         # ATTEMPTED BEFORE IT IS ANNOUNCED, and the attempt is recorded whether or not it raised
         error = ""
         try:
@@ -1705,7 +1705,7 @@ class Daemon:
                       f"restarted",
                 body=(f"The restart was attempted and FAILED: {error}. The dashboard is "
                       f"still wedged and the OS cannot heal it — restart it by hand "
-                      f"(`systemctl --user restart {release.UI_UNIT}`).\n"
+                      f"(`{service_manager.restart_hint(release.UI_UNIT)}`).\n"
                       f"The attempt counts against `ui_health.max_restarts_per_day`, so "
                       f"this is said once rather than on every tick.\n"
                       f"{evidence}"),

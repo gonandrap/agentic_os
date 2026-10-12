@@ -10,7 +10,16 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import bugreport, claude_cli, invariants, notify, paths, release, testing
+from jarvis import (
+    bugreport,
+    claude_cli,
+    invariants,
+    notify,
+    paths,
+    release,
+    service_manager,
+    testing,
+)
 from jarvis.catalog import parse_catalog
 from jarvis.central_store import CentralStore
 
@@ -208,6 +217,17 @@ def test_the_developers_own_local_bin_is_out_of_reach(tmp_path):
 
     assert env[release.CLI_BIN_DIR_ENV].startswith(str(tmp_path))
     assert Path(env[release.CLI_BIN_DIR_ENV]) != Path.home() / ".local" / "bin"
+
+
+def test_the_gate_pins_the_service_manager_to_systemd(tmp_path):
+    """Without this the suite's answer depends on the machine running it: on a Mac
+    `service_manager.manager()` reads `launchd`, `release.service_runner()` hands back a
+    `LaunchdRunner`, the two tests that monkeypatch `release.SystemdRunner` patch a class
+    nobody constructs — and the run `launchctl kickstart -k`s the human's own dashboard
+    (2026-10-12-service-queries-on-a-mac.md §5.1)."""
+    env = testing.gate_environment(tmp_path / "probe-gate")
+
+    assert env[service_manager.MANAGER_ENV] == service_manager.SYSTEMD
 
 
 def test_under_the_gate_the_prod_cli_check_reads_inside_the_sandbox():
