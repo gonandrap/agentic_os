@@ -106,7 +106,7 @@ case "$MANAGER" in
   *) printf '\033[1;31m✗ %s\033[0m\n' \
        "JARVIS_SERVICE_MANAGER must be systemd or launchd, not '$MANAGER'" >&2; exit 1 ;;
 esac
-LAUNCHD_DOMAIN="gui/$(id -u)"
+LAUNCHD_DOMAIN="gui/$UID"
 
 say()  { printf '\033[1;36m▶ %s\033[0m\n' "$*"; }
 run()  { if [ "$DRY_RUN" = 1 ]; then printf '  [dry-run] %s\n' "$*"; else eval "$*"; fi; }
