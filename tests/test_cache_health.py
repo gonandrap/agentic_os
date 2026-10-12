@@ -34,6 +34,16 @@ BOUNDARIES_EACH = 4
 _SEQ = itertools.count()
 
 
+@pytest.fixture(autouse=True)
+def _five_minute_fleet(catalog_file):
+    """Every scenario here is about a fleet on the FIVE-MINUTE write deciding whether
+    to buy the hour; a fleet that already bought it has no such question and the check
+    is silent (`invariants.fleet_buys_the_hour`, tests/test_cache_ttl_alarm_gate.py)."""
+    data = json.loads(catalog_file.read_text())
+    data.setdefault("os", {}).setdefault("defaults", {})["cache_ttl"] = "5m"
+    catalog_file.write_text(json.dumps(data))
+
+
 @pytest.fixture()
 def started(jarvis_home, fake_claude, catalog_file, project):
     ops.start_os(str(catalog_file), foreground=True)
