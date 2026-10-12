@@ -176,6 +176,32 @@ journalctl --user -u jarvis-ui -f           # follow UI logs
 `Restart=always` + `RestartSec=5` + `StartLimitIntervalSec=0` means each is brought
 back up whenever it exits, indefinitely (recovery).
 
+### macOS: launchd instead of systemd
+
+A Mac has no systemd. The same two services are **launchd agents**, rendered by the
+same installer from `deploy/com.jarvis.daemon.plist.template` and
+`deploy/com.jarvis.ui.plist.template` into `~/Library/LaunchAgents/`, with the same
+`PATH`, the same `JARVIS_HOME` / `PRODUCTION_CODE` / `JARVIS_ENV`, and `KeepAlive` +
+`RunAtLoad` standing in for `Restart=always` + `WantedBy=default.target`. The init
+system is picked by `uname -s`; `JARVIS_SERVICE_MANAGER=systemd|launchd` overrides it,
+and both `install_prod_service.sh` and `shipit.sh` read that one knob.
+
+| systemd | launchd |
+|---|---|
+| `jarvis.service` | `com.jarvis.daemon` |
+| `jarvis-ui.service` | `com.jarvis.ui` |
+| `systemctl --user status jarvis` | `launchctl print gui/$UID/com.jarvis.daemon` |
+| `systemctl --user restart jarvis` | `launchctl kickstart -k gui/$UID/com.jarvis.daemon` |
+| `systemctl --user stop jarvis` | `launchctl bootout gui/$UID/com.jarvis.daemon` |
+| `journalctl --user -u jarvis -f` | `tail -f $PRODUCTION_CODE/state/logs/jarvisd.launchd.log` |
+| `EnvironmentFile=` | the agent sources `secrets/jarvis.env` itself before `exec` |
+| linger | not needed: agents survive logout, start at login |
+
+Not ported: the **staged** (`--stage`) restart in `src/jarvis/release.py` still calls
+`systemctl`, and worker turns run on the direct `Popen` transport (no `systemd-run`), so
+a daemon restart on a Mac still takes a running turn with it. A plain `shipit` from your
+own shell is the supported path there.
+
 ### The unit's PATH is the whole fleet's PATH
 
 `Environment=PATH=` in `jarvis.service` is the only PATH the daemon has, and every

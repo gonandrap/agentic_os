@@ -41,10 +41,15 @@ def prod(tmp_path: Path) -> Path:
 
 
 def _run(prod_root: Path, tmp_path: Path, *, path: str = BASE_PATH,
-         args: list[str] | None = None) -> subprocess.CompletedProcess[str]:
+         args: list[str] | None = None, manager: str | None = "systemd",
+         ) -> subprocess.CompletedProcess[str]:
     unit_dir = tmp_path / "units"
     env = {"PATH": path, "HOME": str(tmp_path / "home"),
            "PRODUCTION_CODE": str(prod_root), "USER": os.environ.get("USER", "t")}
+    # Pinned, not inherited: the systemd tests below describe the Linux branch and must
+    # say the same thing on a macOS developer machine, where the default is launchd.
+    if manager is not None:
+        env["JARVIS_SERVICE_MANAGER"] = manager
     return subprocess.run(
         ["bash", str(SCRIPT), "--dry-run", "--unit-dir", str(unit_dir), *(args or [])],
         capture_output=True, text=True, env=env, check=False)
@@ -272,3 +277,104 @@ def test_the_check_is_doctor_only(units):
 
     assert invariants.check_service_path in invariants.OS_INVARIANTS
     assert invariants.check_service_path not in invariants.INVARIANTS
+
+
+# -- launchd: the same install on macOS ------------------------------------------
+#
+# macOS has no systemd. The units become two launchd agents under ~/Library/LaunchAgents,
+# `systemctl --user` becomes `launchctl`, and everything the PATH work above decided
+# still holds: the plist's PATH is the only PATH the daemon and every worker get.
+
+
+def _plist_string(tmp_path: Path, plist: str, key: str) -> str:
+    text = (tmp_path / "units" / plist).read_text()
+    marker = f"<key>{key}</key>"
+    assert marker in text, f"{plist} has no {key} key"
+    after = text.split(marker, 1)[1]
+    return after.split("<string>", 1)[1].split("</string>", 1)[0]
+
+
+def test_launchd_dry_run_renders_two_agents_and_never_calls_systemctl(prod, tmp_path):
+    result = _run(prod, tmp_path, manager="launchd")
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "units" / "com.jarvis.daemon.plist").is_file()
+    assert (tmp_path / "units" / "com.jarvis.ui.plist").is_file()
+    assert "systemctl" not in result.stdout + result.stderr
+    assert "[dry-run] launchctl bootstrap" in result.stdout
+    assert not (tmp_path / "units" / "jarvis.service").exists()
+
+
+def test_launchd_is_the_default_on_darwin(prod, tmp_path):
+    """No knob needed on a Mac: `uname -s` decides, and the env var only overrides it."""
+    result = _run(prod, tmp_path, manager=None)
+
+    assert result.returncode == 0, result.stderr
+    on_mac = os.uname().sysname == "Darwin"
+    assert (tmp_path / "units" / "com.jarvis.daemon.plist").exists() == on_mac
+    assert (tmp_path / "units" / "jarvis.service").exists() == (not on_mac)
+
+
+def test_launchd_agents_carry_the_same_path_the_units_would(prod, tmp_path):
+    odd = tmp_path / "opt" / "weird" / "bin"
+    _fake_gh(odd)
+
+    _run(prod, tmp_path, path=f"{odd}:{BASE_PATH}", manager="launchd")
+
+    daemon_path = _plist_string(tmp_path, "com.jarvis.daemon.plist", "PATH")
+    assert daemon_path == _plist_string(tmp_path, "com.jarvis.ui.plist", "PATH")
+    entries = daemon_path.split(":")
+    assert entries[0] == str(prod / "jarvis_os" / ".venv" / "bin")
+    assert str(odd) in entries
+
+
+def test_launchd_daemon_agent_runs_the_foreground_daemon_with_the_prod_catalog(prod, tmp_path):
+    _run(prod, tmp_path, manager="launchd")
+
+    text = (tmp_path / "units" / "com.jarvis.daemon.plist").read_text()
+    assert "start --catalog" in text and "--foreground" in text
+    assert str(prod / "config" / "catalog.json") in text
+    assert f"<string>{prod / 'state'}</string>" in text  # JARVIS_HOME
+    assert "<string>production</string>" in text         # JARVIS_ENV
+    # launchd has no EnvironmentFile=; the secrets are sourced by the agent itself
+    assert str(prod / "secrets" / "jarvis.env") in text
+
+
+def test_launchd_ui_agent_serves_the_catalog_port(prod, tmp_path):
+    (prod / "config").mkdir()
+    (prod / "config" / "catalog.json").write_text('{"os": {"ui": {"port": 9797}}}')
+
+    _run(prod, tmp_path, manager="launchd")
+
+    text = (tmp_path / "units" / "com.jarvis.ui.plist").read_text()
+    assert "<string>ui</string>" in text
+    assert "<string>9797</string>" in text
+
+
+def test_launchd_restarts_ui_inline_and_the_daemon_detached_and_last(prod, tmp_path):
+    """Same ordering contract as the systemd branch: kick the UI here, hand the daemon's
+    restart to something outside this script so a shipping worker survives it."""
+    result = _run(prod, tmp_path, manager="launchd")
+
+    out = result.stdout
+    ui = out.index("launchctl kickstart -k gui/")
+    assert "com.jarvis.ui" in out[ui:ui + 120]
+    daemon = out.index("com.jarvis.daemon", ui)
+    assert "detached" in out[daemon - 200:daemon + 200]
+    assert ui < daemon
+
+
+def test_launchd_no_restart_loads_but_leaves_the_restarts_to_the_caller(prod, tmp_path):
+    result = _run(prod, tmp_path, manager="launchd", args=["--no-restart"])
+
+    assert result.returncode == 0, result.stderr
+    assert "[dry-run] launchctl bootstrap" in result.stdout
+    assert "kickstart" not in result.stdout
+    assert "left to the caller" in result.stdout
+
+
+def test_an_unknown_service_manager_is_refused(prod, tmp_path):
+    result = _run(prod, tmp_path, manager="upstart")
+
+    assert result.returncode != 0
+    assert "JARVIS_SERVICE_MANAGER" in result.stderr
