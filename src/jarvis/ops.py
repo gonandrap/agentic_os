@@ -9046,6 +9046,31 @@ def last_stuck_investigation(project_name: str, subject: str) -> dict[str, Any] 
     return None
 
 
+#: `excluded_cause` for a manager waiting out its own feature (issue #1008). NOT a
+#: threshold, so NOT a catalog setting — kn-1cec46b5 covers thresholds only.
+IDLE_MANAGER_CAUSE = "its feature's next message"
+
+
+def manager_awaiting_feature(
+    pstore: ProjectStore, wo: dict[str, Any], now: float | None = None
+) -> bool:
+    """Is this a feature manager whose feature can still wake it?
+
+    §3 (`idle`'s actor) of docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-
+    act-on-this.md. Deliberately silent about the work order's OWN status: the caller
+    gates on that, so this stays reusable.
+
+    `now` unused: ops.scheduled_actor calls every predicate as p.test(store, wo, now=now).
+    """
+    if wo.get("kind") != "manager" or not wo.get("parent_id"):
+        return False
+    try:
+        parent = pstore.get_feature_order(wo["parent_id"])
+    except KeyError:
+        return False  # deleted out from under the child: nothing left to wake it
+    return parent["status"] not in FO_TERMINAL_STATUSES
+
+
 def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                window: bool = False,
                stuck_only: bool = True) -> tuple[int, list[dict[str, Any]]]:
@@ -9104,13 +9129,20 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                  if wo["status"] == "pending" else [])
         live_edges = bool(edges) and not any(
             invariants.dependency_is_dead(dep) for dep in edges)
+        if window or any(h.open for h in usage):
+            excluded_cause = PAUSE_USAGE_LIMIT  # keeps precedence over all
+        elif ci_held:
+            excluded_cause = VALIDATION_CI_CAUSE
+        elif live_edges:
+            excluded_cause = stuck.LIVE_DEPENDENCY
+        elif wo["status"] == "idle" and manager_awaiting_feature(pstore, wo):
+            excluded_cause = IDLE_MANAGER_CAUSE
+        else:
+            excluded_cause = ""
         verdict = stuck.assess(
             str(wo["status"]), now - since, now - (durations.last_activity_ts or since),
             discounted, thresholds, cfg.fallback_minutes * 60.0,
-            excluded_cause=(PAUSE_USAGE_LIMIT
-                            if window or any(h.open for h in usage)
-                            else VALIDATION_CI_CAUSE if ci_held
-                            else stuck.LIVE_DEPENDENCY if live_edges else ""))
+            excluded_cause=excluded_cause)
         if stuck_only and not verdict.stuck:
             continue
         blocker = true_blockers(pstore, wo, now=now)

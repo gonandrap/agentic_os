@@ -1593,6 +1593,91 @@ def test_a_projects_own_cadence_is_honoured(jarvis_home, project, tmp_path):
         central.close()
 
 
+# -- the idle feature manager: issue #1008 ---------------------------------------------
+#
+# A manager sits `idle` for its feature's whole life BY DESIGN — it wakes on a message
+# from its feature. `idle` is not in DEFAULT_FLEET_HEALTH_THRESHOLDS, so every manager
+# crossed the fallback ~30 minutes in and the sweep bought an investigation whose only
+# possible verdict was "working as designed", every cooldown, for the feature's whole life.
+# Shaped on `test_usage_limit_hold_is_not_stuck` above: the exclusion, and the same order
+# WITHOUT it being stuck, so nothing here passes on a threshold that can never fire.
+
+
+def _scan(store, *, stuck_only: bool = False) -> tuple[int, list[dict]]:
+    """`ops.stuck_scan` over proj_a at the shipped `fleet_health` numbers."""
+    return ops.stuck_scan(store, "proj_a", catalog.FleetHealthConfig(), time.time(),
+                          stuck_only=stuck_only)
+
+
+def _manager(store, fo_status: str = "executing", hours: float = 5.0,
+             status: str = "idle", kind: str = "manager") -> dict:
+    fo_id = _feature(store, status=fo_status, carrier=False)
+    wo = store.create_work_order("manage it", parent_id=fo_id, kind=kind)
+    park_order(store, wo["id"], status, hours=hours)
+    return store.get_work_order(wo["id"])
+
+
+def test_an_idle_manager_of_an_open_feature_is_excluded(stuck_os):
+    store = stuck_os["store"]
+    manager = _manager(store)
+
+    scanned, rows = _scan(store)
+    assert scanned == 1
+    assert [r["wo"]["id"] for r in rows] == [manager["id"]]
+    assert rows[0]["verdict"].excluded == ops.IDLE_MANAGER_CAUSE
+    assert not rows[0]["verdict"].stuck
+
+    # The row stays scanned and stays in the full output; only `stuck_only` drops it.
+    assert _scan(store, stuck_only=True) == (1, [])
+
+
+def test_an_idle_manager_of_a_settled_feature_is_still_a_candidate(stuck_os):
+    """The other half: once the feature cannot message it, nothing will wake it."""
+    from jarvis.project_store import FO_TERMINAL_STATUSES
+
+    for fo_status in FO_TERMINAL_STATUSES:
+        store = stuck_os["store"]
+        manager = _manager(store, fo_status=fo_status)
+        rows = {r["wo"]["id"]: r for r in _scan(store, stuck_only=True)[1]}
+        assert manager["id"] in rows, fo_status
+        assert rows[manager["id"]]["verdict"].excluded == ""
+        assert rows[manager["id"]]["verdict"].stuck
+
+
+def test_the_carve_out_does_not_widen_past_idle_managers(stuck_os):
+    """Neither an idle ORDINARY order nor a manager that is not idle: both are judged."""
+    store = stuck_os["store"]
+    plain = _manager(store, kind="worker")
+    busy = _manager(store, status="running")
+
+    rows = {r["wo"]["id"]: r for r in _scan(store)[1]}
+    for wo in (plain, busy):
+        assert rows[wo["id"]]["verdict"].excluded == ""
+        assert rows[wo["id"]]["verdict"].stuck
+
+
+def test_manager_awaiting_feature_needs_a_manager_and_a_live_feature(stuck_os):
+    store = stuck_os["store"]
+    fo_id = _feature(store, carrier=False)
+
+    orphan = store.create_work_order("no feature at all", kind="manager")
+    assert not ops.manager_awaiting_feature(store, orphan)
+
+    worker = store.create_work_order("not a manager", parent_id=fo_id)
+    assert not ops.manager_awaiting_feature(store, worker)
+
+    manager = store.create_work_order("manage it", parent_id=fo_id, kind="manager")
+    assert ops.manager_awaiting_feature(store, manager)
+    # scheduled_actor passes now= to every predicate: accepted, changes nothing.
+    assert ops.manager_awaiting_feature(store, manager, now=1234.5) is (
+        ops.manager_awaiting_feature(store, manager)
+    )
+
+    # A feature deleted out from under its manager: KeyError, not a candidate.
+    assert not ops.manager_awaiting_feature(
+        store, {**manager, "parent_id": "fo-does-not-exist"})
+
+
 # -- the free re-assertion: a stale look at a unit the OS can already explain -----------
 #
 # docs/superpowers/specs/2026-10-02-the-health-sweep-must-not-pay-to-restate-a-fingerprint.md
