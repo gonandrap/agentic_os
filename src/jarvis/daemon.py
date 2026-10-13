@@ -416,6 +416,29 @@ asked for the rework, so it was judged outside the budget. Fix what is above and
 `jarvis wo finish {wo_id} --summary "..." --evidence "..."` again — that next round is a
 charged one."""
 
+#: THE SAME REJECTION ON A HEAD GITHUB CALLED RED, with nobody seated and no round spent.
+#: Shaped on `USER_REWORK_FEEDBACK`, and it carries NO round number for the same reason:
+#: none was spent, and a number here would teach the submitter it has fewer attempts than
+#: it has.
+#:
+#: A REFERENCE AND NEVER A PAYLOAD. No log text, no job output, no excerpt — a failure log
+#: is unbounded, model-hostile input the submitter can fetch itself
+#: (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md). The last paragraph is the
+#: whole of the OS's answer to issue 1025's gap 2: the live case was a branch that could
+#: not pass alone because it depended on an unmerged sibling (spec §3.4).
+RED_CI_FEEDBACK = """REVIEW FEEDBACK (no round spent)
+{reason}
+
+Read the failures yourself with `gh pr checks {pr_url}` — none of the output is copied
+here. Then either fix the build, or, if this branch cannot pass on its own because it
+depends on another pull request that has not merged yet, stack it onto that branch or wait
+for the merge. Either way, run
+`jarvis wo finish {wo_id} --summary "..." --evidence "..."` again when the checks are
+green.
+
+This is not one of your {max_rounds} review rounds and nobody has read the work yet, so
+nothing was spent here. The next submission is judged normally."""
+
 #: THE SAME REJECTION, ADDRESSED TO A DIFFERENT JOB. A manager does not fix code — it
 #: files work orders that do — so the closing instruction cannot be the implementor's, and
 #: a manager that read "address this" would go and edit the repository itself.
@@ -2752,6 +2775,25 @@ class Daemon:
                          project.name, wo_id, n, ", ".join(pending))
                 return
 
+            # A HEAD GITHUB HAS ALREADY CALLED RED IS SENT BACK, not judged. Spec:
+            # docs/superpowers/specs/2026-10-13-a-red-head-is-sent-back-before-the-panel.md
+            #
+            # AFTER the head and the file map for the reason the hold above is, BEFORE
+            # the validator because the validator is the expense this exists to avoid,
+            # and NOT before the `ci_pending` hold: a red-and-still-running pull request
+            # is a wait, and ordering this first would convert every wait whose first
+            # check failed into a return. `not pending` is explicit for the same reason —
+            # once the hold lapses a partially reported pull request must reach the seats
+            # rather than be returned on an incomplete list of names (spec §3.2).
+            failing = evidence_mod.ci_failing(packet)
+            returns = store.uncounted_validation_rounds(
+                wo_id=wo_id, cause=ops.RED_CI_CAUSE)
+            if not pending and failing and returns < int(cfg.red_ci_returns):
+                self._validation_red_ci(store, wo, round_id, n, max_rounds, failing)
+                log.info("[%s] %s: round %d returned unjudged — CI is red (%s)",
+                         project.name, wo_id, n, ", ".join(failing))
+                return
+
             validator = (self.validator if self.validator is not None
                          else self._validator(cfg))
             if validator is None:
@@ -2798,7 +2840,18 @@ class Daemon:
             # earlier round it would punish a submitter that was told to go back to a
             # shape it had already tried, which is a legitimate answer to feedback.
             previous = self._preceding_round(store, n, wo_id=wo_id)
-            if self._repeat_submission(round_row, previous):
+            # A SUBMISSION SENT BACK FOR RED CI MAY COME BACK UNCHANGED, and must: the
+            # live case (wo-72c3d20b) was a correct branch that could not pass CI alone
+            # because it needed sibling PR #1023 merged, and waiting then resubmitting
+            # the same branch is the right answer. Keyed on the IMMEDIATELY PRECEDING
+            # round, so an unchanged resubmission three rounds later is still the stall
+            # the guard exists for — and, with the red checks still red past the cap, the
+            # guard is live again on that fingerprint (spec §5.1).
+            after_red_ci = (previous is not None and not failing
+                            and str(previous["uncounted_cause"] or "")
+                            == ops.RED_CI_CAUSE)
+            if self._repeat_submission(round_row, previous,
+                                       after_red_ci=after_red_ci):
                 self._escalate(
                     store, wo, round_id, n,
                     f"this submission is identical to round {previous['round']} — the "
@@ -2956,8 +3009,13 @@ class Daemon:
 
     @staticmethod
     def _repeat_submission(round_row: dict[str, Any],
-                           previous: dict[str, Any] | None) -> bool:
+                           previous: dict[str, Any] | None, *,
+                           after_red_ci: bool = False) -> bool:
         """Is this round the SAME SUBMISSION as the one before it, with nothing new?
+
+        `after_red_ci` is the caller's exemption — see the call site in
+        `_validate_work_order` and spec §5.1 of
+        docs/superpowers/specs/2026-10-13-a-red-head-is-sent-back-before-the-panel.md.
 
         A round a PERSON forced is never one, whatever it hashes to. The guard is about a
         SUBMITTER re-delivering unchanged work in answer to feedback; `jarvis validation
@@ -2975,7 +3033,7 @@ class Daemon:
         Shared by both loops so the rule has one home — a feature round cannot be forced
         today, and the copy in `validate_features` is how that stops being true quietly.
         """
-        if str(round_row["forced_reason"] or "").strip():
+        if str(round_row["forced_reason"] or "").strip() or after_red_ci:
             return False
         return (previous is not None
                 and previous["fingerprint"] == round_row["fingerprint"])
@@ -2998,7 +3056,8 @@ class Daemon:
     def _reject(store: ProjectStore, wo: dict, round_id: int, n: int, max_rounds: int,
                 reason: str, *, note: str = "", budget_round: int | None = None,
                 rebind: tuple[int, int] | None = None,
-                uncounted_cause: str = "") -> None:
+                uncounted_cause: str = "", failing: tuple[str, ...] = (),
+                pr_url: str = "") -> None:
         """Close the round and send the feedback back — OVER THE BUS, never directly.
 
         The round machine does not call `queue_message` and never names a work order as
@@ -3021,6 +3080,11 @@ class Daemon:
         merge, and no "re-judgement 1 of 2" cap (Neo question 973). It rides on the
         event too, so every surface can tell the two uncounted causes apart.
 
+        `failing` and `pr_url` serve the third uncounted cause, `ops.RED_CI_CAUSE`: the
+        check names go on the event and into the envelope, and the envelope points at
+        `gh pr checks <pr_url>` rather than carrying any log text (spec §3.4, §7 of
+        docs/superpowers/specs/2026-10-13-a-red-head-is-sent-back-before-the-panel.md).
+
         `budget_round` is this round's BUDGET POSITION, which after a rebind is behind
         its row number, and it is what the ordinary feedback names — a submitter told
         "round 3 of 3" on its second charged round would ration itself out of a round it
@@ -3034,6 +3098,7 @@ class Daemon:
 
         wo_id = wo["id"]
         rework = uncounted_cause == ops.USER_REWORK_CAUSE
+        red_ci = uncounted_cause == ops.RED_CI_CAUSE
         store.close_validation_round(round_id, "rejected", reason)
         used, of = rebind or (0, max_rounds)
         pos = n if budget_round is None else budget_round
@@ -3041,12 +3106,19 @@ class Daemon:
         # "round 5 of 3" (spec 2026-09-27 §4.4).
         event: dict[str, Any] = {"round": n, "round_id": round_id, "of": of,
                                  "budget_round": pos}
-        if rebind is not None or rework:
+        if rebind is not None or rework or red_ci:
             event["uncounted"] = True
         if uncounted_cause:
             event["uncounted_cause"] = uncounted_cause
+        if failing:
+            # WHAT IT RETURNED FOR, truncated like the envelope's: GitHub's check list
+            # has moved on by the time anyone reads the record (spec §7).
+            event["failing"] = list(failing[:6])
         store.add_event(wo_id, "validation_rejected", event)
-        if rework:
+        if red_ci:
+            text = RED_CI_FEEDBACK.format(reason=reason + note, pr_url=pr_url,
+                                          wo_id=wo_id, max_rounds=max_rounds)
+        elif rework:
             text = USER_REWORK_FEEDBACK.format(max_rounds=max_rounds,
                                                reason=reason + note, wo_id=wo_id)
         elif rebind is not None:
@@ -3154,6 +3226,37 @@ class Daemon:
         store.add_event(wo["id"], "validation_failed",
                         {"round": n, "cause": VALIDATION_HELD_CAUSE,
                          "reopens_at": reopens, "error": limit.message[:500]})
+
+    @staticmethod
+    def _validation_red_ci(store: ProjectStore, wo: dict, round_id: int, n: int,
+                           max_rounds: int, failing: tuple[str, ...]) -> None:
+        """GitHub has finished and says the code is wrong. SEND IT BACK, uncounted.
+
+        A SETTLE AND NOT A HOLD, unlike `_validation_ci_held` beside it: the WORKER has
+        to act — push a fix, restack the branch, or wait for a sibling and resubmit — and
+        a held round holds no worker, sends no envelope and would re-close itself every
+        tick until the deadline lapsed and the seats read the red head anyway (spec §6.3).
+        Nothing in the hold accounting changes, and `hold_cause` stays NULL.
+
+        The round was OPENED counted — `submit_for_validation` had no way to know CI would
+        be red — so it is marked uncounted HERE, with its own cause: a red-CI return must
+        not eat the free round a user's rework needs, and a rebind must not eat a red-CI
+        return (spec §3.3, §4).
+
+        Spec: docs/superpowers/specs/2026-10-13-a-red-head-is-sent-back-before-the-panel.md
+        """
+        from . import ops
+
+        names = ", ".join(failing[:6]) + (" …" if len(failing) > 6 else "")
+        store.mark_validation_round_uncounted(round_id, ops.RED_CI_CAUSE)
+        # SELF-DESCRIBING, because a seat reads this as history next round and must not
+        # take it for a quality finding a previous seat made (spec §5.4).
+        Daemon._reject(
+            store, wo, round_id, n, max_rounds,
+            f"the checks on this pull request have finished and these are red: {names}. "
+            f"It was sent back without review rather than judged.",
+            uncounted_cause=ops.RED_CI_CAUSE, failing=failing,
+            pr_url=str(wo["pr_url"] or ""))
 
     @staticmethod
     def _validation_ci_held(store: ProjectStore, wo: dict, round_id: int, n: int,

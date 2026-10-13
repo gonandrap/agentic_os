@@ -7205,6 +7205,9 @@ REBIND_MAX = 2
 #: re-judge spend the round a user's rework needs — wo-299daf2e.
 REBIND_CAUSE = "rebind"
 USER_REWORK_CAUSE = "user_rework"
+#: Spec docs/superpowers/specs/2026-10-13-a-red-head-is-sent-back-before-the-panel.md §3.3
+#: — bounded by `validation.red_ci_returns`, which is why there is no constant beside it.
+RED_CI_CAUSE = "red_ci"
 
 #: `proof` on `CARRY_REFUSED_EVENT`, one value per condition — the `automerge` hold-code
 #: discipline, so a reader can tell "someone resolved a conflict" from "the daemon could
