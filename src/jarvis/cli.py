@@ -4642,8 +4642,15 @@ def _print_rules_summary(data: dict) -> None:
                            for verdict, n in rec["verdict_counts"].items())
         if counts:
             print(f"  {counts}")
+        # The SAME facts in the SAME order as `evolution.html`: the note, then the
+        # excluded counts off `excluded` (§9 — kn-289d4b89 keeps them out of the
+        # comparison, so a surface that printed the note and hid the numbers would be
+        # reporting an exclusion nobody can size).
         if half["excluded_note"]:
-            print(f"  {half['excluded_note']}")
+            excluded = ", ".join(f"{n} {verdict}"
+                                 for verdict, n in half["excluded"].items())
+            print(f"  {half['excluded_note']}: {excluded}" if excluded
+                  else f"  {half['excluded_note']}")
 
     # LAST: the longest block and the least actionable one.
     if data["timeline"]:

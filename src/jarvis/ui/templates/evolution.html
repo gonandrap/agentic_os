@@ -178,17 +178,19 @@
   <p class="kv">{{ report.recurrences.weaker_half.note }}</p>
   {# §9, ABSENT IS NEVER ZERO: with no recurrence row the sentence is the whole section. #}
   {% if report.recurrences.rows %}
+  <p class="counts">
+    {% for verdict, count in report.recurrences.verdict_counts.items() %}
+    {{ verdict }} {{ count }}{% if not loop.last %} · {% endif %}
+    {% else %}no verdict has been recorded in this window{% endfor %}
+  </p>
+  {# The SAME facts in the SAME order as `cli._print_rules_summary`: the counts, then the
+     note and the `excluded` numbers it is about (§9, kn-289d4b89). #}
   {% if report.recurrences.weaker_half.excluded_note %}
   <p class="sub">{{ report.recurrences.weaker_half.excluded_note }}:
     {% for verdict, count in report.recurrences.weaker_half.excluded.items() %}
     <span class="mono">{{ verdict }}</span>&nbsp;{{ count }}{% if not loop.last %} · {% endif %}
     {% else %}none{% endfor %}</p>
   {% endif %}
-  <p class="counts">
-    {% for verdict, count in report.recurrences.verdict_counts.items() %}
-    {{ verdict }} {{ count }}{% if not loop.last %} · {% endif %}
-    {% else %}no verdict has been recorded in this window{% endfor %}
-  </p>
   {% endif %}
   <table>
     <tr><th>when</th><th>gap class</th><th>verdict</th><th>order</th><th>what happened</th></tr>

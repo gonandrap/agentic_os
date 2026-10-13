@@ -72,7 +72,9 @@ def clock(monkeypatch):
 
 
 def _fire(store, clock, detector_id, *, order_id, outcome=rules.APPLIED,
-          mode=rules.DRY_RUN, at=NOW, cleared_after=None, project="proj_a"):
+          mode=rules.ARMED, at=NOW, cleared_after=None, project="proj_a"):
+    """One fire, backdated through the clock. ARMED by default because the default
+    outcome is `applied`, and nothing applies a remedy until a rule is armed (§6)."""
     clock["t"] = at
     row = store.record_rule_fire(detector_id=detector_id, project=project,
                                  order_id=order_id, order_kind="work_order",
@@ -92,6 +94,35 @@ def detector(store, clock):
     return store.add_detector("stale-panel-hold", COND, project="proj_a",
                               summary="a panel hold nobody clears", source="io",
                               io_id="io-1", fix_wo_id="wo-9")
+
+
+def _arm(store, detector_id, at=NOW):
+    """Arm a detector the only way the schema allows today.
+
+    `arm_detector` ships with the alarm bridge (`central_store.py`'s `detectors` schema
+    comment), so the columns it will write — `status` and `armed_at` — are set here
+    directly. Both, because the report takes EITHER as "ever armed" — `armed_at` or a
+    `status` of armed.
+    """
+    store.conn.execute("UPDATE detectors SET status=?, armed_at=?, armed_by=? WHERE id=?",
+                       (rules.ARMED, at, "the user", detector_id))
+    store.conn.commit()
+
+
+def _investigation(store, tmp_path, subject, *, project="proj_a"):
+    """Register `project` and open one investigation on `subject`."""
+    from jarvis.project_store import ProjectStore
+
+    path = tmp_path / project
+    path.mkdir(exist_ok=True)
+    store.upsert_project(project, str(path))
+    project_store = ProjectStore(path)
+    try:
+        project_store.create_feature_order(f"why is {subject} stuck",
+                                           metadata={ops.SUBJECT_KEY: subject},
+                                           kind="investigation")
+    finally:
+        project_store.close()
 
 
 def _catalog(tmp_path, *, os_min=DEFAULT_RULES_MIN_SAMPLES, project_min=None):
@@ -160,6 +191,60 @@ def test_an_empty_registry_has_no_share_and_the_note_carries_no_zero(store):
     assert "0%" not in share["note"] and "0.0" not in share["note"]
 
 
+def test_an_investigation_with_no_armed_rule_is_no_share_at_all(
+        store, detector, clock, tmp_path):
+    """The ordinary install: something was investigated and nothing was ever armed.
+
+    The denominator is 1, so a report deciding absence by the denominator renders `0%` —
+    a measurement nobody took. A fleet that has never armed a rule has NO mechanical
+    share.
+    """
+    _investigation(store, tmp_path, "wo-1")
+
+    share = ops.evolution_report()["mechanical_share"]
+
+    assert share["value"] is None
+    assert share["note"] == ops._NO_MECHANICAL_SHARE_NOTE
+    assert share["denominator"] == 1
+
+
+def test_a_week_with_investigations_and_no_armed_rule_contributes_no_share(
+        store, detector, clock, tmp_path):
+    """The series obeys the same rule: no armed rule is no point, not a point at zero."""
+    _investigation(store, tmp_path, "wo-1")
+
+    assert ops.evolution_report()["mechanical_share"]["series"] == []
+
+
+def test_a_detector_armed_and_then_retracted_still_counts_as_ever_armed(
+        store, detector, clock, tmp_path):
+    """`armed_at` survives the retraction, and the registry is append-only by design.
+
+    Keyed off the CURRENT status this reads as a fleet that never armed anything, when
+    the rows say a rule was armed and resolved nothing — which is a measured zero.
+    """
+    _arm(store, detector["id"])
+    store.retract_detector(detector["id"], "fixed in code")
+    _investigation(store, tmp_path, "wo-1")
+
+    share = ops.evolution_report()["mechanical_share"]
+
+    assert share["value"] == pytest.approx(0.0)
+    assert share["note"] is None
+
+
+def test_an_unknown_project_is_refused_and_the_fleet_is_not(store, tmp_path):
+    """A report for a name that does not exist would read as a project that learned
+    nothing. `cost_report`'s guard, and `project=None` stays the fleet."""
+    store.upsert_project("proj_a", str(tmp_path / "proj_a"))
+
+    with pytest.raises(ops.OpsError) as excinfo:
+        ops.evolution_report("no_such_project")
+    assert "not registered" in str(excinfo.value)
+
+    assert ops.evolution_report(None)["project"] is None
+
+
 def test_a_project_store_that_will_not_open_is_unreadable_not_a_zero(
         store, detector, clock, tmp_path, monkeypatch):
     """House rule 2: a failure never becomes a default answer.
@@ -206,7 +291,7 @@ def test_a_week_with_no_data_is_absent_from_the_series_not_a_zero_point(
         store, detector, clock):
     """House rule 1 on the series: a week nothing happened in is ABSENT.
 
-    A point with `count: 0` would draw a line through weeks nobody measured, which reads
+    A point with `numerator: 0` would draw a line through weeks nobody measured, which reads
     as "the share was zero then" rather than "there is nothing to say about then".
     """
     _fire(store, clock, detector["id"], order_id="wo-1", at=NOW - DAY,
@@ -376,6 +461,40 @@ def test_the_timeline_folds_the_registry_and_omits_a_missing_link(store, detecto
     assert "issue" not in added["links"] and "pr" not in added["links"]
 
 
+def test_a_knowledge_entry_reaches_the_timeline_with_its_work_order(store, clock):
+    """What the OS learned is half of §9's timeline, and the entry links its author.
+
+    The entry's project is NOT in the registry here, and the fleet report still carries
+    it — `jarvis learn list` lists it, and a reader that asked a scope reader once per
+    registered project would hide it while the detector beside it showed.
+    """
+    entry = store.add_knowledge("a panel hold nobody clears needs a nudge",
+                                project="proj_a", wo_id="wo-9")
+
+    event = next(e for e in ops.evolution_report()["timeline"]
+                 if e["kind"] == "knowledge_added")
+
+    assert event["id"] == entry["id"]
+    assert "learned: a panel hold nobody clears needs a nudge" == event["headline"]
+    assert event["links"] == {"fix_wo": "wo-9"}
+
+
+def test_a_gate_exemption_reaches_the_timeline_with_its_pattern(store, clock):
+    """The other half: what the OS learned is NOT a privileged action."""
+    rule = store.add_gate_rule("exempt", "substring", "scripts/release.sh",
+                               reason="quoted in a grep pattern, it ships nothing",
+                               wo_id="wo-12")
+
+    event = next(e for e in ops.evolution_report()["timeline"]
+                 if e["kind"] == "gate_exemption_learned")
+
+    assert event["id"] == rule["id"]
+    assert event["headline"] == (
+        "learned that 'scripts/release.sh' is not a privileged action: "
+        "quoted in a grep pattern, it ships nothing")
+    assert event["links"] == {"fix_wo": "wo-12"}
+
+
 # -- min_samples resolution -------------------------------------------------------------
 
 
@@ -383,6 +502,10 @@ def test_min_samples_takes_the_project_override_and_falls_back_to_the_fleet(
         store, tmp_path, monkeypatch):
     monkeypatch.setattr(ops, "resolve_catalog",
                         lambda *a, **k: _catalog(tmp_path, os_min=4, project_min=7))
+    # REGISTERED, because an unregistered name is now refused: the catalog and the
+    # project registry are different records, and this test is about the catalog.
+    for name in ("proj_a", "proj_b"):
+        store.upsert_project(name, str(tmp_path / name))
 
     assert ops.evolution_report("proj_a")["min_samples"] == 7
     assert ops.evolution_report()["min_samples"] == 4

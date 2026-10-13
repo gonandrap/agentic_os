@@ -5,7 +5,7 @@ docs/superpowers/specs/2026-09-27-self-evolution.md.
 it verbatim. So the tests that matter here are not about arithmetic — there is none to
 check — they are about the two ways this page could still lie:
 
-* it could DERIVE a number of its own, and then disagree with `jarvis evolution` about
+* it could DERIVE a number of its own, and then disagree with `jarvis rules summary` about
   the same registry (the hand-built-inconsistent-dict test below is the one that catches
   that);
 * it could turn an ABSENT figure into a zero, which reads as a measurement nobody took.
@@ -102,8 +102,39 @@ def test_the_project_page_renders_and_scopes_to_that_project(client):
     assert "proj_a" in body_of(res.text)
 
 
+def test_an_install_with_an_investigation_and_no_armed_rule_shows_no_percent(client):
+    """The ordinary install, end to end: one investigation, nothing armed.
+
+    The denominator is 1, so a page fed a report that decided absence by the denominator
+    renders `0%` — a measurement nobody took.
+    """
+    from jarvis.project_store import ProjectStore
+
+    project_store = ProjectStore(ops.registered_project_paths()["proj_a"])
+    try:
+        project_store.create_feature_order("why is wo-1 stuck",
+                                           metadata={ops.SUBJECT_KEY: "wo-1"},
+                                           kind="investigation")
+    finally:
+        project_store.close()
+
+    body = body_of(client.get("/evolution").text)
+
+    assert ops._NO_MECHANICAL_SHARE_NOTE in body
+    assert "0%" not in body
+
+
+def test_an_unknown_project_is_a_404_and_not_an_empty_report(client):
+    """A page for a name that does not exist would read as a project the OS has learned
+    nothing about — a false negative about a project that is not there."""
+    res = client.get("/evolution/no_such_project")
+
+    assert res.status_code == 404
+
+
 def test_the_days_parameter_narrows_the_window(client):
-    """`days` widens the page the way `--days` widens the CLI report."""
+    """`days` sizes the page's window the way `--days` sizes the CLI report's: 7 narrows
+    it to a week, and the page says so."""
     res = client.get("/evolution?days=7")
     assert res.status_code == 200
     assert "7 days" in body_of(res.text)

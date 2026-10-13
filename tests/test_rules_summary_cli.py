@@ -218,6 +218,38 @@ def test_the_empty_report_says_something_rather_than_printing_nothing(capsys):
     assert out.strip()
 
 
+def test_an_install_with_an_investigation_and_no_armed_rule_prints_no_percent(
+        jarvis_home, tmp_path, capsys):
+    """END TO END against a real registry rather than a hand-built dict.
+
+    One investigation and no armed rule is what an ordinary install looks like, and the
+    denominator is 1 there. `0%` anywhere in this output is the one thing §9 forbids.
+    """
+    from jarvis.central_store import CentralStore
+    from jarvis.project_store import ProjectStore
+
+    path = tmp_path / "proj_a"
+    path.mkdir()
+    store = CentralStore()
+    try:
+        store.upsert_project("proj_a", str(path))
+    finally:
+        store.close()
+    project_store = ProjectStore(path)
+    try:
+        project_store.create_feature_order("why is wo-1 stuck",
+                                           metadata={ops.SUBJECT_KEY: "wo-1"},
+                                           kind="investigation")
+    finally:
+        project_store.close()
+
+    cli._print_rules_summary(ops.evolution_report())
+    out = capsys.readouterr().out
+
+    assert ops._NO_MECHANICAL_SHARE_NOTE in out
+    assert "0%" not in out
+
+
 # -- the CLI ----------------------------------------------------------------------------
 
 

@@ -11591,11 +11591,12 @@ _EVOLUTION_RECURRENCE_LIMIT = 5_000
 _EVOLUTION_KNOWLEDGE_LIMIT = 2_000
 _EVOLUTION_INVESTIGATION_LIMIT = 2_000
 
-#: The sentence an empty denominator ships INSTEAD of a number. Nothing writes `applied`
-#: fires until a rule is armed (§6), so today this is the normal answer and the sentence
-#: is the entire content of the key. It deliberately contains no digit: "0%" or "0.0" in
-#: the prose would be read as the share the OS measured, when the truth is that nothing
-#: has ever been given the chance to resolve anything mechanically.
+#: The sentence a scope with NO EVER-ARMED RULE ships INSTEAD of a number — whatever its
+#: denominator says, because an investigation in the denominator is not a share of zero.
+#: Nothing writes `applied` fires until a rule is armed (§6), so today this is the normal
+#: answer and the sentence is the entire content of the key. It deliberately contains no
+#: digit: "0%" or "0.0" in the prose would be read as the share the OS measured, when the
+#: truth is that nothing has ever been given the chance to resolve anything mechanically.
 _NO_MECHANICAL_SHARE_NOTE = (
     "no rule has been armed yet, so there is no mechanical share to report — which is "
     "not a share of zero")
@@ -11740,18 +11741,15 @@ def _evolution_investigations(scope: str, since: float, until: float,
 def _evolution_knowledge(central: CentralStore, scope: str) -> list[dict[str, Any]]:
     """Every knowledge row in scope, retracted ones included — §9 reports retractions.
 
-    `relevant_knowledge` is a SCOPE reader (`project=? OR project=''`), so a fleet report
-    asks it once per registered project plus once for the global rows and deduplicates by
-    id. That is `jarvis learn list`'s reader rather than SQL of this module's own: the
-    report must see exactly what the user sees listed.
+    `search_knowledge` with an EMPTY TERM is `jarvis learn list`'s own reader, and the
+    report must see exactly what the user sees listed: `project=None` is the whole fleet,
+    a name scopes to that project plus the global rows. Asking a scope reader once per
+    REGISTERED project instead would drop every entry whose project the registry does not
+    carry — while `list_detectors` and `gate_rules` keep theirs — so the fleet timeline
+    would show a project's detector and hide the thing it learned.
     """
-    scopes = [scope] if scope else ["", *(p["name"] for p in central.list_projects())]
-    rows: dict[str, dict[str, Any]] = {}
-    for one in scopes:
-        for row in central.relevant_knowledge(one, limit=_EVOLUTION_KNOWLEDGE_LIMIT,
-                                              include_retired=True):
-            rows[str(row["id"])] = row
-    return list(rows.values())
+    return central.search_knowledge("", limit=_EVOLUTION_KNOWLEDGE_LIMIT,
+                                    project=scope or None)
 
 
 def evolution_report(project: str | None = None, *, days: int = 90) -> dict:
@@ -11770,6 +11768,11 @@ def evolution_report(project: str | None = None, *, days: int = 90) -> dict:
     * `unreadable` — what could not be read, so nothing below had to invent an answer.
     """
     scope = (project or "").strip()
+    # §9: a report for a name that does not exist would read as a project that learned
+    # nothing. `cost_report`'s guard; `project=None` is the fleet and stays valid.
+    known = registered_project_paths()
+    if scope and scope not in known:
+        raise OpsError(f"project {scope!r} not registered (known: {sorted(known)})")
     until = db.now()
     since = until - float(days) * 86400.0
     min_samples = _evolution_min_samples(scope or None)
@@ -11820,6 +11823,18 @@ def evolution_report(project: str | None = None, *, days: int = 90) -> dict:
     numerator = len(resolved_weeks)
     denominator = len(denominator_orders)
 
+    # ABSENCE IS DECIDED BY WHETHER A RULE WAS EVER ARMED, never by the denominator: an
+    # install with one investigation and no armed rule has a denominator of 1, and a
+    # share of 0% there is a measurement nobody took (§9, house rule 1). `armed_at` is
+    # the row the question is really about — it is written when a rule is armed and NOT
+    # cleared by `retract_detector`, so a rule armed and later retracted still counts.
+    # `status` covers a row armed before this read; a fire recorded in `armed` mode is
+    # the fire ledger saying the same thing, and is what keeps the numerator — which can
+    # only be an `applied` fire — from ever standing beside "nothing was armed".
+    ever_armed = any(d["armed_at"] is not None or str(d["status"]) == rules.ARMED
+                     for d in detectors) or any(
+        str(f["mode"]) == rules.ARMED for f in all_fires)
+
     # One point per week WITH DATA. A week nobody measured is absent from the list rather
     # than present with a zero, which would draw a line through it (§9, house rule 1).
     week_resolved: dict[str, set[str]] = {}
@@ -11832,15 +11847,19 @@ def evolution_report(project: str | None = None, *, days: int = 90) -> dict:
             week_investigated.setdefault(_evolution_week(created, zone), set()).add(
                 order_id)
     series = []
-    for week in sorted(set(week_resolved) | set(week_investigated)):
+    # The same rule one level down (§9): a week with investigations and no armed rule
+    # contributes no share, so with nothing ever armed there is no series at all.
+    for week in (sorted(set(week_resolved) | set(week_investigated))
+                 if ever_armed else []):
         got = week_resolved.get(week, set())
         both = got | week_investigated.get(week, set())
         series.append({"week": week, "numerator": len(got), "denominator": len(both),
                        "value": (len(got) / len(both)) if both else None})
 
+    value = (numerator / denominator) if (ever_armed and denominator) else None
     mechanical_share = {
-        "value": (numerator / denominator) if denominator else None,
-        "note": None if denominator else _NO_MECHANICAL_SHARE_NOTE,
+        "value": value,
+        "note": None if value is not None else _NO_MECHANICAL_SHARE_NOTE,
         "numerator": numerator, "denominator": denominator, "series": series,
         "unreadable_projects": unreadable["projects"],
     }
