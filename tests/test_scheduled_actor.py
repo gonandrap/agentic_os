@@ -8,8 +8,9 @@ over the predicates the daemon passes themselves use. Four pins:
 1. coverage — every `(status, origin)` pair derives an actor or a blocker, and the
    pairs that correctly derive NEITHER are a table with a sentence each
 2. population — the registry's keys are exactly `OPEN_STATUSES`
-3. the predicate rule — every entry's test is a symbol IMPORTED from the pass's own
-   module, never a lambda and never a condition restated in `ops`
+3. the predicate rule — every entry's test IS the module-level symbol its `predicate`
+   path names (imported from the pass's module, or `ops`' own public contract), never a
+   lambda and never a condition restated in the registry
 4. no fallthrough — a status missing from the registry raises rather than guessing
 """
 
@@ -129,20 +130,69 @@ def _ops_imports() -> dict[str, str]:
     return found
 
 
+def _module_level_names(module) -> set[str]:
+    """Names the module DEFINES at top level — functions and constants, no imports."""
+    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    out: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            out.add(node.name)
+        elif isinstance(node, ast.Assign):
+            out.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            out.add(node.target.id)
+    return out
+
+
+def _pass_literals() -> list[tuple[str, ast.expr]]:
+    """(`predicate`, the expression written as `test`) per `_Pass(...)` in ops.py."""
+    tree = ast.parse(Path(ops.__file__).read_text(encoding="utf-8"))
+    out: list[tuple[str, ast.expr]] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "_Pass"):
+            continue
+        assert len(node.args) == 4 and not node.keywords, (
+            "a `_Pass` is four positional args; the pin reads `predicate` and `test` "
+            "by position")
+        out.append((ast.literal_eval(node.args[2]), node.args[3]))
+    return out
+
+
 def test_every_predicate_is_an_imported_symbol():
+    """`predicate` names where the test LIVES, and the registry passes that symbol.
+
+    kn-787b7c27: one public contract per question. A predicate may live in `ops` (the
+    layer daemon imports) or in the pass's own module, but the registry must reference
+    it BY NAME — never a lambda, never the condition restated inline.
+    """
     imported = _ops_imports()
-    for status, entry in ops.SCHEDULED_ACTORS.items():
-        for p in entry.passes:
-            module, _, name = p.predicate.rpartition(".")
-            assert module and name, f"{status}: {p.predicate} is not dotted"
-            assert module != "ops", (
-                f"{status}: {p.predicate} is defined in ops — a predicate belongs to "
-                "the pass's own module")
+    entries = [(status, p) for status, entry in ops.SCHEDULED_ACTORS.items()
+               for p in entry.passes]
+    by_predicate: dict[str, list[ast.expr]] = {}
+    for predicate, node in _pass_literals():
+        by_predicate.setdefault(predicate, []).append(node)
+    assert sum(len(v) for v in by_predicate.values()) == len(entries), (
+        "every `_Pass` literal in ops.py must be reachable from SCHEDULED_ACTORS")
+    for status, p in entries:
+        module, _, name = p.predicate.rpartition(".")
+        assert module and name, f"{status}: {p.predicate} is not dotted"
+        home = importlib.import_module(f"jarvis.{module}")
+        assert name in _module_level_names(home), (
+            f"{status}: {p.predicate} is not a module-level function or constant of "
+            f"{module} — the dotted path must name where the predicate LIVES")
+        resolved = getattr(home, name)
+        assert resolved is p.test, f"{status}: {p.predicate} is not the test called"
+        assert getattr(resolved, "__module__", home.__name__) == home.__name__, (
+            f"{status}: {p.predicate} resolves to a symbol of {resolved.__module__}")
+        if module != "ops":  # ops must IMPORT the pass's predicate, never copy it
             assert imported.get(name) == module, (
                 f"{status}: ops.py does not import {name} from {module}")
-            resolved = getattr(importlib.import_module(f"jarvis.{module}"), name)
-            assert resolved is p.test, f"{status}: {p.predicate} is not the test called"
-            assert p.test.__name__ != "<lambda>", f"{status}: {p.predicate} is a lambda"
+        for node in by_predicate[p.predicate]:
+            assert isinstance(node, ast.Name) and node.id == name, (
+                f"{status}: {p.predicate}'s `test` is written as "
+                f"{type(node).__name__}, not the bare name `{name}` — a lambda or a "
+                "condition restated in the registry is the defect this pins")
 
 
 def test_no_fallthrough(jarvis_home, project):

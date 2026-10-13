@@ -291,21 +291,6 @@ def delivers_message(store: ProjectStore, wo: dict[str, Any],
     return worker_session.delivery_hold(store, wo, now=now) is None
 
 
-def feature_wakes_manager(store: ProjectStore, wo: dict[str, Any],
-                          now: float | None = None) -> bool:
-    """True when this manager's feature is still live, so the bus routes to it — §3.
-
-    No parent is unreachable: `idle` is only ever written to a manager, and a manager
-    always carries one (`Daemon.settle_work_order` and `ops.revive_feature_manager`).
-    True keeps the extracted branch identical for it. A DELETED feature raises
-    KeyError, exactly as the branch this came from does.
-    """
-    parent = wo.get("parent_id")
-    if not parent:
-        return True
-    return store.get_feature_order(parent)["status"] not in FO_TERMINAL_STATUSES
-
-
 def runnable_round(store: ProjectStore, wo: dict[str, Any],
                    now: float | None = None) -> dict[str, Any] | None:
     """The round `Daemon.validation_tick` will judge, or None — 2026-10-09 §3.
@@ -5835,8 +5820,13 @@ class Daemon:
             # a closed feature, with nothing left that would ever look at it again.
             # Re-derived from the feature rather than guarded with a lock: noticing is
             # what a reconciler is for.
-            if not feature_wakes_manager(store, wo):
-                self._close_feature_manager(store, str(wo["parent_id"]))
+            # Not ops.manager_awaiting_feature: that answers eligibility and returns
+            # False for a missing parent or a deleted feature; closing must not fire on
+            # either (kn-787b7c27).
+            parent = wo.get("parent_id")
+            feature = store.get_feature_order(parent) if parent else None
+            if feature and feature["status"] in FO_TERMINAL_STATUSES:
+                self._close_feature_manager(store, str(parent))
             elif user_facing_wait(store, wo["id"]):
                 # HOLD IT WHERE IT IS. `waiting_input` is the only carrier of the fact
                 # that this manager ASKED for something, and re-statusing it `idle` would
