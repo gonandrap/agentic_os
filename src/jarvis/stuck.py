@@ -27,6 +27,30 @@ SECONDS_PER_MINUTE = 60  # a unit, not a setting
 #: in status because nothing is expected to happen inside it at all.
 ACTIVITY_STATUSES = ("running",)
 
+#: The holds this module names itself, §4 of docs/superpowers/specs/2026-10-12-a-managers-
+#: by-design-idle-is-not-a-standstill.md. Each rides on `Verdict.excluded` beside
+#: `worker_session.PAUSE_USAGE_LIMIT`, so a held order is a visible row rather than an
+#: invisible skip.
+HOLD_EXEMPT_KIND = "exempt_kind"
+HOLD_AWAITING_FEATURE = "awaiting_feature"
+
+#: One sentence per cause, because the shipped one is false for both of the above: an
+#: exempt kind never clears, and a manager's hold clears when its feature speaks rather
+#: than by itself. `{cause}` and `{kind}` are the only slots.
+EXCLUSION_REASON: Mapping[str, str] = {
+    HOLD_EXEMPT_KIND: ("an order of kind {kind} is never judged by this sweep — "
+                       "`os.fleet_health.exempt_kinds` names it, so time in status is "
+                       "not a claim about it"),
+    HOLD_AWAITING_FEATURE: ("a manager is idle until its feature messages it, and this "
+                            "feature has not finished with it — nothing is judged while "
+                            "that is true"),
+}
+
+#: The usage window's sentence, and the answer for any hold added later: all three of §2's
+#: causes resume by themselves.
+DEFAULT_EXCLUSION_REASON = ("held by {cause}, which clears by itself — nothing is judged "
+                            "while it does")
+
 #: What the investigator is asked, and it is a TEMPLATE rather than prose composed at the
 #: call site for the reason `ops.create_investigation_order` refuses an empty `why`: the
 #: investigator's first reader is a fresh session with no memory of the sweep. The last
@@ -67,7 +91,10 @@ def assess(status: str, seconds_in_status: float, seconds_since_activity: float,
            discounted_seconds: float, thresholds: Mapping[str, float],
            fallback_seconds: float,
            activity_statuses: Sequence[str] = ACTIVITY_STATUSES,
-           excluded_cause: str = "") -> Verdict:
+           excluded_cause: str = "",
+           kind: str = "worker",
+           exempt_kinds: Sequence[str] = (),
+           by_design_idle: bool = False) -> Verdict:
     """The whole decision, over scalars: no store, no config object, no row.
 
     `fallback_seconds` covers an open status `thresholds` does not name, so a status added
@@ -78,17 +105,37 @@ def assess(status: str, seconds_in_status: float, seconds_since_activity: float,
     live `jarvis pause` and the post-reopen ramp are the only ones, because nothing is
     wrong in those cases and all three resume by themselves — so an investigation would
     buy a session to be told the OS is working as designed.
+
+    `kind`, `exempt_kinds` and `by_design_idle` are the 2026-10-12 spec's: `status` cannot
+    express "nothing is expected to happen here until somebody speaks to it", and a
+    `kind='manager'` order is idle-until-messaged by design. All three are SCALARS or a
+    policy list the caller resolved (`activity_statuses`' shape) — `by_design_idle` is
+    computed by the caller from its store, so this module still opens nothing.
+
+    Precedence, and it matters. An exempt kind is not a subject at all, so whether the
+    account's window is shut is irrelevant to it; a fleet pause is a fact about the whole
+    fleet and outranks a fact about one order's feature.
     """
     on_activity = status in activity_statuses
     clock = "activity" if on_activity else "status"
     judged = seconds_since_activity if on_activity else seconds_in_status
     threshold = float(thresholds.get(status, fallback_seconds))
     active = max(0.0, judged - discounted_seconds)
-    if excluded_cause:
+    cause = ""
+    if kind in exempt_kinds:
+        cause = HOLD_EXEMPT_KIND
+    elif excluded_cause:
+        cause = excluded_cause
+    elif by_design_idle:
+        cause = HOLD_AWAITING_FEATURE
+    if cause:
+        # One site composes the sentence, per cause: `active_seconds` and
+        # `threshold_seconds` stay populated so the row still shows the arithmetic.
         return Verdict(stuck=False, clock=clock, active_seconds=active,
-                       threshold_seconds=threshold, excluded=excluded_cause,
-                       reason=f"held by {excluded_cause}, which clears by itself — "
-                              f"nothing is judged while it does")
+                       threshold_seconds=threshold, excluded=cause,
+                       reason=EXCLUSION_REASON.get(
+                           cause, DEFAULT_EXCLUSION_REASON).format(cause=cause,
+                                                                   kind=kind))
     over = active >= threshold
     return Verdict(
         stuck=over, clock=clock, active_seconds=active, threshold_seconds=threshold,

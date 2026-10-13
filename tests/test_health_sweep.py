@@ -1405,6 +1405,148 @@ def test_a_projects_own_cadence_is_honoured(jarvis_home, project, tmp_path):
         central.close()
 
 
+# -- a manager's by-design idle is not a standstill: docs/superpowers/specs/2026-10-12-a-
+# managers-by-design-idle-is-not-a-standstill.md, issue 1010.
+
+
+def a_manager(store, *children: tuple[str, str]) -> tuple[str, str, list[str]]:
+    """A feature order, its idle-capable manager and its children in the named statuses.
+
+    The store rather than `ops.create_work_order`, which has no `kind` parameter: what is
+    under test is the sweep's reading of a `kind='manager'` row, not how one is created.
+    """
+    fo = store.create_feature_order("a feature", description="an ask")
+    store.set_feature_status(fo["id"], "executing")
+    manager = store.create_work_order("manage the feature", parent_id=fo["id"],
+                                      kind="manager")
+    kids = []
+    for title, status in children:
+        child = store.create_work_order(title, parent_id=fo["id"])
+        store.set_status(child["id"], status)
+        kids.append(child["id"])
+    return str(fo["id"]), str(manager["id"]), kids
+
+
+def stuck_row(wo_id: str, project: str = "proj_a") -> dict:
+    """This order's row from `ops.stuck_report` — every open order, judged."""
+    return next(r for r in ops.stuck_report(project) if r["id"] == wo_id)
+
+
+def test_a_manager_with_an_outstanding_child_is_not_a_candidate(stuck_os):
+    """The measured incident, wo-2db95e7c: idle 76.8h with one child in
+    `waiting_pr_merge`, made a candidate and given an investigator session while its
+    feature was progressing."""
+    from jarvis import stuck
+
+    store = stuck_os["store"]
+    _fo, manager_id, _kids = a_manager(store, ("ship it", "waiting_pr_merge"))
+    park_order(store, manager_id, "idle", hours=76.8)
+
+    stuck_os["daemon"].stuck_tick(None)
+
+    assert ops.list_investigation_orders("proj_a", include_settled=True) == []
+    row = stuck_row(manager_id)
+    assert row["stuck"] is False
+    assert row["excluded"] == stuck.HOLD_AWAITING_FEATURE
+
+    # NOT a grace period: ten times the threshold again later changes nothing.
+    park_order(store, manager_id, "idle", hours=768.0)
+    stuck_os["daemon"].stuck_tick(None)
+    assert ops.list_investigation_orders("proj_a", include_settled=True) == []
+    assert stuck_row(manager_id)["excluded"] == stuck.HOLD_AWAITING_FEATURE
+
+
+def test_a_stranded_manager_is_a_candidate_once_over_threshold_and_not_before(stuck_os):
+    """Neo 1603 (1): the by-design test NARROWS candidacy. No outstanding child and
+    nothing queued means the ordinary 30-minute fallback applies — both sides of it."""
+    import jarvis.catalog as catalog_mod
+
+    store = stuck_os["store"]
+    _fo, manager_id, _kids = a_manager(store)
+    fallback = catalog_mod.DEFAULT_FLEET_HEALTH_FALLBACK_MINUTES / 60.0
+
+    park_order(store, manager_id, "idle", hours=fallback / 2)
+    assert stuck_row(manager_id)["stuck"] is False, "inside its threshold"
+    assert stuck_row(manager_id)["excluded"] == ""
+
+    park_order(store, manager_id, "idle", hours=fallback * 2)
+    row = stuck_row(manager_id)
+    assert row["stuck"] is True and row["excluded"] == ""
+
+
+def test_either_queued_reading_holds_a_manager_back(stuck_os):
+    """`_manager_handoff`'s two guards, one module along — and the same function, so a
+    future edit to one cannot move only one of them."""
+    import inspect
+
+    from jarvis import bus, stuck
+    from jarvis.daemon import Daemon
+
+    store = stuck_os["store"]
+    fo_id, manager_id, _kids = a_manager(store)
+    park_order(store, manager_id, "idle", hours=76.8)
+    store.queue_message(manager_id, "your feature needs this")
+    assert stuck_row(manager_id)["excluded"] == stuck.HOLD_AWAITING_FEATURE
+
+    other_fo, other_manager, _ = a_manager(store)
+    park_order(store, other_manager, "idle", hours=76.8)
+    bus.post(store, subject=bus.Subject(fo_id=other_fo), from_role="reconciler",
+             to_role="manager",
+             payload=bus.ChildrenLanded(round=1, children=("wo-x",), note="landed"))
+    assert stuck_row(other_manager)["excluded"] == stuck.HOLD_AWAITING_FEATURE
+
+    handoff = inspect.getsource(Daemon._manager_handoff)
+    assert "nothing_queued_to_manager" in handoff
+    assert "queued_messages" not in handoff, "the duplicate reading is gone"
+    assert "nothing_queued_to_manager" in inspect.getsource(ops.stuck_scan)
+
+
+def test_a_superseded_child_does_not_hold_a_manager_but_an_exhausted_one_does(stuck_os):
+    """The two places `outstanding_feature_children` differs from its neighbours:
+    `Daemon.settle_features`' superseded rule and `budget.live_children`' exclusion of
+    `budget_exhausted` — an exhausted child cannot spend, but it is very much
+    outstanding to a manager."""
+    from jarvis import stuck
+
+    store = stuck_os["store"]
+    fo_id, manager_id, kids = a_manager(store, ("answered for", "waiting_pr_merge"))
+    park_order(store, manager_id, "idle", hours=76.8)
+    store.supersede_children(fo_id, kids, note="the user answered for it")
+    row = stuck_row(manager_id)
+    assert row["excluded"] == "" and row["stuck"] is True
+
+    _fo2, broke_id, _k2 = a_manager(store, ("out of money", "budget_exhausted"))
+    park_order(store, broke_id, "idle", hours=76.8)
+    assert stuck_row(broke_id)["excluded"] == stuck.HOLD_AWAITING_FEATURE
+
+
+def test_an_exempt_kind_is_an_excluded_row_not_an_absence(stuck_os, jarvis_home, project,
+                                                          tmp_path):
+    """§4: the `continue` emitted nothing, so an investigator was indistinguishable from
+    an order inside its threshold. Negative control with `exempt_kinds: []`, without
+    which this passes against a hardcoded skip."""
+    from jarvis import stuck
+
+    store = stuck_os["store"]
+    wo = store.create_work_order("look into wo-1", kind="investigator")
+    park_order(store, wo["id"], "waiting_pr_merge", hours=76.8)
+
+    stuck_os["daemon"].stuck_tick(None)
+
+    assert ops.list_investigation_orders("proj_a", include_settled=True) == []
+    row = stuck_row(wo["id"])
+    assert row["stuck"] is False
+    assert row["excluded"] == stuck.HOLD_EXEMPT_KIND
+    assert "investigator" in row["reason"]
+
+    cat = load_catalog(stuck_catalog(
+        tmp_path, [{"name": "proj_a", "path": str(project),
+                    "fleet_health": {"exempt_kinds": []}}], name="no-exempt.json"))
+    assert cat.projects[0].fleet_health.exempt_kinds == ()
+    row = stuck_row(wo["id"])  # absent entirely under a hardcoded skip
+    assert row["stuck"] is True and row["excluded"] == ""
+
+
 # -- the free re-assertion: a stale look at a unit the OS can already explain -----------
 #
 # docs/superpowers/specs/2026-10-02-the-health-sweep-must-not-pay-to-restate-a-fingerprint.md

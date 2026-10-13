@@ -403,6 +403,56 @@ def test_a_manager_in_any_other_status_still_reaches_the_user(boot, store):
     assert true_blockers(store, store.get_work_order(manager["id"])) != []
 
 
+# -- 4b. what the record SAYS while it waits: §5 of docs/superpowers/specs/2026-10-12-a-
+# managers-by-design-idle-is-not-a-standstill.md, issue 1010's third complaint.
+
+
+def an_idle_manager(boot, store) -> tuple[str, dict, list[dict]]:
+    """A released feature whose manager is `idle` with both children outstanding."""
+    daemon = boot(validation=True)
+    fo_id = release(daemon, "CSV export", "one", "two")
+    manager = store.manager_work_order(fo_id)
+    assert manager is not None
+    store.set_status(manager["id"], "idle")
+    return fo_id, store.get_work_order(manager["id"]), store.feature_children(fo_id)
+
+
+def test_an_idle_managers_label_names_the_children_it_waits_on(boot, store):
+    """A LABEL and not an obligation: "nothing is happening here" is only true of a
+    manager whose feature has finished with it, and the record names the children."""
+    fo_id, manager, children = an_idle_manager(boot, store)
+
+    label = invariants.status_label(store, manager)
+    assert "2 of 2 children" in label and fo_id in label
+    assert children[0]["id"] in label
+
+    for child in children:
+        store.set_status(child["id"], "completed")
+    assert invariants.status_label(store, store.get_work_order(manager["id"])) == \
+        "idle — waiting for a message from its feature"
+
+
+def test_the_outstanding_child_label_raises_no_attention_flag(boot, store):
+    """DEVIATION 2, pinned: a `true_blockers` entry would make INV-ATTENTION-MISSING flag
+    EVERY manager in the fleet on every tick — issue 1010's one correct reading
+    (`needs_attention 0`) turned into a fleet-wide false positive."""
+    _fo_id, manager, _children = an_idle_manager(boot, store)
+
+    assert invariants.true_blockers(store, manager) == []
+    list(invariants.check_blocked_work_is_surfaced(store))
+    assert not store.get_work_order(manager["id"])["needs_attention"]
+
+
+def test_the_sweeps_brief_names_the_child(boot, store):
+    """The sweep printed "nothing the record can name" over a record that named
+    wo-d2d777dc, and that string reached the investigator verbatim."""
+    _fo_id, manager, children = an_idle_manager(boot, store)
+
+    row = next(r for r in ops.stuck_report("proj_a") if r["id"] == manager["id"])
+    assert row["blocker"] != "nothing the record can name"
+    assert children[0]["id"] in row["blocker"]
+
+
 # -- 5. the contract -------------------------------------------------------------------
 
 

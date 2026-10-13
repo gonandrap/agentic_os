@@ -1924,10 +1924,8 @@ class Daemon:
                 and ops.revive_feature_manager(store, fo_id, why="manager handoff")
                 is None):
             return
-        if store.queued_messages(manager["id"]):
-            return
-        if any(e["state"] == "queued" and e["to_role"] == "manager"
-               for e in store.envelopes(subject_fo_id=fo_id)):
+        # ONE reading of "has anybody spoken to it", shared with `ops.stuck_scan`.
+        if not bus.nothing_queued_to_manager(store, fo_id, manager["id"]):
             return
 
         n = int(last["round"])

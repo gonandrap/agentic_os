@@ -1093,6 +1093,21 @@ DEFAULT_FLEET_HEALTH_SWEEP_DARK_MINUTES = 180
 #: silently leaving that status unwatched.
 FLEET_HEALTH_MAP_KEYS = ("thresholds",)
 
+#: Work-order kinds the sweep never judges — §2.1 of docs/superpowers/specs/2026-10-12-a-
+#: managers-by-design-idle-is-not-a-standstill.md. A CATALOG KEY and not a module constant
+#: (kn-1cec46b5, Neo 1596): a kind the sweep must not judge is the same class of decision
+#: as a threshold. `investigator` only — diagnosing the diagnostician is a loop with a
+#: budget attached, and `investigation` is a FEATURE-order kind no `work_orders` row can
+#: hold (`project_store.WO_KINDS`), so shipping it would only fail its own validator.
+#: `manager` is deliberately ABSENT: a manager's exemption is a property of its SITUATION
+#: (§2.2) and a stranded one must still be caught.
+DEFAULT_FLEET_HEALTH_EXEMPT_KINDS: tuple[str, ...] = ("investigator",)
+
+#: `FleetHealthConfig` fields that are a LIST, not a count. Skipped by the reflective
+#: `>= 1` loop in `_parse_fleet_health` for `FLEET_HEALTH_MAP_KEYS`' reason — comparing a
+#: tuple with an int raises `TypeError` — and validated per element instead.
+FLEET_HEALTH_LIST_KEYS = ("exempt_kinds",)
+
 #: `FleetHealthConfig` fields that are a FLEET number and are REFUSED on a project, each
 #: with the reason the refusal states. `max_per_day` rations a fleet-wide daily cap;
 #: `sweep_dark_minutes` bounds the silence of ONE fleet-wide run record
@@ -1135,6 +1150,10 @@ class FleetHealthConfig:
     sweep_every_ticks: int = DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS
     #: Fleet-only: how long the sweep's own run record may be silent (§8).
     sweep_dark_minutes: int = DEFAULT_FLEET_HEALTH_SWEEP_DARK_MINUTES
+    #: Kinds this project's sweep never judges. Overridden WHOLE and not merged per
+    #: element, unlike `thresholds`: a kind list is one policy statement, and a merging
+    #: list could only ever grow — un-exempting a kind would be inexpressible.
+    exempt_kinds: tuple[str, ...] = DEFAULT_FLEET_HEALTH_EXEMPT_KINDS
 
     def threshold_seconds(self, status: str) -> float:
         """This status's threshold, in the seconds `stuck.assess` compares — the named one
@@ -2275,7 +2294,7 @@ def _parse_fleet_health(raw: Any, base: FleetHealthConfig | None = None,
     that a typo must not silently leave a status unwatched, and `fleet.py`'s opening
     paragraph for the third.
     """
-    from .project_store import OPEN_STATUSES
+    from .project_store import OPEN_STATUSES, WO_KINDS
 
     base = base or FleetHealthConfig()
     if not isinstance(raw, dict):
@@ -2296,6 +2315,21 @@ def _parse_fleet_health(raw: Any, base: FleetHealthConfig | None = None,
         if int(minutes) < 1:
             raise _err(f"{where}.thresholds.{status} must be >= 1")
         thresholds[status] = int(minutes)
+    # A WHOLE-FIELD override. The EMPTY list is allowed and means "judge every kind": a
+    # meaningful policy, unlike `os.navigation`'s empty pattern list.
+    exempt_kinds = base.exempt_kinds
+    if "exempt_kinds" in raw:
+        named_kinds = raw["exempt_kinds"]
+        if not isinstance(named_kinds, list) \
+                or not all(isinstance(k, str) for k in named_kinds):
+            raise _err(f'"{where}.exempt_kinds" must be a list of strings')
+        for k in named_kinds:
+            # Refused rather than ignored: a typo that silently exempted nothing is how a
+            # manager stays watched after somebody tried to stop it.
+            if k not in WO_KINDS:
+                raise _err(f"{where}.exempt_kinds: {k!r} is not a work-order kind "
+                           f"(known: {sorted(WO_KINDS)})")
+        exempt_kinds = tuple(named_kinds)
     cfg = FleetHealthConfig(
         enabled=bool(raw.get("enabled", base.enabled)),
         thresholds=thresholds,
@@ -2304,9 +2338,11 @@ def _parse_fleet_health(raw: Any, base: FleetHealthConfig | None = None,
         max_per_day=int(raw.get("max_per_day", base.max_per_day)),
         sweep_every_ticks=int(raw.get("sweep_every_ticks", base.sweep_every_ticks)),
         sweep_dark_minutes=int(raw.get("sweep_dark_minutes", base.sweep_dark_minutes)),
+        exempt_kinds=exempt_kinds,
     )
     for name, value in vars(cfg).items():
-        if name in FLEET_HEALTH_MAP_KEYS or name == "enabled":
+        if name in FLEET_HEALTH_MAP_KEYS or name in FLEET_HEALTH_LIST_KEYS \
+                or name == "enabled":
             continue
         if value < 1:
             raise _err(f"{where}.{name} must be >= 1")
