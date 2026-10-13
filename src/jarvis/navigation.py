@@ -22,6 +22,7 @@ measured with its current meaning (§2.2, kn-358ffb53).
 from __future__ import annotations
 
 import re
+import shlex
 from pathlib import Path
 
 #: Bash commands that count as reading or searching code. EXACTLY §5.3's set and no
@@ -56,6 +57,10 @@ _SWEEP_COMMANDS = ("grep", "rg", "find")
 #: Wrappers that run another command, so the word after them is still in command
 #: position. `_statements` already drops `time` and every env assignment.
 _WRAPPERS = ("sudo", "command", "env", "nohup", "setsid", "time")
+
+#: Flags by which a sweep names its OWN scope. §6 of
+#: docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md.
+_SCOPE_FLAGS = ("-name", "-iname", "-path", "-ipath", "--include", "-g", "--glob")
 
 #: `sed` reads a file only with `-n`; without it, it is an edit.
 _SED_READ_FLAGS = ("--quiet", "--silent")
@@ -129,6 +134,29 @@ def _sweeps_the_tree(word: str, words: list[str]) -> bool:
     return bool(positional) or _recursive_flag(args)
 
 
+def _scope_names_suffix(command: str, masked: str, suffixes: tuple[str, ...]) -> bool:
+    """Whether a sweep's own scope flag names one of `suffixes`.
+
+    §6: read from the RAW command through `shlex.split`, because `_mask_shell_text` blanks
+    the quoted `--include='*.py'` form that the fleet actually types. An unterminated
+    quote raises `ValueError`, and then the masked words are the answer available.
+    """
+    if not suffixes:
+        return False
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        words = masked.split()
+    for index, word in enumerate(words):
+        flag, _, value = word.partition("=")
+        if flag not in _SCOPE_FLAGS:
+            continue
+        scope = value or (words[index + 1] if index + 1 < len(words) else "")
+        if scope.endswith(suffixes):
+            return True
+    return False
+
+
 def _reads_with_sed(args: list[str]) -> bool:
     return any(arg in _SED_READ_FLAGS
                or (arg.startswith("-") and not arg.startswith("--") and "n" in arg)
@@ -136,19 +164,26 @@ def _reads_with_sed(args: list[str]) -> bool:
 
 
 def navigates_source(command: str, suffixes: tuple[str, ...],
-                     commands: tuple[str, ...] = NAV_COMMANDS) -> bool:
+                     commands: tuple[str, ...] = NAV_COMMANDS, *,
+                     scoped_sweeps: bool = False) -> bool:
     """Whether this Bash command reads or searches SOURCE.
 
     `suffixes` and `commands` are arguments and never globals, so the fleet reader can
     pass its catalog-configured sets and re-measuring needs no release (§2.3). A chain
     or a pipeline navigates when ANY statement does.
 
+    `scoped_sweeps` makes a sweep count only when the sweep's own scope names a
+    configured suffix (§6 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md). DEFAULT
+    OFF: `nav_volume.BEFORE_NOTE`'s baseline was measured with unscoped sweeps counting,
+    so the counter's reading stays byte-identical.
+
     Masked FIRST: a `.py` inside a quoted string is prose, so
     `git commit -m "fix pricing.py"` is False.
     """
     if not command:
         return False
-    for words in _statements(_mask_shell_text(command)):
+    masked = _mask_shell_text(command)
+    for words in _statements(masked):
         word = _command_word(words)
         if word not in commands:
             continue
@@ -157,6 +192,10 @@ def navigates_source(command: str, suffixes: tuple[str, ...],
             continue
         if suffixes and any(arg.endswith(suffixes) for arg in args):
             return True
+        if scoped_sweeps and word in _SWEEP_COMMANDS:
+            if _scope_names_suffix(command, masked, suffixes):
+                return True
+            continue
         if _sweeps_the_tree(word, words):
             return True
     return False
