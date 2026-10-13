@@ -122,7 +122,9 @@
       {% else %}
       <td class="mono">{{ fmt_dur(row.dry_run_median) }}</td>
       <td class="mono">{{ fmt_dur(row.armed_median) }}</td>
-      <td class="mono">{{ fmt_dur(row.delta) }}</td>
+      {# The sign is the dict's, carried separately because `fmt_dur` reads a MAGNITUDE —
+         `cli._print_rules_summary`'s shape, so both surfaces print the same marker. #}
+      <td class="mono">{{ "-" if row.delta < 0 else "+" }}{{ fmt_dur(row.delta | abs) }}</td>
       <td class="sub">{{ row.dry_run_samples }} dry run / {{ row.armed_samples }} armed</td>
       {% endif %}
     </tr>

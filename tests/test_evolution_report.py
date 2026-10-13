@@ -208,6 +208,24 @@ def test_an_investigation_with_no_armed_rule_is_no_share_at_all(
     assert share["denominator"] == 1
 
 
+def test_an_armed_rule_with_nothing_stuck_says_so_and_not_that_nothing_is_armed(
+        store, detector, clock):
+    """An armed rule and an empty window are a DIFFERENT absence from a bare install.
+
+    Same `value is None`, two reasons, and one of the two notes is false here: a scope
+    that armed a rule is not told "no rule has been armed yet".
+    """
+    _arm(store, detector["id"])
+
+    share = ops.evolution_report()["mechanical_share"]
+
+    assert share["value"] is None
+    assert share["denominator"] == 0
+    assert share["note"] == ops._NOTHING_STUCK_SHARE_NOTE
+    assert share["note"] != ops._NO_MECHANICAL_SHARE_NOTE
+    assert "no rule has been armed yet" not in share["note"]
+
+
 def test_a_week_with_investigations_and_no_armed_rule_contributes_no_share(
         store, detector, clock, tmp_path):
     """The series obeys the same rule: no armed rule is no point, not a point at zero."""

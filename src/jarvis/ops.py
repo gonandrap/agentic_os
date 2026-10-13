@@ -11601,6 +11601,14 @@ _NO_MECHANICAL_SHARE_NOTE = (
     "no rule has been armed yet, so there is no mechanical share to report — which is "
     "not a share of zero")
 
+#: The OTHER absence, and a scope with an armed rule must never be told the sentence
+#: above: a rule IS armed, nothing got stuck in the window, so the share has an empty
+#: denominator rather than an unarmed registry behind it. Same no-digit rule — a share
+#: needs orders that got stuck, and there were none to resolve either way.
+_NOTHING_STUCK_SHARE_NOTE = (
+    "nothing got stuck in this window, so there is nothing a rule could have resolved "
+    "mechanically — which is not a share of zero")
+
 #: `rules.effective_status`' precedence, as a lookup this module can sort by. `rules`
 #: keeps its own private copy for the pair comparison; this one is only ever used to pick
 #: the STRONGEST pair a detector has, and an unknown string sorts weakest rather than
@@ -11859,7 +11867,10 @@ def evolution_report(project: str | None = None, *, days: int = 90) -> dict:
     value = (numerator / denominator) if (ever_armed and denominator) else None
     mechanical_share = {
         "value": value,
-        "note": None if value is not None else _NO_MECHANICAL_SHARE_NOTE,
+        # TWO reasons a share is absent, and each gets its own sentence: nothing ever
+        # armed, or armed with nothing stuck to resolve.
+        "note": None if value is not None else (
+            _NOTHING_STUCK_SHARE_NOTE if ever_armed else _NO_MECHANICAL_SHARE_NOTE),
         "numerator": numerator, "denominator": denominator, "series": series,
         "unreadable_projects": unreadable["projects"],
     }

@@ -215,6 +215,30 @@ def test_a_stuck_resolution_row_with_a_note_shows_the_note(client, monkeypatch):
     assert "2 dry-run and 0 armed samples, not enough history" in body
 
 
+def _delta_page(client, monkeypatch, delta: float) -> str:
+    monkeypatch.setattr(ops, "evolution_report", lambda *a, **k: report(
+        stuck_resolution=[{"gap_class": "stuck_order", "dry_run_median": 600.0,
+                           "armed_median": 420.0, "delta": delta, "note": None,
+                           "dry_run_samples": 5, "armed_samples": 5}]))
+    return body_of(client.get("/evolution").text)
+
+
+def test_a_negative_delta_renders_differently_from_a_positive_one(client, monkeypatch):
+    """The sign IS the finding: -3m is arming working, +3m is arming making it worse.
+
+    `fmt_dur` has no sign, so a page handing it the raw delta prints both as `3m` and
+    reverses half the rows it shows. `cli._print_rules_summary` prints the marker and the
+    magnitude; this page must print the same pair.
+    """
+    better = _delta_page(client, monkeypatch, -180.0)
+    assert "-3m" in better
+    assert "+3m" not in better
+
+    worse = _delta_page(client, monkeypatch, 180.0)
+    assert "+3m" in worse
+    assert "-3m" not in worse
+
+
 def test_a_weaker_half_with_no_side_names_no_side(client, monkeypatch):
     monkeypatch.setattr(ops, "evolution_report", lambda *a, **k: report(
         recurrences={"rows": [], "verdict_counts": {},
