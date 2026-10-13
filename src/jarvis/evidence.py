@@ -874,3 +874,83 @@ def _truncate(diff: str, limit: int,
             # does not quote the path, and the a-side is the answer when it does.
             dropped.append(old if new not in files and old in files else new)
     return "".join(kept), True, _dedupe(dropped)
+
+
+def _hunks(section: str) -> tuple[str, list[str]]:
+    """One section split into (everything before the first `@@`, the whole `@@` hunks).
+
+    A binary section carries no hunk at all (`_sections`), so it answers an EMPTY hunk
+    list and the caller has nothing of it to keep in part.
+    """
+    head: list[str] = []
+    hunks: list[list[str]] = []
+    for line in section.splitlines(keepends=True):
+        if line.startswith("@@"):
+            hunks.append([line])
+        elif hunks:
+            hunks[-1].append(line)
+        else:
+            head.append(line)
+    return "".join(head), ["".join(h) for h in hunks]
+
+
+def _truncate_hunks(diff: str, limit: int, files: tuple[str, ...]
+                    ) -> tuple[str, bool, tuple[str, ...], tuple[str, ...]]:
+    """Cut `diff` to `limit` chars, the last file at a HUNK boundary. The CONFIRM trim.
+
+    Returns (diff, cut?, dropped, partial). `_truncate` is the panel's and is unchanged:
+    at `validation.diff_chars` the all-or-nothing file rule costs nothing, while at the
+    confirmation's 12,000 a single file over the budget delivers zero of N characters
+    (docs/superpowers/specs/2026-10-13-a-confirmation-question-with-a-zero-character-
+    diff.md part 2). Two functions, two budgets, two stated rules.
+
+    Sections are kept whole while they fit. The FIRST that does not is kept in part —
+    its pre-hunk header plus as many WHOLE hunks as fit, then a marker line naming the
+    hunks omitted — and every section after it is dropped whole, which is `_truncate`'s
+    rule and its reason: a diff whose section order no longer matches the repository
+    reads as complete and is not. NEVER a mid-hunk cut, and never a binary section in
+    part: it has no hunk to keep, so it drops.
+    """
+    if len(diff) <= limit:
+        return diff, False, (), ()
+    kept: list[str] = []
+    dropped: list[str] = []
+    partial: list[str] = []
+    used = 0
+    done = False
+    for new, old, text in _sections(diff):
+        # Prefer the name `files` knows: the b-side is that name in every case git does
+        # not quote the path, and the a-side is the answer when it does.
+        name = old if new not in files and old in files else new
+        if not done and used + len(text) <= limit:
+            kept.append(text)
+            used += len(text)
+            continue
+        if not done:
+            done = True
+            head, hunks = _hunks(text)
+            took = _partial(head, hunks, name, limit - used)
+            if took:
+                kept.append(took)
+                partial.append(name)
+                continue
+        dropped.append(name)
+    return "".join(kept), True, _dedupe(dropped), _dedupe(partial)
+
+
+def _partial(head: str, hunks: list[str], name: str, room: int) -> str:
+    """The head plus the whole hunks that fit in `room`, marker included, or `""`."""
+    taken: list[str] = []
+    for i, hunk in enumerate(hunks):
+        marker = _hunk_marker(len(hunks) - i - 1, name)
+        if len(head) + sum(len(h) for h in taken) + len(hunk) + len(marker) > room:
+            break
+        taken.append(hunk)
+    if not taken:
+        return ""
+    return head + "".join(taken) + _hunk_marker(len(hunks) - len(taken), name)
+
+
+def _hunk_marker(omitted: int, name: str) -> str:
+    """The in-diff line that says this file is shown in part — a third state."""
+    return f"[{omitted} more hunk(s) of {name} not shown]\n" if omitted else ""

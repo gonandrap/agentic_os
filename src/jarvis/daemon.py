@@ -7521,9 +7521,11 @@ class Daemon:
                 # reads the TRIMMED text because that is what is persisted and sent, and
                 # the WHOLE rendered block of it: docs/superpowers/specs/
                 # 2026-09-26-bounded-model-inputs.md § 2.
+                # `unreadable` off the same `ce` this renders: 2026-10-13 spec, part 3.
                 evidence_ok = autoreview.decide_evidence(
                     a, ce.stat, ce.what_changed(),
-                    summary=str(wo.get("result_summary") or ""))
+                    summary=str(wo.get("result_summary") or ""),
+                    unreadable=ce.unreadable)
                 if not evidence_ok.armed:
                     self._note_autoreview_held(store, wo["id"], evidence_ok,
                                                suppress=suppress)
