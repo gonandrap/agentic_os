@@ -249,6 +249,41 @@ def validation_hold(events: Iterable[Any], round_no: int) -> tuple[float, str]:
     return held, cause
 
 
+def validation_ci_hold_spans(events: Iterable[Any], since: float,
+                             now: float) -> list[tuple[float, float]]:
+    """Every interval inside `[since, now]` the OS was holding a round for GitHub's checks.
+
+    §3 of docs/superpowers/specs/2026-10-12-a-validation-round-waiting-for-ci-is-not-stuck.md:
+    `ops.stuck_scan` DISCOUNTS these seconds as well as excluding a live hold. Without
+    the discount an exclusion only postpones the defect — `validating` is judged on time
+    in status, so the first sweep after the checks report sees the whole wait and buys the
+    investigation the exclusion existed to prevent.
+
+    SPANS AND NOT A TOTAL: a usage window can shut while CI runs, and only intervals can
+    be unioned with the usage holds (`holds.union_seconds`). A scalar here would push the
+    double-count arithmetic into the caller.
+
+    ALL ROUNDS, NO ROUND FILTER. Clipping to `since` — the current status span — makes one
+    unnecessary and still correct, because a round only holds for CI while the order is in
+    `validating`.
+
+    Takes ROWS rather than a store for `validation_hold_until`'s reason: one home, two
+    carriers, the other being `ops.feature_events_of_kind`.
+    """
+    spans: list[tuple[float, float]] = []
+    for e in events:
+        payload = db.from_json(e["payload"], {})
+        if payload.get("cause") != VALIDATION_CI_CAUSE:
+            continue
+        start = max(float(e["ts"]), since)
+        # The hold stands until `reopens_at` and `validation_tick` goes again the moment
+        # it lapses, so that moment — clipped at `now` — is where the span ends.
+        end = min(float(payload.get("reopens_at") or 0.0), now)
+        if end > start:
+            spans.append((start, end))
+    return sorted(spans)
+
+
 # What one seat proposed. "" is a seat that offered none — it ran, but said nothing the
 # arbiter can count.
 VALIDATION_VERDICTS = ("pass", "reject", "")

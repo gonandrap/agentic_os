@@ -51,7 +51,7 @@ EXCLUSION_REASON: Mapping[str, str] = {
                             "that is true"),
 }
 
-#: The usage window's sentence, and the answer for any hold added later: all four of §2's
+#: The usage window's sentence, and the answer for any hold added later: all five of §2's
 #: causes resume by themselves.
 DEFAULT_EXCLUSION_REASON = ("held by {cause}, which clears by itself — nothing is judged "
                             "while it does")
@@ -107,11 +107,20 @@ def assess(status: str, seconds_in_status: float, seconds_since_activity: float,
     silently unwatched.
 
     `excluded_cause` short-circuits to `stuck=False`. §2: the account's usage window, a
-    live `jarvis pause`, the post-reopen ramp and a live blocking dependency
-    (`LIVE_DEPENDENCY`), because nothing is wrong in those cases and all four resume by
-    themselves — so an investigation would buy a session to be told the OS is working as
-    designed. `exempt_kinds` and `by_design_idle` exclude too (§1, §2.2 of the 2026-10-12
-    spec).
+    live `jarvis pause`, the post-reopen ramp, a live blocking dependency
+    (`LIVE_DEPENDENCY`) and a validation round held for GitHub's checks
+    (`project_store.VALIDATION_CI_CAUSE`), because nothing is wrong in those cases and all
+    five resume by themselves — so an investigation would buy a session to be told the OS
+    is working as designed. `exempt_kinds` and `by_design_idle` exclude too (§1, §2.2 of
+    the 2026-10-12 spec).
+
+    That CI one is an EXTENSION of kn-6e836793 (the user's 2026-09-27 ruling that the
+    usage hold was the only one) on the record rather than a silent widening — the
+    "Reconciliation with the standing ruling" section of
+    docs/superpowers/specs/2026-10-12-a-validation-round-waiting-for-ci-is-not-stuck.md.
+    It passes the same two tests as a usage window: the OS is deliberately not acting,
+    and the hold clears with NO user decision in the loop. Any hold failing either test
+    stays judged — the auth hold does, because a human running `/login` is what clears it.
 
     `kind`, `exempt_kinds` and `by_design_idle` are the 2026-10-12 spec's: `status` cannot
     express "nothing is expected to happen here until somebody speaks to it", and a
