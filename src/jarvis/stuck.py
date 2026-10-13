@@ -27,6 +27,11 @@ SECONDS_PER_MINUTE = 60  # a unit, not a setting
 #: in status because nothing is expected to happen inside it at all.
 ACTIVITY_STATUSES = ("running",)
 
+#: The fourth self-clearing hold of §2's `excluded_cause` family: this order's
+#: `depends_on` edges are all LIVE, so it is waiting as `--depends-on` designed and the
+#: wait ends without anyone acting. A DEAD edge is not this cause — see §2.3.
+LIVE_DEPENDENCY = "live_dependency"
+
 #: What the investigator is asked, and it is a TEMPLATE rather than prose composed at the
 #: call site for the reason `ops.create_investigation_order` refuses an empty `why`: the
 #: investigator's first reader is a fresh session with no memory of the sweep. The last
@@ -75,9 +80,10 @@ def assess(status: str, seconds_in_status: float, seconds_since_activity: float,
     silently unwatched.
 
     `excluded_cause` short-circuits to `stuck=False`. §2: the account's usage window, a
-    live `jarvis pause` and the post-reopen ramp are the only ones, because nothing is
-    wrong in those cases and all three resume by themselves — so an investigation would
-    buy a session to be told the OS is working as designed.
+    live `jarvis pause`, the post-reopen ramp and a live blocking dependency
+    (`LIVE_DEPENDENCY`) are the only ones, because nothing is wrong in those cases and all
+    four resume by themselves — so an investigation would buy a session to be told the OS
+    is working as designed.
     """
     on_activity = status in activity_statuses
     clock = "activity" if on_activity else "status"
