@@ -176,6 +176,53 @@ def test_ci_that_never_reports_is_judged_anyway_rather_than_parked_for_ever(
     assert CI_HOLD_DEADLINE_SECONDS > 0, "the real ceiling must not be the test's"
 
 
+def test_a_lapsed_ci_hold_is_judged_and_its_held_seconds_still_discounted(
+        fleet, fake_gh, monkeypatch):
+    """The §1(2) half of the root cause: EXCLUSION ALONE IS NOT THE FIX.
+
+    `validating`'s threshold is 15 minutes and it is judged on time in status, so the
+    first sweep after the hold lifts sees 20 minutes and buys the investigation the
+    exclusion was supposed to prevent — while the panel is legitimately mid-judgement.
+    The held seconds are discounted, so the order is judged and is not stuck.
+    """
+    from jarvis import db, ops
+    from jarvis.catalog import FleetHealthConfig
+    from tests.test_health_sweep import park_order
+
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "x = 1")
+    fleet.daemon.validator = Validator(passed())
+    pr = finish(fleet, wo["id"])["pr_url"]
+    fake_gh.set_pr_artifact(pr, checks=PENDING, files=FILES, diff="+x = 1")
+    fleet.drain()
+
+    store = ProjectStore(fleet.project)
+    try:
+        assert store.get_work_order(wo["id"])["status"] == "validating"
+        now = time.time()
+        # Twenty minutes in `validating`, every one of them held: the real hold event
+        # written above, back-dated, with its `reopens_at` a minute in the past.
+        at = park_order(store, wo["id"], "validating", hours=20 / 60.0)
+        for row in store.events_of_kind(wo["id"], "validation_failed"):
+            payload = db.from_json(row["payload"], {})
+            if payload.get("cause") != VALIDATION_CI_CAUSE:
+                continue
+            payload["reopens_at"] = now - 60
+            store.conn.execute("UPDATE wo_events SET ts=?, payload=? WHERE id=?",
+                               (at, json.dumps(payload), row["id"]))
+        store.conn.commit()
+
+        judged = ops.stuck_scan(store, "proj_a", FleetHealthConfig(), now,
+                                stuck_only=False)[1]
+        row = [r for r in judged if r["wo"]["id"] == wo["id"]][0]
+
+        assert row["verdict"].excluded == "", "the lapsed hold still excluded the order"
+        assert row["discounted"] >= 18 * 60, row["discounted"]
+        assert row["verdict"].stuck is False, row["verdict"].reason
+    finally:
+        store.close()
+
+
 # -- 3. what a person reads -----------------------------------------------------------
 
 

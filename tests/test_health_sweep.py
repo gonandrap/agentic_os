@@ -1342,6 +1342,116 @@ def test_held_seconds_do_not_count(stuck_os):
     assert len(ops.list_investigation_orders("proj_a", include_settled=True)) == 1
 
 
+def ci_hold(store, wo_id: str, round_no: int, started: float, reopens: float) -> None:
+    """One `ci_pending` validation hold, in `Daemon._validation_ci_held`'s event shape."""
+    from jarvis.project_store import VALIDATION_CI_CAUSE
+
+    store.add_event(wo_id, "validation_failed",
+                    {"round": round_no, "cause": VALIDATION_CI_CAUSE,
+                     "reopens_at": reopens, "pending": ["unit (3.13)"]})
+    store.conn.execute(
+        "UPDATE wo_events SET ts=? WHERE id=(SELECT MAX(id) FROM wo_events)", (started,))
+    store.conn.commit()
+
+
+def _validating(store, wo_title: str, minutes: float):
+    """An order parked in `validating` with a round on record, `minutes` ago."""
+    wo = ops.create_work_order("proj_a", wo_title)
+    store.open_validation_round(wo_id=wo["id"], fingerprint="f")
+    return wo, park_order(store, wo["id"], "validating", hours=minutes / 60.0)
+
+
+def _judged(store, now: float):
+    """Every row the sweep judges, `stuck_only=False` — the shape `/stuck` reads."""
+    from jarvis.catalog import FleetHealthConfig
+
+    return ops.stuck_scan(store, "proj_a", FleetHealthConfig(), now,
+                          stuck_only=False)[1]
+
+
+def test_a_round_waiting_for_ci_is_excluded_and_still_a_visible_row(stuck_os):
+    """§5: `excluded == "ci_pending"`, `stuck` False, and NO `continue` — a row that
+    vanished would be indistinguishable from one comfortably inside its threshold."""
+    from jarvis.project_store import VALIDATION_CI_CAUSE
+
+    store = stuck_os["store"]
+    now = time.time()
+    wo, at = _validating(store, "waiting for github", minutes=20)
+    ci_hold(store, wo["id"], 1, started=at, reopens=now + 60)
+
+    rows = [r for r in _judged(store, now) if r["wo"]["id"] == wo["id"]]
+
+    assert len(rows) == 1, "the held row left the sweep's output entirely"
+    assert rows[0]["verdict"].excluded == VALIDATION_CI_CAUSE
+    assert rows[0]["verdict"].stuck is False
+
+
+def test_a_validating_order_with_no_ci_hold_is_still_judged(stuck_os):
+    """§7(2): the exclusion must not generalise to every `validating` order."""
+    store = stuck_os["store"]
+    now = time.time()
+    wo, _at = _validating(store, "nothing is holding this round", minutes=20)
+
+    row = [r for r in _judged(store, now) if r["wo"]["id"] == wo["id"]][0]
+
+    assert row["verdict"].excluded == ""
+    assert row["verdict"].stuck is True
+
+
+def test_overlapping_usage_and_ci_holds_are_discounted_once(stuck_os):
+    """§4: the UNION of the two interval sets, never the sum."""
+    store = stuck_os["store"]
+    now = time.time()
+    wo, at = _validating(store, "held by both", minutes=60)
+    usage_hold(store, wo["id"], started=at, ended=at + 30 * 60)
+    ci_hold(store, wo["id"], 1, started=at + 20 * 60, reopens=at + 40 * 60)
+
+    row = [r for r in _judged(store, now) if r["wo"]["id"] == wo["id"]][0]
+
+    assert abs(row["discounted"] - 40 * 60) < 5, row["discounted"]
+    assert row["discounted"] < 30 * 60 + 20 * 60, "the overlap was counted twice"
+
+
+def test_with_no_ci_hold_the_usage_figure_is_unchanged(stuck_os):
+    """§4's identity: `union_seconds` over the usage holds alone equals `by_cause`."""
+    from jarvis import holds
+    from jarvis.worker_session import PAUSE_USAGE_LIMIT
+
+    store = stuck_os["store"]
+    now = time.time()
+    wo, at = _validating(store, "held by the account only", minutes=60)
+    usage_hold(store, wo["id"], started=at, ended=at + 30 * 60)
+
+    row = [r for r in _judged(store, now) if r["wo"]["id"] == wo["id"]][0]
+
+    usage = [h for h in holds.held(store, wo["id"], now=now)
+             if h.cause == PAUSE_USAGE_LIMIT]
+    expected = holds.by_cause(usage, row["since"], now, now).get(PAUSE_USAGE_LIMIT, 0.0)
+    assert row["discounted"] == expected
+
+
+def test_ci_hold_spans_are_clipped_to_the_status_span(stuck_os):
+    """§3: every round, clipped to `[since, now]`, oldest first, nothing else's cause."""
+    from jarvis.project_store import (VALIDATION_HELD_CAUSE,
+                                      validation_ci_hold_spans)
+
+    def ev(ts, round_no, reopens, cause="ci_pending"):
+        return {"ts": ts, "payload": json.dumps(
+            {"round": round_no, "cause": cause, "reopens_at": reopens})}
+
+    events = [
+        ev(130.0, 2, 150.0),                              # wholly inside
+        ev(50.0, 1, 120.0),                               # began before `since`
+        ev(180.0, 3, 400.0),                              # still live at `now`
+        ev(60.0, 1, 90.0),                                # over before `since`
+        ev(140.0, 2, 160.0, cause=VALIDATION_HELD_CAUSE),  # another cause entirely
+    ]
+
+    assert validation_ci_hold_spans(events, 100.0, 200.0) == [
+        (100.0, 120.0), (130.0, 150.0), (180.0, 200.0)]
+    assert validation_ci_hold_spans([], 100.0, 200.0) == []
+
+
 def test_assess_is_pure():
     """§1: the predicate reaches no store, no model and not even the clock."""
     import ast
