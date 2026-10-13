@@ -9051,12 +9051,16 @@ def last_stuck_investigation(project_name: str, subject: str) -> dict[str, Any] 
 IDLE_MANAGER_CAUSE = "its feature's next message"
 
 
-def manager_awaiting_feature(pstore: ProjectStore, wo: dict[str, Any]) -> bool:
+def manager_awaiting_feature(
+    pstore: ProjectStore, wo: dict[str, Any], now: float | None = None
+) -> bool:
     """Is this a feature manager whose feature can still wake it?
 
     §3 (`idle`'s actor) of docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-
     act-on-this.md. Deliberately silent about the work order's OWN status: the caller
     gates on that, so this stays reusable.
+
+    `now` unused: ops.scheduled_actor calls every predicate as p.test(store, wo, now=now).
     """
     if wo.get("kind") != "manager" or not wo.get("parent_id"):
         return False

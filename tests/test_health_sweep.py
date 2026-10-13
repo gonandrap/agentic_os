@@ -1558,6 +1558,10 @@ def test_manager_awaiting_feature_needs_a_manager_and_a_live_feature(stuck_os):
 
     manager = store.create_work_order("manage it", parent_id=fo_id, kind="manager")
     assert ops.manager_awaiting_feature(store, manager)
+    # scheduled_actor passes now= to every predicate: accepted, changes nothing.
+    assert ops.manager_awaiting_feature(store, manager, now=1234.5) is (
+        ops.manager_awaiting_feature(store, manager)
+    )
 
     # A feature deleted out from under its manager: KeyError, not a candidate.
     assert not ops.manager_awaiting_feature(
