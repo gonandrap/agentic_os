@@ -5854,6 +5854,12 @@ class Daemon:
         except Exception:  # noqa: BLE001 — a failing pass must not take the tick down
             log.exception("[%s] the usage meter could not be reconciled", project.name)
             return
+        if meter.get("unreliable"):
+            # A suppressed pass is visible in the log and nowhere else: the user has
+            # nothing to do about a defect in this module's own arithmetic.
+            log.warning("[%s] the usage meter does not reconcile over this span (%s): "
+                        "no residual alarm is raised from it", project.name,
+                        ", ".join(meter["unreliable"]))
         raised = [kind for kind, flag in (
             (METER_OUTSIDE_ALARM, meter["alerts"]["outside"]),
             (METER_RESIDUAL_ALARM, meter["alerts"]["residual"])) if flag]
