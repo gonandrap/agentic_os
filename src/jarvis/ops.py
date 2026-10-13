@@ -9083,6 +9083,11 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         since = durations.current_status_since
         usage = [h for h in spans if h.cause == PAUSE_USAGE_LIMIT]
         discounted = holds.by_cause(usage, since, now, now).get(PAUSE_USAGE_LIMIT, 0.0)
+        # §2.2 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md.
+        edges = (pstore.unfinished_dependencies(wo["id"])
+                 if wo["status"] == "pending" else [])
+        live_edges = bool(edges) and not any(
+            invariants.dependency_is_dead(dep) for dep in edges)
         # IS THIS MANAGER WAITING CORRECTLY? Gated on `kind`, `status` and `parent_id` so
         # no other order pays for the reads (`true_blockers`' rule). A manager with a NULL
         # parent is stranded by definition: there is no feature to be silent, and one
@@ -9097,7 +9102,8 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
             str(wo["status"]), now - since, now - (durations.last_activity_ts or since),
             discounted, thresholds, cfg.fallback_minutes * 60.0,
             excluded_cause=(PAUSE_USAGE_LIMIT
-                            if window or any(h.open for h in usage) else ""),
+                            if window or any(h.open for h in usage)
+                            else (stuck.LIVE_DEPENDENCY if live_edges else "")),
             kind=str(wo.get("kind") or "worker"),
             exempt_kinds=tuple(cfg.exempt_kinds),
             by_design_idle=by_design_idle)

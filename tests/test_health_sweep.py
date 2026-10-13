@@ -1342,6 +1342,84 @@ def test_held_seconds_do_not_count(stuck_os):
     assert len(ops.list_investigation_orders("proj_a", include_settled=True)) == 1
 
 
+def _judge(stuck_os, wo_id: str):
+    """One order's `stuck.Verdict`, through the sweep's own reader."""
+    spec = load_catalog(stuck_os["path"]).projects[0]
+    _scanned, judged = ops.stuck_scan(stuck_os["store"], "proj_a", spec.fleet_health,
+                                      time.time(), stuck_only=False)
+    return next(r["verdict"] for r in judged if r["wo"]["id"] == wo_id)
+
+
+def test_a_live_dependency_is_not_stuck(stuck_os):
+    """§2.2 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md."""
+    from jarvis import stuck
+
+    store = stuck_os["store"]
+    dep = ops.create_work_order("proj_a", "the dependency")
+    child = ops.create_work_order("proj_a", "waiting as --depends-on designed",
+                                  depends_on=[dep["id"]])
+    park_order(store, child["id"], "pending", hours=5)
+
+    verdict = _judge(stuck_os, child["id"])
+    assert verdict.stuck is False
+    assert verdict.excluded == stuck.LIVE_DEPENDENCY
+
+
+@pytest.mark.parametrize("how", ["cancelled", "deleted"])
+def test_a_dead_dependency_is_still_judged(stuck_os, how):
+    """§2.3: a dead edge cannot clear itself, so the order SHOULD be judged."""
+    store = stuck_os["store"]
+    dead = ops.create_work_order("proj_a", "the edge that can never clear")
+    live = ops.create_work_order("proj_a", "the live edge")
+    child = ops.create_work_order("proj_a", "blocked on a dead edge",
+                                  depends_on=[dead["id"], live["id"]])
+    if how == "deleted":
+        ops.delete_work_order(dead["id"])
+    else:
+        store.set_status(dead["id"], "cancelled")
+    park_order(store, child["id"], "pending", hours=5)
+
+    verdict = _judge(stuck_os, child["id"])
+    assert verdict.stuck is True and verdict.excluded == ""
+
+
+def test_pending_with_no_dependencies_is_still_stuck(stuck_os):
+    """§2.2: the exclusion is the EDGES, not the status."""
+    store = stuck_os["store"]
+    wo = ops.create_work_order("proj_a", "pending behind nothing at all")
+    park_order(store, wo["id"], "pending", hours=5)
+
+    verdict = _judge(stuck_os, wo["id"])
+    assert verdict.stuck is True and verdict.excluded == ""
+
+
+def test_edges_exclude_only_a_pending_order(stuck_os):
+    """§2.2: the read is gated on status, not merely on edge presence."""
+    store = stuck_os["store"]
+    dep = ops.create_work_order("proj_a", "the dependency")
+    child = ops.create_work_order("proj_a", "delivered behind a pull request",
+                                  depends_on=[dep["id"]])
+    park_order(store, child["id"], "waiting_pr_merge", hours=5)
+
+    verdict = _judge(stuck_os, child["id"])
+    assert verdict.stuck is True and verdict.excluded == ""
+
+
+def test_usage_window_outranks_a_live_dependency(stuck_os):
+    """§2.2's precedence: the window is the account's and outranks a per-order hold."""
+    from jarvis.worker_session import PAUSE_USAGE_LIMIT
+
+    store = stuck_os["store"]
+    dep = ops.create_work_order("proj_a", "the dependency")
+    child = ops.create_work_order("proj_a", "live edges and a spent window",
+                                  depends_on=[dep["id"]])
+    at = park_order(store, child["id"], "pending", hours=5)
+    usage_hold(store, child["id"], started=at)
+
+    verdict = _judge(stuck_os, child["id"])
+    assert verdict.stuck is False and verdict.excluded == PAUSE_USAGE_LIMIT
+
+
 def test_assess_is_pure():
     """§1: the predicate reaches no store, no model and not even the clock."""
     import ast

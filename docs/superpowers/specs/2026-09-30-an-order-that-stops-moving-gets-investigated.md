@@ -121,7 +121,8 @@ INV-OS-HEALTH-SWEEP-DARK, and the reasoning is `holds.py`'s module docstring: WA
 honest about elapsed time, ACTIVE is "wall minus every interval the OS's own record says
 the order was held", and a threshold belongs on ACTIVE.
 
-**Nothing else is excluded.** Explicitly NOT excluded, and each is a decision:
+**No further STATUS-based exclusions; kind-based skips are enumerated in section 7.**
+Explicitly NOT excluded, and each is a decision:
 
 * `PAUSE_AUTH` — an expired Claude Code sign-in. It does not clear itself, and an order
   parked on one for four hours is exactly the class Part A is about.
@@ -393,6 +394,20 @@ and label, `seconds_in_status`, `seconds_since_activity`, `discounted_seconds`,
 the live-or-last investigation (`id`, `status`, `classification`). The CLI and the page
 both read this document and neither computes a number — `jarvis wo why`'s rule, stated at
 src/jarvis/cli.py:281.
+
+**Two KIND-based skips, and they are not exclusions.** Both sit in `ops.stuck_scan`
+(src/jarvis/ops.py:9048) BEFORE `scanned += 1`, so such orders are never scanned and
+never reach `stuck_report`, `jarvis stuck` or `/stuck` as a row at all. (1) An
+investigation is never a subject: `kind` in (`investigation`, `investigator`), or a
+`parent_id` under `FO_ID_PREFIXES["investigation"]` — `create_investigation_order` refuses
+one as a subject, and that refusal must not be how the sweep learns it. (2) A
+`kind='manager'` order whose status is `idle` with no undelivered inbound message: that is
+a feature manager's designed resting state between messages from its feature (issue 1007,
+wo-e4ae2dfb, Neo ruling 2026-10-09; lands with that order). "Undelivered inbound" means
+`pstore.queued_messages(wo_id)` and nothing else — an unrouted bus envelope is
+INV-ENVELOPE-STUCK's business. Neither skip is a threshold change: every fleet-health
+threshold stays a catalog key under `fleet_health.*`, resolvable fleet-wide and per
+project, never a module constant.
 
 **`jarvis stuck [project] [--json] [--limit N]`**, `cmd_alarms` (src/jarvis/cli.py:2489)
 in shape: a count line, then over-threshold rows marked `!`, then the rest as the record.

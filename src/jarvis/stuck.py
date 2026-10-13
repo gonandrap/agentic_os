@@ -27,6 +27,11 @@ SECONDS_PER_MINUTE = 60  # a unit, not a setting
 #: in status because nothing is expected to happen inside it at all.
 ACTIVITY_STATUSES = ("running",)
 
+#: The fourth self-clearing hold of §2's `excluded_cause` family: this order's
+#: `depends_on` edges are all LIVE, so it is waiting as `--depends-on` designed and the
+#: wait ends without anyone acting. A DEAD edge is not this cause — see §2.3.
+LIVE_DEPENDENCY = "live_dependency"
+
 #: The holds this module names itself, §4 of docs/superpowers/specs/2026-10-12-a-managers-
 #: by-design-idle-is-not-a-standstill.md. Each rides on `Verdict.excluded` beside
 #: `worker_session.PAUSE_USAGE_LIMIT`, so a held order is a visible row rather than an
@@ -46,7 +51,7 @@ EXCLUSION_REASON: Mapping[str, str] = {
                             "that is true"),
 }
 
-#: The usage window's sentence, and the answer for any hold added later: all three of §2's
+#: The usage window's sentence, and the answer for any hold added later: all four of §2's
 #: causes resume by themselves.
 DEFAULT_EXCLUSION_REASON = ("held by {cause}, which clears by itself — nothing is judged "
                             "while it does")
@@ -102,10 +107,11 @@ def assess(status: str, seconds_in_status: float, seconds_since_activity: float,
     silently unwatched.
 
     `excluded_cause` short-circuits to `stuck=False`. §2: the account's usage window, a
-    live `jarvis pause` and the post-reopen ramp, because nothing is wrong in those cases
-    and all three resume by themselves — so an investigation would buy a session to be
-    told the OS is working as designed. `exempt_kinds` and `by_design_idle` exclude too
-    (§1, §2.2 of the 2026-10-12 spec).
+    live `jarvis pause`, the post-reopen ramp and a live blocking dependency
+    (`LIVE_DEPENDENCY`), because nothing is wrong in those cases and all four resume by
+    themselves — so an investigation would buy a session to be told the OS is working as
+    designed. `exempt_kinds` and `by_design_idle` exclude too (§1, §2.2 of the 2026-10-12
+    spec).
 
     `kind`, `exempt_kinds` and `by_design_idle` are the 2026-10-12 spec's: `status` cannot
     express "nothing is expected to happen here until somebody speaks to it", and a

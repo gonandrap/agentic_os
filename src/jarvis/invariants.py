@@ -41,7 +41,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterator
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
 
 from . import budget, db, worker_session
 # A leaf module (logging, subprocess, dataclasses): the import cannot cycle back here.
@@ -1665,7 +1665,16 @@ def dead_dependencies(store: ProjectStore, wo: dict[str, Any]) -> list[dict[str,
     yet, which is the normal condition of a dependency and asks nothing of anyone.
     """
     return [dep for dep in store.unfinished_dependencies(wo["id"])
-            if dep["status"] in DEPENDENCY_DEAD_STATUSES or dep["status"] == "missing"]
+            if dependency_is_dead(dep)]
+
+
+def dependency_is_dead(dep: Mapping[str, Any]) -> bool:
+    """One row of `ProjectStore.unfinished_dependencies`: can this edge NEVER clear?
+
+    §2.3 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md: one
+    definition, shared with `ops.stuck_scan`.
+    """
+    return dep["status"] in DEPENDENCY_DEAD_STATUSES or dep["status"] == "missing"
 
 
 def usage_hold_note(until: float) -> str:
