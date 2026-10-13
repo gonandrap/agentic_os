@@ -463,6 +463,49 @@ def test_a_moved_fingerprint_does_not_file_a_second_request_while_the_first_awai
     assert len(store.list_approvals(wo["id"])) == 1
 
 
+def test_a_refused_fire_does_not_hold_so_a_moved_fingerprint_records_a_new_fire(
+        boot, central, store):
+    """Held only while the alarm is `proposed`; a refusal awaits no verdict."""
+    daemon = boot()                 # remedies ship off: every armed fire is refused
+    det, _rm, wo, _ = _armed_fire(daemon, central, store)
+    (first,) = _fires(central, det)
+    assert first["outcome"] == rules.REFUSED
+    assert store.get_alarm(first["alarm_id"])["status"] != "proposed"
+    store.queue_message(wo["id"], "an unrelated message")
+
+    counts = _tick(daemon, store)
+
+    fires = _fires(central, det)
+    assert len(fires) == 2 and counts["refused"] == 1
+    assert {f["outcome"] for f in fires} == {rules.REFUSED}
+    assert len({f["alarm_id"] for f in fires}) == 2
+
+
+def test_a_failed_post_propose_fingerprint_keeps_the_pre_action_one_and_still_records_the_fire(
+        boot, central, store, monkeypatch):
+    """No fabricated value: the existing branch logs and keeps the pre-action string."""
+    daemon = boot(remedies_allowed=["nudge"])
+    det, _rm = _rule(central)
+    ops.rules_arm(det["id"], "earned", by="gonzalo")
+    wo = store.create_work_order("stuck in review", status="needs_review")
+    before = health.fingerprint(
+        store, {"kind": "work_order", "row": store.get_work_order(wo["id"])})
+    real = health.fingerprint
+
+    def flaky(s, subject):
+        if s.list_approvals(wo["id"]):      # only after propose filed the gate request
+            raise RuntimeError("fingerprint source unreadable")
+        return real(s, subject)
+
+    monkeypatch.setattr(health, "fingerprint", flaky)
+    counts = _tick(daemon, store)
+
+    (fire,) = _fires(central, det)
+    assert fire["outcome"] == rules.PROPOSED and counts["proposed"] == 1
+    assert fire["fingerprint"] == before
+    assert len(store.list_approvals(wo["id"])) == 1
+
+
 def test_a_dry_run_clearing_writes_no_rule_cleared_event(boot, central, store):
     daemon = boot()
     det, _ = _rule(central)

@@ -22,10 +22,10 @@ Five properties beyond the ten seed tests:
    the `state_durations` source reads the holds too, so the claim is the pair the tests
    make: NO walk when the live conditions name neither a hold field nor a time field, and
    AT MOST ONE walk per order when they name both.
-2. **`armed` is inert in this release.** Nothing in the pass branches on
-   `detectors.status`, so an armed detector reaching it before §6 lands records a fire
-   and touches NOTHING else — no alarm, no message, no flag, no gate, and no event on the
-   order's own timeline (Neo, question 882).
+2. **A pair not armed on BOTH halves is inert.** The pass branches on the pair's
+   `rules.effective_status`, so a half-armed pair records a dry-run fire and touches
+   NOTHING else — no alarm, no message, no flag, no gate, and no event on the order's
+   own timeline (Neo, question 882). The armed path is `tests/test_rules_arm.py`.
 3. **A standing condition is one fire.** Not one per tick, and it may fire again only
    after it has cleared.
 4. **Nothing that could not be read decides anything.** A detector that raises is
@@ -448,7 +448,7 @@ def test_each_seed_rule_is_silent_on_a_healthy_order_of_the_same_status(
     assert fires_for(central, det["id"], wo["id"]) == []
 
 
-# -- 3. `armed` is INERT in this release ------------------------------------------------
+# -- 3. a pair not armed on both halves is INERT -----------------------------------------
 
 
 def test_a_pair_that_is_not_armed_on_both_halves_records_a_fire_and_does_nothing_else(

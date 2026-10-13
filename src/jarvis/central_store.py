@@ -1683,12 +1683,13 @@ class CentralStore:
             raise ValueError(f"detector {detector_id} has no live remedy rule, so there is "
                              f"nothing for it to propose — add one before arming")
         now = db.now()
-        self._in_transaction([
-            ("UPDATE detectors SET status=?, armed_at=?, armed_by=?, armed_reason=? "
-             "WHERE id=?", (rules.ARMED, now, by, reason.strip(), detector_id)),
-            ("UPDATE remedy_rules SET status=? WHERE detector_id=? AND retired_at IS NULL",
-             (rules.ARMED, detector_id)),
-        ])
+        with db.write_transaction(self.conn):  # the pair flips together: db.write_transaction
+            self.conn.execute(
+                "UPDATE detectors SET status=?, armed_at=?, armed_by=?, armed_reason=? "
+                "WHERE id=?", (rules.ARMED, now, by, reason.strip(), detector_id))
+            self.conn.execute(
+                "UPDATE remedy_rules SET status=? WHERE detector_id=? AND retired_at IS NULL",
+                (rules.ARMED, detector_id))
         return self.get_detector(detector_id)  # type: ignore[return-value]
 
     def disarm_detector(self, detector_id: str, reason: str) -> dict[str, Any]:
@@ -1709,11 +1710,12 @@ class CentralStore:
             raise ValueError(f"detector {detector_id} is {detector['status']}, not armed")
         if not (reason or "").strip():
             raise ValueError("returning a rule to dry run needs a reason")
-        self._in_transaction([
-            ("UPDATE detectors SET status=? WHERE id=?", (rules.DRY_RUN, detector_id)),
-            ("UPDATE remedy_rules SET status=? WHERE detector_id=? AND retired_at IS NULL",
-             (rules.DRY_RUN, detector_id)),
-        ])
+        with db.write_transaction(self.conn):  # the pair flips together: db.write_transaction
+            self.conn.execute("UPDATE detectors SET status=? WHERE id=?",
+                              (rules.DRY_RUN, detector_id))
+            self.conn.execute(
+                "UPDATE remedy_rules SET status=? WHERE detector_id=? AND retired_at IS NULL",
+                (rules.DRY_RUN, detector_id))
         return self.get_detector(detector_id)  # type: ignore[return-value]
 
     def record_false_positive(self, fire_id: int, reason: str) -> dict[str, Any]:
@@ -1739,29 +1741,18 @@ class CentralStore:
         if fire["outcome"] in (rules.UNREADABLE, rules.CLEARED):
             raise ValueError(f"rule fire {fire_id} is {fire['outcome']} — the rule decided "
                              f"nothing there, so there is nothing to call wrong")
-        stmts: list[tuple[str, tuple[Any, ...]]] = [
-            ("UPDATE rule_fires SET false_positive=1, false_positive_reason=? WHERE id=?",
-             (rules.bound(reason), int(fire_id))),
-            ("UPDATE detectors SET false_positives = false_positives + 1 WHERE id=?",
-             (fire["detector_id"],)),
-        ]
-        if fire["remedy_rule_id"]:
-            stmts.append(("UPDATE remedy_rules SET false_positives = false_positives + 1 "
-                          "WHERE id=?", (fire["remedy_rule_id"],)))
-        self._in_transaction(stmts)
+        with db.write_transaction(self.conn):  # one commit: db.write_transaction
+            self.conn.execute(
+                "UPDATE rule_fires SET false_positive=1, false_positive_reason=? WHERE id=?",
+                (rules.bound(reason), int(fire_id)))
+            self.conn.execute(
+                "UPDATE detectors SET false_positives = false_positives + 1 WHERE id=?",
+                (fire["detector_id"],))
+            if fire["remedy_rule_id"]:
+                self.conn.execute(
+                    "UPDATE remedy_rules SET false_positives = false_positives + 1 "
+                    "WHERE id=?", (fire["remedy_rule_id"],))
         return self.get_rule_fire(int(fire_id))  # type: ignore[return-value]
-
-    def _in_transaction(self, statements: list[tuple[str, tuple[Any, ...]]]) -> None:
-        """All of `statements` or none. The connection is autocommit (`db.connect`), so the
-        pair arm/disarm/false-positive write needs an explicit transaction to be a pair."""
-        self.conn.execute("BEGIN IMMEDIATE")
-        try:
-            for sql, params in statements:
-                self.conn.execute(sql, params)
-        except Exception:
-            self.conn.execute("ROLLBACK")
-            raise
-        self.conn.execute("COMMIT")
 
     def record_rule_fire(self, *, detector_id: str, project: str, order_id: str,
                          order_kind: str, fingerprint: str, mode: str, outcome: str,
