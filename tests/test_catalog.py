@@ -713,6 +713,53 @@ def test_fleet_health_inherits_per_status():
                                      "fleet_health": {"max_per_day": 9}}]})
 
 
+def test_exempt_kinds_overrides_whole_rather_than_merging():
+    """§2.1 of docs/superpowers/specs/2026-10-12-a-managers-by-design-idle-is-not-a-
+    standstill.md: a kind list is ONE policy statement, so a project's value replaces the
+    fleet's — the contrast with the per-status `thresholds` test above is the point. A
+    merging list could only ever grow, leaving un-exempting a kind inexpressible."""
+    cat = parse_catalog({
+        "os": {"fleet_health": {"exempt_kinds": ["investigator", "analyst"]}},
+        "projects": [{"name": "a", "path": "/tmp/a"},
+                     {"name": "b", "path": "/tmp/b",
+                      "fleet_health": {"exempt_kinds": ["manager"]}}],
+    })
+    assert cat.os.fleet_health.exempt_kinds == ("investigator", "analyst")
+    assert cat.projects[0].fleet_health.exempt_kinds == ("investigator", "analyst")
+    assert cat.projects[1].fleet_health.exempt_kinds == ("manager",)
+
+
+def test_exempt_kinds_refuses_a_kind_no_work_order_can_hold():
+    """A typo that silently left a kind watched is how a manager stays judged after
+    somebody tried to stop it. `"investigation"` is a FEATURE-order kind and no
+    `work_orders` row can hold it — the regression guard for the shipped default."""
+    for bad in ("investigation", "plannr"):
+        with pytest.raises(CatalogError, match="is not a work-order kind"):
+            parse_catalog({"os": {"fleet_health": {"exempt_kinds": [bad]}},
+                           "projects": [{"name": "a", "path": "/tmp/a"}]})
+    with pytest.raises(CatalogError, match="investigator"):
+        parse_catalog({"os": {"fleet_health": {"exempt_kinds": ["investigation"]}},
+                       "projects": [{"name": "a", "path": "/tmp/a"}]})
+    with pytest.raises(CatalogError, match="must be a list of strings"):
+        parse_catalog({"os": {"fleet_health": {"exempt_kinds": "manager"}},
+                       "projects": [{"name": "a", "path": "/tmp/a"}]})
+    # The EMPTY list is a meaningful policy — judge every kind — and not a mistake.
+    cat = parse_catalog({"os": {"fleet_health": {"exempt_kinds": []}},
+                         "projects": [{"name": "a", "path": "/tmp/a"}]})
+    assert cat.projects[0].fleet_health.exempt_kinds == ()
+
+
+def test_the_shipped_exempt_kinds_default_parses():
+    """The guard for the reflective `>= 1` loop in `_parse_fleet_health`: without
+    `FLEET_HEALTH_LIST_KEYS` it compares a tuple with an int and every catalog parse in
+    the suite dies with a `TypeError` no other test would explain."""
+    assert jarvis.catalog.DEFAULT_FLEET_HEALTH_EXEMPT_KINDS == ("investigator",)
+    assert "exempt_kinds" in jarvis.catalog.FLEET_HEALTH_LIST_KEYS
+    cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
+    assert cat.projects[0].fleet_health.exempt_kinds == \
+        jarvis.catalog.DEFAULT_FLEET_HEALTH_EXEMPT_KINDS
+
+
 def test_sweep_dark_minutes_is_refused_on_a_project():
     """A FLEET number, `max_per_day`'s reason: the stuck sweep writes ONE fleet-wide run
     record, so no arrangement of per-project numbers can say how long it may be silent."""

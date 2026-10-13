@@ -637,6 +637,65 @@ def dead_feature_children(store: ProjectStore,
             or not store.events_of_kind(c["id"], TURN_DIED_AFTER_DELIVERY_EVENT)]
 
 
+def outstanding_feature_children(store: ProjectStore,
+                                 fo_id: str) -> list[dict[str, Any]]:
+    """The children this feature has not finished with: non-settled, non-superseded.
+
+    §2.2 of docs/superpowers/specs/2026-10-12-a-managers-by-design-idle-is-not-a-
+    standstill.md. BESIDE `dead_feature_children` and for its reason: that answers "which
+    children fail this feature" over the same rows under the same superseded rule, and two
+    readers that must agree exactly — `ops.stuck_scan` and `status_label` — get ONE
+    function. The superseded rule is `Daemon.settle_features`' own: a superseded child
+    settles its feature neither way, so it is not outstanding either.
+
+    NOT `budget.live_children`, which excludes `budget_exhausted` because an exhausted
+    child cannot spend. An exhausted child is very much outstanding to a manager: only the
+    user can fund another turn, and the manager is waiting for that.
+    """
+    return _outstanding(store.feature_children(fo_id))
+
+
+def _outstanding(children: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The rule itself, over rows already read — `outstanding_children_note` needs both
+    the whole list and the outstanding one and must not read the table twice."""
+    from .project_store import TERMINAL_STATUSES as SETTLED_STATUSES
+
+    return [c for c in children
+            if c["status"] not in SETTLED_STATUSES and not c.get("superseded")]
+
+
+#: How many outstanding children the note names before it stops listing them. A label is
+#: read at a glance; the child tree is where the rest are.
+OUTSTANDING_CHILDREN_NAMED = 3
+
+
+def outstanding_children_note(store: ProjectStore, wo: dict[str, Any]) -> str:
+    """Why an idle manager is idle, as one phrase — `""` when it is not that case.
+
+    ONE formatter, shared by `status_label` and `ops.stuck_scan`'s `blocker` field, so the
+    label and the sweep's brief cannot drift. The sweep printed "nothing the record can
+    name" over a record naming wo-d2d777dc (issue 1010), and that string reached an
+    investigator verbatim.
+
+    Gated on kind, status and `parent_id` — `PR_REPAIR_STATUSES`' rule two branches below
+    in `status_label`: only a manager pays the read. FLAGLESS by construction, and that is
+    the whole of deviation 2: this is a LABEL and `true_blockers` gets no branch, so
+    INV-ATTENTION-MISSING stays quiet without an exception. An outstanding child needs
+    nobody.
+    """
+    if wo.get("kind") != "manager" or wo["status"] != "idle" or not wo.get("parent_id"):
+        return ""
+    fo_id = str(wo["parent_id"])
+    children = store.feature_children(fo_id)
+    outstanding = _outstanding(children)
+    if not outstanding:
+        return ""
+    named = ", ".join(c["id"] for c in outstanding[:OUTSTANDING_CHILDREN_NAMED])
+    more = len(outstanding) - OUTSTANDING_CHILDREN_NAMED
+    return (f"waiting on {len(outstanding)} of {len(children)} children in {fo_id} "
+            f"({named}{f', +{more} more' if more > 0 else ''})")
+
+
 def has_delivered(store: ProjectStore, wo: dict[str, Any]) -> bool:
     """Has this work order produced something a person has to decide about?
 
@@ -1812,7 +1871,12 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
     # Below the pause note above, which names a moment this one cannot: a manager whose
     # turn was refused IS coming back, and "idle" alone would read as the steady state.
     if wo["status"] == "idle":
-        return "idle — waiting for a message from its feature"
+        # Naming the children when there are any (spec §5): "waiting for a message" is
+        # true of a manager whose feature has finished with it, and says nothing about one
+        # whose child is still in flight.
+        note = outstanding_children_note(store, wo)
+        return f"idle — {note}" if note else \
+            "idle — waiting for a message from its feature"
     # `needs_review` no longer means the panel is waiting for the user: since issue 212
     # the round runs in parallel with the assumption review, and a status that said only
     # "needs_review" would hide the half of the work that is still moving.

@@ -51,6 +51,9 @@ from .daemon import daemon_running
 from .github import GitHubError
 from .invariants import PR_CLOSED_BLOCKER, UNLANDED_BLOCKER, true_blockers
 from .paths import daemon_pidfile, ensure_home, logs_dir
+# `ops.IDLE_MANAGER_CAUSE` is an ALIAS: `stuck.IDLE_MANAGER_CAUSE` is the one definition
+# of the cause (issue #1008), and `stuck.assess` is what decides it.
+from .stuck import IDLE_MANAGER_CAUSE  # noqa: F401
 from .project_store import (
     ASSUMPTION_DECIDER_OS,
     ASSUMPTION_DECIDER_USER,
@@ -9046,11 +9049,6 @@ def last_stuck_investigation(project_name: str, subject: str) -> dict[str, Any] 
     return None
 
 
-#: `excluded_cause` for a manager waiting out its own feature (issue #1008). NOT a
-#: threshold, so NOT a catalog setting — kn-1cec46b5 covers thresholds only.
-IDLE_MANAGER_CAUSE = "its feature's next message"
-
-
 def manager_awaiting_feature(
     pstore: ProjectStore, wo: dict[str, Any], now: float | None = None
 ) -> bool:
@@ -9084,7 +9082,7 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
     `window` is the PROJECT-WIDE usage hold, read once by the caller rather than once per
     candidate (`health_sweep_hold`'s own docstring).
     """
-    from . import holds, stuck
+    from . import bus, holds, stuck
     from .health import observer_kinds
     from .project_store import (FO_ID_PREFIXES, UNGOVERNED_ORIGINS,
                                 VALIDATION_CI_CAUSE, validation_ci_hold_spans,
@@ -9096,11 +9094,11 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
     for wo in pstore.list_work_orders(statuses=OPEN_STATUSES):
         if wo["origin"] in UNGOVERNED_ORIGINS:
             continue  # the user's own session — `_health_candidates`' rule
-        # AN INVESTIGATION IS NEVER A SUBJECT. `create_investigation_order` refuses it
-        # too, and the refusal must not be how the sweep learns it (§6).
-        if wo.get("kind") in ("investigation", "investigator") \
-                or str(wo.get("parent_id") or "").startswith(
-                    f'{FO_ID_PREFIXES["investigation"]}-'):
+        # AN INVESTIGATION IS NEVER A SUBJECT. A test on the subject's FAMILY — an order
+        # whose parent is an `inv-` feature row — and not on its kind, which is now
+        # `os.fleet_health.exempt_kinds` and reaches `assess` as a named hold.
+        if str(wo.get("parent_id") or "").startswith(
+                f'{FO_ID_PREFIXES["investigation"]}-'):
             continue
         scanned += 1
         durations = state_durations(pstore, wo_id=wo["id"], now=now)
@@ -9129,26 +9127,38 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                  if wo["status"] == "pending" else [])
         live_edges = bool(edges) and not any(
             invariants.dependency_is_dead(dep) for dep in edges)
-        if window or any(h.open for h in usage):
-            excluded_cause = PAUSE_USAGE_LIMIT  # keeps precedence over all
-        elif ci_held:
-            excluded_cause = VALIDATION_CI_CAUSE
-        elif live_edges:
-            excluded_cause = stuck.LIVE_DEPENDENCY
-        elif wo["status"] == "idle" and manager_awaiting_feature(pstore, wo):
-            excluded_cause = IDLE_MANAGER_CAUSE
-        else:
-            excluded_cause = ""
+        # IS THIS MANAGER WAITING CORRECTLY? `manager_awaiting_feature` is the kind +
+        # live-parent half (#1008's predicate); the narrower half is Neo q1603's — a
+        # manager whose feature has nothing outstanding and nothing queued to it is NOT
+        # held, it is stranded, and must still clear its threshold. Gated on `status` so a
+        # manager wedged in `running` or `needs_review` is judged (§2.2, and
+        # `invariants.outstanding_children_note`'s own gate), and so no other order pays
+        # for the reads (`true_blockers`' rule).
+        by_design_idle = bool(
+            wo["status"] == "idle" and manager_awaiting_feature(pstore, wo)
+            and (invariants.outstanding_feature_children(pstore, str(wo["parent_id"]))
+                 or not bus.nothing_queued_to_manager(pstore, str(wo["parent_id"]),
+                                                      str(wo["id"]))))
         verdict = stuck.assess(
             str(wo["status"]), now - since, now - (durations.last_activity_ts or since),
             discounted, thresholds, cfg.fallback_minutes * 60.0,
-            excluded_cause=excluded_cause)
+            excluded_cause=(PAUSE_USAGE_LIMIT
+                            if window or any(h.open for h in usage)
+                            else VALIDATION_CI_CAUSE if ci_held
+                            else stuck.LIVE_DEPENDENCY if live_edges else ""),
+            kind=str(wo.get("kind") or "worker"),
+            exempt_kinds=tuple(cfg.exempt_kinds),
+            by_design_idle=by_design_idle)
         if stuck_only and not verdict.stuck:
             continue
         blocker = true_blockers(pstore, wo, now=now)
         out.append({
             "project": project_name, "wo": wo, "verdict": verdict,
-            "blocker": blocker[0] if blocker else "nothing the record can name",
+            # The outstanding-child note before the empty answer: one formatter shared
+            # with `status_label`, so the row and the listing cannot drift.
+            "blocker": (blocker[0] if blocker
+                        else invariants.outstanding_children_note(pstore, wo)
+                        or "nothing the record can name"),
             "status_label": invariants.status_label(pstore, wo),
             "since": since, "activity": durations.last_activity_ts or since,
             "discounted": discounted,
