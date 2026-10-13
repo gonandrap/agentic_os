@@ -652,9 +652,15 @@ def outstanding_feature_children(store: ProjectStore,
     child cannot spend. An exhausted child is very much outstanding to a manager: only the
     user can fund another turn, and the manager is waiting for that.
     """
+    return _outstanding(store.feature_children(fo_id))
+
+
+def _outstanding(children: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The rule itself, over rows already read — `outstanding_children_note` needs both
+    the whole list and the outstanding one and must not read the table twice."""
     from .project_store import TERMINAL_STATUSES as SETTLED_STATUSES
 
-    return [c for c in store.feature_children(fo_id)
+    return [c for c in children
             if c["status"] not in SETTLED_STATUSES and not c.get("superseded")]
 
 
@@ -681,7 +687,7 @@ def outstanding_children_note(store: ProjectStore, wo: dict[str, Any]) -> str:
         return ""
     fo_id = str(wo["parent_id"])
     children = store.feature_children(fo_id)
-    outstanding = outstanding_feature_children(store, fo_id)
+    outstanding = _outstanding(children)
     if not outstanding:
         return ""
     named = ", ".join(c["id"] for c in outstanding[:OUTSTANDING_CHILDREN_NAMED])

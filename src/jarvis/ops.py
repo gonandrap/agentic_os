@@ -9083,11 +9083,13 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         since = durations.current_status_since
         usage = [h for h in spans if h.cause == PAUSE_USAGE_LIMIT]
         discounted = holds.by_cause(usage, since, now, now).get(PAUSE_USAGE_LIMIT, 0.0)
-        # IS THIS MANAGER WAITING CORRECTLY? Gated on `kind` and on `parent_id` so no
-        # other order pays for the reads (`true_blockers`' rule). A manager with a NULL
-        # parent is stranded by definition: there is no feature to be silent.
+        # IS THIS MANAGER WAITING CORRECTLY? Gated on `kind`, `status` and `parent_id` so
+        # no other order pays for the reads (`true_blockers`' rule). A manager with a NULL
+        # parent is stranded by definition: there is no feature to be silent, and one
+        # wedged in `running` or `needs_review` is not in the by-design idle wait at all
+        # (§2.2, and `invariants.outstanding_children_note`'s own gate).
         by_design_idle = bool(
-            wo.get("kind") == "manager" and wo.get("parent_id")
+            wo.get("kind") == "manager" and wo["status"] == "idle" and wo.get("parent_id")
             and (invariants.outstanding_feature_children(pstore, str(wo["parent_id"]))
                  or not bus.nothing_queued_to_manager(pstore, str(wo["parent_id"]),
                                                       str(wo["id"]))))

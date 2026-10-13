@@ -1456,6 +1456,21 @@ def test_a_manager_with_an_outstanding_child_is_not_a_candidate(stuck_os):
     assert stuck_row(manager_id)["excluded"] == stuck.HOLD_AWAITING_FEATURE
 
 
+def test_a_manager_wedged_in_a_live_status_is_still_judged(stuck_os):
+    """Round 1's blocking finding: the hold covers the by-design IDLE wait and nothing
+    else. Computed from `kind` and the feature alone, it excluded a manager wedged in
+    `running` or sitting in `needs_review` whenever the feature had a live child — a stuck
+    class the activity clock used to catch — and disagreed with
+    `invariants.outstanding_children_note`, which gates on `status == 'idle'`."""
+    store = stuck_os["store"]
+    for status in ("running", "needs_review"):
+        _fo, manager_id, _kids = a_manager(store, ("ship it", "waiting_pr_merge"))
+        park_order(store, manager_id, status, hours=76.8)
+        row = stuck_row(manager_id)
+        assert row["excluded"] == "", status
+        assert row["stuck"] is True, status
+
+
 def test_a_stranded_manager_is_a_candidate_once_over_threshold_and_not_before(stuck_os):
     """Neo 1603 (1): the by-design test NARROWS candidacy. No outstanding child and
     nothing queued means the ordinary 30-minute fallback applies — both sides of it."""
@@ -1475,30 +1490,26 @@ def test_a_stranded_manager_is_a_candidate_once_over_threshold_and_not_before(st
 
 
 def test_either_queued_reading_holds_a_manager_back(stuck_os):
-    """`_manager_handoff`'s two guards, one module along — and the same function, so a
-    future edit to one cannot move only one of them."""
-    import inspect
-
+    """`_manager_handoff`'s two guards, one module along — and through the same function,
+    asserted on its answer rather than on its source text."""
     from jarvis import bus, stuck
-    from jarvis.daemon import Daemon
 
     store = stuck_os["store"]
     fo_id, manager_id, _kids = a_manager(store)
     park_order(store, manager_id, "idle", hours=76.8)
+    assert stuck_row(manager_id)["stuck"] is True, "nothing queued yet: stranded"
     store.queue_message(manager_id, "your feature needs this")
+    assert not bus.nothing_queued_to_manager(store, fo_id, manager_id)
     assert stuck_row(manager_id)["excluded"] == stuck.HOLD_AWAITING_FEATURE
 
     other_fo, other_manager, _ = a_manager(store)
     park_order(store, other_manager, "idle", hours=76.8)
+    assert stuck_row(other_manager)["stuck"] is True
     bus.post(store, subject=bus.Subject(fo_id=other_fo), from_role="reconciler",
              to_role="manager",
              payload=bus.ChildrenLanded(round=1, children=("wo-x",), note="landed"))
+    assert not bus.nothing_queued_to_manager(store, other_fo, other_manager)
     assert stuck_row(other_manager)["excluded"] == stuck.HOLD_AWAITING_FEATURE
-
-    handoff = inspect.getsource(Daemon._manager_handoff)
-    assert "nothing_queued_to_manager" in handoff
-    assert "queued_messages" not in handoff, "the duplicate reading is gone"
-    assert "nothing_queued_to_manager" in inspect.getsource(ops.stuck_scan)
 
 
 def test_a_superseded_child_does_not_hold_a_manager_but_an_exhausted_one_does(stuck_os):
@@ -1520,6 +1531,35 @@ def test_a_superseded_child_does_not_hold_a_manager_but_an_exhausted_one_does(st
     assert stuck_row(broke_id)["excluded"] == stuck.HOLD_AWAITING_FEATURE
 
 
+def test_assess_exclusion_precedence_is_kind_then_fleet_then_feature():
+    """§1's precedence, over scalars: an exempt kind is not a subject at all, a fleet-wide
+    hold outranks a fact about one order's feature. All three keep the arithmetic."""
+    from jarvis import stuck
+    from jarvis.worker_session import PAUSE_USAGE_LIMIT
+
+    def judged(**flags):
+        return stuck.assess("idle", 10 * HOUR, 10 * HOUR, 0.0, {"idle": HOUR}, HOUR,
+                            **flags)
+
+    all_three = judged(kind="investigator", exempt_kinds=("investigator",),
+                       excluded_cause=PAUSE_USAGE_LIMIT, by_design_idle=True)
+    fleet_and_feature = judged(kind="manager", exempt_kinds=("investigator",),
+                               excluded_cause=PAUSE_USAGE_LIMIT, by_design_idle=True)
+    feature_only = judged(kind="manager", exempt_kinds=("investigator",),
+                          by_design_idle=True)
+
+    assert all_three.excluded == stuck.HOLD_EXEMPT_KIND
+    assert fleet_and_feature.excluded == PAUSE_USAGE_LIMIT
+    assert feature_only.excluded == stuck.HOLD_AWAITING_FEATURE
+    for verdict in (all_three, fleet_and_feature, feature_only):
+        assert verdict.stuck is False
+        assert verdict.active_seconds == 10 * HOUR
+        assert verdict.threshold_seconds == HOUR
+
+    # The control: the same arithmetic with nothing excluding it IS stuck.
+    assert judged(kind="manager").stuck is True
+
+
 def test_an_exempt_kind_is_an_excluded_row_not_an_absence(stuck_os, jarvis_home, project,
                                                           tmp_path):
     """§4: the `continue` emitted nothing, so an investigator was indistinguishable from
@@ -1539,12 +1579,23 @@ def test_an_exempt_kind_is_an_excluded_row_not_an_absence(stuck_os, jarvis_home,
     assert row["excluded"] == stuck.HOLD_EXEMPT_KIND
     assert "investigator" in row["reason"]
 
+    # The negative control, through the SAME two surfaces the fleet reads — the report
+    # (`stuck_catalog` registers the catalog `stuck_report` resolves) and the sweep's own
+    # candidate list — so an empty list demonstrably means "judge every kind".
+    def swept(catalog) -> list[str]:
+        run: dict = {"scanned": 0}
+        return [c["wo"]["id"] for c in Daemon(catalog)._stuck_candidates(
+            catalog.projects[0], None, time.time(), run)]
+
+    assert swept(load_catalog(stuck_os["path"])) == [], "exempt: never a candidate"
+
     cat = load_catalog(stuck_catalog(
         tmp_path, [{"name": "proj_a", "path": str(project),
                     "fleet_health": {"exempt_kinds": []}}], name="no-exempt.json"))
     assert cat.projects[0].fleet_health.exempt_kinds == ()
     row = stuck_row(wo["id"])  # absent entirely under a hardcoded skip
     assert row["stuck"] is True and row["excluded"] == ""
+    assert swept(cat) == [wo["id"]]
 
 
 # -- the free re-assertion: a stale look at a unit the OS can already explain -----------

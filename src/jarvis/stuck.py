@@ -102,9 +102,10 @@ def assess(status: str, seconds_in_status: float, seconds_since_activity: float,
     silently unwatched.
 
     `excluded_cause` short-circuits to `stuck=False`. §2: the account's usage window, a
-    live `jarvis pause` and the post-reopen ramp are the only ones, because nothing is
-    wrong in those cases and all three resume by themselves — so an investigation would
-    buy a session to be told the OS is working as designed.
+    live `jarvis pause` and the post-reopen ramp, because nothing is wrong in those cases
+    and all three resume by themselves — so an investigation would buy a session to be
+    told the OS is working as designed. `exempt_kinds` and `by_design_idle` exclude too
+    (§1, §2.2 of the 2026-10-12 spec).
 
     `kind`, `exempt_kinds` and `by_design_idle` are the 2026-10-12 spec's: `status` cannot
     express "nothing is expected to happen here until somebody speaks to it", and a

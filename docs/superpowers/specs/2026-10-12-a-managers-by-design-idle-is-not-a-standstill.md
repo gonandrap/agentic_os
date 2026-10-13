@@ -223,12 +223,18 @@ on its kind, it has no cause to name, and changing it is not what issue 1010 is 
 
 #### 2.2 The manager rule: judged on silence from its feature
 
-A `kind='manager'` order is a candidate only when **both** are true:
+A `kind='manager'` order **in status `idle`** is a candidate only when **both** are true:
 
 * its feature has **no outstanding child** — no child that is non-settled and
   non-superseded; and
 * **nothing has messaged it** — no queued `wo_messages` row for the manager, and no
   envelope still `queued` to role `manager` on the feature.
+
+A manager in any other status is judged like any other order. The hold is the by-design
+IDLE wait and nothing else: one wedged in `running`, or sitting in `waiting_input` /
+`needs_review`, is a real stuck class the activity clock catches, and the same
+`status == "idle"` gate is what `outstanding_children_note` (section 5) applies, so the
+label and the sweep cannot disagree.
 
 **The second half is `_manager_handoff`'s existing reading and must not be redefined.**
 `Daemon._manager_handoff` computes exactly it at `src/jarvis/daemon.py:1930-1936`:
@@ -284,12 +290,13 @@ outstanding child or something IS queued; spelling it as the positive "is it wai
 correctly" keeps the parameter name honest:
 
 ```python
-by_design_idle = wo.get("kind") == "manager" and bool(wo.get("parent_id")) and (
+by_design_idle = (wo.get("kind") == "manager" and wo["status"] == "idle"
+                  and bool(wo.get("parent_id")) and (
     bool(invariants.outstanding_feature_children(pstore, wo["parent_id"]))
-    or not bus.nothing_queued_to_manager(pstore, wo["parent_id"], wo["id"]))
+    or not bus.nothing_queued_to_manager(pstore, wo["parent_id"], wo["id"])))
 ```
 
-**Gated on `kind` and on `parent_id` so no other order pays for the reads** — the rule every
+**Gated on `kind`, `status` and `parent_id` so no other order pays for the reads** — the rule every
 neighbouring branch of `true_blockers` follows ("the read sits behind the status check, so no
 other work order pays for it", `invariants.py:1046`). A manager with a NULL `parent_id` is
 `by_design_idle=False`: a manager with no feature is stranded by definition, and there is no
@@ -470,6 +477,9 @@ sibling branch of it.
    children in either. Both must be excluded. Pair with the assertion that
    `Daemon._manager_handoff` and `ops.stuck_scan` reach the same reading through
    `bus.nothing_queued_to_manager`, so a future edit to one cannot move only one of them.
+3b. **A manager not in `idle` is still judged.** `kind='manager'` in `running` and in
+   `needs_review`, with an outstanding child and no activity past the threshold: a
+   candidate, `excluded == ""`. The hold is the idle wait only (section 2.2).
 4. **A superseded child does not hold a manager back**, and **an exhausted child does** — the
    two places `outstanding_feature_children` differs from its neighbours
    (`daemon.py:1598-1604`, `budget.live_children`).
