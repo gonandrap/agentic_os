@@ -35,9 +35,10 @@ LIVE_DEPENDENCY = "live_dependency"
 #: The holds this module names itself, §4 of docs/superpowers/specs/2026-10-12-a-managers-
 #: by-design-idle-is-not-a-standstill.md. Each rides on `Verdict.excluded` beside
 #: `worker_session.PAUSE_USAGE_LIMIT`, so a held order is a visible row rather than an
-#: invisible skip.
+#: invisible skip. `IDLE_MANAGER_CAUSE` is the ONE definition of the manager's cause in the
+#: codebase and is shared with `ops.IDLE_MANAGER_CAUSE`, which is now an alias of it.
 HOLD_EXEMPT_KIND = "exempt_kind"
-HOLD_AWAITING_FEATURE = "awaiting_feature"
+IDLE_MANAGER_CAUSE = "its feature's next message"
 
 #: One sentence per cause, because the shipped one is false for both of the above: an
 #: exempt kind never clears, and a manager's hold clears when its feature speaks rather
@@ -46,9 +47,9 @@ EXCLUSION_REASON: Mapping[str, str] = {
     HOLD_EXEMPT_KIND: ("an order of kind {kind} is never judged by this sweep — "
                        "`os.fleet_health.exempt_kinds` names it, so time in status is "
                        "not a claim about it"),
-    HOLD_AWAITING_FEATURE: ("a manager is idle until its feature messages it, and this "
-                            "feature has not finished with it — nothing is judged while "
-                            "that is true"),
+    IDLE_MANAGER_CAUSE: ("a manager is idle until its feature messages it, and this "
+                         "feature has not finished with it — nothing is judged while "
+                         "that is true"),
 }
 
 #: The usage window's sentence, and the answer for any hold added later: all five of §2's
@@ -143,7 +144,7 @@ def assess(status: str, seconds_in_status: float, seconds_since_activity: float,
     elif excluded_cause:
         cause = excluded_cause
     elif by_design_idle:
-        cause = HOLD_AWAITING_FEATURE
+        cause = IDLE_MANAGER_CAUSE
     if cause:
         # One site composes the sentence, per cause: `active_seconds` and
         # `threshold_seconds` stay populated so the row still shows the arithmetic.

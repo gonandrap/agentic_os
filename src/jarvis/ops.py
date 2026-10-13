@@ -51,6 +51,9 @@ from .daemon import daemon_running
 from .github import GitHubError
 from .invariants import PR_CLOSED_BLOCKER, UNLANDED_BLOCKER, true_blockers
 from .paths import daemon_pidfile, ensure_home, logs_dir
+# `ops.IDLE_MANAGER_CAUSE` is an ALIAS: `stuck.IDLE_MANAGER_CAUSE` is the one definition
+# of the cause (issue #1008), and `stuck.assess` is what decides it.
+from .stuck import IDLE_MANAGER_CAUSE  # noqa: F401
 from .project_store import (
     ASSUMPTION_DECIDER_OS,
     ASSUMPTION_DECIDER_USER,
@@ -9046,6 +9049,26 @@ def last_stuck_investigation(project_name: str, subject: str) -> dict[str, Any] 
     return None
 
 
+def manager_awaiting_feature(
+    pstore: ProjectStore, wo: dict[str, Any], now: float | None = None
+) -> bool:
+    """Is this a feature manager whose feature can still wake it?
+
+    §3 (`idle`'s actor) of docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-
+    act-on-this.md. Deliberately silent about the work order's OWN status: the caller
+    gates on that, so this stays reusable.
+
+    `now` unused: ops.scheduled_actor calls every predicate as p.test(store, wo, now=now).
+    """
+    if wo.get("kind") != "manager" or not wo.get("parent_id"):
+        return False
+    try:
+        parent = pstore.get_feature_order(wo["parent_id"])
+    except KeyError:
+        return False  # deleted out from under the child: nothing left to wake it
+    return parent["status"] not in FO_TERMINAL_STATUSES
+
+
 def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                window: bool = False,
                stuck_only: bool = True) -> tuple[int, list[dict[str, Any]]]:
@@ -9104,13 +9127,15 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                  if wo["status"] == "pending" else [])
         live_edges = bool(edges) and not any(
             invariants.dependency_is_dead(dep) for dep in edges)
-        # IS THIS MANAGER WAITING CORRECTLY? Gated on `kind`, `status` and `parent_id` so
-        # no other order pays for the reads (`true_blockers`' rule). A manager with a NULL
-        # parent is stranded by definition: there is no feature to be silent, and one
-        # wedged in `running` or `needs_review` is not in the by-design idle wait at all
-        # (§2.2, and `invariants.outstanding_children_note`'s own gate).
+        # IS THIS MANAGER WAITING CORRECTLY? `manager_awaiting_feature` is the kind +
+        # live-parent half (#1008's predicate); the narrower half is Neo q1603's — a
+        # manager whose feature has nothing outstanding and nothing queued to it is NOT
+        # held, it is stranded, and must still clear its threshold. Gated on `status` so a
+        # manager wedged in `running` or `needs_review` is judged (§2.2, and
+        # `invariants.outstanding_children_note`'s own gate), and so no other order pays
+        # for the reads (`true_blockers`' rule).
         by_design_idle = bool(
-            wo.get("kind") == "manager" and wo["status"] == "idle" and wo.get("parent_id")
+            wo["status"] == "idle" and manager_awaiting_feature(pstore, wo)
             and (invariants.outstanding_feature_children(pstore, str(wo["parent_id"]))
                  or not bus.nothing_queued_to_manager(pstore, str(wo["parent_id"]),
                                                       str(wo["id"]))))

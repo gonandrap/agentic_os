@@ -1635,13 +1635,13 @@ def test_a_manager_with_an_outstanding_child_is_not_a_candidate(stuck_os):
     assert ops.list_investigation_orders("proj_a", include_settled=True) == []
     row = stuck_row(manager_id)
     assert row["stuck"] is False
-    assert row["excluded"] == stuck.HOLD_AWAITING_FEATURE
+    assert row["excluded"] == stuck.IDLE_MANAGER_CAUSE
 
     # NOT a grace period: ten times the threshold again later changes nothing.
     park_order(store, manager_id, "idle", hours=768.0)
     stuck_os["daemon"].stuck_tick(None)
     assert ops.list_investigation_orders("proj_a", include_settled=True) == []
-    assert stuck_row(manager_id)["excluded"] == stuck.HOLD_AWAITING_FEATURE
+    assert stuck_row(manager_id)["excluded"] == stuck.IDLE_MANAGER_CAUSE
 
 
 def test_a_manager_wedged_in_a_live_status_is_still_judged(stuck_os):
@@ -1688,7 +1688,7 @@ def test_either_queued_reading_holds_a_manager_back(stuck_os):
     assert stuck_row(manager_id)["stuck"] is True, "nothing queued yet: stranded"
     store.queue_message(manager_id, "your feature needs this")
     assert not bus.nothing_queued_to_manager(store, fo_id, manager_id)
-    assert stuck_row(manager_id)["excluded"] == stuck.HOLD_AWAITING_FEATURE
+    assert stuck_row(manager_id)["excluded"] == stuck.IDLE_MANAGER_CAUSE
 
     other_fo, other_manager, _ = a_manager(store)
     park_order(store, other_manager, "idle", hours=76.8)
@@ -1697,7 +1697,7 @@ def test_either_queued_reading_holds_a_manager_back(stuck_os):
              to_role="manager",
              payload=bus.ChildrenLanded(round=1, children=("wo-x",), note="landed"))
     assert not bus.nothing_queued_to_manager(store, other_fo, other_manager)
-    assert stuck_row(other_manager)["excluded"] == stuck.HOLD_AWAITING_FEATURE
+    assert stuck_row(other_manager)["excluded"] == stuck.IDLE_MANAGER_CAUSE
 
 
 def test_a_superseded_child_does_not_hold_a_manager_but_an_exhausted_one_does(stuck_os):
@@ -1716,7 +1716,7 @@ def test_a_superseded_child_does_not_hold_a_manager_but_an_exhausted_one_does(st
 
     _fo2, broke_id, _k2 = a_manager(store, ("out of money", "budget_exhausted"))
     park_order(store, broke_id, "idle", hours=76.8)
-    assert stuck_row(broke_id)["excluded"] == stuck.HOLD_AWAITING_FEATURE
+    assert stuck_row(broke_id)["excluded"] == stuck.IDLE_MANAGER_CAUSE
 
 
 def test_assess_exclusion_precedence_is_kind_then_fleet_then_feature():
@@ -1738,7 +1738,7 @@ def test_assess_exclusion_precedence_is_kind_then_fleet_then_feature():
 
     assert all_three.excluded == stuck.HOLD_EXEMPT_KIND
     assert fleet_and_feature.excluded == PAUSE_USAGE_LIMIT
-    assert feature_only.excluded == stuck.HOLD_AWAITING_FEATURE
+    assert feature_only.excluded == stuck.IDLE_MANAGER_CAUSE
     for verdict in (all_three, fleet_and_feature, feature_only):
         assert verdict.stuck is False
         assert verdict.active_seconds == 10 * HOUR
@@ -1784,6 +1784,105 @@ def test_an_exempt_kind_is_an_excluded_row_not_an_absence(stuck_os, jarvis_home,
     row = stuck_row(wo["id"])  # absent entirely under a hardcoded skip
     assert row["stuck"] is True and row["excluded"] == ""
     assert swept(cat) == [wo["id"]]
+
+
+# -- the idle feature manager: issue #1008 ---------------------------------------------
+#
+# A manager sits `idle` for its feature's whole life BY DESIGN — it wakes on a message
+# from its feature. `idle` is not in DEFAULT_FLEET_HEALTH_THRESHOLDS, so every manager
+# crossed the fallback ~30 minutes in and the sweep bought an investigation whose only
+# possible verdict was "working as designed", every cooldown, for the feature's whole life.
+# Shaped on `test_usage_limit_hold_is_not_stuck` above: the exclusion, and the same order
+# WITHOUT it being stuck, so nothing here passes on a threshold that can never fire.
+
+
+def _scan(store, *, stuck_only: bool = False) -> tuple[int, list[dict]]:
+    """`ops.stuck_scan` over proj_a at the shipped `fleet_health` numbers."""
+    return ops.stuck_scan(store, "proj_a", catalog.FleetHealthConfig(), time.time(),
+                          stuck_only=stuck_only)
+
+
+def _manager(store, fo_status: str = "executing", hours: float = 5.0,
+             status: str = "idle", kind: str = "manager") -> dict:
+    fo_id = _feature(store, status=fo_status, carrier=False)
+    wo = store.create_work_order("manage it", parent_id=fo_id, kind=kind)
+    park_order(store, wo["id"], status, hours=hours)
+    return store.get_work_order(wo["id"])
+
+
+def test_an_idle_manager_of_an_open_feature_is_excluded(stuck_os):
+    store = stuck_os["store"]
+    manager = _manager(store)
+    # Neo q1603: the hold needs something OUTSTANDING, so the feature gets a live sibling.
+    store.create_work_order("ship it", parent_id=manager["parent_id"],
+                            status="waiting_pr_merge")
+
+    scanned, rows = _scan(store)
+    assert scanned == 2
+    row = next(r for r in rows if r["wo"]["id"] == manager["id"])
+    assert row["verdict"].excluded == ops.IDLE_MANAGER_CAUSE
+    assert not row["verdict"].stuck
+
+    # The row stays scanned and stays in the full output; only `stuck_only` drops it.
+    assert _scan(store, stuck_only=True) == (2, [])
+
+
+def test_an_idle_manager_with_nothing_outstanding_is_still_a_candidate(stuck_os):
+    """Neo q1603: a live feature with nothing outstanding and nothing queued STRANDS its
+    manager — it is not held, and must still clear its ordinary threshold."""
+    store = stuck_os["store"]
+    manager = _manager(store)
+
+    rows = {r["wo"]["id"]: r for r in _scan(store)[1]}
+    assert rows[manager["id"]]["verdict"].excluded == ""
+    assert rows[manager["id"]]["verdict"].stuck is True
+
+
+def test_an_idle_manager_of_a_settled_feature_is_still_a_candidate(stuck_os):
+    """The other half: once the feature cannot message it, nothing will wake it."""
+    from jarvis.project_store import FO_TERMINAL_STATUSES
+
+    for fo_status in FO_TERMINAL_STATUSES:
+        store = stuck_os["store"]
+        manager = _manager(store, fo_status=fo_status)
+        rows = {r["wo"]["id"]: r for r in _scan(store, stuck_only=True)[1]}
+        assert manager["id"] in rows, fo_status
+        assert rows[manager["id"]]["verdict"].excluded == ""
+        assert rows[manager["id"]]["verdict"].stuck
+
+
+def test_the_carve_out_does_not_widen_past_idle_managers(stuck_os):
+    """Neither an idle ORDINARY order nor a manager that is not idle: both are judged."""
+    store = stuck_os["store"]
+    plain = _manager(store, kind="worker")
+    busy = _manager(store, status="running")
+
+    rows = {r["wo"]["id"]: r for r in _scan(store)[1]}
+    for wo in (plain, busy):
+        assert rows[wo["id"]]["verdict"].excluded == ""
+        assert rows[wo["id"]]["verdict"].stuck
+
+
+def test_manager_awaiting_feature_needs_a_manager_and_a_live_feature(stuck_os):
+    store = stuck_os["store"]
+    fo_id = _feature(store, carrier=False)
+
+    orphan = store.create_work_order("no feature at all", kind="manager")
+    assert not ops.manager_awaiting_feature(store, orphan)
+
+    worker = store.create_work_order("not a manager", parent_id=fo_id)
+    assert not ops.manager_awaiting_feature(store, worker)
+
+    manager = store.create_work_order("manage it", parent_id=fo_id, kind="manager")
+    assert ops.manager_awaiting_feature(store, manager)
+    # scheduled_actor passes now= to every predicate: accepted, changes nothing.
+    assert ops.manager_awaiting_feature(store, manager, now=1234.5) is (
+        ops.manager_awaiting_feature(store, manager)
+    )
+
+    # A feature deleted out from under its manager: KeyError, not a candidate.
+    assert not ops.manager_awaiting_feature(
+        store, {**manager, "parent_id": "fo-does-not-exist"})
 
 
 # -- the free re-assertion: a stale look at a unit the OS can already explain -----------

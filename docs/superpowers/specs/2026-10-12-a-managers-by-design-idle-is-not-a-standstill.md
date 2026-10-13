@@ -136,7 +136,7 @@ gains no import of `project_store`, `bus` or anything else.
    subject at all: whether the account's window is shut is irrelevant to something nobody
    is ever going to judge.
 2. `excluded_cause` (today's usage window / fleet pause / reopen ramp) → unchanged, second.
-3. `by_design_idle` → `HOLD_AWAITING_FEATURE`. Last of the three: a fleet pause is a fact
+3. `by_design_idle` → `IDLE_MANAGER_CAUSE`. Last of the three: a fleet pause is a fact
    about the whole fleet and outranks a fact about one order's feature.
 
 All three short-circuit to `stuck=False`, keeping `active_seconds` and
@@ -328,14 +328,14 @@ Neo 1603 (2), the usage-limit hold's shape (`ops.py:9089-9090`,
 
 ```python
 HOLD_EXEMPT_KIND = "exempt_kind"
-HOLD_AWAITING_FEATURE = "awaiting_feature"
+IDLE_MANAGER_CAUSE = "its feature's next message"
 ```
 
 The one-sentence reasons, from `EXCLUSION_REASON` (section 1):
 
 * `HOLD_EXEMPT_KIND` — **"an order of kind {kind} is never judged by this sweep —
   `os.fleet_health.exempt_kinds` names it, so time in status is not a claim about it"**
-* `HOLD_AWAITING_FEATURE` — **"a manager is idle until its feature messages it, and this
+* `IDLE_MANAGER_CAUSE` — **"a manager is idle until its feature messages it, and this
   feature has not finished with it — nothing is judged while that is true"**
 
 `{kind}` interpolates, which is why `kind` is a parameter of `assess` rather than something
@@ -364,6 +364,16 @@ indexed reads per exempt order per sweep (`state_durations`, `holds.held`, `ops.
 that the `continue` used to save. Accepted: investigator and manager orders are a handful per
 project, and "indistinguishable from an order inside its threshold" is precisely the
 complaint Neo 1603 (2) settles.
+
+#### Reconciled with PR #1023
+
+While this order was in review, #1023 landed on `main` for issue #1008: `ops.manager_awaiting_feature`
+plus a cause constant of its own. Its predicate is broader — any non-terminal parent excludes the
+manager — so taken alone it contradicts Neo 1603: a manager whose feature has nothing outstanding and
+nothing queued is stranded, and must still clear its threshold. Per Neo 1645, `manager_awaiting_feature`
+stays as a helper feeding the narrower predicate above, the two constants collapse into the one
+`IDLE_MANAGER_CAUSE` defined here (`ops.IDLE_MANAGER_CAUSE` re-exports it), and the decision stays
+inside `stuck.assess` so it keeps a unit test and a `Verdict` row (kn-143a46df, kn-e91ff3a5).
 
 ### 5. The brief stops saying "nothing the record can name" over a record that names it
 
@@ -465,7 +475,7 @@ sibling branch of it.
 
 1. **A manager with an outstanding child is not a candidate however long it has idled.** Idle
    for 76.8h, one child in `waiting_pr_merge` — the incident's exact shape. Assert
-   `verdict.stuck is False`, `verdict.excluded == stuck.HOLD_AWAITING_FEATURE`, and that the
+   `verdict.stuck is False`, `verdict.excluded == stuck.IDLE_MANAGER_CAUSE`, and that the
    sweep opened no investigation. Then re-assert at 10x the threshold: the exemption is not a
    grace period.
 2. **A manager with no outstanding child and nothing queued IS a candidate once over
