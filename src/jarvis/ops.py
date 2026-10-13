@@ -9104,8 +9104,15 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         since = durations.current_status_since
         usage = [h for h in spans if h.cause == PAUSE_USAGE_LIMIT]
         discounted = holds.by_cause(usage, since, now, now).get(PAUSE_USAGE_LIMIT, 0.0)
+        # §2.2 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md.
+        edges = (pstore.unfinished_dependencies(wo["id"])
+                 if wo["status"] == "pending" else [])
+        live_edges = bool(edges) and not any(
+            invariants.dependency_is_dead(dep) for dep in edges)
         if window or any(h.open for h in usage):
-            excluded_cause = PAUSE_USAGE_LIMIT  # keeps precedence
+            excluded_cause = PAUSE_USAGE_LIMIT  # keeps precedence over both
+        elif live_edges:
+            excluded_cause = stuck.LIVE_DEPENDENCY
         elif wo["status"] == "idle" and manager_awaiting_feature(pstore, wo):
             excluded_cause = IDLE_MANAGER_CAUSE
         else:
