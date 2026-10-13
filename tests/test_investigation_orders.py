@@ -1623,6 +1623,28 @@ def test_an_investigation_is_never_a_subject(stuck_os):
         ops.create_investigation_order("proj_a", investigator["id"], why=WHY)
 
 
+def test_a_live_dependency_spends_no_part_of_the_cap(stuck_os):
+    """§4 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md."""
+    from jarvis import db
+    from jarvis.central_store import CentralStore
+
+    store, daemon = stuck_os["store"], stuck_os["daemon"]
+    dep = ops.create_work_order("proj_a", "the dependency")
+    child = ops.create_work_order("proj_a", "waiting as --depends-on designed",
+                                  depends_on=[dep["id"]])
+    park_order(store, child["id"], "pending", hours=5)
+
+    daemon.stuck_tick(None)
+
+    assert ops.list_investigation_orders("proj_a", include_settled=True) == []
+    central = CentralStore()
+    try:
+        run = db.from_json(central.get_state(Daemon.STUCK_RUN_KEY), {})
+    finally:
+        central.close()
+    assert run["opened"] == 0
+
+
 def test_a_user_owed_order_is_investigated(stuck_os):
     """§3: an order that reads as the user's is swept on exactly the same terms."""
     from jarvis import invariants
