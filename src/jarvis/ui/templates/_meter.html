@@ -1,0 +1,71 @@
+{# The account's usage meter — `ops.cost_meter`, the same subtree `jarvis cost --json`
+   prints. THE SENTENCE IS RENDERED VERBATIM and never re-worded here: two renderers
+   producing two wordings of the same arithmetic is a difference the reader has to
+   explain to themselves (§9 of
+   docs/superpowers/specs/2026-10-08-usage-meter-samples-and-outside-spend.md). No
+   arithmetic in this file beyond placing a point on an axis. #}
+
+{% set tl = meter.timeline %}
+<div class="panel" style="margin-top: 14px; padding: 14px 16px;">
+  <p style="margin: 0 0 8px;"><strong>The account's usage meter</strong></p>
+  <p style="margin: 0 0 10px;">{{ meter.sentence }}</p>
+
+  {% if tl|length > 1 %}
+  {# An inline SVG and no JavaScript: utilisation against the span, 5h and 7d as two
+     lines, so a jump in the meter lines up against what spent in that span. #}
+  {% set n = tl|length %}
+  {% macro points(key) -%}
+    {%- for p in tl -%}
+      {%- if p[key] is not none %}{{ '%.2f'|format(loop.index0 * 600.0 / (n - 1)) }},{{ '%.2f'|format(100 - p[key]) }} {% endif -%}
+    {%- endfor -%}
+  {%- endmacro %}
+  <svg viewBox="0 0 600 100" preserveAspectRatio="none" role="img"
+       style="width: 100%; height: 90px; background: rgba(127,127,127,0.06);">
+    <polyline fill="none" stroke="var(--ink)" stroke-width="1.5"
+              points="{{ points('five_hour_pct') }}"></polyline>
+    <polyline fill="none" stroke="var(--ink)" stroke-width="1" stroke-dasharray="3 3"
+              opacity="0.6" points="{{ points('seven_day_pct') }}"></polyline>
+  </svg>
+  <p class="kv sub mono" style="margin: 4px 0 0;">
+    5h solid · 7d dashed · 0-100% of the window ·
+    {{ tl|length }} point{{ 's' if tl|length != 1 }} ·
+    {{ '%.0f'|format(100 * meter.coverage.share) }}% covered
+  </p>
+  {% endif %}
+
+  <p class="kv mono" style="margin: 8px 0 0;">
+    5h +{{ '%.1f'|format(meter.five_hour.delta_points) }} points ·
+    7d +{{ '%.1f'|format(meter.seven_day.delta_points) }} points ·
+    ${{ '%.2f'|format(meter.dollars_per_point.value) }}/point
+    ({{ meter.dollars_per_point.source }}) ·
+    {{ meter.coverage.samples }} of {{ meter.coverage.expected }} readings
+    {%- if meter.coverage.gap_rows %}, {{ meter.coverage.gap_rows }} failed{% endif %}
+  </p>
+
+  {% if meter.outside.sessions %}
+  {# Session ids link NOWHERE: these are not Jarvis records, and a link would imply the
+     OS knows something about them it does not. #}
+  <table class="mono" style="width: 100%; border-collapse: collapse; font-size: 13px;
+                             margin-top: 10px;">
+    <tr class="sub">
+      <th style="text-align: left;">session</th>
+      <th style="text-align: left;">where</th>
+      <th style="text-align: right;">$</th>
+      <th style="text-align: left; padding-left: 10px;">first prompt</th>
+    </tr>
+    {% for s in meter.outside.sessions %}
+    <tr>
+      <td>{{ s.session_id[:8] }}</td>
+      <td>{{ s.project or s.project_dir }}</td>
+      <td style="text-align: right;">{{ '%.2f'|format(s.usd) }}</td>
+      <td style="padding-left: 10px;">{{ s.title[:70] }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p class="kv sub" style="margin: 4px 0 0;">
+    {{ meter.outside.n }} session{{ 's' if meter.outside.n != 1 }} this machine ran that
+    Jarvis did not dispatch, ${{ '%.2f'|format(meter.outside.total_usd) }} in all —
+    every dollar is counted, the table shows the dearest.
+  </p>
+  {% endif %}
+</div>

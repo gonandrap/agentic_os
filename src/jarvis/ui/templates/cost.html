@@ -147,6 +147,10 @@
   {% endif %}
 </div>
 
+{# The METER, FIRST: the sentence is the first thing read, not a row in a table (§10).
+   Absent rather than faked when it could not be built — see `cost_page`. #}
+{% if meter %}{% include "_meter.html" %}{% endif %}
+
 {# The DISTRIBUTION, above the listing: the listing says which order cost the most and
    cannot say what normal looks like. Absent rather than faked when it could not be
    built — see `cost_page`. #}

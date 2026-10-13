@@ -15,7 +15,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from jarvis import cli, invariants, ops, release
+from jarvis import cli, invariants, ops, release, worker_session
 from jarvis.catalog import DEFAULT_VALIDATION_TIMEOUT
 from jarvis.hooks import handle_hook
 from jarvis.invariants import (
@@ -803,6 +803,107 @@ def test_an_unreadable_catalog_falls_back_to_the_shipped_timeout(monkeypatch):
     monkeypatch.setattr(ops, "validation_config", lambda: None)
 
     assert _validation_timeout() == DEFAULT_VALIDATION_TIMEOUT
+
+
+# -- INV-VALIDATION-STRANDED, second arm: a PASSED round that never landed -----------
+#
+# Spec docs/superpowers/specs/2026-10-09-a-passed-round-that-never-landed-is-stranded.md.
+# The daemon defers the landing of a passed round while a worker turn is in flight and
+# delegates it to `settle_work_order`, which returns early for `validating` — so the
+# landing lives in one control-flow path and nowhere in the state.
+
+
+def _passed(store: ProjectStore, *, age: float = 10) -> tuple[str, dict]:
+    """A `validating` work order whose latest round PASSED and which never landed.
+
+    Carries a `pr_url`, so the expected landing is `waiting_pr_merge` — the helper above
+    writes a `result_summary` and no pull request, which would land `completed`.
+    """
+    wo_id, rnd = _stranded(store, age=age, outcome="passed")
+    store.update_work_order(wo_id, pr_url="https://github.com/o/r/pull/7")
+    return wo_id, rnd
+
+
+def test_a_passed_round_that_never_landed_is_stranded(project):
+    """No staleness threshold of its own: once no turn is in flight there is nothing
+    left in the OS that could ever move it, so the state is already the defect. ONE
+    `check_project(repair=True)` lands it, and the arm reports once — the landing takes
+    the order out of `validating`, so conjunct 1 fails on the next tick."""
+    store = ProjectStore(project)
+    wo_id, rnd = _passed(store)
+
+    found = _stranded_violations(store)
+
+    assert [v.wo_id for v in found] == [wo_id]
+    assert found[0].repaired
+    assert found[0].context["round_id"] == rnd["id"]
+    assert found[0].context["unit"] == "work order"
+    assert store.get_work_order(wo_id)["status"] == "waiting_pr_merge"
+    # the round is not touched: it was judged, and the verdict stands
+    assert _round(store, rnd)["outcome"] == "passed"
+    assert _stranded_violations(store) == []
+
+
+def test_doctor_without_repair_does_not_land_the_passed_round(project, catalog_file,
+                                                              capsys):
+    """`land_when_cleared` reaches `CentralStore.mark_backlog`, which no proxy over the
+    PROJECT store can intercept — so reporting mode skips the call outright rather than
+    relying on `_ReadOnly`."""
+    store = ProjectStore(project)
+    wo_id, _ = _passed(store)
+    store.close()
+
+    rc = cli.main(["doctor", "--catalog", str(catalog_file)])
+
+    assert rc == 1
+    assert "INV-VALIDATION-STRANDED" in capsys.readouterr().out
+    after = ProjectStore(project)
+    try:
+        assert after.get_work_order(wo_id)["status"] == "validating"
+        assert after.last_event_of_kind(wo_id, "validation_landed") is None
+    finally:
+        after.close()
+
+
+def test_the_passed_arm_leaves_a_pending_round_to_the_threshold(project):
+    """The two arms are separate predicates over separate outcomes. A round one timeout
+    old is LATE, not abandoned, and the new arm must not be the thing that fires on
+    it — paired with a passed round, so "nothing reported" cannot pass by accident."""
+    store = ProjectStore(project)
+    late, late_round = _stranded(store, age=DEFAULT_VALIDATION_TIMEOUT)
+    landed, _ = _passed(store)
+
+    found = _stranded_violations(store)
+
+    assert [v.wo_id for v in found] == [landed]
+    assert _round(store, late_round)["outcome"] == "pending"
+    assert store.get_work_order(late)["status"] == "validating"
+
+
+def test_a_passed_round_under_a_live_worker_turn_is_not_stranded(project):
+    """The deferral is CORRECT there: landing writes a status under a worker that is
+    typing, off a row minutes stale. An order whose turn is in flight is waiting
+    correctly, not stranded."""
+    store = ProjectStore(project)
+    wo_id, _ = _passed(store)
+    store.create_turn(wo_id, "message", "go")
+    assert worker_session.busy(store, wo_id) is not None
+
+    assert _stranded_violations(store) == []
+    assert store.get_work_order(wo_id)["status"] == "validating"
+
+
+def test_a_passed_round_already_landed_is_not_stranded(project):
+    """The guard, not construction: an order the settler already landed for this round
+    can be back in `validating` — `land_when_cleared` returns there for an open round,
+    and a later turn re-opens nothing — and landing it twice is what the event pair
+    exists to prevent."""
+    store = ProjectStore(project)
+    wo_id, rnd = _passed(store)
+    store.add_event(wo_id, "validation_landed", {"round_id": int(rnd["id"])})
+
+    assert _stranded_violations(store) == []
+    assert store.get_work_order(wo_id)["status"] == "validating"
 
 
 # -- INV-PROD-CLEAN: production is what the tag says it is ---------------------------

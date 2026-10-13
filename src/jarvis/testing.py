@@ -2821,12 +2821,16 @@ class FleetCostFixture:
         return ProjectStore(self.project_path)
 
     def order(self, title: str = "an order", *, status: str = "completed",
-              session_id: str = "", wo_id: str | None = None) -> str:
+              session_id: str = "", wo_id: str | None = None,
+              prior_sessions: Sequence[str] = ()) -> str:
         store = self._store()
         try:
             wo = store.create_work_order(title, "", wo_id=wo_id, status=status)
-            store.conn.execute("UPDATE work_orders SET session_id=? WHERE id=?",
-                               (session_id, wo["id"]))
+            store.conn.execute(
+                "UPDATE work_orders SET session_id=?, prior_sessions=? WHERE id=?",
+                (session_id,
+                 json.dumps(list(prior_sessions)) if prior_sessions else None,
+                 wo["id"]))
             store.conn.commit()
             return str(wo["id"])
         finally:
@@ -2868,7 +2872,7 @@ class FleetCostFixture:
 
     def os_call(self, kind: str, *, ts: float, wo_id: str = "", cost_usd: float = 0.0,
                 label: str = "", model: str = "claude-opus-5",
-                project: str | None = None) -> None:
+                project: str | None = None, session_id: str = "") -> None:
         from .central_store import CentralStore
 
         central = CentralStore()
@@ -2876,10 +2880,10 @@ class FleetCostFixture:
             central.conn.execute(
                 """INSERT INTO agent_calls (ts, project, wo_id, kind, label, model, ok,
                                             cost_usd, input, cache_write, cache_read,
-                                            output)
-                   VALUES (?,?,?,?,?,?,1,?,0,0,0,0)""",
+                                            output, session_id)
+                   VALUES (?,?,?,?,?,?,1,?,0,0,0,0,?)""",
                 (ts, self.name if project is None else project, wo_id, kind, label,
-                 model, cost_usd))
+                 model, cost_usd, session_id))
             central.conn.commit()
         finally:
             central.close()
@@ -2980,16 +2984,20 @@ class FleetCostFixture:
         }
 
     def transcript(self, session_id: str, rows: Sequence[dict],
-                   subagents: Sequence[Sequence[dict]] = ()) -> None:
-        directory = self.transcript_root / "-proj"
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / f"{session_id}.jsonl").write_text(
-            "".join(json.dumps(r) + "\n" for r in rows))
+                   subagents: Sequence[Sequence[dict]] = (),
+                   directory: str = "-proj") -> Path:
+        """`directory` is the slugified cwd — a non-default one is how a session OUTSIDE
+        every registered project is written (usage-meter spec §6)."""
+        project_dir = self.transcript_root / directory
+        project_dir.mkdir(parents=True, exist_ok=True)
+        lead = project_dir / f"{session_id}.jsonl"
+        lead.write_text("".join(json.dumps(r) + "\n" for r in rows))
         for i, sub in enumerate(subagents):
-            sub_dir = directory / session_id / "subagents"
+            sub_dir = project_dir / session_id / "subagents"
             sub_dir.mkdir(parents=True, exist_ok=True)
             (sub_dir / f"agent-{i}.jsonl").write_text(
                 "".join(json.dumps(r) + "\n" for r in sub))
+        return lead
 
 
 @pytest.fixture()

@@ -17,12 +17,14 @@
       {% for a in st.attention %}
       <li>
         {% if a.wo_id %}
-          <a href="/wo/{{ a.project }}/{{ a.wo_id }}" class="mono">{{ a.wo_id }}</a>
+          <a href="{{ order_path(a.project, a.wo_id) }}" class="mono">{{ a.wo_id }}</a>
         {% elif a.fo_id %}
           {# One line for the whole feature, its flagged children rolled into the reason.
-             The link goes to the feature page, which is where they are individually
-             reachable — that page is what makes the rollup safe to collapse. #}
-          <a href="/fo/{{ a.project }}/{{ a.fo_id }}" class="mono">{{ a.fo_id }}</a>
+             The link goes to that order's OWN page, which is where they are individually
+             reachable — that page is what makes the rollup safe to collapse. Via
+             `order_path`, because an `io-`/`inv-` id rendered with the feature template
+             hid the decision the user owed (GitHub issue #997). #}
+          <a href="{{ order_path(a.project, a.fo_id) }}" class="mono">{{ a.fo_id }}</a>
         {% endif %}
         <strong>{{ a.project }}</strong> — {{ a.title }}
         <div class="sub">{{ a.reason }}

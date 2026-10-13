@@ -249,6 +249,41 @@ def validation_hold(events: Iterable[Any], round_no: int) -> tuple[float, str]:
     return held, cause
 
 
+def validation_ci_hold_spans(events: Iterable[Any], since: float,
+                             now: float) -> list[tuple[float, float]]:
+    """Every interval inside `[since, now]` the OS was holding a round for GitHub's checks.
+
+    §3 of docs/superpowers/specs/2026-10-12-a-validation-round-waiting-for-ci-is-not-stuck.md:
+    `ops.stuck_scan` DISCOUNTS these seconds as well as excluding a live hold. Without
+    the discount an exclusion only postpones the defect — `validating` is judged on time
+    in status, so the first sweep after the checks report sees the whole wait and buys the
+    investigation the exclusion existed to prevent.
+
+    SPANS AND NOT A TOTAL: a usage window can shut while CI runs, and only intervals can
+    be unioned with the usage holds (`holds.union_seconds`). A scalar here would push the
+    double-count arithmetic into the caller.
+
+    ALL ROUNDS, NO ROUND FILTER. Clipping to `since` — the current status span — makes one
+    unnecessary and still correct, because a round only holds for CI while the order is in
+    `validating`.
+
+    Takes ROWS rather than a store for `validation_hold_until`'s reason: one home, two
+    carriers, the other being `ops.feature_events_of_kind`.
+    """
+    spans: list[tuple[float, float]] = []
+    for e in events:
+        payload = db.from_json(e["payload"], {})
+        if payload.get("cause") != VALIDATION_CI_CAUSE:
+            continue
+        start = max(float(e["ts"]), since)
+        # The hold stands until `reopens_at` and `validation_tick` goes again the moment
+        # it lapses, so that moment — clipped at `now` — is where the span ends.
+        end = min(float(payload.get("reopens_at") or 0.0), now)
+        if end > start:
+            spans.append((start, end))
+    return sorted(spans)
+
+
 # What one seat proposed. "" is a seat that offered none — it ran, but said nothing the
 # arbiter can count.
 VALIDATION_VERDICTS = ("pass", "reject", "")
@@ -493,6 +528,32 @@ def is_feature_order_id(unit_id: str) -> bool:
     """Does this id name a `feature_orders` row? The one shared predicate — §2.5 of the
     spec above, which exists because three sites had grown their own `fo-` literal."""
     return unit_id.startswith(("fo-", "io-", "inv-"))
+
+
+#: The URL segment each order id prefix is rendered under. DERIVED from the prefixes the
+#: store mints (`FO_ID_PREFIXES`) rather than written out again: a fifth kind must not be
+#: able to get a page and still link to `/fo/`. The segment IS the prefix for every kind,
+#: which is why this is a set and not a map.
+ORDER_SEGMENTS = {"wo", "fo", *FO_ID_PREFIXES.values()}
+
+
+def order_path(project: str, order_id: str) -> str:
+    """The page that renders this order, from its id PREFIX.
+
+    The ONE derivation every surface links through — here, beside the prefixes it reads
+    and the shared id predicate above, because `search.py` needs it too and must not
+    import the FastAPI module. GitHub issue #997: three templates built
+    `/fo/<project>/<id>` for whatever they had, so an `io-`/`inv-` id rendered with the
+    feature template — "Release this plan?", an empty child tree — and the decision the
+    user owed was only on its own page.
+    """
+    prefix = order_id.split("-", 1)[0]
+    # Unknown prefix: the FEATURE page, never `/wo/`. An id that names no kind we know is
+    # a `feature_orders` row far more often than a work order, and that page refuses by
+    # kind; `/wo/` would 404 with nothing to say.
+    segment = prefix if prefix in ORDER_SEGMENTS else "fo"
+    return f"/{segment}/{project}/{order_id}"
+
 
 # Work-order metadata key: this work order was authorised by whoever filed it, so the
 # worker must not spend a round trip asking whether it may do the thing it was sent to
@@ -1611,9 +1672,13 @@ ADDED_COLUMNS = {
     # is the dedupe: a `critical` one raises ONE attention item for as long as it stands
     # (Neo 1084), and `ops.os_status` cannot ask the checker again — it reads state. Every
     # row written before this reads `warning`, which is what they all were.
+    # …and WHETHER A DECISION IS OWED on it, which `invariants.true_blockers` reads to
+    # route the violation to the work order's own attention flag (spec
+    # docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md §2).
     "violation_reports": {
         "level": "TEXT NOT NULL DEFAULT 'warning'",
         "detail": "TEXT NOT NULL DEFAULT ''",
+        "owed": "TEXT NOT NULL DEFAULT ''",
     },
 }
 
@@ -3964,6 +4029,21 @@ class ProjectStore:
             f"SELECT COUNT(*) FROM wo_events WHERE wo_id=?{clause}",
             (wo_id, *exclude)).fetchone()[0])
 
+    def event_kind_counts(self, wo_id: str) -> dict[str, int]:
+        """`{kind: count}` over this work order's whole timeline. UNBOUNDED, one query.
+
+        The map form of `count_events`, for `rules.FACT_FIELDS`' `event_counts` field
+        (docs/superpowers/specs/2026-09-27-self-evolution.md §5). A condition asking
+        "has this order been dispatched three times" needs the counts per kind, and the two ways to get
+        them without this are both wrong on a busy order: `list_events` caps at its
+        `limit` and would under-report, and `events_of_kind` per kind is a query per kind
+        in the vocabulary, run per order per tick.
+        """
+        rows = self.conn.execute(
+            "SELECT kind, COUNT(*) AS n FROM wo_events WHERE wo_id=? GROUP BY kind",
+            (wo_id,)).fetchall()
+        return {str(r["kind"]): int(r["n"]) for r in rows}
+
     def list_events(self, wo_id: str, limit: int = 200) -> list[dict[str, Any]]:
         rows = self.conn.execute(
             "SELECT * FROM wo_events WHERE wo_id=? ORDER BY ts LIMIT ?", (wo_id, limit)
@@ -4463,7 +4543,8 @@ class ProjectStore:
     # -- invariant violation reports -------------------------------------------
 
     def open_violation_report(self, invariant: str, wo_id: str | None = None,
-                              level: str = "warning", detail: str = "") -> bool:
+                              level: str = "warning", detail: str = "",
+                              owed: str = "") -> bool:
         """Note that this violation is standing. True the FIRST time it is seen.
 
         The caller announces on True and says nothing on False — `invariants.py` rule 3,
@@ -4472,7 +4553,8 @@ class ProjectStore:
 
         `level` and `detail` are kept for a READER rather than for the announcement:
         `standing_violations` is what puts a critical one on the attention list, and the
-        row is the dedupe that makes it one item (Neo 1084).
+        row is the dedupe that makes it one item (Neo 1084). `owed` is the third such
+        reader, through `owed_violations` below.
         """
         key = (invariant, wo_id or "")
         now = db.now()
@@ -4482,13 +4564,27 @@ class ProjectStore:
         if row is None:
             self.conn.execute(
                 "INSERT INTO violation_reports (invariant, wo_id, first_seen, last_seen,"
-                " level, detail) VALUES (?,?,?,?,?,?)",
-                (*key, now, now, level, detail))
+                " level, detail, owed) VALUES (?,?,?,?,?,?,?)",
+                (*key, now, now, level, detail, owed))
             return True
         self.conn.execute(
-            "UPDATE violation_reports SET last_seen=?, seen=seen+1, level=?, detail=?"
-            " WHERE invariant=? AND wo_id=?", (now, level, detail, *key))
+            "UPDATE violation_reports SET last_seen=?, seen=seen+1, level=?, detail=?,"
+            " owed=? WHERE invariant=? AND wo_id=?",
+            (now, level, detail, owed, *key))
         return False
+
+    def owed_violations(self, wo_id: str) -> list[dict[str, Any]]:
+        """Standing violations on this work order that OWE THE USER A DECISION.
+
+        `invariants.true_blockers` appends each row's `owed` sentence, which is what
+        routes an unrepairable invariant to the attention flag instead of the inbox
+        (spec docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-
+        decision.md §2). The row is the dedupe and it survives a process restart.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM violation_reports WHERE wo_id=? AND owed<>''"
+            " ORDER BY first_seen", (wo_id,)).fetchall()
+        return db.rows_to_dicts(rows)
 
     def standing_violations(self, level: str = "") -> list[dict[str, Any]]:
         """Reports still standing, optionally only those at one level. Neo 1084's read."""

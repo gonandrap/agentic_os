@@ -9,7 +9,7 @@
   <span class="kv">
     <a href="/cost{{ '?project=' ~ bill.project if bill.project }}">← all work orders</a> ·
     {% if bill.kind == 'feature_order' %}
-      <a href="/fo/{{ bill.project }}/{{ bill.id }}" class="mono">{{ bill.id }}</a>
+      <a href="{{ order_path(bill.project, bill.id) }}" class="mono">{{ bill.id }}</a>
     {% else %}
       <a href="/wo/{{ bill.project }}/{{ bill.id }}" class="mono">{{ bill.id }}</a> ·
       {# This page shows only money, on purpose. Where the TIME went, what the turn is

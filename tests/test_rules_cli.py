@@ -31,6 +31,16 @@ COND = {"all": [{"field": "status", "op": "eq", "value": "needs_review"},
 @pytest.fixture()
 def store(jarvis_home):
     s = CentralStore()
+    # THE FIVE BUILTIN SEED ROWS ARE CLEARED. `CentralStore` seeds them on every open
+    # (docs/superpowers/specs/2026-09-27-self-evolution.md §5.3), and this file is about
+    # the TABLE MECHANICS — a row round-tripping, an insert being refused, a retraction never
+    # deleting — every assertion of which is written as "and the table stays empty". The
+    # seeds themselves are proved in `tests/test_rules_tick.py`, which is the section that
+    # owns their call site; asserting them here too would be two files disagreeing about
+    # what a count means the first time a sixth rule is seeded.
+    s.conn.execute("DELETE FROM remedy_rules")
+    s.conn.execute("DELETE FROM detectors")
+    s.conn.commit()          # another connection (the CLI opens its own) must see it
     yield s
     s.close()
 
@@ -56,7 +66,9 @@ def test_an_empty_registry_returns_the_sentence_and_no_fabricated_zero(store):
     assert data["counts"]["total"] == 0
     assert isinstance(data["note"], str) and data["note"]
     assert "0.0" not in data["note"] and "0%" not in data["note"]
-    assert data["enabled"] is None
+    # `catalog.RulesConfig` ships OFF, and with no catalog registered at all the answer
+    # is the same False — never None, and never True on a failure to read a file.
+    assert data["enabled"] is False
 
 
 def test_a_detector_that_never_fired_has_no_hit_rate(store, registered):
@@ -170,24 +182,34 @@ def test_the_active_basis_field_reads_the_same_source(store):
     assert set(data["sources"]) == {"state_durations"}
 
 
-def test_dry_run_with_an_order_says_the_snapshot_is_not_built_in_this_release(
+def test_dry_run_on_an_order_whose_snapshot_cannot_be_built_decides_nothing(
         store, registered, tmp_path, monkeypatch):
+    """A snapshot that could not be built is the unreadable case, one level down.
+
+    `matched` stays None — never "no match", which would report a verdict nobody
+    computed. The reader is a store on a path with no project database behind it.
+    """
     det, _rule = registered
     monkeypatch.setattr(ops, "find_work_order",
                         lambda oid, project_name=None: ("proj_a", tmp_path,
                                                         {"id": oid, "kind": "code"}))
+
+    def refuse(*a, **kw):
+        raise RuntimeError("the timeline could not be read")
+
+    monkeypatch.setattr(ops, "rule_facts", refuse)
     data = ops.rules_dry_run(det["id"], "wo-1")
     assert data["evaluated"] is False
     assert data["matched"] is None            # never a verdict nobody computed
-    assert "evaluation" in data["note"]
+    assert "could not be built" in data["note"]
     assert store.list_rule_fires() == []      # it writes NOTHING
 
 
-def test_dry_run_evaluates_once_the_fact_snapshot_exists(store, registered, tmp_path,
-                                                         monkeypatch):
+def test_dry_run_evaluates_the_fact_snapshot(store, registered, tmp_path,
+                                             monkeypatch):
     det, _rule = registered
 
-    def fake_facts(store_, wo, *, now):
+    def fake_facts(store_, wo, *, now, sources=None):
         return rules.Facts(project="proj_a", order_id="wo-1", order_kind="work_order",
                            values={"status": "needs_review", "seconds_in_status": 7200},
                            now=now)

@@ -380,6 +380,26 @@ def _merge(spans: Sequence[Hold], now: float) -> list[Hold]:
     return out
 
 
+def union_seconds(intervals: Sequence[tuple[float, float]]) -> float:
+    """The measure of the UNION of these intervals — overlapping seconds counted once.
+
+    §4 of docs/superpowers/specs/2026-10-12-a-validation-round-waiting-for-ci-is-not-stuck.md:
+    `ops.stuck_scan` discounts the usage holds AND the CI hold spans, and a usage window
+    can shut while CI runs. Summing them would tell a reader the same minutes twice under
+    two names, which is the rule `_merge` already states for `Hold`s.
+
+    Pure arithmetic over pairs: no `Hold`, no cause, no clock. A caller with `Hold`s
+    clips them itself (`Hold.overlap`'s bounds) and hands the pairs in.
+    """
+    total, cursor = 0.0, float("-inf")
+    for start, end in sorted(intervals):
+        if end <= start or end <= cursor:  # empty, or already covered
+            continue
+        total += end - max(start, cursor)
+        cursor = end
+    return total
+
+
 def by_cause(spans: Sequence[Hold], start: float, end: float,
              now: float | None = None) -> dict[str, float]:
     """Seconds held inside `[start, end]`, per cause, biggest first."""

@@ -719,7 +719,11 @@ def test_the_default_render_names_subproc_and_shows_subagents(fleet_fixture, cap
                  subagents=[[f.call_row(at=T0 + 10, mid="s1", write=100_000,
                                         out=1_000)]])
 
-    assert cli.main(["cost"]) == 0
+    # The span is explicit because `jarvis cost` now WINDOWS the listing — it resolves
+    # one window at the top and hands it to every payload builder, so the fixture's
+    # chosen timestamps have to be named (§10 of the usage-meter spec).
+    assert cli.main(["cost", "--since", "2026-09-29T04:00:00+00:00",
+                     "--until", "2026-10-06T04:00:00+00:00"]) == 0
     out = capsys.readouterr().out
     header = next(line for line in out.splitlines() if "work order" in line)
 

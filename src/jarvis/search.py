@@ -92,13 +92,18 @@ def _from_project(store: "ProjectStore", name: str, words: list[str], kinds: set
                             words=words, url=f"/wo/{name}/{row['id']}",
                             ref=f"jarvis wo show {row['id']}"))
     if "feature_order" in kinds:
+        # Issue #997: every kind printed `/fo/` and `jarvis fo show`, so an improvement
+        # order's hit named a command that refuses the id. Function-local, like
+        # `_project_paths`: `ops` imports the stores.
+        from . import ops
+        from .project_store import order_path
         for row in store.search_feature_orders(words, limit=limit):
             out.append(_hit("feature_order", id=row["id"], project=name,
                             title=row["title"], status=row["status"],
                             ts=row["created_at"], score=row["_score"],
                             body=row["description"], words=words,
-                            url=f"/fo/{name}/{row['id']}",
-                            ref=f"jarvis fo show {row['id']}"))
+                            url=order_path(name, row["id"]),
+                            ref=f"{ops.show_verb(row.get('kind'))} {row['id']}"))
     if "alarm" in kinds:
         for row in store.search_alarms(words, limit=limit):
             out.append(_hit("alarm", id=row["id"], project=name,
