@@ -9099,12 +9099,18 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         # The UNION and never the sum: a usage window can shut while CI runs (§4).
         discounted = holds.union_seconds(
             [(max(h.started, since), min(h.finish(now), now)) for h in usage] + ci_spans)
+        # §2.2 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md.
+        edges = (pstore.unfinished_dependencies(wo["id"])
+                 if wo["status"] == "pending" else [])
+        live_edges = bool(edges) and not any(
+            invariants.dependency_is_dead(dep) for dep in edges)
         verdict = stuck.assess(
             str(wo["status"]), now - since, now - (durations.last_activity_ts or since),
             discounted, thresholds, cfg.fallback_minutes * 60.0,
             excluded_cause=(PAUSE_USAGE_LIMIT
                             if window or any(h.open for h in usage)
-                            else VALIDATION_CI_CAUSE if ci_held else ""))
+                            else VALIDATION_CI_CAUSE if ci_held
+                            else stuck.LIVE_DEPENDENCY if live_edges else ""))
         if stuck_only and not verdict.stuck:
             continue
         blocker = true_blockers(pstore, wo, now=now)

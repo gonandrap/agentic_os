@@ -27,6 +27,11 @@ SECONDS_PER_MINUTE = 60  # a unit, not a setting
 #: in status because nothing is expected to happen inside it at all.
 ACTIVITY_STATUSES = ("running",)
 
+#: The fourth self-clearing hold of §2's `excluded_cause` family: this order's
+#: `depends_on` edges are all LIVE, so it is waiting as `--depends-on` designed and the
+#: wait ends without anyone acting. A DEAD edge is not this cause — see §2.3.
+LIVE_DEPENDENCY = "live_dependency"
+
 #: What the investigator is asked, and it is a TEMPLATE rather than prose composed at the
 #: call site for the reason `ops.create_investigation_order` refuses an empty `why`: the
 #: investigator's first reader is a fresh session with no memory of the sweep. The last
@@ -75,13 +80,14 @@ def assess(status: str, seconds_in_status: float, seconds_since_activity: float,
     silently unwatched.
 
     `excluded_cause` short-circuits to `stuck=False`. §2: the account's usage window, a
-    live `jarvis pause` and the post-reopen ramp, because nothing is wrong in those cases
-    and all three resume by themselves — so an investigation would buy a session to be
-    told the OS is working as designed.
+    live `jarvis pause`, the post-reopen ramp, a live blocking dependency
+    (`LIVE_DEPENDENCY`) and a validation round held for GitHub's checks
+    (`project_store.VALIDATION_CI_CAUSE`) are the only ones, because nothing is wrong in
+    those cases and all five resume by themselves — so an investigation would buy a
+    session to be told the OS is working as designed.
 
-    A FOURTH, and it is an EXTENSION of kn-6e836793 (the user's 2026-09-27 ruling that
-    the usage hold was the only one) on the record rather than a silent widening: a
-    validation round held for GitHub's checks, `project_store.VALIDATION_CI_CAUSE` — the
+    That last one is an EXTENSION of kn-6e836793 (the user's 2026-09-27 ruling that the
+    usage hold was the only one) on the record rather than a silent widening — the
     "Reconciliation with the standing ruling" section of
     docs/superpowers/specs/2026-10-12-a-validation-round-waiting-for-ci-is-not-stuck.md.
     It passes the same two tests as a usage window: the OS is deliberately not acting,
