@@ -9086,7 +9086,9 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
     """
     from . import holds, stuck
     from .health import observer_kinds
-    from .project_store import FO_ID_PREFIXES, UNGOVERNED_ORIGINS
+    from .project_store import (FO_ID_PREFIXES, UNGOVERNED_ORIGINS,
+                                VALIDATION_CI_CAUSE, validation_ci_hold_spans,
+                                validation_hold)
     from .worker_session import PAUSE_USAGE_LIMIT
 
     thresholds = {s: cfg.threshold_seconds(s) for s in cfg.thresholds}
@@ -9107,14 +9109,30 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         spans = holds.held(pstore, wo["id"], now=now)
         since = durations.current_status_since
         usage = [h for h in spans if h.cause == PAUSE_USAGE_LIMIT]
-        discounted = holds.by_cause(usage, since, now, now).get(PAUSE_USAGE_LIMIT, 0.0)
+        # A ROUND WAITING FOR GITHUB'S CHECKS IS NOT STUCK (§1 and §3 of
+        # docs/superpowers/specs/2026-10-12-a-validation-round-waiting-for-ci-is-not-stuck.md).
+        # `validating` ONLY: a round runs in parallel with `needs_review`, which is a wait
+        # owed by the USER and the one thing the sweep exists to surface (§1).
+        ci_held, ci_spans = False, []
+        if wo["status"] == "validating":
+            latest = pstore.latest_validation_round(wo_id=wo["id"])
+            events = pstore.events_of_kind(wo["id"], "validation_failed")
+            if latest:
+                until, cause = validation_hold(events, int(latest["round"]))
+                ci_held = cause == VALIDATION_CI_CAUSE and until > now
+            ci_spans = validation_ci_hold_spans(events, since, now)
+        # The UNION and never the sum: a usage window can shut while CI runs (§4).
+        discounted = holds.union_seconds(
+            [(max(h.started, since), min(h.finish(now), now)) for h in usage] + ci_spans)
         # §2.2 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md.
         edges = (pstore.unfinished_dependencies(wo["id"])
                  if wo["status"] == "pending" else [])
         live_edges = bool(edges) and not any(
             invariants.dependency_is_dead(dep) for dep in edges)
         if window or any(h.open for h in usage):
-            excluded_cause = PAUSE_USAGE_LIMIT  # keeps precedence over both
+            excluded_cause = PAUSE_USAGE_LIMIT  # keeps precedence over all
+        elif ci_held:
+            excluded_cause = VALIDATION_CI_CAUSE
         elif live_edges:
             excluded_cause = stuck.LIVE_DEPENDENCY
         elif wo["status"] == "idle" and manager_awaiting_feature(pstore, wo):
