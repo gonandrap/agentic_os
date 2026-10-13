@@ -1105,6 +1105,50 @@ def test_a_rules_block_that_is_not_an_object_is_refused_naming_the_project(tmp_p
                                      "rules": True}]})
 
 
+# -- evolution: the sample floor under §9's medians -------------------------------------
+
+
+def test_evolution_min_samples_ships_a_default_and_a_project_may_override_it(tmp_path):
+    """`evolution.min_samples` is its own section, not `rules.*`: the user reversed the
+    assumption that put it there. §9 of
+    docs/superpowers/specs/2026-09-27-self-evolution.md, with `_parse_inspect`'s
+    field-level inheritance."""
+    cat = parse_catalog({"os": {"evolution": {"min_samples": 4}}, "projects": [
+        {"name": "a", "path": str(tmp_path)},
+        {"name": "b", "path": str(tmp_path), "evolution": {"min_samples": 9}},
+    ]})
+
+    assert cat.os.evolution.min_samples == 4
+    assert cat.projects[0].evolution.min_samples == 4, "silent project inherits the fleet"
+    assert cat.projects[1].evolution.min_samples == 9
+
+
+def test_a_catalog_silent_on_evolution_keeps_the_shipped_floor(tmp_path):
+    cat = parse_catalog({"projects": [{"name": "a", "path": str(tmp_path)}]})
+
+    assert cat.os.evolution.min_samples == jarvis.catalog.DEFAULT_EVOLUTION_MIN_SAMPLES
+    assert cat.projects[0].evolution.min_samples == 3
+    assert not hasattr(cat.os.rules, "min_samples"), "the floor left `rules` entirely"
+
+
+def test_an_evolution_min_samples_below_one_is_refused(tmp_path):
+    """A median over zero samples is not a statistic that could be computed at all."""
+    with pytest.raises(CatalogError,
+                       match="evolution.min_samples must be 1 or more, got 0"):
+        parse_catalog({"os": {"evolution": {"min_samples": 0}}})
+    with pytest.raises(CatalogError,
+                       match=r"projects\[0\] \(a\)\.evolution\.min_samples must be 1 "
+                             r"or more, got -2"):
+        parse_catalog({"projects": [{"name": "a", "path": str(tmp_path),
+                                     "evolution": {"min_samples": -2}}]})
+
+
+def test_an_evolution_block_that_is_not_an_object_is_refused_naming_the_project(tmp_path):
+    with pytest.raises(CatalogError, match=r"projects\[0\] \(a\)\.evolution"):
+        parse_catalog({"projects": [{"name": "a", "path": str(tmp_path),
+                                     "evolution": True}]})
+
+
 # -- `ui_health.*`: the dashboard's liveness probe and self-heal ----------------------
 #
 # docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md §6.

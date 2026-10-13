@@ -11617,28 +11617,30 @@ _EVOLUTION_STATUS_STRENGTH = {rules.RETRACTED: 0, rules.DRY_RUN: 1, rules.ARMED:
 
 
 def _evolution_min_samples(project: str | None) -> int:
-    """The RESOLVED `rules.min_samples` for this scope (Neo q1575).
+    """The RESOLVED `evolution.min_samples` for this scope (Neo q1575).
 
     Never a module constant here: how much history a project needs before it believes its
     own medians is a catalog judgement, and the report's notes quote the number back to
-    the reader. `fleetcost.cost_config`'s idiom exactly, including its two fallbacks — a
-    catalog that will not load, and a project the catalog does not name, both keep the
-    fleet answer rather than raising. A report is a read; failing to read a config file
-    must not be able to deny one.
+    the reader. q1575 named `evolution.min_samples`, this shipped as `rules.min_samples`,
+    and the USER moved it back to its own `evolution` section — `rules` is the arming
+    switch, this is a read of history. `fleetcost.cost_config`'s idiom exactly, including
+    its two fallbacks — a catalog that will not load, and a project the catalog does not
+    name, both keep the fleet answer rather than raising. A report is a read; failing to
+    read a config file must not be able to deny one.
     """
-    from .catalog import DEFAULT_RULES_MIN_SAMPLES
+    from .catalog import DEFAULT_EVOLUTION_MIN_SAMPLES
 
     try:
         resolved = resolve_catalog()
     except (OpsError, CatalogError, OSError, ValueError):
-        return DEFAULT_RULES_MIN_SAMPLES
-    cfg = resolved.os.rules
+        return DEFAULT_EVOLUTION_MIN_SAMPLES
+    cfg = resolved.os.evolution
     if project:
         try:
-            cfg = resolved.project(project).rules
+            cfg = resolved.project(project).evolution
         except CatalogError:
-            cfg = resolved.os.rules
-    return max(1, int(getattr(cfg, "min_samples", DEFAULT_RULES_MIN_SAMPLES)))
+            cfg = resolved.os.evolution
+    return max(1, int(getattr(cfg, "min_samples", DEFAULT_EVOLUTION_MIN_SAMPLES)))
 
 
 def _evolution_zone(project: str | None) -> tuple[str, Any, str | None]:

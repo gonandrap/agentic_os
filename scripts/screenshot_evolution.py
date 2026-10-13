@@ -107,7 +107,7 @@ def seed() -> None:
                                       now=float(row["ts"]) + cleared_after)
 
         # Three ISO weeks, so `by_gap_class` and the week table both have rows, and more
-        # than `rules.min_samples` closed fires on each side so a median and the
+        # than `evolution.min_samples` closed fires on each side so a median and the
         # dry-run/armed comparison both exist.
         for n, (order, secs) in enumerate(
                 (("wo-101", 7200), ("wo-102", 5400), ("wo-103", 4800))):

@@ -24,11 +24,11 @@ import pytest
 
 from jarvis import db, ops, rules
 from jarvis.catalog import (
-    DEFAULT_RULES_MIN_SAMPLES,
+    DEFAULT_EVOLUTION_MIN_SAMPLES,
     Catalog,
+    EvolutionConfig,
     OsConfig,
     ProjectSpec,
-    RulesConfig,
 )
 from jarvis.central_store import CentralStore
 
@@ -125,11 +125,11 @@ def _investigation(store, tmp_path, subject, *, project="proj_a"):
         project_store.close()
 
 
-def _catalog(tmp_path, *, os_min=DEFAULT_RULES_MIN_SAMPLES, project_min=None):
+def _catalog(tmp_path, *, os_min=DEFAULT_EVOLUTION_MIN_SAMPLES, project_min=None):
     project = ProjectSpec(name="proj_a", path=tmp_path / "proj_a")
     if project_min is not None:
-        project.rules = RulesConfig(min_samples=project_min)
-    return Catalog(os=OsConfig(rules=RulesConfig(min_samples=os_min)),
+        project.evolution = EvolutionConfig(min_samples=project_min)
+    return Catalog(os=OsConfig(evolution=EvolutionConfig(min_samples=os_min)),
                    projects=[project])
 
 
@@ -532,4 +532,4 @@ def test_min_samples_takes_the_project_override_and_falls_back_to_the_fleet(
 
 
 def test_min_samples_falls_back_to_the_shipped_default_with_no_catalog(store):
-    assert ops.evolution_report()["min_samples"] == DEFAULT_RULES_MIN_SAMPLES
+    assert ops.evolution_report()["min_samples"] == DEFAULT_EVOLUTION_MIN_SAMPLES
