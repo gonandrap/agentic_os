@@ -1663,9 +1663,9 @@ class CentralStore:
         — worse — a remedy row armed under a detector that is not.
 
         Refuses, writing nothing: an unknown id, a retracted or already-armed detector,
-        an empty reason (the audit is the only record of why a rule gained authority),
-        and a detector with NO live remedy row — "a rule may act" needs something to act
-        with, and arming an empty rule would announce authority that does nothing.
+        an empty reason (the audit is the only record of why a rule gained authority).
+        A detector with NO live remedy row arms fine: the alarm alone is the value (the
+        user's override on wo-2877145f, Neo question 1649; `Daemon._fire_armed`).
         """
         from . import rules
 
@@ -1679,9 +1679,6 @@ class CentralStore:
         if not (reason or "").strip():
             raise ValueError("arming a rule needs a reason — it is the only record of why "
                              "the OS let this rule act")
-        if not self.remedy_rules_for(detector_id):
-            raise ValueError(f"detector {detector_id} has no live remedy rule, so there is "
-                             f"nothing for it to propose — add one before arming")
         now = db.now()
         with db.write_transaction(self.conn):  # the pair flips together: db.write_transaction
             self.conn.execute(

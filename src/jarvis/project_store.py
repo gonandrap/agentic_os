@@ -3414,7 +3414,8 @@ class ProjectStore:
                     source: str = "cost", probe: str | None = None,
                     subject_kind: str = "work_order",
                     fo_id: str | None = None, remedy: str | None = None,
-                    remedy_argument: str = "") -> dict[str, Any]:
+                    remedy_argument: str = "",
+                    status: str = "raised") -> dict[str, Any]:
         """Record one finding — the general raise, of which `add_alarm` is the cost case.
 
         A second entry point rather than a widened `add_alarm`, because `add_alarm`'s one
@@ -3431,9 +3432,12 @@ class ProjectStore:
         only by an armed rule (§6 of docs/superpowers/specs/2026-09-27-self-evolution.md):
         the alarm is born carrying the remedy its detector's row names, and
         `remedies.propose` then files the gate request for it.
+
+        `status` is the birth status, as in `add_alarm`: `informational` is never claimed.
         """
         assert subject_kind in ALARM_SUBJECTS, subject_kind
         assert source in ALARM_SOURCES, source
+        assert status in ALARM_STATUSES, status
         if (subject_kind == "feature_order") != bool(fo_id):
             raise ValueError(
                 f"subject_kind={subject_kind!r} and fo_id={fo_id!r} disagree: "
@@ -3442,11 +3446,11 @@ class ProjectStore:
         self.conn.execute(
             """INSERT INTO wo_alarms (id, wo_id, ts, kind, seq, reason,
                                       subject_kind, fo_id, source, probe,
-                                      remedy, remedy_argument)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                      remedy, remedy_argument, status)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (alarm_id, wo_id, db.now(), kind, int(seq), reason,
              subject_kind, fo_id, source, probe, remedy,
-             remedy_argument if remedy else None),
+             remedy_argument if remedy else None, status),
         )
         return self.get_alarm(alarm_id)
 

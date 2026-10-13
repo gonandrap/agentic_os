@@ -138,7 +138,7 @@ def test_arm_audits_the_row_and_flips_the_detector_and_its_live_remedy_rows(cent
 
 
 @pytest.mark.parametrize("case", ["unknown", "retracted", "armed", "no-reason",
-                                  "blank-reason", "no-remedy"])
+                                  "blank-reason"])
 def test_arm_refuses_and_writes_nothing(central, case):
     det, rm = _rule(central)
     target = det["id"]
@@ -153,17 +153,25 @@ def test_arm_refuses_and_writes_nothing(central, case):
         exc = ValueError
     elif case == "no-reason":
         reason, exc = "", ValueError
-    elif case == "blank-reason":
-        reason, exc = "   ", ValueError
     else:
-        central.retract_remedy_rule(rm["id"], "gone")
-        exc = ValueError
+        reason, exc = "   ", ValueError
     before = central.get_detector(det["id"])
 
     with pytest.raises(exc):
         central.arm_detector(target, by="gonzalo", reason=reason)
 
     assert central.get_detector(det["id"]) == before
+
+
+def test_arming_a_detector_with_no_remedy_row_succeeds(central):
+    """The user's override on wo-2877145f, Neo question 1649: the alarm alone is the value."""
+    det, rm = _rule(central)
+    central.retract_remedy_rule(rm["id"], "gone")
+
+    out = central.arm_detector(det["id"], by="gonzalo", reason="visibility is enough")
+
+    assert out["status"] == rules.ARMED
+    assert central.get_remedy_rule(rm["id"])["status"] == rules.RETRACTED
 
 
 def test_disarm_returns_the_set_to_dry_run_and_keeps_the_audit_of_the_arm(central):
@@ -312,6 +320,78 @@ def test_the_armed_pass_makes_no_network_call_and_spawns_no_subprocess(
     det, _rm, _wo, _counts = _armed_fire(daemon, central, store)
 
     assert _fires(central, det)[0]["outcome"] == rules.PROPOSED
+
+
+# -- (c2) armed detector, no armed remedy: the alarm alone (wo-2877145f, Neo 1649) --------------
+
+
+def _armed_without_remedy(daemon, central, store, *, how):
+    """An ARMED detector whose pair has no ARMED remedy row; one order in the condition."""
+    det, rm = _rule(central)
+    if how == "none":
+        central.retract_remedy_rule(rm["id"], "gone")
+        ops.rules_arm(det["id"], "visibility is enough", by="gonzalo")
+    else:
+        ops.rules_arm(det["id"], "visibility is enough", by="gonzalo")
+        central.retract_remedy_rule(rm["id"], "replaced")
+        central.add_remedy_rule(det["id"], "nudge", argument=ARGUMENT)   # born dry_run
+    wo = store.create_work_order("stuck in review", status="needs_review")
+    return det, wo
+
+
+@pytest.mark.parametrize("how", ["none", "dry_run_remedy"])
+def test_an_armed_detector_without_an_armed_remedy_raises_the_alarm_and_proposes_nothing(
+        boot, central, store, monkeypatch, how):
+    daemon = boot(remedies_allowed=["nudge"])
+    det, wo = _armed_without_remedy(daemon, central, store, how=how)
+
+    def boom(*a, **k):
+        raise AssertionError("propose must not be called without an armed remedy")
+
+    monkeypatch.setattr(remedies, "propose", boom)
+    counts = _tick(daemon, store)
+
+    (fire,) = _fires(central, det)
+    assert (fire["mode"], fire["outcome"]) == (rules.ARMED, rules.RECORDED)
+    assert fire["remedy_rule_id"] == "" and fire["alarm_id"]
+    assert "no armed remedy" in fire["detail"]
+    assert counts["opened"] == 1 and counts["recorded_armed"] == 1
+    assert counts["proposed"] == 0 and counts["refused"] == 0
+
+    alarm = store.get_alarm(fire["alarm_id"])
+    assert alarm["source"] == "rule" and alarm["probe"] == det["id"]
+    assert alarm["seq"] == NO_TURN and alarm["wo_id"] == wo["id"]
+    assert alarm["remedy"] is None and alarm["remedy_argument"] is None
+    assert alarm["status"] == "informational"   # no claim, no model call, no second path
+    assert store.claim_next_alarm() is None
+    after = store.get_work_order(wo["id"])
+    assert not after["needs_attention"] and not after["attention_reason"]
+
+    (fired,) = [e for e in store.list_events(wo["id"], limit=500)
+                if e["kind"] == "rule_fired"]
+    payload = fired["payload"] if isinstance(fired["payload"], dict) else \
+        json.loads(fired["payload"])
+    assert payload["alarm_id"] == alarm["id"] and payload["detector_id"] == det["id"]
+    assert "remedy" not in payload and "remedy_rule_id" not in payload
+    assert store.list_approvals(wo["id"]) == []
+    assert _neo_approvals() == []
+
+
+@pytest.mark.parametrize("how", ["none", "dry_run_remedy"])
+def test_a_standing_condition_without_an_armed_remedy_is_one_fire_not_one_per_tick(
+        boot, central, store, how):
+    daemon = boot(remedies_allowed=["nudge"])
+    det, wo = _armed_without_remedy(daemon, central, store, how=how)
+    _tick(daemon, store)
+
+    _tick(daemon, store)                                   # same fingerprint
+    store.queue_message(wo["id"], "an unrelated message")  # moved fingerprint, alarm unanswered
+    counts = _tick(daemon, store)
+
+    assert counts["opened"] == 0 and counts["recorded_armed"] == 0
+    assert len(_fires(central, det)) == 1
+    assert len(store.alarms_of(wo["id"])) == 1
+    assert store.alarms_of(wo["id"])[0]["status"] == "informational"
 
 
 # -- (d) the allow-list refusal ----------------------------------------------------------

@@ -5410,6 +5410,7 @@ class Daemon:
         counts: dict[str, Any] = {
             "enabled": False, "detectors": 0, "orders": 0, "opened": 0, "closed": 0,
             "unreadable": 0, "capped": "", "proposed": 0, "refused": 0,
+            "recorded_armed": 0,
         }
         # OFF MEANS THE PASS DOES NOT RUN AT ALL — not "runs in dry run" (§5.2). The
         # detectors are already in dry run; a second, quieter dry run under them would
@@ -5594,9 +5595,8 @@ class Daemon:
             if open_fire is not None and str(open_fire["fingerprint"]) == fingerprint:
                 # A condition standing for six hours is ONE fire, not 720.
                 return
-            # §6: a pair ARMED on both halves (`rules.effective_status`, the weaker of
-            # the two) takes the reviewed path. Anything else — including an armed
-            # detector over a dry-run remedy row — is the dry run below, unchanged.
+            # §6, wo-2877145f Neo 1649: an ARMED detector is handled by `_fire_armed`;
+            # only an unarmed one is the dry run below, unchanged.
             taken = None
             if store is not None and wo is not None:
                 taken = self._fire_armed(project, row, cond, facts, fingerprint,
@@ -5629,16 +5629,24 @@ class Daemon:
                     counts: dict[str, Any], store: ProjectStore,
                     wo: dict[str, Any],
                     open_fire: dict[str, Any] | None) -> str | None:
-        """The ARMED half of a fire: a rule becomes an alarm and takes the existing gate.
+        """THE DETECTOR'S STATUS BUYS VISIBILITY, THE PAIR GATES THE PROPOSE.
 
-        §6 of docs/superpowers/specs/2026-09-27-self-evolution.md. Returns None when no
-        remedy row pairs ARMED with this detector (the caller records a dry run),
-        `"fired"` once the fire has been recorded, and `"held"` when it did nothing.
+        The user's override on wo-2877145f, Neo question 1649; §6 of
+        docs/superpowers/specs/2026-09-27-self-evolution.md. Returns None when the
+        DETECTOR is not armed (the caller records a dry run), `"fired"` once the fire has
+        been recorded, and `"held"` when it did nothing.
 
-        HELD: the condition has stood continuously (an open ARMED fire) and its proposal
-        still awaits a verdict. The situation's fingerprint moves for reasons that are
-        not a new gap — a worker turn, a queued message — and each move would otherwise
-        file a second gate request for the same standing condition beside the first.
+        An armed detector always raises the alarm. If a remedy row pairs ARMED with it
+        (`rules.effective_status`) the alarm carries that remedy and takes the gate that
+        already exists; if none does — no row, or every one still `dry_run` — the alarm
+        stands alone, one fire is recorded `armed`/`recorded`, and nothing is proposed.
+
+        HELD: the condition has stood continuously (an open ARMED fire) and its alarm is
+        still unanswered — `proposed` awaiting a verdict, or, with no remedy,
+        `informational` (the supervisor never claims it, so it never moves on). The
+        situation's fingerprint moves for reasons that are not a new gap — a worker turn,
+        a queued message — and each move would otherwise raise a second alarm for the
+        same standing condition beside the first.
 
         THE WHOLE BRIDGE IS: `add_finding` (source `rule`), one `rule_fired` event,
         `remedies.propose`. That is the same call the supervisor makes, so the
@@ -5660,20 +5668,40 @@ class Daemon:
 
         detector_id = str(row.get("id") or "")
         order_id = facts.order_id
+        if row.get("status") != rules.ARMED:
+            return None
         remedy_row: dict[str, Any] | None = None
         alarm: dict[str, Any] | None = None
         try:
             remedy_row = next((r for r in self.central.remedy_rules_for(detector_id)
                                if rules.effective_status(row, r) == rules.ARMED), None)
-            if remedy_row is None:
-                return None
+            awaiting = ("proposed",) if remedy_row else ("informational",)
             if (open_fire is not None and open_fire["mode"] == rules.ARMED
                     and open_fire["alarm_id"]
-                    and store.get_alarm(open_fire["alarm_id"])["status"] == "proposed"):
+                    and store.get_alarm(open_fire["alarm_id"])["status"] in awaiting):
                 return "held"
+            reason = rules.render_condition(cond)
+            if remedy_row is None:
+                # informational: nothing can be proposed, so a supervisor claim would be a
+                # model call and a second acting path; row, event and /alarms still carry it.
+                alarm = store.add_finding(
+                    order_id, kind=str(row["gap_class"]), reason=reason, seq=NO_TURN,
+                    source="rule", probe=detector_id, status="informational")
+                store.add_event(order_id, "rule_fired", {
+                    "alarm_id": alarm["id"], "detector_id": detector_id, "reason": reason})
+                # Nothing filed a gate request, so the pre-action fingerprint stands (the
+                # propose path below recomputes it because `gate_requested` moves it).
+                self.central.record_rule_fire(
+                    detector_id=detector_id, project=project.name, order_id=order_id,
+                    order_kind=facts.order_kind, fingerprint=fingerprint,
+                    mode=rules.ARMED, outcome=rules.RECORDED, remedy_rule_id="",
+                    alarm_id=str(alarm["id"]),
+                    detail="the detector is armed with no armed remedy, so nothing was "
+                           f"proposed: {reason}")
+                counts["recorded_armed"] += 1
+                return "fired"
             primitive, argument = str(remedy_row["primitive"]), str(
                 remedy_row["argument"] or "")
-            reason = rules.render_condition(cond)
             evidence = rules.bound(rules.explain(cond, rules.evaluate(cond, facts)))
             alarm = store.add_finding(
                 order_id, kind=str(row["gap_class"]), reason=reason, seq=NO_TURN,
@@ -5704,8 +5732,7 @@ class Daemon:
             fire = self.central.record_rule_fire(
                 detector_id=detector_id, project=project.name, order_id=order_id,
                 order_kind=facts.order_kind, fingerprint=fingerprint,
-                mode=rules.ARMED if remedy_row else rules.DRY_RUN,
-                outcome=rules.UNREADABLE,
+                mode=rules.ARMED, outcome=rules.UNREADABLE,
                 remedy_rule_id=str(remedy_row["id"]) if remedy_row else "",
                 alarm_id=str(alarm["id"]) if alarm else "",
                 detail=f"the armed fire could not be proposed: {words}")
