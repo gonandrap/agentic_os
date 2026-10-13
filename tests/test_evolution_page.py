@@ -195,6 +195,42 @@ def test_a_weaker_half_with_no_side_names_no_side(client, monkeypatch):
     assert "weaker half: " not in body
 
 
+def test_no_recurrence_renders_the_sentence_and_no_verdict_counts(client, monkeypatch):
+    """Same condition as the CLI: an empty `rows` means no counts line at all."""
+    monkeypatch.setattr(ops, "evolution_report", lambda *a, **k: report(
+        recurrences={"rows": [],
+                     "verdict_counts": {"missed": 0, "remedy_failed": 0,
+                                        "not_armed": 0, "unreadable": 0},
+                     "weaker_half": {
+                         "weaker": None, "missed": 0, "remedy_failed": 0,
+                         "note": "no recurrence has been recorded in this window",
+                         "excluded": {"unreadable": 0, "not_armed": 0},
+                         "excluded_note": "counted here and kept out"}}))
+    body = body_of(client.get("/evolution").text)
+
+    assert "no recurrence has been recorded in this window" in body
+    for rendered in ("missed 0", "remedy_failed 0", "not_armed 0", "unreadable 0",
+                     "counted here and kept out"):
+        assert rendered not in " ".join(body.split())
+
+
+def test_a_recurrence_row_brings_the_verdict_counts_back(client, monkeypatch):
+    monkeypatch.setattr(ops, "evolution_report", lambda *a, **k: report(
+        recurrences={"rows": [{"ts": 1.0, "gap_class": "stuck_order",
+                               "verdict": "missed", "order_id": "wo-1",
+                               "note": "n", "filed_note": "f"}],
+                     "verdict_counts": {"missed": 1},
+                     "weaker_half": {
+                         "weaker": "conditions", "missed": 1, "remedy_failed": 0,
+                         "note": "conditions are the weaker half",
+                         "excluded": {"unreadable": 0},
+                         "excluded_note": "counted here and kept out"}}))
+    body = " ".join(body_of(client.get("/evolution").text).split())
+
+    assert "missed 1" in body
+    assert "counted here and kept out" in body
+
+
 # -- the navigation into it -------------------------------------------------------------
 
 

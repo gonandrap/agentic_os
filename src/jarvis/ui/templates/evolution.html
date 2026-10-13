@@ -176,6 +176,8 @@
   {# The weaker half is a VERDICT the report reached, not a comparison made here: when
      neither side can be named the note says so and this page names no side. #}
   <p class="kv">{{ report.recurrences.weaker_half.note }}</p>
+  {# §9, ABSENT IS NEVER ZERO: with no recurrence row the sentence is the whole section. #}
+  {% if report.recurrences.rows %}
   {% if report.recurrences.weaker_half.excluded_note %}
   <p class="sub">{{ report.recurrences.weaker_half.excluded_note }}:
     {% for verdict, count in report.recurrences.weaker_half.excluded.items() %}
@@ -187,6 +189,7 @@
     {{ verdict }} {{ count }}{% if not loop.last %} · {% endif %}
     {% else %}no verdict has been recorded in this window{% endfor %}
   </p>
+  {% endif %}
   <table>
     <tr><th>when</th><th>gap class</th><th>verdict</th><th>order</th><th>what happened</th></tr>
     {% for row in report.recurrences.rows %}

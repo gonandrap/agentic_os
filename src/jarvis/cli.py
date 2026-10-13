@@ -4636,11 +4636,14 @@ def _print_rules_summary(data: dict) -> None:
     rec = data["recurrences"]
     half = rec["weaker_half"]
     print(f"\n{half['note']}")
-    counts = ", ".join(f"{n} {verdict}" for verdict, n in rec["verdict_counts"].items())
-    if counts:
-        print(f"  {counts}")
-    if half["excluded_note"]:
-        print(f"  {half['excluded_note']}")
+    # §9, ABSENT IS NEVER ZERO: with no recurrence row the sentence is the whole section.
+    if rec["rows"]:
+        counts = ", ".join(f"{n} {verdict}"
+                           for verdict, n in rec["verdict_counts"].items())
+        if counts:
+            print(f"  {counts}")
+        if half["excluded_note"]:
+            print(f"  {half['excluded_note']}")
 
     # LAST: the longest block and the least actionable one.
     if data["timeline"]:

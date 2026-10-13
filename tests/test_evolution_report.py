@@ -336,6 +336,17 @@ def test_the_weaker_half_names_conditions_when_more_was_missed(store, detector):
     assert "conditions" in half["note"]
 
 
+def test_an_equal_tie_of_one_says_time_and_not_1_times(store, detector):
+    """The noun agrees with the count the sentence already holds: "1 time", not "1 times"."""
+    _recur(store, detector["id"], rules.MISSED, "wo-1")
+    _recur(store, detector["id"], rules.REMEDY_FAILED, "wo-2")
+
+    half = ops.evolution_report()["recurrences"]["weaker_half"]
+
+    assert "each failed 1 time in this window" in half["note"]
+    assert "1 times" not in half["note"]
+
+
 def test_no_recurrence_at_all_is_its_own_sentence(store, detector):
     half = ops.evolution_report()["recurrences"]["weaker_half"]
 

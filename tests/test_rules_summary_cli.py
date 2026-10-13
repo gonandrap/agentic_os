@@ -158,6 +158,46 @@ def test_no_weaker_half_prints_the_note_and_names_neither_side(capsys):
     assert "weaker half" not in rest
 
 
+def test_no_recurrence_prints_the_sentence_and_no_verdict_counts(capsys):
+    """ABSENT IS NEVER ZERO applies to the counts line too: with no recurrence row the
+    sentence is the whole section, and `missed 0` beside it reads as a measurement."""
+    note = "no recurrence has been recorded in this window"
+    data = _report(recurrences={
+        "rows": [],
+        "verdict_counts": {"missed": 0, "remedy_failed": 0, "not_armed": 0,
+                           "unreadable": 0},
+        "weaker_half": {"weaker": None, "missed": 0, "remedy_failed": 0, "note": note,
+                        "excluded": {"unreadable": 0, "not_armed": 0},
+                        "excluded_note": "unreadable and not_armed are counted here"}})
+
+    cli._print_rules_summary(data)
+    out = capsys.readouterr().out
+
+    assert note in out
+    for rendered in ("0 missed", "0 remedy_failed", "0 not_armed", "0 unreadable",
+                     "missed 0", "not_armed 0", "unreadable 0"):
+        assert rendered not in out
+    assert "unreadable and not_armed are counted here" not in out
+
+
+def test_a_recurrence_row_brings_the_verdict_counts_back(capsys):
+    data = _report(recurrences={
+        "rows": [{"ts": 1_050_000.0, "gap_class": "stale-panel-hold",
+                  "verdict": "missed", "order_id": "wo-1", "note": "n",
+                  "filed_note": "f"}],
+        "verdict_counts": {"missed": 1, "remedy_failed": 0},
+        "weaker_half": {"weaker": "conditions", "missed": 1, "remedy_failed": 0,
+                        "note": "conditions are the weaker half",
+                        "excluded": {"unreadable": 0},
+                        "excluded_note": "counted here and kept out"}})
+
+    cli._print_rules_summary(data)
+    out = capsys.readouterr().out
+
+    assert "1 missed" in out
+    assert "counted here and kept out" in out
+
+
 def test_a_timeline_entry_with_no_links_renders_without_raising(capsys):
     data = _report(timeline=[{"ts": 1_050_000.0, "kind": "detector_added", "id": "dt-1",
                               "headline": "a detector for stale-panel-hold was registered",

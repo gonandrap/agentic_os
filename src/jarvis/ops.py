@@ -11924,17 +11924,21 @@ def evolution_report(project: str | None = None, *, days: int = 90) -> dict:
             "no recurrence has been recorded in this window that was either missed or "
             "whose remedy failed, so neither conditions nor remedies can be called the "
             "weaker half — which is not the two of them being equally good")
+    # §9: the noun agrees with the count the sentence already holds.
     elif missed == remedy_failed:
         weaker, half_note = None, (
-            f"conditions and remedies have each failed {missed} times in this window — "
+            f"conditions and remedies have each failed {missed} "
+            f"{'time' if missed == 1 else 'times'} in this window — "
             f"equally often, which is not a tie to be broken: both halves want work")
     elif missed > remedy_failed:
         weaker, half_note = "conditions", (
-            f"conditions are the weaker half: {missed} recurrences the condition missed "
+            f"conditions are the weaker half: {missed} "
+            f"{'recurrence' if missed == 1 else 'recurrences'} the condition missed "
             f"against {remedy_failed} where the remedy did not hold")
     else:
         weaker, half_note = "remedies", (
-            f"remedies are the weaker half: {remedy_failed} recurrences where the remedy "
+            f"remedies are the weaker half: {remedy_failed} "
+            f"{'recurrence' if remedy_failed == 1 else 'recurrences'} where the remedy "
             f"did not hold against {missed} the condition missed")
     recurrences = {
         "rows": recurrence_rows, "verdict_counts": verdict_counts,
