@@ -5024,6 +5024,22 @@ class ProjectStore:
             "SELECT * FROM validation_rounds WHERE id=?", (round_id,)).fetchone()
         return dict(row) if row else None
 
+    def mark_validation_round_uncounted(self, round_id: int, cause: str) -> None:
+        """Take an OPEN round out of the budget. One home for this UPDATE.
+
+        `open_validation_round` decides `uncounted` when the round is opened, and a round
+        returned for red CI could not be decided there: `submit_for_validation` had no
+        way to know GitHub would call the head red (spec
+        docs/superpowers/specs/2026-10-13-a-red-head-is-sent-back-before-the-panel.md §3.3).
+
+        NOT a hold cause: `hold_cause` is left alone, because nothing is holding a round
+        that is being settled.
+        """
+        self.conn.execute(
+            "UPDATE validation_rounds SET uncounted=1, uncounted_cause=? WHERE id=?",
+            (cause, round_id),
+        )
+
     def close_validation_round(self, round_id: int, outcome: str,
                                reason: str = "",
                                hold_cause: str | None = None) -> None:

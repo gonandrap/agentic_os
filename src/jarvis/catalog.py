@@ -531,6 +531,12 @@ DEFAULT_VALIDATION_TIMEOUT = 300
 # How many times a unit may be sent back before the loop gives up and asks a human.
 DEFAULT_VALIDATION_MAX_ROUNDS = 3
 
+# How many times a work order whose CI has finished RED is sent back WITHOUT seating the
+# panel and without spending a counted round. 3 is `invariants.PR_REPAIR_MAX_ATTEMPTS`'s
+# number for the same question one authority earlier in the lifecycle. Spec §4:
+# docs/superpowers/specs/2026-10-13-a-red-head-is-sent-back-before-the-panel.md
+DEFAULT_VALIDATION_RED_CI_RETURNS = 3
+
 # Truncation limit for the diff a seat is shown. MEASURED, not chosen: at 0.384
 # tokens/char a round's shared prefix is 76,347 tokens here, which under the shared-cache
 # layout costs less than HALF what 60,000 cost when every seat wrote its own copy
@@ -627,6 +633,9 @@ class ValidationConfig:
     chair_model: str = ""
     timeout: int = DEFAULT_VALIDATION_TIMEOUT
     max_rounds: int = DEFAULT_VALIDATION_MAX_ROUNDS
+    # Spec §4:
+    # docs/superpowers/specs/2026-10-13-a-red-head-is-sent-back-before-the-panel.md
+    red_ci_returns: int = DEFAULT_VALIDATION_RED_CI_RETURNS
     diff_chars: int = DEFAULT_VALIDATION_DIFF_CHARS
     decision_record_chars: int = DEFAULT_VALIDATION_DECISION_RECORD_CHARS
     confirm_diff_chars: int = DEFAULT_VALIDATION_CONFIRM_DIFF_CHARS
@@ -2155,6 +2164,12 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
     max_rounds = int(raw.get("max_rounds", base.max_rounds))
     if max_rounds < 1:
         raise _err(f"{where}.max_rounds must be >= 1")
+    red_ci_returns = int(raw.get("red_ci_returns", base.red_ci_returns))
+    if red_ci_returns < 0:
+        # 0 is legal and means "never return": send every red head to the seats, which
+        # is today's behaviour exactly. `max_rounds` is >= 1 because a unit with zero
+        # rounds can never be judged at all; zero returns is not that (spec §4.3).
+        raise _err(f"{where}.red_ci_returns must be >= 0")
     diff_chars = int(raw.get("diff_chars", base.diff_chars))
     if diff_chars < 1:
         raise _err(f"{where}.diff_chars must be >= 1")
@@ -2190,6 +2205,7 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         chair_model=str(raw.get("chair_model", base.chair_model) or ""),
         timeout=timeout,
         max_rounds=max_rounds,
+        red_ci_returns=red_ci_returns,
         diff_chars=diff_chars,
         decision_record_chars=decision_record_chars,
         confirm_diff_chars=confirm_diff_chars,

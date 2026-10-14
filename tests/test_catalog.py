@@ -1116,6 +1116,45 @@ def test_the_feature_merge_wait_resolves_per_project_and_falls_back_fleet_wide()
         validation_of({"feature_merge_wait_minutes": -1})
 
 
+def test_the_red_ci_return_cap_resolves_per_project_and_zero_is_a_setting():
+    """§4 of
+    docs/superpowers/specs/2026-10-13-a-red-head-is-sent-back-before-the-panel.md:
+    how many times a red head is sent back before the seats read it is a bound the user
+    may want to move, so it is a catalog key. `0` is legal and means never return —
+    today's behaviour exactly, which is what a project that disagrees needs."""
+    assert (parse_catalog({"projects": []}).os.validation.red_ci_returns
+            == jarvis.catalog.DEFAULT_VALIDATION_RED_CI_RETURNS)
+
+    inherits, own = projects_validation(
+        {"red_ci_returns": 5, "max_rounds": 2}, {},
+        {"validation": {"red_ci_returns": 1}})
+    assert inherits.red_ci_returns == 5
+    assert own.red_ci_returns == 1
+    assert own.max_rounds == 2, "a project naming only this key inherits the rest"
+
+    [silent] = projects_validation(None, {})
+    assert (silent.red_ci_returns
+            == jarvis.catalog.DEFAULT_VALIDATION_RED_CI_RETURNS)
+
+    assert validation_of({"red_ci_returns": 0}).red_ci_returns == 0
+    with pytest.raises(CatalogError,
+                       match="os.validation.red_ci_returns must be >= 0"):
+        validation_of({"red_ci_returns": -1})
+
+
+def test_a_round_is_judged_under_the_red_ci_bound_it_was_opened_with():
+    """`config_version.validation_config_from_resolved` walks the dataclass's fields, so
+    the stamped historical read carries the new key for free — and `_round_config` is
+    what makes the bound a round is returned against the one that was live when the
+    worker submitted (spec §4.4)."""
+    from jarvis import config_version as cv
+
+    assert cv.validation_config_from_resolved(
+        {"os.validation.red_ci_returns": 7}).red_ci_returns == 7
+    assert (cv.validation_config_from_resolved({}).red_ci_returns
+            == jarvis.catalog.DEFAULT_VALIDATION_RED_CI_RETURNS)
+
+
 # -- rules: the evaluation pass ships OFF, and a project may switch it on ---------------
 
 
