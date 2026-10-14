@@ -254,6 +254,14 @@ FACT_FIELDS: dict[str, FactField] = _fields(
     ("rounds_left", NUM, "validation_round", "rounds remaining before `max_rounds`"),
     ("judged_head_sha", STR, "validation_round", "the commit that round judged"),
 
+    # The `validation_failed` PAYLOADS, by cause. Its own source and its own field because
+    # every cause writes the same event KIND, so a `count_gte` on `event_counts` would
+    # fire on a transport outage too. Spec §5:
+    # docs/superpowers/specs/2026-10-14-a-killed-validation-panel-opens-an-investigation.md
+    ("validation_failure_causes", MAP, "validation_failures",
+     "`validation_failed` event causes to their counts — `transport`, `killed`, the auth "
+     "cause"),
+
     # The RECORDED pull-request columns. NEVER A LIVE `gh` CALL: a condition is evaluated
     # for every open order on every sweep, and a rule engine that reaches the network per
     # order per tick is a rate limit with extra steps. The recorded columns are refreshed
@@ -1109,7 +1117,7 @@ def _param_specs(schema: Any) -> dict[str, tuple[str, bool]]:
 #: Bumping it is how a later release adds seeds to an `os.db` that already has some: the
 #: seeding pass returns early on a matching version, so reusing a number leaves the new
 #: rows out of every database that has the old ones.
-SEED_VERSION = 1
+SEED_VERSION = 2
 
 #: `invariants.VALIDATION_STUCK_BLOCKER`, INLINED. This module is a leaf — `invariants`
 #: sits well above it and importing it would make the grammar depend on the whole
@@ -1139,7 +1147,7 @@ def seed_id(prefix: str, body: Any) -> str:
     return f"{prefix}-{digest[:10]}"
 
 
-# The five gaps of §1, each one a real incident with an issue behind it. They are DATA,
+# The gaps of §1, each one a real incident with an issue behind it. They are DATA,
 # they live beside the grammar rather than beside the evaluation pass, and that placement
 # is the grammar's acceptance criterion: all five must be expressible without extending
 # it (spec §3.2/§3.5). A criterion checked anywhere else is not a criterion.
@@ -1289,11 +1297,40 @@ _SEEDS: tuple[dict[str, Any], ...] = (
                           "why it is idle.")},
         ],
     },
+    {
+        # Spec §5: docs/superpowers/specs/
+        # 2026-10-14-a-killed-validation-panel-opens-an-investigation.md
+        "gap_class": "killed-validation-panel",
+        "issue_url": f"{_TRACKER}/1039",
+        "summary": ("a round whose validation seats were KILLED BY A SIGNAL more than "
+                    "once on the same order — the kill is recurring, not a blip "
+                    "(issue #1039)"),
+        # THE CAUSE, not the event kind: transport, auth and killed all write
+        # `validation_failed`, and the conflation is what the daemon's own cause exists to
+        # prevent.
+        "condition": {"all": [
+            {"field": "validation_failure_causes", "op": "count_gte",
+             "value": {"kind": "killed", "value": 2}},
+        ]},
+        "remedies": [
+            {"primitive": "file_work_order", "params": {},
+             "argument": ("The validation seats on this order have been killed by a "
+                          "signal more than once: four concurrent processes ending at "
+                          "the same elapsed time with nothing on either stream is one "
+                          "EXTERNAL event — a daemon restart or deploy, a process-group "
+                          "kill, the OOM killer, an outer timeout — and not four model "
+                          "failures. A retry cannot name what killed them and cannot "
+                          "stop it recurring, which is why the remedy here writes code "
+                          "rather than flipping a state. The investigation already filed "
+                          "on the order carries the per-seat facts; what this orders is "
+                          "the fix for whatever it finds.")},
+        ],
+    },
 )
 
 
 def seed_rows() -> list[dict[str, Any]]:
-    """The five builtin detectors with their remedy rows, as store rows.
+    """The builtin detectors with their remedy rows, as store rows.
 
     `[{"detector": {...}, "remedies": [{...}]}]` — nested rather than two flat lists
     because a remedy row carries a foreign key to its detector and the seeding pass would

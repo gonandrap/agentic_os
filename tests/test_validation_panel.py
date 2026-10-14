@@ -416,6 +416,90 @@ def test_the_reason_is_capped(store, round_row, jarvis_home, fake_claude):
     assert len(result["reason"]) <= validation.REASON_LIMIT
 
 
+# -- a killed panel raises rather than escalating (issue #1039) -----------------------
+#
+# Spec §3: docs/superpowers/specs/
+# 2026-10-14-a-killed-validation-panel-opens-an-investigation.md. Over SYNTHESISED
+# opinions, which the auth-hold file does for the same reason: the classifier is the unit
+# under test and per-seat evidence of a kill exists nowhere else.
+
+KILLED = claude_cli.Killed(
+    message="claude -p judge... was killed by a signal (rc=143) and wrote nothing",
+    rc=143)
+
+
+@pytest.fixture()
+def panel(store, round_row, monkeypatch):
+    from jarvis import seats
+
+    monkeypatch.setattr(seats, "prime_cache", lambda *a, **k: None)
+
+    def run(opinions):
+        monkeypatch.setattr(seats, "run_blind", lambda *a, **k: list(opinions))
+        return validation.decide(store, dict(round_row), packet(), cfg())
+
+    return run
+
+
+def _silent(seat: str, **kw):
+    from jarvis import seats
+
+    return seats.Opinion(seat=seat, raw="claude -p ... failed (rc=143): ",
+                         status="abstained", replied=False, **kw)
+
+
+def test_a_killed_panel_raises_rather_than_escalating(panel):
+    """Spec §3 and the defect in one line: `escalated` is terminal and spent the user's
+    attention on an event the record held no rc for."""
+    with pytest.raises(claude_cli.KilledError) as caught:
+        panel([_silent(s, killed=KILLED)
+               for s in ("tester", "security", "architect", "maintainer")])
+
+    assert caught.value.killed.rc == 143
+
+
+def test_one_killed_seat_is_enough_when_no_seat_replied(panel):
+    """Spec §3: first-match like the refusal and auth clauses, not an all-seats rule — one
+    killed seat in a panel where nobody replied is already the event."""
+    with pytest.raises(claude_cli.KilledError):
+        panel([_silent("tester", killed=KILLED),
+               _silent("security")])
+
+
+def test_a_refusal_and_an_auth_failure_each_still_win_over_a_kill(panel):
+    """Spec §3, the two ordering pins inside the same block."""
+    with pytest.raises(claude_cli.UsageLimitError):
+        panel([_silent("tester", killed=KILLED,
+                       refused=claude_cli.UsageLimit(message="limit · resets 9am",
+                                                     reset_at=1.0))])
+    with pytest.raises(claude_cli.AuthFailureError):
+        panel([_silent("tester", killed=KILLED,
+                       auth=claude_cli.AuthFailure(message="Failed to authenticate"))])
+
+
+def test_a_kill_wins_over_the_transport_branch(panel):
+    """Spec §3: the transport branch would state an outage nobody observed — `cause:
+    "transport"` — and spend the outage budget on it."""
+    with pytest.raises(claude_cli.KilledError) as caught:
+        panel([_silent("tester", killed=KILLED),
+               _silent("security", killed=KILLED)])
+
+    assert "failed on the transport" not in str(caught.value)
+
+
+def test_one_killed_seat_beside_one_that_replied_takes_the_ordinary_path(
+        panel, jarvis_home, fake_claude):
+    """Spec §3: the `replied` gate above the block is untouched, so a panel that was
+    reached is judged — the kill is carried and raises nothing."""
+    from jarvis import seats
+
+    verdict = panel([_silent("tester", killed=KILLED),
+                     seats.Opinion(seat="security", raw=json.dumps({"verdict": "pass"}),
+                                   verdict="pass")])
+
+    assert verdict["outcome"] in {"passed", "rejected", "escalated"}
+
+
 # -- the seam ---------------------------------------------------------------------------------
 
 

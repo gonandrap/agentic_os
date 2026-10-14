@@ -318,9 +318,9 @@ def test_validate_params_reads_a_tuple_of_param_objects_as_a_schema():
 # -- the seed rows -----------------------------------------------------------------------
 
 
-def test_seed_rows_are_five_builtin_fleet_wide_detectors_in_dry_run():
+def test_seed_rows_are_six_builtin_fleet_wide_detectors_in_dry_run():
     rows = rules.seed_rows()
-    assert len(rows) == 5
+    assert len(rows) == 6
     for entry in rows:
         det = entry["detector"]
         assert det["status"] == rules.DRY_RUN
@@ -347,14 +347,50 @@ def test_every_seed_condition_parses():
 def test_seed_ids_are_stable_across_calls():
     first = [e["detector"]["id"] for e in rules.seed_rows()]
     second = [e["detector"]["id"] for e in rules.seed_rows()]
-    assert first == second and len(set(first)) == 5
+    assert first == second and len(set(first)) == 6
     assert all(i.startswith("dt-") for i in first)
 
 
-def test_the_five_gap_classes_are_the_ones_the_spec_names():
+def test_the_six_gap_classes_are_the_ones_the_spec_names():
     assert [e["detector"]["gap_class"] for e in rules.seed_rows()] == [
         "stale-panel-hold", "unreachable-neo-question", "catch-up-round-burn",
-        "red-base-inherited", "overtaken-release-order"]
+        "red-base-inherited", "overtaken-release-order", "killed-validation-panel"]
+
+
+def test_the_killed_panel_detector_is_the_sixth_and_ships_dry_run():
+    """§5 of docs/superpowers/specs/
+    2026-10-14-a-killed-validation-panel-opens-an-investigation.md: a round whose seats
+    were killed MORE THAN ONCE on the same order — the kill is recurring, not a blip. Its
+    one remedy writes code, which is why nothing here is armed."""
+    entry = rules.seed_rows()[5]
+    det = entry["detector"]
+
+    assert det["gap_class"] == "killed-validation-panel"
+    assert det["issue_url"].endswith("/1039")
+    assert det["status"] == rules.DRY_RUN
+    assert rules.parse_condition(det["condition"])
+    assert [r["primitive"] for r in entry["remedies"]] == ["file_work_order"]
+    assert all(r["status"] == rules.DRY_RUN for r in entry["remedies"])
+    condition = json.loads(det["condition"])
+    assert {"field": "validation_failure_causes", "op": "count_gte",
+            "value": {"kind": "killed", "value": 2}} in condition["all"]
+
+
+def test_the_seed_version_is_bumped_so_the_sixth_reaches_a_live_os_db():
+    """The seeding pass returns early on a matching version, so a release that adds a
+    seed without bumping this ships the detector dead on every `os.db` that already holds
+    the five."""
+    assert rules.SEED_VERSION == 2
+
+
+def test_the_new_fact_field_is_declared_with_its_own_source():
+    """§5: the cause lives in the `validation_failed` payload and `event_counts` keys on
+    the event KIND, which every cause shares — a condition on it would fire on transport
+    outages too. Its own source slug, so a condition about `status` never pays the walk."""
+    field = rules.FACT_FIELDS["validation_failure_causes"]
+
+    assert (field.type, field.source) == (rules.MAP, "validation_failures")
+    assert "killed" in field.note
 
 
 # -- the drift pins ------------------------------------------------------------------------

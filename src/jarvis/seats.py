@@ -167,6 +167,11 @@ class Opinion:
     #: that could not authenticate must not take down a panel the other three answered,
     #: and that call belongs to `validation.decide` (GitHub issue #778).
     auth: claude_cli.AuthFailure | None = None
+    #: THE SEAT'S PROCESS WAS KILLED and it was never asked. `refused`/`auth`'s twin,
+    #: including the reason it is carried rather than raised: one dead seat must not take
+    #: down a panel the other three answered, and whether the round can be judged without
+    #: it is `validation.decide`'s call (GitHub issue #1039).
+    killed: claude_cli.Killed | None = None
     #: NO DEFINITION FOR THIS SEAT SHIPS IN THIS BUILD — the `SeatError` construction
     #: sites in `panel._round` and `validation._run_seats`, and nowhere else.
     #:
@@ -227,7 +232,8 @@ def _run_seat(seat: str, prompt: str, system: str, model: str, timeout: int,
         return Opinion(seat=seat, raw=str(e), status="abstained", model=model,
                        latency_ms=elapsed(), replied=False,
                        refused=getattr(e, "limit", None),
-                       auth=getattr(e, "auth", None))
+                       auth=getattr(e, "auth", None),
+                       killed=getattr(e, "killed", None))
     raw, usage = result.text, result.usage
     data = structured.parse_json_object(raw)
     if not isinstance(data, dict):

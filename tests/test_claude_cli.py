@@ -363,3 +363,56 @@ def test_output_that_is_not_json_still_carries_the_sizes(fake_claude, monkeypatc
 
     assert result.usage is None                       # nothing to account
     assert (result.prompt_chars, result.system_prompt_chars) == (11, 8)
+
+
+# -- a signal death is its own classified failure --------------------------------------
+#
+# Spec §1, GitHub issue #1039: docs/superpowers/specs/
+# 2026-10-14-a-killed-validation-panel-opens-an-investigation.md
+
+KILL_LIMIT = "You've hit your session limit · resets 11:50pm (America/Los_Angeles)"
+KILL_AUTH = "Failed to authenticate: OAuth session expired and could not be refreshed"
+
+
+@pytest.mark.parametrize("rc", [143, 137, -15, -9])
+def test_a_silent_signal_death_is_classified_as_killed(rc) -> None:
+    """Spec §1. On wo-ab6c309d round 1 `failed (rc=143): ` was the whole record of four
+    seats dying at the same instant, and an empty detail classified as nothing at all."""
+    error = claude_cli._cli_failure(["-p", "judge"], rc, "", "")
+
+    assert isinstance(error, claude_cli.KilledError)
+    assert error.killed.rc == rc
+    assert isinstance(error, claude_cli.ClaudeCliError), "every `except` must keep working"
+    assert str(rc) in error.killed.message
+
+
+def test_a_signal_rc_that_carried_output_stays_an_ordinary_failure() -> None:
+    """Spec §1, the second load-bearing condition (rejected alternative 4): a seat killed
+    after it explained itself must keep the sentence that explains it."""
+    error = claude_cli._cli_failure(["-p", "judge"], 143, "", "seat gave up: no diff")
+
+    assert type(error) is claude_cli.ClaudeCliError
+    assert "no diff" in str(error)
+
+
+def test_an_empty_failure_at_an_ordinary_rc_is_untouched() -> None:
+    error = claude_cli._cli_failure(["-p", "judge"], 1, "", "")
+
+    assert type(error) is claude_cli.ClaudeCliError
+
+
+def test_a_usage_refusal_at_a_signal_rc_still_wins() -> None:
+    """Spec §1, ordering pin one (kn-d77b941d): a spent window states the moment it
+    lifts, and a kill does not."""
+    error = claude_cli._cli_failure(["-p", "judge"], 143, "", KILL_LIMIT)
+
+    assert isinstance(error, claude_cli.UsageLimitError)
+    assert not isinstance(error, claude_cli.KilledError)
+
+
+def test_an_auth_failure_at_a_signal_rc_still_wins() -> None:
+    """Spec §1, ordering pin two: a sign-in failure has a remedy a kill does not."""
+    error = claude_cli._cli_failure(["-p", "judge"], 143, "", KILL_AUTH)
+
+    assert isinstance(error, claude_cli.AuthFailureError)
+    assert not isinstance(error, claude_cli.KilledError)

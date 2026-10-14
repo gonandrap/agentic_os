@@ -1050,6 +1050,13 @@ def decide(store: ProjectStore, round_row: dict[str, Any], packet: EvidencePacke
         auth = next((op.auth for op in opinions if op.auth is not None), None)
         if auth is not None:
             raise claude_cli.AuthFailureError(auth)
+        # ...OR EVERY SEAT'S PROCESS WAS KILLED, which is GitHub issue #1039 and the
+        # spec's §3 — BEFORE the transport branch, which would otherwise state an outage
+        # the OS never observed and spend its budget on it. ANY seat, following the two
+        # above: one killed seat in a panel where nobody replied is already the event.
+        killed = next((op.killed for op in opinions if op.killed is not None), None)
+        if killed is not None:
+            raise claude_cli.KilledError(killed)
         # ...OR THE TRANSPORT IS DOWN, in which case the round belongs to the outage budget
         # it was always meant to reach (`Daemon._validation_outage`). ALL seats, not any:
         # one seat with a 503 beside three that each failed differently is a panel that is

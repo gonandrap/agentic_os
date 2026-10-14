@@ -264,6 +264,16 @@ def _run(args: list[str], cwd: Path | None = None, timeout: int = 120,
     return proc.stdout
 
 
+def _is_signal_rc(rc: int) -> bool:
+    """Was this exit a signal death, in EITHER of the two spellings?
+
+    `rc < 0` is Python's own, when `subprocess` reaps a signalled child; `137`/`143` are
+    128+9 and 128+15, the shell's, which is what the CLI wrapper produced in the incident
+    behind GitHub issue #1039.
+    """
+    return rc < 0 or rc in (137, 143)
+
+
 def _cli_failure(args: list[str], rc: int, stdout: str, stderr: str) -> ClaudeCliError:
     """The exception a non-zero `claude` exit deserves, CLASSIFIED and untruncated.
 
@@ -286,6 +296,13 @@ def _cli_failure(args: list[str], rc: int, stdout: str, stderr: str) -> ClaudeCl
     auth = auth_failure(detail)
     if auth is not None:
         return AuthFailureError(auth)
+    # AFTER both of those and ONLY on an empty detail: spec §1,
+    # docs/superpowers/specs/2026-10-14-a-killed-validation-panel-opens-an-investigation.md
+    if not detail and _is_signal_rc(rc):
+        return KilledError(Killed(
+            message=f"claude {' '.join(args[:4])}... was killed by a signal (rc={rc}) "
+                    f"and wrote nothing",
+            rc=rc))
     return ClaudeCliError(
         f"claude {' '.join(args[:4])}... failed (rc={rc}): {detail[:500]}")
 
@@ -1148,6 +1165,31 @@ class UsageLimitError(ClaudeCliError):
     def __init__(self, limit: UsageLimit) -> None:
         super().__init__(limit.message)
         self.limit = limit
+
+
+@dataclass
+class Killed:
+    """A seat whose process was killed by a signal and said nothing at all."""
+
+    message: str
+    rc: int
+
+
+class KilledError(ClaudeCliError):
+    """`claude` was KILLED BY A SIGNAL and wrote nothing: one external event, not a model
+    failure.
+
+    `UsageLimitError`'s shape and a `ClaudeCliError` subclass for its reason: every
+    existing `except claude_cli.ClaudeCliError` keeps working unchanged and what this adds
+    is `killed`, and with it the rc. The difference from the two above is that NOTHING
+    about the process explains it — a retry can neither name what killed it nor stop it
+    recurring — so the caller opens an investigation rather than waiting
+    (`Daemon._validation_killed`, GitHub issue #1039).
+    """
+
+    def __init__(self, killed: Killed) -> None:
+        super().__init__(killed.message)
+        self.killed = killed
 
 
 class AuthFailureError(ClaudeCliError):
