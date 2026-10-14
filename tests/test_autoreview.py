@@ -2384,6 +2384,126 @@ def test_the_projects_own_cap_reaches_the_packet_both_passes_build():
         assert "ruling 4" not in packet
 
 
+# -- the spec section the assumption cites (GitHub issue #1035) -------------------------
+
+
+SPEC_BODY = ("## 2. The remedy\n\nA worker that cannot reach the bus retries three "
+             "times and then parks.")
+SPEC_DOC = f"# Design\n\n## 1. Why\n\nBecause.\n\n{SPEC_BODY}\n\n## 3. Later\n\nNo.\n"
+CHILD = {"id": "wo-1", "status": "needs_review", "title": "t", "description": "d",
+         "parent_id": "fo-1", "kind": "child", "spec_section": "2. The remedy"}
+
+
+class SpecStore(FakeStore):
+    """`specs.spec_of`'s one read — the parent feature's stored plan. No database: the
+    packet builders must resolve the spec with the store they already hold."""
+
+    def __init__(self, *messages: dict, doc: str = SPEC_DOC,
+                 path: str = "docs/specs/bus.md"):
+        super().__init__(*messages)
+        self.plan = json.dumps({"design_doc": path, "design_doc_content": doc})
+
+    def get_feature_order(self, fo_id: str) -> dict:
+        return {"id": fo_id, "plan": self.plan}
+
+
+SPEC_HEADER = "# THE SPEC SECTION THIS WORK ORDER WAS BUILT TO"
+
+
+def builds(store, cfg=None):
+    """Both passes, each as a one-argument builder over a fresh `FakeNeo`."""
+    return (
+        lambda neo_: autoreview.propose(store, neo_, "p", CHILD, assumption(),
+                                        [assumption()], cfg=cfg),
+        lambda neo_: autoreview.propose_confirmation(store, neo_, "p", CHILD,
+                                                     assumption(), [assumption()],
+                                                     cfg=cfg),
+    )
+
+
+def test_the_spec_section_reaches_both_packets_with_no_daemon_and_no_model_call():
+    """#1035: a reviewer asked to rule on an assumption that cites the spec was shown no
+    spec, and escalated with `evidence-insufficient`. Resolved inside `propose`."""
+    for build in builds(SpecStore()):
+        neo_ = FakeNeo(qrow())
+        build(neo_)
+        (packet,) = neo_.asked
+        assert SPEC_HEADER in packet
+        assert "docs/specs/bus.md § 2. The remedy" in packet
+        assert "retries three times and then parks" in packet
+        # The authority behind the brief: after it, before what was delivered.
+        assert packet.index("# The work order it was recorded against") \
+            < packet.index(SPEC_HEADER) < packet.index("# What the worker says it")
+
+
+def test_the_projects_own_spec_cap_binds_in_both_packets():
+    """`validation.assumption_spec_chars` is per project, so the bound the reviewer reads
+    is the bound that project set — never the module's."""
+    tight = ValidationConfig(assumption_spec_chars=40)
+
+    for build in builds(SpecStore(), cfg=tight):
+        neo_ = FakeNeo(qrow())
+        build(neo_)
+        (packet,) = neo_.asked
+        assert "retries three times" not in packet
+        assert "spec section truncated" in packet
+        assert str(autoreview.DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS) not in packet
+        assert "docs/specs/bus.md § 2. The remedy" in packet
+
+
+def test_a_section_over_the_budget_is_trimmed_with_a_marker_and_the_reference():
+    """Bounded-model-inputs §2: the reference rides whether or not anything was cut, and
+    what was cut says where the rest is."""
+    long_doc = f"# D\n\n## 2. The remedy\n\n{'x' * 9000}\n"
+    neo_ = FakeNeo(qrow())
+
+    autoreview.propose(SpecStore(doc=long_doc), neo_, "p", CHILD, assumption(),
+                       [assumption()])
+
+    (packet,) = neo_.asked
+    assert "x" * 9000 not in packet and "x" * 500 in packet
+    assert ("[spec section truncated — 6,000 of 9,018 chars; full section: "
+            "docs/specs/bus.md § 2. The remedy]") in packet
+
+
+def test_no_spec_section_says_so_explicitly_in_both_packets():
+    """An absent section must read as absent, not as silence: with nothing in the packet
+    a reviewer cannot tell a standalone order from a lost section."""
+    # `WO` has no `parent_id`, so `spec_of` returns None without touching the store.
+    for build in (
+        lambda neo_: autoreview.propose(FakeStore(), neo_, "p", WO, assumption(),
+                                        [assumption()]),
+        lambda neo_: autoreview.propose_confirmation(FakeStore(), neo_, "p", WO,
+                                                     assumption(), [assumption()]),
+    ):
+        neo_ = FakeNeo(qrow())
+        build(neo_)
+        (packet,) = neo_.asked
+        assert SPEC_HEADER in packet and "no spec section" in packet
+
+
+def test_a_spec_whose_named_section_does_not_resolve_is_not_the_same_as_none():
+    """Two different facts: this order was planned against a spec and its section could
+    not be found. Reading one as the other sends the reviewer to the wrong conclusion."""
+    neo_ = FakeNeo(qrow())
+
+    autoreview.propose(SpecStore(doc="# D\n\n## 9. Elsewhere\n\nno.\n"), neo_, "p",
+                       CHILD, assumption(), [assumption()])
+
+    (packet,) = neo_.asked
+    assert "did not resolve" in packet and "docs/specs/bus.md" in packet
+
+
+def test_the_instruction_tells_the_reviewer_to_cite_the_section_not_escalate():
+    """The whole point of #1035: a spec section that settles the assumption is a ruling,
+    not a reason to ask the user for the spec."""
+    for build in builds(SpecStore()):
+        neo_ = FakeNeo(qrow())
+        build(neo_)
+        (packet,) = neo_.asked
+        assert "cite the section" in packet
+
+
 def test_answered_questions_is_newest_first_and_keeps_every_kind(started):
     """The query, §1. Newest first — unlike `open_questions` — because the caller caps and
     the newest ruling is the one that supersedes. NO `kind` filter: an `approval` the user

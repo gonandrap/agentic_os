@@ -78,8 +78,11 @@ from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any
 
-from . import navigation
-from .catalog import DEFAULT_VALIDATION_DECISION_RECORD_CHARS
+from . import navigation, specs
+from .catalog import (
+    DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS,
+    DEFAULT_VALIDATION_DECISION_RECORD_CHARS,
+)
 from .stakes import Stakes
 
 log = logging.getLogger(__name__)
@@ -1600,9 +1603,45 @@ def _record_block(record: str) -> str:
     return f"{RECORD_HEADING}\n{record or NO_RECORD}"
 
 
+#: The spec block's heading and its two empty cases. GitHub issue #1035: the packet carried
+#: no spec at all, so an assumption that cited one was escalated `evidence-insufficient`.
+SPEC_HEADING = "# THE SPEC SECTION THIS WORK ORDER WAS BUILT TO — authority you may CITE"
+NO_SPEC = "  (no spec section — this work order was not planned against one)"
+SPEC_INTRO = ("This section is what the work was supposed to be. Where it settles the "
+              "assumption, rule on it and cite the section.")
+
+
+def _spec_block(spec: dict[str, str] | None, chars: int) -> str:
+    """The section `specs.spec_of` resolved, bounded — or that there is none, in words.
+
+    Three states and they are kept apart: no spec at all (a standalone order, or one
+    planned before specs existed), a spec whose NAMED SECTION did not resolve, and a
+    section. An absent section read as silence is what #1035 is about, and a lost section
+    read as "there was never one" would send the reviewer to the wrong conclusion.
+
+    THE REFERENCE RIDES WHETHER OR NOT ANYTHING WAS CUT
+    (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md §2): a bounded section the
+    reviewer cannot name is one it cannot cite.
+    """
+    if not spec:
+        return f"{SPEC_HEADING}\n{NO_SPEC}"
+    ref = (f"{spec.get('repo_path') or '(no path recorded)'} § "
+           f"{spec.get('section') or '(no section named)'}")
+    text = (spec.get("section_text") or "").strip()
+    if not text:
+        return (f"{SPEC_HEADING} — {ref}\n  (no spec section in the packet: the named "
+                f"section did not resolve in that document)")
+    body = text[:chars]
+    if len(text) > chars:
+        body += (f"\n[spec section truncated — {len(body):,} of {len(text):,} chars; "
+                 f"full section: {ref}]")
+    return f"{SPEC_HEADING} — {ref}\n{SPEC_INTRO}\n{body}"
+
+
 def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any],
                      siblings: list[dict[str, Any]], *, early: bool = False,
-                     record: str = "") -> str:
+                     record: str = "", spec: dict[str, str] | None = None,
+                     spec_chars: int = DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS) -> str:
     """What the reviewer reads. One assumption, quoted; the rest listed, not ruled on.
 
     The siblings are here because an assumption is sometimes only defensible given
@@ -1614,6 +1653,10 @@ def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any
     `record` is what has already been decided on this order (`decision_record`), last of
     the context blocks and the one whose absence produced the escalations in #832. It
     defaults to `""` so a caller not yet teaching one is merely unaware, never wrong.
+
+    `spec` is `specs.spec_of`'s row, rendered by `_spec_block` under the work order it
+    qualifies: the authority an assumption means when it says "per the spec", whose
+    absence from this packet produced the `evidence-insufficient` escalations in #1035.
     """
     n = assumption.get("n")
     others = "\n".join(sibling_line(s) for s in siblings
@@ -1638,13 +1681,15 @@ def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any
         "Answer with `escalate`, `verdict` (`approve` to accept it, `deny` to send it to "
         "the user), `stakes` (`routine` or `high`) and a one-line `reason`.")
     answers += (" When the decision record above settles it, say which id in `reason` "
-                "instead of escalating to ask for it again.")
+                "instead of escalating to ask for it again; when the spec section does, "
+                "cite the section.")
     return "\n\n".join([
         f"ASSUMPTION REVIEW — rule on assumption #{n} of {wo['id']} in {project}, and on "
         f"nothing else.",
         f"# The assumption\n{assumption.get('content') or '(empty)'}",
         f"# The work order it was recorded against\n{wo.get('title') or '(untitled)'}\n"
         f"{(wo.get('description') or '')[:2000]}",
+        _spec_block(spec, spec_chars),
         delivered,
         f"# The work order's other assumptions, for context only — do not rule on these\n"
         f"{others}",
@@ -1861,7 +1906,8 @@ def _what_changed(ev: ConfirmEvidence) -> str:
 
 def _confirm_question(project: str, wo: dict[str, Any], assumption: dict[str, Any],
                       siblings: list[dict[str, Any]], ev: ConfirmEvidence,
-                      record: str = "") -> str:
+                      record: str = "", spec: dict[str, str] | None = None,
+                      spec_chars: int = DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS) -> str:
     """What the reviewer reads at DELIVERY. Everything the early pass could not have.
 
     Each block earns its place, and the two new ones are the whole point of the second
@@ -1880,7 +1926,9 @@ def _confirm_question(project: str, wo: dict[str, Any], assumption: dict[str, An
       reaches here.
 
     The rest mirrors `_ruling_question` deliberately: the assumption quoted, the work
-    order's title and description, and the siblings through `sibling_line` — the
+    order's title and description, its `_spec_block` — the same authority, under the same
+    work order, because #1035 is about the reviewer and not about the pass asking — and
+    the siblings through `sibling_line` — the
     high-stakes net applies to the context list here exactly as it does there, because
     the net is about text reaching a model, not about which pass is asking.
 
@@ -1902,6 +1950,7 @@ def _confirm_question(project: str, wo: dict[str, Any], assumption: dict[str, An
         f"That reading had NO diff and NO result summary in front of it. You do.",
         f"# The work order it was recorded against\n{wo.get('title') or '(untitled)'}\n"
         f"{(wo.get('description') or '')[:CONFIRM_DESCRIPTION_CHARS]}",
+        _spec_block(spec, spec_chars),
         f"# What the worker says it delivered\n"
         f"{(wo.get('result_summary') or '(nothing recorded)')[:CONFIRM_SUMMARY_CHARS]}",
         _what_changed(ev),
@@ -1914,7 +1963,7 @@ def _confirm_question(project: str, wo: dict[str, Any], assumption: dict[str, An
         "Answer with `escalate`, `verdict` (`approve` to confirm it, `deny` to send it "
         "to the user), `stakes` (`routine` or `high`) and a one-line `reason`. When the "
         "decision record above settles it, say which id in `reason` instead of "
-        "escalating to ask for it again.",
+        "escalating to ask for it again; when the spec section does, cite the section.",
     ])
 
 
@@ -1923,6 +1972,13 @@ def _record_chars(cfg: Any) -> int:
     `cfg` — the pure tests and every other caller that has no catalog in hand."""
     return int(getattr(cfg, "decision_record_chars",
                        DEFAULT_VALIDATION_DECISION_RECORD_CHARS))
+
+
+def _spec_chars(cfg: Any) -> int:
+    """This project's `validation.assumption_spec_chars`, or the fleet default with no
+    `cfg` — `_record_chars`'s mirror, for the same callers."""
+    return int(getattr(cfg, "assumption_spec_chars",
+                       DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS))
 
 
 def propose_confirmation(store: Any, neo: Any, project: str, wo: dict[str, Any],
@@ -1950,7 +2006,10 @@ def propose_confirmation(store: Any, neo: Any, project: str, wo: dict[str, Any],
                                          evidence or ConfirmEvidence(),
                                          decision_record(
                                              store, neo, wo["id"], siblings, assumption,
-                                             chars=_record_chars(cfg))),
+                                             chars=_record_chars(cfg)),
+                                         # GitHub issue #1035.
+                                         spec=specs.spec_of(store, wo),
+                                         spec_chars=_spec_chars(cfg)),
                        context=f"{wo.get('title') or ''}\n"
                                f"{(wo.get('description') or '')[:800]}",
                        kind=QUESTION_KIND)
@@ -1987,7 +2046,10 @@ def propose(store: Any, neo: Any, project: str, wo: dict[str, Any],
                            project, wo, assumption, siblings, early=early,
                            record=decision_record(store, neo, wo["id"], siblings,
                                                   assumption,
-                                                  chars=_record_chars(cfg))),
+                                                  chars=_record_chars(cfg)),
+                           # GitHub issue #1035: resolved here, so no caller changes.
+                           spec=specs.spec_of(store, wo),
+                           spec_chars=_spec_chars(cfg)),
                        context=f"{wo.get('title') or ''}\n"
                                f"{(wo.get('description') or '')[:800]}",
                        kind=QUESTION_KIND)
