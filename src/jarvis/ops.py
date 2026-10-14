@@ -77,6 +77,7 @@ from .project_store import (
     TERMINAL_STATUSES,
     WO_STATUSES,
     ProjectStore,
+    claim_sql_selects,
     feature_status_label,
     is_feature_order_id,
     validation_standing,
@@ -16405,7 +16406,9 @@ class _Pass:
     """One candidate actor: the pass, its sentence, and the predicate that decides."""
 
     pass_name: str
-    why: str
+    # A CALLABLE when the sentence depends on the row — `pending`'s does, because a
+    # delayed turn is still this actor and the delay rides in `Actor.why`.
+    why: str | Callable[..., str]
     predicate: str
     test: Callable[..., Any]
 
@@ -16418,6 +16421,19 @@ class ActorPasses:
     none_because: str = ""
 
 
+def _pending_why(store: ProjectStore, wo: dict[str, Any],
+                 now: float | None = None) -> str:
+    """`pending`'s sentence, composed from the claim SQL's own reader.
+
+    A second single-row read after `claim_sql_selects`' — paid only on the status whose
+    answer carries a delay, and only once the predicate has already said yes.
+    """
+    delay = store.why_not_claimable(wo)
+    if delay is None:
+        return "`Daemon.dispatch_pending`'s claim SQL would take this row now"
+    return f"`Daemon.dispatch_pending` owns this row and its turn is later: {delay}"
+
+
 #: Keyed in `OPEN_STATUSES` order, and NO FALLTHROUGH: `scheduled_actor` indexes this
 #: dict, so a status missing from it raises KeyError — which is what makes a new
 #: `OPEN_STATUSES` member fail the pin the day it ships, the way `stuck.assess`'s
@@ -16425,11 +16441,10 @@ class ActorPasses:
 #: `tests/test_catalog.py::test_every_open_status_has_a_threshold`.
 #: Candidates are ordered cheapest-predicate-first.
 SCHEDULED_ACTORS: dict[str, ActorPasses] = {
-    # THE ONE TEMPORARY ENTRY. `pending`'s actor is the claim SQL
-    # (`ProjectStore.claim_next_pending`) and lands with section 4 of the spec.
-    "pending": ActorPasses(none_because=(
-        "section 4 owns `pending` — its actor is `dispatch_pending`'s claim SQL, "
-        "which this section deliberately does not touch")),
+    "pending": ActorPasses((
+        _Pass("Daemon.dispatch_pending", _pending_why,
+              "project_store.claim_sql_selects", claim_sql_selects),
+    )),
     "dispatching": ActorPasses((
         _Pass("Daemon.settle_turns",
               "the claim is inside its grace or a turn is already on record, so the "
@@ -16519,5 +16534,7 @@ def scheduled_actor(store: ProjectStore, wo: dict[str, Any],
     """
     for p in SCHEDULED_ACTORS[wo["status"]].passes:
         if p.test(store, wo, now=now):
-            return Actor(pass_name=p.pass_name, why=p.why, predicate=p.predicate)
+            return Actor(pass_name=p.pass_name,
+                         why=p.why(store, wo, now=now) if callable(p.why) else p.why,
+                         predicate=p.predicate)
     return None
