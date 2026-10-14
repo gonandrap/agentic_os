@@ -1039,6 +1039,45 @@ NO_TRIGGER_REFUSAL = (
     "order the investigation was filed from."
 )
 
+#: The refusal when a fix order NAMES a triggering order this project's records do not
+#: have. SAME SHAPE AS `NO_TRIGGER_REFUSAL` AND FOR THE SAME REASON (§7.2 of
+#: docs/superpowers/specs/2026-09-27-self-evolution.md): the id came from the submitter's
+#: own `--trigger-wo-id`, so it is INPUT, not a record the OS lost — treating it as
+#: unreadable passed checks 3 and 4 unevaluated and let any fix order skip the dry run by
+#: naming an id that does not exist. It names the id AND the argument, because a refusal
+#: that says "name it explicitly" without saying HOW is the dead end kn-85265170 is about.
+TRIGGER_MISSING_REFUSAL = (
+    "gap_class '{gap}' names triggering order '{missing}' through `--trigger-wo-id`, and "
+    "this project's records do not have it. That id is the submitter's own input, not a "
+    "record the OS lost, so this is a REFUSAL and not an unreadable record: nothing has "
+    "shown the detector fires, because there is no order to fire it against. Re-file with "
+    "`jarvis wo create --trigger-wo-id <wo-id>`, naming an order this project has."
+)
+
+
+def note_unproven(sink: list[str] | None, note: str) -> None:
+    """Record one check that PASSED WITHOUT BEING EVALUATED, for the packet to state.
+
+    kn-b7deec8f's third state, now that it HAS a channel: this function is it. The gate's
+    return type is still "a refusal's words or None" — the shape `evidence.nothing_to_judge`
+    and `automerge.decide` share and house law — so the note rides out through a sink the
+    caller owns instead of widening it (§7.2, and §7.3 for where the note is rendered).
+
+    APPENDED ONLY ON AN ARM THAT THEN PASSES. A candidate that goes on to refuse must
+    leave nothing behind, or a refusal would carry notes about checks nobody skipped.
+    """
+    if sink is not None:
+        sink.append(note)
+
+
+def _check_4_note(remedy_row: Mapping[str, Any], primitive: str, why: str) -> str:
+    """One sentence for check 4 passed unevaluated, shared by both arms that can produce
+    it here. `ops.fix_order_precheck`'s injected closure writes the same SHAPE from the
+    other side of the seam — it holds the primitive and the subject, never the row — so a
+    seat reads one spelling of "check 4 was not run" whichever path skipped it."""
+    return (f"check 4, that remedy rule '{remedy_row.get('id') or ''}'s `{primitive}` "
+            f"can actually run against the triggering order, was not run: {why}.")
+
 # Stage numbers, and the LARGEST wins when several detectors each fail differently. A
 # refusal from a later stage has got further into §7.2's four steps and therefore names
 # something more specific: "`dt-match` did not fire on wo-7" is actionable where "no
@@ -1060,6 +1099,8 @@ def precheck(
     *,
     precondition: Callable[[str, Mapping[str, Any]], str] | None = None,
     trigger_unreadable: str = "",
+    trigger_missing: str = "",
+    unproven: list[str] | None = None,
 ) -> str | None:
     """Why this fix order may NOT be submitted for validation yet, or `None`. PURE.
 
@@ -1105,6 +1146,19 @@ def precheck(
     an unproven rule past the gate. Checks 1 and 2 still run in the unreadable case: they
     need no facts, and existence is decided here or it is decided by a seat, which §7.3
     forbids.
+
+    **`trigger_missing` IS THE THIRD OF THOSE STATES AND IT REFUSES**, in
+    `TRIGGER_MISSING_REFUSAL`'s words: the order NAMED a `--trigger-wo-id` the records do
+    not have. That id is the submitter's own input, so calling it unreadable was the round-2
+    defect — checks 3 and 4 passed unevaluated and any fix order could skip the dry run by
+    naming an id that does not exist. It refuses at `_STAGE_NO_MATCH`, exactly where check
+    3 would have run, so the deepest-stage precedence is unchanged and a missing detector
+    still beats it.
+
+    `unproven` is a SINK, not a return value: one sentence per check that passed WITHOUT
+    being evaluated — the unreadable trigger, a primitive that declares no `can_apply`, no
+    precondition injected at all — appended only on an arm that then passes. See
+    `note_unproven`, and §7.3 for the paragraph the packet renders them into.
 
     An empty `gap_class` returns `None` immediately — §7.1's ordinary order, which is
     almost every order, gets no pre-check at all.
@@ -1170,8 +1224,18 @@ def precheck(
                 for r in candidates))
             continue
 
+        if trigger_missing:
+            # NAMED AND NOT THERE: the submitter's own input, so a refusal (§7.2). HERE,
+            # where check 3 would have run, so the stage precedence above is untouched.
+            refuse(_STAGE_NO_MATCH,
+                   TRIGGER_MISSING_REFUSAL.format(gap=gap, missing=trigger_missing))
+            continue
         if trigger_unreadable:
             # Checks 1 and 2 passed and check 3 cannot be run: UNREADABLE, not a refusal.
+            note_unproven(unproven,
+                      f"check 3, that detector '{det_id}'s condition actually fires on "
+                      f"the triggering order's recorded state, was not run: "
+                      f"{trigger_unreadable}.")
             return None
         if trigger_facts is None:
             refuse(_STAGE_NO_MATCH, NO_TRIGGER_REFUSAL.format(gap=gap))
@@ -1192,7 +1256,18 @@ def precheck(
                 except ValueError:
                     params = {}
             sentence: str | None = None
-            if precondition is not None and _declares_can_apply(primitive):
+            if precondition is None:
+                # (iv) Nothing was injected to ask — `resolve`'s storeless callers and
+                # every unit test. Check 4 passes unevaluated and SAYS SO.
+                note_unproven(unproven, _check_4_note(
+                    remedy_row, primitive,
+                    "this caller injected no `can_apply` seam, so nothing could answer"))
+            elif not _declares_can_apply(primitive):
+                # (iii) The primitive declares none — the other half of kn-b7deec8f.
+                note_unproven(unproven, _check_4_note(
+                    remedy_row, primitive,
+                    f"primitive '{primitive}' declares no `can_apply`"))
+            else:
                 sentence = precondition(primitive, params)
             if sentence:
                 # VERBATIM. The precondition already wrote the sentence a reviewer reads

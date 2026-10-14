@@ -158,6 +158,107 @@ def test_an_unreadable_trigger_does_not_excuse_a_missing_detector():
     assert out and "stale-hold" in out
 
 
+# -- a NAMED trigger the records do not have: the submitter's own input ------------------
+
+
+def test_a_named_trigger_the_records_do_not_have_is_refused_in_the_constants_own_words():
+    """The round-2 defect: a made-up `--trigger-wo-id` used to pass checks 3 and 4
+    unevaluated, so any fix order could skip the dry run by naming an id that does not
+    exist. The id came from the submitter, so it is INPUT and it refuses."""
+    out = rules.precheck([MATCHING], rows(), FIX_ORDER, None,
+                         trigger_missing="wo-does-not-exist")
+    assert out == (
+        "gap_class 'stale-hold' names triggering order 'wo-does-not-exist' through "
+        "`--trigger-wo-id`, and this project's records do not have it. That id is the "
+        "submitter's own input, not a record the OS lost, so this is a REFUSAL and not "
+        "an unreadable record: nothing has shown the detector fires, because there is no "
+        "order to fire it against. Re-file with `jarvis wo create --trigger-wo-id "
+        "<wo-id>`, naming an order this project has.")
+
+
+def test_a_missing_detector_still_beats_a_missing_trigger():
+    """Deepest-stage precedence is unchanged: check 1 refuses before check 3 is reached,
+    so the submitter is told about the detector it never registered."""
+    out = rules.precheck([], rows(), FIX_ORDER, None,
+                         trigger_missing="wo-does-not-exist")
+    assert out and "stale-hold" in out and "--detector-id" in out
+    assert "wo-does-not-exist" not in out
+
+
+def test_a_missing_trigger_leaves_no_unproven_note():
+    """A candidate that REFUSES may not leave a note: the notes describe checks that
+    passed unevaluated, and a refusal has not passed anything."""
+    notes: list[str] = []
+    assert rules.precheck([MATCHING], rows(), FIX_ORDER, None,
+                          trigger_missing="wo-gone", unproven=notes) is not None
+    assert notes == []
+
+
+# -- deepest-stage precedence (recorded assumption 2) -----------------------------------
+
+
+def test_the_deepest_refusal_wins_when_detectors_fail_at_different_stages():
+    no_remedy = {**MATCHING, "id": "dt-no-remedy"}
+    out = rules.precheck([no_remedy, MATCHING], rows(), FIX_ORDER,
+                         facts(status="pending"))
+    assert out and "dt-match" in out and "did not match because" in out
+    assert "dt-no-remedy" not in out, "a stage-3 refusal beat a stage-5 one"
+
+
+def test_an_unparseable_detector_loses_to_a_specific_no_match():
+    out = rules.precheck([UNPARSEABLE, MATCHING],
+                         {**rows(), "dt-broken": [{"id": "rr-2", "primitive": "nudge"}]},
+                         FIX_ORDER, facts(status="pending"))
+    assert out and "dt-match" in out and "did not match because" in out
+    assert "dt-broken" not in out
+
+
+# -- the notes: a check that PASSED UNEVALUATED is recorded -----------------------------
+
+
+def test_an_unreadable_trigger_leaves_a_note_naming_check_3():
+    notes: list[str] = []
+    assert rules.precheck([MATCHING], rows(), FIX_ORDER, None,
+                          trigger_unreadable="its recorded state could not be read",
+                          unproven=notes) is None
+    [note] = notes
+    assert note.startswith("check 3")
+    assert "dt-match" in note and "its recorded state could not be read" in note
+
+
+def test_an_undeterminable_precondition_leaves_a_note_naming_check_4():
+    """(iv) no precondition injected at all, and (iii) the primitive declares none."""
+    notes: list[str] = []
+    assert rules.precheck([MATCHING], rows(), FIX_ORDER, facts(status="running"),
+                          unproven=notes) is None
+    [note] = notes
+    assert note.startswith("check 4") and "nudge" in note
+
+    declares_none: list[str] = []
+    import dataclasses
+
+    from jarvis import remedies
+    patched = dict(remedies.REMEDIES)
+    patched["nudge"] = dataclasses.replace(patched["nudge"], can_apply=None)
+    original, remedies.REMEDIES = remedies.REMEDIES, patched
+    try:
+        assert rules.precheck([MATCHING], rows(), FIX_ORDER, facts(status="running"),
+                              precondition=lambda primitive, params: "",
+                              unproven=declares_none) is None
+    finally:
+        remedies.REMEDIES = original
+    [note] = declares_none
+    assert note.startswith("check 4") and "can_apply" in note
+
+
+def test_a_passing_precondition_leaves_no_note():
+    notes: list[str] = []
+    assert rules.precheck([MATCHING], rows(), FIX_ORDER, facts(status="running"),
+                          precondition=lambda primitive, params: "",
+                          unproven=notes) is None
+    assert notes == []
+
+
 # -- purity -----------------------------------------------------------------------------
 
 

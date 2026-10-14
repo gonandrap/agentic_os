@@ -5623,8 +5623,12 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
     # is no submitter to send the refusal back to. The same exemption the bounce below
     # already has, and for the same reason. The daemon site has NO exemption: there the
     # round already exists, so the refusal can be delivered through `_reject`.
+    # The sink: checks the pre-check PASSED WITHOUT EVALUATING, carried into the packet so
+    # the checklist does not claim they were decided mechanically (§7.3). Stays empty on
+    # every forced submission, which skips the check entirely.
+    unproven: list[str] = []
     if not (forced_reason.strip() or uncounted):
-        refusal = fix_order_precheck(store, project_path, wo)
+        refusal = fix_order_precheck(store, project_path, wo, unproven=unproven)
         if refusal is not None:
             _precheck_refused(store, wo, refusal,
                               store.numbered_validation_rounds(wo_id=wo["id"]) + 1)
@@ -5654,7 +5658,8 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
         project_path, wo, declared=declared, diff_chars=cfg.diff_chars,
         spec=specs.spec_of(store, wo), side_effects=side_effects_of(store, str(wo["id"])),
         # The store read is the caller's: `evidence` may not touch a database (spec §4).
-        assumptions=store.all_assumptions(wo["id"]))
+        assumptions=store.all_assumptions(wo["id"]),
+        unproven=tuple(unproven))
     # The NUMBER, not the budget position: a rebind spends one without spending the
     # other (spec 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.1).
     nxt = store.numbered_validation_rounds(wo_id=wo["id"]) + 1
@@ -5731,8 +5736,24 @@ def _bounce(store: ProjectStore, wo: dict[str, Any], previous: dict[str, Any],
                                                paths=", ".join(cited))))
 
 
+#: Check 4 passed unevaluated, from THIS side of the seam — the closure holds the
+#: primitive and the subject, never the remedy row, so the sentence names what it has.
+#: `rules._check_4_note` is the same shape from the other side; one spelling, two homes
+#: because neither module may import the other's locals (§7.3).
+_CHECK_4_NOT_RUN = ("check 4, that `{primitive}` can actually run against the triggering "
+                    "order, was not run: {why}.")
+
+#: The whole pre-check failed, so NONE of §7.2's four checks ran. The outer `except` arm's
+#: note: the submission goes through (the pinned kn-b7deec8f ruling) and the packet says
+#: nothing mechanical stands behind it, instead of claiming all four were decided.
+_PRECHECK_NOT_RUN = ("checks 1-4, the whole mechanical pre-check of this fix order's "
+                     "detector and remedy, were not run: the pre-check itself could not "
+                     "be completed ({why}).")
+
+
 def fix_order_precheck(store: ProjectStore, project_path: Path, wo: Mapping[str, Any],
-                       *, central: Any = None) -> str | None:
+                       *, central: Any = None,
+                       unproven: list[str] | None = None) -> str | None:
     """Why this FIX ORDER may not be judged yet, in `rules.precheck`'s words, or None.
 
     §7.2 of docs/superpowers/specs/2026-09-27-self-evolution.md. `rules.precheck` is
@@ -5756,6 +5777,13 @@ def fix_order_precheck(store: ProjectStore, project_path: Path, wo: Mapping[str,
     panel, which is the direction that leaves the subject alone: refusing an order
     because the OS could not run its own check would charge a submitter for the OS's
     outage, and the check stays retryable on the next submission.
+
+    **EVERY SUCH PASS-THROUGH NOW LEAVES A NOTE IN `unproven`** (§7.3): one sentence per
+    check that passed without being evaluated, which the packet renders so a seat is told
+    the OS could not decide it rather than told it was all decided mechanically. The
+    hidden skip is what round 2 of this feature's own panel caught. A failure that is the
+    SUBMITTER'S INPUT is not in here at all — a `--trigger-wo-id` naming no order refuses,
+    in `rules.TRIGGER_MISSING_REFUSAL`'s words.
     """
     # `rules` is imported at module level; `remedies` is not, and this is the only
     # reader of it here.
@@ -5765,8 +5793,11 @@ def fix_order_precheck(store: ProjectStore, project_path: Path, wo: Mapping[str,
     if not str(row.get("gap_class") or "").strip():
         return None
     own = central is None
-    central = CentralStore() if own else central
     try:
+        # INSIDE the try: a `CentralStore()` that cannot be opened is the same unreadable
+        # input as a row that cannot be read, and raising out of here would turn the
+        # pass-through this whole docstring describes into a crashed submission.
+        central = CentralStore() if own else central
         project = central.project_name_for_path(project_path)
         detectors = central.detectors_for_gap(str(row["gap_class"]).strip(), project)
         # The canonical shape `rules._rows_for` wants: detector id -> rows, which costs
@@ -5774,7 +5805,7 @@ def fix_order_precheck(store: ProjectStore, project_path: Path, wo: Mapping[str,
         remedy_rules = {str(d.get("id") or ""):
                         central.remedy_rules_for(str(d.get("id") or ""))
                         for d in detectors}
-        trigger, unreadable = _triggering_order(store, row)
+        trigger, unreadable, missing = _triggering_order(store, row)
         trigger_facts = None
         if trigger is not None:
             try:
@@ -5788,25 +5819,29 @@ def fix_order_precheck(store: ProjectStore, project_path: Path, wo: Mapping[str,
             """Check 4's seam: `remedies.REMEDIES[primitive].can_apply` against the
             SAME subject the condition was evaluated on.
 
-            **THIS SEAM'S TYPE IS `str` AND IT HAS NO THIRD CHANNEL.** `rules.precheck`
-            branches on `if sentence:`, so the only two things this can say are "a
-            sentence, refuse" and "anything falsy, proceed". Both arms below are cases
-            where NOBODY COULD ANSWER, and both therefore PASS check 4 rather than
-            answer it — the order reaches the panel with check 4 never actually
-            evaluated.
+            **THIS SEAM'S RETURN TYPE IS `str` AND IT STILL HAS NO THIRD CHANNEL.**
+            `rules.precheck` branches on `if sentence:`, so the only two things this can
+            RETURN are "a sentence, refuse" and "anything falsy, proceed". Both arms
+            below are cases where NOBODY COULD ANSWER, and both therefore PASS check 4
+            rather than answer it — the pinned never-fabricate-a-default-answer-from-a-
+            failure direction, because the alternative is refusing a submitter for the
+            OS's own outage.
 
-            That is the pinned never-fabricate-a-default-answer-from-a-failure ruling's
-            direction, in the only form this signature allows: the alternative is
-            refusing a submitter for the OS's own outage. kn-b7deec8f is why a genuine
-            THIRD state — "not determinable", neither `""` nor a refusal — would be the
-            right shape if the seam had one, and `rules.precheck`'s docstring records
-            the same thing from the other side, where a primitive declaring no
-            `can_apply` leaves check 4 unanswered for the packet to state.
+            **THE THIRD CHANNEL IS `unproven`, AND IT IS WHAT kn-b7deec8f ASKED FOR**:
+            the "not determinable" state neither `""` nor a refusal can carry is now
+            RECORDED out of band and rendered in the packet (§7.3), instead of the order
+            reaching the panel with check 4 silently unevaluated. The return shape is
+            unchanged on purpose — a gate returns a reason or nothing, which is house law
+            (`evidence.nothing_to_judge`, `automerge.decide`).
             """
             remedy = remedies_mod.REMEDIES.get(primitive)
             if remedy is None or trigger is None:
                 # No registry entry to ask, or no subject to ask it about. Nothing
-                # computed an answer, so check 4 is passed unevaluated — see above.
+                # computed an answer, so check 4 is passed unevaluated — and says so.
+                rules.note_unproven(unproven, _CHECK_4_NOT_RUN.format(
+                    primitive=primitive,
+                    why=("there is no registry entry for that primitive, or no "
+                         "triggering order to ask it about")))
                 return ""
             try:
                 return str(remedy.can_apply(store, dict(trigger),
@@ -5817,23 +5852,33 @@ def fix_order_precheck(store: ProjectStore, project_path: Path, wo: Mapping[str,
                 # built on an exception would charge the submitter for the OS's fault.
                 log.warning("the `can_apply` of %s raised on %s: %s",
                             primitive, trigger.get("id"), exc)
+                rules.note_unproven(unproven, _CHECK_4_NOT_RUN.format(
+                    primitive=primitive,
+                    why=f"its `can_apply` raised against "
+                        f"{trigger.get('id')} ({exc})"))
                 return ""
 
         return rules.precheck(detectors, remedy_rules, row, trigger_facts,
                               precondition=precondition,
-                              trigger_unreadable=unreadable)
-    except Exception:  # noqa: BLE001 — the pinned ruling again: UNREADABLE, not refused
+                              trigger_unreadable=unreadable,
+                              trigger_missing=missing,
+                              unproven=unproven)
+    except Exception as exc:  # noqa: BLE001 — the pinned ruling again: UNREADABLE, not
+        # refused. The note is what stops the packet claiming four checks nobody ran.
         log.exception("the self-evolution pre-check on %s could not be run",
                       row.get("id"))
+        rules.note_unproven(unproven, _PRECHECK_NOT_RUN.format(why=exc))
         return None
     finally:
-        if own:
+        if own and central is not None:
             central.close()
 
 
-def _triggering_order(store: ProjectStore,
-                      wo: Mapping[str, Any]) -> tuple[dict[str, Any] | None, str]:
-    """The order this fix order's rule is proved against, and why it is UNREADABLE.
+def _triggering_order(
+        store: ProjectStore,
+        wo: Mapping[str, Any]) -> tuple[dict[str, Any] | None, str, str]:
+    """The order this fix order's rule is proved against, why it is UNREADABLE, and the
+    id it named that the records do not have.
 
     THE COLUMN FIRST, THE CHAIN SECOND (§7.2). `trigger_wo_id` set is the whole answer
     and nothing infers over it: the submitter said which order this rule is proved
@@ -5842,22 +5887,36 @@ def _triggering_order(store: ProjectStore,
     order in THIS project — and that fallback exists for the fix order filed by hand, or
     filed before the column shipped; it is a convenience and never the contract.
 
-    `("", None)` — nothing named and nothing inferred — is the REFUSAL case and is the
+    `(None, "", "")` — nothing named and nothing inferred — is the REFUSAL case and is the
     caller's to spell: `rules.precheck` refuses on `trigger_facts=None` with an empty
-    `trigger_unreadable`. A named order that cannot be READ returns the reason instead,
-    and the submission goes through to the panel with the packet saying so.
+    `trigger_unreadable`. A named order that cannot be READ returns the reason in the
+    second slot, and the submission goes through to the panel with the packet saying so.
+
+    **A NAMED ID THE RECORDS DO NOT HAVE IS THE THIRD SLOT, NOT THE SECOND.** It used to
+    come back as unreadable, which passed checks 3 and 4 unevaluated: a fix order could
+    skip the dry run entirely by naming an id that does not exist. The id came out of the
+    submitter's own `--trigger-wo-id`, so it is INPUT and `rules.precheck` refuses on it
+    (`TRIGGER_MISSING_REFUSAL`). A `KeyError` is that case and nothing else; ANY OTHER
+    exception from the same read is a genuine store failure and stays unreadable. The
+    inferred-chain fallback never produces a missing id — nothing the submitter typed can
+    be wrong there.
     """
     named = str(wo.get("trigger_wo_id") or "").strip()
     if named:
         try:
-            return store.get_work_order(named), ""
+            return store.get_work_order(named), "", ""
         except KeyError:
-            return None, (f"the triggering order {named} is not in this project's "
-                          f"records — deleted, or in another project")
+            return None, "", named
+        except Exception as exc:  # noqa: BLE001 — the store could not answer at all:
+            # UNREADABLE, the pinned kn-b7deec8f direction, and NOT the refusal above.
+            log.warning("the triggering order %s named by %s could not be read: %s",
+                        named, wo.get("id"), exc)
+            return None, (f"the triggering order {named} could not be read from this "
+                          f"project's records ({exc})"), ""
     metadata = db.from_json(wo.get("metadata"), {}) or {}
     io_id = str(metadata.get(ORIGIN_IO_KEY) or "")
     if not io_id:
-        return None, ""
+        return None, "", ""
     try:
         _name, _path, io = find_feature_order(io_id, None)
         refs = evidence_refs(io)
@@ -5865,13 +5924,13 @@ def _triggering_order(store: ProjectStore,
         # fact about the OS's records, not an error: the refusal below says so.
         log.warning("the improvement order %s behind %s could not be read: %s",
                     io_id, wo.get("id"), exc)
-        return None, ""
+        return None, "", ""
     for ref in refs:
         try:
-            return store.get_work_order(str(ref)), ""
+            return store.get_work_order(str(ref)), "", ""
         except KeyError:
             continue
-    return None, ""
+    return None, "", ""
 
 
 def _precheck_refused(store: ProjectStore, wo: Mapping[str, Any], reason: str,

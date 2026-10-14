@@ -383,6 +383,18 @@ def test_a_fix_orders_ids_join_the_hash_and_the_injected_prose_does_not():
     assert evidence.fingerprint(reworded) == evidence.fingerprint(base)
 
 
+def test_the_unproven_notes_do_not_move_the_fingerprint():
+    """Same row of the exclusion table as `self_evolution`: the OS wrote the notes, the
+    submitter did not, and they are regenerated every round."""
+    base = _ordinary_packet(gap_class="g", detector_id="dt-1", remedy_rule_id="rm-1",
+                            trigger_wo_id="wo-t", self_evolution="rendered checklist")
+    noted = _ordinary_packet(
+        gap_class="g", detector_id="dt-1", remedy_rule_id="rm-1", trigger_wo_id="wo-t",
+        self_evolution="rendered checklist",
+        self_evolution_unproven=("check 4 was not run: the predicate raised",))
+    assert evidence.fingerprint(noted) == evidence.fingerprint(base)
+
+
 # -- the daemon site: a forced round is NOT exempt, and it spends the round --------------
 
 
@@ -415,6 +427,177 @@ def test_a_forced_round_whose_precheck_fails_is_rejected_without_paying_a_seat(f
     assert "nothing-registered" in str(judged["reason"])
     reason = envelope(fleet, wo["id"])["payload"]["reason"]
     assert "HAS been spent" in reason
+
+
+# -- a named trigger the records do not have: INPUT, so it refuses ----------------------
+
+
+def test_a_trigger_wo_id_that_names_no_order_is_refused_before_the_panel(fleet):
+    """THE ROUND-2 DEFECT, end to end: a made-up `--trigger-wo-id` used to read as
+    UNREADABLE, which passes checks 3 and 4 unevaluated — so a fix order could skip the
+    dry run by naming an id that does not exist, with a detector that would never fire."""
+    det, rid = register("never-fires-either",
+                        {"field": "status", "op": "eq", "value": "cancelled"},
+                        primitive="nudge", params={"what": "say something"})
+    wo_id, v = submit_fix_order(fleet, gap_class="never-fires-either", detector_id=det,
+                                remedy_rule_id=rid, trigger_wo_id="wo-does-not-exist")
+    fleet.drain()
+
+    assert v.calls == [], "a fix order skipped the dry run by naming a made-up order"
+    reason = refusal_reason(fleet, wo_id)
+    assert "wo-does-not-exist" in reason and "--trigger-wo-id" in reason
+
+
+# -- a check that passed UNEVALUATED is in the packet the seats read --------------------
+
+
+#: The claim the checklist drops when a check went unevaluated. Matched
+#: WITHIN one line: the rendered paragraph wraps between "were" and "all".
+MECHANICAL = "all decided mechanically"
+
+
+def test_a_trigger_whose_facts_cannot_be_built_reaches_the_panel_saying_check_3_was_not_run(
+        fleet, monkeypatch):
+    """A GENUINE read failure, which is the pass-through this feature keeps: the panel
+    judges, and the checklist says check 3 was never evaluated instead of claiming it."""
+    trigger = trigger_order(fleet, status="needs_review")
+    det, rid = register("facts-unreadable",
+                        {"field": "status", "op": "eq", "value": "needs_review"},
+                        primitive="nudge", params={"what": "say something"})
+    real = rules.facts
+
+    def boom(store, wo, **kw):
+        if str(wo.get("id")) == trigger["id"]:
+            raise RuntimeError("the state rows could not be read")
+        return real(store, wo, **kw)
+
+    monkeypatch.setattr(rules, "facts", boom)
+    wo_id, v = submit_fix_order(fleet, gap_class="facts-unreadable", detector_id=det,
+                                remedy_rule_id=rid, trigger_wo_id=trigger["id"])
+    fleet.drain()
+
+    assert len(v.calls) == 1, f"an unreadable trigger was refused: {why_refused(fleet, wo_id)}"
+    checklist = v.calls[0]["packet"].self_evolution
+    assert MECHANICAL not in checklist, (
+        f"the packet claimed a check that never ran: "
+        f"{v.calls[0]['packet'].self_evolution_unproven}")
+    assert "check 3" in checklist and "the state rows could not be read" in checklist
+    assert "YOURS TO RAISE" in checklist
+
+
+def test_a_can_apply_that_raises_reaches_the_panel_saying_check_4_was_not_run(
+        fleet, monkeypatch):
+    import dataclasses
+
+    trigger = trigger_order(fleet, status="needs_review")
+    det, rid = register("can-apply-raises",
+                        {"field": "status", "op": "eq", "value": "needs_review"},
+                        primitive="nudge", params={"what": "say something"})
+
+    def boom(store, subject, params):
+        raise RuntimeError("the predicate itself failed")
+
+    monkeypatch.setitem(remedies.REMEDIES, "nudge",
+                        dataclasses.replace(remedies.REMEDIES["nudge"], can_apply=boom))
+    wo_id, v = submit_fix_order(fleet, gap_class="can-apply-raises", detector_id=det,
+                                remedy_rule_id=rid, trigger_wo_id=trigger["id"])
+    fleet.drain()
+
+    assert len(v.calls) == 1, f"a raising predicate refused: {why_refused(fleet, wo_id)}"
+    checklist = v.calls[0]["packet"].self_evolution
+    assert MECHANICAL not in checklist
+    assert "check 4" in checklist and "the predicate itself failed" in checklist
+
+
+def test_a_fully_decided_fix_order_still_claims_every_check_mechanically(fleet):
+    """The pairing: without it, "the claim is absent" proves nothing about the split."""
+    trigger = trigger_order(fleet, status="needs_review",
+                            attention="the review could not be satisfied",
+                            ack=(IDLE_NO_FINISH_BLOCKER,))
+    det, rid = register("fully-decided",
+                        {"field": "needs_attention", "op": "eq", "value": True},
+                        primitive="lower_attention")
+    wo_id, v = submit_fix_order(fleet, gap_class="fully-decided", detector_id=det,
+                                remedy_rule_id=rid, trigger_wo_id=trigger["id"])
+    fleet.drain()
+
+    assert len(v.calls) == 1, why_refused(fleet, wo_id)
+    checklist = v.calls[0]["packet"].self_evolution
+    assert MECHANICAL in checklist, v.calls[0]["packet"].self_evolution_unproven
+    assert "YOURS TO RAISE" not in checklist
+
+
+# -- the ops pass-through paths, each of which leaves a note ----------------------------
+
+
+def proved_pair(fleet, gap: str) -> tuple[dict, dict]:
+    """A fix-order row whose checks 1-3 pass, and the trigger it is proved against."""
+    trigger = trigger_order(fleet, status="needs_review")
+    det, rid = register(gap, {"field": "status", "op": "eq", "value": "needs_review"},
+                        primitive="nudge", params={"what": "say something"})
+    return ({"id": "wo-direct", "gap_class": gap, "detector_id": det,
+             "remedy_rule_id": rid, "trigger_wo_id": trigger["id"]}, trigger)
+
+
+def test_a_central_store_that_cannot_be_opened_lets_the_submission_through(fleet):
+    """The pinned ruling (kn-b7deec8f): an unreadable input may not produce a refusal."""
+    row, _ = proved_pair(fleet, "store-unopenable")
+
+    def boom():
+        raise RuntimeError("the registry database is locked")
+
+    store = fleet.store()
+    notes: list[str] = []
+    try:
+        original, ops.CentralStore = ops.CentralStore, boom
+        try:
+            assert ops.fix_order_precheck(store, fleet.project, row,
+                                          unproven=notes) is None
+        finally:
+            ops.CentralStore = original
+    finally:
+        store.close()
+    assert notes and "the registry database is locked" in notes[0]
+
+
+def test_facts_that_cannot_be_built_leave_a_check_3_note(fleet, monkeypatch):
+    row, trigger = proved_pair(fleet, "facts-raise-direct")
+    real = rules.facts
+
+    def boom(store, wo, **kw):
+        if str(wo.get("id")) == trigger["id"]:
+            raise RuntimeError("the state rows could not be read")
+        return real(store, wo, **kw)
+
+    monkeypatch.setattr(rules, "facts", boom)
+    store = fleet.store()
+    notes: list[str] = []
+    try:
+        assert ops.fix_order_precheck(store, fleet.project, row, unproven=notes) is None
+    finally:
+        store.close()
+    [note] = notes
+    assert note.startswith("check 3") and "the state rows could not be read" in note
+
+
+def test_a_precondition_that_raises_leaves_a_check_4_note(fleet, monkeypatch):
+    import dataclasses
+
+    row, _ = proved_pair(fleet, "precondition-raises-direct")
+
+    def boom(store, subject, params):
+        raise RuntimeError("the predicate itself failed")
+
+    monkeypatch.setitem(remedies.REMEDIES, "nudge",
+                        dataclasses.replace(remedies.REMEDIES["nudge"], can_apply=boom))
+    store = fleet.store()
+    notes: list[str] = []
+    try:
+        assert ops.fix_order_precheck(store, fleet.project, row, unproven=notes) is None
+    finally:
+        store.close()
+    [note] = notes
+    assert note.startswith("check 4") and "the predicate itself failed" in note
 
 
 # -- the seam between the registry and the primitives (kn-e3aa04c5) ---------------------

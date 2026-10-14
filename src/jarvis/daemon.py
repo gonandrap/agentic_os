@@ -2730,8 +2730,27 @@ class Daemon:
                 0 if str(round_row["outcome"] or "") in COUNTED_VALIDATION_OUTCOMES
                 else 1)
             goes_back = (rebinds < ops.REBIND_MAX) if as_rebind else (pos < max_rounds)
+            # THE §7.2 PRE-CHECK RUNS HERE AND ACTS LOWER DOWN, and the split is
+            # deliberate: its verdict is needed BEFORE the packet so the checklist can
+            # name the checks it could not run (§7.3), while the refusal must stay in the
+            # band beside `nothing_to_judge` and `_repeat_submission` — moving the act up
+            # would reorder which guard answers a submission that trips two.
+            #
+            # ITS OWN `CentralStore`, for the reason this whole method opens its own
+            # `ProjectStore`: a sqlite connection belongs to the thread that created it,
+            # and `self.central` belongs to the daemon thread.
+            unproven: list[str] = []
+            central = CentralStore()          # thread-local — see the docstring
+            try:
+                refusal = ops.fix_order_precheck(store, project.path, wo,
+                                                 central=central, unproven=unproven)
+            finally:
+                central.close()
             packet = evidence_mod.collect_work_order(
                 project.path, wo, declared=str(round_row["evidence"] or ""),
+                # WHAT THE OS COULD NOT DECIDE ITSELF, so no seat is told all four §7.2
+                # checks were decided mechanically when one of them never ran (§7.3).
+                unproven=tuple(unproven),
                 diff_chars=cfg.diff_chars, spec=specs.spec_of(store, wo),
                 side_effects=ops.side_effects_of(store, wo_id),
                 assumptions=store.all_assumptions(wo_id),
@@ -2834,26 +2853,17 @@ class Daemon:
                          project.name, wo_id, n)
                 return
 
-            # THE §7.2 PRE-CHECK, A SECOND TIME, for the rounds that did not come
+            # THE §7.2 PRE-CHECK ACTS, A SECOND TIME, for the rounds that did not come
             # through `ops.submit_for_validation`'s unforced path — spec
             # docs/superpowers/specs/2026-09-27-self-evolution.md §7.2. In this band
             # beside `nothing_to_judge` and `_repeat_submission`, and BEFORE
-            # `validator(...)`: the seats are the expense this exists to avoid.
+            # `validator(...)`: the seats are the expense this exists to avoid. The CALL
+            # itself ran above the packet build — see the comment there.
             #
             # NO EXEMPTION FOR A FORCED ROUND HERE (Neo, question 1681). The submission
             # site exempts them because they dereference its return; here the round
             # exists, so the refusal has somewhere to land — and it SPENDS that round,
             # which `PRECHECK_SPENT_NOTE` is what says out loud.
-            #
-            # ITS OWN `CentralStore`, for the reason this whole method opens its own
-            # `ProjectStore`: a sqlite connection belongs to the thread that created it,
-            # and `self.central` belongs to the daemon thread.
-            central = CentralStore()          # thread-local — see the docstring
-            try:
-                refusal = ops.fix_order_precheck(store, project.path, wo,
-                                                 central=central)
-            finally:
-                central.close()
             if refusal is not None:
                 self._reject(store, wo, round_id, n, max_rounds,
                              refusal + ops.PRECHECK_SPENT_NOTE, budget_round=pos,
