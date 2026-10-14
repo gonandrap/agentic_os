@@ -55,16 +55,14 @@ def _detector(store, **kw):
 
 
 def _arm(store, det):
-    """Flip a detector to `armed` in SQL.
+    """Arm a detector through `CentralStore.arm_detector`, the verb §6 brought.
 
-    There is no `arm_detector` verb in this release — §3.3 keeps arming out of the store
-    on purpose and §6 brings it with the alarm bridge — so a test that needs an armed row
-    writes the column. Through `self.conn`, which is `db.connect`'s connection: no test
-    opens its own.
+    It refuses a detector with no live remedy row — "a rule may act" needs something to
+    act WITH — so this adds the one the real flow always has before arming.
     """
-    store.conn.execute("UPDATE detectors SET status=? WHERE id=?",
-                       (rules.ARMED, det["id"]))
-    return store.get_detector(det["id"])
+    if not store.remedy_rules_for(det["id"]):
+        store.add_remedy_rule(det["id"], "nudge", argument="ask where it got to")
+    return store.arm_detector(det["id"], by="test", reason="armed for the fixture")
 
 
 def _fire(store, det, outcome, **kw):

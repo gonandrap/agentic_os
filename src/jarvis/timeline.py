@@ -150,7 +150,8 @@ def _neo_question_id(p: dict[str, Any]) -> int | None:
 #: the other stops `_ref` resolving the new kinds, with no error anywhere.
 ALARM_KINDS = frozenset({"cost_alarm", "alarm_reviewed", "alarm_escalated",
                          "alarm_advice", "health_finding", "health_reviewed",
-                         "remedy_proposed", "remedy_applied", "remedy_refused"})
+                         "remedy_proposed", "remedy_applied", "remedy_refused",
+                         "rule_fired", "rule_dry_run", "rule_cleared"})
 
 #: `project_store.NO_TURN`, duplicated for `ALARM_KINDS`' reason — a leaf may not import
 #: a store — and pinned equal to it by the same test. A `cost_alarm` carrying it judged
@@ -389,6 +390,18 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         by = f" by {p['by']}" if p.get("by") else ""
         return (f"The {p.get('remedy') or 'proposed'} remedy was refused{by}",
                 p.get("reason") or "")
+    # The self-evolution registry's three (§6 of
+    # docs/superpowers/specs/2026-09-27-self-evolution.md). An ARMED rule's fire is the OS
+    # noticing a known gap, not a supervisor's judgement, and the label says which.
+    # `rule_dry_run` is rendered for completeness although nothing writes it (§5 forbids
+    # a timeline event in dry run).
+    if kind == "rule_fired":
+        return ("A rule recognised a known gap",
+                f"{p.get('detector_id') or ''}: {p.get('reason') or ''}")
+    if kind == "rule_dry_run":
+        return ("A rule would have fired (dry run)", p.get("detector_id") or "")
+    if kind == "rule_cleared":
+        return ("The gap a rule recognised has cleared", p.get("detector_id") or "")
     # The analyst's terminal action (`ops.submit_findings`). Labelled here because an
     # unlabelled kind renders as a bare string beside a JSON blob — kn-3f133363.
     if kind == "findings_submitted":

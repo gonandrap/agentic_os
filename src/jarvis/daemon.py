@@ -5491,12 +5491,12 @@ class Daemon:
         shipped in `dry_run`, and the two must not read as one claim on the timeline or
         in `jarvis doctor`.
 
-        **NOTHING HERE BRANCHES ON `detectors.status`** (Neo, question 882). An `armed`
-        detector reaching this pass is treated EXACTLY as a `dry_run` one and still
-        writes `mode="dry_run"`. §6 — the alarm bridge — adds that branch, and it lands
-        separately; until it does, the order in which the two children merge cannot make
-        anything act, which is the property this rule buys. Do not "tidy" it by reading
-        `status` here.
+        **THE ONE BRANCH ON STATUS IS `_evaluate_detector`'S** (Neo, question 882; §6 of
+        the same spec added it). A pair ARMED on both halves — `rules.effective_status`,
+        the weaker of detector and remedy row — raises an alarm and takes the existing
+        `remedies.propose` gate (`_fire_armed`); every other pair is the dry run below.
+        Nothing derives that status from a counter: `arm_threshold` stays recorded and
+        unread, and only `jarvis rules arm` writes `armed`.
 
         **IN `dry_run` NOTHING ELSE HAPPENS.** No alarm, no notification, no message, no
         attention flag, no gate request, and NO EVENT ON THE ORDER'S TIMELINE. A dry run
@@ -5510,7 +5510,8 @@ class Daemon:
         """
         counts: dict[str, Any] = {
             "enabled": False, "detectors": 0, "orders": 0, "opened": 0, "closed": 0,
-            "unreadable": 0, "capped": "",
+            "unreadable": 0, "capped": "", "proposed": 0, "refused": 0,
+            "recorded_armed": 0,
         }
         # OFF MEANS THE PASS DOES NOT RUN AT ALL — not "runs in dry run" (§5.2). The
         # detectors are already in dry run; a second, quieter dry run under them would
@@ -5601,7 +5602,8 @@ class Daemon:
                     detail=f"the fact snapshot could not be built: {e}")
                 continue
             for row, cond in readable:
-                self._evaluate_detector(project, row, cond, facts, fingerprint, counts)
+                self._evaluate_detector(project, row, cond, facts, fingerprint, counts,
+                                        store, wo)
         return counts
 
     @staticmethod
@@ -5658,11 +5660,16 @@ class Daemon:
 
     def _evaluate_detector(self, project: ProjectSpec, row: dict[str, Any],
                            cond: dict[str, Any], facts: Any, fingerprint: str,
-                           counts: dict[str, Any]) -> None:
+                           counts: dict[str, Any], store: ProjectStore | None = None,
+                           wo: dict[str, Any] | None = None) -> None:
         """One detector against one order's facts. Opens a fire, closes one, or neither.
 
         Caught PER DETECTOR: a detector that raises is recorded `unreadable` and the
         other detectors still run against the same snapshot (§5.2.6).
+
+        `store` and `wo` are the project's store and the order row, which only the ARMED
+        branch needs (§6 of docs/superpowers/specs/2026-09-27-self-evolution.md): without
+        them the pass is the dry run it was before, whatever the pair's status.
         """
         from . import rules
 
@@ -5689,17 +5696,170 @@ class Daemon:
             if open_fire is not None and str(open_fire["fingerprint"]) == fingerprint:
                 # A condition standing for six hours is ONE fire, not 720.
                 return
+            # §6, wo-2877145f Neo 1649: an ARMED detector is handled by `_fire_armed`;
+            # only an unarmed one is the dry run below, unchanged.
+            taken = None
+            if store is not None and wo is not None:
+                taken = self._fire_armed(project, row, cond, facts, fingerprint,
+                                         counts, store, wo, open_fire)
+            if taken == "held":
+                return
             counts["opened"] += 1
+            if taken:
+                return
             self.central.record_rule_fire(
                 detector_id=detector_id, project=project.name, order_id=order_id,
                 order_kind=facts.order_kind, fingerprint=fingerprint,
-                # ALWAYS `dry_run`, whatever `detectors.status` says. See `rules_tick`.
+                # `dry_run` unless `_fire_armed` took the fire above. See `rules_tick`.
                 mode=rules.DRY_RUN, outcome=rules.RECORDED,
                 remedy_rule_id="",
                 detail=rules.render_condition(cond))
         elif open_fire is not None:
             counts["closed"] += 1
             self.central.close_rule_fire(int(open_fire["id"]))
+            if open_fire["mode"] == rules.ARMED and store is not None:
+                # An ARMED fire cleared: the order's timeline says so (§6). A dry run
+                # never writes one (§5), so this is gated on the fire's own mode.
+                store.add_event(order_id, "rule_cleared", {
+                    "alarm_id": open_fire["alarm_id"], "detector_id": detector_id,
+                    "fire_id": int(open_fire["id"]),
+                    "seconds": max(0.0, db.now() - float(open_fire["ts"]))})
+
+    def _fire_armed(self, project: ProjectSpec, row: dict[str, Any],
+                    cond: dict[str, Any], facts: Any, fingerprint: str,
+                    counts: dict[str, Any], store: ProjectStore,
+                    wo: dict[str, Any],
+                    open_fire: dict[str, Any] | None) -> str | None:
+        """THE DETECTOR'S STATUS BUYS VISIBILITY, THE PAIR GATES THE PROPOSE.
+
+        The user's override on wo-2877145f, Neo question 1649; §6 of
+        docs/superpowers/specs/2026-09-27-self-evolution.md. Returns None when the
+        DETECTOR is not armed (the caller records a dry run), `"fired"` once the fire has
+        been recorded, and `"held"` when it did nothing.
+
+        An armed detector always raises the alarm. If a remedy row pairs ARMED with it
+        (`rules.effective_status`) the alarm carries that remedy and takes the gate that
+        already exists; if none does — no row, or every one still `dry_run` — the alarm
+        stands alone, one fire is recorded `armed`/`recorded`, and nothing is proposed.
+
+        HELD: the condition has stood continuously (an open ARMED fire) and its alarm is
+        still unanswered — `proposed` awaiting a verdict, or, with no remedy,
+        `informational` (the supervisor never claims it, so it never moves on). The
+        situation's fingerprint moves for reasons that are not a new gap — a worker turn,
+        a queued message — and each move would otherwise raise a second alarm for the
+        same standing condition beside the first.
+
+        THE WHOLE BRIDGE IS: `add_finding` (source `rule`), one `rule_fired` event,
+        `remedies.propose`. That is the same call the supervisor makes, so the
+        `self_heal` approval, the `approval` Neo question, `gates.apply_decision` and
+        `remedies.apply` are the path that already exists — nothing here acts on the
+        order. DB-only: `NeoStore.ask` inserts a row and `propose` is stores and events,
+        so the pass still makes no network call and spawns no subprocess.
+
+        ONE FIRE ROW, WRITTEN LAST, with propose's own outcome: `proposed` with the
+        `alarm_id`, or `refused` with propose's words verbatim. A propose that RAISES is
+        `unreadable` with the exception's words — never a default — and the fire is
+        closed at once, so the dedupe memory does not forbid the next tick from trying
+        again; the half-made alarm is marked `failed` so the supervisor's queue never
+        claims it.
+        """
+        from . import remedies, rules
+        from .neo_store import NeoStore
+        from .project_store import NO_TURN
+
+        detector_id = str(row.get("id") or "")
+        order_id = facts.order_id
+        if row.get("status") != rules.ARMED:
+            return None
+        remedy_row: dict[str, Any] | None = None
+        alarm: dict[str, Any] | None = None
+        try:
+            remedy_row = next((r for r in self.central.remedy_rules_for(detector_id)
+                               if rules.effective_status(row, r) == rules.ARMED), None)
+            awaiting = ("proposed",) if remedy_row else ("informational",)
+            if (open_fire is not None and open_fire["mode"] == rules.ARMED
+                    and open_fire["alarm_id"]
+                    and store.get_alarm(open_fire["alarm_id"])["status"] in awaiting):
+                return "held"
+            reason = rules.render_condition(cond)
+            if remedy_row is None:
+                # informational: nothing can be proposed, so a supervisor claim would be a
+                # model call and a second acting path; row, event and /alarms still carry it.
+                alarm = store.add_finding(
+                    order_id, kind=str(row["gap_class"]), reason=reason, seq=NO_TURN,
+                    source="rule", probe=detector_id, status="informational")
+                store.add_event(order_id, "rule_fired", {
+                    "alarm_id": alarm["id"], "detector_id": detector_id, "reason": reason})
+                # Nothing filed a gate request, so the pre-action fingerprint stands (the
+                # propose path below recomputes it because `gate_requested` moves it).
+                self.central.record_rule_fire(
+                    detector_id=detector_id, project=project.name, order_id=order_id,
+                    order_kind=facts.order_kind, fingerprint=fingerprint,
+                    mode=rules.ARMED, outcome=rules.RECORDED, remedy_rule_id="",
+                    alarm_id=str(alarm["id"]),
+                    detail="the detector is armed with no armed remedy, so nothing was "
+                           f"proposed: {reason}")
+                counts["recorded_armed"] += 1
+                return "fired"
+            primitive, argument = str(remedy_row["primitive"]), str(
+                remedy_row["argument"] or "")
+            evidence = rules.bound(rules.explain(cond, rules.evaluate(cond, facts)))
+            alarm = store.add_finding(
+                order_id, kind=str(row["gap_class"]), reason=reason, seq=NO_TURN,
+                source="rule", probe=detector_id, remedy=primitive,
+                remedy_argument=argument)
+            store.add_event(order_id, "rule_fired", {
+                "alarm_id": alarm["id"], "detector_id": detector_id,
+                "remedy_rule_id": remedy_row["id"], "remedy": primitive,
+                "reason": reason})
+            neo = NeoStore()   # thread-local connection, as every other opener here
+            try:
+                outcome = remedies.propose(
+                    store, neo, project.name, dict(wo), alarm, primitive, argument,
+                    project.supervisor.remedies, evidence=evidence, reason=reason)
+            finally:
+                neo.close()
+        except Exception as e:  # noqa: BLE001 — recorded, never defaulted
+            counts["unreadable"] += 1
+            words = f"{type(e).__name__}: {e}"
+            log.warning("[%s] armed detector %s could not propose on %s: %s",
+                        project.name, detector_id, order_id, words)
+            if alarm is not None:
+                try:
+                    store.update_alarm(alarm["id"], status="failed",
+                                       verdict_reason=words)
+                except Exception:  # noqa: BLE001
+                    log.exception("could not mark alarm %s failed", alarm["id"])
+            fire = self.central.record_rule_fire(
+                detector_id=detector_id, project=project.name, order_id=order_id,
+                order_kind=facts.order_kind, fingerprint=fingerprint,
+                mode=rules.ARMED, outcome=rules.UNREADABLE,
+                remedy_rule_id=str(remedy_row["id"]) if remedy_row else "",
+                alarm_id=str(alarm["id"]) if alarm else "",
+                detail=f"the armed fire could not be proposed: {words}")
+            self.central.close_rule_fire(int(fire["id"]))
+            return "fired"
+
+        proposed = bool(outcome.get("proposed"))
+        counts["proposed" if proposed else "refused"] += 1
+        # THE FINGERPRINT IS TAKEN AFTER THE ACTION. Filing the gate request writes a
+        # `gate_requested` event on the order, which `health.fingerprint` counts, so the
+        # pre-action string would never equal the next tick's and the dedupe memory
+        # (equality of exactly this string) could not engage: one standing condition would
+        # file a gate request per tick. The fire records the situation the rule LEFT.
+        try:
+            from . import health
+            fingerprint = health.fingerprint(
+                store, {"kind": "work_order", "row": store.get_work_order(order_id)})
+        except Exception:  # noqa: BLE001 — keep the pre-action string rather than lose the fire
+            log.exception("[%s] no post-action fingerprint for %s", project.name, order_id)
+        self.central.record_rule_fire(
+            detector_id=detector_id, project=project.name, order_id=order_id,
+            order_kind=facts.order_kind, fingerprint=fingerprint, mode=rules.ARMED,
+            outcome=rules.PROPOSED if proposed else rules.REFUSED,
+            remedy_rule_id=str(remedy_row["id"]), alarm_id=str(alarm["id"]),
+            detail=reason if proposed else str(outcome.get("reason") or ""))
+        return "fired"
 
     # -- 2 & 6. turns, settlement, and injected sessions ---------------------------------------------------
 

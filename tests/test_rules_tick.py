@@ -22,10 +22,10 @@ Five properties beyond the ten seed tests:
    the `state_durations` source reads the holds too, so the claim is the pair the tests
    make: NO walk when the live conditions name neither a hold field nor a time field, and
    AT MOST ONE walk per order when they name both.
-2. **`armed` is inert in this release.** Nothing in the pass branches on
-   `detectors.status`, so an armed detector reaching it before §6 lands records a fire
-   and touches NOTHING else — no alarm, no message, no flag, no gate, and no event on the
-   order's own timeline (Neo, question 882).
+2. **A pair not armed on BOTH halves is inert.** The pass branches on the pair's
+   `rules.effective_status`, so a half-armed pair records a dry-run fire and touches
+   NOTHING else — no alarm, no message, no flag, no gate, and no event on the order's
+   own timeline (Neo, question 882). The armed path is `tests/test_rules_arm.py`.
 3. **A standing condition is one fire.** Not one per tick, and it may fire again only
    after it has cleared.
 4. **Nothing that could not be read decides anything.** A detector that raises is
@@ -448,28 +448,30 @@ def test_each_seed_rule_is_silent_on_a_healthy_order_of_the_same_status(
     assert fires_for(central, det["id"], wo["id"]) == []
 
 
-# -- 3. `armed` is INERT in this release ------------------------------------------------
+# -- 3. a pair not armed on both halves is INERT -----------------------------------------
 
 
-def test_an_armed_detector_records_a_fire_and_does_nothing_else(
+def test_a_pair_that_is_not_armed_on_both_halves_records_a_fire_and_does_nothing_else(
         started, spec, store, central):
-    """Neo, question 882. Nothing in this pass branches on `detectors.status`, so the
-    order in which this child and the arming child merge cannot make anything act."""
+    """Neo, question 882, as §6 narrowed it: the pass now branches on the PAIR's
+    `rules.effective_status`, the weaker of detector and remedy row. An armed REMEDY row
+    under a `dry_run` detector is therefore still a dry run — which is what keeps the
+    order in which a half-flipped pair is written from making anything act. (The armed
+    path itself is `tests/test_rules_arm.py`.)"""
     retract_all_but(central, "stale-panel-hold")
     det = detector_for(central, "stale-panel-hold")
-    central.conn.execute("UPDATE detectors SET status=? WHERE id=?",
-                         (rules.ARMED, det["id"]))
     central.conn.execute("UPDATE remedy_rules SET status=? WHERE detector_id=?",
                          (rules.ARMED, det["id"]))
     wo = a_stale_panel_hold(store)
 
     before = store.list_events(wo["id"], limit=500)
-    tick(started, spec, store)
+    counts = tick(started, spec, store)
     after = store.list_events(wo["id"], limit=500)
 
+    assert counts["proposed"] == 0 and counts["refused"] == 0
     fires = fires_for(central, det["id"], wo["id"])
     assert len(fires) == 1
-    assert fires[0]["mode"] == rules.DRY_RUN, "an armed detector wrote mode=armed"
+    assert fires[0]["mode"] == rules.DRY_RUN, "a half-armed pair wrote mode=armed"
     assert fires[0]["alarm_id"] == ""
     assert after == before, "the pass wrote an event on the order's timeline"
     assert store.alarms_of(wo["id"]) == []

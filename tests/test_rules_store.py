@@ -333,10 +333,11 @@ def test_add_remedy_rule_always_writes_dry_run(store):
 
 
 def test_this_section_exposes_no_verb_that_arms_a_remedy_row(store):
-    """Arming lands with the alarm bridge, in one transaction over the pair. Nothing
-    here may set a remedy row to `armed` — that would make the pair a combination §3.3
-    says cannot exist."""
-    assert [n for n in dir(CentralStore) if "arm" in n.lower()] == []
+    """Arming landed with the alarm bridge (§6), in one transaction over the pair, and
+    the verbs that do it are exactly these. Nothing ELSE may set a remedy row to `armed`
+    — that would make the pair a combination §3.3 says cannot exist."""
+    assert sorted(n for n in dir(CentralStore) if "arm" in n.lower()) == [
+        "arm_detector", "disarm_detector"]
     for verb in (CentralStore.add_remedy_rule, CentralStore.retract_remedy_rule,
                  CentralStore.retract_detector):
         body = ast.parse(textwrap.dedent(inspect.getsource(verb))).body[0]
