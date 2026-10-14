@@ -21,13 +21,14 @@ Four properties carry the section, and each gets its own block:
 
 from __future__ import annotations
 
+import inspect
 import os
 import re
 import subprocess
 
 import pytest
 
-from jarvis import autoreview, daemon as daemon_mod, evidence, ops
+from jarvis import autoreview, daemon as daemon_mod, evidence, navigation, ops
 from jarvis.daemon import Daemon
 from jarvis.project_store import ProjectStore
 
@@ -1440,6 +1441,31 @@ def test_documentation_is_a_mechanical_path_test(path, is_doc):
     the suffixes and dirs PASSED IN — this module holds no classifier of its own."""
     assert autoreview._is_documentation(
         path, (".md", ".rst", ".txt", ".adoc"), frozenset({"docs", "specs"})) is is_doc
+
+
+def test_the_shipped_defaults_are_the_navigation_constants_themselves():
+    """The tiering with NO override: `.md` and a `docs/` component are documentation,
+    `.py` is source — and `.rst` is SOURCE, no longer a doc suffix. The parameterised
+    test above passes its own values in, so only this one covers what SHIPS.
+    """
+    md = added("x.md", "spec line\n" * 5)
+    rst = added("x.rst", "spec line\n" * 5)
+    doc_dir = added("docs/a.py", "spec line\n" * 5)
+    src = added("x.py", "spec line\n" * 5)
+    stat = md[0] + rst[0] + doc_dir[0] + src[0]
+    diff = md[1] + rst[1] + doc_dir[1] + src[1]
+    limit = len(rst[1]) + len(src[1])
+    packet, a = packet_of(stat, diff), assumption(content=ROUTINE)
+
+    ce = autoreview.confirm_evidence(packet, a, limit)
+    defaults = inspect.signature(autoreview.confirm_evidence).parameters
+
+    assert "diff --git a/x.rst" in ce.diff            # .rst tiers as SOURCE
+    assert "diff --git a/x.py" in ce.diff
+    assert set(ce.dropped_files) == {"x.md", "docs/a.py"}
+    assert ce.partial_files == ()
+    assert defaults["doc_suffixes"].default is navigation.DOC_SUFFIXES
+    assert defaults["doc_dirs"].default is navigation.DOC_DIRS
 
 
 def test_a_project_doc_suffix_override_decides_the_tier():
