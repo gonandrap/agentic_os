@@ -44,6 +44,22 @@ MAX_SPAN_GAP_SECONDS = 120.0
 #: (§4 rule 2), not a measurement.
 DROP_TOLERANCE = 1.0
 
+#: `resets_at` is the same INSTANT to the window, not to the microsecond: production
+#: samples of one 17:00:00 reset differ by ~0.7s. A reset is an ADVANCE past this; a
+#: genuine advance is never smaller than the window itself (a new window's reset is its
+#: own start + the window length, and its start is at or after the old reset). One
+#: SAMPLE_SECONDS: nothing finer than one sampling period is resolvable from this series.
+RESET_TOLERANCE_SECONDS = SAMPLE_SECONDS
+
+#: Each window's length, per `FIRST_CLASS` key — the bound in §2 of
+#: docs/superpowers/specs/2026-10-13-usage-meter-spurious-resets.md is per key, and a
+#: hard-coded 5h would let a 7-day span claim 34 weekly resets.
+WINDOW_SECONDS = {"five_hour": 5 * 3600.0, "seven_day": 7 * 86_400.0}
+
+#: More of the span unmeasured than measured: nothing about the rise or the reset count
+#: is bounded, so no dollar figure is derived from it.
+MIN_RELIABLE_COVERAGE_SHARE = 0.5
+
 NOTICE_STREAK_KEY = "usage_meter_notice_streak"
 
 
@@ -314,17 +330,35 @@ class SegmentSum:
     reset_count: int = 0
     anomalies: int = 0
     coverage: Coverage = field(default_factory=Coverage)
+    reliable: bool = True
+    unreliable: list[str] = field(default_factory=list)   #: machine keys, never prose
+    max_resets: int | None = None
 
 
 def _boundary(a: Sample, b: Sample, key: str) -> str:
-    """"", "reset" or "drop" between two consecutive readings (§4 rule 2)."""
+    """"", "reset" or "drop" between two consecutive readings (§4 rule 2, amended).
+
+    A reset is an ADVANCE past `RESET_TOLERANCE_SECONDS` and not a raw inequality: the
+    endpoint's `resets_at` carries sub-second jitter, under which every consecutive pair
+    read as a reset.
+    """
     before, after = a.resets_at(key), b.resets_at(key)
-    if before is not None and after is not None and before != after:
+    if (before is not None and after is not None
+            and after - before > RESET_TOLERANCE_SECONDS):
         return "reset"
     pct_a, pct_b = a.pct(key), b.pct(key)
     if pct_a is not None and pct_b is not None and pct_b < pct_a - DROP_TOLERANCE:
         return "drop"
     return ""
+
+
+def _retreat(a: Sample, b: Sample, key: str) -> bool:
+    """`resets_at` moved BACKWARDS past the tolerance — the endpoint contradicting
+    itself. Counted in `anomalies` and never a boundary: breaking a segment here would
+    restart at 0.0 on a signal we have just called untrustworthy."""
+    before, after = a.resets_at(key), b.resets_at(key)
+    return (before is not None and after is not None
+            and before - after > RESET_TOLERANCE_SECONDS)
 
 
 def segments(samples: Sequence[Sample], *, since: float, until: float, key: str,
@@ -362,8 +396,11 @@ def segments(samples: Sequence[Sample], *, since: float, until: float, key: str,
     start_ts = (head or inside[0]).ts
     cause = ""
     for index in range(1, len(inside) + 1):
-        edge = ("" if index == len(inside)
-                else _boundary(inside[index - 1], inside[index], key))
+        edge = ""
+        if index < len(inside):
+            edge = _boundary(inside[index - 1], inside[index], key)
+            if _retreat(inside[index - 1], inside[index], key):
+                found.anomalies += 1
         if index < len(inside) and not edge:
             continue
         last = inside[index - 1]
@@ -381,8 +418,26 @@ def segments(samples: Sequence[Sample], *, since: float, until: float, key: str,
             # Every later segment starts at 0.0 BY DEFINITION: whatever was spent between
             # the reset instant and the first post-reset sample is inside this span (§4.4).
             start_pct, start_ts, cause = 0.0, inside[index].ts, edge
-    found.delta_points = sum(s.delta for s in found.segments)
     found.reset_count = len(found.segments) - 1
+    # Post-conditions, CLAMP AND MARK both: clamping alone prints a plausible wrong
+    # number, marking alone lets a 19876 reach a '%.1f' template.
+    window = WINDOW_SECONDS.get(key)
+    if window is None:
+        found.reliable = False
+        found.unreliable.append("window_length_unknown")
+    else:
+        found.max_resets = int((until - since) // window) + 1
+        if found.reset_count > found.max_resets:
+            found.reliable = False
+            found.unreliable.append("reset_count_above_span")
+            # The segment list stays as computed: it is the evidence for the defect.
+            found.reset_count = found.max_resets
+    if any(s.delta > 100.0 for s in found.segments):
+        found.reliable = False
+        found.unreliable.append("segment_delta_above_window")
+        for segment in found.segments:
+            segment.delta = min(segment.delta, 100.0)
+    found.delta_points = sum(s.delta for s in found.segments)
     return found
 
 
@@ -656,6 +711,12 @@ RESIDUAL_LABEL = ("either usage this machine cannot see (claude.ai in a browser,
 #: residual, no percentages (§9).
 NO_SAMPLES = "no usage-meter samples cover this span"
 
+#: The meter arithmetic did not survive its own post-conditions, or the span is too
+#: thinly covered to bound either the rise or the reset count. NOTHING in dollars is
+#: derived from it (2026-10-13 spec, part 3).
+UNRELIABLE = ("the usage meter does not reconcile over this span and no dollar figure is "
+              "derived from it")
+
 #: The payload's own version key, the §10.6 rule the rest of the cost payload follows.
 PAYLOAD_VERSION = 1
 
@@ -760,9 +821,40 @@ def _named(sessions: Sequence[OutsideSession]) -> str:
     return f"session {top.session_id[:8]}, {where}{title}"
 
 
+def _duration(seconds: float) -> str:
+    hours, minutes = int(seconds // 3600), int((seconds % 3600) // 60)
+    return f"{hours}h{minutes:02d}m" if hours else f"{minutes}m"
+
+
+def _why_unreliable(keys: Sequence[str], *, coverage: dict[str, Any],
+                    five_hour: dict[str, Any]) -> str:
+    """One clause per machine key, in plain words — the keys themselves never surface."""
+    said: list[str] = []
+    for key in keys:
+        if key == "low_coverage":
+            said.append("more of the span is unmeasured than measured "
+                        f"({round(100 * coverage['share'])}% covered)")
+        elif key == "gap_longer_than_window":
+            said.append(f"a {_duration(coverage['longest_gap_seconds'])} gap is longer "
+                        "than the 5h window, so a whole window may have passed unseen")
+        elif key == "reset_count_above_span":
+            most = five_hour.get("max_resets")
+            said.append("the rise implies more window resets than this span can hold"
+                        + (f" (at most {most})" if most is not None else "")
+                        + " — this is a defect in Jarvis's own arithmetic, filed as such")
+        elif key == "segment_delta_above_window":
+            said.append("one window is reported rising more than its whole 0-100 range "
+                        "— this is a defect in Jarvis's own arithmetic, filed as such")
+        elif key == "window_length_unknown":
+            said.append("this window's length is not known here, so the reset count "
+                        "cannot be bounded")
+    return "; ".join(said)
+
+
 def sentence(*, five_hour: dict[str, Any], spend: dict[str, Any],
              sessions: Sequence[OutsideSession], dollars: dict[str, Any],
-             coverage: dict[str, Any], covered: bool) -> str:
+             coverage: dict[str, Any], covered: bool, derivable: bool = True,
+             unreliable: Sequence[str] = ()) -> str:
     """THE one sentence, built ONCE and rendered verbatim by both surfaces (§9).
 
     A payload key and not a renderer, for `fleetcost.NOTES`' reason: two renderers
@@ -771,6 +863,16 @@ def sentence(*, five_hour: dict[str, Any], spend: dict[str, Any],
     """
     if not covered:
         return NO_SAMPLES
+    if not derivable:
+        # No residual and no RESIDUAL_LABEL: attributing a gap to usage this machine
+        # cannot see requires the meter side of the subtraction to be sound.
+        why = _why_unreliable(unreliable, coverage=coverage, five_hour=five_hour)
+        said = UNRELIABLE + (f" — {why}" if why else "")
+        said += f"; Jarvis spent {_money(spend['jarvis_usd'])}"
+        said += ("; sessions this machine ran that Jarvis did not dispatch spent "
+                 f"{_money(spend['outside_usd'])}")
+        said += f" ({_named(sessions)})" if sessions else ""
+        return said
     implied = float(spend["implied_usd"] or 0.0)
     rough = dollars["source"] in ("thin", "seed")
     figure = f"roughly ${implied:.1f}" if rough else f"~${implied:.1f}"
@@ -793,8 +895,9 @@ def sentence(*, five_hour: dict[str, Any], spend: dict[str, Any],
         spans = dollars["basis_spans"]
         said += f"; from {spans} measured span{'s' if spans != 1 else ''}"
     if coverage["share"] < 0.9:
+        # The FACT and not a bound: missing samples can hide a reset as well as usage.
         said += (f"; the meter covers only {round(100 * coverage['share'])}% of this "
-                 f"span, so the rise is a lower bound")
+                 f"span, so the rise is incomplete")
     if five_hour["reset_count"]:
         times = five_hour["reset_count"]
         said += (f"; the 5h window reset {'once' if times == 1 else f'{times} times'} "
@@ -809,7 +912,10 @@ def _window_dict(sum_: SegmentSum) -> dict[str, Any]:
         "end_pct": segments_[-1].last_pct if segments_ else None,
         "delta_points": round(sum_.delta_points, 2),
         "reset_count": sum_.reset_count,
+        "max_resets": sum_.max_resets,
         "anomalies": sum_.anomalies,
+        "reliable": sum_.reliable,
+        "unreliable": list(sum_.unreliable),
         "segments": [{"since": s.start_ts, "until": s.end_ts,
                       "start_pct": s.start_pct, "end_pct": s.last_pct,
                       "delta": round(s.delta, 2), "cause": s.cause}
@@ -824,7 +930,9 @@ def _coverage_dict(cov: Coverage, rows: Sequence[Sample]) -> dict[str, Any]:
             "longest_gap_seconds": cov.longest_gap_seconds,
             "head_uncovered_seconds": cov.head_uncovered_seconds,
             "first_ts": ok[0].ts if ok else None,
-            "last_ts": ok[-1].ts if ok else None}
+            "last_ts": ok[-1].ts if ok else None,
+            "reliable": cov.share >= MIN_RELIABLE_COVERAGE_SHARE,
+            "min_reliable_share": MIN_RELIABLE_COVERAGE_SHARE}
 
 
 def reconciliation(*, resolved: dict[str, Any], project: str | None = None,
@@ -852,6 +960,18 @@ def reconciliation(*, resolved: dict[str, Any], project: str | None = None,
                      nearest_seconds=cfg.meter_nearest_seconds)
     dollars = dollars_per_point(now=now, cfg=cfg, home=root)
     covered = five.coverage.samples > 0
+    # Coverage is the span's own reason to derive nothing, decided here and not in
+    # `segments`: it is about the sample series, not about one key's arithmetic.
+    span_unreliable: list[str] = []
+    if covered and five.coverage.share < MIN_RELIABLE_COVERAGE_SHARE:
+        span_unreliable.append("low_coverage")
+    if five.coverage.longest_gap_seconds >= WINDOW_SECONDS["five_hour"]:
+        span_unreliable.append("gap_longer_than_window")
+    derivable = covered and five.reliable and seven.reliable and not span_unreliable
+    unreliable: list[str] = []
+    for key in list(five.unreliable) + list(seven.unreliable) + span_unreliable:
+        if key not in unreliable:
+            unreliable.append(key)
 
     sessions = outside_sessions(since=since, until=until, home=root)
     outside_usd = sum(s.usd for s in sessions)
@@ -862,22 +982,25 @@ def reconciliation(*, resolved: dict[str, Any], project: str | None = None,
     scope_workers, scope_calls = (
         jarvis_spend(since=since, until=until, home=root, project=project)
         if project else (None, None))
-    implied = five.delta_points * float(dollars["value"]) if covered else None
-    residual = (implied - jarvis_usd - outside_usd) if covered else None
+    # The UNGATED figure, for `alerts.suppressed` alone: it never reaches the payload or
+    # the sentence, and is the only way "this span would have alarmed" can be said.
+    raw_implied = five.delta_points * float(dollars["value"])
+    implied = raw_implied if derivable else None
+    residual = (implied - jarvis_usd - outside_usd) if derivable else None
 
     def share(value: float | None) -> float | None:
         if implied is None or implied <= 0 or value is None:
             return None
         return round(value / implied, 4)
 
-    spend = {"implied_usd": round(implied, 2) if covered else None,
+    spend = {"implied_usd": round(implied, 2) if derivable else None,
              "workers_usd": round(workers_usd, 2),
              "jarvis_calls_usd": round(calls_usd, 2),
              "jarvis_usd": round(jarvis_usd, 2),
              "outside_usd": round(outside_usd, 2),
              # NEVER CLAMPED: a negative residual is evidence about the estimator, and
              # clamping it to zero would hide the drift (§7).
-             "residual_usd": round(residual, 2) if covered else None,
+             "residual_usd": round(residual, 2) if derivable else None,
              "residual_share": share(residual), "outside_share": share(outside_usd),
              "jarvis_share": share(jarvis_usd),
              # Reported BESIDE the meter and never subtracted from it (§7).
@@ -891,6 +1014,8 @@ def reconciliation(*, resolved: dict[str, Any], project: str | None = None,
     five_hour = _window_dict(five)
     return {"meter": {
         "version": PAYLOAD_VERSION,
+        "reliable": derivable,
+        "unreliable": unreliable,
         "window": {"since": since, "until": until,
                    "source": resolved.get("source", "")},
         "five_hour": five_hour,
@@ -905,17 +1030,29 @@ def reconciliation(*, resolved: dict[str, Any], project: str | None = None,
                                  for s in sessions[:cfg.meter_outside_rows]]},
         "timeline": timeline(in_span),
         "sentence": sentence(five_hour=five_hour, spend=spend, sessions=sessions,
-                             dollars=dollars, coverage=coverage, covered=covered),
-        "alerts": alerts(spend=spend, dollars=dollars, cfg=cfg),
+                             dollars=dollars, coverage=coverage, covered=covered,
+                             derivable=derivable, unreliable=unreliable),
+        "alerts": alerts(spend=spend, dollars=dollars, cfg=cfg,
+                         unreliable=not derivable, raw_implied_usd=raw_implied),
     }}
 
 
 def alerts(*, spend: dict[str, Any], dollars: dict[str, Any],
-           cfg: Any) -> dict[str, Any]:
+           cfg: Any, unreliable: bool = False,
+           raw_implied_usd: float | None = None) -> dict[str, Any]:
     """Which of the two conditions §8 alarms on is true of this span.
 
     Computed HERE, beside the arithmetic, and read by the daemon rather than re-derived
     there: one place decides, so the payload and the alarm can never disagree.
+
+    `unreliable` suppresses BOTH explicitly: both alarm kinds make a claim about the
+    user's other devices, and an unreliable derivation makes it about Jarvis's own
+    arithmetic instead (2026-10-13 spec, part 3).
+
+    `raw_implied_usd` is the UNGATED rise in dollars and feeds `suppressed` only —
+    `spend["implied_usd"]` is already None on an unreliable span, so the two flags below
+    are False by construction and the question "would it have alarmed" can only be
+    answered from the ungated figure.
     """
     implied = spend["implied_usd"]
     big = implied is not None and implied >= cfg.meter_alert_min_usd
@@ -924,10 +1061,13 @@ def alerts(*, spend: dict[str, Any], dollars: dict[str, Any],
     outside = spend["outside_share"]
     residual = spend["residual_share"]
     return {
-        "outside": bool(big and measured and outside is not None
+        "outside": bool(big and measured and not unreliable and outside is not None
                         and outside >= cfg.meter_outside_alert_share),
-        "residual": bool(big and measured and residual is not None
+        "residual": bool(big and measured and not unreliable and residual is not None
                          and abs(residual) >= cfg.meter_residual_alert_share),
+        "unreliable": bool(unreliable),
+        "suppressed": bool(unreliable and measured and raw_implied_usd is not None
+                           and raw_implied_usd >= cfg.meter_alert_min_usd),
         "thresholds": {"outside": cfg.meter_outside_alert_share,
                        "residual": cfg.meter_residual_alert_share},
         "min_usd": cfg.meter_alert_min_usd,

@@ -851,19 +851,24 @@ def test_the_feature_bill_grows_no_own_row_when_there_is_no_own_spend(
 # -- the usage meter, above the listing (tests 36 and 44) ------------------------------
 
 
-def meter_samples_in_the_current_5h_window() -> None:
-    """Twelve readings ending a moment ago, with the real boundary an hour out — so the
-    window `resolve_window` re-anchors on contains every one of them."""
+def meter_samples_in_the_current_5h_window(n: int = 240) -> None:
+    """`n` readings per minute ending a moment ago, with the real boundary an hour out —
+    so the window `resolve_window` re-anchors on contains every one of them.
+
+    240 by default, i.e. the four hours of the re-anchored window that have already
+    happened: under `MIN_RELIABLE_COVERAGE_SHARE` the meter derives no dollar figure
+    (docs/superpowers/specs/2026-10-13-usage-meter-spurious-resets.md).
+    """
     from jarvis import db, usage_meter
     from jarvis.central_store import CentralStore
 
     now = db.now()
     central = CentralStore()
     try:
-        for i in range(12):
+        for i in range(n):
             usage_meter.record(central, usage_meter.Sample(
-                ts=now - (12 - i) * 60, ok=True, five_hour_pct=10.0 + i,
-                five_hour_resets_at=now + 3600, seven_day_pct=5.0 + i / 10,
+                ts=now - (n - i) * 60, ok=True, five_hour_pct=10.0 + i / 10,
+                five_hour_resets_at=now + 3600, seven_day_pct=5.0 + i / 100,
                 seven_day_resets_at=now + 86_400))
         central.conn.commit()
     finally:
@@ -885,6 +890,22 @@ def test_the_meter_sentence_and_the_sparkline_are_above_the_listing(client, proj
     assert "the 5h meter rose" in said
     assert page.text.index(said) < page.text.index("an order in this window")
     assert "<svg" in page.text and "<polyline" in page.text
+
+
+def test_an_unreliable_meter_shows_the_marker_and_no_dollars_per_point(client, project):
+    """12 readings in a 5h window: the page says so and prints no $/point figure."""
+    wo = ops.create_work_order("proj_a", "an order in this window")
+    add_recorded_turn(project, wo["id"], 0.05, 48_000)
+    meter_samples_in_the_current_5h_window(12)
+    meter = ops.cost_meter(resolved=ops.cost_window(window="5h"))["meter"]
+    assert meter["reliable"] is False
+
+    page = client.get("/cost?window=5h")
+
+    assert page.status_code == 200
+    assert "unreliable" in page.text
+    assert "/point" not in page.text
+    assert "an order in this window" in page.text
 
 
 def test_a_broken_meter_leaves_the_listing_rendered(client, project, monkeypatch):
