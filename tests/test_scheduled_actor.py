@@ -33,7 +33,13 @@ from jarvis.daemon import (
     reviews_gate,
 )
 from jarvis.neo_store import NEO_HELD_Q_STATUSES, NeoStore
-from jarvis.project_store import OPEN_STATUSES, UNGOVERNED_ORIGINS, ProjectStore
+from jarvis.project_store import (
+    CLAIM_RULES,
+    OPEN_STATUSES,
+    UNGOVERNED_ORIGINS,
+    ProjectStore,
+)
+from test_claim_rules import HOLDS  # the four delayed rules, built once
 
 ORIGINS = ("jarvis", "injected", "adhoc")
 
@@ -64,19 +70,9 @@ EXPECT_NEITHER: dict[tuple[str, str], str] = {
         "`true_blockers`' triage is behind `governed`",
 }
 
-#: `pending`'s actor is the claim SQL's, and that is section 4's.
-PENDING_XFAIL = "pending's actor lands in the claim-SQL child"
-
-
 def _params() -> list:
-    out = []
-    for status in OPEN_STATUSES:
-        for origin in ORIGINS:
-            marks = ([pytest.mark.xfail(strict=True, reason=PENDING_XFAIL)]
-                     if status == "pending" else [])
-            out.append(pytest.param(status, origin, marks=marks,
-                                    id=f"{status}-{origin}"))
-    return out
+    return [pytest.param(status, origin, id=f"{status}-{origin}")
+            for status in OPEN_STATUSES for origin in ORIGINS]
 
 
 def _row(store: ProjectStore, status: str, origin: str) -> dict:
@@ -311,6 +307,40 @@ def test_reviews_gate_only_when_the_user_does_not_hold_it(jarvis_home, project,
     wo = store.create_work_order("add feature X", status="waiting_input")
     make(store, wo["id"])
     assert reviews_gate(store, wo) is expected
+
+
+# -- `pending`: the claim SQL is the actor, and a DELAY is still that actor ----------
+
+def test_a_claimable_pending_order_names_the_dispatch_pass(jarvis_home, project):
+    store = ProjectStore(project)
+    wo = store.create_work_order("add feature X")
+    actor = ops.scheduled_actor(store, wo)
+    assert actor is not None and actor.pass_name == "Daemon.dispatch_pending"
+
+
+@pytest.mark.parametrize(("code", "make"), HOLDS, ids=[c for c, _ in HOLDS])
+def test_a_delayed_pending_order_still_names_the_dispatch_pass(jarvis_home, project,
+                                                               code, make):
+    """A live dependency, a cap, a backoff and a held plan are all WAITING CORRECTLY:
+    the turn is later, the actor is the same, and nothing here raises attention."""
+    store = ProjectStore(project)
+    wo = store.get_work_order(make(store))
+    actor = ops.scheduled_actor(store, wo)
+    assert actor is not None and actor.pass_name == "Daemon.dispatch_pending"
+    rule = next(r for r in CLAIM_RULES if r.code == code)
+    assert rule.why in actor.why
+    assert invariants.true_blockers(store, wo) == []
+
+
+@pytest.mark.parametrize(("field", "value"), [("hidden", 1), ("status", "running")])
+def test_a_row_the_claims_selection_rejects_derives_no_actor(jarvis_home, project,
+                                                             field, value):
+    store = ProjectStore(project)
+    wo = store.create_work_order("add feature X")
+    store.conn.execute(f"UPDATE work_orders SET {field}=? WHERE id=?",
+                       (value, wo["id"]))
+    row = {**store.get_work_order(wo["id"]), "status": "pending"}
+    assert ops.scheduled_actor(store, row) is None
 
 
 @pytest.mark.parametrize("status", ["needs_review", "budget_exhausted"])
