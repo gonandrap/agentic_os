@@ -8,7 +8,8 @@ orders that own work orders in sets.
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Collection, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -1736,6 +1737,126 @@ DEPENDENCY_SATISFIED_STATUS = "completed"
 DEPENDENCY_DEAD_STATUSES = ("cancelled", "failed")
 
 
+@dataclass(frozen=True)
+class _ClaimRule:
+    """One reason the claim SQL takes a row or passes it over.
+
+    ONE rule, TWO queries: `claim_next_pending`'s atomic UPDATE and the read-only
+    `ProjectStore.claim_refusal` are both built from these `sql` strings, so the two can
+    never drift. Section 4 of
+    docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md.
+    """
+
+    code: str      # the column name this rule takes in the read-only query
+    why: str       # one read-only sentence; no elapsed time, nothing clock-dependent
+    sql: str       # boolean over alias `w`; TRUE = this rule does NOT refuse
+    delayed: bool  # True = `dispatch_pending` still owns the row, its turn is just later
+    params: Callable[[], tuple[Any, ...]]   # deferred: `db.now()` is read per call
+
+
+#: Every refusal, in the order the claim SQL has always had them and cheapest-first.
+#: The numbered prose that used to live in `claim_next_pending`'s docstring is on each
+#: rule, next to the clause it explains.
+CLAIM_RULES: tuple[_ClaimRule, ...] = (
+    # NOT a delay: `dispatch_pending` will never select this row at all.
+    _ClaimRule(
+        code="selection",
+        why="the claim query does not select this row: it is not `pending`, or hidden",
+        sql="w.status='pending' AND w.hidden=0",
+        delayed=False,
+        params=lambda: (),
+    ),
+    # A dispatch that could not reach `claude` is backing off — `retry_after`, written by
+    # `release_dispatch_claim` and by `hold_dispatch`. Without it the caller's `while`
+    # loop re-claims the order it has just failed to launch on the next iteration, and
+    # spends the whole ceiling inside one tick.
+    _ClaimRule(
+        code="retry_after",
+        why="a dispatch is backing off: `retry_after` is still in the future",
+        sql="COALESCE(w.retry_after, 0) <= ?",
+        delayed=True,
+        params=lambda: (db.now(),),
+    ),
+    # A dependency has not completed (Phase 1). This does not hold up the queue behind
+    # it — the filter is in the row SELECTION, so a younger unblocked order is claimed
+    # while an older blocked one waits.
+    _ClaimRule(
+        code="dependency",
+        why="a dependency has not completed yet",
+        sql="""NOT EXISTS (
+                   SELECT 1 FROM json_each(w.depends_on) dep
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM work_orders d
+                       WHERE d.id = dep.value AND d.status = ?
+                   )
+               )""",
+        delayed=True,
+        params=lambda: (DEPENDENCY_SATISFIED_STATUS,),
+    ),
+    # Its feature order is already running `max_parallel` children (Phase 3). A
+    # per-feature slot cap, spent alongside the project-wide `max_concurrent` rather than
+    # instead of it: whichever is tighter binds. It applies only to a feature's `worker`
+    # children — the planner is the feature order deciding what its children are, not one
+    # of them, so capping it against its own children would cap a feature against itself.
+    _ClaimRule(
+        code="max_parallel",
+        why="its feature is already running `max_parallel` children",
+        sql=f"""NOT EXISTS (
+                   SELECT 1 FROM feature_orders f
+                   WHERE f.id = w.parent_id AND w.kind = 'worker'
+                     AND f.max_parallel IS NOT NULL
+                     AND f.max_parallel <= (
+                         SELECT COUNT(*) FROM work_orders s
+                         WHERE s.parent_id = f.id AND s.kind = 'worker'
+                           AND s.status IN ({",".join("?" for _ in ACTIVE_STATUSES)})
+                     )
+               )""",
+        delayed=True,
+        params=lambda: tuple(ACTIVE_STATUSES),
+    ),
+    # Its feature's PLAN is still waiting on the user — any pending assumption on the
+    # planner (spec 2026-09-24-a-planner-assumption-holds-its-feature §2.2). Here rather
+    # than in `Daemon.dispatch_pending` because this is the row SELECTION: a held child is
+    # passed over inside the statement that picks the next row, so a younger unblocked
+    # order is still claimed on the same call, and nothing is written. Filtering in the
+    # caller would mean either releasing a claim it has already written or spending the
+    # whole `max_concurrent` ceiling re-claiming the same held row inside one tick.
+    # `w.kind = 'worker'` keeps the PLANNER dispatchable: it is created and dispatched
+    # before the plan exists, so holding it on its own assumptions would deadlock the
+    # feature permanently. `plan_hold` is the same rule for the readers that render it.
+    _ClaimRule(
+        code="plan_assumption",
+        why="its feature's plan is still waiting on the user",
+        sql="""NOT (w.kind = 'worker' AND EXISTS (
+                   SELECT 1 FROM feature_orders f
+                   JOIN assumptions a ON a.wo_id = f.plan_wo_id
+                   WHERE f.id = w.parent_id AND a.status = 'pending'
+               ))""",
+        delayed=True,
+        params=lambda: (),
+    ),
+)
+
+
+def _claim_params() -> tuple[Any, ...]:
+    """Every rule's parameters, in `CLAIM_RULES` order — read fresh on every call."""
+    return tuple(p for rule in CLAIM_RULES for p in rule.params())
+
+
+def claim_sql_selects(store: ProjectStore, wo: dict[str, Any],
+                      now: float | None = None) -> bool:
+    """Would `Daemon.dispatch_pending`'s claim SQL select this row, now or later?
+
+    The predicate behind `pending`'s entry in `ops.SCHEDULED_ACTORS`. True for a row the
+    claim takes, and ALSO for one it merely defers — a live dependency, a `max_parallel`
+    cap, a `retry_after` backoff, a held plan are all the same actor with a later turn.
+    Only the claim's own SELECTION (not `pending`, or hidden) is a False.
+    `ProjectStore.why_not_claimable` is the sentence for the deferral.
+    """
+    refusal = store.claim_refusal(wo)
+    return refusal is None or refusal.delayed
+
+
 class ProjectStore:
     def __init__(self, project_path: str | Path):
         self.project_path = Path(project_path)
@@ -2485,43 +2606,19 @@ class ProjectStore:
         `only`, when given, restricts the claim to those work order ids — the user's
         pause allow-list (`fleet.FleetPause`, issue #843). Empty means claim nothing.
 
-        Two things can make a pending work order unclaimable, and neither writes anything
-        when it fires: the order is passed over and stays `pending`, because nothing about
-        it has changed.
+        The refusals, and the prose explaining each, are `CLAIM_RULES` — the SAME `sql`
+        strings `claim_refusal` reads with. None of them writes anything when it fires:
+        the order is passed over and stays `pending`, because nothing about it has
+        changed.
 
-        1. **A dependency has not completed** (Phase 1). Note that this does not hold up
-           the queue behind it — the filter is in the row selection, so a younger
-           unblocked order is claimed while an older blocked one waits.
-        2. **Its feature order is already running `max_parallel` children** (Phase 3).
-           A per-feature slot cap, spent alongside the project-wide `max_concurrent`
-           rather than instead of it: whichever is tighter binds. It applies only to a
-           feature's `worker` children — the planner is the feature order deciding what
-           its children are, not one of them, so capping it against its own children
-           would be capping a feature against itself.
-
-        3. **Its feature's PLAN is still waiting on the user** — any pending assumption
-           on the planner (spec 2026-09-24-a-planner-assumption-holds-its-feature §2.2).
-           Here rather than in `Daemon.dispatch_pending` because this is the row
-           SELECTION: a held child is passed over inside the statement that picks the
-           next row, so a younger unblocked order is still claimed on the same call, and
-           nothing is written. Filtering in the caller would mean either releasing a
-           claim it has already written or spending the whole `max_concurrent` ceiling
-           re-claiming the same held row inside one tick.
-           `w.kind = 'worker'` keeps the PLANNER dispatchable: it is created and
-           dispatched before the plan exists, so holding it on its own assumptions would
-           deadlock the feature permanently. `plan_hold` is the same rule for the
-           readers that render it.
-
-        4. **A dispatch that could not reach `claude` is backing off** — `retry_after`,
-           written by `release_dispatch_claim`. Without it the caller's `while` loop
-           re-claims the order it has just failed to launch, on the next iteration, and
-           spends the whole ceiling inside one tick.
+        `only` stays OUT of `CLAIM_RULES`: it is a restriction on this caller, not a
+        property of the row.
 
         For the overwhelming majority of work orders — no dependencies, no parent, never
         a failed launch — all four subqueries are vacuously true and this is the query it
         always was.
         """
-        marks = ",".join("?" for _ in ACTIVE_STATUSES)
+        where = " AND ".join(rule.sql for rule in CLAIM_RULES)
         only_ids: tuple[str, ...] = ()
         only_clause = ""
         if only is not None:
@@ -2532,35 +2629,11 @@ class ProjectStore:
         cur = self.conn.execute(
             f"""UPDATE work_orders SET status='dispatching', updated_at=?
                WHERE id = (SELECT w.id FROM work_orders w
-                           WHERE w.status='pending' AND w.hidden=0
-                             AND COALESCE(w.retry_after, 0) <= ?
-                             AND NOT EXISTS (
-                                 SELECT 1 FROM json_each(w.depends_on) dep
-                                 WHERE NOT EXISTS (
-                                     SELECT 1 FROM work_orders d
-                                     WHERE d.id = dep.value AND d.status = ?
-                                 )
-                             )
-                             AND NOT EXISTS (
-                                 SELECT 1 FROM feature_orders f
-                                 WHERE f.id = w.parent_id AND w.kind = 'worker'
-                                   AND f.max_parallel IS NOT NULL
-                                   AND f.max_parallel <= (
-                                       SELECT COUNT(*) FROM work_orders s
-                                       WHERE s.parent_id = f.id AND s.kind = 'worker'
-                                         AND s.status IN ({marks})
-                                   )
-                             )
-                             AND NOT (w.kind = 'worker' AND EXISTS (
-                                 SELECT 1 FROM feature_orders f
-                                 JOIN assumptions a ON a.wo_id = f.plan_wo_id
-                                 WHERE f.id = w.parent_id AND a.status = 'pending'
-                             ))
+                           WHERE {where}
                              {only_clause}
                            ORDER BY w.created_at LIMIT 1)
                RETURNING *"""
-            , (db.now(), db.now(), DEPENDENCY_SATISFIED_STATUS, *ACTIVE_STATUSES,
-               *only_ids),
+            , (db.now(), *_claim_params(), *only_ids),
         )
         row = cur.fetchone()
         if row is not None and cur.rowcount == 1:
@@ -2569,6 +2642,30 @@ class ProjectStore:
             # docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
             self._record_span(row["id"], "wo", "pending", "dispatching", trigger="claim")
         return dict(row) if row else None
+
+    def claim_refusal(self, wo: dict[str, Any]) -> _ClaimRule | None:
+        """The first `CLAIM_RULES` entry that refuses this row, or None.
+
+        ONE indexed single-row read, built from the same `sql` strings and the same
+        parameter builders as the claim's UPDATE — so the two read the same text by
+        construction rather than by agreement. No session file, no subprocess, no model
+        call, and `fleet.current` is not reached: this runs per work order per tick.
+        """
+        cols = ", ".join(f"({rule.sql}) AS {rule.code}" for rule in CLAIM_RULES)
+        row = self.conn.execute(
+            f"SELECT {cols} FROM work_orders w WHERE w.id = ?",
+            (*_claim_params(), wo["id"]),
+        ).fetchone()
+        if row is None:
+            # No row to find IS the selection rule refusing: `None` here would read as
+            # claimable and give a deleted work order an actor.
+            return CLAIM_RULES[0]
+        return next((rule for rule in CLAIM_RULES if not row[rule.code]), None)
+
+    def why_not_claimable(self, wo: dict[str, Any]) -> str | None:
+        """`claim_refusal`'s sentence, or None when the claim SQL would take this row."""
+        refusal = self.claim_refusal(wo)
+        return refusal.why if refusal else None
 
     def count_active(self) -> int:
         """How many work orders are spending one of this project's `max_concurrent` slots.
@@ -2618,6 +2715,24 @@ class ProjectStore:
         self.conn.execute(
             f"UPDATE work_orders SET {cols} WHERE id=?", (*fields.values(), wo_id)
         )
+
+    def adopt_spec_section(self, wo_id: str, section: str) -> bool:
+        """Record a spec section on a row that has none. True when the write landed.
+
+        `specs.spec_of`'s heal: the column is written once at plan release, so a child
+        whose row is NULL leaves every reader blind until somebody re-derives it. NEVER
+        overwrites a recorded value — a user or a manager that corrected a section by hand
+        owns it — and the guard is in the SQL rather than a read-then-write in Python, so
+        two readers racing on the same tick cannot both decide the column is empty. Spec
+        §2.1 of
+        docs/superpowers/specs/2026-10-13-an-assumption-review-payload-carries-its-spec-section.md
+        """
+        cur = self.conn.execute(
+            "UPDATE work_orders SET spec_section=?, updated_at=? "
+            "WHERE id=? AND (spec_section IS NULL OR spec_section='')",
+            (section, db.now(), wo_id),
+        )
+        return cur.rowcount > 0
 
     def set_status(self, wo_id: str, status: str, *, trigger: str = "",
                    **extra: Any) -> None:

@@ -13,10 +13,17 @@ against a fixture whose presence assertion runs beside it.
 
 from __future__ import annotations
 
+import ast
 import json
+import os
+import subprocess
+from pathlib import Path
 
-from jarvis import cli, ops
+import pytest
+
+from jarvis import cli, invariants, ops
 from jarvis.project_store import ProjectStore
+from jarvis.testing import make_git_project
 
 
 # -- fixtures: rounds and opinions, written straight into the store -------------------
@@ -446,7 +453,8 @@ def test_a_lost_implementor_envelope_keeps_the_old_sentence(jarvis_home, catalog
 # no closed round, so the test cannot tell a flagged order from an unflagged one.
 
 
-def escalated(project, title: str = "the panel gave up on it") -> dict:
+def escalated(project, title: str = "the panel gave up on it",
+              cause: str = ops.ESCALATION_ROUNDS_SPENT) -> dict:
     """A work order in the live shape of wo-659be188: `needs_review`, latest round
     `escalated`, and NO assumption rows at all."""
     store = ProjectStore(project)
@@ -455,7 +463,8 @@ def escalated(project, title: str = "the panel gave up on it") -> dict:
         round_row = store.open_validation_round(wo_id=wo["id"], fingerprint="cccc3333",
                                                summary="ship it", evidence="ran pytest")
         ops.escalate_validation_round(store, wo, round_row["id"], round_row["round"],
-                                      "two rounds running asked for the same test")
+                                      "two rounds running asked for the same test",
+                                      cause=cause)
         return store.get_work_order(wo["id"])
     finally:
         store.close()
@@ -493,7 +502,8 @@ def test_the_review_control_names_the_round_that_gave_up_not_the_row_after_it(
         gave_up = store.open_validation_round(wo_id=wo["id"], fingerprint="r4")
         ops.escalate_validation_round(store, store.get_work_order(wo["id"]),
                                       gave_up["id"], gave_up["round"],
-                                      "four rounds asked for the same test")
+                                      "four rounds asked for the same test",
+                                      cause=ops.ESCALATION_ROUNDS_SPENT)
         after = store.open_validation_round(wo_id=wo["id"], fingerprint="r5")
         assert after["round"] == 5                      # the row that judged nothing
 
@@ -503,6 +513,11 @@ def test_the_review_control_names_the_round_that_gave_up_not_the_row_after_it(
 
     assert owed["escalated"] is True
     assert owed["round"] == 4
+    # `escalation_cause` is keyed on the round's id, so §A's row choice also decides
+    # whether the cause is found at all — row 5 carries no `validation_escalated` event.
+    assert owed["cause"] == ops.ESCALATION_ROUNDS_SPENT
+    assert owed["family"] == "handover"
+    assert "round 4 was its last" in owed["why"]
 
 
 def test_review_state_places_the_one_control_in_the_assumptions_block(
@@ -553,3 +568,376 @@ def test_no_decision_owed_means_no_key_at_all(jarvis_home, catalog_file, project
 
     doc = json.loads(_out(capsys, ["--json", "wo", "show", wo["id"]]))
     assert "review" not in doc
+
+
+# -- an escalated round says WHY, and what to run next ----------------------------------
+#
+# docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md,
+# GitHub issue #1040. Two facts per escalation: which condition fired, and the command
+# THIS order's shape accepts — a no-PR order is never pointed at `jarvis validation force`.
+
+#: Every cause a call site writes. `unrecorded` is a READ-time fallback and never written.
+CAUSES = [c for c in ops.ESCALATION_FAMILY if c != ops.ESCALATION_CAUSE_UNRECORDED]
+
+
+def _git(cwd: Path, *args: str) -> str:
+    env = {"HOME": str(cwd), "PATH": os.environ.get("PATH", ""),
+           "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+           "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+    return subprocess.run(["git", "-C", str(cwd), *args], check=True, env=env,
+                          capture_output=True, text=True).stdout
+
+
+@pytest.fixture()
+def git_project(tmp_path, claude_json) -> Path:
+    """A real repository whose `origin` matches the pull request the harness opens —
+    the evidence collector reads both, so a packet off this one has a diff to judge."""
+    proj = make_git_project(tmp_path, "proj_a")
+    _git(proj, "symbolic-ref", "HEAD", "refs/heads/main")
+    _git(proj, "add", "-A")
+    _git(proj, "commit", "-qm", "base")
+    _git(proj, "remote", "add", "origin", "https://github.com/acme/proj.git")
+    claude_json(proj)
+    return proj
+
+
+def _payload(store, wo_id: str) -> dict:
+    events = store.events_of_kind(wo_id, "validation_escalated")
+    assert events, "nothing escalated"
+    return json.loads(events[-1]["payload"])
+
+
+@pytest.mark.parametrize("cause", CAUSES)
+def test_escalation_records_its_cause_in_the_event_payload(jarvis_home, catalog_file,
+                                                           project, cause):
+    """Spec §2: the one home writes the cause, and §1's one dict gives every cause a
+    family — a cause with none is a `KeyError` here rather than a blank sentence.
+
+    THE STAGED SHAPE, DELIBERATELY, and only for the mapping: every cause at once is what
+    makes a missing family a failure. WHICH CONDITION the real daemon picks is a separate
+    question and is driven at the real call site per cause — `rounds_spent`,
+    `user_rework_ceiling` and `rebinds_spent` by the three tests below,
+    `nothing_to_judge` by test_the_escalations_that_never_call_the_validator_notify_too
+    and `validator_unreachable` by test_three_outages_ping_the_user_once_not_once_per_attempt
+    (both tests/test_validation_loop.py), `bounce_exhausted` by
+    test_the_third_bounce_asks_the_user_and_the_flag_survives_a_reconcile
+    (tests/test_validation_bounce.py).
+    `prompt_refused`, `repeat_submission` and `no_verdict` have NO real site reachable
+    from here — one needs a seat prompt over the 400000-char ceiling, one needs a byte
+    identical resubmission that the fingerprint escalates before any validator runs, and
+    one needs a validator returning a non-verdict — so for those three this fixture is
+    the only coverage of the cause, and the mapping is all it claims."""
+    wo = escalated(project, cause=cause)
+    store = ProjectStore(project)
+    try:
+        payload = _payload(store, wo["id"])
+        state = ops.review_state(store, wo)
+    finally:
+        store.close()
+
+    assert payload["cause"] == cause
+    assert ops.ESCALATION_FAMILY[cause] in ("handover", "not_reviewed", "unjudged")
+    assert state["cause"] == cause
+    assert state["family"] == ops.ESCALATION_FAMILY[cause]
+    assert state["why"] and state["next"]
+
+
+#: Phrases that DENY anyone judged the work. A verb claiming a rejection beside any of
+#: these is the contradiction kn-bec32368 forbids — one escalation worded two ways.
+NOBODY_JUDGED = ("nobody judged", "no seat judged", "nothing new to judge",
+                 "could not be reached", "reached no verdict")
+
+#: Phrases that ASSERT a panel opinion was given. Only a `handover` round has one, so on
+#: any other family these are false wherever they appear — `accept`, `reject` or `next`.
+PANEL_OPINION = ("the panel's asks", "the panel's objection", "the panel's verdict")
+
+
+@pytest.mark.parametrize("cause", CAUSES)
+def test_no_escalation_claims_a_rejection_while_denying_anyone_judged(
+        jarvis_home, catalog_file, project, cause):
+    """THE ROUND-1 REJECTION. `bounce_exhausted`, `nothing_to_judge` and
+    `repeat_submission` were `handover` — verb "was rejected and handed to you" — while
+    their own `why` says no seat judged the submission. The page header, `review_lines`,
+    the timeline label and the notification title all read off the verb, so one
+    mismatched family words a NON-DECISION as a rejection on four surfaces at once.
+
+    Both directions, because either alone is satisfiable by deleting a sentence.
+
+    AND THE SAME BAN ON THE ACTIONS: `accept`, `reject` and every `next` line are read
+    beside the verb, so a neutral verb above "the panel's asks" is the same contradiction
+    one sentence further down (Neo 1723)."""
+    wo = escalated(project, cause=cause)
+    store = ProjectStore(project)
+    try:
+        state = ops.review_state(store, wo)
+    finally:
+        store.close()
+
+    verb, why = state["verb"].lower(), state["why"].lower()
+    if "rejected" in verb:
+        assert not [p for p in NOBODY_JUDGED if p in why], (
+            f"{cause}: verb claims a rejection, why denies anyone judged")
+    else:
+        assert state["family"] in ("not_reviewed", "unjudged"), cause
+        assert "rejected" not in verb, cause
+
+    sentences = [state["accept"], state["reject"], *state["next"]]
+    if state["family"] == "handover":
+        assert [s for s in sentences if "the panel's asks" in s], cause
+        assert [s for s in sentences if "the panel's objection" in s], cause
+        return
+    for s in sentences:
+        low = s.lower()
+        assert not [p for p in PANEL_OPINION if p in low], (
+            f"{cause}: {s!r} cites a panel opinion nobody gave")
+        if "panel verdict" in low:
+            assert ("without a panel verdict" in low or "no panel verdict" in low), (
+                f"{cause}: {s!r} asserts a panel verdict as given")
+
+
+def test_an_unrecorded_escalation_cites_no_panel_opinion():
+    """`unrecorded` is a legacy event with no cause — it may have been an unjudged round,
+    so a panel clause could be false. Neutral like the other non-`handover` families."""
+    for line in ops.escalation_next({"id": "wo-x"}, "unrecorded"):
+        low = line.lower()
+        assert not [p for p in PANEL_OPINION if p in low], line
+        if "panel verdict" in low:
+            assert "without a panel verdict" in low or "no panel verdict" in low, line
+
+
+def test_every_escalation_call_site_names_its_cause():
+    """Spec §2 and rejected alternative 6: KEYWORD-ONLY and NO DEFAULT, so the next call
+    site added cannot revert the surface to the vague sentence by forgetting it."""
+    import inspect
+
+    from jarvis import daemon as daemon_mod
+
+    cause = inspect.signature(ops.escalate_validation_round).parameters["cause"]
+    assert cause.kind is inspect.Parameter.KEYWORD_ONLY
+    assert cause.default is inspect.Parameter.empty
+
+    calls = []
+    for module in (ops, daemon_mod):
+        tree = ast.parse(Path(module.__file__).read_text())
+        calls += [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                  and (getattr(node.func, "attr", None) or getattr(node.func, "id", ""))
+                  in ("_escalate", "escalate_validation_round")]
+
+    assert len(calls) >= 7, "a call site went missing"
+    for call in calls:
+        named = [kw.arg for kw in call.keywords]
+        assert "cause" in named, f"line {call.lineno} escalates without a cause"
+
+
+def test_a_rejection_on_a_user_rework_round_at_the_ceiling_says_so(
+        tmp_path, git_project, jarvis_home, fake_claude, fake_gh):
+    """THE #1040 SHAPE, through the real `Daemon._validate_work_order`: the round after
+    the user's own rejection, rejected with the counted budget spent. A decision with
+    concrete asks, which must not read as "the panel gave up"."""
+    from tests.test_rejudge_moved_head import (
+        Panel, PUSHED, _cfg, _user_rejected, artifact, boot, judge, parked)
+
+    fleet = boot(tmp_path, git_project, max_rounds=2)
+    store, wo = parked(git_project, rounds=2)          # the counted budget is spent
+    _user_rejected(store, wo)
+    artifact(fake_gh, head_oid=PUSHED)
+    row = ops.submit_for_validation(store, git_project,
+                                    store.get_work_order(wo["id"]),
+                                    declared="did the rework", cfg=_cfg(fleet))
+    assert row is not None and row["uncounted_cause"] == ops.USER_REWORK_CAUSE
+
+    judge(fleet, store, Panel("rejected"))
+
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["status"] == "needs_review"
+    assert _payload(store, wo["id"])["cause"] == ops.ESCALATION_USER_REWORK_CEILING
+    state = ops.review_state(store, fresh)
+    assert state["cause"] == ops.ESCALATION_USER_REWORK_CEILING
+    assert state["family"] == "handover"
+    assert "had no round left to send back" in state["why"]
+    assert "gave up" not in state["why"]
+    store.close()
+
+
+def test_a_rejection_with_the_counted_budget_spent_says_rounds_spent(
+        tmp_path, git_project, jarvis_home, fake_claude, fake_gh):
+    """The ordinary arm of the same three-way choice, through the real
+    `Daemon._validate_work_order`: no exemption on the round, so the cause is the round
+    budget and not the user's rework or a rebind."""
+    from tests.test_rejudge_moved_head import (
+        Panel, PUSHED, _cfg, artifact, boot, judge, parked)
+
+    fleet = boot(tmp_path, git_project, max_rounds=2)
+    store, wo = parked(git_project, rounds=1)
+    artifact(fake_gh, head_oid=PUSHED)
+    row = ops.submit_for_validation(store, git_project,
+                                    store.get_work_order(wo["id"]),
+                                    declared="another go", cfg=_cfg(fleet))
+    assert row is not None and not row["uncounted"], "an ordinary, counted round"
+
+    judge(fleet, store, Panel("rejected"))
+
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["status"] == "needs_review"
+    assert _payload(store, wo["id"])["cause"] == ops.ESCALATION_ROUNDS_SPENT
+    assert ops.review_state(store, fresh)["family"] == "handover"
+    store.close()
+
+
+def test_a_rejected_rebind_with_the_rebind_budget_spent_says_rebinds_spent(
+        tmp_path, git_project, jarvis_home, fake_claude, fake_gh):
+    """The third arm, and the one the round NUMBER cannot name: a rebind sits past
+    `max_rounds` and is bounded by `ops.REBIND_MAX` instead, so the daemon has to pick
+    this cause off `as_rebind` rather than off the budget position."""
+    from tests.test_rejudge_moved_head import (
+        AGAIN, Panel, PUSHED, _cfg, _moved, artifact, boot, judge, parked)
+
+    fleet = boot(tmp_path, git_project, max_rounds=3)
+    store, wo = parked(git_project, rounds=3)
+    artifact(fake_gh, head_oid=PUSHED)
+    ops.rejudge_moved_head(store, git_project, wo, project="proj_a", cfg=_cfg(fleet),
+                           decision=_moved(PUSHED), rebind=True)
+    first = store.latest_validation_round(wo_id=wo["id"])
+    store.set_validation_head(first["id"], PUSHED)
+    store.close_validation_round(first["id"], "passed", "")
+    store.set_status(wo["id"], "waiting_pr_merge")
+
+    artifact(fake_gh, head_oid=AGAIN)
+    ops.rejudge_moved_head(store, git_project, store.get_work_order(wo["id"]),
+                           project="proj_a", cfg=_cfg(fleet),
+                           decision=_moved(AGAIN), rebind=True)
+    judge(fleet, store, Panel("rejected"))
+
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["status"] == "needs_review"
+    assert _payload(store, wo["id"])["cause"] == ops.ESCALATION_REBINDS_SPENT
+    state = ops.review_state(store, fresh)
+    assert state["family"] == "handover"
+    assert "the OS asked for itself" in state["why"]
+    store.close()
+
+
+@pytest.mark.parametrize("cause", [ops.ESCALATION_ROUNDS_SPENT,
+                                   ops.ESCALATION_NO_VERDICT])
+def test_a_no_pr_escalated_order_is_never_pointed_at_validation_force(
+        jarvis_home, catalog_file, project, capsys, cause):
+    """THE REGRESSION. `ops.force_validation_refusal` refuses a no-PR force, so no
+    surface may recommend it — spec §4, both families."""
+    ops.start_os(str(catalog_file), foreground=True)
+    wo = escalated(project, cause=cause)
+
+    human = _out(capsys, ["wo", "show", wo["id"]])
+    raw = _out(capsys, ["--json", "wo", "show", wo["id"]])
+    shown = _out(capsys, ["validation", "show", wo["id"]])
+
+    for out in (human, raw, shown):
+        assert "validation force" not in out
+    assert f'jarvis wo review {wo["id"]} --reject' in human
+    assert f'jarvis wo review {wo["id"]} --reject' in shown
+    assert any("--reject" in line for line in json.loads(raw)["review"]["next"])
+
+
+@pytest.mark.parametrize("cause", CAUSES)
+def test_the_give_up_notification_names_the_family_and_never_gave_up(
+        jarvis_home, catalog_file, project, cause):
+    """One vocabulary on every surface — `ops.ESCALATION_VERB` (spec §3). The title
+    `Daemon._escalate_feature` still uses is unchanged: a feature escalation records no
+    cause and has no family to name."""
+    wo = escalated(project, cause=cause)
+    store = ProjectStore(project)
+    try:
+        titles = [row["title"] for row in store.unrouted_notifications()
+                  if row["source"] == "validation"]
+    finally:
+        store.close()
+
+    verb = ops.ESCALATION_VERB[ops.ESCALATION_FAMILY[cause]]
+    assert titles == [ops.ESCALATION_TITLE.format(unit=wo["id"], n=1, verb=verb)]
+    assert "gave up" not in titles[0]
+
+
+def test_a_legacy_escalated_event_with_no_cause_field_reads_as_unrecorded(
+        jarvis_home, catalog_file, project):
+    """Spec §1: an event written before this change lacks the field, and guessing from
+    its `reason` prose would put a wrong sentence — and a wrong command — on it."""
+    wo = escalated(project)
+    store = ProjectStore(project)
+    try:
+        event = store.events_of_kind(wo["id"], "validation_escalated")[-1]
+        legacy = {k: json.loads(event["payload"])[k]
+                  for k in ("round", "round_id", "reason")}
+        store.conn.execute("UPDATE wo_events SET payload=? WHERE id=?",
+                           (json.dumps(legacy), event["id"]))
+        store.conn.commit()
+        state = ops.review_state(store, wo)
+    finally:
+        store.close()
+
+    assert state["cause"] == ops.ESCALATION_CAUSE_UNRECORDED
+    assert state["family"] == "unrecorded"
+    assert "before the OS recorded which condition fired" in state["why"]
+    assert not [line for line in state["next"] if "validation force" in line]
+
+
+@pytest.mark.parametrize("cause", CAUSES)
+def test_validation_stuck_blocker_is_unchanged_for_every_cause(jarvis_home, catalog_file,
+                                                               project, cause):
+    """Spec §6: one attention sentence for every cause, byte for byte. A reason
+    `invariants.true_blockers` cannot re-derive is rewritten by INV-ATTENTION-REASON and
+    the flag stops acking."""
+    ops.start_os(str(catalog_file), foreground=True)
+    wo = escalated(project, cause=cause)
+    store = ProjectStore(project)
+    try:
+        assert (store.get_work_order(wo["id"])["attention_reason"]
+                == invariants.VALIDATION_STUCK_BLOCKER)
+    finally:
+        store.close()
+
+    ops.ack_attention(wo["id"])
+    store = ProjectStore(project)
+    try:
+        assert not store.get_work_order(wo["id"])["needs_attention"]
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("cause", [ops.ESCALATION_ROUNDS_SPENT,
+                                   ops.ESCALATION_NO_VERDICT])
+@pytest.mark.parametrize("pr_url", ["", "https://github.com/acme/proj/pull/7"])
+def test_validation_force_is_offered_only_when_the_refusal_would_allow_it(
+        jarvis_home, catalog_file, project, cause, pr_url):
+    """Spec §4's one-direction pin: the two predicates may differ in strictness, and only
+    this way round — a command the next line of the OS refuses is issue #1040."""
+    ops.start_os(str(catalog_file), foreground=True)
+    wo = escalated(project, cause=cause)
+    store = ProjectStore(project)
+    try:
+        if pr_url:
+            store.update_work_order(wo["id"], pr_url=pr_url)
+        fresh = store.get_work_order(wo["id"])
+        state = ops.review_state(store, fresh)
+        offered = [line for line in state["next"] if "validation force" in line]
+        refusal = ops.force_validation_refusal(
+            store, fresh, project="proj_a", cfg=ops.validation_config("proj_a"))
+    finally:
+        store.close()
+
+    if offered:
+        assert refusal is None or "carries no pull request" not in refusal
+    assert bool(offered) == bool(pr_url and state["family"] == "unjudged")
+
+
+def test_validation_show_prints_the_owed_decision_once(jarvis_home, catalog_file,
+                                                       project, capsys):
+    """Spec §5: after the rounds, not per round — `ops.review_lines` is the one builder
+    and this surface prints it where a reader has already read the deliberation."""
+    ops.start_os(str(catalog_file), foreground=True)
+    wo = escalated(project)
+
+    out = _out(capsys, ["validation", "show", wo["id"]])
+
+    assert out.count("owed:") == 1
+    assert out.count("why:") == 1
+    assert out.index("round 1") < out.index("owed:")

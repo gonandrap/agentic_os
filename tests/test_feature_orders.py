@@ -1120,6 +1120,105 @@ def test_a_refreshed_spec_reaches_the_children_and_the_feature_agent(planning, s
     assert "frozen records" in definition.read_text()
 
 
+# -- a child's section is derivable, not written once ----------------------------------
+#
+# §2.1 of
+# docs/superpowers/specs/2026-10-13-an-assumption-review-payload-carries-its-spec-section.md
+# `work_orders.spec_section` is written once at plan release, so a row
+# whose column is NULL leaves every reader of `spec_of` equally blind — the worker prompt,
+# the panel packet, the dashboard and the assumption reviewer.
+
+
+def _with_plan(store, *children: dict) -> tuple[dict, list[dict]]:
+    """A released feature whose plan is written straight to the row, with its children."""
+    fo = store.create_feature_order("CSV export", description=ASK)
+    plan = a_plan(*children)
+    plan["design_doc_content"] = FIXTURE_DESIGN_DOC_BODY
+    store.update_feature_order(fo["id"], plan=db.to_json(plan))
+    return fo, store.create_plan_children(fo["id"], list(children))
+
+
+def test_a_child_with_no_recorded_section_resolves_it_from_the_plan_and_adopts_it(store):
+    """§2.1. The join is the title, exact; the heal makes the ROW true, not just one
+    prompt."""
+    _, (kid,) = _with_plan(store, child("reader"))
+    store.update_work_order(kid["id"], spec_section=None)
+
+    spec = specs.spec_of(store, store.get_work_order(kid["id"]))
+
+    section = fixture_spec_section("reader")
+    assert spec["section"] == section
+    assert spec["section_text"]
+    assert store.get_work_order(kid["id"])["spec_section"] == section
+
+
+def test_the_heal_runs_once_and_the_fallback_is_not_re_entered(store, monkeypatch):
+    """§2.1. Healing makes the fallback dead code on every subsequent read, which is what
+    keeps a title join cheap."""
+    _, (kid,) = _with_plan(store, child("reader"))
+    store.update_work_order(kid["id"], spec_section=None)
+    specs.spec_of(store, store.get_work_order(kid["id"]))
+
+    def never(*a, **k):
+        raise AssertionError("the fallback ran against a healed row")
+
+    monkeypatch.setattr(specs, "_plan_section_for_title", never)
+    again = specs.spec_of(store, store.get_work_order(kid["id"]))
+
+    assert again["section"] == fixture_spec_section("reader")
+
+
+def test_a_recorded_section_that_disagrees_with_the_plan_is_never_overwritten(store):
+    """§2.1, the user's ruling on question 1690: a corrected section is owned by whoever
+    corrected it."""
+    _, (kid,) = _with_plan(store, child("reader"))
+    corrected = fixture_spec_section("by-hand")
+    assert corrected != fixture_spec_section("reader")
+    store.update_work_order(kid["id"], spec_section=corrected)
+
+    spec = specs.spec_of(store, store.get_work_order(kid["id"]))
+
+    assert spec["section"] == corrected
+    assert store.get_work_order(kid["id"])["spec_section"] == corrected
+
+
+def test_two_plan_children_sharing_one_title_resolve_to_nothing(store):
+    """§2.1: the match must be UNIQUE. A near-match writes the wrong section into a column
+    four readers trust."""
+    twin = child("writer")
+    twin["title"] = child("reader")["title"]
+    _, kids = _with_plan(store, child("reader"), twin)
+    for kid in kids:
+        store.update_work_order(kid["id"], spec_section=None)
+
+    spec = specs.spec_of(store, store.get_work_order(kids[0]["id"]))
+
+    assert spec["section"] == "" and spec["section_text"] == ""
+    assert not store.get_work_order(kids[0]["id"])["spec_section"]
+
+
+def test_a_title_in_no_plan_item_resolves_to_nothing(store):
+    """§2.1: absent resolves to nothing, never to a guess."""
+    _, (kid,) = _with_plan(store, child("reader"))
+    store.update_work_order(kid["id"], spec_section=None, title="Something else")
+
+    spec = specs.spec_of(store, store.get_work_order(kid["id"]))
+
+    assert spec["section"] == "" and spec["section_text"] == ""
+    assert not store.get_work_order(kid["id"])["spec_section"]
+
+
+def test_a_planner_and_a_manager_still_have_no_section_of_their_own(store):
+    """§2.1: three readers depend on `spec_of` answering None for both."""
+    fo, _ = _with_plan(store, child("reader"))
+    planner = store.create_work_order("Plan CSV export", parent_id=fo["id"],
+                                      kind="planner")
+    manager = store.create_manager_order(fo["id"])
+
+    assert specs.spec_of(store, planner) is None
+    assert specs.spec_of(store, manager) is None
+
+
 # -- the spec a person can open ---------------------------------------------------------
 #
 # docs/superpowers/specs/2026-09-28-a-feature-spec-you-can-open.md. The document the OS

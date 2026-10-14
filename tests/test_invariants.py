@@ -2180,3 +2180,314 @@ def test_the_undeclared_delivery_detector_follows_the_widened_predicate(project)
 
     assert not invariants.undeclared_delivery(store, store.get_work_order(
         answered["id"]))
+
+
+# -- a stored spec pointer has to open --------------------------------------------------
+#
+# §2.3 of
+# docs/superpowers/specs/2026-10-13-an-assumption-review-payload-carries-its-spec-section.md
+# `plan["design_doc"]` is what `spec_link` renders and what `jarvis spec
+# section` is given; fo-69ba1cc4 stores a path no file is at, and nothing reported it.
+
+#: Composed, never written: tests/test_spec_location.py refuses the literal in any tracked
+#: file.
+LEGACY_PREFIX = "docs/" + "specs/"
+CANONICAL_DOC = "docs/superpowers/specs/exporter.md"
+
+
+def _feature_with_pointer(store: ProjectStore, design_doc: str | None) -> dict:
+    from jarvis import db
+
+    fo = store.create_feature_order("CSV export", description="an exporter")
+    plan = {"summary": "an exporter", "children": [],
+            "design_doc_content": "# Exporter design\n"}
+    if design_doc is not None:
+        plan["design_doc"] = design_doc
+    store.update_feature_order(fo["id"], plan=db.to_json(plan))
+    return store.get_feature_order(fo["id"])
+
+
+def _pointer_violations(store: ProjectStore) -> list:
+    return list(invariants.check_spec_pointer_resolves(store))
+
+
+def _stored_doc(store: ProjectStore, fo_id: str) -> str:
+    from jarvis import db
+
+    return db.from_json(store.get_feature_order(fo_id)["plan"], {}).get("design_doc", "")
+
+
+def test_a_dead_spec_pointer_with_one_tracked_match_is_repointed(project):
+    """§2.3. The repair is by BASENAME and generic: a literal prefix rewrite would fix the
+    rows that exist today and nothing else."""
+    store = ProjectStore(project)
+    fo = _feature_with_pointer(store, LEGACY_PREFIX + "exporter.md")
+
+    (found,) = _pointer_violations(store)
+
+    assert found.invariant == "INV-SPEC-POINTER-REAL"
+    assert found.repaired is True
+    assert found.repair == f"repointed {fo['id']}'s design_doc to {CANONICAL_DOC}"
+    assert _stored_doc(store, fo["id"]) == CANONICAL_DOC
+
+
+def test_two_tracked_files_of_that_basename_owe_a_decision_and_change_nothing(project):
+    """§2.3: zero or more than one match is reported unrepaired, with an `owed` sentence
+    naming the decision and the command that takes it."""
+    from jarvis.testing import commit
+
+    store = ProjectStore(project)
+    second = Path(project) / "notes" / "exporter.md"
+    second.parent.mkdir(parents=True, exist_ok=True)
+    second.write_text("# a second one\n")
+    commit(Path(project), "a second exporter.md", "notes/exporter.md")
+    fo = _feature_with_pointer(store, LEGACY_PREFIX + "exporter.md")
+
+    (found,) = _pointer_violations(store)
+
+    assert found.repaired is False
+    assert found.owed
+    assert "notes/exporter.md" in found.owed and CANONICAL_DOC in found.owed
+    assert _stored_doc(store, fo["id"]) == LEGACY_PREFIX + "exporter.md"
+
+
+def test_no_tracked_file_of_that_basename_owes_a_decision(project):
+    store = ProjectStore(project)
+    fo = _feature_with_pointer(store, "docs/superpowers/specs/ghost.md")
+
+    (found,) = _pointer_violations(store)
+
+    assert found.repaired is False
+    assert found.owed and "ghost.md" in found.owed
+    assert _stored_doc(store, fo["id"]) == "docs/superpowers/specs/ghost.md"
+
+
+def test_a_pointer_that_resolves_and_a_plan_with_no_pointer_are_silent(project):
+    """Settled features included, on `check_work_lands`' reasoning — but a pointer that
+    opens, a plan without one and a feature with no plan at all say nothing."""
+    store = ProjectStore(project)
+    _feature_with_pointer(store, CANONICAL_DOC)
+    _feature_with_pointer(store, None)
+    store.create_feature_order("unplanned", description="nothing yet")
+
+    assert _pointer_violations(store) == []
+
+
+def test_a_read_only_doctor_run_reports_the_dead_pointer_and_writes_nothing(project):
+    """§2.3: `_ReadOnly._BLOCKED` had to learn `update_feature_order`, or reporting would
+    rewrite plans before the user agreed to let it touch anything."""
+    store = ProjectStore(project)
+    fo = _feature_with_pointer(store, LEGACY_PREFIX + "exporter.md")
+    before = store.get_feature_order(fo["id"])["plan"]
+
+    found = check_project(store, repair=False, slow=True)
+
+    assert [v.invariant for v in found
+            if v.invariant == "INV-SPEC-POINTER-REAL"] == ["INV-SPEC-POINTER-REAL"]
+    assert store.get_feature_order(fo["id"])["plan"] == before
+
+
+def test_two_features_with_dead_pointers_are_two_standing_violations(project):
+    """§2.3, Neo 1695: the dedupe identity is the SUBJECT. Both yield `wo_id=None`, so a
+    key on `wo_id` alone collapsed N dead pointers into one problem."""
+    store = ProjectStore(project)
+    first = _feature_with_pointer(store, "docs/superpowers/specs/ghost.md")
+    second = _feature_with_pointer(store, "docs/superpowers/specs/phantom.md")
+
+    found = _pointer_violations(store)
+
+    assert len(found) == 2
+    assert {v.key for v in found} == {
+        ("INV-SPEC-POINTER-REAL", first["id"]),
+        ("INV-SPEC-POINTER-REAL", second["id"]),
+    }
+    assert all(v.wo_id is None and v.owed for v in found)
+    assert {v.subject_id: v.context["fo_id"] for v in found} == {
+        first["id"]: first["id"], second["id"]: second["id"]}
+
+
+def test_a_repaired_pointer_violation_also_names_its_feature(project):
+    """§2.3: the repaired branch carries `subject_id` too, or a repair on one feature
+    silences the report of a repair on the next."""
+    store = ProjectStore(project)
+    fo = _feature_with_pointer(store, LEGACY_PREFIX + "exporter.md")
+
+    (found,) = _pointer_violations(store)
+
+    assert found.repaired is True
+    assert found.subject_id == fo["id"]
+    assert found.key == ("INV-SPEC-POINTER-REAL", fo["id"])
+
+
+# -- and it opens on the COMMITTED ref, never on this checkout ---------------------------
+#
+# docs/superpowers/specs/2026-10-14-inv-spec-pointer-real-reads-the-integration-branch.md
+
+
+def _planner_branch(store: ProjectStore, project: Path, fo_id: str,
+                    branch: str = "feat/plan") -> Path:
+    """A planner work order with a worktree on a branch of its own, as a dispatch makes."""
+    planner = store.create_work_order("Plan CSV export", parent_id=fo_id, kind="planner")
+    store.update_work_order(planner["id"], worktree=planner["id"])
+    store.update_feature_order(fo_id, plan_wo_id=planner["id"])
+    path = project / ".claude" / "worktrees" / planner["id"]
+    subprocess.run(["git", "-C", str(project), "worktree", "add", "-q", "-b", branch,
+                    str(path)], check=True, capture_output=True)
+    return path
+
+
+def test_a_design_doc_committed_but_absent_from_this_checkout_is_silent(project):
+    """§3.1, the issue-1044 regression: the dev checkout was 38 commits behind, so
+    `.exists()` reported a spec that is on the integration branch as missing."""
+    from jarvis.testing import commit
+
+    store = ProjectStore(project)
+    doc = Path(project) / "docs" / "superpowers" / "specs" / "merged.md"
+    doc.write_text("# merged\n")
+    commit(Path(project), "the merged spec", "docs/superpowers/specs/merged.md")
+    doc.unlink()
+    _feature_with_pointer(store, "docs/superpowers/specs/merged.md")
+
+    assert _pointer_violations(store) == []
+
+
+def test_a_design_doc_only_in_the_working_tree_still_raises(project):
+    """§3.2, the hide half: an uncommitted file short-circuited `.exists()`, so a genuinely
+    dead pointer stayed invisible for as long as it sat in somebody's checkout."""
+    store = ProjectStore(project)
+    local = Path(project) / "docs" / "superpowers" / "specs" / "draft.md"
+    local.write_text("# never committed\n")
+    fo = _feature_with_pointer(store, "docs/superpowers/specs/draft.md")
+
+    (found,) = _pointer_violations(store)
+
+    assert found.repaired is False
+    assert found.owed and "no tracked file carries that name" in found.owed
+    assert _stored_doc(store, fo["id"]) == "docs/superpowers/specs/draft.md"
+
+
+def test_a_design_doc_on_the_planners_branch_and_not_on_main_is_silent(project):
+    """§3.3 and §2.1's rung order: a spec committed on the planner's branch and not yet
+    merged must resolve, or every in-flight feature raises a violation."""
+    from jarvis.testing import commit
+
+    store = ProjectStore(project)
+    fo = _feature_with_pointer(store, "docs/superpowers/specs/branch-only.md")
+    worktree = _planner_branch(store, Path(project), fo["id"])
+    doc = worktree / "docs" / "superpowers" / "specs" / "branch-only.md"
+    doc.parent.mkdir(parents=True, exist_ok=True)
+    doc.write_text("# on the branch\n")
+    commit(worktree, "the spec, on the planner's branch",
+           "docs/superpowers/specs/branch-only.md")
+
+    assert _pointer_violations(store) == []
+
+
+def test_the_repair_only_considers_candidates_that_exist_on_the_ref(project):
+    """§3.4 and §2.3: the single-match branch WRITES, so a candidate from `git ls-files`
+    would repoint a shared row at a path that exists in one person's checkout only."""
+    store = ProjectStore(project)
+    local = Path(project) / "notes" / "exporter.md"
+    local.parent.mkdir(parents=True, exist_ok=True)
+    local.write_text("# local only\n")
+    fo = _feature_with_pointer(store, LEGACY_PREFIX + "exporter.md")
+
+    (found,) = _pointer_violations(store)
+
+    assert found.repaired is True
+    assert "notes/exporter.md" not in found.repair
+    assert _stored_doc(store, fo["id"]) == CANONICAL_DOC
+
+
+def test_the_remote_is_refreshed_at_most_once_however_many_rows_are_scanned(project,
+                                                                           monkeypatch):
+    """§3.5 and §2.2: the memo is threaded in by the caller, so "one fetch however many
+    rows" is an exact property rather than a wall-clock accident."""
+    from jarvis import landing
+
+    store = ProjectStore(project)
+    for name in ("ghost.md", "phantom.md", "spectre.md"):
+        _feature_with_pointer(store, f"docs/superpowers/specs/{name}")
+    calls: list[str] = []
+    monkeypatch.setattr(landing, "_fetch_ref",
+                        lambda repo, ref: calls.append(ref))
+
+    assert len(_pointer_violations(store)) == 3
+    assert calls == ["main"]
+
+
+def test_a_project_with_no_integration_branch_yields_no_violation(project,
+                                                                  monkeypatch):
+    """§3.6 and §2.4: a check that cannot run PASSES. The accepted price is that a repo
+    with no integration branch is not covered by this invariant at all."""
+    from jarvis import landing
+
+    store = ProjectStore(project)
+    _feature_with_pointer(store, "docs/superpowers/specs/ghost.md")
+    monkeypatch.setattr(landing, "base_ref", lambda repo: "")
+
+    assert _pointer_violations(store) == []
+
+
+def test_a_git_that_cannot_run_yields_no_violation(project, monkeypatch):
+    """§2.4: a git that would not execute is not an absent path. Reporting it as one
+    manufactures a violation, and an auto-repair search, out of an infrastructure
+    failure."""
+    from jarvis import landing
+
+    store = ProjectStore(project)
+    _feature_with_pointer(store, "docs/superpowers/specs/ghost.md")
+
+    real = landing.subprocess.run
+
+    # ONLY `cat-file`: a blanket patch empties `base_ref` too, and the row would then be
+    # silent by the no-base-ref path whatever `_object_exists` returns.
+    def refuses_cat_file(argv, *args, **kwargs):
+        if "cat-file" in argv:
+            raise OSError("no git here")
+        return real(argv, *args, **kwargs)
+
+    monkeypatch.setattr(landing.subprocess, "run", refuses_cat_file)
+
+    assert _pointer_violations(store) == []
+
+
+def test_subject_id_defaults_to_none_so_a_work_order_key_is_unchanged():
+    """§2.3: additive. Every violation that predates the field keys on `wo_id` exactly as
+    before."""
+    v = invariants.Violation(invariant="INV-TEST", detail="x", wo_id="wo-1")
+
+    assert v.subject_id is None
+    assert v.key == ("INV-TEST", "wo-1")
+
+
+def test_two_subject_violations_open_two_violation_report_rows(
+        jarvis_home, project, catalog_file, monkeypatch):
+    """§2.3: `Violation.key` alone is not the durable identity — `check_invariants` writes
+    the row, and keying it on `wo_id` left the collapse in the database."""
+    from jarvis.catalog import load_catalog
+    from jarvis.daemon import Daemon
+
+    ops.start_os(str(catalog_file), foreground=True)
+    violations = [invariants.Violation(invariant="INV-TEST-SUBJECT",
+                                       detail=f"dead pointer on {fo_id}",
+                                       subject_id=fo_id, owed=f"decide {fo_id}")
+                  for fo_id in ("fo-aaaa1111", "fo-bbbb2222")]
+    monkeypatch.setattr(invariants, "check_project", lambda *a, **k: violations)
+    catalog = load_catalog(catalog_file)
+    daemon, store = Daemon(catalog), ProjectStore(project)
+    try:
+        daemon.check_invariants(catalog.projects[0], store)
+
+        rows = [r for r in store.standing_violations()
+                if r["invariant"] == "INV-TEST-SUBJECT"]
+        assert sorted(r["wo_id"] for r in rows) == ["fo-aaaa1111", "fo-bbbb2222"]
+    finally:
+        store.close()
+
+
+def test_the_pointer_check_runs_on_the_slow_cadence_only():
+    """§2.3: its population is every feature order a project has ever had and its repair
+    lists the whole repository. `INVARIANTS` runs twice a minute per project."""
+    assert invariants.check_spec_pointer_resolves in invariants.SLOW_INVARIANTS
+    assert invariants.check_spec_pointer_resolves not in invariants.INVARIANTS

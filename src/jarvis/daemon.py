@@ -2934,7 +2934,8 @@ class Daemon:
                 self._escalate(store, wo, round_id, n,
                                "this submission changes no files and records no other "
                                "durable effect, so there is nothing to review. Nobody "
-                               "has judged the work.")
+                               "has judged the work.",
+                               cause=ops.ESCALATION_NOTHING_TO_JUDGE)
                 return
             if empty == "void":
                 self._void(store, wo, round_id, n, evidence_mod.void_reason(packet))
@@ -2962,7 +2963,8 @@ class Daemon:
                     store, wo, round_id, n,
                     f"this submission is identical to round {previous['round']} — the "
                     f"same changes and the same declared evidence — so the review has "
-                    f"nothing new to judge.")
+                    f"nothing new to judge.",
+                    cause=ops.ESCALATION_REPEAT_SUBMISSION)
                 return
 
             failure: claude_cli.ClaudeCliError | None = None
@@ -3067,13 +3069,23 @@ class Daemon:
                 # is over, so the follow-ups are filed rather than lost with it.
                 self._file_follow_ups(store, project, round_row, follow_ups, cfg,
                                       unit=wo_id, wo_id=wo_id)
+                # WHICH of the three handovers this is, from the values already computed
+                # above: the branch is reached only when `goes_back` is False, and what
+                # turned it False is `as_rebind` plus `cause` (spec
+                # 2026-10-14-an-escalated-round-says-why-and-what-to-run-next §1).
+                spent = (ops.ESCALATION_REBINDS_SPENT if as_rebind
+                         else ops.ESCALATION_USER_REWORK_CEILING
+                         if uncounted and cause == ops.USER_REWORK_CAUSE
+                         else ops.ESCALATION_ROUNDS_SPENT)
                 self._escalate(store, wo, round_id, n, reason or (
-                    f"the review was not satisfied after {max_rounds} rounds."))
+                    f"the review was not satisfied after {max_rounds} rounds."),
+                    cause=spent)
             else:
                 # `escalated`, or anything the validator returned that is not a verdict
                 # this machine knows. Either way a human decides.
                 self._escalate(store, wo, round_id, n, reason or (
-                    "the review could not reach a verdict."))
+                    "the review could not reach a verdict."),
+                    cause=ops.ESCALATION_NO_VERDICT)
         except Exception:  # noqa: BLE001 — a round must never kill the daemon
             log.exception("[%s] validating %s failed", project.name, wo_id)
         finally:
@@ -3267,7 +3279,7 @@ class Daemon:
 
     @staticmethod
     def _escalate(store: ProjectStore, wo: dict, round_id: int, n: int,
-                  reason: str) -> None:
+                  reason: str, *, cause: str) -> None:
         """Give up on this unit and ask the user.
 
         The attention reason is `VALIDATION_STUCK_BLOCKER` VERBATIM, because
@@ -3293,10 +3305,15 @@ class Daemon:
         `ops.submit_for_validation` gives up the same way when a submitter has ignored
         the panel's list twice running — and two give-ups that only look alike are two
         attention flags that drift.
+
+        `cause` is an `ops.ESCALATION_FAMILY` key, keyword-only and required at every
+        site: spec
+        docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md
+        §2.
         """
         from . import ops
 
-        ops.escalate_validation_round(store, wo, round_id, n, reason)
+        ops.escalate_validation_round(store, wo, round_id, n, reason, cause=cause)
 
     @staticmethod
     def _validation_held(store: ProjectStore, wo: dict, round_id: int, n: int,
@@ -3455,6 +3472,8 @@ class Daemon:
         re-derives above VALIDATION_STUCK_BLOCKER: "the panel could not be satisfied"
         would point the user at the work, and the cause is a prompt nobody ever sent.
         """
+        from . import ops
+
         central = CentralStore()          # thread-local, as `_round_config` opens its own
         try:
             said = self._note_prompt_refusal(central, store, project.name, wo["id"],
@@ -3465,7 +3484,8 @@ class Daemon:
             store, wo, round_id, n,
             f"the review could not be run: the OS built a {said['total']}-char prompt "
             f"for it, over the {said['ceiling']}-char ceiling ({said['setting']}), so "
-            f"it was never sent. Nobody has judged the work.")
+            f"it was never sent. Nobody has judged the work.",
+            cause=ops.ESCALATION_PROMPT_REFUSED)
         from . import invariants
 
         store.flag_attention(wo["id"], invariants.os_prompt_refused_blocker(said))
@@ -3480,6 +3500,8 @@ class Daemon:
         tries again. Three in a row is where retrying stops — the outages are counted
         from the events, so a daemon restart does not hand the round a fresh budget.
         """
+        from . import ops
+
         wo_id = wo["id"]
         outages = 1 + sum(
             1 for e in store.events_of_kind(wo_id, "validation_failed")
@@ -3494,7 +3516,8 @@ class Daemon:
             self._escalate(
                 store, wo, round_id, n,
                 f"the review could not be run: the validator was unreachable "
-                f"{outages} times in a row. Nobody has judged the work.")
+                f"{outages} times in a row. Nobody has judged the work.",
+                cause=ops.ESCALATION_VALIDATOR_UNREACHABLE)
 
     def _round_config(self, project: ProjectSpec, round_row: dict[str, Any]) -> Any:
         """The validation settings THE ROUND WAS OPENED UNDER, not the live ones.
@@ -5541,7 +5564,9 @@ class Daemon:
             # attention list from state alone — Neo 1084, `ops.os_status`. `owed` rides
             # along for the same reason and is written FIRST, so the row exists before
             # the derivation below reads it.
-            first = store.open_violation_report(v.invariant, v.wo_id, level=v.level,
+            # `v.key[1]`, not `v.wo_id`: the row must dedupe on the same subject `key`
+            # does, or a feature-level check collapses N subjects into one row (Neo 1695).
+            first = store.open_violation_report(v.invariant, v.key[1], level=v.level,
                                                 detail=v.detail, owed=v.owed)
             # A DECISION IS OWED: raise the work order's own flag, with the reason
             # DERIVED rather than written — and do it before the dedupe `continue`, so a

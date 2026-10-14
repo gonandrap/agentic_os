@@ -265,12 +265,10 @@ def _readable_review(detail: dict[str, Any]) -> dict[str, Any]:
     row = dict(detail)
     state = row.pop("review", None)
     if state:
-        owed = "pending assumption" + ("" if state["pending"] == 1 else "s")
-        where = (f"round {state['round']} gave up" if state["escalated"]
-                 else f"{state['pending']} {owed}")
-        row["review"] = [f"owed: {where} — {state['scope']}.",
-                         f"accept: {state['accept']}",
-                         f"reject: {state['reject']} {state['strands']}"]
+        from . import ops
+
+        # Spec 2026-10-14-an-escalated-round-says-why-and-what-to-run-next §5.
+        row["review"] = ops.review_lines(state)
     return row
 
 
@@ -5561,6 +5559,11 @@ def cmd_validation(args: argparse.Namespace) -> int:
         if failed := follow_ups.get("failed"):
             why = follow_ups.get("reason") or "the tracker refused or was unreachable"
             print(f"  {failed} follow-up(s) could not be filed as issues — {why}")
+    # Spec 2026-10-14-an-escalated-round-says-why-and-what-to-run-next §5.
+    if view.get("review"):
+        print()
+        for line in ops.review_lines(view["review"]):
+            print(line)
     # The bus, on the same page as the rounds it carried. Delivered envelopes are
     # routine and live here rather than in any default listing; an UNDELIVERABLE one is
     # a failure, so it is also flagged where nobody has to go looking — `jarvis doctor`

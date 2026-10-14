@@ -503,8 +503,13 @@
    `feature_order.html`, which has no `review_work_order` to post to — spec §5. Rendered
    only when no assumption is pending, which is where the other call site puts it. #}
 {% if review and review.placement == 'validation' %}
-<h2{% if pending == 'validation' %} id="pending"{% endif %}>Round {{ review.round }} gave
-  up — your judgement <a href="#round-{{ review.round }}">round {{ review.round }} →</a></h2>
+{# THE VERB COMES FROM `ops.review_state` — spec
+   docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md
+   §3. `gave up` here contradicted the `Why:` row directly below it, which is issue
+   #1040's complaint. #}
+<h2{% if pending == 'validation' %} id="pending"{% endif %}>Round {{ review.round }}
+  {{ review.verb }} — your judgement
+  <a href="#round-{{ review.round }}">round {{ review.round }} →</a></h2>
 <div class="panel">
   {{ review_ui.review_form(project, wo, review) }}
 </div>
