@@ -19,7 +19,6 @@ from jarvis import cli, invariants, ops, release, worker_session
 from jarvis.catalog import DEFAULT_VALIDATION_TIMEOUT
 from jarvis.hooks import handle_hook
 from jarvis.invariants import (
-    BLOCKED_STATUSES,
     IDLE_NO_FINISH_BLOCKER,
     PR_CLOSED_BLOCKER,
     VALIDATION_STUCK_BLOCKER,
@@ -576,7 +575,11 @@ def test_a_validating_work_order_is_silent_until_the_panel_gives_up(project):
 
     # a round in flight: the OS is working, and nobody owes anybody a decision
     assert true_blockers(store, store.get_work_order(wo["id"])) == []
-    assert "validating" not in BLOCKED_STATUSES
+    # INV-ATTENTION-MISSING now SEES this row — `validating` is in OPEN_STATUSES — and is
+    # silent anyway, because the silence comes from `true_blockers` and not from a gate
+    assert [v for v in check_project(store, repair=True)
+            if v.invariant == "INV-ATTENTION-MISSING" and v.wo_id == wo["id"]] == []
+    assert not store.get_work_order(wo["id"])["needs_attention"]
 
     # ...and the panel still deliberating, with the work order parked for review, is
     # likewise not the user's problem yet
@@ -588,6 +591,26 @@ def test_a_validating_work_order_is_silent_until_the_panel_gives_up(project):
     store.close_validation_round(rnd["id"], "escalated", reason="three rounds, no deal")
     assert true_blockers(store, store.get_work_order(wo["id"])) == [
         VALIDATION_STUCK_BLOCKER]
+
+
+def test_a_validating_work_order_with_a_real_blocker_is_surfaced(project):
+    """The other half of the pairing above, and the gap the deleted `BLOCKED_STATUSES`
+    left: a `validating` row CAN owe the user a decision — a pending assumption — and
+    the old gate left `validating` out, so the blocker was derived and never surfaced.
+    Shape copied from `test_silently_stalled_work_is_surfaced`."""
+    store = ProjectStore(project)
+    wo = store.create_work_order("quietly stuck mid-review")
+    store.add_assumption(wo["id"], "something needing a decision")
+    store.set_status(wo["id"], "validating")
+    store.open_validation_round(wo_id=wo["id"], fingerprint="abc")
+    store.clear_attention(wo["id"])  # invisible on every surface
+
+    violations = check_project(store, repair=True)
+
+    assert [v.invariant for v in violations] == ["INV-ATTENTION-MISSING"]
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["needs_attention"] == 1
+    assert fresh["attention_reason"] == "1 assumption pending your review"
 
 
 def test_a_closed_pull_request_outranks_an_escalated_review(project):

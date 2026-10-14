@@ -68,33 +68,6 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from .fleet import Fleet
     from .project_store import ProjectStore
 
-# Statuses where the user is the one holding the work up. A `running` worker is not
-# blocked on anything the user can see. `pending` used to be excluded on the same
-# reasoning — it hasn't started, so nobody is waiting on a decision — and dependency
-# edges broke that: a pending work order whose dependency was cancelled will never
-# start, and only the user can choose between cancelling it and cutting the edge.
-# This tuple must cover every status `true_blockers` can return a blocker for, or the
-# blocker is derived correctly and then never surfaced.
-BLOCKED_STATUSES = ("waiting_input", "needs_review", "failed", "pending",
-                    # `waiting_pr_merge` is silent in the ordinary case and returns no
-                    # blockers below — it is here for the one state that does, the
-                    # conflict the worker could not resolve (spec §5).
-                    "waiting_pr_merge",
-                    # ...and the two the OS calls work-in-progress, here for the one
-                    # state THEY have: a turn that ended without finishing the work and
-                    # nothing in flight behind it (`parked_reason`). Silent otherwise —
-                    # a running worker is still not blocked on anything the user can see.
-                    "running", "dispatching",
-                    # `idle` is here for exactly one blocker and derives no other: a
-                    # message the user or the bus sent a manager that it will never see
-                    # (MESSAGE_STUCK_BLOCKER). Being idle asks nothing of anyone — that
-                    # is the whole of issue #264 — but a feature routes everything
-                    # through its manager, so a message rotting there strands the
-                    # feature silently, which is issue 43 one level up.
-                    "idle",
-                    # An order that spent its budget. Only the user can decide whether to
-                    # fund another turn, so nothing else will ever move it.
-                    "budget_exhausted")
 #: Statuses a work order can still reach `needs_review` from under its own steam — it
 #: has not delivered yet. `autoreview.decide`'s condition 2 is the reason this tuple
 #: exists: Neo judges an assumption only in `needs_review`, so in a project that has
@@ -195,8 +168,9 @@ PR_REPAIR_MAX_ATTEMPTS = 3
 #: there except notice the merge or the closure, precisely so this pairing still holds.
 #: `Daemon.PR_POLL_STATUSES` carries the argument; the bound is enforced in the loop.
 #:
-#: Every member is in BLOCKED_STATUSES, or INV-ATTENTION-MISSING would derive the give-up
-#: correctly and then never surface it.
+#: Every member is open or `failed`, so INV-ATTENTION-MISSING selects it and surfaces the
+#: give-up. That obligation stopped being a trap when the gate started deriving its
+#: statuses: there is no second list to fall out of.
 #:
 #: The in-flight statuses are deliberately absent — see `Daemon.PR_POLL_STATUSES` — and so
 #: are the terminal ones, which is not merely tidiness: a hand-merged RED pull request
@@ -397,8 +371,9 @@ AUTOMERGE_DENIED_BLOCKER = ("the automatic merge of the commit the panel accepte
 #: re-derive, so repeating it here is mandatory rather than cosmetic.
 #:
 #: A round that is merely OPEN raises nothing at all: `validating` is the OS working,
-#: not a decision anyone owes, which is why that status is absent from BLOCKED_STATUSES
-#: and has no branch below.
+#: not a decision anyone owes, which is why that status has no branch below. The second
+#: reason stopped applying — INV-ATTENTION-MISSING no longer skips `validating`, it
+#: selects it and finds nothing — so the absent branch is the whole of the silence.
 VALIDATION_STUCK_BLOCKER = ("the review could not be satisfied — the work needs your "
                             "judgement")
 
@@ -523,9 +498,11 @@ MESSAGE_STUCK_BLOCKER = ("a message you sent is still queued and the worker has 
 #: Where an undelivered message is a defect rather than a wait. `pending` is absent
 #: because an undispatched order's message goes out as its second turn and a
 #: dependency-blocked order is never an attention item just for waiting (its
-#: unrecoverable case is DEAD_DEPENDENCY_BLOCKER's); `validating` for the reason it is
-#: absent from BLOCKED_STATUSES; the terminal pair because INV-ATTENTION-PHANTOM clears
-#: any flag raised there, so the two checks would fight every tick.
+#: unrecoverable case is DEAD_DEPENDENCY_BLOCKER's); `validating` because a round in
+#: flight is the OS working and owes nobody a decision (no longer because a status gate
+#: skipped it — INV-ATTENTION-MISSING selects `validating` now); the terminal pair
+#: because INV-ATTENTION-PHANTOM clears any flag raised there, so the two checks would
+#: fight every tick.
 #:
 #: `idle` IS here, and it is the one thing an idle manager can still owe the user. It
 #: inherited the coverage rather than gaining it — a manager used to sit in
@@ -1572,8 +1549,8 @@ def parked_reason(store: ProjectStore, wo: dict[str, Any],
     `resume-auto` come to disagree about one work order.
 
     Two shapes, and the second is why this is not merely the first. An order the OS still
-    calls `running` with a finished turn behind it is INVISIBLY stopped — no status in
-    `BLOCKED_STATUSES` reached it before this. An order that finished, was sent back to
+    calls `running` with a finished turn behind it is INVISIBLY stopped — nothing derived
+    a blocker for that shape before this. An order that finished, was sent back to
     work and stopped again is VISIBLY stopped and flagged for the wrong thing, which is
     what `STALE_FINISH_BLOCKER` says.
 
@@ -2552,8 +2529,8 @@ def check_assumption_flags_are_owed(store: ProjectStore) -> Iterator[Violation]:
             continue
         if not (store.pending_assumptions(wo["id"]) and neo_reviews_later(store, wo)):
             continue
-        # An undeliverable objection raises a real blocker on a RUNNING order
-        # (`running` is in BLOCKED_STATUSES), so without this the flag is cleared here
+        # An undeliverable objection raises a real blocker on a RUNNING order, which
+        # INV-ATTENTION-MISSING selects, so without this the flag is cleared here
         # and INV-ATTENTION-MISSING re-raises it on the same tick, for ever.
         if any(_mentions_assumptions(b) for b in true_blockers(store, wo)):
             continue
@@ -2578,7 +2555,11 @@ def check_blocked_work_is_surfaced(store: ProjectStore) -> Iterator[Violation]:
 
     Repairable: raise the flag with the derived reason.
     """
-    for wo in store.list_work_orders(statuses=BLOCKED_STATUSES, include_hidden=True):
+    # Every status `true_blockers` can derive for, derived rather than restated, so no
+    # second list can fall behind it (spec
+    # docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md §5c).
+    statuses = OPEN_STATUSES + ("failed",)
+    for wo in store.list_work_orders(statuses=statuses, include_hidden=True):
         if wo["needs_attention"]:
             continue
         blockers = true_blockers(store, wo)

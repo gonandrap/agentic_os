@@ -675,8 +675,9 @@ def test_giving_up_is_recorded_once_however_long_it_stays_broken(started, projec
 
 
 def test_the_give_up_reason_survives_the_reconciler(started, project, fake_gh, parked_worker):
-    """`true_blockers` is the only source of attention reasons, and a status missing
-    from BLOCKED_STATUSES has its blockers derived and then never surfaced (spec §5)."""
+    """`true_blockers` is the only source of attention reasons, and a status
+    INV-ATTENTION-MISSING does not select has its blockers derived and then never
+    surfaced (spec §5)."""
     conflicting(fake_gh)
     store = ProjectStore(project)
     for _ in range(PR_REPAIR_MAX_ATTEMPTS + 1):
@@ -694,8 +695,8 @@ def test_the_give_up_reason_survives_the_reconciler(started, project, fake_gh, p
 
 def test_a_healthy_parked_work_order_is_still_never_flagged(started, project, fake_gh,
                                                             parked_worker):
-    """`waiting_pr_merge` joined BLOCKED_STATUSES for the conflict case alone; the
-    ordinary merge queue must stay out of the "NEEDS YOU" strip."""
+    """`waiting_pr_merge` derives a blocker for the conflict case alone; the ordinary
+    merge queue must stay out of the "NEEDS YOU" strip."""
     fake_gh.set_pr(PR, "OPEN")
     store = ProjectStore(project)
 

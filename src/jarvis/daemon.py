@@ -6669,7 +6669,7 @@ class Daemon:
         `waiting_input` is what this state actually is, and it is the status that makes
         every existing surface work with no new exception. Still ACTIVE, so
         `retry_paused_turns` keeps sweeping it and no dependency edge treats it as dead;
-        and in `invariants.BLOCKED_STATUSES`, so `true_blockers` can re-derive
+        and selected by INV-ATTENTION-MISSING, so `true_blockers` can re-derive
         AUTH_BLOCKER — the obligation a flag raised only here would not meet.
 
         SAID ONCE, and the status is the guard. Every subsequent tick sees the same pause

@@ -5227,8 +5227,8 @@ def land_when_cleared(store: ProjectStore, wo: dict[str, Any],
 
     **`needs_review` wins while an assumption is pending.** It is the only status that
     says the user owes a decision, and `validating` is deliberately silent
-    (`invariants.BLOCKED_STATUSES`). The round keeps running underneath it and
-    `invariants.status_label` says so.
+    (`invariants.true_blockers` derives nothing there). The round keeps running
+    underneath it and `invariants.status_label` says so.
 
     `panel_cleared` is for a caller that has just settled the panel's half ITSELF and
     must not re-read the round it wrote: the no-validator path closes its round `failed`

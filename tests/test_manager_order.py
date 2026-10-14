@@ -769,8 +769,8 @@ def test_a_relaunched_manager_settles_back_to_idle(boot, store, settle_turns,
 
 def test_a_message_rotting_on_an_idle_manager_still_reaches_the_user(project,
                                                                     monkeypatch):
-    """The one blocker `idle` may still derive, and the reason it is in BLOCKED_STATUSES
-    and MESSAGE_STUCK_STATUSES at all. A feature routes everything through its manager,
+    """The one blocker `idle` may still derive, and the reason it is in
+    MESSAGE_STUCK_STATUSES at all. A feature routes everything through its manager,
     so a message the manager will never see strands the feature silently — issue 43 one
     level up. It inherited this coverage from `waiting_input`; moving the status without
     moving the coverage would have dropped it."""
