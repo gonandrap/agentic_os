@@ -555,6 +555,13 @@ DEFAULT_VALIDATION_DIFF_CHARS = 150000
 # docs/superpowers/specs/2026-09-28-an-assumption-review-reads-the-orders-own-rulings.md
 DEFAULT_VALIDATION_DECISION_RECORD_CHARS = 6000
 
+# Characters of SPEC SECTION the same packet may carry — the authority an assumption cites
+# when it says "per the spec", absent until GitHub issue #1035. `decision_record_chars`'s
+# number because it is the same packet, the same uncached per-assumption call and the other
+# authority block beside the record; well under `confirm_diff_chars` because a section is
+# prose a planner wrote, not a diff.
+DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS = 6000
+
 # Truncation limit for the diff ONE CONFIRMATION QUESTION carries, and it is not the
 # panel's number: measured at q660-748, confirmation questions ran 7K-152K chars against
 # 1-3.8K for the first-pass review of the same assumption and 12-15K for the largest
@@ -638,6 +645,8 @@ class ValidationConfig:
     red_ci_returns: int = DEFAULT_VALIDATION_RED_CI_RETURNS
     diff_chars: int = DEFAULT_VALIDATION_DIFF_CHARS
     decision_record_chars: int = DEFAULT_VALIDATION_DECISION_RECORD_CHARS
+    # GitHub issue #1035: the spec section an assumption review reads.
+    assumption_spec_chars: int = DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS
     confirm_diff_chars: int = DEFAULT_VALIDATION_CONFIRM_DIFF_CHARS
     # Whether a FEATURE order validates as a whole once its children are done, which is
     # a separate question from whether its children each validated: the feature is the
@@ -2185,6 +2194,10 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         raw.get("decision_record_chars", base.decision_record_chars))
     if decision_record_chars < 1:
         raise _err(f"{where}.decision_record_chars must be >= 1")
+    assumption_spec_chars = int(
+        raw.get("assumption_spec_chars", base.assumption_spec_chars))
+    if assumption_spec_chars < 1:
+        raise _err(f"{where}.assumption_spec_chars must be >= 1")
     confirm_diff_chars = int(raw.get("confirm_diff_chars", base.confirm_diff_chars))
     if confirm_diff_chars < 1:
         raise _err(f"{where}.confirm_diff_chars must be >= 1")
@@ -2216,6 +2229,7 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         red_ci_returns=red_ci_returns,
         diff_chars=diff_chars,
         decision_record_chars=decision_record_chars,
+        assumption_spec_chars=assumption_spec_chars,
         confirm_diff_chars=confirm_diff_chars,
         feature_units=bool(raw.get("feature_units", base.feature_units)),
         feature_merge_wait_minutes=feature_merge_wait_minutes,
