@@ -6539,7 +6539,9 @@ class Daemon:
                         or ops_mod.resumed_from(store, wo["id"], turn["seq"])
                         or "waiting_pr_merge")
                 if fresh["status"] != back:
-                    store.set_status(wo["id"], back)
+                    # Spec §C of
+                    # docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md.
+                    store.set_status(wo["id"], back, trigger="turn_settled")
                     if back == "waiting_pr_merge":
                         store.clear_attention(wo["id"])
             else:

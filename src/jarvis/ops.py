@@ -4075,7 +4075,9 @@ def review_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | No
     escalated = (wo["status"] == "needs_review" and validation_escalated(store, wo))
     if not pending and not escalated:
         return None
-    latest = store.latest_validation_round(wo_id=wo["id"]) if escalated else None
+    # The same row the boolean came from, per spec §A of
+    # docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md.
+    latest = store.last_judged_round(wo_id=wo["id"]) if escalated else None
     rows = f"{pending} pending assumption" + ("" if pending == 1 else "s")
     accept = ("Accepts " + rows + " and lands" if pending else "Lands") + \
         " the work order" + (" over the panel's objection" if escalated else "")
@@ -4897,7 +4899,9 @@ def land_finished(store: ProjectStore, wo: dict[str, Any],
         if stranding.produced:
             return park_unlanded(store, wo, stranding)
     status = "waiting_pr_merge" if pr_url else "completed"
-    store.set_status(wo_id, status)
+    # Spec §C of
+    # docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md.
+    store.set_status(wo_id, status, trigger="landed")
     store.clear_attention(wo_id)
     if wo.get("backlog_id") and status == "completed":
         central = CentralStore()
@@ -7130,7 +7134,9 @@ def resettle_after_repair(store: ProjectStore, wo_id: str) -> bool:
     probe["status"] = "waiting_pr_merge"
     if true_blockers(store, probe):
         return False
-    store.set_status(wo_id, "waiting_pr_merge")
+    # Spec §C of
+    # docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md.
+    store.set_status(wo_id, "waiting_pr_merge", trigger="pr_repair_resettled")
     store.add_event(wo_id, "pr_repair_resettled",
                     {"pr_url": wo.get("pr_url"), "was": wo["status"]})
     store.clear_attention(wo_id)
