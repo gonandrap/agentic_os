@@ -2619,6 +2619,24 @@ class ProjectStore:
             f"UPDATE work_orders SET {cols} WHERE id=?", (*fields.values(), wo_id)
         )
 
+    def adopt_spec_section(self, wo_id: str, section: str) -> bool:
+        """Record a spec section on a row that has none. True when the write landed.
+
+        `specs.spec_of`'s heal: the column is written once at plan release, so a child
+        whose row is NULL leaves every reader blind until somebody re-derives it. NEVER
+        overwrites a recorded value — a user or a manager that corrected a section by hand
+        owns it — and the guard is in the SQL rather than a read-then-write in Python, so
+        two readers racing on the same tick cannot both decide the column is empty. Spec
+        §2.1 of
+        docs/superpowers/specs/2026-10-13-an-assumption-review-payload-carries-its-spec-section.md
+        """
+        cur = self.conn.execute(
+            "UPDATE work_orders SET spec_section=?, updated_at=? "
+            "WHERE id=? AND (spec_section IS NULL OR spec_section='')",
+            (section, db.now(), wo_id),
+        )
+        return cur.rowcount > 0
+
     def set_status(self, wo_id: str, status: str, *, trigger: str = "",
                    **extra: Any) -> None:
         """Move a work order, and record the span. Spec §2 of

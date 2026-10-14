@@ -5541,7 +5541,9 @@ class Daemon:
             # attention list from state alone — Neo 1084, `ops.os_status`. `owed` rides
             # along for the same reason and is written FIRST, so the row exists before
             # the derivation below reads it.
-            first = store.open_violation_report(v.invariant, v.wo_id, level=v.level,
+            # `v.key[1]`, not `v.wo_id`: the row must dedupe on the same subject `key`
+            # does, or a feature-level check collapses N subjects into one row (Neo 1695).
+            first = store.open_violation_report(v.invariant, v.key[1], level=v.level,
                                                 detail=v.detail, owed=v.owed)
             # A DECISION IS OWED: raise the work order's own flag, with the reason
             # DERIVED rather than written — and do it before the dedupe `continue`, so a
