@@ -2075,6 +2075,18 @@ class FakeStore:
         pass
 
 
+class SpecStore(FakeStore):
+    """`FakeStore` plus the one read `specs.spec_of` makes: the parent's stored plan."""
+
+    DOC = ("# Self-evolution\n\n## 7.1 Rules\n\nelsewhere\n\n## 7.2 The precheck\n\n"
+           "the four conditions `rules.precheck` must satisfy\n\n## 7.3 Next\n\nafter\n")
+
+    def get_feature_order(self, fo_id: str) -> dict:
+        return {"id": fo_id, "plan": json.dumps(
+            {"design_doc": SPEC_PATH, "design_doc_content": self.DOC,
+             "children": [{"title": "Build the precheck", "spec_section": "7.2"}]})}
+
+
 def record(*rows: dict, messages: tuple[dict, ...] = (), siblings=None,
            others: tuple[dict, ...] = (), ruling_on=None, window: int | None = None,
            **kw) -> str:
@@ -2382,6 +2394,123 @@ def test_the_projects_own_cap_reaches_the_packet_both_passes_build():
         assert "capped at 200 characters" in packet
         assert str(autoreview.DEFAULT_VALIDATION_DECISION_RECORD_CHARS) not in packet
         assert "ruling 4" not in packet
+
+
+# -- the payload carries the spec section -----------------------------------------------
+#
+# §2.2 of
+# docs/superpowers/specs/2026-10-13-an-assumption-review-payload-carries-its-spec-section.md
+# A child work order is briefed by one section of its feature's spec and
+# its description is only the margin around it. Assumption #1 of wo-ab6c309d escalated
+# `evidence-insufficient` saying it could not see the section the OS already owned.
+
+SPEC_HEADER = "# The spec section this work order was told to implement"
+SPEC_PATH = "docs/superpowers/specs/2026-09-27-self-evolution.md"
+
+
+def spec(**over) -> dict:
+    return {"repo_path": SPEC_PATH, "content": "the whole document", "section": "7.2",
+            "section_text": "The four conditions `rules.precheck` must satisfy.", **over}
+
+
+def ruling(**kw) -> str:
+    return autoreview._ruling_question(   # noqa: SLF001
+        "p", WO, assumption(), [], **kw)
+
+
+def test_the_spec_section_reaches_the_packet_with_the_panels_own_cite_line():
+    """The cite line is `evidence._spec_ref`'s format verbatim, so the two seats cannot
+    describe the same section differently."""
+    out = ruling(spec=spec())
+
+    assert SPEC_HEADER in out
+    assert f"{SPEC_PATH} § 7.2" in out
+    assert "The four conditions `rules.precheck` must satisfy." in out
+
+
+def test_the_spec_block_sits_between_the_brief_and_the_delivered_block():
+    """The description is the margin around the section; the two are one brief. The
+    decision record stays last."""
+    out = ruling(spec=spec())
+
+    assert out.index("# The work order it was recorded against") < out.index(SPEC_HEADER)
+    assert out.index(SPEC_HEADER) < out.index("# What the worker says it delivered")
+    assert out.index(SPEC_HEADER) < out.index(RECORD_HEADER)
+
+
+@pytest.mark.parametrize("missing", [None, {"repo_path": SPEC_PATH, "section": "7.2",
+                                            "content": "d", "section_text": ""}])
+def test_no_block_at_all_when_there_is_no_resolved_section(missing):
+    """A heading over `(none)` would tell the reviewer a spec exists and was withheld,
+    which is the opposite of true — and a case the persona escalates."""
+    out = ruling(spec=missing)
+
+    assert SPEC_HEADER not in out
+    assert SPEC_PATH not in out
+
+
+def test_a_section_over_the_budget_keeps_its_head_cuts_on_a_line_and_states_the_count():
+    """kn-e06ff4e6: an all-or-nothing unit over a small budget delivers zero of N
+    characters, and the reviewer escalates for exactly the reason this block exists."""
+    body = "\n".join(f"line {i} " + "x" * 90 for i in range(60))
+
+    block = autoreview._spec_block(spec(section_text=body), 600)   # noqa: SLF001
+
+    lines = block.splitlines()
+    head = "\n".join(lines[3:-1])
+    assert head and head in body
+    assert head.splitlines()[0] == body.splitlines()[0]
+    assert lines[-1] == (
+        f"  (… {len(body) - len(head):,} of {len(body):,} characters of this section "
+        f"omitted — capped at 600 characters; read the rest with `jarvis spec section "
+        f"{SPEC_PATH} 7.2`)")
+
+
+def test_a_first_line_over_the_budget_is_cut_mid_line_rather_than_dropped():
+    """Delivering zero characters is never an outcome."""
+    block = autoreview._spec_block(spec(section_text="y" * 5000), 100)  # noqa: SLF001
+
+    lines = block.splitlines()
+    assert lines[3] == "y" * 100
+    assert "4,900 of 5,000 characters" in lines[-1]
+
+
+def test_a_section_that_fits_carries_no_marker():
+    block = autoreview._spec_block(spec(), 6000)   # noqa: SLF001
+
+    assert "omitted" not in block
+
+
+def test_the_spec_budget_is_the_projects_when_it_names_one():
+    """`_record_chars`' shape: the fleet answer for every caller with no catalog in
+    hand."""
+    assert autoreview._spec_chars(None) == 6000            # noqa: SLF001
+    assert autoreview._spec_chars(                          # noqa: SLF001
+        ValidationConfig(assumption_spec_chars=400)) == 400
+
+
+def test_propose_resolves_the_childs_section_and_puts_it_in_the_packet():
+    """§2.2: built from the `spec_of` dict `propose` already has a `store` to fetch."""
+    kid = {**WO, "parent_id": "fo-1", "kind": "worker", "spec_section": "7.2",
+           "title": "Build the precheck"}
+    neo_ = FakeNeo()
+
+    autoreview.propose(SpecStore(), neo_, "p", kid, assumption(), [assumption()])
+
+    (packet,) = neo_.asked
+    assert SPEC_HEADER in packet
+    assert f"{SPEC_PATH} § 7.2" in packet
+    assert "four conditions" in packet
+
+
+def test_the_persona_tells_the_reviewer_to_cite_the_section_instead_of_escalating():
+    """Without the paragraph the payload grows by up to 6,000 characters and the reviewer
+    keeps escalating for evidence quoted in its own prompt."""
+    persona = autoreview.ASSUMPTION_REVIEWER_PERSONA
+
+    assert "THE SPEC SECTION IS AUTHORITY AND YOU MAY CITE IT." in persona
+    assert "evidence-insufficient" in persona
+    assert "omission" in persona
 
 
 def test_answered_questions_is_newest_first_and_keeps_every_kind(started):

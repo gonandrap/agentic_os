@@ -78,8 +78,11 @@ from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any
 
-from . import navigation
-from .catalog import DEFAULT_VALIDATION_DECISION_RECORD_CHARS
+from . import navigation, specs
+from .catalog import (
+    DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS,
+    DEFAULT_VALIDATION_DECISION_RECORD_CHARS,
+)
 from .stakes import Stakes
 
 log = logging.getLogger(__name__)
@@ -1318,6 +1321,15 @@ in your own prompt spends a review action the user has already spent. An item ma
 `(withheld …)`, `(not answered)` or `(not shown)` is NOT a ruling, and neither is an
 omission line: those are cases to escalate, not blanks to fill in.
 
+THE SPEC SECTION IS AUTHORITY AND YOU MAY CITE IT. When the question carries one, that
+section is the brief the user approved when they approved the plan, and the work order's
+description is only the margin around it. When the section settles the assumption in front
+of you, ACCEPT and name `<path> § <section>` in your `reason` rather than escalating
+`evidence-insufficient` for text quoted in your own prompt. An omission line saying
+characters of the section were omitted is NOT a blank to fill in. And the section is
+authority about what was ASKED, never about a preference nobody recorded: an assumption
+that changes something the user would recognise still escalates, whatever the spec says.
+
 A SIBLING MARKED `(withheld — high-stakes …)` IS NOT A BLANK TO FILL IN. The OS holds
 those assumptions for the user and does not show you their text, deliberately. Do not
 guess at what one says, and do not treat its absence as permission: if your ruling would
@@ -1600,9 +1612,54 @@ def _record_block(record: str) -> str:
     return f"{RECORD_HEADING}\n{record or NO_RECORD}"
 
 
+#: The spec block's heading. Spec §2.2 of
+#: docs/superpowers/specs/2026-10-13-an-assumption-review-payload-carries-its-spec-section.md
+SPEC_HEADING = ("# The spec section this work order was told to implement — the brief, "
+                "and authority you may CITE")
+
+
+def _spec_block(spec: dict[str, str] | None, chars: int) -> str:
+    """This child's spec section, bounded, or `""` when there is no section to show.
+
+    ABSENT RATHER THAN EMPTY-HEADED: a standalone work order, a planner, a manager, a
+    feature planned before specs existed and an ambiguous plan title all produce no block
+    at all, because a heading over `(none)` tells the reviewer a spec exists and was
+    withheld — the opposite of true, and a case the persona escalates. The condition is
+    `specs.spec_of`'s `section_text`, the same test `evidence._spec_ref` applies, and the
+    cite line is that function's format verbatim so the two seats cannot describe one
+    section differently.
+
+    THE TRIM KEEPS THE HEAD AND NEVER DROPS THE WHOLE UNIT (kn-e06ff4e6): an
+    all-or-nothing unit over a small budget delivers zero of N characters, so the reviewer
+    is shown nothing and escalates for exactly the reason this block exists. The cut is on
+    a line boundary, except where the first line alone exceeds the budget — then it is cut
+    mid-line, because delivering zero characters is never an outcome. What went is stated
+    last, by exact count, naming the cap and the command that reads the rest.
+    """
+    if not spec or not spec.get("section_text"):
+        return ""
+    cite = f"{spec.get('repo_path', '')} § {spec.get('section', '')}".strip()
+    text = str(spec["section_text"])
+    kept, spent = [], 0
+    for line in text.splitlines():
+        if spent + len(line) + 1 > chars:
+            break
+        kept.append(line)
+        spent += len(line) + 1
+    head = "\n".join(kept) if kept else text[:chars]
+    body = head
+    if len(head) < len(text):
+        body += (f"\n  (… {len(text) - len(head):,} of {len(text):,} characters of this "
+                 f"section omitted — capped at {chars} characters; read the rest with "
+                 f"`jarvis spec section {spec.get('repo_path', '')} "
+                 f"{spec.get('section', '')}`)")
+    return f"{SPEC_HEADING}\n{cite}\n\n{body}"
+
+
 def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any],
                      siblings: list[dict[str, Any]], *, early: bool = False,
-                     record: str = "") -> str:
+                     record: str = "", spec: dict[str, str] | None = None,
+                     spec_chars: int = DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS) -> str:
     """What the reviewer reads. One assumption, quoted; the rest listed, not ruled on.
 
     The siblings are here because an assumption is sometimes only defensible given
@@ -1614,6 +1671,9 @@ def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any
     `record` is what has already been decided on this order (`decision_record`), last of
     the context blocks and the one whose absence produced the escalations in #832. It
     defaults to `""` so a caller not yet teaching one is merely unaware, never wrong.
+
+    `spec` is `specs.spec_of`'s dict and defaults to None for the same reason. Spec §2.2 of
+    docs/superpowers/specs/2026-10-13-an-assumption-review-payload-carries-its-spec-section.md
     """
     n = assumption.get("n")
     others = "\n".join(sibling_line(s) for s in siblings
@@ -1639,18 +1699,19 @@ def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any
         "the user), `stakes` (`routine` or `high`) and a one-line `reason`.")
     answers += (" When the decision record above settles it, say which id in `reason` "
                 "instead of escalating to ask for it again.")
-    return "\n\n".join([
+    return "\n\n".join([block for block in [
         f"ASSUMPTION REVIEW — rule on assumption #{n} of {wo['id']} in {project}, and on "
         f"nothing else.",
         f"# The assumption\n{assumption.get('content') or '(empty)'}",
         f"# The work order it was recorded against\n{wo.get('title') or '(untitled)'}\n"
         f"{(wo.get('description') or '')[:2000]}",
+        _spec_block(spec, spec_chars),
         delivered,
         f"# The work order's other assumptions, for context only — do not rule on these\n"
         f"{others}",
         _record_block(record),
         answers,
-    ])
+    ] if block])
 
 
 #: How many dropped paths the truncation marker NAMES. The COUNT is always exact — spec
@@ -1925,6 +1986,13 @@ def _record_chars(cfg: Any) -> int:
                        DEFAULT_VALIDATION_DECISION_RECORD_CHARS))
 
 
+def _spec_chars(cfg: Any) -> int:
+    """This project's `validation.assumption_spec_chars`, or the fleet default with no
+    `cfg` — `_record_chars`' shape, for the same callers."""
+    return int(getattr(cfg, "assumption_spec_chars",
+                       DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS))
+
+
 def propose_confirmation(store: Any, neo: Any, project: str, wo: dict[str, Any],
                          assumption: dict[str, Any], siblings: list[dict[str, Any]],
                          *, evidence: ConfirmEvidence | None = None,
@@ -1987,7 +2055,9 @@ def propose(store: Any, neo: Any, project: str, wo: dict[str, Any],
                            project, wo, assumption, siblings, early=early,
                            record=decision_record(store, neo, wo["id"], siblings,
                                                   assumption,
-                                                  chars=_record_chars(cfg))),
+                                                  chars=_record_chars(cfg)),
+                           spec=specs.spec_of(store, wo),
+                           spec_chars=_spec_chars(cfg)),
                        context=f"{wo.get('title') or ''}\n"
                                f"{(wo.get('description') or '')[:800]}",
                        kind=QUESTION_KIND)
