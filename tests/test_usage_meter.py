@@ -233,10 +233,12 @@ def test_a_drop_with_resets_at_unchanged_is_a_boundary_and_an_anomaly():
 
 
 def test_two_resets_inside_one_span_give_three_segments():
+    # The resets are a window apart and the span holds them: two 5h resets inside ten
+    # minutes is what the post-condition of the 2026-10-13 spec clamps.
     rows_ = (series(T0, [10.0, 40.0], T0 + 3600)
-             + series(T0 + 2 * MINUTE, [3.0, 9.0], T0 + 7200)
-             + series(T0 + 4 * MINUTE, [1.0, 6.0], T0 + 10800))
-    found = usage_meter.segments(rows_, since=T0, until=T0 + 10 * MINUTE,
+             + series(T0 + 5 * 3600, [3.0, 9.0], T0 + 6 * 3600)
+             + series(T0 + 10 * 3600, [1.0, 6.0], T0 + 11 * 3600))
+    found = usage_meter.segments(rows_, since=T0, until=T0 + 11 * 3600,
                                  key="five_hour")
 
     assert len(found.segments) == 3 and found.reset_count == 2
@@ -278,6 +280,95 @@ def test_gap_rows_are_excluded_from_segments_and_counted_in_coverage():
     assert found.coverage.samples == 2
     assert found.coverage.share == pytest.approx(2 / 5)
     assert found.coverage.longest_gap_seconds == pytest.approx(4 * MINUTE)
+
+
+# -- the reset tolerance and the segment bound ------------------------------------------
+# docs/superpowers/specs/2026-10-13-usage-meter-spurious-resets.md, cases 1-5.
+
+#: Four CONSECUTIVE production readings of the same 17:00:00 reset: the endpoint
+#: guarantees `resets_at` to the window, not to the microsecond.
+JITTER = [1791882000.49662, 1791882000.479002, 1791882000.321001, 1791881999.789849]
+WEEK = 7 * 86_400.0
+
+
+def test_sub_second_resets_at_jitter_is_not_a_reset():
+    """The production case: 287 reported resets over a week where none happened."""
+    rows_ = [sample(T0 + i * MINUTE, 87.0 * i / 99, JITTER[i % 4]) for i in range(100)]
+
+    found = usage_meter.segments(rows_, since=T0, until=T0 + WEEK, key="five_hour")
+
+    assert found.reset_count == 0
+    assert len(found.segments) == 1
+    assert found.delta_points == pytest.approx(87.0)
+    assert found.reliable is True
+    assert found.unreliable == []
+
+
+def test_a_genuine_advance_of_one_window_is_still_a_reset():
+    rows_ = (series(T0, [10.0, 40.0], T0 + 3600)
+             + series(T0 + 2 * MINUTE, [3.0, 9.0], T0 + 3600 + 5 * 3600))
+
+    found = usage_meter.segments(rows_, since=T0, until=T0 + 10 * MINUTE,
+                                 key="five_hour")
+
+    assert found.reset_count == 1
+    assert [s.cause for s in found.segments] == ["", "reset"]
+    assert [s.start_pct for s in found.segments] == [10.0, 0.0]
+    assert found.delta_points == pytest.approx(30.0 + 9.0)
+
+
+def test_resets_at_moving_backwards_is_an_anomaly_and_not_a_boundary():
+    """A window's reset instant never retreats: the endpoint contradicting itself is
+    visible in `anomalies` and does NOT break a segment at 0.0."""
+    rows_ = (series(T0, [10.0, 40.0], T0 + 7200)
+             + series(T0 + 2 * MINUTE, [42.0, 44.0], T0 + 7200 - 3600))
+
+    found = usage_meter.segments(rows_, since=T0, until=T0 + 10 * MINUTE,
+                                 key="five_hour")
+
+    assert found.reset_count == 0 and len(found.segments) == 1
+    assert found.anomalies == 1
+    assert found.reliable is True
+    assert found.delta_points == pytest.approx(34.0)
+
+
+@pytest.mark.parametrize("advance,resets", [(59.0, 0), (61.0, 1)])
+def test_the_tolerance_edges_are_pinned(advance, resets):
+    assert usage_meter.RESET_TOLERANCE_SECONDS == 60.0
+    rows_ = (series(T0, [10.0, 12.0], T0 + 3600)
+             + series(T0 + 2 * MINUTE, [13.0, 14.0], T0 + 3600 + advance))
+
+    found = usage_meter.segments(rows_, since=T0, until=T0 + 10 * MINUTE,
+                                 key="five_hour")
+
+    assert found.reset_count == resets
+
+
+@pytest.mark.parametrize("key,max_resets", [("five_hour", 34), ("seven_day", 2)])
+def test_more_resets_than_the_span_can_hold_is_clamped_and_marked(
+        key, max_resets, monkeypatch):
+    monkeypatch.setattr(usage_meter, "_boundary", lambda a, b, k: "reset")
+    rows_ = series(T0, [1.0 * i for i in range(120)], T0 + 3600, key=key)
+
+    found = usage_meter.segments(rows_, since=T0, until=T0 + WEEK, key=key)
+
+    assert found.max_resets == max_resets
+    assert found.reset_count == max_resets
+    assert found.reliable is False
+    assert "reset_count_above_span" in found.unreliable
+    assert len(found.segments) == 120, "the segments are the evidence, never re-merged"
+
+
+def test_a_segment_rising_more_than_the_whole_window_is_clamped_and_marked():
+    rows_ = series(T0, [0.0, 120.0], T0 + 3600)
+
+    found = usage_meter.segments(rows_, since=T0, until=T0 + 10 * MINUTE,
+                                 key="five_hour")
+
+    assert found.reliable is False
+    assert "segment_delta_above_window" in found.unreliable
+    assert max(s.delta for s in found.segments) == pytest.approx(100.0)
+    assert found.delta_points == pytest.approx(100.0)
 
 
 # -- 24-28. dollars per point -----------------------------------------------------------

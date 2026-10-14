@@ -116,16 +116,18 @@ def test_the_subtree_keys_and_version_are_pinned(fleet_fixture):
     assert meter["version"] == 1
     assert set(meter) == {"version", "window", "five_hour", "seven_day", "coverage",
                           "dollars_per_point", "spend", "outside", "timeline",
-                          "sentence", "alerts"}
+                          "sentence", "alerts", "reliable", "unreliable"}
     assert set(meter["window"]) == {"since", "until", "source"}
     assert set(meter["five_hour"]) == {"start_pct", "end_pct", "delta_points",
-                                       "reset_count", "anomalies", "segments"}
+                                       "reset_count", "max_resets", "anomalies",
+                                       "reliable", "unreliable", "segments"}
     assert set(meter["seven_day"]) == set(meter["five_hour"])
     assert set(meter["five_hour"]["segments"][0]) == {"since", "until", "start_pct",
                                                       "end_pct", "delta", "cause"}
     assert set(meter["coverage"]) == {"samples", "expected", "share", "gap_rows",
                                       "longest_gap_seconds", "head_uncovered_seconds",
-                                      "first_ts", "last_ts"}
+                                      "first_ts", "last_ts", "reliable",
+                                      "min_reliable_share"}
     assert set(meter["dollars_per_point"]) == {"value", "low", "high", "source",
                                                "basis_spans", "basis_points",
                                                "basis_usd"}
@@ -135,7 +137,8 @@ def test_the_subtree_keys_and_version_are_pinned(fleet_fixture):
                                    "scope_project", "scope_workers_usd",
                                    "scope_jarvis_calls_usd", "scope_jarvis_usd"}
     assert set(meter["outside"]) == {"total_usd", "n", "sessions"}
-    assert set(meter["alerts"]) == {"outside", "residual", "thresholds", "min_usd"}
+    assert set(meter["alerts"]) == {"outside", "residual", "unreliable", "suppressed",
+                                    "thresholds", "min_usd"}
     assert set(meter["timeline"][0]) == {"ts", "five_hour_pct", "seven_day_pct", "ok"}
 
 
@@ -265,6 +268,93 @@ def test_an_unscoped_query_carries_the_scope_keys_as_none(fleet_fixture):
                 "scope_jarvis_usd"):
         assert meter["spend"][key] is None, key
     assert "own share of that" not in meter["sentence"]
+
+
+# -- the honesty gate --------------------------------------------------------------------
+# docs/superpowers/specs/2026-10-13-usage-meter-spurious-resets.md, cases 6-9.
+
+
+def test_a_span_the_meter_barely_covers_derives_no_dollar_figure(fleet_fixture):
+    """3% covered: the rise is not a bound in either direction, so nothing is derived."""
+    meter = meter_of(fleet_fixture, scene(fleet_fixture, until=SPAN_UNTIL, samples=9))
+    said = meter["sentence"]
+    spend = meter["spend"]
+
+    assert meter["coverage"]["share"] == pytest.approx(0.03)
+    assert meter["reliable"] is False
+    assert "low_coverage" in meter["unreliable"]
+    assert usage_meter.UNRELIABLE in said
+    assert "3% covered" in said
+    for forbidden in ("lower bound", usage_meter.RESIDUAL_LABEL, "unexplained"):
+        assert forbidden not in said, forbidden
+    # The measured halves are measured, not derived, and stay numbers.
+    assert f"${spend['jarvis_usd']:.2f}" in said
+    assert f"${spend['outside_usd']:.2f}" in said
+    for key in ("implied_usd", "residual_usd", "residual_share", "outside_share",
+                "jarvis_share"):
+        assert spend[key] is None, key
+
+
+def test_between_the_thresholds_the_figure_stands_and_the_coverage_is_incomplete(
+        fleet_fixture):
+    meter = meter_of(fleet_fixture, scene(fleet_fixture, until=SPAN_UNTIL, samples=210))
+    said = meter["sentence"]
+
+    assert meter["coverage"]["share"] == pytest.approx(0.7)
+    assert meter["reliable"] is True and meter["unreliable"] == []
+    assert "the 5h meter rose 12 points (~$9.8)" in said
+    assert "70% of this span, so the rise is incomplete" in said
+    assert "lower bound" not in said
+
+
+def test_an_unreliable_span_suppresses_both_alarms_and_the_daemon_writes_nothing(
+        fleet_fixture, fixed_now):
+    fleet_fixture.order("the carrier", status="completed")
+    scene(fleet_fixture, until=SPAN_UNTIL, samples=120)        # 40% covered
+    meter = meter_of(fleet_fixture, {"since": SPAN_SINCE, "until": SPAN_UNTIL,
+                                     "source": "session-meter"})
+
+    assert meter["reliable"] is False
+    assert meter["alerts"]["outside"] is False
+    assert meter["alerts"]["residual"] is False
+    assert meter["alerts"]["unreliable"] is True
+    # The raw rise clears the floor, so this span WOULD have alarmed had the arithmetic
+    # been sound — which is the whole claim `suppressed` makes.
+    assert meter["alerts"]["suppressed"] is True
+    assert meter["spend"]["implied_usd"] is None, "and no dollar figure in the payload"
+
+    reconcile(fleet_fixture, daemon_for(fleet_fixture))
+
+    assert alarms(fleet_fixture) == []
+    central = CentralStore()
+    try:
+        assert central.unacked_inbox("warning") == []
+    finally:
+        central.close()
+    store = ProjectStore(fleet_fixture.project_path)
+    try:
+        carrier = store.latest_settled_order()
+        assert store.events_of_kind(carrier["id"], "cost_alarm") == []
+    finally:
+        store.close()
+
+
+def test_a_gap_longer_than_the_window_derives_nothing(fleet_fixture):
+    """A whole 5h window could have opened and closed inside the hole."""
+    since, until = SPAN_SINCE, SPAN_SINCE + 24 * HOUR
+    calibrate(fleet_fixture, since)
+    store_samples(series(since, n=540, first=10.0, last=19.0, resets=until))
+    store_samples(series(since + 15 * HOUR, n=540, first=19.0, last=28.0, resets=until))
+
+    meter = meter_of(fleet_fixture, {"since": since, "until": until,
+                                     "source": "session-meter"})
+
+    assert meter["coverage"]["share"] == pytest.approx(0.75)
+    assert "gap_longer_than_window" in meter["unreliable"]
+    assert "low_coverage" not in meter["unreliable"]
+    assert meter["spend"]["implied_usd"] is None
+    assert usage_meter.UNRELIABLE in meter["sentence"]
+    assert "unexplained" not in meter["sentence"]
 
 
 # -- 33-35. the CLI ----------------------------------------------------------------------
@@ -404,7 +494,7 @@ def test_the_outside_alarm_fires_once_per_window_for_the_os_owner(
         fleet_fixture, fixed_now):
     assert METER_RECONCILE_EVERY_TICKS == 360
     fleet_fixture.order("the carrier", status="completed")
-    scene(fleet_fixture, until=SPAN_UNTIL, samples=120)
+    scene(fleet_fixture, until=SPAN_UNTIL, samples=300)
     daemon = daemon_for(fleet_fixture)
 
     reconcile(fleet_fixture, daemon)
@@ -431,7 +521,7 @@ def test_the_outside_alarm_fires_once_per_window_for_the_os_owner(
 
 def test_the_alarm_is_silent_below_the_floor_and_on_the_seed(fleet_fixture, fixed_now):
     fleet_fixture.order("the carrier", status="completed")
-    scene(fleet_fixture, until=SPAN_UNTIL, samples=120)
+    scene(fleet_fixture, until=SPAN_UNTIL, samples=300)
     fleet_fixture.set_cost(meter_alert_min_usd=50.0)
 
     reconcile(fleet_fixture, daemon_for(fleet_fixture))
@@ -462,7 +552,7 @@ def test_a_second_project_in_the_same_catalog_raises_nothing(fleet_fixture, fixe
     data["projects"].append({"name": "proj_b", "path": str(second)})
     fleet_fixture.catalog_path.write_text(json.dumps(data))
     fleet_fixture.order("the carrier", status="completed")
-    scene(fleet_fixture, until=SPAN_UNTIL, samples=120)
+    scene(fleet_fixture, until=SPAN_UNTIL, samples=300)
     daemon = daemon_for(fleet_fixture)
 
     store = ProjectStore(second)

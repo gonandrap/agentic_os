@@ -1093,6 +1093,21 @@ DEFAULT_FLEET_HEALTH_SWEEP_DARK_MINUTES = 180
 #: silently leaving that status unwatched.
 FLEET_HEALTH_MAP_KEYS = ("thresholds",)
 
+#: Work-order kinds the sweep never judges — §2.1 of docs/superpowers/specs/2026-10-12-a-
+#: managers-by-design-idle-is-not-a-standstill.md. A CATALOG KEY and not a module constant
+#: (kn-1cec46b5, Neo 1596): a kind the sweep must not judge is the same class of decision
+#: as a threshold. `investigator` only — diagnosing the diagnostician is a loop with a
+#: budget attached, and `investigation` is a FEATURE-order kind no `work_orders` row can
+#: hold (`project_store.WO_KINDS`), so shipping it would only fail its own validator.
+#: `manager` is deliberately ABSENT: a manager's exemption is a property of its SITUATION
+#: (§2.2) and a stranded one must still be caught.
+DEFAULT_FLEET_HEALTH_EXEMPT_KINDS: tuple[str, ...] = ("investigator",)
+
+#: `FleetHealthConfig` fields that are a LIST, not a count. Skipped by the reflective
+#: `>= 1` loop in `_parse_fleet_health` for `FLEET_HEALTH_MAP_KEYS`' reason — comparing a
+#: tuple with an int raises `TypeError` — and validated per element instead.
+FLEET_HEALTH_LIST_KEYS = ("exempt_kinds",)
+
 #: `FleetHealthConfig` fields that are a FLEET number and are REFUSED on a project, each
 #: with the reason the refusal states. `max_per_day` rations a fleet-wide daily cap;
 #: `sweep_dark_minutes` bounds the silence of ONE fleet-wide run record
@@ -1135,6 +1150,10 @@ class FleetHealthConfig:
     sweep_every_ticks: int = DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS
     #: Fleet-only: how long the sweep's own run record may be silent (§8).
     sweep_dark_minutes: int = DEFAULT_FLEET_HEALTH_SWEEP_DARK_MINUTES
+    #: Kinds this project's sweep never judges. Overridden WHOLE and not merged per
+    #: element, unlike `thresholds`: a kind list is one policy statement, and a merging
+    #: list could only ever grow — un-exempting a kind would be inexpressible.
+    exempt_kinds: tuple[str, ...] = DEFAULT_FLEET_HEALTH_EXEMPT_KINDS
 
     def threshold_seconds(self, status: str) -> float:
         """This status's threshold, in the seconds `stuck.assess` compares — the named one
@@ -1582,6 +1601,35 @@ class RemedyConfig:
     allowed: tuple[str, ...] = ()
 
 
+#: How many samples a median in the evolution report needs before it is reported as one
+#: (§9 of docs/superpowers/specs/2026-09-27-self-evolution.md). A median over fewer than
+#: three samples is one sample wearing a statistic's name.
+DEFAULT_EVOLUTION_MIN_SAMPLES = 3
+
+
+@dataclass
+class EvolutionConfig:
+    """What the §9 evolution report needs before it believes its own numbers.
+    docs/superpowers/specs/2026-09-27-self-evolution.md.
+
+    `min_samples` is the floor under every median the report prints. Not a module
+    constant in `ops` because how much history a project needs before it trusts its
+    medians is a judgement about that project, and the report's notes say "fewer than N"
+    — so the N a reader is shown and the N the report applied are one value, read once.
+
+    Its own section rather than `rules.min_samples`: `rules` is the off switch for the
+    EVALUATION pass (§5.2) and the floor governs a READ of history that runs whether or
+    not the pass is armed. Neo (q1575) said `evolution.min_samples`, this work order
+    shipped `rules.min_samples`, and the user overruled that — so later §9 tunables land
+    here beside it, and `rules` keeps only what arms a rule.
+
+    Per project as well as fleet-wide, with `_parse_inspect`'s field-level inheritance
+    (`_parse_evolution`): a project naming one key keeps the OS answer for the rest.
+    """
+
+    min_samples: int = DEFAULT_EVOLUTION_MIN_SAMPLES
+
+
 @dataclass
 class RulesConfig:
     """Whether the self-evolution registry is EVALUATED at all. §5.2 of
@@ -1595,9 +1643,13 @@ class RulesConfig:
     between "no rule has ever matched" and "nothing has ever looked".
 
     Per project as well as fleet-wide, with `_parse_inspect`'s field-level inheritance
-    (`_parse_rules`): a project that names one key keeps the OS answer for the rest. One
-    field today, and the shape is the house one so the arming threshold and the remedy
-    allow-list §6 adds do not arrive as a second config object.
+    (`_parse_rules`): a project that names one key keeps the OS answer for the rest. The
+    shape is the house one so the arming threshold and the remedy allow-list §6 adds do
+    not arrive as a second config object.
+
+    What does NOT belong here is §9's reporting floor: it was `rules.min_samples` and the
+    user reversed that, so it is `EvolutionConfig.min_samples`. This section is about
+    arming rules, not about reading their history.
     """
 
     enabled: bool = False
@@ -1681,6 +1733,7 @@ class ProjectSpec:
     concision: ConcisionConfig = field(default_factory=ConcisionConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     rules: RulesConfig = field(default_factory=RulesConfig)
+    evolution: EvolutionConfig = field(default_factory=EvolutionConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
     bugs: BugsConfig = field(default_factory=BugsConfig)
     release: ReleaseConfig = field(default_factory=ReleaseConfig)
@@ -1820,6 +1873,7 @@ class OsConfig:
     concision: ConcisionConfig = field(default_factory=ConcisionConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     rules: RulesConfig = field(default_factory=RulesConfig)
+    evolution: EvolutionConfig = field(default_factory=EvolutionConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
     bugs: BugsConfig = field(default_factory=BugsConfig)
     release: ReleaseConfig = field(default_factory=ReleaseConfig)
@@ -2279,7 +2333,7 @@ def _parse_fleet_health(raw: Any, base: FleetHealthConfig | None = None,
     that a typo must not silently leave a status unwatched, and `fleet.py`'s opening
     paragraph for the third.
     """
-    from .project_store import OPEN_STATUSES
+    from .project_store import OPEN_STATUSES, WO_KINDS
 
     base = base or FleetHealthConfig()
     if not isinstance(raw, dict):
@@ -2300,6 +2354,21 @@ def _parse_fleet_health(raw: Any, base: FleetHealthConfig | None = None,
         if int(minutes) < 1:
             raise _err(f"{where}.thresholds.{status} must be >= 1")
         thresholds[status] = int(minutes)
+    # A WHOLE-FIELD override. The EMPTY list is allowed and means "judge every kind": a
+    # meaningful policy, unlike `os.navigation`'s empty pattern list.
+    exempt_kinds = base.exempt_kinds
+    if "exempt_kinds" in raw:
+        named_kinds = raw["exempt_kinds"]
+        if not isinstance(named_kinds, list) \
+                or not all(isinstance(k, str) for k in named_kinds):
+            raise _err(f'"{where}.exempt_kinds" must be a list of strings')
+        for k in named_kinds:
+            # Refused rather than ignored: a typo that silently exempted nothing is how a
+            # manager stays watched after somebody tried to stop it.
+            if k not in WO_KINDS:
+                raise _err(f"{where}.exempt_kinds: {k!r} is not a work-order kind "
+                           f"(known: {sorted(WO_KINDS)})")
+        exempt_kinds = tuple(named_kinds)
     cfg = FleetHealthConfig(
         enabled=bool(raw.get("enabled", base.enabled)),
         thresholds=thresholds,
@@ -2308,9 +2377,11 @@ def _parse_fleet_health(raw: Any, base: FleetHealthConfig | None = None,
         max_per_day=int(raw.get("max_per_day", base.max_per_day)),
         sweep_every_ticks=int(raw.get("sweep_every_ticks", base.sweep_every_ticks)),
         sweep_dark_minutes=int(raw.get("sweep_dark_minutes", base.sweep_dark_minutes)),
+        exempt_kinds=exempt_kinds,
     )
     for name, value in vars(cfg).items():
-        if name in FLEET_HEALTH_MAP_KEYS or name == "enabled":
+        if name in FLEET_HEALTH_MAP_KEYS or name in FLEET_HEALTH_LIST_KEYS \
+                or name == "enabled":
             continue
         if value < 1:
             raise _err(f"{where}.{name} must be >= 1")
@@ -2501,6 +2572,9 @@ def _parse_rules(raw: Any, base: RulesConfig | None = None,
     `false_positive_disarm` is a COUNT and is refused below 1: zero would demote an armed
     detector the moment it was armed, which makes `jarvis rules arm` a no-op that
     announces itself (§6, Neo's ruling that this is a catalog setting and not a constant).
+
+    `enabled` needs no validation: a boolean whose default is the shipped `False` when
+    neither the fleet nor the project names it.
     """
     base = base or RulesConfig()
     if not isinstance(raw, dict):
@@ -2513,6 +2587,24 @@ def _parse_rules(raw: Any, base: RulesConfig | None = None,
         raise _err(f'"{where}.false_positive_disarm" must be >= 1')
     return RulesConfig(enabled=bool(raw.get("enabled", base.enabled)),
                        false_positive_disarm=disarm)
+
+
+def _parse_evolution(raw: Any, base: EvolutionConfig | None = None,
+                     where: str = "os.evolution") -> EvolutionConfig:
+    """`os.evolution`, or a project's override of it — field-level, like `_parse_inspect`.
+
+    `min_samples` is validated the way `_parse_concision` refuses a negative cap: 1 is
+    the floor, because a "median" over zero samples is not a statistic that could be
+    computed at all, and the report's own note promises the reader a number of samples it
+    waited for.
+    """
+    base = base or EvolutionConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    min_samples = int(raw.get("min_samples", base.min_samples))
+    if min_samples < 1:
+        raise _err(f"{where}.min_samples must be 1 or more, got {min_samples}")
+    return EvolutionConfig(min_samples=min_samples)
 
 
 def _parse_concision(raw: Any, base: ConcisionConfig | None = None,
@@ -2933,6 +3025,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         concision=_parse_concision(os_raw.get("concision", {})),
         supervisor=_parse_supervisor(os_raw.get("supervisor", {})),
         rules=_parse_rules(os_raw.get("rules", {})),
+        evolution=_parse_evolution(os_raw.get("evolution", {})),
         messaging=_parse_messaging(os_raw.get("messaging", {})),
         bugs=_parse_bugs(os_raw.get("bugs", {})),
         release=_parse_release(os_raw.get("release", {})),
@@ -3099,6 +3192,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         rules_cfg = _parse_rules(
             p.get("rules", {}), base=os_cfg.rules,
             where=f"projects[{i}] ({name}).rules")
+        evolution_cfg = _parse_evolution(
+            p.get("evolution", {}), base=os_cfg.evolution,
+            where=f"projects[{i}] ({name}).evolution")
         messaging_cfg = _parse_messaging(
             p.get("messaging", {}), base=os_cfg.messaging,
             where=f"projects[{i}] ({name}).messaging")
@@ -3137,6 +3233,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 concision=concision_cfg,
                 supervisor=supervisor_cfg,
                 rules=rules_cfg,
+                evolution=evolution_cfg,
                 messaging=messaging_cfg,
                 bugs=bugs_cfg,
                 release=release_cfg,

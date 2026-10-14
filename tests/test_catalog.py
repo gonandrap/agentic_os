@@ -713,6 +713,53 @@ def test_fleet_health_inherits_per_status():
                                      "fleet_health": {"max_per_day": 9}}]})
 
 
+def test_exempt_kinds_overrides_whole_rather_than_merging():
+    """§2.1 of docs/superpowers/specs/2026-10-12-a-managers-by-design-idle-is-not-a-
+    standstill.md: a kind list is ONE policy statement, so a project's value replaces the
+    fleet's — the contrast with the per-status `thresholds` test above is the point. A
+    merging list could only ever grow, leaving un-exempting a kind inexpressible."""
+    cat = parse_catalog({
+        "os": {"fleet_health": {"exempt_kinds": ["investigator", "analyst"]}},
+        "projects": [{"name": "a", "path": "/tmp/a"},
+                     {"name": "b", "path": "/tmp/b",
+                      "fleet_health": {"exempt_kinds": ["manager"]}}],
+    })
+    assert cat.os.fleet_health.exempt_kinds == ("investigator", "analyst")
+    assert cat.projects[0].fleet_health.exempt_kinds == ("investigator", "analyst")
+    assert cat.projects[1].fleet_health.exempt_kinds == ("manager",)
+
+
+def test_exempt_kinds_refuses_a_kind_no_work_order_can_hold():
+    """A typo that silently left a kind watched is how a manager stays judged after
+    somebody tried to stop it. `"investigation"` is a FEATURE-order kind and no
+    `work_orders` row can hold it — the regression guard for the shipped default."""
+    for bad in ("investigation", "plannr"):
+        with pytest.raises(CatalogError, match="is not a work-order kind"):
+            parse_catalog({"os": {"fleet_health": {"exempt_kinds": [bad]}},
+                           "projects": [{"name": "a", "path": "/tmp/a"}]})
+    with pytest.raises(CatalogError, match="investigator"):
+        parse_catalog({"os": {"fleet_health": {"exempt_kinds": ["investigation"]}},
+                       "projects": [{"name": "a", "path": "/tmp/a"}]})
+    with pytest.raises(CatalogError, match="must be a list of strings"):
+        parse_catalog({"os": {"fleet_health": {"exempt_kinds": "manager"}},
+                       "projects": [{"name": "a", "path": "/tmp/a"}]})
+    # The EMPTY list is a meaningful policy — judge every kind — and not a mistake.
+    cat = parse_catalog({"os": {"fleet_health": {"exempt_kinds": []}},
+                         "projects": [{"name": "a", "path": "/tmp/a"}]})
+    assert cat.projects[0].fleet_health.exempt_kinds == ()
+
+
+def test_the_shipped_exempt_kinds_default_parses():
+    """The guard for the reflective `>= 1` loop in `_parse_fleet_health`: without
+    `FLEET_HEALTH_LIST_KEYS` it compares a tuple with an int and every catalog parse in
+    the suite dies with a `TypeError` no other test would explain."""
+    assert jarvis.catalog.DEFAULT_FLEET_HEALTH_EXEMPT_KINDS == ("investigator",)
+    assert "exempt_kinds" in jarvis.catalog.FLEET_HEALTH_LIST_KEYS
+    cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
+    assert cat.projects[0].fleet_health.exempt_kinds == \
+        jarvis.catalog.DEFAULT_FLEET_HEALTH_EXEMPT_KINDS
+
+
 def test_sweep_dark_minutes_is_refused_on_a_project():
     """A FLEET number, `max_per_day`'s reason: the stuck sweep writes ONE fleet-wide run
     record, so no arrangement of per-project numbers can say how long it may be silent."""
@@ -1103,6 +1150,50 @@ def test_a_rules_block_that_is_not_an_object_is_refused_naming_the_project(tmp_p
     with pytest.raises(CatalogError, match=r"projects\[0\] \(a\)\.rules"):
         parse_catalog({"projects": [{"name": "a", "path": str(tmp_path),
                                      "rules": True}]})
+
+
+# -- evolution: the sample floor under §9's medians -------------------------------------
+
+
+def test_evolution_min_samples_ships_a_default_and_a_project_may_override_it(tmp_path):
+    """`evolution.min_samples` is its own section, not `rules.*`: the user reversed the
+    assumption that put it there. §9 of
+    docs/superpowers/specs/2026-09-27-self-evolution.md, with `_parse_inspect`'s
+    field-level inheritance."""
+    cat = parse_catalog({"os": {"evolution": {"min_samples": 4}}, "projects": [
+        {"name": "a", "path": str(tmp_path)},
+        {"name": "b", "path": str(tmp_path), "evolution": {"min_samples": 9}},
+    ]})
+
+    assert cat.os.evolution.min_samples == 4
+    assert cat.projects[0].evolution.min_samples == 4, "silent project inherits the fleet"
+    assert cat.projects[1].evolution.min_samples == 9
+
+
+def test_a_catalog_silent_on_evolution_keeps_the_shipped_floor(tmp_path):
+    cat = parse_catalog({"projects": [{"name": "a", "path": str(tmp_path)}]})
+
+    assert cat.os.evolution.min_samples == jarvis.catalog.DEFAULT_EVOLUTION_MIN_SAMPLES
+    assert cat.projects[0].evolution.min_samples == 3
+    assert not hasattr(cat.os.rules, "min_samples"), "the floor left `rules` entirely"
+
+
+def test_an_evolution_min_samples_below_one_is_refused(tmp_path):
+    """A median over zero samples is not a statistic that could be computed at all."""
+    with pytest.raises(CatalogError,
+                       match="evolution.min_samples must be 1 or more, got 0"):
+        parse_catalog({"os": {"evolution": {"min_samples": 0}}})
+    with pytest.raises(CatalogError,
+                       match=r"projects\[0\] \(a\)\.evolution\.min_samples must be 1 "
+                             r"or more, got -2"):
+        parse_catalog({"projects": [{"name": "a", "path": str(tmp_path),
+                                     "evolution": {"min_samples": -2}}]})
+
+
+def test_an_evolution_block_that_is_not_an_object_is_refused_naming_the_project(tmp_path):
+    with pytest.raises(CatalogError, match=r"projects\[0\] \(a\)\.evolution"):
+        parse_catalog({"projects": [{"name": "a", "path": str(tmp_path),
+                                     "evolution": True}]})
 
 
 # -- `ui_health.*`: the dashboard's liveness probe and self-heal ----------------------

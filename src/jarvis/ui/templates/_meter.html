@@ -34,10 +34,16 @@
   {% endif %}
 
   <p class="kv mono" style="margin: 8px 0 0;">
+    {# The figures stay visible and the word does the work: a $/point rate applied to a
+       rise the module could not bound is the defect of the 2026-10-13 spec. #}
     5h +{{ '%.1f'|format(meter.five_hour.delta_points) }} points ·
     7d +{{ '%.1f'|format(meter.seven_day.delta_points) }} points ·
+    {% if meter.reliable -%}
     ${{ '%.2f'|format(meter.dollars_per_point.value) }}/point
-    ({{ meter.dollars_per_point.source }}) ·
+    ({{ meter.dollars_per_point.source }})
+    {%- else -%}
+    both unreliable, no $ figure is derived from them
+    {%- endif %} ·
     {{ meter.coverage.samples }} of {{ meter.coverage.expected }} readings
     {%- if meter.coverage.gap_rows %}, {{ meter.coverage.gap_rows }} failed{% endif %}
   </p>

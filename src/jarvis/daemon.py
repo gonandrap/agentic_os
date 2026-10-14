@@ -1924,10 +1924,8 @@ class Daemon:
                 and ops.revive_feature_manager(store, fo_id, why="manager handoff")
                 is None):
             return
-        if store.queued_messages(manager["id"]):
-            return
-        if any(e["state"] == "queued" and e["to_role"] == "manager"
-               for e in store.envelopes(subject_fo_id=fo_id)):
+        # ONE reading of "has anybody spoken to it", shared with `ops.stuck_scan`.
+        if not bus.nothing_queued_to_manager(store, fo_id, manager["id"]):
             return
 
         n = int(last["round"])
@@ -6014,6 +6012,12 @@ class Daemon:
         except Exception:  # noqa: BLE001 — a failing pass must not take the tick down
             log.exception("[%s] the usage meter could not be reconciled", project.name)
             return
+        if meter.get("unreliable"):
+            # A suppressed pass is visible in the log and nowhere else: the user has
+            # nothing to do about a defect in this module's own arithmetic.
+            log.warning("[%s] the usage meter does not reconcile over this span (%s): "
+                        "no residual alarm is raised from it", project.name,
+                        ", ".join(meter["unreliable"]))
         raised = [kind for kind, flag in (
             (METER_OUTSIDE_ALARM, meter["alerts"]["outside"]),
             (METER_RESIDUAL_ALARM, meter["alerts"]["residual"])) if flag]

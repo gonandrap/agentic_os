@@ -390,6 +390,27 @@ def deliver(store: ProjectStore, central: CentralStore, envelope: dict[str, Any]
     return "delivered"
 
 
+def nothing_queued_to_manager(store: ProjectStore, fo_id: str,
+                              manager_wo_id: str) -> bool:
+    """Has nobody spoken to this feature's manager? §2.2 of docs/superpowers/specs/
+    2026-10-12-a-managers-by-design-idle-is-not-a-standstill.md.
+
+    ONE reading, because two of them is the defect that spec exists to remove.
+    `Daemon._manager_handoff` computed exactly this inline — "one with a queued message,
+    or with the rejection envelope still queued against its feature, has not started" —
+    and `ops.stuck_scan` needs the same answer to tell a manager waiting correctly from
+    one that is stranded. A sweep that disagreed with the nudge would judge an order the
+    daemon was about to wake.
+
+    HERE because this module owns envelopes, `queued` and `ADDRESSABLE_ROLES`: the
+    `to_role == "manager"` string is its vocabulary, not the sweep's.
+    """
+    if store.queued_messages(manager_wo_id):
+        return False
+    return not any(e["state"] == "queued" and e["to_role"] == "manager"
+                   for e in store.envelopes(subject_fo_id=fo_id))
+
+
 def _context(store: ProjectStore, central: CentralStore, envelope: dict[str, Any],
              payload: Payload, *,
              project: str) -> dict[str, Any]:

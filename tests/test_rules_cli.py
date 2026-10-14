@@ -245,9 +245,9 @@ def test_dry_run_on_a_condition_that_no_longer_parses_reports_it_unreadable(stor
 # -- the CLI ----------------------------------------------------------------------------
 
 
-def test_the_family_is_exactly_six_verbs_and_names_the_other_registry():
-    """`arm` and `false-positive` joined the four with §6's alarm bridge; any further
-    verb is a deliberate act that edits this set.
+def test_the_family_is_exactly_seven_verbs_and_names_the_other_registry():
+    """`arm` and `false-positive` joined with §6's alarm bridge and `summary` with §9's
+    evolution report; any further verb is a deliberate act that edits this set.
 
     The description has to open by saying which registry this is and name `jarvis gate
     rules`: one verb meaning two registries is how that family stops being readable.
@@ -255,7 +255,7 @@ def test_the_family_is_exactly_six_verbs_and_names_the_other_registry():
     parser = cli.build_parser()
     rules_parser = parser._subparsers._group_actions[0].choices["rules"]
     verbs = set(rules_parser._subparsers._group_actions[0].choices)
-    assert verbs == {"list", "show", "retract", "dry-run", "arm", "false-positive"}
+    assert verbs == {"list", "show", "retract", "dry-run", "summary", "arm", "false-positive"}
     assert "gate rules" in rules_parser.description
     assert rules_parser.description.strip().startswith("the self-healing")
 
