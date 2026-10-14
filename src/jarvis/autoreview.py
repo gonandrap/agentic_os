@@ -78,6 +78,7 @@ from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any
 
+from . import navigation
 from .catalog import DEFAULT_VALIDATION_DECISION_RECORD_CHARS
 from .stakes import Stakes
 
@@ -1722,7 +1723,9 @@ class ConfirmEvidence:
 
 
 def confirm_evidence(packet: Any, assumption: dict[str, Any], limit: int, *,
-                     collect_limit: int = 0) -> ConfirmEvidence:
+                     collect_limit: int = 0,
+                     doc_suffixes: tuple[str, ...] = navigation.DOC_SUFFIXES,
+                     doc_dirs: frozenset[str] = navigation.DOC_DIRS) -> ConfirmEvidence:
     """Trim one collected packet for one assumption. PURE — no git, no store, no model.
 
     **THE HUNKS THE ASSUMPTION NAMES GO FIRST**, then SOURCE, then DOCUMENTATION. An
@@ -1751,7 +1754,8 @@ def confirm_evidence(packet: Any, assumption: dict[str, Any], limit: int, *,
         if path in files and _names_path(content, path):
             named.append(text)
         else:
-            (docs if _is_documentation(path) else source).append(text)
+            (docs if _is_documentation(path, doc_suffixes, doc_dirs)
+             else source).append(text)
     kept, cut, dropped, partial = evidence._truncate_hunks(
         "".join(named + source + docs), limit, files)
     return ConfirmEvidence(
@@ -1771,13 +1775,13 @@ def _names_path(content: str, path: str) -> bool:
     return lower in content or lower.rsplit("/", 1)[-1] in content
 
 
-#: What tier (c) is, mechanically: the suffix, or a path component that says documentation.
-DOC_SUFFIXES = (".md", ".rst", ".txt", ".adoc")
-DOC_DIRS = frozenset({"docs", "specs"})
-
-
-def _is_documentation(path: str) -> bool:
+def _is_documentation(path: str, doc_suffixes: tuple[str, ...],
+                      doc_dirs: frozenset[str]) -> bool:
     """Is this path documentation? A PATH test, never a reading of the diff's content.
+
+    The suffixes and the dirs are the CONFIGURED ones (`os.navigation.doc_suffixes` /
+    `doc_dirs`) and are passed in: a second classifier here would drift from the fleet's
+    the moment a project overrode it.
 
     Content-sniffing a diff fragment was rejected as non-deterministic and untestable
     (docs/superpowers/specs/2026-10-13-a-confirmation-question-with-a-zero-character-
@@ -1785,7 +1789,8 @@ def _is_documentation(path: str) -> bool:
     the assumption itself names — already covers.
     """
     lower = path.lower()
-    return lower.endswith(DOC_SUFFIXES) or bool(DOC_DIRS & set(lower.split("/")))
+    return (lower.endswith(tuple(doc_suffixes))
+            or bool(set(doc_dirs) & set(lower.split("/"))))
 
 
 def _some_of(names: tuple[str, ...]) -> str:

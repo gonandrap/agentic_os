@@ -20,7 +20,7 @@ from . import probes as probes_mod
 from .claude_cli import DEFAULT_MAX_OS_PROMPT_CHARS, MAX_OS_PROMPT_CHARS_MIN
 from . import schedule as schedule_mod
 from .gates import GateConfig
-from .navigation import (DOC_DUMP_COMMANDS, DOC_SUFFIXES, NAV_COMMANDS,
+from .navigation import (DOC_DIRS, DOC_DUMP_COMMANDS, DOC_SUFFIXES, NAV_COMMANDS,
                          SOURCE_SUFFIXES, SYMBOL_TOOLS, TEXT_SEARCH_TOOLS)
 from .neo_store import Q_KINDS, SEATS
 from .project_store import VALIDATOR_SEATS
@@ -1192,6 +1192,12 @@ DEFAULT_NAVIGATION_CODE_SUFFIXES = SOURCE_SUFFIXES
 #: docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §3.2.
 DEFAULT_NAVIGATION_DOC_SUFFIXES = DOC_SUFFIXES
 
+#: Which path components make a file a DOC by location. The same key `autoreview.
+#: _is_documentation` classifies a confirmation diff's tier (c) with, so a project
+#: overriding it moves both. Not a suffix: entries carry no leading dot.
+#: docs/superpowers/specs/2026-10-13-a-confirmation-question-with-a-zero-character-diff.md
+DEFAULT_NAVIGATION_DOC_DIRS = DOC_DIRS
+
 #: The Bash commands that DUMP a doc. `grep`/`rg`/`find` are absent by decision — text
 #: search in markdown stays legal and counting it would price a legitimate call as waste.
 #: docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §3.2.
@@ -1203,9 +1209,10 @@ DEFAULT_NAVIGATION_DOC_DUMP_COMMANDS = DOC_DUMP_COMMANDS
 DEFAULT_NAVIGATION_WINDOW_DAYS = 7
 
 #: The `NavigationConfig` fields that are a PATTERN LIST, so `_parse_navigation` can
-#: refuse all six the same way. An empty one reports 0% everywhere and looks like a win.
+#: refuse all seven the same way. An empty one reports 0% everywhere and looks like a win.
 NAVIGATION_PATTERN_KEYS = ("bash_commands", "symbol_tools", "text_search_tools",
-                           "code_suffixes", "doc_suffixes", "doc_dump_commands")
+                           "code_suffixes", "doc_suffixes", "doc_dirs",
+                           "doc_dump_commands")
 
 
 @dataclass
@@ -1226,6 +1233,7 @@ class NavigationConfig:
     text_search_tools: tuple[str, ...] = DEFAULT_NAVIGATION_TEXT_SEARCH_TOOLS
     code_suffixes: tuple[str, ...] = DEFAULT_NAVIGATION_CODE_SUFFIXES
     doc_suffixes: tuple[str, ...] = DEFAULT_NAVIGATION_DOC_SUFFIXES
+    doc_dirs: frozenset[str] = DEFAULT_NAVIGATION_DOC_DIRS
     doc_dump_commands: tuple[str, ...] = DEFAULT_NAVIGATION_DOC_DUMP_COMMANDS
     window_days: int = DEFAULT_NAVIGATION_WINDOW_DAYS
 
@@ -2384,6 +2392,9 @@ def _parse_navigation(raw: Any, base: NavigationConfig | None = None,
         code_suffixes=patterns("code_suffixes", base.code_suffixes),
         # docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §3.2.
         doc_suffixes=patterns("doc_suffixes", base.doc_suffixes),
+        # docs/superpowers/specs/2026-10-13-a-confirmation-question-with-a-zero-character-
+        # diff.md: the confirmation tier (c) reads this, so it is NOT a suffix list.
+        doc_dirs=frozenset(patterns("doc_dirs", tuple(base.doc_dirs))),
         doc_dump_commands=patterns("doc_dump_commands", base.doc_dump_commands),
         window_days=int(raw.get("window_days", base.window_days)),
     )

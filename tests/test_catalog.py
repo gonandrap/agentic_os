@@ -957,6 +957,41 @@ def test_a_suffix_without_a_leading_dot_and_a_zero_window_are_refused():
         parse_catalog({"os": {"navigation": {"window_days": 0}}, "projects": []})
 
 
+def test_doc_dirs_is_a_navigation_pattern_key_with_the_leaf_set_as_its_default():
+    """`autoreview._is_documentation`'s path rule is CONFIGURED, not a second classifier
+    in `autoreview`. Identity, not equality: a copied body passes equality then drifts."""
+    from jarvis import catalog, navigation
+
+    assert catalog.DEFAULT_NAVIGATION_DOC_DIRS is navigation.DOC_DIRS
+    assert catalog.NavigationConfig().doc_dirs is navigation.DOC_DIRS
+    assert navigation.DOC_DIRS == frozenset({"docs", "specs"})
+    assert "doc_dirs" in catalog.NAVIGATION_PATTERN_KEYS
+
+    cat = parse_catalog({
+        "os": {"navigation": {"doc_dirs": ["documentation"]}},
+        "projects": [
+            {"name": "a", "path": "/tmp/a"},
+            {"name": "b", "path": "/tmp/b", "navigation": {"doc_dirs": ["adr", "rfc"]}},
+        ],
+    })
+
+    assert cat.os.navigation.doc_dirs == frozenset({"documentation"})
+    assert cat.projects[0].navigation.doc_dirs == frozenset({"documentation"})
+    assert cat.projects[1].navigation.doc_dirs == frozenset({"adr", "rfc"})
+    # field-level inheritance: naming `doc_dirs` keeps the OS answer for the rest
+    assert cat.projects[1].navigation.doc_suffixes == (".md",)
+
+
+def test_an_empty_doc_dirs_is_refused_and_a_dotless_entry_is_not():
+    """A silently empty `doc_dirs` disables the path rule and looks fine — the same
+    failure its siblings' refusal exists for. It is NOT a suffix, so no leading dot."""
+    with pytest.raises(CatalogError, match="navigation.doc_dirs"):
+        parse_catalog({"os": {"navigation": {"doc_dirs": []}}, "projects": []})
+
+    cat = parse_catalog({"os": {"navigation": {"doc_dirs": ["docs"]}}, "projects": []})
+    assert cat.os.navigation.doc_dirs == frozenset({"docs"})
+
+
 # -- `os.cost`: the fleet distribution's tunables ---------------------------------------
 #
 # §6 of docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md. Neo's rider: no

@@ -64,10 +64,28 @@ Replace the two-way `named` / `rest` partition with three lists, joined in this 
 | (c) | documentation sections |
 
 Documentation is a mechanical path test on the section's path (`new or old`), no content
-sniffing:
+sniffing — and it reads the project's CONFIGURED doc classifier, never a second one:
 
-- suffix in `.md`, `.rst`, `.txt`, `.adoc`, case-insensitive; OR
-- any path component equal to `docs` or `specs`.
+- suffix in `project.navigation.doc_suffixes` (`catalog.NavigationConfig.doc_suffixes`,
+  catalog.py:1227; catalog key `os.navigation.doc_suffixes`; default
+  `navigation.DOC_SUFFIXES` = `(".md",)` via `DEFAULT_NAVIGATION_DOC_SUFFIXES`,
+  catalog.py:1193), case-insensitive; OR
+- any path component in `project.navigation.doc_dirs` — a NEW sibling key
+  `os.navigation.doc_dirs`, default `navigation.DOC_DIRS` = `frozenset({"docs",
+  "specs"})`, declared in `navigation.py` beside `DOC_SUFFIXES` (navigation.py:205).
+
+`doc_dirs` joins `NAVIGATION_PATTERN_KEYS` (catalog.py:1207), so `_parse_navigation`
+refuses an empty list exactly as it refuses its siblings and inherits field by field: a
+project naming only `doc_dirs` keeps the OS answer for every other key. It is NOT a
+suffix, so it stays OUT of the dot-prefix validation loop (catalog.py:2392) — `"docs"`
+is a path component and would be refused there.
+
+`autoreview._is_documentation(path, suffixes, dirs)` takes both as arguments and holds NO
+module constants. `confirm_evidence` (autoreview.py:1723) takes them KEYWORD-ONLY,
+defaulting to `navigation.DOC_SUFFIXES` and `navigation.DOC_DIRS` BY IDENTITY — one
+spelling of each in the tree, never a copy — and stays pure. `Daemon._review_assumptions_of`
+passes `project.navigation.doc_suffixes` and `project.navigation.doc_dirs` at the
+`confirm_evidence` call site (daemon.py:7515).
 
 A doc the assumption names stays in tier (a) — tier (a) is tested first and wins. A
 source file the assumption names also stays in (a); the tiering only reorders what was
@@ -175,6 +193,11 @@ to nothing holds. The guard is `full_chars > 0`, never `not diff` alone.
 6. A binary section is never reported as partial.
 7. `(no diff)` with `full_chars > 0` is now unreachable in a FILED question.
 8. Secret precedence: `HELD_EVIDENCE_SECRET` before `HELD_EVIDENCE_UNREADABLE`.
+9. **Exactly ONE doc classifier in the tree, and it is CONFIGURABLE.** `DOC_SUFFIXES` and
+   `DOC_DIRS` are declared once, in `navigation.py`, reached by identity; `autoreview`
+   declares neither and `_is_documentation` takes them as arguments. A project's
+   `os.navigation.doc_suffixes` / `doc_dirs` override governs tier (c) the same way it
+   governs `jarvis navigation` — there is no second list to drift from it.
 
 ## Tests to write first
 
@@ -185,34 +208,43 @@ Order matters — 1 is the live case.
    source sections are present, the doc is last and absent or partial, `diff != ""`, and
    `decide_evidence` arms.
 2. **Tiering.** (a) A doc the assumption names by path stays first, ahead of source.
-   (b) Source before doc when the assumption names nothing. (c) Path test cases:
-   `x.md`, `x.rst`, `x.txt`, `x.adoc`, `docs/a/b.py`, `specs/a.py` are docs;
-   `src/markdown.py`, `src/docsite.py`, `a.mdx` are not.
-3. **Partial section.** First section 2x budget: header lines kept, a whole number of
+   (b) Source before doc when the assumption names nothing. (c) Path test cases at the
+   DEFAULTS (`(".md",)`, `{"docs", "specs"}`): `x.md`, `docs/a/b.py`, `specs/a.py` are
+   docs; `x.rst`, `src/markdown.py`, `src/docsite.py`, `a.mdx` are not.
+3. **A project override reaches the tiering.** `confirm_evidence` with
+   `doc_suffixes=(".rst",)`: `x.md` is SOURCE (tier b) and `x.rst` is DOCUMENTATION
+   (tier c) — the inverse of test 2(c), which is the whole point of reading the config.
+   Same with `doc_dirs=frozenset({"manual"})`: `manual/a.py` is a doc, `docs/a.py` is not.
+4. **The catalog keys.** `os.navigation.doc_dirs` parses; absent, it defaults to
+   `navigation.DOC_DIRS`; a project naming only `doc_dirs` inherits the fleet's
+   `doc_suffixes` field by field; `doc_dirs: []` is REFUSED with the empty-classifier
+   error its siblings raise; `doc_dirs: ["docs"]` is accepted (the dot-prefix rule does
+   NOT apply to it) while `doc_suffixes: ["md"]` is still refused.
+5. **Partial section.** First section 2x budget: header lines kept, a whole number of
    `@@` hunks kept, output ends on a hunk boundary, in-diff marker names the omitted
    hunk count, the file is in `partial_files` and NOT in `dropped_files`, later sections
    all dropped whole.
-4. **Binary.** A binary section too big to fit is dropped, never partial, and appears in
+6. **Binary.** A binary section too big to fit is dropped, never partial, and appears in
    `dropped_files`.
-5. **The hold.** `full_chars > 0` and a first hunk alone over budget: `decide_evidence`
+7. **The hold.** `full_chars > 0` and a first hunk alone over budget: `decide_evidence`
    returns `HELD_EVIDENCE_UNREADABLE`, carries `assumption_id` and `n`, and no question
    is filed by the daemon pass.
-6. **Empty collection still asks.** `packet is None`, and a packet with
+8. **Empty collection still asks.** `packet is None`, and a packet with
    `diff == ""`/`full_chars == 0`: `decide_evidence` ARMS and the question goes out
    (regression guard for the distinction above).
-7. **Secret precedence.** Evidence both secret-shaped and trimmed to nothing reports
+9. **Secret precedence.** Evidence both secret-shaped and trimmed to nothing reports
    `HELD_EVIDENCE_SECRET`.
-8. **Panel untouched.** `_truncate` keeps its existing tests unmodified; add one
-   asserting `collect_work_order` still drops whole files at the panel budget.
-9. **Marker.** With `collect_truncated=True` the marker still says `more than 1,000,000`
-   and names partial and dropped files distinguishably.
-10. **Gate completeness.** The existing
+10. **Panel untouched.** `_truncate` keeps its existing tests unmodified; add one
+    asserting `collect_work_order` still drops whole files at the panel budget.
+11. **Marker.** With `collect_truncated=True` the marker still says `more than 1,000,000`
+    and names partial and dropped files distinguishably.
+12. **Gate completeness.** The existing
     `test_every_byte_of_the_evidence_block_went_through_the_net`
     (tests/test_autoreview_confirm.py:1342) still passes with a partial section in the
     block.
 
 Existing suites to extend: tests/test_autoreview_confirm.py, the `_truncate` tests in
-tests/test_evidence*.py.
+tests/test_evidence*.py, and the `_parse_navigation` tests for the new catalog key.
 
 ## Not in scope
 
@@ -249,3 +281,11 @@ tests/test_evidence*.py.
 6. **Content-sniff documentation instead of a path test.** Non-deterministic over a
    diff fragment and untestable. The path test is mechanical and wrong only in cases
    tier (a) already covers.
+7. **Hardcoded module constants in `autoreview` — `DOC_SUFFIXES = (".md", ".rst",
+   ".txt", ".adoc")` and `DOC_DIRS = {"docs", "specs"}`.** This spec's first version, and
+   REJECTED on review (Neo, agreed by the user): it is a SECOND doc classifier in a tree
+   that already has `navigation.DOC_SUFFIXES` behind a per-project catalog key. The two
+   diverge the moment a project overrides `os.navigation.doc_suffixes` — the same file
+   then counts as a doc for `jarvis navigation` and as source for tier (c), with nothing
+   reporting the disagreement. The wider default was the lure; it is not worth a
+   duplicated classifier, and a project that wants `.rst` can say so once.

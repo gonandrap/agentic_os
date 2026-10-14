@@ -1436,8 +1436,68 @@ def test_source_goes_before_documentation_when_the_assumption_names_nothing():
     ("src/jarvis/autoreview.py", False),
 ])
 def test_documentation_is_a_mechanical_path_test(path, is_doc):
-    """A path test, never content sniffing over a diff fragment (rejected 6)."""
-    assert autoreview._is_documentation(path) is is_doc
+    """A path test, never content sniffing over a diff fragment (rejected 6), and over
+    the suffixes and dirs PASSED IN — this module holds no classifier of its own."""
+    assert autoreview._is_documentation(
+        path, (".md", ".rst", ".txt", ".adoc"), frozenset({"docs", "specs"})) is is_doc
+
+
+def test_a_project_doc_suffix_override_decides_the_tier():
+    """The configured classifier reaches the tiering: with `doc_suffixes == (".rst",)`,
+    `x.md` is SOURCE and `x.rst` is documentation — the reverse of the defaults."""
+    md = added("x.md", "spec line\n" * 5)
+    rst = added("x.rst", "spec line\n" * 5)
+    stat, diff = md[0] + rst[0], md[1] + rst[1]
+    limit = max(len(md[1]), len(rst[1]))
+    packet, a = packet_of(stat, diff), assumption(content=ROUTINE)
+
+    overridden = autoreview.confirm_evidence(packet, a, limit, doc_suffixes=(".rst",))
+    default = autoreview.confirm_evidence(packet, a, limit)
+
+    assert overridden.diff.startswith("diff --git a/x.md")
+    assert overridden.dropped_files == ("x.rst",)
+    assert default.diff.startswith("diff --git a/x.rst")
+    assert default.dropped_files == ("x.md",)
+
+
+def test_a_project_doc_dir_override_decides_the_tier():
+    """`doc_dirs` the same way: a project calling its documentation `manual/` has
+    `docs/` read as source."""
+    manual = added("manual/a.py", "x = 1\n" * 5)
+    docs = added("docs/a.py", "x = 1\n" * 5)
+    stat, diff = manual[0] + docs[0], manual[1] + docs[1]
+    limit = max(len(manual[1]), len(docs[1]))
+    packet, a = packet_of(stat, diff), assumption(content=ROUTINE)
+
+    ce = autoreview.confirm_evidence(packet, a, limit,
+                                     doc_dirs=frozenset({"manual"}))
+
+    assert ce.diff.startswith("diff --git a/docs/a.py")
+    assert ce.dropped_files == ("manual/a.py",)
+
+
+def test_the_configured_doc_classifier_reaches_the_pass(started, monkeypatch):
+    """The daemon resolves it PER PROJECT (`project.navigation`) — `autoreview` carries
+    no second copy that drifts the moment a project overrides the catalog key."""
+    seen: list[dict] = []
+    real = autoreview.confirm_evidence
+
+    def recorder(packet, a, limit, **kw):
+        seen.append(kw)
+        return real(packet, a, limit, **kw)
+
+    monkeypatch.setattr(autoreview, "confirm_evidence", recorder)
+    nav = started.catalog.project("proj_a").navigation
+    nav.doc_suffixes = (".rst",)
+    nav.doc_dirs = frozenset({"manual"})
+    store, wo = park(started, auto_review=True)
+    stub_evidence(monkeypatch, *added("render.py", DEFAULT_FILES["render.py"]))
+    provisional(store, wo)
+
+    ask(started, store)
+
+    assert [k["doc_suffixes"] for k in seen] == [(".rst",)]
+    assert [k["doc_dirs"] for k in seen] == [frozenset({"manual"})]
 
 
 def test_a_file_shown_in_part_is_neither_complete_nor_absent():
