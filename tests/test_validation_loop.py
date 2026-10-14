@@ -26,8 +26,7 @@ import pytest
 from jarvis import claude_cli, ops, validation
 from jarvis.catalog import load_catalog
 from jarvis.central_store import CentralStore
-from jarvis.daemon import (VALIDATION_ESCALATED_TITLE, VALIDATION_REASON_CHARS,
-                          VALIDATION_REASON_CUT, Daemon)
+from jarvis.daemon import VALIDATION_REASON_CHARS, VALIDATION_REASON_CUT, Daemon
 from jarvis.invariants import VALIDATION_STUCK_BLOCKER, true_blockers
 from jarvis.project_store import VALIDATOR_SEATS, ProjectStore
 from jarvis.testing import make_git_project
@@ -1578,7 +1577,11 @@ def test_a_give_up_notifies_and_a_rejection_stays_silent(fleet):
 
     rows = _outbox(fleet)
     assert len(rows) == 1
-    assert rows[0]["title"] == VALIDATION_ESCALATED_TITLE.format(unit=wo["id"], n=2)
+    # The title names the FAMILY now: spec
+    # 2026-10-14-an-escalated-round-says-why-and-what-to-run-next §3. A rejection with
+    # the budget spent is `handover`; `VALIDATION_ESCALATED_TITLE` serves feature orders.
+    assert rows[0]["title"] == ops.ESCALATION_TITLE.format(
+        unit=wo["id"], n=2, verb=ops.ESCALATION_VERB["handover"])
     assert rows[0]["body"] == "no test covers the change", (
         "the body is the round's own reason — the only text that says why")
     assert (rows[0]["level"], rows[0]["source"], rows[0]["wo_id"]) == (
@@ -1603,14 +1606,18 @@ def test_the_give_up_notification_reaches_the_central_inbox(fleet):
     finally:
         central.close()
     assert len(rows) == 1
-    assert rows[0]["title"] == VALIDATION_ESCALATED_TITLE.format(unit=wo["id"], n=1)
+    assert rows[0]["title"] == ops.ESCALATION_TITLE.format(
+        unit=wo["id"], n=1, verb=ops.ESCALATION_VERB["handover"])
     assert rows[0]["body"] == "the change is untested"
     assert (rows[0]["level"], rows[0]["project"]) == ("warning", "proj_a")
 
 
 def test_the_escalations_that_never_call_the_validator_notify_too(fleet):
     """An empty diff gives up without a verdict to quote, so the notification carries
-    the machine's own sentence. Nothing else would tell the user the round closed."""
+    the machine's own sentence. Nothing else would tell the user the round closed.
+
+    `not_reviewed`, NOT `handover`: no seat judged an empty submission, so a title saying
+    it was rejected would claim a decision nobody made (spec §3)."""
     fleet.daemon.validator = Validator(passed())
     wo = fleet.dispatch("empty")
     fleet.worktree(wo["id"])  # a worktree, and not one byte changed in it
@@ -1619,7 +1626,9 @@ def test_the_escalations_that_never_call_the_validator_notify_too(fleet):
 
     rows = _outbox(fleet)
     assert len(rows) == 1
-    assert rows[0]["title"] == VALIDATION_ESCALATED_TITLE.format(unit=wo["id"], n=1)
+    assert rows[0]["title"] == ops.ESCALATION_TITLE.format(
+        unit=wo["id"], n=1, verb=ops.ESCALATION_VERB["not_reviewed"])
+    assert "rejected" not in rows[0]["title"]
     assert "changes no files" in rows[0]["body"]
 
 

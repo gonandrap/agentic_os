@@ -9,6 +9,11 @@ control existing at all on an order with NO assumption rows (and the `#pending` 
 landing on it), and the same order shape with ONE pending assumption, where the control
 renders ONCE and in the assumptions block.
 
+One shot per WRITTEN FAMILY too, which is how a contradictory header gets caught by eye
+rather than by a string assertion: the bare order is `rounds_spent` (`handover` — the panel
+rejected it), the held one is `nothing_to_judge` (`not_reviewed` — no seat judged it, so
+nothing was rejected and no seat opinion is recorded).
+
 The escalated state is built through `ops.finish` + `ops.escalate_validation_round`, never
 `store.set_status` (kn-303839ee): a hand-built state leaves no attention flag and is a
 picture of a surface nobody has.
@@ -46,25 +51,34 @@ def _repo(path: Path) -> None:
     (path / "README.md").write_text("# jarvis_os\n")
 
 
-def _escalate(store, title: str, description: str, summary: str) -> str:
+def _escalate(store, title: str, description: str, summary: str, *,
+              cause: str | None = None, reason: str = REASON,
+              judged: bool = True) -> str:
     """A work order in the live shape of wo-659be188: `needs_review`, latest round
-    `escalated`. Same shape as `tests/test_ui.py::_escalate`, through the real path."""
+    `escalated`. Same shape as `tests/test_ui.py::_escalate`, through the real path.
+
+    `cause` picks the family the page is a picture of. `judged=False` records NO seat
+    opinion, which is the whole point of a `not_reviewed` shot: a page showing seat
+    verdicts beside "was not reviewed" would be a picture of a contradiction.
+    """
     from jarvis import ops
 
     wo = ops.create_work_order("jarvis_os", title, description)
     ops.finish(wo["id"], summary, pr_url=PR,
                evidence="uv run pytest tests/ evals/ — 3841 passed, 2 skipped")
     rnd = store.latest_validation_round(wo_id=wo["id"])
-    store.record_validation_opinion(
-        rnd["id"], "tester", verdict="reject",
-        reply="The fix is right, but I want a regression test that fails without it.",
-        model="claude-opus-5", latency_ms=21300)
-    store.record_validation_opinion(
-        rnd["id"], "reviewer", verdict="pass",
-        reply="Reads correctly and the existing daemon tests cover the path.",
-        model="claude-sonnet-4-5", latency_ms=9100)
+    if judged:
+        store.record_validation_opinion(
+            rnd["id"], "tester", verdict="reject",
+            reply="The fix is right, but I want a regression test that fails without it.",
+            model="claude-opus-5", latency_ms=21300)
+        store.record_validation_opinion(
+            rnd["id"], "reviewer", verdict="pass",
+            reply="Reads correctly and the existing daemon tests cover the path.",
+            model="claude-sonnet-4-5", latency_ms=9100)
     ops.escalate_validation_round(store, store.get_work_order(wo["id"]),
-                                  rnd["id"], rnd["round"], REASON)
+                                  rnd["id"], rnd["round"], reason,
+                                  cause=cause or ops.ESCALATION_ROUNDS_SPENT)
     return wo["id"]
 
 
@@ -102,7 +116,10 @@ def seed() -> tuple[Path, str, str]:
             "The attention list drops a work order whose only blocker is a stale flag",
             "Re-derive attention from the invariants every tick instead of trusting the "
             "stored flag.",
-            "attention is now derived, with the stored flag as a cache")
+            "attention is now derived, with the stored flag as a cache",
+            cause=ops.ESCALATION_NOTHING_TO_JUDGE, judged=False,
+            reason="the submission changed no files and recorded no other durable "
+                   "effect, so the round closed without reaching a seat")
     finally:
         pstore.close()
     ops.assume(held, "Assumed a flag whose blocker no longer holds should be cleared "
