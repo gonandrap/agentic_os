@@ -4077,11 +4077,6 @@ def review_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | No
     if not pending and not escalated:
         return None
     latest = store.latest_validation_round(wo_id=wo["id"]) if escalated else None
-    rows = f"{pending} pending assumption" + ("" if pending == 1 else "s")
-    accept = ("Accepts " + rows + " and lands" if pending else "Lands") + \
-        " the work order" + (" over the panel's objection" if escalated else "")
-    reject = ("Rejects " + rows + " and resumes" if pending else "Resumes") + \
-        " the worker, with your reason as the guidance it is sent back with"
     # WHY THE PANEL HANDED IT OVER, and the command this order's shape accepts — spec
     # docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md
     # §3, §4. Derived HERE and nowhere else, so the terminal and the page cannot word one
@@ -4089,6 +4084,16 @@ def review_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | No
     cause = (escalation_cause(store, wo_id=wo["id"], round_id=int(latest["id"]))
              if latest else None)
     family = ESCALATION_FAMILY[cause] if cause else None
+    rows = f"{pending} pending assumption" + ("" if pending == 1 else "s")
+    # Only a `handover` round carries a panel opinion — every other family was never
+    # judged, so the clause would be false (`escalation_next`'s rule, Neo 1723).
+    landing = ("" if not escalated else
+               " over the panel's objection" if family == "handover"
+               else " without a panel verdict")
+    accept = ("Accepts " + rows + " and lands" if pending else "Lands") + \
+        " the work order" + landing
+    reject = ("Rejects " + rows + " and resumes" if pending else "Resumes") + \
+        " the worker, with your reason as the guidance it is sent back with"
     return {
         "pending": pending,
         "escalated": escalated,
@@ -4117,21 +4122,38 @@ def escalation_next(wo: dict[str, Any], family: str) -> list[str]:
     Spec
     docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md
     §4. `jarvis validation force` is offered ONLY to an `unjudged` family WITH a pull
-    request, for two separate reasons: `force_validation_refusal` (ops.py:5653-5657)
-    refuses a no-PR force, which is issue #1040 itself; and a `handover` order was judged,
-    so a forced round would re-run the same seats on the same unchanged work.
+    request, for two separate reasons: `force_validation_refusal` refuses a no-PR force,
+    which is issue #1040 itself; and neither of the other written families would gain
+    anything from a forced round — a `handover` order was judged, so the same seats would
+    re-run on the same unchanged work, and a `not_reviewed` one has nothing to judge until
+    the submission itself changes. FAMILY PICKS THE VERB AND FORCE-ELIGIBILITY SEPARATELY:
+    that is why `not_reviewed` could be split off `handover` without changing this
+    predicate.
 
     It does NOT call `force_validation_refusal` — that takes a resolved `cfg` and this
     projection has no config and must stay free of one. The two predicates may differ in
     strictness in ONE direction only, and a test pins it.
+
+    FAMILY ALSO PICKS THE WORDING: only `handover` has a panel opinion, so only it may
+    cite the panel's asks or objection. `not_reviewed`, `unjudged` and `unrecorded` get
+    the neutral pair — `unrecorded` included, because a legacy event with no cause may
+    have been an unjudged round, which would make the panel clause false (Neo 1723).
     """
     wo_id = str(wo["id"])
-    lines = [
-        f'jarvis wo review {wo_id} --reject --feedback "<what to change>" — resumes the '
-        f"worker with the panel's asks as its guidance.",
-        f'jarvis wo review {wo_id} --feedback "<why>" — lands it over the panel\'s '
-        f"objection.",
-    ]
+    if family == "handover":
+        lines = [
+            f'jarvis wo review {wo_id} --reject --feedback "<what to change>" — resumes '
+            f"the worker with the panel's asks as its guidance.",
+            f'jarvis wo review {wo_id} --feedback "<why>" — lands it over the panel\'s '
+            f"objection.",
+        ]
+    else:
+        lines = [
+            f'jarvis wo review {wo_id} --reject --feedback "<what to change>" — resumes '
+            f"the worker with your reason as its guidance.",
+            f'jarvis wo review {wo_id} --feedback "<why>" — lands it without a panel '
+            f"verdict.",
+        ]
     if family == "unjudged" and str(wo.get("pr_url") or ""):
         lines.append(
             f'jarvis validation force {wo_id} --reason "<why>" — judges the current pull '
@@ -5476,8 +5498,8 @@ def escalation_cause(store: ProjectStore, *, wo_id: str, round_id: int) -> str:
     Spec
     docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md
     §2. KEYED ON `round_id` AND NOT ON `round`: a rebind spends a row number without
-    spending budget, so `round` is not unique on an order that had one
-    (daemon.py:2819-2825).
+    spending budget, so `round` is not unique on an order that had one (see
+    `Daemon._validate_work_order`'s rebind arm).
     """
     for event in reversed(store.events_of_kind(wo_id, "validation_escalated")):
         payload = db.from_json(event["payload"], {})
@@ -7336,23 +7358,32 @@ ESCALATION_PROMPT_REFUSED = "prompt_refused"
 #: would put a wrong sentence — and a wrong command — on an old order (spec §1).
 ESCALATION_CAUSE_UNRECORDED = "unrecorded"
 
-#: `handover` — the panel REJECTED and is handing the decision over; `unjudged` — nobody
-#: has an opinion on the work. ONE DICT, so a cause added without a family is a `KeyError`
+#: THREE WRITTEN FAMILIES, and the family decides the VERB alone. `handover` — the panel
+#: rejected the work and is handing the decision over; `not_reviewed` — a round opened and
+#: no seat judged the submission, so nothing was rejected; `unjudged` — the panel itself
+#: never produced an opinion. `not_reviewed` exists because its three causes are not
+#: rejections and the `handover` verb claimed they were, against their own `ESCALATION_WHY`
+#: sentence (kn-bec32368: one escalation, one wording). It is NOT force-eligible:
+#: `escalation_next` gates `jarvis validation force` on `unjudged` and a pull request, so
+#: these three stay ineligible without that predicate changing.
+#: ONE DICT, so a cause added without a family is a `KeyError`
 #: in the first test that touches it rather than a blank sentence in production (spec §1).
 ESCALATION_FAMILY: dict[str, str] = {
     ESCALATION_ROUNDS_SPENT: "handover",
     ESCALATION_USER_REWORK_CEILING: "handover",
     ESCALATION_REBINDS_SPENT: "handover",
-    ESCALATION_BOUNCE_EXHAUSTED: "handover",
-    ESCALATION_NOTHING_TO_JUDGE: "handover",
-    ESCALATION_REPEAT_SUBMISSION: "handover",
+    ESCALATION_BOUNCE_EXHAUSTED: "not_reviewed",
+    ESCALATION_NOTHING_TO_JUDGE: "not_reviewed",
+    ESCALATION_REPEAT_SUBMISSION: "not_reviewed",
     ESCALATION_NO_VERDICT: "unjudged",
     ESCALATION_VALIDATOR_UNREACHABLE: "unjudged",
     ESCALATION_PROMPT_REFUSED: "unjudged",
     ESCALATION_CAUSE_UNRECORDED: "unrecorded",
 }
 
-#: WHY the panel handed this order over, one sentence per cause — spec §3's table.
+#: WHY this round escalated, one sentence per cause — spec §3's table. Each sentence must
+#: agree with its family's verb: a `not_reviewed` sentence says nobody judged, a `handover`
+#: sentence says the panel rejected (kn-bec32368).
 #: `user_rework_ceiling` is issue #1040's own case and the reason the wording rule is in
 #: the spec: a rejection with concrete asks and a spent budget is a decision, not an
 #: abandonment, and it must not read as "the panel gave up".
@@ -7392,11 +7423,12 @@ ESCALATION_WHY: dict[str, str] = {
 #: reach the dashboard.
 ESCALATION_VERB: dict[str, str] = {
     "handover": "was rejected and handed to you",
+    "not_reviewed": "was not reviewed",
     "unjudged": "could not be judged",
     "unrecorded": "was escalated",
 }
 
-#: The WORK ORDER give-up notification, worded off the same three verbs — spec §3's rule
+#: The WORK ORDER give-up notification, worded off the same verbs — spec §3's rule
 #: that one vocabulary serves every surface. `daemon.VALIDATION_ESCALATED_TITLE` stays as
 #: it is and now serves `Daemon._escalate_feature` alone: a feature-order escalation
 #: records no cause (spec §Not covered), so it has no family to name.

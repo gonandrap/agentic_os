@@ -709,25 +709,31 @@ def test_a_model_the_record_does_not_have_is_said_so_on_the_timeline_too():
 
 
 def test_an_escalated_round_is_labelled_by_its_family_and_never_gave_up():
-    """Spec 2026-10-14-an-escalated-round-says-why-and-what-to-run-next §1: four of the
-    six `handover` causes are a REJECTION handed over, and "gave up" read as the
-    opposite. A legacy payload with no `cause` field promises nothing."""
+    """Spec 2026-10-14-an-escalated-round-says-why-and-what-to-run-next §1: all three
+    `handover` causes are a REJECTION handed over and "gave up" read as the opposite,
+    while the three `not_reviewed` ones are the inverse — nothing was rejected, so the
+    handover wording claimed a decision nobody made. A legacy payload with no `cause`
+    field promises nothing."""
     from jarvis import ops
     from jarvis.timeline import _describe
 
     handover, _ = _describe("validation_escalated",
                             {"round": 3, "cause": ops.ESCALATION_USER_REWORK_CEILING})
+    not_reviewed, _ = _describe("validation_escalated",
+                                {"round": 1, "cause": ops.ESCALATION_NOTHING_TO_JUDGE})
     unjudged, _ = _describe("validation_escalated",
                             {"round": 1, "cause": ops.ESCALATION_NO_VERDICT})
     legacy, reason = _describe("validation_escalated",
                                {"round": 1, "reason": "no test covers the change"})
 
     assert handover == "Validation was rejected and handed to you"
+    assert not_reviewed == "Validation was not reviewed — over to you"
     assert unjudged == "Validation could not be judged — over to you"
     assert legacy == "Validation was escalated — over to you"
     assert reason == "no test covers the change"
-    for label in (handover, unjudged, legacy):
+    for label in (handover, not_reviewed, unjudged, legacy):
         assert "gave up" not in label
+    assert "rejected" not in not_reviewed
 
 
 def test_the_timelines_families_are_the_os_s_own_and_its_verbs_too():
@@ -735,13 +741,15 @@ def test_the_timelines_families_are_the_os_s_own_and_its_verbs_too():
     here: a cause added to `ops.ESCALATION_FAMILY` without a label would otherwise read
     as the legacy sentence in production."""
     from jarvis import ops
-    from jarvis.timeline import (ESCALATION_HANDOVER, ESCALATION_UNJUDGED, _describe)
+    from jarvis.timeline import (ESCALATION_HANDOVER, ESCALATION_NOT_REVIEWED,
+                                 ESCALATION_UNJUDGED, _describe)
 
     by_family: dict[str, set[str]] = {}
     for cause, family in ops.ESCALATION_FAMILY.items():
         by_family.setdefault(family, set()).add(cause)
 
     assert ESCALATION_HANDOVER == by_family["handover"]
+    assert ESCALATION_NOT_REVIEWED == by_family["not_reviewed"]
     assert ESCALATION_UNJUDGED == by_family["unjudged"]
     for cause, family in ops.ESCALATION_FAMILY.items():
         label, _ = _describe("validation_escalated", {"round": 1, "cause": cause})

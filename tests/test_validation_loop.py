@@ -1614,7 +1614,10 @@ def test_the_give_up_notification_reaches_the_central_inbox(fleet):
 
 def test_the_escalations_that_never_call_the_validator_notify_too(fleet):
     """An empty diff gives up without a verdict to quote, so the notification carries
-    the machine's own sentence. Nothing else would tell the user the round closed."""
+    the machine's own sentence. Nothing else would tell the user the round closed.
+
+    `not_reviewed`, NOT `handover`: no seat judged an empty submission, so a title saying
+    it was rejected would claim a decision nobody made (spec §3)."""
     fleet.daemon.validator = Validator(passed())
     wo = fleet.dispatch("empty")
     fleet.worktree(wo["id"])  # a worktree, and not one byte changed in it
@@ -1624,7 +1627,8 @@ def test_the_escalations_that_never_call_the_validator_notify_too(fleet):
     rows = _outbox(fleet)
     assert len(rows) == 1
     assert rows[0]["title"] == ops.ESCALATION_TITLE.format(
-        unit=wo["id"], n=1, verb=ops.ESCALATION_VERB["handover"])
+        unit=wo["id"], n=1, verb=ops.ESCALATION_VERB["not_reviewed"])
+    assert "rejected" not in rows[0]["title"]
     assert "changes no files" in rows[0]["body"]
 
 

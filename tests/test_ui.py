@@ -3246,6 +3246,31 @@ def test_the_page_still_renders_exactly_one_review_form(client, project):
     assert "Round 1 gave up" not in flat
 
 
+def test_the_review_rows_escape_everything_they_are_handed():
+    """`review.why` and `review.next` are placeholders, so they are safe ONLY while this
+    template renders autoescaped — and `next` carries a work-order id and `why` a reason,
+    neither of which this macro sanitises. Pinned against the real environment the app
+    builds, because the escaping is the environment's and nothing in the template says so.
+    """
+    from fastapi.templating import Jinja2Templates
+
+    from jarvis.ui.app import TEMPLATES
+
+    env = Jinja2Templates(directory=str(TEMPLATES)).env
+    assert env.autoescape, "the review rows have no escaping of their own"
+
+    hostile = "<script>alert(1)</script>"
+    out = env.get_template("_review.html").module.review_form(
+        "proj_a", {"id": hostile},
+        {"pending": 0, "round": 1, "why": f"the panel said {hostile}",
+         "next": [f"jarvis wo review {hostile} --reject"],
+         "scope": "one decision", "accept": "lands it", "reject": "sends it back",
+         "strands": "no reason strands it"})
+
+    assert "<script>" not in str(out)
+    assert "&lt;script&gt;" in str(out)
+
+
 def test_the_page_of_a_no_pr_order_never_names_validation_force(client, project):
     """The regression's fourth surface — spec §4. `ops.force_validation_refusal` refuses
     a no-PR force, so the page must not print the command either."""

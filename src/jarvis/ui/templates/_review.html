@@ -42,7 +42,11 @@
 {# WHY IT WAS HANDED OVER, and the command this order's shape accepts — spec
    docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md
    §5. Text, not buttons: a reader with a terminal open needs the string, and a button for
-   `jarvis validation force` would duplicate the control this page already carries. #}
+   `jarvis validation force` would duplicate the control this page already carries.
+
+   PLACEHOLDERS, and they rely on the environment's autoescape: `why` carries a panel
+   reason and `next` a work-order id, and neither is sanitised here. Pinned by
+   tests/test_ui.py::test_the_review_rows_escape_everything_they_are_handed. #}
 {% if review.why %}<div class="row"><span class="sub">Why: {{ review.why }}</span></div>
 {% endif %}
 {% for command in review.next %}
