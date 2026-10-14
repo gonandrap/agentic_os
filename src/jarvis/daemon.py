@@ -7892,17 +7892,23 @@ class Daemon:
                     packet = self._confirmation_evidence(project, wo)
                 # Trimmed PER ASSUMPTION, and the collection above stays one `git diff`:
                 # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md § 2.
+                # The doc classifier is the PROJECT's (`os.navigation`), never a copy in
+                # `autoreview`: 2026-10-13 spec, part 1.
                 ce = autoreview.confirm_evidence(
                     packet, a, cfg.confirm_diff_chars,
-                    collect_limit=CONFIRM_COLLECT_CHARS)
+                    collect_limit=CONFIRM_COLLECT_CHARS,
+                    doc_suffixes=project.navigation.doc_suffixes,
+                    doc_dirs=project.navigation.doc_dirs)
                 # THE SECOND GATE, over the EVIDENCE rather than the row, and it runs
                 # before `neo.ask` PERSISTS the diff as a question row (kn-deef42ea). It
                 # reads the TRIMMED text because that is what is persisted and sent, and
                 # the WHOLE rendered block of it: docs/superpowers/specs/
                 # 2026-09-26-bounded-model-inputs.md § 2.
+                # `unreadable` off the same `ce` this renders: 2026-10-13 spec, part 3.
                 evidence_ok = autoreview.decide_evidence(
                     a, ce.stat, ce.what_changed(),
-                    summary=str(wo.get("result_summary") or ""))
+                    summary=str(wo.get("result_summary") or ""),
+                    unreadable=ce.unreadable)
                 if not evidence_ok.armed:
                     self._note_autoreview_held(store, wo["id"], evidence_ok,
                                                suppress=suppress)

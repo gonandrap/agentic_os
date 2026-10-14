@@ -21,13 +21,14 @@ Four properties carry the section, and each gets its own block:
 
 from __future__ import annotations
 
+import inspect
 import os
 import re
 import subprocess
 
 import pytest
 
-from jarvis import autoreview, daemon as daemon_mod, evidence, ops
+from jarvis import autoreview, daemon as daemon_mod, evidence, navigation, ops
 from jarvis.daemon import Daemon
 from jarvis.project_store import ProjectStore
 
@@ -1214,23 +1215,22 @@ def test_a_diff_over_the_budget_is_cut_at_a_file_boundary_and_says_what_is_missi
             in confirmation["question"])
 
 
-def test_the_stat_and_the_file_list_survive_a_budget_that_keeps_no_hunk(
-        started, monkeypatch):
-    """evidence.py's rule 3: `files` is never truncated at any limit."""
+def test_the_stat_and_the_file_list_survive_a_budget_that_keeps_no_hunk(started):
+    """evidence.py's rule 3: `files` is never truncated at any limit.
+
+    Read at the TRIM, not through the pass: a collection trimmed to nothing is
+    `HELD_EVIDENCE_UNREADABLE` and files no question (the 2026-10-13 spec, part 3), and
+    the claim here is about what `confirm_evidence` renders, which is unchanged.
+    """
     stat, diff = mods(5)
-    store, wo = park(started, auto_review=True)
-    budget(started, 1)
-    stub_evidence(monkeypatch, stat, diff)
-    provisional(store, wo)
+    ce = build(stat, diff, 1)
+    text = autoreview._confirm_question("proj_a", WO, judged(), [], ce)
 
-    ask(started, store)
-
-    (confirmation,) = questions()
-    assert confirmation["question"].count("diff --git") == 0
+    assert text.count("diff --git") == 0
     for i in range(5):
-        assert f"mod{i:02d}.py" in confirmation["question"]
+        assert f"mod{i:02d}.py" in text
     assert (f"[diff truncated — 0 of {5 * MOD_SECTION:,} chars; "
-            f"5 file(s) not shown: ") in confirmation["question"]
+            f"5 file(s) not shown: ") in text
 
 
 def test_the_reference_rides_on_an_untruncated_question_too(started, monkeypatch):
@@ -1337,23 +1337,283 @@ def what_changed_section(question: str) -> str:
 
 
 def test_every_byte_of_the_evidence_block_went_through_the_net(started, monkeypatch):
-    """The trim goes BEFORE the net, so no byte reaches `neo_store.ask` unscanned."""
-    stat, diff = mods(5)
+    """The trim goes BEFORE the net, so no byte reaches `neo_store.ask` unscanned.
+
+    The budget cuts the last file at a HUNK boundary, so the block carries a section
+    shown in part and its in-diff marker: invariant 2 of the 2026-10-13 spec.
+    """
+    stat, diff = hunky("mod00.py", 8)
     seen: list[str] = []
     real = autoreview.decide_evidence
 
-    def recorder(a, stat_text, diff_text, summary=""):
+    def recorder(a, stat_text, diff_text, summary="", **kw):
         seen.append("\n".join([stat_text, diff_text, summary]))
-        return real(a, stat_text, diff_text, summary=summary)
+        return real(a, stat_text, diff_text, summary=summary, **kw)
 
     monkeypatch.setattr(autoreview, "decide_evidence", recorder)
     store, wo = park(started, auto_review=True)
-    budget(started, 2 * MOD_SECTION)
+    budget(started, len(diff) // 2)
     stub_evidence(monkeypatch, stat, diff)
     provisional(store, wo)
 
     ask(started, store)
 
     (confirmation,) = questions()
+    assert "more hunk(s) of mod00.py not shown" in confirmation["question"]
     assert len(seen) == 1
     assert what_changed_section(confirmation["question"]) in seen[0]
+
+
+# -- the three tiers, the hunk trim and the hold (the 2026-10-13 spec) ------------------
+#
+# docs/superpowers/specs/2026-10-13-a-confirmation-question-with-a-zero-character-diff.md.
+# The live case: 68,675 chars collected, 0 delivered, because a 435-line spec document
+# sorted first in diff order and was 5x the 12,000-char budget on its own.
+
+#: The live case's budget, `catalog.DEFAULT_VALIDATION_CONFIRM_DIFF_CHARS`.
+CONFIRM_BUDGET = 12000
+
+
+def hunky(path: str, hunks: int) -> tuple[str, str]:
+    """`(stat, diff)` for one file modified in `hunks` separate places."""
+    stat = f" {path} | {3 * hunks} +\n 1 file changed, {3 * hunks} insertions(+)\n"
+    body = "".join(f"@@ -{10 * i},3 +{10 * i},3 @@\n"
+                   + "".join(f"+{path} hunk {i} line {j}\n" for j in range(3))
+                   for i in range(hunks))
+    diff = (f"diff --git a/{path} b/{path}\n"
+            f"index 1111111..2222222 100644\n--- a/{path}\n+++ b/{path}\n" + body)
+    return stat, diff
+
+
+def test_the_live_case_the_doc_no_longer_eats_the_whole_budget():
+    """Test 1, and the one the spec exists for: a 60,000-char `.md` under `docs/` first
+    in diff order, an assumption naming a SYMBOL and no path, the default budget."""
+    doc = added("docs/spec.md", "spec line\n" * 6000)
+    src = mods(4)
+    stat, diff = doc[0] + src[0], doc[1] + src[1]
+
+    ce = build(stat, diff, CONFIRM_BUDGET,
+               content="renamed the helper `_render_row` for consistency")
+
+    assert len(doc[1]) > CONFIRM_BUDGET        # not vacuous: the doc alone overruns it
+    assert ce.diff != ""
+    for i in range(4):
+        assert f"diff --git a/mod{i:02d}.py" in ce.diff
+    assert "docs/spec.md" in ce.dropped_files
+    assert autoreview.decide_evidence(judged(), ce.stat, ce.what_changed(),
+                                      unreadable=ce.unreadable).armed
+
+
+def test_a_doc_the_assumption_names_by_path_stays_ahead_of_the_source():
+    """Tier (a) is tested first and wins: a doc the assumption NAMES is what the
+    question is about."""
+    doc = added("docs/spec.md", "spec line\n" * 5)
+    src = mods(3)
+    stat, diff = doc[0] + src[0], doc[1] + src[1]
+
+    ce = build(stat, diff, len(doc[1]),
+               content="the wording in docs/spec.md is the user's own")
+
+    assert ce.diff.startswith("diff --git a/docs/spec.md")
+    assert set(ce.dropped_files) == {f"mod{i:02d}.py" for i in range(3)}
+
+
+def test_source_goes_before_documentation_when_the_assumption_names_nothing():
+    """Tier (b) before tier (c), where the old code kept the collection's order."""
+    doc = added("docs/spec.md", "spec line\n" * 5)
+    src = mods(1)
+    stat, diff = doc[0] + src[0], doc[1] + src[1]
+
+    ce = build(stat, diff, MOD_SECTION)
+
+    assert ce.diff.startswith("diff --git a/mod00.py")
+    assert ce.dropped_files == ("docs/spec.md",)
+
+
+@pytest.mark.parametrize("path, is_doc", [
+    ("x.md", True), ("x.rst", True), ("x.txt", True), ("x.adoc", True),
+    ("X.MD", True), ("docs/a/b.py", True), ("specs/a.py", True),
+    ("src/markdown.py", False), ("src/docsite.py", False), ("a.mdx", False),
+    ("src/jarvis/autoreview.py", False),
+])
+def test_documentation_is_a_mechanical_path_test(path, is_doc):
+    """A path test, never content sniffing over a diff fragment (rejected 6), and over
+    the suffixes and dirs PASSED IN — this module holds no classifier of its own."""
+    assert autoreview._is_documentation(
+        path, (".md", ".rst", ".txt", ".adoc"), frozenset({"docs", "specs"})) is is_doc
+
+
+def test_the_shipped_defaults_are_the_navigation_constants_themselves():
+    """The tiering with NO override: `.md` and a `docs/` component are documentation,
+    `.py` is source — and `.rst` is SOURCE, no longer a doc suffix. The parameterised
+    test above passes its own values in, so only this one covers what SHIPS.
+    """
+    md = added("x.md", "spec line\n" * 5)
+    rst = added("x.rst", "spec line\n" * 5)
+    doc_dir = added("docs/a.py", "spec line\n" * 5)
+    src = added("x.py", "spec line\n" * 5)
+    stat = md[0] + rst[0] + doc_dir[0] + src[0]
+    diff = md[1] + rst[1] + doc_dir[1] + src[1]
+    limit = len(rst[1]) + len(src[1])
+    packet, a = packet_of(stat, diff), assumption(content=ROUTINE)
+
+    ce = autoreview.confirm_evidence(packet, a, limit)
+    defaults = inspect.signature(autoreview.confirm_evidence).parameters
+
+    assert "diff --git a/x.rst" in ce.diff            # .rst tiers as SOURCE
+    assert "diff --git a/x.py" in ce.diff
+    assert set(ce.dropped_files) == {"x.md", "docs/a.py"}
+    assert ce.partial_files == ()
+    assert defaults["doc_suffixes"].default is navigation.DOC_SUFFIXES
+    assert defaults["doc_dirs"].default is navigation.DOC_DIRS
+
+
+def test_a_project_doc_suffix_override_decides_the_tier():
+    """The configured classifier reaches the tiering: with `doc_suffixes == (".rst",)`,
+    `x.md` is SOURCE and `x.rst` is documentation — the reverse of the defaults."""
+    md = added("x.md", "spec line\n" * 5)
+    rst = added("x.rst", "spec line\n" * 5)
+    stat, diff = md[0] + rst[0], md[1] + rst[1]
+    limit = max(len(md[1]), len(rst[1]))
+    packet, a = packet_of(stat, diff), assumption(content=ROUTINE)
+
+    overridden = autoreview.confirm_evidence(packet, a, limit, doc_suffixes=(".rst",))
+    default = autoreview.confirm_evidence(packet, a, limit)
+
+    assert overridden.diff.startswith("diff --git a/x.md")
+    assert overridden.dropped_files == ("x.rst",)
+    assert default.diff.startswith("diff --git a/x.rst")
+    assert default.dropped_files == ("x.md",)
+
+
+def test_a_project_doc_dir_override_decides_the_tier():
+    """`doc_dirs` the same way: a project calling its documentation `manual/` has
+    `docs/` read as source."""
+    manual = added("manual/a.py", "x = 1\n" * 5)
+    docs = added("docs/a.py", "x = 1\n" * 5)
+    stat, diff = manual[0] + docs[0], manual[1] + docs[1]
+    limit = max(len(manual[1]), len(docs[1]))
+    packet, a = packet_of(stat, diff), assumption(content=ROUTINE)
+
+    ce = autoreview.confirm_evidence(packet, a, limit,
+                                     doc_dirs=frozenset({"manual"}))
+
+    assert ce.diff.startswith("diff --git a/docs/a.py")
+    assert ce.dropped_files == ("manual/a.py",)
+
+
+def test_the_configured_doc_classifier_reaches_the_pass(started, monkeypatch):
+    """The daemon resolves it PER PROJECT (`project.navigation`) — `autoreview` carries
+    no second copy that drifts the moment a project overrides the catalog key."""
+    seen: list[dict] = []
+    real = autoreview.confirm_evidence
+
+    def recorder(packet, a, limit, **kw):
+        seen.append(kw)
+        return real(packet, a, limit, **kw)
+
+    monkeypatch.setattr(autoreview, "confirm_evidence", recorder)
+    nav = started.catalog.project("proj_a").navigation
+    nav.doc_suffixes = (".rst",)
+    nav.doc_dirs = frozenset({"manual"})
+    store, wo = park(started, auto_review=True)
+    stub_evidence(monkeypatch, *added("render.py", DEFAULT_FILES["render.py"]))
+    provisional(store, wo)
+
+    ask(started, store)
+
+    assert [k["doc_suffixes"] for k in seen] == [(".rst",)]
+    assert [k["doc_dirs"] for k in seen] == [frozenset({"manual"})]
+
+
+def test_a_file_shown_in_part_is_neither_complete_nor_absent():
+    """Test 3: the hunks that fit are delivered, the file is named `partially shown`,
+    and it is NOT in `dropped_files` — a third state."""
+    stat, diff = hunky("mod00.py", 10)
+    ce = build(stat, diff, len(diff) // 2)
+
+    assert ce.partial_files == ("mod00.py",)
+    assert "mod00.py" not in ce.dropped_files
+    assert "more hunk(s) of mod00.py not shown" in ce.diff
+    assert ce.diff.count("@@ -") < 10 and ce.diff.count("@@ -") > 0
+    marker = autoreview._truncation_marker(ce)
+    assert "1 file(s) partially shown: mod00.py" in marker
+    assert "no whole file dropped" in marker
+
+
+def test_the_marker_distinguishes_partial_from_dropped_and_states_no_false_total():
+    """Test 9, with invariant 4: `partial_files` must not turn `more than` into a
+    computed total."""
+    partial = hunky("big.py", 10)
+    later = mods(2)
+    stat = partial[0] + later[0]
+    diff = partial[1] + later[1]
+
+    ce = build(stat, diff, len(partial[1]) // 2, diff_truncated=True)
+    marker = autoreview._truncation_marker(ce)
+
+    assert f"of more than {daemon_mod.CONFIRM_COLLECT_CHARS:,} chars" in marker
+    assert "2 file(s) not shown: mod00.py, mod01.py" in marker
+    assert "1 file(s) partially shown: big.py" in marker
+
+
+def test_a_collection_trimmed_to_nothing_holds_and_files_no_question(
+        started, monkeypatch):
+    """Test 5. The status quo spent a Neo call that could only escalate, then parked the
+    order for a person (rejected 4)."""
+    stat, diff = mods(5)
+    store, wo = park(started, auto_review=True)
+    budget(started, 1)
+    stub_evidence(monkeypatch, stat, diff)
+    provisional(store, wo)
+
+    ask(started, store)
+
+    assert questions() == []
+    assert held_codes(store, wo["id"]) == [autoreview.HELD_EVIDENCE_UNREADABLE]
+    assert store.all_assumptions(wo["id"])[0]["status"] == "pending"
+
+
+def test_the_unreadable_hold_carries_the_row_it_is_about():
+    """Like every other hold, so `_note_autoreview_held` dedupes per assumption."""
+    d = autoreview.decide_evidence(judged(), " mod00.py | 2 +-", "", unreadable=True)
+
+    assert d.code == autoreview.HELD_EVIDENCE_UNREADABLE
+    assert d.assumption_id == 3 and d.n == 2
+    assert not d.armed
+
+
+def test_the_hold_is_recorded_once_however_many_ticks_run(started, monkeypatch):
+    """It is NOT on `_holds_not_recorded`: it is the only thing on the record saying why
+    an order the feature was switched on for is still waiting for a person."""
+    stat, diff = mods(5)
+    store, wo = park(started, auto_review=True)
+    budget(started, 1)
+    stub_evidence(monkeypatch, stat, diff)
+    provisional(store, wo)
+
+    ask(started, store)
+    ask(started, store)
+
+    assert held_codes(store, wo["id"]) == [autoreview.HELD_EVIDENCE_UNREADABLE]
+
+
+def test_an_empty_collection_still_asks():
+    """Test 6, and the distinction the spec says must not collapse: `full_chars == 0` is
+    git reporting nothing, and the result summary alone is still worth confirming."""
+    empty = autoreview.ConfirmEvidence()
+    nothing_collected = build("", "", CONFIRM_BUDGET)
+
+    assert empty.unreadable is False
+    assert nothing_collected.full_chars == 0 and nothing_collected.diff == ""
+    assert nothing_collected.unreadable is False
+    assert autoreview.decide_evidence(judged(), "", "",
+                                      unreadable=nothing_collected.unreadable).armed
+
+
+def test_a_secret_outranks_an_untrimmable_diff():
+    """Invariant 8: a packet that is both reports the SECRET, which is the one that says
+    where to go and look."""
+    d = autoreview.decide_evidence(judged(), "", f'+api_key = "{SECRET_VALUE}"',
+                                   unreadable=True)
+    assert d.code == autoreview.HELD_EVIDENCE_SECRET

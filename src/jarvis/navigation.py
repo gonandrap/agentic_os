@@ -204,6 +204,10 @@ def navigates_source(command: str, suffixes: tuple[str, ...],
 #: Markdown. A sibling of SOURCE_SUFFIXES, which is unchanged.
 DOC_SUFFIXES: tuple[str, ...] = (".md",)
 
+#: The path components that say documentation. ONE spelling of the predicate in the tree:
+#: `autoreview._is_documentation` reads these through `os.navigation.doc_dirs`.
+DOC_DIRS: frozenset[str] = frozenset({"docs", "specs"})
+
 #: The commands that DUMP a file. `grep`, `rg` and `find` are deliberately ABSENT:
 #: text search in a .md is legitimate and refusing it is this feature's MUST NOT.
 #: `tail` is absent too — measured at 137 tokens a call, it is already cheap.
