@@ -64,7 +64,8 @@ def _escalate(store, title: str, description: str, summary: str) -> str:
         reply="Reads correctly and the existing daemon tests cover the path.",
         model="claude-sonnet-4-5", latency_ms=9100)
     ops.escalate_validation_round(store, store.get_work_order(wo["id"]),
-                                  rnd["id"], rnd["round"], REASON)
+                                  rnd["id"], rnd["round"], REASON,
+                                  cause=ops.ESCALATION_ROUNDS_SPENT)
     return wo["id"]
 
 

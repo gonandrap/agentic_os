@@ -39,6 +39,15 @@
 <div class="row"><span class="sub">{{ review.scope }}.{% if review.pending
       and review.round %} It also settles round {{ review.round }}'s
   escalation.{% endif %}</span></div>
+{# WHY IT WAS HANDED OVER, and the command this order's shape accepts — spec
+   docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md
+   §5. Text, not buttons: a reader with a terminal open needs the string, and a button for
+   `jarvis validation force` would duplicate the control this page already carries. #}
+{% if review.why %}<div class="row"><span class="sub">Why: {{ review.why }}</span></div>
+{% endif %}
+{% for command in review.next %}
+<div class="row"><span class="sub">Next: {{ command }}</span></div>
+{% endfor %}
 <div class="row"><span class="sub">Accept: {{ review.accept }}</span></div>
 <div class="row"><span class="sub">Send back: {{ review.reject }}
   {{ review.strands }}</span></div>

@@ -3156,7 +3156,8 @@ def test_a_work_order_with_no_pull_request_says_nothing_about_merging(client, da
 # closed round, so the test would pass against a page rendering the form unconditionally.
 
 
-def _escalate(project, title="the panel gave up on it"):
+def _escalate(project, title="the panel gave up on it",
+              cause=None):
     """A work order in the live shape of wo-659be188: `needs_review`, latest round
     `escalated`, no assumption rows at all."""
     store = ProjectStore(project)
@@ -3165,7 +3166,8 @@ def _escalate(project, title="the panel gave up on it"):
         r = store.open_validation_round(wo_id=wo["id"], fingerprint="cccc3333",
                                         summary="ship it", evidence="ran pytest")
         ops.escalate_validation_round(store, wo, r["id"], r["round"],
-                                      "round 2 asked for the same test again")
+                                      "round 2 asked for the same test again",
+                                      cause=cause or ops.ESCALATION_ROUNDS_SPENT)
         return store.get_work_order(wo["id"])
     finally:
         store.close()
@@ -3226,6 +3228,30 @@ def test_rejecting_an_escalated_order_records_the_review_and_guides_the_worker(
         assert after["status"] == "needs_review"
     finally:
         store.close()
+
+
+def test_the_page_still_renders_exactly_one_review_form(client, project):
+    """Spec 2026-10-14-an-escalated-round-says-why-and-what-to-run-next §5: two more
+    rows beside the existing ones, and `_review.html`'s structural guarantee holds."""
+    wo = _escalate(project)
+
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+    flat = html.unescape(" ".join(page.split()))
+
+    assert page.count(f'action="/wo/proj_a/{wo["id"]}/review"') == 1
+    assert "the panel rejected this and had no round left" in flat
+    assert f"jarvis wo review {wo['id']} --reject" in flat
+
+
+def test_the_page_of_a_no_pr_order_never_names_validation_force(client, project):
+    """The regression's fourth surface — spec §4. `ops.force_validation_refusal` refuses
+    a no-PR force, so the page must not print the command either."""
+    wo = _escalate(project, cause=ops.ESCALATION_NO_VERDICT)
+
+    flat = html.unescape(" ".join(client.get(f"/wo/proj_a/{wo['id']}").text.split()))
+
+    assert "validation force" not in flat
+    assert "Nobody has judged the work" in flat
 
 
 def test_the_feature_order_page_never_grows_a_work_order_review_form(client, project):

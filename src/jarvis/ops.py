@@ -4082,10 +4082,25 @@ def review_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | No
         " the work order" + (" over the panel's objection" if escalated else "")
     reject = ("Rejects " + rows + " and resumes" if pending else "Resumes") + \
         " the worker, with your reason as the guidance it is sent back with"
+    # WHY THE PANEL HANDED IT OVER, and the command this order's shape accepts — spec
+    # docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md
+    # §3, §4. Derived HERE and nowhere else, so the terminal and the page cannot word one
+    # escalation two ways; None/empty on an order that is not escalated.
+    cause = (escalation_cause(store, wo_id=wo["id"], round_id=int(latest["id"]))
+             if latest else None)
+    family = ESCALATION_FAMILY[cause] if cause else None
     return {
         "pending": pending,
         "escalated": escalated,
         "round": int(latest["round"]) if latest else None,
+        "cause": cause,
+        "family": family,
+        "verb": ESCALATION_VERB[family] if family else None,
+        "why": (ESCALATION_WHY[cause].format(n=int(latest["round"]),
+                                             rebind_max=REBIND_MAX,
+                                             bounce_limit=BOUNCE_LIMIT)
+                if cause else None),
+        "next": escalation_next(wo, family) if family else [],
         "placement": "assumptions" if pending else "validation",
         "scope": "One decision, and it settles the whole order — every pending "
                  "assumption and the order itself, in a single call",
@@ -4094,6 +4109,55 @@ def review_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | No
         "strands": "Rejecting with no reason leaves the work order flagged and the "
                    "worker unguided.",
     }
+
+
+def escalation_next(wo: dict[str, Any], family: str) -> list[str]:
+    """The commands this escalated order accepts, in the order a reader can act.
+
+    Spec
+    docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md
+    §4. `jarvis validation force` is offered ONLY to an `unjudged` family WITH a pull
+    request, for two separate reasons: `force_validation_refusal` (ops.py:5653-5657)
+    refuses a no-PR force, which is issue #1040 itself; and a `handover` order was judged,
+    so a forced round would re-run the same seats on the same unchanged work.
+
+    It does NOT call `force_validation_refusal` — that takes a resolved `cfg` and this
+    projection has no config and must stay free of one. The two predicates may differ in
+    strictness in ONE direction only, and a test pins it.
+    """
+    wo_id = str(wo["id"])
+    lines = [
+        f'jarvis wo review {wo_id} --reject --feedback "<what to change>" — resumes the '
+        f"worker with the panel's asks as its guidance.",
+        f'jarvis wo review {wo_id} --feedback "<why>" — lands it over the panel\'s '
+        f"objection.",
+    ]
+    if family == "unjudged" and str(wo.get("pr_url") or ""):
+        lines.append(
+            f'jarvis validation force {wo_id} --reason "<why>" — judges the current pull '
+            f"request again; worth it only because no seat ever judged this one.")
+    return lines
+
+
+def review_lines(state: dict[str, Any]) -> list[str]:
+    """The decision this order owes, as lines — THE ONE BUILDER both CLI surfaces print.
+
+    Spec
+    docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md
+    §5: `jarvis wo show` and `jarvis validation show` would otherwise word one decision
+    two ways. `where` reads the verb off `review_state` rather than hardcoding
+    `gave up`, which named no cause and read as "nobody judged this" for the four
+    rejections that reach the same transition.
+    """
+    owed = "pending assumption" + ("" if state["pending"] == 1 else "s")
+    where = (f"round {state['round']} {state['verb']}" if state["escalated"]
+             else f"{state['pending']} {owed}")
+    lines = [f"owed: {where} — {state['scope']}."]
+    if state.get("why"):
+        lines.append(f"why: {state['why']}")
+    lines += [f"next: {command}" for command in state.get("next") or []]
+    return lines + [f"accept: {state['accept']}",
+                    f"reject: {state['reject']} {state['strands']}"]
 
 
 def assumption_decider(a: dict[str, Any]) -> str:
@@ -4801,10 +4865,13 @@ def validation_view(unit_id: str, project_name: str | None = None) -> dict[str, 
     store = ProjectStore(path)
     try:
         detail = validation_detail(store, **subject)  # type: ignore[arg-type]
+        # Spec 2026-10-14-an-escalated-round-says-why-and-what-to-run-next §5.
+        owed = review_state(store, row) if unit == "work_order" else None
     finally:
         store.close()
     return {"project": name, "unit": unit, "id": unit_id,
-            "title": row["title"], "status": row["status"], **detail}
+            "title": row["title"], "status": row["status"], **detail,
+            **({"review": owed} if owed else {})}
 
 
 def current_config_version() -> str | None:
@@ -5370,12 +5437,19 @@ BOUNCE_EXHAUSTED = (
 
 
 def escalate_validation_round(store: ProjectStore, wo: dict[str, Any], round_id: int,
-                              n: int, reason: str) -> None:
+                              n: int, reason: str, *, cause: str) -> None:
     """Give up on this unit and ask the user. THE ONE HOME of that transition.
 
     Called by `Daemon._escalate`, whose docstring carries the reasoning for every line
     below — why the attention reason is `VALIDATION_STUCK_BLOCKER` verbatim, why the
     notification is the half the flag cannot do, and why Neo is not asked first.
+
+    `cause` is KEYWORD-ONLY and REQUIRED: a default would let the next call site added be
+    the next silent `unrecorded`, and a missing cause IS the defect (spec
+    docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md
+    §2, rejected alternative 6). It rides in the EVENT PAYLOAD and not on the round —
+    `close_validation_round` and `COUNTED_VALIDATION_OUTCOMES` are untouched, because the
+    cause is not an outcome (Neo 1713).
     """
     from .daemon import VALIDATION_ESCALATED_TITLE, escalation_body
     from .invariants import VALIDATION_STUCK_BLOCKER
@@ -5383,7 +5457,8 @@ def escalate_validation_round(store: ProjectStore, wo: dict[str, Any], round_id:
     wo_id = wo["id"]
     store.close_validation_round(round_id, "escalated", reason)
     store.add_event(wo_id, "validation_escalated",
-                    {"round": n, "round_id": round_id, "reason": reason})
+                    {"round": n, "round_id": round_id, "reason": reason,
+                     "cause": cause})
     store.set_status(wo_id, "needs_review")
     store.flag_attention(wo_id, VALIDATION_STUCK_BLOCKER)
     store.add_notification(
@@ -5391,6 +5466,22 @@ def escalate_validation_round(store: ProjectStore, wo: dict[str, Any], round_id:
         body=escalation_body(reason), level="warning", wo_id=wo_id,
         source="validation",
     )
+
+
+def escalation_cause(store: ProjectStore, *, wo_id: str, round_id: int) -> str:
+    """WHICH CONDITION escalated this round, or `ESCALATION_CAUSE_UNRECORDED`.
+
+    Spec
+    docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md
+    §2. KEYED ON `round_id` AND NOT ON `round`: a rebind spends a row number without
+    spending budget, so `round` is not unique on an order that had one
+    (daemon.py:2819-2825).
+    """
+    for event in reversed(store.events_of_kind(wo_id, "validation_escalated")):
+        payload = db.from_json(event["payload"], {})
+        if int(payload.get("round_id") or 0) == int(round_id):
+            return str(payload.get("cause") or ESCALATION_CAUSE_UNRECORDED)
+    return ESCALATION_CAUSE_UNRECORDED
 
 
 def _worktree_file_test(project_path: Path,
@@ -5567,7 +5658,8 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
         escalate_validation_round(
             store, wo, int(round_row["id"]), nxt,
             BOUNCE_EXHAUSTED.format(n=BOUNCE_LIMIT, round=int(previous["round"]),
-                                    paths=", ".join(cited)))
+                                    paths=", ".join(cited)),
+            cause=ESCALATION_BOUNCE_EXHAUSTED)
         # RE-READ, because the row above is the one that was opened and the caller has to
         # be able to see that it has already been settled. `finish` reads this outcome to
         # know not to land the work order: `land_when_cleared` LANDS an `escalated` round
@@ -7221,6 +7313,86 @@ USER_REWORK_CAUSE = "user_rework"
 #: Spec docs/superpowers/specs/2026-10-13-a-red-head-is-sent-back-before-the-panel.md §3.3
 #: — bounded by `validation.red_ci_returns`, which is why there is no constant beside it.
 RED_CI_CAUSE = "red_ci"
+
+#: WHICH CONDITION ESCALATED A ROUND, written in the `validation_escalated` event payload.
+#: Spec docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md
+#: §1: eight call sites reached one transition and "escalated" covered all of them, so the
+#: user could not tell a REJECTION handed over from "nobody judged the work" — wo-3768437b
+#: sat 4.8 days on that. Beside the `uncounted_cause` constants because an escalation cause
+#: is the same kind of fact about a round and a second home would drift.
+ESCALATION_ROUNDS_SPENT = "rounds_spent"
+ESCALATION_USER_REWORK_CEILING = "user_rework_ceiling"
+ESCALATION_REBINDS_SPENT = "rebinds_spent"
+ESCALATION_BOUNCE_EXHAUSTED = "bounce_exhausted"
+ESCALATION_NOTHING_TO_JUDGE = "nothing_to_judge"
+ESCALATION_REPEAT_SUBMISSION = "repeat_submission"
+ESCALATION_NO_VERDICT = "no_verdict"
+ESCALATION_VALIDATOR_UNREACHABLE = "validator_unreachable"
+ESCALATION_PROMPT_REFUSED = "prompt_refused"
+#: READ-TIME FALLBACK, never written by any call site: every `validation_escalated` event
+#: written before the field existed lacks it, and guessing a cause from its `reason` prose
+#: would put a wrong sentence — and a wrong command — on an old order (spec §1).
+ESCALATION_CAUSE_UNRECORDED = "unrecorded"
+
+#: `handover` — the panel REJECTED and is handing the decision over; `unjudged` — nobody
+#: has an opinion on the work. ONE DICT, so a cause added without a family is a `KeyError`
+#: in the first test that touches it rather than a blank sentence in production (spec §1).
+ESCALATION_FAMILY: dict[str, str] = {
+    ESCALATION_ROUNDS_SPENT: "handover",
+    ESCALATION_USER_REWORK_CEILING: "handover",
+    ESCALATION_REBINDS_SPENT: "handover",
+    ESCALATION_BOUNCE_EXHAUSTED: "handover",
+    ESCALATION_NOTHING_TO_JUDGE: "handover",
+    ESCALATION_REPEAT_SUBMISSION: "handover",
+    ESCALATION_NO_VERDICT: "unjudged",
+    ESCALATION_VALIDATOR_UNREACHABLE: "unjudged",
+    ESCALATION_PROMPT_REFUSED: "unjudged",
+    ESCALATION_CAUSE_UNRECORDED: "unrecorded",
+}
+
+#: WHY the panel handed this order over, one sentence per cause — spec §3's table.
+#: `user_rework_ceiling` is issue #1040's own case and the reason the wording rule is in
+#: the spec: a rejection with concrete asks and a spent budget is a decision, not an
+#: abandonment, and it must not read as "the panel gave up".
+ESCALATION_WHY: dict[str, str] = {
+    ESCALATION_ROUNDS_SPENT:
+        "the panel rejected this and had no round left: round {n} was its last "
+        "(validation.max_rounds).",
+    ESCALATION_USER_REWORK_CEILING:
+        "the panel rejected this. Round {n} was the round after your own rejection, "
+        "judged at the round budget's ceiling, so the rejection had no round left to "
+        "send back — nobody abandoned it, and its asks are in the round below.",
+    ESCALATION_REBINDS_SPENT:
+        "the panel rejected a merge the OS asked for itself, {rebind_max} times running.",
+    ESCALATION_BOUNCE_EXHAUSTED:
+        "the submitter was sent back {bounce_limit} times running for changing nothing "
+        "the panel asked about, and changed none of them. Nobody judged the latest "
+        "submission.",
+    ESCALATION_NOTHING_TO_JUDGE:
+        "the submission changed no files and recorded no other durable effect, so no "
+        "seat judged it.",
+    ESCALATION_REPEAT_SUBMISSION:
+        "the submission was identical to the preceding round, so the panel had nothing "
+        "new to judge.",
+    ESCALATION_NO_VERDICT: "the panel reached no verdict. Nobody has judged the work.",
+    ESCALATION_VALIDATOR_UNREACHABLE:
+        "the panel could not be reached, so nobody has judged the work.",
+    ESCALATION_PROMPT_REFUSED:
+        "the OS built a seat prompt over its character ceiling and never sent it, so "
+        "nobody has judged the work.",
+    ESCALATION_CAUSE_UNRECORDED:
+        "this round was escalated before the OS recorded which condition fired; the "
+        "reason on the round below is what the panel said.",
+}
+
+#: What `round {n} …` reads as per family, for `cli._readable_review`'s `where` clause.
+#: Written here with the rest of the sentences (spec §3): a phrase in the CLI could not
+#: reach the dashboard.
+ESCALATION_VERB: dict[str, str] = {
+    "handover": "was rejected and handed to you",
+    "unjudged": "could not be judged",
+    "unrecorded": "was escalated",
+}
 
 #: `proof` on `CARRY_REFUSED_EVENT`, one value per condition — the `automerge` hold-code
 #: discipline, so a reader can tell "someone resolved a conflict" from "the daemon could
