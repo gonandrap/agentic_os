@@ -687,6 +687,11 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         if str(p.get("uncounted_cause") or "") == "user_rework":
             return ("Validation rejected — sent back, no round spent (the rework you "
                     "asked for)", p.get("reason") or "")
+        # Spec §7:
+        # docs/superpowers/specs/2026-10-13-a-red-head-is-sent-back-before-the-panel.md
+        if str(p.get("uncounted_cause") or "") == "red_ci":
+            return ("Validation rejected — sent back unjudged, no round spent (CI was "
+                    "red)", p.get("reason") or "")
         return "Validation rejected — sent back", p.get("reason") or ""
     if kind == "validation_bounced":
         # NO ROUND WAS SPENT and the line has to say so, or a reader counts this against

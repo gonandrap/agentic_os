@@ -314,8 +314,9 @@ def ci_pending(packet: EvidencePacket) -> tuple[str, ...]:
 
     Reading `status` and not `conclusion` is the whole of the distinction: an
     unfinished check has no conclusion yet, and `failing_checks` — which reads
-    `conclusion` — is deliberately silent about it. A RED check is NOT pending: the
-    answer is in, it is bad, and the round should open so a seat can say so.
+    `conclusion` — is deliberately silent about it. A RED check is not pending, and what
+    the round machine does with one is `ci_failing`'s answer below (spec
+    docs/superpowers/specs/2026-10-13-a-red-head-is-sent-back-before-the-panel.md §3.1).
     """
     from . import github
 
@@ -325,6 +326,36 @@ def ci_pending(packet: EvidencePacket) -> tuple[str, ...]:
         str(c.get("name") or "(unnamed check)")
         for c in (packet.pr.get("checks") or ())
         if str(c.get("status") or "").upper() in github.UNFINISHED_STATUSES)
+
+
+def ci_failing(packet: EvidencePacket) -> tuple[str, ...]:
+    """The names of the checks that have FINISHED and say the code is wrong.
+
+    `ci_pending`'s pair, and it exists here for the same reason: it takes an
+    `EvidencePacket`, whose `pr` is a plain dict, where `github.failing_checks` takes
+    normalised check dicts and `PullRequest.failing` takes a `PullRequest`.
+
+    `()` — nothing to send back for — covers the green answer and the same two
+    non-answers `ci_pending` covers: no pull request behind the packet, and a repository
+    that runs no checks. `daemon._validate_work_order` reads "send it back" from this and
+    must not be handed a send-back nothing happened for.
+
+    THE RED PREDICATE IS NOT RE-DERIVED. `github.RED_CONCLUSIONS` stays the one
+    definition of red in the OS (issue #224), so the names come from
+    `github.failing_checks`; the normalisation is `.get(...) or ""` because that function
+    subscripts `c["conclusion"]` and hand-built packets in tests and injected validators
+    are legitimate.
+
+    Spec: docs/superpowers/specs/2026-10-13-a-red-head-is-sent-back-before-the-panel.md §3.1
+    """
+    from . import github
+
+    if packet.source != "pull_request" or not packet.pr:
+        return ()
+    checks = tuple({"name": str(c.get("name") or ""),
+                    "conclusion": str(c.get("conclusion") or "")}
+                   for c in (packet.pr.get("checks") or ()))
+    return github.failing_checks(checks)
 
 
 #: Keys the REGISTRY stamps on an effect rather than the collector producing them — the
