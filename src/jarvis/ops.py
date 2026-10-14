@@ -892,6 +892,10 @@ def create_work_order(project_name: str, title: str, description: str = "",
                       issue_priority: str | None = None,
                       budget_usd: float | None = None,
                       observability: str | None = None,
+                      gap_class: str | None = None,
+                      detector_id: str | None = None,
+                      remedy_rule_id: str | None = None,
+                      trigger_wo_id: str | None = None,
                       metadata: dict[str, Any] | None = None) -> dict[str, Any]:
     """File a work order. `parent_id` files it UNDER a feature order.
 
@@ -910,6 +914,13 @@ def create_work_order(project_name: str, title: str, description: str = "",
     An open feature order only: attaching a child to one that has already completed or
     failed would silently reopen a settled unit, and `Daemon.settle_features` would then
     have to decide what a new child means for a status the user has already been told.
+
+    `gap_class`, `detector_id`, `remedy_rule_id` and `trigger_wo_id` mark this as a FIX
+    ORDER and are PASSED STRAIGHT THROUGH — §7.1 of
+    docs/superpowers/specs/2026-09-27-self-evolution.md. Nothing here derives, guesses or
+    normalises them, and in particular nothing reads `description` for them: a structural
+    decision taken from free text is kn-5d8a396a, and here it would decide whether a
+    validation round is paid for. An empty `gap_class` is the ordinary case.
     """
     paths = registered_project_paths()
     if project_name not in paths:
@@ -944,6 +955,8 @@ def create_work_order(project_name: str, title: str, description: str = "",
             # has no answer" and the project config is read at write time
             # (`observability.level_for`) — docs/superpowers/specs/2026-09-24-order-observability.md §10.
             observability=observability,
+            gap_class=gap_class, detector_id=detector_id,
+            remedy_rule_id=remedy_rule_id, trigger_wo_id=trigger_wo_id,
         )
         # AT CREATION, from the brief the order is actually given — the only moment at
         # which "this order points at that issue" is a fact rather than an inference.
@@ -3862,6 +3875,66 @@ def merge_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | Non
             "head_oid": "", "merged_at": None, "source": ""}
 
 
+def self_evolution_state(wo: dict[str, Any]) -> dict[str, Any] | None:
+    """What `jarvis wo show` says about a FIX ORDER's four columns, or None.
+
+    §7.1 of docs/superpowers/specs/2026-09-27-self-evolution.md. None — and therefore no
+    line at all — for every order with an empty `gap_class`, which is almost every order:
+    `automerge_state`'s rule, and for its reason. A surface that printed "gap class: none"
+    on every work order in the fleet would spend attention on the absence of a feature
+    nobody asked for.
+
+    **THE CENTRAL STORE IS READ LAZILY, and only then.** The four values are columns on
+    the order precisely so the common surfaces need no second database; opening one for
+    every `jarvis wo show` in the fleet to print nothing is the cost that argued them
+    into columns in the first place.
+
+    **"Proposed, not yet registered" IS NOT AN ERROR.** A fix order is filed BEFORE its
+    rule exists — that is the whole order of events, and the normal state of a fresh one
+    — so a `detector_id` naming no row is reported as what it is, in words, and never as
+    a failure. What refuses an unregistered rule is `rules.precheck`, at submission, with
+    a reason that says how to fix it; this surface only describes.
+
+    The CLI consumes this dict verbatim and derives nothing from it, so `line` is written
+    here and the terminal and the dashboard cannot drift.
+    """
+    gap = str(wo.get("gap_class") or "").strip()
+    if not gap:
+        return None
+    detector_id = str(wo.get("detector_id") or "").strip()
+    remedy_rule_id = str(wo.get("remedy_rule_id") or "").strip()
+    trigger_wo_id = str(wo.get("trigger_wo_id") or "").strip()
+
+    detector: dict[str, Any] | None = None
+    if detector_id:
+        central = CentralStore()
+        try:
+            detector = central.get_detector(detector_id)
+        finally:
+            central.close()
+
+    if not detector_id:
+        detector_note = "no detector named yet"
+    elif detector is None:
+        detector_note = f"detector {detector_id} — proposed, not yet registered"
+    else:
+        detector_note = (f"detector {detector_id} — registered, "
+                         f"{detector.get('status') or 'dry_run'}")
+
+    parts = [f"gap class {gap}", detector_note]
+    if remedy_rule_id:
+        parts.append(f"remedy rule {remedy_rule_id}")
+    parts.append(f"proved against {trigger_wo_id}" if trigger_wo_id
+                 # The refusal `rules.precheck` would print names the same argument, so
+                 # the two surfaces say the same thing about the same missing field.
+                 else "no triggering order named (`jarvis wo create --trigger-wo-id`)")
+    return {"gap_class": gap, "detector_id": detector_id,
+            "remedy_rule_id": remedy_rule_id, "trigger_wo_id": trigger_wo_id,
+            "detector_registered": detector is not None,
+            "detector_status": str((detector or {}).get("status") or ""),
+            "line": " · ".join(parts)}
+
+
 def automerge_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
     """What `jarvis wo show` and the dashboard say about the automatic merge, or None.
 
@@ -5351,6 +5424,32 @@ already answered, or should not be, say which and why in `--evidence` and change
 file it is about anyway — the review cannot read an argument you did not make in the
 diff. Then run `jarvis wo finish {wo_id} --summary "..." --evidence "..."` again."""
 
+#: WHAT A FIX ORDER REFUSED BY THE PRE-CHECK IS TOLD (§7.2 of
+#: docs/superpowers/specs/2026-09-27-self-evolution.md). Shaped on `BOUNCE_FEEDBACK` and
+#: unnumbered for its reason: no round was opened at this site, so none was spent, and a
+#: number here would teach the submitter it has fewer attempts than it has. The refusal
+#: itself is `rules.precheck`'s words VERBATIM — it already names what is missing and the
+#: argument that supplies it (kn-85265170), and re-wording it here would give one refusal
+#: two spellings in one release.
+PRECHECK_FEEDBACK = """REVIEW FEEDBACK (no round was spent)
+{reason}
+
+This submission was not sent to the panel. The seats judge the QUALITY of a rule —
+whether the condition matches the real symptom, whether the remedy is the right
+primitive — and none of that can be judged until the rule exists and has been shown to
+fire on the order it is proved against. Nothing was registered for you: a fix order that
+has not registered its rule has not finished its job.
+
+Fix the above, then run `jarvis wo finish {wo_id} --summary "..." --evidence "..."`
+again."""
+
+#: The same refusal at the DAEMON site, where the round was numbered before the check
+#: could run and is therefore spent. `Daemon._reject` wraps this in `REVIEW_FEEDBACK`,
+#: which already says "round n of max"; this sentence is what makes the charge explicit,
+#: because a submitter that read the bounce wording above would believe this one was free.
+PRECHECK_SPENT_NOTE = (
+    "\n\nThis round was opened before the check could run, so it HAS been spent.")
+
 #: The give-up when that has happened `BOUNCE_LIMIT` times running.
 BOUNCE_EXHAUSTED = (
     "this work order has been sent back {n} times running for changing nothing round "
@@ -5495,6 +5594,11 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
     A FORCED ROUND IS NEVER BOUNCED, for `Daemon._repeat_submission`'s reason: there is
     no submitter to send anything back to.
 
+    **IT ALSO RETURNS None WHEN THE §7.2 PRE-CHECK REFUSED A FIX ORDER** — same shape,
+    same park, and for the same reason: no round is opened and none is spent. That check
+    runs FIRST, above everything below, because the packet is the next expense after the
+    round (spec docs/superpowers/specs/2026-09-27-self-evolution.md §7.2).
+
     THE COMPLETE CALLER SET, because `None` is a new answer they all have to be able to
     meet: `finish` (the only one that can see it, and the one that passes `panel_open`);
     `force_validation` and `rejudge_for_head`, both forced, so both still get a row; and
@@ -5505,6 +5609,26 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
     """
     from . import evidence as evidence_mod
     from . import specs
+
+    # THE MECHANICAL GATE, BEFORE THE PACKET AND BEFORE THE ROUND (§7.2 of
+    # docs/superpowers/specs/2026-09-27-self-evolution.md). The round is what costs
+    # money, so a refusal that opened one has already failed at its job — and a
+    # paperwork failure must not burn a round number in a feature whose whole subject is
+    # orders that burn rounds for nothing. `fix_order_precheck` returns None instantly
+    # for an empty `gap_class`, which is almost every order, and reads nothing at all.
+    #
+    # FORCED SUBMISSIONS ARE EXEMPT AT THIS SITE ONLY (Neo, question 1681): the forced
+    # callers — `force_validation`, `rejudge_for_head`, every `uncounted` rebind —
+    # dereference this function's return immediately and would crash on None, and there
+    # is no submitter to send the refusal back to. The same exemption the bounce below
+    # already has, and for the same reason. The daemon site has NO exemption: there the
+    # round already exists, so the refusal can be delivered through `_reject`.
+    if not (forced_reason.strip() or uncounted):
+        refusal = fix_order_precheck(store, project_path, wo)
+        if refusal is not None:
+            _precheck_refused(store, wo, refusal,
+                              store.numbered_validation_rounds(wo_id=wo["id"]) + 1)
+            return None
 
     # A FIX ASKED FOR BY A REBIND IS ITSELF A REBIND (spec 2026-09-27-a-conflict-
     # resolution-the-os-asked-for-costs-no-round §4.4). The worker was sent back by a
@@ -5605,6 +5729,177 @@ def _bounce(store: ProjectStore, wo: dict[str, Any], previous: dict[str, Any],
                  round=n, outcome="rejected",
                  reason=BOUNCE_FEEDBACK.format(n=n, wo_id=wo_id,
                                                paths=", ".join(cited))))
+
+
+def fix_order_precheck(store: ProjectStore, project_path: Path, wo: Mapping[str, Any],
+                       *, central: Any = None) -> str | None:
+    """Why this FIX ORDER may not be judged yet, in `rules.precheck`'s words, or None.
+
+    §7.2 of docs/superpowers/specs/2026-09-27-self-evolution.md. `rules.precheck` is
+    PURE and this is everything impure it needs: the registry rows, the triggering
+    order's recorded facts and the `can_apply` seam. TWO CALLERS, and they are a pair —
+    `submit_for_validation` before the round is opened, `Daemon._validate_work_order`
+    before the validator is paid, for the routes that do not pass through `finish`.
+
+    **NOTHING IS READ AT ALL WHEN `gap_class` IS EMPTY**, which is almost every order in
+    the fleet: the early return is above every store read on purpose, so the ordinary
+    submission pays nothing for a feature it is not part of.
+
+    `central` is the CentralStore to read the registry from. The daemon passes its OWN —
+    `_validate_work_order` runs on the validate thread and a sqlite connection belongs to
+    the thread that created it — and everything else lets this open and close one.
+
+    **NEVER FABRICATE A DEFAULT ANSWER FROM A FAILURE** (the pinned ruling, kn-b7deec8f's
+    half of it): a detector row that cannot be read, a snapshot that cannot be built, a
+    store that cannot be opened — each is UNREADABLE, and an unreadable input may not
+    produce a refusal. So every failure here returns None and the submission goes to the
+    panel, which is the direction that leaves the subject alone: refusing an order
+    because the OS could not run its own check would charge a submitter for the OS's
+    outage, and the check stays retryable on the next submission.
+    """
+    # `rules` is imported at module level; `remedies` is not, and this is the only
+    # reader of it here.
+    from . import remedies as remedies_mod
+
+    row = dict(wo or {})
+    if not str(row.get("gap_class") or "").strip():
+        return None
+    own = central is None
+    central = CentralStore() if own else central
+    try:
+        project = central.project_name_for_path(project_path)
+        detectors = central.detectors_for_gap(str(row["gap_class"]).strip(), project)
+        # The canonical shape `rules._rows_for` wants: detector id -> rows, which costs
+        # one query per detector for a gap class rather than a scan of the table.
+        remedy_rules = {str(d.get("id") or ""):
+                        central.remedy_rules_for(str(d.get("id") or ""))
+                        for d in detectors}
+        trigger, unreadable = _triggering_order(store, row)
+        trigger_facts = None
+        if trigger is not None:
+            try:
+                trigger_facts = rules.facts(store, trigger, now=time.time())
+            except Exception as exc:  # noqa: BLE001 — see the docstring's pinned ruling
+                log.warning("could not build the facts of %s, the order %s is proved "
+                            "against: %s", trigger.get("id"), row.get("id"), exc)
+                unreadable = (f"its recorded state could not be read ({exc})")
+
+        def precondition(primitive: str, params: Mapping[str, Any]) -> str:
+            """Check 4's seam: `remedies.REMEDIES[primitive].can_apply` against the
+            SAME subject the condition was evaluated on.
+
+            **THIS SEAM'S TYPE IS `str` AND IT HAS NO THIRD CHANNEL.** `rules.precheck`
+            branches on `if sentence:`, so the only two things this can say are "a
+            sentence, refuse" and "anything falsy, proceed". Both arms below are cases
+            where NOBODY COULD ANSWER, and both therefore PASS check 4 rather than
+            answer it — the order reaches the panel with check 4 never actually
+            evaluated.
+
+            That is the pinned never-fabricate-a-default-answer-from-a-failure ruling's
+            direction, in the only form this signature allows: the alternative is
+            refusing a submitter for the OS's own outage. kn-b7deec8f is why a genuine
+            THIRD state — "not determinable", neither `""` nor a refusal — would be the
+            right shape if the seam had one, and `rules.precheck`'s docstring records
+            the same thing from the other side, where a primitive declaring no
+            `can_apply` leaves check 4 unanswered for the packet to state.
+            """
+            remedy = remedies_mod.REMEDIES.get(primitive)
+            if remedy is None or trigger is None:
+                # No registry entry to ask, or no subject to ask it about. Nothing
+                # computed an answer, so check 4 is passed unevaluated — see above.
+                return ""
+            try:
+                return str(remedy.can_apply(store, dict(trigger),
+                                            dict(params or {})) or "")
+            except Exception as exc:  # noqa: BLE001 — a predicate that RAISED produced
+                # no answer either, so the same thing happens: check 4 is passed
+                # unevaluated and the submission goes to the panel, because a refusal
+                # built on an exception would charge the submitter for the OS's fault.
+                log.warning("the `can_apply` of %s raised on %s: %s",
+                            primitive, trigger.get("id"), exc)
+                return ""
+
+        return rules.precheck(detectors, remedy_rules, row, trigger_facts,
+                              precondition=precondition,
+                              trigger_unreadable=unreadable)
+    except Exception:  # noqa: BLE001 — the pinned ruling again: UNREADABLE, not refused
+        log.exception("the self-evolution pre-check on %s could not be run",
+                      row.get("id"))
+        return None
+    finally:
+        if own:
+            central.close()
+
+
+def _triggering_order(store: ProjectStore,
+                      wo: Mapping[str, Any]) -> tuple[dict[str, Any] | None, str]:
+    """The order this fix order's rule is proved against, and why it is UNREADABLE.
+
+    THE COLUMN FIRST, THE CHAIN SECOND (§7.2). `trigger_wo_id` set is the whole answer
+    and nothing infers over it: the submitter said which order this rule is proved
+    against. Only when it is empty does the fallback run —
+    `metadata[ORIGIN_IO_KEY]` to the improvement order, its `--ref` evidence, a concrete
+    order in THIS project — and that fallback exists for the fix order filed by hand, or
+    filed before the column shipped; it is a convenience and never the contract.
+
+    `("", None)` — nothing named and nothing inferred — is the REFUSAL case and is the
+    caller's to spell: `rules.precheck` refuses on `trigger_facts=None` with an empty
+    `trigger_unreadable`. A named order that cannot be READ returns the reason instead,
+    and the submission goes through to the panel with the packet saying so.
+    """
+    named = str(wo.get("trigger_wo_id") or "").strip()
+    if named:
+        try:
+            return store.get_work_order(named), ""
+        except KeyError:
+            return None, (f"the triggering order {named} is not in this project's "
+                          f"records — deleted, or in another project")
+    metadata = db.from_json(wo.get("metadata"), {}) or {}
+    io_id = str(metadata.get(ORIGIN_IO_KEY) or "")
+    if not io_id:
+        return None, ""
+    try:
+        _name, _path, io = find_feature_order(io_id, None)
+        refs = evidence_refs(io)
+    except Exception as exc:  # noqa: BLE001 — a back-link that does not resolve is a
+        # fact about the OS's records, not an error: the refusal below says so.
+        log.warning("the improvement order %s behind %s could not be read: %s",
+                    io_id, wo.get("id"), exc)
+        return None, ""
+    for ref in refs:
+        try:
+            return store.get_work_order(str(ref)), ""
+        except KeyError:
+            continue
+    return None, ""
+
+
+def _precheck_refused(store: ProjectStore, wo: Mapping[str, Any], reason: str,
+                      would_be: int) -> None:
+    """Send a fix order back without convening the panel and without opening a round.
+
+    `_bounce`'s shape, and for its reasons — THE EVENT IS NOT OPTIONAL, and it is written
+    BEFORE the envelope so a bus that refuses still leaves the record saying what
+    happened. It carries the four §7.1 columns because the refusal is ABOUT them: a
+    reader who disagrees can see which detector and which triggering order were judged
+    without re-running anything.
+
+    Not `_bounce` itself: that one is keyed to a PREVIOUS round, and this refusal can
+    happen on round 1 — a fix order's first submission is the commonest place for it.
+    """
+    wo_id = str(wo["id"])
+    store.add_event(wo_id, "validation_refused",
+                    {"would_be_round": would_be,
+                     "gap_class": str(wo.get("gap_class") or ""),
+                     "detector_id": str(wo.get("detector_id") or ""),
+                     "remedy_rule_id": str(wo.get("remedy_rule_id") or ""),
+                     "trigger_wo_id": str(wo.get("trigger_wo_id") or ""),
+                     "reason": reason})
+    bus.post(store, subject=bus.Subject(wo_id=wo_id),
+             from_role="reviewer", to_role="implementor",
+             payload=bus.ReviewFeedback(
+                 round=would_be, outcome="rejected",
+                 reason=PRECHECK_FEEDBACK.format(reason=reason, wo_id=wo_id)))
 
 
 def force_validation_refusal(store: ProjectStore, wo: dict[str, Any], *,

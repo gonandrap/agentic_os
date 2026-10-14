@@ -509,6 +509,36 @@ def test_a_row_that_predates_the_column_has_no_answer_and_is_not_off(project):
     assert observability.records_context(row, ObservabilityConfig()) is True
 
 
+# -- what a fix order carries ----------------------------------------------------------
+#
+# §7.1 of docs/superpowers/specs/2026-09-27-self-evolution.md. Four nullable columns, no
+# backfill: every pre-existing row reads "not a fix order", which is true. The other half
+# of this pair — a row written BEFORE the columns existed — is in
+# tests/test_schema_upgrade.py, because a new column is untested until both exist.
+
+
+def test_the_self_evolution_columns_are_written_at_creation(project):
+    """Set STRUCTURALLY and never inferred from prose (kn-5d8a396a): they arrive as
+    keyword arguments, and nothing anywhere scans a description for them."""
+    store = ProjectStore(project)
+    wo = store.create_work_order(
+        "close the stale-hold gap", description="no slug appears in this text",
+        gap_class="stale-hold", detector_id="dt-7", remedy_rule_id="rr-3",
+        trigger_wo_id="wo-trigger")
+    row = store.get_work_order(wo["id"])
+
+    assert row["gap_class"] == "stale-hold"
+    assert row["detector_id"] == "dt-7"
+    assert row["remedy_rule_id"] == "rr-3"
+    assert row["trigger_wo_id"] == "wo-trigger"
+
+    # The ordinary order, which is almost every order: all four NULL, and the empty
+    # string is stored as NULL so one reading of "not a fix order" reaches every reader.
+    plain = store.get_work_order(store.create_work_order("ordinary")["id"])
+    assert [plain["gap_class"], plain["detector_id"], plain["remedy_rule_id"],
+            plain["trigger_wo_id"]] == [None, None, None, None]
+
+
 def test_an_uncounted_round_records_why_it_is_uncounted(project):
     """Two causes now open a round outside the budget — the OS's own merge rebind and
     the rework a USER asked for — and each has its own bound, so a counter that could

@@ -1026,6 +1026,185 @@ def resolve(
     return tuple(out)
 
 
+#: The refusal when a fix order names no order its detector can be proved against.
+#: VERBATIM FROM §7.2 of docs/superpowers/specs/2026-09-27-self-evolution.md, which
+#: specifies the sentence rather than the idea: it is the one refusal that is about the
+#: OS's own records rather than about the code, and it names `--trigger-wo-id` because a
+#: refusal that says "name it explicitly" without saying HOW is the dead end that section
+#: exists to close (kn-85265170).
+NO_TRIGGER_REFUSAL = (
+    "gap_class '{gap}' has no triggering order to prove its detector against: "
+    "trigger_wo_id is empty and the improvement-order refs resolve to no work order in "
+    "this project. Re-file with `jarvis wo create --trigger-wo-id <wo-id>`, naming the "
+    "order the investigation was filed from."
+)
+
+# Stage numbers, and the LARGEST wins when several detectors each fail differently. A
+# refusal from a later stage has got further into §7.2's four steps and therefore names
+# something more specific: "`dt-match` did not fire on wo-7" is actionable where "no
+# detector for this gap" would be misleading if some other row for the same gap class
+# existed. Only used to choose between refusals; one passing pair beats all of them.
+_STAGE_NO_DETECTOR = 1
+_STAGE_UNREADABLE = 2
+_STAGE_NO_REMEDY = 3
+_STAGE_BAD_PRIMITIVE = 4
+_STAGE_NO_MATCH = 5
+_STAGE_CANNOT_APPLY = 6
+
+
+def precheck(
+    detectors: Iterable[Mapping[str, Any]],
+    remedy_rules: Any,
+    wo: Mapping[str, Any],
+    trigger_facts: Facts | None,
+    *,
+    precondition: Callable[[str, Mapping[str, Any]], str] | None = None,
+    trigger_unreadable: str = "",
+) -> str | None:
+    """Why this fix order may NOT be submitted for validation yet, or `None`. PURE.
+
+    §7.2 of docs/superpowers/specs/2026-09-27-self-evolution.md, in the shape of
+    `evidence.nothing_to_judge` and `automerge.decide`: it returns the refusal's precise
+    words or nothing at all, and it decides, writes and registers nothing.
+
+    **Called before the round is opened**, because the round is what costs money and a
+    paperwork failure must not burn a round number in a feature whose whole subject is
+    orders that burn rounds for nothing. The four checks, in order, each with its own
+    refusal naming what is missing:
+
+    1. a live detector exists for the order's `gap_class`;
+    2. it has a live remedy row whose `primitive` is a key of `remedies.REMEDIES` — and,
+       when the order names a `remedy_rule_id`, that row and no other;
+    3. the detector's condition MATCHES the triggering order's recorded facts — a real
+       evaluation through `evaluate`, never a syntax check;
+    4. that remedy's `can_apply` does not answer with a sentence.
+
+    **IT REFUSES, IT DOES NOT CREATE.** Registering the detector or the remedy here for
+    the submitter would remove the only forcing function this feature has: a fix order
+    that has not registered its rule has not finished its job.
+
+    `precondition` is check 4's seam, exactly as in `resolve`: a caller holding a store
+    injects `(primitive, params) -> str` — `remedies.can_apply` — and this module stays a
+    LEAF (stdlib plus `db`, `catalog`, `remedies`). Nothing here opens a store, reaches
+    the network or spawns a process.
+
+    **`can_apply` with nothing able to answer is a THIRD state** (kn-b7deec8f). No
+    precondition was injected, or the primitive declares none: that is "not
+    determinable", which is neither "yes" nor a refusal. It is NOT collapsed into a pass
+    on check 4 — the order goes through on checks 1-3 and check 4 stays unanswered, for
+    the packet to state — and it is never a refusal, because refusing an order for a
+    question nobody could ask is fabricating an answer from an absence.
+
+    **`trigger_facts is None` IS TWO DIFFERENT STATES AND THEY ARE DELIBERATELY NOT ONE.**
+    With `trigger_unreadable` empty it means there was no triggering order to find at all,
+    and a detector that has never been shown to fire is unproven: that REFUSES, in
+    `NO_TRIGGER_REFUSAL`'s words. With `trigger_unreadable` carrying the reason, the order
+    WAS named and could not be read — deleted, or in another project — and that is
+    UNREADABLE: the submission goes through, the packet states it, and the panel judges.
+    Collapsing the pair would either refuse an order for the OS's own lost record or let
+    an unproven rule past the gate. Checks 1 and 2 still run in the unreadable case: they
+    need no facts, and existence is decided here or it is decided by a seat, which §7.3
+    forbids.
+
+    An empty `gap_class` returns `None` immediately — §7.1's ordinary order, which is
+    almost every order, gets no pre-check at all.
+    """
+    gap = str((wo or {}).get("gap_class") or "").strip()
+    if not gap:
+        return None
+    named_remedy = str((wo or {}).get("remedy_rule_id") or "")
+
+    live = [row for row in (detectors or ()) if not _retired(row)]
+    if not live:
+        return (f"gap_class '{gap}' has no registered detector: nothing in the registry "
+                f"recognises this gap, so the rule this fix order exists to add has not "
+                f"been written down. Register the detector, then name it with "
+                f"`jarvis wo create --detector-id <detector-id>` and submit again.")
+
+    readable, unreadable = readable_detectors(live)
+    best: tuple[int, str] | None = None
+
+    def refuse(stage: int, message: str) -> None:
+        nonlocal best
+        if best is None or stage > best[0]:
+            best = (stage, message)
+
+    for det_id, error in unreadable:
+        # An unreadable stored condition is a REFUSAL and says so, rather than the silent
+        # skip `resolve` performs: there, a row nobody can read produces no proposal and
+        # the caller records `UNREADABLE`; here it is the submitter's own rule, and a rule
+        # this release cannot parse has not been shown to fire.
+        refuse(_STAGE_UNREADABLE,
+               f"detector '{det_id}' has a stored condition this release cannot parse "
+               f"({error}), so it cannot be proved against anything. Re-register it with "
+               f"a condition this release understands, then submit again.")
+
+    for row, cond in readable:
+        det_id = str(row.get("id") or "")
+        candidates = [r for r in _rows_for(remedy_rules, det_id) if not _retired(r)]
+        if named_remedy:
+            candidates = [r for r in candidates if str(r.get("id") or "") == named_remedy]
+            if not candidates:
+                refuse(_STAGE_NO_REMEDY,
+                       f"remedy rule '{named_remedy}' is not a live rule under detector "
+                       f"'{det_id}': the order names a remedy the registry does not have. "
+                       f"Register it, or drop `--remedy-rule-id`, then submit again.")
+                continue
+        if not candidates:
+            refuse(_STAGE_NO_REMEDY,
+                   f"detector '{det_id}' has no live remedy rule: a detector with nothing "
+                   f"to do about the gap cannot close it. Register one naming a primitive "
+                   f"from the closed registry "
+                   f"({', '.join(sorted(remedies.REMEDIES))}), then submit again.")
+            continue
+        usable = [r for r in candidates
+                  if str(r.get("primitive") or "") in remedies.REMEDIES]
+        if not usable:
+            # NAME THE PRIMITIVE THAT DOES NOT EXIST — the spec asks for that word
+            # specifically. `validate_params` refuses the same thing at INSERT; a row
+            # written by an older release, or by a path that skipped it, reaches here.
+            refuse(_STAGE_BAD_PRIMITIVE, "; ".join(
+                f"remedy rule '{r.get('id') or ''}' names primitive "
+                f"'{r.get('primitive') or ''}', which does not exist — a rule names one "
+                f"of {', '.join(sorted(remedies.REMEDIES))}, and the registry is closed"
+                for r in candidates))
+            continue
+
+        if trigger_unreadable:
+            # Checks 1 and 2 passed and check 3 cannot be run: UNREADABLE, not a refusal.
+            return None
+        if trigger_facts is None:
+            refuse(_STAGE_NO_MATCH, NO_TRIGGER_REFUSAL.format(gap=gap))
+            continue
+        evaluation = evaluate(cond, trigger_facts)
+        if not evaluation.matched:
+            refuse(_STAGE_NO_MATCH,
+                   f"detector '{det_id}' did not fire on {trigger_facts.order_id}, the "
+                   f"order it is proved against: {explain(cond, evaluation)}.")
+            continue
+
+        for remedy_row in usable:
+            primitive = str(remedy_row.get("primitive") or "")
+            params = remedy_row.get("params") or {}
+            if isinstance(params, str):
+                try:
+                    params = json.loads(params)
+                except ValueError:
+                    params = {}
+            sentence: str | None = None
+            if precondition is not None and _declares_can_apply(primitive):
+                sentence = precondition(primitive, params)
+            if sentence:
+                # VERBATIM. The precondition already wrote the sentence a reviewer reads
+                # in a gate request; re-wording it here would give the same refusal two
+                # spellings in one release.
+                refuse(_STAGE_CANNOT_APPLY, sentence)
+                continue
+            return None
+
+    return best[1] if best else None
+
+
 def validate_params(primitive: str, params: Mapping[str, Any]) -> list[str]:
     """Why this remedy row may not be inserted, or `[]`. Run at INSERT time.
 

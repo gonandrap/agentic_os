@@ -2834,6 +2834,35 @@ class Daemon:
                          project.name, wo_id, n)
                 return
 
+            # THE §7.2 PRE-CHECK, A SECOND TIME, for the rounds that did not come
+            # through `ops.submit_for_validation`'s unforced path — spec
+            # docs/superpowers/specs/2026-09-27-self-evolution.md §7.2. In this band
+            # beside `nothing_to_judge` and `_repeat_submission`, and BEFORE
+            # `validator(...)`: the seats are the expense this exists to avoid.
+            #
+            # NO EXEMPTION FOR A FORCED ROUND HERE (Neo, question 1681). The submission
+            # site exempts them because they dereference its return; here the round
+            # exists, so the refusal has somewhere to land — and it SPENDS that round,
+            # which `PRECHECK_SPENT_NOTE` is what says out loud.
+            #
+            # ITS OWN `CentralStore`, for the reason this whole method opens its own
+            # `ProjectStore`: a sqlite connection belongs to the thread that created it,
+            # and `self.central` belongs to the daemon thread.
+            central = CentralStore()          # thread-local — see the docstring
+            try:
+                refusal = ops.fix_order_precheck(store, project.path, wo,
+                                                 central=central)
+            finally:
+                central.close()
+            if refusal is not None:
+                self._reject(store, wo, round_id, n, max_rounds,
+                             refusal + ops.PRECHECK_SPENT_NOTE, budget_round=pos,
+                             rebind=(rebinds, ops.REBIND_MAX) if as_rebind else None,
+                             uncounted_cause=cause)
+                log.info("[%s] %s: round %d refused before the panel — %s",
+                         project.name, wo_id, n, refusal)
+                return
+
             # A REPEAT of the IMMEDIATELY PRECEDING round only. Compared against every
             # earlier round it would punish a submitter that was told to go back to a
             # shape it had already tried, which is a legitimate answer to feedback.

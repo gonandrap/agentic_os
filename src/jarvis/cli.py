@@ -183,6 +183,26 @@ def _finding_lines(opinion: dict[str, Any], filed: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _readable_self_evolution(detail: dict[str, Any]) -> dict[str, Any]:
+    """A fix order's four columns collapsed to one line, for HUMAN output.
+
+    `_readable_automerge`'s trick, including the disappearing key: `--json` keeps all
+    four ids and `detector_registered`, because the Evolution view and the evidence
+    packet read them, while a person gets `gap class stale-hold · detector dt-7 —
+    proposed, not yet registered · proved against wo-3`. The four bare columns `**wo`
+    smuggles in are dropped from the human reading too: they would print the same ids a
+    second time, unlabelled (§7.1 of
+    docs/superpowers/specs/2026-09-27-self-evolution.md).
+    """
+    row = dict(detail)
+    state = row.pop("self_evolution", None)
+    if state:
+        for column in ("gap_class", "detector_id", "remedy_rule_id", "trigger_wo_id"):
+            row.pop(column, None)
+        row["self_evolution"] = state["line"]
+    return row
+
+
 def _readable_automerge(detail: dict[str, Any]) -> dict[str, Any]:
     """The automatic merge collapsed to its one line, for HUMAN output.
 
@@ -793,6 +813,29 @@ def build_parser() -> argparse.ArgumentParser:
                         "`off` — no per-turn context ledger and no sealed autopsy. It does NOT disable `jarvis watch`, `jarvis inspect`, `jarvis wo why` or the debug page: those read files that already exist, so the autopsy READING — every turn, its tools, its token classes and its context total, delta, peak and composition — is shown for every order at every level. What `off` stops is the autopsy being SEALED, so that reading survives only as long as Claude Code keeps the transcript. "
                         "`normal` — the default: the per-turn context ledger, and the autopsy sealed onto the order when it settles. "
                         "`full` — that, plus the detail a `full` seal retains: verbatim tool parameters and nested subagent anatomies")
+
+    # WHAT MARKS THIS A FIX ORDER — §7.1 of
+    # docs/superpowers/specs/2026-09-27-self-evolution.md. Four flags and no inference:
+    # the submitter states which gap this order closes, nothing reads --description for
+    # it (kn-5d8a396a), and omitting them all is the ordinary order, which is almost
+    # every order.
+    c.add_argument("--gap-class", default="",
+                   help="the class of gap this order closes (a slug, e.g. "
+                        "`stale-hold`). Marks it a FIX ORDER: before it may be submitted "
+                        "for validation, its detector and remedy must be registered and "
+                        "the detector must be shown to fire on --trigger-wo-id. Omit for "
+                        "an ordinary work order")
+    c.add_argument("--detector-id", default="",
+                   help="the detector that recognises that gap — a `detectors.id`, or "
+                        "the id a detector is being proposed under. Not yet registered "
+                        "is the NORMAL state of a fresh fix order")
+    c.add_argument("--remedy-rule-id", default="",
+                   help="the remedy rule under that detector — a `remedy_rules.id`. Omit "
+                        "to accept any live remedy the detector has")
+    c.add_argument("--trigger-wo-id", default="",
+                   help="the work order the investigation was filed FROM: what the "
+                        "detector's condition is proved against. Read FIRST and, when "
+                        "set, the whole answer — nothing infers over it")
 
     b = wo.add_parser("budget", help="show, set, raise or clear a work order's dollar "
                                      "ceiling — and resume it if it stopped at one")
@@ -3547,10 +3590,18 @@ def cmd_wo(args: argparse.Namespace) -> int:
             append_system_prompt=args.append_system_prompt, depends_on=deps,
             parent_id=parent or None, budget_usd=_budget_arg(args),
             observability=getattr(args, "observability", None),
+            # Verbatim from the flags — §7.1's "set structurally and never inferred from
+            # prose". `getattr` keeps an older argparse namespace (the dashboard builds
+            # one) working unchanged.
+            gap_class=(getattr(args, "gap_class", "") or "").strip() or None,
+            detector_id=(getattr(args, "detector_id", "") or "").strip() or None,
+            remedy_rule_id=(getattr(args, "remedy_rule_id", "") or "").strip() or None,
+            trigger_wo_id=(getattr(args, "trigger_wo_id", "") or "").strip() or None,
         )
         _print({"created": wo["id"], "project": args.project, "status": wo["status"],
                 "depends_on": deps,
                 **({"parent": parent} if parent else {}),
+                **({"gap_class": wo["gap_class"]} if wo.get("gap_class") else {}),
                 **({"budget_usd": wo["budget_usd"]} if wo.get("budget_usd") else {}),
                 "note": (f"jarvisd will dispatch it once {', '.join(deps)} completes"
                          if deps else "jarvisd will dispatch it shortly")}, args.json)
@@ -3714,10 +3765,17 @@ def cmd_wo(args: argparse.Namespace) -> int:
         finally:
             store.close()
         detail["budget"] = ops.work_order_budget(args.wo_id, name)
+        # WHAT A FIX ORDER CARRIES (§7.1), on the never-always rule: no key at all for an
+        # order with an empty `gap_class`. Computed out here for `budget`'s reason — it
+        # may open the central store, which must not nest inside the project store's
+        # lifetime.
+        if (evolution := ops.self_evolution_state(wo)):
+            detail["self_evolution"] = evolution
         _print(_readable_spec(_readable_config(_readable_review(_readable_autoreview(
             _readable_automerge(_readable_harvest(_readable_alarms(
                 _readable_time_in_state(_readable_rounds(_readable_issues(
-                    _readable_conversation(detail)))))))))))
+                    _readable_self_evolution(
+                        _readable_conversation(detail))))))))))))
                if not args.json else detail, args.json)
 
     elif args.wo_cmd == "send":
