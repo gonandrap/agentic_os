@@ -5451,7 +5451,7 @@ def escalate_validation_round(store: ProjectStore, wo: dict[str, Any], round_id:
     `close_validation_round` and `COUNTED_VALIDATION_OUTCOMES` are untouched, because the
     cause is not an outcome (Neo 1713).
     """
-    from .daemon import VALIDATION_ESCALATED_TITLE, escalation_body
+    from .daemon import escalation_body
     from .invariants import VALIDATION_STUCK_BLOCKER
 
     wo_id = wo["id"]
@@ -5462,7 +5462,9 @@ def escalate_validation_round(store: ProjectStore, wo: dict[str, Any], round_id:
     store.set_status(wo_id, "needs_review")
     store.flag_attention(wo_id, VALIDATION_STUCK_BLOCKER)
     store.add_notification(
-        title=VALIDATION_ESCALATED_TITLE.format(unit=wo_id, n=n),
+        # Spec 2026-10-14-an-escalated-round-says-why-and-what-to-run-next §3.
+        title=ESCALATION_TITLE.format(
+            unit=wo_id, n=n, verb=ESCALATION_VERB[ESCALATION_FAMILY[cause]]),
         body=escalation_body(reason), level="warning", wo_id=wo_id,
         source="validation",
     )
@@ -7393,6 +7395,12 @@ ESCALATION_VERB: dict[str, str] = {
     "unjudged": "could not be judged",
     "unrecorded": "was escalated",
 }
+
+#: The WORK ORDER give-up notification, worded off the same three verbs — spec §3's rule
+#: that one vocabulary serves every surface. `daemon.VALIDATION_ESCALATED_TITLE` stays as
+#: it is and now serves `Daemon._escalate_feature` alone: a feature-order escalation
+#: records no cause (spec §Not covered), so it has no family to name.
+ESCALATION_TITLE = "{unit} — round {n} {verb}"
 
 #: `proof` on `CARRY_REFUSED_EVENT`, one value per condition — the `automerge` hold-code
 #: discipline, so a reader can tell "someone resolved a conflict" from "the daemon could

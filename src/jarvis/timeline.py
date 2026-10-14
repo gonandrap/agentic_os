@@ -27,6 +27,15 @@ import json
 import time
 from typing import Any
 
+#: `ops.ESCALATION_FAMILY`'s two written families, as the literals this module is allowed
+#: to hold — it imports nothing from `jarvis`, so tests/test_timeline.py pins these
+#: against the dict rather than a comment promising they match.
+ESCALATION_HANDOVER = frozenset({
+    "rounds_spent", "user_rework_ceiling", "rebinds_spent", "bounce_exhausted",
+    "nothing_to_judge", "repeat_submission"})
+ESCALATION_UNJUDGED = frozenset({
+    "no_verdict", "validator_unreachable", "prompt_refused"})
+
 # Plumbing: how a message got carried, which session was bound, when a turn ended.
 # None of it tells the user anything about the work itself.
 DEBUG_KINDS = frozenset({
@@ -716,7 +725,20 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                 f"{p.get('after_round')} asked about changed",
                 f"unchanged since that round: {cited}" if cited else "")
     if kind == "validation_escalated":
-        return ("Validation gave up — over to you", p.get("reason") or "")
+        # WHICH FAMILY, not merely that a round escalated: "gave up" read as "nobody
+        # judged this" for the six causes that are a REJECTION being handed over (spec
+        # docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md
+        # §1, issue #1040). The verbs are `ops.ESCALATION_VERB`'s, quoted as literals
+        # like "user_rework" above because this module imports nothing from `jarvis`;
+        # tests/test_timeline.py pins both sets against `ops.ESCALATION_FAMILY`. A
+        # payload written before the field existed has no cause and says so.
+        cause = str(p.get("cause") or "")
+        if cause in ESCALATION_HANDOVER:
+            return ("Validation was rejected and handed to you", p.get("reason") or "")
+        if cause in ESCALATION_UNJUDGED:
+            return ("Validation could not be judged — over to you",
+                    p.get("reason") or "")
+        return ("Validation was escalated — over to you", p.get("reason") or "")
     if kind == "validation_void":
         # NOT a give-up and NOT a verdict, and the label has to say both: nobody judged
         # this, and nobody needs to. A reader who takes it for an escalation goes looking

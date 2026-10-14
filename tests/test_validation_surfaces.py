@@ -671,6 +671,25 @@ def test_a_no_pr_escalated_order_is_never_pointed_at_validation_force(
     assert any("--reject" in line for line in json.loads(raw)["review"]["next"])
 
 
+@pytest.mark.parametrize("cause", CAUSES)
+def test_the_give_up_notification_names_the_family_and_never_gave_up(
+        jarvis_home, catalog_file, project, cause):
+    """One vocabulary on every surface — `ops.ESCALATION_VERB` (spec §3). The title
+    `Daemon._escalate_feature` still uses is unchanged: a feature escalation records no
+    cause and has no family to name."""
+    wo = escalated(project, cause=cause)
+    store = ProjectStore(project)
+    try:
+        titles = [row["title"] for row in store.unrouted_notifications()
+                  if row["source"] == "validation"]
+    finally:
+        store.close()
+
+    verb = ops.ESCALATION_VERB[ops.ESCALATION_FAMILY[cause]]
+    assert titles == [ops.ESCALATION_TITLE.format(unit=wo["id"], n=1, verb=verb)]
+    assert "gave up" not in titles[0]
+
+
 def test_a_legacy_escalated_event_with_no_cause_field_reads_as_unrecorded(
         jarvis_home, catalog_file, project):
     """Spec §1: an event written before this change lacks the field, and guessing from

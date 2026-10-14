@@ -3241,6 +3241,9 @@ def test_the_page_still_renders_exactly_one_review_form(client, project):
     assert page.count(f'action="/wo/proj_a/{wo["id"]}/review"') == 1
     assert "the panel rejected this and had no round left" in flat
     assert f"jarvis wo review {wo['id']} --reject" in flat
+    # The HEADER above those rows, which contradicted them — issue #1040.
+    assert f"Round 1 {ops.ESCALATION_VERB['handover']} — your judgement" in flat
+    assert "Round 1 gave up" not in flat
 
 
 def test_the_page_of_a_no_pr_order_never_names_validation_force(client, project):
