@@ -5541,7 +5541,9 @@ class Daemon:
             # attention list from state alone — Neo 1084, `ops.os_status`. `owed` rides
             # along for the same reason and is written FIRST, so the row exists before
             # the derivation below reads it.
-            first = store.open_violation_report(v.invariant, v.wo_id, level=v.level,
+            # `v.key[1]`, not `v.wo_id`: the row must dedupe on the same subject `key`
+            # does, or a feature-level check collapses N subjects into one row (Neo 1695).
+            first = store.open_violation_report(v.invariant, v.key[1], level=v.level,
                                                 detail=v.detail, owed=v.owed)
             # A DECISION IS OWED: raise the work order's own flag, with the reason
             # DERIVED rather than written — and do it before the dedupe `continue`, so a
@@ -7892,17 +7894,23 @@ class Daemon:
                     packet = self._confirmation_evidence(project, wo)
                 # Trimmed PER ASSUMPTION, and the collection above stays one `git diff`:
                 # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md § 2.
+                # The doc classifier is the PROJECT's (`os.navigation`), never a copy in
+                # `autoreview`: 2026-10-13 spec, part 1.
                 ce = autoreview.confirm_evidence(
                     packet, a, cfg.confirm_diff_chars,
-                    collect_limit=CONFIRM_COLLECT_CHARS)
+                    collect_limit=CONFIRM_COLLECT_CHARS,
+                    doc_suffixes=project.navigation.doc_suffixes,
+                    doc_dirs=project.navigation.doc_dirs)
                 # THE SECOND GATE, over the EVIDENCE rather than the row, and it runs
                 # before `neo.ask` PERSISTS the diff as a question row (kn-deef42ea). It
                 # reads the TRIMMED text because that is what is persisted and sent, and
                 # the WHOLE rendered block of it: docs/superpowers/specs/
                 # 2026-09-26-bounded-model-inputs.md § 2.
+                # `unreadable` off the same `ce` this renders: 2026-10-13 spec, part 3.
                 evidence_ok = autoreview.decide_evidence(
                     a, ce.stat, ce.what_changed(),
-                    summary=str(wo.get("result_summary") or ""))
+                    summary=str(wo.get("result_summary") or ""),
+                    unreadable=ce.unreadable)
                 if not evidence_ok.armed:
                     self._note_autoreview_held(store, wo["id"], evidence_ok,
                                                suppress=suppress)

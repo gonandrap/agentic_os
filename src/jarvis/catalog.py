@@ -20,7 +20,7 @@ from . import probes as probes_mod
 from .claude_cli import DEFAULT_MAX_OS_PROMPT_CHARS, MAX_OS_PROMPT_CHARS_MIN
 from . import schedule as schedule_mod
 from .gates import GateConfig
-from .navigation import (DOC_DUMP_COMMANDS, DOC_SUFFIXES, NAV_COMMANDS,
+from .navigation import (DOC_DIRS, DOC_DUMP_COMMANDS, DOC_SUFFIXES, NAV_COMMANDS,
                          SOURCE_SUFFIXES, SYMBOL_TOOLS, TEXT_SEARCH_TOOLS)
 from .neo_store import Q_KINDS, SEATS
 from .project_store import VALIDATOR_SEATS
@@ -555,6 +555,13 @@ DEFAULT_VALIDATION_DIFF_CHARS = 150000
 # docs/superpowers/specs/2026-09-28-an-assumption-review-reads-the-orders-own-rulings.md
 DEFAULT_VALIDATION_DECISION_RECORD_CHARS = 6000
 
+# Characters of SPEC SECTION the same packet may carry — the authority an assumption cites
+# when it says "per the spec", absent until GitHub issue #1035. `decision_record_chars`'s
+# number because it is the same packet, the same uncached per-assumption call and the other
+# authority block beside the record; well under `confirm_diff_chars` because a section is
+# prose a planner wrote, not a diff.
+DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS = 6000
+
 # Truncation limit for the diff ONE CONFIRMATION QUESTION carries, and it is not the
 # panel's number: measured at q660-748, confirmation questions ran 7K-152K chars against
 # 1-3.8K for the first-pass review of the same assumption and 12-15K for the largest
@@ -638,6 +645,8 @@ class ValidationConfig:
     red_ci_returns: int = DEFAULT_VALIDATION_RED_CI_RETURNS
     diff_chars: int = DEFAULT_VALIDATION_DIFF_CHARS
     decision_record_chars: int = DEFAULT_VALIDATION_DECISION_RECORD_CHARS
+    # GitHub issue #1035: the spec section an assumption review reads.
+    assumption_spec_chars: int = DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS
     confirm_diff_chars: int = DEFAULT_VALIDATION_CONFIRM_DIFF_CHARS
     # Whether a FEATURE order validates as a whole once its children are done, which is
     # a separate question from whether its children each validated: the feature is the
@@ -1201,6 +1210,12 @@ DEFAULT_NAVIGATION_CODE_SUFFIXES = SOURCE_SUFFIXES
 #: docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §3.2.
 DEFAULT_NAVIGATION_DOC_SUFFIXES = DOC_SUFFIXES
 
+#: Which path components make a file a DOC by location. The same key `autoreview.
+#: _is_documentation` classifies a confirmation diff's tier (c) with, so a project
+#: overriding it moves both. Not a suffix: entries carry no leading dot.
+#: docs/superpowers/specs/2026-10-13-a-confirmation-question-with-a-zero-character-diff.md
+DEFAULT_NAVIGATION_DOC_DIRS = DOC_DIRS
+
 #: The Bash commands that DUMP a doc. `grep`/`rg`/`find` are absent by decision — text
 #: search in markdown stays legal and counting it would price a legitimate call as waste.
 #: docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §3.2.
@@ -1212,9 +1227,10 @@ DEFAULT_NAVIGATION_DOC_DUMP_COMMANDS = DOC_DUMP_COMMANDS
 DEFAULT_NAVIGATION_WINDOW_DAYS = 7
 
 #: The `NavigationConfig` fields that are a PATTERN LIST, so `_parse_navigation` can
-#: refuse all six the same way. An empty one reports 0% everywhere and looks like a win.
+#: refuse all seven the same way. An empty one reports 0% everywhere and looks like a win.
 NAVIGATION_PATTERN_KEYS = ("bash_commands", "symbol_tools", "text_search_tools",
-                           "code_suffixes", "doc_suffixes", "doc_dump_commands")
+                           "code_suffixes", "doc_suffixes", "doc_dirs",
+                           "doc_dump_commands")
 
 
 @dataclass
@@ -1235,6 +1251,7 @@ class NavigationConfig:
     text_search_tools: tuple[str, ...] = DEFAULT_NAVIGATION_TEXT_SEARCH_TOOLS
     code_suffixes: tuple[str, ...] = DEFAULT_NAVIGATION_CODE_SUFFIXES
     doc_suffixes: tuple[str, ...] = DEFAULT_NAVIGATION_DOC_SUFFIXES
+    doc_dirs: frozenset[str] = DEFAULT_NAVIGATION_DOC_DIRS
     doc_dump_commands: tuple[str, ...] = DEFAULT_NAVIGATION_DOC_DUMP_COMMANDS
     window_days: int = DEFAULT_NAVIGATION_WINDOW_DAYS
 
@@ -2177,6 +2194,10 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         raw.get("decision_record_chars", base.decision_record_chars))
     if decision_record_chars < 1:
         raise _err(f"{where}.decision_record_chars must be >= 1")
+    assumption_spec_chars = int(
+        raw.get("assumption_spec_chars", base.assumption_spec_chars))
+    if assumption_spec_chars < 1:
+        raise _err(f"{where}.assumption_spec_chars must be >= 1")
     confirm_diff_chars = int(raw.get("confirm_diff_chars", base.confirm_diff_chars))
     if confirm_diff_chars < 1:
         raise _err(f"{where}.confirm_diff_chars must be >= 1")
@@ -2208,6 +2229,7 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         red_ci_returns=red_ci_returns,
         diff_chars=diff_chars,
         decision_record_chars=decision_record_chars,
+        assumption_spec_chars=assumption_spec_chars,
         confirm_diff_chars=confirm_diff_chars,
         feature_units=bool(raw.get("feature_units", base.feature_units)),
         feature_merge_wait_minutes=feature_merge_wait_minutes,
@@ -2439,6 +2461,9 @@ def _parse_navigation(raw: Any, base: NavigationConfig | None = None,
         code_suffixes=patterns("code_suffixes", base.code_suffixes),
         # docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §3.2.
         doc_suffixes=patterns("doc_suffixes", base.doc_suffixes),
+        # docs/superpowers/specs/2026-10-13-a-confirmation-question-with-a-zero-character-
+        # diff.md: the confirmation tier (c) reads this, so it is NOT a suffix list.
+        doc_dirs=frozenset(patterns("doc_dirs", tuple(base.doc_dirs))),
         doc_dump_commands=patterns("doc_dump_commands", base.doc_dump_commands),
         window_days=int(raw.get("window_days", base.window_days)),
     )

@@ -156,6 +156,26 @@ def plan_of(store: ProjectStore, fo_id: str) -> dict[str, Any]:
     return db.from_json(fo.get("plan"), {}) or {}
 
 
+def _plan_section_for_title(plan: dict[str, Any], title: str) -> str:
+    """The section the plan's item of this TITLE names, or "" when it does not resolve.
+
+    The title is the only join that exists: `create_plan_children` keeps no plan key on
+    the work-order row and `work_orders` has no `plan_key` column.
+
+    EXACT AND UNIQUE, on the user's ruling on Neo question 1690. No normalisation, no
+    prefix, no fuzzy comparison, and two plan children of one title resolve to nothing —
+    a near-match writes the WRONG section into a column four readers trust, and the
+    assumption reviewer then cites it as authority. Nothing is the behaviour of today,
+    which is merely unhelpful.
+    """
+    if not title:
+        return ""
+    found = [str(c.get("spec_section") or "").strip()
+             for c in (plan.get("children") or [])
+             if isinstance(c, dict) and str(c.get("title") or "") == title]
+    return found[0] if len(found) == 1 else ""
+
+
 def spec_of(store: ProjectStore, wo: dict[str, Any]) -> dict[str, str] | None:
     """This work order's spec, section included, or None.
 
@@ -166,6 +186,10 @@ def spec_of(store: ProjectStore, wo: dict[str, Any]) -> dict[str, str] | None:
     extracted section, "" when it does not resolve).
 
     A planner or a manager has no section of its own: both own the whole feature.
+
+    An empty `work_orders.spec_section` falls back to the parent plan's item and HEALS the
+    row, so the four readers and the row itself cannot disagree. Spec §2.1 of
+    docs/superpowers/specs/2026-10-13-an-assumption-review-payload-carries-its-spec-section.md
     """
     if not wo.get("parent_id") or wo.get("kind") in ("planner", "manager"):
         return None
@@ -175,6 +199,10 @@ def spec_of(store: ProjectStore, wo: dict[str, Any]) -> dict[str, str] | None:
     if not (content and repo_path):
         return None
     which = str(wo.get("spec_section") or "").strip()
+    if not which:
+        which = _plan_section_for_title(plan, str(wo.get("title") or ""))
+        if which:
+            store.adopt_spec_section(str(wo["id"]), which)
     text = sections.extract_section(content, which) if which else None
     return {"repo_path": repo_path, "content": content,
             "section": which, "section_text": (text or "").strip()}

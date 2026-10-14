@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -295,6 +296,121 @@ def test_a_changed_binary_file_does_not_break_the_boundary_rule(env):
     assert cut.diff == added + modified
     assert "a_img.png" not in cut.dropped_files
     assert set(cut.dropped_files) == {f"z{i}.py" for i in range(6)}
+
+
+# ------------------------------------------------------- the hunk-level trim (confirm)
+#
+# docs/superpowers/specs/2026-10-13-a-confirmation-question-with-a-zero-character-diff.md
+# part 2. A SECOND trim, beside `_truncate` and never instead of it: the confirmation
+# budget is 12,000 chars, where one file bigger than the whole budget means the
+# all-or-nothing file rule delivers zero of N characters.
+
+HUNK_MARKER = re.compile(r"\[(\d+) more hunk\(s\) of ([^\]]+) not shown\]")
+
+
+def _hunks(path: str, n: int, lines: int = 3) -> str:
+    """One `diff --git` section with `n` whole `@@` hunks."""
+    head = (f"diff --git a/{path} b/{path}\n"
+            f"index 1111111..2222222 100644\n--- a/{path}\n+++ b/{path}\n")
+    body = "".join(f"@@ -{10 * i},{lines} +{10 * i},{lines} @@\n"
+                   + "".join(f"+{path} hunk {i} line {j}\n" for j in range(lines))
+                   for i in range(n))
+    return head + body
+
+
+def _binary(path: str) -> str:
+    return (f"diff --git a/{path} b/{path}\n"
+            f"index 1111111..2222222 100644\n"
+            f"Binary files a/{path} and b/{path} differ\n")
+
+
+def test_the_hunk_trim_keeps_whole_sections_while_they_fit():
+    a, b = _hunks("a.py", 4), _hunks("b.py", 4)
+    files = ("a.py", "b.py")
+
+    whole = evidence._truncate_hunks(a + b, len(a + b), files)
+    assert whole == (a + b, False, (), ())
+
+    kept, cut, dropped, partial = evidence._truncate_hunks(a + b, len(a), files)
+    assert (kept, cut, dropped, partial) == (a, True, ("b.py",), ())
+
+
+def test_the_first_section_that_does_not_fit_is_kept_hunk_by_hunk():
+    """The whole point: a file over the budget delivers the hunks that fit, not zero
+    characters, and the cut lands on a hunk boundary."""
+    a, b = _hunks("a.py", 10), _hunks("b.py", 2)
+    limit = len(a) // 2
+
+    kept, cut, dropped, partial = evidence._truncate_hunks(a + b, limit,
+                                                           ("a.py", "b.py"))
+
+    assert cut and partial == ("a.py",) and dropped == ("b.py",)
+    assert len(kept) <= limit
+    assert kept.startswith("diff --git a/a.py b/a.py\n")
+    (marker,) = HUNK_MARKER.findall(kept)
+    omitted, named = int(marker[0]), marker[1]
+    shown = kept.count("@@ -")
+    assert named == "a.py" and shown + omitted == 10 and 0 < shown < 10
+    assert kept.rstrip("\n").endswith("not shown]")
+    # NO MID-HUNK CUT: every kept hunk is byte-identical to the one in the collection.
+    for i in range(shown):
+        assert f"+a.py hunk {i} line 2\n" in kept
+    assert f"+a.py hunk {shown} line 0\n" not in kept
+    assert "b.py" not in kept
+
+
+def test_a_section_after_the_partial_one_is_dropped_even_when_it_would_fit():
+    """`_truncate`'s rule, kept word for word: a diff whose section order no longer
+    matches the repository reads as complete and is not."""
+    a, tiny = _hunks("a.py", 10), _hunks("tiny.py", 1)
+    kept, _, dropped, partial = evidence._truncate_hunks(
+        a + tiny, len(a) // 2, ("a.py", "tiny.py"))
+
+    assert partial == ("a.py",) and dropped == ("tiny.py",)
+    assert "tiny.py" not in kept
+
+
+def test_a_binary_section_is_dropped_whole_and_never_reported_as_partial():
+    """A binary section carries no `@@` hunk, so it has no hunk to keep."""
+    big, png = _hunks("a.py", 2), _binary("img.png")
+    kept, cut, dropped, partial = evidence._truncate_hunks(
+        png + big, len(png) - 10, ("img.png", "a.py"))
+
+    assert partial == ()
+    assert dropped == ("img.png", "a.py")
+    assert kept == ""
+
+
+def test_nothing_fits_at_all_and_the_trim_keeps_no_character():
+    """Part 3's case: the collection handed over a diff and the trim kept none of it."""
+    a, b = _hunks("a.py", 10), _hunks("b.py", 10)
+    kept, cut, dropped, partial = evidence._truncate_hunks(a + b, 1, ("a.py", "b.py"))
+
+    assert (kept, cut, partial) == ("", True, ())
+    assert dropped == ("a.py", "b.py")
+
+
+def test_the_partial_file_is_named_the_way_the_file_list_names_it():
+    """`_truncate`'s path rule verbatim: prefer the name `files` knows."""
+    renamed = _hunks("old.py", 10).replace("diff --git a/old.py b/old.py",
+                                           "diff --git a/old.py b/\"new .py\"")
+    _, _, _, partial = evidence._truncate_hunks(renamed, len(renamed) // 2,
+                                                ("old.py",))
+    assert partial == ("old.py",)
+
+
+def test_the_panel_trim_still_drops_whole_files_at_its_own_budget(env):
+    """Invariant 1: `_truncate` is unchanged, so `collect_work_order` keeps the
+    all-or-nothing file rule and no section is ever delivered in part."""
+    for i in range(12):
+        (env.worktree / f"f{i:02d}.py").write_text(_body(f"f{i}", 60))
+    _git(env.worktree, "add", "-A")
+
+    cut = env.collect(diff_chars=4000)
+    assert cut.diff_truncated and cut.dropped_files
+    assert not HUNK_MARKER.search(cut.diff)
+    for path, text in _headers(cut.diff).items():
+        assert text == _git(env.worktree, "diff", "HEAD", "--", path)
 
 
 # --------------------------------------------------------------------- the merge base

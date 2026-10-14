@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -567,12 +568,18 @@ class Violation:
     #: or it can never be acked down (spec
     #: docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md §1).
     owed: str = ""
+    #: DEDUPE IDENTITY for a violation that is not about a work order — a feature order,
+    #: say. Carried separately from `wo_id` precisely because `wo_id` also ROUTES:
+    #: attention flags, timeline events and the notification key on it (spec
+    #: docs/superpowers/specs/2026-10-13-an-assumption-review-payload-carries-its-spec-section.md
+    #: §2.3, Neo 1695).
+    subject_id: str | None = None
 
     @property
     def key(self) -> tuple[str, str | None]:
-        """Identity for dedupe: the same invariant failing on the same work order is
-        one standing problem, however many ticks it survives."""
-        return (self.invariant, self.wo_id)
+        """Identity for dedupe: the same invariant failing on the same SUBJECT is one
+        standing problem, however many ticks it survives."""
+        return (self.invariant, self.subject_id or self.wo_id)
 
     def __str__(self) -> str:
         where = f"{self.wo_id}: " if self.wo_id else ""
@@ -5145,6 +5152,89 @@ def check_default_branch_green(store: ProjectStore) -> Iterator[Violation]:
     )
 
 
+#: How many feature orders the pointer check reads. `list_feature_orders` caps at 200 by
+#: default and the predicate is over EVERY row a project has ever had.
+SPEC_POINTER_ROWS = 100000
+
+INV_SPEC_POINTER_REAL = "INV-SPEC-POINTER-REAL"
+
+
+def check_spec_pointer_resolves(store: ProjectStore) -> Iterator[Violation]:
+    """INV-SPEC-POINTER-REAL — a plan's `design_doc` names a file that is really there.
+
+    `plan["design_doc"]` is what `specs.spec_link` renders on `jarvis wo show` and the
+    work order's page, and what `ops.spec_section` is given. `spec_of` resolves TEXT from
+    `plan["design_doc_content"]`, a snapshot, so a pointer that opens nothing keeps every
+    reader working and is invisible until somebody tries to OPEN the document — which is
+    what fo-69ba1cc4 did. Nothing reported it: the only guard scans TRACKED FILES
+    (tests/test_spec_location.py), and a dead pointer lives in a database row
+    (kn-ba3945bf, kn-818facbf).
+
+    Settled features included, on `check_work_lands`' reasoning: hiding drops a record
+    from listings, it does not mean the record may go on saying something untrue.
+
+    The repair is by BASENAME and is generic on purpose. A literal rewrite from the legacy
+    prefix to the canonical one would fix the rows that exist today and nothing else — not
+    a spec renamed, not one moved within the canonical directory, not a project whose
+    specs live elsewhere. Exactly one tracked file of that basename is repointed; zero or
+    more than one owes the user a decision. Spec §2.3 of
+    docs/superpowers/specs/2026-10-13-an-assumption-review-payload-carries-its-spec-section.md
+    """
+    for fo in store.list_feature_orders(statuses=None, kind=None,
+                                        limit=SPEC_POINTER_ROWS):
+        plan = db.from_json(fo.get("plan"), {}) or {}
+        doc = str(plan.get("design_doc") or "").strip()
+        if not doc or (store.project_path / doc).exists():
+            continue
+        fo_id = fo["id"]
+        matches = _tracked_with_basename(store.project_path, Path(doc).name)
+        detail = (f"feature order {fo_id} stores its design document at `{doc}`, and no "
+                  f"file is there. `jarvis fo show {fo_id}` and the work order pages "
+                  f"under it render that path, and `jarvis spec section {doc} <n>` reads "
+                  f"from disk — the plan's snapshot keeps every other reader working, "
+                  f"which is why nothing noticed.")
+        if len(matches) == 1:
+            plan["design_doc"] = matches[0]
+            store.update_feature_order(fo_id, plan=db.to_json(plan))
+            yield Violation(
+                invariant=INV_SPEC_POINTER_REAL,
+                detail=detail,
+                repaired=True,
+                repair=f"repointed {fo_id}'s design_doc to {matches[0]}",
+                subject_id=fo_id,       # per-feature dedupe identity — spec §2.3
+                context={"fo_id": fo_id, "was": doc, "now": matches[0]},
+            )
+            continue
+        # NO elapsed time and nothing that changes tick to tick, or the item can never be
+        # acked down — `Violation.owed`'s rule.
+        where = (f"{len(matches)} tracked files carry that name: "
+                 f"{', '.join(matches[:10])}" if matches
+                 else "no tracked file carries that name")
+        owed = (f"{detail} {where}, so which document this feature was planned against "
+                f"is a decision: move or rename the file so the stored path opens, or "
+                f"cancel the feature with `jarvis fo cancel {fo_id}`.")
+        yield Violation(
+            invariant=INV_SPEC_POINTER_REAL,
+            detail=owed,
+            owed=owed,
+            subject_id=fo_id,           # per-feature dedupe identity — spec §2.3
+            context={"fo_id": fo_id, "was": doc, "matches": matches[:10]},
+        )
+
+
+def _tracked_with_basename(root: Path, name: str) -> list[str]:
+    """Repo-relative paths of tracked files called `name` — the database half of the
+    tracked-file guard, so it asks `git` the same question."""
+    try:
+        out = subprocess.run(["git", "ls-files", "-z"], cwd=str(root),
+                             capture_output=True, text=True, check=False)
+    except OSError:
+        return []
+    if out.returncode != 0:
+        return []
+    return sorted(p for p in out.stdout.split("\0") if p and Path(p).name == name)
+
+
 INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_default_branch_green,    # first and order-free: a pure read of the central
                                    # reading, repairing nothing and touching no flag any
@@ -5228,6 +5318,11 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
 #: waiting for the answer, and the answer is the point of the command.
 SLOW_INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_work_lands,
+    check_spec_pointer_resolves,  # both properties of this class and neither of the fast
+                                  # one: its population is every feature order a project
+                                  # has ever had, and its repair lists the whole
+                                  # repository to answer a question about a document that
+                                  # changes when somebody MOVES A FILE
 )
 
 
@@ -5274,7 +5369,10 @@ class _ReadOnly:
                 "close_validation_round",
                 # INV-FEATURE-FALSE-FAILURE's. Ditto: reporting that a feature is wrongly
                 # failed must not be the thing that un-fails it.
-                "set_feature_status", "clear_feature_attention")
+                "set_feature_status", "clear_feature_attention",
+                # INV-SPEC-POINTER-REAL's. A read-only doctor run must not rewrite a plan
+                # before the user has agreed to let it touch anything.
+                "update_feature_order")
 
     #: How a checker asks "am I allowed to change anything?". Needed by
     #: `check_envelopes_move`, whose repair also writes to the CENTRAL store — a proxy
