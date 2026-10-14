@@ -5170,6 +5170,13 @@ def check_spec_pointer_resolves(store: ProjectStore) -> Iterator[Violation]:
     (tests/test_spec_location.py), and a dead pointer lives in a database row
     (kn-ba3945bf, kn-818facbf).
 
+    THE ORACLE IS THE COMMITTED REF, never this checkout:
+    docs/superpowers/specs/2026-10-14-inv-spec-pointer-real-reads-the-integration-branch.md.
+    `.exists()` made the verdict a fact about whether somebody had pulled — a false
+    violation for fo-f02d33af, whose spec was on `origin/main` — and hid the mirror case,
+    a pointer that opens only because an uncommitted file sits in one person's tree. A row
+    the ladder cannot answer for yields nothing at all (§2.4).
+
     Settled features included, on `check_work_lands`' reasoning: hiding drops a record
     from listings, it does not mean the record may go on saying something untrue.
 
@@ -5180,14 +5187,22 @@ def check_spec_pointer_resolves(store: ProjectStore) -> Iterator[Violation]:
     more than one owes the user a decision. Spec §2.3 of
     docs/superpowers/specs/2026-10-13-an-assumption-review-payload-carries-its-spec-section.md
     """
+    from . import landing
+
+    # One memo for the whole sweep: the remote is refreshed at most once — spec §2.2.
+    fetched: set[str] = set()
     for fo in store.list_feature_orders(statuses=None, kind=None,
                                         limit=SPEC_POINTER_ROWS):
         plan = db.from_json(fo.get("plan"), {}) or {}
         doc = str(plan.get("design_doc") or "").strip()
-        if not doc or (store.project_path / doc).exists():
+        if not doc:
+            continue
+        found = landing.committed_exists(store.project_path, _planner_row(store, fo),
+                                         doc, fetched)
+        if found is None or found.present:
             continue
         fo_id = fo["id"]
-        matches = _tracked_with_basename(store.project_path, Path(doc).name)
+        matches = _tracked_with_basename(found.repo, found.ref, Path(doc).name)
         detail = (f"feature order {fo_id} stores its design document at `{doc}`, and no "
                   f"file is there. `jarvis fo show {fo_id}` and the work order pages "
                   f"under it render that path, and `jarvis spec section {doc} <n>` reads "
@@ -5222,12 +5237,25 @@ def check_spec_pointer_resolves(store: ProjectStore) -> Iterator[Violation]:
         )
 
 
-def _tracked_with_basename(root: Path, name: str) -> list[str]:
-    """Repo-relative paths of tracked files called `name` — the database half of the
-    tracked-file guard, so it asks `git` the same question."""
+def _planner_row(store: ProjectStore, fo: dict[str, Any]) -> dict[str, Any] | None:
+    """The feature's planner row, for the ladder's first rung.
+
+    `ops._planner_work_order`'s query, deliberately re-stated rather than imported: this
+    module must not depend on `ops`.
+    """
+    if not fo.get("plan_wo_id"):
+        return None
+    return store.get_work_order(fo["plan_wo_id"])
+
+
+def _tracked_with_basename(root: Path, ref: str, name: str) -> list[str]:
+    """Paths called `name` ON `ref` — the same ref the existence question was answered
+    from, because the single-match branch WRITES the answer back. Spec §2.3 of
+    docs/superpowers/specs/2026-10-14-inv-spec-pointer-real-reads-the-integration-branch.md
+    """
     try:
-        out = subprocess.run(["git", "ls-files", "-z"], cwd=str(root),
-                             capture_output=True, text=True, check=False)
+        out = subprocess.run(["git", "ls-tree", "-r", "--name-only", "-z", ref],
+                             cwd=str(root), capture_output=True, text=True, check=False)
     except OSError:
         return []
     if out.returncode != 0:
