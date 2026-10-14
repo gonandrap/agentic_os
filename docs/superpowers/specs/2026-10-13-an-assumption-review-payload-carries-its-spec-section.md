@@ -272,6 +272,18 @@ doctor` runs before the user has agreed to let it touch anything — would rewri
 `update_feature_order` to `_BLOCKED`; the `Violation` still claims `repaired=True`, which is that
 proxy's documented contract (`invariants.py:5260-5263`).
 
+**Each dead pointer is its OWN standing violation (Neo 1695).** This check is FEATURE-level: it
+yields `wo_id=None`, so a dedupe key of `(invariant, wo_id)` collapsed N dead pointers into one
+problem — fix the first feature and the rest stay silent. `Violation` gains an additive
+`subject_id`, set to the `fo_id` on both yields, and `key` returns
+`(invariant, subject_id or wo_id)`: same invariant, same SUBJECT, one standing problem. It is NOT
+`wo_id` itself, because `wo_id` also ROUTES — a feature id there makes `routed` true, the
+`get_work_order` lookup miss raises no flag, and the `not routed` guard then suppresses the
+notification, i.e. total silence, the defect issue 1034 exists to end. The DURABLE identity is the
+`violation_reports` row, so `Daemon.check_invariants` passes `v.key[1]` to
+`open_violation_report` (everything else in that loop keeps `v.wo_id`); `close_violation_reports`
+already consumes `v.key`.
+
 **What (C) does NOT fix.** It repairs the citable POINTER only. `spec_of` resolves text from
 `plan["design_doc_content"]`, a snapshot, and keeps working whether the pointer resolves or not.
 (A) and (B) fix the evidence; (C) fixes the citation.

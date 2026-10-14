@@ -568,12 +568,18 @@ class Violation:
     #: or it can never be acked down (spec
     #: docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md §1).
     owed: str = ""
+    #: DEDUPE IDENTITY for a violation that is not about a work order — a feature order,
+    #: say. Carried separately from `wo_id` precisely because `wo_id` also ROUTES:
+    #: attention flags, timeline events and the notification key on it (spec
+    #: docs/superpowers/specs/2026-10-13-an-assumption-review-payload-carries-its-spec-section.md
+    #: §2.3, Neo 1695).
+    subject_id: str | None = None
 
     @property
     def key(self) -> tuple[str, str | None]:
-        """Identity for dedupe: the same invariant failing on the same work order is
-        one standing problem, however many ticks it survives."""
-        return (self.invariant, self.wo_id)
+        """Identity for dedupe: the same invariant failing on the same SUBJECT is one
+        standing problem, however many ticks it survives."""
+        return (self.invariant, self.subject_id or self.wo_id)
 
     def __str__(self) -> str:
         where = f"{self.wo_id}: " if self.wo_id else ""
@@ -5195,6 +5201,7 @@ def check_spec_pointer_resolves(store: ProjectStore) -> Iterator[Violation]:
                 detail=detail,
                 repaired=True,
                 repair=f"repointed {fo_id}'s design_doc to {matches[0]}",
+                subject_id=fo_id,       # per-feature dedupe identity — spec §2.3
                 context={"fo_id": fo_id, "was": doc, "now": matches[0]},
             )
             continue
@@ -5210,6 +5217,7 @@ def check_spec_pointer_resolves(store: ProjectStore) -> Iterator[Violation]:
             invariant=INV_SPEC_POINTER_REAL,
             detail=owed,
             owed=owed,
+            subject_id=fo_id,           # per-feature dedupe identity — spec §2.3
             context={"fo_id": fo_id, "was": doc, "matches": matches[:10]},
         )
 
