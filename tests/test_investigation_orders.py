@@ -1360,6 +1360,24 @@ def test_the_prompt_names_the_four_classifications_and_what_it_cannot_file(
     assert str(verdicts.MIN_QUOTE_CHARS) in prompt
 
 
+def test_the_gap_bullet_does_not_require_a_stuck_subject(store, project_spec):
+    """A designed wait the sweep investigates anyway is a GAP: the subject is not stuck,
+    so requiring a stuck subject pushed the sweep's own false positives to TRANSIENT."""
+    prompt = _prompt(store, "investigator", project_spec)
+    gap_bullet = next(
+        line for line in prompt.splitlines() if line.startswith("- **GAP**"))
+
+    assert "the subject is stuck because of it" not in gap_bullet
+    assert "kn-4fb740a9" in gap_bullet
+    assert "designed wait" in gap_bullet.lower()
+    # The two sentences about filing stay verbatim.
+    assert "Name the bug to file in `proposed_fix`." in gap_bullet
+    assert ("THE OS FILES IT, expedited, after its own duplicate search — which is why "
+            "you do not file it and cannot.") in gap_bullet
+    # kn-4fb740a9 carries the scope warning and the precedent; the prompt must not.
+    assert "1009" not in gap_bullet and "1020" not in gap_bullet
+
+
 def test_every_write_the_prompt_promises_clears_the_hook(store, project_spec):
     """#905: the hook's allow list pinned to the CONTRACT's list, derived from the
     prompt, so a fifth write fails here instead of silently being unreachable."""
