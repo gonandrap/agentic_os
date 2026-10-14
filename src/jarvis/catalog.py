@@ -1601,6 +1601,35 @@ class RemedyConfig:
     allowed: tuple[str, ...] = ()
 
 
+#: How many samples a median in the evolution report needs before it is reported as one
+#: (§9 of docs/superpowers/specs/2026-09-27-self-evolution.md). A median over fewer than
+#: three samples is one sample wearing a statistic's name.
+DEFAULT_EVOLUTION_MIN_SAMPLES = 3
+
+
+@dataclass
+class EvolutionConfig:
+    """What the §9 evolution report needs before it believes its own numbers.
+    docs/superpowers/specs/2026-09-27-self-evolution.md.
+
+    `min_samples` is the floor under every median the report prints. Not a module
+    constant in `ops` because how much history a project needs before it trusts its
+    medians is a judgement about that project, and the report's notes say "fewer than N"
+    — so the N a reader is shown and the N the report applied are one value, read once.
+
+    Its own section rather than `rules.min_samples`: `rules` is the off switch for the
+    EVALUATION pass (§5.2) and the floor governs a READ of history that runs whether or
+    not the pass is armed. Neo (q1575) said `evolution.min_samples`, this work order
+    shipped `rules.min_samples`, and the user overruled that — so later §9 tunables land
+    here beside it, and `rules` keeps only what arms a rule.
+
+    Per project as well as fleet-wide, with `_parse_inspect`'s field-level inheritance
+    (`_parse_evolution`): a project naming one key keeps the OS answer for the rest.
+    """
+
+    min_samples: int = DEFAULT_EVOLUTION_MIN_SAMPLES
+
+
 @dataclass
 class RulesConfig:
     """Whether the self-evolution registry is EVALUATED at all. §5.2 of
@@ -1614,9 +1643,13 @@ class RulesConfig:
     between "no rule has ever matched" and "nothing has ever looked".
 
     Per project as well as fleet-wide, with `_parse_inspect`'s field-level inheritance
-    (`_parse_rules`): a project that names one key keeps the OS answer for the rest. One
-    field today, and the shape is the house one so the arming threshold and the remedy
-    allow-list §6 adds do not arrive as a second config object.
+    (`_parse_rules`): a project that names one key keeps the OS answer for the rest. The
+    shape is the house one so the arming threshold and the remedy allow-list §6 adds do
+    not arrive as a second config object.
+
+    What does NOT belong here is §9's reporting floor: it was `rules.min_samples` and the
+    user reversed that, so it is `EvolutionConfig.min_samples`. This section is about
+    arming rules, not about reading their history.
     """
 
     enabled: bool = False
@@ -1696,6 +1729,7 @@ class ProjectSpec:
     concision: ConcisionConfig = field(default_factory=ConcisionConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     rules: RulesConfig = field(default_factory=RulesConfig)
+    evolution: EvolutionConfig = field(default_factory=EvolutionConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
     bugs: BugsConfig = field(default_factory=BugsConfig)
     release: ReleaseConfig = field(default_factory=ReleaseConfig)
@@ -1835,6 +1869,7 @@ class OsConfig:
     concision: ConcisionConfig = field(default_factory=ConcisionConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     rules: RulesConfig = field(default_factory=RulesConfig)
+    evolution: EvolutionConfig = field(default_factory=EvolutionConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
     bugs: BugsConfig = field(default_factory=BugsConfig)
     release: ReleaseConfig = field(default_factory=ReleaseConfig)
@@ -2530,13 +2565,31 @@ def _parse_rules(raw: Any, base: RulesConfig | None = None,
                  where: str = "os.rules") -> RulesConfig:
     """`os.rules`, or a project's override of it — field-level, like `_parse_inspect`.
 
-    Nothing to validate beyond the shape: one boolean, whose default is the shipped
-    `False` when neither the fleet nor the project names it.
+    `enabled` needs no validation: a boolean whose default is the shipped `False` when
+    neither the fleet nor the project names it.
     """
     base = base or RulesConfig()
     if not isinstance(raw, dict):
         raise _err(f'"{where}" must be an object')
     return RulesConfig(enabled=bool(raw.get("enabled", base.enabled)))
+
+
+def _parse_evolution(raw: Any, base: EvolutionConfig | None = None,
+                     where: str = "os.evolution") -> EvolutionConfig:
+    """`os.evolution`, or a project's override of it — field-level, like `_parse_inspect`.
+
+    `min_samples` is validated the way `_parse_concision` refuses a negative cap: 1 is
+    the floor, because a "median" over zero samples is not a statistic that could be
+    computed at all, and the report's own note promises the reader a number of samples it
+    waited for.
+    """
+    base = base or EvolutionConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    min_samples = int(raw.get("min_samples", base.min_samples))
+    if min_samples < 1:
+        raise _err(f"{where}.min_samples must be 1 or more, got {min_samples}")
+    return EvolutionConfig(min_samples=min_samples)
 
 
 def _parse_concision(raw: Any, base: ConcisionConfig | None = None,
@@ -2957,6 +3010,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         concision=_parse_concision(os_raw.get("concision", {})),
         supervisor=_parse_supervisor(os_raw.get("supervisor", {})),
         rules=_parse_rules(os_raw.get("rules", {})),
+        evolution=_parse_evolution(os_raw.get("evolution", {})),
         messaging=_parse_messaging(os_raw.get("messaging", {})),
         bugs=_parse_bugs(os_raw.get("bugs", {})),
         release=_parse_release(os_raw.get("release", {})),
@@ -3123,6 +3177,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         rules_cfg = _parse_rules(
             p.get("rules", {}), base=os_cfg.rules,
             where=f"projects[{i}] ({name}).rules")
+        evolution_cfg = _parse_evolution(
+            p.get("evolution", {}), base=os_cfg.evolution,
+            where=f"projects[{i}] ({name}).evolution")
         messaging_cfg = _parse_messaging(
             p.get("messaging", {}), base=os_cfg.messaging,
             where=f"projects[{i}] ({name}).messaging")
@@ -3161,6 +3218,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 concision=concision_cfg,
                 supervisor=supervisor_cfg,
                 rules=rules_cfg,
+                evolution=evolution_cfg,
                 messaging=messaging_cfg,
                 bugs=bugs_cfg,
                 release=release_cfg,
