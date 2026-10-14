@@ -1046,9 +1046,14 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "# The four classifications",
         "A classification is a decision about THE SUBJECT, not about the codebase in "
         "general. Exactly one:",
-        "- **GAP** — the OS is missing a mechanism, and the subject is stuck because of "
-        "it. Name the bug to file in `proposed_fix`. THE OS FILES IT, expedited, after "
-        "its own duplicate search — which is why you do not file it and cannot.",
+        # kn-4fb740a9: a stuck subject is the common case, never the test.
+        "- **GAP** — the OS is missing a mechanism. A stuck subject is the common case, "
+        "not the test: a DESIGNED WAIT the sweep investigated anyway is a GAP too, where "
+        "the missing mechanism is an `excluded_cause` on the SWEEP — plus the discount of "
+        "held seconds wherever the status is judged on time in status — and the stuck "
+        "entity is the sweep, not the subject (`kn-4fb740a9`). Name the bug to file in "
+        "`proposed_fix`. THE OS FILES IT, expedited, after its own duplicate search — "
+        "which is why you do not file it and cannot.",
         "- **WAITING_ON_USER** — nothing is broken; a person owes a decision. Name it BY "
         "ID in `user_owes`: the assumption, the gate, the Neo question. This is the ONE "
         "classification that spends the user's attention.",
