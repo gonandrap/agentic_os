@@ -555,17 +555,11 @@ DEFAULT_VALIDATION_DIFF_CHARS = 150000
 # docs/superpowers/specs/2026-09-28-an-assumption-review-reads-the-orders-own-rulings.md
 DEFAULT_VALIDATION_DECISION_RECORD_CHARS = 6000
 
-# Characters of SPEC SECTION one assumption-review packet may carry — the brief a child
-# work order was told to implement. Not 150000 (that number buys a five-seat SHARED cached
-# prefix; this call is uncached and per assumption) and not the worker prompt's 20,000
-# (that rides in a system prompt built once per turn and cached). 12,000 is the right
-# economics and its reasoning transfers: that cap puts a whole rendered question at ~17-18K
-# chars, and this packet is ~10-12K today, so 6,000 keeps one section from more than
-# doubling it — and equals the decision record's cap, the other evidence block in the same
-# prompt. The section whose absence caused the escalation is ~1,900 characters. The
-# fleet-wide distribution of section lengths is NOT measured, which is why this is a key
-# and not a literal. Spec §2.2:
-# docs/superpowers/specs/2026-10-13-an-assumption-review-payload-carries-its-spec-section.md
+# Characters of SPEC SECTION the same packet may carry — the authority an assumption cites
+# when it says "per the spec", absent until GitHub issue #1035. `decision_record_chars`'s
+# number because it is the same packet, the same uncached per-assumption call and the other
+# authority block beside the record; well under `confirm_diff_chars` because a section is
+# prose a planner wrote, not a diff.
 DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS = 6000
 
 # Truncation limit for the diff ONE CONFIRMATION QUESTION carries, and it is not the
@@ -651,6 +645,7 @@ class ValidationConfig:
     red_ci_returns: int = DEFAULT_VALIDATION_RED_CI_RETURNS
     diff_chars: int = DEFAULT_VALIDATION_DIFF_CHARS
     decision_record_chars: int = DEFAULT_VALIDATION_DECISION_RECORD_CHARS
+    # GitHub issue #1035: the spec section an assumption review reads.
     assumption_spec_chars: int = DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS
     confirm_diff_chars: int = DEFAULT_VALIDATION_CONFIRM_DIFF_CHARS
     # Whether a FEATURE order validates as a whole once its children are done, which is

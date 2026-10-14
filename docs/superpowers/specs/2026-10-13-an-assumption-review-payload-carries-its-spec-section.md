@@ -76,7 +76,8 @@ pointer is checked rather than assumed.
 ## 2. The fix
 
 Three independent parts. (A) and (B) together close the escalation; (C) closes the pointer defect,
-which is what makes the cite line in (B) openable.
+which is what makes the cite line in (B) openable. **(B) is SUPERSEDED — it shipped from main, not
+from here; see the note in §2.2.**
 
 ### 2.1 (A) `specs.spec_of` gains a fallback and a heal
 
@@ -125,6 +126,12 @@ only the daemon passes) re-creates the disagreement the single lookup exists to 
 "a planner has no section of its own" (`specs.py:170`, `specs.py:186-189`).
 
 ### 2.2 (B) The payload carries the section, bounded
+
+> **Superseded.** (B) landed on main via PR #1036 (issue #1035) while this branch was open — same
+> catalog key `validation.assumption_spec_chars`, same 6000 default. This branch keeps that
+> implementation; it did not ship from here. Main's version also covers `propose_confirmation`, so
+> the `_confirm_question` follow-up named in §2.6 is closed by it. Text below is kept for the
+> reasoning, not as a description of unshipped work.
 
 `_ruling_question` gains one block, built from the `spec_of` dict `propose` already has a `store`
 to fetch:

@@ -2075,18 +2075,6 @@ class FakeStore:
         pass
 
 
-class SpecStore(FakeStore):
-    """`FakeStore` plus the one read `specs.spec_of` makes: the parent's stored plan."""
-
-    DOC = ("# Self-evolution\n\n## 7.1 Rules\n\nelsewhere\n\n## 7.2 The precheck\n\n"
-           "the four conditions `rules.precheck` must satisfy\n\n## 7.3 Next\n\nafter\n")
-
-    def get_feature_order(self, fo_id: str) -> dict:
-        return {"id": fo_id, "plan": json.dumps(
-            {"design_doc": SPEC_PATH, "design_doc_content": self.DOC,
-             "children": [{"title": "Build the precheck", "spec_section": "7.2"}]})}
-
-
 def record(*rows: dict, messages: tuple[dict, ...] = (), siblings=None,
            others: tuple[dict, ...] = (), ruling_on=None, window: int | None = None,
            **kw) -> str:
@@ -2396,121 +2384,124 @@ def test_the_projects_own_cap_reaches_the_packet_both_passes_build():
         assert "ruling 4" not in packet
 
 
-# -- the payload carries the spec section -----------------------------------------------
-#
-# §2.2 of
-# docs/superpowers/specs/2026-10-13-an-assumption-review-payload-carries-its-spec-section.md
-# A child work order is briefed by one section of its feature's spec and
-# its description is only the margin around it. Assumption #1 of wo-ab6c309d escalated
-# `evidence-insufficient` saying it could not see the section the OS already owned.
-
-SPEC_HEADER = "# The spec section this work order was told to implement"
-SPEC_PATH = "docs/superpowers/specs/2026-09-27-self-evolution.md"
+# -- the spec section the assumption cites (GitHub issue #1035) -------------------------
 
 
-def spec(**over) -> dict:
-    return {"repo_path": SPEC_PATH, "content": "the whole document", "section": "7.2",
-            "section_text": "The four conditions `rules.precheck` must satisfy.", **over}
+SPEC_BODY = ("## 2. The remedy\n\nA worker that cannot reach the bus retries three "
+             "times and then parks.")
+SPEC_DOC = f"# Design\n\n## 1. Why\n\nBecause.\n\n{SPEC_BODY}\n\n## 3. Later\n\nNo.\n"
+CHILD = {"id": "wo-1", "status": "needs_review", "title": "t", "description": "d",
+         "parent_id": "fo-1", "kind": "child", "spec_section": "2. The remedy"}
 
 
-def ruling(**kw) -> str:
-    return autoreview._ruling_question(   # noqa: SLF001
-        "p", WO, assumption(), [], **kw)
+class SpecStore(FakeStore):
+    """`specs.spec_of`'s one read — the parent feature's stored plan. No database: the
+    packet builders must resolve the spec with the store they already hold."""
+
+    def __init__(self, *messages: dict, doc: str = SPEC_DOC,
+                 path: str = "docs/superpowers/specs/2026-10-13-bus.md"):
+        super().__init__(*messages)
+        self.plan = json.dumps({"design_doc": path, "design_doc_content": doc})
+
+    def get_feature_order(self, fo_id: str) -> dict:
+        return {"id": fo_id, "plan": self.plan}
 
 
-def test_the_spec_section_reaches_the_packet_with_the_panels_own_cite_line():
-    """The cite line is `evidence._spec_ref`'s format verbatim, so the two seats cannot
-    describe the same section differently."""
-    out = ruling(spec=spec())
-
-    assert SPEC_HEADER in out
-    assert f"{SPEC_PATH} § 7.2" in out
-    assert "The four conditions `rules.precheck` must satisfy." in out
+SPEC_HEADER = "# THE SPEC SECTION THIS WORK ORDER WAS BUILT TO"
 
 
-def test_the_spec_block_sits_between_the_brief_and_the_delivered_block():
-    """The description is the margin around the section; the two are one brief. The
-    decision record stays last."""
-    out = ruling(spec=spec())
-
-    assert out.index("# The work order it was recorded against") < out.index(SPEC_HEADER)
-    assert out.index(SPEC_HEADER) < out.index("# What the worker says it delivered")
-    assert out.index(SPEC_HEADER) < out.index(RECORD_HEADER)
-
-
-@pytest.mark.parametrize("missing", [None, {"repo_path": SPEC_PATH, "section": "7.2",
-                                            "content": "d", "section_text": ""}])
-def test_no_block_at_all_when_there_is_no_resolved_section(missing):
-    """A heading over `(none)` would tell the reviewer a spec exists and was withheld,
-    which is the opposite of true — and a case the persona escalates."""
-    out = ruling(spec=missing)
-
-    assert SPEC_HEADER not in out
-    assert SPEC_PATH not in out
+def builds(store, cfg=None):
+    """Both passes, each as a one-argument builder over a fresh `FakeNeo`."""
+    return (
+        lambda neo_: autoreview.propose(store, neo_, "p", CHILD, assumption(),
+                                        [assumption()], cfg=cfg),
+        lambda neo_: autoreview.propose_confirmation(store, neo_, "p", CHILD,
+                                                     assumption(), [assumption()],
+                                                     cfg=cfg),
+    )
 
 
-def test_a_section_over_the_budget_keeps_its_head_cuts_on_a_line_and_states_the_count():
-    """kn-e06ff4e6: an all-or-nothing unit over a small budget delivers zero of N
-    characters, and the reviewer escalates for exactly the reason this block exists."""
-    body = "\n".join(f"line {i} " + "x" * 90 for i in range(60))
-
-    block = autoreview._spec_block(spec(section_text=body), 600)   # noqa: SLF001
-
-    lines = block.splitlines()
-    head = "\n".join(lines[3:-1])
-    assert head and head in body
-    assert head.splitlines()[0] == body.splitlines()[0]
-    assert lines[-1] == (
-        f"  (… {len(body) - len(head):,} of {len(body):,} characters of this section "
-        f"omitted — capped at 600 characters; read the rest with `jarvis spec section "
-        f"{SPEC_PATH} 7.2`)")
+def test_the_spec_section_reaches_both_packets_with_no_daemon_and_no_model_call():
+    """#1035: a reviewer asked to rule on an assumption that cites the spec was shown no
+    spec, and escalated with `evidence-insufficient`. Resolved inside `propose`."""
+    for build in builds(SpecStore()):
+        neo_ = FakeNeo(qrow())
+        build(neo_)
+        (packet,) = neo_.asked
+        assert SPEC_HEADER in packet
+        assert "docs/superpowers/specs/2026-10-13-bus.md § 2. The remedy" in packet
+        assert "retries three times and then parks" in packet
+        # The authority behind the brief: after it, before what was delivered.
+        assert packet.index("# The work order it was recorded against") \
+            < packet.index(SPEC_HEADER) < packet.index("# What the worker says it")
 
 
-def test_a_first_line_over_the_budget_is_cut_mid_line_rather_than_dropped():
-    """Delivering zero characters is never an outcome."""
-    block = autoreview._spec_block(spec(section_text="y" * 5000), 100)  # noqa: SLF001
+def test_the_projects_own_spec_cap_binds_in_both_packets():
+    """`validation.assumption_spec_chars` is per project, so the bound the reviewer reads
+    is the bound that project set — never the module's."""
+    tight = ValidationConfig(assumption_spec_chars=40)
 
-    lines = block.splitlines()
-    assert lines[3] == "y" * 100
-    assert "4,900 of 5,000 characters" in lines[-1]
-
-
-def test_a_section_that_fits_carries_no_marker():
-    block = autoreview._spec_block(spec(), 6000)   # noqa: SLF001
-
-    assert "omitted" not in block
-
-
-def test_the_spec_budget_is_the_projects_when_it_names_one():
-    """`_record_chars`' shape: the fleet answer for every caller with no catalog in
-    hand."""
-    assert autoreview._spec_chars(None) == 6000            # noqa: SLF001
-    assert autoreview._spec_chars(                          # noqa: SLF001
-        ValidationConfig(assumption_spec_chars=400)) == 400
+    for build in builds(SpecStore(), cfg=tight):
+        neo_ = FakeNeo(qrow())
+        build(neo_)
+        (packet,) = neo_.asked
+        assert "retries three times" not in packet
+        assert "spec section truncated" in packet
+        assert str(autoreview.DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS) not in packet
+        assert "docs/superpowers/specs/2026-10-13-bus.md § 2. The remedy" in packet
 
 
-def test_propose_resolves_the_childs_section_and_puts_it_in_the_packet():
-    """§2.2: built from the `spec_of` dict `propose` already has a `store` to fetch."""
-    kid = {**WO, "parent_id": "fo-1", "kind": "worker", "spec_section": "7.2",
-           "title": "Build the precheck"}
-    neo_ = FakeNeo()
+def test_a_section_over_the_budget_is_trimmed_with_a_marker_and_the_reference():
+    """Bounded-model-inputs §2: the reference rides whether or not anything was cut, and
+    what was cut says where the rest is."""
+    long_doc = f"# D\n\n## 2. The remedy\n\n{'x' * 9000}\n"
+    neo_ = FakeNeo(qrow())
 
-    autoreview.propose(SpecStore(), neo_, "p", kid, assumption(), [assumption()])
+    autoreview.propose(SpecStore(doc=long_doc), neo_, "p", CHILD, assumption(),
+                       [assumption()])
 
     (packet,) = neo_.asked
-    assert SPEC_HEADER in packet
-    assert f"{SPEC_PATH} § 7.2" in packet
-    assert "four conditions" in packet
+    assert "x" * 9000 not in packet and "x" * 500 in packet
+    assert ("[spec section truncated — 6,000 of 9,018 chars; full section: "
+            "docs/superpowers/specs/2026-10-13-bus.md § 2. The remedy]") in packet
 
 
-def test_the_persona_tells_the_reviewer_to_cite_the_section_instead_of_escalating():
-    """Without the paragraph the payload grows by up to 6,000 characters and the reviewer
-    keeps escalating for evidence quoted in its own prompt."""
-    persona = autoreview.ASSUMPTION_REVIEWER_PERSONA
+def test_no_spec_section_says_so_explicitly_in_both_packets():
+    """An absent section must read as absent, not as silence: with nothing in the packet
+    a reviewer cannot tell a standalone order from a lost section."""
+    # `WO` has no `parent_id`, so `spec_of` returns None without touching the store.
+    for build in (
+        lambda neo_: autoreview.propose(FakeStore(), neo_, "p", WO, assumption(),
+                                        [assumption()]),
+        lambda neo_: autoreview.propose_confirmation(FakeStore(), neo_, "p", WO,
+                                                     assumption(), [assumption()]),
+    ):
+        neo_ = FakeNeo(qrow())
+        build(neo_)
+        (packet,) = neo_.asked
+        assert SPEC_HEADER in packet and "no spec section" in packet
 
-    assert "THE SPEC SECTION IS AUTHORITY AND YOU MAY CITE IT." in persona
-    assert "evidence-insufficient" in persona
-    assert "omission" in persona
+
+def test_a_spec_whose_named_section_does_not_resolve_is_not_the_same_as_none():
+    """Two different facts: this order was planned against a spec and its section could
+    not be found. Reading one as the other sends the reviewer to the wrong conclusion."""
+    neo_ = FakeNeo(qrow())
+
+    autoreview.propose(SpecStore(doc="# D\n\n## 9. Elsewhere\n\nno.\n"), neo_, "p",
+                       CHILD, assumption(), [assumption()])
+
+    (packet,) = neo_.asked
+    assert "did not resolve" in packet and "docs/superpowers/specs/2026-10-13-bus.md" in packet
+
+
+def test_the_instruction_tells_the_reviewer_to_cite_the_section_not_escalate():
+    """The whole point of #1035: a spec section that settles the assumption is a ruling,
+    not a reason to ask the user for the spec."""
+    for build in builds(SpecStore()):
+        neo_ = FakeNeo(qrow())
+        build(neo_)
+        (packet,) = neo_.asked
+        assert "cite the section" in packet
 
 
 def test_answered_questions_is_newest_first_and_keeps_every_kind(started):
