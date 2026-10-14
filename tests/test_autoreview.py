@@ -2399,7 +2399,7 @@ class SpecStore(FakeStore):
     packet builders must resolve the spec with the store they already hold."""
 
     def __init__(self, *messages: dict, doc: str = SPEC_DOC,
-                 path: str = "docs/specs/bus.md"):
+                 path: str = "docs/superpowers/specs/2026-10-13-bus.md"):
         super().__init__(*messages)
         self.plan = json.dumps({"design_doc": path, "design_doc_content": doc})
 
@@ -2429,7 +2429,7 @@ def test_the_spec_section_reaches_both_packets_with_no_daemon_and_no_model_call(
         build(neo_)
         (packet,) = neo_.asked
         assert SPEC_HEADER in packet
-        assert "docs/specs/bus.md § 2. The remedy" in packet
+        assert "docs/superpowers/specs/2026-10-13-bus.md § 2. The remedy" in packet
         assert "retries three times and then parks" in packet
         # The authority behind the brief: after it, before what was delivered.
         assert packet.index("# The work order it was recorded against") \
@@ -2448,7 +2448,7 @@ def test_the_projects_own_spec_cap_binds_in_both_packets():
         assert "retries three times" not in packet
         assert "spec section truncated" in packet
         assert str(autoreview.DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS) not in packet
-        assert "docs/specs/bus.md § 2. The remedy" in packet
+        assert "docs/superpowers/specs/2026-10-13-bus.md § 2. The remedy" in packet
 
 
 def test_a_section_over_the_budget_is_trimmed_with_a_marker_and_the_reference():
@@ -2463,7 +2463,7 @@ def test_a_section_over_the_budget_is_trimmed_with_a_marker_and_the_reference():
     (packet,) = neo_.asked
     assert "x" * 9000 not in packet and "x" * 500 in packet
     assert ("[spec section truncated — 6,000 of 9,018 chars; full section: "
-            "docs/specs/bus.md § 2. The remedy]") in packet
+            "docs/superpowers/specs/2026-10-13-bus.md § 2. The remedy]") in packet
 
 
 def test_no_spec_section_says_so_explicitly_in_both_packets():
@@ -2491,7 +2491,7 @@ def test_a_spec_whose_named_section_does_not_resolve_is_not_the_same_as_none():
                        CHILD, assumption(), [assumption()])
 
     (packet,) = neo_.asked
-    assert "did not resolve" in packet and "docs/specs/bus.md" in packet
+    assert "did not resolve" in packet and "docs/superpowers/specs/2026-10-13-bus.md" in packet
 
 
 def test_the_instruction_tells_the_reviewer_to_cite_the_section_not_escalate():
