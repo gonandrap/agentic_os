@@ -911,9 +911,11 @@ def parked_on_a_give_up(store: ProjectStore, wo: dict[str, Any]) -> bool:
     INV-ATTENTION-MISSING raises it from here, which is the path that honours
     `acknowledged_blockers`.
 
-    SELF-CLEARING by construction, and without waiting for a poll. Fact 1 reads the
-    LATEST round only, so a later round that passes or merely opens clears it on the same
-    tick, with no new hold event. Fact 2 clears it when the hold changes code — the head
+    SELF-CLEARING by construction, and without waiting for a poll. Fact 1 reads the last
+    JUDGED round, so a later round that PASSES clears it on the same tick, with no new
+    hold event — and one that merely opens does not, per spec
+    docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md §A.
+    Fact 2 clears it when the hold changes code — the head
     moved, CI went red, the pull request closed — each of which has its own sentence and
     its own machinery, and this one must not sit over them.
 
@@ -1619,12 +1621,16 @@ def parked_reason(store: ProjectStore, wo: dict[str, Any],
 def validation_escalated(store: ProjectStore, wo: dict[str, Any]) -> bool:
     """Did this work order's most recent validation round give up and ask for a human?
 
-    Only the LATEST round is consulted. An escalation ends the loop, so an older
-    escalated round with a newer one after it is not something the user still owes a
-    decision on — and a round that is still `pending` owes them nothing yet.
+    The panel's last WORD, not the last ROW BY NUMBER. An escalation is undone by a
+    VERDICT, by `jarvis wo review`, or by a merge — never by a row that judged nothing,
+    and `pending`, `failed` and `void` all judged nothing. All five readers come through
+    here, so the status, the flag, the `wo show` block, the dashboard form and the repair
+    refusal are one fact.
+
+    Spec docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md §A.
     """
-    latest = store.latest_validation_round(wo_id=wo["id"])
-    return bool(latest and latest["outcome"] == "escalated")
+    judged = store.last_judged_round(wo_id=wo["id"])
+    return bool(judged and judged["outcome"] == "escalated")
 
 
 def user_rework_refused(store: ProjectStore, wo: dict[str, Any]) -> bool:
@@ -3305,6 +3311,9 @@ def check_validation_progresses(store: ProjectStore) -> Iterator[Violation]:
     SECOND ARM, work orders only: a round that PASSED and never landed — same defect, a
     unit under review nothing will move again, in its other state. See
     `_passed_round_never_landed`.
+
+    THIRD ARM, work orders only: a panel give-up parked in the merge queue. See
+    `_give_up_parked_in_the_merge_queue`.
     """
     per_round = _validation_timeout()
     threshold = 2 * per_round
@@ -3349,6 +3358,7 @@ def check_validation_progresses(store: ProjectStore) -> Iterator[Violation]:
                          "fo_id": None if id_col == "wo_id" else unit_id},
             )
     yield from _passed_round_never_landed(store)
+    yield from _give_up_parked_in_the_merge_queue(store)
 
 
 def _passed_round_never_landed(store: ProjectStore) -> Iterator[Violation]:
@@ -3416,6 +3426,71 @@ def _passed_round_never_landed(store: ProjectStore) -> Iterator[Violation]:
             invariant="INV-VALIDATION-STRANDED", wo_id=wo_id, detail=detail,
             repaired=True,
             repair=f"landed the passed round — the work order is now `{status}`",
+            context=context,
+        )
+
+
+#: The event the third arm writes when it puts a give-up back on the user's list.
+GIVE_UP_REPARKED = "give_up_reparked"
+
+
+def _give_up_parked_in_the_merge_queue(store: ProjectStore) -> Iterator[Violation]:
+    """INV-VALIDATION-STRANDED, third arm — a panel give-up parked in the merge queue.
+
+    `waiting_pr_merge` is not in `SETTLE_STATUSES`, so nothing re-derives it: one wrong
+    write stands for ever, and fixing the predicate above only stops new ones. Orders
+    already parked need a write.
+
+    Predicate, work orders only: `parked_on_a_give_up` REUSED WHOLE — both of
+    kn-c9a58876's facts at once, the panel's last word and the newest `automerge_held`
+    being `not_passed` — then nothing pending for the `needs_review` arm to decide, then
+    nothing typing. A project running with `auto_merge` off writes no hold, so this does
+    not fire there and its healthy pull request stays on the merge poll.
+
+    NO `flag_attention`: kn-089de524 — `check_blocked_work_is_surfaced` raises it from
+    `true_blockers`, the only path that honours `jarvis wo ack`.
+
+    Spec docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md §B.
+    """
+    rows = store.conn.execute(
+        "SELECT id FROM work_orders WHERE status='waiting_pr_merge'").fetchall()
+    readonly = getattr(store, "readonly", False)
+    for row in rows:
+        wo_id = row["id"]
+        wo = store.get_work_order(wo_id)
+        if not parked_on_a_give_up(store, wo):
+            continue
+        if store.pending_assumptions(wo_id):
+            continue  # the `needs_review` arm's decision outranks this one
+        if worker_session.busy(store, wo_id) is not None \
+                or store.queued_messages(wo_id):
+            continue  # no status is written under a live turn
+        judged = store.last_judged_round(wo_id=wo_id)
+        detail = (
+            f"work order {wo_id} is `waiting_pr_merge` on a round that GAVE UP — round "
+            f"{judged['round']} escalated and nobody has decided it, while the merge is "
+            f"held on `{HELD_NOT_PASSED}`. The status carries no review control and "
+            f"nothing re-derives it."
+        )
+        context = {"round_id": judged["id"], "round": judged["round"],
+                   "unit": "work order", "fo_id": None}
+        if readonly:
+            yield Violation(
+                invariant="INV-VALIDATION-STRANDED", wo_id=wo_id, detail=detail,
+                repaired=True,
+                repair="would set the status to `needs_review` — the give-up is owed",
+                context=context,
+            )
+            continue
+        store.set_status(wo_id, "needs_review", trigger=GIVE_UP_REPARKED)
+        # `round` beside the id so `timeline` can name it without a lookup.
+        store.add_event(wo_id, GIVE_UP_REPARKED,
+                        {"round_id": int(judged["id"]), "round": int(judged["round"]),
+                         "was": "waiting_pr_merge"})
+        yield Violation(
+            invariant="INV-VALIDATION-STRANDED", wo_id=wo_id, detail=detail,
+            repaired=True,
+            repair="status set to needs_review; the give-up is owed again",
             context=context,
         )
 
@@ -5151,6 +5226,13 @@ def check_spec_pointer_resolves(store: ProjectStore) -> Iterator[Violation]:
     (tests/test_spec_location.py), and a dead pointer lives in a database row
     (kn-ba3945bf, kn-818facbf).
 
+    THE ORACLE IS THE COMMITTED REF, never this checkout:
+    docs/superpowers/specs/2026-10-14-inv-spec-pointer-real-reads-the-integration-branch.md.
+    `.exists()` made the verdict a fact about whether somebody had pulled — a false
+    violation for fo-f02d33af, whose spec was on `origin/main` — and hid the mirror case,
+    a pointer that opens only because an uncommitted file sits in one person's tree. A row
+    the ladder cannot answer for yields nothing at all (§2.4).
+
     Settled features included, on `check_work_lands`' reasoning: hiding drops a record
     from listings, it does not mean the record may go on saying something untrue.
 
@@ -5161,14 +5243,22 @@ def check_spec_pointer_resolves(store: ProjectStore) -> Iterator[Violation]:
     more than one owes the user a decision. Spec §2.3 of
     docs/superpowers/specs/2026-10-13-an-assumption-review-payload-carries-its-spec-section.md
     """
+    from . import landing
+
+    # One memo for the whole sweep: the remote is refreshed at most once — spec §2.2.
+    fetched: set[str] = set()
     for fo in store.list_feature_orders(statuses=None, kind=None,
                                         limit=SPEC_POINTER_ROWS):
         plan = db.from_json(fo.get("plan"), {}) or {}
         doc = str(plan.get("design_doc") or "").strip()
-        if not doc or (store.project_path / doc).exists():
+        if not doc:
+            continue
+        found = landing.committed_exists(store.project_path, _planner_row(store, fo),
+                                         doc, fetched)
+        if found is None or found.present:
             continue
         fo_id = fo["id"]
-        matches = _tracked_with_basename(store.project_path, Path(doc).name)
+        matches = _tracked_with_basename(found.repo, found.ref, Path(doc).name)
         detail = (f"feature order {fo_id} stores its design document at `{doc}`, and no "
                   f"file is there. `jarvis fo show {fo_id}` and the work order pages "
                   f"under it render that path, and `jarvis spec section {doc} <n>` reads "
@@ -5203,12 +5293,25 @@ def check_spec_pointer_resolves(store: ProjectStore) -> Iterator[Violation]:
         )
 
 
-def _tracked_with_basename(root: Path, name: str) -> list[str]:
-    """Repo-relative paths of tracked files called `name` — the database half of the
-    tracked-file guard, so it asks `git` the same question."""
+def _planner_row(store: ProjectStore, fo: dict[str, Any]) -> dict[str, Any] | None:
+    """The feature's planner row, for the ladder's first rung.
+
+    `ops._planner_work_order`'s query, deliberately re-stated rather than imported: this
+    module must not depend on `ops`.
+    """
+    if not fo.get("plan_wo_id"):
+        return None
+    return store.get_work_order(fo["plan_wo_id"])
+
+
+def _tracked_with_basename(root: Path, ref: str, name: str) -> list[str]:
+    """Paths called `name` ON `ref` — the same ref the existence question was answered
+    from, because the single-match branch WRITES the answer back. Spec §2.3 of
+    docs/superpowers/specs/2026-10-14-inv-spec-pointer-real-reads-the-integration-branch.md
+    """
     try:
-        out = subprocess.run(["git", "ls-files", "-z"], cwd=str(root),
-                             capture_output=True, text=True, check=False)
+        out = subprocess.run(["git", "ls-tree", "-r", "--name-only", "-z", ref],
+                             cwd=str(root), capture_output=True, text=True, check=False)
     except OSError:
         return []
     if out.returncode != 0:

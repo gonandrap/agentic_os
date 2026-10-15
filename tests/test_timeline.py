@@ -136,6 +136,21 @@ def test_a_merge_refused_because_the_base_moved_says_which_commit_moved():
     assert "{" not in entry["label"] + entry["detail"]
 
 
+def test_a_reparked_give_up_reads_as_a_sentence_and_not_a_json_dump():
+    """THE TIMELINE IS THIS KIND'S ONLY SURFACE, and the move it records is the OS taking
+    a status back — so "it fixed itself" has to be provable, as it is for
+    `pr_repair_resettled` (kn-3f133363). Unregistered it falls through to the bare kind
+    plus a JSON payload. Spec §B of
+    docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md."""
+    entry = build_timeline({}, [ev("give_up_reparked", 1.0, round_id=12, round=4,
+                                   was="waiting_pr_merge")], [])[0]
+    assert entry["level"] == "signal"
+    assert entry["label"] == "Back on your list — the panel's give-up was never decided"
+    assert entry["detail"] == "was waiting_pr_merge, round 4"
+    assert "{" not in entry["label"] + entry["detail"]
+    assert "give_up_reparked" not in entry["label"] + entry["detail"]
+
+
 def test_messages_appear_as_prompt_and_reply():
     """Both directions are moments on the timeline; the words are the conversation's."""
     messages = [
@@ -706,6 +721,54 @@ def test_a_model_the_record_does_not_have_is_said_so_on_the_timeline_too():
     ], [])
 
     assert "model not recorded" in entries[0]["label"]
+
+
+def test_an_escalated_round_is_labelled_by_its_family_and_never_gave_up():
+    """Spec 2026-10-14-an-escalated-round-says-why-and-what-to-run-next §1: all three
+    `handover` causes are a REJECTION handed over and "gave up" read as the opposite,
+    while the three `not_reviewed` ones are the inverse — nothing was rejected, so the
+    handover wording claimed a decision nobody made. A legacy payload with no `cause`
+    field promises nothing."""
+    from jarvis import ops
+    from jarvis.timeline import _describe
+
+    handover, _ = _describe("validation_escalated",
+                            {"round": 3, "cause": ops.ESCALATION_USER_REWORK_CEILING})
+    not_reviewed, _ = _describe("validation_escalated",
+                                {"round": 1, "cause": ops.ESCALATION_NOTHING_TO_JUDGE})
+    unjudged, _ = _describe("validation_escalated",
+                            {"round": 1, "cause": ops.ESCALATION_NO_VERDICT})
+    legacy, reason = _describe("validation_escalated",
+                               {"round": 1, "reason": "no test covers the change"})
+
+    assert handover == "Validation was rejected and handed to you"
+    assert not_reviewed == "Validation was not reviewed — over to you"
+    assert unjudged == "Validation could not be judged — over to you"
+    assert legacy == "Validation was escalated — over to you"
+    assert reason == "no test covers the change"
+    for label in (handover, not_reviewed, unjudged, legacy):
+        assert "gave up" not in label
+    assert "rejected" not in not_reviewed
+
+
+def test_the_timelines_families_are_the_os_s_own_and_its_verbs_too():
+    """`timeline` imports nothing from `jarvis`, so the literals it holds are pinned
+    here: a cause added to `ops.ESCALATION_FAMILY` without a label would otherwise read
+    as the legacy sentence in production."""
+    from jarvis import ops
+    from jarvis.timeline import (ESCALATION_HANDOVER, ESCALATION_NOT_REVIEWED,
+                                 ESCALATION_UNJUDGED, _describe)
+
+    by_family: dict[str, set[str]] = {}
+    for cause, family in ops.ESCALATION_FAMILY.items():
+        by_family.setdefault(family, set()).add(cause)
+
+    assert ESCALATION_HANDOVER == by_family["handover"]
+    assert ESCALATION_NOT_REVIEWED == by_family["not_reviewed"]
+    assert ESCALATION_UNJUDGED == by_family["unjudged"]
+    for cause, family in ops.ESCALATION_FAMILY.items():
+        label, _ = _describe("validation_escalated", {"round": 1, "cause": cause})
+        assert ops.ESCALATION_VERB[family] in label, cause
 
 
 def test_a_dropped_ruling_is_not_narrated_as_neo_declining():

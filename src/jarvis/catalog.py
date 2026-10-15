@@ -537,6 +537,13 @@ DEFAULT_VALIDATION_MAX_ROUNDS = 3
 # docs/superpowers/specs/2026-10-13-a-red-head-is-sent-back-before-the-panel.md
 DEFAULT_VALIDATION_RED_CI_RETURNS = 3
 
+# How many times a round whose seats were KILLED BY A SIGNAL is re-judged before the OS
+# gives up on it and asks the user. A fleet that restarts its daemon during deploys wants
+# a different number from one that does not, which is why this is a key and not a
+# constant (Neo question 1705, condition ii). Spec §4b:
+# docs/superpowers/specs/2026-10-14-a-killed-validation-panel-opens-an-investigation.md
+DEFAULT_VALIDATION_KILLED_RETRIES = 3
+
 # Truncation limit for the diff a seat is shown. MEASURED, not chosen: at 0.384
 # tokens/char a round's shared prefix is 76,347 tokens here, which under the shared-cache
 # layout costs less than HALF what 60,000 cost when every seat wrote its own copy
@@ -643,6 +650,9 @@ class ValidationConfig:
     # Spec §4:
     # docs/superpowers/specs/2026-10-13-a-red-head-is-sent-back-before-the-panel.md
     red_ci_returns: int = DEFAULT_VALIDATION_RED_CI_RETURNS
+    # Spec §4b:
+    # docs/superpowers/specs/2026-10-14-a-killed-validation-panel-opens-an-investigation.md
+    killed_retries: int = DEFAULT_VALIDATION_KILLED_RETRIES
     diff_chars: int = DEFAULT_VALIDATION_DIFF_CHARS
     decision_record_chars: int = DEFAULT_VALIDATION_DECISION_RECORD_CHARS
     # GitHub issue #1035: the spec section an assumption review reads.
@@ -2187,6 +2197,10 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         # is today's behaviour exactly. `max_rounds` is >= 1 because a unit with zero
         # rounds can never be judged at all; zero returns is not that (spec §4.3).
         raise _err(f"{where}.red_ci_returns must be >= 0")
+    killed_retries = int(raw.get("killed_retries", base.killed_retries))
+    if killed_retries < 0:
+        # 0 is legal and means "escalate on the first kill" (spec §4b).
+        raise _err(f"{where}.killed_retries must be >= 0")
     diff_chars = int(raw.get("diff_chars", base.diff_chars))
     if diff_chars < 1:
         raise _err(f"{where}.diff_chars must be >= 1")
@@ -2227,6 +2241,7 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         timeout=timeout,
         max_rounds=max_rounds,
         red_ci_returns=red_ci_returns,
+        killed_retries=killed_retries,
         diff_chars=diff_chars,
         decision_record_chars=decision_record_chars,
         assumption_spec_chars=assumption_spec_chars,

@@ -356,6 +356,77 @@ def committed_text(project_path: Path, planner_wo: dict[str, Any] | None,
     return text, f"{ref} @ {head[:7]}" if head else ref
 
 
+@dataclass(frozen=True)
+class CommittedAt:
+    """Which committed ref answered an existence question, where it is readable, and what
+    it said. §2.3 of
+    docs/superpowers/specs/2026-10-14-inv-spec-pointer-real-reads-the-integration-branch.md
+    needs the ref itself: a caller that lists candidates must list them from the SAME ref
+    it got its answer from."""
+    repo: Path
+    ref: str
+    present: bool
+
+
+def committed_exists(project_path: Path, planner_wo: dict[str, Any] | None,
+                     repo_path: str, fetched: set[str]) -> CommittedAt | None:
+    """Does this path exist on a COMMITTED ref? The ref that answered, or None if none can.
+
+    §2.2 of
+    docs/superpowers/specs/2026-10-14-inv-spec-pointer-real-reads-the-integration-branch.md.
+    `committed_text`'s ladder, same rung order and for the same question-658 reason, with
+    two differences it exists for: `git cat-file -e` rather than the bytes, because a
+    sweep over 100000 rows must not materialise a file per row; and `fetched`, a memo of
+    refs already refreshed THREADED IN BY THE CALLER, so the remote is refreshed at most
+    once per sweep rather than once per row or once per TTL.
+
+    None means the ladder could answer NOTHING — no planner branch and no base ref — and
+    a caller must treat it as "no verdict", never as absent: §2.4, `authored`'s rung-4
+    posture and the never-fabricate ruling. `present=False` is the opposite, a ref that
+    was read and does not carry the path.
+    """
+    answered: CommittedAt | None = None
+    worktree = worktree_of(project_path, planner_wo) if planner_wo else None
+    if worktree is not None:
+        branch = authored(worktree).branch
+        if branch:
+            seen = _object_exists(worktree, branch, repo_path)
+            if seen:
+                return CommittedAt(worktree, branch, True)
+            if seen is False:
+                answered = CommittedAt(worktree, branch, False)
+    ref = base_ref(project_path)
+    if not ref:
+        return answered
+    if ref not in fetched:
+        fetched.add(ref)
+        _fetch_ref(project_path, ref)
+    seen = _object_exists(project_path, ref, repo_path)
+    if seen is None:
+        return answered
+    return CommittedAt(project_path, ref, seen)
+
+
+def _object_exists(repo: Path, ref: str, repo_path: str) -> bool | None:
+    """`git cat-file -e <ref>:<path>`, silent on the miss. None means it COULD NOT RUN.
+
+    Not `_git`: a missing path exits non-zero, which that helper logs as a warning, and
+    the sweep this serves asks about rows that are EXPECTED to miss. But a git that would
+    not execute is not an absent path — reporting it as one fabricates a verdict out of an
+    infrastructure failure (§2.4 and the pinned never-fabricate ruling), so it is a third
+    value the caller has to handle, `_git`'s own reasoning.
+    """
+    try:
+        proc = subprocess.run(["git", "-C", str(repo), "cat-file", "-e",
+                               f"{ref}:{repo_path}"], capture_output=True, text=True,
+                              errors="replace", check=False)
+    except OSError as exc:
+        log.warning("git cat-file -e %s:%s in %s could not run: %s", ref, repo_path,
+                    repo, _scrub(str(exc)))
+        return None
+    return proc.returncode == 0
+
+
 def _fetch_ref(repo: Path, ref: str) -> None:
     """Refresh the default branch before reading it, best-effort. §8.
 

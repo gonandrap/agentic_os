@@ -1506,14 +1506,24 @@ def test_a_decline_written_before_the_cause_existed_is_a_budget_decline(project)
 
 def _parked_on_an_escalation(store: ProjectStore, *, outcome: str = "escalated",
                              hold: str | None = invariants.HELD_NOT_PASSED,
-                             status: str = "waiting_pr_merge") -> dict:
-    """A work order parked behind its pull request with the panel's last word on it."""
+                             status: str = "waiting_pr_merge",
+                             after: str | None = None) -> dict:
+    """A work order parked behind its pull request with the panel's last word on it.
+
+    `after` opens ONE MORE round after that word, with the outcome given — the row the
+    panel's last word used to be lost behind. Spec
+    docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md §A.
+    """
     wo = store.create_work_order("add feature X")
     store.update_work_order(wo["id"], pr_url="https://github.com/acme/proj/pull/7",
                             result_summary="opened a PR")
     row = store.open_validation_round(wo_id=wo["id"], fingerprint="fp")
     store.set_validation_head(row["id"], "aaaa1111aaaa2222")
     store.close_validation_round(row["id"], outcome, "")
+    if after is not None:
+        later = store.open_validation_round(wo_id=wo["id"], fingerprint="fp-after")
+        if after != "pending":
+            store.close_validation_round(later["id"], after, "")
     store.set_status(wo["id"], status)
     if hold is not None:
         store.add_event(wo["id"], "automerge_held", {"code": hold, "round": 1})
@@ -1626,6 +1636,100 @@ def test_a_moved_head_decline_is_the_other_sentence_and_only_that(project):
     blockers = true_blockers(store, moved)
     assert invariants.SHA_MOVED_BLOCKER in blockers
     assert invariants.PARKED_GIVE_UP_BLOCKER not in blockers
+
+
+# -- a row that judged nothing must not drop the give-up under it ----------------------
+# docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md §A, §B.
+
+
+def _owed_after(project, outcome: str) -> tuple[ProjectStore, dict]:
+    store = ProjectStore(project)
+    return store, _parked_on_an_escalation(store, after=outcome)
+
+
+def test_a_pending_round_after_a_give_up_does_not_drop_it(project):
+    """A forced or rebind round in flight judges nothing, so nobody has decided."""
+    store, wo = _owed_after(project, "pending")
+
+    assert invariants.validation_escalated(store, wo) is True
+    assert invariants.parked_on_a_give_up(store, wo) is True
+    assert invariants.PARKED_GIVE_UP_BLOCKER in true_blockers(store, wo)
+
+
+def test_a_failed_transport_round_after_a_give_up_does_not_drop_it(project):
+    """`counted_validation_rounds` already calls a `failed` round no judgement."""
+    store, wo = _owed_after(project, "failed")
+
+    assert invariants.validation_escalated(store, wo) is True
+    assert invariants.parked_on_a_give_up(store, wo) is True
+    assert invariants.PARKED_GIVE_UP_BLOCKER in true_blockers(store, wo)
+
+
+def test_a_void_round_after_a_give_up_does_not_drop_it(project):
+    """A `void` round had nothing for a reviewer, so it asked the submitter nothing."""
+    store, wo = _owed_after(project, "void")
+
+    assert invariants.validation_escalated(store, wo) is True
+    assert invariants.parked_on_a_give_up(store, wo) is True
+    assert invariants.PARKED_GIVE_UP_BLOCKER in true_blockers(store, wo)
+
+
+def _give_up_violations(store: ProjectStore) -> list:
+    return [v for v in invariants.check_validation_progresses(store)
+            if v.invariant == "INV-VALIDATION-STRANDED"]
+
+
+def test_a_give_up_parked_in_the_merge_queue_is_put_back_for_review(project):
+    """§B: nothing re-derives `waiting_pr_merge`, so state already written needs a move.
+    The flag is left to `check_blocked_work_is_surfaced` (kn-089de524)."""
+    store = ProjectStore(project)
+    wo = _parked_on_an_escalation(store)
+
+    found = _give_up_violations(store)
+
+    assert [v.wo_id for v in found] == [wo["id"]]
+    assert found[0].repaired
+    row = store.get_work_order(wo["id"])
+    assert row["status"] == "needs_review"
+    assert store.last_event_of_kind(wo["id"], "give_up_reparked") is not None
+    assert not row["needs_attention"]
+
+    list(invariants.check_blocked_work_is_surfaced(store))
+    row = store.get_work_order(wo["id"])
+    assert row["needs_attention"]
+    assert VALIDATION_STUCK_BLOCKER in true_blockers(store, row)
+
+
+def test_a_project_merging_by_hand_is_left_in_the_merge_queue(project):
+    """The twin of row 3: `auto_merge` off writes no hold, nothing is held by the
+    escalation, and moving it would take a healthy pull request off the merge poll."""
+    store = ProjectStore(project)
+    wo = _parked_on_an_escalation(store, hold=None)
+
+    assert _give_up_violations(store) == []
+    assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
+
+
+def test_the_repair_writes_nothing_under_a_live_turn(project):
+    """The discipline daemon.py:3045 and daemon.py:6353 already follow."""
+    store = ProjectStore(project)
+    wo = _parked_on_an_escalation(store)
+    store.create_turn(wo["id"], "message", "go")
+    assert worker_session.busy(store, wo["id"]) is not None
+
+    assert _give_up_violations(store) == []
+    assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
+
+
+def test_the_repair_is_idempotent(project):
+    """Self-extinguishing: after the move there is no `waiting_pr_merge` row left."""
+    store = ProjectStore(project)
+    _parked_on_an_escalation(store)
+
+    assert len(_give_up_violations(store)) == 1
+    assert _give_up_violations(store) == []
+
+
 # -- is somebody ELSE holding this, or is anything out at all? -------------------------
 # Fix 2 of docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md: two
 # questions, two resolvers, side by side so they cannot drift (kn-4ea33fe6).
@@ -2236,6 +2340,139 @@ def test_a_repaired_pointer_violation_also_names_its_feature(project):
     assert found.repaired is True
     assert found.subject_id == fo["id"]
     assert found.key == ("INV-SPEC-POINTER-REAL", fo["id"])
+
+
+# -- and it opens on the COMMITTED ref, never on this checkout ---------------------------
+#
+# docs/superpowers/specs/2026-10-14-inv-spec-pointer-real-reads-the-integration-branch.md
+
+
+def _planner_branch(store: ProjectStore, project: Path, fo_id: str,
+                    branch: str = "feat/plan") -> Path:
+    """A planner work order with a worktree on a branch of its own, as a dispatch makes."""
+    planner = store.create_work_order("Plan CSV export", parent_id=fo_id, kind="planner")
+    store.update_work_order(planner["id"], worktree=planner["id"])
+    store.update_feature_order(fo_id, plan_wo_id=planner["id"])
+    path = project / ".claude" / "worktrees" / planner["id"]
+    subprocess.run(["git", "-C", str(project), "worktree", "add", "-q", "-b", branch,
+                    str(path)], check=True, capture_output=True)
+    return path
+
+
+def test_a_design_doc_committed_but_absent_from_this_checkout_is_silent(project):
+    """§3.1, the issue-1044 regression: the dev checkout was 38 commits behind, so
+    `.exists()` reported a spec that is on the integration branch as missing."""
+    from jarvis.testing import commit
+
+    store = ProjectStore(project)
+    doc = Path(project) / "docs" / "superpowers" / "specs" / "merged.md"
+    doc.write_text("# merged\n")
+    commit(Path(project), "the merged spec", "docs/superpowers/specs/merged.md")
+    doc.unlink()
+    _feature_with_pointer(store, "docs/superpowers/specs/merged.md")
+
+    assert _pointer_violations(store) == []
+
+
+def test_a_design_doc_only_in_the_working_tree_still_raises(project):
+    """§3.2, the hide half: an uncommitted file short-circuited `.exists()`, so a genuinely
+    dead pointer stayed invisible for as long as it sat in somebody's checkout."""
+    store = ProjectStore(project)
+    local = Path(project) / "docs" / "superpowers" / "specs" / "draft.md"
+    local.write_text("# never committed\n")
+    fo = _feature_with_pointer(store, "docs/superpowers/specs/draft.md")
+
+    (found,) = _pointer_violations(store)
+
+    assert found.repaired is False
+    assert found.owed and "no tracked file carries that name" in found.owed
+    assert _stored_doc(store, fo["id"]) == "docs/superpowers/specs/draft.md"
+
+
+def test_a_design_doc_on_the_planners_branch_and_not_on_main_is_silent(project):
+    """§3.3 and §2.1's rung order: a spec committed on the planner's branch and not yet
+    merged must resolve, or every in-flight feature raises a violation."""
+    from jarvis.testing import commit
+
+    store = ProjectStore(project)
+    fo = _feature_with_pointer(store, "docs/superpowers/specs/branch-only.md")
+    worktree = _planner_branch(store, Path(project), fo["id"])
+    doc = worktree / "docs" / "superpowers" / "specs" / "branch-only.md"
+    doc.parent.mkdir(parents=True, exist_ok=True)
+    doc.write_text("# on the branch\n")
+    commit(worktree, "the spec, on the planner's branch",
+           "docs/superpowers/specs/branch-only.md")
+
+    assert _pointer_violations(store) == []
+
+
+def test_the_repair_only_considers_candidates_that_exist_on_the_ref(project):
+    """§3.4 and §2.3: the single-match branch WRITES, so a candidate from `git ls-files`
+    would repoint a shared row at a path that exists in one person's checkout only."""
+    store = ProjectStore(project)
+    local = Path(project) / "notes" / "exporter.md"
+    local.parent.mkdir(parents=True, exist_ok=True)
+    local.write_text("# local only\n")
+    fo = _feature_with_pointer(store, LEGACY_PREFIX + "exporter.md")
+
+    (found,) = _pointer_violations(store)
+
+    assert found.repaired is True
+    assert "notes/exporter.md" not in found.repair
+    assert _stored_doc(store, fo["id"]) == CANONICAL_DOC
+
+
+def test_the_remote_is_refreshed_at_most_once_however_many_rows_are_scanned(project,
+                                                                           monkeypatch):
+    """§3.5 and §2.2: the memo is threaded in by the caller, so "one fetch however many
+    rows" is an exact property rather than a wall-clock accident."""
+    from jarvis import landing
+
+    store = ProjectStore(project)
+    for name in ("ghost.md", "phantom.md", "spectre.md"):
+        _feature_with_pointer(store, f"docs/superpowers/specs/{name}")
+    calls: list[str] = []
+    monkeypatch.setattr(landing, "_fetch_ref",
+                        lambda repo, ref: calls.append(ref))
+
+    assert len(_pointer_violations(store)) == 3
+    assert calls == ["main"]
+
+
+def test_a_project_with_no_integration_branch_yields_no_violation(project,
+                                                                  monkeypatch):
+    """§3.6 and §2.4: a check that cannot run PASSES. The accepted price is that a repo
+    with no integration branch is not covered by this invariant at all."""
+    from jarvis import landing
+
+    store = ProjectStore(project)
+    _feature_with_pointer(store, "docs/superpowers/specs/ghost.md")
+    monkeypatch.setattr(landing, "base_ref", lambda repo: "")
+
+    assert _pointer_violations(store) == []
+
+
+def test_a_git_that_cannot_run_yields_no_violation(project, monkeypatch):
+    """§2.4: a git that would not execute is not an absent path. Reporting it as one
+    manufactures a violation, and an auto-repair search, out of an infrastructure
+    failure."""
+    from jarvis import landing
+
+    store = ProjectStore(project)
+    _feature_with_pointer(store, "docs/superpowers/specs/ghost.md")
+
+    real = landing.subprocess.run
+
+    # ONLY `cat-file`: a blanket patch empties `base_ref` too, and the row would then be
+    # silent by the no-base-ref path whatever `_object_exists` returns.
+    def refuses_cat_file(argv, *args, **kwargs):
+        if "cat-file" in argv:
+            raise OSError("no git here")
+        return real(argv, *args, **kwargs)
+
+    monkeypatch.setattr(landing.subprocess, "run", refuses_cat_file)
+
+    assert _pointer_violations(store) == []
 
 
 def test_subject_id_defaults_to_none_so_a_work_order_key_is_unchanged():

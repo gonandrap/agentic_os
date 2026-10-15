@@ -27,6 +27,16 @@ import json
 import time
 from typing import Any
 
+#: `ops.ESCALATION_FAMILY`'s three written families, as the literals this module is
+#: allowed to hold — it imports nothing from `jarvis`, so tests/test_timeline.py pins
+#: these against the dict rather than a comment promising they match.
+ESCALATION_HANDOVER = frozenset({
+    "rounds_spent", "user_rework_ceiling", "rebinds_spent"})
+ESCALATION_NOT_REVIEWED = frozenset({
+    "bounce_exhausted", "nothing_to_judge", "repeat_submission"})
+ESCALATION_UNJUDGED = frozenset({
+    "no_verdict", "validator_unreachable", "prompt_refused", "panel_killed"})
+
 # Plumbing: how a message got carried, which session was bound, when a turn ended.
 # None of it tells the user anything about the work itself.
 DEBUG_KINDS = frozenset({
@@ -716,7 +726,24 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                 f"{p.get('after_round')} asked about changed",
                 f"unchanged since that round: {cited}" if cited else "")
     if kind == "validation_escalated":
-        return ("Validation gave up — over to you", p.get("reason") or "")
+        # WHICH FAMILY, not merely that a round escalated: "gave up" read as "nobody
+        # judged this" for the three causes that are a REJECTION being handed over (spec
+        # docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md
+        # §1, issue #1040), and the rejection wording read as a DECISION for the three
+        # where no seat judged the submission at all — hence the third set. The verbs are
+        # `ops.ESCALATION_VERB`'s, quoted as literals like "user_rework" above because
+        # this module imports nothing from `jarvis`; tests/test_timeline.py pins all three
+        # sets against `ops.ESCALATION_FAMILY`. A payload written before the field existed
+        # has no cause and says so.
+        cause = str(p.get("cause") or "")
+        if cause in ESCALATION_HANDOVER:
+            return ("Validation was rejected and handed to you", p.get("reason") or "")
+        if cause in ESCALATION_NOT_REVIEWED:
+            return ("Validation was not reviewed — over to you", p.get("reason") or "")
+        if cause in ESCALATION_UNJUDGED:
+            return ("Validation could not be judged — over to you",
+                    p.get("reason") or "")
+        return ("Validation was escalated — over to you", p.get("reason") or "")
     if kind == "validation_void":
         # NOT a give-up and NOT a verdict, and the label has to say both: nobody judged
         # this, and nobody needs to. A reader who takes it for an escalation goes looking
@@ -808,6 +835,14 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "pr_repair_resettled":
         return ("Back in the merge queue — the reason it was held is gone",
                 f"was {p.get('was')}" if p.get("was") else "")
+    # ...and the inverse move, for the same reason. Spec §B of
+    # docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md.
+    if kind == "give_up_reparked":
+        return ("Back on your list — the panel's give-up was never decided",
+                ", ".join(x for x in (f"was {p.get('was')}" if p.get("was") else "",
+                                      f"round {p.get('round')}" if p.get("round")
+                                      else "")
+                          if x))
     # THE ONLY `automerge_*` KINDS WITH LABELS HERE, and deliberately: every other one is
     # rendered by `ops.automerge_state` as the mechanism's one-line state on the work
     # order. These two are excluded from `ops.AUTOMERGE_EVENTS` — the state after either

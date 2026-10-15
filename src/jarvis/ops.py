@@ -902,6 +902,10 @@ def create_work_order(project_name: str, title: str, description: str = "",
                       issue_priority: str | None = None,
                       budget_usd: float | None = None,
                       observability: str | None = None,
+                      gap_class: str | None = None,
+                      detector_id: str | None = None,
+                      remedy_rule_id: str | None = None,
+                      trigger_wo_id: str | None = None,
                       metadata: dict[str, Any] | None = None) -> dict[str, Any]:
     """File a work order. `parent_id` files it UNDER a feature order.
 
@@ -920,6 +924,13 @@ def create_work_order(project_name: str, title: str, description: str = "",
     An open feature order only: attaching a child to one that has already completed or
     failed would silently reopen a settled unit, and `Daemon.settle_features` would then
     have to decide what a new child means for a status the user has already been told.
+
+    `gap_class`, `detector_id`, `remedy_rule_id` and `trigger_wo_id` mark this as a FIX
+    ORDER and are PASSED STRAIGHT THROUGH — §7.1 of
+    docs/superpowers/specs/2026-09-27-self-evolution.md. Nothing here derives, guesses or
+    normalises them, and in particular nothing reads `description` for them: a structural
+    decision taken from free text is kn-5d8a396a, and here it would decide whether a
+    validation round is paid for. An empty `gap_class` is the ordinary case.
     """
     paths = registered_project_paths()
     if project_name not in paths:
@@ -954,6 +965,8 @@ def create_work_order(project_name: str, title: str, description: str = "",
             # has no answer" and the project config is read at write time
             # (`observability.level_for`) — docs/superpowers/specs/2026-09-24-order-observability.md §10.
             observability=observability,
+            gap_class=gap_class, detector_id=detector_id,
+            remedy_rule_id=remedy_rule_id, trigger_wo_id=trigger_wo_id,
         )
         # AT CREATION, from the brief the order is actually given — the only moment at
         # which "this order points at that issue" is a fact rather than an inference.
@@ -3872,6 +3885,66 @@ def merge_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | Non
             "head_oid": "", "merged_at": None, "source": ""}
 
 
+def self_evolution_state(wo: dict[str, Any]) -> dict[str, Any] | None:
+    """What `jarvis wo show` says about a FIX ORDER's four columns, or None.
+
+    §7.1 of docs/superpowers/specs/2026-09-27-self-evolution.md. None — and therefore no
+    line at all — for every order with an empty `gap_class`, which is almost every order:
+    `automerge_state`'s rule, and for its reason. A surface that printed "gap class: none"
+    on every work order in the fleet would spend attention on the absence of a feature
+    nobody asked for.
+
+    **THE CENTRAL STORE IS READ LAZILY, and only then.** The four values are columns on
+    the order precisely so the common surfaces need no second database; opening one for
+    every `jarvis wo show` in the fleet to print nothing is the cost that argued them
+    into columns in the first place.
+
+    **"Proposed, not yet registered" IS NOT AN ERROR.** A fix order is filed BEFORE its
+    rule exists — that is the whole order of events, and the normal state of a fresh one
+    — so a `detector_id` naming no row is reported as what it is, in words, and never as
+    a failure. What refuses an unregistered rule is `rules.precheck`, at submission, with
+    a reason that says how to fix it; this surface only describes.
+
+    The CLI consumes this dict verbatim and derives nothing from it, so `line` is written
+    here and the terminal and the dashboard cannot drift.
+    """
+    gap = str(wo.get("gap_class") or "").strip()
+    if not gap:
+        return None
+    detector_id = str(wo.get("detector_id") or "").strip()
+    remedy_rule_id = str(wo.get("remedy_rule_id") or "").strip()
+    trigger_wo_id = str(wo.get("trigger_wo_id") or "").strip()
+
+    detector: dict[str, Any] | None = None
+    if detector_id:
+        central = CentralStore()
+        try:
+            detector = central.get_detector(detector_id)
+        finally:
+            central.close()
+
+    if not detector_id:
+        detector_note = "no detector named yet"
+    elif detector is None:
+        detector_note = f"detector {detector_id} — proposed, not yet registered"
+    else:
+        detector_note = (f"detector {detector_id} — registered, "
+                         f"{detector.get('status') or 'dry_run'}")
+
+    parts = [f"gap class {gap}", detector_note]
+    if remedy_rule_id:
+        parts.append(f"remedy rule {remedy_rule_id}")
+    parts.append(f"proved against {trigger_wo_id}" if trigger_wo_id
+                 # The refusal `rules.precheck` would print names the same argument, so
+                 # the two surfaces say the same thing about the same missing field.
+                 else "no triggering order named (`jarvis wo create --trigger-wo-id`)")
+    return {"gap_class": gap, "detector_id": detector_id,
+            "remedy_rule_id": remedy_rule_id, "trigger_wo_id": trigger_wo_id,
+            "detector_registered": detector is not None,
+            "detector_status": str((detector or {}).get("status") or ""),
+            "line": " · ".join(parts)}
+
+
 def automerge_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
     """What `jarvis wo show` and the dashboard say about the automatic merge, or None.
 
@@ -4076,16 +4149,38 @@ def review_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | No
     escalated = (wo["status"] == "needs_review" and validation_escalated(store, wo))
     if not pending and not escalated:
         return None
-    latest = store.latest_validation_round(wo_id=wo["id"]) if escalated else None
+    # The same row the boolean came from, per spec §A of
+    # docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md.
+    latest = store.last_judged_round(wo_id=wo["id"]) if escalated else None
+    # WHY THE PANEL HANDED IT OVER, and the command this order's shape accepts — spec
+    # docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md
+    # §3, §4. Derived HERE and nowhere else, so the terminal and the page cannot word one
+    # escalation two ways; None/empty on an order that is not escalated.
+    cause = (escalation_cause(store, wo_id=wo["id"], round_id=int(latest["id"]))
+             if latest else None)
+    family = ESCALATION_FAMILY[cause] if cause else None
     rows = f"{pending} pending assumption" + ("" if pending == 1 else "s")
+    # Only a `handover` round carries a panel opinion — every other family was never
+    # judged, so the clause would be false (`escalation_next`'s rule, Neo 1723).
+    landing = ("" if not escalated else
+               " over the panel's objection" if family == "handover"
+               else " without a panel verdict")
     accept = ("Accepts " + rows + " and lands" if pending else "Lands") + \
-        " the work order" + (" over the panel's objection" if escalated else "")
+        " the work order" + landing
     reject = ("Rejects " + rows + " and resumes" if pending else "Resumes") + \
         " the worker, with your reason as the guidance it is sent back with"
     return {
         "pending": pending,
         "escalated": escalated,
         "round": int(latest["round"]) if latest else None,
+        "cause": cause,
+        "family": family,
+        "verb": ESCALATION_VERB[family] if family else None,
+        "why": (ESCALATION_WHY[cause].format(n=int(latest["round"]),
+                                             rebind_max=REBIND_MAX,
+                                             bounce_limit=BOUNCE_LIMIT)
+                if cause else None),
+        "next": escalation_next(wo, family) if family else [],
         "placement": "assumptions" if pending else "validation",
         "scope": "One decision, and it settles the whole order — every pending "
                  "assumption and the order itself, in a single call",
@@ -4094,6 +4189,72 @@ def review_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | No
         "strands": "Rejecting with no reason leaves the work order flagged and the "
                    "worker unguided.",
     }
+
+
+def escalation_next(wo: dict[str, Any], family: str) -> list[str]:
+    """The commands this escalated order accepts, in the order a reader can act.
+
+    Spec
+    docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md
+    §4. `jarvis validation force` is offered ONLY to an `unjudged` family WITH a pull
+    request, for two separate reasons: `force_validation_refusal` refuses a no-PR force,
+    which is issue #1040 itself; and neither of the other written families would gain
+    anything from a forced round — a `handover` order was judged, so the same seats would
+    re-run on the same unchanged work, and a `not_reviewed` one has nothing to judge until
+    the submission itself changes. FAMILY PICKS THE VERB AND FORCE-ELIGIBILITY SEPARATELY:
+    that is why `not_reviewed` could be split off `handover` without changing this
+    predicate.
+
+    It does NOT call `force_validation_refusal` — that takes a resolved `cfg` and this
+    projection has no config and must stay free of one. The two predicates may differ in
+    strictness in ONE direction only, and a test pins it.
+
+    FAMILY ALSO PICKS THE WORDING: only `handover` has a panel opinion, so only it may
+    cite the panel's asks or objection. `not_reviewed`, `unjudged` and `unrecorded` get
+    the neutral pair — `unrecorded` included, because a legacy event with no cause may
+    have been an unjudged round, which would make the panel clause false (Neo 1723).
+    """
+    wo_id = str(wo["id"])
+    if family == "handover":
+        lines = [
+            f'jarvis wo review {wo_id} --reject --feedback "<what to change>" — resumes '
+            f"the worker with the panel's asks as its guidance.",
+            f'jarvis wo review {wo_id} --feedback "<why>" — lands it over the panel\'s '
+            f"objection.",
+        ]
+    else:
+        lines = [
+            f'jarvis wo review {wo_id} --reject --feedback "<what to change>" — resumes '
+            f"the worker with your reason as its guidance.",
+            f'jarvis wo review {wo_id} --feedback "<why>" — lands it without a panel '
+            f"verdict.",
+        ]
+    if family == "unjudged" and str(wo.get("pr_url") or ""):
+        lines.append(
+            f'jarvis validation force {wo_id} --reason "<why>" — judges the current pull '
+            f"request again; worth it only because no seat ever judged this one.")
+    return lines
+
+
+def review_lines(state: dict[str, Any]) -> list[str]:
+    """The decision this order owes, as lines — THE ONE BUILDER both CLI surfaces print.
+
+    Spec
+    docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md
+    §5: `jarvis wo show` and `jarvis validation show` would otherwise word one decision
+    two ways. `where` reads the verb off `review_state` rather than hardcoding
+    `gave up`, which named no cause and read as "nobody judged this" for the four
+    rejections that reach the same transition.
+    """
+    owed = "pending assumption" + ("" if state["pending"] == 1 else "s")
+    where = (f"round {state['round']} {state['verb']}" if state["escalated"]
+             else f"{state['pending']} {owed}")
+    lines = [f"owed: {where} — {state['scope']}."]
+    if state.get("why"):
+        lines.append(f"why: {state['why']}")
+    lines += [f"next: {command}" for command in state.get("next") or []]
+    return lines + [f"accept: {state['accept']}",
+                    f"reject: {state['reject']} {state['strands']}"]
 
 
 def assumption_decider(a: dict[str, Any]) -> str:
@@ -4801,10 +4962,13 @@ def validation_view(unit_id: str, project_name: str | None = None) -> dict[str, 
     store = ProjectStore(path)
     try:
         detail = validation_detail(store, **subject)  # type: ignore[arg-type]
+        # Spec 2026-10-14-an-escalated-round-says-why-and-what-to-run-next §5.
+        owed = review_state(store, row) if unit == "work_order" else None
     finally:
         store.close()
     return {"project": name, "unit": unit, "id": unit_id,
-            "title": row["title"], "status": row["status"], **detail}
+            "title": row["title"], "status": row["status"], **detail,
+            **({"review": owed} if owed else {})}
 
 
 def current_config_version() -> str | None:
@@ -4898,7 +5062,9 @@ def land_finished(store: ProjectStore, wo: dict[str, Any],
         if stranding.produced:
             return park_unlanded(store, wo, stranding)
     status = "waiting_pr_merge" if pr_url else "completed"
-    store.set_status(wo_id, status)
+    # Spec §C of
+    # docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md.
+    store.set_status(wo_id, status, trigger="landed")
     store.clear_attention(wo_id)
     if wo.get("backlog_id") and status == "completed":
         central = CentralStore()
@@ -5361,6 +5527,32 @@ already answered, or should not be, say which and why in `--evidence` and change
 file it is about anyway — the review cannot read an argument you did not make in the
 diff. Then run `jarvis wo finish {wo_id} --summary "..." --evidence "..."` again."""
 
+#: WHAT A FIX ORDER REFUSED BY THE PRE-CHECK IS TOLD (§7.2 of
+#: docs/superpowers/specs/2026-09-27-self-evolution.md). Shaped on `BOUNCE_FEEDBACK` and
+#: unnumbered for its reason: no round was opened at this site, so none was spent, and a
+#: number here would teach the submitter it has fewer attempts than it has. The refusal
+#: itself is `rules.precheck`'s words VERBATIM — it already names what is missing and the
+#: argument that supplies it (kn-85265170), and re-wording it here would give one refusal
+#: two spellings in one release.
+PRECHECK_FEEDBACK = """REVIEW FEEDBACK (no round was spent)
+{reason}
+
+This submission was not sent to the panel. The seats judge the QUALITY of a rule —
+whether the condition matches the real symptom, whether the remedy is the right
+primitive — and none of that can be judged until the rule exists and has been shown to
+fire on the order it is proved against. Nothing was registered for you: a fix order that
+has not registered its rule has not finished its job.
+
+Fix the above, then run `jarvis wo finish {wo_id} --summary "..." --evidence "..."`
+again."""
+
+#: The same refusal at the DAEMON site, where the round was numbered before the check
+#: could run and is therefore spent. `Daemon._reject` wraps this in `REVIEW_FEEDBACK`,
+#: which already says "round n of max"; this sentence is what makes the charge explicit,
+#: because a submitter that read the bounce wording above would believe this one was free.
+PRECHECK_SPENT_NOTE = (
+    "\n\nThis round was opened before the check could run, so it HAS been spent.")
+
 #: The give-up when that has happened `BOUNCE_LIMIT` times running.
 BOUNCE_EXHAUSTED = (
     "this work order has been sent back {n} times running for changing nothing round "
@@ -5370,27 +5562,53 @@ BOUNCE_EXHAUSTED = (
 
 
 def escalate_validation_round(store: ProjectStore, wo: dict[str, Any], round_id: int,
-                              n: int, reason: str) -> None:
+                              n: int, reason: str, *, cause: str) -> None:
     """Give up on this unit and ask the user. THE ONE HOME of that transition.
 
     Called by `Daemon._escalate`, whose docstring carries the reasoning for every line
     below — why the attention reason is `VALIDATION_STUCK_BLOCKER` verbatim, why the
     notification is the half the flag cannot do, and why Neo is not asked first.
+
+    `cause` is KEYWORD-ONLY and REQUIRED: a default would let the next call site added be
+    the next silent `unrecorded`, and a missing cause IS the defect (spec
+    docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md
+    §2, rejected alternative 6). It rides in the EVENT PAYLOAD and not on the round —
+    `close_validation_round` and `COUNTED_VALIDATION_OUTCOMES` are untouched, because the
+    cause is not an outcome (Neo 1713).
     """
-    from .daemon import VALIDATION_ESCALATED_TITLE, escalation_body
+    from .daemon import escalation_body
     from .invariants import VALIDATION_STUCK_BLOCKER
 
     wo_id = wo["id"]
     store.close_validation_round(round_id, "escalated", reason)
     store.add_event(wo_id, "validation_escalated",
-                    {"round": n, "round_id": round_id, "reason": reason})
+                    {"round": n, "round_id": round_id, "reason": reason,
+                     "cause": cause})
     store.set_status(wo_id, "needs_review")
     store.flag_attention(wo_id, VALIDATION_STUCK_BLOCKER)
     store.add_notification(
-        title=VALIDATION_ESCALATED_TITLE.format(unit=wo_id, n=n),
+        # Spec 2026-10-14-an-escalated-round-says-why-and-what-to-run-next §3.
+        title=ESCALATION_TITLE.format(
+            unit=wo_id, n=n, verb=ESCALATION_VERB[ESCALATION_FAMILY[cause]]),
         body=escalation_body(reason), level="warning", wo_id=wo_id,
         source="validation",
     )
+
+
+def escalation_cause(store: ProjectStore, *, wo_id: str, round_id: int) -> str:
+    """WHICH CONDITION escalated this round, or `ESCALATION_CAUSE_UNRECORDED`.
+
+    Spec
+    docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md
+    §2. KEYED ON `round_id` AND NOT ON `round`: a rebind spends a row number without
+    spending budget, so `round` is not unique on an order that had one (see
+    `Daemon._validate_work_order`'s rebind arm).
+    """
+    for event in reversed(store.events_of_kind(wo_id, "validation_escalated")):
+        payload = db.from_json(event["payload"], {})
+        if int(payload.get("round_id") or 0) == int(round_id):
+            return str(payload.get("cause") or ESCALATION_CAUSE_UNRECORDED)
+    return ESCALATION_CAUSE_UNRECORDED
 
 
 def _worktree_file_test(project_path: Path,
@@ -5505,6 +5723,11 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
     A FORCED ROUND IS NEVER BOUNCED, for `Daemon._repeat_submission`'s reason: there is
     no submitter to send anything back to.
 
+    **IT ALSO RETURNS None WHEN THE §7.2 PRE-CHECK REFUSED A FIX ORDER** — same shape,
+    same park, and for the same reason: no round is opened and none is spent. That check
+    runs FIRST, above everything below, because the packet is the next expense after the
+    round (spec docs/superpowers/specs/2026-09-27-self-evolution.md §7.2).
+
     THE COMPLETE CALLER SET, because `None` is a new answer they all have to be able to
     meet: `finish` (the only one that can see it, and the one that passes `panel_open`);
     `force_validation` and `rejudge_for_head`, both forced, so both still get a row; and
@@ -5515,6 +5738,30 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
     """
     from . import evidence as evidence_mod
     from . import specs
+
+    # THE MECHANICAL GATE, BEFORE THE PACKET AND BEFORE THE ROUND (§7.2 of
+    # docs/superpowers/specs/2026-09-27-self-evolution.md). The round is what costs
+    # money, so a refusal that opened one has already failed at its job — and a
+    # paperwork failure must not burn a round number in a feature whose whole subject is
+    # orders that burn rounds for nothing. `fix_order_precheck` returns None instantly
+    # for an empty `gap_class`, which is almost every order, and reads nothing at all.
+    #
+    # FORCED SUBMISSIONS ARE EXEMPT AT THIS SITE ONLY (Neo, question 1681): the forced
+    # callers — `force_validation`, `rejudge_for_head`, every `uncounted` rebind —
+    # dereference this function's return immediately and would crash on None, and there
+    # is no submitter to send the refusal back to. The same exemption the bounce below
+    # already has, and for the same reason. The daemon site has NO exemption: there the
+    # round already exists, so the refusal can be delivered through `_reject`.
+    # The sink: checks the pre-check PASSED WITHOUT EVALUATING, carried into the packet so
+    # the checklist does not claim they were decided mechanically (§7.3). Stays empty on
+    # every forced submission, which skips the check entirely.
+    unproven: list[str] = []
+    if not (forced_reason.strip() or uncounted):
+        refusal = fix_order_precheck(store, project_path, wo, unproven=unproven)
+        if refusal is not None:
+            _precheck_refused(store, wo, refusal,
+                              store.numbered_validation_rounds(wo_id=wo["id"]) + 1)
+            return None
 
     # A FIX ASKED FOR BY A REBIND IS ITSELF A REBIND (spec 2026-09-27-a-conflict-
     # resolution-the-os-asked-for-costs-no-round §4.4). The worker was sent back by a
@@ -5540,7 +5787,8 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
         project_path, wo, declared=declared, diff_chars=cfg.diff_chars,
         spec=specs.spec_of(store, wo), side_effects=side_effects_of(store, str(wo["id"])),
         # The store read is the caller's: `evidence` may not touch a database (spec §4).
-        assumptions=store.all_assumptions(wo["id"]))
+        assumptions=store.all_assumptions(wo["id"]),
+        unproven=tuple(unproven))
     # The NUMBER, not the budget position: a rebind spends one without spending the
     # other (spec 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.1).
     nxt = store.numbered_validation_rounds(wo_id=wo["id"]) + 1
@@ -5567,7 +5815,8 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
         escalate_validation_round(
             store, wo, int(round_row["id"]), nxt,
             BOUNCE_EXHAUSTED.format(n=BOUNCE_LIMIT, round=int(previous["round"]),
-                                    paths=", ".join(cited)))
+                                    paths=", ".join(cited)),
+            cause=ESCALATION_BOUNCE_EXHAUSTED)
         # RE-READ, because the row above is the one that was opened and the caller has to
         # be able to see that it has already been settled. `finish` reads this outcome to
         # know not to land the work order: `land_when_cleared` LANDS an `escalated` round
@@ -5615,6 +5864,231 @@ def _bounce(store: ProjectStore, wo: dict[str, Any], previous: dict[str, Any],
                  round=n, outcome="rejected",
                  reason=BOUNCE_FEEDBACK.format(n=n, wo_id=wo_id,
                                                paths=", ".join(cited))))
+
+
+#: Check 4 passed unevaluated, from THIS side of the seam — the closure holds the
+#: primitive and the subject, never the remedy row, so the sentence names what it has.
+#: `rules._check_4_note` is the same shape from the other side; one spelling, two homes
+#: because neither module may import the other's locals (§7.3).
+_CHECK_4_NOT_RUN = ("check 4, that `{primitive}` can actually run against the triggering "
+                    "order, was not run: {why}.")
+
+#: The whole pre-check failed, so NONE of §7.2's four checks ran. The outer `except` arm's
+#: note: the submission goes through (the pinned kn-b7deec8f ruling) and the packet says
+#: nothing mechanical stands behind it, instead of claiming all four were decided.
+_PRECHECK_NOT_RUN = ("checks 1-4, the whole mechanical pre-check of this fix order's "
+                     "detector and remedy, were not run: the pre-check itself could not "
+                     "be completed ({why}).")
+
+
+def fix_order_precheck(store: ProjectStore, project_path: Path, wo: Mapping[str, Any],
+                       *, central: Any = None,
+                       unproven: list[str] | None = None) -> str | None:
+    """Why this FIX ORDER may not be judged yet, in `rules.precheck`'s words, or None.
+
+    §7.2 of docs/superpowers/specs/2026-09-27-self-evolution.md. `rules.precheck` is
+    PURE and this is everything impure it needs: the registry rows, the triggering
+    order's recorded facts and the `can_apply` seam. TWO CALLERS, and they are a pair —
+    `submit_for_validation` before the round is opened, `Daemon._validate_work_order`
+    before the validator is paid, for the routes that do not pass through `finish`.
+
+    **NOTHING IS READ AT ALL WHEN `gap_class` IS EMPTY**, which is almost every order in
+    the fleet: the early return is above every store read on purpose, so the ordinary
+    submission pays nothing for a feature it is not part of.
+
+    `central` is the CentralStore to read the registry from. The daemon passes its OWN —
+    `_validate_work_order` runs on the validate thread and a sqlite connection belongs to
+    the thread that created it — and everything else lets this open and close one.
+
+    **NEVER FABRICATE A DEFAULT ANSWER FROM A FAILURE** (the pinned ruling, kn-b7deec8f's
+    half of it): a detector row that cannot be read, a snapshot that cannot be built, a
+    store that cannot be opened — each is UNREADABLE, and an unreadable input may not
+    produce a refusal. So every failure here returns None and the submission goes to the
+    panel, which is the direction that leaves the subject alone: refusing an order
+    because the OS could not run its own check would charge a submitter for the OS's
+    outage, and the check stays retryable on the next submission.
+
+    **EVERY SUCH PASS-THROUGH NOW LEAVES A NOTE IN `unproven`** (§7.3): one sentence per
+    check that passed without being evaluated, which the packet renders so a seat is told
+    the OS could not decide it rather than told it was all decided mechanically. The
+    hidden skip is what round 2 of this feature's own panel caught. A failure that is the
+    SUBMITTER'S INPUT is not in here at all — a `--trigger-wo-id` naming no order refuses,
+    in `rules.TRIGGER_MISSING_REFUSAL`'s words.
+    """
+    # `rules` is imported at module level; `remedies` is not, and this is the only
+    # reader of it here.
+    from . import remedies as remedies_mod
+
+    row = dict(wo or {})
+    if not str(row.get("gap_class") or "").strip():
+        return None
+    own = central is None
+    try:
+        # INSIDE the try: a `CentralStore()` that cannot be opened is the same unreadable
+        # input as a row that cannot be read, and raising out of here would turn the
+        # pass-through this whole docstring describes into a crashed submission.
+        central = CentralStore() if own else central
+        project = central.project_name_for_path(project_path)
+        detectors = central.detectors_for_gap(str(row["gap_class"]).strip(), project)
+        # The canonical shape `rules._rows_for` wants: detector id -> rows, which costs
+        # one query per detector for a gap class rather than a scan of the table.
+        remedy_rules = {str(d.get("id") or ""):
+                        central.remedy_rules_for(str(d.get("id") or ""))
+                        for d in detectors}
+        trigger, unreadable, missing = _triggering_order(store, row)
+        trigger_facts = None
+        if trigger is not None:
+            try:
+                trigger_facts = rules.facts(store, trigger, now=time.time())
+            except Exception as exc:  # noqa: BLE001 — see the docstring's pinned ruling
+                log.warning("could not build the facts of %s, the order %s is proved "
+                            "against: %s", trigger.get("id"), row.get("id"), exc)
+                unreadable = (f"its recorded state could not be read ({exc})")
+
+        def precondition(primitive: str, params: Mapping[str, Any]) -> str:
+            """Check 4's seam: `remedies.REMEDIES[primitive].can_apply` against the
+            SAME subject the condition was evaluated on.
+
+            **THIS SEAM'S RETURN TYPE IS `str` AND IT STILL HAS NO THIRD CHANNEL.**
+            `rules.precheck` branches on `if sentence:`, so the only two things this can
+            RETURN are "a sentence, refuse" and "anything falsy, proceed". Both arms
+            below are cases where NOBODY COULD ANSWER, and both therefore PASS check 4
+            rather than answer it — the pinned never-fabricate-a-default-answer-from-a-
+            failure direction, because the alternative is refusing a submitter for the
+            OS's own outage.
+
+            **THE THIRD CHANNEL IS `unproven`, AND IT IS WHAT kn-b7deec8f ASKED FOR**:
+            the "not determinable" state neither `""` nor a refusal can carry is now
+            RECORDED out of band and rendered in the packet (§7.3), instead of the order
+            reaching the panel with check 4 silently unevaluated. The return shape is
+            unchanged on purpose — a gate returns a reason or nothing, which is house law
+            (`evidence.nothing_to_judge`, `automerge.decide`).
+            """
+            remedy = remedies_mod.REMEDIES.get(primitive)
+            if remedy is None or trigger is None:
+                # No registry entry to ask, or no subject to ask it about. Nothing
+                # computed an answer, so check 4 is passed unevaluated — and says so.
+                rules.note_unproven(unproven, _CHECK_4_NOT_RUN.format(
+                    primitive=primitive,
+                    why=("there is no registry entry for that primitive, or no "
+                         "triggering order to ask it about")))
+                return ""
+            try:
+                return str(remedy.can_apply(store, dict(trigger),
+                                            dict(params or {})) or "")
+            except Exception as exc:  # noqa: BLE001 — a predicate that RAISED produced
+                # no answer either, so the same thing happens: check 4 is passed
+                # unevaluated and the submission goes to the panel, because a refusal
+                # built on an exception would charge the submitter for the OS's fault.
+                log.warning("the `can_apply` of %s raised on %s: %s",
+                            primitive, trigger.get("id"), exc)
+                rules.note_unproven(unproven, _CHECK_4_NOT_RUN.format(
+                    primitive=primitive,
+                    why=f"its `can_apply` raised against "
+                        f"{trigger.get('id')} ({exc})"))
+                return ""
+
+        return rules.precheck(detectors, remedy_rules, row, trigger_facts,
+                              precondition=precondition,
+                              trigger_unreadable=unreadable,
+                              trigger_missing=missing,
+                              unproven=unproven)
+    except Exception as exc:  # noqa: BLE001 — the pinned ruling again: UNREADABLE, not
+        # refused. The note is what stops the packet claiming four checks nobody ran.
+        log.exception("the self-evolution pre-check on %s could not be run",
+                      row.get("id"))
+        rules.note_unproven(unproven, _PRECHECK_NOT_RUN.format(why=exc))
+        return None
+    finally:
+        if own and central is not None:
+            central.close()
+
+
+def _triggering_order(
+        store: ProjectStore,
+        wo: Mapping[str, Any]) -> tuple[dict[str, Any] | None, str, str]:
+    """The order this fix order's rule is proved against, why it is UNREADABLE, and the
+    id it named that the records do not have.
+
+    THE COLUMN FIRST, THE CHAIN SECOND (§7.2). `trigger_wo_id` set is the whole answer
+    and nothing infers over it: the submitter said which order this rule is proved
+    against. Only when it is empty does the fallback run —
+    `metadata[ORIGIN_IO_KEY]` to the improvement order, its `--ref` evidence, a concrete
+    order in THIS project — and that fallback exists for the fix order filed by hand, or
+    filed before the column shipped; it is a convenience and never the contract.
+
+    `(None, "", "")` — nothing named and nothing inferred — is the REFUSAL case and is the
+    caller's to spell: `rules.precheck` refuses on `trigger_facts=None` with an empty
+    `trigger_unreadable`. A named order that cannot be READ returns the reason in the
+    second slot, and the submission goes through to the panel with the packet saying so.
+
+    **A NAMED ID THE RECORDS DO NOT HAVE IS THE THIRD SLOT, NOT THE SECOND.** It used to
+    come back as unreadable, which passed checks 3 and 4 unevaluated: a fix order could
+    skip the dry run entirely by naming an id that does not exist. The id came out of the
+    submitter's own `--trigger-wo-id`, so it is INPUT and `rules.precheck` refuses on it
+    (`TRIGGER_MISSING_REFUSAL`). A `KeyError` is that case and nothing else; ANY OTHER
+    exception from the same read is a genuine store failure and stays unreadable. The
+    inferred-chain fallback never produces a missing id — nothing the submitter typed can
+    be wrong there.
+    """
+    named = str(wo.get("trigger_wo_id") or "").strip()
+    if named:
+        try:
+            return store.get_work_order(named), "", ""
+        except KeyError:
+            return None, "", named
+        except Exception as exc:  # noqa: BLE001 — the store could not answer at all:
+            # UNREADABLE, the pinned kn-b7deec8f direction, and NOT the refusal above.
+            log.warning("the triggering order %s named by %s could not be read: %s",
+                        named, wo.get("id"), exc)
+            return None, (f"the triggering order {named} could not be read from this "
+                          f"project's records ({exc})"), ""
+    metadata = db.from_json(wo.get("metadata"), {}) or {}
+    io_id = str(metadata.get(ORIGIN_IO_KEY) or "")
+    if not io_id:
+        return None, "", ""
+    try:
+        _name, _path, io = find_feature_order(io_id, None)
+        refs = evidence_refs(io)
+    except Exception as exc:  # noqa: BLE001 — a back-link that does not resolve is a
+        # fact about the OS's records, not an error: the refusal below says so.
+        log.warning("the improvement order %s behind %s could not be read: %s",
+                    io_id, wo.get("id"), exc)
+        return None, "", ""
+    for ref in refs:
+        try:
+            return store.get_work_order(str(ref)), "", ""
+        except KeyError:
+            continue
+    return None, "", ""
+
+
+def _precheck_refused(store: ProjectStore, wo: Mapping[str, Any], reason: str,
+                      would_be: int) -> None:
+    """Send a fix order back without convening the panel and without opening a round.
+
+    `_bounce`'s shape, and for its reasons — THE EVENT IS NOT OPTIONAL, and it is written
+    BEFORE the envelope so a bus that refuses still leaves the record saying what
+    happened. It carries the four §7.1 columns because the refusal is ABOUT them: a
+    reader who disagrees can see which detector and which triggering order were judged
+    without re-running anything.
+
+    Not `_bounce` itself: that one is keyed to a PREVIOUS round, and this refusal can
+    happen on round 1 — a fix order's first submission is the commonest place for it.
+    """
+    wo_id = str(wo["id"])
+    store.add_event(wo_id, "validation_refused",
+                    {"would_be_round": would_be,
+                     "gap_class": str(wo.get("gap_class") or ""),
+                     "detector_id": str(wo.get("detector_id") or ""),
+                     "remedy_rule_id": str(wo.get("remedy_rule_id") or ""),
+                     "trigger_wo_id": str(wo.get("trigger_wo_id") or ""),
+                     "reason": reason})
+    bus.post(store, subject=bus.Subject(wo_id=wo_id),
+             from_role="reviewer", to_role="implementor",
+             payload=bus.ReviewFeedback(
+                 round=would_be, outcome="rejected",
+                 reason=PRECHECK_FEEDBACK.format(reason=reason, wo_id=wo_id)))
 
 
 def force_validation_refusal(store: ProjectStore, wo: dict[str, Any], *,
@@ -7131,7 +7605,9 @@ def resettle_after_repair(store: ProjectStore, wo_id: str) -> bool:
     probe["status"] = "waiting_pr_merge"
     if true_blockers(store, probe):
         return False
-    store.set_status(wo_id, "waiting_pr_merge")
+    # Spec §C of
+    # docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md.
+    store.set_status(wo_id, "waiting_pr_merge", trigger="pr_repair_resettled")
     store.add_event(wo_id, "pr_repair_resettled",
                     {"pr_url": wo.get("pr_url"), "was": wo["status"]})
     store.clear_attention(wo_id)
@@ -7221,6 +7697,111 @@ USER_REWORK_CAUSE = "user_rework"
 #: Spec docs/superpowers/specs/2026-10-13-a-red-head-is-sent-back-before-the-panel.md §3.3
 #: — bounded by `validation.red_ci_returns`, which is why there is no constant beside it.
 RED_CI_CAUSE = "red_ci"
+
+#: WHICH CONDITION ESCALATED A ROUND, written in the `validation_escalated` event payload.
+#: Spec docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md
+#: §1: eight call sites reached one transition and "escalated" covered all of them, so the
+#: user could not tell a REJECTION handed over from "nobody judged the work" — wo-3768437b
+#: sat 4.8 days on that. Beside the `uncounted_cause` constants because an escalation cause
+#: is the same kind of fact about a round and a second home would drift.
+ESCALATION_ROUNDS_SPENT = "rounds_spent"
+ESCALATION_USER_REWORK_CEILING = "user_rework_ceiling"
+ESCALATION_REBINDS_SPENT = "rebinds_spent"
+ESCALATION_BOUNCE_EXHAUSTED = "bounce_exhausted"
+ESCALATION_NOTHING_TO_JUDGE = "nothing_to_judge"
+ESCALATION_REPEAT_SUBMISSION = "repeat_submission"
+ESCALATION_NO_VERDICT = "no_verdict"
+ESCALATION_VALIDATOR_UNREACHABLE = "validator_unreachable"
+ESCALATION_PROMPT_REFUSED = "prompt_refused"
+#: A KILL IS NOT AN OUTAGE: the seats were reached and were killed by a signal, so
+#: `validator_unreachable` would state a transport failure nobody observed — spec
+#: docs/superpowers/specs/2026-10-14-a-killed-validation-panel-opens-an-investigation.md §4
+#: step 3 (kn-6ede3367).
+ESCALATION_PANEL_KILLED = "panel_killed"
+#: READ-TIME FALLBACK, never written by any call site: every `validation_escalated` event
+#: written before the field existed lacks it, and guessing a cause from its `reason` prose
+#: would put a wrong sentence — and a wrong command — on an old order (spec §1).
+ESCALATION_CAUSE_UNRECORDED = "unrecorded"
+
+#: THREE WRITTEN FAMILIES, and the family decides the VERB alone. `handover` — the panel
+#: rejected the work and is handing the decision over; `not_reviewed` — a round opened and
+#: no seat judged the submission, so nothing was rejected; `unjudged` — the panel itself
+#: never produced an opinion. `not_reviewed` exists because its three causes are not
+#: rejections and the `handover` verb claimed they were, against their own `ESCALATION_WHY`
+#: sentence (kn-bec32368: one escalation, one wording). It is NOT force-eligible:
+#: `escalation_next` gates `jarvis validation force` on `unjudged` and a pull request, so
+#: these three stay ineligible without that predicate changing.
+#: ONE DICT, so a cause added without a family is a `KeyError`
+#: in the first test that touches it rather than a blank sentence in production (spec §1).
+ESCALATION_FAMILY: dict[str, str] = {
+    ESCALATION_ROUNDS_SPENT: "handover",
+    ESCALATION_USER_REWORK_CEILING: "handover",
+    ESCALATION_REBINDS_SPENT: "handover",
+    ESCALATION_BOUNCE_EXHAUSTED: "not_reviewed",
+    ESCALATION_NOTHING_TO_JUDGE: "not_reviewed",
+    ESCALATION_REPEAT_SUBMISSION: "not_reviewed",
+    ESCALATION_NO_VERDICT: "unjudged",
+    ESCALATION_VALIDATOR_UNREACHABLE: "unjudged",
+    ESCALATION_PROMPT_REFUSED: "unjudged",
+    ESCALATION_PANEL_KILLED: "unjudged",
+    ESCALATION_CAUSE_UNRECORDED: "unrecorded",
+}
+
+#: WHY this round escalated, one sentence per cause — spec §3's table. Each sentence must
+#: agree with its family's verb: a `not_reviewed` sentence says nobody judged, a `handover`
+#: sentence says the panel rejected (kn-bec32368).
+#: `user_rework_ceiling` is issue #1040's own case and the reason the wording rule is in
+#: the spec: a rejection with concrete asks and a spent budget is a decision, not an
+#: abandonment, and it must not read as "the panel gave up".
+ESCALATION_WHY: dict[str, str] = {
+    ESCALATION_ROUNDS_SPENT:
+        "the panel rejected this and had no round left: round {n} was its last "
+        "(validation.max_rounds).",
+    ESCALATION_USER_REWORK_CEILING:
+        "the panel rejected this. Round {n} was the round after your own rejection, "
+        "judged at the round budget's ceiling, so the rejection had no round left to "
+        "send back — nobody abandoned it, and its asks are in the round below.",
+    ESCALATION_REBINDS_SPENT:
+        "the panel rejected a merge the OS asked for itself, {rebind_max} times running.",
+    ESCALATION_BOUNCE_EXHAUSTED:
+        "the submitter was sent back {bounce_limit} times running for changing nothing "
+        "the panel asked about, and changed none of them. Nobody judged the latest "
+        "submission.",
+    ESCALATION_NOTHING_TO_JUDGE:
+        "the submission changed no files and recorded no other durable effect, so no "
+        "seat judged it.",
+    ESCALATION_REPEAT_SUBMISSION:
+        "the submission was identical to the preceding round, so the panel had nothing "
+        "new to judge.",
+    ESCALATION_NO_VERDICT: "the panel reached no verdict. Nobody has judged the work.",
+    ESCALATION_VALIDATOR_UNREACHABLE:
+        "the panel could not be reached, so nobody has judged the work.",
+    ESCALATION_PROMPT_REFUSED:
+        "the OS built a seat prompt over its character ceiling and never sent it, so "
+        "nobody has judged the work.",
+    ESCALATION_PANEL_KILLED:
+        "the panel's seats were killed by a signal before they could judge this "
+        "submission, so nobody judged the work.",
+    ESCALATION_CAUSE_UNRECORDED:
+        "this round was escalated before the OS recorded which condition fired; the "
+        "reason on the round below is what the panel said.",
+}
+
+#: What `round {n} …` reads as per family, for `cli._readable_review`'s `where` clause.
+#: Written here with the rest of the sentences (spec §3): a phrase in the CLI could not
+#: reach the dashboard.
+ESCALATION_VERB: dict[str, str] = {
+    "handover": "was rejected and handed to you",
+    "not_reviewed": "was not reviewed",
+    "unjudged": "could not be judged",
+    "unrecorded": "was escalated",
+}
+
+#: The WORK ORDER give-up notification, worded off the same verbs — spec §3's rule
+#: that one vocabulary serves every surface. `daemon.VALIDATION_ESCALATED_TITLE` stays as
+#: it is and now serves `Daemon._escalate_feature` alone: a feature-order escalation
+#: records no cause (spec §Not covered), so it has no family to name.
+ESCALATION_TITLE = "{unit} — round {n} {verb}"
 
 #: `proof` on `CARRY_REFUSED_EVENT`, one value per condition — the `automerge` hold-code
 #: discipline, so a reader can tell "someone resolved a conflict" from "the daemon could
@@ -11618,6 +12199,17 @@ def rule_facts(store: ProjectStore, wo: dict[str, Any], *, now: float,
             if name:
                 counts[name] = counts.get(name, 0) + 1
         values["invariant_events"] = counts
+
+    if need("validation_failures"):
+        # BY CAUSE, off the payloads — `event_counts` keys on the KIND, which transport,
+        # auth and killed all share. Spec §5: docs/superpowers/specs/
+        # 2026-10-14-a-killed-validation-panel-opens-an-investigation.md
+        causes: dict[str, int] = {}
+        for event in store.events_of_kind(wo_id, "validation_failed"):
+            cause = str(db.from_json(event["payload"], {}).get("cause") or "")
+            if cause:
+                causes[cause] = causes.get(cause, 0) + 1
+        values["validation_failure_causes"] = causes
 
     if need("dependencies"):
         values["depends_on_count"] = len(store.dependencies(wo))

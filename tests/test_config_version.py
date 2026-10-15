@@ -210,6 +210,21 @@ def test_the_fallback_is_the_only_behaviour_available_today():
     assert cv.validation_config_from_resolved(resolved, "proj_a").max_rounds == 5
 
 
+def test_the_killed_retry_bound_resolves_out_of_a_stored_map():
+    """§4b, step 5 of docs/superpowers/specs/
+    2026-10-14-a-killed-validation-panel-opens-an-investigation.md: this function walks
+    `fields(ValidationConfig)`, so the new key is resolved the moment it exists and a
+    round is judged under the bound it was opened with."""
+    assert cv.validation_config_from_resolved(
+        {"os.validation.killed_retries": 7}).killed_retries == 7
+    assert (cv.validation_config_from_resolved({}).killed_retries
+            == catalog.DEFAULT_VALIDATION_KILLED_RETRIES)
+    assert cv.validation_config_from_resolved(
+        {"os.validation.killed_retries": 3,
+         "projects.proj_a.validation.killed_retries": 0},
+        "proj_a").killed_retries == 0
+
+
 def test_a_map_written_before_a_field_existed_falls_back_to_that_fields_default():
     """A historical version is never migrated (§6). A key added by a later release is
     simply absent from an old row, and the shipped default has to stand for it."""

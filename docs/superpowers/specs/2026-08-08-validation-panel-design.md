@@ -679,10 +679,12 @@ rows in any new table, and no manager order created.
 | `seat_models` / `chair_model` | `{}` / `""` | the chair writes what a human reads |
 | `timeout` | `300` | per seat, seconds |
 | `max_rounds` | `3` | per unit, then escalate |
+| `red_ci_returns` | `3` | red head sent back this many times before escalating; spec `docs/superpowers/specs/2026-10-13-a-red-head-is-sent-back-before-the-panel.md` |
+| `killed_retries` | `3` | rounds killed by a signal re-judged this many times before escalating; `0` is legal and escalates on the first kill; spec `docs/superpowers/specs/2026-10-14-a-killed-validation-panel-opens-an-investigation.md` |
 | `diff_chars` | `60000` | truncation limit |
 | `feature_units` | `true` | whether feature orders validate too, independently of work orders |
 
-`projects[].validation` takes the same eight keys and overrides `os.validation` key by
+`projects[].validation` takes the same keys and overrides `os.validation` key by
 key, so one project can validate while the fleet does not — see
 `docs/superpowers/specs/2026-08-27-the-config-console.md` §1.2. `ProjectSpec.validation`
 is the resolved answer, and every read above is project-aware.

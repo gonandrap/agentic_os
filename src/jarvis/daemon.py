@@ -614,6 +614,31 @@ FEATURE_HANDOFF_EVENT = "manager_handoff"
 #: stall this feature exists to remove.
 VALIDATION_OUTAGE_LIMIT = 3
 
+#: `cause` on the `validation_failed` event of a round whose seats were KILLED BY A
+#: SIGNAL. ITS OWN CAUSE, never `"transport"`: every surface that reads these payloads
+#: (`holds`, `jarvis wo show`, the `validation_failure_causes` rule fact) tells the two
+#: apart only by this string, and a kill counted as an outage is both a false statement
+#: and a budget neither event exhausted (user ruling, Neo question 1705, condition i).
+#: How many are survived is `validation.killed_retries`, not a constant here — spec §4:
+#: docs/superpowers/specs/2026-10-14-a-killed-validation-panel-opens-an-investigation.md
+VALIDATION_KILLED_CAUSE = "killed"
+
+#: The rc off one seat's recorded reply, for the investigation's per-seat line. Read from
+#: the row rather than taken from the panel's exception because the seats may have died on
+#: different signals, and WHICH ones is part of what the investigation is about (spec §4a).
+_SEAT_RC_RE = re.compile(r"rc=(-?\d+)")
+
+
+def _seat_rc(reply: str, fallback: int) -> int:
+    match = _SEAT_RC_RE.search(reply)
+    return int(match.group(1)) if match else fallback
+
+
+def _moment(ts: float) -> str:
+    """A wall-clock moment to the SECOND. The co-incidence is the evidence — four seats
+    ending inside the same second — and a minute-resolution stamp loses it (spec §4a)."""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else "unknown"
+
 #: How long to wait before asking GitHub again whether the checks have finished. One
 #: minute, not one tick: the tick is 5 seconds and the answer changes on CI's clock, so
 #: re-asking every tick would spend a `gh pr view` per 5 seconds per parked order to
@@ -2838,8 +2863,27 @@ class Daemon:
                 0 if str(round_row["outcome"] or "") in COUNTED_VALIDATION_OUTCOMES
                 else 1)
             goes_back = (rebinds < ops.REBIND_MAX) if as_rebind else (pos < max_rounds)
+            # THE §7.2 PRE-CHECK RUNS HERE AND ACTS LOWER DOWN, and the split is
+            # deliberate: its verdict is needed BEFORE the packet so the checklist can
+            # name the checks it could not run (§7.3), while the refusal must stay in the
+            # band beside `nothing_to_judge` and `_repeat_submission` — moving the act up
+            # would reorder which guard answers a submission that trips two.
+            #
+            # ITS OWN `CentralStore`, for the reason this whole method opens its own
+            # `ProjectStore`: a sqlite connection belongs to the thread that created it,
+            # and `self.central` belongs to the daemon thread.
+            unproven: list[str] = []
+            central = CentralStore()          # thread-local — see the docstring
+            try:
+                refusal = ops.fix_order_precheck(store, project.path, wo,
+                                                 central=central, unproven=unproven)
+            finally:
+                central.close()
             packet = evidence_mod.collect_work_order(
                 project.path, wo, declared=str(round_row["evidence"] or ""),
+                # WHAT THE OS COULD NOT DECIDE ITSELF, so no seat is told all four §7.2
+                # checks were decided mechanically when one of them never ran (§7.3).
+                unproven=tuple(unproven),
                 diff_chars=cfg.diff_chars, spec=specs.spec_of(store, wo),
                 side_effects=ops.side_effects_of(store, wo_id),
                 assumptions=store.all_assumptions(wo_id),
@@ -2934,12 +2978,33 @@ class Daemon:
                 self._escalate(store, wo, round_id, n,
                                "this submission changes no files and records no other "
                                "durable effect, so there is nothing to review. Nobody "
-                               "has judged the work.")
+                               "has judged the work.",
+                               cause=ops.ESCALATION_NOTHING_TO_JUDGE)
                 return
             if empty == "void":
                 self._void(store, wo, round_id, n, evidence_mod.void_reason(packet))
                 log.info("[%s] %s: round %d voided — nothing for a reviewer to judge",
                          project.name, wo_id, n)
+                return
+
+            # THE §7.2 PRE-CHECK ACTS, A SECOND TIME, for the rounds that did not come
+            # through `ops.submit_for_validation`'s unforced path — spec
+            # docs/superpowers/specs/2026-09-27-self-evolution.md §7.2. In this band
+            # beside `nothing_to_judge` and `_repeat_submission`, and BEFORE
+            # `validator(...)`: the seats are the expense this exists to avoid. The CALL
+            # itself ran above the packet build — see the comment there.
+            #
+            # NO EXEMPTION FOR A FORCED ROUND HERE (Neo, question 1681). The submission
+            # site exempts them because they dereference its return; here the round
+            # exists, so the refusal has somewhere to land — and it SPENDS that round,
+            # which `PRECHECK_SPENT_NOTE` is what says out loud.
+            if refusal is not None:
+                self._reject(store, wo, round_id, n, max_rounds,
+                             refusal + ops.PRECHECK_SPENT_NOTE, budget_round=pos,
+                             rebind=(rebinds, ops.REBIND_MAX) if as_rebind else None,
+                             uncounted_cause=cause)
+                log.info("[%s] %s: round %d refused before the panel — %s",
+                         project.name, wo_id, n, refusal)
                 return
 
             # A REPEAT of the IMMEDIATELY PRECEDING round only. Compared against every
@@ -2962,7 +3027,8 @@ class Daemon:
                     store, wo, round_id, n,
                     f"this submission is identical to round {previous['round']} — the "
                     f"same changes and the same declared evidence — so the review has "
-                    f"nothing new to judge.")
+                    f"nothing new to judge.",
+                    cause=ops.ESCALATION_REPEAT_SUBMISSION)
                 return
 
             failure: claude_cli.ClaudeCliError | None = None
@@ -3007,6 +3073,14 @@ class Daemon:
                 # ceiling, so the next two would be built identically. Spec §4:
                 # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
                 self._validation_refused(store, project, wo, round_id, n, failure)
+                return
+            if isinstance(failure, claude_cli.KilledError):
+                # BEFORE the generic outage below — a `ClaudeCliError` subclass, so a
+                # clause after it is never reached — and on its own counter: a signal
+                # death is not a transport fault. Spec §4:
+                # docs/superpowers/specs/2026-10-14-a-killed-validation-panel-opens-an-investigation.md
+                self._validation_killed(store, project, wo, round_id, n,
+                                        failure.killed, cfg)
                 return
             if failure is not None:
                 self._validation_outage(store, wo, round_id, n, failure)
@@ -3067,13 +3141,23 @@ class Daemon:
                 # is over, so the follow-ups are filed rather than lost with it.
                 self._file_follow_ups(store, project, round_row, follow_ups, cfg,
                                       unit=wo_id, wo_id=wo_id)
+                # WHICH of the three handovers this is, from the values already computed
+                # above: the branch is reached only when `goes_back` is False, and what
+                # turned it False is `as_rebind` plus `cause` (spec
+                # 2026-10-14-an-escalated-round-says-why-and-what-to-run-next §1).
+                spent = (ops.ESCALATION_REBINDS_SPENT if as_rebind
+                         else ops.ESCALATION_USER_REWORK_CEILING
+                         if uncounted and cause == ops.USER_REWORK_CAUSE
+                         else ops.ESCALATION_ROUNDS_SPENT)
                 self._escalate(store, wo, round_id, n, reason or (
-                    f"the review was not satisfied after {max_rounds} rounds."))
+                    f"the review was not satisfied after {max_rounds} rounds."),
+                    cause=spent)
             else:
                 # `escalated`, or anything the validator returned that is not a verdict
                 # this machine knows. Either way a human decides.
                 self._escalate(store, wo, round_id, n, reason or (
-                    "the review could not reach a verdict."))
+                    "the review could not reach a verdict."),
+                    cause=ops.ESCALATION_NO_VERDICT)
         except Exception:  # noqa: BLE001 — a round must never kill the daemon
             log.exception("[%s] validating %s failed", project.name, wo_id)
         finally:
@@ -3267,7 +3351,7 @@ class Daemon:
 
     @staticmethod
     def _escalate(store: ProjectStore, wo: dict, round_id: int, n: int,
-                  reason: str) -> None:
+                  reason: str, *, cause: str) -> None:
         """Give up on this unit and ask the user.
 
         The attention reason is `VALIDATION_STUCK_BLOCKER` VERBATIM, because
@@ -3293,10 +3377,15 @@ class Daemon:
         `ops.submit_for_validation` gives up the same way when a submitter has ignored
         the panel's list twice running — and two give-ups that only look alike are two
         attention flags that drift.
+
+        `cause` is an `ops.ESCALATION_FAMILY` key, keyword-only and required at every
+        site: spec
+        docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md
+        §2.
         """
         from . import ops
 
-        ops.escalate_validation_round(store, wo, round_id, n, reason)
+        ops.escalate_validation_round(store, wo, round_id, n, reason, cause=cause)
 
     @staticmethod
     def _validation_held(store: ProjectStore, wo: dict, round_id: int, n: int,
@@ -3455,6 +3544,8 @@ class Daemon:
         re-derives above VALIDATION_STUCK_BLOCKER: "the panel could not be satisfied"
         would point the user at the work, and the cause is a prompt nobody ever sent.
         """
+        from . import ops
+
         central = CentralStore()          # thread-local, as `_round_config` opens its own
         try:
             said = self._note_prompt_refusal(central, store, project.name, wo["id"],
@@ -3465,7 +3556,8 @@ class Daemon:
             store, wo, round_id, n,
             f"the review could not be run: the OS built a {said['total']}-char prompt "
             f"for it, over the {said['ceiling']}-char ceiling ({said['setting']}), so "
-            f"it was never sent. Nobody has judged the work.")
+            f"it was never sent. Nobody has judged the work.",
+            cause=ops.ESCALATION_PROMPT_REFUSED)
         from . import invariants
 
         store.flag_attention(wo["id"], invariants.os_prompt_refused_blocker(said))
@@ -3480,6 +3572,8 @@ class Daemon:
         tries again. Three in a row is where retrying stops — the outages are counted
         from the events, so a daemon restart does not hand the round a fresh budget.
         """
+        from . import ops
+
         wo_id = wo["id"]
         outages = 1 + sum(
             1 for e in store.events_of_kind(wo_id, "validation_failed")
@@ -3494,7 +3588,115 @@ class Daemon:
             self._escalate(
                 store, wo, round_id, n,
                 f"the review could not be run: the validator was unreachable "
-                f"{outages} times in a row. Nobody has judged the work.")
+                f"{outages} times in a row. Nobody has judged the work.",
+                cause=ops.ESCALATION_VALIDATOR_UNREACHABLE)
+
+    def _validation_killed(self, store: ProjectStore, project: ProjectSpec, wo: dict,
+                           round_id: int, n: int, killed: claude_cli.Killed,
+                           cfg: Any) -> None:
+        """The seats' PROCESSES WERE KILLED. Re-judge the round, and investigate the kill.
+
+        `_validation_outage`'s shape and NOT its counter (user ruling, Neo question 1705,
+        condition i): the transport filter keys on `cause == "transport"` and this one on
+        `VALIDATION_KILLED_CAUSE`, so neither can see the other's events. Three unrelated
+        503s plus one kill must not escalate an order on a budget neither event exhausted,
+        and `cause: "transport"` on a signal death is a false statement in the one record
+        anybody reads later.
+
+        Counted FROM THE EVENTS, like `_validation_outage`, so a daemon restart does not
+        hand the round a fresh budget. The round is closed `failed`, which
+        `counted_validation_rounds` ignores, so the submitter pays nothing and the next
+        `validation_tick` picks the same round up — no new re-judge mechanism.
+
+        THE INVESTIGATION IS WHY A RETRY ALONE IS NOT THE FIX (GitHub issue #1039): a
+        retry can neither name what SIGTERMed four processes at once nor stop it
+        recurring. `ops.live_investigation` is asked first, so the filing is idempotent
+        across retries, and a filing that fails never propagates — the round close and the
+        event are the work order's own record and must land even when no investigation
+        exists.
+
+        Spec §4:
+        docs/superpowers/specs/2026-10-14-a-killed-validation-panel-opens-an-investigation.md
+        """
+        from . import ops
+
+        wo_id = wo["id"]
+        kills = 1 + sum(
+            1 for e in store.events_of_kind(wo_id, "validation_failed")
+            if db.from_json(e["payload"], {}).get("round") == n
+            and db.from_json(e["payload"], {}).get("cause") == VALIDATION_KILLED_CAUSE)
+        inv_id = self._killed_investigation(store, project, wo_id, round_id, n, killed)
+        store.close_validation_round(
+            round_id, "failed",
+            f"every validation seat was killed by a signal (rc={killed.rc}) before it "
+            f"could judge this submission")
+        store.add_event(wo_id, "validation_failed",
+                        {"round": n, "cause": VALIDATION_KILLED_CAUSE, "attempt": kills,
+                         "rc": killed.rc, "error": killed.message[:500],
+                         "investigation": inv_id})
+        if kills >= int(cfg.killed_retries):
+            # THE INVESTIGATION ID RIDES ON THE SENTENCE: the user reading the attention
+            # item needs somewhere to go that is not a retry (spec §4b).
+            pointer = (f"{inv_id} is investigating what killed them." if inv_id
+                       else "No investigation could be filed, so what killed them is "
+                            "not being diagnosed by anything.")
+            self._escalate(
+                store, wo, round_id, n,
+                f"the review could not be run: its seats were killed by a signal "
+                f"(rc={killed.rc}) {kills} times in a row. Nobody has judged the work. "
+                f"{pointer}",
+                cause=ops.ESCALATION_PANEL_KILLED)
+
+    @staticmethod
+    def _killed_investigation(store: ProjectStore, project: ProjectSpec, wo_id: str,
+                              round_id: int, n: int,
+                              killed: claude_cli.Killed) -> str:
+        """The live investigation on this order, filing one first if there is none.
+
+        FACTS BY REFERENCE, NEVER A PAYLOAD (spec §4a): the per-seat rows, the round and
+        the moments, plus the pointers to check for what else happened at that instant.
+        The seat REPLIES are not copied in — the investigation reads the record itself,
+        and `jarvis validation show` already renders the deliberation.
+        """
+        from . import ops
+
+        try:
+            live = ops.live_investigation(project.name, wo_id)
+            if live:
+                return live
+            seats_said = "\n".join(
+                f"  - {row['seat']}: status={row['status']}, "
+                f"latency_ms={int(row['latency_ms'] or 0)}, "
+                f"rc={_seat_rc(str(row['reply'] or ''), killed.rc)}, "
+                f"ended {_moment(float(row['ts'] or 0.0))}"
+                for row in store.validation_opinions(round_id)) or "  - none recorded"
+            round_row = store.get_validation_round(round_id) or {}
+            opened = float(round_row.get("ts") or 0.0)
+            order = ops.create_investigation_order(project.name, wo_id, why=(
+                f"Validation round {n} of {wo_id} was never judged: its seats' "
+                f"processes were killed by a signal (rc={killed.rc}) and wrote nothing. "
+                f"Four concurrent seats ending at the same elapsed time with no bytes on "
+                f"either stream is ONE EXTERNAL EVENT, not four model failures.\n\n"
+                f"What the record holds (read it, do not take this as the evidence):\n"
+                f"  - round id {round_id}, round {n}, opened {_moment(opened)}\n"
+                f"  - the message the transport classified: {killed.message}\n"
+                f"  - the seats, as the round recorded them:\n{seats_said}\n\n"
+                f"What to check for what else happened at that instant:\n"
+                f"  - this daemon's own restart and deploy record\n"
+                f"  - `jarvis alarms` and `jarvis inspect {wo_id}` around those moments\n"
+                f"  - the fleet pause state, and this order's budget holds\n"
+                f"  - the `os.validation.timeout` in force when the round opened\n\n"
+                f"WHAT NOT TO CONCLUDE: that a retry is the answer. The round IS "
+                f"re-judged already (`validation.killed_retries` bounds it). A retry "
+                f"cannot name what killed these processes and cannot stop it recurring; "
+                f"naming the cause is this order's whole job. GitHub issue #1039."))
+            return str(order["id"])
+        except ops.OpsError as e:
+            # NEVER PROPAGATES: a lost race between two ticks must not cost the round its
+            # own record (spec §4a).
+            log.warning("[%s] %s: no investigation filed for the killed round: %s",
+                        project.name, wo_id, e)
+            return ""
 
     def _round_config(self, project: ProjectSpec, round_row: dict[str, Any]) -> Any:
         """The validation settings THE ROUND WAS OPENED UNDER, not the live ones.
@@ -6541,7 +6743,9 @@ class Daemon:
                         or ops_mod.resumed_from(store, wo["id"], turn["seq"])
                         or "waiting_pr_merge")
                 if fresh["status"] != back:
-                    store.set_status(wo["id"], back)
+                    # Spec §C of
+                    # docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md.
+                    store.set_status(wo["id"], back, trigger="turn_settled")
                     if back == "waiting_pr_merge":
                         store.clear_attention(wo["id"])
             else:

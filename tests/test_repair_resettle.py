@@ -401,6 +401,24 @@ def test_a_panel_that_gave_up_keeps_the_review(started, project, fake_gh, repair
     assert store.get_work_order(repaired["id"])["status"] == "needs_review"
 
 
+def test_a_repair_does_not_resettle_over_a_give_up_hidden_by_a_later_round(
+        started, project, fake_gh, repaired):
+    """ops.py:7120 must not fail open on a row that judged nothing. Spec
+    docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md §A."""
+    store = ProjectStore(project)
+    rnd = store.open_validation_round(wo_id=repaired["id"], fingerprint="abc")
+    store.close_validation_round(rnd["id"], "escalated", reason="three rounds, no deal")
+    later = store.open_validation_round(wo_id=repaired["id"], fingerprint="abc-after")
+    store.close_validation_round(later["id"], "failed", reason="no validator answered")
+    fake_gh.set_pr(PR, "OPEN")                  # the worker resolved the conflict
+
+    started.tick_count = 0
+    poll(started, store)
+
+    assert store.get_work_order(repaired["id"])["status"] == "needs_review"
+    assert ops.resettle_after_repair(store, repaired["id"]) is False
+
+
 def test_unlanded_work_keeps_the_review(started, project, fake_gh, repaired):
     """`ops.park_unlanded`'s episode: code on nothing but its own branch."""
     store = ProjectStore(project)

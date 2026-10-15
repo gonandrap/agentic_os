@@ -26,8 +26,7 @@ import pytest
 from jarvis import claude_cli, ops, validation
 from jarvis.catalog import load_catalog
 from jarvis.central_store import CentralStore
-from jarvis.daemon import (VALIDATION_ESCALATED_TITLE, VALIDATION_REASON_CHARS,
-                          VALIDATION_REASON_CUT, Daemon)
+from jarvis.daemon import VALIDATION_REASON_CHARS, VALIDATION_REASON_CUT, Daemon
 from jarvis.invariants import VALIDATION_STUCK_BLOCKER, true_blockers
 from jarvis.project_store import VALIDATOR_SEATS, ProjectStore
 from jarvis.testing import make_git_project
@@ -1578,7 +1577,11 @@ def test_a_give_up_notifies_and_a_rejection_stays_silent(fleet):
 
     rows = _outbox(fleet)
     assert len(rows) == 1
-    assert rows[0]["title"] == VALIDATION_ESCALATED_TITLE.format(unit=wo["id"], n=2)
+    # The title names the FAMILY now: spec
+    # 2026-10-14-an-escalated-round-says-why-and-what-to-run-next §3. A rejection with
+    # the budget spent is `handover`; `VALIDATION_ESCALATED_TITLE` serves feature orders.
+    assert rows[0]["title"] == ops.ESCALATION_TITLE.format(
+        unit=wo["id"], n=2, verb=ops.ESCALATION_VERB["handover"])
     assert rows[0]["body"] == "no test covers the change", (
         "the body is the round's own reason — the only text that says why")
     assert (rows[0]["level"], rows[0]["source"], rows[0]["wo_id"]) == (
@@ -1603,14 +1606,18 @@ def test_the_give_up_notification_reaches_the_central_inbox(fleet):
     finally:
         central.close()
     assert len(rows) == 1
-    assert rows[0]["title"] == VALIDATION_ESCALATED_TITLE.format(unit=wo["id"], n=1)
+    assert rows[0]["title"] == ops.ESCALATION_TITLE.format(
+        unit=wo["id"], n=1, verb=ops.ESCALATION_VERB["handover"])
     assert rows[0]["body"] == "the change is untested"
     assert (rows[0]["level"], rows[0]["project"]) == ("warning", "proj_a")
 
 
 def test_the_escalations_that_never_call_the_validator_notify_too(fleet):
     """An empty diff gives up without a verdict to quote, so the notification carries
-    the machine's own sentence. Nothing else would tell the user the round closed."""
+    the machine's own sentence. Nothing else would tell the user the round closed.
+
+    `not_reviewed`, NOT `handover`: no seat judged an empty submission, so a title saying
+    it was rejected would claim a decision nobody made (spec §3)."""
     fleet.daemon.validator = Validator(passed())
     wo = fleet.dispatch("empty")
     fleet.worktree(wo["id"])  # a worktree, and not one byte changed in it
@@ -1619,7 +1626,9 @@ def test_the_escalations_that_never_call_the_validator_notify_too(fleet):
 
     rows = _outbox(fleet)
     assert len(rows) == 1
-    assert rows[0]["title"] == VALIDATION_ESCALATED_TITLE.format(unit=wo["id"], n=1)
+    assert rows[0]["title"] == ops.ESCALATION_TITLE.format(
+        unit=wo["id"], n=1, verb=ops.ESCALATION_VERB["not_reviewed"])
+    assert "rejected" not in rows[0]["title"]
     assert "changes no files" in rows[0]["body"]
 
 
@@ -1871,6 +1880,46 @@ def test_a_give_up_survives_the_turn_that_follows_it(fleet, fake_claude):
         fresh = store.get_work_order(wo["id"])
         assert fresh["status"] != "waiting_pr_merge", (
             "the turn ending parked a give-up on the merge queue")
+        assert fresh["status"] == "needs_review"
+        assert VALIDATION_STUCK_BLOCKER in true_blockers(store, fresh)
+    finally:
+        store.close()
+
+
+def test_a_give_up_survives_a_message_turn_after_a_round_that_judged_nothing(
+        fleet, fake_claude):
+    """The issue's order end to end: a row that JUDGED NOTHING sits after the give-up.
+
+    docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md §A.
+    """
+    fleet.reconfigure(max_rounds=1)
+    fleet.daemon.validator = Validator(rejected("no test covers the change"))
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "print('one')\n")
+    finish(fleet, wo["id"])
+
+    fleet.drain()
+
+    store = fleet.store()
+    try:
+        assert store.get_work_order(wo["id"])["status"] == "needs_review"
+
+        void = store.open_validation_round(wo_id=wo["id"], fingerprint="fp-after")
+        store.close_validation_round(void["id"], "void", "nothing to judge")
+        assert store.latest_validation_round(wo_id=wo["id"])["outcome"] == "void"
+
+        gate = fake_claude.hold_turns()
+        store.queue_message(wo["id"], "one more thing")
+        fleet.tick()
+        assert store.get_work_order(wo["id"])["status"] == "running"
+
+        gate.unlink()
+        assert _settle(store, wo["id"])
+        fleet.tick()
+
+        fresh = store.get_work_order(wo["id"])
+        assert fresh["status"] != "waiting_pr_merge", (
+            "a row that judged nothing dropped the give-up onto the merge queue")
         assert fresh["status"] == "needs_review"
         assert VALIDATION_STUCK_BLOCKER in true_blockers(store, fresh)
     finally:
