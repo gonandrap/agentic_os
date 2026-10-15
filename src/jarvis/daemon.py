@@ -1280,6 +1280,9 @@ class Daemon:
                     # decisions read a fresh fact rather than the previous interval's
                     # (spec 2026-09-26-a-red-default-branch-raises-itself.md §1).
                     self.poll_default_branch(project, store)
+                    # BETWEEN the two, spec
+                    # 2026-10-14-a-red-main-dispatches-its-own-fix.md §2.
+                    self.dispatch_base_fix(project, store)
                     self.poll_pull_requests(project, store)
                     # AFTER the poll, in the same tick: a merge that just completed a
                     # work order is what closes its issue, and making the tracker wait
@@ -6964,11 +6967,17 @@ class Daemon:
                   reverse=True)
         worst = reds[0] if reds else None
         was_red = bool(prev.get("red"))
-        wo_id = ""
+        wo_id = issue_url = fix_wo_id = ""
         if worst is not None:
             wo_id = (str(prev.get("wo_id") or "") if was_red
                      else self._attribute_base_red(project, store, owner, repo,
                                                    worst.head_sha))
+            if was_red:
+                # Spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §3: carried
+                # forward exactly as `wo_id` is, so a second red run on one break joins
+                # the order already on it instead of filing again.
+                issue_url = str(prev.get("issue_url") or "")
+                fix_wo_id = str(prev.get("fix_wo_id") or "")
         fact = {
             "red": worst is not None,
             "base": base,
@@ -6978,6 +6987,8 @@ class Daemon:
             "run_url": ci.run_url(owner, repo, worst.run_id) if worst else "",
             "head_sha": worst.head_sha if worst else "",
             "wo_id": wo_id,
+            "issue_url": issue_url,
+            "fix_wo_id": fix_wo_id,
             "checked_at": time.time(),
         }
         self.central.set_base_health(project.name, fact)
@@ -6993,6 +7004,132 @@ class Daemon:
             log.info("[%s] %s recovered", project.name, base)
         elif worst is not None and not was_red:
             log.warning("[%s] %s is red — %s", project.name, base, fact["run_url"])
+
+    def dispatch_base_fix(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """A red tracker `main` files-or-adopts an issue and dispatches a work order on it.
+
+        Spec docs/superpowers/specs/2026-10-14-a-red-main-dispatches-its-own-fix.md §2.
+        The red-base feature was specified as a DETECTOR plus a BRAKE and has no actor, so
+        GitHub issue 1054 sat open and unassigned while wo-024e207b was held `base_red`
+        for 62 minutes. A red `main` is the one defect where the OS is the obligated
+        party: the break is usually its own merge, every parked order inherits it, and no
+        user decision is involved.
+
+        **THE TRACKER PROJECT ONLY** (§1, Neo question 1736): the project whose git
+        `origin` IS `bugreport.bug_repo()`. Every other project stays notify-only — its
+        red branch may be a human's push, and `bug report` files to the OS's repository.
+
+        **A SWEEP, NOT A TRANSITION ACTION.** `poll_default_branch`'s announcements fire
+        on transitions because an announcement must not repeat; a dispatch must be
+        RETRIED, because every way it fails is transient and outside the OS (Neo
+        unreachable, project unregistered, `gh` down). Idempotence comes from the fact's
+        own `issue_url`/`fix_wo_id` (§3), so a tick where nothing changed costs no `gh`
+        call — and DEDUPE IS ON THE ISSUE, never on the run: one break produces many red
+        runs, which is exactly how duplicate filings 1007/1010 cost ~19 USD.
+        """
+        from . import bugreport, github, issues
+        from .project_store import TERMINAL_STATUSES
+
+        origin = github.origin_repo(project.path)
+        repo = bugreport.bug_repo()
+        if origin is None or f"{origin[0]}/{origin[1]}".lower() != repo.lower():
+            return
+        if self._base_red(project) is None:
+            return
+        fact = self.central.base_health(project.name)
+        run_id = fact.get("run_id") or 0
+        issue_url = str(fact.get("issue_url") or "")
+        fix_wo_id = str(fact.get("fix_wo_id") or "")
+        if fix_wo_id:
+            row = store.get_work_order(fix_wo_id)
+            if row is not None and row["status"] not in TERMINAL_STATUSES:
+                return
+            # §2 step 5: that order did not fix it, so the break gets a second one. The
+            # issue is kept — it is the same break.
+            fix_wo_id = ""
+        cleared = False
+        try:
+            # §2 step 6: READ THE STATE rather than parse the refusal — `start_work`
+            # raises on a closed issue, and a stored url someone has since closed can
+            # never yield a work order, so retrying it is the never-ending loop this spec
+            # exists to remove. Cleared and never adopted back (§4's OPEN filter), while
+            # a `gh`, Neo or registration failure keeps the url and retries.
+            if issue_url and issues.view(issue_url, repo).closed:
+                log.info("[%s] %s is closed and no work order came of it — the break is "
+                         "filed afresh on the next tick", project.name, issue_url)
+                issue_url = fix_wo_id = ""
+                cleared = True
+            elif not issue_url:
+                issue_url = self._adopt_base_red_issue(repo, run_id)
+            if issue_url:
+                fix_wo_id = str(issues.start_work(
+                    issue_url, project=project.name).get("wo_id") or "")
+            elif not cleared:
+                filed = bugreport.report_bug(
+                    title=f"`{fact.get('base') or 'main'}` is red in {repo}",
+                    description=self._base_red_brief(project, fact),
+                    expected=(f"`{fact.get('base') or 'main'}` is green, so the OS can "
+                              f"merge the pull requests it is holding"),
+                    actual=(f"workflow `{fact.get('workflow') or 'ci'}` fails on "
+                            f"{fact.get('run_url') or 'an unreadable run'}"),
+                    # §2: `expedite` is what dispatches, at any priority, so the rating
+                    # stays an honest description of the defect.
+                    priority="high", expedite=True, project=project.name)
+                issue_url = str(filed.get("url") or "")
+                fix_wo_id = str((filed.get("pickup") or {}).get("wo_id") or "")
+        except Exception:  # noqa: BLE001 — every failure here is transient and retried
+            log.exception("[%s] could not dispatch a fix for the red default branch",
+                          project.name)
+        # Whatever DID succeed, so an issue filed with no work order is not filed twice
+        # and the next tick retries from the first step still empty (§2 step 9).
+        if (issue_url, fix_wo_id) != (fact.get("issue_url"), fact.get("fix_wo_id")):
+            self.central.set_base_health(
+                project.name,
+                {**fact, "issue_url": issue_url, "fix_wo_id": fix_wo_id})
+        if fix_wo_id:
+            log.info("[%s] %s is fixing the red default branch (%s)", project.name,
+                     fix_wo_id, issue_url)
+
+    def _adopt_base_red_issue(self, repo: str, run_id: Any) -> str:
+        """An OPEN issue already citing this failing run, or `""` — spec §4.
+
+        MECHANICAL, NOT FUZZY: a worker-filed red-main issue quotes the failing run's URL
+        in its body, and the run id is the one token in it unique to this break (it is in
+        1054). `gh` search is token-AND, so searching the whole URL buys nothing the id
+        does not and misses a body that wrote the id without the URL.
+
+        TWO FILTERS. `state == "OPEN"`, because a CLOSED issue citing this run is a fix
+        that was tried and did not work and `issues.start_work` refuses a closed issue
+        outright — `issues_mentioning`'s own `--state all` is load-bearing for its other
+        callers and wrong here. Then the LOWEST number among the open hits, the first one
+        filed, so two concurrent filings converge on one. An issue about this break that
+        never quoted the run id gets a duplicate filing, which is the right way to fail:
+        a duplicate issue is visible and closable (`ops._verdict_duplicate`'s asymmetry).
+        """
+        from . import issues
+
+        if not run_id:
+            return ""
+        open_hits = [r for r in issues.issues_mentioning(repo, str(run_id))
+                     if str(r.get("state") or "").upper() == "OPEN"]
+        if not open_hits:
+            return ""
+        return str(min(open_hits, key=lambda r: int(r.get("number") or 0))["url"])
+
+    @staticmethod
+    def _base_red_brief(project: ProjectSpec, fact: dict[str, Any]) -> str:
+        """The dispatched worker's evidence — §2: `run_url` is also what the NEXT sweep's
+        adoption search keys on, so it is quoted verbatim."""
+        blamed = str(fact.get("wo_id") or "")
+        return (f"`{fact.get('base') or 'main'}` is red in {project.name}. Workflow "
+                f"`{fact.get('workflow') or 'ci'}` fails on run "
+                f"{fact.get('run_url') or 'an unreadable run'} (run id "
+                f"{fact.get('run_id') or 0}), at commit "
+                f"{fact.get('head_sha') or 'an unknown commit'}"
+                + (f", merged by the OS for {blamed}" if blamed else "")
+                + ". Nothing merges onto a broken default branch, so every parked pull "
+                  "request in the fleet is held until this lands. Revert or forward fix "
+                  "— that call is yours.")
 
     def _attribute_base_red(self, project: ProjectSpec, store: ProjectStore,
                             owner: str, repo: str, sha: str) -> str:
@@ -7055,7 +7192,9 @@ class Daemon:
             base=str(fact.get("base") or ""), workflow=str(fact.get("workflow") or ""),
             run_url=str(fact.get("run_url") or ""),
             head_sha=str(fact.get("head_sha") or ""),
-            wo_id=str(fact.get("wo_id") or ""))
+            wo_id=str(fact.get("wo_id") or ""),
+            # Spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §5.
+            fix_wo_id=str(fact.get("fix_wo_id") or ""))
 
     def poll_pull_requests(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Ask GitHub what happened to the pull requests this project is parked behind.
