@@ -62,6 +62,7 @@ from .provenance import (
     borrowed_context,
     borrowed_sections,
 )
+from .stuck import PLAN_ASSUMPTIONS_CAUSE
 
 log = logging.getLogger(__name__)
 
@@ -103,7 +104,9 @@ HELD_ASSUMPTIONS = "assumptions"
 #: the second of the two as a repeat of the first, and the user's command differs —
 #: `jarvis wo review <this order>` against `<the planner>` (spec
 #: docs/superpowers/specs/2026-09-24-a-planner-assumption-holds-its-feature.md §2.4).
-HELD_PLAN_ASSUMPTIONS = "plan_assumptions"
+#: An ALIAS: `stuck.PLAN_ASSUMPTIONS_CAUSE` is the one definition (§1 of
+#: docs/superpowers/specs/2026-10-15-a-plan-held-child-is-not-stuck.md).
+HELD_PLAN_ASSUMPTIONS = PLAN_ASSUMPTIONS_CAUSE
 HELD_NOT_PASSED = "not_passed"
 HELD_SHA_UNRECORDED = "sha_unrecorded"
 HELD_SHA_MOVED = "sha_moved"

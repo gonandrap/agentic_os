@@ -9679,8 +9679,8 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
     from . import bus, holds, stuck, worker_session
     from .health import observer_kinds
     from .project_store import (FO_ID_PREFIXES, UNGOVERNED_ORIGINS,
-                                VALIDATION_CI_CAUSE, validation_ci_hold_spans,
-                                validation_hold)
+                                VALIDATION_CI_CAUSE, plan_hold_spans,
+                                validation_ci_hold_spans, validation_hold)
     from .worker_session import PAUSE_USAGE_LIMIT
 
     thresholds = {s: cfg.threshold_seconds(s) for s in cfg.thresholds}
@@ -9713,9 +9713,27 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                 until, cause = validation_hold(events, int(latest["round"]))
                 ci_held = cause == VALIDATION_CI_CAUSE and until > now
             ci_spans = validation_ci_hold_spans(events, since, now)
-        # The UNION and never the sum: a usage window can shut while CI runs (§4).
+        # A CHILD WHOSE PLAN IS UNRATIFIED IS NOT STUCK (§2 of docs/superpowers/specs/
+        # 2026-10-15-a-plan-held-child-is-not-stuck.md). `pending` and `kind == 'worker'`
+        # ONLY, mirroring the claim rule's own scope — the planner stays judged, because
+        # holding it on its own assumptions would deadlock the feature permanently.
+        plan_held, plan_spans = False, []
+        if (wo["status"] == "pending"
+                and str(wo.get("kind") or "worker") == "worker"):
+            hold = pstore.plan_hold(wo)
+            plan_held = hold is not None
+            # The planner off the feature row once the hold has cleared: §3's discount
+            # outlives the exclusion by exactly one status span.
+            planner_id = ((hold or {}).get("planner_id")
+                          or (_parent_of(pstore, wo) or {}).get("plan_wo_id"))
+            if planner_id:
+                plan_spans = plan_hold_spans(
+                    pstore.all_assumptions(str(planner_id)), since, now)
+        # The UNION and never the sum: a usage window can shut while CI runs, or while a
+        # plan sits unratified (§4, and §5 of the 2026-10-15 spec).
         discounted = holds.union_seconds(
-            [(max(h.started, since), min(h.finish(now), now)) for h in usage] + ci_spans)
+            [(max(h.started, since), min(h.finish(now), now)) for h in usage]
+            + ci_spans + plan_spans)
         # §2.2 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md.
         edges = (pstore.unfinished_dependencies(wo["id"])
                  if wo["status"] == "pending" else [])
@@ -9742,7 +9760,8 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
             excluded_cause=(PAUSE_USAGE_LIMIT
                             if window or any(h.open for h in usage)
                             else VALIDATION_CI_CAUSE if ci_held
-                            else stuck.LIVE_DEPENDENCY if live_edges else ""),
+                            else stuck.LIVE_DEPENDENCY if live_edges
+                            else stuck.PLAN_ASSUMPTIONS_CAUSE if plan_held else ""),
             kind=str(wo.get("kind") or "worker"),
             exempt_kinds=tuple(cfg.exempt_kinds),
             by_design_idle=by_design_idle,

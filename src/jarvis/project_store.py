@@ -285,6 +285,37 @@ def validation_ci_hold_spans(events: Iterable[Any], since: float,
     return sorted(spans)
 
 
+def plan_hold_spans(assumptions: Iterable[Any], since: float,
+                    now: float) -> list[tuple[float, float]]:
+    """Every interval inside `[since, now]` a child was held behind its feature's plan.
+
+    §4 of docs/superpowers/specs/2026-10-15-a-plan-held-child-is-not-stuck.md:
+    `ops.stuck_scan` DISCOUNTS these seconds as well as excluding a live hold. Without
+    the discount an exclusion only postpones the defect — `pending` is judged on time in
+    status, so the first sweep after the user rules sees the whole wait and buys the
+    investigation the exclusion existed to prevent.
+
+    `assumptions` is the PLANNER's rows (`all_assumptions`), rows and not a store for
+    `validation_ci_hold_spans`' reason: one home, named carriers. SPANS AND NOT A TOTAL,
+    because only intervals can be unioned with the usage holds (`holds.union_seconds`).
+
+    A SETTLED ROW WITH NO `decided_at` YIELDS NO SPAN, rather than running to `now`: those
+    are the rows that predate the column, and skipping them under-discounts instead of
+    over-discounting a hold that ended days ago. ALL the planner's assumptions, no
+    round-style filter — clipping to `since` makes one unnecessary and still correct.
+    """
+    spans: list[tuple[float, float]] = []
+    for a in assumptions:
+        decided = a["decided_at"]
+        if decided is None and a["status"] != "pending":
+            continue
+        start = max(float(a["ts"]), since)
+        end = min(now if decided is None else float(decided), now)
+        if end > start:
+            spans.append((start, end))
+    return sorted(spans)
+
+
 # What one seat proposed. "" is a seat that offered none — it ran, but said nothing the
 # arbiter can count.
 VALIDATION_VERDICTS = ("pass", "reject", "")
@@ -1648,6 +1679,14 @@ ADDED_COLUMNS = {
     # default.
     "assumptions": {
         "decided_by": "TEXT NOT NULL DEFAULT ''",        # '' | user | neo
+        # WHEN IT WAS SETTLED, which `status` plus `decided_by` cannot answer: the
+        # fleet-health sweep discounts the seconds a child spent held behind its feature's
+        # plan (docs/superpowers/specs/2026-10-15-a-plan-held-child-is-not-stuck.md §4),
+        # and that is an interval, so it needs the end of one. NULL on every row settled
+        # before this existed, and `plan_hold_spans` yields NO span for those rather than
+        # guessing — an UNDER-discount, never one in the direction that buys an
+        # investigation.
+        "decided_at": "REAL",
         "decided_reason": "TEXT NOT NULL DEFAULT ''",    # the reviewer's one line
         # The MODEL that ruled, and the configuration it ruled under — the two facts that
         # let a reader judge a machine verdict months later, when both have moved on.
@@ -4873,12 +4912,16 @@ class ProjectStore:
         The attribution is keyword-only and defaults to `''` — "the user", the only
         decider that existed before auto-review — so no caller is silently re-attributed
         by this signature growing. `ops` passes it explicitly on both routes.
+
+        `decided_at` is stamped HERE and nowhere else, which is what makes both routes —
+        the user's `jarvis wo review` and auto-review — agree about when a plan hold ended
+        (§3 of docs/superpowers/specs/2026-10-15-a-plan-held-child-is-not-stuck.md).
         """
         assert status in ("accepted", "rejected"), status
         self.conn.execute(
             """UPDATE assumptions SET status=?, decided_by=?, decided_reason=?,
-                   decided_model=?, decided_config_version=? WHERE id=?""",
-            (status, decided_by, reason, model, config_version, assumption_id))
+                   decided_model=?, decided_config_version=?, decided_at=? WHERE id=?""",
+            (status, decided_by, reason, model, config_version, db.now(), assumption_id))
 
     def get_assumption(self, assumption_id: int) -> dict[str, Any] | None:
         row = self.conn.execute("SELECT * FROM assumptions WHERE id=?",

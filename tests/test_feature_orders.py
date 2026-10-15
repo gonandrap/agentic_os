@@ -749,6 +749,32 @@ def test_plan_hold_and_the_claim_query_agree(started, store):
         assert (store.plan_hold(row) is None) == (claimed is not None), label
 
 
+def test_the_sweep_exclusion_and_the_plan_hold_agree(started, store):
+    """§8(8) of docs/superpowers/specs/2026-10-15-a-plan-held-child-is-not-stuck.md: the
+    third statement of one rule, pinned to the second as the claim SQL already is."""
+    import time
+
+    from jarvis import stuck
+    from jarvis.catalog import FleetHealthConfig
+
+    _, _, held_kid = a_bare_feature(store)
+    _, _, clear_kid = a_bare_feature(store, assumptions=0)
+    _, planner, _ = a_bare_feature(store, planner_status="pending")
+    loose = ops.create_work_order("proj_a", "unrelated", description="something else")
+    matrix = [("held child", held_kid), ("clear child", clear_kid),
+              ("the planner", planner), ("no feature", loose)]
+
+    _scanned, judged = ops.stuck_scan(store, "proj_a", FleetHealthConfig(), time.time(),
+                                      stuck_only=False)
+    verdicts = {r["wo"]["id"]: r["verdict"] for r in judged}
+
+    for label, wo in matrix:
+        row = store.get_work_order(wo["id"])
+        assert row["status"] == "pending", label
+        assert ((verdicts[wo["id"]].excluded == stuck.PLAN_ASSUMPTIONS_CAUSE)
+                == (store.plan_hold(row) is not None)), label
+
+
 def test_a_planner_with_no_pending_assumptions_holds_nothing(started, store):
     """NEGATIVE. A settled assumption is not a decision anyone owes."""
     fo = a_released_feature(started, store, "schema")

@@ -1540,6 +1540,134 @@ def test_usage_window_outranks_a_live_dependency(stuck_os):
     assert verdict.stuck is False and verdict.excluded == PAUSE_USAGE_LIMIT
 
 
+def _plan_held(store, *, assumptions: int = 1, kind: str = "worker"):
+    """`(planner, child, assumption ids)` of a feature whose plan is unratified.
+
+    `a_bare_feature`'s rows (tests/test_feature_orders.py:666): what the hold reads is a
+    `plan_wo_id` and a pending assumption row, and no plan machinery decides anything.
+    """
+    fo = store.create_feature_order("CSV export", description="export the table")
+    planner = store.create_work_order("plan it", kind="planner", parent_id=fo["id"],
+                                      status="completed")
+    store.update_feature_order(fo["id"], plan_wo_id=planner["id"], status="executing")
+    kid = store.create_work_order("build it", parent_id=fo["id"], kind=kind)
+    ids = [store.add_assumption(planner["id"], f"the exporter writes CSV, not JSON ({i})")
+           for i in range(assumptions)]
+    return planner, kid, ids
+
+
+def _raised_at(store, assumption_id: int, ts: float) -> None:
+    """Back-date one assumption row, `park_order`'s rule: the store stamps `db.now()`."""
+    store.conn.execute("UPDATE assumptions SET ts=? WHERE id=?", (ts, assumption_id))
+    store.conn.commit()
+
+
+def test_a_plan_held_child_is_excluded_not_investigated(stuck_os):
+    """§2: `excluded == PLAN_ASSUMPTIONS_CAUSE`, `stuck` False, and NO `continue` — a row
+    that vanished would be indistinguishable from one inside its threshold."""
+    from jarvis import stuck
+
+    store = stuck_os["store"]
+    now = time.time()
+    _planner, kid, _ = _plan_held(store)
+    park_order(store, kid["id"], "pending", hours=0.75)
+
+    rows = [r for r in _judged(store, now) if r["wo"]["id"] == kid["id"]]
+    stuck_os["daemon"].stuck_tick(None)
+
+    assert len(rows) == 1, "the held row left the sweep's output entirely"
+    assert rows[0]["verdict"].excluded == stuck.PLAN_ASSUMPTIONS_CAUSE
+    assert rows[0]["verdict"].stuck is False
+    assert ops.list_investigation_orders("proj_a", include_settled=True) == []
+
+
+def test_the_planner_itself_is_still_judged(stuck_os):
+    """§2: the deadlock-avoiding asymmetry — the planner produces the plan, so holding it
+    on its own assumptions would wedge the feature for ever."""
+    store = stuck_os["store"]
+    now = time.time()
+    planner, _kid, _ = _plan_held(store)
+    park_order(store, planner["id"], "pending", hours=0.75)
+
+    row = [r for r in _judged(store, now) if r["wo"]["id"] == planner["id"]][0]
+
+    assert row["verdict"].excluded == ""
+    assert row["verdict"].stuck is True
+
+
+@pytest.mark.parametrize("who", ["manager", "no_feature"])
+def test_a_non_worker_kind_and_an_unparented_pending_row_are_unaffected(stuck_os, who):
+    """§2: the gate is `pending` AND `kind == 'worker'`, mirroring the claim rule."""
+    store = stuck_os["store"]
+    now = time.time()
+    if who == "manager":
+        _planner, row_wo, _ = _plan_held(store, kind="manager")
+    else:
+        _plan_held(store)
+        row_wo = store.create_work_order("an ordinary job")
+    park_order(store, row_wo["id"], "pending", hours=0.75)
+
+    row = [r for r in _judged(store, now) if r["wo"]["id"] == row_wo["id"]][0]
+
+    assert row["verdict"].stuck is True and row["verdict"].excluded == ""
+
+
+def test_a_ratified_plan_falls_back_inside_the_threshold(stuck_os):
+    """§1(2) and §3: the half an exclusion alone does not buy. The hold is gone, so the
+    row is judged — and the DISCOUNT is what keeps 45 minutes in status under 30."""
+    store = stuck_os["store"]
+    now = time.time()
+    _planner, kid, (aid,) = _plan_held(store)
+    at = park_order(store, kid["id"], "pending", hours=0.75)
+    _raised_at(store, aid, at)
+    store.review_assumption(aid, "accepted")
+    # Ruled two minutes ago: `decided_at` is the end of the span (§4).
+    store.conn.execute("UPDATE assumptions SET decided_at=? WHERE id=?",
+                       (now - 120, aid))
+    store.conn.commit()
+
+    row = [r for r in _judged(store, now) if r["wo"]["id"] == kid["id"]][0]
+
+    assert row["verdict"].excluded == ""
+    assert row["verdict"].stuck is False
+    assert row["seconds_in_status"] > 40 * 60
+    assert row["verdict"].active_seconds < 30 * 60
+
+
+def test_a_usage_window_overlapping_the_plan_hold_is_counted_once(stuck_os):
+    """§5: the measure of the UNION, never the sum — and bit-for-bit today's figure with
+    no plan hold at all."""
+    from jarvis import holds
+    from jarvis.worker_session import PAUSE_USAGE_LIMIT
+
+    store = stuck_os["store"]
+    now = time.time()
+    _planner, kid, (aid,) = _plan_held(store)
+    at = park_order(store, kid["id"], "pending", hours=1)
+    usage_hold(store, kid["id"], started=at, ended=at + 30 * 60)
+    _raised_at(store, aid, at + 20 * 60)
+    store.review_assumption(aid, "accepted")
+    store.conn.execute("UPDATE assumptions SET decided_at=? WHERE id=?",
+                       (at + 40 * 60, aid))
+    store.conn.commit()
+
+    row = [r for r in _judged(store, now) if r["wo"]["id"] == kid["id"]][0]
+
+    assert abs(row["discounted"] - 40 * 60) < 5, row["discounted"]
+    assert row["discounted"] < 30 * 60 + 20 * 60, "the overlap was counted twice"
+
+    # No plan hold anywhere: the number is the usage figure and nothing else.
+    plain = ops.create_work_order("proj_a", "held by the account only")
+    at = park_order(store, plain["id"], "pending", hours=1)
+    usage_hold(store, plain["id"], started=at, ended=at + 30 * 60)
+    plain_row = [r for r in _judged(store, now) if r["wo"]["id"] == plain["id"]][0]
+    usage = [h for h in holds.held(store, plain["id"], now=now)
+             if h.cause == PAUSE_USAGE_LIMIT]
+    expected = holds.by_cause(usage, plain_row["since"], now, now).get(
+        PAUSE_USAGE_LIMIT, 0.0)
+    assert plain_row["discounted"] == expected
+
+
 def test_assess_is_pure():
     """§1: the predicate reaches no store, no model and not even the clock."""
     import ast
