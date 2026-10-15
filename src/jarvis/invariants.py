@@ -5213,6 +5213,14 @@ def check_default_branch_green(store: ProjectStore) -> Iterator[Violation]:
     sha = str(fact.get("head_sha") or "")
     wo_id = str(fact.get("wo_id") or "")
     blamed = f", merged by the OS for {wo_id}" if wo_id else ""
+    # Spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §5: the order producing that
+    # commit, and nothing that moves tick to tick — the sentence is the dedupe key.
+    fix_wo_id = str(fact.get("fix_wo_id") or "")
+    issue_url = str(fact.get("issue_url") or "")
+    remedy = (f"The remedy is a commit on `{base}`, and {fix_wo_id} is producing it."
+              if fix_wo_id else
+              f"The remedy is a commit on `{base}`, and no work order is producing it "
+              f"yet.")
     yield Violation(
         invariant=INV_BASE_RED,
         wo_id=None,
@@ -5220,9 +5228,10 @@ def check_default_branch_green(store: ProjectStore) -> Iterator[Violation]:
         detail=(f"`{base}` is red — workflow `{workflow}`, run {url}, at "
                 f"{sha[:10] or 'an unknown commit'}{blamed}. Nothing merges onto a "
                 f"broken default branch, and every pull request built against it "
-                f"inherits the failure. The remedy is a commit on `{base}`."),
+                f"inherits the failure. {remedy}"),
         context={"base": base, "workflow": workflow, "run_url": url, "head_sha": sha,
                  "wo_id": wo_id, "run_id": fact.get("run_id"),
+                 "fix_wo_id": fix_wo_id, "issue_url": issue_url,
                  "checked_at": fact.get("checked_at")},
     )
 
