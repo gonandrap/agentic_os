@@ -129,6 +129,11 @@ owns the exemption mechanism either way, and is the only section that may touch 
 The guard's exemption set contains only class-3 and class-4 files, each with its reason
 recorded next to it, and every convertible file has left it.
 
+**This is a feature-close check, not a child's acceptance criterion.** No single child can
+evaluate it — it is true only of the union of the seven pull requests, and it cannot be
+evaluated at all until `wo-059520b9` has merged. Each child proves its own files instead,
+per the criterion in its section. Do not ask a child to verify section 0.7.
+
 ### 0.8 The two exempt classes
 
 **Class 3 — reviewed and exempt. No child may convert it.** Roughly 40
@@ -171,6 +176,31 @@ that believes it has found a new class-4 site reports it rather than exempting i
 * **`src/jarvis/fleet.py:199-201`** — already the `at=`-everywhere shape this feature is
   arguing for, and its comment cites `invariants.clock` by name. Do not touch.
 
+### 0.9a The fixture's public interface — fixed here, not negotiable per section
+
+Sections 3-7 are dispatched into fresh sessions that cannot see section 1's pull request, so
+"use the shared fixture" would be an instruction pointing at something the worker cannot
+read. The names are therefore fixed in this spec and every section uses them verbatim.
+Section 1 implements exactly this surface in `src/jarvis/testing.py`:
+
+```python
+TEST_EPOCH = 1760000000.0          # 2025-10-09T07:33:20Z — a constant, never time.time()
+
+clock                              # the pytest fixture; NOT autouse
+clock.at                           # the current fake instant, a float
+clock.advance(seconds)             # move it forward; SECONDS, positional, no default
+clock.ticking()                    # every subsequent read is strictly later than the last
+with clock.moved(seconds): ...     # a scoped different instant, restored on exit even if
+                                   #   the block raises
+```
+
+`clock.advance()` with no argument and `clock.advance(minutes=...)` must both raise
+`TypeError`. That is deliberate: it converts section 3's rewrite of
+`tests/test_health_sweep.py` from a silent 60x unit error into an immediate failure.
+
+If a section finds this surface insufficient, it reports that — it does not extend it
+(section 0.10 rule 5).
+
 ### 0.10 Rules every section works to
 
 1. **One instant per answer** (section 0.3).
@@ -182,8 +212,62 @@ that believes it has found a new class-4 site reports it rather than exempting i
    exhaustively and owns them completely — including their exemption markers.
 5. **Only section 1 may edit `src/jarvis/testing.py`.** If the shared fixture is
    insufficient for your file, report it; do not extend it in your PR.
-6. **Do not run the full suite** (`kn` pinned, user ruling 2026-09-18). Run the targeted
-   tests for the files you changed and cite CI for the suite.
+6. **Do not run the full suite** (pinned user ruling, 2026-09-18). Run the targeted tests
+   for the files you changed and cite CI's check-runs for the suite. The full suite takes
+   21-22 minutes, which guarantees your whole conversation is re-sent at the cache-write
+   rate, and a local green that contradicts CI is what gets a round rejected.
+
+### 0.11 How every section proves itself
+
+The guard from `wo-059520b9` may not be on `main` when you start, so none of these name it.
+All of them run today.
+
+**Residual sites in your own files.** The pattern deliberately excludes
+`time.monotonic()` and `time.sleep(` — those are class-3 and must survive:
+
+```bash
+rg -n -e 'time\.time\(\)' -e 'time\.localtime\(\)' -e 'datetime\.now\(\)' -e 'datetime\.utcnow\(\)' <your files>
+```
+
+Done when every line this still prints is a class-3 or class-4 site carrying a
+`# clock-exempt: <reason>` comment, and your PR lists each remaining hit as
+`path:line — class 3|4 — reason`. It is an enumeration to defend, not a number to hit.
+
+**You may not ADD a raw clock read.** This is what catches a worker "preserving behaviour"
+in a new helper, and catches section 1 seeding its epoch from the wall clock:
+
+```bash
+git diff origin/main -- . | rg '^\+' | rg -e 'time\.time\(\)' -e 'time\.localtime\(\)'
+```
+
+**Record the before-state at the START of your session**, or the after-state means nothing:
+the per-file raw-site counts, and `uv run pytest <your files> -q --collect-only | tail -2`.
+Both go in the PR.
+
+**The four checks that catch a green-but-wrong conversion.**
+
+1. *Targeted run*: `uv run pytest <your files> -q` — zero failed, zero errors, and zero NEW
+   skips.
+2. *Collected count must not fall.* Deleting or renaming a test is the commonest false
+   green.
+3. *Assertions must not be deleted.* `git diff -U0 origin/main -- <your files>` must not
+   remove more `assert` lines than it adds; name any net loss, with the reason.
+4. *No new skip or xfail.*
+
+**The mutation check — the only one that proves a converted test still asserts anything.**
+Take the test in your files that most depends on time. Break the thing it is supposed to
+catch — one line, in production code or in the clock mode. Run that one test. Prove it goes
+RED. Revert. Quote in the PR: the line you mutated, the test that failed, and the first line
+of the failure. **A section whose mutation check stays green has shipped a vacuous test,
+whatever the suite says.** Each section below names its own mutation.
+
+**Three things that cannot be proven by a test, so do not invent one.** Section 0.7 is a
+feature-close check over all seven PRs. A class-3 exemption is a negative — that no fake
+clock could make another thread run — and the check is the reviewed evidence: your PR quotes
+the `time.monotonic()` or `time.sleep(` line each mark sits on, and a mark with no spin-wait
+on the quoted line is wrong. And `tests/test_knowledge_retrieval_eval_harness.py:539` has
+not been read closely by anyone; its criterion is an outcome, not an assertion — read it and
+its shim, then state the verdict and the reason in the PR.
 
 ---
 
@@ -230,14 +314,65 @@ Both forms of patching are in use in the tree — `monkeypatch.setattr("jarvis.d
 and `monkeypatch.setattr(db, "now", c)`. The fixture settles on one and later sections use
 only the fixture.
 
-Prove it with a test file of the fixture's own, `tests/test_clock_fixture.py`: each of the
-four modes, and the constant-epoch property (two runs of the same test see the same instant).
+Prove it with a test file of the fixture's own, `tests/test_clock_fixture.py`. **Every
+assertion in it is against a LITERAL, never against another clock read** — that is what
+makes it trustworthy to the five sections downstream.
+
+1. **The constant epoch, the property the whole feature turns on.** A test that does not
+   request the fixture asserts the constant against a hard-coded number:
+   `assert testing.TEST_EPOCH == 1760000000.0`. Then a frozen-mode test asserts
+   `db.now() == 1760000000.0` — the literal, not `clock.at`, not `TEST_EPOCH`. A wall-clock
+   seed cannot pass that, which is exactly what all five pre-existing ad-hoc patchers would
+   fail. Do **not** try to prove this by running the test twice and comparing output:
+   nothing compares the two runs, so it proves nothing the literal does not.
+2. **Frozen.** `a = db.now(); b = db.now(); assert a == b == 1760000000.0`. Then the
+   assertion that proves the patch reaches `db.now`'s ~100 store call sites and not merely
+   comparisons: create a work order and assert `float(wo["created_at"]) == 1760000000.0`.
+3. **Hand-advanced, in seconds.** `clock.advance(90); assert db.now() == 1760000090.0`. Then
+   both traps as explicit failures: `with pytest.raises(TypeError): clock.advance()` and
+   `with pytest.raises(TypeError): clock.advance(minutes=61)`. These two are worth more than
+   the rest of the file.
+4. **Ticking, non-vacuously.** `db.now() < db.now() < db.now()` is not enough on its own;
+   also assert that two rows written through the store land in order — create two turns and
+   assert `float(second["started_at"]) > float(first["started_at"])`. That is the property
+   `tests/test_parked_work.py` consumes.
+5. **Scoped move.** Inside the block, `db.now() == 1760000000.0 + delta`; after it, back to
+   `1760000000.0` exactly. Then the leak test: raise inside the block
+   (`with pytest.raises(RuntimeError): ...`) and assert the clock was restored anyway.
+   `_MovedNow` at `tests/test_health_sweep.py:1013/:1019` assigns `jarvis.db.now` directly,
+   outside monkeypatch, so an exception inside its block leaks the fake into the next test.
+   Yours must not.
+6. **Not autouse, with zero clock reads.** Capture `_REAL_NOW = db.now` at module import.
+   One test that does not request the fixture asserts `db.now is _REAL_NOW`; one that does
+   asserts `db.now is not _REAL_NOW`. Do not prove this by comparing `db.now()` against
+   `time.time()` — that would be a real-clock read in the one file whose whole point is that
+   it has none.
+
+**Mutation check:** change the fixture's seed to `time.time()`, run
+`uv run pytest tests/test_clock_fixture.py -q`, prove the constant-epoch test fails, revert,
+quote the failure.
+
 Then migrate exactly one caller as an end-to-end proof — `tests/test_scheduler.py`, which has
-one site and one fixture.
+one site and one fixture. `rg -n 'time\.time\(\)' tests/test_scheduler.py` then prints
+nothing.
+
+`tests/conftest.py` is an import list today (19 lines, `# noqa: F401`): add the fixture to
+its existing `from jarvis.testing import (...)` block and reorder nothing.
+`uv run pytest tests/test_isolation_gate.py -q` (21 tests) is the cheap proof that
+`jarvis.testing` still imports clean for every suite under the root `conftest.py`.
 
 Do **not** migrate the other four ad-hoc patchers. Section 3 owns them. This section stays
 small on purpose: five sections wait on its merge, and `waiting_pr_merge` does not satisfy a
 dependency edge, so every edge here is a real wall-clock wait.
+
+You also add the class-4 markers for the four exempt sites **in this file**, because you are
+the only work order permitted to edit it: `src/jarvis/testing.py:229, 317, 475` (inside the
+`FAKE_CLAUDE` source string — a different process, which cannot see the patch) and
+`src/jarvis/testing.py:2446-2453` (the coarse-mtime inversion in `signin`, which broke on
+3.13 and not 3.11/3.12). The existing 10-line comment at `:2447-2453` is already a good
+reason; it needs only the marker token added. These four are the one exception to the
+otherwise strict rule that the work order defining class 4 records it — it cannot, because
+it may not touch this file.
 
 Land the recipe from section 0.5 as a knowledge entry, scoped to the project
 (`jarvis learn add ... --project jarvis_os --topic testing`): build the stamp from
@@ -266,6 +401,12 @@ Three jobs:
 3. **Record class 4** from the table in section 0.8, each file with its own reason — the
    reasons differ per file and a generic one is not acceptable.
 
+**You do NOT edit `src/jarvis/testing.py`**, even though section 0.8's class-4 table lists
+four sites in it. Section 0.10 rule 5 gives that file to one owner, and that owner adds
+those four markers itself. Your class-4 job covers the files on your list below and nothing
+else. This is the one place where the work order defining a class does not record every
+instance of it.
+
 Files owned by this section, exhaustively: `tests/test_worker_session.py`,
 `tests/test_config_reload.py`, `tests/test_uncollected_task_block.py`,
 `tests/test_turn_transport.py`, `tests/test_knowledge_retrieval_eval_harness.py`,
@@ -283,9 +424,59 @@ the file where both appear together and the distinction is written out in its ow
 sandbox's file mtimes" and may have a clock shim of its own. Determine whether it needs
 class-4 standing or ordinary conversion; it has not been read closely.
 
+### 2.1 The false green: a mark that is not true
+
+**A marker silences the guard for ever, so a mis-mark is a permanent hole and nothing
+downstream will ever fail.** That makes this section's risk unlike every other section's: it
+cannot be caught by running tests.
+
+For every class-3 mark, your PR quotes the `time.monotonic()` deadline or
+`while ...: time.sleep(` line the marker sits on. **A mark with no spin-wait on the quoted
+line is wrong.**
+
+Second false green: marking a whole FILE where only two sites are exempt, which silently
+exempts every site added later. So the marker sits on the site's own line or the line
+directly above it — never at module top, unless every site in the file is exempt. The seven
+pure class-3 files qualify; `tests/test_uncollected_task_block.py` does not, because it has
+convertible sites too.
+
+A duplicated reason string is a generic reason, and generic reasons are not acceptable.
+Check it mechanically: `rg -o -N 'clock-exempt:.*' tests/ | sort | uniq -d` must print
+nothing.
+
+For the seven files that are pure class 3, the diff must be comment-only by construction:
+
+```bash
+git diff -U0 origin/main -- tests/test_supervisor.py tests/test_validation_loop.py \
+  tests/test_remedies.py tests/test_wo_fix.py tests/test_forced_validation.py \
+  tests/test_rejudge_moved_head.py tests/test_alarm_escalation.py \
+  | rg '^[+-]' | rg -v '^(\+\+\+|---)' | rg -v 'clock-exempt'
+```
+
+prints nothing.
+
+Keep `tests/test_auth_resume.py`'s use of the `signin` fixture working unmodified:
+`src/jarvis/testing.py:2441-2456` stamps the mtime from `time.time()` deliberately, and the
+10-line comment at `:2447-2453` explains the kernel's coarse clock inverting on 3.13.
+
 ## 3 — The files that already hand-rolled a clock
 
-Migrate the four remaining ad-hoc clock patchers onto section 1's fixture and delete them.
+Migrate the four remaining ad-hoc clock patchers onto the shared fixture and delete them.
+
+**The shared fixture already exists in `src/jarvis/testing.py`** — another work order landed
+it before you started, and you must not edit that file. Its surface, which you use verbatim:
+
+```python
+TEST_EPOCH = 1760000000.0          # a constant epoch, never time.time()
+clock                              # the pytest fixture; NOT autouse
+clock.at                           # the current fake instant, a float
+clock.advance(seconds)             # SECONDS, positional, no default
+clock.ticking()                    # every read strictly later than the last
+with clock.moved(seconds): ...     # scoped instant, restored even if the block raises
+```
+
+`clock.advance()` and `clock.advance(minutes=...)` both raise `TypeError` by design, so a
+missed unit conversion fails immediately rather than being wrong by 60x.
 
 Files owned, exhaustively: `tests/test_health_sweep.py`, `tests/test_parked_work.py`,
 `tests/test_evolution_report.py`.
@@ -315,9 +506,30 @@ the clearer illustrations of why seeding from the wall clock is the bug. Mark th
 sites in this file; section 2 does not own them, because section 0.10 rule 4 gives each file
 to exactly one section and this file is yours.
 
-`tests/test_parked_work.py` is the file that proves the ticking mode is load-bearing. Its
-`STALE_FINISH_BLOCKER` tests must keep failing if the clock is frozen instead of ticking —
-if they pass under a frozen clock after your change, the migration is wrong.
+`tests/test_parked_work.py` is the file that proves the ticking mode is load-bearing, and
+this is your **mandatory mutation check**: swap the ticking mode for the frozen mode at all
+six former `_rewind` call sites (`:255, :274, :287, :310, :334, :464`), run
+`uv run pytest tests/test_parked_work.py -q`, and prove at least one test FAILS. Revert, and
+quote the failing test name and assertion in the PR. If every test still passes frozen, the
+migration has made the fixture simultaneous and the file no longer tests what its own
+docstring at `:76-79` says it tests.
+
+**A second mutation, for the `advance()` unit rewrite.** A too-small second count leaves
+nothing past the thresholds, and `_sweep` at `tests/test_health_sweep.py:110-124` only
+asserts that the sweep FINISHED — so a sweep that did nothing still passes, and so does
+every test asserting an absence. Replace one rewritten `advance(N)` with `advance(1)`, run
+the file, and prove the first-look and dedupe tests go red; revert. If they stay green your
+second counts are not load-bearing and the thresholds are untested.
+
+Convert `tests/test_health_sweep.py:2167` too — it patches `db.now` to `time.time() - 600`,
+which is both a real-clock read and the clearest instance of the bug in the tree. After
+conversion the offset comes from the fixture's epoch.
+
+Do not change the thresholds themselves (`FLOOR_MINUTES`,
+`invariants.OS_HEALTH_SWEEP_DARK_MINUTES`): the rewrite changes the UNIT of the advance,
+never what counts as due. `tests/test_scheduler.py` is already migrated and is not yours,
+but its comment at `:34` points at the `_Clock` in your file — update that reference when
+you delete the class it names.
 
 ## 4 — Bulk stamp construction: no production change
 
@@ -333,6 +545,13 @@ Files owned, exhaustively: `tests/test_background_orphan.py`, `tests/test_live.p
 **This section changes no file under `src/jarvis/`.** If you find yourself needing to, the
 site belongs to another section — report it rather than reaching across the seam.
 
+**You need no clock fixture.** Every site here is a stamp your own test writes, so
+`db.now() - 60` is the whole change. A shared `clock` fixture does exist in
+`src/jarvis/testing.py` and introducing it here would be actively harmful: production stamps
+rows through `db.now()`, so freezing it makes every row in a fixture simultaneous and any
+assertion that turns on one row preceding another goes vacuous while still passing.
+`git diff origin/main -- tests/ | rg '^\+.*clock'` must print nothing.
+
 The dominant shape, `tests/test_background_orphan.py` (19 sites, every one of them): a local
 `now = time.time()` passed straight into a `since=`/`until=` argument of
 `background.jobs_left_running`. `now = db.now()`. That is the whole change.
@@ -345,9 +564,38 @@ not class 4.
 `tests/test_uncollected_task_block.py` looks like it belongs here and does not — it is
 section 2's, because its sites are class 4 and the distinction is subtle.
 
+### 4.1 The false green, and the one criterion that catches it
+
+**This section cannot fail loudly.** `db.now()` and `time.time()` return the same value when
+nothing patches them, so every test here passes whether or not your conversion is correct.
+The acceptance criterion is therefore about the DIFF, not the result:
+
+```bash
+git diff -U0 origin/main -- tests/ | rg '^[+-]' | rg -v '^(\+\+\+|---)' \
+  | rg -v 'time\.time\(\)' | rg -v 'db\.now\(\)' | rg -v '^\+from jarvis import'
+```
+
+must print nothing. Every changed line differs from `main` only in the clock call, plus
+added imports. This section is ~45 one-token edits; anything else in the diff is an
+unplanned behaviour change. It also catches the "tidy a boundary while you are in there"
+failure — turning `until=db.now()` into `until=db.now() + 1`.
+
+`tests/test_repair_resettle.py:249-295` asserts `parked_reason(...) == STALE_FINISH_BLOCKER`
+with `long_after = float(turn["ended_at"]) + 365*24*3600`. Those assertions must stay
+inequality-driven off the ROW's `ended_at` and not off a frozen clock. Quote them in the PR
+as unchanged.
+
+The residual-site command from section 0.11 must print nothing at all over your eleven
+files: none of them has an exempt site, so you add no marker comments.
+
 ## 5 — Usage limits, rate-limit holds, the fleet brake
 
 Convert the usage-window group and the two production sites behind it.
+
+**The shared fixture already exists in `src/jarvis/testing.py`** — another work order landed
+it and you must not edit that file. `TEST_EPOCH = 1760000000.0` is its constant epoch; the
+fixture is `clock` (not autouse), with `clock.at`, `clock.advance(seconds)`,
+`clock.ticking()` and `with clock.moved(seconds):`.
 
 Files owned, exhaustively: `tests/test_rate_limit_retry.py`,
 `tests/test_usage_window_is_account_wide.py`, `tests/test_transport_resilience.py`,
@@ -376,10 +624,44 @@ usage-limit reset string parsed against the wall clock. A test here that stages 
 time must derive it from the controlled clock, never from a wall-clock-relative literal
 like `11:50pm`.
 
+**The false green here is the exact tautology that caused issue 1066.** A test that stages
+`reopens_at = db.now() + DELAY` and then asserts `row["reopens_at"] > db.now()` under a
+frozen clock is true no matter what the production code computed — including if it computed
+nothing at all. Assert the exact value instead:
+
+```python
+assert row["reopens_at"] == pytest.approx(testing.TEST_EPOCH + supervisor.RATE_LIMIT_FALLBACK_DELAY)
+```
+
+**Mutation check:** drop the delay from one of the four fallbacks so it reads plain
+`db.now()`, run the file, prove a test goes red, revert, quote it. An inequality that
+survives that mutation is a vacuous assertion.
+
+**Timezone replay, aimed directly at issue 1066:** run your targeted command three times —
+once as-is, once under `TZ=UTC`, once under `TZ=America/Los_Angeles`. All three green. The
+original failure only appeared between 23:50 and midnight Pacific, so a test whose
+expectation still depends on the reader's local date fails one of these three runs.
+
+You change `src/jarvis/neo.py` and `src/jarvis/supervisor.py`, so also run
+`uv run pytest tests/test_neo.py tests/test_supervisor.py -q` and report it green.
+`tests/test_supervisor.py` belongs to another section: if it fails, that is a report, not a
+fix.
+
+Never assert a literal time-of-day string. `invariants.clock`
+(`src/jarvis/invariants.py:1974-1998`) appends `on %a %d %b` whenever the stamp is not today
+by the real local clock, and a constant epoch is never today — another section owns that
+line. `tests/test_fleet_cap.py:540-541` is safe only because it calls `invariants.clock` on
+both sides of the comparison; do the same.
+
 ## 6 — One instant per answer: the two signatures and the nine defaults
 
 The only section that changes a function signature, and the section that retires the
 two-clocks-for-one-question hazard.
+
+**The shared fixture already exists in `src/jarvis/testing.py`** — another work order landed
+it and you must not edit that file. `TEST_EPOCH = 1760000000.0` is its constant epoch; the
+fixture is `clock` (not autouse), with `clock.at`, `clock.advance(seconds)`,
+`clock.ticking()` and `with clock.moved(seconds):`.
 
 Files owned, exhaustively: `tests/test_message_stuck.py`, `tests/test_validation_ci_hold.py`,
 `tests/test_validation_auth_hold.py`, `tests/test_validation_void.py`,
@@ -424,7 +706,27 @@ the one `health.py:177-181` complains about. This section owns all nine, includi
 `src/jarvis/holds.py:205, 223`, `src/jarvis/fleet.py:138` and `src/jarvis/daemon.py:2271`
 — the only `daemon.py` line this section touches.
 
-### 6.3 The validation holds
+### 6.3 `invariants.clock`'s own today-test
+
+`src/jarvis/invariants.py:1996` — inside `clock(ts)` — reads
+`time.localtime(time.time())[:3]` to decide whether `ts` is today. Convert the
+`time.time()` to `db.now()`.
+
+This is the function whose docstring argues this feature's governing rule, and it is
+already most of the way there deliberately: it uses `time.localtime(time.time())` rather
+than a no-argument `time.localtime()` precisely because the no-arg form "reads the C clock
+directly, so it is a SECOND clock this function cannot be told about". Moving the remaining
+`time.time()` to `db.now()` finishes its own argument.
+
+Why it matters beyond tidiness, and why no other section may touch it: under a constant
+epoch nothing is ever "today", so this branch renders every stamp in the long form
+`"%H:%M on %a %d %b"` instead of a bare `"%H:%M"`. Sections 5 and 7 are told that asserted
+time-of-day literals must go through `invariants.clock` rather than being written out, and
+this conversion is what eventually lets a frozen-clock test assert the short form at all.
+Do not change the format strings or the today/not-today rule — only the clock the test
+reads.
+
+### 6.4 The validation holds
 
 `src/jarvis/invariants.py:1732` — `if until <= time.time():` — is the same defect in the
 hold-expiry path, and the test files above are what cover it. Convert it here.
@@ -432,10 +734,66 @@ hold-expiry path, and the test files above are what cover it. Convert it here.
 `tests/test_feature_validation.py` carries class-3 spin-waits as well as convertible sites.
 Mark its class-3 sites; it is your file, not section 2's.
 
+### 6.5 Proving the forwarding, which is the whole point
+
+**The false green here is subtle and it is the likely one:** the parameter gets added, the
+test passes `now=`, and the test ALSO back-dates the row — so the new parameter is never
+load-bearing, and `parked_reason`'s forwarding could be missing entirely while everything
+passes.
+
+Two required checks.
+
+1. At least one new or rewritten test in `tests/test_message_stuck.py` proves the blocker
+   fires from `now=` ALONE, with no `_age_the_turn` or `_age_the_message` call: the row stays
+   current and the answer comes entirely from the passed instant.
+2. **Mutation:** revert the forwarding at `src/jarvis/invariants.py:1617` back to
+   `waiting_on(store, wo)`, run `uv run pytest tests/test_message_stuck.py -q`, prove it
+   goes RED, revert, quote the test. Green after that mutation means the asymmetry
+   documented at `tests/test_message_stuck.py:140-146` is still there and your PR proves
+   nothing.
+
+`check_messages_are_delivered` has **no test that names it today** —
+`rg 'check_messages_are_delivered' tests/` returns nothing — so changing it is invisible to
+the suite. Add coverage that reaches it through `check_project` with `now=`, and mutation-check
+it the same way.
+
+Confirm the signatures mechanically, and that the registry call shape still works:
+
+```bash
+uv run python -I -c "import inspect; from jarvis import ops, invariants; print(inspect.signature(ops.waiting_on)); print(inspect.signature(invariants.check_messages_are_delivered))"
+```
+
+`check_messages_are_delivered` must remain callable as `fn(store)` — it is an `INVARIANTS`
+registry entry.
+
+**The regression set matters more here than your own file list**, because `waiting_on`'s
+test-side callers mostly live outside it: `tests/test_auth_resume.py:342`,
+`tests/test_manager_order.py:679`, `tests/test_parked_work.py:198`,
+`tests/test_resume_auto_diagnosis.py:122, :394`, `tests/test_waiting_on_neo.py:496, :507`.
+Run them and report green. **Do not edit any of them** — three belong to other sections and
+two to none. A failure there is a report, not a fix.
+
+Keep `_age_the_turn` and `_age_the_message` in `tests/test_message_stuck.py` working: they
+are the prior art the knowledge entry cites and other sections read them.
+
 ## 7 — Display ages, logs, and release staging
 
 Convert the read-side group: ages rendered for a human, log windows, and the release
 staging marker.
+
+**The shared fixture already exists in `src/jarvis/testing.py`** — another work order landed
+it and you must not edit that file. `TEST_EPOCH = 1760000000.0` is its constant epoch; the
+fixture is `clock` (not autouse), with `clock.at`, `clock.advance(seconds)`,
+`clock.ticking()` and `with clock.moved(seconds):`.
+
+**`invariants.clock` is not yours and reads the real clock on purpose.**
+`src/jarvis/invariants.py:1996` renders "is this today?" through
+`time.localtime(time.time())[:3]`, and another section owns that line. Until it is
+converted, a constant epoch is never "today", so every stamp renders in the long form
+`"%H:%M on %a %d %b"` rather than a bare `"%H:%M"`. **Never assert a literal time-of-day
+string**: call `invariants.clock` on both sides of the comparison, as
+`tests/test_fleet_cap.py:540-541` already does. Check yourself with
+`rg -n '[0-2][0-9]:[0-5][0-9]' <your files>`.
 
 Files owned, exhaustively: `tests/test_release_staging.py`, `tests/test_ui_observability.py`,
 `tests/test_base_red.py`, `tests/test_release_red_defer.py`, `tests/test_ui_wiring.py`,
@@ -455,9 +813,25 @@ stamp back with `time.mktime(time.strptime(...))` and compares it against
 `cutoff = time.time() - within_seconds` (`:316, :370`). Writer and reader are already two
 clocks.
 
-Convert all of them or none. A test that froze the reader while the writer stamped live
-would silently include or drop everything in the 24-hour window — exactly the failure
+Convert all of them or none — the no-arg `time.localtime()` becomes
+`time.localtime(db.now())`. A test that froze the reader while the writer stamped live would
+silently include or drop everything in the 24-hour window, exactly the failure
 `invariants.clock`'s docstring forbids.
+
+**No existing test would notice**, which is why this needs a new one: `tests/test_uilog.py:89`
+builds its own stamps with `time.strftime(uilog._STAMP, time.localtime(time.time() - seconds_ago))`,
+so test and writer drift together and the suite stays green either way. Add one boundary
+test with the clock frozen: a row stamped `cutoff - 1s` is EXCLUDED and one stamped
+`cutoff + 1s` is INCLUDED.
+
+**Mutation check:** revert the writer to the no-arg `time.localtime()` while leaving the
+reader converted, run `uv run pytest tests/test_uilog.py -q`, prove the boundary test goes
+red, revert, quote it. That test is the only thing between this section and a silent
+off-by-a-whole-window.
+
+Run your targeted command three times — as-is, under `TZ=UTC`, and under
+`TZ=America/Los_Angeles`. The TZ replay is not optional here: `uilog`'s stamp format goes
+through `localtime`, and `invariants.clock`'s today-branch is local-date sensitive.
 
 ### 7.2 Pairs that must move together
 
@@ -473,10 +847,19 @@ all four or none. Low value either way, but not separable.
   that file do convert.
 
 `tests/test_release_staging.py` is the largest file here at 15 sites, mostly `staged_at` and
-`restart_at` fields of a JSON marker. `:592` and `:605` — `before = int(time.time())` …
-`assert before <= marker["staged_at"] <= time.time() + 1` — are a real-elapsed sandwich
-asserting the marker was stamped during the call; decide whether that becomes a controlled
-assertion or a class-4 mark, and say which in the PR.
+`restart_at` fields of a JSON marker.
+
+`:592` and `:605` — `before = int(time.time())` …
+`assert before <= marker["staged_at"] <= time.time() + 1` — are **class 4, and this is
+decided, not a decision for you to make.** `staged_at` is written by
+`scripts/shipit.sh:475`, which stamps it with `$(date +%s)` in a shell subprocess that
+cannot see any patched Python attribute. Mark both lines with that reason — "the marker is
+stamped by `scripts/shipit.sh:475` in another process" — and keep the sandwich asserting
+real elapsed time.
+
+Converting both ends to `db.now()` is the trap: the sandwich would then compare a frozen
+Python epoch against a live shell `date`, and the test would pass always or fail always
+depending on the sign of the epoch relative to now. Neither outcome tests anything.
 
 ---
 
