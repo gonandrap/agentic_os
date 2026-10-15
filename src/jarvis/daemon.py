@@ -7194,7 +7194,9 @@ class Daemon:
             head_sha=str(fact.get("head_sha") or ""),
             wo_id=str(fact.get("wo_id") or ""),
             # Spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §5.
-            fix_wo_id=str(fact.get("fix_wo_id") or ""))
+            fix_wo_id=str(fact.get("fix_wo_id") or ""),
+            # Spec 2026-10-14-the-red-base-fix-is-exempt-by-its-issue.md.
+            issue_url=str(fact.get("issue_url") or ""))
 
     def poll_pull_requests(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Ask GitHub what happened to the pull requests this project is parked behind.

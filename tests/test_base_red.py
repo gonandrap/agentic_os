@@ -827,6 +827,110 @@ def test_a_stale_fact_dispatches_nothing(tracker, project, fake_gh):
     assert not fact().get("fix_wo_id")
 
 
+def no_fix_wo_id() -> dict:
+    """The fact as every route other than the sweep leaves it: an issue, no fixer."""
+    central = CentralStore()
+    central.set_state("base_health:proj_a", json.dumps({**fact(central),
+                                                        "fix_wo_id": ""}))
+    return fact(central)
+
+
+# -- exempt by the ISSUE (spec
+# docs/superpowers/specs/2026-10-14-the-red-base-fix-is-exempt-by-its-issue.md) --------
+
+
+def test_an_order_on_the_red_base_issue_is_exempt_with_no_fix_wo_id(
+        tracker, spec, project, fake_gh, local_base):
+    """wo-e497639e's shape: dispatched on the issue by `jarvis issues start`, so the
+    sweep never named it, and held by the very redness its merge removes."""
+    opt_in(tracker)
+    store, wo = parked(project, pr_url=TRACKER_PR)
+    fake_gh.set_pr(TRACKER_PR, "OPEN", checks=GREEN, merge_state="CLEAN",
+                   head_oid=JUDGED)
+    poll(tracker, store)
+    sweep(tracker, store)
+    store.update_work_order(wo["id"], issue_url=fact()["issue_url"])
+    assert no_fix_wo_id()["issue_url"]
+
+    tracker.poll_pull_requests(spec, store)
+
+    approvals = store.list_approvals(wo["id"])
+    assert len(approvals) == 1 and approvals[0]["kind"] == "auto_merge"
+
+
+def test_a_parked_order_on_another_issue_is_still_held_on_the_red_base(
+        tracker, spec, project, fake_gh, local_base):
+    """The exemption stays NARROW: issue linkage exempts the remedy and nobody else."""
+    opt_in(tracker)
+    store, wo = parked(project, pr_url=TRACKER_PR)
+    fake_gh.set_pr(TRACKER_PR, "OPEN", checks=GREEN, merge_state="CLEAN",
+                   head_oid=JUDGED)
+    poll(tracker, store)
+    sweep(tracker, store)
+    store.update_work_order(
+        wo["id"], issue_url=f"https://github.com/{FIXTURE_BUG_REPO}/issues/4242")
+    no_fix_wo_id()
+
+    tracker.poll_pull_requests(spec, store)
+
+    assert store.list_approvals(wo["id"]) == []
+    held = store.events_of_kind(wo["id"], "automerge_held")
+    assert db.from_json(held[-1]["payload"], {})["code"] == automerge.HELD_BASE_RED
+
+
+def test_the_remedy_with_red_checks_is_held_on_its_own_checks_not_on_the_base(
+        tracker, spec, project, fake_gh, local_base):
+    """Conditions 4-6 are untouched: the exemption skips the WORLD condition only, and
+    a red remedy is refused on the fact about the artifact in hand."""
+    opt_in(tracker)
+    store, wo = parked(project, pr_url=TRACKER_PR)
+    fake_gh.set_pr(TRACKER_PR, "OPEN", checks=[check("lint", "FAILURE",
+                                                     workflow="lint")],
+                   merge_state="CLEAN", head_oid=JUDGED)
+    poll(tracker, store)
+    sweep(tracker, store)
+    store.update_work_order(wo["id"], issue_url=fact()["issue_url"])
+    no_fix_wo_id()
+
+    tracker.poll_pull_requests(spec, store)
+
+    assert store.list_approvals(wo["id"]) == []
+    held = store.events_of_kind(wo["id"], "automerge_held")
+    assert db.from_json(held[-1]["payload"], {})["code"] \
+        == automerge.HELD_CHECKS_FAILED
+
+
+def test_an_unattributed_red_base_exempts_an_order_with_no_issue_either(
+        started, spec, project, fake_gh, local_base):
+    """THE `"" == ""` TRAP. Both halves of the guard require the STORED value non-empty,
+    so a break filed on no issue exempts nobody — least of all an order whose own
+    `issue_url` is empty too."""
+    opt_in(started)
+    store, wo = parked(project)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
+    red_fleet(fake_gh)
+    poll(started, store)
+    store.update_work_order(wo["id"], issue_url="")
+    assert not fact().get("issue_url")
+    assert store.get_work_order(wo["id"])["issue_url"] == ""
+
+    started.poll_pull_requests(spec, store)
+
+    assert store.list_approvals(wo["id"]) == []
+    held = store.events_of_kind(wo["id"], "automerge_held")
+    assert db.from_json(held[-1]["payload"], {})["code"] == automerge.HELD_BASE_RED
+
+
+def test_the_base_red_fact_carries_the_issue_the_break_is_filed_on(
+        tracker, spec, project, fake_gh):
+    """The key already exists on the fact; `_base_red` is what carries it to `decide`."""
+    store = ProjectStore(project)
+    poll(tracker, store)
+    sweep(tracker, store)
+
+    assert tracker._base_red(spec).issue_url == fact()["issue_url"] == fake_gh.issue_url
+
+
 def test_the_hold_reason_and_the_detail_name_the_order_and_never_change(
         tracker, spec, project, fake_gh):
     """§5, the kn-fb4aa3c4 trap: the dedupe key IS the sentence, so both carry the work

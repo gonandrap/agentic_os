@@ -199,6 +199,8 @@ class BaseRed:
     `fix_wo_id` is the order DISPATCHED to repair it (spec
     docs/superpowers/specs/2026-10-14-a-red-main-dispatches-its-own-fix.md §5), and is
     independent of `wo_id`.
+    `issue_url` is the tracker issue the break is filed on, `""` when unattributed (spec
+    docs/superpowers/specs/2026-10-14-the-red-base-fix-is-exempt-by-its-issue.md).
     """
 
     base: str
@@ -207,6 +209,7 @@ class BaseRed:
     head_sha: str
     wo_id: str = ""
     fix_wo_id: str = ""
+    issue_url: str = ""
 
 
 @dataclass(frozen=True)
@@ -272,6 +275,15 @@ def held_base_moved(catch_up: Any, pr: Any, base_oid: str = "") -> Decision:
     }.get(catch_up.outcome, f"{moved} and this branch does not contain it")
     return _held(HELD_BASE_MOVED, reason,
                  head_sha=str(getattr(pr, "head_oid", "") or ""))
+
+
+def is_base_remedy(wo: dict[str, Any], base_red: BaseRed) -> bool:
+    """Is this work order the remedy for that red base? Spec
+    docs/superpowers/specs/2026-10-14-the-red-base-fix-is-exempt-by-its-issue.md.
+    """
+    return bool(base_red.fix_wo_id and str(wo.get("id") or "") == base_red.fix_wo_id) \
+        or bool(base_red.issue_url
+                and str(wo.get("issue_url") or "") == base_red.issue_url)
 
 
 def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: Any,
@@ -360,8 +372,8 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
                      f"merge over a decision a person owes")
     # Spec docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §4,
     # and spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §6 for the exemption.
-    if base_red is not None and not (base_red.fix_wo_id
-                                     and wo.get("id") == base_red.fix_wo_id):
+    # Spec 2026-10-14-the-red-base-fix-is-exempt-by-its-issue.md: issue linkage too.
+    if base_red is not None and not is_base_remedy(wo, base_red):
         blamed = f" (merged by the OS for {base_red.wo_id})" if base_red.wo_id else ""
         # Spec 2026-10-14 §5: tick-stable, so the order's id and nothing that moves.
         fixing = (f"{base_red.fix_wo_id} is fixing it" if base_red.fix_wo_id
