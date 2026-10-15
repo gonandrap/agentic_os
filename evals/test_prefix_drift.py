@@ -30,7 +30,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from jarvis import claude_cli
+from jarvis import claude_cli, dispatch
 from jarvis.catalog import ProjectSpec
 from jarvis.testing import make_git_project
 from jarvis.worker_brief import git_briefing
@@ -70,6 +70,9 @@ class Render:
     prompt: str        # --append-system-prompt, verbatim
     standing: str      # the operator's own instructions for this worker, or ""
     settings: dict
+    #: The project's resolved `worker.cache_ttl` arm — what the settings file's cache
+    #: keys are pinned against (spec 2026-10-15-the-hour-on-worker-turns-only.md §1).
+    cache_ttl: str = "5m"
 
 
 def _fleet(tmp_path, jarvis_home) -> list[Render]:
@@ -80,22 +83,25 @@ def _fleet(tmp_path, jarvis_home) -> list[Render]:
     set whose tails happened to agree would make the central assertion vacuous.
     """
     out: list[Render] = []
+    # The cache-TTL arm varies across the fleet so the settings assertion is pinned to
+    # each project's own arm rather than to one constant — spec §1 and the guard table.
     cases = [
-        ("bare worker", "proj_a", "claude-opus-5", ""),
+        ("bare worker", "proj_a", "claude-opus-5", "", "5m"),
         ("worker, project instructions", "proj_a", "claude-opus-5",
-         "Always run the linter before you commit."),
+         "Always run the linter before you commit.", "5m"),
         ("worker, work-order instructions", "proj_b", "claude-opus-5",
-         "Never touch the vendored tree."),
+         "Never touch the vendored tree.", "1h"),
         ("planner", "proj_b", "claude-opus-5",
-         "Zero in on the smallest plan that ships."),
+         "Zero in on the smallest plan that ships.", "cli"),
         ("other model", "proj_a", "claude-haiku-4-5-20251001",
-         "Only the trailer may differ."),
+         "Only the trailer may differ.", "5m"),
     ]
     paths = {}
-    for label, pname, model, standing in cases:
+    for label, pname, model, standing, arm in cases:
         if pname not in paths:
             paths[pname] = make_git_project(tmp_path, pname)
         spec = ProjectSpec(name=pname, path=paths[pname], description="")
+        spec.worker.cache_ttl = arm
         wo = {"id": f"wo-{label.replace(' ', '')[:8]}", "title": label, "model": model,
               "kind": "planner" if label == "planner" else "worker"}
         # whether the text arrives on the project or on the work order is deliberately
@@ -110,6 +116,7 @@ def _fleet(tmp_path, jarvis_home) -> list[Render]:
             label=label, model=model,
             prompt=brief["append_system_prompt"], standing=standing,
             settings=json.loads(brief["settings_file"].read_text()),
+            cache_ttl=arm,
         ))
     return out
 
@@ -246,11 +253,17 @@ def test_the_head_survives_everything_that_is_not_an_input(tmp_path, jarvis_home
 def test_the_levers_that_suppress_cli_side_churn_are_still_set(fleet):
     """Jarvis owns only half the prompt. The other half is the CLI's, and these two keys
     are the whole of Jarvis's control over whether it moves between turns: the git-status
-    snapshot the briefing replaces, and the cache TTL the writes are billed at."""
+    snapshot the briefing replaces, and the cache TTL the writes are billed at.
+
+    The TTL is pinned to the PROJECT'S ARM rather than to one constant — `5m` and `1h`
+    write their key, `cli` writes none at all (spec
+    docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md §1).
+    """
     for r in fleet:
         assert r.settings["includeGitInstructions"] is False, r.label
-        for key, value in claude_cli.PROMPT_CACHE_5M_ENV.items():
-            assert r.settings["env"][key] == value, r.label
+        env = r.settings["env"]
+        assert {k: env[k] for k in claude_cli.CACHE_TTL_KEYS if k in env} \
+            == dispatch.cache_ttl_env(r.cache_ttl), r.label
 
 
 @scenario("prefix-drift", "the shared head is the bulk of what every worker carries")

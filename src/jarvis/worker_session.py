@@ -724,7 +724,7 @@ def _launch(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any], promp
             msg_id: int | None = None,
             briefing_out: dict[str, Any] | None = None) -> dict[str, Any]:
     from .central_store import CentralStore
-    from .dispatch import worker_name
+    from .dispatch import cache_ttl_env, worker_name
 
     wo_id = wo["id"]
     # THE ONE POINT EVERY TURN PASSES THROUGH, which is why the budget is both checked
@@ -744,7 +744,12 @@ def _launch(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any], promp
     tdir = turns_dir(project, wo_id)
     # The row exists before the process does: a turn that started with nothing on record
     # would run to completion with no one to reap it or capture what it said.
-    turn = store.create_turn(wo_id, kind=kind, prompt=prompt, msg_id=msg_id)
+    # Resolved ONCE per turn and used for both halves — the settings file is written from
+    # the same `project.worker.cache_ttl`, so they cannot drift. §3-§4 of
+    # docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md
+    arm = project.worker.cache_ttl
+    turn = store.create_turn(wo_id, kind=kind, prompt=prompt, msg_id=msg_id,
+                             cache_ttl=arm)
     outfile = tdir / f"{turn['seq']}.json"
     errfile = tdir / f"{turn['seq']}.err"
     store.conn.execute("UPDATE wo_turns SET outfile=?, errfile=? WHERE id=?",
@@ -761,6 +766,7 @@ def _launch(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any], promp
             # per (work order, sequence) — `systemd-run` refuses a unit name already in
             # use, and a resumed or retried turn always has a fresh seq.
             unit=systemd_units.unit_name(wo_id, turn["seq"]),
+            cache=cache_ttl_env(arm),
             name=worker_name(wo),
             worktree=worktree,
             **briefing,
@@ -777,6 +783,9 @@ def _launch(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any], promp
         # reading to the TURN rather than the whole order — §2 of
         # docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md. "" when git cannot say.
         "head": _head_sha(cwd),
+        # The arm this turn was launched on, for the timeline — spec §4, same file as the
+        # `arm` resolution above.
+        "cache_ttl": arm,
     })
     log.info("[%s] %s turn %s for %s (pid %s%s)", project.name, kind, turn["seq"],
              wo_id, spawned.pid, f", unit {spawned.unit}" if spawned.unit else "")

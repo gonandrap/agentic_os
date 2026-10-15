@@ -161,7 +161,9 @@ def test_the_dispatched_reason_blames_the_os_and_never_the_users_config():
                                       days=7)
 
     assert "BREACH" in alarm.reason and "defect in the OS" in alarm.reason
-    assert "claude_cli.cache_env" in alarm.reason
+    # The claim is about the turns stamped `5m`, not about every process the OS starts:
+    # spec §5 of docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md.
+    assert "wo_turns.cache_ttl" in alarm.reason and "5m" in alarm.reason
     assert "~/.claude/settings.json" not in alarm.reason
     assert "MUST NOT TRY" not in alarm.reason
 
@@ -350,6 +352,54 @@ def test_the_real_loop_raises_these_on_the_offset_tick(started, store, transcrip
     assert all(r["wo_id"] == carrier["id"] for r in rows)
     titles = {r["title"] for r in started.central.unacked_inbox()}
     assert set(daemon_mod.CACHE_1H_INBOX_TITLE.values()) <= titles
+
+
+# -- 3. the arm the turn ran on (spec 2026-10-15-the-hour-on-worker-turns-only.md §5) --
+
+
+def _armed_turn(store, transcripts, now, *, arm: str, tokens: int) -> None:
+    """A dispatched 1h write inside a turn STAMPED with `arm`, in that turn's session."""
+    wo = store.create_work_order("armed", status="running", session_id="s-armed")
+    turn = store.create_turn(wo["id"], kind="dispatch", prompt="go", cache_ttl=arm)
+    store.conn.execute("UPDATE wo_turns SET started_at=?, ended_at=? WHERE id=?",
+                       (now - DAY - 10, now - DAY + 10, turn["id"]))
+    store.conn.commit()
+    transcripts("s-armed", [prompt(now - DAY, sdk=True),
+                            wrote_1h(now - DAY + 1, "m1", tokens)])
+
+
+def test_an_hour_the_catalog_asked_for_raises_no_alarm(started, store, transcripts):
+    """The OS must not accuse itself of a defect it was told to have. The daemon builds
+    the `arms` index from `ProjectStore.turn_arms`; without it this is CACHE_1H_DISPATCHED
+    the moment a project opts in."""
+    from jarvis import db
+
+    store.create_work_order("carrier", status="completed")
+    now = db.now()
+    _armed_turn(store, transcripts, now, arm="1h", tokens=9_000_000)
+    project = started.catalog.projects[0]
+    project.inspect = InspectConfig()
+
+    started.check_cache_ttl(project, store)
+
+    assert store.alarms_across() == []
+
+
+def test_the_same_write_on_the_control_arm_still_raises(started, store, transcripts):
+    """The pair: one stamp apart, and the breach is still reported. A suppression that
+    covered the whole fleet while an experiment ran would hide exactly this."""
+    from jarvis import db
+
+    store.create_work_order("carrier", status="completed")
+    now = db.now()
+    _armed_turn(store, transcripts, now, arm="5m", tokens=9_000_000)
+    project = started.catalog.projects[0]
+    project.inspect = InspectConfig()
+
+    started.check_cache_ttl(project, store)
+
+    assert [r["kind"] for r in store.alarms_across()] == \
+        [inspection.CACHE_1H_DISPATCHED_ALARM]
 
 
 def test_one_tick_of_the_real_loop_does_not_scan(started, store, transcripts):
