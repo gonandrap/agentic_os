@@ -614,6 +614,31 @@ FEATURE_HANDOFF_EVENT = "manager_handoff"
 #: stall this feature exists to remove.
 VALIDATION_OUTAGE_LIMIT = 3
 
+#: `cause` on the `validation_failed` event of a round whose seats were KILLED BY A
+#: SIGNAL. ITS OWN CAUSE, never `"transport"`: every surface that reads these payloads
+#: (`holds`, `jarvis wo show`, the `validation_failure_causes` rule fact) tells the two
+#: apart only by this string, and a kill counted as an outage is both a false statement
+#: and a budget neither event exhausted (user ruling, Neo question 1705, condition i).
+#: How many are survived is `validation.killed_retries`, not a constant here — spec §4:
+#: docs/superpowers/specs/2026-10-14-a-killed-validation-panel-opens-an-investigation.md
+VALIDATION_KILLED_CAUSE = "killed"
+
+#: The rc off one seat's recorded reply, for the investigation's per-seat line. Read from
+#: the row rather than taken from the panel's exception because the seats may have died on
+#: different signals, and WHICH ones is part of what the investigation is about (spec §4a).
+_SEAT_RC_RE = re.compile(r"rc=(-?\d+)")
+
+
+def _seat_rc(reply: str, fallback: int) -> int:
+    match = _SEAT_RC_RE.search(reply)
+    return int(match.group(1)) if match else fallback
+
+
+def _moment(ts: float) -> str:
+    """A wall-clock moment to the SECOND. The co-incidence is the evidence — four seats
+    ending inside the same second — and a minute-resolution stamp loses it (spec §4a)."""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else "unknown"
+
 #: How long to wait before asking GitHub again whether the checks have finished. One
 #: minute, not one tick: the tick is 5 seconds and the answer changes on CI's clock, so
 #: re-asking every tick would spend a `gh pr view` per 5 seconds per parked order to
@@ -3010,6 +3035,14 @@ class Daemon:
                 # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
                 self._validation_refused(store, project, wo, round_id, n, failure)
                 return
+            if isinstance(failure, claude_cli.KilledError):
+                # BEFORE the generic outage below — a `ClaudeCliError` subclass, so a
+                # clause after it is never reached — and on its own counter: a signal
+                # death is not a transport fault. Spec §4:
+                # docs/superpowers/specs/2026-10-14-a-killed-validation-panel-opens-an-investigation.md
+                self._validation_killed(store, project, wo, round_id, n,
+                                        failure.killed, cfg)
+                return
             if failure is not None:
                 self._validation_outage(store, wo, round_id, n, failure)
                 return
@@ -3518,6 +3551,112 @@ class Daemon:
                 f"the review could not be run: the validator was unreachable "
                 f"{outages} times in a row. Nobody has judged the work.",
                 cause=ops.ESCALATION_VALIDATOR_UNREACHABLE)
+
+    def _validation_killed(self, store: ProjectStore, project: ProjectSpec, wo: dict,
+                           round_id: int, n: int, killed: claude_cli.Killed,
+                           cfg: Any) -> None:
+        """The seats' PROCESSES WERE KILLED. Re-judge the round, and investigate the kill.
+
+        `_validation_outage`'s shape and NOT its counter (user ruling, Neo question 1705,
+        condition i): the transport filter keys on `cause == "transport"` and this one on
+        `VALIDATION_KILLED_CAUSE`, so neither can see the other's events. Three unrelated
+        503s plus one kill must not escalate an order on a budget neither event exhausted,
+        and `cause: "transport"` on a signal death is a false statement in the one record
+        anybody reads later.
+
+        Counted FROM THE EVENTS, like `_validation_outage`, so a daemon restart does not
+        hand the round a fresh budget. The round is closed `failed`, which
+        `counted_validation_rounds` ignores, so the submitter pays nothing and the next
+        `validation_tick` picks the same round up — no new re-judge mechanism.
+
+        THE INVESTIGATION IS WHY A RETRY ALONE IS NOT THE FIX (GitHub issue #1039): a
+        retry can neither name what SIGTERMed four processes at once nor stop it
+        recurring. `ops.live_investigation` is asked first, so the filing is idempotent
+        across retries, and a filing that fails never propagates — the round close and the
+        event are the work order's own record and must land even when no investigation
+        exists.
+
+        Spec §4:
+        docs/superpowers/specs/2026-10-14-a-killed-validation-panel-opens-an-investigation.md
+        """
+        from . import ops
+
+        wo_id = wo["id"]
+        kills = 1 + sum(
+            1 for e in store.events_of_kind(wo_id, "validation_failed")
+            if db.from_json(e["payload"], {}).get("round") == n
+            and db.from_json(e["payload"], {}).get("cause") == VALIDATION_KILLED_CAUSE)
+        inv_id = self._killed_investigation(store, project, wo_id, round_id, n, killed)
+        store.close_validation_round(
+            round_id, "failed",
+            f"every validation seat was killed by a signal (rc={killed.rc}) before it "
+            f"could judge this submission")
+        store.add_event(wo_id, "validation_failed",
+                        {"round": n, "cause": VALIDATION_KILLED_CAUSE, "attempt": kills,
+                         "rc": killed.rc, "error": killed.message[:500],
+                         "investigation": inv_id})
+        if kills >= int(cfg.killed_retries):
+            # THE INVESTIGATION ID RIDES ON THE SENTENCE: the user reading the attention
+            # item needs somewhere to go that is not a retry (spec §4b).
+            pointer = (f"{inv_id} is investigating what killed them." if inv_id
+                       else "No investigation could be filed, so what killed them is "
+                            "not being diagnosed by anything.")
+            self._escalate(
+                store, wo, round_id, n,
+                f"the review could not be run: its seats were killed by a signal "
+                f"(rc={killed.rc}) {kills} times in a row. Nobody has judged the work. "
+                f"{pointer}")
+
+    @staticmethod
+    def _killed_investigation(store: ProjectStore, project: ProjectSpec, wo_id: str,
+                              round_id: int, n: int,
+                              killed: claude_cli.Killed) -> str:
+        """The live investigation on this order, filing one first if there is none.
+
+        FACTS BY REFERENCE, NEVER A PAYLOAD (spec §4a): the per-seat rows, the round and
+        the moments, plus the pointers to check for what else happened at that instant.
+        The seat REPLIES are not copied in — the investigation reads the record itself,
+        and `jarvis validation show` already renders the deliberation.
+        """
+        from . import ops
+
+        try:
+            live = ops.live_investigation(project.name, wo_id)
+            if live:
+                return live
+            seats_said = "\n".join(
+                f"  - {row['seat']}: status={row['status']}, "
+                f"latency_ms={int(row['latency_ms'] or 0)}, "
+                f"rc={_seat_rc(str(row['reply'] or ''), killed.rc)}, "
+                f"ended {_moment(float(row['ts'] or 0.0))}"
+                for row in store.validation_opinions(round_id)) or "  - none recorded"
+            round_row = store.get_validation_round(round_id) or {}
+            opened = float(round_row.get("ts") or 0.0)
+            order = ops.create_investigation_order(project.name, wo_id, why=(
+                f"Validation round {n} of {wo_id} was never judged: its seats' "
+                f"processes were killed by a signal (rc={killed.rc}) and wrote nothing. "
+                f"Four concurrent seats ending at the same elapsed time with no bytes on "
+                f"either stream is ONE EXTERNAL EVENT, not four model failures.\n\n"
+                f"What the record holds (read it, do not take this as the evidence):\n"
+                f"  - round id {round_id}, round {n}, opened {_moment(opened)}\n"
+                f"  - the message the transport classified: {killed.message}\n"
+                f"  - the seats, as the round recorded them:\n{seats_said}\n\n"
+                f"What to check for what else happened at that instant:\n"
+                f"  - this daemon's own restart and deploy record\n"
+                f"  - `jarvis alarms` and `jarvis inspect {wo_id}` around those moments\n"
+                f"  - the fleet pause state, and this order's budget holds\n"
+                f"  - the `os.validation.timeout` in force when the round opened\n\n"
+                f"WHAT NOT TO CONCLUDE: that a retry is the answer. The round IS "
+                f"re-judged already (`validation.killed_retries` bounds it). A retry "
+                f"cannot name what killed these processes and cannot stop it recurring; "
+                f"naming the cause is this order's whole job. GitHub issue #1039."))
+            return str(order["id"])
+        except ops.OpsError as e:
+            # NEVER PROPAGATES: a lost race between two ticks must not cost the round its
+            # own record (spec §4a).
+            log.warning("[%s] %s: no investigation filed for the killed round: %s",
+                        project.name, wo_id, e)
+            return ""
 
     def _round_config(self, project: ProjectSpec, round_row: dict[str, Any]) -> Any:
         """The validation settings THE ROUND WAS OPENED UNDER, not the live ones.

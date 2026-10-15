@@ -397,13 +397,90 @@ def a_healthy_pending_order(store) -> dict:
     return store.get_work_order(wo["id"])
 
 
+def _kill_event(store, wo_id: str, round_no: int = 1) -> None:
+    from jarvis.daemon import VALIDATION_KILLED_CAUSE
+
+    store.add_event(wo_id, "validation_failed",
+                    {"round": round_no, "cause": VALIDATION_KILLED_CAUSE,
+                     "attempt": 1, "rc": 143,
+                     "error": "killed by a signal (rc=143)", "investigation": ""})
+
+
+def a_killed_validation_panel(store) -> dict:
+    """Issue #1039: the seats of one order's round killed by a signal TWICE — recurring,
+    which is the fact the detector is about."""
+    wo = store.create_work_order("an order whose panel keeps being killed")
+    store.set_status(wo["id"], "validating")
+    _kill_event(store, wo["id"])
+    _kill_event(store, wo["id"])
+    return store.get_work_order(wo["id"])
+
+
+def a_healthy_single_kill(store) -> dict:
+    """One kill is a blip, and three TRANSPORT outages are a different cause entirely —
+    the conflation §4 step 3 of the spec exists to prevent."""
+    wo = store.create_work_order("an order killed once, and unreachable thrice")
+    store.set_status(wo["id"], "validating")
+    _kill_event(store, wo["id"])
+    for attempt in (1, 2, 3):
+        store.add_event(wo["id"], "validation_failed",
+                        {"round": 1, "cause": "transport", "attempt": attempt,
+                         "error": "connection reset"})
+    return store.get_work_order(wo["id"])
+
+
 SEEDS = [
     ("stale-panel-hold", a_stale_panel_hold, a_healthy_needs_review),
     ("unreachable-neo-question", an_unreachable_neo_question, a_healthy_waiting_input),
     ("catch-up-round-burn", a_catch_up_round_burn, a_healthy_parked_order),
     ("red-base-inherited", a_red_base_inherited, a_healthy_parked_order),
     ("overtaken-release-order", an_overtaken_release_order, a_healthy_pending_order),
+    ("killed-validation-panel", a_killed_validation_panel, a_healthy_single_kill),
 ]
+
+
+def test_the_causes_of_a_validation_failure_are_counted_by_cause(store):
+    """§5 of docs/superpowers/specs/
+    2026-10-14-a-killed-validation-panel-opens-an-investigation.md: every cause writes the
+    kind `validation_failed`, so the counts have to come off the PAYLOAD."""
+    wo = a_killed_validation_panel(store)
+    store.add_event(wo["id"], "validation_failed",
+                    {"round": 1, "cause": "transport", "attempt": 1, "error": "reset"})
+
+    facts = ops.rule_facts(store, store.get_work_order(wo["id"]), now=db.now(),
+                           sources=frozenset({"validation_failures"}), project="proj_a")
+
+    assert facts.values["validation_failure_causes"] == {"killed": 2, "transport": 1}
+
+
+def test_the_failure_causes_are_absent_when_the_source_is_not_requested(store):
+    """Its own source slug is the whole point: a condition about `status` must never pay
+    for the event walk (`sources` is the cost model)."""
+    wo = a_killed_validation_panel(store)
+
+    facts = ops.rule_facts(store, store.get_work_order(wo["id"]), now=db.now(),
+                           sources=frozenset({"work_order"}), project="proj_a")
+
+    assert "validation_failure_causes" not in facts.values
+
+
+def test_the_killed_panel_condition_needs_two_kills(store):
+    """§5: more than once on the same order. One kill is a blip and is not this."""
+    condition = next(json.loads(s["detector"]["condition"]) for s in rules.seed_rows()
+                     if s["detector"]["gap_class"] == "killed-validation-panel")
+    parsed = rules.parse_condition(json.dumps(condition))
+    sources = rules.sources_used(parsed)
+
+    twice = a_killed_validation_panel(store)
+    once = a_healthy_single_kill(store)
+
+    def evaluate(wo_id: str) -> bool:
+        facts = ops.rule_facts(store, store.get_work_order(wo_id), now=db.now(),
+                               sources=sources, project="proj_a")
+        return bool(rules.evaluate(parsed, facts).matched)
+
+    assert evaluate(twice["id"]) is True
+    assert evaluate(once["id"]) is False
 
 
 def _build(make, store, project):
@@ -650,6 +727,30 @@ def test_the_version_guard_actually_guards_and_a_second_open_re_seeds_nothing(
     again = CentralStore()
     try:
         assert again.get_detector(det["id"]) is None
+    finally:
+        again.close()
+
+
+def test_a_database_already_at_version_one_gains_exactly_the_sixth_seed(started, central):
+    """The addendum to §5: the pass returns early on a matching version, so without the
+    bump the new detector never reaches an `os.db` that already holds the five and ships
+    dead in production. Simulated by putting a live database back to version 1."""
+    sixth = detector_for(central, "killed-validation-panel")
+    retracted = detector_for(central, "stale-panel-hold")
+    central.retract_detector(retracted["id"], "the user disagreed")
+    central.conn.execute("DELETE FROM remedy_rules WHERE detector_id=?", (sixth["id"],))
+    central.conn.execute("DELETE FROM detectors WHERE id=?", (sixth["id"],))
+    central.set_state("detectors_seed", "1")
+    central.conn.commit()
+
+    again = CentralStore()
+    try:
+        assert again.get_detector(sixth["id"])["gap_class"] == "killed-validation-panel"
+        assert again.remedy_rules_for(sixth["id"])
+        assert again.get_state("detectors_seed") == "2"
+        assert again.get_detector(retracted["id"])["status"] == rules.RETRACTED, (
+            "re-seeding resurrected a detector a person retracted")
+        assert len(again.list_detectors(include_retired=True)) == 6
     finally:
         again.close()
 

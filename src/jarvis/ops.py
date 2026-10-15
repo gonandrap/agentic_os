@@ -11831,6 +11831,17 @@ def rule_facts(store: ProjectStore, wo: dict[str, Any], *, now: float,
                 counts[name] = counts.get(name, 0) + 1
         values["invariant_events"] = counts
 
+    if need("validation_failures"):
+        # BY CAUSE, off the payloads — `event_counts` keys on the KIND, which transport,
+        # auth and killed all share. Spec §5: docs/superpowers/specs/
+        # 2026-10-14-a-killed-validation-panel-opens-an-investigation.md
+        causes: dict[str, int] = {}
+        for event in store.events_of_kind(wo_id, "validation_failed"):
+            cause = str(db.from_json(event["payload"], {}).get("cause") or "")
+            if cause:
+                causes[cause] = causes.get(cause, 0) + 1
+        values["validation_failure_causes"] = causes
+
     if need("dependencies"):
         values["depends_on_count"] = len(store.dependencies(wo))
         values["dead_dependency_count"] = len(
