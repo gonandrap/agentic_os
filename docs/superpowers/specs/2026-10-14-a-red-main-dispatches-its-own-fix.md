@@ -72,6 +72,19 @@ registered, `gh` down, `promote_confirmed` raising. A transition-only dispatch w
 the break for as long as it stayed red. Idempotence comes from the fact's own keys (§3), so
 re-running it on a tick where nothing changed costs zero `gh` calls.
 
+ONE FIX ORDER PER RED-BASE ISSUE, EVER. Once `fix_wo_id` is set it is NEVER cleared while
+the base stays red — not on `failed`, not on `cancelled`, not on `completed`. The sweep's
+retry is about getting ONE order to exist, not about replacing one that does. Read the two
+cases together, because they look alike and are not:
+
+- NO order exists yet (`fix_wo_id` empty). Every failure mode above left nothing behind, so
+  the next tick's attempt is the FIRST dispatch of that break, not a second one. Retrying
+  here is the whole point of being a sweep.
+- An order EXISTS and has reached a terminal status with the base still red. The OS is out
+  of moves: it dispatches nothing more and it does not auto-retry, because `jarvis wo retry`
+  is user-only by contract — a turn that died with no result is replayed by the user, never
+  by the OS. It raises one attention item instead (step 5).
+
 Body, in order; every step is a no-op if the one before already succeeded:
 
 1. Scope gate (§1); return otherwise.
@@ -79,25 +92,30 @@ Body, in order; every step is a no-op if the one before already succeeded:
    (`BASE_HEALTH_FRESH_SECONDS`, `daemon.py:7030-7056`); a stale fact dispatches nothing
    for the same reason it pauses no merge.
 3. Read the raw fact for `run_id`, `run_url`, `issue_url`, `fix_wo_id`.
-4. `fix_wo_id` names an order whose status is NOT in `project_store.TERMINAL_STATUSES` →
-   return. Someone is on it.
+4. `fix_wo_id` names an order whose status is NOT in `project_store.TERMINAL_STATUSES`
+   (`project_store.py:69` — `completed`, `cancelled`, `failed`) → return. Someone is on it.
 5. `fix_wo_id` names a TERMINAL order and the base is still red → that order did not fix
-   it. Clear `fix_wo_id`, keep `issue_url`, fall through: the break gets a second order.
+   it, and the OS has nothing left to try. Dispatch NOTHING. Keep BOTH keys exactly as they
+   are: no clear, no second order. The user is told once, through
+   `check_default_branch_green`'s third remedy branch (§5), which names that order and its
+   terminal status and offers `jarvis wo retry` or a different order. Then return.
 6. `issue_url` set → `issues.start_work(issue_url, project=project.name)`
    (`issues.py:1524-1570`), which is idempotent through `promote_confirmed` /
    `live_work_order` (`issues.py:1407-1424`): one issue, one live work order. Record the
    returned `wo_id`.
 
-   UNLESS THAT STORED ISSUE IS NOW CLOSED, in which case CLEAR `issue_url` (and
-   `fix_wo_id`), log it and return: the next tick adopts-or-files afresh. `start_work`
-   refuses a closed issue outright (`issues.py:1563-1565`), so without this the step
-   raises on every tick for ever — no work order, no progress, no attention item, the
-   base red indefinitely. Which is this spec's own defect one level down, and the reason
-   it is NOT left to step 9's retry: a failure that cannot succeed is not transient.
-   Dedupe survives the clear because §4's OPEN filter can never adopt that issue back.
-   The state is READ (`issues.view`) rather than inferred from the refusal, so the
-   never-succeeds case stays distinguishable from the transient ones — `gh` down, Neo
-   unreachable, project unregistered — which must KEEP `issue_url` and retry.
+   UNLESS THAT STORED ISSUE IS NOW CLOSED, in which case CLEAR `issue_url`, log it and
+   return: the next tick adopts-or-files afresh. `start_work` refuses a closed issue
+   outright (`issues.py:1563-1565`), so without this the step raises on every tick for ever
+   — no work order, no progress, no attention item, the base red indefinitely. Which is
+   this spec's own defect one level down, and the reason it is NOT left to step 9's retry:
+   a failure that cannot succeed is not transient. `fix_wo_id` is necessarily EMPTY when
+   this step runs (steps 4 and 5 return on any value), so there is nothing to clear
+   alongside it and the one-order rule is untouched. Dedupe survives the clear because §4's
+   OPEN filter can never adopt that issue back. The state is READ (`issues.view`) rather
+   than inferred from the refusal, so the never-succeeds case stays distinguishable from
+   the transient ones — `gh` down, Neo unreachable, project unregistered — which must KEEP
+   `issue_url` and retry.
 7. No `issue_url` → ADOPTION SEARCH (§4). A hit: record its url and go to step 6.
 8. Nothing found → FILE: `bugreport.report_bug(title=…, description=…, expected=…,
    actual=…, priority="high", expedite=True)` (`bugreport.py:394-442`). That one call
@@ -106,7 +124,8 @@ Body, in order; every step is a no-op if the one before already succeeded:
    Record `url` and `pickup.wo_id`.
 9. Every failure: `log.exception`, write back whatever DID succeed (an issue filed with no
    work order still stores `issue_url`), return. Next tick retries from the first step that
-   is still empty.
+   is still empty. That retry can only ever produce the FIRST order for the break: once
+   `fix_wo_id` holds an id, step 4 or step 5 returns before any dispatch.
 
 `priority="high"` and NOT `critical`/`blocker`: `expedite=True` is what dispatches, at any
 priority (`route_filing`'s docstring), and the rating must stay an honest description. A
@@ -167,11 +186,27 @@ asymmetry `ops._verdict_duplicate` (`ops.py:10067-10107`) argues for.
   "The remedy is a commit on `main`" with the order that is producing that commit; `context`
   gains `fix_wo_id` and `issue_url`.
 
+THREE remedy branches, not two, because the terminal case is the one the user has to
+decide. `fix_wo_id` empty: today's "no work order is producing it yet". `fix_wo_id` live:
+that order is producing it. `fix_wo_id` TERMINAL (`store.get_work_order(fix_wo_id)` status
+in `TERMINAL_STATUSES`) — the §2 step 5 case — exactly this:
+
+> The remedy is a commit on `main`; wo-xxxxxxxx was dispatched to produce it and is now
+> `failed`, so the OS is out of moves — it dispatches no second fix order and never
+> retries a dead turn itself. Run `jarvis wo retry wo-xxxxxxxx`, or order a different fix.
+
+DERIVED, never stored: the status is read back at render time, under the same rule as the
+rest of this invariant. One attention item, because `INV-BASE-BRANCH-RED` is already
+deduped by `open_violation_report` on the sentence.
+
 TICK-STABLE, which is the constraint from the kn-fb4aa3c4 trap (1): a blocker or attention
 sentence may carry NO value that changes tick to tick, because the dedupe key is the
-sentence. A work-order id is written once per break and only changes when step 5 re-
-dispatches — which IS a new fact worth re-announcing. No elapsed time, no run count, no
-"checked at" goes into either sentence.
+sentence — `ack_attention` stores the derived blockers verbatim and `true_blockers`
+compares by exact string equality. The three values in the terminal sentence (base,
+`fix_wo_id`, the terminal status) are all frozen for as long as the base stays red:
+`fix_wo_id` is written once per break and never rewritten (§2), and a terminal status is
+terminal. No elapsed time, no run count, no "checked at", no retry counter goes into any of
+these sentences.
 
 ### 6. The fix order is exempt from its own hold
 
@@ -195,6 +230,20 @@ blanking `base_red` at the call site would make the holds of three other callers
   announcements. Loses: a dispatch has four transient failure modes outside the OS, and a
   spent transition leaves the break unowned for as long as it stays red. That is the
   original defect with a smaller window.
+- **Re-dispatch a second fix order when the first one dies** — what this spec said until
+  the user ruled on assumption #2 (Neo question 1738); clear `fix_wo_id` on a terminal
+  order, keep the issue, let the next tick dispatch again. Loses twice. (a) UNCAPPED SPEND:
+  nothing bounds the number of orders, so a break no order can fix buys a new worker every
+  time one dies, for as long as `main` stays red. (b) THE SAME CAUSE RECURS: every reason
+  offered for a second order — Neo unreachable, `gh` down, project not registered — is
+  environmental and kills the replacement exactly as it killed the first. A replacement
+  order is only ever a fresh attempt at a failure that was never about the order. The
+  retry that IS kept is the different one: retrying until ONE order exists (§2).
+- **Auto-retry the dead fix order instead of raising attention** — cheaper than a new
+  order, same session. Loses: `jarvis wo retry` is user-only by contract — "a turn that
+  died with no result is never replayed by the OS, only by the user" — and a daemon that
+  replayed it would re-send a whole dead conversation on a loop, which is the spend
+  objection again in a thinner disguise.
 - **Dedupe on `run_id`** — simplest key. Loses: one break produces many red runs; this is
   exactly how 1007/1010 happened.
 - **Dispatch for every project** — looks more useful. Loses: another project's red branch
@@ -206,7 +255,8 @@ blanking `base_red` at the call site would make the holds of three other callers
   one rule in one place; see §6.
 - **Tell the user better** — a sharper inbox line with the exact command. Loses: it is the
   same ask, and the user's standing rule is that a gap the OS notices is one the OS closes
-  itself.
+  itself. (The terminal-order attention item above is NOT this: it fires only once the OS
+  has spent every move it has.)
 
 ### 8. Tests a reviewer should expect
 
@@ -222,20 +272,28 @@ Now (must all exist):
    `report_bug` is never called.
 4. A CLOSED issue quoting the same run id is NOT adopted: a fresh issue is filed.
 5. A dispatch that fails (`report_bug` raising; Neo unreachable; project not registered)
-   leaves the fact without `fix_wo_id` and the NEXT tick retries and succeeds.
+   leaves the fact without `fix_wo_id` and the NEXT tick retries and succeeds. This is the
+   retry the one-order rule KEEPS: no order existed, so the second attempt is the first
+   dispatch.
 6. The fix order itself is NOT held on `base_red`: `decide` arms for
    `wo["id"] == base_red.fix_wo_id` with everything else green, and still holds for any
    other order on the same fact.
 7. The green transition drops BOTH keys; a later re-break starts from an empty fact and
    dispatches again.
-8. `fix_wo_id` pointing at a terminal order while the base is still red re-dispatches, and
-   the new order's id replaces it.
-9. `HELD_BASE_RED`'s reason and `INV-BASE-BRANCH-RED`'s detail contain the work-order id
-   and are byte-identical across three consecutive reconcile passes (the kn-fb4aa3c4
-   tick-stability property, so the violation report is still announced once).
-10. A stale fact (past `BASE_HEALTH_FRESH_SECONDS`) dispatches nothing.
-11. A STORED `issue_url` whose issue has since been CLOSED, on a still-red base, clears
-    both keys rather than raising, and the next tick files a new issue (§2 step 6). The
+8. `fix_wo_id` pointing at a TERMINAL order while the base is still red dispatches NOTHING
+   — no `report_bug`, no `start_work`, `fix_wo_id` unchanged — and `INV-BASE-BRANCH-RED`'s
+   detail names that order and its terminal status. Parametrised over all three of
+   `completed`, `cancelled`, `failed`: the rule is the same for each, and `completed` is
+   the one a reader expects to behave differently.
+9. That terminal-case detail is BYTE-IDENTICAL on two successive ticks with the fact
+   re-polled in between (red continues, `run_id` held constant), so the violation report is
+   announced once and `ack_attention` can match it.
+10. `HELD_BASE_RED`'s reason and `INV-BASE-BRANCH-RED`'s detail contain the work-order id
+    and are byte-identical across three consecutive reconcile passes (the kn-fb4aa3c4
+    tick-stability property, so the violation report is still announced once).
+11. A stale fact (past `BASE_HEALTH_FRESH_SECONDS`) dispatches nothing.
+12. A STORED `issue_url` whose issue has since been CLOSED, on a still-red base, clears
+    `issue_url` rather than raising, and the next tick files a new issue (§2 step 6). The
     retry loop it closes produces no work order at all, so a test that only drives the
     open-issue path cannot see it.
 
@@ -249,9 +307,20 @@ Now (must all exist):
 - No automatic revert of the breaking merge. The dispatched worker decides between revert
   and forward fix.
 - Other projects remain notify-only.
+- No OS-side retry of a dead fix order, and no second fix order per break (§7). The user
+  drives `jarvis wo retry` from the attention item.
 
-### 10. Open question for the reviewer
+### 10. Decisions and open questions
 
-Whether `priority="high"` is right, or whether a red tracker `main` should claim `critical`
-and let Neo re-assess. The dispatch does not depend on it (`expedite` does that work), so
-this only changes the `priority:` label and whether a release is cut on landing.
+SETTLED by the user on recorded assumption #2, 2026-10-14, agreeing with Neo's escalation
+(question 1738): one fix work order per red-base issue, ever. The user's words — "don't
+re-dispatch a fix order every time, just do it once and the OS has to make sure that one
+goes through; all reasons listed to justify a second one (Neo unreachable, gh down, project
+unregistered) will also fail with new orders". §2's one-order rule, §5's third remedy
+branch, §7's rejected alternative and §8 tests 8-9 are that ruling. The re-dispatch step
+this spec carried before is removed, not deferred.
+
+STILL OPEN for the reviewer: whether `priority="high"` is right, or whether a red tracker
+`main` should claim `critical` and let Neo re-assess. The dispatch does not depend on it
+(`expedite` does that work), so this only changes the `priority:` label and whether a
+release is cut on landing.
