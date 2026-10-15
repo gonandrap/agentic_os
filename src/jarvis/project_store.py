@@ -720,7 +720,15 @@ CREATE TABLE IF NOT EXISTS work_orders (
     attention_reason TEXT,
     result_summary TEXT,
     backlog_id TEXT,
-    metadata TEXT
+    metadata TEXT,
+    -- WHAT A FIX ORDER CARRIES — §7.1 of
+    -- docs/superpowers/specs/2026-09-27-self-evolution.md. Also in ADDED_COLUMNS, where
+    -- the argument for columns over `metadata` is; this table already ships, so a live
+    -- database gets all four only there.
+    gap_class TEXT,
+    detector_id TEXT,
+    remedy_rule_id TEXT,
+    trigger_wo_id TEXT
 );
 -- A planned unit of work above the work order: the coarse ask the user actually has,
 -- which the project plans into a dependency-ordered set of ordinary work orders before
@@ -1360,6 +1368,34 @@ ADDED_COLUMNS = {
         # `issues.desired_state` is what makes the sweep free while they agree and a
         # retry when `gh` was unreachable — see the `issues` module docstring.
         "issue_state": "TEXT",
+        # WHAT A FIX ORDER CARRIES: the class of gap it closes, the detector that
+        # recognises that gap, the remedy rule under it, and the order the investigation
+        # was filed FROM — what the dry run runs against. §7.1 of
+        # docs/superpowers/specs/2026-09-27-self-evolution.md, and these four names ARE
+        # the contract: they are spelled to match the registry's own columns, so
+        # `detectors.id` is read through `detector_id` and `remedy_rules.id` through
+        # `remedy_rule_id`, exactly as `rule_fires` and `rule_recurrences` spell the same
+        # two joins. One feature does not carry two spellings of one key.
+        #
+        # COLUMNS AND NOT `metadata`, on `issue_url`'s own precedent two entries up — a
+        # column when several readers need the value without parsing a blob and when
+        # something must SELECT on it. Five readers here: the pre-check
+        # (`rules.precheck`), `evidence.collect_work_order`, §8's recurrence lookup,
+        # `jarvis wo show` and §9's Evolution view; and the recurrence lookup is a query.
+        # The improvement-order back-link stays where it already is, in
+        # `metadata[ORIGIN_IO_KEY]`; this adds no fourth column for it.
+        #
+        # Nullable and NO BACKFILL: every pre-existing row reads "not a fix order", which
+        # is true, and `rules.precheck` returns None for exactly that row — so the gate is
+        # invisible to every order the fleet already has. They are SET STRUCTURALLY AND
+        # NEVER INFERRED FROM PROSE (kn-5d8a396a): `jarvis wo create --gap-class …` and
+        # `ops.create_work_order`'s keyword arguments are the only writers, because a
+        # `gap_class` guessed from a description would put the validation panel's payment
+        # behind a regex over a worker's paragraph.
+        "gap_class": "TEXT",
+        "detector_id": "TEXT",
+        "remedy_rule_id": "TEXT",
+        "trigger_wo_id": "TEXT",
     },
     "feature_orders": {
         # Same, one level up: a feature's bill is its children's, and children can be
@@ -2096,6 +2132,10 @@ class ProjectStore:
         issue_priority: str | None = None,
         budget_usd: float | None = None,
         observability: str | None = None,
+        gap_class: str | None = None,
+        detector_id: str | None = None,
+        remedy_rule_id: str | None = None,
+        trigger_wo_id: str | None = None,
     ) -> dict[str, Any]:
         """Create a work order. `status` and `session_id` are set in the same INSERT
         rather than afterwards, because the row is visible to the daemon the instant it
@@ -2132,14 +2172,21 @@ class ProjectStore:
                    created_at, updated_at, model, effort, permission_mode,
                    append_system_prompt, backlog_id, metadata, session_id, depends_on,
                    parent_id, kind, spec_section, issue_url, issue_priority,
-                   budget_usd, observability)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   budget_usd, observability, gap_class, detector_id, remedy_rule_id,
+                   trigger_wo_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 wo_id, title, description, status, origin, ts, ts, model, effort,
                 permission_mode, append_system_prompt, backlog_id,
                 db.to_json(metadata or {}), session_id, db.to_json(deps),
                 parent_id, kind, spec_section or None, issue_url or None,
                 issue_priority or None, budget_usd, observability,
+                # `or None` as `spec_section` and `issue_url` do: "" and NULL would
+                # otherwise be two spellings of "not a fix order", and the pre-check,
+                # the packet and the Evolution view would each need the same guard
+                # (§7.1 of docs/superpowers/specs/2026-09-27-self-evolution.md).
+                gap_class or None, detector_id or None, remedy_rule_id or None,
+                trigger_wo_id or None,
             ),
         )
         self.add_event(wo_id, "created", {"origin": origin, "depends_on": deps,

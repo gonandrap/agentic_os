@@ -358,6 +358,16 @@ def build_packet_prompt(packet: EvidencePacket) -> str:
         "## The testing evidence the submitter DECLARED\n"
         f"{packet.declared or '(none declared — the submitter claimed no evidence)'}",
     ]
+    if packet.self_evolution:
+        # §7.3 of docs/superpowers/specs/2026-09-27-self-evolution.md, copying the
+        # `spec_ref`/`spec_section` pattern above: HERE and never in the shared prefix or
+        # a seat prompt, which are byte-stable per seat for the prompt cache — one
+        # conditional section there costs the fleet a cache write on every ordinary
+        # round. The text itself is `evidence.self_evolution_checklist`'s, rendered at
+        # collection time, so the packet persisted for this round carries the words the
+        # seats actually read.
+        parts.append("## THIS IS A FIX ORDER — THE SELF-EVOLUTION CHECKLIST\n"
+                     f"{packet.self_evolution}")
     if packet.assumptions:
         called = "\n".join(
             f"- [{a.get('n')}] ({_assumption_state(str(a.get('status') or ''))}) "
