@@ -3644,7 +3644,8 @@ class Daemon:
                 store, wo, round_id, n,
                 f"the review could not be run: its seats were killed by a signal "
                 f"(rc={killed.rc}) {kills} times in a row. Nobody has judged the work. "
-                f"{pointer}")
+                f"{pointer}",
+                cause=ops.ESCALATION_PANEL_KILLED)
 
     @staticmethod
     def _killed_investigation(store: ProjectStore, project: ProjectSpec, wo_id: str,

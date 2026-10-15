@@ -35,7 +35,7 @@ ESCALATION_HANDOVER = frozenset({
 ESCALATION_NOT_REVIEWED = frozenset({
     "bounce_exhausted", "nothing_to_judge", "repeat_submission"})
 ESCALATION_UNJUDGED = frozenset({
-    "no_verdict", "validator_unreachable", "prompt_refused"})
+    "no_verdict", "validator_unreachable", "prompt_refused", "panel_killed"})
 
 # Plumbing: how a message got carried, which session was bound, when a turn ended.
 # None of it tells the user anything about the work itself.

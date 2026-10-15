@@ -7713,6 +7713,11 @@ ESCALATION_REPEAT_SUBMISSION = "repeat_submission"
 ESCALATION_NO_VERDICT = "no_verdict"
 ESCALATION_VALIDATOR_UNREACHABLE = "validator_unreachable"
 ESCALATION_PROMPT_REFUSED = "prompt_refused"
+#: A KILL IS NOT AN OUTAGE: the seats were reached and were killed by a signal, so
+#: `validator_unreachable` would state a transport failure nobody observed — spec
+#: docs/superpowers/specs/2026-10-14-a-killed-validation-panel-opens-an-investigation.md §4
+#: step 3 (kn-6ede3367).
+ESCALATION_PANEL_KILLED = "panel_killed"
 #: READ-TIME FALLBACK, never written by any call site: every `validation_escalated` event
 #: written before the field existed lacks it, and guessing a cause from its `reason` prose
 #: would put a wrong sentence — and a wrong command — on an old order (spec §1).
@@ -7738,6 +7743,7 @@ ESCALATION_FAMILY: dict[str, str] = {
     ESCALATION_NO_VERDICT: "unjudged",
     ESCALATION_VALIDATOR_UNREACHABLE: "unjudged",
     ESCALATION_PROMPT_REFUSED: "unjudged",
+    ESCALATION_PANEL_KILLED: "unjudged",
     ESCALATION_CAUSE_UNRECORDED: "unrecorded",
 }
 
@@ -7773,6 +7779,9 @@ ESCALATION_WHY: dict[str, str] = {
     ESCALATION_PROMPT_REFUSED:
         "the OS built a seat prompt over its character ceiling and never sent it, so "
         "nobody has judged the work.",
+    ESCALATION_PANEL_KILLED:
+        "the panel's seats were killed by a signal before they could judge this "
+        "submission, so nobody judged the work.",
     ESCALATION_CAUSE_UNRECORDED:
         "this round was escalated before the OS recorded which condition fired; the "
         "reason on the round below is what the panel said.",
