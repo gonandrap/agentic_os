@@ -24,7 +24,7 @@ from jarvis.catalog import load_catalog
 from jarvis.central_store import BASE_HEALTH_FRESH_SECONDS, CentralStore
 from jarvis.daemon import Daemon
 from jarvis.invariants import check_project
-from jarvis.project_store import ProjectStore
+from jarvis.project_store import TERMINAL_STATUSES, ProjectStore
 from jarvis.testing import FIXTURE_BUG_REPO, with_origin
 
 PR = "https://github.com/acme/proj/pull/7"
@@ -764,35 +764,175 @@ def test_the_green_transition_drops_both_keys_and_a_re_break_dispatches_again(
     assert filings(fake_gh) == 2
 
 
-def test_a_terminal_fix_order_on_a_still_red_base_re_dispatches(tracker, project,
-                                                                fake_gh):
-    """§2 step 5: that order did not fix it, so the break gets a second one — and keeps
-    the issue it was filed against."""
+def _dead_fix(tracker, store, status: str = "completed") -> str:
+    """One dispatched fix order, settled terminal, with `main` still red."""
+    poll(tracker, store)
+    sweep(tracker, store)
+    fix = fact()["fix_wo_id"]
+    assert fix
+    store.set_status(fix, status)
+    return fix
+
+
+def _owed(store) -> list[str]:
+    return [v.owed for v in check_project(store, repair=False)
+            if v.invariant == invariants.INV_BASE_FIX_DEAD]
+
+
+def _detail(store) -> str:
+    return next(v.detail for v in check_project(store, repair=False)
+                if v.invariant == invariants.INV_BASE_RED)
+
+
+def _command_for(status: str, fix: str, issue_url: str) -> str:
+    """What each dead status may name: `wo retry` is `failed`-only by contract."""
+    return (f"`jarvis wo retry {fix}`" if status == "failed"
+            else f"`jarvis issues start {issue_url}`")
+
+
+@pytest.mark.parametrize("status", TERMINAL_STATUSES)
+def test_a_terminal_fix_order_on_a_still_red_base_dispatches_nothing(tracker, project,
+                                                                     fake_gh, status):
+    """§2 step 5, as the user ruled on assumption 2 (Neo 1738): one fix work order per
+    break, EVER. A second is an uncapped spend loop, and every environmental cause that
+    killed the first kills a replacement."""
+    store = ProjectStore(project)
+    fix = _dead_fix(tracker, store, status)
+    before = filings(fake_gh)
+
+    poll(tracker, store)
+    sweep(tracker, store)
+
+    assert fact()["fix_wo_id"] == fix
+    assert fact()["issue_url"] == fake_gh.issue_url
+    assert filings(fake_gh) == before == 1
+    assert orders(store) == [fix]
+
+
+@pytest.mark.parametrize("status", [*TERMINAL_STATUSES, "deleted"])
+def test_the_detail_names_the_dead_fix_order_and_a_command_that_can_run(
+        tracker, project, fake_gh, status):
+    """§5's third remedy branch: the detail STATES the state the OS is in, names only a
+    command that can actually run — `jarvis wo retry` is `failed`-ONLY — and is
+    byte-identical across ticks because it is the dedupe key."""
+    store = ProjectStore(project)
+    if status == "deleted":
+        poll(tracker, store)
+        sweep(tracker, store)
+        fix = fact()["fix_wo_id"]
+        store.delete_work_order(fix)
+    else:
+        fix = _dead_fix(tracker, store, status)
+
+    seen = set()
+    for _ in range(2):
+        poll(tracker, store)
+        sweep(tracker, store)
+        seen.add(_detail(store))
+
+    assert len(seen) == 1
+    detail = seen.pop()
+    assert f"{fix} was dispatched to produce it and is now `{status}`" in detail
+    assert "dispatches no second fix order" in detail
+    assert _command_for(status, fix, fact()["issue_url"]) in detail
+    if status != "failed":
+        assert "jarvis wo retry" not in detail
+    if status == "deleted":
+        assert "Its record is gone, so nothing can be resumed" in detail
+
+
+@pytest.mark.parametrize("status", TERMINAL_STATUSES)
+def test_a_terminal_fix_order_owes_the_user_a_decision(tracker, spec, project, fake_gh,
+                                                       status):
+    """§5: the OS is out of moves — `jarvis wo retry` is the user's by contract, and
+    `failed`-only — so the violation owes a decision, naming a command that can run, and
+    the sentence reaches the work order's attention flag."""
+    store = ProjectStore(project)
+    fix = _dead_fix(tracker, store, status)
+
+    poll(tracker, store)
+    sweep(tracker, store)
+    tracker.check_invariants(spec, store)
+
+    owed = _owed(store)
+    assert len(owed) == 1 and fix in owed[0] and f"`{status}`" in owed[0]
+    assert _command_for(status, fix, fact()["issue_url"]) in owed[0]
+    if status != "failed":
+        assert "jarvis wo retry" not in owed[0]
+    assert [r["owed"] for r in store.owed_violations(fix)] == owed
+    row = store.get_work_order(fix)
+    assert row["needs_attention"] == 1
+    assert owed[0] in invariants.true_blockers(store, row)
+    if status != "failed":
+        # A `failed` order's own blocker outranks it; otherwise this is the only one.
+        assert row["attention_reason"] == owed[0]
+
+
+def test_the_owed_sentence_is_byte_identical_on_two_successive_ticks(tracker, project,
+                                                                     fake_gh):
+    """The kn-fb4aa3c4 trap: `ack_attention` stores the sentence verbatim and
+    `true_blockers` compares it by equality, so nothing in it may move tick to tick."""
+    store = ProjectStore(project)
+    _dead_fix(tracker, store)
+
+    seen = set()
+    for _ in range(2):
+        poll(tracker, store)
+        sweep(tracker, store)
+        seen.update(_owed(store))
+
+    assert len(seen) == 1
+
+
+def test_a_running_fix_order_owes_no_decision(tracker, project, fake_gh):
+    """The order is working on it: nothing is owed and nothing is dispatched."""
     store = ProjectStore(project)
     poll(tracker, store)
     sweep(tracker, store)
-    first = fact()["fix_wo_id"]
-    store.set_status(first, "completed")
+    fix = fact()["fix_wo_id"]
+    store.set_status(fix, "running")
 
     poll(tracker, store)
     sweep(tracker, store)
 
-    second = fact()["fix_wo_id"]
-    assert second and second != first
-    assert fact()["issue_url"] == fake_gh.issue_url
-    assert filings(fake_gh) == 1
+    assert _owed(store) == []
+    assert orders(store) == [fix] and filings(fake_gh) == 1
+
+
+def test_a_deleted_fix_order_behaves_as_terminal(tracker, project, fake_gh):
+    """A row that is gone is not a second dispatch either — the break had its order."""
+    store = ProjectStore(project)
+    poll(tracker, store)
+    sweep(tracker, store)
+    fix = fact()["fix_wo_id"]
+    store.delete_work_order(fix)
+
+    poll(tracker, store)
+    sweep(tracker, store)
+
+    assert fact()["fix_wo_id"] == fix
+    assert orders(store) == [] and filings(fake_gh) == 1
+    owed = _owed(store)
+    assert len(owed) == 1 and fix in owed[0]
+    assert f"`jarvis issues start {fact()['issue_url']}`" in owed[0]
+    assert "jarvis wo retry" not in owed[0]
 
 
 def test_a_stored_issue_that_was_closed_is_cleared_and_the_break_is_filed_again(
-        tracker, project, fake_gh):
+        tracker, project, fake_gh, monkeypatch):
     """§2 step 6: `start_work` refuses a closed issue outright, so a stored url someone
     has since closed is a retry that can never progress — the shape of the defect this
-    spec removes, one level down."""
+    spec removes, one level down. The url is stored with NO work order (the pickup
+    failed), which under step 5 is the only state this branch can be reached in."""
+    real = bugreport.report_bug
+    pickup_fails = {"on": True}
+    monkeypatch.setattr(bugreport, "report_bug", lambda **kw: (
+        {**real(**kw), "pickup": {}} if pickup_fails["on"] else real(**kw)))
     store = ProjectStore(project)
     poll(tracker, store)
     sweep(tracker, store)
     first = fact()
-    store.set_status(first["fix_wo_id"], "completed")
+    assert first["issue_url"] and not first.get("fix_wo_id")
     fake_gh.set_issue(first["issue_url"], state="CLOSED")
 
     poll(tracker, store)
@@ -801,6 +941,7 @@ def test_a_stored_issue_that_was_closed_is_cleared_and_the_break_is_filed_again(
     assert not fact().get("issue_url") and not fact().get("fix_wo_id")
     assert filings(fake_gh) == 1
 
+    pickup_fails["on"] = False
     fake_gh.next_issue(f"https://github.com/{FIXTURE_BUG_REPO}/issues/8")
     poll(tracker, store)
     sweep(tracker, store)
