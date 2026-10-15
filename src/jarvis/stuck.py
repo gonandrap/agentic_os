@@ -40,6 +40,9 @@ LIVE_DEPENDENCY = "live_dependency"
 HOLD_EXEMPT_KIND = "exempt_kind"
 IDLE_MANAGER_CAUSE = "its feature's next message"
 
+#: §1 of docs/superpowers/specs/2026-10-14-a-worker-turn-in-flight-is-not-stuck.md.
+TURN_IN_FLIGHT_CAUSE = "a worker turn is in flight"
+
 #: One sentence per cause, because the shipped one is false for both of the above: an
 #: exempt kind never clears, and a manager's hold clears when its feature speaks rather
 #: than by itself. `{cause}` and `{kind}` are the only slots.
@@ -50,6 +53,9 @@ EXCLUSION_REASON: Mapping[str, str] = {
     IDLE_MANAGER_CAUSE: ("a manager is idle until its feature messages it, and this "
                          "feature has not finished with it — nothing is judged while "
                          "that is true"),
+    TURN_IN_FLIGHT_CAUSE: ("a worker turn is in flight and writes nothing to the "
+                           "timeline while its tools run — it clears by itself when the "
+                           "turn ends, so nothing is judged while it does"),
 }
 
 #: The usage window's sentence, and the answer for any hold added later: all five of §2's
@@ -100,7 +106,8 @@ def assess(status: str, seconds_in_status: float, seconds_since_activity: float,
            excluded_cause: str = "",
            kind: str = "worker",
            exempt_kinds: Sequence[str] = (),
-           by_design_idle: bool = False) -> Verdict:
+           by_design_idle: bool = False,
+           turn_in_flight: bool = False) -> Verdict:
     """The whole decision, over scalars: no store, no config object, no row.
 
     `fallback_seconds` covers an open status `thresholds` does not name, so a status added
@@ -113,7 +120,8 @@ def assess(status: str, seconds_in_status: float, seconds_since_activity: float,
     (`project_store.VALIDATION_CI_CAUSE`), because nothing is wrong in those cases and all
     five resume by themselves — so an investigation would buy a session to be told the OS
     is working as designed. `exempt_kinds` and `by_design_idle` exclude too (§1, §2.2 of
-    the 2026-10-12 spec).
+    the 2026-10-12 spec), as does a worker whose turn is in flight — it writes nothing to
+    the timeline while its tools run (§1 of the 2026-10-14 spec).
 
     That CI one is an EXTENSION of kn-6e836793 (the user's 2026-09-27 ruling that the
     usage hold was the only one) on the record rather than a silent widening — the
@@ -145,6 +153,8 @@ def assess(status: str, seconds_in_status: float, seconds_since_activity: float,
         cause = excluded_cause
     elif by_design_idle:
         cause = IDLE_MANAGER_CAUSE
+    elif turn_in_flight:
+        cause = TURN_IN_FLIGHT_CAUSE
     if cause:
         # One site composes the sentence, per cause: `active_seconds` and
         # `threshold_seconds` stay populated so the row still shows the arithmetic.
