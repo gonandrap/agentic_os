@@ -19,6 +19,7 @@ Three properties are worth more than the rest and each has its own section below
 from __future__ import annotations
 
 import ast
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -237,6 +238,31 @@ def test_the_not_its_fault_clause_needs_the_same_workflow_red_on_this_branch():
     assert "not its fault" not in other.reason
     green = decide(rnd(), base_red=BASE_RED)
     assert "not its fault" not in green.reason
+
+
+def test_the_order_fixing_main_is_not_held_on_the_base_it_is_fixing():
+    """Spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §6: its own merge is the only
+    thing that turns the base green, so holding it deadlocks the mechanism. Narrow — any
+    other order on the same fact is still held, and an unnamed id exempts nobody."""
+    fixing = replace(BASE_RED, fix_wo_id=WO["id"])
+
+    assert decide(rnd(), base_red=fixing).armed
+    other = decide(rnd(), wo={**WO, "id": "wo-2"}, base_red=fixing)
+    assert other.code == automerge.HELD_BASE_RED and WO["id"] in other.reason
+    assert decide(rnd(), wo={**WO, "id": ""}, base_red=BASE_RED).code \
+        == automerge.HELD_BASE_RED
+
+
+def test_an_unclaimed_red_base_reads_as_nothing_yet_rather_than_as_silence():
+    """Spec 2026-10-14 §5: the hold names the order when there is one, and says there is
+    none when there is not — the tail stays today's sentence either way."""
+    unclaimed = decide(rnd(), base_red=BASE_RED).reason
+    assert "Nothing merges onto a broken default branch." in unclaimed
+    assert "no work order is fixing it yet" in unclaimed
+    named = decide(rnd(), wo={**WO, "id": "wo-2"},
+                   base_red=replace(BASE_RED, fix_wo_id="wo-9")).reason
+    assert "wo-9 is fixing it" in named
+    assert "Nothing merges onto a broken default branch." in named
 
 
 BASE_BEHIND = automerge.BaseBehind(base="main", base_oid=BASE_MOVED)
