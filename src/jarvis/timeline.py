@@ -835,6 +835,14 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "pr_repair_resettled":
         return ("Back in the merge queue — the reason it was held is gone",
                 f"was {p.get('was')}" if p.get("was") else "")
+    # ...and the inverse move, for the same reason. Spec §B of
+    # docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md.
+    if kind == "give_up_reparked":
+        return ("Back on your list — the panel's give-up was never decided",
+                ", ".join(x for x in (f"was {p.get('was')}" if p.get("was") else "",
+                                      f"round {p.get('round')}" if p.get("round")
+                                      else "")
+                          if x))
     # THE ONLY `automerge_*` KINDS WITH LABELS HERE, and deliberately: every other one is
     # rendered by `ops.automerge_state` as the mechanism's one-line state on the work
     # order. These two are excluded from `ops.AUTOMERGE_EVENTS` — the state after either

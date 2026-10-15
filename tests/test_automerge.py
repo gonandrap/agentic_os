@@ -1931,6 +1931,28 @@ def test_a_parked_order_the_panel_gave_up_on_asks_the_user_for_something(
     assert row["attention_reason"] == invariants.PARKED_GIVE_UP_BLOCKER
 
 
+def test_the_parked_sentence_and_the_needs_review_sentence_never_co_occur(
+        started, project, fake_gh):
+    """§B is self-extinguishing: after the repair the status carries the give-up, so one
+    sentence is left, not two.
+
+    docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md.
+    """
+    store, wo = arm(started, project, auto_merge=True, outcome="escalated")
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
+    poll(started, store)
+    assert invariants.PARKED_GIVE_UP_BLOCKER in invariants.true_blockers(
+        store, store.get_work_order(wo["id"]))
+
+    list(invariants.check_validation_progresses(store))
+
+    row = store.get_work_order(wo["id"])
+    assert row["status"] == "needs_review"
+    blockers = invariants.true_blockers(store, row)
+    assert invariants.PARKED_GIVE_UP_BLOCKER not in blockers
+    assert invariants.VALIDATION_STUCK_BLOCKER in blockers
+
+
 def test_a_refused_merge_is_the_other_sentence_and_only_that(started, project, fake_gh):
     """Row 10: `automerge_denied` needs a `validated_head`, which only a PASSED round
     has, so the two are exclusive on the round alone."""

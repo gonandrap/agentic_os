@@ -489,6 +489,37 @@ def test_review_state_owes_a_decision_on_an_escalated_round(jarvis_home, catalog
     assert "flagged" in owed["strands"]
 
 
+def test_the_review_control_names_the_round_that_gave_up_not_the_row_after_it(
+        jarvis_home, catalog_file, project):
+    """§A of docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md:
+    the boolean and the round number come from the same row."""
+    store = ProjectStore(project)
+    try:
+        wo = store.create_work_order("the panel gave up on round 4")
+        for n in (1, 2, 3):
+            earlier = store.open_validation_round(wo_id=wo["id"], fingerprint=f"r{n}")
+            store.close_validation_round(earlier["id"], "rejected", "")
+        gave_up = store.open_validation_round(wo_id=wo["id"], fingerprint="r4")
+        ops.escalate_validation_round(store, store.get_work_order(wo["id"]),
+                                      gave_up["id"], gave_up["round"],
+                                      "four rounds asked for the same test",
+                                      cause=ops.ESCALATION_ROUNDS_SPENT)
+        after = store.open_validation_round(wo_id=wo["id"], fingerprint="r5")
+        assert after["round"] == 5                      # the row that judged nothing
+
+        owed = ops.review_state(store, store.get_work_order(wo["id"]))
+    finally:
+        store.close()
+
+    assert owed["escalated"] is True
+    assert owed["round"] == 4
+    # `escalation_cause` is keyed on the round's id, so §A's row choice also decides
+    # whether the cause is found at all — row 5 carries no `validation_escalated` event.
+    assert owed["cause"] == ops.ESCALATION_ROUNDS_SPENT
+    assert owed["family"] == "handover"
+    assert "round 4 was its last" in owed["why"]
+
+
 def test_review_state_places_the_one_control_in_the_assumptions_block(
         jarvis_home, catalog_file, project):
     """Both true at once is reachable (issue 212). `placement` is the mutual exclusion,

@@ -1483,14 +1483,24 @@ def test_a_decline_written_before_the_cause_existed_is_a_budget_decline(project)
 
 def _parked_on_an_escalation(store: ProjectStore, *, outcome: str = "escalated",
                              hold: str | None = invariants.HELD_NOT_PASSED,
-                             status: str = "waiting_pr_merge") -> dict:
-    """A work order parked behind its pull request with the panel's last word on it."""
+                             status: str = "waiting_pr_merge",
+                             after: str | None = None) -> dict:
+    """A work order parked behind its pull request with the panel's last word on it.
+
+    `after` opens ONE MORE round after that word, with the outcome given — the row the
+    panel's last word used to be lost behind. Spec
+    docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md §A.
+    """
     wo = store.create_work_order("add feature X")
     store.update_work_order(wo["id"], pr_url="https://github.com/acme/proj/pull/7",
                             result_summary="opened a PR")
     row = store.open_validation_round(wo_id=wo["id"], fingerprint="fp")
     store.set_validation_head(row["id"], "aaaa1111aaaa2222")
     store.close_validation_round(row["id"], outcome, "")
+    if after is not None:
+        later = store.open_validation_round(wo_id=wo["id"], fingerprint="fp-after")
+        if after != "pending":
+            store.close_validation_round(later["id"], after, "")
     store.set_status(wo["id"], status)
     if hold is not None:
         store.add_event(wo["id"], "automerge_held", {"code": hold, "round": 1})
@@ -1603,6 +1613,100 @@ def test_a_moved_head_decline_is_the_other_sentence_and_only_that(project):
     blockers = true_blockers(store, moved)
     assert invariants.SHA_MOVED_BLOCKER in blockers
     assert invariants.PARKED_GIVE_UP_BLOCKER not in blockers
+
+
+# -- a row that judged nothing must not drop the give-up under it ----------------------
+# docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md §A, §B.
+
+
+def _owed_after(project, outcome: str) -> tuple[ProjectStore, dict]:
+    store = ProjectStore(project)
+    return store, _parked_on_an_escalation(store, after=outcome)
+
+
+def test_a_pending_round_after_a_give_up_does_not_drop_it(project):
+    """A forced or rebind round in flight judges nothing, so nobody has decided."""
+    store, wo = _owed_after(project, "pending")
+
+    assert invariants.validation_escalated(store, wo) is True
+    assert invariants.parked_on_a_give_up(store, wo) is True
+    assert invariants.PARKED_GIVE_UP_BLOCKER in true_blockers(store, wo)
+
+
+def test_a_failed_transport_round_after_a_give_up_does_not_drop_it(project):
+    """`counted_validation_rounds` already calls a `failed` round no judgement."""
+    store, wo = _owed_after(project, "failed")
+
+    assert invariants.validation_escalated(store, wo) is True
+    assert invariants.parked_on_a_give_up(store, wo) is True
+    assert invariants.PARKED_GIVE_UP_BLOCKER in true_blockers(store, wo)
+
+
+def test_a_void_round_after_a_give_up_does_not_drop_it(project):
+    """A `void` round had nothing for a reviewer, so it asked the submitter nothing."""
+    store, wo = _owed_after(project, "void")
+
+    assert invariants.validation_escalated(store, wo) is True
+    assert invariants.parked_on_a_give_up(store, wo) is True
+    assert invariants.PARKED_GIVE_UP_BLOCKER in true_blockers(store, wo)
+
+
+def _give_up_violations(store: ProjectStore) -> list:
+    return [v for v in invariants.check_validation_progresses(store)
+            if v.invariant == "INV-VALIDATION-STRANDED"]
+
+
+def test_a_give_up_parked_in_the_merge_queue_is_put_back_for_review(project):
+    """§B: nothing re-derives `waiting_pr_merge`, so state already written needs a move.
+    The flag is left to `check_blocked_work_is_surfaced` (kn-089de524)."""
+    store = ProjectStore(project)
+    wo = _parked_on_an_escalation(store)
+
+    found = _give_up_violations(store)
+
+    assert [v.wo_id for v in found] == [wo["id"]]
+    assert found[0].repaired
+    row = store.get_work_order(wo["id"])
+    assert row["status"] == "needs_review"
+    assert store.last_event_of_kind(wo["id"], "give_up_reparked") is not None
+    assert not row["needs_attention"]
+
+    list(invariants.check_blocked_work_is_surfaced(store))
+    row = store.get_work_order(wo["id"])
+    assert row["needs_attention"]
+    assert VALIDATION_STUCK_BLOCKER in true_blockers(store, row)
+
+
+def test_a_project_merging_by_hand_is_left_in_the_merge_queue(project):
+    """The twin of row 3: `auto_merge` off writes no hold, nothing is held by the
+    escalation, and moving it would take a healthy pull request off the merge poll."""
+    store = ProjectStore(project)
+    wo = _parked_on_an_escalation(store, hold=None)
+
+    assert _give_up_violations(store) == []
+    assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
+
+
+def test_the_repair_writes_nothing_under_a_live_turn(project):
+    """The discipline daemon.py:3045 and daemon.py:6353 already follow."""
+    store = ProjectStore(project)
+    wo = _parked_on_an_escalation(store)
+    store.create_turn(wo["id"], "message", "go")
+    assert worker_session.busy(store, wo["id"]) is not None
+
+    assert _give_up_violations(store) == []
+    assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
+
+
+def test_the_repair_is_idempotent(project):
+    """Self-extinguishing: after the move there is no `waiting_pr_merge` row left."""
+    store = ProjectStore(project)
+    _parked_on_an_escalation(store)
+
+    assert len(_give_up_violations(store)) == 1
+    assert _give_up_violations(store) == []
+
+
 # -- is somebody ELSE holding this, or is anything out at all? -------------------------
 # Fix 2 of docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md: two
 # questions, two resolvers, side by side so they cannot drift (kn-4ea33fe6).

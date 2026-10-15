@@ -1884,3 +1884,43 @@ def test_a_give_up_survives_the_turn_that_follows_it(fleet, fake_claude):
         assert VALIDATION_STUCK_BLOCKER in true_blockers(store, fresh)
     finally:
         store.close()
+
+
+def test_a_give_up_survives_a_message_turn_after_a_round_that_judged_nothing(
+        fleet, fake_claude):
+    """The issue's order end to end: a row that JUDGED NOTHING sits after the give-up.
+
+    docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md §A.
+    """
+    fleet.reconfigure(max_rounds=1)
+    fleet.daemon.validator = Validator(rejected("no test covers the change"))
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "print('one')\n")
+    finish(fleet, wo["id"])
+
+    fleet.drain()
+
+    store = fleet.store()
+    try:
+        assert store.get_work_order(wo["id"])["status"] == "needs_review"
+
+        void = store.open_validation_round(wo_id=wo["id"], fingerprint="fp-after")
+        store.close_validation_round(void["id"], "void", "nothing to judge")
+        assert store.latest_validation_round(wo_id=wo["id"])["outcome"] == "void"
+
+        gate = fake_claude.hold_turns()
+        store.queue_message(wo["id"], "one more thing")
+        fleet.tick()
+        assert store.get_work_order(wo["id"])["status"] == "running"
+
+        gate.unlink()
+        assert _settle(store, wo["id"])
+        fleet.tick()
+
+        fresh = store.get_work_order(wo["id"])
+        assert fresh["status"] != "waiting_pr_merge", (
+            "a row that judged nothing dropped the give-up onto the merge queue")
+        assert fresh["status"] == "needs_review"
+        assert VALIDATION_STUCK_BLOCKER in true_blockers(store, fresh)
+    finally:
+        store.close()
