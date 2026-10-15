@@ -80,7 +80,7 @@ import logging
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 from . import worker_session
 
@@ -196,6 +196,135 @@ class EvidencePacket:
     #: field here is hashable. DELIBERATELY NOT in `fingerprint`: `diff_sha` already
     #: covers exactly the same bytes, so hashing it in would add nothing and double-count.
     file_shas: tuple[tuple[str, str], ...] = ()
+    #: THE FOUR COLUMNS A FIX ORDER CARRIES, off the `work_orders` row and nowhere else
+    #: (§7.1 and §7.3 of docs/superpowers/specs/2026-09-27-self-evolution.md). All four
+    #: and not `gap_class` alone, or `fingerprint` cannot hash what §7.3 says it hashes:
+    #: a submitter that registers a different detector, or names a different triggering
+    #: order, with the same diff HAS produced new evidence.
+    gap_class: str = ""
+    detector_id: str = ""
+    remedy_rule_id: str = ""
+    trigger_wo_id: str = ""
+    #: The §7.3 checklist, RENDERED — static prose plus the four ids above, which is why
+    #: this module can build it without opening a database. `""` whenever `gap_class` is
+    #: empty, which is almost every order.
+    #:
+    #: DELIBERATELY NOT in `fingerprint`: it is prose the OS injected rather than
+    #: anything the submitter produced, and it is regenerated every round — the
+    #: `history` row of that function's exclusion table, arriving through a new door.
+    self_evolution: str = ""
+    #: THE §7.2 CHECKS THAT PASSED WITHOUT BEING EVALUATED, one sentence each, straight
+    #: out of `rules.precheck`'s and `ops.fix_order_precheck`'s sink. Empty for every order
+    #: whose four checks were all decided — which is every fix order that reaches the panel
+    #: on a healthy OS — and the checklist above then reads exactly as it did before this
+    #: field existed.
+    #:
+    #: IT EXISTS BECAUSE THE SKIP WAS INVISIBLE: an unreadable trigger or a `can_apply`
+    #: that raised passes the check rather than refusing (the pinned kn-b7deec8f ruling),
+    #: and the checklist was telling every seat all four were decided mechanically and must
+    #: not be re-decided. That is the one hidden skip this feature's own round-2 panel
+    #: caught.
+    #:
+    #: DELIBERATELY NOT in `fingerprint`, on the `history`/`self_evolution` row of that
+    #: function's exclusion table: the OS wrote these sentences, not the submitter, and
+    #: they are regenerated every round.
+    self_evolution_unproven: tuple[str, ...] = ()
+
+
+#: §7.3's checklist, in the PACKET and never in the system prompt:
+#: `validation.build_shared_prefix` and `build_seat_prompt` are byte-stable per seat for
+#: the prompt cache, and one conditional section there costs the fleet a cache write on
+#: every ordinary round.
+#:
+#: THE THREE QUESTIONS ARE ABOUT QUALITY, and the sentence that says so is load-bearing:
+#: existence — that the detector is registered, that a live remedy names a real
+#: primitive, that the condition fires on the triggering order, that the remedy's
+#: preconditions hold — was decided mechanically by `rules.precheck` before this round
+#: was opened, and a seat re-deciding it produces a blocker the submitter cannot act on.
+SELF_EVOLUTION_CHECKLIST = """\
+This work order is a FIX ORDER in the OS's self-evolution loop: it closes a class of gap
+the OS keeps falling into by registering a detector and a remedy for it.
+
+- gap class: {gap_class}
+- detector: {detector_id}
+- remedy rule: {remedy_rule_id}
+- proved against: {trigger_wo_id}
+
+{decided}{unproven}
+The three questions, and they are about quality:
+
+1. Does the condition match the real symptom, or a coincidence of this one order's
+   state? Would it over-fire on a healthy order — name one if you can.
+2. Is the remedy safe and idempotent for this condition, and is it the right primitive?
+3. Is there a test that would fail if the condition stopped matching, and one that would
+   fail if it started matching a healthy order?
+
+The standing rule still governs: block only on a blocker. "The condition could also
+check X" is a follow-up ticket, not a rejection."""
+
+#: The mechanically-decided claim when ALL FOUR of §7.2's checks ran — byte-for-byte the
+#: paragraph that was inline before `unproven` existed, so a fully decided fix order's
+#: checklist is unchanged.
+ALL_CHECKS_DECIDED = """\
+JUDGE QUALITY, NEVER EXISTENCE. That the detector exists, that it has a live remedy
+naming a real primitive, that its condition actually fires on the triggering order's
+recorded state, and that the remedy's preconditions hold against that same order were
+all decided mechanically before this round was opened. Re-deciding any of them here
+produces a blocker the submitter cannot act on.
+"""
+
+#: The same claim NARROWED to the checks that actually ran. It may not say "all four":
+#: a check the OS could not run has nothing mechanical behind it, and telling a seat
+#: otherwise is what turned a pass-through into a hidden skip (§7.2, round 2 of this
+#: feature's own panel).
+SOME_CHECKS_DECIDED = """\
+JUDGE QUALITY, NEVER EXISTENCE — WITH THE ONE EXCEPTION NAMED BELOW. Every check the OS
+could run was decided mechanically before this round was opened, and re-deciding one of
+those here produces a blocker the submitter cannot act on. The checks listed next are
+NOT among them.
+"""
+
+#: What a seat is told about a check that passed unevaluated. THE ONE EXCEPTION to "never
+#: existence", and it is narrow on purpose: that named check and nothing else.
+UNPROVEN_CHECKS = """
+THESE CHECKS WERE NOT RUN, AND THEY ARE YOURS TO RAISE. The OS could not decide them —
+the reason is stated with each — so nothing mechanical stands behind them:
+
+{notes}
+
+Each of those, and only those, is the exception to "never existence". If the diff does
+not satisfy you that such a check holds, say so: the alternative is a skip nobody sees.
+"""
+
+
+def self_evolution_checklist(gap_class: str, detector_id: str, remedy_rule_id: str,
+                             trigger_wo_id: str,
+                             unproven: Sequence[str] = ()) -> str:
+    """The checklist for one fix order, or `""` for every order that is not one.
+
+    The four ids are NAMED IN THE TEXT so a seat can see what it is being asked to judge
+    — a checklist about "the detector" with no id in it reads as generic advice. Each
+    renders as what the record actually says, including "none named": the pre-check is
+    what refuses a missing one, and this surface only describes (`ops.self_evolution_state`
+    takes the same line on the same four values).
+
+    `unproven` EMPTY RENDERS BYTE-IDENTICALLY to what this returned before it existed, and
+    that is the whole reason the paragraph is a substitution rather than a conditional
+    sentence. Non-empty, the mechanically-decided claim narrows to the checks that RAN and
+    the ones that did not are named with their reason — the one exception to "never
+    existence", because the alternative is the hidden skip §7.2's round 2 caught.
+    """
+    if not (gap_class or "").strip():
+        return ""
+    notes = tuple(str(n) for n in unproven if str(n).strip())
+    return SELF_EVOLUTION_CHECKLIST.format(
+        gap_class=gap_class.strip(),
+        detector_id=detector_id or "none named — proposed, not yet registered",
+        remedy_rule_id=remedy_rule_id or "none named",
+        trigger_wo_id=trigger_wo_id or "no triggering order named",
+        decided=ALL_CHECKS_DECIDED if not notes else SOME_CHECKS_DECIDED,
+        unproven=("" if not notes else UNPROVEN_CHECKS.format(
+            notes="\n".join(f"- {n}" for n in notes))))
 
 
 def fingerprint(packet: EvidencePacket) -> str:
@@ -222,6 +351,11 @@ def fingerprint(packet: EvidencePacket) -> str:
     | files an assumption it had not filed     | assumption text     | **yes**       |
     | has an assumption ACCEPTED by the user   | assumption `status` | no            |
     | is judged after an earlier round         | `history`           | no            |
+    | registers a different detector, or names | the four fix-order  | **yes**       |
+    |   a different triggering order           |   ids               |               |
+    | is re-rendered the §7.3 checklist        | `self_evolution`    | no            |
+    | is told a check the OS could not run     | `self_evolution_    | no            |
+    |   went unevaluated                       |   unproven`         |               |
 
     The side-effects row is why the formula widened once. Without it, two consecutive
     diff-less rounds retracting two different entries hash identically, and
@@ -249,6 +383,22 @@ def fingerprint(packet: EvidencePacket) -> str:
     `Daemon._preceding_round`'s repeat guard, and change the hash of every round already
     on the record.
 
+    **The four fix-order ids follow the ASSUMPTIONS precedent exactly, and that shape is
+    the only one that has ever widened this formula safely** (§7.3 of
+    docs/superpowers/specs/2026-09-27-self-evolution.md). They are mixed in ONLY when
+    `gap_class` is non-empty, so every order that is not a fix order — which is almost
+    every order in the fleet — hashes byte-identically to what it hashed before they
+    existed. Mixing them in unconditionally would change the hash of every round already
+    stored and silently disable the repeat guard, which is the failure this docstring
+    spends four paragraphs on. They go IN at all because a submitter that registers a
+    different detector, or names a different triggering order, without touching the diff
+    HAS produced new evidence, and the guard would otherwise call round 2 identical to
+    round 1. The RENDERED `self_evolution` text stays OUT, on the `history` row's
+    reasoning: the OS wrote it, not the submitter, and it is regenerated every round.
+    `self_evolution_unproven` is OUT for exactly that reason too — it is the OS saying
+    which of its own checks it could not run, and a transient store failure on one round
+    must not read as new evidence on the next.
+
     Hashing `packet.diff` is the obvious implementation and it is wrong: the same tree
     would fingerprint differently at two truncation limits, which makes an integrity
     check depend on a display setting. `diff_sha` is taken before the cut for exactly
@@ -263,6 +413,13 @@ def fingerprint(packet: EvidencePacket) -> str:
     for a in packet.assumptions:
         h.update(b"\n")
         h.update(_normalise(str(a.get("content") or "")).encode("utf-8"))
+    if packet.gap_class:
+        # ONLY WHEN THERE IS ONE — the assumptions precedent above, and §7.3's whole
+        # instruction. `packet.self_evolution` is deliberately absent from this.
+        for value in (packet.gap_class, packet.detector_id, packet.remedy_rule_id,
+                      packet.trigger_wo_id):
+            h.update(b"\n")
+            h.update(value.encode("utf-8"))
     return h.hexdigest()[:16]
 
 
@@ -496,7 +653,8 @@ def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
                        spec: dict[str, str] | None = None,
                        side_effects: Iterable[dict[str, Any]] = (),
                        assumptions: Iterable[dict[str, Any]] = (),
-                       history: Iterable[dict[str, Any]] = ()) -> EvidencePacket:
+                       history: Iterable[dict[str, Any]] = (),
+                       unproven: tuple[str, ...] = ()) -> EvidencePacket:
     """Assemble the packet for one work order — from its PULL REQUEST when it has one.
 
     The three cases are spec §3's table, and `packet.source` records which one happened.
@@ -523,6 +681,10 @@ def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
     `ops.prior_round_history`'s — all passed in rather than looked up because this module
     reads a repository and never a database, the same separation that keeps `ProjectRef`
     a two-line stand-in instead of a `ProjectSpec` import.
+
+    `unproven` is `rules.precheck`'s sink, passed through from whichever site ran the §7.2
+    pre-check — the checks that passed WITHOUT being evaluated. Empty leaves the rendered
+    checklist byte-identical (§7.3).
 
     **`history` is empty on the round-opening call and filled on the judging one.**
     `ops.submit_for_validation` builds a packet only to fingerprint it, and `history` is
@@ -559,6 +721,14 @@ def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
                 for name in _git(worktree, *_diff_args(r, "--name-only")).split("\n")
             )
 
+    # §7.1's four columns, off the row this function already takes. The checklist is
+    # rendered HERE because it is static prose plus those four ids: no store is opened
+    # for it, which is what keeps this module's "reads a repository, never a database"
+    # rule true (§7.3).
+    gap_class = str(wo.get("gap_class") or "")
+    detector_id = str(wo.get("detector_id") or "")
+    remedy_rule_id = str(wo.get("remedy_rule_id") or "")
+    trigger_wo_id = str(wo.get("trigger_wo_id") or "")
     effects = tuple(dict(e) for e in side_effects)
     # BEFORE `_truncate`, and that ordering is the whole correctness of the map — see
     # `file_digests`.
@@ -593,6 +763,13 @@ def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
             for a in assumptions),
         history=_history(history),
         file_shas=shas,
+        gap_class=gap_class,
+        detector_id=detector_id,
+        remedy_rule_id=remedy_rule_id,
+        trigger_wo_id=trigger_wo_id,
+        self_evolution=self_evolution_checklist(gap_class, detector_id, remedy_rule_id,
+                                                trigger_wo_id, unproven),
+        self_evolution_unproven=tuple(unproven),
     )
 
 

@@ -661,6 +661,45 @@ def test_a_turn_that_predates_the_context_ledger_reads_as_not_recorded(tmp_path,
     assert "not recorded" in out["turns"][0]["note"]
 
 
+def test_an_order_that_predates_the_self_evolution_columns_is_not_a_fix_order(tmp_path):
+    """§7.1 of docs/superpowers/specs/2026-09-27-self-evolution.md, and the half that is
+    easy to skip: `tests/test_stores.py` WRITES the four columns on a fresh database,
+    and this READS a row written before they existed.
+
+    `work_orders` already ships, so the columns reach a live database only through
+    `ADDED_COLUMNS` — omitting them there makes every live database fail on read while
+    every new install passes its tests. Nullable and no backfill: a pre-existing row
+    reads NULL on all four, which says "not a fix order", and that is true of every row
+    written before this feature. `rules.precheck` returns None for exactly that row, so
+    the gate is invisible to the fleet's ordinary work.
+    """
+    from jarvis import rules
+
+    proj = tmp_path / "legacy-fix-order"
+    (proj / ".jarvis").mkdir(parents=True)
+    old = sqlite3.connect(proj / ".jarvis" / "jarvis.db")
+    old.executescript(SHIPPED_SCHEMA.read_text())
+    old.execute("INSERT INTO work_orders (id, title, description, status, created_at, "
+                "updated_at) VALUES ('wo-old', 'filed before gap classes existed', "
+                "'mentions stale-hold in prose and nothing may read it', "
+                "'completed', 1.0, 1.0)")
+    old.commit()
+    old.close()
+
+    store = ProjectStore(proj)                                 # the upgrade
+    try:
+        assert {"gap_class", "detector_id", "remedy_rule_id",
+                "trigger_wo_id"} <= schema_of(store.conn)["work_orders"]
+        row = store.get_work_order("wo-old")
+        assert row["gap_class"] is None
+        assert row["detector_id"] is None
+        assert row["remedy_rule_id"] is None
+        assert row["trigger_wo_id"] is None
+        assert rules.precheck([], {}, row, None) is None
+    finally:
+        store.close()
+
+
 def test_an_order_that_predates_the_autopsy_column_reads_as_never_sealed(tmp_path):
     """kn-c712a5d6's other half for `autopsy_json`: `tests/test_autopsy.py` writes the
     column, and this reads a row that PREDATES it.
