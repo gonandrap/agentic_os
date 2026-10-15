@@ -2350,3 +2350,224 @@ def test_an_all_parked_project_keeps_the_os_sweep_invariant_green(
     _force_failures(store, invariants.HEALTH_SWEEP_FAILURE_RUN)
     assert list(invariants.check_health_sweep_produces_judgements(store)), (
         "the transport canary must still see a broken sweep")
+
+
+# -- a merge held by a red base is not stuck --------------------------------------------
+#
+# docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md, issue 1082.
+# wo-05e0a06d was swept at 4.9h in `waiting_pr_merge` while `main` was red and the OS was
+# itself holding the merge, and inv-b50cbe1e bought a model session to be told the OS was
+# working as designed. §1's exclusion and §2's discount, shaped on the CI pair above.
+
+
+def red_base_catalog(tmp_path, *, auto_merge: bool = True, enabled: bool = True,
+                     project_path: str = "", name: str = "red-base-catalog.json"):
+    """A registered catalog whose proj_a opted into auto-merge — §3's gate."""
+    return stuck_catalog(
+        tmp_path,
+        [{"name": "proj_a", "path": project_path, "description": "test project",
+          "validation": {"enabled": enabled, "auto_merge": auto_merge}}],
+        name=name)
+
+
+@pytest.fixture()
+def red_base_os(jarvis_home, project, tmp_path):
+    cat = red_base_catalog(tmp_path, project_path=str(project))
+    store = ProjectStore(project)
+    try:
+        yield {"daemon": Daemon(load_catalog(cat)), "store": store, "path": cat}
+    finally:
+        store.close()
+
+
+def base_fact(red: bool = True, age: float = 0.0, project: str = "proj_a") -> float:
+    """The project's stored base-health reading, `age` seconds old. Returns `checked_at`."""
+    from jarvis.central_store import CentralStore
+
+    central = CentralStore()
+    checked_at = time.time() - age
+    try:
+        central.set_base_health(project, {"red": red, "base": "main", "workflow": "ci",
+                                          "run_url": "https://x/1", "head_sha": "abc",
+                                          "wo_id": "", "checked_at": checked_at})
+        central.conn.commit()
+    finally:
+        central.close()
+    return checked_at
+
+
+def red_episodes(pairs, project: str = "proj_a") -> None:
+    from jarvis.central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        central.set_base_red_episodes(project, pairs)
+        central.conn.commit()
+    finally:
+        central.close()
+
+
+def _parked(store, hours: float = 4.9, status: str = "waiting_pr_merge",
+            title: str = "parked behind a red main") -> tuple[dict, float]:
+    wo = ops.create_work_order("proj_a", title)
+    return wo, park_order(store, wo["id"], status, hours=hours)
+
+
+def test_a_merge_held_by_a_red_base_is_excluded_with_its_own_sentence(red_base_os):
+    """§5(1), wo-05e0a06d's own number. `DEFAULT_EXCLUSION_REASON` is true here and says
+    nothing a reader can act on, so the cause carries its own sentence."""
+    from jarvis import stuck
+
+    store = red_base_os["store"]
+    now = time.time()
+    wo, _at = _parked(store)
+    base_fact(red=True)
+
+    row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+    assert row["stuck"] is False, row["reason"]
+    assert row["excluded"] == stuck.BASE_RED_CAUSE
+    assert row["reason"] == stuck.EXCLUSION_REASON[stuck.BASE_RED_CAUSE]
+    assert row["reason"] != stuck.DEFAULT_EXCLUSION_REASON.format(
+        cause=stuck.BASE_RED_CAUSE)
+
+
+def test_needs_review_beside_the_same_red_base_is_still_judged(red_base_os):
+    """§5(2), kn-6e836793's scoping: the OS is not holding this one, the reviewer is."""
+    store = red_base_os["store"]
+    now = time.time()
+    wo, _at = _parked(store, status="needs_review", title="the user owes this review")
+    base_fact(red=True)
+
+    row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+    assert row["excluded"] == ""
+    assert row["stuck"] is True, row["reason"]
+
+
+@pytest.mark.parametrize("off", [{"auto_merge": False}, {"enabled": False}])
+def test_with_auto_merge_off_the_parked_order_stays_judged(jarvis_home, project,
+                                                           tmp_path, off):
+    """§3: with auto-merge off `automerge.decide` is never consulted, no `HELD_BASE_RED`
+    exists and the merge is the wait the USER owes — so a parked pull request nobody
+    merged is reported, red base or not."""
+    red_base_catalog(tmp_path, project_path=str(project), **off)
+    store = ProjectStore(project)
+    try:
+        now = time.time()
+        wo, at = _parked(store)
+        base_fact(red=True)
+        red_episodes([[at, None]])
+
+        row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+        assert row["excluded"] == ""
+        assert row["stuck"] is True, row["reason"]
+        assert row["discounted_seconds"] == 0.0
+    finally:
+        store.close()
+
+
+def test_the_base_going_green_leaves_the_closed_episode_discounted(red_base_os):
+    """§5(4), kn-6e30d561 and the whole reason for §2: THE DISCOUNT MUST OUTLIVE THE
+    EXCLUSION BY ONE STATUS SPAN. Nothing is held any more, and the first sweep after
+    recovery must not judge the hours the hold accumulated."""
+    store = red_base_os["store"]
+    now = time.time()
+    wo, at = _parked(store)
+    base_fact(red=False)
+    red_episodes([[at, at + 4.5 * HOUR]])
+
+    row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+    assert row["excluded"] == ""
+    assert abs(row["discounted_seconds"] - 4.5 * HOUR) < 5, row["discounted_seconds"]
+    assert abs(row["active_seconds"] - 0.4 * HOUR) < 5, row["active_seconds"]
+    assert row["stuck"] is False, row["reason"]
+
+
+def test_a_stale_fact_excludes_nothing_and_stops_discounting_at_the_horizon(red_base_os):
+    """§5(5): a `gh` that stopped answering must not grow the discount on a fact nobody
+    can confirm — the open pair ends at `checked_at + BASE_HEALTH_FRESH_SECONDS`."""
+    from jarvis.central_store import BASE_HEALTH_FRESH_SECONDS
+
+    store = red_base_os["store"]
+    now = time.time()
+    wo, _at = _parked(store)
+    checked_at = base_fact(red=True, age=BASE_HEALTH_FRESH_SECONDS + 1)
+    opened = now - 20 * 60
+    red_episodes([[opened, None]])
+
+    row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+    assert row["excluded"] == "", "a fact nobody can confirm excluded the order"
+    assert row["stuck"] is True, row["reason"]
+    horizon = checked_at + BASE_HEALTH_FRESH_SECONDS
+    assert abs(row["discounted_seconds"] - (horizon - opened)) < 2, \
+        row["discounted_seconds"]
+    assert row["discounted_seconds"] < now - opened, "the open pair ran to `now`"
+
+
+def test_a_usage_hold_inside_the_red_episode_is_discounted_once(red_base_os):
+    """§5(6): the UNION and never the sum — summing would tell a reader the same minutes
+    twice under two names (`holds.union_seconds`' own docstring)."""
+    store = red_base_os["store"]
+    now = time.time()
+    wo, at = _parked(store)
+    base_fact(red=False)
+    red_episodes([[at, at + 2 * HOUR]])
+    usage_hold(store, wo["id"], started=at + 0.5 * HOUR, ended=at + 1 * HOUR)
+
+    row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+    assert abs(row["discounted_seconds"] - 2 * HOUR) < 5, row["discounted_seconds"]
+    assert row["discounted_seconds"] < 2.5 * HOUR, "the overlap was counted twice"
+
+
+def test_the_held_order_is_a_visible_row_and_never_a_continue(red_base_os):
+    """§5(7), kn-143a46df and kn-e91ff3a5: a `continue` has no unit test over the pure
+    predicate and produces no `Verdict`, so the held order would vanish from `jarvis
+    stuck` and `/stuck` instead of explaining itself there."""
+    from jarvis import stuck
+
+    store = red_base_os["store"]
+    now = time.time()
+    wo, _at = _parked(store)
+    base_fact(red=True)
+
+    scanned, rows = ops.stuck_scan(store, "proj_a", catalog.FleetHealthConfig(), now,
+                                   base_red=True, stuck_only=False)
+    held = [r for r in rows if r["wo"]["id"] == wo["id"]]
+
+    assert scanned == 1 and len(held) == 1, "the held row left the sweep's output"
+    assert held[0]["verdict"].excluded == stuck.BASE_RED_CAUSE
+    assert next(r for r in ops.stuck_report("proj_a", now)
+                if r["id"] == wo["id"])["excluded"] == stuck.BASE_RED_CAUSE
+
+
+@pytest.mark.parametrize("auto_merge, excluded", [(True, True), (False, False)])
+def test_both_callers_derive_the_same_bool(jarvis_home, project, tmp_path, auto_merge,
+                                           excluded):
+    """§7's ONE derivation, and the test that would have caught a bool hoisted in one
+    caller only: `Daemon._stuck_candidates` and `ops.stuck_report` over the same store,
+    fact and clock agree."""
+    from jarvis import stuck
+
+    cat = red_base_catalog(tmp_path, project_path=str(project), auto_merge=auto_merge)
+    store = ProjectStore(project)
+    try:
+        now = time.time()
+        wo, _at = _parked(store)
+        base_fact(red=True)
+        spec = load_catalog(cat).projects[0]
+        run: dict = {"scanned": 0}
+
+        candidates = [c["wo"]["id"] for c in
+                      Daemon(load_catalog(cat))._stuck_candidates(spec, None, now, run)]
+        row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+        assert (wo["id"] not in candidates) is excluded, candidates
+        assert (row["excluded"] == stuck.BASE_RED_CAUSE) is excluded
+        assert row["stuck"] is not excluded
+    finally:
+        store.close()

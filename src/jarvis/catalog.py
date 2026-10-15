@@ -1115,6 +1115,15 @@ DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS = 60
 #: `FLEET_HEALTH_FLEET_ONLY_KEYS`.
 DEFAULT_FLEET_HEALTH_SWEEP_DARK_MINUTES = 180
 
+#: How long one project's red-base episodes are REMEMBERED, so the sweep's discount
+#: outlives the hold by a status span — §2 "The retention bound is a CATALOG KEY" of
+#: docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md, Neo's one
+#: condition on 1818. Seven days covers a red base spanning a weekend plus the status span
+#: after it and keeps the stored JSON a handful of pairs. HOURS and not minutes:
+#: `thresholds` and every `*_minutes` measure a sweep's patience, this measures memory,
+#: and `10080` would read as a typo.
+DEFAULT_FLEET_HEALTH_RED_EPISODE_RETENTION_HOURS = 168
+
 #: `FleetHealthConfig` fields that are a MAPPING, not a count — `INSPECT_FRACTION_KEYS`'
 #: arrangement. Excluded from the reflective `>= 1` loop and validated per entry instead,
 #: because an unknown status there must be REFUSED naming `OPEN_STATUSES` rather than
@@ -1182,6 +1191,8 @@ class FleetHealthConfig:
     #: element, unlike `thresholds`: a kind list is one policy statement, and a merging
     #: list could only ever grow — un-exempting a kind would be inexpressible.
     exempt_kinds: tuple[str, ...] = DEFAULT_FLEET_HEALTH_EXEMPT_KINDS
+    #: §2 of docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md.
+    red_episode_retention_hours: int = DEFAULT_FLEET_HEALTH_RED_EPISODE_RETENTION_HOURS
 
     def threshold_seconds(self, status: str) -> float:
         """This status's threshold, in the seconds `stuck.assess` compares — the named one
@@ -2431,6 +2442,8 @@ def _parse_fleet_health(raw: Any, base: FleetHealthConfig | None = None,
         sweep_every_ticks=int(raw.get("sweep_every_ticks", base.sweep_every_ticks)),
         sweep_dark_minutes=int(raw.get("sweep_dark_minutes", base.sweep_dark_minutes)),
         exempt_kinds=exempt_kinds,
+        red_episode_retention_hours=int(raw.get(
+            "red_episode_retention_hours", base.red_episode_retention_hours)),
     )
     for name, value in vars(cfg).items():
         if name in FLEET_HEALTH_MAP_KEYS or name in FLEET_HEALTH_LIST_KEYS \

@@ -5331,6 +5331,60 @@ def _stored_base_health(project_name: str) -> dict[str, Any]:
         central.close()
 
 
+def _base_is_red(spec: Any, now: float, fact: dict[str, Any] | None = None) -> bool:
+    """Is the OS itself holding this project's merges because its base is red?
+
+    §1 of docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md.
+    The ONE place outside the daemon that interprets the stored fact, so the CLI and
+    dashboard reader and the tick cannot disagree about what "red" means: opted into
+    auto-merge (§3's gate, `Daemon.poll_pull_requests`' own), red, and FRESH — a
+    non-numeric or absent `checked_at` is stale.
+    """
+    from .central_store import BASE_HEALTH_FRESH_SECONDS
+
+    if not (spec.validation.enabled and spec.validation.auto_merge):
+        return False
+    fact = _stored_base_health(spec.name) if fact is None else fact
+    if not fact.get("red"):
+        return False
+    checked_at = fact.get("checked_at")
+    if not isinstance(checked_at, (int, float)):
+        return False
+    return now - float(checked_at) <= BASE_HEALTH_FRESH_SECONDS
+
+
+def _base_red_until(fact: dict[str, Any], now: float) -> float:
+    """Where an OPEN red episode stops counting: the fact's freshness horizon.
+
+    §2 of the same spec — never `now`: `Daemon.poll_default_branch` writes nothing on
+    `github.GitHubError`, so an episode left open by a `gh` that stopped answering would
+    otherwise discount for ever. A non-numeric or absent `checked_at` gives `0.0`, which
+    clips every open pair away.
+    """
+    from .central_store import BASE_HEALTH_FRESH_SECONDS
+
+    checked_at = fact.get("checked_at")
+    if not isinstance(checked_at, (int, float)):
+        return 0.0
+    return min(now, float(checked_at) + BASE_HEALTH_FRESH_SECONDS)
+
+
+def _stored_base_red_episodes(project_name: str) -> list[list[float | None]]:
+    """This project's red-base episodes, or `[]` — `_stored_base_health`'s tolerance."""
+    from .central_store import CentralStore
+
+    try:
+        central = CentralStore()
+    except Exception:  # noqa: BLE001 — an unreadable list discounts nothing
+        return []
+    try:
+        return central.base_red_episodes(project_name)
+    except Exception:  # noqa: BLE001 — ditto
+        return []
+    finally:
+        central.close()
+
+
 def _red_base_said(fact: dict[str, Any]) -> dict[str, Any]:
     """What the timeline carries about the run that is holding this release."""
     base = str(fact.get("base") or "main")
@@ -9665,6 +9719,9 @@ def manager_awaiting_feature(
 
 def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                window: bool = False,
+               base_red: bool = False,
+               red_episodes: Sequence[Any] = (),
+               base_red_until: float = 0.0,
                stuck_only: bool = True) -> tuple[int, list[dict[str, Any]]]:
     """Every open order of one project, judged by `stuck.assess`. §7's ONE derivation.
 
@@ -9674,9 +9731,14 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
     the detail of the rest.
 
     `window` is the PROJECT-WIDE usage hold, read once by the caller rather than once per
-    candidate (`health_sweep_hold`'s own docstring).
+    candidate (`health_sweep_hold`'s own docstring). `base_red`, `red_episodes` and
+    `base_red_until` are the same arrangement for the red default branch — §1 and §2 of
+    docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md: the fact
+    is the project's and not the order's, so the caller hoists it and only the CLIP is per
+    candidate.
     """
     from . import bus, holds, stuck, worker_session
+    from .central_store import base_red_hold_spans
     from .health import observer_kinds
     from .project_store import (FO_ID_PREFIXES, UNGOVERNED_ORIGINS,
                                 VALIDATION_CI_CAUSE, validation_ci_hold_spans,
@@ -9713,9 +9775,17 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                 until, cause = validation_hold(events, int(latest["round"]))
                 ci_held = cause == VALIDATION_CI_CAUSE and until > now
             ci_spans = validation_ci_hold_spans(events, since, now)
-        # The UNION and never the sum: a usage window can shut while CI runs (§4).
+        # A MERGE THE OS IS ITSELF HOLDING ONTO A RED BASE IS NOT STUCK (§1 and §2 of
+        # docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md).
+        # `waiting_pr_merge` ONLY: a `needs_review` order beside the same red base is a
+        # wait the USER owes (kn-6e836793).
+        base_red_spans = (base_red_hold_spans(red_episodes, since, now, base_red_until)
+                          if wo["status"] == "waiting_pr_merge" else [])
+        # The UNION and never the sum: a usage window can shut while CI runs (§4), or
+        # while the base is red.
         discounted = holds.union_seconds(
-            [(max(h.started, since), min(h.finish(now), now)) for h in usage] + ci_spans)
+            [(max(h.started, since), min(h.finish(now), now)) for h in usage]
+            + ci_spans + base_red_spans)
         # §2.2 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md.
         edges = (pstore.unfinished_dependencies(wo["id"])
                  if wo["status"] == "pending" else [])
@@ -9739,9 +9809,14 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         verdict = stuck.assess(
             str(wo["status"]), now - since, now - (durations.last_activity_ts or since),
             discounted, thresholds, cfg.fallback_minutes * 60.0,
+            # Order among the last three is ARBITRARY and documented as such: they are
+            # scoped to `validating`, `waiting_pr_merge` and `pending` and so are
+            # mutually exclusive by status (§1 of the 2026-10-15 spec).
             excluded_cause=(PAUSE_USAGE_LIMIT
                             if window or any(h.open for h in usage)
                             else VALIDATION_CI_CAUSE if ci_held
+                            else stuck.BASE_RED_CAUSE
+                            if base_red and wo["status"] == "waiting_pr_merge"
                             else stuck.LIVE_DEPENDENCY if live_edges else ""),
             kind=str(wo.get("kind") or "worker"),
             exempt_kinds=tuple(cfg.exempt_kinds),
@@ -9787,11 +9862,20 @@ def stuck_report(project_name: str | None = None,
             continue
         if project_name and spec.name != project_name:
             continue
+        # ONCE PER PROJECT, never once per candidate — §1 of the 2026-10-15 spec.
+        base_red, red_episodes, base_red_until = False, (), 0.0
+        if spec.validation.enabled and spec.validation.auto_merge:
+            fact = _stored_base_health(spec.name)
+            base_red = _base_is_red(spec, now, fact)
+            base_red_until = _base_red_until(fact, now)
+            red_episodes = tuple(_stored_base_red_episodes(spec.name))
         pstore = ProjectStore(paths[spec.name])
         try:
             _scanned, judged = stuck_scan(
                 pstore, spec.name, spec.fleet_health, now,
-                window=bool(pstore.health_sweep_hold()), stuck_only=False)
+                window=bool(pstore.health_sweep_hold()), base_red=base_red,
+                red_episodes=red_episodes, base_red_until=base_red_until,
+                stuck_only=False)
         finally:
             pstore.close()
         for row in judged:

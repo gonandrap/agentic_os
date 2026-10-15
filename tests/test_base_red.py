@@ -596,3 +596,120 @@ def test_a_red_base_spends_no_round_number_on_a_moved_head(
     assert db.from_json(held[-1]["payload"], {})["code"] == automerge.HELD_BASE_RED
     # The rider: this pull request's own `ci` failure is the same break.
     assert "not its fault" in db.from_json(held[-1]["payload"], {})["reason"]
+
+
+# -- the red-episode list ---------------------------------------------------------------
+# §2 of docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md:
+# Neo's ruling on question 1818. The discount must outlive the exclusion by one status
+# span, so closed episodes and not a live field are what the sweep reads.
+
+
+def episodes(central=None) -> list:
+    central = central or CentralStore()
+    return central.base_red_episodes("proj_a")
+
+
+def test_the_episode_list_is_appended_to_on_a_transition_only(started, project, fake_gh):
+    """ONE open pair however many red polls follow, closed on the green one, and nothing
+    written by a second green poll — the writer is the transition and never the poll."""
+    red_fleet(fake_gh)
+    store = ProjectStore(project)
+
+    for _ in range(3):
+        poll(started, store)
+    opened = episodes()
+    assert len(opened) == 1 and opened[0][1] is None
+    assert opened[0][0] > 0
+
+    fake_gh.set_runs("main", [MAIN_GREEN, MAIN_RED])
+    poll(started, store)
+    closed = episodes()
+    assert len(closed) == 1 and closed[0][1] is not None
+    assert closed[0][0] == opened[0][0]
+
+    poll(started, store)
+    assert episodes() == closed
+
+
+def test_a_crash_while_red_does_not_lose_the_open_episode(started, project, fake_gh):
+    """`was_red` is read from the STORED fact, so a fresh `Daemon` after a restart still
+    closes the pair its predecessor opened — the episode outlives the process."""
+    red_fleet(fake_gh)
+    store = ProjectStore(project)
+    poll(started, store)
+    assert episodes()[0][1] is None
+
+    fresh = Daemon(load_catalog(started.catalog.source_path))
+    fake_gh.set_runs("main", [MAIN_GREEN, MAIN_RED])
+    fresh.poll_default_branch(fresh.catalog.project("proj_a"), store)
+
+    assert episodes()[0][1] is not None
+
+
+def test_advance_red_episodes_and_the_spans_are_pure_units():
+    """Both module-level and both over the LIST — `validation_ci_hold_spans`' rule: the
+    span derivation lives in the module that owns the rows, and takes rows."""
+    from jarvis.central_store import advance_red_episodes, base_red_hold_spans
+
+    # green to red opens a pair; a second call in the same tick opens no second one.
+    opened = advance_red_episodes([], True, 100.0, 3600)
+    assert opened == [[100.0, None]]
+    assert advance_red_episodes(opened, True, 110.0, 3600) == [[100.0, None]]
+    # red to green closes the open pair; a second green call changes nothing.
+    closed = advance_red_episodes(opened, False, 150.0, 3600)
+    assert closed == [[100.0, 150.0]]
+    assert advance_red_episodes(closed, False, 160.0, 3600) == closed
+
+    # clipped to `[since, now]`; an open pair takes `open_end`; a pair wholly before
+    # `since` yields nothing.
+    assert base_red_hold_spans([[50.0, 120.0], [130.0, 150.0], [180.0, None]],
+                               100.0, 200.0, 190.0) == [(100.0, 120.0), (130.0, 150.0),
+                                                        (180.0, 190.0)]
+    assert base_red_hold_spans([[10.0, 90.0]], 100.0, 200.0, 200.0) == []
+    assert base_red_hold_spans([], 100.0, 200.0, 200.0) == []
+
+
+def test_an_unreadable_episode_list_discounts_nothing():
+    """`base_health`'s own tolerance: `[]` for absent, unparseable or not pairs. An
+    unreadable list discounts nothing, which is the under-discount direction."""
+    central = CentralStore()
+    assert central.base_red_episodes("proj_a") == []
+    for bad in ("{not json", '{"red": true}', '[[1, 2, 3]]', '["a", "b"]', '[7]'):
+        central.set_state("base_red_episodes:proj_a", bad)
+        assert central.base_red_episodes("proj_a") == [], bad
+
+
+def test_an_episode_outside_the_retention_window_under_discounts(
+        started, project, fake_gh):
+    """§2 Degradation direction: a trimmed episode yields NO span, so the sweep judges
+    MORE time rather than less — and an order whose red hours were forgotten is flagged,
+    which is exactly today's behaviour. Same for the pre-ship case: no episode at all."""
+    from jarvis import ops as ops_mod
+    from jarvis.catalog import FleetHealthConfig
+    from jarvis.central_store import base_red_hold_spans
+    from tests.test_health_sweep import park_order
+
+    now = time.time()
+    spec_a = started.catalog.project("proj_a")
+    spec_a.fleet_health.red_episode_retention_hours = 1
+    central = CentralStore()
+    central.set_base_red_episodes("proj_a", [[now - 4 * 3600, now - 3 * 3600]])
+    central.set_base_health("proj_a", {"red": True, "base": "main",
+                                       "checked_at": now - 10})
+    store = ProjectStore(project)
+    fake_gh.set_default_branch(REPO, "main")
+    fake_gh.set_runs("main", [MAIN_GREEN, MAIN_RED])
+
+    poll(started, store)  # the red-to-green transition trims the stale pair
+
+    assert episodes() == []
+    wo = ops.create_work_order("proj_a", "parked while main was red, long ago")
+    park_order(store, wo["id"], "waiting_pr_merge", hours=4.9)
+    judged = ops_mod.stuck_scan(store, "proj_a", FleetHealthConfig(), now,
+                                red_episodes=episodes(), base_red_until=now,
+                                stuck_only=False)[1]
+    row = [r for r in judged if r["wo"]["id"] == wo["id"]][0]
+    assert row["discounted"] == 0.0
+    assert row["verdict"].stuck is True, row["verdict"].reason
+    assert base_red_hold_spans([], now - 4.9 * 3600, now, now) == []
+    store.close()
