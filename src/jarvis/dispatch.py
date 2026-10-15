@@ -733,8 +733,13 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         "with the reason: revise and submit again from this same session.",
         "",
         "# Operating contract",
-        f"- `jarvis fo plan {fo_id} --from-file <file>` IS your finish. Do not run "
-        f"`jarvis wo finish` — submitting the plan settles this work order for you.",
+        # §5, docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md
+        f"- `jarvis fo plan {fo_id} --from-file <file>` IS your finish, and you submit "
+        f"the plan ONCE. If the user refuses an assumption afterwards, do NOT resubmit "
+        f"the plan: it would replace the stored one and discard the decisions already "
+        f"recorded on it. Answer the refusal in this session, then run `jarvis wo "
+        f"finish --summary \"…\"`, which records the re-delivery and does not touch the "
+        f"plan.",
         f"- **Neo is your first responder. Any doubt goes to it.** `jarvis wo ask "
         f"{wo['id']} \"<your question>\"`, then END YOUR TURN; the answer arrives as your "
         f"next user turn, usually within a minute. The trigger is DOUBT, not importance. "
@@ -892,9 +897,14 @@ def _analyst_prompt(wo: dict[str, Any], project: ProjectSpec,
         "that printed it.",
         "",
         "# The report",
+        # §5, docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md
         "Write it to a JSON file in your worktree and submit it with the command below, "
-        "which IS your finish. Do not run `jarvis wo finish` — submitting the report "
-        "settles this work order for you. `--from-file` and not an inline argument, "
+        "which IS your finish, and submit it ONCE. If the user refuses an assumption "
+        "afterwards, do NOT resubmit the report: the OS refuses it, and it would replace "
+        "the document and discard the decisions already recorded on it. Answer the "
+        "refusal in this session, then run `jarvis wo finish --summary \"…\"`, which "
+        "records the re-delivery and does not touch the report. `--from-file` and not an "
+        "inline argument, "
         "because the gate classifier's quote-blanking fails on nested and mixed quoting "
         "and a report is full of repo paths and quoted log lines.",
         "",

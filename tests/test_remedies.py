@@ -1221,6 +1221,21 @@ def test_no_param_value_reaches_the_rendered_attention_sentence():
         assert slots == (), f"{key} declares a slot; widen this test with it"
 
 
+def test_the_refusal_templates_render_verbatim():
+    """§5 of docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md:
+    TWO whole sentences and zero interpolation, because `"analyst"` is not an id and so
+    cannot travel through a declared slot."""
+    from jarvis import invariants
+
+    assert remedies.render_attention("refusal_unanswered") is \
+        invariants.REFUSAL_UNANSWERED_BLOCKER
+    assert remedies.render_attention("refusal_unanswered_document") is \
+        invariants.REFUSAL_UNANSWERED_DOC_BLOCKER
+    choices = remedies.get("raise_attention").params[0].choices
+    for key in ("refusal_unanswered", "refusal_unanswered_document"):
+        assert key in remedies.ATTENTION_TEMPLATES and key in choices
+
+
 def test_attention_slots_interpolate_validated_ids_only(monkeypatch):
     """V1 DECLARES NO SLOTS — every template above is `slots=()` — so this grades the
     MACHINERY on a synthetic template, which is what the next template with an id in it

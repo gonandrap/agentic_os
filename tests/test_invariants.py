@@ -2078,6 +2078,136 @@ def test_the_undeclared_delivery_detector_follows_the_widened_predicate(project)
         answered["id"]))
 
 
+# -- an unanswered refusal names itself -------------------------------------------------
+#
+# docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md. wo-d2d981e8
+# sat 12.9 days in `needs_review` under IDLE_NO_FINISH_BLOCKER, whose every clause was
+# wrong: the worker delivered, the user refused, and the delivery is older than the
+# refusal.
+
+
+def _held_by_a_refusal(store: ProjectStore, kind: str = "worker") -> dict:
+    """Delivered, then refused, and nothing delivered since — the held state itself."""
+    wo = store.create_work_order("ship the thing", kind=kind)
+    store.add_event(wo["id"], "finished", {"summary": "delivered"})
+    store.add_event(wo["id"], "reviewed", {"accepted": False})
+    store.set_status(wo["id"], "needs_review")
+    return store.get_work_order(wo["id"])
+
+
+def test_a_needs_review_order_held_only_by_an_unanswered_refusal_says_so(project):
+    """Spec §1 and §3: the generic idle line lies about every clause of this state."""
+    store = ProjectStore(project)
+    wo = _held_by_a_refusal(store)
+
+    blockers = true_blockers(store, wo)
+
+    assert blockers == [invariants.REFUSAL_UNANSWERED_BLOCKER]
+    assert IDLE_NO_FINISH_BLOCKER not in blockers
+
+
+def test_an_analyst_held_by_a_refusal_is_pointed_at_wo_finish(project):
+    """Spec §2: the submission verb would REPLACE the document and discard decisions."""
+    store = ProjectStore(project)
+
+    for kind in invariants.DOCUMENT_DELIVERY_KINDS:
+        wo = _held_by_a_refusal(store, kind=kind)
+
+        assert true_blockers(store, wo) == [invariants.REFUSAL_UNANSWERED_DOC_BLOCKER]
+
+    sentence = invariants.REFUSAL_UNANSWERED_DOC_BLOCKER
+    assert "`jarvis wo finish`" in sentence
+    assert "io report" not in sentence and "fo plan" not in sentence
+
+
+def test_an_answered_refusal_still_derives_the_idle_line(project):
+    """The no-regression half: a finish newer than the refusal clears the hold."""
+    store = ProjectStore(project)
+    wo = _held_by_a_refusal(store)
+    store.add_event(wo["id"], "finished", {"summary": "re-delivered"})
+
+    assert true_blockers(store, store.get_work_order(wo["id"])) == [
+        IDLE_NO_FINISH_BLOCKER]
+
+
+def test_unlanded_work_outranks_an_unanswered_refusal(project):
+    """Spec §3: code stranded on a branch names a different, more urgent decision."""
+    store = ProjectStore(project)
+    wo = _held_by_a_refusal(store)
+    store.add_event(wo["id"], "work_unlanded", {"was": "completed"})
+
+    blockers = true_blockers(store, store.get_work_order(wo["id"]))
+
+    assert blockers == [invariants.UNLANDED_BLOCKER]
+    assert invariants.REFUSAL_UNANSWERED_BLOCKER not in blockers
+
+
+def test_a_pending_assumption_suppresses_the_refusal_line(project):
+    """Spec §3's `not pending` guard: that status is doing what it is for."""
+    store = ProjectStore(project)
+    wo = _held_by_a_refusal(store)
+    store.add_assumption(wo["id"], "assumed the schema is stable")
+
+    assert true_blockers(store, store.get_work_order(wo["id"])) == [
+        "1 assumption pending your review"]
+
+
+def test_an_undeclared_delivery_is_not_said_twice(project):
+    """Spec §3: the same refusal WITH commits behind it already has its own sentence."""
+    store = ProjectStore(project)
+    wo = _held_by_a_refusal(store)
+    for _ in range(invariants.PR_REPAIR_MAX_ATTEMPTS):
+        store.add_event(wo["id"], "pr_undeclared_nudged", {})
+
+    blockers = true_blockers(store, store.get_work_order(wo["id"]))
+
+    assert invariants.PR_UNDECLARED_BLOCKER in blockers
+    assert invariants.REFUSAL_UNANSWERED_BLOCKER not in blockers
+    assert invariants.REFUSAL_UNANSWERED_DOC_BLOCKER not in blockers
+
+
+def test_the_refusal_line_does_not_drag_in_a_stale_finish(project):
+    """Spec §4: both sentences carry the word "assumption", and the `_mentions_
+    assumptions` tail would read the list as nothing-but-assumption-reviews and stack
+    STALE_FINISH_BLOCKER on a line that already names the exit."""
+    store = ProjectStore(project)
+    wo = store.create_work_order("ship the thing")
+    store.add_event(wo["id"], "finished", {"summary": "delivered"})
+    turn = store.create_turn(wo["id"], "message", "go again")
+    store.finish_turn(turn["id"], "done", result="stopped again")
+    store.add_event(wo["id"], "reviewed", {"accepted": False})
+    store.set_status(wo["id"], "needs_review")
+    row = store.get_work_order(wo["id"])
+    later = float(store.latest_turn(wo["id"])["ended_at"]) + 24 * 60 * 60
+
+    assert invariants.parked_reason(store, row, now=later) == \
+        invariants.STALE_FINISH_BLOCKER
+    assert true_blockers(store, row, now=later) == [
+        invariants.REFUSAL_UNANSWERED_BLOCKER]
+
+
+def test_document_delivery_kinds_are_real_kinds():
+    """Spec §2: a renamed kind fails here rather than silently dropping a case."""
+    from jarvis import project_store as ps
+
+    assert set(invariants.DOCUMENT_DELIVERY_KINDS) <= set(ps.WO_KINDS)
+    assert "investigator" not in invariants.DOCUMENT_DELIVERY_KINDS
+    assert "manager" not in invariants.DOCUMENT_DELIVERY_KINDS
+
+
+def test_the_refusal_reason_is_re_derivable(project):
+    """Spec §3: INV-ATTENTION-REASON rewrites any flag `true_blockers` cannot derive."""
+    store = ProjectStore(project)
+    wo = _held_by_a_refusal(store)
+    store.flag_attention(wo["id"], invariants.REFUSAL_UNANSWERED_BLOCKER)
+
+    violations = list(invariants.check_attention_reason_is_true(store))
+
+    assert violations == []
+    assert store.get_work_order(wo["id"])["attention_reason"] == \
+        invariants.REFUSAL_UNANSWERED_BLOCKER
+
+
 # -- a stored spec pointer has to open --------------------------------------------------
 #
 # §2.3 of
