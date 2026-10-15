@@ -1182,6 +1182,28 @@ def test_the_red_ci_return_cap_resolves_per_project_and_zero_is_a_setting():
         validation_of({"red_ci_returns": -1})
 
 
+def test_the_killed_retry_bound_resolves_per_project_and_zero_is_a_setting():
+    """§4b of docs/superpowers/specs/
+    2026-10-14-a-killed-validation-panel-opens-an-investigation.md, a user ruling (Neo
+    question 1705, condition ii): how many kills in a row one round survives is a bound
+    the user may want to move, so it is a catalog key and never a module constant. `0` is
+    legal and means escalate on the first kill."""
+    assert (parse_catalog({"projects": []}).os.validation.killed_retries
+            == jarvis.catalog.DEFAULT_VALIDATION_KILLED_RETRIES)
+
+    inherits, own = projects_validation(
+        {"killed_retries": 5, "max_rounds": 2}, {},
+        {"validation": {"killed_retries": 1}})
+    assert inherits.killed_retries == 5
+    assert own.killed_retries == 1
+    assert own.max_rounds == 2, "a project naming only this key inherits the rest"
+
+    assert validation_of({"killed_retries": 0}).killed_retries == 0
+    with pytest.raises(CatalogError,
+                       match="os.validation.killed_retries must be >= 0"):
+        validation_of({"killed_retries": -1})
+
+
 def test_a_round_is_judged_under_the_red_ci_bound_it_was_opened_with():
     """`config_version.validation_config_from_resolved` walks the dataclass's fields, so
     the stamped historical read carries the new key for free — and `_round_config` is

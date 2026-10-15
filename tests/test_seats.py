@@ -281,6 +281,26 @@ def test_the_summary_never_carries_the_raw_reply():
                                  "latency_ms"}
 
 
+def test_a_killed_seat_abstains_and_carries_the_kill(monkeypatch, tmp_path):
+    """Spec §2, GitHub issue #1039: carried, never raised — one seat whose process was
+    killed must not take down a panel the other three answered, and whether the round can
+    be judged without it is `validation.decide`'s call."""
+    killed = claude_cli.KilledError(
+        claude_cli.Killed(message="seat was killed by a signal (rc=143) and wrote "
+                                  "nothing", rc=143))
+    monkeypatch.setattr(claude_cli, "run_headless_result",
+                        lambda *a, **k: (_ for _ in ()).throw(killed))
+
+    op = seats._run_seat("tester", "p", "s", "sonnet", 10, tmp_path,
+                         kind="validation_seat")
+
+    assert (op.status, op.replied) == ("abstained", False)
+    assert op.killed is not None and op.killed.rc == 143
+    assert op.refused is None and op.auth is None
+    assert set(op.summary()) == {"seat", "status", "verdict", "route", "model",
+                                 "latency_ms"}, "the kill is read by `decide`, not reported"
+
+
 def test_data_is_none_for_a_seat_that_is_not_ok():
     assert seats.Opinion(seat="t", raw='{"a": 1}').data == {"a": 1}
     assert seats.Opinion(seat="t", raw='{"a": 1}', status="abstained").data is None

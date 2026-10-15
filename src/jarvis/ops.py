@@ -4076,7 +4076,9 @@ def review_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | No
     escalated = (wo["status"] == "needs_review" and validation_escalated(store, wo))
     if not pending and not escalated:
         return None
-    latest = store.latest_validation_round(wo_id=wo["id"]) if escalated else None
+    # The same row the boolean came from, per spec §A of
+    # docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md.
+    latest = store.last_judged_round(wo_id=wo["id"]) if escalated else None
     # WHY THE PANEL HANDED IT OVER, and the command this order's shape accepts — spec
     # docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md
     # §3, §4. Derived HERE and nowhere else, so the terminal and the page cannot word one
@@ -4987,7 +4989,9 @@ def land_finished(store: ProjectStore, wo: dict[str, Any],
         if stranding.produced:
             return park_unlanded(store, wo, stranding)
     status = "waiting_pr_merge" if pr_url else "completed"
-    store.set_status(wo_id, status)
+    # Spec §C of
+    # docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md.
+    store.set_status(wo_id, status, trigger="landed")
     store.clear_attention(wo_id)
     if wo.get("backlog_id") and status == "completed":
         central = CentralStore()
@@ -7247,7 +7251,9 @@ def resettle_after_repair(store: ProjectStore, wo_id: str) -> bool:
     probe["status"] = "waiting_pr_merge"
     if true_blockers(store, probe):
         return False
-    store.set_status(wo_id, "waiting_pr_merge")
+    # Spec §C of
+    # docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md.
+    store.set_status(wo_id, "waiting_pr_merge", trigger="pr_repair_resettled")
     store.add_event(wo_id, "pr_repair_resettled",
                     {"pr_url": wo.get("pr_url"), "was": wo["status"]})
     store.clear_attention(wo_id)
@@ -11830,6 +11836,17 @@ def rule_facts(store: ProjectStore, wo: dict[str, Any], *, now: float,
             if name:
                 counts[name] = counts.get(name, 0) + 1
         values["invariant_events"] = counts
+
+    if need("validation_failures"):
+        # BY CAUSE, off the payloads — `event_counts` keys on the KIND, which transport,
+        # auth and killed all share. Spec §5: docs/superpowers/specs/
+        # 2026-10-14-a-killed-validation-panel-opens-an-investigation.md
+        causes: dict[str, int] = {}
+        for event in store.events_of_kind(wo_id, "validation_failed"):
+            cause = str(db.from_json(event["payload"], {}).get("cause") or "")
+            if cause:
+                causes[cause] = causes.get(cause, 0) + 1
+        values["validation_failure_causes"] = causes
 
     if need("dependencies"):
         values["depends_on_count"] = len(store.dependencies(wo))

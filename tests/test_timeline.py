@@ -136,6 +136,21 @@ def test_a_merge_refused_because_the_base_moved_says_which_commit_moved():
     assert "{" not in entry["label"] + entry["detail"]
 
 
+def test_a_reparked_give_up_reads_as_a_sentence_and_not_a_json_dump():
+    """THE TIMELINE IS THIS KIND'S ONLY SURFACE, and the move it records is the OS taking
+    a status back — so "it fixed itself" has to be provable, as it is for
+    `pr_repair_resettled` (kn-3f133363). Unregistered it falls through to the bare kind
+    plus a JSON payload. Spec §B of
+    docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md."""
+    entry = build_timeline({}, [ev("give_up_reparked", 1.0, round_id=12, round=4,
+                                   was="waiting_pr_merge")], [])[0]
+    assert entry["level"] == "signal"
+    assert entry["label"] == "Back on your list — the panel's give-up was never decided"
+    assert entry["detail"] == "was waiting_pr_merge, round 4"
+    assert "{" not in entry["label"] + entry["detail"]
+    assert "give_up_reparked" not in entry["label"] + entry["detail"]
+
+
 def test_messages_appear_as_prompt_and_reply():
     """Both directions are moments on the timeline; the words are the conversation's."""
     messages = [
