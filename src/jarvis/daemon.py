@@ -7028,7 +7028,6 @@ class Daemon:
         runs, which is exactly how duplicate filings 1007/1010 cost ~19 USD.
         """
         from . import bugreport, github, issues
-        from .project_store import TERMINAL_STATUSES
 
         origin = github.origin_repo(project.path)
         repo = bugreport.bug_repo()
@@ -7041,12 +7040,8 @@ class Daemon:
         issue_url = str(fact.get("issue_url") or "")
         fix_wo_id = str(fact.get("fix_wo_id") or "")
         if fix_wo_id:
-            row = store.get_work_order(fix_wo_id)
-            if row is not None and row["status"] not in TERMINAL_STATUSES:
-                return
-            # §2 step 5: that order did not fix it, so the break gets a second one. The
-            # issue is kept — it is the same break.
-            fix_wo_id = ""
+            # §2 step 5: one fix work order per break, EVER, whatever became of it.
+            return
         cleared = False
         try:
             # §2 step 6: READ THE STATE rather than parse the refusal — `start_work`
@@ -7057,7 +7052,8 @@ class Daemon:
             if issue_url and issues.view(issue_url, repo).closed:
                 log.info("[%s] %s is closed and no work order came of it — the break is "
                          "filed afresh on the next tick", project.name, issue_url)
-                issue_url = fix_wo_id = ""
+                # The url ONLY: `fix_wo_id` is necessarily empty here, per step 5 above.
+                issue_url = ""
                 cleared = True
             elif not issue_url:
                 issue_url = self._adopt_base_red_issue(repo, run_id)

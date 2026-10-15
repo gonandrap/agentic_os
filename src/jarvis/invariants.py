@@ -257,6 +257,13 @@ PR_BASE_UPDATE_FAILED_EVENT = "pr_base_update_failed"
 #: docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §3).
 INV_BASE_RED = "INV-BASE-BRANCH-RED"
 
+#: The fix work order for that red branch is SETTLED and the branch is still red — the
+#: one place the OS is out of moves, so it owes the user a decision rather than acting
+#: (spec docs/superpowers/specs/2026-10-14-a-red-main-dispatches-its-own-fix.md §5, Neo
+#: 1738: `jarvis wo retry` is the user's by contract, and a second dispatch is an uncapped
+#: spend loop whose environmental causes kill the replacement too).
+INV_BASE_FIX_DEAD = "INV-BASE-FIX-DEAD"
+
 #: A completed work order whose recorded pull request has not merged. Shared with `ops`,
 #: which closes the report the moment `--abandon` records the decision (spec
 #: docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md §8).
@@ -5217,10 +5224,20 @@ def check_default_branch_green(store: ProjectStore) -> Iterator[Violation]:
     # commit, and nothing that moves tick to tick — the sentence is the dedupe key.
     fix_wo_id = str(fact.get("fix_wo_id") or "")
     issue_url = str(fact.get("issue_url") or "")
-    remedy = (f"The remedy is a commit on `{base}`, and {fix_wo_id} is producing it."
-              if fix_wo_id else
-              f"The remedy is a commit on `{base}`, and no work order is producing it "
-              f"yet.")
+    dead = _dead_base_fix(store, fix_wo_id)
+    tail = _base_fix_decision(dead, fix_wo_id, issue_url)
+    if dead:
+        # §5's third branch: the detail STATES the state; the owed violation below TAKES
+        # the decision.
+        remedy = (f"The remedy is a commit on `{base}`; {fix_wo_id} was dispatched to "
+                  f"produce it and is now `{dead}`, so the OS is out of moves — it "
+                  f"dispatches no second fix order and never retries a dead turn "
+                  f"itself. {tail}")
+    elif fix_wo_id:
+        remedy = f"The remedy is a commit on `{base}`, and {fix_wo_id} is producing it."
+    else:
+        remedy = (f"The remedy is a commit on `{base}`, and no work order is producing "
+                  f"it yet.")
     yield Violation(
         invariant=INV_BASE_RED,
         wo_id=None,
@@ -5234,6 +5251,60 @@ def check_default_branch_green(store: ProjectStore) -> Iterator[Violation]:
                  "fix_wo_id": fix_wo_id, "issue_url": issue_url,
                  "checked_at": fact.get("checked_at")},
     )
+    if not dead:
+        return
+    # NO elapsed time and nothing that changes tick to tick — `Violation.owed`'s rule.
+    owed = (f"{fix_wo_id}, the work order fixing the red default branch `{base}`, "
+            f"settled `{dead}` without clearing it, and the OS will not open another. "
+            f"{tail}")
+    yield Violation(
+        invariant=INV_BASE_FIX_DEAD,
+        wo_id=fix_wo_id,            # `owed_violations` selects by it, so it must be set
+        repaired=False,
+        detail=owed,
+        owed=owed,
+        context={"base": base, "fix_wo_id": fix_wo_id, "issue_url": issue_url,
+                 "status": dead},
+    )
+
+
+def _base_fix_decision(dead: str, fix_wo_id: str, issue_url: str) -> str:
+    """THE DECISION a dead base-fix order leaves the user, naming only a command that can
+    actually run.
+
+    `jarvis wo retry` is `failed`-ONLY by contract: it refuses a delivered or cancelled
+    order, and a deleted row has no session to resume. Naming it there would print a
+    command that cannot succeed. Nothing in here moves tick to tick — `Violation.owed`'s
+    rule.
+    """
+    if not dead:
+        return ""
+    if dead == "failed":
+        return f"Run `jarvis wo retry {fix_wo_id}`, or order a different fix."
+    gone = ("Its record is gone, so nothing can be resumed" if dead == "deleted"
+            else "That order will not run again")
+    if issue_url:
+        return f"{gone} — a fix is a new order on the same issue: " \
+               f"`jarvis issues start {issue_url}`."
+    return f"{gone} — order a fix yourself."
+
+
+def _dead_base_fix(store: ProjectStore, fix_wo_id: str) -> str:
+    """The terminal status of the red base's fix order, `""` while it can still fix it.
+
+    Spec docs/superpowers/specs/2026-10-14-a-red-main-dispatches-its-own-fix.md §5. The
+    work order's own `TERMINAL_STATUSES`, which includes `failed` — this module's local
+    constant of that name does not — and a row that is GONE reads as terminal.
+    """
+    from .project_store import TERMINAL_STATUSES as SETTLED_STATUSES
+
+    if not fix_wo_id:
+        return ""
+    try:
+        status = str(store.get_work_order(fix_wo_id)["status"])
+    except KeyError:
+        return "deleted"
+    return status if status in SETTLED_STATUSES else ""
 
 
 #: How many feature orders the pointer check reads. `list_feature_orders` caps at 200 by

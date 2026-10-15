@@ -1354,6 +1354,16 @@ def ci_hold(store, wo_id: str, round_no: int, started: float, reopens: float) ->
     store.conn.commit()
 
 
+def running_turn(store, wo_id: str, started: float) -> dict:
+    """One turn in flight, started `started` ago. `wo_turns.state` defaults to
+    'running' (project_store.py:1078), so `worker_session.busy` needs nothing else."""
+    turn = store.create_turn(wo_id, "dispatch", "go")
+    store.conn.execute("UPDATE wo_turns SET started_at=? WHERE id=?",
+                       (started, turn["id"]))
+    store.conn.commit()
+    return turn
+
+
 def _validating(store, wo_title: str, minutes: float):
     """An order parked in `validating` with a round on record, `minutes` ago."""
     wo = ops.create_work_order("proj_a", wo_title)
@@ -1784,6 +1794,111 @@ def test_an_exempt_kind_is_an_excluded_row_not_an_absence(stuck_os, jarvis_home,
     row = stuck_row(wo["id"])  # absent entirely under a hardcoded skip
     assert row["stuck"] is True and row["excluded"] == ""
     assert swept(cat) == [wo["id"]]
+
+
+# -- a worker turn in flight: issue #1059 ----------------------------------------------
+#
+# docs/superpowers/specs/2026-10-14-a-worker-turn-in-flight-is-not-stuck.md
+
+
+def test_a_turn_in_flight_is_not_stuck():
+    """§8.1, the incident's scalars: 10.6 minutes of tool calls past the 5-minute
+    `running` threshold, with the row still showing the arithmetic (§7)."""
+    from jarvis import stuck
+
+    judged = stuck.assess("running", 10.6 * 60, 10.6 * 60, 0.0, {"running": 5 * 60},
+                          HOUR, turn_in_flight=True)
+
+    assert judged.stuck is False
+    assert judged.excluded == stuck.TURN_IN_FLIGHT_CAUSE
+    assert judged.clock == "activity"
+    assert judged.active_seconds == 10.6 * 60
+    assert judged.threshold_seconds == 5 * 60
+    assert "writes nothing to the timeline" in judged.reason
+
+
+def test_running_with_no_turn_in_flight_is_judged_as_today():
+    """§8.2: the exclusion must not generalise to every `running` order."""
+    from jarvis import stuck
+
+    judged = stuck.assess("running", 10.6 * 60, 10.6 * 60, 0.0, {"running": 5 * 60},
+                          HOUR)
+
+    assert judged.stuck is True
+    assert judged.excluded == ""
+    assert judged.reason == ("0.2h of active time past the 0.1h threshold for running, "
+                             "judged on time since its last activity")
+
+
+def test_assess_precedence_puts_turn_in_flight_last():
+    """§5: a fleet-wide fact outranks a fact about one order, and the first three links
+    of the chain are pinned so a later edit cannot reorder them silently."""
+    from jarvis import stuck
+    from jarvis.worker_session import PAUSE_USAGE_LIMIT
+
+    def judged(**flags):
+        return stuck.assess("running", 10 * HOUR, 10 * HOUR, 0.0, {"running": HOUR},
+                            HOUR, **flags)
+
+    all_flags = judged(kind="investigator", exempt_kinds=("investigator",),
+                       excluded_cause=PAUSE_USAGE_LIMIT, by_design_idle=True,
+                       turn_in_flight=True)
+    fleet_and_turn = judged(excluded_cause=PAUSE_USAGE_LIMIT, turn_in_flight=True)
+    idle_and_turn = judged(by_design_idle=True, turn_in_flight=True)
+    turn_only = judged(turn_in_flight=True)
+
+    assert all_flags.excluded == stuck.HOLD_EXEMPT_KIND
+    assert fleet_and_turn.excluded == PAUSE_USAGE_LIMIT
+    assert idle_and_turn.excluded == stuck.IDLE_MANAGER_CAUSE
+    assert turn_only.excluded == stuck.TURN_IN_FLIGHT_CAUSE
+    for verdict in (all_flags, fleet_and_turn, idle_and_turn, turn_only):
+        assert verdict.stuck is False
+        assert verdict.active_seconds == 10 * HOUR
+        assert verdict.threshold_seconds == HOUR
+
+    # The control: the same arithmetic with nothing excluding it IS stuck.
+    assert judged().stuck is True
+
+
+def test_a_live_turn_buys_no_investigation(stuck_os):
+    """§8.4 and §8.5: a real `running` turn row excludes, and the order parked
+    identically with NO turn row is the control that still buys one investigation."""
+    from jarvis import stuck
+
+    store = stuck_os["store"]
+    now = time.time()
+    wo = ops.create_work_order("proj_a", "116 bash calls deep")
+    at = park_order(store, wo["id"], "running", hours=0.2)
+    running_turn(store, wo["id"], started=at)
+    control = ops.create_work_order("proj_a", "nothing in flight at all")
+    park_order(store, control["id"], "running", hours=0.2)
+
+    stuck_os["daemon"].stuck_tick(None)
+
+    assert len(ops.list_investigation_orders("proj_a", include_settled=True)) == 1
+    assert not ops.live_investigation("proj_a", wo["id"])
+    assert ops.live_investigation("proj_a", control["id"])
+    # The anti-`continue` assertion (§7): an excluded row is still a judged row.
+    row = [r for r in _judged(store, now) if r["wo"]["id"] == wo["id"]][0]
+    assert row["verdict"].excluded == stuck.TURN_IN_FLIGHT_CAUSE
+    assert row["verdict"].stuck is False
+    assert abs(row["verdict"].active_seconds - 12 * 60) < 60
+
+
+def test_a_live_turn_outside_running_is_still_judged(stuck_os):
+    """§6: a `needs_review` wait is owed by the USER, and hiding one is the single thing
+    the sweep exists to surface. Gated on `running` explicitly, never universally."""
+    store = stuck_os["store"]
+    now = time.time()
+    for status in ("needs_review", "idle"):
+        wo = ops.create_work_order("proj_a", f"a turn row while {status}")
+        at = park_order(store, wo["id"], status, hours=5)
+        running_turn(store, wo["id"], started=at)
+
+        row = [r for r in _judged(store, now) if r["wo"]["id"] == wo["id"]][0]
+
+        assert row["verdict"].excluded == "", status
+        assert row["verdict"].stuck is True, status
 
 
 # -- the idle feature manager: issue #1008 ---------------------------------------------
