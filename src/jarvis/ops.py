@@ -9667,7 +9667,7 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
     `window` is the PROJECT-WIDE usage hold, read once by the caller rather than once per
     candidate (`health_sweep_hold`'s own docstring).
     """
-    from . import bus, holds, stuck
+    from . import bus, holds, stuck, worker_session
     from .health import observer_kinds
     from .project_store import (FO_ID_PREFIXES, UNGOVERNED_ORIGINS,
                                 VALIDATION_CI_CAUSE, validation_ci_hold_spans,
@@ -9724,6 +9724,9 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
             and (invariants.outstanding_feature_children(pstore, str(wo["parent_id"]))
                  or not bus.nothing_queued_to_manager(pstore, str(wo["parent_id"]),
                                                       str(wo["id"]))))
+        # §6 of docs/superpowers/specs/2026-10-14-a-worker-turn-in-flight-is-not-stuck.md.
+        turn_in_flight = bool(wo["status"] == "running"
+                              and worker_session.busy(pstore, wo["id"]))
         verdict = stuck.assess(
             str(wo["status"]), now - since, now - (durations.last_activity_ts or since),
             discounted, thresholds, cfg.fallback_minutes * 60.0,
@@ -9733,7 +9736,8 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                             else stuck.LIVE_DEPENDENCY if live_edges else ""),
             kind=str(wo.get("kind") or "worker"),
             exempt_kinds=tuple(cfg.exempt_kinds),
-            by_design_idle=by_design_idle)
+            by_design_idle=by_design_idle,
+            turn_in_flight=turn_in_flight)
         if stuck_only and not verdict.stuck:
             continue
         blocker = true_blockers(pstore, wo, now=now)
