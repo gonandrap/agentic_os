@@ -198,7 +198,9 @@ class BaseRed:
     attributed — a red base with no attribution is still the fact that pauses the merge.
     `fix_wo_id` is the order DISPATCHED to repair it (spec
     docs/superpowers/specs/2026-10-14-a-red-main-dispatches-its-own-fix.md §5), and is
-    independent of `wo_id`.
+    independent of `wo_id`. `issue_url` is the break's issue and `issue_os_filed` says the
+    OS filed or adopted it under that spec's §4 test — the pair is what §6's exemption is
+    keyed on, read off the fact so `decide` stays pure and makes no network call (§3).
     """
 
     base: str
@@ -207,6 +209,8 @@ class BaseRed:
     head_sha: str
     wo_id: str = ""
     fix_wo_id: str = ""
+    issue_url: str = ""
+    issue_os_filed: bool = False
 
 
 @dataclass(frozen=True)
@@ -360,8 +364,16 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
                      f"merge over a decision a person owes")
     # Spec docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §4,
     # and spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §6 for the exemption.
-    if base_red is not None and not (base_red.fix_wo_id
-                                     and wo.get("id") == base_red.fix_wo_id):
+    # §6: keyed on WHAT THE REMEDY IS FOR — the issue identity — and never on
+    # `fix_wo_id`, which is the OS's own dispatch bookkeeping (kn-af41186c). BOTH halves
+    # must be non-empty: `create_work_order` stores `issue_url or None`, so a
+    # falsy-equals-falsy match would exempt every order in the fleet (§6's `'' == ''`).
+    on_the_break = str(wo.get("issue_url") or "")
+    fixes_the_break = bool(base_red is not None and on_the_break
+                           and base_red.issue_url
+                           and on_the_break == base_red.issue_url
+                           and base_red.issue_os_filed)
+    if base_red is not None and not fixes_the_break:
         blamed = f" (merged by the OS for {base_red.wo_id})" if base_red.wo_id else ""
         # Spec 2026-10-14 §5: tick-stable, so the order's id and nothing that moves.
         fixing = (f"{base_red.fix_wo_id} is fixing it" if base_red.fix_wo_id

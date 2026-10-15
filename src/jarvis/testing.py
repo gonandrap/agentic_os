@@ -1155,6 +1155,7 @@ if argv[:2] == ["issue", "create"]:
     if "--title" in argv:
         r["title"] = argv[argv.index("--title") + 1]
     r["body"] = stdin
+    r["author"] = os.environ.get("FAKE_GH_LOGIN", "")
     save(rows)
     print(url)
 elif argv[:2] == ["issue", "list"]:
@@ -1175,9 +1176,14 @@ elif argv[:2] == ["issue", "list"]:
         if term and term not in (r.get("body") or ""):
             continue
         number = u.rstrip("/").rsplit("/", 1)[-1]
+        # `author` and `body` ride along for every caller: the red-base adoption search
+        # needs both to tell the OS's own filing from a stranger's (spec 2026-10-14 §4).
         out.append({"number": int(number) if number.isdigit() else 0,
                     "title": r.get("title", ""), "url": u,
-                    "state": r.get("state", "OPEN")})
+                    "state": r.get("state", "OPEN"),
+                    "author": {"login": r.get("author")
+                               or os.environ.get("FAKE_GH_LOGIN", "")},
+                    "body": r.get("body", "")})
     print(json.dumps(out))
 elif argv[:2] == ["issue", "view"]:
     rows, r = row(argv[2] if len(argv) > 2 else "")
@@ -1321,6 +1327,9 @@ elif argv[:2] == ["pr", "update-branch"]:
     with open(commits_path, "w") as f:
         json.dump(commits, f)
     print(f"Updated branch of pull request {url}")
+elif argv[:2] == ["api", "user"]:
+    # Who `gh` is authenticated as — the login the OS files issues under.
+    print(os.environ.get("FAKE_GH_LOGIN", ""))
 elif argv[:2] == ["api", "--method"]:
     # The API reads the OS makes — a commit (its parents, or its subject), a branch's
     # protection, and the repository's default branch name. Anything else is an unhandled
@@ -1631,6 +1640,8 @@ def fake_systemd(tmp_path, monkeypatch):
 #: deliberately NOT `bugreport.DEFAULT_BUG_REPO`: see `fake_gh`.
 FIXTURE_BUG_REPO = "jarvis-fixture/no-such-tracker"
 FIXTURE_ISSUE_URL = f"https://github.com/{FIXTURE_BUG_REPO}/issues/7"
+#: The login the fake `gh` is authenticated as — the account the OS files issues under.
+FIXTURE_GH_LOGIN = "jarvis-fixture-bot"
 
 
 @pytest.fixture()
@@ -1652,12 +1663,18 @@ def fake_gh(tmp_path, monkeypatch):
     url = FIXTURE_ISSUE_URL
     monkeypatch.setenv("FAKE_GH_DIR", str(gdir))
     monkeypatch.setenv("FAKE_GH_ISSUE_URL", url)
+    monkeypatch.setenv("FAKE_GH_LOGIN", FIXTURE_GH_LOGIN)
     monkeypatch.setenv("JARVIS_GH_BIN", str(binpath))
+    # `issues.gh_login` caches for the PROCESS, and a pytest process is many fleets: a
+    # login read under one fixture's `gh` must not answer under the next one's.
+    from . import issues as _issues
+    _issues.reset_gh_login()
 
     class Handle:
         dir = gdir
         repo = FIXTURE_BUG_REPO
         issue_url = url
+        login = FIXTURE_GH_LOGIN
         prs: dict[str, dict] = {}
 
         @property
@@ -1717,13 +1734,20 @@ def fake_gh(tmp_path, monkeypatch):
             return base
 
         def add_issue(self, issue_url: str, title: str, body: str = "",
-                      state: str = "OPEN", labels: list[str] | None = None) -> None:
+                      state: str = "OPEN", labels: list[str] | None = None,
+                      author: str | None = None) -> None:
             """Put an issue on the tracker as `issue list` will see it — title and body
             included, which `set_issue` does not carry because nothing read them before
-            the follow-up dedupe did."""
+            the follow-up dedupe did.
+
+            `author` defaults to the login `gh` is authenticated as, so an issue a test
+            adds reads as the OS's own filing; pass a stranger's login for the one case
+            the red-base adoption filter exists for (spec 2026-10-14 §4).
+            """
             rows = self.issues
             rows[issue_url] = {**rows.get(issue_url, {"comments": []}),
                                "state": state.upper(), "title": title, "body": body,
+                               "author": FIXTURE_GH_LOGIN if author is None else author,
                                "labels": sorted(labels or [])}
             (gdir / "issues.json").write_text(json.dumps(rows))
 

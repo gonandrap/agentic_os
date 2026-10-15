@@ -174,6 +174,22 @@ def opted_out(jarvis_home, fake_claude, fake_gh, catalog_file):
     return fake_gh
 
 
+def test_the_authenticated_login_is_read_once_and_a_failed_read_is_not_cached(fake_gh):
+    """Spec 2026-10-14 §4: one `gh api user` per process, because the account cannot
+    change under a running daemon — but `gh` down for one tick is TRANSIENT, so caching
+    that failure would leave red-base adoption off for the daemon's whole life and file a
+    duplicate issue per break for ever."""
+    def reads() -> int:
+        return len([c for c in fake_gh.calls if c["argv"][:2] == ["api", "user"]])
+
+    fake_gh.fail("gh: could not connect")
+    assert issues.gh_login() == "" and reads() == 1
+    fake_gh.works()
+
+    assert issues.gh_login() == fake_gh.login and reads() == 2
+    assert issues.gh_login() == fake_gh.login and reads() == 2
+
+
 # -- what may write to GitHub ---------------------------------------------------------
 
 
@@ -210,8 +226,12 @@ def test_every_gh_command_this_module_builds_is_a_declared_issue_verb():
 #: them earns its place by making a write safe: `issue view` is what makes the label and
 #: close idempotent, `issue list` is the follow-up dedupe, and `repo view` is the privacy
 #: read that decides whether a seat's own words may be published at all (spec §9 of
-#: docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md).
-ISSUE_READS = {("issue", "view"), ("issue", "list"), ("repo", "view")}
+#: docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md). `api user` is the
+#: fourth: the login the OS files under, which is what tells its own red-base filing from
+#: a stranger's issue quoting the same run id (spec 2026-10-14 §4) before `start_work`
+#: turns that body into a privileged worker's brief.
+ISSUE_READS = {("issue", "view"), ("issue", "list"), ("repo", "view"),
+               ("api", "user")}
 
 
 def test_the_declared_verbs_are_exactly_these_writes_and_these_three_reads():

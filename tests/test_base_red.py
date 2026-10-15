@@ -670,16 +670,21 @@ def test_a_second_red_run_joins_the_order_already_on_it(tracker, project, fake_g
     assert orders(store) == [first["fix_wo_id"]]
 
 
+def os_filed_body(run_url: str = TRACKER_RUN_URL) -> str:
+    """A body as `jarvis bug report` writes it: the run url, and §4's filing marker."""
+    return f"run {run_url} failed\n\n{bugreport.FILED_MARKER}"
+
+
 def test_an_open_issue_quoting_the_run_id_is_adopted(tracker, project, fake_gh,
                                                      monkeypatch):
     """§4: the run id is the one token unique to this break, and the LOWEST open hit
-    wins so two concurrent filings converge on one."""
+    AMONG THE ELIGIBLE wins so two concurrent filings converge on one."""
     filed: list[dict] = []
     monkeypatch.setattr(bugreport, "report_bug", lambda **kw: filed.append(kw))
     later = f"https://github.com/{FIXTURE_BUG_REPO}/issues/1200"
     first = f"https://github.com/{FIXTURE_BUG_REPO}/issues/1054"
     for url in (later, first):
-        fake_gh.add_issue(url, "main is red", body=f"run {TRACKER_RUN_URL} failed")
+        fake_gh.add_issue(url, "main is red", body=os_filed_body())
     store = ProjectStore(project)
     poll(tracker, store)
 
@@ -688,16 +693,78 @@ def test_an_open_issue_quoting_the_run_id_is_adopted(tracker, project, fake_gh,
     assert filed == []
     held = fact()
     assert held["issue_url"] == first and held["fix_wo_id"]
+    # §3: an adopted issue that passed §4's author-plus-marker test is the OS's own.
+    assert held["issue_os_filed"] is True
     assert [w["issue_url"] for w in store.list_work_orders(include_hidden=True)] \
         == [first]
+
+
+def test_a_foreign_authored_issue_quoting_the_run_id_is_not_adopted(tracker, project,
+                                                                    fake_gh):
+    """§4 filter 2, THE ATTACK AS REPORTED. The tracker and the run id are public, so a
+    stranger quoting the run id wins the lowest-number race — and `issues.start_work`
+    would dispatch a privileged worker whose brief is that remote body."""
+    attacker = f"https://github.com/{FIXTURE_BUG_REPO}/issues/1000"
+    fake_gh.add_issue(attacker, "main is red", body=os_filed_body(),
+                      author="a-stranger")
+    store = ProjectStore(project)
+    poll(tracker, store)
+
+    sweep(tracker, store)
+
+    held = fact()
+    assert held["issue_url"] == fake_gh.issue_url != attacker
+    assert filings(fake_gh) == 1 and held["fix_wo_id"]
+    assert held["issue_os_filed"] is True
+    assert [w["issue_url"] for w in store.list_work_orders(include_hidden=True)] \
+        == [fake_gh.issue_url]
+
+
+def test_an_os_authored_issue_without_the_filing_marker_is_not_adopted(tracker, project,
+                                                                      fake_gh):
+    """§4 filter 3: the author alone would adopt any issue the OS's account ever opened
+    for another reason that happens to quote the id."""
+    other = f"https://github.com/{FIXTURE_BUG_REPO}/issues/1000"
+    fake_gh.add_issue(other, "a note about run 36273250195",
+                      body=f"run {TRACKER_RUN_URL} failed")
+    store = ProjectStore(project)
+    poll(tracker, store)
+
+    sweep(tracker, store)
+
+    held = fact()
+    assert held["issue_url"] == fake_gh.issue_url != other
+    assert filings(fake_gh) == 1 and held["fix_wo_id"]
+
+
+def test_the_lowest_number_is_taken_among_the_eligible_and_not_overall(tracker, project,
+                                                                      fake_gh,
+                                                                      monkeypatch):
+    """§4 filter 4: lowest-number-AMONG-THE-ELIGIBLE. Overall would hand the break to the
+    stranger's issue, which is the attack again by another route."""
+    filed: list[dict] = []
+    monkeypatch.setattr(bugreport, "report_bug", lambda **kw: filed.append(kw))
+    attacker = f"https://github.com/{FIXTURE_BUG_REPO}/issues/1000"
+    ours = f"https://github.com/{FIXTURE_BUG_REPO}/issues/1054"
+    fake_gh.add_issue(attacker, "main is red", body=os_filed_body(),
+                      author="a-stranger")
+    fake_gh.add_issue(ours, "main is red", body=os_filed_body())
+    store = ProjectStore(project)
+    poll(tracker, store)
+
+    sweep(tracker, store)
+
+    assert filed == []
+    held = fact()
+    assert held["issue_url"] == ours and held["issue_os_filed"] is True
+    assert [w["issue_url"] for w in store.list_work_orders(include_hidden=True)] == [ours]
 
 
 def test_a_closed_issue_quoting_the_run_id_is_not_adopted(tracker, project, fake_gh):
     """§4 filter 1: a CLOSED issue citing this run is a fix that was tried and did not
     work, and `start_work` refuses a closed issue outright."""
     closed = f"https://github.com/{FIXTURE_BUG_REPO}/issues/1054"
-    fake_gh.add_issue(closed, "main is red", body=f"run {TRACKER_RUN_URL} failed",
-                      state="CLOSED")
+    fake_gh.add_issue(closed, "main is red", body=os_filed_body(), state="CLOSED")
     store = ProjectStore(project)
     poll(tracker, store)
 

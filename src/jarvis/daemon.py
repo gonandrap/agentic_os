@@ -6968,6 +6968,7 @@ class Daemon:
         worst = reds[0] if reds else None
         was_red = bool(prev.get("red"))
         wo_id = issue_url = fix_wo_id = ""
+        issue_os_filed = False
         if worst is not None:
             wo_id = (str(prev.get("wo_id") or "") if was_red
                      else self._attribute_base_red(project, store, owner, repo,
@@ -6978,6 +6979,7 @@ class Daemon:
                 # the order already on it instead of filing again.
                 issue_url = str(prev.get("issue_url") or "")
                 fix_wo_id = str(prev.get("fix_wo_id") or "")
+                issue_os_filed = bool(prev.get("issue_os_filed"))
         fact = {
             "red": worst is not None,
             "base": base,
@@ -6989,6 +6991,7 @@ class Daemon:
             "wo_id": wo_id,
             "issue_url": issue_url,
             "fix_wo_id": fix_wo_id,
+            "issue_os_filed": issue_os_filed,
             "checked_at": time.time(),
         }
         self.central.set_base_health(project.name, fact)
@@ -7039,6 +7042,10 @@ class Daemon:
         run_id = fact.get("run_id") or 0
         issue_url = str(fact.get("issue_url") or "")
         fix_wo_id = str(fact.get("fix_wo_id") or "")
+        # §3: True only for an issue that passed §4's author-plus-marker test, or that
+        # `report_bug` filed in this sweep. `automerge.decide` reads it off the fact so
+        # the exemption (§6) costs no `gh` call behind every merge decision.
+        issue_os_filed = bool(fact.get("issue_os_filed"))
         if fix_wo_id:
             # §2 step 5: one fix work order per break, EVER, whatever became of it.
             return
@@ -7054,9 +7061,12 @@ class Daemon:
                          "filed afresh on the next tick", project.name, issue_url)
                 # The url ONLY: `fix_wo_id` is necessarily empty here, per step 5 above.
                 issue_url = ""
+                issue_os_filed = False
                 cleared = True
             elif not issue_url:
                 issue_url = self._adopt_base_red_issue(repo, run_id)
+                # Adoption IS §4's test, so an adopted url is the OS's own filing.
+                issue_os_filed = bool(issue_url)
             if issue_url:
                 fix_wo_id = str(issues.start_work(
                     issue_url, project=project.name).get("wo_id") or "")
@@ -7073,44 +7083,71 @@ class Daemon:
                     priority="high", expedite=True, project=project.name)
                 issue_url = str(filed.get("url") or "")
                 fix_wo_id = str((filed.get("pickup") or {}).get("wo_id") or "")
+                issue_os_filed = bool(issue_url)
         except Exception:  # noqa: BLE001 — every failure here is transient and retried
             log.exception("[%s] could not dispatch a fix for the red default branch",
                           project.name)
         # Whatever DID succeed, so an issue filed with no work order is not filed twice
         # and the next tick retries from the first step still empty (§2 step 9).
-        if (issue_url, fix_wo_id) != (fact.get("issue_url"), fact.get("fix_wo_id")):
+        if (issue_url, fix_wo_id, issue_os_filed) != (
+                fact.get("issue_url"), fact.get("fix_wo_id"),
+                fact.get("issue_os_filed")):
             self.central.set_base_health(
                 project.name,
-                {**fact, "issue_url": issue_url, "fix_wo_id": fix_wo_id})
+                {**fact, "issue_url": issue_url, "fix_wo_id": fix_wo_id,
+                 "issue_os_filed": issue_os_filed})
         if fix_wo_id:
             log.info("[%s] %s is fixing the red default branch (%s)", project.name,
                      fix_wo_id, issue_url)
 
     def _adopt_base_red_issue(self, repo: str, run_id: Any) -> str:
-        """An OPEN issue already citing this failing run, or `""` — spec §4.
+        """An OPEN issue THE OS ITSELF filed citing this failing run, or `""` — spec §4.
 
         MECHANICAL, NOT FUZZY: a worker-filed red-main issue quotes the failing run's URL
         in its body, and the run id is the one token in it unique to this break (it is in
         1054). `gh` search is token-AND, so searching the whole URL buys nothing the id
         does not and misses a body that wrote the id without the URL.
 
-        TWO FILTERS. `state == "OPEN"`, because a CLOSED issue citing this run is a fix
-        that was tried and did not work and `issues.start_work` refuses a closed issue
-        outright — `issues_mentioning`'s own `--state all` is load-bearing for its other
-        callers and wrong here. Then the LOWEST number among the open hits, the first one
-        filed, so two concurrent filings converge on one. An issue about this break that
-        never quoted the run id gets a duplicate filing, which is the right way to fail:
-        a duplicate issue is visible and closable (`ops._verdict_duplicate`'s asymmetry).
+        FOUR FILTERS, all required:
+
+        1. `state == "OPEN"`, because a CLOSED issue citing this run is a fix that was
+           tried and did not work and `issues.start_work` refuses a closed issue outright
+           — `issues_mentioning`'s own `--state all` is load-bearing for its other
+           callers and wrong here.
+        2. THE AUTHOR IS THE OS: the issue's author login equals `issues.gh_login()`.
+        3. THE BODY CARRIES `bugreport.FILED_MARKER` verbatim.
+        4. The LOWEST number AMONG THE ELIGIBLE — the first one the OS filed, so two
+           concurrent filings converge on one.
+
+        **BOTH 2 AND 3, never either.** The tracker and the run id are public, so with the
+        run id as the only key a stranger opens an issue quoting it, wins the
+        lowest-number race, and `issues.start_work` dispatches a privileged worker in the
+        OS's own repository whose brief is that remote body. The marker is public text a
+        stranger can copy; the author login is what a stranger cannot forge. The author
+        alone would adopt any issue the OS's account ever opened for another reason that
+        happens to quote the id.
+
+        FAILING DIRECTION: anything that fails any filter falls through to a FRESH filing.
+        A duplicate issue is visible and closable (`ops._verdict_duplicate`'s asymmetry),
+        and an unreadable login adopts nothing. A stranger's report of the same break is
+        simply ignored; a human can still pick it up with `jarvis issues start`.
         """
-        from . import issues
+        from . import bugreport, issues
 
         if not run_id:
             return ""
-        open_hits = [r for r in issues.issues_mentioning(repo, str(run_id))
-                     if str(r.get("state") or "").upper() == "OPEN"]
-        if not open_hits:
+        login = issues.gh_login()
+        if not login:
             return ""
-        return str(min(open_hits, key=lambda r: int(r.get("number") or 0))["url"])
+        eligible = [
+            r for r in issues.issues_mentioning(repo, str(run_id))
+            if str(r.get("state") or "").upper() == "OPEN"
+            and str((r.get("author") or {}).get("login") or "") == login
+            and bugreport.FILED_MARKER in str(r.get("body") or "")
+        ]
+        if not eligible:
+            return ""
+        return str(min(eligible, key=lambda r: int(r.get("number") or 0))["url"])
 
     @staticmethod
     def _base_red_brief(project: ProjectSpec, fact: dict[str, Any]) -> str:
@@ -7189,8 +7226,11 @@ class Daemon:
             run_url=str(fact.get("run_url") or ""),
             head_sha=str(fact.get("head_sha") or ""),
             wo_id=str(fact.get("wo_id") or ""),
-            # Spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §5.
-            fix_wo_id=str(fact.get("fix_wo_id") or ""))
+            # Spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §5, and §6's exemption
+            # is keyed on the pair below rather than on `fix_wo_id` (kn-af41186c).
+            fix_wo_id=str(fact.get("fix_wo_id") or ""),
+            issue_url=str(fact.get("issue_url") or ""),
+            issue_os_filed=bool(fact.get("issue_os_filed")))
 
     def poll_pull_requests(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Ask GitHub what happened to the pull requests this project is parked behind.

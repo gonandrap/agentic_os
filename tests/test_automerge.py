@@ -240,17 +240,67 @@ def test_the_not_its_fault_clause_needs_the_same_workflow_red_on_this_branch():
     assert "not its fault" not in green.reason
 
 
+#: The break's issue, as the OS filed it and as the fix order carries it.
+BASE_ISSUE = "https://github.com/acme/proj/issues/1054"
+#: The fact for a break the OS filed and dispatched: §6's three conditions can hold.
+BASE_RED_FILED = replace(BASE_RED, fix_wo_id="wo-1", issue_url=BASE_ISSUE,
+                         issue_os_filed=True)
+
+
 def test_the_order_fixing_main_is_not_held_on_the_base_it_is_fixing():
     """Spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §6: its own merge is the only
-    thing that turns the base green, so holding it deadlocks the mechanism. Narrow — any
-    other order on the same fact is still held, and an unnamed id exempts nobody."""
-    fixing = replace(BASE_RED, fix_wo_id=WO["id"])
+    thing that turns the base green, so holding it deadlocks the mechanism. Keyed on WHAT
+    THE REMEDY IS FOR (kn-af41186c) — the issue identity, never `fix_wo_id`."""
+    fixer = {**WO, "issue_url": BASE_ISSUE}
 
-    assert decide(rnd(), base_red=fixing).armed
-    other = decide(rnd(), wo={**WO, "id": "wo-2"}, base_red=fixing)
-    assert other.code == automerge.HELD_BASE_RED and WO["id"] in other.reason
-    assert decide(rnd(), wo={**WO, "id": ""}, base_red=BASE_RED).code \
-        == automerge.HELD_BASE_RED
+    assert decide(rnd(), wo=fixer, base_red=BASE_RED_FILED).armed
+    # Any other order on the same fact is still held.
+    other = decide(rnd(), wo={**WO, "id": "wo-2"}, base_red=BASE_RED_FILED)
+    assert other.code == automerge.HELD_BASE_RED and "wo-1 is fixing it" in other.reason
+    # `fix_wo_id` alone exempts NOTHING: the id the sweep wrote is bookkeeping.
+    bookkeeping = decide(rnd(), base_red=replace(BASE_RED, fix_wo_id=WO["id"]))
+    assert bookkeeping.code == automerge.HELD_BASE_RED
+    # A DIFFERENT issue is a different remedy.
+    elsewhere = decide(rnd(), wo={**WO, "issue_url": BASE_ISSUE + "0"},
+                       base_red=BASE_RED_FILED)
+    assert elsewhere.code == automerge.HELD_BASE_RED
+
+
+@pytest.mark.parametrize("stored", [None, ""])
+@pytest.mark.parametrize("on_fact", ["", None])
+def test_two_empty_issue_urls_do_not_exempt(stored, on_fact):
+    """§6's `'' == ''` TRAP. `create_work_order` stores `issue_url or None`, so an
+    ordinary order's column is NULL — a falsy-equals-falsy match would exempt EVERY order
+    in the fleet from the red-base hold, which is the whole brake switched off."""
+    fact = automerge.BaseRed(base="main", workflow="ci", run_url=BASE_RED.run_url,
+                             head_sha=BASE_RED.head_sha, issue_url=on_fact or "",
+                             issue_os_filed=True)
+    decision = decide(rnd(), wo={**WO, "issue_url": stored}, base_red=fact)
+    assert decision.code == automerge.HELD_BASE_RED
+
+
+def test_matching_issue_urls_the_os_did_not_file_do_not_exempt():
+    """§6 condition 3: the identity is only trustworthy for an issue the OS filed or
+    adopted under §4's author-plus-marker test. An adopted stranger's issue must not
+    hand its order the fleet-wide hold's exemption."""
+    fact = replace(BASE_RED_FILED, issue_os_filed=False)
+    decision = decide(rnd(), wo={**WO, "issue_url": BASE_ISSUE}, base_red=fact)
+    assert decision.code == automerge.HELD_BASE_RED
+
+
+@pytest.mark.parametrize("kw,row,code", [
+    ({"checks": (check("unit (3.13)", "FAILURE"),)}, rnd(), automerge.HELD_CHECKS_FAILED),
+    ({"head_oid": PUSHED}, rnd(), automerge.HELD_SHA_MOVED),
+    ({}, rnd(outcome="rejected"), automerge.HELD_NOT_PASSED),
+    ({"mergeable": "CONFLICTING"}, rnd(), automerge.HELD_NOT_MERGEABLE),
+])
+def test_a_broken_remedy_is_still_held(kw, row, code):
+    """§6: CONDITIONS 4-6 STILL RUN after the exemption. The fix PR's CI runs on the merge
+    ref, so a correct fix is green there; a broken one falls through to its own hold. The
+    exemption removes one hold, not the gate."""
+    decision = decide(row, wo={**WO, "issue_url": BASE_ISSUE},
+                      base_red=BASE_RED_FILED, pull=pr(**kw))
+    assert not decision.armed and decision.code == code
 
 
 def test_an_unclaimed_red_base_reads_as_nothing_yet_rather_than_as_silence():
