@@ -6,20 +6,48 @@ question 1759.
 
 ## 0 — The rule, the seam, and the census
 
-### 0.1 The rule
+### 0.1 The rule, and why class 2 is worth converting
 
 Knowledge entry `kn-4c922b4c`, stated by the user on issue 1066:
 
 > No test may read the real clock. Every time a test needs comes from an injectable or
 > patched time function; timeouts and waits are faked too.
 
-The failure this prevents: `tests/test_health_sweep.py` staged a usage-limit reset of
+The failure that started it: `tests/test_health_sweep.py` staged a usage-limit reset of
 `11:50pm (America/Los_Angeles)` and asserted `row["reopens_at"] > db.now()` against the real
 wall clock. CI run 38693984070 ran it at 06:50:43 UTC — 23:50:43 PDT — and it failed. A test
 that passes 1439 minutes out of 1440 is not a passing test.
 
-`wo-059520b9` fixed that one site and added a hygiene guard. This feature burns the guard's
-exemption list down.
+`wo-059520b9` fixed that one site and added the guard at `tests/test_clock_hygiene.py` with a
+per-file `ALLOWED` dict. **This feature burns that dict down to class 3.**
+
+**Why, and it is not the reason the obvious reading gives.** `kn-5e6af711`, stated by the
+user on issue 1066 after `wo-059520b9`:
+
+> The cost of class 2 is not the flakes it causes, it is the flakes it teaches.
+
+Class 2 is not flaky today. Both sides share one clock and no failing band exists, so on a
+pure risk-today reading these files are fine. Convert them anyway, because **a worker writing
+a new test reads its neighbours and copies what it finds.** Every surviving `time.time()`
+under `tests/` is a worked example of validating against the wall clock, and the next copy of
+it lands beside production code that DOES take a `now=` — which is exactly the two-clock
+disagreement that made `tests/test_health_sweep.py` red. The guard blocks the shape in NEW
+files, so the remaining exposure is precisely the allowlisted files a worker can still read
+and imitate.
+
+Three consequences, and they bind every section below:
+
+1. **No section is sequenced or scoped by "which files are at risk of failing."** Every
+   allowlisted class-2 file is equally worth removing, because every one is equally readable
+   as an example. A section that converts 30 boring files is worth exactly as much as one
+   that converts a subtle one.
+2. **This work is not deprioritised for having no deadline.** "Nothing is failing yet" is
+   not a reason to leave an entry on the list.
+3. **The done-when is not softened to "the risky ones."** It is section 0.7 as written.
+
+Class 3 stays exempt and is not an example to copy, *because its marker names why*. That is
+the whole function of a reason string, and it is why a marker that names the wrong class is
+worse than no marker at all.
 
 ### 0.2 The seam: `db.now()`, and nothing else
 
@@ -35,8 +63,38 @@ This is already the fleet's clock. Two facts make it the whole answer:
 1. **No module anywhere does `from .db import now`** — zero hits across `src/jarvis`. Every
    production read goes through the module attribute, so a single
    `monkeypatch.setattr("jarvis.db.now", c)` moves all of it at once.
-2. **Neo confirmed (question 1759) that the guard flags raw `time.time()` in tests and does
-   NOT flag `db.now()`.** `db.now()` is the sanctioned clock.
+2. **The guard does not flag `db.now()`.** `db.now()` is the sanctioned clock (Neo,
+   question 1759).
+
+What the guard DOES flag, read from `tests/test_clock_hygiene.py` on
+`origin/worktree-wo-059520b9` — this is wider than "raw `time.time()`" and the difference
+matters:
+
+```python
+REAL_CLOCK_READS = frozenset({
+    "time.time", "time.monotonic", "time.sleep",
+    "datetime.now", "datetime.utcnow", "date.today",
+})
+```
+
+Three mechanical facts about it, all load-bearing:
+
+* **It walks the AST, not lines.** A `time.time()` inside a docstring or a comment is not a
+  read. Several files that a grep reports as offenders are clean — `tests/test_message_stuck.py`
+  is the clearest case, where every hit is prose in a docstring. **The `ALLOWED` dict is the
+  authoritative population; a grep is not.**
+* **`time.monotonic` and `time.sleep` are flagged**, which is why class-3 files are on
+  `ALLOWED` at all and why they stay there for ever. A class-3 file never becomes "clean" —
+  it becomes correctly *reasoned*.
+* **It resolves imports**, so `import time as t` and `from time import sleep` are caught too.
+
+Two guard assertions govern the end state:
+
+* `test_allowed_has_no_stale_entries` — an `ALLOWED` entry whose file no longer reads the
+  real clock **fails**. The list is shrink-only: when you finish converting a file you must
+  DELETE its entry, not blank it.
+* `test_allowed_reasons_name_their_class` — every reason must match
+  `^class (2|3) — .+`. See section 0.8 on what this means for class 4.
 
 So the per-function design decision this feature was created to make has one answer almost
 everywhere: **convert the raw `time.time()` age read to `db.now()`.** It is one line per
@@ -82,12 +140,46 @@ injectable. It is not, when the caller omits the argument — which is the commo
 
 Every one of these defaults becomes `db.now()`. Section 6 owns all nine.
 
-### 0.5 The census
+### 0.5 The population: the guard's own `ALLOWED` dict
 
-Measured on this branch, 2026-10-15, counting raw `time.time()` under `tests/` — the
-population the guard flags:
+**47 entries**, read from `tests/test_clock_hygiene.py` on `origin/worktree-wo-059520b9`
+(PR #1068, open at the time of writing). This dict — not any grep — is the population, and
+each entry carries one of three reason constants:
 
-**182 sites across 40 files.**
+| Reason | Entries | What it means | End state |
+|---|---|---|---|
+| `_BACKDATED` (class 2) | 28 | rows back-dated with `time.time()`; the code under test reads `time.time()` itself | **entry deleted** — except the 2 with a class-4 residue (0.8a), whose reason becomes class 4 |
+| `_BOTH` (class 2 + 3) | 9 | both of the above and a spin-wait | **reason becomes `_SPIN`** |
+| `_SPIN` (class 3) | 10 | monotonic-deadline / `time.sleep` spin-waits on real threads and subprocesses | **unchanged, for ever** |
+
+So the work is: **26 entries leave the dict, 9 are re-reasoned down to class 3, 2 are
+re-reasoned to class 4, 10 are confirmed and left alone.** Section 0.7 is exactly that and
+nothing more.
+
+Sections 1-7 partition all 47 entries. Each section owns its files completely and no file
+appears twice:
+
+| § | `ALLOWED` entries owned |
+|---|---|
+| 1 | `test_scheduler` |
+| 2 | the 10 `_SPIN` files, plus `test_auth_resume`, `test_config_reload`, `test_turn_transport`, `test_uncollected_task_block`, `test_worker_session` |
+| 3 | `test_health_sweep` |
+| 4 | `test_background_orphan`, `test_live`, `test_invariants`, `test_investigation_orders`, `test_turn_usage`, `test_budget`, `test_budget_blind_spot`, `test_ui_cost`, `test_scheduled_actor`, `test_repair_resettle` |
+| 5 | `test_rate_limit_retry`, `test_usage_window_is_account_wide`, `test_transport_resilience`, `test_validation_usage_limit`, `test_fleet_cap`, `test_ui_fleet_brake`, `test_parked_retry` |
+| 6 | `test_validation_ci_hold`, `test_validation_auth_hold`, `test_validation_void`, `test_validation_release_skip`, `test_precheck_before_the_panel`, `test_feature_validation` |
+| 7 | `test_release_staging`, `test_ui_observability`, `test_base_red`, `test_release_red_defer`, `test_ui_wiring`, `test_uilog`, `test_nav_volume` |
+
+**Some files named in a section below are NOT on `ALLOWED`** — `tests/test_parked_work.py`,
+`tests/test_evolution_report.py`, `tests/test_message_stuck.py`. They are
+already clean by the guard's reckoning, because they use `db.now()` or their hits are
+docstring prose. Where a section still owns one, the reason is stated there and it is never
+"the guard flags it".
+
+### 0.5a Site shape
+
+For scale rather than for scope: roughly 180 flagged call sites across those 47 files. The
+shape that matters is that **most are fixture stamp construction, not clock reads under
+test.**
 
 The important shape, and the reason this feature is cheaper than it looks: **most sites are
 fixture stamp CONSTRUCTION, not clock reads under test.** `time.time() - 60` building a
@@ -126,8 +218,15 @@ owns the exemption mechanism either way, and is the only section that may touch 
 
 ### 0.7 Done, for the feature as a whole
 
-The guard's exemption set contains only class-3 and class-4 files, each with its reason
-recorded next to it, and every convertible file has left it.
+**No remaining exemption has a class-2 reason.** Concretely: 26 of the 28 `_BACKDATED`
+entries are deleted, the 9 `_BOTH` entries read `_SPIN`, the 10 `_SPIN` entries are
+unchanged, and the two `_BACKDATED` entries with a measured class-4 residue —
+`tests/test_uncollected_task_block.py` and `tests/test_release_staging.py`, section 0.8a —
+end with a class-4 reason, not a class-2 one. `uv run pytest tests/test_clock_hygiene.py -q` passes throughout, including
+`test_allowed_has_no_stale_entries`.
+
+This is **not softened to "the risky ones"** — see section 0.1, consequence 3. Every class-2
+entry is equally worth removing because every one is equally readable as an example.
 
 **This is a feature-close check, not a child's acceptance criterion.** No single child can
 evaluate it — it is true only of the union of the seven pull requests, and it cannot be
@@ -148,10 +247,13 @@ the same shape in `test_supervisor`, `test_validation_loop`, `test_turn_transpor
 `test_remedies`, `test_wo_fix`, `test_feature_validation`, `test_forced_validation`,
 `test_rejudge_moved_head`, `test_alarm_escalation`, `test_config_reload`.
 
-**Class 4 — new, legitimised by Neo in answer to question 1759, and this feature owns
-enumerating it.** A test comparing an in-process instant against a stamp written by the
-KERNEL or by the fake-claude SUBPROCESS. No fake clock can reach either, because neither
-reads the patched attribute. The hazard is already documented in four places in the tree:
+**Class 4 — legitimised by Neo (question 1759). The guard's reason regex does not admit it
+yet; section 2 widens it to `^class (2|3|4) — ` and owns the one reason constant. No other
+section invents a second spelling — see section 0.8a.**
+
+A test comparing an in-process instant against a stamp written by the KERNEL or by a
+SUBPROCESS. No fake clock can reach either, because neither reads the patched attribute. The
+hazard is documented in several places in the tree:
 
 | Site | Why no fake clock reaches it |
 |---|---|
@@ -164,6 +266,42 @@ reads the patched attribute. The hazard is already documented in four places in 
 
 Section 2 enumerates class 4 with a reason per file. No other section may add to it: a child
 that believes it has found a new class-4 site reports it rather than exempting itself.
+
+### 0.8a The class-4 gap — measured, and only three files
+
+I ran the guard's own `real_clock_reads()` over every candidate rather than guessing. Two of
+the files I had provisionally called class 4 are not, and the genuine residue is **three**:
+
+| File | `ALLOWED` | Residue after class-2 conversion | Class-3 claim available? |
+|---|---|---|---|
+| `test_config_reload.py` | `_BOTH` | 6 × `os.utime(path, (time.time() + 1, …))` at `:76, :186, :222` — forging an mtime for a real `stat()` | File stays for its spin-waits, but the `os.utime` reads are **not** spin-waits |
+| `test_uncollected_task_block.py` | `_BACKDATED` | `:147, :148, :269` — real elapsed assertions; `:104` converts | **No** — no spin-wait in the file at all |
+| `test_release_staging.py` | `_BACKDATED` | `:593, :606` — the `$(date +%s)` sandwich (section 7); the other 13 convert | **No** — no spin-wait in the file at all |
+
+Corrections to my earlier reading, which the measurement settled:
+
+* `test_auth_resume.py` has exactly **one** read, `:70 ended = time.time()`. That is ordinary
+  class 2 and converts. It is **not** class 4.
+* `test_ui_observability.py`, `test_turn_transport.py` and `test_worker_session.py` all carry
+  `time.sleep`/`time.monotonic`, so each has an honest class-3 claim and resolves as `_SPIN`.
+  `test_ui_observability.py:429-430` is literally a `while time.time() < deadline:`
+  spin-wait.
+
+So for `test_uncollected_task_block.py` and `test_release_staging.py` the done-when is
+unreachable while the reason regex is `^class (2|3) — `: their class-2 reason must go, no
+class-3 claim is available, and `test_allowed_has_no_stale_entries` forbids leaving a blank
+entry. The worker's only options would be to lie — call a kernel stamp a spin-wait — or to
+leave the entry class 2 and miss the done-when.
+
+**Resolved: the regex grows.** `^class (2|3|4) — ` and a fourth reason constant whose text
+names the kernel/subprocess stamp. Neo's answer to question 1759 gave class 4 "the same
+standing as class 3", and an exempt class the guard's own reason check refuses has no
+standing at all. The alternative — broadening class 3's text from "spin-waits" to "a fake
+clock cannot reach it" — is cheaper and rejected: `kn-5e6af711` turns on the marker naming
+the right **why**, and "another thread must run" and "a shell `date +%s` wrote this" are
+different whys. **Section 2 makes this change**, as the only section that touches the
+exemption mechanism; section 7 consumes it. The regex still refuses `class 2`, so the
+done-when is unchanged and unsoftened: nothing stays exempt for back-dating.
 
 ### 0.9 Sites that stay real, and why
 
@@ -183,10 +321,17 @@ Sections 3-7 are dispatched into fresh sessions that cannot see section 1's pull
 read. The names are therefore fixed in this spec and every section uses them verbatim.
 Section 1 implements exactly this surface in `src/jarvis/testing.py`:
 
+**The fixture MUST be named `clock`, and that is not a style preference.** The guard's
+`fakes_db_now()` returns True as soon as a test function has a parameter named `clock`
+(`tests/test_clock_hygiene.py`), so the name is already load-bearing in assertion A. A
+differently-named fixture would make every test using it invisible to the guard's flake
+check.
+
 ```python
 TEST_EPOCH = 1760000000.0          # 2025-10-09T07:33:20Z — a constant, never time.time()
 
-clock                              # the pytest fixture; NOT autouse
+clock                              # the pytest fixture; NOT autouse; the name is fixed by
+                                   #   the guard's fakes_db_now()
 clock.at                           # the current fake instant, a float
 clock.advance(seconds)             # move it forward; SECONDS, positional, no default
 clock.ticking()                    # every subsequent read is strictly later than the last
@@ -219,19 +364,27 @@ If a section finds this surface insufficient, it reports that — it does not ex
 
 ### 0.11 How every section proves itself
 
-The guard from `wo-059520b9` may not be on `main` when you start, so none of these name it.
-All of them run today.
+**Run the guard itself — it is the authority.** `tests/test_clock_hygiene.py` arrives with
+PR #1068; if it is on your base, `uv run pytest tests/test_clock_hygiene.py -q` is the
+primary criterion and the rest of this section is corroboration. Its
+`test_allowed_has_no_stale_entries` is what forces you to DELETE a converted file's entry
+rather than blank it.
 
-**Residual sites in your own files.** The pattern deliberately excludes
-`time.monotonic()` and `time.sleep(` — those are class-3 and must survive:
+**Enumerate residual sites with the guard's own helper, not with grep.** The guard walks the
+AST, so a `time.time()` in a docstring is not a read and `rg` over-reports — that is how
+`tests/test_message_stuck.py` came to look like an offender when it is clean:
 
-```bash
-rg -n -e 'time\.time\(\)' -e 'time\.localtime\(\)' -e 'datetime\.now\(\)' -e 'datetime\.utcnow\(\)' <your files>
+```python
+# python -I, from the repo root
+import ast
+from tests.test_clock_hygiene import real_clock_reads
+print(real_clock_reads(ast.parse(open("tests/test_foo.py").read())))
 ```
 
-Done when every line this still prints is a class-3 or class-4 site carrying a
-`# clock-exempt: <reason>` comment, and your PR lists each remaining hit as
-`path:line — class 3|4 — reason`. It is an enumeration to defend, not a number to hit.
+Done when every site this still prints is one you can name and defend, and your PR lists each
+remaining hit as `path:line — class N — reason`. It is an enumeration to defend, not a number
+to hit. Remember `time.monotonic` and `time.sleep` are flagged reads too, so a class-3 file
+never prints empty — it prints only spin-waits.
 
 **You may not ADD a raw clock read.** This is what catches a worker "preserving behaviour"
 in a new helper, and catches section 1 seeding its epoch from the wall clock:
@@ -261,13 +414,12 @@ RED. Revert. Quote in the PR: the line you mutated, the test that failed, and th
 of the failure. **A section whose mutation check stays green has shipped a vacuous test,
 whatever the suite says.** Each section below names its own mutation.
 
-**Three things that cannot be proven by a test, so do not invent one.** Section 0.7 is a
-feature-close check over all seven PRs. A class-3 exemption is a negative — that no fake
-clock could make another thread run — and the check is the reviewed evidence: your PR quotes
-the `time.monotonic()` or `time.sleep(` line each mark sits on, and a mark with no spin-wait
-on the quoted line is wrong. And `tests/test_knowledge_retrieval_eval_harness.py:539` has
-not been read closely by anyone; its criterion is an outcome, not an assertion — read it and
-its shim, then state the verdict and the reason in the PR.
+**Two things that cannot be proven by a test, so do not invent one.** Section 0.7 is a
+feature-close check over all seven PRs. And a class-3 or class-4 exemption is a negative —
+that no fake clock could reach the stamp — so the check is reviewed evidence, not an
+assertion: your PR quotes the `time.monotonic()` / `while ...: time.sleep(` line each
+class-3 mark sits on, and the kernel or subprocess call each class-4 mark sits on. A mark
+whose quoted line shows neither is wrong.
 
 ---
 
@@ -316,7 +468,7 @@ only the fixture.
 
 Prove it with a test file of the fixture's own, `tests/test_clock_fixture.py`. **Every
 assertion in it is against a LITERAL, never against another clock read** — that is what
-makes it trustworthy to the five sections downstream.
+makes it trustworthy to the four sections downstream.
 
 1. **The constant epoch, the property the whole feature turns on.** A test that does not
    request the fixture asserts the constant against a hard-coded number:
@@ -362,8 +514,9 @@ its existing `from jarvis.testing import (...)` block and reorder nothing.
 `jarvis.testing` still imports clean for every suite under the root `conftest.py`.
 
 Do **not** migrate the other four ad-hoc patchers. Section 3 owns them. This section stays
-small on purpose: five sections wait on its merge, and `waiting_pr_merge` does not satisfy a
-dependency edge, so every edge here is a real wall-clock wait.
+small on purpose: sections 3, 5, 6 and 7 wait on its merge, and `waiting_pr_merge` does not
+satisfy a dependency edge, so every edge here is a real wall-clock wait. Section 4 does
+**not** wait on it — see section 4.
 
 You also add the class-4 markers for the four exempt sites **in this file**, because you are
 the only work order permitted to edit it: `src/jarvis/testing.py:229, 317, 475` (inside the
@@ -390,12 +543,24 @@ parallel, gets six answers.
 
 Three jobs:
 
-1. **Settle the mechanism.** Per section 0.6, the intended shape is a marker comment in each
-   exempt file that the guard reads. If `wo-059520b9` merged a central allowlist instead,
-   convert it to markers here; this section is the only one that may touch the mechanism
-   either way. Read what the guard actually scans before assuming — `src/jarvis/testing.py`
-   is not under `tests/`, which is correct and necessary (its `FAKE_CLAUDE` string runs in
-   another process) but is also a loophole worth a comment in the guard.
+1. **Convert the mechanism from the central `ALLOWED` dict to per-file marker comments.**
+   `wo-059520b9` shipped the dict (PR #1068); you replace it. This section is the only one
+   that may touch the mechanism, and `wo-059520b9` set three invariants the conversion must
+   preserve:
+   - a reason must match `^class (2|3) — `, and **you widen it to `^class (2|3|4) — ` and add
+     a fourth reason constant naming the kernel/subprocess stamp** (section 0.8a says why, and
+     that widening is yours alone to make). `class 2` stays refused;
+   - **a marker on a file with no real-clock read must FAIL** — the equivalent of today's
+     `test_allowed_has_no_stale_entries`, which is what keeps the list shrink-only;
+   - **nothing is keyed by line.** Markers are per-file, not per-site, so a marker cannot go
+     stale against a line number.
+
+   Keep `test_unlisted_test_files_do_not_read_the_real_clock`,
+   `test_no_test_pairs_a_faked_clock_with_a_wall_clock_literal` and the AST machinery
+   (`real_clock_reads`, `fakes_db_now`, `_import_table`) intact — you are changing where the
+   exemption is stored, not what counts as a read. Note `src/jarvis/testing.py` is not under
+   `tests/` and so is outside the scan; that is correct and necessary, because its
+   `FAKE_CLAUDE` string runs in another process, but it is a loophole worth a comment.
 2. **Record class 3** from the enumeration in section 0.8, each file with the reason that
    applies to it. Convert nothing in these files.
 3. **Record class 4** from the table in section 0.8, each file with its own reason — the
@@ -407,22 +572,34 @@ those four markers itself. Your class-4 job covers the files on your list below 
 else. This is the one place where the work order defining a class does not record every
 instance of it.
 
-Files owned by this section, exhaustively: `tests/test_worker_session.py`,
-`tests/test_config_reload.py`, `tests/test_uncollected_task_block.py`,
-`tests/test_turn_transport.py`, `tests/test_knowledge_retrieval_eval_harness.py`,
-`tests/test_auth_resume.py`, and the class-3 files that carry no raw `time.time()` of their
-own: `tests/test_supervisor.py`, `tests/test_validation_loop.py`, `tests/test_remedies.py`,
-`tests/test_wo_fix.py`, `tests/test_forced_validation.py`,
-`tests/test_rejudge_moved_head.py`, `tests/test_alarm_escalation.py`.
+Files owned by this section, exhaustively — all 15 are `ALLOWED` entries.
+
+The **10 pure class-3 entries**, which stay on the list for ever and need only a confirmed
+reason: `tests/test_alarm_escalation.py`, `tests/test_forced_validation.py`,
+`tests/test_pr_recorded.py`, `tests/test_rejudge_moved_head.py`, `tests/test_remedies.py`,
+`tests/test_rules_tick.py`, `tests/test_seats.py`, `tests/test_supervisor.py`,
+`tests/test_validation_loop.py`, `tests/test_wo_fix.py`. Convert nothing in these.
+
+The **5 mixed entries**, where you convert the class-2 sites and settle the reason:
+`tests/test_auth_resume.py` (`_BACKDATED`, and it is **one** site — `:70
+ended = time.time()` — ordinary class 2 that converts; the entry is then DELETED),
+`tests/test_config_reload.py` (`_BOTH`), `tests/test_turn_transport.py` (`_BOTH`),
+`tests/test_uncollected_task_block.py` (`_BACKDATED`), `tests/test_worker_session.py`
+(`_BOTH`).
+
+`tests/test_config_reload.py`, `tests/test_turn_transport.py` and
+`tests/test_worker_session.py` all carry `time.sleep`/`time.monotonic`, so each has an honest
+class-3 claim and ends as `_SPIN`. `tests/test_uncollected_task_block.py` does not: convert
+`:104`, mark `:147`, `:148` and `:269` **class 4** under the widened regex, and quote in the
+PR what each of those three measures that a patched `jarvis.db.now` cannot reach.
+
+`tests/test_knowledge_retrieval_eval_harness.py` is **not** on `ALLOWED` and is therefore
+not yours. Dropped from this section.
 
 Within those files, class-3 and class-4 sites are marked and left alone; any site that is
 neither is converted per the section 0.5 recipe. `tests/test_uncollected_task_block.py` is
 the file where both appear together and the distinction is written out in its own comments at
 `:32-36` and `:141-147` — read them rather than guessing.
-
-`tests/test_knowledge_retrieval_eval_harness.py:539` names "the shim's `time.time()` and the
-sandbox's file mtimes" and may have a clock shim of its own. Determine whether it needs
-class-4 standing or ordinary conversion; it has not been read closely.
 
 ### 2.1 The false green: a mark that is not true
 
@@ -436,7 +613,7 @@ line is wrong.**
 
 Second false green: marking a whole FILE where only two sites are exempt, which silently
 exempts every site added later. So the marker sits on the site's own line or the line
-directly above it — never at module top, unless every site in the file is exempt. The seven
+directly above it — never at module top, unless every site in the file is exempt. The ten
 pure class-3 files qualify; `tests/test_uncollected_task_block.py` does not, because it has
 convertible sites too.
 
@@ -444,12 +621,13 @@ A duplicated reason string is a generic reason, and generic reasons are not acce
 Check it mechanically: `rg -o -N 'clock-exempt:.*' tests/ | sort | uniq -d` must print
 nothing.
 
-For the seven files that are pure class 3, the diff must be comment-only by construction:
+For the ten files that are pure class 3, the diff must be comment-only by construction:
 
 ```bash
 git diff -U0 origin/main -- tests/test_supervisor.py tests/test_validation_loop.py \
   tests/test_remedies.py tests/test_wo_fix.py tests/test_forced_validation.py \
   tests/test_rejudge_moved_head.py tests/test_alarm_escalation.py \
+  tests/test_pr_recorded.py tests/test_rules_tick.py tests/test_seats.py \
   | rg '^[+-]' | rg -v '^(\+\+\+|---)' | rg -v 'clock-exempt'
 ```
 
@@ -480,6 +658,15 @@ missed unit conversion fails immediately rather than being wrong by 60x.
 
 Files owned, exhaustively: `tests/test_health_sweep.py`, `tests/test_parked_work.py`,
 `tests/test_evolution_report.py`.
+
+Only `tests/test_health_sweep.py` is an `ALLOWED` entry (`_BOTH`); it ends as `_SPIN`, since
+its spin-waits at `:120-122` stay. **The other two are not on `ALLOWED` and the guard does
+not flag them** — `_rewind` and the `clock` fixture there already go through `db.now()`,
+which is the correct shape. They are in this section anyway, and the reason is
+de-duplication rather than hygiene: these are five copies of one artifact, and
+`tests/test_scheduler.py:34` cites `test_health_sweep`'s `_Clock` for its own rationale. A
+second competing `clock` fixture in the tree is exactly the "worked example a worker copies"
+that `kn-5e6af711` is about.
 
 What goes:
 
@@ -539,8 +726,20 @@ the production code already reads `db.now()`.
 Files owned, exhaustively: `tests/test_background_orphan.py`, `tests/test_live.py`,
 `tests/test_invariants.py`, `tests/test_investigation_orders.py`,
 `tests/test_turn_usage.py`, `tests/test_budget.py`, `tests/test_budget_blind_spot.py`,
-`tests/test_ui_cost.py`, `tests/test_config_version.py`, `tests/test_scheduled_actor.py`,
-`tests/test_repair_resettle.py`. Roughly 45 sites.
+`tests/test_ui_cost.py`, `tests/test_scheduled_actor.py`, `tests/test_repair_resettle.py`.
+All 10 are `ALLOWED` entries and this is the largest group.
+
+Nine are `_BACKDATED` and their entries are **deleted** when you finish.
+`tests/test_budget.py` is `_BOTH` and ends as `_SPIN` — it carries spin-waits you must not
+touch.
+
+`tests/test_config_version.py` is **not** on `ALLOWED` and has been dropped from this
+section.
+
+**This is the section section 0.1 is addressed to.** It is the most boring group in the
+feature and it is worth exactly as much as the subtlest one: ten files a worker can read and
+copy, which is the entire exposure `kn-5e6af711` describes. Do not treat "nothing here is
+failing" as licence to do a partial job.
 
 **This section changes no file under `src/jarvis/`.** If you find yourself needing to, the
 site belongs to another section — report it rather than reaching across the seam.
@@ -551,6 +750,11 @@ site belongs to another section — report it rather than reaching across the se
 rows through `db.now()`, so freezing it makes every row in a fixture simultaneous and any
 assertion that turns on one row preceding another goes vacuous while still passing.
 `git diff origin/main -- tests/ | rg '^\+.*clock'` must print nothing.
+
+**So this section has no dependency edge and starts immediately.** Every edit is the token
+swap `time.time()` to `db.now()`, which reads identically whether or not section 1 has
+merged. Making the largest, cheapest group wait a merge cycle on a fixture it must not use
+would buy nothing.
 
 The dominant shape, `tests/test_background_orphan.py` (19 sites, every one of them): a local
 `now = time.time()` passed straight into a `since=`/`until=` argument of
@@ -585,8 +789,8 @@ with `long_after = float(turn["ended_at"]) + 365*24*3600`. Those assertions must
 inequality-driven off the ROW's `ended_at` and not off a frozen clock. Quote them in the PR
 as unchanged.
 
-The residual-site command from section 0.11 must print nothing at all over your eleven
-files: none of them has an exempt site, so you add no marker comments.
+Nine of your ten `ALLOWED` entries are deleted outright. `tests/test_budget.py` keeps its
+entry, re-reasoned to class 3 for its spin-waits.
 
 ## 5 — Usage limits, rate-limit holds, the fleet brake
 
@@ -600,7 +804,11 @@ fixture is `clock` (not autouse), with `clock.at`, `clock.advance(seconds)`,
 Files owned, exhaustively: `tests/test_rate_limit_retry.py`,
 `tests/test_usage_window_is_account_wide.py`, `tests/test_transport_resilience.py`,
 `tests/test_validation_usage_limit.py`, `tests/test_fleet_cap.py`,
-`tests/test_ui_fleet_brake.py`, `tests/test_parked_retry.py`. Roughly 29 sites.
+`tests/test_ui_fleet_brake.py`, `tests/test_parked_retry.py`. All 7 are `ALLOWED` entries.
+
+Five are `_BACKDATED` and their entries are **deleted**.
+`tests/test_usage_window_is_account_wide.py` and `tests/test_validation_usage_limit.py` are
+`_BOTH` and end as `_SPIN` — leave their spin-waits alone.
 
 Production surface, exhaustively — the same expression in four places:
 
@@ -663,7 +871,15 @@ it and you must not edit that file. `TEST_EPOCH = 1760000000.0` is its constant 
 fixture is `clock` (not autouse), with `clock.at`, `clock.advance(seconds)`,
 `clock.ticking()` and `with clock.moved(seconds):`.
 
-Files owned, exhaustively: `tests/test_message_stuck.py`, `tests/test_validation_ci_hold.py`,
+Files owned, exhaustively — six are `ALLOWED` entries plus
+`tests/test_message_stuck.py`, which is **not** on `ALLOWED` (every `time.time()` in it is
+docstring prose, including the `:140-146` passage this section quotes). It is yours because
+it is where the asymmetry is documented and tested, not because the guard flags it.
+
+Five are `_BACKDATED` and their entries are **deleted**;
+`tests/test_feature_validation.py` is `_BOTH` and ends as `_SPIN`.
+
+`tests/test_message_stuck.py`, `tests/test_validation_ci_hold.py`,
 `tests/test_validation_auth_hold.py`, `tests/test_validation_void.py`,
 `tests/test_validation_release_skip.py`, `tests/test_precheck_before_the_panel.py`,
 `tests/test_feature_validation.py`. Roughly 18 sites.
@@ -797,7 +1013,22 @@ string**: call `invariants.clock` on both sides of the comparison, as
 
 Files owned, exhaustively: `tests/test_release_staging.py`, `tests/test_ui_observability.py`,
 `tests/test_base_red.py`, `tests/test_release_red_defer.py`, `tests/test_ui_wiring.py`,
-`tests/test_uilog.py`, `tests/test_nav_volume.py`. Roughly 32 sites.
+`tests/test_uilog.py`, `tests/test_nav_volume.py`. All 7 are `ALLOWED` entries.
+
+Six are `_BACKDATED`. Five of those entries are **deleted**.
+`tests/test_ui_observability.py` is `_BOTH` and ends as `_SPIN`: its `:429-430`
+`while time.time() < deadline:` is a genuine spin-wait and `:474-476` measures real elapsed
+time to prove the dashboard answers while wedged — both stay, while the other six sites in
+that file convert.
+
+`tests/test_release_staging.py` is one of the three class-4 residue files (section 0.8a).
+Thirteen of its fifteen sites convert; `:593` and `:606` cannot, and the file has no
+spin-wait, so no class-3 claim is available to it. Convert the thirteen and mark those two
+**class 4** — `scripts/shipit.sh:474-475` stamps `staged_at` from a shell `date +%s`, which
+no patched Python attribute can reach. The `class 4 — ` spelling and the
+widened reason regex are **already merged by section 2**, which is why this section waits on
+it; use that spelling verbatim rather than a second one of your own, and never call the
+`$(date +%s)` sandwich a spin-wait.
 
 Production surface: `src/jarvis/ui/app.py:193, 209`, `src/jarvis/cli.py:446`,
 `src/jarvis/nav_volume.py:393`, `src/jarvis/wiring.py:239, 273, 276, 325`,
