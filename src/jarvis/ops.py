@@ -9678,8 +9678,9 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
     """
     from . import bus, holds, stuck, worker_session
     from .health import observer_kinds
-    from .project_store import (FO_ID_PREFIXES, UNGOVERNED_ORIGINS,
-                                VALIDATION_CI_CAUSE, validation_ci_hold_spans,
+    from .project_store import (FO_ID_PREFIXES, PLAN_ASSUMPTION_EVENT_KINDS,
+                                UNGOVERNED_ORIGINS, VALIDATION_CI_CAUSE,
+                                plan_hold_spans, validation_ci_hold_spans,
                                 validation_hold)
     from .worker_session import PAUSE_USAGE_LIMIT
 
@@ -9713,9 +9714,34 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                 until, cause = validation_hold(events, int(latest["round"]))
                 ci_held = cause == VALIDATION_CI_CAUSE and until > now
             ci_spans = validation_ci_hold_spans(events, since, now)
+        # A CHILD HELD BY ITS FEATURE'S UNRATIFIED PLAN IS NOT STUCK (§2.3 and §2.4 of
+        # docs/superpowers/specs/2026-10-15-a-child-held-by-its-features-unratified-plan-
+        # is-not-stuck.md). `pending` ONLY: the claim rule withholds a DISPATCH, so a
+        # child already running is not held by it. The DISCOUNT is computed from the
+        # planner's history whether or not the hold still stands — that is the whole
+        # point of it — while the EXCLUSION reads `plan_hold`, the one predicate pinned
+        # to the claim SQL (§2.2). The reads are paid by pending feature children and by
+        # nothing else: the gate is the set `plan_hold` would query for at all.
+        plan_held, plan_spans = False, []
+        if (wo["status"] == "pending" and wo.get("parent_id")
+                and wo.get("kind") == "worker"):
+            plan_held = bool(pstore.plan_hold(wo))
+            try:
+                planner_id = pstore.get_feature_order(
+                    str(wo["parent_id"])).get("plan_wo_id")
+            except KeyError:
+                planner_id = None  # the feature was deleted out from under the child
+            if planner_id:
+                # `events_of_kind` takes ONE kind, so the three are concatenated and
+                # re-sorted: the walk is only right in `ts` order (§2.3).
+                plan_spans = plan_hold_spans(
+                    sorted((e for k in PLAN_ASSUMPTION_EVENT_KINDS
+                            for e in pstore.events_of_kind(str(planner_id), k)),
+                           key=lambda e: float(e["ts"])), since, now)
         # The UNION and never the sum: a usage window can shut while CI runs (§4).
         discounted = holds.union_seconds(
-            [(max(h.started, since), min(h.finish(now), now)) for h in usage] + ci_spans)
+            [(max(h.started, since), min(h.finish(now), now)) for h in usage]
+            + ci_spans + plan_spans)
         # §2.2 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md.
         edges = (pstore.unfinished_dependencies(wo["id"])
                  if wo["status"] == "pending" else [])
@@ -9742,7 +9768,10 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
             excluded_cause=(PAUSE_USAGE_LIMIT
                             if window or any(h.open for h in usage)
                             else VALIDATION_CI_CAUSE if ci_held
-                            else stuck.LIVE_DEPENDENCY if live_edges else ""),
+                            else stuck.LIVE_DEPENDENCY if live_edges
+                            # LAST in the chain, §2.4: a fleet fact outranks a fact
+                            # about one feature's plan.
+                            else stuck.PLAN_ASSUMPTION_CAUSE if plan_held else ""),
             kind=str(wo.get("kind") or "worker"),
             exempt_kinds=tuple(cfg.exempt_kinds),
             by_design_idle=by_design_idle,
@@ -9753,9 +9782,14 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         out.append({
             "project": project_name, "wo": wo, "verdict": verdict,
             # The outstanding-child note before the empty answer: one formatter shared
-            # with `status_label`, so the row and the listing cannot drift.
+            # with `status_label`, so the row and the listing cannot drift. The plan
+            # hold rides there too — §1(2) of the 2026-10-15 spec: this column read
+            # "nothing the record can name" while `status_label` on the SAME row named
+            # the hold and the review command.
             "blocker": (blocker[0] if blocker
                         else invariants.outstanding_children_note(pstore, wo)
+                        or invariants.plan_hold_note(
+                            pstore.plan_hold(wo) if plan_held else None)
                         or "nothing the record can name"),
             "status_label": invariants.status_label(pstore, wo),
             "since": since, "activity": durations.last_activity_ts or since,

@@ -1811,6 +1811,23 @@ def fleet_hold_note(wo: dict[str, Any], fleet: Fleet | None) -> str:
     return fleet.blocked()
 
 
+def plan_hold_note(hold: dict[str, Any] | None) -> str:
+    """One sentence for a `ProjectStore.plan_hold` row, `""` for no hold.
+
+    ONE HOME, TWO READERS (kn-432d0f19): `status_label` and the sweep's blocker column
+    (`ops.stuck_scan`) both print it, and §1(2) of docs/superpowers/specs/2026-10-15-a-
+    child-held-by-its-features-unratified-plan-is-not-stuck.md is what happens when they
+    each compose their own — one row saying "nothing the record can name" beside one
+    naming the plan and the review command.
+    """
+    if not hold:
+        return ""
+    n = hold["n"]
+    return (f"blocked by {hold['fo_id']}'s plan ({n} "
+            f"assumption{'' if n == 1 else 's'} await{'s' if n == 1 else ''} your "
+            f"review — `jarvis wo review {hold['planner_id']}`)")
+
+
 def status_label(store: ProjectStore, wo: dict[str, Any],
                  fleet: Fleet | None = None) -> str:
     """How this work order's status should read to a human.
@@ -1913,12 +1930,9 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
     # themselves, and this one clears only when a person rules on the plan. Of the three
     # true sentences it is the one naming a move (spec §2.3). Flagless — `true_blockers`
     # gets no branch, so INV-ATTENTION-MISSING stays quiet without an exception.
-    hold = store.plan_hold(wo)
-    if hold:
-        n = hold["n"]
-        return (f"pending — blocked by {hold['fo_id']}'s plan ({n} "
-                f"assumption{'' if n == 1 else 's'} await{'s' if n == 1 else ''} your "
-                f"review — `jarvis wo review {hold['planner_id']}`)")
+    note = plan_hold_note(store.plan_hold(wo))
+    if note:
+        return f"pending — {note}"
     blockers = store.unfinished_dependencies(wo["id"])
     if blockers:
         return f"pending — blocked by {', '.join(dep['id'] for dep in blockers)}"
