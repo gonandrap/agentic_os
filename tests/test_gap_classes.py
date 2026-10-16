@@ -51,6 +51,16 @@ def test_by_invariant_skips_the_classes_with_no_detector_yet():
     assert inverse == {c.detector: c.id for c in gaps.GAP_CLASSES.values() if c.detector}
 
 
+def test_the_unwired_precondition_class_is_the_only_one_with_a_detector():
+    """§2.5 of docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md:
+    the first entry in this registry to ship a real detector."""
+    armed = {slug for slug, c in gaps.GAP_CLASSES.items() if c.detector}
+    assert armed == {"unwired-precondition"}
+    assert (gaps.by_invariant()["INV-PRECONDITION-UNWIRED"]
+            == "unwired-precondition")
+    assert gaps.GAP_CLASSES["unwired-precondition"].remedy == gaps.REMEDY_NONE
+
+
 def test_render_registry_names_every_shipped_class():
     text = gaps.render_registry()
     for slug, cls in gaps.GAP_CLASSES.items():
