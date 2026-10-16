@@ -1886,6 +1886,18 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
             return f"{wo['status']} — {note}"
     if wo["status"] != "pending":
         return wo["status"]
+    # FIRST of the four pending answers: of them it is the only one that may never clear
+    # without a person, and it is the condition the order was CREATED with — §2.7 of
+    # docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md. Flagless
+    # like the three below: `true_blockers` gets no branch, so INV-ATTENTION-MISSING stays
+    # quiet without an exception.
+    held = store.open_preconditions(wo["id"])
+    if held:
+        refs = ", ".join(row["ref"] for row in held)
+        notes = "; ".join(row["note"] for row in held if row["note"])
+        label = (f"pending — held until {refs} clears "
+                 f"(`jarvis wo unblock {wo['id']}`)")
+        return f"{label} — {notes}" if notes else label
     # ABOVE the dependency and slot labels, inverting their order: those two clear
     # themselves, and this one clears only when a person rules on the plan. Of the three
     # true sentences it is the one naming a move (spec §2.3). Flagless — `true_blockers`
@@ -5319,6 +5331,46 @@ def _tracked_with_basename(root: Path, ref: str, name: str) -> list[str]:
     return sorted(p for p in out.stdout.split("\0") if p and Path(p).name == name)
 
 
+INV_PRECONDITION_UNWIRED = "INV-PRECONDITION-UNWIRED"
+
+
+def check_precondition_is_wired(store: ProjectStore) -> Iterator[Violation]:
+    """INV-PRECONDITION-UNWIRED — a brief that says "do not start" must be held by state.
+
+    §2.5 of docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md. The
+    population is exactly the set the creation refusal cannot reach: orders that predate
+    it, planner children, and anything the OS filed itself.
+
+    **`owed` stays EMPTY, and that is a ruling, not an omission.** `Daemon.check_invariants`
+    computes `routed = bool(v.owed and v.wo_id)` and a routed violation derives its reason
+    from `true_blockers` while SUPPRESSING the notification — so with no `true_blockers`
+    branch (§2.7 gives it none) a non-empty `owed` here would mean no flag AND no
+    notification, a silent check. Empty `owed` with `wo_id` set gives one timeline event
+    plus one notification per standing violation, and no attention flag.
+
+    Nothing is repaired: only the order's AUTHOR knows whether the sentence names a real
+    hold to wire or stale text to delete (`REMEDY_NONE`, kn-a816ddf6).
+    """
+    from . import preconditions
+
+    for wo in store.list_work_orders(statuses=OPEN_STATUSES, include_hidden=True):
+        matched = preconditions.states_hold(wo["title"], wo["description"] or "")
+        if not matched:
+            continue
+        if store.dependencies(wo) or store.open_preconditions(wo["id"]):
+            continue
+        yield Violation(
+            invariant=INV_PRECONDITION_UNWIRED,
+            wo_id=wo["id"],
+            detail=f"its brief states a stop condition — \"{matched}\" — and nothing "
+                   f"holds it back, so the claim takes it: wire the hold "
+                   f"(`--blocked-by`/`--depends-on` at creation) or delete the sentence",
+            repaired=False,
+            owed="",
+            context={"matched": matched},
+        )
+
+
 INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_default_branch_green,    # first and order-free: a pure read of the central
                                    # reading, repairing nothing and touching no flag any
@@ -5344,6 +5396,9 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                    # same `true_blockers[0]`, so the flag goes up once
     check_blocked_work_is_surfaced,
     check_attention_has_reason,
+    check_precondition_is_wired,   # order-free: a pure read that repairs nothing, raises
+                                   # no flag and writes no status, so nothing else in the
+                                   # tuple reads its output
     check_pull_request_recorded,   # order-free: a pure timeline read that repairs
                                    # nothing and touches no flag. NOT a SLOW_INVARIANT —
                                    # it asks the record, never the repository

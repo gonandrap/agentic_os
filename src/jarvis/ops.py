@@ -709,6 +709,8 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                          # the store open, so every surface reading os_status gets the
                          # same answer as `jarvis wo list` instead of deriving its own.
                          "blocked_by": blocked_by(store, wo),
+                         # Same rule for the other kind of hold — §2.7.
+                         "preconditions": open_preconditions(store, wo),
                          # Same rule, for the other reason a work order can be sitting
                          # still: the transport dropped its turn — the usage limit, or
                          # the API failing — and it retries itself at N.
@@ -897,6 +899,7 @@ def create_work_order(project_name: str, title: str, description: str = "",
                       append_system_prompt: str | None = None,
                       backlog_id: str | None = None,
                       depends_on: list[str] | None = None,
+                      blocked_by: list[str] | None = None,
                       parent_id: str | None = None,
                       issue_url: str | None = None,
                       issue_priority: str | None = None,
@@ -931,11 +934,38 @@ def create_work_order(project_name: str, title: str, description: str = "",
     normalises them, and in particular nothing reads `description` for them: a structural
     decision taken from free text is kn-5d8a396a, and here it would decide whether a
     validation round is paid for. An empty `gap_class` is the ordinary case.
+
+    `blocked_by` is the same shape one mechanism over — §2.3 of
+    docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md. Each ref is a
+    PRECONDITION row the claim SQL evaluates, passed straight through: nothing here
+    derives, guesses or normalises it beyond stripping whitespace, and nothing reads
+    `description` for it.
     """
+    from . import preconditions
+
     paths = registered_project_paths()
     if project_name not in paths:
         raise OpsError(f"project {project_name!r} not registered "
                        f"(known: {sorted(paths)}). Run `jarvis start` first.")
+    try:
+        holds = [preconditions.checked_ref(ref) for ref in (blocked_by or [])]
+    except preconditions.PreconditionError as e:
+        raise OpsError(f"cannot create this work order: {e}") from e
+    # THE REFUSAL, before the store is even opened, so a refused order leaves no row. A
+    # brief that states a stop condition and is held by nothing would be claimed and
+    # dispatched (§2.4) — and this is a refusal and NEVER an attachment: a ref invented
+    # from prose is the whole defect.
+    stated = preconditions.states_hold(title, description)
+    if stated and not (depends_on or holds):
+        raise OpsError(
+            f"cannot create this work order: its brief states a stop condition — "
+            f"\"{stated}\" — and nothing holds it back, so jarvisd would claim and "
+            f"dispatch it (wo-314221b5 cost 0.93 USD this way). Wire the hold: "
+            f"`--depends-on <wo-id>` when another work order in this project must "
+            f"COMPLETE first, or `--blocked-by <bl-…|kn-…|io-…|#issue|text>` when it "
+            f"waits on something that is not a work order. The brief may keep the "
+            f"sentence either way."
+        )
     store = ProjectStore(paths[project_name])
     try:
         if parent_id:
@@ -968,6 +998,11 @@ def create_work_order(project_name: str, title: str, description: str = "",
             gap_class=gap_class, detector_id=detector_id,
             remedy_rule_id=remedy_rule_id, trigger_wo_id=trigger_wo_id,
         )
+        # AT CREATION with the store still open, never as a follow-up write: the daemon
+        # can claim the new row before a second statement lands, and a hold that arrives
+        # after the claim is no hold (§2.3).
+        for ref in holds:
+            store.add_precondition(wo["id"], ref)
         # AT CREATION, from the brief the order is actually given — the only moment at
         # which "this order points at that issue" is a fact rather than an inference.
         record_issue_references(store, paths[project_name], wo)
@@ -991,6 +1026,17 @@ def blocked_by(store: ProjectStore, wo: dict[str, Any]) -> list[dict[str, Any]]:
     if not store.dependencies(wo):
         return []
     return store.unfinished_dependencies(wo["id"])
+
+
+def open_preconditions(store: ProjectStore, wo: dict[str, Any]) -> list[dict[str, Any]]:
+    """The explicit holds still standing on this work order — §2.7.
+
+    `blocked_by`'s sibling, and derived HERE rather than per surface: every reader gets
+    one answer. One probe of `idx_preconditions_open` per row, which is why that index
+    exists; `blocked_by` itself is NOT widened to return these, because its entries are
+    rendered as work order links and a precondition there is a dead link.
+    """
+    return store.open_preconditions(wo["id"])
 
 
 def fleet_if_held(wos: Iterable[dict[str, Any]]) -> "fleet.Fleet | None":
@@ -1550,6 +1596,15 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
     # nudge" and "nothing is running to nudge": true, useless, and confidently wrong about
     # the way through. A nudge cannot move this; the user's ruling on the PLANNER can, so
     # `stalled` stays False (spec 2026-09-24-a-planner-assumption-holds-its-feature §2.3).
+    # ABOVE the plan hold and both catch-alls, on `status_label`'s ranking: a nudge
+    # cannot move an order that was told not to start, and `jarvis wo unblock` can —
+    # §2.7.
+    rows = open_preconditions(store, wo)
+    if rows:
+        refs = ", ".join(row["ref"] for row in rows)
+        return {"what": "precondition", "stalled": False,
+                "detail": f"it was told not to start until {refs} clears — "
+                          f"`jarvis wo unblock {wo_id}` cuts the hold"}
     hold = store.plan_hold(wo)
     if hold:
         return {"what": "plan_assumptions", "stalled": False,
@@ -8401,13 +8456,21 @@ def hide_work_order(wo_id: str, hidden: bool = True,
 
 def unblock_work_order(wo_id: str, drop_all: bool = False,
                        project_name: str | None = None) -> dict[str, Any]:
-    """Cut the dependency edges holding a pending work order back.
+    """Cut the dependency edges and the precondition rows holding a pending order back.
 
     By default only the edges that can never clear — a dependency cancelled, failed or
     deleted — because those are the ones that strand it; a dependency still working is
     doing exactly what the edge was drawn for and releasing the dependent early would
     hand it a worktree without the code it was told to build on. `drop_all` is the
     override for a user who wants it to run anyway, and says so.
+
+    EXTENDED rather than duplicated for the second kind of hold — §2.6 of
+    docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md: the command
+    already means "cut what is holding this order back", and a second command for a
+    second kind of hold is two things to remember and two to forget. The default clears
+    every precondition the daemon can NEVER clear — every non-`bl-` ref, and a `bl-` ref
+    resolving to no central row — which is the same criterion the dependency default uses.
+    `--all` additionally clears a `bl-` row whose backlog item is still open.
     """
     from . import invariants
 
@@ -8415,24 +8478,47 @@ def unblock_work_order(wo_id: str, drop_all: bool = False,
     store = ProjectStore(path)
     try:
         blockers = store.unfinished_dependencies(wo_id)
-        if not blockers:
+        rows = store.open_preconditions(wo_id)
+        if not blockers and not rows:
             raise OpsError(f"{wo_id} is not blocked by anything")
         cut = blockers if drop_all else invariants.dead_dependencies(store, wo)
-        if not cut:
+        live, stranding = _split_preconditions(rows)
+        clearable = stranding + (live if drop_all else [])
+        if not cut and not clearable:
             raise OpsError(
                 f"{wo_id} is waiting on work that is still live "
-                f"({', '.join(d['id'] for d in blockers)}), not stranded. "
+                f"({', '.join([d['id'] for d in blockers] + live)}), not stranded. "
                 f"Pass --all to cut those edges anyway."
             )
+        cleared = store.clear_preconditions(wo_id, clearable, by="user")
         remaining = store.drop_dependencies(wo_id, [d["id"] for d in cut])
         # The stranding was the blocker; with the edge gone the work order is ordinary
         # pending again, and leaving the flag up would keep asking about a settled thing.
+        # Keyed on dependencies alone: a precondition never raised a flag (§2.7), so
+        # there is nothing to lower.
         if not remaining:
             store.clear_attention(wo_id)
     finally:
         store.close()
     return {"project": name, "wo_id": wo_id, "title": wo["title"],
-            "dropped": [d["id"] for d in cut], "still_blocked_by": remaining}
+            "dropped": [d["id"] for d in cut], "still_blocked_by": remaining,
+            "preconditions_cleared": cleared}
+
+
+def _split_preconditions(rows: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+    """(live, stranding) refs — what the daemon can still clear, and what it never can."""
+    live: list[str] = []
+    stranding: list[str] = []
+    central = CentralStore()
+    try:
+        for row in rows:
+            ref = str(row["ref"])
+            item = central.get_backlog(ref) if ref.startswith("bl-") else None
+            (live if item is not None and item["status"] == "open"
+             else stranding).append(ref)
+    finally:
+        central.close()
+    return live, stranding
 
 
 def delete_work_order(wo_id: str, project_name: str | None = None) -> dict[str, Any]:

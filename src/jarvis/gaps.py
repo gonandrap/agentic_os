@@ -115,13 +115,26 @@ GAP_CLASSES: dict[str, GapClass] = {
         issue_url="https://github.com/gonandrap/agentic_os/issues/797",
         since="",
     ),
+    # §2.5 of docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md.
+    "unwired-precondition": GapClass(
+        id="unwired-precondition",
+        headline="an order's brief states a stop condition that exists in no state the "
+                 "scheduler reads, so the claim takes it and a worker pays to rediscover "
+                 "the hold",
+        symptom="a dispatched order whose first line says it must not start, abandoned "
+                "with no commits",
+        detector="INV-PRECONDITION-UNWIRED",
+        remedy=REMEDY_NONE,
+        issue_url="https://github.com/gonandrap/agentic_os/issues/1089",
+        since="",
+    ),
 }
 
 #: Asserted equal to `tuple(GAP_CLASSES)`, on `remedies.SHIPPED_REMEDIES`' precedent. The
 #: registry is closed BY A TEST rather than by convention, so registering a class fails a
 #: suite until a human has read the diff that carries its detector, remedy and test.
 SHIPPED_GAP_CLASSES: tuple[str, ...] = ("stale-hold", "round-burn", "red-main",
-                                        "oversized-input")
+                                        "oversized-input", "unwired-precondition")
 
 
 def checked_slug(raw: str) -> str:

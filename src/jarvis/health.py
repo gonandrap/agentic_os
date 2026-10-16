@@ -208,7 +208,12 @@ def _work_order_blocker(pstore: Any, row: dict[str, Any], cfg: Any) -> str | Non
         # NOT `invariants.dead_dependencies`, which answers the narrower "can never
         # clear", and not `true_blockers`, which is silent on ordinary blocking by
         # design — and ordinary blocking is the whole of alarm al-4bb82f7e.
-        if blocker_id == "dependency" and ops.blocked_by(pstore, row):
+        # The `dependency` id covers BOTH kinds of hold and gains no member of its own:
+        # `health_reassert_blockers` is a catalog setting, and a new one would silently
+        # change what every existing project counts — §2.7 of
+        # docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md.
+        if blocker_id == "dependency" and (ops.blocked_by(pstore, row)
+                                           or ops.open_preconditions(pstore, row)):
             return blocker_id
         # A PURE ROW READ, NO NETWORK: `github.pr_view` is the daemon's poll, never a
         # sweep's. `pr_state == 'CLOSED'` cannot reach here — the status gate, plus

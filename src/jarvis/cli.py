@@ -67,6 +67,22 @@ def _readable_conversation(detail: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+def _readable_preconditions(detail: dict[str, Any]) -> dict[str, Any]:
+    """The holds collapsed to one line each — §2.7.
+
+    HUMAN output only, `_readable_rounds`' trick: `--json` keeps the rows as stored, and a
+    person gets "bl-d5baa28b — the predicate fix" instead of a block per row. The key is
+    dropped altogether when there are none, so an ordinary order's document reads exactly
+    as it did before preconditions existed.
+    """
+    row = dict(detail)
+    held = row.pop("preconditions", None) or []
+    if held:
+        row["preconditions"] = [
+            p["ref"] + (f" — {p['note']}" if p["note"] else "") for p in held]
+    return row
+
+
 def _readable_rounds(detail: dict[str, Any]) -> dict[str, Any]:
     """A unit's document with its validation rounds collapsed to one line each.
 
@@ -800,6 +816,14 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--depends-on", default="",
                    help="comma-separated work order ids that must COMPLETE before this "
                         "one is dispatched (same project only)")
+    # §2.3 of docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md.
+    c.add_argument("--blocked-by", action="append", default=None, metavar="REF",
+                   help="something that is NOT a work order and must clear before this "
+                        "one is dispatched (`bl-…`, `kn-…`, `io-…`, `#123`, a URL, or "
+                        "the words for the wait). Repeatable. It becomes a row the claim "
+                        "SQL evaluates, so the order stays `pending` and costs no worker "
+                        "turn; the OS clears a `bl-` ref itself once the backlog item "
+                        "settles, and `jarvis wo unblock` clears the rest")
     c.add_argument("--parent", default="",
                    help="file it UNDER this feature order: it becomes one of the "
                         "feature's children, so the feature waits for it and shows it "
@@ -845,13 +869,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="remove the ceiling: the order runs uncapped again")
     b.add_argument("--project")
 
-    ub = wo.add_parser("unblock", help="cut the dependency edges holding a work order "
-                                       "back (by default only the ones that can never "
-                                       "clear)")
+    # Both kinds of hold, one command — §2.6 of
+    # docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md.
+    ub = wo.add_parser("unblock", help="cut what is holding a work order back — "
+                                       "dependency edges and `--blocked-by` "
+                                       "preconditions (by default only the ones that "
+                                       "can never clear)")
     ub.add_argument("wo_id")
     ub.add_argument("--project")
     ub.add_argument("--all", action="store_true", dest="drop_all",
-                    help="cut every remaining edge, including dependencies still running")
+                    help="cut every remaining hold, including dependencies still "
+                         "running and a precondition whose backlog item is still open")
 
     l = wo.add_parser("list", help="list work orders")
     l.add_argument("project", nargs="?", help="restrict to one project")
@@ -3581,11 +3609,14 @@ def cmd_wo(args: argparse.Namespace) -> int:
 
     if args.wo_cmd == "create":
         deps = [d.strip() for d in args.depends_on.split(",") if d.strip()]
+        holds = list(getattr(args, "blocked_by", None) or [])
         parent = (args.parent or "").strip()
         wo = ops.create_work_order(
             args.project, args.title, description=args.description, origin=args.origin,
             model=args.model, effort=args.effort, permission_mode=args.permission_mode,
             append_system_prompt=args.append_system_prompt, depends_on=deps,
+            # Through unchanged, on the four self-evolution flags' shape — §2.3.
+            blocked_by=holds,
             parent_id=parent or None, budget_usd=_budget_arg(args),
             observability=getattr(args, "observability", None),
             # Verbatim from the flags — §7.1's "set structurally and never inferred from
@@ -3601,7 +3632,11 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 **({"parent": parent} if parent else {}),
                 **({"gap_class": wo["gap_class"]} if wo.get("gap_class") else {}),
                 **({"budget_usd": wo["budget_usd"]} if wo.get("budget_usd") else {}),
-                "note": (f"jarvisd will dispatch it once {', '.join(deps)} completes"
+                # A HELD ORDER IS NOT DISPATCHED SHORTLY — §2.3.
+                **({"blocked_by": holds} if holds else {}),
+                "note": (f"nothing is dispatched until {', '.join(holds)} clears "
+                         f"(`jarvis wo unblock {wo['id']}` cuts the hold)" if holds
+                         else f"jarvisd will dispatch it once {', '.join(deps)} completes"
                          if deps else "jarvisd will dispatch it shortly")}, args.json)
 
     elif args.wo_cmd == "budget":
@@ -3685,6 +3720,10 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 "status_label": invariants.status_label(store, wo,
                                                         ops.fleet_if_held([wo])),
                 "blocked_by": store.unfinished_dependencies(args.wo_id),
+                # The other kind of hold, always present and empty when there are none
+                # (`validation_rounds`' never-always rule) — §2.7 of
+                # docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md.
+                "preconditions": ops.open_preconditions(store, wo),
                 # What has already been dismissed on this order, decoded. Always
                 # present, empty or not: it is the only durable record of why a work
                 # order was ever flagged — `attention_reason` is NULLed by every ack —
@@ -3772,8 +3811,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
         _print(_readable_spec(_readable_config(_readable_review(_readable_autoreview(
             _readable_automerge(_readable_harvest(_readable_alarms(
                 _readable_time_in_state(_readable_rounds(_readable_issues(
-                    _readable_self_evolution(
-                        _readable_conversation(detail))))))))))))
+                    _readable_self_evolution(_readable_preconditions(
+                        _readable_conversation(detail)))))))))))))
                if not args.json else detail, args.json)
 
     elif args.wo_cmd == "send":

@@ -1265,6 +1265,11 @@ class Daemon:
                 # IMMEDIATELY BEFORE dispatch, not after: `sync_issues` files a release
                 # order late in one tick and this claim takes it early in the next, so a
                 # hold running after dispatch holds nothing on the first opportunity.
+                # IMMEDIATELY BEFORE dispatch for the same reason one mechanism over: a
+                # hold cleared on this tick is claimed on this tick rather than one poll
+                # interval later (§2.6).
+                if reconcile:
+                    self.clear_settled_preconditions(project, store)
                 self.hold_red_release(project, store)
                 self.dispatch_pending(project, store, state)
                 if poll_prs:
@@ -9704,6 +9709,32 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
     #: not minutes, and an hour would ask the user about a break the fleet was already
     #: fixing (2026-09-29 spec §3).
     RED_PARK_AFTER_SECONDS = 6 * 3600
+
+    def clear_settled_preconditions(self, project: ProjectSpec,
+                                    store: ProjectStore) -> None:
+        """Clear every `bl-` precondition whose backlog item has settled.
+
+        §2.6 of docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md: a
+        hold written once and never re-derived is the `stale-hold` class. One indexed read
+        per open row, and zero work for a project with none.
+
+        **A `bl-` ref that resolves to NOTHING does not clear.** A missing row means the
+        ref names nothing the OS can reason about — a typo, or a deleted item — and
+        clearing on absence would release an order whose hold was never satisfied. It
+        stays open for a human, like every other underivable ref: a `kn-` entry, an `io-`
+        id, an issue number and free text have no state the OS can read as "satisfied".
+        """
+        for wo in store.list_work_orders(statuses=("pending",), include_hidden=True):
+            for row in store.open_preconditions(wo["id"]):
+                ref = str(row["ref"])
+                if not ref.startswith("bl-"):
+                    continue
+                item = self.central.get_backlog(ref)
+                if item is None or item["status"] == "open":
+                    continue
+                store.clear_precondition(int(row["id"]), by="os")
+                log.info("[%s] %s: precondition %s cleared (%s is %s)", project.name,
+                         wo["id"], ref, ref, item["status"])
 
     def hold_red_release(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Keep a pending release order out of dispatch while the base branch is red.
