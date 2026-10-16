@@ -274,23 +274,23 @@ def _git(cwd, *args: str) -> str:
 DEFAULT_FILES = {"render.py": "def _render_row():\n    return 1\n"}
 
 
-def with_diff(started, **kw):
+def with_diff(started, *, files=None, **kw):
     """A parked order whose worker worktree really has a commit in it.
 
-    `park` alone leaves the repository empty, and `evidence.collect_work_order` answers
-    an empty packet for one — which this section ASKS on anyway. So the diff has to be
-    real here or the end-to-end test would pass with the evidence never collected at all.
-
-    The diff it collects is not this fixture's to promise: tests about question TEXT
-    state theirs through `stub_evidence` instead.
+    The commit no longer reaches the confirmation question — no diff travels — so this is
+    about the ORDER being a realistic delivery rather than about question text. `files`
+    is a callable that writes the change, for the tests that need a particular one.
     """
     path = started.catalog.project("proj_a").path
     _git(path, "add", "-A")
     _git(path, "commit", "-qm", "base")
     worktree = path / ".claude" / "worktrees" / "wt"
     _git(path, "worktree", "add", "-q", "-b", "wo-branch", str(worktree))
-    for name, body in DEFAULT_FILES.items():
-        (worktree / name).write_text(body)
+    if files is None:
+        for name, body in DEFAULT_FILES.items():
+            (worktree / name).write_text(body)
+    else:
+        files(worktree)
     _git(worktree, "add", "-A")
     _git(worktree, "commit", "-qm", "the change under review")
     store, wo = park(started, auto_review=True, **kw)
@@ -298,74 +298,11 @@ def with_diff(started, **kw):
     return store, store.get_work_order(wo["id"])
 
 
-def packet_of(stat: str, diff: str, *, pr_url: str = PR,
-              source: str = "pull_request", head: str = "wo-branch",
-              diff_truncated: bool = False,
-              dropped_files: tuple[str, ...] = ()) -> evidence.EvidencePacket:
-    """A real packet over a stated diff — `files` read off the `diff --git` headers."""
-    files = tuple(new or old for new, old, _ in evidence._sections(diff) if new or old)
-    return evidence.EvidencePacket(
-        unit="work_order", subject_id="wo-1", title="t", description="d", summary="s",
-        declared="", pr_url=pr_url, base="main", head=head, stat=stat, files=files,
-        diff=diff, diff_truncated=diff_truncated, dropped_files=dropped_files,
-        diff_sha="sha", source=source)
+def test_the_confirmation_carries_what_the_early_pass_never_had(started):
+    """THE SECOND CALL IS STILL THE FEATURE, for the RESULT SUMMARY and the decision
+    record — not for a diff (question 549, reversed by the user as learning #102).
 
-
-def stub_evidence(monkeypatch, stat: str, diff: str, **packet) -> None:
-    """Drive the pass through a chosen `(stat, diff)`, the seam that method exists for.
-
-    A test about what the question CONTAINS should state the diff it means. Deriving it
-    from a fixture repository put the environment in the assertion once already: before
-    `make_git_project` pinned `-b main`, a machine defaulting to `master` matched no rung
-    of `evidence.base_ref`'s ladder and collected an empty diff, and four tests here
-    failed on CI only. The pin fixed that; stating the diff keeps these tests out of the
-    question.
-    """
-    monkeypatch.setattr(Daemon, "_confirmation_evidence",
-                        lambda self, project, wo: packet_of(stat, diff, **packet))
-
-
-def added(path: str, body: str) -> tuple[str, str]:
-    """`(stat, diff)` for one file added whole — the shape git prints, headers included.
-
-    The headers are not decoration: `secret_marker` reads paths off the stat AND off
-    `diff --git`, and must never read `+++ b/…` as an added line.
-    """
-    lines = body.splitlines()
-    n = len(lines)
-    stat = f" {path} | {n} +\n {n} file changed, {n} insertions(+)\n"
-    diff = (f"diff --git a/{path} b/{path}\n"
-            f"new file mode 100644\n--- /dev/null\n+++ b/{path}\n"
-            f"@@ -0,0 +1,{n} @@\n" + "".join(f"+{line}\n" for line in lines))
-    return stat, diff
-
-
-def test_the_confirmation_carries_the_diff_the_early_pass_never_had(started, monkeypatch):
-    """THE SECOND CALL IS THE FEATURE (Neo, question 549). The cheap design — confirm in
-    code, re-ask only if something changed — was refused: a mid-turn verdict never had a
-    result summary, so "something changed" is always true."""
-    store, wo = park(started, auto_review=True)
-    stub_evidence(monkeypatch, *added("render.py", DEFAULT_FILES["render.py"]))
-    provisional(store, wo)
-
-    ask(started, store)
-
-    (confirmation,) = questions()
-    assert confirmation["kind"] == autoreview.QUESTION_KIND
-    assert PROVISIONAL_REASON in confirmation["question"]
-    assert "opened a PR" in confirmation["question"]       # the result summary
-    assert "render.py" in confirmation["question"]         # the diff
-    row = store.all_assumptions(wo["id"])[0]
-    assert row["confirm_question_id"] == confirmation["id"]
-    assert row["neo_question_id"] == EARLY_QUESTION   # the early link is not overwritten
-
-
-def test_the_real_collector_still_reaches_the_question(started):
-    """THE END-TO-END ONE, through `evidence.collect_work_order` and a real worktree —
-    without it every claim above holds over a stub only.
-
-    It asserts what is true in EVERY git environment: the collected diff itself is not,
-    because the base the collector resolves depends on the machine's default branch.
+    docs/superpowers/specs/2026-10-14-neo-never-reads-a-diff.md
     """
     store, wo = with_diff(started)
     provisional(store, wo)
@@ -376,7 +313,9 @@ def test_the_real_collector_still_reaches_the_question(started):
     assert confirmation["kind"] == autoreview.QUESTION_KIND
     assert PROVISIONAL_REASON in confirmation["question"]
     assert "opened a PR" in confirmation["question"]       # the result summary
-    assert store.all_assumptions(wo["id"])[0]["confirm_question_id"] == confirmation["id"]
+    row = store.all_assumptions(wo["id"])[0]
+    assert row["confirm_question_id"] == confirmation["id"]
+    assert row["neo_question_id"] == EARLY_QUESTION   # the early link is not overwritten
 
 
 def test_running_the_confirmation_pass_twice_asks_once(started):
@@ -751,89 +690,56 @@ def held_codes(store, wo_id: str) -> list[str]:
     return [e["code"] for e in events(store, wo_id, "autoreview_held")]
 
 
-def test_a_secret_shaped_added_line_is_never_copied_into_a_stored_question(
-        started, monkeypatch):
-    """THE BLOCKING FINDING. No question is filed at all — the assumption stays pending
-    and is the user's, exactly as it is without this feature. Filing the question with
-    the diff withheld is the cheap design Neo refused in question 549."""
-    store, wo = park(started, auto_review=True)
-    stub_evidence(monkeypatch, *added("settings.py", SECRET_BODY))
-    provisional(store, wo)
-
-    ask(started, store)
-
-    assert questions() == []
-    assert all(SECRET_VALUE not in q["question"] for q in questions())
-    assert store.all_assumptions(wo["id"])[0]["status"] == "pending"
-    (held,) = events(store, wo["id"], "autoreview_held")
-    assert held["code"] == autoreview.HELD_EVIDENCE_SECRET
-    assert SECRET_VALUE not in held["reason"]
-
-
-def test_a_secret_shaped_path_holds_it_whatever_the_body_says(started, monkeypatch):
-    """The path is evidence on its own: a work order that adds a `.env` is one whose
-    diff the OS will not store, and reading the file to find out would be the same
-    mistake one layer down."""
-    store, wo = park(started, auto_review=True)
-    stub_evidence(monkeypatch, *added(".env", "GREETING=hello\n"))
-    provisional(store, wo)
-
-    ask(started, store)
-
-    assert questions() == []
-    (held,) = events(store, wo["id"], "autoreview_held")
-    assert held["code"] == autoreview.HELD_EVIDENCE_SECRET
-    assert ".env" in held["reason"]
-
-
-def test_this_repos_own_everyday_diff_still_arms_and_still_asks(started, monkeypatch):
-    """THE NEGATIVE CONTROL, and without it a net that holds everything passes. Running
-    `high_stakes_marker` over a diff was REJECTED (Neo, question 593) for exactly this:
-    "credential", "production" and "delete" appear in nearly every change this repo
-    makes, so that net would hold almost every confirmation and switch the pass off
-    silently."""
-    store, wo = park(started, auto_review=True)
-    stub_evidence(monkeypatch, *added("render.py", PROSE_BODY))
-    provisional(store, wo)
-
-    ask(started, store)
-
-    (confirmation,) = questions()
-    assert "render.py" in confirmation["question"]
-    assert autoreview.HELD_EVIDENCE_SECRET not in held_codes(store, wo["id"])
-
-
 def test_a_secret_shaped_result_summary_is_never_copied_into_a_stored_question(
-        started, monkeypatch):
-    """THE SECOND BLOCKING FINDING: the diff is not the only text the question carries.
+        started):
+    """THE BLOCKING FINDING. No question is filed at all — the assumption stays pending
+    and is the user's.
 
     `_confirm_question` interpolates `result_summary` raw, and the worker wrote that
-    text — a summary quoting the credential it wired up reaches the question store by
-    exactly the route the diff was gated on.
+    text — a summary quoting the credential it wired up reaches the question store.
     """
     store, wo = park(started, auto_review=True)
-    stub_evidence(monkeypatch, *added("render.py", PROSE_BODY))
     store.update_work_order(wo["id"], result_summary=SECRET_SUMMARY)
     provisional(store, wo)
 
     ask(started, store)
 
     assert questions() == []
-    assert all(SECRET_VALUE not in q["question"] for q in questions())
     assert store.all_assumptions(wo["id"])[0]["status"] == "pending"
     (held,) = events(store, wo["id"], "autoreview_held")
     assert held["code"] == autoreview.HELD_EVIDENCE_SECRET
-    # WHICH TEXT to go and read: the summary, not the diff.
-    assert "result summary" in held["reason"] and "diff" not in held["reason"]
+    # WHICH TEXT to go and read.
+    assert "result summary" in held["reason"]
     assert SECRET_VALUE not in held["reason"]
 
 
-def test_an_ordinary_result_summary_still_arms_and_still_asks(started, monkeypatch):
-    """THE NEGATIVE CONTROL for the summary net, and without it this is the wide net by
-    another route: "credential", "production" and "delete" are what a worker on this
-    repo writes in every summary it files."""
+def test_a_secret_shaped_assumption_is_never_copied_into_a_stored_question(started):
+    """THE OTHER TEXT THE QUESTION CARRIES, and the one that is newly scanned: the
+    question interpolates the assumption's own sentence.
+
+    docs/superpowers/specs/2026-10-14-neo-never-reads-a-diff.md
+    """
+    store, wo = park(started, auto_review=True,
+                     assumptions=(f'wired the client:\napi_key = "{SECRET_VALUE}"',))
+    provisional(store, wo)
+
+    ask(started, store)
+
+    assert questions() == []
+    assert store.all_assumptions(wo["id"])[0]["status"] == "pending"
+    (held,) = events(store, wo["id"], "autoreview_held")
+    assert held["code"] == autoreview.HELD_EVIDENCE_SECRET
+    # WHICH TEXT: the assumption, not the summary.
+    assert "assumption" in held["reason"] and "result summary" not in held["reason"]
+    assert SECRET_VALUE not in held["reason"]
+
+
+def test_an_ordinary_result_summary_still_arms_and_still_asks(started):
+    """THE NEGATIVE CONTROL, and without it a net that holds everything passes. Running
+    `high_stakes_marker` over this text was REJECTED (Neo, question 593) for exactly
+    this: "credential", "production" and "delete" are what a worker on this repo writes
+    in every summary it files."""
     store, wo = park(started, auto_review=True)
-    stub_evidence(monkeypatch, *added("render.py", PROSE_BODY))
     store.update_work_order(wo["id"], result_summary=PROSE_SUMMARY)
     provisional(store, wo)
 
@@ -844,12 +750,12 @@ def test_an_ordinary_result_summary_still_arms_and_still_asks(started, monkeypat
     assert autoreview.HELD_EVIDENCE_SECRET not in held_codes(store, wo["id"])
 
 
-def test_the_evidence_hold_is_written_once_however_many_ticks_run(started, monkeypatch):
+def test_the_evidence_hold_is_written_once_however_many_ticks_run(started):
     """`decide_evidence` carries `assumption_id` and `n` so `_note_autoreview_held`
     dedupes per assumption. The reconciler runs this pass every tick, so without the
     dedupe one held work order writes a timeline line a minute."""
     store, wo = park(started, auto_review=True)
-    stub_evidence(monkeypatch, *added("settings.py", SECRET_BODY))
+    store.update_work_order(wo["id"], result_summary=SECRET_SUMMARY)
     provisional(store, wo)
 
     ask(started, store)
@@ -981,24 +887,37 @@ def test_a_secret_shaped_path_in_a_diff_header_fires_too():
 # -- `decide_evidence`: the hold it returns --------------------------------------------
 
 
-def test_decide_evidence_arms_on_an_ordinary_diff():
-    d = autoreview.decide_evidence(judged(), " render.py | 2 +-", "+    return 1\n")
+def test_decide_evidence_arms_on_ordinary_prose():
+    d = autoreview.decide_evidence(judged(), summary=PROSE_SUMMARY)
     assert d.armed and d.assumption_id == 3 and d.n == 2
 
 
 def test_decide_evidence_reads_the_summary_as_plain_text():
     """No `+` prefix and no diff: the summary is prose the worker typed, and the same
     line scanner reads it."""
-    d = autoreview.decide_evidence(judged(), "", "+    return 1\n",
-                                   summary=SECRET_SUMMARY)
+    d = autoreview.decide_evidence(judged(), summary=SECRET_SUMMARY)
     assert d.code == autoreview.HELD_EVIDENCE_SECRET
     assert "result summary" in d.reason and SECRET_VALUE not in d.reason
 
 
-def test_decide_evidence_arms_on_an_ordinary_summary():
-    d = autoreview.decide_evidence(judged(), " render.py | 2 +-", "+    return 1\n",
-                                   summary=PROSE_SUMMARY)
-    assert d.armed
+def test_decide_evidence_reads_the_assumptions_own_sentence_too():
+    """The second text the question carries, and the one newly scanned.
+
+    docs/superpowers/specs/2026-10-14-neo-never-reads-a-diff.md
+    """
+    d = autoreview.decide_evidence(
+        judged(content=f'wired it:\napi_key = "{SECRET_VALUE}"'),
+        summary=PROSE_SUMMARY)
+    assert d.code == autoreview.HELD_EVIDENCE_SECRET
+    assert "assumption" in d.reason and SECRET_VALUE not in d.reason
+
+
+def test_the_summary_outranks_the_assumption_so_the_wording_stays_tested():
+    """Precedence is unchanged: the summary branch is first."""
+    d = autoreview.decide_evidence(
+        judged(content=f'wired it:\napi_key = "{SECRET_VALUE}"'),
+        summary=SECRET_SUMMARY)
+    assert "result summary" in d.reason
 
 
 def test_the_confirmation_packet_carries_the_decision_record_too():
@@ -1012,9 +931,7 @@ def test_the_confirmation_packet_carries_the_decision_record_too():
     neo_ = FakeNeo(qrow(answered_by="user", answer="build NO kill remedy"))
 
     autoreview.propose_confirmation(
-        FakeStore(), neo_, "p", WO, judged(), [judged()],
-        evidence=autoreview.ConfirmEvidence(stat=" render.py | 2 +-",
-                                            diff="+    return 1\n"))
+        FakeStore(), neo_, "p", WO, judged(), [judged()])
 
     (packet,) = neo_.asked
     assert RECORD_HEADER in packet
@@ -1025,9 +942,7 @@ def test_the_confirmation_packet_carries_the_decision_record_too():
 
 def test_the_confirmation_packet_says_when_there_is_no_record():
     """The empty case on this pass too: `record=""` renders the section, never omits it."""
-    packet = autoreview._confirm_question(   # noqa: SLF001
-        "p", WO, judged(), [],
-        autoreview.ConfirmEvidence(stat=" render.py | 2 +-", diff="+    return 1\n"))
+    packet = autoreview._confirm_question("p", WO, judged(), [])   # noqa: SLF001
 
     assert "(no prior decisions recorded)" in packet
 
@@ -1035,7 +950,7 @@ def test_the_confirmation_packet_says_when_there_is_no_record():
 def test_decide_evidence_holds_and_carries_the_row_it_is_about():
     """`assumption_id` and `n` so `_note_autoreview_held` dedupes per assumption, as
     every other hold does — otherwise one work order records this every tick."""
-    d = autoreview.decide_evidence(judged(), "", f'+api_key = "{SECRET_VALUE}"')
+    d = autoreview.decide_evidence(judged(), summary=SECRET_SUMMARY)
     assert d.code == autoreview.HELD_EVIDENCE_SECRET
     assert d.assumption_id == 3 and d.n == 2
     assert SECRET_VALUE not in d.reason
@@ -1043,38 +958,24 @@ def test_decide_evidence_holds_and_carries_the_row_it_is_about():
 
 # -- the question the store refuses to hold ---------------------------------------------
 
-#: Planted in every CHANGED PATH, so the refusal really is about text carrying it.
-#: Nothing the user reads may repeat it. Spec §4:
+#: Planted in the text that makes the question oversized, so the refusal really is about
+#: text carrying it. Nothing the user reads may repeat it. Spec §4:
 #: docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
 DIFF_MARKER = "PASTED-DIFF-MARKER-7b2d"
 
 
-def _path(i: int) -> str:
-    return f"render_{DIFF_MARKER}_{i:05d}.py"
+def _huge_assumption() -> str:
+    """An assumption sentence alone past `claude_cli.MAX_OS_PROMPT_CHARS`.
 
-
-def _huge_stat() -> tuple[str, str]:
-    """A delivery of tens of thousands of files: the stat and the file list alone carry
-    the question past `claude_cli.MAX_OS_PROMPT_CHARS`, with the diff BODY well inside
-    `validation.confirm_diff_chars`.
-
-    § 2 budgets the diff body and NOTHING else — `_what_changed` interpolates `ev.stat`
-    whole and never truncates `ev.files`, both on purpose — so §4 is the backstop over
-    exactly the parts § 2 does not own:
+    `_confirm_question` interpolates the assumption WHOLE and truncates it at no limit —
+    the deliberate choice §2 made about the one text the question is actually about — so
+    §4 is the backstop over exactly the part §2 does not own:
     docs/superpowers/specs/2026-09-26-bounded-model-inputs.md § 2 and §4.
     """
     from jarvis import claude_cli
 
-    # One stat line plus one file-list entry per file: what the question pays per file.
-    per_file = len(f" {_path(0)} | 1 +\n") + len(f"  {_path(0)}\n")
-    n = claude_cli.MAX_OS_PROMPT_CHARS // per_file + 500
-    stat = "".join(f" {_path(i)} | 1 +\n" for i in range(n))
-    stat += f" {n} files changed, {n} insertions(+)\n"
-    diff = "".join(
-        f"diff --git a/{_path(i)} b/{_path(i)}\nnew file mode 100644\n"
-        f"--- /dev/null\n+++ b/{_path(i)}\n@@ -0,0 +1,1 @@\n+    pass\n"
-        for i in range(n))
-    return stat, diff
+    line = f"renamed the render helper, noted as {DIFF_MARKER}, for consistency\n"
+    return line * (claude_cli.MAX_OS_PROMPT_CHARS // len(line) + 500)
 
 
 def _refusals(store, wo_id: str) -> list[dict]:
@@ -1101,8 +1002,8 @@ def _oversized_confirmation(started, monkeypatch):
     assumption is still pending with a NULL `confirm_question_id` and every later tick
     arrives here again.
     """
-    store, wo = park(started, auto_review=True)
-    stub_evidence(monkeypatch, *_huge_stat())
+    store, wo = park(started, auto_review=True,
+                     assumptions=(_huge_assumption(),))
     provisional(store, wo)
 
     ask(started, store)
@@ -1149,471 +1050,75 @@ def test_the_confirmation_refusal_repeats_no_byte_of_the_question(started, monke
     assert "os.max_os_prompt_chars" in str(fresh["attention_reason"])
 
 
-# -- the confirmation question's own diff budget (spec § 2) -----------------------------
-
-#: One file's section, and every file below is this size: equal-length names make the
-#: budget arithmetic in these tests exact rather than approximate.
-MOD_BODY = "def f():\n    return 1\n"
-MOD_SECTION = len(added("mod00.py", MOD_BODY)[1])
-
-
-def mods(n: int) -> tuple[str, str]:
-    """`(stat, diff)` for `n` equal-sized added files, `mod00.py` upward."""
-    pairs = [added(f"mod{i:02d}.py", MOD_BODY) for i in range(n)]
-    return "".join(p[0] for p in pairs), "".join(p[1] for p in pairs)
-
-
-def budget(started, chars: int) -> None:
-    """The project's `validation.confirm_diff_chars`, which is what the pass trims to."""
-    started.catalog.project("proj_a").validation.confirm_diff_chars = chars
-
-
-def build(stat: str, diff: str, limit: int, *, content: str = ROUTINE,
-          **packet) -> autoreview.ConfirmEvidence:
-    return autoreview.confirm_evidence(
-        packet_of(stat, diff, **packet), assumption(content=content), limit,
-        collect_limit=daemon_mod.CONFIRM_COLLECT_CHARS)
-
-
-def test_a_diff_inside_the_budget_is_carried_whole_and_claims_no_truncation(
-        started, monkeypatch):
-    """The pairing that stops an unconditionally appended marker passing."""
-    store, wo = park(started, auto_review=True)
-    stub_evidence(monkeypatch, *added("render.py", DEFAULT_FILES["render.py"]))
-    provisional(store, wo)
-
-    ask(started, store)
-
-    (confirmation,) = questions()
-    assert "def _render_row():" in confirmation["question"]
-    assert "diff truncated" not in confirmation["question"]
-
-
-def test_a_diff_over_the_budget_is_cut_at_a_file_boundary_and_says_what_is_missing(
-        started, monkeypatch):
-    """The marker names the kept size, the exact total, the exact count and the names."""
-    stat, diff = mods(5)
-    ce = build(stat, diff, 2 * MOD_SECTION)
-    assert ce.diff_truncated and len(ce.diff) == 2 * MOD_SECTION
-    assert ce.full_chars == 5 * MOD_SECTION
-    assert ce.dropped_files == ("mod02.py", "mod03.py", "mod04.py")
-    assert ce.diff.endswith("+    return 1\n") and "mod02.py" not in ce.diff
-
-    store, wo = park(started, auto_review=True)
-    budget(started, 2 * MOD_SECTION)
-    stub_evidence(monkeypatch, stat, diff)
-    provisional(store, wo)
-
-    ask(started, store)
-
-    (confirmation,) = questions()
-    assert (f"[diff truncated — {2 * MOD_SECTION:,} of {5 * MOD_SECTION:,} chars; "
-            f"3 file(s) not shown: mod02.py, mod03.py, mod04.py; "
-            f"full diff: {PR}]") in confirmation["question"]
-    assert confirmation["question"].count("diff --git") == 2
-    assert ("Escalate rather than judge on what you cannot see."
-            in confirmation["question"])
-
-
-def test_the_stat_and_the_file_list_survive_a_budget_that_keeps_no_hunk(started):
-    """evidence.py's rule 3: `files` is never truncated at any limit.
-
-    Read at the TRIM, not through the pass: a collection trimmed to nothing is
-    `HELD_EVIDENCE_UNREADABLE` and files no question (the 2026-10-13 spec, part 3), and
-    the claim here is about what `confirm_evidence` renders, which is unchanged.
-    """
-    stat, diff = mods(5)
-    ce = build(stat, diff, 1)
-    text = autoreview._confirm_question("proj_a", WO, judged(), [], ce)
-
-    assert text.count("diff --git") == 0
-    for i in range(5):
-        assert f"mod{i:02d}.py" in text
-    assert (f"[diff truncated — 0 of {5 * MOD_SECTION:,} chars; "
-            f"5 file(s) not shown: ") in text
-
-
-def test_the_reference_rides_on_an_untruncated_question_too(started, monkeypatch):
-    """Neo, question 753: truncated or not, the question carries the reference."""
-    store, wo = park(started, auto_review=True)
-    stub_evidence(monkeypatch, *added("render.py", DEFAULT_FILES["render.py"]))
-    provisional(store, wo)
-
-    ask(started, store)
-
-    (confirmation,) = questions()
-    assert "diff truncated" not in confirmation["question"]
-    assert f"pull request: {PR}" in confirmation["question"]
-    assert "head branch: wo-branch" in confirmation["question"]
-
-
-def test_a_sha_is_labelled_a_sha_and_a_branch_a_branch(started):
-    """The false-reference trap: `head` means different things per `source`."""
-    stat, diff = added("render.py", DEFAULT_FILES["render.py"])
-    tree = build(stat, diff, MOD_SECTION * 9, source="worktree", head="a" * 40)
-    pr = build(stat, diff, MOD_SECTION * 9, source="pull_request", head="wo-branch")
-
-    from_tree = autoreview._confirm_question("proj_a", WO, judged(), [], tree)
-    from_pr = autoreview._confirm_question("proj_a", WO, judged(), [], pr)
-
-    assert f"head sha: {'a' * 40}" in from_tree and "head branch" not in from_tree
-    assert "head branch: wo-branch" in from_pr and "head sha" not in from_pr
-
-
-def test_a_file_the_assumption_names_is_kept_even_when_diff_order_would_drop_it():
-    """Prefer the hunks that matter: the named file moves to the front of the budget."""
-    stat, diff = mods(5)
-    ce = build(stat, diff, MOD_SECTION, content="renamed the helper in mod04.py")
-
-    assert "diff --git a/mod04.py" in ce.diff
-    assert len(ce.diff) == MOD_SECTION
-    assert set(ce.dropped_files) == {f"mod{i:02d}.py" for i in range(4)}
-    assert build(stat, diff, MOD_SECTION).dropped_files[0] == "mod01.py"
-
-
-def test_a_collection_that_was_itself_truncated_never_states_a_false_total():
-    """Neo, question 945: the total is unknown, so the marker says `more than`."""
-    stat, diff = mods(5)
-    ce = build(stat, diff, 2 * MOD_SECTION, diff_truncated=True,
-               dropped_files=("later.py",))
-    text = autoreview._confirm_question("proj_a", WO, judged(), [], ce)
-
-    assert ce.collect_truncated and "later.py" in ce.dropped_files
-    assert (f"{2 * MOD_SECTION:,} of more than "
-            f"{daemon_mod.CONFIRM_COLLECT_CHARS:,} chars") in text
-    assert f"of {5 * MOD_SECTION:,} chars" not in text
-
-
-def test_the_secret_net_reads_the_trimmed_text_and_not_the_collection(
-        started, monkeypatch):
-    """`decide_evidence` scans what is persisted and sent — both directions asserted."""
-    prose = added("render.py", PROSE_BODY)
-    secret = added("settings.py", SECRET_BODY)
-    stat, diff = prose[0] + secret[0], prose[1] + secret[1]
-
-    store, wo = park(started, auto_review=True)
-    budget(started, len(prose[1]))
-    stub_evidence(monkeypatch, stat, diff)
-    provisional(store, wo)
-
-    ask(started, store)
-
-    (confirmation,) = questions()
-    assert SECRET_VALUE not in confirmation["question"]
-    assert autoreview.HELD_EVIDENCE_SECRET not in held_codes(store, wo["id"])
-
-    # The other direction: the same secret in a KEPT hunk files nothing at all.
-    store_b, wo_b = park(started, auto_review=True)
-    budget(started, len(diff))
-    provisional(store_b, wo_b)
-
-    ask(started, store_b)
-
-    assert len(questions()) == 1
-    assert held_codes(store_b, wo_b["id"]) == [autoreview.HELD_EVIDENCE_SECRET]
-
-
-def test_a_failed_collection_still_asks_with_an_empty_evidence_block(started, monkeypatch):
-    """`Daemon._confirmation_evidence` returning `None` — collection failed — must still
-    ask, with no diff fabricated and no truncation claimed."""
-    store, wo = park(started, auto_review=True)
-    monkeypatch.setattr(Daemon, "_confirmation_evidence", lambda self, project, wo: None)
-    provisional(store, wo)
-
-    ask(started, store)
-
-    (confirmation,) = questions()
-    assert "diff --git" not in confirmation["question"]
-    assert "diff truncated" not in confirmation["question"]
-    assert "pull request: (none)\nhead: (unknown)" in confirmation["question"]
-
-
-def what_changed_section(question: str) -> str:
-    """The question's `# What changed` block, heading to the next `# ` heading."""
-    head = "# What changed"
-    start = question.index(head)
-    nxt = re.compile(r"^# ", re.M).search(question, start + len(head))
-    return question[start:nxt.start() if nxt else len(question)].rstrip("\n")
-
-
-def test_every_byte_of_the_evidence_block_went_through_the_net(started, monkeypatch):
-    """The trim goes BEFORE the net, so no byte reaches `neo_store.ask` unscanned.
-
-    The budget cuts the last file at a HUNK boundary, so the block carries a section
-    shown in part and its in-diff marker: invariant 2 of the 2026-10-13 spec.
-    """
-    stat, diff = hunky("mod00.py", 8)
-    seen: list[str] = []
-    real = autoreview.decide_evidence
-
-    def recorder(a, stat_text, diff_text, summary="", **kw):
-        seen.append("\n".join([stat_text, diff_text, summary]))
-        return real(a, stat_text, diff_text, summary=summary, **kw)
-
-    monkeypatch.setattr(autoreview, "decide_evidence", recorder)
-    store, wo = park(started, auto_review=True)
-    budget(started, len(diff) // 2)
-    stub_evidence(monkeypatch, stat, diff)
-    provisional(store, wo)
-
-    ask(started, store)
-
-    (confirmation,) = questions()
-    assert "more hunk(s) of mod00.py not shown" in confirmation["question"]
-    assert len(seen) == 1
-    assert what_changed_section(confirmation["question"]) in seen[0]
-
-
-# -- the three tiers, the hunk trim and the hold (the 2026-10-13 spec) ------------------
+# -- NO DIFF TRAVELS, and the live case that proves the hold is gone --------------------
 #
-# docs/superpowers/specs/2026-10-13-a-confirmation-question-with-a-zero-character-diff.md.
-# The live case: 68,675 chars collected, 0 delivered, because a 435-line spec document
-# sorted first in diff order and was 5x the 12,000-char budget on its own.
-
-#: The live case's budget, `catalog.DEFAULT_VALIDATION_CONFIRM_DIFF_CHARS`.
-CONFIRM_BUDGET = 12000
+# USER DECISION 2026-10-14, reversing Neo's answer to question 549 (learning #102):
+# checking delivered code against a worker's claims is the VALIDATION PANEL's job.
+# docs/superpowers/specs/2026-10-14-neo-never-reads-a-diff.md
 
 
-def hunky(path: str, hunks: int) -> tuple[str, str]:
-    """`(stat, diff)` for one file modified in `hunks` separate places."""
-    stat = f" {path} | {3 * hunks} +\n 1 file changed, {3 * hunks} insertions(+)\n"
-    body = "".join(f"@@ -{10 * i},3 +{10 * i},3 @@\n"
-                   + "".join(f"+{path} hunk {i} line {j}\n" for j in range(3))
-                   for i in range(hunks))
-    diff = (f"diff --git a/{path} b/{path}\n"
-            f"index 1111111..2222222 100644\n--- a/{path}\n+++ b/{path}\n" + body)
-    return stat, diff
+#: Planted in the body of the change, so "no added line travels" is not vacuous.
+ADDED_MARKER = "ADDED-LINE-MARKER-4c91"
 
 
-def test_the_live_case_the_doc_no_longer_eats_the_whole_budget():
-    """Test 1, and the one the spec exists for: a 60,000-char `.md` under `docs/` first
-    in diff order, an assumption naming a SYMBOL and no path, the default budget."""
-    doc = added("docs/spec.md", "spec line\n" * 6000)
-    src = mods(4)
-    stat, diff = doc[0] + src[0], doc[1] + src[1]
-
-    ce = build(stat, diff, CONFIRM_BUDGET,
-               content="renamed the helper `_render_row` for consistency")
-
-    assert len(doc[1]) > CONFIRM_BUDGET        # not vacuous: the doc alone overruns it
-    assert ce.diff != ""
-    for i in range(4):
-        assert f"diff --git a/mod{i:02d}.py" in ce.diff
-    assert "docs/spec.md" in ce.dropped_files
-    assert autoreview.decide_evidence(judged(), ce.stat, ce.what_changed(),
-                                      unreadable=ce.unreadable).armed
+def big_change(worktree, files: int = 40, lines: int = 200) -> None:
+    """A delivery far past any budget the confirmation ever had, really committed."""
+    for i in range(files):
+        (worktree / f"mod{i:02d}.py").write_text(
+            "".join(f"def f{i}_{j}():  # {ADDED_MARKER}\n    return {j}\n"
+                    for j in range(lines)))
 
 
-def test_a_doc_the_assumption_names_by_path_stays_ahead_of_the_source():
-    """Tier (a) is tested first and wins: a doc the assumption NAMES is what the
-    question is about."""
-    doc = added("docs/spec.md", "spec line\n" * 5)
-    src = mods(3)
-    stat, diff = doc[0] + src[0], doc[1] + src[1]
+def test_a_confirmation_question_carries_no_diff_whatever_the_change_size(started):
+    """THE WHOLE CHANGE, asserted on the RENDERED question and not on a flag.
 
-    ce = build(stat, diff, len(doc[1]),
-               content="the wording in docs/spec.md is the user's own")
-
-    assert ce.diff.startswith("diff --git a/docs/spec.md")
-    assert set(ce.dropped_files) == {f"mod{i:02d}.py" for i in range(3)}
-
-
-def test_source_goes_before_documentation_when_the_assumption_names_nothing():
-    """Tier (b) before tier (c), where the old code kept the collection's order."""
-    doc = added("docs/spec.md", "spec line\n" * 5)
-    src = mods(1)
-    stat, diff = doc[0] + src[0], doc[1] + src[1]
-
-    ce = build(stat, diff, MOD_SECTION)
-
-    assert ce.diff.startswith("diff --git a/mod00.py")
-    assert ce.dropped_files == ("docs/spec.md",)
-
-
-@pytest.mark.parametrize("path, is_doc", [
-    ("x.md", True), ("x.rst", True), ("x.txt", True), ("x.adoc", True),
-    ("X.MD", True), ("docs/a/b.py", True), ("specs/a.py", True),
-    ("src/markdown.py", False), ("src/docsite.py", False), ("a.mdx", False),
-    ("src/jarvis/autoreview.py", False),
-])
-def test_documentation_is_a_mechanical_path_test(path, is_doc):
-    """A path test, never content sniffing over a diff fragment (rejected 6), and over
-    the suffixes and dirs PASSED IN — this module holds no classifier of its own."""
-    assert autoreview._is_documentation(
-        path, (".md", ".rst", ".txt", ".adoc"), frozenset({"docs", "specs"})) is is_doc
-
-
-def test_the_shipped_defaults_are_the_navigation_constants_themselves():
-    """The tiering with NO override: `.md` and a `docs/` component are documentation,
-    `.py` is source — and `.rst` is SOURCE, no longer a doc suffix. The parameterised
-    test above passes its own values in, so only this one covers what SHIPS.
+    Driven through a real worktree with a large commit in it, so a diff reaching the
+    question by ANY route — the stat, the file list, a truncation marker — fails here.
     """
-    md = added("x.md", "spec line\n" * 5)
-    rst = added("x.rst", "spec line\n" * 5)
-    doc_dir = added("docs/a.py", "spec line\n" * 5)
-    src = added("x.py", "spec line\n" * 5)
-    stat = md[0] + rst[0] + doc_dir[0] + src[0]
-    diff = md[1] + rst[1] + doc_dir[1] + src[1]
-    limit = len(rst[1]) + len(src[1])
-    packet, a = packet_of(stat, diff), assumption(content=ROUTINE)
-
-    ce = autoreview.confirm_evidence(packet, a, limit)
-    defaults = inspect.signature(autoreview.confirm_evidence).parameters
-
-    assert "diff --git a/x.rst" in ce.diff            # .rst tiers as SOURCE
-    assert "diff --git a/x.py" in ce.diff
-    assert set(ce.dropped_files) == {"x.md", "docs/a.py"}
-    assert ce.partial_files == ()
-    assert defaults["doc_suffixes"].default is navigation.DOC_SUFFIXES
-    assert defaults["doc_dirs"].default is navigation.DOC_DIRS
-
-
-def test_a_project_doc_suffix_override_decides_the_tier():
-    """The configured classifier reaches the tiering: with `doc_suffixes == (".rst",)`,
-    `x.md` is SOURCE and `x.rst` is documentation — the reverse of the defaults."""
-    md = added("x.md", "spec line\n" * 5)
-    rst = added("x.rst", "spec line\n" * 5)
-    stat, diff = md[0] + rst[0], md[1] + rst[1]
-    limit = max(len(md[1]), len(rst[1]))
-    packet, a = packet_of(stat, diff), assumption(content=ROUTINE)
-
-    overridden = autoreview.confirm_evidence(packet, a, limit, doc_suffixes=(".rst",))
-    default = autoreview.confirm_evidence(packet, a, limit)
-
-    assert overridden.diff.startswith("diff --git a/x.md")
-    assert overridden.dropped_files == ("x.rst",)
-    assert default.diff.startswith("diff --git a/x.rst")
-    assert default.dropped_files == ("x.md",)
-
-
-def test_a_project_doc_dir_override_decides_the_tier():
-    """`doc_dirs` the same way: a project calling its documentation `manual/` has
-    `docs/` read as source."""
-    manual = added("manual/a.py", "x = 1\n" * 5)
-    docs = added("docs/a.py", "x = 1\n" * 5)
-    stat, diff = manual[0] + docs[0], manual[1] + docs[1]
-    limit = max(len(manual[1]), len(docs[1]))
-    packet, a = packet_of(stat, diff), assumption(content=ROUTINE)
-
-    ce = autoreview.confirm_evidence(packet, a, limit,
-                                     doc_dirs=frozenset({"manual"}))
-
-    assert ce.diff.startswith("diff --git a/docs/a.py")
-    assert ce.dropped_files == ("manual/a.py",)
-
-
-def test_the_configured_doc_classifier_reaches_the_pass(started, monkeypatch):
-    """The daemon resolves it PER PROJECT (`project.navigation`) — `autoreview` carries
-    no second copy that drifts the moment a project overrides the catalog key."""
-    seen: list[dict] = []
-    real = autoreview.confirm_evidence
-
-    def recorder(packet, a, limit, **kw):
-        seen.append(kw)
-        return real(packet, a, limit, **kw)
-
-    monkeypatch.setattr(autoreview, "confirm_evidence", recorder)
-    nav = started.catalog.project("proj_a").navigation
-    nav.doc_suffixes = (".rst",)
-    nav.doc_dirs = frozenset({"manual"})
-    store, wo = park(started, auto_review=True)
-    stub_evidence(monkeypatch, *added("render.py", DEFAULT_FILES["render.py"]))
+    store, wo = with_diff(started, files=big_change)
     provisional(store, wo)
 
     ask(started, store)
 
-    assert [k["doc_suffixes"] for k in seen] == [(".rst",)]
-    assert [k["doc_dirs"] for k in seen] == [frozenset({"manual"})]
+    (confirmation,) = questions()
+    text = confirmation["question"]
+    assert "diff --git" not in text
+    assert "@@" not in text
+    assert ADDED_MARKER not in text
+    assert "# What changed" not in text
+    assert "file changed" not in text and "files changed" not in text
+    assert "diff truncated" not in text
+    assert "not shown]" not in text
+    # ...and the texts that DO still travel are there, so this is not an empty question.
+    assert PROVISIONAL_REASON in text
+    assert "opened a PR" in text                      # the result summary
+    assert "the validation panel" in text
 
 
-def test_a_file_shown_in_part_is_neither_complete_nor_absent():
-    """Test 3: the hunks that fit are delivered, the file is named `partially shown`,
-    and it is NOT in `dropped_files` — a third state."""
-    stat, diff = hunky("mod00.py", 10)
-    ce = build(stat, diff, len(diff) // 2)
+def test_a_change_that_is_only_a_huge_document_is_confirmed_rather_than_held(started):
+    """THE LIVE CASE, wo-09c60d79: the only changed file was a ~20,000-char spec
+    document and the assumption named it. The trim kept nothing of it, so the pass held
+    on `evidence_unreadable` and filed no question at all.
 
-    assert ce.partial_files == ("mod00.py",)
-    assert "mod00.py" not in ce.dropped_files
-    assert "more hunk(s) of mod00.py not shown" in ce.diff
-    assert ce.diff.count("@@ -") < 10 and ce.diff.count("@@ -") > 0
-    marker = autoreview._truncation_marker(ce)
-    assert "1 file(s) partially shown: mod00.py" in marker
-    assert "no whole file dropped" in marker
+    Nothing is trimmed any more, so the question is FILED. Driven through the daemon's
+    ask pass, which is where the hold used to be written.
+    """
+    spec_body = "spec line that says something about the change\n" * 420
+    assert len(spec_body) > 19_000, "not the live case: the document is too small"
 
+    def only_a_doc(worktree):
+        (worktree / "docs").mkdir(parents=True, exist_ok=True)
+        (worktree / "docs" / "spec.md").write_text(spec_body)
 
-def test_the_marker_distinguishes_partial_from_dropped_and_states_no_false_total():
-    """Test 9, with invariant 4: `partial_files` must not turn `more than` into a
-    computed total."""
-    partial = hunky("big.py", 10)
-    later = mods(2)
-    stat = partial[0] + later[0]
-    diff = partial[1] + later[1]
-
-    ce = build(stat, diff, len(partial[1]) // 2, diff_truncated=True)
-    marker = autoreview._truncation_marker(ce)
-
-    assert f"of more than {daemon_mod.CONFIRM_COLLECT_CHARS:,} chars" in marker
-    assert "2 file(s) not shown: mod00.py, mod01.py" in marker
-    assert "1 file(s) partially shown: big.py" in marker
-
-
-def test_a_collection_trimmed_to_nothing_holds_and_files_no_question(
-        started, monkeypatch):
-    """Test 5. The status quo spent a Neo call that could only escalate, then parked the
-    order for a person (rejected 4)."""
-    stat, diff = mods(5)
-    store, wo = park(started, auto_review=True)
-    budget(started, 1)
-    stub_evidence(monkeypatch, stat, diff)
+    store, wo = with_diff(
+        started, files=only_a_doc,
+        assumptions=("wrote the wording of docs/spec.md myself",))
     provisional(store, wo)
 
     ask(started, store)
 
-    assert questions() == []
-    assert held_codes(store, wo["id"]) == [autoreview.HELD_EVIDENCE_UNREADABLE]
-    assert store.all_assumptions(wo["id"])[0]["status"] == "pending"
-
-
-def test_the_unreadable_hold_carries_the_row_it_is_about():
-    """Like every other hold, so `_note_autoreview_held` dedupes per assumption."""
-    d = autoreview.decide_evidence(judged(), " mod00.py | 2 +-", "", unreadable=True)
-
-    assert d.code == autoreview.HELD_EVIDENCE_UNREADABLE
-    assert d.assumption_id == 3 and d.n == 2
-    assert not d.armed
-
-
-def test_the_hold_is_recorded_once_however_many_ticks_run(started, monkeypatch):
-    """It is NOT on `_holds_not_recorded`: it is the only thing on the record saying why
-    an order the feature was switched on for is still waiting for a person."""
-    stat, diff = mods(5)
-    store, wo = park(started, auto_review=True)
-    budget(started, 1)
-    stub_evidence(monkeypatch, stat, diff)
-    provisional(store, wo)
-
-    ask(started, store)
-    ask(started, store)
-
-    assert held_codes(store, wo["id"]) == [autoreview.HELD_EVIDENCE_UNREADABLE]
-
-
-def test_an_empty_collection_still_asks():
-    """Test 6, and the distinction the spec says must not collapse: `full_chars == 0` is
-    git reporting nothing, and the result summary alone is still worth confirming."""
-    empty = autoreview.ConfirmEvidence()
-    nothing_collected = build("", "", CONFIRM_BUDGET)
-
-    assert empty.unreadable is False
-    assert nothing_collected.full_chars == 0 and nothing_collected.diff == ""
-    assert nothing_collected.unreadable is False
-    assert autoreview.decide_evidence(judged(), "", "",
-                                      unreadable=nothing_collected.unreadable).armed
-
-
-def test_a_secret_outranks_an_untrimmable_diff():
-    """Invariant 8: a packet that is both reports the SECRET, which is the one that says
-    where to go and look."""
-    d = autoreview.decide_evidence(judged(), "", f'+api_key = "{SECRET_VALUE}"',
-                                   unreadable=True)
-    assert d.code == autoreview.HELD_EVIDENCE_SECRET
+    (confirmation,) = questions()
+    assert confirmation["kind"] == autoreview.QUESTION_KIND
+    assert store.all_assumptions(wo["id"])[0]["confirm_question_id"] == confirmation["id"]
+    assert held_codes(store, wo["id"]) == []
+    assert "spec line that says something" not in confirmation["question"]

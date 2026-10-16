@@ -330,6 +330,10 @@ def build_packet_prompt(packet: EvidencePacket) -> str:
     212). The panel gets no say in whether the user WANTS one — that review runs in
     parallel — only in whether it is wrong.
 
+    **THIS IS NOW THE ONLY PLACE IN THE SYSTEM that checks delivered code against an
+    assumption's sentence.** The delivery-time Neo confirmation no longer sees a diff:
+    docs/superpowers/specs/2026-10-14-neo-never-reads-a-diff.md.
+
     When the unit carries a spec section, that section is the standard the change is held
     to and the brief is demoted to the scope boundary around it — the heading says so,
     because a seat handed two descriptions of the same work will otherwise pick whichever
@@ -376,7 +380,12 @@ def build_packet_prompt(packet: EvidencePacket) -> str:
             "and you are not being asked for that. Whether it is WRONG is yours: a bad "
             "call is a defect like any other and you may reject over one. `accepted` "
             "means the user agreed with the sentence, not that anyone checked the code "
-            f"against it.\n\n{called}")
+            "against it. CHECK THE DIFF AGAINST EACH SENTENCE and raise a finding where "
+            "the diff contradicts, does not implement, or exceeds what the assumption "
+            "says, naming the assumption number and the part of the diff.\n\n"
+            # The ONLY place this is done: the delivery-time Neo confirmation sees no
+            # diff (docs/superpowers/specs/2026-10-14-neo-never-reads-a-diff.md).
+            f"{called}")
     if packet.history:
         parts.append(_history_section(packet))
     parts += _pull_request_sections(packet)
