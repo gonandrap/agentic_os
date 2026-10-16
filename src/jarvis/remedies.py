@@ -28,6 +28,11 @@ from pathlib import Path
 from functools import lru_cache
 from typing import Any, Callable, Mapping
 
+# User decision #11: every borrowed field a reviewer reads is tagged and bounded here,
+# with gates.py's constants and gates.py's idiom. No new limit and no new module.
+from .provenance import (CONTEXT_LIMIT, DESCRIPTION_LIMIT, EVIDENCE_LIMIT, TITLE_LIMIT,
+                         Borrowed, borrowed_context, borrowed_sections)
+
 log = logging.getLogger("remedies")
 
 #: The gate a remedy rides. Not a command gate: nothing here is ever run by a shell.
@@ -1525,19 +1530,32 @@ def _request_question(project: str, subject_id: str, remedy: Remedy, argument: s
         tail = ("Approve it to let the OS act, or deny it with a reason. Denying leaves "
                 "the alarm open and with the user, which is the safe answer whenever the "
                 "case for acting is not made.")
+    # Decision #11: the three fields the OS did not write are tagged and bounded, with
+    # `gates.build_request_question`'s idiom and its constants.
+    author = "the user" if by_user else "the supervisor"
     parts = [
         f"SELF-HEAL REQUEST — gate `{GATE_KIND}`",
         lead,
         f"# The remedy\n"
         f"What it does: {remedy.headline}\n"
         f"What it touches, and what it cannot undo: {remedy.blast}\n"
-        f"{actor}: {argument.strip() or '(nothing given)'}",
-        f"{wants}\n{reason.strip() or '(no reason given)'}",
+        f"{actor}:",
     ]
+    parts += borrowed_sections((
+        Borrowed(label=actor[0].lower() + actor[1:], whose=author, text=argument,
+                 limit=DESCRIPTION_LIMIT, absent="(nothing given)"),))
+    parts.append(wants)
+    parts += borrowed_sections((
+        Borrowed(label=wants.lstrip("# ")[0].lower() + wants.lstrip("# ")[1:],
+                 whose=author, text=reason, limit=DESCRIPTION_LIMIT,
+                 absent="(no reason given)"),))
     # An empty evidence packet is a FACT about an alarm's proposal and worth saying; on
     # the user's path there is no packet to be empty, so saying it would invent a gap.
     if evidence.strip():
-        parts.append(evidence.strip())
+        parts += borrowed_sections((
+            Borrowed(label="the alarm's evidence packet",
+                     whose="the OS's detectors, quoting the worker's own session",
+                     text=evidence, limit=EVIDENCE_LIMIT),))
     elif not by_user:
         parts.append("(the evidence packet was empty)")
     parts.append(tail)
@@ -1598,7 +1616,12 @@ def propose(pstore: Any, neo: Any, project: str, subject: dict[str, Any],
     question = neo.ask(
         project, carrier,
         _request_question(project, subject_id, remedy, argument, evidence, reason),
-        context=f"{subject.get('title') or ''}\n{alarm.get('reason') or ''}",
+        # Decision #11: both halves of the context are borrowed, and both are bounded.
+        context=borrowed_context((
+            Borrowed(label="the subject's title", whose="whoever filed it",
+                     text=subject.get("title") or "", limit=TITLE_LIMIT),
+            Borrowed(label="the alarm's reason", whose="the OS detector that raised it",
+                     text=alarm.get("reason") or "", limit=CONTEXT_LIMIT))),
         # THE EXISTING KIND. A `self_heal` request is an approval, `neo_store.Q_KINDS`
         # already carries it, and `Daemon._deliver_gate_verdict` looks its subject up in
         # `approvals` — which is where this row lives. Adding a kind would need a
@@ -1670,7 +1693,12 @@ def propose_fix(pstore: Any, neo: Any, project: str, subject: dict[str, Any],
         project, carrier,
         _request_question(project, subject_id, remedy, argument, "", reason,
                           by_user=True),
-        context=f"{subject.get('title') or ''}\n{reason}",
+        # Decision #11, `propose`'s bounds — here the second half is the user's reason.
+        context=borrowed_context((
+            Borrowed(label="the subject's title", whose="whoever filed it",
+                     text=subject.get("title") or "", limit=TITLE_LIMIT),
+            Borrowed(label="why the user asked for it", whose="the user",
+                     text=reason, limit=CONTEXT_LIMIT))),
         kind="approval",   # the existing kind, for `propose`'s reasons
     )
     pstore.link_neo_question(approval["id"], question["id"])

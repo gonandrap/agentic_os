@@ -1084,12 +1084,24 @@ def escalation_context(evidence: str, verdict: dict[str, Any]) -> str:
     headless and it can look nothing up, so dropping the packet to save tokens would
     leave it ruling on a one-line summary of a judgement it is being asked to re-take.
     """
+    # Decision #11: the packet and the model's reasoning are both borrowed text, and
+    # both were unbounded. `gates.build_request_question`'s idiom and its constants.
+    from .provenance import (DESCRIPTION_LIMIT, EVIDENCE_LIMIT, Borrowed,
+                             borrowed_block)
+
     return "\n\n".join([
-        evidence,
+        borrowed_block(Borrowed(
+            label="the alarm's evidence packet",
+            whose="the OS's detectors, quoting the worker's own session",
+            text=evidence, limit=EVIDENCE_LIMIT)),
         "\n".join([
             "# What the supervisor made of it",
             "It could not settle this alarm and handed it to you.",
-            f"Its reasoning: {verdict['reason']}",
+            "Its reasoning:",
+            borrowed_block(Borrowed(label="the supervisor's reasoning",
+                                    whose="the supervisor model",
+                                    text=verdict["reason"],
+                                    limit=DESCRIPTION_LIMIT)),
         ]),
     ])
 
@@ -1102,9 +1114,22 @@ def _question_for(verdict: dict[str, Any], alarm: dict[str, Any]) -> str:
     and a `questions` row with no text is unanswerable by Neo AND unreadable by the user
     it would then be escalated to.
     """
-    return verdict["question"].strip() or (
-        f"The supervisor could not settle this alarm: {alarm['reason']}. "
-        f"Does this spend need the user?")
+    # Decision #11: the model's question and the alarm's reason are borrowed text, and
+    # both reached Neo whole.
+    from .provenance import DESCRIPTION_LIMIT, Borrowed, borrowed_block
+
+    asked = verdict["question"].strip()
+    if asked:
+        return borrowed_block(Borrowed(label="the supervisor's question",
+                                       whose="the supervisor model", text=asked,
+                                       limit=DESCRIPTION_LIMIT))
+    return "\n".join([
+        "The supervisor could not settle this alarm:",
+        borrowed_block(Borrowed(label="the alarm's reason",
+                                whose="the OS detector that raised it",
+                                text=alarm["reason"], limit=DESCRIPTION_LIMIT)),
+        "Does this spend need the user?",
+    ])
 
 
 def _apply(pstore: Any, neo_store: Any, central: Any, project: str, wo: dict[str, Any],

@@ -98,6 +98,10 @@ only the server holds the document. See "Rejected alternatives" for `?section=N`
 No cache, no clipping. `sections.clip_at_heading` exists for a prompt budget; a page whose
 entire job is to be readable does not have one.
 
+**Note (2026-10-15):** `sections.clip_at_heading` is gone — Neo ruling Q1880 gives plan
+review the heading OUTLINE, never the document text, so nothing had a prompt budget to clip
+for (kn-b456d5b0).
+
 ### 2. The renderer: `src/jarvis/ui/markdown.py`, escape-first, stdlib only
 
 New module. No FastAPI, no Jinja, no I/O — pure functions over text, so it is unit-testable

@@ -76,6 +76,7 @@ import re
 import time
 from collections.abc import Collection
 from dataclasses import dataclass
+from itertools import zip_longest
 from typing import Any
 
 from . import specs
@@ -1614,11 +1615,86 @@ def _spec_block(spec: dict[str, str] | None, chars: int) -> str:
     if not text:
         return (f"{SPEC_HEADING} — {ref}\n  (no spec section in the packet: the named "
                 f"section did not resolve in that document)")
+    return f"{SPEC_HEADING} — {ref}\n{SPEC_INTRO}\n{_bounded(text, chars, ref)}"
+
+
+def _bounded(text: str, chars: int, ref: str) -> str:
+    """`chars` of the section, with any cut ANNOUNCED IN WORDS and the reference repeated
+    so the reviewer can go and read the rest."""
     body = text[:chars]
     if len(text) > chars:
         body += (f"\n[spec section truncated — {len(body):,} of {len(text):,} chars; "
                  f"full section: {ref}]")
-    return f"{SPEC_HEADING} — {ref}\n{SPEC_INTRO}\n{body}"
+    return body
+
+
+#: The SECOND spec block: the sections this ASSUMPTION cites, which need not be the
+#: section the work order was built to. User decision 2026-10-14 (Neo learning #102), and
+#: Neo's rulings on it: it SUPPLEMENTS the block above, never replaces it, and the two
+#: SHARE `validation.assumption_spec_chars` (Q1884). Resolved at `ops.assume` time and
+#: read off the row (`assumptions.spec_text`); nothing is read from disk here, because the
+#: worktree the path was valid in is gone by now.
+CITED_HEADING = "# THE SPEC SECTION THIS ASSUMPTION CITES — authority you may CITE"
+CITED_INTRO = ("The assumption above argues from this section. Where it settles the "
+               "assumption, rule on it and cite the section.")
+
+
+def _cited_ref(assumption: dict[str, Any]) -> str:
+    """Every reference the pointer columns name, read off them pairwise.
+
+    `spec_path`/`spec_which` are parallel newline lists in `spec_text`'s order, and ALL N
+    are named so none is invisible on the reference line (user decision 2026-10-15). A
+    length disagreement is reported, never crashed on and never silently dropped.
+    """
+    paths = (assumption.get("spec_path") or "").splitlines()
+    whichs = (assumption.get("spec_which") or "").splitlines()
+    refs = [f"{p or '(no path recorded)'} § {w or '(no section named)'}"
+            for p, w in zip_longest(paths, whichs, fillvalue="")]
+    ref = "; ".join(refs) or "(no path recorded) § (no section named)"
+    if len(paths) != len(whichs):
+        ref += (f" [{len(paths)} paths recorded against {len(whichs)} section names — "
+                f"the pairing above may be wrong]")
+    return ref
+
+
+def _cited_block(assumption: dict[str, Any], chars: int) -> str:
+    """The sections the assumption cites, as `ops.assume` labelled them.
+
+    Each body carries its own `<path> § <which>:` line (Neo ruling Q1883).
+    """
+    text = (assumption.get("spec_text") or "").strip()
+    ref = _cited_ref(assumption)
+    return f"{CITED_HEADING} — {ref}\n{CITED_INTRO}\n{_bounded(text, chars, ref)}"
+
+
+def _spec_blocks(assumption: dict[str, Any], spec: dict[str, str] | None,
+                 chars: int) -> list[str]:
+    """The work order's spec block, then the sections the assumption cites if it cites any.
+
+    ONE budget, need-based, with half as a FLOOR (Neo ruling Q1884): a block under the
+    floor is whole and donates its remainder to the oversized one, so only a block that
+    is actually too long is trimmed. No new catalog setting.
+    """
+    cited = (assumption.get("spec_text") or "").strip()
+    built_to = ((spec or {}).get("section_text") or "").strip()
+    if not cited:
+        return [_spec_block(spec, chars)]
+    if not built_to:
+        return [_spec_block(spec, chars), _cited_block(assumption, chars)]
+    a, b = _share(len(built_to), len(cited), chars)
+    return [_spec_block(spec, a), _cited_block(assumption, b)]
+
+
+def _share(a: int, b: int, chars: int) -> tuple[int, int]:
+    """What each of two blocks of size `a` and `b` may spend of one `chars` budget."""
+    floor = chars // 2
+    if a + b <= chars:
+        return a, b
+    if a <= floor:
+        return a, chars - a
+    if b <= floor:
+        return chars - b, b
+    return floor, floor
 
 
 def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any],
@@ -1672,7 +1748,7 @@ def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any
         f"# The assumption\n{assumption.get('content') or '(empty)'}",
         f"# The work order it was recorded against\n{wo.get('title') or '(untitled)'}\n"
         f"{(wo.get('description') or '')[:2000]}",
-        _spec_block(spec, spec_chars),
+        *_spec_blocks(assumption, spec, spec_chars),
         delivered,
         f"# The work order's other assumptions, for context only — do not rule on these\n"
         f"{others}",
@@ -1742,7 +1818,7 @@ def _confirm_question(project: str, wo: dict[str, Any], assumption: dict[str, An
         f"panel's judgement, not yours.",
         f"# The work order it was recorded against\n{wo.get('title') or '(untitled)'}\n"
         f"{(wo.get('description') or '')[:CONFIRM_DESCRIPTION_CHARS]}",
-        _spec_block(spec, spec_chars),
+        *_spec_blocks(assumption, spec, spec_chars),
         f"# What the worker says it delivered\n"
         f"{(wo.get('result_summary') or '(nothing recorded)')[:CONFIRM_SUMMARY_CHARS]}",
         f"# The work order's other assumptions, for context only — do not rule on these\n"
