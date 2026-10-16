@@ -117,8 +117,8 @@ def test_a_flag_cleared_by_something_else_comes_back(started, project, fake_gh):
     """§4's self-heal (kn-2efe73e4): CLEARED is not ACKED, and a violation that still
     stands raises itself again on the next sweep — which is what the raise sitting BEFORE
     the dedupe `continue` buys. After it, only the first sweep to see the violation could
-    ever flag it, and INV-ATTENTION-MISSING cannot put it back (no `completed` in
-    `BLOCKED_STATUSES`)."""
+    ever flag it, and INV-ATTENTION-MISSING cannot put it back (it selects open statuses
+    plus `failed`, never `completed`)."""
     wo = _unmerged(project, started, fake_gh)
     _tick(started, project, sweep=True)
 
