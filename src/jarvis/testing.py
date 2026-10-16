@@ -1784,6 +1784,20 @@ def fake_gh(tmp_path, monkeypatch):
             landed[pr_url] = patch
             path.write_text(json.dumps(landed))
 
+        def pr_state(self, pr_url: str) -> str:
+            """What `gh pr view` would answer for this pull request's `state`.
+
+            The fake's own `roster()` resolution — the registered roster patched by
+            whatever its writes recorded. A test needs it to ask whether a `gh pr close`
+            that RAISED left GitHub alone (wo-7ec57748); no other reader here can say,
+            because a write that failed records no overlay at all.
+            """
+            prs = json.loads(os.environ.get("FAKE_GH_PRS", "{}"))
+            path = gdir / "merged.json"
+            landed = json.loads(path.read_text()) if path.exists() else {}
+            row = {**prs.get(pr_url, {}), **landed.get(pr_url, {})}
+            return str(row.get("state") or "OPEN").upper()
+
         def issue_series(self, base: str) -> str:
             """Make `gh issue create` mint `<base>/1`, `<base>/2`, … one per call.
 

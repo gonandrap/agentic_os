@@ -1444,6 +1444,36 @@ def test_the_suppression_releases_the_moment_the_reopen_succeeds(
     assert store.get_work_order(parked["id"])["status"] == "needs_review"
 
 
+def test_a_close_that_failed_suppresses_nothing(started, project, fake_gh, parked,
+                                                stalled):
+    """THE GUARD IS ON THE OS'S OWN WINDOW, NOT ON THE WORD "started".
+
+    `gh pr close` raising left GitHub exactly as it was: the pull request is still OPEN
+    and the reopen is never attempted. So a CLOSED answer afterwards is somebody else's
+    doing and the user must hear about it — suppressing it would be a mute button on real
+    refused work, on the one path the release test above cannot reach.
+    `pr_resync_unreopened` reads the failed stage for exactly this.
+    """
+    store = stalled
+    fake_gh.fail_pr_close("gh: HTTP 403 — resource not accessible by integration")
+
+    poll(started, store)
+
+    failed = kinds_of(store, parked["id"], "pr_resync_failed")
+    assert len(failed) == 1
+    assert json.loads(failed[0]["payload"])["stage"] == "close"
+    assert resync_calls(fake_gh) == [["pr", "close", PR]]      # the reopen never ran
+    assert fake_gh.pr_state(PR) == "OPEN"
+    assert kinds_of(store, parked["id"], "pr_closed") == []
+
+    fake_gh.set_pr_state(PR, "CLOSED")       # a person shuts it; the OS never did
+    poll(started, store)
+
+    assert len(kinds_of(store, parked["id"], "pr_closed")) == 1
+    assert store.pr_closure_told(parked["id"])
+    assert store.get_work_order(parked["id"])["status"] == "needs_review"
+
+
 def test_a_stall_that_re_arms_buys_one_more_close_and_reopen(
         started, project, fake_gh, parked, stalled, tips):
     """ONE PAIR PER EPISODE, NOT PER PULL REQUEST FOR EVER — `kn-5e93939e` point 3's

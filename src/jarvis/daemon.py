@@ -428,6 +428,32 @@ PR_RESYNC_FAILED_EVENT = "pr_resync_failed"
 PR_RESYNC_CLEARED_EVENT = "pr_resync_cleared"
 
 
+def _opened_episode(store: ProjectStore, wo: dict[str, Any],
+                    kind: str) -> float | None:
+    """When the latest `kind` event opened an episode, or None if there is none.
+
+    THE EPISODE ARITHMETIC, ONCE. All three predicates below ask the same two-part
+    question — "did the latest X happen, and has a Y answered it since?" — and a rule
+    with three expressions is three things free to drift. This half is the opening; the
+    answering half is `_answered_since`.
+    """
+    rows = store.events_of_kind(wo["id"], kind)
+    return float(rows[-1]["ts"]) if rows else None
+
+
+def _answered_since(store: ProjectStore, wo: dict[str, Any], kind: str,
+                    since: float) -> dict[str, Any] | None:
+    """The latest `kind` event at or after `since`, or None — the answering half.
+
+    Returns the ROW, not a bool, because one caller has to read its payload: see
+    `pr_resync_unreopened` on a close that never landed.
+    """
+    rows = store.events_of_kind(wo["id"], kind)
+    if rows and float(rows[-1]["ts"]) >= since:
+        return rows[-1]
+    return None
+
+
 def pr_resync_owed(store: ProjectStore, wo: dict[str, Any]) -> bool:
     """True when this stall episode has not had its ONE close+reopen yet — wo-7ec57748.
 
@@ -435,17 +461,18 @@ def pr_resync_owed(store: ProjectStore, wo: dict[str, Any]) -> bool:
     timeline, never stored. `pr_recompute_stalled`'s event is the dedupe key — one per
     episode by `Daemon._note_recompute_stalled`, re-armed by the push that supersedes the
     stall — so "a stalled event with no attempt at or after it" is exactly one attempt per
-    episode, and the number the remedy decides on is the number the user reads.
+    episode, and the number the remedy decides on is the number the user reads. An attempt
+    whose `gh` call FAILED is an attempt spent: the bound is on what the OS tried, not on
+    what GitHub allowed.
 
     COST: one indexed `wo_events` read, and a second only once the first says there is a
     stall. Paid inside the stalled branch of `Daemon.poll_pull_requests` alone — never on
     the green path.
     """
-    stalled = store.events_of_kind(wo["id"], PR_RECOMPUTE_STALLED_EVENT)
-    if not stalled:
+    stalled = _opened_episode(store, wo, PR_RECOMPUTE_STALLED_EVENT)
+    if stalled is None:
         return False
-    started = store.events_of_kind(wo["id"], PR_RESYNC_STARTED_EVENT)
-    return not (started and float(started[-1]["ts"]) >= float(stalled[-1]["ts"]))
+    return _answered_since(store, wo, PR_RESYNC_STARTED_EVENT, stalled) is None
 
 
 def pr_resync_unreopened(store: ProjectStore, wo: dict[str, Any]) -> bool:
@@ -457,14 +484,23 @@ def pr_resync_unreopened(store: ProjectStore, wo: dict[str, Any]) -> bool:
     was refused. True from before the close (the event is written first) until a
     successful reopen; see `Daemon.resync_pull_request`.
 
+    FALSE AGAIN WHEN THE CLOSE ITSELF FAILED, which is the difference between a guard and
+    a mute button. `gh pr close` raising left GitHub exactly as it was, so a CLOSED
+    answer after that is somebody else's doing and the user must hear about it. The
+    `pr_resync_failed` payload's `stage` is the only record of which `gh` call fell over,
+    so it is what this reads.
+
     A pull request a HUMAN closed has no `pr_resync_started` event at all and is
     unaffected.
     """
-    started = store.events_of_kind(wo["id"], PR_RESYNC_STARTED_EVENT)
-    if not started:
+    started = _opened_episode(store, wo, PR_RESYNC_STARTED_EVENT)
+    if started is None:
         return False
-    done = store.events_of_kind(wo["id"], PR_RESYNC_DONE_EVENT)
-    return not (done and float(done[-1]["ts"]) >= float(started[-1]["ts"]))
+    if _answered_since(store, wo, PR_RESYNC_DONE_EVENT, started):
+        return False
+    failed = _answered_since(store, wo, PR_RESYNC_FAILED_EVENT, started)
+    return not (failed and (db.from_json(failed["payload"], {}) or {}
+                            ).get("stage") == "close")
 
 
 def pr_resync_open(store: ProjectStore, wo: dict[str, Any]) -> bool:
@@ -474,11 +510,10 @@ def pr_resync_open(store: ProjectStore, wo: dict[str, Any]) -> bool:
     `pr_resync_cleared`. Read ONLY on a tick where a stall column actually cleared, so
     the no-write green path pays nothing for it.
     """
-    started = store.events_of_kind(wo["id"], PR_RESYNC_STARTED_EVENT)
-    if not started:
+    started = _opened_episode(store, wo, PR_RESYNC_STARTED_EVENT)
+    if started is None:
         return False
-    cleared = store.events_of_kind(wo["id"], PR_RESYNC_CLEARED_EVENT)
-    return not (cleared and float(cleared[-1]["ts"]) >= float(started[-1]["ts"]))
+    return _answered_since(store, wo, PR_RESYNC_CLEARED_EVENT, started) is None
 
 
 def polls_and_can_act_on_pull_request(store: ProjectStore, wo: dict[str, Any],
@@ -7440,9 +7475,11 @@ class Daemon:
         * AT MOST ONE `gh pr close` PLUS ONE `gh pr reopen` PER STALL EPISODE, with the
           three events they write. Not per tick: the dedupe above is what bounds them, and
           a stall that lasts a day still buys exactly one pair;
-        * ONE indexed read (`pr_resync_unreopened`) inside the `closed_unmerged` branch,
-          which is a branch that ends the order anyway, and ONE (`pr_resync_open`) on the
-          tick a stall column clears — never on a tick where nothing moved.
+        * UP TO THREE indexed reads (`pr_resync_unreopened`) inside the `closed_unmerged`
+          branch, which is a branch that ends the order anyway: the attempts, then the
+          reopens only if the OS ever closed this one, then the failures only if it has
+          not got it open again. ONE read (`pr_resync_open`) on the tick a stall column
+          clears — never on a tick where nothing moved.
 
         The green budget above is unchanged, and the test beside it counts it: a
         `MERGEABLE` pull request reaches none of this.
@@ -9572,6 +9609,20 @@ class Daemon:
         `except` so the record says WHICH stage failed, and a failure returns False with
         the evidence on the timeline — the pull request is left shut, which is what
         `pr_resync_unreopened` goes on reporting.
+
+        **A CLOSE THAT FAILED SUPPRESSES NOTHING, AND THAT IS WHY THE STAGE IS RECORDED.**
+        The guard above is sound only while the OS is the reason the pull request is shut.
+        `gh pr close` raising left GitHub exactly as it was — the pull request is still
+        OPEN, the reopen is never attempted — so a later CLOSED answer is somebody else's
+        doing, and suppressing it would be a mute button on real refused work rather than
+        a guard on the OS's own window. `pr_resync_unreopened` therefore goes false again
+        on a `pr_resync_failed` whose `stage` is `close`, and the two failure stages mean
+        opposite things to it: `close` means nothing happened, `reopen` means the OS owns
+        a shut pull request and must keep saying so.
+
+        The attempt is spent either way: `pr_resync_owed` keys on the `pr_resync_started`
+        event, so a failed close does NOT buy a second pair inside the same episode. The
+        bound is on what the OS tried.
         """
         from . import github, pr_resync
 
