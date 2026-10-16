@@ -750,9 +750,10 @@ def test_plan_hold_and_the_claim_query_agree(started, store):
         assert (store.plan_hold(row) is None) == (claimed is not None), label
 
 
-def test_the_sweep_exclusion_and_the_plan_hold_agree(started, store):
-    """§8(8) of docs/superpowers/specs/2026-10-15-a-plan-held-child-is-not-stuck.md: the
-    third statement of one rule, pinned to the second as the claim SQL already is."""
+def test_the_sweep_exclusion_and_the_claim_query_agree(started, store):
+    """§3 of docs/superpowers/specs/2026-10-15-a-child-held-by-its-features-unratified-plan-is-not-stuck.md:
+    the third statement of one rule, pinned to the claim SQL and NOT to `plan_hold`, which
+    the sweep itself calls to decide the exclusion."""
     import time
 
     from jarvis import stuck
@@ -770,10 +771,15 @@ def test_the_sweep_exclusion_and_the_plan_hold_agree(started, store):
     verdicts = {r["wo"]["id"]: r["verdict"] for r in judged}
 
     for label, wo in matrix:
-        row = store.get_work_order(wo["id"])
-        assert row["status"] == "pending", label
-        assert ((verdicts[wo["id"]].excluded == stuck.PLAN_ASSUMPTIONS_CAUSE)
-                == (store.plan_hold(row) is not None)), label
+        assert store.get_work_order(wo["id"])["status"] == "pending", label
+
+    for label, wo in matrix:
+        for _, other in matrix:
+            store.update_work_order(
+                other["id"], status="pending" if other is wo else "completed")
+        claimed = store.claim_next_pending()
+        assert ((verdicts[wo["id"]].excluded == stuck.PLAN_ASSUMPTION_CAUSE)
+                == (claimed is None)), label
 
 
 def test_a_planner_with_no_pending_assumptions_holds_nothing(started, store):
