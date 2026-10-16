@@ -112,7 +112,8 @@ The two `ops` frozensets and `ops.waiting_on`'s literal are **left as literals**
 work order. Replacing them is a mechanical sweep with its own blast radius across
 `resume-auto`'s diagnosis vocabulary (`tests/test_resume_auto_diagnosis.py:371` asserts the
 string), and a spec that changes the exclusion and that vocabulary in one commit cannot be
-reverted in halves. §10 records it as out of scope and names it.
+reverted in halves. §10 records it as out of scope and names it, and issue #1099 tracks the
+collapse.
 
 **Value, not a new one.** The cause string a surface prints is already
 `"plan_assumptions"` on the merge hold and in `waiting_on`, so a reader who learns it once
@@ -396,7 +397,7 @@ matrix):
   **unchanged** — this spec reads them, it does not touch them.
 - `ops.waiting_on`'s `"plan_assumptions"` literal and the two `ops` frozensets keep their
   literals; collapsing them onto `stuck.PLAN_ASSUMPTIONS_CAUSE` is a separate mechanical
-  work order (§1).
+  work order, tracked as https://github.com/gonandrap/agentic_os/issues/1099 (§1).
 - `invariants.true_blockers`' deliberate silence is untouched.
 - No backfill of `decided_at` for rows settled before it shipped. §4 is explicit that those
   under-discount, and a backfill would have to invent a timestamp.
