@@ -818,6 +818,14 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                 (f"branch at {ref[:10]}, pull request head at {head[:10]}"
                  if ref and head else str(p.get("pr_url") or "")))
     if kind == "pr_resync_done":
+        # TWO WRITERS, ONE EVENT KIND, told apart by `observed`: the OS's own reopen
+        # returning, or the poll SEEING the pull request open again (a reopen that failed
+        # and somebody fixed by hand). Rendering the second as a successful resync would
+        # credit the OS with a repair it did not perform.
+        if p.get("observed"):
+            head = str(p.get("head_oid") or "")
+            return ("Pull request is open again — the resync window is over",
+                    f"head at {head[:10]}" if head else "")
         return "Pull request closed and reopened — waiting for GitHub to answer", ""
     if kind == "pr_resync_failed":
         # THE STAGE IS THE WHOLE POINT: a close that failed changed nothing, and a reopen

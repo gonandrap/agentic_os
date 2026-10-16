@@ -16,7 +16,7 @@ import json
 
 import pytest
 
-from jarvis import db, github, invariants, ops
+from jarvis import db, github, ops
 from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
 from jarvis.invariants import (
@@ -331,7 +331,13 @@ def test_a_green_pull_request_costs_one_call_six_reads_and_no_write(
     assert len([c for c in fake_gh.calls if c["argv"][:2] == ["pr", "view"]]) == 1
     assert not [c for c in fake_gh.calls if c["argv"][:2] == ["run", "list"]]
     assert [s for s in sql if not s.lstrip().upper().startswith("SELECT")] == []
-    assert len([s for s in sql if "wo_events" in s]) == 7
+    # 7 -> 8 DELIBERATELY (wo-7ec57748, round 3): `pr_resync_unreopened`'s first read, the
+    # `pr_resync_started` episode, now runs on the OPEN path of every polled pull request
+    # so the end of a resync window is recorded wherever it is OBSERVED — a person's
+    # reopen included — instead of only when the OS's own `gh pr reopen` returned. Without
+    # it a failed reopen mutes every later real closure for ever. It stops at that one
+    # read for a pull request the OS never closed, which is this one and nearly all.
+    assert len([s for s in sql if "wo_events" in s]) == 8
     # ...and the work-order query is the step's one, for the whole project, not one per
     # pull request: the row is re-read only when a clear has just taken a flag down.
     assert len([s for s in sql if "wo_events" not in s]) == 1
@@ -365,7 +371,9 @@ def test_two_parked_pull_requests_pay_the_per_request_price_twice(
 
     store.conn.set_trace_callback(None)
     assert len([c for c in fake_gh.calls if c["argv"][:2] == ["pr", "view"]]) == 2
-    assert len([s for s in sql if "wo_events" in s]) == 6 * 2 + 1
+    # `6 * n + 1` -> `7 * n + 1`: the resync-window read above is per pull request, which
+    # is what a step with two of them is here to prove.
+    assert len([s for s in sql if "wo_events" in s]) == 7 * 2 + 1
     assert len([s for s in sql if "wo_events" not in s]) == 1
 
 
@@ -391,7 +399,8 @@ def test_the_automatic_merge_costs_a_project_that_has_not_opted_in_nothing(
     poll(started, store)
 
     store.conn.set_trace_callback(None)
-    assert len([s for s in sql if "wo_events" in s]) == 7
+    # 7 -> 8 for the resync-window read, as in the green budget above.
+    assert len([s for s in sql if "wo_events" in s]) == 8
     assert len([s for s in sql if "wo_events" not in s]) == 1
     # ...and no round read, which is what proves the undeclared detector's cheap
     # short-circuit ordering: `refusal_answered` returns True on an order that never had
@@ -438,7 +447,8 @@ def test_an_opted_in_project_declares_what_the_automatic_merge_costs_it(
     # undeclared detector: its short-circuit stops before `judged_heads`.
     assert len([s for s in sql if "validation_rounds" in s]) == 1
     assert len([s for s in sql if "assumptions" in s]) == 1
-    assert len([s for s in sql if "wo_events" in s]) == 8
+    # 8 -> 9 for the resync-window read, as in the green budget above.
+    assert len([s for s in sql if "wo_events" in s]) == 9
     assert not [s for s in sql if "approvals" in s]
 
 
@@ -549,7 +559,8 @@ def test_an_opted_in_project_pays_nothing_for_an_order_awaiting_a_person(
     poll(started, store)
 
     store.conn.set_trace_callback(None)
-    assert len([s for s in sql if "wo_events" in s]) == 7
+    # 7 -> 8 for the resync-window read, as in the green budget above.
+    assert len([s for s in sql if "wo_events" in s]) == 8
     assert not [s for s in sql if "validation_rounds" in s or "assumptions" in s]
 
 
@@ -1390,22 +1401,57 @@ def test_a_reopen_that_fails_says_so_on_the_timeline(started, project, fake_gh, 
     assert store.get_work_order(parked["id"])["status"] == "waiting_pr_merge"
 
 
-@pytest.mark.skipif(not hasattr(invariants, "NO_ACTOR_BLOCKER"),
-                    reason="`invariants.NO_ACTOR_BLOCKER` is wo-d3a70c29's sibling "
-                           "child (`readers`) and has not landed on this base yet")
 def test_a_resync_that_could_not_finish_is_flagged_for_the_user(
         started, project, fake_gh, parked, stalled):
-    """The other half of the one above, gated exactly as wo-d3a70c29 gated its
-    reconcile-tick test: a stall the remedy could not repair has nobody acting on it."""
+    """The other half of the one above: a reopen that failed is the one outcome NOBODY
+    else notices. `pr_recompute_stalled` is OPEN-only so it never fires again, the order
+    sits in `waiting_pr_merge`, and no reader on this base looks at `pr_resync_failed`.
+
+    So the flag is raised here, with a plain reason string — the precedent
+    `release._report_failure` and `budget.escalate` set for a non-invariant caller. The
+    STATUS is untouched: nobody refused this work, the OS broke its own pull request.
+    """
     store = stalled
     fake_gh.fail_pr_reopen("gh: HTTP 403")
+
     poll(started, store)
 
-    started.check_invariants(started.catalog.project("proj_a"), store)
-
+    failed = kinds_of(store, parked["id"], "pr_resync_failed")
+    assert len(failed) == 1
+    assert json.loads(failed[0]["payload"])["stage"] == "reopen"
     row = store.get_work_order(parked["id"])
     assert bool(row["needs_attention"])
-    assert row["attention_reason"] == invariants.NO_ACTOR_BLOCKER
+    assert PR in row["attention_reason"]
+    assert HEAD[:7] in row["attention_reason"]
+    assert row["status"] == "waiting_pr_merge"
+    assert row["status"] != "needs_review"
+    assert kinds_of(store, parked["id"], "pr_closed") == []
+
+
+def test_a_hand_reopened_pull_request_closed_for_real_still_reaches_the_user(
+        started, project, fake_gh, parked, stalled):
+    """THE WINDOW ENDS WHEN THE PULL REQUEST IS OPEN AGAIN, however that happened.
+
+    A failed reopen leaves `pr_resync_unreopened` true for ever, so if a person repairs
+    the pull request by hand and later closes it for real, the `closed_unmerged` branch
+    takes the log-only arm for ever — a mute button on genuinely refused work. The poll
+    observing it OPEN is what closes the window, and it records that observation.
+    """
+    store = stalled
+    fake_gh.fail_pr_reopen("gh: HTTP 403")
+    poll(started, store)                     # the OS closes it; the reopen fails
+
+    fake_gh.set_pr_state(PR, "OPEN")         # a person repairs it by hand
+    poll(started, store)
+    fake_gh.set_pr_state(PR, "CLOSED")       # ...and later refuses the work for real
+    poll(started, store)
+
+    assert len(kinds_of(store, parked["id"], "pr_closed")) == 1
+    assert store.pr_closure_told(parked["id"])
+    assert store.get_work_order(parked["id"])["status"] == "needs_review"
+    observed = [e for e in kinds_of(store, parked["id"], "pr_resync_done")
+                if json.loads(e["payload"]).get("observed")]
+    assert len(observed) == 1
 
 
 def test_the_os_own_closure_is_never_read_as_refused_work(started, project, fake_gh,
