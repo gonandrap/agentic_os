@@ -12,9 +12,11 @@ take the user's review item off their list.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from jarvis import db, ops
+from jarvis import db, github, ops
 from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
 from jarvis.invariants import (
@@ -329,7 +331,13 @@ def test_a_green_pull_request_costs_one_call_six_reads_and_no_write(
     assert len([c for c in fake_gh.calls if c["argv"][:2] == ["pr", "view"]]) == 1
     assert not [c for c in fake_gh.calls if c["argv"][:2] == ["run", "list"]]
     assert [s for s in sql if not s.lstrip().upper().startswith("SELECT")] == []
-    assert len([s for s in sql if "wo_events" in s]) == 7
+    # 7 -> 8 DELIBERATELY (wo-7ec57748, round 3): `pr_resync_unreopened`'s first read, the
+    # `pr_resync_started` episode, now runs on the OPEN path of every polled pull request
+    # so the end of a resync window is recorded wherever it is OBSERVED — a person's
+    # reopen included — instead of only when the OS's own `gh pr reopen` returned. Without
+    # it a failed reopen mutes every later real closure for ever. It stops at that one
+    # read for a pull request the OS never closed, which is this one and nearly all.
+    assert len([s for s in sql if "wo_events" in s]) == 8
     # ...and the work-order query is the step's one, for the whole project, not one per
     # pull request: the row is re-read only when a clear has just taken a flag down.
     assert len([s for s in sql if "wo_events" not in s]) == 1
@@ -363,7 +371,9 @@ def test_two_parked_pull_requests_pay_the_per_request_price_twice(
 
     store.conn.set_trace_callback(None)
     assert len([c for c in fake_gh.calls if c["argv"][:2] == ["pr", "view"]]) == 2
-    assert len([s for s in sql if "wo_events" in s]) == 6 * 2 + 1
+    # `6 * n + 1` -> `7 * n + 1`: the resync-window read above is per pull request, which
+    # is what a step with two of them is here to prove.
+    assert len([s for s in sql if "wo_events" in s]) == 7 * 2 + 1
     assert len([s for s in sql if "wo_events" not in s]) == 1
 
 
@@ -389,7 +399,8 @@ def test_the_automatic_merge_costs_a_project_that_has_not_opted_in_nothing(
     poll(started, store)
 
     store.conn.set_trace_callback(None)
-    assert len([s for s in sql if "wo_events" in s]) == 7
+    # 7 -> 8 for the resync-window read, as in the green budget above.
+    assert len([s for s in sql if "wo_events" in s]) == 8
     assert len([s for s in sql if "wo_events" not in s]) == 1
     # ...and no round read, which is what proves the undeclared detector's cheap
     # short-circuit ordering: `refusal_answered` returns True on an order that never had
@@ -436,7 +447,8 @@ def test_an_opted_in_project_declares_what_the_automatic_merge_costs_it(
     # undeclared detector: its short-circuit stops before `judged_heads`.
     assert len([s for s in sql if "validation_rounds" in s]) == 1
     assert len([s for s in sql if "assumptions" in s]) == 1
-    assert len([s for s in sql if "wo_events" in s]) == 8
+    # 8 -> 9 for the resync-window read, as in the green budget above.
+    assert len([s for s in sql if "wo_events" in s]) == 9
     assert not [s for s in sql if "approvals" in s]
 
 
@@ -547,7 +559,8 @@ def test_an_opted_in_project_pays_nothing_for_an_order_awaiting_a_person(
     poll(started, store)
 
     store.conn.set_trace_callback(None)
-    assert len([s for s in sql if "wo_events" in s]) == 7
+    # 7 -> 8 for the resync-window read, as in the green budget above.
+    assert len([s for s in sql if "wo_events" in s]) == 8
     assert not [s for s in sql if "validation_rounds" in s or "assumptions" in s]
 
 
@@ -1287,3 +1300,310 @@ def test_an_unreadable_ls_remote_leaves_the_cache_standing(started, project, fak
     row = store.get_work_order(parked["id"])
     assert row["pr_ref_oid"] in (None, "")
     assert row["pr_mergeable_unknown_since"]          # the poll still did its work
+
+
+# -- and the OS closes and reopens it ONCE to force the resync (wo-7ec57748) -----------
+
+#: How long #995 sat with mergeability unanswered. Past every plausible
+#: `pull_requests.recompute_stall_minutes`, so condition (b) of `pr_recompute_stalled`
+#: holds as well as condition (a) — the recorded state, not a cheaper half of it.
+STALLED_FOR = 7 * 3600
+
+#: Where the branch is after a LATER push, for the episode that re-arms.
+RETIP = "d" * 40
+
+
+def resync_calls(fake_gh) -> list[list[str]]:
+    """Every `gh pr close` / `gh pr reopen` the fake was asked for, in order."""
+    return [c["argv"][:3] for c in fake_gh.calls
+            if c["argv"][:2] in (["pr", "close"], ["pr", "reopen"])]
+
+
+def kinds_of(store, wo_id: str, kind: str) -> list[dict]:
+    return [e for e in store.list_events(wo_id) if e["kind"] == kind]
+
+
+@pytest.fixture()
+def stalled(started, project, fake_gh, parked, tips):
+    """#995's recorded state: OPEN, head at 0488753, branch tip at 88cac10, mergeability
+    unanswered for 7h — the shape a hand close+reopen fixed."""
+    tips({BRANCH: TIP})
+    unknown(fake_gh)
+    store = ProjectStore(project)
+    store.update_work_order(parked["id"],
+                            pr_mergeable_unknown_since=db.now() - STALLED_FOR)
+    return store
+
+
+def test_a_stalled_pull_request_is_closed_and_reopened_exactly_once(
+        started, project, fake_gh, parked, stalled):
+    """THE REMEDY, and it is one attempt per episode — `ProjectStore._this_conflict`'s
+    rule that episode state is DERIVED from the timeline (kn-5e93939e point 2), with the
+    `pr_recompute_stalled` event as the dedupe key its own docstring promises.
+
+    Close THEN reopen, in that order: the two are one operation to the rest of the OS,
+    and `pr_resync_unreopened` is what stops the OS reading its own closure as a refusal.
+    """
+    store = stalled
+
+    poll(started, store)
+    first = resync_calls(fake_gh)
+    poll(started, store)
+
+    assert first == [["pr", "close", PR], ["pr", "reopen", PR]]
+    assert resync_calls(fake_gh) == first          # a second tick asks for neither again
+    assert len(kinds_of(store, parked["id"], "pr_resync_started")) == 1
+    assert len(kinds_of(store, parked["id"], "pr_resync_done")) == 1
+    payload = json.loads(kinds_of(store, parked["id"], "pr_resync_started")[0]["payload"])
+    assert (payload["pr_url"], payload["head_oid"], payload["ref_oid"]) == (PR, HEAD, TIP)
+
+
+def test_the_poll_after_the_resync_closes_the_episode_and_flags_nobody(
+        started, project, fake_gh, parked, stalled):
+    """GitHub recomputing again IS the clearing — `_note_recompute_stalled`'s rule that
+    the columns clearing is the clearing, written once so the timeline says the episode
+    ended. The order stays parked and silent: nothing here nudges or flags."""
+    store = stalled
+    poll(started, store)
+
+    # what the hand fix produced on #995: the pull request catches up to the branch.
+    fake_gh.set_pr(PR, "OPEN", mergeable="MERGEABLE", base_ref="main", checks=GREEN,
+                   head_oid=TIP, head_ref=BRANCH)
+    poll(started, store)
+
+    assert len(kinds_of(store, parked["id"], "pr_resync_cleared")) == 1
+    cleared = json.loads(kinds_of(store, parked["id"], "pr_resync_cleared")[0]["payload"])
+    assert (cleared["pr_url"], cleared["head_oid"]) == (PR, TIP)
+    row = store.get_work_order(parked["id"])
+    assert row["status"] == "waiting_pr_merge"
+    assert not row["needs_attention"]
+
+
+def test_a_reopen_that_fails_says_so_on_the_timeline(started, project, fake_gh, parked,
+                                                     stalled):
+    """`fail_merge`'s rationale: the likeliest real failure is credentials that read and
+    cannot write, and it must leave the evidence rather than a refused work order.
+
+    `record_pr_closed` is NOT what a failed reopen means — the pull request is shut
+    because the OS shut it.
+    """
+    store = stalled
+    fake_gh.fail_pr_reopen("gh: HTTP 403 — resource not accessible by integration")
+
+    poll(started, store)
+
+    failed = kinds_of(store, parked["id"], "pr_resync_failed")
+    assert len(failed) == 1
+    payload = json.loads(failed[0]["payload"])
+    assert payload["stage"] == "reopen"
+    assert (payload["pr_url"], payload["head_oid"], payload["ref_oid"]) == (PR, HEAD, TIP)
+    assert "403" in payload["error"]
+    assert store.get_work_order(parked["id"])["status"] == "waiting_pr_merge"
+
+
+def test_a_resync_that_could_not_finish_is_flagged_for_the_user(
+        started, project, fake_gh, parked, stalled):
+    """The other half of the one above: a reopen that failed is the one outcome NOBODY
+    else notices. `pr_recompute_stalled` is OPEN-only so it never fires again, the order
+    sits in `waiting_pr_merge`, and no reader on this base looks at `pr_resync_failed`.
+
+    So the flag is raised here, with a plain reason string — the precedent
+    `release._report_failure` and `budget.escalate` set for a non-invariant caller. The
+    STATUS is untouched: nobody refused this work, the OS broke its own pull request.
+    """
+    store = stalled
+    fake_gh.fail_pr_reopen("gh: HTTP 403")
+
+    poll(started, store)
+
+    failed = kinds_of(store, parked["id"], "pr_resync_failed")
+    assert len(failed) == 1
+    assert json.loads(failed[0]["payload"])["stage"] == "reopen"
+    row = store.get_work_order(parked["id"])
+    assert bool(row["needs_attention"])
+    assert PR in row["attention_reason"]
+    assert HEAD[:7] in row["attention_reason"]
+    assert row["status"] == "waiting_pr_merge"
+    assert row["status"] != "needs_review"
+    assert kinds_of(store, parked["id"], "pr_closed") == []
+
+
+def test_a_hand_reopened_pull_request_closed_for_real_still_reaches_the_user(
+        started, project, fake_gh, parked, stalled):
+    """THE WINDOW ENDS WHEN THE PULL REQUEST IS OPEN AGAIN, however that happened.
+
+    A failed reopen leaves `pr_resync_unreopened` true for ever, so if a person repairs
+    the pull request by hand and later closes it for real, the `closed_unmerged` branch
+    takes the log-only arm for ever — a mute button on genuinely refused work. The poll
+    observing it OPEN is what closes the window, and it records that observation.
+    """
+    store = stalled
+    fake_gh.fail_pr_reopen("gh: HTTP 403")
+    poll(started, store)                     # the OS closes it; the reopen fails
+
+    fake_gh.set_pr_state(PR, "OPEN")         # a person repairs it by hand
+    poll(started, store)
+    fake_gh.set_pr_state(PR, "CLOSED")       # ...and later refuses the work for real
+    poll(started, store)
+
+    assert len(kinds_of(store, parked["id"], "pr_closed")) == 1
+    assert store.pr_closure_told(parked["id"])
+    assert store.get_work_order(parked["id"])["status"] == "needs_review"
+    observed = [e for e in kinds_of(store, parked["id"], "pr_resync_done")
+                if json.loads(e["payload"]).get("observed")]
+    assert len(observed) == 1
+
+
+def test_the_os_own_closure_is_never_read_as_refused_work(started, project, fake_gh,
+                                                          parked, stalled):
+    """THE HAZARD `resync_pull_request` writes its event before the close for. Between
+    the close and a reopen that never happened, `gh pr view` answers CLOSED and unmerged
+    — and routing that into `ops.record_pr_closed` would tell the user their work was
+    refused by the OS that closed it."""
+    store = stalled
+    fake_gh.fail_pr_reopen("gh: HTTP 403")
+    poll(started, store)                     # closes it, and cannot get it open again
+
+    poll(started, store)                     # the next tick observes CLOSED, unmerged
+
+    assert kinds_of(store, parked["id"], "pr_closed") == []
+    assert not store.pr_closure_told(parked["id"])
+    assert store.get_work_order(parked["id"])["status"] == "waiting_pr_merge"
+
+
+def test_the_suppression_releases_the_moment_the_reopen_succeeds(
+        started, project, fake_gh, parked, stalled):
+    """THE SUPPRESSION IS NOT A MUTE BUTTON. `pr_resync_unreopened` goes false on the
+    `pr_resync_done` event, so a human closing the pull request AFTER a successful resync
+    is refused work like any other — the test above only pins the failed-reopen side, and
+    a `pr_resync_done` written on the wrong side of the reopen would otherwise silence
+    every later real closure for ever with nothing noticing."""
+    store = stalled
+    poll(started, store)
+    assert len(kinds_of(store, parked["id"], "pr_resync_done")) == 1
+
+    fake_gh.set_pr_state(PR, "CLOSED")       # a person shuts it, after the OS's episode
+    poll(started, store)
+
+    assert len(kinds_of(store, parked["id"], "pr_closed")) == 1
+    assert store.pr_closure_told(parked["id"])
+    assert store.get_work_order(parked["id"])["status"] == "needs_review"
+
+
+def test_a_close_that_failed_suppresses_nothing(started, project, fake_gh, parked,
+                                                stalled):
+    """THE GUARD IS ON THE OS'S OWN WINDOW, NOT ON THE WORD "started".
+
+    `gh pr close` raising left GitHub exactly as it was: the pull request is still OPEN
+    and the reopen is never attempted. So a CLOSED answer afterwards is somebody else's
+    doing and the user must hear about it — suppressing it would be a mute button on real
+    refused work, on the one path the release test above cannot reach.
+    `pr_resync_unreopened` reads the failed stage for exactly this.
+    """
+    store = stalled
+    fake_gh.fail_pr_close("gh: HTTP 403 — resource not accessible by integration")
+
+    poll(started, store)
+
+    failed = kinds_of(store, parked["id"], "pr_resync_failed")
+    assert len(failed) == 1
+    assert json.loads(failed[0]["payload"])["stage"] == "close"
+    assert resync_calls(fake_gh) == [["pr", "close", PR]]      # the reopen never ran
+    assert fake_gh.pr_state(PR) == "OPEN"
+    assert kinds_of(store, parked["id"], "pr_closed") == []
+
+    fake_gh.set_pr_state(PR, "CLOSED")       # a person shuts it; the OS never did
+    poll(started, store)
+
+    assert len(kinds_of(store, parked["id"], "pr_closed")) == 1
+    assert store.pr_closure_told(parked["id"])
+    assert store.get_work_order(parked["id"])["status"] == "needs_review"
+
+
+def test_a_stall_that_re_arms_buys_one_more_close_and_reopen(
+        started, project, fake_gh, parked, stalled, tips):
+    """ONE PAIR PER EPISODE, NOT PER PULL REQUEST FOR EVER — `kn-5e93939e` point 3's
+    budget reset, which `_note_recompute_stalled` already re-arms by the clock: a branch
+    that stalls again next week gets a fresh attempt, not attempt two.
+
+    The same-episode tick buys nothing, which
+    `test_a_stalled_pull_request_is_closed_and_reopened_exactly_once` pins on its second
+    poll and the last assertion here pins again after the re-arm.
+    """
+    store = stalled
+    poll(started, store)
+    fake_gh.set_pr(PR, "OPEN", mergeable="MERGEABLE", base_ref="main", checks=GREEN,
+                   head_oid=TIP, head_ref=BRANCH)
+    poll(started, store)                     # GitHub answers again: episode cleared
+    assert len(kinds_of(store, parked["id"], "pr_resync_cleared")) == 1
+
+    # A LATER PUSH STALLS THE SAME WAY: the head moved, the branch moved further, and
+    # mergeability has been unanswered past the threshold all over again.
+    tips({BRANCH: RETIP})
+    unknown(fake_gh, head_oid=MOVED)
+    poll(started, store)
+    store.update_work_order(parked["id"],
+                            pr_mergeable_unknown_since=db.now() - STALLED_FOR)
+    poll(started, store)
+
+    assert len(kinds_of(store, parked["id"], "pr_recompute_stalled")) == 2
+    assert resync_calls(fake_gh) == [["pr", "close", PR], ["pr", "reopen", PR]] * 2
+    assert len(kinds_of(store, parked["id"], "pr_resync_started")) == 2
+
+    poll(started, store)                     # ...and the second episode is spent too
+    assert len(kinds_of(store, parked["id"], "pr_resync_started")) == 2
+
+
+def test_a_pull_request_a_human_closed_still_reaches_the_user(started, project, fake_gh,
+                                                              parked, tips):
+    """The negative control beside it, in the same file: no resync events, so the
+    closure is somebody's decision and `record_pr_closed` runs unchanged."""
+    tips({BRANCH: TIP})
+    fake_gh.set_pr(PR, "CLOSED", head_oid=HEAD, head_ref=BRANCH)
+    store = ProjectStore(project)
+
+    poll(started, store)
+
+    assert len(kinds_of(store, parked["id"], "pr_closed")) == 1
+    assert store.get_work_order(parked["id"])["status"] == "needs_review"
+
+
+def test_a_validating_work_order_is_never_resynced(started, project, fake_gh, parked,
+                                                   stalled):
+    """`PR_REPAIR_STATUSES` bounds this like every other repair: an open validation round
+    owns the session and the pull request it is judging."""
+    store = stalled
+    store.set_status(parked["id"], "validating")
+
+    poll(started, store)
+
+    assert resync_calls(fake_gh) == []
+    assert kinds_of(store, parked["id"], "pr_resync_started") == []
+
+
+def test_the_resync_module_builds_only_the_two_commands_it_declares():
+    """`tests/test_base_heal.py`'s AST test, copied for the second write module: the
+    allowlist is the mechanism, so a third `gh` command here has to arrive in a commit
+    that also changes this test. `github.py` stays read-only — Neo question 251."""
+    import ast
+    import inspect
+
+    from jarvis import pr_resync
+
+    tree = ast.parse(inspect.getsource(pr_resync))
+    verbs = {tuple(e.value for e in node.elts[:2])
+             for node in ast.walk(tree)
+             if isinstance(node, ast.List) and len(node.elts) >= 2
+             and all(isinstance(e, ast.Constant) and isinstance(e.value, str)
+                     for e in node.elts[:2])}
+    assert verbs <= set(pr_resync.VERBS), \
+        f"undeclared `gh` command: {sorted(verbs - set(pr_resync.VERBS))}"
+    assert set(pr_resync.WRITE_VERBS) == {("pr", "close"), ("pr", "reopen")}
+    assert ("pr", "close") not in set(github.READ_ONLY_VERBS)
+    # NO FLAG REACHES EITHER ARGUMENT LIST — `--delete-branch` would destroy the work the
+    # reopen needs, and `--comment` would author content on somebody's pull request.
+    flags = {e.value for node in ast.walk(tree) if isinstance(node, ast.List)
+             for e in node.elts
+             if isinstance(e, ast.Constant) and isinstance(e.value, str)
+             and e.value.startswith("--")}
+    assert flags == set()
