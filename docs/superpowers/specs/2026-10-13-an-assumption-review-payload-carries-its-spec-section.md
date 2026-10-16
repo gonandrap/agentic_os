@@ -79,6 +79,13 @@ Three independent parts. (A) and (B) together close the escalation; (C) closes t
 which is what makes the cite line in (B) openable. **(B) is SUPERSEDED — it shipped from main, not
 from here; see the note in §2.2.**
 
+> **Mechanism note.** The section a payload carries is resolved from the IN-TEXT reference form
+> (`sections.find_refs`, `sections.py:3-14`) and from `work_orders.spec_section` — never from a new
+> CLI flag or schema. Settled by Neo on question 1878 (2026-10-15): the wo-e4a359cb no-flag/no-schema
+> ruling stands, `jarvis wo assume` gains the existing in-text form and nothing else; knowledge
+> entries kn-5102e704 (superseding) and kn-385459bb (the original ruling). Nothing in §2 asks for a
+> `--section` flag — if you came here from a brief that does, that brief is the superseded half.
+
 ### 2.1 (A) `specs.spec_of` gains a fallback and a heal
 
 In `specs.spec_of` (`specs.py:159`), when `work_orders.spec_section` is empty, resolve the section
