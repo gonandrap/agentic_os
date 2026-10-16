@@ -15,7 +15,9 @@ import subprocess
 import time
 from pathlib import Path
 
-from jarvis import cli, invariants, ops, release, worker_session
+import pytest
+
+from jarvis import cli, db, invariants, ops, release, worker_session
 from jarvis.catalog import DEFAULT_VALIDATION_TIMEOUT
 from jarvis.hooks import handle_hook
 from jarvis.invariants import (
@@ -2505,6 +2507,39 @@ def test_two_subject_violations_open_two_violation_report_rows(
         rows = [r for r in store.standing_violations()
                 if r["invariant"] == "INV-TEST-SUBJECT"]
         assert sorted(r["wo_id"] for r in rows) == ["fo-aaaa1111", "fo-bbbb2222"]
+    finally:
+        store.close()
+
+
+# -- a pull request GitHub stopped recomputing reaches the user (wo-d3a70c29) ----------
+
+
+@pytest.mark.skipif(not hasattr(invariants, "NO_ACTOR_BLOCKER"),
+                    reason="`invariants.NO_ACTOR_BLOCKER` is wo-d3a70c29's sibling "
+                           "child (`readers`) and has not landed on this base yet")
+def test_a_stalled_pull_request_ends_the_tick_as_an_attention_item(
+        jarvis_home, project, catalog_file):
+    """PR #995's row, end to end: `waiting_pr_merge` with the pull request's head behind
+    the branch tip GitHub itself reports derives NO actor, owes the user nothing more
+    specific, and so leaves the tick flagged."""
+    from jarvis.catalog import load_catalog
+    from jarvis.daemon import Daemon
+
+    ops.start_os(str(catalog_file), foreground=True)
+    catalog = load_catalog(catalog_file)
+    daemon, store = Daemon(catalog), ProjectStore(project)
+    try:
+        wo = store.create_work_order("add feature X", status="waiting_pr_merge")
+        store.update_work_order(wo["id"],
+                                pr_url="https://github.com/acme/proj/pull/995",
+                                pr_head_oid="0488753", pr_ref_oid="88cac10",
+                                pr_mergeable_unknown_since=db.now())
+
+        daemon.check_invariants(catalog.projects[0], store)
+
+        row = store.get_work_order(wo["id"])
+        assert bool(row["needs_attention"])
+        assert row["attention_reason"] == invariants.NO_ACTOR_BLOCKER
     finally:
         store.close()
 

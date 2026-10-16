@@ -23,7 +23,7 @@ about that project's code and belongs on that project's tracker, not on the OS's
 **The rule that replaced "one constant repository" is not weaker, and the distinction is
 where the repository NAME comes from.** It is never a string out of the record and never
 anything a model wrote: it is `github.origin_repo(<the project's checkout>)`, a local
-`git remote get-url origin` already declared in `github.LOCAL_GIT_READS`. `checked_repo`
+`git remote get-url origin` already declared in `github.GIT_READS`. `checked_repo`
 then holds that name to an anchored shape before it can be an argument, and
 `checked_issue_url` holds every URL to an anchored shape AND to the repository the
 CALLER named — so a URL out of the record still cannot redirect a write, which is the

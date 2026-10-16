@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from jarvis import ops
+from jarvis import db, ops
 from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
 from jarvis.invariants import (
@@ -308,6 +308,13 @@ def test_a_green_pull_request_costs_one_call_six_reads_and_no_write(
     status line saying the OS is waiting for a build that no longer blocks it. It is
     paid INSIDE `checks_green`, which is why a red or queued pull request does not pay
     it — and no `gh run list` appears here at all, because nothing is failing.
+
+    THE NUMBERS DID NOT MOVE FOR wo-d3a70c29, and that is the assertion: the stall
+    machinery is paid by an UNKNOWN pull request alone. `pr_recompute_stalled` reads two
+    row columns and stops, so this pull request's `MERGEABLE` costs it no statement, no
+    `git ls-remote` and no write. The UNKNOWN side's own budget is counted below
+    (`test_the_remote_tip_is_not_read_while_github_is_still_answering` and its
+    neighbours).
     """
     red(fake_gh, GREEN)
     store = ProjectStore(project)
@@ -1089,3 +1096,194 @@ def test_an_unchanged_head_is_not_rewritten_every_tick(started, project, fake_gh
 
     assert [s for s in sql if not s.lstrip().upper().startswith("SELECT")] == []
     assert float(store.get_work_order(reviewing["id"])["pr_head_seen_at"]) == seen
+
+
+# -- GitHub stopped recomputing this pull request (wo-d3a70c29, PR #995) ---------------
+
+#: #995's branch tip, which the pull request's `head.sha` never caught up to.
+TIP = "cccccccccccccccccccccccccccccccccccccccc"
+BRANCH = "worktree-wo-cdee6f9b"
+
+
+def unknown(fake_gh, head_oid: str = HEAD, pr_url: str = PR) -> None:
+    """The one answer the poll could do nothing with: OPEN, UNKNOWN, no checks state."""
+    fake_gh.set_pr(pr_url, "OPEN", mergeable="UNKNOWN", base_ref="main", checks=GREEN,
+                   head_oid=head_oid, head_ref=BRANCH)
+
+
+@pytest.fixture()
+def tips(monkeypatch):
+    """`tips(mapping)` registers what `git ls-remote --heads origin` answers, and the
+    handle counts the calls — the per-project-per-tick budget is the assertion."""
+    from jarvis import github
+
+    calls: list = []
+
+    def install(mapping: dict[str, str] | None = None, fail: bool = False):
+        def fake(cwd=None, remote="origin"):
+            calls.append(cwd)
+            if fail:
+                raise github.GitHubError("`git ls-remote` failed", "boom")
+            return dict(mapping or {})
+
+        monkeypatch.setattr(github, "ls_remote", fake)
+        return calls
+
+    return install
+
+
+def test_the_remote_tip_is_not_read_while_github_is_still_answering(
+        started, project, fake_gh, parked, tips):
+    """The read is paid by an UNKNOWN pull request and by nothing else: the green common
+    case must not grow a subprocess per parked order per tick."""
+    calls = tips({BRANCH: TIP})
+    red(fake_gh, GREEN)
+    store = ProjectStore(project)
+
+    poll(started, store)
+
+    assert calls == []
+    row = store.get_work_order(parked["id"])
+    assert (row["pr_ref_oid"], row["pr_mergeable_unknown_since"]) == (None, None)
+
+
+def test_the_remote_tip_is_read_once_per_project_per_tick(started, project, fake_gh,
+                                                          parked, tips):
+    """`base_ci`'s shape: filled lazily, shared across the loop. Two UNKNOWN pull
+    requests in one project are one `ls-remote` for the whole repository."""
+    calls = tips({BRANCH: TIP})
+    second = ops.create_work_order("proj_a", "add feature Y")
+    ops.finish(second["id"], "opened a second PR", pr_url=OTHER_PR)
+    unknown(fake_gh)
+    unknown(fake_gh, pr_url=OTHER_PR)
+    store = ProjectStore(project)
+
+    poll(started, store)
+
+    assert len(calls) == 1
+
+
+def test_an_unknown_mergeability_is_clocked_once_and_only_once(started, project,
+                                                               fake_gh, parked, tips):
+    """The clock is what tells a fresh UNKNOWN from one GitHub has abandoned, so it must
+    record the FIRST one and not be bumped every tick (kn-5e93939e)."""
+    tips({BRANCH: HEAD})
+    unknown(fake_gh)
+    store = ProjectStore(project)
+
+    poll(started, store)
+    since = float(store.get_work_order(parked["id"])["pr_mergeable_unknown_since"])
+    poll(started, store)
+
+    assert since > 0
+    assert float(store.get_work_order(parked["id"])["pr_mergeable_unknown_since"]) \
+        == since
+
+
+def test_mergeability_coming_back_clears_the_clock(started, project, fake_gh, parked,
+                                                   tips):
+    """And clears it only when it is set: an answer GitHub never stopped giving writes
+    nothing at all."""
+    tips({BRANCH: HEAD})
+    unknown(fake_gh)
+    store = ProjectStore(project)
+    poll(started, store)
+    assert store.get_work_order(parked["id"])["pr_mergeable_unknown_since"]
+
+    fake_gh.set_pr(PR, "OPEN", mergeable="MERGEABLE", base_ref="main", checks=GREEN,
+                   head_oid=HEAD, head_ref=BRANCH)
+    poll(started, store)
+
+    assert store.get_work_order(parked["id"])["pr_mergeable_unknown_since"] is None
+
+
+def test_a_tip_the_pull_request_never_caught_up_to_is_recorded_and_told_once(
+        started, project, fake_gh, parked, tips):
+    """#995 itself: `pr_ref_oid` carries the branch tip GitHub reports, the row stops
+    deriving an actor, and the episode gets exactly ONE timeline event however many
+    ticks it lasts — the dedupe key the resync remedy will key on."""
+    tips({BRANCH: TIP})
+    unknown(fake_gh)
+    store = ProjectStore(project)
+
+    poll(started, store)
+    poll(started, store)
+
+    row = store.get_work_order(parked["id"])
+    assert (row["pr_ref_oid"], row["pr_head_oid"]) == (TIP, HEAD)
+    assert ops.scheduled_actor(store, row) is None
+    assert len([e for e in store.list_events(parked["id"])
+                if e["kind"] == "pr_recompute_stalled"]) == 1
+
+
+def test_an_unchanged_tip_is_not_rewritten_every_tick(started, project, fake_gh,
+                                                      parked, tips):
+    """The head cache's discipline, applied to the second column."""
+    tips({BRANCH: TIP})
+    unknown(fake_gh)
+    store = ProjectStore(project)
+    poll(started, store)
+    before = float(store.get_work_order(parked["id"])["updated_at"])
+
+    sql: list[str] = []
+    store.conn.set_trace_callback(sql.append)
+    poll(started, store)
+    store.conn.set_trace_callback(None)
+
+    assert [s for s in sql if not s.lstrip().upper().startswith("SELECT")] == []
+    assert float(store.get_work_order(parked["id"])["updated_at"]) == before
+
+
+def test_a_later_healthy_push_voids_the_tip_rather_than_outliving_it(
+        started, project, fake_gh, parked, tips):
+    """The tip is only re-read while mergeability is UNKNOWN, so a stale one beside a
+    new head would read as stalled for ever. Voided on the same write that moves the
+    head; empty is NOT OBSERVED and disqualifies nothing."""
+    tips({BRANCH: TIP})
+    unknown(fake_gh)
+    store = ProjectStore(project)
+    poll(started, store)
+    assert store.get_work_order(parked["id"])["pr_ref_oid"] == TIP
+
+    fake_gh.set_pr(PR, "OPEN", mergeable="MERGEABLE", base_ref="main", checks=GREEN,
+                   head_oid=MOVED, head_ref=BRANCH)
+    poll(started, store)
+
+    row = store.get_work_order(parked["id"])
+    assert (row["pr_head_oid"], row["pr_ref_oid"]) == (MOVED, "")
+    assert ops.scheduled_actor(store, row) is not None
+
+
+def test_a_merged_pull_request_with_a_stale_cached_tip_writes_no_stall_event(
+        started, project, fake_gh, parked, tips):
+    """There is nothing left for GitHub to recompute. The predicate still says stalled —
+    the columns say what they say — but an event here would be evidence about a pull
+    request that has finished, written on the tick before `complete_merged` closes the
+    order."""
+    tips({BRANCH: TIP})
+    store = ProjectStore(project)
+    store.update_work_order(parked["id"], pr_head_oid=HEAD, pr_ref_oid=TIP,
+                            pr_mergeable_unknown_since=db.now())
+    fake_gh.set_pr(PR, "MERGED", merged_at="2026-10-09T10:00:00Z", head_oid=HEAD,
+                   head_ref=BRANCH)
+
+    poll(started, store)
+
+    assert [e for e in store.list_events(parked["id"])
+            if e["kind"] == "pr_recompute_stalled"] == []
+    assert store.get_work_order(parked["id"])["status"] == "completed"
+
+
+def test_an_unreadable_ls_remote_leaves_the_cache_standing(started, project, fake_gh,
+                                                           parked, tips):
+    """github.py's error discipline: stale rather than wrong, and one project's broken
+    remote must not break the poll for the orders around it."""
+    tips(fail=True)
+    unknown(fake_gh)
+    store = ProjectStore(project)
+
+    poll(started, store)
+
+    row = store.get_work_order(parked["id"])
+    assert row["pr_ref_oid"] in (None, "")
+    assert row["pr_mergeable_unknown_since"]          # the poll still did its work

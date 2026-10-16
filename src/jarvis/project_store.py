@@ -1300,6 +1300,19 @@ ADDED_COLUMNS = {
         # be read as history rather than as the cache this is.
         "pr_head_oid": "TEXT",
         "pr_head_seen_at": "REAL",
+        # THE SAME CACHE FOR THE TWO FACTS THAT SAY GITHUB HAS STOPPED RECOMPUTING THIS
+        # PULL REQUEST — wo-d3a70c29, from PR #995: the branch moved and the pull
+        # request's `head.sha` did not, so mergeability stayed UNKNOWN for ~7h and the
+        # poll's every acting branch declined, silently and for ever.
+        #
+        # `pr_ref_oid` is the branch tip `git ls-remote` reports, read only while
+        # mergeability is UNKNOWN; "" is NOT OBSERVED and never a sha that could match
+        # one, same rule as `pr_head_oid` above. `pr_mergeable_unknown_since` is when
+        # mergeability FIRST stopped being an answer, and is cleared the moment it is one
+        # again — a fresh UNKNOWN is what an ordinary push looks like (kn-5e93939e).
+        # Both are read by `daemon.pr_recompute_stalled`, off the row and nothing else.
+        "pr_ref_oid": "TEXT",
+        "pr_mergeable_unknown_since": "REAL",
         # Work orders that must finish before this one may be claimed (JSON list of
         # work-order ids). Deliberately NOT a `blocked` status: this codebase's statuses
         # are load-bearing — OPEN_STATUSES, TERMINAL_STATUSES, true_blockers and the

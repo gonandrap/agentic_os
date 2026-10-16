@@ -24,7 +24,7 @@ from pathlib import Path
 import pytest
 
 from jarvis import invariants, ops
-from jarvis.catalog import load_catalog
+from jarvis.catalog import DEFAULT_PULL_REQUESTS_RECOMPUTE_STALL_MINUTES, load_catalog
 from jarvis.daemon import (
     SETTLE_STATUSES,
     TURN_CLAIM_GRACE_SECONDS,
@@ -233,6 +233,66 @@ def test_waiting_pr_merge_without_a_pr_url_derives_no_actor(jarvis_home, project
     store = ProjectStore(project)
     wo = store.create_work_order("add feature X", status="waiting_pr_merge")
     assert ops.scheduled_actor(store, wo) is None
+
+
+# -- `waiting_pr_merge`: an actor only while GitHub is still recomputing ------------
+# wo-d3a70c29, from PR #995 / wo-cdee6f9b: the branch moved to 88cac10, the pull
+# request's head stayed at 0488753, and mergeability never left UNKNOWN — so the poll
+# kept selecting the row, every acting branch declined, and nothing ever asked the user.
+
+STALLED_HEAD, STALLED_TIP = "0488753", "88cac10"
+
+
+def _parked_on_a_pr(store: ProjectStore, **cache) -> dict:
+    wo = store.create_work_order("add feature X", status="waiting_pr_merge")
+    store.update_work_order(wo["id"], pr_url=PR, **cache)
+    return store.get_work_order(wo["id"])
+
+
+def test_a_pull_request_github_stopped_recomputing_derives_no_actor(jarvis_home,
+                                                                    project):
+    """#995's own row. The poll still SELECTS it (`daemon.polls_pull_request` is
+    untouched, so a resync can still clear the stall); what it no longer is, is an
+    answer to "somebody is going to act on this"."""
+    store = ProjectStore(project)
+    wo = _parked_on_a_pr(store, pr_head_oid=STALLED_HEAD, pr_ref_oid=STALLED_TIP,
+                         pr_mergeable_unknown_since=time.time())
+
+    assert ops.scheduled_actor(store, wo) is None
+
+
+def test_a_fresh_unknown_is_an_ordinary_push_and_keeps_its_actor(jarvis_home, project):
+    """kn-5e93939e: UNKNOWN right after a push is NORMAL — GitHub computes mergeability
+    lazily and asking is what starts it. Nothing may fire on a fresh one."""
+    store = ProjectStore(project)
+    wo = _parked_on_a_pr(store, pr_head_oid=STALLED_HEAD, pr_ref_oid=STALLED_HEAD,
+                         pr_mergeable_unknown_since=time.time())
+
+    actor = ops.scheduled_actor(store, wo)
+
+    assert actor is not None and actor.pass_name == "Daemon.poll_pull_requests"
+
+
+def test_an_unknown_past_the_threshold_derives_no_actor(jarvis_home, project):
+    """Condition (b) alone: head and tip agree, and GitHub has simply stopped answering
+    the mergeability question for longer than `pull_requests.recompute_stall_minutes`."""
+    store = ProjectStore(project)
+    stale = time.time() - (DEFAULT_PULL_REQUESTS_RECOMPUTE_STALL_MINUTES + 1) * 60
+    wo = _parked_on_a_pr(store, pr_head_oid=STALLED_HEAD, pr_ref_oid=STALLED_HEAD,
+                         pr_mergeable_unknown_since=stale)
+
+    assert ops.scheduled_actor(store, wo) is None
+
+
+def test_an_unobserved_tip_never_disqualifies(jarvis_home, project):
+    """Empty is NOT RECORDED and never a sha that could match one: a row the poll has
+    not read a remote tip for keeps its actor."""
+    store = ProjectStore(project)
+    wo = _parked_on_a_pr(store, pr_head_oid=STALLED_HEAD, pr_ref_oid="")
+
+    actor = ops.scheduled_actor(store, wo)
+
+    assert actor is not None and actor.pass_name == "Daemon.poll_pull_requests"
 
 
 def test_a_claim_past_its_grace_is_a_hole_the_settler_still_fails(jarvis_home, project,

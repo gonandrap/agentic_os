@@ -1366,3 +1366,43 @@ def test_ui_health_can_be_switched_off_whole():
                          "projects": [{"name": "a", "path": "/tmp/a"}]})
     assert cat.os.ui_health.enabled is False
     assert cat.projects[0].ui_health.enabled is False
+
+
+# -- `pull_requests`: the one threshold the stall predicate reads (wo-d3a70c29) --------
+
+
+def test_the_recompute_stall_threshold_is_fleet_wide_and_per_project():
+    """`MessagingConfig`'s shape: one field, one area, field-level inheritance. Read by
+    `daemon.pr_recompute_stalled` via `ops.pull_requests_config_at`, and behind NO
+    `enabled` switch — it is a predicate ingredient, not an alarm."""
+    from jarvis import config_version
+
+    cat = parse_catalog({
+        "os": {"pull_requests": {"recompute_stall_minutes": 45}},
+        "projects": [{"name": "a", "path": "/tmp/a",
+                      "pull_requests": {"recompute_stall_minutes": 10}},
+                     {"name": "b", "path": "/tmp/b"}],
+    })
+
+    assert cat.os.pull_requests.recompute_stall_minutes == 45
+    assert cat.project("a").pull_requests.recompute_stall_minutes == 10
+    assert cat.project("b").pull_requests.recompute_stall_minutes == 45  # inherited
+    resolved = config_version.resolve(cat)
+    assert resolved["os.pull_requests.recompute_stall_minutes"] == 45
+    assert resolved["projects.a.pull_requests.recompute_stall_minutes"] == 10
+
+
+def test_a_zero_recompute_stall_threshold_is_refused_rather_than_clamped():
+    """Zero would call every fresh UNKNOWN a stall, which kn-5e93939e says is the normal
+    state right after a push."""
+    for bad in (0, -1):
+        with pytest.raises(
+                CatalogError,
+                match="os.pull_requests.recompute_stall_minutes must be >= 1"):
+            parse_catalog({"os": {"pull_requests": {"recompute_stall_minutes": bad}},
+                           "projects": []})
+
+
+def test_the_shipped_recompute_stall_default_is_thirty_minutes():
+    """Neo question 1830."""
+    assert jarvis.catalog.DEFAULT_PULL_REQUESTS_RECOMPUTE_STALL_MINUTES == 30

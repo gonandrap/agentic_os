@@ -1455,6 +1455,29 @@ class MessagingConfig:
     stuck_minutes: int = DEFAULT_MESSAGING_STUCK_MINUTES
 
 
+# -- pull requests: how long GitHub may go without recomputing one before the OS stops
+# calling its own poll an actor for it. wo-d3a70c29, Neo question 1830.
+
+#: Half an hour. GitHub computes mergeability LAZILY and asking is what starts it, so
+#: UNKNOWN right after a push is the NORMAL state (kn-5e93939e) — the threshold has to
+#: clear every ordinary push before it clears a stall. PR #995 sat UNKNOWN for ~7h.
+DEFAULT_PULL_REQUESTS_RECOMPUTE_STALL_MINUTES = 30
+
+
+@dataclass
+class PullRequestsConfig:
+    """When GitHub's silence about a pull request stops being a wait and becomes a stall.
+
+    `MessagingConfig`'s shape exactly — one field, fleet-wide with `_parse_inspect`'s
+    field-level inheritance — and behind NO `enabled` switch on purpose: this is an
+    ingredient of `daemon.pr_recompute_stalled`, a predicate every surface reads through
+    `ops.scheduled_actor`, not an alarm anyone can turn off. A fleet with validation and
+    inspection both off still has to be able to say nobody is going to act.
+    """
+
+    recompute_stall_minutes: int = DEFAULT_PULL_REQUESTS_RECOMPUTE_STALL_MINUTES
+
+
 # -- the scheduler: the OS filing a work order nobody typed. ABOVE `ProjectSpec` for the
 # `field(default_factory=…)` reason kn-6ca2bcd9 gives, and a catalog setting rather than a
 # module constant for kn-67cdb54b's: "how often, and which jobs" is policy the user holds
@@ -1771,6 +1794,7 @@ class ProjectSpec:
     rules: RulesConfig = field(default_factory=RulesConfig)
     evolution: EvolutionConfig = field(default_factory=EvolutionConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
+    pull_requests: PullRequestsConfig = field(default_factory=PullRequestsConfig)
     bugs: BugsConfig = field(default_factory=BugsConfig)
     release: ReleaseConfig = field(default_factory=ReleaseConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
@@ -1911,6 +1935,7 @@ class OsConfig:
     rules: RulesConfig = field(default_factory=RulesConfig)
     evolution: EvolutionConfig = field(default_factory=EvolutionConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
+    pull_requests: PullRequestsConfig = field(default_factory=PullRequestsConfig)
     bugs: BugsConfig = field(default_factory=BugsConfig)
     release: ReleaseConfig = field(default_factory=ReleaseConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
@@ -2754,6 +2779,27 @@ def _parse_messaging(raw: Any, base: MessagingConfig | None = None,
     return cfg
 
 
+def _parse_pull_requests(raw: Any, base: PullRequestsConfig | None = None,
+                         where: str = "os.pull_requests") -> PullRequestsConfig:
+    """`os.pull_requests`, or a project's override — field-level, like `_parse_messaging`.
+
+    Refused rather than clamped below 1 for that function's reason, with one of its own:
+    zero would call every fresh UNKNOWN a stall, and a fresh UNKNOWN is what an ordinary
+    push looks like (kn-5e93939e).
+    """
+    base = base or PullRequestsConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    cfg = PullRequestsConfig(
+        recompute_stall_minutes=int(raw.get("recompute_stall_minutes",
+                                            base.recompute_stall_minutes)),
+    )
+    for name, value in vars(cfg).items():
+        if value < 1:
+            raise _err(f"{where}.{name} must be >= 1")
+    return cfg
+
+
 def _parse_wiring(raw: Any, base: WiringConfig | None = None,
                   where: str = "os.wiring") -> WiringConfig:
     """`os.wiring`, or a project's override of it — field-level, like `_parse_inspect`.
@@ -3083,6 +3129,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         rules=_parse_rules(os_raw.get("rules", {})),
         evolution=_parse_evolution(os_raw.get("evolution", {})),
         messaging=_parse_messaging(os_raw.get("messaging", {})),
+        pull_requests=_parse_pull_requests(os_raw.get("pull_requests", {})),
         bugs=_parse_bugs(os_raw.get("bugs", {})),
         release=_parse_release(os_raw.get("release", {})),
         schedule=_parse_schedule(os_raw.get("schedule", {})),
@@ -3254,6 +3301,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         messaging_cfg = _parse_messaging(
             p.get("messaging", {}), base=os_cfg.messaging,
             where=f"projects[{i}] ({name}).messaging")
+        pull_requests_cfg = _parse_pull_requests(
+            p.get("pull_requests", {}), base=os_cfg.pull_requests,
+            where=f"projects[{i}] ({name}).pull_requests")
         bugs_cfg = _parse_bugs(
             p.get("bugs", {}), base=os_cfg.bugs,
             where=f"projects[{i}] ({name}).bugs")
@@ -3291,6 +3341,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 rules=rules_cfg,
                 evolution=evolution_cfg,
                 messaging=messaging_cfg,
+                pull_requests=pull_requests_cfg,
                 bugs=bugs_cfg,
                 release=release_cfg,
                 schedule=schedule_cfg,

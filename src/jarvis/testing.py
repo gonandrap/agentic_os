@@ -1791,7 +1791,8 @@ def fake_gh(tmp_path, monkeypatch):
                    mergeable: str | None = None, base_ref: str = "main",
                    checks: list[dict] | None = None,
                    merge_state: str | None = None, head_oid: str = "",
-                   base_oid: str = "", merge_commit: str = "") -> None:
+                   base_oid: str = "", merge_commit: str = "",
+                   head_ref: str = "") -> None:
             """Register what `gh pr view <pr_url>` answers. Re-calling re-states it,
             which is how a test walks a pull request from OPEN to MERGED — or from
             MERGEABLE to CONFLICTING and back.
@@ -1832,6 +1833,10 @@ def fake_gh(tmp_path, monkeypatch):
                 row["mergeStateStatus"] = merge_state
             if head_oid:
                 row["headRefOid"] = head_oid
+            # `headRefName`, shared with `set_pr_artifact`: the branch whose remote tip
+            # the merge poll looks up when mergeability is UNKNOWN (wo-d3a70c29).
+            if head_ref:
+                row["headRefName"] = head_ref
             if base_oid:
                 row["baseRefOid"] = base_oid
             # `mergeCommit.oid`, the commit the merge put on the base — a NESTED object,
