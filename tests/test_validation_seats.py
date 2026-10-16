@@ -446,6 +446,30 @@ def test_every_seat_is_told_that_a_diffless_submission_is_not_an_empty_one(seat)
     assert "THE PULL REQUEST IS THE ARTIFACT" in mandate
 
 
+def test_the_assumptions_block_asks_seats_to_check_the_diff_against_each_sentence():
+    """THE ONLY PLACE LEFT that checks delivered code against an assumption's sentence:
+    the delivery-time Neo confirmation no longer sees a diff.
+
+    docs/superpowers/specs/2026-10-14-neo-never-reads-a-diff.md
+    """
+    prompt = validation.build_packet_prompt(packet(
+        assumptions=({"n": 1, "status": "accepted",
+                      "content": "used a regex, not a parser"},)))
+
+    assert "used a regex, not a parser" in prompt
+    # The existing sentences, unchanged.
+    assert "WHETHER THE USER WANTS IT is theirs to decide" in prompt
+    assert "Whether it is WRONG is yours" in prompt
+    # The new clause: check the DIFF against the sentence and flag the mismatch.
+    flat_prompt = " ".join(prompt.split())
+    assert "contradicts" in flat_prompt and "exceeds" in flat_prompt
+    assert "does not implement" in flat_prompt
+    assert "finding" in flat_prompt
+
+    assert "contradicts" not in " ".join(
+        validation.build_packet_prompt(packet()).split())
+
+
 def test_a_feature_packet_shows_what_each_child_claimed():
     prompt = validation.build_packet_prompt(packet(
         unit="feature", subject_id="fo-1",

@@ -78,7 +78,7 @@ from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any
 
-from . import navigation, specs
+from . import specs
 from .catalog import (
     DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS,
     DEFAULT_VALIDATION_DECISION_RECORD_CHARS,
@@ -180,7 +180,8 @@ HELD_JUDGED = "judged_early"
 #: approved nothing, so no second call is spent on one and the user decides it;
 #: `confirming` is the question already filed; `objection_in_flight` means NOT YET and is
 #: retried next tick; `evidence_secret` is `decide_evidence`'s, over BOTH texts the
-#: question would carry — the diff and the result summary.
+#: question would carry — the result summary and the assumption's own sentence
+#: (docs/superpowers/specs/2026-10-14-neo-never-reads-a-diff.md).
 #:
 #: FOUR OF THE FIVE REACH THE RECORD, and which ones is not arbitrary (kn-22ba6087: a
 #: guard that returns early must still record why). `objected`, `unjudged`,
@@ -195,13 +196,6 @@ HELD_OBJECTED = "objected"
 HELD_CONFIRMING = "confirming"
 HELD_OBJECTION_IN_FLIGHT = "objection_in_flight"
 HELD_EVIDENCE_SECRET = "evidence_secret"
-
-#: docs/superpowers/specs/2026-10-13-a-confirmation-question-with-a-zero-character-diff.md
-#: part 3: the collection handed over a diff and the trim kept none of it, so the question
-#: would carry `(no diff)` and the Neo call could only escalate. RECORDED for
-#: `evidence_secret`'s reason — the hold is the only thing on the record saying why an
-#: order the feature was switched on for is still waiting for a person.
-HELD_EVIDENCE_UNREADABLE = "evidence_unreadable"
 
 #: docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-hold-an-assumption-
 #: for-ever.md §5 and §6. `round_open` is `decide_confirm`'s alone — the confirmation
@@ -539,8 +533,8 @@ SECRET_EVIDENCE = (
 #: What each of `SECRET_EVIDENCE`'s shapes is CALLED on the record. The marker is
 #: rendered on the timeline and on `jarvis wo show`, so it names the shape and never
 #: quotes the match — see `secret_marker`. The names say no more than the shape because
-#: the same scanner reads a diff and a result summary; WHICH of the two carried it is
-#: the hold's to say, in `decide_evidence`.
+#: the same scanner reads a result summary and an assumption sentence; WHICH of the two
+#: carried it is the hold's to say, in `decide_evidence`.
 SECRET_EVIDENCE_NAMES = (
     "a private key block",
     "an ssh key line",
@@ -652,6 +646,11 @@ def secret_marker(stat: str, diff: str) -> str:
     Three nets, cheapest first, and all three read ADDED lines only. A removed secret is
     the change doing the right thing and holding on it would punish the one diff that
     fixes the problem.
+
+    NO PRODUCTION CALLER REMAINS: the confirmation question carries no diff
+    (docs/superpowers/specs/2026-10-14-neo-never-reads-a-diff.md). Kept because it is
+    pure, costs nothing uncalled, and is the only thing here that knows the secret shapes
+    of a DIFF — the panel path has no redaction gate and is the obvious next caller.
     """
     for path in _paths(stat, diff):
         for pattern in _SECRET_PATH_RE:
@@ -775,34 +774,25 @@ def _panel_gave_up(round_n: int, round_reason: str, tail: str,
                  round=round_n, **fields)
 
 
-def decide_evidence(assumption: dict[str, Any], stat: str, diff: str,
-                    summary: str = "", *, unreadable: bool = False) -> Decision:
-    """May the OS put THIS EVIDENCE into a stored question? PURE — no store, no model.
+def decide_evidence(assumption: dict[str, Any], summary: str = "") -> Decision:
+    """May the OS put THESE TEXTS into a stored question? PURE — no store, no model.
 
     **THE SECOND GATE, AND THERE ARE TWO BECAUSE THEY SEE DIFFERENT THINGS.**
-    `decide_confirm` is pure over a ROW — an assumption, a work order, a config — and
-    cannot see a diff; this is the gate over the EVIDENCE, and it runs after the packet
-    is collected and before a single character of it reaches `neo.ask`. Folding it into
-    `decide_confirm` would mean handing that function a diff it has no other use for, on
-    every call site including the ask pass that has none.
+    `decide_confirm` is pure over a ROW — an assumption, a work order, a config — and is
+    called on BOTH passes; this is the gate over the texts the DELIVERY-time question
+    carries, and it runs before a single character of them reaches `neo.ask`. Folding it
+    into `decide_confirm` would hand the ask pass a result summary it has no use for.
 
-    HELD MEANS NO QUESTION IS FILED. Not "filed with the diff withheld": a confirmation
-    with no diff in it is the cheap design Neo refused in question 549, and filing the
-    row at all is the filing decision kn-deef42ea says the redaction decision IS. The
-    assumption stays pending and is the user's — exactly what happens today on a fleet
-    that never switched this on.
+    HELD MEANS NO QUESTION IS FILED, and filing the row at all is the filing decision
+    kn-deef42ea says the redaction decision IS. The assumption stays pending and is the
+    user's — exactly what happens on a fleet that never switched this on.
 
-    **AND A PACKET THE TRIM KEPT NOTHING OF**, checked after both secret scans so
-    secret precedence is unchanged (docs/superpowers/specs/2026-10-13-a-confirmation-
-    question-with-a-zero-character-diff.md part 3). `unreadable` is
-    `ConfirmEvidence.unreadable` and nothing else: an EMPTY COLLECTION still asks, and
-    deriving the condition here from `not diff` would hold the case where git reported
-    nothing and the result summary alone is worth confirming.
-
-    BOTH TEXTS THE QUESTION CARRIES, because `_confirm_question` interpolates the diff
-    AND `wo["result_summary"]` — a worker that quotes the credential it wired up puts it
-    in the question store by the route the diff was gated on. The hold NAMES which of
-    the two it was: the user has to know which text to go and read.
+    BOTH TEXTS THE QUESTION CARRIES, and there are now exactly two — the confirmation
+    carries no diff (docs/superpowers/specs/2026-10-14-neo-never-reads-a-diff.md):
+    `wo["result_summary"]` and the ASSUMPTION's own sentence, both interpolated raw by
+    `_confirm_question`. A worker that quotes the credential it wired up puts it in the
+    question store by either route. The hold NAMES which of the two it was: the user has
+    to know which text to go and read.
 
     Carries `assumption_id` and `n` like every other hold, so
     `Daemon._note_autoreview_held` dedupes per assumption instead of writing a line every
@@ -811,27 +801,20 @@ def decide_evidence(assumption: dict[str, Any], stat: str, diff: str,
     aid = int(assumption.get("id") or 0)
     n = int(assumption.get("n") or 0)
     fields = {"assumption_id": aid, "n": n}
-    marker = secret_marker(stat, diff)
-    if marker:
-        return _held(HELD_EVIDENCE_SECRET,
-                     f"the delivered diff carries {marker}, and the OS will not copy a "
-                     f"secret into a stored question — assumption #{n} is yours",
-                     **fields)
     marker = secret_marker_text(summary)
     if marker:
         # WHICH TEXT, named: the user has to know where to go and look, and the summary
-        # and the diff are two different places.
+        # and the assumption are two different places.
         return _held(HELD_EVIDENCE_SECRET,
                      f"the work order's result summary carries {marker}, and the OS "
                      f"will not copy a secret into a stored question — assumption #{n} "
                      f"is yours",
                      **fields)
-    if unreadable:
-        # AFTER both secret checks: a packet that is both reports the secret (invariant 8).
-        return _held(HELD_EVIDENCE_UNREADABLE,
-                     f"the delivered diff could not be trimmed to the confirmation "
-                     f"budget, so the question would carry no diff at all and the call "
-                     f"could only escalate — assumption #{n} is yours",
+    marker = secret_marker_text(str(assumption.get("content") or ""))
+    if marker:
+        return _held(HELD_EVIDENCE_SECRET,
+                     f"the assumption's own text carries {marker}, and the OS will not "
+                     f"copy a secret into a stored question — assumption #{n} is yours",
                      **fields)
     return Decision(armed=True, code="armed",
                     reason=f"the evidence for assumption #{n} carries nothing "
@@ -1698,232 +1681,38 @@ def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any
     ])
 
 
-#: How many dropped paths the truncation marker NAMES. The COUNT is always exact — spec
-#: docs/superpowers/specs/2026-09-26-bounded-model-inputs.md § 2.
-CONFIRM_DROPPED_FILES_SHOWN = 10
-
 #: The per-field cuts this question makes, named instead of spelled inline — the limit
 #: discipline of `gates.build_request_question` (spec § 2).
 CONFIRM_DESCRIPTION_CHARS = 2000
 CONFIRM_SUMMARY_CHARS = 1500
 
-#: `supervisor.build_evidence`'s closing sentence, reused verbatim for the same purpose.
-CANNOT_SEE = "Escalate rather than judge on what you cannot see."
-
-#: The two `EvidencePacket.source` values, whose `head` means different things.
-SOURCE_WORKTREE = "worktree"
-SOURCE_PULL_REQUEST = "pull_request"
-
-
-@dataclass(frozen=True)
-class ConfirmEvidence:
-    """The delivered change as ONE confirmation question carries it.
-
-    The packet trimmed to `validation.confirm_diff_chars`, plus what the trim removed:
-    a diff the reviewer is not told was cut is how it confirms a change it never saw.
-
-    `full_chars` is the length of the diff the COLLECTION handed over, and
-    `collect_truncated` says that collection was itself bounded — so the total is not
-    knowable and the marker must not state one (Neo, question 945).
-    """
-
-    stat: str = ""
-    diff: str = ""
-    files: tuple[str, ...] = ()
-    diff_truncated: bool = False
-    dropped_files: tuple[str, ...] = ()
-    #: Shown in PART — neither complete nor absent, and never in `dropped_files`
-    #: (docs/superpowers/specs/2026-10-13-a-confirmation-question-with-a-zero-character-
-    #: diff.md part 2).
-    partial_files: tuple[str, ...] = ()
-    pr_url: str = ""
-    source: str = ""
-    head: str = ""
-    full_chars: int = 0
-    collect_truncated: bool = False
-    #: The collection bound, carried so the marker can name it without this module
-    #: holding a number the daemon owns.
-    collect_limit: int = 0
-
-    @property
-    def unreadable(self) -> bool:
-        """The collection handed over a diff and the trim kept none of it.
-
-        The gate reads a boolean rather than re-deriving the condition, and the guard is
-        `full_chars > 0` and never `not diff` alone: an EMPTY COLLECTION still asks
-        (docs/superpowers/specs/2026-10-13-a-confirmation-question-with-a-zero-character-
-        diff.md part 3).
-        """
-        return self.full_chars > 0 and self.diff == ""
-
-    def what_changed(self) -> str:
-        """The EXACT `# What changed` block `_confirm_question` interpolates.
-
-        ONE renderer, called twice — by the question and by the daemon's
-        `decide_evidence` call — so the text scanned and the text sent cannot drift:
-        docs/superpowers/specs/2026-09-26-bounded-model-inputs.md § 2, every byte that is
-        persisted or sent has been through the net.
-        """
-        return _what_changed(self)
-
-
-def confirm_evidence(packet: Any, assumption: dict[str, Any], limit: int, *,
-                     collect_limit: int = 0,
-                     doc_suffixes: tuple[str, ...] = navigation.DOC_SUFFIXES,
-                     doc_dirs: frozenset[str] = navigation.DOC_DIRS) -> ConfirmEvidence:
-    """Trim one collected packet for one assumption. PURE — no git, no store, no model.
-
-    **THE HUNKS THE ASSUMPTION NAMES GO FIRST**, then SOURCE, then DOCUMENTATION. An
-    assumption that mentions a path is confirmed against that path, and spending the
-    budget in diff order drops exactly the file the question is about. The second and
-    third tiers are the live case of docs/superpowers/specs/2026-10-13-a-confirmation-
-    question-with-a-zero-character-diff.md: an assumption naming a SYMBOL names no path
-    at all, which left the collection's order standing and let a 435-line spec document
-    eat a 12,000-char budget ahead of the source the question was about.
-
-    `None` is the collector having failed or there being nothing, and it answers an empty
-    instance: AN EMPTY DIFF STILL ASKS (`Daemon._confirmation_evidence`).
-    """
-    from . import evidence
-
-    if packet is None:
-        return ConfirmEvidence(collect_limit=collect_limit)
-    files = tuple(packet.files or ())
-    full = str(packet.diff or "")
-    content = str(assumption.get("content") or "").lower()
-    named: list[str] = []
-    source: list[str] = []
-    docs: list[str] = []
-    for new, old, text in evidence._sections(full):
-        path = new or old
-        if path in files and _names_path(content, path):
-            named.append(text)
-        else:
-            (docs if _is_documentation(path, doc_suffixes, doc_dirs)
-             else source).append(text)
-    kept, cut, dropped, partial = evidence._truncate_hunks(
-        "".join(named + source + docs), limit, files)
-    return ConfirmEvidence(
-        stat=str(packet.stat or ""), diff=kept, files=files,
-        diff_truncated=bool(cut or packet.diff_truncated),
-        dropped_files=tuple(dict.fromkeys(tuple(packet.dropped_files or ())
-                                          + tuple(dropped))),
-        partial_files=tuple(partial),
-        pr_url=str(packet.pr_url or ""), source=str(packet.source or ""),
-        head=str(packet.head or ""), full_chars=len(full),
-        collect_truncated=bool(packet.diff_truncated), collect_limit=collect_limit)
-
-
-def _names_path(content: str, path: str) -> bool:
-    """Does this text name that file — by its full path or by its basename?"""
-    lower = path.lower()
-    return lower in content or lower.rsplit("/", 1)[-1] in content
-
-
-def _is_documentation(path: str, doc_suffixes: tuple[str, ...],
-                      doc_dirs: frozenset[str]) -> bool:
-    """Is this path documentation? A PATH test, never a reading of the diff's content.
-
-    The suffixes and the dirs are the CONFIGURED ones (`os.navigation.doc_suffixes` /
-    `doc_dirs`) and are passed in: a second classifier here would drift from the fleet's
-    the moment a project overrode it.
-
-    Content-sniffing a diff fragment was rejected as non-deterministic and untestable
-    (docs/superpowers/specs/2026-10-13-a-confirmation-question-with-a-zero-character-
-    diff.md, rejected 6). The path test is wrong only in the cases tier (a) — the path
-    the assumption itself names — already covers.
-    """
-    lower = path.lower()
-    return (lower.endswith(tuple(doc_suffixes))
-            or bool(set(doc_dirs) & set(lower.split("/"))))
-
-
-def _some_of(names: tuple[str, ...]) -> str:
-    """At most `CONFIRM_DROPPED_FILES_SHOWN` names, and a count for the rest."""
-    shown = names[:CONFIRM_DROPPED_FILES_SHOWN]
-    more = len(names) - len(shown)
-    return ", ".join(shown) + (f", and {more} more" if more else "")
-
-
-def _truncation_marker(ev: ConfirmEvidence) -> str:
-    """What was cut, in one line: the kept size, the TOTAL, the count and the names.
-
-    `partially shown` is a third state beside dropped and complete, and it must read as
-    neither (the 2026-10-13 spec, part 2). It never changes the TOTAL: a bounded
-    collection cannot state one (Neo, question 945).
-    """
-    total = (f"more than {ev.collect_limit:,}" if ev.collect_truncated
-             else f"{ev.full_chars:,}")
-    which = (f"{len(ev.dropped_files)} file(s) not shown: {_some_of(ev.dropped_files)}"
-             if ev.dropped_files else "no whole file dropped")
-    partly = (f"{len(ev.partial_files)} file(s) partially shown: "
-              f"{_some_of(ev.partial_files)}; " if ev.partial_files else "")
-    return (f"[diff truncated — {len(ev.diff):,} of {total} chars; {which}; {partly}"
-            f"full diff: {ev.pr_url or '(no pull request)'}]")
-
-
-def _reference(ev: ConfirmEvidence) -> str:
-    """The reference, which rides truncated or not (Neo, question 753).
-
-    A sha as a sha and a branch as a branch: `head` is a HEAD sha on the worktree path
-    and GitHub's `headRefName` on the pull-request path (evidence.py's field comment).
-    """
-    if ev.head and ev.source == SOURCE_WORKTREE:
-        head = f"head sha: {ev.head}"
-    elif ev.head and ev.source == SOURCE_PULL_REQUEST:
-        head = f"head branch: {ev.head}"
-    else:
-        head = "head: (unknown)"
-    return f"pull request: {ev.pr_url or '(none)'}\n{head}"
-
-
-def _what_changed(ev: ConfirmEvidence) -> str:
-    """The full stat, the full file list, the kept hunks, what was cut, the reference."""
-    from . import provenance
-
-    stat = (provenance.borrowed_block(provenance.Borrowed(
-        label="the `git diff --stat` of the delivered change", whose="git",
-        # FULL: the stat is what a reviewer reads when no hunk survived the budget.
-        text=ev.stat, limit=len(ev.stat))) if ev.stat else "(no files reported)")
-    paths = "\n".join(f"  {f}" for f in ev.files)
-    listing = ("changed files, all of them — this list is never truncated:\n"
-               + provenance.borrowed_block(provenance.Borrowed(
-                   label="the changed-file list of the delivered change", whose="git",
-                   # FULL: evidence.py's rule 3 — `files` is truncated at no limit.
-                   text=paths, limit=len(paths))) if ev.files
-               else "changed files: (none reported)")
-    diff = (provenance.borrowed_block(provenance.Borrowed(
-        label="the delivered diff", whose="the worker of this work order",
-        # Bounded upstream by `confirm_diff_chars` at a FILE BOUNDARY: a blind character
-        # limit here would re-cut it mid-hunk.
-        text=ev.diff, limit=len(ev.diff))) if ev.diff else "(no diff)")
-    parts = ["# What changed", stat, listing, diff]
-    if ev.diff_truncated:
-        parts += [f"{_truncation_marker(ev)}\n{CANNOT_SEE}"]
-    parts.append(_reference(ev))
-    return "\n\n".join(parts)
-
 
 def _confirm_question(project: str, wo: dict[str, Any], assumption: dict[str, Any],
-                      siblings: list[dict[str, Any]], ev: ConfirmEvidence,
+                      siblings: list[dict[str, Any]],
                       record: str = "", spec: dict[str, str] | None = None,
                       spec_chars: int = DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS) -> str:
     """What the reviewer reads at DELIVERY. Everything the early pass could not have.
 
-    Each block earns its place, and the two new ones are the whole point of the second
-    call (Neo, question 549):
+    **NO DIFF.** The user reversed Neo's answer to question 549 (learning #102):
+    checking delivered code against a worker's claims is the VALIDATION PANEL's job, and
+    the panel already reads the diff. docs/superpowers/specs/2026-10-14-neo-never-reads-
+    a-diff.md.
 
-    * **the provisional verdict, its reason and its model, labelled as mid-turn.** The
-      reviewer is being asked to confirm a READING, not to rule from scratch, and one
-      formed with no diff in front of it is evidence rather than authority — saying so is
-      what stops the earlier line being read as a decision already taken.
-    * **the diff stat and the diff** (trimmed by `confirm_evidence` to
-      `validation.confirm_diff_chars`, with a marker naming what was cut),
-      and the result summary. This is the fact that did not exist when the assumption was
-      an intention, and confirming without it would be the cheap design Neo refused.
-      **`decide_evidence` HAS ALREADY PASSED BOTH**, because `neo.ask` persists
-      everything below as a question row: neither a diff nor a summary carrying a secret
-      reaches here.
+    Each block earns its place, and what this second call still has that the mid-turn
+    reading did not is two facts, not a diff:
+
+    * **the RESULT SUMMARY** — what the worker says it delivered. This did not exist when
+      the assumption was an intention, and it is the reason the second call exists.
+    * **the DECISION RECORD** — what has already been decided on this order
+      (`decision_record`), which the mid-turn reading was formed without.
+
+    The provisional verdict, its reason and its model are labelled as mid-turn: the
+    reviewer is being asked to confirm a READING, not to rule from scratch, and saying so
+    is what stops the earlier line being read as a decision already taken.
+
+    **`decide_evidence` HAS ALREADY PASSED BOTH TEXTS THAT CARRY WORKER PROSE** — the
+    result summary and the assumption's own sentence — because `neo.ask` persists
+    everything below as a question row.
 
     The rest mirrors `_ruling_question` deliberately: the assumption quoted, the work
     order's title and description, its `_spec_block` — the same authority, under the same
@@ -1947,13 +1736,15 @@ def _confirm_question(project: str, wo: dict[str, Any], assumption: dict[str, An
         f"verdict: {assumption.get('provisional_verdict') or '(none)'} "
         f"(model: {assumption.get('provisional_model') or 'unknown'})\n"
         f"{assumption.get('provisional_reason') or '(no reason recorded)'}\n"
-        f"That reading had NO diff and NO result summary in front of it. You do.",
+        f"That reading had no result summary in front of it. You do. NEITHER reading "
+        f"sees the diff: you are confirming a reading against what the worker says it "
+        f"DELIVERED, and whether the code matches this sentence is the validation "
+        f"panel's judgement, not yours.",
         f"# The work order it was recorded against\n{wo.get('title') or '(untitled)'}\n"
         f"{(wo.get('description') or '')[:CONFIRM_DESCRIPTION_CHARS]}",
         _spec_block(spec, spec_chars),
         f"# What the worker says it delivered\n"
         f"{(wo.get('result_summary') or '(nothing recorded)')[:CONFIRM_SUMMARY_CHARS]}",
-        _what_changed(ev),
         f"# The work order's other assumptions, for context only — do not rule on these\n"
         f"{others}",
         _record_block(record),
@@ -1983,8 +1774,7 @@ def _spec_chars(cfg: Any) -> int:
 
 def propose_confirmation(store: Any, neo: Any, project: str, wo: dict[str, Any],
                          assumption: dict[str, Any], siblings: list[dict[str, Any]],
-                         *, evidence: ConfirmEvidence | None = None,
-                         cfg: Any = None) -> dict[str, Any]:
+                         *, cfg: Any = None) -> dict[str, Any]:
     """Put ONE already-judged assumption back to Neo at delivery. Returns the question.
 
     `propose`'s mirror, and the differences are the two that matter: the link is
@@ -2003,7 +1793,6 @@ def propose_confirmation(store: Any, neo: Any, project: str, wo: dict[str, Any],
     """
     question = neo.ask(project, wo["id"],
                        _confirm_question(project, wo, assumption, siblings,
-                                         evidence or ConfirmEvidence(),
                                          decision_record(
                                              store, neo, wo["id"], siblings, assumption,
                                              chars=_record_chars(cfg)),
