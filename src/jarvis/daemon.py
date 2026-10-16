@@ -7047,11 +7047,11 @@ class Daemon:
         # the exemption (§6) costs no `gh` call behind every merge decision.
         issue_os_filed = bool(fact.get("issue_os_filed"))
         if fix_wo_id:
-            # §2 step 5: one fix work order per break, EVER, whatever became of it.
+            # §2 step 4: one fix work order per break, EVER, whatever became of it.
             return
         cleared = False
         try:
-            # §2 step 6: READ THE STATE rather than parse the refusal — `start_work`
+            # §2 step 5: READ THE STATE rather than parse the refusal — `start_work`
             # raises on a closed issue, and a stored url someone has since closed can
             # never yield a work order, so retrying it is the never-ending loop this spec
             # exists to remove. Cleared and never adopted back (§4's OPEN filter), while
@@ -7059,7 +7059,7 @@ class Daemon:
             if issue_url and issues.view(issue_url, repo).closed:
                 log.info("[%s] %s is closed and no work order came of it — the break is "
                          "filed afresh on the next tick", project.name, issue_url)
-                # The url ONLY: `fix_wo_id` is necessarily empty here, per step 5 above.
+                # The url ONLY: `fix_wo_id` is necessarily empty here, per step 4 above.
                 issue_url = ""
                 issue_os_filed = False
                 cleared = True
@@ -7151,8 +7151,14 @@ class Daemon:
 
     @staticmethod
     def _base_red_brief(project: ProjectSpec, fact: dict[str, Any]) -> str:
-        """The dispatched worker's evidence — §2: `run_url` is also what the NEXT sweep's
-        adoption search keys on, so it is quoted verbatim."""
+        """The dispatched worker's evidence — and the next sweep's adoption key (§4).
+
+        ADOPTION KEYS ON THE RUN ID IN THE BODY, never on `run_url`: `gh` search is
+        token-AND, the id is the one token unique to the break, and the hit is then
+        filtered to OPEN + author login == `issues.gh_login()` + `bugreport.FILED_MARKER`
+        in the body, lowest number among the eligible. So the id is quoted verbatim here;
+        `run_url` and `head_sha` are for the human reading the issue.
+        """
         blamed = str(fact.get("wo_id") or "")
         return (f"`{fact.get('base') or 'main'}` is red in {project.name}. Workflow "
                 f"`{fact.get('workflow') or 'ci'}` fails on run "
