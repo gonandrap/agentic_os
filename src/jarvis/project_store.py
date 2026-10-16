@@ -285,6 +285,65 @@ def validation_ci_hold_spans(events: Iterable[Any], since: float,
     return sorted(spans)
 
 
+#: The three event kinds that move a planner's pending-assumption count, §2.3 of
+#: docs/superpowers/specs/2026-10-15-a-child-held-by-its-features-unratified-plan-is-not-
+#: stuck.md. EXHAUSTIVE: both callers of `review_assumption` write one of the two
+#: settlement kinds — `ops.py:8605` (Neo's auto-review) and `ops.py:8743` (the user's).
+PLAN_ASSUMPTION_EVENT_KINDS = ("assumption", "autoreview_accepted", "reviewed")
+
+
+def plan_hold_spans(events: Iterable[Any], since: float,
+                    now: float) -> list[tuple[float, float]]:
+    """Every interval inside `[since, now]` a feature's plan was unratified.
+
+    §2.3 of docs/superpowers/specs/2026-10-15-a-child-held-by-its-features-unratified-
+    plan-is-not-stuck.md: `ops.stuck_scan` DISCOUNTS these seconds as well as excluding a
+    live hold. `pending` is judged on time in status, so without the discount the first
+    sweep after the user rules sees the whole wait and buys the investigation the
+    exclusion existed to prevent — `validation_ci_hold_spans`' reason, one hold along.
+
+    THE EVENTS ARE THE PLANNER'S WHOLE HISTORY, NOT THE WINDOW'S. The count entering
+    `[since, now]` is only right if the walk starts at the first event ever written, so
+    the clipping happens to the resulting SPANS. Filtering the rows by `since` first
+    would lose every hold that opened before the child's status span — which is the
+    normal case, since the plan is held before the child is even filed.
+
+    SPANS AND NOT A TOTAL, for `validation_ci_hold_spans`' reason: only intervals can be
+    unioned with the usage holds (`holds.union_seconds`), and a usage window can shut
+    while the plan stands.
+
+    Neo ruled this derivation (question 1803) over an `assumptions.decided_ts` column:
+    the timeline is what the OS already writes, and a NULL pre-migration column would
+    reintroduce the stale-exclusion defect on every existing row.
+
+    Takes ROWS rather than a store for `validation_hold_until`'s reason.
+    """
+    spans: list[tuple[float, float]] = []
+    pending, opened = 0, 0.0
+    for e in sorted(events, key=lambda r: float(r["ts"])):
+        kind = str(e["kind"])
+        if kind == "assumption":
+            delta = 1
+        elif kind == "autoreview_accepted":
+            delta = -1
+        elif kind == "reviewed":
+            delta = -int(db.from_json(e["payload"], {}).get("count") or 0)
+        else:
+            continue
+        before = pending
+        # CLAMPED AT ZERO: a malformed `count` must not drive the walk negative, which
+        # would swallow the next hold entirely instead of reporting one wrong span.
+        pending = max(0, pending + delta)
+        if before == 0 and pending > 0:
+            opened = float(e["ts"])
+        elif before > 0 and pending == 0:
+            spans.append((opened, float(e["ts"])))
+    if pending > 0:
+        spans.append((opened, now))
+    return sorted((max(start, since), min(end, now)) for start, end in spans
+                  if min(end, now) > max(start, since))
+
+
 # What one seat proposed. "" is a seat that offered none — it ran, but said nothing the
 # arbiter can count.
 VALIDATION_VERDICTS = ("pass", "reject", "")
@@ -948,6 +1007,27 @@ CREATE TABLE IF NOT EXISTS assumptions (
     -- and the OBJECTION columns (§4.2 of the spec named in ADDED_COLUMNS), for the
     -- same reason.
 );
+-- ONE EXPLICIT PRECONDITION on one work order: the thing it was told not to start
+-- without, as a row the claim SQL can evaluate. Written ONLY by
+-- `jarvis wo create --blocked-by <ref>` and cleared only by the daemon's re-derivation or
+-- by `jarvis wo unblock` — NEVER derived from the brief (kn-5d8a396a, §2.4).
+--
+-- `ref` is deliberately free-form text, not a foreign key: the three things a hold points
+-- at live in three different databases (`bl-` in the central store, `kn-` in the central
+-- store, `io-` in this one) and one of them is a tracker issue or a URL. A column that
+-- could only hold what SQLite can join would refuse exactly the holds that occur.
+CREATE TABLE IF NOT EXISTS preconditions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    wo_id TEXT NOT NULL REFERENCES work_orders(id) ON DELETE CASCADE,
+    ref TEXT NOT NULL,                      -- bl-… | kn-… | io-… | #123 | a URL | free text
+    note TEXT NOT NULL DEFAULT '',          -- the user's own words for the wait
+    status TEXT NOT NULL DEFAULT 'open',    -- open | cleared
+    created_at REAL NOT NULL,
+    cleared_at REAL,
+    cleared_by TEXT NOT NULL DEFAULT '',    -- 'os' | 'user'; '' while open
+    -- Idempotence for a repeated flag, and what makes "attach this hold" re-runnable.
+    UNIQUE (wo_id, ref)
+);
 -- One judging round over one working unit — a work order or a feature order — by the
 -- validation panel. ONE table for both, not two: the two loops record identical facts,
 -- and two tables would mean two of every reader, two renderers, and two chances to
@@ -1224,6 +1304,9 @@ CREATE INDEX IF NOT EXISTS idx_fo_origin_created
 CREATE INDEX IF NOT EXISTS idx_validation_opinions ON validation_opinions(round_id);
 CREATE INDEX IF NOT EXISTS idx_envelopes_state ON envelopes(state, id);
 CREATE INDEX IF NOT EXISTS idx_envelopes_subject ON envelopes(subject_wo_id, subject_fo_id);
+-- One probe per candidate row inside the claim's own statement — §2.2 of
+-- docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md.
+CREATE INDEX IF NOT EXISTS idx_preconditions_open ON preconditions(wo_id, status);
 """
 
 # Columns added after the first release. `CREATE TABLE IF NOT EXISTS` is a no-op on an
@@ -1300,6 +1383,19 @@ ADDED_COLUMNS = {
         # be read as history rather than as the cache this is.
         "pr_head_oid": "TEXT",
         "pr_head_seen_at": "REAL",
+        # THE SAME CACHE FOR THE TWO FACTS THAT SAY GITHUB HAS STOPPED RECOMPUTING THIS
+        # PULL REQUEST — wo-d3a70c29, from PR #995: the branch moved and the pull
+        # request's `head.sha` did not, so mergeability stayed UNKNOWN for ~7h and the
+        # poll's every acting branch declined, silently and for ever.
+        #
+        # `pr_ref_oid` is the branch tip `git ls-remote` reports, read only while
+        # mergeability is UNKNOWN; "" is NOT OBSERVED and never a sha that could match
+        # one, same rule as `pr_head_oid` above. `pr_mergeable_unknown_since` is when
+        # mergeability FIRST stopped being an answer, and is cleared the moment it is one
+        # again — a fresh UNKNOWN is what an ordinary push looks like (kn-5e93939e).
+        # Both are read by `daemon.pr_recompute_stalled`, off the row and nothing else.
+        "pr_ref_oid": "TEXT",
+        "pr_mergeable_unknown_since": "REAL",
         # Work orders that must finish before this one may be claimed (JSON list of
         # work-order ids). Deliberately NOT a `blocked` status: this codebase's statuses
         # are load-bearing — OPEN_STATUSES, TERMINAL_STATUSES, true_blockers and the
@@ -1751,6 +1847,11 @@ ASSUMPTION_DECIDER_OS = "neo"
 #: ESCALATE (§2 of both specs).
 PROVISIONAL_VERDICTS = ("accept", "object")
 
+#: A precondition row's two states, and the two parties that may clear one — §2.1 of
+#: docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md.
+PRECONDITION_STATUSES = ("open", "cleared")
+PRECONDITION_CLEARED_BY = ("os", "user")
+
 #: How an objection reached the worker. `queue` always exists and is the fallback;
 #: `peer` is a mid-turn delivery. Recorded because "it was sent" and "it was sent in a
 #: way the worker could act on before its next turn boundary" are different claims.
@@ -1807,6 +1908,28 @@ CLAIM_RULES: tuple[_ClaimRule, ...] = (
         why="the claim query does not select this row: it is not `pending`, or hidden",
         sql="w.status='pending' AND w.hidden=0",
         delayed=False,
+        params=lambda: (),
+    ),
+    # THE ORDER WAS TOLD NOT TO START, and said so structurally. In `CLAIM_RULES` and not
+    # in `Daemon.dispatch_pending` for `plan_assumption`'s reason one level stronger: an
+    # open precondition is a PROPERTY OF THE ROW (Neo 1906), unlike `claim_next_pending`'s
+    # per-call `only`, which is a restriction on one caller. Here the row is passed over
+    # inside the statement that picks the next one, so a younger unheld order is still
+    # claimed on the same call and NOTHING IS WRITTEN — no status, no attempt, no flag.
+    #
+    # AT INDEX 1, which cannot change whether a row is taken (the UPDATE ANDs every rule)
+    # and decides one thing only: which sentence `claim_refusal` returns, because that
+    # takes the FIRST refusing rule. A precondition is the condition the order was CREATED
+    # with and the other four are circumstances it happens to be in. §2.2 of
+    # docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md.
+    _ClaimRule(
+        code="precondition",
+        why="a precondition it was told not to start without is still open",
+        sql="""NOT EXISTS (
+                   SELECT 1 FROM preconditions p
+                   WHERE p.wo_id = w.id AND p.status = 'open'
+               )""",
+        delayed=True,
         params=lambda: (),
     ),
     # A dispatch that could not reach `claude` is backing off — `retry_after`, written by
@@ -2205,6 +2328,65 @@ class ProjectStore:
         # same row for history, derived from `created_at`.
         self._record_span(wo_id, "wo", "", status, ts=ts)
         return self.get_work_order(wo_id)
+
+    # -- preconditions -----------------------------------------------------
+    # §2.1 of docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md.
+
+    def add_precondition(self, wo_id: str, ref: str, note: str = "") -> dict[str, Any]:
+        """Attach ONE hold. Idempotent on `(wo_id, ref)`, which is what makes the flag
+        re-runnable; the ref is stored verbatim and resolved by nothing here."""
+        ref = ref.strip()
+        row = self.conn.execute(
+            "SELECT * FROM preconditions WHERE wo_id=? AND ref=?", (wo_id, ref)
+        ).fetchone()
+        if row is not None:
+            return dict(row)
+        self.conn.execute(
+            """INSERT INTO preconditions (wo_id, ref, note, created_at)
+               VALUES (?,?,?,?)""",
+            (wo_id, ref, note, db.now()),
+        )
+        self.add_event(wo_id, "precondition_added", {"ref": ref, "note": note})
+        return dict(self.conn.execute(
+            "SELECT * FROM preconditions WHERE wo_id=? AND ref=?",
+            (wo_id, ref)).fetchone())
+
+    def open_preconditions(self, wo_id: str) -> list[dict[str, Any]]:
+        """Every hold still standing on this order, oldest first — `idx_preconditions_open`."""
+        rows = self.conn.execute(
+            "SELECT * FROM preconditions WHERE wo_id=? AND status='open' "
+            "ORDER BY created_at, id", (wo_id,)).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def clear_precondition(self, id_or_ref: int | str, *, by: str) -> None:
+        """Clear one row by its `id` or by its `ref`, naming the party that did it."""
+        assert by in PRECONDITION_CLEARED_BY, by
+        by_id = isinstance(id_or_ref, int)
+        # Column names spelled as literals, never interpolated.
+        select = ("SELECT wo_id, ref, note FROM preconditions "
+                  "WHERE id=? AND status='open'" if by_id else
+                  "SELECT wo_id, ref, note FROM preconditions "
+                  "WHERE ref=? AND status='open'")
+        update = ("UPDATE preconditions SET status='cleared', cleared_at=?, cleared_by=? "
+                  "WHERE id=? AND status='open'" if by_id else
+                  "UPDATE preconditions SET status='cleared', cleared_at=?, cleared_by=? "
+                  "WHERE ref=? AND status='open'")
+        rows = self.conn.execute(select, (id_or_ref,)).fetchall()
+        self.conn.execute(update, (db.now(), by, id_or_ref))
+        for row in rows:
+            self.add_event(row["wo_id"], "precondition_cleared",
+                           {"ref": row["ref"], "by": by, "note": row["note"]})
+
+    def clear_preconditions(self, wo_id: str, refs: Collection[str], *,
+                            by: str) -> list[str]:
+        """Clear several of ONE order's holds, by row id — so a ref another order also
+        waits on is untouched. Returns the refs actually cleared."""
+        assert by in PRECONDITION_CLEARED_BY, by
+        wanted = set(refs)
+        rows = [r for r in self.open_preconditions(wo_id) if r["ref"] in wanted]
+        for row in rows:
+            self.clear_precondition(int(row["id"]), by=by)
+        return [row["ref"] for row in rows]
 
     def get_work_order(self, wo_id: str) -> dict[str, Any]:
         row = self.conn.execute("SELECT * FROM work_orders WHERE id=?", (wo_id,)).fetchone()
