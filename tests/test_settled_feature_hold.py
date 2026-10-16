@@ -81,8 +81,8 @@ def test_a_live_child_under_a_failed_feature_leads_with_the_hold(started, store)
 
 
 def test_one_reconcile_tick_raises_the_flag_with_that_string(started, store):
-    """It reaches the user with NO new writer: INV-ATTENTION-MISSING runs over
-    BLOCKED_STATUSES and raises `blockers[0]`."""
+    """It reaches the user with NO new writer: INV-ATTENTION-MISSING runs over every open
+    status plus `failed` and raises `blockers[0]`."""
     fo, live = a_feature_with_a_live_child(store)
 
     found = invariants.check_project(store)
@@ -205,16 +205,20 @@ def test_a_completed_feature_names_both_ways_out(started, store):
     assert f"jarvis wo done {live['id']}" in blocker
 
 
-def test_a_child_in_validating_is_never_flagged_with_the_hold(started, store):
-    """Deliberate, and it is BLOCKED_STATUSES that makes it so: `validating` is the one
-    open status it leaves out, because the round machine owns that work order and nobody
-    is waiting on the manager."""
-    _fo, live = a_feature_with_a_live_child(store)
+def test_a_child_in_validating_now_carries_the_hold_too(started, store):
+    """It used to be silent, and only because the old status gate left `validating` out —
+    `true_blockers` derived the hold all along (it gates on OPEN_STATUSES, which has
+    `validating`). INV-ATTENTION-MISSING derives its statuses now, so the derived hold
+    reaches the user in every open status: spec
+    docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md §5c."""
+    fo, live = a_feature_with_a_live_child(store)
     store.set_status(live["id"], "validating")
 
     invariants.check_project(store)
 
-    assert not store.get_work_order(live["id"])["needs_attention"]
+    row = store.get_work_order(live["id"])
+    assert row["needs_attention"]
+    assert row["attention_reason"] == hold(fo["id"], fo["status"], live["id"])
 
 
 def test_an_assumption_the_user_owes_still_comes_first(started, store):
