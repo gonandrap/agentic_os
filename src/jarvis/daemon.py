@@ -5669,8 +5669,19 @@ class Daemon:
         # PROJECT-WIDE, read once rather than once per candidate — `health_sweep_hold`'s
         # own docstring — and the fleet half beside it, per §2.1.
         window = bool(pstore.health_sweep_hold()) or (state is not None and state.shut())
+        # §1 and §2 of docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-
+        # not-stuck.md, under `poll_pull_requests`' own gate on that read.
+        base_red, red_episodes, base_red_until = False, (), 0.0
+        if project.validation.enabled and project.validation.auto_merge:
+            # The freshness test is `_base_red`'s, REUSED and not re-derived.
+            base_red = self._base_red(project) is not None
+            base_red_until = ops._base_red_until(self.central.base_health(project.name),
+                                                 now)
+            red_episodes = tuple(self.central.base_red_episodes(project.name))
         scanned, out = ops.stuck_scan(pstore, project.name, project.fleet_health, now,
-                                      window=window)
+                                      window=window, base_red=base_red,
+                                      red_episodes=red_episodes,
+                                      base_red_until=base_red_until)
         run["scanned"] += scanned
         return out
 
@@ -7151,6 +7162,7 @@ class Daemon:
         }
         self.central.set_base_health(project.name, fact)
         if was_red and worst is None:
+            self._record_red_episode(project, red=False, now=fact["checked_at"])
             store.close_violation_report(INV_BASE_RED)
             store.add_notification(
                 title=f"`{base}` is green again in {project.name}",
@@ -7161,7 +7173,25 @@ class Daemon:
             )
             log.info("[%s] %s recovered", project.name, base)
         elif worst is not None and not was_red:
+            self._record_red_episode(project, red=True, now=fact["checked_at"])
             log.warning("[%s] %s is red — %s", project.name, base, fact["run_url"])
+
+    def _record_red_episode(self, project: ProjectSpec, red: bool, now: float) -> None:
+        """Open or close this project's red episode, on a TRANSITION only.
+
+        §2 of docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md,
+        Neo's ruling on question 1818: the sweep's discount must outlive the exclusion by
+        one status span, and a live fact cannot — `_base_red` returns None the instant
+        `main` goes green. THE WRITER IS THE RETENTION BOUND'S READER, from the
+        `ProjectSpec` this method already has.
+        """
+        from .central_store import advance_red_episodes
+
+        self.central.set_base_red_episodes(
+            project.name,
+            advance_red_episodes(
+                self.central.base_red_episodes(project.name), red, now,
+                project.fleet_health.red_episode_retention_hours * 3600.0))
 
     def dispatch_base_fix(self, project: ProjectSpec, store: ProjectStore) -> None:
         """A red tracker `main` files-or-adopts an issue and dispatches a work order on it.

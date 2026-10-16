@@ -43,6 +43,9 @@ IDLE_MANAGER_CAUSE = "its feature's next message"
 #: §1 of docs/superpowers/specs/2026-10-14-a-worker-turn-in-flight-is-not-stuck.md.
 TURN_IN_FLIGHT_CAUSE = "a worker turn is in flight"
 
+#: §1 of docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md.
+BASE_RED_CAUSE = "the default branch is red"
+
 #: §2.1 of docs/superpowers/specs/2026-10-15-a-child-held-by-its-features-unratified-
 #: plan-is-not-stuck.md.
 PLAN_ASSUMPTION_CAUSE = "its feature's unratified plan"
@@ -60,6 +63,10 @@ EXCLUSION_REASON: Mapping[str, str] = {
     TURN_IN_FLIGHT_CAUSE: ("a worker turn is in flight and writes nothing to the "
                            "timeline while its tools run — it clears by itself when the "
                            "turn ends, so nothing is judged while it does"),
+    BASE_RED_CAUSE: ("the OS is holding this merge itself: the default branch's own build "
+                     "is broken and nothing merges onto a red base — it clears when the "
+                     "base goes green, with no decision from you, so nothing is judged "
+                     "while that is true"),
     # §2.1: the shipped sentence is FALSE here — a person ruling on the planner's
     # assumptions is the only thing that clears this, so the sentence names that move.
     PLAN_ASSUMPTION_CAUSE: ("this child is withheld from dispatch until its feature's "
@@ -131,7 +138,10 @@ def assess(status: str, seconds_in_status: float, seconds_since_activity: float,
     five resume by themselves — so an investigation would buy a session to be told the OS
     is working as designed. `exempt_kinds` and `by_design_idle` exclude too (§1, §2.2 of
     the 2026-10-12 spec), as does a worker whose turn is in flight — it writes nothing to
-    the timeline while its tools run (§1 of the 2026-10-14 spec).
+    the timeline while its tools run (§1 of the 2026-10-14 spec). So does a
+    `waiting_pr_merge` order whose auto-merge the OS is itself holding because the default
+    branch is red (`BASE_RED_CAUSE`, §1 of
+    docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md).
 
     That CI one is an EXTENSION of kn-6e836793 (the user's 2026-09-27 ruling that the
     usage hold was the only one) on the record rather than a silent widening — the
