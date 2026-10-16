@@ -35,6 +35,12 @@ HUGE = 500_000       # …so this is "bigger than anything the fake will report"
 
 @pytest.fixture()
 def fleet(jarvis_home, fake_claude, catalog_file, project):
+    # The clock tests below age a turn by `usage.WRITE_TTL_SECONDS`, the five-minute
+    # write; the hour's clock is `tests/test_cache_ttl_compaction.py`'s subject. In the
+    # FILE, because the budget-raise path re-reads the catalog from disk.
+    data = json.loads(Path(catalog_file).read_text())
+    data["projects"][0].setdefault("worker", {})["cache_ttl"] = "5m"
+    Path(catalog_file).write_text(json.dumps(data))
     ops.start_os(str(catalog_file), foreground=True)
     catalog = load_catalog(catalog_file)
     daemon = Daemon(catalog)

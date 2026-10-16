@@ -4727,6 +4727,22 @@ def _cohort_note(cfg: Any, writes: Any) -> str:
             f"hand, so the two figures differ by design.")
 
 
+def fleet_buys_the_hour(catalog: Any) -> bool:
+    """Whether any project's leads buy the one-hour write (`worker.cache_ttl`). Both
+    readers of the 1h question — the dispatched alarm and the TTL trigger — presume the
+    five-minute write, and have no subject in a fleet that chose the hour."""
+    return any(p.worker.cache_ttl == "1h" for p in catalog.projects)
+
+
+def _fleet_catalog() -> Any | None:
+    from .ops import resolve_catalog
+
+    try:
+        return resolve_catalog()
+    except Exception:  # noqa: BLE001 — no catalog is not a cache-health finding
+        return None
+
+
 def check_cache_ttl_trigger() -> Iterator[Violation]:
     """INV-CACHE-TTL-TRIGGER — the 1-hour cache write has started paying, and nobody
     would have noticed.
@@ -4750,6 +4766,9 @@ def check_cache_ttl_trigger() -> Iterator[Violation]:
     """
     from . import usage as usage_mod
 
+    catalog = _fleet_catalog()
+    if catalog is None or fleet_buys_the_hour(catalog):
+        return
     health = _cache_health()
     if health is None:
         return
@@ -4766,7 +4785,7 @@ def check_cache_ttl_trigger() -> Iterator[Violation]:
             f"{deciding:.1%} of the fleet's cache writes are now re-writes the cache "
             f"entry EXPIRING caused, against the {usage_mod.TTL_BREAK_EVEN:.1%} "
             f"break-even where buying the 1-hour cache write starts paying — so the "
-            f"fleet's 5-minute write (`claude_cli.PROMPT_CACHE_5M_ENV`) is now costing "
+            f"fleet's 5-minute write (`worker.cache_ttl: 5m`) is now costing "
             f"money rather than saving it. Price it over the wider population before "
             f"changing anything. For contrast and NOT for comparison, TTL expiry is "
             f"{of_tax:.1%} of the re-write tax — a larger figure, because its "

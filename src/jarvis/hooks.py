@@ -27,7 +27,7 @@ import shlex
 import sys
 import time
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, Mapping, NamedTuple
 
 from . import concision
 # §3 of the 2026-10-02 navigation split: ONE masker in the tree, by identity.
@@ -494,6 +494,7 @@ def payload_reference_decision(payload: dict[str, Any],
 #: against these, so the two cannot drift silently.
 TURN_TRANSPORT_ENV = "JARVIS_TURN_TRANSPORT"
 TRANSPORT_HEADLESS = "headless"
+CACHE_TTL_ENV = "JARVIS_CACHE_TTL"  # `claude_cli.CACHE_TTL_ENV`, same rule
 REQUIRE_CREW_ENV = "JARVIS_REQUIRE_CREW"
 WO_KIND_ENV = "JARVIS_WO_KIND"
 
@@ -510,10 +511,39 @@ TOOL_MANAGED_PATHS_ENV = "JARVIS_TOOL_MANAGED_PATHS"
 #: grow without limit as the list does.
 MAX_TOOL_MANAGED_PATHS = 32
 
-#: The longest a single foreground call may block. Under `inspection.TTL_5M` (300s) with
-#: room for the call itself, so a lead polling on this rhythm never loses the cache.
-#: §3 of docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md.
+#: The longest a single foreground call may block under the FIVE-MINUTE write: under
+#: `inspection.TTL_5M` (300s) with room for the call itself, so a lead polling on this
+#: rhythm never loses the cache. §3 of
+#: docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md. The cap a
+#: given worker actually gets is `foreground_cap_seconds`, sized from the TTL its lead
+#: bought (`claude_cli.CACHE_TTL_ENV`); this literal is the floor it falls back to.
 MAX_FOREGROUND_SECONDS = 240
+#: The cap as a share of the TTL — 240 of 300 is what the measured rule shipped with.
+FOREGROUND_CAP_SHARE = MAX_FOREGROUND_SECONDS / 300
+
+_CACHE_TTL_SECONDS = {"5m": 300, "1h": 3600}
+
+
+def cache_ttl_seconds(env: Mapping[str, str]) -> int:
+    """How long the lead's prompt cache lives, from the TTL dispatch wrote beside the
+    CLI's own pins. Unknown or absent reads as the short one: the direction a mistake
+    must fail in. Findings: docs/superpowers/findings/
+    2026-10-11-the-lead-buys-the-hour-the-crew-does-not.md"""
+    return _CACHE_TTL_SECONDS.get(env.get(CACHE_TTL_ENV, ""), 300)
+
+
+def foreground_cap_seconds(env: Mapping[str, str]) -> int:
+    return int(cache_ttl_seconds(env) * FOREGROUND_CAP_SHARE)
+
+
+def poll_rhythm(env: Mapping[str, str]) -> str:
+    """How often a lead collects a background task: inside the cache window, and not
+    much inside it — every check-in re-reads the whole conversation."""
+    return "3-4 minutes" if cache_ttl_seconds(env) < 3600 else "30-40 minutes"
+
+
+def ttl_minutes(env: Mapping[str, str]) -> int:
+    return cache_ttl_seconds(env) // 60
 
 #: The two crew seats whose median duration in the measured period exceeded the TTL. A
 #: short seat blocking for four minutes is cheap and refusing it would tax every
@@ -655,7 +685,7 @@ def background_task_decision(payload: dict[str, Any],
     # it IS the fix. Gated on the harness's own spelling, never on a shell `&`: a
     # `&`-detached job has no id, so `BashOutput` cannot poll it and the Stop guard
     # cannot see it — the orphan class §4 of the 2026-09-23 spec closed.
-    arm = long_shell_shape(tool_input.get("command", ""))
+    arm = long_shell_shape(tool_input.get("command", ""), foreground_cap_seconds(env))
     if tool_input.get("run_in_background") and arm:
         return None
     if arm:
@@ -665,7 +695,7 @@ def background_task_decision(payload: dict[str, Any],
         return _deny(
             f"`&` is not the way to background this: a `&`-detached job has no id, so "
             f"`BashOutput` cannot poll it and the Stop hook cannot see it. "
-            f"{_LONG_SHELL_ADVICE[arm]} {_LONG_WHY}"
+            f"{_long_shell_advice(arm, env)} {cache_window_why(env)}"
         )
     return _deny(
         "Re-run this in the FOREGROUND: this turn is one `claude -p` process, ending it "
@@ -733,7 +763,7 @@ def _is_whole_suite(words: list[str]) -> bool:
     return not (positional and all(arg.endswith(".py") for arg in positional))
 
 
-def long_shell_shape(command: str) -> str | None:
+def long_shell_shape(command: str, cap: int = MAX_FOREGROUND_SECONDS) -> str | None:
     """Which long-running shape this command is, or None — `"suite"`, `"ci-watch"`,
     `"sleep"`.
 
@@ -751,7 +781,7 @@ def long_shell_shape(command: str) -> str | None:
     # way to express "poll, but give up in time".
     if statements and statements[0][:1] == ["timeout"] and len(statements[0]) > 1:
         limit = _seconds(statements[0][1])
-        if limit is not None and limit <= MAX_FOREGROUND_SECONDS:
+        if limit is not None and limit <= cap:
             return None
     for words in statements:
         if _is_whole_suite(words):
@@ -766,14 +796,21 @@ def long_shell_shape(command: str) -> str | None:
     for words in statements:
         if words[:1] == ["sleep"] and len(words) > 1:
             waited = _seconds(words[1])
-            if waited is not None and waited > MAX_FOREGROUND_SECONDS:
+            if waited is not None and waited > cap:
                 return "sleep"
     return None
 
 
-def long_seat_call(payload: dict[str, Any]) -> str | None:
-    """The seat this payload delegates to in the FOREGROUND, if it is a long one."""
+def long_seat_call(payload: dict[str, Any],
+                   env: Mapping[str, str] | None = None) -> str | None:
+    """The seat this payload delegates to in the FOREGROUND, if it is a long one.
+
+    Under the hour-long write no seat is long: a join is one blocking call with no
+    request in flight, and the crew's runs sit well inside the window — that is the
+    reason the lead buys the hour at all."""
     if payload.get("tool_name") not in ("Agent", "Task"):
+        return None
+    if env is not None and cache_ttl_seconds(env) >= 3600:
         return None
     tool_input = payload.get("tool_input") or {}
     if tool_input.get("run_in_background"):
@@ -786,36 +823,45 @@ def long_seat_call(payload: dict[str, Any]) -> str | None:
 #: suite text names the pinned rule FIRST and backgrounding second: kn-356c724b says a
 #: worker must not run the whole suite locally at all, and this must not read as
 #: permission to (§3a).
-_LONG_SHELL_ADVICE = {
-    "suite": (
-        "Run your targeted tests instead: the tests for what you changed are the "
-        "evidence, and the validation panel runs the suite on more interpreters than "
-        "you can. If this project's own standing instructions require a full run "
-        "before a pull request, background it — set `run_in_background: true` and "
-        "collect with `BashOutput` every 3-4 minutes until it reports finished."
-    ),
-    "ci-watch": (
-        "DO NOT WAIT FOR CI. Finish as soon as your targeted tests pass and the pull "
-        "request is open: the OS holds the validation round until GitHub has reported "
-        "and nothing is billed while it waits. If you must see the result in this turn, "
-        "background the watcher — `run_in_background: true`, then `BashOutput` every "
-        "3-4 minutes."
-    ),
-    "sleep": (
-        "Background the work and poll it instead: `run_in_background: true`, then "
-        f"`BashOutput` every 3-4 minutes. A single call may block up to "
-        f"{MAX_FOREGROUND_SECONDS} seconds — `sleep 200` is legal — and a loop is "
-        f"bounded by `timeout {MAX_FOREGROUND_SECONDS} …`, never by its sleep argument."
-    ),
-}
+def _long_shell_advice(arm: str, env: Mapping[str, str]) -> str:
+    rhythm, cap = poll_rhythm(env), foreground_cap_seconds(env)
+    return {
+        "suite": (
+            "Run your targeted tests instead: the tests for what you changed are the "
+            "evidence, and the validation panel runs the suite on more interpreters "
+            "than you can. If this project's own standing instructions require a full "
+            "run before a pull request, background it — set `run_in_background: true` "
+            f"and collect with `BashOutput` every {rhythm} until it reports finished."
+        ),
+        "ci-watch": (
+            "DO NOT WAIT FOR CI. Finish as soon as your targeted tests pass and the "
+            "pull request is open: the OS holds the validation round until GitHub has "
+            "reported and nothing is billed while it waits. If you must see the result "
+            "in this turn, background the watcher — `run_in_background: true`, then "
+            f"`BashOutput` every {rhythm}."
+        ),
+        "sleep": (
+            "Background the work and poll it instead: `run_in_background: true`, then "
+            f"`BashOutput` every {rhythm}. A single call may block up to {cap} seconds "
+            f"— `sleep {cap - 40}` is legal — and a loop is bounded by `timeout {cap} …`, "
+            "never by its sleep argument."
+        ),
+    }[arm]
 
-#: The reason every arm carries, because the correction is worthless without it.
-_LONG_WHY = (
-    "Your prompt cache lives 5 minutes: a call more than 300 seconds after the previous "
-    "one re-sends this whole conversation at the 1.25x write rate, where a check-in "
-    "inside the window is a 0.1x read. Never end the turn with a task uncollected — the "
-    "Stop hook refuses it, and ending would kill the task."
-)
+
+def cache_window_why(env: Mapping[str, str]) -> str:
+    """The reason every refusal carries, because the correction is worthless without
+    it. Sized from the TTL the lead bought: the same sentence with the hour's numbers
+    is what a worker that bought the hour is told."""
+    ttl, minutes = cache_ttl_seconds(env), ttl_minutes(env)
+    rate = "1.25x" if ttl < 3600 else "2x"
+    return (
+        f"Your prompt cache lives {minutes} minutes: a call more than {ttl} seconds "
+        f"after the previous one re-sends this whole conversation at the {rate} write "
+        f"rate, where a check-in inside the window is a 0.1x read. Never end the turn "
+        f"with a task uncollected — the Stop hook refuses it, and ending would kill the "
+        f"task."
+    )
 
 
 def long_foreground_decision(payload: dict[str, Any],
@@ -836,14 +882,14 @@ def long_foreground_decision(payload: dict[str, Any],
     tool = payload.get("tool_name")
     tool_input = payload.get("tool_input") or {}
     if tool in ("Agent", "Task"):
-        seat = long_seat_call(payload)
+        seat = long_seat_call(payload, env)
         if seat is None:
             return None
         return _deny(
             f"Set `run_in_background: true` on this `{seat}` call and collect it with "
-            f"`TaskOutput` every 3-4 minutes. A foreground seat call is a JOIN: your "
-            f"turn is blocked for its whole duration, and this seat's median run "
-            f"outlasts the cache. {_LONG_WHY}"
+            f"`TaskOutput` every {poll_rhythm(env)}. A foreground seat call is a JOIN: "
+            f"your turn is blocked for its whole duration, and this seat's median run "
+            f"outlasts the cache. {cache_window_why(env)}"
         )
     if tool != "Bash":
         return None
@@ -851,10 +897,10 @@ def long_foreground_decision(payload: dict[str, Any],
     # Already backgrounded is what this rule ASKS for; §4 is where that is permitted.
     if tool_input.get("run_in_background") or backgrounds_through_shell(command):
         return None
-    arm = long_shell_shape(command)
+    arm = long_shell_shape(command, foreground_cap_seconds(env))
     if arm is None:
         return None
-    return _deny(f"{_LONG_SHELL_ADVICE[arm]} {_LONG_WHY}")
+    return _deny(f"{_long_shell_advice(arm, env)} {cache_window_why(env)}")
 
 
 def crew_edit_decision(payload: dict[str, Any],
@@ -2142,8 +2188,8 @@ def held_request_turn_block(store: ProjectStore, wo_id: str, payload: dict[str, 
 UNCOLLECTED_TASK_BLOCK = (
     "You may not end this turn: background task(s) {labels} were started in it and "
     "never collected, and ending here kills them — nothing wakes you and nobody reads "
-    "their output. Collect them now, in this turn: `BashOutput`/`TaskOutput` every 3-4 "
-    "minutes until each one reports finished, and `KillShell` anything you no longer "
+    "their output. Collect them now, in this turn: `BashOutput`/`TaskOutput` every "
+    "{rhythm} until each one reports finished, and `KillShell` anything you no longer "
     "want. Each check-in is a cache READ; ending the turn and starting another is a "
     "full re-write of this conversation. If a task is genuinely hung, kill it and say "
     "so in your final message."
@@ -2200,7 +2246,8 @@ def uncollected_task_turn_block(store: ProjectStore, wo_id: str,
         "session_id": session_id, "jobs": [job.job_id for job in jobs],
     })
     return {"decision": "block",
-            "reason": UNCOLLECTED_TASK_BLOCK.format(labels=background.labels(jobs))}
+            "reason": UNCOLLECTED_TASK_BLOCK.format(labels=background.labels(jobs),
+                                                    rhythm=poll_rhythm(env))}
 
 
 def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:

@@ -107,6 +107,15 @@ DEFAULT_WORKER_BASH_FIRST = "off"
 VALID_TOOL_SEARCH = ("off", "on", "cli")
 DEFAULT_WORKER_TOOL_SEARCH = "on"
 
+# The prompt-cache TTL a worker's LEAD buys and the one its SUBAGENTS buy — the CLI
+# decides them separately, and the economics differ: the lead idles while the crew works
+# and pays the hour only on its deltas; a subagent is never resumed and writes its whole
+# prefix cold. Same strings the CLI parses (`claude_cli.CACHE_TTLS`). Findings:
+# docs/superpowers/findings/2026-10-11-the-lead-buys-the-hour-the-crew-does-not.md
+VALID_CACHE_TTL = ("5m", "1h")
+DEFAULT_WORKER_CACHE_TTL = "1h"
+DEFAULT_WORKER_SUBAGENT_CACHE_TTL = "5m"
+
 # Whether `hooks.py_nav_decision` refuses a worker's source-navigating Bash call at a
 # `.py` path. §6 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md.
 #
@@ -260,7 +269,7 @@ DEFAULT_INVESTIGATION_EFFORT = "low"
 # that never returned — nothing bounded it, and it ended when the work order did).
 #
 # FIVE MINUTES, and the figure is the OS's existing cost boundary rather than a new one:
-# it is the 5-minute prompt-cache TTL `claude_cli.PROMPT_CACHE_5M_ENV` buys and what
+# it is the 5-minute prompt-cache TTL a worker's crew buys (`claude_cli.cache_env`) and what
 # `DEFAULT_INSPECT_ALARM_JOIN_SECONDS` is set to. A call that outlives the cache has
 # already cost the conversation a re-write; letting it run further buys nothing. Every
 # legitimate Serena/context7 call in this fleet's transcripts is sub-minute.
@@ -489,6 +498,9 @@ class WorkerDefaults:
     bash_first: str = DEFAULT_WORKER_BASH_FIRST
     # Spec 2026-10-02-serena-the-cheap-path.md §4 — see VALID_TOOL_SEARCH.
     tool_search: str = DEFAULT_WORKER_TOOL_SEARCH
+    # See VALID_CACHE_TTL.
+    cache_ttl: str = DEFAULT_WORKER_CACHE_TTL
+    subagent_cache_ttl: str = DEFAULT_WORKER_SUBAGENT_CACHE_TTL
     # Spec 2026-10-02-serena-the-cheap-path.md §6 — see VALID_PY_NAV_HOOK.
     py_nav_hook: str = DEFAULT_WORKER_PY_NAV_HOOK
     # Spec 2026-10-06-navigate-specs-like-code.md §5 — see VALID_DOC_NAV_HOOK.
@@ -1850,6 +1862,9 @@ class OsConfig:
     default_bash_first: str = DEFAULT_WORKER_BASH_FIRST
     # Spec 2026-10-02-serena-the-cheap-path.md §4 — see VALID_TOOL_SEARCH.
     default_tool_search: str = DEFAULT_WORKER_TOOL_SEARCH
+    # See VALID_CACHE_TTL.
+    default_cache_ttl: str = DEFAULT_WORKER_CACHE_TTL
+    default_subagent_cache_ttl: str = DEFAULT_WORKER_SUBAGENT_CACHE_TTL
     # Spec 2026-10-02-serena-the-cheap-path.md §6 — see VALID_PY_NAV_HOOK.
     default_py_nav_hook: str = DEFAULT_WORKER_PY_NAV_HOOK
     # Spec 2026-10-06-navigate-specs-like-code.md §5 — see VALID_DOC_NAV_HOOK.
@@ -3035,6 +3050,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         default_permission_mode=defaults.get("permission_mode", DEFAULT_PERMISSION_MODE),
         default_bash_first=defaults.get("bash_first", DEFAULT_WORKER_BASH_FIRST),
         default_tool_search=defaults.get("tool_search", DEFAULT_WORKER_TOOL_SEARCH),
+        default_cache_ttl=defaults.get("cache_ttl", DEFAULT_WORKER_CACHE_TTL),
+        default_subagent_cache_ttl=defaults.get("subagent_cache_ttl",
+                                                DEFAULT_WORKER_SUBAGENT_CACHE_TTL),
         # Spec 2026-10-02-serena-the-cheap-path.md §6.
         default_py_nav_hook=defaults.get("py_nav_hook", DEFAULT_WORKER_PY_NAV_HOOK),
         # Spec 2026-10-06-navigate-specs-like-code.md §5.
@@ -3099,6 +3117,10 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
     if os_cfg.default_tool_search not in VALID_TOOL_SEARCH:
         raise _err(f"os.defaults.tool_search {os_cfg.default_tool_search!r} not in "
                    f"{sorted(VALID_TOOL_SEARCH)}")
+    for key, value in (("cache_ttl", os_cfg.default_cache_ttl),
+                       ("subagent_cache_ttl", os_cfg.default_subagent_cache_ttl)):
+        if value not in VALID_CACHE_TTL:
+            raise _err(f"os.defaults.{key} {value!r} not in {sorted(VALID_CACHE_TTL)}")
     # Spec 2026-10-02-serena-the-cheap-path.md §6.
     if os_cfg.default_py_nav_hook not in VALID_PY_NAV_HOOK:
         raise _err(f"os.defaults.py_nav_hook {os_cfg.default_py_nav_hook!r} not in "
@@ -3155,6 +3177,13 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         if tool_search not in VALID_TOOL_SEARCH:
             raise _err(f"project {name}: worker.tool_search {tool_search!r} not in "
                        f"{sorted(VALID_TOOL_SEARCH)}")
+        cache_ttl = w.get("cache_ttl", os_cfg.default_cache_ttl)
+        subagent_cache_ttl = w.get("subagent_cache_ttl", os_cfg.default_subagent_cache_ttl)
+        for key, value in (("cache_ttl", cache_ttl),
+                           ("subagent_cache_ttl", subagent_cache_ttl)):
+            if value not in VALID_CACHE_TTL:
+                raise _err(f"project {name}: worker.{key} {value!r} not in "
+                           f"{sorted(VALID_CACHE_TTL)}")
         # Spec 2026-10-02-serena-the-cheap-path.md §6 — this message IS what
         # `jarvis config set <project> worker.py_nav_hook` shows.
         py_nav_hook = w.get("py_nav_hook", os_cfg.default_py_nav_hook)
@@ -3189,6 +3218,8 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
             permission_mode=pmode,
             bash_first=bash_first,
             tool_search=tool_search,
+            cache_ttl=cache_ttl,
+            subagent_cache_ttl=subagent_cache_ttl,
             py_nav_hook=py_nav_hook,
             doc_nav_hook=doc_nav_hook,
             doc_read_limit_lines=doc_read_limit_lines,

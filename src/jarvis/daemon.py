@@ -6369,7 +6369,9 @@ class Daemon:
             log.exception("[%s] the one-hour cache scan could not read transcripts",
                           project.name)
             return
-        raised = inspection.hour_alarms(found, cfg, days=days)
+        from .invariants import fleet_buys_the_hour
+        raised = inspection.hour_alarms(found, cfg, days=days,
+                                        hour_bought=fleet_buys_the_hour(self.catalog))
         if not raised:
             return
         carrier = store.latest_settled_order()

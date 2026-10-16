@@ -249,7 +249,10 @@ def test_the_levers_that_suppress_cli_side_churn_are_still_set(fleet):
     snapshot the briefing replaces, and the cache TTL the writes are billed at."""
     for r in fleet:
         assert r.settings["includeGitInstructions"] is False, r.label
-        for key, value in claude_cli.PROMPT_CACHE_5M_ENV.items():
+        pinned = claude_cli.cache_env(lead=r.settings["env"][claude_cli.CACHE_TTL_ENV],
+                                      subagent=r.settings["env"][
+                                          claude_cli.SUBAGENT_PROMPT_CACHE_TTL_ENV])
+        for key, value in pinned.items():
             assert r.settings["env"][key] == value, r.label
 
 

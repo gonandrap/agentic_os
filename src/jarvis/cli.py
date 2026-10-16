@@ -1957,8 +1957,8 @@ def _print_write_ttl(totals: dict) -> None:
     print(f"  cache write   {_tok(write)} tokens at {rate:.2f}x base input — "
           f"{_tok(hour)} of it bought the ONE-HOUR TTL (2x) rather than the "
           f"five-minute one (1.25x)")
-    print("                every path Jarvis launches now forces the 5-minute write, "
-          "so a figure here is spend that predates that or a `claude` it did not start")
+    print("                a worker's LEAD buys the hour by default (`worker.cache_ttl`) "
+          "and its crew the five-minute write; Jarvis's own calls buy five minutes")
 
 
 def _print_os_calls(res: dict) -> None:
@@ -5414,7 +5414,8 @@ def cmd_brief(args: argparse.Namespace) -> int:
                                       gates_enabled=gates_enabled,
                                       serena=os.environ.get("JARVIS_SERENA") != "0",
                                       tool_search=os.environ.get(
-                                          "JARVIS_TOOL_SEARCH", "cli")))
+                                          "JARVIS_TOOL_SEARCH", "cli"),
+                                      cache_ttl=os.environ.get("JARVIS_CACHE_TTL")))
     return 0
 
 

@@ -141,6 +141,38 @@ def test_tool_search_defaults_and_overrides_per_project():
     assert cat.projects[1].worker.tool_search == "on"
 
 
+def test_cache_ttl_defaults_and_overrides_per_project():
+    """The lead buys the hour and its crew the five-minute write, fleet-wide with a
+    per-project override on each. Findings:
+    docs/superpowers/findings/2026-10-11-the-lead-buys-the-hour-the-crew-does-not.md"""
+    cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
+    assert cat.os.default_cache_ttl == "1h"
+    assert cat.os.default_subagent_cache_ttl == "5m"
+    assert cat.projects[0].worker.cache_ttl == "1h"
+    assert cat.projects[0].worker.subagent_cache_ttl == "5m"
+
+    cat = parse_catalog({
+        "os": {"defaults": {"cache_ttl": "5m", "subagent_cache_ttl": "1h"}},
+        "projects": [
+            {"name": "a", "path": "/tmp/a"},
+            {"name": "b", "path": "/tmp/b",
+             "worker": {"cache_ttl": "1h", "subagent_cache_ttl": "5m"}},
+        ],
+    })
+    assert cat.projects[0].worker.cache_ttl == "5m"
+    assert cat.projects[0].worker.subagent_cache_ttl == "1h"
+    assert cat.projects[1].worker.cache_ttl == "1h"
+    assert cat.projects[1].worker.subagent_cache_ttl == "5m"
+
+
+def test_an_invalid_cache_ttl_names_the_key_and_the_valid_values():
+    with pytest.raises(CatalogError) as e:
+        parse_catalog({"projects": [{"name": "a", "path": "/x",
+                                     "worker": {"cache_ttl": "1H"}}]})
+    assert "worker.cache_ttl" in str(e.value)
+    assert "5m" in str(e.value) and "1h" in str(e.value)
+
+
 def test_an_invalid_tool_search_names_the_key_and_the_valid_values():
     """The enum check IS the error message `jarvis config set` shows: `ops.set_config`
     re-parses the document to validate (spec §4)."""
@@ -241,6 +273,12 @@ def test_an_invalid_bash_first_names_the_key_and_the_valid_values():
     ({"projects": [{"name": "a", "path": "/x", "worker": {"tool_search": "yes"}}]},
      "tool_search"),
     ({"os": {"defaults": {"tool_search": "relaxed"}}}, "os.defaults.tool_search"),
+    ({"projects": [{"name": "a", "path": "/x", "worker": {"cache_ttl": "60m"}}]},
+     "cache_ttl"),
+    ({"projects": [{"name": "a", "path": "/x", "worker": {"subagent_cache_ttl": "1H"}}]},
+     "subagent_cache_ttl"),
+    ({"os": {"defaults": {"cache_ttl": "hour"}}}, "os.defaults.cache_ttl"),
+    ({"os": {"defaults": {"subagent_cache_ttl": ""}}}, "os.defaults.subagent_cache_ttl"),
     ({"projects": [{"name": "a", "path": "/x", "worker": {"py_nav_hook": "cli"}}]},
      "py_nav_hook"),
     ({"os": {"defaults": {"py_nav_hook": "yes"}}}, "os.defaults.py_nav_hook"),

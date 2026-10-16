@@ -31,6 +31,15 @@ from jarvis.project_store import NO_TURN, ProjectStore
 DAY = 86_400
 
 
+@pytest.fixture(autouse=True)
+def _five_minute_fleet(catalog_file):
+    """The dispatched alarm is a BREACH only in a fleet on the five-minute write; one
+    whose leads buy the hour is silent on it (tests/test_cache_ttl_alarm_gate.py)."""
+    data = json.loads(catalog_file.read_text())
+    data.setdefault("os", {}).setdefault("defaults", {})["cache_ttl"] = "5m"
+    catalog_file.write_text(json.dumps(data))
+
+
 @pytest.fixture()
 def started(jarvis_home, fake_claude, catalog_file, project):
     ops.start_os(str(catalog_file), foreground=True)

@@ -227,6 +227,8 @@ def briefing_for(project: ProjectSpec, wo: dict[str, Any],
                                           serena=wiring.serena_wired(project.wiring))
                      + ([agent_dir] if agent_dir else [])),
         "autocompact_window": project.worker.autocompact_window,
+        "cache_ttl": project.worker.cache_ttl,
+        "subagent_cache_ttl": project.worker.subagent_cache_ttl,
         # Never negative: `_launch` refuses a spent order outright, so anything that
         # reaches argv is money the order still has.
         "max_budget_usd": max(0.0, cap.remaining_usd) if cap else None,
@@ -482,7 +484,8 @@ def _transcript_context(store: ProjectStore, wo_id: str) -> int | None:
 def compaction_due(store: ProjectStore, wo: dict[str, Any],
                    min_context: int | None,
                    now: float | None = None,
-                   pause: "TurnPause | None" = None) -> Compaction | None:
+                   pause: "TurnPause | None" = None,
+                   ttl_seconds: float = usage.WRITE_TTL_SECONDS) -> Compaction | None:
     """Should the OS compact before this work order's next prompt goes out?
 
     ONE PREDICATE FOR BOTH SHAPES. `pause` is the relaunch of a turn the transport lost
@@ -534,7 +537,7 @@ def compaction_due(store: ProjectStore, wo: dict[str, Any],
     if not ended:
         return None
     age = (time.time() if now is None else now) - ended
-    if age < usage.WRITE_TTL_SECONDS:
+    if age < ttl_seconds:
         return None
     context = measured_context(store, wo["id"])
     # An UNKNOWN size skips the floor rather than failing it: the floor exists to stop
@@ -577,7 +580,9 @@ def compact_before_relaunch(store: ProjectStore, project: ProjectSpec,
     swallow would silently delete the budget escalation.
     """
     assert pause is None or queue is None, "a relaunch is either a pause or a prompt"
-    due = compaction_due(store, wo, min_context, now=now, pause=pause)
+    due = compaction_due(store, wo, min_context, now=now, pause=pause,
+                         ttl_seconds=claude_cli.cache_rhythm(
+                             project.worker.cache_ttl).seconds)
     if due is None:
         return None
     if pause is not None:

@@ -107,9 +107,11 @@ DEFAULT_PRICE = PRICES["opus"]
 CACHE_WRITE_RATE = 1.25  # x input price, at the 5-minute TTL
 CACHE_WRITE_1H_RATE = 2.0  # x input price, at the 1-hour TTL
 CACHE_READ_RATE = 0.10  # x input price, under either TTL
-#: The TTL Jarvis buys (`claude_cli.PROMPT_CACHE_5M_ENV`). A boundary closer together
-#: than this cannot be an expiry, whatever else it looks like.
+#: The five-minute TTL (`claude_cli.cache_env`'s default, and what every crew subagent
+#: buys). A boundary closer together than this cannot be an expiry, whatever else it
+#: looks like; after a call that bought the hour the bar is `WRITE_TTL_1H_SECONDS`.
 WRITE_TTL_SECONDS = 300.0
+WRITE_TTL_1H_SECONDS = 3600.0
 
 #: The share of ALL cache writes that must be TTL expiry before buying the 1-hour write
 #: starts paying. The premium is charged on every written token and recovered only on
@@ -788,6 +790,7 @@ def classify_boundaries(calls: Sequence[Call], *, compactions: Sequence[float] =
     found: list[Boundary] = []
     previous_read: int | None = None
     previous_ts: float | None = None
+    previous_1h = False
     for call in calls:
         read = call.cache_read
         ts = call.ts or None
@@ -798,7 +801,11 @@ def classify_boundaries(calls: Sequence[Call], *, compactions: Sequence[float] =
         if previous_read is not None and read < previous_read:
             # Expired, or the prefix moved: findings/2026-08-30-where-the-800-dollars-went.md
             gap = (ts - previous_ts) if (ts and previous_ts) else None
-            expired = (gap is not None and gap >= WRITE_TTL_SECONDS
+            # The entry the PREVIOUS call wrote is the one that had to lapse, and it
+            # lived an hour when that call bought the hour (`inspection.classify_writes`
+            # keys on the same split).
+            ttl = WRITE_TTL_1H_SECONDS if previous_1h else WRITE_TTL_SECONDS
+            expired = (gap is not None and gap >= ttl
                        and cold_prefix_floor is not None
                        and read <= cold_prefix_floor)
             # Tested FIRST: a compacted boundary reads the static head seconds after
@@ -817,6 +824,7 @@ def classify_boundaries(calls: Sequence[Call], *, compactions: Sequence[float] =
                                   gap=gap or 0.0))
         previous_read = read
         previous_ts = ts
+        previous_1h = call.cache_1h > 0
     return found
 
 
