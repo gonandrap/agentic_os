@@ -470,25 +470,26 @@ def test_a_project_inherits_the_fleet_stakes_classifier_and_may_override_it():
     assert over.stakes_classifier == "classifier"
 
 
-def test_the_confirmation_pass_has_its_own_diff_budget_and_never_reads_the_panels():
-    """Two numbers, no shared name, no shared reader: spec
-    docs/superpowers/specs/2026-09-26-bounded-model-inputs.md § 2."""
+def test_a_catalog_still_naming_confirm_diff_chars_loads_with_the_key_ignored():
+    """The confirmation question carries no diff any more, so the budget is gone — and a
+    live catalog still naming it must keep booting the fleet.
+
+    The validation block parses field by field with `raw.get(...)`, so an unknown key is
+    silently ignored; this pins that for the key this change removed, at BOTH levels.
+    docs/superpowers/specs/2026-10-14-neo-never-reads-a-diff.md
+    """
     v = parse_catalog({"projects": []}).os.validation
-    assert v.confirm_diff_chars == 12000
+    assert not hasattr(v, "confirm_diff_chars")
     assert v.diff_chars == 150000
 
     [over] = projects_validation({"confirm_diff_chars": 9000},
-                                 {"validation": {"confirm_diff_chars": 500}})
-    assert over.confirm_diff_chars == 500
+                                 {"validation": {"confirm_diff_chars": 0}})
+    assert not hasattr(over, "confirm_diff_chars")
     assert over.diff_chars == 150000
-
-    with pytest.raises(CatalogError,
-                       match="os.validation.confirm_diff_chars must be >= 1"):
-        validation_of({"confirm_diff_chars": 0})
 
 
 @pytest.mark.parametrize("key", ["timeout", "max_rounds", "diff_chars",
-                                 "confirm_diff_chars", "decision_record_chars",
+                                 "decision_record_chars",
                                  "assumption_spec_chars"])
 def test_a_validation_budget_below_one_is_rejected(key):
     """Zero rounds is a review that never runs while claiming to; zero diff_chars is a

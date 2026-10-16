@@ -528,14 +528,6 @@ def meter_alarm_reason(kind: str, meter: dict[str, Any]) -> str:
 #: rate of a few a day.
 DIGEST_BATCH = 5
 
-#: What `_confirmation_evidence` collects, and it is a MEMORY bound rather than a prompt
-#: budget: this text never reaches a model — `autoreview.confirm_evidence` trims it to
-#: `validation.confirm_diff_chars` per assumption — and it exists only so that trimmer can
-#: state an honest total in its truncation marker, which `EvidencePacket` cannot supply
-#: (it carries `diff_sha`, not a pre-truncation length). Ruled by Neo, question 945 on
-#: wo-604b5b99; spec docs/superpowers/specs/2026-09-26-bounded-model-inputs.md § 2.
-CONFIRM_COLLECT_CHARS = 1_000_000
-
 #: THE VALIDATION SEAM. A validator is any callable of
 #:
 #:     (ProjectStore, the round row, the evidence packet) -> {
@@ -8192,7 +8184,6 @@ class Daemon:
         undeclared = not answered and invariants_mod.undeclared_delivery(store, wo)
         objecting = bool(store.outstanding_objections(wo["id"]))
         dead_questions, open_questions = self._question_liveness(neo_store, assumptions)
-        packet = None
         rule = autoreview.decide_early if early else autoreview.decide
         suppress = _holds_not_recorded(early)
         for a in assumptions:
@@ -8219,36 +8210,18 @@ class Daemon:
                     self._note_autoreview_held(store, wo["id"], decision,
                                                suppress=suppress)
                     continue
-                # LAZILY, and once per work order: collecting evidence runs git and may
-                # reach GitHub, and an order whose every row holds must not pay for it.
-                if packet is None:
-                    packet = self._confirmation_evidence(project, wo)
-                # Trimmed PER ASSUMPTION, and the collection above stays one `git diff`:
-                # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md § 2.
-                # The doc classifier is the PROJECT's (`os.navigation`), never a copy in
-                # `autoreview`: 2026-10-13 spec, part 1.
-                ce = autoreview.confirm_evidence(
-                    packet, a, cfg.confirm_diff_chars,
-                    collect_limit=CONFIRM_COLLECT_CHARS,
-                    doc_suffixes=project.navigation.doc_suffixes,
-                    doc_dirs=project.navigation.doc_dirs)
-                # THE SECOND GATE, over the EVIDENCE rather than the row, and it runs
-                # before `neo.ask` PERSISTS the diff as a question row (kn-deef42ea). It
-                # reads the TRIMMED text because that is what is persisted and sent, and
-                # the WHOLE rendered block of it: docs/superpowers/specs/
-                # 2026-09-26-bounded-model-inputs.md § 2.
-                # `unreadable` off the same `ce` this renders: 2026-10-13 spec, part 3.
+                # THE SECOND GATE, over the TEXTS rather than the row, and it runs before
+                # `neo.ask` PERSISTS them as a question row (kn-deef42ea). No diff
+                # travels: docs/superpowers/specs/2026-10-14-neo-never-reads-a-diff.md.
                 evidence_ok = autoreview.decide_evidence(
-                    a, ce.stat, ce.what_changed(),
-                    summary=str(wo.get("result_summary") or ""),
-                    unreadable=ce.unreadable)
+                    a, summary=str(wo.get("result_summary") or ""))
                 if not evidence_ok.armed:
                     self._note_autoreview_held(store, wo["id"], evidence_ok,
                                                suppress=suppress)
                     continue
                 try:
                     autoreview.propose_confirmation(store, neo_store, project.name, wo,
-                                                    a, assumptions, evidence=ce, cfg=cfg)
+                                                    a, assumptions, cfg=cfg)
                 except QuestionTooLargeError as e:
                     # The store refused to hold the question, so nothing was asked and
                     # nothing was linked. Say so and carry on to the next assumption:
@@ -8292,7 +8265,8 @@ class Daemon:
         **THE CHEAP CONDITIONS RUN FIRST, which is why the decision is computed before
         this is called.** A row that holds on a cheaper condition — already settled,
         already with Neo, a panel that gave up, the project's permission revoked — never
-        reaches a model, the same discipline `_confirmation_evidence` is collected under.
+        reaches a model, the same ordering `_ask_assumptions` keeps when it runs
+        `decide_confirm` before `autoreview.decide_evidence`.
         Only a row that ARMED, or that held on the high-stakes net itself, is worth
         asking about: those are the two answers the classifier can change.
         """
@@ -8411,32 +8385,6 @@ class Daemon:
             "assumption_id": a.get("id"), "n": a.get("n"), "regex": marker,
             "classifier_high": high, "category": verdict.category,
             "reason": verdict.reason, "model": verdict.model, "parsed": verdict.parsed})
-
-    def _confirmation_evidence(self, project: ProjectSpec,
-                               wo: dict) -> "evidence.EvidencePacket | None":
-        """The evidence the confirmation question is built from. The packet, or `None`.
-
-        `evidence.collect_work_order` does not raise by contract, and this wraps it
-        anyway: one unreadable repository must not cost the work order its pass, and the
-        failure mode of a throw here is an assumption parked for ever.
-
-        **AN EMPTY DIFF STILL ASKS.** The result summary alone is more than the early
-        pass had, and refusing to confirm because git said nothing would leave a settled
-        verdict unusable on exactly the orders that are hardest to read.
-
-        Collected at `CONFIRM_COLLECT_CHARS`, NOT at the panel's `validation.diff_chars`:
-        `autoreview.confirm_evidence` trims this per assumption to
-        `validation.confirm_diff_chars`, and no caller here reads the panel's number.
-        """
-        from . import evidence
-
-        try:
-            return evidence.collect_work_order(
-                project.path, wo, declared="", diff_chars=CONFIRM_COLLECT_CHARS)
-        except Exception:  # noqa: BLE001 — an unreadable repo is not a reason to park
-            log.exception("[%s] evidence for confirming %s's assumptions failed",
-                          project.name, wo["id"])
-            return None
 
     def _note_autoreview_held(self, store: ProjectStore, wo_id: str,
                               decision: Any, *, settling: bool = False,

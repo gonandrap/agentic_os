@@ -565,19 +565,9 @@ DEFAULT_VALIDATION_DECISION_RECORD_CHARS = 6000
 # Characters of SPEC SECTION the same packet may carry — the authority an assumption cites
 # when it says "per the spec", absent until GitHub issue #1035. `decision_record_chars`'s
 # number because it is the same packet, the same uncached per-assumption call and the other
-# authority block beside the record; well under `confirm_diff_chars` because a section is
-# prose a planner wrote, not a diff.
+# authority block beside the record. It is the LARGEST block that question carries: no
+# diff travels with it (docs/superpowers/specs/2026-10-14-neo-never-reads-a-diff.md).
 DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS = 6000
-
-# Truncation limit for the diff ONE CONFIRMATION QUESTION carries, and it is not the
-# panel's number: measured at q660-748, confirmation questions ran 7K-152K chars against
-# 1-3.8K for the first-pass review of the same assumption and 12-15K for the largest
-# legitimate OS question (a plan). 12,000 chars of diff puts the whole rendered question
-# at ~17-18K chars (~6.6K tokens at the 0.384 tokens/char rate cited above) — a plan's
-# order of magnitude, on a call that is UNCACHED and PER ASSUMPTION rather than a
-# five-seat shared prefix, which is why 150000 does not transfer. Spec § 2:
-# docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
-DEFAULT_VALIDATION_CONFIRM_DIFF_CHARS = 12000
 
 # How many follow-up findings ONE ORDER may file, across every round it is judged in.
 #
@@ -657,7 +647,6 @@ class ValidationConfig:
     decision_record_chars: int = DEFAULT_VALIDATION_DECISION_RECORD_CHARS
     # GitHub issue #1035: the spec section an assumption review reads.
     assumption_spec_chars: int = DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS
-    confirm_diff_chars: int = DEFAULT_VALIDATION_CONFIRM_DIFF_CHARS
     # Whether a FEATURE order validates as a whole once its children are done, which is
     # a separate question from whether its children each validated: the feature is the
     # only level at which "does this add up to what was asked" can be judged.
@@ -1220,10 +1209,8 @@ DEFAULT_NAVIGATION_CODE_SUFFIXES = SOURCE_SUFFIXES
 #: docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §3.2.
 DEFAULT_NAVIGATION_DOC_SUFFIXES = DOC_SUFFIXES
 
-#: Which path components make a file a DOC by location. The same key `autoreview.
-#: _is_documentation` classifies a confirmation diff's tier (c) with, so a project
-#: overriding it moves both. Not a suffix: entries carry no leading dot.
-#: docs/superpowers/specs/2026-10-13-a-confirmation-question-with-a-zero-character-diff.md
+#: Which path components make a file a DOC by location. Not a suffix: entries carry no
+#: leading dot.
 DEFAULT_NAVIGATION_DOC_DIRS = DOC_DIRS
 
 #: The Bash commands that DUMP a doc. `grep`/`rg`/`find` are absent by decision — text
@@ -2237,9 +2224,6 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         raw.get("assumption_spec_chars", base.assumption_spec_chars))
     if assumption_spec_chars < 1:
         raise _err(f"{where}.assumption_spec_chars must be >= 1")
-    confirm_diff_chars = int(raw.get("confirm_diff_chars", base.confirm_diff_chars))
-    if confirm_diff_chars < 1:
-        raise _err(f"{where}.confirm_diff_chars must be >= 1")
     stakes_classifier = str(
         raw.get("stakes_classifier", base.stakes_classifier) or "regex")
     if stakes_classifier not in STAKES_CLASSIFIER_MODES:
@@ -2270,7 +2254,6 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         diff_chars=diff_chars,
         decision_record_chars=decision_record_chars,
         assumption_spec_chars=assumption_spec_chars,
-        confirm_diff_chars=confirm_diff_chars,
         feature_units=bool(raw.get("feature_units", base.feature_units)),
         feature_merge_wait_minutes=feature_merge_wait_minutes,
         # Same field-level fallback as every flag in this block — see `auto_merge` below.
