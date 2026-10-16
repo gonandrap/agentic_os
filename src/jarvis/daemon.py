@@ -375,6 +375,64 @@ def polls_pull_request(store: ProjectStore, wo: dict[str, Any],
     return bool(ops.routes_on_pull_request(store, wo))
 
 
+#: The timeline's record that GitHub has stopped recomputing one pull request. ONE per
+#: episode (`Daemon._note_recompute_stalled`), and the dedupe key the one-shot resync
+#: remedy keys on — wo-d3a70c29.
+PR_RECOMPUTE_STALLED_EVENT = "pr_recompute_stalled"
+
+
+def pr_recompute_stalled(store: ProjectStore, wo: dict[str, Any],
+                         now: float | None = None) -> bool:
+    """True when GitHub has stopped recomputing this pull request — wo-d3a70c29.
+
+    PR #995's shape: a push moved `refs/heads/worktree-wo-cdee6f9b` to 88cac10, the pull
+    request's head stayed at 0488753, and mergeability never left UNKNOWN — so
+    `Daemon.poll_pull_requests` kept asking, every acting branch kept declining, and the
+    order sat for ~7h with an actor on paper and nobody acting.
+
+    EITHER of two facts says so, and each is a cached row column:
+
+    (a) the tip `git ls-remote` reported and the head GitHub's own pull request record
+        holds are both observed and DIFFER — the record is behind the branch;
+    (b) mergeability has been unanswered for longer than
+        `pull_requests.recompute_stall_minutes`.
+
+    NOT a conflict and never read as one: UNKNOWN right after a push is the NORMAL state
+    (kn-5e93939e), which is what the threshold in (b) and the both-observed rule in (a)
+    are for. "" is NOT OBSERVED and disqualifies nothing.
+
+    COST: free row fields first, and the catalog read only once a free field says there
+    is something to judge. No network, no subprocess, no session file, no model — this
+    runs per order per reconcile tick through `invariants.true_blockers`.
+    """
+    ref = str(wo.get("pr_ref_oid") or "")
+    head = str(wo.get("pr_head_oid") or "")
+    if ref and head and ref != head:
+        return True
+    since = wo.get("pr_mergeable_unknown_since")
+    if not isinstance(since, (int, float)):
+        return False
+    from . import ops
+    minutes = int(ops.pull_requests_config_at(
+        store.project_path).recompute_stall_minutes)
+    return (now or time.time()) - float(since) > minutes * 60
+
+
+def polls_and_can_act_on_pull_request(store: ProjectStore, wo: dict[str, Any],
+                                      now: float | None = None, *,
+                                      recorded: Any = None) -> bool:
+    """`waiting_pr_merge`'s actor test: the poll selects this row AND can still move it.
+
+    `polls_pull_request` is deliberately NOT tightened — it is the pass's SELECTION
+    predicate, and the poll must keep reading a stalled pull request or the stall could
+    never clear itself after a resync. What changes is the CLAIM: a pull request GitHub
+    has stopped recomputing has no acting branch left, so naming this pass as its actor
+    is the false answer wo-d3a70c29 exists to stop.
+    """
+    return (polls_pull_request(store, wo, now=now, recorded=recorded)
+            and not pr_recompute_stalled(store, wo, now=now))
+
+
 def answers_question(store: ProjectStore, wo: dict[str, Any],
                      now: float | None = None) -> dict[str, Any] | None:
     """The question Neo still holds for this row, or None — 2026-10-09 §3."""
@@ -469,14 +527,6 @@ def meter_alarm_reason(kind: str, meter: dict[str, Any]) -> str:
 #: not a rate limit on steady state: questions long enough to earn a digest arrive at a
 #: rate of a few a day.
 DIGEST_BATCH = 5
-
-#: What `_confirmation_evidence` collects, and it is a MEMORY bound rather than a prompt
-#: budget: this text never reaches a model — `autoreview.confirm_evidence` trims it to
-#: `validation.confirm_diff_chars` per assumption — and it exists only so that trimmer can
-#: state an honest total in its truncation marker, which `EvidencePacket` cannot supply
-#: (it carries `diff_sha`, not a pre-truncation length). Ruled by Neo, question 945 on
-#: wo-604b5b99; spec docs/superpowers/specs/2026-09-26-bounded-model-inputs.md § 2.
-CONFIRM_COLLECT_CHARS = 1_000_000
 
 #: THE VALIDATION SEAM. A validator is any callable of
 #:
@@ -1280,6 +1330,9 @@ class Daemon:
                     # decisions read a fresh fact rather than the previous interval's
                     # (spec 2026-09-26-a-red-default-branch-raises-itself.md §1).
                     self.poll_default_branch(project, store)
+                    # BETWEEN the two, spec
+                    # 2026-10-14-a-red-main-dispatches-its-own-fix.md §2.
+                    self.dispatch_base_fix(project, store)
                     self.poll_pull_requests(project, store)
                     # AFTER the poll, in the same tick: a merge that just completed a
                     # work order is what closes its issue, and making the tracker wait
@@ -5511,8 +5564,19 @@ class Daemon:
         # PROJECT-WIDE, read once rather than once per candidate — `health_sweep_hold`'s
         # own docstring — and the fleet half beside it, per §2.1.
         window = bool(pstore.health_sweep_hold()) or (state is not None and state.shut())
+        # §1 and §2 of docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-
+        # not-stuck.md, under `poll_pull_requests`' own gate on that read.
+        base_red, red_episodes, base_red_until = False, (), 0.0
+        if project.validation.enabled and project.validation.auto_merge:
+            # The freshness test is `_base_red`'s, REUSED and not re-derived.
+            base_red = self._base_red(project) is not None
+            base_red_until = ops._base_red_until(self.central.base_health(project.name),
+                                                 now)
+            red_episodes = tuple(self.central.base_red_episodes(project.name))
         scanned, out = ops.stuck_scan(pstore, project.name, project.fleet_health, now,
-                                      window=window)
+                                      window=window, base_red=base_red,
+                                      red_episodes=red_episodes,
+                                      base_red_until=base_red_until)
         run["scanned"] += scanned
         return out
 
@@ -6964,11 +7028,19 @@ class Daemon:
                   reverse=True)
         worst = reds[0] if reds else None
         was_red = bool(prev.get("red"))
-        wo_id = ""
+        wo_id = issue_url = fix_wo_id = ""
+        issue_os_filed = False
         if worst is not None:
             wo_id = (str(prev.get("wo_id") or "") if was_red
                      else self._attribute_base_red(project, store, owner, repo,
                                                    worst.head_sha))
+            if was_red:
+                # Spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §3: carried
+                # forward exactly as `wo_id` is, so a second red run on one break joins
+                # the order already on it instead of filing again.
+                issue_url = str(prev.get("issue_url") or "")
+                fix_wo_id = str(prev.get("fix_wo_id") or "")
+                issue_os_filed = bool(prev.get("issue_os_filed"))
         fact = {
             "red": worst is not None,
             "base": base,
@@ -6978,10 +7050,14 @@ class Daemon:
             "run_url": ci.run_url(owner, repo, worst.run_id) if worst else "",
             "head_sha": worst.head_sha if worst else "",
             "wo_id": wo_id,
+            "issue_url": issue_url,
+            "fix_wo_id": fix_wo_id,
+            "issue_os_filed": issue_os_filed,
             "checked_at": time.time(),
         }
         self.central.set_base_health(project.name, fact)
         if was_red and worst is None:
+            self._record_red_episode(project, red=False, now=fact["checked_at"])
             store.close_violation_report(INV_BASE_RED)
             store.add_notification(
                 title=f"`{base}` is green again in {project.name}",
@@ -6992,7 +7068,187 @@ class Daemon:
             )
             log.info("[%s] %s recovered", project.name, base)
         elif worst is not None and not was_red:
+            self._record_red_episode(project, red=True, now=fact["checked_at"])
             log.warning("[%s] %s is red — %s", project.name, base, fact["run_url"])
+
+    def _record_red_episode(self, project: ProjectSpec, red: bool, now: float) -> None:
+        """Open or close this project's red episode, on a TRANSITION only.
+
+        §2 of docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md,
+        Neo's ruling on question 1818: the sweep's discount must outlive the exclusion by
+        one status span, and a live fact cannot — `_base_red` returns None the instant
+        `main` goes green. THE WRITER IS THE RETENTION BOUND'S READER, from the
+        `ProjectSpec` this method already has.
+        """
+        from .central_store import advance_red_episodes
+
+        self.central.set_base_red_episodes(
+            project.name,
+            advance_red_episodes(
+                self.central.base_red_episodes(project.name), red, now,
+                project.fleet_health.red_episode_retention_hours * 3600.0))
+
+    def dispatch_base_fix(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """A red tracker `main` files-or-adopts an issue and dispatches a work order on it.
+
+        Spec docs/superpowers/specs/2026-10-14-a-red-main-dispatches-its-own-fix.md §2.
+        The red-base feature was specified as a DETECTOR plus a BRAKE and has no actor, so
+        GitHub issue 1054 sat open and unassigned while wo-024e207b was held `base_red`
+        for 62 minutes. A red `main` is the one defect where the OS is the obligated
+        party: the break is usually its own merge, every parked order inherits it, and no
+        user decision is involved.
+
+        **THE TRACKER PROJECT ONLY** (§1, Neo question 1736): the project whose git
+        `origin` IS `bugreport.bug_repo()`. Every other project stays notify-only — its
+        red branch may be a human's push, and `bug report` files to the OS's repository.
+
+        **A SWEEP, NOT A TRANSITION ACTION.** `poll_default_branch`'s announcements fire
+        on transitions because an announcement must not repeat; a dispatch must be
+        RETRIED, because every way it fails is transient and outside the OS (Neo
+        unreachable, project unregistered, `gh` down). Idempotence comes from the fact's
+        own `issue_url`/`fix_wo_id` (§3), so a tick where nothing changed costs no `gh`
+        call — and DEDUPE IS ON THE ISSUE, never on the run: one break produces many red
+        runs, which is exactly how duplicate filings 1007/1010 cost ~19 USD.
+        """
+        from . import bugreport, github, issues
+
+        origin = github.origin_repo(project.path)
+        repo = bugreport.bug_repo()
+        if origin is None or f"{origin[0]}/{origin[1]}".lower() != repo.lower():
+            return
+        if self._base_red(project) is None:
+            return
+        fact = self.central.base_health(project.name)
+        run_id = fact.get("run_id") or 0
+        issue_url = str(fact.get("issue_url") or "")
+        fix_wo_id = str(fact.get("fix_wo_id") or "")
+        # §3: True only for an issue that passed §4's author-plus-marker test, or that
+        # `report_bug` filed in this sweep. `automerge.decide` reads it off the fact so
+        # the exemption (§6) costs no `gh` call behind every merge decision.
+        issue_os_filed = bool(fact.get("issue_os_filed"))
+        if fix_wo_id:
+            # §2 step 4: one fix work order per break, EVER, whatever became of it.
+            return
+        cleared = False
+        try:
+            # §2 step 5: READ THE STATE rather than parse the refusal — `start_work`
+            # raises on a closed issue, and a stored url someone has since closed can
+            # never yield a work order, so retrying it is the never-ending loop this spec
+            # exists to remove. Cleared and never adopted back (§4's OPEN filter), while
+            # a `gh`, Neo or registration failure keeps the url and retries.
+            if issue_url and issues.view(issue_url, repo).closed:
+                log.info("[%s] %s is closed and no work order came of it — the break is "
+                         "filed afresh on the next tick", project.name, issue_url)
+                # The url ONLY: `fix_wo_id` is necessarily empty here, per step 4 above.
+                issue_url = ""
+                issue_os_filed = False
+                cleared = True
+            elif not issue_url:
+                issue_url = self._adopt_base_red_issue(repo, run_id)
+                # Adoption IS §4's test, so an adopted url is the OS's own filing.
+                issue_os_filed = bool(issue_url)
+            if issue_url:
+                fix_wo_id = str(issues.start_work(
+                    issue_url, project=project.name).get("wo_id") or "")
+            elif not cleared:
+                filed = bugreport.report_bug(
+                    title=f"`{fact.get('base') or 'main'}` is red in {repo}",
+                    description=self._base_red_brief(project, fact),
+                    expected=(f"`{fact.get('base') or 'main'}` is green, so the OS can "
+                              f"merge the pull requests it is holding"),
+                    actual=(f"workflow `{fact.get('workflow') or 'ci'}` fails on "
+                            f"{fact.get('run_url') or 'an unreadable run'}"),
+                    # §2: `expedite` is what dispatches, at any priority, so the rating
+                    # stays an honest description of the defect.
+                    priority="high", expedite=True, project=project.name)
+                issue_url = str(filed.get("url") or "")
+                fix_wo_id = str((filed.get("pickup") or {}).get("wo_id") or "")
+                issue_os_filed = bool(issue_url)
+        except Exception:  # noqa: BLE001 — every failure here is transient and retried
+            log.exception("[%s] could not dispatch a fix for the red default branch",
+                          project.name)
+        # Whatever DID succeed, so an issue filed with no work order is not filed twice
+        # and the next tick retries from the first step still empty (§2 step 9).
+        if (issue_url, fix_wo_id, issue_os_filed) != (
+                fact.get("issue_url"), fact.get("fix_wo_id"),
+                fact.get("issue_os_filed")):
+            self.central.set_base_health(
+                project.name,
+                {**fact, "issue_url": issue_url, "fix_wo_id": fix_wo_id,
+                 "issue_os_filed": issue_os_filed})
+        if fix_wo_id:
+            log.info("[%s] %s is fixing the red default branch (%s)", project.name,
+                     fix_wo_id, issue_url)
+
+    def _adopt_base_red_issue(self, repo: str, run_id: Any) -> str:
+        """An OPEN issue THE OS ITSELF filed citing this failing run, or `""` — spec §4.
+
+        MECHANICAL, NOT FUZZY: a worker-filed red-main issue quotes the failing run's URL
+        in its body, and the run id is the one token in it unique to this break (it is in
+        1054). `gh` search is token-AND, so searching the whole URL buys nothing the id
+        does not and misses a body that wrote the id without the URL.
+
+        FOUR FILTERS, all required:
+
+        1. `state == "OPEN"`, because a CLOSED issue citing this run is a fix that was
+           tried and did not work and `issues.start_work` refuses a closed issue outright
+           — `issues_mentioning`'s own `--state all` is load-bearing for its other
+           callers and wrong here.
+        2. THE AUTHOR IS THE OS: the issue's author login equals `issues.gh_login()`.
+        3. THE BODY CARRIES `bugreport.FILED_MARKER` verbatim.
+        4. The LOWEST number AMONG THE ELIGIBLE — the first one the OS filed, so two
+           concurrent filings converge on one.
+
+        **BOTH 2 AND 3, never either.** The tracker and the run id are public, so with the
+        run id as the only key a stranger opens an issue quoting it, wins the
+        lowest-number race, and `issues.start_work` dispatches a privileged worker in the
+        OS's own repository whose brief is that remote body. The marker is public text a
+        stranger can copy; the author login is what a stranger cannot forge. The author
+        alone would adopt any issue the OS's account ever opened for another reason that
+        happens to quote the id.
+
+        FAILING DIRECTION: anything that fails any filter falls through to a FRESH filing.
+        A duplicate issue is visible and closable (`ops._verdict_duplicate`'s asymmetry),
+        and an unreadable login adopts nothing. A stranger's report of the same break is
+        simply ignored; a human can still pick it up with `jarvis issues start`.
+        """
+        from . import bugreport, issues
+
+        if not run_id:
+            return ""
+        login = issues.gh_login()
+        if not login:
+            return ""
+        eligible = [
+            r for r in issues.issues_mentioning(repo, str(run_id))
+            if str(r.get("state") or "").upper() == "OPEN"
+            and str((r.get("author") or {}).get("login") or "") == login
+            and bugreport.FILED_MARKER in str(r.get("body") or "")
+        ]
+        if not eligible:
+            return ""
+        return str(min(eligible, key=lambda r: int(r.get("number") or 0))["url"])
+
+    @staticmethod
+    def _base_red_brief(project: ProjectSpec, fact: dict[str, Any]) -> str:
+        """The dispatched worker's evidence — and the next sweep's adoption key (§4).
+
+        ADOPTION KEYS ON THE RUN ID IN THE BODY, never on `run_url`: `gh` search is
+        token-AND, the id is the one token unique to the break, and the hit is then
+        filtered to OPEN + author login == `issues.gh_login()` + `bugreport.FILED_MARKER`
+        in the body, lowest number among the eligible. So the id is quoted verbatim here;
+        `run_url` and `head_sha` are for the human reading the issue.
+        """
+        blamed = str(fact.get("wo_id") or "")
+        return (f"`{fact.get('base') or 'main'}` is red in {project.name}. Workflow "
+                f"`{fact.get('workflow') or 'ci'}` fails on run "
+                f"{fact.get('run_url') or 'an unreadable run'} (run id "
+                f"{fact.get('run_id') or 0}), at commit "
+                f"{fact.get('head_sha') or 'an unknown commit'}"
+                + (f", merged by the OS for {blamed}" if blamed else "")
+                + ". Nothing merges onto a broken default branch, so every parked pull "
+                  "request in the fleet is held until this lands. Revert or forward fix "
+                  "— that call is yours.")
 
     def _attribute_base_red(self, project: ProjectSpec, store: ProjectStore,
                             owner: str, repo: str, sha: str) -> str:
@@ -7055,7 +7311,12 @@ class Daemon:
             base=str(fact.get("base") or ""), workflow=str(fact.get("workflow") or ""),
             run_url=str(fact.get("run_url") or ""),
             head_sha=str(fact.get("head_sha") or ""),
-            wo_id=str(fact.get("wo_id") or ""))
+            wo_id=str(fact.get("wo_id") or ""),
+            # Spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §5, and §6's exemption
+            # is keyed on the pair below rather than on `fix_wo_id` (kn-af41186c).
+            fix_wo_id=str(fact.get("fix_wo_id") or ""),
+            issue_url=str(fact.get("issue_url") or ""),
+            issue_os_filed=bool(fact.get("issue_os_filed")))
 
     def poll_pull_requests(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Ask GitHub what happened to the pull requests this project is parked behind.
@@ -7123,6 +7384,23 @@ class Daemon:
         adds one `gh run list` per PROJECT per tick — shared across every pull request in
         the loop, filled lazily, and never called at all while the fleet is green.
 
+        **AN UNKNOWN ONE COSTS MORE, AND ONLY AN UNKNOWN ONE** (wo-d3a70c29). GitHub
+        reporting no mergeability for an OPEN pull request buys three things and the
+        green path pays for none of them:
+
+        * one `git ls-remote --heads origin` per PROJECT per tick, shared across the loop
+          and filled lazily, exactly as `base_ci` above is — the whole repository in one
+          call, so a project with four UNKNOWN pull requests still makes one;
+        * ONE WRITE when `pr_mergeable_unknown_since` goes up, and one when it comes back
+          down. The head cache's discipline, on the same `update_work_order`: nothing is
+          written on a tick where nothing moved, so an UNKNOWN that stays UNKNOWN costs
+          no write at all;
+        * ONE indexed `wo_events` read inside the stalled branch alone — the dedupe for
+          the single `pr_recompute_stalled` event per episode. `pr_recompute_stalled`
+          itself is free on every other row: it reads two row columns and stops.
+
+        The green budget above is unchanged, and the test beside it counts it.
+
         **The automatic merge costs that case NOTHING, and its own cost is counted too.**
         `Daemon.auto_merge` returns on `project.validation.auto_merge` before it reads
         anything, so a project that has not opted in — the shipped state of every project
@@ -7179,6 +7457,11 @@ class Daemon:
         # red check is rebuilt, including the ones with no repair episode and no session
         # to nudge — not just the two that happened to have a worker being nudged.
         base_ci: dict[str, tuple[Any, ...] | None] = {}
+        # THE REMOTE'S OWN BRANCH TIPS, read once per project per tick and lazily, for
+        # `base_ci`'s reason exactly — one `git ls-remote` for the whole repository,
+        # filled only when some polled OPEN pull request reports UNKNOWN mergeability,
+        # so a fleet GitHub is answering about never spawns the subprocess (wo-d3a70c29).
+        tips: dict[str, str] | None = None
         # THE RED-BASE FACT, READ ONCE PER PROJECT PER TICK, for the same reason: it is
         # the project's fact and not the order's, so a read per parked order would be a
         # central query the budget above does not name. Only an opted-in project pays it.
@@ -7204,9 +7487,56 @@ class Daemon:
             # `invariants.parked_reason` runs per order per tick and may not go to the
             # network, and this poll already holds the answer. Written only when it
             # MOVED, so the green common case keeps its no-write budget.
+            #
+            # TWO MORE COLUMNS ON THE SAME DISCIPLINE — wo-d3a70c29. UNKNOWN is the one
+            # answer no branch below can act on, so the poll caches what says it has
+            # STOPPED being temporary: when it started, and where the remote's branch
+            # actually points. One `update_work_order` for all of it, written only if
+            # something moved, so the green common case keeps its no-write budget.
+            unknown = (pr.mergeable == "UNKNOWN"
+                       or (pr.mergeable is None and pr.state == "OPEN"))
+            tip = ""
+            if unknown and pr.head_ref:
+                if tips is None:
+                    try:
+                        tips = github.ls_remote(cwd=project.path)
+                    except Exception:  # noqa: BLE001 — stale beats wrong, and one
+                        # unreadable remote must not break the poll for other orders
+                        log.debug("[%s] could not list remote heads", project.name)
+                        tips = {}
+                tip = tips.get(pr.head_ref, "")
+            cache: dict[str, Any] = {}
             if pr.head_oid and pr.head_oid != str(wo.get("pr_head_oid") or ""):
-                store.update_work_order(wo["id"], pr_head_oid=pr.head_oid,
-                                        pr_head_seen_at=db.now())
+                # VOID THE TIP ON THE SAME WRITE: it is only re-read while mergeability
+                # is UNKNOWN, so a healthy push would otherwise leave an old tip beside
+                # a new head and read as stalled for ever.
+                cache.update(pr_head_oid=pr.head_oid, pr_head_seen_at=db.now(),
+                             pr_ref_oid="")
+            since = wo.get("pr_mergeable_unknown_since")
+            if unknown and not isinstance(since, (int, float)):
+                cache["pr_mergeable_unknown_since"] = db.now()
+            elif not unknown and isinstance(since, (int, float)):
+                cache["pr_mergeable_unknown_since"] = None
+            if tip and tip != cache.get("pr_ref_oid", str(wo.get("pr_ref_oid") or "")):
+                cache["pr_ref_oid"] = tip
+            if cache:
+                store.update_work_order(wo["id"], **cache)
+            # THE PREDICATE IS EXECUTED AND NOT MERELY WRITTEN, every tick and not only
+            # when something moved: condition (b) comes true by the clock, on a tick
+            # where nothing is cached at all. On the OVERLAY rather than `wo`, because
+            # the local dict is never refreshed — judging it would judge the state
+            # before the write above, on the very tick the evidence arrives. Free unless
+            # a row field already says there is something to judge; the one `wo_events`
+            # read is inside the stalled branch alone.
+            #
+            # ON AN OPEN PULL REQUEST ONLY. A merged or closed one whose cached tip still
+            # differs from its cached head IS stalled by the predicate — correctly, the
+            # columns say what they say — but there is nothing left for GitHub to
+            # recompute, so an event here would be evidence about a pull request that has
+            # finished, written on the tick before `complete_merged` closes the order.
+            stalling = {**wo, **cache}
+            if pr.state == "OPEN" and pr_recompute_stalled(store, stalling):
+                self._note_recompute_stalled(store, stalling, pr)
             try:
                 if pr.merged:
                     # THE ROUND FIRST, if one is open: the pull request has landed, so
@@ -8065,7 +8395,6 @@ class Daemon:
         undeclared = not answered and invariants_mod.undeclared_delivery(store, wo)
         objecting = bool(store.outstanding_objections(wo["id"]))
         dead_questions, open_questions = self._question_liveness(neo_store, assumptions)
-        packet = None
         rule = autoreview.decide_early if early else autoreview.decide
         suppress = _holds_not_recorded(early)
         for a in assumptions:
@@ -8092,36 +8421,18 @@ class Daemon:
                     self._note_autoreview_held(store, wo["id"], decision,
                                                suppress=suppress)
                     continue
-                # LAZILY, and once per work order: collecting evidence runs git and may
-                # reach GitHub, and an order whose every row holds must not pay for it.
-                if packet is None:
-                    packet = self._confirmation_evidence(project, wo)
-                # Trimmed PER ASSUMPTION, and the collection above stays one `git diff`:
-                # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md § 2.
-                # The doc classifier is the PROJECT's (`os.navigation`), never a copy in
-                # `autoreview`: 2026-10-13 spec, part 1.
-                ce = autoreview.confirm_evidence(
-                    packet, a, cfg.confirm_diff_chars,
-                    collect_limit=CONFIRM_COLLECT_CHARS,
-                    doc_suffixes=project.navigation.doc_suffixes,
-                    doc_dirs=project.navigation.doc_dirs)
-                # THE SECOND GATE, over the EVIDENCE rather than the row, and it runs
-                # before `neo.ask` PERSISTS the diff as a question row (kn-deef42ea). It
-                # reads the TRIMMED text because that is what is persisted and sent, and
-                # the WHOLE rendered block of it: docs/superpowers/specs/
-                # 2026-09-26-bounded-model-inputs.md § 2.
-                # `unreadable` off the same `ce` this renders: 2026-10-13 spec, part 3.
+                # THE SECOND GATE, over the TEXTS rather than the row, and it runs before
+                # `neo.ask` PERSISTS them as a question row (kn-deef42ea). No diff
+                # travels: docs/superpowers/specs/2026-10-14-neo-never-reads-a-diff.md.
                 evidence_ok = autoreview.decide_evidence(
-                    a, ce.stat, ce.what_changed(),
-                    summary=str(wo.get("result_summary") or ""),
-                    unreadable=ce.unreadable)
+                    a, summary=str(wo.get("result_summary") or ""))
                 if not evidence_ok.armed:
                     self._note_autoreview_held(store, wo["id"], evidence_ok,
                                                suppress=suppress)
                     continue
                 try:
                     autoreview.propose_confirmation(store, neo_store, project.name, wo,
-                                                    a, assumptions, evidence=ce, cfg=cfg)
+                                                    a, assumptions, cfg=cfg)
                 except QuestionTooLargeError as e:
                     # The store refused to hold the question, so nothing was asked and
                     # nothing was linked. Say so and carry on to the next assumption:
@@ -8165,7 +8476,8 @@ class Daemon:
         **THE CHEAP CONDITIONS RUN FIRST, which is why the decision is computed before
         this is called.** A row that holds on a cheaper condition — already settled,
         already with Neo, a panel that gave up, the project's permission revoked — never
-        reaches a model, the same discipline `_confirmation_evidence` is collected under.
+        reaches a model, the same ordering `_ask_assumptions` keeps when it runs
+        `decide_confirm` before `autoreview.decide_evidence`.
         Only a row that ARMED, or that held on the high-stakes net itself, is worth
         asking about: those are the two answers the classifier can change.
         """
@@ -8284,32 +8596,6 @@ class Daemon:
             "assumption_id": a.get("id"), "n": a.get("n"), "regex": marker,
             "classifier_high": high, "category": verdict.category,
             "reason": verdict.reason, "model": verdict.model, "parsed": verdict.parsed})
-
-    def _confirmation_evidence(self, project: ProjectSpec,
-                               wo: dict) -> "evidence.EvidencePacket | None":
-        """The evidence the confirmation question is built from. The packet, or `None`.
-
-        `evidence.collect_work_order` does not raise by contract, and this wraps it
-        anyway: one unreadable repository must not cost the work order its pass, and the
-        failure mode of a throw here is an assumption parked for ever.
-
-        **AN EMPTY DIFF STILL ASKS.** The result summary alone is more than the early
-        pass had, and refusing to confirm because git said nothing would leave a settled
-        verdict unusable on exactly the orders that are hardest to read.
-
-        Collected at `CONFIRM_COLLECT_CHARS`, NOT at the panel's `validation.diff_chars`:
-        `autoreview.confirm_evidence` trims this per assumption to
-        `validation.confirm_diff_chars`, and no caller here reads the panel's number.
-        """
-        from . import evidence
-
-        try:
-            return evidence.collect_work_order(
-                project.path, wo, declared="", diff_chars=CONFIRM_COLLECT_CHARS)
-        except Exception:  # noqa: BLE001 — an unreadable repo is not a reason to park
-            log.exception("[%s] evidence for confirming %s's assumptions failed",
-                          project.name, wo["id"])
-            return None
 
     def _note_autoreview_held(self, store: ProjectStore, wo_id: str,
                               decision: Any, *, settling: bool = False,
@@ -9148,6 +9434,39 @@ class Daemon:
                  f"Nothing was merged and nothing is stuck — merging it yourself works "
                  f"exactly as it always has.",
             wo_id=wo["id"])
+
+    def _note_recompute_stalled(self, store: ProjectStore, wo: dict,
+                                pr: Any) -> bool:
+        """Say GitHub has stopped recomputing this pull request, ONCE per episode.
+
+        `ProjectStore.pr_closure_told`'s arithmetic, against the cheapest clock the row
+        already carries: the episode began when mergeability stopped being an answer or
+        when the head last moved, whichever is later, so an event older than that
+        belongs to a stall that has since been superseded by a push. Nothing writes a
+        "cleared" event — the two columns clearing IS the clearing, and this read is the
+        only cost of saying so.
+
+        THE EVIDENCE AND NOTHING MORE. No notification path, no status, no nudge: the
+        order stops deriving an actor, and `invariants.true_blockers` is what puts it in
+        front of the user. The event is also the dedupe key the one-shot resync remedy
+        (wo-7ec57748) keys on.
+        """
+        started = max(float(wo.get("pr_mergeable_unknown_since") or 0.0),
+                      float(wo.get("pr_head_seen_at") or 0.0))
+        told = store.events_of_kind(wo["id"], PR_RECOMPUTE_STALLED_EVENT)
+        if told and float(told[-1]["ts"]) >= started:
+            return False
+        store.add_event(wo["id"], PR_RECOMPUTE_STALLED_EVENT,
+                        {"pr_url": wo.get("pr_url"),
+                         "head_oid": str(wo.get("pr_head_oid") or ""),
+                         "ref_oid": str(wo.get("pr_ref_oid") or ""),
+                         "branch": getattr(pr, "head_ref", ""),
+                         "mergeable": getattr(pr, "mergeable", None) or "UNKNOWN",
+                         # WHICH OF THE TWO CONDITIONS THIS IS: with no tip observed
+                         # there is nothing to compare, and the clock is the whole of the
+                         # evidence. `timeline._describe` renders the two differently.
+                         "unknown_since": wo.get("pr_mergeable_unknown_since")})
+        return True
 
     def _note_reopened(self, project: ProjectSpec, store: ProjectStore,
                        wo: dict) -> bool:

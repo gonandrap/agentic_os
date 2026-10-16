@@ -23,7 +23,7 @@ about that project's code and belongs on that project's tracker, not on the OS's
 **The rule that replaced "one constant repository" is not weaker, and the distinction is
 where the repository NAME comes from.** It is never a string out of the record and never
 anything a model wrote: it is `github.origin_repo(<the project's checkout>)`, a local
-`git remote get-url origin` already declared in `github.LOCAL_GIT_READS`. `checked_repo`
+`git remote get-url origin` already declared in `github.GIT_READS`. `checked_repo`
 then holds that name to an anchored shape before it can be an argument, and
 `checked_issue_url` holds every URL to an anchored shape AND to the repository the
 CALLER named — so a URL out of the record still cannot redirect a write, which is the
@@ -98,7 +98,13 @@ ISSUE_VERBS = (("issue", "view"), ("issue", "edit"), ("issue", "comment"),
                # that module's own reason: it may build no command against a repository
                # it was not given by `origin`. `repo_is_private` is what decides whether
                # a seat's words may be published at all.
-               ("repo", "view"))
+               ("repo", "view"),
+               # A READ of the AUTHENTICATED ACCOUNT, against no repository at all:
+               # `gh_login`. The red-base adoption filter needs the login the OS files
+               # issues under to tell its own filing from a stranger's quoting the same
+               # run id (spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §4), and a
+               # filter that cannot read it adopts nothing.
+               ("api", "user"))
 
 #: One round trip against GitHub's API. Same budget as `github.GH_TIMEOUT`, and for the
 #: same reason: the daemon's reconcile tick must not block on a network problem.
@@ -573,12 +579,48 @@ def issues_mentioning(repo: str, term: str) -> list[dict[str, Any]]:
         return []
     stdout = _run(["issue", "list", "--repo", repo, "--state", "all",
                    "--search", f"{term} in:body", "--limit", "100",
-                   "--json", "number,title,url,state"], url=repo)
+                   # `author` and `body` are ADDITIVE: the red-base adoption filter needs
+                   # both to tell the OS's own filing from a stranger's quoting the same
+                   # run id (spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §4).
+                   "--json", "number,title,url,state,author,body"], url=repo)
     try:
         rows = json.loads(stdout or "[]")
     except ValueError:
         return []
     return [r for r in rows if isinstance(r, dict) and r.get("url")]
+
+
+#: `gh_login`'s process cache, holding at most the one answer. A list rather than
+#: `lru_cache` because a FAILED read must not be cached (see below).
+_GH_LOGIN: list[str] = []
+
+
+def reset_gh_login() -> None:
+    """Forget the cached login. For fixtures that install a different fake `gh`."""
+    _GH_LOGIN.clear()
+
+
+def gh_login() -> str:
+    """The login `gh` is authenticated as — the account the OS files issues under.
+
+    READ ONCE PER PROCESS: it cannot change under a running daemon, and the caller (the
+    red-base adoption filter, spec §4) already spends one `gh` call on its search. An
+    unreachable or unauthenticated `gh` answers `""`, and `""` matches no author, so the
+    failing direction is ADOPT NOTHING and file afresh.
+
+    A FAILED READ IS NOT CACHED. `gh` being down for one tick is transient, and caching
+    the failure would leave adoption off for the daemon's whole life — one duplicate
+    filing per break, for ever, which is the 1007/1010 cost this spec exists to remove.
+    """
+    if _GH_LOGIN:
+        return _GH_LOGIN[0]
+    try:
+        login = _run(["api", "user", "--jq", ".login"], url="the authenticated account")
+    except Exception:  # noqa: BLE001 — an unknown login adopts nothing
+        log.info("could not read the `gh`-authenticated login")
+        return ""
+    _GH_LOGIN.append(login.strip())
+    return _GH_LOGIN[0]
 
 
 def follow_ups_filed(repo: str, unit_id: str) -> list[dict[str, Any]]:

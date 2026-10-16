@@ -196,6 +196,92 @@ def test_a_tick_never_re_raises_the_attention_the_user_will_lower(started, analy
     assert after["status"] == "plan_review"
 
 
+# -- the re-delivery after a refusal ----------------------------------------------------
+#
+# docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md §5. The
+# analyst's own verb is destructive and, past `plan_review`, refused — so `jarvis wo
+# finish` is the sanctioned re-delivery, and these pin that it touches nothing.
+
+
+@pytest.fixture()
+def refused(started, store, improvement_order, catalog_file):
+    """wo-d2d981e8's state: a report submitted, a finding decided, then a refusal."""
+    analyst = store.create_work_order("analyse it", description=OBSERVATION,
+                                      kind="analyst", status="running")
+    store.update_feature_order(improvement_order["id"], plan_wo_id=analyst["id"],
+                               status="planning")
+    ops.submit_findings(improvement_order["id"], a_report())
+    report = stored_report(store, improvement_order["id"])
+    report["findings"][0]["status"] = "accepted"
+    store.update_feature_order(improvement_order["id"], plan=db.to_json(report))
+    store.add_event(analyst["id"], "reviewed", {"accepted": False})
+    store.set_status(analyst["id"], "needs_review")
+    return improvement_order, analyst
+
+
+def _enable_validation(catalog_file) -> None:
+    """The panel on in the catalog FILE, which is what `ops.finish` reads."""
+    data = _json.loads(catalog_file.read_text())
+    data["os"]["validation"] = {"enabled": True}
+    catalog_file.write_text(_json.dumps(data))
+
+
+def test_wo_finish_after_a_refusal_leaves_the_report_untouched(refused, store,
+                                                               catalog_file):
+    """§5: no guard is needed — `finish` writes the `finished` event and settles, and
+    the stored document is not on any path it takes."""
+    io, analyst = refused
+    _enable_validation(catalog_file)
+    before = store.get_feature_order(io["id"])["plan"]
+    assert not ops.refusal_answered(store, analyst["id"])
+
+    ops.finish(analyst["id"], "answered your refusal in the session")
+
+    assert store.get_feature_order(io["id"])["plan"] == before
+    assert [f["status"] for f in stored_report(store, io["id"])["findings"]] == \
+        ["accepted", "pending"]
+    assert ops.refusal_answered(store, analyst["id"])
+    # §5 point 4: a round IS opened and it costs the budget nothing.
+    rnd = store.validation_rounds(wo_id=analyst["id"])[-1]
+    assert rnd["uncounted"]
+    assert rnd["uncounted_cause"] == ops.USER_REWORK_CAUSE
+
+
+def test_an_analyst_finish_is_voided_rather_than_escalated(refused, store, project):
+    """§5 point 5, the load-bearing one: `feature_order_for_planner` matches an
+    improvement order by `plan_wo_id`, so the packet carries an ATTESTED effect and the
+    round is voided. Were it empty the round would escalate under
+    ESCALATION_NOTHING_TO_JUDGE and the order would come straight back to
+    `needs_review` — one dead end swapped for another."""
+    from jarvis import evidence
+
+    _io, analyst = refused
+    effects = ops.side_effects_of(store, analyst["id"])
+
+    assert [e["kind"] for e in effects] == ["plan_submitted"]
+    assert effects[0]["attested"] is True
+    packet = evidence.collect_work_order(project, store.get_work_order(analyst["id"]),
+                                         declared="", side_effects=effects)
+    assert packet.files == ()
+    assert evidence.nothing_to_judge(packet) == "void"
+
+
+def test_jarvis_io_report_is_still_refused_after_plan_review(refused, store):
+    """Unchanged, and explicit so nobody reopens the destructive path: the briefing now
+    sends the analyst to `jarvis wo finish` precisely because this refuses."""
+    io, _analyst = refused
+    # The fixture already decided the first finding; deciding the last one completes it.
+    ops.review_findings(io["id"],
+                        reject={"stale-code-map": "the map is about to be deleted"})
+    before = store.get_feature_order(io["id"])["plan"]
+
+    with pytest.raises(ops.OpsError) as e:
+        ops.submit_findings(io["id"], a_report(summary="A second reading."))
+
+    assert "completed" in str(e.value)
+    assert store.get_feature_order(io["id"])["plan"] == before
+
+
 def test_cli_io_report_reads_the_file_and_parks_the_order(analysing, store, tmp_path,
                                                           capsys):
     io, _ = analysing
