@@ -183,7 +183,14 @@ def test_the_forced_round_is_what_finally_lets_the_pull_request_merge_itself(
         fleet, project, fake_gh, local_base):
     """The motivating outcome, and why stopping at the column would prove too little: the
     point is not that a commit was written down, it is that condition 4 can now be
-    satisfied and the OS asks to merge."""
+    satisfied and the OS asks to merge.
+
+    THE POLL NOW OPENS THAT ROUND ITSELF (spec 2026-10-16, issue 1095): the hold is
+    `sha_unrecorded` with budget left, so the self-heal arm forces it and
+    `jarvis validation force` is no longer the only route out. The same round and the
+    same `validation_forced` event, with `by == ops.REJUDGE_BY_OS` — the user's command
+    is covered by the rest of this file, the OS's by
+    tests/test_rejudge_moved_head.py."""
     store, wo = parked(fleet, project)
     artifact(fake_gh)
     spec = fleet.catalog.project("proj_a")
@@ -191,8 +198,8 @@ def test_the_forced_round_is_what_finally_lets_the_pull_request_merge_itself(
 
     fleet.poll_pull_requests(spec, store)
     assert store.list_approvals(wo["id"]) == []  # held: the panel named no commit
+    assert store.get_work_order(wo["id"])["status"] == "validating"
 
-    ops.force_validation(wo["id"], reason="round 1 predates head_sha")
     judge(fleet, store, Panel("passed"))
     assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
 
