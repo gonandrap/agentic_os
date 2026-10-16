@@ -2410,11 +2410,16 @@ def diagnose(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
         held_by_fleet = fleet_if_held([wo])
         blocker = waiting_on(store, wo)
         needs_you = invariants.true_blockers(store, wo, now)
+        # §8 of docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md.
+        actor = (scheduled_actor(store, wo, now)
+                 if wo["status"] in SCHEDULED_ACTORS else None)
         payload = {
             "wo_id": str(wo["id"]), "project": name, "title": wo["title"],
             "status": wo["status"],
             "status_label": invariants.status_label(store, wo, held_by_fleet),
             "blocker": blocker,
+            "actor": ({"pass_name": actor.pass_name, "why": actor.why,
+                       "predicate": actor.predicate} if actor is not None else None),
             "needs_you": needs_you,
             # All three `or None`: these return "" for "no note", and an empty string
             # renders as a blank note. Absent must be absent (issue #227).

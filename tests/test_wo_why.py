@@ -378,6 +378,88 @@ def test_a_completed_order_says_how_it_settled(started, project, settle_turns):
     assert not any(c.startswith("jarvis wo resume-auto") for c in commands(d))
 
 
+# -- 8b. the scheduled actor rides on the debug surface ----------------------------------
+# Section 8 of docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md:
+# the pass name goes here and never on the status label.
+
+
+def test_the_diagnosis_carries_the_scheduled_actor(started, project):
+    wo = an_order(started)
+    store = ProjectStore(project)
+    try:
+        row = store.get_work_order(wo["id"])
+        actor = ops.scheduled_actor(store, row)
+        assert actor is not None, "the premise: this row HAS a daemon pass coming for it"
+    finally:
+        store.close()
+
+    d = ops.diagnose(wo["id"])
+
+    assert d["actor"] == {"pass_name": actor.pass_name, "why": actor.why,
+                          "predicate": actor.predicate}
+
+
+def test_a_row_with_no_actor_reports_the_key_present_and_none(started, project):
+    wo = an_order(started)
+    store = ProjectStore(project)
+    try:
+        store.set_status(wo["id"], "needs_review")
+        row = store.get_work_order(wo["id"])
+        assert ops.scheduled_actor(store, row) is None, \
+            "the premise: `needs_review` has no daemon pass — the user is the actor"
+    finally:
+        store.close()
+
+    d = ops.diagnose(wo["id"])
+
+    # Absent must not be how "no actor" is spelled (issue #227's rule).
+    assert "actor" in d
+    assert d["actor"] is None
+
+
+def test_a_settled_order_reports_no_actor_rather_than_raising(started, project,
+                                                              settle_turns):
+    """`scheduled_actor` is keyed on OPEN_STATUSES and raises off them by design."""
+    wo = an_order(started)
+    store = ProjectStore(project)
+    try:
+        assert settle_turns(store)
+        store.set_status(wo["id"], "completed")
+    finally:
+        store.close()
+
+    assert ops.diagnose(wo["id"])["actor"] is None
+
+
+def test_cli_prints_the_actor_under_waiting_on(started, project, capsys):
+    wo = an_order(started)
+    store = ProjectStore(project)
+    try:
+        actor = ops.scheduled_actor(store, store.get_work_order(wo["id"]))
+        assert actor is not None
+    finally:
+        store.close()
+
+    assert cli.main(["wo", "why", wo["id"]]) == 0
+    out = capsys.readouterr().out
+
+    assert actor.pass_name in out and actor.predicate in out and actor.why in out
+    assert out.index("waiting on:") < out.index(actor.pass_name)
+
+
+def test_cli_says_when_no_daemon_pass_will_act(started, project, capsys):
+    wo = an_order(started)
+    store = ProjectStore(project)
+    try:
+        store.set_status(wo["id"], "needs_review")
+    finally:
+        store.close()
+
+    assert cli.main(["wo", "why", wo["id"]]) == 0
+
+    assert "no daemon pass will act on this order" in capsys.readouterr().out
+
+
 # -- 9. the CLI hands the dict over unchanged --------------------------------------------
 
 
