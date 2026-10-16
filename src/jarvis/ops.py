@@ -6281,14 +6281,23 @@ def force_validation(wo_id: str, *, reason: str,
                      project_name: str | None = None) -> dict[str, Any]:
     """`jarvis validation force` — a PERSON opening a fresh round, with no worker.
 
-    Why it exists: jarvis-0.10.0 introduced `validation_rounds.head_sha`, so every round
-    judged before it carries `''` and `automerge.decide`'s condition 4 holds those work
-    orders on `sha_unrecorded` for ever. The only route to a fresh round was `jarvis wo
-    finish`, which writes a `finished` event and demands a `--summary` — so re-judging a
-    work order meant forging a worker's account of work no worker had done. This reaches
+    Why it exists: a round carrying `head_sha = ''` holds its work order on
+    `sha_unrecorded` for ever under `automerge.decide`'s condition 4, and that population
+    has TWO sources, not one. jarvis-0.10.0 introduced `validation_rounds.head_sha`, so
+    every round judged before it carries `''`; and a round judged TODAY carries it
+    whenever its evidence packet could not fetch the pull request and fell back to the
+    worktree (`evidence.EvidencePacket.pr_error`, `evidence.judged_head` — wo-5a7f71b5,
+    issue 1095).
+
+    Before this command existed the only route to a fresh round was `jarvis wo finish`,
+    which writes a `finished` event and demands a `--summary` — so re-judging a work
+    order meant forging a worker's account of work no worker had done. This reaches
     `submit_for_validation` directly and writes NO `finished` event; the packet is
     re-collected from scratch, which is how the new round comes to read the CURRENT pull
     request and record the CURRENT head.
+
+    Since spec 2026-10-16 the OS re-judges the second kind ITSELF, so this is now the
+    user's remedy for when the OS's round budget is spent rather than the only way out.
 
     **`--reason` is REQUIRED and stored on the round**, following `jarvis config set` and
     `jarvis gate approve`. A forced round that looked organic afterwards is the defect
@@ -6356,6 +6365,18 @@ def force_validation(wo_id: str, *, reason: str,
 REJUDGE_FORCED_REASON = ("the OS re-judged this itself: round {n} passed on {judged}, "
                          "and the head of the pull request is now {head} — nothing "
                          "merges a commit no round has read")
+
+#: The `forced_reason` for the OTHER unusable binding: the round passed and recorded NO
+#: commit, because its evidence packet could not fetch the pull request and read a
+#: worktree (`evidence.EvidencePacket.pr_error`). `REJUDGE_FORCED_REASON` above renders
+#: "passed on , and the head ... is now X" there — a false claim about a commit, in a
+#: string `round_line` and `timeline._describe` show verbatim (spec
+#: docs/superpowers/specs/2026-10-16-a-verdict-bound-to-no-commit-re-judges-itself.md §3).
+#: It names one commit because there is only one to name.
+SHA_UNRECORDED_FORCED_REASON = (
+    "the OS re-judged this itself: round {n} passed without recording which commit it "
+    "judged — it read a worktree rather than the pull request — so this round judges "
+    "the pull request at {head}")
 
 #: `validation_forced.by` for a round no person asked for. Absent means the person, which
 #: is every row written before this existed and every `jarvis validation force` since.
@@ -6554,6 +6575,9 @@ def rejudge_moved_head(store: ProjectStore, project_path: Path, wo: dict[str, An
         reason = REBIND_FORCED_REASON.format(n=round_n, judged=judged[:10],
                                              head=head[:10], used=used + 1,
                                              max=REBIND_MAX)
+    elif not judged:
+        # Nothing to name, so nothing is claimed about it (spec 2026-10-16 §3).
+        reason = SHA_UNRECORDED_FORCED_REASON.format(n=round_n, head=head[:10])
     else:
         reason = REJUDGE_FORCED_REASON.format(n=round_n, judged=judged[:10],
                                               head=head[:10])

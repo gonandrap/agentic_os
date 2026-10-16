@@ -475,13 +475,21 @@ def only_the_head_moved(round_row: dict[str, Any] | None, wo: dict[str, Any], pr
     bound to an older commit" — which is what makes re-judging it worth a round number
     (spec docs/superpowers/specs/2026-09-19-a-moved-head-re-judges-itself.md section 3).
 
-    **ONLY MEANINGFUL AFTER A `HELD_SHA_MOVED`, and its one caller checks that first.**
-    Substituting the head satisfies conditions 4 and 5 by construction, so on any other
-    hold this would answer about a round that never passed — `HELD_NOT_PASSED` is a
-    verdict the panel meant to stand, and nothing here may read it as a near miss.
+    **ONLY MEANINGFUL AFTER A `HELD_SHA_MOVED` OR A `HELD_SHA_UNRECORDED`, and its one
+    caller checks that first.** Substituting the head satisfies conditions 4 and 5 by
+    construction, so on any other hold this would answer about a round that never passed
+    — `HELD_NOT_PASSED` is a verdict the panel meant to stand, and nothing here may read
+    it as a near miss.
+
+    Both codes are sound for that reason and not by permission: `HELD_SHA_UNRECORDED` is
+    reachable ONLY from the `round_row is not None and outcome == "passed"` arm of
+    `decide`'s `not judged` branch, and every other way into that branch returns
+    `HELD_NOT_PASSED`. So substitution cannot manufacture a pass on either; conditions
+    1-3, 6 and the base facts are still judged for real (spec
+    docs/superpowers/specs/2026-10-16-a-verdict-bound-to-no-commit-re-judges-itself.md §2).
 
     `plan_assumptions` is unreachable in practice — the plan hold returns before the sha
-    checks, so `HELD_SHA_MOVED` cannot be the code — and is taken beside its neighbour
+    checks, so neither sha code can be the one held on — and is taken beside its neighbour
     anyway: the OS must not open a fresh validation round on behalf of a plan the user
     has not ratified (spec §2.4).
     """

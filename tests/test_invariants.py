@@ -1475,9 +1475,11 @@ def test_a_rebind_decline_is_not_a_spent_round_budget(project):
 
     assert invariants.rejudge_exhausted(store, spent) is False
     assert invariants.rebind_exhausted(store, spent) is True
+    assert invariants.sha_unrecorded_rejudge_spent(store, spent) is False
     blockers = true_blockers(store, spent)
     assert invariants.REBIND_EXHAUSTED_BLOCKER in blockers
     assert invariants.SHA_MOVED_BLOCKER not in blockers
+    assert invariants.SHA_UNRECORDED_SPENT_BLOCKER not in blockers
 
 
 def test_a_budget_decline_still_reads_as_one(project):
@@ -1488,9 +1490,11 @@ def test_a_budget_decline_still_reads_as_one(project):
 
     assert invariants.rejudge_exhausted(store, budget) is True
     assert invariants.rebind_exhausted(store, budget) is False
+    assert invariants.sha_unrecorded_rejudge_spent(store, budget) is False
     blockers = true_blockers(store, budget)
     assert invariants.SHA_MOVED_BLOCKER in blockers
     assert invariants.REBIND_EXHAUSTED_BLOCKER not in blockers
+    assert invariants.SHA_UNRECORDED_SPENT_BLOCKER not in blockers
 
 
 def test_a_decline_written_before_the_cause_existed_is_a_budget_decline(project):
@@ -1500,6 +1504,46 @@ def test_a_decline_written_before_the_cause_existed_is_a_budget_decline(project)
 
     assert invariants.rejudge_exhausted(store, old) is True
     assert invariants.rebind_exhausted(store, old) is False
+    assert invariants.sha_unrecorded_rejudge_spent(store, old) is False
+
+
+def test_a_spent_unrecorded_head_is_its_own_blocker_and_only_its_own(project):
+    """The fourth sentence in the family: the OS spent its one round on this commit and
+    that round bound nothing either, so no decline exists and the three declines'
+    derivations must all stay false (spec 2026-10-16 §4b)."""
+    from jarvis import ops
+
+    store = ProjectStore(project)
+    wo = store.create_work_order("add feature X")
+    store.update_work_order(wo["id"], pr_url="https://github.com/acme/proj/pull/7")
+    row = store.open_validation_round(wo_id=wo["id"], fingerprint="fp")
+    store.close_validation_round(row["id"], "passed", "")      # head_sha stays ''
+    store.set_status(wo["id"], "waiting_pr_merge")
+    head = "bbbb1111bbbb2222"
+    store.add_event(wo["id"], "validation_forced",
+                    {"round": 1, "by": ops.REJUDGE_BY_OS, "head_sha": head,
+                     "judged_sha": ""})
+    store.add_event(wo["id"], "automerge_held",
+                    {"code": invariants.HELD_SHA_UNRECORDED, "head_sha": head})
+    spent = store.get_work_order(wo["id"])
+
+    assert invariants.sha_unrecorded_rejudge_spent(store, spent) is True
+    assert invariants.rejudge_exhausted(store, spent) is False
+    assert invariants.rebind_exhausted(store, spent) is False
+    assert invariants.sha_unrecorded_exhausted(store, spent) is False
+    blockers = true_blockers(store, spent)
+    assert invariants.SHA_UNRECORDED_SPENT_BLOCKER in blockers
+    assert invariants.SHA_UNRECORDED_BLOCKER not in blockers
+    assert invariants.SHA_MOVED_BLOCKER not in blockers
+    assert invariants.REBIND_EXHAUSTED_BLOCKER not in blockers
+
+    # ...and a head the OS has NOT judged belongs to the re-judge path, not to the user.
+    store.add_event(wo["id"], "automerge_held",
+                    {"code": invariants.HELD_SHA_UNRECORDED,
+                     "head_sha": "cccc1111cccc2222"})
+    moved = store.get_work_order(wo["id"])
+    assert invariants.sha_unrecorded_rejudge_spent(store, moved) is False
+    assert invariants.SHA_UNRECORDED_SPENT_BLOCKER not in true_blockers(store, moved)
 
 
 # -- a panel give-up that survived into `waiting_pr_merge` ----------------------------
