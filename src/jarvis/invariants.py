@@ -47,6 +47,9 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
 from . import budget, db, worker_session
 # A leaf module (logging, subprocess, dataclasses): the import cannot cycle back here.
 from .automerge import HELD_NOT_PASSED, HELD_SHA_MOVED
+# Same leaf argument: `autoreview` imports only `navigation`, `specs`, `catalog` and
+# `stakes` at module scope, and none of those reaches this module.
+from .autoreview import REFUSAL_UNANSWERED_REASON
 from .catalog import DEFAULT_VALIDATION_MAX_ROUNDS, DEFAULT_VALIDATION_TIMEOUT
 from .neo_store import USER_HELD_Q_STATUSES
 from .project_store import (
@@ -230,6 +233,13 @@ PR_BASE_UPDATE_FAILED_EVENT = "pr_base_update_failed"
 #: reports and notifies (spec
 #: docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §3).
 INV_BASE_RED = "INV-BASE-BRANCH-RED"
+
+#: The fix work order for that red branch is SETTLED and the branch is still red — the
+#: one place the OS is out of moves, so it owes the user a decision rather than acting
+#: (spec docs/superpowers/specs/2026-10-14-a-red-main-dispatches-its-own-fix.md §5, Neo
+#: 1738: `jarvis wo retry` is the user's by contract, and a second dispatch is an uncapped
+#: spend loop whose environmental causes kill the replacement too).
+INV_BASE_FIX_DEAD = "INV-BASE-FIX-DEAD"
 
 #: A completed work order whose recorded pull request has not merged. Shared with `ops`,
 #: which closes the report the moment `--abandon` records the decision (spec
@@ -425,6 +435,46 @@ IDLE_NO_FINISH_BLOCKER = ("the worker stopped mid-task without `jarvis wo finish
                           "nothing it started is still running; read its last message, "
                           "then `jarvis wo send` or `jarvis wo done`")
 
+#: WHAT THE IDLE LINE ABOVE SAID ABOUT A HOLD IT DOES NOT DESCRIBE: the worker DID
+#: deliver, the user refused an assumption, and the delivery is older than the refusal.
+#: COMPOSED from the autoreview sentence rather than re-spelled, because the same fact
+#: reaches the user twice — as the hold on `jarvis wo show` and as this line — and two
+#: spellings of one sentence pass every behavioural test and drift anyway (kn-4ea33fe6).
+#: §1 of docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md
+#:
+#: TWO WHOLE SENTENCES AND NOT ONE WITH A SLOT: `remedies.render_attention` interpolates
+#: only values matching `_ID_PATTERN`, and `"analyst"` is not an id, so a per-kind suffix
+#: cannot travel through a declared slot (§1). Free of any elapsed time and of any count,
+#: on PARKED_BLOCKER's rule.
+REFUSAL_UNANSWERED_BLOCKER = (
+    f"{REFUSAL_UNANSWERED_REASON} — read your refusal, then `jarvis wo send` telling it "
+    f"what to change; it re-delivers with `jarvis wo finish`")
+#: The same hold on a kind whose own submission verb REPLACES the stored document.
+REFUSAL_UNANSWERED_DOC_BLOCKER = (
+    f"{REFUSAL_UNANSWERED_REASON} — it delivered a document, not code, and resubmitting "
+    f"that document would replace it and discard the decisions you have already "
+    f"recorded on it; `jarvis wo send` telling it what to change, and it re-delivers "
+    f"with `jarvis wo finish`, which records the delivery and does not touch the "
+    f"document")
+
+#: The kinds whose FIRST delivery used a verb of their own (`jarvis io report`,
+#: `jarvis fo plan`), both of which REPLACE the stored document — so re-delivering
+#: through them after a refusal discards the user's decisions on it. Filed here, beside
+#: its only reader, and NOT beside `project_store.WO_KINDS`: that tuple is the column
+#: vocabulary, and a membership rule about `ops` submission verbs filed there invites
+#: readers who want something else from it (§2).
+#:
+#: `investigator` is absent because `jarvis investigate verdict` settles through
+#: `close_out` rather than `finish`, so it reaches `completed` and never sits in
+#: `needs_review`; `manager` is absent because it is `idle`, never `needs_review`.
+DOCUMENT_DELIVERY_KINDS = ("planner", "analyst")
+
+#: Both sentences above contain the word "assumption", so `true_blockers`' tail would
+#: read a list holding one as nothing-but-assumption-reviews and stack `parked_reason` on
+#: a line that already names the exit (§4).
+REFUSAL_HELD_BLOCKERS = frozenset({REFUSAL_UNANSWERED_BLOCKER,
+                                   REFUSAL_UNANSWERED_DOC_BLOCKER})
+
 #: What a `failed` work order says when there is nothing more specific to say. A CONSTANT
 #: because `Daemon.settle_work_order` raises it and `true_blockers` re-derives it: the two
 #: carried different spellings of this one state ("worker turn failed" at the write site),
@@ -551,6 +601,10 @@ class Violation:
     #: docs/superpowers/specs/2026-10-13-an-assumption-review-payload-carries-its-spec-section.md
     #: §2.3, Neo 1695).
     subject_id: str | None = None
+    #: What the NOTIFICATION says, when `detail` holds text that must not leave the
+    #: record — the user's own brief, say. Empty means the notification uses `detail`
+    #: (spec docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md §2.5).
+    notice: str = ""
 
     @property
     def key(self) -> tuple[str, str | None]:
@@ -1240,6 +1294,10 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     if wo["status"] == "waiting_pr_merge" and parked_on_a_give_up(store, wo):
         blockers.append(PARKED_GIVE_UP_BLOCKER)
     if governed and wo["status"] == "needs_review":
+        # In the body, the pattern `auto_review_at` above already uses: `ops` imports
+        # this module.
+        from .ops import refusal_answered
+
         # THREE WAYS TO ARRIVE AT `needs_review`, ranked, and each asking the user for
         # something different. The `not pending` guards are PER LINE and not on the
         # branch head, which is the whole subtlety here: only ONE of the three can be
@@ -1284,6 +1342,19 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         #    only runs once the user's gate has cleared.
         elif not pending and store.work_unlanded_open(wo["id"]):
             blockers.append(UNLANDED_BLOCKER)
+        # 3b. The user refused an assumption and nothing has delivered since. Below the
+        #     unlanded line — code stranded on a branch is the more urgent fact and names
+        #     a different decision — and above the idle line, which would call a worker
+        #     that DID deliver one that stopped mid-task. The `PR_UNDECLARED_BLOCKER`
+        #     guard is because that blocker is the same refusal WITH commits behind it,
+        #     appended earlier from `PR_REPAIR_BLOCKERS`; without it both lines appear
+        #     and the second is the weaker. Spec §3,
+        #     docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md
+        elif (not pending and PR_UNDECLARED_BLOCKER not in blockers
+                and not refusal_answered(store, wo["id"])):
+            blockers.append(REFUSAL_UNANSWERED_DOC_BLOCKER
+                            if wo.get("kind") in DOCUMENT_DELIVERY_KINDS
+                            else REFUSAL_UNANSWERED_BLOCKER)
         # 4. Nothing more specific: the worker stopped without finishing. Guarded,
         #    because a `needs_review` holding a pending assumption is doing exactly what
         #    that status is for, and this line would call it a worker that gave up.
@@ -1303,7 +1374,11 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # here has told the user the worker has stopped — an assumption review is the one
     # blocker that says who owes what without saying anything about the session behind
     # it, which is how wo-a4bd6958 sat for 7h13m under a four-hour-old assumptions line.
-    if all(_mentions_assumptions(b) for b in blockers):
+    # ...and the two refusal lines are NOT assumption reviews, though they name one: they
+    # say plenty about the session behind them, which is the rule this tail applies (§4,
+    # docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md).
+    if all(_mentions_assumptions(b) and b not in REFUSAL_HELD_BLOCKERS
+           for b in blockers):
         parked = parked_reason(store, wo, now=now)
         if parked:
             blockers.append(parked)
@@ -1788,6 +1863,23 @@ def fleet_hold_note(wo: dict[str, Any], fleet: Fleet | None) -> str:
     return fleet.blocked()
 
 
+def plan_hold_note(hold: dict[str, Any] | None) -> str:
+    """One sentence for a `ProjectStore.plan_hold` row, `""` for no hold.
+
+    ONE HOME, TWO READERS (kn-432d0f19): `status_label` and the sweep's blocker column
+    (`ops.stuck_scan`) both print it, and §1(2) of docs/superpowers/specs/2026-10-15-a-
+    child-held-by-its-features-unratified-plan-is-not-stuck.md is what happens when they
+    each compose their own — one row saying "nothing the record can name" beside one
+    naming the plan and the review command.
+    """
+    if not hold:
+        return ""
+    n = hold["n"]
+    return (f"blocked by {hold['fo_id']}'s plan ({n} "
+            f"assumption{'' if n == 1 else 's'} await{'s' if n == 1 else ''} your "
+            f"review — `jarvis wo review {hold['planner_id']}`)")
+
+
 def status_label(store: ProjectStore, wo: dict[str, Any],
                  fleet: Fleet | None = None) -> str:
     """How this work order's status should read to a human.
@@ -1886,16 +1978,25 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
             return f"{wo['status']} — {note}"
     if wo["status"] != "pending":
         return wo["status"]
+    # FIRST of the four pending answers: of them it is the only one that may never clear
+    # without a person, and it is the condition the order was CREATED with — §2.7 of
+    # docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md. Flagless
+    # like the three below: `true_blockers` gets no branch, so INV-ATTENTION-MISSING stays
+    # quiet without an exception.
+    held = store.open_preconditions(wo["id"])
+    if held:
+        refs = ", ".join(row["ref"] for row in held)
+        notes = "; ".join(row["note"] for row in held if row["note"])
+        label = (f"pending — held until {refs} clears "
+                 f"(`jarvis wo unblock {wo['id']}`)")
+        return f"{label} — {notes}" if notes else label
     # ABOVE the dependency and slot labels, inverting their order: those two clear
-    # themselves, and this one clears only when a person rules on the plan. Of the three
+    # themselves, and this one clears only when a person rules on the plan. Of the four
     # true sentences it is the one naming a move (spec §2.3). Flagless — `true_blockers`
     # gets no branch, so INV-ATTENTION-MISSING stays quiet without an exception.
-    hold = store.plan_hold(wo)
-    if hold:
-        n = hold["n"]
-        return (f"pending — blocked by {hold['fo_id']}'s plan ({n} "
-                f"assumption{'' if n == 1 else 's'} await{'s' if n == 1 else ''} your "
-                f"review — `jarvis wo review {hold['planner_id']}`)")
+    note = plan_hold_note(store.plan_hold(wo))
+    if note:
+        return f"pending — {note}"
     blockers = store.unfinished_dependencies(wo["id"])
     if blockers:
         return f"pending — blocked by {', '.join(dep['id'] for dep in blockers)}"
@@ -5194,6 +5295,24 @@ def check_default_branch_green(store: ProjectStore) -> Iterator[Violation]:
     sha = str(fact.get("head_sha") or "")
     wo_id = str(fact.get("wo_id") or "")
     blamed = f", merged by the OS for {wo_id}" if wo_id else ""
+    # Spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §5: the order producing that
+    # commit, and nothing that moves tick to tick — the sentence is the dedupe key.
+    fix_wo_id = str(fact.get("fix_wo_id") or "")
+    issue_url = str(fact.get("issue_url") or "")
+    dead = _dead_base_fix(store, fix_wo_id)
+    tail = _base_fix_decision(dead, fix_wo_id, issue_url)
+    if dead:
+        # §5's third branch: the detail STATES the state; the owed violation below TAKES
+        # the decision.
+        remedy = (f"The remedy is a commit on `{base}`; {fix_wo_id} was dispatched to "
+                  f"produce it and is now `{dead}`, so the OS is out of moves — it "
+                  f"dispatches no second fix order and never retries a dead turn "
+                  f"itself. {tail}")
+    elif fix_wo_id:
+        remedy = f"The remedy is a commit on `{base}`, and {fix_wo_id} is producing it."
+    else:
+        remedy = (f"The remedy is a commit on `{base}`, and no work order is producing "
+                  f"it yet.")
     yield Violation(
         invariant=INV_BASE_RED,
         wo_id=None,
@@ -5201,11 +5320,66 @@ def check_default_branch_green(store: ProjectStore) -> Iterator[Violation]:
         detail=(f"`{base}` is red — workflow `{workflow}`, run {url}, at "
                 f"{sha[:10] or 'an unknown commit'}{blamed}. Nothing merges onto a "
                 f"broken default branch, and every pull request built against it "
-                f"inherits the failure. The remedy is a commit on `{base}`."),
+                f"inherits the failure. {remedy}"),
         context={"base": base, "workflow": workflow, "run_url": url, "head_sha": sha,
                  "wo_id": wo_id, "run_id": fact.get("run_id"),
+                 "fix_wo_id": fix_wo_id, "issue_url": issue_url,
                  "checked_at": fact.get("checked_at")},
     )
+    if not dead:
+        return
+    # NO elapsed time and nothing that changes tick to tick — `Violation.owed`'s rule.
+    owed = (f"{fix_wo_id}, the work order fixing the red default branch `{base}`, "
+            f"settled `{dead}` without clearing it, and the OS will not open another. "
+            f"{tail}")
+    yield Violation(
+        invariant=INV_BASE_FIX_DEAD,
+        wo_id=fix_wo_id,            # `owed_violations` selects by it, so it must be set
+        repaired=False,
+        detail=owed,
+        owed=owed,
+        context={"base": base, "fix_wo_id": fix_wo_id, "issue_url": issue_url,
+                 "status": dead},
+    )
+
+
+def _base_fix_decision(dead: str, fix_wo_id: str, issue_url: str) -> str:
+    """THE DECISION a dead base-fix order leaves the user, naming only a command that can
+    actually run.
+
+    `jarvis wo retry` is `failed`-ONLY by contract: it refuses a delivered or cancelled
+    order, and a deleted row has no session to resume. Naming it there would print a
+    command that cannot succeed. Nothing in here moves tick to tick — `Violation.owed`'s
+    rule.
+    """
+    if not dead:
+        return ""
+    if dead == "failed":
+        return f"Run `jarvis wo retry {fix_wo_id}`, or order a different fix."
+    gone = ("Its record is gone, so nothing can be resumed" if dead == "deleted"
+            else "That order will not run again")
+    if issue_url:
+        return f"{gone} — a fix is a new order on the same issue: " \
+               f"`jarvis issues start {issue_url}`."
+    return f"{gone} — order a fix yourself."
+
+
+def _dead_base_fix(store: ProjectStore, fix_wo_id: str) -> str:
+    """The terminal status of the red base's fix order, `""` while it can still fix it.
+
+    Spec docs/superpowers/specs/2026-10-14-a-red-main-dispatches-its-own-fix.md §5. The
+    work order's own `TERMINAL_STATUSES`, which includes `failed` — this module's local
+    constant of that name does not — and a row that is GONE reads as terminal.
+    """
+    from .project_store import TERMINAL_STATUSES as SETTLED_STATUSES
+
+    if not fix_wo_id:
+        return ""
+    try:
+        status = str(store.get_work_order(fix_wo_id)["status"])
+    except KeyError:
+        return "deleted"
+    return status if status in SETTLED_STATUSES else ""
 
 
 #: How many feature orders the pointer check reads. `list_feature_orders` caps at 200 by
@@ -5319,6 +5493,52 @@ def _tracked_with_basename(root: Path, ref: str, name: str) -> list[str]:
     return sorted(p for p in out.stdout.split("\0") if p and Path(p).name == name)
 
 
+INV_PRECONDITION_UNWIRED = "INV-PRECONDITION-UNWIRED"
+
+
+def check_precondition_is_wired(store: ProjectStore) -> Iterator[Violation]:
+    """INV-PRECONDITION-UNWIRED — a brief that says "do not start" must be held by state.
+
+    §2.5 of docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md. The
+    population is exactly the set the creation refusal cannot reach: orders that predate
+    it, planner children, and anything the OS filed itself.
+
+    **`owed` stays EMPTY, and that is a ruling, not an omission.** `Daemon.check_invariants`
+    computes `routed = bool(v.owed and v.wo_id)` and a routed violation derives its reason
+    from `true_blockers` while SUPPRESSING the notification — so with no `true_blockers`
+    branch (§2.7 gives it none) a non-empty `owed` here would mean no flag AND no
+    notification, a silent check. Empty `owed` with `wo_id` set gives one timeline event
+    plus one notification per standing violation, and no attention flag.
+
+    Nothing is repaired: only the order's AUTHOR knows whether the sentence names a real
+    hold to wire or stale text to delete (`REMEDY_NONE`, kn-a816ddf6).
+    """
+    from . import preconditions
+
+    for wo in store.list_work_orders(statuses=OPEN_STATUSES, include_hidden=True):
+        matched = preconditions.states_hold(wo["title"], wo["description"] or "")
+        if not matched:
+            continue
+        if store.dependencies(wo) or store.open_preconditions(wo["id"]):
+            continue
+        yield Violation(
+            invariant=INV_PRECONDITION_UNWIRED,
+            wo_id=wo["id"],
+            detail=f"its brief states a stop condition — \"{matched}\" — and nothing "
+                   f"holds it back, so the claim takes it: wire the hold "
+                   f"(`--blocked-by`/`--depends-on` at creation) or delete the sentence",
+            repaired=False,
+            owed="",
+            # The matched sentence is the USER's text: it stays on the record and never
+            # rides outward into a notification (§2.5).
+            notice=f"{wo['id']}: its brief states an unwired stop condition and nothing "
+                   f"holds it back, so the claim takes it — wire the hold "
+                   f"(`--blocked-by`/`--depends-on` at creation) or delete the sentence; "
+                   f"`jarvis wo show {wo['id']}` quotes it",
+            context={"matched": matched},
+        )
+
+
 INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_default_branch_green,    # first and order-free: a pure read of the central
                                    # reading, repairing nothing and touching no flag any
@@ -5344,6 +5564,9 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                    # same `true_blockers[0]`, so the flag goes up once
     check_blocked_work_is_surfaced,
     check_attention_has_reason,
+    check_precondition_is_wired,   # order-free: a pure read that repairs nothing, raises
+                                   # no flag and writes no status, so nothing else in the
+                                   # tuple reads its output
     check_pull_request_recorded,   # order-free: a pure timeline read that repairs
                                    # nothing and touches no flag. NOT a SLOW_INVARIANT —
                                    # it asks the record, never the repository

@@ -33,6 +33,11 @@ DEFAULT_BUG_REPO = "gonandrap/agentic_os"
 BUG_REPO_ENV = "JARVIS_BUG_REPO"
 BUG_LABEL = "bug"
 
+#: The last line of every body this module files. Public text, so it proves nothing on
+#: its own — the red-base adoption filter pairs it with the AUTHOR login (spec
+#: docs/superpowers/specs/2026-10-14-a-red-main-dispatches-its-own-fix.md §4).
+FILED_MARKER = "<!-- Filed automatically by `jarvis bug report`. -->"
+
 #: `gh` location override, mirroring JARVIS_CLAUDE_BIN.
 GH_BIN_ENV = "JARVIS_GH_BIN"
 
@@ -276,7 +281,7 @@ def render_body(*, description: str, expected: str, actual: str, version: str,
         f"- **Reported by:** {reporter}",
         f"- **Reported at:** {time.strftime('%Y-%m-%d %H:%M:%S %Z')}",
         "",
-        "<!-- Filed automatically by `jarvis bug report`. -->",
+        FILED_MARKER,
     ]
     return "\n".join(parts)
 

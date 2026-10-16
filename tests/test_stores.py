@@ -92,43 +92,6 @@ def test_assumptions_are_numbered_from_one_per_work_order(project):
     store.close()
 
 
-def test_plan_hold_spans_clips_and_skips_an_undated_settlement(project):
-    """§4 of docs/superpowers/specs/2026-10-15-a-plan-held-child-is-not-stuck.md: a
-    settled row with no `decided_at` yields NO span — an UNDER-discount, never one in the
-    direction that buys an investigation."""
-    from jarvis.project_store import plan_hold_spans
-
-    rows = [
-        {"ts": 130.0, "status": "accepted", "decided_at": 150.0},   # wholly inside
-        {"ts": 50.0, "status": "pending", "decided_at": None},      # began before `since`
-        {"ts": 60.0, "status": "accepted", "decided_at": None},     # settled, undated
-        {"ts": 170.0, "status": "rejected", "decided_at": 400.0},   # clipped at `now`
-        {"ts": 70.0, "status": "accepted", "decided_at": 90.0},     # over before `since`
-    ]
-
-    assert plan_hold_spans(rows, 100.0, 200.0) == [
-        (100.0, 200.0), (130.0, 150.0), (170.0, 200.0)]
-    assert plan_hold_spans([], 100.0, 200.0) == []
-
-
-def test_review_assumption_stamps_decided_at_on_both_routes(project):
-    """§3: one site, both routes — the user's `jarvis wo review` and auto-review."""
-    store = ProjectStore(project)
-    wo = store.create_work_order("x")
-    mine = store.add_assumption(wo["id"], "assumed sqlite")
-    theirs = store.add_assumption(wo["id"], "assumed UTF-8")
-    pending = store.add_assumption(wo["id"], "assumed the other thing")
-
-    store.review_assumption(mine, "accepted")
-    store.review_assumption(theirs, "accepted", decided_by="neo")
-
-    by_id = {a["id"]: a for a in store.all_assumptions(wo["id"])}
-    assert by_id[mine]["decided_at"] and by_id[theirs]["decided_at"]
-    # Nothing settled it, so the span the sweep discounts is still open.
-    assert by_id[pending]["decided_at"] is None
-    store.close()
-
-
 def test_notifications_outbox(project):
     store = ProjectStore(project)
     store.add_notification("t1", "b1", level="warning")

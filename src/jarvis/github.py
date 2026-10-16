@@ -66,12 +66,18 @@ GH_TIMEOUT = 30
 READ_ONLY_VERBS = (("pr", "view"), ("pr", "diff"), ("pr", "list"),
                    ("api", "--method"))
 
-#: The LOCAL git subcommands this module runs, held to the same standard by the same
-#: test. `origin_repo` shells out to git to learn which repository this checkout belongs
-#: to; that never touches the network and can mutate nothing, but it puts a second
-#: command family in a module whose whole claim is "everything here is a question", so
-#: it is declared rather than left for a reader to audit.
-LOCAL_GIT_READS = (("remote", "get-url", "origin"),)
+#: The git subcommands this module runs, held to the same standard by the same test: the
+#: standard is READ-ONLY, which is why the name does not say "local". `origin_repo`
+#: shells out to git to learn which repository this checkout belongs to, which puts a
+#: second command family in a module whose whole claim is "everything here is a
+#: question", so it is declared rather than left for a reader to audit.
+#:
+#: `ls-remote --heads` reaches the NETWORK, and deliberately: it asks the REMOTE what its
+#: branches point at, which is the fact PR #995 proved `gh pr view` will not tell you
+#: (wo-d3a70c29). A local `refs/heads` read would answer a different question and answer
+#: it wrong — the OS's checkout is not where the push landed. No entry here may mutate
+#: anything, local or remote.
+GIT_READS = (("remote", "get-url", "origin"), ("ls-remote", "--heads"))
 
 
 class GitHubError(RuntimeError):
@@ -225,8 +231,12 @@ def blob_url(cwd: Path | None, repo_path: str) -> str | None:
 #:   whose pull request merged and whose branch then carried MORE commits. It is recorded
 #:   on the `pr_merged` event so the landing sweep can ask months later without a second
 #:   round trip (`landing.assess`).
+#:
+#: `headRefName` rides along for `ls_remote`'s sake and costs nothing on this call: the
+#: poll has to know WHICH branch to look the remote tip up for, and the alternative is a
+#: second round trip for a string `gh` was already willing to hand over (wo-d3a70c29).
 PR_FIELDS = ("state,mergedAt,mergeable,mergeStateStatus,baseRefName,baseRefOid,"
-             "statusCheckRollup,headRefOid,mergeCommit")
+             "statusCheckRollup,headRefOid,headRefName,mergeCommit")
 
 #: A check conclusion that means THE CODE IS WRONG — as opposed to merely not green. The
 #: distinction is the whole of the red-pull-request spec's §2: a run that is PENDING,
@@ -330,6 +340,11 @@ class PullRequest:
     #: (docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §5.1).
     #: `ops.catch_up_needed` asks the ancestry question this is the input to.
     base_oid: str = ""
+    #: `headRefName`: the branch this pull request is FROM. Read only to look its tip up
+    #: on the remote (`ls_remote`), which is the one question `headRefOid` cannot answer
+    #: — that field is the head GITHUB'S PULL REQUEST RECORD holds, and PR #995 is what
+    #: happens when the two stop agreeing.
+    head_ref: str = ""
     #: `mergeCommit.oid`: the commit THIS PULL REQUEST PUT ON ITS BASE, and `""` when
     #: GitHub did not answer it (an open pull request has none, which is not an error).
     #: NOT `head_oid` and never interchangeable with it: `automerge._merge_args` merges
@@ -465,9 +480,54 @@ def pr_view(url: str, cwd: Path | None = None) -> PullRequest:
         checks=read_checks(payload),
         head_oid=str(payload.get("headRefOid") or ""),
         base_oid=str(payload.get("baseRefOid") or ""),
+        head_ref=str(payload.get("headRefName") or ""),
         # A nested object, so one `or {}` guard — spec §2.
         merge_commit_oid=str((payload.get("mergeCommit") or {}).get("oid") or ""),
     )
+
+
+def ls_remote(cwd: Path | None = None, remote: str = "origin") -> dict[str, str]:
+    """`{branch: sha}` for every head on the REMOTE. Raises `GitHubError` on any doubt.
+
+    The one fact `pr_view` cannot report: where the remote's own refs point. PR #995
+    moved `refs/heads/worktree-wo-cdee6f9b` to 88cac10 and the pull request's `head.sha`
+    stayed at 0488753, so GitHub never recomputed mergeability and the merge poll's every
+    acting branch declined for ~7h (wo-d3a70c29). A LOCAL `refs/heads` read would answer
+    about the OS's own checkout, which is not where the push landed.
+
+    THE WHOLE REPOSITORY IN ONE CALL, because the caller needs it once per project per
+    tick however many pull requests it is parked behind — the same bargain `base_ci`
+    strikes in that loop.
+
+    Raising rather than returning `{}` is the distinction `GhUnavailable` exists for: an
+    unreadable remote must leave the caller's cache STANDING (stale rather than wrong),
+    and `{}` would read as "the branch is gone".
+    """
+    where = str(cwd) if cwd and Path(cwd).is_dir() else None
+    if not BRANCH_RE.match(remote):
+        raise GitHubError(f"refusing to ask about remote {remote!r}",
+                          GitHubError.URL_REFUSED)
+    try:
+        proc = subprocess.run(["git", "-C", where or ".", "ls-remote", "--heads",
+                               remote],
+                              capture_output=True, text=True, timeout=GH_TIMEOUT)
+    except subprocess.TimeoutExpired as e:
+        raise GitHubError(f"`git ls-remote {remote}` timed out after {GH_TIMEOUT}s",
+                          GitHubError.TIMEOUT) from e
+    except (OSError, subprocess.SubprocessError) as e:
+        raise GitHubError(f"`git ls-remote {remote}` could not be run: {e}",
+                          GitHubError.REFUSED) from e
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip() or f"exit {proc.returncode}"
+        log.info("`git ls-remote %s` failed: %s", remote, detail)
+        raise GitHubError(f"`git ls-remote {remote}` failed: {detail}",
+                          GitHubError.REFUSED)
+    heads: dict[str, str] = {}
+    for line in (proc.stdout or "").splitlines():
+        sha, _, ref = line.partition("\t")
+        if sha.strip() and ref.startswith("refs/heads/"):
+            heads[ref[len("refs/heads/"):].strip()] = sha.strip()
+    return heads
 
 
 def open_pull_request_for_branch(branch: str, cwd: Path | None = None) -> str:

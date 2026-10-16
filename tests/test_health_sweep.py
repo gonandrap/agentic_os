@@ -1540,132 +1540,160 @@ def test_usage_window_outranks_a_live_dependency(stuck_os):
     assert verdict.stuck is False and verdict.excluded == PAUSE_USAGE_LIMIT
 
 
-def _plan_held(store, *, assumptions: int = 1, kind: str = "worker"):
-    """`(planner, child, assumption ids)` of a feature whose plan is unratified.
+# -- a child held by its feature's unratified plan (the 2026-10-15 spec) --------------
 
-    `a_bare_feature`'s rows (tests/test_feature_orders.py:666): what the hold reads is a
-    `plan_wo_id` and a pending assumption row, and no plan machinery decides anything.
+
+def _held_child(store, *, status: str = "pending", assumptions: int = 1,
+                hours: float = 2.0):
+    """`(feature, planner, child, at)`: a feature child `hours` in `status` whose
+    planner has `assumptions` pending since `at`.
+
+    `a_bare_feature` is the 2026-09-24 spec's own fixture — the hold reads a
+    `plan_wo_id` and a pending assumption row, and nothing else.
     """
-    fo = store.create_feature_order("CSV export", description="export the table")
-    planner = store.create_work_order("plan it", kind="planner", parent_id=fo["id"],
-                                      status="completed")
-    store.update_feature_order(fo["id"], plan_wo_id=planner["id"], status="executing")
-    kid = store.create_work_order("build it", parent_id=fo["id"], kind=kind)
-    ids = [store.add_assumption(planner["id"], f"the exporter writes CSV, not JSON ({i})")
-           for i in range(assumptions)]
-    return planner, kid, ids
+    from tests.test_feature_orders import a_bare_feature
+
+    fo, planner, kid = a_bare_feature(store, status=status, assumptions=assumptions)
+    at = park_order(store, kid["id"], status, hours=hours)
+    # `park_order` back-dates the CHILD's timeline; the count is walked on the planner's.
+    store.conn.execute("UPDATE wo_events SET ts=? WHERE wo_id=? AND kind='assumption'",
+                       (at, planner["id"]))
+    store.conn.commit()
+    return fo, planner, kid, at
 
 
-def _raised_at(store, assumption_id: int, ts: float) -> None:
-    """Back-date one assumption row, `park_order`'s rule: the store stamps `db.now()`."""
-    store.conn.execute("UPDATE assumptions SET ts=? WHERE id=?", (ts, assumption_id))
+def settle_plan(store, planner_id: str, at: float, count: int = 1) -> None:
+    """The user's route, back-dated: every pending assumption ruled, one `reviewed`."""
+    for a in store.pending_assumptions(planner_id):
+        store.review_assumption(a["id"], "accepted")
+    store.add_event(planner_id, "reviewed", {"accepted": True, "count": count})
+    store.conn.execute(
+        "UPDATE wo_events SET ts=? WHERE id=(SELECT MAX(id) FROM wo_events)", (at,))
     store.conn.commit()
 
 
-def test_a_plan_held_child_is_excluded_not_investigated(stuck_os):
-    """§2: `excluded == PLAN_ASSUMPTIONS_CAUSE`, `stuck` False, and NO `continue` — a row
-    that vanished would be indistinguishable from one inside its threshold."""
+def test_a_child_held_by_an_unratified_plan_is_not_stuck(stuck_os):
+    """§3(1). Two hours `pending` because the OS's own claim rule withholds it."""
     from jarvis import stuck
 
     store = stuck_os["store"]
-    now = time.time()
-    _planner, kid, _ = _plan_held(store)
-    park_order(store, kid["id"], "pending", hours=0.75)
+    _fo, planner, kid, _at = _held_child(store)
 
-    rows = [r for r in _judged(store, now) if r["wo"]["id"] == kid["id"]]
-    stuck_os["daemon"].stuck_tick(None)
+    verdict = _judge(stuck_os, kid["id"])
 
-    assert len(rows) == 1, "the held row left the sweep's output entirely"
-    assert rows[0]["verdict"].excluded == stuck.PLAN_ASSUMPTIONS_CAUSE
-    assert rows[0]["verdict"].stuck is False
-    assert ops.list_investigation_orders("proj_a", include_settled=True) == []
+    assert verdict.stuck is False
+    assert verdict.excluded == stuck.PLAN_ASSUMPTION_CAUSE
+    assert "clears by itself" not in verdict.reason, verdict.reason
+    assert "jarvis wo review" in verdict.reason, verdict.reason
+    assert store.plan_hold(store.get_work_order(kid["id"]))["planner_id"] == planner["id"]
 
 
-def test_the_planner_itself_is_still_judged(stuck_os):
-    """§2: the deadlock-avoiding asymmetry — the planner produces the plan, so holding it
-    on its own assumptions would wedge the feature for ever."""
+def test_a_lifted_plan_hold_is_judged_and_its_held_seconds_still_discounted(stuck_os):
+    """§2.3 and §3(2): EXCLUSION ALONE IS NOT THE FIX. `pending` is judged on time in
+    status, so the first sweep after the user rules sees the whole two hours and buys
+    the investigation the exclusion existed to prevent — one dispatch tick too early."""
     store = stuck_os["store"]
     now = time.time()
-    planner, _kid, _ = _plan_held(store)
-    park_order(store, planner["id"], "pending", hours=0.75)
-
-    row = [r for r in _judged(store, now) if r["wo"]["id"] == planner["id"]][0]
-
-    assert row["verdict"].excluded == ""
-    assert row["verdict"].stuck is True
-
-
-@pytest.mark.parametrize("who", ["manager", "no_feature"])
-def test_a_non_worker_kind_and_an_unparented_pending_row_are_unaffected(stuck_os, who):
-    """§2: the gate is `pending` AND `kind == 'worker'`, mirroring the claim rule."""
-    store = stuck_os["store"]
-    now = time.time()
-    if who == "manager":
-        _planner, row_wo, _ = _plan_held(store, kind="manager")
-    else:
-        _plan_held(store)
-        row_wo = store.create_work_order("an ordinary job")
-    park_order(store, row_wo["id"], "pending", hours=0.75)
-
-    row = [r for r in _judged(store, now) if r["wo"]["id"] == row_wo["id"]][0]
-
-    assert row["verdict"].stuck is True and row["verdict"].excluded == ""
-
-
-def test_a_ratified_plan_falls_back_inside_the_threshold(stuck_os):
-    """§1(2) and §3: the half an exclusion alone does not buy. The hold is gone, so the
-    row is judged — and the DISCOUNT is what keeps 45 minutes in status under 30."""
-    store = stuck_os["store"]
-    now = time.time()
-    _planner, kid, (aid,) = _plan_held(store)
-    at = park_order(store, kid["id"], "pending", hours=0.75)
-    _raised_at(store, aid, at)
-    store.review_assumption(aid, "accepted")
-    # Ruled two minutes ago: `decided_at` is the end of the span (§4).
-    store.conn.execute("UPDATE assumptions SET decided_at=? WHERE id=?",
-                       (now - 120, aid))
-    store.conn.commit()
+    _fo, planner, kid, _at = _held_child(store, hours=2)
+    settle_plan(store, planner["id"], now - 60)
 
     row = [r for r in _judged(store, now) if r["wo"]["id"] == kid["id"]][0]
 
-    assert row["verdict"].excluded == ""
-    assert row["verdict"].stuck is False
-    assert row["seconds_in_status"] > 40 * 60
-    assert row["verdict"].active_seconds < 30 * 60
+    assert row["verdict"].excluded == "", "the lifted hold still excluded the child"
+    assert abs(row["verdict"].active_seconds - 60) < 5, row["verdict"].active_seconds
+    assert row["verdict"].stuck is False, row["verdict"].reason
 
 
-def test_a_usage_window_overlapping_the_plan_hold_is_counted_once(stuck_os):
-    """§5: the measure of the UNION, never the sum — and bit-for-bit today's figure with
-    no plan hold at all."""
-    from jarvis import holds
+def test_plan_hold_spans_walk_the_pending_count_over_the_planners_timeline():
+    """§3(3): pure, row-shaped, clipped to `[since, now]`, and a `reviewed` with
+    `count=N` closes a span that N `assumption` events opened."""
+    from jarvis.project_store import plan_hold_spans
+
+    def ev(ts, kind, **payload):
+        return {"ts": ts, "kind": kind, "payload": json.dumps(payload)}
+
+    events = [ev(50.0, "assumption"),                 # opened before `since`
+              ev(60.0, "assumption"),
+              ev(120.0, "reviewed", count=2),         # both settled at once
+              ev(150.0, "assumption"),
+              ev(160.0, "autoreview_accepted")]       # Neo's route, one at a time
+
+    assert plan_hold_spans(events, 100.0, 200.0) == [(100.0, 120.0), (150.0, 160.0)]
+    assert plan_hold_spans([ev(150.0, "assumption")], 100.0,
+                           200.0) == [(150.0, 200.0)], "a live hold must end at `now`"
+    assert plan_hold_spans([], 100.0, 200.0) == []
+    assert plan_hold_spans([ev(70.0, "assumption"), ev(80.0, "reviewed", count=1)],
+                           100.0, 200.0) == [], "a span over before `since` was kept"
+    # A malformed count cannot drive the walk negative and swallow the next hold.
+    assert plan_hold_spans([ev(110.0, "reviewed", count=5), ev(150.0, "assumption")],
+                           100.0, 200.0) == [(150.0, 200.0)]
+
+
+def test_overlapping_usage_and_plan_holds_are_discounted_once(stuck_os):
+    """§3(4): the UNION of the interval sets, never the sum — a usage window can shut
+    while the plan stands, and 40 + 30 minutes of a 60-minute wait is impossible."""
+    store = stuck_os["store"]
+    now = time.time()
+    _fo, planner, kid, at = _held_child(store, hours=1)
+    settle_plan(store, planner["id"], at + 40 * 60)
+    usage_hold(store, kid["id"], started=at + 20 * 60, ended=at + 50 * 60)
+
+    row = [r for r in _judged(store, now) if r["wo"]["id"] == kid["id"]][0]
+
+    assert abs(row["discounted"] - 50 * 60) < 5, row["discounted"]
+    assert row["discounted"] < 40 * 60 + 30 * 60, "the overlap was counted twice"
+
+
+def test_a_running_child_of_a_held_feature_is_judged_normally(stuck_os):
+    """§2.4: the claim rule withholds a DISPATCH only. Work already in flight is not
+    held by it and must still clear its threshold."""
+    store = stuck_os["store"]
+    _fo, _planner, kid, _at = _held_child(store, status="running", hours=5)
+
+    verdict = _judge(stuck_os, kid["id"])
+
+    assert verdict.excluded == "" and verdict.stuck is True
+
+
+def test_a_usage_window_outranks_a_plan_hold(stuck_os):
+    """§2.4's precedence: the account's window is a fact about the whole fleet."""
     from jarvis.worker_session import PAUSE_USAGE_LIMIT
 
     store = stuck_os["store"]
+    _fo, _planner, kid, at = _held_child(store)
+    usage_hold(store, kid["id"], started=at)
+
+    verdict = _judge(stuck_os, kid["id"])
+
+    assert verdict.stuck is False and verdict.excluded == PAUSE_USAGE_LIMIT
+
+
+def test_the_held_child_stays_a_visible_row_and_its_two_readers_agree(stuck_os):
+    """§3(6) and §4's rejection of a `continue`: kn-143a46df, a held order is a row on
+    `jarvis stuck` showing its arithmetic. §1(2): the blocker column and
+    `status_label` on the SAME row must not contradict each other."""
+    store = stuck_os["store"]
     now = time.time()
-    _planner, kid, (aid,) = _plan_held(store)
-    at = park_order(store, kid["id"], "pending", hours=1)
-    usage_hold(store, kid["id"], started=at, ended=at + 30 * 60)
-    _raised_at(store, aid, at + 20 * 60)
-    store.review_assumption(aid, "accepted")
-    store.conn.execute("UPDATE assumptions SET decided_at=? WHERE id=?",
-                       (at + 40 * 60, aid))
-    store.conn.commit()
+    _fo, planner, kid, _at = _held_child(store)
 
-    row = [r for r in _judged(store, now) if r["wo"]["id"] == kid["id"]][0]
+    rows = [r for r in _judged(store, now) if r["wo"]["id"] == kid["id"]]
 
-    assert abs(row["discounted"] - 40 * 60) < 5, row["discounted"]
-    assert row["discounted"] < 30 * 60 + 20 * 60, "the overlap was counted twice"
+    assert len(rows) == 1, "the held row left the sweep's output entirely"
+    assert rows[0]["verdict"].stuck is False
+    assert rows[0]["verdict"].threshold_seconds == 30 * 60, "the arithmetic is gone"
+    assert f"jarvis wo review {planner['id']}" in rows[0]["status_label"]
+    assert f"jarvis wo review {planner['id']}" in rows[0]["blocker"]
+    assert "nothing the record can name" not in rows[0]["blocker"]
 
-    # No plan hold anywhere: the number is the usage figure and nothing else.
-    plain = ops.create_work_order("proj_a", "held by the account only")
-    at = park_order(store, plain["id"], "pending", hours=1)
-    usage_hold(store, plain["id"], started=at, ended=at + 30 * 60)
-    plain_row = [r for r in _judged(store, now) if r["wo"]["id"] == plain["id"]][0]
-    usage = [h for h in holds.held(store, plain["id"], now=now)
-             if h.cause == PAUSE_USAGE_LIMIT]
-    expected = holds.by_cause(usage, plain_row["since"], now, now).get(
-        PAUSE_USAGE_LIMIT, 0.0)
-    assert plain_row["discounted"] == expected
+
+def test_a_pending_child_of_a_ratified_plan_is_still_judged(stuck_os):
+    """NEGATIVE, §2.5: the exclusion is the HOLD and never `pending` generally."""
+    store = stuck_os["store"]
+    _fo, _planner, kid, _at = _held_child(store, assumptions=0)
+
+    verdict = _judge(stuck_os, kid["id"])
+
+    assert verdict.excluded == "" and verdict.stuck is True
 
 
 def test_assess_is_pure():
@@ -2478,3 +2506,224 @@ def test_an_all_parked_project_keeps_the_os_sweep_invariant_green(
     _force_failures(store, invariants.HEALTH_SWEEP_FAILURE_RUN)
     assert list(invariants.check_health_sweep_produces_judgements(store)), (
         "the transport canary must still see a broken sweep")
+
+
+# -- a merge held by a red base is not stuck --------------------------------------------
+#
+# docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md, issue 1082.
+# wo-05e0a06d was swept at 4.9h in `waiting_pr_merge` while `main` was red and the OS was
+# itself holding the merge, and inv-b50cbe1e bought a model session to be told the OS was
+# working as designed. §1's exclusion and §2's discount, shaped on the CI pair above.
+
+
+def red_base_catalog(tmp_path, *, auto_merge: bool = True, enabled: bool = True,
+                     project_path: str = "", name: str = "red-base-catalog.json"):
+    """A registered catalog whose proj_a opted into auto-merge — §3's gate."""
+    return stuck_catalog(
+        tmp_path,
+        [{"name": "proj_a", "path": project_path, "description": "test project",
+          "validation": {"enabled": enabled, "auto_merge": auto_merge}}],
+        name=name)
+
+
+@pytest.fixture()
+def red_base_os(jarvis_home, project, tmp_path):
+    cat = red_base_catalog(tmp_path, project_path=str(project))
+    store = ProjectStore(project)
+    try:
+        yield {"daemon": Daemon(load_catalog(cat)), "store": store, "path": cat}
+    finally:
+        store.close()
+
+
+def base_fact(red: bool = True, age: float = 0.0, project: str = "proj_a") -> float:
+    """The project's stored base-health reading, `age` seconds old. Returns `checked_at`."""
+    from jarvis.central_store import CentralStore
+
+    central = CentralStore()
+    checked_at = time.time() - age
+    try:
+        central.set_base_health(project, {"red": red, "base": "main", "workflow": "ci",
+                                          "run_url": "https://x/1", "head_sha": "abc",
+                                          "wo_id": "", "checked_at": checked_at})
+        central.conn.commit()
+    finally:
+        central.close()
+    return checked_at
+
+
+def red_episodes(pairs, project: str = "proj_a") -> None:
+    from jarvis.central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        central.set_base_red_episodes(project, pairs)
+        central.conn.commit()
+    finally:
+        central.close()
+
+
+def _parked(store, hours: float = 4.9, status: str = "waiting_pr_merge",
+            title: str = "parked behind a red main") -> tuple[dict, float]:
+    wo = ops.create_work_order("proj_a", title)
+    return wo, park_order(store, wo["id"], status, hours=hours)
+
+
+def test_a_merge_held_by_a_red_base_is_excluded_with_its_own_sentence(red_base_os):
+    """§5(1), wo-05e0a06d's own number. `DEFAULT_EXCLUSION_REASON` is true here and says
+    nothing a reader can act on, so the cause carries its own sentence."""
+    from jarvis import stuck
+
+    store = red_base_os["store"]
+    now = time.time()
+    wo, _at = _parked(store)
+    base_fact(red=True)
+
+    row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+    assert row["stuck"] is False, row["reason"]
+    assert row["excluded"] == stuck.BASE_RED_CAUSE
+    assert row["reason"] == stuck.EXCLUSION_REASON[stuck.BASE_RED_CAUSE]
+    assert row["reason"] != stuck.DEFAULT_EXCLUSION_REASON.format(
+        cause=stuck.BASE_RED_CAUSE)
+
+
+def test_needs_review_beside_the_same_red_base_is_still_judged(red_base_os):
+    """§5(2), kn-6e836793's scoping: the OS is not holding this one, the reviewer is."""
+    store = red_base_os["store"]
+    now = time.time()
+    wo, _at = _parked(store, status="needs_review", title="the user owes this review")
+    base_fact(red=True)
+
+    row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+    assert row["excluded"] == ""
+    assert row["stuck"] is True, row["reason"]
+
+
+@pytest.mark.parametrize("off", [{"auto_merge": False}, {"enabled": False}])
+def test_with_auto_merge_off_the_parked_order_stays_judged(jarvis_home, project,
+                                                           tmp_path, off):
+    """§3: with auto-merge off `automerge.decide` is never consulted, no `HELD_BASE_RED`
+    exists and the merge is the wait the USER owes — so a parked pull request nobody
+    merged is reported, red base or not."""
+    red_base_catalog(tmp_path, project_path=str(project), **off)
+    store = ProjectStore(project)
+    try:
+        now = time.time()
+        wo, at = _parked(store)
+        base_fact(red=True)
+        red_episodes([[at, None]])
+
+        row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+        assert row["excluded"] == ""
+        assert row["stuck"] is True, row["reason"]
+        assert row["discounted_seconds"] == 0.0
+    finally:
+        store.close()
+
+
+def test_the_base_going_green_leaves_the_closed_episode_discounted(red_base_os):
+    """§5(4), kn-6e30d561 and the whole reason for §2: THE DISCOUNT MUST OUTLIVE THE
+    EXCLUSION BY ONE STATUS SPAN. Nothing is held any more, and the first sweep after
+    recovery must not judge the hours the hold accumulated."""
+    store = red_base_os["store"]
+    now = time.time()
+    wo, at = _parked(store)
+    base_fact(red=False)
+    red_episodes([[at, at + 4.5 * HOUR]])
+
+    row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+    assert row["excluded"] == ""
+    assert abs(row["discounted_seconds"] - 4.5 * HOUR) < 5, row["discounted_seconds"]
+    assert abs(row["active_seconds"] - 0.4 * HOUR) < 5, row["active_seconds"]
+    assert row["stuck"] is False, row["reason"]
+
+
+def test_a_stale_fact_excludes_nothing_and_stops_discounting_at_the_horizon(red_base_os):
+    """§5(5): a `gh` that stopped answering must not grow the discount on a fact nobody
+    can confirm — the open pair ends at `checked_at + BASE_HEALTH_FRESH_SECONDS`."""
+    from jarvis.central_store import BASE_HEALTH_FRESH_SECONDS
+
+    store = red_base_os["store"]
+    now = time.time()
+    wo, _at = _parked(store)
+    checked_at = base_fact(red=True, age=BASE_HEALTH_FRESH_SECONDS + 1)
+    opened = now - 20 * 60
+    red_episodes([[opened, None]])
+
+    row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+    assert row["excluded"] == "", "a fact nobody can confirm excluded the order"
+    assert row["stuck"] is True, row["reason"]
+    horizon = checked_at + BASE_HEALTH_FRESH_SECONDS
+    assert abs(row["discounted_seconds"] - (horizon - opened)) < 2, \
+        row["discounted_seconds"]
+    assert row["discounted_seconds"] < now - opened, "the open pair ran to `now`"
+
+
+def test_a_usage_hold_inside_the_red_episode_is_discounted_once(red_base_os):
+    """§5(6): the UNION and never the sum — summing would tell a reader the same minutes
+    twice under two names (`holds.union_seconds`' own docstring)."""
+    store = red_base_os["store"]
+    now = time.time()
+    wo, at = _parked(store)
+    base_fact(red=False)
+    red_episodes([[at, at + 2 * HOUR]])
+    usage_hold(store, wo["id"], started=at + 0.5 * HOUR, ended=at + 1 * HOUR)
+
+    row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+    assert abs(row["discounted_seconds"] - 2 * HOUR) < 5, row["discounted_seconds"]
+    assert row["discounted_seconds"] < 2.5 * HOUR, "the overlap was counted twice"
+
+
+def test_the_held_order_is_a_visible_row_and_never_a_continue(red_base_os):
+    """§5(7), kn-143a46df and kn-e91ff3a5: a `continue` has no unit test over the pure
+    predicate and produces no `Verdict`, so the held order would vanish from `jarvis
+    stuck` and `/stuck` instead of explaining itself there."""
+    from jarvis import stuck
+
+    store = red_base_os["store"]
+    now = time.time()
+    wo, _at = _parked(store)
+    base_fact(red=True)
+
+    scanned, rows = ops.stuck_scan(store, "proj_a", catalog.FleetHealthConfig(), now,
+                                   base_red=True, stuck_only=False)
+    held = [r for r in rows if r["wo"]["id"] == wo["id"]]
+
+    assert scanned == 1 and len(held) == 1, "the held row left the sweep's output"
+    assert held[0]["verdict"].excluded == stuck.BASE_RED_CAUSE
+    assert next(r for r in ops.stuck_report("proj_a", now)
+                if r["id"] == wo["id"])["excluded"] == stuck.BASE_RED_CAUSE
+
+
+@pytest.mark.parametrize("auto_merge, excluded", [(True, True), (False, False)])
+def test_both_callers_derive_the_same_bool(jarvis_home, project, tmp_path, auto_merge,
+                                           excluded):
+    """§7's ONE derivation, and the test that would have caught a bool hoisted in one
+    caller only: `Daemon._stuck_candidates` and `ops.stuck_report` over the same store,
+    fact and clock agree."""
+    from jarvis import stuck
+
+    cat = red_base_catalog(tmp_path, project_path=str(project), auto_merge=auto_merge)
+    store = ProjectStore(project)
+    try:
+        now = time.time()
+        wo, _at = _parked(store)
+        base_fact(red=True)
+        spec = load_catalog(cat).projects[0]
+        run: dict = {"scanned": 0}
+
+        candidates = [c["wo"]["id"] for c in
+                      Daemon(load_catalog(cat))._stuck_candidates(spec, None, now, run)]
+        row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+        assert (wo["id"] not in candidates) is excluded, candidates
+        assert (row["excluded"] == stuck.BASE_RED_CAUSE) is excluded
+        assert row["stuck"] is not excluded
+    finally:
+        store.close()

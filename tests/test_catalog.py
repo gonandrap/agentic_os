@@ -470,25 +470,26 @@ def test_a_project_inherits_the_fleet_stakes_classifier_and_may_override_it():
     assert over.stakes_classifier == "classifier"
 
 
-def test_the_confirmation_pass_has_its_own_diff_budget_and_never_reads_the_panels():
-    """Two numbers, no shared name, no shared reader: spec
-    docs/superpowers/specs/2026-09-26-bounded-model-inputs.md § 2."""
+def test_a_catalog_still_naming_confirm_diff_chars_loads_with_the_key_ignored():
+    """The confirmation question carries no diff any more, so the budget is gone — and a
+    live catalog still naming it must keep booting the fleet.
+
+    The validation block parses field by field with `raw.get(...)`, so an unknown key is
+    silently ignored; this pins that for the key this change removed, at BOTH levels.
+    docs/superpowers/specs/2026-10-14-neo-never-reads-a-diff.md
+    """
     v = parse_catalog({"projects": []}).os.validation
-    assert v.confirm_diff_chars == 12000
+    assert not hasattr(v, "confirm_diff_chars")
     assert v.diff_chars == 150000
 
     [over] = projects_validation({"confirm_diff_chars": 9000},
-                                 {"validation": {"confirm_diff_chars": 500}})
-    assert over.confirm_diff_chars == 500
+                                 {"validation": {"confirm_diff_chars": 0}})
+    assert not hasattr(over, "confirm_diff_chars")
     assert over.diff_chars == 150000
-
-    with pytest.raises(CatalogError,
-                       match="os.validation.confirm_diff_chars must be >= 1"):
-        validation_of({"confirm_diff_chars": 0})
 
 
 @pytest.mark.parametrize("key", ["timeout", "max_rounds", "diff_chars",
-                                 "confirm_diff_chars", "decision_record_chars",
+                                 "decision_record_chars",
                                  "assumption_spec_chars"])
 def test_a_validation_budget_below_one_is_rejected(key):
     """Zero rounds is a review that never runs while claiming to; zero diff_chars is a
@@ -763,6 +764,39 @@ def test_the_shipped_exempt_kinds_default_parses():
     cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
     assert cat.projects[0].fleet_health.exempt_kinds == \
         jarvis.catalog.DEFAULT_FLEET_HEALTH_EXEMPT_KINDS
+
+
+def test_red_episode_retention_is_resolvable_fleet_wide_and_per_project():
+    """§2 "The retention bound is a CATALOG KEY" of
+    docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md: Neo's one
+    condition on 1818 — how long the OS remembers one project's red-base episodes is never
+    a module constant. Per project by nature, so NOT a fleet-only key, and a plain positive
+    int, so the reflective tail loop already refuses `0` and `-1` naming the key."""
+    cat = parse_catalog({
+        "os": {"fleet_health": {"red_episode_retention_hours": 72,
+                                "cooldown_minutes": 99}},
+        "projects": [{"name": "a", "path": "/tmp/a"},
+                     {"name": "b", "path": "/tmp/b",
+                      "fleet_health": {"red_episode_retention_hours": 12}}],
+    })
+    assert cat.os.fleet_health.red_episode_retention_hours == 72
+    assert cat.projects[0].fleet_health.red_episode_retention_hours == 72
+    assert cat.projects[1].fleet_health.red_episode_retention_hours == 12
+    # A project naming it keeps the fleet answer for every other field.
+    assert cat.projects[1].fleet_health.cooldown_minutes == 99
+
+    assert jarvis.catalog.FleetHealthConfig().red_episode_retention_hours == \
+        jarvis.catalog.DEFAULT_FLEET_HEALTH_RED_EPISODE_RETENTION_HOURS == 168
+    assert "red_episode_retention_hours" not in \
+        jarvis.catalog.FLEET_HEALTH_FLEET_ONLY_KEYS
+    assert "red_episode_retention_hours" not in jarvis.catalog.FLEET_HEALTH_LIST_KEYS
+    assert "red_episode_retention_hours" not in jarvis.catalog.FLEET_HEALTH_MAP_KEYS
+    for bad in (0, -1):
+        with pytest.raises(CatalogError,
+                           match=r"red_episode_retention_hours must be >= 1"):
+            parse_catalog({"projects": [
+                {"name": "a", "path": "/tmp/a",
+                 "fleet_health": {"red_episode_retention_hours": bad}}]})
 
 
 def test_sweep_dark_minutes_is_refused_on_a_project():
@@ -1366,3 +1400,43 @@ def test_ui_health_can_be_switched_off_whole():
                          "projects": [{"name": "a", "path": "/tmp/a"}]})
     assert cat.os.ui_health.enabled is False
     assert cat.projects[0].ui_health.enabled is False
+
+
+# -- `pull_requests`: the one threshold the stall predicate reads (wo-d3a70c29) --------
+
+
+def test_the_recompute_stall_threshold_is_fleet_wide_and_per_project():
+    """`MessagingConfig`'s shape: one field, one area, field-level inheritance. Read by
+    `daemon.pr_recompute_stalled` via `ops.pull_requests_config_at`, and behind NO
+    `enabled` switch — it is a predicate ingredient, not an alarm."""
+    from jarvis import config_version
+
+    cat = parse_catalog({
+        "os": {"pull_requests": {"recompute_stall_minutes": 45}},
+        "projects": [{"name": "a", "path": "/tmp/a",
+                      "pull_requests": {"recompute_stall_minutes": 10}},
+                     {"name": "b", "path": "/tmp/b"}],
+    })
+
+    assert cat.os.pull_requests.recompute_stall_minutes == 45
+    assert cat.project("a").pull_requests.recompute_stall_minutes == 10
+    assert cat.project("b").pull_requests.recompute_stall_minutes == 45  # inherited
+    resolved = config_version.resolve(cat)
+    assert resolved["os.pull_requests.recompute_stall_minutes"] == 45
+    assert resolved["projects.a.pull_requests.recompute_stall_minutes"] == 10
+
+
+def test_a_zero_recompute_stall_threshold_is_refused_rather_than_clamped():
+    """Zero would call every fresh UNKNOWN a stall, which kn-5e93939e says is the normal
+    state right after a push."""
+    for bad in (0, -1):
+        with pytest.raises(
+                CatalogError,
+                match="os.pull_requests.recompute_stall_minutes must be >= 1"):
+            parse_catalog({"os": {"pull_requests": {"recompute_stall_minutes": bad}},
+                           "projects": []})
+
+
+def test_the_shipped_recompute_stall_default_is_thirty_minutes():
+    """Neo question 1830."""
+    assert jarvis.catalog.DEFAULT_PULL_REQUESTS_RECOMPUTE_STALL_MINUTES == 30

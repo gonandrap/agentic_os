@@ -299,6 +299,36 @@ def test_the_work_order_page_says_the_spans_stop_short_of_the_status(client, pro
     assert ops.SPANS_BEHIND_NOTE.replace("'", "&#39;") in page.text
 
 
+# -- 3b. the scheduled actor, beside `waiting on` -------------------------------------
+# Section 8 of docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md.
+
+def test_the_diagnosis_panel_names_the_pass_that_will_act(client, dispatched):
+    store, wo_id = dispatched["store"], dispatched["wo_id"]
+    actor = ops.scheduled_actor(store, store.get_work_order(wo_id))
+    assert actor is not None, "the premise: this row HAS a daemon pass coming for it"
+
+    page = client.get(f"/wo/proj_a/{wo_id}/debug").text
+
+    assert actor.pass_name in page
+    assert actor.predicate in page
+    assert actor.why in page
+    assert page.index("waiting on") < page.index(actor.pass_name)
+
+
+def test_the_diagnosis_panel_says_when_no_pass_will_act(client, project):
+    wo = ops.create_work_order("proj_a", "nobody is coming")
+    store = ProjectStore(project)
+    try:
+        store.set_status(wo["id"], "needs_review")
+        assert ops.scheduled_actor(store, store.get_work_order(wo["id"])) is None
+    finally:
+        store.close()
+
+    page = client.get(f"/wo/proj_a/{wo['id']}/debug").text
+
+    assert "no daemon pass will act on this order" in page
+
+
 # -- 4. absent is never zero (issue #227) ---------------------------------------------
 
 def test_an_order_with_no_session_says_so_instead_of_reporting_zeroes(client):

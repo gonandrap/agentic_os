@@ -682,6 +682,18 @@ def test_the_planner_is_told_to_navigate_specs_rather_than_read_them():
         assert command in p
 
 
+def test_the_planner_briefing_names_wo_finish_as_the_redelivery():
+    """§5 of docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md:
+    `jarvis fo plan` is still the FIRST delivery's finish, and a resubmission after a
+    refusal would replace the plan — so the re-delivery is `jarvis wo finish`."""
+    p = _planner_prompt()
+
+    assert "`jarvis fo plan fo-1 --from-file <file>` IS your finish" in p
+    assert "Do not run `jarvis wo finish`" not in p
+    assert "jarvis wo finish" in p
+    assert "does not touch" in p
+
+
 def test_the_common_briefing_tail_reaches_the_posture_through_worker_brief():
     """No duplicated prose in `_common_briefing`: it composes
     `worker_brief.navigation_section`, so asserting the tail carries the posture also

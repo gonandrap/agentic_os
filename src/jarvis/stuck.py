@@ -43,10 +43,12 @@ IDLE_MANAGER_CAUSE = "its feature's next message"
 #: §1 of docs/superpowers/specs/2026-10-14-a-worker-turn-in-flight-is-not-stuck.md.
 TURN_IN_FLIGHT_CAUSE = "a worker turn is in flight"
 
-#: §1 of docs/superpowers/specs/2026-10-15-a-plan-held-child-is-not-stuck.md. The ONE
-#: definition of the cause in the codebase; `automerge.HELD_PLAN_ASSUMPTIONS` is an alias
-#: of it, `IDLE_MANAGER_CAUSE`'s move.
-PLAN_ASSUMPTIONS_CAUSE = "plan_assumptions"
+#: §1 of docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md.
+BASE_RED_CAUSE = "the default branch is red"
+
+#: §2.1 of docs/superpowers/specs/2026-10-15-a-child-held-by-its-features-unratified-
+#: plan-is-not-stuck.md.
+PLAN_ASSUMPTION_CAUSE = "its feature's unratified plan"
 
 #: One sentence per cause, because the shipped one is false for both of the above: an
 #: exempt kind never clears, and a manager's hold clears when its feature speaks rather
@@ -61,11 +63,16 @@ EXCLUSION_REASON: Mapping[str, str] = {
     TURN_IN_FLIGHT_CAUSE: ("a worker turn is in flight and writes nothing to the "
                            "timeline while its tools run — it clears by itself when the "
                            "turn ends, so nothing is judged while it does"),
-    # §2 of docs/superpowers/specs/2026-10-15-a-plan-held-child-is-not-stuck.md: the
-    # default sentence is FALSE here — this hold does not clear by itself.
-    PLAN_ASSUMPTIONS_CAUSE: ("its feature's plan is still waiting on a ruling, so the "
-                             "claim passes this child over by design — the decision is "
-                             "owed on the planner, where it is flagged"),
+    BASE_RED_CAUSE: ("the OS is holding this merge itself: the default branch's own build "
+                     "is broken and nothing merges onto a red base — it clears when the "
+                     "base goes green, with no decision from you, so nothing is judged "
+                     "while that is true"),
+    # §2.1: the shipped sentence is FALSE here — a person ruling on the planner's
+    # assumptions is the only thing that clears this, so the sentence names that move.
+    PLAN_ASSUMPTION_CAUSE: ("this child is withheld from dispatch until its feature's "
+                            "plan is ratified, and only you can ratify it — "
+                            "`jarvis wo review <planner-id>` on the feature's planner "
+                            "is what clears it, so nothing is judged while it stands"),
 }
 
 #: The usage window's sentence, and the answer for any hold added later: all five of §2's
@@ -126,31 +133,23 @@ def assess(status: str, seconds_in_status: float, seconds_since_activity: float,
 
     `excluded_cause` short-circuits to `stuck=False`. §2: the account's usage window, a
     live `jarvis pause`, the post-reopen ramp, a live blocking dependency
-    (`LIVE_DEPENDENCY`), a validation round held for GitHub's checks
-    (`project_store.VALIDATION_CI_CAUSE`) and a child of a feature whose plan is
-    unratified (`PLAN_ASSUMPTIONS_CAUSE`), because nothing is wrong in any of those cases
-    — so an investigation would buy a session to be told the OS is working as designed.
-    `exempt_kinds` and `by_design_idle` exclude too (§1, §2.2 of the 2026-10-12 spec), as
-    does a worker whose turn is in flight — it writes nothing to the timeline while its
-    tools run (§1 of the 2026-10-14 spec).
-
-    ALL BUT ONE OF THEM RESUME BY THEMSELVES, and the exception is the plan hold: it
-    clears when a PERSON runs `jarvis wo review` on the planner. It is excluded anyway, on
-    a different ground, and that ground is the whole of the extension — §6 of
-    docs/superpowers/specs/2026-10-15-a-plan-held-child-is-not-stuck.md: the decision is
-    owed on the PLANNER, which is flagged, and the child being judged carries no decision
-    of its own. A hold on the order that owes the action stays judged, which is why
-    `VALIDATION_AUTH_CAUSE` is still absent — a human running `/login` clears it, on the
-    order under judgement.
+    (`LIVE_DEPENDENCY`) and a validation round held for GitHub's checks
+    (`project_store.VALIDATION_CI_CAUSE`), because nothing is wrong in those cases and all
+    five resume by themselves — so an investigation would buy a session to be told the OS
+    is working as designed. `exempt_kinds` and `by_design_idle` exclude too (§1, §2.2 of
+    the 2026-10-12 spec), as does a worker whose turn is in flight — it writes nothing to
+    the timeline while its tools run (§1 of the 2026-10-14 spec). So does a
+    `waiting_pr_merge` order whose auto-merge the OS is itself holding because the default
+    branch is red (`BASE_RED_CAUSE`, §1 of
+    docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md).
 
     That CI one is an EXTENSION of kn-6e836793 (the user's 2026-09-27 ruling that the
     usage hold was the only one) on the record rather than a silent widening — the
     "Reconciliation with the standing ruling" section of
     docs/superpowers/specs/2026-10-12-a-validation-round-waiting-for-ci-is-not-stuck.md.
     It passes the same two tests as a usage window: the OS is deliberately not acting,
-    and the hold clears with NO user decision in the loop. The plan hold is the second
-    such extension, recorded in the same way (kn-6e836793, kn-fe8f7d5b and the 2026-10-15
-    spec's "Reconciliation with the standing rulings").
+    and the hold clears with NO user decision in the loop. Any hold failing either test
+    stays judged — the auth hold does, because a human running `/login` is what clears it.
 
     `kind`, `exempt_kinds` and `by_design_idle` are the 2026-10-12 spec's: `status` cannot
     express "nothing is expected to happen here until somebody speaks to it", and a

@@ -837,3 +837,102 @@ def test_the_staged_marker_records_the_base(tmp_path):
                  "--base", base, "0.2.0")
     assert r.returncode == 0, r.stdout + r.stderr
     assert base in r.stdout
+
+
+# -- the telegram notify says WHY it failed --------------------------------------
+#
+# The 0.11.8 release printed "telegram: notified" and delivered nothing: without -f,
+# curl exits 0 on HTTP 401, and stderr went to /dev/null so the cause was gone too.
+# Sliced out of the real script for the same reason as the lock guard above — a copy
+# keeps passing after the original changes.
+
+_TELEGRAM_START = "# >>> telegram-notify"
+_TELEGRAM_END = "# <<< telegram-notify"
+
+#: The token is in the URL, so it reaches curl's stderr. Distinctive enough that a
+#: leak anywhere in the output is unmistakable.
+_FAKE_TOKEN = "123456:AAHfake-bot-token-value"
+
+
+def _telegram_source() -> str:
+    text = SHIPIT.read_text()
+    start, end = text.find(_TELEGRAM_START), text.find(_TELEGRAM_END)
+    assert start >= 0, f"{_TELEGRAM_START} missing from scripts/shipit.sh"
+    assert end > start, f"{_TELEGRAM_END} missing or misplaced in scripts/shipit.sh"
+    return text[start:end]
+
+
+def _run_notify(tmp_path: Path, fake_curl: str) -> subprocess.CompletedProcess[str]:
+    """Run the sliced function with `fake_curl` as the body of a curl on PATH."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    curl = bin_dir / "curl"
+    curl.write_text("#!/usr/bin/env bash\n" + fake_curl)
+    curl.chmod(curl.stat().st_mode | stat.S_IEXEC)
+    secrets = tmp_path / "prod.env"
+    secrets.write_text(
+        f"JARVIS_TELEGRAM_TOKEN={_FAKE_TOKEN}\nJARVIS_TELEGRAM_CHAT_ID=4242\n")
+    script = (
+        "set -euo pipefail\n"
+        "say() { printf '%s\\n' \"$*\"; }\n"
+        "run() { printf 'would: %s\\n' \"$*\"; }\n"
+        "DRY_RUN=0\n"
+        "TAG=jarvis-0.2.0\n"
+        f"PROD_DIR='{tmp_path / 'prod'!s}'\n"
+        f"PROD_SECRETS='{secrets!s}'\n"
+        + _telegram_source()
+        + "\nrc=0; notify_telegram || rc=$?; printf 'rc=%s\\n' \"$rc\"\n"
+    )
+    env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+    return subprocess.run([BASH, "-c", script], capture_output=True, text=True, env=env)
+
+
+def test_notify_reports_a_curl_failure_with_its_exit_code_and_stderr(tmp_path):
+    r = _run_notify(tmp_path, 'echo "curl: (28) Operation timed out" >&2\nexit 28\n')
+    out = r.stdout + r.stderr
+    assert "curl exit 28" in out, out
+    assert "Operation timed out" in out, out
+    assert "rc=0" in out, "the notify is best-effort — it must never fail the release"
+
+
+def test_notify_reports_an_http_error_with_telegrams_description(tmp_path):
+    r = _run_notify(
+        tmp_path,
+        'printf \'{"ok":false,"description":"Unauthorized"}\\n401\\n\'\nexit 0\n')
+    out = r.stdout + r.stderr
+    assert "HTTP 401" in out, out
+    assert "Unauthorized" in out, out
+    assert "notified" not in out, out
+    assert r.returncode == 0, out
+    assert "rc=0" in out, out
+
+
+def test_notify_treats_http_200_with_ok_false_as_a_failure(tmp_path):
+    """The exact shape that shipped silently: 200 OK, nothing delivered."""
+    r = _run_notify(
+        tmp_path,
+        'printf \'{"ok":false,"description":"chat not found"}\\n200\\n\'\nexit 0\n')
+    out = r.stdout + r.stderr
+    assert "chat not found" in out, out
+    assert "notified" not in out, out
+    assert "rc=0" in out, out
+
+
+def test_notify_reports_success_on_a_real_200(tmp_path):
+    r = _run_notify(tmp_path, 'printf \'{"ok":true,"result":{}}\\n200\\n\'\nexit 0\n')
+    out = r.stdout + r.stderr
+    assert "telegram: notified" in out, out
+    assert "failed" not in out, out
+
+
+def test_notify_never_echoes_the_bot_token(tmp_path):
+    """curl puts the whole URL in its stderr on a connection error, and the token is
+    in the URL. Printing the cause must not print the credential."""
+    r = _run_notify(
+        tmp_path,
+        'echo "curl: (6) Could not resolve host:'
+        f' https://api.telegram.org/bot{_FAKE_TOKEN}/sendMessage" >&2\nexit 6\n')
+    out = r.stdout + r.stderr
+    assert _FAKE_TOKEN not in out, out
+    assert "<redacted>" in out, out
+    assert "rc=0" in out, out
