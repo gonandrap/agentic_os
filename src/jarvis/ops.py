@@ -2976,7 +2976,8 @@ def assume(wo_id: str, content: str) -> dict[str, Any]:
     the row: the review packet is built long after the worker's worktree is gone, so a
     pointer resolved later would resolve to nothing (kn-924730d7). N sections ride in ONE
     labelled `spec_text` under the three existing columns (Neo ruling Q1883);
-    `spec_path`/`spec_which` are the FIRST reference's.
+    `spec_path`/`spec_which` are PARALLEL NEWLINE LISTS of all N in the same order, so no
+    reader of the pointer sees one reference out of N (user decision 2026-10-15).
     """
     from . import sections
     from .invariants import neo_reviews_later
@@ -2986,7 +2987,8 @@ def assume(wo_id: str, content: str) -> dict[str, Any]:
     store = ProjectStore(path)
     try:
         store.add_assumption(wo_id, content,
-                             **({"spec_path": cited[0][0], "spec_which": cited[0][1],
+                             **({"spec_path": "\n".join(p for p, _, _ in cited),
+                                 "spec_which": "\n".join(w for _, w, _ in cited),
                                  "spec_text": sections.label_sections(cited)}
                                 if cited else {}))
         if not neo_reviews_later(store, wo):

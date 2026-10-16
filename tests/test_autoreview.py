@@ -2546,20 +2546,51 @@ def test_an_assumption_that_cites_nothing_grows_no_second_block():
         assert CITED_HEADER not in packet
 
 
-def test_the_reference_line_counts_the_sections_when_more_than_one_was_cited():
-    """Q1883: no cardinality cap, so N sections ride in one labelled snapshot. One names
-    itself; N say how many are labelled below, each over its own `<path> § <which>:`."""
-    two = ("docs/a.md § 3:\n## 3. Errors\n\nThey raise.\n\n"
-           "docs/a.md § Data model:\n## Data model\n\nDicts.")
+TWO_CITED = ("docs/a.md § 3:\n## 3. Errors\n\nThey raise.\n\n"
+             "docs/b.md § Data model:\n## Data model\n\nDicts.")
+
+
+def test_the_reference_line_names_every_section_that_was_cited():
+    """User decision 2026-10-15: the pointer columns are parallel newline lists, so the
+    reference line names ALL N — no reference is invisible on it."""
     neo_ = FakeNeo(qrow())
 
-    autoreview.propose(SpecStore(), neo_, "p", CHILD, citing(spec_text=two),
+    autoreview.propose(SpecStore(), neo_, "p", CHILD,
+                       citing(spec_path="docs/a.md\ndocs/b.md",
+                              spec_which="3\nData model", spec_text=TWO_CITED),
                        [assumption()])
 
     (packet,) = neo_.asked
-    assert "— 2 sections, each labelled below" in packet
-    assert "docs/a.md § 3:" in packet and "docs/a.md § Data model:" in packet
+    assert "docs/a.md § 3; docs/b.md § Data model" in packet
+    assert "docs/a.md § 3:" in packet and "docs/b.md § Data model:" in packet
     assert "They raise." in packet and "Dicts." in packet
+
+
+def test_lists_of_different_length_say_so_instead_of_dropping_a_reference():
+    neo_ = FakeNeo(qrow())
+
+    autoreview.propose(SpecStore(), neo_, "p", CHILD,
+                       citing(spec_path="docs/a.md\ndocs/b.md", spec_which="3",
+                              spec_text=TWO_CITED),
+                       [assumption()])
+
+    (packet,) = neo_.asked
+    assert "docs/a.md § 3; docs/b.md § (no section named)" in packet
+    assert "2 paths recorded against 1 section names" in packet
+
+
+def test_the_truncation_note_repeats_every_cited_reference():
+    neo_ = FakeNeo(qrow())
+
+    autoreview.propose(SpecStore(), neo_, "p", CHILD,
+                       citing(spec_path="docs/a.md\ndocs/b.md",
+                              spec_which="3\nData model",
+                              spec_text="y" * 9000),
+                       [assumption()], cfg=ValidationConfig(assumption_spec_chars=100))
+
+    (packet,) = neo_.asked
+    assert ("of 9,000 chars; full section: "
+            "docs/a.md § 3; docs/b.md § Data model]") in packet
 
 
 # -- one budget, need-based, half as a FLOOR (Neo ruling Q1884) ------------------------

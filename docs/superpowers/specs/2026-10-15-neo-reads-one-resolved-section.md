@@ -120,6 +120,15 @@ columns `spec_path`, `spec_which` and `spec_text`, added through `ProjectStore`'
 NULL defaults — and **NULL on all three means "cited no section"**, which is what every row
 written before today says.
 
+**N references, three columns.** `spec_text` carries every resolved body, each under its own
+`<path> § <which>:` label; `spec_path` and `spec_which` are **parallel newline lists of ALL
+N in that same order**, line *i* of one pairing with line *i* of the other. One cited
+section is one line in each, byte-identical to a single value. The pointer must not
+describe one reference out of N — every reader of it sees and can validate all N — and that
+needs no fourth column and no JSON. `autoreview._cited_ref` reads the pair back and names
+every reference on the reference line, reporting a length disagreement rather than dropping
+a reference.
+
 **Why there and not at packet-build time.** The review packet is built long after the
 worker's worktree — the only tree the relative path was ever valid in — is gone. A pointer
 resolved at read time resolves to nothing. kn-924730d7: a value written once by one path
@@ -214,7 +223,8 @@ These are the work order's acceptance criteria.
    only the big one carries a truncation notice); both oversized (each trimmed, each
    announcing its cut). Assert on rendered text and on the truncation wording.
 5. **Two sections are not refused.** A `wo ask` text citing two sections resolves and both
-   ride — the pin against a cardinality cap being retrofitted (Q1883).
+   ride — the pin against a cardinality cap being retrofitted (Q1883). Both pointer columns
+   hold both references, and the reference line names both.
 6. **Plan review carries the outline.** `plans.build_plan_context` for a plan whose design
    doc has a distinctive body sentence contains every heading line and NOT that sentence,
    and keeps the "Do NOT open this path on disk" wording.

@@ -406,8 +406,9 @@ def test_two_cited_sections_both_resolve_in_both_verbs(dispatched, project):
 
 def test_assume_stores_every_cited_section_under_one_labelled_snapshot(dispatched,
                                                                       project):
-    """Q1883. Three columns, N sections: each body preceded by its own
-    `<path> § <which>:` line, `spec_path`/`spec_which` from the FIRST reference."""
+    """Q1883 + user decision 2026-10-15: three columns, N sections. Each body preceded by
+    its own `<path> § <which>:` line; the pointer columns are parallel newline lists of
+    ALL N, never the first alone."""
     daemon, wo = dispatched
     _doc(project)
 
@@ -418,8 +419,8 @@ def test_assume_stores_every_cited_section_under_one_labelled_snapshot(dispatche
         (row,) = store.all_assumptions(wo["id"])
     finally:
         store.close()
-    assert (row["spec_path"], row["spec_which"]) == (
-        "docs/superpowers/specs/exporter.md", "3")
+    assert row["spec_path"].splitlines() == ["docs/superpowers/specs/exporter.md"] * 2
+    assert row["spec_which"].splitlines() == ["3", "Data model"]
     assert "docs/superpowers/specs/exporter.md § 3:" in row["spec_text"]
     assert "docs/superpowers/specs/exporter.md § Data model:" in row["spec_text"]
     assert "An empty result set writes the header" in row["spec_text"]

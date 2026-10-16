@@ -1707,8 +1707,10 @@ ADDED_COLUMNS = {
         "objection_delivered_ts": "REAL",
         "objection_withdrawn_ts": "REAL",
         # THE SPEC SECTIONS THIS ASSUMPTION CITES — N of them under ONE labelled snapshot
-        # in `spec_text` (Neo ruling Q1883), `spec_path`/`spec_which` being the FIRST
-        # reference's — resolved at `ops.assume` time and snapshotted here. User decision
+        # in `spec_text` (Neo ruling Q1883), `spec_path`/`spec_which` being PARALLEL
+        # NEWLINE LISTS of all N in that same order, one line each, so the pointer never
+        # describes one reference out of N (user decision 2026-10-15) — resolved at
+        # `ops.assume` time and snapshotted here. User decision
         # 2026-10-14 (Neo learning #102): a reviewer is handed specific sections, never a
         # document, and `ops.SECTION_SNAPSHOT_CHARS` bounds their total. Stored rather than
         # re-resolved

@@ -76,6 +76,7 @@ import re
 import time
 from collections.abc import Collection
 from dataclasses import dataclass
+from itertools import zip_longest
 from typing import Any
 
 from . import specs
@@ -1638,20 +1639,31 @@ CITED_INTRO = ("The assumption above argues from this section. Where it settles 
                "assumption, rule on it and cite the section.")
 
 
+def _cited_ref(assumption: dict[str, Any]) -> str:
+    """Every reference the pointer columns name, read off them pairwise.
+
+    `spec_path`/`spec_which` are parallel newline lists in `spec_text`'s order, and ALL N
+    are named so none is invisible on the reference line (user decision 2026-10-15). A
+    length disagreement is reported, never crashed on and never silently dropped.
+    """
+    paths = (assumption.get("spec_path") or "").splitlines()
+    whichs = (assumption.get("spec_which") or "").splitlines()
+    refs = [f"{p or '(no path recorded)'} § {w or '(no section named)'}"
+            for p, w in zip_longest(paths, whichs, fillvalue="")]
+    ref = "; ".join(refs) or "(no path recorded) § (no section named)"
+    if len(paths) != len(whichs):
+        ref += (f" [{len(paths)} paths recorded against {len(whichs)} section names — "
+                f"the pairing above may be wrong]")
+    return ref
+
+
 def _cited_block(assumption: dict[str, Any], chars: int) -> str:
     """The sections the assumption cites, as `ops.assume` labelled them.
 
-    The reference line names the one section when one was cited, and counts them when
-    several were (Neo ruling Q1883): each body carries its own `<path> § <which>:` line.
+    Each body carries its own `<path> § <which>:` line (Neo ruling Q1883).
     """
-    from . import sections
-
     text = (assumption.get("spec_text") or "").strip()
-    labels = sections.labelled_sections(text)
-    ref = (f"{assumption.get('spec_path') or '(no path recorded)'} § "
-           f"{assumption.get('spec_which') or '(no section named)'}"
-           if len(labels) <= 1 else
-           f"{len(labels)} sections, each labelled below")
+    ref = _cited_ref(assumption)
     return f"{CITED_HEADING} — {ref}\n{CITED_INTRO}\n{_bounded(text, chars, ref)}"
 
 
