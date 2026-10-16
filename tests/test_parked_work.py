@@ -10,8 +10,8 @@ until the user typed. Two separate failures produced that, and each has a test h
   `STALE_FINISH_BLOCKER`, and the rule it must obey is that it rides BESIDE the older
   reason and never over it.
 * A work order the OS still calls `running` with a settled turn behind it had no check
-  at all: `running` was not in `BLOCKED_STATUSES`, so `true_blockers` never looked. That
-  is `PARKED_BLOCKER`.
+  at all: no branch of `true_blockers` looked at a `running` order. That is
+  `PARKED_BLOCKER`.
 
 The noise rule is the other half of the suite and most of its assertions: an order
 waiting on a dependency, a gate, Neo, a queued message, a scheduled retry or a turn in
@@ -250,8 +250,8 @@ def test_an_injected_session_is_never_parked(project):
 
 
 def test_the_reconciler_flags_a_parked_running_order(project, monkeypatch):
-    """`running` joined BLOCKED_STATUSES for this alone: without it the blocker is
-    derived correctly and then never surfaced."""
+    """INV-ATTENTION-MISSING must select `running` for this: a status it skips has its
+    blocker derived correctly and then never surfaced."""
     store = ProjectStore(project)
     restore = _rewind(monkeypatch, LONG_ENOUGH)
     wo = _parked_running(store)
