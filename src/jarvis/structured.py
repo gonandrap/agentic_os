@@ -161,6 +161,35 @@ def parse_json_object(raw: str) -> dict[str, Any] | None:
     return None
 
 
+def parse_json_objects(raw: str) -> list[dict[str, Any]]:
+    """Every successive top-level JSON OBJECT in `raw`, prose between them skipped.
+
+    `parse_json_object` refuses a reply carrying two of them, deliberately (see `_JSON_RE`),
+    and that refusal stays. This is the other reading of the same bytes, for a caller that
+    knows what two objects in one reply mean and can fold them itself — issue #1098, where
+    Neo put its `dispatch` in a second object and a settled answer escalated.
+
+    NO POLICY: nothing is merged, no field is privileged, and a reply with nothing to
+    decode is an empty list rather than an error. Arrays and scalars are not returned —
+    the scan starts at each `{` — and no repair is attempted, unlike `parse_json_object`:
+    a truncated last object is simply absent.
+    """
+    raw = raw or ""
+    decoder = json.JSONDecoder()
+    out: list[dict[str, Any]] = []
+    i = raw.find("{")
+    while i >= 0:
+        try:
+            data, end = decoder.raw_decode(raw, i)
+        except json.JSONDecodeError:
+            i = raw.find("{", i + 1)
+            continue
+        if isinstance(data, dict):
+            out.append(data)
+        i = raw.find("{", max(end, i + 1))
+    return out
+
+
 def coerce(raw: str, validate: Callable[[dict[str, Any]], Any],
            on_invalid: Callable[[str], Any] | None = None) -> Any:
     """Parse + validate a reply already in hand. `request`'s `attempts=1` body.
