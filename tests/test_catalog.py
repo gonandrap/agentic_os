@@ -233,8 +233,52 @@ def test_an_invalid_bash_first_names_the_key_and_the_valid_values():
         assert value in str(e.value)
 
 
+def test_cache_ttl_defaults_to_five_minutes_and_overrides_per_project():
+    """§1 of docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md: the
+    apparatus ships with the control arm, so nothing changes until a project opts in."""
+    from jarvis.catalog import DEFAULT_WORKER_CACHE_TTL, VALID_WORKER_CACHE_TTL
+
+    assert DEFAULT_WORKER_CACHE_TTL == "5m"
+    assert VALID_WORKER_CACHE_TTL == ("5m", "1h", "cli")
+
+    cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
+    assert cat.os.default_cache_ttl == "5m"
+    assert cat.projects[0].worker.cache_ttl == "5m"
+
+    cat = parse_catalog({
+        "os": {"defaults": {"cache_ttl": "1h"}},
+        "projects": [
+            {"name": "a", "path": "/tmp/a"},
+            {"name": "b", "path": "/tmp/b", "worker": {"cache_ttl": "cli"}},
+        ],
+    })
+    assert cat.os.default_cache_ttl == "1h"
+    assert cat.projects[0].worker.cache_ttl == "1h"     # inherits the fleet value
+    assert cat.projects[1].worker.cache_ttl == "cli"
+
+
+@pytest.mark.parametrize("value", ["5m", "1h", "cli"])
+def test_every_cache_ttl_value_parses(value):
+    cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a",
+                                       "worker": {"cache_ttl": value}}]})
+    assert cat.projects[0].worker.cache_ttl == value
+
+
+def test_an_invalid_cache_ttl_names_the_key_and_the_valid_values():
+    """The enum check IS the error message `jarvis config set` shows (spec §1)."""
+    with pytest.raises(CatalogError) as e:
+        parse_catalog({"projects": [{"name": "a", "path": "/x",
+                                     "worker": {"cache_ttl": "1 hour"}}]})
+    assert "worker.cache_ttl" in str(e.value)
+    for value in ("5m", "1h", "cli"):
+        assert value in str(e.value)
+
+
 @pytest.mark.parametrize("bad,msg", [
     ({"projects": "nope"}, "projects"),
+    ({"projects": [{"name": "a", "path": "/x", "worker": {"cache_ttl": "60m"}}]},
+     "cache_ttl"),
+    ({"os": {"defaults": {"cache_ttl": "2h"}}}, "os.defaults.cache_ttl"),
     ({"projects": [{"name": "a", "path": "/x", "worker": {"bash_first": "yes"}}]},
      "bash_first"),
     ({"os": {"defaults": {"bash_first": "on"}}}, "os.defaults.bash_first"),

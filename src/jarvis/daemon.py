@@ -6502,6 +6502,28 @@ class Daemon:
                 wo_id=tax.worst_id)
             log.info("[%s] %s: %s", project.name, kind, reason)
 
+    def _turn_arms(self, since: float) -> dict[str, list[tuple[float, float, str]]]:
+        """Every project's stamped turns, indexed by session id — spec §5 of
+        docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md.
+
+        FLEET-WIDE although `check_cache_ttl` runs for one project: the transcript scan is
+        fleet-wide, so an arm indexed per project would read every other project's
+        deliberate hour as a breach. An unreadable project is skipped and its turns fall
+        to `dispatched`, which is the safe direction.
+        """
+        index: dict[str, list[tuple[float, float, str]]] = {}
+        for project in self.catalog.projects:
+            if not project.path.is_dir():
+                continue
+            try:
+                rows = self.store_for(project).turn_arms(since)
+            except Exception:
+                log.exception("[%s] cache-TTL arms unreadable", project.name)
+                continue
+            for session_id, started_at, ended_at, arm in rows:
+                index.setdefault(session_id, []).append((started_at, ended_at, arm))
+        return index
+
     def check_cache_ttl(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Raise the fleet's remaining ONE-HOUR cache writes, split by who bought them.
 
@@ -6542,7 +6564,7 @@ class Daemon:
         days = cfg.alarm_cache_1h_window_days
         since = db.now() - days * 86_400
         try:
-            found = inspection.one_hour_writes(since)
+            found = inspection.one_hour_writes(since, arms=self._turn_arms(since))
         except OSError:  # a transcript tree that moved or is unreadable
             log.exception("[%s] the one-hour cache scan could not read transcripts",
                           project.name)

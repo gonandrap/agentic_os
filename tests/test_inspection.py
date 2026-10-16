@@ -1599,6 +1599,90 @@ def test_since_cuts_on_the_write_not_on_the_session(write_transcript):
     assert inspection.one_hour_writes(ALL_OF_IT)[0].foreign == 7_300
 
 
+def _arms(session: str, arm: str, *, start: float = -1.0,
+          end: float = 1e12) -> dict[str, list[tuple[float, float, str]]]:
+    return {session: [(start, end, arm)]}
+
+
+@pytest.mark.parametrize("arm", ["1h", "cli"])
+def test_an_hour_bought_on_purpose_is_deliberate_and_not_a_breach(write_transcript, arm):
+    """§5 of docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md: the
+    oracle is the per-turn stamp, so the OS stops accusing itself of a defect it was told
+    to have."""
+    write_transcript("armed", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        assistant_row(10, "m1", write=9_000, ttl_1h=9_000),
+    ])
+
+    (entry,) = inspection.one_hour_writes(ALL_OF_IT, arms=_arms("armed", arm))
+
+    assert (entry.deliberate, entry.dispatched, entry.foreign) == (9_000, 0, 0)
+    assert inspection.hour_alarms([entry], InspectConfig(), days=7) == []
+
+
+def test_the_same_write_on_the_five_minute_arm_is_still_a_breach(write_transcript):
+    """The real fault, and the reason the alarm is not suppressed while an arm runs: a 1h
+    write from a turn stamped `5m` is a plumbing mistake, and the experiment's window is
+    exactly when one is most likely."""
+    write_transcript("control", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        assistant_row(10, "m1", write=900_000, ttl_1h=900_000),
+    ])
+
+    (entry,) = inspection.one_hour_writes(ALL_OF_IT, arms=_arms("control", "5m"))
+
+    assert (entry.dispatched, entry.deliberate) == (900_000, 0)
+    (alarm,) = inspection.hour_alarms([entry], InspectConfig(), days=7)
+    assert alarm.kind == inspection.CACHE_1H_DISPATCHED_ALARM
+
+
+def test_an_unstamped_turn_is_dispatched_because_unknown_is_not_a_licence(
+        write_transcript):
+    """Both ways of having no stamp: no index at all, and an index with no interval
+    covering the write."""
+    write_transcript("unstamped", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        assistant_row(10, "m1", write=900_000, ttl_1h=900_000),
+    ])
+
+    (no_index,) = inspection.one_hour_writes(ALL_OF_IT)
+    (elsewhere,) = inspection.one_hour_writes(
+        ALL_OF_IT, arms=_arms("unstamped", "1h", start=5_000, end=6_000))
+
+    assert no_index.dispatched == 900_000 and no_index.deliberate == 0
+    assert elsewhere.dispatched == 900_000 and elsewhere.deliberate == 0
+
+
+def test_a_foreign_write_is_untouched_by_any_arm(write_transcript):
+    """A person's own `claude` is not an arm, so the foreign half and its remedy line are
+    the same whatever the stamp says (spec, out of scope)."""
+    write_transcript("typed", [
+        prompt_row(0, "have a look", sdk=False),
+        assistant_row(10, "m1", write=900_000, ttl_1h=900_000),
+    ])
+
+    (entry,) = inspection.one_hour_writes(ALL_OF_IT, arms=_arms("typed", "1h"))
+
+    assert (entry.foreign, entry.deliberate, entry.dispatched) == (900_000, 0, 0)
+    (alarm,) = inspection.hour_alarms([entry], InspectConfig(), days=7)
+    assert alarm.kind == inspection.CACHE_1H_FOREIGN_ALARM
+    assert inspection.REMEDY_LINE in alarm.reason
+
+
+def test_the_breach_alarm_names_the_arm_it_is_about_and_the_hour_bought_on_purpose():
+    """The reason can no longer claim every 1h write breaks a fleet-wide guarantee, and a
+    reader has to be able to see the deliberate total without being alarmed by it."""
+    found = [inspection.HourWrites(session_id="s", directory="-proj",
+                                   dispatched=900_000, deliberate=4_000_000,
+                                   first_ts=0.0, last_ts=0.0)]
+
+    (alarm,) = inspection.hour_alarms(found, InspectConfig(), days=7)
+
+    assert "5m" in alarm.reason, "which turns the breach is about"
+    assert "4,000,000" in alarm.reason, "the hour that WAS bought on purpose"
+    assert "claude_cli.cache_env" not in alarm.reason
+
+
 def test_the_biggest_offender_is_first(write_transcript):
     """The caller quotes the top of this list into an alarm, so the order is the ranking
     by what it cost rather than whatever the filesystem returned."""

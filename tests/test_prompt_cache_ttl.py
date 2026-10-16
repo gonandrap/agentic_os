@@ -18,9 +18,10 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import claude_cli
+from jarvis import claude_cli, dispatch
 
 FLAG = "FORCE_PROMPT_CACHING_5M"
+FLAG_1H = "ENABLE_PROMPT_CACHING_1H"
 
 #: The two functions in `claude_cli` allowed to start a `claude` process, because they
 #: are the two that apply `PROMPT_CACHE_5M_ENV`. A third would silently buy the 2x write.
@@ -40,8 +41,8 @@ def _no_inherited_flag(monkeypatch):
     inherits it and hands it to the fake `claude`, so every assertion below passes with
     the implementation deleted (verified by mutation; kn-95a32178).
     """
-    monkeypatch.delenv(FLAG, raising=False)
-    monkeypatch.delenv("ENABLE_PROMPT_CACHING_1H", raising=False)
+    for key in claude_cli.CACHE_TTL_KEYS:
+        monkeypatch.delenv(key, raising=False)
 
 
 # -- the seam ------------------------------------------------------------------------
@@ -74,6 +75,39 @@ def test_only_the_two_launchers_start_a_claude_process() -> None:
 def test_the_flag_value_is_one_the_cli_actually_parses() -> None:
     """The CLI accepts exactly 1/true/yes/on (kn-522c6103), and "y" is silently ignored."""
     assert claude_cli.PROMPT_CACHE_5M_ENV == {FLAG: "1"}
+
+
+def test_the_one_hour_key_and_value_are_the_ones_the_cli_parses() -> None:
+    """Same reason as the sibling above: a value the CLI does not parse fails SILENTLY.
+
+    `claude` 2.1.300 takes 1/true/yes/on, lowercased and trimmed, and reports
+    `reason:"enable_1h_env"` when this key buys the hour.
+    """
+    assert claude_cli.PROMPT_CACHE_1H_ENV_KEY == FLAG_1H
+    assert dispatch.cache_ttl_env("1h") == {FLAG_1H: "1"}
+
+
+def test_the_decision_owns_both_keys_and_nothing_else() -> None:
+    """`CACHE_TTL_KEYS` is what `spawn_turn` STRIPS from the ambient environment, so a
+    variable Jarvis does not own must never appear in it — spec §2."""
+    assert set(claude_cli.CACHE_TTL_KEYS) == {FLAG, FLAG_1H}
+
+
+# -- the three arms --------------------------------------------------------------------
+
+
+def test_the_five_minute_arm_is_todays_behaviour() -> None:
+    assert dispatch.cache_ttl_env("5m") == claude_cli.PROMPT_CACHE_5M_ENV
+
+
+def test_the_one_hour_arm_writes_no_five_minute_key() -> None:
+    """The 5m flag short-circuits the CLI's TTL decision before the 1h one is read, so an
+    arm that set both would be the control arm wearing a label."""
+    assert FLAG not in dispatch.cache_ttl_env("1h")
+
+
+def test_the_cli_arm_writes_nothing_at_all() -> None:
+    assert dispatch.cache_ttl_env("cli") == {}
 
 
 # -- precedence ------------------------------------------------------------------------
@@ -121,3 +155,35 @@ def test_a_worker_turn_carries_the_flag_in_its_environment_too(fake_claude, tmp_
     calls = fake_claude.wait_calls(lambda c: "-p" in c["argv"])
     assert calls, "the fake claude was never invoked"
     assert _cache_env(calls[-1]) == {FLAG: "1"}
+
+
+def _spawn_env(fake_claude, tmp_path, **kw) -> dict:
+    claude_cli.spawn_turn("hi", cwd=tmp_path, session_id="s-1",
+                          outfile=tmp_path / "o.json", errfile=tmp_path / "o.err", **kw)
+    calls = fake_claude.wait_calls(lambda c: "-p" in c["argv"])
+    assert calls, "the fake claude was never invoked"
+    return _cache_env(calls[-1])
+
+
+def test_no_caller_opinion_keeps_todays_environment(fake_claude, tmp_path,
+                                                    monkeypatch) -> None:
+    """`cache=None` is "no opinion" and must stay the 5m default — spec §3."""
+    monkeypatch.setenv(FLAG_1H, "1")
+    assert _spawn_env(fake_claude, tmp_path, cache=None) == {FLAG: "1"}
+
+
+def test_the_one_hour_arm_reaches_the_child_without_the_five_minute_key(
+        fake_claude, tmp_path, monkeypatch) -> None:
+    """The ambient 5m flag is set DELIBERATELY here: a daemon started from a Jarvis
+    worker carries it, and an arm that merely added its own key would run as 5m."""
+    monkeypatch.setenv(FLAG, "1")
+    assert _spawn_env(fake_claude, tmp_path,
+                      cache=dispatch.cache_ttl_env("1h")) == {FLAG_1H: "1"}
+
+
+def test_the_cli_arm_strips_the_ambient_flag_out_of_the_child(
+        fake_claude, tmp_path, monkeypatch) -> None:
+    """Trap 2 in one test: the variable is set in the parent and must be ABSENT from the
+    child, which is the only thing that makes `cli` an arm rather than a relabelled 5m."""
+    monkeypatch.setenv(FLAG, "1")
+    assert _spawn_env(fake_claude, tmp_path, cache=dispatch.cache_ttl_env("cli")) == {}

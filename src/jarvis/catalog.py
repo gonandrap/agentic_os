@@ -107,6 +107,17 @@ DEFAULT_WORKER_BASH_FIRST = "off"
 VALID_TOOL_SEARCH = ("off", "on", "cli")
 DEFAULT_WORKER_TOOL_SEARCH = "on"
 
+# WHICH PROMPT-CACHE TTL a worker TURN's writes are billed at. §1 of
+# docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md.
+#
+# `5m` forces FORCE_PROMPT_CACHING_5M (today's behaviour, the control arm), `1h` sets
+# ENABLE_PROMPT_CACHING_1H and no 5m key, `cli` writes nothing. DEFAULT `5m`: the fleet
+# arithmetic says do not switch (TTL-expiry 10.6% of cache writes against a 39.5%
+# break-even), and the worker-only number has never been measured because there was no
+# way to measure it. OS-side calls (`claude_cli._run`) are not an arm and never switch.
+VALID_WORKER_CACHE_TTL = ("5m", "1h", "cli")
+DEFAULT_WORKER_CACHE_TTL = "5m"
+
 # Whether `hooks.py_nav_decision` refuses a worker's source-navigating Bash call at a
 # `.py` path. §6 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md.
 #
@@ -489,6 +500,8 @@ class WorkerDefaults:
     bash_first: str = DEFAULT_WORKER_BASH_FIRST
     # Spec 2026-10-02-serena-the-cheap-path.md §4 — see VALID_TOOL_SEARCH.
     tool_search: str = DEFAULT_WORKER_TOOL_SEARCH
+    # Spec 2026-10-15-the-hour-on-worker-turns-only.md §1 — see VALID_WORKER_CACHE_TTL.
+    cache_ttl: str = DEFAULT_WORKER_CACHE_TTL
     # Spec 2026-10-02-serena-the-cheap-path.md §6 — see VALID_PY_NAV_HOOK.
     py_nav_hook: str = DEFAULT_WORKER_PY_NAV_HOOK
     # Spec 2026-10-06-navigate-specs-like-code.md §5 — see VALID_DOC_NAV_HOOK.
@@ -1872,6 +1885,8 @@ class OsConfig:
     default_bash_first: str = DEFAULT_WORKER_BASH_FIRST
     # Spec 2026-10-02-serena-the-cheap-path.md §4 — see VALID_TOOL_SEARCH.
     default_tool_search: str = DEFAULT_WORKER_TOOL_SEARCH
+    # Spec 2026-10-15-the-hour-on-worker-turns-only.md §1 — see VALID_WORKER_CACHE_TTL.
+    default_cache_ttl: str = DEFAULT_WORKER_CACHE_TTL
     # Spec 2026-10-02-serena-the-cheap-path.md §6 — see VALID_PY_NAV_HOOK.
     default_py_nav_hook: str = DEFAULT_WORKER_PY_NAV_HOOK
     # Spec 2026-10-06-navigate-specs-like-code.md §5 — see VALID_DOC_NAV_HOOK.
@@ -3077,6 +3092,8 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         default_permission_mode=defaults.get("permission_mode", DEFAULT_PERMISSION_MODE),
         default_bash_first=defaults.get("bash_first", DEFAULT_WORKER_BASH_FIRST),
         default_tool_search=defaults.get("tool_search", DEFAULT_WORKER_TOOL_SEARCH),
+        # Spec 2026-10-15-the-hour-on-worker-turns-only.md §1.
+        default_cache_ttl=defaults.get("cache_ttl", DEFAULT_WORKER_CACHE_TTL),
         # Spec 2026-10-02-serena-the-cheap-path.md §6.
         default_py_nav_hook=defaults.get("py_nav_hook", DEFAULT_WORKER_PY_NAV_HOOK),
         # Spec 2026-10-06-navigate-specs-like-code.md §5.
@@ -3142,6 +3159,10 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
     if os_cfg.default_tool_search not in VALID_TOOL_SEARCH:
         raise _err(f"os.defaults.tool_search {os_cfg.default_tool_search!r} not in "
                    f"{sorted(VALID_TOOL_SEARCH)}")
+    # Spec 2026-10-15-the-hour-on-worker-turns-only.md §1.
+    if os_cfg.default_cache_ttl not in VALID_WORKER_CACHE_TTL:
+        raise _err(f"os.defaults.cache_ttl {os_cfg.default_cache_ttl!r} not in "
+                   f"{sorted(VALID_WORKER_CACHE_TTL)}")
     # Spec 2026-10-02-serena-the-cheap-path.md §6.
     if os_cfg.default_py_nav_hook not in VALID_PY_NAV_HOOK:
         raise _err(f"os.defaults.py_nav_hook {os_cfg.default_py_nav_hook!r} not in "
@@ -3198,6 +3219,12 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         if tool_search not in VALID_TOOL_SEARCH:
             raise _err(f"project {name}: worker.tool_search {tool_search!r} not in "
                        f"{sorted(VALID_TOOL_SEARCH)}")
+        # Spec 2026-10-15-the-hour-on-worker-turns-only.md §1 — this message IS what
+        # `jarvis config set <project> worker.cache_ttl` shows.
+        cache_ttl = w.get("cache_ttl", os_cfg.default_cache_ttl)
+        if cache_ttl not in VALID_WORKER_CACHE_TTL:
+            raise _err(f"project {name}: worker.cache_ttl {cache_ttl!r} not in "
+                       f"{sorted(VALID_WORKER_CACHE_TTL)}")
         # Spec 2026-10-02-serena-the-cheap-path.md §6 — this message IS what
         # `jarvis config set <project> worker.py_nav_hook` shows.
         py_nav_hook = w.get("py_nav_hook", os_cfg.default_py_nav_hook)
@@ -3232,6 +3259,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
             permission_mode=pmode,
             bash_first=bash_first,
             tool_search=tool_search,
+            cache_ttl=cache_ttl,
             py_nav_hook=py_nav_hook,
             doc_nav_hook=doc_nav_hook,
             doc_read_limit_lines=doc_read_limit_lines,

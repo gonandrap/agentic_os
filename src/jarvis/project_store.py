@@ -1546,6 +1546,13 @@ ADDED_COLUMNS = {
         # "nothing was in the window"; `ops.context_report` renders that as a sentence
         # rather than an empty table (spec §5, forward-only).
         "context_json": "TEXT",
+        # WHICH CACHE-TTL ARM this turn was launched on (catalog.VALID_WORKER_CACHE_TTL).
+        # '' is "not recorded" — a turn that ran before this column existed — and is
+        # NEVER read as an arm: every such turn did run at 5m, but a reader that assumed
+        # it would be asserting a fact about a row that does not carry it. Per TURN and
+        # not per order, because the catalog can change between turns. §4 of
+        # docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md
+        "cache_ttl": "TEXT NOT NULL DEFAULT ''",
     },
     "validation_rounds": {
         # WHICH CONFIGURATION JUDGED THIS ROUND — a different question from the work
@@ -4712,18 +4719,19 @@ class ProjectStore:
 
     def create_turn(self, wo_id: str, kind: str, prompt: str,
                     msg_id: int | None = None, outfile: str = "",
-                    errfile: str = "") -> dict[str, Any]:
+                    errfile: str = "", cache_ttl: str = "") -> dict[str, Any]:
         """Open a turn row. Written BEFORE the process is spawned, so a turn can never
-        be running with nothing on record to reap it."""
+        be running with nothing on record to reap it — and so a turn can never run
+        unstamped with the cache-TTL arm it was launched on (see ADDED_COLUMNS)."""
         assert kind in TURN_KINDS, kind
         seq = self.conn.execute(
             "SELECT COALESCE(MAX(seq), 0) + 1 AS n FROM wo_turns WHERE wo_id=?", (wo_id,)
         ).fetchone()["n"]
         cur = self.conn.execute(
             """INSERT INTO wo_turns (wo_id, seq, kind, msg_id, prompt, started_at,
-                                     outfile, errfile)
-               VALUES (?,?,?,?,?,?,?,?)""",
-            (wo_id, seq, kind, msg_id, prompt, db.now(), outfile, errfile),
+                                     outfile, errfile, cache_ttl)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (wo_id, seq, kind, msg_id, prompt, db.now(), outfile, errfile, cache_ttl),
         )
         return self.get_turn(int(cur.lastrowid))  # type: ignore[arg-type,return-value]
 
@@ -4872,6 +4880,27 @@ class ProjectStore:
             "SELECT seq, started_at FROM wo_turns WHERE wo_id=? ORDER BY seq",
             (wo_id,)).fetchall()
         return [(int(r["seq"]), float(r["started_at"])) for r in rows]
+
+    def turn_arms(self, since: float) -> list[tuple[str, float, float, str]]:
+        """`(session_id, started_at, ended_at, cache_ttl)` per STAMPED turn since `since`.
+
+        The oracle `inspection.one_hour_writes` classifies a one-hour write against: a
+        transcript is keyed by session id, so the join to `work_orders` is what makes a
+        turn findable from one. A turn still running has no `ended_at` and gets `inf` — a
+        write happening now belongs to it. Unstamped turns are left out: '' is "not
+        recorded" and must fall to `dispatched`, never to an arm. §5 of
+        docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md
+        """
+        rows = self.conn.execute(
+            """SELECT w.session_id AS session_id, t.started_at AS started_at,
+                      t.ended_at AS ended_at, t.cache_ttl AS cache_ttl
+                 FROM wo_turns t JOIN work_orders w ON w.id = t.wo_id
+                WHERE t.cache_ttl != '' AND w.session_id IS NOT NULL
+                      AND t.started_at >= ?""",
+            (since,)).fetchall()
+        return [(str(r["session_id"]), float(r["started_at"]),
+                 float(r["ended_at"]) if r["ended_at"] is not None else float("inf"),
+                 str(r["cache_ttl"])) for r in rows]
 
     def recent_turns(self, wo_id: str, limit: int = 20) -> list[dict[str, Any]]:
         """The conversation's most recent turns, newest first.

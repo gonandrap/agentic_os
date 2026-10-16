@@ -240,6 +240,23 @@ def test_the_turn_in_a_unit_still_buys_the_five_minute_cache_write(
     assert calls[-1]["cache_env"] == {"FORCE_PROMPT_CACHING_5M": "1"}
 
 
+def test_the_cli_arm_puts_no_setenv_on_this_transport_either(
+        fake_claude, fake_systemd, tmp_path, monkeypatch) -> None:
+    """`systemd_units.run_prefix` builds `--setenv` from the same `env` dict, so the
+    `cli` arm's ABSENCE is the one thing that could survive the unit boundary unnoticed.
+    The flag is set in the parent deliberately: without that this asserts nothing
+    (spec §3, Trap 2).
+    """
+    monkeypatch.setenv("FORCE_PROMPT_CACHING_5M", "1")
+    unit = "jarvis-turn-wo-2-1.service"
+    _spawn(tmp_path, unit=unit, cache={})
+
+    setenv = fake_systemd.units[unit]["setenv"]
+    assert [k for k in claude_cli.CACHE_TTL_KEYS if k in setenv] == [], setenv
+    calls = fake_claude.wait_calls(lambda c: "-p" in c["argv"])
+    assert calls and calls[-1]["cache_env"] == {}
+
+
 def test_a_systemd_that_refuses_still_gets_the_turn_started(
         fake_claude, fake_systemd, tmp_path) -> None:
     """A transport problem must never be why the fleet stops dispatching."""

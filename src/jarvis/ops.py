@@ -13362,6 +13362,10 @@ APPLY_RULES: tuple[tuple[str, str], ...] = (
     # tool list cannot change mid-conversation. Spec §4:
     # docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md
     ("*.tool_search", "next-dispatch"),
+    # Read once per spawn into the worker's settings file, and a running worker's session
+    # already holds the environment it was launched with. §1:
+    # docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md
+    ("*.cache_ttl", "next-dispatch"),
     # Read once per spawn into the worker's settings file, which is where the hook reads
     # it. Spec §6: docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md
     ("*.py_nav_hook", "next-dispatch"),
@@ -14226,6 +14230,11 @@ def _turn_row(turn: dict[str, Any], u: dict[str, Any] | None) -> dict[str, Any]:
         # shows the number owes the reader which one it is (issue #471).
         "cost_source": turn.get("cost_source"),
         "recorded": u is not None,
+        # WHICH CACHE-TTL ARM this turn ran on, which is what makes the cache_1h /
+        # cache_5m columns below groupable. Outside the `u is not None` block: the arm is
+        # known even for a turn with no usage. '' is "not recorded", never an arm. §4 of
+        # docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md
+        "cache_ttl": turn.get("cache_ttl") or "",
         # Which message set this turn going, where one did. It is the join that lets a
         # message on the work order page show what answering it cost.
         "msg_id": turn.get("msg_id"),

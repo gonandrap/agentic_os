@@ -71,6 +71,22 @@ def bash_first_env(bash_first: str) -> dict[str, str]:
     return {BASH_FIRST_ENV: "true", BASH_FIRST_VARIANT_ENV: bash_first}
 
 
+def cache_ttl_env(cache_ttl: str) -> dict[str, str]:
+    """The env for one `worker.cache_ttl` value — spec §2 of
+    docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md.
+
+    STRINGS, every one, for `bash_first_env`'s reason. The key strings live in
+    `claude_cli` and are never spelled twice: the settings file and the spawn environment
+    must not be able to disagree. `cli` writes NOTHING, which is the CLI's own automatic
+    TTL; `1h` writes no 5m key, which would short-circuit it in the binary.
+    """
+    if cache_ttl == "cli":
+        return {}
+    if cache_ttl == "1h":
+        return {claude_cli.PROMPT_CACHE_1H_ENV_KEY: "1"}
+    return dict(claude_cli.PROMPT_CACHE_5M_ENV)
+
+
 # Whether Claude Code DEFERS MCP tools behind `ToolSearch` or lists them with full
 # schemas. §4 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md records the probes.
 TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
@@ -239,13 +255,14 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         # import `catalog` (see its module docstring).
         concision.STANDING_PROMPT_ENV: (wo.get("append_system_prompt")
                                         or project.worker.append_system_prompt or ""),
-        # Buy the 5-minute prompt cache (write 1.25x) instead of the 1-hour one (2x),
-        # which Claude Code would otherwise pick for a headless session. Taken from
-        # `claude_cli` rather than spelled again: the settings file and the spawn
-        # environment must not be able to disagree about what TTL Jarvis buys.
-        # Measurements and the reversal criteria: kn-f94abf34, and docs/superpowers/
-        # specs/2026-08-22-the-five-minute-write-everywhere.md.
-        **claude_cli.PROMPT_CACHE_5M_ENV,
+        # WHICH PROMPT-CACHE TTL THIS WORKER'S WRITES ARE BILLED AT — the project's
+        # `worker.cache_ttl` arm, default `5m` (write 1.25x rather than the 1-hour 2x).
+        # Resolved through `cache_ttl_env` rather than spelled again: the settings file
+        # and the spawn environment must not be able to disagree about what TTL Jarvis
+        # buys. Measurements and the reversal criteria: kn-f94abf34, docs/superpowers/
+        # specs/2026-08-22-the-five-minute-write-everywhere.md, and §2-§3 of
+        # docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md.
+        **cache_ttl_env(project.worker.cache_ttl),
         # WHAT A TURN IS, for every hook that would otherwise assume it. Taken from
         # `claude_cli` for the reason the cache flag above is: the launcher and the
         # settings file must not be able to disagree. §3 of docs/superpowers/specs/
