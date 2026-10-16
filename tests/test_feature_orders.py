@@ -858,7 +858,10 @@ def test_no_overtaken_note_when_no_child_has_merged(started, store):
 # COMMITTED copy for as long as the review is open (B).
 
 
-REVISED = FIXTURE_DESIGN_DOC_BODY.replace("Rows are dicts", "Rows are frozen records")
+#: A revision visible in the OUTLINE the review now carries (Neo ruling Q1880): a changed
+#: sentence is invisible there, so the revision adds a heading as well.
+REVISED = (FIXTURE_DESIGN_DOC_BODY.replace("Rows are dicts", "Rows are frozen records")
+           + "\n## Frozen records\n\nNew in the revision.\n")
 
 
 def git(repo, *args) -> None:
@@ -898,13 +901,15 @@ def plan_questions() -> list[dict]:
 
 
 def test_the_question_carries_the_spec_under_its_own_label(planning, store):
-    """1. The reviewer is handed the text, not the filename it used to go hunting for."""
+    """1. The reviewer is handed the spec's outline, not the filename it used to go
+    hunting for (Neo ruling Q1880: headings, no body text)."""
     _, fo = planning
 
     out = ops.submit_plan(fo["id"], a_plan(child("reader")))
 
     q = question(out["neo_question_id"])
-    assert "An empty result set writes the header" in q["context"]
+    assert "## 3. Failure handling" in q["context"]
+    assert "An empty result set writes the header" not in q["context"]
     assert "Do NOT open this path on disk" in q["context"]
     assert "Spec under review:" in neo_mod.build_question_prompt(q)
 
@@ -929,7 +934,7 @@ def test_a_spec_merged_after_submission_is_what_the_review_reads(planning, store
     assert question(old_qid)["answer"] == f"SUPERSEDED by question {old_qid + 1}"
     assert refreshed["plan_question_id"] == old_qid + 1
     new = question(refreshed["plan_question_id"])
-    assert "Rows are frozen records" in new["context"]
+    assert "## Frozen records" in new["context"]
     assert re.search(r"as committed on main @ [0-9a-f]{7}", new["context"])
     assert json.loads(refreshed["plan"])["design_doc_content"] == REVISED
 
@@ -946,8 +951,9 @@ def test_an_unmerged_revision_is_read_from_the_branch_never_from_main(planning, 
     daemon.tick()
 
     new = question(store.get_feature_order(fo["id"])["plan_question_id"])
-    assert "Rows are frozen records" in new["context"]
-    assert "Rows are dicts" not in new["context"]
+    assert "## Frozen records" in new["context"]      # the branch's copy
+    assert "## Frozen records" in REVISED and "## Frozen records" \
+        not in FIXTURE_DESIGN_DOC_BODY                # ...and main's older copy lacks it
     assert "as committed on branch feat/plan @ " in new["context"]
 
 
@@ -1080,9 +1086,10 @@ def test_a_revision_the_plan_no_longer_fits_goes_back_to_the_planner(planning, s
                                                              {})["reason"]
 
 
-def test_a_spec_over_the_bound_is_clipped_in_the_question_and_whole_in_the_plan(
+def test_the_question_carries_the_spec_outline_and_the_plan_the_whole_text(
         planning, store, project):
-    """11. Clipping is a rendering of the QUESTION. The children keep the whole text."""
+    """11, under Neo ruling Q1880: the question is an OUTLINE rendering. The children
+    keep the whole text."""
     _, fo = planning
     big = FIXTURE_DESIGN_DOC_BODY + "\n".join(
         f"\n## Padding {n}\n\n" + "x" * 4000 for n in range(40))
@@ -1091,8 +1098,8 @@ def test_a_spec_over_the_bound_is_clipped_in_the_question_and_whole_in_the_plan(
     out = ops.submit_plan(fo["id"], a_plan(child("reader")))
 
     q = question(out["neo_question_id"])
-    assert "TRUNCATED at " in q["context"]
-    assert "## Padding 39" in q["context"]     # the omitted headings, verbatim
+    assert "## Padding 0" in q["context"] and "## Padding 39" in q["context"]
+    assert "x" * 100 not in q["context"]       # every heading, no body prose
     assert len(q["context"]) < len(big)
     assert json.loads(store.get_feature_order(fo["id"])["plan"])["design_doc_content"] \
         == big

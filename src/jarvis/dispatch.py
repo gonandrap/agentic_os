@@ -746,7 +746,10 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"\"docs/superpowers/specs/feature.md\": …`), never by pasting it; the referenced section "
         f"is delivered to whoever answers automatically.",
         f"- `jarvis wo assume {wo['id']} \"...\"` for a call you made with NO doubt. "
-        f"Record every one, including the small ones.",
+        f"Record every one, including the small ones. Cite a spec BY SECTION in-text, "
+        f"the same shape (e.g. `from section 3 of design doc "
+        f"\"docs/superpowers/specs/feature.md\": …`), never by pasting it and never by "
+        f"naming a whole document.",
         f"- Work only inside your worktree (you start in it).",
         f"- File deferred work instead of leaving notes: `jarvis backlog add "
         f"{project.name} \"...\"` — including anything you decided was OUT of this "
@@ -951,7 +954,10 @@ def _analyst_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"{wo['id']} \"<your question>\"`, then END YOUR TURN; the answer arrives as your "
         f"next user turn, usually within a minute. The trigger is DOUBT, not importance.",
         f"- `jarvis wo assume {wo['id']} \"...\"` for a call you made with NO doubt. "
-        f"Record every one, including the small ones.",
+        f"Record every one, including the small ones. Cite a spec BY SECTION in-text "
+        f"(e.g. `from section 3 of design doc "
+        f"\"docs/superpowers/specs/feature.md\": …`), never by pasting it and never by "
+        f"naming a whole document.",
         "- Work only inside your worktree (you start in it).",
         *([f"- READ the OS knowledge base before you diagnose — it is indexed at the end "
            f"of this prompt, not pasted into it: `jarvis learn search \"<term>\" "
@@ -1133,7 +1139,8 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "are faster than grep.",
         "Writes — EXACTLY four, and nothing else is permitted:",
         f"- `jarvis wo ask {wo['id']} \"<question>\"`",
-        f"- `jarvis wo assume {wo['id']} \"<call you made with no doubt>\"`",
+        f"- `jarvis wo assume {wo['id']} \"<call you made with no doubt, citing any "
+        f"spec by section in-text>\"`",
         f"- `jarvis learn add \"...\" --project {project.name}`",
         f"- `jarvis investigate verdict {inv_id} --from-file verdict.json`",
         "**`jarvis bug report` and `jarvis issues start` are refused for this kind**, and "
@@ -1149,7 +1156,10 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"{wo['id']} \"<your question>\"`, then END YOUR TURN; the answer arrives as your "
         f"next user turn, usually within a minute. The trigger is DOUBT, not importance.",
         f"- `jarvis wo assume {wo['id']} \"...\"` for a call you made with NO doubt. "
-        f"Record every one, including the small ones.",
+        f"Record every one, including the small ones. Cite a spec BY SECTION in-text "
+        f"(e.g. `from section 3 of design doc "
+        f"\"docs/superpowers/specs/feature.md\": …`), never by pasting it and never by "
+        f"naming a whole document.",
         "- Work only inside your worktree (you start in it).",
         *([f"- READ the OS knowledge base before you diagnose — it is indexed at the end "
            f"of this prompt, not pasted into it: `jarvis learn search \"<term>\" "
@@ -1279,7 +1289,9 @@ def _manager_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"paragraph: the decision, the options, your recommendation.",
         f"- `jarvis wo assume {wo['id']} \"...\"` for a call you made with NO doubt. "
         f"Record every one: this work order's record is the only account anyone gets of "
-        f"why the feature changed shape.",
+        f"why the feature changed shape. Cite a spec BY SECTION in-text (e.g. `from "
+        f"section 3 of design doc \"docs/superpowers/specs/feature.md\": …`), never by "
+        f"pasting it and never by naming a whole document.",
         "- Do not run `jarvis wo finish` and do not open a pull request. Neither applies "
         "to you.",
         f"- Read what the fleet already knows before you decide anything: `jarvis learn "

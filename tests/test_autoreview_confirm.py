@@ -1102,6 +1102,10 @@ def test_a_change_that_is_only_a_huge_document_is_confirmed_rather_than_held(sta
 
     Nothing is trimmed any more, so the question is FILED. Driven through the daemon's
     ask pass, which is where the hold used to be written.
+
+    The sentence no longer NAMES the document: `jarvis wo assume` refuses a `.md` path
+    with no section since the user decision of 2026-10-14 (Neo learning #102). The live
+    case is the DIFF being one huge document, which is what `only_a_doc` still builds.
     """
     spec_body = "spec line that says something about the change\n" * 420
     assert len(spec_body) > 19_000, "not the live case: the document is too small"
@@ -1112,7 +1116,7 @@ def test_a_change_that_is_only_a_huge_document_is_confirmed_rather_than_held(sta
 
     store, wo = with_diff(
         started, files=only_a_doc,
-        assumptions=("wrote the wording of docs/spec.md myself",))
+        assumptions=("wrote the wording of the new spec document myself",))
     provisional(store, wo)
 
     ask(started, store)

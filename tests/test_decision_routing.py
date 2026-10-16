@@ -99,6 +99,28 @@ def test_contract_preempts_the_rationalisations_for_guessing(contract: str) -> N
         assert excuse in contract, f"unaddressed rationalisation: {excuse!r}"
 
 
+#: The ONE spelling of a spec citation — `sections.REF_RE`'s in-text form, as the
+#: `jarvis wo ask` guidance already teaches it. There is no `--section` flag.
+SECTION_FORM = 'section 3 of design doc "docs/superpowers/specs/feature.md"'
+
+
+@pytest.mark.parametrize("kind", ["planner", "analyst", "investigator", "manager"])
+def test_every_kinds_assume_line_cites_a_spec_by_section(kind, catalog_file) -> None:
+    """User decision 2026-10-14 (Neo learning #102): an assumption cites ONE section of a
+    spec in-text. Never a pasted document, never a whole document named."""
+    spec = load_catalog(catalog_file).projects[0]
+    prompt = build_worker_prompt({"id": "wo-k", "title": "t", "description": "d",
+                                  "kind": kind, "parent_id": "fo-1"}, spec,
+                                 knowledge=[])
+
+    lines = [ln for ln in prompt.splitlines() if "`jarvis wo assume" in ln]
+    assert lines, f"no assume guidance in the {kind} prompt"
+    for line in lines:
+        assert "section" in line, line
+    assert any(SECTION_FORM in ln for ln in lines), lines
+    assert any("never by pasting" in ln for ln in lines), lines
+
+
 def test_operation_template_mirrors_the_contract() -> None:
     """dispatch.py briefs the worker; OPERATION.md is what a human (or an agent
     started outside the OS) reads. They must not drift apart."""

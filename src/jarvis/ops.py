@@ -2970,13 +2970,25 @@ def assume(wo_id: str, content: str) -> dict[str, Any]:
     THE FLAG IS NOT UNCONDITIONAL. `invariants.neo_reviews_later` is the same predicate
     `true_blockers` derives with, asked here so the write and the derivation cannot
     disagree for the seconds before the next reconcile tick (issue #711).
+
+    An assumption may cite design-doc sections in-text, exactly as a question may
+    (`_section_blocks`, the shared resolver). They are resolved HERE and snapshotted on
+    the row: the review packet is built long after the worker's worktree is gone, so a
+    pointer resolved later would resolve to nothing (kn-924730d7). N sections ride in ONE
+    labelled `spec_text` under the three existing columns (Neo ruling Q1883);
+    `spec_path`/`spec_which` are the FIRST reference's.
     """
+    from . import sections
     from .invariants import neo_reviews_later
 
     name, path, wo = find_work_order(wo_id)
+    cited = _section_blocks(path, wo, content)
     store = ProjectStore(path)
     try:
-        store.add_assumption(wo_id, content)
+        store.add_assumption(wo_id, content,
+                             **({"spec_path": cited[0][0], "spec_which": cited[0][1],
+                                 "spec_text": sections.label_sections(cited)}
+                                if cited else {}))
         if not neo_reviews_later(store, wo):
             store.flag_attention(wo_id, "assumptions pending review")
     finally:
@@ -10927,16 +10939,12 @@ def resume_feature_order(fo_id: str, fix: str = "",
 SECTION_SNAPSHOT_CHARS = 6000
 
 
-def _resolve_section(path: Path, wo: dict[str, Any], ref_path: str,
-                     which: str) -> str | None:
-    """The referenced section's text, read from wherever this worker can see the file.
+def _section_candidates(path: Path, wo: dict[str, Any], ref_path: str) -> list[Path]:
+    """Every place this worker could be naming, in order of authority.
 
-    Tried in the order the file is most likely to be authoritative: the worker's own
-    worktree, the project tree, then the materialised feature snapshot under
-    `.jarvis/features/` (where dispatch puts a parent feature's design document).
+    Split out of `_resolve_section` so a refusal can tell "no such file" from "no such
+    heading" without a second list that could disagree with the resolver's.
     """
-    from . import sections
-
     candidates = []
     if Path(ref_path).is_absolute():
         candidates.append(Path(ref_path))
@@ -10947,7 +10955,20 @@ def _resolve_section(path: Path, wo: dict[str, Any], ref_path: str,
         if wo.get("parent_id"):
             candidates.append(path / ".jarvis" / "features" / wo["parent_id"]
                               / Path(ref_path).name)
-    for candidate in candidates:
+    return candidates
+
+
+def _resolve_section(path: Path, wo: dict[str, Any], ref_path: str,
+                     which: str) -> str | None:
+    """The referenced section's text, read from wherever this worker can see the file.
+
+    Tried in the order the file is most likely to be authoritative: the worker's own
+    worktree, the project tree, then the materialised feature snapshot under
+    `.jarvis/features/` (where dispatch puts a parent feature's design document).
+    """
+    from . import sections
+
+    for candidate in _section_candidates(path, wo, ref_path):
         if candidate.is_file():
             section = sections.extract_section(candidate.read_text(), which)
             if section is not None:
@@ -10957,6 +10978,49 @@ def _resolve_section(path: Path, wo: dict[str, Any], ref_path: str,
                                  f"{SECTION_SNAPSHOT_CHARS} characters]")
                 return section
     return None
+
+
+#: The in-text form, shown in every refusal below. There is no `--section` flag: the
+#: reference lives inside the sentence (`sections.REF_RE`), and this is its one spelling.
+SECTION_FORM_HINT = 'from section 3 of design doc "docs/superpowers/specs/feature.md": …'
+
+
+def _section_blocks(path: Path, wo: dict[str, Any],
+                    text: str) -> list[tuple[str, str, str]]:
+    """Every design-doc section this text cites, resolved: `(path, which, section)`.
+
+    Both `jarvis wo ask` and `jarvis wo assume` resolve through here, so the two verbs
+    cannot drift — user decision 2026-10-14 (Neo learning #102): Neo never receives a
+    full spec, only pointers to specific sections, resolved to those sections' text.
+
+    NO CARDINALITY CAP (Neo ruling Q1883): `validation.assumption_spec_chars` bounds the
+    text, never a count of sections. Two refusals, and each leaves the caller a move: a
+    document named with no section (nothing to resolve), and a reference that does not
+    resolve (the whole file is never substituted, and it is never silently dropped).
+    """
+    from . import sections
+
+    refs = sections.find_refs(text)
+    bare = sections.unreferenced_docs(text)
+    if bare:
+        raise OpsError(
+            f"that text names {bare[0]!r} without naming a section of it, so there is "
+            f"nothing to resolve. Cite the section in the sentence — "
+            f"`{SECTION_FORM_HINT}` — and that section alone is delivered.")
+    out = []
+    for ref_path, which in refs:
+        section = _resolve_section(path, wo, ref_path, which)
+        if section is None:
+            exists = any(c.is_file() for c in _section_candidates(path, wo, ref_path))
+            why = (f"that document has no such heading — `jarvis spec toc {ref_path}` "
+                   f"lists the ones it has"
+                   if exists else
+                   "no such file in your worktree or the project tree — check the path")
+            raise OpsError(f"section {which!r} of {ref_path!r} does not resolve: {why}. "
+                           f"The section is what Neo reads, so nothing is recorded until "
+                           f"the reference resolves.")
+        out.append((ref_path, which, section))
+    return out
 
 
 def ask_question(wo_id: str, question: str, project_name: str | None = None) -> dict[str, Any]:
@@ -10970,9 +11034,9 @@ def ask_question(wo_id: str, question: str, project_name: str | None = None) -> 
     (`from section 3 of design doc "docs/superpowers/specs/x.md"`). The reference is resolved HERE,
     at ask time: the section — and only the section — is snapshotted into the question's
     context, so Neo reads exactly the design context the paragraph argues from while the
-    recorded question stays a paragraph.
+    recorded question stays a paragraph. A reference that does not resolve and a document
+    named with no section are both REFUSALS — see `_section_blocks`.
     """
-    from . import sections
     from .neo_store import NeoStore
 
     if len(question) > QUESTION_MAX_CHARS:
@@ -10987,13 +11051,8 @@ def ask_question(wo_id: str, question: str, project_name: str | None = None) -> 
 
     name, path, wo = find_work_order(wo_id, project_name)
     context = f"{wo['title']}\n{(wo.get('description') or '')[:800]}"
-    for ref_path, which in sections.find_refs(question):
-        section = _resolve_section(path, wo, ref_path, which)
-        if section is not None:
-            context += f"\n\nReferenced artifact — {ref_path} § {which}:\n{section}"
-        else:
-            context += (f"\n\n(the question references {ref_path!r} section {which!r}, "
-                        f"which could not be resolved — no such file or section)")
+    for ref_path, which, section in _section_blocks(path, wo, question):
+        context += f"\n\nReferenced artifact — {ref_path} § {which}:\n{section}"
     neo = NeoStore()
     try:
         q = neo.ask(name, wo_id, question, context=context)

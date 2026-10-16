@@ -69,6 +69,24 @@ def test_assumptions_flow(project):
     assert store.pending_assumptions(wo["id"]) == []
 
 
+def test_add_assumption_still_takes_two_positional_arguments(project):
+    """The cited-section columns are OPTIONAL keywords: every existing caller — the CLI,
+    `invariants.check_assumptions_persisted`, the screenshot scripts — keeps working and
+    writes NULL, which reads as "cited no section"."""
+    store = ProjectStore(project)
+    wo = store.create_work_order("x")
+
+    store.add_assumption(wo["id"], "assumed sqlite")
+    store.add_assumption(wo["id"], "errors raise", spec_path="docs/x.md",
+                         spec_which="3", spec_text="## 3. Errors\n\nThey raise.")
+
+    plain, cited = store.all_assumptions(wo["id"])
+    assert (plain["spec_path"], plain["spec_which"], plain["spec_text"]) == (None,) * 3
+    assert cited["spec_path"] == "docs/x.md" and cited["spec_which"] == "3"
+    assert "They raise." in cited["spec_text"]
+    store.close()
+
+
 def test_assumptions_are_numbered_from_one_per_work_order(project):
     """`n` is what the timeline says instead of repeating the text, so it has to be a
     POSITION within this work order — a row id would start the second work order's list

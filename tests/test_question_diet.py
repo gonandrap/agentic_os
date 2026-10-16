@@ -139,6 +139,13 @@ def test_plan_reviewer_persona_no_longer_judges_text_it_does_not_receive():
     assert "It is what was asked for" in plans.PLAN_REVIEWER_PERSONA
 
 
+def test_the_persona_describes_the_outline_the_question_actually_carries():
+    """Q1880: the question carries the spec's heading outline, so the persona must not
+    promise spec text or a truncation marker that can no longer appear."""
+    assert "HEADING OUTLINE" in plans.PLAN_REVIEWER_PERSONA
+    assert "TRUNCATED" not in plans.PLAN_REVIEWER_PERSONA
+
+
 # -- P2: the design document is first-class ---------------------------------------------
 
 
@@ -242,6 +249,29 @@ def test_find_refs_reads_the_documented_shapes():
     assert sections.find_refs("no references here") == []
 
 
+def test_unreferenced_docs_are_the_md_paths_no_reference_covers():
+    covered = ('From section 3 of design doc "docs/superpowers/specs/exporter.md": '
+               'docs/superpowers/specs/exporter.md says errors raise.')
+    assert sections.unreferenced_docs(covered) == []
+    bare = "I read docs/superpowers/specs/exporter.md and went with CSV."
+    assert sections.unreferenced_docs(bare) == ["docs/superpowers/specs/exporter.md"]
+    # Only markdown, and only once per path.
+    assert sections.unreferenced_docs("edited src/jarvis/ops.py and tests/t.py") == []
+    assert sections.unreferenced_docs("a.md, a.md and b.md") == ["a.md", "b.md"]
+
+
+def test_heading_outline_is_every_heading_line_and_nothing_else():
+    """Neo ruling Q1880: a structural fingerprint for plan review. Same matcher
+    (`HEADING_RE`) as `find_heading`, so the outline and a resolved section agree."""
+    outline = sections.heading_outline(DESIGN_DOC)
+
+    assert outline[:3] == ["# Exporter design", "## 1. Shape", "## 2. Data model"]
+    assert outline == [f"{m.group(1)} {m.group(2)}"
+                       for m in sections.HEADING_RE.finditer(DESIGN_DOC)]
+    assert "The exporter is one module with one entry point." not in outline
+    assert sections.heading_outline("prose with no heading at all") == []
+
+
 def test_extract_section_by_number_and_name():
     by_number = sections.extract_section(DESIGN_DOC, "3")
     assert by_number is not None
@@ -296,18 +326,137 @@ def test_a_referenced_section_reaches_neo_and_the_rest_of_the_doc_does_not(
     assert "union of keys" not in q["context"]  # the rest of the doc stayed home
 
 
-def test_an_unresolvable_reference_still_asks_and_says_so(dispatched, project):
-    daemon, wo = dispatched
-    out = ops.ask_question(
-        wo["id"],
-        'From section 9 of design doc "docs/superpowers/specs/ghost.md": which default?')
+# -- one section, resolved or refused, for BOTH verbs ----------------------------------
+#
+# User decision 2026-10-14 (Neo learning #102): Neo never receives a full spec, only a
+# pointer to ONE specific section resolved to that section's text. A reference that does
+# not resolve is a REFUSAL, never a note in the context and never the whole file.
+
+
+def _doc(project):
+    doc = project / "docs" / "superpowers" / "specs" / "exporter.md"
+    doc.parent.mkdir(parents=True, exist_ok=True)
+    doc.write_text(DESIGN_DOC)
+    return doc
+
+
+def _nothing_recorded(project, wo_id):
     neo = NeoStore()
     try:
-        q = neo.get(1)
+        assert neo.get(1) is None
     finally:
         neo.close()
-    assert q is not None  # the ask went through
-    assert "could not be resolved" in q["context"]
+    store = ProjectStore(project)
+    try:
+        assert store.all_assumptions(wo_id) == []
+    finally:
+        store.close()
+
+
+def _both_verbs(wo_id):
+    return (lambda text: ops.ask_question(wo_id, text),
+            lambda text: ops.assume(wo_id, text))
+
+
+def test_an_unresolvable_reference_is_refused_in_both_verbs(dispatched, project):
+    """The file is missing, or the heading is. Either way the asker is told which, and
+    nothing is recorded: a silently dropped reference is a question argued from nothing."""
+    daemon, wo = dispatched
+    _doc(project)
+
+    for verb in _both_verbs(wo["id"]):
+        with pytest.raises(ops.OpsError, match="no such file"):
+            verb('From section 9 of design doc "docs/superpowers/specs/ghost.md": '
+                 'which default?')
+        with pytest.raises(ops.OpsError, match="no such heading"):
+            verb('From section "Nowhere at all" of design doc '
+                 '"docs/superpowers/specs/exporter.md": which default?')
+    _nothing_recorded(project, wo["id"])
+
+
+def test_a_document_named_with_no_section_is_refused_with_the_shape_named(dispatched,
+                                                                         project):
+    daemon, wo = dispatched
+    _doc(project)
+
+    for verb in _both_verbs(wo["id"]):
+        with pytest.raises(ops.OpsError, match="section 3 of design doc"):
+            verb("I read docs/superpowers/specs/exporter.md and went with CSV.")
+    _nothing_recorded(project, wo["id"])
+
+
+TWO_REFS = ('Errors raise per section 3 of design doc '
+            '"docs/superpowers/specs/exporter.md", and the header is the union of keys '
+            'per section "Data model" of design doc '
+            '"docs/superpowers/specs/exporter.md".')
+
+
+def test_two_cited_sections_both_resolve_in_both_verbs(dispatched, project):
+    """Neo ruling Q1883: NO cardinality cap. `validation.assumption_spec_chars` bounds the
+    text, never a count of sections."""
+    daemon, wo = dispatched
+    _doc(project)
+
+    for verb in _both_verbs(wo["id"]):
+        verb(TWO_REFS)
+
+
+def test_assume_stores_every_cited_section_under_one_labelled_snapshot(dispatched,
+                                                                      project):
+    """Q1883. Three columns, N sections: each body preceded by its own
+    `<path> § <which>:` line, `spec_path`/`spec_which` from the FIRST reference."""
+    daemon, wo = dispatched
+    _doc(project)
+
+    ops.assume(wo["id"], TWO_REFS)
+
+    store = ProjectStore(project)
+    try:
+        (row,) = store.all_assumptions(wo["id"])
+    finally:
+        store.close()
+    assert (row["spec_path"], row["spec_which"]) == (
+        "docs/superpowers/specs/exporter.md", "3")
+    assert "docs/superpowers/specs/exporter.md § 3:" in row["spec_text"]
+    assert "docs/superpowers/specs/exporter.md § Data model:" in row["spec_text"]
+    assert "An empty result set writes the header" in row["spec_text"]
+    assert "union of keys" in row["spec_text"]
+    assert "one module with one entry point" not in row["spec_text"]  # §1 stayed home
+
+
+def test_assume_resolves_the_section_once_and_stores_the_snapshot(dispatched, project):
+    """kn-924730d7: the worker's worktree is gone by the time the review packet is built,
+    so the pointer is resolved HERE and the section stored on the row."""
+    daemon, wo = dispatched
+    _doc(project)
+
+    ops.assume(wo["id"],
+               'Errors raise, per section 3 of design doc '
+               '"docs/superpowers/specs/exporter.md".')
+
+    store = ProjectStore(project)
+    try:
+        (row,) = store.all_assumptions(wo["id"])
+    finally:
+        store.close()
+    assert row["spec_path"] == "docs/superpowers/specs/exporter.md"
+    assert row["spec_which"] == "3"
+    assert "An empty result set writes the header" in row["spec_text"]
+    assert "union of keys" not in row["spec_text"]  # the rest of the doc stayed home
+
+
+def test_an_assumption_with_no_reference_at_all_is_recorded_as_before(dispatched,
+                                                                      project):
+    daemon, wo = dispatched
+
+    ops.assume(wo["id"], "used tabs, not spaces")
+
+    store = ProjectStore(project)
+    try:
+        (row,) = store.all_assumptions(wo["id"])
+    finally:
+        store.close()
+    assert (row["spec_path"], row["spec_which"], row["spec_text"]) == (None, None, None)
 
 
 def test_a_question_over_the_cap_is_refused_with_the_fix_named(dispatched):
