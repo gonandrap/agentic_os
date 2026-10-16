@@ -565,19 +565,9 @@ DEFAULT_VALIDATION_DECISION_RECORD_CHARS = 6000
 # Characters of SPEC SECTION the same packet may carry — the authority an assumption cites
 # when it says "per the spec", absent until GitHub issue #1035. `decision_record_chars`'s
 # number because it is the same packet, the same uncached per-assumption call and the other
-# authority block beside the record; well under `confirm_diff_chars` because a section is
-# prose a planner wrote, not a diff.
+# authority block beside the record. It is the LARGEST block that question carries: no
+# diff travels with it (docs/superpowers/specs/2026-10-14-neo-never-reads-a-diff.md).
 DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS = 6000
-
-# Truncation limit for the diff ONE CONFIRMATION QUESTION carries, and it is not the
-# panel's number: measured at q660-748, confirmation questions ran 7K-152K chars against
-# 1-3.8K for the first-pass review of the same assumption and 12-15K for the largest
-# legitimate OS question (a plan). 12,000 chars of diff puts the whole rendered question
-# at ~17-18K chars (~6.6K tokens at the 0.384 tokens/char rate cited above) — a plan's
-# order of magnitude, on a call that is UNCACHED and PER ASSUMPTION rather than a
-# five-seat shared prefix, which is why 150000 does not transfer. Spec § 2:
-# docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
-DEFAULT_VALIDATION_CONFIRM_DIFF_CHARS = 12000
 
 # How many follow-up findings ONE ORDER may file, across every round it is judged in.
 #
@@ -657,7 +647,6 @@ class ValidationConfig:
     decision_record_chars: int = DEFAULT_VALIDATION_DECISION_RECORD_CHARS
     # GitHub issue #1035: the spec section an assumption review reads.
     assumption_spec_chars: int = DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS
-    confirm_diff_chars: int = DEFAULT_VALIDATION_CONFIRM_DIFF_CHARS
     # Whether a FEATURE order validates as a whole once its children are done, which is
     # a separate question from whether its children each validated: the feature is the
     # only level at which "does this add up to what was asked" can be judged.
@@ -1231,10 +1220,8 @@ DEFAULT_NAVIGATION_CODE_SUFFIXES = SOURCE_SUFFIXES
 #: docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §3.2.
 DEFAULT_NAVIGATION_DOC_SUFFIXES = DOC_SUFFIXES
 
-#: Which path components make a file a DOC by location. The same key `autoreview.
-#: _is_documentation` classifies a confirmation diff's tier (c) with, so a project
-#: overriding it moves both. Not a suffix: entries carry no leading dot.
-#: docs/superpowers/specs/2026-10-13-a-confirmation-question-with-a-zero-character-diff.md
+#: Which path components make a file a DOC by location. Not a suffix: entries carry no
+#: leading dot.
 DEFAULT_NAVIGATION_DOC_DIRS = DOC_DIRS
 
 #: The Bash commands that DUMP a doc. `grep`/`rg`/`find` are absent by decision — text
@@ -1464,6 +1451,29 @@ class MessagingConfig:
     """
 
     stuck_minutes: int = DEFAULT_MESSAGING_STUCK_MINUTES
+
+
+# -- pull requests: how long GitHub may go without recomputing one before the OS stops
+# calling its own poll an actor for it. wo-d3a70c29, Neo question 1830.
+
+#: Half an hour. GitHub computes mergeability LAZILY and asking is what starts it, so
+#: UNKNOWN right after a push is the NORMAL state (kn-5e93939e) — the threshold has to
+#: clear every ordinary push before it clears a stall. PR #995 sat UNKNOWN for ~7h.
+DEFAULT_PULL_REQUESTS_RECOMPUTE_STALL_MINUTES = 30
+
+
+@dataclass
+class PullRequestsConfig:
+    """When GitHub's silence about a pull request stops being a wait and becomes a stall.
+
+    `MessagingConfig`'s shape exactly — one field, fleet-wide with `_parse_inspect`'s
+    field-level inheritance — and behind NO `enabled` switch on purpose: this is an
+    ingredient of `daemon.pr_recompute_stalled`, a predicate every surface reads through
+    `ops.scheduled_actor`, not an alarm anyone can turn off. A fleet with validation and
+    inspection both off still has to be able to say nobody is going to act.
+    """
+
+    recompute_stall_minutes: int = DEFAULT_PULL_REQUESTS_RECOMPUTE_STALL_MINUTES
 
 
 # -- the scheduler: the OS filing a work order nobody typed. ABOVE `ProjectSpec` for the
@@ -1782,6 +1792,7 @@ class ProjectSpec:
     rules: RulesConfig = field(default_factory=RulesConfig)
     evolution: EvolutionConfig = field(default_factory=EvolutionConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
+    pull_requests: PullRequestsConfig = field(default_factory=PullRequestsConfig)
     bugs: BugsConfig = field(default_factory=BugsConfig)
     release: ReleaseConfig = field(default_factory=ReleaseConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
@@ -1922,6 +1933,7 @@ class OsConfig:
     rules: RulesConfig = field(default_factory=RulesConfig)
     evolution: EvolutionConfig = field(default_factory=EvolutionConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
+    pull_requests: PullRequestsConfig = field(default_factory=PullRequestsConfig)
     bugs: BugsConfig = field(default_factory=BugsConfig)
     release: ReleaseConfig = field(default_factory=ReleaseConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
@@ -2223,9 +2235,6 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         raw.get("assumption_spec_chars", base.assumption_spec_chars))
     if assumption_spec_chars < 1:
         raise _err(f"{where}.assumption_spec_chars must be >= 1")
-    confirm_diff_chars = int(raw.get("confirm_diff_chars", base.confirm_diff_chars))
-    if confirm_diff_chars < 1:
-        raise _err(f"{where}.confirm_diff_chars must be >= 1")
     stakes_classifier = str(
         raw.get("stakes_classifier", base.stakes_classifier) or "regex")
     if stakes_classifier not in STAKES_CLASSIFIER_MODES:
@@ -2256,7 +2265,6 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         diff_chars=diff_chars,
         decision_record_chars=decision_record_chars,
         assumption_spec_chars=assumption_spec_chars,
-        confirm_diff_chars=confirm_diff_chars,
         feature_units=bool(raw.get("feature_units", base.feature_units)),
         feature_merge_wait_minutes=feature_merge_wait_minutes,
         # Same field-level fallback as every flag in this block — see `auto_merge` below.
@@ -2767,6 +2775,27 @@ def _parse_messaging(raw: Any, base: MessagingConfig | None = None,
     return cfg
 
 
+def _parse_pull_requests(raw: Any, base: PullRequestsConfig | None = None,
+                         where: str = "os.pull_requests") -> PullRequestsConfig:
+    """`os.pull_requests`, or a project's override — field-level, like `_parse_messaging`.
+
+    Refused rather than clamped below 1 for that function's reason, with one of its own:
+    zero would call every fresh UNKNOWN a stall, and a fresh UNKNOWN is what an ordinary
+    push looks like (kn-5e93939e).
+    """
+    base = base or PullRequestsConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    cfg = PullRequestsConfig(
+        recompute_stall_minutes=int(raw.get("recompute_stall_minutes",
+                                            base.recompute_stall_minutes)),
+    )
+    for name, value in vars(cfg).items():
+        if value < 1:
+            raise _err(f"{where}.{name} must be >= 1")
+    return cfg
+
+
 def _parse_wiring(raw: Any, base: WiringConfig | None = None,
                   where: str = "os.wiring") -> WiringConfig:
     """`os.wiring`, or a project's override of it — field-level, like `_parse_inspect`.
@@ -3096,6 +3125,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         rules=_parse_rules(os_raw.get("rules", {})),
         evolution=_parse_evolution(os_raw.get("evolution", {})),
         messaging=_parse_messaging(os_raw.get("messaging", {})),
+        pull_requests=_parse_pull_requests(os_raw.get("pull_requests", {})),
         bugs=_parse_bugs(os_raw.get("bugs", {})),
         release=_parse_release(os_raw.get("release", {})),
         schedule=_parse_schedule(os_raw.get("schedule", {})),
@@ -3267,6 +3297,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         messaging_cfg = _parse_messaging(
             p.get("messaging", {}), base=os_cfg.messaging,
             where=f"projects[{i}] ({name}).messaging")
+        pull_requests_cfg = _parse_pull_requests(
+            p.get("pull_requests", {}), base=os_cfg.pull_requests,
+            where=f"projects[{i}] ({name}).pull_requests")
         bugs_cfg = _parse_bugs(
             p.get("bugs", {}), base=os_cfg.bugs,
             where=f"projects[{i}] ({name}).bugs")
@@ -3304,6 +3337,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 rules=rules_cfg,
                 evolution=evolution_cfg,
                 messaging=messaging_cfg,
+                pull_requests=pull_requests_cfg,
                 bugs=bugs_cfg,
                 release=release_cfg,
                 schedule=schedule_cfg,

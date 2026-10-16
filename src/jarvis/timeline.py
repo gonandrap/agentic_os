@@ -797,6 +797,19 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                 f"attempt {p.get('attempt')} of {of}" if of else "")
     if kind == "pr_conflict_cleared":
         return "Merge conflict resolved", ""
+    # wo-d3a70c29: evidence, not an alarm — the order stops deriving an actor and
+    # `true_blockers` is what asks the user.
+    if kind == "pr_recompute_stalled":
+        # TWO CONDITIONS, TWO SENTENCES. With a tip observed the evidence is the
+        # disagreement; with none it is the clock, and naming a branch "at " would
+        # describe a comparison nobody made.
+        ref, head = str(p.get("ref_oid") or ""), str(p.get("head_oid") or "")
+        title = "GitHub stopped recomputing the pull request"
+        if ref and head:
+            return title, (f"branch at {ref[:10]}, pull request head at {head[:10]}")
+        since = _clock(p.get("unknown_since"))
+        return title, (f"mergeability unanswered since {since}" if since
+                       else "mergeability unanswered")
     if kind == "pr_conflict_unresolved":
         return ("Merge conflict the worker could not resolve — over to you",
                 f"{p.get('attempts')} attempts")

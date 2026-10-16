@@ -55,9 +55,9 @@ def test_every_gh_command_this_module_builds_is_a_declared_read_verb():
     assert gh_verbs <= set(github.READ_ONLY_VERBS), (
         f"a non-read gh command is built in github.py: "
         f"{sorted(gh_verbs - set(github.READ_ONLY_VERBS))}")
-    assert git_verbs <= set(github.LOCAL_GIT_READS), (
-        f"an undeclared local git command is built in github.py: "
-        f"{sorted(git_verbs - set(github.LOCAL_GIT_READS))}")
+    assert git_verbs <= set(github.GIT_READS), (
+        f"an undeclared git command is built in github.py: "
+        f"{sorted(git_verbs - set(github.GIT_READS))}")
 
 
 def test_every_api_call_this_module_builds_is_a_get_and_can_be_nothing_else():
@@ -143,11 +143,11 @@ def test_the_protection_read_is_the_declared_get(fake_gh):
     ('x = ["git", "-C", str(p), "remote", "add", "origin", url]', False),
     ('x = ["git", "-C", str(p), "commit", "-m", "x"]', False),
 ])
-def test_the_local_git_carve_out_excludes_everything_it_does_not_name(source, allowed):
+def test_the_git_carve_out_excludes_everything_it_does_not_name(source, allowed):
     """kn-67364b3a: an allowlist that has never been shown to REFUSE anything is not
-    known to be an allowlist. `LOCAL_GIT_READS` was added to let one local read through,
-    and the risk is that it lets the whole `git` family through with it — so the same
-    rule the module is held to is run here against tails that must fail.
+    known to be an allowlist. `GIT_READS` was added to let one read through, and the risk
+    is that it lets the whole `git` family through with it — so the same rule the module
+    is held to is run here against tails that must fail.
 
     The check is duplicated from the test above rather than shared, deliberately: a
     helper both tests call could be broken in a way that makes both pass.
@@ -161,7 +161,7 @@ def test_the_local_git_carve_out_excludes_everything_it_does_not_name(source, al
                 tails.add(tuple(w for w in words[2:] if isinstance(w, str)))
     if not tails:  # the non-git row: nothing for this carve-out to admit
         return
-    assert (tails <= set(github.LOCAL_GIT_READS)) is allowed, (
+    assert (tails <= set(github.GIT_READS)) is allowed, (
         f"{source!r} should {'pass' if allowed else 'FAIL'} the carve-out")
 
 

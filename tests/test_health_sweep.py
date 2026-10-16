@@ -1540,6 +1540,162 @@ def test_usage_window_outranks_a_live_dependency(stuck_os):
     assert verdict.stuck is False and verdict.excluded == PAUSE_USAGE_LIMIT
 
 
+# -- a child held by its feature's unratified plan (the 2026-10-15 spec) --------------
+
+
+def _held_child(store, *, status: str = "pending", assumptions: int = 1,
+                hours: float = 2.0):
+    """`(feature, planner, child, at)`: a feature child `hours` in `status` whose
+    planner has `assumptions` pending since `at`.
+
+    `a_bare_feature` is the 2026-09-24 spec's own fixture — the hold reads a
+    `plan_wo_id` and a pending assumption row, and nothing else.
+    """
+    from tests.test_feature_orders import a_bare_feature
+
+    fo, planner, kid = a_bare_feature(store, status=status, assumptions=assumptions)
+    at = park_order(store, kid["id"], status, hours=hours)
+    # `park_order` back-dates the CHILD's timeline; the count is walked on the planner's.
+    store.conn.execute("UPDATE wo_events SET ts=? WHERE wo_id=? AND kind='assumption'",
+                       (at, planner["id"]))
+    store.conn.commit()
+    return fo, planner, kid, at
+
+
+def settle_plan(store, planner_id: str, at: float, count: int = 1) -> None:
+    """The user's route, back-dated: every pending assumption ruled, one `reviewed`."""
+    for a in store.pending_assumptions(planner_id):
+        store.review_assumption(a["id"], "accepted")
+    store.add_event(planner_id, "reviewed", {"accepted": True, "count": count})
+    store.conn.execute(
+        "UPDATE wo_events SET ts=? WHERE id=(SELECT MAX(id) FROM wo_events)", (at,))
+    store.conn.commit()
+
+
+def test_a_child_held_by_an_unratified_plan_is_not_stuck(stuck_os):
+    """§3(1). Two hours `pending` because the OS's own claim rule withholds it."""
+    from jarvis import stuck
+
+    store = stuck_os["store"]
+    _fo, planner, kid, _at = _held_child(store)
+
+    verdict = _judge(stuck_os, kid["id"])
+
+    assert verdict.stuck is False
+    assert verdict.excluded == stuck.PLAN_ASSUMPTION_CAUSE
+    assert "clears by itself" not in verdict.reason, verdict.reason
+    assert "jarvis wo review" in verdict.reason, verdict.reason
+    assert store.plan_hold(store.get_work_order(kid["id"]))["planner_id"] == planner["id"]
+
+
+def test_a_lifted_plan_hold_is_judged_and_its_held_seconds_still_discounted(stuck_os):
+    """§2.3 and §3(2): EXCLUSION ALONE IS NOT THE FIX. `pending` is judged on time in
+    status, so the first sweep after the user rules sees the whole two hours and buys
+    the investigation the exclusion existed to prevent — one dispatch tick too early."""
+    store = stuck_os["store"]
+    now = time.time()
+    _fo, planner, kid, _at = _held_child(store, hours=2)
+    settle_plan(store, planner["id"], now - 60)
+
+    row = [r for r in _judged(store, now) if r["wo"]["id"] == kid["id"]][0]
+
+    assert row["verdict"].excluded == "", "the lifted hold still excluded the child"
+    assert abs(row["verdict"].active_seconds - 60) < 5, row["verdict"].active_seconds
+    assert row["verdict"].stuck is False, row["verdict"].reason
+
+
+def test_plan_hold_spans_walk_the_pending_count_over_the_planners_timeline():
+    """§3(3): pure, row-shaped, clipped to `[since, now]`, and a `reviewed` with
+    `count=N` closes a span that N `assumption` events opened."""
+    from jarvis.project_store import plan_hold_spans
+
+    def ev(ts, kind, **payload):
+        return {"ts": ts, "kind": kind, "payload": json.dumps(payload)}
+
+    events = [ev(50.0, "assumption"),                 # opened before `since`
+              ev(60.0, "assumption"),
+              ev(120.0, "reviewed", count=2),         # both settled at once
+              ev(150.0, "assumption"),
+              ev(160.0, "autoreview_accepted")]       # Neo's route, one at a time
+
+    assert plan_hold_spans(events, 100.0, 200.0) == [(100.0, 120.0), (150.0, 160.0)]
+    assert plan_hold_spans([ev(150.0, "assumption")], 100.0,
+                           200.0) == [(150.0, 200.0)], "a live hold must end at `now`"
+    assert plan_hold_spans([], 100.0, 200.0) == []
+    assert plan_hold_spans([ev(70.0, "assumption"), ev(80.0, "reviewed", count=1)],
+                           100.0, 200.0) == [], "a span over before `since` was kept"
+    # A malformed count cannot drive the walk negative and swallow the next hold.
+    assert plan_hold_spans([ev(110.0, "reviewed", count=5), ev(150.0, "assumption")],
+                           100.0, 200.0) == [(150.0, 200.0)]
+
+
+def test_overlapping_usage_and_plan_holds_are_discounted_once(stuck_os):
+    """§3(4): the UNION of the interval sets, never the sum — a usage window can shut
+    while the plan stands, and 40 + 30 minutes of a 60-minute wait is impossible."""
+    store = stuck_os["store"]
+    now = time.time()
+    _fo, planner, kid, at = _held_child(store, hours=1)
+    settle_plan(store, planner["id"], at + 40 * 60)
+    usage_hold(store, kid["id"], started=at + 20 * 60, ended=at + 50 * 60)
+
+    row = [r for r in _judged(store, now) if r["wo"]["id"] == kid["id"]][0]
+
+    assert abs(row["discounted"] - 50 * 60) < 5, row["discounted"]
+    assert row["discounted"] < 40 * 60 + 30 * 60, "the overlap was counted twice"
+
+
+def test_a_running_child_of_a_held_feature_is_judged_normally(stuck_os):
+    """§2.4: the claim rule withholds a DISPATCH only. Work already in flight is not
+    held by it and must still clear its threshold."""
+    store = stuck_os["store"]
+    _fo, _planner, kid, _at = _held_child(store, status="running", hours=5)
+
+    verdict = _judge(stuck_os, kid["id"])
+
+    assert verdict.excluded == "" and verdict.stuck is True
+
+
+def test_a_usage_window_outranks_a_plan_hold(stuck_os):
+    """§2.4's precedence: the account's window is a fact about the whole fleet."""
+    from jarvis.worker_session import PAUSE_USAGE_LIMIT
+
+    store = stuck_os["store"]
+    _fo, _planner, kid, at = _held_child(store)
+    usage_hold(store, kid["id"], started=at)
+
+    verdict = _judge(stuck_os, kid["id"])
+
+    assert verdict.stuck is False and verdict.excluded == PAUSE_USAGE_LIMIT
+
+
+def test_the_held_child_stays_a_visible_row_and_its_two_readers_agree(stuck_os):
+    """§3(6) and §4's rejection of a `continue`: kn-143a46df, a held order is a row on
+    `jarvis stuck` showing its arithmetic. §1(2): the blocker column and
+    `status_label` on the SAME row must not contradict each other."""
+    store = stuck_os["store"]
+    now = time.time()
+    _fo, planner, kid, _at = _held_child(store)
+
+    rows = [r for r in _judged(store, now) if r["wo"]["id"] == kid["id"]]
+
+    assert len(rows) == 1, "the held row left the sweep's output entirely"
+    assert rows[0]["verdict"].stuck is False
+    assert rows[0]["verdict"].threshold_seconds == 30 * 60, "the arithmetic is gone"
+    assert f"jarvis wo review {planner['id']}" in rows[0]["status_label"]
+    assert f"jarvis wo review {planner['id']}" in rows[0]["blocker"]
+    assert "nothing the record can name" not in rows[0]["blocker"]
+
+
+def test_a_pending_child_of_a_ratified_plan_is_still_judged(stuck_os):
+    """NEGATIVE, §2.5: the exclusion is the HOLD and never `pending` generally."""
+    store = stuck_os["store"]
+    _fo, _planner, kid, _at = _held_child(store, assumptions=0)
+
+    verdict = _judge(stuck_os, kid["id"])
+
+    assert verdict.excluded == "" and verdict.stuck is True
+
+
 def test_assess_is_pure():
     """§1: the predicate reaches no store, no model and not even the clock."""
     import ast

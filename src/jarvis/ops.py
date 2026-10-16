@@ -51,6 +51,7 @@ from .daemon import (
     answers_question,
     daemon_running,
     delivers_message,
+    polls_and_can_act_on_pull_request,
     polls_pull_request,
     retries_turn,
     reviews_gate,
@@ -3283,7 +3284,7 @@ def follow_up_repo(project_path: Path) -> str:
 
     Read from the CHECKOUT's own `origin` and from nowhere else. That is the point: the
     repository name becomes a `gh --repo` argument, and the one source that no model and
-    no stored string can influence is the local remote (`github.LOCAL_GIT_READS`).
+    no stored string can influence is the local remote (`github.GIT_READS`).
 
     "" for a project with no `origin` at all — several in the fleet are local-only — and
     the caller reports that as a filing it could not make rather than as a finding that
@@ -5447,8 +5448,8 @@ def land_when_cleared(store: ProjectStore, wo: dict[str, Any],
 
     **`needs_review` wins while an assumption is pending.** It is the only status that
     says the user owes a decision, and `validating` is deliberately silent
-    (`invariants.BLOCKED_STATUSES`). The round keeps running underneath it and
-    `invariants.status_label` says so.
+    (`invariants.true_blockers` derives nothing there). The round keeps running
+    underneath it and `invariants.status_label` says so.
 
     `panel_cleared` is for a caller that has just settled the panel's half ITSELF and
     must not re-read the round it wrote: the no-validator path closes its round `failed`
@@ -9740,8 +9741,9 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
     from . import bus, holds, stuck, worker_session
     from .central_store import base_red_hold_spans
     from .health import observer_kinds
-    from .project_store import (FO_ID_PREFIXES, UNGOVERNED_ORIGINS,
-                                VALIDATION_CI_CAUSE, validation_ci_hold_spans,
+    from .project_store import (FO_ID_PREFIXES, PLAN_ASSUMPTION_EVENT_KINDS,
+                                UNGOVERNED_ORIGINS, VALIDATION_CI_CAUSE,
+                                plan_hold_spans, validation_ci_hold_spans,
                                 validation_hold)
     from .worker_session import PAUSE_USAGE_LIMIT
 
@@ -9781,11 +9783,35 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         # wait the USER owes (kn-6e836793).
         base_red_spans = (base_red_hold_spans(red_episodes, since, now, base_red_until)
                           if wo["status"] == "waiting_pr_merge" else [])
+        # A CHILD HELD BY ITS FEATURE'S UNRATIFIED PLAN IS NOT STUCK (§2.3 and §2.4 of
+        # docs/superpowers/specs/2026-10-15-a-child-held-by-its-features-unratified-plan-
+        # is-not-stuck.md). `pending` ONLY: the claim rule withholds a DISPATCH, so a
+        # child already running is not held by it. The DISCOUNT is computed from the
+        # planner's history whether or not the hold still stands — that is the whole
+        # point of it — while the EXCLUSION reads `plan_hold`, the one predicate pinned
+        # to the claim SQL (§2.2). The reads are paid by pending feature children and by
+        # nothing else: the gate is the set `plan_hold` would query for at all.
+        plan_held, plan_spans = False, []
+        if (wo["status"] == "pending" and wo.get("parent_id")
+                and wo.get("kind") == "worker"):
+            plan_held = bool(pstore.plan_hold(wo))
+            try:
+                planner_id = pstore.get_feature_order(
+                    str(wo["parent_id"])).get("plan_wo_id")
+            except KeyError:
+                planner_id = None  # the feature was deleted out from under the child
+            if planner_id:
+                # `events_of_kind` takes ONE kind, so the three are concatenated and
+                # re-sorted: the walk is only right in `ts` order (§2.3).
+                plan_spans = plan_hold_spans(
+                    sorted((e for k in PLAN_ASSUMPTION_EVENT_KINDS
+                            for e in pstore.events_of_kind(str(planner_id), k)),
+                           key=lambda e: float(e["ts"])), since, now)
         # The UNION and never the sum: a usage window can shut while CI runs (§4), or
         # while the base is red.
         discounted = holds.union_seconds(
             [(max(h.started, since), min(h.finish(now), now)) for h in usage]
-            + ci_spans + base_red_spans)
+            + ci_spans + base_red_spans + plan_spans)
         # §2.2 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md.
         edges = (pstore.unfinished_dependencies(wo["id"])
                  if wo["status"] == "pending" else [])
@@ -9809,15 +9835,18 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         verdict = stuck.assess(
             str(wo["status"]), now - since, now - (durations.last_activity_ts or since),
             discounted, thresholds, cfg.fallback_minutes * 60.0,
-            # Order among the last three is ARBITRARY and documented as such: they are
-            # scoped to `validating`, `waiting_pr_merge` and `pending` and so are
-            # mutually exclusive by status (§1 of the 2026-10-15 spec).
+            # CI and base-red cannot collide: `validating` and `waiting_pr_merge` (§1 of
+            # the 2026-10-15 spec). The last two are BOTH `pending`, so their order is
+            # load-bearing — a live dependency outranks the plan hold (§2.4).
             excluded_cause=(PAUSE_USAGE_LIMIT
                             if window or any(h.open for h in usage)
                             else VALIDATION_CI_CAUSE if ci_held
                             else stuck.BASE_RED_CAUSE
                             if base_red and wo["status"] == "waiting_pr_merge"
-                            else stuck.LIVE_DEPENDENCY if live_edges else ""),
+                            else stuck.LIVE_DEPENDENCY if live_edges
+                            # LAST in the chain, §2.4: a fleet fact outranks a fact
+                            # about one feature's plan.
+                            else stuck.PLAN_ASSUMPTION_CAUSE if plan_held else ""),
             kind=str(wo.get("kind") or "worker"),
             exempt_kinds=tuple(cfg.exempt_kinds),
             by_design_idle=by_design_idle,
@@ -9828,9 +9857,14 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         out.append({
             "project": project_name, "wo": wo, "verdict": verdict,
             # The outstanding-child note before the empty answer: one formatter shared
-            # with `status_label`, so the row and the listing cannot drift.
+            # with `status_label`, so the row and the listing cannot drift. The plan
+            # hold rides there too — §1(2) of the 2026-10-15 spec: this column read
+            # "nothing the record can name" while `status_label` on the SAME row named
+            # the hold and the review command.
             "blocker": (blocker[0] if blocker
                         else invariants.outstanding_children_note(pstore, wo)
+                        or invariants.plan_hold_note(
+                            pstore.plan_hold(wo) if plan_held else None)
                         or "nothing the record can name"),
             "status_label": invariants.status_label(pstore, wo),
             "since": since, "activity": durations.last_activity_ts or since,
@@ -15179,6 +15213,27 @@ def messaging_config_at(project_path: Path) -> Any:
         return MessagingConfig()
 
 
+def pull_requests_config_at(project_path: Path) -> Any:
+    """`os.pull_requests` for the project rooted at `project_path`.
+
+    `inspect_config_at`'s twin again, for `daemon.pr_recompute_stalled` — a predicate is
+    handed a `ProjectStore` and no project name. Falls back to the OS block and then to
+    the shipped defaults for that function's reason: a threshold with no catalog behind
+    it is still a threshold, and having none would mean having no predicate.
+    """
+    from .catalog import PullRequestsConfig
+
+    try:
+        catalog = resolve_catalog()
+        target = Path(project_path).resolve()
+        for spec in catalog.projects:
+            if Path(spec.path).resolve() == target:
+                return spec.pull_requests
+        return catalog.os.pull_requests
+    except (OpsError, CatalogError, OSError, ValueError):
+        return PullRequestsConfig()
+
+
 @observability.metered(OBSERVE_INSPECT, target="target", project="project")
 def inspect_report(target: str, project: str | None = None, *,
                    write_floor: int | None = None,
@@ -17186,10 +17241,14 @@ SCHEDULED_ACTORS: dict[str, ActorPasses] = {
         "no daemon pass — the user reviews it, and `invariants.true_blockers` is what "
         "puts it in front of them")),
     "waiting_pr_merge": ActorPasses((
+        # wo-d3a70c29: the poll still SELECTS a stalled row (`polls_pull_request` is
+        # untouched); what it is no longer is an answer to "somebody will act on this".
         _Pass("Daemon.poll_pull_requests",
-              "the row carries a routing pull request, so the poll asks GitHub what "
-              "became of it",
-              "daemon.polls_pull_request", polls_pull_request),
+              "`daemon.polls_and_can_act_on_pull_request` says yes: the row carries a "
+              "routing pull request and GitHub is still recomputing it, so the poll "
+              "asks what became of it and some branch of it can move the row",
+              "daemon.polls_and_can_act_on_pull_request",
+              polls_and_can_act_on_pull_request),
     )),
     # Deliberately none: `project_store.NOT_RETRIED` excludes it and
     # `Daemon.settle_work_order` returns early for it.

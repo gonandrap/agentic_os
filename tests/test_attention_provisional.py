@@ -173,7 +173,7 @@ def test_the_three_states_that_must_not_raise_it(started, catalog_file, case, st
 
 
 def test_premature_leaves_an_undeliverable_objection_flagged(started, catalog_file):
-    """(g). `running` is in BLOCKED_STATUSES, so clearing here would be undone by
+    """(g). INV-ATTENTION-MISSING selects `running`, so clearing here would be undone by
     INV-ATTENTION-MISSING on the same tick, for ever."""
     opt_in(catalog_file)
     store, wo, a = order(started, status="running", verdict="object")

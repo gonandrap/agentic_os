@@ -114,8 +114,16 @@ def test_the_terminal_action_is_the_report_and_never_wo_finish(analyst_prompt,
                                                                improvement_order):
     assert f"jarvis io report {improvement_order['id']} --from-file" in analyst_prompt
     # An analyst that runs `wo finish` settles itself before the report is stored.
-    assert "jarvis wo finish" not in analyst_prompt.replace(
-        "Do not run `jarvis wo finish`", "")
+    assert "which IS your finish" in analyst_prompt
+
+
+def test_the_analyst_briefing_names_wo_finish_as_the_redelivery(analyst_prompt):
+    """§5 of docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md:
+    resubmitting the report after a refusal is refused by the OS and would discard the
+    decisions already recorded on it, so the re-delivery is `jarvis wo finish`."""
+    assert "Do not run `jarvis wo finish`" not in analyst_prompt
+    assert "jarvis wo finish" in analyst_prompt
+    assert "does not touch" in analyst_prompt
 
 
 def test_the_analyst_is_never_told_to_open_a_pull_request(analyst_prompt):

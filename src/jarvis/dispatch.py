@@ -391,6 +391,47 @@ def materialize_design_doc(store: ProjectStore, project: ProjectSpec,
     return specs.materialize(project.path, wo["parent_id"], wo["id"], spec)
 
 
+def dependency_context(store: ProjectStore, wo: dict[str, Any]) -> list[dict[str, Any]]:
+    """What each dependency ACTUALLY recorded. Empty for anything but a worker.
+
+    Read at dispatch and passed in, like `feature_context`, so `build_worker_prompt`
+    stays a pure function of its arguments. A brief that asserts what a dependency
+    shipped is a claim; this is the record it is checked against (kn-5368cc71).
+    """
+    if wo.get("kind") not in ("worker", None):
+        return []
+    out: list[dict[str, Any]] = []
+    for dep_id in store.dependencies(wo):
+        try:
+            dep = store.get_work_order(dep_id)
+        except KeyError:
+            # Same rule `feature_context` states for a deleted parent.
+            out.append({"id": dep_id, "status": "missing"})
+            continue
+        out.append({k: dep.get(k) for k in
+                    ("id", "status", "title", "result_summary", "pr_url")})
+    return out
+
+
+def _dependency_block(dependencies: list[dict[str, Any]]) -> list[str]:
+    """kn-5368cc71: three children of one feature order each burned a Neo question on the
+    same false claim about what a dependency had shipped."""
+    lines = [
+        "# What your dependencies ACTUALLY shipped",
+        "Your brief's claims about what a dependency shipped are a HINT; this block is "
+        "the record. Check it before you build on one.",
+    ]
+    for dep in dependencies:
+        if dep.get("status") == "missing":
+            lines.append(f"- `{dep['id']}` [missing] — this dependency's record is gone")
+            continue
+        lines.append(
+            f"- `{dep['id']}` [{dep.get('status') or 'unknown'}] {dep.get('title') or ''}"
+            f" — result: {dep.get('result_summary') or '(none recorded)'}"
+            f" — PR: {dep.get('pr_url') or '(none)'}")
+    return lines
+
+
 def feature_context(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
     """The parent order a MANAGER or an ANALYST needs. None for anything else.
 
@@ -422,7 +463,8 @@ def feature_context(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] |
 def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
                         knowledge: KnowledgeBrief | None = None,
                         design_doc: dict[str, str] | None = None,
-                        feature: dict[str, Any] | None = None) -> str:
+                        feature: dict[str, Any] | None = None,
+                        dependencies: list[dict[str, Any]] | None = None) -> str:
     """What the worker is told, composed from the work order and its project.
 
     Five kinds of work order get five shapes. A WORKER opens with the minimum — its
@@ -478,6 +520,8 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
                f"planner's branch.",
                ] if design_doc.get("path") else []),
         ] if design_doc else []),
+        # kn-5368cc71: the record, so the brief's dependency claims are checkable.
+        *(["", *_dependency_block(dependencies)] if dependencies else []),
         "",
         *worker_brief.core_contract(wo["id"], wo["title"], project.name,
                                     bool(knowledge), live_gates,
@@ -733,8 +777,13 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         "with the reason: revise and submit again from this same session.",
         "",
         "# Operating contract",
-        f"- `jarvis fo plan {fo_id} --from-file <file>` IS your finish. Do not run "
-        f"`jarvis wo finish` — submitting the plan settles this work order for you.",
+        # §5, docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md
+        f"- `jarvis fo plan {fo_id} --from-file <file>` IS your finish, and you submit "
+        f"the plan ONCE. If the user refuses an assumption afterwards, do NOT resubmit "
+        f"the plan: it would replace the stored one and discard the decisions already "
+        f"recorded on it. Answer the refusal in this session, then run `jarvis wo "
+        f"finish --summary \"…\"`, which records the re-delivery and does not touch the "
+        f"plan.",
         f"- **Neo is your first responder. Any doubt goes to it.** `jarvis wo ask "
         f"{wo['id']} \"<your question>\"`, then END YOUR TURN; the answer arrives as your "
         f"next user turn, usually within a minute. The trigger is DOUBT, not importance. "
@@ -892,9 +941,14 @@ def _analyst_prompt(wo: dict[str, Any], project: ProjectSpec,
         "that printed it.",
         "",
         "# The report",
+        # §5, docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md
         "Write it to a JSON file in your worktree and submit it with the command below, "
-        "which IS your finish. Do not run `jarvis wo finish` — submitting the report "
-        "settles this work order for you. `--from-file` and not an inline argument, "
+        "which IS your finish, and submit it ONCE. If the user refuses an assumption "
+        "afterwards, do NOT resubmit the report: the OS refuses it, and it would replace "
+        "the document and discard the decisions already recorded on it. Answer the "
+        "refusal in this session, then run `jarvis wo finish --summary \"…\"`, which "
+        "records the re-delivery and does not touch the report. `--from-file` and not an "
+        "inline argument, "
         "because the gate classifier's quote-blanking fails on nested and mixed quoting "
         "and a report is full of repo paths and quoted log lines.",
         "",
@@ -1412,7 +1466,8 @@ def dispatch_work_order(
     )
     prompt = build_worker_prompt(wo, project, knowledge,
                                  design_doc=materialize_design_doc(store, project, wo),
-                                 feature=feature_context(store, wo))
+                                 feature=feature_context(store, wo),
+                                 dependencies=dependency_context(store, wo))
 
     # Resolved onto the row before the turn is launched, so every later turn rebuilds the
     # same briefing from the record rather than re-reading a catalog that may have moved.
