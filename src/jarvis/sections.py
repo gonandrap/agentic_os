@@ -55,7 +55,8 @@ def unreferenced_docs(text: str) -> list[str]:
 
     The other half of the in-text form. A sentence that names a design document without
     naming a section of it is the shape the user decision of 2026-10-14 (Neo learning
-    #102) refuses: Neo is handed ONE section, so "the spec says so" with a whole document
+    #102) refuses: Neo is handed cited SECTIONS — N under one labelled snapshot, bounded by
+    one total (`ops.SECTION_SNAPSHOT_CHARS`) — so "the spec says so" with a whole document
     beside it has nothing to resolve. `ops` turns each of these into a refusal that shows
     the asker the form above.
     """

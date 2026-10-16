@@ -88,9 +88,9 @@ that `jarvis wo assume` now understands it too. `sections.REF_RE` stays the one 
 
 Both `ops.ask_question` and `ops.assume` resolve through `ops._section_blocks`, so the two
 verbs cannot drift. Same resolution order it has today (the worker's worktree, the project
-tree, then the materialised feature snapshot under `.jarvis/features/`), same
-`SECTION_SNAPSHOT_CHARS` bound with the cut announced, and the SAME TWO REFUSALS in both
-verbs:
+tree, then the materialised feature snapshot under `.jarvis/features/`), the
+`SECTION_SNAPSHOT_CHARS` bound as ONE TOTAL over every section it resolves (water-filled,
+invariant 9) with each cut announced, and the SAME TWO REFUSALS in both verbs:
 
 1. **A reference that does not resolve.** The refusal names WHICH failure it is — no such
    file in the worktree or the project tree, or no such heading in a file that exists
@@ -187,6 +187,12 @@ looking harmless, which is the shape Part 2 now refuses.
 7. A plan review question contains heading LINES of the design document and no body text.
 8. An assumption row with NULL `spec_*` reads as "cited no section" everywhere, and every
    pre-existing row is one.
+9. Every section resolved by `ops._section_blocks` for one text — for `wo ask`'s context
+   and for the stored `assumptions.spec_text` alike — never together exceeds
+   `ops.SECTION_SNAPSHOT_CHARS`, which is a TOTAL and never a per-section cap. The total
+   is divided by WATER-FILLING: the equal share `total // n` is a FLOOR, a section under
+   its share donates its remainder, only oversized sections are trimmed, and every trim is
+   announced in words.
 
 ## Tests to write first
 
@@ -212,12 +218,18 @@ These are the work order's acceptance criteria.
 6. **Plan review carries the outline.** `plans.build_plan_context` for a plan whose design
    doc has a distinctive body sentence contains every heading line and NOT that sentence,
    and keeps the "Do NOT open this path on disk" wording.
-7. **The regression pin.** For every Neo question builder, a payload built from a fixture
-   spec document contains no body text of that document beyond one bounded section. One
-   test over the builders by name, so a NEW channel added later without a resolver fails
-   here.
+7. **The regression pin.** A payload built from a fixture spec document contains no body
+   text of that document beyond the bounded sections. One test naming the builders it
+   pins — `autoreview.propose`, `autoreview.propose_confirmation`,
+   `plans.build_plan_context` — plus a sibling over `ops.ask_question`. A NEW channel
+   added later is NOT discovered by it: add the channel to the list.
 8. **Migration.** A database created before the three columns opens, migrates, and its
    existing assumption rows render as "cited no section".
+9. **The TOTAL budget on the `ask` path.** A `wo ask` text citing EVERY section of a
+   fixture document produces a context SHORTER than the document, carrying the announced
+   truncation — `ops.SECTION_SNAPSHOT_CHARS` is one total over all resolved sections, not
+   a per-section cap. Plus the water-filling case: a short section stays whole and donates
+   its remainder to an oversized one, which alone is trimmed.
 
 ## What this loses, and why that is acceptable
 

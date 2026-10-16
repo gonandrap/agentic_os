@@ -1706,9 +1706,12 @@ ADDED_COLUMNS = {
         "objection_sent_ts": "REAL",
         "objection_delivered_ts": "REAL",
         "objection_withdrawn_ts": "REAL",
-        # THE ONE SPEC SECTION THIS ASSUMPTION CITES, resolved at `ops.assume` time and
-        # snapshotted here. User decision 2026-10-14 (Neo learning #102): a reviewer is
-        # handed one specific section, never a document. Stored rather than re-resolved
+        # THE SPEC SECTIONS THIS ASSUMPTION CITES — N of them under ONE labelled snapshot
+        # in `spec_text` (Neo ruling Q1883), `spec_path`/`spec_which` being the FIRST
+        # reference's — resolved at `ops.assume` time and snapshotted here. User decision
+        # 2026-10-14 (Neo learning #102): a reviewer is handed specific sections, never a
+        # document, and `ops.SECTION_SNAPSHOT_CHARS` bounds their total. Stored rather than
+        # re-resolved
         # when the review packet is built, because by then the worker's worktree — the
         # only tree the path was ever valid in — is gone (kn-924730d7).
         #

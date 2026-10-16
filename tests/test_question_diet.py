@@ -351,6 +351,9 @@ def _nothing_recorded(project, wo_id):
         assert store.all_assumptions(wo_id) == []
     finally:
         store.close()
+    # Spec invariant 2: a refused reference writes NOTHING, ASSUMPTIONS.md included.
+    md = project / "ASSUMPTIONS.md"
+    assert not md.is_file() or wo_id not in md.read_text()
 
 
 def _both_verbs(wo_id):
@@ -457,6 +460,70 @@ def test_an_assumption_with_no_reference_at_all_is_recorded_as_before(dispatched
     finally:
         store.close()
     assert (row["spec_path"], row["spec_which"], row["spec_text"]) == (None, None, None)
+
+
+# -- ONE TOTAL budget over every cited section (spec invariant 1 on the `ask` path) ----
+
+
+UNCITED = "THE-UNCITED-SENTENCE, which nobody asked about."
+
+
+def _doc_of_six(project):
+    """A document whose every section is big, so citing them all would deliver it whole."""
+    body = f"# Design\n\n{UNCITED}\n"
+    for n, letter in enumerate("abcdef", start=1):
+        body += f"\n## {n}. Part {letter}\n\n{letter * 3000}\n"
+    doc = project / "docs" / "superpowers" / "specs" / "six.md"
+    doc.parent.mkdir(parents=True, exist_ok=True)
+    doc.write_text(body)
+    return doc, body
+
+
+def test_ask_cannot_emit_a_whole_spec_file_even_citing_every_section(dispatched, project):
+    """Sibling of `test_autoreview.py::test_no_question_builder_can_emit_a_whole_spec_file`
+    for the `ask` verb: `ops.SECTION_SNAPSHOT_CHARS` is a TOTAL over all resolved sections,
+    so every heading cited still cannot carry the document."""
+    daemon, wo = dispatched
+    _, body = _doc_of_six(project)
+    text = " and ".join(
+        f'section {n} of design doc "docs/superpowers/specs/six.md"' for n in range(1, 7))
+
+    ops.ask_question(wo["id"], f"Which default? Per {text}, I recommend no.")
+
+    neo = NeoStore()
+    try:
+        context = neo.get(1)["context"]
+    finally:
+        neo.close()
+    assert body not in context
+    assert UNCITED not in context
+    assert len(context) < len(body)
+    assert "section truncated" in context
+    for letter in "abcdef":
+        assert letter * 1001 not in context   # 6000 // 6 = 1000 each
+
+
+def test_ask_water_fills_so_a_short_section_donates_to_a_long_one(dispatched, project):
+    """Neo ruling Q1884 generalised to N: equal share is a FLOOR, a shorter section donates
+    its remainder, only oversized sections are trimmed."""
+    daemon, wo = dispatched
+    doc = project / "docs" / "superpowers" / "specs" / "two.md"
+    doc.parent.mkdir(parents=True, exist_ok=True)
+    doc.write_text("# D\n\n## 1. Small\n\nsss\n\n## 2. Big\n\n" + "b" * 9000 + "\n")
+
+    ops.ask_question(
+        wo["id"],
+        'Per section 1 of design doc "docs/superpowers/specs/two.md" and section 2 of '
+        'design doc "docs/superpowers/specs/two.md", I recommend no.')
+
+    neo = NeoStore()
+    try:
+        context = neo.get(1)["context"]
+    finally:
+        neo.close()
+    assert context.count("section truncated") == 1
+    assert "sss" in context                                  # stayed whole
+    assert "b" * 5900 in context and "b" * 6000 not in context   # took the remainder
 
 
 def test_a_question_over_the_cap_is_refused_with_the_fix_named(dispatched):

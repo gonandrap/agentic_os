@@ -10934,8 +10934,9 @@ def resume_feature_order(fo_id: str, fix: str = "",
 
 # -- Neo (OS answerer agent) ---------------------------------------------------------------------
 
-#: The most of a referenced section that rides to Neo. A section this long is a design
-#: document wearing one heading; the cut is announced in the context, never silent.
+#: The most ALL referenced sections together may ride to Neo — a TOTAL, never per section:
+#: per section, a text citing every heading delivered the whole document. Cuts are
+#: announced in the context, never silent.
 SECTION_SNAPSHOT_CHARS = 6000
 
 
@@ -10972,12 +10973,32 @@ def _resolve_section(path: Path, wo: dict[str, Any], ref_path: str,
         if candidate.is_file():
             section = sections.extract_section(candidate.read_text(), which)
             if section is not None:
-                if len(section) > SECTION_SNAPSHOT_CHARS:
-                    section = (section[:SECTION_SNAPSHOT_CHARS]
-                               + "\n[… section truncated — it is longer than "
-                                 f"{SECTION_SNAPSHOT_CHARS} characters]")
-                return section
+                return section   # verbatim; `_section_blocks` owns the TOTAL budget
     return None
+
+
+def _water_fill(sizes: list[int], total: int) -> list[int]:
+    """What each block may spend of one `total`: equal share is a FLOOR, a block under its
+    share donates the remainder to the rest, repeated until stable.
+
+    Neo ruling Q1884 ("half is a FLOOR an under-floor block donates its remainder from")
+    generalised from 2 blocks to N. `autoreview._share` is the 2-block case at render time.
+    """
+    allowed = list(sizes)
+    open_ = set(range(len(sizes)))
+    budget = total
+    while open_:
+        share = budget // len(open_)
+        under = [i for i in open_ if sizes[i] <= share]
+        if not under:
+            for i in open_:
+                allowed[i] = share
+            break
+        for i in under:
+            allowed[i] = sizes[i]
+            budget -= sizes[i]
+            open_.discard(i)
+    return allowed
 
 
 #: The in-text form, shown in every refusal below. There is no `--section` flag: the
@@ -10997,6 +11018,10 @@ def _section_blocks(path: Path, wo: dict[str, Any],
     text, never a count of sections. Two refusals, and each leaves the caller a move: a
     document named with no section (nothing to resolve), and a reference that does not
     resolve (the whole file is never substituted, and it is never silently dropped).
+
+    `SECTION_SNAPSHOT_CHARS` is ONE TOTAL over every resolved section, water-filled
+    (`_water_fill`), so citing every heading of a document cannot deliver the document —
+    on the `ask` path and in the stored `assumptions.spec_text` alike.
     """
     from . import sections
 
@@ -11020,7 +11045,12 @@ def _section_blocks(path: Path, wo: dict[str, Any],
                            f"The section is what Neo reads, so nothing is recorded until "
                            f"the reference resolves.")
         out.append((ref_path, which, section))
-    return out
+    allowed = _water_fill([len(s) for _, _, s in out], SECTION_SNAPSHOT_CHARS)
+    return [(ref_path, which,
+             section if len(section) <= cap else
+             section[:cap] + f"\n[… section truncated — {cap:,} of {len(section):,} "
+                             f"characters; full section: {ref_path} § {which}]")
+            for (ref_path, which, section), cap in zip(out, allowed)]
 
 
 def ask_question(wo_id: str, question: str, project_name: str | None = None) -> dict[str, Any]:
@@ -11030,12 +11060,13 @@ def ask_question(wo_id: str, question: str, project_name: str | None = None) -> 
     exists precisely to keep these off the user's plate. The answer arrives as the
     worker's next user turn via the normal message-delivery path.
 
-    A question is one paragraph that may reference a design artifact section in-text
-    (`from section 3 of design doc "docs/superpowers/specs/x.md"`). The reference is resolved HERE,
-    at ask time: the section — and only the section — is snapshotted into the question's
-    context, so Neo reads exactly the design context the paragraph argues from while the
-    recorded question stays a paragraph. A reference that does not resolve and a document
-    named with no section are both REFUSALS — see `_section_blocks`.
+    A question is one paragraph that may reference design artifact sections in-text
+    (`from section 3 of design doc "docs/superpowers/specs/x.md"`). Every reference is resolved HERE,
+    at ask time: those sections — and only those sections, their total bounded by
+    `SECTION_SNAPSHOT_CHARS` — are snapshotted into the question's context, so Neo reads
+    exactly the design context the paragraph argues from while the recorded question stays
+    a paragraph. A reference that does not resolve and a document named with no section are
+    both REFUSALS — see `_section_blocks`.
     """
     from .neo_store import NeoStore
 

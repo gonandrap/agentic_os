@@ -2626,8 +2626,10 @@ UNCITED = "THE-UNCITED-SENTENCE, which nobody asked about."
 
 
 def test_no_question_builder_can_emit_a_whole_spec_file():
-    """The regression the decision exists to prevent: a payload carrying a DOCUMENT. All
-    three builders — both assumption passes and the plan review."""
+    """The regression the decision exists to prevent: a payload carrying a DOCUMENT. The
+    builders pinned by name: `propose`, `propose_confirmation`, `plans.build_plan_context`.
+    `ops.ask_question` is pinned by its sibling, tests/test_question_diet.py
+    ::test_ask_cannot_emit_a_whole_spec_file_even_citing_every_section."""
     big = (f"# Design\n\n## 1. Why\n\n{UNCITED}\n" + "w" * 9000
            + "\n\n## 2. The remedy\n\n" + "r" * 9000 + "\n\n## 3. Later\n\n"
            + "l" * 9000 + "\n")
