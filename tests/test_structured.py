@@ -93,6 +93,43 @@ def test_nothing_to_parse_and_an_empty_object_are_different_answers():
     assert structured.parse_json_object("{}") == {}
 
 
+# --- parse_json_objects: the successive objects, no policy ------------------------
+
+#: Issue #1098, verbatim: a verdict object, a prose line, then a second object.
+TWO_OBJECTS = ('{"escalate": false, "answer": "x", "reason": "y"}\n'
+               'Dispatch filed alongside the answer:\n'
+               '{"dispatch": {"title": "t", "description": "d"}}')
+
+
+def test_parse_json_objects_returns_both_objects_across_prose():
+    assert structured.parse_json_objects(TWO_OBJECTS) == [
+        {"escalate": False, "answer": "x", "reason": "y"},
+        {"dispatch": {"title": "t", "description": "d"}},
+    ]
+
+
+def test_parse_json_objects_on_a_single_object():
+    assert structured.parse_json_objects('here: {"ok": 1} — done') == [{"ok": 1}]
+
+
+def test_parse_json_objects_on_prose_with_no_object():
+    assert structured.parse_json_objects("no braces here at all") == []
+    assert structured.parse_json_objects("") == []
+
+
+def test_a_nested_object_is_one_result_not_two():
+    assert structured.parse_json_objects('{"ok": {"inner": 1}}') == [{"ok": {"inner": 1}}]
+
+
+def test_arrays_and_scalars_are_not_objects():
+    assert structured.parse_json_objects('[1, 2] 7 "s" true') == []
+
+
+def test_parse_json_object_still_refuses_the_two_object_reply():
+    # The single-object refusal stays pinned: the fold lives in `neo`, not here.
+    assert structured.parse_json_object(TWO_OBJECTS) is None
+
+
 # --- close_unterminated: the one repair, and everything it refuses to repair -------
 #
 # The boundary these tests exist to hold is a single sentence: CLOSERS ONLY. A reply

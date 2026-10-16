@@ -86,7 +86,8 @@ An escalation may carry one optional label, which is grouped and reported:
   "cause": "<on an escalation, name the cause from this list; omit it if none fits: \
 high-stakes | no-learning-applies>"
 Either may carry one optional cleanup dispatch:
-  "dispatch": {"title": "<short: which record is wrong>", "description": "<the full brief>"}"""
+  "dispatch": {"title": "<short: which record is wrong>", "description": "<the full brief>"}
+`dispatch` is a FIELD of that one JSON object, never a second object after it (issue #1098)."""
 
 
 # The learnings block is the one part of Neo's prompt that grows without limit. Every
@@ -340,6 +341,37 @@ def _unparseable_verdict(raw: str) -> dict[str, Any]:
             "reason": f"{UNPARSEABLE_PREFIX}{(raw or '')[:120]}"}
 
 
+def _fold_split_reply(raw: str) -> dict[str, Any]:
+    """Last chance before the fail-safe: one verdict split across two JSON objects.
+
+    Issue #1098 — Neo answered, then emitted `{"dispatch": …}` as a SECOND top-level
+    object with a prose line between. The greedy single-object span covers both and
+    parses as nothing, so a settled answer reached the user as `unparseable-reply` and
+    the dispatch was never filed.
+
+    ONLY `dispatch` is mirrored, and only when exactly ONE object rules: two objects
+    carrying `escalate` is a reply that said two things, which stays unreadable rather
+    than being resolved by picking one. Everything else falls through to
+    `_unparseable_verdict`, which remains last.
+    """
+    objects = structured.parse_json_objects(raw)
+    if len(objects) < 2:
+        return _unparseable_verdict(raw)
+    ruling = [o for o in objects if "escalate" in o]
+    if len(ruling) != 1:
+        return _unparseable_verdict(raw)
+    verdict = dict(ruling[0])
+    if verdict.get("dispatch") is None:
+        for other in objects:
+            if other is not ruling[0] and other.get("dispatch") is not None:
+                verdict["dispatch"] = other["dispatch"]
+                break
+    try:
+        return _validate_verdict(verdict)
+    except Exception:
+        return _unparseable_verdict(raw)
+
+
 def parse_verdict(raw: str) -> dict[str, Any]:
     """Parse Neo's strict-JSON reply, tolerating fenced or chatty output.
     Unparseable output is treated as an escalation — never deliver garbage.
@@ -352,7 +384,7 @@ def parse_verdict(raw: str) -> dict[str, Any]:
 
     `dispatch` is absent on almost every answer; None means "nothing to clean up".
     """
-    return structured.coerce(raw, _validate_verdict, on_invalid=_unparseable_verdict)
+    return structured.coerce(raw, _validate_verdict, on_invalid=_fold_split_reply)
 
 
 def answer_question(store: NeoStore, q: dict[str, Any], model: str,
