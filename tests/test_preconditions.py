@@ -175,6 +175,80 @@ def test_an_empty_ref_is_refused(started):
         ops.create_work_order("proj_a", "wire it", blocked_by=["  "])
 
 
+# -- §2.4.1: a held backlog item holds its promotion -----------------------------------
+
+def test_a_promotion_of_a_held_item_is_held_even_when_its_own_brief_is_silent(
+        started, store, central):
+    """THE REVIEW'S REPRO (issue 1089, clause 2; Neo 1914). The HOLD is in the item's
+    title; the order's own brief repeats nothing."""
+    item = central.add_backlog("proj_a", HOLD_BRIEF)
+
+    wo = ops.create_work_order("proj_a", "wire the actor", description="",
+                               backlog_id=item["id"])
+
+    assert [r["ref"] for r in store.open_preconditions(wo["id"])] == [item["id"]]
+    assert store.claim_next_pending() is None
+
+
+def test_promote_backlog_of_a_held_item_succeeds_and_the_order_is_held(
+        started, store, central):
+    item = central.add_backlog("proj_a", "wire the actor", description=HOLD_BRIEF)
+
+    out = ops.promote_backlog(item["id"])
+
+    assert [r["ref"] for r in store.open_preconditions(out["wo_id"])] == [item["id"]]
+    assert store.claim_next_pending() is None
+
+
+def test_the_matched_sentence_is_the_note_on_the_attached_row(started, store, central):
+    item = central.add_backlog("proj_a", "wire the actor", description=HOLD_BRIEF)
+
+    wo = ops.create_work_order("proj_a", "wire the actor", backlog_id=item["id"])
+
+    row = store.open_preconditions(wo["id"])[0]
+    assert HOLD_BRIEF.lower() in row["note"].lower()
+
+
+def test_an_open_item_that_states_no_hold_attaches_nothing(started, store, central):
+    item = central.add_backlog("proj_a", "the 5a predicate fix",
+                               description="wire the actor")
+
+    wo = ops.create_work_order("proj_a", "wire the actor", backlog_id=item["id"])
+
+    assert store.open_preconditions(wo["id"]) == []
+    assert store.claim_next_pending()["id"] == wo["id"]
+
+
+@pytest.mark.parametrize("status", ["promoted", "done", "dropped"])
+def test_an_item_that_is_not_open_attaches_nothing(started, store, central, status):
+    item = central.add_backlog("proj_a", "wire the actor", description=HOLD_BRIEF)
+    central.mark_backlog(item["id"], status)
+
+    wo = ops.create_work_order("proj_a", "wire the actor", backlog_id=item["id"])
+
+    assert store.open_preconditions(wo["id"]) == []
+
+
+def test_an_explicit_hold_wins_and_nothing_extra_is_attached(started, store, central):
+    item = central.add_backlog("proj_a", "wire the actor", description=HOLD_BRIEF)
+
+    wo = ops.create_work_order("proj_a", "wire the actor", backlog_id=item["id"],
+                               blocked_by=["kn-5845939d"])
+
+    assert [r["ref"] for r in store.open_preconditions(wo["id"])] == ["kn-5845939d"]
+
+
+def test_a_dependency_edge_wins_too_and_nothing_extra_is_attached(started, store,
+                                                                 central):
+    item = central.add_backlog("proj_a", "wire the actor", description=HOLD_BRIEF)
+    dep = ops.create_work_order("proj_a", "the predicate fix")
+
+    wo = ops.create_work_order("proj_a", "wire the actor", backlog_id=item["id"],
+                               depends_on=[dep["id"]])
+
+    assert store.open_preconditions(wo["id"]) == []
+
+
 # -- §2.5: the detector --------------------------------------------------------------
 
 def _unwired(store: ProjectStore) -> str:
@@ -233,9 +307,30 @@ def test_the_violation_notifies_and_raises_no_attention_flag(project, catalog_fi
     store.close()
 
 
+def test_the_notification_does_not_quote_the_brief(project, catalog_file):
+    """§2.5: the matched sentence stays on the record, never in a notification."""
+    store = ProjectStore(project)
+    wo_id = _unwired(store)
+    daemon = Daemon(load_catalog(catalog_file))
+    spec = load_catalog(catalog_file).projects[0]
+
+    daemon.check_invariants(spec, store)
+
+    note = [n for n in store.unrouted_notifications()
+            if invariants.INV_PRECONDITION_UNWIRED in n["title"]][0]
+    assert HOLD_BRIEF.lower() not in note["body"].lower()
+    assert wo_id in note["body"] and "unwired stop condition" in note["body"]
+    # ...and the sentence IS on the record `jarvis wo show` reads.
+    event = [e for e in store.list_events(wo_id) if e["kind"] == "invariant"][0]
+    payload = json.loads(event["payload"])
+    assert HOLD_BRIEF.lower() in payload["matched"].lower()
+    assert HOLD_BRIEF.lower() in payload["detail"].lower()
+    store.close()
+
+
 # -- §2.6: re-derivation -------------------------------------------------------------
 
-@pytest.mark.parametrize("status", ["promoted", "done", "dropped"])
+@pytest.mark.parametrize("status", ["done", "dropped"])
 def test_a_settled_backlog_item_clears_the_row(started, store, central, status):
     item = central.add_backlog("proj_a", "the 5a predicate fix")
     wo = ops.create_work_order("proj_a", "wire the actor", blocked_by=[item["id"]])
@@ -263,6 +358,33 @@ def test_an_open_backlog_item_does_not_clear_the_row(started, store, central):
     assert [r["ref"] for r in store.open_preconditions(wo["id"])] == [item["id"]]
 
 
+def test_a_promoted_backlog_item_does_not_clear_the_row(started, store, central):
+    """§2.6: `promoted` means the item became a work order, not that it was done."""
+    item = central.add_backlog("proj_a", "the 5a predicate fix")
+    wo = ops.create_work_order("proj_a", "wire the actor", blocked_by=[item["id"]])
+    central.mark_backlog(item["id"], "promoted")
+    spec = started.catalog.projects[0]
+
+    started.clear_settled_preconditions(spec, store)
+
+    assert [r["ref"] for r in store.open_preconditions(wo["id"])] == [item["id"]]
+    assert store.claim_next_pending() is None
+
+
+def test_a_promoted_hold_is_live_not_stranding(started, store, central):
+    """§2.6: the daemon can still clear it, so `unblock` without `--all` must not."""
+    item = central.add_backlog("proj_a", "the 5a predicate fix")
+    wo = ops.create_work_order("proj_a", "wire the actor", blocked_by=[item["id"]])
+    central.mark_backlog(item["id"], "promoted")
+
+    rows = store.open_preconditions(wo["id"])
+    assert ops._split_preconditions(rows) == ([item["id"]], [])
+
+    with pytest.raises(ops.OpsError) as e:
+        ops.unblock_work_order(wo["id"])
+    assert item["id"] in str(e.value) and "--all" in str(e.value)
+
+
 @pytest.mark.parametrize("ref", ["bl-nosuchitem", "kn-5845939d"])
 def test_a_ref_the_os_cannot_derive_stays_open(started, store, ref):
     wo = ops.create_work_order("proj_a", "wire the actor", blocked_by=[ref])
@@ -279,6 +401,20 @@ def test_the_tick_clears_before_it_dispatches():
     assert (src.index("clear_settled_preconditions")
             < src.index("self.hold_red_release")
             < src.index("self.dispatch_pending"))
+
+
+def test_a_real_tick_clears_before_it_dispatches(started, monkeypatch):
+    """The same order on a REAL tick, not read off the source (§2.6)."""
+    order: list[str] = []
+    monkeypatch.setattr(Daemon, "clear_settled_preconditions",
+                        lambda self, p, s: order.append("clear"))
+    monkeypatch.setattr(Daemon, "dispatch_pending",
+                        lambda self, p, s, state: order.append("dispatch"))
+    started.tick_count = 0      # the next tick is a reconcile one
+
+    started.tick()
+
+    assert order == ["clear", "dispatch"]
 
 
 # -- §2.6: `jarvis wo unblock` -------------------------------------------------------

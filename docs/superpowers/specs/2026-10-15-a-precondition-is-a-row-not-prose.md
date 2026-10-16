@@ -224,6 +224,41 @@ refused: refusing at plan release would reject a plan a human has already approv
 last step, with no route back but a re-plan. A planner child that states a hold is caught
 by §2.5 instead. That asymmetry is the point of having a detector at all.
 
+#### 2.4.1 A promotion of a HELD backlog item is held, not refused
+
+Issue 1089's second clause: a work order that is a promotion of an OPEN held backlog item
+must not leave `pending`. `ops.promote_backlog` copies the item's title and description
+verbatim, so the §2.4 refusal catches that path — but a caller passing `backlog_id` with a
+brief of its own that repeats no stop phrase does not state a hold, and the order is
+claimed. That is the hole.
+
+**The trigger is `backlog_id`, not the brief.** When `ops.create_work_order` is given a
+truthy `backlog_id`, it reads the central item once (`CentralStore.get_backlog`); if the
+item exists, its status is `open`, and `preconditions.states_hold(item["title"],
+item["description"] or "")` matches, a precondition row is ATTACHED with
+`ref = backlog_id` and `note` = the matched sentence.
+
+**The ref stays structural.** `backlog_id` is what the caller passed, not a ref read out of
+the item's text, so §2.4's rule — a ref invented from prose is the whole defect — holds:
+the attachment derives nothing. Only the NOTE comes from the text, and a note is
+description, never a predicate.
+
+**It is an attachment and not a refusal**, per Neo question 1914: "Promoting a held item
+must file the order and hold it visibly — refusing hides the work." The §2.4 refusal does
+not fire for an order that got this row, and is otherwise unchanged. Only when nothing the
+caller typed already holds the order (`depends_on` or `--blocked-by`): an explicit hold
+wins and nothing is added.
+
+**Ordering.** The central read happens BEFORE `ProjectStore` is opened, so §2.4's property
+— a refused order leaves no row — survives. One extra `get_backlog`, and only when
+`backlog_id` is truthy.
+
+**The hold is effectively permanent, and that is why §2.7 names the escape hatch.** The
+daemon clears a `bl-` ref when the item goes `done`/`dropped` (§2.6), and `ops.py` marks a
+promoted item `done` only when the order itself COMPLETES — which it cannot, while held.
+So `jarvis wo unblock <wo-id>` is the release, and the pending label says so rather than
+reading as a stuck daemon.
+
 ### 2.5 Gap class `unwired-precondition`, with a real detector
 
 New entry in `gaps.GAP_CLASSES` (`src/jarvis/gaps.py:74`) and in `SHIPPED_GAP_CLASSES`
@@ -314,8 +349,13 @@ interval later.
 For each open precondition row whose `ref` starts `bl-`: read `self.central.get_backlog(ref)`
 (beside `list_backlog`, `src/jarvis/central_store.py:761`; the `backlog.status` vocabulary
 is `open | promoted | done | dropped`, `:140`). Clear the row with `by="os"` when the item
-exists and its status is NOT `open`. One indexed read per open row, and zero work for a
-project with none.
+exists and its status is `done` or `dropped` — the set named once as
+`central_store.SETTLED_BACKLOG_STATUSES`. One indexed read per open row, and zero work for
+a project with none.
+
+**`promoted` is NOT satisfaction.** It says the item was turned into a work order, not that
+its condition was met: in issue 1089's own repro the held item IS the work, so counting
+promotion would drop the hold on the very next tick, exactly when the work starts.
 
 **A `bl-` ref that resolves to NOTHING does not clear.** A missing row means the ref names
 nothing the OS can reason about — a typo, or a deleted item — and clearing on absence would
@@ -334,7 +374,8 @@ hold is two things for the user to remember and two to forget.
   clears every open precondition row the daemon can never clear — every non-`bl-` ref, and
   a `bl-` ref resolving to no central row. That is the same criterion the dependency default
   already uses: these are the holds that strand the order forever.
-- **`--all`** additionally clears `bl-` rows whose backlog item is still `open` — the user
+- **`--all`** additionally clears `bl-` rows whose backlog item is UNSETTLED — `open` or
+  `promoted`, the live set `ops._split_preconditions` derives — the user
   saying "run it anyway, without the thing it was told to wait for", which is exactly what
   `--all` already means for a live dependency edge.
 - the two refusals widen: `is not blocked by anything` must now count rows as well as edges,
@@ -452,10 +493,18 @@ is what the issue's requirement is actually about: no new blocker vocabulary.
    containing the matched sentence, `--depends-on` and `--blocked-by`; no row left behind;
    accepted with either wiring; and the named false negatives (`wait for X first`, `after Y
    ships`, `once Z lands`) create normally.
+6a. **The held promotion (§2.4.1)**: an order created with `backlog_id` naming an OPEN item
+   whose TITLE states a hold, and whose own brief repeats nothing, gets a row with
+   `ref == <backlog id>` and is NOT claimed (`claim_next_pending()` is None) — the review's
+   repro; `ops.promote_backlog` of such an item raises no `OpsError` and its order is held;
+   the matched sentence is on the row's `note`; nothing is attached for an open item that
+   states no hold, for an item that is not `open`, or when `--blocked-by`/`depends_on`
+   already holds the order.
 7. **Re-derivation**: a `bl-` precondition clears on the reconcile tick when the backlog
-   item goes `promoted`/`done`/`dropped`, with a `precondition_cleared` event and
-   `cleared_by == "os"`; it does NOT clear while the item is `open`, nor when the item does
-   not exist; a `kn-` ref never clears by itself.
+   item goes `done`/`dropped`, with a `precondition_cleared` event and
+   `cleared_by == "os"`; it does NOT clear while the item is `open` or `promoted`, nor when
+   the item does not exist; a `promoted` ref is in `_split_preconditions`'s live set; a
+   `kn-` ref never clears by itself.
 8. **`jarvis wo unblock`**: default clears the underivable rows and refuses on a live `bl-`
    one naming `--all`; `--all` clears it; `preconditions_cleared` is in the payload; the
    dependency-only behaviour is unchanged.

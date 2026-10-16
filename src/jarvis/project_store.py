@@ -2282,13 +2282,18 @@ class ProjectStore:
     def clear_precondition(self, id_or_ref: int | str, *, by: str) -> None:
         """Clear one row by its `id` or by its `ref`, naming the party that did it."""
         assert by in PRECONDITION_CLEARED_BY, by
-        column = "id" if isinstance(id_or_ref, int) else "ref"
-        rows = self.conn.execute(
-            f"SELECT wo_id, ref, note FROM preconditions "
-            f"WHERE {column}=? AND status='open'", (id_or_ref,)).fetchall()
-        self.conn.execute(
-            f"UPDATE preconditions SET status='cleared', cleared_at=?, cleared_by=? "
-            f"WHERE {column}=? AND status='open'", (db.now(), by, id_or_ref))
+        by_id = isinstance(id_or_ref, int)
+        # Column names spelled as literals, never interpolated.
+        select = ("SELECT wo_id, ref, note FROM preconditions "
+                  "WHERE id=? AND status='open'" if by_id else
+                  "SELECT wo_id, ref, note FROM preconditions "
+                  "WHERE ref=? AND status='open'")
+        update = ("UPDATE preconditions SET status='cleared', cleared_at=?, cleared_by=? "
+                  "WHERE id=? AND status='open'" if by_id else
+                  "UPDATE preconditions SET status='cleared', cleared_at=?, cleared_by=? "
+                  "WHERE ref=? AND status='open'")
+        rows = self.conn.execute(select, (id_or_ref,)).fetchall()
+        self.conn.execute(update, (db.now(), by, id_or_ref))
         for row in rows:
             self.add_event(row["wo_id"], "precondition_cleared",
                            {"ref": row["ref"], "by": by, "note": row["note"]})

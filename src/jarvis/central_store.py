@@ -53,6 +53,13 @@ AIMED_VERBS = ("show", "search")
 #: it lives here because the store cannot import `ops` (layering runs stores upward only).
 MISSED_MIN_WORDS = 3
 
+#: Backlog statuses that SATISFY a `bl-` precondition. `promoted` is not one: it says the
+#: item became a work order, not that its condition was met (spec
+#: docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md §2.6). One
+#: constant so `Daemon.clear_settled_preconditions` and `ops._split_preconditions` cannot
+#: drift onto two sets.
+SETTLED_BACKLOG_STATUSES = ("done", "dropped")
+
 
 def split_tags(tags: str) -> list[str]:
     return [t for t in (s.strip() for s in (tags or "").split(",")) if t]

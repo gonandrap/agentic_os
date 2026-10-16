@@ -46,7 +46,7 @@ from .agent_usage import (
     OBSERVE_CONTEXT, OBSERVE_INSPECT, OBSERVE_LIVE, OBSERVE_WHY,
 )
 from .sections import QUESTION_MAX_CHARS, QUESTION_WARN_CHARS
-from .central_store import MISSED_MIN_WORDS, CentralStore
+from .central_store import MISSED_MIN_WORDS, SETTLED_BACKLOG_STATUSES, CentralStore
 from .daemon import (
     answers_question,
     daemon_running,
@@ -955,8 +955,24 @@ def create_work_order(project_name: str, title: str, description: str = "",
     # brief that states a stop condition and is held by nothing would be claimed and
     # dispatched (§2.4) — and this is a refusal and NEVER an attachment: a ref invented
     # from prose is the whole defect.
+    # §2.4.1: a promotion of an OPEN backlog item whose own text states a hold is HELD,
+    # not refused (issue 1089 clause 2, Neo 1914). Read before the store is opened so the
+    # refusal below keeps its property of leaving no row, and only when nothing the caller
+    # typed already holds the order. The ref is `backlog_id` verbatim — structural, never
+    # derived from the prose — and the matched sentence is the note.
+    backlog_hold: tuple[str, str] | None = None
+    if backlog_id and not (depends_on or holds):
+        central = CentralStore()
+        try:
+            item = central.get_backlog(backlog_id)
+        finally:
+            central.close()
+        if item and item["status"] == "open":
+            matched = preconditions.states_hold(item["title"], item["description"] or "")
+            if matched:
+                backlog_hold = (backlog_id, matched)
     stated = preconditions.states_hold(title, description)
-    if stated and not (depends_on or holds):
+    if stated and not (depends_on or holds or backlog_hold):
         raise OpsError(
             f"cannot create this work order: its brief states a stop condition — "
             f"\"{stated}\" — and nothing holds it back, so jarvisd would claim and "
@@ -1003,6 +1019,8 @@ def create_work_order(project_name: str, title: str, description: str = "",
         # after the claim is no hold (§2.3).
         for ref in holds:
             store.add_precondition(wo["id"], ref)
+        if backlog_hold:                                    # §2.4.1
+            store.add_precondition(wo["id"], backlog_hold[0], note=backlog_hold[1])
         # AT CREATION, from the brief the order is actually given — the only moment at
         # which "this order points at that issue" is a fact rather than an inference.
         record_issue_references(store, paths[project_name], wo)
@@ -8514,7 +8532,10 @@ def _split_preconditions(rows: list[dict[str, Any]]) -> tuple[list[str], list[st
         for row in rows:
             ref = str(row["ref"])
             item = central.get_backlog(ref) if ref.startswith("bl-") else None
-            (live if item is not None and item["status"] == "open"
+            # Unsettled, NOT just `open`: a `promoted` item is still one the daemon can
+            # clear later, so cutting its edge here would strand nothing (§2.6).
+            (live if item is not None
+             and item["status"] not in SETTLED_BACKLOG_STATUSES
              else stranding).append(ref)
     finally:
         central.close()

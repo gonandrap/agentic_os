@@ -551,6 +551,10 @@ class Violation:
     #: docs/superpowers/specs/2026-10-13-an-assumption-review-payload-carries-its-spec-section.md
     #: §2.3, Neo 1695).
     subject_id: str | None = None
+    #: What the NOTIFICATION says, when `detail` holds text that must not leave the
+    #: record — the user's own brief, say. Empty means the notification uses `detail`
+    #: (spec docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md §2.5).
+    notice: str = ""
 
     @property
     def key(self) -> tuple[str, str | None]:
@@ -1899,7 +1903,7 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
                  f"(`jarvis wo unblock {wo['id']}`)")
         return f"{label} — {notes}" if notes else label
     # ABOVE the dependency and slot labels, inverting their order: those two clear
-    # themselves, and this one clears only when a person rules on the plan. Of the three
+    # themselves, and this one clears only when a person rules on the plan. Of the four
     # true sentences it is the one naming a move (spec §2.3). Flagless — `true_blockers`
     # gets no branch, so INV-ATTENTION-MISSING stays quiet without an exception.
     hold = store.plan_hold(wo)
@@ -5367,6 +5371,12 @@ def check_precondition_is_wired(store: ProjectStore) -> Iterator[Violation]:
                    f"(`--blocked-by`/`--depends-on` at creation) or delete the sentence",
             repaired=False,
             owed="",
+            # The matched sentence is the USER's text: it stays on the record and never
+            # rides outward into a notification (§2.5).
+            notice=f"{wo['id']}: its brief states an unwired stop condition and nothing "
+                   f"holds it back, so the claim takes it — wire the hold "
+                   f"(`--blocked-by`/`--depends-on` at creation) or delete the sentence; "
+                   f"`jarvis wo show {wo['id']}` quotes it",
             context={"matched": matched},
         )
 

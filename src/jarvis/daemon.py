@@ -60,7 +60,7 @@ from . import (background, bugreport, bus, claude_cli, db, fleet, holds, inspect
                notify, release, usage_meter, worker_session)
 from . import budget as budget_mod
 from .catalog import Catalog, ProjectSpec, load_catalog
-from .central_store import CentralStore
+from .central_store import SETTLED_BACKLOG_STATUSES, CentralStore
 from .dispatch import dispatch_work_order
 from . import invariants as invariants_mod
 from .invariants import PR_REPAIR_STATUSES, RETRY_HELD_RESTATE
@@ -5775,9 +5775,13 @@ class Daemon:
                 # the double-report that buried wo-1abd3886 in a 230-item pile. One with
                 # `owed` and no `wo_id` is project-level, has no order to flag, and keeps
                 # its notification (spec §4).
+                # `v.notice` when the checker set one: its `detail` carries text that
+                # must not leave the record (spec 2026-10-15-a-precondition-is-a-row-
+                # not-prose.md §2.5).
                 store.add_notification(
                     title=f"OS invariant violated: {v.invariant}",
-                    body=f"{v.detail}" + (f" ({v.wo_id})" if v.wo_id else ""),
+                    body=v.notice or (f"{v.detail}"
+                                      + (f" ({v.wo_id})" if v.wo_id else "")),
                     # The violation's OWN level: most are `warning`, and one that must
                     # not arrive beside a stale attention flag says `critical`.
                     level=v.level, wo_id=v.wo_id, source="invariants",
@@ -9730,7 +9734,7 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
                 if not ref.startswith("bl-"):
                     continue
                 item = self.central.get_backlog(ref)
-                if item is None or item["status"] == "open":
+                if item is None or item["status"] not in SETTLED_BACKLOG_STATUSES:
                     continue
                 store.clear_precondition(int(row["id"]), by="os")
                 log.info("[%s] %s: precondition %s cleared (%s is %s)", project.name,
