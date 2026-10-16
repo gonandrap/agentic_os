@@ -766,6 +766,39 @@ def test_the_shipped_exempt_kinds_default_parses():
         jarvis.catalog.DEFAULT_FLEET_HEALTH_EXEMPT_KINDS
 
 
+def test_red_episode_retention_is_resolvable_fleet_wide_and_per_project():
+    """§2 "The retention bound is a CATALOG KEY" of
+    docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md: Neo's one
+    condition on 1818 — how long the OS remembers one project's red-base episodes is never
+    a module constant. Per project by nature, so NOT a fleet-only key, and a plain positive
+    int, so the reflective tail loop already refuses `0` and `-1` naming the key."""
+    cat = parse_catalog({
+        "os": {"fleet_health": {"red_episode_retention_hours": 72,
+                                "cooldown_minutes": 99}},
+        "projects": [{"name": "a", "path": "/tmp/a"},
+                     {"name": "b", "path": "/tmp/b",
+                      "fleet_health": {"red_episode_retention_hours": 12}}],
+    })
+    assert cat.os.fleet_health.red_episode_retention_hours == 72
+    assert cat.projects[0].fleet_health.red_episode_retention_hours == 72
+    assert cat.projects[1].fleet_health.red_episode_retention_hours == 12
+    # A project naming it keeps the fleet answer for every other field.
+    assert cat.projects[1].fleet_health.cooldown_minutes == 99
+
+    assert jarvis.catalog.FleetHealthConfig().red_episode_retention_hours == \
+        jarvis.catalog.DEFAULT_FLEET_HEALTH_RED_EPISODE_RETENTION_HOURS == 168
+    assert "red_episode_retention_hours" not in \
+        jarvis.catalog.FLEET_HEALTH_FLEET_ONLY_KEYS
+    assert "red_episode_retention_hours" not in jarvis.catalog.FLEET_HEALTH_LIST_KEYS
+    assert "red_episode_retention_hours" not in jarvis.catalog.FLEET_HEALTH_MAP_KEYS
+    for bad in (0, -1):
+        with pytest.raises(CatalogError,
+                           match=r"red_episode_retention_hours must be >= 1"):
+            parse_catalog({"projects": [
+                {"name": "a", "path": "/tmp/a",
+                 "fleet_health": {"red_episode_retention_hours": bad}}]})
+
+
 def test_sweep_dark_minutes_is_refused_on_a_project():
     """A FLEET number, `max_per_day`'s reason: the stuck sweep writes ONE fleet-wide run
     record, so no arrangement of per-project numbers can say how long it may be silent."""
