@@ -512,6 +512,13 @@ if [ "$any_installed" = 0 ]; then
 fi
 
 # --- 7. notify Telegram (best-effort) -------------------------------------------
+# >>> telegram-notify (sliced verbatim by tests/test_shipit.py — keep both markers)
+# The 0.11.8 release printed "telegram: notified" and delivered nothing: curl without
+# -f exits 0 on HTTP 4xx, and stderr went to /dev/null, so the cause was unrecoverable.
+# One call must yield the exit code, the status AND the body — Telegram's reason is the
+# JSON "description" — hence -w and no -f. Still best-effort: always returns 0.
+# Every string that reaches `say` is token-redacted first: the token is in the URL, so
+# curl quotes it back in its own stderr.
 notify_telegram() {
   local text="🚀 Shipped $TAG to production ($PROD_DIR)"
   if [ "$DRY_RUN" = 1 ]; then
@@ -525,13 +532,38 @@ notify_telegram() {
   if [ -z "$tok" ] || [ -z "$chat" ]; then
     say "telegram: token/chat_id not in $PROD_SECRETS — skipped"; return 0
   fi
-  if curl -sS --max-time 15 "https://api.telegram.org/bot${tok}/sendMessage" \
-       -d "chat_id=${chat}" -d "text=${text}" >/dev/null 2>&1; then
-    say "telegram: notified"
-  else
-    say "telegram: send failed (non-fatal)"
+  local errfile out err status body desc rc=0
+  errfile="$(mktemp)" || { say "telegram: no temp file for curl's stderr — skipped"; return 0; }
+  out="$(curl -sS --max-time 15 -w '\n%{http_code}' \
+         "https://api.telegram.org/bot${tok}/sendMessage" \
+         -d "chat_id=${chat}" -d "text=${text}" 2>"$errfile")" || rc=$?
+  err="$(cat "$errfile")"; rm -f "$errfile"
+  err="${err//"$tok"/<redacted>}"
+  if [ "$rc" -ne 0 ]; then
+    say "telegram: send failed (curl exit $rc: ${err:-no stderr})"
+    return 0
   fi
+  status="${out##*$'\n'}"   # -w put the status on its own last line, after the body
+  body="${out%$'\n'*}"
+  body="${body//"$tok"/<redacted>}"
+  # jq is not a dependency; a parse that fails must degrade to no description.
+  desc="$(printf '%s' "$body" \
+          | sed -n 's/.*"description"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+          | head -n 1)" || desc=""
+  case "$status" in
+    2??)
+      # A 200 with "ok":false is the silent failure this whole change exists for.
+      if printf '%s' "$body" | grep -q '"ok"[[:space:]]*:[[:space:]]*false'; then
+        say "telegram: send failed (HTTP $status, ok:false${desc:+: $desc})"
+      else
+        say "telegram: notified"
+      fi
+      ;;
+    *) say "telegram: HTTP ${status:-unknown}: ${desc:-${body:-no response body}}" ;;
+  esac
+  return 0
 }
+# <<< telegram-notify
 say "notifying telegram"
 notify_telegram
 
