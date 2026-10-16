@@ -7952,7 +7952,13 @@ class Daemon:
                     return
             if not decision.armed:
                 self._note_automerge_held(store, wo_id, decision)
-                if (not record_only and decision.code == automerge.HELD_SHA_MOVED
+                # TWO CODES, ONE PROPERTY (spec 2026-10-16 §1): a passed round whose
+                # commit binding is unusable and a pull request otherwise ready. Keyed on
+                # one of them, this arm left every `sha_unrecorded` stall permanent
+                # (issue 1095). `HELD_NOT_PASSED` stays out — that verdict stands.
+                if (not record_only
+                        and decision.code in (automerge.HELD_SHA_MOVED,
+                                              automerge.HELD_SHA_UNRECORDED)
                         and automerge.only_the_head_moved(
                             round_row, wo, pr, cfg, pending_assumptions=pending,
                             plan_assumptions=plan_assumptions)):
@@ -9261,10 +9267,23 @@ class Daemon:
                 log.info("[%s] %s: the head moved to %s and the OS has re-judged this "
                          "merge %s time(s) — leaving it for the user", project.name,
                          wo["id"], out["head_sha"][:10], out["rebinds"])
+            elif not out["judged_sha"]:
+                # Same false claim as the success log below, one branch along: nothing
+                # was judged, so nothing moved (spec 2026-10-16 §3). `REBIND_EXHAUSTED`
+                # above is unreachable on this path — the carry stays `sha_moved`-only.
+                log.info("[%s] %s: the passed round recorded no commit and round %s "
+                         "would be the last — leaving it for the user", project.name,
+                         wo["id"], out["next_round"])
             else:
                 log.info("[%s] %s: the head moved to %s and round %s would be the "
                          "last — leaving it for the user", project.name, wo["id"],
                          out["head_sha"][:10], out["next_round"])
+        elif not out["judged_sha"]:
+            # NOTHING WAS JUDGED, so "the head moved from  to bbbb1111bb" is the same
+            # false claim the reason text makes (spec 2026-10-16 §3).
+            log.info("[%s] %s: the passed round recorded no commit — re-judging the "
+                     "pull request at %s as round %s", project.name, wo["id"],
+                     out["head_sha"][:10], out["round"])
         else:
             log.info("[%s] %s: the head moved from %s to %s — re-judging it as round %s",
                      project.name, wo["id"], out["judged_sha"][:10],

@@ -1411,3 +1411,146 @@ def test_a_rejected_user_rework_round_with_no_budget_left_goes_to_the_user(
     assert invariants.VALIDATION_STUCK_BLOCKER not in blockers
     assert invariants.REBIND_EXHAUSTED_BLOCKER not in blockers
     assert invariants.SHA_MOVED_BLOCKER not in blockers
+
+
+# -- a verdict bound to NO commit, spec 2026-10-16 --------------------------------------
+#
+# The same stall with the other hold code: the round passed and recorded nothing, because
+# the evidence packet could not fetch the pull request and read a worktree
+# (`evidence.EvidencePacket.pr_error`). `HELD_SHA_UNRECORDED`, not `HELD_SHA_MOVED` — so
+# the self-heal arm never fired and the order parked for ever (issue 1095, wo-5a7f71b5).
+
+
+def unrecorded(project, *, rounds: int = 1, outcome: str = "passed"):
+    """Parked with its latest round `passed` and `head_sha=''` — what a worktree packet
+    leaves behind. `parked`'s own fixture with nothing to bind a verdict to."""
+    return parked(project, judged="", rounds=rounds, outcome=outcome)
+
+
+def forced_payloads(store, wo) -> list[dict]:
+    return [db.from_json(e["payload"], {})
+            for e in store.events_of_kind(wo["id"], "validation_forced")]
+
+
+def test_a_round_that_recorded_no_commit_re_judges_itself(fleet, project, fake_gh):
+    """THE HEAL. Everything else about the pull request is ready — OPEN, green, CLEAN,
+    no assumption owed, budget left — and the only thing missing is which commit the
+    panel accepted. One tick spends one COUNTED round on the head that is there."""
+    store, wo = unrecorded(project)
+    artifact(fake_gh, head_oid=PUSHED)
+
+    poll(fleet, store)
+
+    assert store.get_work_order(wo["id"])["status"] == "validating"
+    payloads = forced_payloads(store, wo)
+    assert len(payloads) == 1
+    assert payloads[0]["by"] == ops.REJUDGE_BY_OS
+    assert payloads[0]["head_sha"] == PUSHED and payloads[0]["judged_sha"] == ""
+    # COUNTED: nothing was judged to rebind and the user asked for nothing.
+    row = store.latest_validation_round(wo_id=wo["id"])
+    assert not row["uncounted_cause"] and not row["uncounted"]
+
+
+def test_the_unrecorded_head_costs_one_round_per_commit(fleet, project, fake_gh):
+    """`ops.rejudged_heads`' dedupe, on this code too. The fetch can fail twice — the
+    round the OS just opened records `''` again — and a key that saturated on the hold
+    would then spend the whole budget at a standstill."""
+    store, wo = unrecorded(project)
+    artifact(fake_gh, head_oid=PUSHED)
+    poll(fleet, store)
+    judge(fleet, store, Panel("passed"))
+    # The pull request was unreadable again: round 2 bound no commit either.
+    store.set_validation_head(store.latest_validation_round(wo_id=wo["id"])["id"], "")
+
+    poll(fleet, store)
+    poll(fleet, store)
+
+    assert len(forced_payloads(store, wo)) == 1
+    assert not store.events_of_kind(wo["id"], invariants.REJUDGE_DECLINED_EVENT)
+    assert rounds_of(store, wo) == [1, 2]
+
+
+@pytest.mark.parametrize("checks,assumption", [(RED, False), (GREEN, True)])
+def test_an_unrecorded_head_on_a_pull_request_that_is_not_ready_is_left_alone(
+        fleet, project, fake_gh, checks, assumption):
+    """`automerge.only_the_head_moved` is reused unchanged, so the guard still holds:
+    substituting the head satisfies conditions 4 and 5 and nothing else. A red build or
+    an assumption the user owes is a second reason this does not merge, and a round
+    spent there buys nothing."""
+    store, wo = unrecorded(project)
+    if assumption:
+        store.add_assumption(wo["id"], "the exporter writes CSV")
+    artifact(fake_gh, head_oid=PUSHED, checks=checks)
+
+    poll(fleet, store)
+
+    assert rounds_of(store, wo) == [1]
+    assert not store.events_of_kind(wo["id"], "validation_forced")
+    assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
+
+
+def test_the_unrecorded_decline_reaches_the_user_with_its_own_sentence(
+        tmp_path, project, jarvis_home, fake_claude, fake_gh):
+    """The second defect in the chain. The decline was already written and derived no
+    sentence, so the user was never told that `validation.max_rounds` is the remedy —
+    and `SHA_MOVED_BLOCKER` would be a false claim about an older commit there is
+    none of."""
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = unrecorded(project, rounds=2)
+    artifact(fake_gh, head_oid=PUSHED)
+
+    poll(fleet, store)
+
+    declined = store.events_of_kind(wo["id"], invariants.REJUDGE_DECLINED_EVENT)
+    assert len(declined) == 1
+    assert db.from_json(declined[0]["payload"], {})["cause"] == ops.REJUDGE_BUDGET_SPENT
+    row = store.get_work_order(wo["id"])
+    assert invariants.sha_unrecorded_exhausted(store, row)
+    blockers = invariants.true_blockers(store, row)
+    assert invariants.SHA_UNRECORDED_BLOCKER in blockers
+    assert invariants.SHA_MOVED_BLOCKER not in blockers
+    assert invariants.REBIND_EXHAUSTED_BLOCKER not in blockers
+
+    # ...and it self-clears: the user spends the round the machine left them, it records
+    # the live head, and the flag drops with no hand-clearing.
+    ops.force_validation(wo["id"], reason="I read the pull request myself")
+    judge(fleet, store, Panel("passed"))
+    poll(fleet, store)
+
+    row = store.get_work_order(wo["id"])
+    assert not invariants.sha_unrecorded_exhausted(store, row)
+    assert invariants.SHA_UNRECORDED_BLOCKER not in invariants.true_blockers(store, row)
+
+
+def test_the_unrecorded_reason_never_claims_the_head_moved(fleet, project, fake_gh):
+    """`REJUDGE_FORCED_REASON` renders "round 1 passed on , and the head of the pull
+    request is now bbbb1111bb" with nothing judged — a false claim about a commit, in a
+    string `round_line` and `timeline._describe` show verbatim."""
+    store, wo = unrecorded(project)
+    artifact(fake_gh, head_oid=PUSHED)
+
+    poll(fleet, store)
+
+    stored = store.latest_validation_round(wo_id=wo["id"])["forced_reason"]
+    payload = forced_payloads(store, wo)[0]
+    for text in (stored, payload["reason"]):
+        assert "moved" not in text and "older" not in text
+        assert "passed on" not in text and "judged  " not in text
+        assert PUSHED[:10] in text
+
+
+@pytest.mark.parametrize("outcome", ["rejected", "failed", "pending"])
+def test_a_round_that_never_passed_is_still_never_re_judged(fleet, project, fake_gh,
+                                                            outcome):
+    """REGRESSION LOCK on the exclusion. `HELD_NOT_PASSED` is the other way into
+    `decide`'s `not judged` branch and it stays out: a round that is not `passed` is a
+    verdict the panel meant to stand, and the gap behind it is kn-bbc03206's."""
+    store, wo = unrecorded(project, outcome=outcome)
+    artifact(fake_gh, head_oid=PUSHED)
+
+    poll(fleet, store)
+
+    assert rounds_of(store, wo) == [1]
+    assert not store.events_of_kind(wo["id"], "validation_forced")
+    held = store.events_of_kind(wo["id"], "automerge_held")
+    assert db.from_json(held[-1]["payload"], {})["code"] == automerge.HELD_NOT_PASSED
