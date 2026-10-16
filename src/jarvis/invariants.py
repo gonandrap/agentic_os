@@ -47,6 +47,9 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
 from . import budget, db, worker_session
 # A leaf module (logging, subprocess, dataclasses): the import cannot cycle back here.
 from .automerge import HELD_NOT_PASSED, HELD_SHA_MOVED
+# Same leaf argument: `autoreview` imports only `navigation`, `specs`, `catalog` and
+# `stakes` at module scope, and none of those reaches this module.
+from .autoreview import REFUSAL_UNANSWERED_REASON
 from .catalog import DEFAULT_VALIDATION_MAX_ROUNDS, DEFAULT_VALIDATION_TIMEOUT
 from .neo_store import USER_HELD_Q_STATUSES
 from .project_store import (
@@ -424,6 +427,46 @@ AUTH_BLOCKER = ("Claude Code could not authenticate — sign in again and it res
 IDLE_NO_FINISH_BLOCKER = ("the worker stopped mid-task without `jarvis wo finish` — "
                           "nothing it started is still running; read its last message, "
                           "then `jarvis wo send` or `jarvis wo done`")
+
+#: WHAT THE IDLE LINE ABOVE SAID ABOUT A HOLD IT DOES NOT DESCRIBE: the worker DID
+#: deliver, the user refused an assumption, and the delivery is older than the refusal.
+#: COMPOSED from the autoreview sentence rather than re-spelled, because the same fact
+#: reaches the user twice — as the hold on `jarvis wo show` and as this line — and two
+#: spellings of one sentence pass every behavioural test and drift anyway (kn-4ea33fe6).
+#: §1 of docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md
+#:
+#: TWO WHOLE SENTENCES AND NOT ONE WITH A SLOT: `remedies.render_attention` interpolates
+#: only values matching `_ID_PATTERN`, and `"analyst"` is not an id, so a per-kind suffix
+#: cannot travel through a declared slot (§1). Free of any elapsed time and of any count,
+#: on PARKED_BLOCKER's rule.
+REFUSAL_UNANSWERED_BLOCKER = (
+    f"{REFUSAL_UNANSWERED_REASON} — read your refusal, then `jarvis wo send` telling it "
+    f"what to change; it re-delivers with `jarvis wo finish`")
+#: The same hold on a kind whose own submission verb REPLACES the stored document.
+REFUSAL_UNANSWERED_DOC_BLOCKER = (
+    f"{REFUSAL_UNANSWERED_REASON} — it delivered a document, not code, and resubmitting "
+    f"that document would replace it and discard the decisions you have already "
+    f"recorded on it; `jarvis wo send` telling it what to change, and it re-delivers "
+    f"with `jarvis wo finish`, which records the delivery and does not touch the "
+    f"document")
+
+#: The kinds whose FIRST delivery used a verb of their own (`jarvis io report`,
+#: `jarvis fo plan`), both of which REPLACE the stored document — so re-delivering
+#: through them after a refusal discards the user's decisions on it. Filed here, beside
+#: its only reader, and NOT beside `project_store.WO_KINDS`: that tuple is the column
+#: vocabulary, and a membership rule about `ops` submission verbs filed there invites
+#: readers who want something else from it (§2).
+#:
+#: `investigator` is absent because `jarvis investigate verdict` settles through
+#: `close_out` rather than `finish`, so it reaches `completed` and never sits in
+#: `needs_review`; `manager` is absent because it is `idle`, never `needs_review`.
+DOCUMENT_DELIVERY_KINDS = ("planner", "analyst")
+
+#: Both sentences above contain the word "assumption", so `true_blockers`' tail would
+#: read a list holding one as nothing-but-assumption-reviews and stack `parked_reason` on
+#: a line that already names the exit (§4).
+REFUSAL_HELD_BLOCKERS = frozenset({REFUSAL_UNANSWERED_BLOCKER,
+                                   REFUSAL_UNANSWERED_DOC_BLOCKER})
 
 #: What a `failed` work order says when there is nothing more specific to say. A CONSTANT
 #: because `Daemon.settle_work_order` raises it and `true_blockers` re-derives it: the two
@@ -1240,6 +1283,10 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     if wo["status"] == "waiting_pr_merge" and parked_on_a_give_up(store, wo):
         blockers.append(PARKED_GIVE_UP_BLOCKER)
     if governed and wo["status"] == "needs_review":
+        # In the body, the pattern `auto_review_at` above already uses: `ops` imports
+        # this module.
+        from .ops import refusal_answered
+
         # THREE WAYS TO ARRIVE AT `needs_review`, ranked, and each asking the user for
         # something different. The `not pending` guards are PER LINE and not on the
         # branch head, which is the whole subtlety here: only ONE of the three can be
@@ -1284,6 +1331,19 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         #    only runs once the user's gate has cleared.
         elif not pending and store.work_unlanded_open(wo["id"]):
             blockers.append(UNLANDED_BLOCKER)
+        # 3b. The user refused an assumption and nothing has delivered since. Below the
+        #     unlanded line — code stranded on a branch is the more urgent fact and names
+        #     a different decision — and above the idle line, which would call a worker
+        #     that DID deliver one that stopped mid-task. The `PR_UNDECLARED_BLOCKER`
+        #     guard is because that blocker is the same refusal WITH commits behind it,
+        #     appended earlier from `PR_REPAIR_BLOCKERS`; without it both lines appear
+        #     and the second is the weaker. Spec §3,
+        #     docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md
+        elif (not pending and PR_UNDECLARED_BLOCKER not in blockers
+                and not refusal_answered(store, wo["id"])):
+            blockers.append(REFUSAL_UNANSWERED_DOC_BLOCKER
+                            if wo.get("kind") in DOCUMENT_DELIVERY_KINDS
+                            else REFUSAL_UNANSWERED_BLOCKER)
         # 4. Nothing more specific: the worker stopped without finishing. Guarded,
         #    because a `needs_review` holding a pending assumption is doing exactly what
         #    that status is for, and this line would call it a worker that gave up.
@@ -1303,7 +1363,11 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # here has told the user the worker has stopped — an assumption review is the one
     # blocker that says who owes what without saying anything about the session behind
     # it, which is how wo-a4bd6958 sat for 7h13m under a four-hour-old assumptions line.
-    if all(_mentions_assumptions(b) for b in blockers):
+    # ...and the two refusal lines are NOT assumption reviews, though they name one: they
+    # say plenty about the session behind them, which is the rule this tail applies (§4,
+    # docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md).
+    if all(_mentions_assumptions(b) and b not in REFUSAL_HELD_BLOCKERS
+           for b in blockers):
         parked = parked_reason(store, wo, now=now)
         if parked:
             blockers.append(parked)
