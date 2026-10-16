@@ -181,6 +181,31 @@ Why the last clause still self-clears correctly. `_parked_on_a_decline` ends on
 `store.validated_head` is the single source `decide` is forbidden to re-derive, so no new
 reader of "which commit did the panel accept" is introduced anywhere in this change.
 
+### 4b. The dedupe must not be silent either
+
+One path reaches no user at all, and it is the one the heal creates. The OS spends its one
+round on head H, that round records `''` AGAIN (the fetch failed twice), `decide` holds on
+`HELD_SHA_UNRECORDED` at H once more — and `rejudge_moved_head` now returns at its first
+guard (`src/jarvis/ops.py:6454`, `head in rejudged_heads`) every tick, writing NOTHING. No
+decline, so `sha_unrecorded_exhausted` is false and the order is parked green and silent
+with an untouched round budget.
+
+`invariants.sha_unrecorded_rejudge_spent` is the derivation for it, beside
+`sha_unrecorded_exhausted`: newest `automerge_held` is `HELD_SHA_UNRECORDED` on a non-empty
+head, that head is in `ops.rejudged_heads`, and `store.validated_head(latest round) !=
+head` — §4's tail clause verbatim, for §4's reason. NOT `_parked_on_a_decline` with a
+fourth argument: that function requires a `REJUDGE_DECLINED_EVENT` and this case has none.
+
+A FOURTH sentence, `SHA_UNRECORDED_SPENT_BLOCKER`, rather than a reuse of the third:
+`SHA_UNRECORDED_BLOCKER` says "no rounds are left to bind one" and offers
+`validation.max_rounds`, and both are FALSE here — the budget was never spent and the
+per-head dedupe is permanent, so another round changes nothing on this commit. The honest
+remedies are two: merge it by hand, or `jarvis validation force` once GitHub is reachable.
+
+Mutual exclusivity with the three stays by construction: they all require a decline for the
+held head, this one requires an OS `validation_forced` for it, and the dedupe returns before
+either decline arm can write one for a head the OS has already judged.
+
 ### 5. The docstring stops calling it a migration population
 
 `ops.force_validation` (`src/jarvis/ops.py:6207`), the "Why it exists" paragraph at

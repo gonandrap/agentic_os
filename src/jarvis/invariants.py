@@ -348,6 +348,20 @@ SHA_UNRECORDED_BLOCKER = ("the panel passed this without recording which commit 
                           "(`jarvis validation force`), or give it another round "
                           "(`validation.max_rounds`) and the OS re-judges it itself")
 
+#: THE SAME STALL WITH NO DECLINE BEHIND IT, and why it is a fourth sentence rather than
+#: a reuse of the one above: the OS spent its one round on this very commit and that round
+#: could not read the pull request either, so `SHA_UNRECORDED_BLOCKER`'s "no rounds are
+#: left" and its `validation.max_rounds` remedy are both FALSE — the budget is untouched
+#: and the per-head dedupe (`ops.rejudged_heads`) is permanent, so another round changes
+#: nothing on this commit. Re-derived from the timeline by `sha_unrecorded_rejudge_spent`
+#: for kn-089de524's reason (spec
+#: docs/superpowers/specs/2026-10-16-a-verdict-bound-to-no-commit-re-judges-itself.md §4b).
+SHA_UNRECORDED_SPENT_BLOCKER = ("the panel passed this without recording which commit it "
+                                "judged, the OS re-judged it itself and that round could "
+                                "not read the pull request either — so no round will bind "
+                                "one: merge it yourself, or re-judge it "
+                                "(`jarvis validation force`) once GitHub is reachable")
+
 #: THE THIRD SENTENCE IN THIS FAMILY, and the one that names the LIVE cause: the rework
 #: the user asked for when they rejected on review was judged — outside the budget, as
 #: Neo's ruling on question 973 requires — and the panel refused it with no counted
@@ -894,6 +908,31 @@ def sha_unrecorded_exhausted(store: ProjectStore, wo: dict[str, Any]) -> bool:
     return _parked_on_a_decline(store, wo, rebind=False, code=HELD_SHA_UNRECORDED)
 
 
+def sha_unrecorded_rejudge_spent(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """The stall with no commit bound AND NO DECLINE: the OS spent its one round on this
+    very head and that round recorded nothing either, so `rejudge_moved_head` returns on
+    the per-head dedupe every tick and writes nothing.
+
+    NOT `_parked_on_a_decline` with another code: that one requires a
+    `REJUDGE_DECLINED_EVENT` and this path has none — the dedupe returns before both
+    decline arms, which is also what keeps the four mutually exclusive. Same tail clause
+    and same reason as that function's (spec 2026-10-16 §4b).
+    """
+    from . import ops as ops_mod
+
+    held = store.events_of_kind(wo["id"], "automerge_held")
+    if not held:
+        return False
+    newest = db.from_json(held[-1]["payload"], {})
+    if str(newest.get("code") or "") != HELD_SHA_UNRECORDED:
+        return False
+    head = str(newest.get("head_sha") or "")
+    if not head or head not in ops_mod.rejudged_heads(store, str(wo["id"])):
+        return False
+    return store.validated_head(
+        store.latest_validation_round(wo_id=wo["id"])) != head
+
+
 def _parked_on_a_decline(store: ProjectStore, wo: dict[str, Any], *,
                          rebind: bool, code: str) -> bool:
     """The three facts the derivations above share, read for one `cause` and one hold
@@ -1309,6 +1348,13 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # can co-occur: they read the same newest hold and demand different codes of it.
     if wo["status"] == "waiting_pr_merge" and sha_unrecorded_exhausted(store, wo):
         blockers.append(SHA_UNRECORDED_BLOCKER)
+    # ...AND THE SAME STALL THE OS ALREADY SPENT ITS ROUND ON, where no decline was ever
+    # written (spec 2026-10-16 §4b). None of the four can co-occur, by construction: the
+    # three above all need a `REJUDGE_DECLINED_EVENT` for the held head, this one needs an
+    # OS `validation_forced` for it, and `rejudge_moved_head`'s per-head dedupe returns
+    # before either decline arm can write one for a head it has judged.
+    if wo["status"] == "waiting_pr_merge" and sha_unrecorded_rejudge_spent(store, wo):
+        blockers.append(SHA_UNRECORDED_SPENT_BLOCKER)
     # A MERGE THE REVIEWER REFUSED. Nothing re-asks for that commit, so the order would
     # otherwise sit parked for ever with nothing owed by anyone (spec 2026-09-24 fix 4b).
     # Gated on the status for the same reason as the branch above, and ordered after it

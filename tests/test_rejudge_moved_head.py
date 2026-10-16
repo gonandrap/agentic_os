@@ -1454,7 +1454,8 @@ def test_a_round_that_recorded_no_commit_re_judges_itself(fleet, project, fake_g
 def test_the_unrecorded_head_costs_one_round_per_commit(fleet, project, fake_gh):
     """`ops.rejudged_heads`' dedupe, on this code too. The fetch can fail twice — the
     round the OS just opened records `''` again — and a key that saturated on the hold
-    would then spend the whole budget at a standstill."""
+    would then spend the whole budget at a standstill; and the dedupe must not be SILENT,
+    because no decline is written on this path and the user is owed the stall."""
     store, wo = unrecorded(project)
     artifact(fake_gh, head_oid=PUSHED)
     poll(fleet, store)
@@ -1468,6 +1469,67 @@ def test_the_unrecorded_head_costs_one_round_per_commit(fleet, project, fake_gh)
     assert len(forced_payloads(store, wo)) == 1
     assert not store.events_of_kind(wo["id"], invariants.REJUDGE_DECLINED_EVENT)
     assert rounds_of(store, wo) == [1, 2]
+    row = store.get_work_order(wo["id"])
+    assert invariants.sha_unrecorded_rejudge_spent(store, row)
+    blockers = invariants.true_blockers(store, row)
+    assert invariants.SHA_UNRECORDED_SPENT_BLOCKER in blockers
+    # Not the budget sentence: nothing was declined and the budget is untouched.
+    assert invariants.SHA_UNRECORDED_BLOCKER not in blockers
+    assert invariants.SHA_MOVED_BLOCKER not in blockers
+    assert invariants.REBIND_EXHAUSTED_BLOCKER not in blockers
+
+
+def test_the_os_round_in_flight_on_an_unrecorded_head_blocks_nobody(
+        fleet, project, fake_gh):
+    """The round the OS just opened may yet bind the commit, so the stall is not the
+    user's while it runs — and before that round exists the head has not been spent."""
+    store, wo = unrecorded(project)
+    artifact(fake_gh, head_oid=PUSHED)
+
+    poll(fleet, store)
+
+    row = store.get_work_order(wo["id"])
+    assert row["status"] == "validating"
+    assert invariants.SHA_UNRECORDED_SPENT_BLOCKER not in invariants.true_blockers(
+        store, row)
+
+
+def test_a_round_that_binds_the_unrecorded_head_clears_the_blocker(
+        fleet, project, fake_gh):
+    """The tail clause: the OS's own round read the pull request after all and recorded
+    the commit, so the stall is over and must stop being flagged."""
+    store, wo = unrecorded(project)
+    artifact(fake_gh, head_oid=PUSHED)
+    poll(fleet, store)
+    judge(fleet, store, Panel("passed"))
+
+    row = store.get_work_order(wo["id"])
+    assert ProjectStore.validated_head(
+        store.latest_validation_round(wo_id=wo["id"])) == PUSHED
+    assert not invariants.sha_unrecorded_rejudge_spent(store, row)
+    assert invariants.SHA_UNRECORDED_SPENT_BLOCKER not in invariants.true_blockers(
+        store, row)
+
+
+def test_a_head_that_moved_past_the_spent_one_is_re_judged_not_flagged(
+        fleet, project, fake_gh):
+    """The branch moved to a commit the OS has not judged, so the re-judge path owns the
+    order again and nothing is owed by the user."""
+    store, wo = unrecorded(project)
+    artifact(fake_gh, head_oid=PUSHED)
+    poll(fleet, store)
+    judge(fleet, store, Panel("passed"))
+    store.set_validation_head(store.latest_validation_round(wo_id=wo["id"])["id"], "")
+    artifact(fake_gh, head_oid=AGAIN)
+
+    poll(fleet, store)
+
+    payloads = forced_payloads(store, wo)
+    assert [p["head_sha"] for p in payloads] == [PUSHED, AGAIN]
+    row = store.get_work_order(wo["id"])
+    assert row["status"] == "validating"
+    assert invariants.SHA_UNRECORDED_SPENT_BLOCKER not in invariants.true_blockers(
+        store, row)
 
 
 @pytest.mark.parametrize("checks,assumption", [(RED, False), (GREEN, True)])
