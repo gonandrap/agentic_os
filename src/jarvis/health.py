@@ -12,7 +12,10 @@ session file would make watching cost more than judging.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .ops import Actor
 
 SECONDS_PER_MINUTE = 60  # a unit, not a setting
 
@@ -156,6 +159,27 @@ def blocker(pstore: Any, subject: dict[str, Any], cfg: Any) -> str | None:
     if subject["kind"] == "feature_order":
         return _children_blocker(pstore, subject["row"], cfg)
     return _work_order_blocker(pstore, subject["row"], cfg)
+
+
+def actor(pstore: Any, subject: dict[str, Any]) -> Actor | None:
+    """The daemon pass that will next touch this unit, or None.
+
+    SEPARATE FROM `blocker` so `blocker` stays pure — `due` and the dedupe read it.
+    §7 of docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md.
+    """
+    from . import db, ops
+    from .project_store import OPEN_STATUSES
+
+    if subject["kind"] == "feature_order":
+        return None
+    row = subject["row"]
+    # ON `project_store.OPEN_STATUSES` AND NOT `ops.SCHEDULED_ACTORS`, whose own keys
+    # would silence the registry's no-fallthrough coverage pin (§2). A settled row does
+    # reach here (`tests/test_rewrite_tax_alarm.py` builds a packet for one).
+    if row.get("status") not in OPEN_STATUSES:
+        return None
+    # ON `db.now()`, the OS's clock, for the reason `_work_order_blocker` gives below.
+    return ops.scheduled_actor(pstore, row, now=db.now())
 
 
 def _work_order_blocker(pstore: Any, row: dict[str, Any], cfg: Any) -> str | None:
