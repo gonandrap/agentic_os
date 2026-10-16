@@ -51,6 +51,7 @@ from .daemon import (
     answers_question,
     daemon_running,
     delivers_message,
+    polls_and_can_act_on_pull_request,
     polls_pull_request,
     retries_turn,
     reviews_gate,
@@ -2483,11 +2484,16 @@ def diagnose(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
         held_by_fleet = fleet_if_held([wo])
         blocker = waiting_on(store, wo)
         needs_you = invariants.true_blockers(store, wo, now)
+        # §8 of docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md.
+        actor = (scheduled_actor(store, wo, now)
+                 if wo["status"] in SCHEDULED_ACTORS else None)
         payload = {
             "wo_id": str(wo["id"]), "project": name, "title": wo["title"],
             "status": wo["status"],
             "status_label": invariants.status_label(store, wo, held_by_fleet),
             "blocker": blocker,
+            "actor": ({"pass_name": actor.pass_name, "why": actor.why,
+                       "predicate": actor.predicate} if actor is not None else None),
             "needs_you": needs_you,
             # All three `or None`: these return "" for "no note", and an empty string
             # renders as a blank note. Absent must be absent (issue #227).
@@ -3356,7 +3362,7 @@ def follow_up_repo(project_path: Path) -> str:
 
     Read from the CHECKOUT's own `origin` and from nowhere else. That is the point: the
     repository name becomes a `gh --repo` argument, and the one source that no model and
-    no stored string can influence is the local remote (`github.LOCAL_GIT_READS`).
+    no stored string can influence is the local remote (`github.GIT_READS`).
 
     "" for a project with no `origin` at all — several in the fleet are local-only — and
     the caller reports that as a filing it could not make rather than as a finding that
@@ -5400,6 +5406,60 @@ def _stored_base_health(project_name: str) -> dict[str, Any]:
         return central.base_health(project_name)
     except Exception:  # noqa: BLE001 — ditto
         return {}
+    finally:
+        central.close()
+
+
+def _base_is_red(spec: Any, now: float, fact: dict[str, Any] | None = None) -> bool:
+    """Is the OS itself holding this project's merges because its base is red?
+
+    §1 of docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md.
+    The ONE place outside the daemon that interprets the stored fact, so the CLI and
+    dashboard reader and the tick cannot disagree about what "red" means: opted into
+    auto-merge (§3's gate, `Daemon.poll_pull_requests`' own), red, and FRESH — a
+    non-numeric or absent `checked_at` is stale.
+    """
+    from .central_store import BASE_HEALTH_FRESH_SECONDS
+
+    if not (spec.validation.enabled and spec.validation.auto_merge):
+        return False
+    fact = _stored_base_health(spec.name) if fact is None else fact
+    if not fact.get("red"):
+        return False
+    checked_at = fact.get("checked_at")
+    if not isinstance(checked_at, (int, float)):
+        return False
+    return now - float(checked_at) <= BASE_HEALTH_FRESH_SECONDS
+
+
+def _base_red_until(fact: dict[str, Any], now: float) -> float:
+    """Where an OPEN red episode stops counting: the fact's freshness horizon.
+
+    §2 of the same spec — never `now`: `Daemon.poll_default_branch` writes nothing on
+    `github.GitHubError`, so an episode left open by a `gh` that stopped answering would
+    otherwise discount for ever. A non-numeric or absent `checked_at` gives `0.0`, which
+    clips every open pair away.
+    """
+    from .central_store import BASE_HEALTH_FRESH_SECONDS
+
+    checked_at = fact.get("checked_at")
+    if not isinstance(checked_at, (int, float)):
+        return 0.0
+    return min(now, float(checked_at) + BASE_HEALTH_FRESH_SECONDS)
+
+
+def _stored_base_red_episodes(project_name: str) -> list[list[float | None]]:
+    """This project's red-base episodes, or `[]` — `_stored_base_health`'s tolerance."""
+    from .central_store import CentralStore
+
+    try:
+        central = CentralStore()
+    except Exception:  # noqa: BLE001 — an unreadable list discounts nothing
+        return []
+    try:
+        return central.base_red_episodes(project_name)
+    except Exception:  # noqa: BLE001 — ditto
+        return []
     finally:
         central.close()
 
@@ -9772,6 +9832,9 @@ def manager_awaiting_feature(
 
 def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                window: bool = False,
+               base_red: bool = False,
+               red_episodes: Sequence[Any] = (),
+               base_red_until: float = 0.0,
                stuck_only: bool = True) -> tuple[int, list[dict[str, Any]]]:
     """Every open order of one project, judged by `stuck.assess`. §7's ONE derivation.
 
@@ -9781,12 +9844,18 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
     the detail of the rest.
 
     `window` is the PROJECT-WIDE usage hold, read once by the caller rather than once per
-    candidate (`health_sweep_hold`'s own docstring).
+    candidate (`health_sweep_hold`'s own docstring). `base_red`, `red_episodes` and
+    `base_red_until` are the same arrangement for the red default branch — §1 and §2 of
+    docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md: the fact
+    is the project's and not the order's, so the caller hoists it and only the CLIP is per
+    candidate.
     """
     from . import bus, holds, stuck, worker_session
+    from .central_store import base_red_hold_spans
     from .health import observer_kinds
-    from .project_store import (FO_ID_PREFIXES, UNGOVERNED_ORIGINS,
-                                VALIDATION_CI_CAUSE, validation_ci_hold_spans,
+    from .project_store import (FO_ID_PREFIXES, PLAN_ASSUMPTION_EVENT_KINDS,
+                                UNGOVERNED_ORIGINS, VALIDATION_CI_CAUSE,
+                                plan_hold_spans, validation_ci_hold_spans,
                                 validation_hold)
     from .worker_session import PAUSE_USAGE_LIMIT
 
@@ -9820,9 +9889,41 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                 until, cause = validation_hold(events, int(latest["round"]))
                 ci_held = cause == VALIDATION_CI_CAUSE and until > now
             ci_spans = validation_ci_hold_spans(events, since, now)
-        # The UNION and never the sum: a usage window can shut while CI runs (§4).
+        # A MERGE THE OS IS ITSELF HOLDING ONTO A RED BASE IS NOT STUCK (§1 and §2 of
+        # docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md).
+        # `waiting_pr_merge` ONLY: a `needs_review` order beside the same red base is a
+        # wait the USER owes (kn-6e836793).
+        base_red_spans = (base_red_hold_spans(red_episodes, since, now, base_red_until)
+                          if wo["status"] == "waiting_pr_merge" else [])
+        # A CHILD HELD BY ITS FEATURE'S UNRATIFIED PLAN IS NOT STUCK (§2.3 and §2.4 of
+        # docs/superpowers/specs/2026-10-15-a-child-held-by-its-features-unratified-plan-
+        # is-not-stuck.md). `pending` ONLY: the claim rule withholds a DISPATCH, so a
+        # child already running is not held by it. The DISCOUNT is computed from the
+        # planner's history whether or not the hold still stands — that is the whole
+        # point of it — while the EXCLUSION reads `plan_hold`, the one predicate pinned
+        # to the claim SQL (§2.2). The reads are paid by pending feature children and by
+        # nothing else: the gate is the set `plan_hold` would query for at all.
+        plan_held, plan_spans = False, []
+        if (wo["status"] == "pending" and wo.get("parent_id")
+                and wo.get("kind") == "worker"):
+            plan_held = bool(pstore.plan_hold(wo))
+            try:
+                planner_id = pstore.get_feature_order(
+                    str(wo["parent_id"])).get("plan_wo_id")
+            except KeyError:
+                planner_id = None  # the feature was deleted out from under the child
+            if planner_id:
+                # `events_of_kind` takes ONE kind, so the three are concatenated and
+                # re-sorted: the walk is only right in `ts` order (§2.3).
+                plan_spans = plan_hold_spans(
+                    sorted((e for k in PLAN_ASSUMPTION_EVENT_KINDS
+                            for e in pstore.events_of_kind(str(planner_id), k)),
+                           key=lambda e: float(e["ts"])), since, now)
+        # The UNION and never the sum: a usage window can shut while CI runs (§4), or
+        # while the base is red.
         discounted = holds.union_seconds(
-            [(max(h.started, since), min(h.finish(now), now)) for h in usage] + ci_spans)
+            [(max(h.started, since), min(h.finish(now), now)) for h in usage]
+            + ci_spans + base_red_spans + plan_spans)
         # §2.2 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md.
         edges = (pstore.unfinished_dependencies(wo["id"])
                  if wo["status"] == "pending" else [])
@@ -9846,10 +9947,18 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         verdict = stuck.assess(
             str(wo["status"]), now - since, now - (durations.last_activity_ts or since),
             discounted, thresholds, cfg.fallback_minutes * 60.0,
+            # CI and base-red cannot collide: `validating` and `waiting_pr_merge` (§1 of
+            # the 2026-10-15 spec). The last two are BOTH `pending`, so their order is
+            # load-bearing — a live dependency outranks the plan hold (§2.4).
             excluded_cause=(PAUSE_USAGE_LIMIT
                             if window or any(h.open for h in usage)
                             else VALIDATION_CI_CAUSE if ci_held
-                            else stuck.LIVE_DEPENDENCY if live_edges else ""),
+                            else stuck.BASE_RED_CAUSE
+                            if base_red and wo["status"] == "waiting_pr_merge"
+                            else stuck.LIVE_DEPENDENCY if live_edges
+                            # LAST in the chain, §2.4: a fleet fact outranks a fact
+                            # about one feature's plan.
+                            else stuck.PLAN_ASSUMPTION_CAUSE if plan_held else ""),
             kind=str(wo.get("kind") or "worker"),
             exempt_kinds=tuple(cfg.exempt_kinds),
             by_design_idle=by_design_idle,
@@ -9860,9 +9969,14 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         out.append({
             "project": project_name, "wo": wo, "verdict": verdict,
             # The outstanding-child note before the empty answer: one formatter shared
-            # with `status_label`, so the row and the listing cannot drift.
+            # with `status_label`, so the row and the listing cannot drift. The plan
+            # hold rides there too — §1(2) of the 2026-10-15 spec: this column read
+            # "nothing the record can name" while `status_label` on the SAME row named
+            # the hold and the review command.
             "blocker": (blocker[0] if blocker
                         else invariants.outstanding_children_note(pstore, wo)
+                        or invariants.plan_hold_note(
+                            pstore.plan_hold(wo) if plan_held else None)
                         or "nothing the record can name"),
             "status_label": invariants.status_label(pstore, wo),
             "since": since, "activity": durations.last_activity_ts or since,
@@ -9894,11 +10008,20 @@ def stuck_report(project_name: str | None = None,
             continue
         if project_name and spec.name != project_name:
             continue
+        # ONCE PER PROJECT, never once per candidate — §1 of the 2026-10-15 spec.
+        base_red, red_episodes, base_red_until = False, (), 0.0
+        if spec.validation.enabled and spec.validation.auto_merge:
+            fact = _stored_base_health(spec.name)
+            base_red = _base_is_red(spec, now, fact)
+            base_red_until = _base_red_until(fact, now)
+            red_episodes = tuple(_stored_base_red_episodes(spec.name))
         pstore = ProjectStore(paths[spec.name])
         try:
             _scanned, judged = stuck_scan(
                 pstore, spec.name, spec.fleet_health, now,
-                window=bool(pstore.health_sweep_hold()), stuck_only=False)
+                window=bool(pstore.health_sweep_hold()), base_red=base_red,
+                red_episodes=red_episodes, base_red_until=base_red_until,
+                stuck_only=False)
         finally:
             pstore.close()
         for row in judged:
@@ -15202,6 +15325,27 @@ def messaging_config_at(project_path: Path) -> Any:
         return MessagingConfig()
 
 
+def pull_requests_config_at(project_path: Path) -> Any:
+    """`os.pull_requests` for the project rooted at `project_path`.
+
+    `inspect_config_at`'s twin again, for `daemon.pr_recompute_stalled` — a predicate is
+    handed a `ProjectStore` and no project name. Falls back to the OS block and then to
+    the shipped defaults for that function's reason: a threshold with no catalog behind
+    it is still a threshold, and having none would mean having no predicate.
+    """
+    from .catalog import PullRequestsConfig
+
+    try:
+        catalog = resolve_catalog()
+        target = Path(project_path).resolve()
+        for spec in catalog.projects:
+            if Path(spec.path).resolve() == target:
+                return spec.pull_requests
+        return catalog.os.pull_requests
+    except (OpsError, CatalogError, OSError, ValueError):
+        return PullRequestsConfig()
+
+
 @observability.metered(OBSERVE_INSPECT, target="target", project="project")
 def inspect_report(target: str, project: str | None = None, *,
                    write_floor: int | None = None,
@@ -17209,10 +17353,14 @@ SCHEDULED_ACTORS: dict[str, ActorPasses] = {
         "no daemon pass — the user reviews it, and `invariants.true_blockers` is what "
         "puts it in front of them")),
     "waiting_pr_merge": ActorPasses((
+        # wo-d3a70c29: the poll still SELECTS a stalled row (`polls_pull_request` is
+        # untouched); what it is no longer is an answer to "somebody will act on this".
         _Pass("Daemon.poll_pull_requests",
-              "the row carries a routing pull request, so the poll asks GitHub what "
-              "became of it",
-              "daemon.polls_pull_request", polls_pull_request),
+              "`daemon.polls_and_can_act_on_pull_request` says yes: the row carries a "
+              "routing pull request and GitHub is still recomputing it, so the poll "
+              "asks what became of it and some branch of it can move the row",
+              "daemon.polls_and_can_act_on_pull_request",
+              polls_and_can_act_on_pull_request),
     )),
     # Deliberately none: `project_store.NOT_RETRIED` excludes it and
     # `Daemon.settle_work_order` returns early for it.

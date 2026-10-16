@@ -1155,6 +1155,7 @@ if argv[:2] == ["issue", "create"]:
     if "--title" in argv:
         r["title"] = argv[argv.index("--title") + 1]
     r["body"] = stdin
+    r["author"] = os.environ.get("FAKE_GH_LOGIN", "")
     save(rows)
     print(url)
 elif argv[:2] == ["issue", "list"]:
@@ -1175,9 +1176,14 @@ elif argv[:2] == ["issue", "list"]:
         if term and term not in (r.get("body") or ""):
             continue
         number = u.rstrip("/").rsplit("/", 1)[-1]
+        # `author` and `body` ride along for every caller: the red-base adoption search
+        # needs both to tell the OS's own filing from a stranger's (spec 2026-10-14 §4).
         out.append({"number": int(number) if number.isdigit() else 0,
                     "title": r.get("title", ""), "url": u,
-                    "state": r.get("state", "OPEN")})
+                    "state": r.get("state", "OPEN"),
+                    "author": {"login": r.get("author")
+                               or os.environ.get("FAKE_GH_LOGIN", "")},
+                    "body": r.get("body", "")})
     print(json.dumps(out))
 elif argv[:2] == ["issue", "view"]:
     rows, r = row(argv[2] if len(argv) > 2 else "")
@@ -1321,6 +1327,42 @@ elif argv[:2] == ["pr", "update-branch"]:
     with open(commits_path, "w") as f:
         json.dump(commits, f)
     print(f"Updated branch of pull request {url}")
+elif argv[:2] == ["api", "user"]:
+    # Who `gh` is authenticated as — the login the OS files issues under.
+    print(os.environ.get("FAKE_GH_LOGIN", ""))
+elif argv[:2] in (["pr", "close"], ["pr", "reopen"]):
+    # THE RESYNC PAIR (wo-7ec57748), and it models what the close DOES rather than
+    # mocking the remedy's outcome: `pr view` answers CLOSED from here until a reopen,
+    # which is the hazard the daemon's event ordering exists for — a poll between the two
+    # sees a pull request closed and unmerged, and must not read the OS's own closure as
+    # refused work. A fake that left the state OPEN could not express it.
+    #
+    # Reopening does NOT move the head or the mergeability: only a test that then
+    # registers what GitHub recomputed gets a healthy pull request, exactly as
+    # `pr update-branch` above refuses to turn checks green by itself.
+    prs = roster()
+    url = argv[2] if len(argv) > 2 else ""
+    pr = prs.get(url)
+    if pr is None:
+        sys.stderr.write("no pull requests found for this URL\n")
+        sys.exit(1)
+    # Failing ONE of the two and nothing else, `FAKE_GH_FAIL_MERGE`'s rationale: the
+    # likeliest real failure is credentials that read and cannot write, and a blanket
+    # failure never reaches the call at all.
+    refuse = os.environ.get("FAKE_GH_FAIL_PR_" + argv[1].upper())
+    if refuse:
+        sys.stderr.write(refuse + "\n")
+        sys.exit(1)
+    try:
+        with open(merged_path) as f:
+            landed = json.load(f)
+    except (OSError, ValueError):
+        landed = {}
+    state = "CLOSED" if argv[1] == "close" else "OPEN"
+    landed[url] = {**landed.get(url, {}), "state": state}
+    with open(merged_path, "w") as f:
+        json.dump(landed, f)
+    print(f"{state.title()} pull request {url}")
 elif argv[:2] == ["api", "--method"]:
     # The API reads the OS makes — a commit (its parents, or its subject), a branch's
     # protection, and the repository's default branch name. Anything else is an unhandled
@@ -1631,6 +1673,8 @@ def fake_systemd(tmp_path, monkeypatch):
 #: deliberately NOT `bugreport.DEFAULT_BUG_REPO`: see `fake_gh`.
 FIXTURE_BUG_REPO = "jarvis-fixture/no-such-tracker"
 FIXTURE_ISSUE_URL = f"https://github.com/{FIXTURE_BUG_REPO}/issues/7"
+#: The login the fake `gh` is authenticated as — the account the OS files issues under.
+FIXTURE_GH_LOGIN = "jarvis-fixture-bot"
 
 
 @pytest.fixture()
@@ -1652,12 +1696,18 @@ def fake_gh(tmp_path, monkeypatch):
     url = FIXTURE_ISSUE_URL
     monkeypatch.setenv("FAKE_GH_DIR", str(gdir))
     monkeypatch.setenv("FAKE_GH_ISSUE_URL", url)
+    monkeypatch.setenv("FAKE_GH_LOGIN", FIXTURE_GH_LOGIN)
     monkeypatch.setenv("JARVIS_GH_BIN", str(binpath))
+    # `issues.gh_login` caches for the PROCESS, and a pytest process is many fleets: a
+    # login read under one fixture's `gh` must not answer under the next one's.
+    from . import issues as _issues
+    _issues.reset_gh_login()
 
     class Handle:
         dir = gdir
         repo = FIXTURE_BUG_REPO
         issue_url = url
+        login = FIXTURE_GH_LOGIN
         prs: dict[str, dict] = {}
 
         @property
@@ -1681,6 +1731,15 @@ def fake_gh(tmp_path, monkeypatch):
             write.
             """
             monkeypatch.setenv("FAKE_GH_FAIL_MERGE", message)
+
+        def fail_pr_close(self, message: str) -> None:
+            """Fail `gh pr close` and NOTHING else — `fail_merge`'s rationale."""
+            monkeypatch.setenv("FAKE_GH_FAIL_PR_CLOSE", message)
+
+        def fail_pr_reopen(self, message: str) -> None:
+            """Fail `gh pr reopen` alone: the pull request really does end up CLOSED,
+            which is the stage whose failure leaves the OS holding its own closure."""
+            monkeypatch.setenv("FAKE_GH_FAIL_PR_REOPEN", message)
 
         def works(self) -> None:
             """Undo `fail` — a test that proves the lifecycle RETRIES has to."""
@@ -1706,6 +1765,39 @@ def fake_gh(tmp_path, monkeypatch):
                                "labels": sorted(labels or [])}
             (gdir / "issues.json").write_text(json.dumps(rows))
 
+        def set_pr_state(self, pr_url: str, state: str,
+                         merged_at: str | None = None) -> None:
+            """Move a pull request the fake's OWN writes have already patched.
+
+            `set_pr` cannot do it: `pr close`, `pr reopen` and `pr update-branch` record
+            what they did as an overlay ON TOP of the registered roster, so a re-register
+            is overwritten by the overlay. This is a human closing a pull request AFTER
+            the OS closed and reopened it — the case that proves the resync's suppression
+            of `record_pr_closed` RELEASES (wo-7ec57748).
+            """
+            path = gdir / "merged.json"
+            landed = json.loads(path.read_text()) if path.exists() else {}
+            patch = {**landed.get(pr_url, {}), "state": state.upper(),
+                     "mergeable": None}
+            if merged_at is not None:
+                patch["mergedAt"] = merged_at
+            landed[pr_url] = patch
+            path.write_text(json.dumps(landed))
+
+        def pr_state(self, pr_url: str) -> str:
+            """What `gh pr view` would answer for this pull request's `state`.
+
+            The fake's own `roster()` resolution — the registered roster patched by
+            whatever its writes recorded. A test needs it to ask whether a `gh pr close`
+            that RAISED left GitHub alone (wo-7ec57748); no other reader here can say,
+            because a write that failed records no overlay at all.
+            """
+            prs = json.loads(os.environ.get("FAKE_GH_PRS", "{}"))
+            path = gdir / "merged.json"
+            landed = json.loads(path.read_text()) if path.exists() else {}
+            row = {**prs.get(pr_url, {}), **landed.get(pr_url, {})}
+            return str(row.get("state") or "OPEN").upper()
+
         def issue_series(self, base: str) -> str:
             """Make `gh issue create` mint `<base>/1`, `<base>/2`, … one per call.
 
@@ -1717,13 +1809,20 @@ def fake_gh(tmp_path, monkeypatch):
             return base
 
         def add_issue(self, issue_url: str, title: str, body: str = "",
-                      state: str = "OPEN", labels: list[str] | None = None) -> None:
+                      state: str = "OPEN", labels: list[str] | None = None,
+                      author: str | None = None) -> None:
             """Put an issue on the tracker as `issue list` will see it — title and body
             included, which `set_issue` does not carry because nothing read them before
-            the follow-up dedupe did."""
+            the follow-up dedupe did.
+
+            `author` defaults to the login `gh` is authenticated as, so an issue a test
+            adds reads as the OS's own filing; pass a stranger's login for the one case
+            the red-base adoption filter exists for (spec 2026-10-14 §4).
+            """
             rows = self.issues
             rows[issue_url] = {**rows.get(issue_url, {"comments": []}),
                                "state": state.upper(), "title": title, "body": body,
+                               "author": FIXTURE_GH_LOGIN if author is None else author,
                                "labels": sorted(labels or [])}
             (gdir / "issues.json").write_text(json.dumps(rows))
 
@@ -1791,7 +1890,8 @@ def fake_gh(tmp_path, monkeypatch):
                    mergeable: str | None = None, base_ref: str = "main",
                    checks: list[dict] | None = None,
                    merge_state: str | None = None, head_oid: str = "",
-                   base_oid: str = "", merge_commit: str = "") -> None:
+                   base_oid: str = "", merge_commit: str = "",
+                   head_ref: str = "") -> None:
             """Register what `gh pr view <pr_url>` answers. Re-calling re-states it,
             which is how a test walks a pull request from OPEN to MERGED — or from
             MERGEABLE to CONFLICTING and back.
@@ -1832,6 +1932,10 @@ def fake_gh(tmp_path, monkeypatch):
                 row["mergeStateStatus"] = merge_state
             if head_oid:
                 row["headRefOid"] = head_oid
+            # `headRefName`, shared with `set_pr_artifact`: the branch whose remote tip
+            # the merge poll looks up when mergeability is UNKNOWN (wo-d3a70c29).
+            if head_ref:
+                row["headRefName"] = head_ref
             if base_oid:
                 row["baseRefOid"] = base_oid
             # `mergeCommit.oid`, the commit the merge put on the base — a NESTED object,

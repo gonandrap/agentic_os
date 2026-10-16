@@ -3904,6 +3904,12 @@ def _print_diagnosis(d: dict[str, Any]) -> None:
     print(f"{d['wo_id']} — {d['title']}  ({d['project']})")
     print(f"  {d['status_label']}")
     print(f"\nwaiting on: {d['blocker']['what']} — {d['blocker']['detail']}")
+    # §8 of docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md.
+    if d["actor"]:
+        print(f"  who will act: {d['actor']['pass_name']} · "
+              f"{d['actor']['predicate']} — {d['actor']['why']}")
+    else:
+        print("  who will act: no daemon pass will act on this order")
     for blocker in d["needs_you"]:
         print(f"  needs you: {blocker}")
     for note in (d["notes"]["parked"], d["notes"]["pause"], d["notes"]["fleet_hold"]):

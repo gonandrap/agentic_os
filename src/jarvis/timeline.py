@@ -805,6 +805,45 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                 f"attempt {p.get('attempt')} of {of}" if of else "")
     if kind == "pr_conflict_cleared":
         return "Merge conflict resolved", ""
+    # wo-d3a70c29: evidence, not an alarm — the order stops deriving an actor and
+    # `true_blockers` is what asks the user.
+    if kind == "pr_recompute_stalled":
+        # TWO CONDITIONS, TWO SENTENCES. With a tip observed the evidence is the
+        # disagreement; with none it is the clock, and naming a branch "at " would
+        # describe a comparison nobody made.
+        ref, head = str(p.get("ref_oid") or ""), str(p.get("head_oid") or "")
+        title = "GitHub stopped recomputing the pull request"
+        if ref and head:
+            return title, (f"branch at {ref[:10]}, pull request head at {head[:10]}")
+        since = _clock(p.get("unknown_since"))
+        return title, (f"mergeability unanswered since {since}" if since
+                       else "mergeability unanswered")
+    # ...and the remedy, which the OS now performs instead of the user (wo-7ec57748).
+    # ONE close+reopen per stall episode, so these four lines are the whole episode.
+    if kind == "pr_resync_started":
+        ref, head = str(p.get("ref_oid") or ""), str(p.get("head_oid") or "")
+        return ("Closing and reopening the pull request to make GitHub recompute it",
+                (f"branch at {ref[:10]}, pull request head at {head[:10]}"
+                 if ref and head else str(p.get("pr_url") or "")))
+    if kind == "pr_resync_done":
+        # TWO WRITERS, ONE EVENT KIND, told apart by `observed`: the OS's own reopen
+        # returning, or the poll SEEING the pull request open again (a reopen that failed
+        # and somebody fixed by hand). Rendering the second as a successful resync would
+        # credit the OS with a repair it did not perform.
+        if p.get("observed"):
+            head = str(p.get("head_oid") or "")
+            return ("Pull request is open again — the resync window is over",
+                    f"head at {head[:10]}" if head else "")
+        return "Pull request closed and reopened — waiting for GitHub to answer", ""
+    if kind == "pr_resync_failed":
+        # THE STAGE IS THE WHOLE POINT: a close that failed changed nothing, and a reopen
+        # that failed left the pull request SHUT by the OS.
+        return (f"Could not {p.get('stage') or 'resync'} the pull request to resync it",
+                str(p.get("error") or p.get("reason") or ""))
+    if kind == "pr_resync_cleared":
+        head = str(p.get("head_oid") or "")
+        return ("GitHub is recomputing the pull request again",
+                f"head at {head[:10]}" if head else "")
     if kind == "pr_conflict_unresolved":
         return ("Merge conflict the worker could not resolve — over to you",
                 f"{p.get('attempts')} attempts")

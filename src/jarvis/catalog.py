@@ -1104,6 +1104,15 @@ DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS = 60
 #: `FLEET_HEALTH_FLEET_ONLY_KEYS`.
 DEFAULT_FLEET_HEALTH_SWEEP_DARK_MINUTES = 180
 
+#: How long one project's red-base episodes are REMEMBERED, so the sweep's discount
+#: outlives the hold by a status span — §2 "The retention bound is a CATALOG KEY" of
+#: docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md, Neo's one
+#: condition on 1818. Seven days covers a red base spanning a weekend plus the status span
+#: after it and keeps the stored JSON a handful of pairs. HOURS and not minutes:
+#: `thresholds` and every `*_minutes` measure a sweep's patience, this measures memory,
+#: and `10080` would read as a typo.
+DEFAULT_FLEET_HEALTH_RED_EPISODE_RETENTION_HOURS = 168
+
 #: `FleetHealthConfig` fields that are a MAPPING, not a count — `INSPECT_FRACTION_KEYS`'
 #: arrangement. Excluded from the reflective `>= 1` loop and validated per entry instead,
 #: because an unknown status there must be REFUSED naming `OPEN_STATUSES` rather than
@@ -1171,6 +1180,8 @@ class FleetHealthConfig:
     #: element, unlike `thresholds`: a kind list is one policy statement, and a merging
     #: list could only ever grow — un-exempting a kind would be inexpressible.
     exempt_kinds: tuple[str, ...] = DEFAULT_FLEET_HEALTH_EXEMPT_KINDS
+    #: §2 of docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md.
+    red_episode_retention_hours: int = DEFAULT_FLEET_HEALTH_RED_EPISODE_RETENTION_HOURS
 
     def threshold_seconds(self, status: str) -> float:
         """This status's threshold, in the seconds `stuck.assess` compares — the named one
@@ -1440,6 +1451,29 @@ class MessagingConfig:
     """
 
     stuck_minutes: int = DEFAULT_MESSAGING_STUCK_MINUTES
+
+
+# -- pull requests: how long GitHub may go without recomputing one before the OS stops
+# calling its own poll an actor for it. wo-d3a70c29, Neo question 1830.
+
+#: Half an hour. GitHub computes mergeability LAZILY and asking is what starts it, so
+#: UNKNOWN right after a push is the NORMAL state (kn-5e93939e) — the threshold has to
+#: clear every ordinary push before it clears a stall. PR #995 sat UNKNOWN for ~7h.
+DEFAULT_PULL_REQUESTS_RECOMPUTE_STALL_MINUTES = 30
+
+
+@dataclass
+class PullRequestsConfig:
+    """When GitHub's silence about a pull request stops being a wait and becomes a stall.
+
+    `MessagingConfig`'s shape exactly — one field, fleet-wide with `_parse_inspect`'s
+    field-level inheritance — and behind NO `enabled` switch on purpose: this is an
+    ingredient of `daemon.pr_recompute_stalled`, a predicate every surface reads through
+    `ops.scheduled_actor`, not an alarm anyone can turn off. A fleet with validation and
+    inspection both off still has to be able to say nobody is going to act.
+    """
+
+    recompute_stall_minutes: int = DEFAULT_PULL_REQUESTS_RECOMPUTE_STALL_MINUTES
 
 
 # -- the scheduler: the OS filing a work order nobody typed. ABOVE `ProjectSpec` for the
@@ -1758,6 +1792,7 @@ class ProjectSpec:
     rules: RulesConfig = field(default_factory=RulesConfig)
     evolution: EvolutionConfig = field(default_factory=EvolutionConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
+    pull_requests: PullRequestsConfig = field(default_factory=PullRequestsConfig)
     bugs: BugsConfig = field(default_factory=BugsConfig)
     release: ReleaseConfig = field(default_factory=ReleaseConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
@@ -1898,6 +1933,7 @@ class OsConfig:
     rules: RulesConfig = field(default_factory=RulesConfig)
     evolution: EvolutionConfig = field(default_factory=EvolutionConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
+    pull_requests: PullRequestsConfig = field(default_factory=PullRequestsConfig)
     bugs: BugsConfig = field(default_factory=BugsConfig)
     release: ReleaseConfig = field(default_factory=ReleaseConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
@@ -2414,6 +2450,8 @@ def _parse_fleet_health(raw: Any, base: FleetHealthConfig | None = None,
         sweep_every_ticks=int(raw.get("sweep_every_ticks", base.sweep_every_ticks)),
         sweep_dark_minutes=int(raw.get("sweep_dark_minutes", base.sweep_dark_minutes)),
         exempt_kinds=exempt_kinds,
+        red_episode_retention_hours=int(raw.get(
+            "red_episode_retention_hours", base.red_episode_retention_hours)),
     )
     for name, value in vars(cfg).items():
         if name in FLEET_HEALTH_MAP_KEYS or name in FLEET_HEALTH_LIST_KEYS \
@@ -2730,6 +2768,27 @@ def _parse_messaging(raw: Any, base: MessagingConfig | None = None,
         raise _err(f'"{where}" must be an object')
     cfg = MessagingConfig(
         stuck_minutes=int(raw.get("stuck_minutes", base.stuck_minutes)),
+    )
+    for name, value in vars(cfg).items():
+        if value < 1:
+            raise _err(f"{where}.{name} must be >= 1")
+    return cfg
+
+
+def _parse_pull_requests(raw: Any, base: PullRequestsConfig | None = None,
+                         where: str = "os.pull_requests") -> PullRequestsConfig:
+    """`os.pull_requests`, or a project's override — field-level, like `_parse_messaging`.
+
+    Refused rather than clamped below 1 for that function's reason, with one of its own:
+    zero would call every fresh UNKNOWN a stall, and a fresh UNKNOWN is what an ordinary
+    push looks like (kn-5e93939e).
+    """
+    base = base or PullRequestsConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    cfg = PullRequestsConfig(
+        recompute_stall_minutes=int(raw.get("recompute_stall_minutes",
+                                            base.recompute_stall_minutes)),
     )
     for name, value in vars(cfg).items():
         if value < 1:
@@ -3066,6 +3125,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         rules=_parse_rules(os_raw.get("rules", {})),
         evolution=_parse_evolution(os_raw.get("evolution", {})),
         messaging=_parse_messaging(os_raw.get("messaging", {})),
+        pull_requests=_parse_pull_requests(os_raw.get("pull_requests", {})),
         bugs=_parse_bugs(os_raw.get("bugs", {})),
         release=_parse_release(os_raw.get("release", {})),
         schedule=_parse_schedule(os_raw.get("schedule", {})),
@@ -3237,6 +3297,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         messaging_cfg = _parse_messaging(
             p.get("messaging", {}), base=os_cfg.messaging,
             where=f"projects[{i}] ({name}).messaging")
+        pull_requests_cfg = _parse_pull_requests(
+            p.get("pull_requests", {}), base=os_cfg.pull_requests,
+            where=f"projects[{i}] ({name}).pull_requests")
         bugs_cfg = _parse_bugs(
             p.get("bugs", {}), base=os_cfg.bugs,
             where=f"projects[{i}] ({name}).bugs")
@@ -3274,6 +3337,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 rules=rules_cfg,
                 evolution=evolution_cfg,
                 messaging=messaging_cfg,
+                pull_requests=pull_requests_cfg,
                 bugs=bugs_cfg,
                 release=release_cfg,
                 schedule=schedule_cfg,

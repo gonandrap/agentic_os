@@ -285,6 +285,65 @@ def validation_ci_hold_spans(events: Iterable[Any], since: float,
     return sorted(spans)
 
 
+#: The three event kinds that move a planner's pending-assumption count, §2.3 of
+#: docs/superpowers/specs/2026-10-15-a-child-held-by-its-features-unratified-plan-is-not-
+#: stuck.md. EXHAUSTIVE: both callers of `review_assumption` write one of the two
+#: settlement kinds — `ops.py:8605` (Neo's auto-review) and `ops.py:8743` (the user's).
+PLAN_ASSUMPTION_EVENT_KINDS = ("assumption", "autoreview_accepted", "reviewed")
+
+
+def plan_hold_spans(events: Iterable[Any], since: float,
+                    now: float) -> list[tuple[float, float]]:
+    """Every interval inside `[since, now]` a feature's plan was unratified.
+
+    §2.3 of docs/superpowers/specs/2026-10-15-a-child-held-by-its-features-unratified-
+    plan-is-not-stuck.md: `ops.stuck_scan` DISCOUNTS these seconds as well as excluding a
+    live hold. `pending` is judged on time in status, so without the discount the first
+    sweep after the user rules sees the whole wait and buys the investigation the
+    exclusion existed to prevent — `validation_ci_hold_spans`' reason, one hold along.
+
+    THE EVENTS ARE THE PLANNER'S WHOLE HISTORY, NOT THE WINDOW'S. The count entering
+    `[since, now]` is only right if the walk starts at the first event ever written, so
+    the clipping happens to the resulting SPANS. Filtering the rows by `since` first
+    would lose every hold that opened before the child's status span — which is the
+    normal case, since the plan is held before the child is even filed.
+
+    SPANS AND NOT A TOTAL, for `validation_ci_hold_spans`' reason: only intervals can be
+    unioned with the usage holds (`holds.union_seconds`), and a usage window can shut
+    while the plan stands.
+
+    Neo ruled this derivation (question 1803) over an `assumptions.decided_ts` column:
+    the timeline is what the OS already writes, and a NULL pre-migration column would
+    reintroduce the stale-exclusion defect on every existing row.
+
+    Takes ROWS rather than a store for `validation_hold_until`'s reason.
+    """
+    spans: list[tuple[float, float]] = []
+    pending, opened = 0, 0.0
+    for e in sorted(events, key=lambda r: float(r["ts"])):
+        kind = str(e["kind"])
+        if kind == "assumption":
+            delta = 1
+        elif kind == "autoreview_accepted":
+            delta = -1
+        elif kind == "reviewed":
+            delta = -int(db.from_json(e["payload"], {}).get("count") or 0)
+        else:
+            continue
+        before = pending
+        # CLAMPED AT ZERO: a malformed `count` must not drive the walk negative, which
+        # would swallow the next hold entirely instead of reporting one wrong span.
+        pending = max(0, pending + delta)
+        if before == 0 and pending > 0:
+            opened = float(e["ts"])
+        elif before > 0 and pending == 0:
+            spans.append((opened, float(e["ts"])))
+    if pending > 0:
+        spans.append((opened, now))
+    return sorted((max(start, since), min(end, now)) for start, end in spans
+                  if min(end, now) > max(start, since))
+
+
 # What one seat proposed. "" is a seat that offered none — it ran, but said nothing the
 # arbiter can count.
 VALIDATION_VERDICTS = ("pass", "reject", "")
@@ -1324,6 +1383,19 @@ ADDED_COLUMNS = {
         # be read as history rather than as the cache this is.
         "pr_head_oid": "TEXT",
         "pr_head_seen_at": "REAL",
+        # THE SAME CACHE FOR THE TWO FACTS THAT SAY GITHUB HAS STOPPED RECOMPUTING THIS
+        # PULL REQUEST — wo-d3a70c29, from PR #995: the branch moved and the pull
+        # request's `head.sha` did not, so mergeability stayed UNKNOWN for ~7h and the
+        # poll's every acting branch declined, silently and for ever.
+        #
+        # `pr_ref_oid` is the branch tip `git ls-remote` reports, read only while
+        # mergeability is UNKNOWN; "" is NOT OBSERVED and never a sha that could match
+        # one, same rule as `pr_head_oid` above. `pr_mergeable_unknown_since` is when
+        # mergeability FIRST stopped being an answer, and is cleared the moment it is one
+        # again — a fresh UNKNOWN is what an ordinary push looks like (kn-5e93939e).
+        # Both are read by `daemon.pr_recompute_stalled`, off the row and nothing else.
+        "pr_ref_oid": "TEXT",
+        "pr_mergeable_unknown_since": "REAL",
         # Work orders that must finish before this one may be claimed (JSON list of
         # work-order ids). Deliberately NOT a `blocked` status: this codebase's statuses
         # are load-bearing — OPEN_STATUSES, TERMINAL_STATUSES, true_blockers and the
