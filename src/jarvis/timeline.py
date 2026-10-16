@@ -235,6 +235,14 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         return STATUS_LABEL.get(status, status or "Status changed"), ""
     if kind == "dispatched":
         return "Worker dispatched", p.get("worktree") or ""
+    # §2.6 of docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md.
+    if kind == "precondition_added":
+        return (f"Held until {p.get('ref') or 'something'} clears",
+                p.get("note") or "")
+    if kind == "precondition_cleared":
+        by = "the OS" if p.get("by") == "os" else "you"
+        return (f"Hold on {p.get('ref') or 'something'} cleared by {by}",
+                p.get("note") or "")
     if kind == "dispatch_deferred_for_compaction":
         # The prompt is QUEUED, not sent: the audit trail is this, then `compacted`,
         # then `message_delivered` (spec 2026-09-29 §3.6).
