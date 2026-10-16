@@ -299,13 +299,87 @@ def settles_turn(store: ProjectStore, wo: dict[str, Any],
     for a row no pass will ever touch again, which is the hole this feature exists to
     close rather than to paper over.
 
+    A DONE TURN IS NOT ENOUGH, and `or store.latest_turn(...) is not None` was the
+    defect: a turn done and ended hours ago kept naming this pass for a row the pass
+    re-derives nothing for, every tick, for ever. `settles_done_turn` below is the one
+    rule, and `Daemon.settle_work_order` gates on the same call.
+
     Cheapest first: two free row fields, then the free grace, then one indexed read.
     """
     if wo["status"] not in SETTLE_STATUSES:
         return False
     if wo["origin"] in UNGOVERNED_ORIGINS:
         return False
-    return settle_grace_holds(wo, now) or store.latest_turn(wo["id"]) is not None
+    if settle_grace_holds(wo, now):
+        return True
+    turn = store.latest_turn(wo["id"])
+    if turn is None:
+        return False  # the claim-with-no-launch hole; see the docstring above
+    if turn["state"] != "done":
+        return True   # running or paused: the settler re-derives the row from the turn
+    return settles_done_turn(store, wo)
+
+
+def settles_done_turn(store: ProjectStore, wo: dict[str, Any], *,
+                      queued: list[dict[str, Any]] | None = None) -> bool:
+    """Does a DONE turn move this row — `Daemon.settle_work_order`'s own rule.
+
+    ONE EXPRESSION, TWO READERS: the settler gates its done-turn half on this and
+    `settles_turn` above answers the registry with it, so "the settler will act" and
+    "the settler writes something" cannot drift (the predicate rule, 2026-10-09 §2).
+
+    False is the four shapes where the settler's done-turn branches write NOTHING:
+
+    1. a QUEUED MESSAGE — that row is `Daemon.deliver_messages`', which sends it as the
+       next turn, and nothing has settled yet;
+    2. a non-manager parked on a HELD gate request — `something_is_out` is true and
+       `user_facing_wait` is false, so nothing is written: the request is the worker's
+       own move and is owed by nobody (fix 2 of
+       docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md). An
+       outward-facing one is True instead and the settler parks it `waiting_input`,
+       which is the half GitHub issue 100 was missing — a `wo ask` still unanswered at
+       settle time was filed as `needs_review` + IDLE_NO_FINISH_BLOCKER;
+    3. the same outward-facing wait ALREADY in `waiting_input` — the status it would be
+       written to;
+    4. a manager in its designed steady state: already `idle`, or holding a wait of its
+       own, because `waiting_input` is the only carrier of the fact that a manager ASKED
+       for something and re-statusing it `idle` would say the opposite (issue #264).
+
+    `user_facing_wait` is read beside `something_is_out` so the pair cannot drift
+    (kn-4ea33fe6), and both live here rather than in the settler for kn-787b7c27's
+    reason: one public contract per question.
+
+    Everything else is True, including every row with a `result_summary` — which is
+    every row the round machine owes a deferred landing, since a round can only have
+    PASSED on delivered work. NO GRACE of its own: the 300s post-claim grace answers a
+    row with no turn at all and is `settles_turn`'s, above.
+
+    COST (§2): one indexed read before any field is asked twice, and the gate reads
+    only on a row with no summary — the same reads `settle_work_order` already paid for
+    on this row this tick. `queued` lets a caller holding the list pass it in.
+    """
+    from .invariants import something_is_out, user_facing_wait
+
+    msgs = queued if queued is not None else store.queued_messages(wo["id"])
+    if msgs:
+        return False
+    if wo.get("result_summary"):
+        return True
+    manager = wo.get("kind") == "manager"
+    if not manager and something_is_out(store, wo["id"]):
+        return (user_facing_wait(store, wo["id"])
+                and wo["status"] != "waiting_input")
+    if manager:
+        # Its feature being over is the one thing that still moves it
+        # (`_close_feature_manager`); asked-for-something holds it where it is.
+        parent = wo.get("parent_id")
+        feature = store.get_feature_order(parent) if parent else None
+        if feature and feature["status"] in FO_TERMINAL_STATUSES:
+            return True
+        if user_facing_wait(store, wo["id"]):
+            return False
+        return wo["status"] != "idle"
+    return True
 
 
 def retries_turn(store: ProjectStore, wo: dict[str, Any],
@@ -331,24 +405,42 @@ def delivers_message(store: ProjectStore, wo: dict[str, Any],
     return worker_session.delivery_hold(store, wo, now=now) is None
 
 
-def runnable_round(store: ProjectStore, wo: dict[str, Any],
-                   now: float | None = None) -> dict[str, Any] | None:
-    """The round `Daemon.validation_tick` will judge, or None — 2026-10-09 §3.
+def validation_round(store: ProjectStore, wo: dict[str, Any],
+                     now: float | None = None) -> dict[str, Any] | None:
+    """The round THE PANEL OWNS on this row, held or not — 2026-10-09 §2.
 
-    `ProjectStore.work_orders_awaiting_validation`'s SQL restricted to ONE row: the
-    same `RUNNABLE_VALIDATION_OUTCOMES` and `OPEN_STATUSES` bound, with
-    `latest_validation_round` being the `MAX(round)` that query joins on — plus the
-    pass's own hold test. This round met a window of its own and the refusal named
-    when it lifts; `failed` is RUNNABLE, so without that test the same closed window
-    is walked into every tick (`_validation_held`).
+    ROW SELECTION ONLY. `ProjectStore.work_orders_awaiting_validation`'s SQL restricted
+    to ONE row: the same `RUNNABLE_VALIDATION_OUTCOMES` and `OPEN_STATUSES` bound, with
+    `latest_validation_round` being the `MAX(round)` that query joins on.
+
+    THE HOLD IS NOT IN IT, and that is the whole point of the split: a round inside its
+    hold has a NAMED actor whose turn is DELAYED — `Daemon.validation_tick` judges it
+    the moment the window reopens — and §2's `None` means nobody will ever act. The
+    hold test lives in `runnable_round` below, which is what the pass itself asks.
 
     `work_orders_awaiting_validation` must NOT be called here: it takes no `wo_id`,
     so it would be a project-wide query per order per reconcile tick.
+
+    `now` is accepted and unused, so this reads as every other registry predicate.
     """
     if wo["status"] not in OPEN_STATUSES:
         return None
     row = store.latest_validation_round(wo_id=wo["id"])
     if not row or row.get("outcome") not in RUNNABLE_VALIDATION_OUTCOMES:
+        return None
+    return row
+
+
+def runnable_round(store: ProjectStore, wo: dict[str, Any],
+                   now: float | None = None) -> dict[str, Any] | None:
+    """The round `Daemon.validation_tick` will judge NOW, or None — 2026-10-09 §3.
+
+    The selection above PLUS the pass's own hold test. This round met a window of its
+    own and the refusal named when it lifts; `failed` is RUNNABLE, so without that test
+    the same closed window is walked into every tick (`_validation_held`).
+    """
+    row = validation_round(store, wo, now)
+    if row is None:
         return None
     if validation_hold_until(store.events_of_kind(wo["id"], "validation_failed"),
                              int(row["round"])) > (now or time.time()):
@@ -6557,7 +6649,9 @@ class Daemon:
 
     def settle_work_order(self, project: ProjectSpec, store: ProjectStore,
                           wo: dict) -> None:
-        from .invariants import something_is_out, true_blockers, user_facing_wait
+        # `user_facing_wait` is NOT read here any more: it decides eligibility, and
+        # eligibility is `settles_done_turn`'s one rule.
+        from .invariants import something_is_out, true_blockers
 
         # OUT OF MONEY, asked before the turn is looked at but AFTER the round machine's
         # claim below. The budget governs the order's WHOLE bill, so what spends the last
@@ -6738,10 +6832,15 @@ class Daemon:
                                        wo_id=wo["id"], source="reconciler")
             return
 
-        # The turn is done. Everything below decides what the work order does next.
-        if store.queued_messages(wo["id"]):
-            return  # the next turn goes out this tick; nothing has settled yet
+        # The turn is done. ONE RULE decides whether it moves this row, and
+        # `settles_turn` answers the actor registry with the same call — a second
+        # condition left beside it is the drift 2026-10-09 §2's predicate rule forbids.
+        # It subsumes the `queued_messages` return that used to stand here (the next
+        # turn goes out this tick; nothing has settled yet) and each done-turn branch
+        # below that wrote nothing.
         fresh = store.get_work_order(wo["id"])
+        if not settles_done_turn(store, fresh):
+            return
         from . import ops as ops_mod
 
         # THE LANDING THE ROUND MACHINE DEFERRED, taken explicitly rather than left to
@@ -6815,23 +6914,13 @@ class Daemon:
             # question awaiting an answer. Either way the worker was TOLD to end its turn
             # and wait, so an idle worker here is compliance, not abandonment.
             #
-            # THE WHOLE PREDICATE, and a manager is excluded from it: `something_is_out`
-            # adds `held_approvals`, which is what keeps an idle worker holding an
-            # unargued gate out of the `else` below and off the user's list (fix 2 of
-            # docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md), and
-            # the exclusion is what keeps the manager branch below reachable exactly as
-            # before. The WRITE stays conditional on the wait being outward-facing: a
-            # held request is the worker's own move, so it parks nothing.
-            #
-            # The question half was missing, and the `else` below caught those instead:
-            # a `jarvis wo ask` whose answer had not landed by the time the turn settled
-            # was filed as `needs_review` + IDLE_NO_FINISH_BLOCKER and put in front of
-            # the user, for a worker doing exactly what the contract asks of it (GitHub
-            # issue 100). Only the tightness of the Neo drain loop kept that rare; a
-            # slow or disabled Neo makes it every `wo ask`.
-            if (user_facing_wait(store, wo["id"])
-                    and fresh["status"] != "waiting_input"):
-                store.set_status(wo["id"], "waiting_input")
+            # THIS READ CHOOSES THE STATUS, it does not decide eligibility: it is what
+            # tells this arm from the `else` tail below. Whether the wait is
+            # outward-facing, and whether the row is already parked there, are
+            # `settles_done_turn`'s — see it for fix 2 of
+            # docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md and for
+            # GitHub issue 100.
+            store.set_status(wo["id"], "waiting_input")
         elif wo.get("kind") == "manager":
             # A project manager order is idle BY DESIGN: it acts on a message and ends
             # its turn, and between messages there is nothing for it to do. The default
@@ -6848,7 +6937,8 @@ class Daemon:
             # runs. Suppressing the FLAG was never enough: six other surfaces re-derive
             # meaning from the status alone, which is kn-cffc8905's trap paid a third
             # time. A manager that genuinely ASKED for something stays in
-            # `waiting_input`, which is where it belongs — see the guard below.
+            # `waiting_input`, which is where it belongs — `settles_done_turn` holds it
+            # there and this arm is never reached for it (issue #264).
             #
             # UNLESS ITS FEATURE IS ALREADY OVER, and that ordering is one the feature
             # round machine makes reachable. A manager is created `pending` and claimed
@@ -6866,24 +6956,7 @@ class Daemon:
             feature = store.get_feature_order(parent) if parent else None
             if feature and feature["status"] in FO_TERMINAL_STATUSES:
                 self._close_feature_manager(store, str(parent))
-            elif user_facing_wait(store, wo["id"]):
-                # HOLD IT WHERE IT IS. `waiting_input` is the only carrier of the fact
-                # that this manager ASKED for something, and re-statusing it `idle` would
-                # say the opposite — nothing to act on — about an order waiting for a
-                # verdict: muted, out of FEATURED_STATUSES, and refused a nudge.
-                #
-                # THE BRANCH ABOVE NOW COVERS THE REST, and a manager is excluded from it
-                # on purpose so this one stays reachable: `something_is_out` there is the
-                # whole predicate, including `awaiting_case`. What is left here is the
-                # narrower question — is somebody ELSE holding this — because a HELD gate
-                # request is the manager's own move and is owed by nobody. A manager
-                # holding only one falls through to `idle`, which is the truthful label:
-                # its feature is what wakes it. Fix 2 of
-                # docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md.
-                # `user_facing_wait` lives beside `something_is_out` so the pair cannot
-                # drift (kn-4ea33fe6).
-                pass
-            elif fresh["status"] != "idle":
+            else:
                 store.set_status(wo["id"], "idle")
                 # The one write the re-status cannot do on its own: a manager carried
                 # over from before issue #264 may have been flagged while it was in
