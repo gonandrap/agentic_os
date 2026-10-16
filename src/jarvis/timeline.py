@@ -810,6 +810,24 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         since = _clock(p.get("unknown_since"))
         return title, (f"mergeability unanswered since {since}" if since
                        else "mergeability unanswered")
+    # ...and the remedy, which the OS now performs instead of the user (wo-7ec57748).
+    # ONE close+reopen per stall episode, so these four lines are the whole episode.
+    if kind == "pr_resync_started":
+        ref, head = str(p.get("ref_oid") or ""), str(p.get("head_oid") or "")
+        return ("Closing and reopening the pull request to make GitHub recompute it",
+                (f"branch at {ref[:10]}, pull request head at {head[:10]}"
+                 if ref and head else str(p.get("pr_url") or "")))
+    if kind == "pr_resync_done":
+        return "Pull request closed and reopened — waiting for GitHub to answer", ""
+    if kind == "pr_resync_failed":
+        # THE STAGE IS THE WHOLE POINT: a close that failed changed nothing, and a reopen
+        # that failed left the pull request SHUT by the OS.
+        return (f"Could not {p.get('stage') or 'resync'} the pull request to resync it",
+                str(p.get("error") or p.get("reason") or ""))
+    if kind == "pr_resync_cleared":
+        head = str(p.get("head_oid") or "")
+        return ("GitHub is recomputing the pull request again",
+                f"head at {head[:10]}" if head else "")
     if kind == "pr_conflict_unresolved":
         return ("Merge conflict the worker could not resolve — over to you",
                 f"{p.get('attempts')} attempts")
