@@ -375,6 +375,64 @@ def polls_pull_request(store: ProjectStore, wo: dict[str, Any],
     return bool(ops.routes_on_pull_request(store, wo))
 
 
+#: The timeline's record that GitHub has stopped recomputing one pull request. ONE per
+#: episode (`Daemon._note_recompute_stalled`), and the dedupe key the one-shot resync
+#: remedy keys on — wo-d3a70c29.
+PR_RECOMPUTE_STALLED_EVENT = "pr_recompute_stalled"
+
+
+def pr_recompute_stalled(store: ProjectStore, wo: dict[str, Any],
+                         now: float | None = None) -> bool:
+    """True when GitHub has stopped recomputing this pull request — wo-d3a70c29.
+
+    PR #995's shape: a push moved `refs/heads/worktree-wo-cdee6f9b` to 88cac10, the pull
+    request's head stayed at 0488753, and mergeability never left UNKNOWN — so
+    `Daemon.poll_pull_requests` kept asking, every acting branch kept declining, and the
+    order sat for ~7h with an actor on paper and nobody acting.
+
+    EITHER of two facts says so, and each is a cached row column:
+
+    (a) the tip `git ls-remote` reported and the head GitHub's own pull request record
+        holds are both observed and DIFFER — the record is behind the branch;
+    (b) mergeability has been unanswered for longer than
+        `pull_requests.recompute_stall_minutes`.
+
+    NOT a conflict and never read as one: UNKNOWN right after a push is the NORMAL state
+    (kn-5e93939e), which is what the threshold in (b) and the both-observed rule in (a)
+    are for. "" is NOT OBSERVED and disqualifies nothing.
+
+    COST: free row fields first, and the catalog read only once a free field says there
+    is something to judge. No network, no subprocess, no session file, no model — this
+    runs per order per reconcile tick through `invariants.true_blockers`.
+    """
+    ref = str(wo.get("pr_ref_oid") or "")
+    head = str(wo.get("pr_head_oid") or "")
+    if ref and head and ref != head:
+        return True
+    since = wo.get("pr_mergeable_unknown_since")
+    if not isinstance(since, (int, float)):
+        return False
+    from . import ops
+    minutes = int(ops.pull_requests_config_at(
+        store.project_path).recompute_stall_minutes)
+    return (now or time.time()) - float(since) > minutes * 60
+
+
+def polls_and_can_act_on_pull_request(store: ProjectStore, wo: dict[str, Any],
+                                      now: float | None = None, *,
+                                      recorded: Any = None) -> bool:
+    """`waiting_pr_merge`'s actor test: the poll selects this row AND can still move it.
+
+    `polls_pull_request` is deliberately NOT tightened — it is the pass's SELECTION
+    predicate, and the poll must keep reading a stalled pull request or the stall could
+    never clear itself after a resync. What changes is the CLAIM: a pull request GitHub
+    has stopped recomputing has no acting branch left, so naming this pass as its actor
+    is the false answer wo-d3a70c29 exists to stop.
+    """
+    return (polls_pull_request(store, wo, now=now, recorded=recorded)
+            and not pr_recompute_stalled(store, wo, now=now))
+
+
 def answers_question(store: ProjectStore, wo: dict[str, Any],
                      now: float | None = None) -> dict[str, Any] | None:
     """The question Neo still holds for this row, or None — 2026-10-09 §3."""
@@ -7115,6 +7173,23 @@ class Daemon:
         adds one `gh run list` per PROJECT per tick — shared across every pull request in
         the loop, filled lazily, and never called at all while the fleet is green.
 
+        **AN UNKNOWN ONE COSTS MORE, AND ONLY AN UNKNOWN ONE** (wo-d3a70c29). GitHub
+        reporting no mergeability for an OPEN pull request buys three things and the
+        green path pays for none of them:
+
+        * one `git ls-remote --heads origin` per PROJECT per tick, shared across the loop
+          and filled lazily, exactly as `base_ci` above is — the whole repository in one
+          call, so a project with four UNKNOWN pull requests still makes one;
+        * ONE WRITE when `pr_mergeable_unknown_since` goes up, and one when it comes back
+          down. The head cache's discipline, on the same `update_work_order`: nothing is
+          written on a tick where nothing moved, so an UNKNOWN that stays UNKNOWN costs
+          no write at all;
+        * ONE indexed `wo_events` read inside the stalled branch alone — the dedupe for
+          the single `pr_recompute_stalled` event per episode. `pr_recompute_stalled`
+          itself is free on every other row: it reads two row columns and stops.
+
+        The green budget above is unchanged, and the test beside it counts it.
+
         **The automatic merge costs that case NOTHING, and its own cost is counted too.**
         `Daemon.auto_merge` returns on `project.validation.auto_merge` before it reads
         anything, so a project that has not opted in — the shipped state of every project
@@ -7171,6 +7246,11 @@ class Daemon:
         # red check is rebuilt, including the ones with no repair episode and no session
         # to nudge — not just the two that happened to have a worker being nudged.
         base_ci: dict[str, tuple[Any, ...] | None] = {}
+        # THE REMOTE'S OWN BRANCH TIPS, read once per project per tick and lazily, for
+        # `base_ci`'s reason exactly — one `git ls-remote` for the whole repository,
+        # filled only when some polled OPEN pull request reports UNKNOWN mergeability,
+        # so a fleet GitHub is answering about never spawns the subprocess (wo-d3a70c29).
+        tips: dict[str, str] | None = None
         # THE RED-BASE FACT, READ ONCE PER PROJECT PER TICK, for the same reason: it is
         # the project's fact and not the order's, so a read per parked order would be a
         # central query the budget above does not name. Only an opted-in project pays it.
@@ -7196,9 +7276,56 @@ class Daemon:
             # `invariants.parked_reason` runs per order per tick and may not go to the
             # network, and this poll already holds the answer. Written only when it
             # MOVED, so the green common case keeps its no-write budget.
+            #
+            # TWO MORE COLUMNS ON THE SAME DISCIPLINE — wo-d3a70c29. UNKNOWN is the one
+            # answer no branch below can act on, so the poll caches what says it has
+            # STOPPED being temporary: when it started, and where the remote's branch
+            # actually points. One `update_work_order` for all of it, written only if
+            # something moved, so the green common case keeps its no-write budget.
+            unknown = (pr.mergeable == "UNKNOWN"
+                       or (pr.mergeable is None and pr.state == "OPEN"))
+            tip = ""
+            if unknown and pr.head_ref:
+                if tips is None:
+                    try:
+                        tips = github.ls_remote(cwd=project.path)
+                    except Exception:  # noqa: BLE001 — stale beats wrong, and one
+                        # unreadable remote must not break the poll for other orders
+                        log.debug("[%s] could not list remote heads", project.name)
+                        tips = {}
+                tip = tips.get(pr.head_ref, "")
+            cache: dict[str, Any] = {}
             if pr.head_oid and pr.head_oid != str(wo.get("pr_head_oid") or ""):
-                store.update_work_order(wo["id"], pr_head_oid=pr.head_oid,
-                                        pr_head_seen_at=db.now())
+                # VOID THE TIP ON THE SAME WRITE: it is only re-read while mergeability
+                # is UNKNOWN, so a healthy push would otherwise leave an old tip beside
+                # a new head and read as stalled for ever.
+                cache.update(pr_head_oid=pr.head_oid, pr_head_seen_at=db.now(),
+                             pr_ref_oid="")
+            since = wo.get("pr_mergeable_unknown_since")
+            if unknown and not isinstance(since, (int, float)):
+                cache["pr_mergeable_unknown_since"] = db.now()
+            elif not unknown and isinstance(since, (int, float)):
+                cache["pr_mergeable_unknown_since"] = None
+            if tip and tip != cache.get("pr_ref_oid", str(wo.get("pr_ref_oid") or "")):
+                cache["pr_ref_oid"] = tip
+            if cache:
+                store.update_work_order(wo["id"], **cache)
+            # THE PREDICATE IS EXECUTED AND NOT MERELY WRITTEN, every tick and not only
+            # when something moved: condition (b) comes true by the clock, on a tick
+            # where nothing is cached at all. On the OVERLAY rather than `wo`, because
+            # the local dict is never refreshed — judging it would judge the state
+            # before the write above, on the very tick the evidence arrives. Free unless
+            # a row field already says there is something to judge; the one `wo_events`
+            # read is inside the stalled branch alone.
+            #
+            # ON AN OPEN PULL REQUEST ONLY. A merged or closed one whose cached tip still
+            # differs from its cached head IS stalled by the predicate — correctly, the
+            # columns say what they say — but there is nothing left for GitHub to
+            # recompute, so an event here would be evidence about a pull request that has
+            # finished, written on the tick before `complete_merged` closes the order.
+            stalling = {**wo, **cache}
+            if pr.state == "OPEN" and pr_recompute_stalled(store, stalling):
+                self._note_recompute_stalled(store, stalling, pr)
             try:
                 if pr.merged:
                     # THE ROUND FIRST, if one is open: the pull request has landed, so
@@ -9096,6 +9223,39 @@ class Daemon:
                  f"Nothing was merged and nothing is stuck — merging it yourself works "
                  f"exactly as it always has.",
             wo_id=wo["id"])
+
+    def _note_recompute_stalled(self, store: ProjectStore, wo: dict,
+                                pr: Any) -> bool:
+        """Say GitHub has stopped recomputing this pull request, ONCE per episode.
+
+        `ProjectStore.pr_closure_told`'s arithmetic, against the cheapest clock the row
+        already carries: the episode began when mergeability stopped being an answer or
+        when the head last moved, whichever is later, so an event older than that
+        belongs to a stall that has since been superseded by a push. Nothing writes a
+        "cleared" event — the two columns clearing IS the clearing, and this read is the
+        only cost of saying so.
+
+        THE EVIDENCE AND NOTHING MORE. No notification path, no status, no nudge: the
+        order stops deriving an actor, and `invariants.true_blockers` is what puts it in
+        front of the user. The event is also the dedupe key the one-shot resync remedy
+        (wo-7ec57748) keys on.
+        """
+        started = max(float(wo.get("pr_mergeable_unknown_since") or 0.0),
+                      float(wo.get("pr_head_seen_at") or 0.0))
+        told = store.events_of_kind(wo["id"], PR_RECOMPUTE_STALLED_EVENT)
+        if told and float(told[-1]["ts"]) >= started:
+            return False
+        store.add_event(wo["id"], PR_RECOMPUTE_STALLED_EVENT,
+                        {"pr_url": wo.get("pr_url"),
+                         "head_oid": str(wo.get("pr_head_oid") or ""),
+                         "ref_oid": str(wo.get("pr_ref_oid") or ""),
+                         "branch": getattr(pr, "head_ref", ""),
+                         "mergeable": getattr(pr, "mergeable", None) or "UNKNOWN",
+                         # WHICH OF THE TWO CONDITIONS THIS IS: with no tip observed
+                         # there is nothing to compare, and the clock is the whole of the
+                         # evidence. `timeline._describe` renders the two differently.
+                         "unknown_since": wo.get("pr_mergeable_unknown_since")})
+        return True
 
     def _note_reopened(self, project: ProjectSpec, store: ProjectStore,
                        wo: dict) -> bool:

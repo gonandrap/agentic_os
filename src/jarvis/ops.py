@@ -51,6 +51,7 @@ from .daemon import (
     answers_question,
     daemon_running,
     delivers_message,
+    polls_and_can_act_on_pull_request,
     polls_pull_request,
     retries_turn,
     reviews_gate,
@@ -3283,7 +3284,7 @@ def follow_up_repo(project_path: Path) -> str:
 
     Read from the CHECKOUT's own `origin` and from nowhere else. That is the point: the
     repository name becomes a `gh --repo` argument, and the one source that no model and
-    no stored string can influence is the local remote (`github.LOCAL_GIT_READS`).
+    no stored string can influence is the local remote (`github.GIT_READS`).
 
     "" for a project with no `origin` at all — several in the fleet are local-only — and
     the caller reports that as a filing it could not make rather than as a finding that
@@ -15095,6 +15096,27 @@ def messaging_config_at(project_path: Path) -> Any:
         return MessagingConfig()
 
 
+def pull_requests_config_at(project_path: Path) -> Any:
+    """`os.pull_requests` for the project rooted at `project_path`.
+
+    `inspect_config_at`'s twin again, for `daemon.pr_recompute_stalled` — a predicate is
+    handed a `ProjectStore` and no project name. Falls back to the OS block and then to
+    the shipped defaults for that function's reason: a threshold with no catalog behind
+    it is still a threshold, and having none would mean having no predicate.
+    """
+    from .catalog import PullRequestsConfig
+
+    try:
+        catalog = resolve_catalog()
+        target = Path(project_path).resolve()
+        for spec in catalog.projects:
+            if Path(spec.path).resolve() == target:
+                return spec.pull_requests
+        return catalog.os.pull_requests
+    except (OpsError, CatalogError, OSError, ValueError):
+        return PullRequestsConfig()
+
+
 @observability.metered(OBSERVE_INSPECT, target="target", project="project")
 def inspect_report(target: str, project: str | None = None, *,
                    write_floor: int | None = None,
@@ -17102,10 +17124,14 @@ SCHEDULED_ACTORS: dict[str, ActorPasses] = {
         "no daemon pass — the user reviews it, and `invariants.true_blockers` is what "
         "puts it in front of them")),
     "waiting_pr_merge": ActorPasses((
+        # wo-d3a70c29: the poll still SELECTS a stalled row (`polls_pull_request` is
+        # untouched); what it is no longer is an answer to "somebody will act on this".
         _Pass("Daemon.poll_pull_requests",
-              "the row carries a routing pull request, so the poll asks GitHub what "
-              "became of it",
-              "daemon.polls_pull_request", polls_pull_request),
+              "`daemon.polls_and_can_act_on_pull_request` says yes: the row carries a "
+              "routing pull request and GitHub is still recomputing it, so the poll "
+              "asks what became of it and some branch of it can move the row",
+              "daemon.polls_and_can_act_on_pull_request",
+              polls_and_can_act_on_pull_request),
     )),
     # Deliberately none: `project_store.NOT_RETRIED` excludes it and
     # `Daemon.settle_work_order` returns early for it.
