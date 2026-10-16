@@ -658,11 +658,16 @@ def build_evidence(pstore: Any, subject: dict[str, Any],
         # line asserting the absence of a blocker is a claim the judge would weigh where
         # silence is the status quo it already reads.
         blocked = health.blocker(pstore, subject, cfg)
+        # ABSENT with no actor for the reason just above, and BEFORE `blocked:` because
+        # that is the only placement whose index relative to `this session is` is fixed
+        # (§7, the spec `health.actor` cites).
+        actor = health.actor(pstore, subject)
         sections.append([
             "# The work order",
             f"{row.get('id')} [{row.get('status')}] on "
             f"{row.get('model') or '(default model)'}",
             f"this session is {_what_it_is(row)}",
+            *([f"scheduled_actor: {actor.pass_name} - {actor.why}"] if actor else []),
             *([f"blocked: {BLOCKED_SENTENCES.get(blocked, blocked)}"] if blocked else []),
             f"title: {row.get('title')}",
             f"brief: {_clip(str(row.get('description') or ''), cfg.description_chars)}",
