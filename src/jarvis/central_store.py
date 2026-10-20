@@ -168,6 +168,7 @@ class KnowledgeBrief:
     digest: list[dict[str, Any]] = field(default_factory=list)
     overflow: list[tuple[str, int]] = field(default_factory=list)
     hints: list[dict[str, Any]] = field(default_factory=list)
+    pinned_chars: int = 0  # 0 = pinned entries render in full
 
     @property
     def overflow_count(self) -> int:
@@ -1132,7 +1133,8 @@ class CentralStore:
                         digest_limit: int = 40,
                         digest_chars: int = 4000, title: str = "",
                         hint_limit: int = 3,
-                        hint_chars: int = 400) -> KnowledgeBrief:
+                        hint_chars: int = 400,
+                        pinned_chars: int = 0) -> KnowledgeBrief:
         """Build the bounded prompt view of the knowledge base.
 
         Cost is capped by `pinned_limit` + `digest_chars` no matter how large the base
@@ -1149,7 +1151,8 @@ class CentralStore:
         `validation._round`'s shared prefix and `ops._index_cost` both call it positionally
         with the project only and must keep measuring the same prompt.
         """
-        brief = KnowledgeBrief(project=project, total=self.count_knowledge(project))
+        brief = KnowledgeBrief(project=project, total=self.count_knowledge(project),
+                               pinned_chars=pinned_chars)
         if brief.total == 0:
             return brief
 

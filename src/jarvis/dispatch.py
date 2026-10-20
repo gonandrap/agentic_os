@@ -162,6 +162,11 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
     ):
         if rule not in allow:
             allow.append(rule)
+    # A bare-name deny drops the tool's schema from the worker's starting context (docs/os/architecture/worker-context.md).
+    deny = settings["permissions"].setdefault("deny", [])
+    for tool in project.worker.denied_tools:
+        if tool not in deny:
+            deny.append(tool)
 
     # THE prefix-stability lever. Claude Code builds a git-status snapshot (branch,
     # `status --short`, last five commits) into the dynamic half of the system prompt
@@ -315,6 +320,10 @@ def worker_name(wo: dict[str, Any]) -> str:
     return f"[WO {wo['id']}] {wo['title'][:60]}"
 
 
+#: Largest overflow topics named in the roll-call; the rest are one `jarvis learn topics` away.
+OVERFLOW_TOPICS_SHOWN = 12
+
+
 def render_knowledge_block(brief: KnowledgeBrief, project_name: str) -> list[str]:
     """The knowledge base as a map plus a retrieval verb, not as a payload.
 
@@ -343,10 +352,16 @@ def render_knowledge_block(brief: KnowledgeBrief, project_name: str) -> list[str
         "Entries marked `(global)` came from another project; the rest are this one's.",
     ]
     if brief.pinned:
-        lines += ["", "## Pinned — read these now (full text)"]
+        cap = brief.pinned_chars
+        lines += ["", "## Pinned — read these now" + (
+            " (the rule; `jarvis learn show <id>` for the rest)" if cap
+            else " (full text)")]
         for k in brief.pinned:
             topic = f" [{k['topic']}]" if k["topic"] else ""
-            lines.append(f"- ({k['project'] or 'global'}{topic}) {k['content']}")
+            body = k["content"]
+            if cap and len(body) > cap:
+                body = body[:cap].rstrip() + f"… (`jarvis learn show {k['id']}`)"
+            lines.append(f"- ({k['project'] or 'global'}{topic}) {body}")
     if brief.hints:
         # Above the index, because it is the most relevant thing in the section; below it
         # this would read as a footnote. Labelled as evidence rather than as a verdict —
@@ -372,7 +387,11 @@ def render_knowledge_block(brief: KnowledgeBrief, project_name: str) -> list[str
             scope = "" if k["project"] == project_name else " (global)"
             lines.append(f"- `{k['id']}`{scope} {k['headline']}")
     if brief.overflow:
-        listed = ", ".join(f"{t or '(no topic)'} ({n})" for t, n in brief.overflow)
+        top = brief.overflow[:OVERFLOW_TOPICS_SHOWN]
+        listed = ", ".join(f"{t or '(no topic)'} ({n})" for t, n in top)
+        if len(brief.overflow) > len(top):
+            listed += (f", and {len(brief.overflow) - len(top)} more topics "
+                       f"(`jarvis learn topics --project {project_name}`)")
         lines += [
             "",
             f"## Not indexed above — {brief.overflow_count} further entries, by topic",
@@ -508,10 +527,10 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         return _analyst_prompt(wo, project, knowledge, feature)
     if wo.get("kind") == "investigator":
         return _investigator_prompt(wo, project, knowledge, feature)
-    from . import wiring, worker_brief
+    from . import os_map, wiring, worker_brief
     from .gates import KINDS
 
-    live_gates = tuple(k.name for k in KINDS
+    live_gates =tuple(k.name for k in KINDS
                        if k.name in project.gates.enabled) if project.gates else ()
     parts = [
         f"You are the worker agent for Jarvis work order `{wo['id']}` in project "
@@ -551,6 +570,7 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         *(["", *nav] if (nav := worker_brief.navigation_core(
             wiring.serena_wired(project.wiring),
             tool_search=project.worker.tool_search)) else []),
+        *(["", *omap] if (omap := os_map.brief_block(wo, project.path)) else []),
     ]
     pre_approved = _pre_approval(wo)
     if pre_approved:
@@ -575,6 +595,10 @@ def _navigation_briefing(serena: bool = True, tool_search: str = "cli") -> list[
     return worker_brief.navigation_section(serena, tool_search=tool_search).splitlines()
 
 
+#: Kinds whose hooks refuse every write, so they never reach a gate.
+READ_ONLY_KINDS = ("investigator", "analyst")
+
+
 def _common_briefing(parts: list[str], wo: dict[str, Any], project: ProjectSpec,
                      knowledge: KnowledgeBrief | None = None) -> list[str]:
     """The full-briefing tail — now only the PLANNER's prompt carries it inline.
@@ -584,14 +608,20 @@ def _common_briefing(parts: list[str], wo: dict[str, Any], project: ProjectSpec,
     index are the parts a worker still gets inline, composed in
     `build_worker_prompt` directly.
     """
-    from . import wiring
+    from . import os_map, wiring
 
     parts += ["", *_navigation_briefing(wiring.serena_wired(project.wiring),
                                        tool_search=project.worker.tool_search)]
+    if omap := os_map.brief_block(wo, project.path):
+        parts += ["", *omap]
     pre_approved = _pre_approval(wo)
     if pre_approved:
         parts += ["", *_pre_approved_briefing(pre_approved)]
-    if project.gates:
+    if project.gates and wo.get("kind") in READ_ONLY_KINDS:
+        # A read-only order cannot run a gated command; the protocol is one fetch away.
+        parts += ["", f"Privileged actions are gated; protocol: `jarvis brief gates --wo "
+                      f"{wo['id']}`."]
+    elif project.gates:
         parts += ["", *_gate_briefing(wo, project)]
     if knowledge:
         parts += render_knowledge_block(knowledge, project.name)
@@ -1480,6 +1510,7 @@ def dispatch_work_order(
         title=wo["title"],
         hint_limit=cfg.knowledge_hint_limit,
         hint_chars=cfg.knowledge_hint_chars,
+        pinned_chars=cfg.knowledge_pinned_chars,
     )
     prompt = build_worker_prompt(wo, project, knowledge,
                                  design_doc=materialize_design_doc(store, project, wo),

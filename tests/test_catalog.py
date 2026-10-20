@@ -901,7 +901,7 @@ def test_the_knowledge_hint_bounds_round_trip():
                          "projects": []})
     assert (cat.os.knowledge_hint_limit, cat.os.knowledge_hint_chars) == (5, 900)
     # and the digest budget is untouched by either
-    assert cat.os.knowledge_digest_chars == 4000
+    assert cat.os.knowledge_digest_chars == 1000
 
 
 def test_the_ceiling_has_no_off_switch():
