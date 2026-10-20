@@ -46,6 +46,9 @@ TURN_IN_FLIGHT_CAUSE = "a worker turn is in flight"
 #: §1 of docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md.
 BASE_RED_CAUSE = "the default branch is red"
 
+#: §1 of docs/superpowers/specs/2026-10-20-a-merge-held-for-running-checks-is-not-stuck.md.
+AUTOMERGE_CHECKS_CAUSE = "GitHub's checks on the merge commit"
+
 #: §2.1 of docs/superpowers/specs/2026-10-15-a-child-held-by-its-features-unratified-
 #: plan-is-not-stuck.md.
 PLAN_ASSUMPTION_CAUSE = "its feature's unratified plan"
@@ -67,6 +70,13 @@ EXCLUSION_REASON: Mapping[str, str] = {
                      "is broken and nothing merges onto a red base — it clears when the "
                      "base goes green, with no decision from you, so nothing is judged "
                      "while that is true"),
+    # §1: the default sentence is TRUE here and still says nothing a reader can act on —
+    # and they must be able to tell WHICH of the two `waiting_pr_merge` holds has them.
+    AUTOMERGE_CHECKS_CAUSE: ("the OS is holding this merge itself: GitHub has not finished "
+                             "running the checks on the commit the panel judged, and "
+                             "nothing merges a commit whose checks have not reported — it "
+                             "clears when they do, with no decision from you, so nothing "
+                             "is judged while that is true"),
     # §2.1: the shipped sentence is FALSE here — a person ruling on the planner's
     # assumptions is the only thing that clears this, so the sentence names that move.
     PLAN_ASSUMPTION_CAUSE: ("this child is withheld from dispatch until its feature's "
@@ -141,7 +151,10 @@ def assess(status: str, seconds_in_status: float, seconds_since_activity: float,
     the timeline while its tools run (§1 of the 2026-10-14 spec). So does a
     `waiting_pr_merge` order whose auto-merge the OS is itself holding because the default
     branch is red (`BASE_RED_CAUSE`, §1 of
-    docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md).
+    docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md) — or
+    because GitHub has not finished the checks on the commit the panel judged
+    (`AUTOMERGE_CHECKS_CAUSE`, §1 of
+    docs/superpowers/specs/2026-10-20-a-merge-held-for-running-checks-is-not-stuck.md).
 
     That CI one is an EXTENSION of kn-6e836793 (the user's 2026-09-27 ruling that the
     usage hold was the only one) on the record rather than a silent widening — the

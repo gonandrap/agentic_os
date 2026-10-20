@@ -3928,6 +3928,62 @@ AUTOMERGE_EVENTS = ("automerge_merged", "automerge_decided", "automerge_proposed
 AUTOMERGE_TERMINAL = "automerge_merged"
 
 
+def automerge_checks_hold_spans(events: Iterable[Any], since: float,
+                                now: float) -> list[tuple[float, float]]:
+    """Every interval inside `[since, now]` the OS held a merge for GitHub's checks.
+
+    §4 of docs/superpowers/specs/2026-10-20-a-merge-held-for-running-checks-is-not-
+    stuck.md: `stuck_scan` DISCOUNTS these seconds as well as excluding a live hold.
+    `waiting_pr_merge` is judged on time in status, so an exclusion alone only MOVES the
+    false positive to the first sweep after the checks report — `validation_ci_hold_spans`'
+    reason, one hold along (kn-0a222b38, kn-6e30d561).
+
+    HERE RATHER THAN BESIDE ITS TWO SIBLINGS IN `project_store`: the rows are
+    `automerge_*` timeline events and `AUTOMERGE_EVENTS` — the vocabulary that makes the
+    walk correct — is this module's. `project_store` sits BELOW `automerge` in the import
+    layering, so filtering on `HELD_CHECKS_RUNNING` there means a back-import.
+
+    **THE SPAN ENDS AT ITS SUCCESSOR, AND A HOLD WITH NO SUCCESSOR CONTRIBUTES NOTHING**
+    (Neo question 1992 of wo-a1d7b87c, option (a)). Unlike the validation CI hold there is
+    no `reopens_at` and no refresh — `Daemon._note_automerge_held` writes ONE event per
+    `(head_sha, code, reason, round)` — so the record carries a start and no end, and the
+    next event of any `AUTOMERGE_EVENTS` kind is the earliest moment it can prove the hold
+    had ended. An open tail to `now` would discount a wait the merge GATE owns and would
+    grow on a fact nobody can confirm when `gh` stops answering, which is
+    `central_store.base_red_hold_spans`' stated rule and the direction kn-6e30d561 forbids.
+    The live hold is carried by the EXCLUSION instead, so every failure makes the sweep
+    judge MORE time, never less.
+
+    `HELD_CHECKS_RUNNING` ONLY, §3's boundary: `checks_none` may mean the workflow never
+    fired, `checks_failed` is red, and every other code names something somebody owes.
+
+    SPANS AND NOT A TOTAL, and the SPANS are clipped rather than the rows —
+    `plan_hold_spans`' two rules: only intervals can be unioned with the usage holds
+    (`holds.union_seconds`), and a hold that opened before the current status span is the
+    normal case.
+
+    Takes ROWS rather than a store for `validation_ci_hold_spans`' reason.
+    """
+    from . import db
+    from .automerge import HELD_CHECKS_RUNNING
+
+    rows = sorted(events, key=lambda e: float(e["ts"]))
+    spans: list[tuple[float, float]] = []
+    for n, e in enumerate(rows):
+        if str(e["kind"]) != "automerge_held":
+            continue
+        payload = db.from_json(e["payload"], {}) or {}
+        if str(payload.get("code") or "") != HELD_CHECKS_RUNNING:
+            continue
+        nxt = next((r for r in rows[n + 1:] if str(r["kind"]) in AUTOMERGE_EVENTS), None)
+        if nxt is None:
+            continue  # nothing dates the end: option (a) contributes no span at all
+        start, end = max(float(e["ts"]), since), min(float(nxt["ts"]), now)
+        if end > start:
+            spans.append((start, end))
+    return sorted(spans)
+
+
 def merge_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
     """What the surfaces say about this order's pull request landing, or None.
 
@@ -9919,6 +9975,23 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         # wait the USER owes (kn-6e836793).
         base_red_spans = (base_red_hold_spans(red_episodes, since, now, base_red_until)
                           if wo["status"] == "waiting_pr_merge" else [])
+        # A MERGE THE OS IS ITSELF HOLDING FOR GITHUB'S RUNNING CHECKS IS NOT STUCK (§2
+        # and §3 of docs/superpowers/specs/2026-10-20-a-merge-held-for-running-checks-is-
+        # not-stuck.md). `waiting_pr_merge` ONLY, so no other order pays for the reads: a
+        # `needs_review` order beside the same pull request is a wait the USER owes
+        # (kn-6e836793). ONE `automerge_state` call serves both the exclusion and the
+        # blocker note — `bool(note)` is what makes "excluded" and "the blocker says why"
+        # inseparable (§5).
+        automerge_checks_held, automerge_spans, am_note = False, [], ""
+        if wo["status"] == "waiting_pr_merge":
+            am_note = invariants.automerge_checks_note(automerge_state(pstore, wo))
+            automerge_checks_held = bool(am_note)
+            # `events_of_kind` takes ONE kind, so the kinds are concatenated and
+            # re-sorted: the walk is only right in `ts` order (§4).
+            automerge_spans = automerge_checks_hold_spans(
+                sorted((e for k in AUTOMERGE_EVENTS
+                        for e in pstore.events_of_kind(wo["id"], k)),
+                       key=lambda e: float(e["ts"])), since, now)
         # A CHILD HELD BY ITS FEATURE'S UNRATIFIED PLAN IS NOT STUCK (§2.3 and §2.4 of
         # docs/superpowers/specs/2026-10-15-a-child-held-by-its-features-unratified-plan-
         # is-not-stuck.md). `pending` ONLY: the claim rule withholds a DISPATCH, so a
@@ -9947,7 +10020,7 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         # while the base is red.
         discounted = holds.union_seconds(
             [(max(h.started, since), min(h.finish(now), now)) for h in usage]
-            + ci_spans + base_red_spans + plan_spans)
+            + ci_spans + base_red_spans + plan_spans + automerge_spans)
         # §2.2 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md.
         edges = (pstore.unfinished_dependencies(wo["id"])
                  if wo["status"] == "pending" else [])
@@ -9979,6 +10052,10 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                             else VALIDATION_CI_CAUSE if ci_held
                             else stuck.BASE_RED_CAUSE
                             if base_red and wo["status"] == "waiting_pr_merge"
+                            # AFTER the red base and BEFORE the dependency: both are
+                            # `waiting_pr_merge`-only and CAN co-occur, and a fleet fact
+                            # outranks a fact about one order (§2).
+                            else stuck.AUTOMERGE_CHECKS_CAUSE if automerge_checks_held
                             else stuck.LIVE_DEPENDENCY if live_edges
                             # LAST in the chain, §2.4: a fleet fact outranks a fact
                             # about one feature's plan.
@@ -10001,6 +10078,9 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                         else invariants.outstanding_children_note(pstore, wo)
                         or invariants.plan_hold_note(
                             pstore.plan_hold(wo) if plan_held else None)
+                        # §5 of the 2026-10-20 spec, after the plan hold, which is
+                        # `pending`-only and cannot co-occur with it.
+                        or am_note
                         or "nothing the record can name"),
             "status_label": invariants.status_label(pstore, wo),
             "since": since, "activity": durations.last_activity_ts or since,

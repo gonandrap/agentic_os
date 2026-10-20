@@ -1958,6 +1958,43 @@ def plan_hold_note(hold: dict[str, Any] | None) -> str:
             f"review — `jarvis wo review {hold['planner_id']}`)")
 
 
+#: §5 of docs/superpowers/specs/2026-10-20-a-merge-held-for-running-checks-is-not-stuck.md.
+#: NOT an attention reason and NOT a blocker, on `BASE_RED_NOTE`'s rule: nobody owes a
+#: decision while GitHub runs the checks.
+AUTOMERGE_CHECKS_NOTE = "waiting for GitHub's checks on {sha} — {reason}"
+
+
+def automerge_checks_note(state: dict[str, Any] | None) -> str:
+    """One sentence for a LIVE `checks_running` auto-merge hold, `""` for anything else.
+
+    ONE HOME, TWO READERS (kn-432d0f19), both in `ops.stuck_scan`: the blocker column and
+    the §2 exclusion predicate (`bool(note)`). Two functions over the same dict — one
+    deciding the exclusion, one wording the row — is how the sweep's blocker column came
+    to print "nothing the record can name" beside a `jarvis wo show` that named the hold.
+
+    §3's triple test is performed HERE: the hold is the newest `ops.automerge_state` row,
+    it is not marked stale (a stale hold is no hold — `ops.force_validation_state`'s
+    reading), and its code is `HELD_CHECKS_RUNNING` and nothing wider.
+
+    Takes the DICT rather than a store, on `plan_hold_note`'s shape: `ops` imports this
+    module. Derived, never fetched — `base_red_note`'s division, the poll wrote the hold
+    down and this reads it back.
+
+    NOT wired into `status_label`: that runs per row in every listing and pays ONE INDEXED
+    READ, while `automerge_state` costs up to six. The sweep is gated on
+    `waiting_pr_merge` and pays it once.
+    """
+    from .automerge import HELD_CHECKS_RUNNING
+
+    if not state or state.get("kind") != "automerge_held" or state.get("stale"):
+        return ""
+    if str(state.get("code") or "") != HELD_CHECKS_RUNNING:
+        return ""
+    return AUTOMERGE_CHECKS_NOTE.format(
+        sha=str(state.get("head_sha") or "")[:10] or "the merge commit",
+        reason=state.get("reason") or "no reason recorded")
+
+
 def status_label(store: ProjectStore, wo: dict[str, Any],
                  fleet: Fleet | None = None) -> str:
     """How this work order's status should read to a human.
