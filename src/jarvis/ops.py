@@ -48,6 +48,9 @@ from .agent_usage import (
 from .sections import QUESTION_MAX_CHARS, QUESTION_WARN_CHARS
 from .central_store import MISSED_MIN_WORDS, SETTLED_BACKLOG_STATUSES, CentralStore
 from .daemon import (
+    DAEMON_DARK_INTERVALS,
+    DAEMON_DARK_MIN_SECONDS,
+    RECONCILE_TICK_KEY,
     answers_question,
     daemon_running,
     delivers_message,
@@ -516,6 +519,55 @@ def _held_jobs(store: ProjectStore, catalog: Catalog | None = None) -> list[dict
             if st["held_since"] and st["job_id"] in cfg.jobs]
 
 
+def _daemon_liveness(central: CentralStore, pid: int | None) -> dict[str, Any] | None:
+    """ONE fleet-level item when jarvisd is stopped or dark, else None.
+
+    Liveness is a fact about the PROCESS, so only a reader outside it can assert it.
+    Spec docs/superpowers/specs/2026-10-16-a-stopped-daemon-is-a-liveness-gap.md.
+    """
+    if pid is None:
+        path = central.get_state("catalog_path")
+        return {
+            "project": "os", "wo_id": None,
+            "title": "jarvisd is not running", "status": "daemon",
+            "reason": "nothing is dispatching work orders, relaunching turns, "
+                      "delivering messages or settling any work order",
+            "cause": "stopped",
+            "decide": f"jarvis start --catalog {path}" if path else "jarvis start",
+        }
+    stamp = db.from_json(central.get_state(RECONCILE_TICK_KEY), None)
+    ts = interval = 0.0
+    if isinstance(stamp, dict):
+        try:
+            ts = float(stamp.get("ts") or 0.0)
+            interval = float(stamp.get("interval") or 0.0)
+        except (TypeError, ValueError):  # a malformed stamp is no stamp
+            ts = interval = 0.0
+    if not ts:
+        # §2b: with no stamp the age is measured from the start, and with neither nothing
+        # fires — a fresh install must not report as broken
+        # (invariants.check_stuck_sweep_alive's own rule).
+        interval = 0.0
+        try:
+            ts = float(central.get_state("daemon_started_at") or 0.0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        if not ts:
+            return None
+    dark = db.now() - ts
+    if dark < max(float(DAEMON_DARK_MIN_SECONDS), interval * DAEMON_DARK_INTERVALS):
+        return None
+    # No `decide`: no jarvis verb restarts a wedged daemon (§2b).
+    return {
+        "project": "os", "wo_id": None,
+        "title": "jarvisd is dark", "status": "daemon",
+        "reason": f"pid {pid} is alive but has completed no reconcile pass for "
+                  f"{int(dark / 60)}m — nothing is being dispatched, relaunched, "
+                  f"delivered or settled",
+        "cause": "dark",
+    }
+
+
 def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
     central = CentralStore()
     try:
@@ -843,6 +895,12 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                           f"{int(ui['window_seconds'] / 3600)}h — latest: "
                           f"{ui['recent'][0]['summary']}. Full traceback: {ui['log']}",
             })
+        # Beside it, under the same argument: the daemon is the OS, and nothing inside it
+        # can report its own death. Spec
+        # docs/superpowers/specs/2026-10-16-a-stopped-daemon-is-a-liveness-gap.md.
+        liveness = _daemon_liveness(central, pid)
+        if liveness:
+            attention.append(liveness)
         return {
             "daemon": {
                 "running": pid is not None,

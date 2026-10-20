@@ -2091,7 +2091,11 @@ def test_a_standing_critical_violation_reaches_the_attention_list(
     items = [i for i in status["attention"] if i.get("invariant") == "INV-TEST-CRITICAL"]
     assert len(items) == 1
     assert items[0]["reason"] == "a standing break"
-    assert status["attention"] == items, "nothing else is asking, so this is why"
+    # Minus the liveness line: this test starts the OS in the foreground, so no pidfile
+    # exists and jarvisd reads as stopped (spec
+    # docs/superpowers/specs/2026-10-16-a-stopped-daemon-is-a-liveness-gap.md).
+    assert [i for i in status["attention"] if i["status"] != "daemon"] == items, \
+        "nothing else is asking, so this is why"
     assert not status["healthy"]
 
     # ...and the report row is also what takes it away again.
@@ -2100,7 +2104,8 @@ def test_a_standing_critical_violation_reaches_the_attention_list(
         assert closed.close_violation_report("INV-TEST-CRITICAL", wo["id"])
     finally:
         closed.close()
-    assert ops.os_status(catalog)["attention"] == [], "the row is also the removal"
+    assert [i for i in ops.os_status(catalog)["attention"]
+            if i["status"] != "daemon"] == [], "the row is also the removal"
 
 
 # -- a passed forced round answers a refusal --------------------------------------------
