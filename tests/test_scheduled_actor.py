@@ -18,12 +18,13 @@ from __future__ import annotations
 
 import ast
 import importlib
+import json
 import time
 from pathlib import Path
 
 import pytest
 
-from jarvis import invariants, ops
+from jarvis import gates, invariants, ops
 from jarvis.catalog import DEFAULT_PULL_REQUESTS_RECOMPUTE_STALL_MINUTES, load_catalog
 from jarvis.daemon import (
     SETTLE_STATUSES,
@@ -168,7 +169,10 @@ def test_every_predicate_is_an_imported_symbol():
     by_predicate: dict[str, list[ast.expr]] = {}
     for predicate, node in _pass_literals():
         by_predicate.setdefault(predicate, []).append(node)
-    assert sum(len(v) for v in by_predicate.values()) == len(entries), (
+    # SETS, not counts: one `_Pass` literal may be registered under several statuses
+    # (the shared gate-sweep constant is, under all nine — wo-715db5af). An ORPHAN
+    # literal still fails, which is what this line is for.
+    assert set(by_predicate) == {p.predicate for _, p in entries}, (
         "every `_Pass` literal in ops.py must be reachable from SCHEDULED_ACTORS")
     for status, p in entries:
         module, _, name = p.predicate.rpartition(".")
@@ -192,10 +196,16 @@ def test_every_predicate_is_an_imported_symbol():
 
 
 def test_no_fallthrough(jarvis_home, project):
+    """STILL A PIN after wo-715db5af's relaxation: the shared gate-sweep pass is
+    registered under every open status, so `needs_review` and `budget_exhausted` now
+    carry one pass AND a `none_because`. The XOR holds over the passes that are the
+    status's OWN — a status with its own pass may not also claim there is none, and a
+    status with none may not go silent about why."""
     for status, entry in ops.SCHEDULED_ACTORS.items():
-        assert bool(entry.none_because) is not bool(entry.passes), (
+        own = tuple(p for p in entry.passes if p is not ops.REVIEWS_GATE)
+        assert bool(entry.none_because) is not bool(own), (
             f"{status}: `none_because` must be non-empty exactly when there are no "
-            "passes")
+            "passes other than the shared gate-sweep constant")
     store = ProjectStore(project)
     wo = store.create_work_order("add feature X")
     with pytest.raises(KeyError):
@@ -410,3 +420,73 @@ def test_a_none_because_status_blocks_on_the_user(jarvis_home, project, status):
     wo = _row(store, status, "jarvis")
     assert (ops.scheduled_actor(store, wo),
             invariants.true_blockers(store, wo) != []) == (None, True)
+
+
+# -- a HELD gate request outlives the status it was filed under ---------------------
+# wo-715db5af / Neo 1987: `gates.sweep_unargued` has no status filter (it iterates
+# `list_approvals(statuses=(AWAITING_CASE,))` project-wide) and `gates.file_request`
+# deliberately does not park the row that files an `awaiting_case` request. So the gate
+# pass belongs under EVERY open status, not `waiting_input` alone.
+
+@pytest.fixture()
+def gate_sweeper(fake_claude, catalog_file, project):
+    """`sweep(store)` — `Daemon.abandon_unargued_gates` over a gates-enabled project."""
+    data = json.loads(catalog_file.read_text(encoding="utf-8"))
+    data["projects"][0]["gates"] = ["pr_merge"]
+    catalog_file.write_text(json.dumps(data), encoding="utf-8")
+    catalog = load_catalog(catalog_file)
+    daemon, spec = Daemon(catalog), catalog.projects[0]
+    assert spec.gates, "the premise: the project gates `pr_merge`, so the sweep runs"
+
+    def run(store: ProjectStore) -> None:
+        daemon.abandon_unargued_gates(spec, store)
+
+    return run
+
+
+def _hold_a_request(store: ProjectStore, wo_id: str) -> dict:
+    return store.add_approval(wo_id, "pr_merge", GATED, status="awaiting_case")
+
+
+def _expire_the_case(store: ProjectStore, approval_id: int) -> None:
+    """Wind the filing back past `case_ttl_seconds` rather than sleeping through it."""
+    store.conn.execute("UPDATE approvals SET ts = ts - ? WHERE id=?",
+                       (gates.DEFAULT_CASE_TTL_SECONDS + 60, approval_id))
+
+
+def test_a_held_request_on_a_running_ungoverned_row_names_the_gate_sweep(
+        jarvis_home, project, gate_sweeper):
+    """The live shape on main, PAIRED WITH ITS PASS. `running` + an ungoverned origin:
+    `settles_turn` and `retries_turn` both decline on origin and no message is queued,
+    so before this the row derived None — while the sweep was going to close its
+    request regardless."""
+    store = ProjectStore(project)
+    assert ("running", UNGOVERNED_ORIGINS[0]) in EXPECT_NEITHER, \
+        "the premise: with no request this same row correctly derives neither"
+    wo = _row(store, "running", UNGOVERNED_ORIGINS[0])
+    approval = _hold_a_request(store, wo["id"])
+
+    actor = ops.scheduled_actor(store, wo)
+    assert actor is not None and actor.predicate == "daemon.reviews_gate"
+
+    # The other half of the predicate rule: the pass named really does act on THIS row.
+    _expire_the_case(store, approval["id"])
+    gate_sweeper(store)
+
+    closed = store.get_approval(approval["id"])
+    assert (closed["status"], closed["closed_as"]) == ("expired", "abandoned")
+
+
+@pytest.mark.parametrize("status", ["needs_review", "budget_exhausted"])
+def test_a_held_request_names_an_actor_on_a_none_because_status(jarvis_home, project,
+                                                                status):
+    """Those two statuses' `None` was unconditional; it is now the predicate's answer.
+    The `none_because` sentence stays — it is still why the row has no pass of its own."""
+    store = ProjectStore(project)
+    wo = _row(store, status, "jarvis")
+    _hold_a_request(store, wo["id"])
+
+    actor = ops.scheduled_actor(store, wo)
+
+    assert actor is not None and actor.predicate == "daemon.reviews_gate"
+    assert ops.SCHEDULED_ACTORS[status].none_because
