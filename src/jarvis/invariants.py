@@ -1432,9 +1432,11 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         #    relabelling kn-78346a2d names — dropping it FOR GOOD, because accepting the
         #    assumption lands the work order and nothing re-derives it afterwards.
         #    ONE OF THREE SENTENCES: a give-up on a round a USER rejection bought names
-        #    that cause instead (spec 2026-09-27 §5, Neo question 973), and splits on
-        #    whether the panel judged it (GitHub issue 1106, spec 2026-10-14-an-escalated
-        #    -round-says-why-and-what-to-run-next.md §1).
+        #    that cause instead (spec 2026-09-27 §5, Neo question 973), and splits off the
+        #    one family where no seat judged the submission — `not_reviewed`, every other
+        #    family keeping the refusal sentence (GitHub issue 1106, spec 2026-10-14-an
+        #    -escalated-round-says-why-and-what-to-run-next.md §1). The `else` arm below
+        #    is the pre-existing one, for escalations a user rejection did NOT buy.
         elif validation_escalated(store, wo):
             if user_rework_unreviewed(store, wo):
                 blockers.append(USER_REWORK_UNREVIEWED_BLOCKER)
@@ -1829,19 +1831,21 @@ def user_rework_refused(store: ProjectStore, wo: dict[str, Any]) -> bool:
     escalated the round lives in the `validation_escalated` payload, so the row alone made
     every `not_reviewed` escalation claim a panel refusal (GitHub issue 1106, spec
     docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md
-    §1). `handover` is the only family where a seat judged and refused, and the gate is
-    STRICT — an `unjudged` or `unrecorded` cause falls through to
-    `VALIDATION_STUCK_BLOCKER`, on `ops.escalation_next`'s precedent that a legacy
-    no-cause event must not be made to claim a panel opinion (Neo 1723).
+    §1). THE MAPPING IS A BINARY SPLIT: `not_reviewed` is the only family that gets
+    `USER_REWORK_UNREVIEWED_BLOCKER`; `handover` is the judged-and-refused family and
+    keeps this sentence, and so do `unjudged` and `unrecorded` — issue 1106 prescribes
+    only the `not_reviewed` split, so moving them would be a behaviour change nobody
+    asked for.
     """
-    return _escalated_user_rework_family(store, wo) == "handover"
+    family = _escalated_user_rework_family(store, wo)
+    return bool(family) and family != "not_reviewed"
 
 
 def user_rework_unreviewed(store: ProjectStore, wo: dict[str, Any]) -> bool:
     """The same round with NO seat's opinion on it — `USER_REWORK_UNREVIEWED_BLOCKER`.
 
-    `user_rework_refused`'s sibling, differing only in the family: `not_reviewed` means a
-    round opened and nothing judged the submission (GitHub issue 1106, spec
+    `user_rework_refused`'s sibling and the ONLY family it gives up: `not_reviewed` means
+    a round opened and nothing judged the submission (GitHub issue 1106, spec
     docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md
     §1).
     """

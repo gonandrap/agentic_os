@@ -1448,10 +1448,10 @@ def test_an_unreviewed_user_rework_round_does_not_claim_the_panel_refused_it(
     assert invariants.VALIDATION_STUCK_BLOCKER not in blockers
 
 
-def test_a_user_rework_round_escalated_with_no_recorded_cause_claims_nothing(
+def test_a_user_rework_round_with_no_recorded_cause_keeps_the_refused_sentence(
         tmp_path, project, jarvis_home, fake_claude, fake_gh):
-    """The strict gate, on `escalation_next`'s precedent (Neo 1723): a legacy event with
-    no cause may have been an unjudged round, so neither rework sentence is defensible."""
+    """Issue 1106 prescribes ONE split and `not_reviewed` is it: a legacy event with no
+    cause keeps the sentence it has always had, rather than a third user-visible case."""
     fleet = boot(tmp_path, project, max_rounds=3)
     store, wo = parked(project, rounds=3)
     row = _escalated_user_rework(fleet, store, wo, project,
@@ -1459,9 +1459,25 @@ def test_a_user_rework_round_escalated_with_no_recorded_cause_claims_nothing(
 
     blockers = invariants.true_blockers(store, row)
 
-    assert invariants.VALIDATION_STUCK_BLOCKER in blockers
+    assert invariants.USER_REWORK_REFUSED_BLOCKER in blockers
     assert invariants.USER_REWORK_UNREVIEWED_BLOCKER not in blockers
-    assert invariants.USER_REWORK_REFUSED_BLOCKER not in blockers
+    assert invariants.VALIDATION_STUCK_BLOCKER not in blockers
+
+
+def test_an_unjudged_user_rework_round_keeps_the_refused_sentence(
+        tmp_path, project, jarvis_home, fake_claude, fake_gh):
+    """Same for family `unjudged` (`no_verdict`): only `not_reviewed` moves."""
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = parked(project, rounds=3)
+    assert ops.ESCALATION_FAMILY[ops.ESCALATION_NO_VERDICT] == "unjudged"
+    row = _escalated_user_rework(fleet, store, wo, project,
+                                 cause=ops.ESCALATION_NO_VERDICT)
+
+    blockers = invariants.true_blockers(store, row)
+
+    assert invariants.USER_REWORK_REFUSED_BLOCKER in blockers
+    assert invariants.USER_REWORK_UNREVIEWED_BLOCKER not in blockers
+    assert invariants.VALIDATION_STUCK_BLOCKER not in blockers
 
 
 def test_the_unreviewed_sentence_names_the_two_routes_and_nothing_that_moves():
