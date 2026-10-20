@@ -1958,6 +1958,23 @@ def plan_hold_note(hold: dict[str, Any] | None) -> str:
             f"review — `jarvis wo review {hold['planner_id']}`)")
 
 
+def precondition_note(rows: list[dict[str, Any]]) -> str:
+    """One sentence for a `ProjectStore.open_preconditions` result, `""` for no rows.
+
+    ONE HOME, TWO READERS (kn-432d0f19), `plan_hold_note`'s arrangement one hold along:
+    §1.2 of docs/superpowers/specs/2026-10-19-an-order-held-by-an-open-precondition-is-
+    not-stuck.md is what happened while the sweep's blocker column composed its own — one
+    row reading "nothing the record can name" beside one naming the hold and the way out.
+    """
+    if not rows:
+        return ""
+    refs = ", ".join(row["ref"] for row in rows)
+    notes = "; ".join(row["note"] for row in rows if row["note"])
+    note = (f"held until {refs} clears "
+            f"(`jarvis wo unblock {rows[0]['wo_id']}`)")
+    return f"{note} — {notes}" if notes else note
+
+
 def status_label(store: ProjectStore, wo: dict[str, Any],
                  fleet: Fleet | None = None) -> str:
     """How this work order's status should read to a human.
@@ -2061,13 +2078,10 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
     # docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md. Flagless
     # like the three below: `true_blockers` gets no branch, so INV-ATTENTION-MISSING stays
     # quiet without an exception.
-    held = store.open_preconditions(wo["id"])
-    if held:
-        refs = ", ".join(row["ref"] for row in held)
-        notes = "; ".join(row["note"] for row in held if row["note"])
-        label = (f"pending — held until {refs} clears "
-                 f"(`jarvis wo unblock {wo['id']}`)")
-        return f"{label} — {notes}" if notes else label
+    # §4 of the 2026-10-19 spec: the sentence lives in `precondition_note`, one home.
+    note = precondition_note(store.open_preconditions(wo["id"]))
+    if note:
+        return f"pending — {note}"
     # ABOVE the dependency and slot labels, inverting their order: those two clear
     # themselves, and this one clears only when a person rules on the plan. Of the four
     # true sentences it is the one naming a move (spec §2.3). Flagless — `true_blockers`

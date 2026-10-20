@@ -344,6 +344,36 @@ def plan_hold_spans(events: Iterable[Any], since: float,
                   if min(end, now) > max(start, since))
 
 
+def precondition_hold_spans(rows: Iterable[Any], since: float,
+                            now: float) -> list[tuple[float, float]]:
+    """Every interval inside `[since, now]` a `preconditions` row held this order.
+
+    §3.2 of docs/superpowers/specs/2026-10-19-an-order-held-by-an-open-precondition-is-
+    not-stuck.md: `ops.stuck_scan` DISCOUNTS these seconds as well as excluding the live
+    hold, for `plan_hold_spans`' reason — `pending` is judged on time in status, so an
+    exclusion with no discount only moves the false positive to the sweep after the row
+    clears. Derived from the rows' own `created_at` / `cleared_at`, which is why an order
+    whose hold has since cleared is not retroactively judged for the time it was held.
+
+    THE ROWS ARE NOT FILTERED BY `since` FIRST, `plan_hold_spans`' rule: a precondition is
+    normally created WITH the order, before the `pending` span opens, so the clipping is
+    applied to the resulting spans.
+
+    SPANS AND NOT A TOTAL, and overlapping rows are returned unmerged: only intervals can
+    be unioned with the usage, CI and base-red spans by `holds.union_seconds`, and a usage
+    window can shut while a precondition stands.
+
+    Takes ROWS rather than a store for `validation_hold_until`'s reason.
+    """
+    spans: list[tuple[float, float]] = []
+    for row in rows:
+        start = max(float(row["created_at"] or 0.0), since)
+        end = min(float(row["cleared_at"] or now), now)
+        if end > start:
+            spans.append((start, end))
+    return sorted(spans)
+
+
 # What one seat proposed. "" is a seat that offered none — it ran, but said nothing the
 # arbiter can count.
 VALIDATION_VERDICTS = ("pass", "reject", "")
@@ -2355,6 +2385,16 @@ class ProjectStore:
         """Every hold still standing on this order, oldest first — `idx_preconditions_open`."""
         rows = self.conn.execute(
             "SELECT * FROM preconditions WHERE wo_id=? AND status='open' "
+            "ORDER BY created_at, id", (wo_id,)).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def preconditions_of(self, wo_id: str) -> list[dict[str, Any]]:
+        """EVERY hold this order has ever carried, oldest first — §3.2 of
+        docs/superpowers/specs/2026-10-19-an-order-held-by-an-open-precondition-is-not-
+        stuck.md: `precondition_hold_spans` computes the discount from `cleared_at`, which
+        a cleared row carries and `open_preconditions` cannot see."""
+        rows = self.conn.execute(
+            "SELECT * FROM preconditions WHERE wo_id=? "
             "ORDER BY created_at, id", (wo_id,)).fetchall()
         return db.rows_to_dicts(rows)
 

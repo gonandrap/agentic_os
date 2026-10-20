@@ -9879,8 +9879,8 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
     from .health import observer_kinds
     from .project_store import (FO_ID_PREFIXES, PLAN_ASSUMPTION_EVENT_KINDS,
                                 UNGOVERNED_ORIGINS, VALIDATION_CI_CAUSE,
-                                plan_hold_spans, validation_ci_hold_spans,
-                                validation_hold)
+                                plan_hold_spans, precondition_hold_spans,
+                                validation_ci_hold_spans, validation_hold)
     from .worker_session import PAUSE_USAGE_LIMIT
 
     thresholds = {s: cfg.threshold_seconds(s) for s in cfg.thresholds}
@@ -9943,11 +9943,22 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                     sorted((e for k in PLAN_ASSUMPTION_EVENT_KINDS
                             for e in pstore.events_of_kind(str(planner_id), k)),
                            key=lambda e: float(e["ts"])), since, now)
+        # AN ORDER HELD BY AN OPEN PRECONDITION IS NOT STUCK (§2 and §3 of
+        # docs/superpowers/specs/2026-10-19-an-order-held-by-an-open-precondition-is-not-
+        # stuck.md). `pending` ONLY (§5): the row withholds a DISPATCH, so an order
+        # already running is not held by it. The EXCLUSION reads `open_preconditions`,
+        # the predicate pinned to the claim SQL; the DISCOUNT needs every row, because
+        # `cleared_at` is what it is computed from (§3.2).
+        pre_held, pre_spans = False, []
+        if wo["status"] == "pending":
+            pre_held = bool(pstore.open_preconditions(wo["id"]))
+            pre_spans = precondition_hold_spans(
+                pstore.preconditions_of(wo["id"]), since, now)
         # The UNION and never the sum: a usage window can shut while CI runs (§4), or
         # while the base is red.
         discounted = holds.union_seconds(
             [(max(h.started, since), min(h.finish(now), now)) for h in usage]
-            + ci_spans + base_red_spans + plan_spans)
+            + ci_spans + base_red_spans + plan_spans + pre_spans)
         # §2.2 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md.
         edges = (pstore.unfinished_dependencies(wo["id"])
                  if wo["status"] == "pending" else [])
@@ -9979,6 +9990,10 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                             else VALIDATION_CI_CAUSE if ci_held
                             else stuck.BASE_RED_CAUSE
                             if base_red and wo["status"] == "waiting_pr_merge"
+                            # Below the fleet facts and above both `pending` holds,
+                            # §3.3 (Neo 1982): `status_label` ranks this label first of
+                            # its four, so the two surfaces keep ONE ranking.
+                            else stuck.PRECONDITION_CAUSE if pre_held
                             else stuck.LIVE_DEPENDENCY if live_edges
                             # LAST in the chain, §2.4: a fleet fact outranks a fact
                             # about one feature's plan.
@@ -9997,8 +10012,11 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
             # hold rides there too — §1(2) of the 2026-10-15 spec: this column read
             # "nothing the record can name" while `status_label` on the SAME row named
             # the hold and the review command.
+            # The precondition note ahead of the plan hold's, §4: the ordering is §3.3's.
             "blocker": (blocker[0] if blocker
                         else invariants.outstanding_children_note(pstore, wo)
+                        or invariants.precondition_note(
+                            pstore.open_preconditions(wo["id"]) if pre_held else [])
                         or invariants.plan_hold_note(
                             pstore.plan_hold(wo) if plan_held else None)
                         or "nothing the record can name"),

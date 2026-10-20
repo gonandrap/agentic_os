@@ -50,6 +50,10 @@ BASE_RED_CAUSE = "the default branch is red"
 #: plan-is-not-stuck.md.
 PLAN_ASSUMPTION_CAUSE = "its feature's unratified plan"
 
+#: §2.1 of docs/superpowers/specs/2026-10-19-an-order-held-by-an-open-precondition-is-not-
+#: stuck.md.
+PRECONDITION_CAUSE = "an open precondition"
+
 #: One sentence per cause, because the shipped one is false for both of the above: an
 #: exempt kind never clears, and a manager's hold clears when its feature speaks rather
 #: than by itself. `{cause}` and `{kind}` are the only slots.
@@ -73,6 +77,12 @@ EXCLUSION_REASON: Mapping[str, str] = {
                             "plan is ratified, and only you can ratify it — "
                             "`jarvis wo review <planner-id>` on the feature's planner "
                             "is what clears it, so nothing is judged while it stands"),
+    # §2.1: the shipped sentence is FALSE here too — `project_store.
+    # PRECONDITION_CLEARED_BY` is ("os", "user"), so the sentence names both parties.
+    PRECONDITION_CAUSE: ("this order was created held until its precondition clears and "
+                         "the row is still open — the OS clears it when it resolves the "
+                         "ref, and `jarvis wo unblock <id>` is how you clear it yourself, "
+                         "so nothing is judged while it stands"),
 }
 
 #: The usage window's sentence, and the answer for any hold added later: all five of §2's
