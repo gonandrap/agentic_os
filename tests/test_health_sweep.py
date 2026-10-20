@@ -2749,18 +2749,51 @@ def am_event(store, wo_id: str, kind: str, at: float, **payload) -> None:
     store.conn.commit()
 
 
-def checks_hold(store, wo_id: str, at: float, *, code: str = "checks_running",
+def checks_hold(daemon, store, wo_id: str, at: float, *, code: str = "checks_running",
                 round_n: int = 1, reason: str = RUNNING_REASON) -> None:
-    """One `automerge_held` event, exactly as `Daemon._note_automerge_held` writes it."""
-    am_event(store, wo_id, "automerge_held", at, code=code, reason=reason,
-             judged_sha=JUDGED_SHA, head_sha=JUDGED_SHA, round=round_n)
+    """One `automerge_held` event, written by THE DAEMON'S OWN WRITER.
+
+    `Daemon._note_automerge_held` is the only thing that writes these rows in production,
+    so a change to its payload — or to its dedupe — breaks these cases instead of passing
+    over a hand-written key. Only the timestamp is ours: the poll stamps `now` and the
+    sweep's whole subject is an hour-old hold.
+    """
+    from jarvis import automerge
+
+    daemon._note_automerge_held(store, wo_id, automerge.Decision(
+        armed=False, code=code, reason=reason, judged_sha=JUDGED_SHA,
+        head_sha=JUDGED_SHA, round_n=round_n))
+    store.conn.execute(
+        "UPDATE wo_events SET ts=? WHERE id=(SELECT MAX(id) FROM wo_events)", (at,))
+    store.conn.commit()
 
 
-def _held_for_checks(store, hours: float = 61 / 60,
-                     status: str = "waiting_pr_merge") -> tuple[dict, float]:
-    wo, at = _parked(store, hours=hours, status=status,
+def base_health_without_checked_at(project: str = "proj_a") -> None:
+    """A stored fact carrying NO `checked_at` — `_base_red_until`'s `0.0` horizon, which
+    is also what a project not opted into auto-merge gets (§3's degradation)."""
+    from jarvis.central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        central.set_base_health(project, {"red": False, "base": "main", "workflow": "ci",
+                                          "run_url": "https://x/1", "head_sha": "abc",
+                                          "wo_id": ""})
+        central.conn.commit()
+    finally:
+        central.close()
+
+
+def _held_for_checks(os_, hours: float = 61 / 60, status: str = "waiting_pr_merge",
+                     fact_age: float = 0.0) -> tuple[dict, float]:
+    """A parked order held for the checks, beside a base-health fact `fact_age` old.
+
+    The fact is FRESH by default — §7's standing condition — because §3's fourth
+    condition reads its freshness horizon, and `fact_age` is how a case says otherwise.
+    """
+    wo, at = _parked(os_["store"], hours=hours, status=status,
                      title="parked while GitHub runs the checks")
-    checks_hold(store, wo["id"], at + 60.0)
+    checks_hold(os_["daemon"], os_["store"], wo["id"], at + 60.0)
+    base_fact(red=False, age=fact_age)
     return wo, at
 
 
@@ -2771,7 +2804,7 @@ def test_a_merge_held_for_running_checks_is_excluded_with_its_own_sentence(red_b
     from jarvis import stuck
 
     now = time.time()
-    wo, _at = _held_for_checks(red_base_os["store"])
+    wo, _at = _held_for_checks(red_base_os)
 
     row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
 
@@ -2787,9 +2820,8 @@ def test_the_blocker_column_names_the_hold_the_record_already_carries(red_base_o
     "nothing the record can name" on the row where `jarvis wo show` printed the hold."""
     from jarvis import invariants
 
-    store = red_base_os["store"]
     now = time.time()
-    wo, _at = _held_for_checks(store)
+    wo, _at = _held_for_checks(red_base_os)
 
     row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
 
@@ -2807,7 +2839,8 @@ def test_every_other_hold_code_is_still_judged(red_base_os, code):
     store = red_base_os["store"]
     now = time.time()
     wo, at = _parked(store, hours=61 / 60, title="held on something somebody owes")
-    checks_hold(store, wo["id"], at + 60.0, code=code)
+    checks_hold(red_base_os["daemon"], store, wo["id"], at + 60.0, code=code)
+    base_fact(red=False)
 
     row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
 
@@ -2817,10 +2850,17 @@ def test_every_other_hold_code_is_still_judged(red_base_os, code):
 
 def test_a_stale_hold_is_no_hold(red_base_os):
     """§7(4): `ops.automerge_state` marks a hold from an overtaken round stale, and a
-    stale hold is not a claim about NOW (`force_validation_state`'s reading)."""
+    stale hold is not a claim about NOW (`force_validation_state`'s reading).
+
+    4.9h in status with the hold written at the last minute of it, so the DISCOUNT the
+    open hold still earns (§4 dates spans off the record alone and knows nothing of
+    staleness) cannot be what decides the verdict.
+    """
     store = red_base_os["store"]
     now = time.time()
-    wo, _at = _held_for_checks(store)
+    wo, at = _parked(store, hours=4.9, title="a hold its own round overtook")
+    checks_hold(red_base_os["daemon"], store, wo["id"], at + 4.8 * 3600)
+    base_fact(red=False)
     for _ in range(2):
         row = store.open_validation_round(wo_id=wo["id"], fingerprint="fp")
         store.close_validation_round(row["id"], "passed", "")
@@ -2834,7 +2874,7 @@ def test_a_stale_hold_is_no_hold(red_base_os):
 def test_needs_review_beside_the_same_pull_request_is_still_judged(red_base_os):
     """§7(5), kn-6e836793's scoping: a `needs_review` order is a wait the USER owes."""
     now = time.time()
-    wo, _at = _held_for_checks(red_base_os["store"], hours=4.9, status="needs_review")
+    wo, _at = _held_for_checks(red_base_os, hours=4.9, status="needs_review")
 
     row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
 
@@ -2848,7 +2888,7 @@ def test_a_red_base_outranks_the_running_checks(red_base_os):
     from jarvis import stuck
 
     now = time.time()
-    wo, _at = _held_for_checks(red_base_os["store"])
+    wo, _at = _held_for_checks(red_base_os)
     base_fact(red=True)
 
     row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
@@ -2864,8 +2904,9 @@ def test_the_checks_reporting_leaves_the_closed_span_discounted(red_base_os):
     store = red_base_os["store"]
     now = time.time()
     wo, at = _parked(store, hours=70 / 60, title="the checks have since reported")
-    checks_hold(store, wo["id"], at + 2 * 60.0)
+    checks_hold(red_base_os["daemon"], store, wo["id"], at + 2 * 60.0)
     am_event(store, wo["id"], "automerge_proposed", at + 65 * 60.0, approval_id=1)
+    base_fact(red=False)
 
     row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
 
@@ -2875,15 +2916,62 @@ def test_the_checks_reporting_leaves_the_closed_span_discounted(red_base_os):
     assert row["stuck"] is False, row["reason"]
 
 
+@pytest.mark.parametrize("fact_age, label", [
+    (90 * 60.0, "a gh outage that began before the hold"),
+    (None, "no checked_at at all, or a project not opted into auto-merge"),
+])
+def test_a_stale_base_health_fact_un_excludes_and_stops_discounting(red_base_os,
+                                                                   fact_age, label):
+    """§7(8), and the test review round 1 asked for BY NAME. kn-2579843f's one rule has
+    two halves — "a stale fact excludes nothing" AND "a stale fact stops discounting" —
+    and this fails if either ships without the other.
+
+    THE BLOCKER COLUMN STILL NAMES THE HOLD (§3, §5): the implication is one-way, so a
+    judged order says what the record holds instead of "nothing the record can name",
+    and the investigation it buys starts informed.
+    """
+    from jarvis import invariants
+
+    store = red_base_os["store"]
+    now = time.time()
+    wo, _at = _held_for_checks(red_base_os, fact_age=fact_age or 0.0)
+    if fact_age is None:
+        base_health_without_checked_at()
+
+    row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+    assert row["excluded"] == "", label
+    assert row["stuck"] is True, row["reason"]
+    assert row["discounted_seconds"] == 0.0, row["discounted_seconds"]
+    assert row["blocker"] == invariants.AUTOMERGE_CHECKS_NOTE.format(
+        sha=JUDGED_SHA[:10], reason=RUNNING_REASON)
+
+
+def test_an_open_hold_is_discounted_only_as_far_as_the_horizon(red_base_os):
+    """§7(9) and §4's outage sentence: the fact was last confirmed 20m ago, so the open
+    hold is discounted to that observation's horizon — 55m of the 60m it has been open.
+    Fails under the superseded 1992 rule (which discounts 0) and under an open tail to
+    `now` (which discounts 60m)."""
+    store = red_base_os["store"]
+    now = time.time()
+    wo, _at = _held_for_checks(red_base_os, fact_age=20 * 60.0)
+
+    row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+    assert abs(row["discounted_seconds"] - 55 * 60.0) < 30, row["discounted_seconds"]
+    assert abs(row["active_seconds"] - 6 * 60.0) < 30, row["active_seconds"]
+
+
 def test_a_usage_hold_inside_the_checks_span_is_discounted_once(red_base_os):
-    """§7(8): the UNION and never the sum — summing would tell a reader the same minutes
+    """§7(10): the UNION and never the sum — summing would tell a reader the same minutes
     twice under two names (`holds.union_seconds`' own docstring)."""
     store = red_base_os["store"]
     now = time.time()
     wo, at = _parked(store, hours=70 / 60, title="a window shut while the checks ran")
-    checks_hold(store, wo["id"], at + 2 * 60.0)
+    checks_hold(red_base_os["daemon"], store, wo["id"], at + 2 * 60.0)
     am_event(store, wo["id"], "automerge_proposed", at + 65 * 60.0, approval_id=1)
     usage_hold(store, wo["id"], started=at + 10 * 60.0, ended=at + 20 * 60.0)
+    base_fact(red=False)
 
     row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
 
@@ -2892,17 +2980,17 @@ def test_a_usage_hold_inside_the_checks_span_is_discounted_once(red_base_os):
 
 
 def test_the_checks_held_order_is_a_visible_row_and_never_a_continue(red_base_os):
-    """§7(9), kn-143a46df and kn-e91ff3a5: a `continue` has no unit test over the pure
+    """§7(11), kn-143a46df and kn-e91ff3a5: a `continue` has no unit test over the pure
     predicate and produces no `Verdict`, so the held order would vanish from `jarvis
     stuck` and `/stuck` instead of explaining itself there."""
     from jarvis import stuck
 
     store = red_base_os["store"]
     now = time.time()
-    wo, _at = _held_for_checks(store)
+    wo, _at = _held_for_checks(red_base_os)
 
     scanned, rows = ops.stuck_scan(store, "proj_a", catalog.FleetHealthConfig(), now,
-                                   stuck_only=False)
+                                   base_red_until=now, stuck_only=False)
     held = [r for r in rows if r["wo"]["id"] == wo["id"]]
 
     assert scanned == 1 and len(held) == 1, "the held row left the sweep's output"
@@ -2911,11 +2999,16 @@ def test_the_checks_held_order_is_a_visible_row_and_never_a_continue(red_base_os
                 if r["id"] == wo["id"])["excluded"] == stuck.AUTOMERGE_CHECKS_CAUSE
 
 
-@pytest.mark.parametrize("code, excluded", [("checks_running", True),
-                                            ("checks_failed", False)])
+@pytest.mark.parametrize("code, fact_age, excluded", [
+    ("checks_running", 0.0, True),
+    ("checks_failed", 0.0, False),
+    # Case 8 is here because the horizon is hoisted SEPARATELY in each caller, so a
+    # second hoist that forgot the freshness would show up only as a disagreement.
+    ("checks_running", 90 * 60.0, False),
+])
 def test_both_callers_agree_about_the_running_checks(jarvis_home, project, tmp_path,
-                                                     code, excluded):
-    """§7(10), the 2026-09-30 spec's ONE derivation: `Daemon._stuck_candidates` and
+                                                     code, fact_age, excluded):
+    """§7(12), the 2026-09-30 spec's ONE derivation: `Daemon._stuck_candidates` and
     `ops.stuck_report` over the same store and clock agree."""
     from jarvis import stuck
 
@@ -2923,8 +3016,10 @@ def test_both_callers_agree_about_the_running_checks(jarvis_home, project, tmp_p
     store = ProjectStore(project)
     try:
         now = time.time()
+        daemon = Daemon(load_catalog(cat))
         wo, at = _parked(store, hours=61 / 60, title="both callers read this one")
-        checks_hold(store, wo["id"], at + 60.0, code=code)
+        checks_hold(daemon, store, wo["id"], at + 60.0, code=code)
+        base_fact(red=False, age=fact_age)
         spec = load_catalog(cat).projects[0]
         run: dict = {"scanned": 0}
 

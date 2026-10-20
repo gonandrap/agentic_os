@@ -3928,8 +3928,8 @@ AUTOMERGE_EVENTS = ("automerge_merged", "automerge_decided", "automerge_proposed
 AUTOMERGE_TERMINAL = "automerge_merged"
 
 
-def automerge_checks_hold_spans(events: Iterable[Any], since: float,
-                                now: float) -> list[tuple[float, float]]:
+def automerge_checks_hold_spans(events: Iterable[Any], since: float, now: float,
+                                open_end: float) -> list[tuple[float, float]]:
     """Every interval inside `[since, now]` the OS held a merge for GitHub's checks.
 
     §4 of docs/superpowers/specs/2026-10-20-a-merge-held-for-running-checks-is-not-
@@ -3943,16 +3943,38 @@ def automerge_checks_hold_spans(events: Iterable[Any], since: float,
     walk correct — is this module's. `project_store` sits BELOW `automerge` in the import
     layering, so filtering on `HELD_CHECKS_RUNNING` there means a back-import.
 
-    **THE SPAN ENDS AT ITS SUCCESSOR, AND A HOLD WITH NO SUCCESSOR CONTRIBUTES NOTHING**
-    (Neo question 1992 of wo-a1d7b87c, option (a)). Unlike the validation CI hold there is
-    no `reopens_at` and no refresh — `Daemon._note_automerge_held` writes ONE event per
-    `(head_sha, code, reason, round)` — so the record carries a start and no end, and the
-    next event of any `AUTOMERGE_EVENTS` kind is the earliest moment it can prove the hold
-    had ended. An open tail to `now` would discount a wait the merge GATE owns and would
-    grow on a fact nobody can confirm when `gh` stops answering, which is
-    `central_store.base_red_hold_spans`' stated rule and the direction kn-6e30d561 forbids.
-    The live hold is carried by the EXCLUSION instead, so every failure makes the sweep
-    judge MORE time, never less.
+    **EACH SPAN ENDS AT `min(its successor's ts, open_end, now)`**, where `open_end` is
+    §3's base-health freshness horizon (`_base_red_until`) — so a hold with NO successor
+    ends at the horizon, and a successor arriving after it is clipped back to it. Unlike
+    the validation CI hold there is no `reopens_at` and no refresh —
+    `Daemon._note_automerge_held` writes ONE event per `(head_sha, code, reason, round)`
+    — so the record carries a start and no end, and the next event of any
+    `AUTOMERGE_EVENTS` kind is the earliest moment it can PROVE the hold had ended. An
+    open tail to `now` is the other way to be wrong: it would discount a wait the merge
+    GATE owns, and grow on a fact nobody can confirm — `central_store.base_red_hold_
+    spans`' stated rule for its own open pairs, and the direction kn-6e30d561 forbids.
+
+    §4 states what a `gh` outage therefore does, and this paragraph must stay word for
+    word with it (and with kn-09ccf1c7):
+
+    > A `gh` that stops answering stops BOTH halves forgiving within one
+    > `BASE_HEALTH_FRESH_SECONDS` window of the last confirmed observation: the exclusion
+    > lapses because the base-health fact is no longer fresh, and every open span ends at
+    > that same horizon rather than at the outage's end — so a longer outage makes the
+    > sweep judge MORE time, never less.
+
+    This SUPERSEDES Neo question 1992's option (a), which contributed NOTHING for a
+    successor-less hold; question 1998 replaces it with the horizon, because 1992 was
+    answered with no bound available and "nothing" under-discounts every LIVE hold — the
+    half of the pair that has to outlive the exclusion. 1992's rule survives as the limit
+    case: with no fresh fact `open_end` clips every span away, which `if end > start`
+    keeps true for an absent or non-numeric `checked_at` (`open_end` of `0.0`) and for a
+    project not opted into auto-merge.
+
+    **THE ROWS ARE SORTED HERE AND NOWHERE ELSE.** The walk is only correct in `ts` order
+    and the caller hands over one `events_of_kind` read per kind, so this sorts them — the
+    one sort, rather than a second one at the call site that the next reader has to prove
+    redundant.
 
     `HELD_CHECKS_RUNNING` ONLY, §3's boundary: `checks_none` may mean the workflow never
     fired, `checks_failed` is red, and every other code names something somebody owes.
@@ -3976,9 +3998,9 @@ def automerge_checks_hold_spans(events: Iterable[Any], since: float,
         if str(payload.get("code") or "") != HELD_CHECKS_RUNNING:
             continue
         nxt = next((r for r in rows[n + 1:] if str(r["kind"]) in AUTOMERGE_EVENTS), None)
-        if nxt is None:
-            continue  # nothing dates the end: option (a) contributes no span at all
-        start, end = max(float(e["ts"]), since), min(float(nxt["ts"]), now)
+        # Nothing dates the end of an open hold but the horizon (§4).
+        ends = [open_end, now] + ([float(nxt["ts"])] if nxt is not None else [])
+        start, end = max(float(e["ts"]), since), min(ends)
         if end > start:
             spans.append((start, end))
     return sorted(spans)
@@ -6688,8 +6710,9 @@ def force_validation_state(store: ProjectStore, wo: dict[str, Any], *, project: 
     refusal = force_validation_refusal(store, wo, project=project, cfg=cfg)
     state: dict[str, Any] = dict(held or {})
     # A STALE HOLD IS TREATED AS NO HOLD (2026-09-27 spec §3): diagnosing from one would
-    # say the head moved away from a commit a later round has since judged.
-    if state.get("kind") != "automerge_held" or state.get("stale"):
+    # say the head moved away from a commit a later round has since judged. Shared
+    # predicate — `automerge.hold_is_live`.
+    if not automerge.hold_is_live(state):
         state = {}
     code = str(state.get("code") or "")
     judged = str(state.get("judged_sha") or "")
@@ -9929,6 +9952,12 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
     docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md: the fact
     is the project's and not the order's, so the caller hoists it and only the CLIP is per
     candidate.
+
+    `base_red_until` now serves BOTH `waiting_pr_merge` holds — §3 of
+    docs/superpowers/specs/2026-10-20-a-merge-held-for-running-checks-is-not-stuck.md. It
+    is the base-health fact's freshness horizon, so it bounds the running-checks hold's
+    exclusion and its discount too, and the name predates that second reader rather than
+    narrowing it.
     """
     from . import bus, holds, stuck, worker_session
     from .central_store import base_red_hold_spans
@@ -9980,18 +10009,22 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         # not-stuck.md). `waiting_pr_merge` ONLY, so no other order pays for the reads: a
         # `needs_review` order beside the same pull request is a wait the USER owes
         # (kn-6e836793). ONE `automerge_state` call serves both the exclusion and the
-        # blocker note — `bool(note)` is what makes "excluded" and "the blocker says why"
-        # inseparable (§5).
+        # blocker note, and the implication is ONE-WAY (§3, §5): an exclusion always
+        # carries a named blocker, while a named blocker whose base-health fact has gone
+        # STALE is judged — `base_red_until >= now` is §3's fourth condition, exact because
+        # the horizon is a `min(now, …)`, and it is applied HERE because the helper is pure
+        # over the order's own record and cannot reach a project fact.
         automerge_checks_held, automerge_spans, am_note = False, [], ""
         if wo["status"] == "waiting_pr_merge":
             am_note = invariants.automerge_checks_note(automerge_state(pstore, wo))
-            automerge_checks_held = bool(am_note)
-            # `events_of_kind` takes ONE kind, so the kinds are concatenated and
-            # re-sorted: the walk is only right in `ts` order (§4).
+            automerge_checks_held = bool(am_note) and base_red_until >= now
+            # `events_of_kind` takes ONE kind, so the kinds are concatenated: the walk is
+            # only right in `ts` order and sorts them ITSELF (§4), so there is no second
+            # sort here.
             automerge_spans = automerge_checks_hold_spans(
-                sorted((e for k in AUTOMERGE_EVENTS
-                        for e in pstore.events_of_kind(wo["id"], k)),
-                       key=lambda e: float(e["ts"])), since, now)
+                [e for k in AUTOMERGE_EVENTS
+                 for e in pstore.events_of_kind(wo["id"], k)],
+                since, now, base_red_until)
         # A CHILD HELD BY ITS FEATURE'S UNRATIFIED PLAN IS NOT STUCK (§2.3 and §2.4 of
         # docs/superpowers/specs/2026-10-15-a-child-held-by-its-features-unratified-plan-
         # is-not-stuck.md). `pending` ONLY: the claim rule withholds a DISPATCH, so a
@@ -12419,6 +12452,7 @@ def rule_facts(store: ProjectStore, wo: dict[str, Any], *, now: float,
 
     Read-only: no model, no network, no subprocess, nothing written.
     """
+    from . import automerge
     from . import budget as budget_mod
     from . import holds as holds_mod
     from . import invariants as invariants_mod
@@ -12488,13 +12522,10 @@ def rule_facts(store: ProjectStore, wo: dict[str, Any], *, now: float,
 
     if need("automerge"):
         state = automerge_state(store, wo)
-        # A STALE HOLD IS NOT A CLAIM ABOUT NOW — docs/superpowers/specs/2026-09-27-a-
-        # stale-merge-hold-is-not-the-reason-a-pr-is-not-merging.md §2. The event is
-        # immutable and `automerge_state` marks rather than drops it, so contributing a
-        # marked one would let a rule fire on a hold the OS has already said is history.
-        if (state and state.get("kind") == "automerge_held"
-                and not state.get("stale")):
-            put("automerge_code", str(state.get("code") or ""))
+        # A STALE HOLD IS NOT A CLAIM ABOUT NOW — `automerge.hold_is_live`, the one
+        # predicate the three readers of this dict share, with the reasoning.
+        if automerge.hold_is_live(state):
+            put("automerge_code", str((state or {}).get("code") or ""))
 
     if need("waiting_on"):
         put("waiting_on", str(waiting_on(store, wo).get("what") or ""))

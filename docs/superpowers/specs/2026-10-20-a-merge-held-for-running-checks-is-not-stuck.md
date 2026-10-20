@@ -7,12 +7,13 @@ the in-flight turn (`.../2026-10-14-a-worker-turn-in-flight-is-not-stuck.md`), t
 (`.../2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md`) and the unratified plan
 (`.../2026-10-15-a-child-held-by-its-features-unratified-plan-is-not-stuck.md`).
 
-Design is settled. This records the evidence, the shape and the reasoning; the boundary
-question was decided by Neo on question 1992 of this work order.
+Design is settled. This records the evidence, the shape and the reasoning. The boundary
+question was decided by Neo on question 1992 of this work order and **amended by Neo on
+question 1998**, which supersedes 1992's option (a) in one respect — §4 records both.
 
 ## The problem
 
-`ops.stuck_scan` (src/jarvis/ops.py:9856) excludes **exactly one CI wait, and it is gated on
+`ops.stuck_scan` (src/jarvis/ops.py:9913) excludes **exactly one CI wait, and it is gated on
 `validating`** (src/jarvis/ops.py:9908-9915):
 
 ```python
@@ -23,7 +24,7 @@ question was decided by Neo on question 1992 of this work order.
 ```
 
 In `waiting_pr_merge` the only project fact the sweep reads is
-`central_store.base_red_hold_spans` (src/jarvis/ops.py:9920-9921), the red-base pair. There
+`central_store.base_red_hold_spans` (src/jarvis/ops.py:9975), the red-base pair. There
 is no reader of **the auto-merge poll's own hold**.
 
 So an order parked by that hold — the `automerge_held` event with code
@@ -137,7 +138,7 @@ and both can be true of one order at one instant. The red base is a **project** 
 by the caller from `CentralStore.base_health`, while the newest `automerge_held` row can
 still carry `checks_running` from an earlier tick — the poll writes one event per
 `(head_sha, code, reason, round)` and nothing rewrites it, so the record's newest hold lags
-the fact by up to one poll.
+the fact by up to one poll. §3's fourth condition is what bounds that lag.
 
 Red base wins, on §2.4 of the plan-hold spec's ranking: **a fleet fact outranks a fact about
 one order.** A broken default branch is the thing to go and look at; one pull request's
@@ -148,18 +149,52 @@ No collision with `VALIDATION_CI_CAUSE`, which is `validating`-only, and none wi
 at src/jarvis/ops.py:9974-9976 claiming CI and base-red "cannot collide" stays true and gains
 the sentence above.
 
-### §3 The liveness test, which is the one already established in two places
+### §3 The liveness test: the established triple, plus a freshness horizon
 
 A live hold is the **newest** `ops.automerge_state(store, wo)` row satisfying all three:
 
 1. `state["kind"] == "automerge_held"`;
 2. `not state.get("stale")`;
-3. `str(state.get("code")) == automerge.HELD_CHECKS_RUNNING`.
+3. `str(state.get("code")) == automerge.HELD_CHECKS_RUNNING`;
 
-Nothing new is derived. `automerge_state` (src/jarvis/ops.py:4026) already picks the newest
-event by timestamp across `ops.AUTOMERGE_EVENTS`, already applies the sticky-refusal rule,
-and already **marks a hold stale rather than dropping it**. The two precedents that read it
-exactly this way, and which this must not diverge from:
+**AND a fourth condition, on the project, decided by Neo on question 1998:**
+
+4. the project's `CentralStore.base_health` fact is **FRESH**, expressed as
+   `base_red_until >= now`.
+
+**The horizon is `ops._base_red_until(fact, now)`** (src/jarvis/ops.py:5490), which is
+`min(now, checked_at + central_store.BASE_HEALTH_FRESH_SECONDS)` — 900s
+(src/jarvis/central_store.py:22). Freshness is expressible as `horizon >= now` **because the
+horizon is a `min(now, …)`**: a stale fact clips strictly below `now`, a fresh one lands
+exactly on it.
+
+**It is ALREADY a parameter and nothing new is plumbed.** `stuck_scan` takes
+`base_red_until: float = 0.0` (src/jarvis/ops.py:9917), both callers hoist it once per
+project — `ops.stuck_report` at src/jarvis/ops.py:10117-10120 and `Daemon._stuck_candidates`
+at src/jarvis/daemon.py:5678-5688 — and `base_red_spans` already consumes it
+(src/jarvis/ops.py:9975). **No signature change, no rename.** The name predates this second
+reader; renaming it would touch two callers and the sweep's tests to buy nothing. Only
+`stuck_scan`'s docstring gains a sentence saying the horizon now serves both
+`waiting_pr_merge` holds.
+
+**Why THIS fact and no new record.** The hoist already happens under
+`spec.validation.enabled and spec.validation.auto_merge` (src/jarvis/ops.py:10117) — exactly
+the projects where a `checks_running` hold can exist, because nothing else opens one.
+`Daemon.poll_default_branch` stamps `checked_at` every tick for those same projects and
+writes **NOTHING** on `github.GitHubError` (src/jarvis/daemon.py:7428-7443), so the horizon is
+the OS's own most recent confirmed observation of GitHub for that project. No schema change
+and no new per-tick write.
+
+**Degradation is the correct one in both of its cases.** The horizon is `0.0` when
+`checked_at` is absent or non-numeric, and the caller leaves it `0.0` when the project is not
+opted into auto-merge. `0.0 >= now` is false, so the liveness test fails and §4's `min`
+clips every span away: an order whose project the OS is not observing is **judged**, not
+forgiven.
+
+Nothing new is derived from the timeline. `automerge_state` (src/jarvis/ops.py:4026) already
+picks the newest event by timestamp across `ops.AUTOMERGE_EVENTS`, already applies the
+sticky-refusal rule, and already **marks a hold stale rather than dropping it**. The two
+precedents that read it exactly this way, and which the triple must not diverge from:
 
 * the `need("automerge")` arm of the rules facts pass (src/jarvis/ops.py:12409-12417):
   `state and state.get("kind") == "automerge_held" and not state.get("stale")` — "a stale
@@ -172,6 +207,16 @@ exactly this way, and which this must not diverge from:
 A third reading of the same dict would be a third definition of "the OS is holding this
 merge".
 
+**Where the fourth condition is applied, and where it is NOT.** The predicate is
+`automerge_checks_held = bool(am_note) and base_red_until >= now` in `stuck_scan`.
+`invariants.automerge_checks_note` (§5) stays **pure over the dict and tests only the
+triple**: what the record SAYS is timeless, while liveness is a claim about `now` resting on
+a hoisted project fact the helper may not reach. So §5's inseparability is a one-way
+implication and must be read as such — **an exclusion always comes with a named blocker; a
+named blocker does not always exclude.** A held order whose project's fact has gone stale is
+judged, and its blocker column still says what the record knows, so the investigation it buys
+starts informed instead of on `"nothing the record can name"`.
+
 **`HELD_CHECKS_RUNNING` ONLY, and nothing wider** (kn-6e836793 — an extension stays an
 extension only if its boundary is stated):
 
@@ -180,8 +225,8 @@ extension only if its boundary is stated):
   never fired, and an order sitting there forever is exactly what the sweep must surface.
 * `HELD_CHECKS_FAILED` is **red** (src/jarvis/automerge.py:448). Nothing clears it but a
   push, which is somebody's work.
-* `HELD_BASE_RED` is §2's sibling and already excluded by its own, better-sourced path (a
-  fresh central fact, not an event that may lag).
+* `HELD_BASE_RED` is §2's sibling and already excluded by its own, better-sourced path (the
+  central fact itself, not an event that may lag).
 * Every other code — `HELD_MERGE_STATE_UNCLEAN`, `HELD_SHA_MOVED`, `HELD_NOT_PASSED`,
   `HELD_ASSUMPTIONS`, `HELD_PLAN_ASSUMPTIONS`, `HELD_SHA_UNRECORDED`, `HELD_PR_CLOSED`,
   `HELD_NOT_MERGEABLE`, `HELD_BASE_MOVED` — names something a person or a worker owes, and
@@ -195,9 +240,9 @@ extension only if its boundary is stated):
 five `events_of_kind` reads plus one `latest_validation_round`; one call per parked candidate
 is the whole cost, and it is **one** call serving both the exclusion and §5's blocker note.
 
-Nothing is hoisted by the caller and neither caller's signature changes. These are the
-ORDER's own timeline rows, not a project fact — the opposite of the red base, where the
-caller hoists because the fact is the project's.
+Nothing else is hoisted and neither caller's signature changes. The timeline rows are the
+ORDER's own — the opposite of the red base and of the horizon, both of which are the
+project's and therefore hoisted.
 
 ### §4 The discount, and the pair is the whole point
 
@@ -207,13 +252,14 @@ past 1.0h, nothing is held any more, and the sweep buys the investigation the ex
 existed to prevent. kn-0a222b38's pair rule, and kn-6e30d561's corollary — **the discount
 must outlive the exclusion by one status span.**
 
-**A new pure spans function, shaped on `project_store.validation_ci_hold_spans`**
-(src/jarvis/project_store.py:252): rows in, spans out, clipped to `[since, now]`, empties
-dropped by `if end > start`.
+**A new pure spans function, shaped on `central_store.base_red_hold_spans`**
+(src/jarvis/central_store.py:62): rows in, spans out, clipped to `[since, now]`, empties
+dropped by `if end > start`, and an **open** span ended by a horizon passed in — the same
+fourth positional argument, under the same name:
 
 ```python
-def automerge_checks_hold_spans(events: Iterable[Any], since: float,
-                                now: float) -> list[tuple[float, float]]
+def automerge_checks_hold_spans(events: Iterable[Any], since: float, now: float,
+                                open_end: float) -> list[tuple[float, float]]
 ```
 
 **Where it lives: `src/jarvis/ops.py`, module level, directly below `AUTOMERGE_EVENTS` /
@@ -239,12 +285,28 @@ weighed and lose:
   no clock" — and §6's rejected alternative for `_episodes`.
 * **`stuck.py`**: its opening paragraph forbids anything that knows a row shape.
 
-**THE BOUNDARY, settled by Neo on question 1992 of this work order, option (a):** each
-`checks_running` `automerge_held` event's span runs from **its own `ts`** to the `ts` of the
-**NEXT event of any kind in `ops.AUTOMERGE_EVENTS`**, and **a hold with no successor
-contributes NOTHING.**
+**THE BOUNDARY.** Each `checks_running` `automerge_held` event's span runs from **its own
+`ts`** to
 
-The reasoning, which must stay on the record because the two siblings both do the opposite:
+```
+min(ts of the NEXT event of any kind in ops.AUTOMERGE_EVENTS, open_end, now)
+```
+
+where `open_end` is §3's horizon and a hold with no successor therefore ends at the horizon.
+Empty results are dropped, so a stale fact (`open_end` below the hold's own start, `0.0` in
+the limit) contributes nothing at all.
+
+**This SUPERSEDES Neo question 1992's option (a) in one respect, and the record says so
+rather than leaving the next reader to find a contradiction.** 1992 ruled that a hold with
+**no successor contributes NOTHING**; question 1998 replaces that with the horizon. The
+reason: 1992 was answered with no bound available, and "contributes nothing" was the only
+safe degradation for an open span nobody could close. With a horizon in hand it is no longer
+the right one — it under-discounts every live hold, which is the half of the pair that must
+outlive the exclusion. The 1992 rule survives as the **limit case**: with no fresh fact the
+horizon clips the span away and contributes nothing, exactly as before.
+
+The rest of 1992's reasoning stands, and must stay on the record because the two siblings
+both do the opposite:
 
 * **There is no `reopens_at` and no refresh.** `Daemon._validation_ci_held` rewrites its
   event every `CI_HOLD_RECHECK_SECONDS`, which is what lets `validation_ci_hold_spans` end a
@@ -254,35 +316,50 @@ The reasoning, which must stay on the record because the two siblings both do th
 * **A hold that lapsed because the checks went GREEN is superseded by a different kind** —
   `automerge_proposed`, then `automerge_decided`/`automerge_merged` — not by another hold. So
   the next event of **any** `AUTOMERGE_EVENTS` kind is the earliest moment the record can
-  prove the hold had ended, and that is precisely what option (a) ends the span at.
-* **An open tail to `now` would discount a wait the merge GATE owns.** After the checks pass,
-  the order sits in `waiting_pr_merge` waiting on a gate request — a wait somebody may well
-  owe — and a growing span would forgive it under the checks' name.
-* **And it would break `base_red_hold_spans`' stated rule** (src/jarvis/central_store.py:71-73):
-  an open span must never end at `now` on a fact nobody can confirm. A broken `gh` writes no
-  new event at all; `Daemon._warn_pr_poll_broken` (src/jarvis/daemon.py:10849) is what
-  surfaces that, not a silently growing discount.
+  prove the hold had ended, and the `min` prefers it whenever it exists.
 
-Under (a) the open window is carried by the **EXCLUSION** (§2-§3, which reads the live hold)
-and the discount accrues only over a window a later event confirms has ended. The two halves
-degrade the same way: a `gh` that stopped answering freezes both — no new hold to exclude on,
-no successor to close a span with — and every failure therefore makes the sweep judge MORE
-time, never less. That is kn-6e30d561's required direction.
+**Why the horizon and NEVER `now`** — the four reasons an open tail to `now` is wrong are
+unchanged, and they are what the horizon answers:
 
-**The caller must re-sort, not filter.** `ProjectStore.events_of_kind` takes ONE kind and the
-walk is only right in `ts` order, so `stuck_scan` concatenates every `AUTOMERGE_EVENTS` kind
-and sorts — `plan_hold_spans`' concatenate-and-re-sort shape (src/jarvis/ops.py:9940-9945),
-for the same stated reason:
+1. After the checks pass, the order sits in `waiting_pr_merge` waiting on a gate request — a
+   wait somebody may well owe — and a tail to `now` would forgive it under the checks' name.
+2. `base_red_hold_spans`' stated rule (src/jarvis/central_store.py:71-73): an open span must
+   never end at `now` on a fact nobody can confirm.
+3. A broken `gh` writes no new event at all. `Daemon._warn_pr_poll_broken`
+   (src/jarvis/daemon.py:10849) is what surfaces that, not a silently growing discount.
+4. kn-6e30d561's required direction: every failure to observe must make the sweep judge more
+   time, never less.
+
+**What a `gh` outage now does, stated so the code docstring and kn-09ccf1c7 can match it word
+for word.** The horizon is what makes reason 4 true, and without it both halves
+over-forgave — the live hold stayed excluded for the whole outage, and the poll's first event
+on recovery became the successor, discounting the entire gap:
+
+> **A `gh` that stops answering stops BOTH halves forgiving within one
+> `BASE_HEALTH_FRESH_SECONDS` window of the last confirmed observation: the exclusion lapses
+> because the base-health fact is no longer fresh, and every open span ends at that same
+> horizon rather than at the outage's end — so a longer outage makes the sweep judge MORE
+> time, never less.**
+
+This is the doctrine of kn-2579843f (Neo question 1818) applied verbatim: "a stale fact
+excludes nothing" and "a stale fact stops discounting" are **ONE rule**, and an open pair ends
+at the freshness horizon and NEVER at `now`. That entry is the authority for this section.
+
+**The function owns the sort; the caller only concatenates.** `ProjectStore.events_of_kind`
+takes ONE kind and the walk is only right in `ts` order, so `stuck_scan` concatenates every
+`AUTOMERGE_EVENTS` kind and hands them over unordered — `automerge_checks_hold_spans` sorts
+the rows itself ("THE ROWS ARE SORTED HERE AND NOWHERE ELSE"), so no caller sorts them a
+second time:
 
 ```python
         automerge_checks_held, automerge_spans = False, []
         if wo["status"] == "waiting_pr_merge":
             am_note = invariants.automerge_checks_note(automerge_state(pstore, wo))
-            automerge_checks_held = bool(am_note)
+            automerge_checks_held = bool(am_note) and base_red_until >= now
             automerge_spans = automerge_checks_hold_spans(
-                sorted((e for k in AUTOMERGE_EVENTS
-                        for e in pstore.events_of_kind(wo["id"], k)),
-                       key=lambda e: float(e["ts"])), since, now)
+                [e for k in AUTOMERGE_EVENTS
+                 for e in pstore.events_of_kind(wo["id"], k)],
+                since, now, base_red_until)
 ```
 
 The whole history is walked and the SPANS are clipped, never the rows —
@@ -316,12 +393,12 @@ the 2026-10-15 plan-hold spec is this exact defect, and its medicine is **one sh
 
 ```python
 def automerge_checks_note(state: dict[str, Any] | None) -> str:
-    """One sentence for a LIVE `checks_running` auto-merge hold, `""` for anything else."""
+    """One sentence for a `checks_running` auto-merge hold, `""` for anything else."""
 ```
 
-Pure, over the dict `ops.automerge_state` returns (or `None`). It performs §3's triple test
-itself — kind, not stale, `code == automerge.HELD_CHECKS_RUNNING`, the constant reached by a
-function-local `from .automerge import HELD_CHECKS_RUNNING`, `base_red_note`'s
+Pure, over the dict `ops.automerge_state` returns (or `None`). It performs §3's **triple**
+test itself — kind, not stale, `code == automerge.HELD_CHECKS_RUNNING`, the constant reached
+by a function-local `from .automerge import HELD_CHECKS_RUNNING`, `base_red_note`'s
 function-local-import shape — and returns the blocker sentence built from the event's own
 stored `reason` plus the short head sha, e.g.
 
@@ -329,6 +406,10 @@ stored `reason` plus the short head sha, e.g.
 waiting for GitHub's checks on 7662d08b70 — CI has not finished on this commit — 1 check(s)
 still running
 ```
+
+It does **not** test §3's fourth condition, for §3's stated reason: the horizon is a project
+fact the helper cannot reach, and the sentence describes the record rather than claiming a
+hold is live now.
 
 *Why it lives in `invariants.py` and takes the dict.* `base_red_note` is the shape precedent:
 a note derived from the newest event, with **no network** — "whether the base is red is a
@@ -341,12 +422,12 @@ of an `ops` import (`ops` imports `invariants`), exactly as `plan_hold_note` tak
 1. the blocker column (`blocker[0] or outstanding_children_note or plan_hold_note or
    automerge_checks_note or "nothing the record can name"` — appended after the plan-hold
    note, which is `pending`-only and cannot co-occur);
-2. the §2 **predicate**: `automerge_checks_held = bool(am_note)`.
+2. the §2 **predicate**, as the first conjunct: `bool(am_note) and base_red_until >= now`.
 
 That second reader is the design and not a shortcut. Two functions over the same dict — one
 deciding the exclusion, one wording the row — is how the sweep's two columns came to
-disagree in the first place; `bool(note)` makes "excluded" and "the blocker says why"
-inseparable by construction.
+disagree in the first place; sharing the note makes "excluded" and "the blocker says why"
+inseparable **in that direction**: an exclusion cannot happen without a named blocker.
 
 **It is NOT wired into `invariants.status_label`**, and that is a decision. `status_label`
 runs per row in every listing, and its `PR_REPAIR_STATUSES` arm pays "ONE INDEXED READ"
@@ -377,11 +458,16 @@ Three prose edits, each of which becomes **false** the moment §1 ships:
 3. `stuck.py`'s `EXCLUSION_REASON` preamble (src/jarvis/stuck.py:53-55) says `{cause}` and
    `{kind}` are the only slots — still true; the new sentence takes no slot.
 
+A fourth text is not a surface but must agree with §4's outage sentence word for word:
+`automerge_checks_hold_spans`' own docstring. Knowledge entry kn-09ccf1c7 is corrected by the
+same words, outside this repo.
+
 ### §7 Test plan
 
 `tests/test_health_sweep.py` owns the sweep; `tests/test_validation_ci_hold.py` is the pair's
 precedent; `tests/test_automerge.py` owns the hold's own lifecycle. Extend those three — no
-new file.
+new file. Every sweep case below hands `stuck_scan` a FRESH `base_red_until` (`now`) unless
+it says otherwise.
 
 In `tests/test_health_sweep.py`:
 
@@ -409,27 +495,40 @@ In `tests/test_health_sweep.py`:
    `since + 2m` followed by an `automerge_proposed` at `since + 65m`, no live hold now.
    `excluded == ""` and `stuck is False`, because `active_seconds ≈ 7m` is inside the 1.0h
    threshold. **Assert `active_seconds`** — the number is the claim.
-8. **Union, not sum.** A usage hold fully inside the discounted span: `row["discounted"]`
-   equals the union, strictly less than the total.
-9. **No `continue`.** With `stuck_only=False` the held order is PRESENT in `stuck_scan`'s
-   rows and in `ops.stuck_report`, carrying `excluded` — kn-143a46df's structural guard.
-10. **Both callers agree.** `Daemon._stuck_candidates` and `ops.stuck_report` over the same
-    store and clock produce the same verdict for cases 1 and 3; the §7 "one derivation"
-    invariant of the 2026-09-30 spec.
+8. **A STALE base-health fact un-excludes AND stops discounting.** Case 1's row, except
+   `base_red_until = now - 1`: `excluded == ""`, `stuck is True`, and `row["discounted"]` has
+   no second from the open hold. The §3/§4 guard, and the test that fails if either half of
+   kn-2579843f's one rule is implemented without the other. A second assertion with
+   `base_red_until = 0.0` (no `checked_at`, or a project not opted into auto-merge) for the
+   same outcome.
+9. **An open hold IS discounted while the fact is fresh, up to the horizon only.** 61m in
+   status, a `checks_running` hold at `since + 1m` and no successor, `base_red_until`
+   stamped `BASE_HEALTH_FRESH_SECONDS` into the span: `row["discounted"]` equals
+   `horizon - (since + 1m)` and **not** `now - (since + 1m)`. The assertion that fails under
+   both the superseded 1992 rule (which gives `0`) and an open tail to `now`.
+10. **Union, not sum.** A usage hold fully inside the discounted span: `row["discounted"]`
+    equals the union, strictly less than the total.
+11. **No `continue`.** With `stuck_only=False` the held order is PRESENT in `stuck_scan`'s
+    rows and in `ops.stuck_report`, carrying `excluded` — kn-143a46df's structural guard.
+12. **Both callers agree.** `Daemon._stuck_candidates` and `ops.stuck_report` over the same
+    store and clock produce the same verdict for cases 1, 3 and 8; the §7 "one derivation"
+    invariant of the 2026-09-30 spec. Case 8 is in the list because the horizon is hoisted
+    separately in each caller.
 
 In `tests/test_automerge.py` (or beside `plan_hold_spans`' units, whichever the repo's
 convention puts the pure functions in):
 
-11. **`automerge_checks_hold_spans` as a pure unit:** a hold closed by a later
+13. **`automerge_checks_hold_spans` as a pure unit:** a hold closed by a later
     `automerge_proposed`; a hold closed by a later `automerge_held` of a different code; two
-    holds in sequence; a hold with **no** successor yielding **NOTHING** (Neo 1992's option
-    (a), the assertion that fails if an open tail to `now` is ever added); a span wholly
-    before `since` yielding nothing; clipping at `since` and at `now`; rows handed in out of
-    `ts` order still walked correctly.
-12. **`invariants.automerge_checks_note` as a pure unit:** `None`, a non-hold kind, a stale
+    holds in sequence; a hold with **no** successor ending at `open_end`; the same hold with
+    `open_end = 0.0` yielding **nothing**; a successor LATER than `open_end` (the span ends at
+    `open_end`) and one EARLIER (it ends at the successor) — the `min`'s two arms; a span
+    wholly before `since` yielding nothing; clipping at `since` and at `now`; rows handed in
+    out of `ts` order still walked correctly.
+14. **`invariants.automerge_checks_note` as a pure unit:** `None`, a non-hold kind, a stale
     hold, a hold with each other code — all `""`; a live `checks_running` hold quoting the
-    stored `reason` and the short sha.
-13. **Flagless.** `invariants.true_blockers` on the held order returns the same list it
+    stored `reason` and the short sha. No horizon argument — §5.
+15. **Flagless.** `invariants.true_blockers` on the held order returns the same list it
     returns today, and `check_blocked_work_is_surfaced` raises no violation for it.
 
 ### §8 Rejected alternatives
@@ -450,29 +549,60 @@ convention puts the pure functions in):
 4. **End an open span at `now`.** Neo 1992's option (b). It would discount a wait the merge
    gate owns, and would grow on a fact nobody can confirm when `gh` stops answering — the
    over-discount direction kn-6e30d561 forbids, and the rule `base_red_hold_spans` already
-   states for its own open pairs.
-5. **A `reopens_at` on the `automerge_held` payload**, making this hold look like the
+   states for its own open pairs. §4's four reasons.
+5. **No time bound at all** — the triple with no fourth condition, which is what review round
+   1 rejected and correctly so. The hold stays excluded for the whole outage, and the poll's
+   first event on recovery closes a span over the entire gap. Both halves forgive time nobody
+   observed; kn-2579843f forbids each of them separately.
+6. **A new per-tick work-order column stamped by the merge poll** — the most precise bound
+   available, since it would be a confirmed observation of THIS pull request rather than of
+   the project. Rejected on cost: a schema change plus a write on the poll's green path,
+   which that poll's stated budget avoids writing on. The project-level fact is one
+   observation coarser and free.
+7. **A fixed maximum hold age, no new record** — treat a `checks_running` hold older than N
+   as dead. Rejected twice over: N is an arbitrary constant with nothing to derive it from,
+   and it un-excludes a legitimately held order whose checks are merely slow — which is the
+   defect this spec exists to fix, reintroduced on a timer.
+8. **Document the gap as accepted** — the reviewer's second option: keep the unbounded
+   exclusion and write down that an outage over-forgives. Rejected: kn-2579843f is a standing
+   rule, not a preference, and a bound was available at no cost. Accepting a gap is for the
+   case where the alternative is expensive; here it was a parameter the function already
+   took.
+9. **A `reopens_at` on the `automerge_held` payload**, making this hold look like the
    validation CI one. That is a change to the poll's write path and to the dedupe key, with
    `ops._automerge_hold_is_stale` and `force_validation_state` reading the same payload; the
-   successor event already dates the end, so the write path earns nothing.
-6. **A `fleet_health.*` catalog key** for the merge wait. A setting asks the user to know
-   GitHub's runtime. The hold and its successor are already in the record; reading them is
-   free.
-7. **A `continue` in `stuck_scan`.** kn-143a46df, kn-e91ff3a5 — §1.
-8. **Name the blocker in `invariants.true_blockers`.** kn-143a46df: a blocker named there
-   arms INV-ATTENTION-MISSING, and the deliberate silence is correct. The fix is to not open
-   the investigation.
+   successor event and the horizon already date the end, so the write path earns nothing.
+10. **A `fleet_health.*` catalog key** for the merge wait. A setting asks the user to know
+    GitHub's runtime. The hold, its successor and the horizon are already in the record;
+    reading them is free.
+11. **A `continue` in `stuck_scan`.** kn-143a46df, kn-e91ff3a5 — §1.
+12. **Name the blocker in `invariants.true_blockers`.** kn-143a46df: a blocker named there
+    arms INV-ATTENTION-MISSING, and the deliberate silence is correct. The fix is to not open
+    the investigation.
 
 ### §9 Out of scope, explicitly
 
+* **ACCEPTED BLIND SPOT: a `gh` failure specific to ONE pull request.** A deleted repo, a
+  typo'd URL or a permission loss on one PR leaves `Daemon.poll_default_branch` succeeding —
+  so the project's fact stays fresh and the horizon keeps advancing — while that one order
+  never polls. It stays excluded, and its open span keeps accruing, for as long as the
+  project is healthy. Accepted by Neo on question 1998 and recorded here as accepted: it is
+  the same error class the red-base hold already accepts, both halves rest on the same fact,
+  and the per-pull-request bound that would close it is §8.6, rejected on cost. The bound
+  this spec adds covers the failure mode that actually occurred — `gh` down for the whole
+  project.
 * **`holds.py` is untouched** — no `_episodes` synthesis, no new `HOLD_CAUSES` entry (§8.1).
-* **No threshold changes.** `waiting_pr_merge` stays 60 minutes; `fleet_health.cooldown_minutes`,
-  `max_per_day` and the fingerprint are untouched. The repeat-per-episode symptom is cured by
-  not flagging the order at all.
-* **No catalog key** of any kind.
-* **No change to `Daemon._note_automerge_held`, its dedupe key, `automerge.decide` or any
-  `HELD_*` code.** The record already says the right thing; the defect was that the sweep did
-  not read it.
+* **No threshold changes.** `waiting_pr_merge` stays 60 minutes;
+  `fleet_health.cooldown_minutes`, `max_per_day` and the fingerprint are untouched. The
+  repeat-per-episode symptom is cured by not flagging the order at all.
+* **No catalog key** of any kind, and `BASE_HEALTH_FRESH_SECONDS` stays 900 and stays
+  `central_store`'s.
+* **No schema change and no new per-tick write** — §3. `stuck_scan`'s signature is unchanged;
+  only its docstring and the body of the `waiting_pr_merge` arm move.
+* **No change to `Daemon._note_automerge_held`, its dedupe key, `automerge.decide`,
+  `Daemon.poll_default_branch` or any `HELD_*` code.** The record already says the right
+  thing; the defect was that the sweep did not read it, and then that it read it without a
+  clock.
 * **`ops.automerge_state`, `ops._automerge_line` and `jarvis wo show` are unchanged.** They
   were the surface that was already correct.
 * **`invariants.status_label` gains nothing** — §5, with the read-budget reason.

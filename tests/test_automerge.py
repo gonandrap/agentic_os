@@ -2093,10 +2093,10 @@ def test_the_blocker_is_re_derivable_and_is_not_relabelled(started, project, fak
 
 def a_hold(store, wo_id: str, code: str, *, round_n: int, head_sha: str = JUDGED,
            reason: str = "round 1 is waiting for CI") -> None:
-    """One `automerge_held` event, exactly as `Daemon._note_automerge_held` writes it."""
-    store.add_event(wo_id, "automerge_held", {
-        "code": code, "reason": reason, "judged_sha": JUDGED, "head_sha": head_sha,
-        "round": round_n})
+    """One `automerge_held` event, through the writer's OWN payload builder."""
+    store.add_event(wo_id, "automerge_held", automerge.hold_payload(
+        automerge.Decision(armed=False, code=code, reason=reason, judged_sha=JUDGED,
+                           head_sha=head_sha, round_n=round_n)))
 
 
 def open_round(store, wo_id: str, outcome: str = "") -> int:
@@ -2417,11 +2417,15 @@ def test_the_round_line_beside_a_re_judging_hold_describes_the_round_and_no_hold
 # -- a merge held for running checks is not stuck ---------------------------------------
 #
 # docs/superpowers/specs/2026-10-20-a-merge-held-for-running-checks-is-not-stuck.md, issue
-# 1110. The two pure halves, §7.11 and §7.12; the sweep's own assertions are in
+# 1110. The two pure halves, §7.13 and §7.14; the sweep's own assertions are in
 # tests/test_health_sweep.py beside the red base's.
 
 T0 = 1_700_000_000.0
 MINUTE = 60.0
+NOW = T0 + 60 * MINUTE
+#: A FRESH horizon for the cases that are not about staleness: §3's `min(now, …)` lands
+#: exactly on `now` whenever the base-health fact was confirmed inside the window.
+FRESH = NOW
 RUNNING_REASON = "CI has not finished on this commit — 1 check(s) still running"
 
 
@@ -2432,18 +2436,31 @@ def am_event(kind: str, ts: float, **payload) -> dict:
     return {"kind": kind, "ts": ts, "payload": _json.dumps(payload)}
 
 
-def a_running_hold(ts: float, **payload) -> dict:
-    return am_event("automerge_held", ts, code=automerge.HELD_CHECKS_RUNNING,
-                    reason=RUNNING_REASON, head_sha=JUDGED, round=1, **payload)
+def a_hold_event(ts: float, code: str = automerge.HELD_CHECKS_RUNNING,
+                 reason: str = RUNNING_REASON, round_n: int = 1,
+                 head_sha: str = JUDGED) -> dict:
+    """One `automerge_held` row whose PAYLOAD comes from the writer's own builder.
+
+    `automerge.hold_payload` is what `Daemon._note_automerge_held` writes through, so a
+    change to the payload's shape breaks these units instead of passing over a key they
+    hand-wrote. The store is not involved — these cases are pure.
+    """
+    return am_event("automerge_held", ts, **automerge.hold_payload(
+        automerge.Decision(armed=False, code=code, reason=reason, judged_sha=JUDGED,
+                           head_sha=head_sha, round_n=round_n)))
+
+
+def a_running_hold(ts: float, **over) -> dict:
+    return a_hold_event(ts, **over)
 
 
 def test_a_hold_is_a_span_to_the_next_automerge_event_of_any_kind():
-    """§4, Neo 1992 option (a): the successor dates the end, because nothing rewrites an
-    `automerge_held` event and the record carries a start and no end."""
+    """§4: the successor dates the end, because nothing rewrites an `automerge_held`
+    event and the record carries a start and no end. The `min`'s successor arm."""
     rows = [a_running_hold(T0 + MINUTE),
             am_event("automerge_proposed", T0 + 6 * MINUTE)]
 
-    assert ops.automerge_checks_hold_spans(rows, T0, T0 + 60 * MINUTE) == \
+    assert ops.automerge_checks_hold_spans(rows, T0, NOW, FRESH) == \
         [(T0 + MINUTE, T0 + 6 * MINUTE)]
 
 
@@ -2451,10 +2468,10 @@ def test_a_later_hold_of_another_code_closes_the_span_too():
     """§4: a hold that lapsed is superseded by SOME event, and a differently-coded hold is
     one — the checks reported and the merge is now held on something else."""
     rows = [a_running_hold(T0 + MINUTE),
-            am_event("automerge_held", T0 + 4 * MINUTE,
-                     code=automerge.HELD_CHECKS_FAILED, reason="CI failed: unit")]
+            a_hold_event(T0 + 4 * MINUTE, code=automerge.HELD_CHECKS_FAILED,
+                         reason="CI failed: unit")]
 
-    assert ops.automerge_checks_hold_spans(rows, T0, T0 + 60 * MINUTE) == \
+    assert ops.automerge_checks_hold_spans(rows, T0, NOW, FRESH) == \
         [(T0 + MINUTE, T0 + 4 * MINUTE)]
 
 
@@ -2464,23 +2481,45 @@ def test_two_holds_in_sequence_are_two_spans():
             a_running_hold(T0 + 10 * MINUTE),
             am_event("automerge_failed", T0 + 12 * MINUTE)]
 
-    assert ops.automerge_checks_hold_spans(rows, T0, T0 + 60 * MINUTE) == \
+    assert ops.automerge_checks_hold_spans(rows, T0, NOW, FRESH) == \
         [(T0 + MINUTE, T0 + 3 * MINUTE), (T0 + 10 * MINUTE, T0 + 12 * MINUTE)]
 
 
-def test_a_hold_with_no_successor_contributes_nothing():
-    """NEO 1992's option (a), and the assertion that fails if an open tail to `now` is
-    ever added: the live hold is carried by the EXCLUSION, never by the discount."""
+def test_a_hold_with_no_successor_ends_at_the_horizon():
+    """§4, and it SUPERSEDES Neo 1992's option (a): nothing dates the end, so the span
+    runs to the freshness horizon — the live hold is the half of the pair that has to
+    outlive the exclusion (kn-6e30d561), and 1992's "contributes nothing" under-discounted
+    every one of them."""
     rows = [a_running_hold(T0 + MINUTE)]
+    horizon = T0 + 40 * MINUTE
 
-    assert ops.automerge_checks_hold_spans(rows, T0, T0 + 60 * MINUTE) == []
+    assert ops.automerge_checks_hold_spans(rows, T0, NOW, horizon) == \
+        [(T0 + MINUTE, horizon)]
+
+
+def test_a_successor_after_the_horizon_is_clipped_at_the_horizon():
+    """§4's outage sentence: `gh` stopped answering, the poll wrote nothing for an hour,
+    and its first event on recovery would otherwise discount the entire gap."""
+    rows = [a_running_hold(T0 + MINUTE), am_event("automerge_proposed", T0 + 55 * MINUTE)]
+    horizon = T0 + 20 * MINUTE
+
+    assert ops.automerge_checks_hold_spans(rows, T0, NOW, horizon) == \
+        [(T0 + MINUTE, horizon)]
+
+
+def test_a_horizon_of_zero_yields_no_span_at_all():
+    """§3's degradation, both of its cases: no `checked_at` on the fact, and a project not
+    opted into auto-merge. 1992's rule survives as the LIMIT CASE."""
+    rows = [a_running_hold(T0 + MINUTE), am_event("automerge_proposed", T0 + 6 * MINUTE)]
+
+    assert ops.automerge_checks_hold_spans(rows, T0, NOW, 0.0) == []
 
 
 def test_a_span_wholly_before_the_status_began_contributes_nothing():
     rows = [a_running_hold(T0 - 20 * MINUTE),
             am_event("automerge_proposed", T0 - 10 * MINUTE)]
 
-    assert ops.automerge_checks_hold_spans(rows, T0, T0 + 60 * MINUTE) == []
+    assert ops.automerge_checks_hold_spans(rows, T0, NOW, FRESH) == []
 
 
 def test_the_spans_are_clipped_and_never_the_rows():
@@ -2491,22 +2530,27 @@ def test_the_spans_are_clipped_and_never_the_rows():
             a_running_hold(T0 + 20 * MINUTE),
             am_event("automerge_decided", T0 + 90 * MINUTE)]
 
-    assert ops.automerge_checks_hold_spans(rows, T0, T0 + 60 * MINUTE) == \
-        [(T0, T0 + 5 * MINUTE), (T0 + 20 * MINUTE, T0 + 60 * MINUTE)]
+    assert ops.automerge_checks_hold_spans(rows, T0, NOW, FRESH) == \
+        [(T0, T0 + 5 * MINUTE), (T0 + 20 * MINUTE, NOW)]
 
 
 def test_rows_handed_over_out_of_order_are_still_walked_in_ts_order():
     """The caller concatenates one `events_of_kind` read per kind, so the rows arrive
-    grouped by kind — the walk sorts them itself (§4)."""
+    grouped by kind — the walk sorts them itself, and is the ONLY site that does (§4)."""
     rows = [am_event("automerge_proposed", T0 + 6 * MINUTE), a_running_hold(T0 + MINUTE)]
 
-    assert ops.automerge_checks_hold_spans(rows, T0, T0 + 60 * MINUTE) == \
+    assert ops.automerge_checks_hold_spans(rows, T0, NOW, FRESH) == \
         [(T0 + MINUTE, T0 + 6 * MINUTE)]
 
 
 def live_hold_state(**over) -> dict:
-    return {"kind": "automerge_held", "code": automerge.HELD_CHECKS_RUNNING,
-            "reason": RUNNING_REASON, "head_sha": JUDGED, "round": 1, **over}
+    """What `ops.automerge_state` returns over one live hold: the writer's payload plus
+    the two keys that function owns."""
+    return {**automerge.hold_payload(
+        automerge.Decision(armed=False, code=automerge.HELD_CHECKS_RUNNING,
+                           reason=RUNNING_REASON, judged_sha=JUDGED, head_sha=JUDGED,
+                           round_n=1)),
+        "kind": "automerge_held", "ts": T0, **over}
 
 
 def test_the_note_names_the_commit_and_quotes_the_stored_reason():
@@ -2533,6 +2577,18 @@ def test_only_a_live_checks_running_hold_gets_a_note(state):
     """§3's triple test, performed by the helper itself: every other code names something
     a person or a worker owes, and a stale hold is no hold."""
     assert invariants.automerge_checks_note(state) == ""
+
+
+def test_the_stored_reason_is_flattened_and_clamped_for_the_column():
+    """The sweep's blocker COLUMN renders this verbatim, so one long reason cannot be
+    allowed to wreck it — `objection_response_line`'s bound, reused."""
+    note = invariants.automerge_checks_note(
+        live_hold_state(reason="CI has not finished\non this commit — " + "x" * 300))
+
+    assert "\n" not in note
+    assert note.endswith("…")
+    assert len(note) <= len(f"waiting for GitHub's checks on {JUDGED[:10]} — ") + \
+        invariants.AUTOMERGE_CHECKS_REASON_CHARS
 
 
 def test_the_note_arms_no_flag_and_names_no_blocker(started, project):
