@@ -9874,7 +9874,7 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
     is the project's and not the order's, so the caller hoists it and only the CLIP is per
     candidate.
     """
-    from . import bus, holds, stuck, worker_session
+    from . import budget, bus, holds, stuck, worker_session
     from .central_store import base_red_hold_spans
     from .health import observer_kinds
     from .project_store import (FO_ID_PREFIXES, PLAN_ASSUMPTION_EVENT_KINDS,
@@ -9901,6 +9901,16 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         spans = holds.held(pstore, wo["id"], now=now)
         since = durations.current_status_since
         usage = [h for h in spans if h.cause == PAUSE_USAGE_LIMIT]
+        # AN ORDER AT ITS BUDGET CAP IS NOT STUCK (§2 of docs/superpowers/specs/
+        # 2026-10-20-a-work-order-at-its-budget-cap-is-not-stuck.md). The episode is
+        # already on the timeline at BOTH ends — `holds._OPEN` maps `budget_exhausted`
+        # to `holds.BUDGET` and `holds._CLOSE` maps `budget_resumed` — so the span is
+        # read off `spans` above and needs no new read. A CLOSED episode still counts
+        # while the status stands, which is kn-6e30d561: the discount outlives the
+        # exclusion by one status span.
+        budget_spans = ([(max(h.started, since), min(h.finish(now), now))
+                         for h in spans if h.cause == holds.BUDGET]
+                        if wo["status"] == budget.EXHAUSTED else [])
         # A ROUND WAITING FOR GITHUB'S CHECKS IS NOT STUCK (§1 and §3 of
         # docs/superpowers/specs/2026-10-12-a-validation-round-waiting-for-ci-is-not-stuck.md).
         # `validating` ONLY: a round runs in parallel with `needs_review`, which is a wait
@@ -9943,11 +9953,11 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                     sorted((e for k in PLAN_ASSUMPTION_EVENT_KINDS
                             for e in pstore.events_of_kind(str(planner_id), k)),
                            key=lambda e: float(e["ts"])), since, now)
-        # The UNION and never the sum: a usage window can shut while CI runs (§4), or
-        # while the base is red.
+        # The UNION and never the sum: a usage window can shut while CI runs (§4),
+        # while the base is red, or while an order sits at its budget cap.
         discounted = holds.union_seconds(
             [(max(h.started, since), min(h.finish(now), now)) for h in usage]
-            + ci_spans + base_red_spans + plan_spans)
+            + ci_spans + base_red_spans + plan_spans + budget_spans)
         # §2.2 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md.
         edges = (pstore.unfinished_dependencies(wo["id"])
                  if wo["status"] == "pending" else [])
@@ -9979,6 +9989,13 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                             else VALIDATION_CI_CAUSE if ci_held
                             else stuck.BASE_RED_CAUSE
                             if base_red and wo["status"] == "waiting_pr_merge"
+                            # DOCUMENTARY, not load-bearing (§3 of the 2026-10-20
+                            # spec): a collision is impossible by construction except
+                            # with the fleet usage window above — the other arms are
+                            # scoped to `validating`, `waiting_pr_merge` and `pending`,
+                            # and an order has one status.
+                            else stuck.BUDGET_CAP_CAUSE
+                            if wo["status"] == budget.EXHAUSTED
                             else stuck.LIVE_DEPENDENCY if live_edges
                             # LAST in the chain, §2.4: a fleet fact outranks a fact
                             # about one feature's plan.

@@ -2727,3 +2727,183 @@ def test_both_callers_derive_the_same_bool(jarvis_home, project, tmp_path, auto_
         assert row["stuck"] is not excluded
     finally:
         store.close()
+
+
+# -- a work order at its budget cap -----------------------------------------------------
+# docs/superpowers/specs/2026-10-20-a-work-order-at-its-budget-cap-is-not-stuck.md
+
+
+def _spent(store, hours: float = 2.0, status: str | None = None,
+           status_ago: float = 0.0, resumed_after: float | None = None,
+           assumptions: int = 0,
+           title: str = "parked at its cap") -> tuple[dict, float]:
+    """An order whose budget ran out `hours` ago, with the park's own event.
+
+    `status` moves it on afterwards (what the raise does), `status_ago` back-dates that
+    move — `set_status` stamps `db.now()` and there is no back-dating call
+    (`park_order`'s own reason) — and `resumed_after` writes the `budget_resumed` that
+    closes the `holds.BUDGET` episode.
+    """
+    from jarvis import budget
+
+    wo = ops.create_work_order("proj_a", title)
+    for i in range(assumptions):
+        store.add_assumption(wo["id"], f"assumption {i}")
+    at = park_order(store, wo["id"], budget.EXHAUSTED, hours=hours)
+    store.add_event(wo["id"], "budget_exhausted",
+                    {"cap_usd": 50.0, "spent_usd": 50.16, "source": "work_order"}, ts=at)
+    if resumed_after is not None:
+        store.add_event(wo["id"], "budget_resumed", {"cap_usd": 75.0},
+                        ts=at + resumed_after)
+    if status is not None:
+        store.set_status(wo["id"], status)
+        moved = time.time() - status_ago
+        store.conn.execute(
+            "UPDATE wo_state_spans SET ts=? WHERE id="
+            "(SELECT id FROM wo_state_spans WHERE order_id=? AND order_kind='wo' "
+            "ORDER BY ts DESC, id DESC LIMIT 1)", (moved, wo["id"]))
+        store.conn.execute(
+            "UPDATE wo_events SET ts=? WHERE id=(SELECT MAX(id) FROM wo_events)",
+            (moved,))
+    store.conn.commit()
+    return store.get_work_order(wo["id"]), at
+
+
+def test_assess_names_the_raise_and_not_a_hold_that_clears_itself():
+    """§1: `DEFAULT_EXCLUSION_REASON` is FALSE here — only the user raising the cap
+    clears it, so the cause carries its own sentence and names the command."""
+    from jarvis import stuck
+
+    judged = stuck.assess(
+        "budget_exhausted", 5 * HOUR, 5 * HOUR, 5 * HOUR, {}, 0.5 * HOUR,
+        excluded_cause=stuck.BUDGET_CAP_CAUSE)
+
+    assert judged.stuck is False
+    assert judged.excluded == stuck.BUDGET_CAP_CAUSE
+    assert judged.reason == stuck.EXCLUSION_REASON[stuck.BUDGET_CAP_CAUSE]
+    assert judged.reason != stuck.DEFAULT_EXCLUSION_REASON.format(
+        cause=stuck.BUDGET_CAP_CAUSE)
+    assert "jarvis wo budget" in judged.reason
+    # The same wall clock with nothing holding it IS stuck: the hold is the difference.
+    assert stuck.assess("budget_exhausted", 5 * HOUR, 5 * HOUR, 0.0, {},
+                        0.5 * HOUR).stuck
+
+
+def test_a_parked_order_is_excluded_with_the_named_cause(stuck_os):
+    """§6(1): wo-4091ba42's own case — $50.16 of a $50.00 cap bought inv-392bc511."""
+    from jarvis import stuck
+
+    store = stuck_os["store"]
+    now = time.time()
+    wo, _at = _spent(store)
+
+    row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+    assert row["stuck"] is False, row["reason"]
+    assert row["excluded"] == stuck.BUDGET_CAP_CAUSE
+    assert row["reason"] == stuck.EXCLUSION_REASON[stuck.BUDGET_CAP_CAUSE]
+    assert row["reason"] != stuck.DEFAULT_EXCLUSION_REASON.format(
+        cause=stuck.BUDGET_CAP_CAUSE)
+    # The discount is the other half, proved apart from the exclusion: the whole parked
+    # span is held, so there is no active time left to judge.
+    assert abs(row["discounted_seconds"] - 2 * HOUR) < 5, row["discounted_seconds"]
+    assert row["active_seconds"] < 5, row["active_seconds"]
+
+
+def test_the_status_is_the_key_and_never_the_pending_assumptions(stuck_os):
+    """§6(2), kn-fe8f7d5b's regression guard: an assumption owed in any other status is
+    a wait the user owes and stays judged."""
+    from jarvis import stuck
+
+    store = stuck_os["store"]
+    now = time.time()
+    bare, _at = _spent(store, title="parked, nothing owed")
+    owed, _ = _spent(store, status="needs_review", status_ago=2 * HOUR, assumptions=2,
+                     title="reviewed, not parked")
+
+    rows = {r["id"]: r for r in ops.stuck_report("proj_a", now)}
+
+    assert rows[bare["id"]]["excluded"] == stuck.BUDGET_CAP_CAUSE
+    assert rows[owed["id"]]["excluded"] == ""
+    assert rows[owed["id"]]["stuck"] is True, rows[owed["id"]]["reason"]
+
+
+def test_the_discount_outlives_the_exclusion(stuck_os):
+    """§6(3), kn-6e30d561: the raise moves the status on, and the first sweep after it
+    must not judge the hours the park accumulated."""
+    store = stuck_os["store"]
+    now = time.time()
+    wo, _at = _spent(store, hours=2.0, resumed_after=2 * HOUR - 300, status="pending",
+                     status_ago=300, title="the user raised the cap")
+
+    row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+    assert row["excluded"] == "", "a closed episode still excluded the order"
+    assert abs(row["active_seconds"] - 300) < 10, row["active_seconds"]
+    assert row["stuck"] is False, row["reason"]
+
+
+def test_a_usage_window_inside_the_park_is_discounted_once(stuck_os):
+    """§6(4): the UNION and never the sum (`holds.union_seconds`' own docstring)."""
+    store = stuck_os["store"]
+    now = time.time()
+    wo, at = _spent(store, hours=2.0)
+    usage_hold(store, wo["id"], started=at + 0.5 * HOUR, ended=at + 1 * HOUR)
+
+    row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+    assert abs(row["discounted_seconds"] - 2 * HOUR) < 5, row["discounted_seconds"]
+    assert row["discounted_seconds"] < 2.5 * HOUR, "the overlap was counted twice"
+
+
+def test_a_fleet_usage_window_outranks_the_budget_cap(stuck_os):
+    """§3: a fact about the ACCOUNT outranks a fact about one order's money."""
+    from jarvis import stuck
+    from jarvis.worker_session import PAUSE_USAGE_LIMIT
+
+    store = stuck_os["store"]
+    now = time.time()
+    wo, at = _spent(store, hours=2.0)
+    usage_hold(store, wo["id"], started=at)
+
+    row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+    assert row["excluded"] == PAUSE_USAGE_LIMIT
+    assert row["excluded"] != stuck.BUDGET_CAP_CAUSE
+    assert row["stuck"] is False, row["reason"]
+
+
+def test_the_parked_order_is_a_visible_row_and_never_a_continue(stuck_os):
+    """§6(5), kn-143a46df: a `continue` produces no `Verdict`, so the parked order would
+    vanish from `jarvis stuck` and `/stuck` instead of explaining itself there."""
+    from jarvis import stuck
+
+    store = stuck_os["store"]
+    now = time.time()
+    wo, _at = _spent(store)
+
+    scanned, rows = ops.stuck_scan(store, "proj_a", catalog.FleetHealthConfig(), now,
+                                   stuck_only=False)
+    parked = [r for r in rows if r["wo"]["id"] == wo["id"]]
+
+    assert scanned == 1 and len(parked) == 1, "the parked row left the sweep's output"
+    assert parked[0]["verdict"].excluded == stuck.BUDGET_CAP_CAUSE
+    assert next(r for r in ops.stuck_report("proj_a", now)
+                if r["id"] == wo["id"])["excluded"] == stuck.BUDGET_CAP_CAUSE
+
+
+def test_the_parked_order_buys_no_investigation_and_no_new_write(stuck_os):
+    """§6(8), kn-1e65d22d rule 2: the debt is already surfaced, so a sweep over a parked
+    order writes no event and sends no notification."""
+    store, daemon = stuck_os["store"], stuck_os["daemon"]
+    wo, _at = _spent(store, hours=5.0)
+    def notified() -> int:
+        return int(store.conn.execute(
+            "SELECT COUNT(*) FROM notifications").fetchone()[0])
+
+    before = (store.count_events(wo["id"]), notified())
+
+    daemon.stuck_tick(None)
+
+    assert ops.list_investigation_orders("proj_a", include_settled=True) == []
+    assert (store.count_events(wo["id"]), notified()) == before

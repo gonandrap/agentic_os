@@ -1174,9 +1174,19 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         from .ops import auto_review_at
         if auto_review_at(store.project_path):
             owed = [a for a in pending if not _os_is_confirming(a)]
+    # ONE COMPOUND LINE when the order is also out of money — §4 of docs/superpowers/
+    # specs/2026-10-20-a-work-order-at-its-budget-cap-is-not-stuck.md, Neo 2018. It
+    # REPLACES both constituents and is emitted in the slot the assumptions line
+    # occupies, which is the higher of the two: a surface printing only `reason[0]`
+    # would otherwise hide half the wait, and the money is what the order is parked on.
+    compound = False
     if owed and not neo_reviews_later(store, wo):
         n = len(owed)
-        blockers.append(f"{n} assumption{'s' if n != 1 else ''} pending your review")
+        compound = wo["status"] == budget.EXHAUSTED
+        clause = (f"{n} assumption{'s' if n != 1 else ''} "
+                  f"also await{'s' if n == 1 else ''} you")
+        blockers.append(f"{budget_blocker(store, wo)}; {clause}" if compound
+                        else f"{n} assumption{'s' if n != 1 else ''} pending your review")
     # A privileged action Neo declined to decide on. Nobody else can open that gate, and
     # the work order cannot proceed past it.
     for approval in store.escalated_approvals(wo["id"]):
@@ -1200,7 +1210,9 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # ABOVE `failed`, and above every wait below: an order in this status has nothing
     # else it can be waiting for, and the question the user is being asked is about
     # money rather than about the work.
-    if wo["status"] == budget.EXHAUSTED:
+    # ...unless the compound line above already carried it: neither constituent is ever
+    # printed twice (§4 of the 2026-10-20 spec).
+    if wo["status"] == budget.EXHAUSTED and not compound:
         blockers.append(budget_blocker(store, wo))
     if governed and wo["status"] == "failed":
         # TWO SENTENCES, and the second is the one the generic line got wrong: a session

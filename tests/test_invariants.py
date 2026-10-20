@@ -2718,6 +2718,84 @@ def test_a_stalled_pull_request_ends_the_tick_as_an_attention_item(
         store.close()
 
 
+# -- the budget cap and the assumptions it parked on -----------------------------------
+# §4 of docs/superpowers/specs/2026-10-20-a-work-order-at-its-budget-cap-is-not-stuck.md
+
+
+def _parked_at_its_cap(store: ProjectStore, n: int = 3) -> dict:
+    """An order the OS stopped at its cap, owing `n` assumption decisions."""
+    from jarvis import budget
+
+    wo = store.create_work_order("ran out of money mid-task")
+    for i in range(n):
+        store.add_assumption(wo["id"], f"assumption {i}")
+    store.update_work_order(wo["id"], result_summary="half done")
+    store.set_status(wo["id"], budget.EXHAUSTED)
+    return store.get_work_order(wo["id"])
+
+
+def test_a_parked_order_owing_assumptions_gets_one_compound_line(project):
+    """§6(6): the money first, then the assumptions — ONE line replacing both. Neo 2018.
+
+    `reason[0]` on wo-4091ba42 named only the assumptions, so a user who accepted both
+    never learned the order had no money left to spend on the answer.
+    """
+    store = ProjectStore(project)
+    wo = _parked_at_its_cap(store, n=3)
+
+    blockers = true_blockers(store, wo)
+
+    assert len(blockers) == 1, blockers
+    assert blockers[0].startswith(invariants.budget_blocker(store, wo))
+    assert "3 assumptions also await you" in blockers[0]
+    assert not any("pending your review" in b for b in blockers)
+    assert invariants.budget_blocker(store, wo) not in blockers
+
+
+def test_the_compound_line_is_singular_for_one_assumption(project):
+    store = ProjectStore(project)
+    wo = _parked_at_its_cap(store, n=1)
+
+    line = true_blockers(store, wo)[0]
+
+    assert line.startswith(invariants.budget_blocker(store, wo))
+    assert "1 assumption also awaits you" in line
+    assert "assumptions" not in line
+
+
+def test_the_compound_line_gains_no_parked_sentence(project):
+    """§6(7): the compound mentions assumptions, so the `_mentions_assumptions` tail
+    would append a second, weaker parked sentence the budget line alone never had.
+    `budget_exhausted` is outside `PARKABLE_STATUSES`, which is what keeps it off."""
+    store = ProjectStore(project)
+    wo = _parked_at_its_cap(store, n=3)
+
+    blockers = true_blockers(store, wo)
+
+    assert invariants.parked_reason(store, wo) is None
+    assert invariants.PARKED_BLOCKER not in blockers
+    assert invariants.STALE_FINISH_BLOCKER not in blockers
+
+
+def test_a_parked_order_owing_nothing_keeps_the_plain_budget_line(project):
+    """§5: no change to the status with nothing owed — one line, and no parked tail."""
+    store = ProjectStore(project)
+    wo = _parked_at_its_cap(store, n=0)
+
+    assert true_blockers(store, wo) == [invariants.budget_blocker(store, wo)]
+
+
+def test_needs_review_with_assumptions_owed_is_byte_identical(project):
+    """§5: the assumptions line is untouched in every other status."""
+    store = ProjectStore(project)
+    wo = _settled_with_assumptions(store, n=3)
+
+    blockers = true_blockers(store, wo)
+
+    assert blockers[0] == "3 assumptions pending your review"
+    assert not any("budget spent" in b for b in blockers)
+
+
 def test_the_pointer_check_runs_on_the_slow_cadence_only():
     """§2.3: its population is every feature order a project has ever had and its repair
     lists the whole repository. `INVARIANTS` runs twice a minute per project."""
