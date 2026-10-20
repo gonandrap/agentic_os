@@ -2790,7 +2790,7 @@ def test_assess_names_the_raise_and_not_a_hold_that_clears_itself():
 
 
 def test_a_parked_order_is_excluded_with_the_named_cause(stuck_os):
-    """§6(1): wo-4091ba42's own case — $50.16 of a $50.00 cap bought inv-392bc511."""
+    """§7(1): wo-4091ba42's own case — $50.16 of a $50.00 cap bought inv-392bc511."""
     from jarvis import stuck
 
     store = stuck_os["store"]
@@ -2811,7 +2811,7 @@ def test_a_parked_order_is_excluded_with_the_named_cause(stuck_os):
 
 
 def test_the_status_is_the_key_and_never_the_pending_assumptions(stuck_os):
-    """§6(2), kn-fe8f7d5b's regression guard: an assumption owed in any other status is
+    """§7(2), kn-fe8f7d5b's regression guard: an assumption owed in any other status is
     a wait the user owes and stays judged."""
     from jarvis import stuck
 
@@ -2828,23 +2828,24 @@ def test_the_status_is_the_key_and_never_the_pending_assumptions(stuck_os):
     assert rows[owed["id"]]["stuck"] is True, rows[owed["id"]]["reason"]
 
 
-def test_the_discount_outlives_the_exclusion(stuck_os):
-    """§6(3), kn-6e30d561: the raise moves the status on, and the first sweep after it
-    must not judge the hours the park accumulated."""
+def test_the_discount_stops_when_the_status_moves_on(stuck_os):
+    """§7(3): no `budget_resumed`, so the `holds.BUDGET` episode is still OPEN — the case
+    four of the five paths out of `_resume_after_budget` leave behind. The status gate is
+    what keeps that open hold off the new status span."""
     store = stuck_os["store"]
     now = time.time()
-    wo, _at = _spent(store, hours=2.0, resumed_after=2 * HOUR - 300, status="pending",
-                     status_ago=300, title="the user raised the cap")
+    wo, _at = _spent(store, hours=5.0, status="pending", status_ago=4 * HOUR,
+                     title="raised, never resumed")
 
     row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
 
-    assert row["excluded"] == "", "a closed episode still excluded the order"
-    assert abs(row["active_seconds"] - 300) < 10, row["active_seconds"]
-    assert row["stuck"] is False, row["reason"]
+    assert row["excluded"] == ""
+    assert row["discounted_seconds"] < 5, row["discounted_seconds"]
+    assert row["stuck"] is True, row["reason"]
 
 
 def test_a_usage_window_inside_the_park_is_discounted_once(stuck_os):
-    """§6(4): the UNION and never the sum (`holds.union_seconds`' own docstring)."""
+    """§7(4): the UNION and never the sum (`holds.union_seconds`' own docstring)."""
     store = stuck_os["store"]
     now = time.time()
     wo, at = _spent(store, hours=2.0)
@@ -2874,7 +2875,7 @@ def test_a_fleet_usage_window_outranks_the_budget_cap(stuck_os):
 
 
 def test_the_parked_order_is_a_visible_row_and_never_a_continue(stuck_os):
-    """§6(5), kn-143a46df: a `continue` produces no `Verdict`, so the parked order would
+    """§7(5), kn-143a46df: a `continue` produces no `Verdict`, so the parked order would
     vanish from `jarvis stuck` and `/stuck` instead of explaining itself there."""
     from jarvis import stuck
 
@@ -2893,7 +2894,7 @@ def test_the_parked_order_is_a_visible_row_and_never_a_continue(stuck_os):
 
 
 def test_the_parked_order_buys_no_investigation_and_no_new_write(stuck_os):
-    """§6(8), kn-1e65d22d rule 2: the debt is already surfaced, so a sweep over a parked
+    """§7(8), kn-1e65d22d rule 2: the debt is already surfaced, so a sweep over a parked
     order writes no event and sends no notification."""
     store, daemon = stuck_os["store"], stuck_os["daemon"]
     wo, _at = _spent(store, hours=5.0)

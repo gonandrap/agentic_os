@@ -9902,12 +9902,15 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         since = durations.current_status_since
         usage = [h for h in spans if h.cause == PAUSE_USAGE_LIMIT]
         # AN ORDER AT ITS BUDGET CAP IS NOT STUCK (§2 of docs/superpowers/specs/
-        # 2026-10-20-a-work-order-at-its-budget-cap-is-not-stuck.md). The episode is
-        # already on the timeline at BOTH ends — `holds._OPEN` maps `budget_exhausted`
-        # to `holds.BUDGET` and `holds._CLOSE` maps `budget_resumed` — so the span is
-        # read off `spans` above and needs no new read. A CLOSED episode still counts
-        # while the status stands, which is kn-6e30d561: the discount outlives the
-        # exclusion by one status span.
+        # 2026-10-20-a-work-order-at-its-budget-cap-is-not-stuck.md). `holds._OPEN` maps
+        # `budget_exhausted` to `holds.BUDGET`, so the span is read off `spans` above
+        # and needs no new read. WHILE THE STATUS STANDS AND NEVER AFTER:
+        # `_resume_after_budget` writes `budget_resumed` only on its one fully
+        # successful path, so on the other four the episode is still OPEN once the
+        # status has moved on, and an ungated union would discount the whole new status
+        # span for ever. kn-6e30d561 wants the discount to outlive the exclusion; here
+        # the status-span RESET does that — `since` moves to the raise, so the parked
+        # hours are not in the window being judged.
         budget_spans = ([(max(h.started, since), min(h.finish(now), now))
                          for h in spans if h.cause == holds.BUDGET]
                         if wo["status"] == budget.EXHAUSTED else [])

@@ -1179,6 +1179,9 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # REPLACES both constituents and is emitted in the slot the assumptions line
     # occupies, which is the higher of the two: a surface printing only `reason[0]`
     # would otherwise hide half the wait, and the money is what the order is parked on.
+    # `neo_reviews_later` can never skip it: `budget_exhausted` is absent from
+    # `PRE_DELIVERY_STATUSES`, so it is False in this status whatever `auto_review`
+    # says.
     compound = False
     if owed and not neo_reviews_later(store, wo):
         n = len(owed)

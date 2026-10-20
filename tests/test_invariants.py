@@ -2735,7 +2735,7 @@ def _parked_at_its_cap(store: ProjectStore, n: int = 3) -> dict:
 
 
 def test_a_parked_order_owing_assumptions_gets_one_compound_line(project):
-    """§6(6): the money first, then the assumptions — ONE line replacing both. Neo 2018.
+    """§7(6): the money first, then the assumptions — ONE line replacing both. Neo 2018.
 
     `reason[0]` on wo-4091ba42 named only the assumptions, so a user who accepted both
     never learned the order had no money left to spend on the answer.
@@ -2764,7 +2764,7 @@ def test_the_compound_line_is_singular_for_one_assumption(project):
 
 
 def test_the_compound_line_gains_no_parked_sentence(project):
-    """§6(7): the compound mentions assumptions, so the `_mentions_assumptions` tail
+    """§7(7): the compound mentions assumptions, so the `_mentions_assumptions` tail
     would append a second, weaker parked sentence the budget line alone never had.
     `budget_exhausted` is outside `PARKABLE_STATUSES`, which is what keeps it off."""
     store = ProjectStore(project)
@@ -2775,6 +2775,25 @@ def test_the_compound_line_gains_no_parked_sentence(project):
     assert invariants.parked_reason(store, wo) is None
     assert invariants.PARKED_BLOCKER not in blockers
     assert invariants.STALE_FINISH_BLOCKER not in blockers
+
+
+def test_the_compound_line_survives_auto_review(started, catalog_file):
+    """§4: `neo_reviews_later` cannot skip the compound line — `budget_exhausted` is
+    outside `invariants.PRE_DELIVERY_STATUSES`, so it is False in this status however the
+    project has `validation.auto_review` set."""
+    for key in ("validation.enabled", "validation.auto_review"):
+        ops.set_config(key, True, project="proj_a", reason="the panel has been right",
+                       catalog_path=str(catalog_file))
+    store = ProjectStore(started.catalog.project("proj_a").path)
+    wo = _parked_at_its_cap(store, n=3)
+
+    assert ops.auto_review_at(store.project_path), "the switch never reached the file"
+    assert invariants.neo_reviews_later(store, wo) is False
+    blockers = true_blockers(store, wo)
+
+    assert len(blockers) == 1, blockers
+    assert blockers[0].startswith(invariants.budget_blocker(store, wo))
+    assert "3 assumptions also await you" in blockers[0]
 
 
 def test_a_parked_order_owing_nothing_keeps_the_plain_budget_line(project):

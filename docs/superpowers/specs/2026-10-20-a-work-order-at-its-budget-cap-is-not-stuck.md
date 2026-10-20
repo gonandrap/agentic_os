@@ -116,9 +116,25 @@ would report the same minutes twice under two names.
 No new read, no new store, no new accessor. Same status gate as the exclusion, so no other
 order pays for the filter.
 
-**A CLOSED episode survives the raise**, which is kn-6e30d561's requirement that the
-discount outlive the exclusion: `budget_resumed` ends the episode and the pair stays in the
-timeline, so the first sweep after the resume still discounts the parked hours.
+**The discount applies WHILE THE ORDER IS PARKED AND NEVER AFTER**, and the status gate is
+load-bearing in one direction only:
+
+- A CLOSED episode can never reach a later status span. `budget_resumed` is written only on
+  `_resume_after_budget`'s one fully successful path (`ops.py:17240`), the same path that
+  moved the status, so a closed episode always lies entirely before `since` and clips to
+  zero with or without the gate.
+- An OPEN one would. The other four paths out of that function — never dispatched,
+  unreadable catalog, a relaunch already queued, a failed relaunch (`ops.py:17203`,
+  `17210`, `17229`, `17238`) — move the status WITHOUT writing `budget_resumed`, leaving the
+  hold open. Ungated, `h.finish(now)` is `now`, the clip is the entire new status span, and
+  that order is never judged again. The gate is what stops it.
+
+So the discount changes no verdict after the raise, and is not meant to. What protects the
+first post-resume sweep is the status-span RESET: `since` moves to the raise, so the parked
+hours are not in the window being judged at all — that is how kn-6e30d561's requirement is
+met for this hold. What the discount is FOR is the number on the row the exclusion leaves
+visible: `jarvis stuck` prints `active_seconds` (`ops.py:10075`), and without the union a
+parked order's row would claim hours of active wait that never ran.
 
 **`holds._outside` clips worker-turn seconds out of the span** (`holds.py:338`). Correct
 and harmless here: a parked order runs no turn, so there is nothing to clip. Degradation is
@@ -220,9 +236,11 @@ Extend `tests/test_health_sweep.py` (the sweep's exclusion+discount home, with
 2. **The status is the key, not the assumptions.** Same row with no pending assumption:
    still excluded. A `needs_review` order with assumptions owed and the same spent cap:
    `stuck is True`, `excluded == ""`. kn-fe8f7d5b's regression guard.
-3. **The discount outlives the exclusion.** 2h parked, `budget_resumed` written and the
-   status moved to `pending` 5 minutes ago: `excluded == ""`, `stuck is False`, and
-   `active_seconds` asserted near 300s — the number is the claim (kn-6e30d561).
+3. **The discount stops when the status moves on.** Parked 5h with NO `budget_resumed` —
+   the open-episode case four of the five resume paths leave behind — and the status moved
+   on 4h ago: `excluded == ""`, `discounted_seconds` near 0, `stuck is True`. Delete the
+   status gate and this fails, which is the point: the previous version passed with
+   `budget_spans` deleted.
 4. **Union, not sum.** A usage hold wholly inside the budget episode: `discounted` equals
    the union, not the total.
 5. **No `continue`.** With `stuck_only=False` the parked order is PRESENT in
