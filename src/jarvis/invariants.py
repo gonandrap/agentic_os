@@ -528,6 +528,10 @@ STALE_FINISH_BLOCKER = ("the worker went back to work after finishing and stoppe
 #: for. Each reason below is now DERIVED: `validating` by the round predicate, `pending`
 #: by the claim SQL, `waiting_pr_merge` by the poll's, `idle` by the manager's.
 #:
+#: EVERYTHING BELOW IS THIS LIST'S HISTORICAL RECORD — why each status was in or out while
+#: the list WAS the gate — and not the current rule. Kept because it records decisions
+#: with reasons; read it as history, never as a justification for a gate that is gone.
+#:
 #: Where "nothing is in flight" is worth saying. `validating` is excluded because the
 #: round machine owns that work order and INV-VALIDATION-STRANDED already watches it;
 #: `pending` has no turn to be parked after; `waiting_pr_merge` is waiting on
@@ -1696,8 +1700,10 @@ def parked_reason(store: ProjectStore, wo: dict[str, Any],
     if wo.get("origin") in UNGOVERNED_ORIGINS:
         # An injected session was never briefed on `jarvis wo finish`, so a turn of its
         # that ends without one is not a worker parking mid-task. A manager used to be
-        # excused here too; `idle` is not in PARKABLE_STATUSES, so the status says it
-        # now and the kind does not have to (issue #264).
+        # excused here too (issue #264); what excuses it NOW is the verdict —
+        # `ops.scheduled_actor` names `ops.manager_awaiting_feature` for an idle manager
+        # with a live feature — so neither the kind nor the old PARKABLE_STATUSES reason
+        # ("`idle` is not in the list") applies: `idle` IS in `OPEN_STATUSES` (§5a).
         return None
     # OPEN, and that is the whole gate: `PARKABLE_STATUSES` stops being consulted (§5a),
     # and `validating` is NOT added to it — the list is not the question any more. The

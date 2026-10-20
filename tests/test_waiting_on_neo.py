@@ -141,11 +141,24 @@ def test_an_answered_question_stops_suppressing_anything(project):
 def test_a_reply_already_queued_is_not_a_reason_to_ask_again(project):
     """The last few seconds of the same wait. `ops.send_message` clears the flag as the
     user writes; until the daemon delivers, `waiting_input` stands — and the invariant
-    put the flag back within a tick, asking the user for something they had just done."""
+    put the flag back within a tick, asking the user for something they had just done.
+
+    THE SESSION ID IS THE PREMISE, not decoration: `worker_session.delivery_hold` returns
+    HOLD_NO_SESSION for a row that has none, so `daemon.delivers_message` would not select
+    and `true_blockers` would NOT be `[]` at all — no actor is derived, so it carries
+    NO_ACTOR_BLOCKER
+    (docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md
+    §5b). A real `waiting_input` row got there through a settled turn, so it has one."""
     store = ProjectStore(project)
     wo = store.create_work_order("blocked task")
+    store.update_work_order(wo["id"], session_id="sess-1")
+    turn = store.create_turn(wo["id"], "dispatch", "do the thing")
+    store.finish_turn(turn["id"], "done", result="waiting on your reply")
     store.set_status(wo["id"], "waiting_input")
     store.queue_message(wo["id"], "yes, go ahead", source="user")
+    # §5b: `[]` because `Daemon.deliver_messages` owns the row, not because nothing derived.
+    assert ops.scheduled_actor(store, store.get_work_order(wo["id"])).predicate == (
+        "daemon.delivers_message")
 
     assert true_blockers(store, store.get_work_order(wo["id"])) == []
 

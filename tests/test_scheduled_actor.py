@@ -35,8 +35,10 @@ from jarvis.daemon import (
     settles_turn,
 )
 from jarvis.neo_store import NEO_HELD_Q_STATUSES, NeoStore
+from jarvis.invariants import user_facing_wait
 from jarvis.project_store import (
     CLAIM_RULES,
+    FO_TERMINAL_STATUSES,
     OPEN_STATUSES,
     UNGOVERNED_ORIGINS,
     VALIDATION_HELD_CAUSE,
@@ -505,6 +507,100 @@ def test_each_wait_shape_behaves_as_the_pass_behaves(jarvis_home, project, settl
     row = _age_past_grace(store, wo["id"])
 
     assert settles_turn(store, row) is False
+
+    settler(store)
+    assert store.get_work_order(wo["id"])["status"] == after
+
+
+#: (status, kind, what makes the shape, the status the settler leaves) — the two row
+#: shapes where a `result_summary` is read BEFORE the gate and manager questions, in
+#: `settles_done_turn` and in `Daemon.settle_work_order` alike. Same style as
+#: `WAIT_SHAPES` / `test_each_wait_shape_behaves_as_the_pass_behaves`: the ROW SHAPE
+#: maps to an actor verdict and to a status, never to a string on its own.
+SUMMARY_SHAPES = [
+    pytest.param("running", None, _held_gate, "completed", id="summary-held-gate"),
+    pytest.param("waiting_input", "manager", _pending_gate, "completed",
+                 id="summary-manager-asked"),
+]
+
+
+@pytest.mark.parametrize(("status", "kind", "make", "after"), SUMMARY_SHAPES)
+def test_a_summary_outranks_the_wait_shape_in_both_readers(jarvis_home, project,
+                                                           settler, status, kind, make,
+                                                           after):
+    """A `result_summary` is the FIRST question both readers ask, so neither wait shape
+    below it is reached — `settles_turn` is True and the settler LANDS the row.
+
+    EQUIVALENCE, not new behaviour. `Daemon.settle_work_order`'s done-turn chain is
+    `if fresh.get("result_summary"): ... elif (not manager and something_is_out): ...
+    elif manager: ... else: ...` both before and after the refactor, so
+    `settles_done_turn` returning True on a summary MIRRORS the settler's own branch
+    order. For these two shapes the settler takes the summary branch and never reaches
+    the unconditional `set_status("waiting_input")` arm nor the manager arm.
+
+    `completed` is therefore the TRUE status for the manager case, not `waiting_input`:
+    issue #264's rule — a manager that ASKED for something stays `waiting_input` — is
+    about a manager with NO summary, which is `WAIT_SHAPES`' `manager-asked` case. A
+    manager carrying one has DELIVERED, and `ops.land_finished` ends it (no `pr_url`
+    and no unlanded commits here, so `completed`).
+    """
+    store = ProjectStore(project)
+    kw: dict = {"status": status}
+    if kind == "manager":
+        kw["kind"] = kind
+        kw["parent_id"] = store.create_feature_order("a feature")["id"]
+    wo = store.create_work_order("add feature X", **kw)
+    if kind == "manager":
+        feature = store.get_feature_order(kw["parent_id"])
+        assert feature["status"] not in FO_TERMINAL_STATUSES, \
+            "the premise: the feature is LIVE, so nothing closes the manager"
+    _done_turn(store, wo["id"])
+    make(store, wo["id"])
+    assert user_facing_wait(store, wo["id"]) is (kind == "manager"), \
+        ("the premise: a PENDING gate is a user-facing wait and a HELD one is not — "
+         "the manager arm's hold, and the `waiting_input` write's chooser")
+    store.update_work_order(wo["id"], result_summary="shipped the export")
+    row = _age_past_grace(store, wo["id"])
+
+    assert settles_turn(store, row) is True
+
+    settler(store)
+    assert store.get_work_order(wo["id"])["status"] == after
+
+
+#: (status, kind, what makes the shape, the status the settler leaves) — the mirror of
+#: `WAIT_SHAPES`: the two done-turn arms that DO write, each on the row that reaches it.
+#: Without these the arms' writes are pinned nowhere in this file, since every
+#: `WAIT_SHAPES` row returns from `settles_done_turn` before the arm is reached.
+WRITE_SHAPES = [
+    pytest.param("running", None, _pending_gate, "waiting_input", id="arm-parks-it"),
+    pytest.param("waiting_input", "manager", lambda store, wo_id: None, "idle",
+                 id="arm-idles-the-manager"),
+]
+
+
+@pytest.mark.parametrize(("status", "kind", "make", "after"), WRITE_SHAPES)
+def test_each_arm_that_writes_is_reached_on_its_own_row(jarvis_home, project, settler,
+                                                        status, kind, make, after):
+    """`settles_turn` True and the arm's write, for a row with NO `result_summary`.
+
+    The `something_is_out` arm's `set_status("waiting_input")` is unconditional now
+    because `settles_done_turn` already refused the held-gate and already-parked rows —
+    so the row that reaches it is an OUTWARD-facing wait not yet parked. The manager arm
+    is reached only by a manager with a live feature and no wait of its own, and `idle`
+    is what it writes (issue #264).
+    """
+    store = ProjectStore(project)
+    kw: dict = {"status": status}
+    if kind == "manager":
+        kw["kind"] = kind
+        kw["parent_id"] = store.create_feature_order("a feature")["id"]
+    wo = store.create_work_order("add feature X", **kw)
+    _done_turn(store, wo["id"])
+    make(store, wo["id"])
+    row = _age_past_grace(store, wo["id"])
+
+    assert settles_turn(store, row) is True
 
     settler(store)
     assert store.get_work_order(wo["id"])["status"] == after

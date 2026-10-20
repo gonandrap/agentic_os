@@ -6838,6 +6838,10 @@ class Daemon:
         # It subsumes the `queued_messages` return that used to stand here (the next
         # turn goes out this tick; nothing has settled yet) and each done-turn branch
         # below that wrote nothing.
+        #
+        # ORDER IS LOAD-BEARING: every arm below relies on this gate (the
+        # `waiting_input` arm writes unconditionally because of it), and the
+        # deferred-landing early return sits between them. Do not reorder the three.
         fresh = store.get_work_order(wo["id"])
         if not settles_done_turn(store, fresh):
             return
@@ -6915,8 +6919,12 @@ class Daemon:
             # and wait, so an idle worker here is compliance, not abandonment.
             #
             # THIS READ CHOOSES THE STATUS, it does not decide eligibility: it is what
-            # tells this arm from the `else` tail below. Whether the wait is
-            # outward-facing, and whether the row is already parked there, are
+            # tells this arm from the `else` tail below. THE WRITE BELOW IS
+            # UNCONDITIONAL BECAUSE `settles_done_turn` ABOVE ALREADY REFUSED BOTH ROWS
+            # THAT NEED NO WRITE — a non-manager on a HELD (not outward-facing) gate
+            # request, and a row already IN `waiting_input` — so there is no guard lost
+            # here, only one that moved. Whether the wait is outward-facing, and whether
+            # the row is already parked there, are
             # `settles_done_turn`'s — see it for fix 2 of
             # docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md and for
             # GitHub issue 100.
