@@ -1,21 +1,4 @@
-"""Retracting a superseded ruling: it leaves the prompt, it stays in the record.
-
-Both of the OS's ledgers — Neo's learnings and the central knowledge base — were
-INSERT-only. A ruling the user reversed therefore stayed in every prompt beside its
-replacement for ever, and the live production learnings accumulated a CONFLICT NOTICE
-entry quoting three mutually unsatisfiable rulings of the user's own.
-
-Retraction is an UPDATE, never a DELETE. The property that keeps it honest is that a
-retired row is still returned by the AUDIT reads (`NeoStore.all_learnings`,
-`CentralStore.search_knowledge`) carrying `retired_at` and `retired_reason`, while the
-PROMPT reads (`NeoStore.learnings` -> `neo.build_system_prompt`, and
-`CentralStore.relevant_knowledge` -> the worker prompt) skip it.
-
-EVERY FILTER TEST HERE CARRIES ITS NEGATIVE CONTROL IN THE SAME TEST, because a filter
-that returned nothing at all would satisfy "the retired one is gone" perfectly. So each
-one names a second, non-retired entry that MUST still be there. (Same rule as
-`test_neo.py::test_a_seat_scoped_learning_does_not_move_neos_cached_prefix`.)
-"""
+"""Retracting a superseded ruling: it leaves the prompt, it stays in the record"""
 
 from __future__ import annotations
 
@@ -44,23 +27,11 @@ def central(jarvis_home):
         store.close()
 
 
-# -- learnings ---------------------------------------------------------------------
+# -- learnings
 
 
 def test_a_retracted_learning_leaves_neos_prompt_and_the_survivors_do_not_move(neo):
-    """The point of the whole feature, and the one property that pins it.
-
-    THIS IS A DELIBERATE EXCEPTION TO THE APPEND-ONLY PROMPT PREFIX that
-    `test_neo.py::test_learnings_shape_future_answers` protects, and it is worth being
-    explicit rather than letting it read as drift: a retraction genuinely DOES rewrite
-    that prefix, because the whole purpose is to remove text the user has reversed. It
-    costs one Anthropic prompt-cache miss, once, at the moment the user changes their
-    mind — which is exactly when a stale cached prefix is the thing you least want.
-
-    What it must NOT do is reorder the rows that survive. Oldest-first ordering is what
-    makes an ordinary new learning an append; if a retraction reshuffled the survivors,
-    every subsequent prompt would be a fresh miss rather than one.
-    """
+    """The point of the whole feature, and the one property that pins it"""
     a = neo.add_learning("Always default to CSV", project="proj_a")
     b = neo.add_learning("Never bundle two decisions in one PR", project="proj_a")
     c = neo.add_learning("Squash merges only", project="proj_a")
@@ -79,8 +50,7 @@ def test_a_retracted_learning_leaves_neos_prompt_and_the_survivors_do_not_move(n
 
 
 def test_a_retracted_learning_is_still_in_the_audit_trail(neo):
-    """RETIRED IS NOT DELETED. This is the assertion that stops anyone implementing
-    retraction as a DELETE the next time the prompt needs shortening."""
+    """RETIRED IS NOT DELETED"""
     row = neo.add_learning("Always default to CSV", project="proj_a")
     neo.retract_learning(row["id"], "the user moved to JSON in 2026-08")
 
@@ -95,13 +65,7 @@ def test_a_retracted_learning_is_still_in_the_audit_trail(neo):
 
 
 def test_the_seat_scoped_query_also_drops_retired_learnings(neo):
-    """The default-safe filter lives in `NeoStore.learnings`, not in
-    `neo.build_system_prompt`, precisely so the panel's per-seat prompt builder — which
-    lives in another module and another work order — inherits it for free.
-
-    Three controls in one call, because a seat query returning `[]` proves nothing:
-    the surviving global row and the surviving seat row must both still be there.
-    """
+    """The default-safe filter lives in `NeoStore.learnings`"""
     glob = neo.add_learning("Always default to CSV", project="proj_a")
     dead = neo.add_learning("A grep naming shipit ships nothing",
                             project="proj_a", seat="blast")
@@ -129,9 +93,7 @@ def test_retracting_a_learning_that_does_not_exist_raises(neo):
 
 
 def test_retracting_a_learning_twice_is_refused(neo):
-    """Refuse rather than re-stamp. The first reason and timestamp record WHEN the user
-    changed their mind; an idempotent second retraction would overwrite both, and the
-    audit trail is the only thing retraction has instead of a delete."""
+    """Refuse rather than re-stamp"""
     row = neo.add_learning("Always default to CSV", project="proj_a")
     first = neo.retract_learning(row["id"], "the user moved to JSON")
     with pytest.raises(ValueError, match="already retired"):
@@ -142,7 +104,7 @@ def test_retracting_a_learning_twice_is_refused(neo):
     assert after["retired_at"] == first["retired_at"]
 
 
-# -- knowledge ---------------------------------------------------------------------
+# -- knowledge
 
 
 def test_a_retracted_knowledge_entry_leaves_the_worker_prompt_feed(central):
@@ -173,12 +135,7 @@ def test_a_retracted_knowledge_entry_is_still_in_the_audit_trail(central):
 
 
 def test_the_retired_marker_survives_the_search_index_shape(central, capsys):
-    """Spec test 5 of 2026-10-02-learn-search-returns-an-index.md.
-
-    `jarvis learn search` prints index rows now, and a 160-char excerpt is even easier to
-    mistake for standing advice than a headline — so the one field that says the entry was
-    retracted has to survive the shape change.
-    """
+    """Spec test 5 of 2026-10-02-learn-search-returns-an-index.md"""
     import json
 
     from jarvis.cli import build_parser, cmd_learn
@@ -218,18 +175,11 @@ def test_retracting_knowledge_twice_is_refused(central):
     assert after["retired_at"] == first["retired_at"]
 
 
-# -- the mirrored memory file ---------------------------------------------------------
+# -- the mirrored memory file
 
 
 def test_a_retracted_memory_mirror_does_not_capture_the_next_rewrite_in_place(central):
-    """`record_memory_file` replaces its row in place so a rewritten memory file does
-    not accumulate near-duplicates. Its SELECT skips retired rows.
-
-    The alternative — updating the retired row in place — would turn one retraction
-    into a permanent silent mute: every later version of that file written into a row
-    no prompt reads, with nothing telling anyone why their memory stopped arriving
-    (ruled by Neo, question 56). A retraction is a statement about the TEXT.
-    """
+    """`record_memory_file` replaces its row in place so a rewritten memory file does not accumulate..."""
     assert central.record_memory_file("PRs #1-#2 are unmerged.", project="proj_a",
                                       topic="project_tesis")
     original = central.search_knowledge("PRs #1-#2")[0]
@@ -251,8 +201,7 @@ def test_a_retracted_memory_mirror_does_not_capture_the_next_rewrite_in_place(ce
 
 
 def test_retraction_does_not_make_the_mirror_start_accumulating_rows(central):
-    """The replace-in-place behaviour is untouched for the ordinary case: rewriting a
-    memory file that was never retracted still updates ONE row."""
+    """The replace-in-place behaviour is untouched for the ordinary case: rewriting a memory file that was..."""
     for text in ("first version", "second version", "third version"):
         central.record_memory_file(text, project="proj_a", topic="project_tesis")
 
@@ -263,7 +212,7 @@ def test_retraction_does_not_make_the_mirror_start_accumulating_rows(central):
     assert rows[0]["retired_at"] is None
 
 
-# -- the CLI ---------------------------------------------------------------------------
+# -- the CLI
 
 
 def _run(argv: list[str], capsys) -> tuple[int, str, str]:

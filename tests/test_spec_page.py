@@ -1,9 +1,4 @@
-"""The stdlib markdown renderer behind the spec page — escape-first, subset only.
-
-§2 of docs/superpowers/specs/2026-09-28-a-feature-spec-you-can-open.md. The security
-property under test is the ORDER: the whole document is escaped before a single rule
-runs, so the only markup in the output is markup this module emitted.
-"""
+"""The stdlib markdown renderer behind the spec page — escape-first, subset only (docs/superpowers/specs/2026-09-28-a-feature-spec-you-can-open.md)"""
 
 from __future__ import annotations
 
@@ -12,7 +7,7 @@ from jarvis.ui import markdown
 
 
 def test_escape_first_leaves_no_live_markup():
-    """Test 2 of the spec's Tests section: planner prose is inert."""
+    """Test 2 of the spec's Tests section: planner prose is inert"""
     doc = (
         "## Threats\n\n"
         "<script>alert(1)</script>\n\n"
@@ -21,9 +16,7 @@ def test_escape_first_leaves_no_live_markup():
     )
     out = markdown.render(doc)
 
-    # Spec test 2, with its one assertion stated the only way escape-first can satisfy
-    # it: `onerror=` survives as TEXT (that is what escaping does), so what must not
-    # exist is a tag carrying it. No `<script`, no `<img`, no `javascript:` in an href.
+    # Spec test 2, with its one assertion stated the only way escape-first can satisfy it: `onerror=`...
     assert "<script" not in out
     assert "<img" not in out
     assert "onerror" not in out.replace("&lt;img src=x onerror=alert(1)&gt;", "")
@@ -40,8 +33,7 @@ def test_autolinks_only_http_and_https():
 
 
 def test_an_autolink_stops_at_an_escaped_quote_and_keeps_a_real_ampersand():
-    """The pattern runs over ESCAPED text, so `'` is `&#x27;` by then: without the
-    distinction, `https://x.com's` puts the entity inside the href."""
+    """The pattern runs over ESCAPED text"""
     out = markdown.render("see https://x.com/a's page and https://x.com/q?a=1&b=2 too")
 
     assert '<a href="https://x.com/a">' in out
@@ -95,7 +87,7 @@ def test_slug_folds_accents_and_section_marks():
 
 
 def test_slug_collisions_first_wins_bare():
-    """Test 5: GitHub's rule, and `render` and `anchor_for` must agree on it."""
+    """Test 5: GitHub's rule, and `render` and `anchor_for` must agree on it"""
     doc = "## Data model\n\nfirst\n\n## Data model\n\nsecond\n"
 
     assert [s for _t, s in markdown.anchors(doc)] == ["data-model", "data-model-1"]
@@ -105,13 +97,7 @@ def test_slug_collisions_first_wins_bare():
 
 
 def test_a_hash_comment_inside_a_fence_does_not_shift_every_later_id():
-    """A `#` line in fenced bash is a HEADING_RE match `render` never emits.
-
-    `anchors()` must keep counting it — `sections.find_heading` indexes into the same
-    list — so `render` looks its slug up BY LINE instead of consuming an iterator.
-    Without that, one shell comment sends every `#anchor` deep link below it to the
-    wrong section, and our own specs are full of fenced bash.
-    """
+    """A `#` line in fenced bash is a HEADING_RE match `render` never emits"""
     doc = "## Intro\n\n```bash\n# install things\n```\n\n## Data model\n\ntext\n"
     out = markdown.render(doc)
 
@@ -127,7 +113,7 @@ def test_anchor_for_uses_the_one_matcher():
     assert markdown.anchor_for(doc, "2") == "2-data-model"
     assert markdown.anchor_for(doc, "data model") == "2-data-model"
     assert markdown.anchor_for(doc, "no such thing") is None
-    # And it is literally `sections.find_heading`, never a second rule.
+    # And it is literally `sections.find_heading`, never a second rule
     assert sections.find_heading(doc, "2") == 1
 
 

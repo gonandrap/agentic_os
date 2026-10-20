@@ -1,4 +1,4 @@
-"""Web UI tests: pages render, actions call the same ops as the CLI."""
+"""Web UI tests: pages render, actions call the same ops as the CLI"""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ def daemon(catalog_file):
 
 @pytest.fixture()
 def gated_catalog(tmp_path, project):
-    """A catalog whose only project gates every privileged action."""
+    """A catalog whose only project gates every privileged action"""
     data = {
         "os": {"defaults": {"model": "sonnet"},
                "notifications": {"sinks": ["log"]}},
@@ -47,7 +47,7 @@ def gated_catalog(tmp_path, project):
 
 @pytest.fixture()
 def gated(jarvis_home, fake_claude, gated_catalog, project):
-    """A started OS with a gated project, a dispatched work order, and a browser."""
+    """A started OS with a gated project, a dispatched work order, and a browser"""
     ops.start_os(str(gated_catalog), foreground=True)
     daemon = Daemon(load_catalog(gated_catalog))
     wo = ops.create_work_order("proj_a", "ship version 1.2.3")
@@ -63,7 +63,7 @@ def gated(jarvis_home, fake_claude, gated_catalog, project):
             self.client = TestClient(create_app(), follow_redirects=False)
 
         def request(self, command="./scripts/shipit.sh", why="please"):
-            """File a gate request and return the approval row."""
+            """File a gate request and return the approval row"""
             ops.request_gate_approval(self.wo_id, command, why=why)
             store = ProjectStore(project)
             try:
@@ -89,8 +89,7 @@ def test_dashboard_renders_quiet(client):
 
 
 def test_dashboard_auto_refresh_is_scoped_to_the_live_regions(client):
-    """A whole-page refresh wipes a half-typed work order, so the meta tag is
-    noscript-only and JS swaps just the live regions."""
+    """A whole-page refresh wipes a half-typed work order"""
     r = client.get("/")
     assert '<noscript><meta http-equiv="refresh"' in r.text
     assert r.text.count('http-equiv="refresh"') == 1
@@ -116,12 +115,7 @@ def test_create_wo_via_ui_marks_origin(client, project):
 
 
 def test_waiting_input_wo_shows_resume_hint_and_auto_action(client, daemon, project):
-    """A worker blocked on a permission prompt can't be approved from the web UI, so the
-    page surfaces the native escape hatch plus a resume-in-auto action.
-
-    `claude --resume`, not `claude attach`: attaching is a background-agent verb, and
-    worker turns are headless — between turns nothing owns the session, so it opens
-    directly."""
+    """A worker blocked on a permission prompt can't be approved from the web UI"""
     wo = ops.create_work_order("proj_a", "blocked task")
     daemon.tick()
     store = ProjectStore(project)
@@ -142,9 +136,7 @@ def test_waiting_input_wo_shows_resume_hint_and_auto_action(client, daemon, proj
 
 
 def test_wo_page_shows_the_whole_session_id(client, daemon, project):
-    """The session id is a thing to COPY, not to recognise — an abbreviation is
-    useless to `claude --resume`, so the metadata line carries every character
-    whatever the work order's status."""
+    """The session id is a thing to COPY, not to recognise"""
     sid = "8a53d05e-6f2b-4c19-9a7d-3e51b0c4f7d2"
     wo = ops.create_work_order("proj_a", "long-running task")
     daemon.tick()
@@ -158,10 +150,7 @@ def test_wo_page_shows_the_whole_session_id(client, daemon, project):
 
 def test_resume_command_is_offered_only_when_no_turn_can_be_in_flight(
         client, daemon, project):
-    """Settled work orders get the whole `claude --resume` line, ready to run — that
-    is what the id is FOR. An active one gets the id and no invitation: a headless
-    turn may be running, and a second driver on one session is how a work order ends
-    up forked off a dead conversation (kn-04e97789)."""
+    """Settled work orders get the whole `claude --resume` line, ready to run — that is what the id is FOR"""
     sid = "8a53d05e-6f2b-4c19-9a7d-3e51b0c4f7d2"
     wo = ops.create_work_order("proj_a", "some task")
     daemon.tick()
@@ -182,13 +171,7 @@ def test_resume_command_is_offered_only_when_no_turn_can_be_in_flight(
 
 
 def test_a_work_order_parked_on_neo_is_not_called_blocked(client, daemon, project):
-    """The same page, the same status, a different wait — GitHub issue 100.
-
-    `waiting_input` is where `jarvis wo ask` parks a work order too, and the block above
-    told the reader it was blocked on a permission prompt whenever it was in fact waiting
-    on Neo, over a button that flips `auto` to `auto`. What the page owes here is who has
-    it.
-    """
+    """The same page, the same status, a different wait — GitHub issue 100"""
     wo = ops.create_work_order("proj_a", "build the exporter")
     daemon.tick()
     ops.ask_question(wo["id"], "Should the export default to CSV or JSON?")
@@ -202,8 +185,7 @@ def test_a_work_order_parked_on_neo_is_not_called_blocked(client, daemon, projec
 
 
 def test_wo_page_anchors_pending_at_what_needs_the_user(client, daemon):
-    """Notifications deep-link to #pending; it must land on the live ask, and the
-    page must never emit two of them."""
+    """Notifications deep-link to #pending"""
     wo = ops.create_work_order("proj_a", "risky change")
     daemon.tick()
 
@@ -218,13 +200,11 @@ def test_wo_page_anchors_pending_at_what_needs_the_user(client, daemon):
     assert '<h2 id="pending">Assumptions pending your review</h2>' in review
 
 
-# -- the work order page reads as three alternatives, not one long scroll ---------------
+# -- the work order page reads as three alternatives, not one long scroll
 
 
 def test_the_three_readings_are_tabs_and_the_asks_are_not(client, daemon, project):
-    """Conversation, spend and timeline are alternatives — one tab strip, one panel
-    open. What the page ASKS of the reader stays outside: an ask behind a tab is an ask
-    that does not happen."""
+    """Conversation, spend and timeline are alternatives — one tab strip, one panel open"""
     wo = ops.create_work_order("proj_a", "risky change")
     daemon.tick()
     ops.assume(wo["id"], "assumed the API is v2")
@@ -233,16 +213,15 @@ def test_the_three_readings_are_tabs_and_the_asks_are_not(client, daemon, projec
     page = client.get(f"/wo/proj_a/{wo['id']}").text
     head, tabs = page.split('<div class="tabbed"', 1)
     assert 'id="tab-conversation"' in tabs and 'id="tab-timeline"' in tabs
-    # Exactly one panel starts open, and it is the conversation.
+    # Exactly one panel starts open, and it is the conversation
     assert tabs.count('class="tabpanel on"') == 1
     assert 'class="tabpanel on" id="tab-conversation"' in tabs
-    # The pending-assumptions panel is above the strip, where it cannot be hidden.
+    # The pending-assumptions panel is above the strip, where it cannot be hidden
     assert "Assumptions pending your review" in head
 
 
 def test_the_page_still_reads_without_the_tab_script(client, daemon):
-    """Nothing is hidden until the script marks the container `.js`, so a browser that
-    never runs it gets the stack the page used to be rather than one third of it."""
+    """Nothing is hidden until the script marks the container `.js`"""
     wo = ops.create_work_order("proj_a", "risky change")
     daemon.tick()
     page = client.get(f"/wo/proj_a/{wo['id']}").text
@@ -253,8 +232,7 @@ def test_the_page_still_reads_without_the_tab_script(client, daemon):
 
 def test_a_neo_answer_is_one_line_on_the_page_and_credited_to_neo(client, daemon,
                                                                   project):
-    """It used to be two — the "Neo answered the worker" event and the message under
-    it — and the message called Neo "you"."""
+    """It used to be two — the "Neo answered the worker" event and the message under it"""
     from jarvis.project_store import ProjectStore as _PS
 
     wo = ops.create_work_order("proj_a", "risky change")
@@ -268,11 +246,10 @@ def test_a_neo_answer_is_one_line_on_the_page_and_credited_to_neo(client, daemon
 
     page = client.get(f"/wo/proj_a/{wo['id']}").text
     said, story = page.split('id="tab-timeline"', 1)
-    # The conversation credits it correctly, and is the only place the words appear.
+    # The conversation credits it correctly, and is the only place the words appear
     assert "neo → worker" in said
     assert said.count("[Neo] go with CSV") == 1
-    # In the timeline the answer is ONE entry, saying what happened and pointing at the
-    # words rather than repeating them a tab away.
+    # In the timeline the answer is ONE entry
     assert story.count("Neo answered the worker") == 1
     assert "[Neo] go with CSV" not in story
     assert "in the conversation" in story
@@ -286,21 +263,14 @@ def test_a_question_on_the_timeline_is_a_link_to_the_question(client, daemon, pr
     page = client.get(f"/wo/proj_a/{wo['id']}").text
     said, story = page.split('id="tab-timeline"', 1)
     assert f'/neo/question/{result["question_id"]}' in story
-    # ...and the question itself is NOT reprinted beside the link. It is a turn in the
-    # conversation, which is where the answer to it will land.
+    # ...and the question itself is NOT reprinted beside the link
     assert "Should the export default to CSV or JSON?" not in story
     assert "Should the export default to CSV or JSON?" in said
     assert "worker → Neo" in said
 
 
 def test_an_alarm_on_the_timeline_is_a_link_to_that_alarm(client, daemon, project):
-    """§4 of docs/superpowers/specs/2026-08-31-the-supervisor.md.
-
-    The exact href, not `"al-" in page`: the id is printed on the page by the standing
-    of the alarm itself, so the loose assertion passes with no link rendered at all.
-    `/alarms/<project>/<al-id>` is the shape §5 builds and 404s until it does — the
-    assertion that it RESOLVES is that section's, and deliberately not here.
-    """
+    """§4 of docs/superpowers/specs/2026-08-31-the-supervisor.md"""
     wo = ops.create_work_order("proj_a", "export citations")
     daemon.tick()
     _, path, _ = ops.find_work_order(wo["id"], "proj_a")
@@ -318,8 +288,7 @@ def test_an_alarm_on_the_timeline_is_a_link_to_that_alarm(client, daemon, projec
     page = client.get(f"/wo/proj_a/{wo['id']}").text
     said, story = page.split('id="tab-timeline"', 1)
     assert f'href="/alarms/proj_a/{alarm["id"]}"' in story
-    # The note is speech and lives in the conversation, once. The verdict's reason is
-    # the record's and lives on the timeline, once.
+    # The note is speech and lives in the conversation, once
     assert said.count("it is re-running the suite; nothing is stuck") == 1
     assert "it is re-running the suite; nothing is stuck" not in story
     assert "supervisor → you" in said
@@ -340,10 +309,7 @@ def test_the_question_page_holds_the_question_and_its_answer(client, daemon, pro
 
 
 def test_a_triage_question_sends_the_reader_to_the_issue_not_the_backlog(client):
-    """No worker exists to answer a `triage` question (issue #240), so the page offers no
-    reply box — and what it offers instead has to be a route that EXISTS. The filing
-    stopped creating a backlog item (kn-c5725f1f), so `promote it from the backlog` was
-    pointing at a queue that is no longer written."""
+    """No worker exists to answer a `triage` question (issue #240), so the page offers no reply box"""
     import json as _json
 
     from jarvis.neo_store import NeoStore
@@ -359,8 +325,7 @@ def test_a_triage_question_sends_the_reader_to_the_issue_not_the_backlog(client)
 
     page = client.get(f"/neo/question/{q['id']}").text
     assert "jarvis issues start" in page and url in page
-    # The nav bar still links the backlog page; what must be gone is this block sending
-    # the reader there as the resolution.
+    # The nav bar still links the backlog page
     assert "from the backlog" not in page and "backlog promote" not in page
     assert 'action="/neo/' not in page, "there is nobody to reply to"
 
@@ -372,8 +337,7 @@ def test_a_question_that_does_not_exist_says_so(client):
 
 
 def test_the_neo_stats_page_renders_an_empty_fleet_without_a_fabricated_zero(client):
-    """§6 of docs/superpowers/specs/2026-10-01-neo-observability.md: its own page, no new nav entry,
-    and an absent ratio reads "not recorded" rather than 0%."""
+    """§6 of docs/superpowers/specs/2026-10-01-neo-observability.md: its own page"""
     page = client.get("/neo/stats")
     assert page.status_code == 200
     assert '<span class="sub">not recorded</span>' in page.text
@@ -414,8 +378,7 @@ def test_the_neo_stats_page_prints_the_counts_and_the_cause_split(client, daemon
 
 def test_the_stats_page_reads_the_causes_as_three_answers_to_who_decided(client, daemon,
                                                                         project):
-    """Neo, question 1170: an override is a THIRD answer to "who decided", and the class
-    nothing can write is named rather than left to vanish."""
+    """Neo, question 1170: an override is a THIRD answer to "who decided\""""
     from jarvis import ops as ops_mod
     from jarvis.neo_store import NeoStore
 
@@ -438,12 +401,7 @@ def test_the_stats_page_reads_the_causes_as_three_answers_to_who_decided(client,
 
 
 def test_the_stats_page_renders_spend_and_latency_over_several_neo_kinds(client, project):
-    """Two kinds is the case the page is FOR, and it is where sorting by a bucket breaks:
-    `dictsort(by='value')` compares the bucket dicts themselves and raises
-    `TypeError: '<' not supported between instances of 'dict' and 'dict'`.
-
-    Found by scripts/screenshot_neo_stats.py — every earlier test seeded at most one kind.
-    """
+    """Two kinds is the case the page is FOR"""
     central = CentralStore()
     try:
         central.upsert_project("proj_a", str(project))
@@ -465,8 +423,7 @@ def test_the_stats_page_renders_spend_and_latency_over_several_neo_kinds(client,
 
 
 def test_the_stats_page_trend_counts_stay_on_one_line(client, daemon, project):
-    """wo-327f211c: at 1280px "10 asked · 1 escalated" wrapped inside a 150px span, so the
-    trend block rendered at twice its height. bill.html:110 idiom is white-space: nowrap."""
+    """wo-327f211c: at 1280px "10 asked · 1 escalated" wrapped inside a 150px span"""
     wo = ops.create_work_order("proj_a", "pick a format")
     daemon.tick()
     ops.ask_question(wo["id"], "which format?")
@@ -481,7 +438,7 @@ def test_the_stats_page_trend_counts_stay_on_one_line(client, daemon, project):
 
 def test_the_stats_page_trend_row_carries_the_unreachable_count_and_rate(client, daemon,
                                                                         project):
-    """Spec §4: a bar may never contradict the counts beside it."""
+    """Spec §4: a bar may never contradict the counts beside it"""
     from jarvis.neo_store import NeoStore
 
     wo = ops.create_work_order("proj_a", "pick a format")
@@ -510,11 +467,7 @@ def test_an_unregistered_project_on_the_stats_page_is_an_error_not_a_crash(clien
 
 
 def test_the_question_page_reviews_the_answer_and_stays_put(client, daemon, project):
-    """The timeline sends the reader here; the decision has to be here too.
-
-    `/neo` is a list with no anchor, so the link this page used to carry landed them on
-    somebody else's question — reported by the user against wo-01d30340.
-    """
+    """The timeline sends the reader here; the decision has to be here too"""
     wo = ops.create_work_order("proj_a", "pick a format")
     daemon.tick()
     ops.ask_question(wo["id"], "CSV or JSON?")
@@ -562,7 +515,7 @@ def test_the_question_page_answers_an_escalation_and_stays_put(client, daemon, p
 
 
 def test_a_neo_decision_will_not_redirect_off_site(client, daemon, project):
-    """`next` is attacker-settable, exactly as on the gates form."""
+    """`next` is attacker-settable, exactly as on the gates form"""
     wo = ops.create_work_order("proj_a", "pick a format")
     daemon.tick()
     ops.ask_question(wo["id"], "CSV or JSON?")
@@ -574,8 +527,7 @@ def test_a_neo_decision_will_not_redirect_off_site(client, daemon, project):
 
 
 def test_a_refused_neo_decision_flashes_on_the_tab_it_came_from(client, daemon, project):
-    """`?error=` has to precede `#tab-review` — after it the browser reads the flash as
-    part of the fragment and `base.html` renders nothing."""
+    """`?error=` has to precede `#tab-review`"""
     wo = ops.create_work_order("proj_a", "pick a format")
     daemon.tick()
     ops.ask_question(wo["id"], "CSV or JSON?")
@@ -587,8 +539,7 @@ def test_a_refused_neo_decision_flashes_on_the_tab_it_came_from(client, daemon, 
 
 
 def test_the_question_page_sends_a_gate_request_to_the_gates_tab(gated):
-    """An approval question carries a gate the textarea cannot open — the branch
-    `neo.html` has always had, now that this page renders the controls too."""
+    """An approval question carries a gate the textarea cannot open"""
     gated.request()
     gated.daemon._neo_drain()  # the fake model escalates by default
 
@@ -599,11 +550,7 @@ def test_the_question_page_sends_a_gate_request_to_the_gates_tab(gated):
 
 def test_an_escalated_assumption_sends_the_user_to_the_work_order_not_the_worker(
         client, daemon, project):
-    """Auto-review's half of the same rule. Nobody ASKED this question — the OS filed it
-    against an assumption a worker that has long since finished recorded, so the reply
-    box would deliver the user's words into a work order nobody asked to reopen.
-    `ops.neo_answer_escalated` refuses it; this is the half that stops them typing into
-    a box that then errors."""
+    """Auto-review's half of the same rule"""
     from jarvis.neo_store import NeoStore
 
     wo = ops.create_work_order("proj_a", "export the schedule")
@@ -626,8 +573,7 @@ def test_an_escalated_assumption_sends_the_user_to_the_work_order_not_the_worker
 
 
 def test_assumptions_are_numbered_to_match_the_timeline(client, daemon, project):
-    """The timeline says "Assumption #2 recorded" and never the text, so the number is
-    the only thing tying an entry to the paragraph it is about."""
+    """The timeline says "Assumption #2 recorded" and never the text"""
     wo = ops.create_work_order("proj_a", "risky change")
     daemon.tick()
     ops.assume(wo["id"], "assumed the API is v2")
@@ -637,14 +583,12 @@ def test_assumptions_are_numbered_to_match_the_timeline(client, daemon, project)
     page = client.get(f"/wo/proj_a/{wo['id']}").text
     assert "#1" in page and "#2" in page
     assert "Assumption #1 recorded" in page and "Assumption #2 recorded" in page
-    # The text is written once, in the panel that asks for a decision on it.
+    # The text is written once, in the panel that asks for a decision on it
     assert page.count("assumed the API is v2") == 1
 
 
 def test_a_reviewed_assumption_is_still_readable_by_its_number(client, daemon, project):
-    """The timeline names an assumption and says nothing else about it, so the number
-    has to stay resolvable after the decision — a panel that emptied on review would
-    leave "Assumption #1 recorded" pointing at nothing."""
+    """The timeline names an assumption and says nothing else about it"""
     wo = ops.create_work_order("proj_a", "risky change")
     daemon.tick()
     ops.assume(wo["id"], "assumed the API is v2")
@@ -655,20 +599,14 @@ def test_a_reviewed_assumption_is_still_readable_by_its_number(client, daemon, p
     assert "Assumption #1 recorded" in page
     assert "assumed the API is v2" in page
     assert "accepted" in page
-    # ...and the decision is no longer being asked for.
+    # ...and the decision is no longer being asked for
     assert "Accept all" not in page
     assert "Assumptions the worker recorded" in page
 
 
 def test_the_page_says_which_assumptions_the_os_decided_and_which_you_did(client,
                                                                           project):
-    """THE post-condition of auto-review, on the surface somebody actually reads.
-
-    The OS can settle an assumption itself now. A badge saying only "accepted" would
-    credit a machine verdict to the reader, and the reader has no other way to tell:
-    both rows look identical once the pending panel is gone. So the page must name the
-    decider on each one, separately — the two must not be able to read the same.
-    """
+    """THE post-condition of auto-review, on the surface somebody actually reads"""
     from jarvis.project_store import ASSUMPTION_DECIDER_OS, ASSUMPTION_DECIDER_USER
 
     wo = ops.create_work_order("proj_a", "task with two judgement calls")
@@ -682,29 +620,20 @@ def test_the_page_says_which_assumptions_the_os_decided_and_which_you_did(client
                             reason="fine")
     store.set_status(wo["id"], "needs_review")
 
-    # Whitespace-normalised: the claim is about the WORDS on the badge, and a reviewer
-    # reindenting the template must not have to come and fix this test.
+    # Whitespace-normalised: the claim is about the WORDS on the badge
     page = " ".join(client.get(f"/wo/proj_a/{wo['id']}").text.split())
     assert "accepted by the OS (neo, claude-opus-5)" in page
     assert "accepted by you" in page
-    # Not just "both phrases appear somewhere": the model is named on the OS's row, and
-    # the user's row does not borrow it.
+    # Not just "both phrases appear somewhere": the model is named on the OS's row
     assert page.count("the OS (neo, claude-opus-5)") == 1
     assert page.count("claude-opus-5") == 1
-    # ...and the reason the OS gave is on the row it decided, as TEXT: it used to be a
-    # `title=` tooltip, which is a place nobody looks (GitHub issue #712).
+    # ...and the reason the OS gave is on the row it decided (#712)
     assert "a naming convention, not a decision" in page
     assert 'title="a naming convention, not a decision"' not in page
 
 
 def test_a_pending_assumption_says_what_the_os_did_with_it(client, project):
-    """THE DEFECT of issue #712: an assumption Neo had escalated and one the keyword net
-    held both rendered as text and an age, indistinguishable from one nobody reviewed.
-
-    The events are written by hand here rather than driven through the daemon — the
-    claim is about the PAGE, and `tests/test_autoreview.py` owns the claim about which
-    event the mechanism writes.
-    """
+    """THE DEFECT of issue #712: an assumption Neo had escalated and one the keyword net held both..."""
     wo = ops.create_work_order("proj_a", "task with three judgement calls")
     store = ProjectStore(project)
     escalated = store.add_assumption(wo["id"], "changed the CLI's default output")
@@ -718,21 +647,18 @@ def test_a_pending_assumption_says_what_the_os_did_with_it(client, project):
         "reason": "assumption #2 mentions 'production' — the OS does not decide those"})
     store.set_status(wo["id"], "needs_review")
 
-    # Unescaped: the quoted marker is the readable half of a hold and Jinja spells it
-    # `&#39;`, which is the browser's business and not this claim's.
+    # Unescaped: the quoted marker is the readable half of a hold and Jinja spells it `&#39;`
     page = html.unescape(" ".join(client.get(f"/wo/proj_a/{wo['id']}").text.split()))
 
     assert "Neo escalated (question 47): this is a surface others call" in page
     assert '/neo/question/47' in page
     assert "Held by the OS — mentions 'production'" in page
-    # The third assumption grows nothing: silence and a hold are different facts.
+    # The third assumption grows nothing: silence and a hold are different facts
     assert page.count("Held by the OS") == 1 and page.count("Neo escalated") == 1
 
 
 def test_the_page_and_jarvis_wo_show_cannot_disagree_about_who_decided(client, project):
-    """One renderer, asserted as one renderer. `ops.assumption_decider` is what the CLI
-    prints and what the badge prints; a second spelling on either side is the failure
-    this pins, because the one that drops the "the OS" is the one somebody reads."""
+    """One renderer, asserted as one renderer"""
     from jarvis.project_store import ASSUMPTION_DECIDER_OS
 
     wo = ops.create_work_order("proj_a", "task with a judgement call")
@@ -751,14 +677,7 @@ def test_the_page_and_jarvis_wo_show_cannot_disagree_about_who_decided(client, p
 
 def test_a_model_the_os_did_not_record_is_said_so_rather_than_left_blank(client,
                                                                         project):
-    """A row written by an older OS, or by a path that forgot to pass the model. "the OS
-    (neo, )" reads as a rendering bug and invites the reader to ignore it; the honest
-    phrase says the attribution is real and the model is what is missing.
-
-    This is also the assertion that DISCRIMINATES: the badge used to spell the
-    attribution inline and rendered `?` here, where `jarvis wo show` said "model not
-    recorded". Two spellings of the same fact; this test fails if a second one returns.
-    """
+    """A row written by an older OS, or by a path that forgot to pass the model"""
     from jarvis.project_store import ASSUMPTION_DECIDER_OS
 
     wo = ops.create_work_order("proj_a", "task with a judgement call")
@@ -773,10 +692,7 @@ def test_a_model_the_os_did_not_record_is_said_so_rather_than_left_blank(client,
 
 
 def test_the_auto_review_line_shows_before_there_is_a_pull_request(client, project):
-    """Auto-review is not a fact about a pull request: it fires on `needs_review`, which
-    is normally reached before one exists, and a HOLD is exactly what the user needs to
-    see at that moment. This line once rendered only inside the `pr_url` block, and 109
-    UI tests passed with it visible to nobody."""
+    """Auto-review is not a fact about a pull request: it fires on `needs_review`"""
     wo = ops.create_work_order("proj_a", "task with a risky judgement call")
     store = ProjectStore(project)
     store.add_assumption(wo["id"], "reused the production API key")
@@ -793,9 +709,7 @@ def test_the_auto_review_line_shows_before_there_is_a_pull_request(client, proje
 
 
 def test_the_banner_stops_claiming_a_decision_is_pending(client, project):
-    """docs/superpowers/specs/2026-09-25-a-decided-assumption-is-not-left-with-you.md:
-    the escalation stays on the record, and the claim that the user still owes a decision
-    does not survive them taking it."""
+    """docs/superpowers/specs/2026-09-25-a-decided-assumption-is-not-left-with-you.md: the escalation..."""
     wo = ops.create_work_order("proj_a", "task with a judgement call")
     store = ProjectStore(project)
     aid = store.add_assumption(wo["id"], "changed the CLI's default output")
@@ -816,7 +730,7 @@ def test_the_banner_stops_claiming_a_decision_is_pending(client, project):
 
 def test_wo_show_carries_every_assumption_with_its_number(jarvis_home, fake_claude,
                                                           catalog_file, capsys):
-    """`jarvis wo show` speaks the same record as the page, for the same reason."""
+    """`jarvis wo show` speaks the same record as the page, for the same reason"""
     import json as _json
 
     from jarvis import cli
@@ -865,7 +779,7 @@ def test_send_message_via_ui(client, project):
 
 def _add_session(fake_claude, project, sid="adhoc-9", name="manual poking",
                  state="working"):
-    """A Claude session the user started in the project directory."""
+    """A Claude session the user started in the project directory"""
     import json
     sessions = fake_claude.sessions
     sessions.append({"id": "zz", "sessionId": sid, "cwd": str(project),
@@ -876,8 +790,7 @@ def _add_session(fake_claude, project, sid="adhoc-9", name="manual poking",
 
 def test_your_own_sessions_are_offered_for_injection(client, daemon, fake_claude,
                                                      project):
-    """The dashboard affordance for GitHub issue 47: the project page offers to take a
-    session the user started, and until they say so it stays off the books."""
+    """The dashboard affordance for GitHub issue 47: the project page offers to take a session the user..."""
     _add_session(fake_claude, project)
     daemon.tick_count = 0
     daemon.tick()
@@ -895,8 +808,7 @@ def test_your_own_sessions_are_offered_for_injection(client, daemon, fake_claude
 
 def test_the_session_panel_never_breaks_the_page(client, fake_claude, project,
                                                  monkeypatch):
-    """It shells out to `claude agents --json` — the one thing on any page that does.
-    A CLI that is slow, broken or missing costs the panel, never the page."""
+    """It shells out to `claude agents --json` — the one thing on any page that does"""
     from jarvis import claude_cli
 
     def boom(*a, **k):
@@ -930,8 +842,7 @@ def test_inbox_page_and_ack(client, daemon, project):
 
 
 def test_dashboard_clears_unacked_banner_after_ack(client, daemon, project):
-    """Acking every inbox item must clear the "unacked notification" banner on
-    the main dashboard, not just the /inbox page."""
+    """Acking every inbox item must clear the "unacked notification" banner on the main dashboard"""
     store = ProjectStore(project)
     store.add_notification("disk almost full", level="critical")
     daemon.tick()
@@ -946,9 +857,7 @@ def test_dashboard_clears_unacked_banner_after_ack(client, daemon, project):
 
 
 def test_dashboard_is_never_cached(client):
-    """The dashboard state (unacked count, attention items) changes on every
-    action, so browsers must always revalidate it — never serve a stale copy
-    from disk cache or history (bfcache) after the user navigates back."""
+    """The dashboard state (unacked count"""
     r = client.get("/")
     assert r.headers.get("cache-control", "") == "no-store"
 
@@ -978,9 +887,7 @@ def test_knowledge_page(client):
 
 
 def test_knowledge_page_reports_what_the_base_costs_and_who_reads_it(client):
-    """The page used to answer "what do we know" and nothing about what that is worth:
-    no cost, no reads, no unopened entries. Both halves render together or the page is
-    back to being a wall of text."""
+    """The page used to answer "what do we know" and nothing about what that is worth: no cost"""
     central = CentralStore()
     row = central.add_knowledge("A LESSON WITH A FIRST LINE LONG ENOUGH TO BE CUT. "
                                 + "padding " * 60, project="proj_a", topic="tooling")
@@ -1005,9 +912,7 @@ def test_unknown_project_and_wo(client):
 
 
 def test_neo_tab_lists_questions_still_with_neo(client, daemon, project):
-    """A queued question used to appear only as a number in the counts line, so a
-    Neo that had stopped draining was indistinguishable from a Neo with nothing to
-    do — the page said "Neo hasn't handled anything yet" while a worker sat parked."""
+    """A queued question used to appear only as a number in the counts line"""
     wo = ops.create_work_order("proj_a", "pick a format")
     daemon.tick()
     ops.ask_question(wo["id"], "CSV or JSON?")
@@ -1020,9 +925,7 @@ def test_neo_tab_lists_questions_still_with_neo(client, daemon, project):
 
 
 def test_neo_tab_shows_a_question_stuck_mid_answer(client, daemon, project):
-    """`claim_next` flips a question to `answering` and only a completed drain moves
-    it on; a crash in between strands it, since neo_tick only ever looks at `queued`.
-    Stranded is exactly when the user needs to see it."""
+    """`claim_next` flips a question to `answering` and only a completed drain moves it on"""
     from jarvis.neo_store import NeoStore
 
     wo = ops.create_work_order("proj_a", "pick a format")
@@ -1066,22 +969,14 @@ def test_neo_tab_review_flow(client, daemon, project):
     assert "Always CSV" in page.text
 
 
-#: A question of the shape that made this necessary — Neo question #53 was ~7,000
-#: characters of feature-order brief, rendered inline, and the user could not keep up.
+#: A question of the shape that made this necessary (#53)
 LONG_QUESTION = ("Should the exporter emit CSV or JSON, given the constraints below? "
                  * 30)
 
 
 def test_neo_tab_shortens_an_over_long_question_and_keeps_the_full_text_one_click_away(
         client, daemon, project):
-    """The whole feature, end to end, with its control.
-
-    The page must show the SHORTENED question — and the verbatim text must still be
-    reachable from it. Asserting only the first half cannot tell "correctly shortened"
-    from "the question was lost", which is the failure that would actually hurt: the
-    user reviews Neo's answers from this page, and an answer to a question they can no
-    longer read is not reviewable.
-    """
+    """The whole feature, end to end, with its control"""
     wo = ops.create_work_order("proj_a", "pick a format")
     daemon.tick()
     ops.ask_question(wo["id"], LONG_QUESTION)
@@ -1093,7 +988,7 @@ def test_neo_tab_shortens_an_over_long_question_and_keeps_the_full_text_one_clic
     assert "digest of:" in page                       # the shortened rendering
     assert "cut down to the decision" in page            # ...and it says that it is one
     assert "i-have-adhd" in page                      # attribution for the style
-    # THE CONTROL: the verbatim question is on the page, inside the disclosure.
+    # THE CONTROL: the verbatim question is on the page, inside the disclosure
     assert "Full question context sent to Neo" in page
     body = page.split("Full question context sent to Neo", 1)[1]
     assert LONG_QUESTION.strip() in body
@@ -1102,10 +997,7 @@ def test_neo_tab_shortens_an_over_long_question_and_keeps_the_full_text_one_clic
 
 def test_neo_tab_shows_a_short_question_in_full_and_still_offers_the_disclosure(
         client, daemon, project):
-    """No digest, no loss: a question under the threshold renders exactly as it did
-    before this existed. The disclosure is there anyway — it carries the work-order
-    context, which the page never shows otherwise, and a control that appears only
-    sometimes is not one the reader learns to trust."""
+    """No digest, no loss: a question under the threshold renders exactly as it did before this existed"""
     wo = ops.create_work_order("proj_a", "pick a format")
     daemon.tick()
     ops.ask_question(wo["id"], "CSV or JSON?")
@@ -1122,7 +1014,7 @@ def test_neo_tab_shows_a_short_question_in_full_and_still_offers_the_disclosure(
 
 def test_neo_tab_falls_back_to_the_full_question_when_the_digest_failed(
         client, daemon, project):
-    """A recorded digest failure must render as today's page, not as a blank box."""
+    """A recorded digest failure must render as today's page, not as a blank box"""
     wo = ops.create_work_order("proj_a", "pick a format")
     daemon.tick()
     ops.ask_question(wo["id"], LONG_QUESTION + " FORCE_DIGEST_FAIL")
@@ -1154,15 +1046,7 @@ def test_neo_tab_escalation_answer_flow(client, daemon, project):
 
 
 def test_neo_tab_shows_panel_deliberation_collapsed(client, daemon, project):
-    """The deliberation is on the page the user already reads, folded shut.
-
-    A tab of its own would be a new place to spend exactly the attention the panel
-    exists to protect, so this is a `<details>` on `/neo` and nothing more.
-
-    The marker is "Panel deliberation", NOT the bare word "panel": `neo.html` has used
-    a CSS class named `panel` for its generic box since long before this existed, so a
-    test keyed on that string would pass against an unchanged template.
-    """
+    """The deliberation is on the page the user already reads, folded shut"""
     from jarvis.neo_store import NeoStore
 
     wo = ops.create_work_order("proj_a", "pick a format")
@@ -1193,8 +1077,7 @@ def test_neo_tab_shows_panel_deliberation_collapsed(client, daemon, project):
 
 
 def test_neo_tab_labels_a_seat_scoped_learning(client):
-    """Unlabelled, a learning only one seat reads would display as a rule the whole of
-    Neo follows — the opposite of what it is."""
+    """Unlabelled, a learning only one seat reads would display as a rule the whole of Neo follows"""
     from jarvis.neo_store import NeoStore
 
     neo = NeoStore()
@@ -1227,8 +1110,7 @@ def test_gates_tab_is_empty_and_unbadged_when_nothing_is_gated(client):
 
 
 def test_gates_tab_shows_the_request_the_reviewer_saw(gated):
-    """Approving a bare command string is not a review. The page has to carry the
-    same case Neo read, or the user is rubber-stamping."""
+    """Approving a bare command string is not a review"""
     approval = gated.request(why="all tests pass, PR is merged")
     gated.daemon._neo_drain()  # the fake model escalates by default
 
@@ -1245,12 +1127,10 @@ def test_gates_tab_shows_the_request_the_reviewer_saw(gated):
 
 
 def test_gates_tab_explains_a_request_held_for_the_worker_s_case(gated):
-    """`awaiting_case` used to render as a badge word under "Decided" and nothing else —
-    a status the user could neither act on nor wait out. The report was literally "it is
-    not clear what the status is and how to proceed"."""
+    """`awaiting_case` used to render as a badge word under "Decided" and nothing else"""
     from jarvis.hooks import preflight_decision
 
-    # The attempt alone is what holds it: no case, no reviewer (gates.AWAITING_CASE).
+    # The attempt alone is what holds it: no case, no reviewer (gates.AWAITING_CASE)
     settings = json.loads(
         (gated.project / ".jarvis" / "worker-settings"
          / f"{gated.wo_id}.json").read_text())
@@ -1263,13 +1143,11 @@ def test_gates_tab_explains_a_request_held_for_the_worker_s_case(gated):
 
     assert "Awaiting the worker's case" in page
     assert "jarvis gate request" in page
-    # BOTH exits, here as everywhere a blocked worker's row is explained (spec §3) — the
-    # held row is the one place the page describes what the worker should do next.
+    # BOTH exits, here as everywhere a blocked worker's row is explained (spec §3)
     assert "jarvis gate contest" in page
     assert "No reviewer sees it yet" in page
     assert "gates.case_ttl_seconds" in page
-    # Not "Refused": the TTL abandons, and saying refused would promise a reviewer who
-    # never looked — the same false record `dismissed` exists to prevent (spec §4).
+    # Not "Refused": the TTL abandons, and saying refused would promise a reviewer who never looked
     assert "Abandoned automatically in" in page
     assert "Refused automatically" not in page
     assert f'id="gate-{gated.approval()["id"]}"' in page
@@ -1280,8 +1158,7 @@ def test_gates_tab_explains_a_request_held_for_the_worker_s_case(gated):
 
 
 def test_gate_pending_with_neo_costs_no_badge(gated):
-    """A request Neo is still reviewing is free by design — badging it would undo
-    the entire point of having Neo review it."""
+    """A request Neo is still reviewing is free by design"""
     gated.request()
     r = gated.client.get("/gates")
     assert "With Neo" in r.text
@@ -1321,8 +1198,7 @@ def test_approve_from_the_dashboard_opens_the_gate(gated):
 
 
 def test_deny_from_the_dashboard_needs_a_reason(gated):
-    """ops.decide_gate refuses a reasonless denial — the worker acts on that text.
-    The dashboard must surface the refusal rather than silently doing nothing."""
+    """ops.decide_gate refuses a reasonless denial — the worker acts on that text"""
     approval = gated.request()
     gated.daemon._neo_drain()
 
@@ -1342,8 +1218,7 @@ def test_deny_from_the_dashboard_needs_a_reason(gated):
 
 
 def test_gate_decision_returns_to_the_page_it_was_made_from(gated):
-    """Deciding from a work order should land back on that work order, and `next`
-    must not become an open redirect out of the dashboard."""
+    """Deciding from a work order should land back on that work order"""
     approval = gated.request()
     back = f"/wo/proj_a/{gated.wo_id}"
 
@@ -1365,8 +1240,7 @@ def test_gate_decision_returns_to_the_page_it_was_made_from(gated):
 
 
 def test_dismiss_from_the_dashboard_clears_the_command_without_approving_it(gated):
-    """The third button. It has to do what approve does to the worker and none of what
-    approve does to the record."""
+    """The third button"""
     from jarvis.hooks import preflight_decision
 
     command = "uv run pytest tests/test_release_staging.py -k shipit"
@@ -1391,15 +1265,14 @@ def test_dismiss_from_the_dashboard_clears_the_command_without_approving_it(gate
     assert result["hookSpecificOutput"]["permissionDecision"] == "allow"
 
     page = gated.client.get("/gates").text
-    # Listed apart from the verdicts, with the rate, and NOT counted as approved.
+    # Listed apart from the verdicts, with the rate, and NOT counted as approved
     assert "Not gated actions — the OS got these wrong" in page
     assert "false-positive rate: 1 of 1 (100%)" in page
     assert "no gate has been decided yet" in page
 
 
 def test_dismiss_from_the_dashboard_needs_a_reason(gated):
-    """The reason is the defect report on the recogniser — the only thing attached to
-    the false-positive count that says what actually went wrong."""
+    """The reason is the defect report on the recogniser"""
     approval = gated.request(command="uv run pytest tests/test_release_staging.py -k shipit")
 
     r = gated.client.post(f"/gates/{approval['id']}/decide",
@@ -1411,8 +1284,7 @@ def test_dismiss_from_the_dashboard_needs_a_reason(gated):
 
 
 def test_a_mangled_decision_value_cannot_open_a_gate(gated):
-    """`decision` is an attacker-settable form field, so an unknown value must fail
-    closed rather than falling through to the permissive branch."""
+    """`decision` is an attacker-settable form field"""
     approval = gated.request()
 
     gated.client.post(f"/gates/{approval['id']}/decide",
@@ -1423,9 +1295,7 @@ def test_a_mangled_decision_value_cannot_open_a_gate(gated):
 
 
 def test_neo_tab_sends_gate_escalations_to_the_gates_tab(gated):
-    """A gate escalation is a Neo question, so it also lands on the neo tab. Answering
-    it there queues a message and leaves the gate shut — the reply box has to be
-    replaced by a pointer at the thing that actually decides it."""
+    """A gate escalation is a Neo question, so it also lands on the neo tab"""
     gated.request()
     gated.daemon._neo_drain()
 
@@ -1444,8 +1314,7 @@ def test_dashboard_attention_deep_links_an_escalated_gate(gated):
 
 
 def test_timeline_hides_plumbing_until_debug_is_requested(client, daemon, project):
-    """The default timeline reads as a story; delivery receipts and session hooks
-    only appear behind the debug toggle."""
+    """The default timeline reads as a story"""
     wo = ops.create_work_order("proj_a", "export citations",
                                description="BibTeX drops DOIs")
     daemon.tick()
@@ -1532,8 +1401,7 @@ def test_mark_done_from_the_work_order_page(client, project):
 
 
 def test_mark_done_is_not_offered_while_assumptions_are_pending(client, project):
-    """It would accept the assumptions silently. The panel that decides them is on the
-    same page, so the user is one click from being allowed to close it."""
+    """It would accept the assumptions silently"""
     wo = ops.create_work_order("proj_a", "has an open question")
     ops.assume(wo["id"], "used the sqlite backend")
 
@@ -1555,8 +1423,7 @@ def test_mark_done_is_not_offered_while_assumptions_are_pending(client, project)
 
 
 def test_settled_work_orders_collapse_into_a_count(client, project):
-    """The complaint: a project page that lists every work order ever created is
-    unreadable. Settled ones are the bulk of it and none is asking for anything."""
+    """The complaint: a project page that lists every work order ever created is unreadable"""
     open_wo = ops.create_work_order("proj_a", "still going")
     done = ops.create_work_order("proj_a", "old and finished")
     killed = ops.create_work_order("proj_a", "old and cancelled")
@@ -1584,12 +1451,7 @@ def test_settled_work_orders_collapse_into_a_count(client, project):
 
 
 def test_pr_merges_and_running_work_get_the_rows(client, project):
-    """The listing question the user actually asks the dashboard: what is moving, and
-    what is waiting for me to merge it.
-
-    `pending` is the collapsed case here because it is one of the two statuses that
-    genuinely need nobody — see the test below for the ones that do.
-    """
+    """The listing question the user actually asks the dashboard: what is moving"""
     running = ops.create_work_order("proj_a", "still going")
     merging = ops.create_work_order("proj_a", "waiting on a merge")
     ops.create_work_order("proj_a", "not started yet")
@@ -1613,13 +1475,7 @@ def test_pr_merges_and_running_work_get_the_rows(client, project):
 
 
 def test_a_decision_you_owe_gets_a_row_not_a_count(client, daemon, project):
-    """The statuses invariants.true_blockers calls real blockers have to be rows.
-
-    They were counts, which is how a project page came to print "3 needs review" in the
-    header and "nothing running and nothing to merge" in the panel underneath it. A
-    listing that disagrees with true_blockers about what needs the user is a bug in the
-    listing.
-    """
+    """The statuses invariants.true_blockers calls real blockers have to be rows"""
     reviewing = ops.create_work_order("proj_a", "decide this please")
     blocked = ops.create_work_order("proj_a", "worker is stuck")
     daemon.tick()
@@ -1647,7 +1503,7 @@ def test_a_decision_you_owe_gets_a_row_not_a_count(client, daemon, project):
 
 def test_a_project_whose_only_open_work_needs_review_is_not_an_empty_panel(client,
                                                                           daemon):
-    """The reported bug, exactly: counts and panel contradicting each other."""
+    """The reported bug, exactly: counts and panel contradicting each other"""
     for n in range(3):
         wo = ops.create_work_order("proj_a", f"needs a decision {n}")
         daemon.tick()
@@ -1664,14 +1520,11 @@ def test_a_project_whose_only_open_work_needs_review_is_not_an_empty_panel(clien
 
 
 def test_a_blocked_work_order_says_what_it_is_waiting_for(client, project):
-    """Both listings, because they derive it by different routes — the dashboard off
-    `ops.os_status`, the project page off the store directly. A surface that worked
-    while its twin lied is exactly how the FEATURED_STATUSES bug survived."""
+    """Both listings, because they derive it by different routes"""
     dep = ops.create_work_order("proj_a", "the schema change")
     ops.create_work_order("proj_a", "needs the schema", depends_on=[dep["id"]])
 
-    # Pending work still collapses by default — a work order waiting its turn needs
-    # nobody — so the line is asserted where the user actually expands to see it.
+    # Pending work still collapses by default
     for url in ("/?show=pending", "/project/proj_a?show=pending"):
         page = client.get(url)
         assert "blocked by" in page.text, url
@@ -1679,7 +1532,7 @@ def test_a_blocked_work_order_says_what_it_is_waiting_for(client, project):
 
 
 def test_a_stranded_work_order_reaches_the_attention_strip(client, project):
-    """The one dependency case that is not routine: it will never start on its own."""
+    """The one dependency case that is not routine: it will never start on its own"""
     dep = ops.create_work_order("proj_a", "the schema change")
     child = ops.create_work_order("proj_a", "needs the schema", depends_on=[dep["id"]])
     store = ProjectStore(project)
@@ -1693,7 +1546,7 @@ def test_a_stranded_work_order_reaches_the_attention_strip(client, project):
 
 
 def test_a_pr_waiting_to_be_merged_never_enters_the_attention_strip(client, project):
-    """It is a merge queue, not an interrupt: NEEDS YOU has to stay for real blockers."""
+    """It is a merge queue, not an interrupt: NEEDS YOU has to stay for real blockers"""
     wo = ops.create_work_order("proj_a", "waiting on a merge")
     ops.finish(wo["id"], "PR is up", pr_url="https://github.com/a/b/pull/9")
 
@@ -1703,7 +1556,7 @@ def test_a_pr_waiting_to_be_merged_never_enters_the_attention_strip(client, proj
 
 
 def test_expanding_a_settled_group_keeps_hidden_work_orders_showing(client, project):
-    """Two independent toggles: expanding one must not silently undo the other."""
+    """Two independent toggles: expanding one must not silently undo the other"""
     shy = ops.create_work_order("proj_a", "hidden and finished")
     ops.mark_done(shy["id"])
     ops.hide_work_order(shy["id"], hidden=True)
@@ -1729,12 +1582,7 @@ def test_a_bogus_show_value_falls_back_to_the_open_list(client, project):
 
 
 def test_got_it_button_puts_the_flag_down(client, project):
-    """The dashboard complaint in one test: acking has to survive the daemon.
-
-    The attention strip is what the user actually reads, and before this there was no
-    control on the page that could clear it — `jarvis inbox ack` acks notifications,
-    which is a different store entirely.
-    """
+    """The dashboard complaint in one test: acking has to survive the daemon"""
     wo = ops.create_work_order("proj_a", "noisy task")
     store = ProjectStore(project)
     store.set_status(wo["id"], "needs_review")
@@ -1751,7 +1599,7 @@ def test_got_it_button_puts_the_flag_down(client, project):
 
 
 def test_got_it_is_not_offered_when_a_decision_is_owed(client, project):
-    """Assumptions need accept/reject — dismissing one would drop the work silently."""
+    """Assumptions need accept/reject — dismissing one would drop the work silently"""
     wo = ops.create_work_order("proj_a", "task with a judgement call")
     store = ProjectStore(project)
     store.add_assumption(wo["id"], "picked postgres over sqlite")
@@ -1768,14 +1616,9 @@ def test_got_it_is_not_offered_when_a_decision_is_owed(client, project):
 
 
 def test_stale_deep_link_to_unregistered_project_is_not_a_500(client):
-    """Notifications embed a deep link built from whatever project name the emitter
-    passed. When that project is not (or is no longer) registered the dashboard has
-    to say so — a bare "Internal Server Error" tells the user nothing and leaves
-    them unable to tell a Jarvis bug from a vanished work order.
-    """
+    """Notifications embed a deep link built from whatever project name the emitter passed"""
     r = client.get("/wo/proj_gone/wo-4fdb20ba")
-    # 404, not 200: there is genuinely no such page. What matters is that it is not a
-    # 500 and that the page names which half of the link went stale.
+    # 404, not 200: there is genuinely no such page
     assert r.status_code == 404
     assert "Internal Server Error" not in r.text
     assert "proj_gone" in r.text and "not registered" in r.text
@@ -1783,9 +1626,7 @@ def test_stale_deep_link_to_unregistered_project_is_not_a_500(client):
 
 
 def test_stale_deep_link_to_a_deleted_work_order_says_which_half_is_gone(client):
-    """The other stale-link shape: the project is fine, the work order is not (a
-    notification that outlived `jarvis wo delete`). Blaming the project here would send
-    the user to check the catalog for no reason."""
+    """The other stale-link shape: the project is fine"""
     r = client.get("/wo/proj_a/wo-neverexisted")
     assert r.status_code == 404
     assert "is registered, but it has no work order" in r.text
@@ -1793,13 +1634,7 @@ def test_stale_deep_link_to_a_deleted_work_order_says_which_half_is_gone(client)
 
 def test_unexpected_error_renders_a_page_and_lands_in_the_os_log(
         jarvis_home, fake_claude, catalog_file, monkeypatch):
-    """Defence in depth: whatever else breaks, the dashboard owes the user a page
-    and the OS owes itself a trace on disk. Before this, UI tracebacks went to the
-    systemd journal only — invisible to `$JARVIS_HOME/logs`, to Jarvis and to Neo.
-
-    Starlette always re-raises after sending the response so the server can log it,
-    hence `raise_server_exceptions=False` — a real browser still gets the page.
-    """
+    """Defence in depth: whatever else breaks"""
     ops.start_os(str(catalog_file), foreground=True)
     c = TestClient(create_app(), follow_redirects=False, raise_server_exceptions=False)
 
@@ -1818,16 +1653,12 @@ def test_unexpected_error_renders_a_page_and_lands_in_the_os_log(
     assert "RuntimeError" in log
 
 
-# -- feature orders ------------------------------------------------------------------
-#
-# The feature page is the one view where the whole feature is visible at once — the ask,
-# the plan as submitted, and each child's live status against it. It is also where an
-# escalated plan is decided, because deciding needs all three on one screen.
+# -- feature orders
 
 
 @pytest.fixture()
 def feature(client, daemon, project):
-    """A feature order whose plan is submitted and escalated to the user."""
+    """A feature order whose plan is submitted and escalated to the user"""
     from tests.test_feature_orders import ASK, a_plan, child
 
     fo = ops.create_feature_order("proj_a", "CSV export", description=ASK)
@@ -1872,8 +1703,7 @@ def test_releasing_a_plan_from_the_browser_creates_the_children(feature):
 
 
 def test_sending_a_plan_back_with_no_reason_says_so_instead_of_failing(feature):
-    """The planner sees only the reason, so a bare rejection is a guess. The refusal has
-    to reach the page rather than becoming a 500."""
+    """The planner sees only the reason, so a bare rejection is a guess"""
     client, fo = feature
 
     res = client.post(f"/fo/proj_a/{fo['id']}/review", data={"decision": "reject"})
@@ -1884,9 +1714,7 @@ def test_sending_a_plan_back_with_no_reason_says_so_instead_of_failing(feature):
 
 
 def test_a_plan_neo_can_decide_never_reaches_the_users_page(client, daemon, project):
-    """The control for the panel above: routine plans must not put a decision on screen,
-    because a feature order that costs an interactive review every time costs more
-    attention than typing the work orders by hand."""
+    """The control for the panel above: routine plans must not put a decision on screen"""
     from tests.test_feature_orders import ASK, a_plan, child
 
     fo = ops.create_feature_order("proj_a", "CSV export", description=ASK)
@@ -1907,20 +1735,16 @@ def test_the_project_page_lists_feature_orders_without_repeating_the_tree(featur
 
     assert f"/fo/proj_a/{fo['id']}" in page
     assert "Feature orders" in page
-    # The children belong to the listing below as ordinary work orders, and to the
-    # feature's own page as a tree. Not to both, on one page.
+    # The children belong to the listing below as ordinary work orders
     assert page.count(f"/fo/proj_a/{fo['id']}") == 1
 
 
-# -- the spec page ---------------------------------------------------------------------
-#
-# docs/superpowers/specs/2026-09-28-a-feature-spec-you-can-open.md. The document the OS
-# HOLDS, rendered — it works before any pull request exists, which is the live bug.
+# -- the spec page
 
 
 @pytest.fixture()
 def released_feature(client, daemon, project):
-    """A feature whose plan was released, so planner, feature and children all exist."""
+    """A feature whose plan was released, so planner, feature and children all exist"""
     from tests.test_feature_orders import ASK, a_plan, child
 
     fo = ops.create_feature_order("proj_a", "CSV export", description=ASK)
@@ -1932,7 +1756,7 @@ def released_feature(client, daemon, project):
 
 
 def test_the_spec_page_renders_a_held_document_with_no_pull_request(released_feature):
-    """Spec test 1 — wo-1170d758's shape, the one that must not regress."""
+    """Spec test 1 — wo-1170d758's shape, the one that must not regress"""
     client, fo = released_feature
     assert not any(c["pr_url"] for c in fo["children"])
 
@@ -1945,8 +1769,7 @@ def test_the_spec_page_renders_a_held_document_with_no_pull_request(released_fea
 
 def test_the_spec_page_prints_the_revision_it_holds_and_never_invents_one(
         released_feature, project):
-    """Spec test 7, second half. A fabricated provenance line is worse than none on the
-    one page whose purpose is to show what the reviewer read."""
+    """Spec test 7, second half"""
     client, fo = released_feature
 
     page = client.get(f"/spec/proj_a/{fo['id']}").text
@@ -1966,7 +1789,7 @@ def test_the_spec_page_prints_the_revision_it_holds_and_never_invents_one(
 
 
 def test_a_feature_with_no_plan_is_200_and_names_its_status(client, daemon):
-    """Spec test 7, first half: three outcomes, none of them a 500."""
+    """Spec test 7, first half: three outcomes, none of them a 500"""
     from tests.test_feature_orders import ASK
 
     fo = ops.create_feature_order("proj_a", "CSV export", description=ASK)
@@ -1987,7 +1810,7 @@ def test_an_unknown_project_spec_is_the_ordinary_error_page(client):
 
 
 def test_three_pages_link_to_the_one_spec_page(released_feature):
-    """Spec test 3: the planner's page, the feature page and a child's page."""
+    """Spec test 3: the planner's page, the feature page and a child's page"""
     client, fo = released_feature
     link = f"/spec/proj_a/{fo['id']}"
 
@@ -1999,7 +1822,7 @@ def test_three_pages_link_to_the_one_spec_page(released_feature):
 
 def test_a_childs_link_carries_its_sections_anchor_and_that_id_exists(released_feature,
                                                                       project):
-    """Spec test 4 — assert the PAIR. A fragment pointing at no id is the bug."""
+    """Spec test 4 — assert the PAIR"""
     from jarvis import specs
 
     client, fo = released_feature
@@ -2013,21 +1836,17 @@ def test_a_childs_link_carries_its_sections_anchor_and_that_id_exists(released_f
 
     fragment = f"/spec/proj_a/{fo['id']}#{anchor}"
     assert fragment in client.get(f"/wo/proj_a/{kid['id']}").text
-    # And the plan's child row on the feature page links to the same fragment.
+    # And the plan's child row on the feature page links to the same fragment
     assert fragment in client.get(f"/fo/proj_a/{fo['id']}").text
     assert f'id="{anchor}"' in client.get(f"/spec/proj_a/{fo['id']}").text
 
 
-# -- improvement orders --------------------------------------------------------------
-#
-# §6.1 of docs/superpowers/specs/2026-09-23-improvement-orders.md: the page opens on the
-# counts, then the evidence, then one card per finding — because a report is only
-# judgeable next to what it was quoted from, and the decision is taken where it is read.
+# -- improvement orders
 
 
 @pytest.fixture()
 def improvement(client, project, improvement_order):
-    """An improvement order in `plan_review` with the shared findings report on it."""
+    """An improvement order in `plan_review` with the shared findings report on it"""
     from jarvis.testing import a_report
 
     store = ProjectStore(project)
@@ -2052,8 +1871,7 @@ def test_the_improvement_page_opens_on_counts_then_evidence_and_the_analyst(impr
     for ref in ("wo-11111111", "#42", "https://example.invalid/x"):
         assert html.escape(ref) in page
     assert f"/wo/proj_a/{analyst['id']}" in page
-    # Its LIVE status, not the one it was created with: `submit_findings` settles the
-    # analyst, and a page still calling it running would be the stale half of the link.
+    # Its LIVE status, not the one it was created with: `submit_findings` settles the analyst
     assert io["analyst"]["status"] in page
 
 
@@ -2083,8 +1901,7 @@ def test_an_accepted_finding_lists_the_orders_it_filed(improvement):
     for order in filed:
         link = f"/wo/proj_a/{order['id']}"
         assert link in page
-        # The status has to ride on the filed order's OWN row: an accepted finding that
-        # says what was proposed and not what became of it is the missing half (§5.3.1).
+        # The status has to ride on the filed order's OWN row: an accepted finding that says what was...
         row = page[page.index(link):page.index(link) + 400]
         assert order["status"] in row
 
@@ -2112,8 +1929,7 @@ def test_accepting_a_finding_from_the_browser_decides_it(improvement):
 
 
 def test_rejecting_a_finding_with_no_reason_says_so_instead_of_failing(improvement):
-    """The reason is what the knowledge entry and the analyst read, so a bare rejection
-    is a decision nobody can learn from. The refusal reaches the page, not a 500."""
+    """The reason is what the knowledge entry and the analyst read"""
     client, io, _ = improvement
 
     res = client.post(f"/io/proj_a/{io['id']}/review",
@@ -2135,21 +1951,16 @@ def test_the_project_page_lists_improvement_orders_without_expanding_findings(im
     assert page.count(f"/io/proj_a/{io['id']}") == 1
     assert "Improvement orders" in page
     assert "findings awaiting you" in page   # the kind-aware label, not `plan_review`
-    # Counts, not trees: the findings are what the order's own page is for.
+    # Counts, not trees: the findings are what the order's own page is for
     assert "before touching the dispatch path" not in page
 
 
-# -- investigation orders ------------------------------------------------------------
-#
-# §2.9 of docs/superpowers/specs/2026-09-27-investigation-orders.md: the page leads with
-# the classification and the subject, then the root cause, the evidence and what was
-# filed. NO POST action — there is nothing to decide, and that absence is what "the order
-# settles itself" looks like on a screen.
+# -- investigation orders
 
 
 @pytest.fixture()
 def investigation(client, project):
-    """A settled investigation with a WAITING_ON_USER verdict on it."""
+    """A settled investigation with a WAITING_ON_USER verdict on it"""
     from jarvis.testing import a_verdict
 
     store = ProjectStore(project)
@@ -2186,8 +1997,7 @@ def test_the_investigation_page_leads_with_the_classification_and_the_subject(
     assert html.escape(f"jarvis wo show {subject}") in page   # its source
     assert "as-4" in page                               # what the user owes
     assert f"/wo/proj_a/{investigator['id']}" in page
-    # Nothing to decide: the difference from the improvement-order page. The base
-    # layout's search box is a GET, so the assertion is about POSTs.
+    # Nothing to decide: the difference from the improvement-order page
     assert 'method="post"' not in page
 
 
@@ -2239,7 +2049,7 @@ def test_the_project_page_lists_live_investigations_beside_the_other_kinds(clien
 
 
 def _settle_feature(project, title, status):
-    """A feature order in a terminal status, with no ceremony about how it got there."""
+    """A feature order in a terminal status, with no ceremony about how it got there"""
     fo = ops.create_feature_order("proj_a", title, description="the whole ask, at "
                                   "length, with enough detail to plan it properly")
     store = ProjectStore(project)
@@ -2251,8 +2061,7 @@ def _settle_feature(project, title, status):
 
 
 def test_settled_feature_orders_collapse_into_a_count(client, project):
-    """The complaint: a completed feature order left the project page and there was no
-    way back to it — the CLI has `fo list --all`, the dashboard had nothing."""
+    """The complaint: a completed feature order left the project page and there was no way back to it"""
     done = _settle_feature(project, "CSV export", "completed")
     killed = _settle_feature(project, "PDF export", "cancelled")
     still_going = ops.create_feature_order("proj_a", "XLS export",
@@ -2262,7 +2071,7 @@ def test_settled_feature_orders_collapse_into_a_count(client, project):
     page = client.get("/project/proj_a").text
     assert "XLS export" in page
     assert "CSV export" not in page and "PDF export" not in page
-    # The gap was discoverability, not just filtering: the count says they exist.
+    # The gap was discoverability, not just filtering: the count says they exist
     assert "1 completed" in page and "1 cancelled" in page
     assert "fo=completed" in page
     assert "fo=failed" not in page  # zero of them: no count, no link
@@ -2278,10 +2087,7 @@ def test_settled_feature_orders_collapse_into_a_count(client, project):
 
 
 def test_a_settled_feature_is_still_told_apart_from_an_open_one(client, project):
-    """Revealed, it is a row like any other — wearing its own status, not an open one's.
-
-    Also the case where a project has ONLY settled features: the block still exists.
-    """
+    """Revealed, it is a row like any other — wearing its own status, not an open one's"""
     _settle_feature(project, "CSV export", "failed")
 
     page = client.get("/project/proj_a?fo=all").text
@@ -2291,7 +2097,7 @@ def test_a_settled_feature_is_still_told_apart_from_an_open_one(client, project)
 
 def test_the_work_order_reveal_and_the_feature_reveal_do_not_undo_each_other(client,
                                                                             project):
-    """Two independent reveals on one page: every link must carry the other."""
+    """Two independent reveals on one page: every link must carry the other"""
     _settle_feature(project, "CSV export", "completed")
     finished = ops.create_work_order("proj_a", "old and finished")
     ops.mark_done(finished["id"])
@@ -2335,8 +2141,7 @@ def test_an_unknown_feature_order_is_a_page_not_a_traceback(client):
 
 
 def test_the_feature_page_shows_its_slot_budget(client, daemon, project):
-    """`max_parallel` is invisible everywhere else, so the one page that holds the whole
-    feature is where the user finds out why three children are showing two running."""
+    """`max_parallel` is invisible everywhere else"""
     from tests.test_feature_orders import ASK, a_plan, child
 
     fo = ops.create_feature_order("proj_a", "CSV export", description=ASK,
@@ -2351,13 +2156,12 @@ def test_the_feature_page_shows_its_slot_budget(client, daemon, project):
     page = client.get(f"/fo/proj_a/{fo['id']}").text
 
     assert "2/2 slots in use" in page
-    # ...and the child that is waiting says so, rather than reading as about-to-start.
+    # ...and the child that is waiting says so, rather than reading as about-to-start
     assert "waiting for a slot" in page
 
 
 def test_an_uncapped_feature_page_says_nothing_about_slots(feature):
-    """The control: a feature with no cap has nothing to report, and the project's own
-    max_concurrent is not this page's business."""
+    """The control: a feature with no cap has nothing to report"""
     client, fo = feature
 
     assert "slots in use" not in client.get(f"/fo/proj_a/{fo['id']}").text
@@ -2365,8 +2169,7 @@ def test_an_uncapped_feature_page_says_nothing_about_slots(feature):
 
 def test_the_attention_strip_links_a_rolled_up_feature_to_its_page(client, daemon,
                                                                    project):
-    """The rollup collapses the children's lines, so the one link it leaves has to reach
-    the page where they are individually visible — otherwise collapsing them hides them."""
+    """The rollup collapses the children's lines"""
     from jarvis.project_store import ProjectStore
     from tests.test_feature_orders import ASK, a_plan, child
 
@@ -2388,8 +2191,7 @@ def test_the_attention_strip_links_a_rolled_up_feature_to_its_page(client, daemo
     assert f'/fo/proj_a/{fo["id"]}' in page
     assert "1 of its work orders need you" in page
 def test_knowledge_page_pin_toggle(client):
-    """Pinning is the switch between 'in every worker prompt verbatim' and 'an index
-    line the worker looks up' — so it has to be operable without touching SQLite."""
+    """Pinning is the switch between 'in every worker prompt verbatim' and 'an index line the worker looks..."""
     from jarvis.central_store import PINNED_TAG, CentralStore, has_tag
 
     central = CentralStore()
@@ -2412,10 +2214,10 @@ def test_knowledge_page_pin_toggle(client):
     assert fresh is not None and not has_tag(fresh["tags"], PINNED_TAG)
 
 
-# -- which instance is this? -----------------------------------------------------
+# -- which instance is this?
 
 def _chrome(jarvis_home, catalog_file, path="/"):
-    """The rendered header, from a freshly built app (the badge is read once)."""
+    """The rendered header, from a freshly built app (the badge is read once)"""
     ops.start_os(str(catalog_file), foreground=True)
     c = TestClient(create_app(), follow_redirects=False)
     return c.get(path).text
@@ -2423,8 +2225,7 @@ def _chrome(jarvis_home, catalog_file, path="/"):
 
 def test_header_names_a_dev_instance_and_its_version(
         jarvis_home, fake_claude, catalog_file, monkeypatch):
-    """Two checkouts of the same code on one machine render identical dashboards;
-    the badge is what stops someone acting on the live fleet from the wrong one."""
+    """Two checkouts of the same code on one machine render identical dashboards"""
     from jarvis import bugreport
 
     monkeypatch.delenv("JARVIS_ENV", raising=False)
@@ -2432,8 +2233,7 @@ def test_header_names_a_dev_instance_and_its_version(
     monkeypatch.setattr(bugreport, "jarvis_version", lambda: "dev-a1b2c3d")
     html = _chrome(jarvis_home, catalog_file)
 
-    # a dev build has no release number — the sha is the version, and the badge does
-    # not say "dev" twice
+    # a dev build has no release number — the sha is the version, and the badge does not say "dev" twice
     assert "dev · a1b2c3d" in html
     assert "vdev-" not in html
     assert 'class="instance"' in html  # muted: dev must not wear the prod colour
@@ -2453,8 +2253,7 @@ def test_header_marks_a_production_instance(
 
 def test_a_hand_edited_release_still_says_so_in_the_badge(
         jarvis_home, fake_claude, catalog_file, monkeypatch):
-    """`-dirty` means the production checkout is no longer the release it claims to
-    be. It reaches bug reports already; the header is where someone would see it."""
+    """`-dirty` means the production checkout is no longer the release it claims to be"""
     from jarvis import bugreport
 
     monkeypatch.setenv("JARVIS_ENV", "production")
@@ -2466,8 +2265,7 @@ def test_a_hand_edited_release_still_says_so_in_the_badge(
 
 def test_instance_badge_is_on_every_page_with_a_diagnosable_tooltip(
         jarvis_home, fake_claude, catalog_file, monkeypatch):
-    """It lives in the base template, so it cannot go missing on the page someone
-    happens to deep-link into out of a Telegram alert."""
+    """It lives in the base template, so it cannot go missing on the page someone happens to deep-link..."""
     monkeypatch.setenv("JARVIS_ENV", "production")
     for path in ("/", "/inbox", "/backlog", "/knowledge", "/neo", "/gates"):
         html = _chrome(jarvis_home, catalog_file, path)
@@ -2488,11 +2286,7 @@ def test_version_lookup_failure_does_not_break_the_header(
     assert 'class="instance"' in html
 
 
-# -- units under validation -----------------------------------------------------------
-#
-# Templates index STATUS_META and FO_STATUS_META BY STATUS, so a status added to the
-# vocabulary without an entry in both does not degrade — it 500s the page, and it takes
-# every other work order in the project down with it.
+# -- units under validation
 
 
 def test_a_validating_work_order_renders_everywhere_it_appears(client, project):
@@ -2508,9 +2302,7 @@ def test_a_validating_work_order_renders_everywhere_it_appears(client, project):
 
 
 def test_an_idle_manager_renders_everywhere_it_appears(client, project):
-    """The third status added to the vocabulary, under the rule above. It also carries
-    the point of issue #264 onto the page: an idle manager must not read "waiting on
-    you" anywhere, and the work-order page says what it IS waiting for instead."""
+    """The third status added to the vocabulary, under the rule above (#264)"""
     store = ProjectStore(project)
     wo = store.create_work_order("coordinate the exporter", kind="manager")
     store.set_status(wo["id"], "idle")
@@ -2535,16 +2327,11 @@ def test_a_validating_feature_order_renders_everywhere_it_appears(client, projec
     assert "under review" in client.get(f"/fo/proj_a/{fo['id']}").text
 
 
-# -- the validation section ------------------------------------------------------------
-#
-# The rounds are shown outright; the seats are folded shut. `id="validation"` is the
-# section marker every test here keys on rather than the word "Validation", which the
-# timeline already prints ("Validation rejected — sent back") on a page that may have no
-# section at all.
+# -- the validation section
 
 
 def _validated(store, *, wo_id=None, fo_id=None):
-    """A rejection and a pass, with the seats that produced them."""
+    """A rejection and a pass, with the seats that produced them"""
     subject = {"wo_id": wo_id} if wo_id else {"fo_id": fo_id}
     first = store.open_validation_round(**subject, fingerprint="aaaa1111")
     store.close_validation_round(first["id"], "rejected", "no test touches the branch")
@@ -2570,8 +2357,7 @@ def test_the_work_order_page_shows_its_rounds_and_folds_the_seats_away(client, p
     assert "rejected" in page and "passed" in page
     assert "no test touches the branch" in page
     assert "tester" in page and "security" in page
-    # Folded, not hidden: the seats are one click away and cost nobody a page of
-    # reading they did not ask for. Zero JavaScript, as everywhere else here.
+    # Folded, not hidden: the seats are one click away and cost nobody a page of reading they did not ask...
     assert "Panel deliberation" in page
     assert "<details" in page
     assert "no file under tests/ is in the diff" in page
@@ -2593,9 +2379,7 @@ def test_the_feature_page_shows_its_rounds_and_folds_the_seats_away(client, proj
 
 
 def test_a_voided_round_reads_as_voided_and_not_as_the_raw_word(client, project):
-    """Every outcome the machine can write needs a badge here, or the dashboard shows a
-    round nobody can interpret — `kn-99e37a4b`, a server-rendered template is a surface.
-    """
+    """Every outcome the machine can write needs a badge here"""
     store = ProjectStore(project)
     wo = store.create_work_order("ship 0.10.5")
     rnd = store.open_validation_round(wo_id=wo["id"], fingerprint="cccc3333")
@@ -2606,15 +2390,12 @@ def test_a_voided_round_reads_as_voided_and_not_as_the_raw_word(client, project)
     assert 'id="validation"' in page
     assert "voided</span>" in page
     assert "the OS verifies it itself" in page
-    # The fall-through badge prints the raw outcome and colours it "in flight", which is
-    # the one reading a settled round must not get.
+    # The fall-through badge prints the raw outcome and colours it "in flight"
     assert ">void</span>" not in page
 
 
 def test_a_round_waiting_for_ci_is_not_painted_as_a_failure(client, project):
-    """GitHub issue #581. `failed` is the storage word for a CI wait as much as for a
-    reviewer outage, and the red ✗ this page used to print for both is what made a
-    green, mergeable pull request read as a failed review for its whole CI window."""
+    """GitHub issue #581"""
     store = ProjectStore(project)
     wo = store.create_work_order("add the export")
     rnd = store.open_validation_round(wo_id=wo["id"], fingerprint="dddd4444")
@@ -2625,14 +2406,12 @@ def test_a_round_waiting_for_ci_is_not_painted_as_a_failure(client, project):
 
     assert 'class="st tone-active"><span class="i">◑</span>waiting for CI</span>' in page
     assert ">failed</span>" not in page
-    # Not a bare `"tone-bad" not in page`: the stylesheet names every tone.
+    # Not a bare `"tone-bad" not in page`: the stylesheet names every tone
     assert 'class="st tone-bad"' not in page, "a wait was toned as a failure"
 
 
 def test_a_round_held_for_authentication_is_not_painted_as_a_failure(client, project):
-    """GitHub issue #778. No template edit ships with that fix — the badge is keyed on
-    `project_store.validation_standing` — so the thing that can regress is the table row,
-    and this is what pins it rendered."""
+    """GitHub issue #778"""
     from jarvis.project_store import VALIDATION_AUTH_CAUSE
 
     store = ProjectStore(project)
@@ -2651,10 +2430,7 @@ def test_a_round_held_for_authentication_is_not_painted_as_a_failure(client, pro
 
 
 def test_a_round_that_really_failed_keeps_the_red_badge(client, project):
-    """The other half, and the one a rendering fix breaks by accident: an outage and an
-    unconfigured panel have no `hold_cause`, nothing is coming back on its own, and they
-    must still read as failures. This also covers every row written before the column
-    existed — they carry NULL, and NULL means "nothing is holding this"."""
+    """The other half, and the one a rendering fix breaks by accident: an outage and an unconfigured panel..."""
     store = ProjectStore(project)
     wo = store.create_work_order("add the import")
     rnd = store.open_validation_round(wo_id=wo["id"], fingerprint="eeee5555")
@@ -2667,9 +2443,7 @@ def test_a_round_that_really_failed_keeps_the_red_badge(client, project):
 
 
 def test_a_unit_that_was_never_validated_gets_no_validation_section(client, project):
-    """No empty box. Validation ships disabled, so this is every unit in the fleet —
-    a section that renders as a heading over nothing would be on almost every page in
-    the dashboard, saying nothing, for ever."""
+    """No empty box"""
     store = ProjectStore(project)
     wo = store.create_work_order("ship the exporter")
     fo = store.create_feature_order("CSV export", description="the whole ask")
@@ -2680,10 +2454,7 @@ def test_a_unit_that_was_never_validated_gets_no_validation_section(client, proj
 
 def test_the_work_order_page_reads_its_label_off_the_os_not_the_template(client,
                                                                         project):
-    """`invariants.status_label` is where every surface gets its wording, and this page
-    is the one that has drifted from the listings before by deriving its own. The round
-    number is the proof: STATUS_META can produce "under review", and nothing a template
-    can reach knows that this is round 2 of 3."""
+    """`invariants.status_label` is where every surface gets its wording"""
     from jarvis import invariants
 
     store = ProjectStore(project)
@@ -2701,8 +2472,7 @@ def test_the_work_order_page_reads_its_label_off_the_os_not_the_template(client,
 
 def test_an_undeliverable_envelope_is_visible_on_the_page_and_a_delivered_one_is_not(
         client, project):
-    """Feedback that reached nobody must never read like feedback that was acted on.
-    Delivered envelopes are routine and belong behind `jarvis validation show`."""
+    """Feedback that reached nobody must never read like feedback that was acted on"""
     store = ProjectStore(project)
     wo = store.create_work_order("ship the exporter")
     lost = store.post_envelope(from_role="reviewer", to_role="implementor",
@@ -2717,15 +2487,12 @@ def test_an_undeliverable_envelope_is_visible_on_the_page_and_a_delivered_one_is
     assert 'id="validation"' in page          # a section with no rounds, but a failure
     assert "reached nobody" in page
     assert "nobody fills role implementor" in page
-    # ONE envelope on the page, out of two on the record. Counted rather than asserted
-    # absent by word: "delivered" is ordinary English and appears in the reply box's
-    # own copy, so a bare `not in` would fail against a page that is perfectly correct.
+    # ONE envelope on the page, out of two on the record
     assert page.count("review_feedback") == 1
 
 
 def test_the_feature_page_names_its_manager_order(client, project):
-    """Paired with a feature that has none — which is every feature planned with
-    validation switched off, and the case that must keep rendering."""
+    """Paired with a feature that has none"""
     store = ProjectStore(project)
     with_mgr = store.create_feature_order("CSV export", description="the whole ask")
     mgr = store.create_work_order("own the follow-through", kind="manager",
@@ -2735,7 +2502,7 @@ def test_the_feature_page_names_its_manager_order(client, project):
     page = client.get(f"/fo/proj_a/{with_mgr['id']}").text
     assert "manager:" in page
     assert mgr["id"] in page
-    # ...and it is not counted as a piece of the work.
+    # ...and it is not counted as a piece of the work
     assert "no children" in page
 
     plain = client.get(f"/fo/proj_a/{without['id']}")
@@ -2743,13 +2510,11 @@ def test_the_feature_page_names_its_manager_order(client, project):
     assert "manager:" not in plain.text
 
 
-# -- a contested match on the page (spec 2026-09-12) ----------------------------------
+# -- a contested match on the page (spec 2026-09-12)
 
 
 def test_a_contested_gate_offers_no_approve_button(gated):
-    """The page's verbs are the user's options. A contest argues the command performs no
-    privileged action, so there is nothing here to authorise — and `ops.decide_gate`
-    refuses an approval on one, which would make the button an error page."""
+    """The page's verbs are the user's options"""
     ops.contest_gate_match(gated.wo_id, "./scripts/shipit.sh",
                            why="the literal is inside a message body")
     gated.daemon._neo_drain()          # the fake escalates by default
@@ -2762,8 +2527,7 @@ def test_a_contested_gate_offers_no_approve_button(gated):
 
 
 def test_an_abandoned_request_is_not_shown_as_expired(gated):
-    """`expired` is three different outcomes and only one of them is evidence about the
-    classifier. A row nobody ever reviewed must not read like a grant that ran out."""
+    """`expired` is three different outcomes and only one of them is evidence about the classifier"""
     from jarvis.hooks import preflight_decision
 
     settings = json.loads(
@@ -2781,13 +2545,12 @@ def test_an_abandoned_request_is_not_shown_as_expired(gated):
 
     page = gated.client.get("/gates").text
     assert "abandoned, never reviewed" in page
-    # ...and counted beside the false-positive rate rather than inside it.
+    # ...and counted beside the false-positive rate rather than inside it
     assert "1 more were abandoned" in page
 
 
 def test_a_spent_grant_is_not_shown_as_expired(gated):
-    """Issue 491: 23 of 26 production auto_merge gates were approved, used, and then
-    badged `– expired` — a working pipeline reading as Neo letting every merge lapse."""
+    """Issue 491: 23 of 26 production auto_merge gates were approved, used, and then badged `– expired`"""
     from jarvis.hooks import preflight_decision
 
     settings = json.loads(
@@ -2810,15 +2573,12 @@ def test_a_spent_grant_is_not_shown_as_expired(gated):
 
     assert "spent" in page
     assert f"{gates.GRANT_MAX_USES}/{gates.GRANT_MAX_USES} used" in page
-    # ...and NOT as the outcome it is the opposite of.
+    # ...and NOT as the outcome it is the opposite of
     assert ">expired<" not in page
 
 
 def test_the_work_order_page_splits_expired_too(gated):
-    """The other renderer of `GATE_META`, and the one that had never split `expired` at
-    all: it keyed on the raw status, so `abandoned` never reached this page either. The
-    twin test pins the two helpers as FUNCTIONS — only a page assertion catches this
-    template going back to `a.status`."""
+    """The other renderer of `GATE_META`"""
     from jarvis.hooks import preflight_decision
 
     settings = json.loads(
@@ -2836,8 +2596,7 @@ def test_the_work_order_page_splits_expired_too(gated):
     for _ in range(gates.GRANT_MAX_USES):
         preflight_decision(payload, settings["env"])
 
-    # ...and beside it the outcome this page has never been able to say either: blocked,
-    # never argued, closed by the TTL (`gates.sweep_unargued`).
+    # ...and beside it the outcome this page has never been able to say either: blocked
     preflight_decision({"tool_name": "Bash",
                         "tool_input": {"command": gated.gated_command},
                         "cwd": str(gated.project)}, settings["env"])
@@ -2856,12 +2615,11 @@ def test_the_work_order_page_splits_expired_too(gated):
     assert ">expired</span>" not in page
 
 
-# -- budgets ---------------------------------------------------------------------------
+# -- budgets
 
 
 def test_the_work_order_page_offers_a_budget_even_when_there_is_none(client):
-    """The box is always offered: setting a budget on an order that has none is as much a
-    thing the reader came here to do as raising one that ran out."""
+    """The box is always offered: setting a budget on an order that has none is as much a thing the reader..."""
     wo = ops.create_work_order("proj_a", "uncapped", description="do it")
     page = client.get(f"/wo/proj_a/{wo['id']}").text
     assert "No budget" in page
@@ -2878,8 +2636,7 @@ def test_setting_a_budget_from_the_dashboard_calls_the_same_op(client):
 
 
 def test_an_empty_box_is_not_a_clear(client):
-    """A form submitted by accident must not silently remove a ceiling. Clearing takes
-    its own named control, the same separation `jarvis wo budget --clear` makes."""
+    """A form submitted by accident must not silently remove a ceiling"""
     wo = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=9.0)
     r = client.post(f"/wo/proj_a/{wo['id']}/budget", data={"amount": "  "})
     assert r.status_code == 303
@@ -2899,9 +2656,7 @@ def test_a_bad_amount_comes_back_as_a_flash_not_a_traceback(client):
 
 
 def test_the_budget_box_refuses_nan_rather_than_accepting_an_uncappable_cap(client):
-    """The dashboard POST is an entry point of its own, and `nan` is the input that gets
-    PAST a `> 0` check: an order carrying it renders as budgeted and is never capped. It
-    has to come back as a flash, leaving the order exactly as unbudgeted as it was."""
+    """The dashboard POST is an entry point of its own"""
     wo = ops.create_work_order("proj_a", "capped", description="do it")
     for bad in ("nan", "inf", "-inf"):
         r = client.post(f"/wo/proj_a/{wo['id']}/budget", data={"amount": bad})
@@ -2912,21 +2667,13 @@ def test_the_budget_box_refuses_nan_rather_than_accepting_an_uncappable_cap(clie
 
 def _broke_family(project, *, budget_usd: float = 3.0,
                   kind: str = "investigation") -> tuple[str, str]:
-    """A family whose money is gone and one child parked on its slice.
-
-    Written through the store rather than ticked into existence: these two tests are about
-    the ROUTE's non-error channel, not about the allocator, which
-    tests/test_budget.py owns.
-    """
+    """A family whose money is gone and one child parked on its slice"""
     store = ProjectStore(project)
     try:
         fo = store.create_feature_order("why is it stuck", description="it is stuck",
                                         kind=kind, budget_usd=budget_usd)
         store.set_feature_status(fo["id"], "planning")
-        # The child's kind is the family's, not a free choice: `store.feature_children`
-        # selects `kind='worker'` only, and a non-feature family's one child reaches
-        # `budget.family` as the parent's `plan_wo_id` instead (tests/test_budget.py's
-        # `_the_one_child`). Get either wrong and the pool sees no spend at all.
+        # The child's kind is the family's
         child = store.create_work_order(
             "diagnose it", description="look", parent_id=fo["id"],
             kind="worker" if kind == "feature" else "investigator")
@@ -2943,10 +2690,7 @@ def _broke_family(project, *, budget_usd: float = 3.0,
 
 
 def test_raising_a_family_capped_child_says_so_and_calls_it_no_error(client, project):
-    """Obligation 8 of docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md.
-    The reporter's literal path: the budget WAS raised and the page said nothing. A red ✗
-    would be the second false statement — a refusal is not an error, and a user who sees
-    one raises the child's number again instead of the family's."""
+    """Obligation 8 of docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md"""
     _fo_id, child = _broke_family(project)
     r = client.post(f"/wo/proj_a/{child}/budget", data={"amount": "$10"})
     assert r.status_code == 303
@@ -2958,17 +2702,13 @@ def test_raising_a_family_capped_child_says_so_and_calls_it_no_error(client, pro
 
     page = client.get(f"/wo/proj_a/{child}{location[location.index('?'):]}").text
     assert "jarvis investigate budget" in html.unescape(page)
-    # The rendered DIV, not the class name: base.html's stylesheet defines
-    # `.error-flash` on every page, so a bare substring check can never fail.
+    # The rendered DIV, not the class name: base.html's stylesheet defines `.error-flash` on every page
     assert '<div class="error-flash">' not in page
     assert '<div class="note-flash"' in page
 
 
 def test_the_budget_card_calls_the_family_by_its_kind(client, project):
-    """The card beside the flash said "its feature's slice" for an investigation.
-    `Ceiling.source == 'feature'` is the ALLOCATOR's word for "the family's cap", not a
-    claim about the parent's kind — the two surfaces must agree, so the card reads the
-    same `ops.family_prose` table the note does."""
+    """The card beside the flash said "its feature's slice" for an investigation"""
     _fo_id, child = _broke_family(project)
     page = html.unescape(client.get(f"/wo/proj_a/{child}").text)
     assert "its investigation's slice" in page
@@ -2977,8 +2717,7 @@ def test_the_budget_card_calls_the_family_by_its_kind(client, project):
 
 
 def test_raising_a_family_with_parked_children_names_them(client, project):
-    """Obligation 8, the sibling route: `exhausted_children` is the whole instruction to
-    the user — `jarvis wo budget <child> <amount>` is what spends the new money."""
+    """Obligation 8, the sibling route: `exhausted_children` is the whole instruction to the user"""
     fo_id, child = _broke_family(project, kind="feature")
     r = client.post(f"/fo/proj_a/{fo_id}/budget", data={"amount": "$50"})
     assert r.status_code == 303
@@ -2989,14 +2728,12 @@ def test_raising_a_family_with_parked_children_names_them(client, project):
                                     f"{location[location.index('?'):]}").text)
     assert child in page
     assert "jarvis wo budget" in page
-    # The WHOLE clause agrees, not just the noun: one order is parked on ITS OWN
-    # ceiling, not on "their own ceiling".
+    # The WHOLE clause agrees, not just the noun: one order is parked on ITS OWN ceiling
     assert "1 work order still parked on its own ceiling" in page
 
 
 def test_api_status_carries_every_feature_order_kind(client, project):
-    """Obligation 7 at the surface that reads the payload: `/api/status` and
-    `jarvis status --json` are its only consumers, Jarvis's own pulse check included."""
+    """Obligation 7 at the surface that reads the payload: `/api/status` and `jarvis status --json` are..."""
     store = ProjectStore(project)
     try:
         io = store.create_feature_order("slow first turns", description="three in a row",
@@ -3011,8 +2748,7 @@ def test_api_status_carries_every_feature_order_kind(client, project):
 
 
 def test_a_spent_order_is_featured_ahead_of_everything_else(client, daemon):
-    """It is the only blocker the reader cannot answer by reading: the order is stopped
-    and spending nothing until they decide."""
+    """It is the only blocker the reader cannot answer by reading: the order is stopped and spending..."""
     from jarvis.ui.app import FEATURED_STATUSES, group_open
 
     assert FEATURED_STATUSES[0] == "budget_exhausted"
@@ -3021,19 +2757,17 @@ def test_a_spent_order_is_featured_ahead_of_everything_else(client, daemon):
     assert [w["id"] for w in featured] == ["wo-2", "wo-1"]
 
 
-# -- a budget at CREATION time ----------------------------------------------------------
+# -- a budget at CREATION time
 
 
 def _form(page: str, action: str) -> str:
-    """The one form posting to `action`. Both create forms carry an identical budget
-    input, so a whole-page assertion is answered by whichever renders first."""
+    """The one form posting to `action`"""
     start = page.index(f'action="{action}"')
     return page[start:page.index("</form>", start)]
 
 
 def test_both_create_forms_offer_a_budget(client):
-    """The ceiling was settable only after the order existed — which is after the money
-    it was meant to bound had started being spent."""
+    """The ceiling was settable only after the order existed"""
     page = client.get("/").text
     assert 'name="budget"' in _form(page, "/wo/create")
     assert 'name="budget"' in _form(page, "/fo/create")
@@ -3058,8 +2792,7 @@ def test_creating_a_feature_order_from_the_browser_stamps_the_family_budget(clie
 
 
 def test_an_empty_budget_box_on_creation_is_not_a_zero(client):
-    """Empty means "the project's default", which is usually no ceiling. Zero would read
-    as "spend nothing", which is why `parse_amount` refuses it outright."""
+    """Empty means "the project's default", which is usually no ceiling"""
     r = client.post("/wo/create", data={"project": "proj_a", "title": "uncapped",
                                         "description": "do it", "budget": "  "})
     wo_id = r.headers["location"].rsplit("/", 1)[-1]
@@ -3075,9 +2808,7 @@ def test_an_empty_budget_box_on_creation_is_not_a_zero(client):
 @pytest.mark.parametrize("bad", ["lots", "nan", "inf", "-inf", "0"])
 def test_a_bad_budget_refuses_the_order_rather_than_filing_it_uncapped(client, project,
                                                                       bad):
-    """`nan` is the one that matters: it survives a `> 0` check, so an order carrying it
-    renders as budgeted and is never capped. Filing the order and dropping the ceiling
-    would be worse than refusing — the user asked for a cap and would not get one."""
+    """`nan` is the one that matters: it survives a `> 0` check"""
     r = client.post("/wo/create", data={"project": "proj_a", "title": "capped",
                                         "description": "do it", "budget": bad})
     assert r.status_code == 303
@@ -3095,16 +2826,13 @@ def test_a_bad_budget_refuses_the_order_rather_than_filing_it_uncapped(client, p
 
 
 def test_the_browser_side_pattern_never_rejects_what_the_server_accepts(client):
-    """The pattern exists so a typo bounces before it costs the description typed beside
-    it (Neo, q418). It is allowed to be LOOSER than `budget.parse_amount` — that just
-    means the flash does the work — but never tighter, or the box refuses a real amount
-    with no message any server-side test would ever see."""
+    """The pattern exists so a typo bounces before it costs the description typed beside it (Neo, q418)"""
     import re
 
     from jarvis import budget
 
     page = client.get("/").text
-    # Per form, so dropping the attribute from ONE of them is not covered by the other.
+    # Per form, so dropping the attribute from ONE of them is not covered by the other
     found = {form: re.findall(r'pattern="([^"]+)"', _form(page, form))
              for form in ("/wo/create", "/fo/create")}
     assert all(len(v) == 1 for v in found.values()), f"one rule per form, got {found}"
@@ -3119,8 +2847,7 @@ def test_the_browser_side_pattern_never_rejects_what_the_server_accepts(client):
 
 
 def test_the_work_order_page_says_the_pull_request_merged(client, daemon, project):
-    """The dashboard half of the 2026-09-25 spec §7 — off `ops.merge_state`, the same
-    derivation `jarvis wo show` reads, and off the event rather than `pr_state`."""
+    """The dashboard half of the 2026-09-25 spec §7"""
     pr = "https://github.com/acme/proj/pull/735"
     wo = ops.create_work_order("proj_a", "the cap")
     daemon.tick()
@@ -3148,18 +2875,12 @@ def test_a_work_order_with_no_pull_request_says_nothing_about_merging(client, da
     assert "MERGED" not in client.get(f"/wo/proj_a/{wo['id']}").text
 
 
-# -- the review control an escalated round owes ------------------------------------------
-#
-# docs/superpowers/specs/2026-09-27-a-review-control-for-an-escalated-round.md §3, §5, §7.
-# THE FIXTURE GOES THROUGH `ops.escalate_validation_round` (ruling kn-303839ee): a
-# `set_status("needs_review")` plus a hand-written round leaves no attention flag and no
-# closed round, so the test would pass against a page rendering the form unconditionally.
+# -- the review control an escalated round owes
 
 
 def _escalate(project, title="the panel gave up on it",
               cause=None):
-    """A work order in the live shape of wo-659be188: `needs_review`, latest round
-    `escalated`, no assumption rows at all."""
+    """A work order in the live shape of wo-659be188: `needs_review`"""
     store = ProjectStore(project)
     try:
         wo = store.create_work_order(title)
@@ -3174,8 +2895,7 @@ def _escalate(project, title="the panel gave up on it",
 
 
 def test_an_escalated_round_with_no_assumptions_still_offers_the_review(client, project):
-    """The whole defect: the only review form was gated on a pending assumption, so an
-    order the panel gave up on named the ask and offered no way to answer it."""
+    """The whole defect: the only review form was gated on a pending assumption"""
     wo = _escalate(project)
 
     page = client.get(f"/wo/proj_a/{wo['id']}").text
@@ -3184,12 +2904,12 @@ def test_an_escalated_round_with_no_assumptions_still_offers_the_review(client, 
     assert 'name="decision" value="accept"' in page
     assert 'name="decision" value="reject"' in page
     assert "over the panel's objection" in html.unescape(" ".join(page.split()))
-    # ...and it is where the deep link lands — §7.
+    # ...and it is where the deep link lands — §7
     assert page.count('id="pending"') == 1
 
 
 def test_the_review_control_renders_once_and_in_the_assumptions_block(client, project):
-    """Neo 838: exactly one form, never two. Both conditions are true here."""
+    """Neo 838: exactly one form, never two"""
     wo = _escalate(project)
     ops.assume(wo["id"], "assumed the API is v2")
 
@@ -3197,10 +2917,10 @@ def test_the_review_control_renders_once_and_in_the_assumptions_block(client, pr
     action = f'action="/wo/proj_a/{wo["id"]}/review"'
 
     assert page.count(action) == 1
-    # The one form is in the assumptions block, above the rounds — never beside them.
+    # The one form is in the assumptions block, above the rounds — never beside them
     block = page.split("Assumptions pending your review", 1)[1].split(">Validation<", 1)[0]
     assert action in block
-    # The line naming the round this one decision now ALSO settles.
+    # The line naming the round this one decision now ALSO settles
     assert "also settles round 1" in " ".join(block.split())
 
 
@@ -3218,21 +2938,17 @@ def test_rejecting_an_escalated_order_records_the_review_and_guides_the_worker(
         assert store.events_of_kind(wo["id"], "reviewed")
         assert [m["content"] for m in store.list_messages(wo["id"])] \
             == ["the panel is right"]
-        # THE REVIEW TOOK EFFECT, not just the delivery. `ops.review_work_order` leaves a
-        # rejection WITH feedback un-flagged (the guidance is the answer to what flagged
-        # the user), so the escalation's attention flag must be down.
+        # THE REVIEW TOOK EFFECT, not just the delivery
         after = store.get_work_order(wo["id"])
         assert not after["needs_attention"]
-        # ...and the status is unchanged by design: `needs_review` is an OPEN status and
-        # the worker resumes when jarvisd delivers the queued message, not in this process.
+        # ...and the status is unchanged by design: `needs_review` is an OPEN status and the worker resumes...
         assert after["status"] == "needs_review"
     finally:
         store.close()
 
 
 def test_the_page_still_renders_exactly_one_review_form(client, project):
-    """Spec 2026-10-14-an-escalated-round-says-why-and-what-to-run-next §5: two more
-    rows beside the existing ones, and `_review.html`'s structural guarantee holds."""
+    """Spec 2026-10-14-an-escalated-round-says-why-and-what-to-run-next §5: two more rows beside the..."""
     wo = _escalate(project)
 
     page = client.get(f"/wo/proj_a/{wo['id']}").text
@@ -3241,17 +2957,13 @@ def test_the_page_still_renders_exactly_one_review_form(client, project):
     assert page.count(f'action="/wo/proj_a/{wo["id"]}/review"') == 1
     assert "the panel rejected this and had no round left" in flat
     assert f"jarvis wo review {wo['id']} --reject" in flat
-    # The HEADER above those rows, which contradicted them — issue #1040.
+    # The HEADER above those rows, which contradicted them — issue #1040
     assert f"Round 1 {ops.ESCALATION_VERB['handover']} — your judgement" in flat
     assert "Round 1 gave up" not in flat
 
 
 def test_the_review_rows_escape_everything_they_are_handed():
-    """`review.why` and `review.next` are placeholders, so they are safe ONLY while this
-    template renders autoescaped — and `next` carries a work-order id and `why` a reason,
-    neither of which this macro sanitises. Pinned against the real environment the app
-    builds, because the escaping is the environment's and nothing in the template says so.
-    """
+    """`review.why` and `review.next` are placeholders"""
     from fastapi.templating import Jinja2Templates
 
     from jarvis.ui.app import TEMPLATES
@@ -3272,8 +2984,7 @@ def test_the_review_rows_escape_everything_they_are_handed():
 
 
 def test_the_page_of_a_no_pr_order_never_names_validation_force(client, project):
-    """The regression's fourth surface — spec §4. `ops.force_validation_refusal` refuses
-    a no-PR force, so the page must not print the command either."""
+    """The regression's fourth surface — spec §4"""
     wo = _escalate(project, cause=ops.ESCALATION_NO_VERDICT)
 
     flat = html.unescape(" ".join(client.get(f"/wo/proj_a/{wo['id']}").text.split()))
@@ -3283,9 +2994,7 @@ def test_the_page_of_a_no_pr_order_never_names_validation_force(client, project)
 
 
 def test_the_feature_order_page_never_grows_a_work_order_review_form(client, project):
-    """§5: the shared `section()` macro must not carry it. A feature order has no
-    `review_work_order` equivalent, so a form posting to `/wo/.../review` there would
-    point at nothing."""
+    """§5: the shared `section()` macro must not carry it"""
     store = ProjectStore(project)
     try:
         fo = store.create_feature_order("CSV export", description="the whole ask")
@@ -3303,10 +3012,7 @@ def test_the_feature_order_page_never_grows_a_work_order_review_form(client, pro
 
 
 def test_the_open_span_says_when_it_last_moved(client, daemon, project):
-    """Fix 4's span line: "still in it" is true but is not the live fact.
-
-    Spec: docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md.
-    """
+    """Fix 4's span line: "still in it" is true but is not the live fact (docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md)"""
     wo = ops.create_work_order("proj_a", "risky change")
     daemon.tick()
     store = ProjectStore(project)
@@ -3320,8 +3026,7 @@ def test_the_open_span_says_when_it_last_moved(client, daemon, project):
 
 
 def test_stuck_report_is_the_only_arithmetic(client, project, capsys):
-    """§7 of docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-
-    investigated.md: one reader, two renderers, and neither computes a number."""
+    """§7 of docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets- investigated.md: one..."""
     from test_health_sweep import park_order
 
     from jarvis import catalog, cli
@@ -3343,7 +3048,7 @@ def test_stuck_report_is_the_only_arithmetic(client, project, capsys):
     assert cli.main(["stuck", "--json"]) == 0
     printed = json.loads(capsys.readouterr().out)
 
-    # The clocks move between the two reads; everything the renderers DECIDE from does not.
+    # The clocks move between the two reads; everything the renderers DECIDE from does not
     moving = ("seconds_in_status", "seconds_since_activity", "active_seconds")
     assert set(printed[0]) == set(row)
     assert [{k: v for k, v in r.items() if k not in moving} for r in printed] == \
@@ -3354,12 +3059,7 @@ def test_stuck_report_is_the_only_arithmetic(client, project, capsys):
 
 
 def test_the_terminal_names_the_blocker_too(client, project, capsys):
-    """Parity fix: `jarvis stuck` prints the blocker `/stuck` already renders.
-
-    §7 of docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-
-    investigated.md: one reader, two renderers — a user-owed wait must read the same
-    in the terminal as on the page.
-    """
+    """Parity fix: `jarvis stuck` prints the blocker `/stuck` already renders"""
     from test_health_sweep import park_order
 
     from jarvis import cli
@@ -3376,11 +3076,9 @@ def test_the_terminal_names_the_blocker_too(client, project, capsys):
     assert "what the record says blocks it: worker is waiting on your input" in out
 
 
-# -- the retry control -----------------------------------------------------------------
-# docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md §7b.
+# -- the retry control
 
-#: Wording ONLY the retry section emits — a whole-page assertion is otherwise answered by
-#: the timeline or the conversation, which also talk about retries (kn-d51713af).
+#: Wording ONLY the retry section emits
 RETRY_HEADING = "Retry this work order"
 
 
@@ -3389,7 +3087,7 @@ def _page(client, wo_id: str, query: str = "") -> str:
 
 
 def _died(daemon, project, session: bool = True) -> dict:
-    """A work order whose worker died without delivering — with or without a session."""
+    """A work order whose worker died without delivering — with or without a session"""
     wo = ops.create_work_order("proj_a", "died without delivering")
     if session:
         daemon.tick()
@@ -3406,8 +3104,7 @@ def _died(daemon, project, session: bool = True) -> dict:
 
 
 def test_the_retry_control_is_on_a_failed_order_and_on_no_other(client, daemon, project):
-    """`ops.retry_state`'s None convention: no control at all where the mechanism does
-    not apply, rather than a permanently disabled box on every page."""
+    """`ops.retry_state`'s None convention: no control at all where the mechanism does not apply"""
     dead = _died(daemon, project)
     live = ops.create_work_order("proj_a", "still going")
     daemon.tick()
@@ -3422,7 +3119,7 @@ def test_the_no_session_refusal_renders_above_a_disabled_box(client, daemon, pro
     page = _page(client, wo["id"])
 
     assert "no session to relaunch" in page
-    # Above the control it governs, and the control is shut.
+    # Above the control it governs, and the control is shut
     assert page.index("no session to relaunch") < page.index('name="message"')
     assert page.count("disabled") >= 2
 
@@ -3462,8 +3159,7 @@ def test_a_refused_press_flashes_the_refusal_and_claims_nothing(client, daemon, 
 
 @pytest.mark.parametrize("crafted", ["999999", "nonsense", "-1"])
 def test_a_crafted_retried_link_states_no_fact(client, daemon, project, crafted):
-    """The notice is rebuilt from an id the record knows, never carried as text —
-    `fix_filed_notice`'s rule. An unparsable or unknown one renders no claim."""
+    """The notice is rebuilt from an id the record knows, never carried as text — `fix_filed_notice`'s rule"""
     wo = _died(daemon, project)
 
     page = _page(client, wo["id"], f"?retried={crafted}")
@@ -3472,16 +3168,11 @@ def test_a_crafted_retried_link_states_no_fact(client, daemon, project, crafted)
     assert "jarvisd launches the turn" not in page
 
 
-# -- one order, one page: links are derived from the id PREFIX -----------------------
-#
-# GitHub issue #997: the NEEDS YOU strip built `/fo/<project>/<id>` for every
-# `feature_orders` row, so an improvement order rendered with the feature template —
-# "Release this plan?", "all 0 work orders" — and the per-finding accept/reject the user
-# actually owed was only on `/io/`. `order_path` is the one derivation.
+# -- one order, one page: links are derived from the id PREFIX
 
 
 def _flagged(project, title, kind, reason):
-    """A `feature_orders` row of one kind, flagged for the user. No ceremony."""
+    """A `feature_orders` row of one kind, flagged for the user"""
     store = ProjectStore(project)
     try:
         row = store.create_feature_order(title, description="the whole ask", kind=kind)
@@ -3517,9 +3208,7 @@ def test_an_old_fo_bookmark_for_another_kind_redirects(client, project, kind, se
 
 
 def test_order_path_maps_every_prefix_and_falls_back_to_the_feature_page():
-    # In `project_store`, beside the prefixes it derives from: `search.py` links through
-    # the same derivation and must not import the FastAPI module. `ui.app` re-exports it
-    # under the same name, which is what the templates call.
+    # In `project_store`, beside the prefixes it derives from: `search.py` links through the same...
     from jarvis.project_store import order_path
     from jarvis.ui import app
 
@@ -3528,6 +3217,5 @@ def test_order_path_maps_every_prefix_and_falls_back_to_the_feature_page():
     assert order_path("proj_a", "fo-1234") == "/fo/proj_a/fo-1234"
     assert order_path("proj_a", "io-1234") == "/io/proj_a/io-1234"
     assert order_path("proj_a", "inv-1234") == "/inv/proj_a/inv-1234"
-    # Unknown prefix: the feature page, never `/wo/` — an id that names no kind is a
-    # `feature_orders` row far more often than a work order.
+    # Unknown prefix: the feature page, never `/wo/`
     assert order_path("proj_a", "zz-1234") == "/fo/proj_a/zz-1234"

@@ -1,35 +1,4 @@
-"""A pull request red only because its base was red heals itself.
-
-docs/superpowers/specs/2026-09-18-a-red-base-heals-itself.md.
-
-THE TWO PRODUCTION SHAPES, measured on the fleet 2026-09-18, are named in the docstrings
-below and drive the tests rather than being quoted beside them:
-
-* **Shape 1** — wo-43c4c665, PR #280, check `unit (3.12)`, run 35302313324, started
-  03:12:17Z, built at merge commit 07a05eb.
-* **Shape 2** — wo-b2f88616, PR #298, check `unit (3.11)`, run 35315816246, started
-  06:39:22Z. Note the SHARD DIFFERS from shape 1's: fail-fast cancels siblings, which is
-  why the recogniser pairs on the WORKFLOW and not on the job name (Neo question 435).
-
-Both were byte-identical to `main`'s own failure at the time: run 35298519923 at 9dd7bcc,
-started 02:13:51Z. `main` recovered at run 35361364013, commit e080156, 15:16:03Z, and
-neither pull request healed — GitHub never rebuilds a pull request's merge ref when its
-base moves. Each burned three worker turns, about USD 5.22, on three identical answers.
-
-**THE TWO WRONG IMPLEMENTATIONS THIS FILE EXISTS TO CATCH**, because both look like
-success from the outside:
-
-1. **Re-running the build.** A re-run replays the same merge commit, so it reproduces an
-   inherited failure for ever at full CI cost; both re-runs tried on production came back
-   red. The fake models the merge ref rather than the outcome — `pr update-branch` moves
-   `headRefOid` and leaves the checks alone — so an implementation that re-runs never gets
-   a green pull request here either.
-2. **Stopping when CI goes green.** Updating the branch MOVES THE HEAD, and auto-merge
-   refuses a commit no round judged, so the healed pull request is held `sha_moved` and
-   the stall is the same one wearing a better label. Both production pull requests did
-   exactly this and needed `jarvis validation force` by hand. So the acceptance here is
-   that the pull request MERGES, not that it goes green.
-"""
+"""A pull request red only because its base was red heals itself (docs/superpowers/specs/2026-09-18-a-red-base-heals-itself.md)"""
 
 from __future__ import annotations
 
@@ -51,43 +20,38 @@ from jarvis.testing import make_git_project
 PR = "https://github.com/acme/proj/pull/7"
 PR2 = "https://github.com/acme/proj/pull/8"
 
-#: Shape 1's commits, at their production lengths — the judged one and the one the
-#: branch update produced. `jarvis wo show` reported exactly this pair on wo-43c4c665.
+#: Shape 1's commits, at their production lengths
 JUDGED = "709582ae53000000000000000000000000000aaa"
 UPDATED = "c2120424ba000000000000000000000000000bbb"
-#: Shape 2's, on the second pull request of the fleet-wide test.
+#: Shape 2's, on the second pull request of the fleet-wide test
 JUDGED2 = "a650fd2c98000000000000000000000000000ccc"
 UPDATED2 = "85dbac55fb000000000000000000000000000ddd"
 
 
 def check(name: str, conclusion: str, started: str = "2026-09-18T03:12:17Z",
           workflow: str = "ci", status: str = "COMPLETED") -> dict:
-    """One `statusCheckRollup` entry, with the two fields the recogniser reads.
-
-    `startedAt` and `workflowName` cost nothing — `gh` answers `statusCheckRollup` whole
-    — so they are in the payload both readers already parse.
-    """
+    """One `statusCheckRollup` entry, with the two fields the recogniser reads"""
     return {"__typename": "CheckRun", "name": name, "status": status,
             "conclusion": conclusion, "startedAt": started, "workflowName": workflow}
 
 
 def run(run_id: int, sha: str, conclusion: str, started: str,
         workflow: str = "ci", status: str = "completed") -> dict:
-    """One `gh run list` row. LOWER CASE conclusions, as the real CLI answers them."""
+    """One `gh run list` row"""
     return {"databaseId": run_id, "headSha": sha, "conclusion": conclusion,
             "status": status, "startedAt": started, "workflowName": workflow}
 
 
-#: `main`'s own failure, and its recovery. The real run ids and the real instants.
+#: `main`'s own failure, and its recovery
 MAIN_RED = run(35298519923, "9dd7bcc", "failure", "2026-09-18T02:13:51Z")
 MAIN_GREEN = run(35361364013, "e080156", "success", "2026-09-18T15:16:03Z")
-#: A green `main` from BEFORE the pull request's check ran — the control.
+#: A green `main` from BEFORE the pull request's check ran — the control
 MAIN_WAS_GREEN = run(35290000000, "1111111", "success", "2026-09-18T01:00:00Z")
 
-#: Shape 1: the branch is red on one shard, its siblings cancelled by fail-fast.
+#: Shape 1: the branch is red on one shard, its siblings cancelled by fail-fast
 RED_312 = [check("unit (3.12)", "FAILURE"), check("unit (3.11)", "CANCELLED"),
            check("evals", "SUCCESS")]
-#: Shape 2: the SAME inherited failure surfacing on a different shard.
+#: Shape 2: the SAME inherited failure surfacing on a different shard
 RED_311 = [check("unit (3.11)", "FAILURE", started="2026-09-18T06:39:22Z"),
            check("evals", "SUCCESS", started="2026-09-18T06:39:22Z")]
 GREEN = [check("unit (3.12)", "SUCCESS", started="2026-09-18T16:00:00Z"),
@@ -102,10 +66,7 @@ def started(jarvis_home, fake_claude, catalog_file, project):
 
 def parked(project_path, *, pr_url: str = PR, judged: str = JUDGED,
            title: str = "add feature X"):
-    """A work order finished behind a pull request, with a passed round on `judged`.
-
-    Everything the heal and the merge both need, so each test moves exactly one fact.
-    """
+    """A work order finished behind a pull request, with a passed round on `judged`"""
     store = ProjectStore(project_path)
     wo = ops.create_work_order("proj_a", title)
     ops.finish(wo["id"], "opened a PR", pr_url=pr_url)
@@ -126,18 +87,12 @@ def opt_in(daemon):
     spec.validation.auto_merge = True
 
 
-# -- recognising it -------------------------------------------------------------------
+# -- recognising it
 
 
 def test_a_check_that_failed_on_a_red_base_is_rebuilt_and_the_worker_is_not_nudged(
         started, project, fake_gh):
-    """SHAPE 1 — wo-43c4c665, PR #280, `unit (3.12)`, run 35302313324 started 03:12:17Z
-    against a `main` whose head was 9dd7bcc (run 35298519923, red, 02:13:51Z), with
-    `main` green again at e080156 (run 35361364013, 15:16:03Z).
-
-    The whole point in one assertion pair: the branch is rebuilt, and the worker — who
-    answered this correctly three times and could do nothing — is never asked.
-    """
+    """SHAPE 1 — wo-43c4c665, PR #280"""
     store, wo = parked(project)
     fake_gh.set_pr(PR, "OPEN", checks=RED_312, head_oid=JUDGED)
     fake_gh.set_runs("main", [MAIN_GREEN, MAIN_RED])
@@ -152,10 +107,7 @@ def test_a_check_that_failed_on_a_red_base_is_rebuilt_and_the_worker_is_not_nudg
 
 def test_the_os_updates_the_branch_and_never_re_runs_the_build(started, project,
                                                                fake_gh):
-    """THE PLAUSIBLE WRONG IMPLEMENTATION, and it fails silently in production: a re-run
-    replays the same merge commit (run 35302313324 is fixed at 07a05eb, the merge with a
-    red `main`), so it comes back red having spent a full build. Both re-runs the user
-    tried on 2026-09-18 did exactly that."""
+    """THE PLAUSIBLE WRONG IMPLEMENTATION"""
     store, _ = parked(project)
     fake_gh.set_pr(PR, "OPEN", checks=RED_312, head_oid=JUDGED)
     fake_gh.set_runs("main", [MAIN_GREEN, MAIN_RED])
@@ -168,9 +120,7 @@ def test_the_os_updates_the_branch_and_never_re_runs_the_build(started, project,
 
 def test_a_branch_that_broke_itself_is_still_the_workers_problem(started, project,
                                                                  fake_gh):
-    """THE CONTROL, and the one that must not regress: `main` was green when this check
-    ran and is green now, so the failure is the branch's own. Unchanged behaviour — the
-    worker is nudged exactly as it is today, and nothing is pushed anywhere."""
+    """THE CONTROL, and the one that must not regress: `main` was green when this check ran and is green..."""
     store, wo = parked(project)
     fake_gh.set_pr(PR, "OPEN", checks=RED_312, head_oid=JUDGED)
     fake_gh.set_runs("main", [MAIN_GREEN, MAIN_WAS_GREEN])
@@ -185,9 +135,7 @@ def test_a_branch_that_broke_itself_is_still_the_workers_problem(started, projec
 
 
 def test_a_legacy_commit_status_is_never_judged_inherited(started, project, fake_gh):
-    """A commit status carries no workflow and no start time, so the recogniser cannot
-    place it against the base's history. It falls through to the worker — today's
-    behaviour, and the safe direction for anything this heal cannot reason about."""
+    """A commit status carries no workflow and no start time"""
     store, wo = parked(project)
     fake_gh.set_pr(PR, "OPEN", head_oid=JUDGED,
                    checks=[{"__typename": "StatusContext", "context": "buildkite",
@@ -200,15 +148,12 @@ def test_a_legacy_commit_status_is_never_judged_inherited(started, project, fake
     assert store.pr_repair_attempts(wo["id"], "checks") == 1
 
 
-# -- not spending a worker turn on the unfixable case ---------------------------------
+# -- not spending a worker turn on the unfixable case
 
 
 def test_while_the_base_is_red_no_attempt_is_spent_and_the_status_line_says_why(
         started, project, fake_gh):
-    """THE WASTE THIS ORDER WAS FILED OVER. While `main` is red nothing the worker pushes
-    can pass, so each nudge is a whole conversation re-sent for an answer that cannot
-    change. No attempt is spent, nothing is pushed — and the work order SAYS what it is
-    waiting for, because a parked order that is silent reads as one the OS forgot."""
+    """THE WASTE THIS ORDER WAS FILED OVER"""
     store, wo = parked(project)
     fake_gh.set_pr(PR, "OPEN", checks=RED_312, head_oid=JUDGED)
     fake_gh.set_runs("main", [MAIN_RED])
@@ -223,18 +168,14 @@ def test_while_the_base_is_red_no_attempt_is_spent_and_the_status_line_says_why(
     row = store.get_work_order(wo["id"])
     assert status_label(store, row) == (
         "waiting_pr_merge — " + BASE_RED_NOTE.format(base="main"))
-    # Said ONCE however long the base stays broken, and it asks nobody for anything:
-    # the OS is waiting for a build that is already running, not for a decision.
+    # Said ONCE however long the base stays broken
     assert len(store.events_of_kind(wo["id"], "pr_base_health")) == 1
     assert not row["needs_attention"]
 
 
 def test_the_waiting_note_comes_down_when_the_pull_request_goes_green(
         started, project, fake_gh):
-    """The other end of the note, and the reason the poll pays a fourth indexed read: a
-    pull request whose checks predate the breakage can go green while `main` is still
-    red, and a status line left saying "waiting for main" would send the user looking
-    for something that no longer blocks them."""
+    """The other end of the note, and the reason the poll pays a fourth indexed read: a pull request whose..."""
     store, wo = parked(project)
     fake_gh.set_pr(PR, "OPEN", checks=RED_312, head_oid=JUDGED)
     fake_gh.set_runs("main", [MAIN_RED])
@@ -248,22 +189,12 @@ def test_the_waiting_note_comes_down_when_the_pull_request_goes_green(
     assert status_label(store, store.get_work_order(wo["id"])) == "waiting_pr_merge"
 
 
-# -- bounding it ----------------------------------------------------------------------
+# -- bounding it
 
 
 def test_a_rebuilt_branch_that_is_still_red_falls_through_to_the_worker_once(
         started, project, fake_gh):
-    """SHAPE 2 — wo-b2f88616, PR #298, `unit (3.11)`, run 35315816246 started 06:39:22Z.
-
-    Note the shard: `main`'s red run failed a DIFFERENT job of the same matrix, so a
-    recogniser that paired on the job name would refuse to heal this one. It pairs on
-    the workflow instead (Neo question 435).
-
-    And the bound: once the merge ref has been rebuilt on a green base and CI is STILL
-    red, the failure is the branch's own. The worker is nudged and the branch is never
-    updated a second time for that base commit — an update would only reproduce the same
-    commit, which is the re-run trap one level along.
-    """
+    """SHAPE 2 — wo-b2f88616, PR #298, `unit (3.11)`, run 35315816246 started 06:39:22Z"""
     store, wo = parked(project, judged=JUDGED2)
     fake_gh.set_pr(PR, "OPEN", checks=RED_311, head_oid=JUDGED2)
     fake_gh.set_runs("main", [MAIN_GREEN, MAIN_RED])
@@ -273,7 +204,7 @@ def test_a_rebuilt_branch_that_is_still_red_falls_through_to_the_worker_once(
     assert fake_gh.updates == [PR]
     assert store.pr_repair_attempts(wo["id"], "checks") == 0
 
-    # Rebuilt, and red again on the new head: the branch really is broken.
+    # Rebuilt, and red again on the new head: the branch really is broken
     fake_gh.set_pr(PR, "OPEN", checks=RED_311, head_oid=UPDATED2)
     poll(started, store)
 
@@ -285,9 +216,7 @@ def test_a_rebuilt_branch_that_is_still_red_falls_through_to_the_worker_once(
 
 def test_an_update_github_refuses_spends_the_attempt_and_reaches_the_worker(
         started, project, fake_gh):
-    """A refusal counts the same as a success, or a pull request GitHub will not update
-    is retried every two minutes for ever and never reaches the worker who could fix it.
-    The recorded reason is this OS's own phrase, never `gh`'s stderr."""
+    """A refusal counts the same as a success"""
     store, wo = parked(project)
     fake_gh.set_pr(PR, "OPEN", checks=RED_312, head_oid=JUDGED)
     fake_gh.set_runs("main", [MAIN_GREEN, MAIN_RED])
@@ -302,20 +231,14 @@ def test_an_update_github_refuses_spends_the_attempt_and_reaches_the_worker(
     payload = db.from_json(failed[0]["payload"], {})
     assert payload["base_sha"] == "e080156"
     assert "merge conflict" not in payload["reason"]     # our vocabulary, not gh's
-    # Nudged on the first tick, when the refusal fell through. The second tick neither
-    # re-updates (the attempt is spent) nor re-nudges — `heal_pull_request`'s existing
-    # guard sees the message still queued, which is the behaviour that was already right.
+    # Nudged on the first tick, when the refusal fell through
     assert store.pr_repair_attempts(wo["id"], "checks") == 1
     assert len(store.queued_messages(wo["id"])) == 1
 
 
 def test_a_conflicting_pull_request_is_the_conflict_paths_and_never_this_ones(
         started, project, fake_gh):
-    """Where a conflicting update goes, and it is answered STRUCTURALLY rather than by
-    policy: `elif pr.conflicting` precedes `elif pr.failing`, so a pull request GitHub
-    says will not merge never reaches this heal at all. The existing conflict episode
-    owns it, which is the right owner — a worker resolving the conflict merges its base
-    in anyway, and that cures the inherited failure too."""
+    """Where a conflicting update goes"""
     store, wo = parked(project)
     fake_gh.set_pr(PR, "OPEN", checks=RED_312, mergeable="CONFLICTING",
                    merge_state="DIRTY", head_oid=JUDGED)
@@ -330,10 +253,7 @@ def test_a_conflicting_pull_request_is_the_conflict_paths_and_never_this_ones(
 
 def test_the_heal_waits_while_the_panel_is_reading_the_branch(started, project,
                                                               fake_gh):
-    """Neo question 283's hazard, one mechanism along and stronger: this MOVES THE HEAD,
-    so running it under an open round is the branch moving beneath the seats
-    mid-judgement. Deferred, never dropped — nothing is nudged either, so the attempt
-    budget is not spent while the OS waits."""
+    """Neo question 283's hazard, one mechanism along and stronger: this MOVES THE HEAD"""
     store, wo = parked(project)
     store.open_validation_round(wo_id=wo["id"], fingerprint="fp2")
     fake_gh.set_pr(PR, "OPEN", checks=RED_312, head_oid=JUDGED)
@@ -345,20 +265,12 @@ def test_the_heal_waits_while_the_panel_is_reading_the_branch(started, project,
     assert store.pr_repair_attempts(wo["id"], "checks") == 0
 
 
-# -- the fleet ------------------------------------------------------------------------
+# -- the fleet
 
 
 def test_the_base_going_green_clears_stale_red_checks_across_the_whole_fleet(
         started, project, fake_gh):
-    """THE GAP ONE LEVEL UP. When `main` recovers, EVERY open pull request is carrying a
-    stale red check — not just the ones a worker happened to be nudged about. A heal
-    driven per pull request by something that was already looking at it would leave the
-    rest sitting red until somebody noticed.
-
-    So the base's CI is read ONCE for the project and shared across the loop: one
-    `gh run list` for the whole fleet, and every parked pull request rebuilt on the same
-    tick. Shapes 1 and 2 are the two pull requests here, as they were on production.
-    """
+    """THE GAP ONE LEVEL UP"""
     store, one = parked(project, pr_url=PR, judged=JUDGED, title="shape one")
     _, two = parked(project, pr_url=PR2, judged=JUDGED2, title="shape two")
     fake_gh.set_pr(PR, "OPEN", checks=RED_312, head_oid=JUDGED)
@@ -371,14 +283,12 @@ def test_the_base_going_green_clears_stale_red_checks_across_the_whole_fleet(
     for wo_id in (one["id"], two["id"]):
         assert store.queued_messages(wo_id) == []
         assert len(store.events_of_kind(wo_id, "pr_base_updated")) == 1
-    # ONE base read for the whole project, however many pull requests it has.
+    # ONE base read for the whole project, however many pull requests it has
     assert len([c for c in fake_gh.calls if c["argv"][:2] == ["run", "list"]]) == 1
 
 
 def test_a_pull_request_with_no_session_is_healed_too(started, project, fake_gh):
-    """`heal_pull_request` returns early with no session to resume, so before this a
-    pull request whose worker was gone could never be repaired at all. Nothing here
-    talks to a worker, so that guard does not apply and must not be copied."""
+    """`heal_pull_request` returns early with no session to resume"""
     store, wo = parked(project)
     store.update_work_order(wo["id"], session_id=None)
     fake_gh.set_pr(PR, "OPEN", checks=RED_312, head_oid=JUDGED)
@@ -389,18 +299,12 @@ def test_a_pull_request_with_no_session_is_healed_too(started, project, fake_gh)
     assert fake_gh.updates == [PR]
 
 
-# -- the heal is done when it MERGES --------------------------------------------------
+# -- the heal is done when it MERGES
 
 
 def test_the_heal_carries_the_verdict_and_the_pull_request_actually_merges(
         started, project, fake_gh, local_base):
-    """END TO END, AND THIS IS THE ACCEPTANCE THAT MATTERS. A test stopping at "CI went
-    green" passes on an implementation that leaves the pull request held `sha_moved`,
-    which is what happened by hand on production: PR #280 judged 709582ae53, head moved
-    to c2120424ba, every check green, `CLEAN`, and it did not merge.
-
-    Three ticks, which is the state machine: update the branch, watch CI, merge.
-    """
+    """END TO END, AND THIS IS THE ACCEPTANCE THAT MATTERS (#280)"""
     opt_in(started)
     store, wo = parked(project)
     fake_gh.set_pr(PR, "OPEN", checks=RED_312, head_oid=JUDGED)
@@ -414,7 +318,7 @@ def test_the_heal_carries_the_verdict_and_the_pull_request_actually_merges(
     payload = db.from_json(carried[0]["payload"], {})
     assert payload["judged_sha"] == JUDGED
     assert payload["carried_head_sha"] == UPDATED
-    # `head_sha` still says what the SEATS read. Only `carried_head_sha` moved.
+    # `head_sha` still says what the SEATS read
     row = store.latest_validation_round(wo_id=wo["id"])
     assert row["head_sha"] == JUDGED and row["carried_head_sha"] == UPDATED
     assert ProjectStore.validated_head(row) == UPDATED
@@ -423,8 +327,7 @@ def test_the_heal_carries_the_verdict_and_the_pull_request_actually_merges(
     poll(started, store)                                    # 2. green on the new head
     approvals = store.list_approvals(wo["id"])
     assert len(approvals) == 1 and approvals[0]["kind"] == "auto_merge"
-    # THE MERGE IS STILL GATED. The carry changes what this request says, never whether
-    # one is filed — nothing about the heal lets the OS merge unreviewed.
+    # THE MERGE IS STILL GATED
     gates.apply_decision(store, approvals[0]["id"], "approved", "ok", "neo",
                          project="proj_a")
 
@@ -436,10 +339,7 @@ def test_the_heal_carries_the_verdict_and_the_pull_request_actually_merges(
 
 
 def test_a_worker_push_after_the_heal_is_not_carried(started, project, fake_gh):
-    """THE SCOPE OF THE WEAKENING. The carry is licensed by "this commit differs from
-    the judged one by a merge of the base and nothing else". A worker that pushes
-    afterwards breaks that, the head leaves `carried_head_sha`, and `decide` holds
-    `sha_moved` again — correctly, because now there IS new authored content."""
+    """THE SCOPE OF THE WEAKENING"""
     opt_in(started)
     store, wo = parked(project)
     fake_gh.set_pr(PR, "OPEN", checks=RED_312, head_oid=JUDGED)
@@ -453,8 +353,7 @@ def test_a_worker_push_after_the_heal_is_not_carried(started, project, fake_gh):
 
     assert store.list_approvals(wo["id"]) == []
     held = store.events_of_kind(wo["id"], "automerge_held")
-    # The first tick held on CI — it had finished and FAILED on that commit, the
-    # inherited failure. The SECOND is the one this test is about.
+    # The first tick held on CI — it had finished and FAILED on that commit, the inherited failure
     assert [db.from_json(e["payload"], {})["code"] for e in held] == [
         automerge.HELD_CHECKS_FAILED, automerge.HELD_SHA_MOVED]
     assert db.from_json(held[-1]["payload"], {})["judged_sha"] == UPDATED
@@ -463,11 +362,7 @@ def test_a_worker_push_after_the_heal_is_not_carried(started, project, fake_gh):
 
 def test_the_head_the_carry_rests_on_is_re_read_immediately_before_the_update(
         started, project, fake_gh):
-    """REVIEW ROUND 1. The `pr.head_oid` taken at the top of the poll loop is a stale
-    snapshot by the time the update runs: the `busy` guard and a `gh run list` with a
-    30s timeout both sit in between, and a worker turn can end and push inside that
-    window. So the head is read again AFTER the guards and immediately before the
-    update, and the call order is what says so."""
+    """REVIEW ROUND 1"""
     store, _ = parked(project)
     fake_gh.set_pr(PR, "OPEN", checks=RED_312, head_oid=JUDGED)
     fake_gh.set_runs("main", [MAIN_GREEN, MAIN_RED])
@@ -481,22 +376,13 @@ def test_the_head_the_carry_rests_on_is_re_read_immediately_before_the_update(
 
 def test_a_push_that_beat_the_update_is_caught_by_the_commits_parents(
         started, project, fake_gh):
-    """REVIEW ROUND 1, and the half that cannot be raced. `gh pr update-branch` has no
-    `--match-head-commit`, so narrowing the window is not closing it: a worker can still
-    push between the re-read and the update landing. The carry is therefore proved from
-    what the resulting commit ACTUALLY merged — a head built on a worker's push has that
-    push as its first parent, not the judged commit.
-
-    Without this the OS would bind the panel's verdict to code the seats never read and
-    record "no authored content changed" beside it, which `automerge.decide` and the
-    gate request would both then repeat to Neo. Silent, and it falls open.
-    """
+    """REVIEW ROUND 1, and the half that cannot be raced"""
     opt_in(started)
     store, wo = parked(project)
     fake_gh.set_pr(PR, "OPEN", checks=RED_312, head_oid=JUDGED)
     fake_gh.set_runs("main", [MAIN_GREEN, MAIN_RED])
     fake_gh.updated_head(UPDATED)
-    # The worker's push landed in the window, so the update merged the base into THAT.
+    # The worker's push landed in the window, so the update merged the base into THAT
     raced = "0ddba11000000000000000000000000000000111"
     fake_gh.set_parents(UPDATED, [raced, "basecommit0"])
 
@@ -508,8 +394,7 @@ def test_a_push_that_beat_the_update_is_caught_by_the_commits_parents(
     assert row["carried_head_sha"] == ""
     assert ProjectStore.validated_head(row) == JUDGED
 
-    # ...and the pull request is HELD rather than merged, which is the direction this
-    # failure has to fall.
+    # ...and the pull request is HELD rather than merged, which is the direction this failure has to fall
     fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=UPDATED)
     poll(started, store)
     assert store.list_approvals(wo["id"]) == []
@@ -518,9 +403,7 @@ def test_a_push_that_beat_the_update_is_caught_by_the_commits_parents(
 
 def test_a_carry_is_refused_when_the_parents_cannot_be_read_at_all(started, project,
                                                                    fake_gh):
-    """The proof is a network call and it can fail. An unprovable carry is not a carry:
-    the pull request stays bound to the commit the seats read and waits for a person,
-    which is worse than a carry and much better than one nobody can justify."""
+    """The proof is a network call and it can fail"""
     store, wo = parked(project)
     fake_gh.set_pr(PR, "OPEN", checks=RED_312, head_oid=JUDGED)
     fake_gh.set_runs("main", [MAIN_GREEN, MAIN_RED])
@@ -534,26 +417,20 @@ def test_a_carry_is_refused_when_the_parents_cannot_be_read_at_all(started, proj
 
 
 @pytest.mark.parametrize("parents, carried", [
-    # The shape a rebuilt merge ref has: judged first, the base second.
+    # The shape a rebuilt merge ref has: judged first, the base second
     ((JUDGED, "basecommit0"), True),
-    # Judged as the SECOND parent. The first is the side the merge was made ONTO, so
-    # this is a different history with somebody else's work at its root and
-    # `git log --first-parent` would never show the reviewed branch at all.
+    # Judged as the SECOND parent
     (("basecommit0", JUDGED), False),
-    # Not a merge: one parent means the branch was rebased or rewritten, which
-    # `update_branch` never does and nothing else may be carried over.
+    # Not a merge: one parent means the branch was rebased or rewritten
     ((JUDGED,), False),
-    # An octopus merge brought in something nobody accounted for.
+    # An octopus merge brought in something nobody accounted for
     ((JUDGED, "basecommit0", "somethingelse"), False),
-    # Unreadable.
+    # Unreadable
     ((), False),
 ])
 def test_only_a_two_parent_merge_onto_the_judged_commit_may_be_carried(
         started, project, fake_gh, parents, carried):
-    """The predicate itself, driven directly rather than through the poll — the fixture
-    cannot produce most of these through `update-branch`, because GitHub never builds
-    one that way, and "the fake cannot express it" is not a reason to leave the rule
-    untested."""
+    """The predicate itself, driven directly rather than through the poll"""
     store, wo = parked(project)
 
     out = ops.carry_validated_head(store, wo, judged=JUDGED, head_after=UPDATED,
@@ -566,10 +443,7 @@ def test_only_a_two_parent_merge_onto_the_judged_commit_may_be_carried(
 
 def test_nothing_is_carried_when_the_head_had_already_moved_off_the_verdict(
         started, project, fake_gh):
-    """Fact 2 of the carry: the commit the panel accepted must be the one this update
-    replaced. A worker that pushed before the heal means the pull request was already
-    going to be held `sha_moved`, and carrying a verdict onto a commit built from that
-    push would bind the panel to work it never read."""
+    """Fact 2 of the carry: the commit the panel accepted must be the one this update replaced"""
     store, wo = parked(project)
     ahead = "beefcafe00000000000000000000000000000fff"
     fake_gh.set_pr(PR, "OPEN", checks=RED_312, head_oid=ahead)
@@ -586,9 +460,7 @@ def test_nothing_is_carried_when_the_head_had_already_moved_off_the_verdict(
 
 
 def test_a_carry_can_never_manufacture_a_binding_the_seats_never_made():
-    """A round that recorded no judged commit can never auto-merge, and a carry must not
-    be the way round that. Both halves are asserted here rather than driven, because the
-    population this protects is every round judged before `head_sha` shipped."""
+    """A round that recorded no judged commit can never auto-merge"""
     assert ProjectStore.validated_head(
         {"outcome": "passed", "head_sha": "", "carried_head_sha": UPDATED}) is None
     assert ProjectStore.validated_head(
@@ -597,7 +469,7 @@ def test_a_carry_can_never_manufacture_a_binding_the_seats_never_made():
         {"outcome": "passed", "head_sha": JUDGED, "carried_head_sha": ""}) == JUDGED
 
 
-# -- the recogniser, without a network ------------------------------------------------
+# -- the recogniser, without a network
 
 
 BASE = (ci.Run(35361364013, "e080156", "success", "completed",
@@ -607,27 +479,25 @@ BASE = (ci.Run(35361364013, "e080156", "success", "completed",
 
 
 @pytest.mark.parametrize("started_at, workflow, verdict", [
-    # Shape 1 and shape 2: ran while 9dd7bcc was head, and `main` is green now.
+    # Shape 1 and shape 2: ran while 9dd7bcc was head, and `main` is green now
     ("2026-09-18T03:12:17Z", "ci", True),
     ("2026-09-18T06:39:22Z", "ci", True),
-    # Ran BEFORE the base broke: whatever is wrong is the branch's own.
+    # Ran BEFORE the base broke: whatever is wrong is the branch's own
     ("2026-09-18T01:00:00Z", "ci", False),
-    # Ran after the recovery: it was built against a base that works.
+    # Ran after the recovery: it was built against a base that works
     ("2026-09-18T16:00:00Z", "ci", False),
-    # A workflow the base does not run cannot be paired with any base verdict.
+    # A workflow the base does not run cannot be paired with any base verdict
     ("2026-09-18T03:12:17Z", "release", False),
-    # No workflow at all — a legacy commit status.
+    # No workflow at all — a legacy commit status
     ("2026-09-18T03:12:17Z", "", False),
 ])
 def test_the_recogniser_is_temporal_and_workflow_scoped(started_at, workflow, verdict):
-    """The table, both directions, without a daemon. A false positive costs one bounded
-    branch update; a false negative costs exactly today's behaviour."""
+    """The table, both directions, without a daemon"""
     assert ci.inherited({"started_at": started_at, "workflow": workflow}, BASE) is verdict
 
 
 def test_a_base_still_building_does_not_read_as_recovered():
-    """`main` is red and a fix is IN PROGRESS. The heal must wait rather than rebuild
-    against a base nobody has judged yet — `latest` takes the newest COMPLETED run."""
+    """`main` is red and a fix is IN PROGRESS"""
     building = (ci.Run(35399655231, "abc1234", "", "in_progress",
                        ci.parse_ts("2026-09-18T15:00:00Z"), "ci"), BASE[1])
     assert ci.base_is_red(building, ("ci",))
@@ -636,8 +506,7 @@ def test_a_base_still_building_does_not_read_as_recovered():
 
 
 def test_a_cancelled_base_run_says_nothing_about_the_code():
-    """A human stopping a run on `main` is not `main` being broken, and reading it as
-    one would rebuild every pull request in the fleet for nothing."""
+    """A human stopping a run on `main` is not `main` being broken"""
     cancelled = (ci.Run(1, "abc1234", "cancelled", "completed",
                         ci.parse_ts("2026-09-18T02:13:51Z"), "ci"),)
     assert not ci.base_is_red(cancelled, ("ci",))
@@ -645,17 +514,11 @@ def test_a_cancelled_base_run_says_nothing_about_the_code():
                             cancelled)
 
 
-# -- the write surface ----------------------------------------------------------------
+# -- the write surface
 
 
 def test_this_module_writes_only_the_branch_update():
-    """`tests/test_github_artifact.py`'s guard, for the module that is ALLOWED to write.
-
-    `github.py` proves it runs no write verb at all, which is what keeps a judging seat
-    unable to talk to the implementor it is reviewing. That property is why the write
-    lives here instead, and it is worth nothing unless this module's own surface is
-    pinned too: the OS may update a branch and do nothing else from this file.
-    """
+    """`tests/test_github_artifact.py`'s guard, for the module that is ALLOWED to write"""
     tree = ast.parse(Path(ci.__file__).read_text())
     verbs = set()
     for node in ast.walk(tree):
@@ -671,8 +534,7 @@ def test_this_module_writes_only_the_branch_update():
 
 
 def test_a_branch_name_github_answered_is_still_checked_before_it_is_an_argument():
-    """`baseRefName` comes back from GitHub about a pull request whose URL a WORKER
-    wrote, and a name opening with `-` sits where `gh` would read a flag."""
+    """`baseRefName` comes back from GitHub about a pull request whose URL a WORKER wrote"""
     from jarvis.github import GitHubError
 
     for bad in ("--repo=someone/else", "-x", "main;rm -rf /", ""):
@@ -680,36 +542,25 @@ def test_a_branch_name_github_answered_is_still_checked_before_it_is_an_argument
             ci.base_runs(bad)
 
 
-# -- a catch-up with `main` costs no round ---------------------------------------------
-# docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md, issue #806:
-# the carry above, generalised from ONE merge the OS made to a CHAIN of base merges
-# anyone made — and proved twice, because parentage alone would carry an evil merge.
+# -- a catch-up with `main` costs no round
 
-#: The chain: JUDGED, then `main` merged in twice. Production lengths, as above.
+#: The chain: JUDGED, then `main` merged in twice
 MID = "1a2b3c4d5e00000000000000000000000000f001"
 CAUGHT_UP = "2b3c4d5e6f00000000000000000000000000f002"
 BASE1 = "3c4d5e6f7a00000000000000000000000000f003"
 BASE2 = "4d5e6f7a8b00000000000000000000000000f004"
 WORKER_PUSH = "5e6f7a8b9c00000000000000000000000000f005"
-#: The divergent pull-merge shape of wo-00bd1096 / PR #779: a merge of two lineages of the
-#: BRANCH itself, its second parent already contained in JUDGED (§3.2 item 6, Neo 806).
+#: The divergent pull-merge shape of wo-00bd1096 / PR #779: a merge of two lineages of the BRANCH...
 PULL_MERGE = "6f7a8b9c0d00000000000000000000000000f006"
 BRANCH_SIDE = "7a8b9c0d1e00000000000000000000000000f007"
 
 
 @pytest.fixture()
 def local_proof(monkeypatch):
-    """Proof (b) and the ancestry half of proof (a), answered without a checkout. §3.3.
-
-    The `project` fixture is a repository with no `origin`, so a real fetch resolves
-    nothing here. The git itself is proved against a real clone below, and the refusal a
-    failed fetch produces is driven through the real code in
-    `test_a_fetch_that_fails_refuses_the_carry_and_merges_nothing`.
-    """
+    """Proof (b) and the ancestry half of proof (a), answered without a checkout. §3.3"""
     from jarvis import branchproof
 
-    # THE REAL ONES, kept reachable: the two whitespace tests below drive the daemon with
-    # ids a real repository produced, so they need the git behind the fake (review round 1).
+    # THE REAL ONES, kept reachable: the two whitespace tests below drive the daemon with ids a real...
     state = {"id": "b7f0deadbeef", "ids": {}, "ancestors": None, "contained": set(),
              "git_fetch": branchproof.fetch, "git_fingerprint": branchproof.diff_fingerprint}
 
@@ -720,9 +571,7 @@ def local_proof(monkeypatch):
         return state["ids"].get(sha, state["id"])
 
     def is_ancestor(repo, ancestor, descendant):
-        # TWO DESCENDANTS, and telling them apart is the whole of Neo question 806's
-        # widening: `origin/<base>` (a base merge) and the JUDGED commit (a pull merge of
-        # the branch's own lineage). `contained` is the second set.
+        # TWO DESCENDANTS, and telling them apart is the whole of Neo question 806's widening:...
         if descendant.startswith("origin/"):
             return state["ancestors"] is None or ancestor in state["ancestors"]
         return ancestor in state["contained"]
@@ -734,7 +583,7 @@ def local_proof(monkeypatch):
 
 
 def api_reads(fake_gh) -> list[str]:
-    """Every commit the walk asked GitHub about — the bound is a length of this list."""
+    """Every commit the walk asked GitHub about — the bound is a length of this list"""
     return [c["argv"][3].rsplit("/", 1)[-1] for c in fake_gh.calls
             if c["argv"][:2] == ["api", "--method"] and "/commits/" in c["argv"][3]]
 
@@ -746,13 +595,7 @@ def refusals(store, wo) -> list[str]:
 
 def test_two_base_merges_in_a_row_carry_the_verdict_and_cost_no_round(
         started, project, fake_gh, local_proof, local_base):
-    """THE WHOLE FEATURE. `main` was merged in twice — by a worker clearing a conflict, by
-    the user pressing "Update branch", it does not matter — so the head is two commits
-    past the one round 1 read. Today that costs a round, and on the last one it strands
-    the order in front of the user (wo-00bd1096, wo-8736a5c5).
-
-    The acceptance is that it MERGES on no new round: the carry, the same-tick re-decide
-    (§3.5 step 3), the gate, the merge."""
+    """THE WHOLE FEATURE"""
     opt_in(started)
     store, wo = parked(project)
     fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=CAUGHT_UP)
@@ -771,9 +614,9 @@ def test_two_base_merges_in_a_row_carry_the_verdict_and_cost_no_round(
     row = store.latest_validation_round(wo_id=wo["id"])
     assert row["head_sha"] == JUDGED and row["carried_head_sha"] == CAUGHT_UP
     assert ProjectStore.validated_head(row) == CAUGHT_UP
-    # NO ROUND, which is the point: one settled round before and after.
+    # NO ROUND, which is the point: one settled round before and after
     assert store.counted_validation_rounds(wo_id=wo["id"]) == 1
-    # ...and the merge is proposed on the SAME tick, not two minutes later.
+    # ...and the merge is proposed on the SAME tick, not two minutes later
     approvals = store.list_approvals(wo["id"])
     assert [a["kind"] for a in approvals] == ["auto_merge"]
     assert CAUGHT_UP in approvals[0]["command"]
@@ -789,9 +632,7 @@ def test_two_base_merges_in_a_row_carry_the_verdict_and_cost_no_round(
 
 def test_a_chain_whose_first_parent_is_a_worker_push_is_refused(started, project,
                                                                fake_gh, local_proof):
-    """PROOF (a), §3.2. First parents only: a commit on the way back to the judged one
-    that is not a two-parent merge is authored content, and the verdict may not cross it.
-    Said once per (head, proof) however long the pull request stays parked."""
+    """PROOF (a), §3.2"""
     opt_in(started)
     store, wo = parked(project)
     fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=CAUGHT_UP)
@@ -808,9 +649,7 @@ def test_a_chain_whose_first_parent_is_a_worker_push_is_refused(started, project
 
 def test_a_merge_of_something_other_than_the_base_is_refused(started, project, fake_gh,
                                                             local_proof):
-    """§3.2 item 6, and it is what makes the chain a chain of BASE merges: a two-parent
-    merge whose second parent is not an ancestor of `origin/main` merged somebody else's
-    branch in — authored content arriving in a shape that looks identical."""
+    """§3.2 item 6, and it is what makes the chain a chain of BASE merges: a two-parent merge whose second..."""
     opt_in(started)
     store, wo = parked(project)
     local_proof["ancestors"] = {BASE1}
@@ -826,13 +665,7 @@ def test_a_merge_of_something_other_than_the_base_is_refused(started, project, f
 
 def test_a_pull_merge_of_the_branchs_own_lineage_carries_the_verdict(
         started, project, fake_gh, local_proof):
-    """§3.2 item 6 as Neo question 806 widened it — the shape of wo-00bd1096 / PR #779.
-
-    A worker ran `git pull --no-rebase` before pushing, so the head is a merge of two
-    lineages of the BRANCH: its second parent is already contained in the judged commit,
-    so it brings in no commit that was not judged. Proof (b) is still required and still
-    equal, so the verdict carries and no round is spent.
-    """
+    """§3.2 item 6 as Neo question 806 widened it — the shape of wo-00bd1096 / PR #779"""
     opt_in(started)
     store, wo = parked(project)
     local_proof["ancestors"] = {BASE1}
@@ -847,7 +680,7 @@ def test_a_pull_merge_of_the_branchs_own_lineage_carries_the_verdict(
     assert len(carried) == 1
     payload = db.from_json(carried[0]["payload"], {})
     assert payload["chain"] == [MID, PULL_MERGE]
-    # `merged_base_shas` MUST NOT LIE: the pull merge's second parent is no base commit.
+    # `merged_base_shas` MUST NOT LIE: the pull merge's second parent is no base commit
     assert payload["merged_base_shas"] == [BASE1]
     assert payload["merged_branch_shas"] == [BRANCH_SIDE]
     assert payload["base_sha"] == BASE1
@@ -858,10 +691,7 @@ def test_a_pull_merge_of_the_branchs_own_lineage_carries_the_verdict(
 
 def test_a_merge_bringing_in_an_unjudged_commit_is_still_refused(
         started, project, fake_gh, local_proof):
-    """Neo question 806's condition 3: the same shape with one fact moved. The second
-    parent is an ancestor of NEITHER `origin/main` NOR the judged commit, so it brings in
-    authored content no seat read — refused as `chain`, and the round machine gets its
-    turn on that head."""
+    """Neo question 806's condition 3: the same shape with one fact moved"""
     opt_in(started)
     store, wo = parked(project)
     local_proof["ancestors"] = {BASE1}
@@ -880,9 +710,7 @@ def test_a_merge_bringing_in_an_unjudged_commit_is_still_refused(
 
 def test_the_walk_is_bounded_and_spends_no_more_api_calls_than_the_limit(
         started, project, fake_gh, local_proof):
-    """THE BOUND, §3.2 item 5. Ten catch-ups on one parked pull request is not a case
-    worth an unbounded walk, and the cost of the bound is the assertion: one `gh api` per
-    commit, at most `ci.CHAIN_LIMIT` of them, then fall through."""
+    """THE BOUND, §3.2 item 5"""
     opt_in(started)
     store, wo = parked(project)
     chain = [f"{i:02d}" + "0" * 34 + "aa11" for i in range(ci.CHAIN_LIMIT + 2)]
@@ -897,13 +725,11 @@ def test_the_walk_is_bounded_and_spends_no_more_api_calls_than_the_limit(
     assert len(api_reads(fake_gh)) == ci.CHAIN_LIMIT
 
 
-# -- a rebind: the round the OS's own merge costs nobody -------------------------------
-# spec docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.2
+# -- a rebind: the round the OS's own merge costs nobody
 
 
 def _resolved(local_proof, fake_gh, head=None):
-    """A merge of the base whose CONFLICT RESOLUTION changed the branch's own diff —
-    proof (a) holds, proof (b) does not. wo-8736a5c5 / PR #794."""
+    """A merge of the base whose CONFLICT RESOLUTION changed the branch's own diff (#794)"""
     head = head or CAUGHT_UP
     local_proof["ids"][head] = "a-resolution-nobody-judged"
     fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=head)
@@ -912,9 +738,7 @@ def _resolved(local_proof, fake_gh, head=None):
 
 def test_a_changed_diff_walks_the_chain_only_when_a_rebind_could_open(
         started, project, fake_gh, local_proof):
-    """THE READ BUDGET. A parked pull request is polled every couple of minutes and the
-    walk is up to `ci.CHAIN_LIMIT` `gh api` calls; paying that on every tick of every
-    pull request whose diff genuinely changed buys nothing when no rebind could open."""
+    """THE READ BUDGET"""
     opt_in(started)
     store, wo = parked(project)
     _resolved(local_proof, fake_gh)
@@ -931,8 +755,7 @@ def test_a_changed_diff_walks_the_chain_only_when_a_rebind_could_open(
 
 def test_a_changed_diff_on_a_proved_chain_reports_a_rebind(started, project, fake_gh,
                                                            local_proof):
-    """The carry is still REFUSED — that resolution is content no seat has read — and
-    the caller is told a rebind may be opened on it."""
+    """The carry is still REFUSED — that resolution is content no seat has read"""
     opt_in(started)
     store, wo = parked(project)
     _resolved(local_proof, fake_gh)
@@ -950,10 +773,7 @@ def test_a_changed_diff_on_a_proved_chain_reports_a_rebind(started, project, fak
 
 def test_a_fetch_that_fails_refuses_the_carry_and_merges_nothing(started, project,
                                                                 fake_gh):
-    """§3.4, and the open question the spec logs: the `project` fixture has no `origin`,
-    so proof (b) cannot be computed at all — the shape of a checkout whose origin refuses
-    `refs/pull/N/head`. Refused, named `fetch` so a reader can tell it from a conflict
-    resolution, and the pull request falls through untouched."""
+    """§3.4, and the open question the spec logs: the `project` fixture has no `origin`"""
     opt_in(started)
     store, wo = parked(project)
     fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=CAUGHT_UP)
@@ -968,7 +788,7 @@ def test_a_fetch_that_fails_refuses_the_carry_and_merges_nothing(started, projec
     assert not [c for c in fake_gh.calls if c["argv"][:2] == ["pr", "merge"]]
 
 
-# -- proof (b), against a real repository ---------------------------------------------
+# -- proof (b), against a real repository
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -981,12 +801,7 @@ def _git(cwd: Path, *args: str) -> str:
 
 
 def _a_branch_that_merged_main(tmp_path) -> tuple[Path, str, str, str]:
-    """A real clone whose feature branch merged a moved `main`, cleanly and evilly.
-
-    Returns (repo, judged, caught_up, evil). `caught_up` is an ordinary merge of
-    `origin/main`; `evil` merges the same commit and edits the branch's own file while
-    resolving — the case GitHub reports with the parentage of a clean one.
-    """
+    """A real clone whose feature branch merged a moved `main`, cleanly and evilly"""
     up = make_git_project(tmp_path, "upstream")
     repo = tmp_path / "work"
     subprocess.run(["git", "clone", "-q", str(up), str(repo)], check=True)
@@ -1010,9 +825,7 @@ def _a_branch_that_merged_main(tmp_path) -> tuple[Path, str, str, str]:
 
 
 def test_identical_patch_ids_carry_and_an_edited_branch_file_does_not(tmp_path):
-    """PROOF (b), §3.3, and the whole reason it exists. An evil merge has the parentage of
-    a clean one, so proof (a) alone would carry it and bind the panel's verdict to code no
-    seat read. What the branch adds ON TOP OF ITS MERGE BASE catches it."""
+    """PROOF (b), §3.3, and the whole reason it exists"""
     from jarvis import branchproof
 
     repo, judged, caught_up, evil = _a_branch_that_merged_main(tmp_path)
@@ -1024,13 +837,7 @@ def test_identical_patch_ids_carry_and_an_edited_branch_file_does_not(tmp_path):
 
 
 def _a_branch_that_added_a_binary_file(tmp_path) -> tuple[Path, str, str]:
-    """A real clone whose feature branch ADDED a binary file, then a merge swapped it.
-
-    Returns (repo, judged, swapped). `bin.dat` holds a NUL byte, so `git diff` prints only
-    `Binary files ... differ` for it and the `index` line's new-side blob id is the only
-    fingerprint of its content. `swapped` merges `origin/main` cleanly and rewrites those
-    bytes while resolving.
-    """
+    """A real clone whose feature branch ADDED a binary file, then a merge swapped it"""
     up = make_git_project(tmp_path, "upstream")
     repo = tmp_path / "binwork"
     subprocess.run(["git", "clone", "-q", str(up), str(repo)], check=True)
@@ -1051,10 +858,7 @@ def _a_branch_that_added_a_binary_file(tmp_path) -> tuple[Path, str, str]:
 
 
 def test_a_merge_that_swaps_a_binary_files_bytes_is_not_the_judged_diff(tmp_path):
-    """REVIEW ROUND 3's BLOCKER. `git diff` prints no content for a binary file, only
-    `Binary files ... differ`, so dropping the `index` blob ids dropped the ONLY
-    fingerprint of it: a resolution that swapped the bytes of a file the branch added took
-    the judged commit's id and carried the verdict onto content no seat read."""
+    """REVIEW ROUND 3's BLOCKER"""
     from jarvis import branchproof
 
     repo, judged, swapped = _a_branch_that_added_a_binary_file(tmp_path)
@@ -1064,12 +868,7 @@ def test_a_merge_that_swaps_a_binary_files_bytes_is_not_the_judged_diff(tmp_path
 
 
 def _a_branch_that_added_a_latin1_text_file(tmp_path) -> tuple[Path, str, str]:
-    r"""A real clone whose branch added a TEXT file that is not valid UTF-8.
-
-    Returns (repo, judged, rewritten). `accents.txt` holds b"caf\xe9\n" — Latin-1, and no
-    NUL byte, so `git diff` prints it as content rather than as `Binary files ... differ`.
-    `rewritten` merges `origin/main` and changes that byte to `\xe8` while resolving.
-    """
+    """A real clone whose branch added a TEXT file that is not valid UTF-8"""
     up = make_git_project(tmp_path, "upstream")
     repo = tmp_path / "latin1work"
     subprocess.run(["git", "clone", "-q", str(up), str(repo)], check=True)
@@ -1090,11 +889,7 @@ def _a_branch_that_added_a_latin1_text_file(tmp_path) -> tuple[Path, str, str]:
 
 
 def test_a_merge_that_rewrites_an_undecodable_byte_is_not_the_judged_diff(tmp_path):
-    r"""REVIEW ROUND 5's BLOCKER. The fingerprint is over the diff's BYTES. A text file's
-    diff carries its content, so the binary rule does not cover it, and hashing that text
-    as UTF-8 with `errors="replace"` mapped every undecodable byte to one U+FFFD:
-    b"caf\xe9\n" and b"caf\xe8\n" hashed alike and a resolution that swapped them carried
-    the verdict onto bytes no seat read."""
+    """REVIEW ROUND 5's BLOCKER"""
     from jarvis import branchproof
 
     repo, judged, rewritten = _a_branch_that_added_a_latin1_text_file(tmp_path)
@@ -1104,12 +899,7 @@ def test_a_merge_that_rewrites_an_undecodable_byte_is_not_the_judged_diff(tmp_pa
 
 
 def test_a_base_merge_that_moves_the_hunks_section_heading_still_matches(tmp_path):
-    """The `@@`'s trailing SECTION HEADING is in the hash, unlike the ranges beside it, so
-    the tolerance of §3.3 only holds while a base merge MOVES that line without changing
-    which heading the branch's hunk sits under. `main` adds a function above `alpha`, so
-    the heading `def alpha():` slides down four lines and the id must not move. A base
-    change that lands BETWEEN the heading and the hunk renames it and does move the id:
-    that is the conservative false refusal `diff_fingerprint` documents and accepts."""
+    """The `@@`'s trailing SECTION HEADING is in the hash"""
     from jarvis import branchproof
 
     up = make_git_project(tmp_path, "upstream")
@@ -1140,14 +930,7 @@ def test_a_base_merge_that_moves_the_hunks_section_heading_still_matches(tmp_pat
 
 
 def _a_python_branch_that_merged_main(tmp_path) -> tuple[Path, str, str, str]:
-    """A real clone where `main` moved INSIDE the file the branch also changed.
-
-    Returns (repo, judged, caught_up, dedented). `caught_up` merges the moved `main`
-    cleanly — the branch's own hunk is untouched and only its LINE NUMBERS shift, the
-    tolerance §3.3 has to keep. `dedented` merges the same commit and pulls a `return` out
-    of its `if` while resolving: whitespace only, a different program, and `git patch-id
-    --stable` cannot see it (review round 1 of wo-659be188).
-    """
+    """A real clone where `main` moved INSIDE the file the branch also changed"""
     up = make_git_project(tmp_path, "upstream")
     (up / "mod.py").write_text("def f(x):\n    if x:\n        return 1\n    return 0\n")
     _git(up, "add", "mod.py")
@@ -1178,13 +961,7 @@ def _a_python_branch_that_merged_main(tmp_path) -> tuple[Path, str, str, str]:
 
 def test_a_resolution_that_only_re_indents_python_is_not_the_diff_that_was_judged(
         started, project, fake_gh, local_proof, tmp_path):
-    """REVIEW ROUND 1's BLOCKER. `git patch-id --stable` strips whitespace before hashing,
-    so a resolution that dedents a `return` out of its `if` — a different program, on the
-    branch's own line — produced the SAME id and the verdict was carried onto it, with the
-    record saying the diff was byte-identical.
-
-    Both halves in one test: the ids from a real repository must differ, and the daemon
-    driven with those ids must refuse the carry as `patch_id`."""
+    """REVIEW ROUND 1's BLOCKER"""
     git_fingerprint = local_proof["git_fingerprint"]
     repo, judged, _caught_up, dedented = _a_python_branch_that_merged_main(tmp_path)
     assert local_proof["git_fetch"](repo, "main")
@@ -1207,12 +984,7 @@ def test_a_resolution_that_only_re_indents_python_is_not_the_diff_that_was_judge
 
 def test_a_base_merge_that_only_shifts_the_branchs_line_numbers_still_carries(
         started, project, fake_gh, local_proof, tmp_path):
-    """THE TOLERANCE, and the reason the `@@` ranges are normalised rather than hashed.
-
-    `main` added lines ABOVE the branch's own hunk in the same file, so the branch's
-    contribution is unchanged and only the hunk header's numbers moved. A whitespace-exact
-    hash that kept them would refuse this — the commonest catch-up on the fleet — so the
-    ids must still be equal and the verdict must still carry with no round spent."""
+    """THE TOLERANCE, and the reason the `@@` ranges are normalised rather than hashed"""
     git_fingerprint = local_proof["git_fingerprint"]
     repo, judged, caught_up, _dedented = _a_python_branch_that_merged_main(tmp_path)
     assert local_proof["git_fetch"](repo, "main")
@@ -1233,8 +1005,7 @@ def test_a_base_merge_that_only_shifts_the_branchs_line_numbers_still_carries(
 
 
 def test_the_ancestry_question_is_asked_of_the_local_origin_ref(tmp_path):
-    """§3.2 item 6 asked locally rather than with a `compare` call per commit: the fetch
-    is already paid for, and the API cost of the walk would otherwise double."""
+    """§3.2 item 6 asked locally rather than with a `compare` call per commit: the fetch is already paid..."""
     from jarvis import branchproof
 
     repo, judged, caught_up, _evil = _a_branch_that_merged_main(tmp_path)
@@ -1246,9 +1017,7 @@ def test_the_ancestry_question_is_asked_of_the_local_origin_ref(tmp_path):
 
 
 def test_a_fetch_of_a_ref_nobody_publishes_fails_rather_than_guessing(tmp_path):
-    """The other open question: a `refs/pull/N/head` some origin refuses makes the feature
-    inert there, so the failure is a False the caller has to handle — logged with the ref
-    it asked for. And a ref is an argument, so a flag-shaped one never becomes one."""
+    """The other open question: a `refs/pull/N/head` some origin refuses makes the feature inert there"""
     from jarvis import branchproof
 
     repo, _judged, _caught_up, _evil = _a_branch_that_merged_main(tmp_path)
@@ -1258,9 +1027,7 @@ def test_a_fetch_of_a_ref_nobody_publishes_fails_rather_than_guessing(tmp_path):
 
 
 def test_attempt_hands_back_gits_own_stderr(tmp_path):
-    """spec docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md §7: `run` drops the reason a
-    command failed, so `checkpoint_skipped` could only hold a fixed string. `attempt` is
-    the same execution block, handing back git's stderr beside the stdout `run` returns."""
+    """spec docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md §7: `run` drops the reason a..."""
     from jarvis import branchproof
 
     repo, _judged, _caught_up, _evil = _a_branch_that_merged_main(tmp_path)
@@ -1275,10 +1042,7 @@ def test_attempt_hands_back_gits_own_stderr(tmp_path):
 
 
 def test_the_local_proof_module_runs_git_and_talks_to_nothing_else():
-    """`test_this_module_writes_only_the_branch_update`'s guard, for the new module. `ci`
-    is held against a `gh` allowlist and `github` against a read-only one; this module is
-    the local-`git` home, so what it is held against is that it shells out to `git` alone
-    and imports neither of them (§3.1)."""
+    """`test_this_module_writes_only_the_branch_update`'s guard, for the new module"""
     from jarvis import branchproof
 
     tree = ast.parse(Path(branchproof.__file__).read_text())

@@ -1,16 +1,4 @@
-"""The user's brake, and the recovery after a usage-window reopen (issue #843).
-
-2026-09-28 21:00 PDT: the window reopened and eleven work-order turns resumed within a
-minute, each re-writing a cold 100-170k-token conversation — 2.25M cache-write tokens in
-two minutes, the window spent again inside ten, and the same stampede waiting at every
-reopen after it. The only brake the user had was `systemctl stop` and `kill`.
-
-Four mechanisms, tested separately because they fail separately:
-  * `jarvis pause` / `jarvis resume` — nothing starts a turn unless allow-listed
-  * the ramp — after a reopen, a small in-flight cap for a while, whatever the steady cap
-  * the breaker — a window spent again soon after reopening slows the next ramp, loudly
-  * compaction before a cold relaunch — tests/test_compaction.py
-"""
+"""The user's brake, and the recovery after a usage-window reopen (issue #843)"""
 
 from __future__ import annotations
 
@@ -50,7 +38,7 @@ def os_up(jarvis_home, fake_claude, tmp_path, project):
 
 
 def _park_on_usage_limit(store, wos, fake_claude, settle_turns, daemon, monkeypatch):
-    """Every order dispatched and refused by the window; then the window reopens."""
+    """Every order dispatched and refused by the window; then the window reopens"""
     monkeypatch.setattr(worker_session, "RATE_LIMIT_MIN_DELAY", 0)
     fake_claude.turns_rate_limited(reset="11:59pm (UTC)")
     _tick(daemon)
@@ -63,7 +51,7 @@ def _park_on_usage_limit(store, wos, fake_claude, settle_turns, daemon, monkeypa
                        ("Claude AI usage limit reached|1000000000",))
 
 
-# -- the pause --------------------------------------------------------------------------
+# -- the pause
 
 
 def test_a_paused_fleet_dispatches_only_what_is_allowed(os_up, fake_claude):
@@ -150,17 +138,16 @@ def test_an_unreadable_pause_record_fails_closed(os_up):
     assert pause is not None and not pause.allows("wo-anything")
 
 
-# -- the ramp and the breaker -----------------------------------------------------------
+# -- the ramp and the breaker
 
 
 def test_a_reopen_starts_a_ramp_that_binds_under_a_wide_cap(os_up, fake_claude,
                                                             settle_turns, monkeypatch):
-    """THE INCIDENT: eleven resumed under a cap of fifteen. The cap was not the bug —
-    a reopen is the one moment the whole backlog is due at once."""
+    """THE INCIDENT: eleven resumed under a cap of fifteen"""
     store, daemon, central = os_up["store"], os_up["daemon"], os_up["central"]
     wos = [ops.create_work_order("proj_a", f"w{n}") for n in range(5)]
     _park_on_usage_limit(store, wos, fake_claude, settle_turns, daemon, monkeypatch)
-    # The outage was announced while the window was shut; this tick sees it lift.
+    # The outage was announced while the window was shut; this tick sees it lift
     assert central.get_state(fleet.OUTAGE_ANNOUNCED_KEY)
 
     _tick(daemon)
@@ -191,22 +178,20 @@ def test_a_window_spent_again_soon_after_reopening_trips_the_breaker(os_up):
     assert central.get_state(fleet.BREAKER_KEY)
     critical = central.unacked_inbox(level="critical")
     assert critical and "spent again 10 min after it reopened" in critical[0]["title"]
-    # The next ramp is slower and longer.
+    # The next ramp is slower and longer
     central.set_state(fleet.REOPENED_KEY, "200000")
     slow = fleet.ramp(central, now=200000 + fleet.RAMP_SECONDS + 1)
     assert slow is not None and slow.cap == fleet.BREAKER_RAMP_CAP and slow.tripped
 
 
 def test_fleet_pause_opens_nothing_but_records_a_run(os_up, monkeypatch):
-    """§5 step 3 of docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-
-    investigated.md: a paused fleet is excluded, and the RUN is still recorded — a
-    deliberately quiet sweep must not read as a dark one."""
+    """§5 step 3 of docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets- investigated.md: a..."""
     from test_health_sweep import park_order
 
     from jarvis import invariants, schedule
 
     store, central, daemon = os_up["store"], os_up["central"], os_up["daemon"]
-    # The check runs on the OS-OWNING project only, so point the install inside this one.
+    # The check runs on the OS-OWNING project only, so point the install inside this one
     monkeypatch.setattr(schedule, "__file__",
                         str(Path(store.project_path) / "src" / "jarvis" / "schedule.py"))
     wo = ops.create_work_order("proj_a", "parked while the fleet is paused")

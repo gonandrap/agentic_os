@@ -1,14 +1,4 @@
-"""Getting a feature order out of `failed`.
-
-`Daemon.settle_features` only ever looks at `executing` features, which makes `failed`
-terminal: a child that recovers afterwards leaves the feature failed for ever. fo-e353491c
-sat like that showing `12/12 done` and a reason naming a `completed` work order, and the
-only way out was an edit to the production database.
-
-Two ways back, and the tests below are mostly about the seam between them: the automatic
-`INV-FEATURE-FALSE-FAILURE`, and `jarvis fo resume` for a child that is genuinely still
-dead. Design: docs/superpowers/specs/2026-08-29-feature-order-resume.md.
-"""
+"""Getting a feature order out of `failed` (docs/superpowers/specs/2026-08-29-feature-order-resume.md)"""
 
 from __future__ import annotations
 
@@ -64,7 +54,7 @@ def a_released_feature(daemon, store, *keys: str) -> dict:
 
 
 def a_failed_feature(daemon, store, *keys: str) -> tuple[dict, list[dict]]:
-    """A feature settled `failed` by its first child, the rest completed."""
+    """A feature settled `failed` by its first child, the rest completed"""
     fo = a_released_feature(daemon, store, *keys)
     kids = store.feature_children(fo["id"])
     store.set_status(kids[0]["id"], "failed")
@@ -75,12 +65,11 @@ def a_failed_feature(daemon, store, *keys: str) -> tuple[dict, list[dict]]:
     return store.get_feature_order(fo["id"]), kids
 
 
-# -- INV-FEATURE-FALSE-FAILURE: the child recovered on its own ---------------------------
+# -- INV-FEATURE-FALSE-FAILURE: the child recovered on its own
 
 
 def test_a_feature_goes_back_to_work_once_its_dead_child_recovers(started, store):
-    """The whole bug in one test. `settle_features` never looks at a settled feature, so
-    without the invariant the second half of this never happens however many ticks run."""
+    """The whole bug in one test"""
     fo, kids = a_failed_feature(started, store, "one", "two")
     store.set_status(kids[0]["id"], "completed")  # `jarvis wo done`, a retry, a late merge
 
@@ -93,10 +82,7 @@ def test_a_feature_goes_back_to_work_once_its_dead_child_recovers(started, store
 
 
 def test_the_reopened_feature_is_then_settled_by_the_ordinary_path(started, store):
-    """The invariant decides NOTHING — it hands the feature back to `settle_features`,
-    which reaches the same answer it would have reached the first time. A repair that
-    completed the feature itself would be a second place that ends a feature, and the two
-    would drift the day validation is switched on."""
+    """The invariant decides NOTHING — it hands the feature back to `settle_features`"""
     fo, kids = a_failed_feature(started, store, "one", "two")
     store.set_status(kids[0]["id"], "completed")
 
@@ -109,8 +95,7 @@ def test_the_reopened_feature_is_then_settled_by_the_ordinary_path(started, stor
 
 
 def test_a_feature_with_a_still_dead_child_is_left_alone(started, store):
-    """The invariant repairs only what is unambiguous. A child that is still failed is
-    still a real failure, and reopening on it would drop the flag the user needs."""
+    """The invariant repairs only what is unambiguous"""
     fo, _kids = a_failed_feature(started, store, "one", "two")
 
     found = invariants.check_project(store)
@@ -121,10 +106,7 @@ def test_a_feature_with_a_still_dead_child_is_left_alone(started, store):
 
 
 def test_the_settler_and_the_invariant_cannot_flap(started, store):
-    """Both sides read `dead_feature_children`, so a feature the settler failed is one
-    the invariant refuses to reopen. If they ever disagreed the feature would oscillate
-    on every reconcile, and the user would watch the flag blink. Ticked repeatedly,
-    because one pass proves nothing about a loop."""
+    """Both sides read `dead_feature_children`"""
     fo, _kids = a_failed_feature(started, store, "one", "two")
 
     for _ in range(8):
@@ -135,9 +117,7 @@ def test_the_settler_and_the_invariant_cannot_flap(started, store):
 
 
 def test_doctor_reports_the_false_failure_without_curing_it(started, store):
-    """`jarvis doctor` with no `--repair` is a pure read. Reporting that a feature is
-    wrongly failed must not be the thing that un-fails it — `set_feature_status` and
-    `clear_feature_attention` are on `_ReadOnly._BLOCKED` for exactly this."""
+    """`jarvis doctor` with no `--repair` is a pure read"""
     fo, kids = a_failed_feature(started, store, "one", "two")
     store.set_status(kids[0]["id"], "completed")
 
@@ -148,8 +128,7 @@ def test_doctor_reports_the_false_failure_without_curing_it(started, store):
 
 
 def test_a_feature_with_no_children_at_all_is_not_reopened(started, store):
-    """A feature failed before its plan was ever released has nothing to re-derive from,
-    and `all([])` would otherwise complete it — announcing a delivery of nothing."""
+    """A feature failed before its plan was ever released has nothing to re-derive from"""
     fo = ops.create_feature_order("proj_a", "CSV export", description=ASK)
     store.set_feature_status(fo["id"], "failed")
     store.flag_feature_attention(fo["id"], "the planner died")
@@ -159,7 +138,7 @@ def test_a_feature_with_no_children_at_all_is_not_reopened(started, store):
     assert store.get_feature_order(fo["id"])["status"] == "failed"
 
 
-# -- `jarvis fo resume`: the user answering for a child that is still dead ---------------
+# -- `jarvis fo resume`: the user answering for a child that is still dead
 
 
 def test_resume_supersedes_the_dead_child_and_files_the_fix(started, store):
@@ -171,15 +150,12 @@ def test_resume_supersedes_the_dead_child_and_files_the_fix(started, store):
     assert store.get_feature_order(fo["id"])["status"] == "executing"
     filed = store.get_work_order(out["fix_wo_id"])
     assert filed["parent_id"] == fo["id"]
-    # The description is the ONLY thing that worker will see, so it is the user's words
-    # verbatim; the title is a derived label and may be truncated.
+    # The description is the ONLY thing that worker will see, so it is the user's words verbatim
     assert filed["description"] == "redo the exporter, without the shim"
 
 
 def test_a_superseded_child_stops_failing_its_feature(started, store):
-    """The point of the whole mechanism. The dead child is still `failed` in the tree —
-    nothing lies about it — and the feature completes anyway once the corrective work
-    lands."""
+    """The point of the whole mechanism"""
     fo, kids = a_failed_feature(started, store, "one", "two")
     out = ops.resume_feature_order(fo["id"], fix="redo the exporter, without the shim")
 
@@ -191,9 +167,7 @@ def test_a_superseded_child_stops_failing_its_feature(started, store):
 
 
 def test_a_superseded_child_also_stops_holding_completion_up(started, store):
-    """The other half, and the one that is easy to miss: a child excluded from the dead
-    check but still counted towards `all completed` would leave the feature `executing`
-    for ever, which is a worse failure than the one being fixed — it raises nothing."""
+    """The other half, and the one that is easy to miss: a child excluded from the dead check but still..."""
     fo, kids = a_failed_feature(started, store, "one", "two")
 
     ops.resume_feature_order(fo["id"])  # no fix: the work is already done
@@ -212,9 +186,7 @@ def test_resume_without_a_fix_files_nothing(started, store):
 
 
 def test_resume_refuses_a_feature_that_is_not_failed(started, store):
-    """`cancelled` was the user's own decision and `completed` has nothing to resume.
-    Reversing a cancellation is a different act with different consequences for the
-    children they stopped, so it is not smuggled in under this command."""
+    """`cancelled` was the user's own decision and `completed` has nothing to resume"""
     fo = a_released_feature(started, store, "one")
     ops.cancel_feature_order(fo["id"])
 
@@ -223,8 +195,7 @@ def test_resume_refuses_a_feature_that_is_not_failed(started, store):
 
 
 def test_resuming_twice_records_the_first_decision_only(started, store):
-    """Idempotent on the child id, and the FIRST note is kept — it is the one that was
-    true when the decision was taken."""
+    """Idempotent on the child id, and the FIRST note is kept"""
     fo, kids = a_failed_feature(started, store, "one", "two")
     ops.resume_feature_order(fo["id"], fix="first answer")
     store.set_feature_status(fo["id"], "failed")  # as if it failed again
@@ -237,10 +208,7 @@ def test_resuming_twice_records_the_first_decision_only(started, store):
 
 
 def test_the_record_lives_where_a_feature_with_no_manager_can_hold_it(started, store):
-    """`ops.feature_event` — the obvious home — returns False when a feature has no
-    project manager order, which is every feature planned while `os.validation.enabled`
-    was false, including the one that motivated this. A record that silently fails to be
-    written for its own motivating case is not a record."""
+    """`ops.feature_event` — the obvious home"""
     fo, kids = a_failed_feature(started, store, "one", "two")
     assert store.manager_work_order(fo["id"]) is None
 
@@ -250,24 +218,12 @@ def test_the_record_lives_where_a_feature_with_no_manager_can_hold_it(started, s
     assert [s["wo_id"] for s in store.superseded_children(fo["id"])] == [kids[0]["id"]]
 
 
-# -- the manager the reopening has to revive ---------------------------------------------
-#
-# docs/superpowers/specs/2026-10-07-a-settled-features-live-children-must-have-a-manager-or
-# -a-hold.md §(c). Manager liveness used to be WRITTEN ONCE at a transition
-# (`_close_feature_manager`) and never derived, so every path that reversed that transition
-# had to remember to undo it — and neither this command nor INV-FEATURE-FALSE-FAILURE did.
-# fo-ac00376e sat in `executing` for 5.4 days with a `completed` manager and no signal.
+# -- the manager the reopening has to revive
 
 
 def a_failed_feature_with_a_closed_manager(daemon, store,
                                            *keys: str) -> tuple[dict, list[dict], dict]:
-    """The live shape of fo-ac00376e: failed, reopened by hand later, manager `completed`.
-
-    The manager is created directly because this file's catalog runs with
-    `os.validation.enabled` off, and closed through `_close_feature_manager` — the one
-    writer — rather than with a `set_status`, so what is reversed below is the real
-    transition and not a staged imitation of it.
-    """
+    """The live shape of fo-ac00376e: failed, reopened by hand later, manager `completed`"""
     fo, kids = a_failed_feature(daemon, store, *keys)
     manager = store.create_manager_order(fo["id"])
     store.set_status(manager["id"], "idle")
@@ -277,16 +233,14 @@ def a_failed_feature_with_a_closed_manager(daemon, store,
 
 
 def a_round(store, fo_id: str) -> None:
-    """One judged round on the feature, so there is feedback with somewhere to land."""
+    """One judged round on the feature, so there is feedback with somewhere to land"""
     opened = store.open_validation_round(fo_id=fo_id, fingerprint="aaaa1111",
                                          summary="the exporter", evidence="pytest -q")
     store.close_validation_round(opened["id"], "rejected", "no test covers the branch")
 
 
 def assert_manager_is_back(store, central, fo_id: str) -> None:
-    """The four assertions both reopening paths owe, and they are one function because
-    the two must not drift: a feature reopened by the invariant is as headless as one
-    reopened by the command."""
+    """The four assertions both reopening paths owe"""
     manager = store.manager_work_order(fo_id)
     assert manager["status"] == "idle"
     assert not manager["needs_attention"]
@@ -303,8 +257,7 @@ def assert_manager_is_back(store, central, fo_id: str) -> None:
 
 
 def test_fo_resume_revives_the_manager_it_needs(started, store, jarvis_home):
-    """`jarvis fo resume` put the feature back to work and left it with no addressee for
-    the `manager` role, so the next round's feedback went nowhere."""
+    """`jarvis fo resume` put the feature back to work and left it with no addressee for the `manager`..."""
     fo, _kids, _manager = a_failed_feature_with_a_closed_manager(started, store,
                                                                  "one", "two")
     a_round(store, fo["id"])
@@ -321,9 +274,7 @@ def test_fo_resume_revives_the_manager_it_needs(started, store, jarvis_home):
 
 
 def test_the_invariants_own_repair_revives_it_too(started, store, jarvis_home):
-    """The same four assertions with NO `jarvis fo resume` anywhere: driven through a
-    doctor pass, because INV-FEATURE-FALSE-FAILURE reopens a feature on its own the moment
-    a dead child recovers, and it reopened it just as headless."""
+    """The same four assertions with NO `jarvis fo resume` anywhere: driven through a doctor pass"""
     fo, kids, _manager = a_failed_feature_with_a_closed_manager(started, store,
                                                                 "one", "two")
     a_round(store, fo["id"])
@@ -343,9 +294,7 @@ def test_the_invariants_own_repair_revives_it_too(started, store, jarvis_home):
 
 
 def test_a_feature_with_no_manager_row_is_resumed_exactly_as_before(started, store):
-    """The control, and it is every feature planned while validation was off — including
-    the one that motivated `fo resume`. `revive_feature_manager` returns None and nothing
-    else changes."""
+    """The control, and it is every feature planned while validation was off"""
     fo, _kids = a_failed_feature(started, store, "one", "two")
     assert store.manager_work_order(fo["id"]) is None
 
@@ -356,8 +305,7 @@ def test_a_feature_with_no_manager_row_is_resumed_exactly_as_before(started, sto
 
 
 def test_a_live_manager_is_not_touched(started, store):
-    """The other control: `idle` is in OPEN_STATUSES, so there is nothing to revive and
-    no second `manager_revived` event to confuse its timeline with."""
+    """The other control: `idle` is in OPEN_STATUSES"""
     fo, _kids = a_failed_feature(started, store, "one", "two")
     manager = store.create_manager_order(fo["id"])
     store.set_status(manager["id"], "idle")
@@ -369,12 +317,11 @@ def test_a_live_manager_is_not_touched(started, store):
                 if e["kind"] == "manager_revived"]
 
 
-# -- the surfaces ------------------------------------------------------------------------
+# -- the surfaces
 
 
 def test_a_superseded_child_stays_in_the_tree_marked(started, store):
-    """Superseded, never hidden. Billing and cancellation still want the row, and a child
-    the user answered for that VANISHED would look like one that never ran."""
+    """Superseded, never hidden"""
     fo, kids = a_failed_feature(started, store, "one", "two")
     ops.resume_feature_order(fo["id"], fix="redo it")
 
@@ -404,7 +351,7 @@ def test_the_feature_page_offers_the_form_and_marks_the_child(started, store):
     after = ui_client.get(f"/fo/proj_a/{fo['id']}").text
     assert "superseded" in after
     assert kids[0]["id"] in after  # still listed, not dropped
-    # Gone from the page the moment there is nothing to resume.
+    # Gone from the page the moment there is nothing to resume
     assert f"/fo/proj_a/{fo['id']}/resume" not in after
 
 
@@ -423,8 +370,7 @@ def test_the_cli_resumes_and_says_what_it_filed(started, store, capsys):
 
 
 def test_the_metadata_key_survives_a_feature_that_already_had_metadata(started, store):
-    """`metadata` is one JSON blob shared with whatever else ever wants a key there, so
-    the write must merge rather than replace."""
+    """`metadata` is one JSON blob shared with whatever else ever wants a key there"""
     fo, kids = a_failed_feature(started, store, "one", "two")
     store.update_feature_order(fo["id"], metadata='{"something_else": 1}')
 

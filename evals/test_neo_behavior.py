@@ -1,9 +1,4 @@
-"""Neo behavioral scorecard (deterministic).
-
-What Neo PROMISES: questions never get lost, answers reach the right worker,
-escalations always reach the user, corrections always become learnings, and the
-token bill stays flat because the prompt prefix is byte-stable and FIFO-drained.
-"""
+"""Neo behavioral scorecard (deterministic)"""
 
 from __future__ import annotations
 
@@ -33,9 +28,7 @@ def dispatched_wo(daemon, title="eval task"):
 
 
 def neo_calls(fake_claude):
-    """Neo's headless calls only — a worker turn is a `claude -p` invocation too since
-    the transport moved off background sessions, so the session id is what tells them
-    apart."""
+    """Neo's headless calls only — a worker turn is a `claude -p` invocation too since the transport moved..."""
     return [c for c in fake_claude.calls
             if "-p" in c["argv"]
             and "--resume" not in c["argv"] and "--session-id" not in c["argv"]]
@@ -49,14 +42,9 @@ def question_of(call):
     return call["argv"][call["argv"].index("-p") + 1].splitlines()[-1]
 
 
-# -- 1. no question is ever lost ---------------------------------------------------
+# -- 1. no question is ever lost
 
-# EVERY CASE HERE IS A MODEL THAT REPLIED. A model that was never reached has its own
-# scenario below, because its arc spans several drains rather than one: it is retried
-# first and only becomes the user's once the retries are genuinely spent (spec
-# docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §2). Folding it back in
-# here would re-assert the defect that spec exists to fix — a crash terminal at attempt
-# zero, dressed as a judgement.
+# EVERY CASE HERE IS A MODEL THAT REPLIED (docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §2)
 OUTCOME_BATTERY = [
     ("plain question gets answered and delivered", "which linter?", "answered"),
     ("model-declined question escalates", "FORCE_ESCALATE: delete prod db?", "escalated"),
@@ -95,14 +83,7 @@ def test_question_outcomes(daemon, project, name, question, expected):
 @scenario("neo/no-question-lost",
           "a model that was never reached is retried, then surfaced as unreachable")
 def test_an_unreachable_model_is_retried_before_it_is_surfaced(daemon, project):
-    """The promise this scenario makes, restated for a call that never happened.
-
-    'Never lost' and 'terminal at the first failure' are not the same thing, and Neo
-    question 388 is what the difference cost: a crash was written as a verdict and
-    reached the user as an escalation Neo had never made. The question must survive
-    every retry still answerable, stay off the user's plate while it does, and only
-    then become visible — as UNREACHABLE, never as a judgement.
-    """
+    """The promise this scenario makes, restated for a call that never happened"""
     wo = dispatched_wo(daemon)
     qid = ops.ask_question(wo["id"], "FORCE_FAIL: anyone?")["question_id"]
 
@@ -150,7 +131,7 @@ def test_an_unreachable_model_is_retried_before_it_is_surfaced(daemon, project):
 
 
 def _clear_retry_hold(qid: int) -> None:
-    """Skip the backoff the OS puts between retries, so the eval does not sleep."""
+    """Skip the backoff the OS puts between retries, so the eval does not sleep"""
     neo = NeoStore()
     try:
         neo.clear_retry_hold(qid)
@@ -171,7 +152,7 @@ def test_ask_is_quiet(daemon, project):
     assert not ops.os_status()["attention"]
 
 
-# -- 2. escalations demand the user everywhere ------------------------------------
+# -- 2. escalations demand the user everywhere
 
 @scenario("neo/escalation-surfacing", "escalation hits inbox + wo attention + status + counts")
 def test_escalation_surfaces_everywhere(daemon, project):
@@ -211,7 +192,7 @@ def test_user_answer_resolves(daemon, project):
         store.close()
 
 
-# -- 3. token economics: stable prefix, FIFO, back-to-back --------------------------
+# -- 3. token economics: stable prefix, FIFO, back-to-back
 
 @scenario("neo/token-economics", "system prompt is byte-identical across a 6-question drain")
 def test_prefix_stability_across_drain(daemon, fake_claude):
@@ -254,7 +235,7 @@ def test_append_only_prefix(jarvis_home):
         neo.close()
 
 
-# -- 4. the learning loop ------------------------------------------------------------
+# -- 4. the learning loop
 
 @scenario("neo/learning-loop", "correction → learning → next prompt → worker guidance")
 def test_correction_loop(daemon, project, fake_claude):
@@ -321,14 +302,11 @@ def test_unreviewed_accounting(daemon):
     assert ops.os_status()["neo"]["unreviewed"] == 1
 
 
-# -- 5. the ledger gets repaired, not just complained about ------------------------
+# -- 5. the ledger gets repaired, not just complained about
 
 @scenario("neo/ledger-hygiene", "a contradicting record produces a filed cleanup, not a note")
 def test_cleanup_is_filed_and_visible(daemon, project):
-    """The promise: the OS's memory is append-only, so a superseded ruling sits next to
-    its replacement until someone corrects it. Neo is the only reader holding both, so
-    when it says the record is wrong, that has to become work the user can see — not a
-    line in an answer nobody re-reads."""
+    """The promise: the OS's memory is append-only"""
     wo = dispatched_wo(daemon)
     ops.ask_question(wo["id"], "FORCE_DISPATCH: the old ruling or the new one?")
     daemon._neo_drain()
@@ -348,9 +326,7 @@ def test_cleanup_is_filed_and_visible(daemon, project):
 
 @scenario("neo/ledger-hygiene", "a pre-approved cleanup never spawns another")
 def test_cleanups_do_not_multiply(daemon, project):
-    """Neo answers the cleanup worker's questions too. Unbounded, one unresolvable
-    contradiction becomes a fresh work order per round trip — the exact noise the
-    feature is supposed to remove."""
+    """Neo answers the cleanup worker's questions too"""
     wo = dispatched_wo(daemon)
     ops.ask_question(wo["id"], "FORCE_DISPATCH: which ruling?")
     daemon._neo_drain()

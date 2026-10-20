@@ -1,9 +1,4 @@
-"""§4.4 pins for `spec_index`: delegation, one matcher, two documents, and the verb.
-
-docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §4.4. The traversal pin is a SYMLINK
-and never a `../` string: a prefix test passes the `../` case and is defeated by the link,
-so the `../` version of this test pins nothing.
-"""
+"""§4.4 pins for `spec_index`: delegation, one matcher, two documents, and the verb (docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §4.4.)"""
 
 from __future__ import annotations
 
@@ -65,14 +60,14 @@ def test_section_includes_nested_heading_and_stops_at_the_next_peer():
 
 
 def test_spec_index_defines_no_heading_regex():
-    """§4.1: a second heading matcher in this tree is the bug."""
+    """§4.1: a second heading matcher in this tree is the bug"""
     src = Path(inspect.getsourcefile(spec_index)).read_text()
     assert not re.search(r"re\.compile\([^)]*#", src)
     assert "#{1,6}" not in src
 
 
 def test_toc_derives_from_sections_heading_re_by_identity(monkeypatch):
-    """Identity, so a retyped copy that merely passes equality fails here."""
+    """Identity, so a retyped copy that merely passes equality fails here"""
     seen: list[str] = []
     real = sections.HEADING_RE
 
@@ -101,11 +96,7 @@ def test_toc_over_the_fixture():
 
 @pytest.mark.parametrize("source", ["fixture", "real"])
 def test_every_toc_ref_resolves_back_to_its_own_heading(source):
-    """§4.1: the ref is one `jarvis spec section` accepts, verbatim.
-
-    A `### 2.1` row carrying number `2` lands on `## 2.`, a different section — the
-    bug §4.1 names, one row down.
-    """
+    """§4.1: the ref is one `jarvis spec section` accepts, verbatim"""
     md = FIXTURE if source == "fixture" else REAL_SPEC.read_text()
     heading_lines = md.splitlines()
     for s in spec_index.toc(md):
@@ -116,7 +107,7 @@ def test_every_toc_ref_resolves_back_to_its_own_heading(source):
 
 
 def test_toc_over_the_real_committed_spec():
-    """§4.4: one tidy fixture is where this suite goes vacuous."""
+    """§4.4: one tidy fixture is where this suite goes vacuous"""
     md = REAL_SPEC.read_text()
     got = spec_index.toc(md)
     lines = md.splitlines()
@@ -129,7 +120,7 @@ def test_toc_over_the_real_committed_spec():
         assert s.tokens == len(sections.extract_section(md, s.number or s.name)) // 4
 
 
-# -- §4.1 `search`: section granularity, and the walk ------------------------------------
+# -- §4.1 `search`: section granularity, and the walk
 
 SEARCHABLE = """# Exporter
 
@@ -149,7 +140,7 @@ Nothing about budgets.
 
 
 def test_search_reports_one_hit_per_section_with_a_resolvable_ref(tmp_path):
-    """§4.1: section granularity, deduplicated — not a grep line list."""
+    """§4.1: section granularity, deduplicated — not a grep line list"""
     (tmp_path / "doc.md").write_text(SEARCHABLE)
     hits = spec_index.search(tmp_path, "retry budget")
     assert [(h.path, h.section) for h in hits] == [("doc.md", "1"), ("doc.md", "2")]
@@ -169,7 +160,7 @@ def test_search_requires_every_term_case_insensitively(tmp_path):
 
 
 def test_search_prunes_vendor_dirs_and_keeps_dot_jarvis(tmp_path):
-    """§4.2's sub-second scan is false on the first project with a virtualenv."""
+    """§4.2's sub-second scan is false on the first project with a virtualenv"""
     for where in (".venv/lib", "node_modules/pkg", ".git", "__pycache__"):
         d = tmp_path / where
         d.mkdir(parents=True)
@@ -182,7 +173,7 @@ def test_search_prunes_vendor_dirs_and_keeps_dot_jarvis(tmp_path):
 
 
 def test_search_prunes_sibling_git_worktrees(tmp_path):
-    """A worktree is a copy of the tree, so an unpruned walk ranks another branch first."""
+    """A worktree is a copy of the tree, so an unpruned walk ranks another branch first"""
     sibling = tmp_path / ".claude" / "worktrees" / "other" / "docs"
     sibling.mkdir(parents=True)
     (sibling / "doc.md").write_text("## 1. Slice\n\nthe retry budget is nine\n")
@@ -207,12 +198,12 @@ def test_search_context_is_one_capped_line(tmp_path):
     assert hit.context.startswith("the retry budget")
 
 
-# -- §4.2 root resolution, containment, payloads -----------------------------------------
+# -- §4.2 root resolution, containment, payloads
 
 
 @pytest.fixture()
 def registered(project, monkeypatch):
-    """`proj_a` in the central store, with the cwd inside it — the default scope."""
+    """`proj_a` in the central store, with the cwd inside it — the default scope"""
     central = CentralStore()
     try:
         central.upsert_project("proj_a", str(project))
@@ -256,7 +247,7 @@ def test_spec_search_unknown_project_names_it_and_scans_nothing(registered, monk
 
 
 def test_comma_separated_project_is_rejected(registered, capsys):
-    """§4.2: one project, never a union — so `a,b` is simply an unknown name."""
+    """§4.2: one project, never a union — so `a,b` is simply an unknown name"""
     assert cli.main(["spec", "search", "separable", "--project", "proj_a,proj_a"]) == 1
     assert "proj_a,proj_a" in capsys.readouterr().err
 
@@ -276,13 +267,7 @@ def test_no_project_and_a_cwd_outside_every_project_names_the_fix(registered, tm
 
 
 def _execute(command: str) -> dict:
-    """Run an emitted `jarvis spec section …` string the way a reader would type it.
-
-    Parsing it and calling `ops` is the whole test: a command that only PARSES can still
-    open a different file, which is what a root-relative path does from any cwd but the
-    root. The parser runs too, since `ops` alone would accept a `--project` placed where
-    argparse rejects it.
-    """
+    """Run an emitted `jarvis spec section …` string the way a reader would type it"""
     tokens = shlex.split(command)
     assert tokens[:3] == ["jarvis", "spec", "section"], command
     cli.build_parser().parse_args(tokens[1:])
@@ -296,10 +281,7 @@ def _execute(command: str) -> dict:
 
 def test_a_relative_path_is_read_from_the_cwd_and_reported_root_relative(registered,
                                                                          monkeypatch):
-    """A worker's worktree sits under the root, so a root-relative base reads MAIN's copy.
-
-    Same filename at the root and in the subdirectory: the one next to the caller wins.
-    """
+    """A worker's worktree sits under the root, so a root-relative base reads MAIN's copy"""
     (registered / "doc.md").write_text("# The copy at the root\n\nnot this one.\n")
     sub = registered / "sub"
     sub.mkdir()
@@ -314,7 +296,7 @@ def test_a_relative_path_is_read_from_the_cwd_and_reported_root_relative(registe
 
 def test_an_emitted_toc_command_opens_that_row_from_the_callers_cwd(registered,
                                                                     monkeypatch):
-    """§4.2's "exact command that shows it": it must run from the cwd that printed it."""
+    """§4.2's "exact command that shows it": it must run from the cwd that printed it"""
     sub = registered / "sub"
     sub.mkdir()
     monkeypatch.chdir(sub)
@@ -327,11 +309,7 @@ def test_an_emitted_toc_command_opens_that_row_from_the_callers_cwd(registered,
 
 def test_an_emitted_search_command_opens_a_hit_in_another_directory(registered,
                                                                    monkeypatch):
-    """The hit's DISPLAY path is root-relative; the command's must be callable.
-
-    The hit lives in `docs/superpowers/specs/`, the caller in `sub/`, so a root-relative string in
-    the command resolves to nothing at all.
-    """
+    """The hit's DISPLAY path is root-relative; the command's must be callable"""
     sub = registered / "sub"
     sub.mkdir()
     monkeypatch.chdir(sub)
@@ -345,11 +323,11 @@ def test_an_emitted_search_command_opens_a_hit_in_another_directory(registered,
 
 def test_an_emitted_command_names_the_project_the_caller_named(registered, tmp_path,
                                                                monkeypatch):
-    """`--project` plus an absolute path: from outside every root, nothing else resolves."""
+    """`--project` plus an absolute path: from outside every root, nothing else resolves"""
     outside = tmp_path / "outside"
     outside.mkdir()
     monkeypatch.chdir(outside)
-    # Absolute: from outside every root a relative path reads nothing, as `_spec_file` says.
+    # Absolute: from outside every root a relative path reads nothing, as `_spec_file` says
     toc = ops.spec_toc(
         str(registered / "docs" / "superpowers" / "specs" / "exporter.md"),
         project="proj_a")
@@ -364,7 +342,7 @@ def test_an_emitted_command_names_the_project_the_caller_named(registered, tmp_p
 
 
 def test_a_symlink_out_of_the_tree_is_refused_naming_the_root(registered, tmp_path):
-    """§4.2: both sides resolved — a prefix test is passed by this link."""
+    """§4.2: both sides resolved — a prefix test is passed by this link"""
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "secret.md").write_text("# Secret\n\nnot in the project\n")
@@ -375,7 +353,7 @@ def test_a_symlink_out_of_the_tree_is_refused_naming_the_root(registered, tmp_pa
     assert cli.main(["spec", "toc", "escape.md"]) == 1
 
 
-# -- §4.3 the three command spellings ----------------------------------------------------
+# -- §4.3 the three command spellings
 
 
 def test_the_three_spellings_parse_as_the_contract_names_them():
@@ -386,7 +364,7 @@ def test_the_three_spellings_parse_as_the_contract_names_them():
 
 
 def test_both_spec_helps_exit_zero():
-    """A new top-level verb can reorder argparse subcommands."""
+    """A new top-level verb can reorder argparse subcommands"""
     parser = cli.build_parser()
     for argv in (["spec", "--help"], ["fo", "spec", "--help"]):
         with pytest.raises(SystemExit) as e:

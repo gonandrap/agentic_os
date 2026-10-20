@@ -1,15 +1,4 @@
-"""Improvement orders: a `feature_orders` row with `kind='improvement'`.
-
-Section 2 of docs/superpowers/specs/2026-09-23-improvement-orders.md — persistence and
-the CLI surface. Two properties this file exists to protect:
-
-* **A new kind must not leak into the feature-order listings.** Nothing read
-  `feature_orders.kind` before this, so every unfiltered query picked the new rows up
-  silently. Each one is pinned here with a positive `kind` filter, never a negative one.
-* **…and must still reach the attention path.** An improvement order needing the user is
-  exactly as much an attention item as a feature order is, so `flagged_feature_orders`
-  stays unfiltered (§2.4).
-"""
+"""Improvement orders: a `feature_orders` row with `kind='improvement'` (docs/superpowers/specs/2026-09-23-improvement-orders.md)"""
 
 from __future__ import annotations
 
@@ -41,7 +30,7 @@ def store(project):
     s.close()
 
 
-# -- the store: the kind column, and the queries it has to reach -----------------------
+# -- the store: the kind column, and the queries it has to reach
 
 def test_the_kind_column_carries_both_values_and_defaults_to_feature(store):
     fo = store.create_feature_order("CSV export", description="the whole ask")
@@ -77,7 +66,7 @@ def test_an_improvement_order_is_absent_from_every_feature_listing(store):
 
 
 def test_the_attention_path_is_not_filtered(store):
-    """§2.4: the filter goes on the listings, not on the attention path."""
+    """§2.4: the filter goes on the listings, not on the attention path"""
     io = store.create_feature_order("slow first turns", description=OBSERVATION,
                                     kind="improvement")
     store.flag_feature_attention(io["id"], "findings awaiting you")
@@ -85,8 +74,7 @@ def test_the_attention_path_is_not_filtered(store):
 
 
 def test_the_planner_sweep_never_sees_an_improvement_order(store):
-    """The exact call `Daemon.plan_features` makes, asserted here rather than on the
-    daemon: a planner opened on an improvement order is the loudest failure in §2.4."""
+    """The exact call `Daemon.plan_features` makes"""
     io = store.create_feature_order("slow first turns", description=OBSERVATION,
                                     kind="improvement")
     assert io["status"] == "pending"
@@ -94,8 +82,7 @@ def test_the_planner_sweep_never_sees_an_improvement_order(store):
 
 
 def test_feature_order_for_planner_matches_an_analyst_row(store):
-    """§2.4: `feature_order_for_planner` keys on `plan_wo_id` and will now match the
-    analyst too. `INV-NEO-ESCALATIONS-LIVE` reads it, so prove it rather than reason."""
+    """§2.4: `feature_order_for_planner` keys on `plan_wo_id` and will now match the analyst too"""
     io = store.create_feature_order("slow first turns", description=OBSERVATION,
                                     kind="improvement")
     wo = store.create_work_order("analyse it", description="…")
@@ -105,8 +92,7 @@ def test_feature_order_for_planner_matches_an_analyst_row(store):
 
 
 def test_no_negative_kind_filter_exists_in_the_new_sql():
-    """§2.4 again, from the other side: a negative filter excludes nothing that has not
-    been invented yet, which is the bug this whole section is fixing."""
+    """§2.4 again, from the other side: a negative filter excludes nothing that has not been invented yet"""
     for verb in (ProjectStore.list_feature_orders, ProjectStore.feature_status_counts,
                  ProjectStore.feature_summary, ProjectStore.flagged_feature_orders):
         src = inspect.getsource(verb)
@@ -130,7 +116,7 @@ def test_is_feature_order_id():
     assert not pred("al-abc")
 
 
-# -- ops: filing one --------------------------------------------------------------------
+# -- ops: filing one
 
 def test_creating_an_improvement_order_stores_its_refs_verbatim(started, store):
     io = ops.create_improvement_order("proj_a", "slow first turns",
@@ -163,7 +149,7 @@ def test_an_improvement_order_with_no_evidence_is_refused(started):
     assert "--ref" in msg
 
 
-# -- ops: the listings, the show, the guards --------------------------------------------
+# -- ops: the listings, the show, the guards
 
 def test_the_two_listings_do_not_see_each_other(started):
     fo = ops.create_feature_order("proj_a", "CSV export", description="the whole ask")
@@ -230,8 +216,7 @@ def test_the_feature_verbs_refuse_an_improvement_order(started, store):
 
 
 def test_fo_show_refuses_an_improvement_order_and_names_io_show(started):
-    """GitHub issue #997: `show_feature_order` was the one `show_*` with no kind guard,
-    so an `io-` id came back as a feature order with an empty child tree."""
+    """GitHub issue #997: `show_feature_order` was the one `show_*` with no kind guard"""
     io = ops.create_improvement_order("proj_a", "slow first turns",
                                       description=OBSERVATION, refs=REFS)
     with pytest.raises(ops.OpsError) as e:
@@ -257,7 +242,7 @@ def test_os_status_labels_an_improvement_order_by_kind(started, store):
     assert items and items[0]["status"] == "improvement:findings awaiting you"
 
 
-# -- the budget passthrough --------------------------------------------------------------
+# -- the budget passthrough
 
 def test_the_family_budget_works_on_an_io_id(started):
     io = ops.create_improvement_order("proj_a", "slow first turns",
@@ -269,7 +254,7 @@ def test_the_family_budget_works_on_an_io_id(started):
     assert ops.set_feature_budget(io["id"], None)["budget_usd"] is None
 
 
-# -- the CLI ------------------------------------------------------------------------------
+# -- the CLI
 
 def test_the_cli_drives_the_whole_surface(started, store, capsys):
     assert cli.main(["io", "create", "proj_a", "slow first turns",
@@ -311,17 +296,13 @@ def test_cost_accepts_an_io_id(started):
     assert cli.main(["cost", io["id"]]) == 0
 
 
-# -- the shared fixture (§2.7) ------------------------------------------------------------
+# -- the shared fixture (§2.7)
 
-# -- the kind-agnostic paths (2026-10-01-a-family-capped-raise-must-say-so.md) ------------
-#
-# The other side of this file's first property: the filter belongs on the LISTINGS, and a
-# caller whose job is kind-agnostic has to NAME `kind` rather than leave the default.
+# -- the kind-agnostic paths (2026-10-01-a-family-capped-raise-must-say-so.md)
 
 
 def test_the_io_budget_verbs_refuse_a_row_of_another_kind(started):
-    """Obligation 5. `jarvis io budget` was the one `io` verb with no kind guard, and the
-    guard goes in `ops` so `/api` and every future caller gets it too."""
+    """Obligation 5"""
     fo = ops.create_feature_order("proj_a", "CSV export", description="the whole ask")
     for call in (lambda i: ops.improvement_order_budget(i),
                  lambda i: ops.set_improvement_budget(i, 9.0)):
@@ -336,9 +317,7 @@ def test_the_io_budget_verbs_refuse_a_row_of_another_kind(started):
 
 
 def test_raising_the_budget_names_the_parked_analyst(started, store):
-    """Obligation 5, the half that was silent (Neo question 1198). An analyst is
-    `kind='analyst'` and reaches the family as the parent's `plan_wo_id`, so the list of
-    children to top up was read off a set it can never be in."""
+    """Obligation 5, the half that was silent (Neo question 1198)"""
     io = ops.create_improvement_order("proj_a", "slow first turns",
                                       description=OBSERVATION, refs=REFS, budget_usd=2.0)
     child = store.create_work_order("analyse it", description="look",
@@ -352,8 +331,7 @@ def test_raising_the_budget_names_the_parked_analyst(started, store):
 
 
 def test_a_settled_flagged_improvement_order_still_lists(started, store):
-    """Obligation 6. A flag nobody can list is a flag nobody can act on — the listing's
-    default is the open rows PLUS any flagged row whatever its status."""
+    """Obligation 6"""
     io = ops.create_improvement_order("proj_a", "slow first turns",
                                       description=OBSERVATION, refs=REFS)
     quiet = ops.create_improvement_order("proj_a", "another one",
@@ -367,14 +345,12 @@ def test_a_settled_flagged_improvement_order_still_lists(started, store):
     assert quiet["id"] not in listed          # settled and unflagged stays hidden
     assert quiet["id"] in [r["id"] for r in
                            ops.list_improvement_orders("proj_a", include_settled=True)]
-    # ...and the flagged io is still not in the FEATURE listing: this is not a kind leak.
+    # ...and the flagged io is still not in the FEATURE listing: this is not a kind leak
     assert io["id"] not in [r["id"] for r in ops.list_feature_orders("proj_a")]
 
 
 def test_os_status_carries_every_kind_in_one_list(started, store):
-    """Obligation 7. The payload's readers are `jarvis status --json` and `/api/status` —
-    every machine reader, Jarvis's own pulse check included. Four attention items against
-    an empty listing is this leak."""
+    """Obligation 7"""
     fo = ops.create_feature_order("proj_a", "CSV export", description="the whole ask")
     io = ops.create_improvement_order("proj_a", "slow first turns",
                                       description=OBSERVATION, refs=REFS)
@@ -384,23 +360,16 @@ def test_os_status_carries_every_kind_in_one_list(started, store):
     by_id = {r["id"]: r for r in rows}
     assert by_id[fo["id"]]["kind"] == "feature"
     assert by_id[io["id"]]["kind"] == "improvement"
-    # A kind-aware label, through the one mapping: `planning` means "analysing" here, and
-    # a payload saying `planning` for all three kinds is the same leak in another shape.
+    # A kind-aware label, through the one mapping: `planning` means "analysing" here
     assert by_id[io["id"]]["status_label"] == "analysing"
     assert by_id[fo["id"]]["status_label"] == "pending"
 
 
 def test_the_two_settle_passes_name_their_kind_explicitly():
-    """Obligation 9. The guard against the next leak, source-level like
-    `test_no_negative_kind_filter_exists_in_the_new_sql` above and for the same reason:
-    the defect is a MISSING ARGUMENT, which no behavioural test can see on a path no
-    fixture covers. The settlement pass is feature-only BY LIFECYCLE and must say so
-    rather than rest on a default; the budget pass visits every kind, one at a time, so
-    it must not be feature-only."""
+    """Obligation 9"""
     src = inspect.getsource(Daemon.settle_features)
     assert 'statuses=("executing",), kind="feature"' in src
-    # The budget pass drives its kind off the table of what each kind runs in, so it
-    # reaches all three. A literal `kind="feature"` there would be the leak again.
+    # The budget pass drives its kind off the table of what each kind runs in, so it reaches all three
     assert "_FAMILY_RUNNING_STATUS.items()" in src
     assert src.count('kind="feature"') == 1
 

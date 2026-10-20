@@ -1,15 +1,4 @@
-"""Screenshot the "who will act" row of the debug page's diagnosis panel — §8 of
-docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md.
-
-The row sits right under "waiting on" and names the daemon pass coming for the order
-(`pass_name · predicate`) plus the sentence saying why. The fixture is a PENDING order,
-which `project_store.claim_sql_selects` selects, so `Daemon.dispatch_pending` is the
-actor — the same premise `tests/test_ui_debug.py` §3b asserts in strings.
-
-Everything lives in a temp `JARVIS_HOME`, so it never touches the live OS:
-
-    uv run python scripts/screenshot_who_will_act.py
-"""
+"""Screenshot the "who will act" row of the debug page's diagnosis panel (docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md)"""
 
 from __future__ import annotations
 
@@ -29,9 +18,7 @@ PORT = 8798
 
 
 def seed() -> tuple[str, str]:
-    """One pending work order in a fresh home. Pending and nothing else: the actor is
-    derived from the row's status and the claim SQL, so any further state would only
-    risk moving it to a different pass."""
+    """One pending work order in a fresh home"""
     from jarvis import ops
     from jarvis.central_store import CentralStore
 
@@ -56,8 +43,7 @@ def seed() -> tuple[str, str]:
 
 
 def check_actor(project: str, wo_id: str) -> None:
-    """The premise, before any browser: this row HAS an actor. A screenshot of the
-    fallback sentence would look like a captured feature and prove nothing."""
+    """The premise, before any browser: this row HAS an actor"""
     from jarvis import ops
     from jarvis.project_store import ProjectStore
 

@@ -1,15 +1,4 @@
-"""A red default branch raises itself.
-
-docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md.
-
-THE INCIDENT, measured 2026-09-26: PR #765 (wo-15f5d969) auto-merged onto a stale base,
-`main` went red on run 36273250195, and nothing in the OS noticed for ~4h — every
-base-health fact it held was written per work order, by the heal path, only for an order
-whose OWN pull request was failing. #765 had merged and left nothing parked, so there was
-no order for that path to run on. The test that would have caught it is
-`test_a_project_with_nothing_parked_and_auto_merge_off_still_learns_main_is_red`: no
-parked pull request, `auto_merge` off, and the fact plus the finding still arrive.
-"""
+"""A red default branch raises itself (docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md)"""
 
 from __future__ import annotations
 
@@ -30,21 +19,21 @@ from jarvis.testing import FIXTURE_BUG_REPO, with_origin
 PR = "https://github.com/acme/proj/pull/7"
 REPO = "acme/proj"
 JUDGED = "709582ae53000000000000000000000000000aaa"
-#: The red commit ON `main` — a squash, so a different object from any judged head.
+#: The red commit ON `main` — a squash, so a different object from any judged head
 MAIN_RED_SHA = "36273250000000000000000000000000000fff1"
 
 
 def run(run_id: int, sha: str, conclusion: str, started: str,
         workflow: str = "ci", status: str = "completed") -> dict:
-    """One `gh run list` row. LOWER CASE conclusions, as the real CLI answers them."""
+    """One `gh run list` row"""
     return {"databaseId": run_id, "headSha": sha, "conclusion": conclusion,
             "status": status, "startedAt": started, "workflowName": workflow}
 
 
-#: The incident's own run, and the recovery after it.
+#: The incident's own run, and the recovery after it
 MAIN_RED = run(36273250195, MAIN_RED_SHA, "failure", "2026-09-26T21:35:00Z")
 MAIN_GREEN = run(36273999999, "e080156", "success", "2026-09-26T23:00:00Z")
-#: A second break, after the recovery.
+#: A second break, after the recovery
 MAIN_RED_AGAIN = run(36274111111, "abc1234", "failure", "2026-09-27T01:00:00Z")
 
 
@@ -90,7 +79,7 @@ def runs_called(fake_gh) -> int:
 
 def parked(project_path, *, pr_url: str = PR, judged: str = JUDGED,
            title: str = "add feature X"):
-    """A work order finished behind a pull request, with a passed round on `judged`."""
+    """A work order finished behind a pull request, with a passed round on `judged`"""
     store = ProjectStore(project_path)
     wo = ops.create_work_order("proj_a", title)
     ops.finish(wo["id"], "opened a PR", pr_url=pr_url)
@@ -107,16 +96,12 @@ def opt_in(daemon):
     cfg.auto_merge = True
 
 
-# -- 1. the poll ----------------------------------------------------------------------
+# -- 1. the poll
 
 
 def test_a_renamed_default_branch_is_re_read_rather_than_reported_green(
         started, project, fake_gh):
-    """REVIEW FINDING 1. The cached name is the one thing about the fact that can go
-    stale silently: `gh run list --branch main` on a repository renamed to `trunk`
-    answers NO ROWS, no workflow has a red newest run, and the fact would be written
-    `red: false` — the OS positively asserting a green base it never looked at, which is
-    the one direction the spec forbids. An empty answer on a CACHED name re-reads it."""
+    """REVIEW FINDING 1"""
     central = CentralStore()
     central.set_base_health("proj_a", {"red": False, "base": "main",
                                        "base_read_at": time.time(),
@@ -130,15 +115,14 @@ def test_a_renamed_default_branch_is_re_read_rather_than_reported_green(
     held = fact()
     assert held["base"] == "trunk"
     assert held["red"] is True and held["run_id"] == 36273250195
-    # The retry is bounded: the name is read once and the runs twice, never in a loop.
+    # The retry is bounded: the name is read once and the runs twice, never in a loop
     assert runs_called(fake_gh) == 2
     assert len([c for c in fake_gh.calls if c["argv"][:2] == ["api", "--method"]
                 and c["argv"][-1] == ".default_branch"]) == 1
 
 
 def test_an_empty_answer_on_a_freshly_read_name_is_not_re_read(started, project, fake_gh):
-    """A project whose default branch has no CI at all is not a rename: one name read,
-    one runs read, and a fact that is not red."""
+    """A project whose default branch has no CI at all is not a rename: one name read"""
     red_fleet(fake_gh, rows=())
     store = ProjectStore(project)
 
@@ -150,8 +134,7 @@ def test_an_empty_answer_on_a_freshly_read_name_is_not_re_read(started, project,
 
 def test_a_project_with_nothing_parked_and_auto_merge_off_still_learns_main_is_red(
         started, project, fake_gh):
-    """THE #793 SHAPE, and the test that would have caught the incident. No parked pull
-    request, no `auto_merge`, and the fact plus the finding still arrive."""
+    """THE #793 SHAPE, and the test that would have caught the incident"""
     store = ProjectStore(project)
     assert store.list_work_orders() == []
     assert not started.catalog.project("proj_a").validation.auto_merge
@@ -172,15 +155,14 @@ def test_a_project_with_nothing_parked_and_auto_merge_off_still_learns_main_is_r
 
 def test_the_poll_costs_one_run_list_per_project_per_tick_and_nothing_else(
         started, project, fake_gh):
-    """The whole added cost Neo costed: ~30 calls/hour/project."""
+    """The whole added cost Neo costed: ~30 calls/hour/project"""
     red_fleet(fake_gh)
     store = ProjectStore(project)
 
     poll(started, store)
 
     assert runs_called(fake_gh) == 1
-    # Two pinned GETs on this FIRST poll and neither again: the default branch name,
-    # cached in the same fact, and the one attribution read the red transition buys.
+    # Two pinned GETs on this FIRST poll and neither again: the default branch name
     assert [c["argv"][:2] for c in fake_gh.calls
             if c["argv"][:2] != ["run", "list"]] == [["api", "--method"]] * 2
 
@@ -191,7 +173,7 @@ def test_the_poll_costs_one_run_list_per_project_per_tick_and_nothing_else(
 
 
 def test_a_project_with_no_origin_is_never_asked(started, project, fake_gh):
-    """`github.origin_repo` is the step's gate: no remote, no call, no fact."""
+    """`github.origin_repo` is the step's gate: no remote, no call, no fact"""
     import subprocess
 
     subprocess.run(["git", "-C", str(project), "remote", "remove", "origin"], check=True)
@@ -205,7 +187,7 @@ def test_a_project_with_no_origin_is_never_asked(started, project, fake_gh):
 
 
 def test_a_gh_that_fails_writes_no_state_and_raises_nothing(started, project, fake_gh):
-    """Unreadable means NOT KNOWN — never green and never red."""
+    """Unreadable means NOT KNOWN — never green and never red"""
     red_fleet(fake_gh)
     fake_gh.fail("gh: could not reach github.com")
     store = ProjectStore(project)
@@ -228,7 +210,7 @@ def test_a_green_default_branch_writes_a_fact_that_is_not_red(started, project, 
 
 
 def test_a_cancelled_newest_run_is_not_a_red_default_branch(started, project, fake_gh):
-    """`ci.RED_RUN_CONCLUSIONS` — a human stopping a run says nothing about the code."""
+    """`ci.RED_RUN_CONCLUSIONS` — a human stopping a run says nothing about the code"""
     red_fleet(fake_gh, rows=(run(1, "abc", "cancelled", "2026-09-26T23:00:00Z"), MAIN_RED))
     store = ProjectStore(project)
 
@@ -239,7 +221,7 @@ def test_a_cancelled_newest_run_is_not_a_red_default_branch(started, project, fa
 
 def test_an_unfinished_newer_run_does_not_hide_the_red_completed_one(
         started, project, fake_gh):
-    """Red iff any workflow's newest COMPLETED run is red."""
+    """Red iff any workflow's newest COMPLETED run is red"""
     red_fleet(fake_gh, rows=(run(2, "abc", "", "2026-09-26T23:00:00Z", status="in_progress"),
                              MAIN_RED))
     store = ProjectStore(project)
@@ -251,11 +233,7 @@ def test_an_unfinished_newer_run_does_not_hide_the_red_completed_one(
 
 def test_the_poll_runs_before_the_pull_request_poll_on_the_pr_cadence(
         started, project, fake_gh, monkeypatch):
-    """Same tick, BEFORE `poll_pull_requests`, so this tick's `auto_merge` reads a
-    fresh fact rather than the previous interval's. The dispatch sweep sits BETWEEN them
-    (spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §2): after the poll, so it
-    reads this tick's reading, and before the PR poll, so the `fix_wo_id` it writes names
-    the order in the same tick's holds."""
+    """Same tick, BEFORE `poll_pull_requests`"""
     order: list[str] = []
     monkeypatch.setattr(Daemon, "poll_default_branch",
                         lambda self, p, s: order.append("base"))
@@ -270,13 +248,12 @@ def test_the_poll_runs_before_the_pull_request_poll_on_the_pr_cadence(
     assert order == ["base", "fix", "prs"]
 
 
-# -- 2. the fact, the rows and the attribution ----------------------------------------
+# -- 2. the fact, the rows and the attribution
 
 
 def test_the_red_commit_is_attributed_through_the_squash_subject(
         started, project, fake_gh):
-    """The squash subject's `(#N)`, resolved to an order that carries
-    `automerge_merged` — the row says "the OS merged this", so it must be true."""
+    """The squash subject's `(#N)`, resolved to an order that carries `automerge_merged`"""
     store, wo = parked(project)
     store.add_event(wo["id"], "automerge_merged", {"head_sha": JUDGED})
     red_fleet(fake_gh)
@@ -292,7 +269,7 @@ def test_the_red_commit_is_attributed_through_the_squash_subject(
 
 def test_the_last_pull_request_number_in_the_subject_is_the_merged_one(
         started, project, fake_gh):
-    """Production shape: `… (#749) (#765)` — the squash's own number is the LAST."""
+    """Production shape: `… (#749) (#765)` — the squash's own number is the LAST"""
     store, wo = parked(project)
     store.add_event(wo["id"], "automerge_merged", {"head_sha": JUDGED})
     red_fleet(fake_gh)
@@ -305,12 +282,10 @@ def test_the_last_pull_request_number_in_the_subject_is_the_merged_one(
 
 def test_an_order_outside_the_listing_window_is_still_attributed(
         started, project, fake_gh):
-    """REVIEW FINDING 2. `list_work_orders` is `created_at DESC LIMIT 200`, so on a
-    mature project the order that merged five minutes ago — created months ago — is not
-    in the window and would be named nobody. The lookup is by pull-request NUMBER."""
+    """REVIEW FINDING 2"""
     store, wo = parked(project)
     store.add_event(wo["id"], "automerge_merged", {"head_sha": JUDGED})
-    # Older than every other order, so `created_at DESC LIMIT 200` provably excludes it.
+    # Older than every other order, so `created_at DESC LIMIT 200` provably excludes it
     store.conn.execute("UPDATE work_orders SET created_at=? WHERE id=?", (1.0, wo["id"]))
     for n in range(200):
         store.create_work_order(title=f"filler {n}")
@@ -324,7 +299,7 @@ def test_an_order_outside_the_listing_window_is_still_attributed(
 
 
 def test_the_pull_request_lookup_never_matches_a_number_by_prefix(project):
-    """`/pull/7` must not claim `/pull/17` or `/pull/70`."""
+    """`/pull/7` must not claim `/pull/17` or `/pull/70`"""
     store = ProjectStore(project)
     for url in ("https://github.com/acme/proj/pull/17",
                 "https://github.com/acme/proj/pull/70"):
@@ -337,7 +312,7 @@ def test_the_pull_request_lookup_never_matches_a_number_by_prefix(project):
 
 
 def test_an_unreadable_subject_names_no_work_order(started, project, fake_gh):
-    """A red `main` with no attribution is still the row the user needs."""
+    """A red `main` with no attribution is still the row the user needs"""
     store, wo = parked(project)
     store.add_event(wo["id"], "automerge_merged", {"head_sha": JUDGED})
     red_fleet(fake_gh)   # no subject registered: the commit read 404s
@@ -350,7 +325,7 @@ def test_an_unreadable_subject_names_no_work_order(started, project, fake_gh):
 
 def test_an_order_without_an_automerge_merged_event_is_not_claimed(
         started, project, fake_gh):
-    """The user merged it by hand: the row must not say the OS did."""
+    """The user merged it by hand: the row must not say the OS did"""
     store, _ = parked(project)
     red_fleet(fake_gh)
     fake_gh.set_commit_subject(MAIN_RED_SHA, "a fix (#7)")
@@ -362,10 +337,7 @@ def test_an_order_without_an_automerge_merged_event_is_not_claimed(
 
 def test_attribution_is_never_by_comparing_the_judged_sha_with_the_base_run_sha(
         started, project, fake_gh):
-    """THE REGRESSION THIS SPEC EXISTS TO PREVENT. `automerge_merged.head_sha` is the
-    PULL REQUEST's head and the merge is `--squash`, so the commit on `main` is a
-    different object — the two never compare equal, and an implementation that matched
-    on them would attribute nothing in production and everything here."""
+    """THE REGRESSION THIS SPEC EXISTS TO PREVENT"""
     store, wo = parked(project)
     store.add_event(wo["id"], "automerge_merged", {"head_sha": MAIN_RED_SHA})
     red_fleet(fake_gh)
@@ -377,7 +349,7 @@ def test_attribution_is_never_by_comparing_the_judged_sha_with_the_base_run_sha(
 
 
 def test_the_commit_is_read_only_on_the_red_transition(started, project, fake_gh):
-    """One extra `gh` call per red transition, never per tick."""
+    """One extra `gh` call per red transition, never per tick"""
     store, wo = parked(project)
     store.add_event(wo["id"], "automerge_merged", {"head_sha": JUDGED})
     red_fleet(fake_gh)
@@ -394,12 +366,11 @@ def test_the_commit_is_read_only_on_the_red_transition(started, project, fake_gh
                 and c["argv"][c["argv"].index("--jq") + 1] == ".commit.message"]) == 1
 
 
-# -- 3. the invariant and the announcements -------------------------------------------
+# -- 3. the invariant and the announcements
 
 
 def test_the_invariant_is_derived_and_makes_no_subprocess(started, project, fake_gh):
-    """An invariant that shelled out to `gh` would put a subprocess behind
-    `jarvis wo list` — `invariants.base_red_note`'s rule."""
+    """An invariant that shelled out to `gh` would put a subprocess behind `jarvis wo list`"""
     red_fleet(fake_gh)
     store = ProjectStore(project)
     poll(started, store)
@@ -415,8 +386,7 @@ def test_the_invariant_is_derived_and_makes_no_subprocess(started, project, fake
 
 def test_the_break_is_announced_once_across_repeated_reconcile_passes(
         started, spec, project, fake_gh):
-    """One writer per direction: the unrepaired violation's notification IS the red
-    row, deduped by `open_violation_report`."""
+    """One writer per direction: the unrepaired violation's notification IS the red row"""
     red_fleet(fake_gh)
     store = ProjectStore(project)
 
@@ -431,8 +401,7 @@ def test_the_break_is_announced_once_across_repeated_reconcile_passes(
 
 def test_the_green_transition_announces_recovery_and_re_arms_the_report(
         started, spec, project, fake_gh):
-    """`close_violation_report` for THIS key only, so a break-recover-break inside the
-    hourly landing sweep window announces twice rather than once."""
+    """`close_violation_report` for THIS key only"""
     red_fleet(fake_gh)
     store = ProjectStore(project)
     poll(started, store)
@@ -448,8 +417,7 @@ def test_the_green_transition_announces_recovery_and_re_arms_the_report(
     assert not [r for r in store.violation_reports()
                 if r["invariant"] == invariants.INV_BASE_RED]
 
-    # A SECOND break, newer than the recovery — `ci.latest` sorts by `startedAt`, so a
-    # re-registered older run is not a new break.
+    # A SECOND break, newer than the recovery
     fake_gh.set_runs("main", [MAIN_RED_AGAIN, MAIN_GREEN, MAIN_RED])
     poll(started, store)
     started.check_invariants(spec, store)
@@ -460,8 +428,7 @@ def test_the_green_transition_announces_recovery_and_re_arms_the_report(
 
 
 def test_closing_one_report_leaves_every_other_standing(project):
-    """Why the plural sweep version is unusable here: it DELETES every report not in
-    the iterable it is given."""
+    """Why the plural sweep version is unusable here: it DELETES every report not in the iterable it is..."""
     store = ProjectStore(project)
     store.open_violation_report(invariants.INV_BASE_RED)
     store.open_violation_report("INV-SOMETHING-ELSE", "wo-1")
@@ -486,7 +453,7 @@ def test_a_still_red_base_writes_no_second_row_on_the_next_three_polls(
                 if invariants.INV_BASE_RED in n["title"]]) == 1
 
 
-# -- the merge pause, wired ------------------------------------------------------------
+# -- the merge pause, wired
 
 
 def test_a_fresh_red_fact_pauses_a_parked_merge(started, spec, project, fake_gh):
@@ -504,8 +471,7 @@ def test_a_fresh_red_fact_pauses_a_parked_merge(started, spec, project, fake_gh)
 
 
 def test_a_stale_reading_never_pauses_a_merge(started, spec, project, fake_gh, local_base):
-    """A `gh` that stopped answering must not pause the fleet's merges for ever on a
-    fact nobody can confirm."""
+    """A `gh` that stopped answering must not pause the fleet's merges for ever on a fact nobody can..."""
     opt_in(started)
     store, wo = parked(project)
     fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
@@ -523,9 +489,7 @@ def test_a_stale_reading_never_pauses_a_merge(started, spec, project, fake_gh, l
 
 def test_the_stored_fact_is_read_once_per_project_per_poll(started, spec, project,
                                                            fake_gh, monkeypatch):
-    """REVIEW FINDING 3. It is the same fact for every order in the loop, so it is read
-    once per project per poll and passed down — not once per parked order, which is a
-    central read the poll's stated budget does not name."""
+    """REVIEW FINDING 3"""
     opt_in(started)
     store, one = parked(project, pr_url=PR, title="one")
     _, two = parked(project, pr_url=PR.replace("/7", "/8"), judged=JUDGED, title="two")
@@ -557,20 +521,18 @@ def test_an_absent_fact_never_pauses_a_merge(started, spec, project, fake_gh, lo
 
 
 def test_the_pause_is_a_pause_and_not_a_stall(started, spec, project, fake_gh, local_base):
-    """END TO END, §Tests item 5: a parked order held on a red `main`, `main` goes
-    green, and the merge proceeds. A held merge that never resumed would be the same
-    stall wearing a better label."""
+    """END TO END, §Tests item 5: a parked order held on a red `main`"""
     opt_in(started)
     store, wo = parked(project)
     fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
     red_fleet(fake_gh)
 
-    poll(started, store)                        # 1. `main` is red: the merge pauses
+    poll(started, store)                        # 1
     started.poll_pull_requests(spec, store)
     assert store.list_approvals(wo["id"]) == []
 
     fake_gh.set_runs("main", [MAIN_GREEN, MAIN_RED])
-    poll(started, store)                        # 2. `main` recovers: the merge arms
+    poll(started, store)                        # 2
     started.poll_pull_requests(spec, store)
     approvals = store.list_approvals(wo["id"])
     assert len(approvals) == 1 and approvals[0]["kind"] == "auto_merge"
@@ -586,8 +548,7 @@ def test_the_pause_is_a_pause_and_not_a_stall(started, spec, project, fake_gh, l
 
 def test_a_red_base_spends_no_round_number_on_a_moved_head(
         started, spec, project, fake_gh):
-    """`HELD_BASE_RED` sits before the sha checks, so no round is spent re-judging a
-    branch whose CI is inheriting `main`'s failure."""
+    """`HELD_BASE_RED` sits before the sha checks"""
     opt_in(started)
     store, wo = parked(project)
     fake_gh.set_pr(PR, "OPEN", checks=RED, merge_state="CLEAN", head_oid="f00dfeed0000")
@@ -600,14 +561,11 @@ def test_a_red_base_spends_no_round_number_on_a_moved_head(
     assert store.latest_validation_round(wo_id=wo["id"]) == before
     held = store.events_of_kind(wo["id"], "automerge_held")
     assert db.from_json(held[-1]["payload"], {})["code"] == automerge.HELD_BASE_RED
-    # The rider: this pull request's own `ci` failure is the same break.
+    # The rider: this pull request's own `ci` failure is the same break
     assert "not its fault" in db.from_json(held[-1]["payload"], {})["reason"]
 
 
-# -- the red-episode list ---------------------------------------------------------------
-# §2 of docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md:
-# Neo's ruling on question 1818. The discount must outlive the exclusion by one status
-# span, so closed episodes and not a live field are what the sweep reads.
+# -- the red-episode list
 
 
 def episodes(central=None) -> list:
@@ -616,8 +574,7 @@ def episodes(central=None) -> list:
 
 
 def test_the_episode_list_is_appended_to_on_a_transition_only(started, project, fake_gh):
-    """ONE open pair however many red polls follow, closed on the green one, and nothing
-    written by a second green poll — the writer is the transition and never the poll."""
+    """ONE open pair however many red polls follow"""
     red_fleet(fake_gh)
     store = ProjectStore(project)
 
@@ -638,8 +595,7 @@ def test_the_episode_list_is_appended_to_on_a_transition_only(started, project, 
 
 
 def test_a_crash_while_red_does_not_lose_the_open_episode(started, project, fake_gh):
-    """`was_red` is read from the STORED fact, so a fresh `Daemon` after a restart still
-    closes the pair its predecessor opened — the episode outlives the process."""
+    """`was_red` is read from the STORED fact"""
     red_fleet(fake_gh)
     store = ProjectStore(project)
     poll(started, store)
@@ -653,21 +609,19 @@ def test_a_crash_while_red_does_not_lose_the_open_episode(started, project, fake
 
 
 def test_advance_red_episodes_and_the_spans_are_pure_units():
-    """Both module-level and both over the LIST — `validation_ci_hold_spans`' rule: the
-    span derivation lives in the module that owns the rows, and takes rows."""
+    """Both module-level and both over the LIST"""
     from jarvis.central_store import advance_red_episodes, base_red_hold_spans
 
-    # green to red opens a pair; a second call in the same tick opens no second one.
+    # green to red opens a pair; a second call in the same tick opens no second one
     opened = advance_red_episodes([], True, 100.0, 3600)
     assert opened == [[100.0, None]]
     assert advance_red_episodes(opened, True, 110.0, 3600) == [[100.0, None]]
-    # red to green closes the open pair; a second green call changes nothing.
+    # red to green closes the open pair; a second green call changes nothing
     closed = advance_red_episodes(opened, False, 150.0, 3600)
     assert closed == [[100.0, 150.0]]
     assert advance_red_episodes(closed, False, 160.0, 3600) == closed
 
-    # clipped to `[since, now]`; an open pair takes `open_end`; a pair wholly before
-    # `since` yields nothing.
+    # clipped to `[since, now]`; an open pair takes `open_end`
     assert base_red_hold_spans([[50.0, 120.0], [130.0, 150.0], [180.0, None]],
                                100.0, 200.0, 190.0) == [(100.0, 120.0), (130.0, 150.0),
                                                         (180.0, 190.0)]
@@ -676,8 +630,7 @@ def test_advance_red_episodes_and_the_spans_are_pure_units():
 
 
 def test_an_unreadable_episode_list_discounts_nothing():
-    """`base_health`'s own tolerance: `[]` for absent, unparseable or not pairs. An
-    unreadable list discounts nothing, which is the under-discount direction."""
+    """`base_health`'s own tolerance: `[]` for absent, unparseable or not pairs"""
     central = CentralStore()
     assert central.base_red_episodes("proj_a") == []
     for bad in ("{not json", '{"red": true}', '[[1, 2, 3]]', '["a", "b"]', '[7]'):
@@ -687,9 +640,7 @@ def test_an_unreadable_episode_list_discounts_nothing():
 
 def test_an_episode_outside_the_retention_window_under_discounts(
         started, project, fake_gh):
-    """§2 Degradation direction: a trimmed episode yields NO span, so the sweep judges
-    MORE time rather than less — and an order whose red hours were forgotten is flagged,
-    which is exactly today's behaviour. Same for the pre-ship case: no episode at all."""
+    """§2 Degradation direction: a trimmed episode yields NO span"""
     from jarvis import ops as ops_mod
     from jarvis.catalog import FleetHealthConfig
     from jarvis.central_store import base_red_hold_spans
@@ -721,16 +672,16 @@ def test_an_episode_outside_the_retention_window_under_discounts(
     store.close()
 
 
-# -- the dispatch (spec 2026-10-14-a-red-main-dispatches-its-own-fix.md) --------------
+# -- the dispatch (spec 2026-10-14-a-red-main-dispatches-its-own-fix.md)
 
-#: The failing run's url as a worker-filed issue on the tracker would quote it.
+#: The failing run's url as a worker-filed issue on the tracker would quote it
 TRACKER_RUN_URL = ci.run_url(*FIXTURE_BUG_REPO.split("/"), 36273250195)
 TRACKER_PR = f"https://github.com/{FIXTURE_BUG_REPO}/pull/9"
 
 
 @pytest.fixture()
 def tracker(started, project, fake_gh):
-    """`proj_a`'s git `origin` IS `bugreport.bug_repo()` — §1's whole gate."""
+    """`proj_a`'s git `origin` IS `bugreport.bug_repo()` — §1's whole gate"""
     subprocess.run(["git", "-C", str(project), "remote", "set-url", "origin",
                     f"https://github.com/{FIXTURE_BUG_REPO}.git"], check=True)
     fake_gh.set_default_branch(FIXTURE_BUG_REPO, "main")
@@ -751,7 +702,7 @@ def orders(store) -> list[str]:
 
 
 def test_a_project_that_is_not_the_tracker_dispatches_nothing(started, project, fake_gh):
-    """§1: every other project stays notify-only, byte-identical to today."""
+    """§1: every other project stays notify-only, byte-identical to today"""
     red_fleet(fake_gh)
     store = ProjectStore(project)
     poll(started, store)
@@ -767,8 +718,7 @@ def test_a_project_that_is_not_the_tracker_dispatches_nothing(started, project, 
 
 
 def test_a_second_red_run_joins_the_order_already_on_it(tracker, project, fake_gh):
-    """§3: dedupe on the ISSUE, not on the run — keying on the run id is the 1007/1010
-    shape, one filing per red run."""
+    """§3: dedupe on the ISSUE, not on the run"""
     store = ProjectStore(project)
     poll(tracker, store)
     sweep(tracker, store)
@@ -788,14 +738,13 @@ def test_a_second_red_run_joins_the_order_already_on_it(tracker, project, fake_g
 
 
 def os_filed_body(run_url: str = TRACKER_RUN_URL) -> str:
-    """A body as `jarvis bug report` writes it: the run url, and §4's filing marker."""
+    """A body as `jarvis bug report` writes it: the run url, and §4's filing marker"""
     return f"run {run_url} failed\n\n{bugreport.FILED_MARKER}"
 
 
 def test_an_open_issue_quoting_the_run_id_is_adopted(tracker, project, fake_gh,
                                                      monkeypatch):
-    """§4: the run id is the one token unique to this break, and the LOWEST open hit
-    AMONG THE ELIGIBLE wins so two concurrent filings converge on one."""
+    """§4: the run id is the one token unique to this break"""
     filed: list[dict] = []
     monkeypatch.setattr(bugreport, "report_bug", lambda **kw: filed.append(kw))
     later = f"https://github.com/{FIXTURE_BUG_REPO}/issues/1200"
@@ -810,7 +759,7 @@ def test_an_open_issue_quoting_the_run_id_is_adopted(tracker, project, fake_gh,
     assert filed == []
     held = fact()
     assert held["issue_url"] == first and held["fix_wo_id"]
-    # §3: an adopted issue that passed §4's author-plus-marker test is the OS's own.
+    # §3: an adopted issue that passed §4's author-plus-marker test is the OS's own
     assert held["issue_os_filed"] is True
     assert [w["issue_url"] for w in store.list_work_orders(include_hidden=True)] \
         == [first]
@@ -818,9 +767,7 @@ def test_an_open_issue_quoting_the_run_id_is_adopted(tracker, project, fake_gh,
 
 def test_a_foreign_authored_issue_quoting_the_run_id_is_not_adopted(tracker, project,
                                                                     fake_gh):
-    """§4 filter 2, THE ATTACK AS REPORTED. The tracker and the run id are public, so a
-    stranger quoting the run id wins the lowest-number race — and `issues.start_work`
-    would dispatch a privileged worker whose brief is that remote body."""
+    """§4 filter 2, THE ATTACK AS REPORTED"""
     attacker = f"https://github.com/{FIXTURE_BUG_REPO}/issues/1000"
     fake_gh.add_issue(attacker, "main is red", body=os_filed_body(),
                       author="a-stranger")
@@ -839,8 +786,7 @@ def test_a_foreign_authored_issue_quoting_the_run_id_is_not_adopted(tracker, pro
 
 def test_an_os_authored_issue_without_the_filing_marker_is_not_adopted(tracker, project,
                                                                       fake_gh):
-    """§4 filter 3: the author alone would adopt any issue the OS's account ever opened
-    for another reason that happens to quote the id."""
+    """§4 filter 3: the author alone would adopt any issue the OS's account ever opened for another reason..."""
     other = f"https://github.com/{FIXTURE_BUG_REPO}/issues/1000"
     fake_gh.add_issue(other, "a note about run 36273250195",
                       body=f"run {TRACKER_RUN_URL} failed")
@@ -857,8 +803,7 @@ def test_an_os_authored_issue_without_the_filing_marker_is_not_adopted(tracker, 
 def test_the_lowest_number_is_taken_among_the_eligible_and_not_overall(tracker, project,
                                                                       fake_gh,
                                                                       monkeypatch):
-    """§4 filter 4: lowest-number-AMONG-THE-ELIGIBLE. Overall would hand the break to the
-    stranger's issue, which is the attack again by another route."""
+    """§4 filter 4: lowest-number-AMONG-THE-ELIGIBLE"""
     filed: list[dict] = []
     monkeypatch.setattr(bugreport, "report_bug", lambda **kw: filed.append(kw))
     attacker = f"https://github.com/{FIXTURE_BUG_REPO}/issues/1000"
@@ -878,8 +823,7 @@ def test_the_lowest_number_is_taken_among_the_eligible_and_not_overall(tracker, 
 
 
 def test_a_closed_issue_quoting_the_run_id_is_not_adopted(tracker, project, fake_gh):
-    """§4 filter 1: a CLOSED issue citing this run is a fix that was tried and did not
-    work, and `start_work` refuses a closed issue outright."""
+    """§4 filter 1: a CLOSED issue citing this run is a fix that was tried and did not work"""
     closed = f"https://github.com/{FIXTURE_BUG_REPO}/issues/1054"
     fake_gh.add_issue(closed, "main is red", body=os_filed_body(), state="CLOSED")
     store = ProjectStore(project)
@@ -890,7 +834,7 @@ def test_a_closed_issue_quoting_the_run_id_is_not_adopted(tracker, project, fake
     held = fact()
     assert held["issue_url"] == fake_gh.issue_url != closed
     assert filings(fake_gh) == 1 and held["fix_wo_id"]
-    # §2: `high` + `expedite`, and the evidence the NEXT sweep's search keys on.
+    # §2: `high` + `expedite`, and the evidence the NEXT sweep's search keys on
     assert store.get_work_order(held["fix_wo_id"])["issue_priority"] == "high"
     body = fake_gh.issue(held["issue_url"])["body"]
     assert TRACKER_RUN_URL in body and MAIN_RED_SHA in body and "36273250195" in body
@@ -898,8 +842,7 @@ def test_a_closed_issue_quoting_the_run_id_is_not_adopted(tracker, project, fake
 
 def test_a_filing_that_fails_leaves_nothing_and_the_next_tick_succeeds(
         tracker, project, fake_gh, monkeypatch):
-    """§2 step 9: every way the dispatch fails is transient and outside the OS, so the
-    sweep retries rather than firing once on the red transition."""
+    """§2 step 9: every way the dispatch fails is transient and outside the OS"""
     real = bugreport.report_bug
     boom = {"on": True}
 
@@ -926,7 +869,7 @@ def test_a_filing_that_fails_leaves_nothing_and_the_next_tick_succeeds(
 
 def test_the_green_transition_drops_both_keys_and_a_re_break_dispatches_again(
         tracker, project, fake_gh):
-    """§3: the GREEN transition simply does not set them, so no explicit clear."""
+    """§3: the GREEN transition simply does not set them, so no explicit clear"""
     store = ProjectStore(project)
     poll(tracker, store)
     sweep(tracker, store)
@@ -949,7 +892,7 @@ def test_the_green_transition_drops_both_keys_and_a_re_break_dispatches_again(
 
 
 def _dead_fix(tracker, store, status: str = "completed") -> str:
-    """One dispatched fix order, settled terminal, with `main` still red."""
+    """One dispatched fix order, settled terminal, with `main` still red"""
     poll(tracker, store)
     sweep(tracker, store)
     fix = fact()["fix_wo_id"]
@@ -969,7 +912,7 @@ def _detail(store) -> str:
 
 
 def _command_for(status: str, fix: str, issue_url: str) -> str:
-    """What each dead status may name: `wo retry` is `failed`-only by contract."""
+    """What each dead status may name: `wo retry` is `failed`-only by contract"""
     return (f"`jarvis wo retry {fix}`" if status == "failed"
             else f"`jarvis issues start {issue_url}`")
 
@@ -977,9 +920,7 @@ def _command_for(status: str, fix: str, issue_url: str) -> str:
 @pytest.mark.parametrize("status", TERMINAL_STATUSES)
 def test_a_terminal_fix_order_on_a_still_red_base_dispatches_nothing(tracker, project,
                                                                      fake_gh, status):
-    """§2 step 5, as the user ruled on assumption 2 (Neo 1738): one fix work order per
-    break, EVER. A second is an uncapped spend loop, and every environmental cause that
-    killed the first kills a replacement."""
+    """§2 step 5, as the user ruled on assumption 2 (Neo 1738): one fix work order per break, EVER"""
     store = ProjectStore(project)
     fix = _dead_fix(tracker, store, status)
     before = filings(fake_gh)
@@ -996,9 +937,7 @@ def test_a_terminal_fix_order_on_a_still_red_base_dispatches_nothing(tracker, pr
 @pytest.mark.parametrize("status", [*TERMINAL_STATUSES, "deleted"])
 def test_the_detail_names_the_dead_fix_order_and_a_command_that_can_run(
         tracker, project, fake_gh, status):
-    """§5's third remedy branch: the detail STATES the state the OS is in, names only a
-    command that can actually run — `jarvis wo retry` is `failed`-ONLY — and is
-    byte-identical across ticks because it is the dedupe key."""
+    """§5's third remedy branch: the detail STATES the state the OS is in"""
     store = ProjectStore(project)
     if status == "deleted":
         poll(tracker, store)
@@ -1028,9 +967,7 @@ def test_the_detail_names_the_dead_fix_order_and_a_command_that_can_run(
 @pytest.mark.parametrize("status", TERMINAL_STATUSES)
 def test_a_terminal_fix_order_owes_the_user_a_decision(tracker, spec, project, fake_gh,
                                                        status):
-    """§5: the OS is out of moves — `jarvis wo retry` is the user's by contract, and
-    `failed`-only — so the violation owes a decision, naming a command that can run, and
-    the sentence reaches the work order's attention flag."""
+    """§5: the OS is out of moves — `jarvis wo retry` is the user's by contract, and `failed`-only"""
     store = ProjectStore(project)
     fix = _dead_fix(tracker, store, status)
 
@@ -1048,14 +985,13 @@ def test_a_terminal_fix_order_owes_the_user_a_decision(tracker, spec, project, f
     assert row["needs_attention"] == 1
     assert owed[0] in invariants.true_blockers(store, row)
     if status != "failed":
-        # A `failed` order's own blocker outranks it; otherwise this is the only one.
+        # A `failed` order's own blocker outranks it; otherwise this is the only one
         assert row["attention_reason"] == owed[0]
 
 
 def test_the_owed_sentence_is_byte_identical_on_two_successive_ticks(tracker, project,
                                                                      fake_gh):
-    """The kn-fb4aa3c4 trap: `ack_attention` stores the sentence verbatim and
-    `true_blockers` compares it by equality, so nothing in it may move tick to tick."""
+    """The kn-fb4aa3c4 trap: `ack_attention` stores the sentence verbatim and `true_blockers` compares it..."""
     store = ProjectStore(project)
     _dead_fix(tracker, store)
 
@@ -1069,7 +1005,7 @@ def test_the_owed_sentence_is_byte_identical_on_two_successive_ticks(tracker, pr
 
 
 def test_a_running_fix_order_owes_no_decision(tracker, project, fake_gh):
-    """The order is working on it: nothing is owed and nothing is dispatched."""
+    """The order is working on it: nothing is owed and nothing is dispatched"""
     store = ProjectStore(project)
     poll(tracker, store)
     sweep(tracker, store)
@@ -1084,7 +1020,7 @@ def test_a_running_fix_order_owes_no_decision(tracker, project, fake_gh):
 
 
 def test_a_deleted_fix_order_behaves_as_terminal(tracker, project, fake_gh):
-    """A row that is gone is not a second dispatch either — the break had its order."""
+    """A row that is gone is not a second dispatch either — the break had its order"""
     store = ProjectStore(project)
     poll(tracker, store)
     sweep(tracker, store)
@@ -1104,10 +1040,7 @@ def test_a_deleted_fix_order_behaves_as_terminal(tracker, project, fake_gh):
 
 def test_a_stored_issue_that_was_closed_is_cleared_and_the_break_is_filed_again(
         tracker, project, fake_gh, monkeypatch):
-    """§2 step 6: `start_work` refuses a closed issue outright, so a stored url someone
-    has since closed is a retry that can never progress — the shape of the defect this
-    spec removes, one level down. The url is stored with NO work order (the pickup
-    failed), which under step 5 is the only state this branch can be reached in."""
+    """§2 step 6: `start_work` refuses a closed issue outright"""
     real = bugreport.report_bug
     pickup_fails = {"on": True}
     monkeypatch.setattr(bugreport, "report_bug", lambda **kw: (
@@ -1136,8 +1069,7 @@ def test_a_stored_issue_that_was_closed_is_cleared_and_the_break_is_filed_again(
 
 
 def test_a_stale_fact_dispatches_nothing(tracker, project, fake_gh):
-    """§2 step 2: freshness is judged in exactly one place, and a stale fact dispatches
-    nothing for the same reason it pauses no merge."""
+    """§2 step 2: freshness is judged in exactly one place"""
     store = ProjectStore(project)
     poll(tracker, store)
     central = CentralStore()
@@ -1154,10 +1086,7 @@ def test_a_stale_fact_dispatches_nothing(tracker, project, fake_gh):
 
 def test_the_adopted_issues_brief_carries_no_third_party_comment(tracker, project,
                                                                  fake_gh):
-    """REVIEW ROUND 4 item 3. §4's author-plus-marker test vouches for the TITLE AND BODY
-    of an adopted issue and for nothing else: anyone may comment on a public tracker
-    issue, so a brief that reproduced comments would hand a stranger's text to a
-    privileged worker through an issue the OS did file."""
+    """REVIEW ROUND 4 item 3. §4's author-plus-marker test vouches for the TITLE AND BODY of an adopted..."""
     ours = f"https://github.com/{FIXTURE_BUG_REPO}/issues/1054"
     fake_gh.add_issue(ours, "main is red", body=os_filed_body())
     rows = fake_gh.issues
@@ -1173,11 +1102,9 @@ def test_the_adopted_issues_brief_carries_no_third_party_comment(tracker, projec
     assert fix and fact()["issue_url"] == ours
     description = store.get_work_order(fix)["description"]
     assert "STRANGER-TEXT" not in description
-    # The body the OS itself wrote IS reproduced, so the absence above is not an empty
-    # brief passing by accident.
+    # The body the OS itself wrote IS reproduced
     assert TRACKER_RUN_URL in description and ours in description
-    # The fake's `issue view` does not serve comments at all, so the assertion that
-    # matters is that nothing ever ASKED for them.
+    # The fake's `issue view` does not serve comments at all
     asked = [c["argv"] for c in fake_gh.calls[before:]
              if "comments" in " ".join(c["argv"])]
     assert asked == []
@@ -1185,16 +1112,14 @@ def test_the_adopted_issues_brief_carries_no_third_party_comment(tracker, projec
 
 def test_the_fix_orders_own_pull_request_arms_while_the_base_is_still_red(
         tracker, spec, project, fake_gh, local_base):
-    """§6 END TO END: the fix order's own merge is the only thing that turns the base
-    green, so the fact `dispatch_base_fix` leaves behind must exempt THAT order and hold
-    every other one — through the daemon's own poll, not `decide` in isolation."""
+    """§6 END TO END: the fix order's own merge is the only thing that turns the base green"""
     opt_in(tracker)
     store = ProjectStore(project)
     poll(tracker, store)
     sweep(tracker, store)
     fix = fact()["fix_wo_id"]
     assert fix and fact()["issue_url"] and fact()["issue_os_filed"] is True
-    # The fix order, parked behind its own green pull request.
+    # The fix order, parked behind its own green pull request
     ops.finish(fix, "opened a PR", pr_url=TRACKER_PR)
     store.update_work_order(fix, session_id="sess-" + fix)
     row = store.open_validation_round(wo_id=fix, fingerprint="fp-" + fix)
@@ -1213,7 +1138,7 @@ def test_the_fix_orders_own_pull_request_arms_while_the_base_is_still_red(
     assert len(approvals) == 1 and approvals[0]["kind"] == "auto_merge"
     assert [db.from_json(e["payload"], {})["code"]
             for e in store.events_of_kind(fix, "automerge_held")] == []
-    # The same red base, the same tick: an unrelated order is still held.
+    # The same red base, the same tick: an unrelated order is still held
     held = store.events_of_kind(other["id"], "automerge_held")
     assert db.from_json(held[-1]["payload"], {})["code"] == automerge.HELD_BASE_RED
     assert store.list_approvals(other["id"]) == []
@@ -1221,8 +1146,7 @@ def test_the_fix_orders_own_pull_request_arms_while_the_base_is_still_red(
 
 def test_the_hold_reason_and_the_detail_name_the_order_and_never_change(
         tracker, spec, project, fake_gh):
-    """§5, the kn-fb4aa3c4 trap: the dedupe key IS the sentence, so both carry the work
-    order and nothing that moves tick to tick."""
+    """§5, the kn-fb4aa3c4 trap: the dedupe key IS the sentence"""
     opt_in(tracker)
     store, wo = parked(project, pr_url=TRACKER_PR)
     fake_gh.set_pr(TRACKER_PR, "OPEN", checks=GREEN, merge_state="CLEAN",

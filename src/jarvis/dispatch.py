@@ -1,4 +1,4 @@
-"""Dispatch: turn a claimed work order into a running Claude Code worker."""
+"""Dispatch: turn a claimed work order into a running Claude Code worker"""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from .project_store import MAX_DISPATCH_ATTEMPTS, ProjectStore
 
 
 def _worker_path() -> str:
-    """Daemon PATH, with the directory holding `jarvis` prepended."""
+    """Daemon PATH, with the directory holding `jarvis` prepended"""
     path = os.environ.get("PATH", "")
     exe = shutil.which("jarvis") or sys.executable
     bindir = str(Path(exe).parent)
@@ -24,46 +24,24 @@ def _worker_path() -> str:
     return path
 
 
-# Serena's READ-ONLY tool surface. Naming a tool in an agent's `tools:` key makes it
-# available; it does not make it runnable — permission is a separate gate, and a headless
-# turn cannot answer a prompt. Probed live 2026-08-03: a seat holding
-# `mcp__…__activate_project` in `tools:` but not in `permissions.allow` had the call
-# BLOCKED and reported it could not proceed; with these rules added, the same seat ran
-# activate_project -> find_symbol -> find_referencing_symbols and answered correctly with
-# no text search at all. So this list is what turns "Serena first" from prose into
-# something a worker can actually do.
-#
-# Enumerated rather than granted wholesale, for the same reason the planning seats
-# enumerate: Serena also ships `execute_shell_command`, `create_text_file` and
-# `replace_symbol_body`. Allowing the server as a unit would hand every worker — and every
-# seat that is deliberately denied a shell — a shell, through a side door.
+# Serena's READ-ONLY tool surface
 SERENA_READ_TOOLS = (
     "activate_project", "get_symbols_overview", "find_symbol",
     "find_referencing_symbols", "find_declaration", "find_implementations",
     "search_for_pattern", "find_file", "list_dir", "list_memories", "read_memory",
 )
 
-# A plugin install produces the long prefix, `claude mcp add serena` the short one. Jarvis
-# configures no MCP server itself, so it cannot know which; both are listed, and a rule
-# naming a tool that does not exist on this install is simply inert.
+# A plugin install produces the long prefix, `claude mcp add serena` the short one
 SERENA_TOOL_PREFIXES = ("mcp__serena__", "mcp__plugin_serena_serena__")
 
 
-# The two undocumented keys in the 2.1.284 binary that decide `auto` mode's bash-first
-# steer: `CLAUDE_CODE_THRIFTY_SONIC` whether it exists at all (the env value wins over
-# the statsig cohort when defined), `CLAUDE_CODE_COZY_TEAPOT` which variant. §2 of
-# docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md records the probes.
+# The two undocumented keys in the 2.1.284 binary that decide `auto` mode's bash-first steer:... (docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md)
 BASH_FIRST_ENV = "CLAUDE_CODE_THRIFTY_SONIC"
 BASH_FIRST_VARIANT_ENV = "CLAUDE_CODE_COZY_TEAPOT"
 
 
 def bash_first_env(bash_first: str) -> dict[str, str]:
-    """The env for one `worker.bash_first` value — spec §2.
-
-    STRINGS, every one: Claude Code's `env` is a `Record<string,string>` and an integer
-    risks the CLI rejecting the whole settings file. `cli` writes NOTHING, which is the
-    state where Jarvis leaves the vendor's cohort draw alone.
-    """
+    """The env for one `worker.bash_first` value — spec §2"""
     if bash_first == "cli":
         return {}
     if bash_first == "off":
@@ -72,14 +50,7 @@ def bash_first_env(bash_first: str) -> dict[str, str]:
 
 
 def cache_ttl_env(cache_ttl: str) -> dict[str, str]:
-    """The env for one `worker.cache_ttl` value — spec §2 of
-    docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md.
-
-    STRINGS, every one, for `bash_first_env`'s reason. The key strings live in
-    `claude_cli` and are never spelled twice: the settings file and the spawn environment
-    must not be able to disagree. `cli` writes NOTHING, which is the CLI's own automatic
-    TTL; `1h` writes no 5m key, which would short-circuit it in the binary.
-    """
+    """The env for one `worker.cache_ttl` value (docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md)"""
     if cache_ttl == "cli":
         return {}
     if cache_ttl == "1h":
@@ -87,18 +58,12 @@ def cache_ttl_env(cache_ttl: str) -> dict[str, str]:
     return dict(claude_cli.PROMPT_CACHE_5M_ENV)
 
 
-# Whether Claude Code DEFERS MCP tools behind `ToolSearch` or lists them with full
-# schemas. §4 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md records the probes.
+# Whether Claude Code DEFERS MCP tools behind `ToolSearch` or lists them with full schemas. §4 of... (docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md)
 TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
 
 
 def tool_search_env(tool_search: str) -> dict[str, str]:
-    """The env for one `worker.tool_search` value — spec §4.
-
-    STRINGS, every one: Claude Code's `env` is a `Record<string,string>` and an integer
-    risks the CLI rejecting the whole settings file. `cli` writes NOTHING, which is the
-    state where Jarvis leaves the vendor's own answer alone.
-    """
+    """The env for one `worker.tool_search` value — spec §4"""
     if tool_search == "cli":
         return {}
     if tool_search == "off":
@@ -107,20 +72,13 @@ def tool_search_env(tool_search: str) -> dict[str, str]:
 
 
 def serena_allow_rules() -> list[str]:
-    """`permissions.allow` entries for every read-only Serena tool, under both prefixes."""
+    """`permissions.allow` entries for every read-only Serena tool, under both prefixes"""
     return [f"{prefix}{tool}"
             for prefix in SERENA_TOOL_PREFIXES for tool in SERENA_READ_TOOLS]
 
 
 def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
-    """Merge the project's injected settings with per-work-order env and persist
-    them for --settings.
-
-    The worker session lives in a fresh worktree where the (untracked)
-    .claude/settings.json doesn't exist, so hooks/permissions/env must travel with
-    the spawn. The file outlives the spawn call — Claude reloads settings from it —
-    so it is kept under the project's .jarvis dir for the work order's lifetime.
-    """
+    """Merge the project's injected settings with per-work-order env and persist them for --settings"""
     import json as _json
 
     from . import agent_usage, concision, hooks, wiring
@@ -130,19 +88,11 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
     settings = build_settings(project.settings_overrides)
     settings.pop("_jarvis", None)
 
-    # WHAT THE PROJECT DESELECTED on /config, and the only place a deselection takes
-    # effect: the user's own Claude configuration is read to populate that page and
-    # never written. Merged before the rules below so the permission block can ask
-    # whether Serena survived. See `wiring.settings_patch`.
+    # WHAT THE PROJECT DESELECTED on /config
     settings = deep_merge(settings, wiring.settings_patch(project.wiring))
     serena = wiring.serena_wired(project.wiring)
 
-    # Declarative worker permissions: full edit rights inside its own worktree,
-    # read rights over the whole project. Workers default to `auto` mode (which runs
-    # routine tools unattended), so these are a safety net for projects that opt into
-    # a stricter mode — under `acceptEdits`/`default` a --bg session would otherwise
-    # prompt and stall (verified live). Sensitive-path deny guards from the project's
-    # settings_overrides still win in every mode.
+    # Declarative worker permissions: full edit rights inside its own worktree
     proj_abs = str(project.path).lstrip("/")
     wt_abs = f"{proj_abs}/.claude/worktrees/{wo['id']}"
     allow = settings.setdefault("permissions", {}).setdefault("allow", [])
@@ -151,38 +101,16 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         f"Write(//{wt_abs}/**)",
         f"NotebookEdit(//{wt_abs}/**)",
         f"Read(//{proj_abs}/**)",
-        # Read-only code navigation. Without these the symbol tools are visible and
-        # unrunnable, which is worse than absent: the worker is told to prefer Serena,
-        # tries, gets blocked, and either stalls asking for permission it cannot be
-        # granted headlessly or falls back to grep having wasted a call. Omitted
-        # entirely when the project has deselected Serena — a rule naming an absent
-        # tool is inert, but a settings file that both removes a server and grants its
-        # tools is the incoherence this feature exists to avoid.
+        # Read-only code navigation
         *(serena_allow_rules() if serena else ()),
     ):
         if rule not in allow:
             allow.append(rule)
 
-    # THE prefix-stability lever. Claude Code builds a git-status snapshot (branch,
-    # `status --short`, last five commits) into the dynamic half of the system prompt
-    # and rebuilds it per process — and a worker turn IS a process (`-p --resume`). So
-    # the worker dirties its tree, the snapshot changes, the system prompt changes, and
-    # the cached prefix for the entire conversation dies at every turn boundary. This
-    # setting is the only switch that removes the snapshot; measured on 2.1.233, turn 2
-    # of a resumed worker goes from writing 10,983 / reading 15,995 tokens to writing
-    # 552 / reading 26,113. It also drops the CLI's own git and commit/PR instruction
-    # blocks, which `worker_brief.git_briefing` restates as static text on
-    # --append-system-prompt (tests/test_stable_prefix.py holds the two together).
+    # THE prefix-stability lever
     settings["includeGitInstructions"] = False
 
-    # ONE COPY OF THE PROJECT'S CLAUDE.md reaches the worker. Its worktree is inside the
-    # project, so the CLI loads the branch's copy AND the main checkout's — ~11k
-    # duplicated tokens in every request's prefix, and two instruction sets that may
-    # disagree. The worktree path is PREDICTED, not checked: this file is written before
-    # the spawn whose `--worktree` flag creates it. Spec docs/superpowers/specs/
-    # 2026-09-29-one-copy-of-the-projects-claude-md.md §3.
-    # BOTH SPELLINGS of the root when a catalog path runs through a symlink: an entry
-    # naming a file the CLI did not load is inert, a missing one leaves the duplicate.
+    # ONE COPY OF THE PROJECT'S CLAUDE.md reaches the worker
     resolved = project.path.resolve() if project.path.exists() else project.path
     excludes = [str(p) for p in (settings.get("claudeMdExcludes") or [])]
     for path in hooks.claude_md_excludes(
@@ -199,106 +127,45 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         "JARVIS_WO_ID": wo["id"],
         "JARVIS_PROJECT": project.name,
         "JARVIS_PROJECT_PATH": str(project.path),
-        # The worker's jarvis calls must hit the same central state as the daemon.
+        # The worker's jarvis calls must hit the same central state as the daemon
         "JARVIS_HOME": str(jarvis_home()),
-        # Where TOKEN ACCOUNTING goes, pinned separately from JARVIS_HOME and read by
-        # `agent_usage` alone. The two are the same value here and diverge in exactly
-        # one place: a test run inside this worker, whose isolation gate redirects
-        # JARVIS_HOME away from live state. Real tokens billed by an opt-in LLM eval
-        # are still this work order's cost, and without this they were spent into a
-        # tmp directory and deleted (issue #103). See `agent_usage.SPEND_HOME_ENV`.
+        # Where TOKEN ACCOUNTING goes, pinned separately from JARVIS_HOME and read by `agent_usage` alone (#103)
         agent_usage.SPEND_HOME_ENV: str(jarvis_home()),
-        # Workers call `jarvis …` from Bash (contract); make sure it resolves even
-        # though the Claude supervisor daemon has its own PATH.
+        # Workers call `jarvis …` from Bash (contract)
         "PATH": _worker_path(),
-        # Which privileged actions the PreToolUse gate mediates for this worker. Travels
-        # as env rather than being looked up per hook call: the hook runs on every Bash
-        # command and must not load and parse the catalog to decide it has nothing to do.
+        # Which privileged actions the PreToolUse gate mediates for this worker
         "JARVIS_GATES": project.gates.to_json(),
-        # Whether the navigation briefing may say "Serena first" — `jarvis brief
-        # navigation` is a separate process and would otherwise recommend a server this
-        # same file has just removed. Travels as env for `JARVIS_GATES`' reason: the
-        # answer is fixed at spawn, and a per-call catalog read would be a second
-        # source of truth that can disagree with the settings beside it.
+        # Whether the navigation briefing may say "Serena first"
         "JARVIS_SERENA": "1" if serena else "0",
-        # Whether the navigation briefing may say the symbol tools are DEFERRED —
-        # `jarvis brief navigation` is a separate process and would otherwise tell the
-        # worker to make a `ToolSearch` call for tools already in its tool list. Env for
-        # `JARVIS_SERENA`'s reason (spec 2026-10-02-serena-the-cheap-path.md §4).
+        # Whether the navigation briefing may say the symbol tools are DEFERRED
         "JARVIS_TOOL_SEARCH": project.worker.tool_search,
-        # Whether `hooks.py_nav_decision` refuses a source-navigating Bash call at a
-        # `.py` path (spec 2026-10-02-serena-the-cheap-path.md §6).
+        # Whether `hooks.py_nav_decision` refuses a source-navigating Bash call at a `.py` path (spec...
         "JARVIS_PY_NAV_HOOK": project.worker.py_nav_hook,
-        # Whether `hooks.doc_nav_decision` refuses a whole-file or oversized read of a
-        # SPEC, and the line bar both of its arms share (spec §5 of
-        # docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md). The bar is the RESOLVED
-        # number — `catalog.DEFAULT_WORKER_DOC_READ_LIMIT_LINES` is only its fallback —
-        # and travels as a STRING because Claude Code's settings `env` is a
-        # `Record<string,string>`, like `MCP_TOOL_TIMEOUT` below.
+        # Whether `hooks.doc_nav_decision` refuses a whole-file or oversized read of a SPEC (docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md)
         "JARVIS_DOC_NAV_HOOK": project.worker.doc_nav_hook,
         "JARVIS_DOC_READ_LIMIT_LINES": str(project.worker.doc_read_limit_lines),
-        # The `jarvis wo finish --summary` word cap the PreToolUse hook enforces
-        # (spec 2026-09-19 SS5.3). Env for `JARVIS_GATES`' reason, and more sharply:
-        # `hooks.finish_summary_decision` runs on EVERY Bash command, and a catalog
-        # parse there would be a 39% tax on a ~155ms hook process.
+        # The `jarvis wo finish --summary` word cap the PreToolUse hook enforces (spec 2026-09-19 SS5.3)
         "JARVIS_SUMMARY_MAX_WORDS": str(project.concision.summary_max_words),
-        # The character cap on a `jarvis wo send` / `wo assume` body, enforced by
-        # `hooks.payload_reference_decision` (§5 of docs/superpowers/specs/
-        # 2026-09-26-bounded-model-inputs.md). Env for the same reason as the cap above
-        # it: the check runs on EVERY Bash command and a catalog parse there would be a
-        # 39% tax on a ~155ms hook process.
+        # The character cap on a `jarvis wo send` / `wo assume` body
         concision.MESSAGE_CAP_ENV: str(project.concision.message_max_chars),
-        # The standing worker instructions, for the `SubagentStart` hook to re-inject:
-        # a subagent inherits none of its parent's `--append-system-prompt`. Resolved
-        # exactly as `worker_session.briefing` resolves it, so the subagent is told what
-        # the worker was told. Env for `JARVIS_GATES`' reason — `concision` must not
-        # import `catalog` (see its module docstring).
+        # The standing worker instructions
         concision.STANDING_PROMPT_ENV: (wo.get("append_system_prompt")
                                         or project.worker.append_system_prompt or ""),
-        # WHICH PROMPT-CACHE TTL THIS WORKER'S WRITES ARE BILLED AT — the project's
-        # `worker.cache_ttl` arm, default `5m` (write 1.25x rather than the 1-hour 2x).
-        # Resolved through `cache_ttl_env` rather than spelled again: the settings file
-        # and the spawn environment must not be able to disagree about what TTL Jarvis
-        # buys. Measurements and the reversal criteria: kn-f94abf34, docs/superpowers/
-        # specs/2026-08-22-the-five-minute-write-everywhere.md, and §2-§3 of
-        # docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md.
+        # WHICH PROMPT-CACHE TTL THIS WORKER'S WRITES ARE BILLED AT (docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md)
         **cache_ttl_env(project.worker.cache_ttl),
-        # WHAT A TURN IS, for every hook that would otherwise assume it. Taken from
-        # `claude_cli` for the reason the cache flag above is: the launcher and the
-        # settings file must not be able to disagree. §3 of docs/superpowers/specs/
-        # 2026-09-23-the-crew-a-worker-must-use.md.
+        # WHAT A TURN IS, for every hook that would otherwise assume it
         claude_cli.TURN_TRANSPORT_ENV: claude_cli.TRANSPORT_HEADLESS,
-        # WHAT ONE MCP TOOL CALL MAY TAKE, read by Claude Code itself (issue #845:
-        # nothing bounded the 18m50s Serena call that never returned). Set HERE and not
-        # in `settings.base.json`, because this `env.update` beats both the asset and the
-        # project's `settings_overrides` — a project that needs longer raises the catalog
-        # setting, and a value the asset carried could not be overridden from there. A
-        # STRING like every value in this dict: Claude Code's `env` is a
-        # `Record<string,string>` and an integer risks the CLI rejecting the whole file.
+        # WHAT ONE MCP TOOL CALL MAY TAKE (#845)
         "MCP_TOOL_TIMEOUT": str(project.worker.mcp_tool_timeout_ms),
-        # WHETHER `auto` MODE'S BASH-FIRST STEER REACHES THIS WORKER (spec §2, same
-        # file). Here and not in `settings.base.json` for `MCP_TOOL_TIMEOUT`'s reason —
-        # this `env.update` beats both the asset and `settings_overrides`, so a value the
-        # asset carried could not be overridden from the catalog. Written in EVERY
-        # permission mode: the steer only exists under `auto`, and a per-mode conditional
-        # would be a second source of truth about a vendor behaviour.
+        # WHETHER `auto` MODE'S BASH-FIRST STEER REACHES THIS WORKER (spec §2, same file)
         **bash_first_env(project.worker.bash_first),
-        # WHETHER THIS WORKER'S SYMBOL TOOLS ARE LISTED OR DEFERRED (spec
-        # 2026-10-02-serena-the-cheap-path.md §4). Here for `MCP_TOOL_TIMEOUT`'s reason.
+        # WHETHER THIS WORKER'S SYMBOL TOOLS ARE LISTED OR DEFERRED (spec 2026-10-02-serena-the-cheap-path.md...
         **tool_search_env(project.worker.tool_search),
-        # Whether the lead must delegate its file edits to the crew (§7 of that spec).
-        # Env for `JARVIS_GATES`' reason: `hooks.crew_edit_decision` runs on every file
-        # write and must not parse the catalog to decide it has nothing to do.
+        # Whether the lead must delegate its file edits to the crew (§7 of that spec)
         "JARVIS_REQUIRE_CREW": "1" if project.worker.require_crew else "0",
-        # The crew is the ordinary worker's; a planner has its own team prose. Carried as
-        # env rather than read at hook time for the same reason as the key above.
+        # The crew is the ordinary worker's; a planner has its own team prose
         "JARVIS_WO_KIND": str(wo.get("kind") or "worker"),
-        # The tracked files an installed TOOL rewrites, which the worktree's index is told
-        # not to report (`hooks.mark_tool_managed_paths`). Env for `JARVIS_GATES`' reason,
-        # and the sharper one the constant states: the `SessionStart` hook must not import
-        # `jarvis.catalog` to read a value fixed at spawn. The project spec is already
-        # resolved against the OS config, so this list is the answer for this project and
-        # the hook consults nothing else.
+        # The tracked files an installed TOOL rewrites
         hooks.TOOL_MANAGED_PATHS_ENV: _json.dumps(
             list(project.worktree.tool_managed_paths)),
     })
@@ -310,20 +177,12 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
 
 
 def worker_name(wo: dict[str, Any]) -> str:
-    """Background session display name. The `[WO <id>]` prefix is the visible marker
-    (in the agents view and UI) that this session is framework-managed."""
+    """Background session display name"""
     return f"[WO {wo['id']}] {wo['title'][:60]}"
 
 
 def render_knowledge_block(brief: KnowledgeBrief, project_name: str) -> list[str]:
-    """The knowledge base as a map plus a retrieval verb, not as a payload.
-
-    Pasting entries in full made the prompt grow with the base — every work order in the
-    fleet paying for every learning ever recorded — while the selector (most-recent-N)
-    meant the entry that actually mattered usually fell outside the window anyway. So the
-    prompt ships headlines and ids at bounded cost, and the worker pulls full text for
-    what its task touches.
-    """
+    """The knowledge base as a map plus a retrieval verb, not as a payload"""
     lines = [
         "",
         f"# Knowledge base — {brief.total} entries visible to `{project_name}` "
@@ -348,10 +207,7 @@ def render_knowledge_block(brief: KnowledgeBrief, project_name: str) -> list[str
             topic = f" [{k['topic']}]" if k["topic"] else ""
             lines.append(f"- ({k['project'] or 'global'}{topic}) {k['content']}")
     if brief.hints:
-        # Above the index, because it is the most relevant thing in the section; below it
-        # this would read as a footnote. Labelled as evidence rather than as a verdict —
-        # the rule `knowledge_usage_report` already states for `could_have_read`, and
-        # without the label a lexical coincidence reads as an instruction.
+        # Above the index, because it is the most relevant thing in the section
         lines += [
             "",
             "## Matched your work order's TITLE — a HINT, not an instruction",
@@ -386,20 +242,7 @@ def render_knowledge_block(brief: KnowledgeBrief, project_name: str) -> list[str
 
 def materialize_design_doc(store: ProjectStore, project: ProjectSpec,
                            wo: dict[str, Any]) -> dict[str, str] | None:
-    """Put this child's SECTION of the feature spec, and the spec, where it can read them.
-
-    A child's worktree branches from the default branch, but the spec lives on the
-    PLANNER's unmerged branch — so the snapshot taken at `fo plan` time is written under
-    the project's shared `.jarvis/` tree, which workers already read (agent skills live
-    there). Returns what the prompt renders (`repo_path`, `path`, and `section` /
-    `section_path` when the child's section resolved), or None when the work order has no
-    parent or its plan names no document. Idempotent: later dispatches of siblings rewrite
-    the same bytes.
-
-    §4 of docs/superpowers/specs/2026-08-29-spec-driven-feature-orders.md is why the
-    section is written as its own file rather than only named: pointing a worker at a
-    whole spec is what made every child read all of it.
-    """
+    """Put this child's SECTION of the feature spec, and the spec, where it can read them (docs/superpowers/specs/2026-08-29-spec-driven-feature-orders.md)"""
     from . import specs
 
     spec = specs.spec_of(store, wo)
@@ -409,12 +252,7 @@ def materialize_design_doc(store: ProjectStore, project: ProjectSpec,
 
 
 def dependency_context(store: ProjectStore, wo: dict[str, Any]) -> list[dict[str, Any]]:
-    """What each dependency ACTUALLY recorded. Empty for anything but a worker.
-
-    Read at dispatch and passed in, like `feature_context`, so `build_worker_prompt`
-    stays a pure function of its arguments. A brief that asserts what a dependency
-    shipped is a claim; this is the record it is checked against (kn-5368cc71).
-    """
+    """What each dependency ACTUALLY recorded"""
     if wo.get("kind") not in ("worker", None):
         return []
     out: list[dict[str, Any]] = []
@@ -422,7 +260,7 @@ def dependency_context(store: ProjectStore, wo: dict[str, Any]) -> list[dict[str
         try:
             dep = store.get_work_order(dep_id)
         except KeyError:
-            # Same rule `feature_context` states for a deleted parent.
+            # Same rule `feature_context` states for a deleted parent
             out.append({"id": dep_id, "status": "missing"})
             continue
         out.append({k: dep.get(k) for k in
@@ -431,8 +269,7 @@ def dependency_context(store: ProjectStore, wo: dict[str, Any]) -> list[dict[str
 
 
 def _dependency_block(dependencies: list[dict[str, Any]]) -> list[str]:
-    """kn-5368cc71: three children of one feature order each burned a Neo question on the
-    same false claim about what a dependency had shipped."""
+    """kn-5368cc71: three children of one feature order each burned a Neo question on the same false claim..."""
     lines = [
         "# What your dependencies ACTUALLY shipped",
         "Your brief's claims about what a dependency shipped are a HINT; this block is "
@@ -450,19 +287,7 @@ def _dependency_block(dependencies: list[dict[str, Any]]) -> list[str]:
 
 
 def feature_context(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
-    """The parent order a MANAGER or an ANALYST needs. None for anything else.
-
-    Read at dispatch rather than snapshotted at creation, and passed in rather than
-    looked up inside `build_worker_prompt`, for the same two reasons
-    `materialize_design_doc` is shaped this way: the prompt builder stays a pure function
-    of its arguments, and the manager's children change under it — it files more of them
-    as the feature runs, so anything frozen at release would be wrong by its second turn.
-
-    An ANALYST gets the row and an EMPTY `children` list rather than its parent's
-    children: an improvement order has none, and the orders it proposes are filed
-    independently (§1.3 of the improvement-orders spec). Same key so the manager path is
-    untouched.
-    """
+    """The parent order a MANAGER or an ANALYST needs"""
     if (wo.get("kind") not in ("manager", "analyst", "investigator")
             or not wo.get("parent_id")):
         return None
@@ -471,8 +296,7 @@ def feature_context(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] |
     except KeyError:
         return None  # a briefing is not the place to raise on a deleted parent
     if wo.get("kind") in ("analyst", "investigator"):
-        # Neither has children: an improvement order and an investigation are one row plus
-        # one session, so the query would always answer an empty list.
+        # Neither has children: an improvement order and an investigation are one row plus one session
         return {"fo": fo, "children": []}
     return {"fo": fo, "children": store.feature_children(fo["id"])}
 
@@ -482,24 +306,7 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
                         design_doc: dict[str, str] | None = None,
                         feature: dict[str, Any] | None = None,
                         dependencies: list[dict[str, Any]] | None = None) -> str:
-    """What the worker is told, composed from the work order and its project.
-
-    Five kinds of work order get five shapes. A WORKER opens with the minimum — its
-    identity, the work order, a compressed contract of only the load-bearing
-    invariants — plus an index of the full briefings it can fetch on demand with
-    `jarvis brief <section>` (single-sourced in `worker_brief`, so the CLI and this
-    prompt cannot drift). A PLANNER keeps its full prompt: one session per feature,
-    already reviewed as a unit. A MANAGER gets neither: it writes no product code, so
-    every line of the worker contract about worktrees, pull requests and finishing would
-    be an instruction to do something it must not do. An ANALYST is the same case for the
-    same reason (§3.1 of the improvement-orders spec): falling through to the worker
-    contract would tell it to open a pull request, which is the one thing it must never
-    do. An INVESTIGATOR is the analyst's case again and one step stricter (§2.3 of
-    docs/superpowers/specs/2026-09-27-investigation-orders.md): its no-write rule is
-    enforced by two hooks, so the worker contract's pull-request lines would be an
-    instruction its own tool calls refuse. The surfaces around the contract — the
-    pre-approval marker and the knowledge index — are identical for all five.
-    """
+    """What the worker is told, composed from the work order and its project (docs/superpowers/specs/2026-09-27-investigation-orders.md)"""
     if wo.get("kind") == "planner":
         return _planner_prompt(wo, project, knowledge)
     if wo.get("kind") == "manager":
@@ -528,7 +335,7 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
                f"is the source of truth for WHAT to build. It is materialised at "
                f"{design_doc['section_path']}: read it first.",
                ] if design_doc.get("section_path") else []),
-            # Spec 2026-10-06-navigate-specs-like-code.md §6: the path is an ARGUMENT.
+            # Spec 2026-10-06-navigate-specs-like-code.md §6: the path is an ARGUMENT
             *([f"The whole spec is snapshotted at {design_doc['path']} — navigate it, "
                f"never open it whole: `jarvis spec toc <path>` for its headings, "
                f"`jarvis spec section <path> <n|name>` for another section, "
@@ -537,7 +344,7 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
                f"planner's branch.",
                ] if design_doc.get("path") else []),
         ] if design_doc else []),
-        # kn-5368cc71: the record, so the brief's dependency claims are checkable.
+        # kn-5368cc71: the record, so the brief's dependency claims are checkable
         *(["", *_dependency_block(dependencies)] if dependencies else []),
         "",
         *worker_brief.core_contract(wo["id"], wo["title"], project.name,
@@ -546,8 +353,7 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         "",
         *worker_brief.section_index(wo["id"], gated=bool(project.gates),
                                     serena=wiring.serena_wired(project.wiring)),
-        # Spec 2026-10-01-the-steer-that-beat-the-brief.md §3 — its own top-level block
-        # after the index, never inside the core.
+        # Spec 2026-10-01-the-steer-that-beat-the-brief.md §3
         *(["", *nav] if (nav := worker_brief.navigation_core(
             wiring.serena_wired(project.wiring),
             tool_search=project.worker.tool_search)) else []),
@@ -567,9 +373,7 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
 
 
 def _navigation_briefing(serena: bool = True, tool_search: str = "cli") -> list[str]:
-    """Serena before grep — the full text lives in `worker_brief` (single source
-    with `jarvis brief navigation`); this shape survives for the planner's
-    `_common_briefing` tail."""
+    """Serena before grep — the full text lives in `worker_brief` (single source with `jarvis brief..."""
     from . import worker_brief
 
     return worker_brief.navigation_section(serena, tool_search=tool_search).splitlines()
@@ -577,13 +381,7 @@ def _navigation_briefing(serena: bool = True, tool_search: str = "cli") -> list[
 
 def _common_briefing(parts: list[str], wo: dict[str, Any], project: ProjectSpec,
                      knowledge: KnowledgeBrief | None = None) -> list[str]:
-    """The full-briefing tail — now only the PLANNER's prompt carries it inline.
-
-    A worker's prompt reaches the same text through `worker_brief.section_index`
-    and `jarvis brief <section>` instead; the pre-approval marker and the knowledge
-    index are the parts a worker still gets inline, composed in
-    `build_worker_prompt` directly.
-    """
+    """The full-briefing tail — now only the PLANNER's prompt carries it inline"""
     from . import wiring
 
     parts += ["", *_navigation_briefing(wiring.serena_wired(project.wiring),
@@ -600,48 +398,7 @@ def _common_briefing(parts: list[str], wo: dict[str, Any], project: ProjectSpec,
 
 def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
                     knowledge: KnowledgeBrief | None = None) -> str:
-    """The briefing for a feature order's planner.
-
-    Four things make it different from a worker's, and each is load-bearing:
-
-    * **Its output is a graph, not a change.** So its terminal action is structured —
-      `jarvis fo plan --from-file` against a JSON document — rather than prose. The
-      `--from-file` shape is not cosmetic either: `gates.scannable()`'s quote-blanking
-      fails on nested and mixed quoting, and a plan is a long argument full of repo
-      paths, which is exactly the input that trips the gate classifier into a false
-      positive. It goes in a file.
-    * **Its readers are strangers.** Each child work order is dispatched into a fresh
-      session that sees its own description and nothing else — not this plan, not this
-      conversation, not its siblings. That is the failure this briefing spends the most
-      words on, because it is the one the validator can only partly catch.
-    * **It plans; it does not build.** A planner that returns the finished solution has
-      failed at the job even if the solution is good, because the point of the feature
-      order is a decomposition the fleet can execute in parallel.
-    * **It leads a team.** Two seats — `jarvis-architect` and `jarvis-test-lead` — reach
-      it as subagent types over the extra `--add-dir` that `briefing_for` gives a
-      planner and no one else. A briefing that did not name them would leave two
-      definitions sitting on disk that nothing ever invokes, so this section is what
-      makes the seats real.
-
-    The third one is carried HERE, in prose, and not by a permission rule on the planner
-    itself — which is a weaker guarantee and worth stating plainly rather than leaving
-    for someone to discover. The planner is a work order, not a subagent, so it has no
-    `tools:` frontmatter (the CLI-enforced layer); its only available restriction is the
-    `permissions.deny` path `_write_worker_settings` writes, and a deny broad enough to
-    stop product code also stops the two things a planner is REQUIRED to do — write the
-    `plan.json` it submits, and produce a design document, whose pull request the design
-    makes the base of the children's stack. Phase 3 revisited this and left it alone. The
-    alternative its backlog item floated was denying edits under the project's source
-    directories while leaving the worktree root writable — but "source directory" is not a
-    concept the catalog has, so it would mean guessing `src/`-shaped paths per project,
-    and breaking any planner whose design document lives under one is exactly the case
-    decision 2 depends on.
-
-    The SEATS are where the posture is enforced instead, and there it is real: each is
-    declared `tools: Read, Grep, Glob`, which the CLI enforces rather than advises. No
-    `Bash` either — withholding `Write` while granting a shell is not a prohibition,
-    because a heredoc writes a file just as well (ruled 2026-08-03).
-    """
+    """The briefing for a feature order's planner"""
     from .plans import CHILD_CAP, MAX_DESCRIPTION_CHARS, MIN_DESCRIPTION_CHARS
 
     fo_id = wo.get("parent_id") or "?"
@@ -817,15 +574,14 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"- File deferred work instead of leaving notes: `jarvis backlog add "
         f"{project.name} \"...\"` — including anything you decided was OUT of this "
         f"feature's scope.",
-        # conditional for the same reason as the worker's: no index, no instruction to
-        # go and read one
+        # conditional for the same reason as the worker's: no index, no instruction to go and read one
         *([f"- READ the OS knowledge base before you decompose — it is indexed at the "
            f"end of this prompt, not pasted into it: `jarvis learn search \"<term>\" "
            f"--project {project.name}` finds and ranks matching entries, then "
            f"`jarvis learn show <id>` returns the body. A plan built "
            f"without it will hand children the lessons the fleet already paid for, "
            f"again."] if knowledge else []),
-        # Spec 2026-10-06-navigate-specs-like-code.md §6.
+        # Spec 2026-10-06-navigate-specs-like-code.md §6
         "- NAVIGATE the specs you read, never open one whole — you are the fleet's "
         "heaviest spec reader: `jarvis spec toc <path>` for the headings, "
         "`jarvis spec section <path> <n|name>` for the one section you need, "
@@ -851,15 +607,7 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
 
 
 def _evidence_checklist(refs: list[str]) -> list[str]:
-    """One line per stored evidence ref, each naming the command that reads that shape.
-
-    §3.3 of docs/superpowers/specs/2026-09-23-improvement-orders.md: resolution is the
-    analyst's job, naming the verb is the OS's, so the analyst does not spend its first
-    turn guessing which command reads which kind of reference. An UNRECOGNISED ref is
-    still listed, with a note to work out how to read it — dropping it would hide
-    evidence the user chose to attach. A ref that does not resolve is a FINDING about the
-    OS's records, not an error here.
-    """
+    """One line per stored evidence ref, each naming the command that reads that shape (docs/superpowers/specs/2026-09-23-improvement-orders.md)"""
     lines = []
     for ref in refs:
         ref = str(ref).strip()
@@ -887,25 +635,7 @@ def _evidence_checklist(refs: list[str]) -> list[str]:
 def _analyst_prompt(wo: dict[str, Any], project: ProjectSpec,
                     knowledge: KnowledgeBrief | None = None,
                     feature: dict[str, Any] | None = None) -> str:
-    """The briefing for an improvement order's analyst — §3.2 of
-    docs/superpowers/specs/2026-09-23-improvement-orders.md.
-
-    STATIC, unlike a child of a feature order: there is no spec to build an agent type
-    from, so `specs.install_agent` is never called for an improvement order. It carries
-    `_common_briefing` — the knowledge index and the navigation ranking — because it
-    reads records and code for a living.
-
-    "You analyse, you do not build" is PROSE, not enforcement, and that is worth stating
-    plainly rather than leaving for someone to discover. Same reason as the planner's: an
-    analyst is a work order, not a subagent, so its only lever is the `permissions.deny`
-    path `_write_worker_settings` writes — and a deny broad enough to stop product code
-    also stops it writing the `report.json` it is REQUIRED to submit.
-
-    It gets no planning seats (`bootstrap.install_agent_assets` gives those to
-    `kind == "planner"` only). A diagnosis is one reading of one record set; the seats
-    exist to argue about a DECOMPOSITION, and they have no `Bash`, so they could not read
-    the evidence anyway.
-    """
+    """The briefing for an improvement order's analyst (docs/superpowers/specs/2026-09-23-improvement-orders.md)"""
     from . import db
     from .ops import EVIDENCE_REFS_KEY  # lazy: ops imports dispatch
 
@@ -1003,9 +733,7 @@ def _analyst_prompt(wo: dict[str, Any], project: ProjectSpec,
         "The validator names every problem at once, so one revision fixes all of them.",
         "",
         "# Scope",
-        # §4.3 of the improvement-orders spec owns this cap; `findings.MAX_FINDINGS` is
-        # the constant that enforces it. Written literally rather than imported: the
-        # validator module is a sibling's and importing it would couple dispatch to it.
+        # §4.3 of the improvement-orders spec owns this cap
         "- At most 6 findings, ranked worst first, unless your report carries a "
         "top-level `justification` saying why it cannot be fewer. This is the ATTENTION "
         "cap: a report the user will not read changes nothing.",
@@ -1049,21 +777,7 @@ def _analyst_prompt(wo: dict[str, Any], project: ProjectSpec,
 def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
                          knowledge: KnowledgeBrief | None = None,
                          feature: dict[str, Any] | None = None) -> str:
-    """The briefing for an investigation order's investigator — §2.3 of
-    docs/superpowers/specs/2026-09-27-investigation-orders.md.
-
-    STATIC like `_analyst_prompt`, for its reason (no spec, so `specs.install_agent` is
-    never called), and it ends with `_common_briefing` so it inherits the knowledge index
-    and the Serena-before-grep navigation ranking — it reads records and code for a living.
-    No planning seats, again for `_analyst_prompt`'s reason.
-
-    ONE THING HERE IS NOT PROSE, and it is the difference from every prompt above:
-    `hooks.investigator_write_decision` and `hooks.investigator_bash_decision` refuse this
-    session's writes and its mutating shell commands. So these lines describe a wall the
-    session will hit rather than a rule it is asked to keep — which is why the prompt names
-    `verdict.json` with that exact spelling (the one path the write hook exempts) and names
-    the four permitted `jarvis` mutations exactly.
-    """
+    """The briefing for an investigation order's investigator (docs/superpowers/specs/2026-09-27-investigation-orders.md)"""
     from . import db, gaps, verdicts
     from .ops import SUBJECT_KEY  # lazy: ops imports dispatch
 
@@ -1117,7 +831,7 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "# The four classifications",
         "A classification is a decision about THE SUBJECT, not about the codebase in "
         "general. Exactly one:",
-        # kn-4fb740a9: a stuck subject is the common case, never the test.
+        # kn-4fb740a9: a stuck subject is the common case, never the test
         "- **GAP** — the OS is missing a mechanism. A stuck subject is the common case, "
         "not the test: a DESIGNED WAIT the sweep investigated anyway is a GAP too, where "
         "the missing mechanism is an `excluded_cause` on the SWEEP — plus the discount of "
@@ -1245,31 +959,7 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
 def _manager_prompt(wo: dict[str, Any], project: ProjectSpec,
                     knowledge: KnowledgeBrief | None = None,
                     feature: dict[str, Any] | None = None) -> str:
-    """The briefing for a feature order's project manager.
-
-    Three things make it different from a worker's, and each is why the worker contract
-    cannot simply be reused with a line struck out:
-
-    * **It produces no code.** Every load-bearing sentence of `worker_brief.core_contract`
-      is about producing a change — the worktree, the `[wo-…]` pull request title,
-      `jarvis wo finish`. A manager that read them would open a pull request against a
-      feature it is supposed to be coordinating, which is the exact failure this branch
-      exists to prevent.
-    * **It is idle by design, and long-lived.** So the prompt says so in as many words.
-      A session told to work autonomously toward a complete solution will invent work
-      when its inbox is empty; this one is told that an empty inbox IS the finished state
-      between messages, and that it never settles itself (`Daemon.settle_features` closes
-      it when its feature closes).
-    * **It sees the feature, not a slice of it.** It is the only session that reasons
-      about the whole ask and every child at once, so both ride in the prompt — the ask
-      from the feature order, the children read live at dispatch (`feature_context`).
-
-    The last line of the contract is the one that keeps principle 1 of the design intact:
-    a manager does not learn who sends it messages. Everything it receives arrives as an
-    ordinary user turn through the message queue, posted to a ROLE by something that never
-    named this work order — and a manager that went looking for the sender would couple
-    the two ends the bus exists to keep apart.
-    """
+    """The briefing for a feature order's project manager"""
     fo = (feature or {}).get("fo") or {}
     children = (feature or {}).get("children") or []
     fo_id = wo.get("parent_id") or "?"
@@ -1376,12 +1066,7 @@ def _manager_prompt(wo: dict[str, Any], project: ProjectSpec,
 
 
 def _pre_approval(wo: dict[str, Any]) -> dict[str, Any] | None:
-    """The pre-approval marker, if this work order carries one.
-
-    Metadata arrives as a JSON string straight off the row, and a work order with none
-    is the overwhelming common case, so this stays quiet about anything malformed —
-    a briefing is not the place to raise a schema error.
-    """
+    """The pre-approval marker, if this work order carries one"""
     from . import db
     from .project_store import PRE_APPROVED_KEY
 
@@ -1395,14 +1080,7 @@ def _pre_approval(wo: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _pre_approved_briefing(marker: dict[str, Any]) -> list[str]:
-    """Tell the worker the decision it would otherwise ask about is already made.
-
-    The contract above tells workers to ask on any doubt, and that is right for work
-    the user commissioned. This work order was filed BY the reviewer, so "may I?" would
-    route the question back to the one who already said yes — a minute spent to be told
-    what the briefing says. The scope line is what keeps that narrow: it names the thing
-    approved, and everything outside it goes back to the ordinary rule.
-    """
+    """Tell the worker the decision it would otherwise ask about is already made"""
     by = str(marker.get("by") or "the reviewer")
     scope = str(marker.get("scope") or "the change this work order describes")
     lines = [
@@ -1421,16 +1099,7 @@ def _pre_approved_briefing(marker: dict[str, Any]) -> list[str]:
 
 
 def _gate_briefing(wo: dict[str, Any], project: ProjectSpec) -> list[str]:
-    """Tell the worker that shipping is reachable, and how.
-
-    Worth stating explicitly: a worker that believes releases are simply forbidden will
-    finish the work order with "someone should ship this" rather than asking, and the
-    gate never gets used. The point of the gate is that the answer is "yes, with review".
-
-    The full text lives in `worker_brief.gates_section` (single source with
-    `jarvis brief gates`); this shape survives for the planner's `_common_briefing`
-    tail and for tests that compare the worker-facing gate surfaces.
-    """
+    """Tell the worker that shipping is reachable, and how"""
     from . import worker_brief
 
     return worker_brief.gates_section(
@@ -1438,16 +1107,7 @@ def _gate_briefing(wo: dict[str, Any], project: ProjectSpec) -> list[str]:
 
 
 def resolved_choices(project: ProjectSpec, wo: dict[str, Any]) -> dict[str, Any]:
-    """The model and effort this work order runs on — PER KIND, then per project.
-
-    The work order's own values win (`jarvis wo create --model`), then the kind's, then
-    the project's. Only one kind has its own today: an INVESTIGATOR reads records and
-    quotes lines, so it runs cheap at low effort — §2.8 of
-    docs/superpowers/specs/2026-09-27-investigation-orders.md.
-
-    A function rather than two lines inline, so a kind's choice is resolved in ONE place
-    and `jarvis wo show` reports what was actually used.
-    """
+    """The model and effort this work order runs on — PER KIND, then per project (docs/superpowers/specs/2026-09-27-investigation-orders.md)"""
     by_kind = {"investigator": (project.worker.investigation_model,
                                 project.worker.investigation_effort)}
     model, effort = by_kind.get(wo.get("kind") or "worker",
@@ -1463,12 +1123,7 @@ def dispatch_work_order(
     wo: dict[str, Any],
     os_config: OsConfig | None = None,
 ) -> dict[str, Any]:
-    """Open the worker's conversation for a work order already in `dispatching` state.
-
-    Dispatch composes what the worker is told — the prompt, the settings file, the
-    resolved model/effort/permission mode — and hands the running of it to
-    `worker_session`, which owns the transport.
-    """
+    """Open the worker's conversation for a work order already in `dispatching` state"""
     from . import budget, context, worker_session
 
     cfg = os_config or OsConfig()
@@ -1486,31 +1141,20 @@ def dispatch_work_order(
                                  feature=feature_context(store, wo),
                                  dependencies=dependency_context(store, wo))
 
-    # Resolved onto the row before the turn is launched, so every later turn rebuilds the
-    # same briefing from the record rather than re-reading a catalog that may have moved.
+    # Resolved onto the row before the turn is launched
     resolved = {
         **resolved_choices(project, wo),
         "permission_mode": wo.get("permission_mode") or project.worker.permission_mode,
-        # Which configuration this ran under. NULL until the ledger holds a version —
-        # "before the console existed", never version 1 (config-console design §5).
+        # Which configuration this ran under
         "config_version": (central.head_config_version() or {}).get("id"),
     }
     store.update_work_order(wo["id"], **resolved)
-    # A CHILD TAKES ITS SLICE OF THE FEATURE'S BUDGET HERE, and here is the only place it
-    # ever does: reserve-on-dispatch is what stops two children claimed in the same tick
-    # being handed the same remainder (src/jarvis/budget.py). No-op for a standalone
-    # order and for a child whose feature has no budget, which is nearly all of them.
+    # A CHILD TAKES ITS SLICE OF THE FEATURE'S BUDGET HERE
     budget.reserve(store, central, wo)
     wo = store.get_work_order(wo["id"])
 
     try:
-        # COMPACT FIRST IF THIS IS A SECOND DISPATCH INTO A COLD CONVERSATION. A work
-        # order can reach here with its session intact (`ops.defer_red_release` re-parks
-        # a running release order to `pending`), and `worker_session.start` would then
-        # resume it and re-write the whole transcript. No "is this a re-dispatch" guard:
-        # `compaction_due` returns None with no turn on record, so an opening dispatch is
-        # byte-identical to before (spec §3.6 of
-        # docs/superpowers/specs/2026-09-29-one-compaction-decision-on-every-relaunch.md).
+        # COMPACT FIRST IF THIS IS A SECOND DISPATCH INTO A COLD CONVERSATION (docs/superpowers/specs/2026-09-29-one-compaction-decision-on-every-relaunch.md)
         queued: dict[str, Any] = {}
         compacted = worker_session.compact_before_relaunch(
             store, project, wo, cfg.compact_min_context, queue=prompt,
@@ -1518,19 +1162,11 @@ def dispatch_work_order(
         if compacted is None:
             turn, briefing = worker_session.start(store, project, wo, prompt)
     except budget.BudgetExhausted as e:
-        # Spent before it ever ran a turn — its feature had nothing left to lend it, or
-        # the panel and Neo spent the order's own budget on an earlier round. Not a
-        # dispatch FAILURE: nothing is broken and the work has not been judged, so it
-        # goes to the user as what it is (`budget.escalate` writes the timeline entry,
-        # the flag and the notification) rather than to `failed`.
+        # Spent before it ever ran a turn
         budget.escalate(store, wo, e.exhausted)
         return store.get_work_order(wo["id"])
     except claude_cli.ClaudeCliError as e:
-        # A TURN THAT COULD NOT BE LAUNCHED IS NOT A WORK ORDER THAT FAILED. `failed` at
-        # attempts=0 turned a blip in the transport into a terminal state and asked the
-        # user to look at a work order nothing was wrong with — spec
-        # docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §5. Back to
-        # `pending` behind a backoff; only the ceiling is terminal, and it says why.
+        # A TURN THAT COULD NOT BE LAUNCHED IS NOT A WORK ORDER THAT FAILED (docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §5.)
         outcome = store.release_dispatch_claim(wo["id"], str(e))
         store.add_event(wo["id"], "dispatch_failed",
                         {"error": str(e)[:500], "outcome": outcome})
@@ -1550,11 +1186,7 @@ def dispatch_work_order(
         raise
 
     if compacted is not None:
-        # NO WORKER PROMPT HAS BEEN SENT: it is the queued message, and delivery puts it
-        # into the summarised conversation on the tick after the compaction settles. So
-        # no `dispatched` event and no seq-1 context ledger — there is no dispatch turn,
-        # and `_launch` recorded the compaction's own row. The claimed-but-no-turn state
-        # `settle_work_order` fails on is not reachable: the compaction IS a live turn.
+        # NO WORKER PROMPT HAS BEEN SENT: it is the queued message
         store.clear_dispatch_attempts(wo["id"])
         store.set_status(wo["id"], "running")
         store.add_event(wo["id"], "dispatch_deferred_for_compaction", {
@@ -1562,16 +1194,9 @@ def dispatch_work_order(
         central.touch_project(project.name)
         return store.get_work_order(wo["id"])
 
-    # THE CONTEXT LEDGER for the seq-1 dispatch turn, and only that one: Neo's ruling on
-    # question 681 partitions the writers so no row is written twice, and this is the only
-    # site holding the `KnowledgeBrief` the knowledge block is measured from
-    # (`worker_session._launch` records every other turn). The briefing comes back from
-    # `start` rather than being rebuilt — `briefing_for` REWRITES the worker settings
-    # file, and a measurement must not have side effects. Spec docs/superpowers/specs/
-    # 2026-09-24-order-observability.md §5.
+    # THE CONTEXT LEDGER for the seq-1 dispatch turn
     if turn["seq"] == 1:
-        # `worktree` is written by `start` above, AFTER the row this `wo` was read from —
-        # spec 2026-09-29-one-copy-of-the-projects-claude-md §4 defect (b).
+        # `worktree` is written by `start` above, AFTER the row this `wo` was read from
         context.record(store, project, {**wo, "worktree": wo["id"]}, turn, briefing,
                        knowledge=knowledge)
     store.clear_dispatch_attempts(wo["id"])

@@ -1,11 +1,4 @@
-"""The knowledge base reaches workers as an index they query, not as a payload.
-
-Pasting every relevant entry into the worker prompt made dispatch cost grow with the
-size of the knowledge base — every work order in the fleet paying for every lesson ever
-recorded — while the selector (most-recent-N) meant the entry that actually mattered
-usually fell outside the window anyway. These tests pin the replacement: bounded prompt
-cost, nothing silently invisible, and retrieval verbs that actually work.
-"""
+"""The knowledge base reaches workers as an index they query, not as a payload"""
 
 from __future__ import annotations
 
@@ -27,7 +20,7 @@ def _prompt(brief):
     return build_worker_prompt({"id": "wo-1", "title": "t", "description": "d"}, SPEC, brief)
 
 
-# -- headlines ----------------------------------------------------------------------
+# -- headlines
 
 def test_headline_collapses_a_whole_memory_file_to_one_line():
     doc = "# Deploy runbook\n\n" + ("body line that goes on and on. " * 200)
@@ -41,10 +34,10 @@ def test_headline_truncates_long_single_line_entries():
     assert len(line) <= 160 and line.endswith("…")
 
 
-# -- the brief ----------------------------------------------------------------------
+# -- the brief
 
 def test_prompt_cost_is_bounded_by_the_budget_not_the_base_size(jarvis_home):
-    """The whole point: 1000 entries must not cost more prompt than 40."""
+    """The whole point: 1000 entries must not cost more prompt than 40"""
     central = CentralStore()
     for i in range(40):
         central.add_knowledge(f"entry {i} " + "padding " * 60, project="p1",
@@ -55,14 +48,12 @@ def test_prompt_cost_is_bounded_by_the_budget_not_the_base_size(jarvis_home):
                               topic=f"t{i % 5}")
     big = len(_prompt(central.knowledge_brief("p1")))
     assert central.count_knowledge("p1") == 1040
-    # 26x the knowledge, and the prompt must not have grown by more than a rounding
-    # error (only the entry count and overflow tallies change width).
+    # 26x the knowledge, and the prompt must not have grown by more than a rounding error (only the entry...
     assert big - small < 200, f"prompt grew {big - small} chars with the base"
 
 
 def test_digest_covers_every_topic_rather_than_the_busiest_one(jarvis_home):
-    """Round-robin selection, not straight recency: a map that omits whole topics
-    cannot tell a worker that there is anything to look up."""
+    """Round-robin selection, not straight recency: a map that omits whole topics cannot tell a worker..."""
     central = CentralStore()
     central.add_knowledge("the one deploy rule", project="p1", topic="deploy")
     for i in range(200):  # a very busy topic recorded much later
@@ -125,15 +116,7 @@ def test_empty_base_renders_no_block(jarvis_home):
 
 
 def test_empty_base_also_removes_the_instructions_to_read_it(jarvis_home):
-    """No index, no instruction to consult one.
-
-    Telling a worker to look something up in a knowledge base that is not in its prompt
-    is worse than saying nothing: it sent a subject in evals/llm/test_worker_judgment.py
-    (which briefs with an empty base) off to `jarvis learn search "branch name"` for a
-    branch-naming call it should simply have recorded. Both knowledge bullets are
-    therefore conditional, and the WRITE bullet is not — a worker with nothing to read
-    still has everything to record.
-    """
+    """No index, no instruction to consult one"""
     from jarvis.dispatch import build_worker_prompt
 
     central = CentralStore()
@@ -153,7 +136,7 @@ def test_empty_base_also_removes_the_instructions_to_read_it(jarvis_home):
     assert "LOOK IT UP FIRST" in stocked
 
 
-# -- the prompt tells the worker to go and read ----------------------------------------
+# -- the prompt tells the worker to go and read
 
 def test_prompt_teaches_on_demand_retrieval(jarvis_home):
     central = CentralStore()
@@ -162,15 +145,13 @@ def test_prompt_teaches_on_demand_retrieval(jarvis_home):
     assert "jarvis learn search" in prompt
     assert "jarvis learn show <id>" in prompt
     assert "INDEX, not the knowledge" in prompt
-    # and the contract itself must carry the read verb, not only the write verb.
-    # The core contract now ends where the on-demand section index begins
-    # (worker_brief.section_index) — the record prose moved behind `jarvis brief`.
+    # and the contract itself must carry the read verb, not only the write verb
     contract = prompt[prompt.index("# Operating contract"):prompt.index("# Full briefings")]
     assert "jarvis learn search" in contract
     assert "jarvis learn add" in contract
 
 
-# -- pinning ---------------------------------------------------------------------------
+# -- pinning
 
 def test_pin_and_unpin_round_trip(jarvis_home):
     central = CentralStore()
@@ -189,21 +170,14 @@ def test_pin_and_unpin_round_trip(jarvis_home):
     assert central.pin_knowledge("kn-nope") is None
 
 
-# -- retrieval verbs -------------------------------------------------------------------
+# -- retrieval verbs
 
 def _run(argv: list[str]) -> None:
     cmd_learn(build_parser().parse_args(argv))
 
 
 def test_every_indexed_entry_is_retrievable_by_its_own_headline(jarvis_home):
-    """The index is only worth its space if what it advertises can be cashed in.
-
-    A worker sees the headline and nothing else, so the words it has to search with are
-    the words in the headline. Both routes are checked here — by id, and by a term
-    lifted from the headline — because an index whose entries cannot be fetched back is
-    strictly worse than the bulk injection it replaced. The behavioural counterpart
-    (does a model actually do this?) is evals/llm/test_knowledge_retrieval_judgment.py.
-    """
+    """The index is only worth its space if what it advertises can be cashed in"""
     central = CentralStore()
     bodies = {
         "deploy": "Schema migrations never run inside the deploy step, because the "
@@ -219,8 +193,7 @@ def test_every_indexed_entry_is_retrievable_by_its_own_headline(jarvis_home):
 
     for k in central.knowledge_brief("p1").digest:
         assert central.get_knowledge(k["id"]) is not None, "id in the index is dead"
-        # the least distinctive thing a worker could reasonably search: the headline's
-        # first real word
+        # the least distinctive thing a worker could reasonably search: the headline's first real word
         term = k["headline"].split()[0]
         hits = central.search_knowledge(term, project="p1")
         assert any(h["id"] == k["id"] for h in hits), \
@@ -228,11 +201,7 @@ def test_every_indexed_entry_is_retrievable_by_its_own_headline(jarvis_home):
 
 
 def test_retracted_entries_leave_the_index_not_just_the_payload(jarvis_home):
-    """Retraction has to remove a ruling from the MAP as well as the prompt text.
-
-    A superseded headline left in the index is worse than a superseded entry pasted in
-    full: the worker reads it, believes the OS knows something, and goes and fetches it.
-    """
+    """Retraction has to remove a ruling from the MAP as well as the prompt text"""
     central = CentralStore()
     live = central.add_knowledge("deploy with the release script", project="p1",
                                  topic="deploy")
@@ -252,8 +221,7 @@ def test_retracted_entries_leave_the_index_not_just_the_payload(jarvis_home):
 
 
 def test_retracted_pinned_entry_stops_being_injected(jarvis_home):
-    """Pinning is the loudest tier, so it is the one where a stale ruling does most
-    damage: a retracted rail must stop riding along verbatim."""
+    """Pinning is the loudest tier, so it is the one where a stale ruling does most damage: a retracted..."""
     central = CentralStore()
     rail = central.add_knowledge("NEVER deploy on a Friday", project="p1", topic="deploy",
                                  tags=PINNED_TAG)
@@ -267,8 +235,7 @@ def test_retracted_pinned_entry_stops_being_injected(jarvis_home):
 
 
 def test_retired_topics_do_not_advertise_themselves(jarvis_home):
-    """A topic whose only entries were retracted must not appear in the overflow
-    roll-call — it would send a worker looking for something that is not there."""
+    """A topic whose only entries were retracted must not appear in the overflow roll-call"""
     central = CentralStore()
     gone = central.add_knowledge("the old way", project="p1", topic="legacy")
     central.add_knowledge("the current way", project="p1", topic="deploy")
@@ -289,14 +256,7 @@ def test_search_scopes_to_project_plus_global(jarvis_home):
 
 
 def test_multi_word_search_ors_and_ranks(jarvis_home):
-    """Agents search in phrases, not keywords.
-
-    Under whole-phrase `LIKE '%cents rounding format%'` every one of these queries
-    returned NOTHING, and the retrieval eval scored 2/7 for that reason alone — the
-    worker asked the right question and the store said "never heard of it". Words are
-    ORed and rows ranked by how many matched, so a phrase where only some words land
-    still retrieves, best match first.
-    """
+    """Agents search in phrases, not keywords"""
     central = CentralStore()
     central.add_knowledge(
         "Billing figures are stored in integer cents and rounded for display ONLY at "
@@ -308,8 +268,7 @@ def test_multi_word_search_ors_and_ranks(jarvis_home):
     central.add_knowledge("Pull requests are squash-merged.", project="p1",
                           topic="process")
 
-    # "rounding" matches nothing (the entry says "rounded") — the query still lands on
-    # the strength of its other words
+    # "rounding" matches nothing (the entry says "rounded")
     hits = central.search_knowledge("cents rounding format", project="p1")
     assert hits and hits[0]["topic"] == "billing"
     hits = central.search_knowledge("artifacts storage report output", project="p1")
@@ -324,17 +283,12 @@ def test_multi_word_search_ors_and_ranks(jarvis_home):
     assert central.search_knowledge("kubernetes helm chart", project="p1") == []
     # the empty term stays the "everything" read that `learn list` and the UI rely on
     assert len(central.search_knowledge("", project="p1")) == 3
-    # the score is how the list is ordered, not a field of an entry: it must not leak
-    # into the UI, `--json` output, or anything that round-trips a row
+    # the score is how the list is ordered
     assert "_score" not in ranked[0]
 
 
 def test_search_stems_so_a_different_inflection_still_retrieves(jarvis_home):
-    """The gap FTS5 was added to close: "rounding" finding an entry that says "rounded".
-
-    Under substring matching alone this query retrieved the entry only by riding along
-    with its other words (kn-b02bd307). On its own it returned nothing.
-    """
+    """The gap FTS5 was added to close: "rounding" finding an entry that says "rounded\""""
     central = CentralStore()
     central.add_knowledge("Figures are rounded at the presentation layer.",
                           project="p1", topic="billing")
@@ -348,13 +302,7 @@ def test_search_stems_so_a_different_inflection_still_retrieves(jarvis_home):
 
 
 def test_search_ranks_by_bm25_not_by_how_many_words_appeared(jarvis_home):
-    """Ranking is the other half, and it needs a case word-counting CANNOT get right.
-
-    Both entries contain both query words, so the substring tier scores them equal and
-    falls back to recency — which puts the padded one first. BM25 sees that the other
-    says the same thing in a tenth of the space, and the assertion below is the
-    difference: with the FTS tier off, this exact query returns them the other way up.
-    """
+    """Ranking is the other half, and it needs a case word-counting CANNOT get right"""
     central = CentralStore()
     central.add_knowledge("Scheduled reports are chunked by day.",
                           project="p1", topic="reports")
@@ -372,9 +320,7 @@ def test_search_ranks_by_bm25_not_by_how_many_words_appeared(jarvis_home):
 
 
 def test_fts_never_retrieves_less_than_substring_matching_did(jarvis_home):
-    """The floor (spec §2, §3). Porter stems "deploy" and "deployment" apart, so pure
-    FTS5 would answer this query with nothing — and a worker reads nothing as "the OS
-    has never heard of this"."""
+    """The floor (spec §2, §3)"""
     central = CentralStore()
     central.add_knowledge("Deployment runs from a release tag, never from main.",
                           project="p1", topic="releases")
@@ -388,9 +334,7 @@ def test_fts_never_retrieves_less_than_substring_matching_did(jarvis_home):
 
 
 def test_search_does_not_raise_on_what_a_user_actually_types(jarvis_home):
-    """`-`, `:`, `*`, `"` and bare `(` are FTS5 SYNTAX. This is a read verb reached from
-    the CLI, the dashboard and every worker: it returns rows or none, never a traceback.
-    """
+    """`-`, `:`, `*`, `"` and bare `(` are FTS5 SYNTAX"""
     central = CentralStore()
     central.add_knowledge("PRs #1-#2 are unmerged.", project="p1", topic="process")
 
@@ -402,9 +346,7 @@ def test_search_does_not_raise_on_what_a_user_actually_types(jarvis_home):
 
 
 def test_the_index_tracks_every_writer_not_just_add_knowledge(jarvis_home):
-    """Triggers, not a call in `add_knowledge` — `retract_knowledge`,
-    `record_memory_file` and `set_knowledge_tags` write to the table directly (spec §4).
-    """
+    """Triggers, not a call in `add_knowledge`"""
     central = CentralStore()
     row = central.add_knowledge("Figures are rounded at the presentation layer.",
                                 project="p1", topic="billing")
@@ -427,9 +369,7 @@ def test_the_index_tracks_every_writer_not_just_add_knowledge(jarvis_home):
 
 
 def test_an_existing_os_db_is_backfilled_once(jarvis_home):
-    """`executescript(SCHEMA)` is a no-op on a database that already has its tables, so
-    a live `os.db` gets the index by rebuild — the same problem ADDED_COLUMNS solves for
-    columns (spec §4)."""
+    """`executescript(SCHEMA)` is a no-op on a database that already has its tables"""
     central = CentralStore()
     central.add_knowledge("Figures are rounded at the presentation layer.",
                           project="p1", topic="billing")
@@ -452,8 +392,7 @@ def test_an_existing_os_db_is_backfilled_once(jarvis_home):
 
 
 def test_search_still_works_when_sqlite_has_no_fts5(jarvis_home, monkeypatch):
-    """A search as good as yesterday's is not an outage; a store that will not open is
-    (spec §8)."""
+    """A search as good as yesterday's is not an outage; a store that will not open is (spec §8)"""
     central = CentralStore()
     central.add_knowledge("Figures are rounded at the presentation layer.",
                           project="p1", topic="billing")
@@ -511,7 +450,7 @@ def test_cli_add_pin_flag(jarvis_home, capsys):
     assert has_tag(row["tags"], PINNED_TAG) and has_tag(row["tags"], "git")
 
 
-# -- catalog knobs -----------------------------------------------------------------------
+# -- catalog knobs
 
 def test_catalog_exposes_the_budget(jarvis_home):
     from jarvis.catalog import parse_catalog
@@ -523,10 +462,7 @@ def test_catalog_exposes_the_budget(jarvis_home):
     assert OsConfig().knowledge_digest_limit == 40
 
 
-# -- `jarvis learn search` is an index, not a payload ------------------------------------
-#
-# Spec: docs/superpowers/specs/2026-10-02-learn-search-returns-an-index.md. `search` was
-# the one retrieval verb with no index form, and it printed every matching body in full.
+# -- `jarvis learn search` is an index, not a payload
 
 
 BODY = ("deploy runs from the tag\n"
@@ -535,7 +471,7 @@ BODY = ("deploy runs from the tag\n"
 
 
 def test_search_rows_never_carry_a_body(jarvis_home, capsys):
-    """Spec test 1 — the acceptance test. A truncated body would still be a body."""
+    """Spec test 1 — the acceptance test"""
     central = CentralStore()
     central.add_knowledge(BODY, project="p1", topic="releases")
     _run(["--json", "learn", "search", "deploy", "--project", "p1"])
@@ -547,7 +483,7 @@ def test_search_rows_never_carry_a_body(jarvis_home, capsys):
 
 
 def test_search_still_records_a_hit_on_every_entry_it_named(jarvis_home, capsys):
-    """Spec test 3 — `search` stays in AIMED_VERBS."""
+    """Spec test 3 — `search` stays in AIMED_VERBS"""
     central = CentralStore()
     row = central.add_knowledge(BODY, project="p1", topic="releases")
     _run(["--json", "learn", "search", "deploy", "--project", "p1"])
@@ -556,7 +492,7 @@ def test_search_still_records_a_hit_on_every_entry_it_named(jarvis_home, capsys)
 
 
 def test_an_excerpt_quotes_the_body_line_that_matched(jarvis_home, capsys):
-    """Spec test 4, case 1."""
+    """Spec test 4, case 1"""
     central = CentralStore()
     central.add_knowledge(BODY, project="p1", topic="releases")
     _run(["--json", "learn", "search", "gate", "--project", "p1"])
@@ -565,7 +501,7 @@ def test_an_excerpt_quotes_the_body_line_that_matched(jarvis_home, capsys):
 
 
 def test_a_long_matching_line_is_bounded_like_a_headline(jarvis_home, capsys):
-    """Spec test 4, case 2 — `headline()` IS the bound; no new constant."""
+    """Spec test 4, case 2 — `headline()` IS the bound; no new constant"""
     central = CentralStore()
     central.add_knowledge("short first line\n" + "gate " * 200, project="p1")
     _run(["--json", "learn", "search", "gate", "--project", "p1"])
@@ -574,7 +510,7 @@ def test_a_long_matching_line_is_bounded_like_a_headline(jarvis_home, capsys):
 
 
 def test_a_match_only_in_the_first_line_yields_no_excerpt(jarvis_home, capsys):
-    """Spec test 4, case 3 — the headline already shows it."""
+    """Spec test 4, case 3 — the headline already shows it"""
     central = CentralStore()
     central.add_knowledge("deploy from the tag\nnothing else matches here", project="p1")
     _run(["--json", "learn", "search", "deploy", "--project", "p1"])
@@ -583,7 +519,7 @@ def test_a_match_only_in_the_first_line_yields_no_excerpt(jarvis_home, capsys):
 
 
 def test_a_hit_with_no_matching_body_line_still_returns_the_row(jarvis_home, capsys):
-    """Spec test 4, case 4 — a topic hit has nothing to quote."""
+    """Spec test 4, case 4 — a topic hit has nothing to quote"""
     central = CentralStore()
     central.add_knowledge("one line only", project="p1", topic="releases")
     _run(["--json", "learn", "search", "releases", "--project", "p1"])
@@ -592,7 +528,7 @@ def test_a_hit_with_no_matching_body_line_still_returns_the_row(jarvis_home, cap
 
 
 def test_an_index_row_prices_the_fetch(jarvis_home, capsys):
-    """Spec test 6 — `chars` is the body length, so `show <id>` can be priced first."""
+    """Spec test 6 — `chars` is the body length, so `show <id>` can be priced first"""
     central = CentralStore()
     central.add_knowledge(BODY, project="p1", topic="releases")
     _run(["--json", "learn", "search", "deploy", "--project", "p1"])
@@ -601,7 +537,7 @@ def test_an_index_row_prices_the_fetch(jarvis_home, capsys):
 
 
 def test_no_prompt_promises_that_search_returns_full_text(jarvis_home):
-    """Spec test 7 — every prompt string that advertised bodies from `search`."""
+    """Spec test 7 — every prompt string that advertised bodies from `search`"""
     from jarvis import dispatch, worker_brief
 
     central = CentralStore()
@@ -620,18 +556,18 @@ def test_no_prompt_promises_that_search_returns_full_text(jarvis_home):
     assert "jarvis learn search" in rendered[3]
 
 
-# -- half 2: title-matched hints at dispatch ---------------------------------------------
+# -- half 2: title-matched hints at dispatch
 
 
 def _stocked(central, n=60, project="p1"):
-    """A base deep enough that the oldest entries fall into overflow."""
+    """A base deep enough that the oldest entries fall into overflow"""
     for i in range(n):
         central.add_knowledge(f"bulk {i} " + "padding " * 20, project=project,
                               topic=f"t{i % 5}")
 
 
 def test_a_brief_with_no_title_has_no_hints(jarvis_home):
-    """Spec test 8 — the default must stay byte-identical (validation.py, _index_cost)."""
+    """Spec test 8 — the default must stay byte-identical (validation.py, _index_cost)"""
     central = CentralStore()
     central.add_knowledge("deploy runs from the tag", project="p1", topic="releases")
     brief = central.knowledge_brief("p1")
@@ -640,7 +576,7 @@ def test_a_brief_with_no_title_has_no_hints(jarvis_home):
 
 
 def test_a_title_matched_overflow_entry_reaches_the_prompt(jarvis_home):
-    """Spec test 9 — the 586-entry overflow is where the relevant entry was hiding."""
+    """Spec test 9 — the 586-entry overflow is where the relevant entry was hiding"""
     central = CentralStore()
     target = central.add_knowledge(
         "the gate matches the shipit command byte for byte", project="p1", topic="gates")
@@ -656,7 +592,7 @@ def test_a_title_matched_overflow_entry_reaches_the_prompt(jarvis_home):
 
 def test_dispatch_passes_the_work_order_title_and_the_hint_bounds(
         jarvis_home, fake_claude, project, catalog_file):
-    """Spec test 9, the wiring half: the real launch path asks for hints."""
+    """Spec test 9, the wiring half: the real launch path asks for hints"""
     from jarvis import dispatch, ops
     from jarvis.catalog import load_catalog
     from jarvis.project_store import ProjectStore
@@ -689,7 +625,7 @@ def test_dispatch_passes_the_work_order_title_and_the_hint_bounds(
 
 
 def test_an_entry_already_in_the_index_is_not_repeated_as_a_hint(jarvis_home):
-    """Spec test 10."""
+    """Spec test 10"""
     central = CentralStore()
     indexed = central.add_knowledge("the shipit gate matches byte for byte",
                                     project="p1", topic="gates")
@@ -702,7 +638,7 @@ def test_an_entry_already_in_the_index_is_not_repeated_as_a_hint(jarvis_home):
 
 
 def test_the_hint_budget_is_separate_from_the_digest_budget(jarvis_home):
-    """Spec test 11 — bounds hold and the digest is the same size either way."""
+    """Spec test 11 — bounds hold and the digest is the same size either way"""
     central = CentralStore()
     for i in range(6):
         central.add_knowledge(f"the shipit gate matches byte for byte, case {i} "
@@ -723,7 +659,7 @@ def test_the_hint_budget_is_separate_from_the_digest_budget(jarvis_home):
 
 
 def test_a_short_title_gets_no_hints(jarvis_home):
-    """Spec test 12 — below MISSED_MIN_WORDS the query matches half the base."""
+    """Spec test 12 — below MISSED_MIN_WORDS the query matches half the base"""
     from jarvis.central_store import MISSED_MIN_WORDS
 
     central = CentralStore()
@@ -737,13 +673,12 @@ def test_a_short_title_gets_no_hints(jarvis_home):
 
 
 def test_a_hint_is_not_filtered_by_when_the_order_was_created(jarvis_home):
-    """Spec test 13 — the report's `ts <= created_at` filter does NOT apply here."""
+    """Spec test 13 — the report's `ts <= created_at` filter does NOT apply here"""
     central = CentralStore()
     _stocked(central)
     fresh = central.add_knowledge("the shipit gate matches byte for byte", project="p1",
                                   topic="gates")
-    # a newer entry in the same topic, so round-robin indexes that one and `fresh` is in
-    # overflow — the case this hint tier exists for
+    # a newer entry in the same topic, so round-robin indexes that one and `fresh` is in overflow
     central.add_knowledge("gates are reviewed by Neo", project="p1", topic="gates")
     brief = central.knowledge_brief("p1", digest_limit=5, digest_chars=600,
                                     title="the shipit gate matches byte for byte")
@@ -751,7 +686,7 @@ def test_a_hint_is_not_filtered_by_when_the_order_was_created(jarvis_home):
 
 
 def test_the_hint_block_says_title_match_and_says_hint(jarvis_home):
-    """Spec test 14 — a lexical coincidence must not read as an instruction."""
+    """Spec test 14 — a lexical coincidence must not read as an instruction"""
     from jarvis.dispatch import render_knowledge_block
 
     central = CentralStore()

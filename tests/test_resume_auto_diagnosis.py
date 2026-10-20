@@ -1,18 +1,4 @@
-"""`jarvis wo resume-auto` diagnoses before it nudges — GitHub issue 100, bug 2.
-
-The command was written to recover a worker stalled on a permission prompt: flip it to
-`auto` and nudge it. But `auto` is `catalog.DEFAULT_PERMISSION_MODE`, the production
-catalog sets it explicitly, and no project overrides it — so the flip is always
-`auto → auto`, and a worker in a mode that never prompts has never stalled on one. The
-only thing the command actually did was send a message, and a message is not free: every
-turn boundary re-sends the whole conversation at the cache-write rate. On wo-52a6164d it
-was run twice against a worker that had never stalled, was mid-turn, and completed the
-release unaided half an hour later.
-
-So it now says what the work order is really waiting on, refuses the pointless nudge, and
-keeps `--force` for the user who has decided otherwise. `jarvis status` stops naming it
-as the remedy wherever a permission prompt is impossible.
-"""
+"""`jarvis wo resume-auto` diagnoses before it nudges — GitHub issue 100, bug 2"""
 
 from __future__ import annotations
 
@@ -29,14 +15,14 @@ from jarvis.project_store import ProjectStore
 
 @pytest.fixture()
 def started(jarvis_home, fake_claude, catalog_file, project):
-    """`permission_mode` falls to `auto`, exactly as the production catalog leaves it."""
+    """`permission_mode` falls to `auto`, exactly as the production catalog leaves it"""
     ops.start_os(str(catalog_file), foreground=True)
     return Daemon(load_catalog(catalog_file))
 
 
 @pytest.fixture()
 def prompting_catalog(tmp_path, project):
-    """The one fleet shape where `resume-auto` can still do its original job."""
+    """The one fleet shape where `resume-auto` can still do its original job"""
     data = {
         "os": {"defaults": {"model": "sonnet", "permission_mode": "acceptEdits"},
                "notifications": {"sinks": ["log"]}},
@@ -49,8 +35,7 @@ def prompting_catalog(tmp_path, project):
 
 
 def parked_on_neo(daemon, project) -> dict:
-    """A work order waiting on Neo — the state three of five sampled production work
-    orders were in when the user was told to run this command."""
+    """A work order waiting on Neo — the state three of five sampled production work orders were in when..."""
     wo = ops.create_work_order("proj_a", "build the exporter")
     daemon.tick()
     ops.ask_question(wo["id"], "Should the export default to CSV or JSON?")
@@ -58,7 +43,7 @@ def parked_on_neo(daemon, project) -> dict:
     return wo
 
 
-# -- the refusal ----------------------------------------------------------------------
+# -- the refusal
 
 
 def test_it_refuses_to_nudge_a_work_order_parked_on_neo(started, project):
@@ -80,7 +65,7 @@ def test_it_refuses_to_nudge_a_work_order_parked_on_neo(started, project):
 
 
 def test_force_nudges_anyway(started, project):
-    """The user who has diagnosed it themselves keeps the old behaviour, explicitly."""
+    """The user who has diagnosed it themselves keeps the old behaviour, explicitly"""
     daemon = started
     wo = parked_on_neo(daemon, project)
 
@@ -106,10 +91,7 @@ def test_it_declines_while_a_gate_is_with_neo(started, project):
 
 
 def test_it_declines_while_a_gate_waits_for_the_worker_to_argue_it(started, project):
-    """The GitHub issue 100 false diagnosis, arriving down the gate road: an
-    `awaiting_case` request has no branch of its own, so the park used to fall through to
-    "an unanswered permission prompt is what is left" — about a worker in `auto`, which
-    cannot prompt, blocked at a hook that told it to file its case."""
+    """The GitHub issue 100 false diagnosis"""
     daemon = started
     wo = ops.create_work_order("proj_a", "ship it")
     daemon.tick()
@@ -124,16 +106,15 @@ def test_it_declines_while_a_gate_waits_for_the_worker_to_argue_it(started, proj
 
     assert wait["what"] == "gate_held"
     assert wait["stalled"] is False
-    # The worker's move, who is holding it, and the clock that closes it if nobody moves.
+    # The worker's move, who is holding it, and the clock that closes it if nobody moves
     assert f"gate {approval['id']}" in wait["detail"]
-    # BY REQUEST NUMBER and BOTH exits (spec §3, §8): a worktree-isolated worker cannot
-    # pass its own command string back, so an exit that re-quotes it is not an exit.
+    # BY REQUEST NUMBER and BOTH exits (spec §3
     assert f"jarvis gate request {approval['id']} " in wait["detail"]
     assert f"jarvis gate contest {approval['id']} " in wait["detail"]
     assert "./scripts/shipit.sh" not in wait["detail"]
     assert "no reviewer sees it yet" in wait["detail"]
     assert "case_ttl_seconds" in wait["detail"]
-    # The clock abandons it; saying "refuses" would promise a reviewer who never looked.
+    # The clock abandons it; saying "refuses" would promise a reviewer who never looked
     assert "abandons it unreviewed" in wait["detail"]
 
     result = ops.resume_in_auto(wo["id"])
@@ -174,10 +155,7 @@ def test_it_points_at_the_review_when_assumptions_are_pending(started, project):
 
 def test_it_says_the_panel_is_still_reading_a_work_order_parked_for_the_user(started,
                                                                             project):
-    """Since issue 212 a round runs beside the assumption review, so `needs_review` no
-    longer means nothing is moving. PAIRED with the same work order once its round has
-    been judged, which is the half that proves the note is read off the round and not
-    off the status."""
+    """Since issue 212 a round runs beside the assumption review"""
     daemon = started
     wo = ops.create_work_order("proj_a", "risky change")
     daemon.tick()
@@ -202,7 +180,7 @@ def test_it_says_the_panel_is_still_reading_a_work_order_parked_for_the_user(sta
 
 
 def test_it_declines_for_a_worker_that_is_simply_working(started, project):
-    """The wo-52a6164d case: a running worker, mid-turn, nothing wrong with it."""
+    """The wo-52a6164d case: a running worker, mid-turn, nothing wrong with it"""
     daemon = started
     wo = ops.create_work_order("proj_a", "long job")
     daemon.tick()
@@ -214,8 +192,7 @@ def test_it_declines_for_a_worker_that_is_simply_working(started, project):
 
 
 def test_it_declines_on_an_escalated_question_and_names_the_command(started, project):
-    """Escalated is the user's — but the way through is `jarvis neo answer`, not a nudge
-    at a worker that is waiting exactly as it was told to."""
+    """Escalated is the user's — but the way through is `jarvis neo answer`"""
     daemon = started
     wo = ops.create_work_order("proj_a", "build the exporter")
     daemon.tick()
@@ -229,13 +206,11 @@ def test_it_declines_on_an_escalated_question_and_names_the_command(started, pro
     assert "jarvis neo answer 1" in result["diagnosis"]
 
 
-# -- what it must still do ------------------------------------------------------------
+# -- what it must still do
 
 
 def test_a_genuine_stall_is_still_nudged(started, project):
-    """The one thing left that nothing else can clear: `waiting_input` with no gate, no
-    question, no queued message. Nothing is coming for this by itself, so the nudge is a
-    repair — even though the mode is `auto` and cannot be the cause."""
+    """The one thing left that nothing else can clear: `waiting_input` with no gate"""
     daemon = started
     wo = ops.create_work_order("proj_a", "blocked task")
     daemon.tick()
@@ -271,7 +246,7 @@ def test_a_mode_that_can_prompt_is_still_flipped(started, project):
     assert "permission_mode_changed" in kinds
 
 
-# -- and what `jarvis status` steers at -------------------------------------------------
+# -- and what `jarvis status` steers at
 
 
 def test_status_does_not_offer_the_remedy_where_no_prompt_is_possible(started, project):
@@ -336,8 +311,7 @@ def test_the_cli_carries_force_through(started, project, capsys):
 
 
 def test_a_question_neo_has_answered_leaves_nothing_to_diagnose(started, project):
-    """Once the answer is queued the work order is moving again — the diagnosis has to
-    say so rather than reporting a wait that is over."""
+    """Once the answer is queued the work order is moving again"""
     daemon = started
     wo = parked_on_neo(daemon, project)
     daemon._neo_drain()
@@ -349,10 +323,7 @@ def test_a_question_neo_has_answered_leaves_nothing_to_diagnose(started, project
 
 
 def a_child_of_an_unratified_plan(store, *, status: str) -> tuple[str, str]:
-    """`(child id, planner id)` — a feature whose planner owes the user a decision.
-
-    docs/superpowers/specs/2026-09-24-a-planner-assumption-holds-its-feature.md §2.3.
-    """
+    """`(child id, planner id)` — a feature whose planner owes the user a decision (docs/superpowers/specs/2026-09-24-a-planner-assumption-holds-its-feature.md §2.3.)"""
     fo = store.create_feature_order("CSV export", description="an exporter")
     planner = store.create_work_order("plan it", kind="planner", parent_id=fo["id"])
     store.update_feature_order(fo["id"], plan_wo_id=planner["id"], status="executing")
@@ -362,8 +333,7 @@ def a_child_of_an_unratified_plan(store, *, status: str) -> tuple[str, str]:
 
 
 def test_resume_auto_names_the_plan_hold(started, project):
-    """"not dispatched yet" and "nothing is running to nudge" are both true and useless:
-    the way through is a ruling on the PLANNER, so the diagnosis names it."""
+    """"not dispatched yet" and "nothing is running to nudge" are both true and useless: the way through..."""
     store = ProjectStore(project)
     kid_id, planner_id = a_child_of_an_unratified_plan(store, status="pending")
 
@@ -374,7 +344,7 @@ def test_resume_auto_names_the_plan_hold(started, project):
     assert planner_id in result["diagnosis"]
     assert f"jarvis wo review {planner_id}" in result["diagnosis"]
 
-    # ...and the child parked behind the MERGE hold, which the catch-all would answer.
+    # ...and the child parked behind the MERGE hold, which the catch-all would answer
     parked_id, _ = a_child_of_an_unratified_plan(store, status="waiting_pr_merge")
     parked = ops.resume_in_auto(parked_id)
 
@@ -383,9 +353,7 @@ def test_resume_auto_names_the_plan_hold(started, project):
 
 
 def test_a_failed_order_is_not_stalled_so_no_nudge_is_offered(started, project):
-    """§6 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md: `stalled` is the
-    narrow claim that a MESSAGE is a repair, and a nudge into a dead conversation is not
-    the move — `jarvis wo retry` is, offered by its own predicate."""
+    """§6 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md: `stalled` is the..."""
     wo = ops.create_work_order("proj_a", "died without delivering")
     started.tick()
     store = ProjectStore(project)

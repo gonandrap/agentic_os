@@ -1,10 +1,4 @@
-"""What a dependency ACTUALLY shipped, in the dispatched prompt.
-
-A child's brief can assert that a dependency shipped something it did not — three
-children of one feature order each burned a Neo question on the same false claim
-(kn-5368cc71). The block under test closes that class mechanically: the record travels
-with the prompt, so the brief's claims are checkable without trusting the brief.
-"""
+"""What a dependency ACTUALLY shipped, in the dispatched prompt"""
 
 from __future__ import annotations
 
@@ -47,7 +41,7 @@ def _prompt(store, spec, wo):
         wo, spec, None, dependencies=dispatch.dependency_context(store, wo))
 
 
-# -- the block ---------------------------------------------------------------------------
+# -- the block
 
 def test_a_completed_dependency_puts_its_result_and_pr_in_the_prompt(store, spec):
     dep = _dep(store)
@@ -61,8 +55,7 @@ def test_a_completed_dependency_puts_its_result_and_pr_in_the_prompt(store, spec
 
 
 def test_the_block_says_the_brief_is_a_hint_and_the_record_wins(store, spec):
-    """Pinned like tests/test_worker_brief.py pins phrases: this sentence is the whole
-    mechanism — without it the block is data the worker may read past."""
+    """Pinned like tests/test_worker_brief.py pins phrases: this sentence is the whole mechanism"""
     prompt = _prompt(store, spec, _child(store, [_dep(store)["id"]]))
 
     assert ("Your brief's claims about what a dependency shipped are a HINT; this block "
@@ -105,12 +98,11 @@ def test_edge_order_is_preserved(store, spec):
     assert prompt.index(first["id"]) < prompt.index(second["id"])
 
 
-# -- dependency_context ------------------------------------------------------------------
+# -- dependency_context
 
 @pytest.mark.parametrize("kind", ["manager", "planner", "analyst", "investigator"])
 def test_only_a_worker_gets_the_record(store, spec, kind):
-    """A manager writes no code and an analyst never builds on a dependency; the block
-    would be context they cannot use."""
+    """A manager writes no code and an analyst never builds on a dependency"""
     dep = _dep(store)
     wo = store.create_work_order("not a worker", "d", depends_on=[dep["id"]], kind=kind)
     assert dispatch.dependency_context(store, wo) == []
@@ -136,7 +128,7 @@ def test_a_missing_row_carries_nothing_but_id_and_status(store, spec):
         {"id": dep["id"], "status": "missing"}]
 
 
-# -- determinism (the property tests/test_context.py:458 relies on) ----------------------
+# -- determinism (the property tests/test_context.py:458 relies on)
 
 def test_the_prompt_stays_deterministic(store, spec):
     child = _child(store, [_dep(store)["id"]])

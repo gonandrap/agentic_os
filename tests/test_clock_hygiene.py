@@ -1,19 +1,4 @@
-"""No test reads the real clock.
-
-Two assertions over the tracked `tests/**/*.py` tree, both by AST and never by line
-grep — see docs/superpowers/specs/2026-10-15-no-test-reads-the-real-clock.md.
-
-A. The flake SHAPE: one test function that both fakes `jarvis.db.now` and stages a
-   wall-clock time of day has two clocks that can disagree across a date boundary.
-   That is the class-1 bug this guard exists for.
-B. Any tracked file under `tests/` that is not in `ALLOWED` may contain no real-clock
-   read at all. `ALLOWED` is keyed by file, every reason names its class, and a stale
-   entry fails — so the list can only shrink.
-
-There is no threshold here by design: assertion A is a shape and assertion B is a
-per-file boolean. Any number this rule needed would be a catalog key, never a module
-constant.
-"""
+"""No test reads the real clock (docs/superpowers/specs/2026-10-15-no-test-reads-the-real-clock.md)"""
 
 from __future__ import annotations
 
@@ -24,10 +9,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Class 2 = rows back-dated with `time.time() - N` while the code under test reads
-# `time.time()` itself (both sides share one clock, so there is no band).
-# Class 3 = monotonic-deadline / `time.sleep` spin-waits on real daemon threads and
-# real subprocesses; a fake clock cannot make another thread run.
+# Class 2 = rows back-dated with `time.time()
 _BACKDATED = "class 2 — rows back-dated or stamped with time.time(); the code under test reads time.time() itself and takes no now="
 _SPIN = "class 3 — monotonic-deadline / time.sleep spin-waits on real daemon threads and subprocesses"
 _BOTH = (
@@ -85,7 +67,7 @@ ALLOWED: dict[str, str] = {
     "tests/test_worker_session.py": _BOTH,
 }
 
-# The calls that read the real clock, as dotted names after import resolution.
+# The calls that read the real clock, as dotted names after import resolution
 REAL_CLOCK_READS = frozenset(
     {
         "time.time",
@@ -97,10 +79,7 @@ REAL_CLOCK_READS = frozenset(
     }
 )
 
-# One or two digits, an optional `:MM`, then either an am/pm marker or a timezone
-# parenthetical: `11:50pm`, `3am`, `12:01am (UTC)`, `23:46 (UTC)`. Matched against the
-# WHOLE literal, so `in 5h`, `2d 3h 15m` and bare integers do not match — the fix for a
-# flagged site is to rewrite the literal as a duration.
+# One or two digits, an optional `:MM`
 _TIME_OF_DAY = re.compile(
     r"\d{1,2}(?::\d{2})?\s*(?:[ap]m(?:\s*\([^()]+\))?|\([^()]+\))",
     re.IGNORECASE,
@@ -131,7 +110,7 @@ def _tracked_test_files() -> list[str]:
 
 
 def _sources() -> dict[str, ast.Module]:
-    """Tracked test files, parsed. A file that does not parse is a defect, not a skip."""
+    """Tracked test files, parsed"""
     trees: dict[str, ast.Module] = {}
     for rel in _tracked_test_files():
         text = (REPO_ROOT / rel).read_text(encoding="utf-8")
@@ -149,7 +128,7 @@ def _sources() -> dict[str, ast.Module]:
 
 
 def _dotted(node: ast.AST) -> str | None:
-    """`a.b.c` -> "a.b.c"; anything else (subscripts, calls, literals) -> None."""
+    """`a.b.c` -> "a.b.c"; anything else (subscripts, calls, literals) -> None"""
     parts: list[str] = []
     cur = node
     while isinstance(cur, ast.Attribute):
@@ -162,12 +141,7 @@ def _dotted(node: ast.AST) -> str | None:
 
 
 def _import_table(tree: ast.Module) -> dict[str, str]:
-    """Local name -> dotted canonical name, from this file's own imports.
-
-    `import time as t` -> {"t": "time"}; `from time import sleep` ->
-    {"sleep": "time.sleep"}; `from datetime import datetime` ->
-    {"datetime": "datetime.datetime"}.
-    """
+    """Local name -> dotted canonical name, from this file's own imports"""
     table: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -198,7 +172,7 @@ def _is_real_clock_read(resolved: str) -> bool:
     if resolved in REAL_CLOCK_READS:
         return True
     parts = resolved.split(".")
-    # `datetime.datetime.now` / `datetime.date.today`: the stdlib class sits between.
+    # `datetime.datetime.now` / `datetime.date.today`: the stdlib class sits between
     return (
         len(parts) > 2
         and parts[0] in {"time", "datetime"}
@@ -207,7 +181,7 @@ def _is_real_clock_read(resolved: str) -> bool:
 
 
 def real_clock_reads(tree: ast.Module) -> list[tuple[int, str]]:
-    """(line, dotted name) for every real-clock read in one parsed file."""
+    """(line, dotted name) for every real-clock read in one parsed file"""
     table = _import_table(tree)
     found: list[tuple[int, str]] = []
     for node in ast.walk(tree):
@@ -259,7 +233,7 @@ def fakes_db_now(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
     for node in subtree:
         if isinstance(node, ast.Call):
             func = _dotted(node.func) or ""
-            # A `_MovedNow`-style context manager.
+            # A `_MovedNow`-style context manager
             if func.split(".")[-1].endswith("MovedNow"):
                 return True
             if func == "setattr" or func.endswith(".setattr"):
@@ -286,7 +260,7 @@ def fakes_db_now(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
 
 
 def wall_clock_literals(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str]:
-    """String constants in this test that stage a wall-clock time of day."""
+    """String constants in this test that stage a wall-clock time of day"""
     found: list[str] = []
     for node in [*fn.decorator_list, *fn.body]:
         for sub in ast.walk(node):
@@ -300,7 +274,7 @@ def wall_clock_literals(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str]
 
 
 def flake_offenders(sources: dict[str, ast.Module]) -> list[str]:
-    """One message per test function that both fakes `db.now` and stages a time of day."""
+    """One message per test function that both fakes `db.now` and stages a time of day"""
     offenders: list[str] = []
     for rel, tree in sorted(sources.items()):
         for fn in _test_functions(tree):
@@ -319,7 +293,7 @@ def flake_offenders(sources: dict[str, ast.Module]) -> list[str]:
 
 
 def clock_offenders(sources: dict[str, ast.Module]) -> list[str]:
-    """One message per unlisted file that reads the real clock."""
+    """One message per unlisted file that reads the real clock"""
     offenders: list[str] = []
     for rel, tree in sorted(sources.items()):
         if rel in ALLOWED:
@@ -336,7 +310,7 @@ def clock_offenders(sources: dict[str, ast.Module]) -> list[str]:
 def stale_entries(
     allowed: dict[str, str], sources: dict[str, ast.Module]
 ) -> list[str]:
-    """Allowlisted files that contain no real-clock read any more."""
+    """Allowlisted files that contain no real-clock read any more"""
     return sorted(
         rel
         for rel, tree in sources.items()
@@ -402,9 +376,7 @@ def _parse(source: str) -> ast.Module:
     return ast.parse(source)
 
 
-# The pre-fix text of test_a_refused_sweep_is_held_and_not_recorded_as_a_failure.
-# These are source strings, so the wall-clock literals below are not literals of THIS
-# file's own AST and the real walk never trips over them.
+# The pre-fix text of test_a_refused_sweep_is_held_and_not_recorded_as_a_failure
 _PRE_FIX_FLAKE = '''
 def test_a_refused_sweep_is_held_and_not_recorded_as_a_failure(clock, fake_claude):
     fake_claude.health_rate_limited(reset="11:50pm (America/Los_Angeles)")

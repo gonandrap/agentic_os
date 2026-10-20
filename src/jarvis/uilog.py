@@ -1,35 +1,4 @@
-"""The dashboard's own log — and, more to the point, the OS's ability to read it back.
-
-`$JARVIS_HOME/logs/ui.log` gets one entry per unhandled dashboard failure;
-`ui-access.log` gets one line per request. Both live next to `jarvisd.log` and the
-databases, which is the whole reason this module exists: before it, a UI traceback
-existed only in the systemd journal, so a 500 on the OS's own web UI was invisible to
-`jarvis status`, to `jarvis doctor`, to the inbox, and to every agent that can read the
-state directory but not `journalctl`. An error in the dashboard is now as visible to the
-OS as an error in the daemon.
-
-Writing is only half of that. The daemon raises an inbox item for errors it has not seen
-yet, `os_status` counts recent ones and `jarvis doctor` reports them — all of which need
-to *parse* the log, so the format is part of the contract, not an implementation detail:
-
-    2026-07-27 14:03:11 [ERROR] GET /wo/proj_a/wo-4fdb20ba — KeyError: 'proj_a'
-        Traceback (most recent call last):
-        ...
-
-The header line is the only line that starts at column 0; every traceback line is
-indented, so `_HEADER` can never match inside a traceback body however creative the
-exception message is. Timestamps are local time, matching `notifications.log` and
-`jarvisd.log` — these files are read by a human first.
-
-Both files rotate at `MAX_BYTES` into a single `.1` sibling, so a dashboard stuck in a
-crash loop cannot fill the state directory.
-
-Two more files live here, for the failure that writes NO error: `ui-stacks.log` and
-`ui-wedge.json`, the dashboard's dump of its own threads and the stamp the daemon and
-`jarvis doctor` read back when its threadpool wedges. They are separate files on purpose
-— the `[ERROR]` format above is a parsed contract and a wedge is not an exception. See
-`stack_dump_path`.
-"""
+"""The dashboard's own log — and, more to the point, the OS's ability to read it back"""
 
 from __future__ import annotations
 
@@ -44,20 +13,13 @@ from pathlib import Path
 
 from .paths import logs_dir
 
-#: Rotate at 512 KiB, keeping one previous file. A crash loop writes tracebacks fast.
+#: Rotate at 512 KiB, keeping one previous file
 MAX_BYTES = 512 * 1024
 
-#: How far back `recent_errors` reads. Bounded so `jarvis status` (and `/api/status`,
-#: which the dashboard polls every 15s) never pays for the whole file. An entry older
-#: than this many bytes has almost certainly aged out of the reporting window too.
+#: How far back `recent_errors` reads
 TAIL_BYTES = 64 * 1024
 
-#: How recent a dashboard error has to be to still be worth the user's attention.
-#: Reporting is window-based rather than acknowledged-based on purpose: there is no
-#: "I have seen the UI error" verb, and a signal that needs a manual clear is a signal
-#: that gets ignored. The inbox item raised by the daemon is the one-shot alert; this
-#: window is the standing "the dashboard is broken right now" indicator, and it expires
-#: on its own once the dashboard has been quiet for a day.
+#: How recent a dashboard error has to be to still be worth the user's attention
 ERROR_WINDOW_SECONDS = 24 * 3600
 
 _STAMP = "%Y-%m-%d %H:%M:%S"
@@ -69,7 +31,7 @@ _HEADER = re.compile(
 
 @dataclass(frozen=True)
 class UiError:
-    """One unhandled dashboard failure, parsed back out of `ui.log`."""
+    """One unhandled dashboard failure, parsed back out of `ui.log`"""
 
     ts: float
     when: str
@@ -97,45 +59,26 @@ def access_log_path() -> Path:
     return logs_dir() / "ui-access.log"
 
 
-#: `os_state` keys the wedge self-heal keeps (spec §4). HERE, in the leaf module both
-#: readers already import, so the daemon that writes them and the doctor check that
-#: reports them cannot drift onto two spellings — and so neither has to import the other.
-#: `UI_HEALTHZ_OK_AT` is the "this dashboard was once serving" sighting that stops a
-#: machine with no `jarvis ui` being restarted every tick.
+#: `os_state` keys the wedge self-heal keeps (spec §4)
 UI_HEALTHZ_OK_AT = "ui_healthz_ok_at"
 UI_WEDGE_RESTARTS = "ui_wedge_restarts"
 UI_WEDGE_CAPPED_AT = "ui_wedge_capped_at"
 
 
 def stack_dump_path() -> Path:
-    """Every thread's Python stack, written by the dashboard about ITSELF.
-
-    §3 of
-    docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md:
-    the wedge produced no exception, so there was nothing for `record_error` to write and
-    `py-spy` could not attach (ptrace not permitted) — a self-dump is the only way to get
-    the frames at all. A FILE OF ITS OWN rather than a record in `ui.log`: the `[ERROR]`
-    format there is a parsed contract with three readers (kn-57fb4919), and a wedge is
-    not an unhandled exception.
-    """
+    """Every thread's Python stack, written by the dashboard about ITSELF (docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md)"""
     return logs_dir() / "ui-stacks.log"
 
 
 def wedge_stamp_path() -> Path:
-    """The small JSON the daemon and `jarvis doctor` read back: when the dashboard first
-    tripped, the limiter figures at that moment, and where the stacks are."""
+    """The small JSON the daemon and `jarvis doctor` read back: when the dashboard first tripped"""
     return logs_dir() / "ui-wedge.json"
 
 
-# -- writing ------------------------------------------------------------------------
+# -- writing
 
 def _append(path: Path, text: str) -> None:
-    """Append, rotating first if the file has grown past `MAX_BYTES`.
-
-    Every caller is on a request path, so this must never raise: a logger that can take
-    the dashboard down is worse than no logger. Rotation loses the byte watermark the
-    daemon keeps, which `read_errors` handles by restarting from zero.
-    """
+    """Append, rotating first if the file has grown past `MAX_BYTES`"""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists() and path.stat().st_size >= MAX_BYTES:
@@ -147,40 +90,25 @@ def _append(path: Path, text: str) -> None:
 
 
 def record_error(method: str, path: str, exc: BaseException) -> None:
-    """Write one `[ERROR]` entry, header line plus indented traceback."""
+    """Write one `[ERROR]` entry, header line plus indented traceback"""
     stamp = time.strftime(_STAMP, time.localtime())
     tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     body = "".join(f"    {line}\n" for line in tb.rstrip("\n").splitlines())
-    # Newlines in the exception message would forge a second entry; flatten them.
+    # Newlines in the exception message would forge a second entry; flatten them
     message = " ".join(str(exc).splitlines()) or "(no message)"
     _append(ui_log_path(),
             f"{stamp} [ERROR] {method} {path} — {type(exc).__name__}: {message}\n{body}")
 
 
 def record_access(method: str, path: str, status: int, duration_ms: float) -> None:
-    """Write one access line.
-
-    This is what was missing when "I clicked the link and got an internal server error"
-    had to be placed in time: without it there is no record of which deep links were
-    followed, in what order, or which of them failed.
-    """
+    """Write one access line"""
     stamp = time.strftime(_STAMP, time.localtime())
     _append(access_log_path(),
             f"{stamp} [{status}] {method} {path} {duration_ms:.0f}ms\n")
 
 
 def dump_stacks(note: str = "") -> Path | None:
-    """Append every live thread's Python stack to `stack_dump_path()`.
-
-    `faulthandler.dump_traceback(all_threads=True)` needs a real file descriptor, so the
-    file is opened rather than handed a buffer; `sys._current_frames` is the fallback for
-    an environment where faulthandler cannot write (a captured stdout, a closed fd).
-
-    Never raises — `_append`'s rule (a logger that can take the dashboard down is worse
-    than no logger), and here it is load-bearing: a failed dump must still leave the 503
-    answerable. Rotates at `MAX_BYTES` into one `.1` sibling, so a flapping wedge cannot
-    fill the state directory.
-    """
+    """Append every live thread's Python stack to `stack_dump_path()`"""
     path = stack_dump_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -207,12 +135,7 @@ def dump_stacks(note: str = "") -> Path | None:
 
 def record_wedge(*, limiter: dict[str, int], uptime_seconds: float,
                  version: str = "") -> dict[str, object]:
-    """Dump the stacks and (re)write the wedge stamp. Returns the stamp as written.
-
-    `since` is the FIRST trip's time: a wedge that keeps failing keeps dumping, and the
-    useful fact is when the dashboard stopped serving, not when it last said so. Never
-    raises, for `dump_stacks`' reason.
-    """
+    """Dump the stacks and (re)write the wedge stamp"""
     stamp: dict[str, object] = {
         "since": time.time(), "at": time.time(), "limiter": dict(limiter),
         "uptime_seconds": round(uptime_seconds, 1), "version": version,
@@ -240,18 +163,14 @@ def record_wedge(*, limiter: dict[str, int], uptime_seconds: float,
 
 
 def read_wedge() -> dict[str, object] | None:
-    """The wedge stamp, or None when the dashboard has never tripped.
-
-    Corrupt JSON reads as None, `release.read_marker`'s rule: no reader should act on
-    garbage, and the doctor check is what reports the file itself being wrong.
-    """
+    """The wedge stamp, or None when the dashboard has never tripped"""
     try:
         return json.loads(wedge_stamp_path().read_text())
     except (OSError, ValueError):
         return None
 
 
-# -- reading ------------------------------------------------------------------------
+# -- reading
 
 def _parse(text: str) -> list[UiError]:
     errors: list[UiError] = []
@@ -277,34 +196,7 @@ def _parse(text: str) -> list[UiError]:
 def read_errors(cursor: str = "",
                 within_seconds: float = ERROR_WINDOW_SECONDS,
                 ) -> tuple[list[UiError], str]:
-    """Errors written since `cursor` and newer than `within_seconds`, plus the cursor
-    to resume from.
-
-    The daemon stores the returned cursor so each error is announced exactly once —
-    without it, one standing failure would re-notify on every five-second tick.
-
-    The cursor is opaque: a byte offset *plus* the file's identity (inode and a hash of
-    its first bytes). A bare offset is not enough, because rotation can leave a new file
-    of much the same size and the daemon would then silently seek past real errors. Any
-    mismatch restarts from the top, so the failure mode is re-announcing a handful of
-    entries rather than going quiet — the right direction for an alerting path.
-
-    That restart is also why the age bound exists. Resuming from the top is right about
-    *which bytes* to re-read and silent about *when* they were written, so anything that
-    puts the reader back at zero — rotation, a truncated log, a fresh install, a lost
-    `os_state` — announces the file's entire history as though it had just happened.
-    Jarvis 0.5.5 shipped this reader a release after the writer it reads, so the first
-    tick on a production box found a week-old `ui.log`, had no cursor yet, and alerted
-    the user to four errors that had been fixed for a week.
-
-    The bound is the entries' age rather than the absence of a cursor, because "no
-    cursor, so skip to EOF" would be silent about a crash loop happening right now — the
-    one failure mode this module refuses. On the normal incremental path the filter is a
-    no-op: those entries are seconds old. It bites only when the reader restarts, and
-    then it drops exactly what `recent_errors` and `os_status` already decline to
-    report. A daemon that was down longer than the window is its own alert; backfilling
-    UI errors from an outage is not this function's job.
-    """
+    """Errors written since `cursor` and newer than `within_seconds`, plus the cursor to resume from"""
     p = ui_log_path()
     if not p.exists():
         return [], ""
@@ -317,9 +209,7 @@ def read_errors(cursor: str = "",
     cutoff = time.time() - within_seconds
     errors = [e for e in _parse(raw.decode("utf-8", errors="replace"))
               if e.ts >= cutoff]
-    # The cursor advances past the entries the filter dropped: they have been read and
-    # dismissed, and re-reading them into the same silence every five seconds is work
-    # the daemon does not need to repeat.
+    # The cursor advances past the entries the filter dropped: they have been read and dismissed
     return errors, _cursor(offset + len(raw), st, head)
 
 
@@ -327,13 +217,7 @@ _HEAD_BYTES = 512
 
 
 def _fingerprint(st: os.stat_result, head: bytes) -> str:
-    """Identity of the file, stable under appends and not under replacement.
-
-    The *first line* rather than the first N bytes: appending changes how much of the
-    file the head read returns, so hashing raw bytes would make every append look like
-    a new file and re-announce the whole log. The first line only changes when the
-    file is truncated or rotated away, which is exactly the event this has to catch.
-    """
+    """Identity of the file, stable under appends and not under replacement"""
     first_line = head.split(b"\n", 1)[0]
     return f"{st.st_ino}-{hashlib.sha1(first_line).hexdigest()[:12]}"
 
@@ -343,7 +227,7 @@ def _cursor(offset: int, st: os.stat_result, head: bytes) -> str:
 
 
 def _resume_at(cursor: str, st: os.stat_result, head: bytes) -> int:
-    """Byte offset the cursor points at, or 0 if it no longer describes this file."""
+    """Byte offset the cursor points at, or 0 if it no longer describes this file"""
     raw_offset, _, fingerprint = cursor.partition(":")
     try:
         offset = int(raw_offset)
@@ -356,11 +240,7 @@ def _resume_at(cursor: str, st: os.stat_result, head: bytes) -> int:
 
 def recent_errors(within_seconds: float = ERROR_WINDOW_SECONDS,
                   limit: int = 5) -> tuple[list[UiError], int]:
-    """The `limit` newest errors inside the window, and how many the window holds.
-
-    Reads only the last `TAIL_BYTES`, so the first entry in that slice may be truncated
-    mid-traceback; a partial header simply fails to match and is skipped.
-    """
+    """The `limit` newest errors inside the window, and how many the window holds"""
     p = ui_log_path()
     if not p.exists():
         return [], 0

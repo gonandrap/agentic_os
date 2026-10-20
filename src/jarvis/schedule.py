@@ -1,15 +1,4 @@
-"""The scheduler: work orders the OS files without being asked.
-
-Design, and the ruling behind each guard rail:
-docs/superpowers/specs/2026-09-14-the-scheduler.md.
-
-Layering: this module imports NOTHING else of Jarvis's AT MODULE SCOPE, which is what lets
-`catalog` import it for the job roster without a cycle — `os_project`'s `github` read is
-function-local for that reason. The cadence is a PURE FUNCTION of a stored
-row, a config and a clock (`decide`), so the one thing that must never be got wrong — "may the OS spend money right now" — is
-testable without a store, a daemon or a catalog. `Daemon.schedule_tick` is the only
-caller that turns a `Decision` into a work order.
-"""
+"""The scheduler: work orders the OS files without being asked (docs/superpowers/specs/2026-09-14-the-scheduler.md)"""
 
 from __future__ import annotations
 
@@ -18,58 +7,38 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-#: The origin every scheduled work order carries — `project_store.WO_ORIGINS`. It exists
-#: for the reason `neo` does: the OS filed this, nobody typed it, and a listing that
-#: cannot tell the two apart cannot answer "why am I paying for this".
+#: The origin every scheduled work order carries — `project_store.WO_ORIGINS`
 ORIGIN = "schedule"
 
 SECONDS_PER_HOUR = 3600
 
-#: What `decide` returns. `wait` is the overwhelmingly common answer and writes nothing.
+#: What `decide` returns
 FIRE, HOLD, WAIT = "fire", "hold", "wait"
 
 
 @dataclass(frozen=True)
 class JobContext:
-    """What a job knows about the firing it is about to describe.
-
-    A struct rather than a bare project name so a rider added later can branch on
-    something new without changing every existing `describe`.
-    """
+    """What a job knows about the firing it is about to describe"""
 
     project: str
-    #: Whether THIS project is the one that owns the running OS install. Only it runs
-    #: the OS-level checks: they are fleet-wide, so N projects reporting the same OS
-    #: fault every morning is N-1 copies of the alarm nobody reads.
+    #: Whether THIS project is the one that owns the running OS install
     owns_os: bool = False
 
 
 @dataclass(frozen=True)
 class ScheduledJob:
-    """One recurring job. Adding a rider is an entry in `JOBS` and nothing else.
-
-    `describe` builds the work order's description at firing time rather than storing
-    one: the text is the ONLY thing the worker sees, and a job whose description was
-    frozen at catalog-parse time could not name the project it woke up in.
-    """
+    """One recurring job"""
 
     id: str
     title: str
     describe: Callable[[JobContext], str]
 
 
-# -- the first rider: the daily doctor ---------------------------------------------------
+# -- the first rider: the daily doctor
 
 
 def _doctor_description(ctx: JobContext) -> str:
-    """The daily `jarvis doctor` run, and what to do with what it finds.
-
-    Deliberately does NOT enumerate the checks. `invariants.INVARIANTS` grows — two
-    sibling orders on issue #164 are adding to it right now — and a description that
-    listed them would have to be rewritten by each one, which is exactly the coupling
-    this registry exists to avoid. The order runs the doctor; the doctor decides what
-    the doctor checks.
-    """
+    """The daily `jarvis doctor` run, and what to do with what it finds (#164)"""
     scope = f"jarvis doctor {ctx.project} --repair"
     if not ctx.owns_os:
         scope += " --skip-os"
@@ -122,9 +91,7 @@ DOCTOR_JOB = ScheduledJob(
     describe=_doctor_description,
 )
 
-#: Every recurring job the OS knows how to file. A rider is one entry here plus its
-#: `describe`; `ScheduleConfig.jobs` decides which of them a project actually runs, and
-#: an id named there that is absent from this tuple is a `CatalogError` at boot.
+#: Every recurring job the OS knows how to file
 JOBS: tuple[ScheduledJob, ...] = (DOCTOR_JOB,)
 
 JOB_IDS: tuple[str, ...] = tuple(j.id for j in JOBS)
@@ -137,25 +104,11 @@ def job(job_id: str) -> ScheduledJob:
     raise KeyError(job_id)
 
 
-# -- who owns the OS ---------------------------------------------------------------------
+# -- who owns the OS
 
 
 def os_owner(projects: Iterable[tuple[str, Path]], *, fallback: bool = True) -> str | None:
-    """Which project runs the fleet-wide OS checks — exactly one, or none at all.
-
-    The project whose directory contains the `jarvis` package that is RUNNING: in dev
-    that is the checkout being edited, in production the deployed tag. Derived rather
-    than declared because a catalog key would be one more thing to get wrong on a
-    deployment that already knows the answer.
-
-    Falls back to the first project in catalog order when no project contains the
-    install (a pip-installed OS driving projects that are not it). The fallback is
-    arbitrary but it is DETERMINISTIC AND UNIQUE, which is the property that matters:
-    the checks still run somewhere, and they still run once. It answers "who runs the
-    fleet checks" and NEVER "which project IS the OS" — an arbitrary project must not
-    be forced to run the OS's own health sweep, nor refused a config write. Callers
-    asking the second question pass `fallback=False` and get None.
-    """
+    """Which project runs the fleet-wide OS checks — exactly one, or none at all"""
     pkg = Path(__file__).resolve().parent
     first: str | None = None
     for name, path in projects:
@@ -169,17 +122,13 @@ def os_owner(projects: Iterable[tuple[str, Path]], *, fallback: bool = True) -> 
     return first if fallback else None
 
 
-#: `os_project`'s origin reads, memoised by the path asked about. `git remote get-url` is
-#: a subprocess and the release guards ask once per project per tick, while the `origin` of
-#: a checkout does not move under a running daemon. Tests that rewrite a remote clear it
-#: (the `origins` fixture).
+#: `os_project`'s origin reads, memoised by the path asked about
 _ORIGIN_CACHE: dict[str, tuple[str, str] | None] = {}
 
 
 def _origin_of(path: Path | None) -> tuple[str, str] | None:
-    """`github.origin_repo(path)`, cached, and never the thing that raises."""
-    # Function-local, and must stay so: this module imports nothing of Jarvis's at module
-    # scope, which is what lets `catalog` import it without a cycle.
+    """`github.origin_repo(path)`, cached, and never the thing that raises"""
+    # Function-local, and must stay so: this module imports nothing of Jarvis's at module scope
     from . import github
 
     if path is None:
@@ -195,12 +144,7 @@ def _origin_of(path: Path | None) -> tuple[str, str] | None:
 
 def os_candidates(projects: Iterable[tuple[str, Path]], *,
                   install: Path | None = None) -> list[str]:
-    """Every catalog project whose git `origin` is this code's — `os_project`'s matches.
-
-    Separate so a caller can tell the two None cases apart: no candidate is an OS-less
-    deployment, two candidates is an ambiguity nobody declared
-    (`invariants.check_os_identity`).
-    """
+    """Every catalog project whose git `origin` is this code's — `os_project`'s matches"""
     mine = _origin_of(install if install is not None else Path(__file__).resolve().parent)
     if mine is None:
         return []
@@ -209,42 +153,17 @@ def os_candidates(projects: Iterable[tuple[str, Path]], *,
 
 def os_project(projects: Iterable[tuple[str, Path]], *,
                install: Path | None = None) -> str | None:
-    """Which catalog project IS the OS — the one whose git `origin` is this code's, or None.
-
-    The question `os_owner` must NOT be asked: that one answers "who runs the fleet
-    checks" and is allowed an arbitrary answer, this one grants the OS's own authority
-    over its release path and its config, and a wrong answer there is worse than none.
-
-    BY ORIGIN, NOT BY PATH. Path containment cannot answer it in production: the running
-    package lives in the deployed checkout (`…/production/jarvis_os/src/jarvis`) while the
-    catalog's `jarvis_os` path is the dev checkout, so no project contains the install and
-    `os_owner` answers with its fallback — the wrong project — or with None. Both
-    checkouts have the SAME `origin`, because a release tag is a checkout of this
-    repository, so origin is the one property that holds in dev and in production alike.
-
-    Derived rather than declared, the rule `os_owner` and `issues.tracker_project` already
-    state, and this is `tracker_project`'s exact mechanism: `github.origin_repo` per
-    project path. No catalog key, no environment variable, nothing a deployment can set
-    wrong.
-
-    None on every doubt, and that is the safe answer everywhere it is asked: an
-    unreadable origin, a pip-installed OS whose code is in no checkout at all, and
-    AMBIGUITY — two catalog projects sharing one origin (a worktree listed beside its
-    checkout) name no unique OS, so nothing is granted the OS's authority.
-
-    `install` is the seam the tests need: it defaults to the directory of the RUNNING
-    `jarvis` package, and a test passes the package directory of a simulated deployment.
-    """
+    """Which catalog project IS the OS — the one whose git `origin` is this code's, or None"""
     matches = os_candidates(projects, install=install)
     return matches[0] if len(matches) == 1 else None
 
 
-# -- the cadence -------------------------------------------------------------------------
+# -- the cadence
 
 
 @dataclass(frozen=True)
 class Decision:
-    """What to do about one job on one tick."""
+    """What to do about one job on one tick"""
 
     action: str          # FIRE | HOLD | WAIT
     reason: str = ""     # why, in words, for the record and for `jarvis doctor`
@@ -252,27 +171,7 @@ class Decision:
 
 def decide(state: dict[str, Any], *, interval_seconds: float, now: float,
            blocker: dict[str, Any] | None) -> Decision:
-    """Fire, hold, or wait — the whole cadence, as a pure function.
-
-    THREE PROPERTIES, each of which is a ruling rather than an implementation choice
-    (spec §3):
-
-    * **At most one catch-up, never a backfill.** Due-ness is `now - last_fired_at >=
-      interval` and firing sets `last_fired_at = now`, NOT `last_fired_at + interval`. A
-      daemon that was off for a week comes back and files one order, not seven. The
-      alternative — advancing by whole intervals — turns an outage into a burst of
-      spending at exactly the moment the fleet is least well.
-
-    * **A restart never fires.** `last_fired_at` is seeded to the moment the job is first
-      seen enabled (`ProjectStore.seed_schedule`) and lives in the project store, so it
-      survives the daemon. Nothing about starting the OS makes a job due.
-
-    * **Held, not queued.** A job whose previous order has not settled does not fire and
-      does not advance its clock, so the backlog can never grow past one. It raises no
-      attention either — six stacked doctor orders is precisely the alarm nobody reads —
-      but the hold IS persisted, so `jarvis doctor` and `jarvis status` can say that a
-      scheduler is parked rather than dead (INV-SCHEDULE-HELD).
-    """
+    """Fire, hold, or wait — the whole cadence, as a pure function"""
     if now - float(state["last_fired_at"] or 0.0) < interval_seconds:
         return Decision(WAIT)
     if blocker is not None:
@@ -281,6 +180,6 @@ def decide(state: dict[str, Any], *, interval_seconds: float, now: float,
 
 
 def held_seconds(state: dict[str, Any], now: float) -> float:
-    """How long this job has wanted to fire and could not. 0.0 when it is not held."""
+    """How long this job has wanted to fire and could not. 0.0 when it is not held"""
     since = state.get("held_since")
     return max(0.0, now - float(since)) if since else 0.0

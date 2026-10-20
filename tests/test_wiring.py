@@ -1,21 +1,4 @@
-"""Per-project wiring: which of the USER'S MCP servers, skills and plugins reach a
-worker (issue #164 item 4; spec docs/superpowers/specs/2026-09-16-per-project-wiring.md).
-
-Three claims are load-bearing here and each has its own test rather than riding on
-another's assertions:
-
-* the SHIPPED DEFAULT changes nothing — the worker settings file is what it was, down to
-  the Serena permission rules;
-* a deselection reaches the SPAWN, through the one file `dispatch._write_worker_settings`
-  writes, for ordinary workers and for a feature order's planner and manager alike;
-* a deselection is COHERENT — unwiring Serena also takes the permission rules that name
-  its tools, the navigation briefing that recommends it, and the seat definitions that
-  open by telling a subagent to call it.
-
-What this file does NOT prove: that Claude Code honours the keys. That is not a claim
-about Jarvis's code and cannot be asserted from here — it was measured live against
-2.1.272 (see the PR body, and `jarvis learn` topic `worker environment`).
-"""
+"""Per-project wiring: which of the USER'S MCP servers (#164)"""
 
 from __future__ import annotations
 
@@ -33,7 +16,7 @@ SERENA = "serena@claude-plugins-official"
 
 @pytest.fixture(autouse=True)
 def not_a_worker(monkeypatch):
-    """`ops.set_config` refuses a worker session, and this suite is run by one."""
+    """`ops.set_config` refuses a worker session, and this suite is run by one"""
     monkeypatch.delenv("JARVIS_WO_ID", raising=False)
 
 
@@ -43,11 +26,10 @@ def _settings(project, w: WiringConfig, wo: dict | None = None) -> dict:
     return json.loads(out.read_text())
 
 
-# -- the default -----------------------------------------------------------------------
+# -- the default
 
 def test_the_shipped_default_wires_everything_and_writes_nothing(project, jarvis_home):
-    """The whole opt-out promise in one assertion: a project that never opens /config
-    launches the session it launched before this block existed."""
+    """The whole opt-out promise in one assertion: a project that never opens /config launches the session..."""
     settings = _settings(project, WiringConfig())
     for key in ("disableClaudeAiConnectors", "disableBundledSkills",
                 "enabledPlugins", "skillOverrides"):
@@ -59,14 +41,7 @@ def test_the_shipped_default_wires_everything_and_writes_nothing(project, jarvis
 def test_no_file_of_the_users_own_is_written_by_a_deselection(monkeypatch, tmp_path,
                                                               project, jarvis_home,
                                                               fake_claude, catalog_file):
-    """THE load-bearing constraint, pinned on the FILESYSTEM: the user's Claude
-    configuration is read to populate the list and never written, and neither is the
-    project's own `.claude/` tree, which belongs to the sessions they open themselves.
-
-    Snapshot-and-compare rather than an assertion on a return value, because the claim
-    is about absence: nothing an output contains can catch a write to a file the test
-    never looked at. The whole path runs between the two snapshots — discovery,
-    `ops.set_wiring`, and the dispatch seam that turns the result into a spawn."""
+    """THE load-bearing constraint, pinned on the FILESYSTEM: the user's Claude configuration is read to..."""
     home = tmp_path / "user-home"
     skill = home / ".claude" / "skills" / "note-taker"
     skill.mkdir(parents=True)
@@ -74,8 +49,7 @@ def test_no_file_of_the_users_own_is_written_by_a_deselection(monkeypatch, tmp_p
         "---\nname: note-taker\ndescription: takes notes\n---\nbody")
     (home / ".claude" / "settings.json").write_text(
         json.dumps({"enabledPlugins": {SERENA: True}}))
-    # The file `/mcp disable` would write `disabledMcpServers` into, which is why a
-    # hand-added server gets no button: that lever cannot be pulled from here.
+    # The file `/mcp disable` would write `disabledMcpServers` into
     (home / ".claude.json").write_text(json.dumps({"projects": {str(project): {}}}))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home / ".claude"))
     assert wiring.claude_home() == home / ".claude"
@@ -97,21 +71,20 @@ def test_no_file_of_the_users_own_is_written_by_a_deselection(monkeypatch, tmp_p
     monkeypatch.setattr(wiring, "read_mcp_servers",
                         lambda **k: [("plugin:serena:serena", "uvx")])
     inv = wiring.discover(refresh=True)
-    # Proof the snapshotted tree was READ, without which "unchanged" would be trivial.
+    # Proof the snapshotted tree was READ, without which "unchanged" would be trivial
     assert "note-taker" in {i.name for i in inv.items}
 
     ops.set_wiring(f"{wiring.LEVER_PLUGIN}{SERENA}", False, project="proj_a")
     w = ops.wiring_config("proj_a")
     assert w.disabled_plugins == (SERENA,)
-    # ...and it did take effect, so the comparison below is about a live deselection.
+    # ...and it did take effect, so the comparison below is about a live deselection
     assert _settings(project, w)["enabledPlugins"] == {SERENA: False}
 
     assert snapshot() == before
 
 
 def test_a_project_inherits_the_fleet_base_and_may_deselect_more(tmp_path):
-    """`os.wiring` is a base, not a default nobody can reach: the fleet answer holds
-    for a project that says nothing, field by field."""
+    """`os.wiring` is a base, not a default nobody can reach: the fleet answer holds for a project that..."""
     catalog = parse_catalog({
         "os": {"wiring": {"bundled_skills": False, "disabled_plugins": ["a@m"]}},
         "projects": [
@@ -124,8 +97,7 @@ def test_a_project_inherits_the_fleet_base_and_may_deselect_more(tmp_path):
     assert quiet.wiring.bundled_skills is False
     assert quiet.wiring.disabled_plugins == ("a@m",)
     assert quiet.wiring.claude_ai_connectors is True
-    # Field-level: `loud` names two fields and keeps the fleet's answer for the third,
-    # and its own list REPLACES rather than merges (ScheduleConfig.jobs' rule).
+    # Field-level: `loud` names two fields and keeps the fleet's answer for the third
     assert loud.wiring.claude_ai_connectors is False
     assert loud.wiring.bundled_skills is False
     assert loud.wiring.disabled_plugins == ("b@m",)
@@ -140,8 +112,7 @@ def test_a_list_that_is_not_a_list_is_refused_by_name(tmp_path):
 
 
 def test_an_id_naming_nothing_installed_is_inert_rather_than_fatal(tmp_path):
-    """A catalog is read by the daemon on a machine whose Claude configuration moves
-    under it. Uninstalling a deselected plugin must not take the fleet down."""
+    """A catalog is read by the daemon on a machine whose Claude configuration moves under it"""
     catalog = parse_catalog({"os": {}, "projects": [
         {"name": "p", "path": str(tmp_path),
          "wiring": {"disabled_plugins": ["never-installed@nowhere"]}},
@@ -149,7 +120,7 @@ def test_an_id_naming_nothing_installed_is_inert_rather_than_fatal(tmp_path):
     assert catalog.project("p").wiring.disabled_plugins == ("never-installed@nowhere",)
 
 
-# -- the patch that reaches a spawn -----------------------------------------------------
+# -- the patch that reaches a spawn
 
 @pytest.mark.parametrize("config,expected", [
     (WiringConfig(claude_ai_connectors=False), {"disableClaudeAiConnectors": True}),
@@ -168,8 +139,7 @@ def test_each_deselection_reaches_the_settings_file_as_its_own_key(
 
 def test_a_deselected_plugin_does_not_clobber_the_projects_own_overrides(project,
                                                                         jarvis_home):
-    """`enabledPlugins` is a dict, so the patch must merge into a project's
-    `settings_overrides` rather than replace the block."""
+    """`enabledPlugins` is a dict, so the patch must merge into a project's `settings_overrides` rather..."""
     spec = ProjectSpec(name="proj_a", path=project,
                        settings_overrides={"enabledPlugins": {"keep@m": True}},
                        wiring=WiringConfig(disabled_plugins=("drop@m",)))
@@ -178,15 +148,14 @@ def test_a_deselected_plugin_does_not_clobber_the_projects_own_overrides(project
                                                              "drop@m": False}
 
 
-# -- coherence: everywhere Serena is named ----------------------------------------------
+# -- coherence: everywhere Serena is named
 
 def test_unwiring_serena_takes_its_permission_rules_with_it(project, jarvis_home):
-    """The trap `dispatch.SERENA_READ_TOOLS` documents, seen from the other side: a
-    settings file that removes a server and grants its tools in the same breath."""
+    """The trap `dispatch.SERENA_READ_TOOLS` documents"""
     settings = _settings(project, WiringConfig(disabled_plugins=(SERENA,)))
     assert not set(serena_allow_rules()) & set(settings["permissions"]["allow"])
     assert settings["env"]["JARVIS_SERENA"] == "0"
-    # The rest of the permission block is untouched — this removes rules, not rights.
+    # The rest of the permission block is untouched — this removes rules, not rights
     assert any(r.startswith("Edit(") for r in settings["permissions"]["allow"])
 
 
@@ -200,9 +169,7 @@ def test_the_navigation_briefing_stops_recommending_a_server_that_was_removed():
 
 
 def test_jarvis_brief_navigation_agrees_with_the_dispatch_that_spawned_it(monkeypatch):
-    """The briefing is fetched by a SEPARATE process, so the answer travels as env —
-    `JARVIS_GATES`' pattern. Without this the worker is told to use what dispatch
-    just removed."""
+    """The briefing is fetched by a SEPARATE process, so the answer travels as env"""
     from jarvis import cli
 
     monkeypatch.setenv("JARVIS_SERENA", "0")
@@ -212,9 +179,7 @@ def test_jarvis_brief_navigation_agrees_with_the_dispatch_that_spawned_it(monkey
 
 
 def test_the_prompts_own_index_line_stops_advertising_it_too(project):
-    """`section_index` is in EVERY worker's opening prompt, so a stale "Serena first"
-    there is the same defect one layer earlier than the briefing it points at — the rule
-    the `gates` line already follows: never point at territory this project lacks."""
+    """`section_index` is in EVERY worker's opening prompt"""
     from jarvis.dispatch import build_worker_prompt
 
     spec = ProjectSpec(name="proj_a", path=project,
@@ -245,13 +210,12 @@ def test_the_seats_are_untouched_when_serena_is_wired(project, jarvis_home):
         assert "not wired for this project" not in text
 
 
-# -- feature orders: the planner and the manager go through the same seam ---------------
+# -- feature orders: the planner and the manager go through the same seam
 
 @pytest.mark.parametrize("kind", ["worker", "planner", "manager"])
 def test_every_kind_of_work_order_carries_the_projects_selection(project, jarvis_home,
                                                                  kind):
-    """The user named work orders AND feature orders. A feature order is a planner, a
-    manager and children — all of them spawn through `_write_worker_settings`."""
+    """The user named work orders AND feature orders"""
     settings = _settings(project, WiringConfig(claude_ai_connectors=False),
                          {"id": f"wo-{kind}", "title": "t", "kind": kind})
     assert settings["disableClaudeAiConnectors"] is True
@@ -267,14 +231,12 @@ def test_the_planners_prompt_does_not_recommend_an_unwired_serena(project):
     assert "activate_project" not in prompt
 
 
-# -- the levers, and the one place that decides what a lever writes ---------------------
+# -- the levers, and the one place that decides what a lever writes
 
 def test_a_lever_round_trips_through_the_catalog_without_a_reason(jarvis_home,
                                                                   fake_claude,
                                                                   catalog_file):
-    """Wiring is not a `SAFETY_KEYS` path: unwiring narrows what a worker can reach and
-    wiring back restores what the user's own configuration already says, so neither
-    demands the justification a permission change does (kn-64f4922c)."""
+    """Wiring is not a `SAFETY_KEYS` path: unwiring narrows what a worker can reach and wiring back..."""
     ops.start_os(str(catalog_file), foreground=True)
     ops.set_wiring(f"{wiring.LEVER_PLUGIN}{SERENA}", False, project="proj_a")
     assert ops.wiring_config("proj_a").disabled_plugins == (SERENA,)
@@ -290,15 +252,14 @@ def test_the_fleet_base_is_settable_from_the_same_lever(jarvis_home, fake_claude
     ops.start_os(str(catalog_file), foreground=True)
     ops.set_wiring(wiring.LEVER_CONNECTORS, False)
     assert ops.wiring_config().claude_ai_connectors is False
-    # A project that says nothing inherits it — that is what makes this a fleet answer.
+    # A project that says nothing inherits it — that is what makes this a fleet answer
     assert ops.wiring_config("proj_a").claude_ai_connectors is False
 
 
 def test_a_second_identical_deselection_writes_the_same_document(jarvis_home,
                                                                  fake_claude,
                                                                  catalog_file):
-    """The lists are sorted, so a deselection made twice is the same catalog and
-    therefore the same content-addressed config version."""
+    """The lists are sorted, so a deselection made twice is the same catalog and therefore the same..."""
     ops.start_os(str(catalog_file), foreground=True)
     first = ops.set_wiring(f"{wiring.LEVER_SKILL}b", False, project="proj_a")
     ops.set_wiring(f"{wiring.LEVER_SKILL}a", False, project="proj_a")
@@ -314,10 +275,10 @@ def test_an_unknown_lever_is_an_error_not_a_silent_write(jarvis_home, fake_claud
         ops.set_wiring("nonsense:x", False, project="proj_a")
 
 
-# -- reading the user's configuration ---------------------------------------------------
+# -- reading the user's configuration
 
 def test_a_server_name_maps_to_the_tool_prefix_claude_code_calls_it_under():
-    """Both spellings of one server, which is why `SERENA_TOOL_PREFIXES` has two."""
+    """Both spellings of one server, which is why `SERENA_TOOL_PREFIXES` has two"""
     assert wiring.tool_prefix("plugin:serena:serena") == "mcp__plugin_serena_serena__"
     assert wiring.tool_prefix("serena") == "mcp__serena__"
     assert wiring.tool_prefix("claude.ai Google Drive") == "mcp__claude_ai_Google_Drive__"
@@ -336,9 +297,7 @@ def test_the_mcp_listing_is_parsed_leniently(monkeypatch):
 
 
 def test_every_source_gets_the_lever_that_can_actually_unwire_it(monkeypatch, tmp_path):
-    """The page may only offer a control that exists. A claude.ai connector has no
-    per-server lever — `/mcp disable` writes the user's own config, which this feature
-    may not — so it gets the block's, and a server from neither source gets none."""
+    """The page may only offer a control that exists"""
     (tmp_path / "skills" / "mine").mkdir(parents=True)
     (tmp_path / "skills" / "mine" / "SKILL.md").write_text(
         "---\nname: mine\ndescription: a skill of my own\n---\nbody")
@@ -359,9 +318,9 @@ def test_every_source_gets_the_lever_that_can_actually_unwire_it(monkeypatch, tm
     assert levers["hand-added"] == ""
     assert levers["mine"] == f"{wiring.LEVER_SKILL}mine"
     assert levers["Claude Code's bundled skills"] == wiring.LEVER_BUNDLED
-    # A plugin the USER has turned off is not Jarvis's to list as wired.
+    # A plugin the USER has turned off is not Jarvis's to list as wired
     assert "off@m" not in levers
-    # Unwiring the plugin unwires the server it provides — one lever, both rows.
+    # Unwiring the plugin unwires the server it provides — one lever, both rows
     applied = wiring.applied(WiringConfig(disabled_plugins=(SERENA,)), inv)
     assert {i.name for i in applied.unwired} == {SERENA, "plugin:serena:serena"}
 

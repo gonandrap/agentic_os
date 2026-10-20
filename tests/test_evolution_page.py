@@ -1,19 +1,4 @@
-"""The dashboard's `/evolution` surface — §9 of
-docs/superpowers/specs/2026-09-27-self-evolution.md.
-
-`ops.evolution_report` computes every figure ONCE and both the CLI and this page render
-it verbatim. So the tests that matter here are not about arithmetic — there is none to
-check — they are about the two ways this page could still lie:
-
-* it could DERIVE a number of its own, and then disagree with `jarvis rules summary` about
-  the same registry (the hand-built-inconsistent-dict test below is the one that catches
-  that);
-* it could turn an ABSENT figure into a zero, which reads as a measurement nobody took.
-
-Plus the §9 hard requirement: it must render against an EMPTY registry, because
-`uilog.record_error` plus `INV-UI-HEALTHY` turn a 500 into an inbox item and an empty
-registry is what every install starts with.
-"""
+"""The dashboard's `/evolution` surface — §9 of docs/superpowers/specs/2026-09-27-self-evolution.md"""
 
 from __future__ import annotations
 
@@ -38,21 +23,12 @@ def client(jarvis_home, fake_claude, catalog_file, app):
 
 
 def body_of(html: str) -> str:
-    """Everything after `base.html`'s inline stylesheet.
-
-    The assertions below include `"0%" not in …`, and the stylesheet legitimately
-    carries `width: 100%` and `color-mix(… 10%, …)`. Scoping to the body keeps the
-    assertion about what the PAGE said rather than about the CSS.
-    """
+    """Everything after `base.html`'s inline stylesheet"""
     return html.split("</style>", 1)[-1]
 
 
 def report(**over) -> dict:
-    """A complete `evolution_report` dict with nothing in it, for monkeypatching.
-
-    Written out here rather than taken from a real registry so a test can state one
-    deliberately wrong figure and nothing else.
-    """
+    """A complete `evolution_report` dict with nothing in it, for monkeypatching"""
     base = {
         "window": {"days": 90, "since": 1.0, "until": 2.0,
                    "week_zone": "Europe/Madrid", "week_zone_note": None},
@@ -75,24 +51,19 @@ def report(**over) -> dict:
 
 
 def timeline_block(html: str) -> str:
-    """Just the timeline list — the region a links assertion may look at.
-
-    The nav is in the body too and is full of `href`s, so "this entry rendered no link"
-    can only be asserted against the entry's own markup.
-    """
+    """Just the timeline list — the region a links assertion may look at"""
     after = html.split('id="evolution-timeline"', 1)[-1]
     return after.split("</ul>", 1)[0]
 
 
-# -- the §9 requirement: an empty registry is the normal case ---------------------------
+# -- the §9 requirement: an empty registry is the normal case
 
 
 def test_the_fleet_page_renders_against_an_empty_registry(client):
     res = client.get("/evolution")
     assert res.status_code == 200
     body = body_of(res.text)
-    # Not a blank page: an install with no armed rule still has to say WHY there is no
-    # mechanical share, which is the whole content of the figure on day one.
+    # Not a blank page: an install with no armed rule still has to say WHY there is no mechanical share
     assert "no rule has been armed yet" in body
 
 
@@ -103,11 +74,7 @@ def test_the_project_page_renders_and_scopes_to_that_project(client):
 
 
 def test_an_install_with_an_investigation_and_no_armed_rule_shows_no_percent(client):
-    """The ordinary install, end to end: one investigation, nothing armed.
-
-    The denominator is 1, so a page fed a report that decided absence by the denominator
-    renders `0%` — a measurement nobody took.
-    """
+    """The ordinary install, end to end: one investigation, nothing armed"""
     from jarvis.project_store import ProjectStore
 
     project_store = ProjectStore(ops.registered_project_paths()["proj_a"])
@@ -125,28 +92,24 @@ def test_an_install_with_an_investigation_and_no_armed_rule_shows_no_percent(cli
 
 
 def test_an_unknown_project_is_a_404_and_not_an_empty_report(client):
-    """A page for a name that does not exist would read as a project the OS has learned
-    nothing about — a false negative about a project that is not there."""
+    """A page for a name that does not exist would read as a project the OS has learned nothing about"""
     res = client.get("/evolution/no_such_project")
 
     assert res.status_code == 404
 
 
 def test_the_days_parameter_narrows_the_window(client):
-    """`days` sizes the page's window the way `--days` sizes the CLI report's: 7 narrows
-    it to a week, and the page says so."""
+    """`days` sizes the page's window the way `--days` sizes the CLI report's: 7 narrows it to a week"""
     res = client.get("/evolution?days=7")
     assert res.status_code == 200
     assert "7 days" in body_of(res.text)
 
 
-# -- the page prints what the dict says and computes nothing ----------------------------
+# -- the page prints what the dict says and computes nothing
 
 
 def test_the_page_renders_the_dicts_share_and_recomputes_none_of_it(client, monkeypatch):
-    """THE spec-named test. The dict's `value` is 0.42 while its numerator over its
-    denominator is 7/100 — deliberately inconsistent, which a real report can never be.
-    A template doing its own arithmetic prints 7%; one rendering the dict prints 42%."""
+    """THE spec-named test"""
     monkeypatch.setattr(ops, "evolution_report", lambda *a, **k: report(
         mechanical_share={"value": 0.42, "note": None, "numerator": 7,
                           "denominator": 100, "series": [], "unreadable_projects": []}))
@@ -183,8 +146,7 @@ def test_a_rule_with_no_hit_rate_shows_the_note(client, monkeypatch):
 
 
 def test_a_timeline_entry_with_no_links_renders_no_link(client, monkeypatch):
-    """§9: a missing link is ABSENT, never a broken one. The links dict omits the keys
-    entirely, so the template may not index one."""
+    """§9: a missing link is ABSENT, never a broken one"""
     monkeypatch.setattr(ops, "evolution_report", lambda *a, **k: report(
         timeline=[{"ts": 1.0, "kind": "gap_class_first_seen", "id": "stuck_order",
                    "headline": "the OS recognised stuck_order for the first time",
@@ -224,12 +186,7 @@ def _delta_page(client, monkeypatch, delta: float) -> str:
 
 
 def test_a_negative_delta_renders_differently_from_a_positive_one(client, monkeypatch):
-    """The sign IS the finding: -3m is arming working, +3m is arming making it worse.
-
-    `fmt_dur` has no sign, so a page handing it the raw delta prints both as `3m` and
-    reverses half the rows it shows. `cli._print_rules_summary` prints the marker and the
-    magnitude; this page must print the same pair.
-    """
+    """The sign IS the finding: -3m is arming working, +3m is arming making it worse"""
     better = _delta_page(client, monkeypatch, -180.0)
     assert "-3m" in better
     assert "+3m" not in better
@@ -251,7 +208,7 @@ def test_a_weaker_half_with_no_side_names_no_side(client, monkeypatch):
 
 
 def test_no_recurrence_renders_the_sentence_and_no_verdict_counts(client, monkeypatch):
-    """Same condition as the CLI: an empty `rows` means no counts line at all."""
+    """Same condition as the CLI: an empty `rows` means no counts line at all"""
     monkeypatch.setattr(ops, "evolution_report", lambda *a, **k: report(
         recurrences={"rows": [],
                      "verdict_counts": {"missed": 0, "remedy_failed": 0,
@@ -286,7 +243,7 @@ def test_a_recurrence_row_brings_the_verdict_counts_back(client, monkeypatch):
     assert "counted here and kept out" in body
 
 
-# -- the navigation into it -------------------------------------------------------------
+# -- the navigation into it
 
 
 def test_the_nav_carries_the_link_and_marks_it_here(client):
@@ -302,13 +259,11 @@ def test_the_project_page_links_to_its_own_evolution_report(client):
     assert 'href="/evolution/proj_a"' in body
 
 
-# -- read-only, by the work order's scope boundary --------------------------------------
+# -- read-only, by the work order's scope boundary
 
 
 def test_nothing_under_evolution_accepts_a_post(app):
-    """The scope boundary says no arming and no rule editing from the page, so the
-    absence of a mutating route is a test and not a convention. `jarvis rules retract`
-    stays the only way to retract."""
+    """The scope boundary says no arming and no rule editing from the page"""
     offenders = [(r.path, sorted(r.methods)) for r in app.routes
                  if getattr(r, "path", "").startswith("/evolution")
                  and "POST" in getattr(r, "methods", set())]

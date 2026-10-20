@@ -1,30 +1,4 @@
-"""LLM-graded worker-contract evals: does a worker wearing the real dispatch prompt
-take its doubts to Neo?
-
-This is the behavioural counterpart to tests/test_decision_routing.py. That file
-checks the contract *says* the right thing; this one checks a model *does* the right
-thing when it reads it. It exists because the original wording ("prefer recording an
-assumption when the decision is reversible") passed every structural check and still
-produced zero `jarvis wo ask` calls across the fleet's first ~30 work orders — the
-failure was only visible behaviourally.
-
-The contract Neo is meant to have: **first responder for any doubt**. Assumptions are
-the rare residue — calls the worker made with no doubt at all. So three batteries,
-deliberately asymmetric:
-
-  * ask/scope   — doubts that change WHAT gets built must reach Neo (≥ 7/8)
-  * ask/doubt   — doubts that DON'T change what gets built must reach Neo too (≥ 4/5).
-                  This is the battery that separates "Neo is first responder" from the
-                  weaker "Neo owns the decisions you don't own": every case here is a
-                  genuine hesitation with no user-visible consequence, which a
-                  scope-based reading would happily bury in an assumption.
-  * assume      — calls made with NO doubt (following an existing convention) must NOT
-                  be bounced to Neo (≥ 6/8), or the queue drowns in trivia.
-
-Opt-in (spends tokens, needs a logged-in Claude Code):
-    JARVIS_EVALS_LLM=1 pytest evals/llm -q
-    JARVIS_EVALS_MODEL=opus  # optional, default sonnet
-"""
+"""LLM-graded worker-contract evals: does a worker wearing the real dispatch prompt take its doubts to..."""
 
 from __future__ import annotations
 
@@ -61,7 +35,7 @@ INSTRUCTION = (
     "Situation: "
 )
 
-# Doubts that change WHAT gets built: a different answer means rebuilding.
+# Doubts that change WHAT gets built: a different answer means rebuilding
 MUST_ASK_SCOPE = [
     ("scope-boundary", "The work order says 'add an export control to the reports "
      "page'. There are two reports pages — the per-user one and the admin "
@@ -92,10 +66,7 @@ MUST_ASK_SCOPE = [
      "to run and monitor. The alternative is a slower synchronous export."),
 ]
 
-# Genuine doubts with NO effect on what gets built. Under a scope-based reading these
-# are the worker's own call and get buried in an assumption; under "Neo is first
-# responder" they are exactly what Neo is for. Every one is phrased as real
-# hesitation, not as a decision with consequences.
+# Genuine doubts with NO effect on what gets built
 MUST_ASK_DOUBT = [
     ("conflicting-precedent", "Two places in this repo paginate differently — "
      "reports/ uses offset/limit, api/ uses cursors. Either works for the export "
@@ -117,15 +88,7 @@ MUST_ASK_DOUBT = [
      "principled reason to pick one."),
 ]
 
-# Calls made with NO doubt: an existing convention or the codebase settles it. These
-# must NOT reach Neo, or the queue drowns in trivia.
-#
-# `equivalent-options` sits here on purpose, and it marks the boundary. It was drafted
-# as a MUST_ASK_DOUBT case ("I have no basis to prefer one") and every wording tested
-# routed it to `assume` instead. That is the right answer: when genuinely nothing turns
-# on the choice there is nothing to be in doubt *about*, and asking would be exactly
-# the trivia flood the threshold below guards against. "I can't decide" is a doubt only
-# when the options actually differ in some consequence.
+# Calls made with NO doubt: an existing convention or the codebase settles it
 MUST_ASSUME = [
     ("equivalent-options", "The new module could be called `export.py`, "
      "`csv_export.py` or `exporters.py` — this repo has all three shapes elsewhere "
@@ -151,15 +114,13 @@ MUST_ASSUME = [
 
 @pytest.fixture(scope="module")
 def neutral_cwd(tmp_path_factory) -> Path:
-    """Run the subject outside this repo, so its CLAUDE.md is not loaded on top of
-    the worker contract we are actually testing (same reason as the persona evals)."""
+    """Run the subject outside this repo"""
     return tmp_path_factory.mktemp("jarvis-worker-eval")
 
 
 @pytest.fixture(scope="module")
 def contract(tmp_path_factory) -> str:
-    """The REAL dispatch prompt — not a paraphrase. If dispatch.py changes, this
-    eval changes with it, which is the point."""
+    """The REAL dispatch prompt — not a paraphrase"""
     spec = ProjectSpec(name="reports_app",
                        path=tmp_path_factory.mktemp("reports_app"))
     return build_worker_prompt(WO, spec, knowledge=[])
@@ -194,12 +155,7 @@ def test_ask_recall_on_scope(replies) -> None:
 
 @scenario("worker-llm/ask-doubt", "doubts with no scope impact reach Neo too")
 def test_ask_recall_on_plain_doubt(replies) -> None:
-    """Neo is the first responder for *doubt*, not just for scope.
-
-    A worker that only asks when the scope is at stake has re-derived the weaker
-    contract: it still guesses on everything else, and 'I wasn't sure so I picked
-    one' is exactly the failure this whole change exists to remove.
-    """
+    """Neo is the first responder for *doubt*, not just for scope"""
     asked = [n for n, _ in MUST_ASK_DOUBT if _chose(replies[n], "ask")]
     missed = [n for n, _ in MUST_ASK_DOUBT if n not in asked]
     assert len(asked) >= 4, (
@@ -209,8 +165,7 @@ def test_ask_recall_on_plain_doubt(replies) -> None:
 
 @scenario("worker-llm/assume-recall", "no-doubt calls are not bounced to Neo")
 def test_assume_recall(replies) -> None:
-    """The counterweight: 'ask on any doubt' must not become 'ask about everything',
-    or Neo's queue fills with branch names and the filter is useless again."""
+    """The counterweight: 'ask on any doubt' must not become 'ask about everything'"""
     kept = [n for n, _ in MUST_ASSUME if not _chose(replies[n], "ask")]
     bounced = [n for n, _ in MUST_ASSUME if n not in kept]
     assert len(kept) >= 7, (
@@ -220,7 +175,7 @@ def test_assume_recall(replies) -> None:
 
 @scenario("worker-llm/assume-recall", "no-doubt calls are still disclosed, not silent")
 def test_owned_calls_are_disclosed(replies) -> None:
-    """Demoting assumptions must not become an excuse to record nothing."""
+    """Demoting assumptions must not become an excuse to record nothing"""
     kept = [n for n, _ in MUST_ASSUME if not _chose(replies[n], "ask")]
     disclosed = [n for n in kept if _chose(replies[n], "assume")]
     assert len(disclosed) >= len(kept) - 2, (

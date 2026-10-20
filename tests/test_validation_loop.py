@@ -1,16 +1,4 @@
-"""The work-order round machine: `finish` opens a round, the daemon judges it off the
-tick thread, the reconciler keeps its hands off.
-
-THE VALIDATOR IS INJECTED. This work order builds the loop and defines the seam; the
-panel that fills it is a later one, so every test here hands `Daemon.validator` a fake
-callable and asserts on STORED ROWS AND CALL COUNTS. That discipline is not stylistic:
-validation ships disabled, and a test that reaches this code through the daemon without
-enabling it exercises the OLD path and still gets a perfectly good ending. "A verdict
-came back" proves nothing about which machine produced it.
-
-Most tests here are PAIRS for the same reason. "It did not escalate" and "the reconciler
-did nothing this tick" are the same observation unless something beside it moved.
-"""
+"""The work-order round machine: `finish` opens a round"""
 
 from __future__ import annotations
 
@@ -32,16 +20,11 @@ from jarvis.project_store import VALIDATOR_SEATS, ProjectStore
 from jarvis.testing import make_git_project
 
 
-# -- the fixture: a real repository, a real worktree, a fake panel --------------------
+# -- the fixture: a real repository, a real worktree, a fake panel
 
 
 def _git(cwd: Path, *args: str, env_extra: dict[str, str] | None = None) -> str:
-    """git with a pinned identity and no user or system config in sight.
-
-    `env_extra` is for the few tests that have to place a commit or a tag at a specific
-    MOMENT (`GIT_COMMITTER_DATE`), since the env here is built from scratch rather than
-    inherited.
-    """
+    """git with a pinned identity and no user or system config in sight"""
     env = {"HOME": str(cwd), "PATH": os.environ.get("PATH", ""),
            "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
@@ -52,13 +35,7 @@ def _git(cwd: Path, *args: str, env_extra: dict[str, str] | None = None) -> str:
 
 
 class Validator:
-    """The injected seam, driven by the test.
-
-    Records every entry — the call count is what most of these tests actually assert —
-    and answers with the queued outcomes in order, repeating the last one for ever
-    after. An outcome that is an exception is raised instead of returned, which is how
-    a transport outage is staged.
-    """
+    """The injected seam, driven by the test"""
 
     def __init__(self, *outcomes):
         self.outcomes = list(outcomes) or [passed()]
@@ -73,8 +50,7 @@ class Validator:
                            "fingerprint": round_row["fingerprint"]})
         self.stores.append(store)
         self.entered.set()
-        # A round is up to five headless calls; holding here is what lets a test watch
-        # the tick thread carry on without it.
+        # A round is up to five headless calls
         assert self.release.wait(timeout=15), "a blocked validator was never released"
         outcome = (self.outcomes.pop(0) if len(self.outcomes) > 1
                    else self.outcomes[0])
@@ -96,7 +72,7 @@ def rejected(reason: str = "the tests do not touch the change") -> dict:
 
 
 def _seats(verdict: str) -> list[dict]:
-    """What a panel hands back per seat — named, so the opinions are real rows."""
+    """What a panel hands back per seat — named, so the opinions are real rows"""
     return [{"seat": seat, "status": "ok", "verdict": verdict, "model": "sonnet",
              "latency_ms": 12,
              "reply": f"the {seat} seat says: {verdict} — no test covers the change"}
@@ -104,7 +80,7 @@ def _seats(verdict: str) -> list[dict]:
 
 
 class Fleet:
-    """One booted OS, plus the git plumbing these tests need."""
+    """One booted OS, plus the git plumbing these tests need"""
 
     def __init__(self, tmp_path, project, catalog_path):
         self.tmp_path = tmp_path
@@ -112,13 +88,9 @@ class Fleet:
         self.catalog_path = catalog_path
         self.daemon = Daemon(load_catalog(catalog_path))
 
-    # -- configuration ---------------------------------------------------------
+    # -- configuration
     def reconfigure(self, project_validation: dict | None = None, **validation) -> None:
-        """Rewrite the catalog on disk AND reload the daemon's copy.
-
-        Both halves matter: `ops.finish` reads the catalog from disk (it runs in the
-        worker's process, not the daemon's), and the daemon reads its own loaded copy.
-        """
+        """Rewrite the catalog on disk AND reload the daemon's copy"""
         write_catalog(self.tmp_path, self.project,
                       project_validation=project_validation, **validation)
         self.daemon.catalog = load_catalog(self.catalog_path)
@@ -130,9 +102,9 @@ class Fleet:
     def store(self) -> ProjectStore:
         return ProjectStore(self.project)
 
-    # -- work orders -----------------------------------------------------------
+    # -- work orders
     def dispatch(self, title: str = "task", **kw) -> dict:
-        """Create a work order and give it a session, the way a real one gets one."""
+        """Create a work order and give it a session, the way a real one gets one"""
         wo = ops.create_work_order("proj_a", title, **kw)
         self.daemon.tick()
         store = self.store()
@@ -143,9 +115,7 @@ class Fleet:
         return wo
 
     def worktree(self, wo_id: str) -> Path:
-        """The worktree the real `claude --worktree` would have cut. The fake CLI does
-        not, so the tests do it themselves — with real git, because the evidence
-        collector is a reading of what git says."""
+        """The worktree the real `claude --worktree` would have cut"""
         path = self.project / ".claude" / "worktrees" / wo_id
         if not path.is_dir():
             _git(self.project, "worktree", "add", "-q", "-b", f"b-{wo_id}",
@@ -153,20 +123,20 @@ class Fleet:
         return path
 
     def change(self, wo_id: str, text: str, name: str = "app.py") -> Path:
-        """A committed change in the work order's worktree — evidence to judge."""
+        """A committed change in the work order's worktree — evidence to judge"""
         tree = self.worktree(wo_id)
         (tree / name).write_text(text)
         _git(tree, "add", "-A")
         _git(tree, "commit", "-qm", f"work {len(text)}")
         return tree
 
-    # -- the daemon ------------------------------------------------------------
+    # -- the daemon
     def tick(self) -> None:
         self.daemon.tick_count = 0
         self.daemon.tick()
 
     def drain(self, timeout: float = 15.0) -> None:
-        """One tick, then wait for whatever it started off-thread to finish."""
+        """One tick, then wait for whatever it started off-thread to finish"""
         self.tick()
         deadline = time.monotonic() + timeout
         while self.daemon.validating and time.monotonic() < deadline:
@@ -175,7 +145,7 @@ class Fleet:
 
 
 def _settle(store: ProjectStore, wo_id: str, timeout: float = 15.0) -> bool:
-    """Wait for this work order's turn to end — a turn is a detached process."""
+    """Wait for this work order's turn to end — a turn is a detached process"""
     from jarvis import worker_session
 
     deadline = time.monotonic() + timeout
@@ -208,13 +178,7 @@ def write_catalog(tmp_path: Path, project: Path,
 
 @pytest.fixture()
 def fleet(tmp_path, jarvis_home, fake_claude, claude_json):
-    """A booted OS over a REAL git repository, with validation enabled.
-
-    The repository is real and its default branch is named explicitly: the collector
-    resolves the merge base through a ladder that ends at `main`, and a repo whose
-    `git init` happened to name the branch something else would collect an empty diff
-    and make every escalation test pass for the wrong reason.
-    """
+    """A booted OS over a REAL git repository, with validation enabled"""
     project = make_git_project(tmp_path, "proj_a")
     _git(project, "symbolic-ref", "HEAD", "refs/heads/main")
     _git(project, "add", "-A")
@@ -225,28 +189,19 @@ def fleet(tmp_path, jarvis_home, fake_claude, claude_json):
     return Fleet(tmp_path, project, catalog_path)
 
 
-#: "give this work order a pull request of its own", as distinct from `None`, which is
-#: the tests that are ABOUT finishing without one.
+#: "give this work order a pull request of its own"
 AUTO_PR = "<auto>"
 
 
 def finish(fleet: Fleet, wo_id: str, summary: str = "done", pr: str | None = AUTO_PR,
            evidence: str = "ran `pytest -q`: 412 passed") -> dict:
-    """Finish the way a worker that produced code now has to: behind a pull request.
-
-    The default became a URL when GitHub issue #232 shipped. `Fleet.change` COMMITS to
-    the work order's branch — that is the whole point, the panel needs a diff to judge —
-    and a work order that settles over commits no pull request covers is the defect that
-    issue is about, so `ops.finish` refuses it. That refusal is not what any test in this
-    file is about; every one of them is about the round machine, and the pull request is
-    scenery. `pr=None` is still there for the tests that ARE about the two endings.
-    """
+    """Finish the way a worker that produced code now has to: behind a pull request (#232)"""
     if pr == AUTO_PR:
         pr = f"https://github.com/x/y/pull/{int(wo_id[-4:], 16) % 900 + 100}"
     return ops.finish(wo_id, summary, pr_url=pr, evidence=evidence)
 
 
-# -- submission ----------------------------------------------------------------------
+# -- submission
 
 
 def test_finish_opens_round_one_and_parks_the_work_order_in_validating(fleet):
@@ -266,7 +221,7 @@ def test_finish_opens_round_one_and_parks_the_work_order_in_validating(fleet):
         assert rounds[0]["evidence"] == "ran `pytest -q`: 412 passed"
         fresh = store.get_work_order(wo["id"])
         assert fresh["status"] == "validating"
-        # `validating` is the system working, not a decision anyone owes.
+        # `validating` is the system working, not a decision anyone owes
         assert fresh["needs_attention"] == 0
         assert [e["kind"] for e in store.list_events(wo["id"])].count(
             "validation_submitted") == 1
@@ -275,9 +230,7 @@ def test_finish_opens_round_one_and_parks_the_work_order_in_validating(fleet):
 
 
 def test_a_worker_that_omits_evidence_still_finishes(fleet):
-    """`--evidence` is optional on purpose: every worker in flight across the release
-    that adds the flag predates it, and an empty declaration is an ordinary submission
-    rather than a thin one."""
+    """`--evidence` is optional on purpose: every worker in flight across the release that adds the flag..."""
     wo = fleet.dispatch()
     fleet.change(wo["id"], "print('one')\n")
 
@@ -296,19 +249,11 @@ def test_a_worker_that_omits_evidence_still_finishes(fleet):
         store.close()
 
 
-# -- the reconciler stands back ------------------------------------------------------
+# -- the reconciler stands back
 
 
 def test_the_reconciler_does_not_settle_a_validating_work_order(fleet):
-    """THE SHARPEST TRAP IN THE FEATURE, and it needs the pairing.
-
-    `settle_work_order` re-derives the outcome from the latest turn on EVERY tick: a
-    done turn with a `result_summary` and a `pr_url` means `waiting_pr_merge`, no
-    questions asked. The second work order below is that same row in every respect
-    except that it is not validating, and it takes exactly that path on the same tick —
-    without it, "still validating" is indistinguishable from "the reconciler did nothing
-    this tick".
-    """
+    """THE SHARPEST TRAP IN THE FEATURE, and it needs the pairing"""
     held = Validator(passed())
     held.block()  # the round stays open across both ticks
     fleet.daemon.validator = held
@@ -320,7 +265,7 @@ def test_the_reconciler_does_not_settle_a_validating_work_order(fleet):
     loose = fleet.dispatch("loose")
     store = fleet.store()
     try:
-        # The same row, minus the round: finished, with a pull request, still `running`.
+        # The same row, minus the round: finished, with a pull request, still `running`
         store.update_work_order(loose["id"], result_summary="done",
                                 pr_url="https://github.com/x/y/pull/2")
 
@@ -331,10 +276,7 @@ def test_the_reconciler_does_not_settle_a_validating_work_order(fleet):
         assert store.get_work_order(guarded["id"])["status"] == "validating"
         assert store.get_work_order(loose["id"])["status"] == "waiting_pr_merge"
 
-        # And handed in directly, because the status filter in `settle_turns` is only
-        # the FIRST guard. The early return is the second, and it is the one that holds
-        # the day a caller passes a validating work order in — which is precisely how
-        # this bug would come back.
+        # And handed in directly, because the status filter in `settle_turns` is only the FIRST guard
         fleet.daemon.settle_work_order(fleet.spec, store,
                                        store.get_work_order(guarded["id"]))
         assert store.get_work_order(guarded["id"])["status"] == "validating"
@@ -345,17 +287,7 @@ def test_the_reconciler_does_not_settle_a_validating_work_order(fleet):
 
 def test_a_validating_work_order_is_polled_and_keeps_its_pull_request(
         fleet, fake_gh):
-    """A validating work order IS polled, and the poll leaves it exactly where it is
-    while the pull request is still open.
-
-    IT USED TO BE EXEMPT, on the rule that keeps `running` and `dispatching` out: leave
-    the statuses something else owns alone. `validating` is owned by the round machine
-    rather than by a worker typing, so nothing is writing to the branch — and since
-    `ops.rejudge_moved_head` the order can sit there for the length of a round while the
-    user merges the pull request by hand. `Daemon.PR_POLL_STATUSES` carries that
-    argument. Asserted here as the two halves that must both hold: the poll RUNS, and it
-    changes nothing on its own.
-    """
+    """A validating work order IS polled"""
     held = Validator(passed())
     held.block()
     fleet.daemon.validator = held
@@ -367,9 +299,7 @@ def test_a_validating_work_order_is_polled_and_keeps_its_pull_request(
 
     store = fleet.store()
     try:
-        # Measured as "a NEW gh call", not "any gh call at all": the evidence collector
-        # reads the pull request itself (spec 2026-09-12 §3), so `finish` above has
-        # already made one and this must not be counting that.
+        # Measured as "a NEW gh call", not "any gh call at all": the evidence collector reads the pull...
         before = len(fake_gh.calls)
         fleet.daemon.poll_pull_requests(fleet.spec, store)
         assert fake_gh.calls[before:], "a validating work order went unpolled"
@@ -383,8 +313,7 @@ def test_a_validating_work_order_is_polled_and_keeps_its_pull_request(
 
 
 def test_wo_done_closes_a_validating_work_order(fleet):
-    """The user's escape hatch has to work from inside a review, or a wedged validation
-    is a support incident with no way out."""
+    """The user's escape hatch has to work from inside a review"""
     held = Validator(passed())
     held.block()
     fleet.daemon.validator = held
@@ -404,19 +333,11 @@ def test_wo_done_closes_a_validating_work_order(fleet):
         store.close()
 
 
-# -- off the tick thread -------------------------------------------------------------
+# -- off the tick thread
 
 
 def test_the_validator_runs_off_the_tick_thread_with_its_own_store(fleet):
-    """Five seats at a 300-second timeout would freeze every project in the catalog if
-    they ran inline, so the tick must return while the round is still in flight.
-
-    AND the pool thread must open its OWN store: `db.connect` does not pass
-    `check_same_thread=False`, so a round that reused the daemon's connection would
-    raise `ProgrammingError` on its first write. Adding that flag would silently stop
-    this proving anything — the identity assertion below is what keeps the rule
-    readable after it stopped being enforced by an exception.
-    """
+    """Five seats at a 300-second timeout would freeze every project in the catalog if they ran inline"""
     held = Validator(passed())
     held.block()
     fleet.daemon.validator = held
@@ -462,9 +383,7 @@ def test_a_second_tick_does_not_start_a_second_validation(fleet):
 
 
 def test_the_round_row_exists_before_the_validator_starts(fleet):
-    """Opened on the submitting thread, before anything fans out, so a crash
-    mid-validation leaves a `pending` round something can later find rather than a work
-    order sitting in `validating` with no trace of why."""
+    """Opened on the submitting thread"""
     seen: dict = {}
     wo = fleet.dispatch()
     fleet.change(wo["id"], "print('one')\n")
@@ -481,18 +400,11 @@ def test_the_round_row_exists_before_the_validator_starts(fleet):
     assert seen["rows"][0]["outcome"] == "pending", "the round was open while judged"
 
 
-# -- a pass ---------------------------------------------------------------------------
+# -- a pass
 
 
 def test_a_pass_settles_exactly_where_finish_would(fleet):
-    """`waiting_pr_merge` with a pull request, `completed` without one — the same two
-    endings `ops.finish` reaches with validation switched off, reached by the same
-    function so they cannot drift.
-
-    The no-pull-request arm ABANDONS, and that is the point rather than a workaround: a
-    work order that produced a diff and completes without a pull request is GitHub issue
-    #232's whole finding, and the only honest route to that ending is now saying so. The
-    ending itself is unchanged, which is what this test is for."""
+    """`waiting_pr_merge` with a pull request, `completed` without one (#232)"""
     fleet.daemon.validator = Validator(passed())
 
     with_pr = fleet.dispatch("with pr")
@@ -521,9 +433,7 @@ def test_a_pass_settles_exactly_where_finish_would(fleet):
 
 
 def test_a_backlog_backed_work_order_closes_its_item_once_validation_passes(fleet):
-    """The trap `ops.finish` carries: it closes the backlog item only when the resulting
-    status is `completed`, so routing through `validating` would silently stop backlog
-    items closing at all."""
+    """The trap `ops.finish` carries: it closes the backlog item only when the resulting status is..."""
     central = CentralStore()
     try:
         item = central.add_backlog("proj_a", "the thing", "details")
@@ -539,11 +449,7 @@ def test_a_backlog_backed_work_order_closes_its_item_once_validation_passes(flee
     fleet.change(wo["id"], "print('one')\n")
     fleet.daemon.validator = Validator(passed())
 
-    # Abandoned rather than behind a pull request, because the backlog item closes on
-    # the `completed` branch of `land_finished` and nowhere else — a work order parked
-    # in `waiting_pr_merge` closes its item when the merge lands, which is a different
-    # test. See `test_a_pass_settles_exactly_where_finish_would` for why that ending now
-    # has to be asked for out loud (GitHub issue #232).
+    # Abandoned rather than behind a pull request (#232)
     ops.finish(wo["id"], "done", evidence="ran the tests",
                abandon="spiked; the approach does not work")
     central = CentralStore()
@@ -556,7 +462,7 @@ def test_a_backlog_backed_work_order_closes_its_item_once_validation_passes(flee
         central.close()
 
 
-# -- a rejection ----------------------------------------------------------------------
+# -- a rejection
 
 
 def _reject_one(fleet, title: str = "task", **kw) -> tuple[dict, Validator]:
@@ -570,14 +476,7 @@ def _reject_one(fleet, title: str = "task", **kw) -> tuple[dict, Validator]:
 
 
 def test_a_rejection_reaches_the_worker_as_ordinary_review_feedback(fleet):
-    """AND ONLY VIA THE BUS, AND SAYING NOTHING ABOUT WHO JUDGED IT.
-
-    The implementing side is never told a panel exists — principle 3 of the design: each
-    judging entity sees input and produces output and knows nothing else. That is a
-    "this must not appear" assertion, which is worthless alone, so it is paired in this
-    same test with the place the seats DO appear: the `validation_opinions` rows, which
-    name every seat and carry its reply verbatim.
-    """
+    """AND ONLY VIA THE BUS, AND SAYING NOTHING ABOUT WHO JUDGED IT"""
     wo, _ = _reject_one(fleet)
     store = fleet.store()
     try:
@@ -588,8 +487,7 @@ def test_a_rejection_reaches_the_worker_as_ordinary_review_feedback(fleet):
         assert envelopes[0]["kind"] == "review_feedback"
 
         fleet.tick()  # the router delivers it; the worker's next turn goes out
-        # `list_messages` carries both directions; the worker's own final output is
-        # the other one. Only what was sent INTO the session is under test here.
+        # `list_messages` carries both directions; the worker's own final output is the other one
         texts = [m["content"] for m in store.list_messages(wo["id"])
                  if m["direction"] == "user_to_agent"]
         assert len(texts) == 1
@@ -601,7 +499,7 @@ def test_a_rejection_reaches_the_worker_as_ordinary_review_feedback(fleet):
             assert forbidden.lower() not in text.lower(), (
                 f"the worker was told about {forbidden}")
 
-        # …and here is where the seats DO live, for the same round.
+        # …and here is where the seats DO live, for the same round
         round_row = store.latest_validation_round(wo_id=wo["id"])
         opinions = store.validation_opinions(round_row["id"])
         assert {o["seat"] for o in opinions} == {"tester", "security"}
@@ -616,10 +514,7 @@ def test_a_rejection_reaches_the_worker_as_ordinary_review_feedback(fleet):
 
 
 def test_the_round_machine_never_queues_a_message_itself(fleet, monkeypatch):
-    """What pins the decoupling: with `queue_message` booby-trapped, a rejection must
-    still post its envelope. The round machine names a ROLE and forgets — it does not
-    know a work order is on the other end, and the day the recipient is a feature
-    order's manager instead, nothing here changes."""
+    """What pins the decoupling: with `queue_message` booby-trapped"""
     fleet.daemon.validator = Validator(rejected())
     wo = fleet.dispatch()
     fleet.change(wo["id"], "print('one')\n")
@@ -628,8 +523,7 @@ def test_the_round_machine_never_queues_a_message_itself(fleet, monkeypatch):
     def boom(*a, **kw):
         raise AssertionError("the round machine queued a message directly")
 
-    # Armed only around the round itself: reaping a worker turn records the worker's own
-    # final reply through the same method, and trapping that would prove nothing.
+    # Armed only around the round itself: reaping a worker turn records the worker's own final reply...
     monkeypatch.setattr(ProjectStore, "queue_message", boom)
     fleet.drain()
 
@@ -662,14 +556,7 @@ def test_a_resubmission_opens_round_two(fleet):
 
 
 def test_round_two_reads_round_one_and_round_one_reads_nothing(fleet):
-    """THE OLD REPLY SHAPE, which is most of production: every opinion stored before this
-    feature is prose, and an injected validator writes prose too. `validation.findings`
-    parses no finding out of one, so the entry falls back to the ROUND ROW's own outcome
-    and reason — which is what the submitter was actually told, and the whole of what a
-    later seat needs in order not to re-litigate it.
-
-    Every positive is paired with the same string being absent from round 1, or "round 2
-    has history" and "the renderer always emits history" are one observation."""
+    """THE OLD REPLY SHAPE, which is most of production: every opinion stored before this feature is..."""
     wo, validator = _reject_one(fleet)
     fleet.tick()  # deliver the feedback, so the work order is running again
 
@@ -679,9 +566,7 @@ def test_round_two_reads_round_one_and_round_one_reads_nothing(fleet):
 
     store = fleet.store()
     try:
-        # FIRST, so that a failure here names its cause: an identical resubmission is
-        # escalated on its fingerprint before the validator is ever called, and the
-        # assertions below would then fail as an IndexError about nothing.
+        # FIRST, so that a failure here names its cause: an identical resubmission is escalated on its...
         assert [r["round"] for r in store.validation_rounds(wo_id=wo["id"])] == [1, 2]
     finally:
         store.close()
@@ -704,21 +589,14 @@ def test_round_two_reads_round_one_and_round_one_reads_nothing(fleet):
         "renderer putting words in a seat's mouth")
 
 
-#: What the fake `claude` answers to each token, so an assertion can name the string it
-#: is about. Read off `testing.FAKE_CLAUDE`'s validation branch rather than restated: a
-#: fixture that drifted from it would make the follow-up assertions below vacuous.
+#: What the fake `claude` answers to each token, so an assertion can name the string it is about
 BLOCKER_DETAIL = "what the tester seat would stop this over"
 FOLLOW_UP_TITLE = "the architect follow-up"
 FOLLOW_UP_DETAIL = "what the architect seat would file rather than argue"
 
 
 def _panel_round(fleet, wo_id: str, code: str, summary: str) -> None:
-    """One round judged by the REAL panel over the fake `claude` — no injected validator,
-    because this test is about what the seats and the chair were actually handed.
-
-    The FORCE tokens ride in `summary`, never in the work order's description: a
-    description is carried into every later round's packet and would re-fire in round 2.
-    """
+    """One round judged by the REAL panel over the fake `claude`"""
     fleet.change(wo_id, code)
     finish(fleet, wo_id, summary=summary)
     fleet.drain()
@@ -726,21 +604,9 @@ def _panel_round(fleet, wo_id: str, code: str, summary: str) -> None:
 
 def test_a_prior_blocker_reaches_round_two_and_a_prior_follow_up_reaches_nobody(
         fleet, fake_claude):
-    """THE PIN §5.2.1 EXISTS FOR. `_run_chair` hands the chair the same shared prefix the
-    four seats read, so a follow-up rendered into the packet is a follow-up in front of
-    the chair — sitting directly above the line telling it those remarks are not before
-    it, in exactly the rounds where the failure this feature fixes lives.
-
-    So the assertions below sweep EVERY seat call of round 2, the chair's among them, and
-    read the prefix each was actually handed — `system_prompt_seen`, resolved through the
-    file `claude_cli` writes it to. Checking only the chair's own USER prompt would report
-    green on exactly the leak this is about, because the leak is in the system half.
-    """
+    """THE PIN §5.2.1 EXISTS FOR"""
     wo = fleet.dispatch()
-    # TWO SEATS RATHER THAN ONE raising both, because the fake's FORCE branches are
-    # mutually exclusive per seat and that file is not this work order's to edit. The
-    # property is unaffected: the packet has no seat dimension — `history` carries no
-    # seat at all — so which seat a finding came from cannot change what is rendered.
+    # TWO SEATS RATHER THAN ONE raising both
     _panel_round(fleet, wo["id"], "print('one')\n",
                  "FORCE_BLOCK_TESTER FORCE_FOLLOWUP_ARCHITECT")
     fleet.tick()  # deliver the rejection
@@ -753,8 +619,7 @@ def test_a_prior_blocker_reaches_round_two_and_a_prior_follow_up_reaches_nobody(
         rounds = store.validation_rounds(wo_id=wo["id"])
         assert [r["round"] for r in rounds] == [1, 2]
         assert rounds[0]["outcome"] == "rejected"
-        # Vacuous unless round 1 really raised one of each: the two assertions
-        # below are about strings, and a round that raised nothing has none.
+        # Vacuous unless round 1 really raised one of each: the two assertions below are about strings
         replies = "".join(str(o["reply"])
                           for o in store.validation_opinions(int(rounds[0]["id"])))
         assert BLOCKER_DETAIL in replies and FOLLOW_UP_DETAIL in replies
@@ -778,13 +643,7 @@ def test_a_prior_blocker_reaches_round_two_and_a_prior_follow_up_reaches_nobody(
 
 
 def test_history_lists_only_the_rounds_the_budget_counted(tmp_path):
-    """A `failed` round is an outage or a panel that was never wired in, so its stored
-    reason is about the OS and not about the code, and a `pending` one has no outcome at
-    all. Either rendered under "these points were raised in earlier rounds" would tell
-    five seats something false about the submission.
-
-    Paired with the counted round beside it, or "the builder returns nothing" passes.
-    """
+    """A `failed` round is an outage or a panel that was never wired in"""
     store = ProjectStore(tmp_path / "proj")
     try:
         wo_id = store.create_work_order("task")["id"]
@@ -809,22 +668,17 @@ def test_history_lists_only_the_rounds_the_budget_counted(tmp_path):
         assert history[0]["reason"] == "go again"
         assert [b["title"] for b in history[0]["blockers"]] == ["MUST-CHANGE"], (
             "a follow-up in here is a follow-up in front of the chair")
-        # ...and the round being judged is never its own history.
+        # ...and the round being judged is never its own history
         assert ops.prior_round_history(store, wo_id=wo_id, before=1) == []
     finally:
         store.close()
 
 
-# -- round accounting -----------------------------------------------------------------
+# -- round accounting
 
 
 def test_opening_a_round_twice_yields_one_row_but_a_real_resubmission_advances(fleet):
-    """Idempotent per (work order, round), enforced by the partial unique index rather
-    than by a SELECT before the INSERT — that check-then-insert is a race with no lock.
-
-    Paired with a genuine resubmission, or the test would be satisfied by a machine that
-    never advances a round at all.
-    """
+    """Idempotent per (work order, round)"""
     held = Validator(rejected(), passed())
     held.block()
     fleet.daemon.validator = held
@@ -849,12 +703,7 @@ def test_opening_a_round_twice_yields_one_row_but_a_real_resubmission_advances(f
 
 
 def test_a_transport_outage_consumes_no_round_but_a_rejection_does(fleet):
-    """A `ClaudeCliError` is the panel being unreachable, not a verdict on the work.
-
-    The pairing is the whole test: an outage that left the round `failed` but still
-    advanced the counter would be indistinguishable from this one until the third bad
-    night on the network gave up on a work order nothing had ever judged.
-    """
+    """A `ClaudeCliError` is the panel being unreachable, not a verdict on the work"""
     validator = Validator(claude_cli.ClaudeCliError("connection reset"), rejected())
     fleet.daemon.validator = validator
     wo = fleet.dispatch()
@@ -900,9 +749,7 @@ def test_three_outages_escalate_rather_than_retrying_for_ever(fleet):
 
 
 def test_two_failed_rounds_then_a_rejection_land_on_round_one(fleet):
-    """Rounds are COUNTED, never inferred from the row count. Two outages and a
-    rejection is round ONE rejected — round three would mean two bad nights on the
-    network had spent two thirds of this work order's budget."""
+    """Rounds are COUNTED, never inferred from the row count"""
     fleet.daemon.validator = Validator(
         claude_cli.ClaudeCliError("boom"), claude_cli.ClaudeCliError("boom"),
         rejected())
@@ -922,9 +769,7 @@ def test_two_failed_rounds_then_a_rejection_land_on_round_one(fleet):
 
 
 def test_a_project_switch_decides_whether_finish_opens_a_round_at_all(fleet):
-    """Both directions, because either alone passes for the wrong reason: a submission
-    site that ignored the project would keep answering the OS block, and one that ignored
-    the OS block would still look right in the first half."""
+    """Both directions, because either alone passes for the wrong reason: a submission site that ignored..."""
     fleet.reconfigure(enabled=False, project_validation={"enabled": True})
     wo = fleet.dispatch()
     fleet.change(wo["id"], "print('one')\n")
@@ -937,9 +782,7 @@ def test_a_project_switch_decides_whether_finish_opens_a_round_at_all(fleet):
 
 
 def test_the_daemon_prices_a_round_from_the_projects_settings_not_the_os_block(fleet):
-    """The three `self.catalog.os.validation` reads were on threads already holding a
-    `ProjectSpec`; this pins that they now use it. The OS budget of 9 would take three
-    more rounds before escalating."""
+    """The three `self.catalog.os.validation` reads were on threads already holding a `ProjectSpec`"""
     fleet.reconfigure(max_rounds=9, project_validation={"max_rounds": 1})
     fleet.daemon.validator = Validator(rejected("still no test"))
     wo = fleet.dispatch()
@@ -977,19 +820,17 @@ def test_max_rounds_rejections_escalate(fleet):
         assert fresh["status"] == "needs_review"
         assert fresh["attention_reason"] == VALIDATION_STUCK_BLOCKER
         assert true_blockers(store, fresh) == [VALIDATION_STUCK_BLOCKER]
-        # The last round sends nothing back: there is no round left to fix in.
+        # The last round sends nothing back: there is no round left to fix in
         assert len(store.envelopes(subject_wo_id=wo["id"])) == 1
     finally:
         store.close()
 
 
-# -- the two escalations that never call the validator --------------------------------
+# -- the two escalations that never call the validator
 
 
 def test_an_empty_diff_escalates_and_a_real_one_does_not(fleet):
-    """A validator handed an empty diff will approve it, and that one silent pass would
-    make the whole feature theatre. Paired with the identical work order that DID change
-    something, so "the validator was not called" is a fact about the diff."""
+    """A validator handed an empty diff will approve it"""
     validator = Validator(passed())
     fleet.daemon.validator = validator
 
@@ -1027,7 +868,7 @@ def test_a_repeated_fingerprint_escalates_and_one_byte_of_change_does_not(fleet)
     fleet.tick()
     assert len(validator.calls) == 1
 
-    # Resubmitted with nothing changed: same diff, same declared evidence.
+    # Resubmitted with nothing changed: same diff, same declared evidence
     finish(fleet, wo["id"], summary="reworded, same work")
     fleet.drain()
 
@@ -1042,7 +883,7 @@ def test_a_repeated_fingerprint_escalates_and_one_byte_of_change_does_not(fleet)
     finally:
         store.close()
 
-    # The pairing: one byte of new work, and the same machine runs the validator again.
+    # The pairing: one byte of new work, and the same machine runs the validator again
     other = fleet.dispatch("other")
     fleet.change(other["id"], "print('one')\n")
     finish(fleet, other["id"])
@@ -1062,9 +903,7 @@ def test_a_repeated_fingerprint_escalates_and_one_byte_of_change_does_not(fleet)
 
 
 def test_fingerprints_a_b_a_do_not_escalate(fleet):
-    """Compared against the IMMEDIATELY PRECEDING round only. A submitter told to go
-    back to a shape it already tried is answering the feedback, not repeating itself —
-    and nothing else distinguishes "the previous round" from "any previous round"."""
+    """Compared against the IMMEDIATELY PRECEDING round only"""
     fleet.reconfigure(max_rounds=9)
     validator = Validator(rejected())
     fleet.daemon.validator = validator
@@ -1088,18 +927,11 @@ def test_fingerprints_a_b_a_do_not_escalate(fleet):
         store.close()
 
 
-# -- the kill switch ------------------------------------------------------------------
+# -- the kill switch
 
 
 def test_the_kill_switch_drains_open_rounds_instead_of_stranding_them(fleet):
-    """THE FLAG IS A SAFE STOP, NOT A TRAPDOOR.
-
-    `os.validation.enabled` gates OPENING a round and never settling one. A user who
-    turns the panel off at three in the morning because it is misbehaving must not
-    thereby strand every unit already inside it — so the daemon still judges and settles
-    what is open, and only `ops.finish` reverts to today's path immediately. Both halves
-    are asserted here because nothing else covers either.
-    """
+    """THE FLAG IS A SAFE STOP, NOT A TRAPDOOR"""
     held = Validator(passed())
     held.block()
     fleet.daemon.validator = held
@@ -1132,17 +964,7 @@ def test_the_kill_switch_drains_open_rounds_instead_of_stranding_them(fleet):
 
 
 def test_with_no_validator_wired_an_open_round_settles_unjudged(fleet, monkeypatch):
-    """A round with nothing to judge it settles its unit unjudged.
-
-    The panel now fills the seam, so this case has to be STAGED rather than found:
-    `_validator` is made to return None, which is exactly what it returns on every
-    catalog that has not enabled validation — and what it would return again if the panel
-    were ever unwired or removed.
-
-    Closed `failed` and never `passed` — a round nobody judged must not read as a
-    verdict on any surface — and the work order lands exactly where it lands with
-    validation switched off, so an unwired seam costs nothing and hides nothing.
-    """
+    """A round with nothing to judge it settles its unit unjudged"""
     monkeypatch.setattr(Daemon, "_validator", staticmethod(lambda cfg: None))
     wo = fleet.dispatch()
     fleet.change(wo["id"], "print('one')\n")
@@ -1166,12 +988,7 @@ def test_with_no_validator_wired_an_open_round_settles_unjudged(fleet, monkeypat
 
 
 def test_a_pending_assumption_no_longer_holds_the_round_back(fleet):
-    """THE POINT OF ISSUE 212: the two gates open together and are joined, not chained.
-
-    The user still owes a decision and the status still says so — but the round runs
-    underneath it, on a diff that existed from the moment the worker finished. wo-4fc128ca
-    waited 44 minutes for a human before the panel was allowed to start.
-    """
+    """THE POINT OF ISSUE 212: the two gates open together and are joined, not chained"""
     fleet.daemon.validator = Validator(passed())
     wo = fleet.dispatch()
     fleet.change(wo["id"], "print('one')\n")
@@ -1194,7 +1011,7 @@ def test_a_pending_assumption_no_longer_holds_the_round_back(fleet):
     try:
         assert len(fleet.daemon.validator.calls) == 1
         assert store.latest_validation_round(wo_id=wo["id"])["outcome"] == "passed"
-        # ...and the JOIN holds it: one gate cleared is not both.
+        # ...and the JOIN holds it: one gate cleared is not both
         assert store.get_work_order(wo["id"])["status"] == "needs_review"
     finally:
         store.close()
@@ -1204,8 +1021,7 @@ def test_a_pending_assumption_no_longer_holds_the_round_back(fleet):
 
 
 def test_the_panel_reads_the_assumptions_it_is_judging_around(fleet):
-    """An assumption is a decision embodied in the diff, and it ships in the PR like
-    everything else. The seats never saw one before issue 212."""
+    """An assumption is a decision embodied in the diff, and it ships in the PR like everything else"""
     fleet.daemon.validator = Validator(passed())
     wo = fleet.dispatch()
     fleet.change(wo["id"], "print('one')\n")
@@ -1222,9 +1038,7 @@ def test_the_panel_reads_the_assumptions_it_is_judging_around(fleet):
 
 
 def test_a_refused_assumption_blocks_the_landing_a_pass_would_otherwise_do(fleet):
-    """The hole parallelism opens. The user turns a call down, the worker starts
-    revising, and the round already in flight passes the code as it stood. Nothing is
-    PENDING at that moment — and landing would ship the decision the user refused."""
+    """The hole parallelism opens"""
     fleet.daemon.validator = Validator(passed())
     wo = _parked_on_assumptions(fleet)
 
@@ -1234,9 +1048,7 @@ def test_a_refused_assumption_blocks_the_landing_a_pass_would_otherwise_do(fleet
     store = fleet.store()
     try:
         assert store.latest_validation_round(wo_id=wo["id"])["outcome"] == "passed"
-        # The feedback went out as a turn in this same tick, and `worker_session.busy`
-        # reads the stored turn — only `poll` ends one — so the landing is deferred
-        # behind it every time, never landed live (spec §3.1).
+        # The feedback went out as a turn in this same tick
         assert "validation_landing_deferred" in \
             [e["kind"] for e in store.list_events(wo["id"])]
         assert _settle(store, wo["id"])
@@ -1246,32 +1058,18 @@ def test_a_refused_assumption_blocks_the_landing_a_pass_would_otherwise_do(fleet
     finally:
         store.close()
 
-    # The worker answers the refusal, and the work order may land again.
+    # The worker answers the refusal, and the work order may land again
     fleet.change(wo["id"], "print('utf-16')\n")
     assert finish(fleet, wo["id"], pr="https://github.com/x/y/pull/9")["status"] == \
         "validating"
 
 
-# -- the second route into done ------------------------------------------------------
-#
-# `ops.review_work_order` reaches `waiting_pr_merge`/`completed` without ever touching
-# `ops.finish`, so a work order that filed assumptions used to arrive at the merge queue
-# with nothing having judged it.
+# -- the second route into done
 
 
 def test_a_rejection_while_the_user_is_deciding_reaches_the_worker_and_keeps_the_park(
         fleet):
-    """The decision the user was offered and took: full parallelism, so the feedback goes
-    to the worker IMMEDIATELY rather than waiting for them (issue 212, spec §5).
-
-    Both halves are the test. The feedback has to MOVE — a rejection the worker never
-    sees is the serialization this change removed, wearing a different hat — and the
-    user's own pending decision has to survive that movement. It nearly does not:
-    `Daemon._deliver` clears the attention flag on any work order it un-parks, which
-    erases "assumptions pending review" outright. `true_blockers` re-derives it from the
-    assumption row on the next reconcile, which is what makes the erasure a blink rather
-    than a loss.
-    """
+    """The decision the user was offered and took: full parallelism"""
     fleet.reconfigure(max_rounds=3)
     fleet.daemon.validator = Validator(rejected("no test covers the change"))
     wo = _parked_on_assumptions(fleet)
@@ -1282,8 +1080,7 @@ def test_a_rejection_while_the_user_is_deciding_reaches_the_worker_and_keeps_the
     try:
         assert store.latest_validation_round(wo_id=wo["id"])["outcome"] == "rejected"
         fresh = store.get_work_order(wo["id"])
-        # Not settled and not un-parked by the verdict itself: the user still owes a
-        # decision, and the panel refusing the code is not that decision.
+        # Not settled and not un-parked by the verdict itself: the user still owes a decision
         assert fresh["status"] == "needs_review"
         assert len(store.pending_assumptions(wo["id"])) == 1
         assert true_blockers(store, fresh)[0] == "1 assumption pending your review"
@@ -1300,7 +1097,7 @@ def test_a_rejection_while_the_user_is_deciding_reaches_the_worker_and_keeps_the
         assert delivered, "the worker was never given the feedback"
         fresh = store.get_work_order(wo["id"])
         assert len(store.pending_assumptions(wo["id"])) == 1
-        # The flag `_deliver` cleared, back on the record and still naming the assumption.
+        # The flag `_deliver` cleared, back on the record and still naming the assumption
         assert fresh["needs_attention"] == 1
         assert fresh["attention_reason"] == "1 assumption pending your review"
     finally:
@@ -1309,16 +1106,7 @@ def test_a_rejection_while_the_user_is_deciding_reaches_the_worker_and_keeps_the
 
 def test_an_escalation_while_the_user_is_deciding_leaves_the_assumption_in_front_of_them(
         fleet):
-    """The other concurrent verdict, and the one that writes an attention flag of its
-    own. `Daemon._escalate` stamps VALIDATION_STUCK_BLOCKER over whatever was there —
-    which, now that the two gates overlap, can be the user's pending assumption.
-
-    `true_blockers` ranks the assumption first and the give-up second, so the user is
-    told BOTH rather than the more recent one: they are two independent things owed, and
-    dropping either is the silent relabelling kn-78346a2d names. The accept then lands
-    the work order exactly where the join's table says an `escalated` round lands — the
-    user shipping it anyway, which is the only exit from a give-up.
-    """
+    """The other concurrent verdict, and the one that writes an attention flag of its own"""
     fleet.reconfigure(max_rounds=1)  # one rejection exhausts the budget
     fleet.daemon.validator = Validator(rejected("no test covers the change"))
     wo = _parked_on_assumptions(fleet)
@@ -1357,9 +1145,7 @@ def test_an_escalation_while_the_user_is_deciding_leaves_the_assumption_in_front
 
 
 def test_a_cancelled_work_orders_open_round_is_never_picked_up(fleet):
-    """The bound the round-keyed query needs and the status-keyed one got for free.
-    PAIRED with the `needs_review` work order beside it, which is the whole reason the
-    status filter had to go: judge them both or judge neither is the trap."""
+    """The bound the round-keyed query needs and the status-keyed one got for free"""
     fleet.daemon.validator = Validator(passed())
     live = _parked_on_assumptions(fleet)
     stopped = _parked_on_assumptions(fleet, pr="https://github.com/x/y/pull/13")
@@ -1378,7 +1164,7 @@ def test_a_cancelled_work_orders_open_round_is_never_picked_up(fleet):
 
 def _parked_on_assumptions(fleet: Fleet, *, evidence: str = "ran `pytest -q`: 412 passed",
                            pr: str = "https://github.com/x/y/pull/9") -> dict:
-    """A work order in the state `finish` leaves one that filed an assumption."""
+    """A work order in the state `finish` leaves one that filed an assumption"""
     wo = fleet.dispatch()
     fleet.change(wo["id"], "print('reviewed')\n")
     ops.assume(wo["id"], "assumed the exporter writes UTF-8")
@@ -1388,10 +1174,7 @@ def _parked_on_assumptions(fleet: Fleet, *, evidence: str = "ran `pytest -q`: 41
 
 
 def test_accepting_assumptions_validates_only_when_the_feature_is_on(fleet):
-    """THE PAIRING IS THE TEST. Validation ships disabled, so an accept that lands in
-    `waiting_pr_merge` proves nothing on its own — that is where it lands today and
-    where it landed before this file existed. The same review is run twice, once each
-    side of the flag, and the two endings have to differ."""
+    """THE PAIRING IS THE TEST"""
     fleet.daemon.validator = Validator(passed())
 
     # -- the flag OFF: exactly today's behaviour, and not one row in validation_rounds
@@ -1428,24 +1211,11 @@ def test_accepting_assumptions_validates_only_when_the_feature_is_on(fleet):
 
 
 def test_a_work_order_already_judged_is_not_validated_a_second_time(fleet):
-    """PAIRED with a never-validated one in the same test. "No new round" is satisfied
-    perfectly by an implementation that opens no rounds at all on this route, so the
-    control has to open one.
-
-    The rule: a round already on record means the loop has run. An acceptance after
-    that is the USER overruling the machine, and the machine does not get a second
-    vote — re-submitting would hand the work order straight back to the reviewer that
-    had already given up on it.
-
-    Since issue 212 the control is the one that has to be staged: `finish` opens a round
-    for every work order, so the only way to reach this route without one is a work order
-    that finished while the panel was switched off.
-    """
+    """PAIRED with a never-validated one in the same test"""
     fleet.reconfigure(max_rounds=1)  # one rejection is the whole budget
     fleet.daemon.validator = Validator(rejected("no test covers the change"))
 
     # -- judged already: the round ran, the reviewer gave up, and it is in front of the
-    # user for exactly that reason. They say ship it anyway.
     judged = fleet.dispatch("judged")
     fleet.change(judged["id"], "print('judged')\n")
     finish(fleet, judged["id"], pr="https://github.com/x/y/pull/10")
@@ -1485,14 +1255,7 @@ def test_a_work_order_already_judged_is_not_validated_a_second_time(fleet):
 
 
 def test_the_review_route_carries_the_evidence_the_worker_declared(fleet):
-    """`finish` drops a work order with pending assumptions into `needs_review` before
-    it ever reaches the validation branch, so without this the evidence its worker
-    passed would be lost and round 1 would open empty — on exactly the work orders that
-    filed assumptions. It is recovered from the `finished` event's payload.
-
-    Paired with a worker that declared nothing, which must still finish: `--evidence` is
-    optional, and an empty declaration is an ordinary submission rather than a thin one.
-    """
+    """`finish` drops a work order with pending assumptions into `needs_review` before it ever reaches the..."""
     declared = "`uv run pytest -q` — 412 passed; exporter checked by hand on 3 files"
     told = _parked_on_assumptions(fleet, evidence=declared)
     silent = _parked_on_assumptions(fleet, evidence="",
@@ -1511,9 +1274,7 @@ def test_the_review_route_carries_the_evidence_the_worker_declared(fleet):
 
 
 def test_rejecting_assumptions_opens_no_round_of_its_own(fleet):
-    """A rejection is not a route into done. The work order goes back to its worker with
-    the user's reasoning — and the round `finish` already opened is the only one there
-    is: this route never adds a second."""
+    """A rejection is not a route into done"""
     fleet.daemon.validator = Validator(passed())
     wo = _parked_on_assumptions(fleet)
     store = fleet.store()
@@ -1533,21 +1294,11 @@ def test_rejecting_assumptions_opens_no_round_of_its_own(fleet):
         store.close()
 
 
-# -- the give-up reaches the user (issue #199) ----------------------------------------
+# -- the give-up reaches the user (issue #199)
 
 
 def _outbox(fleet):
-    """The VALIDATION outbox rows the next tick will route. `unrouted_notifications` is
-    the honest read: `route_outbox` marks them `routed`, so anything still here has not
-    reached the central inbox yet.
-
-    FILTERED TO `validation`, which every caller in this file is about. The fixture has
-    no `fake_gh` and `finish` opens a pull request, so the daemon files one project-level
-    `pr-poll` warning about a `gh` the isolation gate blocked — and since the poll started
-    visiting `validating` too, it files that warning during the round rather than only
-    after it. That is a fact about the fixture, not about whether a give-up reached the
-    user, and an unfiltered read would make every assertion here depend on it.
-    """
+    """The VALIDATION outbox rows the next tick will route"""
     store = fleet.store()
     try:
         return [r for r in store.unrouted_notifications()
@@ -1557,10 +1308,7 @@ def _outbox(fleet):
 
 
 def test_a_give_up_notifies_and_a_rejection_stays_silent(fleet):
-    """PAIRED, because "a notification exists" says nothing about which transition wrote
-    it. The rejection half is the contract `_reject` keeps: its feedback travels to the
-    worker over the bus, and a ping per round would train the user to ignore the sink
-    that has to carry the give-up."""
+    """PAIRED, because "a notification exists" says nothing about which transition wrote it"""
     fleet.reconfigure(max_rounds=2)
     fleet.daemon.validator = Validator(rejected("no test covers the change"))
     wo = fleet.dispatch()
@@ -1577,9 +1325,7 @@ def test_a_give_up_notifies_and_a_rejection_stays_silent(fleet):
 
     rows = _outbox(fleet)
     assert len(rows) == 1
-    # The title names the FAMILY now: spec
-    # 2026-10-14-an-escalated-round-says-why-and-what-to-run-next §3. A rejection with
-    # the budget spent is `handover`; `VALIDATION_ESCALATED_TITLE` serves feature orders.
+    # The title names the FAMILY now: spec 2026-10-14-an-escalated-round-says-why-and-what-to-run-next §3
     assert rows[0]["title"] == ops.ESCALATION_TITLE.format(
         unit=wo["id"], n=2, verb=ops.ESCALATION_VERB["handover"])
     assert rows[0]["body"] == "no test covers the change", (
@@ -1589,8 +1335,7 @@ def test_a_give_up_notifies_and_a_rejection_stays_silent(fleet):
 
 
 def test_the_give_up_notification_reaches_the_central_inbox(fleet):
-    """The outbox row is only half the path: `route_outbox` -> central inbox -> sinks is
-    what puts a give-up in front of a user who is not looking at `jarvis status`."""
+    """The outbox row is only half the path: `route_outbox` -> central inbox -> sinks is what puts a..."""
     fleet.reconfigure(max_rounds=1)
     fleet.daemon.validator = Validator(rejected("the change is untested"))
     wo = fleet.dispatch()
@@ -1613,11 +1358,7 @@ def test_the_give_up_notification_reaches_the_central_inbox(fleet):
 
 
 def test_the_escalations_that_never_call_the_validator_notify_too(fleet):
-    """An empty diff gives up without a verdict to quote, so the notification carries
-    the machine's own sentence. Nothing else would tell the user the round closed.
-
-    `not_reviewed`, NOT `handover`: no seat judged an empty submission, so a title saying
-    it was rejected would claim a decision nobody made (spec §3)."""
+    """An empty diff gives up without a verdict to quote"""
     fleet.daemon.validator = Validator(passed())
     wo = fleet.dispatch("empty")
     fleet.worktree(wo["id"])  # a worktree, and not one byte changed in it
@@ -1633,9 +1374,7 @@ def test_the_escalations_that_never_call_the_validator_notify_too(fleet):
 
 
 def test_three_outages_ping_the_user_once_not_once_per_attempt(fleet):
-    """The outage path writes a `validation_failed` event per attempt and escalates on
-    the third. One give-up is one notification: a row per attempt would report a bad
-    network three times and the decision the user owes not at all."""
+    """The outage path writes a `validation_failed` event per attempt and escalates on the third"""
     fleet.daemon.validator = Validator(claude_cli.ClaudeCliError("connection reset"))
     wo = fleet.dispatch()
     fleet.change(wo["id"], "print('one')\n")
@@ -1652,9 +1391,7 @@ def test_three_outages_ping_the_user_once_not_once_per_attempt(fleet):
 
 
 def test_a_long_reason_is_cut_and_says_that_it_was(fleet):
-    """A panel reason runs to paragraphs and a sink renders it as one push. What the
-    user must not get is a sentence that simply stops: the cut has to be visible, or a
-    clipped reason reads as the machine having nothing more to say."""
+    """A panel reason runs to paragraphs and a sink renders it as one push"""
     long_reason = "the seats disagree about the header row. " * 40
     assert len(long_reason) > VALIDATION_REASON_CHARS, "the fixture must exceed the cut"
     fleet.reconfigure(max_rounds=1)
@@ -1672,17 +1409,14 @@ def test_a_long_reason_is_cut_and_says_that_it_was(fleet):
 
     store = fleet.store()
     try:
-        # The cut is the NOTIFICATION's, not the record's: the round keeps the whole
-        # reason, which is what `jarvis wo show` and `jarvis validation show` read.
+        # The cut is the NOTIFICATION's, not the record's: the round keeps the whole reason
         assert store.latest_validation_round(wo_id=wo["id"])["reason"] == long_reason
     finally:
         store.close()
 
 
 def test_a_reason_that_fits_is_not_marked_as_cut(fleet):
-    """The pairing for the test above: without it, a marker appended unconditionally
-    would pass every assertion there and put "[…]" on every short reason the user reads.
-    """
+    """The pairing for the test above: without it"""
     fleet.reconfigure(max_rounds=1)
     fleet.daemon.validator = Validator(rejected("no test covers the change"))
     wo = fleet.dispatch()
@@ -1698,10 +1432,7 @@ def test_a_reason_that_fits_is_not_marked_as_cut(fleet):
 
 def test_a_passed_round_does_not_land_an_order_whose_worker_is_typing(fleet,
                                                                      fake_claude):
-    """Measured on wo-83e4183c: a round opened before turn 13 came back `passed` while
-    turn 13 ran, and the landing put a planner halfway through a revision into
-    `needs_review`. The verdict is about a commit the worker has already moved past;
-    what it must not do is write a status under a live conversation."""
+    """Measured on wo-83e4183c: a round opened before turn 13 came back `passed` while turn 13 ran"""
     wo = fleet.dispatch()
     fleet.change(wo["id"], "print('one')\n")
     finish(fleet, wo["id"])
@@ -1721,7 +1452,7 @@ def test_a_passed_round_does_not_land_an_order_whose_worker_is_typing(fleet,
         assert store.get_work_order(wo["id"])["status"] == "running", (
             "the verdict landed a work order whose worker was mid-turn")
 
-        # The turn ends; the landing the round deferred is the settler's to finish.
+        # The turn ends; the landing the round deferred is the settler's to finish
         gate.unlink()
         assert _settle(store, wo["id"])
         fleet.tick()
@@ -1734,14 +1465,7 @@ def test_a_passed_round_does_not_land_an_order_whose_worker_is_typing(fleet,
 
 
 def _defer_under_a_live_turn(fleet, fake_claude, store, wo_id: str):
-    """Park `wo_id` in `validating` WITH a worker turn in flight, then let a `passed`
-    round defer its landing. Returns the hold gate.
-
-    The status is written by hand because no fixture route produces the pair: delivering
-    a message is the only way to start a turn on a validating order, and delivery itself
-    moves the status to `running`. The rows measured in production — wo-9f00e3b5,
-    wo-12b4e416, wo-d2d777dc — were all `validating` when their landing was deferred.
-    """
+    """Park `wo_id` in `validating` WITH a worker turn in flight"""
     held = Validator(passed())
     held.block()
     fleet.daemon.validator = held
@@ -1768,11 +1492,7 @@ def _defer_under_a_live_turn(fleet, fake_claude, store, wo_id: str):
 
 def test_a_deferred_landing_is_taken_when_the_order_is_still_validating(fleet,
                                                                        fake_claude):
-    """The shape nothing else covers: the deferral happened while the status WAS
-    `validating`, which is the only state it can happen in. The recovery used to sit
-    below `settle_work_order`'s `validating` return, so it was unreachable in every case
-    it exists for — measured stuck on wo-9f00e3b5 (7.5d), wo-12b4e416 (8d) and
-    wo-d2d777dc (2d), each with a `passed` round and no round open."""
+    """The shape nothing else covers: the deferral happened while the status WAS `validating`"""
     wo = fleet.dispatch()
     fleet.change(wo["id"], "print('one')\n")
     finish(fleet, wo["id"])
@@ -1794,8 +1514,7 @@ def test_a_deferred_landing_is_taken_when_the_order_is_still_validating(fleet,
 
 def test_the_deferred_landing_waits_while_the_worker_is_still_typing(fleet,
                                                                     fake_claude):
-    """The pairing: the hoisted recovery must keep the deferral's own predicate. A
-    landing written under a live turn is the thing the deferral exists to prevent."""
+    """The pairing: the hoisted recovery must keep the deferral's own predicate"""
     wo = fleet.dispatch()
     fleet.change(wo["id"], "print('one')\n")
     finish(fleet, wo["id"])
@@ -1816,9 +1535,7 @@ def test_the_deferred_landing_waits_while_the_worker_is_still_typing(fleet,
 
 
 def test_a_pending_round_still_stops_the_settler_at_validating(fleet):
-    """The return the recovery was hoisted above is not widened: a round still open owns
-    the work order, and the settler must leave it alone — a done turn with a summary and
-    a `pr_url` would otherwise reach the merge queue unjudged."""
+    """The return the recovery was hoisted above is not widened: a round still open owns the work order"""
     held = Validator(passed())
     held.block()  # the round stays `pending` across the tick
     fleet.daemon.validator = held
@@ -1841,16 +1558,7 @@ def test_a_pending_round_still_stops_the_settler_at_validating(fleet):
 
 
 def test_a_give_up_survives_the_turn_that_follows_it(fleet, fake_claude):
-    """The mirror of the test above, and the case where the landing must NOT be
-    deferred: a give-up writes `needs_review` under a possibly-live turn because
-    `true_blockers` can derive VALIDATION_STUCK_BLOCKER from no other status. The
-    exposure is therefore at the other end. A turn runs after the refusal — a message
-    is all it takes — and when it ends, the pull request `finish` recorded is still on
-    the row, so the settler's `pr_url` branch parked the order in `waiting_pr_merge`
-    and took a refusal off the user's list with nobody having decided anything. The
-    flag goes with it: `true_blockers` derives the blocker from `needs_review` alone.
-    Spec §3.3.
-    """
+    """The mirror of the test above, and the case where the landing must NOT be deferred: a give-up writes..."""
     fleet.reconfigure(max_rounds=1)  # one rejection exhausts the budget
     fleet.daemon.validator = Validator(rejected("no test covers the change"))
     wo = fleet.dispatch()
@@ -1866,8 +1574,7 @@ def test_a_give_up_survives_the_turn_that_follows_it(fleet, fake_claude):
         assert fresh["status"] == "needs_review"
         assert true_blockers(store, fresh) == [VALIDATION_STUCK_BLOCKER]
 
-        # The turn that follows the refusal, held open across the give-up it must not
-        # undo. Delivery un-parks the order, so it settles out of `running`.
+        # The turn that follows the refusal, held open across the give-up it must not undo
         gate = fake_claude.hold_turns()
         store.queue_message(wo["id"], "one more thing")
         fleet.tick()
@@ -1888,10 +1595,7 @@ def test_a_give_up_survives_the_turn_that_follows_it(fleet, fake_claude):
 
 def test_a_give_up_survives_a_message_turn_after_a_round_that_judged_nothing(
         fleet, fake_claude):
-    """The issue's order end to end: a row that JUDGED NOTHING sits after the give-up.
-
-    docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md §A.
-    """
+    """The issue's order end to end: a row that JUDGED NOTHING sits after the give-up (docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md §A.)"""
     fleet.reconfigure(max_rounds=1)
     fleet.daemon.validator = Validator(rejected("no test covers the change"))
     wo = fleet.dispatch()

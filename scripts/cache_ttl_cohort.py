@@ -1,26 +1,5 @@
 #!/usr/bin/env python3
-"""Is it time to buy the one-hour prompt cache yet?
-
-`jarvis cost` prints this split for one order or for the fleet's whole history. This
-prints it for a COHORT WINDOW, which is the form the decision actually needs: the answer
-moves as the OS changes, and a figure averaged over all history hides the trend that
-will eventually reverse it. Measured 2026-08-30, as a share of ALL cache writes: 0.3%
-was TTL expiry before the `includeGitInstructions` fix, 15.4% after it, and 20.4% over
-the trailing week — against a 39.5% break-even. RE-MEASURED 2026-09-16: 30.5% over 30
-days and 34.2% over 7, so the drift is real and the answer is now a close call. See
-`docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md` and its appendix.
-
-`invariants.check_cache_ttl_trigger` now watches the crossing so nobody has to remember
-to run this, but over Jarvis's own worker sessions rather than every transcript here;
-this is still what prices the decision over the whole machine.
-
-Classification is `usage.read_session`'s own, not a second implementation, so this
-script and `jarvis cost` cannot drift apart — including the `os.cold_prefix_floor`
-threshold, which both resolve from the catalog.
-
-    uv run python scripts/cache_ttl_cohort.py --days 30
-    uv run python scripts/cache_ttl_cohort.py --since 2026-08-15 --until 2026-08-23
-"""
+"""Is it time to buy the one-hour prompt cache yet? (docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md)"""
 
 from __future__ import annotations
 
@@ -33,9 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from jarvis import usage  # noqa: E402
 
-#: Not re-derived here. `invariants.check_cache_ttl_trigger` takes the same decision on
-#: the same break-even, and two spellings of one ratio is how the two surfaces come to
-#: disagree about when to switch.
+#: Not re-derived here
 TRIGGER = usage.TTL_BREAK_EVEN
 
 
@@ -56,17 +33,14 @@ def main(argv: list[str] | None = None) -> int:
     since = args.since if args.since is not None else now - args.days * 86400
     until = args.until if args.until is not None else now
 
-    # Resolved once, and loudly: with no catalog registered this raises rather than
-    # classifying every boundary against a threshold nobody configured.
+    # Resolved once, and loudly: with no catalog registered this raises rather than classifying every...
     from jarvis.ops import resolve_catalog
     floor = resolve_catalog().os.cold_prefix_floor
 
     total = usage.Usage()
     sessions = 0
     for session_id, paths in usage.index_sessions().items():
-        # A session belongs to the cohort it STARTED in: its turns are one conversation
-        # and splitting them across windows would attribute a boundary to a window whose
-        # configuration did not produce it.
+        # A session belongs to the cohort it STARTED in: its turns are one conversation and splitting them...
         started, _ = usage._time_span(sorted(paths)[0])
         if not started or not (since <= started < until):
             continue
@@ -92,11 +66,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"    TTL expired      {total.rewrite_ttl_excess:>15,}  "
           f"{total.boundaries_ttl} boundaries — a longer TTL buys this back")
 
-    # THE TRIGGER'S DENOMINATOR IS EVERY WRITTEN TOKEN, NOT THE TAX. Switching pays the
-    # 1h premium on the whole cache-write line, so the share that decides it is
-    # W_ttl/cache_write. The share OF THE TAX is a much larger number about a much
-    # smaller base, and reading one against the other says "nearly worth switching" when
-    # the truth is "off by a factor of two" — which is how this script earned its place.
+    # THE TRIGGER'S DENOMINATOR IS EVERY WRITTEN TOKEN, NOT THE TAX
     ttl_write = total.rewrite_ttl_write
     decisive = ttl_write / total.cache_write if total.cache_write else 0.0
     saving = (usage.CACHE_WRITE_RATE - usage.CACHE_READ_RATE) * ttl_write

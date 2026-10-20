@@ -1,43 +1,4 @@
-"""The conversation layer: how a message reaches a working session, and how the OS
-learns what came back.
-
-Everything above this module speaks in **turns**. Nothing above it knows that a turn is
-a `claude -p` process, where its output lands, or how its liveness is judged — so the
-transport can change again without the daemon, dispatch, ops or the UI moving.
-
-## Why turns and not background sessions
-
-Workers used to run as Claude Code background agents, one *new* agent per delivered turn
-(`claude --bg --resume <sid>`), with the superseded one retired on a best-effort
-`claude stop`. That transport had three problems, all structural:
-
-* it leaked — any failed retirement left a dead agent in the roster forever (the live
-  fleet reached 63);
-* the session id moved — `--bg --resume` forks under a supervisor-assigned id, which
-  needed `bind_session`, a `prior_sessions` trail, an invariant, hook-time binding and
-  name-matching just to keep a pointer honest;
-* completion was read out of the supervisor's private `~/.claude/jobs/<id>/state.json`,
-  behind a three-strikes retry because the file lands asynchronously.
-
-A headless turn fixes all three at once, because of one verified property: **`claude -p
---resume <sid>` reuses the session id** rather than forking it (`--fork-session` exists
-to opt into forking). So Jarvis mints the id with `--session-id` before the first process
-starts, and it is immutable for the work order's whole life. The pointer cannot move, so
-nothing is needed to stop it moving.
-
-## The shape of a turn
-
-    claude -p --session-id <uuid> [briefing] -- "<prompt>"      # turn 1
-    claude -p --resume     <uuid> [briefing] -- "<prompt>"      # every turn after
-
-Detached, stdout redirected to `<project>/.jarvis/turns/<wo-id>/<seq>.json`. `poll()`
-reaps it: process gone + parseable JSON = done, and the JSON's `result` IS the worker's
-final message.
-
-Turns are detached rather than awaited on a thread pool because `shipit` restarts jarvisd
-on every release and a turn can run for hours — a turn parented to the daemon would lose
-its reply on each deploy.
-"""
+"""The conversation layer: how a message reaches a working session"""
 
 from __future__ import annotations
 
@@ -55,42 +16,24 @@ from .project_store import COMPACT_TURN, COST_FROM_TRANSCRIPT, ProjectStore
 
 log = logging.getLogger("jarvisd")
 
-#: A turn still running after this long is reported, never killed: a legitimately long
-#: turn is indistinguishable from a hung one from out here, and killing loses real work.
+#: A turn still running after this long is reported
 TURN_STALL_SECONDS = 6 * 3600
 
-#: How long to wait before retrying a turn whose limit message named a reset but no time
-#: this parser could read. Short enough to recover the same evening, long enough that a
-#: dozen work orders re-asking do not become a poll loop against the CLI.
+#: How long to wait before retrying a turn whose limit message named a reset but no time this parser...
 RATE_LIMIT_FALLBACK_DELAY = 15 * 60
 
-#: The floor under every retry, measured from the refusal. The reset moment is a clock
-#: time rounded to the minute, so it can land a few seconds in the past the instant it
-#: is parsed; without this the first retry would go out immediately and be refused again.
+#: The floor under every retry, measured from the refusal
 RATE_LIMIT_MIN_DELAY = 60
 
-#: How many consecutive turns of ONE conversation may be refused for the limit before
-#: the OS stops retrying and hands it to the user. A real window reopens after one wait,
-#: so a streak this long means the parse is wrong or something structural is — and
-#: retrying for ever would hide that behind a work order that looks busy and is not.
+#: How many consecutive turns of ONE conversation may be refused for the limit before the OS stops...
 MAX_RATE_LIMIT_RETRIES = 8
 
-#: The backoff for a turn the TRANSPORT lost — a 500, a 529, a dropped connection. One
-#: delay per attempt, in seconds, and its length is also the retry cap: five tries over
-#: about thirty-nine minutes, then it becomes the user's problem.
-#:
-#: Unlike the usage limit, nothing here states when the API will be well again, so there
-#: is no moment to wait for and the schedule has to be a guess. It is shaped like one:
-#: the first two are quick because most 500s are over in seconds and a work order that
-#: heals in a minute costs the user no attention at all, and the tail stretches out
-#: because a fault still there after ten minutes is an outage, and hammering an outage
-#: helps nobody. Claude Code already retries inside the turn before it gives up, so
-#: every delay here sits on top of a burst it has lost.
+#: The backoff for a turn the TRANSPORT lost — a 500, a 529, a dropped connection
 TRANSIENT_BACKOFF = (60, 120, 360, 600, 1200)  # 1m, 2m, 6m, 10m, 20m
 
 
 def new_session_id() -> str:
-    """Mint the session id for a work order. `--session-id` requires a valid UUID."""
+    """Mint the session id for a work order"""
     return str(uuid.uuid4())
 
 
@@ -107,32 +50,13 @@ def worktree_path(project: ProjectSpec, wo: dict[str, Any]) -> Path | None:
 
 
 def _append_system_prompt(*parts: str | None) -> str:
-    """Join the pieces of `--append-system-prompt` into one stable block.
-
-    Jarvis's own git briefing comes first and the project's standing instructions
-    second, so the order is fixed by construction rather than by whichever happens to
-    be set: appending a project's instructions to the end of a static prefix keeps the
-    common part of the prompt identical across every work order in the fleet, which is
-    the same cache-prefix argument that motivates the briefing in the first place.
-    """
+    """Join the pieces of `--append-system-prompt` into one stable block"""
     return "\n\n".join(p.strip() for p in parts if p and p.strip())
 
 
 def feature_agent(store: ProjectStore | None, project: ProjectSpec,
                   wo: dict[str, Any]) -> tuple[str | None, Path | None]:
-    """This child's per-feature agent type: its name and the directory that supplies it.
-
-    Rebuilt from the stored plan on EVERY turn rather than only at plan release, for the
-    reason `bootstrap._rebuild` rebuilds the skills tree on every dispatch: the
-    destination is generated, so a definition deleted or mangled between turns heals
-    itself, and a feature released before this existed acquires one on its next dispatch.
-
-    `(None, None)` for anything without one, and every failure lands there too — no
-    parent, no plan, no `Agent profile` appendix, an unwritable `.jarvis/`. A missing
-    persona must never be the reason a work order does not run (§3 of
-    docs/superpowers/specs/2026-08-29-spec-driven-feature-orders.md). The two travel
-    together or not at all: `--agent` without its `--add-dir` is an immediate CLI error.
-    """
+    """This child's per-feature agent type: its name and the directory that supplies it (docs/superpowers/specs/2026-08-29-spec-driven-feature-orders.md)"""
     from . import specs
 
     if store is None or not wo.get("parent_id") or wo.get("kind") != "worker":
@@ -151,60 +75,7 @@ def feature_agent(store: ProjectStore | None, project: ProjectSpec,
 def briefing_for(project: ProjectSpec, wo: dict[str, Any],
                  store: ProjectStore | None = None,
                  central: Any = None) -> dict[str, Any]:
-    """The flags every turn of this work order is launched with.
-
-    A resumed session re-derives its model, effort, permission mode, system prompt and
-    reachable directories from argv — it does NOT inherit them from the transcript. So
-    the briefing is rebuilt identically for every turn; anything dropped here is simply
-    absent from that turn onwards, including the project's standing instructions and the
-    OS's own skills. (This is the property #42 established for the old fallback path,
-    preserved on the new transport.)
-
-    `permission_mode` falls back to the project default rather than staying NULL: a
-    headless turn cannot answer a permission prompt, so Claude's default mode is not the
-    conservative choice, it is a guaranteed stall. Only `adhoc` rows reach here with the
-    column unset — dispatch persists the resolved value back onto dispatched ones — and
-    resolving it here keeps the column's NULL meaningful.
-
-    `append_system_prompt` is COMPOSED here rather than passed through: Jarvis's static
-    git briefing plus whatever standing instructions the work order or project carry.
-    The briefing exists because dispatch switches off Claude Code's own git blocks to
-    keep the system prompt from moving between turns (see `_write_worker_settings`), and
-    re-derivation is exactly why it has to be rebuilt here — a turn that composed it
-    differently would move the prefix it was added to protect.
-
-    `add_dirs` is the one flag that now depends on the work order's KIND: a planner also
-    reaches the architect and test-lead seat definitions, and an ordinary worker does not
-    (design decision 4). Because a resumed turn re-derives its flags from argv, this is
-    also what keeps the seats available on the planner's second and later turns — dropping
-    the kind here would make them vanish after turn 1. A child of a feature order adds a
-    third: the directory holding its feature's own agent type, which is what makes
-    `agent` resolvable — see `feature_agent`.
-
-    `store` is optional only so the tests and callers that ask for a briefing outside a
-    dispatch keep working; without it a child of a feature order simply runs as an
-    ordinary worker.
-
-    `autocompact_window` is the one flag read from the CATALOG on every turn rather than
-    from the work-order row. Model, effort and permission mode are resolved onto the row
-    at dispatch so a running work order keeps the briefing it started with; this is the
-    opposite case on purpose. It is a spend control, not a property of the task, so
-    lowering it in the catalog must reach the long-running work orders that are the
-    reason to lower it — not just the ones dispatched afterwards.
-
-    `max_budget_usd` is RECOMPUTED HERE ON EVERY TURN and that is not an optimisation,
-    it is the only thing that makes a budget hold: `claude --max-budget-usd` caps ONE
-    INVOCATION and forgets what the session spent before it (measured — see
-    src/jarvis/budget.py), so a value resolved once at dispatch would let a ten-turn
-    work order spend ten budgets. None when the order has no ceiling, which is the
-    default and leaves the argv exactly as it was before this shipped.
-
-    `central` is optional for the same reason `store` is, and the consequence is stated
-    rather than hidden: without it the Jarvis half of the bill (Neo, the panel) is
-    invisible, so the ceiling is computed from the worker's turns alone and is therefore
-    too GENEROUS. Every dispatch path passes one; the callers that do not are tests and
-    the read-only briefing preview.
-    """
+    """The flags every turn of this work order is launched with (#42)"""
     from . import wiring
     from .bootstrap import install_agent_assets
     from .dispatch import _write_worker_settings
@@ -227,26 +98,18 @@ def briefing_for(project: ProjectSpec, wo: dict[str, Any],
                                           serena=wiring.serena_wired(project.wiring))
                      + ([agent_dir] if agent_dir else [])),
         "autocompact_window": project.worker.autocompact_window,
-        # Never negative: `_launch` refuses a spent order outright, so anything that
-        # reaches argv is money the order still has.
+        # Never negative: `_launch` refuses a spent order outright
         "max_budget_usd": max(0.0, cap.remaining_usd) if cap else None,
     }
 
 
 def busy(store: ProjectStore, wo_id: str) -> dict[str, Any] | None:
-    """The work order's in-flight turn, or None. One turn at a time, always.
-
-    A second concurrent turn would resume the same session id while the first still
-    holds it, which the CLI refuses — and even if it did not, the two turns would
-    interleave into one transcript.
-    """
+    """The work order's in-flight turn, or None"""
     turn = store.latest_turn(wo_id)
     return turn if turn and turn["state"] == "running" else None
 
 
-#: `DeliveryHold.kind`, so a caller could branch on the hold without matching its prose.
-#: NOTHING DOES TODAY — both callers read `accounted` and `reason` only — so these are a
-#: label on the record, not a dispatch table, and a new kind costs no caller a branch.
+#: `DeliveryHold.kind`, so a caller could branch on the hold without matching its prose
 HOLD_NO_SESSION = "no_session"
 HOLD_BUDGET = "budget"
 HOLD_TURN_IN_FLIGHT = "turn_in_flight"
@@ -256,19 +119,7 @@ HOLD_RETRY_OVERDUE = "retry_overdue"
 
 @dataclass(frozen=True)
 class DeliveryHold:
-    """Why `Daemon.deliver_messages` will not start a turn for this work order now.
-
-    ONE HOME FOR THE DECISION, and the reason it has to be one is that two callers ask
-    the same question for opposite purposes: the delivery pass asks "may I send", and
-    `invariants.stuck_message` asks "is this silence a defect". Derived separately they
-    drift, and the drift is invisible — a fourth skip added to the loop would leave the
-    diagnosis saying "the delivery pass has not attempted it" about a message the pass
-    had just declined, which is the one sentence GitHub issue 43 exists to get right.
-
-    `accounted` is what the second caller needs: something else already owns this wait,
-    so it is not a defect and must not raise a second line about one stopped worker.
-    `reason` is one clause, written to be read after "because".
-    """
+    """Why `Daemon.deliver_messages` will not start a turn for this work order now"""
 
     kind: str
     accounted: bool
@@ -277,73 +128,40 @@ class DeliveryHold:
 
 def delivery_hold(store: ProjectStore, wo: dict[str, Any],
                   now: float | None = None) -> DeliveryHold | None:
-    """The hold on this work order's queued messages, or None if delivery may go.
-
-    A NON-RESUMABLE PAUSE IS NOT A HOLD. The turn is dead and nothing will relaunch it,
-    so the message is the only thing that can start the conversation again — and if the
-    account really cannot answer, `Daemon._deliver` marks the message `failed` and
-    flags, which is a louder answer than holding it for ever would be.
-
-    `pending` is not judged here either. An undispatched order has no session by
-    definition, and whether that is a wait or a defect is a question about the work
-    order rather than about delivery (`invariants.MESSAGE_STUCK_STATUSES`).
-    """
+    """The hold on this work order's queued messages, or None if delivery may go"""
     if wo["status"] == budget.EXHAUSTED:
-        # Delivering would launch a turn there is no money for, and `_launch` would
-        # refuse it anyway. `accounted`: the work order is already flagged and in front
-        # of the user with the budget on it, so a second line about a message waiting
-        # would be the same fact twice.
+        # Delivering would launch a turn there is no money for, and `_launch` would refuse it anyway
         return DeliveryHold(HOLD_BUDGET, accounted=True,
                             reason="its budget is spent — raise it and the message goes")
     if not wo.get("session_id"):
-        # Nothing carries a queued message into a dispatch prompt — it goes out as the
-        # order's SECOND turn, once `start` mints a session.
+        # Nothing carries a queued message into a dispatch prompt
         return DeliveryHold(HOLD_NO_SESSION, accounted=False,
                             reason="it has no session to resume")
     if busy(store, wo["id"]):
-        # Mid-turn: one turn at a time, and `--resume` would refuse anyway.
+        # Mid-turn: one turn at a time, and `--resume` would refuse anyway
         return DeliveryHold(HOLD_TURN_IN_FLIGHT, accounted=True,
                             reason="a turn is already in flight")
     pause = turn_pause(store, wo["id"])
     if pause is None or not pause.resumable:
         return None
-    # The lost turn has to go out first — it is holding a message already marked
-    # `delivered`, so sending this one now would silently jump the queue.
-    #
-    # `resumable`, not `exhausted`: the two answer differently only for an auth pause
-    # whose sign-in has not changed, and that one never exhausts by design — holding on
-    # it would hold `jarvis wo send … "retry"` for ever, which is the manual escape
-    # hatch for a sign-in the OS cannot see (Neo, question 169).
+    # The lost turn has to go out first
     noun = PAUSE_NOUN[pause.reason]
     if not pause.due(now=now):
         return DeliveryHold(HOLD_RETRY_BOOKED, accounted=True,
                             reason=f"its {noun} retry is booked and has not come due")
-    # Past its own deadline and still here: the relaunch `Daemon.retry_paused_turns`
-    # owes did not happen. INV-PAUSE-OVERDUE reports that; this is the half of it the
-    # user can see, because their message is what is waiting behind it.
+    # Past its own deadline and still here: the relaunch `Daemon.retry_paused_turns` owes did not happen
     return DeliveryHold(HOLD_RETRY_OVERDUE, accounted=False,
                         reason=f"its {noun} retry came due and has not happened")
 
 
 def start(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
           prompt: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Open the conversation: turn 1, in a fresh worktree, under a minted session id.
-
-    Returns the turn row AND the briefing it was launched with, which is the one thing
-    this differs from `send`/`retry` in: `dispatch.dispatch_work_order` records the
-    context ledger for the seq-1 turn, and `briefing_for` REWRITES the worker settings
-    file — so dispatch must be handed the briefing rather than rebuilding it to measure
-    it (spec docs/superpowers/specs/2026-09-24-order-observability.md §5).
-    """
+    """Open the conversation: turn 1, in a fresh worktree, under a minted session id (docs/superpowers/specs/2026-09-24-order-observability.md §5)"""
     wo_id = wo["id"]
     session_id = wo.get("session_id") or new_session_id()
     store.update_work_order(wo_id, session_id=session_id, worktree=wo_id)
     row = {**wo, "session_id": session_id, "worktree": wo_id}
-    # RE-DECIDED FROM THE FILESYSTEM, `retry`'s way, because a work order can reach
-    # dispatch a second time carrying both: `ops.defer_red_release` re-parks a release to
-    # `pending` with its session and worktree intact (2026-09-29 spec §5). `--session-id`
-    # on a session that exists is refused by the CLI and `--worktree` asks for a
-    # directory that is already there. Byte-identical for an ordinary first dispatch.
+    # RE-DECIDED FROM THE FILESYSTEM
     started = _conversation_started(project, row)
     tree = worktree_path(project, row)
     briefing: dict[str, Any] = {}
@@ -355,50 +173,23 @@ def start(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
 
 def send(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any], text: str,
          msg_id: int | None = None) -> dict[str, Any]:
-    """Deliver a message as the work order's next turn.
-
-    The turn resumes the same session id the work order has always had, from inside its
-    worktree (transcripts are keyed by the directory the session was created in, so
-    resuming from the project root would not find the conversation).
-    """
+    """Deliver a message as the work order's next turn"""
     _release_background_owner(store, wo)
     cwd = worktree_path(project, wo) or project.path
     return _launch(store, project, wo, text, kind="message", resume=True,
                    worktree=None, cwd=cwd, msg_id=msg_id)
 
 
-# -- compaction: the one boundary the OS pays for on purpose --------------------------
-#
-# A turn boundary past the prompt cache's write TTL re-sends the WHOLE conversation at
-# the 1.25x cache-write rate — 5.9M tokens across two work orders in one afternoon on
-# 2026-09-18, which is what this exists for. The conversation is going to be re-sent
-# either way; what the OS chooses is WHAT gets re-sent. Compacting first replaces it
-# with a summary, and does so at the plain-input rate, because the CLI does not
-# cache-write a compaction call (`claude_cli.COMPACT_PROMPT` lists what was measured).
-#
-# IT IS ONLY EVER CHEAPER AT A COLD BOUNDARY, and that asymmetry is the whole trigger.
-# At a WARM one the next prompt would have READ the conversation at 0.1x, so compacting
-# would pay 1.0x for tokens about to cost a tenth of that — 10x worse, on every turn.
-# Past the TTL that read was never on offer.
-#
-# Automatic and unconditional above the floor: no flag, no per-order opt-in, and the
-# timeline says what it did and why (the pinned self-healing learning).
-# Spec: docs/superpowers/specs/2026-09-18-compact-past-the-ttl.md.
+# -- compaction: the one boundary the OS pays for on purpose
 
 
 @dataclass(frozen=True)
 class Compaction:
-    """Why the OS is about to compact this conversation before its next prompt."""
+    """Why the OS is about to compact this conversation before its next prompt"""
 
-    #: Seconds since the previous turn ENDED, which is a LOWER bound on the age of the
-    #: cache entry: the entry was last touched by that turn's final API call, which is
-    #: strictly earlier than the moment its process exited. A lower bound is the safe
-    #: way round: the error is always in the direction of compacting LESS often than the
-    #: bill would justify.
+    #: Seconds since the previous turn ENDED
     age: float
-    #: The conversation's size as measured, or None when it could not be read at all
-    #: (`measured_context`, issue #885). None is UNKNOWN and never 0: nothing may
-    #: record a size the OS did not measure.
+    #: The conversation's size as measured (#885)
     context: int | None
 
     @property
@@ -411,12 +202,7 @@ class Compaction:
 
 
 def turn_context(turn: dict[str, Any] | None) -> int:
-    """How large the conversation was at the end of a turn, or 0 if unrecorded.
-
-    `context_peak` off the stored usage envelope, so it survives the result file being
-    pruned. 0 for a turn reaped before the column existed, and 0 means "do not compact":
-    an unmeasured conversation is not evidence of a large one.
-    """
+    """How large the conversation was at the end of a turn, or 0 if unrecorded"""
     from . import db
 
     envelope = db.from_json((turn or {}).get("usage_json"), None)
@@ -424,24 +210,7 @@ def turn_context(turn: dict[str, Any] | None) -> int:
 
 
 def measured_context(store: ProjectStore, wo_id: str) -> int | None:
-    """The conversation's size as last MEASURED, or None when it is UNKNOWN.
-
-    Not the latest turn's own figure. A turn that ended without a result — killed, reaped
-    as dead, refused before it reached the model — records none, and reading its 0 as
-    "small" re-sent a 126k conversation cold (issue #856, a turn killed in a fleet stop).
-    A turn records only its own peak, so the newest measured one is the best lower bound
-    on what the next prompt will carry.
-
-    WHEN NO TURN RECORDED ONE AT ALL the transcript still knows, and issue #885 is what
-    happens without that fallback: wo-d5626c53's only turn died on the usage limit, so
-    every turn on record read 0, and the relaunch re-wrote 181,342 tokens cold while
-    three other orders the same minute compacted correctly.
-
-    0 AND None ARE DIFFERENT ANSWERS, and the split is Neo's ruling on questions 1097
-    and 1127: a readable transcript with nothing billed, a work order with no session at
-    all, and a session id with no transcript file are all genuinely EMPTY and must not
-    compact. Only a transcript that exists and cannot be read is UNKNOWN.
-    """
+    """The conversation's size as last MEASURED, or None when it is UNKNOWN (#856)"""
     for turn in store.recent_turns(wo_id, limit=MAX_RATE_LIMIT_RETRIES + 4):
         context = turn_context(turn)
         if context:
@@ -450,19 +219,7 @@ def measured_context(store: ProjectStore, wo_id: str) -> int | None:
 
 
 def _transcript_context(store: ProjectStore, wo_id: str) -> int | None:
-    """The size of the last BILLED call in the session transcript (issue #885).
-
-    `usage.session_calls` is already the lead agent's calls in timestamp order with the
-    synthetic and unbilled rows dropped, so the error row that ended the turn is not in
-    this — but a trailing call can still carry no context (output only), and that is not
-    a size either.
-
-    NO FILE ON DISK IS 0, never UNKNOWN (Neo question 1127): `--resume` reads that same
-    transcript, so with no file there is no conversation to compact and UNKNOWN could
-    only launch a compaction that must fail with `No conversation found with session ID`
-    — the regression `tests/test_rate_limit_retry.py::
-    test_a_clock_time_reset_comes_due_without_the_error_being_rewritten` caught.
-    """
+    """The size of the last BILLED call in the session transcript (issue #885)"""
     session_id = store.get_work_order(wo_id).get("session_id")
     if not session_id:
         return 0
@@ -483,43 +240,7 @@ def compaction_due(store: ProjectStore, wo: dict[str, Any],
                    min_context: int | None,
                    now: float | None = None,
                    pause: "TurnPause | None" = None) -> Compaction | None:
-    """Should the OS compact before this work order's next prompt goes out?
-
-    ONE PREDICATE FOR BOTH SHAPES. `pause` is the relaunch of a turn the transport lost
-    (issue #843, once `resume_compaction_due`): the boundary is then the PAUSED turn
-    rather than the latest one, and the caller owns the pause —
-    `ops._resume_after_budget` builds a synthetic one that is not on record at all, so
-    it is never re-read here. Two exported predicates is what let a caller pick neither
-    (spec 2026-09-29-one-compaction-decision-on-every-relaunch.md §3.2).
-
-    THE EXCLUSIONS, and each is the answer to a way this could cost more than it saves:
-
-    * `min_context` is None — the fleet has switched compaction off
-      (`os.compact_min_context`), the only way to.
-    * No turn on record. There is no conversation yet, so there is nothing to summarise
-      and the opening prompt writes the cache rather than re-writing it.
-    * The last turn is ITSELF a compaction. Nothing has been added since, so a second
-      one would summarise a summary for no reason — and if that one failed, compacting
-      again is the loop rather than the fix.
-    * A turn is in flight. A compaction is a boundary act and must never land in the
-      middle of a turn, because what it discards is what that turn is holding in its
-      head. (`Daemon.deliver_messages` would not have got here — `delivery_hold` stops
-      it first — but the decision must not depend on the caller having checked.)
-    * The gap is inside the write TTL. The entry is alive and the next prompt will READ
-      it at a tenth of what compacting would cost.
-    * The conversation is under the floor, AND its size was measured. Below the floor
-      the summary's own output tokens cost more than the re-write they replace —
-      measured, see `catalog.DEFAULT_COMPACT_MIN_CONTEXT`. A size that could not be
-      read at all is not under it (issue #885).
-    * The last turn is paused AND RESUMABLE. That pause is `Daemon.retry_paused_turns`'
-      business and `compaction_due(..., pause=…)` is how it asks — compacting here
-      would make `_nudge`'s "the conversation above is intact" false, and a compact turn
-      behind a paused one ERASES the pause (`turn_pause` re-derives it from the LATEST
-      turn), so the relaunch it waited for never comes. A NON-resumable pause has neither
-      problem: no relaunch is coming, so no nudge will lie and there is no pause anyone
-      is waiting on. `delivery_hold` holds the delivery for a resumable pause — but the
-      decision must not depend on the caller having checked.
-    """
+    """Should the OS compact before this work order's next prompt goes out? (#843)"""
     if min_context is None:
         return None
     turn = pause.turn if pause is not None else store.latest_turn(wo["id"])
@@ -527,8 +248,7 @@ def compaction_due(store: ProjectStore, wo: dict[str, Any],
         return None
     if pause is None and turn["state"] == "running":
         return None
-    # The paused turn is anchored on `started_at` when it never ended: a turn refused
-    # before it ran records no end, and the pause is the proof it is over.
+    # The paused turn is anchored on `started_at` when it never ended: a turn refused before it ran...
     ended = (turn.get("ended_at") or turn["started_at"] if pause is not None
              else turn.get("ended_at"))
     if not ended:
@@ -537,14 +257,10 @@ def compaction_due(store: ProjectStore, wo: dict[str, Any],
     if age < usage.WRITE_TTL_SECONDS:
         return None
     context = measured_context(store, wo["id"])
-    # An UNKNOWN size skips the floor rather than failing it: the floor exists to stop
-    # a small conversation paying for a summary, and there is no evidence of one here
-    # (issue #885). Every other exclusion above still applies.
+    # An UNKNOWN size skips the floor rather than failing it: the floor exists to stop a small... (#885)
     if context is not None and context < min_context:
         return None
-    # Last, because it is the only one that costs a second query — and `turn_pause`
-    # answers None for every turn that did not fail, so the streak count behind it is
-    # only ever reached by a turn that is genuinely paused.
+    # Last, because it is the only one that costs a second query
     if pause is None and turn["state"] == "failed":
         held = turn_pause(store, wo["id"])
         if held is not None and held.resumable:
@@ -559,23 +275,7 @@ def compact_before_relaunch(store: ProjectStore, project: ProjectSpec,
                             now: float | None = None,
                             queued_out: dict[str, Any] | None = None,
                             ) -> dict[str, Any] | None:
-    """The ONE compaction decision, for every path that relaunches a conversation.
-
-    Returns the compaction turn when it launched one — and then the caller must NOT
-    launch its own turn on this tick — or None, and the caller proceeds exactly as it
-    did before. `pause` is a relaunch of a lost turn, `queue` is a prompt that goes out
-    behind the compaction as a message; they are mutually exclusive.
-
-    DECISION AND ACTION IN ONE FUNCTION, ON PURPOSE. A caller that can ask the predicate
-    and ignore the answer is the defect this exists to remove: the decision used to be
-    opt-in, and three relaunch paths never took it (spec §1.5). `tests/
-    test_relaunch_paths.py` enforces the other half — every launch site reaches here.
-
-    IT RAISES, IT DOES NOT SWALLOW. The three callers have three different and correct
-    policies (`Daemon._compacted_first` swallows everything, `retry_paused_turns`
-    escalates `BudgetExhausted`, `ops._resume_after_budget` reports), and a shared
-    swallow would silently delete the budget escalation.
-    """
+    """The ONE compaction decision, for every path that relaunches a conversation"""
     assert pause is None or queue is None, "a relaunch is either a pause or a prompt"
     due = compaction_due(store, wo, min_context, now=now, pause=pause)
     if due is None:
@@ -590,14 +290,7 @@ def compact_before_relaunch(store: ProjectStore, project: ProjectSpec,
 
 def compact(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
             due: Compaction) -> dict[str, Any]:
-    """Summarise the conversation, as a turn of its own, before the next prompt.
-
-    A turn rather than a blocking call inside the delivery pass: compacting a 300k
-    conversation takes ~30 seconds, the daemon's reconcile loop cannot stop for that,
-    and the existing poll/reap machinery already knows how to wait for a `claude -p`
-    that is out. The queued message stays QUEUED and goes out on the tick after this
-    settles, into a session whose cache is warm again.
-    """
+    """Summarise the conversation, as a turn of its own, before the next prompt"""
     _release_background_owner(store, wo)
     cwd = worktree_path(project, wo) or project.path
     store.add_event(wo["id"], "compacting", {
@@ -607,24 +300,13 @@ def compact(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
                    resume=True, worktree=None, cwd=cwd)
 
 
-#: The source a relaunch queued behind a compaction carries (`compact_then_resume`).
-#: NOT `queue_message`'s default `"jarvis"`: `ops._resume_after_budget` distinguishes a
-#: queued relaunch from an ordinary `wo send` on this value alone (spec
-#: docs/superpowers/specs/2026-09-29-one-compaction-decision-on-every-relaunch.md §3.5).
-#: In `timeline.UNAUTHORED_SOURCES` — nobody decided it.
+#: The source a relaunch queued behind a compaction carries (`compact_then_resume`) (docs/superpowers/specs/2026-09-29-one-compaction-decision-on-every-relaunch.md §3.5)
 RESUME_SOURCE = "relaunch"
 
 
 def compact_then_resume(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
                         pause: "TurnPause", due: Compaction) -> dict[str, Any]:
-    """Queue the paused turn's relaunch, then compact; delivery sends it afterwards.
-
-    WHAT IS QUEUED is what `retry` would have sent, with one honest change: a turn that
-    reached the model is told its conversation was compacted rather than that it is
-    intact. A turn refused before it ran is queued verbatim — the worker never saw it.
-    The queued message is held while the compaction runs (the order is busy) and goes
-    out on the tick after it settles, into a summarised, warm conversation.
-    """
+    """Queue the paused turn's relaunch, then compact; delivery sends it afterwards"""
     turn = pause.turn
     prompt = (_nudge_after_compaction(pause) if _reached_model(turn)
               else turn["prompt"])
@@ -640,31 +322,17 @@ def _compact_after_queueing(store: ProjectStore, project: ProjectSpec,
                             wo: dict[str, Any], prompt: str, due: Compaction,
                             queued_out: dict[str, Any] | None = None,
                             ) -> dict[str, Any]:
-    """Queue a prompt that was about to be LAUNCHED, then compact in front of it.
-
-    The dispatch-resume path (spec §3.6): a work order can reach dispatch a second time
-    with its session intact, and then the dispatch prompt is an ordinary message into an
-    existing conversation. `queued_out` hands the message id back the way `_launch` hands
-    back a briefing — `dispatch_work_order` records it on the event that replaces
-    `dispatched`.
-    """
+    """Queue a prompt that was about to be LAUNCHED, then compact in front of it"""
     msg_id = store.queue_message(wo["id"], prompt, source=RESUME_SOURCE)
     if queued_out is not None:
         queued_out["msg_id"] = msg_id
-    # No event of its own: `compact` writes `compacting`, and the caller writes what it
-    # did INSTEAD of launching — `dispatch_deferred_for_compaction` carries this msg_id.
+    # No event of its own: `compact` writes `compacting`
     return _compact_or_withdraw(store, project, wo, due, msg_id)
 
 
 def _compact_or_withdraw(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
                          due: Compaction, msg_id: int) -> dict[str, Any]:
-    """Compact, and take the queued relaunch back if the compaction cannot launch.
-
-    QUEUE-FIRST STAYS: erasing the pause before the relaunch is queued is the stall
-    issue #843 exists to prevent. This is the other half — a queued relaunch left behind
-    by a compaction that never ran goes out later behind a second one, which is two
-    relaunches of one lost turn (spec §2, §3.3).
-    """
+    """Compact, and take the queued relaunch back if the compaction cannot launch (#843)"""
     try:
         return compact(store, project, wo, due)
     except Exception:
@@ -674,21 +342,7 @@ def _compact_or_withdraw(store: ProjectStore, project: ProjectSpec, wo: dict[str
 
 def _record_compaction(store: ProjectStore, project_name: str, wo_id: str,
                        turn: dict[str, Any], result: claude_cli.TurnResult) -> None:
-    """Put the compaction's outcome on the timeline and its cost on the bill.
-
-    THE COST HAS TO BE WRITTEN DOWN HERE OR IT IS LOST. A compaction makes a full-sized
-    API call and writes no assistant message, so `usage.read_session` — the worker half
-    of every cost surface — cannot see it (`claude_cli.COMPACT_PROMPT`). Recorded in
-    `agent_usage` instead, which is where the OS's own spend on a work order already
-    goes: without this the saving would be reported gross, and a net figure that hides
-    the cost of the remedy is the one thing this feature must not produce.
-
-    CALLED ON BOTH OUTCOMES, so `ok` goes in the payload and `timeline._describe`
-    renders the two apart. A compaction that died spent what it spent and has to stay
-    on the bill — but the conversation was NOT compacted, there is no before/after to
-    show, and an event that reads the same either way would make the saving asserted
-    rather than provable, which is the half the self-healing rule is about.
-    """
+    """Put the compaction's outcome on the timeline and its cost on the bill"""
     from . import agent_usage
 
     session_id = str(store.get_work_order(wo_id).get("session_id") or "")
@@ -703,8 +357,7 @@ def _record_compaction(store: ProjectStore, project_name: str, wo_id: str,
     store.add_event(wo_id, "compacted", {
         "seq": turn["seq"],
         "ok": result.ok,
-        # The CLI's own measurement of what it achieved, not an estimate of ours. Both
-        # are None on a failure — no boundary was written, so there is nothing to read.
+        # The CLI's own measurement of what it achieved, not an estimate of ours
         "before": (done or {}).get("pre"),
         "after": (done or {}).get("post"),
         "cost_usd": result.cost_usd,
@@ -727,12 +380,7 @@ def _launch(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any], promp
     from .dispatch import cache_ttl_env, worker_name
 
     wo_id = wo["id"]
-    # THE ONE POINT EVERY TURN PASSES THROUGH, which is why the budget is both checked
-    # and computed here rather than at the three callers. A `CentralStore` is opened per
-    # launch because the Jarvis half of the bill lives in it and the alternative was
-    # threading one through `start`, `send` and `retry` and every one of their callers —
-    # a connection whose cost is nothing beside spawning a `claude` process, and a
-    # correctness property (no launch path can forget the cap) bought for it.
+    # THE ONE POINT EVERY TURN PASSES THROUGH
     central = CentralStore()
     try:
         out = budget.exhaustion(store, central, wo)
@@ -742,11 +390,7 @@ def _launch(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any], promp
     finally:
         central.close()
     tdir = turns_dir(project, wo_id)
-    # The row exists before the process does: a turn that started with nothing on record
-    # would run to completion with no one to reap it or capture what it said.
-    # Resolved ONCE per turn and used for both halves — the settings file is written from
-    # the same `project.worker.cache_ttl`, so they cannot drift. §3-§4 of
-    # docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md
+    # The row exists before the process does: a turn that started with nothing on record would run to... (docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md)
     arm = project.worker.cache_ttl
     turn = store.create_turn(wo_id, kind=kind, prompt=prompt, msg_id=msg_id,
                              cache_ttl=arm)
@@ -762,9 +406,7 @@ def _launch(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any], promp
             outfile=outfile,
             errfile=errfile,
             resume=resume,
-            # Named from the row that already exists, which is what makes the name unique
-            # per (work order, sequence) — `systemd-run` refuses a unit name already in
-            # use, and a resumed or retried turn always has a fresh seq.
+            # Named from the row that already exists
             unit=systemd_units.unit_name(wo_id, turn["seq"]),
             cache=cache_ttl_env(arm),
             name=worker_name(wo),
@@ -779,37 +421,25 @@ def _launch(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any], promp
     store.add_event(wo_id, "turn_started", {
         "seq": turn["seq"], "kind": kind, "pid": spawned.pid, "unit": spawned.unit,
         "session_id": wo["session_id"], "resumed": resume,
-        # Where the branch stood when this turn began, so a harvest can scope its
-        # reading to the TURN rather than the whole order — §2 of
-        # docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md. "" when git cannot say.
+        # Where the branch stood when this turn began (docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md)
         "head": _head_sha(cwd),
-        # The arm this turn was launched on, for the timeline — spec §4, same file as the
-        # `arm` resolution above.
+        # The arm this turn was launched on, for the timeline
         "cache_ttl": arm,
     })
     log.info("[%s] %s turn %s for %s (pid %s%s)", project.name, kind, turn["seq"],
              wo_id, spawned.pid, f", unit {spawned.unit}" if spawned.unit else "")
     fresh = store.get_turn(turn["id"])
-    # `start` asks for the briefing back through this dict — see its docstring. An
-    # out-parameter rather than a second return value because `send`, `retry` and
-    # `compact` all return this row straight to callers that treat it as a DB row.
+    # `start` asks for the briefing back through this dict — see its docstring
     if briefing_out is not None:
         briefing_out.update(briefing)
-    # THE CONTEXT LEDGER, for every turn EXCEPT the seq-1 dispatch turn — Neo's ruling on
-    # question 681. That one is recorded by `dispatch.dispatch_work_order`, which is the
-    # only caller holding the `KnowledgeBrief` the knowledge block is measured from. The
-    # partition is by (kind, seq) and not by kind: a RETRIED dispatch turn takes a fresh
-    # seq, so it lands here, and every turn is therefore recorded exactly once by exactly
-    # one writer (spec docs/superpowers/specs/2026-09-24-order-observability.md §5).
+    # THE CONTEXT LEDGER, for every turn EXCEPT the seq-1 dispatch turn — Neo's ruling on question 681 (docs/superpowers/specs/2026-09-24-order-observability.md §5)
     if kind != "dispatch" or turn["seq"] > 1:
         context.record(store, project, wo, fresh, briefing)
     return fresh  # type: ignore[return-value]
 
 
 def _head_sha(cwd: Path | None) -> str:
-    """`git rev-parse HEAD` in the directory the turn runs in, or "". One subprocess per
-    turn, on `branchproof.run`'s timeout — spec §2 of
-    docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md."""
+    """`git rev-parse HEAD` in the directory the turn runs in, or "" (docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md)"""
     from . import branchproof
 
     if cwd is None:
@@ -818,17 +448,7 @@ def _head_sha(cwd: Path | None) -> str:
 
 
 def _release_background_owner(store: ProjectStore, wo: dict[str, Any]) -> None:
-    """Hand a session over from the background agent that owns it, if one does.
-
-    `--resume` refuses a session a background agent still holds, and two kinds of work
-    order can be in that state: one dispatched before headless turns existed, and one
-    adopted from a session the user started themselves. Both are recognised the same
-    way — no turn on record means Jarvis has never driven this conversation — so the
-    roster is consulted exactly once per work order and never again afterwards.
-
-    Best effort throughout: if the roster is unreachable the resume will fail loudly on
-    its own, which is a better error than one raised here.
-    """
+    """Hand a session over from the background agent that owns it, if one does"""
     if store.latest_turn(wo["id"]) is not None:
         return  # already on the headless transport
     sid = wo.get("session_id")
@@ -847,12 +467,7 @@ def _release_background_owner(store: ProjectStore, wo: dict[str, Any]) -> None:
 
 
 def poll(store: ProjectStore, project_name: str = "") -> list[dict[str, Any]]:
-    """Reap every turn whose process has ended. Returns the turns that just settled.
-
-    Turn-level only: this decides whether a *turn* finished and records what it said.
-    Deciding what that means for the *work order* is the reconciler's job, which reads
-    these rows.
-    """
+    """Reap every turn whose process has ended"""
     settled: list[dict[str, Any]] = []
     for turn in store.running_turns():
         if claude_cli.process_alive(turn["pid"]):
@@ -866,15 +481,7 @@ def poll(store: ProjectStore, project_name: str = "") -> list[dict[str, Any]]:
 
 
 def _unit_still_running(turn: dict[str, Any]) -> bool:
-    """Liveness of last resort, for a turn whose transient unit started but whose main
-    pid could not be read back.
-
-    The pid stays the primary answer — it is cheaper, it is what every other caller uses,
-    and for a unit-hosted turn it is the `claude` process itself, so `process_alive`'s
-    "no longer our child" case already covers a daemon restart. This only stops a turn
-    that is demonstrably running from being reaped as dead over a missing number, so it
-    is asked only once the pid has said nothing useful.
-    """
+    """Liveness of last resort, for a turn whose transient unit started but whose main pid could not be..."""
     unit = turn.get("unit")
     return bool(unit) and turn["pid"] is None and systemd_units.unit_active(unit)
 
@@ -886,10 +493,7 @@ def _reap(store: ProjectStore, turn: dict[str, Any],
         Path(turn["outfile"]),
         Path(turn["errfile"]) if turn["errfile"] else None,
         previous=store.turn_usage_before(wo_id, turn["seq"]))
-    # The turn's prompt file, if the brief was too big for argv. Deleted HERE and not in
-    # `spawn_turn`: the process has ended, so stdin has been read or never will be. Only
-    # when an outfile was named — a turn row that never spawned has none. Spec §3:
-    # docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
+    # The turn's prompt file, if the brief was too big for argv (docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md)
     if turn["outfile"]:
         Path(turn["outfile"]).with_suffix(".prompt").unlink(missing_ok=True)
     if result is None:
@@ -900,18 +504,12 @@ def _reap(store: ProjectStore, turn: dict[str, Any],
         if auth:
             payload |= {"reason": PAUSE_AUTH}
         store.add_event(wo_id, "turn_paused" if auth else "turn_failed", payload)
-        # The envelope is what `cost_usd` normally comes from and there is none, so the
-        # transcript answers instead. Without this the turn is billed $0.00 for ever.
+        # The envelope is what `cost_usd` normally comes from and there is none
         cost = lost_turn_cost(store, wo_id, turn)
         settled = store.finish_turn(turn["id"], "failed", error=error, cost_usd=cost,
                                     cost_source=COST_FROM_TRANSCRIPT)
         if not auth:
-            # WHAT THE TURN LEFT ON DISK, on the `turn_failed` outcome alone — a pause
-            # resumes the same session and a checkpoint commit under a live worker
-            # surprises it mid-task. After `finish_turn` and wrapped here rather than
-            # inside the module, so a daemon killed mid-harvest leaves a SETTLED turn
-            # with no harvest and an ImportError is caught too (spec §7):
-            # docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md.
+            # WHAT THE TURN LEFT ON DISK, on the `turn_failed` outcome alone (docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md)
             try:
                 from . import harvest
 
@@ -922,29 +520,10 @@ def _reap(store: ProjectStore, turn: dict[str, Any],
                 log.warning("could not harvest turn %s of %s: %s", turn["seq"], wo_id,
                             exc)
         return settled
-    # Recorded on BOTH outcomes: a failed turn's tokens were spent just the same — the
-    # turn that motivated this hit a 429 having already paid $0.07 for the attempt.
+    # Recorded on BOTH outcomes: a failed turn's tokens were spent just the same
     usage_json = json.dumps(result.usage) if result.usage else None
     if not result.ok:
-        # A turn lost to the usage window or to a broken API is not a failure of the
-        # work, so it does not get "Worker turn failed" in the timeline — the turn row
-        # still records state `failed`, which is the plumbing truth, but the story the
-        # user reads is that the OS paused and will resume itself. Emitted here, where a
-        # turn is reaped exactly once, so a pause lasting hours says so once and not
-        # every tick.
-        #
-        # Classified off the LIVE result rather than the row about to be written, which
-        # is the same evidence `_diagnose` will re-read later (the row carries both
-        # fields for exactly that reason) — but this is the one moment the stderr tail is
-        # also in hand.
-        # THE BUDGET IS TESTED FIRST AND IT IS NOT A PAUSE. A turn the CLI stopped for
-        # `--max-budget-usd` did real work and spent real money, and nothing about it
-        # gets better by being retried — a relaunch would simply spend the next budget
-        # the same way. So it gets its own event and falls through to `finish_turn`
-        # without a `reason`, which is what keeps `turn_pause` returning None for it and
-        # stops `retry_paused_turns` ever picking it up. What the WORK ORDER does about
-        # it is `Daemon.settle_work_order`'s, decided from the accounting rather than
-        # from this signal (`budget.exhaustion` says why).
+        # A turn lost to the usage window or to a broken API is not a failure of the work
         overspent = claude_cli.stopped_for_budget(result)
         auth = None if overspent else claude_cli.auth_failure(result.error)
         limit = None if overspent or auth else claude_cli.usage_limit(result.error)
@@ -973,8 +552,7 @@ def _reap(store: ProjectStore, turn: dict[str, Any],
             wo_id, "turn_paused" if auth or limit or transient else "turn_failed",
             payload)
         if turn["kind"] == COMPACT_TURN:
-            # A compaction that died still spent what it spent, and the same argument
-            # applies: nothing downstream can see it unless it is written here.
+            # A compaction that died still spent what it spent
             _record_compaction(store, project_name, wo_id, turn, result)
         return store.finish_turn(turn["id"], "failed", error=result.error,
                                  result=result.result or None,
@@ -984,10 +562,7 @@ def _reap(store: ProjectStore, turn: dict[str, Any],
                                  api_error_status=result.api_error_status)
 
     if turn["kind"] == COMPACT_TURN:
-        # NOT A REPLY, AND NOT THE WORKER'S. `/compact` returns an empty `result`, and
-        # the fallback below would hand back the summary the CLI wrote — recording it
-        # would put a message the worker never sent into the work order's record, and
-        # `record_agent_reply` is what the dashboard, the digest and `wo show` read.
+        # NOT A REPLY, AND NOT THE WORKER'S
         _record_compaction(store, project_name, wo_id, turn, result)
         return store.finish_turn(turn["id"], "done", result="",
                                  cost_usd=result.cost_usd,
@@ -995,11 +570,7 @@ def _reap(store: ProjectStore, turn: dict[str, Any],
 
     reply = result.result or _last_assistant_message(store, wo_id, turn)
     msg_id = store.record_agent_reply(wo_id, reply) if reply else None
-    # WHAT THE TURN LEFT RUNNING, asked here because this is the one place a turn is
-    # settled exactly once — a reconciler branch would re-derive it every tick
-    # (kn-089de524). The reply is already on the record: what this decides is whether it
-    # is still true. Spec
-    # docs/superpowers/specs/2026-09-22-a-dead-background-job-is-not-a-live-one.md.
+    # WHAT THE TURN LEFT RUNNING, asked here because this is the one place a turn is settled exactly once... (docs/superpowers/specs/2026-09-22-a-dead-background-job-is-not-a-live-one.md)
     orphaned = background.orphaned_in_turn(store, wo_id, turn)
     if orphaned:
         background.record(store, wo_id, turn, orphaned, msg_id)
@@ -1014,9 +585,7 @@ def _reap(store: ProjectStore, turn: dict[str, Any],
 
 def _last_assistant_message(store: ProjectStore, wo_id: str,
                             turn: dict[str, Any]) -> str:
-    """Backup reply source: what the `Stop` hook saw, for a turn whose JSON came back
-    with an empty `result`. The hook fires inside the session and carries the final
-    message verbatim, so it is the same text by another road."""
+    """Backup reply source: what the `Stop` hook saw"""
     from . import db
 
     for event in reversed(store.list_events(wo_id, limit=200)):
@@ -1029,26 +598,13 @@ def _last_assistant_message(store: ProjectStore, wo_id: str,
     return ""
 
 
-#: What the OS used to say about EVERY turn that died this way, and all it could say.
-#: Kept as the last resort only.
+#: What the OS used to say about EVERY turn that died this way, and all it could say
 NO_RESULT = "the turn's process ended without writing a result"
 
 
 def lost_turn_cost(store: ProjectStore, wo_id: str,
                    turn: dict[str, Any]) -> float | None:
-    """What a turn spent, when the CLI never got to say — read off the transcript.
-
-    THE MONEY IS REAL AND THE ENVELOPE IS NOT THE ONLY RECORD OF IT. `finish_turn` SETs
-    `cost_usd`, so a settle that omits it writes NULL and `budget.spent` bills the turn
-    nothing for ever; a turn killed by a reboot, an OOM, a machine bounce or a cancel is
-    exactly the turn that ran long enough to be expensive (issue #471).
-
-    A FLOOR — list prices, lead agent only (`usage.cost_between` says why) — and
-    `project_store.COST_FROM_TRANSCRIPT` is what the caller stamps the row with. None
-    when there is no session, no transcript or nothing inside the window, which is the
-    honest answer for a turn that died before its first API call and leaves the column
-    NULL rather than asserting a zero.
-    """
+    """What a turn spent, when the CLI never got to say — read off the transcript (#471)"""
     try:
         session_id = store.get_work_order(wo_id).get("session_id")
     except KeyError:
@@ -1065,20 +621,7 @@ def lost_turn_cost(store: ProjectStore, wo_id: str,
 
 def _transcript_error(store: ProjectStore, wo_id: str,
                       turn: dict[str, Any]) -> str:
-    """Why a turn died, recovered from the session transcript — the third place to look.
-
-    `claude -p` can exit writing neither the result JSON nor a byte of stderr, and then
-    the transcript is the only record of the reason. It writes one there as an assistant
-    message from `<synthetic>`, its own voice: "Failed to authenticate: OAuth session
-    expired and could not be refreshed" is what all three of the 2026-08-27 work orders
-    were really saying while the OS reported `NO_RESULT` (kn-8d466c3d).
-
-    TWO VOICES, AND ONLY ONE OF THEM IS AN ERROR. A `<synthetic>` message is the CLI
-    speaking and is returned verbatim, so `_diagnose` can classify it. Anything else is
-    the WORKER speaking — its last words before something killed the process — which is
-    worth showing and must not be read as a diagnosis, so it goes back wrapped in
-    `NO_RESULT` rather than standing in for it.
-    """
+    """Why a turn died, recovered from the session transcript — the third place to look"""
     session_id = store.get_work_order(wo_id).get("session_id")
     if not session_id:
         return ""
@@ -1108,79 +651,22 @@ def is_stalled(turn: dict[str, Any] | None) -> bool:
                 and time.time() - turn["started_at"] > TURN_STALL_SECONDS)
 
 
-# -- parked, and coming back by itself ------------------------------------------------
-#
-# THREE WAYS A TURN DIES WITHOUT THE WORK BEING WRONG, and none is the work order's
-# fault, so none should cost the user an evening.
-#
-#   `usage_limit`  the account's window is spent. The turn did not happen at all:
-#                  nothing was sent, nothing was billed, and the CLI says WHEN the
-#                  window reopens, so the wait is a fact rather than a guess.
-#   `transient`    the transport broke — a 500, a 529, a dropped connection. The turn
-#                  DID happen, possibly at length, and nothing says when the API will
-#                  be well again, so the wait is a backoff (`TRANSIENT_BACKOFF`).
-#   `auth`         Claude Code could not sign in. Nothing about the wait is a duration:
-#                  it ends when a human runs `/login`, so the moment it may go again is
-#                  read off the credentials file rather than computed (`PAUSE_AUTH`).
-#
-# Treating any of them as a failure settles the work order into `failed`, which is a
-# DEPENDENCY_DEAD_STATUS, fails the parent feature order and puts a permanent attention
-# flag on something that will be fine again in a minute — or the minute after the user
-# signs in. So the OS does not fail it at all: the work order stays in an ACTIVE status
-# and `Daemon.retry_paused_turns` relaunches the turn when the wait is up. (Auth is the
-# one that changes status while it waits, to `waiting_input`, because it is the one the
-# user has to do something about — `Daemon._park_on_signin`.)
-#
-# WHY ONE ABSTRACTION AND NOT THREE. The pause is read in five places — the settler,
-# message delivery, the retry pass, `invariants.status_label` and INV-PAUSE-OVERDUE —
-# and every one of them asks the same question ("is this work order coming back by
-# itself, and when?"). A second parallel predicate would mean five more call sites that
-# could be updated one at a time and drift, which is the exact failure the original
-# design called out. So there is ONE predicate, `turn_pause`, the reason it returns is a
-# field, and even auth — whose answer is "yes, but on an action rather than a clock" —
-# is expressed as a `retry_at` rather than as machinery of its own.
-#
-# There is still NO column and NO status for the pause itself. It is re-derived from the
-# latest turn every time it is asked for, which is the rule project_store.py states for
-# exactly this choice ("`waiting_pr_merge` earned a status because nothing derived it;
-# this does not"). What IS stored is the turn's own diagnosis — the CLI's
-# `terminal_reason` and `api_error_status` — because that is evidence, and the file it
-# came from gets pruned.
+# -- parked, and coming back by itself
 
-#: The window is spent. Deterministic: the refusal names the moment it reopens.
+#: The window is spent
 PAUSE_USAGE_LIMIT = "usage_limit"
-#: The API broke. Nothing names a moment, so `TRANSIENT_BACKOFF` picks one.
+#: The API broke
 PAUSE_TRANSIENT = "transient"
-#: THE ODD ONE OUT, AND THE COMMENT ABOVE IS WHY IT IS STILL HERE. Claude Code could not
-#: authenticate. It clears when a human runs `/login`, which may be in thirty seconds or
-#: next week, so unlike the two above there is no deadline to wait on — and a backoff
-#: would be a guess that either hammers an account that cannot answer or leaves the user
-#: waiting an hour after signing back in.
-#:
-#: SO THE EVIDENCE IS THE CLOCK. `_auth_retry_at` reads `claude_cli.signin_changed_at`
-#: and hands back the moment the stored sign-in last changed, if that is after the turn
-#: died — and `NEVER` if it is not. `due()` stays the same clock comparison it is for
-#: the other two, every reader keeps working unchanged, and a relaunch can happen at most
-#: once per rewrite of the credentials file (Neo, question 169; this reverses question
-#: 167's `max_attempts = 0`, which settled these into `failed`).
+#: THE ODD ONE OUT, AND THE COMMENT ABOVE IS WHY IT IS STILL HERE
 PAUSE_AUTH = "auth"
 
-#: NOT A TRANSPORT PAUSE, AND NEVER DIAGNOSED AS ONE. `_reap` files a budget stop without
-#: a reason and `turn_pause` therefore returns None for it, which is what keeps
-#: `Daemon.retry_paused_turns` from relaunching a turn there is no money for — the whole
-#: point of the status. This value exists for the ONE relaunch that is legitimate:
-#: `ops._resume_after_budget`, after a person has raised the number, which constructs a
-#: `TurnPause` by hand to reuse `retry`'s rule about what a relaunch re-sends. Nothing
-#: reads it off a stored row, because nothing ever writes it to one.
+#: NOT A TRANSPORT PAUSE, AND NEVER DIAGNOSED AS ONE
 PAUSE_BUDGET = "budget"
 
-#: A `retry_at` that will not arrive. Not a far-future deadline: `resumable` tests for
-#: this exact value, so nothing goes looking at a clock that was never a promise.
+#: A `retry_at` that will not arrive
 NEVER = float("inf")
 
-#: What to call each reason in a sentence written for the user. Here rather than at each
-#: surface so the notification, the status note and the timeline cannot end up calling
-#: the same pause three different things.
+#: What to call each reason in a sentence written for the user
 PAUSE_NOUN = {
     PAUSE_USAGE_LIMIT: "usage-limit",
     PAUSE_TRANSIENT: "Claude API",
@@ -1191,23 +677,21 @@ PAUSE_NOUN = {
 
 @dataclass(frozen=True)
 class TurnPause:
-    """A work order that stopped for something other than the work, and is coming back."""
+    """A work order that stopped for something other than the work, and is coming back"""
 
-    #: `PAUSE_USAGE_LIMIT`, `PAUSE_TRANSIENT` or `PAUSE_AUTH` — why it stopped, and
-    #: which schedule decided `retry_at`.
+    #: `PAUSE_USAGE_LIMIT`, `PAUSE_TRANSIENT` or `PAUSE_AUTH`
     reason: str
-    #: The turn that died. Its `prompt` is what a retry re-sends, when it re-sends one.
+    #: The turn that died
     turn: dict[str, Any]
-    #: The earliest moment the OS will relaunch.
+    #: The earliest moment the OS will relaunch
     retry_at: float
-    #: Consecutive failures of this same kind, this one included.
+    #: Consecutive failures of this same kind, this one included
     attempts: int
-    #: The failure, verbatim and squeezed onto one line.
+    #: The failure, verbatim and squeezed onto one line
     message: str
-    #: When the usage window reopens, as the CLI stated it. None for a transient failure,
-    #: and for a limit message that named a reset in no time this parser could read.
+    #: When the usage window reopens, as the CLI stated it
     reset_at: float | None = None
-    #: The HTTP status, for a transient failure that carried one. Display only.
+    #: The HTTP status, for a transient failure that carried one
     status: int | None = None
 
     @property
@@ -1219,27 +703,12 @@ class TurnPause:
 
     @property
     def exhausted(self) -> bool:
-        """Retried enough. The work order fails for real and asks for the user.
-
-        NEVER TRUE FOR AUTH, whatever the streak says, and that is the point of the
-        whole reason: `failed` is a DEPENDENCY_DEAD_STATUS, so exhausting one would
-        strand its dependents and fail its parent feature order — which is what happened
-        to fo-e353491c on 2026-08-27 — for something a `/login` fixes. What limits an
-        auth relaunch is `retry_at` moving, which happens once per sign-in, not a count.
-        """
+        """Retried enough"""
         return self.reason != PAUSE_AUTH and self.attempts > self.max_attempts
 
     @property
     def resumable(self) -> bool:
-        """Will the OS relaunch this turn by itself — ever?
-
-        `due()` answers "not yet"; only this answers "not ever", which is a state solely
-        `PAUSE_AUTH` can be in. The two readers that must tell them apart are
-        `Daemon.deliver_messages`, which holds a queued message behind a lost turn that
-        is going out first and would otherwise hold the manual escape hatch for ever, and
-        `invariants.check_paused_turns_resume`, which reports a relaunch that did not
-        happen.
-        """
+        """Will the OS relaunch this turn by itself — ever?"""
         return not self.exhausted and self.retry_at != NEVER
 
     def due(self, now: float | None = None) -> bool:
@@ -1247,17 +716,7 @@ class TurnPause:
 
 
 def turn_pause(store: ProjectStore, wo_id: str) -> TurnPause | None:
-    """This work order's pause, or None if it is not in one.
-
-    None for every ordinary failure and for every healthy conversation, so callers use
-    it as the predicate itself. Costs one indexed row in the common case: the streak is
-    only counted once the latest turn is already known to be one of these.
-
-    The usage limit is tested first and `claude_cli.transient_failure` re-tests it, so a
-    429 can never be read as a transient fault however this is called. That ordering is
-    load-bearing: the un-retryable form of a 429 is a SPEND cap, and backing off and
-    retrying one would burn five attempts on something only the user can clear.
-    """
+    """This work order's pause, or None if it is not in one"""
     turn = store.latest_turn(wo_id)
     if turn is None or turn["state"] != "failed":
         return None
@@ -1282,8 +741,7 @@ def turn_pause(store: ProjectStore, wo_id: str) -> TurnPause | None:
             message=reason.message,
         )
     attempts = pause_streak(store, wo_id, PAUSE_TRANSIENT)
-    # One delay per attempt, and the last one repeats — which it only can when the
-    # streak has already run past the cap, i.e. when `exhausted` is about to be true.
+    # One delay per attempt, and the last one repeats
     delay = TRANSIENT_BACKOFF[min(max(attempts, 1), len(TRANSIENT_BACKOFF)) - 1]
     return TurnPause(
         reason=PAUSE_TRANSIENT,
@@ -1296,16 +754,7 @@ def turn_pause(store: ProjectStore, wo_id: str) -> TurnPause | None:
 
 
 def _auth_retry_at(ended: float) -> float:
-    """When an auth-paused turn may go again: the moment the sign-in last changed.
-
-    NOT anchored to the turn the way the other two reasons are (`_diagnose` explains why
-    they must be). Their deadline is a statement the CLI made when the turn died and can
-    only be read once; this is a live fact about the account that the user changes later,
-    on purpose, and re-reading it is the entire mechanism.
-
-    `NEVER` unless the change came AFTER the failure. A sign-in older than the turn is
-    the one that failed.
-    """
+    """When an auth-paused turn may go again: the moment the sign-in last changed"""
     changed = claude_cli.signin_changed_at()
     return changed if changed is not None and changed > ended else NEVER
 
@@ -1313,24 +762,7 @@ def _auth_retry_at(ended: float) -> float:
 def _diagnose(
     turn: dict[str, Any],
 ) -> claude_cli.AuthFailure | claude_cli.UsageLimit | claude_cli.TransientFailure | None:
-    """What this failed turn actually was, or None if it was an ordinary failure.
-
-    One place, so the pause and the streak that counts it can never disagree about what
-    a given turn was. The usage limit goes before the transient because its message is
-    also an API error and would otherwise be read as one; auth goes before BOTH, because
-    it is the one diagnosis here that no amount of retrying can improve.
-
-    A PURE FUNCTION OF THE ROW, AND `now` IS WHAT MAKES IT ONE. The refusal states a
-    wall-clock time ("resets 12pm") or a countdown ("resets in 2h 15m"), and both are
-    statements made at the moment the turn ENDED. Resolving them against the clock of
-    whichever pass happens to be asking is what cost wo-b4f207ad twelve hours: at 12:00
-    exactly, `claude_cli._reset_moment`'s "that time has gone, so it means tomorrow"
-    rule starts firing, so every subsequent pass pushed the deadline another day out
-    and `TurnPause.due` was never true — the deadline outran the pass chasing it, for
-    ever. The countdown form was worse still: `now + 2h15m` on every pass is a moment
-    that can never arrive. Anchored here instead, the answer is fixed the moment the
-    turn is settled and no later reader can move it.
-    """
+    """What this failed turn actually was, or None if it was an ordinary failure"""
     error = turn.get("error")
     auth = claude_cli.auth_failure(error)
     if auth is not None:
@@ -1346,16 +778,7 @@ def _diagnose(
 
 
 def pause_streak(store: ProjectStore, wo_id: str, reason: str) -> int:
-    """How many turns in a row this conversation has lost to `reason`.
-
-    Counted off the end of the conversation rather than stored, so it resets itself the
-    moment one turn gets through — which is the only definition of "recovered" that does
-    not need a column someone has to remember to clear.
-
-    The count stops at the first turn that was anything ELSE, a different pause reason
-    included: a conversation that hit the usage limit and then hit a 500 is on its first
-    500, and charging it the limit's attempts would cut its backoff short.
-    """
+    """How many turns in a row this conversation has lost to `reason`"""
     want = {PAUSE_USAGE_LIMIT: claude_cli.UsageLimit,
             PAUSE_TRANSIENT: claude_cli.TransientFailure,
             PAUSE_AUTH: claude_cli.AuthFailure}[reason]
@@ -1369,61 +792,11 @@ def pause_streak(store: ProjectStore, wo_id: str, reason: str) -> int:
 
 def retry(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
           pause: TurnPause) -> dict[str, Any]:
-    """Relaunch a turn the transport lost. Same conversation, and usually same prompt.
-
-    WHAT IT RE-SENDS DEPENDS ON WHETHER THE TURN EVER REACHED THE MODEL (Neo, question
-    126). The prompt is read back off the turn row, which is why nothing is lost when the
-    lost turn was carrying a user message: `Daemon._deliver` marks a message `delivered`
-    the instant the process starts, so the turn row is the only remaining copy of what
-    the worker never got to read. Re-sending it verbatim is exactly right for a turn that
-    was refused BEFORE it ran — the conversation is untouched and the worker has still
-    never seen the message.
-
-    It is wrong for a turn that died in flight. Verified on wo-4f460495, the work order
-    that motivated this: its turn took a 500 after 350 seconds, and the session transcript
-    holds the prompt followed by ~55 messages and $1.99 of real work. Re-sending the
-    prompt there would put the same user message into the conversation a second time and
-    invite the worker to redo everything it had already done. So when the turn reached the
-    model, the retry resumes with a short continuation nudge instead (`_nudge`) and lets
-    the transcript speak for what was already said.
-
-    The test is `duration_api_ms`, which the CLI reports on the failed envelope too: a
-    turn refused before it reached the API records 0 there, and a turn that got any
-    distance records the time it spent. It is read from the stored usage envelope, so it
-    outlives the result file.
-
-    THE PAUSE REASON IS NOT A PROXY FOR THAT, and an earlier version of this comment
-    claimed it was — that a usage-limit refusal always records 0, "verified across every
-    usage-limit refusal the fleet has recorded". That is false, and the fleet has since
-    disproved it comprehensively: on 2026-08-22 five work orders were refused for the
-    session limit MID-TURN, after real work, recording 223,944ms / 433,119ms /
-    545,416ms / 1,003,519ms / 1,150,038ms of API time and $1.69–$15.80 of spend apiece.
-    The window can close under a conversation that is already running, not only in front
-    of one about to start. Reading the measurement rather than trusting the reason is
-    what makes this correct anyway — do not "simplify" it back to a check on
-    `pause.reason`, which would re-send a prompt those five workers had already acted on.
-
-    Two flags have to be re-decided rather than copied off the original turn, because a
-    failure can land on either side of both. Each is settled by asking the filesystem
-    what actually exists, so the answer is a fact and not a guess about how far the CLI
-    got before it gave up:
-
-    * `--resume` vs `--session-id`: a session that was never written cannot be resumed,
-      and one that WAS cannot be re-opened. The transcript file is the test.
-    * `--worktree`: the flag creates the worktree, so passing it again once the
-      directory exists asks for one that is already there. Once it exists the retry
-      simply runs from inside it, which is what every later turn does anyway.
-    """
+    """Relaunch a turn the transport lost"""
     turn = pause.turn
     started = _conversation_started(project, wo)
     tree = worktree_path(project, wo)
-    # Both halves are required. A turn can bill API time and still leave no session to
-    # resume (the opening turn, dying before the transcript lands), and nudging a
-    # conversation that does not exist would open one whose entire content is the nudge.
-    # A COMPACTION IS ALWAYS RE-SENT VERBATIM, whatever it reached. `/compact` is a
-    # command and not a conversation, so the nudge below — prose addressed to a worker
-    # mid-task — would land in the transcript as a user message asking nobody to
-    # continue nothing. Re-running it is safe: at worst it summarises a summary.
+    # Both halves are required
     nudge = started and _reached_model(turn) and turn["kind"] != COMPACT_TURN
     prompt = _nudge(pause) if nudge else turn["prompt"]
     return _launch(
@@ -1434,12 +807,7 @@ def retry(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
 
 
 def _reached_model(turn: dict[str, Any]) -> bool:
-    """Did this turn get as far as the API before it died?
-
-    False when there is no usage envelope at all: a turn reaped before that column
-    existed, or one that crashed without writing a result. Both are better served by the
-    verbatim re-send, which is the behaviour that was already there.
-    """
+    """Did this turn get as far as the API before it died?"""
     from . import db
 
     usage = db.from_json(turn.get("usage_json"), None)
@@ -1449,20 +817,8 @@ def _reached_model(turn: dict[str, Any]) -> bool:
 
 
 def _nudge(pause: TurnPause) -> str:
-    """What a worker is told when its own turn is relaunched under it.
-
-    Addressed to the worker, not the user, and it has one job: make clear that the
-    conversation above is intact and that the interruption was the transport, so the
-    worker continues instead of starting again. It says what happened because a worker
-    that can see the gap in its own transcript will otherwise spend a turn working out
-    what it missed.
-    """
-    # THE BUDGET IS NOT THE TRANSPORT, and saying so matters to the reader: a worker told
-    # "the Claude API failed" when in fact its spending ceiling was reached and then
-    # raised has been given a false account of its own conversation, and the sentence
-    # after it ("this was the transport, not anything you or the work did") compounds it.
-    # The work did cause this one — it cost money — and the honest framing is that the
-    # user has decided to fund more of it.
+    """What a worker is told when its own turn is relaunched under it"""
+    # THE BUDGET IS NOT THE TRANSPORT
     if pause.reason == PAUSE_BUDGET:
         return (
             "[Jarvis] Your previous turn was cut short because this work order reached "
@@ -1486,16 +842,8 @@ def _nudge(pause: TurnPause) -> str:
 
 
 def _nudge_after_compaction(pause: TurnPause) -> str:
-    """`_nudge`, for a relaunch that goes out behind a compaction (issue #843).
-
-    The one sentence `_nudge` cannot say here is "the conversation above is intact": the
-    OS summarised it while it waited, because re-sending it whole after the cache expired
-    would have cost more than the summary. The worker is told so, and told to trust the
-    disk over its memory of details the summary may have dropped.
-    """
-    # THE BUDGET IS NOT THE TRANSPORT, `_nudge`'s rule, and the budget-raise resume is a
-    # caller of this one since spec 2026-09-29 §3.5: the work DID cause this stop, and
-    # the sentence below about the transport would be a false account of it.
+    """`_nudge`, for a relaunch that goes out behind a compaction (issue #843)"""
+    # THE BUDGET IS NOT THE TRANSPORT
     if pause.reason == PAUSE_BUDGET:
         return (
             "[Jarvis] Your previous turn was cut short because this work order reached "
@@ -1532,23 +880,15 @@ def _conversation_started(project: ProjectSpec, wo: dict[str, Any]) -> bool:
 
 
 def cancel(store: ProjectStore, wo_id: str) -> dict[str, Any]:
-    """Take down the work order's in-flight turn, if it has one.
-
-    Best effort by design, exactly like the `claude stop` it replaces: the caller's
-    state change (cancelling, deleting) must never hinge on a process being killable.
-    """
+    """Take down the work order's in-flight turn, if it has one"""
     turn = busy(store, wo_id)
     if turn is None:
         return {"stopped": False, "reason": "no turn in flight"}
-    # The unit first, and then the process group anyway. Stopping the unit is the
-    # thorough half — systemd takes down the whole cgroup, MCP servers included — but it
-    # is `--no-block`, and a turn that fell back to the direct transport has no unit at
-    # all, so the signal still goes out either way.
+    # The unit first, and then the process group anyway
     unit = turn.get("unit")
     stopped_unit = systemd_units.stop_unit(unit) if unit else False
     killed = claude_cli.kill_process_group(turn["pid"]) or stopped_unit
-    # A cancelled turn wrote no envelope and spent what it spent; same fallback as the
-    # reap path, for the same reason.
+    # A cancelled turn wrote no envelope and spent what it spent
     store.finish_turn(turn["id"], "failed",
                       error="cancelled" if killed else "cancelled (process already gone)",
                       cost_usd=lost_turn_cost(store, wo_id, turn),
