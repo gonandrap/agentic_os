@@ -42,6 +42,19 @@ CLAUDE_BIN_ENV = "JARVIS_CLAUDE_BIN"
 #: docs/superpowers/specs/2026-08-22-the-five-minute-write-everywhere.md
 PROMPT_CACHE_5M_ENV = {"FORCE_PROMPT_CACHING_5M": "1"}
 
+#: Buy the ONE-HOUR write instead, for the `worker.cache_ttl` arm that asks for it. In
+#: `claude` 2.1.300 this is what returns `reason:"enable_1h_env"`, and the 5m flag
+#: short-circuits above it — so the arm must set this and NOT that. §2 of
+#: docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md
+PROMPT_CACHE_1H_ENV_KEY = "ENABLE_PROMPT_CACHING_1H"
+
+#: Every variable this decision OWNS. Absence is a value (the `cli` arm), so a caller
+#: that sets the TTL must also be able to say "none of these". Deliberately NOT the
+#: CLI's `CLAUDE_CODE_PROMPT_CACHE_TTL` pair, which Jarvis does not set: this tuple is
+#: what `spawn_turn` strips from the ambient environment, and stripping a variable the OS
+#: does not own is a change it cannot justify.
+CACHE_TTL_KEYS = (*PROMPT_CACHE_5M_ENV, PROMPT_CACHE_1H_ENV_KEY)
+
 
 #: WHICH TRANSPORT this session's turns run on, declared rather than assumed. Every rule
 #: that depends on a turn being one-shot (the PreToolUse backgrounding refusal, the crew
@@ -935,6 +948,7 @@ class SpawnedTurn:
 
 def spawn_turn(prompt: str, cwd: Path, session_id: str, outfile: Path,
                errfile: Path, resume: bool = False, unit: str | None = None,
+               cache: dict[str, str] | None = None,
                **kwargs: Any) -> SpawnedTurn:
     """Start one worker turn; returns the pid to track it by and the unit it runs in.
 
@@ -961,6 +975,10 @@ def spawn_turn(prompt: str, cwd: Path, session_id: str, outfile: Path,
     property holds for a turn launched without one. `os.environ` is overlaid FIRST here
     (it is ambient, not intent) — the opposite order from `_run`. Both transports build
     that same environment, which is the whole reason they share this one function.
+
+    `cache` is the WORKER'S ARM, from `dispatch.cache_ttl_env`: `None` is "no caller
+    opinion" and keeps the 5m default, `{}` is the `cli` arm and is not the same thing.
+    §3 of docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md
     """
     outfile.parent.mkdir(parents=True, exist_ok=True)
     # THE PROMPT FILE BELONGS TO THE TURN, like `<seq>.json` and `<seq>.err`, and
@@ -972,7 +990,10 @@ def spawn_turn(prompt: str, cwd: Path, session_id: str, outfile: Path,
     if promptfile is not None:
         promptfile.write_text(prompt, encoding="utf-8")
     args = turn_args(prompt, session_id, resume, prompt_via_stdin=big, **kwargs)
-    env = {**os.environ, **cache_env()}
+    # Stripped first so the `cli` arm's ABSENCE survives a daemon whose own process
+    # carries the flag — spec §3.
+    env = {k: v for k, v in os.environ.items() if k not in CACHE_TTL_KEYS}
+    env.update(cache_env() if cache is None else cache)
     if unit and systemd_units.use_transient_units():
         prefix = systemd_units.run_prefix(
             unit, cwd=cwd, outfile=outfile, errfile=errfile, env=env,

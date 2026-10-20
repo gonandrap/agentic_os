@@ -424,3 +424,80 @@ def test_workers_buy_the_five_minute_cache_not_the_one_hour_one(fleet, settle_tu
     settings = json.loads(
         (fleet["path"] / ".jarvis" / "worker-settings" / f"{wo['id']}.json").read_text())
     assert settings["env"]["FORCE_PROMPT_CACHING_5M"] == "1"
+
+
+def _worker_env(fleet, wo) -> dict:
+    settings = json.loads(
+        (fleet["path"] / ".jarvis" / "worker-settings" / f"{wo['id']}.json").read_text())
+    return settings["env"]
+
+
+def test_the_one_hour_arm_writes_only_the_one_hour_key(fleet, settle_turns):
+    """§2 of docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md: the 5m
+    flag short-circuits the CLI's TTL decision, so an arm carrying both is the control
+    arm wearing a label."""
+    store, project = fleet["store"], fleet["project"]
+    project.worker.cache_ttl = "1h"
+    wo = _wo(fleet)
+    worker_session.start(store, project, wo, "go")
+    assert settle_turns(store)
+
+    env = _worker_env(fleet, wo)
+    assert env["ENABLE_PROMPT_CACHING_1H"] == "1"
+    assert "FORCE_PROMPT_CACHING_5M" not in env
+
+
+def test_the_cli_arm_names_neither_key_in_the_settings_file(fleet, settle_turns):
+    """Absence IS the arm — the CLI's own automatic TTL (spec §1)."""
+    store, project = fleet["store"], fleet["project"]
+    project.worker.cache_ttl = "cli"
+    wo = _wo(fleet)
+    worker_session.start(store, project, wo, "go")
+    assert settle_turns(store)
+
+    env = _worker_env(fleet, wo)
+    assert [k for k in claude_cli.CACHE_TTL_KEYS if k in env] == []
+
+
+@pytest.mark.parametrize("arm", ["5m", "1h", "cli"])
+def test_every_turn_is_stamped_with_the_arm_it_ran_on(fleet, settle_turns, arm):
+    """§4: the stamp is written at LAUNCH from the resolved setting, before any API call,
+    so it is true whatever the account was doing — which is what tells a refused hour
+    apart from an arm that never applied (Trap 1)."""
+    store, project = fleet["store"], fleet["project"]
+    project.worker.cache_ttl = arm
+    wo = _wo(fleet)
+    turn, _ = worker_session.start(store, project, wo, "go")
+
+    assert store.get_turn(turn["id"])["cache_ttl"] == arm
+    events = [e for e in store.list_events(wo["id"]) if e["kind"] == "turn_started"]
+    assert json.loads(events[-1]["payload"])["cache_ttl"] == arm
+    assert settle_turns(store)
+
+
+def test_the_per_turn_table_carries_the_arm_even_with_no_usage(fleet):
+    """`ops._turn_row` is what `jarvis cost <wo-id>` renders, and the existing
+    cache_1h/cache_5m columns are the experiment's whole report — so the grouping key has
+    to be on the row of a turn with no usage recorded too (spec §4)."""
+    from jarvis import ops as ops_mod
+
+    store, project = fleet["store"], fleet["project"]
+    project.worker.cache_ttl = "1h"
+    wo = _wo(fleet)
+    turn, _ = worker_session.start(store, project, wo, "go")
+
+    row = ops_mod._turn_row(store.get_turn(turn["id"]), None)
+    assert row["cache_ttl"] == "1h"
+
+
+def test_a_turn_that_predates_the_column_reads_as_not_recorded(fleet):
+    """'' is "not recorded" and is NEVER read as an arm: every such turn did run at 5m,
+    but a reader asserting that would be stating a fact the row does not carry."""
+    from jarvis import ops as ops_mod
+
+    store = fleet["store"]
+    wo = _wo(fleet)
+    turn = store.create_turn(wo["id"], kind="dispatch", prompt="go")
+
+    assert store.get_turn(turn["id"])["cache_ttl"] == ""
+    assert ops_mod._turn_row(store.get_turn(turn["id"]), None)["cache_ttl"] == ""

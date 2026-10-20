@@ -913,6 +913,27 @@ def test_parse_verdict_still_escalates_a_reply_cut_off_mid_answer():
     assert v["reason"].startswith(neo_mod.UNPARSEABLE_PREFIX)
 
 
+def test_parse_verdict_folds_a_dispatch_emitted_as_a_second_object():
+    """Issue #1098: Neo answered, then emitted its dispatch as a SECOND object."""
+    v = neo_mod.parse_verdict(
+        '{"escalate": false, "answer": "x", "reason": "y"}\n'
+        'Dispatch filed alongside the answer:\n'
+        '{"dispatch": {"title": "t", "description": "d"}}')
+    assert v["escalate"] is False
+    assert v["answer"] == "x"
+    assert v["reason"] == "y"
+    assert v["dispatch"] == {"title": "t", "description": "d"}
+
+
+def test_two_objects_that_both_rule_still_escalate():
+    """Two verdicts is a reply that said two things — the fold refuses to pick one."""
+    v = neo_mod.parse_verdict(
+        '{"escalate": false, "answer": "x", "reason": "y"}\n'
+        '{"escalate": true, "answer": "", "reason": "z"}')
+    assert v["escalate"] is True
+    assert v["reason"].startswith(neo_mod.UNPARSEABLE_PREFIX)
+
+
 def test_answer_question_logs_the_full_raw_reply_when_it_cannot_be_parsed(
         jarvis_home, monkeypatch, caplog):
     """Every SURFACE clips the raw reply to 120 characters — the escalation reason, the

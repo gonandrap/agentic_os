@@ -241,6 +241,10 @@ ATTENTION_TEMPLATES: dict[str, tuple[str, tuple[str, ...]]] = {
     "message_stuck": ("MESSAGE_STUCK_BLOCKER", ()),
     "idle_no_finish": ("IDLE_NO_FINISH_BLOCKER", ()),
     "auth": ("AUTH_BLOCKER", ()),
+    # Two keys and no slot: §1 of
+    # docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md
+    "refusal_unanswered": ("REFUSAL_UNANSWERED_BLOCKER", ()),
+    "refusal_unanswered_document": ("REFUSAL_UNANSWERED_DOC_BLOCKER", ()),
 }
 
 #: The ONLY shape a value may have to reach a rendered sentence: a record id, or an issue

@@ -136,6 +136,31 @@ def test_a_merge_refused_because_the_base_moved_says_which_commit_moved():
     assert "{" not in entry["label"] + entry["detail"]
 
 
+def test_a_stall_with_a_tip_observed_names_both_commits():
+    """wo-d3a70c29 condition (a): the evidence IS the disagreement, so both shas."""
+    entry = build_timeline({}, [ev("pr_recompute_stalled", 1.0,
+                                   head_oid="0488753aaaa", ref_oid="88cac10bbbb",
+                                   branch="worktree-wo-cdee6f9b",
+                                   mergeable="UNKNOWN")], [])[0]
+    assert entry["label"] == "GitHub stopped recomputing the pull request"
+    assert "branch at 88cac10bbb" in entry["detail"]
+    assert "pull request head at 0488753aa" in entry["detail"]
+    assert "{" not in entry["label"] + entry["detail"]
+
+
+def test_a_stall_with_no_tip_observed_says_the_clock_and_names_no_branch():
+    """Condition (b): nothing was compared, so a "branch at " with an empty sha after it
+    would describe a comparison nobody made."""
+    entry = build_timeline({}, [ev("pr_recompute_stalled", 1.0,
+                                   head_oid="0488753aaaa", ref_oid="",
+                                   mergeable="UNKNOWN",
+                                   unknown_since=1.0)], [])[0]
+    assert entry["label"] == "GitHub stopped recomputing the pull request"
+    assert entry["detail"].startswith("mergeability unanswered since ")
+    assert "branch at" not in entry["detail"]
+    assert "{" not in entry["label"] + entry["detail"]
+
+
 def test_a_reparked_give_up_reads_as_a_sentence_and_not_a_json_dump():
     """THE TIMELINE IS THIS KIND'S ONLY SURFACE, and the move it records is the OS taking
     a status back — so "it fixed itself" has to be provable, as it is for

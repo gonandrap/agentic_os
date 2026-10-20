@@ -2001,6 +2001,10 @@ class HourWrites:
     directory: str = ""
     dispatched: int = 0
     foreign: int = 0
+    #: Jarvis's own transport buying the hour ON PURPOSE: a turn stamped with the `1h` or
+    #: `cli` arm (`wo_turns.cache_ttl`). NOT an alarm — the OS was told to buy it. §5 of
+    #: docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md
+    deliberate: int = 0
     #: First and last 1h WRITE, not the session's lifetime. A session mostly paying the
     #: correct rate must not report its whole span as the leak.
     first_ts: float = 0.0
@@ -2008,11 +2012,12 @@ class HourWrites:
 
     @property
     def total(self) -> int:
-        return self.dispatched + self.foreign
+        return self.dispatched + self.foreign + self.deliberate
 
     def as_dict(self) -> dict[str, Any]:
         return {"session_id": self.session_id, "directory": self.directory,
                 "dispatched": self.dispatched, "foreign": self.foreign,
+                "deliberate": self.deliberate,
                 "total": self.total, "first_ts": self.first_ts,
                 "last_ts": self.last_ts}
 
@@ -2037,8 +2042,24 @@ def _subagent_transcripts(path: Path) -> list[Path]:
     return sorted(directory.glob("*.jsonl")) if directory.is_dir() else []
 
 
+#: The arms that BOUGHT the hour on purpose — `catalog.VALID_WORKER_CACHE_TTL` minus the
+#: control. A turn stamped neither, or not stamped at all, is a breach if it is Jarvis's.
+DELIBERATE_ARMS = ("1h", "cli")
+
+
+def _arm_of(arms: Mapping[str, Sequence[tuple[float, float, str]]] | None,
+            session_id: str, ts: float) -> str:
+    """Which cache-TTL arm was running in `session_id` at `ts`, or "" — spec §5."""
+    for started_at, ended_at, arm in (arms or {}).get(session_id, ()):
+        if started_at <= ts <= ended_at:
+            return arm
+    return ""
+
+
 def one_hour_writes(since: float, *, root: Path | None = None,
-                    cfg: InspectConfig | None = None) -> list[HourWrites]:
+                    cfg: InspectConfig | None = None,
+                    arms: Mapping[str, Sequence[tuple[float, float, str]]] | None = None,
+                    ) -> list[HourWrites]:
     """Every session that bought the one-hour cache write since `since`, biggest first.
 
     ATTRIBUTION IS `_prompt_of`'s, NOT A SECOND POLICY. A turn is Jarvis's when the
@@ -2059,6 +2080,13 @@ def one_hour_writes(since: float, *, root: Path | None = None,
     their own evidence every one of them would read as a person's, which would hide
     exactly the breach this exists to catch. `_attach_calls` does the inheriting — their
     calls land in the parent turn that was running, by the rule the bill already uses.
+
+    AN ARM BOUGHT ON PURPOSE IS NOT A BREACH, and the oracle is the per-turn stamp
+    `arms` carries (session id to `(started_at, ended_at, arm)` intervals, from
+    `ProjectStore.turn_arms`) and never a second policy. A dispatched write inside a turn
+    stamped `1h` or `cli` is `deliberate`; one with no stamp, or none covering it, stays
+    `dispatched` — unknown is not a licence. §5 of
+    docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md
 
     AN UNKNOWN TTL IS NOT A 1h TTL. Only `ephemeral_1h_input_tokens` itself counts, so a
     row written before Claude Code reported the split contributes nothing — the floor
@@ -2090,10 +2118,12 @@ def one_hour_writes(since: float, *, root: Path | None = None,
                 if entry is None:
                     entry = found[path.stem] = HourWrites(session_id=path.stem,
                                                           directory=path.parent.name)
-                if dispatched:
-                    entry.dispatched += call.cache_1h
-                else:
+                if not dispatched:
                     entry.foreign += call.cache_1h
+                elif _arm_of(arms, path.stem, call.ts) in DELIBERATE_ARMS:
+                    entry.deliberate += call.cache_1h
+                else:
+                    entry.dispatched += call.cache_1h
                 entry.first_ts = min(entry.first_ts, call.ts) or call.ts
                 entry.last_ts = max(entry.last_ts, call.ts)
     return sorted(found.values(), key=lambda e: (-e.total, e.session_id))
@@ -2151,19 +2181,23 @@ def hour_alarms(found: Sequence[HourWrites], cfg: InspectConfig, *,
     """
     dispatched = sum(e.dispatched for e in found)
     foreign = sum(e.foreign for e in found)
+    deliberate = sum(e.deliberate for e in found)
     window = f"in the last {days} days"
     raised: list[Alarm] = []
     if dispatched >= cfg.alarm_cache_1h_dispatched_tokens:
+        # Scoped to the 5m arm, and the deliberate total named beside it: an arm that
+        # bought the hour on purpose is not a defect (spec §5).
         raised.append(Alarm(CACHE_1H_DISPATCHED_ALARM, (
             f"{dispatched:,} tokens were written at the ONE-HOUR cache TTL {window} by "
-            f"turns JARVIS ITSELF dispatched — about "
-            f"${_hour_premium_usd(dispatched):,.2f} at Opus list above what the "
-            f"five-minute write would have cost. `claude_cli.cache_env` forces "
-            f"FORCE_PROMPT_CACHING_5M on every process this OS starts, so this is a "
-            f"BREACH of that guarantee and a defect in the OS — not in anyone's personal "
-            f"configuration. Start at `claude_cli._run` and `spawn_turn`, the only two "
-            f"functions here that start a process, and at "
-            f"`dispatch._write_worker_settings`. Sessions: "
+            f"turns JARVIS ITSELF dispatched whose `wo_turns.cache_ttl` arm was 5m — "
+            f"about ${_hour_premium_usd(dispatched):,.2f} at Opus list above what the "
+            f"five-minute write would have cost. Those turns were launched to buy the "
+            f"FIVE-MINUTE write, so this is a BREACH of what they asked for and a defect "
+            f"in the OS — not in anyone's personal configuration. Start at "
+            f"`claude_cli.spawn_turn`'s `cache` argument, `dispatch.cache_ttl_env` and "
+            f"`dispatch._write_worker_settings`. A further {deliberate:,} tokens bought "
+            f"the hour ON PURPOSE on a 1h or cli arm {window}, which is not part of this "
+            f"figure and is not a fault. Sessions: "
             f"{_name_sessions(found, 'dispatched')}.")))
     if foreign >= cfg.alarm_cache_1h_tokens:
         raised.append(Alarm(CACHE_1H_FOREIGN_ALARM, (

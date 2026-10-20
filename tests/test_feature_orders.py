@@ -155,8 +155,9 @@ def test_the_planner_carries_the_ask_verbatim_and_a_planner_briefing(planning, s
     assert "Do not build the feature" in prompt
     # The rule the whole plan lives or dies on has to be in there.
     assert "sees its own description plus its section, and nothing else" in prompt
-    # And it must NOT be told to finish the ordinary way, because `fo plan` is its finish.
-    assert "Do not run `jarvis wo finish`" in prompt
+    # And `fo plan` is its finish — `jarvis wo finish` is only the re-delivery after a
+    # refusal (2026-10-14-an-unanswered-refusal-must-name-itself.md §5).
+    assert "IS your finish" in prompt
 
 
 def test_a_planner_runs_on_ordinary_worker_permissions(planning, store, project):

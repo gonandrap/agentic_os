@@ -28,6 +28,63 @@ def base_health_key(project: str) -> str:
     return f"base_health:{project}"
 
 
+def base_red_episodes_key(project: str) -> str:
+    """The `os_state` key holding one project's red-base episodes."""
+    return f"base_red_episodes:{project}"
+
+
+def advance_red_episodes(episodes: list[list[float | None]], red: bool, now: float,
+                         retention_seconds: float) -> list[list[float | None]]:
+    """The red-episode list after one TRANSITION, trimmed to the retention bound.
+
+    §2 of docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md,
+    Neo's ruling on question 1818. Green to red opens a pair, red to green closes the open
+    one, and pairs whose `end` is older than `now - retention_seconds` are dropped.
+    Idempotent, so a double call in one tick cannot open two episodes.
+
+    PURE and over the LIST rather than a store, `project_store.validation_ci_hold_spans`'
+    rule: the derivation lives in the module that owns the rows — here the `os_state` JSON
+    `base_red_episodes_key` already keys — beside the key it filters on.
+
+    `retention_seconds` is the CALLER's, resolved from
+    `fleet_health.red_episode_retention_hours`: the writer is the bound's reader, and the
+    bound is never a module constant.
+    """
+    out: list[list[float | None]] = [[p[0], p[1]] for p in episodes]
+    open_pair = out[-1] if out and out[-1][1] is None else None
+    if red and open_pair is None:
+        out.append([float(now), None])
+    elif not red and open_pair is not None:
+        open_pair[1] = float(now)
+    cutoff = float(now) - float(retention_seconds)
+    return [p for p in out if p[1] is None or float(p[1]) >= cutoff]
+
+
+def base_red_hold_spans(episodes: Sequence[Any], since: float, now: float,
+                        open_end: float) -> list[tuple[float, float]]:
+    """Every interval inside `[since, now]` this project's default branch was red.
+
+    §2 of the same spec: `ops.stuck_scan` discounts these seconds as well as excluding a
+    live hold, because `waiting_pr_merge` is judged on time in status — an exclusion alone
+    only postpones the defect to the first sweep after the base recovers (kn-6e30d561).
+
+    An OPEN pair ends at `open_end` and never at `now`: `Daemon.poll_default_branch` writes
+    nothing on `github.GitHubError`, so a `gh` that stopped answering would otherwise grow
+    the discount on a fact nobody can confirm — the one direction that must never happen.
+
+    Empty spans are dropped (`validation_ci_hold_spans`' `if end > start` rule), so a pair
+    entirely before the current status span contributes nothing.
+    """
+    spans: list[tuple[float, float]] = []
+    for pair in episodes:
+        start, end = pair[0], pair[1]
+        begin = max(float(start), since)
+        finish = min(open_end if end is None else float(end), now)
+        if finish > begin:
+            spans.append((begin, finish))
+    return sorted(spans)
+
+
 # Tag marking knowledge mirrored out of a Claude Code memory file rather than typed
 # by a worker via `jarvis learn add`.
 MEMORY_TAG = "claude-memory"
@@ -52,6 +109,13 @@ AIMED_VERBS = ("show", "search")
 #: `knowledge_brief`'s hint tier and by `ops.knowledge_usage_report`'s `could_have_read`;
 #: it lives here because the store cannot import `ops` (layering runs stores upward only).
 MISSED_MIN_WORDS = 3
+
+#: Backlog statuses that SATISFY a `bl-` precondition. `promoted` is not one: it says the
+#: item became a work order, not that its condition was met (spec
+#: docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md §2.6). One
+#: constant so `Daemon.clear_settled_preconditions` and `ops._split_preconditions` cannot
+#: drift onto two sets.
+SETTLED_BACKLOG_STATUSES = ("done", "dropped")
 
 
 def split_tags(tags: str) -> list[str]:
@@ -2292,3 +2356,41 @@ class CentralStore:
         except ValueError:
             return {}
         return fact if isinstance(fact, dict) else {}
+
+    def set_base_red_episodes(self, project: str,
+                              episodes: Sequence[Any]) -> None:
+        """This project's red-base episodes, as `[[start, end-or-null], ...]`.
+
+        §2 of docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md:
+        fleet-shaped, so it belongs beside `base_health` in `os_state`.
+        """
+        self.set_state(base_red_episodes_key(project),
+                       json.dumps([list(p) for p in episodes]))
+
+    def base_red_episodes(self, project: str) -> list[list[float | None]]:
+        """The stored episodes, or `[]` — absent, unparseable or not a list of pairs.
+
+        `base_health`'s tolerance: an unreadable list discounts nothing, which is the
+        under-discount direction the spec's degradation section requires.
+        """
+        raw = self.get_state(base_red_episodes_key(project))
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return []
+        if not isinstance(parsed, list):
+            return []
+        out: list[list[float | None]] = []
+        for pair in parsed:
+            if not isinstance(pair, list) or len(pair) != 2:
+                return []
+            start, end = pair
+            if isinstance(start, bool) or not isinstance(start, (int, float)):
+                return []
+            if end is not None and (isinstance(end, bool)
+                                    or not isinstance(end, (int, float))):
+                return []
+            out.append([float(start), None if end is None else float(end)])
+        return out

@@ -60,7 +60,7 @@ from . import (background, bugreport, bus, claude_cli, db, fleet, holds, inspect
                notify, release, usage_meter, worker_session)
 from . import budget as budget_mod
 from .catalog import Catalog, ProjectSpec, load_catalog
-from .central_store import CentralStore
+from .central_store import SETTLED_BACKLOG_STATUSES, CentralStore
 from .dispatch import dispatch_work_order
 from . import invariants as invariants_mod
 from .invariants import PR_REPAIR_STATUSES, RETRY_HELD_RESTATE
@@ -373,6 +373,169 @@ def polls_pull_request(store: ProjectStore, wo: dict[str, Any],
         return True
     from . import ops
     return bool(ops.routes_on_pull_request(store, wo))
+
+
+#: The timeline's record that GitHub has stopped recomputing one pull request. ONE per
+#: episode (`Daemon._note_recompute_stalled`), and the dedupe key the one-shot resync
+#: remedy keys on — wo-d3a70c29.
+PR_RECOMPUTE_STALLED_EVENT = "pr_recompute_stalled"
+
+
+def pr_recompute_stalled(store: ProjectStore, wo: dict[str, Any],
+                         now: float | None = None) -> bool:
+    """True when GitHub has stopped recomputing this pull request — wo-d3a70c29.
+
+    PR #995's shape: a push moved `refs/heads/worktree-wo-cdee6f9b` to 88cac10, the pull
+    request's head stayed at 0488753, and mergeability never left UNKNOWN — so
+    `Daemon.poll_pull_requests` kept asking, every acting branch kept declining, and the
+    order sat for ~7h with an actor on paper and nobody acting.
+
+    EITHER of two facts says so, and each is a cached row column:
+
+    (a) the tip `git ls-remote` reported and the head GitHub's own pull request record
+        holds are both observed and DIFFER — the record is behind the branch;
+    (b) mergeability has been unanswered for longer than
+        `pull_requests.recompute_stall_minutes`.
+
+    NOT a conflict and never read as one: UNKNOWN right after a push is the NORMAL state
+    (kn-5e93939e), which is what the threshold in (b) and the both-observed rule in (a)
+    are for. "" is NOT OBSERVED and disqualifies nothing.
+
+    COST: free row fields first, and the catalog read only once a free field says there
+    is something to judge. No network, no subprocess, no session file, no model — this
+    runs per order per reconcile tick through `invariants.true_blockers`.
+    """
+    ref = str(wo.get("pr_ref_oid") or "")
+    head = str(wo.get("pr_head_oid") or "")
+    if ref and head and ref != head:
+        return True
+    since = wo.get("pr_mergeable_unknown_since")
+    if not isinstance(since, (int, float)):
+        return False
+    from . import ops
+    minutes = int(ops.pull_requests_config_at(
+        store.project_path).recompute_stall_minutes)
+    return (now or time.time()) - float(since) > minutes * 60
+
+
+#: The one-shot resync episode, as four timeline kinds and NOTHING ELSE — wo-7ec57748,
+#: Neo question 1911 option B. No column (so no migration and no drift between a counter
+#: and the record: kn-5e93939e point 2), no blocker string, and no `ops.PrRepair`, whose
+#: whole shape is nudging a worker — nothing in this remedy messages anybody.
+PR_RESYNC_STARTED_EVENT = "pr_resync_started"
+PR_RESYNC_DONE_EVENT = "pr_resync_done"
+PR_RESYNC_FAILED_EVENT = "pr_resync_failed"
+PR_RESYNC_CLEARED_EVENT = "pr_resync_cleared"
+
+
+def _opened_episode(store: ProjectStore, wo: dict[str, Any],
+                    kind: str) -> float | None:
+    """When the latest `kind` event opened an episode, or None if there is none.
+
+    THE EPISODE ARITHMETIC, ONCE. All three predicates below ask the same two-part
+    question — "did the latest X happen, and has a Y answered it since?" — and a rule
+    with three expressions is three things free to drift. This half is the opening; the
+    answering half is `_answered_since`.
+    """
+    rows = store.events_of_kind(wo["id"], kind)
+    return float(rows[-1]["ts"]) if rows else None
+
+
+def _answered_since(store: ProjectStore, wo: dict[str, Any], kind: str,
+                    since: float) -> dict[str, Any] | None:
+    """The latest `kind` event at or after `since`, or None — the answering half.
+
+    Returns the ROW, not a bool, because one caller has to read its payload: see
+    `pr_resync_unreopened` on a close that never landed.
+    """
+    rows = store.events_of_kind(wo["id"], kind)
+    if rows and float(rows[-1]["ts"]) >= since:
+        return rows[-1]
+    return None
+
+
+def pr_resync_owed(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """True when this stall episode has not had its ONE close+reopen yet — wo-7ec57748.
+
+    `ProjectStore._this_conflict`'s arithmetic: episode state is DERIVED from the
+    timeline, never stored. `pr_recompute_stalled`'s event is the dedupe key — one per
+    episode by `Daemon._note_recompute_stalled`, re-armed by the push that supersedes the
+    stall — so "a stalled event with no attempt at or after it" is exactly one attempt per
+    episode, and the number the remedy decides on is the number the user reads. An attempt
+    whose `gh` call FAILED is an attempt spent: the bound is on what the OS tried, not on
+    what GitHub allowed.
+
+    COST: one indexed `wo_events` read, and a second only once the first says there is a
+    stall. Paid inside the stalled branch of `Daemon.poll_pull_requests` alone — never on
+    the green path.
+    """
+    stalled = _opened_episode(store, wo, PR_RECOMPUTE_STALLED_EVENT)
+    if stalled is None:
+        return False
+    return _answered_since(store, wo, PR_RESYNC_STARTED_EVENT, stalled) is None
+
+
+def pr_resync_unreopened(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """True when the OS closed this pull request and has not got it open again.
+
+    THE HAZARD GUARD. `gh pr view` answers CLOSED and unmerged between the close and the
+    reopen, and for ever if the reopen failed — so without this a poll would route the
+    OS's OWN closure into `ops.record_pr_closed` and tell the user their delivered work
+    was refused. True from before the close (the event is written first) until the pull
+    request is OPEN AGAIN; see `Daemon.resync_pull_request`.
+
+    THE WINDOW ENDS WHEN IT IS OPEN AGAIN, HOWEVER THAT HAPPENED — the OS's own reopen
+    returning, or a person's, observed by `poll_pull_requests` and recorded by
+    `Daemon._note_resync_reopened`. Both write `pr_resync_done`, which is the one fact
+    this reads. Without the second writer a reopen that FAILED would hold the window open
+    for ever: a pull request somebody repaired by hand and then closed for real would be
+    logged and the user never told, which is a mute button rather than a guard.
+
+    FALSE AGAIN WHEN THE CLOSE ITSELF FAILED, which is the difference between a guard and
+    a mute button. `gh pr close` raising left GitHub exactly as it was, so a CLOSED
+    answer after that is somebody else's doing and the user must hear about it. The
+    `pr_resync_failed` payload's `stage` is the only record of which `gh` call fell over,
+    so it is what this reads.
+
+    A pull request a HUMAN closed has no `pr_resync_started` event at all and is
+    unaffected.
+    """
+    started = _opened_episode(store, wo, PR_RESYNC_STARTED_EVENT)
+    if started is None:
+        return False
+    if _answered_since(store, wo, PR_RESYNC_DONE_EVENT, started):
+        return False
+    failed = _answered_since(store, wo, PR_RESYNC_FAILED_EVENT, started)
+    return not (failed and (db.from_json(failed["payload"], {}) or {}
+                            ).get("stage") == "close")
+
+
+def pr_resync_open(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """True when a resync episode is still open — attempted and not yet cleared.
+
+    What decides whether the tick that sees GitHub answering again owes the timeline a
+    `pr_resync_cleared`. Read ONLY on a tick where a stall column actually cleared, so
+    the no-write green path pays nothing for it.
+    """
+    started = _opened_episode(store, wo, PR_RESYNC_STARTED_EVENT)
+    if started is None:
+        return False
+    return _answered_since(store, wo, PR_RESYNC_CLEARED_EVENT, started) is None
+
+
+def polls_and_can_act_on_pull_request(store: ProjectStore, wo: dict[str, Any],
+                                      now: float | None = None, *,
+                                      recorded: Any = None) -> bool:
+    """`waiting_pr_merge`'s actor test: the poll selects this row AND can still move it.
+
+    `polls_pull_request` is deliberately NOT tightened — it is the pass's SELECTION
+    predicate, and the poll must keep reading a stalled pull request or the stall could
+    never clear itself after a resync. What changes is the CLAIM: a pull request GitHub
+    has stopped recomputing has no acting branch left, so naming this pass as its actor
+    is the false answer wo-d3a70c29 exists to stop.
+    """
+    return (polls_pull_request(store, wo, now=now, recorded=recorded)
+            and not pr_recompute_stalled(store, wo, now=now))
 
 
 def answers_question(store: ProjectStore, wo: dict[str, Any],
@@ -1265,6 +1428,11 @@ class Daemon:
                 # IMMEDIATELY BEFORE dispatch, not after: `sync_issues` files a release
                 # order late in one tick and this claim takes it early in the next, so a
                 # hold running after dispatch holds nothing on the first opportunity.
+                # IMMEDIATELY BEFORE dispatch for the same reason one mechanism over: a
+                # hold cleared on this tick is claimed on this tick rather than one poll
+                # interval later (§2.6).
+                if reconcile:
+                    self.clear_settled_preconditions(project, store)
                 self.hold_red_release(project, store)
                 self.dispatch_pending(project, store, state)
                 if poll_prs:
@@ -1272,6 +1440,9 @@ class Daemon:
                     # decisions read a fresh fact rather than the previous interval's
                     # (spec 2026-09-26-a-red-default-branch-raises-itself.md §1).
                     self.poll_default_branch(project, store)
+                    # BETWEEN the two, spec
+                    # 2026-10-14-a-red-main-dispatches-its-own-fix.md §2.
+                    self.dispatch_base_fix(project, store)
                     self.poll_pull_requests(project, store)
                     # AFTER the poll, in the same tick: a merge that just completed a
                     # work order is what closes its issue, and making the tracker wait
@@ -5503,8 +5674,19 @@ class Daemon:
         # PROJECT-WIDE, read once rather than once per candidate — `health_sweep_hold`'s
         # own docstring — and the fleet half beside it, per §2.1.
         window = bool(pstore.health_sweep_hold()) or (state is not None and state.shut())
+        # §1 and §2 of docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-
+        # not-stuck.md, under `poll_pull_requests`' own gate on that read.
+        base_red, red_episodes, base_red_until = False, (), 0.0
+        if project.validation.enabled and project.validation.auto_merge:
+            # The freshness test is `_base_red`'s, REUSED and not re-derived.
+            base_red = self._base_red(project) is not None
+            base_red_until = ops._base_red_until(self.central.base_health(project.name),
+                                                 now)
+            red_episodes = tuple(self.central.base_red_episodes(project.name))
         scanned, out = ops.stuck_scan(pstore, project.name, project.fleet_health, now,
-                                      window=window)
+                                      window=window, base_red=base_red,
+                                      red_episodes=red_episodes,
+                                      base_red_until=base_red_until)
         run["scanned"] += scanned
         return out
 
@@ -5770,9 +5952,13 @@ class Daemon:
                 # the double-report that buried wo-1abd3886 in a 230-item pile. One with
                 # `owed` and no `wo_id` is project-level, has no order to flag, and keeps
                 # its notification (spec §4).
+                # `v.notice` when the checker set one: its `detail` carries text that
+                # must not leave the record (spec 2026-10-15-a-precondition-is-a-row-
+                # not-prose.md §2.5).
                 store.add_notification(
                     title=f"OS invariant violated: {v.invariant}",
-                    body=f"{v.detail}" + (f" ({v.wo_id})" if v.wo_id else ""),
+                    body=v.notice or (f"{v.detail}"
+                                      + (f" ({v.wo_id})" if v.wo_id else "")),
                     # The violation's OWN level: most are `warning`, and one that must
                     # not arrive beside a stale attention flag says `critical`.
                     level=v.level, wo_id=v.wo_id, source="invariants",
@@ -6316,6 +6502,28 @@ class Daemon:
                 wo_id=tax.worst_id)
             log.info("[%s] %s: %s", project.name, kind, reason)
 
+    def _turn_arms(self, since: float) -> dict[str, list[tuple[float, float, str]]]:
+        """Every project's stamped turns, indexed by session id — spec §5 of
+        docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md.
+
+        FLEET-WIDE although `check_cache_ttl` runs for one project: the transcript scan is
+        fleet-wide, so an arm indexed per project would read every other project's
+        deliberate hour as a breach. An unreadable project is skipped and its turns fall
+        to `dispatched`, which is the safe direction.
+        """
+        index: dict[str, list[tuple[float, float, str]]] = {}
+        for project in self.catalog.projects:
+            if not project.path.is_dir():
+                continue
+            try:
+                rows = self.store_for(project).turn_arms(since)
+            except Exception:
+                log.exception("[%s] cache-TTL arms unreadable", project.name)
+                continue
+            for session_id, started_at, ended_at, arm in rows:
+                index.setdefault(session_id, []).append((started_at, ended_at, arm))
+        return index
+
     def check_cache_ttl(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Raise the fleet's remaining ONE-HOUR cache writes, split by who bought them.
 
@@ -6356,7 +6564,7 @@ class Daemon:
         days = cfg.alarm_cache_1h_window_days
         since = db.now() - days * 86_400
         try:
-            found = inspection.one_hour_writes(since)
+            found = inspection.one_hour_writes(since, arms=self._turn_arms(since))
         except OSError:  # a transcript tree that moved or is unreadable
             log.exception("[%s] the one-hour cache scan could not read transcripts",
                           project.name)
@@ -6956,11 +7164,19 @@ class Daemon:
                   reverse=True)
         worst = reds[0] if reds else None
         was_red = bool(prev.get("red"))
-        wo_id = ""
+        wo_id = issue_url = fix_wo_id = ""
+        issue_os_filed = False
         if worst is not None:
             wo_id = (str(prev.get("wo_id") or "") if was_red
                      else self._attribute_base_red(project, store, owner, repo,
                                                    worst.head_sha))
+            if was_red:
+                # Spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §3: carried
+                # forward exactly as `wo_id` is, so a second red run on one break joins
+                # the order already on it instead of filing again.
+                issue_url = str(prev.get("issue_url") or "")
+                fix_wo_id = str(prev.get("fix_wo_id") or "")
+                issue_os_filed = bool(prev.get("issue_os_filed"))
         fact = {
             "red": worst is not None,
             "base": base,
@@ -6970,10 +7186,14 @@ class Daemon:
             "run_url": ci.run_url(owner, repo, worst.run_id) if worst else "",
             "head_sha": worst.head_sha if worst else "",
             "wo_id": wo_id,
+            "issue_url": issue_url,
+            "fix_wo_id": fix_wo_id,
+            "issue_os_filed": issue_os_filed,
             "checked_at": time.time(),
         }
         self.central.set_base_health(project.name, fact)
         if was_red and worst is None:
+            self._record_red_episode(project, red=False, now=fact["checked_at"])
             store.close_violation_report(INV_BASE_RED)
             store.add_notification(
                 title=f"`{base}` is green again in {project.name}",
@@ -6984,7 +7204,187 @@ class Daemon:
             )
             log.info("[%s] %s recovered", project.name, base)
         elif worst is not None and not was_red:
+            self._record_red_episode(project, red=True, now=fact["checked_at"])
             log.warning("[%s] %s is red — %s", project.name, base, fact["run_url"])
+
+    def _record_red_episode(self, project: ProjectSpec, red: bool, now: float) -> None:
+        """Open or close this project's red episode, on a TRANSITION only.
+
+        §2 of docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md,
+        Neo's ruling on question 1818: the sweep's discount must outlive the exclusion by
+        one status span, and a live fact cannot — `_base_red` returns None the instant
+        `main` goes green. THE WRITER IS THE RETENTION BOUND'S READER, from the
+        `ProjectSpec` this method already has.
+        """
+        from .central_store import advance_red_episodes
+
+        self.central.set_base_red_episodes(
+            project.name,
+            advance_red_episodes(
+                self.central.base_red_episodes(project.name), red, now,
+                project.fleet_health.red_episode_retention_hours * 3600.0))
+
+    def dispatch_base_fix(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """A red tracker `main` files-or-adopts an issue and dispatches a work order on it.
+
+        Spec docs/superpowers/specs/2026-10-14-a-red-main-dispatches-its-own-fix.md §2.
+        The red-base feature was specified as a DETECTOR plus a BRAKE and has no actor, so
+        GitHub issue 1054 sat open and unassigned while wo-024e207b was held `base_red`
+        for 62 minutes. A red `main` is the one defect where the OS is the obligated
+        party: the break is usually its own merge, every parked order inherits it, and no
+        user decision is involved.
+
+        **THE TRACKER PROJECT ONLY** (§1, Neo question 1736): the project whose git
+        `origin` IS `bugreport.bug_repo()`. Every other project stays notify-only — its
+        red branch may be a human's push, and `bug report` files to the OS's repository.
+
+        **A SWEEP, NOT A TRANSITION ACTION.** `poll_default_branch`'s announcements fire
+        on transitions because an announcement must not repeat; a dispatch must be
+        RETRIED, because every way it fails is transient and outside the OS (Neo
+        unreachable, project unregistered, `gh` down). Idempotence comes from the fact's
+        own `issue_url`/`fix_wo_id` (§3), so a tick where nothing changed costs no `gh`
+        call — and DEDUPE IS ON THE ISSUE, never on the run: one break produces many red
+        runs, which is exactly how duplicate filings 1007/1010 cost ~19 USD.
+        """
+        from . import bugreport, github, issues
+
+        origin = github.origin_repo(project.path)
+        repo = bugreport.bug_repo()
+        if origin is None or f"{origin[0]}/{origin[1]}".lower() != repo.lower():
+            return
+        if self._base_red(project) is None:
+            return
+        fact = self.central.base_health(project.name)
+        run_id = fact.get("run_id") or 0
+        issue_url = str(fact.get("issue_url") or "")
+        fix_wo_id = str(fact.get("fix_wo_id") or "")
+        # §3: True only for an issue that passed §4's author-plus-marker test, or that
+        # `report_bug` filed in this sweep. `automerge.decide` reads it off the fact so
+        # the exemption (§6) costs no `gh` call behind every merge decision.
+        issue_os_filed = bool(fact.get("issue_os_filed"))
+        if fix_wo_id:
+            # §2 step 4: one fix work order per break, EVER, whatever became of it.
+            return
+        cleared = False
+        try:
+            # §2 step 5: READ THE STATE rather than parse the refusal — `start_work`
+            # raises on a closed issue, and a stored url someone has since closed can
+            # never yield a work order, so retrying it is the never-ending loop this spec
+            # exists to remove. Cleared and never adopted back (§4's OPEN filter), while
+            # a `gh`, Neo or registration failure keeps the url and retries.
+            if issue_url and issues.view(issue_url, repo).closed:
+                log.info("[%s] %s is closed and no work order came of it — the break is "
+                         "filed afresh on the next tick", project.name, issue_url)
+                # The url ONLY: `fix_wo_id` is necessarily empty here, per step 4 above.
+                issue_url = ""
+                issue_os_filed = False
+                cleared = True
+            elif not issue_url:
+                issue_url = self._adopt_base_red_issue(repo, run_id)
+                # Adoption IS §4's test, so an adopted url is the OS's own filing.
+                issue_os_filed = bool(issue_url)
+            if issue_url:
+                fix_wo_id = str(issues.start_work(
+                    issue_url, project=project.name).get("wo_id") or "")
+            elif not cleared:
+                filed = bugreport.report_bug(
+                    title=f"`{fact.get('base') or 'main'}` is red in {repo}",
+                    description=self._base_red_brief(project, fact),
+                    expected=(f"`{fact.get('base') or 'main'}` is green, so the OS can "
+                              f"merge the pull requests it is holding"),
+                    actual=(f"workflow `{fact.get('workflow') or 'ci'}` fails on "
+                            f"{fact.get('run_url') or 'an unreadable run'}"),
+                    # §2: `expedite` is what dispatches, at any priority, so the rating
+                    # stays an honest description of the defect.
+                    priority="high", expedite=True, project=project.name)
+                issue_url = str(filed.get("url") or "")
+                fix_wo_id = str((filed.get("pickup") or {}).get("wo_id") or "")
+                issue_os_filed = bool(issue_url)
+        except Exception:  # noqa: BLE001 — every failure here is transient and retried
+            log.exception("[%s] could not dispatch a fix for the red default branch",
+                          project.name)
+        # Whatever DID succeed, so an issue filed with no work order is not filed twice
+        # and the next tick retries from the first step still empty (§2 step 9).
+        if (issue_url, fix_wo_id, issue_os_filed) != (
+                fact.get("issue_url"), fact.get("fix_wo_id"),
+                fact.get("issue_os_filed")):
+            self.central.set_base_health(
+                project.name,
+                {**fact, "issue_url": issue_url, "fix_wo_id": fix_wo_id,
+                 "issue_os_filed": issue_os_filed})
+        if fix_wo_id:
+            log.info("[%s] %s is fixing the red default branch (%s)", project.name,
+                     fix_wo_id, issue_url)
+
+    def _adopt_base_red_issue(self, repo: str, run_id: Any) -> str:
+        """An OPEN issue THE OS ITSELF filed citing this failing run, or `""` — spec §4.
+
+        MECHANICAL, NOT FUZZY: a worker-filed red-main issue quotes the failing run's URL
+        in its body, and the run id is the one token in it unique to this break (it is in
+        1054). `gh` search is token-AND, so searching the whole URL buys nothing the id
+        does not and misses a body that wrote the id without the URL.
+
+        FOUR FILTERS, all required:
+
+        1. `state == "OPEN"`, because a CLOSED issue citing this run is a fix that was
+           tried and did not work and `issues.start_work` refuses a closed issue outright
+           — `issues_mentioning`'s own `--state all` is load-bearing for its other
+           callers and wrong here.
+        2. THE AUTHOR IS THE OS: the issue's author login equals `issues.gh_login()`.
+        3. THE BODY CARRIES `bugreport.FILED_MARKER` verbatim.
+        4. The LOWEST number AMONG THE ELIGIBLE — the first one the OS filed, so two
+           concurrent filings converge on one.
+
+        **BOTH 2 AND 3, never either.** The tracker and the run id are public, so with the
+        run id as the only key a stranger opens an issue quoting it, wins the
+        lowest-number race, and `issues.start_work` dispatches a privileged worker in the
+        OS's own repository whose brief is that remote body. The marker is public text a
+        stranger can copy; the author login is what a stranger cannot forge. The author
+        alone would adopt any issue the OS's account ever opened for another reason that
+        happens to quote the id.
+
+        FAILING DIRECTION: anything that fails any filter falls through to a FRESH filing.
+        A duplicate issue is visible and closable (`ops._verdict_duplicate`'s asymmetry),
+        and an unreadable login adopts nothing. A stranger's report of the same break is
+        simply ignored; a human can still pick it up with `jarvis issues start`.
+        """
+        from . import bugreport, issues
+
+        if not run_id:
+            return ""
+        login = issues.gh_login()
+        if not login:
+            return ""
+        eligible = [
+            r for r in issues.issues_mentioning(repo, str(run_id))
+            if str(r.get("state") or "").upper() == "OPEN"
+            and str((r.get("author") or {}).get("login") or "") == login
+            and bugreport.FILED_MARKER in str(r.get("body") or "")
+        ]
+        if not eligible:
+            return ""
+        return str(min(eligible, key=lambda r: int(r.get("number") or 0))["url"])
+
+    @staticmethod
+    def _base_red_brief(project: ProjectSpec, fact: dict[str, Any]) -> str:
+        """The dispatched worker's evidence — and the next sweep's adoption key (§4).
+
+        ADOPTION KEYS ON THE RUN ID IN THE BODY, never on `run_url`: `gh` search is
+        token-AND, the id is the one token unique to the break, and the hit is then
+        filtered to OPEN + author login == `issues.gh_login()` + `bugreport.FILED_MARKER`
+        in the body, lowest number among the eligible. So the id is quoted verbatim here;
+        `run_url` and `head_sha` are for the human reading the issue.
+        """
+        blamed = str(fact.get("wo_id") or "")
+        return (f"`{fact.get('base') or 'main'}` is red in {project.name}. Workflow "
+                f"`{fact.get('workflow') or 'ci'}` fails on run "
+                f"{fact.get('run_url') or 'an unreadable run'} (run id "
+                f"{fact.get('run_id') or 0}), at commit "
+                f"{fact.get('head_sha') or 'an unknown commit'}"
+                + (f", merged by the OS for {blamed}" if blamed else "")
+                + ". Nothing merges onto a broken default branch, so every parked pull "
+                  "request in the fleet is held until this lands. Revert or forward fix "
+                  "— that call is yours.")
 
     def _attribute_base_red(self, project: ProjectSpec, store: ProjectStore,
                             owner: str, repo: str, sha: str) -> str:
@@ -7047,7 +7447,12 @@ class Daemon:
             base=str(fact.get("base") or ""), workflow=str(fact.get("workflow") or ""),
             run_url=str(fact.get("run_url") or ""),
             head_sha=str(fact.get("head_sha") or ""),
-            wo_id=str(fact.get("wo_id") or ""))
+            wo_id=str(fact.get("wo_id") or ""),
+            # Spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §5, and §6's exemption
+            # is keyed on the pair below rather than on `fix_wo_id` (kn-af41186c).
+            fix_wo_id=str(fact.get("fix_wo_id") or ""),
+            issue_url=str(fact.get("issue_url") or ""),
+            issue_os_filed=bool(fact.get("issue_os_filed")))
 
     def poll_pull_requests(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Ask GitHub what happened to the pull requests this project is parked behind.
@@ -7115,6 +7520,45 @@ class Daemon:
         adds one `gh run list` per PROJECT per tick — shared across every pull request in
         the loop, filled lazily, and never called at all while the fleet is green.
 
+        **AN UNKNOWN ONE COSTS MORE, AND ONLY AN UNKNOWN ONE** (wo-d3a70c29). GitHub
+        reporting no mergeability for an OPEN pull request buys three things and the
+        green path pays for none of them:
+
+        * one `git ls-remote --heads origin` per PROJECT per tick, shared across the loop
+          and filled lazily, exactly as `base_ci` above is — the whole repository in one
+          call, so a project with four UNKNOWN pull requests still makes one;
+        * ONE WRITE when `pr_mergeable_unknown_since` goes up, and one when it comes back
+          down. The head cache's discipline, on the same `update_work_order`: nothing is
+          written on a tick where nothing moved, so an UNKNOWN that stays UNKNOWN costs
+          no write at all;
+        * ONE indexed `wo_events` read inside the stalled branch alone — the dedupe for
+          the single `pr_recompute_stalled` event per episode. `pr_recompute_stalled`
+          itself is free on every other row: it reads two row columns and stops.
+
+        **AND THE STALL IS REPAIRED, which costs that case more again** (wo-7ec57748).
+        Inside the same stalled branch, and nowhere else:
+
+        * TWO more indexed `wo_events` reads for `pr_resync_owed` — the stalled events,
+          and the attempts only once there is a stall to repair;
+        * AT MOST ONE `gh pr close` PLUS ONE `gh pr reopen` PER STALL EPISODE, with the
+          three events they write. Not per tick: the dedupe above is what bounds them, and
+          a stall that lasts a day still buys exactly one pair;
+        * UP TO THREE indexed reads (`pr_resync_unreopened`) inside the `closed_unmerged`
+          branch, which is a branch that ends the order anyway: the attempts, then the
+          reopens only if the OS ever closed this one, then the failures only if it has
+          not got it open again. ONE read (`pr_resync_open`) on the tick a stall column
+          clears — never on a tick where nothing moved;
+        * ONE indexed `wo_events` read ON THE OPEN PATH OF EVERY POLLED PULL REQUEST, and
+          it is the one figure here the green case does pay. `pr_resync_unreopened`'s
+          first read is the `pr_resync_started` episode, and for every pull request the OS
+          has never closed — all of them, nearly always — it stops there. It sits beside
+          `_note_reopened`'s existing `pr_closure_told` read on the same path, and it buys
+          the end of the resync window being recorded wherever it is observed rather than
+          only when the OS's own reopen returned.
+
+        The green budget above is unchanged, and the test beside it counts it: a
+        `MERGEABLE` pull request reaches none of this.
+
         **The automatic merge costs that case NOTHING, and its own cost is counted too.**
         `Daemon.auto_merge` returns on `project.validation.auto_merge` before it reads
         anything, so a project that has not opted in — the shipped state of every project
@@ -7171,6 +7615,11 @@ class Daemon:
         # red check is rebuilt, including the ones with no repair episode and no session
         # to nudge — not just the two that happened to have a worker being nudged.
         base_ci: dict[str, tuple[Any, ...] | None] = {}
+        # THE REMOTE'S OWN BRANCH TIPS, read once per project per tick and lazily, for
+        # `base_ci`'s reason exactly — one `git ls-remote` for the whole repository,
+        # filled only when some polled OPEN pull request reports UNKNOWN mergeability,
+        # so a fleet GitHub is answering about never spawns the subprocess (wo-d3a70c29).
+        tips: dict[str, str] | None = None
         # THE RED-BASE FACT, READ ONCE PER PROJECT PER TICK, for the same reason: it is
         # the project's fact and not the order's, so a read per parked order would be a
         # central query the budget above does not name. Only an opted-in project pays it.
@@ -7196,9 +7645,83 @@ class Daemon:
             # `invariants.parked_reason` runs per order per tick and may not go to the
             # network, and this poll already holds the answer. Written only when it
             # MOVED, so the green common case keeps its no-write budget.
+            #
+            # TWO MORE COLUMNS ON THE SAME DISCIPLINE — wo-d3a70c29. UNKNOWN is the one
+            # answer no branch below can act on, so the poll caches what says it has
+            # STOPPED being temporary: when it started, and where the remote's branch
+            # actually points. One `update_work_order` for all of it, written only if
+            # something moved, so the green common case keeps its no-write budget.
+            unknown = (pr.mergeable == "UNKNOWN"
+                       or (pr.mergeable is None and pr.state == "OPEN"))
+            tip = ""
+            if unknown and pr.head_ref:
+                if tips is None:
+                    try:
+                        tips = github.ls_remote(cwd=project.path)
+                    except Exception:  # noqa: BLE001 — stale beats wrong, and one
+                        # unreadable remote must not break the poll for other orders
+                        log.debug("[%s] could not list remote heads", project.name)
+                        tips = {}
+                tip = tips.get(pr.head_ref, "")
+            cache: dict[str, Any] = {}
             if pr.head_oid and pr.head_oid != str(wo.get("pr_head_oid") or ""):
-                store.update_work_order(wo["id"], pr_head_oid=pr.head_oid,
-                                        pr_head_seen_at=db.now())
+                # VOID THE TIP ON THE SAME WRITE: it is only re-read while mergeability
+                # is UNKNOWN, so a healthy push would otherwise leave an old tip beside
+                # a new head and read as stalled for ever.
+                cache.update(pr_head_oid=pr.head_oid, pr_head_seen_at=db.now(),
+                             pr_ref_oid="")
+            since = wo.get("pr_mergeable_unknown_since")
+            if unknown and not isinstance(since, (int, float)):
+                cache["pr_mergeable_unknown_since"] = db.now()
+            elif not unknown and isinstance(since, (int, float)):
+                cache["pr_mergeable_unknown_since"] = None
+            if tip and tip != cache.get("pr_ref_oid", str(wo.get("pr_ref_oid") or "")):
+                cache["pr_ref_oid"] = tip
+            if cache:
+                store.update_work_order(wo["id"], **cache)
+                # THE EPISODE'S END, and only on a tick where a stall column actually
+                # cleared — wo-7ec57748. Either half says GitHub is answering again: the
+                # clock coming down, or the tip voided by a head that finally moved. The
+                # `pr_resync_open` read lives INSIDE this branch, so a tick where nothing
+                # moved (every tick of a healthy pull request) pays nothing for it and
+                # the no-write green path is untouched.
+                if (("pr_mergeable_unknown_since" in cache
+                     and cache["pr_mergeable_unknown_since"] is None)
+                        or cache.get("pr_ref_oid") == "") \
+                        and pr_resync_open(store, wo):
+                    store.add_event(wo["id"], PR_RESYNC_CLEARED_EVENT,
+                                    {"pr_url": wo.get("pr_url"),
+                                     "head_oid": pr.head_oid or ""})
+            # THE PREDICATE IS EXECUTED AND NOT MERELY WRITTEN, every tick and not only
+            # when something moved: condition (b) comes true by the clock, on a tick
+            # where nothing is cached at all. On the OVERLAY rather than `wo`, because
+            # the local dict is never refreshed — judging it would judge the state
+            # before the write above, on the very tick the evidence arrives. Free unless
+            # a row field already says there is something to judge; the one `wo_events`
+            # read is inside the stalled branch alone.
+            #
+            # ON AN OPEN PULL REQUEST ONLY. A merged or closed one whose cached tip still
+            # differs from its cached head IS stalled by the predicate — correctly, the
+            # columns say what they say — but there is nothing left for GitHub to
+            # recompute, so an event here would be evidence about a pull request that has
+            # finished, written on the tick before `complete_merged` closes the order.
+            stalling = {**wo, **cache}
+            # WAS THE RESYNC PERFORMED ON THIS VERY TICK? `pr` was read BEFORE it, so its
+            # `OPEN` predates the OS's own close and is not an observation of GitHub after
+            # it — which is exactly what `_note_resync_reopened` below needs.
+            resynced = False
+            if pr.state == "OPEN" and pr_recompute_stalled(store, stalling):
+                self._note_recompute_stalled(store, stalling, pr)
+                # ...AND REPAIR IT, ONCE PER EPISODE (wo-7ec57748). The evidence above
+                # used to be the whole of it and left the user to close and reopen the
+                # pull request by hand. `PR_REPAIR_STATUSES` bounds this like every other
+                # repair — never `validating`, where an open round owns the session and
+                # the commit it is judging — and the stalled event `_note_recompute_
+                # stalled` has just written is the dedupe key `pr_resync_owed` reads.
+                # Nudges nobody: this is the OS asking GitHub again, not a worker.
+                if wo["status"] in PR_REPAIR_STATUSES and pr_resync_owed(store, wo):
+                    self.resync_pull_request(project, store, stalling, pr)
+                    resynced = True
             try:
                 if pr.merged:
                     # THE ROUND FIRST, if one is open: the pull request has landed, so
@@ -7227,7 +7750,18 @@ class Daemon:
                     # and reading it here would mean a pull request closed, reopened and
                     # closed again never told the user the second time — this bug's own
                     # silence, reintroduced by the guard against it.
-                    if not store.pr_closure_told(wo["id"]):
+                    # UNLESS THE OS IS THE ONE THAT CLOSED IT — wo-7ec57748. A resync
+                    # closes the pull request and reopens it, so a poll landing between
+                    # the two (or after a reopen that failed) sees exactly this shape over
+                    # work nobody refused. See the hazard in `resync_pull_request`: the
+                    # `pr_resync_started` event is written BEFORE the close precisely so
+                    # this test can be made. A human's closure has no such event and falls
+                    # through to the branch below unchanged.
+                    if pr_resync_unreopened(store, wo):
+                        log.info("[%s] %s is closed because the OS closed it to resync "
+                                 "it — %s is not refused work", project.name,
+                                 wo["pr_url"], wo["id"])
+                    elif not store.pr_closure_told(wo["id"]):
                         log.info("[%s] %s closed unmerged — %s needs the user",
                                  project.name, wo["pr_url"], wo["id"])
                         # Same reason as the merge above, the other way: a pull request
@@ -7256,6 +7790,18 @@ class Daemon:
                     # about a pull request whose status line still called it dead.
                     log.info("[%s] %s is open again — %s", project.name,
                              wo["pr_url"], wo["id"])
+                elif not resynced and self._note_resync_reopened(project, store, wo, pr):
+                    # THE RESYNC WINDOW'S END, and the position is most of the guard: this
+                    # chain is bounded by `PR_REPAIR_STATUSES` and is only reached when
+                    # the pull request is neither merged nor closed-unmerged — i.e. OPEN
+                    # — so a second `pr.state == "OPEN"` test here would be noise.
+                    # `resynced` is the rest of it: on the tick the resync itself ran this
+                    # `pr` was read before the close, so its OPEN says nothing about
+                    # GitHub afterwards and reading it as an observation would end the
+                    # window the same tick it opened — the hazard guard, disarmed.
+                    # Before the repairs below for `_note_reopened`'s reason: get the
+                    # record straight before nudging anybody.
+                    pass
                 elif pr.conflicting:
                     self.heal_pull_request(project, store, wo, ops.PR_CONFLICT,
                                            "conflicts",
@@ -7614,7 +8160,13 @@ class Daemon:
                     return
             if not decision.armed:
                 self._note_automerge_held(store, wo_id, decision)
-                if (not record_only and decision.code == automerge.HELD_SHA_MOVED
+                # TWO CODES, ONE PROPERTY (spec 2026-10-16 §1): a passed round whose
+                # commit binding is unusable and a pull request otherwise ready. Keyed on
+                # one of them, this arm left every `sha_unrecorded` stall permanent
+                # (issue 1095). `HELD_NOT_PASSED` stays out — that verdict stands.
+                if (not record_only
+                        and decision.code in (automerge.HELD_SHA_MOVED,
+                                              automerge.HELD_SHA_UNRECORDED)
                         and automerge.only_the_head_moved(
                             round_row, wo, pr, cfg, pending_assumptions=pending,
                             plan_assumptions=plan_assumptions)):
@@ -8923,10 +9475,23 @@ class Daemon:
                 log.info("[%s] %s: the head moved to %s and the OS has re-judged this "
                          "merge %s time(s) — leaving it for the user", project.name,
                          wo["id"], out["head_sha"][:10], out["rebinds"])
+            elif not out["judged_sha"]:
+                # Same false claim as the success log below, one branch along: nothing
+                # was judged, so nothing moved (spec 2026-10-16 §3). `REBIND_EXHAUSTED`
+                # above is unreachable on this path — the carry stays `sha_moved`-only.
+                log.info("[%s] %s: the passed round recorded no commit and round %s "
+                         "would be the last — leaving it for the user", project.name,
+                         wo["id"], out["next_round"])
             else:
                 log.info("[%s] %s: the head moved to %s and round %s would be the "
                          "last — leaving it for the user", project.name, wo["id"],
                          out["head_sha"][:10], out["next_round"])
+        elif not out["judged_sha"]:
+            # NOTHING WAS JUDGED, so "the head moved from  to bbbb1111bb" is the same
+            # false claim the reason text makes (spec 2026-10-16 §3).
+            log.info("[%s] %s: the passed round recorded no commit — re-judging the "
+                     "pull request at %s as round %s", project.name, wo["id"],
+                     out["head_sha"][:10], out["round"])
         else:
             log.info("[%s] %s: the head moved from %s to %s — re-judging it as round %s",
                      project.name, wo["id"], out["judged_sha"][:10],
@@ -9097,6 +9662,122 @@ class Daemon:
                  f"exactly as it always has.",
             wo_id=wo["id"])
 
+    def _note_recompute_stalled(self, store: ProjectStore, wo: dict,
+                                pr: Any) -> bool:
+        """Say GitHub has stopped recomputing this pull request, ONCE per episode.
+
+        `ProjectStore.pr_closure_told`'s arithmetic, against the cheapest clock the row
+        already carries: the episode began when mergeability stopped being an answer or
+        when the head last moved, whichever is later, so an event older than that
+        belongs to a stall that has since been superseded by a push. Nothing writes a
+        "cleared" event — the two columns clearing IS the clearing, and this read is the
+        only cost of saying so.
+
+        THE EVIDENCE AND NOTHING MORE. No notification path, no status, no nudge: the
+        order stops deriving an actor, and `invariants.true_blockers` is what puts it in
+        front of the user. The event is also the dedupe key the one-shot resync remedy
+        (wo-7ec57748) keys on.
+        """
+        started = max(float(wo.get("pr_mergeable_unknown_since") or 0.0),
+                      float(wo.get("pr_head_seen_at") or 0.0))
+        told = store.events_of_kind(wo["id"], PR_RECOMPUTE_STALLED_EVENT)
+        if told and float(told[-1]["ts"]) >= started:
+            return False
+        store.add_event(wo["id"], PR_RECOMPUTE_STALLED_EVENT,
+                        {"pr_url": wo.get("pr_url"),
+                         "head_oid": str(wo.get("pr_head_oid") or ""),
+                         "ref_oid": str(wo.get("pr_ref_oid") or ""),
+                         "branch": getattr(pr, "head_ref", ""),
+                         "mergeable": getattr(pr, "mergeable", None) or "UNKNOWN",
+                         # WHICH OF THE TWO CONDITIONS THIS IS: with no tip observed
+                         # there is nothing to compare, and the clock is the whole of the
+                         # evidence. `timeline._describe` renders the two differently.
+                         "unknown_since": wo.get("pr_mergeable_unknown_since")})
+        return True
+
+    def resync_pull_request(self, project: ProjectSpec, store: ProjectStore,
+                            wo: dict, pr: Any) -> bool:
+        """Close and reopen this pull request ONCE, to make GitHub recompute it.
+
+        PR #995's remedy, performed by the OS instead of by the user: reopening rebuilds
+        the pull request's head and its mergeability, which is what a hand close+reopen
+        fixed in one go (`pr_resync.pr_close`, wo-7ec57748). Nothing is nudged, nothing is
+        flagged and nothing is messaged — the bound is `pr_resync_owed`, one pair per
+        stall episode, derived from the timeline.
+
+        **THE EVENT IS WRITTEN BEFORE THE CLOSE, AND THAT ORDERING IS THE HAZARD GUARD.**
+        Between the close and the reopen `gh pr view` answers CLOSED and unmerged, and a
+        tick that read that without knowing the OS had done it would route it into
+        `ops.record_pr_closed` — telling the user their delivered work was refused, and
+        moving the order to `needs_review`, over a closure the OS itself performed.
+        `pr_resync_unreopened` is true from before the close until a successful reopen
+        (and stays true for ever if the reopen failed), so no tick and no failure path can
+        reach that branch. Writing the event after the close would leave exactly one tick,
+        and a crash, where it could.
+
+        **NOTHING BETWEEN THE CLOSE AND THE REOPEN MAY WRITE TO THE STORE OR CALL OUT.**
+        The two are one operation to the rest of the OS. Each `gh` call has its own
+        `except` so the record says WHICH stage failed, and a failure returns False with
+        the evidence on the timeline — the pull request is left shut, which is what
+        `pr_resync_unreopened` goes on reporting.
+
+        **A CLOSE THAT FAILED SUPPRESSES NOTHING, AND THAT IS WHY THE STAGE IS RECORDED.**
+        The guard above is sound only while the OS is the reason the pull request is shut.
+        `gh pr close` raising left GitHub exactly as it was — the pull request is still
+        OPEN, the reopen is never attempted — so a later CLOSED answer is somebody else's
+        doing, and suppressing it would be a mute button on real refused work rather than
+        a guard on the OS's own window. `pr_resync_unreopened` therefore goes false again
+        on a `pr_resync_failed` whose `stage` is `close`, and the two failure stages mean
+        opposite things to it: `close` means nothing happened, `reopen` means the OS owns
+        a shut pull request and must keep saying so.
+
+        The attempt is spent either way: `pr_resync_owed` keys on the `pr_resync_started`
+        event, so a failed close does NOT buy a second pair inside the same episode. The
+        bound is on what the OS tried.
+
+        **A REOPEN THAT FAILED RAISES ATTENTION, AND A CLOSE THAT FAILED DOES NOT.** It is
+        the one outcome nobody else on this base would notice: the pull request is shut by
+        the OS, the order stays in `waiting_pr_merge`, `pr_recompute_stalled` is OPEN-only
+        so it never fires again, and nothing reads `pr_resync_failed`. So the flag is
+        raised here, as a plain reason string (`release._report_failure` and
+        `budget.escalate`'s precedent for a non-invariant caller) naming the pull request
+        and the head it is stuck at. The STATUS is not touched — nobody refused this work,
+        so `needs_review` would be false. A failed CLOSE flags nothing: GitHub was left
+        exactly as it was, and there is nothing for the user to act on.
+        """
+        from . import github, pr_resync
+
+        url = wo.get("pr_url")
+        stuck = {"pr_url": url,
+                 "head_oid": str(wo.get("pr_head_oid") or ""),
+                 "ref_oid": str(wo.get("pr_ref_oid") or ""),
+                 "branch": getattr(pr, "head_ref", "")}
+        store.add_event(wo["id"], PR_RESYNC_STARTED_EVENT, dict(stuck))
+        for stage, call in (("close", pr_resync.pr_close),
+                            ("reopen", pr_resync.pr_reopen)):
+            try:
+                call(url, cwd=project.path)
+            except Exception as e:  # noqa: BLE001 — every failure is the same decision
+                log.warning("[%s] could not %s %s to resync %s: %s", project.name,
+                            stage, url, wo["id"], e)
+                store.add_event(wo["id"], PR_RESYNC_FAILED_EVENT,
+                                {**stuck, "stage": stage, "error": str(e),
+                                 "reason": getattr(e, "reason",
+                                                   github.GitHubError.REFUSED)})
+                if stage == "reopen":
+                    # See the docstring: the OS owns a shut pull request and no other
+                    # reader on this base would ever say so.
+                    store.flag_attention(
+                        wo["id"],
+                        f"could not reopen {url} after closing it to make GitHub "
+                        f"recompute it: the pull request is shut and its head is stuck "
+                        f"at {stuck['head_oid'][:7] or '?'}"[:300])
+                return False
+        store.add_event(wo["id"], PR_RESYNC_DONE_EVENT, dict(stuck))
+        log.info("[%s] closed and reopened %s to make GitHub recompute %s",
+                 project.name, url, wo["id"])
+        return True
+
     def _note_reopened(self, project: ProjectSpec, store: ProjectStore,
                        wo: dict) -> bool:
         """This open pull request was recorded as closed: say so, once. True if it was.
@@ -9131,6 +9812,30 @@ class Daemon:
                 store.flag_attention(wo["id"], blockers[0])
             else:
                 store.clear_attention(wo["id"])
+        return True
+
+    def _note_resync_reopened(self, project: ProjectSpec, store: ProjectStore,
+                              wo: dict, pr: Any) -> bool:
+        """This pull request is open again after the OS's resync window: record it, once.
+
+        `_note_reopened`'s shape exactly — the pull request is OPEN and a record says
+        otherwise, so correct the record once and return True. Here the record is the
+        resync window `pr_resync_unreopened` derives: a reopen that FAILED leaves it true
+        for ever, so a person repairing the pull request by hand and later closing it for
+        real would be logged and never told. The window's end is "it is open again",
+        however that happened.
+
+        `PR_RESYNC_DONE_EVENT` is reused rather than a fifth event kind coined: "the pull
+        request is open again" is one fact. `observed: True` is what says GitHub was SEEN
+        that way rather than that the OS's own `gh pr reopen` returned.
+        """
+        if not pr_resync_unreopened(store, wo):
+            return False
+        store.add_event(wo["id"], PR_RESYNC_DONE_EVENT,
+                        {"pr_url": wo.get("pr_url"), "head_oid": pr.head_oid or "",
+                         "observed": True})
+        log.info("[%s] %s is open again after the OS closed it to resync it — the "
+                 "window on %s is over", project.name, wo.get("pr_url"), wo["id"])
         return True
 
     def heal_inherited_failure(self, project: ProjectSpec, store: ProjectStore,
@@ -9704,6 +10409,32 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
     #: not minutes, and an hour would ask the user about a break the fleet was already
     #: fixing (2026-09-29 spec §3).
     RED_PARK_AFTER_SECONDS = 6 * 3600
+
+    def clear_settled_preconditions(self, project: ProjectSpec,
+                                    store: ProjectStore) -> None:
+        """Clear every `bl-` precondition whose backlog item has settled.
+
+        §2.6 of docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md: a
+        hold written once and never re-derived is the `stale-hold` class. One indexed read
+        per open row, and zero work for a project with none.
+
+        **A `bl-` ref that resolves to NOTHING does not clear.** A missing row means the
+        ref names nothing the OS can reason about — a typo, or a deleted item — and
+        clearing on absence would release an order whose hold was never satisfied. It
+        stays open for a human, like every other underivable ref: a `kn-` entry, an `io-`
+        id, an issue number and free text have no state the OS can read as "satisfied".
+        """
+        for wo in store.list_work_orders(statuses=("pending",), include_hidden=True):
+            for row in store.open_preconditions(wo["id"]):
+                ref = str(row["ref"])
+                if not ref.startswith("bl-"):
+                    continue
+                item = self.central.get_backlog(ref)
+                if item is None or item["status"] not in SETTLED_BACKLOG_STATUSES:
+                    continue
+                store.clear_precondition(int(row["id"]), by="os")
+                log.info("[%s] %s: precondition %s cleared (%s is %s)", project.name,
+                         wo["id"], ref, ref, item["status"])
 
     def hold_red_release(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Keep a pending release order out of dispatch while the base branch is red.

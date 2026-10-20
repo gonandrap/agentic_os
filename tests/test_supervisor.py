@@ -827,6 +827,8 @@ def _fixed_transcript(path: Path) -> None:
 #:
 #: Moved once, deliberately, for issue 227: every turn now carries what it ACTUALLY cost,
 #: because the judge was asserting spend it had never read.
+#:
+#: And once more for §7: the named pass that will next touch the order, positive only.
 EXPECTED_WORK_ORDER_PACKET = """\
 # The alarm
 kind: long-turn
@@ -836,6 +838,7 @@ raised on turn 1, 0 minute(s) ago
 # The work order
 {wo_id} [running] on claude-opus-5
 this session is an ordinary work order
+scheduled_actor: Daemon.settle_turns - the settler sweeps this status and a turn is on record (or the claim is still inside its grace)
 title: write the design doc
 brief: a long brief about the console
 
@@ -906,9 +909,100 @@ def test_the_work_order_packet_names_a_blocker_and_stays_silent_without_one(
     assert not [line for line in plain.splitlines() if line.startswith("blocked")]
     (line,) = [line for line in packet.splitlines() if line.startswith("blocked:")]
     assert line == f"blocked: {supervisor.BLOCKED_SENTENCES['dependency']}"
+    # `+ 2` since §7: this row also derives a scheduled actor, which sits at `+ 1`.
+    assert packet.splitlines().index(line) == \
+           packet.splitlines().index(next(l for l in packet.splitlines()
+                                          if l.startswith("this session is"))) + 2
+
+
+def test_the_work_order_packet_names_the_scheduled_actor_and_stays_silent_without_one(
+        started, monkeypatch):
+    """§7 of docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md,
+    modelled on `test_the_work_order_packet_names_a_blocker_and_stays_silent_without_one`
+    above: positive content only, at a fixed index after `this session is`."""
+    from jarvis import health
+
+    daemon = started()
+    monkeypatch.setattr(db, "now", lambda: FIXED_NOW)
+    inspect_cfg = daemon.catalog.projects[0].inspect
+
+    wo = ops.create_work_order("proj_a", "write the design doc")
+    store = ProjectStore(ops.find_work_order(wo["id"])[1])
+    try:
+        actor = health.actor(store, _wo_subject(store, wo["id"]))
+        packet = supervisor.build_evidence(store, _wo_subject(store, wo["id"]), None,
+                                           CFG, inspect_cfg)
+        store.update_work_order(wo["id"], status="budget_exhausted")
+        spent = supervisor.build_evidence(store, _wo_subject(store, wo["id"]), None,
+                                          CFG, inspect_cfg)
+        # The `OPEN_STATUSES` gate is what makes a settled row safe here: without it
+        # `ops.SCHEDULED_ACTORS` has no fallthrough and this raises KeyError.
+        store.update_work_order(wo["id"], status="completed")
+        settled = supervisor.build_evidence(store, _wo_subject(store, wo["id"]), None,
+                                            CFG, inspect_cfg)
+    finally:
+        store.close()
+
+    assert actor is not None
+    (line,) = [l for l in packet.splitlines() if l.startswith("scheduled_actor:")]
+    assert line == f"scheduled_actor: {actor.pass_name} - {actor.why}"
     assert packet.splitlines().index(line) == \
            packet.splitlines().index(next(l for l in packet.splitlines()
                                           if l.startswith("this session is"))) + 1
+    assert not [l for l in spent.splitlines() if l.startswith("scheduled_actor")]
+    assert settled.startswith("# The work order")
+    assert not [l for l in settled.splitlines() if l.startswith("scheduled_actor")]
+
+
+def test_the_actor_line_sits_above_the_blocker_line(started, monkeypatch):
+    """A parked pull request derives BOTH, and the order is fixed: the actor at `this
+    session is` + 1 and the blocker at + 2 (§7)."""
+    from jarvis import health
+
+    daemon = started()
+    monkeypatch.setattr(db, "now", lambda: FIXED_NOW)
+    inspect_cfg = daemon.catalog.projects[0].inspect
+
+    wo = ops.create_work_order("proj_a", "write the design doc")
+    store = ProjectStore(ops.find_work_order(wo["id"])[1])
+    try:
+        store.update_work_order(wo["id"], status="waiting_pr_merge",
+                                pr_url="https://example.invalid/pr/1")
+        subject = _wo_subject(store, wo["id"])
+        actor = health.actor(store, subject)
+        blocked = health.blocker(store, subject, CFG)
+        packet = supervisor.build_evidence(store, subject, None, CFG, inspect_cfg)
+    finally:
+        store.close()
+
+    assert actor is not None and actor.pass_name == "Daemon.poll_pull_requests"
+    assert blocked == "pull-request"
+    lines = packet.splitlines()
+    at = lines.index(next(l for l in lines if l.startswith("this session is")))
+    assert lines[at + 1] == f"scheduled_actor: {actor.pass_name} - {actor.why}"
+    assert lines[at + 2] == f"blocked: {supervisor.BLOCKED_SENTENCES['pull-request']}"
+
+
+def test_the_actor_verdict_never_reaches_the_blocker(started, monkeypatch):
+    """`health.blocker` stays PURE (§7, constraint 2): `due` and the dedupe read it, so an
+    order with an actor and no blocker still answers None — and a feature order has no
+    scheduled actor at all."""
+    from jarvis import health
+
+    started()
+    monkeypatch.setattr(db, "now", lambda: FIXED_NOW)
+
+    wo = ops.create_work_order("proj_a", "write the design doc")
+    store = ProjectStore(ops.find_work_order(wo["id"])[1])
+    try:
+        store.update_work_order(wo["id"], status="running", session_id=wo["id"])
+        subject = _wo_subject(store, wo["id"])
+        assert health.actor(store, subject) is not None
+        assert health.blocker(store, subject, CFG) is None
+        fo = store.create_feature_order("a feature", "do the thing")
+        assert health.actor(store, {"kind": "feature_order", "row": fo}) is None
+    finally:
+        store.close()
 
 
 def test_each_transport_blocker_reads_its_sentence_from_the_hold_cause():
