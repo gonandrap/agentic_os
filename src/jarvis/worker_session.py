@@ -51,7 +51,8 @@ from typing import Any
 
 from . import background, budget, claude_cli, context, systemd_units, usage
 from .catalog import ProjectSpec
-from .project_store import COMPACT_TURN, COST_FROM_TRANSCRIPT, ProjectStore
+from .project_store import (COMPACT_TURN, COST_FROM_TRANSCRIPT, TERMINAL_STATUSES,
+                            ProjectStore)
 
 log = logging.getLogger("jarvisd")
 
@@ -252,6 +253,8 @@ HOLD_BUDGET = "budget"
 HOLD_TURN_IN_FLIGHT = "turn_in_flight"
 HOLD_RETRY_BOOKED = "retry_booked"
 HOLD_RETRY_OVERDUE = "retry_overdue"
+#: Per MESSAGE, not per work order, and the only one of these that is: see `message_hold`.
+HOLD_OBJECTION_PARKED = "objection_parked"
 
 
 @dataclass(frozen=True)
@@ -323,6 +326,47 @@ def delivery_hold(store: ProjectStore, wo: dict[str, Any],
     # user can see, because their message is what is waiting behind it.
     return DeliveryHold(HOLD_RETRY_OVERDUE, accounted=False,
                         reason=f"its {noun} retry came due and has not happened")
+
+
+#: Why a queued objection waits, in one clause read after "because". `accounted`: nothing
+#: has gone wrong and nobody is waiting on the user — the order takes another turn and it
+#: goes out with it, or it reaches `needs_review`/terminal and the disarm pass takes it
+#: back (§2 of the spec named on `message_hold`).
+OBJECTION_PARKED_REASON = ("the OS objected and the worker is not running — it goes out "
+                           "with the order's next turn")
+
+
+def message_hold(store: ProjectStore, wo: dict[str, Any], msg: dict[str, Any],
+                 now: float | None = None) -> DeliveryHold | None:
+    """The hold on THIS message, or None if delivery may go — `delivery_hold` plus one.
+
+    §1.1 of docs/superpowers/specs/2026-10-20-an-objection-is-withdrawn-before-the-order-
+    stops.md. ONE DERIVATION, THREE READERS: `Daemon.deliver_messages`,
+    `daemon.delivers_message` and `invariants.stuck_message`. The last is why the hold has
+    to be expressed at all rather than left implicit in the delivery loop — a queued
+    objection nothing has attempted becomes INV-MESSAGE-STUCK, which is a false defect
+    report about the daemon.
+
+    THE ONE MESSAGE-SHAPED HOLD, and it is here and not in `delivery_hold` because that
+    function is per work order and sees no message: arming this branch there would hold
+    the USER's own message to a `needs_review` order, and that revive is the documented
+    behaviour of `jarvis wo send`. An objection reaches a RUNNING conversation or it
+    reaches nobody — so it is skipped per message and a user message queued behind it
+    still goes out, taking the conversation back to `running`, which is the boundary the
+    objection then rides.
+
+    Not armed on a TERMINAL status or on `needs_review`: those are the two the daemon
+    WITHDRAWS on, and a hold there would be a silent queue with no terminator.
+    """
+    status = str(wo["status"] or "")
+    if (status != "running" and status not in TERMINAL_STATUSES
+            and status != "needs_review"):
+        envelope = store.envelope_for_message(int(msg["id"]))
+        if envelope and envelope["kind"] == "assumption_objection":
+            return DeliveryHold(HOLD_OBJECTION_PARKED, accounted=True,
+                                reason=OBJECTION_PARKED_REASON)
+    # Every existing per-order hold, through the one call, so none is re-derived.
+    return delivery_hold(store, wo, now=now)
 
 
 def start(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],

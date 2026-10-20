@@ -74,6 +74,8 @@ from .project_store import (
     FO_OPEN_STATUSES,
     FO_TERMINAL_STATUSES,
     MAX_MESSAGE_DELIVERY_ATTEMPTS,
+    OBJECTION_HANDED_BACK_REASON,
+    OBJECTION_WITHDRAWN_REASON,
     OPEN_STATUSES,
     PRE_APPROVED_KEY,
     RETRY_SWEEP_STATUSES,
@@ -94,11 +96,19 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 log = logging.getLogger("jarvisd")
 
 #: Why an objection was taken back, in the envelope's note, in the timeline event and in
-#: `ops.objection_line`. ONE string: the user reads it on three surfaces and a wording
-#: that depends on which pass withdrew it is a difference they would have to explain.
+#: `ops.objection_line`. ONE STRING PER OUTCOME, and the same string on all three surfaces
+#: for that outcome: the wording may never depend on WHICH PASS withdrew it — the reconcile
+#: pass and the delivery pass both reach both cases — only on what happened to the order.
+#: `OBJECTION_WITHDRAWN_REASON` is the order that STOPPED before it could be told;
+#: `OBJECTION_HANDED_BACK_REASON` is the order that DELIVERED, where the decision is now
+#: the user's (`ops.review_state` re-surfaces it there).
+#:
+#: DEFINED IN `project_store` AND ONLY RE-EXPORTED HERE: `ProjectStore.objection_counts`
+#: buckets on exact match, so a second spelling anywhere turns every count into `other`.
 #: §6.6 of docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-
-#: runs.md.
-OBJECTION_WITHDRAWN_REASON = "the order stopped before it could be delivered"
+#: runs.md, narrowed to TERMINAL statuses by §1-§3 of docs/superpowers/specs/2026-10-20-an-
+#: objection-is-withdrawn-before-the-order-stops.md. Both names are imported above.
+
 
 def fetch_healthz(url: str, timeout: float) -> dict[str, Any] | None:
     """`GET /healthz` as a dict, or None when the dashboard did not answer.
@@ -324,11 +334,18 @@ def retries_turn(store: ProjectStore, wo: dict[str, Any],
 def delivers_message(store: ProjectStore, wo: dict[str, Any],
                      now: float | None = None, *,
                      queued: list[dict[str, Any]] | None = None) -> bool:
-    """True when `Daemon.deliver_messages` will send a queued turn — 2026-10-09 §3."""
+    """True when `Daemon.deliver_messages` will send a queued turn — 2026-10-09 §3.
+
+    PER MESSAGE, because one of the holds is (`worker_session.message_hold`): "will a
+    turn go out" stays true for a user message queued behind a held objection and is
+    false when the objection is all there is. Without that, `ops.waiting_on` answers
+    `queued_message` for an order no turn is coming for — §1.1 of
+    docs/superpowers/specs/2026-10-20-an-objection-is-withdrawn-before-the-order-stops.md.
+    """
     msgs = queued if queued is not None else store.queued_messages(wo["id"])
     if not msgs:
         return False
-    return worker_session.delivery_hold(store, wo, now=now) is None
+    return any(worker_session.message_hold(store, wo, m, now=now) is None for m in msgs)
 
 
 def runnable_round(store: ProjectStore, wo: dict[str, Any],
@@ -2783,20 +2800,31 @@ class Daemon:
             except KeyError:
                 store.mark_message(msg["id"], "failed")
                 continue
-            # BEFORE the holds, deliberately: a stopped order's hold would skip this
+            # BEFORE the holds, deliberately: a STOPPED order's hold would skip this
             # message for ever instead of taking it back, and the delivery side is the
             # one that must lose the race with the withdrawal pass (§6.6).
-            if wo["status"] != "running":
+            #
+            # TERMINAL AND `needs_review` ONLY, since issue 1112. Every other non-running
+            # status is one the order comes back from, and there the objection is HELD by
+            # `worker_session.message_hold` below with nothing written — §1 of
+            # docs/superpowers/specs/2026-10-20-an-objection-is-withdrawn-before-the-
+            # order-stops.md.
+            status = str(wo["status"] or "")
+            if status in TERMINAL_STATUSES or status == "needs_review":
                 envelope = store.envelope_for_message(int(msg["id"]))
                 if envelope and envelope["kind"] == "assumption_objection":
-                    self._withdraw_objection(store, wo["id"], envelope=envelope)
+                    self._withdraw_objection(
+                        store, wo["id"], envelope=envelope,
+                        reason=(OBJECTION_HANDED_BACK_REASON if status == "needs_review"
+                                else OBJECTION_WITHDRAWN_REASON))
                     continue
-            # Every per-work-order hold, in the one place that decides them
-            # (`worker_session.delivery_hold`). Held, not dropped: the same queue sends
-            # it as the next turn once the hold clears. The same call answers
+            # Every hold, in the one place that decides them
+            # (`worker_session.message_hold`, which is `delivery_hold` plus the one
+            # per-MESSAGE branch). Held, not dropped: the same queue sends it as the next
+            # turn once the hold clears. The same call answers
             # `invariants.stuck_message`, which is what keeps "nothing is coming" and
             # "this is why" from drifting apart.
-            if not delivers_message(store, wo, queued=[msg]):
+            if worker_session.message_hold(store, wo, msg) is not None:
                 continue
             pending.setdefault(wo["id"], []).append(dict(msg))
         # Chronological, because `queued_messages` is and a dict keeps insertion order:
@@ -8441,12 +8469,19 @@ class Daemon:
 
     def withdraw_stale_objections(self, project: ProjectSpec,
                                   store: ProjectStore) -> None:
-        """Take back every objection whose order stopped before it was delivered (§6.6).
+        """Take back every objection whose order will never take another turn (§6.6).
 
         An objection queued for an order that is no longer `running` would arrive as a
         fresh turn on an order nobody asked to reopen — the exact thing the parent spec
-        refused. There is no third option: an undelivered objection is either delivered
-        while the order runs or withdrawn, and one of the two is always recorded.
+        refused.
+
+        THERE IS A THIRD OPTION SINCE ISSUE 1112, and it is why this pass is narrower
+        than "not running": an order in `validating`, `waiting_pr_merge` or
+        `budget_exhausted` comes back, so its objection is HELD
+        (`worker_session.message_hold`) and goes out at the next turn boundary. Only two
+        statuses end the wait — terminal, and `needs_review`, which disarms under
+        `OBJECTION_HANDED_BACK_REASON` because the order DELIVERED and the user owes the
+        decision (§2, 2026-10-20-an-objection-is-withdrawn-before-the-order-stops.md).
 
         A DELIVERED OBJECTION IS NEVER WITHDRAWN: `outstanding_objections` is already
         the "neither delivered nor withdrawn" query, and it is the only thing that
@@ -8466,17 +8501,28 @@ class Daemon:
         """
         for wo_id in store.work_orders_with_objections():
             try:
-                if store.get_work_order(wo_id)["status"] == "running":
+                status = str(store.get_work_order(wo_id)["status"] or "")
+                # TERMINAL, never merely not-running: `needs_review`, `validating`,
+                # `waiting_pr_merge` and `budget_exhausted` are all states an order COMES
+                # BACK FROM, and withdrawing there is GitHub issue 1112 (§1 of
+                # docs/superpowers/specs/2026-10-20-an-objection-is-withdrawn-before-the-
+                # order-stops.md). Three outcomes where there were two: terminal
+                # withdraws, `needs_review` DISARMS under its own reason, and every other
+                # open status HOLDS with nothing written.
+                if status not in TERMINAL_STATUSES and status != "needs_review":
                     continue
+                reason = (OBJECTION_HANDED_BACK_REASON if status == "needs_review"
+                          else OBJECTION_WITHDRAWN_REASON)
                 for a in store.outstanding_objections(wo_id):
-                    self._withdraw_objection(store, wo_id, assumption=a)
+                    self._withdraw_objection(store, wo_id, assumption=a, reason=reason)
             except Exception:  # noqa: BLE001 — one order must never stop the rest
                 log.exception("[%s] objections for %s could not be withdrawn",
                               project.name, wo_id)
 
     def _withdraw_objection(self, store: ProjectStore, wo_id: str, *,
                             assumption: dict[str, Any] | None = None,
-                            envelope: dict[str, Any] | None = None) -> None:
+                            envelope: dict[str, Any] | None = None,
+                            reason: str = OBJECTION_WITHDRAWN_REASON) -> None:
         """Disarm the carrier FIRST, then stamp the withdrawal (§6.6, in that order).
 
         The envelope and the message are what can still become a turn; the timestamp and
@@ -8487,6 +8533,11 @@ class Daemon:
         Called from both sides of the race — the reconcile pass, which starts from the
         assumption, and `deliver_messages`, which starts from the envelope — so it takes
         either end and resolves the other.
+
+        `reason` is the CALLER's, because two of them are true of different statuses and
+        the user reads whichever applies on three surfaces: the envelope note, the
+        timeline event and `ops.objection_line`. It defaults to the old one, which is
+        what every row written before issue 1112 was withdrawn for.
         """
         if envelope is None and assumption and assumption.get("objection_envelope_id"):
             envelope = store.get_envelope(int(assumption["objection_envelope_id"]))
@@ -8496,8 +8547,7 @@ class Daemon:
                  if a.get("objection_envelope_id") == envelope["id"]), None)
         if envelope is not None:
             if envelope["state"] == "queued":
-                store.mark_envelope(int(envelope["id"]), "withdrawn",
-                                    note=OBJECTION_WITHDRAWN_REASON)
+                store.mark_envelope(int(envelope["id"]), "withdrawn", note=reason)
             if envelope.get("delivered_msg_id"):
                 # ONLY FROM `queued`, the envelope's own rule: a delivered message was
                 # read by the worker and rewriting it would put a lie on the record
@@ -8510,7 +8560,9 @@ class Daemon:
         store.withdraw_objection(int(assumption["id"]))
         store.add_event(wo_id, "autoreview_objection_withdrawn", {
             "assumption_id": assumption["id"], "n": assumption.get("n"),
-            "reason": OBJECTION_WITHDRAWN_REASON,
+            # THE CARRIER OF THE REASON (§3): the envelope note is written only from
+            # `queued`, so the event is the only record that is always there.
+            "reason": reason,
             "envelope_id": assumption.get("objection_envelope_id")})
 
     def _unreachable_question_ids(self, neo_store: Any,

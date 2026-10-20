@@ -33,6 +33,10 @@ from jarvis.ui.app import create_app  # noqa: E402
 
 REASON = "the helper is not idempotent on retry, so the second call double-counts"
 NOW = 1_700_000_000.0
+#: The two withdrawal reasons, verbatim — `jarvis.project_store` owns the strings and
+#: these tests assert the TEXT a user reads, so they are spelled out here on purpose.
+STOPPED = "the order stopped before it could be delivered"
+HANDED_BACK = "the order delivered its result and the decision is yours"
 
 
 @pytest.fixture()
@@ -49,7 +53,8 @@ def page_of(client, wo_id: str) -> str:
 def objecting_order(store, *, delivered: float | None = None,
                     withdrawn: float | None = None, transport: str = "queue",
                     envelope_state: str = "queued", msg_status: str | None = None,
-                    verdict: str = "object"):
+                    verdict: str = "object", withdrawn_reason: str = "",
+                    status: str = "running"):
     """An order with one assumption whose objection reached `envelope_state`.
 
     Returns `(wo, assumption row with every derivation attached)` — the row both
@@ -59,7 +64,7 @@ def objecting_order(store, *, delivered: float | None = None,
     aid = store.add_assumption(wo["id"], "the API is idempotent")
     store.record_provisional(aid, verdict=verdict, reason=REASON, model="opus",
                              stakes="routine")
-    store.set_status(wo["id"], "running")
+    store.set_status(wo["id"], status)
     env_id = store.post_envelope(from_role="reviewer", to_role="implementor",
                                  kind="assumption_objection",
                                  payload={"reason": REASON},
@@ -76,6 +81,13 @@ def objecting_order(store, *, delivered: float | None = None,
         store.mark_objection_delivered(aid, delivered)
     if withdrawn:
         store.withdraw_objection(aid, withdrawn)
+    if withdrawn_reason:
+        # THE CARRIER OF THE REASON is the event and never the column: §3 of
+        # docs/superpowers/specs/2026-10-20-an-objection-is-withdrawn-before-the-order-
+        # stops.md. `Daemon._withdraw_objection` writes exactly this payload.
+        store.add_event(wo["id"], "autoreview_objection_withdrawn",
+                        {"assumption_id": aid, "n": 1, "reason": withdrawn_reason,
+                         "envelope_id": env_id})
     return store.get_work_order(wo["id"]), row_of(store, wo["id"], aid)
 
 
@@ -135,8 +147,13 @@ def test_an_assumption_in_an_auto_review_off_project_grows_no_lines(client, proj
 # -- the four end states ---------------------------------------------------------------
 
 
-def test_the_four_end_states_each_read_differently(client, project):
-    """§8 item 3: four facts, four sentences. Any two spelled the same is the defect."""
+def test_the_five_end_states_each_read_differently(client, project):
+    """§8 item 3: five facts, five sentences. Any two spelled the same is the defect.
+
+    Five since issue 1112: the hand-back is a withdrawal of its own, because a
+    `needs_review` order did not stop — it delivered, and the decision is the user's
+    (spec 2026-10-20-an-objection-is-withdrawn-before-the-order-stops.md §3).
+    """
     store = ProjectStore(project)
     lines = {}
     _, flight = objecting_order(store)
@@ -144,19 +161,87 @@ def test_the_four_end_states_each_read_differently(client, project):
     _, delivered = objecting_order(store, delivered=NOW + 60)
     lines["delivered"] = ops.objection_line(delivered)
     _, withdrawn = objecting_order(store, withdrawn=NOW + 90,
-                                   envelope_state="withdrawn")
+                                   envelope_state="withdrawn",
+                                   withdrawn_reason=STOPPED)
     lines["withdrawn"] = ops.objection_line(withdrawn)
+    _, handed = objecting_order(store, withdrawn=NOW + 90, envelope_state="withdrawn",
+                                withdrawn_reason=HANDED_BACK, status="needs_review")
+    lines["handed_back"] = ops.objection_line(handed)
     _, dead = objecting_order(store, msg_status="failed")
     lines["dead"] = ops.objection_line(dead)
 
-    assert len(set(lines.values())) == 4, lines
+    assert len(set(lines.values())) == 5, lines
     assert lines["flight"].endswith("in flight")
     assert "delivered at " in lines["delivered"]
     assert "withdrawn at " in lines["withdrawn"]
-    assert "the order stopped before it could be delivered" in lines["withdrawn"]
+    assert STOPPED in lines["withdrawn"]
+    assert HANDED_BACK in lines["handed_back"]
     assert "UNDELIVERABLE" in lines["dead"]
     for line in lines.values():
         assert "objection sent to the worker over the queue at " in line
+
+
+def test_a_handed_back_objection_says_the_decision_is_yours(client, project):
+    """§3: the reason is read OFF THE ROW, and the fallback is the historical fact.
+
+    A row withdrawn before this shipped has no event to read, and every one of those was
+    withdrawn because the order stopped — so the fallback is a fact, not a guess.
+    """
+    store = ProjectStore(project)
+    wo, handed = objecting_order(store, withdrawn=NOW + 90,
+                                 envelope_state="withdrawn",
+                                 withdrawn_reason=HANDED_BACK, status="needs_review")
+
+    assert handed["objection_withdrawn_reason"] == HANDED_BACK
+    line = ops.objection_line(handed)
+    assert HANDED_BACK in line and STOPPED not in line
+    assert line in ops.assumption_line(handed)
+    assert line in page_of(client, wo["id"])
+
+    _, historical = objecting_order(store, withdrawn=NOW + 90,
+                                    envelope_state="withdrawn")
+
+    assert historical["objection_withdrawn_reason"] == ""
+    assert STOPPED in ops.objection_line(historical)
+
+
+def test_the_review_payload_names_the_objected_assumption(client, project):
+    """§4: the link the boundary was missing, on both surfaces, and the reason ONCE.
+
+    `provisional_line` already prints the objection's reason beside the assumption, so
+    the review note must not print it a second time — the whole payload is read together.
+    """
+    store = ProjectStore(project)
+    wo, row = objecting_order(store, withdrawn=NOW + 90, envelope_state="withdrawn",
+                              withdrawn_reason=HANDED_BACK, status="needs_review")
+
+    review = ops.review_state(store, store.get_work_order(wo["id"]))
+
+    assert review["objected"] == [{"n": 1, "reason": REASON, "delivery": "handed_back"}]
+    assert "assumption #1" in review["objected_note"]
+    assert "the worker was never told" in review["objected_note"]
+    assert REASON not in review["objected_note"]
+    assert review["objected_note"] in "\n".join(ops.review_lines(review))
+
+    page = page_of(client, wo["id"])
+    assert review["objected_note"] in page
+    assert page.count(REASON) == 1
+    readable = cli._readable_review({"id": wo["id"], "review": review})["review"]
+    assert [line for line in readable if review["objected_note"] in line]
+    assert len([line for line in readable if REASON in line]) == 0
+
+
+def test_a_delivered_objection_does_not_say_the_worker_was_never_told(project):
+    """The one objected row where the worker WAS told, and left the assumption standing
+    (§7 of the 2026-09-23 spec). Calling that silence would be false."""
+    store = ProjectStore(project)
+    wo, _ = objecting_order(store, delivered=NOW + 60, status="needs_review")
+
+    review = ops.review_state(store, store.get_work_order(wo["id"]))
+
+    assert review["objected"][0]["delivery"] == "delivered"
+    assert "never told" not in review["objected_note"]
+    assert "left it as it is" in review["objected_note"]
 
 
 @pytest.mark.parametrize("kwargs,expected", [
