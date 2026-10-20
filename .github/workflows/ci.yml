@@ -55,7 +55,7 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
       - run: pip install -e ".[dev]"
-      - run: pytest tests -q -n auto --timeout=120 --splits 8 --group ${{ matrix.group }}
+      - run: pytest tests -q -n auto --timeout=60 --splits 8 --group ${{ matrix.group }}
 
   unit:
     name: unit (${{ matrix.python-version }})
@@ -84,7 +84,7 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
       - run: pip install -e ".[dev]"
-      - run: pytest evals -q -n auto --timeout=120
+      - run: pytest evals -q -n auto --timeout=60
       - name: Upload scorecard
         if: always()
         uses: actions/upload-artifact@v4
@@ -105,4 +105,4 @@ jobs:
           cache-dependency-path: pyproject.toml
       - run: pip install -e ".[dev]"
       - run: playwright install --with-deps chromium
-      - run: pytest tests_browser -q --timeout=120
+      - run: pytest tests_browser -q --timeout=60
