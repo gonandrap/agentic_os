@@ -2669,7 +2669,10 @@ def test_a_stalled_pull_request_ends_the_tick_as_an_attention_item(
 
         row = store.get_work_order(wo["id"])
         assert bool(row["needs_attention"])
-        assert row["attention_reason"] == invariants.NO_ACTOR_BLOCKER
+        # The string names the STATUS (§5b): `.format` is what this child landed, and the
+        # bare constant is a template.
+        assert row["attention_reason"] == invariants.NO_ACTOR_BLOCKER.format(
+            status="waiting_pr_merge")
     finally:
         store.close()
 
@@ -2679,3 +2682,155 @@ def test_the_pointer_check_runs_on_the_slow_cadence_only():
     lists the whole repository. `INVARIANTS` runs twice a minute per project."""
     assert invariants.check_spec_pointer_resolves in invariants.SLOW_INVARIANTS
     assert invariants.check_spec_pointer_resolves not in invariants.INVARIANTS
+
+
+# -- 5b/5d: an OPEN row no pass selects says so ----------------------------------------
+# docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md §5b/§5d.
+# The two shapes the feature was opened for: a `validating` row with no round (the panel
+# owns nothing) and a `waiting_pr_merge` row with no `pr_url` (the poll selects nothing).
+
+#: (status, what makes the row) — each derives no actor from `ops.scheduled_actor`.
+NO_ACTOR_SHAPES = [
+    pytest.param("validating", id="validating-with-no-round"),
+    pytest.param("waiting_pr_merge", id="waiting-pr-merge-with-no-pr-url"),
+]
+
+
+def _no_actor_row(store: ProjectStore, status: str) -> dict:
+    """A delivered work order parked in `status` with nothing for a pass to select."""
+    wo = store.create_work_order("add feature X", status=status)
+    store.update_work_order(wo["id"], result_summary="done")
+    return store.get_work_order(wo["id"])
+
+
+@pytest.mark.parametrize("status", NO_ACTOR_SHAPES)
+def test_an_open_row_no_pass_selects_names_the_hole(project, status):
+    store = ProjectStore(project)
+    wo = _no_actor_row(store, status)
+
+    assert ops.scheduled_actor(store, wo) is None, "the premise: nobody will act"
+    assert true_blockers(store, wo) == [
+        invariants.NO_ACTOR_BLOCKER.format(status=status)]
+
+
+@pytest.mark.parametrize("status", NO_ACTOR_SHAPES)
+def test_the_no_actor_line_carries_no_elapsed_time(project, status):
+    """§2: INV-ATTENTION-REASON re-derives it and `ack_attention` stores it verbatim, so
+    a reason that ticked could never be acknowledged."""
+    store = ProjectStore(project)
+    wo = _no_actor_row(store, status)
+
+    early = true_blockers(store, wo, now=time.time())
+    late = true_blockers(store, wo, now=time.time() + 40 * 60 * 60)
+
+    assert early == late != []
+
+
+def test_a_round_the_panel_owns_names_nobody_new(project):
+    """The other half of line 579's pairing, at the new arm: an actor is an answer, and
+    an order the panel is judging must not be flagged."""
+    store = ProjectStore(project)
+    wo = _no_actor_row(store, "validating")
+    store.open_validation_round(wo_id=wo["id"], fingerprint="fp-1")
+
+    assert true_blockers(store, store.get_work_order(wo["id"])) == []
+
+
+def test_the_new_arm_never_doubles_a_line_that_already_names_the_stop(project):
+    """Neo's precedence ruling: the parked tail first, and the new arm only when no
+    worker-stopped line is on the list. PARKED_BLOCKER carries the cause where
+    NO_ACTOR_BLOCKER carries only the absence."""
+    store = ProjectStore(project)
+    wo = store.create_work_order("delivered, sent back to work, stopped again")
+    early = store.create_turn(wo["id"], "dispatch", "plan it")
+    store.finish_turn(early["id"], "done", result="submitted the plan")
+    store.update_work_order(wo["id"], result_summary="planned it")
+    store.add_event(wo["id"], "finished", {"summary": "planned it"})
+    store.add_assumption(wo["id"], "one call I made")
+    later_turn = store.create_turn(wo["id"], "message", "go and open the PR")
+    store.finish_turn(later_turn["id"], "done", result="waiting on exact counts")
+    store.set_status(wo["id"], "needs_review")
+    wo = store.get_work_order(wo["id"])
+    later = float(store.latest_turn(wo["id"])["ended_at"]) + 90 * 60
+
+    assert ops.scheduled_actor(store, wo, now=later) is None, "the premise"
+    assert true_blockers(store, wo, now=later) == [
+        "1 assumption pending your review", invariants.STALE_FINISH_BLOCKER]
+
+
+def test_an_ungoverned_open_row_is_still_asked_for_nothing(project):
+    """`UNGOVERNED_ORIGINS` stays load-bearing (§1 prohibition 3): both the settler and
+    the retry sweep skip an `adhoc` row, so it has no actor BY DESIGN — and
+    `tests/test_scheduled_actor.py`'s EXPECT_NEITHER table says so for this pair."""
+    store = ProjectStore(project)
+    wo = store.create_work_order("a legacy background agent", origin="adhoc",
+                                 status="running")
+    turn = store.create_turn(wo["id"], "dispatch", "whatever it was doing")
+    store.finish_turn(turn["id"], "done", result="…")
+    wo = store.get_work_order(wo["id"])
+    later = float(store.latest_turn(wo["id"])["ended_at"]) + 90 * 60
+
+    assert ops.scheduled_actor(store, wo, now=later) is None, "the premise"
+    assert true_blockers(store, wo, now=later) == []
+
+
+def test_the_actor_is_derived_once_per_derivation(project, monkeypatch):
+    """§5d's cost clause: `true_blockers` runs for every work order on every reconcile
+    tick, so the verdict is computed ONCE and handed to `parked_reason`, never once per
+    arm."""
+    store = ProjectStore(project)
+    wo = _no_actor_row(store, "validating")
+    calls: list[str] = []
+    real = ops.scheduled_actor
+    monkeypatch.setattr(ops, "scheduled_actor",
+                        lambda *a, **k: calls.append(a[1]["id"]) or real(*a, **k))
+
+    assert true_blockers(store, wo) != []
+    assert calls == [wo["id"]]
+
+
+def test_a_settled_row_costs_the_tick_no_verdict_at_all(project, monkeypatch):
+    """The same clause from the other end: `SCHEDULED_ACTORS` is keyed by
+    `OPEN_STATUSES`, so asking it about a `completed` row would raise — and every
+    settled work order in the project would pay for the question."""
+    store = ProjectStore(project)
+    wo = store.create_work_order("add feature X", status="completed")
+    monkeypatch.setattr(ops, "scheduled_actor",
+                        lambda *a, **k: pytest.fail("a settled row was asked"))
+
+    assert true_blockers(store, store.get_work_order(wo["id"])) == []
+
+
+@pytest.mark.parametrize("status", NO_ACTOR_SHAPES)
+def test_the_hole_ends_the_tick_flagged_and_acks_for_good(jarvis_home, project,
+                                                          catalog_file, status):
+    """§5d end to end: the reason INV-ATTENTION-REASON re-derives, and `jarvis wo ack`
+    puts the flag down for good — the reconciler re-derives attention every tick, so an
+    ack that did not stick would come straight back."""
+    from jarvis.catalog import load_catalog
+    from jarvis.daemon import Daemon
+
+    ops.start_os(str(catalog_file), foreground=True)
+    catalog = load_catalog(catalog_file)
+    daemon, store = Daemon(catalog), ProjectStore(project)
+    try:
+        wo = _no_actor_row(store, status)
+
+        daemon.check_invariants(catalog.projects[0], store)
+
+        row = store.get_work_order(wo["id"])
+        assert (bool(row["needs_attention"]), row["attention_reason"]) == (
+            True, invariants.NO_ACTOR_BLOCKER.format(status=status))
+        # INV-ATTENTION-REASON rewrites any reason this function cannot re-derive: the
+        # flag surviving a second pass unchanged IS that re-derivation.
+        daemon.check_invariants(catalog.projects[0], store)
+        assert store.get_work_order(wo["id"])["attention_reason"] == \
+            invariants.NO_ACTOR_BLOCKER.format(status=status)
+
+        ops.ack_attention(wo["id"])
+        assert not bool(store.get_work_order(wo["id"])["needs_attention"])
+
+        daemon.check_invariants(catalog.projects[0], store)
+        assert not bool(store.get_work_order(wo["id"])["needs_attention"])
+    finally:
+        store.close()

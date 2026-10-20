@@ -535,13 +535,17 @@ def parked_shape(rec: Record, store: ProjectStore, wo: str) -> float:
     instant opening refusal, which writes `turn_paused` and no turn row — so the LATEST
     turn is still the settled one and `parked_reason` reaches its threshold test. That is
     the only shape in which this suppression can ever matter: a paused order whose latest
-    turn is `failed` is turned away several lines earlier, and `ops.waiting_on` would
-    answer `retry_pending` for it besides.
+    turn is `failed` is turned away several lines earlier.
+
+    `waiting_pr_merge` WITH NO `pr_url`, because `parked_reason` reads
+    `ops.scheduled_actor` now (§5a): that is a row no pass selects, so the overlap
+    arithmetic below is the only thing that can decide the answer. A `running` row would
+    name `Daemon.settle_turns` and the pair would both pass for the wrong reason.
 
     Returns the moment to read the record at.
     """
     seq = rec.turn(T0, T0 + 60)
-    store.set_status(wo, "running")
+    store.set_status(wo, "waiting_pr_merge")
     rec.event("turn_paused", T0 + 60,
               {"seq": seq, "reason": "usage_limit",
                "error": "You've hit your session limit · resets 2:10pm"})

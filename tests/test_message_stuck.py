@@ -137,24 +137,29 @@ def test_resume_auto_says_what_is_holding_it_and_does_not_send_another(project):
 def test_a_stuck_message_speaks_instead_of_the_parked_line(project):
     """One stopped worker, one sentence: PARKED_BLOCKER would only say it went quiet.
 
-    THE FIXTURE HAS TO BE OLD IN THE ROWS, not in a `now` argument. `parked_reason` takes
-    one and `ops.waiting_on`, which it consults, does not — it reads `time.time()` itself
-    — so passing `now=` ages only half the question and the `None` comes back from
-    `queued_message`'s pre-existing IN_FLIGHT_WAITS membership, which is exactly what
-    this test must not be able to pass on. The second assertion is the negative control:
-    with the message delivered, the same fixture IS parked, which is what proves the
-    check was armed and makes reverting `SPOKEN_FOR_WAITS` fail here.
+    THE FIXTURE HAS TO BE OLD IN THE ROWS, not in a `now` argument, and the STATUS is the
+    other half of it: `waiting_pr_merge` with no `pr_url` is a row NO DAEMON PASS SELECTS,
+    so nobody else owns it and the sentence here is this suite's to choose.
+
+    ASSERTED ON `true_blockers`, which is where the choosing happens since §5a
+    (docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md):
+    `parked_reason` answers one question now — is a pass coming — and `message_stuck` is
+    no longer one of its exemptions, because the parked tail is already skipped whenever a
+    line on the list names the stop. The second half is the negative control: with the
+    message delivered, the same fixture IS parked, so a suite that had simply stopped
+    reporting either sentence fails here.
     """
     store = ProjectStore(project)
-    wo = _sent_and_never_delivered(store)
+    wo = _sent_and_never_delivered(store, status="waiting_pr_merge")
     _age_the_message(store, wo["id"])
     _age_the_turn(store, wo["id"])
 
     assert ops.waiting_on(store, wo)["what"] == "message_stuck"
-    assert parked_reason(store, wo) is None
+    assert true_blockers(store, wo) == [MESSAGE_STUCK_BLOCKER]
 
     store.mark_message(store.queued_messages(wo["id"])[0]["id"], "delivered")
 
+    assert true_blockers(store, wo) == [PARKED_BLOCKER]
     assert parked_reason(store, wo) == PARKED_BLOCKER
 
 

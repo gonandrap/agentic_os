@@ -9,9 +9,19 @@ until the user typed. Two separate failures produced that, and each has a test h
   hours older than the parking, which named none of what had just happened. That is
   `STALE_FINISH_BLOCKER`, and the rule it must obey is that it rides BESIDE the older
   reason and never over it.
-* A work order the OS still calls `running` with a settled turn behind it had no check
-  at all: no branch of `true_blockers` looked at a `running` order. That is
-  `PARKED_BLOCKER`.
+* A work order with a settled turn behind it and no pass selecting it had no check at
+  all. That is `PARKED_BLOCKER`.
+
+WHICH ROW THAT IS, IS DERIVED (§5a,
+docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md):
+`parked_reason` asks `ops.scheduled_actor` instead of consulting `PARKABLE_STATUSES` and
+`SPOKEN_FOR_WAITS`. So a `running` row with a done turn is NOT this shape — it is
+`Daemon.settle_turns`' row, which moves it to `needs_review` where IDLE_NO_FINISH_BLOCKER
+speaks (`daemon.settles_turn`, pinned by `tests/test_scheduled_actor.py::
+test_a_done_turn_the_settler_does_move_still_names_it`). The fixture that used to say
+`running` encoded a daemon that was NOT RUNNING, and no row predicate can see that — the
+only evidence would be elapsed time, which is the second opinion this feature deletes.
+The fixture below is a row nobody selects instead.
 
 The noise rule is the other half of the suite and most of its assertions: an order
 waiting on a dependency, a gate, Neo, a queued message, a scheduled retry or a turn in
@@ -24,7 +34,7 @@ import json
 
 import pytest
 
-from jarvis import db, ops
+from jarvis import db, invariants, ops
 from jarvis.central_store import CentralStore
 from jarvis.invariants import (
     PARKED_BLOCKER,
@@ -40,13 +50,38 @@ from jarvis.project_store import ProjectStore
 LONG_ENOUGH = 90 * 60
 
 
-def _parked_running(store: ProjectStore, title: str = "the parked one") -> dict:
-    """The shape `Daemon.settle_work_order` leaves behind when it never gets there: the
-    turn is reaped and done, the work order still says `running`, nothing is queued."""
+def _parked(store: ProjectStore, title: str = "the parked one") -> dict:
+    """A row NO PASS SELECTS: the turn is reaped and done, the order sits in
+    `waiting_pr_merge`, and no `pr_url` was ever recorded.
+
+    So `Daemon.poll_pull_requests` — the only candidate for that status — has nothing to
+    ask GitHub about, nothing else sweeps it, and `ops.scheduled_actor` names nobody.
+    That is what "parked" means now, and it is one of the two shapes §5d was written for.
+
+    The SESSION ID is part of the shape rather than decoration: without one
+    `worker_session.delivery_hold` holds any queued message, so the message test below
+    would pin the wrong verdict (the note `tests/test_scheduled_actor.py:534` makes).
+    """
     wo = store.create_work_order(title)
-    store.set_status(wo["id"], "running")
+    store.update_work_order(wo["id"], session_id="sess-1")
     turn = store.create_turn(wo["id"], "dispatch", "do the thing")
     store.finish_turn(turn["id"], "done", result="waiting on exact counts")
+    store.set_status(wo["id"], "waiting_pr_merge")
+    return store.get_work_order(wo["id"])
+
+
+def _waiting_on_a_delegate(store: ProjectStore) -> dict:
+    """A worker parked in `waiting_input`, where the gate and question passes DO select.
+
+    The noise rule's two delegate cases need this status rather than the one above:
+    `daemon.reviews_gate` and `daemon.answers_question` are registered for
+    `waiting_input` only, and they are the actors that make those waits correct.
+    """
+    wo = store.create_work_order("asked the delegate something")
+    store.update_work_order(wo["id"], session_id="sess-1")
+    turn = store.create_turn(wo["id"], "dispatch", "do the thing")
+    store.finish_turn(turn["id"], "done", result="waiting on the gate")
+    store.set_status(wo["id"], "waiting_input")
     return store.get_work_order(wo["id"])
 
 
@@ -93,9 +128,12 @@ def _later(store: ProjectStore, wo_id: str) -> float:
 # -- the two shapes it must catch ------------------------------------------------------
 
 
-def test_a_settled_turn_on_a_running_order_is_parked_once_the_threshold_passes(project):
+def test_a_settled_turn_on_a_row_no_pass_selects_is_parked_once_the_threshold_passes(
+        project):
+    """GitHub issue 100's half of this suite, on the row the derivation can see: the turn
+    is done, nobody is coming, and once the threshold passes the user is told so."""
     store = ProjectStore(project)
-    wo = _parked_running(store)
+    wo = _parked(store)
 
     assert parked_reason(store, wo, now=float(wo["updated_at"])) is None
     assert parked_reason(store, wo, now=_later(store, wo["id"])) == PARKED_BLOCKER
@@ -147,7 +185,7 @@ def test_a_dependency_blocked_order_is_not_parked(project):
 
 def test_a_gate_blocked_order_is_not_parked(project):
     store = ProjectStore(project)
-    wo = _parked_running(store)
+    wo = _waiting_on_a_delegate(store)
     store.add_approval(wo["id"], "pr_merge", "gh pr merge 42")
 
     assert parked_reason(store, wo, now=_later(store, wo["id"])) is None
@@ -155,7 +193,7 @@ def test_a_gate_blocked_order_is_not_parked(project):
 
 def test_an_order_with_a_pending_neo_question_is_not_parked(project):
     store = ProjectStore(project)
-    wo = _parked_running(store)
+    wo = _waiting_on_a_delegate(store)
     neo = NeoStore()
     try:
         neo.ask("proj_a", wo["id"], "which way round?")
@@ -176,10 +214,19 @@ def test_an_order_with_a_turn_in_flight_is_not_parked(project):
 
 
 def test_a_queued_message_is_not_parked(project):
-    """The next turn is already written down; the daemon delivers it."""
+    """The next turn is already written down; the daemon delivers it.
+
+    THE STATUS AND THE SESSION ID ARE BOTH THE PREMISE, not decoration.
+    `Daemon.deliver_messages` is registered for the statuses it sweeps, and
+    `worker_session.delivery_hold` holds a message on an order with no session (nothing
+    carries one into a dispatch prompt) — so without either, delivery is NOT the actor and
+    the row is parked with a message behind it, which `true_blockers` reports as
+    MESSAGE_STUCK_BLOCKER. The same note `tests/test_scheduled_actor.py:534` makes.
+    """
     store = ProjectStore(project)
-    wo = _parked_running(store)
+    wo = _waiting_on_a_delegate(store)
     store.queue_message(wo["id"], "carry on")
+    wo = store.get_work_order(wo["id"])
 
     assert parked_reason(store, wo, now=_later(store, wo["id"])) is None
 
@@ -204,12 +251,16 @@ def test_an_idle_manager_is_never_parked(project):
     """A project manager is idle BY DESIGN between its feature's messages — flagging one
     would put a permanent second line on every feature order in the fleet.
 
-    The SILENCE IS BOUGHT BY THE STATUS, not by the kind (issue #264): `idle` is absent
-    from PARKABLE_STATUSES because "nothing is in flight" is its definition rather than
-    news about it, which is what replaced this function's `kind == 'manager'` carve-out.
+    The SILENCE IS NOW BOUGHT BY THE VERDICT (§5a): `ops.manager_awaiting_feature` says
+    `Daemon.deliver_envelopes` still routes to this row, which is a POSITIVE actor rather
+    than an absence — so the LIVE FEATURE is the premise, where the status used to carry
+    it by being absent from PARKABLE_STATUSES (issue #264). `idle` is only ever written to
+    a feature's manager, so a row without one was never the shape this test is about.
     """
     store = ProjectStore(project)
-    wo = store.create_work_order("manage the feature", kind="manager")
+    wo = store.create_work_order(
+        "manage the feature", kind="manager",
+        parent_id=store.create_feature_order("widen the supervisor", "…")["id"])
     store.set_status(wo["id"], "idle")
     turn = store.create_turn(wo["id"], "dispatch", "manage it")
     store.finish_turn(turn["id"], "done", result="nothing to do")
@@ -254,7 +305,7 @@ def test_the_reconciler_flags_a_parked_running_order(project, monkeypatch):
     blocker derived correctly and then never surfaced."""
     store = ProjectStore(project)
     restore = _rewind(monkeypatch, LONG_ENOUGH)
-    wo = _parked_running(store)
+    wo = _parked(store)
     restore()
 
     violations = check_project(store)
@@ -273,7 +324,7 @@ def test_a_read_only_doctor_run_reports_the_parking_without_raising_it(
     threshold through that same proxy, which is a passthrough of a non-callable."""
     store = ProjectStore(project)
     restore = _rewind(monkeypatch, LONG_ENOUGH)
-    wo = _parked_running(store)
+    wo = _parked(store)
     restore()
 
     violations = check_project(store, repair=False)
@@ -286,7 +337,7 @@ def test_jarvis_status_names_the_parked_order_and_what_it_is_parked_on(
         project, catalog_file, monkeypatch):
     store = ProjectStore(project)
     restore = _rewind(monkeypatch, LONG_ENOUGH)
-    parked = _parked_running(store)
+    parked = _parked(store)
     masked = _wo_a4bd6958(store)
     restore()
     check_project(store)
@@ -334,7 +385,7 @@ def test_the_dashboard_shows_the_blocker_the_flag_could_not_carry(
     store = ProjectStore(project)
     restore = _rewind(monkeypatch, LONG_ENOUGH)
     masked = _wo_a4bd6958(store)
-    ordinary = _parked_running(store, title="nothing to add")
+    ordinary = _parked(store, title="nothing to add")
     restore()
     check_project(store)  # the reconciler is what puts the flag on `ordinary`
     store.close()
@@ -387,7 +438,7 @@ def _set_inspect(catalog_file, *, os_block: dict | None = None,
 @pytest.mark.parametrize("minutes,parked", [(600, False), (10, True)])
 def test_the_threshold_is_a_fleet_setting(project, catalog_file, minutes, parked):
     store = ProjectStore(project)
-    wo = _parked_running(store)
+    wo = _parked(store)
     _set_inspect(catalog_file, os_block={"alarm_parked_minutes": minutes})
 
     got = parked_reason(store, wo, now=_later(store, wo["id"]))
@@ -398,7 +449,7 @@ def test_the_threshold_is_a_fleet_setting(project, catalog_file, minutes, parked
 def test_a_project_overrides_the_fleet_threshold_and_inherits_the_rest(
         project, catalog_file):
     store = ProjectStore(project)
-    wo = _parked_running(store)
+    wo = _parked(store)
     _set_inspect(catalog_file, os_block={"alarm_parked_minutes": 10},
                  project_block={"alarm_parked_minutes": 600})
 
@@ -408,18 +459,22 @@ def test_a_project_overrides_the_fleet_threshold_and_inherits_the_rest(
 
 def test_disabling_the_inspect_alarms_disables_the_parked_check(project, catalog_file):
     store = ProjectStore(project)
-    wo = _parked_running(store)
+    wo = _parked(store)
     _set_inspect(catalog_file, os_block={"enabled": False})
 
     assert parked_reason(store, wo, now=_later(store, wo["id"])) is None
-    assert true_blockers(store, wo, now=_later(store, wo["id"])) == []
+    # ...and what is left is the line the THRESHOLD does not govern: the alarms switch
+    # turns off "it has been quiet for an hour", never "no pass selects this row" (§5b —
+    # the hole is a fact about the row, with no clock in it).
+    assert true_blockers(store, wo, now=_later(store, wo["id"])) == [
+        invariants.NO_ACTOR_BLOCKER.format(status="waiting_pr_merge")]
 
 
 def test_the_parked_reason_does_not_move_with_the_clock(project):
     """It is compared against `attention_reason` and stored by `ack_attention`, so a
     reason carrying an elapsed time would be rewritten every tick and never stick."""
     store = ProjectStore(project)
-    wo = _parked_running(store)
+    wo = _parked(store)
     ended = float(store.latest_turn(wo["id"])["ended_at"])
 
     assert (parked_reason(store, wo, now=ended + LONG_ENOUGH)
@@ -428,7 +483,7 @@ def test_the_parked_reason_does_not_move_with_the_clock(project):
 
 def test_acknowledging_a_parked_order_puts_the_flag_down_for_good(project):
     store = ProjectStore(project)
-    wo = _parked_running(store)
+    wo = _parked(store)
     now = _later(store, wo["id"])
     store.ack_attention(wo["id"], true_blockers(store, wo, now=now))
 
@@ -442,11 +497,78 @@ def test_nothing_here_nudges_a_worker(project):
     waiting on died with its process, so "continue" would have resumed nothing.
     """
     store = ProjectStore(project)
-    wo = _parked_running(store)
+    wo = _parked(store)
     check_project(store)
 
     assert store.queued_messages(wo["id"]) == []
-    assert store.get_work_order(wo["id"])["status"] == "running"
+    assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
+
+
+# -- 5a: the verdict is the predicate --------------------------------------------------
+# docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md §5a.
+
+
+def test_a_settled_work_order_is_never_asked_who_owns_it(project):
+    """The gate is `OPEN_STATUSES`, not `PARKABLE_STATUSES`, and it has to be: three
+    callers outside `true_blockers` pass rows in ANY status, and `ops.SCHEDULED_ACTORS`
+    is keyed by exactly the nine open ones — so a settled row would raise `KeyError`."""
+    store = ProjectStore(project)
+    wo = _parked(store)
+    store.set_status(wo["id"], "completed")
+
+    assert parked_reason(store, store.get_work_order(wo["id"]),
+                         now=_later(store, wo["id"])) is None
+
+
+def test_it_never_asks_ops_waiting_on(project, monkeypatch):
+    """§5a: cutting the `parked_reason` to `waiting_on` edge is what lets section 6
+    rebase `waiting_on` on the same verdict without a cycle. A call coming back here is
+    that cycle, whatever answer it returns."""
+    store = ProjectStore(project)
+    wo = _parked(store)
+    monkeypatch.setattr(ops, "waiting_on",
+                        lambda *a, **k: pytest.fail("parked_reason asked waiting_on"))
+
+    parked_reason(store, wo, now=_later(store, wo["id"]))
+
+
+def test_the_caller_can_hand_over_a_verdict_it_already_derived(project):
+    """The sentinel is NOT None, and that distinction is the argument's whole point: a
+    caller that derived "nobody will act" passes None, and one that derived nothing at
+    all leaves the default so this function derives it (Neo's ruling)."""
+    store = ProjectStore(project)
+    wo = _parked(store)
+    now = _later(store, wo["id"])
+    somebody = ops.Actor(pass_name="Daemon.settle_turns", why="…",
+                         predicate="daemon.settles_turn")
+
+    assert parked_reason(store, wo, now=now, actor=somebody) is None
+    assert parked_reason(store, wo, now=now, actor=None) == PARKED_BLOCKER
+    assert parked_reason(store, wo, now=now,
+                         actor=invariants.ACTOR_NOT_DERIVED) == \
+        parked_reason(store, wo, now=now)
+
+
+def test_resume_auto_still_nudges_a_parked_worker(project, catalog_file):
+    """The other half of the GitHub issue 100 pin: the flag is one surface, and the
+    command the flag sends the user to has to still do something when they get there.
+
+    ITS OWN FIXTURE, and a `running` one: `ops.resume_in_auto` reads `ops.waiting_on`,
+    which §5a did not touch and section 6 owns — so this half is pinned on the row the
+    command is actually run against, not on the row the attention list now derives.
+    """
+    store = ProjectStore(project)
+    wo = store.create_work_order("stopped mid-task")
+    store.set_status(wo["id"], "running")
+    turn = store.create_turn(wo["id"], "dispatch", "do the thing")
+    store.finish_turn(turn["id"], "done", result="waiting on exact counts")
+    wo = store.get_work_order(wo["id"])
+    store.close()
+    _register(catalog_file)
+
+    answer = ops.resume_in_auto(wo["id"])
+
+    assert answer["nudged"] is True
 
 
 # -- 2b: a head the OS has already judged is not an undelivered one ---------------------

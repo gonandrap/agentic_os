@@ -521,6 +521,13 @@ STALE_FINISH_BLOCKER = ("the worker went back to work after finishing and stoppe
                         "without finishing — its recorded summary is older than its last "
                         "turn; read that turn, then `jarvis wo send`")
 
+#: NO LONGER CONSULTED BY `parked_reason`, and left here saying so rather than deleted:
+#: §5a of docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md
+#: replaced this list with `ops.scheduled_actor` over `OPEN_STATUSES`, and the feature's
+#: explicit MUST NOT is adding `validating` to it — the fix the next reader will reach
+#: for. Each reason below is now DERIVED: `validating` by the round predicate, `pending`
+#: by the claim SQL, `waiting_pr_merge` by the poll's, `idle` by the manager's.
+#:
 #: Where "nothing is in flight" is worth saying. `validating` is excluded because the
 #: round machine owns that work order and INV-VALIDATION-STRANDED already watches it;
 #: `pending` has no turn to be parked after; `waiting_pr_merge` is waiting on
@@ -531,6 +538,22 @@ STALE_FINISH_BLOCKER = ("the worker went back to work after finishing and stoppe
 #: `kind == "manager"` carve-out: the status now carries the fact the carve-out was
 #: asserting, so a manager in any OTHER status is judged like anything else.
 PARKABLE_STATUSES = ("dispatching", "running", "waiting_input", "needs_review")
+
+#: What an OPEN work order says when `ops.scheduled_actor` names nobody and no other
+#: blocker says what the user must DO. It names the STATUS and the ABSENCE and nothing
+#: else: PARKED_BLOCKER carries a cause, this carries only that no pass selects the row
+#: (§5b, docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md).
+#:
+#: PRODUCED ONLY BY `true_blockers`, under the trap `PR_CLOSED_BLOCKER` documents:
+#: INV-ATTENTION-REASON rewrites any attention reason `true_blockers` cannot re-derive,
+#: so the same sentence raised anywhere else is relabelled on the next tick.
+#:
+#: FREE OF ANY ELAPSED TIME, under the rule PARKED_BLOCKER states above: the reason is
+#: compared against `attention_reason` and stored verbatim by `ProjectStore.ack_attention`,
+#: so a reason that ticked could never be acknowledged.
+NO_ACTOR_BLOCKER = ("nothing is going to act on this: no daemon pass selects a "
+                    "`{status}` work order in this state — read its record, then "
+                    "`jarvis wo send`, `jarvis wo retry` or `jarvis wo done`")
 
 #: What a work order says when something the user sent it is still sitting in the queue
 #: and the worker has never seen it. GitHub issue 43: the delivery loop held messages for
@@ -572,6 +595,10 @@ IN_FLIGHT_WAITS = ("turn_running", "queued_message", "neo_question", "gate_with_
 #: raises MESSAGE_STUCK_BLOCKER for it directly, and that sentence names what the user is
 #: missing where PARKED_BLOCKER would only say the worker went quiet.
 SPOKEN_FOR_WAITS = IN_FLIGHT_WAITS + ("message_stuck",)
+
+#: `parked_reason`'s `actor` default: NOBODY HAS DERIVED A VERDICT YET, so derive one.
+#: Distinct from None, which is itself a verdict — that no daemon pass will act (§2).
+ACTOR_NOT_DERIVED = object()
 
 
 @dataclass
@@ -1375,9 +1402,33 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md).
     if all(_mentions_assumptions(b) and b not in REFUSAL_HELD_BLOCKERS
            for b in blockers):
-        parked = parked_reason(store, wo, now=now)
+        # ONE VERDICT PER ORDER PER DERIVATION (§5d's cost clause): derived here, handed
+        # to `parked_reason`, and read again by the arm below — never once per arm. Only
+        # an OPEN row is asked: `ops.SCHEDULED_ACTORS` is keyed by `OPEN_STATUSES` and
+        # raises on anything else, and a settled order must not pay for the question.
+        actor: Any = ACTOR_NOT_DERIVED
+        if wo["status"] in OPEN_STATUSES:
+            from .ops import scheduled_actor
+
+            actor = scheduled_actor(store, wo, now=now)
+        parked = parked_reason(store, wo, now=now, actor=actor)
         if parked:
             blockers.append(parked)
+        # NOBODY OWNS IT, AND NOTHING IS OWED. LAST, behind the parked tail and
+        # behind its guard rather than a second copy of it (Neo's precedence ruling): the
+        # parked line carries the CAUSE where this carries only the absence, so a
+        # worker-stopped line already on the list is the better sentence. `governed`
+        # because an `adhoc` or `injected` row genuinely has no actor BY DESIGN — both
+        # the settler and the retry sweep skip it — and is asked for nothing
+        # (`Daemon.retire_ungoverned`, INV-ADHOC-LEGACY-RETIRED).
+        #
+        # `not blockers` INSIDE the reused guard, not instead of it: §5b says NO
+        # USER-OWED BLOCKER, and the guard above answers the narrower question of whether
+        # any line says the WORKER stopped. An assumption review passes that guard while
+        # being exactly a thing the user owes — every `needs_review` order holding one
+        # would otherwise be told twice that nobody owns it.
+        elif governed and actor is None and not blockers:
+            blockers.append(NO_ACTOR_BLOCKER.format(status=wo["status"]))
     # What the user has already looked at and dismissed stops being a blocker — but only
     # exactly that. Anything new still gets through (a pending assumption never can be
     # acknowledged away; `jarvis wo ack` refuses).
@@ -1612,14 +1663,24 @@ def check_spans_reach_the_status(store: ProjectStore) -> Iterator[Violation]:
 
 
 def parked_reason(store: ProjectStore, wo: dict[str, Any],
-                  now: float | None = None) -> str | None:
+                  now: float | None = None,
+                  actor: Any = ACTOR_NOT_DERIVED) -> str | None:
     """Why nothing is going to happen to this work order — or None if something is.
 
-    THE PREDICATE IS `ops.waiting_on`, NOT A SECOND OPINION. That function already
-    answers "what is this order actually waiting for" for `jarvis wo resume-auto`, and
-    its answers divide cleanly into things the OS will do next (`IN_FLIGHT_WAITS`) and
-    everything else. Deriving the same split again here is how the attention list and
-    `resume-auto` come to disagree about one work order.
+    THE PREDICATE IS `ops.scheduled_actor`, NOT A SECOND OPINION. That function answers
+    "which daemon pass will act on this row next" over the passes' OWN predicates, so
+    the attention list cannot come to disagree with the passes about one work order.
+    Deriving the same split again here is the defect this reads instead of repeating
+    (§5a, docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md).
+
+    It was `ops.waiting_on` and `SPOKEN_FOR_WAITS` / `IN_FLIGHT_WAITS` until that spec.
+    NO CALL TO `waiting_on` MAY COME BACK: section 6 rebases that function on this same
+    verdict, and an edge from here to it would close the cycle.
+
+    `actor` is the verdict a caller has ALREADY derived — `true_blockers` computes it
+    once per order per tick and hands it over. `ACTOR_NOT_DERIVED` (the default, and
+    deliberately not None) means derive it here; None means a caller derived it and
+    nobody will act.
 
     Two shapes, and the second is why this is not merely the first. An order the OS still
     calls `running` with a finished turn behind it is INVISIBLY stopped — nothing derived
@@ -1629,8 +1690,8 @@ def parked_reason(store: ProjectStore, wo: dict[str, Any],
 
     Ordered cheapest first, and that ordering is load-bearing rather than tidy: this runs
     from `true_blockers`, which runs for every work order on every reconcile tick, and
-    the catalog read and `waiting_on`'s cross-database question about Neo both sit behind
-    the two free row checks. No model, no transcript.
+    the catalog read and the verdict's indexed reads both sit behind the two free row
+    checks. No model, no transcript.
     """
     if wo.get("origin") in UNGOVERNED_ORIGINS:
         # An injected session was never briefed on `jarvis wo finish`, so a turn of its
@@ -1638,7 +1699,13 @@ def parked_reason(store: ProjectStore, wo: dict[str, Any],
         # excused here too; `idle` is not in PARKABLE_STATUSES, so the status says it
         # now and the kind does not have to (issue #264).
         return None
-    if wo["status"] not in PARKABLE_STATUSES:
+    # OPEN, and that is the whole gate: `PARKABLE_STATUSES` stops being consulted (§5a),
+    # and `validating` is NOT added to it — the list is not the question any more. The
+    # bound is `OPEN_STATUSES` because `ops.SCHEDULED_ACTORS` is keyed by exactly those
+    # nine statuses and raises `KeyError` on anything else, and this function has three
+    # callers outside `true_blockers` (`ops.os_status`, `ops.diagnose`, `ui.app`) that
+    # pass rows in any status at all.
+    if wo["status"] not in OPEN_STATUSES:
         return None
     turn = store.latest_turn(wo["id"])
     if turn is None or turn["state"] != "done" or not turn["ended_at"]:
@@ -1661,9 +1728,15 @@ def parked_reason(store: ProjectStore, wo: dict[str, Any],
     if (now - ended) - sum(h.overlap(ended, now, now) for h in spans) \
             < minutes * SECONDS_PER_MINUTE:
         return None
-    from .ops import waiting_on
+    # SOMEBODY IS GOING TO ACT ON IT, and that is the one thing that makes a silence not
+    # a parking. In the same position the `waiting_on` read held, under the same cost
+    # ordering: below the free row checks, the turn read, the threshold and the
+    # `holds.held` overlap, so only a row already quiet for an hour pays for it.
+    if actor is ACTOR_NOT_DERIVED:
+        from .ops import scheduled_actor
 
-    if waiting_on(store, wo)["what"] in SPOKEN_FOR_WAITS:
+        actor = scheduled_actor(store, wo, now=now)
+    if actor is not None:
         return None
     finished = store.events_of_kind(wo["id"], "finished")
     if (finished and float(finished[-1]["ts"]) < float(turn["started_at"])
