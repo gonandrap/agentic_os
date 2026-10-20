@@ -46,7 +46,8 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev]"
-      - run: pytest tests -q
+      # Per-test deadline: a hang here burned 3.5h and named no test (run 39375255996).
+      - run: pytest tests -q --timeout=300 --timeout-method=thread
 
   evals:
     # Deterministic behavioral scorecard for Jarvis + Neo (evals/README.md).

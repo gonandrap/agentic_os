@@ -36,7 +36,7 @@ OTHER_PR = "https://github.com/acme/proj/pull/8"
 
 
 @pytest.fixture()
-def started(jarvis_home, fake_claude, catalog_file, project):
+def started(jarvis_home, fake_claude, catalog_file, project, live_daemon):
     ops.start_os(str(catalog_file), foreground=True)
     return Daemon(load_catalog(catalog_file))
 
