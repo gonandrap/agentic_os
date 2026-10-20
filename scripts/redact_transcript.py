@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
-"""Reduce a real Claude Code transcript to the skeleton `jarvis inspect` reads"""
+"""Reduce a real Claude Code transcript to the skeleton `jarvis inspect` reads.
+
+The regression fixture for the anatomy of a turn has to be a REAL session — the three
+findings it pins down (a cold start, a prefix-miss twelve seconds after the previous
+call, a TTL expiry after a 450-second block) are facts about timings and token counts
+that a hand-written file would only reproduce by being told the answer.
+
+The session itself cannot be committed: 1.5 MB, and its tool results contain the whole
+of the repository it was reading plus the user's and Neo's own words. So this keeps
+exactly the fields the analysis consumes — the clock, the usage objects, the tool ids
+and names, and enough of an injected prompt to recognise which kind it was — and drops
+every payload. What survives is unreadable as prose and identical as arithmetic.
+
+    scripts/redact_transcript.py <transcript.jsonl> <out-dir>
+
+Re-run it when the fixture needs rebuilding; the output is committed under tests/data.
+"""
 
 from __future__ import annotations
 

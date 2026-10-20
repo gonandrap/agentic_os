@@ -1,4 +1,39 @@
-"""Rebuild the labelled stakes corpus from a live fleet (docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md)"""
+"""Rebuild the labelled stakes corpus from a live fleet. The OUTPUT IS NOT COMMITTED.
+
+docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md SS3.9.
+
+WHY THE OUTPUT IS NOT COMMITTED (Neo, question 650). The corpus is verbatim production
+assumption prose from the fleet's own work orders, and `gonandrap/agentic_os` is a PUBLIC
+repository. So it lives OUTSIDE the repo, at `$JARVIS_STAKES_CORPUS`, defaulting to
+`$JARVIS_HOME/evals/stakes_corpus.json`, and the A/B eval SKIPS when that file is absent
+rather than failing.
+
+**PARAPHRASING WAS CONSIDERED AND REJECTED**, in the same ruling: a paraphrase changes the
+exact tokens the regex fires on — `delet` is 21 of its 91 hits — so the regex arm would be
+scored on rewritten text instead of production text, and the A/B would be measuring the
+paraphraser. What IS committed is this script and a small synthetic fixture
+(`evals/data/stakes_corpus_synthetic.json`), which is what the eval reads on a clean
+checkout.
+
+Run it against a fleet you own:
+
+    python evals/tools/build_stakes_corpus.py              # -> $JARVIS_STAKES_CORPUS
+    python evals/tools/build_stakes_corpus.py --out /tmp/corpus.json
+
+The labels are yours to write and are kept BESIDE the output, in `stakes_labels.json`:
+
+    {"wo-fca1ac5b#4": ["none", false, "regex fired on 'delet'; a conflict note"],
+     "wo-3819e654#1": ["publishing", false, "chose the tag and pushed it"]}
+
+`[category, uncertain, why]`. Anything absent is `routine` — the honest default, because
+~78 of the regex's 91 hits are routine and a corpus that assumed otherwise would flatter
+every arm. `uncertain: true` marks a label the user has not checked, and the eval EXCLUDES
+those rows from its assertion and reports them separately.
+
+Hidden and settled orders are included on purpose (`--all --include-hidden`): the fleet's
+whole history is the population the 498-row measurement was taken over, and dropping the
+closed ones would drop most of the acts.
+"""
 
 from __future__ import annotations
 

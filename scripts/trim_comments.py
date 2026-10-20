@@ -126,7 +126,9 @@ def _literal(text: str) -> str:
 def trim_docstrings(src: str, rel: str) -> str:
     tree = ast.parse(src)
     lines = src.splitlines(keepends=True)
-    keep = KEEP_DOCSTRINGS.get(rel, set())
+    keep = set(KEEP_DOCSTRINGS.get(rel, set()))
+    if any(isinstance(n, ast.Name) and n.id == "__doc__" for n in ast.walk(tree)):
+        keep.add("<module>")  # the module docstring is read at runtime (argparse help, usage)
     edits = []
     for qual, node in _docstring_nodes(tree):
         if qual in keep:

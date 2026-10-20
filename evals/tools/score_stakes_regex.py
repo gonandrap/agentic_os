@@ -1,4 +1,23 @@
-"""Score the SHIPPED net against the TIGHTENED one on the labelled corpus (docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md §6-)"""
+"""Score the SHIPPED net against the TIGHTENED one on the labelled corpus. NO MODEL CALL.
+
+docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md §6-§7.
+
+The A/B (`evals/llm/test_stakes_classifier_ab.py`) costs real calls and a session's usage
+limit, so it is opt-in and it caches. THIS COSTS NOTHING: both nets are regexes, so every
+narrowing can be re-scored on every row in under a second, and each rule in
+`autoreview.HIGH_STAKES_TIGHTENED` was derived with this loop rather than by reading.
+
+Reads the corpus from `$JARVIS_STAKES_CORPUS` (or `$JARVIS_HOME/evals/stakes_corpus.json`,
+or the committed synthetic fixture). THE PRODUCTION CORPUS IS NOT IN THIS REPO and must not
+be — it is verbatim production prose and the repository is public (Neo, question 650).
+
+    JARVIS_STAKES_CORPUS=/tmp/wo8a3/stakes_corpus.json \
+        uv run python evals/tools/score_stakes_regex.py
+
+`--diff-only` prints just the rows the two nets disagree on. Precision and recall are over
+the CERTAIN rows; the uncertain ones are reported separately and are never scored, the same
+split the A/B asserts under.
+"""
 
 from __future__ import annotations
 

@@ -1,4 +1,36 @@
-"""jarvis — the agentic OS command line"""
+"""jarvis — the agentic OS command line.
+
+Grouped commands:
+  jarvis start|stop|status|adopt          OS lifecycle
+  jarvis cost [project|wo-id|fo-id]       what the work has cost in tokens
+  jarvis inspect <wo-id|fo-id>            where its TIME went, and which cache writes
+                                          were a defect rather than the cache expiring
+  jarvis watch <wo-id>                    what its turn is doing RIGHT NOW, repainted
+  jarvis alarms [project] [--wo|--fo|--source]   findings, newest first: a turn raised
+                                          WHILE it burned, or a probe's symptom
+  jarvis alarms show|review <al-id>       one alarm, and your verdict on the
+                                          supervisor's
+  jarvis supervisor probes [project]      what this project is watched for, and where
+                                          each answer came from
+  jarvis wo create|list|show|send|ask|assume|finish|review|cancel|done|inject
+  jarvis fo create|list|show|plan|submit|approve|cancel feature orders (planned sets)
+  jarvis gate request|contest|list|show|approve|deny|dismiss  privileged-action
+                                          approvals (contest = the match was wrong)
+  jarvis gate rules|rule-retract|explain  what counts as privileged, and what the OS
+                                          has LEARNED does not
+  jarvis rules list|show|retract|dry-run|arm|false-positive  the SELF-HEALING registry:
+                                          the gaps the OS recognises in itself, and the
+                                          person-only verbs that arm one or call a fire
+                                          wrong (not the gate rules)
+  jarvis neo list|show|review|answer|learnings|learn|export
+  jarvis backlog add|list|show|promote|done
+  jarvis learn add|list|search|show|topics|stats|pin|unpin
+  jarvis notify / jarvis inbox
+  jarvis bug report                       file a Jarvis OS bug (GitHub issue + ping)
+  jarvis ui                               web dashboard
+  jarvis daemon run                       (internal) foreground daemon
+  jarvis _hook                            (internal) Claude Code hook handler
+"""
 
 from __future__ import annotations
 

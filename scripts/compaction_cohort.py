@@ -1,5 +1,34 @@
 #!/usr/bin/env python3
-"""What would compacting at every expired boundary have cost, and what would it save?"""
+"""What would compacting at every expired boundary have cost, and what would it save?
+
+The companion to `scripts/cache_ttl_cohort.py`. That one prices the OTHER remedy for
+the same waste — buying the one-hour cache write — and answers "not yet". This one
+prices compaction, boundary by boundary, over the same cohort window and the same
+transcript population, and it is the measurement that set
+`catalog.DEFAULT_COMPACT_MIN_CONTEXT`.
+
+    uv run python scripts/compaction_cohort.py --days 30
+    uv run python scripts/compaction_cohort.py --days 30 --floor 60000
+
+THE MODEL, and every constant in it is measured rather than chosen. A compaction is a
+plain-input call (the CLI does not cache-write it — probe below), so at an EXPIRED
+boundary it replaces a 1.25x re-write with a 1.0x re-send and leaves a ~15k summary in
+place of the whole history:
+
+    before = 1.25*W_b + sum_j (0.1*read_j + 1.25*write_j + 1.0*input_j)
+    after  = 1.0*C + out_rate*S_out                        <- the compaction call itself
+           + 1.25*S_write + 0.1*(S_ctx - S_write)          <- the real turn's first call
+           + sum_j (0.1*max(0, read_j - (C - S_ctx)) + 1.25*write_j + 1.0*input_j)
+
+W_b and every read_j/write_j/input_j are the fleet's own numbers, read through
+`usage.session_calls`. S_out, S_ctx and S_write are `COMPACT_SUMMARY_OUTPUT`,
+`COMPACT_CONTEXT` and `COMPACT_FIRST_WRITE`, measured live — see the docstrings there.
+`j` ranges over the calls after the boundary up to the NEXT boundary, i.e. the rest of
+that turn; the saving compaction goes on producing in every LATER turn is deliberately
+left out, so the figure is a floor.
+
+Read-only. Costs nothing and calls no model.
+"""
 
 from __future__ import annotations
 

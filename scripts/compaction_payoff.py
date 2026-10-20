@@ -1,5 +1,23 @@
 #!/usr/bin/env python3
-"""Did each worker-conversation compaction the OS paid for actually pay off? (docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md)"""
+"""Did each worker-conversation compaction the OS paid for actually pay off?
+
+The retrospective companion to `scripts/compaction_cohort.py`. That one PREDICTS what
+compacting at every TTL-expired boundary would save; this one MEASURES the compactions
+the daemon really ran (`worker_session.compact_before_relaunch`), one by one, against
+what the same work order went on to do afterwards.
+
+    JARVIS_HOME=/home/gonzalo/workspace/production/state \\
+        uv run python scripts/compaction_payoff.py --since 2026-09-28 [--json]
+
+THE ARITHMETIC LIVES IN `jarvis.compaction_payoff` and is re-exported below, not copied:
+this script is its renderer. Two copies of `assess` would fork silently, so the module's
+objects are imported by identity and `tests/test_compaction_payoff.py` asserts it. See
+that module's docstring for the sources, the method and every approximation, and §1 of
+docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md for why the move happened.
+
+Deterministic and read-only: every SQLite database is opened `mode=ro`, transcripts are
+only read, no model is called.
+"""
 
 from __future__ import annotations
 
