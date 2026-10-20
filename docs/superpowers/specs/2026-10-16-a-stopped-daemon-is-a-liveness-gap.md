@@ -102,6 +102,11 @@ neither, the `dark` arm does NOT fire. That is `check_stuck_sweep_alive`'s own r
 words: "NEVER SWEPT is only dark while the OS is UP" — a fresh install, or a fleet whose
 first tick has not landed, must not report as broken.
 
+A malformed or unparseable stamp is treated as NO stamp, and takes that same path: for the
+first `max(300, interval * 10)` seconds after `daemon_started_at` nothing is reported, and
+after that it reports `dark`. Deliberate, not an oversight — a corrupt stamp is not
+evidence of life, so the only safe reading of one is the reading of none.
+
 ## 3. What it must not do
 
 1. No new arm in `invariants.true_blockers` (`invariants.py:1084`), and no new

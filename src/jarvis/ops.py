@@ -48,8 +48,6 @@ from .agent_usage import (
 from .sections import QUESTION_MAX_CHARS, QUESTION_WARN_CHARS
 from .central_store import MISSED_MIN_WORDS, SETTLED_BACKLOG_STATUSES, CentralStore
 from .daemon import (
-    DAEMON_DARK_INTERVALS,
-    DAEMON_DARK_MIN_SECONDS,
     RECONCILE_TICK_KEY,
     answers_question,
     daemon_running,
@@ -517,6 +515,12 @@ def _held_jobs(store: ProjectStore, catalog: Catalog | None = None) -> list[dict
              "reason": st["held_reason"] or "", "wo_id": st["last_wo_id"]}
             for st in store.list_schedule_states()
             if st["held_since"] and st["job_id"] in cfg.jobs]
+
+
+#: §2b: dark once the newest stamp is older than
+#: max(DAEMON_DARK_MIN_SECONDS, interval * DAEMON_DARK_INTERVALS).
+DAEMON_DARK_INTERVALS = 10
+DAEMON_DARK_MIN_SECONDS = 300
 
 
 def _daemon_liveness(central: CentralStore, pid: int | None) -> dict[str, Any] | None:

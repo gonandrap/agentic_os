@@ -2068,7 +2068,7 @@ def _stuck_attention(catalog) -> list:
 
 
 def test_a_standing_critical_violation_reaches_the_attention_list(
-        jarvis_home, project, catalog_file, monkeypatch):
+        jarvis_home, project, catalog_file, monkeypatch, live_daemon):
     """Neo 1084: `jarvis status` read HEALTHY over a standing critical violation."""
     from jarvis.catalog import load_catalog
     from jarvis.daemon import Daemon
@@ -2091,11 +2091,7 @@ def test_a_standing_critical_violation_reaches_the_attention_list(
     items = [i for i in status["attention"] if i.get("invariant") == "INV-TEST-CRITICAL"]
     assert len(items) == 1
     assert items[0]["reason"] == "a standing break"
-    # Minus the liveness line: this test starts the OS in the foreground, so no pidfile
-    # exists and jarvisd reads as stopped (spec
-    # docs/superpowers/specs/2026-10-16-a-stopped-daemon-is-a-liveness-gap.md).
-    assert [i for i in status["attention"] if i["status"] != "daemon"] == items, \
-        "nothing else is asking, so this is why"
+    assert status["attention"] == items, "nothing else is asking, so this is why"
     assert not status["healthy"]
 
     # ...and the report row is also what takes it away again.
@@ -2104,8 +2100,7 @@ def test_a_standing_critical_violation_reaches_the_attention_list(
         assert closed.close_violation_report("INV-TEST-CRITICAL", wo["id"])
     finally:
         closed.close()
-    assert [i for i in ops.os_status(catalog)["attention"]
-            if i["status"] != "daemon"] == [], "the row is also the removal"
+    assert ops.os_status(catalog)["attention"] == [], "the row is also the removal"
 
 
 # -- a passed forced round answers a refusal --------------------------------------------

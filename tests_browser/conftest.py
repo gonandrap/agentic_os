@@ -17,6 +17,7 @@ from jarvis.testing import (  # noqa: F401
     claude_json,
     fake_claude,
     jarvis_home,
+    live_daemon,
     make_git_project,
     project,
 )
@@ -84,7 +85,7 @@ def _serve(catalog_path):
 
 
 @pytest.fixture()
-def server(jarvis_home, fake_claude, catalog_file):
+def server(jarvis_home, fake_claude, catalog_file, live_daemon):
     """OS started (foreground bootstrap) + live UI server; yields the base URL."""
     yield from _serve(catalog_file)
 
@@ -109,7 +110,7 @@ def gated_catalog(tmp_path, project):
 
 
 @pytest.fixture()
-def gated_server(jarvis_home, fake_claude, gated_catalog):
+def gated_server(jarvis_home, fake_claude, gated_catalog, live_daemon):
     """The same UI, over a fleet where privileged actions need approval."""
     yield from _serve(gated_catalog)
 

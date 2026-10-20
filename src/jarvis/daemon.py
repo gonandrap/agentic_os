@@ -138,10 +138,6 @@ RECONCILE_EVERY_TICKS = 6  # refresh `claude agents --json` every N ticks (injec
 #: The reconcile stamp a reader outside the process judges liveness by. §2a of
 #: docs/superpowers/specs/2026-10-16-a-stopped-daemon-is-a-liveness-gap.md.
 RECONCILE_TICK_KEY = "reconcile_tick"
-#: §2b: dark once the newest stamp is older than
-#: max(DAEMON_DARK_MIN_SECONDS, interval * DAEMON_DARK_INTERVALS).
-DAEMON_DARK_INTERVALS = 10
-DAEMON_DARK_MIN_SECONDS = 300
 SECONDS_PER_HOUR = 3600    # a unit, not a setting
 #: Ask GitHub about parked pull requests every N ticks — ~2 minutes at the default 5s
 #: interval. Its own cadence rather than the reconcile one because it leaves the machine:

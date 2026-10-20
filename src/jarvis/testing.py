@@ -2162,6 +2162,33 @@ def jarvis_home(tmp_path, monkeypatch):
 
 
 @pytest.fixture()
+def live_daemon(jarvis_home):
+    """A fleet whose jarvisd is UP: a pidfile for this process and a fresh reconcile stamp.
+
+    `ops.start_os(..., foreground=True)` writes neither, so a suite that starts the OS
+    that way and ticks a `Daemon` by hand has no running daemon as far as any reader is
+    concerned — and read-time liveness derivation says so. Spec
+    docs/superpowers/specs/2026-10-16-a-stopped-daemon-is-a-liveness-gap.md.
+    """
+    from . import db
+    from .central_store import CentralStore
+    from .daemon import RECONCILE_EVERY_TICKS, RECONCILE_TICK_KEY, daemon_pidfile
+
+    pidfile = daemon_pidfile()
+    pidfile.parent.mkdir(parents=True, exist_ok=True)
+    pidfile.write_text(str(os.getpid()))
+    central = CentralStore()
+    try:
+        central.set_state("daemon_started_at", str(db.now()))
+        central.set_state(RECONCILE_TICK_KEY, db.to_json(
+            {"ts": db.now(), "interval": RECONCILE_EVERY_TICKS * 5.0}))
+    finally:
+        central.close()
+    yield
+    pidfile.unlink(missing_ok=True)
+
+
+@pytest.fixture()
 def allow_external_sinks(monkeypatch):
     """Lift the external-sink kill switch for a test that must exercise sink internals.
 

@@ -145,7 +145,7 @@ def transcripts(tmp_path, monkeypatch):
 
 
 @pytest.fixture()
-def fleet(jarvis_home, project, fake_claude, catalog_file):
+def fleet(jarvis_home, project, fake_claude, catalog_file, live_daemon):
     """The OS started over one project, with a daemon to drive dispatch by hand.
 
     The real path on purpose: this eval is about what the OS actually records, so a

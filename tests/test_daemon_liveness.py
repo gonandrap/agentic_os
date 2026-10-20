@@ -12,13 +12,8 @@ import pytest
 from jarvis import db, ops
 from jarvis.catalog import load_catalog
 from jarvis.central_store import CentralStore
-from jarvis.daemon import (
-    DAEMON_DARK_INTERVALS,
-    DAEMON_DARK_MIN_SECONDS,
-    RECONCILE_EVERY_TICKS,
-    RECONCILE_TICK_KEY,
-    Daemon,
-)
+from jarvis.daemon import RECONCILE_EVERY_TICKS, RECONCILE_TICK_KEY, Daemon
+from jarvis.ops import DAEMON_DARK_INTERVALS, DAEMON_DARK_MIN_SECONDS
 from jarvis.project_store import ProjectStore
 
 #: Well past the window, in seconds.
@@ -152,16 +147,26 @@ def test_a_malformed_stamp_behaves_as_no_stamp(project, catalog_file, monkeypatc
     assert [a["cause"] for a in _daemon_items(catalog_file)] == ["dark"]
 
 
-def test_the_window_is_the_wider_of_the_floor_and_ten_intervals(project, catalog_file,
-                                                                monkeypatch):
+#: (interval, age, expected causes). A FAST interval — the 6s cadence of
+#: `--poll-interval 1` — puts ten intervals at 60s, below the 300s floor, so the floor is
+#: what binds; a wide one puts the mandate above it.
+WINDOW_CASES = [
+    (6.0, 120.0, [], "ten 6s intervals is 60s, so the 300s floor binds"),
+    (6.0, 400.0, ["dark"], "past the floor, and the floor is the wider arm"),
+    (600.0, 1000.0, [], "ten 600s intervals is 6000s, so the mandate binds"),
+    (600.0, 6600.0, ["dark"], "past the mandate"),
+]
+
+
+@pytest.mark.parametrize("interval,age,causes,why", WINDOW_CASES)
+def test_the_window_is_the_wider_of_the_floor_and_ten_intervals(
+        project, catalog_file, monkeypatch, interval, age, causes, why):
     """A slow poll interval widens the window; a fast one keeps the floor."""
     _alive(monkeypatch)
     _register(catalog_file)
-    wide = DAEMON_DARK_MIN_SECONDS
-    _stamp(db.to_json({"ts": db.now() - (DAEMON_DARK_MIN_SECONDS + 60),
-                       "interval": wide}))
+    _stamp(db.to_json({"ts": db.now() - age, "interval": interval}))
 
-    assert _daemon_items(catalog_file) == []
+    assert [a["cause"] for a in _daemon_items(catalog_file)] == causes, why
 
 
 # -- the writer ------------------------------------------------------------------------
@@ -189,11 +194,38 @@ def test_a_non_reconcile_tick_does_not_advance_the_stamp(project, catalog_file,
     central = CentralStore()
     try:
         first = central.get_state(RECONCILE_TICK_KEY)
+        assert first is not None, "else the comparison below holds vacuously"
 
         daemon.tick()
 
         assert daemon.tick_count == 2
         assert central.get_state(RECONCILE_TICK_KEY) == first
+    finally:
+        central.close()
+
+
+def test_a_tick_that_dies_mid_pass_does_not_stamp_itself_alive(
+        project, catalog_file, jarvis_home, fake_claude, monkeypatch):
+    """§2a's reason for the placement: the stamp is the LAST thing a reconcile does.
+
+    `route_new_inbox` is the last call before the `if reconcile:` block, so a failure
+    there is a reconcile pass that did its work and never finished — which must read as
+    dark, not as alive.
+    """
+    from jarvis import notify
+
+    def boom(*a, **k):
+        raise RuntimeError("the pass died")
+
+    monkeypatch.setattr(notify, "route_new_inbox", boom)
+    daemon = Daemon(load_catalog(catalog_file), poll_interval=POLL_INTERVAL)
+
+    with pytest.raises(RuntimeError, match="the pass died"):
+        daemon.tick()
+
+    central = CentralStore()
+    try:
+        assert central.get_state(RECONCILE_TICK_KEY) is None
     finally:
         central.close()
 
