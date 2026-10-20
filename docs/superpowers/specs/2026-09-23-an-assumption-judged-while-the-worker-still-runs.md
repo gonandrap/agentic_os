@@ -423,6 +423,15 @@ an order still running keeps it outstanding, however long it has been queued.
 
 ## 7. Confirmation at delivery, before anything settles
 
+> **Note, 2026-10-20 — this section STANDS.** GitHub issue 1112 part (2) asks for a mechanism
+> that re-opens an objected-but-still-pending assumption at a later delivery. It does NOT
+> license a second Neo question on a provisional `object`: ruled by Neo on question 2008 of
+> wo-66fc8296, an objection is never re-asked to Neo and never settled with `decided_by=neo`
+> — no confirmation pass, no `confirm_question_id` write, no new column, no new question kind.
+> 1112(2) is delivery and surfacing only (re-delivery under a new distinct withdrawal reason,
+> plus surfacing the objected assumption in the `needs_review` USER review payload) and is
+> written as its own spec section, not as an amendment here. Knowledge entry kn-4a91e483.
+
 A provisional approval is an opinion about an intention. At `needs_review` the intention
 has become a diff and a result summary, and only then may it settle.
 
