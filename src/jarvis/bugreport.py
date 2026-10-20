@@ -397,6 +397,10 @@ def _notify(project: str, title: str, url: str, version: str, wo_id: str,
         central.close()
 
 
+AGENT_EXPEDITE_NOTE = ("--expedite ignored: filed from a work-order session, so the issue "
+                       "is filed only — the user decides whether to start it")
+
+
 def report_bug(*, title: str, description: str, expected: str, actual: str,
                priority: str = "", steps: str = "", project: str = "",
                wo_id: str = "", expedite: bool = False) -> dict[str, Any]:
@@ -433,6 +437,10 @@ def report_bug(*, title: str, description: str, expected: str, actual: str,
     except ValueError as e:
         raise BugReportError(str(e)) from e
     project = project or os.environ.get("JARVIS_PROJECT", "")
+    note = ""
+    if expedite and os.environ.get("JARVIS_WO_ID"):
+        expedite = False  # an agent files only; expediting is the user's call
+        note = AGENT_EXPEDITE_NOTE
     wo_id = wo_id or os.environ.get("JARVIS_WO_ID", "")
     version = jarvis_version()
     repo = bug_repo()
@@ -444,5 +452,8 @@ def report_bug(*, title: str, description: str, expected: str, actual: str,
     # tracker actually shows rather than what it was about to show (issue #240).
     pickup = _route(url, title, body, priority, expedite=expedite)
     _notify(project, title, url, version, wo_id, pickup)
-    return {"url": url, "title": title, "repo": repo, "version": version,
-            "project": project, "wo_id": wo_id, "pickup": pickup}
+    out = {"url": url, "title": title, "repo": repo, "version": version,
+           "project": project, "wo_id": wo_id, "pickup": pickup}
+    if note:
+        out["note"] = note
+    return out

@@ -3155,3 +3155,22 @@ class Recorder:
 
     def __bool__(self) -> bool:
         return True
+
+
+@pytest.fixture()
+def self_dispatch_on(monkeypatch):
+    """Opt every parsed catalog back in to `os.autonomy.self_dispatch` and the stuck sweep."""
+    from . import catalog as catalog_mod
+
+    autonomy, fleet_health = catalog_mod._parse_autonomy, catalog_mod._parse_fleet_health
+
+    def _autonomy(raw):
+        return autonomy({"self_dispatch": True, **raw} if isinstance(raw, dict) else raw)
+
+    def _fleet_health(raw, base=None, where="os.fleet_health"):
+        if where == "os.fleet_health" and isinstance(raw, dict):
+            raw = {"enabled": True, **raw}
+        return fleet_health(raw, base, where)
+
+    monkeypatch.setattr(catalog_mod, "_parse_autonomy", _autonomy)
+    monkeypatch.setattr(catalog_mod, "_parse_fleet_health", _fleet_health)

@@ -1467,3 +1467,6 @@ def test_a_live_investigator_with_no_verdict_still_parks(started, store):
     assert row["needs_attention"]
     assert len(store.events_of_kind(investigator, "budget_exhausted")) == 1
 
+
+# Written for the opt-in OS (os.autonomy.self_dispatch on, stuck sweep on).
+pytestmark = pytest.mark.usefixtures("self_dispatch_on")
