@@ -700,6 +700,17 @@ def test_a_dropped_ruling_is_not_narrated_as_neo_declining():
     assert plain["label"] != dropped["label"]
 
 
+def test_a_dropped_ruling_the_os_will_re_ask_does_not_say_left_with_you():
+    """io-51469add: a transient drop is not the user's decision"""
+    (entry,) = build_timeline({}, [
+        ev("autoreview_escalated", 1.0, assumption_id=1, n=1, dropped="status",
+           re_asked=True, reason="the work order is running, not waiting on a review"),
+    ], [])
+
+    assert "left with you" not in entry["label"]
+    assert "will ask Neo again" in entry["label"]
+
+
 def test_an_auto_review_event_with_no_reason_still_says_something():
     """Every one of these rows exists to carry a WHY"""
     entries = build_timeline({}, [

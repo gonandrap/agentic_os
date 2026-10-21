@@ -283,6 +283,9 @@ DEFAULT_VALIDATION_FOLLOW_UP_CAP = 5
 # How long the reconciler may wait for a merged child's commit to appear on the default branch before... (docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md)
 DEFAULT_VALIDATION_FEATURE_MERGE_WAIT_MINUTES = 15
 
+# Withdrawn share of early objections that reaches the inbox, 1 = off (io-ce566253)
+DEFAULT_VALIDATION_OBJECTION_WITHDRAWAL_ALARM_RATE = 0.5
+
 #: Which net answers "is this assumption high-stakes?" before any model call... (docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md)
 STAKES_CLASSIFIER_MODES = ("regex", "shadow", "classifier", "regex-tightened")
 
@@ -319,6 +322,8 @@ class ValidationConfig:
     max_follow_ups: int = DEFAULT_VALIDATION_FOLLOW_UP_CAP
     # WHICH NET DECIDES THAT AN ASSUMPTION IS HIGH-STAKES before any model call... (docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md)
     stakes_classifier: str = "regex"
+    # WHEN FAILING EARLY OBJECTIONS REACH THE INBOX: withdrawn over sent (io-ce566253)
+    objection_withdrawal_alarm_rate: float = DEFAULT_VALIDATION_OBJECTION_WITHDRAWAL_ALARM_RATE
 
 
 # -- the house style: how terse the OS holds its workers
@@ -1265,6 +1270,11 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
     if feature_merge_wait_minutes < 0:
         # 0 is legal and means "never defer": check once, flag immediately
         raise _err(f"{where}.feature_merge_wait_minutes must be >= 0")
+    withdrawal_rate = float(raw.get("objection_withdrawal_alarm_rate",
+                                    base.objection_withdrawal_alarm_rate))
+    if not 0.0 <= withdrawal_rate <= 1.0:
+        # A share: 1 means never raise it, 0 means raise it on any withdrawal at all
+        raise _err(f"{where}.objection_withdrawal_alarm_rate must be between 0 and 1")
     max_follow_ups = int(raw.get("max_follow_ups", base.max_follow_ups))
     if max_follow_ups < 0:
         # 0 is legal and is NOT the same setting as `follow_ups: false`: it files nothing while leaving every...
@@ -1292,6 +1302,7 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         auto_review=bool(raw.get("auto_review", base.auto_review)),
         # Same fallback again — see `ValidationConfig.stakes_classifier`
         stakes_classifier=stakes_classifier,
+        objection_withdrawal_alarm_rate=withdrawal_rate,
     )
 
 

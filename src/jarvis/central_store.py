@@ -657,6 +657,12 @@ class CentralStore:
         return {"inbox": inbox, "agent_calls": calls, "knowledge_reads": reads,
                 "backlog_reopened": backlog}
 
+    def inbox_titled_since(self, project: str, title: str, since: float) -> bool:
+        """Has this exact item been raised for this project since `since`, acked or not?"""
+        return self.conn.execute(
+            "SELECT 1 FROM inbox WHERE project=? AND title=? AND ts >= ? LIMIT 1",
+            (project, title, since)).fetchone() is not None
+
     def unacked_inbox(self, level: str | None = None) -> list[dict[str, Any]]:
         if level:
             rows = self.conn.execute(

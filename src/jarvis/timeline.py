@@ -363,6 +363,11 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         # `dropped` means the OS had a ruling and threw it away because the state moved under it (spec §5.1)
         why = " — the OS dropped its ruling when the work order changed" if p.get(
             "dropped") else ""
+        if p.get("re_asked"):
+            # A TRANSIENT drop is not the user's: the next pass puts it to Neo again (io-51469add)
+            return (f"Assumption #{p.get('n')}: the OS dropped its ruling when the work "
+                    f"order changed, and will ask Neo again",
+                    p.get("reason") or "no reason recorded")
         return (f"Assumption #{p.get('n')} left with you{why}",
                 p.get("reason") or "no reason recorded")
     if kind == "autoreview_held":

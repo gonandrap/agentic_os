@@ -3248,7 +3248,12 @@ def assumptions_with_rulings(store: ProjectStore, wo_id: str) -> list[dict[str, 
         if unreachable:
             ruling["unreachable"] = unreachable
     base = store.all_assumptions(wo_id)
+    # The net the user called wrong, read by the stakes corpus builder (io-51469add)
+    alarms = {int(p.get("assumption_id") or 0): str(p.get("marker") or p.get("net") or "")
+              for p in (db.from_json(e["payload"], {}) for e in
+                        store.events_of_kind(wo_id, STAKES_FALSE_ALARM_EVENT))}
     rows = [{**a, "os_ruling": newest.get(int(a.get("id") or 0)),
+             "stakes_false_alarm": alarms.get(int(a.get("id") or 0), ""),
              # Both derivations read the carrier and the timeline
              "objection_undeliverable": (bool(a.get("objection_envelope_id"))
                                          and invariants.objection_undeliverable(store, a)),
@@ -3343,6 +3348,9 @@ def assumption_ruling_line(a: dict[str, Any]) -> str:
     ruling = a.get("os_ruling") or {}
     kind, reason = str(ruling.get("kind") or ""), str(ruling.get("reason") or "").strip()
     question = ruling.get("neo_question_id")
+    if kind == "autoreview_escalated" and ruling.get("re_asked"):
+        return (f"The OS dropped Neo's ruling (question {question}) and will ask again"
+                f"{' — ' + reason if reason else ''}")
     if kind == "autoreview_escalated":
         asked = f" (question {question})" if question else ""
         return f"Neo escalated{asked}{': ' + reason if reason else ''}"
@@ -3445,6 +3453,9 @@ def _autoreview_line(state: dict[str, Any]) -> str:
     if kind == "autoreview_accepted":
         return (f"assumption #{n} accepted by the OS (Neo, "
                 f"{state.get('model') or 'model not recorded'}) — "
+                f"{state.get('reason') or 'no reason recorded'}")
+    if kind == "autoreview_escalated" and state.get("re_asked") and not since:
+        return (f"assumption #{n} goes back to Neo — the OS dropped its ruling: "
                 f"{state.get('reason') or 'no reason recorded'}")
     if kind == "autoreview_escalated":
         return (f"assumption #{n} left with you — "
@@ -5796,14 +5807,77 @@ def record_provisional_verdict(store: ProjectStore, wo: dict[str, Any],
         "neo_question_id": question_id, "decided_by": ASSUMPTION_DECIDER_OS})
 
 
-def review_work_order(wo_id: str, accept: bool = True,
-                      feedback: str = "") -> dict[str, Any]:
+#: The event a user's 'false alarm' writes: a defect in the high-stakes net, never an authorisation
+STAKES_FALSE_ALARM_EVENT = "autoreview_stakes_false_alarm"
+
+#: The user's own words for a net that fired on nothing (wo-764454c5, wo-8fd40f1a)
+FALSE_ALARM_RE = re.compile(r"\bfalse[ -]alarm", re.IGNORECASE)
+
+
+def _record_stakes_false_alarms(store: ProjectStore, wo_id: str,
+                                pending: list[dict[str, Any]], *, feedback: str,
+                                net: str) -> frozenset[int]:
+    """A user's 'false alarm' on a row the high-stakes net held is a CLASSIFIER DEFECT"""
+    from . import autoreview
+
+    held: dict[int, dict[str, Any]] = {}
+    for event in store.events_of_kind(wo_id, "autoreview_held"):
+        payload = db.from_json(event["payload"], {})
+        if payload.get("code") == autoreview.HELD_HIGH_STAKES:
+            held[int(payload.get("assumption_id") or 0)] = payload
+    recorded = set()
+    for a in pending:
+        hold = held.get(int(a["id"]))
+        if hold is None:
+            continue
+        content = str(a.get("content") or "")
+        store.add_event(wo_id, STAKES_FALSE_ALARM_EVENT, {
+            "assumption_id": a["id"], "n": a.get("n"), "net": net,
+            "marker": autoreview.high_stakes_marker(
+                content, tightened=net == "regex-tightened"),
+            "hold_reason": str(hold.get("reason") or ""), "feedback": feedback})
+        recorded.add(int(a["id"]))
+    return frozenset(recorded)
+
+
+def _teach_assumption_rules(project: str, wo: dict[str, Any], rows: list[dict[str, Any]],
+                            accepted: bool, feedback: str, *,
+                            false_alarms: frozenset[int] = frozenset(),
+                            tightened: bool = False) -> list[int]:
+    """Write the user's ruling as rule-shaped learnings — a no-reason one only once per class"""
+    from . import neo as neo_mod
+    from .neo_store import NeoStore
+
+    if not rows:
+        return []
+    rules = neo_mod.learnings_from_assumption_review(
+        wo, rows, accepted, feedback, false_alarms=false_alarms, tightened=tightened)
+    neo = NeoStore()
+    try:
+        ids = []
+        for rule in rules:
+            # A reasonless rule is the same sentence every time: writing it twice would crowd real rules out
+            if not (feedback or "").strip() and neo.has_active_learning(rule, project):
+                continue
+            ids.append(int(neo.add_learning(rule, project=project, source="review")["id"]))
+        return ids
+    finally:
+        neo.close()
+
+
+def review_work_order(wo_id: str, accept: bool = True, feedback: str = "",
+                      false_alarm: bool = False) -> dict[str, Any]:
     """Accept (or reject) all pending assumptions and settle the work order"""
     name, path, wo = find_work_order(wo_id)
     cfg = validation_config(name)
+    net = str(getattr(cfg, "stakes_classifier", "regex") or "regex")
     store = ProjectStore(path)
     try:
-        pending = store.pending_assumptions(wo_id)
+        pending = [a for a in store.all_assumptions(wo_id) if a["status"] == "pending"]
+        alarms: frozenset[int] = frozenset()
+        if false_alarm or FALSE_ALARM_RE.search(feedback or ""):
+            alarms = _record_stakes_false_alarms(store, wo_id, pending,
+                                                 feedback=feedback, net=net)
         for a in pending:
             # STAMPED `user` RATHER THAN LEFT EMPTY
             store.review_assumption(a["id"], "accepted" if accept else "rejected",
@@ -5822,20 +5896,15 @@ def review_work_order(wo_id: str, accept: bool = True,
 
     out = {"project": name, "wo_id": wo_id, "reviewed": len(pending), "accepted": accept,
            "status": status}
+    if alarms:
+        out["false_alarms"] = len(alarms)
+    learned = _teach_assumption_rules(name, wo, pending, accept, feedback,
+                                      false_alarms=alarms,
+                                      tightened=net == "regex-tightened")
+    if learned:
+        out["learning_id"], out["learning_ids"] = learned[0], learned
     if not feedback:
         return out
-
-    from . import neo as neo_mod
-    from .neo_store import NeoStore
-    neo = NeoStore()
-    try:
-        learning = neo.add_learning(
-            neo_mod.learning_from_assumption_review(wo, pending, accept, feedback),
-            project=name, source="review",
-        )
-    finally:
-        neo.close()
-    out["learning_id"] = learning["id"]
 
     # A rejection without guidance reaching the worker just strands it
     if not accept and wo["status"] in OPEN_STATUSES:
@@ -11707,6 +11776,83 @@ NEO_ESCALATION_INVISIBLE_NOTE = (
 )
 
 
+#: What the question counts are, said beside them now that they are not the headline (io-51469add)
+NEO_QUESTIONS_PLUMBING_NOTE = (
+    "PLUMBING, not the rate you feel: one assumption row makes 0, 1 or 2 questions "
+    "(none when a net holds it before any model call, two when an early reading is "
+    "confirmed), and a superseded question is the OS closing one, not Neo deciding — "
+    "the ASSUMPTIONS block above is per row"
+)
+
+#: The three buckets every assumption row lands in, the kn-18a6444b recipe's names
+ASSUMPTION_BUCKETS = ("neo_decided", "neo_escalated", "never_reached_neo")
+
+
+def _share(n: int, of: int) -> float | None:
+    return round(n / of, 4) if of else None
+
+
+def assumption_row_outcomes(facts: Sequence[dict[str, Any]],
+                            now: float | None = None) -> dict[str, Any]:
+    """Neo's assumption rate PER ROW, three buckets, unsettled apart (kn-18a6444b)"""
+    now = db.now() if now is None else now
+    out: dict[str, Any] = {key: 0 for key in ASSUMPTION_BUCKETS}
+    never_by_hold: dict[str, int] = {}
+    unsettled = {"count": 0, "reached_neo": 0, "never_reached_neo": 0}
+    ages: list[float] = []
+    rows = high = alarms = 0
+    dropped = {"total": 0, "re_asked": 0}
+    for f in facts:
+        for key in dropped:
+            dropped[key] += int(f["dropped"][key])
+        high += len(f["high_stakes"])
+        alarms += len(f["false_alarms"] & f["high_stakes"])
+        for a in f["rows"]:
+            rows += 1
+            aid = int(a["id"])
+            # Reached = a question was ever filed: the column, or the ask event a cleared link leaves behind
+            reached = bool(a.get("neo_question_id") or a.get("confirm_question_id")
+                           or aid in f["asked"])
+            if str(a.get("status") or "") == "pending":
+                unsettled["count"] += 1
+                unsettled["reached_neo" if reached else "never_reached_neo"] += 1
+                ages.append(max(0.0, now - float(a.get("ts") or now)) / 86400)
+                continue
+            # The DECIDER column alone, never prose: kn-18a6444b's trap 1
+            if str(a.get("decided_by") or "") == "neo":
+                out["neo_decided"] += 1
+            elif reached:
+                out["neo_escalated"] += 1
+            else:
+                out["never_reached_neo"] += 1
+                code = f["last_hold"].get(aid) or "no hold recorded"
+                never_by_hold[code] = never_by_hold.get(code, 0) + 1
+    settled = sum(out[key] for key in ASSUMPTION_BUCKETS)
+    ages.sort()
+    unsettled["median_age_days"] = (round(ages[len(ages) // 2], 1) if ages else None)
+    unsettled["max_age_days"] = round(ages[-1], 1) if ages else None
+    return {
+        "rows": rows, "settled": settled, **out,
+        "rates": {key: _share(out[key], settled) for key in ASSUMPTION_BUCKETS},
+        "never_reached_by_hold": never_by_hold,
+        "unsettled": unsettled,
+        "dropped_rulings": dropped,
+        # The net's own defect rate, the `jarvis gate rules` false-positive idiom
+        "stakes_net": {"held": high, "false_alarms": alarms,
+                       "false_alarm_rate": _share(alarms, high)},
+    }
+
+
+def objection_outcomes(store: ProjectStore, since: float | None = None) -> dict[str, Any]:
+    """Sent, delivered, ACTED ON, withdrawn — `objection_counts` plus `objection_response` (io-ce566253)"""
+    counted = store.objection_counts(since=since)
+    acted = 0
+    for a in store.delivered_objections(since=since):
+        if objection_response(store, a) is not None:
+            acted += 1
+    return {**counted, "acted_on": acted}
+
+
 def _escalation_rate(answered: int, escalated: int, failed: int) -> float | None:
     """`escalated` ALONE over SETTLED questions, `None` — never `0.0` — with no denominator"""
     settled = answered + escalated + failed
@@ -11882,8 +12028,9 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
     work_orders = feature_orders = 0
     wo_questions = fo_questions = 0
     # WHAT THE OBJECTIONS DID, beside the escalation rate (docs/superpowers/specs/2026-10-20-an-objection-is-withdrawn-before-the-order-stops.md)
-    objections: dict[str, Any] = {"sent": 0, "delivered": 0, "withdrawn": 0,
-                                  "by_reason": {}}
+    objections: dict[str, Any] = {"sent": 0, "delivered": 0, "acted_on": 0,
+                                  "withdrawn": 0, "by_reason": {}}
+    row_facts: list[dict[str, Any]] = []
     for name, path in sorted(scope.items()):
         store = ProjectStore(path)
         try:
@@ -11893,10 +12040,11 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
             features = [fo for fo in store.list_feature_orders(kind="feature",
                                                                limit=10_000)
                         if since is None or (fo["created_at"] or 0) >= since]
-            counted = store.objection_counts(since=since)
+            counted = objection_outcomes(store, since=since)
+            row_facts.append(store.assumption_review_facts(since=since))
         finally:
             store.close()
-        for key in ("sent", "delivered", "withdrawn"):
+        for key in ("sent", "delivered", "acted_on", "withdrawn"):
             objections[key] += int(counted[key])
         for reason, n in counted["by_reason"].items():
             objections["by_reason"][reason] = (
@@ -11918,6 +12066,7 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
     objections["handed_back"] = int(
         objections["by_reason"].get(OBJECTION_HANDED_BACK_REASON, 0))
     objections["other"] = int(objections["by_reason"].get("other", 0))
+    objections["withdrawal_rate"] = _share(objections["withdrawn"], objections["sent"])
     per_order = {
         "work_orders": work_orders,
         "questions_per_wo": (round(wo_questions / work_orders, 2)
@@ -11929,7 +12078,9 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
 
     return {
         "scope": project or "fleet", "days": days, "since": since,
-        "questions": questions,
+        # THE HEADLINE: per assumption ROW, what the user's inbox actually shows (io-51469add)
+        "assumptions": assumption_row_outcomes(row_facts),
+        "questions": questions, "questions_note": NEO_QUESTIONS_PLUMBING_NOTE,
         "objections": objections,
         "by_kind": by_kind, "by_kind_note": NEO_ASSUMPTION_KIND_NOTE,
         "by_project": by_project,
