@@ -1,18 +1,4 @@
-"""A turn is one-shot, and the record says so when a worker forgets.
-
-wo-2df8828c backgrounded a 15-minute paid eval, ended its turn on "I'll be re-invoked
-when it finishes", and landed in `needs_review`. Nothing re-invoked it and nothing
-survived — a turn is one `claude -p` process. The user read the status as a mislabelled
-`running`, which is the second half of the bug: the flag said the turn had ended without
-saying what that cost.
-
-Two halves ship together here, and either alone leaves the fleet wrong:
-
-  * the CONTRACT that stops a worker believing in a wake-up (`worker_brief` for the
-    dispatched prompt, OPERATION.md for the worker that goes looking), and
-  * the ATTENTION LINE that tells the user what actually happened when one does —
-    one constant, so the flag and its re-derivation cannot tell two stories.
-"""
+"""A turn is one-shot, and the record says so when a worker forgets"""
 
 from __future__ import annotations
 
@@ -46,14 +32,11 @@ def _worker_prompt(path) -> str:
     return build_worker_prompt(wo, spec(path))
 
 
-# -- 1. the contract ------------------------------------------------------------------
+# -- 1. the contract
 
 
 def test_the_rule_is_in_the_core_not_behind_a_fetch(project):
-    """The core's admission test (worker_brief.CORE_BUDGET_CHARS) asks whether a worker
-    lacking the bullet does damage before it would think to fetch the section. This one
-    does: by the time the turn has ended the work and the money are already gone, and
-    there is no next turn in which to look anything up."""
+    """The core's admission test (worker_brief.CORE_BUDGET_CHARS) asks whether a worker lacking the bullet..."""
     from jarvis import worker_brief
 
     prompt = _worker_prompt(project)
@@ -65,9 +48,7 @@ def test_the_rule_is_in_the_core_not_behind_a_fetch(project):
 
 
 def test_both_worker_texts_teach_that_nothing_wakes_a_worker(project):
-    """OPERATION.md is what a worker reads if it goes LOOKING; the dispatched prompt is
-    what it reads without looking. A worker that has only one of them still ends turns,
-    so both carry the rule — the same pairing the `--evidence` flag needed."""
+    """OPERATION.md is what a worker reads if it goes LOOKING"""
     for where, text in (("OPERATION.md", _operation_md(project)),
                         ("the worker prompt", _worker_prompt(project))):
         assert "one-shot" in text or "single `claude -p`" in text, (
@@ -76,9 +57,7 @@ def test_both_worker_texts_teach_that_nothing_wakes_a_worker(project):
 
 
 def test_the_record_section_says_what_to_do_instead(project):
-    """A prohibition with no alternative is advice a worker cannot follow. The full
-    section has to name both the mechanism and the three things that DO start a turn,
-    or 'never background it' reads as 'never do long work'."""
+    """A prohibition with no alternative is advice a worker cannot follow"""
     from jarvis import worker_brief
 
     section = worker_brief.render_section("record", wo_id="wo-abc123", project="p1")
@@ -92,9 +71,7 @@ def test_the_record_section_says_what_to_do_instead(project):
 
 
 def test_the_template_version_was_bumped(project):
-    """Prose is the entire mechanism, and prose only reaches an already-bootstrapped
-    repo through the bump. Pinned to the value this work order shipped so a later edit
-    that forgets it fails here rather than in a fleet that never sees the paragraph."""
+    """Prose is the entire mechanism, and prose only reaches an already-bootstrapped repo through the bump"""
     assert TEMPLATE_VERSION >= 10
     assert f"template v{TEMPLATE_VERSION}" in _operation_md(project)
 
@@ -111,16 +88,11 @@ def test_an_already_bootstrapped_project_is_regenerated_by_the_bump(project):
     assert "one-shot" in op.read_text()
 
 
-# -- 2. the attention line ------------------------------------------------------------
+# -- 2. the attention line
 
 
 def test_the_flag_says_what_happened_not_that_a_turn_ended(project):
-    """The two facts the user cannot see for themselves, and guesses wrong without.
-
-    'worker idle without `jarvis wo finish`' said only the second one, and wo-2df8828c
-    read as a status bug — the work order LOOKED like it was still running an eval,
-    because its last message said so.
-    """
+    """The two facts the user cannot see for themselves, and guesses wrong without"""
     assert "mid-task" in IDLE_NO_FINISH_BLOCKER
     assert "nothing it started is still running" in IDLE_NO_FINISH_BLOCKER
     assert "jarvis wo finish" in IDLE_NO_FINISH_BLOCKER
@@ -128,9 +100,7 @@ def test_the_flag_says_what_happened_not_that_a_turn_ended(project):
 
 @pytest.mark.parametrize("status", ["waiting_input", "validating"])
 def test_a_worker_that_was_told_to_wait_is_not_accused_of_stopping(project, status):
-    """The branches above the default in `settle_work_order`: a work order parked on
-    Neo, on a gate or on the round machine is idle BY INSTRUCTION. Accusing it of
-    stopping mid-task is the false positive GitHub issue 100 was."""
+    """The branches above the default in `settle_work_order`: a work order parked on Neo"""
     store = ProjectStore(project)
     wo = store.create_work_order("task")
     store.set_status(wo["id"], status)
@@ -139,7 +109,7 @@ def test_a_worker_that_was_told_to_wait_is_not_accused_of_stopping(project, stat
         wo["id"]))
 
 
-# -- 3. the paid A/B stays honest -----------------------------------------------------
+# -- 3. the paid A/B stays honest
 
 EVAL_PATH = Path(__file__).resolve().parents[1] / "evals" / "llm" / "test_one_shot_turn_ab.py"
 
@@ -151,9 +121,7 @@ def test_the_ab_eval_exists_and_is_opt_in():
 
 
 def test_the_ab_markers_still_match_the_shipped_prose(project):
-    """The A/B's arms differ by a substring cut. Reword the rule without updating the
-    marker and `_strip_rule` silently removes NOTHING — arm WITHOUT becomes arm WITH,
-    the eval passes at 100%, and it has measured an A/A."""
+    """The A/B's arms differ by a substring cut"""
     import importlib.util
 
     spec_ = importlib.util.spec_from_file_location("_one_shot_ab", EVAL_PATH)
@@ -174,8 +142,7 @@ def test_the_ab_markers_still_match_the_shipped_prose(project):
 
 
 def test_the_ab_cut_removes_the_rule_and_nothing_else(project):
-    """The arms must be byte-identical everywhere but the rule, or the A/B measures
-    whatever else drifted."""
+    """The arms must be byte-identical everywhere but the rule, or the A/B measures whatever else drifted"""
     import importlib.util
 
     spec_ = importlib.util.spec_from_file_location("_one_shot_ab", EVAL_PATH)
@@ -192,8 +159,7 @@ def test_the_ab_cut_removes_the_rule_and_nothing_else(project):
 
 
 def test_the_ab_asserts_no_cost_or_latency_number():
-    """Same ban the other paid evals carry: a test that failed on tokens or seconds
-    would spend real money to be flaky."""
+    """Same ban the other paid evals carry: a test that failed on tokens or seconds would spend real money..."""
     import ast
 
     tree = ast.parse(EVAL_PATH.read_text())

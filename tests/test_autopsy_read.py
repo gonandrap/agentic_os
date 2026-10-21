@@ -1,15 +1,4 @@
-"""The read side of the seal: one chokepoint, and every surface saying which it read.
-
-§4 of docs/superpowers/specs/2026-09-27-order-autopsy-durability.md. `autopsy.anatomy_for` is the one
-place that chooses between a sealed reading and a fresh one, and standing rule (a) — a
-persisted figure and a freshly derived one must never disagree on the same order — is a
-claim about a SURFACE, so it is proven here and nowhere else: one order, `ops.inspect_report`
-run before and after the seal with the transcript untouched, equal once provenance is popped.
-
-Rule (b) is the other half: an order whose autopsy was never persisted renders as *not
-recorded*, never as zero, and the three states *not recorded*, *no transcript* and
-*genuinely zero* stay distinguishable at all four surfaces.
-"""
+"""The read side of the seal: one chokepoint, and every surface saying which it read (docs/superpowers/specs/2026-09-27-order-autopsy-durability.md)"""
 
 from __future__ import annotations
 
@@ -34,7 +23,7 @@ SESSION = "sess-read-side"
 
 
 def an_order(session: str = SESSION, *, title: str = "an order that finished") -> dict:
-    """One settled work order with `session` on it, and the row itself."""
+    """One settled work order with `session` on it, and the row itself"""
     wo = ops.create_work_order("proj_a", title)
     _name, path, _row = ops.find_work_order(wo["id"])
     store = ProjectStore(path)
@@ -46,12 +35,7 @@ def an_order(session: str = SESSION, *, title: str = "an order that finished") -
 
 
 def rows() -> list[dict]:
-    """Three cache writes either side of the default 20,000 write floor, and one join.
-
-    NO tool parameters: a `normal` seal carries none by design and §6 is what makes them
-    reachable, so an order that ran one would differ on `params` alone and say nothing
-    about rule (a). That difference is what `provenance["params"]` exists to declare.
-    """
+    """Three cache writes either side of the default 20,000 write floor, and one join"""
     return [
         prompt_row(0, "You are the worker agent for wo-1"),
         assistant_row(10, "m1", write=50_000),
@@ -61,18 +45,15 @@ def rows() -> list[dict]:
     ]
 
 
-#: Two turn windows bracketing the timestamps `rows()` writes: turn 1 holds the
-#: cold-start write at t=10, turn 2 the `prefix-miss` write at t=100.
+#: Two turn windows bracketing the timestamps `rows()` writes: turn 1 holds the cold-start write at...
 WINDOWS = ((0.0, 50.0), (95.0, 115.0))
 
-#: What `context.measured_tokens` sums out of each seeded payload, so the residual can be
-#: asserted as a number rather than re-derived by the test.
+#: What `context.measured_tokens` sums out of each seeded payload
 MEASURED_TOKENS = (20_300 // 4, 25_600 // 4)
 
 
 def ingredients(prompt_bytes: int, dirs_bytes: int) -> list[dict]:
-    """One turn's measured ingredients, through `context._row`: the payload shape belongs
-    to that module and a hand-built copy here would drift out of what the report reads."""
+    """One turn's measured ingredients"""
     from jarvis import context as context_mod
 
     return [context_mod._row("worker_prompt", prompt_bytes),
@@ -81,9 +62,7 @@ def ingredients(prompt_bytes: int, dirs_bytes: int) -> list[dict]:
 
 
 def seed_turns(wo_id: str) -> None:
-    """Two measured turn windows for the order, the way `scripts/screenshot_debug_page.py`
-    seeds them: `context_report` joins the anatomy's cache writes to turns BY these
-    timestamps, so without them every per-turn figure is None and rule (a) is vacuous."""
+    """Two measured turn windows for the order"""
     from jarvis import context as context_mod
 
     _name, path, _row = ops.find_work_order(wo_id)
@@ -94,7 +73,7 @@ def seed_turns(wo_id: str) -> None:
             turn = store.create_turn(wo_id, kind="dispatch" if seq == 1 else "message",
                                      prompt="p")
             store.finish_turn(turn["id"], "done", result="ok", cost_usd=0.1, num_turns=2)
-            # Rewritten directly because `create_turn` stamps `now` (§4).
+            # Rewritten directly because `create_turn` stamps `now` (§4)
             store.conn.execute(
                 "UPDATE wo_turns SET started_at=?, ended_at=?, context_json=? WHERE id=?",
                 (window[0], window[1],
@@ -119,13 +98,12 @@ def drop_transcript(tmp_path, session: str = SESSION) -> None:
     (tmp_path / "projects" / "-proj" / f"{session}.jsonl").unlink()
 
 
-# -- rule (a) at a surface -------------------------------------------------------------
+# -- rule (a) at a surface
 
 
 def test_the_anatomy_report_says_exactly_the_same_thing_once_the_order_is_sealed(
         started, write_transcript):
-    """Standing rule (a), and only this child can prove it: the same order, the same
-    transcript, read fresh and then read from its seal, must not disagree by one key."""
+    """Standing rule (a), and only this child can prove it: the same order"""
     write_transcript(SESSION, rows())
     wo = an_order()
 
@@ -139,13 +117,7 @@ def test_the_anatomy_report_says_exactly_the_same_thing_once_the_order_is_sealed
 
 
 def figures(report: dict) -> list[dict]:
-    """The per-turn numbers `context_report` takes off the ANATOMY, and nothing else.
-
-    `residual` is the observed cold-start prefix minus what Jarvis measured and
-    `prefix_break` is the `prefix-miss` writes joined to the turn's window, so both are
-    unreadable unless a real anatomy answered. Numbers and counts only: rendered prose
-    would compare two sentences rather than two readings.
-    """
+    """The per-turn numbers `context_report` takes off the ANATOMY, and nothing else"""
     return [{"seq": t["seq"],
              "residual_tokens": (t["residual"] or {}).get("tokens"),
              "observed_prefix": ((t["residual"] or {}).get("detail")
@@ -157,9 +129,7 @@ def figures(report: dict) -> list[dict]:
 
 def test_the_context_ledger_says_exactly_the_same_thing_once_the_order_is_sealed(
         started, write_transcript):
-    """Rule (a) at the second surface, and it only bites over MEASURED turns: the
-    windows bracket `rows()`, so turn 1 carries the cold-start residual and turn 2 the
-    prefix break that the anatomy's own writes produce."""
+    """Rule (a) at the second surface"""
     write_transcript(SESSION, rows())
     wo = an_order()
     seed_turns(wo["id"])
@@ -181,9 +151,7 @@ def test_the_context_ledger_says_exactly_the_same_thing_once_the_order_is_sealed
 
 def test_the_context_ledger_per_turn_figures_come_from_the_seal_with_no_transcript(
         started, write_transcript, tmp_path):
-    """The proof that `context_report` READS the seal rather than saying `sealed` over an
-    empty ledger: the transcript is deleted and every anatomy-derived per-turn figure is
-    still the one the derived run reported."""
+    """The proof that `context_report` READS the seal rather than saying `sealed` over an empty ledger:..."""
     write_transcript(SESSION, rows())
     wo = an_order()
     seed_turns(wo["id"])
@@ -201,8 +169,7 @@ def test_the_context_ledger_per_turn_figures_come_from_the_seal_with_no_transcri
 
 def test_a_sealed_order_is_read_from_its_seal_once_the_transcript_is_gone(
         started, write_transcript, tmp_path):
-    """The whole point of the seal at a surface: the transcript is pruned and the report
-    still states the clock it ran, rather than reporting `found: false`."""
+    """The whole point of the seal at a surface: the transcript is pruned and the report still states the..."""
     write_transcript(SESSION, rows())
     wo = an_order()
     seal_it(wo["id"])
@@ -216,8 +183,7 @@ def test_a_sealed_order_is_read_from_its_seal_once_the_transcript_is_gone(
 
 def test_a_live_read_is_forced_past_the_seal_the_way_a_bill_forces_one(
         started, write_transcript):
-    """`live=True` is `bill.build(..., live=True)`'s parameter and its justification: the
-    thing a test comparing a seal against a fresh reading needs."""
+    """`live=True` is `bill.build(..."""
     write_transcript(SESSION, rows())
     wo = an_order()
     seal_it(wo["id"])
@@ -231,12 +197,11 @@ def test_a_live_read_is_forced_past_the_seal_the_way_a_bill_forces_one(
     assert fresh.as_dict() == sealed.as_dict()
 
 
-# -- rule (b) at all four surfaces -----------------------------------------------------
+# -- rule (b) at all four surfaces
 
 
 def test_the_anatomy_of_an_order_with_no_session_is_not_recorded_and_never_zero(started):
-    """The no-session path `ops.inspect_report` has always had must survive the
-    chokepoint: no session, no seal and no transcript are three gaps, not three zeros."""
+    """The no-session path `ops.inspect_report` has always had must survive the chokepoint: no session"""
     wo = an_order(session="")
 
     (unit,) = ops.inspect_report(wo["id"])["units"]
@@ -273,13 +238,12 @@ def test_the_evidence_packet_of_an_order_with_no_session_is_not_recorded(started
     assert not any("0s wall" in line for line in lines)
 
 
-# -- the floors, and the sentence a short list must never tell -------------------------
+# -- the floors, and the sentence a short list must never tell
 
 
 def test_a_write_floor_above_the_sealed_one_is_answered_by_the_seal_and_filtered(
         started, write_transcript, tmp_path):
-    """Asked for MORE than the seal was taken at, the seal can answer: it holds every
-    write the question wants, and the ones below the requested floor come out."""
+    """Asked for MORE than the seal was taken at"""
     write_transcript(SESSION, rows())
     wo = an_order()
     seal_it(wo["id"])
@@ -295,8 +259,7 @@ def test_a_write_floor_above_the_sealed_one_is_answered_by_the_seal_and_filtered
 
 def test_a_write_floor_below_the_sealed_one_derives_while_the_transcript_is_there(
         started, write_transcript):
-    """A seal taken at 20,000 holds no write below it, ever — so the transcript answers
-    while it exists, and the reading is the full one."""
+    """A seal taken at 20,000 holds no write below it, ever"""
     write_transcript(SESSION, rows())
     wo = an_order()
     seal_it(wo["id"])
@@ -310,9 +273,7 @@ def test_a_write_floor_below_the_sealed_one_derives_while_the_transcript_is_ther
 
 def test_a_write_floor_below_the_sealed_one_names_the_sealed_floor_once_it_must_answer(
         started, write_transcript, tmp_path):
-    """The sentence a short list must never be allowed to tell. The seal holds nothing
-    below 20,000 and the transcript is gone, so the report NAMES the sealed floor rather
-    than handing back two writes that read as "there were none under 20,000"."""
+    """The sentence a short list must never be allowed to tell"""
     write_transcript(SESSION, rows())
     wo = an_order()
     seal_it(wo["id"])
@@ -322,7 +283,7 @@ def test_a_write_floor_below_the_sealed_one_names_the_sealed_floor_once_it_must_
 
     assert unit["provenance"]["source"] == "sealed"
     assert "20,000" in unit["provenance"]["floor_note"]
-    # Reported at the floor it can actually speak for, never at the one asked for.
+    # Reported at the floor it can actually speak for, never at the one asked for
     assert unit["provenance"]["write_floor"] == 20_000
 
 
@@ -367,12 +328,11 @@ def test_a_join_floor_below_the_sealed_one_names_the_sealed_floor_once_it_must_a
     assert unit["provenance"]["join_floor"] == 30
 
 
-# -- the three-state level rendering ---------------------------------------------------
+# -- the three-state level rendering
 
 
 def test_the_three_autopsy_levels_render_three_different_sentences():
-    """`full` is unreachable until §6 and the rendering must already carry it, so the
-    three states are three strings and no surface can collapse two of them."""
+    """`full` is unreachable until §6 and the rendering must already carry it"""
     said = {autopsy.autopsy_level_note(level)
             for level in (autopsy.UNKNOWN, autopsy.NORMAL, autopsy.FULL)}
 
@@ -382,8 +342,7 @@ def test_the_three_autopsy_levels_render_three_different_sentences():
 
 def test_a_seal_taken_at_full_says_so_even_though_nothing_writes_one_yet(
         started, write_transcript):
-    """Hand-built, because `full` is §6's to make reachable: the read side must already
-    tell the three levels apart rather than hard-coding two."""
+    """Hand-built, because `full` is §6's to make reachable: the read side must already tell the three..."""
     write_transcript(SESSION, rows())
     wo = an_order()
     seal_it(wo["id"])
@@ -422,14 +381,12 @@ def test_a_seal_written_before_the_level_existed_reads_as_the_third_state(
     assert prov["level_note"] == autopsy.autopsy_level_note(autopsy.UNKNOWN)
 
 
-# -- the two readers that must NOT prefer a seal ---------------------------------------
+# -- the two readers that must NOT prefer a seal
 
 
 def test_the_live_no_transcript_frame_points_at_jarvis_inspect_and_reads_no_seal(
         started, write_transcript, tmp_path):
-    """§7: `live_report` is a byte-cursor reader of one file and the parent spec forbids
-    persistence there, so a sealed order's live frame still says there is nothing to read
-    — and now names the command that CAN answer."""
+    """§7: `live_report` is a byte-cursor reader of one file and the parent spec forbids persistence..."""
     write_transcript(SESSION, rows())
     wo = an_order()
     seal_it(wo["id"])
@@ -444,9 +401,7 @@ def test_the_live_no_transcript_frame_points_at_jarvis_inspect_and_reads_no_seal
 
 def test_live_alarms_still_prefers_no_seal(started, write_transcript, tmp_path,
                                            monkeypatch):
-    """It reads at a deliberately different floor (`alarm_write_tokens`) and its subject
-    is a RUNNING session, which has no seal. Asserted so that widening the AST pin cannot
-    quietly change it."""
+    """It reads at a deliberately different floor (`alarm_write_tokens`) and its subject is a RUNNING..."""
     write_transcript(SESSION, rows())
     wo = an_order()
     seal_it(wo["id"])
@@ -462,14 +417,12 @@ def test_live_alarms_still_prefers_no_seal(started, write_transcript, tmp_path,
     assert reads == [SESSION], "live_alarms derives, and never from a seal"
 
 
-# -- the terminal surfaces PRINT it ----------------------------------------------------
+# -- the terminal surfaces PRINT it
 
 
 def test_the_three_terminal_renderers_print_which_reading_answered(
         started, write_transcript, tmp_path, capsys):
-    """Carrying provenance and printing it are different things, and §4 asks for the
-    second. `jarvis inspect`, `jarvis wo context` and `jarvis wo why`, over one sealed
-    order whose transcript is gone."""
+    """Carrying provenance and printing it are different things, and §4 asks for the second"""
     from jarvis import cli
 
     write_transcript(SESSION, rows())
@@ -489,8 +442,7 @@ def test_the_three_terminal_renderers_print_which_reading_answered(
 
 def test_the_anatomy_says_which_reading_answered_even_when_nothing_was_found(
         started, capsys):
-    """ABOVE the `found` early return, in `largest_os_input`'s position: which reading
-    answered is exactly what a reader needs in the one case there is nothing else."""
+    """ABOVE the `found` early return"""
     from jarvis import cli
 
     wo = an_order(session="")
@@ -504,23 +456,14 @@ def test_the_anatomy_says_which_reading_answered_even_when_nothing_was_found(
     assert " 0" not in printed
 
 
-# -- the AST pin -----------------------------------------------------------------------
+# -- the AST pin
 
-#: The modules a read of a session anatomy is pinned in. `inspection.live_alarms` calls
-#: `inspection.read_session` directly and is EXEMPT: it reads at `alarm_write_tokens`
-#: rather than `report_write_floor`, so a seal taken at the report floor cannot answer
-#: it, and its subject is a running session, which has no seal. Whoever widens this scope
-#: to `inspection.py` must whitelist it.
+#: The modules a read of a session anatomy is pinned in
 PINNED = ("ops.py", "supervisor.py")
 
 
 def anatomy_reads(tree: ast.AST) -> list[int]:
-    """Every `inspection.read_session(...)` in one tree, by line.
-
-    Keyed on the MODULE QUALIFIER and not on the attribute alone: `usage.read_session` is
-    a DIFFERENT function of the same name on the bill path (`ops.py`, `bill.py`) and must
-    pass.
-    """
+    """Every `inspection.read_session(...)` in one tree, by line"""
     return [node.lineno for node in ast.walk(tree)
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
@@ -530,12 +473,7 @@ def anatomy_reads(tree: ast.AST) -> list[int]:
 
 
 def offenders(root: Path, pinned: tuple[str, ...]) -> list[str]:
-    """`module.py:line` for every anatomy read in a PINNED module under `root`.
-
-    The scoping, the pinning and the module-qualifier keying are the rule — the walk
-    alone is not — so the guard and its meta-test run this same function rather than two
-    copies of the loop.
-    """
+    """`module.py:line` for every anatomy read in a PINNED module under `root`"""
     found = []
     for path in sorted(root.glob("*.py")):
         if path.name not in pinned:
@@ -546,10 +484,7 @@ def offenders(root: Path, pinned: tuple[str, ...]) -> list[str]:
 
 
 def test_every_anatomy_read_in_ops_and_supervisor_goes_through_the_chokepoint():
-    """THE GUARD. Nothing at the call site distinguishes a read that prefers the seal
-    from one that cannot, so the rule is checked on the source: `ops` and `supervisor`
-    reach an anatomy through `autopsy.anatomy_for`, which is the one place that chooses.
-    """
+    """THE GUARD"""
     body, first = inspect_mod.getsourcelines(autopsy.anatomy_for)
     allowed = range(first, first + len(body))
     root = Path(inspection.__file__).parent
@@ -557,9 +492,7 @@ def test_every_anatomy_read_in_ops_and_supervisor_goes_through_the_chokepoint():
     assert offenders(root, PINNED) == [], (
         "read an anatomy through `autopsy.anatomy_for`, so the seal is preferred and the "
         "surface can say which reading answered")
-    # The whitelist is a line range in `autopsy.py`, the shape
-    # `test_only_db_write_transaction_opens_a_transaction` uses: the chokepoint's own
-    # derive must stay a derive.
+    # The whitelist is a line range in `autopsy.py`
     assert anatomy_reads(ast.parse(Path(autopsy.__file__).read_text())) and all(
         line in allowed or line in _seal_lines()
         for line in anatomy_reads(ast.parse(Path(autopsy.__file__).read_text())))
@@ -571,11 +504,7 @@ def _seal_lines() -> range:
 
 
 def test_the_anatomy_pin_would_catch_the_move_it_forbids(tmp_path):
-    """A guard nobody has ever seen fail is a guard nobody knows works — and it is the
-    SCOPED LOOP that has to be seen failing, not the walk under it. The same `offenders`
-    the guard runs, over a tree holding all three cases at once: the forbidden read in a
-    pinned module, the bill path's namesake in another pinned one, and the same forbidden
-    read in a module nobody pinned."""
+    """A guard nobody has ever seen fail is a guard nobody knows works"""
     (tmp_path / "ops.py").write_text("from . import inspection\n"
                                      "def unit(wo, cfg):\n"
                                      "    return inspection.read_session(wo['s'], cfg)\n")

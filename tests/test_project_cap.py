@@ -1,21 +1,4 @@
-"""`max_concurrent` counts turns that are executing, not records that are waiting.
-
-Issue #134. `count_active` used to count every status in `ACTIVE_STATUSES`, three of
-which park a work order on somebody else — `waiting_input` (a Neo question, a gate, a
-queued message), `validating` (the panel is judging) and `dispatching`. A project capped
-at 5 could therefore have one turn in flight and refuse to claim a sixth order.
-
-The narrowing is only half the change, and the other half is what this file mostly tests.
-The cap used to be enforced in exactly one place, `dispatch_pending`, and a resume is not
-a dispatch: once parking is free, six rounds rejected by one validation tick would all
-restart at once and blow straight past the cap through a door nobody was watching. So the
-two passes that un-park a work order — `deliver_messages` and `retry_paused_turns` — are
-under the cap too, and both hold the same way everything else in this OS holds: the work
-stays exactly where it was, nothing is written, and the next tick tries again.
-
-Paired throughout: a shape that must be held is asserted beside the shape that must NOT
-be, because a cap that held everything would pass half of these perfectly.
-"""
+"""`max_concurrent` counts turns that are executing, not records that are waiting (#134)"""
 
 from __future__ import annotations
 
@@ -31,12 +14,7 @@ from jarvis.project_store import ProjectStore, resume_spends_slot
 
 @pytest.fixture()
 def boot(tmp_path, jarvis_home, fake_claude, project):
-    """The OS against a catalog this test wrote, so `max_concurrent` is the subject.
-
-    `max_in_flight` is out of the way at 50: the shipped fleet default (3) is tighter
-    than the project default, and a test of the project cap that actually bound on the
-    fleet cap would pass for the wrong reason (kn-f1934cfc).
-    """
+    """The OS against a catalog this test wrote, so `max_concurrent` is the subject"""
     def _boot(max_concurrent: int = 2) -> Daemon:
         path = tmp_path / f"catalog-{max_concurrent}.json"
         path.write_text(json.dumps({
@@ -63,11 +41,7 @@ def store(project):
 
 
 def _parked(store: ProjectStore, title: str, status: str) -> dict:
-    """A work order with a finished turn behind it, parked in `status`.
-
-    The turn matters: `deliver_messages` skips a work order with no `session_id`, and
-    `worker_session.busy` skips one whose latest turn is still running.
-    """
+    """A work order with a finished turn behind it, parked in `status`"""
     wo = ops.create_work_order("proj_a", title, description="something to do")
     store.set_status(wo["id"], "running", session_id=f"s-{wo['id']}")
     turn = store.create_turn(wo["id"], kind="dispatch", prompt="go")
@@ -80,15 +54,11 @@ def _turns(store: ProjectStore, wo_id: str) -> int:
     return len(store.list_turns(wo_id))
 
 
-# -- 1. what spends a slot -------------------------------------------------------------
+# -- 1. what spends a slot
 
 
 def test_only_an_executing_turn_spends_a_slot(boot, store):
-    """The narrowing itself, one status at a time, against its own control.
-
-    `dispatching` is IN even though `dispatch_work_order` reaches `running` in the same
-    call: a crash between the claim and the launch must not read as a free slot.
-    """
+    """The narrowing itself, one status at a time, against its own control"""
     boot()
     for status in ("waiting_input", "validating"):
         wo = _parked(store, f"parked in {status}", status)
@@ -102,7 +72,7 @@ def test_only_an_executing_turn_spends_a_slot(boot, store):
 
 
 def test_a_full_project_still_claims_past_parked_orders(boot, store):
-    """The user-visible bug in #134: five records, one turn, and nothing dispatches."""
+    """The user-visible bug in #134: five records, one turn, and nothing dispatches"""
     daemon = boot(max_concurrent=2)
     spec = daemon.catalog.project("proj_a")
     _parked(store, "parked on Neo", "waiting_input")
@@ -113,7 +83,7 @@ def test_a_full_project_still_claims_past_parked_orders(boot, store):
 
     assert store.get_work_order(work["id"])["status"] != "pending"
 
-    # The control: two orders actually running, and the same call claims nothing.
+    # The control: two orders actually running, and the same call claims nothing
     _parked(store, "running one", "running")
     _parked(store, "running two", "running")
     store.set_status(work["id"], "completed")
@@ -123,15 +93,11 @@ def test_a_full_project_still_claims_past_parked_orders(boot, store):
     assert store.get_work_order(blocked["id"])["status"] == "pending"
 
 
-# -- 2. the herd, held at delivery -----------------------------------------------------
+# -- 2. the herd, held at delivery
 
 
 def test_rejected_rounds_do_not_all_resume_at_once(boot, store):
-    """THE test in this file. Four rounds rejected by one tick, a project capped at two.
-
-    Feedback from the panel reaches its worker as a queued message (`bus.deliver` posts
-    one rather than launching a turn), so delivery is where the whole herd arrives.
-    """
+    """THE test in this file"""
     daemon = boot(max_concurrent=2)
     spec = daemon.catalog.project("proj_a")
     rejected = [_parked(store, f"round {i} rejected", "validating") for i in range(4)]
@@ -156,7 +122,7 @@ def test_rejected_rounds_do_not_all_resume_at_once(boot, store):
 
 
 def test_the_oldest_waiting_conversation_takes_the_free_slot(boot, store):
-    """Chronological, because `queued_messages` is: holding must not reorder a queue."""
+    """Chronological, because `queued_messages` is: holding must not reorder a queue"""
     daemon = boot(max_concurrent=1)
     spec = daemon.catalog.project("proj_a")
     first = _parked(store, "asked first", "waiting_input")
@@ -171,7 +137,7 @@ def test_the_oldest_waiting_conversation_takes_the_free_slot(boot, store):
 
 
 def test_a_held_message_goes_out_as_soon_as_a_slot_frees(boot, store):
-    """Held, not dropped — the property that makes the hold safe to be silent about."""
+    """Held, not dropped — the property that makes the hold safe to be silent about"""
     daemon = boot(max_concurrent=1)
     spec = daemon.catalog.project("proj_a")
     busy = _parked(store, "already running", "running")
@@ -189,8 +155,7 @@ def test_a_held_message_goes_out_as_soon_as_a_slot_frees(boot, store):
 
 
 def test_an_order_already_holding_a_slot_is_never_held(boot, store):
-    """It is the order the cap is counting: charging it again would refuse to resume the
-    very work the slot was reserved for."""
+    """It is the order the cap is counting: charging it again would refuse to resume the very work the..."""
     daemon = boot(max_concurrent=1)
     spec = daemon.catalog.project("proj_a")
     running = _parked(store, "mid-conversation", "running")
@@ -204,9 +169,7 @@ def test_an_order_already_holding_a_slot_is_never_held(boot, store):
 
 
 def test_a_manager_is_exempt_from_the_hold_as_well_as_from_the_count(boot, store):
-    """The two must agree. A manager does not contribute to `count_active`, so holding
-    its message against that cap would strand a feature's coordinator behind its own
-    children — and it is the children who report TO it."""
+    """The two must agree"""
     daemon = boot(max_concurrent=1)
     spec = daemon.catalog.project("proj_a")
     _parked(store, "a child, running", "running")
@@ -226,16 +189,11 @@ def test_a_manager_is_exempt_from_the_hold_as_well_as_from_the_count(boot, store
     assert resume_spends_slot(store.get_work_order(manager["id"])) is False
 
 
-# -- 3. the second door: the retry sweep -----------------------------------------------
+# -- 3. the second door: the retry sweep
 
 
 def test_an_auth_parked_order_is_held_by_the_project_cap(boot, store, signin):
-    """`retry_paused_turns` resumes without dispatching, so the cap has to be re-checked
-    here too — otherwise `max_concurrent` is advisory through a second door.
-
-    An AUTH pause is the shape it bites on, because `_park_on_signin` is the only path
-    that parks a work order OUT of `running`.
-    """
+    """`retry_paused_turns` resumes without dispatching, so the cap has to be re-checked here too"""
     from jarvis import worker_session
 
     daemon = boot(max_concurrent=1)
@@ -268,10 +226,7 @@ def test_an_auth_parked_order_is_held_by_the_project_cap(boot, store, signin):
 
 
 def test_a_usage_parked_order_is_not_charged_for_the_slot_it_holds(boot, store):
-    """The pairing. A usage or transient pause leaves its work order `running`, which
-    already spends a slot — so the project cap must not hold its retry, or a full project
-    could never recover from a refusal at all. Staggering THAT herd is the fleet cap's
-    job, which counts turns in flight (kn-f1934cfc)."""
+    """The pairing"""
     from jarvis import worker_session
 
     daemon = boot(max_concurrent=1)

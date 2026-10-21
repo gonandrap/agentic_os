@@ -1,17 +1,4 @@
-"""The symptom catalogue: health probes as configuration.
-
-§2 of docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md.
-
-WHAT THESE TESTS ARE BUILT TO AVOID. `assert len(cfg.probes) == 5` is green off the
-shipped defaults with no parser at all, and `assert len(resolved) == 4` after an override
-is green on WHOLESALE REPLACEMENT — the merge rule this section exists to establish. So
-every inheritance assertion is a set of four made together: the count, the disabled probe
-being PRESENT rather than absent, an untouched probe being byte-identical to the fleet's,
-and the fleet's own list being unchanged afterwards.
-
-The section ships no trigger and no model call, which is a property of the diff that no
-test can grade. The closest observable is the last test in this file.
-"""
+"""The symptom catalogue: health probes as configuration (docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md)"""
 
 from __future__ import annotations
 
@@ -30,10 +17,7 @@ P2 = probes.HealthProbe(id="two", title="Second", prompt="the second symptom",
                         subjects=("work_order",))
 
 
-#: THE COMMITTED OUTPUT of `build_system_prompt(store, project)` with no probes and
-#: no learnings, byte for byte. A literal rather than a re-derivation on purpose:
-#: the whole failure this pins is a template that grew, and a test that rebuilt the
-#: prompt from the same parts would grow with it.
+#: THE COMMITTED OUTPUT of `build_system_prompt(store
 PROMPT_WITHOUT_PROBES = """\
 You are the SUPERVISOR inside the Jarvis agentic OS.
 
@@ -134,18 +118,11 @@ def _catalog(tmp_path: Path, os_block: dict, project_block: dict | None = None,
                                   "projects": [project]})
 
 
-# -- the merge rule --------------------------------------------------------------------
+# -- the merge rule
 
 
 def test_the_merge_is_by_id_and_leaves_the_fleet_list_alone(tmp_path):
-    """THE THREE CASES IN ONE TEST, because each alone passes for the wrong reason.
-
-    An OS list of three, a project that disables one of them and adds one of its own.
-    Asserting only the length would pass on wholesale replacement; asserting only the
-    new probe would pass on a merge that dropped the rest. The fourth assertion — the
-    OS-level list is still three — is what catches a merge that edited the shared
-    `DEFAULT_PROBES` tuple in place.
-    """
+    """THE THREE CASES IN ONE TEST, because each alone passes for the wrong reason"""
     three = [{"id": "a", "title": "A", "prompt": "aaa"},
              {"id": "b", "title": "B", "prompt": "bbb"},
              {"id": "c", "title": "C", "prompt": "ccc"}]
@@ -158,27 +135,25 @@ def test_the_merge_is_by_id_and_leaves_the_fleet_list_alone(tmp_path):
     fleet = cat.os.supervisor.probes
     mine = cat.project("p").supervisor.probes
 
-    # The OS list merged over the shipped five, so it is eight; the project adds one.
+    # The OS list merged over the shipped five, so it is eight; the project adds one
     assert [p.id for p in mine] == [p.id for p in fleet] + ["d"]
     assert len(mine) == len(fleet) + 1
 
-    # PRESENT AND DISABLED, never absent: a project cannot delete what the fleet watches
-    # for, so the record of the fleet's list stays legible on every project's read.
+    # PRESENT AND DISABLED, never absent: a project cannot delete what the fleet watches for
     (disabled,) = [p for p in mine if p.id == "b"]
     assert disabled.enabled is False
     assert disabled.title == "B" and disabled.prompt == "bbb"
 
-    # An untouched probe is byte-identical to the fleet's, not a rebuilt copy.
+    # An untouched probe is byte-identical to the fleet's, not a rebuilt copy
     assert next(p for p in mine if p.id == "a") == next(p for p in fleet if p.id == "a")
 
-    # ... and the fleet's own list never moved.
+    # ... and the fleet's own list never moved
     assert next(p for p in fleet if p.id == "b").enabled is True
     assert len(fleet) == len(probes.DEFAULT_PROBES) + 3
 
 
 def test_an_override_replaces_only_the_fields_it_names(tmp_path):
-    """`{"id": …, "prompt": …}` rewords a probe and keeps everything else — the property
-    that makes "watch for this differently here" a one-line catalog edit."""
+    """`{"id": …, "prompt": …}` rewords a probe and keeps everything else"""
     cat = _catalog(tmp_path, {}, {"probes": [{"id": "no-progress",
                                               "prompt": "reworded for this project"}]})
     (mine,) = [p for p in cat.project("p").supervisor.probes if p.id == "no-progress"]
@@ -192,9 +167,7 @@ def test_an_override_replaces_only_the_fields_it_names(tmp_path):
 
 
 def test_resolve_does_not_mutate_the_base_it_was_given():
-    """Directly, without a catalog: `DEFAULT_PROBES` is module state shared by every
-    project's resolved config, so a merge that appended in place would leak across the
-    fleet — and across tests."""
+    """Directly, without a catalog: `DEFAULT_PROBES` is module state shared by every project's resolved..."""
     base = (P1, P2)
     out = probes.resolve(base, [{"id": "one", "enabled": False},
                                 {"id": "three", "title": "T", "prompt": "ttt"}])
@@ -205,12 +178,11 @@ def test_resolve_does_not_mutate_the_base_it_was_given():
     assert P1.enabled is True
 
 
-# -- the refusals ----------------------------------------------------------------------
+# -- the refusals
 
 
 def test_a_probe_id_may_not_shadow_an_inspection_alarm_kind(tmp_path):
-    """Two different things would read as one on `/alarms`, in `jarvis alarms` and in
-    every listing that groups by kind."""
+    """Two different things would read as one on `/alarms`"""
     with pytest.raises(CatalogError) as e:
         _catalog(tmp_path, {"probes": [{"id": "long-turn", "title": "T",
                                         "prompt": "p"}]})
@@ -218,17 +190,14 @@ def test_a_probe_id_may_not_shadow_an_inspection_alarm_kind(tmp_path):
 
 
 def test_reserved_ids_are_exactly_inspections_alarm_kinds():
-    """`probes` cannot import `inspection` (it would be a cycle through `catalog`), so
-    the list is duplicated as literals — and this is what keeps the copy honest when a
-    fourth alarm kind is added."""
+    """`probes` cannot import `inspection` (it would be a cycle through `catalog`)"""
     from jarvis import inspection
 
     assert set(probes.RESERVED_IDS) == set(inspection.ALARM_KINDS)
 
 
 def test_a_duplicate_id_in_one_list_is_refused(tmp_path):
-    """The merge would silently collapse them and the second entry would win with no
-    sign that the first was ever read."""
+    """The merge would silently collapse them and the second entry would win with no sign that the first..."""
     with pytest.raises(CatalogError) as e:
         _catalog(tmp_path, {"probes": [{"id": "dup", "title": "A", "prompt": "a"},
                                        {"id": "dup", "title": "B", "prompt": "b"}]})
@@ -236,7 +205,7 @@ def test_a_duplicate_id_in_one_list_is_refused(tmp_path):
 
 
 def test_an_unknown_subject_is_refused(tmp_path):
-    """A probe armed for nothing is a setting that silently does nothing."""
+    """A probe armed for nothing is a setting that silently does nothing"""
     with pytest.raises(CatalogError) as e:
         _catalog(tmp_path, {"probes": [{"id": "x", "title": "X", "prompt": "x",
                                         "subjects": ["gate"]}]})
@@ -244,10 +213,7 @@ def test_an_unknown_subject_is_refused(tmp_path):
 
 
 def test_a_prompt_over_the_budget_is_refused(tmp_path):
-    """At the shipped budget, so the offender named is the one the catalog added. A
-    budget set BELOW the shipped prompts is refused too, naming whichever ships longest
-    — which is the honest answer: the cap bounds one prompt and the fleet's own list is
-    in it."""
+    """At the shipped budget, so the offender named is the one the catalog added"""
     over = "x" * (catalog.SupervisorConfig().probe_prompt_chars + 1)
     with pytest.raises(CatalogError) as e:
         _catalog(tmp_path, {"probes": [{"id": "wordy", "title": "W", "prompt": over}]})
@@ -255,8 +221,7 @@ def test_a_prompt_over_the_budget_is_refused(tmp_path):
 
 
 def test_more_enabled_probes_than_the_cap_is_refused(tmp_path):
-    """They all ride in ONE system prompt, so the cap is on the prompt rather than on
-    the catalog's tidiness."""
+    """They all ride in ONE system prompt"""
     with pytest.raises(CatalogError) as e:
         _catalog(tmp_path, {"max_enabled_probes": 5,
                             "probes": [{"id": "extra", "title": "E", "prompt": "e"}]})
@@ -264,8 +229,7 @@ def test_more_enabled_probes_than_the_cap_is_refused(tmp_path):
 
 
 def test_disabling_a_shipped_probe_makes_room_under_the_cap(tmp_path):
-    """The positive partner for the refusal above: the cap counts ENABLED probes, so a
-    project at the ceiling can still add one by switching another off."""
+    """The positive partner for the refusal above: the cap counts ENABLED probes"""
     cat = _catalog(tmp_path, {"max_enabled_probes": 5,
                               "probes": [{"id": "no-progress", "enabled": False},
                                          {"id": "extra", "title": "E", "prompt": "e"}]})
@@ -281,24 +245,17 @@ def test_a_probe_id_must_be_kebab_case(tmp_path):
 
 
 def test_a_new_probe_must_bring_its_own_title_and_prompt(tmp_path):
-    """An override may name one field because the rest are inherited; an ADDITION has
-    nothing to inherit from, and a probe with an empty prompt detects nothing."""
+    """An override may name one field because the rest are inherited"""
     with pytest.raises(CatalogError) as e:
         _catalog(tmp_path, {"probes": [{"id": "bare"}]})
     assert "bare" in str(e.value) and "title" in str(e.value)
 
 
-# -- the two shared functions that break loudly on the new fields ----------------------
+# -- the two shared functions that break loudly on the new fields
 
 
 def test_a_catalog_declaring_a_probe_parses_resolves_and_round_trips(tmp_path):
-    """`config_version._jsonable` had no dataclass branch, so a `tuple[HealthProbe, …]`
-    reached `json.dumps` and took out `jarvis config show`, `jarvis config set` and every
-    config-version write. THE DODGE IS `_SKIP`: hiding `probes` from the resolved map
-    would pass this and hide every probe from the console and from the version stamp, so
-    `tests/test_supervisor.py::test_every_supervisor_setting_reaches_the_config_console`
-    must keep passing unmodified beside it.
-    """
+    """`config_version._jsonable` had no dataclass branch"""
     cat = _catalog(tmp_path, {"probes": [{"id": "mine", "title": "M", "prompt": "mmm"}]})
     resolved = config_version.resolve(cat)
 
@@ -312,13 +269,7 @@ def test_a_catalog_declaring_a_probe_parses_resolves_and_round_trips(tmp_path):
 
 
 def test_health_enabled_inherits_field_by_field_and_reaches_the_resolved_map(tmp_path):
-    """EXCLUDING A FIELD FROM THE REFLECTIVE `int()` PARSE IS HALF THE FIX. `int(False)`
-    is 0, which trips the `>= 1` floor rather than raising a `TypeError`, so a worker who
-    widened the exclusion for `probes` alone bricked the OS with a message naming the
-    wrong key. And a field excluded but never read back is pinned at its default however
-    the catalog sets it — every "ships off" assertion downstream then passes on a switch
-    that can never be turned on.
-    """
+    """EXCLUDING A FIELD FROM THE REFLECTIVE `int()` PARSE IS HALF THE FIX"""
     cat = _catalog(tmp_path, {"health_enabled": True}, {"health_enabled": False})
 
     assert cat.os.supervisor.health_enabled is True
@@ -329,8 +280,7 @@ def test_health_enabled_inherits_field_by_field_and_reaches_the_resolved_map(tmp
 
 
 def test_the_sweeps_off_switch_is_a_safety_key():
-    """Same class of act as `os.supervisor.enabled`: it removes a watcher, and the change
-    is invisible on every surface until the thing it was watching goes wrong."""
+    """Same class of act as `os.supervisor.enabled`: it removes a watcher"""
     assert "os.supervisor.health_enabled" in catalog.SAFETY_KEYS
 
 
@@ -339,12 +289,11 @@ def test_the_sweep_ships_off_and_its_numbers_are_settings():
     assert catalog.SupervisorConfig().probes == probes.DEFAULT_PROBES
 
 
-# -- the checklist, and the prompt prefix it may not move ------------------------------
+# -- the checklist, and the prompt prefix it may not move
 
 
 def test_armed_filters_by_enabled_and_by_subject():
-    """A feature order is not shown the work-order probes, and neither is shown a
-    disabled one."""
+    """A feature order is not shown the work-order probes, and neither is shown a disabled one"""
     disabled = probes.HealthProbe(id="off", title="Off", prompt="off", enabled=False)
     pool = (P1, P2, disabled)
 
@@ -362,15 +311,7 @@ def test_the_checklist_keeps_the_resolved_order():
 
 def test_the_system_prompt_is_unchanged_without_probes_and_extends_with_them(
         jarvis_home):
-    """THE MOST IMPORTANT PIN IN THIS SECTION, and the existing byte-stability test does
-    not grade it: that one compares two calls in one process, so it catches a clock in
-    the prompt and NOT a template that grew an empty checklist header for everybody.
-
-    The cost review and the health sweep share this function; the cost prompt's prefix is
-    load-bearing, because a changed prefix reprices every review silently. Equality alone
-    would forbid the feature, so the second half asserts PREFIX EXTENSION — which is the
-    property the cache actually needs.
-    """
+    """THE MOST IMPORTANT PIN IN THIS SECTION"""
     from jarvis.neo_store import NeoStore
 
     store = NeoStore()
@@ -386,15 +327,12 @@ def test_the_system_prompt_is_unchanged_without_probes_and_extends_with_them(
     assert P1.prompt in with_probes
 
 
-# -- the CLI read ----------------------------------------------------------------------
+# -- the CLI read
 
 
 def test_supervisor_probes_says_where_each_answer_came_from(
         jarvis_home, catalog_file, project):
-    """`kn-42c52cec`: a resolved value the user cannot see is a value they cannot trust,
-    and merge-by-id is exactly the kind of resolution that goes wrong quietly — a project
-    that switched a probe off looks, on every other surface, like one that never had it.
-    """
+    """`kn-42c52cec`: a resolved value the user cannot see is a value they cannot trust"""
     data = json.loads(catalog_file.read_text())
     data["projects"][0]["supervisor"] = {
         "probes": [{"id": "no-progress", "enabled": False},
@@ -411,7 +349,7 @@ def test_supervisor_probes_says_where_each_answer_came_from(
     assert by_id["brief-mismatch"]["source"] == "fleet"
     assert len(rows) == len(probes.DEFAULT_PROBES) + 1
 
-    # The fleet's own read is unaffected, and everything on it is the fleet's.
+    # The fleet's own read is unaffected, and everything on it is the fleet's
     fleet = ops.supervisor_probes(catalog_path=str(catalog_file))
     assert {r["source"] for r in fleet} == {"fleet"}
     assert all(r["enabled"] for r in fleet)
@@ -419,8 +357,7 @@ def test_supervisor_probes_says_where_each_answer_came_from(
 
 def test_the_cli_prints_the_source_and_marks_a_disabled_probe(
         jarvis_home, catalog_file, project, capsys):
-    """The CLI is the OS: whatever the resolution says has to be readable in a terminal,
-    not only in `--json`."""
+    """The CLI is the OS: whatever the resolution says has to be readable in a terminal"""
     from jarvis.cli import main
 
     data = json.loads(catalog_file.read_text())
@@ -438,8 +375,7 @@ def test_the_cli_prints_the_source_and_marks_a_disabled_probe(
 
 def test_supervisor_probes_json_carries_the_whole_prompt(
         jarvis_home, catalog_file, project, capsys):
-    """Human output clips the paragraphs so the inheritance stays readable; `--json` is
-    where the text a model will be shown actually lives."""
+    """Human output clips the paragraphs so the inheritance stays readable"""
     from jarvis.cli import main
 
     assert main(["supervisor", "probes", "--json",
@@ -448,19 +384,12 @@ def test_supervisor_probes_json_carries_the_whole_prompt(
     assert rows[0]["prompt"] == probes.DEFAULT_PROBES[0].prompt
 
 
-# -- and nothing looks at any of it yet ------------------------------------------------
+# -- and nothing looks at any of it yet
 
 
 def test_configured_probes_raise_nothing_and_call_no_model(
         jarvis_home, fake_claude, catalog_file, project):
-    """THE CLOSEST OBSERVABLE FOR "this section adds no trigger". It cannot prove the
-    property — that is the reviewer's job and the pull request says so — but a worker who
-    wired a sweep in here would fail it.
-
-    The positive partner is the first assertion: the probes really are resolved and armed
-    on the project the tick walked, so the zeroes below are not the zeroes of a feature
-    that was never configured.
-    """
+    """THE CLOSEST OBSERVABLE FOR "this section adds no trigger\""""
     data = json.loads(catalog_file.read_text())
     data["projects"][0]["supervisor"] = {
         "health_enabled": True,
@@ -483,22 +412,11 @@ def test_configured_probes_raise_nothing_and_call_no_model(
         store.close()
 
 
-# -- the sweep's own output contract (issue #216) ---------------------------------------
+# -- the sweep's own output contract (issue #216)
 
 
 def test_the_checklist_states_the_sweeps_output_contract():
-    """THE DEFECT THIS FILE EXISTED THROUGH. The sweep's whole prompt was the persona,
-    the learnings and this checklist, and NONE of the three named `findings` — so the
-    only output contract the model ever saw was `SUPERVISOR_PERSONA`'s `{"decision":
-    ...}`, which `supervisor._validate_findings` rejects for the one key it was never
-    asked for. In production every sweep obeyed the contract it was given and was
-    recorded `failed`: 2215 of 2215, $101.78, zero findings.
-
-    The contract lives HERE rather than in the persona because the persona is shared
-    with the cost review, whose prefix must not move, and because `render_checklist`
-    renders nothing at all when no probe is armed — so a project that arms none still
-    pays nothing.
-    """
+    """THE DEFECT THIS FILE EXISTED THROUGH"""
     out = probes.render_checklist([P1, P2])
 
     assert "findings" in out
@@ -507,14 +425,7 @@ def test_the_checklist_states_the_sweeps_output_contract():
 
 
 def test_the_sweeps_contract_comes_AFTER_the_personas(jarvis_home):
-    """ORDER IS THE WHOLE FIX, not the presence of the words.
-
-    `SUPERVISOR_PERSONA` says "Output STRICT JSON, nothing else" and then gives the cost
-    review's three shapes. A findings contract placed above that is simply overruled by
-    the more emphatic instruction below it. `build_system_prompt` appends the checklist
-    last, so this holds by construction — and this test is what stops someone
-    interleaving it later for tidiness.
-    """
+    """ORDER IS THE WHOLE FIX, not the presence of the words"""
     from jarvis.neo_store import NeoStore
 
     store = NeoStore()
@@ -527,8 +438,7 @@ def test_the_sweeps_contract_comes_AFTER_the_personas(jarvis_home):
 
 
 def test_the_contract_does_not_reach_a_project_that_arms_no_probe(jarvis_home):
-    """The cost review shares this prompt and its prefix is load-bearing. Empty in,
-    empty out — the same rule `PROMPT_WITHOUT_PROBES` pins, restated for the contract."""
+    """The cost review shares this prompt and its prefix is load-bearing"""
     assert probes.render_checklist([]) == ""
 
     from jarvis.neo_store import NeoStore

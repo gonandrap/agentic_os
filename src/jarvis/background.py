@@ -1,15 +1,4 @@
-"""Background jobs a worker turn left behind when it ended.
-
-docs/superpowers/specs/2026-09-22-a-dead-background-job-is-not-a-live-one.md, issue
-#575. A turn is one `claude -p` process: whatever it backgrounded dies with it, and the
-worker's parting "I'll report when it lands" is false the moment it is written. The
-briefing has forbidden this since `TEMPLATE_VERSION` v10 and a worker violated it on two
-consecutive turns, so what is needed here is a CHECK rather than another sentence.
-
-Reads the session transcript and nothing else — no process lookup, no model call. The
-job is dead by the time anyone asks; the question this module answers is whether the
-turn ever collected it.
-"""
+"""Background jobs a worker turn left behind when it ended (docs/superpowers/specs/2026-09-22-a-dead-background-job-is-not-a-live-one.md)"""
 
 from __future__ import annotations
 
@@ -21,44 +10,25 @@ from typing import Any, Iterator
 
 from . import db, usage
 
-#: The event `worker_session._reap` writes when it catches one. Payload: `seq`, the
-#: reply's `msg_id`, and `jobs` — one `{id, command}` each.
+#: The event `worker_session._reap` writes when it catches one
 EVENT = "background_orphaned"
 
-#: `wo_messages.source` for the note a resume carries. In
-#: `timeline.UNAUTHORED_SOURCES`, so the conversation renders it as Jarvis speaking: a
-#: detector wrote it, not the user, and the worker must not read it as the user's words.
+#: `wo_messages.source` for the note a resume carries
 SOURCE = "background-orphan"
 
-#: The tool that kills a background job. Naming one is collection of a sort — the worker
-#: knew the job was there and dealt with it, so nothing was abandoned.
+#: The tool that kills a background job
 KILL_TOOL = "KillShell"
 
-#: The tools that poll one. Their result carries a status; anything other than `running`
-#: means the worker saw the job end inside the turn. `TaskOutput` collects a backgrounded
-#: `Agent`, which §5 of
-#: docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md makes a
-#: legal thing for a lead to have running.
+#: The tools that poll one (docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md)
 POLL_TOOL = ("BashOutput", "TaskOutput")
 
-#: Every parameter spelling a poll or a kill names its subject with. Read tolerantly for
-#: `RUNNING`'s reason — UNVERIFIED against a live `TaskOutput` call, kn-df5574d3 — and
-#: none of them is this module's to choose.
+#: Every parameter spelling a poll or a kill names its subject with
 JOB_ID_PARAMS = ("bash_id", "shell_id", "task_id", "agent_id", "subagent_id")
 
-#: The status a `<task-notification>` or a poll reports while the job is still going.
-#: Every other value is an ending of some kind — completed, failed, killed — and all of
-#: them are collection. UNVERIFIED AGAINST A LIVE POLL: no transcript in the fleet has
-#: ever contained a `BashOutput`, which is exactly why this bug reached production, so
-#: the poll shape is read tolerantly (any `<status>` tag, any `status` field) rather than
-#: matched exactly. kn-df5574d3: a measurement of an external tool expires when that tool
-#: ships a version, and nothing fails when it does.
+#: The status a `<task-notification>` or a poll reports while the job is still going
 RUNNING = "running"
 
-#: How the harness starts `toolUseResult` when the call FAILED or was refused — verified
-#: on a real denied `Bash` row. The FALLBACK only: the structured `is_error` flag is the
-#: primary signal, and this prefix is matched at the start and nowhere else, so prose
-#: mentioning an error cannot clear a launch.
+#: How the harness starts `toolUseResult` when the call FAILED or was refused
 ERROR_PREFIX = "Error: "
 
 _TASK_ID = re.compile(r"<task-id>\s*([^<\s]+)\s*</task-id>")
@@ -67,14 +37,13 @@ _STATUS = re.compile(r"<status>\s*([^<\s]+)\s*</status>")
 
 @dataclass(frozen=True)
 class Job:
-    """One background job a turn started and never collected."""
+    """One background job a turn started and never collected"""
 
     job_id: str
     command: str
 
     def label(self) -> str:
-        """How the job is named to a person — the id first, because that is what the
-        user can check against `ps` and what the OS's own alarm quoted."""
+        """How the job is named to a person"""
         if not self.command:
             return f"`{self.job_id}`"
         return f"`{self.job_id}` (`{_clip(self.command)}`)"
@@ -84,9 +53,7 @@ def labels(jobs: list[Job]) -> str:
     return ", ".join(job.label() for job in jobs)
 
 
-#: How much of a command survives into a label. A `uv run pytest …` line with three
-#: pipes is a paragraph, and this text lands in a message the worker reads and a marker
-#: the user reads; both want the head of it.
+#: How much of a command survives into a label
 COMMAND_CHARS = 80
 
 
@@ -98,16 +65,7 @@ def _clip(command: str) -> str:
 
 def orphaned_in_turn(store: Any, wo_id: str,
                      turn: dict[str, Any]) -> list[Job]:
-    """Background jobs this turn started and never collected before it ended.
-
-    The exemption is a `finished` event inside the turn: a worker that called
-    `jarvis wo finish` has had its authoritative last word recorded, and a job it
-    collected on the way to finishing must not be reported as abandoned (spec §2).
-
-    Returns empty rather than raising on anything the transcript cannot answer — no
-    session id, no file, an unreadable one. A detector that crashes the reaper would
-    cost the work order its whole turn record.
-    """
+    """Background jobs this turn started and never collected before it ended"""
     session_id = str(store.get_work_order(wo_id).get("session_id") or "")
     if not session_id:
         return []
@@ -129,12 +87,7 @@ def _finished_in_turn(store: Any, wo_id: str, turn: dict[str, Any]) -> bool:
 def jobs_left_running(session_id: str, *, since: float, until: float,
                       index: dict[str, list[Path]] | None = None,
                       root: Path | None = None) -> list[Job]:
-    """The transcript half, with no store in it — spec §2's table, in order.
-
-    Bounded to ONE TURN by `since`/`until` for `usage.said_in_session`'s reason: a
-    session outlives the turn that stalled in it, and a job the previous turn left
-    behind is the previous turn's finding, already on the record.
-    """
+    """The transcript half, with no store in it — spec §2's table, in order"""
     if index is None:
         index = usage.index_sessions(root)
     launched: dict[str, dict[str, Any]] = {}  # tool_use id -> its input
@@ -154,7 +107,7 @@ def jobs_left_running(session_id: str, *, since: float, until: float,
 
 def _scan_calls(row: dict[str, Any], launched: dict[str, dict[str, Any]],
                 polls: dict[str, str], collected: set[str]) -> None:
-    """What the worker ASKED for: a launch to remember, a kill or a poll to match up."""
+    """What the worker ASKED for: a launch to remember, a kill or a poll to match up"""
     for block in usage.blocks_of(row, "tool_use"):
         call_id, name = str(block.get("id") or ""), str(block.get("name") or "")
         params = block.get("input")
@@ -174,18 +127,7 @@ def _scan_calls(row: dict[str, Any], launched: dict[str, dict[str, Any]],
 def _scan_results(row: dict[str, Any], launched: dict[str, dict[str, Any]],
                   polls: dict[str, str], jobs: dict[str, Job],
                   collected: set[str]) -> None:
-    """What came BACK: the id a launch was given, and what a poll said about one.
-
-    The id is read from `toolUseResult.backgroundTaskId` — structured, and the same
-    field the harness writes for every background launch — rather than parsed out of the
-    English sentence beside it. A background `Agent` may report its id under another key
-    or none, so the launching `tool_use` id is the fallback: a launch with no reported id
-    is TRACKED rather than silently dropped (§5 of
-    docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md).
-
-    A launch whose result is an ERROR is skipped: a `run_in_background` call a PreToolUse
-    hook refused started no process, so reporting it would block a turn for nothing.
-    """
+    """What came BACK: the id a launch was given, and what a poll said about one (docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md)"""
     result = row.get("toolUseResult")
     outcome = result if isinstance(result, dict) else {}
     job_id = str(outcome.get("backgroundTaskId") or "")
@@ -202,12 +144,7 @@ def _scan_results(row: dict[str, Any], launched: dict[str, dict[str, Any]],
 
 
 def _failed(block: dict[str, Any], result: Any) -> bool:
-    """Whether this tool_result reports an ERROR — a refused or failed call.
-
-    Read the way the rest of this module reads the harness: the structured flag first
-    (`is_error` on the block, `is_error`/`isError` on `toolUseResult`), then `ERROR_PREFIX`
-    on the text as the fallback.
-    """
+    """Whether this tool_result reports an ERROR — a refused or failed call"""
     if block.get("is_error"):
         return True
     if isinstance(result, dict):
@@ -225,13 +162,7 @@ def _says_stopped(text: str, outcome: dict[str, Any]) -> bool:
 
 
 def _notified(row: dict[str, Any]) -> set[str]:
-    """Job ids this row reports as finished.
-
-    The `<task-notification>` block Claude Code delivers when a background job ends —
-    verified on a real transcript. It is what a worker turn NEVER receives, which is the
-    bug; it is here so that an interactive session, which does, is not accused of
-    abandoning a job it was told about.
-    """
+    """Job ids this row reports as finished"""
     done: set[str] = set()
     for text in _prose_of(row):
         if "<task-notification>" not in text:
@@ -244,19 +175,7 @@ def _notified(row: dict[str, Any]) -> set[str]:
 
 
 def _prose_of(row: dict[str, Any]) -> Iterator[str]:
-    """Where the HARNESS writes a notification, and nowhere the model writes anything.
-
-    THE DETECTOR'S KILL-SWITCH MUST NOT BE WRITABLE BY THE THING IT POLICES. A
-    `<task-notification>` in this text puts a job in `collected`, which is the whole
-    exemption — so a worker whose reply merely QUOTED one (this module's own docstrings
-    do, and so does any turn discussing issue #575) would clear its own finding: no
-    event, no void, no nudge, silently. Fail-open, by the worker's own prose.
-
-    So only the three shapes the harness itself writes, verified on a real transcript:
-    a `queue-operation`'s `content`, the `attachment.prompt` copy of the same
-    notification, and a USER row's plain-string message — never an assistant row's,
-    which carries the model's words in exactly that field.
-    """
+    """Where the HARNESS writes a notification, and nowhere the model writes anything (#575)"""
     for value in (row.get("content"), (row.get("attachment") or {}).get("prompt")
                   if isinstance(row.get("attachment"), dict) else None):
         if isinstance(value, str):
@@ -277,12 +196,7 @@ def _text_of(content: Any) -> str:
 
 def record(store: Any, wo_id: str, turn: dict[str, Any], jobs: list[Job],
            msg_id: int | None) -> None:
-    """File the finding against the turn that produced it.
-
-    `msg_id` is the reply the promise is IN, and it is what `timeline.build_conversation`
-    voids. A turn that ended without saying anything has none, and the event is still
-    worth writing: the job died either way.
-    """
+    """File the finding against the turn that produced it"""
     store.add_event(wo_id, EVENT, {
         "seq": turn["seq"], "msg_id": msg_id,
         "jobs": [{"id": job.job_id, "command": job.command} for job in jobs],
@@ -290,11 +204,7 @@ def record(store: Any, wo_id: str, turn: dict[str, Any], jobs: list[Job],
 
 
 def pending_orphan(store: Any, wo: dict[str, Any]) -> dict[str, Any] | None:
-    """The finding against this work order's LATEST turn, if that turn has one.
-
-    Keyed on the turn rather than on "has this ever happened": the next turn is the
-    retry, and once it has run the note has been given. Nothing has to be cleared.
-    """
+    """The finding against this work order's LATEST turn, if that turn has one"""
     turn = store.latest_turn(wo["id"])
     if turn is None:
         return None
@@ -310,11 +220,7 @@ def jobs_of(payload: dict[str, Any]) -> list[Job]:
             for j in (payload.get("jobs") or ()) if isinstance(j, dict)]
 
 
-#: What the OS tells the worker on the way back in. Says the three things the last turn
-#: got wrong — the job is dead, a turn is one-shot, poll it inside the turn — and says
-#: who is speaking, because the user did not write it (spec §4). The correction is the
-#: poll rhythm and no longer the foreground wait: §6c of
-#: docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md.
+#: What the OS tells the worker on the way back in (docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md)
 RESUME_NOTE = """\
 [jarvis] Before anything else: your last turn ended while it still had a background job \
 running, so that job was killed with the turn and produced nothing. Dead: {jobs}. \
@@ -329,16 +235,7 @@ will report when a run lands."""
 
 def resume_note(store: Any, wo: dict[str, Any],
                 queued: list[dict[str, Any]] = ()) -> str:  # type: ignore[assignment]
-    """The note to carry into this work order's next turn, or "".
-
-    ONCE PER TURN, and `queued` is what makes that true: a delivery whose transport
-    failed leaves its messages QUEUED, so the note it already wrote comes back in the
-    next tick's batch. Seeing itself there is the whole guard — the turn it was written
-    for is still the latest one, so nothing else about the finding has changed.
-
-    Past that tick the seq is the guard: `worker_session.send` opens a new turn, and
-    `pending_orphan` is keyed on the latest one.
-    """
+    """The note to carry into this work order's next turn, or "\""""
     if any(m.get("source") == SOURCE for m in queued):
         return ""
     payload = pending_orphan(store, wo)
@@ -348,38 +245,22 @@ def resume_note(store: Any, wo: dict[str, Any],
     return RESUME_NOTE.format(jobs=labels(jobs) if jobs else "the job it started")
 
 
-#: How many times the OS sends a work order back on its own before the user is asked.
-#: TWO, and the cap is the whole safety of it: the turn being retried is one that ended
-#: in seconds saying nothing, so a worker that does it a third time is not going to stop
-#: on the fourth. Neo, question 500.
+#: How many times the OS sends a work order back on its own before the user is asked
 NUDGE_MAX = 2
 
-#: The OS sent it back itself. `nudged` carries the attempt; `unresolved` is written once
-#: when the budget is gone and the work order is left to the ordinary idle path.
+#: The OS sent it back itself
 NUDGED = "background_nudged"
 UNRESOLVED = "background_unresolved"
 
 
 def nudge(store: Any, wo: dict[str, Any]) -> bool:
-    """Send this work order back to its worker over a job that died with its turn.
-
-    True when the OS has taken it on, and then the caller must leave the row alone: the
-    message is queued, the next delivery pass turns it into a turn, and the work order
-    moves itself. False when there is nothing to nudge about or the budget is spent,
-    and then the caller settles it exactly as it always did — this raises no attention
-    reason of its own, deliberately, so `invariants.true_blockers` stays the one author
-    of what a parked work order says (kn-089de524 and INV-ATTENTION-REASON).
-
-    kn-ca2e365e's rule, on the remedy side: the user's own lever is `jarvis wo send`,
-    and this reuses it rather than inventing a second way to start a turn.
-    """
+    """Send this work order back to its worker over a job that died with its turn"""
     note = resume_note(store, wo)
     if not note:
         return False
     attempts = len(store.events_of_kind(wo["id"], NUDGED))
     if attempts >= NUDGE_MAX:
-        # Said once, then never again: `pending_orphan` still matches the latest turn on
-        # every subsequent tick, and the reconciler is here every couple of minutes.
+        # Said once, then never again: `pending_orphan` still matches the latest turn on every subsequent...
         if not store.events_of_kind(wo["id"], UNRESOLVED):
             store.add_event(wo["id"], UNRESOLVED, {"attempts": attempts})
         return False

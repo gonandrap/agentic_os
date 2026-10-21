@@ -1,19 +1,4 @@
-"""`ops.rules_*` and the `jarvis rules` CLI family.
-
-The two properties these tests exist to pin:
-
-1. **Absent is never zero.** An empty registry returns a SENTENCE, not a table of zeros,
-   and a detector that has never fired has no hit rate rather than a hit rate of 0.0. A
-   fabricated zero reads as a measurement.
-2. **A thing that could not be read decides nothing.** `rules_dry_run` on a detector
-   whose stored condition no longer parses reports it UNREADABLE and evaluates nothing;
-   with an order id and no fact snapshot to build it says so and returns no verdict. It
-   never reports "no match", which would be an answer nobody computed.
-
-The CLI derives no number: it prints what `ops` returned.
-
-Spec: docs/superpowers/specs/2026-09-27-self-evolution.md §3.4.
-"""
+"""`ops.rules_*` and the `jarvis rules` CLI family (docs/superpowers/specs/2026-09-27-self-evolution.md §3.4.)"""
 
 from __future__ import annotations
 
@@ -31,13 +16,7 @@ COND = {"all": [{"field": "status", "op": "eq", "value": "needs_review"},
 @pytest.fixture()
 def store(jarvis_home):
     s = CentralStore()
-    # THE FIVE BUILTIN SEED ROWS ARE CLEARED. `CentralStore` seeds them on every open
-    # (docs/superpowers/specs/2026-09-27-self-evolution.md §5.3), and this file is about
-    # the TABLE MECHANICS — a row round-tripping, an insert being refused, a retraction never
-    # deleting — every assertion of which is written as "and the table stays empty". The
-    # seeds themselves are proved in `tests/test_rules_tick.py`, which is the section that
-    # owns their call site; asserting them here too would be two files disagreeing about
-    # what a count means the first time a sixth rule is seeded.
+    # THE FIVE BUILTIN SEED ROWS ARE CLEARED (docs/superpowers/specs/2026-09-27-self-evolution.md §5.3)
     s.conn.execute("DELETE FROM remedy_rules")
     s.conn.execute("DELETE FROM detectors")
     s.conn.commit()          # another connection (the CLI opens its own) must see it
@@ -57,7 +36,7 @@ def registered(store):
     return det, rule
 
 
-# -- rules_list -------------------------------------------------------------------------
+# -- rules_list
 
 
 def test_an_empty_registry_returns_the_sentence_and_no_fabricated_zero(store):
@@ -66,8 +45,7 @@ def test_an_empty_registry_returns_the_sentence_and_no_fabricated_zero(store):
     assert data["counts"]["total"] == 0
     assert isinstance(data["note"], str) and data["note"]
     assert "0.0" not in data["note"] and "0%" not in data["note"]
-    # `catalog.RulesConfig` ships OFF, and with no catalog registered at all the answer
-    # is the same False — never None, and never True on a failure to read a file.
+    # `catalog.RulesConfig` ships OFF
     assert data["enabled"] is False
 
 
@@ -103,7 +81,7 @@ def test_the_counts_lead_and_include_the_retracted(store, registered):
     assert counts == {"total": 2, "armed": 0, "dry_run": 1, "retracted": 1}
 
 
-# -- rules_show -------------------------------------------------------------------------
+# -- rules_show
 
 
 def test_show_carries_the_whole_provenance_chain(store, registered):
@@ -128,7 +106,7 @@ def test_show_refuses_an_unknown_id(store):
         ops.rules_show("dt-nope")
 
 
-# -- rules_retract ----------------------------------------------------------------------
+# -- rules_retract
 
 
 def test_retract_dispatches_on_the_prefix_and_never_deletes(store, registered):
@@ -153,7 +131,7 @@ def test_retract_refuses_an_empty_reason_and_an_unknown_id(store, registered):
     assert store.get_detector(det["id"])["retired_at"] is None
 
 
-# -- rules_dry_run ----------------------------------------------------------------------
+# -- rules_dry_run
 
 
 def test_dry_run_without_an_order_lists_what_the_condition_reads(store, registered):
@@ -167,9 +145,7 @@ def test_dry_run_without_an_order_lists_what_the_condition_reads(store, register
 
 
 def test_the_active_basis_field_reads_the_same_source(store):
-    """Spec §6 of
-    docs/superpowers/specs/2026-09-30-time-in-state-counts-a-usage-limit-hold-as-running.md
-    """
+    """Spec §6 of docs/superpowers/specs/2026-09-30-time-in-state-counts-a-usage-limit-hold-as-running.md"""
     det = store.add_detector(
         "held-too-long",
         {"all": [{"field": "seconds_in_status_active", "op": "gte", "value": 3600}]},
@@ -184,11 +160,7 @@ def test_the_active_basis_field_reads_the_same_source(store):
 
 def test_dry_run_on_an_order_whose_snapshot_cannot_be_built_decides_nothing(
         store, registered, tmp_path, monkeypatch):
-    """A snapshot that could not be built is the unreadable case, one level down.
-
-    `matched` stays None — never "no match", which would report a verdict nobody
-    computed. The reader is a store on a path with no project database behind it.
-    """
+    """A snapshot that could not be built is the unreadable case, one level down"""
     det, _rule = registered
     monkeypatch.setattr(ops, "find_work_order",
                         lambda oid, project_name=None: ("proj_a", tmp_path,
@@ -229,8 +201,7 @@ def test_dry_run_evaluates_the_fact_snapshot(store, registered, tmp_path,
 def test_dry_run_on_a_condition_that_no_longer_parses_reports_it_unreadable(store,
                                                                            registered):
     det, _rule = registered
-    # A row written by an older release naming a field this one removed. Written raw on
-    # purpose: `add_detector` cannot produce it, which is the point.
+    # A row written by an older release naming a field this one removed
     store.conn.execute("UPDATE detectors SET condition=? WHERE id=?",
                        (json.dumps({"all": [{"field": "moon_phase", "op": "eq",
                                              "value": "full"}]}), det["id"]))
@@ -242,16 +213,11 @@ def test_dry_run_on_a_condition_that_no_longer_parses_reports_it_unreadable(stor
     assert store.list_rule_fires() == []
 
 
-# -- the CLI ----------------------------------------------------------------------------
+# -- the CLI
 
 
 def test_the_family_is_exactly_seven_verbs_and_names_the_other_registry():
-    """`arm` and `false-positive` joined with §6's alarm bridge and `summary` with §9's
-    evolution report; any further verb is a deliberate act that edits this set.
-
-    The description has to open by saying which registry this is and name `jarvis gate
-    rules`: one verb meaning two registries is how that family stops being readable.
-    """
+    """`arm` and `false-positive` joined with §6's alarm bridge and `summary` with §9's evolution report"""
     parser = cli.build_parser()
     rules_parser = parser._subparsers._group_actions[0].choices["rules"]
     verbs = set(rules_parser._subparsers._group_actions[0].choices)
@@ -310,7 +276,7 @@ def test_show_clips_a_long_detail_to_one_line(store, registered, capsys):
     out = capsys.readouterr().out
     fire_line = [ln for ln in out.splitlines() if ln.strip().startswith("fire ")][0]
     assert len(fire_line) < 200 and fire_line.endswith("…")
-    # The stored value is untouched: only the terminal line is clipped.
+    # The stored value is untouched: only the terminal line is clipped
     assert ops.rules_show(det["id"])["fires"][0]["detail"] == "x" * 4000
 
 

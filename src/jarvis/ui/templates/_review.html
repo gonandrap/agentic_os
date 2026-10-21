@@ -47,6 +47,14 @@
    PLACEHOLDERS, and they rely on the environment's autoescape: `why` carries a panel
    reason and `next` a work-order id, and neither is sanitised here. Pinned by
    tests/test_ui.py::test_the_review_rows_escape_everything_they_are_handed. #}
+{# THE OBJECTION THE WORKER WAS NEVER TOLD, at the boundary where the user rules on it —
+   §4 of docs/superpowers/specs/2026-10-20-an-objection-is-withdrawn-before-the-order-
+   stops.md. The sentence comes from `ops.review_state` like every other one here, and it
+   deliberately does NOT repeat the objection's reason: the assumption block above prints
+   that through `ops.provisional_line`, and twice is twice. #}
+{% if review.objected_note %}<div class="row"><span class="sub">{{ review.objected_note
+  }}</span></div>
+{% endif %}
 {% if review.why %}<div class="row"><span class="sub">Why: {{ review.why }}</span></div>
 {% endif %}
 {% for command in review.next %}

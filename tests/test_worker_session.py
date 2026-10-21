@@ -1,8 +1,4 @@
-"""The conversation layer itself: minting, launching, reaping and killing turns.
-
-`test_pipeline` covers what a turn means for a work order. This covers the layer under
-it — the part that would be swapped out if the transport ever changed again.
-"""
+"""The conversation layer itself: minting, launching, reaping and killing turns"""
 
 from __future__ import annotations
 
@@ -21,7 +17,7 @@ from jarvis.project_store import ProjectStore
 
 @pytest.fixture()
 def fleet(jarvis_home, fake_claude, catalog_file, project):
-    """A started OS plus the pieces the layer is called with directly."""
+    """A started OS plus the pieces the layer is called with directly"""
     ops.start_os(str(catalog_file), foreground=True)
     catalog = load_catalog(catalog_file)
     return {
@@ -37,7 +33,7 @@ def _wo(fleet, **kwargs) -> dict:
     return fleet["store"].get_work_order(wo["id"])
 
 
-# -- session identity ------------------------------------------------------------------
+# -- session identity
 
 
 def test_start_mints_a_uuid_and_records_the_turn(fleet, settle_turns):
@@ -84,7 +80,7 @@ def test_busy_reports_the_in_flight_turn_and_only_that(fleet, fake_claude,
     assert worker_session.busy(store, wo["id"]) is None
 
 
-# -- reaping ---------------------------------------------------------------------------
+# -- reaping
 
 
 def test_a_completed_turn_records_the_reply_exactly_once(fleet, settle_turns):
@@ -121,8 +117,7 @@ def test_a_process_that_dies_without_output_fails_the_turn(fleet, fake_claude,
 
 
 def test_an_empty_reply_falls_back_to_what_the_stop_hook_saw(fleet):
-    """A turn whose JSON result comes back empty is not a turn with nothing to say:
-    the Stop hook fires inside the session and carries the final message verbatim."""
+    """A turn whose JSON result comes back empty is not a turn with nothing to say: the Stop hook fires..."""
     from jarvis.hooks import handle_hook
 
     store, project = fleet["store"], fleet["project"]
@@ -149,8 +144,7 @@ def test_an_empty_reply_falls_back_to_what_the_stop_hook_saw(fleet):
 
 
 def test_a_long_running_turn_is_reported_not_killed(fleet, fake_claude, settle_turns):
-    """A legitimately long turn and a hung one look identical from out here, and
-    killing loses real work — so a stall raises a flag and leaves the process alone."""
+    """A legitimately long turn and a hung one look identical from out here, and killing loses real work"""
     store = fleet["store"]
     gate = fake_claude.hold_turns()
     wo = _wo(fleet)
@@ -176,7 +170,7 @@ def test_a_long_running_turn_is_reported_not_killed(fleet, fake_claude, settle_t
     assert settle_turns(store)
 
 
-# -- cancelling -------------------------------------------------------------------------
+# -- cancelling
 
 
 def test_cancel_kills_the_process_group(fleet, fake_claude):
@@ -205,17 +199,11 @@ def test_cancel_with_nothing_in_flight_is_a_no_op(fleet, settle_turns):
     assert worker_session.cancel(store, wo["id"])["stopped"] is False
 
 
-# -- liveness --------------------------------------------------------------------------
+# -- liveness
 
 
 def test_process_alive_rejects_a_pid_that_is_not_a_claude(fake_claude):
-    """Pid reuse over a multi-hour turn would otherwise read as "still running" and
-    hang the work order forever, so liveness checks what the pid actually is.
-
-    The pytest process is the perfect adversarial case: it is alive, and it runs from
-    `.claude/worktrees/<name>/.venv/bin/python`, so a substring match on "claude" calls
-    it a live worker turn. Matching whole path components is what stops that.
-    """
+    """Pid reuse over a multi-hour turn would otherwise read as "still running" and hang the work order..."""
     import os
 
     assert claude_cli.process_alive(None) is False
@@ -224,10 +212,7 @@ def test_process_alive_rejects_a_pid_that_is_not_a_claude(fake_claude):
 
 
 def test_a_finished_turn_is_not_reported_alive_as_a_zombie(fleet):
-    """Nothing waits on a detached turn, so on exit it becomes a **zombie** — and
-    signalling a zombie succeeds. `os.kill` alone would therefore report every finished
-    turn as still running, forever, and no work order would ever settle.
-    """
+    """Nothing waits on a detached turn, so on exit it becomes a **zombie**"""
     import os
 
     store, project = fleet["store"], fleet["project"]
@@ -247,13 +232,7 @@ def test_a_finished_turn_is_not_reported_alive_as_a_zombie(fleet):
 
 
 def test_a_just_launched_turn_is_never_reported_dead(fleet, fake_claude, settle_turns):
-    """The mirror of the zombie case, and the one CI caught.
-
-    Between fork and exec a child's `/proc` cmdline is still the PARENT's, so judging
-    liveness from the cmdline declares a turn dead the instant it is launched — and
-    `poll` then reaps it before it has written anything, failing a perfectly healthy
-    turn. Locally the window closed too fast to notice; CI lost the race every run.
-    """
+    """The mirror of the zombie case, and the one CI caught"""
     store, project = fleet["store"], fleet["project"]
     gate = fake_claude.hold_turns()
     for _ in range(8):
@@ -265,18 +244,11 @@ def test_a_just_launched_turn_is_never_reported_dead(fleet, fake_claude, settle_
     assert settle_turns(store)
 
 
-# -- migration off background sessions ---------------------------------------------------
+# -- migration off background sessions
 
 
 def test_a_work_order_in_flight_at_upgrade_is_surfaced_not_failed(fleet):
-    """The deploy-day case: work orders that were already running when this release
-    landed have a conversation but no turn on record.
-
-    They must not be settled from that absence. Their background agent is still the
-    thing driving them and this reconciler cannot see it, so failing them would be a
-    lie about work that may be perfectly fine — and on the live fleet it would have
-    hit every in-flight work order within five minutes of the restart.
-    """
+    """The deploy-day case: work orders that were already running when this release landed have a..."""
     store = fleet["store"]
     wo = _wo(fleet)
     store.update_work_order(wo["id"], session_id="a-session-from-before",
@@ -296,9 +268,7 @@ def test_a_work_order_in_flight_at_upgrade_is_surfaced_not_failed(fleet):
 
 
 def test_a_work_order_claimed_but_never_launched_still_fails(fleet):
-    """The other side of that branch, and why it exists: no session and no turn means
-    the daemon died between claiming the work order and spawning anything. Nothing is
-    running, and nothing ever will be."""
+    """The other side of that branch, and why it exists: no session and no turn means the daemon died..."""
     store = fleet["store"]
     wo = _wo(fleet)
     store.set_status(wo["id"], "dispatching")
@@ -315,12 +285,7 @@ def test_a_work_order_claimed_but_never_launched_still_fails(fleet):
 
 def test_a_legacy_bg_session_is_released_before_its_next_turn(fleet, fake_claude,
                                                               settle_turns):
-    """Work orders dispatched under the old transport migrate themselves.
-
-    `--resume` refuses a session a background agent still holds, so the first message
-    delivered to a legacy work order releases the agent and moves the conversation onto
-    headless turns for good — which is also what drains the leaked roster as it goes.
-    """
+    """Work orders dispatched under the old transport migrate themselves"""
     store, project = fleet["store"], fleet["project"]
     wo = _wo(fleet)
     claude_cli.spawn_background(prompt="legacy", cwd=fleet["path"],
@@ -342,7 +307,7 @@ def test_a_legacy_bg_session_is_released_before_its_next_turn(fleet, fake_claude
     assert store.get_work_order(wo["id"])["job_id"] is None
 
 
-# -- the context bound reaches the CLI, from the catalog, on every turn ------------------
+# -- the context bound reaches the CLI, from the catalog, on every turn
 
 
 def _autocompact_of(argv: list[str]) -> str | None:
@@ -351,12 +316,7 @@ def _autocompact_of(argv: list[str]) -> str | None:
 
 def test_every_turn_carries_the_projects_context_bound(fleet, fake_claude,
                                                        settle_turns):
-    """Dispatch AND the resumed turns after it must both pass `--autocompact`.
-
-    The bound is what keeps a worker's context — and therefore the cache-read charge on
-    every API call it makes — from growing without limit. `briefing_for` is rebuilt per
-    turn precisely so a resume cannot drop it.
-    """
+    """Dispatch AND the resumed turns after it must both pass `--autocompact`"""
     store, project = fleet["store"], fleet["project"]
     wo = _wo(fleet)
     expected = str(project.worker.autocompact_window)
@@ -374,12 +334,7 @@ def test_every_turn_carries_the_projects_context_bound(fleet, fake_claude,
 
 def test_lowering_the_bound_reaches_a_running_work_order(fleet, fake_claude,
                                                          settle_turns):
-    """The bound is read from the CATALOG each turn, not frozen onto the row.
-
-    Model, effort and permission mode ARE frozen at dispatch, so this is a deliberate
-    difference: a spend control that only applied to work orders dispatched afterwards
-    would miss the long-running ones that are the reason to tighten it.
-    """
+    """The bound is read from the CATALOG each turn, not frozen onto the row"""
     store, project = fleet["store"], fleet["project"]
     wo = _wo(fleet)
     worker_session.start(store, project, wo, "go")
@@ -393,7 +348,7 @@ def test_lowering_the_bound_reaches_a_running_work_order(fleet, fake_claude,
 
 
 def test_opting_out_emits_no_flag_at_all(fleet, fake_claude, settle_turns):
-    """A project that sets the window to null gets the CLI's own default back."""
+    """A project that sets the window to null gets the CLI's own default back"""
     store, project = fleet["store"], fleet["project"]
     project.worker.autocompact_window = None
     wo = _wo(fleet)
@@ -405,17 +360,7 @@ def test_opting_out_emits_no_flag_at_all(fleet, fake_claude, settle_turns):
 
 
 def test_workers_buy_the_five_minute_cache_not_the_one_hour_one(fleet, settle_turns):
-    """A cache WRITE costs 1.25x base input at the 5-minute TTL and 2x at the 1-hour one.
-
-    Claude Code opts a headless session into the 1h TTL by default. Measured across
-    every transcript on the machine, 98.1% of cache-READ tokens land within five
-    minutes of the previous call, so the longer window is bought and almost never
-    used — and the gap it exists to cover (a turn boundary) is cold anyway because
-    git status moves in the system prompt (kn-625e79f1).
-
-    Asserting the literal, not a constant: this is a cost decision, and it should
-    take a deliberate edit and a fresh measurement to reverse.
-    """
+    """A cache WRITE costs 1.25x base input at the 5-minute TTL and 2x at the 1-hour one"""
     store, project = fleet["store"], fleet["project"]
     wo = _wo(fleet)
     worker_session.start(store, project, wo, "go")
@@ -424,3 +369,73 @@ def test_workers_buy_the_five_minute_cache_not_the_one_hour_one(fleet, settle_tu
     settings = json.loads(
         (fleet["path"] / ".jarvis" / "worker-settings" / f"{wo['id']}.json").read_text())
     assert settings["env"]["FORCE_PROMPT_CACHING_5M"] == "1"
+
+
+def _worker_env(fleet, wo) -> dict:
+    settings = json.loads(
+        (fleet["path"] / ".jarvis" / "worker-settings" / f"{wo['id']}.json").read_text())
+    return settings["env"]
+
+
+def test_the_one_hour_arm_writes_only_the_one_hour_key(fleet, settle_turns):
+    """§2 of docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md: the 5m flag..."""
+    store, project = fleet["store"], fleet["project"]
+    project.worker.cache_ttl = "1h"
+    wo = _wo(fleet)
+    worker_session.start(store, project, wo, "go")
+    assert settle_turns(store)
+
+    env = _worker_env(fleet, wo)
+    assert env["ENABLE_PROMPT_CACHING_1H"] == "1"
+    assert "FORCE_PROMPT_CACHING_5M" not in env
+
+
+def test_the_cli_arm_names_neither_key_in_the_settings_file(fleet, settle_turns):
+    """Absence IS the arm — the CLI's own automatic TTL (spec §1)"""
+    store, project = fleet["store"], fleet["project"]
+    project.worker.cache_ttl = "cli"
+    wo = _wo(fleet)
+    worker_session.start(store, project, wo, "go")
+    assert settle_turns(store)
+
+    env = _worker_env(fleet, wo)
+    assert [k for k in claude_cli.CACHE_TTL_KEYS if k in env] == []
+
+
+@pytest.mark.parametrize("arm", ["5m", "1h", "cli"])
+def test_every_turn_is_stamped_with_the_arm_it_ran_on(fleet, settle_turns, arm):
+    """§4: the stamp is written at LAUNCH from the resolved setting"""
+    store, project = fleet["store"], fleet["project"]
+    project.worker.cache_ttl = arm
+    wo = _wo(fleet)
+    turn, _ = worker_session.start(store, project, wo, "go")
+
+    assert store.get_turn(turn["id"])["cache_ttl"] == arm
+    events = [e for e in store.list_events(wo["id"]) if e["kind"] == "turn_started"]
+    assert json.loads(events[-1]["payload"])["cache_ttl"] == arm
+    assert settle_turns(store)
+
+
+def test_the_per_turn_table_carries_the_arm_even_with_no_usage(fleet):
+    """`ops._turn_row` is what `jarvis cost <wo-id>` renders"""
+    from jarvis import ops as ops_mod
+
+    store, project = fleet["store"], fleet["project"]
+    project.worker.cache_ttl = "1h"
+    wo = _wo(fleet)
+    turn, _ = worker_session.start(store, project, wo, "go")
+
+    row = ops_mod._turn_row(store.get_turn(turn["id"]), None)
+    assert row["cache_ttl"] == "1h"
+
+
+def test_a_turn_that_predates_the_column_reads_as_not_recorded(fleet):
+    """'' is "not recorded" and is NEVER read as an arm: every such turn did run at 5m"""
+    from jarvis import ops as ops_mod
+
+    store = fleet["store"]
+    wo = _wo(fleet)
+    turn = store.create_turn(wo["id"], kind="dispatch", prompt="go")
+
+    assert store.get_turn(turn["id"])["cache_ttl"] == ""
+    assert ops_mod._turn_row(store.get_turn(turn["id"]), None)["cache_ttl"] == ""

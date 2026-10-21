@@ -1,11 +1,4 @@
-"""`jarvis cost` — attributing transcript spend back to work orders.
-
-`tests/test_usage.py` covers the parser. This covers the layer above it: which work
-orders a report speaks for, and how a feature order's total is assembled. The two
-questions that matter here are both about honesty rather than arithmetic — a report
-that silently omits a work order, or reports an unmeasurable one as free, is worse
-than no report at all, because it invites a conclusion about where the tokens went.
-"""
+"""`jarvis cost` — attributing transcript spend back to work orders"""
 
 from __future__ import annotations
 
@@ -21,7 +14,7 @@ from jarvis.project_store import ProjectStore
 def assistant_row(mid: str, *, write: int = 0, read: int = 0, out: int = 0,
                   at: float | None = None, stop_reason: str | None = "end_turn",
                   blocks: list[dict] | None = None) -> dict:
-    """One assistant row. SEALED by default — see `placeholder_rows` for the other kind."""
+    """One assistant row"""
     row = {
         "type": "assistant",
         "message": {
@@ -32,9 +25,7 @@ def assistant_row(mid: str, *, write: int = 0, read: int = 0, out: int = 0,
         },
     }
     if at is not None:
-        # A subagent is charged to the turn that was running when it STARTED, so a test
-        # about that attribution needs to place its rows on the clock — in the same
-        # RFC-3339-with-a-Z shape Claude Code writes.
+        # A subagent is charged to the turn that was running when it STARTED
         row["timestamp"] = (datetime.fromtimestamp(at, tz=timezone.utc)
                             .isoformat().replace("+00:00", "Z"))
     return row
@@ -42,13 +33,7 @@ def assistant_row(mid: str, *, write: int = 0, read: int = 0, out: int = 0,
 
 def placeholder_rows(mid: str, *, read: int = 0, write: int = 0, out: int = 5,
                      at: float | None = None) -> list[dict]:
-    """The two rows Claude Code writes for one UNSEALED message, and no third.
-
-    A background subagent's assistant message is written once per content block with
-    `stop_reason: null` and a streaming `output_tokens` of 3-33; the sealed row carrying
-    the real output is never written, so the true figure is not in the file
-    (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §1).
-    """
+    """The two rows Claude Code writes for one UNSEALED message, and no third (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §1)"""
     return [
         assistant_row(mid, write=write, read=read, out=out, at=at, stop_reason=None,
                       blocks=[{"type": "text", "text": "thinking about it"}]),
@@ -68,12 +53,9 @@ def transcripts(tmp_path, monkeypatch):
               subagents: list[list[dict]] | None = None):
         (root / "-proj" / f"{session_id}.jsonl").write_text(
             "".join(json.dumps(r) + "\n" for r in rows))
-        # Claude Code files a subagent's own transcript beside its parent's, under a
-        # directory named for the parent session. `usage.read_session` reads them from
-        # there, which is the only reason a subagent's share can be told apart at all.
+        # Claude Code files a subagent's own transcript beside its parent's
         for i, sub in enumerate(subagents or []):
-            # Either a bare list of rows or (rows, meta): the meta file is what names a
-            # subagent's row on the bill, and most tests do not care what it is called.
+            # Either a bare list of rows or (rows
             sub_rows, meta = sub if isinstance(sub, tuple) else (sub, None)
             sub_dir = root / "-proj" / session_id / "subagents"
             sub_dir.mkdir(parents=True, exist_ok=True)
@@ -87,13 +69,7 @@ def transcripts(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def registered(jarvis_home, project, tmp_path):
-    """One registered project AND a registered catalog.
-
-    The catalog is not decoration: a bill classifies its cold cache boundaries against
-    `os.cold_prefix_floor`, which has no default anywhere, so building one without a
-    catalog raises rather than guessing a threshold. That failure is asserted directly
-    in `test_a_bill_without_a_catalog_fails_loudly_rather_than_guessing`.
-    """
+    """One registered project AND a registered catalog"""
     import json as _json
 
     from jarvis.central_store import CentralStore
@@ -126,16 +102,11 @@ def give_session(store, wo_id: str, session_id: str) -> None:
     store.conn.commit()
 
 
-# -- what the report speaks for -------------------------------------------------------
+# -- what the report speaks for
 
 
 def test_a_hidden_work_order_still_counts_toward_the_bill(store, transcripts):
-    """Hiding is about attention, not about spend.
-
-    Paired with a visible work order in the same report: asserting only that the
-    hidden one appears would pass against a report that ignored `hidden` entirely in
-    the other direction, and the totals line is what makes the omission dangerous.
-    """
+    """Hiding is about attention, not about spend"""
     visible = store.create_work_order("visible", "")
     hidden = store.create_work_order("hidden", "")
     give_session(store, visible["id"], "sess-visible")
@@ -152,7 +123,7 @@ def test_a_hidden_work_order_still_counts_toward_the_bill(store, transcripts):
 
 
 def test_a_work_order_with_no_transcript_is_unmeasured_not_free(store, transcripts):
-    """An empty transcript directory must not read as "this work order was free"."""
+    """An empty transcript directory must not read as "this work order was free\""""
     measured = store.create_work_order("has a transcript", "")
     give_session(store, measured["id"], "sess-there")
     transcripts("sess-there", [assistant_row("m1", write=1_000_000)])
@@ -165,7 +136,7 @@ def test_a_work_order_with_no_transcript_is_unmeasured_not_free(store, transcrip
     gone = next(u for u in report["units"] if u["title"] == "never dispatched")
     assert gone["found"] is False
     assert gone["turns"] == 0
-    # The measured one still contributes in full, so the total is not merely "small".
+    # The measured one still contributes in full, so the total is not merely "small"
     assert report["totals"]["list_cost_usd"] == pytest.approx(6.25)
 
 
@@ -180,22 +151,16 @@ def test_units_are_ordered_dearest_first(store, transcripts):
 
 
 def test_an_unregistered_project_is_refused_rather_than_reported_empty(registered):
-    """An empty report for a typo'd name would read as "this project cost nothing"."""
+    """An empty report for a typo'd name would read as "this project cost nothing\""""
     with pytest.raises(ops.OpsError, match="not registered"):
         ops.cost_report(project="no_such_project")
 
 
-# -- feature orders -------------------------------------------------------------------
+# -- feature orders
 
 
 def test_a_feature_order_rolls_up_its_planner_and_its_children(store, transcripts):
-    """The number a reader of `jarvis cost fo-…` wants is the whole feature's bill.
-
-    The planner is the point: it carries `parent_id` like any child but is excluded
-    from `feature_children`, so a rollup that used only the children would silently
-    drop the single most expensive session of an unfinished feature order — which is
-    exactly the shape fo-e353491c was in when this was written.
-    """
+    """The number a reader of `jarvis cost fo-…` wants is the whole feature's bill"""
     fo = store.create_feature_order("a feature", "do the thing")
     planner = store.create_work_order("Plan: a feature", "", kind="planner",
                                       parent_id=fo["id"])
@@ -214,7 +179,7 @@ def test_a_feature_order_rolls_up_its_planner_and_its_children(store, transcript
 
 
 def test_a_work_order_id_reports_only_that_work_order(store, transcripts):
-    """The single-unit path, and the control for the rollup above."""
+    """The single-unit path, and the control for the rollup above"""
     fo = store.create_feature_order("a feature", "do the thing")
     child = store.create_work_order("child one", "", parent_id=fo["id"])
     other = store.create_work_order("unrelated", "")
@@ -229,12 +194,12 @@ def test_a_work_order_id_reports_only_that_work_order(store, transcripts):
     assert report["totals"]["list_cost_usd"] == pytest.approx(6.25)
 
 
-# -- recorded turns: the exact accounting -----------------------------------------------
+# -- recorded turns: the exact accounting
 
 
 def recorded_usage(cost: float = 0.05, *, peak: int = 48_249,
                    window: int | None = 1_000_000, calls: int = 1) -> dict:
-    """The compact envelope `claude_cli.derive_turn_usage` stores in `usage_json`."""
+    """The compact envelope `claude_cli.derive_turn_usage` stores in `usage_json`"""
     return {"total_cost_usd": cost, "input": 2, "cache_write": 2558,
             "cache_read": 45689, "cache_1h": 2558, "cache_5m": 0, "output": 941,
             "api_calls": calls, "context_peak": peak, "context_window": window,
@@ -256,12 +221,7 @@ def add_turn(store, wo_id: str, usage: dict | None, state: str = "done",
 
 
 def test_a_single_work_order_breaks_down_turn_by_turn(store, transcripts):
-    """The point of recording: seeing WHERE in a bloated work order the cost rises.
-
-    Each turn carries its own cost, token classes (ephemeral split included) and
-    context peak against the model's window, and the aggregate is exactly the sum of
-    the turns — no estimation anywhere.
-    """
+    """The point of recording: seeing WHERE in a bloated work order the cost rises"""
     wo = store.create_work_order("bloating", "")
     add_turn(store, wo["id"], recorded_usage(0.05, peak=48_249))
     add_turn(store, wo["id"], recorded_usage(0.07, peak=90_000, calls=3))
@@ -286,8 +246,7 @@ def test_a_single_work_order_breaks_down_turn_by_turn(store, transcripts):
 
 
 def test_partially_recorded_turns_are_declared_never_silently_mixed(store, transcripts):
-    """Half a record must say it is half a record: one number quietly assembled from
-    two accounting systems would be trusted as if it were one."""
+    """Half a record must say it is half a record: one number quietly assembled from two accounting..."""
     wo = store.create_work_order("half recorded", "")
     add_turn(store, wo["id"], recorded_usage(0.05))
     add_turn(store, wo["id"], None)                 # settled, nothing recorded
@@ -304,9 +263,7 @@ def test_partially_recorded_turns_are_declared_never_silently_mixed(store, trans
 
 def test_a_work_order_with_no_turn_record_stays_on_the_transcript_estimate(
         store, transcripts):
-    """The old path is the fallback, and it is labelled as the estimate it is:
-    sessions that predate turn capture (or were never Jarvis-driven) have only
-    their transcript to speak for them."""
+    """The old path is the fallback, and it is labelled as the estimate it is: sessions that predate turn..."""
     wo = store.create_work_order("pre-capture", "")
     give_session(store, wo["id"], "sess-old")
     transcripts("sess-old", [assistant_row("m1", write=1_000_000)])
@@ -321,9 +278,7 @@ def test_a_work_order_with_no_turn_record_stays_on_the_transcript_estimate(
 
 def test_missing_usage_is_backfilled_from_the_outfile_on_read(store, transcripts,
                                                               tmp_path):
-    """History is recoverable without a migration: a turn reaped before this release
-    has no `usage_json`, but its outfile still holds the full envelope. The first
-    read parses it AND writes it back, so the record survives outfile pruning."""
+    """History is recoverable without a migration: a turn reaped before this release has no `usage_json`"""
     from test_turn_usage import result_json
 
     outfile = tmp_path / "old-turn.json"
@@ -345,7 +300,7 @@ def test_missing_usage_is_backfilled_from_the_outfile_on_read(store, transcripts
 
 
 def test_the_fleet_rollup_carries_the_recorded_cost(store, transcripts):
-    """The summary keeps working on transcripts, but the exact figure rides along."""
+    """The summary keeps working on transcripts, but the exact figure rides along"""
     wo = store.create_work_order("recorded one", "")
     add_turn(store, wo["id"], recorded_usage(0.25))
     other = store.create_work_order("transcript one", "")
@@ -361,12 +316,7 @@ def test_the_fleet_rollup_carries_the_recorded_cost(store, transcripts):
 
 
 def test_the_cli_prints_the_bill_turn_by_turn(store, transcripts, capsys):
-    """`jarvis cost <id>` is the bill, and the terminal gets the same one the page does.
-
-    Both views, both totals and the reconciliation, because a CLI that showed a subset
-    would be a second accounting of the same tokens — which is the thing this whole
-    surface exists to stop.
-    """
+    """`jarvis cost <id>` is the bill, and the terminal gets the same one the page does"""
     from jarvis import cli
 
     wo = store.create_work_order("printable", "")
@@ -381,21 +331,15 @@ def test_the_cli_prints_the_bill_turn_by_turn(store, transcripts, capsys):
     assert "dispatch" in out and "message" in out
     assert "adds up" in out                     # the reconciliation, stated
     assert "0.07" in out                        # the second turn's own cost
-    # The bloat signal survives the rewrite, outside the bill and labelled as not a
-    # charge: the same context is re-read on every call of a turn.
+    # The bloat signal survives the rewrite
     assert "9%" in out and "context peak" in out
-    # Every class of token, priced — the line items that make it a bill at all.
+    # Every class of token, priced — the line items that make it a bill at all
     assert "cache write" in out and "cache read" in out and "fresh input" in out
 
 
 def test_the_cli_shows_what_jarvis_spent_beside_what_the_worker_did(store, transcripts,
                                                                     capsys):
-    """A `jarvis` column and a `jarvis itself` total line, so the OS's own spend is not
-    silently folded into the worker's — or, worse, silently dropped.
-
-    Its own column rather than a footnote: on a short work order that asked Neo three
-    questions, the OS's half is most of the bill.
-    """
+    """A `jarvis` column and a `jarvis itself` total line"""
     from jarvis import agent_usage, cli
 
     wo = store.create_work_order("asked for help", "")
@@ -413,20 +357,14 @@ def test_the_cli_shows_what_jarvis_spent_beside_what_the_worker_did(store, trans
 
     out = capsys.readouterr().out
     assert "what Jarvis spent on this order" in out and "2 calls" in out
-    # Seat by seat, one line each: five seats on one gate review is the shape that
-    # explains a bill nobody can otherwise account for.
+    # Seat by seat, one line each: five seats on one gate review is the shape that explains a bill nobody...
     assert "premise" in out and "blast" in out
-    # And the worker's own half beside it, never folded together.
+    # And the worker's own half beside it, never folded together
     assert "the worker's own session" in out
 
 
 def test_the_cli_declares_a_mixed_record(store, transcripts, capsys):
-    """A turn whose result JSON is gone is a line on the bill, not a silent omission.
-
-    Its spend is the difference between the transcript and the turns that ARE recorded,
-    which is the only place it survives at all — and the page says both that the line is
-    an estimate and that the turn exists.
-    """
+    """A turn whose result JSON is gone is a line on the bill, not a silent omission"""
     from jarvis import cli
 
     wo = store.create_work_order("half", "")
@@ -443,11 +381,11 @@ def test_the_cli_declares_a_mixed_record(store, transcripts, capsys):
     assert "no longer have the result JSON" in out
 
 
-# -- the tax, end to end --------------------------------------------------------------
+# -- the tax, end to end
 
 
 def test_the_rewrite_tax_survives_into_the_rollup(store, transcripts):
-    """The report exists to surface this number, so it is asserted at the top level."""
+    """The report exists to surface this number, so it is asserted at the top level"""
     wo = store.create_work_order("resumed twice", "")
     give_session(store, wo["id"], "sess-resumed")
     transcripts("sess-resumed", [
@@ -463,11 +401,11 @@ def test_the_rewrite_tax_survives_into_the_rollup(store, transcripts):
     assert report["totals"]["rewrite_cost_usd"] == pytest.approx(11.5)
 
 
-# -- the rate the cache write was actually paid at -------------------------------------
+# -- the rate the cache write was actually paid at
 
 
 def _os_call(wo_id: str, **split) -> None:
-    """One recorded OS-side call (Neo answering), with a chosen TTL split."""
+    """One recorded OS-side call (Neo answering), with a chosen TTL split"""
     from jarvis import agent_usage
 
     agent_usage.record("neo_answer", project="proj_a", wo_id=wo_id, label="question",
@@ -478,11 +416,7 @@ def _os_call(wo_id: str, **split) -> None:
 
 
 def test_the_os_half_is_priced_at_the_ttl_it_actually_bought(store):
-    """Jarvis's own calls used to be priced at the 5-minute FLOOR whatever they bought.
-
-    100k Opus write tokens at $5/M input: $0.625 at the floor, $1.00 at the rate paid.
-    Spec: 2026-08-22-the-five-minute-write-everywhere.md.
-    """
+    """Jarvis's own calls used to be priced at the 5-minute FLOOR whatever they bought"""
     wo = store.create_work_order("an order Neo answered", "")
     _os_call(wo["id"], cache_1h=100_000, cache_5m=0)
 
@@ -492,7 +426,7 @@ def test_the_os_half_is_priced_at_the_ttl_it_actually_bought(store):
 
 
 def test_a_call_with_no_split_recorded_still_prices_at_the_floor(store):
-    """An ABSENT split is not evidence of a one-hour write: pre-split rows must not move."""
+    """An ABSENT split is not evidence of a one-hour write: pre-split rows must not move"""
     wo = store.create_work_order("an order from before the split existed", "")
     _os_call(wo["id"])
 
@@ -501,14 +435,11 @@ def test_a_call_with_no_split_recorded_still_prices_at_the_floor(store):
     assert unit["os_cost_usd"] == pytest.approx(0.625, abs=0.01)
 
 
-# -- how big the OS's own inputs were --------------------------------------------------
+# -- how big the OS's own inputs were
 
 
 def test_the_largest_input_by_kind_appears_in_the_jarvis_half(store):
-    """Spec §3, docs/superpowers/specs/2026-09-26-bounded-model-inputs.md: `jarvis cost`
-    gains the largest input by kind. MAX and not a sum, and prompt + system prompt,
-    because what was sent to the model is both.
-    """
+    """Spec §3, docs/superpowers/specs/2026-09-26-bounded-model-inputs.md: `jarvis cost` gains the largest..."""
     from jarvis import agent_usage
 
     wo = store.create_work_order("an order with two OS calls", "")
@@ -530,13 +461,7 @@ def test_the_largest_input_by_kind_appears_in_the_jarvis_half(store):
 
 
 def test_the_largest_input_is_a_total_one_call_really_sent(store):
-    """The reported figure belongs to ONE call: two maxima added describe no call.
-
-    Spec §3, docs/superpowers/specs/2026-09-26-bounded-model-inputs.md. Two panel seats
-    in the same SQL group (same work order, kind, label and model) with mirrored sizes:
-    150,000 + 2,000 and 3,000 + 40,000. The answer is 152,000; 190,000 would be the
-    biggest prompt of one call plus the biggest system prompt of another.
-    """
+    """The reported figure belongs to ONE call: two maxima added describe no call (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)"""
     from jarvis import agent_usage
 
     wo = store.create_work_order("an order with two panel seats", "")
@@ -558,7 +483,7 @@ def test_the_largest_input_is_a_total_one_call_really_sent(store):
 
 
 def test_a_call_that_recorded_no_size_reports_zero_not_a_guess(store):
-    """Pre-measurement rows read 0, which means NOT MEASURED — never an empty prompt."""
+    """Pre-measurement rows read 0, which means NOT MEASURED — never an empty prompt"""
     wo = store.create_work_order("an order from before the sizes existed", "")
     _os_call(wo["id"])
 
@@ -569,8 +494,7 @@ def test_a_call_that_recorded_no_size_reports_zero_not_a_guess(store):
 
 
 def test_the_cli_prints_the_largest_input_in_full(store, capsys):
-    """A plain character count with thousands separators, never abbreviated: this number
-    is quoted into bug reports and `152k` loses the fact."""
+    """A plain character count with thousands separators"""
     from jarvis import cli
 
     wo = store.create_work_order("an order Neo answered at length", "")
@@ -583,10 +507,7 @@ def test_the_cli_prints_the_largest_input_in_full(store, capsys):
 
 
 def test_the_rollup_reports_the_write_split_across_both_halves(store, transcripts):
-    """The footer's one job: "is anything still buying the one-hour write?".
-
-    Worker and OS spend sum into ONE line deliberately — see `ops._write_ttl`.
-    """
+    """The footer's one job: "is anything still buying the one-hour write?\""""
     wo = store.create_work_order("a worker that also asked Neo", "")
     give_session(store, wo["id"], "sess-both")
     transcripts("sess-both", [assistant_row("m1", write=40_000)])
@@ -599,15 +520,11 @@ def test_the_rollup_reports_the_write_split_across_both_halves(store, transcript
                             totals["cache_5m"]) == pytest.approx(2.0)
 
 
-# -- improvement orders ----------------------------------------------------------------
-#
-# §6.3 of docs/superpowers/specs/2026-09-23-improvement-orders.md: the cost surface took
-# no code to reach a new kind, so it takes tests to prove it did — a kind whose bill
-# silently reads zero is the one failure nothing else here would catch.
+# -- improvement orders
 
 
 def analyst_of(store, io: dict, *, session: str = "sess-analyst") -> dict:
-    """The improvement order's analyst: its planner-shaped child — §3.1."""
+    """The improvement order's analyst: its planner-shaped child — §3.1"""
     analyst = store.create_work_order(f"Analyse: {io['title']}"[:200], "the observation",
                                       kind="analyst", parent_id=io["id"])
     store.update_feature_order(io["id"], plan_wo_id=analyst["id"])
@@ -617,12 +534,7 @@ def analyst_of(store, io: dict, *, session: str = "sess-analyst") -> dict:
 
 
 def seal_pass(tmp_path, store) -> None:
-    """The daemon's seal tick, against the catalog `registered` wrote.
-
-    A real `ProjectSpec`: `seal_bills` swallows a failed seal and writes an error
-    payload in its place, so a hand-rolled stand-in would make an unsealed bill look
-    sealed.
-    """
+    """The daemon's seal tick, against the catalog `registered` wrote"""
     from jarvis.catalog import load_catalog
     from jarvis.daemon import Daemon
 
@@ -632,11 +544,7 @@ def seal_pass(tmp_path, store) -> None:
 
 def test_an_improvement_orders_bill_is_its_analyst_plus_its_own_calls(
         store, transcripts, improvement_order):
-    """The family is the order plus its analyst — §2.6, and both halves have to land.
-
-    The analyst's session is the WORKER half and must be non-zero: an improvement order
-    whose bill reads zero would say the fleet analysed itself for free.
-    """
+    """The family is the order plus its analyst — §2.6, and both halves have to land"""
     io = improvement_order
     analyst = analyst_of(store, io)
     transcripts("sess-analyst", [assistant_row("m1", write=1_000_000, out=5_000)])
@@ -648,7 +556,7 @@ def test_an_improvement_orders_bill_is_its_analyst_plus_its_own_calls(
     assert [o["id"] for o in b["orders"]] == [analyst["id"]]
     worker = next(line for line in b["actors"] if line["key"] == "worker")
     assert worker["tokens"]["total"] == 1_005_000
-    # ...and the order's own calls beside it, never folded into the analyst's session.
+    # ...and the order's own calls beside it, never folded into the analyst's session
     jarvis_half = next(line for line in b["actors"] if line["key"] == "jarvis")
     assert jarvis_half["tokens"]["total"] == 100_010
     assert b["total"]["tokens"]["total"] == 1_105_010
@@ -657,15 +565,13 @@ def test_an_improvement_orders_bill_is_its_analyst_plus_its_own_calls(
 
 def test_a_completed_improvement_orders_bill_is_sealed_and_read_back(
         store, transcripts, improvement_order, tmp_path, monkeypatch):
-    """Settling it freezes the figure — §6.3. The evidence expires and the order does
-    not: an improvement order costed live for ever gets cheaper the longer it is left.
-    """
+    """Settling it freezes the figure — §6.3"""
     from jarvis.testing import a_report
 
     io = improvement_order
     analyst = analyst_of(store, io, session="sess-sealed")
     transcripts("sess-sealed", [assistant_row("m1", write=800_000, out=4_000)])
-    # Settled first: §4.1's `finish` step is the analyst's, not this test's.
+    # Settled first: §4.1's `finish` step is the analyst's, not this test's
     store.set_status(analyst["id"], "completed")
     ops.submit_findings(io["id"], a_report())
     ops.review_findings(io["id"], reject={
@@ -686,14 +592,13 @@ def test_a_completed_improvement_orders_bill_is_sealed_and_read_back(
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(tmp_path / "gone"))
     assert ops.bill(io["id"])["total"]["tokens"]["total"] == 804_000
     assert ops.bill(io["id"])["accuracy"]["sealed_at"]
-    # ...and the proof the seal is doing the work: recomputing now finds nothing.
+    # ...and the proof the seal is doing the work: recomputing now finds nothing
     assert ops.bill(io["id"], live=True)["total"]["tokens"]["total"] == 0
 
 
 def test_the_cli_reads_an_io_id_as_an_id_and_not_as_a_project_name(
         store, transcripts, improvement_order, capsys):
-    """`jarvis cost io-…` resolves through `is_feature_order_id` — §2.5. Without it the
-    id falls through to the fleet report and comes back "project not registered"."""
+    """`jarvis cost io-…` resolves through `is_feature_order_id` — §2.5"""
     from jarvis import cli
 
     io = improvement_order
@@ -710,8 +615,7 @@ def test_the_cli_reads_an_io_id_as_an_id_and_not_as_a_project_name(
 
 def test_the_cli_names_the_parents_own_calls_beside_the_orders_under_it(
         store, transcripts, improvement_order, capsys):
-    """"the orders under it" must add up to the headline, and the parent's own calls
-    belong to no child — unlabelled, the list visibly sums to less than the total."""
+    """"the orders under it" must add up to the headline, and the parent's own calls belong to no child"""
     from jarvis import bill as bill_mod
     from jarvis import cli
 
@@ -729,7 +633,7 @@ def test_the_cli_names_the_parents_own_calls_beside_the_orders_under_it(
 
 def test_the_cli_prints_no_own_line_when_the_parent_spent_nothing_of_its_own(
         store, transcripts, improvement_order, capsys):
-    """A feature that spent nothing of its own must not grow an empty line."""
+    """A feature that spent nothing of its own must not grow an empty line"""
     from jarvis import bill as bill_mod
     from jarvis import cli
 
@@ -744,11 +648,7 @@ def test_the_cli_prints_no_own_line_when_the_parent_spent_nothing_of_its_own(
     assert bill_mod.OWN_LABEL not in out
 
 
-# -- the window: the report FILTERS with it and never computes one ----------------------
-#
-# §5 of docs/superpowers/specs/2026-10-07-cost-window-selector.md. The boundary
-# arithmetic is `fleetcost.resolve_window`'s; everything here is about which population
-# the existing keys speak for once one is given.
+# -- the window: the report FILTERS with it and never computes one
 
 SINCE = 1_790_654_400.0        # Mon 2026-09-29 04:00 UTC — the acceptance week's reset
 UNTIL = SINCE + 7 * 86_400
@@ -756,7 +656,7 @@ INSIDE = SINCE + 32 * 3_600
 
 
 def turn_at(store, wo_id: str, at: float, *, cost: float = 1.0) -> None:
-    """A settled turn at a CHOSEN time — `create_turn` stamps `db.now()`."""
+    """A settled turn at a CHOSEN time — `create_turn` stamps `db.now()`"""
     store.conn.execute(
         """INSERT INTO wo_turns (wo_id, seq, kind, prompt, state, started_at, ended_at,
                                  cost_usd, cost_source)
@@ -783,7 +683,7 @@ def os_call_at(wo_id: str, at: float, *, cost: float = 0.25,
 
 
 def test_window_filters_orders_before_the_limit(store, transcripts):
-    """APPLIED IN SQL: filtering after `LIMIT 50` reports an empty last week."""
+    """APPLIED IN SQL: filtering after `LIMIT 50` reports an empty last week"""
     old = store.create_work_order("ran inside the window", "")
     store.conn.execute("UPDATE work_orders SET created_at=? WHERE id=?",
                        (SINCE - 86_400, old["id"]))
@@ -797,7 +697,7 @@ def test_window_filters_orders_before_the_limit(store, transcripts):
 
     assert [u["id"] for u in res["units"]] == [old["id"]]
     assert res["window"] == window
-    # The trap this guards: without the window the order is past the limit entirely.
+    # The trap this guards: without the window the order is past the limit entirely
     plain = ops.cost_report(project="proj_a", limit=50)
     assert old["id"] not in [u["id"] for u in plain["units"]]
     assert plain["window"] is None
@@ -814,7 +714,7 @@ def test_window_filters_os_calls_and_transcripts(store, transcripts):
     ])
     os_call_at(inside["id"], INSIDE)
     os_call_at(inside["id"], UNTIL + 10)
-    # No turn in the window at all — only Neo answering between turns (§5a).
+    # No turn in the window at all — only Neo answering between turns (§5a)
     asked = store.create_work_order("Neo answered it mid-window", "")
     turn_at(store, asked["id"], UNTIL + 7_200)
     os_call_at(asked["id"], INSIDE)
@@ -830,7 +730,7 @@ def test_window_filters_os_calls_and_transcripts(store, transcripts):
 
 
 def test_undated_transcript_message_is_excluded_and_counted(store, transcripts):
-    """A message that cannot be PLACED is excluded and disclosed, never counted in."""
+    """A message that cannot be PLACED is excluded and disclosed, never counted in"""
     wo = store.create_work_order("a transcript with unreadable stamps", "")
     give_session(store, wo["id"], "sess-undated")
     turn_at(store, wo["id"], INSIDE)
@@ -846,7 +746,7 @@ def test_undated_transcript_message_is_excluded_and_counted(store, transcripts):
     assert unit["undated_messages"] == 2
     assert unit["cache_write"] == 100_000, "their tokens are in no total"
     assert windowed["totals"]["undated_messages"] == 2
-    # Nothing is excluded without a window, so there is nothing to disclose.
+    # Nothing is excluded without a window, so there is nothing to disclose
     plain = next(u for u in ops.cost_report(project="proj_a")["units"]
                  if u["id"] == wo["id"])
     assert plain["undated_messages"] == 0
@@ -854,7 +754,7 @@ def test_undated_transcript_message_is_excluded_and_counted(store, transcripts):
 
 
 def test_the_cli_prints_the_undated_message_count(store, monkeypatch, capsys):
-    """The sentence rides on the payload, so every surface says it the same way."""
+    """The sentence rides on the payload, so every surface says it the same way"""
     from jarvis import cli
 
     payload = ops.cost_report(project="proj_a")
@@ -874,7 +774,7 @@ def test_the_cli_prints_the_undated_message_count(store, monkeypatch, capsys):
 
 @pytest.fixture()
 def proj_b(registered, tmp_path, claude_json):
-    """A SECOND registered project — `_os_groups` is read fleet-wide, one store at a time."""
+    """A SECOND registered project — `_os_groups` is read fleet-wide, one store at a time"""
     from jarvis.central_store import CentralStore
     from jarvis.testing import make_git_project
 
@@ -890,11 +790,7 @@ def proj_b(registered, tmp_path, claude_json):
 
 
 def test_a_windowed_fleet_report_spans_two_projects(store, proj_b, transcripts):
-    """`_os_groups` is FLEET-WIDE and `get_work_order` RAISES on a foreign id.
-
-    So the by-id pass of §5a must never look proj_b's order up in proj_a's database:
-    unguarded, a fleet-wide `/cost` 500s as soon as two projects have in-window calls.
-    """
+    """`_os_groups` is FLEET-WIDE and `get_work_order` RAISES on a foreign id"""
     a = store.create_work_order("Neo answered proj_a mid-window", "")
     turn_at(store, a["id"], UNTIL + 7_200)
     os_call_at(a["id"], INSIDE)
@@ -916,7 +812,7 @@ def test_a_windowed_fleet_report_spans_two_projects(store, proj_b, transcripts):
 
 
 def test_a_targets_bill_ignores_the_window(store, transcripts):
-    """One order's bill is the WHOLE order: a truncated bill stops reconciling."""
+    """One order's bill is the WHOLE order: a truncated bill stops reconciling"""
     wo = store.create_work_order("a long-running order", "")
     give_session(store, wo["id"], "sess-target")
     turn_at(store, wo["id"], INSIDE)

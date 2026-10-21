@@ -1,16 +1,4 @@
-"""Screenshot a FORCED validation round on the work-order page, for a PR's UI evidence.
-
-`scripts/screenshot_automerge.py` is the shape this copies. Two rounds on one work order,
-because the pair is the whole claim: round 1 judged before `head_sha` shipped, carrying no
-commit and therefore unable to auto-merge, and round 2 opened by hand — marked `forced`,
-carrying the reason, and carrying the commit that unblocks the merge. A shot of the forced
-round alone would not show what it is different FROM.
-
-Writes PNGs to docs/screenshots/. Everything it touches lives in a temp `JARVIS_HOME` and
-a temp catalog, so it never reads or writes the live OS:
-
-    uv run python scripts/screenshot_forced_round.py
-"""
+"""Screenshot a FORCED validation round on the work-order page, for a PR's UI evidence"""
 
 from __future__ import annotations
 
@@ -32,7 +20,7 @@ REASON = "round 1 was judged before jarvis-0.10.0 and recorded no commit"
 
 
 def _repo(path: Path) -> None:
-    """An empty checkout, the shape `testing.make_git_project` builds for the suite."""
+    """An empty checkout, the shape `testing.make_git_project` builds for the suite"""
     import subprocess
 
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
@@ -40,19 +28,7 @@ def _repo(path: Path) -> None:
 
 
 def order(store) -> str:
-    """One work order parked behind a pull request, with the pair of rounds.
-
-    **ROUND 2 IS OPENED BY `ops.force_validation` ITSELF**, not written here. The shot is
-    evidence of the path the operator actually takes — the `forced_reason` on the round
-    and the `validation_forced` event are whatever that function really produces, so a
-    change that stopped writing either shows up in the picture instead of being papered
-    over by hand-inserted rows. Only the panel's VERDICT is faked, because a real one
-    would need five model calls.
-
-    Round 1 is settled the way the pre-0.10.0 daemon settled every round: a verdict, and
-    NO commit beside it. That is the state the whole feature exists to get out of, so
-    seeding it with a commit would make the shot a picture of something else.
-    """
+    """One work order parked behind a pull request, with the pair of rounds"""
     from jarvis import ops
 
     wo = ops.create_work_order(
@@ -66,16 +42,14 @@ def order(store) -> str:
     store.record_validation_opinion(first["id"], "tester", verdict="pass",
                                     reply="The recogniser's boundary is pinned.",
                                     model="claude-opus-5", latency_ms=19200)
-    # `force_validation` only accepts FORCEABLE_STATUSES, so the work order has to be
-    # parked exactly as the real one is before the command will touch it.
+    # `force_validation` only accepts FORCEABLE_STATUSES
     store.set_status(wo["id"], "waiting_pr_merge")
 
     ops.force_validation(wo["id"], reason=REASON, project_name="jarvis_os")
 
     forced = store.latest_validation_round(wo_id=wo["id"])
     assert forced is not None and forced["forced_reason"] == REASON
-    # The panel's half, faked: `Daemon._validate_work_order` would record the head from
-    # the evidence packet and close the round, and neither needs a model to be a picture.
+    # The panel's half, faked: `Daemon._validate_work_order` would record the head from the evidence...
     store.set_validation_head(forced["id"], JUDGED)
     store.close_validation_round(forced["id"], "passed", "")
     store.record_validation_opinion(forced["id"], "tester", verdict="pass",
@@ -137,9 +111,7 @@ def shoot(wo_id: str) -> None:
         page.locator("h2", has_text="Validation").first.scroll_into_view_if_needed()
         page.wait_for_timeout(200)
         page.screenshot(path=SHOTS / "forced-round.png")
-        # The TIMELINE is the other rendered surface this touches, and the one the whole
-        # command is about: it is where a forced re-judgement would otherwise read like a
-        # worker re-delivering. Behind a tab, so it has to be clicked.
+        # The TIMELINE is the other rendered surface this touches
         page.get_by_role("tab", name="Timeline").click()
         page.wait_for_timeout(200)
         page.locator("#tab-timeline").scroll_into_view_if_needed()

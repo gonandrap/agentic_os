@@ -1,58 +1,4 @@
-"""A dollar ceiling on one order, enforced by the CLI on every call it makes.
-
-Design: docs/superpowers/specs/2026-09-18-a-budget-per-order.md.
-
-WHAT `claude --max-budget-usd` ACTUALLY DOES. None of this is documented by the CLI, so
-it was measured on 2026-09-18 against the real API and every number below is from those
-runs. The whole design rests on it:
-
-* **The cap is PER INVOCATION, not per session.** A session that had already spent
-  $0.0327 across its first turn resumed under `--max-budget-usd 0.01` and ran to
-  completion, spending another $0.0072. Prior spend on the same session id does not
-  count against the flag. THIS IS THE WHOLE REASON THIS MODULE EXISTS: the running
-  total is Jarvis's to keep, and each turn is handed `budget - spent so far`.
-  * The same measurement also concluded that `total_cost_usd` on the resumed envelope
-    reports that invocation's spend alone. THAT HALF IS FALSE, on every multi-turn
-    order since CLI 2.1.277: it is the RESUMED SESSION'S RUNNING BILL, as is
-    `modelUsage` (issue #470). The cap and the accounting simply do not agree about
-    which dollars they mean, and `_spend` summing the column as it was read made a $50
-    ceiling cut wo-966987af at a real $29.87 — the error growing with every turn.
-    `claude_cli.derive_turn_usage` now records the DELTA, so `wo_turns.cost_usd` is
-    this turn's spend and the sum below is the order's, once.
-* **It is checked BETWEEN API calls, so it overshoots.** A run capped at $0.001 spent
-  $0.0471 — 47x — because the first call was already past the line when the check ran.
-  The flag is a stop signal, not a hard limit; the bound is "one API call of overshoot",
-  and a turn's first call against a 400k context is not cheap. `Ceiling.remaining` is
-  therefore never presented as a guarantee, and `Exhaustion.spent_usd` reports what was
-  actually spent rather than the cap.
-* **On exhaustion the process exits 1 AND STILL WRITES A USABLE RESULT JSON.** It
-  carries `type: "result"`, `is_error: true`, `subtype: "error_max_budget_usd"`,
-  `terminal_reason: "budget_exhausted"` and `errors: ["Reached maximum budget ($X)"]`.
-  What it does NOT carry is the `result` field, so `claude_cli.read_turn_result` sees an
-  errored turn with no message — which is why `read_turn_result` falls back to the
-  envelope's `errors` list, so the record says "Reached maximum budget ($5.00)" rather
-  than "turn reported is_error".
-  `total_cost_usd` and `modelUsage` are accurate for the invocation, so the accounting
-  survives the cut and the last turn is billed like any other.
-* **Partial work is preserved and the session is resumable.** The transcript is written
-  in full, tool calls already made have already taken effect, and resuming the exhausted
-  session under a larger cap continues the same conversation with its context intact.
-  That is what makes `ops.set_work_order_budget`'s top-up-and-resume possible rather
-  than merely designable.
-* Subagents count against the same cap: the envelope's `subagent_stats.refused.budget`
-  records the ones the CLI declined to spawn for it.
-
-WHICH DOLLARS THE CEILING GOVERNS: the order's WHOLE BILL, exactly as `jarvis cost <id>`
-reports it — the worker's own turns PLUS what Jarvis spent on that order (Neo answers,
-panel seats, supervisor reviews, digests). Not the worker session alone. The user's
-number has to be the number they can check, and on the four orders that motivated this
-the two readings differ by ~13%. Ruled by the user through Neo on question 404.
-
-The consequence is accepted rather than worked around: the worker's per-turn ceiling
-shrinks as the panel spends, and a panel round can carry an order past its cap with no
-worker turn running at all. So `exhaustion` answers from the ACCOUNTING, and the turn's
-own exit code is only corroboration — see its docstring.
-"""
+"""A dollar ceiling on one order, enforced by the CLI on every call it makes (docs/superpowers/specs/2026-09-18-a-budget-per-order.md)"""
 
 from __future__ import annotations
 
@@ -76,45 +22,18 @@ if TYPE_CHECKING:  # pragma: no cover
     from .central_store import CentralStore
 
 
-#: The work-order status an order lands in when its budget is gone. A status of its own
-#: rather than a reuse, because `failed` says the work went wrong and `needs_review` says
-#: a judgement is wanted, and neither is true of an order that was doing fine and ran out
-#: of money. Declared in `project_store.WO_STATUSES`; named here because every reader in
-#: this module wants it and none of them should re-type the string.
+#: The work-order status an order lands in when its budget is gone
 EXHAUSTED = "budget_exhausted"
 
-#: ...and the feature-order one. Same word, different tuple (`FO_STATUSES`): a feature
-#: order runs no session of its own, so it shares the vocabulary and not the lifecycle.
+#: ...and the feature-order one
 FO_EXHAUSTED = "budget_exhausted"
 
-#: Reading the CLI's own refusal off a result envelope is `claude_cli`'s job, not this
-#: module's — see `claude_cli.stopped_for_budget` and the constants beside it.
+#: Reading the CLI's own refusal off a result envelope is `claude_cli`'s job, not this module's
 
 
 @dataclass(frozen=True)
 class Spend:
-    """What one order has cost so far, split into the two halves `jarvis cost` shows.
-
-    Both come from SQL sums over numbers the CLI itself reported — `wo_turns.cost_usd`
-    is `total_cost_usd` off each turn's result envelope, `agent_calls.cost_usd` is the
-    same field off each OS call. Deliberately NOT `bill.for_work_order`, which walks
-    Claude Code's whole transcript tree: this is asked on every dispatch and on every
-    reconcile tick of every order, and it has to be two indexed queries.
-
-    WHAT THIS DOES NOT SEE, AND WHY THAT IS STILL THE RIGHT ANSWER HERE. A turn writes
-    its envelope when it ends, so a turn in flight is not in these sums at all — and a
-    turn has no time bound, so the gap is not "one turn" in any useful sense. It was
-    documented as a safe lag and it is not one: the user reading `Budget: $0.00 of
-    $30.00` beside a bill chip saying `~$3.25` was reading this query (issue #471).
-
-    The enforcement stays on it anyway, and deliberately (Neo, question 469). The real
-    ceiling is applied at LAUNCH — a turn is spawned with `--max-budget-usd = cap -
-    spent` and the CLI stops it there — so nothing is gained by re-deriving the figure
-    mid-turn, while a great deal is lost: this is asked on every reconcile tick of every
-    order, and `Daemon.settle_work_order` asks it of a RUNNING one, so a live figure here
-    would park an order and kill its worker mid-task on the strength of a list-price
-    estimate. The estimate is display-only, and `in_flight` is where it lives.
-    """
+    """What one order has cost so far, split into the two halves `jarvis cost` shows (#471)"""
 
     worker_usd: float = 0.0
     jarvis_usd: float = 0.0
@@ -129,15 +48,10 @@ class Spend:
 
 
 def spent(store: ProjectStore, central: CentralStore | None, wo_id: str) -> Spend:
-    """One work order's whole bill to date. Two queries, no transcript walk."""
+    """One work order's whole bill to date"""
     row = _worker_row(store, wo_id)
     if row["stale"]:
-        # A turn counted under an older reading of the result envelope is re-derived
-        # before it is summed, ONCE, and written back (`ops._turn_usage`) — the same
-        # lazy repair `jarvis cost` runs, done here because this is the number that
-        # STOPS work: version-2 rows hold the resumed session's running total, so an
-        # order would exhaust a budget it had spent a third of. Costs one JSON read per
-        # stale turn and nothing at all afterwards.
+        # A turn counted under an older reading of the result envelope is re-derived before it is summed
         from . import ops
 
         ops._turn_rows(store, wo_id)
@@ -150,12 +64,8 @@ def spent(store: ProjectStore, central: CentralStore | None, wo_id: str) -> Spen
 
 
 def _worker_row(store: ProjectStore, wo_id: str) -> Any:
-    """The worker half of one order's spend, and how many of its turns were counted
-    under a superseded reading of the result envelope — in one query, because the
-    common case is zero and must stay a single indexed scan."""
-    # The compaction is charged on the Jarvis half, so it is filtered out of the SUM and
-    # NOT out of the `WHERE`: the staleness aggregate must keep seeing every row
-    # (docs/superpowers/specs/2026-10-08-count-a-compaction-once.md §2).
+    """The worker half of one order's spend"""
+    # The compaction is charged on the Jarvis half (docs/superpowers/specs/2026-10-08-count-a-compaction-once.md §2)
     return store.conn.execute(
         "SELECT COALESCE(SUM(CASE WHEN kind <> ? THEN cost_usd ELSE 0 END), 0) AS c, "
         "       COALESCE(SUM(CASE WHEN COALESCE("
@@ -168,17 +78,7 @@ def _worker_row(store: ProjectStore, wo_id: str) -> Any:
 
 
 def in_flight(store: ProjectStore, wo_id: str) -> float:
-    """What the turn running RIGHT NOW has spent so far — an estimate, for display only.
-
-    NEVER FOR THE ENFORCEMENT (`spent` says why, and Neo ruled it on question 469). This
-    walks Claude Code's transcript, it is priced at list prices, and it is a floor: the
-    lead agent's calls only (`usage.cost_between`). It exists so the budget line agrees
-    with the bill chip beside it instead of reporting $0.00 at an order that has been
-    burning money for an hour.
-
-    0.0 when no turn is in flight, when the order has no session, or when the transcript
-    cannot be read — every one of which means "nothing to add to the recorded total".
-    """
+    """What the turn running RIGHT NOW has spent so far — an estimate, for display only"""
     from . import usage
 
     turn = store.latest_turn(wo_id)
@@ -198,18 +98,13 @@ def in_flight(store: ProjectStore, wo_id: str) -> float:
 
 
 def feature_in_flight(store: ProjectStore, fo: dict[str, Any]) -> float:
-    """The same for a feature order's whole family — its planner and every child."""
+    """The same for a feature order's whole family — its planner and every child"""
     return sum(in_flight(store, child["id"]) for child in family(store, fo))
 
 
 def feature_spent(store: ProjectStore, central: CentralStore | None,
                   fo: dict[str, Any]) -> Spend:
-    """A feature order's ROLLUP: its planner, its manager and every child.
-
-    The same set `bill.for_feature_order` rolls up, so the two answer the same question
-    about the same dollars — which is the point of a family budget the user checks with
-    `jarvis cost <fo-id>`.
-    """
+    """A feature order's ROLLUP: its planner, its manager and every child"""
     total = Spend()
     for child in family(store, fo):
         total = total + spent(store, central, child["id"])
@@ -217,15 +112,7 @@ def feature_spent(store: ProjectStore, central: CentralStore | None,
 
 
 def family(store: ProjectStore, fo: dict[str, Any]) -> list[dict[str, Any]]:
-    """Every work order whose spend the feature is answerable for.
-
-    THE FAMILY THE FAMILY BUDGET IS BOUNDED OVER, and public so that what the OS REPORTS
-    is read off the same set the allocator ENFORCES over (Neo question 1198). It is
-    deliberately NOT `ProjectStore.feature_children`, which is the `kind='worker'`
-    children only: an improvement order's analyst and an investigation's investigator are
-    `kind='analyst'`/`'investigator'` and reach their parent as its `plan_wo_id`, so for
-    those two kinds the two sets do not intersect at all.
-    """
+    """Every work order whose spend the feature is answerable for"""
     orders: list[dict[str, Any]] = []
     planner_id = fo.get("plan_wo_id")
     if planner_id:
@@ -238,77 +125,38 @@ def family(store: ProjectStore, fo: dict[str, Any]) -> list[dict[str, Any]]:
     return orders
 
 
-# -- the family budget ----------------------------------------------------------------
-#
-# RESERVE ON DISPATCH (option A, ruled by the user through Neo on question 404). A child
-# claims a slice of its feature's unreserved remainder at the moment it is dispatched,
-# that slice becomes the child's own ceiling, and the unspent part of it returns to the
-# pool when the child settles. The alternative — re-reading the feature's remainder on
-# every turn — is always TRUE but hands two children dispatched in parallel the same
-# dollars, and the family then overshoots by up to (N-1) turns.
-#
-# THE INVARIANT, which `Pool` exists to keep and `test_budget.py` pins:
-#
-#     the allocator never PROMISES more than `unreserved`, which is floored at zero
-#
-# It holds because a reservation is only ever cut from `unreserved`, which already has
-# every outstanding reservation subtracted from it. Release needs no write at all: a
-# settled child drops out of `held`, and its real spend is already inside `total`.
-#
-# NOT the stronger-sounding `spent + everything live children may still spend <= budget`,
-# which cannot hold and whose failure has nothing to do with allocation: the flag is
-# checked between API calls and overshoots (see the probe at the top of this file), so a
-# child that ran 51c past its slice has already put the family 51c over before anything
-# here is asked. State the property the allocator owns, not the one it would be nice to
-# have — a comment claiming the stronger one sends the next reader hunting a bug in the
-# arithmetic that is really in the CLI.
+# -- the family budget
 
 
 @dataclass(frozen=True)
 class Pool:
-    """A feature order's budget, decomposed the way the user has to see it to act.
-
-    `unreserved` is the one Neo made a condition of option A: when a child exhausts its
-    slice, the escalation states this number, so the user tops the child up rather than
-    guessing why a funded feature stalled.
-    """
+    """A feature order's budget, decomposed the way the user has to see it to act"""
 
     budget_usd: float
     spent_usd: float
-    #: The unspent part of every live child's reservation — money already promised.
+    #: The unspent part of every live child's reservation — money already promised
     held_usd: float
-    #: Children not yet settled and not yet holding a reservation.
+    #: Children not yet settled and not yet holding a reservation
     unclaimed: int
 
     @property
     def pool_usd(self) -> float:
-        """What is left of the money, before anyone's claim on it."""
+        """What is left of the money, before anyone's claim on it"""
         return max(0.0, self.budget_usd - self.spent_usd)
 
     @property
     def unreserved_usd(self) -> float:
-        """...and what is left after the claims. What a new child may be cut from."""
+        """...and what is left after the claims"""
         return max(0.0, self.pool_usd - self.held_usd)
 
     def slice_for_one_more(self) -> float:
-        """An equal share of the unreserved remainder, this claimant included.
-
-        Equal rather than proportional to anything: nothing at dispatch time knows what
-        a child will need, so the only defensible split is the one that makes no claim
-        to. It self-corrects — a child that settles cheaply releases the rest of its
-        slice, and the next child's share is cut from a larger pool.
-        """
+        """An equal share of the unreserved remainder, this claimant included"""
         return self.unreserved_usd / max(1, self.unclaimed)
 
 
 def pool(store: ProjectStore, central: CentralStore | None, fo: dict[str, Any],
          claimant: str | None = None) -> Pool | None:
-    """A feature order's budget as it stands right now, or None if it has no budget.
-
-    `claimant` is the child about to reserve, counted among `unclaimed` so it gets a
-    share — and excluded from `held` so a re-dispatch re-cuts its slice rather than
-    reserving a second one on top of the first.
-    """
+    """A feature order's budget as it stands right now, or None if it has no budget"""
     budget = fo.get("budget_usd")
     if not budget:
         return None
@@ -322,7 +170,7 @@ def pool(store: ProjectStore, central: CentralStore | None, fo: dict[str, Any],
             unclaimed += 1
             continue
         if child["status"] in TERMINAL_STATUSES:
-            # Settled: its reservation is released. Its real spend stays in `total`.
+            # Settled: its reservation is released
             continue
         reserved = child.get("budget_reserved_usd")
         if reserved:
@@ -335,27 +183,7 @@ def pool(store: ProjectStore, central: CentralStore | None, fo: dict[str, Any],
 
 def reserve(store: ProjectStore, central: CentralStore | None,
             wo: dict[str, Any]) -> float | None:
-    """Cut this child's slice out of its feature's budget, at dispatch or afterwards.
-
-    Returns the new reservation, or None when there is nothing to cut from — no parent,
-    or a parent with no budget, in which case the child is bounded by its own budget
-    alone. Idempotent by way of `pool(claimant=…)`: reserving twice re-cuts one share
-    rather than stacking two.
-
-    RE-CUTTING IS THE WAY BACK for a child that stopped on its slice. A reservation is
-    the child's ceiling, and `ceiling` takes the tighter of it and the child's own
-    budget, so without a re-cut a slice-exhausted child could never be raised out of
-    `budget_exhausted` by any number the user typed on it — the stale slice would go on
-    winning the `min`. `ops.set_work_order_budget` calls this before it decides, so
-    topping up the child spends the family's CURRENT unreserved remainder on it.
-
-    The reservation written is `already spent + the new share`, not the share alone,
-    because it is a LIFETIME cap and `ceiling` measures the child's whole spend against
-    it. Cutting the share alone would price the child's past twice — once inside
-    `pool.spent_usd` and once inside its own ceiling — and leave the family holding back
-    money it had already accounted for. At dispatch the child has spent nothing and the
-    two are the same number.
-    """
+    """Cut this child's slice out of its feature's budget, at dispatch or afterwards"""
     parent_id = wo.get("parent_id")
     if not parent_id:
         return None
@@ -378,24 +206,18 @@ def reserve(store: ProjectStore, central: CentralStore | None,
     return already + share
 
 
-# -- the ceiling one turn is launched under -------------------------------------------
+# -- the ceiling one turn is launched under
 
 
 @dataclass(frozen=True)
 class Ceiling:
-    """The dollar cap for this work order's NEXT turn, and where it came from.
+    """The dollar cap for this work order's NEXT turn, and where it came from"""
 
-    `remaining_usd` is what goes to `claude --max-budget-usd`. It is never a guarantee —
-    see the overshoot note at the top of this file — and `source` is what the escalation
-    quotes so a user whose work order stopped can tell "I set $5 on this order" from
-    "its feature lent it $0.40".
-    """
-
-    #: The tightest cap that applies, in dollars.
+    #: The tightest cap that applies, in dollars
     cap_usd: float
-    #: What has already gone against that cap.
+    #: What has already gone against that cap
     spent_usd: float
-    #: Which of the caps was tightest: 'work_order' or 'feature'.
+    #: Which of the caps was tightest: 'work_order' or 'feature'
     source: str
 
     @property
@@ -404,31 +226,13 @@ class Ceiling:
 
     @property
     def exhausted(self) -> bool:
-        """Nothing left to spend.
-
-        `<= 0`, with no floor under it. A minimum viable turn budget was considered and
-        rejected: the first API call of a turn against a large context costs real money
-        (measured at ~$0.03-0.05), so a few cents of remainder does buy a wasted call —
-        but any floor makes the effective cap `budget - floor`, which is not the number
-        the user typed, and being able to check the number is the whole point.
-        """
+        """Nothing left to spend"""
         return self.remaining_usd <= 0
 
 
 def ceiling(store: ProjectStore, central: CentralStore | None,
             wo: dict[str, Any], spend: Spend | None = None) -> Ceiling | None:
-    """What bounds this work order, or None when nothing does.
-
-    NONE IS THE DEFAULT AND THE DEFAULT IS NO CEILING. An OS that starts refusing to
-    work because of a number nobody set would be worse than the problem it solves, so an
-    order with no budget and no budgeted parent behaves exactly as it did before this
-    shipped: no flag on the argv, no new status reachable, nothing to escalate.
-
-    Two caps can apply at once — the order's own and the slice its feature reserved for
-    it — and the tightest wins. They are not added: the reservation is the family's
-    statement about this child, the budget is the user's, and neither entitles the order
-    to the other's dollars.
-    """
+    """What bounds this work order, or None when nothing does"""
     spend = spent(store, central, wo["id"]) if spend is None else spend
     caps: list[tuple[float, str]] = []
     own = wo.get("budget_usd")
@@ -443,35 +247,24 @@ def ceiling(store: ProjectStore, central: CentralStore | None,
     return Ceiling(cap_usd=cap, spent_usd=spend.total_usd, source=source)
 
 
-# -- running out ----------------------------------------------------------------------
+# -- running out
 
 
 @dataclass(frozen=True)
 class Exhaustion:
-    """An order that ran out of money, and everything the user needs to answer it."""
+    """An order that ran out of money, and everything the user needs to answer it"""
 
     ceiling: Ceiling
-    #: The feature's remaining unreserved budget, when this order is a child of a
-    #: budgeted feature. Neo's condition on reserve-on-dispatch: without it a user whose
-    #: child stopped cannot tell a stalled feature from a funded one.
+    #: The feature's remaining unreserved budget, when this order is a child of a budgeted feature
     pool: Pool | None = None
-    #: What the worker was in the middle of when it stopped — its last turn's prompt,
-    #: squeezed to one line. Empty when the order never ran a turn.
+    #: What the worker was in the middle of when it stopped — its last turn's prompt, squeezed to one line
     doing: str = ""
-    #: What this child's family is CALLED — "feature", "investigation", "improvement
-    #: order". Supplied by `exhaustion`, which is the only place with the parent row;
-    #: "feature" is the default because an order with no parent never shows it.
+    #: What this child's family is CALLED — "feature", "investigation", "improvement order"
     family: str = "feature"
 
     @property
     def reason(self) -> str:
-        """The attention line, re-derivable by `invariants.true_blockers`.
-
-        Everything the user needs to decide is in it, because the attention list is the
-        only place many of these are ever read: what the cap was, what was actually
-        spent (which EXCEEDS the cap — see the overshoot note), and, for a child, what
-        its feature still has to top it up with.
-        """
+        """The attention line, re-derivable by `invariants.true_blockers`"""
         c = self.ceiling
         where = f"its {self.family}'s slice" if c.source == "feature" else "its budget"
         line = (f"budget spent — ${c.spent_usd:.2f} of {where} of ${c.cap_usd:.2f}"
@@ -484,19 +277,7 @@ class Exhaustion:
 
 def exhaustion(store: ProjectStore, central: CentralStore | None,
                wo: dict[str, Any]) -> Exhaustion | None:
-    """Has this work order run out of money? Answered from the ACCOUNTING.
-
-    Not from the turn's exit code, and that is deliberate rather than defensive. The
-    budget governs the order's whole bill, so a panel round or a run of Neo answers can
-    carry an order past its cap with no worker turn having failed — or even run — at
-    all. A check that keyed on `terminal_reason` would miss every one of those, and the
-    order would go on being dispatched against a budget it had already spent.
-
-    The turn's own signal is not ignored, it is simply redundant here: a turn the CLI
-    stopped for the budget has by definition spent up to the cap it was given, so the
-    sum below is already at or past it. `worker_session._reap` records the signal on the
-    timeline because it is evidence about THAT TURN, and this decides the order.
-    """
+    """Has this work order run out of money?"""
     c = ceiling(store, central, wo)
     if c is None or not c.exhausted:
         return None
@@ -510,11 +291,7 @@ def exhaustion(store: ProjectStore, central: CentralStore | None,
             parent = None
         if parent is not None:
             parent_pool = pool(store, central, parent)
-            # The ONE place that knows the parent's kind, so the word is resolved here
-            # and carried on the value object: `reason` is read from three call sites
-            # (`escalate`, `invariants.true_blockers`, `BudgetExhausted`) and none of
-            # them holds the row. Function-local so `budget.py` keeps no module-scope
-            # dependency on `ops` — the allocator stays under the surfaces.
+            # The ONE place that knows the parent's kind
             from .ops import family_prose
             family = family_prose(parent.get("kind"))[0]
     turn = store.latest_turn(wo["id"])
@@ -524,11 +301,7 @@ def exhaustion(store: ProjectStore, central: CentralStore | None,
 
 def feature_exhaustion(store: ProjectStore, central: CentralStore | None,
                        fo: dict[str, Any]) -> Pool | None:
-    """The feature's own pool when the family has spent it all, else None.
-
-    Distinct from a child exhausting its slice: this is the whole family out of money,
-    and no top-up to one child can restart it.
-    """
+    """The feature's own pool when the family has spent it all, else None"""
     p = pool(store, central, fo)
     if p is None or p.pool_usd > 0:
         return None
@@ -536,15 +309,7 @@ def feature_exhaustion(store: ProjectStore, central: CentralStore | None,
 
 
 class BudgetExhausted(RuntimeError):
-    """Raised instead of launching a turn there is no money for.
-
-    The last line of defence rather than the first. `Daemon.settle_work_order` moves a
-    spent order to `budget_exhausted` on the tick after it runs out, and `NOT_RETRIED`
-    and `delivery_hold` keep the other two launch paths off it — but all three of those
-    are decisions taken BEFORE the launch, and between any of them and the spawn a panel
-    round can land and take the order past its cap. So the transport checks too, at the
-    one point every turn passes through.
-    """
+    """Raised instead of launching a turn there is no money for"""
 
     def __init__(self, exhausted: Exhaustion):
         super().__init__(exhausted.reason)
@@ -552,24 +317,7 @@ class BudgetExhausted(RuntimeError):
 
 
 def escalate(store: ProjectStore, wo: dict[str, Any], out: Exhaustion) -> bool:
-    """Park a spent work order in `budget_exhausted` and put it in front of the user.
-
-    Returns whether anything changed, so a reconcile tick that meets the same order
-    again writes no second event and sends no second notification.
-
-    The flag is set here AND re-derived by `invariants.true_blockers` from the status —
-    which is the rule this codebase states for any new attention reason, because the
-    reconciler rewrites `needs_attention` from state on every tick and a flag only this
-    function set would be wiped on the next one.
-
-    NOTHING IS OWED ON WORK THAT IS OVER, and the two guards below are at this funnel
-    because all five callers pass through it — `Daemon._deliver` deliberately relaunches
-    a SETTLED order, so a queued message arriving after the work ended is enough on its
-    own (§2.2 of docs/superpowers/specs/2026-10-01-a-submitted-verdict-must-settle-its-
-    investigator.md). The verdict clause is the one that survives the race: it is true
-    before the status write and before the turn exits. `exhaustion` keeps no such guard —
-    the order IS over its cap, and only the parking was wrong.
-    """
+    """Park a spent work order in `budget_exhausted` and put it in front of the user"""
     if wo["status"] == EXHAUSTED:
         return False
     if wo["status"] in TERMINAL_STATUSES:
@@ -587,9 +335,7 @@ def escalate(store: ProjectStore, wo: dict[str, Any], out: Exhaustion) -> bool:
     })
     store.add_notification(
         title=f"{wo['id']} has spent its budget",
-        # What it was in the middle of, which is the half a bare dollar figure cannot
-        # give: the user is deciding whether to fund another turn, and that decision is
-        # about the work, not the number.
+        # What it was in the middle of, which is the half a bare dollar figure cannot give: the user is...
         body=(out.reason + (f"\n\nIt was working on: {out.doing}" if out.doing else "")),
         level="warning", wo_id=wo["id"], source="reconciler",
     )
@@ -597,7 +343,7 @@ def escalate(store: ProjectStore, wo: dict[str, Any], out: Exhaustion) -> bool:
 
 
 def escalate_feature(store: ProjectStore, fo: dict[str, Any], p: Pool) -> bool:
-    """The same, one level up: the whole family is out of money."""
+    """The same, one level up: the whole family is out of money"""
     if fo["status"] == FO_EXHAUSTED:
         return False
     store.set_feature_status(fo["id"], FO_EXHAUSTED)
@@ -610,30 +356,14 @@ def escalate_feature(store: ProjectStore, fo: dict[str, Any], p: Pool) -> bool:
 
 
 def feature_reason(p: Pool) -> str:
-    """The feature order's attention line when its family budget is gone."""
+    """The feature order's attention line when its family budget is gone"""
     return (f"budget spent — ${p.spent_usd:.2f} of ${p.budget_usd:.2f} across this "
             f"feature's planner and children; raise it with "
             f"`jarvis fo budget <id> <amount>` or cancel it")
 
 
 def parse_amount(raw: str) -> float:
-    """A budget as the user types it: `5`, `5.50`, `$5.50`. Raises ValueError.
-
-    Zero is refused rather than treated as "no budget": `--budget 0` reads like an
-    instruction to spend nothing, and silently turning it into "spend anything" is the
-    one misreading that costs money. `--clear` is how a budget is removed.
-
-    `nan` AND `inf` ARE REFUSED FIRST, and they are why `float()` alone is not enough:
-    both are accepted by `float()` and both survive a `<= 0` test, `nan` because every
-    comparison against it is False. A `nan` budget is the worst possible outcome for a
-    spend control — it FAILS OPEN while reading as enabled. `Ceiling.exhausted` is
-    `nan - spent <= 0`, False for the life of the order, so the cap is never reached and
-    `INV-BUDGET-OVERSPENT` never fires; meanwhile `briefing_for`'s `max(0.0, nan)` is
-    0.0 (`max` keeps its first argument when the comparison is False), so every turn goes
-    out under `--max-budget-usd 0.000000`, a value the probes at the top of this file
-    never measured. The dashboard would show the order as budgeted throughout. An
-    infinite budget is the same lie told less subtly.
-    """
+    """A budget as the user types it: `5`, `5.50`, `$5.50`"""
     text = raw.strip().lstrip("$").replace(",", "")
     try:
         value = float(text)
@@ -648,25 +378,18 @@ def parse_amount(raw: str) -> float:
 
 
 def format_usd(value: float | None) -> str:
-    """One way of writing a budget, so every surface writes it the same way."""
+    """One way of writing a budget, so every surface writes it the same way"""
     return "—" if not value else f"${value:,.2f}"
 
 
 def format_money(value: float) -> str:
-    """A figure that is MONEY, where zero is a number and not an absence.
-
-    The counterpart to `format_usd`, not a replacement: that one renders 0.0 and None
-    identically as an em dash, which is right for "this order has no budget" and wrong
-    for "it has spent nothing" or "its family has nothing left". Both of those read as
-    "unknown" through the dash, and "unknown" sends the user somewhere other than where
-    the fact points.
-    """
+    """A figure that is MONEY, where zero is a number and not an absence"""
     return f"${value:,.2f}"
 
 
 def status_note(store: ProjectStore, central: CentralStore | None,
                 wo: dict[str, Any]) -> str:
-    """`$1.20 of $5.00` for a listing, or "" when the order has no ceiling."""
+    """`$1.20 of $5.00` for a listing, or "" when the order has no ceiling"""
     c = ceiling(store, central, wo)
     if c is None:
         return ""
@@ -674,42 +397,21 @@ def status_note(store: ProjectStore, central: CentralStore | None,
 
 
 def default_for(project: ProjectSpec | None) -> float | None:
-    """The catalog's standing budget for a new order in this project, if it sets one.
-
-    Resolved at CREATION and stamped onto the row, unlike `autocompact_window`, which is
-    re-read from the catalog on every turn. The opposite choice on purpose: a budget is a
-    contract with the user about ONE order — `jarvis wo show` has to be able to say what
-    the cap is, and lowering a fleet default must not silently strand work the user
-    already authorised at the old number.
-    """
+    """The catalog's standing budget for a new order in this project, if it sets one"""
     if project is None:
         return None
     return getattr(project.worker, "budget_usd", None)
 
 
 def feature_default_for(project: ProjectSpec | None) -> float | None:
-    """The catalog's standing budget for a new FEATURE order — the family's whole bill.
-
-    A separate setting from `default_for`, and not a multiple of it: a feature's children
-    are not known when the default is written, so a per-work-order number says nothing
-    useful about the family. A project that sets only one of the two gets a ceiling on
-    that kind of order alone, which is the honest reading of having set only one.
-    """
+    """The catalog's standing budget for a new FEATURE order — the family's whole bill"""
     if project is None:
         return None
     return getattr(project.worker, "feature_budget_usd", None)
 
 
 def investigation_default_for(project: ProjectSpec | None) -> float | None:
-    """The standing budget for a new INVESTIGATION order — the order plus its one
-    investigator.
-
-    The one place in this codebase where "no ceiling is the default" does not hold, and
-    §2.8 of docs/superpowers/specs/2026-09-27-investigation-orders.md says why: the caller
-    is a daemon loop, not a human typing, so an uncapped default is an uncapped loop. So
-    the catalog's `investigation_budget_usd` ships NON-None, and the fallback is the
-    feature default rather than None.
-    """
+    """The standing budget for a new INVESTIGATION order — the order plus its one investigator (docs/superpowers/specs/2026-09-27-investigation-orders.md)"""
     from .catalog import DEFAULT_INVESTIGATION_BUDGET_USD
 
     if project is None:
@@ -721,7 +423,7 @@ def investigation_default_for(project: ProjectSpec | None) -> float | None:
 
 
 def live_children(store: ProjectStore, fo_id: str) -> list[dict[str, Any]]:
-    """The children of a feature that are still able to spend. Used by the escalation."""
+    """The children of a feature that are still able to spend"""
     return [c for c in store.feature_children(fo_id)
             if c["status"] not in TERMINAL_STATUSES and c["status"] != EXHAUSTED]
 

@@ -1,14 +1,4 @@
-"""Screenshot the harvest block on a work-order page, for a PR's UI evidence.
-
-Issue #888, spec docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md §5: what the OS read
-off disk when a turn died renders directly ABOVE the retry control, because it is what
-the user reads before pressing the button. This shot is that adjacency.
-
-Everything it touches lives in a temp `JARVIS_HOME` and a temp catalog, so it never
-reads or writes the live OS:
-
-    uv run python scripts/screenshot_harvest.py
-"""
+"""Screenshot the harvest block on a work-order page, for a PR's UI evidence (docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md §5)"""
 
 from __future__ import annotations
 
@@ -41,7 +31,7 @@ def _git(cwd: Path, *args: str) -> str:
 
 
 def _repo(root: Path) -> Path:
-    """A project repository on `main`, with a bare origin so an upstream exists."""
+    """A project repository on `main`, with a bare origin so an upstream exists"""
     path = root / PROJECT
     path.mkdir(parents=True)
     _git(path.parent, "init", "-q", "-b", "main", str(path))
@@ -56,13 +46,7 @@ def _repo(root: Path) -> Path:
 
 
 def seed(project: Path) -> tuple[str, str]:
-    """A failed work order whose last turn was harvested — the rich case.
-
-    Three commits on the branch (one of them made in the dead turn), one pushed so the
-    tail is unpushed, an uncommitted file for the checkpoint to catch, a last message,
-    and a background job the turn left running. Driven through `harvest.write` itself
-    rather than through a worker turn: the transport is not what this shot is about.
-    """
+    """A failed work order whose last turn was harvested — the rich case"""
     from jarvis import background, harvest, ops
     from jarvis.project_store import ProjectStore
 
@@ -78,7 +62,7 @@ def seed(project: Path) -> tuple[str, str]:
     _git(worktree, "push", "-q", "-u", "origin", wo_id)
     head_at_launch = _git(worktree, "rev-parse", "HEAD").strip()
 
-    # …and then the turn that died: one commit it did make, one file it never staged.
+    # …and then the turn that died: one commit it did make, one file it never staged
     (worktree / "csv_writer.py").write_text("def csv_writer(rows):\n    return rows\n")
     _git(worktree, "add", "-A")
     _git(worktree, "commit", "-qm", "start the CSV writer")
@@ -94,8 +78,7 @@ def seed(project: Path) -> tuple[str, str]:
     store.finish_turn(turn["id"], "failed",
                       error="the turn's process ended without writing a result")
 
-    # The one writer of `background_orphaned` still writes it; the transcript this
-    # script has no worker to produce is what is stood in for here.
+    # The one writer of `background_orphaned` still writes it
     job = background.Job("b51fl7bhe", "uv run pytest tests/ -q")
     background.orphaned_in_turn = lambda *a, **k: [job]  # type: ignore[assignment]
 
@@ -115,7 +98,7 @@ def serve() -> None:
 
 
 def shoot(name: str, wo_id: str) -> Path:
-    """The harvest section and the retry control below it, in one frame."""
+    """The harvest section and the retry control below it, in one frame"""
     from playwright.sync_api import sync_playwright
 
     SHOTS.mkdir(parents=True, exist_ok=True)
@@ -128,8 +111,7 @@ def shoot(name: str, wo_id: str) -> Path:
         harvest = page.locator("h2#harvest")
         harvest.scroll_into_view_if_needed()
         page.wait_for_timeout(200)
-        # The retry panel is the point of the shot: the clip runs to the bottom of the
-        # control, so the two are provably adjacent rather than two separate crops.
+        # The retry panel is the point of the shot: the clip runs to the bottom of the control
         button = page.locator("button", has_text="Retry this order").first
         button.scroll_into_view_if_needed()
         page.wait_for_timeout(200)

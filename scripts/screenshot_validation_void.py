@@ -1,10 +1,4 @@
-"""Screenshot a VOIDED validation round on a work-order page, for a PR's UI evidence.
-
-Writes PNGs to docs/screenshots/. Everything it touches lives in a temp `JARVIS_HOME`
-and a temp catalog, so it never reads or writes the live OS:
-
-    uv run python scripts/screenshot_validation_void.py
-"""
+"""Screenshot a VOIDED validation round on a work-order page, for a PR's UI evidence"""
 
 from __future__ import annotations
 
@@ -22,8 +16,7 @@ PORT = 8798
 
 
 def seed() -> str:
-    """One work order per round outcome that settles, so the new badge is read BESIDE
-    the ones it has to be told apart from rather than on its own."""
+    """One work order per round outcome that settles"""
     from jarvis.central_store import CentralStore
     from jarvis.project_store import ProjectStore
 

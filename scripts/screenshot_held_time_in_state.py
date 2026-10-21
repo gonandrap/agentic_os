@@ -1,19 +1,4 @@
-"""Screenshot the "Time in state" panel under a usage-limit hold, for issue #887.
-
-`scripts/screenshot_held_gate.py` and `scripts/screenshot_auth_hold_badge.py` are the
-shape this copies: a work-order page with a hold on it. THREE IMAGES, because the claim
-has three halves — the hold OPEN (the badge must read the active age, not wall), the hold
-CLOSED (wall survives, beside active), and an order never held at all (the panel is
-untouched for the common case).
-
-Every shot spans the tab strip as well as the panel: the badge is the headline complaint
-of the issue, and a panel shot alone would not show it.
-
-Writes to docs/screenshots/. Everything lives in a temp `JARVIS_HOME` and a temp catalog,
-so it never reads or writes the live OS:
-
-    uv run python scripts/screenshot_held_time_in_state.py
-"""
+"""Screenshot the "Time in state" panel under a usage-limit hold, for issue #887"""
 
 from __future__ import annotations
 
@@ -29,14 +14,13 @@ REPO = Path(__file__).resolve().parent.parent
 SHOTS = REPO / "docs" / "screenshots"
 PORT = 8809
 
-#: The issue's own numbers: 5h24m in `running`, of which the order was let work 45m.
-#: Away from a rounding edge, since the render happens a fraction of a second after `now`.
+#: The issue's own numbers: 5h24m in `running`, of which the order was let work 45m
 WALL = 5 * 3600 + 24 * 60
 WORKED = 45 * 60
 
 
 def _event_at(store, wo_id: str, kind: str, ts: float, payload: dict) -> None:
-    """An event dated when it happened, not when this script ran."""
+    """An event dated when it happened, not when this script ran"""
     store.add_event(wo_id, kind, payload)
     store.conn.execute(
         "UPDATE wo_events SET ts=? WHERE id=(SELECT MAX(id) FROM wo_events WHERE wo_id=?)",
@@ -44,8 +28,7 @@ def _event_at(store, wo_id: str, kind: str, ts: float, payload: dict) -> None:
 
 
 def held_order(store, title: str, *, resumed: bool) -> str:
-    """Issue 887 reproduced: running since T0, one turn T0..T0+45m, then paused on the
-    usage limit and never let go (`resumed=False`) or retried now (`resumed=True`)."""
+    """Issue 887 reproduced: running since T0"""
     from jarvis.worker_session import PAUSE_USAGE_LIMIT
 
     now = time.time()
@@ -71,7 +54,7 @@ def held_order(store, title: str, *, resumed: bool) -> str:
 
 
 def plain_order(store, title: str) -> str:
-    """The control: no pause of any kind, so the panel must render as it always did."""
+    """The control: no pause of any kind, so the panel must render as it always did"""
     now = time.time()
     wo = store.create_work_order(title)
     store.set_status(wo["id"], "running")
@@ -131,11 +114,7 @@ def serve() -> None:
 
 
 def shoot(page, wo_id: str, out: Path) -> str:
-    """One clip from the tab strip to the bottom of the Gantt panel.
-
-    The strip is in the clip on purpose: the badge and the totals line are the two
-    surfaces the issue says disagree, and separate shots would not show they now agree.
-    """
+    """One clip from the tab strip to the bottom of the Gantt panel"""
     page.goto(f"http://127.0.0.1:{PORT}/wo/jarvis_os/{wo_id}")
     page.locator("button[role=tab][data-panel=tab-states]").click()
     page.wait_for_timeout(300)

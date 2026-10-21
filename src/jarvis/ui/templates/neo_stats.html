@@ -47,6 +47,18 @@
     <span class="sub">— over settled questions only; superseded ones are out of it,
       and an open one has no outcome yet</span>
   </p>
+  {# WHAT THE OS'S OBJECTIONS DID, beside the rate — §5 of docs/superpowers/specs/
+     2026-10-20-an-objection-is-withdrawn-before-the-order-stops.md. The two withdrawals
+     are split because they mean opposite things about the worker: one order stopped
+     before it could be told, the other delivered and handed the decision to the user. #}
+  <p class="kv mono" style="margin: 6px 0 0;">
+    {{ report.objections.sent }} objections sent ·
+    {{ report.objections.delivered }} delivered ·
+    {{ report.objections.withdrawn }} withdrawn
+    <span class="sub">— {{ report.objections.stopped }} the order stopped,
+      {{ report.objections.handed_back }} handed to you,
+      {{ report.objections.other }} other</span>
+  </p>
   {# Its own figure, never blended into the rate above: a crash is not a decision. #}
   <p class="kv" style="margin: 6px 0 0;">
     unreachable rate {{ pct(q.unreachable_rate) }}

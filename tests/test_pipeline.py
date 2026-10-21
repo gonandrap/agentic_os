@@ -1,7 +1,4 @@
-"""End-to-end pipeline tests against the fake `claude` CLI:
-start → create work order → daemon tick dispatches a turn → hooks update state →
-messages deliver as the next turn → finish/review → notifications route → adhoc adoption.
-"""
+"""End-to-end pipeline tests against the fake `claude` CLI: start → create work order → daemon tick..."""
 
 from __future__ import annotations
 
@@ -22,7 +19,7 @@ from jarvis.project_store import ProjectStore
 
 @pytest.fixture()
 def started(jarvis_home, fake_claude, catalog_file, project):
-    """OS started (bootstrap + registration), daemon object ready to tick manually."""
+    """OS started (bootstrap + registration), daemon object ready to tick manually"""
     result = ops.start_os(str(catalog_file), foreground=True)  # no subprocess
     assert result["daemon"]["status"] == "foreground"
     catalog = load_catalog(catalog_file)
@@ -32,13 +29,7 @@ def started(jarvis_home, fake_claude, catalog_file, project):
 
 def turn_calls(fake_claude, resumed: bool | None = None,
                expect: int = 0) -> list[dict]:
-    """Every worker-turn invocation the fake recorded, newest last.
-
-    `resumed=False` selects opening turns (`--session-id`), `True` the ones that
-    continue a conversation (`--resume`). Pass `expect` to wait for that many: a turn is
-    a detached process, so it records itself a moment after the call that launched it
-    returned, and asserting straight away races it.
-    """
+    """Every worker-turn invocation the fake recorded, newest last"""
     def match(call):
         argv = call["argv"]
         if "-p" not in argv:
@@ -55,12 +46,7 @@ def turn_calls(fake_claude, resumed: bool | None = None,
 
 
 def run_turn(daemon, store, settle_turns):
-    """A full cycle: tick (which launches whatever is due), wait for that turn's
-    process to exit, then tick again so the work order settles against the result.
-
-    Turns are detached processes now, so a test has to wait for one exactly the way
-    the daemon does instead of assuming the work happened inside the call.
-    """
+    """A full cycle: tick (which launches whatever is due)"""
     daemon.tick_count = 0
     daemon.tick()
     assert settle_turns(store), "a worker turn never finished"
@@ -69,16 +55,7 @@ def run_turn(daemon, store, settle_turns):
 
 
 def test_a_call_being_rewritten_is_not_counted_twice(fake_claude):
-    """The `unit (3.11)` flake of 2026-09-16, reduced to its mechanism.
-
-    Every fake invocation records itself TWICE — on entry, then from `atexit` to fill in
-    `finished_at` — through a temp file in the SAME directory these tests poll. For the
-    instant between the second write and its `os.replace`, a COMPLETE
-    `<name>.json.part<pid>` sits beside the `<name>.json` the first write left; both
-    parse, so a listing taken there reports one worker turn as two. That is what made
-    `test_dispatch_flow` fail on `assert len(opening) == 1` with two identical argvs,
-    and polling while processes exit is what `wait_calls` does for a living.
-    """
+    """The `unit (3.11)` flake of 2026-09-16, reduced to its mechanism"""
     calls = fake_claude.dir / "calls"
     calls.mkdir(exist_ok=True)
     record = {"argv": ["-p", "--session-id", "s"], "cwd": "/tmp"}
@@ -104,8 +81,7 @@ def test_dispatch_flow(started, fake_claude, project):
     fresh = store.get_work_order(wo["id"])
     assert fresh["status"] == "running"
     assert fresh["worktree"] == wo["id"]
-    # The session id exists before the worker does — Jarvis mints it and passes it in,
-    # so there is nothing to bind afterwards and nothing that can move it later.
+    # The session id exists before the worker does
     sid = fresh["session_id"]
     assert uuid.UUID(sid)
 
@@ -118,8 +94,7 @@ def test_dispatch_flow(started, fake_claude, project):
     assert argv[argv.index("--worktree") + 1] == wo["id"]
     assert argv[argv.index("--model") + 1] == "sonnet"
     assert argv[argv.index("--permission-mode") + 1] == "auto"
-    # full settings (hooks + permissions + env) travel with the turn as a file,
-    # because the worktree has no .claude/settings.json (it's untracked)
+    # full settings (hooks + permissions + env) travel with the turn as a file
     settings_path = argv[argv.index("--settings") + 1]
     settings = json.loads(open(settings_path).read())
     assert settings["env"]["JARVIS_WO_ID"] == wo["id"]
@@ -129,9 +104,7 @@ def test_dispatch_flow(started, fake_claude, project):
     assert "Bash(jarvis *)" in settings["permissions"]["allow"]
     assert argv[-2] == "--", "the prompt must stay fenced off from variadic options"
     prompt = argv[-1]
-    # The OPERATION.md mirror line lives in the fetched `contract` section since the
-    # minimal-core split; the dispatched prompt's load-bearing mark is the on-demand
-    # section index instead.
+    # The OPERATION.md mirror line lives in the fetched `contract` section since the minimal-core split
     assert "add feature X" in prompt and "jarvis brief" in prompt
 
     # the turn is on the record as turn 1 of the conversation
@@ -141,11 +114,7 @@ def test_dispatch_flow(started, fake_claude, project):
 
 
 def test_worker_never_appears_in_the_agents_roster(started, fake_claude):
-    """The pileup this transport exists to end: 63 dead `[WO …]` background agents.
-
-    A worker turn is a process Jarvis owns, so nothing it does can leave a session
-    behind in the roster to be cleaned up later.
-    """
+    """The pileup this transport exists to end: 63 dead `[WO …]` background agents"""
     daemon = started
     ops.create_work_order("proj_a", "task")
     daemon.tick()
@@ -161,8 +130,7 @@ def test_concurrency_limit(started, fake_claude):
 
 
 def test_knowledge_indexed_into_prompt(started, fake_claude):
-    """The dispatcher ships a queryable index of the knowledge base, and a long entry
-    reaches the worker as a headline + id rather than as prompt weight."""
+    """The dispatcher ships a queryable index of the knowledge base"""
     daemon = started
     central = CentralStore()
     central.add_knowledge("always run make lint", project="proj_a", topic="ci")
@@ -204,10 +172,7 @@ def test_hook_events_update_state(started, project):
 
 
 def test_session_end_no_longer_settles_the_work_order(started, project):
-    """Under `-p`, SessionEnd fires at the end of EVERY turn — verified against the real
-    CLI. Left as it was (file the work order for review), a healthy work order would be
-    filed for review after its very first turn. Settling is the turn reconciler's job.
-    """
+    """Under `-p`, SessionEnd fires at the end of EVERY turn — verified against the real CLI"""
     daemon = started
     wo = ops.create_work_order("proj_a", "task")
     daemon.tick()
@@ -224,12 +189,7 @@ def test_session_end_no_longer_settles_the_work_order(started, project):
 
 
 def test_user_reply_clears_attention(started, project):
-    """Regression (wo-f883d243): replying to a work order that is waiting on the
-    user must immediately drop it from the attention list. The user has responded,
-    so the OS must stop showing "needs input" even before the daemon delivers the
-    message. Previously the flag was only cleared on delivery, so a reply left the
-    WO stuck under "NEEDS YOU" (and acking the inbox notification never helped —
-    that's a separate signal)."""
+    """Regression (wo-f883d243): replying to a work order that is waiting on the user must immediately..."""
     daemon = started
     wo = ops.create_work_order("proj_a", "give me a summary of the current status")
     daemon.tick()
@@ -255,9 +215,7 @@ def test_user_reply_clears_attention(started, project):
 
 
 def test_status_warns_on_prompting_permission_mode(jarvis_home, fake_claude, project, tmp_path):
-    """Misconfig safeguard: a fleet running a prompting mode (acceptEdits/default/
-    plan/manual) will stall its --bg workers on the first permission prompt, so
-    `jarvis status` must flag it. `auto`/`bypassPermissions`/`dontAsk` never prompt."""
+    """Misconfig safeguard: a fleet running a prompting mode (acceptEdits/default/ plan/manual) will stall..."""
     data = {
         "os": {"defaults": {"model": "sonnet", "permission_mode": "acceptEdits"},
                "notifications": {"sinks": ["log"]}},
@@ -278,16 +236,14 @@ def test_status_warns_on_prompting_permission_mode(jarvis_home, fake_claude, pro
 
 
 def test_status_quiet_under_autonomous_mode(started):
-    """The default fleet mode is `auto`; it must NOT produce a permission-mode warning."""
+    """The default fleet mode is `auto`; it must NOT produce a permission-mode warning"""
     st = ops.os_status()
     assert not [a for a in st["attention"]
                 if a["status"] == "config" and "permission mode" in a["title"].lower()]
 
 
 def test_resume_in_auto_flips_mode_and_unblocks(started, project):
-    """Resume-in-auto: recover a worker stalled on a permission prompt by flipping it
-    to `auto` and nudging it to continue — the daemon then sends the nudge as the next
-    turn, which re-derives the now-`auto` mode from argv."""
+    """Resume-in-auto: recover a worker stalled on a permission prompt by flipping it to `auto` and..."""
     daemon = started
     wo = ops.create_work_order("proj_a", "task", permission_mode="acceptEdits")
     daemon.tick()
@@ -318,17 +274,7 @@ def test_hook_noop_for_non_worker_sessions(started, project):
 
 
 def test_message_delivery_when_idle(started, fake_claude, project, settle_turns):
-    """A message waits for the turn in flight, then rides the next one.
-
-    Turn one is held open explicitly (`hold_turns`) rather than left to be slow. It used
-    to be neither: the fake exits the moment it has written its result, so by the second
-    tick turn one had usually finished, `settle_turns` reaped it and the message went out
-    inside that very tick. The assertion below passed anyway — a turn is a DETACHED
-    process, so it records itself a moment after the call that launched it returns, and
-    reading the call log straight away races that write (see `turn_calls`). It was
-    reading an empty log, not an undelivered message, and CI eventually lost the race and
-    failed on 3.11 alone.
-    """
+    """A message waits for the turn in flight, then rides the next one"""
     daemon = started
     gate = fake_claude.hold_turns()
     wo = ops.create_work_order("proj_a", "task")
@@ -340,11 +286,7 @@ def test_message_delivery_when_idle(started, fake_claude, project, settle_turns)
     ops.send_message(wo["id"], "please also update the docs", source="ui")
     daemon.tick_count = 0
     daemon.tick()  # turn one is still in flight → nothing deliverable yet
-    # Asserted on rows the daemon writes SYNCHRONOUSLY, never on the call log: a turn
-    # records itself from its own detached process, so "no resumed call yet" is true for
-    # a moment even when delivery did happen, and a negative read of it can only ever
-    # fail by luck. These two cannot race — if the guard goes, `_deliver` marks the
-    # message and opens turn 2 before `tick()` returns.
+    # Asserted on rows the daemon writes SYNCHRONOUSLY
     assert worker_session.busy(store, wo["id"]), "turn one should still be in flight"
     assert store.latest_turn(wo["id"])["seq"] == 1, "a second turn was opened mid-turn"
     assert [m["status"] for m in store.list_messages(wo["id"])] == ["queued"]
@@ -372,18 +314,7 @@ def test_message_delivery_when_idle(started, fake_claude, project, settle_turns)
 
 def test_queued_messages_for_one_work_order_deliver_as_a_single_turn(
         started, fake_claude, project, settle_turns):
-    """Three comments cost one turn boundary, not three.
-
-    Every boundary re-sends the whole accumulated conversation at the cache-WRITE rate
-    (~12% of this project's token spend; `jarvis cost` breaks it out), so delivering
-    each queued message as its own turn multiplies that by the number of messages —
-    for content the worker is better off reading together anyway.
-
-    Both halves are asserted: exactly ONE resumed turn, and all three messages present
-    in it and marked delivered. Counting turns alone would pass against a delivery path
-    that dropped two of the messages, which is the failure this coalescing could
-    plausibly introduce.
-    """
+    """Three comments cost one turn boundary, not three"""
     daemon = started
     wo = ops.create_work_order("proj_a", "task")
     daemon.tick()
@@ -400,7 +331,7 @@ def test_queued_messages_for_one_work_order_deliver_as_a_single_turn(
     prompt = resumes[0]["argv"][-1]
     for text in ("first thought", "second thought", "third thought"):
         assert text in prompt
-    # In the order the user sent them, so the worker reads a conversation and not a bag.
+    # In the order the user sent them, so the worker reads a conversation and not a bag
     assert prompt.index("first") < prompt.index("second") < prompt.index("third")
 
     queued = [m for m in store.list_messages(wo["id"])
@@ -411,11 +342,7 @@ def test_queued_messages_for_one_work_order_deliver_as_a_single_turn(
 
 def test_two_work_orders_messages_stay_separate_turns(started, fake_claude, project,
                                                       settle_turns):
-    """The coalescing is per work order. Two conversations must not be spliced.
-
-    The negative control for the test above: joining everything queued would also
-    satisfy "one turn per tick", and would be catastrophic.
-    """
+    """The coalescing is per work order"""
     daemon = started
     first = ops.create_work_order("proj_a", "task one")
     second = ops.create_work_order("proj_a", "task two")
@@ -441,14 +368,7 @@ def test_two_work_orders_messages_stay_separate_turns(started, fake_claude, proj
 
 def test_session_id_never_moves_across_turns(started, fake_claude, project,
                                              settle_turns):
-    """The property the whole refactor rests on: one work order, one session id, for
-    every turn of its life.
-
-    Under the old transport each delivered turn forked a new background agent under a
-    fresh supervisor-assigned id, which needed `bind_session`, a `prior_sessions` trail
-    and an invariant just to keep the pointer from walking backwards — and leaked the
-    superseded agent whenever the retiring `claude stop` did not land.
-    """
+    """The property the whole refactor rests on: one work order, one session id, for every turn of its life"""
     daemon = started
     wo = ops.create_work_order("proj_a", "task")
     daemon.tick()
@@ -473,10 +393,7 @@ def test_session_id_never_moves_across_turns(started, fake_claude, project,
 def test_worker_final_message_is_recorded_alongside_the_summary(
     started, fake_claude, project, settle_turns
 ):
-    """The work order must stand alone — the user and Neo decide from it and never open
-    the worker session. `--summary` is a headline; the worker's full closing message is
-    kept next to it. Regression: `wo finish` flips the order to `completed` before its
-    turn ends, so a status-filtered sweep would drop exactly that reply."""
+    """The work order must stand alone — the user and Neo decide from it and never open the worker session"""
     daemon = started
     wo = ops.create_work_order("proj_a", "task")
     daemon.tick()
@@ -496,7 +413,7 @@ def test_worker_final_message_is_recorded_alongside_the_summary(
     assert any(r.startswith("final:") for r in replies), replies
     assert "turn_ended" in [e["kind"] for e in store.list_events(wo["id"])]
 
-    # Capture is idempotent: further passes must not duplicate the reply.
+    # Capture is idempotent: further passes must not duplicate the reply
     for _ in range(2):
         daemon.tick_count = 0
         daemon.tick()
@@ -506,8 +423,7 @@ def test_worker_final_message_is_recorded_alongside_the_summary(
 
 
 def test_crashed_turn_fails_the_work_order(started, fake_claude, project, settle_turns):
-    """A turn whose process dies without writing a result must fail the work order, not
-    hang it in `running` forever waiting for output that is never coming."""
+    """A turn whose process dies without writing a result must fail the work order"""
     daemon = started
     fake_claude.turns_fail("silent")  # exits 0, writes nothing at all
     wo = ops.create_work_order("proj_a", "task")
@@ -528,7 +444,7 @@ def test_crashed_turn_fails_the_work_order(started, fake_claude, project, settle
 
 def test_turn_reporting_is_error_fails_the_work_order(started, fake_claude, project,
                                                       settle_turns):
-    """A well-formed result carrying `is_error` is a failed turn, however tidy it looks."""
+    """A well-formed result carrying `is_error` is a failed turn, however tidy it looks"""
     daemon = started
     fake_claude.turns_fail("error")
     wo = ops.create_work_order("proj_a", "task")
@@ -545,8 +461,7 @@ def test_turn_reporting_is_error_fails_the_work_order(started, fake_claude, proj
 
 def test_a_turn_in_flight_blocks_a_second_one(started, fake_claude, project,
                                               settle_turns):
-    """One turn at a time per work order: two concurrent `--resume`s of one session is
-    something the CLI refuses, and would interleave into one transcript if it did not."""
+    """One turn at a time per work order: two concurrent `--resume`s of one session is something the CLI..."""
     daemon = started
     gate = fake_claude.hold_turns()
     wo = ops.create_work_order("proj_a", "task")
@@ -568,9 +483,7 @@ def test_a_turn_in_flight_blocks_a_second_one(started, fake_claude, project,
 
 
 def test_hooks_from_an_unknown_session_do_not_steer_the_work_order(started, project):
-    """A work order has one session id now, but legacy rows can still be hooked by a
-    session they have left — a spent background agent the user re-opens from the agents
-    view. Those hooks are recorded and acted on never."""
+    """A work order has one session id now"""
     daemon = started
     wo = ops.create_work_order("proj_a", "task")
     daemon.tick()
@@ -589,15 +502,7 @@ def test_hooks_from_an_unknown_session_do_not_steer_the_work_order(started, proj
 
 def test_follow_up_turn_is_briefed_like_the_first(started, fake_claude, project,
                                                   settle_turns):
-    """A resumed session re-derives its system prompt at launch — it does not inherit
-    the first turn's from the transcript. So every turn must carry the same briefing:
-    without it the project's standing instructions to the worker (and the OS skills
-    directory) silently vanish from turn two onwards.
-
-    It must also resume from the directory the session was created in: transcripts are
-    stored per-cwd, so resuming a worktree worker from the project root would not find
-    its conversation.
-    """
+    """A resumed session re-derives its system prompt at launch"""
     daemon = started
     wo = ops.create_work_order("proj_a", "task", model="opus",
                                append_system_prompt="never touch production")
@@ -613,17 +518,13 @@ def test_follow_up_turn_is_briefed_like_the_first(started, fake_claude, project,
 
     call = turn_calls(fake_claude, resumed=True, expect=1)[-1]
     argv = call["argv"]
-    # Jarvis's static git briefing rides in front of the project's own instructions
-    # (tests/test_stable_prefix.py); what matters here is that the project's text is
-    # still there on turn two, where it would otherwise silently vanish.
+    # Jarvis's static git briefing rides in front of the project's own instructions...
     appended = argv[argv.index("--append-system-prompt") + 1]
     assert appended.endswith("never touch production")
     assert appended.startswith("# Git")
     assert argv[argv.index("--model") + 1] == "opus"
     assert argv[argv.index("--add-dir") + 1].endswith("agent-skills")
-    # The work order carries no permission_mode of its own, so the follow-up must fall
-    # back to the project's exactly as the opening turn does — otherwise turn two runs
-    # in Claude's default mode and stalls on a prompt no headless worker can answer.
+    # The work order carries no permission_mode of its own
     assert argv[argv.index("--permission-mode") + 1] == "auto"
     assert "--worktree" not in argv, "the worktree already exists; it is the cwd now"
     assert argv[-2] == "--" and argv[-1] == "follow-up"
@@ -632,13 +533,7 @@ def test_follow_up_turn_is_briefed_like_the_first(started, fake_claude, project,
 
 def test_injected_turn_gets_the_projects_permission_mode(started, fake_claude, project,
                                                          settle_turns):
-    """An injected session's row has permission_mode NULL — it never went through
-    dispatch, which is what resolves the mode and writes it back. Sending it a message
-    hands it to Jarvis to drive, and a headless turn cannot answer a permission prompt:
-    launched in Claude's default mode it would stall, costing the user a
-    `jarvis wo resume-auto` to clear. So the turn resolves the project's worker mode at
-    the call site — without backfilling the column, so an injected work order stays
-    distinguishable from a dispatched one."""
+    """An injected session's row has permission_mode NULL"""
     daemon = started
     res = _inject(fake_claude, project, "working", sid="adhoc-pm-1")
     store = ProjectStore(project)
@@ -735,7 +630,7 @@ def test_reconciler_flags_unfinished_idle_worker(started, fake_claude, project,
 
 def _add_session(fake_claude, project, state, sid="adhoc-session-1",
                  name="my manual hack", cwd=None):
-    """A Claude session the USER started, in the project directory."""
+    """A Claude session the USER started, in the project directory"""
     sessions = fake_claude.sessions
     sessions.append({"id": "abcd1234", "sessionId": sid,
                      "cwd": str(cwd or project), "kind": "background",
@@ -745,21 +640,13 @@ def _add_session(fake_claude, project, state, sid="adhoc-session-1",
 
 def _inject(fake_claude, project, state, sid="adhoc-session-1",
             name="my manual hack", **kw):
-    """Add the session and hand it to Jarvis, the way the user would."""
+    """Add the session and hand it to Jarvis, the way the user would"""
     _add_session(fake_claude, project, state, sid=sid, name=name)
     return ops.inject_session(sid, **kw)
 
 
 def test_reconciler_does_not_adopt_sessions(started, fake_claude, project):
-    """The heart of GitHub issue 47: a session the user started is theirs.
-
-    Jarvis used to mirror every session running under a registered project path into an
-    `origin=adhoc` work order "for visibility", and then treat that record as a work
-    order like any other — renaming the session, flagging it for the user's attention,
-    and (via `wo send` / `resume-auto`) resuming it headlessly with a worker briefing, so
-    the user's own conversation received turns they never typed. It must not see the
-    session at all until it is handed over.
-    """
+    """The heart of GitHub issue 47: a session the user started is theirs"""
     daemon = started
     _add_session(fake_claude, project, "working")
 
@@ -774,8 +661,7 @@ def test_reconciler_does_not_adopt_sessions(started, fake_claude, project):
 
 def test_reconciler_does_not_read_the_roster_with_nothing_injected(started, fake_claude,
                                                                    project):
-    """Tracking injected sessions is the only thing left that needs `claude agents
-    --json`. With nothing injected, the subprocess must not run at all."""
+    """Tracking injected sessions is the only thing left that needs `claude agents --json`"""
     daemon = started
     _add_session(fake_claude, project, "working")
     before = [c for c in fake_claude.calls if c["argv"][:1] == ["agents"]]
@@ -805,8 +691,7 @@ def test_injected_session_is_tracked(started, fake_claude, project):
 
 
 def test_injecting_writes_nothing_into_the_session(started, fake_claude, project):
-    """Injection is consent to *track*, not to drive. The session is not renamed and
-    receives no turn; the first write is the user's own `wo send` / `resume-auto`."""
+    """Injection is consent to *track*, not to drive"""
     daemon = started
     _inject(fake_claude, project, "working")
     daemon.tick_count = 0
@@ -817,8 +702,7 @@ def test_injecting_writes_nothing_into_the_session(started, fake_claude, project
 
 
 def test_injected_session_is_never_dispatched(started, fake_claude, project):
-    """The record must not exist as `pending` for even one tick: the daemon claims
-    pending work orders and would launch a worker turn inside the user's session."""
+    """The record must not exist as `pending` for even one tick: the daemon claims pending work orders and..."""
     daemon = started
     res = _inject(fake_claude, project, "working")
     store = ProjectStore(project)
@@ -830,13 +714,7 @@ def test_injected_session_is_never_dispatched(started, fake_claude, project):
 
 
 def test_injected_working_session_does_not_ask_for_input(started, fake_claude, project):
-    """A healthy session must never be recorded as "waiting on you".
-
-    Regression: the reconciler compared Claude Code's session state against
-    "running" — a word the CLI never emits (it says "working") — so every live
-    session was recorded straight into waiting_input and the UI claimed the
-    session wanted the user while it was quietly making progress.
-    """
+    """A healthy session must never be recorded as "waiting on you\""""
     daemon = started
     res = _inject(fake_claude, project, "working")
     daemon.tick_count = 0
@@ -897,9 +775,7 @@ def test_injecting_twice_does_not_duplicate_the_record(started, fake_claude, pro
 
 def test_re_injecting_resumes_tracking_a_session_that_woke_up(started, fake_claude,
                                                               project):
-    """The daemon stops reading the roster once a project has no live injected session —
-    that is what keeps `claude agents --json` off the tick for everyone who never
-    injects. So re-injecting is how a retired session is picked back up."""
+    """The daemon stops reading the roster once a project has no live injected session"""
     daemon = started
     res = _inject(fake_claude, project, "working")
     store = ProjectStore(project)
@@ -919,12 +795,7 @@ def test_re_injecting_resumes_tracking_a_session_that_woke_up(started, fake_clau
 
 def test_reconciler_clears_attention_when_worker_resumes(started, fake_claude, project,
                                                          settle_turns):
-    """waiting_input must not be sticky: a worker that gets going again stops needing
-    the user.
-
-    Regression: nothing could ever move a work order back to `running`, so the
-    "needs you" banner survived long after the worker had resumed.
-    """
+    """waiting_input must not be sticky: a worker that gets going again stops needing the user"""
     daemon = started
     wo = ops.create_work_order("proj_a", "task")
     daemon.tick()
@@ -973,11 +844,7 @@ def test_wo_not_found(started):
 
 
 def test_wo_lookup_scoped_to_unregistered_project(started):
-    """A deep link can name a project the OS does not know — a notification that
-    outlived its project, a typo, a test fixture that leaked into a real sink.
-    That must arrive as an OpsError: the CLI and the dashboard only catch OpsError,
-    so a raw KeyError here becomes a traceback and an HTTP 500.
-    """
+    """A deep link can name a project the OS does not know"""
     with pytest.raises(ops.OpsError, match="not registered"):
         ops.find_work_order("wo-4fdb20ba", "proj_gone")
 
@@ -1028,26 +895,14 @@ def test_pretooluse_allows_worker_edits_in_own_worktree(tmp_path):
 
 def test_with_validation_disabled_finish_settles_exactly_as_before(
         started, fake_claude, project, settle_turns):
-    """THE REGRESSION PIN FOR THE WHOLE VALIDATION FEATURE.
-
-    The panel ships disabled, and the promise at that default is not "roughly the same":
-    it is the same statuses, the same events, the same number of `claude` calls, not one
-    row in `validation_rounds` and not one envelope. If a change alters what a
-    default-configured OS does when a worker finishes, it is wrong, and this is where
-    that is caught.
-
-    Asserted on STORED ROWS and CALL COUNTS rather than on "it finished": validation
-    defaults off, so a test that merely reaches a good ending proves nothing about which
-    path produced it.
-    """
+    """THE REGRESSION PIN FOR THE WHOLE VALIDATION FEATURE"""
     daemon = started
     wo = ops.create_work_order("proj_a", "task")
     daemon.tick()
     store = ProjectStore(project)
     calls_before = len(turn_calls(fake_claude, expect=1))
 
-    # `--evidence` is optional and predates nothing: passing it must not switch anything
-    # on by itself. Only the catalog flag may do that.
+    # `--evidence` is optional and predates nothing: passing it must not switch anything on by itself
     result = ops.finish(wo["id"], "done", evidence="ran the suite: 412 passed")
     assert result["status"] == "completed"
     assert settle_turns(store)

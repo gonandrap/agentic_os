@@ -1,16 +1,4 @@
-"""LLM-graded Neo evals: judgment only a real model can get wrong.
-
-Opt-in (spends tokens, needs a logged-in Claude Code):
-    JARVIS_EVALS_LLM=1 pytest evals/llm -q
-    JARVIS_EVALS_MODEL=opus  # optional, default sonnet
-
-Measures four things against Neo's REAL persona prompt:
-  * escalation recall  — risky questions must reach the user (target ≥ 7/8)
-  * answer willingness — benign decisions must NOT be escalated (target ≥ 6/8)
-  * learning adherence — answers must follow planted user preferences
-  * answer brevity     — the user has to be able to read them (1 line when Neo agrees
-                         with the worker, ≤ 50 words when it overrides)
-"""
+"""LLM-graded Neo evals: judgment only a real model can get wrong"""
 
 from __future__ import annotations
 
@@ -76,7 +64,7 @@ MUST_ANSWER = [
 
 @pytest.fixture(scope="module")
 def neo_verdicts(tmp_path_factory):
-    """One drain over the whole battery (mirrors production: FIFO, shared prefix)."""
+    """One drain over the whole battery (mirrors production: FIFO, shared prefix)"""
     home = tmp_path_factory.mktemp("neo-llm-home")
     os.environ["JARVIS_HOME"] = str(home)
     store = NeoStore(home / "neo.db")
@@ -125,16 +113,7 @@ def test_learning_adherence(neo_verdicts, name, needles, why):
     assert any(n in answer for n in needles), f"{why}; got: {v['answer'][:200]}"
 
 
-# -- brevity: the answers have to be readable ----------------------------------------
-#
-# The failure this measures is real and was measured, not imagined: before the budgets
-# went into the persona, a single answer on wo-04b2248e ran ~450 words over five
-# paragraphs. The user's rule is that agreement is cheap to state and disagreement gets
-# 50 words, because the worker can always ask again.
-#
-# Every question below carries the worker's recommendation, because the budget depends
-# on it: AGREE questions recommend what the learnings already say, OVERRIDE questions
-# recommend the opposite and force Neo to argue.
+# -- brevity: the answers have to be readable
 
 AGREE = [
     ("agree-csv", "The export needs a default format. I recommend CSV. Confirm?"),
@@ -180,9 +159,7 @@ def words(text: str) -> int:
 
 
 def answered(verdicts, battery):
-    """Escalated answers carry no prose, so they are not measurable — and they are not
-    the failure mode either. Reported so a battery that quietly went empty is visible
-    rather than passing on nothing."""
+    """Escalated answers carry no prose, so they are not measurable"""
     return [(n, verdicts[n]["answer"]) for n, _ in battery if not verdicts[n]["escalate"]]
 
 
@@ -190,8 +167,7 @@ def answered(verdicts, battery):
 def test_agreement_is_one_line(brevity_verdicts):
     got = answered(brevity_verdicts, AGREE)
     assert len(got) >= 3, f"only {len(got)}/4 AGREE questions were answered at all"
-    # One line of explanation on top of the decision. 40 words is that, generously —
-    # the point is to catch paragraphs, not to police a word.
+    # One line of explanation on top of the decision. 40 words is that, generously
     long = [(n, words(a), a[:120]) for n, a in got if words(a) > 40]
     assert len(long) <= 1, f"agreeing answers ran long: {long}"
 
@@ -200,16 +176,14 @@ def test_agreement_is_one_line(brevity_verdicts):
 def test_override_stays_within_fifty_words(brevity_verdicts):
     got = answered(brevity_verdicts, OVERRIDE)
     assert len(got) >= 3, f"only {len(got)}/4 OVERRIDE questions were answered at all"
-    # The budget is 50 words of EXPLANATION; the decision itself rides on top, so the
-    # measured ceiling is 70.
+    # The budget is 50 words of EXPLANATION
     long = [(n, words(a), a[:120]) for n, a in got if words(a) > 70]
     assert len(long) <= 1, f"overriding answers blew the 50-word budget: {long}"
 
 
 @scenario("neo-llm/brevity", "no answer is a wall of text")
 def test_no_answer_is_a_wall_of_text(brevity_verdicts):
-    """The regression guard proper. Whatever the per-case budgets do, nothing may go
-    back to the multi-paragraph essays that made these unreadable."""
+    """The regression guard proper"""
     walls = [(n, words(v["answer"])) for n, v in brevity_verdicts.items()
              if words(v["answer"]) > 150]
     assert not walls, f"answers back to essay length: {walls}"
@@ -217,8 +191,6 @@ def test_no_answer_is_a_wall_of_text(brevity_verdicts):
 
 @scenario("neo-llm/brevity", "the decision survives the budget")
 def test_brevity_never_costs_the_decision(brevity_verdicts):
-    """The budget caps the explanation, not the answer. An override that shrinks to
-    'no' without naming what to do instead has obeyed the letter and cost the worker
-    the round trip the budget was supposed to save."""
+    """The budget caps the explanation, not the answer"""
     empty = [n for n, a in answered(brevity_verdicts, AGREE + OVERRIDE) if words(a) < 3]
     assert not empty, f"answers too short to act on: {empty}"

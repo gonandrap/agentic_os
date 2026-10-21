@@ -1,10 +1,4 @@
-"""Hiding and deleting work orders.
-
-Hiding is presentation-only: the record stays, it just stops competing for the
-user's attention. Deleting is destructive and cascades — the work order and every
-row that hangs off it (events, messages, assumptions, notifications, central inbox
-entries) leave the database for good.
-"""
+"""Hiding and deleting work orders"""
 
 from __future__ import annotations
 
@@ -16,7 +10,7 @@ from jarvis import cli, ops
 from jarvis.central_store import CentralStore
 from jarvis.project_store import ProjectStore
 
-# -- store layer -------------------------------------------------------------------
+# -- store layer
 
 
 def test_hidden_work_orders_are_out_of_sight_but_still_there(project):
@@ -45,7 +39,7 @@ def test_unhide_puts_the_work_order_back(project):
 
 
 def test_hidden_work_orders_drop_out_of_the_summary(project):
-    """Hiding is how the user says 'stop counting this against me'."""
+    """Hiding is how the user says 'stop counting this against me'"""
     store = ProjectStore(project)
     wo = store.create_work_order("noisy")
     store.flag_attention(wo["id"], "needs you")
@@ -61,7 +55,7 @@ def test_hidden_work_orders_drop_out_of_the_summary(project):
 
 
 def test_claiming_ignores_hidden_work_orders(project):
-    """A hidden pending order is not dispatched — hiding parks the work."""
+    """A hidden pending order is not dispatched — hiding parks the work"""
     store = ProjectStore(project)
     hidden = store.create_work_order("hidden one")
     store.set_hidden(hidden["id"], True)
@@ -84,7 +78,7 @@ def test_delete_work_order_cascades(project):
 
     counts = store.delete_work_order(wo["id"])
 
-    # 3 events: the assumption, the approval request, and the queued message.
+    # 3 events: the assumption, the approval request, and the queued message
     assert counts == {"events": 3, "messages": 2, "turns": 1, "assumptions": 1,
                       "approvals": 1, "notifications": 1}
     with pytest.raises(KeyError):
@@ -95,9 +89,7 @@ def test_delete_work_order_cascades(project):
     assert store.pending_assumptions(wo["id"]) == []
     assert store.list_approvals(wo["id"]) == []
     assert store.unrouted_notifications() == []
-    # `wo_alarms` goes by ON DELETE CASCADE, so it is deliberately NOT a seventh key in
-    # `counts` — which means the `==` above would stay green with the cascade broken.
-    # This is the assertion that actually watches it.
+    # `wo_alarms` goes by ON DELETE CASCADE, so it is deliberately NOT a seventh key in `counts`
     assert store.alarms_of(wo["id"]) == []
     assert store.conn.execute("SELECT COUNT(*) c FROM wo_alarms").fetchone()["c"] == 0
     # the neighbour is untouched
@@ -112,7 +104,7 @@ def test_delete_unknown_work_order_raises(project):
         store.delete_work_order("wo-nope")
 
 
-# -- ops layer ---------------------------------------------------------------------
+# -- ops layer
 
 
 @pytest.fixture()
@@ -163,7 +155,7 @@ def test_ops_delete_removes_central_inbox_traces(started, project):
 
 
 def test_ops_delete_releases_the_backlog_item(started):
-    """Deleting a promoted work order must not leave the backlog pointing at a ghost."""
+    """Deleting a promoted work order must not leave the backlog pointing at a ghost"""
     central = CentralStore()
     item = central.add_backlog("proj_a", "some deferred thing")
     central.close()
@@ -180,7 +172,7 @@ def test_ops_delete_releases_the_backlog_item(started):
     assert row["status"] == "open"
 
 
-# -- CLI ---------------------------------------------------------------------------
+# -- CLI
 
 
 def test_cli_hide_unhide_and_list_filtering(started, capsys):
@@ -216,7 +208,7 @@ def test_cli_delete_requires_confirmation(started, capsys):
 
 
 def test_existing_databases_gain_the_hidden_column(project):
-    """Production DBs predate `hidden`; opening one must ALTER it in, not blow up."""
+    """Production DBs predate `hidden`; opening one must ALTER it in, not blow up"""
     store = ProjectStore(project)
     wo = store.create_work_order("from before the feature")
     store.conn.execute("ALTER TABLE work_orders DROP COLUMN hidden")  # simulate an old DB

@@ -167,6 +167,13 @@ is a registry entry; a missing key is not.
 
 ### Per status: the pass, and the predicate to import
 
+**Amendment 2026-10-19 (wo-715db5af, Neo 1987).** The gate pass (`ops.REVIEWS_GATE`,
+`daemon.reviews_gate`) is registered under **every** open status, not `waiting_input`
+alone: `gates.sweep_unargued` has no status filter, and filing an `awaiting_case` request
+does not park the row (`gates.file_request`), so a held request outlives whatever status
+it was filed under. `needs_review` and `budget_exhausted` keep their `none_because`
+sentences — they still have no pass of their own.
+
 All passes are `Daemon` methods called from `Daemon.tick` (`daemon.py:841-1075`).
 
 **`dispatching` and `running` — `Daemon.settle_turns`** (`daemon.py:5403`, settling via

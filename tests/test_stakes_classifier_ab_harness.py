@@ -1,15 +1,4 @@
-"""The stakes A/B's call cache, proven without spending a cent.
-
-`evals/llm/test_stakes_classifier_ab.py` is 495 corpus rows x N runs x 2 models of `claude
--p`, so it runs concurrently and caches every reply on disk to survive an interrupt. Both
-of those can make the eval LIE rather than fail: a cache that keeps serving replies after
-the prompt or the corpus changed reports a measurement of something that no longer exists,
-and a resumed run that reports zero latency and zero cost for its cached half reports a
-stopwatch that was not running.
-
-The eval itself is gated on `JARVIS_EVALS_LLM` and never runs here. Everything below
-drives the same code paths with a FAKE classifier: no model call, no network.
-"""
+"""The stakes A/B's call cache, proven without spending a cent"""
 
 from __future__ import annotations
 
@@ -31,8 +20,7 @@ def ab():
     spec = importlib.util.spec_from_file_location("_stakes_ab_under_test", EVAL_PATH)
     assert spec and spec.loader, f"cannot load {EVAL_PATH}"
     mod = importlib.util.module_from_spec(spec)
-    # Registered BEFORE exec: `@dataclass` resolves its string annotations through
-    # `sys.modules[cls.__module__]`, which is None for a module loaded by hand.
+    # Registered BEFORE exec: `@dataclass` resolves its string annotations through...
     sys.modules[spec.name] = mod
     try:
         spec.loader.exec_module(mod)
@@ -88,8 +76,7 @@ def test_a_resumed_run_makes_no_call_it_already_paid_for(ab, corpus_file, tmp_pa
 
 
 def test_the_cache_is_keyed_per_run_not_per_row(ab, corpus_file, tmp_path, monkeypatch):
-    """Run 2 must not be served run 1's reply: the variance assertion measures exactly the
-    difference between two identical calls, and a row-keyed cache would report 0.000."""
+    """Run 2 must not be served run 1's reply: the variance assertion measures exactly the difference..."""
     seen: list[int] = []
     run_index = [0]
 
@@ -147,11 +134,7 @@ def test_the_cache_is_discarded_when_the_corpus_changes(ab, corpus_file, tmp_pat
 
 def test_the_cache_survives_an_interrupt_before_the_run_ends(ab, corpus_file, tmp_path,
                                                              monkeypatch):
-    """Written DURING the run, not at the end — the interrupted run is the case it is for.
-
-    The flush threshold is bypassed for the same reason a real interrupt would be: the
-    file on disk must already name the calls that completed.
-    """
+    """Written DURING the run, not at the end — the interrupted run is the case it is for"""
     monkeypatch.setattr(ab, "CACHE_FLUSH_EVERY", 1)
     monkeypatch.setattr(ab, "_classify", _fake(ab, [0]))
     cache_path = tmp_path / "cache.json"
@@ -180,8 +163,7 @@ def test_an_empty_cache_env_disables_the_cache(ab, corpus_file, tmp_path, monkey
 
 
 def test_the_ceiling_arm_defaults_to_one_run_and_variance_skips(ab):
-    """`CEILING_N=1` is the point of the knob; the variance assertion is about the
-    CANDIDATE, so with a one-run arm it must skip rather than take stdev of one sample."""
+    """`CEILING_N=1` is the point of the knob"""
     assert ab.CEILING_N == 1
     assert ab.N_RUNS == 3
 
@@ -191,14 +173,7 @@ def test_the_ceiling_arm_defaults_to_one_run_and_variance_skips(ab):
     assert excinfo.typename == "Skipped"
 
 
-# -- the cache must never store a call that never reached the API -----------------------
-#
-# MEASURED, and it is why this section exists: of 1485 haiku entries in the run of
-# 2026-09-25, 1280 had `parsed=False` and `cost_usd == 0.0` — every one made while the
-# session's usage limit was in force, turned into a HELD `Call` by `_classify`'s except
-# path and then CACHED. The scorecard reported haiku precision 0.04 as haiku's judgement
-# when it was a transport outage. `HELD` is the right SHIPPED behaviour for the daemon; a
-# measurement is not a decision, and an unreachable model made no judgement to record.
+# -- the cache must never store a call that never reached the API
 
 
 def _failed(ab, row_id: str = "r1"):
@@ -245,9 +220,7 @@ def test_a_re_run_retries_every_failed_call(ab, corpus_file, tmp_path, monkeypat
 
 
 def test_reached_is_not_inferred_from_a_zero_cost(ab, corpus_file, tmp_path, monkeypatch):
-    """A cheap call served off a cached prefix can legitimately report $0.00. Dropping it
-    would throw away real judgements, so `reached` is set explicitly and only False on
-    `_classify`'s exception path."""
+    """A cheap call served off a cached prefix can legitimately report $0.00"""
     monkeypatch.setattr(ab, "_classify",
                         lambda row, model, cwd: ab.Call(row["id"], True, 9.0, 0.0, True))
     cache_path = tmp_path / "cache.json"
@@ -262,8 +235,7 @@ def test_reached_is_not_inferred_from_a_zero_cost(ab, corpus_file, tmp_path, mon
 
 def test_a_transport_failure_and_an_unreadable_reply_are_different_findings(
         ab, tmp_path, monkeypatch):
-    """Both used to land as `parsed=False`. One says the model was never asked, the other
-    says it answered something nobody can read; the scorecard shows them apart."""
+    """Both used to land as `parsed=False`"""
     def transport(*_a, **_kw):
         raise RuntimeError("usage limit reached")
 
@@ -287,8 +259,7 @@ def test_a_transport_failure_and_an_unreadable_reply_are_different_findings(
 
 
 def test_the_cache_drops_poisoned_entries_on_load(ab, corpus_file, tmp_path):
-    """The one-shot repair: the file written by the poisoned run heals itself, keeping
-    every call that did reach the API."""
+    """The one-shot repair: the file written by the poisoned run heals itself"""
     cache_path = tmp_path / "cache.json"
     cache_path.write_text(json.dumps({
         "fingerprint": ab.fingerprint(corpus_file),
@@ -312,8 +283,7 @@ def test_the_cache_drops_poisoned_entries_on_load(ab, corpus_file, tmp_path):
 
 
 def test_a_poisoned_arm_refuses_to_be_scored(ab):
-    """An arm with a 5% transport-failure rate reporting a precision to three decimals is
-    exactly what happened. A printed warning would not have stopped it."""
+    """An arm with a 5% transport-failure rate reporting a precision to three decimals is exactly what..."""
     clean = [ab.Metrics(0.5, 0.5, 0.5, calls=100, failed=2)]
     poisoned = [ab.Metrics(0.04, 0.9, 0.07, calls=100, failed=5)]
 
@@ -330,8 +300,7 @@ def test_a_poisoned_arm_refuses_to_be_scored(ab):
 
 
 def test_the_other_assertions_skip_rather_than_pass_on_a_poisoned_arm(ab):
-    """Their numbers are computed from holds nobody ruled on. Passing green off those is
-    the failure mode; skipping says the run has to be repeated."""
+    """Their numbers are computed from holds nobody ruled on"""
     poisoned = {"per_run": {
         "haiku": [ab.Metrics(1.0, 1.0, 1.0, calls=100, failed=50)],
         "sonnet": [ab.Metrics(1.0, 1.0, 1.0, calls=100, failed=0)],
@@ -351,8 +320,7 @@ def test_the_other_assertions_skip_rather_than_pass_on_a_poisoned_arm(ab):
 
 
 def test_the_eval_gives_the_classifier_no_tools_either(ab, tmp_path, monkeypatch):
-    """The same pin as the daemon's. A classifier that can read the repository is a
-    different classifier from the one these numbers measure."""
+    """The same pin as the daemon's"""
     seen: dict = {}
 
     def transport(prompt, **kw):

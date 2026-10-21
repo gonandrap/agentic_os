@@ -1,14 +1,4 @@
-"""The plan validator — the backstop that runs whether or not Neo is paying attention.
-
-Neo, not the user, is the routine reviewer of plans, and the design calls the two
-backstops that reversal rests on (this and the child cap) load-bearing rather than
-nice-to-have. So these tests are written against the rejections by NAME, not
-against whatever the implementation happens to catch: a future simplification that drops
-one of them should fail here loudly.
-
-No fixtures, no database, no daemon. `plans.py` is pure functions over a submitted
-document on purpose — the checker has to be more trustworthy than the thing it checks.
-"""
+"""The plan validator — the backstop that runs whether or not Neo is paying attention"""
 
 from __future__ import annotations
 
@@ -26,13 +16,12 @@ from jarvis.plans import (
     render_plan,
     spec_problems,
 )
-from jarvis.sections import clip_at_heading
 from jarvis.testing import fixture_spec_section
 
 
 def child(key: str, needs: list[str] | None = None, description: str | None = None,
           title: str | None = None, section: str | None = None) -> dict:
-    """A child that passes every check, so a test can break exactly one thing."""
+    """A child that passes every check, so a test can break exactly one thing"""
     return {
         "key": key,
         "title": title if title is not None else f"Do the {key} piece",
@@ -47,13 +36,11 @@ def child(key: str, needs: list[str] | None = None, description: str | None = No
 
 
 def plan(*children: dict, **extra) -> dict:
-    """A plan that passes every check. `design_doc` is defaulted rather than written
-    into each call so a test can knock out exactly the rule it is about — pass
-    `design_doc=""` to make it a plan that names no design document."""
+    """A plan that passes every check"""
     return {"design_doc": "docs/superpowers/specs/budgets.md", "children": list(children), **extra}
 
 
-# -- the shape ------------------------------------------------------------------------
+# -- the shape
 
 
 def test_a_well_formed_plan_comes_back_normalised():
@@ -61,8 +48,7 @@ def test_a_well_formed_plan_comes_back_normalised():
                           summary="  add budgets  "))
 
     assert out["summary"] == "add budgets"
-    # Deduplicated, first-seen order, and the optional field is present rather than
-    # absent — everything downstream reads the normalised document, never the raw one.
+    # Deduplicated, first-seen order, and the optional field is present rather than absent
     assert out["children"][1]["needs"] == ["schema"]
     assert out["children"][0]["acceptance"] == ""
 
@@ -75,7 +61,7 @@ def test_a_plan_that_is_not_an_object_or_has_no_children_is_refused():
 
 
 def test_every_problem_is_reported_at_once():
-    """A planner that has to resubmit per problem burns a session round trip per line."""
+    """A planner that has to resubmit per problem burns a session round trip per line"""
     with pytest.raises(PlanError) as e:
         parse_plan(plan(child("a", description="too short"),
                         child("b", title="", needs=["nope"])))
@@ -83,13 +69,11 @@ def test_every_problem_is_reported_at_once():
     assert len(e.value.problems) >= 3
 
 
-# -- rejection 1: cycles ---------------------------------------------------------------
+# -- rejection 1: cycles
 
 
 def test_a_dependency_cycle_is_refused_and_names_the_ring():
-    """Phase 1's edges are acyclic BY CONSTRUCTION — an edge may only point at a row
-    that already exists. A plan is written before any row exists, so that argument does
-    not reach it and this is the real cycle check Phase 1 said was owed."""
+    """Phase 1's edges are acyclic BY CONSTRUCTION — an edge may only point at a row that already exists"""
     with pytest.raises(PlanError) as e:
         parse_plan(plan(child("a", needs=["b"]), child("b", needs=["c"]),
                         child("c", needs=["a"])))
@@ -111,18 +95,17 @@ def test_two_separate_cycles_are_both_reported():
 
 
 def test_a_diamond_is_not_a_cycle():
-    """The shape a real decomposition makes constantly: two independent pieces on one
-    schema change, joined by a third. A cycle checker that flags this is unusable."""
+    """The shape a real decomposition makes constantly: two independent pieces on one schema change"""
     parse_plan(plan(child("schema"), child("left", needs=["schema"]),
                     child("right", needs=["schema"]),
                     child("join", needs=["left", "right"])))
 
 
-# -- rejection 2: unknown ids ----------------------------------------------------------
+# -- rejection 2: unknown ids
 
 
 def test_a_need_naming_nothing_in_the_plan_is_refused():
-    """The failure that looks most like success: it would land as a child with no edge."""
+    """The failure that looks most like success: it would land as a child with no edge"""
     with pytest.raises(PlanError, match="not a child of this plan"):
         parse_plan(plan(child("a"), child("b", needs=["wo-12345678"])))
 
@@ -132,7 +115,7 @@ def test_duplicate_keys_are_refused():
         parse_plan(plan(child("a"), child("a")))
 
 
-# -- rejection 3: the child cap --------------------------------------------------------
+# -- rejection 3: the child cap
 
 
 def test_a_plan_at_the_cap_needs_no_justification():
@@ -153,7 +136,7 @@ def test_over_the_cap_with_a_justification_validates():
     assert out["justification"]
 
 
-# -- rejection 4: descriptions that do not stand alone ---------------------------------
+# -- rejection 4: descriptions that do not stand alone
 
 
 @pytest.mark.parametrize("description", [
@@ -163,9 +146,7 @@ def test_over_the_cap_with_a_justification_validates():
     "Implement the second half of the work set out above, with tests alongside it too.",
 ])
 def test_a_description_pointing_outside_itself_is_refused(description):
-    """The child worker sees its description and NOTHING else — not the plan, not its
-    siblings, not this conversation. A sentence pointing at any of them hands a worker a
-    reference it cannot follow."""
+    """The child worker sees its description and NOTHING else"""
     with pytest.raises(PlanError) as e:
         parse_plan(plan(child("a", description=description)))
 
@@ -173,18 +154,15 @@ def test_a_description_pointing_outside_itself_is_refused(description):
 
 
 @pytest.mark.parametrize("description", [
-    # 'As described below' points at the rest of this description, which the worker
-    # does get.
+    # 'As described below' points at the rest of this description, which the worker does get
     "Add the budget column and the API that reads it, as described below. The column "
     "is nullable, defaults to NULL, and the API omits it entirely when it is unset.",
-    # An ordinal is how a good standalone brief is structured, not a reference out of it.
+    # An ordinal is how a good standalone brief is structured, not a reference out of it
     "The first step is to add the budget column, nullable and defaulting to NULL. The "
     "second is to teach the serializer to omit it when unset. Test both together.",
 ])
 def test_a_description_pointing_INTO_itself_is_fine(description):
-    """The negative control for the phrase list, and the half that keeps it honest. A
-    checker that rejects good prose trains planners to write worse prose to get past
-    it — which costs exactly the context this check exists to protect."""
+    """The negative control for the phrase list, and the half that keeps it honest"""
     parse_plan(plan(child("a", description=description)))
 
 
@@ -204,10 +182,7 @@ def test_a_missing_description_says_why_it_matters():
         parse_plan(plan(child("a", description="")))
 
 
-# -- rejection 5: descriptions that do not stop ----------------------------------------
-# The mirror of rejection 4, and the one the prose could not enforce: `_planner_prompt`
-# has said "a brief, not an encyclopedia" for as long as the design-document field has
-# existed, and planners still shipped six-kilobyte briefs restating their spec.
+# -- rejection 5: descriptions that do not stop
 
 
 def test_a_description_over_the_ceiling_is_refused():
@@ -219,7 +194,7 @@ def test_a_description_over_the_ceiling_is_refused():
 
 
 def test_the_ceiling_names_the_way_out():
-    """A rejection that does not say what to do instead just gets reworded prose back."""
+    """A rejection that does not say what to do instead just gets reworded prose back"""
     fat = "x" * (MAX_DESCRIPTION_CHARS + 1)
     with pytest.raises(PlanError) as e:
         parse_plan(plan(child("schema", description=fat)))
@@ -228,16 +203,14 @@ def test_the_ceiling_names_the_way_out():
 
 
 def test_a_description_right_at_the_ceiling_is_fine():
-    """The boundary is inclusive: a brief may BE the maximum, not merely approach it."""
+    """The boundary is inclusive: a brief may BE the maximum, not merely approach it"""
     ok = "Ship the schema piece. " + "x" * (MAX_DESCRIPTION_CHARS - 23)
     assert len(ok) == MAX_DESCRIPTION_CHARS
     out = parse_plan(plan(child("schema", description=ok)))
     assert out["children"][0]["description"] == ok
 
 
-# -- rejection 6: a plan standing on no design document --------------------------------
-# The ceiling above is only affordable because a brief may CITE a document instead of
-# carrying it. So the document has to exist — or be the first thing the plan builds.
+# -- rejection 6: a plan standing on no design document
 
 
 def test_a_plan_with_no_design_document_at_all_is_refused():
@@ -246,17 +219,12 @@ def test_a_plan_with_no_design_document_at_all_is_refused():
 
 
 def test_there_is_no_escape_hatch_for_a_spec_that_does_not_exist_yet():
-    """`design_doc_by` — naming the CHILD that would write the spec — was removed with
-    this rejection's tightening (Neo, question 179). A plan whose spec does not exist
-    cannot be checked at submission, which is the whole point of the checks around it;
-    a stray `design_doc_by` is now just an ignored key, never a second way to pass."""
+    """`design_doc_by` — naming the CHILD that would write the spec"""
     with pytest.raises(PlanError, match="design_doc"):
         parse_plan(plan(child("schema"), design_doc="", design_doc_by="schema"))
 
 
-# -- rejection 7: children that do not line up with the spec's sections ----------------
-# Pure over the plan + the spec's TEXT, so it lives in `spec_problems` and is called by
-# `ops.submit_plan`, which is the one place holding both.
+# -- rejection 7: children that do not line up with the spec's sections
 
 
 DOC = ("# Budgets\n\n## 1. Schema\n\nThe table.\n\n## 2. API\n\nThe endpoint.\n\n"
@@ -277,8 +245,7 @@ def test_a_section_that_matches_no_heading_is_refused():
 
 
 def test_two_children_may_not_claim_the_same_section():
-    """The mechanical form of "the spec's boundaries are the split": a boundary two work
-    orders share is a boundary the planner did not cut."""
+    """The mechanical form of "the spec's boundaries are the split": a boundary two work orders share is a..."""
     problems = spec_problems(
         parse_plan(plan(child("schema", section="1"), child("api", section="1"))), DOC)
     assert any("both claim section" in p for p in problems)
@@ -291,35 +258,31 @@ def test_a_child_may_not_claim_the_agent_profile_appendix():
 
 
 def test_a_spec_with_no_agent_profile_is_refused():
-    """Every feature builds its agent type from that appendix, so a spec without one is
-    a feature whose children have no persona to run as."""
+    """Every feature builds its agent type from that appendix"""
     bare = "# Budgets\n\n## 1. Schema\n\nThe table.\n"
     problems = spec_problems(parse_plan(plan(child("schema", section="1"))), bare)
     assert any("Agent profile" in p for p in problems)
 
 
 def test_a_stub_agent_profile_is_refused():
-    """A heading with one line under it is a placeholder, not a system prompt."""
+    """A heading with one line under it is a placeholder, not a system prompt"""
     stub = "# Budgets\n\n## 1. Schema\n\nThe table.\n\n## Agent profile\n\nBe good.\n"
     problems = spec_problems(parse_plan(plan(child("schema", section="1"))), stub)
     assert any("under the" in p for p in problems)
 
 
 def test_a_child_with_no_section_at_all_is_refused_by_parse_plan():
-    """Reported by `parse_plan`, not `spec_problems`: it needs no document to see it,
-    and a planner should learn it in the same revision as everything else structural."""
+    """Reported by `parse_plan`, not `spec_problems`: it needs no document to see it"""
     naked = {**child("schema"), "spec_section": ""}
     with pytest.raises(PlanError, match="spec_section"):
         parse_plan(plan(naked))
 
 
-# -- creation order --------------------------------------------------------------------
+# -- creation order
 
 
 def test_children_are_ordered_so_every_edge_points_backwards():
-    """Not tidiness: `create_work_order` refuses an edge pointing at a row that does not
-    exist yet, and that refusal is what keeps the live graph acyclic by construction.
-    Creating in this order is what lets a validated plan land through it unchanged."""
+    """Not tidiness: `create_work_order` refuses an edge pointing at a row that does not exist yet"""
     out = parse_plan(plan(child("last", needs=["middle"]), child("first"),
                           child("middle", needs=["first"])))
 
@@ -334,11 +297,11 @@ def test_independent_children_keep_the_order_the_planner_wrote_them_in():
     assert [c["key"] for c in creation_order(out["children"])] == ["b", "a", "c"]
 
 
-# -- rendering -------------------------------------------------------------------------
+# -- rendering
 
 
 def test_the_rendered_plan_carries_what_a_reviewer_has_to_judge():
-    """One renderer, so Neo reviews the same text the user sees when Neo escalates."""
+    """One renderer, so Neo reviews the same text the user sees when Neo escalates"""
     out = parse_plan(plan(child("schema"), child("api", needs=["schema"]),
                           summary="add budgets"))
 
@@ -349,47 +312,40 @@ def test_the_rendered_plan_carries_what_a_reviewer_has_to_judge():
     assert out["children"][0]["description"] in text
 
 
-# -- the spec that travels with the question (issue #746) --------------------------------
+# -- the spec that travels with the question (issue #746)
 
 
-def test_the_context_carries_the_spec_and_forbids_reading_disk():
-    """§5: the reviewer gets the text, its provenance, and the refusal to go hunting."""
+def test_the_context_is_the_heading_outline_and_forbids_reading_disk():
+    """Neo ruling Q1880: the OUTLINE, never the document"""
     plan = {"design_doc": "docs/superpowers/specs/x.md",
-            "design_doc_content": "# X\n\n## 1. Shape\n\nOne module.\n"}
+            "design_doc_content": "# X\n\n## 1. Shape\n\nOne module.\n\n### Detail\n\nNo.\n"}
 
     context = build_plan_context(plan, "main @ fb7739d")
 
     assert context.startswith(
         "SPEC UNDER REVIEW — docs/superpowers/specs/x.md, as committed on main @ fb7739d.")
     assert "Do NOT open this path on disk" in context
-    assert "One module." in context
-    assert "TRUNCATED" not in context
+    assert "# X" in context and "## 1. Shape" in context and "### Detail" in context
+    assert "One module." not in context and "No." not in context
 
 
-def test_a_clipped_spec_says_so_and_names_every_section_it_dropped():
-    """§10: a silently clipped spec the reviewer believes is whole recreates 658."""
+def test_the_outline_carries_every_heading_in_order_and_no_body_prose():
+    """Q1880: no clipping to judge — every heading survives, no body prose does"""
     body = "\n".join(f"## {n}. Piece {n}\n\nbody{n} " + "x" * 400
                      for n in range(1, 40))
     plan = {"design_doc": "docs/superpowers/specs/x.md", "design_doc_content": body}
 
-    context = build_plan_context(plan, "main @ abc1234", max_chars=2000)
+    context = build_plan_context(plan, "main @ abc1234")
 
-    assert "TRUNCATED at " in context and f" of {len(body)} characters" in context
-    assert "body1 " in context
-    assert "## 39. Piece 39" in context   # every omitted heading, verbatim
-    assert "body39 " not in context       # and none of their text
-
-
-def test_clipping_cuts_at_a_heading_and_never_mid_sentence():
-    doc = "# Top\n\nintro\n\n## 1. One\n\naaaa\n\n## 2. Two\n\nbbbb\n"
-
-    kept, omitted = clip_at_heading(doc, 35)
-
-    assert kept == "# Top\n\nintro\n\n## 1. One\n\naaaa"
-    assert omitted == ["## 2. Two"]
+    headings = [f"## {n}. Piece {n}" for n in range(1, 40)]
+    positions = [context.index(h) for h in headings]
+    assert positions == sorted(positions)
+    assert "body1 " not in context and "body39 " not in context
+    assert "x" * 100 not in context
 
 
-def test_a_document_that_fits_is_returned_whole_with_nothing_omitted():
-    doc = "# Top\n\n## 1. One\n\naaaa\n"
-
-    assert clip_at_heading(doc, 10_000) == (doc, [])
+def test_an_unresolvable_document_is_refused_rather_than_substituted():
+    """The ask/assume path's refusal shape: nothing is substituted for a document that does not resolve"""
+    with pytest.raises(PlanError, match="docs/superpowers/specs/x.md"):
+        build_plan_context({"design_doc": "docs/superpowers/specs/x.md",
+                            "design_doc_content": ""}, "main @ abc1234")

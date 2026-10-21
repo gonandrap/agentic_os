@@ -1,10 +1,4 @@
-"""Bug reporting: any agent in the fleet can file a Jarvis OS bug from one command.
-
-A report becomes a GitHub issue on the OS repo (rendered from a fixed template that
-always carries the running Jarvis version) and a Telegram ping carrying the issue link.
-Both halves matter: a report that silently fails to file is worse than no report at all,
-so failures raise instead of half-succeeding.
-"""
+"""Bug reporting: any agent in the fleet can file a Jarvis OS bug from one command"""
 
 import json as _json
 import os as _os
@@ -16,8 +10,7 @@ from jarvis import bugreport, cli
 
 @pytest.fixture()
 def started_project_wo(jarvis_home, fake_claude, catalog_file, project):
-    """A started OS that has dispatched one work order, so the spawn call can be
-    inspected for how the worker was wired up."""
+    """A started OS that has dispatched one work order"""
     from jarvis import ops
     from jarvis.catalog import load_catalog
     from jarvis.daemon import Daemon
@@ -29,17 +22,13 @@ def started_project_wo(jarvis_home, fake_claude, catalog_file, project):
 
 @pytest.fixture()
 def reporting(jarvis_home, fake_claude, fake_gh, catalog_file):
-    """A started OS with a fake `gh`, so reports have somewhere to go.
-
-    `fake_claude` is required even though nothing here spawns a session: starting the
-    OS refuses to proceed without a `claude` binary on PATH.
-    """
+    """A started OS with a fake `gh`, so reports have somewhere to go"""
     from jarvis import ops
     ops.start_os(str(catalog_file), foreground=True)
     return fake_gh
 
 
-# -- the template ---------------------------------------------------------------
+# -- the template
 
 
 def test_body_carries_every_template_section():
@@ -85,18 +74,12 @@ def test_optional_steps_appear_only_when_given():
     assert "Steps to reproduce" in with_steps and "jarvis status" in with_steps
 
 
-# -- which Jarvis is running ----------------------------------------------------
-#
-# The requirement under every test here: the reported string must never be a number
-# that was never released. main's pyproject deliberately lags the shipped version (the
-# bump lives only on release branches), so dist metadata alone invents releases in the
-# dev checkout — issue #51, where a bug filed from dev recorded 0.1.1 while production
-# ran 0.2.1.
+# -- which Jarvis is running
 
 
 @pytest.fixture(autouse=True)
 def _uncached_version():
-    """`jarvis_version` is cached for the dashboard's sake; tests need it re-resolved."""
+    """`jarvis_version` is cached for the dashboard's sake; tests need it re-resolved"""
     bugreport.jarvis_version.cache_clear()
     yield
     bugreport.jarvis_version.cache_clear()
@@ -114,16 +97,14 @@ def _git(cwd, *args):
 
 @pytest.fixture()
 def checkout(tmp_path, monkeypatch):
-    """A throwaway git checkout laid out like this repo, with one release tag on a
-    branch that is NOT an ancestor of main — exactly how shipit leaves the real repo."""
+    """A throwaway git checkout laid out like this repo"""
     root = tmp_path / "jarvis_os"
     (root / "src" / "jarvis").mkdir(parents=True)
     (root / "src" / "jarvis" / "__init__.py").write_text("")
     _git(root, "init", "-q", "-b", "main")
     _git(root, "add", "-A")
     _git(root, "commit", "-qm", "first")
-    # The release cut: a branch off main carrying the bump commit and the tag, never
-    # merged back. main therefore has no reachable jarvis-* tag, ever.
+    # The release cut: a branch off main carrying the bump commit and the tag
     _git(root, "checkout", "-q", "-b", "release/jarvis-1.2.3")
     (root / "pyproject.toml").write_text('version = "1.2.3"\n')
     _git(root, "add", "-A")
@@ -135,14 +116,13 @@ def checkout(tmp_path, monkeypatch):
 
 
 def test_production_reports_the_release_tag_it_is_detached_at(checkout):
-    """Production is `git checkout -f jarvis-X.Y.Z`, so HEAD *is* the release."""
+    """Production is `git checkout -f jarvis-X.Y.Z`, so HEAD *is* the release"""
     _git(checkout, "checkout", "-q", "jarvis-1.2.3")
     assert bugreport.jarvis_version() == "1.2.3"
 
 
 def test_dev_checkout_reports_a_commit_never_a_version_number(checkout):
-    """The issue-#51 regression: on main there is no reachable tag, and dist metadata
-    would hand back a pyproject number that never shipped."""
+    """The issue-#51 regression: on main there is no reachable tag"""
     version = bugreport.jarvis_version()
     head = _git(checkout, "rev-parse", "--short", "HEAD")
     assert version == f"dev-{head}"
@@ -150,12 +130,7 @@ def test_dev_checkout_reports_a_commit_never_a_version_number(checkout):
 
 
 def test_a_failing_git_describe_falls_through_instead_of_propagating(checkout):
-    """Guards the reason this code asks `--exact-match` rather than describing HEAD.
-
-    Release tags are descendants of main, so on a dev HEAD `git describe` does not
-    return a stale answer — it exits non-zero with "No tags can describe". That fatal
-    must become the dev string, never an exception and never an empty version.
-    """
+    """Guards the reason this code asks `--exact-match` rather than describing HEAD"""
     import subprocess
     described = subprocess.run(
         ["git", "-C", str(checkout), "describe", "--tags", "--match", "jarvis-*"],
@@ -169,22 +144,21 @@ def test_a_failing_git_describe_falls_through_instead_of_propagating(checkout):
 
 
 def test_uncommitted_changes_are_flagged_on_a_release_too(checkout):
-    """A hand-edited production checkout is not the release it claims to be."""
+    """A hand-edited production checkout is not the release it claims to be"""
     _git(checkout, "checkout", "-q", "jarvis-1.2.3")
     (checkout / "pyproject.toml").write_text('version = "9.9.9"\n')
     assert bugreport.jarvis_version() == "1.2.3-dirty"
 
 
 def test_untracked_scratch_files_do_not_count_as_dirty(checkout):
-    """Workers leave scratch files everywhere; only tracked changes alter the code."""
+    """Workers leave scratch files everywhere; only tracked changes alter the code"""
     (checkout / "notes.md").write_text("scratch")
     assert bugreport.jarvis_version().endswith(_git(checkout, "rev-parse", "--short",
                                                     "HEAD"))
 
 
 def test_a_wheel_install_falls_back_to_dist_metadata(tmp_path, monkeypatch):
-    """No checkout, no git answer — and dist metadata is correct there anyway, because
-    the wheel was built from the tag whose pyproject carries the bump."""
+    """No checkout, no git answer — and dist metadata is correct there anyway"""
     from importlib.metadata import version as dist_version
     site = tmp_path / "site-packages" / "jarvis"
     site.mkdir(parents=True)
@@ -194,8 +168,7 @@ def test_a_wheel_install_falls_back_to_dist_metadata(tmp_path, monkeypatch):
 
 def test_an_unrelated_enclosing_repo_is_not_mistaken_for_a_jarvis_checkout(
         tmp_path, monkeypatch):
-    """A venv under someone else's project puts our package inside THEIR repo. Reporting
-    their commit as the Jarvis version would be the same lie in a new costume."""
+    """A venv under someone else's project puts our package inside THEIR repo"""
     from importlib.metadata import version as dist_version
     other = tmp_path / "someones_project"
     site = other / ".venv" / "lib" / "python3.13" / "site-packages" / "jarvis"
@@ -209,14 +182,14 @@ def test_an_unrelated_enclosing_repo_is_not_mistaken_for_a_jarvis_checkout(
 
 
 def test_version_never_raises_even_when_git_explodes(monkeypatch):
-    """Three surfaces render this string, one of them a web page. It must not throw."""
+    """Three surfaces render this string, one of them a web page"""
     def boom(*_a, **_k):
         raise RuntimeError("git went sideways")
     monkeypatch.setattr(bugreport, "_jarvis_checkout", boom)
     assert bugreport.jarvis_version()
 
 
-# -- filing the issue -----------------------------------------------------------
+# -- filing the issue
 
 
 def test_report_files_a_github_issue_labelled_bug(reporting):
@@ -224,15 +197,14 @@ def test_report_files_a_github_issue_labelled_bug(reporting):
                          expected="e", actual="a", priority="low")
     call = reporting.calls[-1]
     assert call["argv"][:3] == ["issue", "create", "--repo"]
-    # The fixture's tracker, which nobody owns — `fake_gh` moves `bug_repo()` so that a
-    # test escaping the fake `gh` cannot write to the live one.
+    # The fixture's tracker, which nobody owns
     assert call["argv"][3] == reporting.repo
     assert "--label" in call["argv"]
     assert call["argv"][call["argv"].index("--label") + 1] == "bug"
 
 
 def test_report_sends_the_body_over_stdin_not_argv(reporting):
-    """Bodies carry stack traces and logs; argv has a length limit, stdin does not."""
+    """Bodies carry stack traces and logs; argv has a length limit, stdin does not"""
     bugreport.report_bug(title="t", description="d" * 5000, expected="e", actual="a", priority="low")
     call = reporting.calls[-1]
     assert "--body-file" in call["argv"]
@@ -252,7 +224,7 @@ def test_report_targets_an_overridable_repo(reporting, monkeypatch):
     assert reporting.calls[-1]["argv"][3] == "someone/elsewhere"
 
 
-# -- notifying the user ---------------------------------------------------------
+# -- notifying the user
 
 
 def test_report_notifies_the_user_with_the_issue_link(reporting):
@@ -269,7 +241,7 @@ def test_report_notifies_the_user_with_the_issue_link(reporting):
     assert any("wo send is lost" in i["title"] for i in items)
 
 
-# -- failing loudly -------------------------------------------------------------
+# -- failing loudly
 
 
 def test_a_failed_filing_raises_rather_than_reporting_success(reporting):
@@ -280,7 +252,7 @@ def test_a_failed_filing_raises_rather_than_reporting_success(reporting):
 
 
 def test_a_failed_filing_does_not_notify(reporting):
-    """A Telegram ping with no issue behind it trains the user to distrust the pings."""
+    """A Telegram ping with no issue behind it trains the user to distrust the pings"""
     from jarvis.central_store import CentralStore
     reporting.fail("boom")
     with pytest.raises(bugreport.BugReportError):
@@ -293,9 +265,7 @@ def test_a_failed_filing_does_not_notify(reporting):
 
 
 def test_a_missing_gh_blames_path_not_the_user_s_installation(reporting, monkeypatch):
-    """Issue #90: `gh` WAS installed (a snap), it was simply absent from the systemd
-    unit's PATH — and the old message sent the user off to reinstall it. The diagnosis
-    has to name what was searched, or the reader has no way to reach that conclusion."""
+    """Issue #90: `gh` WAS installed (a snap), it was simply absent from the systemd unit's PATH"""
     monkeypatch.setenv("JARVIS_GH_BIN", "/nonexistent/gh")
     monkeypatch.setenv("PATH", "/opt/only-this-dir")
 
@@ -309,18 +279,12 @@ def test_a_missing_gh_blames_path_not_the_user_s_installation(reporting, monkeyp
     assert "JARVIS_GH_BIN" in msg and "install_prod_service.sh" in msg
 
 
-# -- finding `gh` ---------------------------------------------------------------
-#
-# The daemon runs under systemd --user, which hands it none of a login shell's PATH.
-# On Ubuntu `gh` is a snap in /snap/bin, so PATH lookup alone found nothing and both
-# PR-merge polling and `jarvis bug report` were off fleet-wide (issues #41, #90). The
-# service unit's PATH is the primary fix; this scan is what heals a daemon whose unit
-# was rendered before it.
+# -- finding `gh`
 
 
 @pytest.fixture()
 def no_gh_on_path(monkeypatch, tmp_path):
-    """No override, and a PATH with no `gh` in it. Returns a dir to plant one in."""
+    """No override, and a PATH with no `gh` in it"""
     monkeypatch.delenv(bugreport.GH_BIN_ENV, raising=False)
     empty = tmp_path / "empty-path"
     empty.mkdir()
@@ -347,8 +311,7 @@ def test_gh_is_found_in_a_well_known_directory_when_path_has_it_not(
 
 
 def test_path_still_wins_over_the_fallback_scan(no_gh_on_path, monkeypatch, tmp_path):
-    """The scan is a last resort: whatever the operator put on PATH is the real answer,
-    and a stale copy in /usr/bin must not shadow it."""
+    """The scan is a last resort: whatever the operator put on PATH is the real answer"""
     on_path = tmp_path / "real-bin"
     on_path.mkdir()
     preferred = _plant_gh(on_path)
@@ -360,8 +323,7 @@ def test_path_still_wins_over_the_fallback_scan(no_gh_on_path, monkeypatch, tmp_
 
 
 def test_the_override_beats_everything(no_gh_on_path, monkeypatch):
-    """JARVIS_GH_BIN is how the test-isolation gate keeps a test off the real tracker,
-    so a fallback that could out-vote it would be a hole in that gate."""
+    """JARVIS_GH_BIN is how the test-isolation gate keeps a test off the real tracker"""
     _plant_gh(no_gh_on_path)
     monkeypatch.setattr(bugreport, "GH_SEARCH_DIRS", (str(no_gh_on_path),))
     monkeypatch.setenv(bugreport.GH_BIN_ENV, "/somewhere/else/gh")
@@ -377,16 +339,11 @@ def test_a_non_executable_file_named_gh_is_not_gh(no_gh_on_path, monkeypatch):
 
 
 def test_the_search_list_covers_the_snap_default():
-    """The list is mirrored in scripts/install_prod_service.sh; /snap/bin is the entry
-    issue #90 turned on, and dropping it silently re-breaks the fleet."""
+    """The list is mirrored in scripts/install_prod_service.sh (#90)"""
     assert "/snap/bin" in bugreport.GH_SEARCH_DIRS
 
 
-# -- heal_path: the half that reaches WORKERS -----------------------------------
-#
-# `gh_bin()` resolves `gh` for Python callers, and the service unit's PATH covers the
-# daemon — but a worker shells out to a bare `gh` from bash, so only the PATH the daemon
-# passes on reaches it. `heal_path` is what puts the missing directories there.
+# -- heal_path: the half that reaches WORKERS
 
 
 def test_heal_path_adds_a_missing_directory_that_exists(tmp_path, monkeypatch):
@@ -400,9 +357,7 @@ def test_heal_path_adds_a_missing_directory_that_exists(tmp_path, monkeypatch):
 
 
 def test_heal_path_appends_so_nothing_is_ever_shadowed(tmp_path, monkeypatch):
-    """APPEND, never prepend. The list includes /usr/bin and /bin, and a snap-installed
-    `node` or `python` ahead of the production venv would change which interpreter the
-    whole fleet runs — a far worse bug than the one being fixed."""
+    """APPEND, never prepend"""
     snap = tmp_path / "snap" / "bin"
     snap.mkdir(parents=True)
     monkeypatch.setattr(bugreport, "GH_SEARCH_DIRS", (str(snap),))
@@ -415,8 +370,7 @@ def test_heal_path_appends_so_nothing_is_ever_shadowed(tmp_path, monkeypatch):
 
 
 def test_heal_path_skips_directories_that_do_not_exist(tmp_path, monkeypatch):
-    """A PATH entry pointing nowhere is noise in every `command not found` message the
-    fleet ever prints, and it is what a naive 'just add them all' would leave behind."""
+    """A PATH entry pointing nowhere is noise in every `command not found` message the fleet ever prints"""
     monkeypatch.setattr(bugreport, "GH_SEARCH_DIRS", (str(tmp_path / "nope"),))
     env = {"PATH": "/usr/bin"}
 
@@ -437,8 +391,7 @@ def test_heal_path_is_idempotent(tmp_path, monkeypatch):
 
 
 def test_the_daemon_heals_its_path_before_it_spawns_anything(monkeypatch):
-    """Ordering is the whole point: a worker inherits `os.environ` as it stands when
-    `claude_cli.spawn_turn` copies it, so healing after the first dispatch is too late."""
+    """Ordering is the whole point: a worker inherits `os.environ` as it stands when..."""
     from jarvis import daemon
 
     order = []
@@ -464,7 +417,7 @@ def test_the_daemon_heals_its_path_before_it_spawns_anything(monkeypatch):
     assert order[0] == "heal"
 
 
-# -- the CLI --------------------------------------------------------------------
+# -- the CLI
 
 
 def test_cli_reports_a_bug_and_prints_the_url(reporting, capsys):
@@ -479,7 +432,7 @@ def test_cli_reports_a_bug_and_prints_the_url(reporting, capsys):
 
 
 def test_cli_requires_expected_and_actual(reporting):
-    """The template is the point — a freeform 'it broke' report is not acceptable."""
+    """The template is the point — a freeform 'it broke' report is not acceptable"""
     with pytest.raises(SystemExit):
         cli.main(["bug", "report", "t", "--description", "d"])
 
@@ -492,15 +445,14 @@ def test_cli_reports_the_failure_instead_of_exiting_zero(reporting, capsys):
     assert "gh exploded" in capsys.readouterr().err
 
 
-# -- getting the skill in front of every agent ----------------------------------
+# -- getting the skill in front of every agent
 
 
 SKILL = "report-jarvis-bug"
 
 
 def test_installing_agent_skills_lays_them_out_where_add_dir_finds_them(project):
-    """`--add-dir X` loads skills from X/.claude/skills/ (verified against the CLI),
-    which is the only injection point that reaches a worker in a fresh worktree."""
+    """`--add-dir X` loads skills from X/.claude/skills/ (verified against the CLI)"""
     from jarvis.bootstrap import install_agent_assets
     root = install_agent_assets(project)[0]
     assert (root / ".claude" / "skills" / SKILL / "SKILL.md").is_file()
@@ -516,7 +468,7 @@ def test_installing_agent_skills_is_idempotent_and_self_healing(project):
 
 
 def test_agent_skills_live_under_the_gitignored_state_dir(project):
-    """They are generated, not authored — they must never show up in `git status`."""
+    """They are generated, not authored — they must never show up in `git status`"""
     from jarvis.bootstrap import install_agent_assets
     root = install_agent_assets(project)[0]
     assert ".jarvis" in root.relative_to(project).parts
@@ -530,7 +482,7 @@ def test_the_skill_warns_that_the_tracker_is_public():
 
 
 def test_dispatch_points_the_worker_at_the_skill(started_project_wo):
-    """A skill the worker cannot load is not wired to anything."""
+    """A skill the worker cannot load is not wired to anything"""
     fake_claude, project_path = started_project_wo
     spawn = fake_claude.wait_calls(
         lambda c: "-p" in c["argv"] and "--session-id" in c["argv"])[-1]
@@ -542,8 +494,7 @@ def test_dispatch_points_the_worker_at_the_skill(started_project_wo):
 
 
 def test_this_repo_ships_the_skill_to_its_own_agents():
-    """agentic_os is itself a managed project; Jarvis and workers here need the skill
-    too, and for a worktree to see it, it must be git-tracked at the repo root."""
+    """agentic_os is itself a managed project"""
     from pathlib import Path
 
     from jarvis.bootstrap import ASSETS

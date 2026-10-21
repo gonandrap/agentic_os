@@ -1,13 +1,4 @@
-"""A turn whose process died without writing a result, and what the OS reads off disk.
-
-Issue #888, spec docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md. Three halves, in the
-order the OS meets them: the reap that harvests (§2), the checkpoint commit that keeps
-uncommitted work (§3), and the relaunch brief the harvest replaces `RETRY_NOTE` with
-(§6).
-
-NOTHING HERE FAKES GIT, for `tests/test_landing.py`'s reason: the harvest is a reading of
-what git actually says, and a fake would only test the fake.
-"""
+"""A turn whose process died without writing a result, and what the OS reads off disk (#888)"""
 
 from __future__ import annotations
 
@@ -48,12 +39,7 @@ def fleet(jarvis_home, fake_claude, catalog_file, project):
 
 
 def _order(fleet, *, code: str | None = None, dirty: str | None = None) -> dict:
-    """A work order with a worktree cut off `main`, carrying `code` and `dirty`.
-
-    `worktree` is set by `worker_session.start`; the directory is made here because the
-    fake CLI never honours `--worktree` (spec §7's "no worktree on disk" case is the
-    test that leaves it out).
-    """
+    """A work order with a worktree cut off `main`, carrying `code` and `dirty`"""
     project = fleet["path"]
     wo = ops.create_work_order("proj_a", "build the exporter")
     wt = project / ".claude" / "worktrees" / wo["id"]
@@ -68,8 +54,7 @@ def _order(fleet, *, code: str | None = None, dirty: str | None = None) -> dict:
 
 
 def _start(fleet, wo_id: str, mode: str = "silent") -> None:
-    """Launch turn 1 under a transport fault. `silent` is the issue's own shape: exit 0,
-    no result JSON, no stderr."""
+    """Launch turn 1 under a transport fault"""
     if mode == "silent":
         fleet["fake"].turns_fail("silent")
     store = fleet["store"]
@@ -77,13 +62,7 @@ def _start(fleet, wo_id: str, mode: str = "silent") -> None:
 
 
 def _dead_turn(fleet, wo_id: str, settle, said: str = "", during=None) -> dict:
-    """A real turn through the transport whose process wrote nothing at all.
-
-    The REAP is what has to harvest — nothing here is called by hand. `said` is the
-    worker's last words as the `Stop` hook recorded them, which is the only place they
-    exist for a turn that wrote no result. `during(turn)` runs after the launch and
-    before the reap: what the turn itself did, in the window the harvest reads (§2).
-    """
+    """A real turn through the transport whose process wrote nothing at all"""
     _start(fleet, wo_id)
     if said:
         fleet["store"].add_event(wo_id, "hook:Stop", {"last_assistant_message": said})
@@ -113,11 +92,11 @@ def _turn_started(store, wo_id: str, seq: int) -> dict:
     raise AssertionError(f"no turn_started for seq {seq}")
 
 
-# -- 1. what the reap reads off disk ---------------------------------------------------
+# -- 1. what the reap reads off disk
 
 
 def test_harvest_records_last_message_and_commits(fleet, settle_turns):
-    """§2: the payload names the turn, what the branch carries, and what it said."""
+    """§2: the payload names the turn, what the branch carries, and what it said"""
     wo = _order(fleet, code="exporter")
     turn = _dead_turn(fleet, wo["id"], settle_turns,
                       said="Exporter written; the CSV path is still untested.")
@@ -130,11 +109,11 @@ def test_harvest_records_last_message_and_commits(fleet, settle_turns):
     assert payload["authored"]["branch"] == f"worktree-{wo['id']}"
     assert payload["authored"]["commits"] == 1
     assert payload["authored"]["dirty"] == []
-    # Committed BEFORE the launch, so `head..HEAD` is empty: the turn itself made none.
+    # Committed BEFORE the launch, so `head..HEAD` is empty: the turn itself made none
     assert payload["since"] == "turn"
     assert payload["turn_commits"] == []
     assert payload["unreadable"] == ""
-    # §5: ONE render contract, and both surfaces read it.
+    # §5: ONE render contract, and both surfaces read it
     state = ops.harvest_state(fleet["store"], fleet["store"].get_work_order(wo["id"]))
     assert state["line"].startswith("1 commit on ")
     page = TestClient(create_app(), follow_redirects=False).get(
@@ -144,7 +123,7 @@ def test_harvest_records_last_message_and_commits(fleet, settle_turns):
 
 
 def test_turn_commits_are_scoped_to_the_launch_sha(fleet, settle_turns):
-    """§2: `turn_started.head` scopes the reading to THIS turn, not the whole order."""
+    """§2: `turn_started.head` scopes the reading to THIS turn, not the whole order"""
     wo = _order(fleet, code="exporter")
     wt = wo["worktree_path"]
     head_before = _git(wt, "rev-parse", "HEAD").strip()
@@ -162,13 +141,12 @@ def test_turn_commits_are_scoped_to_the_launch_sha(fleet, settle_turns):
     assert payload["since"] == "turn"
     assert len(payload["turn_commits"]) == 1
     assert after.startswith(payload["turn_commits"][0])
-    # The whole branch is two commits; only one of them was made in the turn.
+    # The whole branch is two commits; only one of them was made in the turn
     assert payload["authored"]["commits"] == 2
 
 
 def test_turn_commits_fall_back_to_the_order_span(fleet, settle_turns):
-    """§2: no `head` on the record — a turn launched before this shipped — so the span
-    is `base..HEAD` and the payload says `order` rather than guessing."""
+    """§2: no `head` on the record — a turn launched before this shipped"""
     wo = _order(fleet, code="exporter")
     wt = wo["worktree_path"]
     store = fleet["store"]
@@ -177,7 +155,7 @@ def test_turn_commits_fall_back_to_the_order_span(fleet, settle_turns):
         (wt / "csv_path.py").write_text("def csv_path():\n    return 3\n")
         _git(wt, "add", "-A")
         _git(wt, "commit", "-qm", "add csv_path")
-        # `_head_at_launch` reads the LAST `turn_started` for the seq, so this one wins.
+        # `_head_at_launch` reads the LAST `turn_started` for the seq, so this one wins
         store.add_event(wo["id"], "turn_started", {"seq": turn["seq"]})
 
     _dead_turn(fleet, wo["id"], settle_turns, during=commit_and_forget_the_head)
@@ -189,7 +167,7 @@ def test_turn_commits_fall_back_to_the_order_span(fleet, settle_turns):
 
 
 def test_harvest_checkpoints_uncommitted_work(fleet, settle_turns):
-    """§3: uncommitted edits outlive the worktree, as a local commit with the trailer."""
+    """§3: uncommitted edits outlive the worktree, as a local commit with the trailer"""
     wo = _order(fleet, dirty="halfway")
     wt = wo["worktree_path"]
     _dead_turn(fleet, wo["id"], settle_turns)
@@ -205,14 +183,14 @@ def test_harvest_checkpoints_uncommitted_work(fleet, settle_turns):
 
 
 def test_checkpoint_is_not_pushed_and_makes_no_branch(fleet, settle_turns):
-    """§3: local only. Never a push, never a new branch, never a pull request."""
+    """§3: local only"""
     wo = _order(fleet, dirty="halfway")
     wt = wo["worktree_path"]
     branches_before = _git(fleet["path"], "branch", "--list").splitlines()
     _dead_turn(fleet, wo["id"], settle_turns)
 
     assert _git(fleet["path"], "branch", "--list").splitlines() == branches_before
-    # No upstream was ever set, and the harvest did not set one.
+    # No upstream was ever set, and the harvest did not set one
     assert subprocess.run(["git", "-C", str(wt), "rev-parse", "--abbrev-ref",
                            "HEAD@{upstream}"], capture_output=True).returncode != 0
     payload = _harvest_payload(fleet["store"], wo["id"])
@@ -221,7 +199,7 @@ def test_checkpoint_is_not_pushed_and_makes_no_branch(fleet, settle_turns):
 
 
 def test_nothing_to_harvest_is_recorded_as_such(fleet, settle_turns):
-    """§7: the event IS written, and it never claims something was saved."""
+    """§7: the event IS written, and it never claims something was saved"""
     wo = _order(fleet)
     _dead_turn(fleet, wo["id"], settle_turns)
 
@@ -237,16 +215,14 @@ def test_nothing_to_harvest_is_recorded_as_such(fleet, settle_turns):
 
 
 def test_harvest_raises_turn_still_settles(fleet, settle_turns, monkeypatch):
-    """§7: the harvest is best effort and the settlement is not. Nothing escapes."""
+    """§7: the harvest is best effort and the settlement is not"""
     wo = _order(fleet, dirty="halfway")
 
     def boom(*a, **k):
         raise RuntimeError("harvest exploded")
 
     monkeypatch.setattr(harvest, "write", boom)
-    # Dispatched by the DAEMON here, unlike every test above: what is under test is that
-    # the settlement outlives the harvest, and the reconciler only settles an order it
-    # claimed.
+    # Dispatched by the DAEMON here, unlike every test above: what is under test is that the settlement...
     store = fleet["store"]
     fleet["fake"].turns_fail("silent")
     fleet["daemon"].tick()
@@ -261,8 +237,7 @@ def test_harvest_raises_turn_still_settles(fleet, settle_turns, monkeypatch):
 
 @pytest.mark.parametrize("fault", ["rate_limit", "api_error", "budget", "auth"])
 def test_no_harvest_on_pause_paths(fleet, settle_turns, fault):
-    """Decision 2: a PAUSE resumes the same session, and a commit under a live worker
-    surprises it mid-task. No harvest, no commit."""
+    """Decision 2: a PAUSE resumes the same session, and a commit under a live worker surprises it mid-task"""
     wo = _order(fleet, dirty="halfway")
     wt = wo["worktree_path"]
     head_before = _git(wt, "rev-parse", "HEAD").strip()
@@ -272,8 +247,7 @@ def test_no_harvest_on_pause_paths(fleet, settle_turns, fault):
     elif fault == "api_error":
         fake.turns_api_error(500)
     elif fault == "budget":
-        # Not a pause, and excluded for its own reason: the turn RAN and spent real
-        # money, and `finish_turn` takes it down the result branch, not this one.
+        # Not a pause, and excluded for its own reason: the turn RAN and spent real money
         fake.turns_fail("budget")
     else:
         fake.turns_auth_failed()
@@ -286,7 +260,7 @@ def test_no_harvest_on_pause_paths(fleet, settle_turns, fault):
 
 
 def test_harvest_skips_checkpoint_during_rebase(fleet, settle_turns):
-    """§7: no commit on top of a half-finished merge. The read-only half still runs."""
+    """§7: no commit on top of a half-finished merge"""
     wo = _order(fleet, code="exporter", dirty="halfway")
     wt = wo["worktree_path"]
     gitdir = Path(_git(wt, "rev-parse", "--absolute-git-dir").strip())
@@ -302,8 +276,7 @@ def test_harvest_skips_checkpoint_during_rebase(fleet, settle_turns):
 
 
 def test_refused_checkpoint_commit_records_gits_own_words(fleet, settle_turns):
-    """§7: git refuses the commit — ITS OWN STDERR is recorded, clipped to one line, and
-    the rest of the harvest stands."""
+    """§7: git refuses the commit — ITS OWN STDERR is recorded"""
     wo = _order(fleet, code="exporter", dirty="halfway")
     heads = fleet["path"] / ".git" / "refs" / "heads"
     heads.chmod(0o500)  # no ref lock can be made here, so the commit cannot land
@@ -330,9 +303,7 @@ def test_refused_checkpoint_commit_records_gits_own_words(fleet, settle_turns):
 
 def test_a_refusal_with_nothing_to_say_falls_back_to_the_fixed_reason(
         fleet, settle_turns, monkeypatch):
-    """§7: the fixed string is the FALLBACK — the field is never empty when git failed
-    with an empty stderr, or could not be run at all. Monkeypatched: a real git that
-    exits non-zero and says nothing is not reachable from a test."""
+    """§7: the fixed string is the FALLBACK"""
     from jarvis import branchproof
 
     real = branchproof.attempt
@@ -352,8 +323,7 @@ def test_a_refusal_with_nothing_to_say_falls_back_to_the_fixed_reason(
 
 
 def test_second_harvest_skips_an_already_checkpointed_head(fleet, settle_turns):
-    """§3: the trailer is the machine handle — a harvest that reads a HEAD already
-    carrying this turn's checkpoint never commits a second one."""
+    """§3: the trailer is the machine handle"""
     wo = _order(fleet, dirty="halfway")
     wt = wo["worktree_path"]
     store = fleet["store"]
@@ -372,11 +342,11 @@ def test_second_harvest_skips_an_already_checkpointed_head(fleet, settle_turns):
 
 
 def test_no_worktree_records_unreadable(fleet, settle_turns):
-    """§7: `said` and the jobs are still harvested when the directory is gone."""
+    """§7: `said` and the jobs are still harvested when the directory is gone"""
     wo = _order(fleet, dirty="halfway")
     store = fleet["store"]
     _start(fleet, wo["id"])
-    # Taken away before the reap, the way the disk sweep of issue #232 took 172 of them.
+    # Taken away before the reap, the way the disk sweep of issue #232 took 172 of them
     shutil.rmtree(wo["worktree_path"])
     assert settle_turns(store)
 
@@ -386,18 +356,18 @@ def test_no_worktree_records_unreadable(fleet, settle_turns):
 
 
 def test_harvest_does_not_write_result_summary(fleet, settle_turns):
-    """Neo q1131, pinned: machine prose there makes a failed order read as delivered."""
+    """Neo q1131, pinned: machine prose there makes a failed order read as delivered"""
     wo = _order(fleet, code="exporter", dirty="halfway")
     _dead_turn(fleet, wo["id"], settle_turns)
 
     assert fleet["store"].get_work_order(wo["id"])["result_summary"] in (None, "")
 
 
-# -- 2. the relaunch brief -------------------------------------------------------------
+# -- 2. the relaunch brief
 
 
 def test_retry_brief_replaces_retry_note(fleet, settle_turns):
-    """§6: the OS reads it off disk so the worker does not have to re-derive it."""
+    """§6: the OS reads it off disk so the worker does not have to re-derive it"""
     wo = _order(fleet, code="exporter", dirty="halfway")
     _dead_turn(fleet, wo["id"], settle_turns, said="Half of the CSV path is written.")
     store = fleet["store"]
@@ -416,7 +386,7 @@ def test_retry_brief_replaces_retry_note(fleet, settle_turns):
 
 
 def test_retry_note_when_no_harvest(fleet, settle_turns):
-    """An order with nothing harvested falls back to `RETRY_NOTE`, unchanged."""
+    """An order with nothing harvested falls back to `RETRY_NOTE`, unchanged"""
     wo = _order(fleet)
     _dead_turn(fleet, wo["id"], settle_turns)
     store = fleet["store"]
@@ -428,12 +398,11 @@ def test_retry_note_when_no_harvest(fleet, settle_turns):
     assert body["content"] == ops.RETRY_NOTE
 
 
-# -- 3. the background jobs, recorded by their one writer ------------------------------
+# -- 3. the background jobs, recorded by their one writer
 
 
 def test_background_jobs_recorded_once(fleet, settle_turns, monkeypatch):
-    """§2: `background.record` stays the ONE writer of `background_orphaned`, and the
-    harvest payload carries only the count."""
+    """§2: `background.record` stays the ONE writer of `background_orphaned`"""
     wo = _order(fleet, dirty="halfway")
     from jarvis import background as bg
 

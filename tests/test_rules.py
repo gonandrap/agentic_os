@@ -1,27 +1,4 @@
-"""The self-evolution registry's grammar, its pure evaluator, and the seed rows.
-
-Three properties are load-bearing here and each has its own block below.
-
-1. **Every problem at once.** `parse_condition` is written for a person pasting a
-   condition into `jarvis rules` and for a model proposing one from an improvement
-   order. Both re-submit per error message, so a parser that stops at the first problem
-   costs a round trip per line it could have reported together.
-2. **Absent is not false.** A leaf whose field the order does not record is FALSE for
-   every operator except `absent`, and the evaluator says WHICH field was missing. A
-   condition that matches only because a field is missing is the commonest way a rule
-   over-fires (spec §3.2), and these tests are where that stays caught.
-3. **The grammar's acceptance criterion**: all five seed conditions of §3.5 are
-   expressible without extending it.
-
-WHAT THIS FILE DELIBERATELY DOES NOT ASSERT, so nobody reads it as forgotten: that the
-seed rules' primitives exist in `remedies.REMEDIES`, that their parameters satisfy a
-primitive's schema, or that `rules.resolve` returns a `Resolution` for any of the five.
-Six of those primitives (`update_branch`, `carry_verdict`, `lower_attention`,
-`drop_hold`, `retry_neo_question`, `raise_attention`) land with §4, which this section
-has no dependency on — the two are built in parallel on purpose. **§5.3 owns all three
-of those assertions and the firing proof**, because it is the one section that depends
-on both. (Neo, question 878.)
-"""
+"""The self-evolution registry's grammar, its pure evaluator, and the seed rows"""
 
 from __future__ import annotations
 
@@ -35,12 +12,12 @@ from jarvis import automerge, invariants, probes, remedies, rules
 
 
 def facts(**values):
-    """One order's recorded facts. Only what is passed is RECORDED — that is the point."""
+    """One order's recorded facts"""
     return rules.Facts(project="acme", order_id="wo-1", order_kind="worker",
                        values=values, now=1000.0)
 
 
-# -- the grammar ----------------------------------------------------------------------
+# -- the grammar
 
 
 @pytest.mark.parametrize("node", [
@@ -65,7 +42,7 @@ def test_parse_condition_accepts_every_combinator():
 
 
 def test_parse_condition_reports_every_problem_at_once():
-    """One document, three independent faults, one exception naming all three."""
+    """One document, three independent faults, one exception naming all three"""
     doc = {"all": [
         {"field": "no_such_field", "op": "eq", "value": "x"},
         {"field": "status", "op": "matches", "value": "x"},
@@ -109,7 +86,7 @@ def test_sources_and_fields_used():
     assert rules.sources_used(cond) == frozenset({"work_order", "holds"})
 
 
-# -- absent is not false --------------------------------------------------------------
+# -- absent is not false
 
 
 @pytest.mark.parametrize("op, value, expected", [
@@ -146,12 +123,11 @@ def test_evaluation_names_the_absent_fields_and_explain_says_so():
     assert [leaf.present for leaf in ev.leaves] == [True, False]
 
 
-# -- combinators, nesting, purity ------------------------------------------------------
+# -- combinators, nesting, purity
 
 
 def test_explain_a_recorded_field_that_simply_did_not_match():
-    """The other arm: the field IS recorded and the comparison failed. It must NOT
-    borrow the absence wording — that would blame a missing fact for a real mismatch."""
+    """The other arm: the field IS recorded and the comparison failed"""
     cond = rules.parse_condition({"field": "status", "op": "eq", "value": "needs_review"})
     ev = rules.evaluate(cond, facts(status="running"))
     said = rules.explain(cond, ev)
@@ -195,13 +171,7 @@ def test_render_condition_reads_as_prose():
 
 
 def test_facts_is_declared_here_and_implemented_by_ops_rule_facts(monkeypatch):
-    """`rules.facts` is the CONTRACT; `ops.rule_facts` is the body.
-
-    The readers behind every `FactField.source` slug sit ABOVE this module, so putting
-    them here would end the leaf property `remedies` and `central_store` depend on. What
-    is asserted is the delegation and the fact that the import is CALL-TIME — a
-    module-level `ops` import in `rules` is the thing that would cost every importer.
-    """
+    """`rules.facts` is the CONTRACT; `ops.rule_facts` is the body"""
     from jarvis import ops
 
     seen = {}
@@ -218,7 +188,7 @@ def test_facts_is_declared_here_and_implemented_by_ops_rule_facts(monkeypatch):
     assert "ops" not in {name for name in dir(rules) if not name.startswith("_")}
 
 
-# -- resolve ---------------------------------------------------------------------------
+# -- resolve
 
 
 MATCHING = {"id": "dt-match", "condition": json.dumps(
@@ -275,7 +245,7 @@ def test_resolve_accepts_remedy_rows_as_a_flat_iterable():
     assert [r.primitive for r in out] == ["nudge"]
 
 
-# -- parameter validation ---------------------------------------------------------------
+# -- parameter validation
 
 
 def test_validate_params_refuses_a_primitive_that_is_not_in_the_registry():
@@ -284,21 +254,13 @@ def test_validate_params_refuses_a_primitive_that_is_not_in_the_registry():
 
 
 def test_validate_params_accepts_a_primitive_that_declares_no_parameters():
-    """§4 has since landed and `Remedy.params` now exists, declared EMPTY for a primitive
-    that takes none — "no parameters" and "nobody wrote the schema" are the same readable
-    fact there, and `_param_specs` answers `{}` to both. This test was written before that
-    and asserted `params is None`, which is the pre-§4 spelling of the same claim."""
+    """§4 has since landed and `Remedy.params` now exists"""
     assert remedies.REMEDIES["nudge"].params == ()
     assert rules.validate_params("nudge", {}) == []
 
 
 def test_validate_params_reads_a_tuple_of_param_objects_as_a_schema():
-    """The primitives section spells `Remedy.params` as `tuple[Param, ...]`, not a dict.
-
-    That section is on a parallel branch and its exact spelling is not settled, so the
-    schema branch accepts either shape. A schema check that raises `AttributeError` the
-    day the other shape lands is worse than one that adapts.
-    """
+    """The primitives section spells `Remedy.params` as `tuple[Param, ...]`, not a dict"""
 
     class _Param:
         def __init__(self, name, type_, required):
@@ -315,7 +277,7 @@ def test_validate_params_reads_a_tuple_of_param_objects_as_a_schema():
         assert any("unknown parameter 'nope'" in p for p in problems)
 
 
-# -- the seed rows -----------------------------------------------------------------------
+# -- the seed rows
 
 
 def test_seed_rows_are_six_builtin_fleet_wide_detectors_in_dry_run():
@@ -338,8 +300,7 @@ def test_seed_rows_are_six_builtin_fleet_wide_detectors_in_dry_run():
 
 
 def test_every_seed_condition_parses():
-    """§3.2's acceptance criterion: all five seed conditions are expressible in the
-    grammar without extending it. Checked here because this is where the grammar is."""
+    """§3.2's acceptance criterion: all five seed conditions are expressible in the grammar without..."""
     for entry in rules.seed_rows():
         assert rules.parse_condition(entry["detector"]["condition"])
 
@@ -358,10 +319,7 @@ def test_the_six_gap_classes_are_the_ones_the_spec_names():
 
 
 def test_the_killed_panel_detector_is_the_sixth_and_ships_dry_run():
-    """§5 of docs/superpowers/specs/
-    2026-10-14-a-killed-validation-panel-opens-an-investigation.md: a round whose seats
-    were killed MORE THAN ONCE on the same order — the kill is recurring, not a blip. Its
-    one remedy writes code, which is why nothing here is armed."""
+    """§5 of docs/superpowers/specs/ 2026-10-14-a-killed-validation-panel-opens-an-investigation.md: a..."""
     entry = rules.seed_rows()[5]
     det = entry["detector"]
 
@@ -377,28 +335,23 @@ def test_the_killed_panel_detector_is_the_sixth_and_ships_dry_run():
 
 
 def test_the_seed_version_is_bumped_so_the_sixth_reaches_a_live_os_db():
-    """The seeding pass returns early on a matching version, so a release that adds a
-    seed without bumping this ships the detector dead on every `os.db` that already holds
-    the five."""
+    """The seeding pass returns early on a matching version"""
     assert rules.SEED_VERSION == 2
 
 
 def test_the_new_fact_field_is_declared_with_its_own_source():
-    """§5: the cause lives in the `validation_failed` payload and `event_counts` keys on
-    the event KIND, which every cause shares — a condition on it would fire on transport
-    outages too. Its own source slug, so a condition about `status` never pays the walk."""
+    """§5: the cause lives in the `validation_failed` payload and `event_counts` keys on the event KIND"""
     field = rules.FACT_FIELDS["validation_failure_causes"]
 
     assert (field.type, field.source) == (rules.MAP, "validation_failures")
     assert "killed" in field.note
 
 
-# -- the drift pins ------------------------------------------------------------------------
+# -- the drift pins
 
 
 def test_the_inlined_blocker_sentence_tracks_invariants():
-    """`rules` is a LEAF and may not import `invariants`, so the literal is inlined
-    there. This is the pin that keeps the copy honest — the TEST may import both."""
+    """`rules` is a LEAF and may not import `invariants`, so the literal is inlined there"""
     assert rules.VALIDATION_STUCK_BLOCKER == invariants.VALIDATION_STUCK_BLOCKER
     seed = json.loads(rules.seed_rows()[0]["detector"]["condition"])
     reasons = [n["value"] for n in seed["all"] if n.get("field") == "attention_reason"]
@@ -413,7 +366,7 @@ def test_the_quoted_automerge_codes_are_the_real_ones():
 
 
 def test_effective_status_is_the_weaker_of_the_pair():
-    """§3.3: the pair can hold no other combination, and every caller reads it here."""
+    """§3.3: the pair can hold no other combination, and every caller reads it here"""
     weakest = {
         (rules.RETRACTED, rules.RETRACTED): rules.RETRACTED,
         (rules.RETRACTED, rules.DRY_RUN): rules.RETRACTED,
@@ -432,7 +385,7 @@ def test_effective_status_is_the_weaker_of_the_pair():
 
 
 def test_effective_status_reads_retired_at_as_retracted():
-    """`_retired`'s two spellings: a row retired by timestamp alone is still dead."""
+    """`_retired`'s two spellings: a row retired by timestamp alone is still dead"""
     assert rules.effective_status(
         {"status": rules.ARMED}, {"status": rules.ARMED, "retired_at": 1.0}
     ) == rules.RETRACTED
@@ -442,8 +395,7 @@ def test_effective_status_reads_retired_at_as_retracted():
 
 
 def test_seed_rule_five_raise_attention_carries_a_template_key_not_free_text():
-    """§4: `raise_attention` RENDERS its reason and never relays one, so the row carries
-    a template key and no prose parameter."""
+    """§4: `raise_attention` RENDERS its reason and never relays one"""
     entry = rules.seed_rows()[4]
     assert entry["detector"]["gap_class"] == "overtaken-release-order"
     rem = [r for r in entry["remedies"] if r["primitive"] == "raise_attention"]
@@ -462,11 +414,11 @@ def test_bound_records_the_cap_it_applied():
     assert str(rules.FACTS_CHARS) in out[rules.FACTS_CHARS:]
 
 
-# -- the recurrence lookup, the verdict and the redaction boundary (§8) -------------------
+# -- the recurrence lookup, the verdict and the redaction boundary (§8)
 
 
 def _det(**kw):
-    """A detector row as the table holds it, carrying only what the lookup reads."""
+    """A detector row as the table holds it, carrying only what the lookup reads"""
     kw.setdefault("id", "dt-1")
     kw.setdefault("gap_class", "stale-panel-hold")
     kw.setdefault("project", "")
@@ -477,8 +429,7 @@ def _det(**kw):
 
 
 def test_recurrence_verdicts_are_four_and_reuse_the_unreadable_string():
-    """Neo question 974: `unreadable` is a verdict of its OWN, not a fourth spelling of
-    `missed`. It reuses the fire outcome's string so one word means one thing."""
+    """Neo question 974: `unreadable` is a verdict of its OWN, not a fourth spelling of `missed`"""
     assert rules.RECURRENCE_VERDICTS == (
         rules.NOT_ARMED, rules.MISSED, rules.REMEDY_FAILED,
         rules.UNREADABLE_RECURRENCE)
@@ -529,8 +480,7 @@ def test_an_armed_detector_with_no_fire_missed_it():
 
 @pytest.mark.parametrize("outcome", [rules.PROPOSED, rules.REFUSED, rules.APPLIED])
 def test_an_armed_detector_that_fired_and_acted_is_a_remedy_failure(outcome):
-    """`applied` is in the set on Neo question 974's ruling: the remedy ran and the gap
-    recurred anyway, so the remedy is still the half that failed."""
+    """`applied` is in the set on Neo question 974's ruling: the remedy ran and the gap recurred anyway"""
     assert rules.recurrence_verdict(_det(status=rules.ARMED),
                                     {"outcome": outcome}) == rules.REMEDY_FAILED
 
@@ -549,8 +499,7 @@ def test_a_recorded_or_cleared_fire_is_no_usable_fire(outcome):
 
 
 def test_the_recurrence_comment_carries_the_four_fields_and_nothing_else():
-    """§8's redaction boundary: the tracker is PUBLIC, so the comment is BUILT from four
-    arguments and there is no parameter anything private could arrive through."""
+    """§8's redaction boundary: the tracker is PUBLIC"""
     body = rules.recurrence_comment(order_id="wo-77", gap_class="stale-panel-hold",
                                     verdict=rules.MISSED, detector_id="dt-9")
     for field in ("wo-77", "stale-panel-hold", rules.MISSED, "dt-9"):

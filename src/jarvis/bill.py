@@ -1,51 +1,4 @@
-"""The bill: every token an order spent, as line items that add up.
-
-`ops.cost_report` answers "what did this cost" with a handful of totals side by side —
-the worker's, Jarvis's own, the worker's subprocesses. It is correct and it is not a
-bill: the reader cannot see WHERE a token went, cannot expand a figure into the calls
-that made it, and cannot check that the parts sum to the whole. Asked to read one, a
-user asked four questions this module exists to answer (wo-4576667e): why is the OS's
-half all called "jarvis", what is the re-write tax, whose tokens are in the headline,
-and where is the per-actor token count.
-
-## One set of leaves, folded two ways
-
-Everything here is built from a flat list of `Item`s — the indivisible facts of the
-bill, each one a token count with a model, a price, an owner and a turn. Nothing else
-is measured. The two views the UI renders are two FOLDS of that one list:
-
-    by actor  worker → its turns;  jarvis → Neo, the panel's seats, digests;
-              subprocesses → the programs that ran them
-    by turn   turn 1 → what the worker, Jarvis and the subprocesses spent on it;
-              turn 2 → …; and one line for anything outside any turn
-
-Because both are folds of the same leaves, "add up the turns and you get the order" is
-true BY CONSTRUCTION rather than by a second calculation that could disagree with the
-first. `reconcile` proves it on every payload anyway, and the result rides along in
-`checks` so the page can say so out loud: an accounting nobody can check is a claim.
-
-## Where each leaf comes from
-
-* THE WORKER's turns: `wo_turns.usage_json`, the `claude` CLI's own per-turn accounting
-  (`claude_cli.derive_turn_usage`). Exact, and — since the version-3 reading, which
-  takes each turn's share of a running total the CLI reports per session — summing to
-  what the session transcript independently says the conversation cost. `reconcile`
-  compares the two rather than trusting either (`_check_calls`).
-* THE WORKER's unrecorded turns: the transcript total MINUS the recorded turns, when a
-  work order has both and they disagree. That difference is precisely the turns whose
-  result JSON is gone, and leaving it out is how a bill quietly loses a third of itself.
-* JARVIS's own calls and the worker's SUBPROCESSES: `agent_calls`, recorded as each call
-  returned (`agent_usage`) because nothing can recover them afterwards.
-
-## Two currencies, never blended
-
-`exact_usd` is the CLI's own figure for the lines that have one; `list_usd` re-prices
-the same tokens at Anthropic list prices so that every line — including the ones with no
-exact figure — can be added into one number. They are carried side by side the whole way
-up, and `exact_missing` counts the leaves that could not contribute to the first, so a
-partial exact total is never read as a complete one. TOKENS are the figure that always
-reconciles; dollars are derived and labelled. (kn-e6bb1166's ruling, held to.)
-"""
+"""The bill: every token an order spent, as line items that add up"""
 
 from __future__ import annotations
 
@@ -56,58 +9,16 @@ from typing import Any, Sequence
 from . import db, usage as usage_mod
 from .project_store import COMPACT_TURN
 
-#: How many `agent_calls` rows one order's bill will read. Far above any real order (a
-#: heavy one runs to dozens), and counted rather than assumed: a truncated bill would
-#: understate exactly the expensive order someone is investigating, so `checks` says so.
+#: How many `agent_calls` rows one order's bill will read
 CALL_LIMIT = 20_000
 
-#: How many per-API-call rows one TURN carries into the sealed bill. A bill is frozen
-#: into `work_orders.bill_json` when the order settles, so this array is stored, not
-#: derived on demand — and a long turn can run to hundreds of calls, which is a size a
-#: seal should not grow without a bound. The ones kept are the DEAREST, because "which
-#: call cost that" is the question the list exists to answer; the rest are counted and
-#: their totals reported on `calls_folded`, never silently dropped.
+#: How many per-API-call rows one TURN carries into the sealed bill
 TURN_CALL_LIMIT = 200
 
-#: Schema version of a SEALED payload. A bill is frozen when its order settles, because
-#: every source it is built from expires (kn-3629fa87) — but that froze the SHAPE too,
-#: so a bill sealed before per-call rows existed could never have them, not even while
-#: the transcript behind it was still on disk. Bumping this re-derives such a seal ONCE,
-#: and only while recomputing still sees everything the seal holds; see `_upgrade_seal`.
-#: Bump it when a field is added that a reader of an old bill would otherwise never get.
-#:
-#: 1 — the original payload.
-#: 2 — per-API-call rows on each turn (`call_rows`), the `api_calls` count taken from
-#:     the transcript rather than from the envelope's sample, and `cost.write_rate`.
-#: 3 — the re-write block's RAW cause split (`ttl_write`, `prefix_write`) and the worker
-#:     session's own `cache_write`, which the cache-TTL decision needs as its
-#:     denominator. `ttl_share` alone cannot recover them: it is their ratio.
-#: 4 — the THIRD boundary cause, `compact_write`/`compact_boundaries`: a boundary the OS
-#:     compacted across, which looks exactly like a prefix miss and is not one
-#:     (`usage.Usage.rewrite_compact_write`). Absent on a version-3 seal means ZERO
-#:     rather than unknown — those orders predate compaction — so an old bill stays
-#:     readable and `prefix_boundaries` keeps its meaning across the change.
-#: 5 — turns counted as their own spend rather than as the resumed session's running
-#:     total (`claude_cli.USAGE_SCHEMA_VERSION` 3). The ONLY version bump so far whose
-#:     re-derivation makes a bill SMALLER, which is why `_upgrade_seal` had to learn
-#:     that a correction is not a loss.
-#:
-#: NOT BUMPED for the subagent-attribution keys (`calls_cover_by_model` on a turn row,
-#: `placeholder` on the payload, `sealed` on a call row, the `unattributed` agent row):
-#: re-sealing every bill on disk would re-read transcripts that have part-expired, which
-#: turns an already-correct seal into a permanent unknown (kn-938b1878,
-#: docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §9). So the opposite
-#: convention to version 4's holds for them: ABSENT MEANS UNKNOWN, NOT ZERO, and every
-#: renderer tests PRESENCE (`if bill.get("placeholder") is not None`) so a measured zero
-#: and a seal that predates the measurement do not render the same.
+#: Schema version of a SEALED payload (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §9)
 PAYLOAD_VERSION = 5
 
-#: The actor a line belongs to. Four, because they are four different KINDS of spend
-#: and the user's first question about the old line was why the OS's half looked like
-#: one thing: the worker's own conversation, what Jarvis spent thinking about the order
-#: while the worker slept, what the worker's own tool calls spawned beneath it, and what
-#: the user spent LOOKING at the order rather than doing it (§10 of
-#: docs/superpowers/specs/2026-09-24-order-observability.md).
+#: The actor a line belongs to (docs/superpowers/specs/2026-09-24-order-observability.md)
 WORKER, JARVIS, SUBPROC = "worker", "jarvis", "subprocesses"
 OBSERVE = "observability"
 
@@ -124,7 +35,7 @@ ACTOR_NOTES = {
             "the dashboard",
     SUBPROC: "an eval suite, a script, a nested harness — its tokens are this order's, "
              "recorded as each call returned",
-    # Say the 0.00 out loud, because a reviewer will otherwise read it as a bug (§10).
+    # Say the 0.00 out loud, because a reviewer will otherwise read it as a bug (§10)
     OBSERVE: "money spent LOOKING at this order, not DOING it: every `jarvis watch`, "
              "`jarvis inspect`, `jarvis wo why`, context ledger read and context ledger "
              "write, one row each. Dollars of zero beside a count and a wall clock that "
@@ -133,12 +44,7 @@ ACTOR_NOTES = {
              "not a missing figure",
 }
 
-#: WHAT IS NOT ON THIS BILL, one sentence per actor class — and ONE SOURCE for both
-#: renderers (`cli._print_bill` and ui/templates/bill.html each carried its own copy, and
-#: wording that differs between two renderers is wording the reader stops trusting).
-#:
-#: ABSENT IS NOT ZERO (Neo's ruling on question 766): a class with no line did not spend
-#: 0.00, it was not recorded, and each sentence says which of the two it is.
+#: WHAT IS NOT ON THIS BILL, one sentence per actor class
 ABSENT_NOTES = {
     WORKER: "The worker's own session — nothing measurable. Either it was never "
             "dispatched, or Claude Code has pruned the transcript and the result JSON of "
@@ -155,10 +61,7 @@ ABSENT_NOTES = {
 }
 
 
-#: THE SUBAGENT SIDE'S ZERO, NAMED — beside `ABSENT_NOTES` for that block's stated
-#: reason: a caveat worded differently in two renderers is one the reader learns to
-#: ignore. Printed by `cli._print_bill` and by ui/templates/bill.html, and only when
-#: `rewrite.by_side.subagent.structural_zero` is true (spec 2026-10-02 §1.5).
+#: THE SUBAGENT SIDE'S ZERO, NAMED
 SUBAGENT_REWRITE_ZERO = (
     "of that, subagents contributed 0 tokens across 0 boundaries — a STRUCTURAL zero and "
     "not a small one: a subagent's written volume never exceeds its own context peak, and "
@@ -168,41 +71,23 @@ SUBAGENT_REWRITE_ZERO = (
 
 
 def absent_notes(payload: dict[str, Any]) -> list[tuple[str, str]]:
-    """The classes with NO line on this payload, each with the sentence that says so.
-
-    An absence nobody names reads as an omission, and "was nothing at all spent on the
-    OS?" was one of the four questions this surface exists to answer.
-    """
+    """The classes with NO line on this payload, each with the sentence that says so"""
     present = {line.get("key") for line in payload.get("actors") or []}
     return [(key, text) for key, text in ABSENT_NOTES.items() if key not in present]
 
-#: The line for spend that belongs to the order but to no turn of it. Its own line
-#: rather than folded into the nearest turn (Neo, question 121): the turns view claims
-#: to be exhaustive, so anything it cannot place has to be visible, not absorbed.
+#: The line for spend that belongs to the order but to no turn of it
 NO_TURN = "outside any turn"
 NO_TURN_NOTE = ("spend that belongs to this order but to none of its turns — a call "
                 "made before the first turn started, or a conversation with no turns "
                 "on record at all")
 
-#: How `payload["own"]` is labelled, on the page and in the terminal both — wording that
-#: differs between the two renderers is wording the reader stops trusting.
+#: How `payload["own"]` is labelled, on the page and in the terminal both
 OWN_LABEL = "what Jarvis spent on this order itself, not on any order below it"
 
 
 @dataclass
 class Item:
-    """One indivisible charge: some tokens, on a model, for an actor, in a turn.
-
-    `path` is where it hangs in the by-actor view — ("jarvis", "panel seat", "blast")
-    puts one seat of the panel under the panel under Jarvis. `turn` is its seq in the
-    by-turn view, or None for the `NO_TURN` line. Everything else on a bill is a sum of
-    these; nothing is measured anywhere else.
-
-    `inner` is the same path with the turn taken out of it, for the by-turn view: a
-    worker item hangs under `worker → turn 3 → the model` when the tree is grouped by
-    actor and under `turn 3 → worker → the model` when it is grouped by turn. Two
-    orderings of one fact, so that neither view has to invent a segment.
-    """
+    """One indivisible charge: some tokens, on a model, for an actor, in a turn"""
 
     path: tuple[str, ...]
     inner: tuple[str, ...] = ()
@@ -214,30 +99,21 @@ class Item:
     output: int = 0
     cache_1h: int = 0
     cache_5m: int = 0
-    #: The CLI's own dollar figure, where the source carried one. None is not zero: it
-    #: means this line can only be priced at list, and `exact_missing` will say so.
+    #: The CLI's own dollar figure, where the source carried one
     exact_usd: float | None = None
-    #: How many countable acts this stands for, and what to call one. A worker line
-    #: counts TURNS and an OS line counts CALLS; a line that mixes them counts neither,
-    #: and says so by carrying no unit at all rather than picking the wrong word.
+    #: How many countable acts this stands for, and what to call one
     calls: int = 1
     unit: str = "call"
     note: str = ""
-    #: Which reading of a result envelope produced it (`claude_cli.USAGE_SCHEMA_VERSION`).
-    #: Surfaced so a re-derived order is distinguishable from a pre-fix one, which is
-    #: the one thing Neo added to the ruling on question 121.
+    #: Which reading of a result envelope produced it (`claude_cli.USAGE_SCHEMA_VERSION`)
     usage_v: int | None = None
 
 
-#: "no item has proposed a note yet", which is not the same as "the items disagree".
+#: "no item has proposed a note yet", which is not the same as "the items disagree"
 _UNSET = object()
 
 
-#: What the `tokens` figure on every line of this bill counts. Said once, here, and
-#: printed by both renderers, because "tokens: 517k" on a turn that read 68k of context
-#: is a number nobody can interpret without it: it is a SUM OVER THE TURN'S API CALLS,
-#: not a size. The four classes are 20x apart in price, so their sum is a workload
-#: measure and never a context measure — `context peak` is the one that is a size.
+#: What the `tokens` figure on every line of this bill counts
 TOKENS_MEAN = ("every token the API billed for, of all four classes added together — "
                "fresh input + cache write + cache read + output. It is a sum over the "
                "API calls underneath, not a context size: a turn of 11 calls each "
@@ -246,15 +122,7 @@ TOKENS_MEAN = ("every token the API billed for, of all four classes added togeth
 
 
 def write_rate_of(line: dict[str, Any]) -> float:
-    """The multiple this line's cache-write tokens were charged at.
-
-    Reads the exact token-weighted figure `_settle_rate` put on the line, and falls back
-    to the ratio of the line's own TTL split for a bill SEALED before that field existed
-    — every bill on disk today. The fallback is the same arithmetic `usage.write_rate`
-    does, one level coarser (a folded ratio rather than a per-item weighting), which is
-    close and never the wrong end of the range; defaulting to the 1.25x floor instead
-    would print `1.25x` beside a line whose own split says two thirds of it was 2x.
-    """
+    """The multiple this line's cache-write tokens were charged at"""
     rate = line.get("cost", {}).get("write_rate")
     if isinstance(rate, (int, float)) and rate:
         return float(rate)
@@ -264,17 +132,7 @@ def write_rate_of(line: dict[str, Any]) -> float:
 
 
 def rate_note(line: dict[str, Any], fmt: Any = None) -> str:
-    """Why this line's cache writes cost the multiple they cost.
-
-    A cache WRITE is 1.25x base input at the 5-minute TTL and 2x at the one-hour one,
-    and the split decides. Every surface used to print the range `1.25–2x` beside a
-    figure already computed from the split, which tells the reader the price list when
-    what they are looking at is the price paid — so the rate is now the number, and
-    this is the sentence under it. Three cases, and they are genuinely different: the
-    split was measured, it was measured for PART of the line (the CLI reports it for a
-    sample of a turn, so `write_rate` applies the sample's RATIO to the whole), or it
-    was not reported at all and 1.25x is a floor rather than a finding.
-    """
+    """Why this line's cache writes cost the multiple they cost"""
     fmt = fmt or (lambda n: f"{n:,}")
     tokens = line["tokens"]
     written = tokens["cache_write"]
@@ -300,16 +158,13 @@ def _zero_tokens() -> dict[str, int]:
 
 
 def _line(key: str, label: str, note: str = "") -> dict[str, Any]:
-    """An empty line item. Everything on it accumulates as items are folded in."""
+    """An empty line item"""
     return {
         "key": key, "label": label, "note": note, "_note": _UNSET,
         "calls": 0,
         "tokens": {**_zero_tokens(), "cache_1h": 0, "cache_5m": 0,
                    "billed_input": 0, "cached_input": 0, "total": 0},
-        # `write_rate` is the multiple of base input price this line's cache-WRITE
-        # tokens actually cost, settled from `_write_weighted` once the items are in.
-        # A number and not a range: the range 1.25–2x is the price LIST, and what a
-        # reader of one line wants is the price PAID (see `_settle_rate`).
+        # `write_rate` is the multiple of base input price this line's cache-WRITE tokens actually cost
         "cost": {"list_usd": 0.0, "exact_usd": 0.0, "by_class": _zero_class_costs(),
                  "write_rate": usage_mod.CACHE_WRITE_RATE, "_write_weighted": 0.0},
         "exact_missing": 0,
@@ -325,7 +180,7 @@ def _zero_class_costs() -> dict[str, float]:
 
 
 def _add_item(line: dict[str, Any], item: Item) -> None:
-    """Charge one item to one line — the only place a bill's numbers ever grow."""
+    """Charge one item to one line — the only place a bill's numbers ever grow"""
     tokens = line["tokens"]
     for cls in usage_mod.TOKEN_CLASSES:
         tokens[cls] += getattr(item, cls)
@@ -337,21 +192,14 @@ def _add_item(line: dict[str, Any], item: Item) -> None:
     line["calls"] += item.calls
     if item.calls:
         line["unit"] = item.unit if line["unit"] in (None, item.unit) else ""
-    # A note explains a line only while every item on it says the same thing. The first
-    # item proposes one; a later one that disagrees withdraws it, because a parent whose
-    # children are a lead agent and a subagent is neither and must not claim to be.
+    # A note explains a line only while every item on it says the same thing
     line["_note"] = item.note if line["_note"] in (_UNSET, item.note) else ""
-    # Priced PER ITEM, not from the folded totals: the write rate depends on a TTL split
-    # that is exact for one item and only a ratio once items on different models and
-    # different TTLs are added together.
+    # Priced PER ITEM, not from the folded totals: the write rate depends on a TTL split that is exact...
     classes = usage_mod.class_costs(
         item.model or "unknown", input=item.input, cache_write=item.cache_write,
         cache_read=item.cache_read, output=item.output,
         cache_1h=item.cache_1h, cache_5m=item.cache_5m)
-    # The same per-item rate, kept token-weighted so the line can report the multiple
-    # it PAID rather than the range it might have paid. Weighted by tokens rather than
-    # by dollars so a line mixing an Opus turn and a Haiku one still reports the rate
-    # its cache-write tokens were charged at, not a figure the price bands have moved.
+    # The same per-item rate, kept token-weighted so the line can report the multiple it PAID rather than...
     line["cost"]["_write_weighted"] += item.cache_write * usage_mod.write_rate(
         item.cache_write, item.cache_1h, item.cache_5m)
     for cls, value in classes.items():
@@ -369,12 +217,7 @@ def _add_item(line: dict[str, Any], item: Item) -> None:
 
 def _fold(items: Sequence[Item], key: Any, label: Any, note: Any = None,
           depth: int | None = None) -> list[dict[str, Any]]:
-    """Group items into a tree of lines, one level per element of `key(item)`.
-
-    `key` returns the path of an item as a tuple; every prefix of it becomes a line, and
-    every item is charged to EVERY line on its path — which is what makes a parent the
-    exact sum of its children rather than a separately computed figure that can drift.
-    """
+    """Group items into a tree of lines, one level per element of `key(item)`"""
     roots: list[dict[str, Any]] = []
     index: dict[tuple, dict[str, Any]] = {}
     for item in items:
@@ -400,22 +243,14 @@ def _fold(items: Sequence[Item], key: Any, label: Any, note: Any = None,
 
 
 def _settle_note(line: dict[str, Any]) -> None:
-    """Adopt the items' agreed note, unless the fold already gave the line one."""
+    """Adopt the items' agreed note, unless the fold already gave the line one"""
     proposed = line.pop("_note", _UNSET)
     if not line["note"] and isinstance(proposed, str):
         line["note"] = proposed
 
 
 def _settle_rate(line: dict[str, Any]) -> None:
-    """Turn the weighted accumulator into the one number a reader wants: the rate paid.
-
-    A cache write is 1.25x base input at the 5-minute TTL and 2x at the one-hour one,
-    and every surface used to print that RANGE — on a line whose tokens were, to the
-    token, all 5-minute. The range is the price list; this is the invoice. Where the
-    source reported no TTL split at all the accumulator is the 1.25x floor `write_rate`
-    charges, and `tokens.cache_1h + tokens.cache_5m == 0` is how a renderer tells the
-    floor apart from a measurement (`rate_note`).
-    """
+    """Turn the weighted accumulator into the one number a reader wants: the rate paid"""
     cost = line["cost"]
     weighted = cost.pop("_write_weighted", 0.0)
     written = line["tokens"]["cache_write"]
@@ -431,22 +266,17 @@ def _total_line(items: Sequence[Item], label: str) -> dict[str, Any]:
     return line
 
 
-# -- gathering the leaves -----------------------------------------------------------
+# -- gathering the leaves
 
 
-#: The agent that IS the session — the one whose turns Jarvis drives, as opposed to the
-#: ones it spawned with the Task tool. Named on its own row only when there is something
-#: to distinguish it from; a turn that spawned nothing is the lead agent entire.
+#: The agent that IS the session — the one whose turns Jarvis drives
 LEAD = "the lead agent"
 LEAD_NOTE = ("the session's own conversation, with everything its subagents spent taken "
              "out and given their own rows")
 SUBAGENT_NOTE = ("spawned by the lead agent — its tokens are part of the total of the "
                  "turn it ran in, not on top of it")
 
-#: THE RESIDUE OF A TURN, NAMED — tokens the envelope reports that neither the lead's own
-#: API calls nor its subagents' transcripts account for. Beside `LEAD`/`LEAD_NOTE` for the
-#: `SUBAGENT_REWRITE_ZERO` reason: both renderers read the one wording
-#: (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §2).
+#: THE RESIDUE OF A TURN, NAMED — tokens the envelope reports that neither the lead's own API calls... (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §2)
 UNATTRIBUTED = "unattributed"
 UNATTRIBUTED_NOTE = (
     "what no transcript accounts for: tokens this turn's envelope reports that neither "
@@ -456,24 +286,19 @@ UNATTRIBUTED_NOTE = (
     "real figure is never written — so the shortfall is mostly output and cannot honestly "
     "be charged to an agent. A RESIDUE, not a measurement")
 
-#: §4: the lead's own transcript is gone, so its row is the turn less its subagents. A
-#: figure derived by subtraction is not a measurement — the `ABSENT_NOTES` doctrine.
+#: §4: the lead's own transcript is gone, so its row is the turn less its subagents
 LEAD_UNMEASURED_NOTE = (
     "the session's own conversation — what is LEFT of the turn after its subagents, "
     "because the lead's own transcript has been pruned. Anything its subagents "
     "under-reported is inside this figure rather than beside it, so it is a ceiling for "
     "the lead and not a measurement of it")
 
-#: §6: said of a figure read from a transcript that holds placeholder output. One source
-#: for the running-turn line's note and for `cli`'s caption; the counts are printed beside
-#: it, never baked in, so the sentence can be matched on either surface.
+#: §6: said of a figure read from a transcript that holds placeholder output
 PLACEHOLDER_NOTE = (
     "the sealed row carrying their real output is never written, so this figure is a "
     "FLOOR and nothing here estimates the difference")
 
-#: THE MEASURED ZERO, said out loud (§9). A bill sealed before the measurement existed
-#: carries no `placeholder` block at all and must render as NOTHING — so the zero needs a
-#: sentence of its own, or the two cases would be indistinguishable on the page.
+#: THE MEASURED ZERO, said out loud (§9)
 PLACEHOLDER_ZERO = (
     "every API call on this bill carries a sealed output figure — a measured zero, not a "
     "missing measurement")
@@ -481,24 +306,8 @@ PLACEHOLDER_ZERO = (
 
 def _turn_items(turn_rows: Sequence[dict[str, Any]],
                 session: Any) -> tuple[list[Item], list[str]]:
-    """The worker's own spend, split turn by turn and then AGENT by agent.
-
-    A turn's recorded total (`modelUsage`) already contains everything its subagents
-    spent, so the agents under a turn are a PARTITION of it, never additions to it: the
-    subagent rows are subtracted out of the turn and the lead agent gets the remainder.
-    That is what makes the user's identity hold — add up every agent row of a work order
-    and you have the worker's whole session, exactly, with no double count possible.
-
-    THE SECOND HALF IS THE POINT. A work order whose result JSONs have been pruned has
-    turns on record with no usage on them; the session transcript still knows what the
-    whole conversation cost. The difference between the transcript and the turns that
-    ARE recorded is exactly what those turns spent, so it is charged as one item rather
-    than dropped — dropping it is how a bill loses a third of itself and still looks
-    tidy. Clamped at zero per class: a turn running right now is in the transcript and
-    not yet in the recorded rows, and a negative charge would be a fiction either way.
-    """
-    # A compaction is the OS's call, charged on the Jarvis half from `agent_calls`
-    # (docs/superpowers/specs/2026-10-08-count-a-compaction-once.md §1).
+    """The worker's own spend, split turn by turn and then AGENT by agent"""
+    # A compaction is the OS's call, charged on the Jarvis half from `agent_calls`... (docs/superpowers/specs/2026-10-08-count-a-compaction-once.md §1)
     worker_rows = [r for r in turn_rows if r.get("kind") != COMPACT_TURN]
     items: list[Item] = []
     notes: list[str] = []
@@ -517,10 +326,7 @@ def _turn_items(turn_rows: Sequence[dict[str, Any]],
             for cls in usage_mod.TOKEN_CLASSES:
                 recorded[cls] += m.get(cls) or 0
         subs = subs_by_turn.get(row["seq"], [])
-        # What the turn's subagents came to, beside what its own API calls came to.
-        # Together they are what the turn's total has to be made of, and `_check_calls`
-        # tests exactly that — a turn bigger than everything found inside it is the
-        # signature of a figure that belongs to something larger than the turn.
+        # What the turn's subagents came to, beside what its own API calls came to
         row["subagent_cover"] = {
             cls: sum(getattr(s.usage, cls) for s in subs)
             for cls in usage_mod.TOKEN_CLASSES}
@@ -534,8 +340,7 @@ def _turn_items(turn_rows: Sequence[dict[str, Any]],
             "not be taken out of the turn it ran in, because the turn's own total does "
             "not contain them. They stay inside the turn rather than being added to it: "
             "a bill that grew when it looked closer would not be a bill.")
-    # Said about the right thing (§5): the sentence above is worded about subagents and
-    # would be a lie about a lead excess.
+    # Said about the right thing (§5): the sentence above is worded about subagents and would be a lie...
     if stranded["lead"]:
         notes.append(
             f"{stranded['lead']:,} tokens the lead agent's own API calls report are more "
@@ -552,10 +357,7 @@ def _turn_items(turn_rows: Sequence[dict[str, Any]],
         "output": max(0, whole.output - recorded["output"]),
     }
     if any(gap.values()):
-        # WHY a turn is missing from the recorded set decides what to call this line. A
-        # turn running RIGHT NOW has not written its result JSON yet and will settle
-        # into its own line within the minute; a settled turn with no usage will never
-        # have one. Calling both "gone" would read as data loss on every live page.
+        # WHY a turn is missing from the recorded set decides what to call this line
         live = [r for r in worker_rows
                 if not r.get("recorded") and r.get("state") == "running"]
         unrecorded = [r for r in worker_rows if not r.get("recorded")]
@@ -568,7 +370,7 @@ def _turn_items(turn_rows: Sequence[dict[str, Any]],
             note = ("a turn writes its result JSON when it ends, so its spend is the "
                     "transcript's for now and moves onto its own turn line once it "
                     "settles")
-            # On the line that is actually low, not only in a summary block (§6).
+            # On the line that is actually low, not only in a summary block (§6)
             if whole.placeholder_calls:
                 note += (f" · {whole.placeholder_calls:,} API call(s) report placeholder "
                          f"output totalling {whole.placeholder_output:,} tokens — "
@@ -592,21 +394,12 @@ def _turn_items(turn_rows: Sequence[dict[str, Any]],
 
 def _subagents_by_turn(turn_rows: Sequence[dict[str, Any]],
                        session: Any) -> dict[int, list[Any]]:
-    """Which turn each subagent ran in — the last one that had started when it began.
-
-    The same rule the OS's own calls are attributed by (question 121), applied to the
-    one other thing on a bill that has a timestamp and no turn id. A subagent that lands
-    outside every turn, or on a turn with nothing recorded, is left where it already is:
-    inside the transcript figure the gap line charges.
-    """
+    """Which turn each subagent ran in — the last one that had started when it began"""
     locate = _turn_locator(turn_rows)
     recorded = {r["seq"] for r in turn_rows if r.get("recorded")}
     out: dict[int, list[Any]] = {}
     for sub in getattr(session, "each_subagent", []) or []:
-        # A subagent that spent nothing gets no row. Claude Code leaves a transcript
-        # behind for an agent that was aborted before its first API call — real on
-        # wo-cd73c537, where one of the three carries only synthetic messages — and a
-        # row charging nothing would split a turn into "the lead agent" and an absence.
+        # A subagent that spent nothing gets no row
         if not sub.usage.total_tokens:
             continue
         seq = locate(sub.started_at)
@@ -617,24 +410,7 @@ def _subagents_by_turn(turn_rows: Sequence[dict[str, Any]],
 
 def _attach_calls(turn_rows: Sequence[dict[str, Any]], session_id: str,
                   index: dict[str, list[Path]] | None) -> None:
-    """Put the LEAD agent's API calls on the turn each ran in, and fix the count.
-
-    The bill's finest grain was a turn, and a turn is an agent LOOP: the model answers,
-    a tool runs, the model is called again with the result appended. Every call re-sends
-    the conversation, so a turn's `cache_read` is a sum over its calls — 517k on a turn
-    whose largest single call read 59k — and with no per-call rows there was no way to
-    see that from the bill. The transcript has them, one assistant message per call, and
-    on wo-e23252e4 turn 1 the eleven of them sum to the CLI's own `modelUsage` totals to
-    the token in all four classes. So this is a PARTITION of a figure already on the
-    bill, in the sense kn-7a2180ba means it, and never an addend.
-
-    It also settles `api_calls`, which said 1 for that eleven-call turn: it came from
-    `usage.iterations` in the result envelope, and that array is a SAMPLE of a turn (one
-    entry, carrying 679 of the turn's 58,913 written tokens), not one entry per call.
-    Where the transcript survives the count is the number of calls found; where it does
-    not, the envelope's figure stands and `calls_source` says which is which, because a
-    count from a sample and a count from the calls themselves are not the same claim.
-    """
+    """Put the LEAD agent's API calls on the turn each ran in, and fix the count"""
     calls = usage_mod.session_calls(session_id, index=index) if session_id else []
     for row in turn_rows:
         row["calls_source"] = "envelope"
@@ -652,11 +428,7 @@ def _attach_calls(turn_rows: Sequence[dict[str, Any]], session_id: str,
             continue
         kept, folded = found, None
         if len(found) > TURN_CALL_LIMIT:
-            # The dearest calls, because "which call cost that" is what the list answers.
-            # What is dropped is SAID rather than silently truncated: a list that stops
-            # at 200 with no note reads as a turn that made 200 calls. Selected by
-            # IDENTITY, not equality — two calls of a turn can carry identical counts,
-            # and a value-based difference would drop both and unbalance the fold.
+            # The dearest calls, because "which call cost that" is what the list answers
             dearest = sorted(range(len(found)),
                              key=lambda i: found[i].total_tokens,
                              reverse=True)[:TURN_CALL_LIMIT]
@@ -673,21 +445,13 @@ def _attach_calls(turn_rows: Sequence[dict[str, Any]], session_id: str,
         row["calls_folded"] = folded
         row["api_calls"] = len(found)
         row["calls_source"] = "transcript"
-        # What these calls come to, beside what the turn came to. They are the LEAD
-        # agent's calls only — a subagent writes its own transcript and has its own row
-        # — so on a turn that spawned one they cover less than the whole, and the honest
-        # thing is to publish the difference rather than to let two figures sit next to
-        # each other unexplained. `reconcile` checks the one direction that would be a
-        # bug: a partition may fall short of its total, never exceed it.
+        # What these calls come to, beside what the turn came to
         row["calls_cover"] = {
             **{cls: sum(getattr(c, cls) for c in found)
                for cls in usage_mod.TOKEN_CLASSES},
             "total": sum(c.total_tokens for c in found),
         }
-        # The same cover PER MODEL, because the drawdown in `_agent_items` is per model
-        # and a flat figure cannot feed it. Its presence is "this turn's lead calls were
-        # found in the transcript", which is what §4 branches on (spec
-        # docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §2).
+        # The same cover PER MODEL, because the drawdown in `_agent_items` is per model and a flat figure... (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §2)
         by_model: dict[str, dict[str, int]] = {}
         for call in found:
             counts = by_model.setdefault(call.model or "unknown",
@@ -695,9 +459,7 @@ def _attach_calls(turn_rows: Sequence[dict[str, Any]], session_id: str,
             for cls in usage_mod.TOKEN_CLASSES:
                 counts[cls] += getattr(call, cls)
         row["calls_cover_by_model"] = by_model
-        # The context a turn actually reached, from the calls themselves. The envelope's
-        # figure was right here by luck — its one sampled iteration happened to be the
-        # turn's last and therefore its largest — and it is a floor in general.
+        # The context a turn actually reached, from the calls themselves
         row["context_peak"] = max(row.get("context_peak") or 0,
                                   max(c.context for c in found))
         window = row.get("context_window") or 0
@@ -707,25 +469,7 @@ def _attach_calls(turn_rows: Sequence[dict[str, Any]], session_id: str,
 
 def _agent_items(row: dict[str, Any], models: Sequence[dict[str, Any]],
                  subs: Sequence[Any]) -> tuple[list[Item], dict[str, int]]:
-    """One turn, split into the agents that ran inside it. Returns (items, stranded).
-
-    The turn's totals are the budget and the subagents are drawn from it PER MODEL and
-    per class, in order, each taking at most what is left. So the rows always sum back
-    to the turn no matter how the two sources disagree, and what a subagent's transcript
-    claims beyond the turn's own total is reported as stranded rather than added — the
-    two directions of the same rule that keeps this a bill and not a growing estimate.
-
-    THE LEAD IS DRAWN FROM THE SAME BUDGET, by its own API calls, and what neither side
-    accounts for is charged to nobody: a subagent's transcript under-reports its output by
-    construction, and handing the lead that difference made its row a figure the reader
-    acts on and the transcript denies (spec
-    docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §2).
-
-    The turn's exact dollar figure is split across the rows in proportion to what they
-    cost at list. Tokens are the figure that reconciles and dollars are derived and
-    labelled (kn-e6bb1166): the turn line keeps the CLI's figure to the cent, and each
-    row under it carries its share of it rather than nothing at all.
-    """
+    """One turn, split into the agents that ran inside it (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §2)"""
     budget = {(m.get("model") or "unknown"): {c: m.get(c) or 0
                                               for c in usage_mod.TOKEN_CLASSES}
               for m in models}
@@ -749,9 +493,6 @@ def _agent_items(row: dict[str, Any], models: Sequence[dict[str, Any]],
             if any(take.values()):
                 drafts.append((sub.label, model, take, "subagent"))
     # §2.1: with no subagent, nothing the lead's transcript misses belongs to anyone else
-    # — side-model calls and the CLI's own compaction are the lead's own spend — so the
-    # remainder goes to the lead unchanged. §4: and so it does with no cover to split on,
-    # under a note that says the figure is a subtraction.
     cover = row.get("calls_cover_by_model") if subs else None
     if not cover:
         role = "lead" if not subs else "lead_unmeasured"
@@ -774,32 +515,22 @@ def _agent_items(row: dict[str, Any], models: Sequence[dict[str, Any]],
                 stranded["lead"] += want - got
             if any(take.values()) or not drafts:
                 drafts.append((LEAD, key, take, "lead"))
-        # Per model, like the lead's own rows: output is the dearest class and a residue
-        # priced in the wrong model's band is a wrong dollar figure.
+        # Per model, like the lead's own rows: output is the dearest class and a residue priced in the wrong...
         for model, left in budget.items():
             if any(left.values()):
                 drafts.append((UNATTRIBUTED, model, dict(left), "unattributed"))
-    # Priced first, so the turn's one exact figure can be shared out by what each row
-    # is worth. `list_usd` of a whole turn is never zero unless the turn is.
+    # Priced first, so the turn's one exact figure can be shared out by what each row is worth
     priced = [(d, sum(usage_mod.class_costs(d[1], **d[2]).values())) for d in drafts]
     total_list = sum(p for _, p in priced) or 1.0
     exact = row.get("cost_usd")
-    # The agent level only when it DISTINGUISHES something: a turn whose only agent is
-    # the lead would get a child that repeats the turn and says nothing, the same rule
-    # the per-model level follows. A turn whose only agent is a SUBAGENT still gets one
-    # — dropping that level would let a turn consumed entirely by a subagent look like
-    # ordinary lead spend, which is the opposite of what these rows are for.
+    # The agent level only when it DISTINGUISHES something: a turn whose only agent is the lead would get...
     labels = {d[0] for d, _ in priced}
     named = len(labels) > 1 or labels != {LEAD}
     items: list[Item] = []
     charged_turn = False
     for i, ((label, model, take, role), list_usd) in enumerate(priced):
         first = i == 0
-        # The countable act on a worker line is the TURN — an actor line reads "6 turns"
-        # and not "6 calls", which is a different number and a different claim. A
-        # subagent is not a second countable act inside its turn: it is part of the one
-        # turn already counted, so it carries no count of its own and the turn line
-        # keeps saying "1 turn" instead of collapsing to a meaningless "2 charges".
+        # The countable act on a worker line is the TURN
         counts = role.startswith("lead") and not charged_turn
         charged_turn = charged_turn or counts
         leaf: tuple[str, ...] = (label,) if named else ()
@@ -808,8 +539,7 @@ def _agent_items(row: dict[str, Any], models: Sequence[dict[str, Any]],
             inner=(WORKER,) + leaf,
             turn=row["seq"], model=model if model != "unknown" else "",
             **take,
-            # The TTL split is reported once per turn, for part of it; it rides on the
-            # first row so its ratio prices that turn's writes.
+            # The TTL split is reported once per turn, for part of it
             cache_1h=(row.get("cache_1h") or 0) if first else 0,
             cache_5m=(row.get("cache_5m") or 0) if first else 0,
             exact_usd=None if exact is None else exact * list_usd / total_list,
@@ -825,15 +555,7 @@ def _agent_items(row: dict[str, Any], models: Sequence[dict[str, Any]],
 
 def _call_items(rows: Sequence[dict[str, Any]],
                 turn_at: Any) -> list[Item]:
-    """One item per `agent_calls` row — Jarvis's own calls and the worker's subprocesses.
-
-    The path is what the user asked to be able to expand: actor, then the KIND of work
-    (Neo answering, a panel's seats, a digest), then the individual call — which for a
-    panel is its seat, so each persona is its own line and the question "which seat is
-    dear" has an answer. Subprocess rows are grouped by the program that ran them
-    instead: one `pytest evals/llm` is forty calls, and forty rows saying `pytest` is
-    not a breakdown.
-    """
+    """One item per `agent_calls` row — Jarvis's own calls and the worker's subprocesses"""
     from . import agent_usage
 
     items: list[Item] = []
@@ -845,16 +567,10 @@ def _call_items(rows: Sequence[dict[str, Any]],
         if agent_usage.is_subprocess(kind):
             path: tuple[str, ...] = (SUBPROC, label or described)
         elif agent_usage.is_observability(kind):
-            # Its own class, exactly as a subprocess row gets one: looking at the order is
-            # not Jarvis working on it (§10).
+            # Its own class, exactly as a subprocess row gets one: looking at the order is not Jarvis working on...
             path = (OBSERVE, described)
         else:
-            # A third level only when it SAYS something the kind did not. A panel's
-            # rows are labelled with the seat, so each persona gets its own line (the
-            # standing ruling: one row per seat, never one per question). Neo's answers
-            # are labelled with nothing useful, so they are split by the question they
-            # answered instead — the countable act on that line. A digest is labelled
-            # with neither and gets no third level rather than one repeating the kind.
+            # A third level only when it SAYS something the kind did not
             leaf = label
             if row.get("question_id") and label in ("", "question", described):
                 leaf = f"question #{row['question_id']}"
@@ -880,13 +596,7 @@ def _call_items(rows: Sequence[dict[str, Any]],
 
 
 def _turn_locator(turn_rows: Sequence[dict[str, Any]]) -> Any:
-    """Which turn a timestamp belongs to: the last one that had STARTED by then.
-
-    Ruled on question 121. It puts a Neo answer on the turn that asked the question —
-    the worker asks and ends its turn, so the answer arrives while no turn is running —
-    and a subprocess call on the turn that ran it. Anything earlier than the first turn
-    has no turn to belong to and lands on the `NO_TURN` line, in the open.
-    """
+    """Which turn a timestamp belongs to: the last one that had STARTED by then"""
     starts = sorted((r.get("started_at") or 0, r["seq"]) for r in turn_rows)
 
     def locate(ts: float) -> int | None:
@@ -901,7 +611,7 @@ def _turn_locator(turn_rows: Sequence[dict[str, Any]]) -> Any:
     return locate
 
 
-# -- assembling one order's bill ------------------------------------------------------
+# -- assembling one order's bill
 
 
 def _turn_label(rows: Sequence[dict[str, Any]]) -> Any:
@@ -918,7 +628,7 @@ def _turn_label(rows: Sequence[dict[str, Any]]) -> Any:
 
 def compose(items: Sequence[Item], turn_rows: Sequence[dict[str, Any]],
             label: str) -> dict[str, Any]:
-    """The two folds and the total, over one order's items. See the module docstring."""
+    """The two folds and the total, over one order's items"""
     turn_label = _turn_label(turn_rows)
     by_turn = _fold(
         items,
@@ -927,7 +637,7 @@ def compose(items: Sequence[Item], turn_rows: Sequence[dict[str, Any]],
                          else _actor_label(p[-1])),
         note=lambda p: (NO_TURN_NOTE if p == (NO_TURN,) else ""),
     )
-    # Turns in order, with `NO_TURN` last: it is a residue, not a step in the story.
+    # Turns in order, with `NO_TURN` last: it is a residue, not a step in the story
     by_turn.sort(key=lambda line: (line["key"] == NO_TURN,
                                    _seq_of(line["key"])))
     return {
@@ -941,19 +651,11 @@ def compose(items: Sequence[Item], turn_rows: Sequence[dict[str, Any]],
 
 
 def _agent_view(items: Sequence[Item]) -> list[dict[str, Any]]:
-    """The worker's session by AGENT — the lead, then each subagent it spawned.
-
-    A third fold of the same leaves, and the one that answers the identity the user
-    stated: add up every agent of a work order and the sum is the worker's whole
-    session — the order's total less what Jarvis spent on it and less the claude
-    processes the worker itself launched. `reconcile` checks exactly that.
-    """
+    """The worker's session by AGENT — the lead, then each subagent it spawned"""
     worker = [i for i in items if i.path and i.path[0] == WORKER]
     view = _fold(worker, key=lambda i: (i.inner[1] if len(i.inner) > 1 else LEAD,),
                  label=lambda p: str(p[-1]))
-    # The lead first, then the subagents in the order they were spawned; a bill reads
-    # top-down and the agent that ran the order belongs at the top of its own list.
-    # ...and the residue last: it is not an agent, it is what no agent accounts for (§2).
+    # The lead first, then the subagents in the order they were spawned
     view.sort(key=lambda line: (line["label"] != LEAD, line["label"] == UNATTRIBUTED))
     return view
 
@@ -972,19 +674,7 @@ def _actor_label(segment: Any) -> str:
 
 def build(target: str, project: str | None = None, *,
           live: bool = False) -> dict[str, Any]:
-    """The bill for one order, work or feature, resolved by id.
-
-    A SEALED bill is returned as it was sealed. A bill is computed from sources that
-    expire — Claude Code prunes transcripts and result JSONs on its own schedule — so
-    recomputing a finished order's bill every time it is looked at means the answer
-    quietly shrinks as the evidence ages. It is frozen when the order settles instead,
-    and only an open order is costed live. `live=True` recomputes anyway, which is what
-    sealing itself does and what a test comparing the two needs.
-
-    The feature order is tried FIRST, for the reason `ops._cost_for_target` gives: the
-    two id spaces cannot collide, but resolving the work order first would answer
-    `bill fo-…` with the planner's own spend, which is the one figure nobody wants.
-    """
+    """The bill for one order, work or feature, resolved by id"""
     from . import ops
 
     try:
@@ -1005,35 +695,7 @@ def build(target: str, project: str | None = None, *,
 
 def _upgrade_seal(project: str, path: Path, order: dict[str, Any],
                   sealed: dict[str, Any], *, feature: bool) -> dict[str, Any] | None:
-    """Re-derive a seal written before this module computed a field it computes now.
-
-    Sealing exists because the evidence expires, and freezing the numbers froze the
-    SHAPE with them: a bill sealed before per-call rows existed could never show them,
-    not even on an order whose transcript was still on disk. So a stored payload carries
-    `PAYLOAD_VERSION`, and an older one is recomputed ONCE — under the same rule sealing
-    already encodes, and this is the whole of it: the fresh computation is adopted only
-    if it still sees at least as many tokens as the seal holds, in every class. The
-    moment the transcript is pruned, recomputing loses tokens, the test fails, and the
-    seal stands untouched for good. A bill must never shrink because someone looked at
-    it again (kn-3629fa87), and this cannot make it.
-
-    THE ONE SHRINK THAT IS ALLOWED is a CORRECTION: a seal whose turns were counted
-    under a superseded reading of the result envelope, re-derived from the same result
-    JSONs under the current one. That is the case a seal cannot survive on its own — an
-    order settled under `USAGE_SCHEMA_VERSION` 2 holds the whole resumed session's spend
-    once per turn, three to six times its real bill — and "never shrink" would freeze
-    exactly the wrong number for ever. It is admitted only when the fresh reading is
-    ENTIRELY current (no version-2 turn left in it, which is what a pruned result JSON
-    leaves behind) so a shrink can never come from evidence that merely aged, and it is
-    ANNOUNCED: `accuracy.corrected_from` carries what the seal used to say.
-
-    `bill_sealed_at` is preserved: WHEN this order settled is not changed by re-deriving
-    its payload, and `accuracy.resealed_at` records that the re-derivation happened, so
-    the page is not quietly claiming today's reading was taken back then.
-
-    Returns None when there is nothing to upgrade or the evidence has gone — the caller
-    keeps the seal. Never raises: a bill that cannot be upgraded is still a bill.
-    """
+    """Re-derive a seal written before this module computed a field it computes now"""
     from .project_store import ProjectStore
 
     if (sealed.get("payload_v") or 1) >= PAYLOAD_VERSION:
@@ -1050,9 +712,7 @@ def _upgrade_seal(project: str, path: Path, order: dict[str, Any],
         at = order.get("bill_sealed_at")
         if shrank:
             fresh["accuracy"] = {**fresh["accuracy"], "corrected_from": stale}
-        # Stamped BEFORE it is written, so the record on disk says it was re-derived
-        # too. Setting it only on the returned copy would make the fact visible exactly
-        # once — to this reader — and invisible to the next one.
+        # Stamped BEFORE it is written, so the record on disk says it was re-derived too
         fresh["accuracy"] = {**fresh["accuracy"], "sealed_at": at, "live": False,
                              "resealed_at": db.now()}
         store = ProjectStore(path)
@@ -1066,35 +726,7 @@ def _upgrade_seal(project: str, path: Path, order: dict[str, Any],
 
 
 def _corrects_a_reading(sealed: dict[str, Any], fresh: dict[str, Any]) -> bool:
-    """Is the fresh bill smaller because the OLD one counted wrong, or because the
-    evidence has aged? Only the first may replace a seal.
-
-    The seal must hold turns read under a superseded `USAGE_SCHEMA_VERSION`, and the
-    fresh reading must hold none — one version-2 turn left in it is a result JSON that
-    has been pruned, and its spend would be the transcript estimate, which is exactly
-    the ageing this guard exists to refuse.
-
-    THAT IS NOT ENOUGH ON ITS OWN, because the version marker only speaks for turns the
-    bill can still SEE. An order whose session transcript is pruned between the seal and
-    the re-read loses its unrecorded turns entirely, re-derives the recorded ones to the
-    current version, and would pass the test above while quietly dropping real spend —
-    for ever, since the seal it overwrites was the last record of it. So the fresh
-    reading must also see no LESS than the seal did: any gap in `accuracy` whose CAUSE
-    the sealed bill did not already carry is evidence that has aged, not a correction.
-
-    BY CAUSE AND NOT BY WORDING (`_gap_causes`), because the disclosures are prose and
-    prose gets rewritten. Splitting the version-1 line into a turn sentence and a call
-    sentence made every pre-split seal look, to a literal set difference, like a bill
-    that had just lost evidence — the permanent silent refusal this order exists to
-    remove, re-created by an edit to an English sentence.
-
-    IT ASKS ABOUT TURNS AND ONLY TURNS, which `total.usage_versions` cannot answer:
-    that set also holds the stamp of every `agent_calls` row on the bill, and an OS
-    call is a one-shot `claude -p` with no result JSON kept, so its version can never
-    be refreshed the way `ops._turn_usage` refreshes a turn's. Reading the mixed set
-    made every bill carrying a pre-fix OS call permanently ineligible — the defect this
-    docstring used to describe as working.
-    """
+    """Is the fresh bill smaller because the OLD one counted wrong, or because the evidence has aged?"""
     from . import claude_cli
 
     if _gap_causes(fresh) - _gap_causes(sealed):
@@ -1106,17 +738,7 @@ def _corrects_a_reading(sealed: dict[str, Any], fresh: dict[str, Any]) -> bool:
 
 
 def _turn_versions(payload: dict[str, Any]) -> set[int]:
-    """Which reading produced the WORKER TURNS of one bill, at any level of it.
-
-    A version-independent figure is the difference between the two populations: the
-    v2-to-v3 correction is about diffing a RESUMED session's running totals, and a
-    one-shot OS call has no previous envelope to diff (`claude_cli.derive_turn_usage`),
-    so its stamp says which parser read it and nothing about its numbers.
-
-    Reads the turn rows every payload already carries, sealed ones included, so this
-    needed no new field and no `PAYLOAD_VERSION` bump. Unrecorded turns are skipped:
-    they have no envelope to have a version, and `_accuracy` discloses them separately.
-    """
+    """Which reading produced the WORKER TURNS of one bill, at any level of it"""
     versions = {row.get("usage_v") or 1
                 for row in payload.get("turn_rows") or [] if row.get("recorded")}
     for order in payload.get("orders") or []:      # a feature order, one level down
@@ -1125,27 +747,7 @@ def _turn_versions(payload: dict[str, Any]) -> set[int]:
 
 
 def _call_versions(rows: Sequence[dict[str, Any]]) -> set[int]:
-    """Which reading produced JARVIS'S OWN CALLS on one bill.
-
-    Kept apart from `_turn_versions` because the two versions mean different things
-    here. Version 2 is about diffing a RESUMED session and says nothing about a
-    one-shot call, which is why the guard must not read it. Version 1 is not about
-    sessions at all: it means the envelope carried no `modelUsage`, so the figure is
-    the lead agent's `usage` and misses anything the call spawned beneath it
-    (`claude_cli.derive_turn_usage`) — a real under-reading for a call, and disclosed
-    as one. No call can ever be corrected: a one-shot `claude -p` keeps no result JSON.
-
-    An envelope with no stamp counts as version 1, the same default `_turn_versions`
-    applies: the stamp arrived WITH the modelUsage fix, so a row that predates it was
-    read by the parser that missed subagents. A row with no envelope at all is skipped
-    — no reading was taken, so there is none to be old.
-
-    AN OBSERVABILITY ROW IS SKIPPED FOR THAT SAME REASON, envelope or not (§10 of
-    docs/superpowers/specs/2026-09-24-order-observability.md): a metered look bought no model call, so
-    its `wall_ms`-and-zeros envelope carries no reading that could be old, and counting it
-    as version 1 would make every bill holding one disclose an under-reading that is not
-    there.
-    """
+    """Which reading produced JARVIS'S OWN CALLS on one bill (docs/superpowers/specs/2026-09-24-order-observability.md)"""
     from . import agent_usage
 
     versions: set[int] = set()
@@ -1159,7 +761,7 @@ def _call_versions(rows: Sequence[dict[str, Any]]) -> set[int]:
 
 
 def unseal(order: dict[str, Any]) -> dict[str, Any] | None:
-    """The bill frozen onto this order when it settled, if there is one."""
+    """The bill frozen onto this order when it settled, if there is one"""
     raw = order.get("bill_json")
     if not raw:
         return None
@@ -1174,13 +776,7 @@ def unseal(order: dict[str, Any]) -> dict[str, Any] | None:
 def seal(project: str, path: Path, order: dict[str, Any], *,
          feature: bool = False, index: dict[str, list[Path]] | None = None
          ) -> dict[str, Any]:
-    """Compute a settled order's bill and freeze it onto the order. Idempotent.
-
-    Called by the daemon a tick or two after an order settles, and again for every
-    order that settled before this existed — which is the only way those get an
-    accurate bill at all, since the evidence for them is still on disk today and will
-    not be next month.
-    """
+    """Compute a settled order's bill and freeze it onto the order"""
     from .project_store import ProjectStore
 
     payload = (for_feature_order(project, path, order, index=index) if feature
@@ -1195,14 +791,10 @@ def seal(project: str, path: Path, order: dict[str, Any], *,
     return payload
 
 
-# WHAT EACH DISCLOSURE BELOW IS ABOUT, as a key that outlives its wording. Changing a
-# sentence in `_accuracy` must not change what `_corrects_a_reading` believes a seal
-# could see. Add a row here whenever a gap is added, and keep the marker a phrase that
-# names the CAUSE rather than one that happens to read well.
+# WHAT EACH DISCLOSURE BELOW IS ABOUT, as a key that outlives its wording
 _GAP_CAUSES = (
     ("transcript for the worker's session is gone", "no-transcript"),
-    # One cause, said twice: a turn's sentence and a call's. Both mean the same reading
-    # produced the figure, so a seal written before the split still covers the split.
+    # One cause, said twice: a turn's sentence and a call's
     ("modelUsage fix", "read-before-modelusage"),
     ("per-turn fix", "read-before-per-turn"),
     ("no longer have the result JSON", "estimated-from-transcript"),
@@ -1210,12 +802,7 @@ _GAP_CAUSES = (
 
 
 def _gap_causes(payload: dict[str, Any]) -> set[str]:
-    """The causes one bill's `accuracy.gaps` disclose, whatever words they used.
-
-    An unrecognised sentence is its own cause, so a gap this table has not been taught
-    still counts as a gap — the guard stays strict by default and is only ever loosened
-    on purpose.
-    """
+    """The causes one bill's `accuracy.gaps` disclose, whatever words they used"""
     causes = set()
     for gap in ((payload.get("accuracy") or {}).get("gaps") or []):
         causes.add(next((cause for mark, cause in _GAP_CAUSES if mark in gap), gap))
@@ -1224,24 +811,15 @@ def _gap_causes(payload: dict[str, Any]) -> set[str]:
 
 def _accuracy(payload: dict[str, Any], turn_rows: Sequence[dict[str, Any]],
               session: Any, calls: Sequence[dict[str, Any]] = ()) -> dict[str, Any]:
-    """What this bill could not see — the disclaimer, computed rather than assumed.
-
-    A bill sealed at completion is complete. One reconstructed later from whatever
-    survived is not, and the honest thing is to say which parts are missing rather than
-    to present a smaller number with the same confidence.
-    """
+    """What this bill could not see — the disclaimer, computed rather than assumed"""
     gaps: list[str] = []
     if turn_rows and not session.found:
         gaps.append("Claude Code's transcript for the worker's session is gone, so any "
                     "turn without a result JSON of its own could not be counted at all.")
-    # Turn versions, not the bill's mixed set: an OS call's stamp is not a claim about
-    # a turn's reading and printing it here disclosed a ceiling that was not there
-    # (`_turn_versions`).
+    # Turn versions, not the bill's mixed set: an OS call's stamp is not a claim about a turn's reading...
     versions = _turn_versions({"turn_rows": turn_rows})
     if 1 in _call_versions(calls):
-        # Said separately from the turn line below and worded for a CALL, because the
-        # two are true of different things and a reader cannot act on a sentence about
-        # turns when what is short is Jarvis's own spend.
+        # Said separately from the turn line below and worded for a CALL
         gaps.append("Some of Jarvis's own calls on this order were counted before the "
                     "modelUsage fix, so each is its lead agent's spend only and misses "
                     "whatever it spawned beneath itself — a floor, not a total.")
@@ -1250,11 +828,7 @@ def _accuracy(payload: dict[str, Any], turn_rows: Sequence[dict[str, Any]],
                     "JSON is gone too, so their tokens are the old, low reading — a "
                     "floor, not a total.")
     if 2 in versions:
-        # The opposite disclaimer to the one above, and it has to be said as plainly:
-        # these turns hold the whole resumed session's running total each, so the
-        # figure is a CEILING and the order really cost less. Only a turn whose result
-        # JSON has been pruned can still be in this state — anything still on disk is
-        # re-derived on sight (`ops._turn_usage`).
+        # The opposite disclaimer to the one above
         gaps.append("Some turns were counted before the per-turn fix and their result "
                     "JSON is gone, so each one still carries the whole session's "
                     "running total — a ceiling, not a total.")
@@ -1266,11 +840,7 @@ def _accuracy(payload: dict[str, Any], turn_rows: Sequence[dict[str, Any]],
 
 
 def _cold_prefix_floor() -> int:
-    """`os.cold_prefix_floor`, or the catalog's own error if none is registered.
-
-    Deliberately no fallback: classifying a cold boundary against a threshold nobody
-    configured would print a finding the configuration never produced.
-    """
+    """`os.cold_prefix_floor`, or the catalog's own error if none is registered"""
     from .ops import resolve_catalog
 
     return resolve_catalog().os.cold_prefix_floor
@@ -1278,7 +848,7 @@ def _cold_prefix_floor() -> int:
 
 def for_work_order(project: str, path: Path, wo: dict[str, Any],
                    index: dict[str, list[Path]] | None = None) -> dict[str, Any]:
-    """One work order's bill: its turns, Jarvis's calls on it, its own subprocesses."""
+    """One work order's bill: its turns, Jarvis's calls on it, its own subprocesses"""
     from . import ops
     from .central_store import CentralStore
     from .project_store import ProjectStore
@@ -1295,9 +865,7 @@ def for_work_order(project: str, path: Path, wo: dict[str, Any],
         central.close()
     session = usage_mod.read_session(wo.get("session_id") or "", _cold_prefix_floor(),
                                      index=index)
-    # Per-API-call detail, sealed onto the turn rows. Done BEFORE the items are built so
-    # that `api_calls` and `context_peak` are settled once, on the rows every surface
-    # reads, rather than corrected differently in each renderer.
+    # Per-API-call detail, sealed onto the turn rows
     _attach_calls(turn_rows, wo.get("session_id") or "", index)
     worker_items, notes = _turn_items(turn_rows, session)
     items = [*worker_items, *_call_items(calls, _turn_locator(turn_rows))]
@@ -1325,12 +893,7 @@ def for_work_order(project: str, path: Path, wo: dict[str, Any],
 
 def for_feature_order(project: str, path: Path, fo: dict[str, Any],
                       index: dict[str, list[Path]] | None = None) -> dict[str, Any]:
-    """A feature order's bill: its planner and every child, each a whole bill itself.
-
-    The hierarchy the user asked for goes all the way down — the feature's total, each
-    order under it, and each order's own turns — because a feature order is where "what
-    did this cost" is asked and the answer is never one session's.
-    """
+    """A feature order's bill: its planner and every child, each a whole bill itself"""
     from . import ops
     from .central_store import CentralStore
     from .project_store import ProjectStore
@@ -1347,16 +910,10 @@ def for_feature_order(project: str, path: Path, fo: dict[str, Any],
         children.extend(store.feature_children(fo["id"]))
     finally:
         store.close()
-    # ONE pass over Claude Code's transcript tree for the whole feature, not one per
-    # child: `index_sessions` walks every project directory there is, and a feature with
-    # eight children would otherwise walk it eight times to answer one page.
+    # ONE pass over Claude Code's transcript tree for the whole feature
     index = index if index is not None else usage_mod.index_sessions()
     orders = [for_work_order(project, path, child, index=index) for child in children]
-    # Calls Jarvis made against the PARENT row itself — a plan question whose planner is
-    # gone carries the feature's own id (`ProjectStore.work_order_for_question`), and an
-    # improvement order's family is the order plus its analyst, §2.6 of
-    # docs/superpowers/specs/2026-09-23-improvement-orders.md. Nothing below this row
-    # owns them, so without this they are on no bill at all.
+    # Calls Jarvis made against the PARENT row itself (docs/superpowers/specs/2026-09-23-improvement-orders.md)
     central = CentralStore()
     try:
         own_calls = central.agent_calls(wo_id=fo["id"], limit=CALL_LIMIT)
@@ -1367,8 +924,7 @@ def for_feature_order(project: str, path: Path, fo: dict[str, Any],
     agent_items: list[Item] = []
     for order, child in zip(orders, children):
         for line in order["actors"]:
-            # Re-charged as one item per leaf of the child's own tree, so the feature's
-            # by-actor view is the same fold over the same facts one level up.
+            # Re-charged as one item per leaf of the child's own tree
             items.extend(_relabel(line, child["id"]))
         for line in order.get("agents") or []:
             agent_items.extend(_relabel(line, child["id"], prefix=(child["id"],)))
@@ -1382,22 +938,17 @@ def for_feature_order(project: str, path: Path, fo: dict[str, Any],
                         label=lambda p: _actor_label(p[-1]),
                         note=lambda p: ACTOR_NOTES.get(p[-1], "") if len(p) == 1 else ""),
         "turns": [],
-        # Every agent the feature ran, one order at a time. The identity holds a level
-        # up unchanged: these sum to the feature's workers, and each order below has the
-        # same view over its own turns.
+        # Every agent the feature ran, one order at a time
         "agents": _fold(agent_items, key=lambda i: i.path,
                         label=lambda p: str(p[-1])),
         "orders": orders,
-        # Its own calls as one line beside the orders, so `reconcile`'s third view still
-        # adds up to the headline: the feature's total is its orders PLUS this.
+        # Its own calls as one line beside the orders
         "own": _total_line(own_items, fo["id"]) if own_items else None,
         "notes": [],
         "checks": {},
     }
     payload["checks"] = reconcile(payload)
-    # A feature's accuracy is the worst of its children's: one order whose transcript is
-    # gone makes the feature's total a floor, and saying so on the feature is the only
-    # place the reader of the feature will see it.
+    # A feature's accuracy is the worst of its children's: one order whose transcript is gone makes the...
     gaps: list[str] = []
     for order in orders:
         for gap in (order.get("accuracy") or {}).get("gaps") or []:
@@ -1412,15 +963,8 @@ def for_feature_order(project: str, path: Path, fo: dict[str, Any],
 
 def _relabel(line: dict[str, Any], wo_id: str, prefix: tuple[str, ...] = ()
              ) -> list[Item]:
-    """Flatten a built line tree back into items, for folding one level up.
-
-    A feature order's bill is its children's leaves re-folded, not their totals added:
-    adding totals would give the feature a correct headline and no way to expand it,
-    which is the thing this whole module exists to fix.
-    """
-    # The order id goes in as the SECOND segment, so a feature's by-actor view reads
-    # "the workers → this order → its turns" rather than merging every child's "turn 1"
-    # into one line, which is what a plain re-fold of the same keys would do.
+    """Flatten a built line tree back into items, for folding one level up"""
+    # The order id goes in as the SECOND segment
     segment = line["key"].split("/")[-1]
     path = (*prefix, segment) if prefix else (segment, wo_id)
     children = line.get("children") or []
@@ -1441,15 +985,7 @@ def _relabel(line: dict[str, Any], wo_id: str, prefix: tuple[str, ...] = ()
 
 
 def _worker_extras(session: Any) -> dict[str, Any]:
-    """The facts about a worker's session that live beside the line items.
-
-    SUBAGENTS now have rows of their own — under the turn they ran in, drawn out of that
-    turn's total rather than added to it — so this is the headline over those rows, not
-    a substitute for them. THE RE-WRITE TAX has no rows and cannot: it is a SHARE of the
-    cache-write charge already on the bill, the part that paid to re-send context a warm
-    cache would have served, and the user's second question was what it even is, so the
-    sentence that says so travels with the number.
-    """
+    """The facts about a worker's session that live beside the line items"""
     total = session.total
     return {
         "subagents": {
@@ -1458,10 +994,7 @@ def _worker_extras(session: Any) -> dict[str, Any]:
             "output": session.subagents.output,
             "billed_input": session.subagents.billed_input,
         },
-        # §6. Split by side for the reason `rewrite.by_side` is: the lead side is zero by
-        # shape (every lead row carries a `stop_reason`) and the subagent side is the
-        # finding. ABSENT on a seal written before this existed means UNKNOWN, not zero —
-        # see `PAYLOAD_VERSION` (§9).
+        # §6
         "placeholder": {
             "calls": total.placeholder_calls,
             "output": total.placeholder_output,
@@ -1475,21 +1008,13 @@ def _worker_extras(session: Any) -> dict[str, Any]:
             "ttl_share": total.rewrite_ttl_share,
             "ttl_tokens": total.rewrite_ttl_excess,
             "ttl_boundaries": total.boundaries_ttl,
-            # THE RAW OBSERVATIONS, and not a second apportionment of the tax. Every key
-            # above is a share OF the tax; the cache-TTL decision is taken against a
-            # share of EVERY written token, so it needs both halves seen at a boundary
-            # and the whole cache-write line to divide them by (`usage.TTL_BREAK_EVEN`,
-            # kn-1449447a (4)). Their sum is deliberately not `tokens` — see
-            # `usage.Usage.rewrite_ttl_write`.
+            # THE RAW OBSERVATIONS, and not a second apportionment of the tax
             "ttl_write": total.rewrite_ttl_write,
             "prefix_write": total.rewrite_prefix_write,
             "compact_write": total.rewrite_compact_write,
             "compact_boundaries": total.boundaries_compact,
             "cache_write": total.cache_write,
-            # q1215: the order-level rollup, LABELLED by side. `total` already summed
-            # both (`Usage.__add__`, `usage.py:279-280`); what no surface could say is
-            # which side contributed what, and the subagent side is ZERO BY ARITHMETIC,
-            # never by being small.
+            # q1215: the order-level rollup, LABELLED by side
             "by_side": {
                 "main": {"tokens": session.main.rewrite_excess,
                          "boundaries": session.main.resume_boundaries,
@@ -1508,7 +1033,7 @@ def _worker_extras(session: Any) -> dict[str, Any]:
 
 
 def _annotate_turns(payload: dict[str, Any], turn_rows: Sequence[dict[str, Any]]) -> None:
-    """Hang each turn's timings and context on its line, for the per-turn header."""
+    """Hang each turn's timings and context on its line, for the per-turn header"""
     by_seq = {str(r["seq"]): r for r in turn_rows}
     for line in payload["turns"]:
         row = by_seq.get(line["key"])
@@ -1517,24 +1042,14 @@ def _annotate_turns(payload: dict[str, Any], turn_rows: Sequence[dict[str, Any]]
 
 
 def reconcile(payload: dict[str, Any], tolerance: float = 1e-6) -> dict[str, Any]:
-    """Prove the bill adds up, and say so in the payload.
-
-    Three claims, each checked rather than asserted: the by-turn view sums to the total,
-    the by-actor view sums to the total, and every parent line is the sum of its
-    children all the way down. They cannot fail while both views are folds of one item
-    list — which is exactly why this is cheap to run on every payload, and why a failure
-    here means the shape changed under someone, not that a number was mistyped.
-    """
+    """Prove the bill adds up, and say so in the payload"""
     problems: list[str] = []
     total = payload["total"]
     views = {name: payload.get(name) or [] for name in ("turns", "actors")}
-    # A feature order's third view: its children, each a whole bill. Compared by their
-    # own total lines, which is the only way the hierarchy the user asked for can be
-    # trusted — a feature whose headline is not its children's sum is telling two
-    # different stories on one page.
+    # A feature order's third view: its children, each a whole bill
     if payload.get("orders"):
         views["orders"] = [order["total"] for order in payload["orders"]]
-        # Plus what Jarvis spent on the parent row itself, which belongs to no child.
+        # Plus what Jarvis spent on the parent row itself, which belongs to no child
         if payload.get("own"):
             views["orders"].append(payload["own"])
     for view, lines in views.items():
@@ -1558,41 +1073,16 @@ def reconcile(payload: dict[str, Any], tolerance: float = 1e-6) -> dict[str, Any
     return {"balanced": not problems, "problems": problems}
 
 
-#: How far a turn's own figure may stand above everything found INSIDE it — its API
-#: calls plus its subagents — before that is a defect rather than something the
-#: transcript simply cannot see. BOTH NUMBERS ARE MEASURED, over the 40 most recent
-#: multi-turn orders on the dev machine:
-#:
-#:  * `modelUsage` counts side-model calls that write no assistant message, a flat
-#:    ~0.38M per turn and almost all of it cache_read (361,687 / 364,806 / 365,618 /
-#:    366,399 on turns of 2.7M to 4.1M, none with a subagent) — flat, so a
-#:    multiplicative allowance alone fails a short turn and passes a long one;
-#:  * a worker running under `--autocompact` compacts ITSELF, which re-reads the whole
-#:    conversation and writes no assistant message either. wo-d81fcc15 turn 2 is 1.19M
-#:    above its 6.73M of calls that way — 1.18x, with nothing recorded anywhere,
-#:    because that compaction is the CLI's and not `agent_usage.COMPACTION`.
-#:
-#: So the line is drawn where the DEFECT lives and not where the noise stops: a turn
-#: carrying the session's running total is a multiple of what is inside it — 45.64M
-#: against 4.12M on wo-966987af turn 3 — and the check is deliberately blind to a few
-#: percent, which no evidence on disk could settle either way (issue #470).
+#: How far a turn's own figure may stand above everything found INSIDE it (#470)
 CALL_COVER_SLACK = 2.0
 
-#: ...and the flat half of it, sized to absorb one self-compaction of a large context.
+#: ...and the flat half of it, sized to absorb one self-compaction of a large context
 CALL_COVER_RESIDUE = 1_500_000
 
 
 def _check_compaction_once(payload: dict[str, Any],
                            rows: Sequence[dict[str, Any]]) -> list[str]:
-    """A compaction charged to the worker AND recorded as a Jarvis compaction.
-
-    The SHAPE of the defect, not a number: it compares a `wo_turns` row against an item
-    sourced from `agent_calls`, which are the two tables the double count spans and the
-    one thing the fold invariants cannot see. BOTH children are required — the worker
-    child alone is an order whose `agent_calls` row was pruned or never written, and the
-    Jarvis child alone is the fixed state
-    (docs/superpowers/specs/2026-10-08-count-a-compaction-once.md §3).
-    """
+    """A compaction charged to the worker AND recorded as a Jarvis compaction (docs/superpowers/specs/2026-10-08-count-a-compaction-once.md §3)"""
     from . import agent_usage
 
     described = agent_usage.describe(agent_usage.COMPACTION)
@@ -1618,33 +1108,14 @@ def _check_compaction_once(payload: dict[str, Any],
 
 
 def _check_calls(payload: dict[str, Any]) -> list[str]:
-    """Per-call rows are a PARTITION of their turn: they may not exceed it, and — with
-    the turn's subagents beside them — they may not fall hopelessly short of it either.
-
-    THE EXCESS direction is the thing kn-7a2180ba forbids: a bill that grows when you
-    look closer. On wo-e23252e4 the two sides are equal to the token in all four classes
-    on all three turns, which is what makes the per-call view worth showing at all.
-
-    THE SHORTFALL direction was left unchecked, and that is how a bill got to say 184.6M
-    in its headline over a per-call table summing to 49.0M without anything failing
-    (wo-966987af). A shortfall is ordinary — the lead agent's calls are less than a turn
-    that spawned subagents — so what is checked is the turn against its calls PLUS its
-    subagents, both drawn from transcripts.
-
-    IT IS ASKED ONLY OF A CONVERSATION THE TRANSCRIPT ACCOUNTS FOR ENTIRELY: every
-    recorded turn with calls of its own found inside it. A transcript Claude Code has
-    part-pruned makes a turn look bigger than its evidence for a reason that is not a
-    bug, and one that cannot place a single call in a turn window says nothing about
-    that turn at all.
-    """
+    """Per-call rows are a PARTITION of their turn: they may not exceed it, and"""
     problems: list[str] = []
     rows = payload.get("turn_rows") or []
     problems.extend(_check_compaction_once(payload, rows))
     rows = [row for row in rows if row.get("kind") != COMPACT_TURN]
     for row in rows:
         cover = row.get("calls_cover")
-        # A turn with no result JSON yet — one in flight — has no figure of its own to
-        # exceed, and its calls are in the transcript the moment the worker makes them.
+        # A turn with no result JSON yet
         if not cover or not row.get("recorded"):
             continue
         for cls in usage_mod.TOKEN_CLASSES:
@@ -1670,15 +1141,7 @@ def _check_calls(payload: dict[str, Any]) -> list[str]:
 
 
 def _check_agents(payload: dict[str, Any]) -> list[str]:
-    """The user's identity: every agent added up IS the worker's whole session.
-
-    Stated on wo-4576667e as "sum the usage of all agents for a work order and it equals
-    the total minus the OS's". Checked against the worker's actor line, which is that
-    difference — the total less what Jarvis spent on the order and less the claude
-    processes the worker spawned. Checked and not merely arranged: subagent rows are
-    subtracted out of a turn's own total, and an off-by-one in that subtraction is
-    exactly the kind of error a bill must not be able to ship.
-    """
+    """The user's identity: every agent added up IS the worker's whole session"""
     agents = payload.get("agents") or []
     if not agents:
         return []
@@ -1696,20 +1159,7 @@ def _check_agents(payload: dict[str, Any]) -> list[str]:
 
 
 def _check_lead(payload: dict[str, Any]) -> list[str]:
-    """A lead row may never exceed what the lead's OWN API calls report.
-
-    The defect this fix is about, stated as arithmetic the bill can check on itself: the
-    lead used to be handed every token a subagent's placeholder rows failed to report —
-    69,460 output against its transcript's 17,421 on wo-be05ab99 turn 2 — and the fold
-    balanced throughout, because the money was in the right turn and on the wrong agent
-    (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §8).
-
-    SKIPPED WHERE IT CANNOT SPEAK, the same discipline `_check_calls` keeps: a turn with
-    no `calls_cover_by_model` is §4's fallback, where the lead legitimately holds the
-    remainder, and a turn that is not `recorded` has no envelope to partition. The lead
-    line is found by LABEL rather than by a key shape, so the fold's key function is free
-    to change without this silently passing.
-    """
+    """A lead row may never exceed what the lead's OWN API calls report (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §8)"""
     problems: list[str] = []
     for row in payload.get("turn_rows") or []:
         cover = row.get("calls_cover_by_model")
@@ -1730,7 +1180,7 @@ def _check_lead(payload: dict[str, Any]) -> list[str]:
 
 def _descendant(roots: Sequence[dict[str, Any]], key: str,
                 label: str) -> dict[str, Any] | None:
-    """The first line labelled `label` anywhere under the root keyed `key`."""
+    """The first line labelled `label` anywhere under the root keyed `key`"""
     root = next((line for line in roots if line["key"] == key), None)
     stack = list(root["children"] or []) if root else []
     while stack:
@@ -1755,48 +1205,22 @@ def _check_children(line: dict[str, Any]) -> list[str]:
     return problems
 
 
-# -- the re-write tax as a STANDING condition ------------------------------------------
-#
-# `inspection.alarms` reports one call re-sending one conversation, while the turn that
-# made it is still running, and it already names the cause. What nothing reported is the
-# aggregate: a PROJECT's re-write tax over a window, and which of the two causes it was.
-# Issue 164 item 1; finding 1 of
-# docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md.
-#
-# Read off SEALED BILLS (`ProjectStore.sealed_bills_since`) rather than transcripts,
-# which is what makes it affordable on the reconcile cadence — the objection finding 2
-# raised against doing this at all.
+# -- the re-write tax as a STANDING condition
 
 #: `inspection`'s two aggregate alarm kinds, duplicated as literals rather than imported
-#: — the same answer `probes.RESERVED_IDS` gives, and for the same reason one level over:
-#: `inspection` imports `catalog`, and this module is accounting that knows `db` and
-#: `usage` and must not learn the config layer to name a string. `cfg` below stays
-#: duck-typed for that reason too. `tests/test_rewrite_tax_alarm.py` pins both equal.
 REWRITE_PREFIX_ALARM = "rewrite-tax-prefix"
 REWRITE_TTL_ALARM = "rewrite-tax-ttl"
 
 
 def cohort_command(days: int = 30) -> str:
-    """The `scripts/cache_ttl_cohort.py` invocation a finding points its reader at.
-
-    Spelled once: the whole hazard of these findings is a reader acting on the wrong
-    ratio, and a command written out differently in two places is one of them going
-    stale. Takes the window because `invariants._cohort_note` reports over a configured
-    one, and sending that reader to a 30-day cohort would answer a different question
-    from the one they were just shown.
-    """
+    """The `scripts/cache_ttl_cohort.py` invocation a finding points its reader at"""
     return f"uv run python scripts/cache_ttl_cohort.py --days {days}"
 
 
-#: The default window's spelling, which is what `rewrite_alarms` quotes.
+#: The default window's spelling, which is what `rewrite_alarms` quotes
 COHORT_COMMAND = cohort_command()
 
-#: The break-even the TTL decision is actually taken against, as a sentence rather than a
-#: number this module branches on — nothing here compares anything to it. It is in the
-#: alarm's prose because the alarm's own threshold is a share of the BILL, roughly half
-#: this ratio, and a judge that read one against the other would propose switching the
-#: write TTL on evidence that says keep it (kn-1449447a (4), which is the error the
-#: findings doc's own draft made).
+#: The break-even the TTL decision is actually taken against
 TTL_DECISION_NOTE = (
     "This is a share of the BILL and is NOT the trigger for switching the write TTL. "
     "That decision is TTL-expiry tokens as a share of ALL cache writes, against a "
@@ -1808,20 +1232,7 @@ TTL_DECISION_NOTE = (
 
 @dataclass
 class RewriteTax:
-    """One project's re-write tax over a cohort window, split by CAUSE.
-
-    `ttl_share` is the TTL's share OF THE TAX and is None when no boundary in the window
-    was classified — `usage.Usage.rewrite_ttl_share`'s rule, kept all the way up here:
-    unmeasured must never print as 0%, and with no split there is no cause to name, so no
-    alarm is raised at all.
-
-    THE SPLIT AND THE DENOMINATOR COME FROM DIFFERENT POPULATIONS ON PURPOSE.
-    `bill_usd`, `tax_usd` and `tax_tokens` are every sealed order in the window, because
-    an order that paid no tax is still spend the tax is a share OF. The ratio is taken
-    only over the orders whose boundaries were classified (`classified_tokens`) and then
-    applied to the whole — dropping the unclassified orders from the denominator instead
-    would shrink it and inflate every share printed.
-    """
+    """One project's re-write tax over a cohort window, split by CAUSE"""
 
     days: int
     since: float
@@ -1831,59 +1242,45 @@ class RewriteTax:
     tax_tokens: int
     classified_tokens: int
     ttl_tokens: int
-    #: The biggest single contributor, which is the alarm's CARRIER and its exemplar —
-    #: never its culprit. See `Daemon.check_rewrite_tax`.
+    #: The biggest single contributor, which is the alarm's CARRIER and its exemplar — never its culprit
     worst_id: str
     worst_title: str
     worst_tax_usd: float
-    #: Sealed orders in the window carrying NO re-write block at all, so absent from
-    #: `orders` and from `bill_usd` alike. Said on the alarm, because a denominator
-    #: introduced as "this project's bill" while some of that bill was never looked at
-    #: is a claim wider than the number behind it (kn-6c0bef4c (2)).
+    #: Sealed orders in the window carrying NO re-write block at all
     unmeasured_orders: int = 0
 
     @property
     def ttl_share(self) -> float | None:
-        """Of the tax, the fraction the cache entry EXPIRING accounts for."""
+        """Of the tax, the fraction the cache entry EXPIRING accounts for"""
         if not self.classified_tokens:
             return None
         return self.ttl_tokens / self.classified_tokens
 
     @property
     def tax_share(self) -> float:
-        """The whole tax as a fraction of the window's bill, both at list prices."""
+        """The whole tax as a fraction of the window's bill, both at list prices"""
         return self.tax_usd / self.bill_usd if self.bill_usd else 0.0
 
     @property
     def ttl_share_of_bill(self) -> float | None:
-        """None, never 0.0, when nothing was classified — the rule this class's own
-        docstring states, and the one a dashboard reading these would otherwise break:
-        a window no boundary could be classified in has no TTL half to print, and 0%
-        reads as "measured, and it is nothing"."""
+        """None, never 0.0, when nothing was classified"""
         share = self.ttl_share
         return self.tax_share * share if share is not None else None
 
     @property
     def prefix_share_of_bill(self) -> float | None:
-        """None when unmeasured — see `ttl_share_of_bill`."""
+        """None when unmeasured — see `ttl_share_of_bill`"""
         share = self.ttl_share
         return self.tax_share * (1 - share) if share is not None else None
 
     @property
     def coverage(self) -> float:
-        """How much of the tax the split actually accounts for. Stated on the alarm when
-        it is partial, because a share drawn from half the evidence is a weaker claim."""
+        """How much of the tax the split actually accounts for"""
         return self.classified_tokens / self.tax_tokens if self.tax_tokens else 0.0
 
 
 def rewrite_tax(store: Any, *, days: int, now: float | None = None) -> RewriteTax | None:
-    """One project's re-write tax over the trailing `days`, or None if nothing settled.
-
-    A COHORT WINDOW AND NEVER ALL HISTORY (kn-1449447a (5)): the split between the two
-    causes is drifting, and an average over everything ever sealed averages the trend
-    away — which is the difference between an alarm that notices a change and one that
-    restates a constant.
-    """
+    """One project's re-write tax over the trailing `days`, or None if nothing settled"""
     now = now if now is not None else db.now()
     since = now - days * 86_400
     orders = store.sealed_bills_since(since)
@@ -1895,18 +1292,12 @@ def rewrite_tax(store: Any, *, days: int, now: float | None = None) -> RewriteTa
         payload = db.from_json(order.get("bill_json") or "", {}) or {}
         rewrite = payload.get("rewrite")
         if not isinstance(rewrite, dict):
-            # A bill sealed before `_worker_extras` carried the block, or one sealed
-            # EMPTY because it could not be computed (`Daemon.seal_bills`). Neither is
-            # evidence of a small tax, so it is left out of both halves rather than
-            # counted as a zero — which would dilute every share on this record. The
-            # count is kept so the alarm can say the denominator is not the whole bill.
+            # A bill sealed before `_worker_extras` carried the block
             unmeasured += 1
             continue
         counted += 1
         total = payload.get("total") or {}
-        # LIST prices on both sides. `rewrite.list_usd` has no exact twin — it is derived
-        # from a rate, not billed — so pairing it with `exact_usd` would divide one
-        # currency by another and print the answer as a percentage.
+        # LIST prices on both sides
         bill_usd += float((total.get("cost") or {}).get("list_usd") or 0.0)
         this_tax = float(rewrite.get("list_usd") or 0.0)
         tax_usd += this_tax
@@ -1927,8 +1318,7 @@ def rewrite_tax(store: Any, *, days: int, now: float | None = None) -> RewriteTa
 
 
 def _coverage_note(tax: RewriteTax) -> str:
-    """Said only when the split rests on part of the tax. A claim drawn from half the
-    evidence and one drawn from all of it must not read identically."""
+    """Said only when the split rests on part of the tax"""
     if tax.coverage >= 0.99:
         return ""
     return (f" The split is measured over {tax.coverage:.0%} of the tax; the rest "
@@ -1936,8 +1326,7 @@ def _coverage_note(tax: RewriteTax) -> str:
 
 
 def _denominator_note(tax: RewriteTax) -> str:
-    """The OTHER coverage, which `_coverage_note` does not cover: the split's evidence is
-    part of the tax, and the tax's own denominator is part of the project's spend."""
+    """The OTHER coverage, which `_coverage_note` does not cover: the split's evidence is part of the tax"""
     if not tax.unmeasured_orders:
         return ""
     return (f" That bill is the {tax.orders} settled orders carrying a re-write "
@@ -1946,18 +1335,7 @@ def _denominator_note(tax: RewriteTax) -> str:
 
 
 def rewrite_alarms(tax: RewriteTax, cfg: Any) -> list[tuple[str, str]]:
-    """What is standing-wrong with this project's spend, one alarm per CAUSE.
-
-    A `(kind, reason)` pair and NOT an `inspection.Alarm`: that class lives behind the
-    config layer, and the caller who raises these already holds it.
-
-    NEITHER IS RAISED WHEN THE SPLIT IS UNMEASURED. `ttl_share` is None exactly when no
-    boundary was classified, and an alarm that named a cause anyway would be inventing
-    the one fact it exists to carry.
-
-    Each reason is self-contained down to the command that checks it, because the
-    supervisor judges on the alarm and the evidence packet and can look nothing up.
-    """
+    """What is standing-wrong with this project's spend, one alarm per CAUSE"""
     ttl_share = tax.ttl_share
     if ttl_share is None:
         return []
@@ -1985,31 +1363,12 @@ def rewrite_alarms(tax: RewriteTax, cfg: Any) -> list[tuple[str, str]]:
     return raised
 
 
-# -- cache health: the two ratios the FLEET's cache configuration is judged on ----------
-#
-# `RewriteTax` above is one project's tax as a share of its BILL — money, per project,
-# raised as an alarm. This is the other question entirely: two ratios over CACHE-WRITE
-# TOKENS, summed across every project, because what they decide is fleet-wide (the write
-# TTL every worker is launched with, and one line of `dispatch._write_worker_settings`).
-# `invariants.check_cache_ttl_trigger` and `invariants.check_prefix_stable` are the
-# readers; this module only counts.
+# -- cache health: the two ratios the FLEET's cache configuration is judged on
 
 
 @dataclass
 class CacheWrites:
-    """Cache-write tokens over a cohort window, split by what happened at each boundary.
-
-    Summed from SEALED BILLS — an indexed query and a JSON parse per order, never a
-    transcript walk, which is what lets a check on this run whenever `jarvis doctor` does
-    (the walk is ~5 minutes over this machine's 4,642 transcripts, measured 2026-09-16).
-    Addable, because the fleet's answer is the sum of its projects'.
-
-    THE THREE RATIOS BELOW HAVE DIFFERENT DENOMINATORS AND ONLY THE FIRST TWO DECIDE
-    ANYTHING. `ttl_share_of_writes` is the one the 1-hour cache write is bought on;
-    `ttl_share_of_tax` is roughly double it and is carried only so a reader who has met
-    that number elsewhere can see both side by side and not confuse them (kn-1449447a
-    (4) — the error PR #160's own draft made).
-    """
+    """Cache-write tokens over a cohort window, split by what happened at each boundary (#160)"""
 
     orders: int = 0
     cache_write: int = 0
@@ -2017,15 +1376,10 @@ class CacheWrites:
     prefix_write: int = 0
     boundaries: int = 0
     ttl_boundaries: int = 0
-    #: The boundaries the OS compacted across, and what they wrote. Kept apart from
-    #: `prefix_write` or the remedy would be counted as the defect — see
-    #: `usage.Usage.rewrite_compact_write`.
+    #: The boundaries the OS compacted across, and what they wrote
     compact_write: int = 0
     compact_boundaries: int = 0
-    #: Sealed orders in the window whose bill predates `PAYLOAD_VERSION` 3 and so has no
-    #: raw split to read. Counted, never treated as a zero: an unmeasured order is not
-    #: evidence of a healthy one, and saying how many were skipped is what keeps the
-    #: ratios' denominator from being introduced as more than it is.
+    #: Sealed orders in the window whose bill predates `PAYLOAD_VERSION` 3 and so has no raw split to read
     unmeasured_orders: int = 0
 
     def __add__(self, other: CacheWrites) -> CacheWrites:
@@ -2043,55 +1397,28 @@ class CacheWrites:
 
     @property
     def prefix_boundaries(self) -> int:
-        """The boundaries left once the two EXPLAINED kinds are taken out.
-
-        A compacted boundary is subtracted along with an expired one: the OS asked for
-        it, so counting it here would report the prefix drifting every time compaction
-        worked (`usage.Usage.rewrite_compact_write`).
-        """
+        """The boundaries left once the two EXPLAINED kinds are taken out"""
         return self.boundaries - self.ttl_boundaries - self.compact_boundaries
 
     @property
     def ttl_share_of_writes(self) -> float | None:
-        """THE DECIDING RATIO for the write TTL: TTL-expiry writes over ALL cache writes.
-
-        The 1-hour premium is charged on every written token and recovered only on the
-        ones a longer entry would have kept, so this — and nothing else — is what
-        `usage.TTL_BREAK_EVEN` is compared against.
-
-        None, never 0.0, when the window wrote nothing: unmeasured must not read as a
-        finding (`usage.Usage.rewrite_ttl_share`'s rule, kept up here).
-        """
+        """THE DECIDING RATIO for the write TTL: TTL-expiry writes over ALL cache writes"""
         return self.ttl_write / self.cache_write if self.cache_write else None
 
     @property
     def prefix_share_of_writes(self) -> float | None:
-        """The same denominator, the other cause: writes spent re-sending a MOVED PREFIX.
-
-        Deliberately not `1 - ttl_share_of_writes`. The two do not partition the
-        cache-write line — most writes happen at no boundary at all — so a prefix
-        regression raises this whether or not TTL expiry moves.
-        """
+        """The same denominator, the other cause: writes spent re-sending a MOVED PREFIX"""
         return self.prefix_write / self.cache_write if self.cache_write else None
 
     @property
     def ttl_share_of_tax(self) -> float | None:
-        """NOT A TRIGGER. The TTL's share of the classified re-write tax, which runs at
-        about double `ttl_share_of_writes` because its denominator is far smaller.
-        Reported beside it so the two are never met one at a time."""
+        """NOT A TRIGGER"""
         seen = self.ttl_write + self.prefix_write
         return self.ttl_write / seen if seen else None
 
 
 def cache_writes_since(store: Any, since: float) -> CacheWrites:
-    """One project's `CacheWrites` over the window, read off its sealed bills.
-
-    Only `PAYLOAD_VERSION` 3 bills carry the raw split, so this sees nothing older than
-    that version — and an order whose transcript was pruned before its bill was upgraded
-    never will (`_upgrade_seal` refuses to adopt a re-derivation that lost tokens, which
-    is the rule that keeps a bill from shrinking). Those land in `unmeasured_orders` and
-    the checks say so rather than quietly narrowing their own denominator.
-    """
+    """One project's `CacheWrites` over the window, read off its sealed bills"""
     found = CacheWrites()
     for order in store.sealed_bills_since(since):
         payload = db.from_json(order.get("bill_json") or "", {}) or {}
@@ -2105,9 +1432,7 @@ def cache_writes_since(store: Any, since: float) -> CacheWrites:
         found.prefix_write += int(rewrite.get("prefix_write") or 0)
         found.boundaries += int(rewrite.get("boundaries") or 0)
         found.ttl_boundaries += int(rewrite.get("ttl_boundaries") or 0)
-        # Absent on a version-3 seal, and zero is the right reading rather than a gap:
-        # nothing sealed before `PAYLOAD_VERSION` 4 could have been compacted, because
-        # the OS did not compact anything.
+        # Absent on a version-3 seal, and zero is the right reading rather than a gap: nothing sealed before...
         found.compact_write += int(rewrite.get("compact_write") or 0)
         found.compact_boundaries += int(rewrite.get("compact_boundaries") or 0)
     return found

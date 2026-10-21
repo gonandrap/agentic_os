@@ -1,16 +1,4 @@
-"""Screenshot the RETRY control on the work-order page, for a PR's UI evidence.
-
-`scripts/screenshot_rejudge_control.py` is the shape this copies. Two shots, because
-the control has two readings and neither implies the other: a `failed` order that CAN
-be retried — enabled box, enabled button, and the line saying a retry buries none of
-its pending assumptions — and a `failed` order that cannot, where the refusal sentence
-sits directly above the box it disables.
-
-Writes PNGs to docs/screenshots/. Everything it touches lives in a temp `JARVIS_HOME`
-and a temp catalog, so it never reads or writes the live OS:
-
-    uv run python scripts/screenshot_retry_control.py
-"""
+"""Screenshot the RETRY control on the work-order page, for a PR's UI evidence"""
 
 from __future__ import annotations
 
@@ -35,9 +23,7 @@ def _repo(path: Path) -> None:
 
 
 def _failed(store, title: str, description: str, *, session: bool) -> str:
-    """A work order whose worker died without delivering — `tests/test_wo_retry.py`'s
-    `a_failed_order` shape, minus the dispatch: `failed` plus the attention flag, and
-    a session id only where the worker got as far as opening a conversation."""
+    """A work order whose worker died without delivering"""
     from jarvis import ops
     from jarvis import worker_session
 
@@ -83,8 +69,7 @@ def seed() -> tuple[Path, str, str]:
             session=False)
     finally:
         pstore.close()
-    # The pending-assumption line is about a decision the user still owes, so the
-    # retriable order gets a real one rather than a stub row.
+    # The pending-assumption line is about a decision the user still owes
     ops.assume(live, "Assumed an open span should be closed at its last event rather "
                      "than at read time, so a re-read cannot move it.")
     return catalog, live, never
@@ -111,8 +96,7 @@ def shoot(live: str, never: str) -> None:
                             (never, "wo-retry-refused.png")):
             page.goto(f"{base}/wo/jarvis_os/{wo_id}#retry")
             page.locator("h2#retry").scroll_into_view_if_needed()
-            # The heading lands at the top edge on a scroll-into-view; back off so the
-            # panel under it is in frame too.
+            # The heading lands at the top edge on a scroll-into-view
             page.evaluate("window.scrollBy(0, -60)")
             page.wait_for_timeout(300)
             page.screenshot(path=SHOTS / name)

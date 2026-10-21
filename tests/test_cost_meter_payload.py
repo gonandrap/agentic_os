@@ -1,12 +1,4 @@
-"""The `meter` subtree, the one sentence, and the surfaces that render it.
-
-Spec docs/superpowers/specs/2026-10-08-usage-meter-samples-and-outside-spend.md §§7, 9,
-10 and the third block of §8. Tests 29-37, 43 and 44 of its §13.
-
-The scene below is the spec's own worked example, built from records rather than from
-literals: 12 points at $0.82/point is $9.84 implied, against $6.50 Jarvis spent, $2.48
-an outside session spent and $0.86 nobody can account for — 66%, 25%, 9%.
-"""
+"""The `meter` subtree, the one sentence, and the surfaces that render it (docs/superpowers/specs/2026-10-08-usage-meter-samples-and-outside-spend.md)"""
 
 from __future__ import annotations
 
@@ -32,8 +24,7 @@ def stamp(text: str) -> float:
     return when.timestamp()
 
 
-#: Inside the acceptance week (Mon 2026-09-28 21:00 PDT -> the next Monday), and inside
-#: the 5h slice 10:00-15:00 UTC that `session_window` resolves for it.
+#: Inside the acceptance week (Mon 2026-09-28 21:00 PDT -> the next Monday)
 T0 = stamp("2026-09-30T12:00:00+00:00")
 SPAN_SINCE = stamp("2026-09-30T10:00:00+00:00")
 SPAN_UNTIL = stamp("2026-09-30T15:00:00+00:00")
@@ -68,8 +59,7 @@ def series(start: float, *, n: int, first: float, last: float, resets: float):
 
 
 def calibrate(f, start: float) -> None:
-    """Three clean 40-minute spans of 10 points each, $8.20 apiece — $0.82/point,
-    MEASURED, so the alarms are not computed from the shipped seed."""
+    """Three clean 40-minute spans of 10 points each, $8.20 apiece"""
     for offset in (-8 * HOUR, -6 * HOUR, -4 * HOUR):
         at = start + offset
         store_samples(series(at, n=40, first=0.0, last=10.0, resets=start + 9 * HOUR))
@@ -81,7 +71,7 @@ def scene(f, *, since: float = SPAN_SINCE, until: float = SPAN_SINCE + HOUR,
           samples: int | None = None, points: float = 12.0,
           worker_usd: float = 6.0, os_usd: float = 0.5,
           outside: bool = True) -> dict:
-    """The worked example, as records. Returns the resolved window it is built for."""
+    """The worked example, as records"""
     calibrate(f, since)
     n = samples if samples is not None else int((until - since) / MINUTE)
     store_samples(series(since, n=n, first=10.0, last=10.0 + points, resets=until))
@@ -93,7 +83,7 @@ def scene(f, *, since: float = SPAN_SINCE, until: float = SPAN_SINCE + HOUR,
     if outside:
         f.transcript("1a9cd19d-0000-4000-8000-000000000001", [
             prompt_row("look at the cost page", at=since + 4 * MINUTE),
-            # $2.00 of cache write + $0.48 of output at Opus list = $2.48.
+            # $2.00 of cache write + $0.48 of output at Opus list = $2.48
             f.call_row(at=since + 5 * MINUTE, write=320_000, out=19_200, mid="m-out"),
         ], directory="-home-someone-elsewhere")
     return {"since": since, "until": until, "source": "session-meter",
@@ -106,11 +96,11 @@ def meter_of(f, resolved, **over) -> dict:
     return ops.cost_meter(**kwargs)["meter"]
 
 
-# -- 29. the subtree ---------------------------------------------------------------------
+# -- 29. the subtree
 
 
 def test_the_subtree_keys_and_version_are_pinned(fleet_fixture):
-    """The contract test the rest of the cost payload already has (§9)."""
+    """The contract test the rest of the cost payload already has (§9)"""
     meter = meter_of(fleet_fixture, scene(fleet_fixture))
 
     assert meter["version"] == 1
@@ -171,7 +161,7 @@ def test_the_timeline_is_decimated_to_three_hundred_points(fleet_fixture):
     assert meter["timeline"][0]["ts"] >= resolved["since"]
 
 
-# -- 30-32. the sentence -----------------------------------------------------------------
+# -- 30-32. the sentence
 
 
 def test_the_sentence_matches_the_shape_in_the_spec(fleet_fixture):
@@ -185,9 +175,9 @@ def test_the_sentence_matches_the_shape_in_the_spec(fleet_fixture):
     assert f"Jarvis spent ${spend['jarvis_usd']:.2f} (66%)" in said
     assert f"other sessions on this machine ${spend['outside_usd']:.2f} (25%" in said
     assert f"unexplained ${spend['residual_usd']:.2f} (9%)" in said
-    # The top session, named so the user can go and stop it.
+    # The top session, named so the user can go and stop it
     assert "session 1a9cd19d" in said and "look at the cost page" in said
-    # BOTH halves of the label, every time and in that order (§7).
+    # BOTH halves of the label, every time and in that order (§7)
     assert said.index("usage this machine cannot see") < \
         said.index("accounting error in Jarvis")
     shares = [spend["jarvis_share"], spend["outside_share"], spend["residual_share"]]
@@ -208,8 +198,7 @@ def test_a_span_with_no_samples_says_so_and_derives_nothing(fleet_fixture):
 
 
 def test_a_negative_residual_is_reported_negative_and_never_clamped(fleet_fixture):
-    """The meter moved less than the measured spend implies: evidence about the
-    estimator, and clamping it would hide the drift (§7)."""
+    """The meter moved less than the measured spend implies: evidence about the estimator"""
     meter = meter_of(fleet_fixture, scene(fleet_fixture, worker_usd=50.0))
 
     assert meter["spend"]["residual_usd"] < 0
@@ -219,12 +208,7 @@ def test_a_negative_residual_is_reported_negative_and_never_clamped(fleet_fixtur
 
 
 def test_a_scoped_query_keeps_the_residual_fleet_wide(fleet_fixture):
-    """Another project's spend is EXPLAINED, never unexplained (§7).
-
-    `jarvis cost <project>` scopes the listing, but the meter is account-wide, so the
-    residual arithmetic stays fleet-wide and the project's own share is reported beside
-    it.
-    """
+    """Another project's spend is EXPLAINED, never unexplained (§7)"""
     from jarvis.testing import FleetCostFixture, make_git_project
 
     second = make_git_project(fleet_fixture.catalog_path.parent, "proj_b")
@@ -248,12 +232,12 @@ def test_a_scoped_query_keeps_the_residual_fleet_wide(fleet_fixture):
     spend = meter["spend"]
     implied = float(spend["implied_usd"])
 
-    # proj_b's $3.00 is counted, and the residual is the fleet-wide one.
+    # proj_b's $3.00 is counted, and the residual is the fleet-wide one
     assert spend["jarvis_usd"] == pytest.approx(9.5)
     assert spend["workers_usd"] == pytest.approx(9.0)
     assert spend["residual_usd"] == pytest.approx(round(implied - 9.5, 2))
     assert spend["residual_usd"] != pytest.approx(round(implied - 6.5, 2))
-    # The scoped figures sit beside it, never subtracted from the meter.
+    # The scoped figures sit beside it, never subtracted from the meter
     assert spend["scope_project"] == "proj_a"
     assert spend["scope_jarvis_usd"] == pytest.approx(6.5)
     assert spend["scope_workers_usd"] == pytest.approx(6.0)
@@ -270,12 +254,11 @@ def test_an_unscoped_query_carries_the_scope_keys_as_none(fleet_fixture):
     assert "own share of that" not in meter["sentence"]
 
 
-# -- the honesty gate --------------------------------------------------------------------
-# docs/superpowers/specs/2026-10-13-usage-meter-spurious-resets.md, cases 6-9.
+# -- the honesty gate
 
 
 def test_a_span_the_meter_barely_covers_derives_no_dollar_figure(fleet_fixture):
-    """3% covered: the rise is not a bound in either direction, so nothing is derived."""
+    """3% covered: the rise is not a bound in either direction, so nothing is derived"""
     meter = meter_of(fleet_fixture, scene(fleet_fixture, until=SPAN_UNTIL, samples=9))
     said = meter["sentence"]
     spend = meter["spend"]
@@ -287,7 +270,7 @@ def test_a_span_the_meter_barely_covers_derives_no_dollar_figure(fleet_fixture):
     assert "3% covered" in said
     for forbidden in ("lower bound", usage_meter.RESIDUAL_LABEL, "unexplained"):
         assert forbidden not in said, forbidden
-    # The measured halves are measured, not derived, and stay numbers.
+    # The measured halves are measured, not derived, and stay numbers
     assert f"${spend['jarvis_usd']:.2f}" in said
     assert f"${spend['outside_usd']:.2f}" in said
     for key in ("implied_usd", "residual_usd", "residual_share", "outside_share",
@@ -318,8 +301,7 @@ def test_an_unreliable_span_suppresses_both_alarms_and_the_daemon_writes_nothing
     assert meter["alerts"]["outside"] is False
     assert meter["alerts"]["residual"] is False
     assert meter["alerts"]["unreliable"] is True
-    # The raw rise clears the floor, so this span WOULD have alarmed had the arithmetic
-    # been sound — which is the whole claim `suppressed` makes.
+    # The raw rise clears the floor, so this span WOULD have alarmed had the arithmetic been sound
     assert meter["alerts"]["suppressed"] is True
     assert meter["spend"]["implied_usd"] is None, "and no dollar figure in the payload"
 
@@ -340,7 +322,7 @@ def test_an_unreliable_span_suppresses_both_alarms_and_the_daemon_writes_nothing
 
 
 def test_a_gap_longer_than_the_window_derives_nothing(fleet_fixture):
-    """A whole 5h window could have opened and closed inside the hole."""
+    """A whole 5h window could have opened and closed inside the hole"""
     since, until = SPAN_SINCE, SPAN_SINCE + 24 * HOUR
     calibrate(fleet_fixture, since)
     store_samples(series(since, n=540, first=10.0, last=19.0, resets=until))
@@ -357,7 +339,7 @@ def test_a_gap_longer_than_the_window_derives_nothing(fleet_fixture):
     assert "unexplained" not in meter["sentence"]
 
 
-# -- 33-35. the CLI ----------------------------------------------------------------------
+# -- 33-35. the CLI
 
 
 def _windowed_orders(f):
@@ -371,8 +353,7 @@ def _windowed_orders(f):
 
 
 def test_jarvis_cost_window_5h_now_windows_the_listing(fleet_fixture, capsys):
-    """The CLI half of the window selector's defect 3: `--window` without `--fleet`
-    silently windowed nothing (§10)."""
+    """The CLI half of the window selector's defect 3: `--window` without `--fleet` silently windowed..."""
     recent, old = _windowed_orders(fleet_fixture)
     span = datetime.fromtimestamp(db.now() - 30 * 86_400, tz=timezone.utc).isoformat()
 
@@ -396,14 +377,13 @@ def test_the_json_payloads_carry_the_window_and_one_meter_subtree(fleet_fixture,
 
     assert listing["window"]["window"] == "5h"
     assert listing["meter"]["version"] == 1
-    # The SAME subtree from the SAME resolved window — one population, two payloads.
+    # The SAME subtree from the SAME resolved window — one population, two payloads
     assert listing["meter"] == fleet["meter"]
     assert fleet["fleet"]["window"]["since"] == listing["window"]["since"]
 
 
 def test_one_orders_bill_carries_no_meter_block(fleet_fixture, capsys):
-    """A bill's span is the ORDER's life, not a window, and the residual is an
-    account-level quantity: printed under one bill it reads as that order's (§10)."""
+    """A bill's span is the ORDER's life"""
     wo = fleet_fixture.order("one order")
     fleet_fixture.turn(wo, started_at=db.now() - 60, ended_at=db.now(), cost_usd=1.0)
 
@@ -415,7 +395,7 @@ def test_one_orders_bill_carries_no_meter_block(fleet_fixture, capsys):
     assert "the 5h meter" not in capsys.readouterr().out
 
 
-# -- 37. the anchor ----------------------------------------------------------------------
+# -- 37. the anchor
 
 
 def test_the_5h_window_re_anchors_on_the_meter_and_falls_back_to_the_guess(fleet_fixture):
@@ -426,8 +406,7 @@ def test_the_5h_window_re_anchors_on_the_meter_and_falls_back_to_the_guess(fleet
     assert (fallback["since"], fallback["until"]) == guess
     assert fallback["source"] == "session-window"
 
-    # The measured discrepancy of 2026-10-08, re-stated on this week's grid: the real
-    # boundary is 80 minutes past the week-anchored guess.
+    # The measured discrepancy of 2026-10-08
     real_reset = guess[1] + 80 * MINUTE
     store_samples([usage_meter.Sample(ts=T0 - 30, ok=True, five_hour_pct=44.0,
                                       five_hour_resets_at=real_reset)])
@@ -438,11 +417,11 @@ def test_the_5h_window_re_anchors_on_the_meter_and_falls_back_to_the_guess(fleet
     assert anchored["since"] == real_reset - 5 * HOUR
     assert (anchored["since"], anchored["until"]) != guess
 
-    # `offset` steps back in whole 5h multiples FROM the real boundary.
+    # `offset` steps back in whole 5h multiples FROM the real boundary
     back = fleetcost.resolve_window(window="5h", offset=-2, cfg=cfg, now=T0)
     assert back["until"] == real_reset - 10 * HOUR
 
-    # The note is for the fallback ONLY: it describes a guess, and this is not one.
+    # The note is for the fallback ONLY: it describes a guess, and this is not one
     assert fleetcost.SESSION_ANCHOR_NOTE not in \
         fleetcost.report(resolved=anchored)["fleet"]["notes"]
     assert fleetcost.SESSION_ANCHOR_NOTE in \
@@ -450,7 +429,7 @@ def test_the_5h_window_re_anchors_on_the_meter_and_falls_back_to_the_guess(fleet
 
 
 def test_a_stale_sample_does_not_anchor_anything(fleet_fixture):
-    """Older than `meter_nearest_seconds` is not a reading of THIS window."""
+    """Older than `meter_nearest_seconds` is not a reading of THIS window"""
     cfg = CostConfig()
     store_samples([usage_meter.Sample(ts=T0 - 4 * cfg.meter_nearest_seconds, ok=True,
                                       five_hour_pct=44.0,
@@ -460,7 +439,7 @@ def test_a_stale_sample_does_not_anchor_anything(fleet_fixture):
     assert found["source"] == "session-window"
 
 
-# -- 43. the daemon ----------------------------------------------------------------------
+# -- 43. the daemon
 
 
 @pytest.fixture()
@@ -530,7 +509,7 @@ def test_the_alarm_is_silent_below_the_floor_and_on_the_seed(fleet_fixture, fixe
 
 def test_an_alarm_computed_from_the_shipped_constant_is_about_the_constant(
         fleet_fixture, fixed_now):
-    """No calibration span: `dollars_per_point.source == 'seed'` and nothing fires."""
+    """No calibration span: `dollars_per_point.source == 'seed'` and nothing fires"""
     fleet_fixture.order("the carrier", status="completed")
     store_samples(series(SPAN_SINCE, n=120, first=10.0, last=22.0, resets=SPAN_UNTIL))
     fleet_fixture.transcript("1a9cd19d-0000-4000-8000-000000000001", [
@@ -544,7 +523,7 @@ def test_an_alarm_computed_from_the_shipped_constant_is_about_the_constant(
 
 
 def test_a_second_project_in_the_same_catalog_raises_nothing(fleet_fixture, fixed_now):
-    """A FLEET reading carried by one project: N projects raising it is N-1 copies."""
+    """A FLEET reading carried by one project: N projects raising it is N-1 copies"""
     from jarvis.testing import make_git_project
 
     second = make_git_project(fleet_fixture.catalog_path.parent, "proj_b")
@@ -564,7 +543,7 @@ def test_a_second_project_in_the_same_catalog_raises_nothing(fleet_fixture, fixe
         store.close()
 
 
-# -- 44. a read writes nothing -----------------------------------------------------------
+# -- 44. a read writes nothing
 
 
 def _counts(f) -> dict[str, int]:

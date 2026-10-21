@@ -1,16 +1,4 @@
-"""Screenshot a planner assumption whose feature has already landed children (§2.6).
-
-The claim a passing UI test cannot make: a reader ruling on a still-pending planner
-assumption can SEE what a rejection now costs — children of that plan have merged, so
-turning it down buys a follow-up fix, not an unwind. Derived from the timeline; nothing
-extra is stored, and the row stays pending.
-
-Spec: docs/superpowers/specs/2026-09-24-a-planner-assumption-holds-its-feature.md §2.6.
-`scripts/screenshot_assumption_rulings.py` is the shape this copies, including the temp
-`JARVIS_HOME` that keeps it off the live OS:
-
-    uv run python scripts/screenshot_overtaken_assumption.py
-"""
+"""Screenshot a planner assumption whose feature has already landed children (§2.6) (docs/superpowers/specs/2026-09-24-a-planner-assumption-holds-its-feature.md §2.6.)"""
 
 from __future__ import annotations
 
@@ -29,12 +17,7 @@ SHOT = "overtaken-assumption-work-order.png"
 
 
 def seed() -> str:
-    """A feature, its planner, three children, one merged, one pending assumption.
-
-    Built from rows the way `tests/test_feature_orders.py::a_bare_feature` does: what the
-    note reads is a `plan_wo_id`, the children of that feature and a `pr_merged` event —
-    no planner session and no plan machinery.
-    """
+    """A feature, its planner, three children, one merged, one pending assumption"""
     from jarvis.central_store import CentralStore
     from jarvis.project_store import ProjectStore
 

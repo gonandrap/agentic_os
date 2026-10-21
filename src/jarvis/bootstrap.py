@@ -1,13 +1,4 @@
-"""Project bootstrap ("adopt"): make a project OS-ready, idempotently.
-
-- README.md         required; stub generated when missing
-- OPERATION.md      the operating contract, generated from a versioned template —
-                    but never over a copy the repository has committed (issue 279)
-- .jarvis/          per-project state dir, added to .gitignore
-- .claude/settings.json  injected: OS baseline deep-merged with catalog overrides,
-                    marked with a "_jarvis" key (managed flag + content hash) so
-                    manual drift is detected on the next start
-"""
+"""Project bootstrap ("adopt"): make a project OS-ready, idempotently"""
 
 from __future__ import annotations
 
@@ -25,51 +16,13 @@ from typing import Any
 from .catalog import ProjectSpec
 from .paths import project_state_dir
 
-# v5 = v4's privileged-action gates section + the decision-routing rewrite (Neo as
-# first responder). Both landed as "v4" on separate branches, so a project that
-# regenerated against either one would have skipped the other's content.
-# v6 = the `dismissed` gate verdict. A worker that does not know a false positive has an
-# outcome other than "denied" reasonably concludes the command is forbidden and starts
-# rewording it to get past the recogniser, which is the one response that must not be
-# learned. Bumping the version is what pushes that paragraph into every managed repo.
-# v7 = the `[<wo-id>] ` pull request title rule, and `jarvis wo finish --pr`. Numbered 7
-# rather than 6 because the `dismissed` paragraph above ALSO landed as v6, on another
-# branch — exactly the collision the v5 note describes, caught this time in a merge
-# instead of by a project that silently skipped one branch's content.
-# v8 = "Serena first, grep second". A worker cannot be given this posture by withholding a
-# tool the way the planning seats are — it needs Grep and Bash to do its job — so ranking
-# the tools in prose is the only lever, and it has to reach every managed repo to be worth
-# anything. Stated conditionally: Jarvis configures no MCP server itself, so whether a
-# worker has Serena depends on the user's own Claude config and on the project.
-# v9 = `jarvis wo finish --evidence`. Workers did not know the flag existed, so every
-# submission arrived with no account of how the change was tested and the reviewer had
-# only the diff. Prose is the whole mechanism — the flag has been accepted since the
-# round machine landed — so it has to reach every managed repo to be worth anything,
-# which is what this bump is for.
-# v10 = a turn is one-shot. Nothing in the contract said so, so a worker backgrounded a
-# 15-minute eval, signed off on the promise of a wake-up that does not exist, and the run
-# died with its process (wo-2df8828c). Prose is again the whole mechanism, and it only
-# helps the workers whose repo has it.
-# v11 = the second exit (`jarvis gate contest`, beside `explain`) and the per-kind ask —
-# spec 2026-09-12 §3, §6. Prose is the whole mechanism, so it has to reach every repo.
-# v12 = the crew (spec 2026-09-23-the-crew-a-worker-must-use.md SS5, SS6): the lead
-# delegates spec writing to `jarvis-spec-writer` and code to `jarvis-implementer`. The
-# division of labour is prose in the core contract, so it has to reach every managed repo.
-# v13 = the poll rhythm (spec 2026-09-29-a-lead-must-not-block-past-its-cache.md SS6):
-# long work runs in the BACKGROUND and the lead polls it every 3-4 minutes, because the
-# foreground wait the contract used to prescribe cost ~$52 over 25 work orders (issue
-# 868). The prescription is prose in the core contract, so it has to reach every repo.
-# v14 = pass a reference, never a payload (spec 2026-09-26-bounded-model-inputs.md §5):
-# a PreToolUse check now refuses an oversized `jarvis wo send` / `wo assume` body, a
-# question over 4000 chars and a `$(git diff …)` substitution, so every managed repo's
-# contract has to say what to pass instead before a worker is refused.
+# v5 = v4's privileged-action gates section + the decision-routing rewrite (Neo as first responder)
 TEMPLATE_VERSION = 14
 ASSETS = Path(__file__).parent / "assets"
 
 
 def jarvis_hook_command() -> str:
-    """Absolute command for injected hooks — the Claude daemon's PATH may not
-    include wherever jarvis is installed."""
+    """Absolute command for injected hooks"""
     exe = shutil.which("jarvis")
     if exe:
         return f"{exe} _hook"
@@ -77,11 +30,7 @@ def jarvis_hook_command() -> str:
 
 
 def _rebuild(src: Path, root: Path, leaf: str) -> Path:
-    """Rebuild `root/.claude/<leaf>/` from `src`, wholesale. Returns `root`.
-
-    Generated, never authored: the whole destination is dropped and recopied on each
-    dispatch, so a stale or locally mangled copy heals itself.
-    """
+    """Rebuild `root/.claude/<leaf>/` from `src`, wholesale"""
     dest = root / ".claude" / leaf
     if dest.exists():
         shutil.rmtree(dest)
@@ -90,12 +39,7 @@ def _rebuild(src: Path, root: Path, leaf: str) -> Path:
     return root
 
 
-#: Prepended to a planning seat's definition when the project has deselected Serena.
-#: The seat files are written for a fleet that HAS it — their first instruction is a
-#: Serena call — so an override at the top is what keeps a deselection coherent all the
-#: way into a planner's subagents. The `tools:` entries are stripped beside it: naming an
-#: absent tool is inert, but leaving it there is the settings file granting what the
-#: same dispatch removed (`dispatch._write_worker_settings`).
+#: Prepended to a planning seat's definition when the project has deselected Serena
 NO_SERENA_SEAT_NOTE = (
     "> **Serena is not wired for this project.** It was deselected on Jarvis's\n"
     "> /config page, so its symbol tools are not in your tool list and there is\n"
@@ -108,7 +52,7 @@ _SERENA_TOOL_ENTRY = re.compile(r",\s*mcp__(?:plugin_)?serena[A-Za-z0-9_]*")
 
 
 def _strip_serena(text: str) -> str:
-    """A seat definition with its Serena tool grants removed and the note prepended."""
+    """A seat definition with its Serena tool grants removed and the note prepended"""
     head, sep, body = text.partition("---\n")          # opening fence
     front, sep2, rest = body.partition("\n---\n")      # closing fence
     if not sep or not sep2:
@@ -118,30 +62,11 @@ def _strip_serena(text: str) -> str:
 
 def install_agent_assets(project_path: Path, kind: str = "worker",
                          serena: bool = True) -> list[Path]:
-    """Materialize the OS-provided agent assets for a work order of `kind`; return the
-    directories to hand Claude via `--add-dir`.
-
-    Getting an asset in front of a worker is awkward: workers run in a fresh git
-    worktree, so an untracked `.claude/` in the main checkout never reaches them, and no
-    settings key can declare an extra skills directory (checked against the CLI). What
-    does work — verified live, with a negative control — is `--add-dir X`, which loads
-    skills from `X/.claude/skills/` and subagent definitions from `X/.claude/agents/`.
-    So the OS keeps both inside the project's gitignored `.jarvis/` tree and points each
-    worker at whichever it is entitled to on spawn.
-
-    **A root per population, and the split is load-bearing.** Skills go to every worker;
-    the planning seats go to planners only; the crew (`jarvis-spec-writer`,
-    `jarvis-implementer`) goes to ordinary workers only. Putting the seats in the skills
-    root and omitting them for workers would mean the worker path had to DELETE
-    `agents/` to keep owning its whole generated tree — and that delete would land while
-    a concurrently-dispatched planner turn was reading it. Separate roots make the
-    populations independent, so no dispatch can disturb another's.
-    """
+    """Materialize the OS-provided agent assets for a work order of `kind`"""
     def _seats(src: str, leaf: str) -> Path:
         root = _rebuild(ASSETS / src, project_state_dir(project_path) / leaf, "agents")
         if not serena:
-            # Safe to rewrite in place: `_rebuild` just dropped and recopied the whole
-            # destination, and it is regenerated on every dispatch.
+            # Safe to rewrite in place: `_rebuild` just dropped and recopied the whole destination
             for seat in (root / ".claude" / "agents").glob("*.md"):
                 seat.write_text(_strip_serena(seat.read_text()))
         return root
@@ -151,14 +76,13 @@ def install_agent_assets(project_path: Path, kind: str = "worker",
     if kind == "planner":
         roots.append(_seats("agents", "agent-seats"))
     if kind == "worker":
-        # The crew an ordinary worker must delegate to — a THIRD root for the reason
-        # above (spec 2026-09-23-the-crew-a-worker-must-use.md SS5).
+        # The crew an ordinary worker must delegate to
         roots.append(_seats("worker-agents", "agent-crew"))
     return roots
 
 
 def _tree_matches(src: Path, dest: Path) -> bool:
-    """Same set of files, same bytes — used to avoid rewriting an already-current skill."""
+    """Same set of files, same bytes — used to avoid rewriting an already-current skill"""
     rel = {p.relative_to(src) for p in src.rglob("*") if p.is_file()}
     if rel != {p.relative_to(dest) for p in dest.rglob("*") if p.is_file()}:
         return False
@@ -166,21 +90,7 @@ def _tree_matches(src: Path, dest: Path) -> bool:
 
 
 def install_project_skills(project_path: Path) -> list[str]:
-    """Install the OS's user-facing skills into the project itself; return the names
-    written (empty when everything was already current).
-
-    Different audience from `install_agent_assets`, so a different delivery. Those are
-    for the workers Jarvis dispatches and ride in on `--add-dir` at spawn time. These are
-    for the sessions the *user* opens by hand, which get no such flag and only ever load
-    `<project>/.claude/skills/` — so they are written into the project, next to the
-    `.claude/settings.json` bootstrap already injects there. Like that file they are
-    untracked and not gitignored: the OS leaves it to the project whether to commit them.
-
-    Only the subdirectories the OS owns are touched. `<project>/.claude/skills/` is where
-    users keep their own skills, so this never clears the tree — contrast
-    `install_agent_assets`, which owns its whole (gitignored, generated) destination and
-    rebuilds it wholesale.
-    """
+    """Install the OS's user-facing skills into the project itself"""
     written: list[str] = []
     root = project_path / ".claude" / "skills"
     for src in sorted(p for p in (ASSETS / "project-skills").iterdir() if p.is_dir()):
@@ -188,8 +98,7 @@ def install_project_skills(project_path: Path) -> list[str]:
         if dest.exists():
             if _tree_matches(src, dest):
                 continue
-            # No catalog knob customizes a skill, so a local edit is drift, not
-            # configuration — preserving it would mean the OS could never ship a fix.
+            # No catalog knob customizes a skill, so a local edit is drift, not configuration
             shutil.rmtree(dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(src, dest)
@@ -211,7 +120,7 @@ class BootstrapReport:
 
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    """Recursive dict merge; override wins; lists and scalars are replaced."""
+    """Recursive dict merge; override wins; lists and scalars are replaced"""
     out = dict(base)
     for k, v in override.items():
         if isinstance(v, dict) and isinstance(out.get(k), dict):
@@ -237,7 +146,7 @@ def build_settings(overrides: dict[str, Any]) -> dict[str, Any]:
 
 
 def settings_drift(settings_path: Path) -> str | None:
-    """Return a drift description if the injected settings were manually edited."""
+    """Return a drift description if the injected settings were manually edited"""
     if not settings_path.exists():
         return "missing"
     try:
@@ -309,7 +218,7 @@ DEFAULT_SPECIFICS = "_None yet._"
 
 
 def operation_specifics(text: str) -> str:
-    """The hand-written 'Project specifics' section of an existing OPERATION.md."""
+    """The hand-written 'Project specifics' section of an existing OPERATION.md"""
     if SPECIFICS_MARKER not in text:
         return DEFAULT_SPECIFICS
     return text.split(SPECIFICS_MARKER, 1)[1].strip() or DEFAULT_SPECIFICS
@@ -317,7 +226,7 @@ def operation_specifics(text: str) -> str:
 
 def render_operation_md(project: ProjectSpec,
                         specifics: str = DEFAULT_SPECIFICS) -> str:
-    """The contract exactly as it belongs on disk, rendered but not written."""
+    """The contract exactly as it belongs on disk, rendered but not written"""
     return (ASSETS / "OPERATION.md.tmpl").read_text().format(
         template_version=TEMPLATE_VERSION,
         project_name=project.name,
@@ -327,12 +236,7 @@ def render_operation_md(project: ProjectSpec,
 
 
 def tracked_in_vcs(path: Path) -> bool:
-    """Whether the repository — rather than the OS — owns this file.
-
-    Fails open (False): the no-overwrite rule below only binds where we can positively
-    prove the file is committed, so a project with no git binary keeps the old
-    behaviour rather than silently stopping getting its contract refreshed.
-    """
+    """Whether the repository — rather than the OS — owns this file"""
     try:
         proc = subprocess.run(
             ["git", "-C", str(path.parent), "ls-files", "--error-unmatch", "--",
@@ -345,17 +249,7 @@ def tracked_in_vcs(path: Path) -> bool:
 
 def ensure_operation_md(project: ProjectSpec, report: BootstrapReport,
                         force: bool = False) -> None:
-    """Generate/refresh OPERATION.md, preserving the 'Project specifics' section.
-
-    Two rules, both from issue 279. Staleness is decided by COMPARING THE RENDER, not
-    by matching `template vN` in the first line: that string is a proxy for the content
-    and was wrong in both directions — it missed a gates section gone stale under an
-    unchanged version, and it reported a rewrite as needed on a file that already said
-    the right thing. And a render that does differ is still not written over a TRACKED
-    copy: the OS never commits, so such a write dirties the tree permanently and leaves
-    `git pull --ff-only` refusing before every release. Drift on a tracked file is
-    reported for a human to regenerate and commit (`--force-config`), never applied.
-    """
+    """Generate/refresh OPERATION.md, preserving the 'Project specifics' section"""
     op_path = project.path / "OPERATION.md"
     current = op_path.read_text() if op_path.exists() else None
     desired = render_operation_md(
@@ -377,13 +271,7 @@ def ensure_operation_md(project: ProjectSpec, report: BootstrapReport,
 
 
 def _gates_section(project: ProjectSpec) -> str:
-    """The privileged-actions clause of the contract, for OPERATION.md.
-
-    Written from the catalog rather than hard-coded because the answer differs per
-    project, and getting it wrong in either direction is costly: a worker that wrongly
-    believes it may ship will try, and a worker that wrongly believes it may not will
-    stop short and leave the release to a human who was never told it was ready.
-    """
+    """The privileged-actions clause of the contract, for OPERATION.md"""
     from .gates import KINDS
 
     if not project.gates:
@@ -402,8 +290,7 @@ def _gates_section(project: ProjectSpec) -> str:
         "independent reviewer (Neo, the user's delegate) decides whether they run.",
         "",
     ]
-    # With the two questions each kind's own request has to answer — a reviewer sees
-    # nothing but what the worker wrote. Spec 2026-09-12 §6.
+    # With the two questions each kind's own request has to answer
     for k in live:
         lines += [
             f"- `{k.name}` — {k.summary}",
@@ -466,11 +353,7 @@ def _gates_section(project: ProjectSpec) -> str:
 
 
 def workspace_trusted(project_path: Path) -> bool | None:
-    """Whether Claude Code trusts this workspace (None = unknown / never opened).
-
-    Untrusted workspaces IGNORE permissions.allow entries (verified live), which
-    stalls unattended workers on their first tool call.
-    """
+    """Whether Claude Code trusts this workspace (None = unknown / never opened)"""
     cfg = Path(os.environ.get("JARVIS_CLAUDE_JSON", "~/.claude.json")).expanduser()
     if not cfg.exists():
         return None
@@ -489,15 +372,7 @@ def _claude_json_path() -> Path:
 
 
 def ensure_trust(project: ProjectSpec, report: BootstrapReport) -> None:
-    """Trust the workspace on the user's behalf, so workers never stall.
-
-    Every project in the catalog is one the user already runs Claude in, so being in
-    the catalog *is* the trust decision — we don't make them accept a dialog per
-    project. Untrusted workspaces silently ignore `permissions.allow` (verified live),
-    which stalls unattended workers on their first tool call. We set
-    `hasTrustDialogAccepted: true` for the project path in ~/.claude.json, preserving
-    every other key and writing atomically.
-    """
+    """Trust the workspace on the user's behalf, so workers never stall"""
     if workspace_trusted(project.path) is True:
         report.note("workspace already trusted")
         return
@@ -518,7 +393,7 @@ def ensure_trust(project: ProjectSpec, report: BootstrapReport) -> None:
 
 
 def ensure_project_skills(project: ProjectSpec, report: BootstrapReport) -> None:
-    """Give the user's own sessions in this project the OS skills meant for them."""
+    """Give the user's own sessions in this project the OS skills meant for them"""
     written = install_project_skills(project.path)
     if written:
         report.note("installed .claude/skills/: " + ", ".join(written))

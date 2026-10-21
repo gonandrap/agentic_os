@@ -1,16 +1,4 @@
-"""A pull request whose head moved past its verdict re-judges itself.
-
-docs/superpowers/specs/2026-09-19-a-moved-head-re-judges-itself.md, issue #493.
-
-THE BUG: the OS nudges its own worker to resolve a merge conflict, the worker pushes,
-and the head is now a commit no round has read. `automerge.decide` holds on `sha_moved`
-for ever, `waiting_pr_merge` carries no attention flag, and the order sits green and
-mergeable until a person runs `jarvis validation force`. Measured on wo-2005a89b.
-
-So every test here starts from a round that PASSED and recorded a commit, and then
-moves the head — a fixture whose round recorded nothing is the OTHER bug
-(`tests/test_forced_validation.py`), and a fix for it passes while this one stalls.
-"""
+"""A pull request whose head moved past its verdict re-judges itself (docs/superpowers/specs/2026-09-19-a-moved-head-re-judges-itself.md)"""
 
 from __future__ import annotations
 
@@ -31,7 +19,7 @@ from jarvis.testing import make_git_project
 
 PR = "https://github.com/acme/proj/pull/7"
 JUDGED = "aaaa1111aaaa2222aaaa3333aaaa4444aaaa5555"
-#: What the conflict resolution pushed: the merge commit no seat has read.
+#: What the conflict resolution pushed: the merge commit no seat has read
 PUSHED = "bbbb1111bbbb2222bbbb3333bbbb4444bbbb5555"
 AGAIN = "cccc1111cccc2222cccc3333cccc4444cccc5555"
 GREEN = [{"__typename": "CheckRun", "name": "unit", "status": "COMPLETED",
@@ -52,9 +40,7 @@ def _git(cwd: Path, *args: str) -> str:
 
 
 def write_catalog(tmp_path: Path, project: Path, **validation) -> Path:
-    """A catalog ON DISK: `ops.force_validation_refusal` — which this feature shares with
-    the person's command — resolves its config through `ops.validation_config`, which
-    re-reads the file rather than the daemon's object."""
+    """A catalog ON DISK: `ops.force_validation_refusal`"""
     data = {
         "os": {
             "defaults": {"model": "sonnet", "max_in_flight": 50},
@@ -71,8 +57,7 @@ def write_catalog(tmp_path: Path, project: Path, **validation) -> Path:
 
 @pytest.fixture()
 def project(tmp_path, claude_json) -> Path:
-    """A real repository whose `origin` matches `PR` — the evidence collector reads
-    both, and the branch is named explicitly for kn-4b6f18f5's reason."""
+    """A real repository whose `origin` matches `PR`"""
     proj = make_git_project(tmp_path, "proj_a")
     _git(proj, "symbolic-ref", "HEAD", "refs/heads/main")
     _git(proj, "add", "-A")
@@ -83,21 +68,19 @@ def project(tmp_path, claude_json) -> Path:
 
 
 def boot(tmp_path, project, **validation) -> Daemon:
-    """A started OS whose project has the panel and the automatic merge on."""
+    """A started OS whose project has the panel and the automatic merge on"""
     ops.start_os(str(write_catalog(tmp_path, project, **validation)), foreground=True)
     return Daemon(load_catalog(tmp_path / "catalog.json"))
 
 
 @pytest.fixture()
 def fleet(tmp_path, jarvis_home, fake_claude, project):
-    """ROOM IN THE ROUND BUDGET, deliberately: the shipped `max_rounds` is 3 and the OS
-    never spends the last one, so a fixture at the default could only ever prove the
-    refusal. The tests about the boundary boot their own fleet at 3."""
+    """ROOM IN THE ROUND BUDGET, deliberately: the shipped `max_rounds` is 3 and the OS never spends the..."""
     return boot(tmp_path, project, max_rounds=5)
 
 
 class Panel:
-    """The injected validator seam. Records the round numbers it was handed."""
+    """The injected validator seam"""
 
     def __init__(self, outcome: str = "passed"):
         self.outcome = outcome
@@ -113,9 +96,7 @@ class Panel:
 
 def parked(project, *, judged: str = JUDGED, outcome: str = "passed",
            rounds: int = 1) -> tuple[ProjectStore, dict]:
-    """An order parked behind its pull request with `rounds` settled rounds, the last of
-    them on `judged`. The real `ops.finish` puts it there, so the `finished` event these
-    tests count is genuine."""
+    """An order parked behind its pull request with `rounds` settled rounds, the last of them on `judged`"""
     store = ProjectStore(project)
     wo = ops.create_work_order("proj_a", "add feature X")
     ops.finish(wo["id"], "opened a PR", pr_url=PR, evidence="ran the suite")
@@ -132,7 +113,7 @@ def parked(project, *, judged: str = JUDGED, outcome: str = "passed",
 
 def artifact(fake_gh, *, head_oid: str, checks=GREEN,
              merge_state: str = "CLEAN") -> None:
-    """The pull request BOTH readers see — the evidence collector and the poll."""
+    """The pull request BOTH readers see — the evidence collector and the poll"""
     fake_gh.set_pr_artifact(
         PR, title="[wo-1] add feature X", body="## Summary\nit adds feature X",
         diff="diff --git a/app.py b/app.py\n@@ -0,0 +1 @@\n+feature\n",
@@ -147,7 +128,7 @@ def poll(fleet, store) -> None:
 
 
 def judge(fleet, store, panel: Panel, timeout: float = 15.0) -> None:
-    """Run whatever round is open to a verdict, off the daemon's tick thread."""
+    """Run whatever round is open to a verdict, off the daemon's tick thread"""
     fleet.validator = panel
     fleet.validation_tick(fleet.catalog.project("proj_a"), store)
     deadline = time.monotonic() + timeout
@@ -157,10 +138,7 @@ def judge(fleet, store, panel: Panel, timeout: float = 15.0) -> None:
 
 
 class HeldPanel(Panel):
-    """A panel stopped MID-ROUND, so the pull request can settle underneath it.
-
-    The five seats take minutes on a real round; every test above settles one in a
-    microsecond, which is the one window the tests below are about."""
+    """A panel stopped MID-ROUND, so the pull request can settle underneath it"""
 
     def __init__(self, outcome: str = "passed"):
         super().__init__(outcome)
@@ -174,7 +152,7 @@ class HeldPanel(Panel):
 
 
 def hold(fleet, store, panel: HeldPanel) -> None:
-    """Start the open round and leave it inside the validator."""
+    """Start the open round and leave it inside the validator"""
     fleet.validator = panel
     fleet.validation_tick(fleet.catalog.project("proj_a"), store)
     assert panel.entered.wait(15), "the round never reached the panel"
@@ -192,18 +170,12 @@ def rounds_of(store, wo) -> list[int]:
     return [int(r["round"]) for r in store.validation_rounds(wo_id=wo["id"])]
 
 
-# -- the bug, end to end ---------------------------------------------------------------
+# -- the bug, end to end
 
 
 def test_the_head_the_os_moved_is_re_judged_and_the_pull_request_then_merges(
         fleet, project, fake_gh, local_base):
-    """THE WHOLE BUG. The conflict resolution moved the head past the verdict; nothing
-    used to re-open a round, so the order sat green and unmerged until a person noticed.
-
-    Stopping at "a round was opened" would prove too little — wo-2005a89b's pull request
-    was green and mergeable the whole time. The acceptance is that it MERGES: the OS asks
-    for the gate, on the commit that is actually there.
-    """
+    """THE WHOLE BUG"""
     store, wo = parked(project)
     artifact(fake_gh, head_oid=PUSHED)
 
@@ -224,9 +196,7 @@ def test_the_head_the_os_moved_is_re_judged_and_the_pull_request_then_merges(
 
 
 def test_nobody_had_to_ask_and_no_worker_was_pretended(fleet, project, fake_gh):
-    """The two halves of the record. `jarvis validation force` had to exist because the
-    only other route wrote a `finished` event nobody earned; a round the OS opens must
-    not write one either, and must not read afterwards as one a person asked for."""
+    """The two halves of the record"""
     store, wo = parked(project)
     artifact(fake_gh, head_oid=PUSHED)
     before = len(store.events_of_kind(wo["id"], "finished"))
@@ -238,8 +208,7 @@ def test_nobody_had_to_ask_and_no_worker_was_pretended(fleet, project, fake_gh):
     payload = db.from_json(forced[-1]["payload"], {})
     assert payload["by"] == ops.REJUDGE_BY_OS
     assert payload["head_sha"] == PUSHED and payload["judged_sha"] == JUDGED
-    # Both commits in the sentence stored on the round itself, where
-    # `jarvis validation show` renders it beside the verdict it caused.
+    # Both commits in the sentence stored on the round itself
     reason = store.latest_validation_round(wo_id=wo["id"])["forced_reason"]
     assert JUDGED[:10] in reason and PUSHED[:10] in reason
 
@@ -248,13 +217,11 @@ def test_nobody_had_to_ask_and_no_worker_was_pretended(fleet, project, fake_gh):
     assert "by the OS" in label and "by hand" not in label
 
 
-# -- the guards ------------------------------------------------------------------------
+# -- the guards
 
 
 def test_one_round_per_commit_and_not_one_per_tick(fleet, project, fake_gh):
-    """A parked pull request is polled every couple of minutes. A trigger that fired on
-    the hold rather than on the commit would spend the whole round budget in ten
-    minutes."""
+    """A parked pull request is polled every couple of minutes"""
     store, wo = parked(project)
     artifact(fake_gh, head_oid=PUSHED)
 
@@ -267,8 +234,7 @@ def test_one_round_per_commit_and_not_one_per_tick(fleet, project, fake_gh):
 
 
 def test_a_head_that_moves_again_is_judged_again(fleet, project, fake_gh):
-    """The other side of that key: the dedupe is per COMMIT, so a branch that genuinely
-    moves a second time is not silently left on the verdict for the first."""
+    """The other side of that key: the dedupe is per COMMIT"""
     store, wo = parked(project)
     artifact(fake_gh, head_oid=PUSHED)
     poll(fleet, store)
@@ -285,10 +251,7 @@ def test_a_head_that_moves_again_is_judged_again(fleet, project, fake_gh):
                                                 (GREEN, "DIRTY")])
 def test_a_pull_request_that_is_not_otherwise_ready_is_left_alone(
         fleet, project, fake_gh, checks, merge_state):
-    """GUARD 2. The re-judge is worth a round number only when the stale verdict is the
-    ONLY thing left holding the merge. Judging a commit whose build is still running —
-    or one the worker is about to push over, because CI went red or the branch stopped
-    merging — spends a round on a diff that is about to be replaced."""
+    """GUARD 2"""
     store, wo = parked(project)
     artifact(fake_gh, head_oid=PUSHED, checks=checks, merge_state=merge_state)
 
@@ -296,15 +259,13 @@ def test_a_pull_request_that_is_not_otherwise_ready_is_left_alone(
 
     assert rounds_of(store, wo) == [1]
     assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
-    # ...and the hold is still recorded, so the surfaces still say what is going on.
+    # ...and the hold is still recorded, so the surfaces still say what is going on
     held = store.events_of_kind(wo["id"], "automerge_held")
     assert db.from_json(held[-1]["payload"], {})["code"] == automerge.HELD_SHA_MOVED
 
 
 def test_a_branch_somebody_is_still_typing_into_is_not_judged(fleet, project, fake_gh):
-    """GUARD 4. A turn in flight is a push that has not happened yet — and an open round
-    owns the worker's session (kn-01a4ab27), which is how the panel's feedback ends up
-    in a conversation mid-task."""
+    """GUARD 4"""
     store, wo = parked(project)
     artifact(fake_gh, head_oid=PUSHED)
     store.create_turn(wo["id"], "message", "resolve the conflict")
@@ -315,7 +276,7 @@ def test_a_branch_somebody_is_still_typing_into_is_not_judged(fleet, project, fa
 
 
 def test_a_message_already_on_its_way_holds_it_too(fleet, project, fake_gh):
-    """GUARD 4, the other half: a queued message is a turn about to start."""
+    """GUARD 4, the other half: a queued message is a turn about to start"""
     store, wo = parked(project)
     artifact(fake_gh, head_oid=PUSHED)
     store.queue_message(wo["id"], "one more thing")
@@ -326,10 +287,7 @@ def test_a_message_already_on_its_way_holds_it_too(fleet, project, fake_gh):
 
 
 def test_a_rejected_round_is_never_reopened_by_the_machine(fleet, project, fake_gh):
-    """OUT OF SCOPE AND IT STAYS THERE (spec §6). An order parked over a REJECTED round
-    holds on `not_passed`, and that verdict is one the panel meant to stand: reopening it
-    would burn round numbers arguing with the reviewer. It is a different bug with a
-    different cause, tracked separately."""
+    """OUT OF SCOPE AND IT STAYS THERE (spec §6)"""
     store, wo = parked(project, outcome="rejected")
     artifact(fake_gh, head_oid=PUSHED)
 
@@ -343,9 +301,7 @@ def test_a_rejected_round_is_never_reopened_by_the_machine(fleet, project, fake_
 def test_a_project_that_never_opted_in_is_not_re_judged_either(tmp_path, project,
                                                                jarvis_home, fake_claude,
                                                                fake_gh):
-    """The panel's own switch, shared with the person's command through
-    `ops.force_validation_refusal`: a project with the panel off has nothing to judge
-    with, and one with `auto_merge` off is never polled by this mechanism at all."""
+    """The panel's own switch, shared with the person's command through `ops.force_validation_refusal`: a..."""
     fleet = boot(tmp_path, project, auto_merge=False)
     store, wo = parked(project)
     artifact(fake_gh, head_oid=PUSHED)
@@ -356,15 +312,12 @@ def test_a_project_that_never_opted_in_is_not_re_judged_either(tmp_path, project
     assert store.events_of_kind(wo["id"], "automerge_held") == []
 
 
-# -- the last round is the user's ------------------------------------------------------
+# -- the last round is the user's
 
 
 def test_the_machine_never_spends_the_last_round(tmp_path, project, jarvis_home,
                                                  fake_claude, fake_gh):
-    """GUARD 6. `max_rounds` is where a rejection stops going back to a worker and starts
-    going to the user — and on a parked order there is no worker left. A machine that
-    spent the final round would hand the user an escalation instead of a decision they
-    could still have acted on."""
+    """GUARD 6"""
     fleet = boot(tmp_path, project, max_rounds=3)
     store, wo = parked(project, rounds=2)
     artifact(fake_gh, head_oid=PUSHED)
@@ -376,7 +329,7 @@ def test_the_machine_never_spends_the_last_round(tmp_path, project, jarvis_home,
     assert len(declined) == 1
     payload = db.from_json(declined[0]["payload"], {})
     assert payload["head_sha"] == PUSHED and payload["next_round"] == 3
-    # ...and the person still can: the round it left is theirs to spend.
+    # ...and the person still can: the round it left is theirs to spend
     ops.force_validation(wo["id"], reason="I read the merge commit myself")
     assert rounds_of(store, wo) == [1, 2, 3]
 
@@ -384,9 +337,7 @@ def test_the_machine_never_spends_the_last_round(tmp_path, project, jarvis_home,
 def test_the_one_stall_it_cannot_heal_is_the_one_it_reports(tmp_path, project,
                                                             jarvis_home, fake_claude,
                                                             fake_gh):
-    """§4. A held auto-merge is deliberately not an attention item — but that rule was
-    written when every `sha_moved` hold was ordinary. The one the OS cannot clear by
-    itself is not ordinary, and silence there is the 30 minutes wo-2005a89b sat green."""
+    """§4"""
     fleet = boot(tmp_path, project, max_rounds=3)
     store, wo = parked(project, rounds=2)
     artifact(fake_gh, head_oid=PUSHED)
@@ -395,8 +346,7 @@ def test_the_one_stall_it_cannot_heal_is_the_one_it_reports(tmp_path, project,
 
     row = store.get_work_order(wo["id"])
     assert invariants.true_blockers(store, row)[0] == invariants.SHA_MOVED_BLOCKER
-    # The flag itself comes from INV-ATTENTION-MISSING, which is the path that honours
-    # an ack — never from the write site (kn-089de524).
+    # The flag itself comes from INV-ATTENTION-MISSING, which is the path that honours an ack
     assert not row["needs_attention"]
     list(invariants.check_blocked_work_is_surfaced(store))
     row = store.get_work_order(wo["id"])
@@ -407,8 +357,7 @@ def test_the_one_stall_it_cannot_heal_is_the_one_it_reports(tmp_path, project,
 def test_the_decline_is_recorded_once_and_an_ack_stays_down(tmp_path, project,
                                                             jarvis_home, fake_claude,
                                                             fake_gh):
-    """The reconciler trap in both its shapes (kn-089de524): an event per tick buries the
-    timeline, and a flag re-raised per tick overwrites the user's `jarvis wo ack`."""
+    """The reconciler trap in both its shapes (kn-089de524): an event per tick buries the timeline"""
     fleet = boot(tmp_path, project, max_rounds=3)
     store, wo = parked(project, rounds=2)
     artifact(fake_gh, head_oid=PUSHED)
@@ -426,10 +375,7 @@ def test_the_decline_is_recorded_once_and_an_ack_stays_down(tmp_path, project,
 
 def test_the_flag_goes_down_by_itself_when_the_branch_moves_again(
         tmp_path, project, jarvis_home, fake_claude, fake_gh):
-    """Derived and not stored, which is what makes it BOTH self-clearing and re-askable:
-    the blocker is about one commit. A head that moves again is asked afresh — one
-    decline per commit, the flag still up — and it goes down by itself the moment a round
-    binds a verdict to the head that is there."""
+    """Derived and not stored, which is what makes it BOTH self-clearing and re-askable: the blocker is..."""
     fleet = boot(tmp_path, project, max_rounds=3)
     store, wo = parked(project, rounds=2)
     artifact(fake_gh, head_oid=PUSHED)
@@ -442,8 +388,7 @@ def test_the_flag_goes_down_by_itself_when_the_branch_moves_again(
     assert len(store.events_of_kind(wo["id"], invariants.REJUDGE_DECLINED_EVENT)) == 2
     assert invariants.rejudge_exhausted(store, store.get_work_order(wo["id"]))
 
-    # The person spends the round the machine left them, and nothing has to be cleared
-    # by hand: the newest hold stops being `sha_moved`, so the blocker stops deriving.
+    # The person spends the round the machine left them
     ops.force_validation(wo["id"], reason="I read the merge commit myself")
     judge(fleet, store, Panel("passed"))
     poll(fleet, store)
@@ -453,13 +398,11 @@ def test_the_flag_goes_down_by_itself_when_the_branch_moves_again(
         store, store.get_work_order(wo["id"]))
 
 
-# -- the policy, without a daemon ------------------------------------------------------
+# -- the policy, without a daemon
 
 
 def test_the_hold_the_os_cannot_read_a_head_from_writes_nothing(fleet, project):
-    """An empty head is `gh` failing to answer, not a commit. Recording a decline for it
-    would poison the dedupe — the key would be `""` and would then swallow the real head
-    when it arrives."""
+    """An empty head is `gh` failing to answer, not a commit"""
     store, wo = parked(project)
     decision = automerge._held(automerge.HELD_SHA_MOVED, "unknown",
                                judged_sha=JUDGED, head_sha="")
@@ -474,10 +417,7 @@ def test_the_hold_the_os_cannot_read_a_head_from_writes_nothing(fleet, project):
 
 
 def test_the_substituted_head_answers_about_the_merge_and_not_about_the_round():
-    """`automerge.only_the_head_moved` is `decide` with the live head put in — so the six
-    conditions stay in one table. It is meaningful ONLY after a `sha_moved` hold, which
-    is why its caller checks that first: substituting the head satisfies conditions 4
-    and 5 by construction, and on a rejected round that would read as a near miss."""
+    """`automerge.only_the_head_moved` is `decide` with the live head put in"""
     from jarvis.github import PullRequest
 
     def pull(**over):
@@ -497,10 +437,7 @@ def test_the_substituted_head_answers_about_the_merge_and_not_about_the_round():
 
 def test_raising_the_budget_is_all_the_user_has_to_do(tmp_path, project, jarvis_home,
                                                       fake_claude, fake_gh):
-    """The decline suppresses the EVENT, never the remedy. A commit the OS judged is
-    judged for ever, but one it declined was declined against a round budget — so the
-    tick after the user raises that budget, the OS heals the stall it reported instead
-    of waiting to be told again."""
+    """The decline suppresses the EVENT, never the remedy"""
     fleet = boot(tmp_path, project, max_rounds=3)
     store, wo = parked(project, rounds=2)
     artifact(fake_gh, head_oid=PUSHED)
@@ -515,16 +452,7 @@ def test_raising_the_budget_is_all_the_user_has_to_do(tmp_path, project, jarvis_
 
 def test_a_round_the_os_opened_and_the_panel_rejected_goes_back_to_the_worker(
         fleet, project, fake_gh):
-    """THE OUTCOME THIS CHANGE NEWLY AUTOMATES: the OS opened the round, and the panel
-    refused it. A rejection below `max_rounds` must land where every other rejection
-    lands — feedback in the worker's session — and never in the silent park of
-    wo-7e08ac40, which is `waiting_pr_merge` over a `not_passed` hold with nobody left
-    to act and no flag.
-
-    The session stamp is what `parked` leaves out and every real parked order has:
-    `waiting_pr_merge` is reached through `jarvis wo finish`, which only a dispatched
-    worker can call.
-    """
+    """THE OUTCOME THIS CHANGE NEWLY AUTOMATES: the OS opened the round, and the panel refused it"""
     store, wo = parked(project)
     store.update_work_order(wo["id"], session_id="sess-1")
     artifact(fake_gh, head_oid=PUSHED)
@@ -546,12 +474,7 @@ def test_a_round_the_os_opened_and_the_panel_rejected_goes_back_to_the_worker(
 
 
 def test_an_os_rejection_never_parks_the_order_silently(fleet, project, fake_gh):
-    """The other half of the same worry: while the feedback is in flight the order must
-    not read as a settled park. It stays `validating` — a state the round machine owns
-    and `invariants.MESSAGE_STUCK_STATUSES` deliberately leaves to it — the poll writes
-    no hold at all because a parked order is the only thing it looks at, and the
-    envelope names the work order itself as the implementor, so the feedback reached
-    somebody rather than nobody."""
+    """The other half of the same worry: while the feedback is in flight the order must not read as a..."""
     store, wo = parked(project)
     store.update_work_order(wo["id"], session_id="sess-1")
     artifact(fake_gh, head_oid=PUSHED)
@@ -573,23 +496,17 @@ def test_an_os_rejection_never_parks_the_order_silently(fleet, project, fake_gh)
     assert envelope["delivered_wo_id"] == wo["id"]
 
 
-# -- the pull request settles UNDER the re-judgement ------------------------------------
+# -- the pull request settles UNDER the re-judgement
 
 
 def test_a_hand_merge_during_the_re_judgement_is_noticed_on_the_very_next_poll(
         fleet, project, fake_gh):
-    """The gap re-judging opened. It moves the order into `validating`, which used to be
-    unpolled — so the user merging the pull request themselves, while five seats read a
-    diff that had just landed, went unnoticed until the round settled and parked the order
-    back in `waiting_pr_merge`. Noticing that merge is what the poll is for, so
-    `validating` is polled and the round is closed `void` first.
-    """
+    """The gap re-judging opened"""
     store, wo = parked(project)
     artifact(fake_gh, head_oid=PUSHED)
     poll(fleet, store)                      # the head moved: round 2 is open
     assert store.get_work_order(wo["id"])["status"] == "validating"
-    # AND THE SEATS ARE ACTUALLY READING IT. The merge lands mid-round, which is the
-    # only shape of this that can happen: five seats take minutes.
+    # AND THE SEATS ARE ACTUALLY READING IT
     panel = HeldPanel("passed")
     hold(fleet, store, panel)
 
@@ -597,19 +514,15 @@ def test_a_hand_merge_during_the_re_judgement_is_noticed_on_the_very_next_poll(
     poll(fleet, store)
 
     assert store.get_work_order(wo["id"])["status"] == "completed"
-    # VOID, not passed or rejected: nothing judged this, and nothing was left undecided.
-    # It costs the submitter no round, so a later re-delivery is not short of budget.
+    # VOID, not passed or rejected: nothing judged this, and nothing was left undecided
     round_2 = store.validation_rounds(wo_id=wo["id"])[-1]
     assert int(round_2["round"]) == 2 and round_2["outcome"] == "void"
     assert store.counted_validation_rounds(wo_id=wo["id"]) == 1
     assert store.events_of_kind(wo["id"], "validation_void")
-    # The user merged it. The record must not claim the OS did.
+    # The user merged it
     assert store.events_of_kind(wo["id"], "automerge_merged") == []
 
-    # AND THE PANEL FINISHES ANYWAY. Its verdict is about a question that stopped
-    # mattering, so it must not overwrite the `void` — nor re-land the work order it
-    # read before the merge, which `ops.land_when_cleared` would park back in
-    # `waiting_pr_merge` on a pass.
+    # AND THE PANEL FINISHES ANYWAY
     release(fleet, panel)
 
     row = store.get_work_order(wo["id"])
@@ -621,8 +534,7 @@ def test_a_hand_merge_during_the_re_judgement_is_noticed_on_the_very_next_poll(
 
 def test_a_hand_closure_during_the_re_judgement_reaches_the_user_the_same_way(
         fleet, project, fake_gh):
-    """The other ending, under the same rule: somebody shut the pull request on purpose,
-    so the panel's verdict decides nothing and the work order is the user's."""
+    """The other ending, under the same rule: somebody shut the pull request on purpose"""
     store, wo = parked(project)
     artifact(fake_gh, head_oid=PUSHED)
     poll(fleet, store)
@@ -636,8 +548,7 @@ def test_a_hand_closure_during_the_re_judgement_reaches_the_user_the_same_way(
     assert store.validation_rounds(wo_id=wo["id"])[-1]["outcome"] == "void"
     assert store.counted_validation_rounds(wo_id=wo["id"]) == 1
 
-    # The mirror of the merge case: a panel settling afterwards must not pass the work
-    # order out of the user's hands and back behind a pull request nobody will merge.
+    # The mirror of the merge case: a panel settling afterwards must not pass the work order out of the...
     release(fleet, panel)
 
     assert store.get_work_order(wo["id"])["status"] == "needs_review"
@@ -646,18 +557,13 @@ def test_a_hand_closure_during_the_re_judgement_reaches_the_user_the_same_way(
 
 
 def test_the_widened_poll_nudges_nobody_while_a_round_is_open(fleet, project, fake_gh):
-    """THE BOUND ON THE WIDENING. `validating` is polled but is NOT in
-    `PR_REPAIR_STATUSES`, and it must not be: `invariants.true_blockers` derives the two
-    repair give-ups only there, so a nudge sent here would raise a flag nothing can
-    re-derive and INV-ATTENTION-REASON would relabel it on the next tick.
-    """
+    """THE BOUND ON THE WIDENING"""
     store, wo = parked(project)
     store.update_work_order(wo["id"], session_id="sess-1")
     artifact(fake_gh, head_oid=PUSHED)
     poll(fleet, store)                      # round 2 is open
 
-    # ...and now the pull request conflicts, which in any repair status sends the worker
-    # a nudge and opens a repair episode.
+    # ...and now the pull request conflicts
     fake_gh.set_pr(PR, "OPEN", checks=RED, merge_state="DIRTY", head_oid=PUSHED)
     poll(fleet, store)
 
@@ -666,36 +572,28 @@ def test_the_widened_poll_nudges_nobody_while_a_round_is_open(fleet, project, fa
     assert store.pr_repair_attempts(wo["id"], ops.PR_CHECKS) == 0
     assert store.events_of_kind(wo["id"], "pr_conflict_nudged") == []
     assert store.events_of_kind(wo["id"], "pr_checks_nudged") == []
-    # The round it is waiting on is untouched — nothing here voided it.
+    # The round it is waiting on is untouched — nothing here voided it
     assert store.validation_rounds(wo_id=wo["id"])[-1]["outcome"] == "pending"
 
 
 def test_validating_is_the_only_status_polled_without_being_repairable():
-    """The pairing `invariants.PR_REPAIR_STATUSES` documents, asserted rather than
-    described: every other polled status may derive a repair blocker."""
+    """The pairing `invariants.PR_REPAIR_STATUSES` documents"""
     from jarvis.daemon import PR_POLL_STATUSES
 
     assert set(PR_POLL_STATUSES) - set(invariants.PR_REPAIR_STATUSES) == {"validating"}
     assert not set(invariants.PR_REPAIR_STATUSES) - set(PR_POLL_STATUSES)
 
 
-# -- the head that moved for no reason a seat needs to read -----------------------------
-# docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md: a catch-up
-# with `main` is proved, not re-judged, and the round machine below must not see it.
+# -- the head that moved for no reason a seat needs to read
 
-#: The head after `main` was merged in, and the base commit that went in with it.
+#: The head after `main` was merged in, and the base commit that went in with it
 CAUGHT_UP = "dddd1111dddd2222dddd3333dddd4444dddd5555"
 BASE = "eeee1111eeee2222eeee3333eeee4444eeee5555"
 
 
 @pytest.fixture()
 def local_proof(monkeypatch):
-    """The local half of the carry's proof (§3.3), answered without a network.
-
-    This project's `origin` is `github.com/acme/proj`, which no fetch can reach; the git
-    is proved against a real clone in `tests/test_base_heal.py`. `ids` makes one commit's
-    patch-id differ, which is what an evil merge looks like here.
-    """
+    """The local half of the carry's proof (§3.3), answered without a network"""
     from jarvis import branchproof
 
     state = {"id": "cafe12345678", "ids": {}}
@@ -708,9 +606,7 @@ def local_proof(monkeypatch):
 
 
 def test_a_catch_up_with_main_costs_no_round(fleet, project, fake_gh, local_proof):
-    """§1. The head moved because `main` was merged in — which the OS's own gate reviewer
-    demands — and the round machine must never see it. No `validation_forced`, no round 2,
-    and the verdict now covers the commit that is there."""
+    """§1"""
     store, wo = parked(project)
     fake_gh.set_parents(CAUGHT_UP, [JUDGED, BASE])
     artifact(fake_gh, head_oid=CAUGHT_UP)
@@ -726,15 +622,12 @@ def test_a_catch_up_with_main_costs_no_round(fleet, project, fake_gh, local_proo
 
 def test_the_carry_runs_with_no_rounds_left_and_a_decline_already_written(
         tmp_path, project, jarvis_home, fake_claude, fake_gh, local_proof):
-    """PART 3, §6 item 2, and the exact state of wo-00bd1096 and wo-8736a5c5: the budget
-    is spent and this head was already declined. The carry consults neither
-    `max_rounds` nor the declined-heads dedupe — structurally, because
-    `ops.carry_merge_chain` never reads `cfg` — so a stranded order still recovers."""
+    """PART 3, §6 item 2, and the exact state of wo-00bd1096 and wo-8736a5c5: the budget is spent and this..."""
     fleet = boot(tmp_path, project, max_rounds=3)
     store, wo = parked(project, rounds=2)
     fake_gh.set_parents(CAUGHT_UP, [JUDGED, BASE])
     artifact(fake_gh, head_oid=CAUGHT_UP)
-    # The tick before this feature shipped: declined, on this very head.
+    # The tick before this feature shipped: declined, on this very head
     store.add_event(wo["id"], invariants.REJUDGE_DECLINED_EVENT,
                     {"head_sha": CAUGHT_UP, "judged_sha": JUDGED, "round": 2,
                      "next_round": 3, "max_rounds": 3})
@@ -752,23 +645,20 @@ def test_the_carry_runs_with_no_rounds_left_and_a_decline_already_written(
 def test_the_stranded_blocker_falls_by_itself_on_the_tick_after_the_carry(
         tmp_path, project, jarvis_home, fake_claude, fake_gh, local_proof,
         local_base):
-    """§6 item 4. Attention is re-derived every tick, so nothing has to be acked and
-    nothing has to be forced: the carry binds a verdict to the head, `rejudge_exhausted`
-    stops being true at its last clause, and the flag goes down on its own."""
+    """§6 item 4"""
     fleet = boot(tmp_path, project, max_rounds=3)
     store, wo = parked(project, rounds=2)
     artifact(fake_gh, head_oid=CAUGHT_UP)
-    # Round 3 would be the last, so the old path declined and flagged the user.
+    # Round 3 would be the last, so the old path declined and flagged the user
     poll(fleet, store)
     list(invariants.check_blocked_work_is_surfaced(store))
     assert store.get_work_order(wo["id"])["attention_reason"] == \
         invariants.SHA_MOVED_BLOCKER
 
-    # ...and now the proof can be made — the daemon reads the parents it could not before.
+    # ...and now the proof can be made — the daemon reads the parents it could not before
     fake_gh.set_parents(CAUGHT_UP, [JUDGED, BASE])
     poll(fleet, store)
-    # INV-ATTENTION-REASON, the checker that takes a flag DOWN: the blocker stopped being
-    # derivable, so nothing had to be acked (kn-089de524).
+    # INV-ATTENTION-REASON, the checker that takes a flag DOWN: the blocker stopped being derivable
     list(invariants.check_attention_reason_is_true(store))
 
     assert not invariants.rejudge_exhausted(store, store.get_work_order(wo["id"]))
@@ -776,9 +666,7 @@ def test_the_stranded_blocker_falls_by_itself_on_the_tick_after_the_carry(
     assert invariants.SHA_MOVED_BLOCKER not in invariants.true_blockers(store, row)
     assert rounds_of(store, wo) == [1, 2]
 
-    # NOTHING WAS TYPED. The blocker stopped deriving, so the flag is no longer re-raised
-    # and the order goes on down the merge path — the gate is Neo's to answer, and the flag
-    # itself comes down with the work order (INV-ATTENTION-PHANTOM).
+    # NOTHING WAS TYPED
     from jarvis import gates
 
     approvals = store.list_approvals(wo["id"])
@@ -794,10 +682,7 @@ def test_the_stranded_blocker_falls_by_itself_on_the_tick_after_the_carry(
 
 def test_an_evil_merge_still_costs_a_round_and_still_declines_at_the_last_one(
         fleet, project, fake_gh, local_proof):
-    """§3.4: the fall-through is not a consolation prize. A merge whose resolution edited
-    the branch's own files differs in patch-id, and that resolution is authored content no
-    seat has read — precisely what a round exists to judge. So the refusal is recorded,
-    naming the proof, and the round machine takes over unchanged."""
+    """§3.4: the fall-through is not a consolation prize"""
     store, wo = parked(project)
     local_proof["ids"][CAUGHT_UP] = "0ther00patch"
     fake_gh.set_parents(CAUGHT_UP, [JUDGED, BASE])
@@ -816,11 +701,7 @@ def test_an_evil_merge_still_costs_a_round_and_still_declines_at_the_last_one(
 
 def test_an_evil_merge_on_the_last_round_is_re_judged_as_a_rebind(
         tmp_path, project, jarvis_home, fake_claude, fake_gh, local_proof):
-    """THE DEFECT THIS TEST USED TO ASSERT, end to end and through the poll. At
-    `max_rounds` the decline stranded wo-8736a5c5 on the user for a merge the OS itself
-    demanded; proof (a) holds and proof (b) does not, so the round that reads the
-    resolution is a rebind and no budget is spent (spec
-    docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md)."""
+    """THE DEFECT THIS TEST USED TO ASSERT, end to end and through the poll (docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md)"""
     fleet = boot(tmp_path, project, max_rounds=3)
     store, wo = parked(project, rounds=2)
     local_proof["ids"][CAUGHT_UP] = "0ther00patch"
@@ -840,13 +721,11 @@ def test_an_evil_merge_on_the_last_round_is_re_judged_as_a_rebind(
     assert not invariants.rejudge_exhausted(store, store.get_work_order(wo["id"]))
 
 
-# -- the flag the carry itself puts down (spec §6 item 4) ------------------------------
+# -- the flag the carry itself puts down (spec §6 item 4)
 
 
 def _stranded(tmp_path, project, fake_gh) -> tuple[object, object, dict]:
-    """An order flagged `sha_moved` with its round budget spent — the state the carry
-    inherits. Parents unreadable on the first poll, so the carry refuses and the round
-    machine declines and flags."""
+    """An order flagged `sha_moved` with its round budget spent — the state the carry inherits"""
     fleet = boot(tmp_path, project, max_rounds=3)
     store, wo = parked(project, rounds=2)
     artifact(fake_gh, head_oid=CAUGHT_UP)
@@ -859,9 +738,7 @@ def _stranded(tmp_path, project, fake_gh) -> tuple[object, object, dict]:
 
 def test_the_carry_puts_the_flag_down_itself(tmp_path, project, jarvis_home,
                                              fake_claude, fake_gh, local_proof):
-    """§6 item 4. `sha_moved` was the only blocker, so the carry that made it untrue takes
-    the flag down there and then — the user does not keep an attention item until the
-    pull request merges."""
+    """§6 item 4"""
     fleet, store, wo = _stranded(tmp_path, project, fake_gh)
     fake_gh.set_parents(CAUGHT_UP, [JUDGED, BASE])
 
@@ -876,12 +753,7 @@ def test_the_carry_puts_the_flag_down_itself(tmp_path, project, jarvis_home,
 
 
 def test_another_true_blocker_keeps_the_flag_up(fleet, project):
-    """The carry clears the reason it made untrue, never somebody else's. A pending
-    assumption is still the user's to decide, so the flag stays up and says so.
-
-    Asked of `ops.carry_merge_chain` directly: with an assumption pending, `decide` holds
-    on `assumptions` rather than `sha_moved`, so the daemon's carry is never reached and
-    the rule has to be proved where it lives."""
+    """The carry clears the reason it made untrue, never somebody else's"""
     store, wo = parked(project)
     store.add_assumption(wo["id"], "used sqlite rather than postgres")
     store.flag_attention(wo["id"], invariants.SHA_MOVED_BLOCKER)
@@ -904,8 +776,7 @@ def test_another_true_blocker_keeps_the_flag_up(fleet, project):
 def test_the_lowered_flag_is_not_re_raised_on_the_next_tick(tmp_path, project,
                                                             jarvis_home, fake_claude,
                                                             fake_gh, local_proof):
-    """kn-089de524: attention is re-derived every tick, so a flag lowered on this path
-    must stay down without an ack and the carry must not write a second one."""
+    """kn-089de524: attention is re-derived every tick"""
     fleet, store, wo = _stranded(tmp_path, project, fake_gh)
     fake_gh.set_parents(CAUGHT_UP, [JUDGED, BASE])
     poll(fleet, store)
@@ -921,8 +792,7 @@ def test_the_lowered_flag_is_not_re_raised_on_the_next_tick(tmp_path, project,
     assert len(store.events_of_kind(wo["id"], ops.HEAD_CARRIED_EVENT)) == 1
 
 
-# -- a rebind: the round the OS's own merge costs nobody -------------------------------
-# spec docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md
+# -- a rebind: the round the OS's own merge costs nobody
 
 
 def _cfg(fleet):
@@ -936,9 +806,7 @@ def _moved(head: str = PUSHED, *, round_n: int = 3):
 
 def test_a_conflict_resolving_merge_past_the_cap_is_re_judged_without_spending_a_round(
         tmp_path, project, jarvis_home, fake_claude, fake_gh):
-    """wo-8736a5c5 / PR #794. The OS's own conflict poll made the worker merge `main`;
-    the resolution is content no seat read, so the carry correctly refuses — and the
-    re-judge that follows must not be charged to the worker's rework budget."""
+    """wo-8736a5c5 / PR #794"""
     fleet = boot(tmp_path, project, max_rounds=3)
     store, wo = parked(project, rounds=3)
     artifact(fake_gh, head_oid=PUSHED)
@@ -964,8 +832,7 @@ def test_a_conflict_resolving_merge_past_the_cap_is_re_judged_without_spending_a
 
 def test_the_rebind_arm_never_reads_the_round_budget(tmp_path, project, jarvis_home,
                                                      fake_claude, fake_gh):
-    """§4.3: `cfg.max_rounds` is not consulted at all on the rebind arm — the live
-    order's recovery must not depend on any round accounting reaching this path."""
+    """§4.3: `cfg.max_rounds` is not consulted at all on the rebind arm"""
     fleet = boot(tmp_path, project, max_rounds=1)
     store, wo = parked(project, rounds=3)
     artifact(fake_gh, head_oid=PUSHED)
@@ -979,8 +846,7 @@ def test_the_rebind_arm_never_reads_the_round_budget(tmp_path, project, jarvis_h
 
 def test_rebind_max_bounds_the_self_repair(tmp_path, project, jarvis_home, fake_claude,
                                            fake_gh):
-    """§4.3, the cap branch. Past `REBIND_MAX` the decline names its own cause, so a
-    reader can tell it from a spent round budget — and it is said once per commit."""
+    """§4.3, the cap branch"""
     fleet = boot(tmp_path, project, max_rounds=3)
     store, wo = parked(project, rounds=3)
     artifact(fake_gh, head_oid=PUSHED)
@@ -1014,8 +880,7 @@ def test_rebind_max_bounds_the_self_repair(tmp_path, project, jarvis_home, fake_
 
 def test_a_non_merge_head_change_past_the_cap_still_goes_to_the_user(
         tmp_path, project, jarvis_home, fake_claude, fake_gh):
-    """A worker PUSH past the cap is what `max_rounds` is FOR: no rebind, today's
-    decline — now naming its cause — and today's blocker, byte for byte."""
+    """A worker PUSH past the cap is what `max_rounds` is FOR: no rebind, today's decline"""
     fleet = boot(tmp_path, project, max_rounds=3)
     store, wo = parked(project, rounds=2)
     artifact(fake_gh, head_oid=PUSHED)
@@ -1033,10 +898,8 @@ def test_a_non_merge_head_change_past_the_cap_still_goes_to_the_user(
 
 def test_a_passing_rebind_arms_the_merge(tmp_path, project, jarvis_home, fake_claude,
                                          fake_gh, local_base):
-    """§5 test 2. The point of the exemption is a pull request that MERGES: the rebind
-    binds a verdict to the head the OS's own merge produced, so `decide` arms on it and
-    nobody was asked for anything."""
-    # local_base: spec 2026-09-28-a-merge-checks-the-base-it-lands-on.md §3.2/§3.4.
+    """§5 test 2"""
+    # local_base: spec 2026-09-28-a-merge-checks-the-base-it-lands-on.md §3.2/§3.4
     fleet = boot(tmp_path, project, max_rounds=3)
     store, wo = parked(project, rounds=3)
     artifact(fake_gh, head_oid=PUSHED)
@@ -1061,8 +924,7 @@ def test_a_passing_rebind_arms_the_merge(tmp_path, project, jarvis_home, fake_cl
 
 def test_a_rebind_says_so_on_the_round_listing(tmp_path, project, jarvis_home,
                                                fake_claude, fake_gh):
-    """§4.3's last paragraph: round 4 under `max_rounds` 3 reads as the very bug this
-    spec is about unless the line says the round was not charged to anyone."""
+    """§4.3's last paragraph: round 4 under `max_rounds` 3 reads as the very bug this spec is about unless..."""
     fleet = boot(tmp_path, project, max_rounds=3)
     store, wo = parked(project, rounds=3)
     artifact(fake_gh, head_oid=PUSHED)
@@ -1078,9 +940,7 @@ def test_a_rebind_says_so_on_the_round_listing(tmp_path, project, jarvis_home,
 
 def test_a_rejected_rebind_goes_to_the_worker(tmp_path, project, jarvis_home,
                                               fake_claude, fake_gh):
-    """§5 test 3, §4.4. The row is numbered past `max_rounds`, and routing on that
-    would send it to the user — the rebind budget is what decides, and the feedback may
-    not tell the worker it has spent a round it has not."""
+    """§5 test 3, §4.4"""
     fleet = boot(tmp_path, project, max_rounds=3)
     store, wo = parked(project, rounds=3)
     store.update_work_order(wo["id"], session_id="sess-1")
@@ -1106,9 +966,7 @@ def test_a_rejected_rebind_goes_to_the_worker(tmp_path, project, jarvis_home,
 
 def test_rebind_max_exhausted_goes_to_the_user(tmp_path, project, jarvis_home,
                                                fake_claude, fake_gh):
-    """§5 test 4, §4.5. `SHA_MOVED_BLOCKER` would offer `validation.max_rounds` as the
-    remedy, and the rebind arm never reads it — so the sentence has to be the other
-    one, and raising the round budget must not restart anything."""
+    """§5 test 4, §4.5"""
     fleet = boot(tmp_path, project, max_rounds=3)
     store, wo = parked(project, rounds=3)
     for head in (PUSHED, AGAIN):
@@ -1142,10 +1000,7 @@ def test_rebind_max_exhausted_goes_to_the_user(tmp_path, project, jarvis_home,
 
 def test_an_ordinary_round_after_a_rebind_is_budgeted_by_position(
         tmp_path, project, jarvis_home, fake_claude, fake_gh):
-    """§4.4. A rebind spends a row number and no budget, so every ordinary round after
-    one is judged a position late if the routing reads the row: one counted round plus a
-    passing rebind puts the next submission on row 3 while its budget position is 2, and
-    it would be escalated — and told "round 3 of 3" — with a round still in hand."""
+    """§4.4"""
     fleet = boot(tmp_path, project, max_rounds=3)
     store, wo = parked(project, rounds=1)
     store.update_work_order(wo["id"], session_id="sess-1")
@@ -1172,10 +1027,7 @@ def test_an_ordinary_round_after_a_rebind_is_budgeted_by_position(
 
 def test_a_fix_after_a_rejected_rebind_is_itself_a_rebind(
         tmp_path, project, jarvis_home, fake_claude, fake_gh):
-    """§4.4. The worker was sent back by a round nobody charged it for, so the round
-    that reads its fix may not be charged either: rebind 1 is the OS's re-judge of the
-    merge, rebind 2 is the fix, and a second rejection has spent `REBIND_MAX` and goes
-    to the user."""
+    """§4.4"""
     fleet = boot(tmp_path, project, max_rounds=3)
     store, wo = parked(project, rounds=1)
     store.update_work_order(wo["id"], session_id="sess-1")
@@ -1196,25 +1048,18 @@ def test_a_fix_after_a_rejected_rebind_is_itself_a_rebind(
     assert store.get_work_order(wo["id"])["status"] == "needs_review"
 
 
-# -- a rework the USER asked for: the second uncounted cause ---------------------------
-# Neo question 973: "a separate 'user_rework' cause, one uncounted round per user
-# rejection, no REBIND_MAX, with its own feedback wording and exhausted blocker".
-# wo-299daf2e: rounds 1 and 2 passed, the USER rejected on review, the worker delivered
-# the rework and merged main, and the OS declined the re-judge for the round cap — so
-# the rework the user asked for was never judged.
+# -- a rework the USER asked for: the second uncounted cause
 
 
 def _user_rejected(store, wo, feedback: str = "not what I asked for") -> None:
-    """What `ops.review_work_order(accept=False)` leaves on the record."""
+    """What `ops.review_work_order(accept=False)` leaves on the record"""
     store.add_event(wo["id"], "reviewed",
                     {"accepted": False, "count": 1, "feedback": feedback})
 
 
 def test_a_rework_the_user_asked_for_is_judged_past_the_cap(
         tmp_path, project, jarvis_home, fake_claude, fake_gh):
-    """THE LIVE CASE, wo-299daf2e. The head moved by a chain that is NOT all merges of
-    the base, so `rebind` is False and the ordinary arm declines on `max_rounds` — and
-    the rework is the USER'S, so a round must open whatever the budget says."""
+    """THE LIVE CASE, wo-299daf2e"""
     fleet = boot(tmp_path, project, max_rounds=3)
     store, wo = parked(project, rounds=3)
     _user_rejected(store, wo)
@@ -1233,9 +1078,7 @@ def test_a_rework_the_user_asked_for_is_judged_past_the_cap(
 
 def test_one_free_round_per_user_rejection_and_no_more(
         tmp_path, project, jarvis_home, fake_claude, fake_gh):
-    """The predicate self-terminates: once the user-rework round has SETTLED it is the
-    newest settled round, so the next moved head past the cap is declined exactly as it
-    is today."""
+    """The predicate self-terminates: once the user-rework round has SETTLED it is the newest settled..."""
     fleet = boot(tmp_path, project, max_rounds=3)
     store, wo = parked(project, rounds=3)
     _user_rejected(store, wo)
@@ -1260,9 +1103,7 @@ def test_one_free_round_per_user_rejection_and_no_more(
 
 def test_the_two_uncounted_causes_never_spend_each_other(
         tmp_path, project, jarvis_home, fake_claude, fake_gh):
-    """`REBIND_MAX` bounds the OS's own merge re-judgements and NOTHING else: a work
-    order that has spent both rebinds still gets the round the user's rework needs, and
-    the rework round does not count towards the rebind bound."""
+    """`REBIND_MAX` bounds the OS's own merge re-judgements and NOTHING else: a work order that has spent..."""
     fleet = boot(tmp_path, project, max_rounds=3)
     store, wo = parked(project, rounds=3)
     for head in (PUSHED, AGAIN):
@@ -1295,8 +1136,7 @@ def test_the_two_uncounted_causes_never_spend_each_other(
 
 def test_a_worker_re_delivery_of_a_user_rework_costs_no_round(
         tmp_path, project, jarvis_home, fake_claude, fake_gh):
-    """The worker coming back through `jarvis wo finish` gets the same free round: the
-    rework is the user's whichever route re-opens the panel."""
+    """The worker coming back through `jarvis wo finish` gets the same free round: the rework is the..."""
     fleet = boot(tmp_path, project, max_rounds=3)
     store, wo = parked(project, rounds=3)
     _user_rejected(store, wo)
@@ -1312,8 +1152,7 @@ def test_a_worker_re_delivery_of_a_user_rework_costs_no_round(
 
 def test_a_fix_after_a_rejected_user_rework_round_is_an_ordinary_round(
         tmp_path, project, jarvis_home, fake_claude, fake_gh):
-    """UNLIKE a rebind, whose fix is itself a rebind: the bound here is ONE round per
-    user rejection, so the worker's next attempt is charged like any other."""
+    """UNLIKE a rebind, whose fix is itself a rebind: the bound here is ONE round per user rejection"""
     fleet = boot(tmp_path, project, max_rounds=5)
     store, wo = parked(project, rounds=1)
     _user_rejected(store, wo)
@@ -1337,14 +1176,12 @@ def test_a_fix_after_a_rejected_user_rework_round_is_an_ordinary_round(
 
 def test_a_passing_user_rework_round_arms_the_merge(tmp_path, project, jarvis_home,
                                                     fake_claude, fake_gh, local_base):
-    """The point of the exemption is a pull request that MERGES: the rework the user
-    asked for is judged past the budget, passes, and the OS asks for the gate."""
-    # local_base: spec 2026-09-28-a-merge-checks-the-base-it-lands-on.md §3.2/§3.4.
+    """The point of the exemption is a pull request that MERGES: the rework the user asked for is judged..."""
+    # local_base: spec 2026-09-28-a-merge-checks-the-base-it-lands-on.md §3.2/§3.4
     fleet = boot(tmp_path, project, max_rounds=3)
     store, wo = parked(project, rounds=3)
     _user_rejected(store, wo)
-    # The worker answered it: `ops.refusal_answered` is the other half of the user's
-    # gate, and without a re-delivery the landing correctly refuses.
+    # The worker answered it: `ops.refusal_answered` is the other half of the user's gate
     store.add_event(wo["id"], "finished", {"summary": "did the rework"})
     artifact(fake_gh, head_oid=PUSHED)
 
@@ -1366,8 +1203,7 @@ def test_a_passing_user_rework_round_arms_the_merge(tmp_path, project, jarvis_ho
 
 def test_a_rejected_user_rework_round_goes_back_to_the_worker(
         tmp_path, project, jarvis_home, fake_claude, fake_gh):
-    """The counted budget still has room, so the worker gets the feedback — and it may
-    not read as a rebind: there is no "re-judgement 1 of 2" bound here."""
+    """The counted budget still has room, so the worker gets the feedback"""
     fleet = boot(tmp_path, project, max_rounds=5)
     store, wo = parked(project, rounds=2)
     store.update_work_order(wo["id"], session_id="sess-1")
@@ -1392,9 +1228,7 @@ def test_a_rejected_user_rework_round_goes_back_to_the_worker(
 
 def test_a_rejected_user_rework_round_with_no_budget_left_goes_to_the_user(
         tmp_path, project, jarvis_home, fake_claude, fake_gh):
-    """One free round per user rejection and no more: the counted budget is spent, so
-    the refusal is the user's to read — and the sentence has to name THIS cause, not the
-    older `sha_moved` refusal and not the rebind's."""
+    """One free round per user rejection and no more: the counted budget is spent"""
     fleet = boot(tmp_path, project, max_rounds=3)
     store, wo = parked(project, rounds=3)
     _user_rejected(store, wo)
@@ -1411,3 +1245,269 @@ def test_a_rejected_user_rework_round_with_no_budget_left_goes_to_the_user(
     assert invariants.VALIDATION_STUCK_BLOCKER not in blockers
     assert invariants.REBIND_EXHAUSTED_BLOCKER not in blockers
     assert invariants.SHA_MOVED_BLOCKER not in blockers
+
+
+# -- a user-rework round NOBODY judged, GitHub issue 1106
+
+
+def _escalated_user_rework(fleet, store, wo, project, *, cause: str) -> dict:
+    """An uncounted user-rework round escalated through the real op with `cause`"""
+    _user_rejected(store, wo)
+    row = ops.submit_for_validation(store, project, store.get_work_order(wo["id"]),
+                                    declared="did the rework", cfg=_cfg(fleet))
+    assert row is not None and row["uncounted_cause"] == ops.USER_REWORK_CAUSE
+    ops.escalate_validation_round(store, store.get_work_order(wo["id"]), int(row["id"]),
+                                  int(row["round"]), "nothing new to judge", cause=cause)
+    return store.get_work_order(wo["id"])
+
+
+def test_an_unreviewed_user_rework_round_does_not_claim_the_panel_refused_it(
+        tmp_path, project, jarvis_home, fake_claude, fake_gh):
+    """Issue 1106"""
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = parked(project, rounds=3)
+    row = _escalated_user_rework(fleet, store, wo, project,
+                                 cause=ops.ESCALATION_REPEAT_SUBMISSION)
+
+    blockers = invariants.true_blockers(store, row)
+
+    assert invariants.USER_REWORK_UNREVIEWED_BLOCKER in blockers
+    assert invariants.USER_REWORK_REFUSED_BLOCKER not in blockers
+    assert invariants.VALIDATION_STUCK_BLOCKER not in blockers
+
+
+def test_a_user_rework_round_with_no_recorded_cause_keeps_the_refused_sentence(
+        tmp_path, project, jarvis_home, fake_claude, fake_gh):
+    """Issue 1106 prescribes ONE split and `not_reviewed` is it: a legacy event with no cause keeps the..."""
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = parked(project, rounds=3)
+    row = _escalated_user_rework(fleet, store, wo, project,
+                                 cause=ops.ESCALATION_CAUSE_UNRECORDED)
+
+    blockers = invariants.true_blockers(store, row)
+
+    assert invariants.USER_REWORK_REFUSED_BLOCKER in blockers
+    assert invariants.USER_REWORK_UNREVIEWED_BLOCKER not in blockers
+    assert invariants.VALIDATION_STUCK_BLOCKER not in blockers
+
+
+def test_an_unjudged_user_rework_round_keeps_the_refused_sentence(
+        tmp_path, project, jarvis_home, fake_claude, fake_gh):
+    """Same for family `unjudged` (`no_verdict`): only `not_reviewed` moves"""
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = parked(project, rounds=3)
+    assert ops.ESCALATION_FAMILY[ops.ESCALATION_NO_VERDICT] == "unjudged"
+    row = _escalated_user_rework(fleet, store, wo, project,
+                                 cause=ops.ESCALATION_NO_VERDICT)
+
+    blockers = invariants.true_blockers(store, row)
+
+    assert invariants.USER_REWORK_REFUSED_BLOCKER in blockers
+    assert invariants.USER_REWORK_UNREVIEWED_BLOCKER not in blockers
+    assert invariants.VALIDATION_STUCK_BLOCKER not in blockers
+
+
+def test_the_unreviewed_sentence_names_the_two_routes_and_nothing_that_moves():
+    """`ack_attention` stores it verbatim and INV-ATTENTION-REASON compares it, so no clock and no sha"""
+    text = invariants.USER_REWORK_UNREVIEWED_BLOCKER
+
+    assert not any(ch.isdigit() for ch in text)
+    assert "max_rounds" not in text
+    assert 'jarvis wo review --reject --feedback "<what to change>"' in text
+    assert 'jarvis wo review --feedback "<why>"' in text
+    assert "refused" not in text and "judged and" not in text
+
+
+def test_the_unreviewed_blocker_can_be_acknowledged(
+        tmp_path, project, jarvis_home, fake_claude, fake_gh):
+    """The round trip the wording rule exists for: what `true_blockers` derives is what `ack_attention`..."""
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = parked(project, rounds=3)
+    row = _escalated_user_rework(fleet, store, wo, project,
+                                 cause=ops.ESCALATION_NOTHING_TO_JUDGE)
+    store.ack_attention(row["id"], invariants.true_blockers(store, row))
+
+    list(invariants.check_attention_reason_is_true(store))
+    list(invariants.check_blocked_work_is_surfaced(store))
+
+    assert not store.get_work_order(wo["id"])["needs_attention"]
+
+
+# -- a verdict bound to NO commit, spec 2026-10-16
+
+
+def unrecorded(project, *, rounds: int = 1, outcome: str = "passed"):
+    """Parked with its latest round `passed` and `head_sha=''` — what a worktree packet leaves behind"""
+    return parked(project, judged="", rounds=rounds, outcome=outcome)
+
+
+def forced_payloads(store, wo) -> list[dict]:
+    return [db.from_json(e["payload"], {})
+            for e in store.events_of_kind(wo["id"], "validation_forced")]
+
+
+def test_a_round_that_recorded_no_commit_re_judges_itself(fleet, project, fake_gh):
+    """THE HEAL"""
+    store, wo = unrecorded(project)
+    artifact(fake_gh, head_oid=PUSHED)
+
+    poll(fleet, store)
+
+    assert store.get_work_order(wo["id"])["status"] == "validating"
+    payloads = forced_payloads(store, wo)
+    assert len(payloads) == 1
+    assert payloads[0]["by"] == ops.REJUDGE_BY_OS
+    assert payloads[0]["head_sha"] == PUSHED and payloads[0]["judged_sha"] == ""
+    # COUNTED: nothing was judged to rebind and the user asked for nothing
+    row = store.latest_validation_round(wo_id=wo["id"])
+    assert not row["uncounted_cause"] and not row["uncounted"]
+
+
+def test_the_unrecorded_head_costs_one_round_per_commit(fleet, project, fake_gh):
+    """`ops.rejudged_heads`' dedupe, on this code too"""
+    store, wo = unrecorded(project)
+    artifact(fake_gh, head_oid=PUSHED)
+    poll(fleet, store)
+    judge(fleet, store, Panel("passed"))
+    # The pull request was unreadable again: round 2 bound no commit either
+    store.set_validation_head(store.latest_validation_round(wo_id=wo["id"])["id"], "")
+
+    poll(fleet, store)
+    poll(fleet, store)
+
+    assert len(forced_payloads(store, wo)) == 1
+    assert not store.events_of_kind(wo["id"], invariants.REJUDGE_DECLINED_EVENT)
+    assert rounds_of(store, wo) == [1, 2]
+    row = store.get_work_order(wo["id"])
+    assert invariants.sha_unrecorded_rejudge_spent(store, row)
+    blockers = invariants.true_blockers(store, row)
+    assert invariants.SHA_UNRECORDED_SPENT_BLOCKER in blockers
+    # Not the budget sentence: nothing was declined and the budget is untouched
+    assert invariants.SHA_UNRECORDED_BLOCKER not in blockers
+    assert invariants.SHA_MOVED_BLOCKER not in blockers
+    assert invariants.REBIND_EXHAUSTED_BLOCKER not in blockers
+
+
+def test_the_os_round_in_flight_on_an_unrecorded_head_blocks_nobody(
+        fleet, project, fake_gh):
+    """The round the OS just opened may yet bind the commit"""
+    store, wo = unrecorded(project)
+    artifact(fake_gh, head_oid=PUSHED)
+
+    poll(fleet, store)
+
+    row = store.get_work_order(wo["id"])
+    assert row["status"] == "validating"
+    assert invariants.SHA_UNRECORDED_SPENT_BLOCKER not in invariants.true_blockers(
+        store, row)
+
+
+def test_a_round_that_binds_the_unrecorded_head_clears_the_blocker(
+        fleet, project, fake_gh):
+    """The tail clause: the OS's own round read the pull request after all and recorded the commit"""
+    store, wo = unrecorded(project)
+    artifact(fake_gh, head_oid=PUSHED)
+    poll(fleet, store)
+    judge(fleet, store, Panel("passed"))
+
+    row = store.get_work_order(wo["id"])
+    assert ProjectStore.validated_head(
+        store.latest_validation_round(wo_id=wo["id"])) == PUSHED
+    assert not invariants.sha_unrecorded_rejudge_spent(store, row)
+    assert invariants.SHA_UNRECORDED_SPENT_BLOCKER not in invariants.true_blockers(
+        store, row)
+
+
+def test_a_head_that_moved_past_the_spent_one_is_re_judged_not_flagged(
+        fleet, project, fake_gh):
+    """The branch moved to a commit the OS has not judged"""
+    store, wo = unrecorded(project)
+    artifact(fake_gh, head_oid=PUSHED)
+    poll(fleet, store)
+    judge(fleet, store, Panel("passed"))
+    store.set_validation_head(store.latest_validation_round(wo_id=wo["id"])["id"], "")
+    artifact(fake_gh, head_oid=AGAIN)
+
+    poll(fleet, store)
+
+    payloads = forced_payloads(store, wo)
+    assert [p["head_sha"] for p in payloads] == [PUSHED, AGAIN]
+    row = store.get_work_order(wo["id"])
+    assert row["status"] == "validating"
+    assert invariants.SHA_UNRECORDED_SPENT_BLOCKER not in invariants.true_blockers(
+        store, row)
+
+
+@pytest.mark.parametrize("checks,assumption", [(RED, False), (GREEN, True)])
+def test_an_unrecorded_head_on_a_pull_request_that_is_not_ready_is_left_alone(
+        fleet, project, fake_gh, checks, assumption):
+    """`automerge.only_the_head_moved` is reused unchanged"""
+    store, wo = unrecorded(project)
+    if assumption:
+        store.add_assumption(wo["id"], "the exporter writes CSV")
+    artifact(fake_gh, head_oid=PUSHED, checks=checks)
+
+    poll(fleet, store)
+
+    assert rounds_of(store, wo) == [1]
+    assert not store.events_of_kind(wo["id"], "validation_forced")
+    assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
+
+
+def test_the_unrecorded_decline_reaches_the_user_with_its_own_sentence(
+        tmp_path, project, jarvis_home, fake_claude, fake_gh):
+    """The second defect in the chain"""
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = unrecorded(project, rounds=2)
+    artifact(fake_gh, head_oid=PUSHED)
+
+    poll(fleet, store)
+
+    declined = store.events_of_kind(wo["id"], invariants.REJUDGE_DECLINED_EVENT)
+    assert len(declined) == 1
+    assert db.from_json(declined[0]["payload"], {})["cause"] == ops.REJUDGE_BUDGET_SPENT
+    row = store.get_work_order(wo["id"])
+    assert invariants.sha_unrecorded_exhausted(store, row)
+    blockers = invariants.true_blockers(store, row)
+    assert invariants.SHA_UNRECORDED_BLOCKER in blockers
+    assert invariants.SHA_MOVED_BLOCKER not in blockers
+    assert invariants.REBIND_EXHAUSTED_BLOCKER not in blockers
+
+    # ...and it self-clears: the user spends the round the machine left them
+    ops.force_validation(wo["id"], reason="I read the pull request myself")
+    judge(fleet, store, Panel("passed"))
+    poll(fleet, store)
+
+    row = store.get_work_order(wo["id"])
+    assert not invariants.sha_unrecorded_exhausted(store, row)
+    assert invariants.SHA_UNRECORDED_BLOCKER not in invariants.true_blockers(store, row)
+
+
+def test_the_unrecorded_reason_never_claims_the_head_moved(fleet, project, fake_gh):
+    """`REJUDGE_FORCED_REASON` renders "round 1 passed on"""
+    store, wo = unrecorded(project)
+    artifact(fake_gh, head_oid=PUSHED)
+
+    poll(fleet, store)
+
+    stored = store.latest_validation_round(wo_id=wo["id"])["forced_reason"]
+    payload = forced_payloads(store, wo)[0]
+    for text in (stored, payload["reason"]):
+        assert "moved" not in text and "older" not in text
+        assert "passed on" not in text and "judged  " not in text
+        assert PUSHED[:10] in text
+
+
+@pytest.mark.parametrize("outcome", ["rejected", "failed", "pending"])
+def test_a_round_that_never_passed_is_still_never_re_judged(fleet, project, fake_gh,
+                                                            outcome):
+    """REGRESSION LOCK on the exclusion"""
+    store, wo = unrecorded(project, outcome=outcome)
+    artifact(fake_gh, head_oid=PUSHED)
+
+    poll(fleet, store)
+
+    assert rounds_of(store, wo) == [1]
+    assert not store.events_of_kind(wo["id"], "validation_forced")
+    held = store.events_of_kind(wo["id"], "automerge_held")
+    assert db.from_json(held[-1]["payload"], {})["code"] == automerge.HELD_NOT_PASSED
