@@ -181,14 +181,7 @@ class NeoStore:
         self._migrate()
 
     def _migrate(self) -> None:
-        for table, columns in ADDED_COLUMNS.items():
-            have = {
-                r["name"]
-                for r in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
-            }
-            for name, decl in columns.items():
-                if name not in have:
-                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+        db.add_missing_columns(self.conn, ADDED_COLUMNS)
 
     def close(self) -> None:
         self.conn.close()
