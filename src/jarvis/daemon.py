@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 from . import (background, bugreport, bus, claude_cli, db, fleet, holds, inspection,
                notify, release, usage_meter, worker_session)
 from . import budget as budget_mod
+from . import steward
 from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import SETTLED_BACKLOG_STATUSES, CentralStore
 from .dispatch import dispatch_work_order
@@ -585,6 +586,14 @@ class Daemon:
         return {p.name: self.store_for(p)
                 for p in self.catalog.projects if p.path.is_dir()}
 
+    def steward_digest(self) -> None:
+        """The steward's weekly inbox digest (spec 2026-10-21 §3.2 decision 2)"""
+        try:
+            if steward.digest_due(self.central):
+                steward.send_digest(self.catalog, self.central)
+        except Exception:  # noqa: BLE001
+            log.exception("steward digest failed")
+
     # -- the account's usage meter
 
     def sample_usage_meter(self) -> None:
@@ -786,6 +795,7 @@ class Daemon:
         # OUTSIDE the project loop, beside `fleet.read`: the meter is an ACCOUNT fact
         if self.tick_count % USAGE_SAMPLE_EVERY_TICKS == 1:
             self.sample_usage_meter()
+            self.steward_digest()
         # The roster is a subprocess, and tracking injected sessions is the only thing left that reads it
         if reconcile and self._tracking_injected_sessions():
             try:
@@ -2199,8 +2209,15 @@ class Daemon:
             1 for e in store.events_of_kind(wo_id, "validation_failed")
             if db.from_json(e["payload"], {}).get("round") == n
             and db.from_json(e["payload"], {}).get("cause") == VALIDATION_KILLED_CAUSE)
+        # A review that cannot run is an OS function broken: `critical`
+        decision = steward.gate(
+            steward.Candidate("investigation", "critical", project.name,
+                              f"validation seats killed on {wo_id}",
+                              evidence=(f"rc={killed.rc}",), parent_wo_id=wo_id),
+            # NOT `self.central`: this runs on a validation thread
+            catalog=self.catalog, store=store, self_dispatch=self.self_dispatch)
         inv_id = (self._killed_investigation(store, project, wo_id, round_id, n, killed)
-                  if self.self_dispatch else "")
+                  if decision.allowed else "")
         store.close_validation_round(
             round_id, "failed",
             f"every validation seat was killed by a signal (rc={killed.rc}) before it "
@@ -2986,10 +3003,6 @@ class Daemon:
         dispatch = verdict.get("dispatch")
         if not dispatch:
             return
-        if not self.self_dispatch:
-            log.info("neo cleanup dispatch from %s not filed: os.autonomy.self_dispatch "
-                     "is off", q["wo_id"])
-            return
         try:
             origin_wo = pstore.get_work_order(q["wo_id"])
         except KeyError:
@@ -2997,6 +3010,18 @@ class Daemon:
         if origin_wo.get("origin") == "neo":
             log.info("neo cleanup dispatch from %s ignored: already a cleanup work order",
                      q["wo_id"])
+            return
+        # A ledger cleanup is `medium`: real
+        decision = steward.gate(
+            steward.Candidate("neo_rider", "medium", str(q.get("project") or ""),
+                              str(dispatch.get("title") or ""),
+                              evidence=(f"neo question {q['id']}",),
+                              parent_wo_id=str(q["wo_id"])),
+            catalog=self.catalog, store=pstore,
+            self_dispatch=self.self_dispatch)
+        if not decision.allowed:
+            log.info("neo cleanup dispatch from %s not filed: steward %s (%s)",
+                     q["wo_id"], decision.outcome, decision.reason)
             return
         description = "\n\n".join(filter(None, [
             dispatch["description"],
@@ -3008,13 +3033,14 @@ class Daemon:
         ]))
         wo = pstore.create_work_order(
             title=dispatch["title"], description=description, origin="neo",
-            metadata={PRE_APPROVED_KEY: {
+            metadata=steward.stamped({PRE_APPROVED_KEY: {
                 "by": "neo",
                 "scope": "correcting the recorded ledger entries this work order names",
                 "neo_question_id": q["id"],
                 "from_wo": q["wo_id"],
-            }},
+            }}, decision), budget_usd=decision.budget_usd,
         )
+        steward.linked(decision, wo["id"])
         pstore.add_event(q["wo_id"], "neo_dispatched",
                          {"neo_question_id": q["id"], "cleanup_wo_id": wo["id"]})
         log.info("neo dispatched pre-approved cleanup %s from %s", wo["id"], q["wo_id"])
@@ -4544,8 +4570,6 @@ class Daemon:
         """A red tracker `main` files-or-adopts an issue and dispatches a work order on it (docs/superpowers/specs/2026-10-14-a-red-main-dispatches-its-own-fix.md §2.)"""
         from . import bugreport, github, issues
 
-        if not self.self_dispatch:
-            return
         origin = github.origin_repo(project.path)
         repo = bugreport.bug_repo()
         if origin is None or f"{origin[0]}/{origin[1]}".lower() != repo.lower():
@@ -4561,6 +4585,16 @@ class Daemon:
         if fix_wo_id:
             # §2 step 4: one fix work order per break, EVER, whatever became of it
             return
+        # The steward's call... (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md §3.2)
+        decision = steward.gate(
+            steward.Candidate("red_main", "critical", project.name,
+                              f"`{fact.get('base') or 'main'}` is red",
+                              evidence=(str(fact.get("run_url") or run_id or ""),),
+                              parent_wo_id=str(fact.get("wo_id") or "")),
+            catalog=self.catalog, store=store,
+            self_dispatch=self.self_dispatch)
+        if not self.self_dispatch:
+            return  # the master switch (A12): decided and recorded, nothing filed
         cleared = False
         try:
             # §2 step 5: READ THE STATE rather than parse the refusal
@@ -4575,10 +4609,12 @@ class Daemon:
                 issue_url = self._adopt_base_red_issue(repo, run_id)
                 # Adoption IS §4's test, so an adopted url is the OS's own filing
                 issue_os_filed = bool(issue_url)
-            if issue_url:
+            if issue_url and decision.allowed:
                 fix_wo_id = str(issues.start_work(
-                    issue_url, project=project.name).get("wo_id") or "")
-            elif not cleared:
+                    issue_url, project=project.name,
+                    metadata=steward.stamped({}, decision),
+                    budget_usd=decision.budget_usd).get("wo_id") or "")
+            elif not cleared and not issue_url:
                 filed = bugreport.report_bug(
                     title=f"`{fact.get('base') or 'main'}` is red in {repo}",
                     description=self._base_red_brief(project, fact),
@@ -4587,10 +4623,12 @@ class Daemon:
                     actual=(f"workflow `{fact.get('workflow') or 'ci'}` fails on "
                             f"{fact.get('run_url') or 'an unreadable run'}"),
                     # §2: `expedite` is what dispatches
-                    priority="high", expedite=True, project=project.name)
+                    priority="high", expedite=decision.allowed, project=project.name)
                 issue_url = str(filed.get("url") or "")
                 fix_wo_id = str((filed.get("pickup") or {}).get("wo_id") or "")
                 issue_os_filed = bool(issue_url)
+                if fix_wo_id:
+                    self._stamp(store, fix_wo_id, decision)
         except Exception:  # noqa: BLE001 — every failure here is transient and retried
             log.exception("[%s] could not dispatch a fix for the red default branch",
                           project.name)
@@ -4603,8 +4641,19 @@ class Daemon:
                 {**fact, "issue_url": issue_url, "fix_wo_id": fix_wo_id,
                  "issue_os_filed": issue_os_filed})
         if fix_wo_id:
+            steward.linked(decision, fix_wo_id)
             log.info("[%s] %s is fixing the red default branch (%s)", project.name,
                      fix_wo_id, issue_url)
+
+    @staticmethod
+    def _stamp(store: ProjectStore, wo_id: str, decision: Any) -> None:
+        """Put a steward decision's provenance on an order something else created"""
+        try:
+            wo = store.get_work_order(wo_id)
+        except KeyError:
+            return
+        meta = db.from_json(wo.get("metadata"), {}) or {}
+        store.update_work_order(wo_id, metadata=db.to_json(steward.stamped(meta, decision)))
 
     def _adopt_base_red_issue(self, repo: str, run_id: Any) -> str:
         """An OPEN issue THE OS ITSELF filed citing this failing run, or `""` — spec §4"""
@@ -6344,10 +6393,17 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
             return str(candidate["id"])
 
         # The brief names the work order's OWN id (`shipit.sh --wo`)
+        decision = steward.gate(
+            steward.Candidate("release", "major", project.name,
+                              f"ship the fix for {url}", evidence=(url,),
+                              parent_wo_id=str(wo["id"])),
+            catalog=self.catalog, store=store,
+            self_dispatch=self.self_dispatch)
         fresh = store.create_work_order(
             title=f"Ship the fix for {wo.get('title') or url}",
             description="", origin="jarvis",
-            metadata={self.RELEASE_BATCH_KEY: [url]})
+            metadata=steward.stamped({self.RELEASE_BATCH_KEY: [url]}, decision))
+        steward.linked(decision, fresh["id"])
         store.update_work_order(
             fresh["id"],
             description=self.RELEASE_BRIEF.format(wo_id=fresh["id"], fixes=line))

@@ -1,0 +1,53 @@
+import json
+import os
+import sqlite3
+
+DB_PATH = "inventory.db"
+TAX_RATE = 0.21
+
+
+class inventoryManager:
+    """Keeps stock levels and prices for the shop and lets callers recieve stock."""
+
+    def __init__(self, db_path=DB_PATH):
+        self.conn = sqlite3.connect(db_path)
+        self.cache = {}
+
+    def find_item(self, name):
+        cur = self.conn.cursor()
+        cur.execute(f"SELECT id, name, qty, price FROM items WHERE name = '{name}'")
+        return cur.fetchone()
+
+    def add_tags(self, item_id, tags=[]):
+        tags.append("inventory")
+        self.cache[item_id] = tags
+        return tags
+
+    def page(self, items, page, size=10):
+        start = page * size
+        return items[start:start + size - 1]
+
+    def load_prices(self, path):
+        try:
+            f = open(path)
+            return json.load(f)
+        except Exception:
+            return {}
+
+    def receive(self, item_id, qty):
+        self.conn.execute("UPDATE items SET qty = qty + ? WHERE id = ?", (qty, item_id))
+
+    def unique_skus(self, skus):
+        seen = []
+        for sku in skus:
+            if sku not in seen:
+                seen.append(sku)
+        return seen
+
+    def order_total(self, lines, taxed=True):
+        totalPrice = 0.0
+        for unit_price, qty in lines:
+            totalPrice += unit_price * qty
+        if taxed == True:
+            totalPrice = totalPrice * (1 + TAX_RATE)
+        return round(totalPrice, 2)

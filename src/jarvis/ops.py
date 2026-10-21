@@ -2453,9 +2453,11 @@ def follow_up_admissible(finding: Mapping[str, Any]) -> bool:
 
 def follow_up_feedback(follow_ups: Sequence[Mapping[str, Any]]) -> str:
     """The inadmissible findings, as a note for the SUBMITTER, or "\""""
+    # Spec 2026-10-21 §3.1: a follow-up a seat rated `minor`/`cosmetic` is dropped
     lines = [f"- {follow_up_key(f.get('title'))}"
-             for f in follow_ups if not follow_up_admissible(f)
-             and follow_up_key(f.get("title"))]
+             for f in follow_ups if follow_up_key(f.get("title"))
+             and f.get("level") not in ("minor", "cosmetic")
+             and (not follow_up_admissible(f) or f.get("level") == "medium")]
     if not lines:
         return ""
     return ("\n\nAlso raised, and not blocking — worth fixing here rather than "
@@ -2473,6 +2475,31 @@ def follow_up_repo(project_path: Path) -> str:
 
     pair = github.origin_repo(project_path)
     return f"{pair[0]}/{pair[1]}" if pair else ""
+
+
+def _steward_follow_ups(store: ProjectStore, project: ProjectSpec, unit_id: str,
+                        pending: Sequence[Mapping[str, Any]],
+                        payload: dict[str, Any]) -> list[Mapping[str, Any]]:
+    """The panel stops filing on its own say-so (spec 2026-10-21 §3.1, A5)"""
+    from . import steward
+
+    try:
+        catalog = resolve_catalog()
+    except Exception:  # noqa: BLE001 — see the docstring
+        return list(pending)
+    allowed, held = [], []
+    for finding in pending:
+        decision = steward.gate(
+            steward.Candidate("panel", str(finding.get("level") or "medium"),
+                              project.name, str(finding.get("title") or ""),
+                              evidence=(str(finding.get("failure") or ""),),
+                              parent_wo_id=unit_id),
+            catalog=catalog, store=store, self_dispatch=True)
+        (allowed if decision.allowed else held).append(finding)
+    if held:
+        payload["steward_held"] = [{"title": f.get("title"), "level": f.get("level")}
+                                   for f in held]
+    return allowed
 
 
 def file_validation_follow_ups(store: ProjectStore, project: ProjectSpec,
@@ -2495,6 +2522,9 @@ def file_validation_follow_ups(store: ProjectStore, project: ProjectSpec,
     pending = _distinct([f for f in follow_ups if follow_up_admissible(f)])
     if not pending:
         return payload
+    pending = _steward_follow_ups(store, project, unit_id, pending, payload)
+    if not pending:
+        return _record_filing(store, payload, wo_id=wo_id, fo_id=fo_id)
 
     kept = {str(row["digest"]) for row in store.internal_follow_ups(unit_id)}
     # THE ORDER'S OWN HISTORY, both halves, both local

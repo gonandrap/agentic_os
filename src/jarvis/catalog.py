@@ -39,6 +39,11 @@ SAFETY_KEYS = (
     "*.schedule.*",
     # Files work nobody typed: same class of act as the scheduler
     "os.autonomy.*",
+    # How much of that the steward may spend, and how deep it may go (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md)
+    "os.evolution.weekly_usd", "os.evolution.critical_weekly_usd",
+    "os.evolution.yield_above_usd", "os.evolution.order_budget_usd",
+    "os.evolution.max_depth", "os.evolution.*_min_refs", "os.evolution.min_precision",
+    "os.evolution.mode",
     # What the OS is permitted to WATCH (docs/superpowers/specs/2026-09-27-self-evolution.md)
     "*.rules.*",
 )
@@ -829,12 +834,34 @@ class RemedyConfig:
 #: How many samples a median in the evolution report needs before it is reported as one (§9 of... (docs/superpowers/specs/2026-09-27-self-evolution.md)
 DEFAULT_EVOLUTION_MIN_SAMPLES = 3
 
+#: The steward's ledger (§3.3 of... (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md)
+DEFAULT_EVOLUTION_WEEKLY_USD = 150.0
+DEFAULT_EVOLUTION_CRITICAL_WEEKLY_USD = 60.0
+DEFAULT_EVOLUTION_YIELD_ABOVE_USD = 900.0
+DEFAULT_EVOLUTION_ORDER_BUDGET_USD = 25.0
+DEFAULT_EVOLUTION_MAX_DEPTH = 1
+DEFAULT_EVOLUTION_MAJOR_MIN_REFS = 1
+DEFAULT_EVOLUTION_MEDIUM_MIN_REFS = 3
+DEFAULT_EVOLUTION_MIN_PRECISION = 0.2
+#: `shadow` decides and records but changes no dispatch; `enforce` applies the decision
+EVOLUTION_MODES = ("shadow", "enforce")
+
 
 @dataclass
 class EvolutionConfig:
     """What the §9 evolution report needs before it believes its own numbers.... (docs/superpowers/specs/2026-09-27-self-evolution.md)"""
 
     min_samples: int = DEFAULT_EVOLUTION_MIN_SAMPLES
+    # The steward (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md...
+    weekly_usd: float = DEFAULT_EVOLUTION_WEEKLY_USD
+    critical_weekly_usd: float = DEFAULT_EVOLUTION_CRITICAL_WEEKLY_USD
+    yield_above_usd: float = DEFAULT_EVOLUTION_YIELD_ABOVE_USD
+    order_budget_usd: float = DEFAULT_EVOLUTION_ORDER_BUDGET_USD
+    max_depth: int = DEFAULT_EVOLUTION_MAX_DEPTH
+    major_min_refs: int = DEFAULT_EVOLUTION_MAJOR_MIN_REFS
+    medium_min_refs: int = DEFAULT_EVOLUTION_MEDIUM_MIN_REFS
+    min_precision: float = DEFAULT_EVOLUTION_MIN_PRECISION
+    mode: str = "shadow"
 
 
 @dataclass
@@ -1594,7 +1621,27 @@ def _parse_evolution(raw: Any, base: EvolutionConfig | None = None,
     min_samples = int(raw.get("min_samples", base.min_samples))
     if min_samples < 1:
         raise _err(f"{where}.min_samples must be 1 or more, got {min_samples}")
-    return EvolutionConfig(min_samples=min_samples)
+    money = {}
+    for key in ("weekly_usd", "critical_weekly_usd", "yield_above_usd", "order_budget_usd"):
+        value = float(raw.get(key, getattr(base, key)))
+        if value < 0:
+            raise _err(f"{where}.{key} must be 0 or more, got {value}")
+        money[key] = value
+    # `critical_weekly_usd` above `weekly_usd` is not refused: the steward checks both
+    counts = {}
+    for key in ("max_depth", "major_min_refs", "medium_min_refs"):
+        value = int(raw.get(key, getattr(base, key)))
+        if value < 0:
+            raise _err(f"{where}.{key} must be 0 or more, got {value}")
+        counts[key] = value
+    min_precision = float(raw.get("min_precision", base.min_precision))
+    if not 0 <= min_precision <= 1:
+        raise _err(f"{where}.min_precision must be between 0 and 1, got {min_precision}")
+    mode = str(raw.get("mode", base.mode))
+    if mode not in EVOLUTION_MODES:
+        raise _err(f"{where}.mode must be one of {list(EVOLUTION_MODES)}, got {mode!r}")
+    return EvolutionConfig(min_samples=min_samples, min_precision=min_precision,
+                           mode=mode, **money, **counts)
 
 
 def _parse_concision(raw: Any, base: ConcisionConfig | None = None,
