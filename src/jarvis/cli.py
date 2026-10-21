@@ -735,6 +735,21 @@ def build_parser() -> argparse.ArgumentParser:
                                       "bug repository)")
     sp.add_argument("--json", action="store_true")
 
+    # docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md
+    steward = sub.add_parser(
+        "steward",
+        help="what the OS may spend on itself: the ledger, and every decision with its rule",
+    ).add_subparsers(dest="steward_cmd", required=True)
+    sp = steward.add_parser("ledger", help="this week's evolution spend against the cap")
+    sp.add_argument("--json", action="store_true")
+    sp = steward.add_parser("decisions", help="every decision, newest first")
+    sp.add_argument("--limit", type=int, default=30)
+    sp.add_argument("--json", action="store_true")
+    sp = steward.add_parser("why", help="the decisions that led to, or came from, one order")
+    sp.add_argument("wo_id")
+    sp.add_argument("--json", action="store_true")
+    sp = steward.add_parser("digest", help="the weekly digest, now (sends nothing)")
+
     # `jarvis alarms` and `jarvis alarms <project>` are the two spellings that already
     # exist, and a bare positional cannot coexist with a subparser group — argparse
     # would read `proj_a` as an unknown subcommand. So the group is the only positional
@@ -2981,6 +2996,59 @@ def cmd_issues(args: argparse.Namespace) -> int:
         who = ", ".join(f"{u['unit_id']} ({u['kind']})" for u in row["units"])
         print(f"     {who}")
     return 0
+
+
+def cmd_steward(args: argparse.Namespace) -> int:
+    """`jarvis steward …` — read-only views of the steward's ledger and decisions."""
+    from dataclasses import asdict
+
+    from . import ops, steward
+    from .central_store import CentralStore
+
+    catalog = ops.resolve_catalog()
+    central = CentralStore()
+    try:
+        if args.steward_cmd == "digest":
+            print(steward.render_digest(steward.digest(catalog, central)))
+            return 0
+        if args.steward_cmd == "ledger":
+            cfg = catalog.os.evolution
+            book = steward.ledger(catalog, central)
+            if args.json:
+                print(json.dumps({"mode": cfg.mode, **asdict(book),
+                                  "weekly_usd": cfg.weekly_usd,
+                                  "critical_weekly_usd": cfg.critical_weekly_usd,
+                                  "yield_above_usd": cfg.yield_above_usd}))
+                return 0
+            print(f"mode {cfg.mode}; self_dispatch "
+                  f"{'on' if catalog.os.autonomy.self_dispatch else 'off'}")
+            print(f"evolution  ${book.evolution_usd:8.2f} of ${cfg.weekly_usd:.2f}")
+            print(f"critical   ${book.critical_usd:8.2f} of ${cfg.critical_weekly_usd:.2f}")
+            print(f"fleet      ${book.fleet_usd:8.2f} (new self-work waits above "
+                  f"${cfg.yield_above_usd:.2f})")
+            return 0
+        rows = (central.steward_decisions(wo_id=args.wo_id) if args.steward_cmd == "why"
+                else central.steward_decisions(limit=args.limit))
+        if args.json:
+            print(json.dumps(rows))
+            return 0
+        if not rows:
+            print("no steward decisions" + (f" about {args.wo_id}"
+                                            if args.steward_cmd == "why" else ""))
+            return 0
+        for r in rows:
+            applied = "applied" if r["applied"] else r["mode"]
+            to = f" -> {r['wo_id']}" if r["wo_id"] else ""
+            print(f"#{r['id']} {_age(r['ts'])} ago [{r['outcome']}/{applied}] "
+                  f"{r['origin_kind']} {r['severity']}"
+                  + (f" (claimed {r['claimed_severity']})"
+                     if r["claimed_severity"] and r["claimed_severity"] != r["severity"]
+                     else "")
+                  + f" gen {r['generation']}: {r['subject'][:80]}{to}")
+            print(f"    {r['rule']}: {r['reason']}")
+        return 0
+    finally:
+        central.close()
 
 
 def cmd_alarms(args: argparse.Namespace) -> int:
@@ -5834,6 +5902,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_watch(args)
         if args.cmd == "alarms":
             return cmd_alarms(args)
+        if args.cmd == "steward":
+            return cmd_steward(args)
         if args.cmd == "stuck":
             return cmd_stuck(args)
         if args.cmd == "search":

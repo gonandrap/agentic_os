@@ -1323,3 +1323,42 @@ def test_a_seat_that_anchors_nothing_files_nothing(fleet, tracker, fake_claude):
 
     assert titles(tracker) == []
     assert kept_rows(fleet, wo["id"]) == [], "inadmissible is not the same as withheld"
+
+
+# -- the steward (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md §3.1)
+
+
+def _rated(title: str, level: str) -> dict:
+    return {"seat": "tester", "title": title, "detail": "d", "round": 1, "level": level,
+            "file": "src/proj/a.py", "symbol": "run",
+            "failure": "returns None instead of raising"}
+
+
+def _enforcing(monkeypatch):
+    cat = ops.resolve_catalog()
+    cat.os.evolution.mode = "enforce"
+    monkeypatch.setattr(ops, "resolve_catalog", lambda *a, **k: cat)
+
+
+def test_shadow_files_every_rated_follow_up_as_before(fleet, tracker):
+    wo = judged(fleet, "passed")
+    settle_again(fleet, wo["id"], [_rated("Rename the helper", "cosmetic")])
+    assert "Rename the helper" in titles(tracker)
+
+
+def test_enforced_the_panel_files_no_minor_cosmetic_or_lone_medium(fleet, tracker,
+                                                                    monkeypatch):
+    wo = judged(fleet, "passed")
+    before = titles(tracker)
+    _enforcing(monkeypatch)
+    out = settle_again(fleet, wo["id"], [_rated("Rename the helper", "cosmetic"),
+                                         _rated("Drop the unused import", "minor"),
+                                         _rated("A silent empty price list", "medium")])
+    assert titles(tracker) == before
+    assert {h["level"] for h in out["steward_held"]} == {"cosmetic", "minor", "medium"}
+
+
+def test_a_medium_goes_back_to_the_coder_and_a_cosmetic_does_not():
+    note = ops.follow_up_feedback([_rated("A silent empty price list", "medium"),
+                                   _rated("Rename the helper", "cosmetic")])
+    assert "A silent empty price list" in note and "Rename the helper" not in note

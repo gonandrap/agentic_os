@@ -152,6 +152,8 @@ not release anything yourself."""
 #: `_apply_file_work_order`'s refusal, hoisted to module level so §11's entry point can
 #: state it BEFORE a grant is filed instead of after one was spent — one home for the rule,
 #: because a second copy passes every behavioural test and drifts anyway (kn-4ea33fe6).
+STEWARD_REFUSED = ("{origin} proposed `file_work_order`, and the steward declined: "
+                   "{reason}")
 SELF_DISPATCH_OFF = ("{origin} proposed `file_work_order`, but os.autonomy.self_dispatch is "
                      "off: an alarm files no work nobody typed — nothing was done")
 NO_ARGUMENT = ("{origin} proposed `file_work_order` with no argument — there is nothing "
@@ -668,14 +670,31 @@ def _apply_file_work_order(pstore: Any, central: Any, project: str,
     """
     from . import ops
 
+    from . import steward
     from .issues import self_dispatch_configured
 
     argument = intent.argument
     origin = intent.alarm_id or intent.subject_id
     if not argument:
         raise RemedyRefused(NO_ARGUMENT.format(origin=origin))
-    if intent.alarm_id is not None and not self_dispatch_configured():
-        raise RemedyRefused(SELF_DISPATCH_OFF.format(origin=origin))
+    decision = None
+    if intent.alarm_id is not None:
+        # An alarm-born fix is work nobody typed: the steward's call (spec 2026-10-21
+        # §3.2), the alarm its evidence. A user-named subject is the user's decision.
+        from .ops import resolve_catalog
+
+        switch = self_dispatch_configured()
+        decision = steward.gate(
+            steward.Candidate("remedy", "major", project, _title_from(argument),
+                              evidence=(f"alarm {intent.alarm_id}",)),
+            catalog=resolve_catalog(), self_dispatch=switch)
+        if not switch:
+            raise RemedyRefused(SELF_DISPATCH_OFF.format(origin=origin))
+        if not decision.allowed:
+            raise RemedyRefused(STEWARD_REFUSED.format(origin=origin,
+                                                       reason=decision.reason))
+    stamp: dict[str, Any] = {"metadata": steward.stamped({}, decision),
+                             "budget_usd": decision.budget_usd} if decision else {}
     reason = intent.reason.strip()
     # §11: the alarm brief sends the worker to `jarvis alarms show`, which is a row that
     # does not exist when the user asked. See `USER_FIX_BRIEF`.
@@ -688,14 +707,17 @@ def _apply_file_work_order(pstore: Any, central: Any, project: str,
                                       argument=argument)
         ship_title = USER_SHIP_TITLE.format(subject_id=intent.subject_id)
     try:
-        fix = ops.create_work_order(project, _title_from(argument), description=brief)
+        fix = ops.create_work_order(project, _title_from(argument), description=brief,
+                                    **stamp)
+        if decision:
+            steward.linked(decision, fix["id"])
     except ops.OpsError as exc:
         raise RemedyRefused(str(exc)) from exc
     try:
         ship = ops.create_work_order(
             project, ship_title,
             description=SHIP_BRIEF.format(fix_id=fix["id"], reason=reason),
-            depends_on=[fix["id"]])
+            depends_on=[fix["id"]], **stamp)
     except ops.OpsError as exc:
         log.warning("filed %s for %s but could not file its ship order: %s",
                     fix["id"], origin, exc)

@@ -782,9 +782,19 @@ def _parsed_findings(data: Mapping[str, Any]) -> list[dict[str, str]]:
         if not title and not detail:
             continue
         severity = BLOCKER if item.get("severity") == BLOCKER else FOLLOW_UP
-        out.append({"severity": severity, "title": title, "detail": detail,
-                    **_anchor(item)})
+        found = {"severity": severity, "title": title, "detail": detail, **_anchor(item)}
+        level = str(item.get("level") or "").strip().lower()
+        if severity == FOLLOW_UP and level:
+            # Spec 2026-10-21 §3.1: how much a follow-up is worth. Only carried when the
+            # seat said, so a reply on the older schema reads exactly as it did.
+            found["level"] = level if level in FOLLOW_UP_LEVELS else "medium"
+        out.append(found)
     return out
+
+
+#: A follow-up's worth on the steward's scale (spec 2026-10-21 §3.0); `major` and above
+#: is a blocker.
+FOLLOW_UP_LEVELS = ("medium", "minor", "cosmetic")
 
 
 #: What a follow-up must name before it can become a tracker issue, carried on the
@@ -1185,7 +1195,8 @@ def _follow_ups(opinions: Sequence[seats.Opinion], round_no: int) -> list[dict[s
         row = {"seat": op.seat, "status": op.status, "reply": op.raw}
         out += [{"seat": op.seat, "title": f["title"], "detail": f["detail"],
                  "round": round_no,
-                 **{k: f.get(k, "") for k in ANCHOR_KEYS}}
+                 **{k: f.get(k, "") for k in ANCHOR_KEYS},
+                 **({"level": f["level"]} if f.get("level") else {})}
                 for f in follow_ups(findings(row))]
     return out
 

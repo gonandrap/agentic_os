@@ -90,8 +90,8 @@ Two or three sentences of `reason`. A long one buries the sentence that mattered
 
 STRICT JSON, nothing else.
 
-  {"verdict": "pass", "blocking": false, "reason": "<one line: nothing here blocks>", "asks": [], "findings": [{"severity": "follow_up", "title": "<one line>", "detail": "<...>", "file": "<the path the wrong behaviour is in>", "symbol": "<the function or class, if one>", "failure": "<concrete inputs or state -> wrong output>"}]}
-  {"verdict": "reject", "blocking": false, "reason": "<what does not fit, addressed to the submitter>", "asks": ["<a concrete thing to change>", "..."], "findings": [{"severity": "blocker", "title": "<one line>", "detail": "<what is wrong and what would satisfy it>"}, {"severity": "follow_up", "title": "<one line>", "detail": "<...>", "file": "<the path the wrong behaviour is in>", "symbol": "<the function or class, if one>", "failure": "<concrete inputs or state -> wrong output>"}]}
+  {"verdict": "pass", "blocking": false, "reason": "<one line: nothing here blocks>", "asks": [], "findings": [{"severity": "follow_up", "level": "medium|minor|cosmetic", "title": "<one line>", "detail": "<...>", "file": "<the path the wrong behaviour is in>", "symbol": "<the function or class, if one>", "failure": "<concrete inputs or state -> wrong output>"}]}
+  {"verdict": "reject", "blocking": false, "reason": "<what does not fit, addressed to the submitter>", "asks": ["<a concrete thing to change>", "..."], "findings": [{"severity": "blocker", "title": "<one line>", "detail": "<what is wrong and what would satisfy it>"}, {"severity": "follow_up", "level": "medium|minor|cosmetic", "title": "<one line>", "detail": "<...>", "file": "<the path the wrong behaviour is in>", "symbol": "<the function or class, if one>", "failure": "<concrete inputs or state -> wrong output>"}]}
 
 ## WHAT MAKES A FINDING A BLOCKER
 
@@ -114,6 +114,15 @@ Any `severity` that is not exactly `blocker` is read as `follow_up`. `title` is 
 under 100 characters naming the file or the symbol, and becomes the ticket's title; `detail`
 says what is wrong and what would satisfy it, and becomes the ticket's description. Write
 one entry per separate point, whichever severity it carries.
+
+## HOW MUCH A `follow_up` IS WORTH
+
+Every follow-up you file becomes paid work for an engineer, and the budget for it is small.
+Rate each one with `level`: `medium` — a real defect a user or operator would eventually
+notice (wrong result, lost data, a silent failure); `minor` — hygiene that changes no
+behaviour; `cosmetic` — naming, typos, style. Only `medium` is ever filed; `minor` and
+`cosmetic` are counted and dropped, so do not inflate a rating to get one filed — the
+`failure` you name is checked against it. Filing nothing is a good answer.
 
 ## WHAT A `follow_up` MUST NAME, OR IT IS NOT ONE
 

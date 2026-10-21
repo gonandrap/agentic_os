@@ -3339,9 +3339,13 @@ def follow_up_feedback(follow_ups: Sequence[Mapping[str, Any]]) -> str:
     docstring or a missing test costs nothing and is fixed in the same session. This is
     where they go instead of the tracker.
     """
+    # Spec 2026-10-21 §3.1: a follow-up a seat rated `minor`/`cosmetic` is dropped, and
+    # one it rated `medium` comes back here too — fixing it in the open session is nearly
+    # free, a follow-up order starts cold. Unrated findings (the older schema) as before.
     lines = [f"- {follow_up_key(f.get('title'))}"
-             for f in follow_ups if not follow_up_admissible(f)
-             and follow_up_key(f.get("title"))]
+             for f in follow_ups if follow_up_key(f.get("title"))
+             and f.get("level") not in ("minor", "cosmetic")
+             and (not follow_up_admissible(f) or f.get("level") == "medium")]
     if not lines:
         return ""
     return ("\n\nAlso raised, and not blocking — worth fixing here rather than "
@@ -3374,6 +3378,38 @@ def follow_up_repo(project_path: Path) -> str:
 
     pair = github.origin_repo(project_path)
     return f"{pair[0]}/{pair[1]}" if pair else ""
+
+
+def _steward_follow_ups(store: ProjectStore, project: ProjectSpec, unit_id: str,
+                        pending: Sequence[Mapping[str, Any]],
+                        payload: dict[str, Any]) -> list[Mapping[str, Any]]:
+    """The panel stops filing on its own say-so (spec 2026-10-21 §3.1, A5).
+
+    Each follow-up is a `panel` candidate at the seat's `level` (default `medium`), its
+    failure scenario the evidence, and the number of orders already referencing an issue
+    of that title its recurrence. Minor and cosmetic are dropped; a medium is filed only
+    when it recurs. Shadow mode files exactly what it filed before. A catalog that cannot
+    be read leaves the list untouched: a steward failure is never a silent change.
+    """
+    from . import steward
+
+    try:
+        catalog = resolve_catalog()
+    except Exception:  # noqa: BLE001 — see the docstring
+        return list(pending)
+    allowed, held = [], []
+    for finding in pending:
+        decision = steward.gate(
+            steward.Candidate("panel", str(finding.get("level") or "medium"),
+                              project.name, str(finding.get("title") or ""),
+                              evidence=(str(finding.get("failure") or ""),),
+                              parent_wo_id=unit_id),
+            catalog=catalog, store=store, self_dispatch=True)
+        (allowed if decision.allowed else held).append(finding)
+    if held:
+        payload["steward_held"] = [{"title": f.get("title"), "level": f.get("level")}
+                                   for f in held]
+    return allowed
 
 
 def file_validation_follow_ups(store: ProjectStore, project: ProjectSpec,
@@ -3438,6 +3474,9 @@ def file_validation_follow_ups(store: ProjectStore, project: ProjectSpec,
     pending = _distinct([f for f in follow_ups if follow_up_admissible(f)])
     if not pending:
         return payload
+    pending = _steward_follow_ups(store, project, unit_id, pending, payload)
+    if not pending:
+        return _record_filing(store, payload, wo_id=wo_id, fo_id=fo_id)
 
     kept = {str(row["digest"]) for row in store.internal_follow_ups(unit_id)}
     # THE ORDER'S OWN HISTORY, both halves, both local. `issue_links_of` is the relation

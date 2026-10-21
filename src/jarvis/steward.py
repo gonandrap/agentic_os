@@ -336,15 +336,22 @@ def gate(c: Candidate, *, catalog: Catalog, store: ProjectStore | None = None,
         decision = Decision(outcome=outcome, rule=rule, reason=reason, severity=severity,
                             claimed_severity=claimed, generation=generation, mode=mode,
                             allowed=allowed, budget_usd=budget_usd)
+        decision.stamp = {"origin_kind": c.origin_kind, "generation": generation,
+                          "severity": severity, "mode": mode}
+        repeat = _repeat_of(central, c, outcome, now)
+        if repeat:
+            # A site the daemon re-asks every tick (a red `main`, a held order) gets ONE
+            # row per hour, not one per tick: the table is read by a person.
+            decision.decision_id = repeat
+            decision.stamp["decision_id"] = repeat
+            return decision
         decision.decision_id = central.record_steward_decision({
             "ts": now, "project": c.project, "origin_kind": c.origin_kind,
             "subject": c.subject[:500], "severity": severity, "claimed_severity": claimed,
             "outcome": outcome, "rule": rule, "reason": reason, "mode": mode,
             "applied": int(allowed and outcome == "dispatch"), "generation": generation,
             "parent_wo_id": c.parent_wo_id, "budget_usd": budget_usd})
-        decision.stamp = {"origin_kind": c.origin_kind, "generation": generation,
-                          "severity": severity, "decision_id": decision.decision_id,
-                          "mode": mode}
+        decision.stamp["decision_id"] = decision.decision_id
         if outcome == "ask" and mode == "enforce" and self_dispatch:
             central.add_inbox(c.project, f"steward: {c.subject[:120]}",
                               f"{reason}. Decide it yourself, or raise "
@@ -355,6 +362,21 @@ def gate(c: Candidate, *, catalog: Catalog, store: ProjectStore | None = None,
     finally:
         if own_central:
             central.close()
+
+
+#: How long an identical decision is not recorded again.
+REPEAT_SECONDS = 3600
+
+
+def _repeat_of(central: CentralStore, c: Candidate, outcome: str,
+               now: float | None) -> int:
+    """The id of the same decision about the same subject in the last hour, or 0."""
+    since = (now if now is not None else db.now()) - REPEAT_SECONDS
+    row = central.conn.execute(
+        "SELECT id FROM steward_decisions WHERE ts>=? AND project=? AND origin_kind=? "
+        "AND subject=? AND outcome=? AND wo_id='' ORDER BY id DESC LIMIT 1",
+        (since, c.project, c.origin_kind, c.subject[:500], outcome)).fetchone()
+    return int(row["id"]) if row else 0
 
 
 def stamped(metadata: Mapping[str, Any] | None, decision: Decision) -> dict[str, Any]:
@@ -378,3 +400,67 @@ def linked(decision: Decision, wo_id: str, central: CentralStore | None = None) 
     finally:
         if own:
             central.close()
+
+
+# ---------------------------------------------------------------- the weekly digest
+
+
+def digest(catalog: Catalog, central: CentralStore, *, now: float | None = None
+           ) -> dict[str, Any]:
+    """§3.2 decision 2's one artefact: spend by detector, what was held back, precision."""
+    now = now if now is not None else db.now()
+    cfg = catalog.os.evolution
+    book = ledger(catalog, central, now=now)
+    rows = central.steward_decisions(now - WINDOW_SECONDS, limit=5000)
+    by_kind: dict[str, dict[str, int]] = {}
+    for row in rows:
+        counts = by_kind.setdefault(row["origin_kind"], {o: 0 for o in OUTCOMES})
+        counts[row["outcome"]] = counts.get(row["outcome"], 0) + 1
+    counts = precision(catalog, now=now)
+    return {"mode": cfg.mode, "ledger": book, "weekly_usd": cfg.weekly_usd,
+            "critical_weekly_usd": cfg.critical_weekly_usd,
+            "yield_above_usd": cfg.yield_above_usd, "by_kind": by_kind,
+            "held": [r for r in rows if r["outcome"] in ("queue", "ask")][:10],
+            "precision": counts, "throttled": sorted(throttled(cfg, counts))}
+
+
+def render_digest(d: Mapping[str, Any]) -> str:
+    book: Ledger = d["ledger"]
+    lines = [f"steward ({d['mode']}): evolution ${book.evolution_usd:.2f} of "
+             f"${d['weekly_usd']:.2f} this week, critical ${book.critical_usd:.2f} of "
+             f"${d['critical_weekly_usd']:.2f}; fleet ${book.fleet_usd:.2f} "
+             f"(new self-work yields above ${d['yield_above_usd']:.2f})"]
+    for kind, counts in sorted(d["by_kind"].items()):
+        lines.append(f"  {kind:<14} " + "  ".join(f"{o} {counts.get(o, 0)}"
+                                                    for o in OUTCOMES))
+    if d["precision"]:
+        lines.append("precision (user touched / dispatched, 28 days):")
+        for kind, (hit, total) in sorted(d["precision"].items()):
+            mark = "  THROTTLED" if kind in d["throttled"] else ""
+            lines.append(f"  {kind:<14} {hit}/{total}{mark}")
+    if d["held"]:
+        lines.append("held back:")
+        lines += [f"  [{r['outcome']}] {r['origin_kind']} {r['severity']}: "
+                  f"{r['subject'][:70]} — {r['rule']}" for r in d["held"]]
+    return "\n".join(lines)
+
+
+#: os_state key holding when the weekly digest last went to the inbox.
+DIGEST_STATE_KEY = "steward_digest_at"
+
+
+def digest_due(central: CentralStore, *, now: float | None = None) -> bool:
+    now = now if now is not None else db.now()
+    return now - float(central.get_state(DIGEST_STATE_KEY) or 0) >= WINDOW_SECONDS
+
+
+def send_digest(catalog: Catalog, central: CentralStore, *, now: float | None = None
+                ) -> int:
+    """One inbox item a week; 0 when the steward decided nothing that week."""
+    now = now if now is not None else db.now()
+    d = digest(catalog, central, now=now)
+    central.set_state(DIGEST_STATE_KEY, str(now))
+    if not d["by_kind"]:
+        return 0
+    return central.add_inbox("", "steward: the week in self-evolution",
+                             render_digest(d), level="info")
