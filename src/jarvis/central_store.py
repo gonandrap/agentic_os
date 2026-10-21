@@ -538,6 +538,30 @@ CREATE TABLE IF NOT EXISTS usage_samples (
 );
 CREATE INDEX IF NOT EXISTS idx_usage_samples_ts ON usage_samples(ts);
 CREATE INDEX IF NOT EXISTS idx_usage_samples_ok ON usage_samples(ok, ts);
+
+-- Every decision the steward made about work the OS proposed for itself: what, why, and
+-- whether it was applied. docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md §3.2.
+-- `applied` is 0 in shadow mode and for any outcome that is not `dispatch`; `outcome` is
+-- what the steward WOULD do either way, so a shadow week reads as the enforced one would.
+CREATE TABLE IF NOT EXISTS steward_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    project TEXT NOT NULL DEFAULT '',
+    origin_kind TEXT NOT NULL,
+    subject TEXT NOT NULL DEFAULT '',
+    severity TEXT NOT NULL,
+    claimed_severity TEXT NOT NULL DEFAULT '',
+    outcome TEXT NOT NULL,                  -- dispatch | queue | drop | ask
+    rule TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    mode TEXT NOT NULL,                     -- shadow | enforce
+    applied INTEGER NOT NULL DEFAULT 0,
+    generation INTEGER NOT NULL DEFAULT 0,
+    parent_wo_id TEXT NOT NULL DEFAULT '',
+    wo_id TEXT NOT NULL DEFAULT '',         -- the order it led to, once one exists
+    budget_usd REAL
+);
+CREATE INDEX IF NOT EXISTS idx_steward_decisions_ts ON steward_decisions(ts);
 CREATE INDEX IF NOT EXISTS idx_os_config_versions_ts ON os_config_versions(ts);
 CREATE INDEX IF NOT EXISTS idx_gate_rules_role ON gate_rules(role, kind);
 CREATE INDEX IF NOT EXISTS idx_inbox_status ON inbox(status);
@@ -726,6 +750,44 @@ class CentralStore:
         return here.name
 
     # -- inbox ------------------------------------------------------------------
+
+    def record_steward_decision(self, row: dict[str, Any]) -> int:
+        """One steward decision (`steward.gate`). Returns its id."""
+        cols = ("project", "origin_kind", "subject", "severity", "claimed_severity",
+                "outcome", "rule", "reason", "mode", "applied", "generation",
+                "parent_wo_id", "wo_id", "budget_usd")
+        cur = self.conn.execute(
+            f"INSERT INTO steward_decisions (ts, {', '.join(cols)}) "
+            f"VALUES (?{', ?' * len(cols)})",
+            (row.get("ts") or db.now(),
+             *(row.get(c, {"applied": 0, "generation": 0, "budget_usd": None}.get(c, ""))
+               for c in cols)))
+        return int(cur.lastrowid)
+
+    def link_steward_decision(self, decision_id: int, wo_id: str) -> None:
+        """Name the order a decision led to, once the caller has created it."""
+        self.conn.execute("UPDATE steward_decisions SET wo_id=? WHERE id=?",
+                          (wo_id, decision_id))
+
+    def steward_decisions(self, since: float = 0.0, *, wo_id: str = "",
+                          limit: int = 500) -> list[dict[str, Any]]:
+        """Decisions newest first, optionally only those about (or leading to) one order."""
+        if wo_id:
+            rows = self.conn.execute(
+                "SELECT * FROM steward_decisions WHERE (wo_id=? OR parent_wo_id=?) "
+                "AND ts>=? ORDER BY id DESC LIMIT ?", (wo_id, wo_id, since, limit))
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM steward_decisions WHERE ts>=? ORDER BY id DESC LIMIT ?",
+                (since, limit))
+        return [dict(r) for r in rows.fetchall()]
+
+    def call_cost_since(self, since: float) -> float:
+        """Everything the OS's own calls cost since `since`, fleet-wide. One indexed sum."""
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0) AS c FROM agent_calls WHERE ts>=?",
+            (since,)).fetchone()
+        return float(row["c"] or 0.0)
 
     def add_inbox(self, project: str, title: str, body: str = "", level: str = "info",
                   wo_id: str | None = None) -> int:

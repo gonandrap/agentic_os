@@ -56,6 +56,13 @@ SAFETY_KEYS = (
     "*.schedule.*",
     # Files work nobody typed: same class of act as the scheduler.
     "os.autonomy.*",
+    # How much of that the steward may spend, and how deep it may go. Same act at a
+    # different magnitude. docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md
+    # `min_samples` is a reporting floor, not spend, so the steward's keys are named.
+    "os.evolution.weekly_usd", "os.evolution.critical_weekly_usd",
+    "os.evolution.yield_above_usd", "os.evolution.order_budget_usd",
+    "os.evolution.max_depth", "os.evolution.*_min_refs", "os.evolution.min_precision",
+    "os.evolution.mode",
     # What the OS is permitted to WATCH — and, once §6 of
     # docs/superpowers/specs/2026-09-27-self-evolution.md lands, the switch everything
     # it is permitted to DO about what it watched hangs off. It is here at the WATCHING stage
@@ -1693,6 +1700,20 @@ class RemedyConfig:
 #: three samples is one sample wearing a statistic's name.
 DEFAULT_EVOLUTION_MIN_SAMPLES = 3
 
+#: The steward's ledger (§3.3 of
+#: docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md).
+#: List-price USD over a rolling 7 days; placeholders sized from the 2026-10-20 measurement.
+DEFAULT_EVOLUTION_WEEKLY_USD = 150.0
+DEFAULT_EVOLUTION_CRITICAL_WEEKLY_USD = 60.0
+DEFAULT_EVOLUTION_YIELD_ABOVE_USD = 900.0
+DEFAULT_EVOLUTION_ORDER_BUDGET_USD = 25.0
+DEFAULT_EVOLUTION_MAX_DEPTH = 1
+DEFAULT_EVOLUTION_MAJOR_MIN_REFS = 1
+DEFAULT_EVOLUTION_MEDIUM_MIN_REFS = 3
+DEFAULT_EVOLUTION_MIN_PRECISION = 0.2
+#: `shadow` decides and records but changes no dispatch; `enforce` applies the decision.
+EVOLUTION_MODES = ("shadow", "enforce")
+
 
 @dataclass
 class EvolutionConfig:
@@ -1715,6 +1736,18 @@ class EvolutionConfig:
     """
 
     min_samples: int = DEFAULT_EVOLUTION_MIN_SAMPLES
+    # The steward (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md
+    # §3.3). Read from `os.evolution` only: the ledger is fleet-wide, so a project override
+    # of these is parsed (the dataclass is shared) and ignored.
+    weekly_usd: float = DEFAULT_EVOLUTION_WEEKLY_USD
+    critical_weekly_usd: float = DEFAULT_EVOLUTION_CRITICAL_WEEKLY_USD
+    yield_above_usd: float = DEFAULT_EVOLUTION_YIELD_ABOVE_USD
+    order_budget_usd: float = DEFAULT_EVOLUTION_ORDER_BUDGET_USD
+    max_depth: int = DEFAULT_EVOLUTION_MAX_DEPTH
+    major_min_refs: int = DEFAULT_EVOLUTION_MAJOR_MIN_REFS
+    medium_min_refs: int = DEFAULT_EVOLUTION_MEDIUM_MIN_REFS
+    min_precision: float = DEFAULT_EVOLUTION_MIN_PRECISION
+    mode: str = "shadow"
 
 
 @dataclass
@@ -2715,7 +2748,28 @@ def _parse_evolution(raw: Any, base: EvolutionConfig | None = None,
     min_samples = int(raw.get("min_samples", base.min_samples))
     if min_samples < 1:
         raise _err(f"{where}.min_samples must be 1 or more, got {min_samples}")
-    return EvolutionConfig(min_samples=min_samples)
+    money = {}
+    for key in ("weekly_usd", "critical_weekly_usd", "yield_above_usd", "order_budget_usd"):
+        value = float(raw.get(key, getattr(base, key)))
+        if value < 0:
+            raise _err(f"{where}.{key} must be 0 or more, got {value}")
+        money[key] = value
+    # `critical_weekly_usd` above `weekly_usd` is not refused: the steward checks both,
+    # so the smaller binds, and lowering the weekly cap alone stays a one-key change.
+    counts = {}
+    for key in ("max_depth", "major_min_refs", "medium_min_refs"):
+        value = int(raw.get(key, getattr(base, key)))
+        if value < 0:
+            raise _err(f"{where}.{key} must be 0 or more, got {value}")
+        counts[key] = value
+    min_precision = float(raw.get("min_precision", base.min_precision))
+    if not 0 <= min_precision <= 1:
+        raise _err(f"{where}.min_precision must be between 0 and 1, got {min_precision}")
+    mode = str(raw.get("mode", base.mode))
+    if mode not in EVOLUTION_MODES:
+        raise _err(f"{where}.mode must be one of {list(EVOLUTION_MODES)}, got {mode!r}")
+    return EvolutionConfig(min_samples=min_samples, min_precision=min_precision,
+                           mode=mode, **money, **counts)
 
 
 def _parse_concision(raw: Any, base: ConcisionConfig | None = None,
