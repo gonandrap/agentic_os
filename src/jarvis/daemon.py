@@ -81,8 +81,7 @@ def _limiter_line(figures: dict[str, Any]) -> str:
 
 RECONCILE_EVERY_TICKS = 6  # refresh `claude agents --json` every N ticks (injected only)
 
-#: The reconcile stamp a reader outside the process judges liveness by. §2a of
-#: docs/superpowers/specs/2026-10-16-a-stopped-daemon-is-a-liveness-gap.md.
+#: Reconcile stamp an outside reader judges liveness by; spec 2026-10-16 §2a
 RECONCILE_TICK_KEY = "reconcile_tick"
 SECONDS_PER_HOUR = 3600    # a unit, not a setting
 #: Ask GitHub about parked pull requests every N ticks — ~2 minutes at the default 5s interval
@@ -912,10 +911,7 @@ class Daemon:
         from .notify import route_new_inbox
         route_new_inbox(self.central, self.catalog)
 
-        # LAST, so a reconcile pass that hangs goes dark instead of reporting itself
-        # alive; the interval is stamped by the writer because `poll_interval` is a
-        # launch argument no reader can see. §2a of
-        # docs/superpowers/specs/2026-10-16-a-stopped-daemon-is-a-liveness-gap.md.
+        # LAST, so a reconcile pass that hangs goes dark instead of reporting itself alive (docs/superpowers/specs/2026-10-16-a-stopped-daemon-is-a-liveness-gap.md)
         if reconcile:
             self.central.set_state(RECONCILE_TICK_KEY, db.to_json(
                 {"ts": db.now(),

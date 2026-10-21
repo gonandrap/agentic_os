@@ -424,18 +424,13 @@ def _held_jobs(store: ProjectStore, catalog: Catalog | None = None) -> list[dict
             if st["held_since"] and st["job_id"] in cfg.jobs]
 
 
-#: §2b: dark once the newest stamp is older than
-#: max(DAEMON_DARK_MIN_SECONDS, interval * DAEMON_DARK_INTERVALS).
+#: §2b: dark once the newest stamp is older than max(MIN_SECONDS, interval * INTERVALS)
 DAEMON_DARK_INTERVALS = 10
 DAEMON_DARK_MIN_SECONDS = 300
 
 
 def _daemon_liveness(central: CentralStore, pid: int | None) -> dict[str, Any] | None:
-    """ONE fleet-level item when jarvisd is stopped or dark, else None.
-
-    Liveness is a fact about the PROCESS, so only a reader outside it can assert it.
-    Spec docs/superpowers/specs/2026-10-16-a-stopped-daemon-is-a-liveness-gap.md.
-    """
+    """ONE fleet-level item when jarvisd is stopped or dark, else None (docs/superpowers/specs/2026-10-16-a-stopped-daemon-is-a-liveness-gap.md)"""
     if pid is None:
         path = central.get_state("catalog_path")
         return {
@@ -455,9 +450,7 @@ def _daemon_liveness(central: CentralStore, pid: int | None) -> dict[str, Any] |
         except (TypeError, ValueError):  # a malformed stamp is no stamp
             ts = interval = 0.0
     if not ts:
-        # §2b: with no stamp the age is measured from the start, and with neither nothing
-        # fires — a fresh install must not report as broken
-        # (invariants.check_stuck_sweep_alive's own rule).
+        # §2b: with no stamp the age is measured from the start, and with neither nothing fires
         interval = 0.0
         try:
             ts = float(central.get_state("daemon_started_at") or 0.0)
@@ -468,7 +461,7 @@ def _daemon_liveness(central: CentralStore, pid: int | None) -> dict[str, Any] |
     dark = db.now() - ts
     if dark < max(float(DAEMON_DARK_MIN_SECONDS), interval * DAEMON_DARK_INTERVALS):
         return None
-    # No `decide`: no jarvis verb restarts a wedged daemon (§2b).
+    # No `decide`: no jarvis verb restarts a wedged daemon (§2b)
     return {
         "project": "os", "wo_id": None,
         "title": "jarvisd is dark", "status": "daemon",
@@ -709,9 +702,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                           f"{int(ui['window_seconds'] / 3600)}h — latest: "
                           f"{ui['recent'][0]['summary']}. Full traceback: {ui['log']}",
             })
-        # Beside it, under the same argument: the daemon is the OS, and nothing inside it
-        # can report its own death. Spec
-        # docs/superpowers/specs/2026-10-16-a-stopped-daemon-is-a-liveness-gap.md.
+        # Beside it, under the same argument: the daemon is the OS (docs/superpowers/specs/2026-10-16-a-stopped-daemon-is-a-liveness-gap.md)
         liveness = _daemon_liveness(central, pid)
         if liveness:
             attention.append(liveness)

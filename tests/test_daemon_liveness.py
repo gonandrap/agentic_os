@@ -1,7 +1,4 @@
-"""A stopped or wedged jarvisd is a liveness gap only a reader outside it can assert.
-
-Spec docs/superpowers/specs/2026-10-16-a-stopped-daemon-is-a-liveness-gap.md.
-"""
+"""A stopped or wedged jarvisd is a liveness gap only a reader outside it can assert (docs/superpowers/specs/2026-10-16-a-stopped-daemon-is-a-liveness-gap.md)"""
 
 from __future__ import annotations
 
@@ -16,14 +13,14 @@ from jarvis.daemon import RECONCILE_EVERY_TICKS, RECONCILE_TICK_KEY, Daemon
 from jarvis.ops import DAEMON_DARK_INTERVALS, DAEMON_DARK_MIN_SECONDS
 from jarvis.project_store import ProjectStore
 
-#: Well past the window, in seconds.
+#: Well past the window, in seconds
 LONG_DARK = 10 * DAEMON_DARK_MIN_SECONDS
 
 POLL_INTERVAL = 2.0
 
 
 def _register(catalog_file, *, catalog_path: bool = True) -> None:
-    """What `jarvis start` writes to the central store, minus starting anything."""
+    """What `jarvis start` writes to the central store, minus starting anything"""
     data = json.loads(catalog_file.read_text())
     central = CentralStore()
     try:
@@ -60,7 +57,7 @@ def _daemon_items(catalog_file) -> list[dict]:
     return [a for a in ops.os_status()["attention"] if a["status"] == "daemon"]
 
 
-# -- the reader ------------------------------------------------------------------------
+# -- the reader
 
 
 def test_a_stopped_daemon_is_one_item_naming_jarvis_start(project, catalog_file,
@@ -115,7 +112,7 @@ def test_a_stamp_older_than_the_window_is_one_dark_item(project, catalog_file,
 
 def test_a_fresh_install_with_no_stamp_and_no_start_says_nothing(project, catalog_file,
                                                                  monkeypatch):
-    """invariants.check_stuck_sweep_alive's own rule: never report a fresh install."""
+    """invariants.check_stuck_sweep_alive's own rule: never report a fresh install"""
     _alive(monkeypatch)
     _register(catalog_file)
 
@@ -147,9 +144,7 @@ def test_a_malformed_stamp_behaves_as_no_stamp(project, catalog_file, monkeypatc
     assert [a["cause"] for a in _daemon_items(catalog_file)] == ["dark"]
 
 
-#: (interval, age, expected causes). A FAST interval — the 6s cadence of
-#: `--poll-interval 1` — puts ten intervals at 60s, below the 300s floor, so the floor is
-#: what binds; a wide one puts the mandate above it.
+#: (interval, age, expected causes)
 WINDOW_CASES = [
     (6.0, 120.0, [], "ten 6s intervals is 60s, so the 300s floor binds"),
     (6.0, 400.0, ["dark"], "past the floor, and the floor is the wider arm"),
@@ -161,7 +156,7 @@ WINDOW_CASES = [
 @pytest.mark.parametrize("interval,age,causes,why", WINDOW_CASES)
 def test_the_window_is_the_wider_of_the_floor_and_ten_intervals(
         project, catalog_file, monkeypatch, interval, age, causes, why):
-    """A slow poll interval widens the window; a fast one keeps the floor."""
+    """A slow poll interval widens the window; a fast one keeps the floor"""
     _alive(monkeypatch)
     _register(catalog_file)
     _stamp(db.to_json({"ts": db.now() - age, "interval": interval}))
@@ -169,7 +164,7 @@ def test_the_window_is_the_wider_of_the_floor_and_ten_intervals(
     assert [a["cause"] for a in _daemon_items(catalog_file)] == causes, why
 
 
-# -- the writer ------------------------------------------------------------------------
+# -- the writer
 
 
 def test_a_reconcile_tick_stamps_the_interval_it_was_launched_with(
@@ -206,12 +201,7 @@ def test_a_non_reconcile_tick_does_not_advance_the_stamp(project, catalog_file,
 
 def test_a_tick_that_dies_mid_pass_does_not_stamp_itself_alive(
         project, catalog_file, jarvis_home, fake_claude, monkeypatch):
-    """§2a's reason for the placement: the stamp is the LAST thing a reconcile does.
-
-    `route_new_inbox` is the last call before the `if reconcile:` block, so a failure
-    there is a reconcile pass that did its work and never finished — which must read as
-    dark, not as alive.
-    """
+    """§2a's reason for the placement: the stamp is the LAST thing a reconcile does"""
     from jarvis import notify
 
     def boom(*a, **k):
