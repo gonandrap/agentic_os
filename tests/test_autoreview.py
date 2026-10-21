@@ -535,6 +535,8 @@ def park(daemon, *, auto_review: bool, auto_merge: bool = False,
     spec.validation.enabled = True
     spec.validation.auto_review = auto_review
     spec.validation.auto_merge = auto_merge
+    # These pin the wide net's hold wording; the tightened default words its holds differently
+    spec.validation.stakes_classifier = "regex"
     wo = ops.create_work_order("proj_a", "add feature X", description=description)
     for text in assumptions:
         ops.assume(wo["id"], text)
