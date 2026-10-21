@@ -235,7 +235,16 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "compacting":
         return "Compacting the conversation", p.get("reason") or ""
     if kind == "compacted":
-        # `ok` is absent on the hook's own event (`hooks.note_compaction`)
+        # NEVER A BARE "Conversation compacted" (io-12b7d873)
+        if "ok" not in p:
+            # The hook's own event (`hooks.note_compaction`), written BEFORE Claude Code compacts
+            trigger = p.get("trigger") or "auto"
+            return (f"Claude Code compacting the conversation ({trigger})",
+                    "its own decision, not the OS's — the size it leaves is not reported here")
+        if p.get("outcome") == "nothing_compacted":
+            return ("Compaction summarised nothing",
+                    "it returned success but left no boundary in the transcript — the "
+                    "conversation is intact and the compaction will be retried")
         if p.get("ok") is False:
             # The conversation is INTACT and the next prompt still pays the re-write
             return "Compaction failed", str(p.get("error") or "")
@@ -243,7 +252,19 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         if isinstance(before, int) and isinstance(after, int) and before:
             return ("Conversation compacted",
                     f"{before:,} tokens summarised to {after:,}")
-        return "Conversation compacted", ""
+        if p.get("outcome") == "unverified":
+            return ("Compaction unverified",
+                    "it returned success, but the transcript could not be read to "
+                    "confirm a boundary")
+        # Recorded before the outcome was: ok, and no boundary was found
+        return ("Compaction reported, no boundary found",
+                "it returned success but the transcript shows nothing was summarised")
+    if kind == "compaction_landed":
+        after = p.get("after")
+        return ("Compaction had landed — not re-sent",
+                f"turn {p.get('seq')} failed after compacting"
+                + (f" the conversation to {after:,} tokens" if isinstance(after, int)
+                   else "") + "; a second one would only summarise the summary")
     if kind == "attention":
         return "Needs you", p.get("reason") or ""
     if kind == "acknowledged":

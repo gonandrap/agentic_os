@@ -1093,7 +1093,7 @@ def create_app() -> FastAPI:
 
     @app.get("/wo/{name}/{wo_id}", response_class=HTMLResponse)
     def work_order(request: Request, name: str, wo_id: str, debug: str = "",
-                   forced: str = "", retried: str = ""):
+                   forced: str = "", retried: str = "", events: str = ""):
         try:
             pname, path, wo = ops.find_work_order(wo_id, name)
         except ops.OpsError as e:
@@ -1101,7 +1101,11 @@ def create_app() -> FastAPI:
                           hint=_stale_link_hint(name, wo_id), status_code=404)
         store = ProjectStore(path)
         try:
-            events = store.list_events(wo_id)
+            # THE NEWEST PAGE, and how much is behind it — `jarvis wo show`'s rule (io-12b7d873)
+            every = events == "all"
+            events_page = store.list_events(wo_id, limit=None if every else 200,
+                                            newest=True)
+            events_hidden = store.count_events(wo_id) - len(events_page)
             messages = store.list_messages(wo_id)
             # Both lists: `assumptions` is the record, `unreviewed` is the ask — §4
             assumptions = ops.assumptions_with_rulings(store, wo_id)
@@ -1167,11 +1171,12 @@ def create_app() -> FastAPI:
                       issues=issue_index,
                       auto_review=auto_review, force=force, forced_lines=forced_lines,
                       retry=retry, retried_line=retried_line, harvest=harvest,
-                      timeline=build_timeline(wo, events, messages,
+                      timeline=build_timeline(wo, events_page, messages,
                                               include_debug=show_debug),
-                      debug=show_debug, debug_count=count_debug(events),
+                      events_hidden=events_hidden, events_all=every,
+                      debug=show_debug, debug_count=count_debug(events_page),
                       # What was said, and what happened — two readings of one record, neither derivable from the other
-                      conversation=build_conversation(events, messages),
+                      conversation=build_conversation(events_page, messages),
                       assumptions=assumptions, unreviewed=unreviewed, review=review,
                       approvals=approvals, bill=bill, states=states,
                       turn_lines=turn_lines_by_message(bill))

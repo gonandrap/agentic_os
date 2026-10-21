@@ -234,10 +234,44 @@ def turn_context(turn: dict[str, Any] | None) -> int:
 def measured_context(store: ProjectStore, wo_id: str) -> int | None:
     """The conversation's size as last MEASURED, or None when it is UNKNOWN (#856)"""
     for turn in store.recent_turns(wo_id, limit=MAX_RATE_LIMIT_RETRIES + 4):
+        # A compaction's own prompt is the PRE-compaction peak; what it left is the post size
+        achieved = compacted_to(turn)
+        if achieved:
+            return achieved
         context = turn_context(turn)
         if context:
             return context
     return _transcript_context(store, wo_id)
+
+
+def compaction_record(turn: dict[str, Any] | None) -> dict[str, Any] | None:
+    """`wo_turns.compaction_json` decoded: a boundary, `{}` for none, None if never read"""
+    from . import db
+
+    record = db.from_json((turn or {}).get("compaction_json"), None)
+    return record if isinstance(record, dict) else None
+
+
+def compacted_to(turn: dict[str, Any] | None) -> int:
+    """The size a compaction turn left the conversation at, or 0 if it left no boundary"""
+    if not turn or turn.get("kind") != COMPACT_TURN:
+        return 0
+    return int((compaction_record(turn) or {}).get("post") or 0)
+
+
+def compaction_landed(store: ProjectStore, wo: dict[str, Any],
+                      turn: dict[str, Any]) -> bool:
+    """Did this compaction turn leave a boundary in the session?"""
+    if compaction_record(turn):
+        return True
+    session_id = str(wo.get("session_id") or "")
+    if not session_id:
+        return False
+    # Read again even when `{}` was stored: a turn that died without an envelope was never asked
+    found = usage.last_compaction(session_id, since=turn["started_at"])
+    if found is not None:
+        store.set_turn_compaction(turn["id"], found)
+    return found is not None
 
 
 def _transcript_context(store: ProjectStore, wo_id: str) -> int | None:
@@ -362,9 +396,20 @@ def _compact_or_withdraw(store: ProjectStore, project: ProjectSpec, wo: dict[str
         raise
 
 
+#: `compacted.outcome`: what a compaction turn did
+COMPACTION_DONE = "compacted"
+COMPACTION_DIED = "died"
+COMPACTION_NOTHING = "nothing_compacted"
+COMPACTION_UNVERIFIED = "unverified"
+
+#: The error a compaction turn settles `failed` with when it returned ok and left no boundary
+NOTHING_COMPACTED = ("the compaction returned success but left no compact boundary in "
+                     "the transcript — nothing was summarised")
+
+
 def _record_compaction(store: ProjectStore, project_name: str, wo_id: str,
-                       turn: dict[str, Any], result: claude_cli.TurnResult) -> None:
-    """Put the compaction's outcome on the timeline and its cost on the bill"""
+                       turn: dict[str, Any], result: claude_cli.TurnResult) -> str:
+    """Put the compaction's outcome on the timeline and its cost on the bill, and return it"""
     from . import agent_usage
 
     session_id = str(store.get_work_order(wo_id).get("session_id") or "")
@@ -375,16 +420,26 @@ def _record_compaction(store: ProjectStore, project_name: str, wo_id: str,
     try:
         done = usage.last_compaction(session_id, since=turn["started_at"])
     except OSError:
-        done = None
+        # An unreadable transcript is no verdict: nothing is recorded and the envelope decides
+        done, readable = None, False
+    else:
+        readable = True
+        store.set_turn_compaction(turn["id"], done)
+    outcome = (COMPACTION_DIED if not result.ok
+               else COMPACTION_DONE if done is not None
+               else COMPACTION_NOTHING if readable else COMPACTION_UNVERIFIED)
     store.add_event(wo_id, "compacted", {
         "seq": turn["seq"],
-        "ok": result.ok,
+        "ok": outcome in (COMPACTION_DONE, COMPACTION_UNVERIFIED),
+        "outcome": outcome,
         # The CLI's own measurement of what it achieved, not an estimate of ours
         "before": (done or {}).get("pre"),
         "after": (done or {}).get("post"),
         "cost_usd": result.cost_usd,
-        "error": (result.error or "")[:500] or None,
+        "error": (NOTHING_COMPACTED if outcome == COMPACTION_NOTHING
+                  else (result.error or "")[:500] or None),
     })
+    return outcome
 
 
 def wo_model(store: ProjectStore, wo_id: str) -> str:
@@ -585,8 +640,11 @@ def _reap(store: ProjectStore, turn: dict[str, Any],
 
     if turn["kind"] == COMPACT_TURN:
         # NOT A REPLY, AND NOT THE WORKER'S
-        _record_compaction(store, project_name, wo_id, turn, result)
-        return store.finish_turn(turn["id"], "done", result="",
+        outcome = _record_compaction(store, project_name, wo_id, turn, result)
+        # SETTLED AGAINST ITS POST-CONDITION: ok with no boundary did not happen, and `turn_pause` retries it
+        failed = outcome == COMPACTION_NOTHING
+        return store.finish_turn(turn["id"], "failed" if failed else "done", result="",
+                                 error=NOTHING_COMPACTED if failed else None,
                                  cost_usd=result.cost_usd,
                                  num_turns=result.num_turns, usage_json=usage_json)
 
@@ -610,7 +668,8 @@ def _last_assistant_message(store: ProjectStore, wo_id: str,
     """Backup reply source: what the `Stop` hook saw"""
     from . import db
 
-    for event in reversed(store.list_events(wo_id, limit=200)):
+    # The NEWEST page: an ascending LIMIT would search the oldest events of a long order
+    for event in reversed(store.list_events(wo_id, limit=200, newest=True)):
         if event["kind"] != "hook:Stop" or event["ts"] < turn["started_at"]:
             continue
         payload = db.from_json(event.get("payload"), {}) or {}
@@ -786,6 +845,9 @@ def _diagnose(
 ) -> claude_cli.AuthFailure | claude_cli.UsageLimit | claude_cli.TransientFailure | None:
     """What this failed turn actually was, or None if it was an ordinary failure"""
     error = turn.get("error")
+    # A compaction that summarised nothing is the transport's loss, retried on its backoff
+    if turn.get("kind") == COMPACT_TURN and error == NOTHING_COMPACTED:
+        return claude_cli.TransientFailure(message=NOTHING_COMPACTED, status=None)
     auth = claude_cli.auth_failure(error)
     if auth is not None:
         return auth
@@ -813,9 +875,17 @@ def pause_streak(store: ProjectStore, wo_id: str, reason: str) -> int:
 
 
 def retry(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
-          pause: TurnPause) -> dict[str, Any]:
-    """Relaunch a turn the transport lost"""
+          pause: TurnPause) -> dict[str, Any] | None:
+    """Relaunch a turn the transport lost — None when the record shows nothing is left to relaunch"""
     turn = pause.turn
+    # `/compact` is re-sent only into a conversation it never compacted (io-12b7d873)
+    if turn["kind"] == COMPACT_TURN and compaction_landed(store, wo, turn):
+        store.settle_turn_landed(turn["id"])
+        store.add_event(wo["id"], "compaction_landed", {
+            "seq": turn["seq"], "reason": pause.reason,
+            "after": compacted_to(store.get_turn(turn["id"])) or None,
+        })
+        return None
     started = _conversation_started(project, wo)
     tree = worktree_path(project, wo)
     # Both halves are required

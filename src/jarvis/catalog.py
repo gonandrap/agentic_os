@@ -357,6 +357,9 @@ DEFAULT_INSPECT_ALARM_WRITE_TOKENS = 300_000
 #: How long a work order may sit with its turn ended and nothing in flight before...
 DEFAULT_INSPECT_ALARM_PARKED_MINUTES = 60
 
+#: How far back the compaction post-conditions look for a chained or unproven compaction (io-12b7d873)
+DEFAULT_INSPECT_ALARM_COMPACTION_WINDOW_DAYS = 7
+
 # -- the AGGREGATE half of the re-write tax
 
 #: The cohort window, in days
@@ -407,6 +410,7 @@ class InspectConfig:
     alarm_subagent_tool_minutes: int = DEFAULT_INSPECT_ALARM_SUBAGENT_TOOL_MINUTES
     alarm_write_tokens: int = DEFAULT_INSPECT_ALARM_WRITE_TOKENS
     alarm_parked_minutes: int = DEFAULT_INSPECT_ALARM_PARKED_MINUTES
+    alarm_compaction_window_days: int = DEFAULT_INSPECT_ALARM_COMPACTION_WINDOW_DAYS
     alarm_rewrite_window_days: int = DEFAULT_INSPECT_ALARM_REWRITE_WINDOW_DAYS
     alarm_rewrite_prefix_share: float = DEFAULT_INSPECT_ALARM_REWRITE_PREFIX_SHARE
     alarm_rewrite_ttl_share: float = DEFAULT_INSPECT_ALARM_REWRITE_TTL_SHARE
@@ -1309,6 +1313,8 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
                                        base.alarm_write_tokens)),
         alarm_parked_minutes=int(raw.get("alarm_parked_minutes",
                                          base.alarm_parked_minutes)),
+        alarm_compaction_window_days=int(raw.get("alarm_compaction_window_days",
+                                                 base.alarm_compaction_window_days)),
         alarm_rewrite_window_days=int(raw.get("alarm_rewrite_window_days",
                                               base.alarm_rewrite_window_days)),
         alarm_rewrite_prefix_share=float(raw.get("alarm_rewrite_prefix_share",

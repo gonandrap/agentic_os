@@ -822,6 +822,82 @@ def check_undeclared_delivery(store: ProjectStore) -> Iterator[Violation]:
         )
 
 
+#: `wo_alarms.kind` for the two compaction post-conditions (io-12b7d873)
+COMPACTION_CHAINED_ALARM = "compaction-chained"
+COMPACTION_UNPROVEN_ALARM = "compaction-unproven"
+
+
+def _compaction_window(store: ProjectStore) -> tuple[bool, int]:
+    """Whether the compaction checks are armed for THIS project, and how many days back they look"""
+    from .ops import inspect_config_at
+
+    cfg = inspect_config_at(store.project_path)
+    return bool(cfg.enabled), int(cfg.alarm_compaction_window_days)
+
+
+def _figures(record: dict[str, Any] | None) -> str:
+    if not record or not record.get("post"):
+        return ""
+    return f" ({int(record.get('pre') or 0):,} → {int(record['post']):,} tokens)"
+
+
+def compaction_findings(store: ProjectStore,
+                        since: float) -> list[tuple[str, dict[str, Any], str]]:
+    """`(alarm kind, turn, reason)` for every compaction since `since` that breaks a post-condition"""
+    found: list[tuple[str, dict[str, Any], str]] = []
+    for turn in store.compaction_turns_since(since):
+        record = worker_session.compaction_record(turn)
+        if turn.get("prev_kind") == worker_session.COMPACT_TURN:
+            prev = db.from_json(turn.get("prev_compaction_json"), None)
+            # A row from before the column existed is judged on its state alone
+            landed = (bool(prev.get("post")) if isinstance(prev, dict)
+                      else turn.get("prev_state") == "done")
+            if landed:
+                found.append((COMPACTION_CHAINED_ALARM, turn, (
+                    f"turn {turn['seq']} compacted the conversation turn "
+                    f"{turn['prev_seq']} had already compacted"
+                    f"{_figures(prev if isinstance(prev, dict) else None)}, with no "
+                    f"worker turn between — it summarised the summary"
+                    + (f"{_figures(record)}" if record else ""))))
+        if turn["state"] == "done" and record is not None and not record.get("post"):
+            found.append((COMPACTION_UNPROVEN_ALARM, turn, (
+                f"compaction turn {turn['seq']} settled ok with no compact boundary and "
+                f"no achieved size on record — nothing shows the conversation shrank")))
+    return found
+
+
+def check_compactions_hold(store: ProjectStore) -> Iterator[Violation]:
+    """INV-COMPACTION-CHAINED / INV-COMPACTION-UNPROVEN — what must be true after the OS pays to compact"""
+    enabled, days = _compaction_window(store)
+    if not enabled:
+        return
+    readonly = getattr(store, "readonly", False)
+    since = time.time() - days * 86400
+    for kind, turn, reason in compaction_findings(store, since):
+        wo_id = turn["wo_id"]
+        # ONE ALARM PER TURN, EVER: the row is the memory, so an ack holds across ticks
+        if any(a["kind"] == kind and a["seq"] == turn["seq"]
+               for a in store.alarms_of(wo_id)):
+            continue
+        if not readonly:
+            row = store.add_alarm(wo_id, kind, turn["seq"], reason)
+            store.add_event(wo_id, "cost_alarm", {"kind": kind, "seq": turn["seq"],
+                                                  "reason": reason,
+                                                  "alarm_id": row["id"]})
+            wo = store.get_work_order(wo_id)
+            if wo["status"] not in TERMINAL_STATUSES and not wo["needs_attention"]:
+                store.flag_attention(wo_id, reason)
+        yield Violation(
+            invariant=("INV-COMPACTION-CHAINED" if kind == COMPACTION_CHAINED_ALARM
+                       else "INV-COMPACTION-UNPROVEN"),
+            wo_id=wo_id,
+            detail=reason,
+            repaired=not readonly,
+            repair=("would raise " if readonly else "raised ") + f"a {kind} alarm",
+            context={"seq": turn["seq"]},
+        )
+
+
 def check_spans_reach_the_status(store: ProjectStore) -> Iterator[Violation]:
     """INV-SPAN-BEHIND — a status write with no span is repaired where it is found (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md)"""
     readonly = getattr(store, "readonly", False)
@@ -3361,6 +3437,8 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                    # raised before them is read as phantom attention on an alarm `true_blockers` cannot re-derive
     check_undeclared_delivery,     # order-free: it raises a FINDING and touches no flag
                                    # and no status, so nothing else here reads its output
+    check_compactions_hold,        # after the flag checks: it RAISES a flag no blocker
+                                   # re-derives, like the cost alarms it shares a shape with
     check_spans_reach_the_status,  # order-free: it appends a span and changes no status
                                    # and nothing else here reads `wo_state_spans`
     check_envelopes_move,          # last: it delivers, and delivery changes work orders

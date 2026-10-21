@@ -447,8 +447,9 @@ def _said_lines(pstore: Any, wo_id: str | None, cfg: Any) -> list[str]:
     if wo_id is None:
         said.append(NO_CARRIER_LINE)
         return said
+    # The NEWEST page: what was LAST said is the tail, which an ascending LIMIT drops
     conversation = timeline.build_conversation(
-        pstore.list_events(wo_id), pstore.list_messages(wo_id))
+        pstore.list_events(wo_id, newest=True), pstore.list_messages(wo_id))
     for turn in conversation[-cfg.quoted_turns:]:
         said.append(f"- {turn['who']}: "
                     f"{_clip(str(turn.get('content') or ''), cfg.conversation_quote_chars)}")
