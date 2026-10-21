@@ -72,6 +72,9 @@ revised; (B) alone still leaves the reviewer reading disk.
 
 ### 5. (A) The spec travels in the question
 
+**Note (2026-10-15):** superseded — Neo ruling Q1880 sends the heading OUTLINE, never the
+document text, so `build_plan_context` carries no spec body and no clipper (kn-b456d5b0).
+
 New in `plans.py`, beside `build_plan_question` (`plans.py:463`) because that function
 already owns everything the reviewer reads:
 
@@ -246,6 +249,10 @@ it cannot be referenced by name — that is the bug. Measured in this repo:
 `2026-09-24-an-auto-merge-request-that-proves-itself.md` is 383+ lines (~26KB). 40,000
 chars clips nothing currently in `docs/superpowers/specs/` and stays under half of #67's
 pre-diet 21,250 input tokens.
+
+**Note (2026-10-15):** `sections.clip_at_heading` is gone — Neo ruling Q1880 gives plan
+review the heading OUTLINE, never the document text, so there is nothing left to clip
+(kn-b456d5b0).
 
 **Clipping cuts at a heading boundary, never mid-sentence.** New pure function in
 `sections.py` (it owns `HEADING_RE` and `extract_section`, `sections.py:48`, and has no

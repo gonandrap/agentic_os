@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
-from jarvis import autoreview, neo, ops, stakes
+from jarvis import autoreview, neo, ops, plans, stakes
 from jarvis.catalog import ValidationConfig, load_catalog
 from jarvis.daemon import Daemon
 from jarvis.neo_store import NeoStore
@@ -2194,6 +2195,194 @@ def test_the_instruction_tells_the_reviewer_to_cite_the_section_not_escalate():
         build(neo_)
         (packet,) = neo_.asked
         assert "cite the section" in packet
+
+
+# -- the section the ASSUMPTION cites (user decision 2026-10-14, Neo learning #102) ----
+
+
+CITED_HEADER = "# THE SPEC SECTION THIS ASSUMPTION CITES"
+CITED_TEXT = "## 4. Retries\n\nThree attempts, then park and say so."
+
+
+def citing(**over) -> dict:
+    """An assumption whose own cited section was resolved and stored at assume time."""
+    return assumption(**{"spec_path": "docs/superpowers/specs/2026-10-14-retries.md",
+                         "spec_which": "4. Retries", "spec_text": CITED_TEXT, **over})
+
+
+def test_the_section_the_assumption_cites_rides_in_both_packets():
+    """It SUPPLEMENTS the work order's own spec block, never replaces it: one is the
+    section the order was built to, the other the section this sentence argues from."""
+    for build in (
+        lambda neo_: autoreview.propose(SpecStore(), neo_, "p", CHILD, citing(),
+                                        [assumption()]),
+        lambda neo_: autoreview.propose_confirmation(SpecStore(), neo_, "p", CHILD,
+                                                     citing(), [assumption()]),
+    ):
+        neo_ = FakeNeo(qrow())
+        build(neo_)
+        (packet,) = neo_.asked
+        assert CITED_HEADER in packet
+        assert ("docs/superpowers/specs/2026-10-14-retries.md § 4. Retries") in packet
+        assert "Three attempts, then park and say so." in packet
+        # The work order's own section is still there, and first.
+        assert SPEC_HEADER in packet and "retries three times and then parks" in packet
+        assert packet.index(SPEC_HEADER) < packet.index(CITED_HEADER)
+
+
+def test_an_assumption_that_cites_nothing_grows_no_second_block():
+    for build in builds(SpecStore()):
+        neo_ = FakeNeo(qrow())
+        build(neo_)
+        (packet,) = neo_.asked
+        assert CITED_HEADER not in packet
+
+
+TWO_CITED = ("docs/a.md § 3:\n## 3. Errors\n\nThey raise.\n\n"
+             "docs/b.md § Data model:\n## Data model\n\nDicts.")
+
+
+def test_the_reference_line_names_every_section_that_was_cited():
+    """User decision 2026-10-15: the pointer columns are parallel newline lists, so the
+    reference line names ALL N — no reference is invisible on it."""
+    neo_ = FakeNeo(qrow())
+
+    autoreview.propose(SpecStore(), neo_, "p", CHILD,
+                       citing(spec_path="docs/a.md\ndocs/b.md",
+                              spec_which="3\nData model", spec_text=TWO_CITED),
+                       [assumption()])
+
+    (packet,) = neo_.asked
+    assert "docs/a.md § 3; docs/b.md § Data model" in packet
+    assert "docs/a.md § 3:" in packet and "docs/b.md § Data model:" in packet
+    assert "They raise." in packet and "Dicts." in packet
+
+
+def test_lists_of_different_length_say_so_instead_of_dropping_a_reference():
+    neo_ = FakeNeo(qrow())
+
+    autoreview.propose(SpecStore(), neo_, "p", CHILD,
+                       citing(spec_path="docs/a.md\ndocs/b.md", spec_which="3",
+                              spec_text=TWO_CITED),
+                       [assumption()])
+
+    (packet,) = neo_.asked
+    assert "docs/a.md § 3; docs/b.md § (no section named)" in packet
+    assert "2 paths recorded against 1 section names" in packet
+
+
+def test_the_truncation_note_repeats_every_cited_reference():
+    neo_ = FakeNeo(qrow())
+
+    autoreview.propose(SpecStore(), neo_, "p", CHILD,
+                       citing(spec_path="docs/a.md\ndocs/b.md",
+                              spec_which="3\nData model",
+                              spec_text="y" * 9000),
+                       [assumption()], cfg=ValidationConfig(assumption_spec_chars=100))
+
+    (packet,) = neo_.asked
+    assert ("of 9,000 chars; full section: "
+            "docs/a.md § 3; docs/b.md § Data model]") in packet
+
+
+# -- one budget, need-based, half as a FLOOR (Neo ruling Q1884) ------------------------
+
+
+def doc_with(remedy_chars: int) -> str:
+    """The fixture document with `2. The remedy` grown to exactly `remedy_chars`."""
+    head = "## 2. The remedy\n\n"
+    return (f"# Design\n\n## 1. Why\n\nBecause.\n\n{head}"
+            f"{'r' * (remedy_chars - len(head))}\n\n## 3. Later\n\nNo.\n")
+
+
+def cite_of(chars: int) -> str:
+    head = "## 4. Retries\n\n"
+    return head + "c" * (chars - len(head))
+
+
+def one_packet(doc: str, cited: str, chars: int) -> str:
+    neo_ = FakeNeo(qrow())
+    autoreview.propose(SpecStore(doc=doc), neo_, "p", CHILD,
+                       citing(spec_text=cited), [assumption()],
+                       cfg=ValidationConfig(assumption_spec_chars=chars))
+    (packet,) = neo_.asked
+    return packet
+
+
+def test_neither_block_is_trimmed_when_both_fit():
+    """Q1884: each block takes only what it NEEDS. A flat half starved one block while
+    the other's half sat unused."""
+    packet = one_packet(doc_with(200), cite_of(3000), 4000)
+
+    assert "spec section truncated" not in packet
+    assert "r" * 182 in packet and "c" * 2985 in packet
+
+
+def test_half_is_a_floor_the_under_floor_block_donates_its_remainder_from():
+    """200 + 9000 over a 4000 budget: the 200 stays whole and only the oversized block
+    is trimmed, to `chars - 200`."""
+    packet = one_packet(doc_with(200), cite_of(9000), 4000)
+
+    assert packet.count("spec section truncated") == 1
+    assert "r" * 182 in packet
+    assert "[spec section truncated — 3,800 of 9,000 chars" in packet
+
+
+def test_two_oversized_blocks_each_get_the_floor_and_both_announce_the_cut():
+    packet = one_packet(doc_with(3000), cite_of(9000), 4000)
+
+    assert packet.count("spec section truncated") == 2
+    assert "[spec section truncated — 2,000 of 3,000 chars" in packet
+    assert "[spec section truncated — 2,000 of 9,000 chars" in packet
+
+
+def test_one_block_alone_gets_the_whole_budget():
+    neo_ = FakeNeo(qrow())
+    autoreview.propose(SpecStore(doc=doc_with(9000)), neo_, "p", CHILD, assumption(),
+                       [assumption()], cfg=ValidationConfig(assumption_spec_chars=4000))
+
+    (packet,) = neo_.asked
+    assert "[spec section truncated — 4,000 of 9,000 chars" in packet
+
+
+UNCITED = "THE-UNCITED-SENTENCE, which nobody asked about."
+
+
+def test_no_question_builder_can_emit_a_whole_spec_file():
+    """The regression the decision exists to prevent: a payload carrying a DOCUMENT. The
+    builders pinned by name: `propose`, `propose_confirmation`, `plans.build_plan_context`.
+    `ops.ask_question` is pinned by its sibling, tests/test_question_diet.py
+    ::test_ask_cannot_emit_a_whole_spec_file_even_citing_every_section."""
+    big = (f"# Design\n\n## 1. Why\n\n{UNCITED}\n" + "w" * 9000
+           + "\n\n## 2. The remedy\n\n" + "r" * 9000 + "\n\n## 3. Later\n\n"
+           + "l" * 9000 + "\n")
+    tight = ValidationConfig(assumption_spec_chars=200)
+
+    for build in (
+        lambda neo_: autoreview.propose(SpecStore(doc=big), neo_, "p", CHILD, citing(),
+                                        [assumption()], cfg=tight),
+        lambda neo_: autoreview.propose_confirmation(SpecStore(doc=big), neo_, "p",
+                                                     CHILD, citing(), [assumption()],
+                                                     cfg=tight),
+    ):
+        neo_ = FakeNeo(qrow())
+        build(neo_)
+        (packet,) = neo_.asked
+        assert big not in packet
+        assert UNCITED not in packet
+        assert "w" * 100 not in packet      # §1 is not this child's section
+        assert "l" * 100 not in packet      # nor is §3
+        # §2 IS this child's section, and arrives bounded by the budget — all of it bar
+        # the short cited section's need (Q1884).
+        longest = max(len(run) for run in re.findall(r"r+", packet))
+        assert 0 < longest < 200
+
+    outline = plans.build_plan_context(
+        {"design_doc": "docs/superpowers/specs/x.md", "design_doc_content": big},
+        "main @ abc1234")
+    assert big not in outline and UNCITED not in outline
+    for run in ("w" * 100, "r" * 100, "l" * 100):
+        assert run not in outline
 
 
 def test_answered_questions_is_newest_first_and_keeps_every_kind(started):

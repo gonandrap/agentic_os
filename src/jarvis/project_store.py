@@ -1051,6 +1051,23 @@ ADDED_COLUMNS = {
         "objection_sent_ts": "REAL",
         "objection_delivered_ts": "REAL",
         "objection_withdrawn_ts": "REAL",
+        # THE SPEC SECTIONS THIS ASSUMPTION CITES — N of them under ONE labelled snapshot
+        # in `spec_text` (Neo ruling Q1883), `spec_path`/`spec_which` being PARALLEL
+        # NEWLINE LISTS of all N in that same order, one line each, so the pointer never
+        # describes one reference out of N (user decision 2026-10-15) — resolved at
+        # `ops.assume` time and snapshotted here. User decision
+        # 2026-10-14 (Neo learning #102): a reviewer is handed specific sections, never a
+        # document, and `ops.SECTION_SNAPSHOT_CHARS` bounds their total. Stored rather than
+        # re-resolved
+        # when the review packet is built, because by then the worker's worktree — the
+        # only tree the path was ever valid in — is gone (kn-924730d7).
+        #
+        # NULL ON ALL THREE IS "CITED NO SECTION": every row written before this existed,
+        # and every assumption whose sentence names no design artifact, which is most of
+        # them. A surface not taught about them renders exactly as it does today.
+        "spec_path": "TEXT",
+        "spec_which": "TEXT",
+        "spec_text": "TEXT",
     },
     # WHICH MESSAGE AN ENVELOPE BECAME
     "envelopes": {
@@ -3149,13 +3166,22 @@ class ProjectStore:
 
     # -- assumptions
 
-    def add_assumption(self, wo_id: str, content: str) -> int:
+    def add_assumption(self, wo_id: str, content: str, *, spec_path: str | None = None,
+                       spec_which: str | None = None,
+                       spec_text: str | None = None) -> int:
+        """Record one assumption, with the spec section it cites if it cites one.
+
+        The three `spec_*` arguments are OPTIONAL and default to NULL, so every caller
+        written before them — the CLI, `invariants.check_assumptions_persisted`, the
+        screenshot scripts — keeps working and says "cited no section".
+        """
         n = 1 + int(self.conn.execute(
             "SELECT COUNT(*) FROM assumptions WHERE wo_id=?", (wo_id,)
         ).fetchone()[0])
         cur = self.conn.execute(
-            "INSERT INTO assumptions (wo_id, ts, content) VALUES (?,?,?)",
-            (wo_id, db.now(), content),
+            "INSERT INTO assumptions (wo_id, ts, content, spec_path, spec_which, "
+            "spec_text) VALUES (?,?,?,?,?,?)",
+            (wo_id, db.now(), content, spec_path, spec_which, spec_text),
         )
         self.add_event(wo_id, "assumption", {"content": content, "n": n})
         return int(cur.lastrowid)
