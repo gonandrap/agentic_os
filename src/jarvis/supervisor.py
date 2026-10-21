@@ -822,7 +822,7 @@ def reassert_health(pstore: Any, project: str, subject: dict[str, Any]) -> dict[
 
 
 def escalation_context(evidence: str, verdict: dict[str, Any]) -> str:
-    """What Neo is handed with the question — §3: the supervisor's own reading is APPENDED, never substituted, because Neo is headless and cannot look the packet up"""
+    """What Neo is handed with the question"""
     # Decision #11: packet and model reasoning are both borrowed text, both bounded
     from .provenance import (DESCRIPTION_LIMIT, EVIDENCE_LIMIT, Borrowed,
                              borrowed_block)
@@ -845,7 +845,7 @@ def escalation_context(evidence: str, verdict: dict[str, Any]) -> str:
 
 
 def _question_for(verdict: dict[str, Any], alarm: dict[str, Any]) -> str:
-    """The one question put to Neo, never empty: a model that escalates without filling `question` in has still judged, and an empty `questions` row is unanswerable by Neo and unreadable by the user it would be escalated to"""
+    """The one question put to Neo, never empty: a model that escalates without filling `question` in has..."""
     # Decision #11: the model's question and the alarm's reason are borrowed text, bounded
     from .provenance import DESCRIPTION_LIMIT, Borrowed, borrowed_block
 

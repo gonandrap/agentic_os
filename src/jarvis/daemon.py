@@ -5860,8 +5860,7 @@ class Daemon:
                                         str(p.get("reason") or ""),
                                         int(p.get("round") or 0))):
             return
-        # THE PAYLOAD'S SHAPE HAS ONE DEFINITION, `automerge.hold_payload` — its readers
-        # and the tests that build these rows all go through it.
+        # THE PAYLOAD'S SHAPE HAS ONE DEFINITION, `automerge.hold_payload`
         store.add_event(wo_id, "automerge_held", automerge.hold_payload(decision))
 
     def _warn_automerge_failed(self, project: ProjectSpec, store: ProjectStore,

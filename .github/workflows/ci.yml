@@ -84,6 +84,13 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
       - run: pip install -e ".[dev]"
+      # In this required job so it blocks without a ruleset edit
+      - name: Comments and docstrings stay one line
+        run: |
+          python scripts/trim_comments.py --check || {
+            echo "::error::A comment or docstring runs past one line. Run 'uv run python scripts/trim_comments.py' and push the result."
+            exit 1
+          }
       - run: pytest evals -q -n auto --timeout=60
       - name: Upload scorecard
         if: always()

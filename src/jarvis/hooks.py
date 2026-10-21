@@ -305,7 +305,7 @@ def finish_summary_decision(payload: dict[str, Any],
         f"is captured onto the work order verbatim and is what the user and Neo "
         f"actually read. Nothing is lost by moving it there.\n"
         f"  - Evidence goes in `--evidence`, not in the summary.\n"
-        f"Your `i-have-adhd` and `caveman` skills are how to shorten it without "
+        f"Your `caveman` skill is how to shorten it without "
         f"dropping anything that matters."
     )
 

@@ -713,12 +713,10 @@ def ask_triage(project: str, issue_url: str, title: str, body: str,
     from .neo_store import NeoStore
     from .provenance import TITLE_LIMIT, Borrowed, borrowed_block
 
-    # The title is bounded in the JSON record too: it rides to Neo as `context=`, and
-    # `triage_payload` reads it back as a work order's title, where 300 is already ample.
+    # The title is bounded in the JSON record too: it rides to Neo as `context=`
     context = json.dumps({"issue_url": issue_url, "title": title[:TITLE_LIMIT],
                           "priority": priority, "body": body[:4000]})
-    # Decision #11: the title is borrowed text — whoever filed the bug wrote it — and it
-    # was the one field in this prompt with no bound. The body keeps its own slice.
+    # Decision #11: the title is borrowed text
     quoted_title = borrowed_block(Borrowed(
         label="the tracker issue's title", whose="the agent that filed the bug",
         text=title, limit=TITLE_LIMIT))

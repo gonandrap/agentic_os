@@ -623,3 +623,15 @@ for every call to be recorded here instead. These are those calls.
     the description (`os_map.classify`); every other level is a file path it opens on
     demand. CLAUDE.md's crib sheet is one line per command; the reasoning moved verbatim
     to `docs/os/operator/*.md`.
+
+86. **`ponytail` replaces `i-have-adhd` for every agent; reviewers judge against the ask.**
+    Per the user, 2026-10-21: workers make the smallest complete change and reviewers do
+    not ask for what nobody asked for. `ponytail` is vendored verbatim
+    (`src/jarvis/assets/skills/ponytail/`) and its `full`-level rules ride the house style
+    in place of i-have-adhd's `## Shape`; `concision.REVIEW_SCOPE` is appended to every
+    validation seat's prompt, and the seat mandates lost the bullets that invited unasked
+    work (the architect's "where the decision lives", the maintainer's "silent failure",
+    the tester's "missing class"). `caveman` stays: it governs wording, ponytail governs
+    scope. The dashboard digest keeps its own i-have-adhd prompt: it rewrites a question
+    for the user to read and shapes no agent's work. Reversal criterion: if reviewed work
+    starts missing callers or tests the ask needed, restore the removed seat bullets first.
