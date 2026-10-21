@@ -1005,26 +1005,17 @@ def _owning(monkeypatch, tmp_path, project, **kw) -> ProjectStore:
     return ProjectStore(project)
 
 
-def test_the_os_sweep_switched_off_is_reported_critical(monkeypatch, tmp_path, project):
+def test_the_os_sweep_switched_off_in_the_catalog_is_deliberate(monkeypatch, tmp_path, project):
     store = _owning(monkeypatch, tmp_path, project, health=False)
 
-    (violation,) = _dark(store)
-
-    assert violation.invariant == "INV-OS-HEALTH-SWEEP-DARK"
-    assert violation.level == "critical"
-    assert not violation.repaired, "re-enabling it would be the OS editing the catalog"
-    assert "DISABLED" in violation.detail
-    assert "health_enabled" in violation.detail
+    assert _dark(store) == []
     store.close()
 
 
-def test_the_supervisor_switch_takes_the_sweep_dark_too(monkeypatch, tmp_path, project):
-    """Two switches, either of which is fatal: `_health_projects` requires both"""
+def test_the_supervisor_switch_off_is_deliberate_too(monkeypatch, tmp_path, project):
     store = _owning(monkeypatch, tmp_path, project, enabled=False)
 
-    (violation,) = _dark(store)
-
-    assert "supervisor.enabled" in violation.detail
+    assert _dark(store) == []
     store.close()
 
 
