@@ -463,9 +463,7 @@ def test_the_status_label_names_the_hold_and_the_way_out(store):
 
 
 def test_precondition_note_is_the_one_formatter_status_label_prints(store):
-    """§4 of docs/superpowers/specs/2026-10-19-an-order-held-by-an-open-precondition-is-
-    not-stuck.md: one home, two readers, and `status_label`'s output byte-identical to
-    what it composed inline — single ref, several refs, and the `"; "`-joined notes."""
+    """§4 of docs/superpowers/specs/2026-10-19-an-order-held-by-an-open-precondition-is- not-stuck.md: one..."""
     one = store.create_work_order("wire the actor")
     store.add_precondition(one["id"], "bl-d5baa28b")
     many = store.create_work_order("wire the other actor")
@@ -486,8 +484,7 @@ def test_precondition_note_is_the_one_formatter_status_label_prints(store):
 
 
 def test_preconditions_of_returns_cleared_rows_where_open_preconditions_cannot(store):
-    """§3.2: the discount is computed from `cleared_at`, which is invisible to
-    `open_preconditions` — so the spans need every row, oldest first."""
+    """§3.2: the discount is computed from `cleared_at`, which is invisible to `open_preconditions`"""
     wo = store.create_work_order("wire the actor")
     store.add_precondition(wo["id"], "bl-d5baa28b")
     store.add_precondition(wo["id"], "#1105")

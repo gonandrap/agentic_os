@@ -1510,16 +1510,12 @@ def test_a_pending_child_of_a_ratified_plan_is_still_judged(stuck_os):
     assert verdict.excluded == "" and verdict.stuck is True
 
 
-# -- an order held by an open precondition (the 2026-10-19 spec) ----------------------
+# -- an order held by an open precondition (the 2026-10-19 spec)
 
 
 def _precondition_held(store, *, status: str = "pending", refs=("bl-d5baa28b",),
                        hours: float = 2.0):
-    """`(wo, at)`: one order `hours` into `status`, held by a row per `refs` since `at`.
-
-    `park_order` back-dates the order's own clocks; the `preconditions` rows carry their
-    own `created_at`, which is what the discount is derived from (§3.1).
-    """
+    """`(wo, at)`: one order `hours` into `status`, held by a row per `refs` since `at`"""
     wo = ops.create_work_order("proj_a", "wire the actor", blocked_by=list(refs))
     at = park_order(store, wo["id"], status, hours=hours)
     store.conn.execute("UPDATE preconditions SET created_at=? WHERE wo_id=?",
@@ -1529,7 +1525,7 @@ def _precondition_held(store, *, status: str = "pending", refs=("bl-d5baa28b",),
 
 
 def clear_hold(store, wo_id: str, ref: str, at: float) -> None:
-    """The user's route, back-dated: `jarvis wo unblock`'s own call, cleared at `at`."""
+    """The user's route, back-dated: `jarvis wo unblock`'s own call, cleared at `at`"""
     store.clear_precondition(ref, by="user")
     store.conn.execute("UPDATE preconditions SET cleared_at=? WHERE wo_id=? AND ref=?",
                        (at, wo_id, ref))
@@ -1537,7 +1533,7 @@ def clear_hold(store, wo_id: str, ref: str, at: float) -> None:
 
 
 def test_an_order_held_by_an_open_precondition_is_not_stuck(stuck_os):
-    """§7(2) and §7(4). Two hours `pending` because the claim rule withholds it."""
+    """§7(2) and §7(4)"""
     from jarvis import stuck
 
     store = stuck_os["store"]
@@ -1552,9 +1548,7 @@ def test_an_order_held_by_an_open_precondition_is_not_stuck(stuck_os):
 
 
 def test_a_cleared_precondition_is_judged_and_its_held_seconds_still_discounted(stuck_os):
-    """§3.1 and §7(5): EXCLUSION ALONE IS NOT THE FIX. The row cleared a minute ago and
-    the dispatch tick has not run, so the order is still `pending` — without the discount
-    the first post-clear sweep sees the whole two hours and buys the investigation."""
+    """§3.1 and §7(5): EXCLUSION ALONE IS NOT THE FIX"""
     store = stuck_os["store"]
     now = time.time()
     wo, _at = _precondition_held(store, hours=2)
@@ -1568,8 +1562,7 @@ def test_a_cleared_precondition_is_judged_and_its_held_seconds_still_discounted(
 
 
 def test_precondition_hold_spans_are_row_shaped_and_clipped_to_the_status_span():
-    """§3.2 and §7(1): pure over rows, spans and never a total, clipped to
-    `[since, now]` — and a row created before `since` is clipped, NOT dropped."""
+    """§3.2 and §7(1): pure over rows, spans and never a total, clipped to `[since, now]`"""
     from jarvis.project_store import precondition_hold_spans
 
     def row(created_at, cleared_at=None):
@@ -1581,14 +1574,13 @@ def test_precondition_hold_spans_are_row_shaped_and_clipped_to_the_status_span()
                                    200.0) == [(100.0, 200.0)], "the normal case was lost"
     assert precondition_hold_spans([row(50.0, 80.0)], 100.0, 200.0) == []
     assert precondition_hold_spans([], 100.0, 200.0) == []
-    # Overlapping rows are all returned and sorted — the union is `union_seconds`' job.
+    # Overlapping rows are all returned and sorted — the union is `union_seconds`' job
     assert precondition_hold_spans([row(160.0), row(120.0, 180.0)], 100.0, 200.0) == [
         (120.0, 180.0), (160.0, 200.0)]
 
 
 def test_overlapping_usage_and_precondition_holds_are_discounted_once(stuck_os):
-    """§3.2: the UNION of the interval sets, never the sum — a usage window can shut
-    while the precondition stands."""
+    """§3.2: the UNION of the interval sets, never the sum"""
     store = stuck_os["store"]
     now = time.time()
     wo, at = _precondition_held(store, hours=1)
@@ -1602,8 +1594,7 @@ def test_overlapping_usage_and_precondition_holds_are_discounted_once(stuck_os):
 
 
 def test_a_running_order_with_an_open_precondition_is_judged_normally(stuck_os):
-    """§5 and §7(6): the row withholds a DISPATCH, so work already in flight is not held
-    by it and must still clear its threshold."""
+    """§5 and §7(6): the row withholds a DISPATCH"""
     store = stuck_os["store"]
     wo, _at = _precondition_held(store, status="running", hours=5)
 
@@ -1613,8 +1604,7 @@ def test_a_running_order_with_an_open_precondition_is_judged_normally(stuck_os):
 
 
 def test_a_validating_order_is_never_excluded_by_a_precondition_row(stuck_os):
-    """§5's gate is also why §3.3's CI and base-red ranks cannot collide with this one:
-    those two holds are `validating` and `waiting_pr_merge` ONLY."""
+    """§5's gate is also why §3.3's CI and base-red ranks cannot collide with this one: those two holds..."""
     store = stuck_os["store"]
     wo, _at = _precondition_held(store, status="validating", hours=5)
 
@@ -1624,7 +1614,7 @@ def test_a_validating_order_is_never_excluded_by_a_precondition_row(stuck_os):
 
 
 def test_a_usage_window_outranks_a_precondition(stuck_os):
-    """§3.3's precedence: the account's window is a fact about the whole fleet."""
+    """§3.3's precedence: the account's window is a fact about the whole fleet"""
     from jarvis.worker_session import PAUSE_USAGE_LIMIT
 
     store = stuck_os["store"]
@@ -1637,8 +1627,7 @@ def test_a_usage_window_outranks_a_precondition(stuck_os):
 
 
 def test_a_precondition_outranks_a_live_dependency(stuck_os):
-    """§3.3, Neo 1982: the cause the sweep reports matches the sentence `status_label`
-    prints on the same row, which ranks the precondition first of its four answers."""
+    """§3.3, Neo 1982: the cause the sweep reports matches the sentence `status_label` prints on the same..."""
     from jarvis import stuck
 
     store = stuck_os["store"]
@@ -1654,7 +1643,7 @@ def test_a_precondition_outranks_a_live_dependency(stuck_os):
 
 
 def test_a_precondition_outranks_a_plan_hold(stuck_os):
-    """§3.3: above `PLAN_ASSUMPTION_CAUSE` too, for the same one-ranking reason."""
+    """§3.3: above `PLAN_ASSUMPTION_CAUSE` too, for the same one-ranking reason"""
     from jarvis import stuck
 
     store = stuck_os["store"]
@@ -1668,8 +1657,7 @@ def test_a_precondition_outranks_a_plan_hold(stuck_os):
 
 
 def test_the_held_order_stays_a_visible_row_and_its_two_readers_agree(stuck_os):
-    """§2.2's rejection of a `continue` (kn-143a46df) and §4 and §7(7): the blocker
-    column and `status_label` on the SAME row must not contradict each other."""
+    """§2.2's rejection of a `continue` (kn-143a46df) and §4 and §7(7): the blocker column and..."""
     store = stuck_os["store"]
     now = time.time()
     wo, _at = _precondition_held(store)

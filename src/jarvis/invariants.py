@@ -1004,13 +1004,7 @@ def plan_hold_note(hold: dict[str, Any] | None) -> str:
 
 
 def precondition_note(rows: list[dict[str, Any]]) -> str:
-    """One sentence for a `ProjectStore.open_preconditions` result, `""` for no rows.
-
-    ONE HOME, TWO READERS (kn-432d0f19), `plan_hold_note`'s arrangement one hold along:
-    §1.2 of docs/superpowers/specs/2026-10-19-an-order-held-by-an-open-precondition-is-
-    not-stuck.md is what happened while the sweep's blocker column composed its own — one
-    row reading "nothing the record can name" beside one naming the hold and the way out.
-    """
+    """One sentence for a `ProjectStore.open_preconditions` result, `""` for no rows"""
     if not rows:
         return ""
     refs = ", ".join(row["ref"] for row in rows)
@@ -1101,8 +1095,7 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
             return f"{wo['status']} — {note}"
     if wo["status"] != "pending":
         return wo["status"]
-    # FIRST of the four pending answers: of them it is the only one that may never clear without a... (docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md)
-    # §4 of the 2026-10-19 spec: the sentence lives in `precondition_note`, one home
+    # FIRST of the four pending answers: of them it is the only one that may never clear without a...... (docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md)
     note = precondition_note(store.open_preconditions(wo["id"]))
     if note:
         return f"pending — {note}"

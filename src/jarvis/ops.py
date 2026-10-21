@@ -6504,8 +6504,7 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                     sorted((e for k in PLAN_ASSUMPTION_EVENT_KINDS
                             for e in pstore.events_of_kind(str(planner_id), k)),
                            key=lambda e: float(e["ts"])), since, now)
-        # AN ORDER HELD BY AN OPEN PRECONDITION IS NOT STUCK (§2, §3 and §5 of the
-        # 2026-10-19 spec): `pending` only, and the discount needs every row
+        # AN ORDER HELD BY AN OPEN PRECONDITION IS NOT STUCK (§2
         pre_held, pre_spans = False, []
         if wo["status"] == "pending":
             pre_held = bool(pstore.open_preconditions(wo["id"]))
@@ -6558,8 +6557,7 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         blocker = true_blockers(pstore, wo, now=now)
         out.append({
             "project": project_name, "wo": wo, "verdict": verdict,
-            # The outstanding-child note before the empty answer: one formatter shared with `status_label`
-            # The precondition note ahead of the plan hold's, §4: the ordering is §3.3's
+            # The outstanding-child note before the empty answer: one formatter shared with `status_label` The...
             "blocker": (blocker[0] if blocker
                         else invariants.outstanding_children_note(pstore, wo)
                         or invariants.precondition_note(
