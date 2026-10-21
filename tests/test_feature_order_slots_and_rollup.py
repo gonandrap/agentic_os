@@ -1,22 +1,4 @@
-"""Phase 3 of feature orders: the per-feature slot cap, and the attention rollup.
-
-Two independent things, kept together because both are about a feature order NOT
-overwhelming something — the project's worker slots in one case, the user's attention
-strip in the other.
-
-**`max_parallel`** is a second cap spent alongside the project-wide `max_concurrent`
-rather than instead of it; whichever is tighter binds. It is the USER's knob, not the
-planner's (ruled 2026-08-03): a planner that budgets its own slots can hand itself the
-whole project's concurrency, and it would be one more thing the plan validator has to
-police.
-
-**The rollup** is a change to how attention is PRESENTED, never to how it is derived.
-`invariants.true_blockers` stays the single source of truth, every child keeps its own
-flag, and `jarvis wo list` still shows them one by one. What changes is that the strip
-gets one line per feature instead of one per child — the fear the `waiting_pr_merge`
-comment in `project_store.py` states outright: a strip that names everything stops being
-read.
-"""
+"""Phase 3 of feature orders: the per-feature slot cap, and the attention rollup"""
 
 from __future__ import annotations
 
@@ -60,8 +42,7 @@ def child(key: str, needs: list[str] | None = None) -> dict:
 
 
 def a_feature(daemon, store, *keys: str, max_parallel: int | None = None) -> dict:
-    """A released feature order with independent children — no edges, so the only thing
-    that can hold one back is a slot."""
+    """A released feature order with independent children"""
     fo = ops.create_feature_order("proj_a", "CSV export", description=ASK,
                                   max_parallel=max_parallel)
     daemon.tick()
@@ -72,19 +53,18 @@ def a_feature(daemon, store, *keys: str, max_parallel: int | None = None) -> dic
     return store.get_feature_order(fo["id"])
 
 
-# -- max_parallel: the knob -------------------------------------------------------------
+# -- max_parallel: the knob
 
 
 def test_a_feature_order_is_uncapped_by_default(started, store):
-    """The column has existed since Phase 2 and meant nothing. NULL must keep meaning
-    exactly what it meant then: the project's own cap is the only one."""
+    """The column has existed since Phase 2 and meant nothing"""
     fo = ops.create_feature_order("proj_a", "CSV export", description=ASK)
 
     assert fo["max_parallel"] is None
 
 
 def test_the_cap_must_be_at_least_one(started):
-    """Zero is not "no cap", it is a feature order that can never dispatch anything."""
+    """Zero is not "no cap", it is a feature order that can never dispatch anything"""
     with pytest.raises(ops.OpsError, match="at least 1"):
         ops.create_feature_order("proj_a", "CSV export", description=ASK, max_parallel=0)
 
@@ -103,8 +83,7 @@ def test_promoting_a_backlog_item_can_set_the_cap(started):
 
 
 def test_the_cap_is_refused_on_a_plain_work_order_promotion(started):
-    """Refused rather than ignored: a work order has no children to cap, so silently
-    dropping the flag would promote something other than what was asked for."""
+    """Refused rather than ignored: a work order has no children to cap"""
     from jarvis.central_store import CentralStore
 
     central = CentralStore()
@@ -116,7 +95,7 @@ def test_the_cap_is_refused_on_a_plain_work_order_promotion(started):
         central.close()
 
 
-# -- max_parallel: the effect on dispatch -----------------------------------------------
+# -- max_parallel: the effect on dispatch
 
 
 def test_a_capped_feature_dispatches_only_that_many_children(started, store):
@@ -131,16 +110,7 @@ def test_a_capped_feature_dispatches_only_that_many_children(started, store):
 
 
 def test_the_held_child_starts_when_a_sibling_finishes(started, store):
-    """The cap holds a slot, it does not drop the work: nothing is written while a child
-    waits, so the row is simply claimed once a sibling frees one.
-
-    Driven through `claim_next_pending` with the siblings' statuses set here, rather than
-    through a second `daemon.tick()`. A tick reconciles BEFORE it dispatches, so whether a
-    sibling dispatched by the previous tick is still occupying its slot depends on how
-    fast its turn is reaped — which made this test pass locally and fail on CI's 3.11
-    runner. The property under test is the claim filter, not the reaper, so the reaper is
-    taken out of it.
-    """
+    """The cap holds a slot, it does not drop the work: nothing is written while a child waits"""
     fo = a_feature(started, store, "one", "two", "three", max_parallel=2)
     one, two, three = store.feature_children(fo["id"])
     store.set_status(one["id"], "running")
@@ -155,7 +125,7 @@ def test_the_held_child_starts_when_a_sibling_finishes(started, store):
 
 
 def test_an_uncapped_feature_dispatches_everything_the_project_allows(started, store):
-    """The control for the two tests above: same plan, no cap, and all three run."""
+    """The control for the two tests above: same plan, no cap, and all three run"""
     fo = a_feature(started, store, "one", "two", "three")
 
     started.tick()
@@ -164,9 +134,7 @@ def test_an_uncapped_feature_dispatches_everything_the_project_allows(started, s
 
 
 def test_the_cap_does_not_hold_up_unrelated_work(started, store):
-    """The same property Phase 1's dependency filter has: the filter is in the row
-    selection, so a work order that is not a child of the capped feature is claimed while
-    the capped one waits."""
+    """The same property Phase 1's dependency filter has: the filter is in the row selection"""
     fo = a_feature(started, store, "one", "two", "three", max_parallel=1)
     other = ops.create_work_order("proj_a", "unrelated", description="something else")
 
@@ -177,9 +145,7 @@ def test_the_cap_does_not_hold_up_unrelated_work(started, store):
 
 
 def test_the_planner_is_not_capped_against_its_own_children(started, store):
-    """A planner carries `parent_id` too. Capping it against the children it has not
-    decided on yet would be capping a feature against itself — with `max_parallel=1` and
-    one child running, a re-plan would never start."""
+    """A planner carries `parent_id` too"""
     fo = ops.create_feature_order("proj_a", "CSV export", description=ASK,
                                   max_parallel=1)
 
@@ -190,9 +156,7 @@ def test_the_planner_is_not_capped_against_its_own_children(started, store):
 
 
 def test_a_capped_child_says_why_it_is_waiting(started, store):
-    """`pending` alone promises "will start as soon as a slot frees", and for a child
-    behind a full feature that is true but useless — it does not say whose slot. Every
-    surface renders through `status_label`, so saying it here says it everywhere."""
+    """`pending` alone promises "will start as soon as a slot frees\""""
     from jarvis import invariants
 
     fo = a_feature(started, store, "one", "two", max_parallel=1)
@@ -206,8 +170,7 @@ def test_a_capped_child_says_why_it_is_waiting(started, store):
 
 
 def test_a_child_blocked_on_a_dependency_says_that_instead(started, store):
-    """Ranked deliberately: a child waiting on a sibling's MERGE is not going to start
-    when a slot frees, so naming the slot would be the less true of the two answers."""
+    """Ranked deliberately: a child waiting on a sibling's MERGE is not going to start when a slot frees"""
     from jarvis import invariants
 
     fo = ops.create_feature_order("proj_a", "CSV export", description=ASK,
@@ -225,8 +188,7 @@ def test_a_child_blocked_on_a_dependency_says_that_instead(started, store):
 
 
 def test_a_capped_child_is_not_an_attention_item(started, store):
-    """Waiting for a slot is the system working. A blocker that always clears by itself
-    must stay silent — the same rule that keeps a merely unfinished dependency quiet."""
+    """Waiting for a slot is the system working"""
     fo = a_feature(started, store, "one", "two", max_parallel=1)
     started.tick()
 
@@ -244,7 +206,7 @@ def test_show_reports_the_cap_and_what_is_using_it(started, store):
     assert detail["active_children"] == 2
 
 
-# -- the attention rollup ---------------------------------------------------------------
+# -- the attention rollup
 
 
 def flag(store, wo_id: str, reason: str) -> None:
@@ -252,8 +214,7 @@ def flag(store, wo_id: str, reason: str) -> None:
 
 
 def test_three_flagged_children_are_one_line(started, store):
-    """The whole point. Six children could put six lines in a strip that has to stay
-    readable, and the user experiences them as one piece of work."""
+    """The whole point"""
     fo = a_feature(started, store, "one", "two", "three")
     started.tick()
     for c in store.feature_children(fo["id"]):
@@ -266,8 +227,7 @@ def test_three_flagged_children_are_one_line(started, store):
 
 
 def test_the_line_says_how_many_and_which(started, store):
-    """Collapsed, not hidden: the user has to be able to tell one flagged child from
-    three without opening the page first."""
+    """Collapsed, not hidden: the user has to be able to tell one flagged child from three without opening..."""
     fo = a_feature(started, store, "one", "two", "three")
     started.tick()
     kids = store.feature_children(fo["id"])
@@ -283,8 +243,7 @@ def test_the_line_says_how_many_and_which(started, store):
 
 
 def test_the_line_carries_the_progress_count(started, store):
-    """`3/6 done, 1 needs you` — the count is what tells the user whether this is a
-    feature in trouble or one nearly finished."""
+    """`3/6 done, 1 needs you` — the count is what tells the user whether this is a feature in trouble or..."""
     fo = a_feature(started, store, "one", "two", "three")
     started.tick()
     kids = store.feature_children(fo["id"])
@@ -297,8 +256,7 @@ def test_the_line_carries_the_progress_count(started, store):
 
 
 def test_a_standalone_work_order_still_gets_its_own_line(started, store):
-    """The control. Nothing about a work order with no parent changes, and that is nearly
-    all of them."""
+    """The control"""
     wo = ops.create_work_order("proj_a", "unrelated", description="something else")
     store.update_work_order(wo["id"], needs_attention=1, attention_reason="failed")
 
@@ -308,8 +266,7 @@ def test_a_standalone_work_order_still_gets_its_own_line(started, store):
 
 
 def test_the_children_keep_their_own_flags(started, store):
-    """Presentation only. The rollup must not clear anything — `jarvis wo list`, the
-    project page and the feature page all still show each flagged child."""
+    """Presentation only"""
     fo = a_feature(started, store, "one", "two")
     started.tick()
     kids = store.feature_children(fo["id"])
@@ -323,7 +280,7 @@ def test_the_children_keep_their_own_flags(started, store):
 
 
 def test_a_flagged_feature_with_no_flagged_children_still_gets_its_line(started, store):
-    """The Phase 2 case — an escalated plan — must survive the rollup unchanged."""
+    """The Phase 2 case — an escalated plan — must survive the rollup unchanged"""
     fo = ops.create_feature_order("proj_a", "CSV export", description=ASK)
     started.tick()
     store.update_feature_order(fo["id"], needs_attention=1,
@@ -336,10 +293,7 @@ def test_a_flagged_feature_with_no_flagged_children_still_gets_its_line(started,
 
 
 def test_a_failed_feature_reaches_the_strip_at_all(started, store):
-    """`failed` is a SETTLED status, so a scan of the open statuses alone never sees it —
-    and `failed` is also the only status a feature order raises its OWN flag in. The two
-    together meant the "flag once, at feature level" the design asks for was derived
-    correctly and then never shown."""
+    """`failed` is a SETTLED status, so a scan of the open statuses alone never sees it"""
     fo = a_feature(started, store, "one", "two")
     started.tick()
     store.set_status(store.feature_children(fo["id"])[0]["id"], "failed")
@@ -352,9 +306,7 @@ def test_a_failed_feature_reaches_the_strip_at_all(started, store):
 
 
 def test_a_failed_feature_still_rolls_its_children_up(started, store):
-    """A settled feature order has left the open statuses, but a `failed` one always has
-    flagged children. Letting them back into the strip individually would undo the rollup
-    at exactly the moment it is carrying the most lines."""
+    """A settled feature order has left the open statuses, but a `failed` one always has flagged children"""
     fo = a_feature(started, store, "one", "two")
     started.tick()
     kids = store.feature_children(fo["id"])
@@ -370,9 +322,7 @@ def test_a_failed_feature_still_rolls_its_children_up(started, store):
 
 
 def test_status_renders_a_feature_line_without_crashing(started, store, capsys):
-    """`jarvis status` read `approval_id` off every item that carried a `decide` key, so
-    a feature order's line raised KeyError — and the rollup is what makes that line
-    common. The renderer is exercised, not just the data."""
+    """`jarvis status` read `approval_id` off every item that carried a `decide` key"""
     from jarvis import cli
 
     fo = a_feature(started, store, "one", "two")

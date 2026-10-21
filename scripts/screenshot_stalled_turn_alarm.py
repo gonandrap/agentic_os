@@ -1,12 +1,4 @@
-"""Screenshot `/alarms` carrying a `stalled-turn` finding, for a PR's UI evidence.
-
-§7.4 of docs/superpowers/specs/2026-08-30-the-anatomy-of-a-turn.md (issue 227). The
-page's point is the contrast: the new kind sits beside the three that say money is
-going out and says that none is. `scripts/screenshot_wo_alarm_record.py` is the shape
-this copies, temp `JARVIS_HOME` and all, so it never touches the live OS:
-
-    uv run python scripts/screenshot_stalled_turn_alarm.py
-"""
+"""Screenshot `/alarms` carrying a `stalled-turn` finding, for a PR's UI evidence (docs/superpowers/specs/2026-08-30-the-anatomy-of-a-turn.md)"""
 
 from __future__ import annotations
 
@@ -53,13 +45,13 @@ def seed() -> None:
         description="The CSV writer drops the DOI column on multi-author rows.")
     _, path, _ = ops.find_work_order(dead["id"], "jarvis_os")
     pstore = ProjectStore(path)
-    # The live case, as it now reads: no API call, so no claim about money.
+    # The live case, as it now reads: no API call, so no claim about money
     pstore.add_alarm(dead["id"], STALL_ALARM, 3,
                      "this turn has been open 65 minutes and has made no API call at "
                      "all — the work never started, and nothing has been spent on it "
                      f"— `jarvis inspect {dead['id']}`")
     pstore.flag_attention(dead["id"], "a turn open with no API call")
-    # Beside a turn that really is burning, which is the contrast worth seeing.
+    # Beside a turn that really is burning, which is the contrast worth seeing
     pstore.add_alarm(busy["id"], TURN_ALARM, 2,
                      "this turn has been running 74 minutes and is still being billed "
                      "(31 API calls, the last one 2m ago, 4,812,043 tokens for $18.44 "

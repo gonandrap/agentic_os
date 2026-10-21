@@ -1,36 +1,4 @@
-"""LLM-graded plan-review evals: Neo judging SKELETON questions.
-
-Opt-in (spends tokens, needs a logged-in Claude Code):
-    JARVIS_EVALS_LLM=1 pytest evals/llm/test_plan_review_judgment.py -q
-    JARVIS_EVALS_MODEL=opus  # optional, default sonnet
-
-wo-e4a359cb put plan-review questions on a diet: `plans.build_plan_question` now
-renders one line per child and withholds the briefs. The token cut is measured
-elsewhere (`evals/test_question_diet_budget.py`); THIS eval is the other half of that
-bargain — proof the skeleton still carries enough for Neo to review well, and the
-early warning if a future change to the skeleton (or the persona) degrades the
-review. Every question in the battery is composed by the SHIPPED
-`build_plan_question` from a `parse_plan`-validated plan, so the eval always grades
-the input shape production ships, never a hand-written approximation of it.
-
-Four measurements, against Neo's real plan-review path (`neo.answer_question` with
-`kind="plan"`, which selects `PLAN_REVIEWER_PERSONA`):
-
-  * release-blocked recall — a plan with a real problem must NOT be released (4/4)
-  * escalation choice      — an ambiguous ask and a privileged child go to the USER,
-                             not back to the planner (2/2; both are named verbatim in
-                             the persona, and the ambiguous-ask case reproduced 4/4
-                             in the wo-e4a359cb A/B against the real 84KB question)
-  * release willingness    — clean plans are released by Neo alone (≥ 2/3): the whole
-                             point of Neo reviewing plans is that most never cost the
-                             user attention
-  * reason quality         — a rejection names the offending child, judged from its
-                             ONE LINE (the new persona bullet), never from briefs
-
-Validated against production: the `scope-gap` scenario is the silhouette of real
-question #67 (ask names two units, plan covers one), which production Neo escalated
-for exactly the reason this battery expects.
-"""
+"""LLM-graded plan-review evals: Neo judging SKELETON questions (#67)"""
 
 from __future__ import annotations
 
@@ -52,15 +20,13 @@ pytestmark = [
 scenario = pytest.mark.scenario
 MODEL = os.environ.get("JARVIS_EVALS_MODEL", "sonnet")
 
-#: Rides in every child description and must never reach a question: the skeleton
-#: withholds briefs, and the free harness test asserts this marker proves it.
+#: Rides in every child description and must never reach a question: the skeleton withholds briefs
 FAT_MARKER = "FAT-BRIEF-CONTEXT"
 
 
 def _child(key: str, title: str, acceptance: str, needs: list[str] | None = None,
            brief: str = "") -> dict[str, Any]:
-    # As fat as a brief may now be. The point of the marker is that NO brief text reaches
-    # the question, so what matters is that it is there at all, not how much of it.
+    # As fat as a brief may now be
     filler = f"{FAT_MARKER}: {brief or title}. " + "Context repeated at length. " * 15
     return {"key": key, "title": title, "description": filler,
             "needs": needs or [], "acceptance": acceptance,
@@ -68,8 +34,7 @@ def _child(key: str, title: str, acceptance: str, needs: list[str] | None = None
 
 
 def _case(name: str, ask: str, plan_doc: dict[str, Any]) -> tuple[str, str]:
-    # Every plan must stand on a design document (plans._spec_problems). Defaulted here
-    # so a case still says only what it is about; a case may override it.
+    # Every plan must stand on a design document (plans._spec_problems)
     plan = plans.parse_plan({"design_doc": "docs/superpowers/specs/feature.md", **plan_doc})
     fo = {"id": f"fo-{name}", "title": ask.split(".")[0][:80], "description": ask}
     return name, plans.build_plan_question(fo, plan)
@@ -115,13 +80,7 @@ MUST_RELEASE = [
 ]
 
 MUST_BLOCK = [
-    # The #67 silhouette, tension included: the ask names two units of work, the plan
-    # covers one, and folding the other in would take the plan over the child cap —
-    # so "which half did the user mean" is a commitment decision, not a revision the
-    # planner can make. ESCALATE. (An earlier 3-child version of this fixture was
-    # correctly REJECTED by Neo — re-decomposing fit under the cap, so it WAS the
-    # planner's call. The cap pressure is what makes escalation the right verdict,
-    # here and in the real #67.)
+    # The #67 silhouette, tension included: the ask names two units of work
     _case(
         "scope-gap",
         "Validate both invoices and subscription renewals before they post to the "
@@ -150,8 +109,7 @@ MUST_BLOCK = [
                     "the panel scorecard runs green on the invented corpus",
                     needs=["panel"]),
          ]}),
-    # A child that needs a privileged action to do its job: ESCALATE (persona names
-    # merging, releasing and restarting verbatim).
+    # A child that needs a privileged action to do its job: ESCALATE (persona names merging
     _case(
         "privileged-child",
         "Automate the weekly changelog: gather merged PRs into a draft post.",
@@ -163,7 +121,7 @@ MUST_BLOCK = [
                     "the release is deployed to production and the post is public",
                     needs=["gather"]),
          ]}),
-    # A child plainly outside the ask: REJECT, naming it — fixable by the planner.
+    # A child plainly outside the ask: REJECT, naming it — fixable by the planner
     _case(
         "scope-drift",
         "Add a CSV exporter to the reporting module, with a command that calls it "
@@ -175,8 +133,7 @@ MUST_BLOCK = [
              _child("theme", "Add a dark-mode theme to the dashboard",
                     "the dashboard renders in dark mode behind a toggle"),
          ]}),
-    # A child that cannot be named from its line: REJECT — the skeleton is the review
-    # surface now, so an unnameable line is itself the defect.
+    # A child that cannot be named from its line: REJECT
     _case(
         "unnameable-child",
         "Add rate limiting to the public API endpoints.",
@@ -196,7 +153,7 @@ def _released(v: dict[str, Any]) -> bool:
 
 @pytest.fixture(scope="module")
 def verdicts(tmp_path_factory):
-    """One drain over the battery through the REAL plan-review path."""
+    """One drain over the battery through the REAL plan-review path"""
     home = tmp_path_factory.mktemp("plan-review-llm-home")
     os.environ["JARVIS_HOME"] = str(home)
     return collect_verdicts(MODEL, home)

@@ -1,30 +1,5 @@
 #!/usr/bin/env python3
-"""Can a peer message reach a HEADLESS (`claude -p`) worker MID-TURN?
-
-Hand-run only. §3 of
-docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-runs.md
-says why this cannot be a pytest: the root conftest.py points JARVIS_CLAUDE_BIN at a
-stub that exits 1, so a test would measure the stub and report its behaviour as the
-answer.
-
-Receiver argv mirrors `claude_cli.turn_args()` / `spawn_turn()` in every part that
-could plausibly change the answer — `-p --output-format json -n "[WO …] …"`, detached,
-stdin=DEVNULL. ONE DELIBERATE DIFFERENCE: `--session-id` on a fresh session, where a
-real worker's second and later turns use `--resume`. A spike run in a friendlier shape
-answers a question nobody asked, so the difference is named rather than hidden: nothing
-measured here distinguishes the two, and a resumed session is NOT covered.
-
-Mid-turn is PROVEN BY CONSTRUCTION, not asserted: a `-p` session gets one turn and
-exits. If the message is in that turn's result, it arrived between tool calls.
-
-    uv run python scripts/spike_peer_message.py --trials 5
-    uv run python scripts/spike_peer_message.py --mode identity
-
-`--mode identity` answers §3.2 unknown 4 only as far as it goes: a hook allow-listing
-the sender's pid refuses a sender that is not on the list. It does NOT test FORGERY -
-no sender here presents another process's pid - so nothing it prints makes the envelope
-pid trustworthy. See the spike doc.
-"""
+"""Can a peer message reach a HEADLESS (`claude -p`) worker MID-TURN? (docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-runs.md)"""
 
 from __future__ import annotations
 
@@ -40,9 +15,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
-#: Disablers the 2026-08-17 doc review said switch the peer feature off. MEASURED
-#: FALSE for DISABLE_TELEMETRY on 2.1.281; the other three are reported, not tested.
-#: Printed in the header so a run says which were set while it measured.
+#: Disablers the 2026-08-17 doc review said switch the peer feature off
 DISABLERS = ("DISABLE_TELEMETRY", "DO_NOT_TRACK",
              "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_GROWTHBOOK")
 
@@ -171,11 +144,7 @@ def trial(n: int, calls: int, secs: int, fire_after: int, autocompact: str | Non
     }
 
 
-# --------------------------------------------------------------------------
-# Identity mode: can a receiver tell a KNOWN sender from an UNKNOWN one?
-# §3.2 unknown 4. A "no" here means the peer transport does not ship, so it is
-# measured, not reasoned about.
-# --------------------------------------------------------------------------
+# Identity mode: can a receiver tell a KNOWN sender from an UNKNOWN one? §3.2 unknown 4
 
 HOOK = """#!/bin/bash
 payload=$(cat)
@@ -190,8 +159,7 @@ exit 2
 
 
 def descendants(root: int) -> set[int]:
-    """Every pid under `root`, because `claude` is a shim and the socket path names
-    the node process, not the pid we spawned."""
+    """Every pid under `root`, because `claude` is a shim and the socket path names the node process"""
     kids: dict[int, list[int]] = {}
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
@@ -213,11 +181,7 @@ def descendants(root: int) -> set[int]:
 
 def run_sender_tracked(name: str, token: str, timeout: int, allow: Path | None,
                        sender_name: str | None) -> dict[str, object]:
-    """Send, and (when `allow` is given) publish the sender's own pid tree as it runs.
-
-    That IS the production shape: a long-lived daemon knows its own pid and can tell
-    the receiver about it out of band. A forger cannot get into this file.
-    """
+    """Send, and (when `allow` is given) publish the sender's own pid tree as it runs"""
     args = [claude(), "-p", "--output-format", "json", "--permission-mode", "auto",
             "--allowedTools", "ListAgents", "SendMessage"]
     if sender_name:
@@ -257,9 +221,7 @@ def identity_trials(calls: int, secs: int, fire_after: int,
         {"hooks": [{"type": "command", "command": str(hook)}]}]}}))
 
     rows = []
-    # 1) honest: the sender publishes its own pids, so the hook allow-lists it.
-    # 2) forger: same binary, NO publication, and it names itself after the honest
-    #    sender - the `from-name` a receiver sees is self-declared.
+    # 1) honest: the sender publishes its own pids
     for label, track, sender_name in (("honest", True, "jarvis-daemon"),
                                       ("forger", False, "jarvis-daemon")):
         log.write_text("")
@@ -304,7 +266,7 @@ def main() -> int:
     ap.add_argument("--secs", type=int, default=5)
     ap.add_argument("--fire-after", type=int, default=20)
     ap.add_argument("--autocompact", default=None)
-    # The receiver-side off switch: `crossSessionInbound` accept | hold | refuse.
+    # The receiver-side off switch: `crossSessionInbound` accept | hold | refuse
     ap.add_argument("--settings", default=None)
     ap.add_argument("--out", default="/tmp/spike-peer-message")
     ap.add_argument("--mode", choices=("delivery", "identity"), default="delivery")

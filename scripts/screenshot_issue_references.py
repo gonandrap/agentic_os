@@ -1,23 +1,4 @@
-"""Screenshot the ISSUE INDEX — both ends of it — for a PR's UI evidence.
-
-`scripts/screenshot_follow_ups.py` is the shape this copies, and the seeding is
-deliberately the same so the two pictures are comparable: two rounds, the issues filed
-by `ops.file_validation_follow_ups` ITSELF rather than seeded by hand, and only the
-panel's verdict faked.
-
-WHAT THIS ADDS, and why one shot would not do. A SECOND work order cites one of those
-issues in its brief, so the ranking has something to rank: the project page shows an
-issue referenced twice above one referenced once, which is the whole priority signal —
-a single-issue shot cannot show an order.
-
-`gh` IS THE SHIPPED FAKE for `screenshot_follow_ups`' reason: the project claims a real
-public tracker as its `origin`, so a real `gh` here would open real issues.
-
-Writes PNGs to docs/screenshots/. Everything it touches lives in a temp `JARVIS_HOME`
-and a temp catalog, so it never reads or writes the live OS:
-
-    uv run python scripts/screenshot_issue_references.py
-"""
+"""Screenshot the ISSUE INDEX — both ends of it — for a PR's UI evidence"""
 
 from __future__ import annotations
 
@@ -90,7 +71,7 @@ def _opinion(store, round_id, seat, verdict, reason, findings):
 
 
 def raiser(store, catalog) -> str:
-    """The order whose review filed three issues over two rounds."""
+    """The order whose review filed three issues over two rounds"""
     from jarvis import ops
 
     wo = ops.create_work_order(
@@ -135,7 +116,7 @@ def raiser(store, catalog) -> str:
 
 
 def citer() -> None:
-    """A later order whose brief cites one of them. This is what makes a count a rank."""
+    """A later order whose brief cites one of them"""
     from jarvis import ops
 
     ops.create_work_order(
@@ -171,8 +152,7 @@ def seed() -> tuple[Path, str]:
     wo_id = raiser(pstore, load_catalog(catalog))
     pstore.close()
     citer()
-    # The sweep is what reads each issue's state and writes the count back. Run one
-    # tick's worth of it, so the pictures show what a live fleet shows.
+    # The sweep is what reads each issue's state and writes the count back
     from jarvis.daemon import Daemon
 
     daemon = Daemon(load_catalog(catalog))

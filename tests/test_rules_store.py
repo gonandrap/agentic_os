@@ -1,20 +1,4 @@
-"""The self-evolution registry's rows: `detectors`, `remedy_rules`, `rule_fires`.
-
-Three properties carry the weight here, and each has a block below.
-
-1. **Nothing unvalidated reaches the table.** A condition is parsed on INSERT, a
-   `gap_class` must be a slug, a remedy names a primitive from the closed
-   `remedies.REMEDIES`. A row the engine cannot read is a row that silently answers a
-   question nobody asked.
-2. **Rows are never deleted.** Retraction writes `retired_at` and a reason; the row stays
-   listed with `include_retired=True`. Same discipline as `gate_rules` and the knowledge
-   base, for the same reason: what the OS believed and when is evidence.
-3. **The tables open on a LIVE database.** `test_a_database_written_before_these_tables_
-   existed_opens_and_works` builds an `os.db` from the previous release's `SCHEMA` and
-   opens the current `CentralStore` on it. A new table is untested until that passes.
-
-Spec: docs/superpowers/specs/2026-09-27-self-evolution.md §3.1, §3.3, §3.4.
-"""
+"""The self-evolution registry's rows: `detectors`, `remedy_rules`, `rule_fires` (docs/superpowers/specs/2026-09-27-self-evolution.md §3.1)"""
 
 from __future__ import annotations
 
@@ -36,13 +20,7 @@ COND = {"all": [{"field": "status", "op": "eq", "value": "needs_review"},
 @pytest.fixture()
 def store(jarvis_home):
     s = CentralStore()
-    # THE FIVE BUILTIN SEED ROWS ARE CLEARED. `CentralStore` seeds them on every open
-    # (docs/superpowers/specs/2026-09-27-self-evolution.md §5.3), and this file is about
-    # the TABLE MECHANICS — a row round-tripping, an insert being refused, a retraction never
-    # deleting — every assertion of which is written as "and the table stays empty". The
-    # seeds themselves are proved in `tests/test_rules_tick.py`, which is the section that
-    # owns their call site; asserting them here too would be two files disagreeing about
-    # what a count means the first time a sixth rule is seeded.
+    # THE FIVE BUILTIN SEED ROWS ARE CLEARED (docs/superpowers/specs/2026-09-27-self-evolution.md §5.3)
     s.conn.execute("DELETE FROM remedy_rules")
     s.conn.execute("DELETE FROM detectors")
     s.conn.commit()          # another connection (the CLI opens its own) must see it
@@ -56,7 +34,7 @@ def _detector(store, **kw):
     return store.add_detector(**kw)
 
 
-# -- nothing unvalidated reaches the table ----------------------------------------------
+# -- nothing unvalidated reaches the table
 
 
 def test_a_detector_round_trips_and_is_created_in_dry_run(store):
@@ -125,7 +103,7 @@ def test_a_remedy_rule_refuses_an_unknown_or_retracted_detector(store):
     assert "retracted" in str(e.value)
 
 
-# -- scope: '' is every project ---------------------------------------------------------
+# -- scope: '' is every project
 
 
 def test_list_detectors_for_a_project_returns_its_rows_and_the_fleet_wide_ones(store):
@@ -148,7 +126,7 @@ def test_list_detectors_filters_by_gap_class_and_status(store):
     assert store.list_detectors(status=rules.ARMED) == []
 
 
-# -- retraction never deletes -----------------------------------------------------------
+# -- retraction never deletes
 
 
 def test_retracting_a_detector_hides_it_retracts_its_remedies_and_never_deletes(store):
@@ -185,7 +163,7 @@ def test_retracting_a_remedy_rule_never_deletes_and_refuses_a_second_time(store)
         store.retract_remedy_rule("rm-nope", "never existed")
 
 
-# -- fires: what counts as a hit, and the dedupe memory ---------------------------------
+# -- fires: what counts as a hit, and the dedupe memory
 
 
 def _fire(store, det, outcome, **kw):
@@ -258,11 +236,11 @@ def test_list_rule_fires_is_newest_first_and_filters(store):
     assert [f["id"] for f in store.list_rule_fires(project="proj_a", limit=1)] == [c["id"]]
 
 
-# -- the migration ----------------------------------------------------------------------
+# -- the migration
 
 
 def _previous_schema() -> str:
-    """The `SCHEMA` literal as it was at HEAD — before these three tables existed."""
+    """The `SCHEMA` literal as it was at HEAD — before these three tables existed"""
     src = subprocess.run(["git", "show", "HEAD:src/jarvis/central_store.py"],
                          capture_output=True, text=True, check=True).stdout
     for node in ast.parse(src).body:
@@ -274,14 +252,7 @@ def _previous_schema() -> str:
 
 def test_a_database_written_before_these_tables_existed_opens_and_works(jarvis_home,
                                                                         tmp_path):
-    """A new table is untested until a LIVE-SHAPED database opens on it.
-
-    `CREATE TABLE IF NOT EXISTS` creates the three new tables in an `os.db` that predates
-    them, which is exactly why they need no `ADDED_COLUMNS` entry — but "exactly why" is
-    an argument, and this is the check. The old rows have to survive it too: a schema
-    change that opens and silently drops what was already there passes every test that
-    only writes.
-    """
+    """A new table is untested until a LIVE-SHAPED database opens on it"""
     path = tmp_path / "old-os.db"
     old = db.connect(path)
     old.executescript(_previous_schema())
@@ -304,11 +275,11 @@ def test_a_database_written_before_these_tables_existed_opens_and_works(jarvis_h
         store.close()
 
 
-# -- scope: an io-learned rule may not police the fleet ----------------------------------
+# -- scope: an io-learned rule may not police the fleet
 
 
 def test_an_io_learned_detector_may_not_be_fleet_wide(store):
-    """§3: fleet-wide is the POWERFUL case, so it is the reviewed one."""
+    """§3: fleet-wide is the POWERFUL case, so it is the reviewed one"""
     with pytest.raises(ValueError) as e:
         _detector(store, source="io", project="")
     assert "io" in str(e.value) and "project" in str(e.value)
@@ -324,7 +295,7 @@ def test_builtin_and_user_detectors_may_be_fleet_wide(store, source):
     assert det["project"] == "" and det["source"] == source
 
 
-# -- a remedy row follows its detector ---------------------------------------------------
+# -- a remedy row follows its detector
 
 
 def test_add_remedy_rule_always_writes_dry_run(store):
@@ -333,9 +304,7 @@ def test_add_remedy_rule_always_writes_dry_run(store):
 
 
 def test_this_section_exposes_no_verb_that_arms_a_remedy_row(store):
-    """Arming landed with the alarm bridge (§6), in one transaction over the pair, and
-    the verbs that do it are exactly these. Nothing ELSE may set a remedy row to `armed`
-    — that would make the pair a combination §3.3 says cannot exist."""
+    """Arming landed with the alarm bridge (§6)"""
     assert sorted(n for n in dir(CentralStore) if "arm" in n.lower()) == [
         "arm_detector", "disarm_detector"]
     for verb in (CentralStore.add_remedy_rule, CentralStore.retract_remedy_rule,

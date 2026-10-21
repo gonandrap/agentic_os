@@ -1,14 +1,4 @@
-"""A merge request that names the base it was filed against, and is withdrawn when it moves.
-
-docs/superpowers/specs/2026-09-28-a-merge-checks-the-base-it-lands-on.md §3.5 and §3.6,
-GitHub issue #837. Its own file rather than more of `tests/test_automerge.py`: these are
-about the APPROVALS LEDGER — what a pending request records and what closes it — rather
-than about the branch.
-
-THE MEASURED INCIDENT IS THE FIRST TEST. Gate 308 authorised a squash of PR #829 whose
-judged head did not contain `main`'s tip, and it got there because `pr.base_oid` — GitHub's
-cached `baseRefOid` — lagged the real tip by three commits and 5.3 hours.
-"""
+"""A merge request that names the base it was filed against, and is withdrawn when it moves (docs/superpowers/specs/2026-09-28-a-merge-checks-the-base-it-lands-on.md §3.5)"""
 
 from __future__ import annotations
 
@@ -22,11 +12,11 @@ from jarvis.project_store import ProjectStore
 
 PR = "https://github.com/acme/proj/pull/7"
 
-#: The commit round 1 judged, the base tip it contains, and the tip it does NOT.
+#: The commit round 1 judged, the base tip it contains, and the tip it does NOT
 JUDGED = "709582ae53000000000000000000000000000aaa"
 BASE_1 = "8ea18feec4000000000000000000000000000821"
 BASE_2 = "37fe650fab000000000000000000000000000827"
-#: Where `origin/main` REALLY is when GitHub is still reporting BASE_2.
+#: Where `origin/main` REALLY is when GitHub is still reporting BASE_2
 BASE_3 = "9d41c0be77000000000000000000000000000833"
 UPDATED = "c2120424ba000000000000000000000000000bbb"
 
@@ -47,7 +37,7 @@ def started(jarvis_home, fake_claude, catalog_file, project):
 
 @pytest.fixture()
 def local(local_base):
-    """The shared checkout fake (`testing.local_base`), at this file's base commit."""
+    """The shared checkout fake (`testing.local_base`), at this file's base commit"""
     local_base.update({"tip": BASE_1, "contains": {BASE_1}})
     return local_base
 
@@ -83,14 +73,12 @@ def merges(fake_gh) -> list:
     return [c for c in fake_gh.calls if c["argv"][:2] == ["pr", "merge"]]
 
 
-# -- the incident ---------------------------------------------------------------------
+# -- the incident
 
 
 def test_gate_308_a_head_that_contains_only_githubs_stale_base_is_never_proposed(
         started, project, fake_gh, local):
-    """THE REGRESSION, issue #837 / gate 308. The judged head contains the base commit
-    `pr.base_oid` reports (B1); `origin/main` is really at B2, a descendant of B1 the head
-    does not contain. Nothing may be proposed and nothing may be merged."""
+    """THE REGRESSION, issue #837 / gate 308"""
     opt_in(started)
     store, wo = parked(project)
     green_pr(fake_gh, base_oid=BASE_1)         # GitHub's cached reading: 5.3h behind
@@ -104,9 +92,7 @@ def test_gate_308_a_head_that_contains_only_githubs_stale_base_is_never_proposed
 
 def test_a_base_that_moves_between_the_verdict_and_the_merge_refuses_and_catches_up(
         started, project, fake_gh, local):
-    """§3.1's daemon arm: the grant is live, the head has not moved, and `main` has. The
-    merge never reaches GitHub, the refusal is on the record and the branch is caught up.
-    """
+    """§3.1's daemon arm: the grant is live, the head has not moved, and `main` has"""
     opt_in(started)
     store, wo = parked(project)
     green_pr(fake_gh)
@@ -128,21 +114,10 @@ def test_a_base_that_moves_between_the_verdict_and_the_merge_refuses_and_catches
 
 def test_a_checkout_that_cannot_resolve_githubs_base_oid_does_not_stall_for_ever(
         started, project, fake_gh, local):
-    """THE LIVELOCK. The pre-`decide` fact is UNFETCHED, so a checkout that does not have
-    `pr.base_oid` at all cannot answer the ancestry question — and `ops.catch_up_needed`
-    reads "cannot answer" as BEHIND, on every tick. The fetched read is authoritative: the
-    tip IS contained, so the tick re-decides without the stale fact and carries on.
-
-    Holding on the cheap read instead would park a mergeable pull request for ever, and
-    write nothing saying why. The safety property is untouched — `apply` fetches too.
-
-    THE REQUEST MUST SURVIVE THE RE-DECIDE and the merge must actually land: §3.6's
-    supersede reads the cheap fact too, so an over-report there withdraws a healthy
-    pending request and blocks its command string for ever."""
+    """THE LIVELOCK"""
     opt_in(started)
     store, wo = parked(project)
-    # GitHub reports a base commit this checkout has never seen; `origin/main` is at BASE_1
-    # and the judged head contains it.
+    # GitHub reports a base commit this checkout has never seen
     green_pr(fake_gh, base_oid=BASE_2)
     local.update({"tip": BASE_1, "contains": {BASE_1}})
 
@@ -163,13 +138,12 @@ def test_a_checkout_that_cannot_resolve_githubs_base_oid_does_not_stall_for_ever
     assert [c["argv"][:2] for c in merges(fake_gh)] == [["pr", "merge"]]
 
 
-# -- §3.5: the base is ON the request -------------------------------------------------
+# -- §3.5: the base is ON the request
 
 
 def test_the_request_records_and_states_the_base_it_was_filed_against(
         started, project, fake_gh, local):
-    """§3.5: a column, the `automerge_proposed` payload, and the sentence the reviewer
-    reads — which now names the check that will catch the base if it moves again."""
+    """§3.5: a column, the `automerge_proposed` payload, and the sentence the reviewer reads"""
     opt_in(started)
     store, wo = parked(project)
     green_pr(fake_gh)
@@ -190,8 +164,7 @@ def test_the_request_records_and_states_the_base_it_was_filed_against(
 
 
 def test_the_column_arrives_on_a_database_that_was_created_without_it(started, project):
-    """§3.5 through `ADDED_COLUMNS` + `_migrate`, this repo's one mechanism: an approval
-    written before the column existed reads as `''` — "this request records no base"."""
+    """§3.5 through `ADDED_COLUMNS` + `_migrate`"""
     store = ProjectStore(project)
     store.conn.execute("ALTER TABLE approvals DROP COLUMN base_oid")
     wo = ops.create_work_order("proj_a", "old order")
@@ -207,13 +180,12 @@ def test_the_column_arrives_on_a_database_that_was_created_without_it(started, p
         store.close()
 
 
-# -- §3.6: a pending request whose base moved is superseded ----------------------------
+# -- §3.6: a pending request whose base moved is superseded
 
 
 def test_a_pending_request_whose_base_moved_is_superseded_and_never_answered(
         started, project, fake_gh, local):
-    """§3.6: nothing is authorised and nothing is refused. The command string stays
-    blocked, so the next request is a real review of the commit that will actually land."""
+    """§3.6: nothing is authorised and nothing is refused"""
     opt_in(started)
     store, wo = parked(project)
     green_pr(fake_gh)
@@ -221,8 +193,7 @@ def test_a_pending_request_whose_base_moved_is_superseded_and_never_answered(
     [approval] = store.list_approvals(wo["id"])
     assert approval["status"] == "pending"
 
-    # GitHub says BASE_2; the checkout, after fetching, says BASE_3 — the commit the merge
-    # would really land on.
+    # GitHub says BASE_2; the checkout, after fetching, says BASE_3
     fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED,
                    base_oid=BASE_2)
     local["tip"] = BASE_3
@@ -230,8 +201,7 @@ def test_a_pending_request_whose_base_moved_is_superseded_and_never_answered(
 
     row = store.get_approval(approval["id"])
     assert row["status"] == "expired" and row["closed_as"] == "superseded"
-    # The recorded base of the request, and the FETCHED tip — never `pr.base_oid`: §3.1's
-    # whole point is that GitHub's cached read is untrustworthy.
+    # The recorded base of the request, and the FETCHED tip
     assert row["decided_by"] == "os" and BASE_1[:10] in row["decision_reason"]
     assert BASE_3[:10] in row["decision_reason"]
     assert BASE_2[:10] not in row["decision_reason"]
@@ -246,9 +216,7 @@ def test_a_pending_request_whose_base_moved_is_superseded_and_never_answered(
 
 def test_an_already_approved_request_is_left_exactly_as_it_was(started, project,
                                                                fake_gh, local):
-    """§3.6's race, and why it is safe: Neo can answer between the read and the write.
-    `supersede_approval` no-ops on a decided row, and §3.1's precondition is then what
-    stops the merge."""
+    """§3.6's race, and why it is safe: Neo can answer between the read and the write"""
     opt_in(started)
     store, wo = parked(project)
     green_pr(fake_gh)
@@ -269,9 +237,7 @@ def test_an_already_approved_request_is_left_exactly_as_it_was(started, project,
 
 def test_the_propose_supersede_loop_is_bounded_and_ends_in_one_exhausted_hold(
         started, project, fake_gh, local):
-    """§3.6's three bounds, driven on a base that moves on every tick. The ceiling is
-    designed: `ops.CATCH_UP_MAX` updates, then a hold that names the cap and asks the
-    user — never an endless pair of requests nobody can answer."""
+    """§3.6's three bounds, driven on a base that moves on every tick"""
     opt_in(started)
     store, wo = parked(project)
     green_pr(fake_gh)
@@ -292,13 +258,12 @@ def test_the_propose_supersede_loop_is_bounded_and_ends_in_one_exhausted_hold(
     assert merges(fake_gh) == []
 
 
-# -- §3.4: the hold names the FETCHED tip, never `pr.base_oid` -------------------------
+# -- §3.4: the hold names the FETCHED tip, never `pr.base_oid`
 
 
 def test_the_hold_on_a_refused_catch_up_names_the_fetched_tip_not_githubs(
         started, project, fake_gh, local):
-    """§3.1: GitHub's cached `baseRefOid` is untrustworthy, so it may not be quoted at a
-    user. GitHub says BASE_2; `origin/main` is really at BASE_3."""
+    """§3.1: GitHub's cached `baseRefOid` is untrustworthy, so it may not be quoted at a user"""
     opt_in(started)
     store, wo = parked(project)
     green_pr(fake_gh)
@@ -316,14 +281,12 @@ def test_the_hold_on_a_refused_catch_up_names_the_fetched_tip_not_githubs(
     assert BASE_2[:10] not in held[-1]["reason"]
 
 
-# -- §3.6 / Amendment E: only a FETCHED base fact withdraws a request ------------------
+# -- §3.6 / Amendment E: only a FETCHED base fact withdraws a request
 
 
 def test_a_deferred_catch_up_leaves_the_pending_request_standing(started, project,
                                                                  fake_gh, local):
-    """A deferral is retried, not withdrawn (§3.6 / Amendment E). The guard clears by
-    itself and the next tick re-reads; withdrawing here buys a fresh Neo review for a base
-    move nobody has confirmed."""
+    """A deferral is retried, not withdrawn (§3.6 / Amendment E)"""
     opt_in(started)
     store, wo = parked(project)
     green_pr(fake_gh)
@@ -345,9 +308,7 @@ def test_a_deferred_catch_up_leaves_the_pending_request_standing(started, projec
 
 def test_a_catch_up_that_never_fetched_leaves_the_pending_request_standing(
         started, project, fake_gh, local):
-    """A pre-fetch FAILED carries no base fact at all — `base_tip` is empty (§3.6 /
-    Amendment E). Superseding on it withdraws a healthy request on the strength of
-    `pr.base_oid`, the read §3.1 exists because it cannot be trusted."""
+    """A pre-fetch FAILED carries no base fact at all — `base_tip` is empty (§3.6 / Amendment E)"""
     opt_in(started)
     store, wo = parked(project)
     green_pr(fake_gh)
@@ -365,8 +326,7 @@ def test_a_catch_up_that_never_fetched_leaves_the_pending_request_standing(
 
 
 def test_held_base_moved_without_a_fetched_tip_names_no_commit_at_all():
-    """No fetched read means no commit in the sentence — not `pr.base_oid`, and not a
-    placeholder either."""
+    """No fetched read means no commit in the sentence — not `pr.base_oid`, and not a placeholder either"""
     catch_up = ops.CatchUp(pr=None, outcome=ops.CATCH_UP_FAILED, reason="fetch failed")
     pr = type("PR", (), {"base_ref": "main", "base_oid": BASE_2, "head_oid": JUDGED})()
 

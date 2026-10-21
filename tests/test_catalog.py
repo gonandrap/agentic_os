@@ -57,15 +57,9 @@ def test_max_concurrent_config():
 
 
 def test_autocompact_is_bounded_by_default():
-    """The context bound is ON for a catalog that says nothing about it.
-
-    This is the whole point of the setting: cache READ is 56% of the fleet's bill and
-    it is linear in context size, so a default of "no bound" leaves the bleed running
-    until someone remembers a flag.
-    """
+    """The context bound is ON for a catalog that says nothing about it"""
     cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
-    # The literal, not the constant: asserting the constant against itself would hold
-    # even if someone set it to None, which is the one change this test exists to catch.
+    # The literal, not the constant: asserting the constant against itself would hold even if someone set...
     assert cat.os.default_autocompact_window == 400_000
     assert cat.projects[0].worker.autocompact_window == 400_000
     assert DEFAULT_AUTOCOMPACT_WINDOW == 400_000
@@ -80,20 +74,14 @@ def test_autocompact_fleet_default_and_project_override():
              "worker": {"autocompact_window": 600_000}},           # raises it
         ],
     })
-    # None of the three is DEFAULT_AUTOCOMPACT_WINDOW: an override that silently fell
-    # back to the module default would otherwise pass this test.
+    # None of the three is DEFAULT_AUTOCOMPACT_WINDOW: an override that silently fell back to the module...
     assert cat.os.default_autocompact_window == 200_000
     assert cat.projects[0].worker.autocompact_window == 200_000
     assert cat.projects[1].worker.autocompact_window == 600_000
 
 
 def test_a_project_opts_out_with_an_explicit_null():
-    """null is the opt-out, and it must survive a non-null fleet default.
-
-    The `or`-style fallback that reads fine for model and effort is wrong here: 0 and
-    None both mean "no bound", so a project's null has to beat the fleet's number
-    rather than fall through to it.
-    """
+    """null is the opt-out, and it must survive a non-null fleet default"""
     cat = parse_catalog({
         "os": {"defaults": {"autocompact_window": 150_000}},
         "projects": [{"name": "a", "path": "/tmp/a",
@@ -103,7 +91,7 @@ def test_a_project_opts_out_with_an_explicit_null():
 
 
 def test_absent_and_null_are_different():
-    """Silence inherits the bound; only an explicit null removes it."""
+    """Silence inherits the bound; only an explicit null removes it"""
     cat = parse_catalog({
         "projects": [
             {"name": "a", "path": "/tmp/a", "worker": {}},
@@ -115,11 +103,7 @@ def test_absent_and_null_are_different():
 
 
 def test_tool_search_defaults_and_overrides_per_project():
-    """§4 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md: a three-state string enum,
-    fleet-wide with a per-project override. The default PINS DEFERRAL ON — deferral is
-    what makes a worker's first navigation call a symbol call (7/7 deferred against 1/10
-    with the tools present, wo-ab5d81db), so `cli` would leave that outcome to a vendor
-    default and `off` is a measured regression on it."""
+    """§4 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md: a three-state string enum"""
     from jarvis.catalog import DEFAULT_WORKER_TOOL_SEARCH, VALID_TOOL_SEARCH
 
     assert DEFAULT_WORKER_TOOL_SEARCH == "on"
@@ -142,8 +126,7 @@ def test_tool_search_defaults_and_overrides_per_project():
 
 
 def test_an_invalid_tool_search_names_the_key_and_the_valid_values():
-    """The enum check IS the error message `jarvis config set` shows: `ops.set_config`
-    re-parses the document to validate (spec §4)."""
+    """The enum check IS the error message `jarvis config set` shows: `ops.set_config` re-parses the..."""
     with pytest.raises(CatalogError) as e:
         parse_catalog({"projects": [{"name": "a", "path": "/x",
                                      "worker": {"tool_search": "true"}}]})
@@ -153,11 +136,7 @@ def test_an_invalid_tool_search_names_the_key_and_the_valid_values():
 
 
 def test_py_nav_hook_defaults_off_and_overrides_per_project():
-    """§6 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md: TWO states, not three —
-    `cli` exists only where Jarvis defers to a vendor behaviour, and this hook is
-    entirely Jarvis's own. Default OFF: the hook measures ZERO contribution to first-call
-    order, and on fleet-wide a worker cannot search the tree for ANY text (issue 936);
-    wo-d2d777dc owns that fix and the flip is sequenced behind it (wo-ab5d81db)."""
+    """§6 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md: TWO states, not three"""
     from jarvis.catalog import DEFAULT_WORKER_PY_NAV_HOOK, VALID_PY_NAV_HOOK
 
     assert DEFAULT_WORKER_PY_NAV_HOOK == "off"
@@ -180,7 +159,7 @@ def test_py_nav_hook_defaults_off_and_overrides_per_project():
 
 
 def test_an_invalid_py_nav_hook_names_the_key_and_the_valid_values():
-    """The enum check IS the error message `jarvis config set` shows (spec §6)."""
+    """The enum check IS the error message `jarvis config set` shows (spec §6)"""
     with pytest.raises(CatalogError) as e:
         parse_catalog({"projects": [{"name": "a", "path": "/x",
                                      "worker": {"py_nav_hook": "true"}}]})
@@ -190,10 +169,7 @@ def test_an_invalid_py_nav_hook_names_the_key_and_the_valid_values():
 
 
 def test_bash_first_defaults_off_and_overrides_per_project():
-    """§1 of docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md: a string
-    enum, fleet-wide with a per-project override, and the DEFAULT DISABLES — `relaxed` is
-    a softer copy of the instruction that already beat the brief at a measured 0% hit
-    rate."""
+    """§1 of docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md: a string enum"""
     from jarvis.catalog import DEFAULT_WORKER_BASH_FIRST, VALID_BASH_FIRST
 
     assert DEFAULT_WORKER_BASH_FIRST == "off"
@@ -223,8 +199,7 @@ def test_every_bash_first_value_parses(value):
 
 
 def test_an_invalid_bash_first_names_the_key_and_the_valid_values():
-    """The enum check IS the error message `jarvis config set` shows: `ops.set_config`
-    re-parses the document to validate (spec §1)."""
+    """The enum check IS the error message `jarvis config set` shows: `ops.set_config` re-parses the..."""
     with pytest.raises(CatalogError) as e:
         parse_catalog({"projects": [{"name": "a", "path": "/x",
                                      "worker": {"bash_first": "true"}}]})
@@ -234,8 +209,7 @@ def test_an_invalid_bash_first_names_the_key_and_the_valid_values():
 
 
 def test_cache_ttl_defaults_to_five_minutes_and_overrides_per_project():
-    """§1 of docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md: the
-    apparatus ships with the control arm, so nothing changes until a project opts in."""
+    """§1 of docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md: the apparatus ships with..."""
     from jarvis.catalog import DEFAULT_WORKER_CACHE_TTL, VALID_WORKER_CACHE_TTL
 
     assert DEFAULT_WORKER_CACHE_TTL == "5m"
@@ -265,7 +239,7 @@ def test_every_cache_ttl_value_parses(value):
 
 
 def test_an_invalid_cache_ttl_names_the_key_and_the_valid_values():
-    """The enum check IS the error message `jarvis config set` shows (spec §1)."""
+    """The enum check IS the error message `jarvis config set` shows (spec §1)"""
     with pytest.raises(CatalogError) as e:
         parse_catalog({"projects": [{"name": "a", "path": "/x",
                                      "worker": {"cache_ttl": "1 hour"}}]})
@@ -293,8 +267,7 @@ def test_an_invalid_cache_ttl_names_the_key_and_the_valid_values():
     ({"projects": [{"name": "a", "path": "/x"}, {"name": "a", "path": "/y"}]}, "duplicate"),
     ({"projects": [{"name": "a", "path": "/x", "worker": {"permission_mode": "yolo"}}]}, "permission_mode"),
     ({"projects": [{"name": "a", "path": "/x", "max_concurrent": 0}]}, "max_concurrent"),
-    # Outside the range `claude --autocompact` accepts: caught at boot, not on the
-    # first dispatch, because the CLI's rejection would surface as a dead worker.
+    # Outside the range `claude --autocompact` accepts: caught at boot
     ({"os": {"defaults": {"autocompact_window": 50_000}}}, "autocompact_window"),
     ({"os": {"defaults": {"autocompact_window": 2_000_000}}}, "autocompact_window"),
     ({"projects": [{"name": "a", "path": "/x",
@@ -319,7 +292,7 @@ def test_unknown_project_lookup():
 
 
 def test_empty_projects_allowed():
-    # A standby instance (e.g. a fresh production deployment) boots empty.
+    # A standby instance (e.g. a fresh production deployment) boots empty
     cat = parse_catalog({"projects": []})
     assert cat.projects == []
 
@@ -329,7 +302,7 @@ def test_missing_projects_defaults_empty():
     assert cat.projects == []
 
 
-# -- Neo's panel ---------------------------------------------------------------------
+# -- Neo's panel
 
 
 def panel_of(raw):
@@ -337,8 +310,7 @@ def panel_of(raw):
 
 
 def test_the_panel_is_off_unless_a_catalog_turns_it_on():
-    """The rule every work order in this feature obeys. Enabling it is a catalog edit,
-    gated on a measurement that does not exist yet — never a default that drifts in."""
+    """The rule every work order in this feature obeys"""
     assert parse_catalog({"projects": []}).os.neo.panel.enabled is False
 
 
@@ -353,18 +325,12 @@ def test_an_empty_panel_block_parses():
 
 
 def test_a_roster_of_every_seat_parses():
-    """The negative control for the validator below: `neo_store.SEATS` is the vocabulary,
-    and every name in it must be accepted — including the seats whose definitions ship in
-    a later release. A config written ahead of the code is caught at run time (the seat
-    records a `failed` opinion and the panel proceeds), not by refusing to boot the
-    fleet."""
+    """The negative control for the validator below: `neo_store.SEATS` is the vocabulary"""
     assert panel_of({"roster": list(SEATS)}).roster == SEATS
 
 
 def test_a_roster_naming_an_unknown_seat_is_rejected():
-    """Every seat past `premise` is a safety check, so a typo that silently drops one
-    removes a check and tells nobody — the same reasoning as an invalid
-    `permission_mode`, with more at stake."""
+    """Every seat past `premise` is a safety check"""
     with pytest.raises(CatalogError, match="scpetic"):
         panel_of({"roster": ["premise", "scpetic", "chair"]})
 
@@ -397,7 +363,7 @@ def test_panel_settings_round_trip():
     assert p.fast_path is False
 
 
-# -- the validation panel -------------------------------------------------------------
+# -- the validation panel
 
 
 def validation_of(raw):
@@ -405,12 +371,7 @@ def validation_of(raw):
 
 
 def test_validation_ships_disabled_with_every_default_spelled_out():
-    """All eight by value, not by shape.
-
-    `enabled` is the load-bearing one — at this default the OS must behave exactly as
-    it does today — but each of the others prices a round, and a default that drifted
-    would change fleet-wide spend without anyone editing a catalog.
-    """
+    """All eight by value, not by shape"""
     v = parse_catalog({"projects": []}).os.validation
     assert v.enabled is False
     assert v.roster == ("tester", "security", "architect", "maintainer", "chair")
@@ -427,10 +388,7 @@ def test_validation_ships_disabled_with_every_default_spelled_out():
 
 
 def test_a_validator_roster_naming_an_unknown_seat_is_rejected_and_the_five_are_not():
-    """Paired on purpose. A validator strict enough to catch the typo is easy to write
-    and easy to write too strictly, and the failure mode of "too strict" is a fleet that
-    refuses to start — so the five legal names must be proved accepted in the same
-    breath as the illegal one is refused."""
+    """Paired on purpose"""
     assert validation_of({"roster": list(VALIDATOR_SEATS)}).roster == VALIDATOR_SEATS
     with pytest.raises(CatalogError, match="tetser"):
         validation_of({"roster": ["tetser", "chair"]})
@@ -440,14 +398,7 @@ def test_a_validator_roster_naming_an_unknown_seat_is_rejected_and_the_five_are_
 
 def test_a_roster_naming_a_seat_whose_markdown_has_not_shipped_still_parses(monkeypatch,
                                                                             tmp_path):
-    """`VALIDATOR_SEATS` is the VOCABULARY, not the set of seats shipped in this build.
-
-    All five now ship, so the staging case this test was written for — config written
-    ahead of the code — has to be STAGED rather than found: the seat directory is swapped
-    for an empty one, and parsing must still accept the five defaults. If it consulted
-    the asset directory, a catalog written for the next release would stop the fleet
-    booting on this one.
-    """
+    """`VALIDATOR_SEATS` is the VOCABULARY, not the set of seats shipped in this build"""
     monkeypatch.setattr(jarvis.validation, "SEAT_ASSETS", tmp_path / "no-seats")
     assert jarvis.validation.shipped_seats() == ()
 
@@ -474,12 +425,11 @@ def test_validation_settings_round_trip():
     assert v.feature_units is False
 
 
-# -- the stakes classifier: three values, not a boolean --------------------------------
+# -- the stakes classifier: three values, not a boolean
 
 
 def test_the_stakes_classifier_ships_on_the_regex():
-    """SS3.4. `regex` is today's behaviour exactly — no call, no new row, no new event —
-    and it is the shipped default at both levels."""
+    """SS3.4"""
     assert parse_catalog({"projects": []}).os.validation.stakes_classifier == "regex"
     assert validation_of({}).stakes_classifier == "regex"
 
@@ -490,9 +440,7 @@ def test_every_legal_stakes_classifier_mode_parses(mode):
 
 
 def test_a_fourth_stakes_classifier_value_is_refused_loudly():
-    """The `roster` precedent: a typo that silently changes which net guards the settle
-    path is refused at boot, naming the value and the three legal ones — not shrugged off
-    to the default, which would read as the feature being off."""
+    """The `roster` precedent: a typo that silently changes which net guards the settle path is refused at..."""
     with pytest.raises(CatalogError) as err:
         validation_of({"stakes_classifier": "haiku"})
     message = str(err.value)
@@ -502,7 +450,7 @@ def test_a_fourth_stakes_classifier_value_is_refused_loudly():
 
 
 def test_a_project_inherits_the_fleet_stakes_classifier_and_may_override_it():
-    """The ordinary field-level fallback: a project naming one key keeps the rest."""
+    """The ordinary field-level fallback: a project naming one key keeps the rest"""
     quiet, loud = projects_validation({"stakes_classifier": "shadow"},
                                       {}, {"validation": {"auto_review": True}})
     assert quiet.stakes_classifier == "shadow"
@@ -515,13 +463,7 @@ def test_a_project_inherits_the_fleet_stakes_classifier_and_may_override_it():
 
 
 def test_a_catalog_still_naming_confirm_diff_chars_loads_with_the_key_ignored():
-    """The confirmation question carries no diff any more, so the budget is gone — and a
-    live catalog still naming it must keep booting the fleet.
-
-    The validation block parses field by field with `raw.get(...)`, so an unknown key is
-    silently ignored; this pins that for the key this change removed, at BOTH levels.
-    docs/superpowers/specs/2026-10-14-neo-never-reads-a-diff.md
-    """
+    """The confirmation question carries no diff any more, so the budget is gone (docs/superpowers/specs/2026-10-14-neo-never-reads-a-diff.md)"""
     v = parse_catalog({"projects": []}).os.validation
     assert not hasattr(v, "confirm_diff_chars")
     assert v.diff_chars == 150000
@@ -536,20 +478,16 @@ def test_a_catalog_still_naming_confirm_diff_chars_loads_with_the_key_ignored():
                                  "decision_record_chars",
                                  "assumption_spec_chars"])
 def test_a_validation_budget_below_one_is_rejected(key):
-    """Zero rounds is a review that never runs while claiming to; zero diff_chars is a
-    panel handed nothing, which the design says must never be asked to judge. Zero
-    decision_record_chars is a reviewer shown none of the order's own rulings, which is
-    the defect the record exists to fix, and zero assumption_spec_chars is the same
-    defect for the spec section (GitHub issue #1035)."""
+    """Zero rounds is a review that never runs while claiming to (#1035)"""
     with pytest.raises(CatalogError, match=f"os.validation.{key}"):
         validation_of({key: 0})
 
 
-# -- a project's own validation settings ----------------------------------------------
+# -- a project's own validation settings
 
 
 def projects_validation(os_raw=None, *project_raws):
-    """Parse a fleet and hand back each project's resolved `validation`."""
+    """Parse a fleet and hand back each project's resolved `validation`"""
     cat = parse_catalog({
         "os": {"validation": os_raw} if os_raw is not None else {},
         "projects": [dict({"name": chr(ord("a") + i), "path": "/tmp/p"}, **raw)
@@ -559,8 +497,7 @@ def projects_validation(os_raw=None, *project_raws):
 
 
 def test_a_project_that_says_nothing_gets_the_os_answer_and_ships_disabled():
-    """The whole point of the default, restated one level down: adding the key must not
-    turn anything on, and a silent project must be indistinguishable from today."""
+    """The whole point of the default"""
     [quiet] = projects_validation(None, {})
     assert quiet == parse_catalog({"projects": []}).os.validation
     assert quiet.enabled is False
@@ -571,16 +508,14 @@ def test_a_project_that_says_nothing_gets_the_os_answer_and_ships_disabled():
 
 
 def test_one_project_can_turn_validation_on_while_the_fleet_stays_off():
-    """The acceptance criterion of the design doc's §1.2, as one assertion."""
+    """The acceptance criterion of the design doc's §1.2, as one assertion"""
     on, off = projects_validation(None, {"validation": {"enabled": True}}, {})
     assert on.enabled is True
     assert off.enabled is False
 
 
 def test_a_project_override_inherits_every_key_it_does_not_name():
-    """`os.validation` is the BASE, not a fallback consulted later: a project naming one
-    key must carry the OS's answer for the other seven, so no caller has two objects to
-    reconcile."""
+    """`os.validation` is the BASE, not a fallback consulted later: a project naming one key must carry..."""
     os_raw = {"enabled": True, "roster": ["tester", "chair"], "chair_model": "opus",
               "timeout": 90, "max_rounds": 1, "diff_chars": 200,
               "decision_record_chars": 400, "assumption_spec_chars": 700,
@@ -598,9 +533,7 @@ def test_a_project_override_inherits_every_key_it_does_not_name():
 
 
 def test_a_project_seat_models_replaces_the_os_map_rather_than_merging_into_it():
-    """Inheritance is FIELD-level, and `seat_models` is one field (Neo, q174). A project
-    that names it owns the whole map; the seats it drops fall back to the project model
-    the way an empty map always has."""
+    """Inheritance is FIELD-level, and `seat_models` is one field (Neo, q174)"""
     [v] = projects_validation({"seat_models": {"architect": "opus"}},
                               {"validation": {"seat_models": {"chair": "sonnet"}}})
     assert v.seat_models == {"chair": "sonnet"}
@@ -619,8 +552,7 @@ def test_a_project_override_does_not_reach_back_up_to_the_os_block():
 
 
 def test_a_project_validation_block_is_validated_and_the_error_names_the_project():
-    """Same checks as the OS block — the vocabulary and the budgets — but a message that
-    points at the object the user actually typed, not at `os.validation`."""
+    """Same checks as the OS block — the vocabulary and the budgets"""
     with pytest.raises(CatalogError, match=r"projects\[0\] \(a\)\.validation\.roster"):
         projects_validation(None, {"validation": {"roster": ["tetser"]}})
     with pytest.raises(CatalogError, match=r"projects\[0\] \(a\)\.validation\.max_rounds"):
@@ -630,13 +562,7 @@ def test_a_project_validation_block_is_validated_and_the_error_names_the_project
 
 
 def test_the_cold_prefix_floor_is_fleet_wide_and_not_a_project_override():
-    """Deliberately NOT under `os.defaults`, which is the namespace projects override.
-
-    The two surfaces that consume this threshold walk transcripts rather than work
-    orders, so a per-project value would be honoured for one order's bill and ignored by
-    every aggregate. This pins the placement: a project naming the key must not change
-    anything, or the knob would look overridable while behaving fleet-wide (Neo, q191).
-    """
+    """Deliberately NOT under `os.defaults`, which is the namespace projects override"""
     c = parse_catalog({
         "os": {"cold_prefix_floor": 9_000},
         "projects": [{"name": "a", "path": ".", "cold_prefix_floor": 123}],
@@ -646,8 +572,7 @@ def test_the_cold_prefix_floor_is_fleet_wide_and_not_a_project_override():
 
 
 def test_the_cold_prefix_floor_is_validated_at_boot_not_at_report_time():
-    """A bad value must fail where it was typed, not surface as a cost report quietly
-    reclassifying every boundary — which reads as a finding, not as a config error."""
+    """A bad value must fail where it was typed"""
     assert (parse_catalog({"projects": []}).os.cold_prefix_floor
             == DEFAULT_COLD_PREFIX_FLOOR)
     for bad in ("5000", True, -1, DEFAULT_COLD_PREFIX_FLOOR_MAX + 1):
@@ -656,8 +581,7 @@ def test_the_cold_prefix_floor_is_validated_at_boot_not_at_report_time():
 
 
 def test_the_guard_rail_on_the_floor_is_itself_configurable():
-    """`cold_prefix_floor_max` is config, not a constant: a fleet whose static heads are
-    unusually large has to be able to raise the floor past the shipped ceiling."""
+    """`cold_prefix_floor_max` is config"""
     over = {"cold_prefix_floor": DEFAULT_COLD_PREFIX_FLOOR_MAX + 50_000}
     with pytest.raises(CatalogError, match="cold_prefix_floor"):
         parse_catalog({"os": over, "projects": []})
@@ -671,8 +595,7 @@ def test_the_guard_rail_on_the_floor_is_itself_configurable():
 
 
 def test_worker_require_crew_defaults_true():
-    """§7 of docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md: the crew
-    is the default, and turning it off is a project's deliberate opt-out."""
+    """§7 of docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md: the crew is the default"""
     cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
     assert cat.projects[0].worker.require_crew is True
 
@@ -689,10 +612,7 @@ def test_worker_require_crew_parsed():
             {"name": "a", "path": "/tmp/a", "worker": {"require_crew": "no"}}]})
 
 
-# -- observability: what debug data is COLLECTED ----------------------------------------
-#
-# §10 of docs/superpowers/specs/2026-09-24-order-observability.md. `off` gates exactly one write,
-# §5's per-turn ingredient row, and no read.
+# -- observability: what debug data is COLLECTED
 
 
 def test_observability_ships_at_normal_fleet_wide_and_per_project():
@@ -702,8 +622,7 @@ def test_observability_ships_at_normal_fleet_wide_and_per_project():
 
 
 def test_a_project_inherits_the_fleet_observability_level_and_may_override_it():
-    """`_parse_inspect`'s field-level inheritance: the project object is the ANSWER, so
-    no caller consults two objects."""
+    """`_parse_inspect`'s field-level inheritance: the project object is the ANSWER"""
     cat = parse_catalog({
         "os": {"observability": {"level": "off"}},
         "projects": [
@@ -717,8 +636,7 @@ def test_a_project_inherits_the_fleet_observability_level_and_may_override_it():
 
 
 def test_an_unknown_observability_level_is_refused_naming_the_legal_ones():
-    """`GateConfig.parse`'s rule: a typo in `jarvis config set` must not silently leave
-    debugging off."""
+    """`GateConfig.parse`'s rule: a typo in `jarvis config set` must not silently leave debugging off"""
     with pytest.raises(CatalogError, match="off.*normal.*full"):
         parse_catalog({"os": {"observability": {"level": "verbose"}}, "projects": []})
     with pytest.raises(CatalogError, match=r"projects\[0\] \(a\).observability"):
@@ -728,22 +646,20 @@ def test_an_unknown_observability_level_is_refused_naming_the_legal_ones():
         parse_catalog({"os": {"observability": "full"}, "projects": []})
 
 
-# -- `fleet_health`: §4 of docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-
-# gets-investigated.md
+# -- `fleet_health`: §4 of docs/superpowers/specs/2026-09-30-an-order-that-stops-moving
 
 
 def test_every_open_status_has_a_threshold():
-    """The test that makes a new `OPEN_STATUSES` member a failure rather than a blind
-    spot: seven are named and the rest ride the fallback."""
+    """The test that makes a new `OPEN_STATUSES` member a failure rather than a blind spot: seven are..."""
     cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
     cfg = cat.projects[0].fleet_health
-    assert cfg.enabled
+    assert not cfg.enabled  # ships off: os.autonomy
     for status in OPEN_STATUSES:
         assert cfg.threshold_seconds(status) > 0
 
 
 def test_fleet_health_inherits_per_status():
-    """`thresholds` inherits PER STATUS: a project disabling one must not drop the rest."""
+    """`thresholds` inherits PER STATUS: a project disabling one must not drop the rest"""
     cat = parse_catalog({
         "os": {"fleet_health": {"thresholds": {"running": 90}}},
         "projects": [{"name": "a", "path": "/tmp/a",
@@ -764,10 +680,7 @@ def test_fleet_health_inherits_per_status():
 
 
 def test_exempt_kinds_overrides_whole_rather_than_merging():
-    """§2.1 of docs/superpowers/specs/2026-10-12-a-managers-by-design-idle-is-not-a-
-    standstill.md: a kind list is ONE policy statement, so a project's value replaces the
-    fleet's — the contrast with the per-status `thresholds` test above is the point. A
-    merging list could only ever grow, leaving un-exempting a kind inexpressible."""
+    """§2.1 of docs/superpowers/specs/2026-10-12-a-managers-by-design-idle-is-not-a- standstill.md: a kind..."""
     cat = parse_catalog({
         "os": {"fleet_health": {"exempt_kinds": ["investigator", "analyst"]}},
         "projects": [{"name": "a", "path": "/tmp/a"},
@@ -780,9 +693,7 @@ def test_exempt_kinds_overrides_whole_rather_than_merging():
 
 
 def test_exempt_kinds_refuses_a_kind_no_work_order_can_hold():
-    """A typo that silently left a kind watched is how a manager stays judged after
-    somebody tried to stop it. `"investigation"` is a FEATURE-order kind and no
-    `work_orders` row can hold it — the regression guard for the shipped default."""
+    """A typo that silently left a kind watched is how a manager stays judged after somebody tried to stop..."""
     for bad in ("investigation", "plannr"):
         with pytest.raises(CatalogError, match="is not a work-order kind"):
             parse_catalog({"os": {"fleet_health": {"exempt_kinds": [bad]}},
@@ -793,16 +704,14 @@ def test_exempt_kinds_refuses_a_kind_no_work_order_can_hold():
     with pytest.raises(CatalogError, match="must be a list of strings"):
         parse_catalog({"os": {"fleet_health": {"exempt_kinds": "manager"}},
                        "projects": [{"name": "a", "path": "/tmp/a"}]})
-    # The EMPTY list is a meaningful policy — judge every kind — and not a mistake.
+    # The EMPTY list is a meaningful policy — judge every kind — and not a mistake
     cat = parse_catalog({"os": {"fleet_health": {"exempt_kinds": []}},
                          "projects": [{"name": "a", "path": "/tmp/a"}]})
     assert cat.projects[0].fleet_health.exempt_kinds == ()
 
 
 def test_the_shipped_exempt_kinds_default_parses():
-    """The guard for the reflective `>= 1` loop in `_parse_fleet_health`: without
-    `FLEET_HEALTH_LIST_KEYS` it compares a tuple with an int and every catalog parse in
-    the suite dies with a `TypeError` no other test would explain."""
+    """The guard for the reflective `>= 1` loop in `_parse_fleet_health`: without `FLEET_HEALTH_LIST_KEYS`..."""
     assert jarvis.catalog.DEFAULT_FLEET_HEALTH_EXEMPT_KINDS == ("investigator",)
     assert "exempt_kinds" in jarvis.catalog.FLEET_HEALTH_LIST_KEYS
     cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
@@ -811,11 +720,7 @@ def test_the_shipped_exempt_kinds_default_parses():
 
 
 def test_red_episode_retention_is_resolvable_fleet_wide_and_per_project():
-    """§2 "The retention bound is a CATALOG KEY" of
-    docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md: Neo's one
-    condition on 1818 — how long the OS remembers one project's red-base episodes is never
-    a module constant. Per project by nature, so NOT a fleet-only key, and a plain positive
-    int, so the reflective tail loop already refuses `0` and `-1` naming the key."""
+    """§2 "The retention bound is a CATALOG KEY" of... (docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md)"""
     cat = parse_catalog({
         "os": {"fleet_health": {"red_episode_retention_hours": 72,
                                 "cooldown_minutes": 99}},
@@ -826,7 +731,7 @@ def test_red_episode_retention_is_resolvable_fleet_wide_and_per_project():
     assert cat.os.fleet_health.red_episode_retention_hours == 72
     assert cat.projects[0].fleet_health.red_episode_retention_hours == 72
     assert cat.projects[1].fleet_health.red_episode_retention_hours == 12
-    # A project naming it keeps the fleet answer for every other field.
+    # A project naming it keeps the fleet answer for every other field
     assert cat.projects[1].fleet_health.cooldown_minutes == 99
 
     assert jarvis.catalog.FleetHealthConfig().red_episode_retention_hours == \
@@ -844,8 +749,7 @@ def test_red_episode_retention_is_resolvable_fleet_wide_and_per_project():
 
 
 def test_sweep_dark_minutes_is_refused_on_a_project():
-    """A FLEET number, `max_per_day`'s reason: the stuck sweep writes ONE fleet-wide run
-    record, so no arrangement of per-project numbers can say how long it may be silent."""
+    """A FLEET number, `max_per_day`'s reason: the stuck sweep writes ONE fleet-wide run record"""
     with pytest.raises(CatalogError, match=r"os\.fleet_health\.sweep_dark_minutes"):
         parse_catalog({"projects": [{"name": "a", "path": "/tmp/a",
                                      "fleet_health": {"sweep_dark_minutes": 20}}]})
@@ -860,12 +764,11 @@ def test_sweep_dark_minutes_is_refused_on_a_project():
         jarvis.catalog.DEFAULT_FLEET_HEALTH_SWEEP_DARK_MINUTES
 
 
-# -- the backstop ceiling on an OS-side prompt (spec §4,
-# docs/superpowers/specs/2026-09-26-bounded-model-inputs.md) -------------------------
+# -- the backstop ceiling on an OS-side prompt (spec §4
 
 
 def test_the_os_prompt_ceiling_defaults_to_the_measured_number():
-    """400,000 is a MEASURED default: the worst legitimate OS call is 285,929 chars."""
+    """400,000 is a MEASURED default: the worst legitimate OS call is 285,929 chars"""
     from jarvis.catalog import DEFAULT_MAX_OS_PROMPT_CHARS
 
     assert DEFAULT_MAX_OS_PROMPT_CHARS == 400_000
@@ -875,8 +778,7 @@ def test_the_os_prompt_ceiling_defaults_to_the_measured_number():
 
 
 def test_a_ceiling_below_the_floor_is_refused_at_boot():
-    """Below the floor the ceiling silently disables validation, which is worse than
-    the bug it fixes — so it fails where it was typed."""
+    """Below the floor the ceiling silently disables validation, which is worse than the bug it fixes"""
     from jarvis.catalog import MAX_OS_PROMPT_CHARS_MIN
 
     assert MAX_OS_PROMPT_CHARS_MIN == 300_000
@@ -892,8 +794,7 @@ def test_a_ceiling_below_the_floor_is_refused_at_boot():
 
 
 def test_the_knowledge_hint_bounds_round_trip():
-    """Spec test 15 of 2026-10-02-learn-search-returns-an-index.md — a pointer, not a
-    second index, so the defaults are deliberately small and separate from the digest."""
+    """Spec test 15 of 2026-10-02-learn-search-returns-an-index.md"""
     from jarvis.catalog import OsConfig
 
     assert (OsConfig().knowledge_hint_limit, OsConfig().knowledge_hint_chars) == (3, 400)
@@ -901,18 +802,17 @@ def test_the_knowledge_hint_bounds_round_trip():
                          "projects": []})
     assert (cat.os.knowledge_hint_limit, cat.os.knowledge_hint_chars) == (5, 900)
     # and the digest budget is untouched by either
-    assert cat.os.knowledge_digest_chars == 4000
+    assert cat.os.knowledge_digest_chars == 1000
 
 
 def test_the_ceiling_has_no_off_switch():
-    """A backstop with an off switch is not a backstop: null is refused, not honoured."""
+    """A backstop with an off switch is not a backstop: null is refused, not honoured"""
     with pytest.raises(CatalogError, match="max_os_prompt_chars"):
         parse_catalog({"os": {"max_os_prompt_chars": None}, "projects": []})
 
 
 def test_loading_a_catalog_arms_the_transport_ceiling(tmp_path):
-    """The seam Neo ruled on (q1077): one override at startup, not a parameter plumbed
-    through twenty call sites."""
+    """The seam Neo ruled on (q1077): one override at startup"""
     from jarvis import claude_cli
 
     before = claude_cli.MAX_OS_PROMPT_CHARS
@@ -926,14 +826,7 @@ def test_loading_a_catalog_arms_the_transport_ceiling(tmp_path):
 
 
 def test_the_blocker_set_is_the_catalogs_to_narrow(tmp_path):
-    """`supervisor.health_reassert_blockers` is a CATALOG SETTING and never a module
-    constant (kn-1cec46b5, Neo q1217). An unknown id is refused with the known ones
-    named — `_parse_remedies`' rule — and a project overrides the list field by field
-    while the rest of `os.supervisor` is inherited.
-
-    It also pins the `_SUPERVISOR_NON_NUMERIC` trap: a field missing from that set is a
-    `TypeError` on every catalog load, which this test is the first to see.
-    """
+    """`supervisor.health_reassert_blockers` is a CATALOG SETTING and never a module constant..."""
     from jarvis import health
 
     with pytest.raises(CatalogError, match=", ".join(health.BLOCKERS)):
@@ -957,18 +850,13 @@ def test_the_blocker_set_is_the_catalogs_to_narrow(tmp_path):
 
 
 def test_the_sweep_cadence_defaults_do_not_move(tmp_path):
-    """The free re-assertion buys quiet by SPENDING less, never by watching less — the
-    spec's "out of scope" list, and the alternative it rejected."""
+    """The free re-assertion buys quiet by SPENDING less, never by watching less"""
     cfg = parse_catalog({"os": {}, "projects": []}).os.supervisor
     assert (cfg.health_every_ticks, cfg.health_min_interval_minutes,
             cfg.health_stale_minutes, cfg.health_max_units_per_tick) == (20, 30, 720, 4)
 
 
-# -- navigation: the classifier's patterns are DATA, never module constants -------------
-#
-# q1216's condition, §2.3 of
-# docs/superpowers/specs/2026-10-02-subagent-cache-anatomy-and-the-navigation-split.md:
-# re-measuring under a different definition of "navigation" must not need a release.
+# -- navigation: the classifier's patterns are DATA, never module constants
 
 
 def test_navigation_ships_the_measured_defaults_fleet_wide_and_per_project():
@@ -995,8 +883,7 @@ def test_navigation_ships_the_measured_defaults_fleet_wide_and_per_project():
 
 
 def test_a_project_naming_one_navigation_key_inherits_the_rest():
-    """`_parse_inspect`'s field-level inheritance: the project object is the ANSWER, so
-    no caller consults two objects."""
+    """`_parse_inspect`'s field-level inheritance: the project object is the ANSWER"""
     cat = parse_catalog({
         "os": {"navigation": {"window_days": 30}},
         "projects": [
@@ -1014,7 +901,7 @@ def test_a_project_naming_one_navigation_key_inherits_the_rest():
 
 
 def test_an_empty_navigation_pattern_list_is_refused_naming_the_key():
-    """An empty classifier reports 0% everywhere and looks like a win."""
+    """An empty classifier reports 0% everywhere and looks like a win"""
     with pytest.raises(CatalogError, match="navigation.bash_commands"):
         parse_catalog({"os": {"navigation": {"bash_commands": []}}, "projects": []})
     with pytest.raises(CatalogError, match=r"projects\[0\] \(a\).navigation"):
@@ -1041,8 +928,7 @@ def test_a_suffix_without_a_leading_dot_and_a_zero_window_are_refused():
 
 
 def test_doc_dirs_is_a_navigation_pattern_key_with_the_leaf_set_as_its_default():
-    """`autoreview._is_documentation`'s path rule is CONFIGURED, not a second classifier
-    in `autoreview`. Identity, not equality: a copied body passes equality then drifts."""
+    """`autoreview._is_documentation`'s path rule is CONFIGURED, not a second classifier in `autoreview`"""
     from jarvis import catalog, navigation
 
     assert catalog.DEFAULT_NAVIGATION_DOC_DIRS is navigation.DOC_DIRS
@@ -1066,8 +952,7 @@ def test_doc_dirs_is_a_navigation_pattern_key_with_the_leaf_set_as_its_default()
 
 
 def test_an_empty_doc_dirs_is_refused_and_a_dotless_entry_is_not():
-    """A silently empty `doc_dirs` disables the path rule and looks fine — the same
-    failure its siblings' refusal exists for. It is NOT a suffix, so no leading dot."""
+    """A silently empty `doc_dirs` disables the path rule and looks fine"""
     with pytest.raises(CatalogError, match="navigation.doc_dirs"):
         parse_catalog({"os": {"navigation": {"doc_dirs": []}}, "projects": []})
 
@@ -1075,11 +960,7 @@ def test_an_empty_doc_dirs_is_refused_and_a_dotless_entry_is_not():
     assert cat.os.navigation.doc_dirs == frozenset({"docs"})
 
 
-# -- `os.cost`: the fleet distribution's tunables ---------------------------------------
-#
-# §6 of docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md. Neo's rider: no
-# module constant for anything tunable, so the usage-week reset and the percentile are
-# catalog settings, resolvable fleet-wide AND per project.
+# -- `os.cost`: the fleet distribution's tunables
 
 
 def test_cost_defaults_ship_on_both_config_objects(tmp_path):
@@ -1090,17 +971,15 @@ def test_cost_defaults_ship_on_both_config_objects(tmp_path):
         assert cfg.week_reset_zone == "America/Los_Angeles"
         assert cfg.percentile == 0.9
         assert cfg.max_orders == 500
-        # §10.10 of the per-tool addendum: the `chars` estimator's divisor and the row
-        # cap of the tool table, both catalog settings for the same stated reason.
+        # §10.10 of the per-tool addendum: the `chars` estimator's divisor and the row cap of the tool table
         assert cfg.chars_per_token == 4.0
         assert cfg.tool_rows == 20
-        # §7 of docs/superpowers/specs/2026-10-07-cost-window-selector.md: the 5h grid's
-        # length is a belief about the usage grid, so it is a setting and not a constant.
+        # §7 of docs/superpowers/specs/2026-10-07-cost-window-selector.md: the 5h grid's length is a belief...
         assert cfg.session_window_hours == 5.0
 
 
 def test_a_non_positive_session_window_hours_is_refused():
-    """A fractional length is a legal belief about the grid; zero is not a length."""
+    """A fractional length is a legal belief about the grid; zero is not a length"""
     for bad in (0, -1, -2.5):
         with pytest.raises(CatalogError, match="session_window_hours must be > 0"):
             parse_catalog({"os": {"cost": {"session_window_hours": bad}},
@@ -1110,7 +989,7 @@ def test_a_non_positive_session_window_hours_is_refused():
 
 
 def test_a_non_positive_chars_per_token_is_refused():
-    """Zero or less is not a divisor, and a negative one would report negative tokens."""
+    """Zero or less is not a divisor, and a negative one would report negative tokens"""
     for bad in (0, -1, -0.5):
         with pytest.raises(CatalogError, match="chars_per_token"):
             parse_catalog({"os": {"cost": {"chars_per_token": bad}}, "projects": []})
@@ -1119,7 +998,7 @@ def test_a_non_positive_chars_per_token_is_refused():
 
 
 def test_a_cost_tool_rows_below_one_is_refused():
-    """Zero rows is a table with a truncation line and nothing above it."""
+    """Zero rows is a table with a truncation line and nothing above it"""
     for bad in (0, -5):
         with pytest.raises(CatalogError, match="tool_rows"):
             parse_catalog({"os": {"cost": {"tool_rows": bad}}, "projects": []})
@@ -1128,8 +1007,7 @@ def test_a_cost_tool_rows_below_one_is_refused():
 
 
 def test_a_project_overrides_one_cost_key_and_inherits_the_rest(tmp_path):
-    """Field-level inheritance, `_parse_inspect`'s shape (kn-6ca2bcd9): the project
-    object is the ANSWER, so no caller consults two objects."""
+    """Field-level inheritance, `_parse_inspect`'s shape (kn-6ca2bcd9): the project object is the ANSWER"""
     from jarvis import config_version
 
     cat = parse_catalog({
@@ -1151,8 +1029,7 @@ def test_a_project_overrides_one_cost_key_and_inherits_the_rest(tmp_path):
 
 
 def test_midnight_is_a_legal_cost_week_reset_hour():
-    """Zero is legal here: `_parse_inspect`'s ">= 1" rule would reject midnight, and
-    an hour is not a count."""
+    """Zero is legal here: `_parse_inspect`'s ">= 1" rule would reject midnight, and an hour is not a count"""
     cat = parse_catalog({"os": {"cost": {"week_reset_hour": 0,
                                          "week_reset_weekday": 0}}, "projects": []})
     assert cat.os.cost.week_reset_hour == 0
@@ -1169,7 +1046,7 @@ def test_an_out_of_range_cost_reset_day_or_hour_is_refused_naming_the_key():
 
 
 def test_a_cost_percentile_outside_the_open_interval_is_refused():
-    """Both ends exclusive: 0 names no value and 1 is the max, which `max` already is."""
+    """Both ends exclusive: 0 names no value and 1 is the max, which `max` already is"""
     for bad in (0, 1, -0.5, 1.5):
         with pytest.raises(CatalogError, match="percentile"):
             parse_catalog({"os": {"cost": {"percentile": bad}}, "projects": []})
@@ -1184,8 +1061,7 @@ def test_a_cost_max_orders_below_one_is_refused():
 
 
 def test_an_unknown_cost_time_zone_is_refused_naming_the_bad_value(tmp_path):
-    """A zone that no `ZoneInfo` can construct makes every window wrong, so it fails
-    where it was typed."""
+    """A zone that no `ZoneInfo` can construct makes every window wrong, so it fails where it was typed"""
     with pytest.raises(CatalogError) as caught:
         parse_catalog({"os": {"cost": {"week_reset_zone": "Mars/Olympus"}},
                        "projects": []})
@@ -1199,7 +1075,7 @@ def test_an_unknown_cost_time_zone_is_refused_naming_the_bad_value(tmp_path):
 
 
 def test_cost_paths_have_an_explicit_apply_class():
-    """ops.APPLY_RULES decides it rather than falling through (spec §6.2)."""
+    """ops.APPLY_RULES decides it rather than falling through (spec §6.2)"""
     from jarvis import ops
 
     assert any(glob == "*.cost.*" for glob, _ in ops.APPLY_RULES)
@@ -1208,11 +1084,7 @@ def test_cost_paths_have_an_explicit_apply_class():
 
 
 def test_the_feature_merge_wait_resolves_per_project_and_falls_back_fleet_wide():
-    """§4 of
-    docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md:
-    how long the reconciler waits for a merged child's commit to appear on the default
-    branch is a per-project habit, so it is a catalog key with this block's ordinary
-    field-level fallback rather than a module constant."""
+    """§4 of... (docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md)"""
     assert (parse_catalog({"projects": []}).os.validation.feature_merge_wait_minutes
             == jarvis.catalog.DEFAULT_VALIDATION_FEATURE_MERGE_WAIT_MINUTES)
 
@@ -1226,7 +1098,7 @@ def test_the_feature_merge_wait_resolves_per_project_and_falls_back_fleet_wide()
     assert (silent.feature_merge_wait_minutes
             == jarvis.catalog.DEFAULT_VALIDATION_FEATURE_MERGE_WAIT_MINUTES)
 
-    # 0 is legal and means "never defer": check once, flag immediately.
+    # 0 is legal and means "never defer": check once, flag immediately
     assert validation_of(
         {"feature_merge_wait_minutes": 0}).feature_merge_wait_minutes == 0
     with pytest.raises(CatalogError,
@@ -1235,11 +1107,7 @@ def test_the_feature_merge_wait_resolves_per_project_and_falls_back_fleet_wide()
 
 
 def test_the_red_ci_return_cap_resolves_per_project_and_zero_is_a_setting():
-    """§4 of
-    docs/superpowers/specs/2026-10-13-a-red-head-is-sent-back-before-the-panel.md:
-    how many times a red head is sent back before the seats read it is a bound the user
-    may want to move, so it is a catalog key. `0` is legal and means never return —
-    today's behaviour exactly, which is what a project that disagrees needs."""
+    """§4 of docs/superpowers/specs/2026-10-13-a-red-head-is-sent-back-before-the-panel.md: how many times..."""
     assert (parse_catalog({"projects": []}).os.validation.red_ci_returns
             == jarvis.catalog.DEFAULT_VALIDATION_RED_CI_RETURNS)
 
@@ -1261,11 +1129,7 @@ def test_the_red_ci_return_cap_resolves_per_project_and_zero_is_a_setting():
 
 
 def test_the_killed_retry_bound_resolves_per_project_and_zero_is_a_setting():
-    """§4b of docs/superpowers/specs/
-    2026-10-14-a-killed-validation-panel-opens-an-investigation.md, a user ruling (Neo
-    question 1705, condition ii): how many kills in a row one round survives is a bound
-    the user may want to move, so it is a catalog key and never a module constant. `0` is
-    legal and means escalate on the first kill."""
+    """§4b of docs/superpowers/specs/ 2026-10-14-a-killed-validation-panel-opens-an-investigation.md"""
     assert (parse_catalog({"projects": []}).os.validation.killed_retries
             == jarvis.catalog.DEFAULT_VALIDATION_KILLED_RETRIES)
 
@@ -1283,10 +1147,7 @@ def test_the_killed_retry_bound_resolves_per_project_and_zero_is_a_setting():
 
 
 def test_a_round_is_judged_under_the_red_ci_bound_it_was_opened_with():
-    """`config_version.validation_config_from_resolved` walks the dataclass's fields, so
-    the stamped historical read carries the new key for free — and `_round_config` is
-    what makes the bound a round is returned against the one that was live when the
-    worker submitted (spec §4.4)."""
+    """`config_version.validation_config_from_resolved` walks the dataclass's fields"""
     from jarvis import config_version as cv
 
     assert cv.validation_config_from_resolved(
@@ -1295,13 +1156,11 @@ def test_a_round_is_judged_under_the_red_ci_bound_it_was_opened_with():
             == jarvis.catalog.DEFAULT_VALIDATION_RED_CI_RETURNS)
 
 
-# -- rules: the evaluation pass ships OFF, and a project may switch it on ---------------
+# -- rules: the evaluation pass ships OFF, and a project may switch it on
 
 
 def test_rules_ship_off_fleet_wide_and_a_project_may_override_enabled(tmp_path):
-    """`rules.enabled` is §5.2's off switch (docs/superpowers/specs/
-    2026-09-27-self-evolution.md), with `_parse_inspect`'s field-level inheritance: one
-    project naming it true leaves the fleet — and every other project — false."""
+    """`rules.enabled` is §5.2's off switch (docs/superpowers/specs/ 2026-09-27-self-evolution.md)"""
     cat = parse_catalog({"os": {}, "projects": [
         {"name": "a", "path": str(tmp_path)},
         {"name": "b", "path": str(tmp_path), "rules": {"enabled": True}},
@@ -1313,8 +1172,7 @@ def test_rules_ship_off_fleet_wide_and_a_project_may_override_enabled(tmp_path):
 
 
 def test_a_project_silent_on_rules_inherits_a_fleet_wide_on(tmp_path):
-    """The converse, which is what makes this an override and not a default: on
-    fleet-wide reaches a project that names nothing, and a project may name false."""
+    """The converse, which is what makes this an override and not a default: on fleet-wide reaches a..."""
     cat = parse_catalog({"os": {"rules": {"enabled": True}}, "projects": [
         {"name": "a", "path": str(tmp_path)},
         {"name": "b", "path": str(tmp_path), "rules": {"enabled": False}},
@@ -1331,14 +1189,11 @@ def test_a_rules_block_that_is_not_an_object_is_refused_naming_the_project(tmp_p
                                      "rules": True}]})
 
 
-# -- evolution: the sample floor under §9's medians -------------------------------------
+# -- evolution: the sample floor under §9's medians
 
 
 def test_evolution_min_samples_ships_a_default_and_a_project_may_override_it(tmp_path):
-    """`evolution.min_samples` is its own section, not `rules.*`: the user reversed the
-    assumption that put it there. §9 of
-    docs/superpowers/specs/2026-09-27-self-evolution.md, with `_parse_inspect`'s
-    field-level inheritance."""
+    """`evolution.min_samples` is its own section (docs/superpowers/specs/2026-09-27-self-evolution.md)"""
     cat = parse_catalog({"os": {"evolution": {"min_samples": 4}}, "projects": [
         {"name": "a", "path": str(tmp_path)},
         {"name": "b", "path": str(tmp_path), "evolution": {"min_samples": 9}},
@@ -1358,7 +1213,7 @@ def test_a_catalog_silent_on_evolution_keeps_the_shipped_floor(tmp_path):
 
 
 def test_an_evolution_min_samples_below_one_is_refused(tmp_path):
-    """A median over zero samples is not a statistic that could be computed at all."""
+    """A median over zero samples is not a statistic that could be computed at all"""
     with pytest.raises(CatalogError,
                        match="evolution.min_samples must be 1 or more, got 0"):
         parse_catalog({"os": {"evolution": {"min_samples": 0}}})
@@ -1375,9 +1230,7 @@ def test_an_evolution_block_that_is_not_an_object_is_refused_naming_the_project(
                                      "evolution": True}]})
 
 
-# -- `ui_health.*`: the dashboard's liveness probe and self-heal ----------------------
-#
-# docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md §6.
+# -- `ui_health.*`: the dashboard's liveness probe and self-heal
 
 
 def test_ui_health_ships_the_measured_defaults_fleet_wide_and_per_project():
@@ -1405,8 +1258,7 @@ def test_ui_health_ships_the_measured_defaults_fleet_wide_and_per_project():
 
 
 def test_a_project_naming_one_ui_health_key_inherits_the_rest():
-    """`_parse_inspect`'s field-level inheritance (kn-6ca2bcd9): the project object is
-    the ANSWER, so no caller consults two objects."""
+    """`_parse_inspect`'s field-level inheritance (kn-6ca2bcd9): the project object is the ANSWER"""
     from jarvis import config_version
 
     cat = parse_catalog({
@@ -1429,8 +1281,7 @@ def test_a_project_naming_one_ui_health_key_inherits_the_rest():
 
 
 def test_an_absurd_ui_health_value_is_refused_naming_the_key():
-    """Every one is a count or a duration, so `>= 1`: a zero interval is a probe that
-    never sleeps, a zero cap a self-heal that can never heal."""
+    """Every one is a count or a duration"""
     for key in ("probe_interval_seconds", "probe_timeout_seconds", "trip_threshold",
                 "healthz_timeout_seconds", "restart_cooldown_seconds",
                 "max_restarts_per_day"):
@@ -1446,13 +1297,11 @@ def test_ui_health_can_be_switched_off_whole():
     assert cat.projects[0].ui_health.enabled is False
 
 
-# -- `pull_requests`: the one threshold the stall predicate reads (wo-d3a70c29) --------
+# -- `pull_requests`: the one threshold the stall predicate reads (wo-d3a70c29)
 
 
 def test_the_recompute_stall_threshold_is_fleet_wide_and_per_project():
-    """`MessagingConfig`'s shape: one field, one area, field-level inheritance. Read by
-    `daemon.pr_recompute_stalled` via `ops.pull_requests_config_at`, and behind NO
-    `enabled` switch — it is a predicate ingredient, not an alarm."""
+    """`MessagingConfig`'s shape: one field, one area, field-level inheritance"""
     from jarvis import config_version
 
     cat = parse_catalog({
@@ -1471,8 +1320,7 @@ def test_the_recompute_stall_threshold_is_fleet_wide_and_per_project():
 
 
 def test_a_zero_recompute_stall_threshold_is_refused_rather_than_clamped():
-    """Zero would call every fresh UNKNOWN a stall, which kn-5e93939e says is the normal
-    state right after a push."""
+    """Zero would call every fresh UNKNOWN a stall"""
     for bad in (0, -1):
         with pytest.raises(
                 CatalogError,
@@ -1482,5 +1330,5 @@ def test_a_zero_recompute_stall_threshold_is_refused_rather_than_clamped():
 
 
 def test_the_shipped_recompute_stall_default_is_thirty_minutes():
-    """Neo question 1830."""
+    """Neo question 1830"""
     assert jarvis.catalog.DEFAULT_PULL_REQUESTS_RECOMPUTE_STALL_MINUTES == 30

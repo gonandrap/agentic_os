@@ -1,12 +1,4 @@
-"""An invariant the OS cannot repair owes a DECISION, and says so on the work order.
-
-Spec docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md.
-The seven test obligations in its last section, in order.
-
-The fixtures come from `test_work_lands`: INV-WORK-LANDED is the first owed checker, and
-driving it end to end needs the same repository with a real history and the same fake
-`gh`. Reproducing them here would be a second copy of the one seam that matters.
-"""
+"""An invariant the OS cannot repair owes a DECISION, and says so on the work order (docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md)"""
 
 from __future__ import annotations
 
@@ -48,20 +40,19 @@ def _invariant_notes(project: Path) -> list[dict]:
 
 
 def _unmerged(project: Path, daemon: Daemon, fake_gh) -> dict:
-    """A completed order whose recorded pull request is open — the wo-1abd3886 shape."""
+    """A completed order whose recorded pull request is open — the wo-1abd3886 shape"""
     wo = _delivered(project, "launcher contract", PR, code="launcher")
     fake_gh.set_pr(PR, "OPEN")
     _refresh(daemon, project)
     return wo
 
 
-# -- 1. flagged exactly once, and on the attention list --------------------------------
+# -- 1. flagged exactly once, and on the attention list
 
 
 def test_an_unmerged_pull_request_flags_its_order_exactly_once(started, project,
                                                                fake_gh):
-    """Obligation 1. wo-1abd3886 sat `completed` with an open PR for 6.5 days with
-    nothing but one `warning` among 230 unacked inbox items."""
+    """Obligation 1. wo-1abd3886 sat `completed` with an open PR for 6.5 days with nothing but one..."""
     wo = _unmerged(project, started, fake_gh)
 
     _tick(started, project, sweep=True)
@@ -72,7 +63,7 @@ def test_an_unmerged_pull_request_flags_its_order_exactly_once(started, project,
     assert row["needs_attention"] == 1
     assert "Merge it" in row["attention_reason"]
     assert len(_events(project, wo["id"], "attention")) == 1
-    # The attention item REPLACES the inbox line rather than joining it.
+    # The attention item REPLACES the inbox line rather than joining it
     assert _invariant_notes(project) == []
     items = [i for i in ops.os_status()["attention"] if i["wo_id"] == wo["id"]]
     assert [i["reason"] for i in items] == [row["attention_reason"]]
@@ -81,7 +72,7 @@ def test_an_unmerged_pull_request_flags_its_order_exactly_once(started, project,
 def test_the_owed_blocker_is_derived_and_not_a_reason_of_the_daemons_own(started,
                                                                         project,
                                                                         fake_gh):
-    """§3: the flag carries `true_blockers(store, wo)[0]`, so every surface agrees."""
+    """§3: the flag carries `true_blockers(store, wo)[0]`, so every surface agrees"""
     wo = _unmerged(project, started, fake_gh)
 
     _tick(started, project, sweep=True)
@@ -96,13 +87,12 @@ def test_the_owed_blocker_is_derived_and_not_a_reason_of_the_daemons_own(started
         store.close()
 
 
-# -- 2. an ack puts it down for good ---------------------------------------------------
+# -- 2. an ack puts it down for good
 
 
 @pytest.mark.parametrize("sweep", [True, False])
 def test_an_acked_owed_blocker_is_never_raised_again(started, project, fake_gh, sweep):
-    """Obligation 2. `acknowledged()` filtering at the tail of `true_blockers` is the
-    whole of the mechanism — no new ack machinery."""
+    """Obligation 2"""
     wo = _unmerged(project, started, fake_gh)
     _tick(started, project, sweep=True)
 
@@ -114,11 +104,7 @@ def test_an_acked_owed_blocker_is_never_raised_again(started, project, fake_gh, 
 
 
 def test_a_flag_cleared_by_something_else_comes_back(started, project, fake_gh):
-    """§4's self-heal (kn-2efe73e4): CLEARED is not ACKED, and a violation that still
-    stands raises itself again on the next sweep — which is what the raise sitting BEFORE
-    the dedupe `continue` buys. After it, only the first sweep to see the violation could
-    ever flag it, and INV-ATTENTION-MISSING cannot put it back (it selects open statuses
-    plus `failed`, never `completed`)."""
+    """§4's self-heal (kn-2efe73e4): CLEARED is not ACKED"""
     wo = _unmerged(project, started, fake_gh)
     _tick(started, project, sweep=True)
 
@@ -132,13 +118,12 @@ def test_a_flag_cleared_by_something_else_comes_back(started, project, fake_gh):
     assert _row(project, wo["id"])["needs_attention"] == 1
 
 
-# -- 3. INV-ATTENTION-PHANTOM stops clearing what is owed ------------------------------
+# -- 3
 
 
 def test_phantom_attention_spares_an_owed_flag_and_still_clears_a_stale_one(
         started, project, fake_gh):
-    """Obligation 3, both halves in one pass: the guard is `true_blockers` being
-    non-empty, so the existing behaviour is untouched for every other terminal order."""
+    """Obligation 3, both halves in one pass: the guard is `true_blockers` being non-empty"""
     owed = _unmerged(project, started, fake_gh)
     _tick(started, project, sweep=True)
     stale = ops.create_work_order("proj_a", "finished long ago")
@@ -156,13 +141,12 @@ def test_phantom_attention_spares_an_owed_flag_and_still_clears_a_stale_one(
     assert _row(project, stale["id"])["needs_attention"] == 0
 
 
-# -- 4. --abandon silences it within a tick --------------------------------------------
+# -- 4. --abandon silences it within a tick
 
 
 def test_abandon_closes_the_report_and_the_next_tick_lowers_the_flag(started, project,
                                                                     fake_gh):
-    """Obligation 4. Without §8's `close_violation_report` the user clears the alert and
-    watches it sit there for up to an hour — the wo-5eedc84d shape."""
+    """Obligation 4"""
     wo = _unmerged(project, started, fake_gh)
     _tick(started, project, sweep=True)
     assert _row(project, wo["id"])["needs_attention"] == 1
@@ -179,7 +163,7 @@ def test_abandon_closes_the_report_and_the_next_tick_lowers_the_flag(started, pr
     assert _row(project, wo["id"])["needs_attention"] == 0
 
 
-# -- 5 & 7. what does NOT change -------------------------------------------------------
+# -- 5 & 7. what does NOT change
 
 
 def _switchable(**kwargs) -> tuple:
@@ -190,7 +174,7 @@ def _switchable(**kwargs) -> tuple:
 
 def test_a_plain_unrepaired_violation_still_only_notifies(started, project,
                                                           monkeypatch):
-    """Obligation 5. A violation with neither `repaired` nor `owed` is unchanged."""
+    """Obligation 5"""
     wo = ops.create_work_order("proj_a", "unfixable")
     monkeypatch.setattr(invariants, "INVARIANTS", _switchable(wo_id=wo["id"]))
 
@@ -202,8 +186,7 @@ def test_a_plain_unrepaired_violation_still_only_notifies(started, project,
 
 def test_an_owed_violation_with_no_work_order_keeps_its_notification(started, project,
                                                                     monkeypatch):
-    """Obligation 7. INV-LANDING-AUDIT-FRESH's shape: project-level, no order to flag,
-    so the inbox is the only surface it has."""
+    """Obligation 7"""
     monkeypatch.setattr(invariants, "INVARIANTS",
                         _switchable(owed="decide something about the project"))
 
@@ -219,10 +202,7 @@ def test_an_owed_violation_with_no_work_order_keeps_its_notification(started, pr
 
 def test_a_critical_owed_violation_is_one_line_and_not_two(started, project,
                                                            monkeypatch):
-    """§7. The critical seam in `ops.os_status` builds its own project-level line from
-    the report row, and a `critical` owed checker would therefore be reported twice —
-    once as the work order's flag, once as an `invariant` item pointing at
-    `jarvis doctor`. No owed checker is critical today; the skip keeps that safe."""
+    """§7"""
     wo = ops.create_work_order("proj_a", "owes a critical decision")
     monkeypatch.setattr(invariants, "INVARIANTS",
                         _switchable(wo_id=wo["id"], level="critical",
@@ -235,12 +215,11 @@ def test_a_critical_owed_violation_is_one_line_and_not_two(started, project,
     assert [i for i in items if i["status"] == "invariant"] == []
 
 
-# -- 6. the reason is left alone -------------------------------------------------------
+# -- 6. the reason is left alone
 
 
 def test_attention_reason_leaves_the_owed_blocker_alone(started, project, fake_gh):
-    """Obligation 6. INV-ATTENTION-REASON re-derives `true_blockers[0]`, and the owed
-    string IS that — so there is nothing to rewrite and nothing to report."""
+    """Obligation 6"""
     wo = _unmerged(project, started, fake_gh)
     _tick(started, project, sweep=True)
     before = _row(project, wo["id"])["attention_reason"]

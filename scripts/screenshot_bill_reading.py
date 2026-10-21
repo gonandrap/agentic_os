@@ -1,13 +1,4 @@
-"""Screenshot the bill's "counted the old way" notes, for a PR's UI evidence.
-
-Two turns whose result JSON is gone and which therefore cannot be re-derived: one read
-before `USAGE_SCHEMA_VERSION` 2 (a fraction of its turn) and one before version 3 (the
-whole resumed session). They are wrong in OPPOSITE directions, and the page has to say
-which way, per line. Everything lives in a temp `JARVIS_HOME`, so it never touches the
-live OS:
-
-    uv run python scripts/screenshot_bill_reading.py
-"""
+"""Screenshot the bill's "counted the old way" notes, for a PR's UI evidence"""
 
 from __future__ import annotations
 
@@ -85,8 +76,7 @@ def shoot(project: str, wo_id: str) -> None:
         browser = p.chromium.launch()
         page = browser.new_page(viewport={"width": 1280, "height": 1400})
         page.goto(f"http://127.0.0.1:{PORT}/cost/{project}/{wo_id}")
-        # The itemisation is a <details>: the dashboard has no JavaScript, so every
-        # disclosure on the page is opened here rather than clicked one at a time.
+        # The itemisation is a <details>: the dashboard has no JavaScript
         page.evaluate("document.querySelectorAll('details')"
                       ".forEach(d => d.open = true)")
         page.wait_for_timeout(200)

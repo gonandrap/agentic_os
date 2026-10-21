@@ -1,17 +1,4 @@
-"""Token accounting read back from Claude Code's transcripts.
-
-The module under test is a parser for a file format Jarvis does not own, so these
-tests are written against the shapes that format actually produces — above all the
-streaming duplicate (`test_streamed_duplicates_...`), which is not a hypothetical:
-the first hand measurement of wo-cd73c537 reported 2.7M cache-write tokens where the
-true figure is 1.03M, because every assistant message appears in the transcript two
-or three times and summing the rows counts its input once per copy.
-
-Most assertions here are PAIRED — the case that should count sits in the same test as
-the case that should not. "Returns one message" is indistinguishable from "the parser
-is broken and returns one message for everything" unless something in the same test
-proves it can return two.
-"""
+"""Token accounting read back from Claude Code's transcripts"""
 
 from __future__ import annotations
 
@@ -22,9 +9,7 @@ import pytest
 
 from jarvis import usage
 
-#: `read_session` takes the cold-prefix floor as a REQUIRED argument — there is no
-#: module default to fall back on — so every call here passes one. The value only
-#: matters to the tests that are about the classification; elsewhere it is inert.
+#: `read_session` takes the cold-prefix floor as a REQUIRED argument
 FLOOR = 5_000
 
 
@@ -32,16 +17,7 @@ def row(mid: str, *, write: int = 0, read: int = 0, out: int = 0, plain: int = 0
         model: str = "claude-opus-5", ttl_1h: int = 0, ttl_5m: int = 0,
         at: str = "2026-08-09T00:00:00.000Z",
         stop_reason: str | None = "end_turn") -> dict:
-    """One assistant row, in the shape Claude Code writes.
-
-    `cache_creation` — the TTL the write bought — is nested one level down and is only
-    written when a test asks for it, because most rows in the wild predate it and the
-    module has to price those too.
-
-    `stop_reason` defaults to a SEALED value: a row carrying none is a mid-stream
-    snapshot whose `output_tokens` is a placeholder
-    (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §1).
-    """
+    """One assistant row, in the shape Claude Code writes (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §1)"""
     usage_obj: dict = {
         "input_tokens": plain,
         "cache_creation_input_tokens": write,
@@ -61,7 +37,7 @@ def row(mid: str, *, write: int = 0, read: int = 0, out: int = 0, plain: int = 0
 
 @pytest.fixture()
 def transcripts(tmp_path, monkeypatch):
-    """A fake `~/.claude/projects` tree, with a helper that writes one session into it."""
+    """A fake `~/.claude/projects` tree, with a helper that writes one session into it"""
     root = tmp_path / "projects"
     root.mkdir()
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
@@ -82,20 +58,11 @@ def transcripts(tmp_path, monkeypatch):
     return write
 
 
-# -- the streaming duplicate ----------------------------------------------------------
+# -- the streaming duplicate
 
 
 def test_streamed_duplicates_count_once_but_distinct_messages_both_count(transcripts):
-    """The trap that inflated the first measurement of this very work order 2.6x.
-
-    One message id written three times as it streams: identical cache figures, growing
-    `output_tokens`. It must contribute its input ONCE and its output at the FINAL
-    value, not the first (the opening copy reports `output_tokens: 1`).
-
-    Paired with a second, distinct message id in the same transcript — without it,
-    `cache_write == 500` would also be satisfied by a parser that ignored every row
-    after the first.
-    """
+    """The trap that inflated the first measurement of this very work order 2.6x"""
     transcripts("s1", [
         row("msg_a", write=500, read=0, out=1),
         row("msg_a", write=500, read=0, out=140),
@@ -111,17 +78,7 @@ def test_streamed_duplicates_count_once_but_distinct_messages_both_count(transcr
 
 
 def test_a_message_whose_every_row_is_mid_stream_is_counted_not_estimated(transcripts):
-    """The defect this parser can only DISCLOSE: a message with no sealed row at all.
-
-    Claude Code writes a subagent's assistant message once per content block with
-    `stop_reason: null` and a streaming `output_tokens`, and never writes the sealed row
-    carrying the real figure. Counted, flagged, and NOT estimated — `output` stays the
-    MAX-merged placeholder, which is what fails if someone later scales it
-    (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §1, decision 3).
-
-    Paired with a sealed message in the same transcript, so "1 placeholder call" cannot
-    pass against a parser that calls everything a placeholder.
-    """
+    """The defect this parser can only DISCLOSE: a message with no sealed row at all (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §1)"""
     path = transcripts("s1", [
         row("msg_a", write=1_000, read=2_000, out=5, stop_reason=None),
         row("msg_a", write=1_000, read=2_000, out=5, stop_reason=None),
@@ -137,7 +94,7 @@ def test_a_message_whose_every_row_is_mid_stream_is_counted_not_estimated(transc
 
 
 def test_output_takes_the_max_not_the_last_row(transcripts):
-    """Rows are not guaranteed to arrive in ascending order of completeness."""
+    """Rows are not guaranteed to arrive in ascending order of completeness"""
     transcripts("s1", [
         row("msg_a", out=900),
         row("msg_a", out=12),
@@ -145,16 +102,12 @@ def test_output_takes_the_max_not_the_last_row(transcripts):
     assert usage.read_session("s1", FLOOR).total.output == 900
 
 
-# -- the re-write tax -----------------------------------------------------------------
+# -- the re-write tax
 
 
 def test_rewrite_excess_counts_only_what_was_written_twice(transcripts):
-    """A session that re-writes its prefix reports the excess; a clean one reports zero.
-
-    Both halves in one test: `rewrite_excess == 0` on its own would pass just as well
-    against a property that always returns zero.
-    """
-    # Clean: context grows monotonically, each token written exactly once.
+    """A session that re-writes its prefix reports the excess; a clean one reports zero"""
+    # Clean: context grows monotonically, each token written exactly once
     transcripts("clean", [
         row("m1", write=1000, read=0),
         row("m2", write=500, read=1000),
@@ -165,7 +118,7 @@ def test_rewrite_excess_counts_only_what_was_written_twice(transcripts):
     assert clean.cache_write == 1800
     assert clean.rewrite_excess == 0
 
-    # Re-written: the third call re-sends the whole 1500-token prefix as a write.
+    # Re-written: the third call re-sends the whole 1500-token prefix as a write
     transcripts("cold", [
         row("m1", write=1000, read=0),
         row("m2", write=500, read=1000),
@@ -178,26 +131,22 @@ def test_rewrite_excess_counts_only_what_was_written_twice(transcripts):
 
 
 def test_rewrite_cost_is_the_difference_between_writing_and_reading(transcripts):
-    """The tax is what the re-sent tokens cost ABOVE reading them, not their full price."""
+    """The tax is what the re-sent tokens cost ABOVE reading them, not their full price"""
     transcripts("s1", [
         row("m1", write=1_000_000, read=0),
         row("m2", write=1_000_000, read=0),
     ])
     total = usage.read_session("s1", FLOOR).total
     assert total.rewrite_excess == 1_000_000
-    # 1M tokens at Opus $5/MTok: written at 1.25x = $6.25, read at 0.1x = $0.50.
+    # 1M tokens at Opus $5/MTok: written at 1.25x = $6.25, read at 0.1x = $0.50
     assert total.rewrite_cost_usd == pytest.approx(5.75)
 
 
-# -- turn boundaries ------------------------------------------------------------------
+# -- turn boundaries
 
 
 def test_a_boundary_is_the_cache_going_backwards_not_a_big_write(transcripts):
-    """Boundaries are counted from cache_read DROPPING, so no threshold is involved.
-
-    The rising-read call in the middle is the control: it writes just as much as the
-    dropping one, and must not count.
-    """
+    """Boundaries are counted from cache_read DROPPING, so no threshold is involved"""
     transcripts("s1", [
         row("m1", write=900, read=0),      # first call: nothing to drop from
         row("m2", write=900, read=900),    # read rose — same write size, not a boundary
@@ -213,18 +162,11 @@ def test_a_single_turn_session_has_no_boundaries(transcripts):
     assert usage.read_session("s1", FLOOR).total.resume_boundaries == 0
 
 
-# -- which of the two causes made a boundary cold -------------------------------------
+# -- which of the two causes made a boundary cold
 
 def test_a_boundary_inside_the_ttl_is_the_prefix_moving_however_little_it_read(
         transcripts):
-    """The misreading this split exists to prevent, and its opposite in the same test.
-
-    wo-5a6b2d6d's 157k re-write was read as a 14-minute turn outliving a 5-minute cache.
-    The gap between the call that wrote the cache and the one that missed it was TWELVE
-    SECONDS: the entry was alive and the prefix had moved. A classifier that looked only
-    at how little was read would get that backwards, so the pair below differs in the
-    GAP alone — same tokens, same drop, opposite cause.
-    """
+    """The misreading this split exists to prevent, and its opposite in the same test"""
     transcripts("s1", [
         row("m1", write=9_000, read=0, at="2026-08-09T00:00:00.000Z"),
         row("m2", write=100, read=9_000, at="2026-08-09T00:00:02.000Z"),
@@ -247,12 +189,7 @@ def test_a_boundary_inside_the_ttl_is_the_prefix_moving_however_little_it_read(
 
 
 def test_a_long_gap_that_still_read_the_static_prefix_is_not_an_expiry(transcripts):
-    """An expired entry leaves NOTHING; a moved prefix still serves the system prompt.
-
-    Both calls below sit far outside the TTL and differ only in what survived, which is
-    the whole discriminator: 20k read back means the entry was there and stopped
-    matching, and no longer TTL would have changed that.
-    """
+    """An expired entry leaves NOTHING; a moved prefix still serves the system prompt"""
     transcripts("s1", [
         row("m1", write=60_000, read=0, at="2026-08-09T00:00:00.000Z"),
         row("m2", write=100, read=60_000, at="2026-08-09T00:00:02.000Z"),
@@ -265,11 +202,7 @@ def test_a_long_gap_that_still_read_the_static_prefix_is_not_an_expiry(transcrip
 
 
 def test_the_cause_split_is_a_partition_of_the_tax_not_a_second_count(transcripts):
-    """`rewrite_excess` keeps its own threshold-free definition; the causes divide it.
-
-    The two halves must add back to the tax exactly (kn-7a2180ba), even though the raw
-    boundary writes they are derived from do not equal it.
-    """
+    """`rewrite_excess` keeps its own threshold-free definition; the causes divide it"""
     transcripts("s1", [
         row("m1", write=50_000, read=0, at="2026-08-09T00:00:00.000Z"),
         row("m2", write=100, read=50_000, at="2026-08-09T00:00:02.000Z"),
@@ -285,8 +218,7 @@ def test_the_cause_split_is_a_partition_of_the_tax_not_a_second_count(transcript
 
 
 def test_an_unclassified_tax_reports_no_share_rather_than_a_zero_one(transcripts):
-    """A session with no boundary has NOT been measured at 0% — the two must not read
-    alike, or a report prints "0% was the TTL" as though it were a finding."""
+    """A session with no boundary has NOT been measured at 0%"""
     transcripts("s1", [row("m1", write=500), row("m2", write=400, read=500)])
     total = usage.read_session("s1", FLOOR).total
     assert total.rewrite_ttl_share is None
@@ -295,13 +227,7 @@ def test_an_unclassified_tax_reports_no_share_rather_than_a_zero_one(transcripts
 
 def test_the_floor_comes_from_the_catalog_and_reclassifies_the_same_boundary(
         transcripts):
-    """`os.cold_prefix_floor` is the knob, and this is the boundary it moves.
-
-    One transcript, read twice under different floors. At 5,000 a boundary reading 16k
-    kept its prefix, so no TTL would have helped it; raise the floor above 16k and the
-    same boundary is read as an expiry. Nothing else about the session changes, which is
-    what makes this the setting's actual effect rather than a coincidence.
-    """
+    """`os.cold_prefix_floor` is the knob, and this is the boundary it moves"""
     transcripts("s1", [
         row("m1", write=60_000, read=0, at="2026-08-09T00:00:00.000Z"),
         row("m2", write=100, read=60_000, at="2026-08-09T00:00:02.000Z"),
@@ -312,13 +238,7 @@ def test_the_floor_comes_from_the_catalog_and_reclassifies_the_same_boundary(
 
 
 def test_the_floor_has_no_default_anywhere_in_this_module():
-    """There must be nothing to fall back TO.
-
-    A default here would let a caller that could not reach a catalog still produce a
-    classification, and a cost report that classified against a guessed threshold prints
-    a finding the configuration never produced. Asserted on the module surface rather
-    than on one call, because the way this regresses is somebody re-adding the constant.
-    """
+    """There must be nothing to fall back TO"""
     assert not hasattr(usage, "COLD_PREFIX_FLOOR")
     assert not hasattr(usage, "resolved_cold_prefix_floor")
     with pytest.raises(TypeError):
@@ -326,7 +246,7 @@ def test_the_floor_has_no_default_anywhere_in_this_module():
 
 
 def test_merging_keeps_the_share_token_weighted_not_averaged():
-    """Two sessions of very different size must not each get half a vote."""
+    """Two sessions of very different size must not each get half a vote"""
     small = usage.Usage(rewrite_ttl_write=10, rewrite_prefix_write=0, boundaries_ttl=1,
                         resume_boundaries=1)
     large = usage.Usage(rewrite_ttl_write=0, rewrite_prefix_write=990,
@@ -337,16 +257,11 @@ def test_merging_keeps_the_share_token_weighted_not_averaged():
     assert merged.rewrite_ttl_share == 0.01
 
 
-# -- subagents ------------------------------------------------------------------------
+# -- subagents
 
 
 def test_subagents_are_counted_separately_and_included_in_the_total(transcripts):
-    """A third of the planner's bill was subagents, so they get their own line.
-
-    Asserting the split AND the sum: reporting them only inside the total would hide
-    the thing worth acting on, and reporting them only separately would understate
-    what the work order cost.
-    """
+    """A third of the planner's bill was subagents, so they get their own line"""
     transcripts("s1", [row("m1", write=1000, out=10)], subagents={
         "agent-aaa": [row("s1m1", write=300, out=5)],
         "agent-bbb": [row("s2m1", write=200, out=7)],
@@ -361,13 +276,7 @@ def test_subagents_are_counted_separately_and_included_in_the_total(transcripts)
 
 
 def test_the_subagent_rewrite_tax_is_a_structural_zero_not_a_small_one(transcripts):
-    """Spec 2026-10-02 §1.5, asserted as a PROPERTY and not as a constant.
-
-    The main side's cache read goes BACKWARDS once, so it has a boundary and an excess.
-    The subagent's never does and its written volume never exceeds its own context peak,
-    so `rewrite_excess` and `resume_boundaries` can only be 0 — while it still wrote
-    real tokens. That is the zero `jarvis cost` has to label.
-    """
+    """Spec 2026-10-02 §1.5, asserted as a PROPERTY and not as a constant"""
     transcripts(
         "structural",
         [row("m1", write=60_000, read=50_000, at="2026-08-09T00:00:00.000Z"),
@@ -382,8 +291,7 @@ def test_the_subagent_rewrite_tax_is_a_structural_zero_not_a_small_one(transcrip
     assert session.subagents.rewrite_excess == 0
     assert session.subagents.resume_boundaries == 0
     assert session.main.rewrite_excess > 0 and session.main.resume_boundaries == 1
-    # `Usage.__add__` sums both sides, so the total carries the main side's tax alone —
-    # which is why an unlabelled rollup reads as "subagent cache spend is negligible".
+    # `Usage.__add__` sums both sides, so the total carries the main side's tax alone
     assert session.total.rewrite_excess == session.main.rewrite_excess
     assert session.total.resume_boundaries == session.main.resume_boundaries
     assert session.total.cache_write == (session.main.cache_write
@@ -391,23 +299,16 @@ def test_the_subagent_rewrite_tax_is_a_structural_zero_not_a_small_one(transcrip
 
 
 def test_an_empty_subagent_transcript_is_not_counted_as_an_agent(transcripts):
-    """Claude Code leaves behind stub files for agents that produced nothing."""
+    """Claude Code leaves behind stub files for agents that produced nothing"""
     transcripts("s1", [row("m1", write=100)], subagents={"agent-empty": []})
     assert usage.read_session("s1", FLOOR).subagent_count == 0
 
 
-# -- sessions split across project directories ----------------------------------------
+# -- sessions split across project directories
 
 
 def test_a_session_split_across_project_dirs_sums_every_segment(transcripts):
-    """Claude Code keys the transcript directory on the segment's cwd, so one session
-    id can leave files under two slugs — wo-2fa7c0e9's did (repo root, then its
-    worktree), and keeping one path per session id read that work order as $0.51 /
-    1 turn when the true figure was three times that.
-
-    Paired with a single-segment session in one of the same directories, which must
-    not double.
-    """
+    """Claude Code keys the transcript directory on the segment's cwd"""
     transcripts("split", [row("m1", write=100, read=0, out=10)], slug="-repo")
     transcripts("split", [row("m2", write=50, read=400, out=20)],
                 slug="-repo-worktree")
@@ -418,16 +319,14 @@ def test_a_session_split_across_project_dirs_sums_every_segment(transcripts):
     assert split.cache_write == 150
     assert split.cache_read == 400
     assert split.output == 30
-    # A second file exists only because the session was resumed somewhere else, so
-    # the file boundary itself counts as one resume even though no cache drop is
-    # visible across separately-read files.
+    # A second file exists only because the session was resumed somewhere else
     assert split.resume_boundaries == 1
 
     assert usage.read_session("solo", FLOOR).total.output == 5
 
 
 def test_subagents_are_found_beside_every_segment(transcripts):
-    """Each segment directory can hold its own subagent transcripts."""
+    """Each segment directory can hold its own subagent transcripts"""
     transcripts("split", [row("m1", write=100)], slug="-repo",
                 subagents={"agent-aaa": [row("sa1", out=5)]})
     transcripts("split", [row("m2", write=50)], slug="-repo-worktree",
@@ -438,11 +337,11 @@ def test_subagents_are_found_beside_every_segment(transcripts):
     assert session.subagents.output == 12
 
 
-# -- missing evidence -----------------------------------------------------------------
+# -- missing evidence
 
 
 def test_a_missing_transcript_is_not_found_rather_than_free(transcripts):
-    """Unmeasurable and zero are different answers and must not render the same."""
+    """Unmeasurable and zero are different answers and must not render the same"""
     transcripts("present", [row("m1", write=100, out=10)])
 
     missing = usage.read_session("nope", FLOOR)
@@ -455,19 +354,16 @@ def test_a_missing_transcript_is_not_found_rather_than_free(transcripts):
 
 
 def test_a_work_order_with_no_session_id_reports_not_found(transcripts):
-    """A work order that never got a session must not match a transcript by accident."""
+    """A work order that never got a session must not match a transcript by accident"""
     transcripts("", [row("m1", write=100)], slug="-oddly-named")
     assert usage.read_session("", FLOOR).found is False
 
 
-# -- pricing --------------------------------------------------------------------------
+# -- pricing
 
 
 def test_synthetic_messages_are_free_but_unknown_models_are_not():
-    """`<synthetic>` is Claude Code's own placeholder for an API error it rendered as a
-    turn — never billed. An unrecognised REAL model must not take the same path: it
-    falls back to the Opus rate, because silently pricing a new model at zero would
-    make the report quietly wrong the week a model ships."""
+    """`<synthetic>` is Claude Code's own placeholder for an API error it rendered as a turn — never billed"""
     assert usage.price_for("<synthetic>") == (0.0, 0.0)
     assert usage.price_for("claude-opus-5") == (5.0, 25.0)
     assert usage.price_for("claude-haiku-4-5-20251001") == (1.0, 5.0)
@@ -476,7 +372,7 @@ def test_synthetic_messages_are_free_but_unknown_models_are_not():
 
 
 def test_cost_is_priced_per_message_model_not_per_session(transcripts):
-    """A session that mixes models must not price the cheap half at the dear rate."""
+    """A session that mixes models must not price the cheap half at the dear rate"""
     transcripts("s1", [
         row("m1", plain=1_000_000, out=1_000_000, model="claude-opus-5"),
         row("m2", plain=1_000_000, out=1_000_000, model="claude-haiku-4-5"),
@@ -495,36 +391,26 @@ def test_cache_reads_are_a_tenth_and_writes_are_a_quarter_more(transcripts):
 
 
 def test_a_one_hour_cache_write_costs_twice_input_not_a_quarter_more(transcripts):
-    """The TTL is a PRICE, and Jarvis bought the expensive one for months.
-
-    1.25x at the 5-minute TTL, 2x at the one-hour one (kn-f94abf34, measured over 1,075
-    transcripts). Every write a worker made before `FORCE_PROMPT_CACHING_5M` shipped was
-    a 1h write, so pricing them all at 1.25x understated the largest avoidable line in
-    the bill by 60% of itself. The split is reported per message and is used where it is
-    there.
-    """
+    """The TTL is a PRICE, and Jarvis bought the expensive one for months"""
     transcripts("s1", [row("m1", write=1_000_000, ttl_1h=1_000_000)])
     assert usage.read_session("s1", FLOOR).total.list_cost_usd == pytest.approx(10.0)
     transcripts("s2", [row("m1", write=1_000_000, ttl_5m=1_000_000)])
     assert usage.read_session("s2", FLOOR).total.list_cost_usd == pytest.approx(6.25)
-    # Half and half prices in between, and a message with no split at all stays on the
-    # 5-minute rate — the floor, and what this module has always charged.
+    # Half and half prices in between, and a message with no split at all stays on the 5-minute rate
     transcripts("s3", [row("m1", write=1_000_000, ttl_1h=500_000, ttl_5m=500_000)])
     assert usage.read_session("s3", FLOOR).total.list_cost_usd == pytest.approx(8.125)
 
 
 def test_the_split_is_a_ratio_when_it_covers_only_part_of_the_write(transcripts):
-    """A turn's envelope reports the split for PART of the turn while `modelUsage`
-    reports the whole; the ratio is what carries over, applied to all of it."""
+    """A turn's envelope reports the split for PART of the turn while `modelUsage` reports the whole"""
     priced = usage.priced("claude-opus-5", cache_write=1_000_000,
                           cache_1h=80_000, cache_5m=20_000)
-    # 80% of the sample was 1h, so the whole million is priced at 1.25 + 0.8*0.75.
+    # 80% of the sample was 1h, so the whole million is priced at 1.25 + 0.8*0.75
     assert priced.list_cost_usd == pytest.approx(1_000_000 * 5 * 1.85 / 1e6)
 
 
 def test_the_bill_says_what_each_class_of_token_cost(transcripts):
-    """The line items. A total says how much; only the classes say where it went — and
-    they are priced 20x apart, so which one dominates IS the finding."""
+    """The line items"""
     transcripts("s1", [row("m1", plain=1_000, write=100_000, read=2_000_000,
                            out=10_000)])
     classes = usage.read_session("s1", FLOOR).total.cost_by_class
@@ -536,16 +422,11 @@ def test_the_bill_says_what_each_class_of_token_cost(transcripts):
         usage.read_session("s1", FLOOR).total.list_cost_usd)
 
 
-# -- merging --------------------------------------------------------------------------
+# -- merging
 
 
 def test_merging_sums_the_tax_but_takes_the_peak():
-    """Two sessions' re-write excesses add; their context peaks do not.
-
-    Summing the peaks would let a merged total's excess be computed against a context
-    no single session ever reached, which is why `rewrite_excess` is stored per session
-    rather than derived from merged figures.
-    """
+    """Two sessions' re-write excesses add; their context peaks do not"""
     a = usage.Usage(cache_write=300, context_peak=100, rewrite_excess=200)
     b = usage.Usage(cache_write=500, context_peak=400, rewrite_excess=100)
     merged = a + b
@@ -555,19 +436,13 @@ def test_merging_sums_the_tax_but_takes_the_peak():
 
 
 def test_a_transcript_path_may_be_a_plain_string(transcripts):
-    """`_assistant_messages` is the module's useful handle for ad-hoc measurement, and a
-    string is the obvious thing to hand it — it should not need a `Path`."""
+    """`_assistant_messages` is the module's useful handle for ad-hoc measurement"""
     path = transcripts("s1", [row("m1", write=100, out=10)])
     assert usage._assistant_messages(str(path)) == usage._assistant_messages(path)
 
 
 def test_rows_without_usage_are_ignored(transcripts):
-    """Tool results, hooks and UI state make up most of a transcript.
-
-    The `custom-title` row carries the literal string "usage" to exercise the cheap
-    pre-filter `_assistant_messages` uses to skip most lines without parsing them: a
-    row that survives the substring check must still be rejected on its type.
-    """
+    """Tool results, hooks and UI state make up most of a transcript"""
     transcripts("s1", [
         {"type": "user", "message": {"content": "hello"}},
         {"type": "attachment", "attachment": {"type": "task_reminder"}},
@@ -583,11 +458,7 @@ def test_rows_without_usage_are_ignored(transcripts):
 def call_row(mid: str, *, read: int = 0, out: int = 0, write: int = 0, plain: int = 0,
              tools: Sequence[tuple[str, str]] = (),
              at: str = "2026-10-06T00:00:00.000Z") -> dict:
-    """One assistant row with `usage` and optional `tool_use` blocks.
-
-    `tools` is (id, name) pairs: the parallel-call case is several blocks on ONE row,
-    which is how Claude Code writes it and the case the char split exists for.
-    """
+    """One assistant row with `usage` and optional `tool_use` blocks"""
     return {
         "type": "assistant",
         "timestamp": at,
@@ -604,7 +475,7 @@ def call_row(mid: str, *, read: int = 0, out: int = 0, write: int = 0, plain: in
 
 def result_row(*results: tuple[str, str], at: str = "2026-10-06T00:00:01.000Z",
                is_error: bool = False) -> dict:
-    """One user row carrying `tool_result` blocks — (tool_use_id, text) pairs."""
+    """One user row carrying `tool_result` blocks — (tool_use_id, text) pairs"""
     return {
         "type": "user",
         "timestamp": at,
@@ -622,12 +493,7 @@ def write_jsonl(path, rows_out: Sequence[dict]):
 
 def test_tool_results_pairs_a_use_with_its_result_and_sizes_it_by_context_delta(
         tmp_path):
-    """The pair, and the unmatched call beside it so "one result" cannot be a stub.
-
-    Paired on purpose: a `tool_use` whose result never arrived (the turn was killed
-    mid-call) must come back unmatched and WITHOUT tokens, never zero-filled into the
-    averages — §10.2's `excluded.unmatched_calls`.
-    """
+    """The pair, and the unmatched call beside it so "one result" cannot be a stub"""
     path = write_jsonl(tmp_path / "s1.jsonl", [
         call_row("m1", read=1000, out=50, tools=[("t1", "Read")]),
         result_row(("t1", "x" * 40)),
@@ -637,18 +503,14 @@ def test_tool_results_pairs_a_use_with_its_result_and_sizes_it_by_context_delta(
     assert [(r.tool_use_id, r.name, r.matched) for r in found] == [
         ("t1", "Read", True), ("t2", "Bash", False)]
     first, unmatched = found
-    # 1200 - 1000 - 50: the tokens call m2 was asked to read that m1 was not.
+    # 1200 - 1000 - 50: the tokens call m2 was asked to read that m1 was not
     assert (first.tokens, first.token_basis) == (150, usage.BASIS_CONTEXT_DELTA)
     assert (first.chars, first.is_error, first.caller) == (40, False, usage.CALLER_MAIN)
     assert (unmatched.tokens, unmatched.token_basis) == (0, "")
 
 
 def test_parallel_results_split_char_proportionally_and_sum_to_the_delta(tmp_path):
-    """K results between one call pair share ONE exact delta, 1:1:2 by characters.
-
-    The sum is the assertion that matters: 150 split three ways has a remainder, and a
-    per-result rounding that loses it would under-report the fleet's tool cost.
-    """
+    """K results between one call pair share ONE exact delta, 1:1:2 by characters"""
     path = write_jsonl(tmp_path / "s1.jsonl", [
         call_row("m1", read=1000, out=50,
                  tools=[("t1", "Read"), ("t2", "Read"), ("t3", "Bash")]),
@@ -662,11 +524,7 @@ def test_parallel_results_split_char_proportionally_and_sum_to_the_delta(tmp_pat
 
 
 def test_a_compaction_between_the_calls_falls_back_to_chars(tmp_path):
-    """The context goes DOWN at a `compact_boundary`, so the delta is not the result.
-
-    Divisor comes from the caller (`cost.chars_per_token`), which is why the same file
-    is sized twice here: 40 characters is 10 tokens at 4.0 and 20 at 2.0.
-    """
+    """The context goes DOWN at a `compact_boundary`, so the delta is not the result"""
     path = write_jsonl(tmp_path / "s1.jsonl", [
         call_row("m1", read=1000, out=50, tools=[("t1", "Read")]),
         result_row(("t1", "x" * 40)),
@@ -682,7 +540,7 @@ def test_a_compaction_between_the_calls_falls_back_to_chars(tmp_path):
 
 
 def test_a_user_prompt_between_the_calls_falls_back_to_chars(tmp_path):
-    """Otherwise the user's own typing is charged to the tool."""
+    """Otherwise the user's own typing is charged to the tool"""
     path = write_jsonl(tmp_path / "s1.jsonl", [
         call_row("m1", read=1000, out=50, tools=[("t1", "Read")]),
         result_row(("t1", "x" * 40)),
@@ -695,7 +553,7 @@ def test_a_user_prompt_between_the_calls_falls_back_to_chars(tmp_path):
 
 
 def test_a_non_positive_delta_falls_back_to_chars(tmp_path):
-    """A context that did not grow cannot be evidence of what the tool appended."""
+    """A context that did not grow cannot be evidence of what the tool appended"""
     path = write_jsonl(tmp_path / "s1.jsonl", [
         call_row("m1", read=1000, out=50, tools=[("t1", "Read")]),
         result_row(("t1", "x" * 40)),
@@ -706,11 +564,7 @@ def test_a_non_positive_delta_falls_back_to_chars(tmp_path):
 
 
 def test_a_sidechain_result_is_attributed_to_the_subagent_not_the_main_chain(tmp_path):
-    """Caller is the FILE the row came from — `read_session`'s own split (§10.3).
-
-    Paired: the same walk over the parent transcript must say `main`, or "subagent"
-    would be indistinguishable from a constant.
-    """
+    """Caller is the FILE the row came from — `read_session`'s own split (§10.3)"""
     parent = write_jsonl(tmp_path / "s1.jsonl", [
         call_row("m1", read=1000, out=50, tools=[("t1", "Read")]),
         result_row(("t1", "x" * 40)),
@@ -724,5 +578,5 @@ def test_a_sidechain_result_is_attributed_to_the_subagent_not_the_main_chain(tmp
     assert [r.caller for r in usage.tool_results(parent)] == [usage.CALLER_MAIN]
     sub_result, = usage.tool_results(sub)
     assert sub_result.caller == usage.CALLER_SUBAGENT
-    # 600 - 500 - 10, measured inside the subagent's own chain.
+    # 600 - 500 - 10, measured inside the subagent's own chain
     assert (sub_result.tokens, sub_result.name) == (90, "Grep")

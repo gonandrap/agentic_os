@@ -1,22 +1,4 @@
-"""A validation round WAITS for GitHub to finish the checks before it judges anything.
-
-The user's ruling, 2026-09-18 (kn-356c724b): a worker runs the TARGETED tests and CI runs
-the suite. The full suite takes ~21 minutes, a worker turn is one conversation with a
-five-minute prompt cache, and one blocking call that long re-sends the whole conversation
-at the cache-WRITE rate on the next call — wo-16a488ee paid that seven times, ~1.5M
-tokens, and its round-1 rejection was still about CI contradicting the local green it had
-spent 75 minutes producing.
-
-Somebody still has to wait for the real suite. THE OS IS THE CHEAP PLACE TO WAIT: nothing
-is billed while a round is held and no seat is reached, whereas the same wait inside a
-worker turn is paid for twice.
-
-The mechanism is `_validation_held`'s, reused rather than copied — the round is closed
-`failed` (RUNNABLE, uncounted, so no round number is spent) with `reopens_at` on the
-event, which `validation_hold_until` reads back. These tests drive the REAL
-`Daemon._validate_work_order`, because "the validator was not called" is the whole claim
-and a unit test of the predicate alone would pass with the branch deleted.
-"""
+"""A validation round WAITS for GitHub to finish the checks before it judges anything"""
 
 from __future__ import annotations
 
@@ -37,15 +19,12 @@ GREEN = [{"name": "unit (3.11)", "status": "COMPLETED", "conclusion": "SUCCESS"}
          {"name": "evals", "status": "COMPLETED", "conclusion": "SUCCESS"}]
 RED = [{"name": "unit (3.11)", "status": "COMPLETED", "conclusion": "FAILURE"}]
 
-#: A real changed file on the artifact. Not scenery: `nothing_to_judge` escalates a
-#: packet with no files before the validator is ever reached, so an artifact registered
-#: without one would make every "the panel judged it" assertion below pass or fail for a
-#: reason that has nothing to do with CI.
+#: A real changed file on the artifact
 FILES = [{"path": "app.py", "additions": 1, "deletions": 0}]
 
 
 def _packet(checks, source="pull_request"):
-    """The one field `ci_pending` reads, in the shape the collector builds."""
+    """The one field `ci_pending` reads, in the shape the collector builds"""
     return evidence_mod.EvidencePacket(
         unit="work_order", subject_id="wo-1", title="t", description="", summary="",
         declared="", pr_url="https://github.com/x/y/pull/1", base="a", head="b",
@@ -54,7 +33,7 @@ def _packet(checks, source="pull_request"):
         pr={"checks": checks, "head_sha": "abc"} if source == "pull_request" else None)
 
 
-# -- 1. the predicate -----------------------------------------------------------------
+# -- 1. the predicate
 
 
 def test_an_unfinished_check_is_what_the_os_waits_for():
@@ -62,30 +41,23 @@ def test_an_unfinished_check_is_what_the_os_waits_for():
 
 
 def test_a_finished_check_is_never_waited_for_whatever_it_concluded():
-    """GREEN and RED are both ANSWERS. Waiting on a red check would park the work order
-    until the deadline lapsed instead of letting a seat say the code is broken — the
-    distinction `failing_checks` draws, read from `status` rather than `conclusion`."""
+    """GREEN and RED are both ANSWERS"""
     assert evidence_mod.ci_pending(_packet(GREEN)) == ()
     assert evidence_mod.ci_pending(_packet(RED)) == ()
 
 
 def test_nothing_to_wait_for_is_not_a_wait():
-    """Both shapes that can never become a verdict. A repository that runs no checks,
-    and a packet with no pull request behind it: a round that waited on either would
-    wait until the deadline every single time."""
+    """Both shapes that can never become a verdict"""
     assert evidence_mod.ci_pending(_packet([])) == ()
     assert evidence_mod.ci_pending(_packet(None, source="worktree")) == ()
 
 
-# -- 2. the hold ----------------------------------------------------------------------
+# -- 2. the hold
 
 
 def test_the_round_is_held_while_ci_is_still_running_and_no_seat_is_reached(
         fleet, fake_gh):
-    """THE CLAIM OF THIS FILE. The panel must not judge a submission against an empty
-    check list: `validator-seats/tester.md` judges the declared evidence against the
-    check runs, so judging now would make every submission's testing claim unverifiable
-    at exactly the moment the worker stopped proving it locally."""
+    """THE CLAIM OF THIS FILE"""
     wo = fleet.dispatch()
     fleet.change(wo["id"], "x = 1")
     never = Validator(passed())
@@ -110,9 +82,7 @@ def test_the_round_is_held_while_ci_is_still_running_and_no_seat_is_reached(
 
 
 def test_waiting_for_ci_spends_no_round_number(fleet, fake_gh):
-    """`failed` is RUNNABLE and `counted_validation_rounds` ignores it, so a submission
-    held for twenty minutes still gets its three real rounds. A hold that burned a round
-    would give a worker two attempts because GitHub was slow."""
+    """`failed` is RUNNABLE and `counted_validation_rounds` ignores it"""
     wo = fleet.dispatch()
     fleet.change(wo["id"], "x = 1")
     fleet.daemon.validator = Validator(passed())
@@ -129,14 +99,7 @@ def test_waiting_for_ci_spends_no_round_number(fleet, fake_gh):
 
 
 def test_the_hold_lifts_by_itself_once_the_checks_report(fleet, fake_gh, monkeypatch):
-    """The other half, and the one that makes the wait a wait rather than a stall: the
-    SAME round is judged on a later tick, with no worker turn, no user and no command.
-
-    The recheck delay is shortened rather than the event rewritten. `validation_hold_until`
-    takes the LATEST moment for a round, so a lapsed event written beside a live one
-    changes nothing — the hold has to expire on its own terms or this test would assert
-    over a path the daemon never takes.
-    """
+    """The other half, and the one that makes the wait a wait rather than a stall: the SAME round is..."""
     monkeypatch.setattr("jarvis.daemon.CI_HOLD_RECHECK_SECONDS", -1.0)
     wo = fleet.dispatch()
     fleet.change(wo["id"], "x = 1")
@@ -156,11 +119,7 @@ def test_the_hold_lifts_by_itself_once_the_checks_report(fleet, fake_gh, monkeyp
 
 def test_ci_that_never_reports_is_judged_anyway_rather_than_parked_for_ever(
         fleet, fake_gh, monkeypatch):
-    """The ceiling, and it fails SAFE rather than open: the round is judged on what
-    GitHub actually reported, and the tester seat is already told to say "no checks
-    reported" rather than read it as a pass. Waiting for ever is the failure mode
-    `VALIDATION_OUTAGE_LIMIT` exists to prevent one authority along — a workflow that
-    never finishes would park the work order in `validating` with nobody watching."""
+    """The ceiling, and it fails SAFE rather than open: the round is judged on what GitHub actually..."""
     monkeypatch.setattr("jarvis.daemon.CI_HOLD_DEADLINE_SECONDS", -1.0)
     wo = fleet.dispatch()
     fleet.change(wo["id"], "x = 1")
@@ -178,13 +137,7 @@ def test_ci_that_never_reports_is_judged_anyway_rather_than_parked_for_ever(
 
 def test_a_lapsed_ci_hold_is_judged_and_its_held_seconds_still_discounted(
         fleet, fake_gh, monkeypatch):
-    """The §1(2) half of the root cause: EXCLUSION ALONE IS NOT THE FIX.
-
-    `validating`'s threshold is 15 minutes and it is judged on time in status, so the
-    first sweep after the hold lifts sees 20 minutes and buys the investigation the
-    exclusion was supposed to prevent — while the panel is legitimately mid-judgement.
-    The held seconds are discounted, so the order is judged and is not stuck.
-    """
+    """The §1(2) half of the root cause: EXCLUSION ALONE IS NOT THE FIX"""
     from jarvis import db, ops
     from jarvis.catalog import FleetHealthConfig
     from tests.test_health_sweep import park_order
@@ -200,8 +153,7 @@ def test_a_lapsed_ci_hold_is_judged_and_its_held_seconds_still_discounted(
     try:
         assert store.get_work_order(wo["id"])["status"] == "validating"
         now = time.time()
-        # Twenty minutes in `validating`, every one of them held: the real hold event
-        # written above, back-dated, with its `reopens_at` a minute in the past.
+        # Twenty minutes in `validating`
         at = park_order(store, wo["id"], "validating", hours=20 / 60.0)
         for row in store.events_of_kind(wo["id"], "validation_failed"):
             payload = db.from_json(row["payload"], {})
@@ -223,14 +175,11 @@ def test_a_lapsed_ci_hold_is_judged_and_its_held_seconds_still_discounted(
         store.close()
 
 
-# -- 3. what a person reads -----------------------------------------------------------
+# -- 3. what a person reads
 
 
 def test_the_two_holds_are_one_mechanism_and_two_sentences():
-    """Same behaviour, different facts. A reader must not be told the account is out of
-    budget when GitHub is merely still running, so the cause is its own — and
-    `validation_hold_until` honours BOTH, which is what stops a new cause holding once
-    and then spinning every tick for ever."""
+    """Same behaviour, different facts"""
     ci = {"payload": '{"round": 1, "cause": "ci_pending", "reopens_at": 50, '
                      '"pending": ["unit (3.11)"]}'}
     window = {"payload": '{"round": 1, "cause": "usage_limit", "reopens_at": 90}'}
@@ -246,11 +195,11 @@ def test_the_two_holds_are_one_mechanism_and_two_sentences():
     assert VALIDATION_CI_CAUSE != VALIDATION_HELD_CAUSE
 
 
-# -- 4. the three renderers -----------------------------------------------------------
+# -- 4. the three renderers
 
 
 class _Pr:
-    """The narrowest pull request `automerge.decide` reads before it holds."""
+    """The narrowest pull request `automerge.decide` reads before it holds"""
     head_oid = "abc123abc123"
     state = "OPEN"
     mergeable_now = True
@@ -263,11 +212,7 @@ class _Cfg:
 
 
 def test_the_hold_is_on_the_ROUND_and_not_only_on_the_event(fleet, fake_gh):
-    """GitHub issue #581. The cause used to live on the `validation_failed` event alone,
-    and none of the three surfaces that render a round can reach it — a feature round's
-    event is on its manager's timeline, not on the round's own subject. So all three
-    printed the storage word, and a green, mergeable pull request read as a failed
-    review for the whole CI window."""
+    """GitHub issue #581"""
     from jarvis import automerge, ops
     from jarvis.project_store import validation_standing
 
@@ -289,8 +234,7 @@ def test_the_hold_is_on_the_ROUND_and_not_only_on_the_event(fleet, fake_gh):
         line = ops.round_line(ops.validation_rounds(store, wo_id=wo["id"])[0])
         assert "waiting for CI" in line and "· failed ·" not in line
 
-        # 2. the auto-merge hold sentence, which is the one the user quoted. The
-        #    DECISION is unchanged — a held round still does not merge.
+        # 2. the auto-merge hold sentence, which is the one the user quoted
         held = automerge.decide(dict(row),
                                 {**store.get_work_order(wo["id"]),
                                  "status": "waiting_pr_merge"},
@@ -302,15 +246,12 @@ def test_the_hold_is_on_the_ROUND_and_not_only_on_the_event(fleet, fake_gh):
     finally:
         store.close()
 
-    # 3. the dashboard badge, rendered in tests/test_ui.py. All three read this one
-    #    helper, which is what stops one of them drifting (kn-432d0f19).
+    # 3. the dashboard badge, rendered in tests/test_ui.py
     assert validation_standing(row) == ("waiting for CI", "active", "◑")
 
 
 def test_a_round_closed_for_any_other_reason_clears_the_hold(fleet):
-    """Written on EVERY close, not only the holding ones. A held round is re-closed in
-    place when the tick picks it up again, so a cause left behind by an earlier hold
-    would outlive the hold and report a genuine outage as "waiting for CI"."""
+    """Written on EVERY close, not only the holding ones"""
     from jarvis.project_store import validation_standing
 
     store = ProjectStore(fleet.project)
@@ -331,11 +272,7 @@ def test_a_round_closed_for_any_other_reason_clears_the_hold(fleet):
 
 
 def test_a_row_written_before_the_column_existed_reads_as_it_always_did(fleet):
-    """kn-c712a5d6: a new column is untested until a test reads a row that predates it.
-    NULL is "nothing is holding this round" — the honest reading of every pre-migration
-    row, and of every genuine failure. There is no backfill and this is why one is not
-    owed: a round still genuinely held rewrites the column on its next recheck tick,
-    which is the whole population anyone can misread."""
+    """kn-c712a5d6: a new column is untested until a test reads a row that predates it"""
     from jarvis import ops
 
     store = ProjectStore(fleet.project)

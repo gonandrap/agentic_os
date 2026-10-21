@@ -1,21 +1,4 @@
-"""Screenshot a `panel_gave_up` hold that NAMES its round, and the same order once a later
-round passed, for a PR's UI evidence (kn-c531a831).
-
-docs/superpowers/specs/2026-09-26-a-panel-gave-up-hold-says-which-round-and-stops-when-it-
-passes.md. TWO SHOTS, because the change makes two claims and either alone is half of it:
-
-1. the hold says WHICH round gave up and quotes 120 characters of what the panel said,
-   with a `round 2 →` link whose target is the anchor the Validation section below emits;
-2. once round 3 PASSES the sentence is gone — from the assumption row and from the
-   `auto_review:` line — while the event itself stays on the timeline.
-
-`scripts/screenshot_assumption_rulings.py` is the shape this copies (records written
-through the stores, so the picture is of a RENDERED record and not of a fake model), and
-the rounds are built `scripts/screenshot_forced_round.py`'s way. Everything lives in a temp
-`JARVIS_HOME`, so it never reads or writes the live OS:
-
-    uv run python scripts/screenshot_panel_hold_round.py
-"""
+"""Screenshot a `panel_gave_up` hold that NAMES its round"""
 
 from __future__ import annotations
 
@@ -33,9 +16,7 @@ PORT = 8808
 
 JUDGED = "4afb5e7b1c2d3e4f5061728394a5b6c7d8e9f012"
 
-#: What the panel wrote when it gave up. LONGER THAN THE CLAMP on purpose: the hint in the
-#: hold has to be seen ending in `…` with the full text one round-link away, which is the
-#: whole split the spec chose over putting a paragraph beside an assumption.
+#: What the panel wrote when it gave up
 PANEL_REASON = (
     "the seats could not agree about whether the retry loop is safe under a partial "
     "write: two read the advisory lock as sufficient and one read it as advisory only, "
@@ -45,12 +26,7 @@ PANEL_REASON = (
 
 
 def seed() -> str:
-    """One parked work order: an assumption the OS accepted, and one the panel held.
-
-    The hold's TEXT IS NOT TYPED HERE — it is whatever `autoreview.decide` really produces
-    for an escalated round 2, so a change that stopped naming the round or stopped quoting
-    the reason shows up in the picture instead of being papered over by hand-written prose.
-    """
+    """One parked work order: an assumption the OS accepted, and one the panel held"""
     from jarvis import autoreview
     from jarvis.catalog import ValidationConfig
     from jarvis.central_store import CentralStore
@@ -78,9 +54,7 @@ def seed() -> str:
     store.update_work_order(wo["id"], status="needs_review",
                             result_summary="added the exporter and its tests; "
                                            "opened a pull request")
-    # An acceptance from an earlier pass, so the `auto_review:` summary has something to
-    # fall back TO in the second shot: a line that merely disappeared would not show that
-    # the mechanism is still reporting, only that it went quiet.
+    # An acceptance from an earlier pass
     decided = store.add_assumption(wo["id"], "named the helper `_render_row`, matching "
                                              "the two beside it")
     store.review_assumption(decided, "accepted", decided_by=ASSUMPTION_DECIDER_OS,
@@ -94,9 +68,7 @@ def seed() -> str:
     held = store.add_assumption(wo["id"], "dropped the `--since` flag from the exporter — "
                                           "the spec did not mention it")
 
-    # Round 1 passed on an earlier commit; round 2 is the one that gave up. Two rounds so
-    # the link has somewhere to be WRONG: an anchor pointing at the section heading rather
-    # than at round 2 is invisible on a page with one round.
+    # Round 1 passed on an earlier commit; round 2 is the one that gave up
     first = store.open_validation_round(wo_id=wo["id"], fingerprint="7c1f9a2e04b3")
     store.set_validation_head(first["id"], JUDGED)
     store.close_validation_round(first["id"], "passed", "")
@@ -128,7 +100,7 @@ def seed() -> str:
 
 
 def pass_a_later_round(wo_id: str) -> None:
-    """Round 3, forced and PASSED at the same commit — wo-15f5d969's real trace."""
+    """Round 3, forced and PASSED at the same commit — wo-15f5d969's real trace"""
     from jarvis.central_store import CentralStore
     from jarvis.project_store import ProjectStore
 
@@ -154,8 +126,7 @@ def serve() -> None:
 
 
 def shoot(wo_id: str, name: str) -> Path:
-    """The work-order page, whole: the hold line and the round it points at are in two
-    different sections, and the claim is that the LINK between them resolves."""
+    """The work-order page, whole: the hold line and the round it points at are in two different sections"""
     from playwright.sync_api import sync_playwright
 
     SHOTS.mkdir(parents=True, exist_ok=True)

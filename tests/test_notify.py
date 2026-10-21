@@ -1,4 +1,4 @@
-"""Notification sinks: deep links back into the local UI."""
+"""Notification sinks: deep links back into the local UI"""
 
 from __future__ import annotations
 
@@ -50,11 +50,7 @@ def test_wo_url_quotes_path_segments():
 
 @pytest.fixture
 def sent(monkeypatch, allow_external_sinks):
-    """Capture the Telegram payload instead of hitting the network.
-
-    Stubbing `urlopen` is what earns this the right to lift the isolation gate's
-    external-sink kill switch — nothing here can reach the real API.
-    """
+    """Capture the Telegram payload instead of hitting the network"""
     calls: list[dict] = []
 
     class Resp:
@@ -91,16 +87,11 @@ def test_telegram_without_wo_id_has_no_link(sent):
     assert "<a href" not in sent[0]["text"]
 
 
-# -- deep links that would dead-end -------------------------------------------------
+# -- deep links that would dead-end
 
 def test_route_validates_the_deep_link_before_it_ships(jarvis_home, fake_claude,
                                                        catalog_file, sent):
-    """A notification is often the user's only way into a work order, and the link used
-    to be built from whatever project name the emitter passed — no check that the
-    project was registered or the work order existed. The observed failure: a test
-    fixture's project name reached the real Telegram sink and the user followed it into
-    an HTTP 500.
-    """
+    """A notification is often the user's only way into a work order"""
     from jarvis import ops
     from jarvis.central_store import CentralStore
 
@@ -120,8 +111,7 @@ def test_route_validates_the_deep_link_before_it_ships(jarvis_home, fake_claude,
 
     live, stale_project, stale_wo = (c["text"] for c in sent)
     assert f'<a href="http://127.0.0.1:8787/wo/proj_a/{real["id"]}#pending">' in live
-    # No link at all rather than one that 404s: the user cannot tell a stale link from
-    # a broken dashboard, and guessing wrong costs them a debugging session.
+    # No link at all rather than one that 404s: the user cannot tell a stale link from a broken...
     assert "<a href" not in stale_project
     assert "not registered with this Jarvis" in stale_project
     assert "<a href" not in stale_wo
@@ -130,7 +120,7 @@ def test_route_validates_the_deep_link_before_it_ships(jarvis_home, fake_claude,
 
 def test_the_log_sink_records_why_a_link_was_withheld(jarvis_home, fake_claude,
                                                       catalog_file):
-    """On disk too — otherwise a dead link is only ever visible to whoever tapped it."""
+    """On disk too — otherwise a dead link is only ever visible to whoever tapped it"""
     from jarvis import ops
     from jarvis.central_store import CentralStore
     from jarvis.paths import logs_dir
@@ -148,8 +138,6 @@ def test_the_log_sink_records_why_a_link_was_withheld(jarvis_home, fake_claude,
 
 
 def test_a_sink_called_directly_still_links(sent):
-    """Validation needs a CentralStore; a sink must not open one behind its caller's
-    back (that is how a test starts reading the real fleet's state). Direct callers keep
-    the unvalidated URL."""
+    """Validation needs a CentralStore"""
     notify.sink_telegram(item(), make_catalog())
     assert "<a href" in sent[0]["text"]

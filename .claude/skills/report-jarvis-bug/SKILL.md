@@ -71,27 +71,14 @@ to this, which is exactly the state in which everything feels critical. The ques
 whether work STOPPED, whether something was LOST, or whether the OS said something
 UNTRUE — not how irritating it was.
 
-`critical` and `blocker` commit the fleet to a fix and to a release, so your rating is a
-CLAIM and Neo re-assesses it against this same rubric before anything acts on it. Claim
-one honestly when it fits; a claim Neo downgrades is queued like any other bug and
-costs nothing but the disagreement, which is a signal the user wants. `low`, `medium`
-and `high` are not re-assessed — they wait on the tracker until someone runs
-`jarvis issues start <issue-url>`.
+`critical` and `blocker` are a CLAIM, and Neo re-assesses the rating against this same
+rubric. Claim one honestly when it fits; a downgrade costs nothing but the
+disagreement, which is a signal the user wants.
 
-### `--expedite`: work on it now
-
-`--expedite` files the issue exactly as above and dispatches a work order on it
-immediately, at any priority — `jarvis issues start` in the same step. It is a
-SCHEDULING decision and changes nothing about the rating, which is the point: never
-inflate a priority to get a bug worked on, expedite it instead. On `critical`/`blocker`
-Neo still re-assesses the claim alongside, and your claim still buys no release: the
-work order is dispatched carrying no rating at all, and only Neo confirming writes one
-on and lets a release ship when the fix lands. What the verdict no longer decides is
-whether the work happens.
-
-**The user's call, not yours.** Expedite when they asked for this bug now, or when the
-bug is blocking the work order you are in and you are the one who will be waiting.
-Otherwise file it and carry on — a bug every agent expedites is a queue again.
+**Filing is all you do.** Whatever the priority, the OS dispatches no work order and
+cuts no release off your report: the issue waits on the tracker until the user runs
+`jarvis issues start <issue-url>`. NEVER pass `--expedite` — expediting is the user's
+call, and from a work-order session the OS ignores it and says so.
 
 The running Jarvis OS version, your project and your work order id are attached
 automatically — do not put them in the text.
@@ -112,8 +99,7 @@ jarvis bug report "wo send silently drops messages when the worker is idle" \
 ```
 
 The command prints the issue URL, and under it one line saying what happened next: that
-the bug waits on the tracker, or that Neo is re-assessing your claim, or the id of the
-work order it dispatched. It never rounds
+the bug waits on the tracker, or that Neo is re-assessing your claim. It never rounds
 your claim up to a decision — a `critical` whose re-assessment is still queued says so.
 Mention both lines in your final answer, then get back to your work order.
 
