@@ -413,7 +413,7 @@ def test_an_assumption_with_no_reference_at_all_is_recorded_as_before(dispatched
     assert (row["spec_path"], row["spec_which"], row["spec_text"]) == (None, None, None)
 
 
-# -- one decision per record (docs/superpowers/specs/2026-10-21-questions-to-neo-are-atomic.md) --
+# -- one decision per record (docs/superpowers/specs/2026-10-21-questions-to-neo-are-atomic.md)
 
 
 def test_an_over_cap_assumption_is_refused_and_told_to_split(dispatched, project):
@@ -467,7 +467,7 @@ def test_a_project_override_of_each_cap_is_honoured_and_zero_switches_it_off(
     ops.ask_question(wo["id"], "z" * 2500)
 
 
-# -- in-text references, keyword-anchored (spec §4) -----------------------------------
+# -- in-text references, keyword-anchored (spec §4)
 
 
 def _asked(wo_id: str, question: str) -> int:

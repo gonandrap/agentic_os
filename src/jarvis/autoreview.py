@@ -26,8 +26,7 @@ QUESTION_KIND = "assumption"
 _CITED_QUESTION_RE = re.compile(
     r"\b(?:neo\s+question|question|neo|q)\s*#?\s*(\d{1,6})\b", re.IGNORECASE)
 
-#: A SIBLING assumption the text names. Keyword-anchored, because a bare `#n` must match
-#: NOTHING: bodies routinely carry `issue #832` and `PR #1090` (spec §4a).
+#: A SIBLING assumption the text names (#832)
 _CITED_SIBLING_RE = re.compile(r"\bassumptions?\b", re.IGNORECASE)
 _CITED_SIBLING_TAIL_RE = re.compile(r"\s*(?:,|and)?\s*#?\s*(\d{1,6})\b", re.IGNORECASE)
 
@@ -852,11 +851,7 @@ def cited_sibling_ns(text: str) -> list[int]:
 
 def cited_ref_problem(neo: Any, wo_id: str, text: str,
                       siblings: list[dict[str, Any]]) -> str:
-    """Why an in-text reference cannot resolve, or `''` (spec §4c).
-
-    A question asked on THIS order and not yet answered is NOT a problem: it has a
-    rendering of its own. Sibling `n` is order-scoped, so "foreign" is a question-id case.
-    """
+    """Why an in-text reference cannot resolve, or `''` (spec §4c)"""
     for qid in cited_question_ids(text):
         row = neo.get(qid)
         if row is None:

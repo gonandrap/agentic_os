@@ -95,7 +95,7 @@ def test_every_kinds_assume_line_cites_a_spec_by_section(kind, catalog_file) -> 
     assert any("never by pasting" in ln for ln in lines), lines
 
 
-#: Spec §5: the in-text reference form, keyword-anchored. There is no `--ref` flag.
+#: Spec §5: the in-text reference form, keyword-anchored
 REF_FORM = ("Q1234", "assumption #2")
 
 

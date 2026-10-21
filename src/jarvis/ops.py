@@ -7564,15 +7564,7 @@ REF_FORM_HINT = "per Q1234 / per assumption #2"
 
 
 def _cited_blocks(project: str, path: Path, wo: dict[str, Any], text: str) -> str:
-    """Every in-text question or sibling reference this text names, RESOLVED.
-
-    One scanner and one resolver for both verbs, and they live in `autoreview` beside
-    `_CITED_QUESTION_RE` (spec §4). An unknown or foreign reference is a REFUSAL: nothing
-    is recorded, the same bargain `_section_blocks` already strikes for a spec section.
-    A reference to a question asked on THIS order and not yet answered is NOT a refusal —
-    it has a rendering of its own, and refusing it would stop a worker citing the
-    question it just asked.
-    """
+    """Every in-text question or sibling reference this text names, RESOLVED"""
     from . import autoreview
     from .neo_store import NeoStore
 

@@ -123,8 +123,7 @@ def test_every_core_command_string_parses():
     assert len(cmds) >= 5, "the core stopped teaching its commands inline"
     for cmd in cmds:
         tokens = [re.sub(r"<[^>]*>", "x", t) or "x" for t in shlex.split(cmd)][1:]
-        # Prose names a verb without its arguments ("a second `jarvis wo assume`");
-        # what this test guards is typo'd flags, not a bare mention
+        # Prose names a verb without its arguments ("a second `jarvis wo assume`")
         if all(t.isalpha() for t in tokens):
             continue
         try:
