@@ -48,6 +48,8 @@ from .agent_usage import (
 from .sections import QUESTION_MAX_CHARS, QUESTION_WARN_CHARS
 from .central_store import MISSED_MIN_WORDS, SETTLED_BACKLOG_STATUSES, CentralStore
 from .daemon import (
+    OBJECTION_HANDED_BACK_REASON,
+    OBJECTION_WITHDRAWN_REASON,
     answers_question,
     daemon_running,
     delivers_message,
@@ -4224,10 +4226,20 @@ def review_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | No
     """
     from .invariants import validation_escalated
 
-    pending = len(store.pending_assumptions(wo["id"]))
+    pending_rows = store.pending_assumptions(wo["id"])
+    pending = len(pending_rows)
     escalated = (wo["status"] == "needs_review" and validation_escalated(store, wo))
     if not pending and not escalated:
         return None
+    # THE ENRICHED ROWS, and only when a pending row actually carries an objection —
+    # which is nearly never, so every other call costs the extra read nothing. The
+    # withdrawal REASON is not a column (§3): `assumptions_with_rulings` is the one place
+    # it is derived, so this reads it there rather than walking the events a second time.
+    objected = objected_rows(
+        [a for a in assumptions_with_rulings(store, wo["id"])
+         if str(a.get("status") or "") == "pending"]
+        if any(str(a.get("provisional_verdict") or "") == "object"
+               and a.get("objection_envelope_id") for a in pending_rows) else [])
     # The same row the boolean came from, per spec §A of
     # docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md.
     latest = store.last_judged_round(wo_id=wo["id"]) if escalated else None
@@ -4267,7 +4279,81 @@ def review_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | No
         "reject": reject + ".",
         "strands": "Rejecting with no reason leaves the work order flagged and the "
                    "worker unguided.",
+        # THE OBJECTED ROWS THE USER IS ABOUT TO RULE ON, present only when there are
+        # any (this dict's never-always rule) — §4 of docs/superpowers/specs/2026-10-20-
+        # an-objection-is-withdrawn-before-the-order-stops.md. The link the boundary was
+        # missing: the OS objected to this assumption, and the result below is the thing
+        # the early reading never saw (`objected_note` says what became of the
+        # objection). The reason is NOT repeated in the sentence — `provisional_line`
+        # prints it two lines above on both surfaces — but it rides in the structure, so
+        # a consumer reading only `review` is complete.
+        **({"objected": objected,
+            "objected_note": objected_note(objected)} if objected else {}),
     }
+
+
+#: What happened to the objection on an objected row, off the three `objection_*_ts`
+#: columns and nothing else — EVERY value `objected_rows` can emit. `handed_back` is
+#: `needs_review`'s disarm (§2); `delivered` is the one case where the worker WAS told.
+OBJECTION_DELIVERY_STATES = ("delivered", "handed_back", "withdrawn", "in_flight")
+
+#: The delivery states that mean the worker never read the objection. `delivered` is
+#: deliberately absent: there the worker was told and left the assumption as it is, which
+#: is a different fact and must not be rendered as silence (§7 of the 2026-09-23 spec).
+OBJECTION_UNTOLD_STATES = ("handed_back", "withdrawn", "in_flight")
+
+
+def objected_rows(pending: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The pending assumptions the OS OBJECTED to, structured for `review_state`.
+
+    §4. One derivation for both surfaces, like every other sentence in that dict.
+    """
+    out = []
+    for a in pending:
+        if str(a.get("provisional_verdict") or "") != "object":
+            continue
+        if not a.get("objection_envelope_id"):
+            continue
+        if a.get("objection_delivered_ts"):
+            delivery = "delivered"
+        elif a.get("objection_withdrawn_ts"):
+            # WHICH withdrawal, which is the fact the user cannot otherwise get: taken
+            # back because the order stopped, or handed to them because it delivered.
+            delivery = ("handed_back"
+                        if str(a.get("objection_withdrawn_reason") or "")
+                        == OBJECTION_HANDED_BACK_REASON else "withdrawn")
+        else:
+            delivery = "in_flight"
+        out.append({"n": a.get("n"), "reason": str(a.get("provisional_reason") or ""),
+                    "delivery": delivery})
+    return out
+
+
+def objected_note(objected: list[dict[str, Any]]) -> str:
+    """One sentence, in Python because a phrase in Jinja cannot reach a terminal (§4).
+
+    IT SAYS WHETHER THE WORKER WAS TOLD, which is the fact that changes what the user is
+    reading: an objection that was DELIVERED and left the assumption standing is the
+    worker disagreeing with it (§7 of the 2026-09-23 spec), and calling that "never told"
+    would be false. A mixed list says both and names which rows are which. The objection's
+    REASON is never repeated here — `provisional_line` prints it on both surfaces.
+    """
+    def which(rows: list[dict[str, Any]]) -> str:
+        return ", ".join(f"#{o['n']}" for o in rows)
+
+    untold = [o for o in objected if o["delivery"] in OBJECTION_UNTOLD_STATES]
+    told = [o for o in objected if o["delivery"] == "delivered"]
+    noun = "assumption" if len(objected) == 1 else "assumptions"
+    tail = "decide it against the result this order delivered"
+    if untold and told:
+        return (f"the OS objected to {noun} {which(untold)}, which the worker was never "
+                f"told, and to {which(told)}, which it was told and left as it is — "
+                f"{tail}")
+    if told:
+        return (f"the OS objected to {noun} {which(told)} and the worker was told and "
+                f"left it as it is — {tail}")
+    return (f"the OS objected to {noun} {which(untold)} and the worker was never told "
+            f"— {tail}")
 
 
 def escalation_next(wo: dict[str, Any], family: str) -> list[str]:
@@ -4329,6 +4415,11 @@ def review_lines(state: dict[str, Any]) -> list[str]:
     where = (f"round {state['round']} {state['verb']}" if state["escalated"]
              else f"{state['pending']} {owed}")
     lines = [f"owed: {where} — {state['scope']}."]
+    # THE LINK AT THE BOUNDARY (§4 of 2026-10-20-an-objection-is-withdrawn-before-the-
+    # order-stops.md), and it does not repeat the objection's reason: `assumption_line`
+    # prints that above through `provisional_line`.
+    if state.get("objected_note"):
+        lines.append(f"objected: {state['objected_note']}.")
     if state.get("why"):
         lines.append(f"why: {state['why']}")
     lines += [f"next: {command}" for command in state.get("next") or []]
@@ -4612,6 +4703,13 @@ def assumptions_with_rulings(store: ProjectStore, wo_id: str) -> list[dict[str, 
     from . import db
 
     newest: dict[int, dict[str, Any]] = {}
+    # WHY AN OBJECTION WAS TAKEN BACK, captured while the events are already in hand and
+    # INDEPENDENTLY of the `os_ruling` ranking: a later `autoreview_asked` or
+    # `autoreview_escalated` outranks the withdrawal, so `os_ruling` would then not be it.
+    # §3 of docs/superpowers/specs/2026-10-20-an-objection-is-withdrawn-before-the-order-
+    # stops.md — the event is the carrier because the envelope note is written only from
+    # `queued`, which is not the state the rows this exists for are in. Zero extra queries.
+    withdrawn_reason: dict[int, str] = {}
     stale = _stale_panel_hold(store, wo_id)
     for kind in AUTOREVIEW_EVENTS:
         for event in store.events_of_kind(wo_id, kind):
@@ -4619,6 +4717,9 @@ def assumptions_with_rulings(store: ProjectStore, wo_id: str) -> list[dict[str, 
             aid = int(payload.get("assumption_id") or 0)
             if not aid:
                 continue
+            if kind == "autoreview_objection_withdrawn":
+                # The LAST one per assumption, `events_of_kind` being chronological.
+                withdrawn_reason[aid] = str(payload.get("reason") or "")
             # A hold about a round a later one overtook is not a ruling about now: it is
             # `continue`d, so the row falls back to the next-best event and to `os_ruling
             # = None` when this was the only one — which `assumption_ruling_line` renders
@@ -4655,7 +4756,11 @@ def assumptions_with_rulings(store: ProjectStore, wo_id: str) -> list[dict[str, 
              "objection_undeliverable": (bool(a.get("objection_envelope_id"))
                                          and invariants.objection_undeliverable(store, a)),
              "objection_response": (objection_response(store, a, rows=base)
-                                    if a.get("objection_delivered_ts") else None)}
+                                    if a.get("objection_delivered_ts") else None),
+             # Asked only of rows that WERE withdrawn, `objection_response`'s discipline.
+             "objection_withdrawn_reason": (
+                 withdrawn_reason.get(int(a.get("id") or 0), "")
+                 if a.get("objection_withdrawn_ts") else "")}
             for a in base]
     # Children of this plan that have already landed, for the rows that are still the
     # user's. Only when something is pending and this order is a planner, so every other
@@ -4863,10 +4968,12 @@ def provisional_line(a: dict[str, Any]) -> str:
 def objection_line(a: dict[str, Any]) -> str:
     """THE OBJECTION SENT TO THE WORKER: how it travelled, and how it ended. Or `''`.
 
-    FOUR END STATES AND THEY ARE FOUR DIFFERENT THINGS TO A USER — in flight, delivered,
-    withdrawn because the order stopped first, and undeliverable — so rendering any two
-    of them the same is the defect this line exists to avoid (§8). Every objection the OS
-    ever sent is visible here, delivered or not: that is the user's stated requirement.
+    FIVE END STATES AND THEY ARE FIVE DIFFERENT THINGS TO A USER — in flight, delivered,
+    withdrawn because the order stopped first, HANDED BACK because the order delivered
+    and the decision is the user's, and undeliverable — so rendering any two of them the
+    same is the defect this line exists to avoid (§8, and §3 of the 2026-10-20 spec,
+    which is where the fifth comes from). Every objection the OS ever sent is visible
+    here, delivered or not: that is the user's stated requirement.
 
     `objection_undeliverable` is the one fact NOT on the assumption row: §9 defines it
     over the carrier (the message `failed`, or the envelope terminal and not delivered),
@@ -4881,8 +4988,13 @@ def objection_line(a: dict[str, Any]) -> str:
     if a.get("objection_delivered_ts"):
         return f"{head}, delivered at {_stamp(a['objection_delivered_ts'])}"
     if a.get("objection_withdrawn_ts"):
-        return (f"{head}, withdrawn at {_stamp(a['objection_withdrawn_ts'])} — the "
-                f"order stopped before it could be delivered")
+        # OFF THE ROW, never hard-coded: there are two reasons since issue 1112 and a
+        # renderer that knows only one lies about the other (§3). The fallback is a fact
+        # and not a guess — every row written before that shipped was withdrawn because
+        # the order stopped.
+        why = (str(a.get("objection_withdrawn_reason") or "")
+               or OBJECTION_WITHDRAWN_REASON)
+        return f"{head}, withdrawn at {_stamp(a['objection_withdrawn_ts'])} — {why}"
     if a.get("objection_undeliverable"):
         return f"{head}, UNDELIVERABLE — the worker was never told"
     return f"{head}, in flight"
@@ -16953,6 +17065,12 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
                    for row in order_rows}
     work_orders = feature_orders = 0
     wo_questions = fo_questions = 0
+    # WHAT THE OBJECTIONS DID, beside the escalation rate — §5 of
+    # docs/superpowers/specs/2026-10-20-an-objection-is-withdrawn-before-the-order-stops.md
+    # (Neo question 2009). Read inside the loop that already opens a store, and summed
+    # across projects like every other figure here. A census: zeros print.
+    objections: dict[str, Any] = {"sent": 0, "delivered": 0, "withdrawn": 0,
+                                  "by_reason": {}}
     for name, path in sorted(scope.items()):
         store = ProjectStore(path)
         try:
@@ -16962,8 +17080,14 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
             features = [fo for fo in store.list_feature_orders(kind="feature",
                                                                limit=10_000)
                         if since is None or (fo["created_at"] or 0) >= since]
+            counted = store.objection_counts(since=since)
         finally:
             store.close()
+        for key in ("sent", "delivered", "withdrawn"):
+            objections[key] += int(counted[key])
+        for reason, n in counted["by_reason"].items():
+            objections["by_reason"][reason] = (
+                objections["by_reason"].get(reason, 0) + int(n))
         # Hidden orders INCLUDED, `cost_report`'s reason: hiding is a gesture about
         # attention, and the order still asked its questions.
         work_orders += len(orders)
@@ -16977,6 +17101,13 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
             wo_questions += asked
             if wo.get("parent_id") in feature_ids or wo["id"] in family:
                 fo_questions += asked
+    # The same three figures under names a renderer can read: `by_reason` is keyed by the
+    # reason TEXT, which neither a Jinja template nor a terminal line should have to spell.
+    objections["stopped"] = int(
+        objections["by_reason"].get(OBJECTION_WITHDRAWN_REASON, 0))
+    objections["handed_back"] = int(
+        objections["by_reason"].get(OBJECTION_HANDED_BACK_REASON, 0))
+    objections["other"] = int(objections["by_reason"].get("other", 0))
     per_order = {
         "work_orders": work_orders,
         "questions_per_wo": (round(wo_questions / work_orders, 2)
@@ -16989,6 +17120,7 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
     return {
         "scope": project or "fleet", "days": days, "since": since,
         "questions": questions,
+        "objections": objections,
         "by_kind": by_kind, "by_kind_note": NEO_ASSUMPTION_KIND_NOTE,
         "by_project": by_project,
         "by_day": question_days,

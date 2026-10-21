@@ -185,14 +185,21 @@ def test_a_row_that_predates_the_columns_is_left_alone(started):
 # -- §6.6 withdrawal -------------------------------------------------------------------
 
 
-def test_an_order_that_stops_with_an_objection_queued_ends_withdrawn(started):
-    """Half one of the pair that matters: no turn is ever sent to the worker."""
+@pytest.mark.parametrize("status", ["cancelled", "completed"])
+def test_an_order_that_stops_with_an_objection_queued_ends_withdrawn(started, status):
+    """Half one of the pair that matters: no turn is ever sent to the worker.
+
+    TERMINAL ONLY since issue 1112. The `needs_review` half of this test moved to
+    `test_an_order_that_leaves_running_for_needs_review_keeps_its_objection`: that status
+    is one the order comes back from, so it is a hand-back under its own reason and not a
+    stop (spec 2026-10-20-an-objection-is-withdrawn-before-the-order-stops.md §1).
+    """
     project = spec(started)
     store = ProjectStore(project.path)
     wo, a = running_order(store)
     started.auto_review(project, store)
     started.deliver_envelopes(project, store)
-    store.set_status(wo["id"], "needs_review")
+    store.set_status(wo["id"], status)
 
     started.withdraw_stale_objections(project, store)
 
@@ -225,14 +232,20 @@ def test_an_undelivered_envelope_is_withdrawn_too(started):
     assert store.get_assumption(a["id"])["objection_withdrawn_ts"] is not None
 
 
-def test_an_order_still_running_keeps_its_objection_however_long_it_waited(started):
-    """Half two of the pair. Age is not the trigger; leaving `running` is."""
+@pytest.mark.parametrize("status", ["running", "validating", "waiting_pr_merge",
+                                    "budget_exhausted", "waiting_input"])
+def test_an_order_still_running_keeps_its_objection_however_long_it_waited(started,
+                                                                          status):
+    """Half two of the pair. Age is not the trigger, and neither is leaving `running`:
+    since issue 1112 every open status an order COMES BACK FROM holds its objection too,
+    with nothing written (spec 2026-10-20 §1)."""
     project = spec(started)
     store = ProjectStore(project.path)
     wo, a = running_order(store)
     started.auto_review(project, store)
     store.conn.execute("UPDATE assumptions SET objection_sent_ts=0.0 WHERE id=?",
                        (a["id"],))
+    store.set_status(wo["id"], status)
 
     started.withdraw_stale_objections(project, store)
 
@@ -343,21 +356,54 @@ def test_withdrawal_never_rewrites_a_message_the_worker_already_read(started):
     assert store.get_message(int(env["delivered_msg_id"]))["status"] == "delivered"
 
 
-def test_delivery_refuses_an_objection_to_an_order_that_stopped(started):
-    """Belt as well as braces: the delivery side must lose the race (§6.6)."""
+@pytest.mark.parametrize("status,reason", [
+    ("cancelled", "the order stopped before it could be delivered"),
+    ("completed", "the order stopped before it could be delivered"),
+    ("needs_review", "the order delivered its result and the decision is yours"),
+])
+def test_delivery_refuses_an_objection_to_an_order_that_stopped(started, status, reason):
+    """Belt as well as braces: the delivery side must lose the race (§6.6).
+
+    Two reasons now, on the two status sets that END the wait (spec 2026-10-20 §1).
+    """
     project = spec(started)
     store = ProjectStore(project.path)
     wo, a = running_order(store)
     started.auto_review(project, store)
     started.deliver_envelopes(project, store)
-    store.set_status(wo["id"], "needs_review")
+    store.set_status(wo["id"], status)
 
     started.deliver_messages(project, store)
 
     assert store.queued_messages(wo["id"]) == []
     assert store.get_assumption(a["id"])["objection_withdrawn_ts"] is not None
-    assert events(store, wo["id"], "autoreview_objection_withdrawn")
-    assert store.get_work_order(wo["id"])["status"] == "needs_review"
+    [ev] = events(store, wo["id"], "autoreview_objection_withdrawn")
+    assert ev["reason"] == reason
+    assert store.get_work_order(wo["id"])["status"] == status
+
+
+@pytest.mark.parametrize("status", ["validating", "waiting_pr_merge",
+                                    "budget_exhausted", "waiting_input"])
+def test_delivery_holds_an_objection_to_an_order_that_will_run_again(started, status):
+    """THE THIRD OUTCOME (spec 2026-10-20 §1): nothing is written and nothing is sent.
+
+    GitHub issue 1112 was this branch withdrawing on every non-running status, including
+    the four an order comes back from.
+    """
+    project = spec(started)
+    store = ProjectStore(project.path)
+    wo, a = running_order(store)
+    store.set_status(wo["id"], "running", session_id="s-held")
+    started.auto_review(project, store)
+    started.deliver_envelopes(project, store)
+    store.set_status(wo["id"], status)
+
+    started.deliver_messages(project, store)
+
+    assert len(store.queued_messages(wo["id"])) == 1        # still queued
+    assert store.get_assumption(a["id"])["objection_withdrawn_ts"] is None
+    assert events(store, wo["id"], "autoreview_objection_withdrawn") == []
+    assert store.list_turns(wo["id"]) == []                 # and no turn went out
 
 
 # -- the joint: §6.6's withdrawal and §7's gate ----------------------------------------
@@ -386,6 +432,279 @@ def tick(daemon, project, store, *, poll=True, reconcile=True, drain=True):
         daemon.withdraw_stale_objections(project, store)
     if drain:
         daemon._neo_drain()
+
+
+def objection_in_flight(daemon, project, store, *, session="s-objection",
+                        title="an order with an objection"):
+    """A RUNNING order, mid-turn, whose objection is queued as a message.
+
+    The real path end to end, per kn-13e71e04: the early pass records the verdict, §6.1
+    files the envelope, the bus routes it to a `wo_messages` row, and the turn in flight
+    (HOLD_TURN_IN_FLIGHT) is what keeps that row `queued` — never a missing session.
+
+    Returns `(wo_id, turn, envelope)`. Spec
+    docs/superpowers/specs/2026-10-20-an-objection-is-withdrawn-before-the-order-stops.md.
+    """
+    wo = ops.create_work_order("proj_a", title, description="d")
+    wo_id = wo["id"]
+    store.set_status(wo_id, "running", session_id=session)
+    turn = store.create_turn(wo_id, "dispatch", "the dispatch prompt")
+    ops.assume(wo_id, OBJECTED_TEXT)
+    tick(daemon, project, store)                                  # the early reading
+    tick(daemon, project, store)                                  # §6.1 files it
+    tick(daemon, project, store, reconcile=False, drain=False)    # the bus routes it
+    a = next(a for a in store.all_assumptions(wo_id) if a["objection_envelope_id"])
+    env = store.get_envelope(int(a["objection_envelope_id"]))
+    assert store.get_message(int(env["delivered_msg_id"]))["status"] == "queued"
+    return wo_id, turn, env
+
+
+def objection_row(store, wo_id: str) -> dict:
+    return next(a for a in store.all_assumptions(wo_id) if a["objection_envelope_id"])
+
+
+def test_an_order_that_leaves_running_for_needs_review_keeps_its_objection(started):
+    """CHANGE 1 AND CHANGE 2, the pair that matters: `needs_review` is not a stop.
+
+    The order leaves `running` BETWEEN the delivery half of a tick and the reconcile
+    half (kn-cc29cd1b — `ops.finish` is the worker's own process writing, so the flip
+    really does land mid-tick). Nothing is withdrawn under the old reason, nothing is
+    delivered, no turn is launched; the DISARM pass is what writes the new reason.
+    """
+    project = spec(started)
+    store = ProjectStore(project.path)
+    wo_id, turn, env = objection_in_flight(started, project, store)
+
+    assert ops.finish(wo_id, "two readings recorded")["status"] == "needs_review"
+    store.finish_turn(turn["id"], "done")
+
+    # ...and before the reconcile half: the objection is still the OS's to resolve.
+    row = objection_row(store, wo_id)
+    assert row["objection_withdrawn_ts"] is None
+    assert [a["id"] for a in store.outstanding_objections(wo_id)] == [row["id"]]
+    assert row["objection_delivered_ts"] is None
+    assert events(store, wo_id, "autoreview_objection_withdrawn") == []
+
+    tick(started, project, store, poll=False, drain=False)        # the disarm
+
+    row = objection_row(store, wo_id)
+    assert row["objection_withdrawn_ts"] is not None
+    assert row["objection_delivered_ts"] is None
+    [ev] = events(store, wo_id, "autoreview_objection_withdrawn")
+    assert ev["reason"] == "the order delivered its result and the decision is yours"
+    assert store.get_message(int(env["delivered_msg_id"]))["status"] == "withdrawn"
+    assert store.queued_messages(wo_id) == []
+    assert store.get_work_order(wo_id)["status"] == "needs_review"
+    assert [t["seq"] for t in store.list_turns(wo_id)] == [1]     # no turn, ever
+
+
+def test_an_order_that_goes_terminal_with_an_objection_queued_still_gets_the_old_reason(
+        started):
+    """The negative control for the reason: a CANCELLED order really did stop first."""
+    project = spec(started)
+    store = ProjectStore(project.path)
+    wo_id, turn, env = objection_in_flight(started, project, store)
+    store.finish_turn(turn["id"], "done")
+
+    ops.cancel(wo_id)
+    tick(started, project, store, drain=False)
+
+    row = objection_row(store, wo_id)
+    assert row["objection_withdrawn_ts"] is not None
+    [ev] = events(store, wo_id, "autoreview_objection_withdrawn")
+    assert ev["reason"] == "the order stopped before it could be delivered"
+    assert store.get_message(int(env["delivered_msg_id"]))["status"] == "withdrawn"
+
+
+def test_an_objection_rides_the_next_turn_after_a_rejected_round(started):
+    """THE REGRESSION TEST FOR `wo-a1d7b87c`: `validating` is a state it comes back from.
+
+    The round is opened by hand (`tests/test_autoreview.park`'s convention — the panel
+    does not run in a unit test); `Daemon._reject` is the real pass that sends the
+    submitter back, and the objection rides the turn AFTER it.
+    """
+    project = spec(started)
+    store = ProjectStore(project.path)
+    wo_id, turn, env = objection_in_flight(started, project, store)
+    store.finish_turn(turn["id"], "done")
+    wo = store.get_work_order(wo_id)
+    round_row = store.open_validation_round(wo_id=wo_id, fingerprint="fp1")
+    store.set_status(wo_id, "validating")
+
+    # a round in flight: the objection is HELD, not withdrawn
+    tick(started, project, store, drain=False)
+    row = objection_row(store, wo_id)
+    assert row["objection_withdrawn_ts"] is None
+    assert store.get_message(int(env["delivered_msg_id"]))["status"] == "queued"
+
+    started._reject(store, wo, int(round_row["id"]), 1, 3,
+                    "the exporter still double-counts")
+    tick(started, project, store, drain=False)       # the feedback turn goes out
+    assert store.get_work_order(wo_id)["status"] == "running"
+    for t in store.list_turns(wo_id):
+        if t["state"] == "running":
+            store.finish_turn(t["id"], "done")
+
+    tick(started, project, store, drain=False)       # ...and the objection rides next
+
+    row = objection_row(store, wo_id)
+    assert row["objection_delivered_ts"] is not None
+    assert row["objection_withdrawn_ts"] is None
+    assert store.get_message(int(env["delivered_msg_id"]))["status"] == "delivered"
+
+
+def test_a_held_objection_is_never_a_stuck_message(started):
+    """§1.1: an accounted hold, or INV-MESSAGE-STUCK reports a defect that is not one.
+
+    `waiting_input` is where this is observable — a status in
+    `invariants.MESSAGE_STUCK_STATUSES` that an order comes back from — and
+    `needs_review` is the other half: the disarm has taken the carrier, so there is no
+    queued message to call stuck either.
+    """
+    from jarvis import invariants
+
+    project = spec(started)
+    store = ProjectStore(project.path)
+    wo_id, turn, env = objection_in_flight(started, project, store)
+    store.finish_turn(turn["id"], "done")
+    # Not a finish, so kn-13e71e04 does not apply: the worker going quiet mid-task is
+    # exactly what this status is.
+    store.set_status(wo_id, "waiting_input")
+    store.conn.execute("UPDATE wo_messages SET ts=ts-? WHERE wo_id=?", (90 * 60, wo_id))
+    store.conn.commit()
+
+    tick(started, project, store, drain=False)
+
+    wo = store.get_work_order(wo_id)
+    assert objection_row(store, wo_id)["objection_withdrawn_ts"] is None
+    assert store.get_message(int(env["delivered_msg_id"]))["status"] == "queued"
+    assert invariants.stuck_message(store, wo) is None
+    assert invariants.MESSAGE_STUCK_BLOCKER not in invariants.true_blockers(store, wo)
+    assert [v.invariant for v in invariants.check_project(store)
+            if v.invariant == "INV-MESSAGE-STUCK"] == []
+
+
+def test_a_user_message_is_still_delivered_past_a_held_objection(started):
+    """One rule: the objection reaches a running conversation or it reaches nobody.
+
+    The user's own message revives the order (that is `jarvis wo send`'s documented
+    behaviour) and the held objection is skipped PER MESSAGE rather than coalesced into
+    the turn it was never allowed to start.
+    """
+    project = spec(started)
+    store = ProjectStore(project.path)
+    wo_id, turn, env = objection_in_flight(started, project, store)
+    store.finish_turn(turn["id"], "done")
+    store.set_status(wo_id, "waiting_input")
+
+    ops.send_message(wo_id, "please also check the retry path")
+    assert daemon_delivers(started, store, wo_id) is True
+
+    tick(started, project, store, drain=False)
+
+    sent = [t for t in store.list_turns(wo_id) if t["seq"] > 1]
+    assert len(sent) == 1
+    assert REASON not in str(sent[0]["prompt"] or "")
+    assert "please also check the retry path" in str(sent[0]["prompt"] or "")
+    assert store.get_message(int(env["delivered_msg_id"]))["status"] == "queued"
+    assert objection_row(store, wo_id)["objection_delivered_ts"] is None
+
+
+def daemon_delivers(daemon, store, wo_id: str) -> bool:
+    from jarvis import daemon as daemon_mod
+
+    return daemon_mod.delivers_message(store, store.get_work_order(wo_id))
+
+
+def test_a_budget_exhausted_order_keeps_its_objection(started):
+    """`budget_exhausted` is OPEN, not terminal: the user raises it and the work goes on.
+
+    So the objection goes out with it, which is the whole argument for the hold.
+    """
+    project = spec(started)
+    store = ProjectStore(project.path)
+    wo_id, turn, env = objection_in_flight(started, project, store)
+    store.finish_turn(turn["id"], "done")
+    store.set_status(wo_id, "budget_exhausted")
+
+    tick(started, project, store, drain=False)
+    assert objection_row(store, wo_id)["objection_withdrawn_ts"] is None
+    assert store.get_message(int(env["delivered_msg_id"]))["status"] == "queued"
+
+    ops.set_work_order_budget(wo_id, 50.0)
+    for t in store.list_turns(wo_id):
+        if t["state"] == "running":
+            store.finish_turn(t["id"], "done")
+    tick(started, project, store, drain=False)
+
+    assert objection_row(store, wo_id)["objection_delivered_ts"] is not None
+    assert store.get_message(int(env["delivered_msg_id"]))["status"] == "delivered"
+
+
+def test_the_disarm_is_what_clears_the_confirm_gate_for_the_siblings(started):
+    """§2's second argument: `objections_outstanding` is per ORDER, so one objected row
+    holds the confirmation of every accepted sibling until the disarm releases it."""
+    project = spec(started)
+    store = ProjectStore(project.path)
+    wo = ops.create_work_order("proj_a", "an order with two readings", description="d")
+    wo_id = wo["id"]
+    store.set_status(wo_id, "running", session_id="s-siblings")
+    turn = store.create_turn(wo_id, "dispatch", "the dispatch prompt")
+    ops.assume(wo_id, OBJECTED_TEXT)
+    ops.assume(wo_id, ACCEPTED_TEXT)
+    tick(started, project, store)
+    tick(started, project, store)
+    tick(started, project, store, reconcile=False, drain=False)
+
+    assert ops.finish(wo_id, "two readings recorded")["status"] == "needs_review"
+    store.finish_turn(turn["id"], "done")
+
+    def accepted():
+        return next(a for a in store.all_assumptions(wo_id)
+                    if "FORCE_ACCEPT" in a["content"])
+
+    # the disarm tick: the gate still held while the objection was outstanding
+    tick(started, project, store, poll=False, drain=False)
+    assert autoreview.HELD_OBJECTION_IN_FLIGHT in [
+        h["code"] for h in events(store, wo_id, "autoreview_held")]
+    assert accepted()["confirm_question_id"] is None
+    assert objection_row(store, wo_id)["objection_withdrawn_ts"] is not None
+
+    tick(started, project, store, poll=False, drain=False)
+    assert accepted()["confirm_question_id"] is not None
+
+
+def test_objection_counts_split_withdrawals_by_reason(started):
+    """CHANGE 5: a derived read over the three ts columns, no table and no write path."""
+    project = spec(started)
+    store = ProjectStore(project.path)
+
+    handed, turn_a, _ = objection_in_flight(started, project, store, session="s-a",
+                                            title="an order that delivered")
+    assert ops.finish(handed, "delivered")["status"] == "needs_review"
+    store.finish_turn(turn_a["id"], "done")
+    tick(started, project, store, poll=False, drain=False)
+
+    stopped, turn_b, _ = objection_in_flight(started, project, store, session="s-b",
+                                             title="an order that stopped")
+    store.finish_turn(turn_b["id"], "done")
+    ops.cancel(stopped)
+    tick(started, project, store, drain=False)
+
+    counts = store.objection_counts()
+    assert counts["sent"] == 2
+    assert counts["delivered"] == 0
+    assert counts["withdrawn"] == 2
+    assert counts["by_reason"] == {
+        "the order stopped before it could be delivered": 1,
+        "the order delivered its result and the decision is yours": 1,
+        "other": 0}
+
+    report = ops.neo_stats_report(project="proj_a")
+    assert report["objections"]["by_reason"] == counts["by_reason"]
+    assert (report["objections"]["stopped"], report["objections"]["handed_back"],
+            report["objections"]["other"]) == (1, 1, 0)
+    assert report["objections"]["sent"] == 2
 
 
 def test_the_withdrawal_is_what_lets_the_confirmation_pass_run(started):
@@ -473,7 +792,11 @@ def test_the_withdrawal_is_what_lets_the_confirmation_pass_run(started):
     assert objected["objection_delivered_ts"] is None
     [withdrawn] = events(store, wo_id, "autoreview_objection_withdrawn")
     assert withdrawn["n"] == objected["n"]
-    assert withdrawn["reason"] == "the order stopped before it could be delivered"
+    # THE DISARM, not the old withdrawal: this order reached `needs_review`, so it
+    # delivered and the decision is the user's (spec 2026-10-20 §2). Same pass, same tick
+    # position, same tick count — only the reason differs.
+    assert withdrawn["reason"] == ("the order delivered its result and the decision "
+                                   "is yours")
     assert store.get_message(int(env["delivered_msg_id"]))["status"] == "withdrawn"
     assert store.queued_messages(wo_id) == []
     assert [t["seq"] for t in store.list_turns(wo_id)] == [1]   # no second turn, ever

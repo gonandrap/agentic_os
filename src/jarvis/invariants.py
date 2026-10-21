@@ -1537,10 +1537,13 @@ def stuck_message(store: ProjectStore, wo: dict[str, Any],
 
     * a status outside MESSAGE_STUCK_STATUSES, whose own note says who owns each one;
     * anything younger than `messaging.stuck_minutes`;
-    * and the two `worker_session.delivery_hold` marks `accounted` — a turn in flight,
-      and a retry the OS has booked and not yet missed.
+    * and the three `worker_session.message_hold` marks `accounted` — a turn in flight, a
+      retry the OS has booked and not yet missed, and an OBJECTION queued for an order
+      that is not running and will run again (§1.1 of docs/superpowers/specs/2026-10-20-
+      an-objection-is-withdrawn-before-the-order-stops.md: it goes out at the next turn
+      boundary, so calling it stuck is a false defect report about the daemon).
 
-    THE HOLD IS NOT RE-DERIVED HERE. `delivery_hold` is the same call
+    THE HOLD IS NOT RE-DERIVED HERE. `message_hold` is the same call
     `Daemon.deliver_messages` skips on, so "the delivery pass declined this" and "this is
     why" cannot drift; asking the same questions again independently is how they would.
     What is left over — no hold at all, or one nothing owns — is the shape GitHub issue
@@ -1559,7 +1562,7 @@ def stuck_message(store: ProjectStore, wo: dict[str, Any],
     minutes = int(messaging_config_at(store.project_path).stuck_minutes)
     if now - float(oldest["ts"]) < minutes * SECONDS_PER_MINUTE:
         return None
-    hold = worker_session.delivery_hold(store, wo, now=now)
+    hold = worker_session.message_hold(store, wo, oldest, now=now)
     if hold is not None and hold.accounted:
         return None
     # No hold at all is its own finding: the pass was free to send and the message is
