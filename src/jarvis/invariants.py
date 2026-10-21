@@ -1208,7 +1208,12 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
         latest = store.latest_validation_round(wo_id=wo["id"])
         round_no = latest["round"] if latest else 1
         # The budget is the shipped default rather than this project's configured `os.validation.max_rounds`:...
-        label = f"validating — review round {round_no} of {DEFAULT_VALIDATION_MAX_ROUNDS}"
+        # A round count nobody will judge is a false promise (docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md §8)
+        from .ops import scheduled_actor
+        label = (f"validating — review round {round_no} of "
+                 f"{DEFAULT_VALIDATION_MAX_ROUNDS}"
+                 if scheduled_actor(store, wo) is not None
+                 else "validating — no review is scheduled")
         # Why nothing is happening, when the answer is a spent window rather than a slow reviewer
         held = (validation_hold_note(store, wo["id"], int(round_no))
                 or fleet_hold_note(wo, fleet))

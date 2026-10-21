@@ -19,7 +19,7 @@ from jarvis.invariants import (
     status_label,
     true_blockers,
 )
-from jarvis.project_store import ProjectStore
+from jarvis.project_store import OPEN_STATUSES, ProjectStore
 
 IDLE_NOTIFICATION = "Claude is waiting for your input"
 
@@ -2720,6 +2720,49 @@ def test_the_hole_ends_the_tick_flagged_and_acks_for_good(jarvis_home, project,
         assert not bool(store.get_work_order(wo["id"])["needs_attention"])
     finally:
         store.close()
+
+
+# -- the label stops promising a round nobody is going to judge
+
+
+def test_the_validating_label_does_not_promise_a_round_nobody_will_judge(project):
+    """`ops.scheduled_actor` is None, so the round count is a false promise"""
+    store = ProjectStore(project)
+    wo = _no_actor_row(store, "validating")
+
+    assert ops.scheduled_actor(store, wo) is None
+    label = status_label(store, wo)
+
+    assert label == "validating — no review is scheduled"
+    assert "review round" not in label
+
+
+#: Today's label per open status — NO default and NO `.get`: a new member must KeyError here
+ACTOR_LABELS = {
+    "pending": "pending",
+    "dispatching": "dispatching",
+    "running": "running",
+    "idle": "idle — waiting for a message from its feature",
+    "waiting_input": "waiting_input",
+    "validating": "validating — review round 1 of 3",
+    "needs_review": "needs_review",
+    "waiting_pr_merge": "waiting_pr_merge",
+    "budget_exhausted": "budget spent — cleared, resuming shortly",
+}
+
+GATED_COMMAND = "gh " + "pr merge 42"  # split so the recogniser does not gate this file
+
+
+@pytest.mark.parametrize("status", OPEN_STATUSES)
+def test_a_row_with_an_actor_keeps_todays_label(jarvis_home, project, status):
+    """`REVIEWS_GATE` is under every open status, so one open request is the uniform recipe"""
+    store = ProjectStore(project)
+    wo = _no_actor_row(store, status)
+    store.add_approval(wo["id"], "pr_merge", GATED_COMMAND)
+    wo = store.get_work_order(wo["id"])
+
+    assert ops.scheduled_actor(store, wo) is not None
+    assert status_label(store, wo) == ACTOR_LABELS[status]
 
 
 # Written for the opt-in OS (os.autonomy.self_dispatch on, stuck sweep on)
