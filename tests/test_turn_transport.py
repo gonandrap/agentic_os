@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import claude_cli, ops, systemd_units, worker_session
+from jarvis import claude_cli, db, ops, systemd_units, worker_session
 from jarvis.catalog import load_catalog
 from jarvis.project_store import ProjectStore
 
@@ -261,7 +261,7 @@ def test_a_unit_that_never_reported_a_pid_is_not_reaped_as_dead(
     assert turn["pid"] is None and turn["unit"]
     # Past the "spawned this instant" grace, so only the unit can save it
     store.conn.execute("UPDATE wo_turns SET started_at=? WHERE id=?",
-                       (time.time() - 120, turn["id"]))
+                       (db.now() - 120, turn["id"]))
 
     assert worker_session.poll(store) == []
     assert store.get_turn(turn["id"])["state"] == "running"
@@ -327,6 +327,7 @@ def _ctl_calls(fake_systemd) -> list[dict]:
 
 def _wait_until(done: Callable[[], bool], message: str,
                 timeout: float = 15.0) -> None:
+    # clock-exempt: class 3 — spin-waits on a caller-supplied predicate about a real transient unit
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if done():
@@ -340,6 +341,7 @@ def _has_result(outfile: Path) -> bool:
 
 
 def _wait_for_result(outfile: Path, timeout: float = 15.0) -> None:
+    # clock-exempt: class 3 — spin-waits for a real worker subprocess to write its result file
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if _has_result(outfile):
@@ -349,6 +351,7 @@ def _wait_for_result(outfile: Path, timeout: float = 15.0) -> None:
 
 
 def _poll_until_settled(store, timeout: float = 15.0) -> list[dict]:
+    # clock-exempt: class 3 — spin-waits for worker_session.poll to reap a turn whose unit is really gone
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         settled = worker_session.poll(store)

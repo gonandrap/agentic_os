@@ -1,5 +1,6 @@
 """An order that wrote code must carry its pull request (INV-PR-RECORDED) (#42)"""
 
+# clock-exempt: class 3 — one real time.sleep(0.01) so two work_abandoned timestamps differ; not a deadline loop
 from __future__ import annotations
 
 import json

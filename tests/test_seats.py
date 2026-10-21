@@ -1,5 +1,6 @@
 """The seat primitive, extracted from Neo's panel so two panels can share it"""
 
+# clock-exempt: class 3 — a real time.sleep injected into the fake model so the seat's latency_ms is non-zero
 from __future__ import annotations
 
 import inspect

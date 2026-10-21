@@ -1,5 +1,6 @@
 """The evaluation pass: `Daemon.rules_tick`, the fact snapshot, and the five seed rules (docs/superpowers/specs/2026-09-27-self-evolution.md §5.)"""
 
+# clock-exempt: class 3 — measures real monotonic elapsed to bound one rules_tick's wall cost; not a spin-wait
 from __future__ import annotations
 
 import inspect

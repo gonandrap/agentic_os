@@ -1,5 +1,6 @@
 """A pull request whose head moved past its verdict re-judges itself (docs/superpowers/specs/2026-09-19-a-moved-head-re-judges-itself.md)"""
 
+# clock-exempt: class 3 — spin-waits on fleet.validating twice while the moved head is re-judged on a real thread
 from __future__ import annotations
 
 import json
