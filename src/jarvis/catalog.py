@@ -286,6 +286,10 @@ DEFAULT_WORKER_MCP_TOOL_TIMEOUT_MS = 300_000
 # arrives through `jarvis config set`, so it is refused where the message can name the key.
 WORKER_MCP_TOOL_TIMEOUT_MS_MIN = 1000
 
+#: Built-in tools a one-shot headless turn cannot use, removed from its tool list by deny rule (docs/os/architecture/worker-context.md).
+DEFAULT_WORKER_DENIED_TOOLS = ("Workflow", "ScheduleWakeup", "ReportFindings",
+                               "ListAgents", "Agent(statusline-setup)")
+
 
 def _parse_budget(raw: dict[str, Any], key: str, where: str,
                   default: float | None) -> float | None:
@@ -529,6 +533,7 @@ class WorkerDefaults:
     # What one MCP tool call may take, in milliseconds — see
     # DEFAULT_WORKER_MCP_TOOL_TIMEOUT_MS and issue #845.
     mcp_tool_timeout_ms: int = DEFAULT_WORKER_MCP_TOOL_TIMEOUT_MS
+    denied_tools: tuple[str, ...] = DEFAULT_WORKER_DENIED_TOOLS
 
 
 # The validation panel's default roster: every seat in the vocabulary. Unlike Neo's
@@ -1539,7 +1544,8 @@ class WiringConfig:
     """
 
     claude_ai_connectors: bool = True
-    bundled_skills: bool = True
+    # Off by default: CLI-shipped skills (dataviz, loop, …) cost ~1.6K tokens per worker start.
+    bundled_skills: bool = False
     #: `<plugin>@<marketplace>` ids, as `claude plugin list` spells them.
     disabled_plugins: tuple[str, ...] = ()
     #: Skill names — user and project skills only. A PLUGIN's skills follow their
@@ -1938,8 +1944,9 @@ class OsConfig:
     # Knowledge reaches workers as an index they query on demand, so prompt cost stays
     # flat as the base grows. Only entries tagged `pinned` are pasted in full.
     knowledge_inject_limit: int = 8      # max pinned entries injected verbatim
-    knowledge_digest_limit: int = 40     # max index lines
-    knowledge_digest_chars: int = 4000   # hard char budget for those lines
+    knowledge_digest_limit: int = 8      # max index lines
+    knowledge_digest_chars: int = 1000   # hard char budget for those lines
+    knowledge_pinned_chars: int = 360    # per pinned entry; the rest is `jarvis learn show`
     # Entries matching the work order's own TITLE, surfaced as a pointer into the overflow.
     # A budget of its own, deliberately small and never taken out of the digest's: hints
     # eating the index would make the same base produce a different index size per title,
@@ -3137,8 +3144,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         compact_min_context=_compact_min_context_or_err(os_raw),
         max_os_prompt_chars=_max_os_prompt_chars_or_err(os_raw),
         knowledge_inject_limit=int(os_raw.get("knowledge_inject_limit", 8)),
-        knowledge_digest_limit=int(os_raw.get("knowledge_digest_limit", 40)),
-        knowledge_digest_chars=int(os_raw.get("knowledge_digest_chars", 4000)),
+        knowledge_digest_limit=int(os_raw.get("knowledge_digest_limit", 8)),
+        knowledge_digest_chars=int(os_raw.get("knowledge_digest_chars", 1000)),
+        knowledge_pinned_chars=int(os_raw.get("knowledge_pinned_chars", 360)),
         knowledge_hint_limit=int(os_raw.get("knowledge_hint_limit", 3)),
         knowledge_hint_chars=int(os_raw.get("knowledge_hint_chars", 400)),
         neo=neo_cfg,
@@ -3266,6 +3274,11 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
             raise _err(f"project {name}: worker.mcp_tool_timeout_ms must be >= "
                        f"{WORKER_MCP_TOOL_TIMEOUT_MS_MIN} (milliseconds — a ceiling "
                        f"under a second would fail every MCP call), got {mcp_timeout}")
+        denied_tools = w.get("denied_tools", list(DEFAULT_WORKER_DENIED_TOOLS))
+        if (not isinstance(denied_tools, list)
+                or not all(isinstance(t, str) and t for t in denied_tools)):
+            raise _err(f"project {name}: worker.denied_tools must be a list of tool "
+                       f"names, got {denied_tools!r}")
         worker = WorkerDefaults(
             model=w.get("model") or p.get("model") or os_cfg.default_model,
             effort=w.get("effort", os_cfg.default_effort),
@@ -3297,6 +3310,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                                        DEFAULT_INVESTIGATION_EFFORT),
             require_crew=require_crew,
             mcp_tool_timeout_ms=mcp_timeout,
+            denied_tools=tuple(denied_tools),
         )
         try:
             gate_cfg = GateConfig.parse(p.get("gates"))
