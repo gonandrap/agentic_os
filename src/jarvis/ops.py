@@ -6442,8 +6442,8 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
     from .health import observer_kinds
     from .project_store import (FO_ID_PREFIXES, PLAN_ASSUMPTION_EVENT_KINDS,
                                 UNGOVERNED_ORIGINS, VALIDATION_CI_CAUSE,
-                                plan_hold_spans, validation_ci_hold_spans,
-                                validation_hold)
+                                plan_hold_spans, precondition_hold_spans,
+                                validation_ci_hold_spans, validation_hold)
     from .worker_session import PAUSE_USAGE_LIMIT
 
     thresholds = {s: cfg.threshold_seconds(s) for s in cfg.thresholds}
@@ -6504,10 +6504,17 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                     sorted((e for k in PLAN_ASSUMPTION_EVENT_KINDS
                             for e in pstore.events_of_kind(str(planner_id), k)),
                            key=lambda e: float(e["ts"])), since, now)
+        # AN ORDER HELD BY AN OPEN PRECONDITION IS NOT STUCK (§2
+        pre_held, pre_spans = False, []
+        if wo["status"] == "pending":
+            pre_held = bool(pstore.open_preconditions(wo["id"]))
+            pre_spans = precondition_hold_spans(
+                pstore.preconditions_of(wo["id"]), since, now)
         # The UNION and never the sum: a usage window can shut while CI runs (§4)
         discounted = holds.union_seconds(
             [(max(h.started, since), min(h.finish(now), now)) for h in usage]
-            + ci_spans + base_red_spans + plan_spans + automerge_spans + budget_spans)
+            + ci_spans + base_red_spans + plan_spans + automerge_spans
+            + budget_spans + pre_spans)
         # §2.2 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md
         edges = (pstore.unfinished_dependencies(wo["id"])
                  if wo["status"] == "pending" else [])
@@ -6536,6 +6543,8 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                             # DOCUMENTARY, not load-bearing (§3 of the 2026-10-20 spec): a collision is impossible by...
                             else stuck.BUDGET_CAP_CAUSE
                             if wo["status"] == budget.EXHAUSTED
+                            # Above both `pending` holds, §3.3 (Neo 1982): `status_label` keeps the same ranking
+                            else stuck.PRECONDITION_CAUSE if pre_held
                             else stuck.LIVE_DEPENDENCY if live_edges
                             # LAST in the chain, §2.4: a fleet fact outranks a fact about one feature's plan
                             else stuck.PLAN_ASSUMPTION_CAUSE if plan_held else ""),
@@ -6548,9 +6557,11 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         blocker = true_blockers(pstore, wo, now=now)
         out.append({
             "project": project_name, "wo": wo, "verdict": verdict,
-            # The outstanding-child note before the empty answer: one formatter shared with `status_label`
+            # The outstanding-child note before the empty answer: one formatter shared with `status_label` The...
             "blocker": (blocker[0] if blocker
                         else invariants.outstanding_children_note(pstore, wo)
+                        or invariants.precondition_note(
+                            pstore.open_preconditions(wo["id"]) if pre_held else [])
                         or invariants.plan_hold_note(
                             pstore.plan_hold(wo) if plan_held else None)
                         # §5 of the 2026-10-20 spec, after the plan hold, which is `pending`-only and cannot co-occur with it

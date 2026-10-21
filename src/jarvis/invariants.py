@@ -1003,6 +1003,17 @@ def plan_hold_note(hold: dict[str, Any] | None) -> str:
             f"review — `jarvis wo review {hold['planner_id']}`)")
 
 
+def precondition_note(rows: list[dict[str, Any]]) -> str:
+    """One sentence for a `ProjectStore.open_preconditions` result, `""` for no rows"""
+    if not rows:
+        return ""
+    refs = ", ".join(row["ref"] for row in rows)
+    notes = "; ".join(row["note"] for row in rows if row["note"])
+    note = (f"held until {refs} clears "
+            f"(`jarvis wo unblock {rows[0]['wo_id']}`)")
+    return f"{note} — {notes}" if notes else note
+
+
 #: §5 of docs/superpowers/specs/2026-10-20-a-merge-held-for-running-checks-is-not-stuck.md
 AUTOMERGE_CHECKS_NOTE = "waiting for GitHub's checks on {sha} — {reason}"
 
@@ -1084,14 +1095,10 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
             return f"{wo['status']} — {note}"
     if wo["status"] != "pending":
         return wo["status"]
-    # FIRST of the four pending answers: of them it is the only one that may never clear without a... (docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md)
-    held = store.open_preconditions(wo["id"])
-    if held:
-        refs = ", ".join(row["ref"] for row in held)
-        notes = "; ".join(row["note"] for row in held if row["note"])
-        label = (f"pending — held until {refs} clears "
-                 f"(`jarvis wo unblock {wo['id']}`)")
-        return f"{label} — {notes}" if notes else label
+    # FIRST of the four pending answers: of them it is the only one that may never clear without a...... (docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md)
+    note = precondition_note(store.open_preconditions(wo["id"]))
+    if note:
+        return f"pending — {note}"
     # ABOVE the dependency and slot labels
     note = plan_hold_note(store.plan_hold(wo))
     if note:

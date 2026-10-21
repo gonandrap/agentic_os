@@ -163,6 +163,18 @@ def plan_hold_spans(events: Iterable[Any], since: float,
                   if min(end, now) > max(start, since))
 
 
+def precondition_hold_spans(rows: Iterable[Any], since: float,
+                            now: float) -> list[tuple[float, float]]:
+    """Every interval inside `[since, now]` a `preconditions` row held this order"""
+    spans: list[tuple[float, float]] = []
+    for row in rows:
+        start = max(float(row["created_at"] or 0.0), since)
+        end = min(float(row["cleared_at"] or now), now)
+        if end > start:
+            spans.append((start, end))
+    return sorted(spans)
+
+
 # What one seat proposed
 VALIDATION_VERDICTS = ("pass", "reject", "")
 # ...and whether that seat's opinion is usable at all
@@ -1444,6 +1456,13 @@ class ProjectStore:
         """Every hold still standing on this order, oldest first — `idx_preconditions_open`"""
         rows = self.conn.execute(
             "SELECT * FROM preconditions WHERE wo_id=? AND status='open' "
+            "ORDER BY created_at, id", (wo_id,)).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def preconditions_of(self, wo_id: str) -> list[dict[str, Any]]:
+        """EVERY hold this order has ever carried, oldest first"""
+        rows = self.conn.execute(
+            "SELECT * FROM preconditions WHERE wo_id=? "
             "ORDER BY created_at, id", (wo_id,)).fetchall()
         return db.rows_to_dicts(rows)
 
