@@ -215,3 +215,56 @@ def test_a_stamp_survives_the_metadata_round_trip(fleet):
     wo = store.create_work_order("x", metadata={steward.STAMP_KEY: {"generation": 3}})
     assert steward.stamp_of(store.get_work_order(wo["id"])) == {"generation": 3}
     assert json.loads(store.get_work_order(wo["id"])["metadata"])
+
+
+def test_an_identical_decision_within_the_hour_is_one_row(fleet):
+    """A red `main` is re-asked every tick; the table is read by a person."""
+    make, store = fleet
+    first = steward.gate(cand(severity="minor"), catalog=make(), store=store)
+    again = steward.gate(cand(severity="minor"), catalog=make(), store=store)
+    assert first.decision_id == again.decision_id
+    central = CentralStore()
+    try:
+        assert len(central.steward_decisions()) == 1
+    finally:
+        central.close()
+
+
+# ---------------------------------------------------------------- the weekly digest
+
+
+def test_the_digest_goes_out_once_a_week_and_says_what_was_held(fleet):
+    make, store = fleet
+    cat = make()
+    steward.gate(cand(severity="minor", subject="a typo"), catalog=cat, store=store)
+    central = CentralStore()
+    try:
+        assert steward.digest_due(central)
+        assert steward.send_digest(cat, central)
+        assert not steward.digest_due(central)
+        [item] = [i for i in central.conn.execute("SELECT * FROM inbox").fetchall()
+                  if i["title"].startswith("steward")]
+    finally:
+        central.close()
+    assert "bug_agent" in item["body"] and "drop 1" in item["body"]
+
+
+def test_a_week_with_no_decisions_sends_nothing(fleet):
+    make, _store = fleet
+    central = CentralStore()
+    try:
+        assert steward.send_digest(make(), central) == 0
+    finally:
+        central.close()
+
+
+def test_the_cli_shows_each_decision_with_its_rule(fleet, capsys):
+    """`decisions` reads only the record, so it needs no catalog."""
+    from jarvis import cli
+
+    make, store = fleet
+    steward.gate(cand(severity="cosmetic", subject="rename it"), catalog=make(),
+                 store=store)
+    assert cli.main(["steward", "decisions"]) == 0
+    out = capsys.readouterr().out
+    assert "[drop/shadow]" in out and "low-severity" in out and "rename it" in out

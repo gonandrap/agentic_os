@@ -3005,13 +3005,13 @@ def cmd_steward(args: argparse.Namespace) -> int:
     from . import ops, steward
     from .central_store import CentralStore
 
-    catalog = ops.resolve_catalog()
     central = CentralStore()
     try:
         if args.steward_cmd == "digest":
-            print(steward.render_digest(steward.digest(catalog, central)))
+            print(steward.render_digest(steward.digest(ops.resolve_catalog(), central)))
             return 0
         if args.steward_cmd == "ledger":
+            catalog = ops.resolve_catalog()
             cfg = catalog.os.evolution
             book = steward.ledger(catalog, central)
             if args.json:
