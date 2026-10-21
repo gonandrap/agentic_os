@@ -1,14 +1,4 @@
-"""Screenshot `/alarms` and one alarm page carrying a FEATURE-subject finding.
-
-§1 of docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md.
-`scripts/screenshot_wo_alarm_record.py` is the shape it copies, and the seed is a
-DIVERGENT one on purpose: the feature and its carrier have different titles and
-different statuses, so the picture shows which of the two each surface renders. Nothing
-here turns the supervisor on — the columns it would fill are written directly, because
-a picture is not worth a real model call:
-
-    uv run python scripts/screenshot_feature_finding.py
-"""
+"""Screenshot `/alarms` and one alarm page carrying a FEATURE-subject finding (docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md)"""
 
 from __future__ import annotations
 
@@ -26,8 +16,7 @@ PORT = 8799
 
 
 def seed() -> str:
-    """One feature order with two findings carried by two different work orders, plus
-    one ordinary cost alarm — the two subject kinds side by side on one page."""
+    """One feature order with two findings carried by two different work orders"""
     from jarvis import ops
     from jarvis.central_store import CentralStore
     from jarvis.project_store import ProjectStore

@@ -1,10 +1,4 @@
-"""A file a TOOL rewrites must not reach a worker's commit.
-
-Spec docs/superpowers/specs/2026-09-25-serena-config-churn-and-tool-managed-files.md.
-`.serena/project.yml` is tracked and Serena regenerates it on activation, inside the
-worker's worktree, where `git add -A` stages the churn into a pull request about
-something else. The worktree's index is told the file is not the worker's to report.
-"""
+"""A file a TOOL rewrites must not reach a worker's commit (docs/superpowers/specs/2026-09-25-serena-config-churn-and-tool-managed-files.md)"""
 
 from __future__ import annotations
 
@@ -43,8 +37,7 @@ def commit_everything(project: Path) -> None:
 
 
 def make_worktree(project: Path, wo_id: str, tracked=(SERENA,)) -> Path:
-    """The worktree Claude Code's `--worktree` flag would have created, plus the
-    tracked tool-managed files the checkout carries."""
+    """The worktree Claude Code's `--worktree` flag would have created"""
     for rel in tracked:
         path = project / rel
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -75,7 +68,7 @@ def session_start(cwd: Path) -> dict[str, object]:
 
 
 def flags(tree: Path, rel: str) -> str:
-    """The index flag letter `git ls-files -v` reports — `S` is skip-worktree."""
+    """The index flag letter `git ls-files -v` reports — `S` is skip-worktree"""
     out = git(tree, "ls-files", "-v", "--", rel).strip()
     return out.split(" ", 1)[0] if out else ""
 
@@ -89,7 +82,7 @@ def events(project: Path, wo_id: str, kind="tool_managed_paths") -> list[dict]:
         store.close()
 
 
-# -- 1. the worktree's index stops reporting the file ------------------------------------
+# -- 1. the worktree's index stops reporting the file
 
 
 def test_marks_each_configured_path_in_the_worktree(wo, project):
@@ -104,7 +97,7 @@ def test_marks_each_configured_path_in_the_worktree(wo, project):
 
 
 def test_the_rewritten_file_is_invisible_to_status_and_add(wo, project):
-    """The point of the flag: the tool keeps rewriting, git stops staging."""
+    """The point of the flag: the tool keeps rewriting, git stops staging"""
     tree = make_worktree(project, wo["id"])
     handle_hook(session_start(tree), env(project, wo["id"]))
 
@@ -116,8 +109,7 @@ def test_the_rewritten_file_is_invisible_to_status_and_add(wo, project):
 
 
 def test_marking_twice_is_a_no_op_and_records_nothing_the_second_time(wo, project):
-    """`SessionStart` fires once per TURN; a row per turn would make the record a
-    hook log (timeline.py:19-21)."""
+    """`SessionStart` fires once per TURN"""
     tree = make_worktree(project, wo["id"])
     handle_hook(session_start(tree), env(project, wo["id"]))
     handle_hook(session_start(tree), env(project, wo["id"]))
@@ -126,11 +118,11 @@ def test_marking_twice_is_a_no_op_and_records_nothing_the_second_time(wo, projec
     assert flags(tree, SERENA) == "S"
 
 
-# -- 2. anything that is not this work order's worktree ----------------------------------
+# -- 2. anything that is not this work order's worktree
 
 
 def test_does_nothing_in_the_shared_checkout(wo, project):
-    """The dev checkout's own churn is the user's to see and commit."""
+    """The dev checkout's own churn is the user's to see and commit"""
     make_worktree(project, wo["id"])
 
     handle_hook(session_start(project), env(project, wo["id"]))
@@ -151,7 +143,7 @@ def test_does_nothing_under_another_work_orders_worktree(wo, project):
     assert events(project, wo["id"]) == []
 
 
-# -- 3. untracked, absent, and never fatal ----------------------------------------------
+# -- 3. untracked, absent, and never fatal
 
 
 def test_untracked_and_absent_paths_are_skipped_and_the_hook_still_answers(wo, project):
@@ -182,7 +174,7 @@ def test_a_broken_git_never_breaks_the_session(wo, project, monkeypatch):
 
 
 def test_no_env_means_the_mechanism_is_off(wo, project):
-    """A work order dispatched before this landed carries no such env."""
+    """A work order dispatched before this landed carries no such env"""
     tree = make_worktree(project, wo["id"])
     bare = env(project, wo["id"])
     bare.pop(hooks.TOOL_MANAGED_PATHS_ENV)
@@ -201,7 +193,7 @@ def test_unparseable_env_is_off_and_silent(wo, project):
     assert events(project, wo["id"]) == []
 
 
-# -- 4. the list is a setting -----------------------------------------------------------
+# -- 4. the list is a setting
 
 
 def test_a_project_override_reaches_the_worker_and_the_hook(wo, project, tmp_path):
@@ -251,7 +243,7 @@ def test_the_default_dispatch_env_carries_it(wo, project, catalog_file):
     (["../../etc/passwd"], "must not contain"),
 ])
 def test_a_path_that_could_escape_the_worktree_is_refused(project, value, message):
-    """The value is handed to `git -C <worktree>`."""
+    """The value is handed to `git -C <worktree>`"""
     with pytest.raises(CatalogError) as e:
         parse_catalog({"os": {"worktree": {"tool_managed_paths": value}}, "projects": []})
     assert message in str(e.value)
@@ -265,7 +257,7 @@ def test_the_same_refusals_apply_to_a_project_override(project):
     assert "projects[0] (proj_a).worktree.tool_managed_paths" in str(e.value)
 
 
-# -- 5. it is circuitry, not the user's story -------------------------------------------
+# -- 5. it is circuitry, not the user's story
 
 
 def test_the_event_is_debug_only():

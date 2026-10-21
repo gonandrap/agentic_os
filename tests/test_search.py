@@ -1,11 +1,4 @@
-"""`jarvis search`, its fan-out and the dashboard page — docs/superpowers/specs/
-2026-09-23-artifact-search.md.
-
-THE POINT OF THE VERB IS THE SETTLED RECORD, so every fixture here closes the thing it
-files: a search that only finds live work is the surface the user already had. The
-strings are distinctive for the reason tests/test_alarm_review.py says — a page is
-proved to be rendering the hit, not echoing the query.
-"""
+"""`jarvis search`, its fan-out and the dashboard page"""
 
 from __future__ import annotations
 
@@ -45,7 +38,7 @@ def _client():
 
 
 def test_finds_a_completed_work_order(started):
-    """The order this feature exists for: settled, off every listing's first page."""
+    """The order this feature exists for: settled, off every listing's first page"""
     wo_id = _wo("fix the login spinner", LOGIN, summary="cache key was wrong")
     hits = search.search("login spinner")
     assert [h["id"] for h in hits] == [wo_id]
@@ -58,14 +51,14 @@ def test_finds_a_completed_work_order(started):
 
 
 def test_a_hidden_order_is_still_findable(started):
-    """`wo hide` drops an order from LISTINGS. Search is retrieval, not a listing."""
+    """`wo hide` drops an order from LISTINGS"""
     wo_id = _wo("fix the login spinner", LOGIN)
     ops.hide_work_order(wo_id)
     assert [h["id"] for h in search.search("spinner")] == [wo_id]
 
 
 def test_title_outranks_a_body_mention(started):
-    """Weighting is the whole difference between a ranking and a pile."""
+    """Weighting is the whole difference between a ranking and a pile"""
     body = _wo("something else entirely", f"while doing it, {LOGIN}")
     titled = _wo("the login spinner itself")
     hits = search.search("login spinner")
@@ -73,23 +66,21 @@ def test_title_outranks_a_body_mention(started):
 
 
 def test_word_or_not_phrase(started):
-    """Two of three words is the hit the user meant (kn-c6e8fbf0)."""
+    """Two of three words is the hit the user meant (kn-c6e8fbf0)"""
     wo_id = _wo("the login spinner")
     assert [h["id"] for h in search.search("login spinner cache")] == [wo_id]
     assert search.search(NOWHERE) == []
 
 
 def test_an_id_typed_in_full_is_a_jump(started):
-    """An exact id outranks a row that merely mentions it."""
+    """An exact id outranks a row that merely mentions it"""
     target = _wo("a quiet title")
     _wo("a work order about another one", f"follows on from {target}")
     assert search.search(target)[0]["id"] == target
 
 
 def test_a_pasted_description_is_capped_and_still_finds_its_order(started):
-    """A user pasted a whole work-order description into the box: hundreds of words, one
-    unindexed LIKE per word per column, over a minute per search. Its first words are
-    the title, so the cap keeps the hit and drops the cost."""
+    """A user pasted a whole work-order description into the box: hundreds of words"""
     from jarvis import db
 
     wo_id = _wo("fix the login spinner", LOGIN)
@@ -101,13 +92,13 @@ def test_a_pasted_description_is_capped_and_still_finds_its_order(started):
 
 
 def test_empty_query_returns_nothing(started):
-    """A search verb is not a listing: no query means no answer, not everything."""
+    """A search verb is not a listing: no query means no answer, not everything"""
     _wo("fix the login spinner")
     assert search.search("   ") == []
 
 
 def _one_of_every_kind():
-    """File one record of each searchable kind, all saying "login spinner"."""
+    """File one record of each searchable kind, all saying "login spinner\""""
     wo_id = _wo("fix the login spinner")
     path = ops.find_work_order(wo_id)[1]
     store = ProjectStore(path)
@@ -141,7 +132,7 @@ def _one_of_every_kind():
 
 
 def test_every_kind_is_searched(started):
-    """The six kinds the order named, plus knowledge (Neo question 528)."""
+    """The six kinds the order named, plus knowledge (Neo question 528)"""
     filed = _one_of_every_kind()
     hits = search.search("login spinner")
     assert {h["kind"]: h["id"] for h in hits} == filed
@@ -149,8 +140,7 @@ def test_every_kind_is_searched(started):
 
 
 def test_every_hit_is_actionable_from_either_surface(started):
-    """A hit carries a page that renders and a `jarvis` command that exists — for EVERY
-    kind, not just the work order. Spec section 4."""
+    """A hit carries a page that renders and a `jarvis` command that exists"""
     filed = _one_of_every_kind()
     client = _client()
     parser = build_parser()
@@ -171,8 +161,7 @@ def test_every_hit_is_actionable_from_either_surface(started):
 ])
 def test_a_feature_orders_hit_points_at_its_own_kind(started, project, kind, segment,
                                                      verb):
-    """Issue #997, the search surface: every `feature_orders` row printed `/fo/` and
-    `jarvis fo show`, so an improvement order named a command that refuses the id."""
+    """Issue #997, the search surface: every `feature_orders` row printed `/fo/` and `jarvis fo show`"""
     store = ProjectStore(project)
     try:
         row = store.create_feature_order("rebuild the login spinner", "a big one",
@@ -197,7 +186,7 @@ def test_kind_filter_and_unknown_kind(started):
 
 
 def test_project_scope(started, tmp_path, jarvis_home):
-    """The same verb, narrowed to the project the user is looking at."""
+    """The same verb, narrowed to the project the user is looking at"""
     _wo("fix the login spinner")
     central = CentralStore()
     try:
@@ -265,7 +254,7 @@ def test_page_is_scoped_by_project(started, tmp_path):
 
 
 def test_page_survives_a_project_that_does_not_exist(started):
-    """A deep link the user edited is not a 500: the scope falls back to the fleet."""
+    """A deep link the user edited is not a 500: the scope falls back to the fleet"""
     _wo("fix the login spinner")
     page = _client().get("/search", params={"q": "spinner", "project": "ghost"})
     assert page.status_code == 200
@@ -273,7 +262,7 @@ def test_page_survives_a_project_that_does_not_exist(started):
 
 
 def test_the_box_is_on_every_page(started):
-    """Search reachable without knowing it exists — the UX complaint, precisely."""
+    """Search reachable without knowing it exists — the UX complaint, precisely"""
     client = _client()
     for path in ("/", f"/project/proj_a", "/backlog"):
         page = client.get(path).text

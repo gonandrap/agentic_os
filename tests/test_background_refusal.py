@@ -1,18 +1,4 @@
-"""Backgrounding is refused at the tool call, not asked for in the briefing.
-
-§4 of docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md. The contract has
-forbidden it in prose since TEMPLATE_VERSION v10; wo-2df8828c backgrounded anyway and
-wo-d81fcc15 did it twice, the second time for 62 hours of wall clock (issue #575).
-kn-6dcaf055 names the class: a rule the OS only asks for is not enforced.
-
-The refusal is conditional on the DECLARED transport (§3), never on a hardcoded belief
-that a turn is one-shot.
-
-§3 and §4 of docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md
-invert it for three shell shapes and one seat call: those are refused in the FOREGROUND
-and permitted when backgrounded, because a call blocking past the 5-minute prompt cache
-re-sends the whole conversation at the write rate (issue 868, ~$52 over 25 work orders).
-"""
+"""Backgrounding is refused at the tool call, not asked for in the briefing (docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md)"""
 
 from __future__ import annotations
 
@@ -55,8 +41,7 @@ def _seat(subagent_type: str, tool_name: str = "Agent", env=None, **tool_input):
 
 
 def test_run_in_background_denied_on_headless():
-    # `./server.sh` and not the suite: §4 of the 2026-09-29 spec carves the three long
-    # shapes out, and what stays refused is the job nobody polls for.
+    # `./server.sh` and not the suite: §4 of the 2026-09-29 spec carves the three long shapes out
     result = _bash("./server.sh", run_in_background=True)
 
     assert _decision(result) == "deny"
@@ -76,8 +61,7 @@ def test_nohup_setsid_disown_denied():
 
 
 def test_double_ampersand_and_redirects_allowed():
-    """The whole difficulty of the shell case. Every one of these is a foreground
-    command, and denying any of them would break the worker's ordinary shell."""
+    """The whole difficulty of the shell case"""
     for command in ("cd /tmp && pytest", "make 2>&1 | tee log", "cmd &> out.txt",
                     "cmd &>> out.txt", "a && b && c"):
         assert _bash(command) is None, command
@@ -89,35 +73,32 @@ def test_ampersand_inside_quotes_allowed():
 
 
 def test_a_backgrounding_word_as_an_argument_is_not_a_job():
-    """In command position only. Denying `grep -r nohup src/` would make the rule
-    something the worker learns to work around rather than obey."""
+    """In command position only"""
     for command in ("grep -r nohup src/", "rg setsid", "cat notes-about-disown.md"):
         assert _bash(command) is None, command
 
 
 def test_allowed_when_transport_is_background():
-    """`spawn_background` is supervisor-owned: the job outlives the call and the
-    notification arrives. Hardcoding one-shot-ness would make this a lie."""
+    """`spawn_background` is supervisor-owned: the job outlives the call and the notification arrives"""
     env = {"JARVIS_WO_ID": "wo-bg01",
            claude_cli.TURN_TRANSPORT_ENV: claude_cli.TRANSPORT_BACKGROUND}
 
     assert _bash("pytest &", env=env) is None
     assert _bash("pytest", env=env, run_in_background=True) is None
-    # Under `spawn_background` the gap is the supervisor's problem and §3 has no subject.
+    # Under `spawn_background` the gap is the supervisor's problem and §3 has no subject
     assert _fg("uv run pytest tests/", env=env) is None
     assert _seat("jarvis-implementer", env=env) is None
 
 
 def test_no_op_without_transport_env():
-    """Absent key = not a Jarvis worker, exactly as `JARVIS_WO_ID` behaves everywhere."""
+    """Absent key = not a Jarvis worker, exactly as `JARVIS_WO_ID` behaves everywhere"""
     assert _bash("pytest &", env={}) is None
     assert _fg("uv run pytest tests/", env={}) is None
     assert _seat("jarvis-implementer", env={}) is None
 
 
 def test_subagent_call_denied_too():
-    """PreToolUse fires for a subagent's calls under the parent session, carrying
-    `agent_type` — so the seats are covered without a second mechanism."""
+    """PreToolUse fires for a subagent's calls under the parent session, carrying `agent_type`"""
     result = hooks.background_task_decision(
         {"tool_name": "Bash", "agent_type": "jarvis-implementer",
          "tool_input": {"command": "pytest &"}}, HEADLESS)
@@ -126,27 +107,24 @@ def test_subagent_call_denied_too():
 
 
 def test_the_refusal_is_reachable_around_by_nothing_the_auto_allow_covers():
-    """Ordering: the check sits before the `jarvis …` auto-allow, the same trap the PR
-    checks and the summary cap already sit in front of."""
+    """Ordering: the check sits before the `jarvis …` auto-allow"""
     payload = {"tool_name": "Bash",
                "tool_input": {"command": "jarvis wo show wo-bg01 &"}}
 
     assert _decision(hooks.preflight_decision(payload, HEADLESS)) == "deny"
 
 
-# -- §3: the foreground refusal, the other half of the same matcher --------------------
+# -- §3: the foreground refusal, the other half of the same matcher
 
 
 def test_foreground_whole_suite_run_denied():
-    """The three spellings the fleet uses. A 20-minute blocking call is one 1.25x
-    re-write of the whole conversation on the next call (kn-356c724b, issue 868)."""
+    """The three spellings the fleet uses"""
     for command in ("uv run pytest tests/", "pytest", "python -m pytest tests/ evals/"):
         assert _decision(_fg(command)) == "deny", command
 
 
 def test_targeted_test_run_allowed():
-    """The false positives that would make the rule something a lead works around
-    rather than obeys — kn-27fed9d2 item 7. Each of these is seconds."""
+    """The false positives that would make the rule something a lead works around rather than obeys"""
     for command in ("pytest tests/test_hooks.py",
                     "pytest tests/test_hooks.py::test_one",
                     "pytest --collect-only", "pytest --version",
@@ -166,7 +144,7 @@ def test_ci_read_without_watch_allowed():
 
 
 def test_long_sleep_and_poll_loops_denied():
-    """A loop's wall clock is not bounded by its sleep argument, however small."""
+    """A loop's wall clock is not bounded by its sleep argument, however small"""
     for command in ("sleep 900", "sleep 20m",
                     "while true; do sleep 30; gh pr checks; done",
                     "until gh pr checks; do sleep 60; done"):
@@ -174,23 +152,21 @@ def test_long_sleep_and_poll_loops_denied():
 
 
 def test_short_sleep_and_bounded_loop_allowed():
-    """`sleep 200` is the sanctioned check-in wait: this threshold is what makes the
-    polling rhythm legal, and `timeout N` is a bound, not an unbounded wait."""
+    """`sleep 200` is the sanctioned check-in wait: this threshold is what makes the polling rhythm legal"""
     for command in ("sleep 200", "sleep 0.5", "for i in 1 2 3; do sleep 2; done",
                     "timeout 200 bash -c 'while :; do sleep 5; done'"):
         assert _fg(command) is None, command
 
 
 def test_long_shape_inside_quotes_or_comment_allowed():
-    """`_mask_shell_text`, the same masking the shell half of §4 depends on."""
+    """`_mask_shell_text`, the same masking the shell half of §4 depends on"""
     for command in ('grep -r "sleep 900" src/', "echo 'gh run watch'",
                     "pytest tests/test_x.py  # not the whole suite"):
         assert _fg(command) is None, command
 
 
 def test_suite_deny_text_points_at_the_pinned_rule():
-    """The text must not read as permission to run the suite locally: the pinned entry
-    says a worker must not, and backgrounding is the second-best exit."""
+    """The text must not read as permission to run the suite locally: the pinned entry says a worker must..."""
     reason = _reason(_fg("uv run pytest tests/"))
 
     assert "targeted" in reason
@@ -198,9 +174,7 @@ def test_suite_deny_text_points_at_the_pinned_rule():
 
 
 def test_same_shapes_allowed_when_backgrounded():
-    """One matcher, two call sites: §3 refuses the shape in the foreground and §4
-    permits it backgrounded. A second spelling of "long" would leave a lead with no
-    legal way to run it at all (kn-d4d5a967)."""
+    """One matcher, two call sites: §3 refuses the shape in the foreground and §4 permits it backgrounded"""
     for command in ("uv run pytest tests/", "pytest",
                     "python -m pytest tests/ evals/", "gh run watch",
                     "gh pr checks 42 --watch", "sleep 900", "sleep 20m",
@@ -211,8 +185,7 @@ def test_same_shapes_allowed_when_backgrounded():
 
 
 def test_other_backgrounding_still_denied():
-    """A job nobody polls for, which is the orphan class §4 of the 2026-09-23 spec
-    closed. Today's text, unchanged."""
+    """A job nobody polls for, which is the orphan class §4 of the 2026-09-23 spec closed"""
     for command, extra in (("nohup ./server.sh &", {}),
                            ("./server.sh", {"run_in_background": True})):
         result = _bash(command, **extra)
@@ -222,9 +195,7 @@ def test_other_backgrounding_still_denied():
 
 
 def test_an_ampersanded_long_shape_is_told_the_rhythm_not_the_foreground():
-    """Two wrong turns of advice otherwise: today's text would send the lead at the
-    foreground call `long_foreground_decision` refuses next. The SHAPE may be
-    backgrounded; the `&` may not."""
+    """Two wrong turns of advice otherwise: today's text would send the lead at the foreground call..."""
     result = _bash("uv run pytest tests/ &")
 
     assert _decision(result) == "deny"
@@ -235,7 +206,7 @@ def test_an_ampersanded_long_shape_is_told_the_rhythm_not_the_foreground():
 
 
 def test_foreground_long_seat_agent_denied():
-    """The 55-write, $33.5 half of the bill, and the larger one."""
+    """The 55-write, $33.5 half of the bill, and the larger one"""
     for seat in hooks.LONG_SEATS:
         for tool in ("Agent", "Task"):
             result = _seat(seat, tool_name=tool)
@@ -250,16 +221,13 @@ def test_backgrounded_long_seat_allowed():
 
 
 def test_other_subagent_type_allowed_in_foreground():
-    """A short seat blocking for four minutes is cheap, and taxing every delegation
-    with a hook refusal would be the false positive that trains the rule away."""
+    """A short seat blocking for four minutes is cheap"""
     for seat in ("jarvis-architect", "jarvis-test-lead", "general-purpose"):
         assert _seat(seat) is None, seat
 
 
 def test_long_foreground_precedes_the_jarvis_auto_allow():
-    """The ordering IS the enforcement: the auto-allow waves every `jarvis …` command
-    through, so a refusal placed after it passes a unit test and does nothing in
-    production."""
+    """The ordering IS the enforcement: the auto-allow waves every `jarvis …` command through"""
     source = inspect.getsource(hooks.preflight_decision)
 
     assert "long_foreground_decision" in source
@@ -267,7 +235,7 @@ def test_long_foreground_precedes_the_jarvis_auto_allow():
         "background_task_decision")
     assert source.index("long_foreground_decision") < source.index(
         "is_jarvis_command_chain")
-    # And it runs: a carved-out shape inside a `jarvis` chain is still refused.
+    # And it runs: a carved-out shape inside a `jarvis` chain is still refused
     assert _decision(hooks.preflight_decision(
         {"tool_name": "Bash",
          "tool_input": {"command": "jarvis wo show wo-bg01 && sleep 900"}},
@@ -275,8 +243,7 @@ def test_long_foreground_precedes_the_jarvis_auto_allow():
 
 
 def test_settings_matcher_names_agent():
-    """Without this the `Agent` arm is dead code in production and no behavioural test
-    would say so (§3b)."""
+    """Without this the `Agent` arm is dead code in production and no behavioural test would say so (§3b)"""
     settings = json.loads(
         (Path(hooks.__file__).parent / "assets" / "settings.base.json").read_text())
     matcher = settings["hooks"]["PreToolUse"][0]["matcher"]

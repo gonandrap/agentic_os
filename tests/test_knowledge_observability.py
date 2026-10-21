@@ -1,16 +1,4 @@
-"""The knowledge base is measured, not assumed.
-
-`test_knowledge_ondemand.py` pins what a worker prompt COSTS. This pins the other half,
-which did not exist: what is actually READ. The OS could say what it knew and nothing at
-all about whether anyone consulted it — the only evidence was an opt-in paid eval
-somebody had to remember to run — so an entry nobody has ever opened and a work order
-that never looked were both invisible.
-
-Two properties carry most of these tests. Recording NEVER breaks the read it counts, and
-a sweep of the index (`list`, `topics`) is not a retrieval: counting it as one would mark
-the whole base consulted and destroy the only number that says which entries earn their
-place.
-"""
+"""The knowledge base is measured, not assumed"""
 
 from __future__ import annotations
 
@@ -38,7 +26,7 @@ def base(jarvis_home):
     central.close()
 
 
-# -- the read log ---------------------------------------------------------------------
+# -- the read log
 
 def test_show_records_the_entry_it_returned(base, capsys, monkeypatch):
     kid = base.search_knowledge("DEPLOY")[0]["id"]
@@ -73,8 +61,7 @@ def test_a_search_that_finds_nothing_is_recorded_as_asked_and_unanswered(base, c
 
 
 def test_listing_the_index_is_not_a_retrieval(base, capsys):
-    """`list` sweeps; only `show`/`search` aim. Crediting a sweep to every entry it
-    printed would make "never read" unreachable."""
+    """`list` sweeps; only `show`/`search` aim"""
     run("list")
     capsys.readouterr()
 
@@ -93,11 +80,7 @@ def test_a_headline_list_is_not_charged_for_bodies_it_never_printed(base, capsys
 
 
 def test_a_search_is_charged_for_the_index_it_printed_not_the_bodies(base, capsys):
-    """Spec test 2 of 2026-10-02-learn-search-returns-an-index.md.
-
-    Without the `chars=` override at the search call site, `jarvis learn stats` keeps
-    reporting bodies nobody received and the done-when condition is unmeasurable.
-    """
+    """Spec test 2 of 2026-10-02-learn-search-returns-an-index.md"""
     import json
 
     cmd_learn(build_parser().parse_args(["--json", "learn", "search", "DEPLOY"]))
@@ -117,7 +100,7 @@ def test_topics_is_recorded_without_touching_any_entry(base, capsys):
 
 
 def test_recording_never_breaks_the_read_it_counts(base, capsys, monkeypatch):
-    """An observer that can fail the thing it observes is worse than no observer."""
+    """An observer that can fail the thing it observes is worse than no observer"""
     base.conn.execute("DROP TABLE knowledge_reads")
     assert run("search", "gate") == 0
     assert "GATE MATCHES" in capsys.readouterr().out
@@ -132,11 +115,11 @@ def test_deleting_a_work_order_takes_its_reads_with_it(base, capsys, monkeypatch
     assert base.knowledge_hit_counts() == {}
 
 
-# -- the report -----------------------------------------------------------------------
+# -- the report
 
 @pytest.fixture()
 def fleet(jarvis_home, project):
-    """A registered project with a completed work order and two entries."""
+    """A registered project with a completed work order and two entries"""
     central = CentralStore()
     central.upsert_project("proj_a", str(project))
     yield central
@@ -157,8 +140,7 @@ def test_the_prompt_cost_is_measured_against_a_real_prompt(fleet):
                         topic="releases")
     cost = ops.knowledge_usage_report(project="proj_a")["prompt_cost"][0]
     assert cost["indexed"] == 1
-    # The index ships and the body does not: the block is a fraction of the prompt while
-    # the entry itself is longer than the block.
+    # The index ships and the body does not: the block is a fraction of the prompt while the entry itself...
     assert 0 < cost["index_chars"] < cost["prompt_chars"]
     assert cost["body_chars"] > 300
 
@@ -183,9 +165,7 @@ def test_an_order_that_finished_without_reading_is_counted(fleet, project):
 
 
 def test_work_that_predates_the_log_is_not_accused_of_ignoring_the_base(fleet, project):
-    """Reads were unrecorded until this table existed. Reporting every order that
-    finished before then as one that never consulted memory would turn a missing
-    measurement into a finding — 125 of them, on the fleet this shipped to."""
+    """Reads were unrecorded until this table existed"""
     _completed(project, "wo-ancient", "rewrite the release runbook")
     report = ops.knowledge_usage_report(project="proj_a")
     assert report["observed_from"] is None
@@ -198,9 +178,7 @@ def test_work_that_predates_the_log_is_not_accused_of_ignoring_the_base(fleet, p
 
 
 def test_could_have_read_needs_an_entry_that_predates_the_order(fleet, project):
-    """The signal is 'the answer was already there'. An entry the order wrote ITSELF is
-    not something it failed to read, and counting it would flag every order that
-    recorded a learning."""
+    """The signal is 'the answer was already there'"""
     fleet.record_knowledge_read("search", term="anything")  # the log begins
     _completed(project, "wo-late", "rewrite the release runbook")
     fleet.add_knowledge("THE RELEASE RUNBOOK rewrite lesson.", project="proj_a",
@@ -228,8 +206,7 @@ def test_an_order_that_read_is_not_reported_as_silent(fleet, project, capsys,
 
 
 def test_truncated_headlines_are_counted(fleet):
-    """The index line is the only thing that decides whether an entry is ever read, so
-    how many entries reach it cut mid-sentence is a first-class number."""
+    """The index line is the only thing that decides whether an entry is ever read"""
     fleet.add_knowledge("SHORT ONE.", project="proj_a", topic="t")
     fleet.add_knowledge("A HEADLINE THAT RUNS ON. " * 20, project="proj_a", topic="t")
     assert ops.knowledge_usage_report(project="proj_a")["size"]["truncated_headlines"] == 1

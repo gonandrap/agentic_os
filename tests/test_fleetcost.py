@@ -1,15 +1,4 @@
-"""`jarvis cost --fleet` — the distribution, on synthetic state only.
-
-Spec §7 of docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md. Everything
-here is built by the `fleet_fixture` helper in `jarvis/testing.py`: no real transcript,
-no real agent, and chosen timestamps, because every question this report answers is
-about WHEN a turn ran and what population it belongs to.
-
-Two rules are asserted harder than the arithmetic, because getting them wrong produces a
-number that reads as true: a turn still running is EXCLUDED and never a zero, and money
-from two different sources (`cost_source`) is reported as two figures and never blended
-(kn-e6bb1166).
-"""
+"""`jarvis cost --fleet` — the distribution, on synthetic state only (docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md)"""
 
 from __future__ import annotations
 
@@ -29,10 +18,10 @@ def stamp(text: str) -> float:
     return when.timestamp()
 
 
-#: The acceptance week: Mon 2026-09-28 21:00 PDT -> the following Monday.
+#: The acceptance week: Mon 2026-09-28 21:00 PDT -> the following Monday
 SINCE = stamp("2026-09-29T04:00:00+00:00")
 UNTIL = stamp("2026-10-06T04:00:00+00:00")
-#: Somewhere comfortably inside it.
+#: Somewhere comfortably inside it
 T0 = stamp("2026-09-30T12:00:00+00:00")
 
 
@@ -43,26 +32,26 @@ def envelope(*, input: int = 0, cache_read: int = 0, cache_write: int = 0,
             "cache_1h": 0}
 
 
-# -- 1. the default window -------------------------------------------------------------
+# -- 1. the default window
 
 
 def test_usage_week_boundaries():
-    """The Claude usage week, from the catalog's reset and never a literal."""
+    """The Claude usage week, from the catalog's reset and never a literal"""
     cfg = catalog.CostConfig()
 
     assert fleetcost.usage_week(T0, cfg) == (SINCE, UNTIL)
-    # The reset instant itself opens the new week.
+    # The reset instant itself opens the new week
     assert fleetcost.usage_week(SINCE, cfg) == (SINCE, UNTIL)
-    # One second before it is still the PREVIOUS week.
+    # One second before it is still the PREVIOUS week
     before = fleetcost.usage_week(SINCE - 1, cfg)
     assert before == (stamp("2026-09-22T04:00:00+00:00"), SINCE)
-    # ...and the last instant of the week is the week.
+    # ...and the last instant of the week is the week
     assert fleetcost.usage_week(UNTIL - 1, cfg) == (SINCE, UNTIL)
 
-    # A non-default hour moves it: Monday 00:00 PDT is 07:00 UTC.
+    # A non-default hour moves it: Monday 00:00 PDT is 07:00 UTC
     midnight = fleetcost.usage_week(T0, catalog.CostConfig(week_reset_hour=0))
     assert midnight[0] == stamp("2026-09-28T07:00:00+00:00")
-    # Zero is a legal hour and must not be read as "unset".
+    # Zero is a legal hour and must not be read as "unset"
     assert midnight[1] == stamp("2026-10-05T07:00:00+00:00")
 
 
@@ -74,10 +63,7 @@ def test_window_of_prefers_the_flags():
     assert fleetcost.window_of(None, None, cfg, now=T0)["source"] == "usage-week"
 
 
-# -- 1b. the window SELECTOR -----------------------------------------------------------
-#
-# §1-§4 of docs/superpowers/specs/2026-10-07-cost-window-selector.md. One resolver, read
-# by the CLI, `--json` and the page, so a bad parameter is a refusal on all three.
+# -- 1b. the window SELECTOR
 
 WEEK_SECONDS = 7 * 86400
 
@@ -97,17 +83,17 @@ def test_week_offsets_step_back_whole_local_weeks():
         w = windows[n]
         assert w["source"] == "week-offset"
         assert w["window"] == "week" and w["offset"] == n
-        # Seven LOCAL days, and the configured hour at each end.
+        # Seven LOCAL days, and the configured hour at each end
         local = datetime.fromtimestamp(w["since"], ZoneInfo("America/Los_Angeles"))
         assert (local.hour, local.weekday()) == (21, 0)
         assert w["until"] - w["since"] == WEEK_SECONDS
-    # The windows abut exactly: no gap and no overlap at a boundary.
+    # The windows abut exactly: no gap and no overlap at a boundary
     assert windows[-1]["until"] == windows[0]["since"]
     assert windows[-4]["since"] == SINCE - 4 * WEEK_SECONDS
 
 
 def test_week_across_dst_in_both_directions():
-    """A week spanning a transition is seven LOCAL days: 169 or 167 absolute hours."""
+    """A week spanning a transition is seven LOCAL days: 169 or 167 absolute hours"""
     autumn = resolved(window="week", now=stamp("2026-10-28T12:00:00+00:00"))
     spring = resolved(window="week", now=stamp("2027-03-10T12:00:00+00:00"))
 
@@ -116,10 +102,10 @@ def test_week_across_dst_in_both_directions():
     for w in (autumn, spring):
         local = datetime.fromtimestamp(w["since"], ZoneInfo("America/Los_Angeles"))
         assert (local.hour, local.weekday()) == (21, 0)
-        # Both ends printed: one abbreviation across a transition is wrong at one end.
+        # Both ends printed: one abbreviation across a transition is wrong at one end
         assert "PDT" in w["local_label"] and "PST" in w["local_label"]
     assert autumn["local_label"] == "2026-10-26 21:00 PDT to 2026-11-02 21:00 PST"
-    # The OFFSET path crosses it too, not just the week containing `now`.
+    # The OFFSET path crosses it too, not just the week containing `now`
     back = resolved(window="week", offset=-1, now=stamp("2026-11-04T12:00:00+00:00"))
     assert back["until"] - back["since"] == 169 * 3600
     assert back["local_label"] == autumn["local_label"]
@@ -146,7 +132,7 @@ def test_session_window_grid():
         SINCE + 5 * 3600
     assert resolved(window="5h", offset=-3, now=now, cfg=cfg)["since"] == \
         current["since"] - 15 * 3600
-    # A non-default length moves every edge, and a fractional one is legal.
+    # A non-default length moves every edge, and a fractional one is legal
     hourly = resolved(window="5h", now=now,
                       cfg=catalog.CostConfig(session_window_hours=1.0))
     assert (hourly["since"], hourly["until"]) == (now, now + 3600)
@@ -156,15 +142,14 @@ def test_session_window_grid():
 
 
 def test_session_window_steps_across_a_week_start():
-    """Continuous in ABSOLUTE time: the step stays the length, across the reset (§2)."""
+    """Continuous in ABSOLUTE time: the step stays the length, across the reset (§2)"""
     now = SINCE + 2 * 3600
     steps = [resolved(window="5h", offset=-n, now=now) for n in range(4)]
 
     for earlier, later in zip(steps[1:], steps):
         assert later["since"] - earlier["since"] == 5 * 3600
         assert earlier["until"] == later["since"]
-    # It crosses the reset rather than re-anchoring on the previous week's own grid,
-    # which is the accepted non-alignment: 168 is not a multiple of 5.
+    # It crosses the reset rather than re-anchoring on the previous week's own grid
     assert steps[1]["since"] < SINCE < steps[0]["until"]
 
 
@@ -174,7 +159,7 @@ def test_custom_range():
         assert window["since"] == SINCE
         assert window["source"] == "flags"
         assert window["window"] is None and window["offset"] is None
-    # Naive input is UTC, the way `--since` already reads it.
+    # Naive input is UTC, the way `--since` already reads it
     assert resolved(since="2026-09-29T04:00:00")["since"] == SINCE
 
 
@@ -196,7 +181,7 @@ def test_refusals():
             match=r"--since/--until and --window/--offset are two ways to name the same "
                   r"thing — pass one or the other, not both"):
         resolved(window="week", since=SINCE)
-    # The same refusal covers an offset beside a custom range.
+    # The same refusal covers an offset beside a custom range
     with pytest.raises(ops.OpsError, match="pass one or the other, not both"):
         resolved(offset=-1, until=UNTIL)
 
@@ -212,21 +197,17 @@ def test_window_of_still_resolves_the_week():
     assert flagged["source"] == "flags" and flagged["window"] is None
 
 
-# -- 1c. the DISPLAY zone --------------------------------------------------------------
-#
-# §11 of docs/superpowers/specs/2026-10-07-cost-window-selector.md. Display only: the
-# boundaries stay anchored in `cfg.week_reset_zone`, so picking a zone must move NO
-# number.
+# -- 1c. the DISPLAY zone
 
 
 def test_the_default_zone_comes_from_the_catalog():
     cfg = catalog.CostConfig()
 
     assert fleetcost.resolve_zone(None, cfg) == cfg.week_reset_zone
-    # Empty is ABSENT, not a bad zone: a blank form field is not a refusal.
+    # Empty is ABSENT, not a bad zone: a blank form field is not a refusal
     assert fleetcost.resolve_zone("", cfg) == cfg.week_reset_zone
     assert fleetcost.resolve_zone("Europe/Berlin", cfg) == "Europe/Berlin"
-    # And it is read from the catalog, never a module constant.
+    # And it is read from the catalog, never a module constant
     moved = catalog.CostConfig(week_reset_zone="Asia/Tokyo")
     assert fleetcost.resolve_zone(None, moved) == "Asia/Tokyo"
 
@@ -236,14 +217,14 @@ def test_the_default_zone_comes_from_the_catalog():
 
 
 def test_a_picked_zone_moves_the_label_and_no_number():
-    """The load-bearing test: the zone is DISPLAY ONLY (Neo q1460)."""
+    """The load-bearing test: the zone is DISPLAY ONLY (Neo q1460)"""
     default = resolved(window="week")
     berlin = resolved(window="week", tz="Europe/Berlin")
 
     assert berlin["zone"] == "Europe/Berlin"
     assert berlin["local_label"] != default["local_label"]
     assert berlin["local_label"] == "2026-09-29 06:00 to 2026-10-06 06:00 CEST"
-    # Byte-identical boundaries: the week stays anchored in `week_reset_zone`.
+    # Byte-identical boundaries: the week stays anchored in `week_reset_zone`
     assert berlin["since"] == default["since"]
     assert berlin["until"] == default["until"]
     assert berlin["label"] == default["label"]
@@ -261,7 +242,7 @@ def test_a_bad_zone_is_a_refusal_never_a_fallback():
 
 
 def test_a_dst_change_in_a_picked_zone_prints_both_abbreviations():
-    """Berlin's autumn transition is 2026-10-25, inside this usage week."""
+    """Berlin's autumn transition is 2026-10-25, inside this usage week"""
     week = resolved(window="week", tz="Europe/Berlin",
                     now=stamp("2026-10-21T12:00:00+00:00"))
 
@@ -282,11 +263,11 @@ def test_the_zone_rides_on_every_source():
         assert "JST" in w["local_label"]
 
 
-# -- 2. the one place a population statistic is computed -------------------------------
+# -- 2. the one place a population statistic is computed
 
 
 def test_metric_nearest_rank_p90():
-    """p90 is nearest-rank, so it is always a value some order actually had."""
+    """p90 is nearest-rank, so it is always a value some order actually had"""
     def p90(n: int) -> float:
         values = [(float(i), f"wo-{i}") for i in range(1, n + 1)]
         return fleetcost.metric(values).p90
@@ -307,7 +288,7 @@ def test_metric_nearest_rank_p90():
     assert empty.avg is None and empty.p90 is None and empty.max is None
 
 
-# -- 3. turns, compactions, windows ----------------------------------------------------
+# -- 3. turns, compactions, windows
 
 
 def report(**kwargs):
@@ -328,7 +309,7 @@ def test_compact_turns_are_not_turns(fleet_fixture):
     assert fleet["metrics"]["turns_per_order"]["n"] == 1
     assert fleet["metrics"]["turns_per_order"]["avg"] == 3.0
     assert fleet["metrics"]["compactions_per_order"]["avg"] == 2.0
-    # The compact turn's dollars are not a worker turn's dollars either.
+    # The compact turn's dollars are not a worker turn's dollars either
     assert fleet["metrics"]["cost_per_turn_usd"]["n"] == 3
 
 
@@ -369,11 +350,11 @@ def test_running_turn_excluded_not_zero(fleet_fixture):
     assert report()["orders"]["live"] == 1
 
 
-# -- 4. two currencies, never blended --------------------------------------------------
+# -- 4. two currencies, never blended
 
 
 def test_mixed_cost_basis_labelled(fleet_fixture):
-    """`envelope` is the headline; the transcript FLOOR is its own figure with its own n."""
+    """`envelope` is the headline; the transcript FLOOR is its own figure with its own n"""
     wo = fleet_fixture.order(session_id="sess-a")
     fleet_fixture.turn(wo, started_at=T0, ended_at=T0 + 60, cost_usd=1.0,
                        cost_source="envelope")
@@ -394,7 +375,7 @@ def test_mixed_cost_basis_labelled(fleet_fixture):
     assert headline["excluded"]["unrecorded"] == 1
     assert floor["provenance"] == "transcript"
     assert floor["n"] == 1 and floor["avg"] == 0.5
-    # The one thing that must never happen: a single blended average.
+    # The one thing that must never happen: a single blended average
     assert headline["avg"] != pytest.approx((1.0 + 3.0 + 0.5) / 3)
 
 
@@ -409,11 +390,11 @@ def test_an_all_envelope_population_is_not_labelled_mixed(fleet_fixture):
     assert metrics["cost_per_turn_usd_transcript_floor"]["avg"] is None
 
 
-# -- 5. boundaries: four causes, four counts -------------------------------------------
+# -- 5. boundaries: four causes, four counts
 
 
 def test_ttl_and_prefix_reported_separately(fleet_fixture):
-    """All FOUR causes of `usage.classify_boundaries`, each on its own line."""
+    """All FOUR causes of `usage.classify_boundaries`, each on its own line"""
     f = fleet_fixture
     rows = [
         f.call_row(at=T0, write=50_000, out=100),
@@ -429,8 +410,7 @@ def test_ttl_and_prefix_reported_separately(fleet_fixture):
     counts = fleetcost.boundary_counts("sess-a", 5_000)
 
     assert counts == {"ttl": 1, "prefix": 1, "compacted": 1, "undecided": 0}
-    # No floor configured: the TTL split is left OPEN rather than guessed, and the
-    # undecided ones are reported as their own count instead of being dropped.
+    # No floor configured: the TTL split is left OPEN rather than guessed
     assert fleetcost.boundary_counts("sess-a", None) == {
         "ttl": 0, "prefix": 0, "compacted": 1, "undecided": 2}
 
@@ -470,7 +450,7 @@ def test_subagent_share_comes_off_the_transcript(fleet_fixture):
     assert report()["metrics"]["subagent_share"]["avg"] == pytest.approx(share)
 
 
-# -- 6. the OS's own spend -------------------------------------------------------------
+# -- 6. the OS's own spend
 
 
 def test_os_by_kind_includes_zero_cost_kinds(fleet_fixture):
@@ -488,7 +468,7 @@ def test_os_by_kind_includes_zero_cost_kinds(fleet_fixture):
     assert by_kind["observe_turn"]["cost_usd"] == 0.0, "a $0 kind still reconciles"
     assert by_kind["neo_answer"]["cost_usd"] == 2.0, "out-of-window call excluded"
     assert fleet["os_unattributed"] == {"calls": 1, "cost_usd": 0.25}
-    # The unattributed call lands on no order; the attributed one does.
+    # The unattributed call lands on no order; the attributed one does
     assert fleet["metrics"]["cost_per_order_usd"]["avg"] == 3.0
 
 
@@ -522,14 +502,13 @@ def test_records_are_counted_not_priced(fleet_fixture):
     assert metrics["neo_questions_per_order"]["avg"] == 1.0
 
 
-# -- 7. the contract and the read-only guarantee ---------------------------------------
+# -- 7. the contract and the read-only guarantee
 
 
 FLEET_KEYS = {
     "version", "window", "scope", "orders", "metrics", "os_cost_by_kind",
     "os_unattributed", "compaction_payoff", "floor", "floor_reason", "notes",
-    # §10.6: ADDITIVE under the existing key, and `version` stays 1 — the subtree
-    # carries its own.
+    # §10.6: ADDITIVE under the existing key, and `version` stays 1 — the subtree carries its own
     "tools",
 }
 METRIC_KEYS = {
@@ -565,12 +544,12 @@ def test_payload_keys_stable(fleet_fixture):
     assert fleet["floor_reason"] == ops.COST_FLOOR_NOTE
     assert fleet["metrics"]["tokens_per_turn.cache_write"]["avg"] == 30.0
     assert fleet["metrics"]["tokens_per_turn.cache_write"]["unit"] == "tokens"
-    # The payoff block is the existing arithmetic, verbatim.
+    # The payoff block is the existing arithmetic, verbatim
     assert "pct_paid_off" in fleet["compaction_payoff"]
 
 
 def test_the_report_takes_a_named_window_or_a_resolved_one(fleet_fixture):
-    """`resolved` wins and is refused beside any raw parameter: no "which one was it" (§6)."""
+    """`resolved` wins and is refused beside any raw parameter: no "which one was it" (§6)"""
     wo = fleet_fixture.order(session_id="sess-a")
     fleet_fixture.turn(wo, started_at=T0, ended_at=T0 + 100, cost_usd=1.0)
 
@@ -581,7 +560,7 @@ def test_the_report_takes_a_named_window_or_a_resolved_one(fleet_fixture):
     picked = ops.cost_window(window="5h", now=T0)
     session = ops.fleet_cost(resolved=picked)["fleet"]
     assert session["window"] == picked
-    # The anchor travels in the payload, not in one renderer (§2).
+    # The anchor travels in the payload, not in one renderer (§2)
     assert fleetcost.SESSION_ANCHOR_NOTE in session["notes"]
     assert fleetcost.SESSION_ANCHOR_NOTE not in week["notes"]
     with pytest.raises(ops.OpsError, match="pass one or the other, not both"):
@@ -589,13 +568,13 @@ def test_the_report_takes_a_named_window_or_a_resolved_one(fleet_fixture):
 
 
 def test_an_unknown_project_is_refused_not_reported_as_empty(fleet_fixture):
-    """"Nothing ran" is a claim about the fleet; a typo must not make it."""
+    """"Nothing ran" is a claim about the fleet; a typo must not make it"""
     with pytest.raises(ops.OpsError, match="not registered"):
         report(project="proj_typo")
 
 
 def test_read_only(fleet_fixture, monkeypatch):
-    """No `ProjectStore`, so no `_migrate`, so not one byte written to a project DB."""
+    """No `ProjectStore`, so no `_migrate`, so not one byte written to a project DB"""
     wo = fleet_fixture.order(session_id="sess-a")
     fleet_fixture.turn(wo, started_at=T0, ended_at=T0 + 100, cost_usd=1.0)
 
@@ -613,7 +592,7 @@ def test_read_only(fleet_fixture, monkeypatch):
     assert fleet_fixture.db.stat().st_mtime_ns == before
 
 
-# -- 8. the surfaces -------------------------------------------------------------------
+# -- 8. the surfaces
 
 
 def test_the_cli_renders_the_fleet_section(fleet_fixture, capsys):
@@ -645,7 +624,7 @@ def test_the_cli_fleet_json_is_the_payload(fleet_fixture, capsys):
 
 
 def test_the_cli_takes_a_named_window_and_an_offset(fleet_fixture, capsys):
-    """§6: `--fleet` is the windowed surface on the CLI; the bare listing is not."""
+    """§6: `--fleet` is the windowed surface on the CLI; the bare listing is not"""
     from jarvis import cli
 
     wo = fleet_fixture.order(session_id="sess-a")
@@ -657,7 +636,7 @@ def test_the_cli_takes_a_named_window_and_an_offset(fleet_fixture, capsys):
 
     assert window["window"] == "5h" and window["offset"] == -2
     assert window["source"] == "session-window"
-    # The local clock the reset is specified in, beside the UTC label (§4).
+    # The local clock the reset is specified in, beside the UTC label (§4)
     assert window["local_label"] and "UTC" in window["label"]
     assert cli.main(["cost", "--fleet", "--window", "week", "--offset", "-1"]) == 0
     assert "usage week" not in capsys.readouterr().out
@@ -688,7 +667,7 @@ def test_the_cli_prints_the_local_window_beside_the_utc_one(fleet_fixture, capsy
 
 
 def test_the_cli_takes_a_display_zone(fleet_fixture, capsys):
-    """§11: `--tz` so the CLI label and the page label agree, and nothing else moves."""
+    """§11: `--tz` so the CLI label and the page label agree, and nothing else moves"""
     from jarvis import cli
 
     args = ["cost", "--fleet", "--json", "--since", "2026-09-29T04:00:00+00:00",
@@ -703,13 +682,13 @@ def test_the_cli_takes_a_display_zone(fleet_fixture, capsys):
     assert berlin["local_label"] == "2026-09-29 06:00 to 2026-10-06 06:00 CEST"
     assert (berlin["since"], berlin["until"]) == (plain["since"], plain["until"])
     assert berlin["label"] == plain["label"]
-    # A bad zone is the same refusal here as on the page, with a non-zero exit.
+    # A bad zone is the same refusal here as on the page, with a non-zero exit
     assert cli.main(args + ["--tz", "Mars/Olympus"]) == 1
     assert "is not a zone this report knows" in capsys.readouterr().err
 
 
 def test_the_default_render_names_subproc_and_shows_subagents(fleet_fixture, capsys):
-    """The `sub` column measured subprocesses; subagent spend was never printed at all."""
+    """The `sub` column measured subprocesses; subagent spend was never printed at all"""
     from jarvis import cli
 
     f = fleet_fixture
@@ -719,9 +698,7 @@ def test_the_default_render_names_subproc_and_shows_subagents(fleet_fixture, cap
                  subagents=[[f.call_row(at=T0 + 10, mid="s1", write=100_000,
                                         out=1_000)]])
 
-    # The span is explicit because `jarvis cost` now WINDOWS the listing — it resolves
-    # one window at the top and hands it to every payload builder, so the fixture's
-    # chosen timestamps have to be named (§10 of the usage-meter spec).
+    # The span is explicit because `jarvis cost` now WINDOWS the listing
     assert cli.main(["cost", "--since", "2026-09-29T04:00:00+00:00",
                      "--until", "2026-10-06T04:00:00+00:00"]) == 0
     out = capsys.readouterr().out
@@ -731,11 +708,7 @@ def test_the_default_render_names_subproc_and_shows_subagents(fleet_fixture, cap
     assert " sub " not in header, "the ambiguous name is gone"
 
 
-# -- 9. §10.5: the Bash command-shape classifier ---------------------------------------
-#
-# A TABLE, because the rules are ordered and first-match-wins: what breaks is never one
-# rule, it is two rules in the wrong order. The tie-break axis is WHAT PRODUCED THE
-# BYTES, not what clipped them, so every clipped variant below still names its producer.
+# -- 9. §10.5: the Bash command-shape classifier
 
 CLASSIFIER_CASES = [
     # one per shape the §10.5 table names, in rule order
@@ -774,28 +747,17 @@ def test_classify_command_table(command, shape):
 
 
 def test_classify_command_adversarial_strings():
-    """Two strings that break a naive classifier, and neither may raise.
-
-    A quoted ARGUMENT that reads like a `sed -n` range is not a file dump — posix
-    tokenizing is what keeps it out — and an UNBALANCED quote must fall back to
-    whitespace splitting rather than let `shlex`'s `ValueError` out into a report.
-    """
+    """Two strings that break a naive classifier, and neither may raise"""
     assert fleetcost.classify_command('git commit -m "use sed -n 1,5p"') == "other"
     assert fleetcost.classify_command("cat 'f.py | head") == "cat_file"
-    # Total: every string has a shape, and the degenerate ones are not a crash.
+    # Total: every string has a shape, and the degenerate ones are not a crash
     for odd in ("", "   ", "|", "&& ||", "sed", 'echo "unclosed', "\x01\x02"):
         assert fleetcost.classify_command(odd) in fleetcost.SHAPES
 
 
-# -- 10. §10.4/§10.6: what a tool cost, and what it CARRIED ----------------------------
-#
-# The quantity under test is not the result's size: it is the size times the number of
-# later API calls it rode along in. A 20k-token dump read 30 more times is a 600k-token
-# charge, which is why `carried_usd` is what the table sorts on.
+# -- 10. §10.4/§10.6: what a tool cost, and what it CARRIED
 
-#: One input token at list price for the fixture's model, and the two rates a carried
-#: result can be billed at. Read off `usage` rather than written down, for the same
-#: reason §10.4 reuses `prefix_rate`: a second copy of a price is a second answer.
+#: One input token at list price for the fixture's model
 OPUS = 5.0 / 1e6
 READ_RATE = 0.10
 WRITE_RATE = 1.25
@@ -814,7 +776,7 @@ def tool_costs(sessions, *, floor=5_000, since=SINCE, until=UNTIL, **cfg_keys):
 
 
 def test_carried_cost_stops_at_the_next_compaction(fleet_fixture):
-    """A compaction REPLACES the conversation, so the result stops being carried."""
+    """A compaction REPLACES the conversation, so the result stops being carried"""
     f = fleet_fixture
     f.transcript("sess-a", [
         f.call_row(at=T0, write=1_000, out=50, tools=[("t1", "Read", {})]),
@@ -837,7 +799,7 @@ def test_carried_cost_stops_at_the_next_compaction(fleet_fixture):
 
 
 def test_carried_cost_splits_read_ttl_and_prefix(fleet_fixture):
-    """TTL expiry and a prefix miss cost the same and have different fixes (§10.4)."""
+    """TTL expiry and a prefix miss cost the same and have different fixes (§10.4)"""
     f = fleet_fixture
     dump = "sed -n '1,50p' src/jarvis/usage.py"
     f.transcript("sess-a", [
@@ -862,8 +824,7 @@ def test_carried_cost_splits_read_ttl_and_prefix(fleet_fixture):
     assert shape["carried_read_usd"] + shape["carried_rewrite_ttl_usd"] + shape[
         "carried_rewrite_prefix_usd"] == pytest.approx(shape["carried_usd"])
 
-    # No floor configured: the TTL split is left OPEN. The field is None — never 0.00,
-    # which a renderer would print as "no TTL expiry" (usage.py's standing rule).
+    # No floor configured: the TTL split is left OPEN
     open_split = tool_costs(["sess-a"], floor=None)["by_tool"]["Bash"]
     assert open_split["carried_rewrite_ttl_usd"] is None
     assert open_split["carried_rewrite_prefix_usd"] == pytest.approx(
@@ -872,7 +833,7 @@ def test_carried_cost_splits_read_ttl_and_prefix(fleet_fixture):
 
 
 def test_main_and_subagent_are_a_partition(fleet_fixture):
-    """And a subagent's result rides on the SUBAGENT's calls, never the lead's."""
+    """And a subagent's result rides on the SUBAGENT's calls, never the lead's"""
     f = fleet_fixture
     f.transcript("sess-a", [
         f.call_row(at=T0, write=1_000, out=50, tools=[("t1", "Read", {})]),
@@ -894,14 +855,14 @@ def test_main_and_subagent_are_a_partition(fleet_fixture):
     assert (by_caller["main"]["result_tokens"]
             + by_caller["subagent"]["result_tokens"]) == totals["result_tokens"]
     assert by_caller["subagent"]["result_tokens"] == 90, "600 - 500 - 10"
-    # m3 at T0+20 is a LEAD call after the subagent's last one: not in its denominator.
+    # m3 at T0+20 is a LEAD call after the subagent's last one: not in its denominator
     assert tools["by_tool"]["Grep"]["carried_calls"] == 1
     assert tools["by_tool"]["Read"]["carried_calls"] == 2
     assert "by_caller" not in by_caller["main"], "two levels deep, never recursive"
 
 
 def test_error_results_are_counted_and_not_averaged_away(fleet_fixture):
-    """A refused call returns a two-line refusal: counted, never averaged in silently."""
+    """A refused call returns a two-line refusal: counted, never averaged in silently"""
     f = fleet_fixture
     f.transcript("sess-a", [
         f.call_row(at=T0, write=1_000, out=50, tools=[
@@ -922,7 +883,7 @@ def test_error_results_are_counted_and_not_averaged_away(fleet_fixture):
 
 
 def test_an_unmatched_call_is_excluded_not_zero_filled(fleet_fixture):
-    """The turn was killed between the `tool_use` and its result."""
+    """The turn was killed between the `tool_use` and its result"""
     f = fleet_fixture
     f.transcript("sess-a", [
         f.call_row(at=T0, write=1_000, out=50, tools=[("t1", "Read", {})]),
@@ -971,7 +932,7 @@ TOOL_COST_KEYS = {
 
 
 def test_tools_payload_keys_stable(fleet_fixture):
-    """§7.9's guard, one level down: a renderer must not be able to rename a field."""
+    """§7.9's guard, one level down: a renderer must not be able to rename a field"""
     f = fleet_fixture
     wo = f.order(session_id="sess-a")
     f.turn(wo, started_at=T0, ended_at=T0 + 100, cost_usd=1.0)
@@ -995,8 +956,7 @@ def test_tools_payload_keys_stable(fleet_fixture):
     assert set(tools["totals"]) == TOOL_COST_KEYS
     bash = tools["by_tool"]["Bash"]
     assert set(bash) == TOOL_COST_KEYS | {"shapes"}, "shapes are Bash's alone"
-    # A shape keeps `by_caller` — the table has a main/sub column on every row — and
-    # the caller level carries neither, so the structure cannot recurse.
+    # A shape keeps `by_caller` — the table has a main/sub column on every row
     assert set(bash["shapes"]["cat_file"]) == TOOL_COST_KEYS
     assert set(bash["by_caller"]["main"]) == TOOL_COST_KEYS - {"by_caller"}
     assert "shapes" not in tools["by_tool"]["Bash"]["by_caller"]["main"]
@@ -1005,7 +965,7 @@ def test_tools_payload_keys_stable(fleet_fixture):
 
 
 def test_tools_respects_max_orders(fleet_fixture):
-    """The cap is `cost.max_orders`, applied before anything reads a transcript."""
+    """The cap is `cost.max_orders`, applied before anything reads a transcript"""
     f = fleet_fixture
     f.set_cost(max_orders=1)
     for i in range(3):
@@ -1037,7 +997,7 @@ def test_an_order_with_no_transcript_is_counted_not_dropped(fleet_fixture):
 
 
 def test_tools_read_only(fleet_fixture, monkeypatch):
-    """Not one byte written to a project DB or to a transcript the report measures."""
+    """Not one byte written to a project DB or to a transcript the report measures"""
     f = fleet_fixture
     wo = f.order(session_id="sess-a")
     f.turn(wo, started_at=T0, ended_at=T0 + 100, cost_usd=1.0)
@@ -1062,13 +1022,11 @@ def test_tools_read_only(fleet_fixture, monkeypatch):
     assert (f.db.stat().st_mtime_ns, transcript.stat().st_mtime_ns) == before
 
 
-# Cases 13-18: the window bound, docs/superpowers/specs/2026-10-08-cost-tool-section-
-# window-clip.md §1-§4. A result counts only if its own `ts` is in `[since, until)`, and
-# the carried ride stops at `until` as well as at the next compaction.
+# Cases 13-18: the window bound, docs/superpowers/specs/2026-10-08-cost-tool-section- window-clip.md...
 
 
 def test_a_result_before_since_is_excluded(fleet_fixture):
-    """`result.ts` is the selector: a result landing before the window is not in it."""
+    """`result.ts` is the selector: a result landing before the window is not in it"""
     f = fleet_fixture
     f.transcript("sess-a", [
         f.call_row(at=SINCE - 120, write=1_000, out=50, tools=[("t1", "Read", {})]),
@@ -1092,7 +1050,7 @@ def test_a_result_before_since_is_excluded(fleet_fixture):
 
 
 def test_a_result_after_until_is_excluded(fleet_fixture):
-    """Half-open: a result at EXACTLY `until` is out, which no other case would catch."""
+    """Half-open: a result at EXACTLY `until` is out, which no other case would catch"""
     f = fleet_fixture
     f.transcript("sess-a", [
         f.call_row(at=T0, write=1_000, out=50, tools=[("t1", "Read", {})]),
@@ -1119,7 +1077,7 @@ def test_a_result_after_until_is_excluded(fleet_fixture):
 
 
 def test_carried_range_is_truncated_at_until(fleet_fixture):
-    """The case the fix exists for: a result in the window, a ride that left it."""
+    """The case the fix exists for: a result in the window, a ride that left it"""
     f = fleet_fixture
     rows = [
         f.call_row(at=UNTIL - 200, write=1_000, out=50, tools=[("t1", "Read", {})]),
@@ -1135,12 +1093,10 @@ def test_carried_range_is_truncated_at_until(fleet_fixture):
 
     assert read["carried_calls"] == 2, "the two calls before until, never the two after"
     assert read["carried_tokens"] == 300
-    # Priced the way §10.4's own test prices, so the two post-`until` calls cannot hide
-    # inside a tolerance.
+    # Priced the way §10.4's own test prices, so the two post-`until` calls cannot hide inside a tolerance
     assert read["carried_usd"] == pytest.approx(150 * OPUS * 2 * READ_RATE)
 
-    # A compaction BEFORE until: the ride stops there, proving the min() and not
-    # "whichever bound was added last".
+    # A compaction BEFORE until: the ride stops there
     f.transcript("sess-b", [*rows[:3], f.compact_row(at=UNTIL - 85), *rows[3:]])
     compacted = tool_costs(["sess-b"])["by_tool"]["Read"]
 
@@ -1149,7 +1105,7 @@ def test_carried_range_is_truncated_at_until(fleet_fixture):
 
 
 def test_excluded_outside_window_counts_results(fleet_fixture):
-    """Each exclusion counted once, in its own key: matched check first, window second."""
+    """Each exclusion counted once, in its own key: matched check first, window second"""
     f = fleet_fixture
     f.transcript("sess-a", [
         f.call_row(at=SINCE - 120, write=1_000, out=50,
@@ -1157,7 +1113,7 @@ def test_excluded_outside_window_counts_results(fleet_fixture):
         f.result_row(("a1", "x" * 20), at=SINCE - 60),
         f.result_row(("a2", "x" * 20), at=SINCE - 50),
         f.call_row(at=SINCE - 40, read=1_200, mid="m2"),
-        # In-window and UNMATCHED: its own key, never `outside_window`.
+        # In-window and UNMATCHED: its own key, never `outside_window`
         f.call_row(at=T0, write=1_000, out=50, mid="m3", tools=[("b1", "Read", {})]),
         f.call_row(at=T0 + 2, read=1_200, mid="m4", tools=[("c1", "Read", {})]),
         f.result_row(("c1", "x" * 40), at=UNTIL + 10),
@@ -1173,7 +1129,7 @@ def test_excluded_outside_window_counts_results(fleet_fixture):
 
 
 def test_subagent_results_are_clipped_too(fleet_fixture):
-    """Clipping only the main chain would leave most of the over-count in place."""
+    """Clipping only the main chain would leave most of the over-count in place"""
     f = fleet_fixture
     f.transcript("sess-a", [
         f.call_row(at=T0, write=1_000, out=50, tools=[("t1", "Read", {})]),
@@ -1203,7 +1159,7 @@ def test_subagent_results_are_clipped_too(fleet_fixture):
 
 
 def test_tool_carried_usd_never_exceeds_window_spend(fleet_fixture):
-    """§8's acceptance criterion: a share cannot exceed its whole. An INEQUALITY."""
+    """§8's acceptance criterion: a share cannot exceed its whole"""
     f = fleet_fixture
     wo = f.order(session_id="sess-a")
     f.turn(wo, started_at=T0, ended_at=T0 + 100, cost_usd=1.0)
@@ -1212,7 +1168,7 @@ def test_tool_carried_usd_never_exceeds_window_spend(fleet_fixture):
                    tools=[("t1", "Bash", {"command": "sed -n '1,900p' f"})]),
         f.result_row(("t1", "x" * 4_000), at=T0 + 1),
         f.call_row(at=T0 + 10, read=50_000, input=200, out=100, mid="m2"),
-        # The session ran on for weeks past the window.
+        # The session ran on for weeks past the window
         *[f.call_row(at=UNTIL + 100 * i, read=50_000, input=200, out=100, mid=f"L{i}")
           for i in range(1, 9)],
     ])
@@ -1223,13 +1179,12 @@ def test_tool_carried_usd_never_exceeds_window_spend(fleet_fixture):
     spend = (per_order["avg"] or 0.0) * per_order["n"]
 
     assert tools["totals"]["carried_usd"] <= spend
-    # And strictly less than the unclipped walk, so a revert FAILS instead of passing
-    # vacuously on a fixture where the two happen to agree.
+    # And strictly less than the unclipped walk
     unclipped = tool_costs(["sess-a"], until=UNTIL + 10_000_000)
     assert tools["totals"]["carried_usd"] < unclipped["totals"]["carried_usd"]
 
 
-# -- 11. §10.7: the render --------------------------------------------------------------
+# -- 11. §10.7: the render
 
 
 def test_the_cli_renders_the_tool_table(fleet_fixture, capsys):
@@ -1254,14 +1209,12 @@ def test_the_cli_renders_the_tool_table(fleet_fixture, capsys):
     rows = [line for line in out.splitlines() if line.startswith(("Bash", "Read"))]
     assert rows[0].startswith("Bash · sed_range"), "carried $ descending"
     assert "main/sub" in out
-    # Bash is one row PER SHAPE and never also a total line: two rows that sum to a
-    # third invite the reader to add the wrong pair (§10.7).
+    # Bash is one row PER SHAPE and never also a total line: two rows that sum to a third invite the...
     assert not any(line.strip() == "Bash" for line in out.splitlines())
 
 
 def test_the_render_truncates_at_cost_tool_rows(fleet_fixture, capsys):
-    """At most `cost.tool_rows` rows, and a long tool name is elided for DISPLAY only:
-    the `--json` payload always carries it in full."""
+    """At most `cost.tool_rows` rows, and a long tool name is elided for DISPLAY only: the `--json`..."""
     from jarvis import cli
 
     f = fleet_fixture
@@ -1290,7 +1243,7 @@ def test_the_render_truncates_at_cost_tool_rows(fleet_fixture, capsys):
 
 
 def test_the_dashboard_renders_the_same_payload(fleet_fixture):
-    """No second computation: the partial reads `fleet.tools` and nothing else."""
+    """No second computation: the partial reads `fleet.tools` and nothing else"""
     import jinja2
 
     from jarvis.ui.app import TEMPLATES
@@ -1315,7 +1268,7 @@ def test_the_dashboard_renders_the_same_payload(fleet_fixture):
 
 
 def _window_hid_one(f):
-    """A transcript with exactly one matched result PAST `until`, and one inside it."""
+    """A transcript with exactly one matched result PAST `until`, and one inside it"""
     wo = f.order(session_id="sess-a")
     f.turn(wo, started_at=T0, ended_at=T0 + 100, cost_usd=1.0)
     f.transcript("sess-a", [
@@ -1331,7 +1284,7 @@ def _window_hid_one(f):
 
 
 def test_the_render_names_what_the_window_hid(fleet_fixture, capsys):
-    """§10.7: the clip is DISCLOSED with its count, and silent when nothing was hidden."""
+    """§10.7: the clip is DISCLOSED with its count, and silent when nothing was hidden"""
     from jarvis import cli
 
     _window_hid_one(fleet_fixture)
@@ -1341,15 +1294,14 @@ def test_the_render_names_what_the_window_hid(fleet_fixture, capsys):
     out = capsys.readouterr().out
     assert "1 tool results outside the window, excluded" in out
 
-    # The same state with a window wide enough to contain everything: nothing hidden,
-    # so the sentence must not appear at all.
+    # The same state with a window wide enough to contain everything: nothing hidden
     assert cli.main(["cost", "--fleet", "--since", "2026-09-29T04:00:00+00:00",
                      "--until", "2027-10-06T04:00:00+00:00"]) == 0
     assert "tool results outside the window, excluded" not in capsys.readouterr().out
 
 
 def test_the_dashboard_names_what_the_window_hid(fleet_fixture):
-    """The HTML footer discloses the same count from the same payload key."""
+    """The HTML footer discloses the same count from the same payload key"""
     import jinja2
 
     from jarvis.ui.app import TEMPLATES

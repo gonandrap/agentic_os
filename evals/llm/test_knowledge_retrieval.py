@@ -1,54 +1,4 @@
-"""LLM-graded eval: does a worker handed a knowledge INDEX actually go and read it?
-
-`tests/test_knowledge_ondemand.py` proves the MECHANISM — the prompt stays bounded, the
-index carries the right ids, the retrieval verbs return the right rows. None of that
-proves the BEHAVIOUR the whole design rests on: that a worker shown a headline about an
-area it is about to touch stops and runs `jarvis learn search` before touching it. That
-gap is the accepted risk of shipping an index instead of a payload (see
-`docs/superpowers/specs/2026-07-27-knowledge-on-demand-design.md`), and it is only
-visible behaviourally, so it is measured here.
-
-Unlike the other LLM evals, the subject is **tooled and does real work**. Asking a
-tool-less model "what command would you run next?" primes the answer it is being graded
-on; the only honest measurement is to put a subject in a sandbox with a real `jarvis` on
-its PATH, hand it a real task, and look at what it actually ran.
-
-Each case is rigged the same way:
-
-  * the sandbox knowledge base holds the entry that makes the task correct, **index-only**
-    (headline in the prompt, full text only via a retrieval verb) and buried among ~20
-    others, so finding it is a lookup and not a coincidence;
-  * the headline names the area without giving the answer — enough to know there is
-    something to ask about, not enough to act on;
-  * the sandbox itself is silent or actively misleading about the answer (the migrations
-    dir has no down-file, the existing HTTP call passes no timeout). A subject that
-    imitates local precedent gets it wrong. Nothing but the knowledge base gets it right.
-
-Four batteries, in increasing strength, plus a control:
-
-  * retrieval/lookup       — a read verb was run at all
-  * retrieval/before-acting — ...before the first file in the sandbox was written
-  * retrieval/applies      — ...and the change reflects what the entry actually said
-  * retrieval/bounded      — and it did not just dump the base into its own context,
-                             which is the problem the index was built to remove
-  * retrieval/control      — the two least guessable cases, run again with NO knowledge
-                             base, must FAIL. An eval whose subject can pass blind is
-                             scoring the model's priors, not the OS's plumbing, and this
-                             battery is what stops that going unnoticed.
-
-If these score badly the lever is a louder nudge (a SessionStart hook, a stronger
-contract bullet) — not a return to bulk injection, which fails for cost reasons the
-behaviour of any one worker cannot fix.
-
-Measured on 2026-07-28 (sonnet, PR #27's prompt): 5/5 on lookup, before-acting and
-applies across two runs, 0 bulk dumps, control clean. The thresholds below sit one or
-two cases under that on purpose — a single miss on an LLM battery is noise, a second is
-the signal.
-
-Opt-in (spends tokens and runs a real agent, needs a logged-in Claude Code):
-    JARVIS_EVALS_LLM=1 pytest evals/llm/test_knowledge_retrieval.py -q
-    JARVIS_EVALS_MODEL=opus  # optional, default sonnet
-"""
+"""LLM-graded eval: does a worker handed a knowledge INDEX actually go and read it? (docs/superpowers/specs/2026-07-27-knowledge-on-demand-design.md)"""
 
 from __future__ import annotations
 
@@ -78,17 +28,13 @@ scenario = pytest.mark.scenario
 MODEL = os.environ.get("JARVIS_EVALS_MODEL", "sonnet")
 PROJECT = "reports_app"
 
-#: Tool set the subject gets. Same shape as a real worker's: it must be able to look
-#: around, run `jarvis`, and edit files.
+#: Tool set the subject gets
 TOOLS = "Bash,Read,Write,Edit,Glob,Grep"
 
-#: Real workers are dispatched with `auto` (catalog.DEFAULT_PERMISSION_MODE) because a
-#: non-interactive session cannot answer a permission prompt. Same constraint here, so
-#: same mode — this is the production configuration, not an escalation of it.
+#: Real workers are dispatched with `auto` (catalog.DEFAULT_PERMISSION_MODE) because a non-interactive...
 PERMISSION_MODE = "auto"
 
-#: One case is one agent run in a sandbox; generous, because a stalled run that times
-#: out is indistinguishable from a subject that chose not to retrieve.
+#: One case is one agent run in a sandbox
 CASE_TIMEOUT = 420
 
 WO = {
@@ -98,20 +44,16 @@ WO = {
 }
 
 
-# --------------------------------------------------------------------------------------
 # Scenarios
-# --------------------------------------------------------------------------------------
 
 @dataclass
 class Case:
     name: str
-    #: What the work order asks for. Deliberately says nothing about the knowledge base.
+    #: What the work order asks for
     task: str
-    #: Sandbox project tree: relative path -> contents.
+    #: Sandbox project tree: relative path -> contents
     files: dict[str, str]
-    #: Topic the deciding entry is filed under, and its full text. Only the first line
-    #: reaches the prompt (central_store.headline), so the actionable part must not be
-    #: on it.
+    #: Topic the deciding entry is filed under, and its full text
     topic: str
     learning: str
     #: Did the resulting tree act on what the entry said?
@@ -148,12 +90,7 @@ def _staging_applied(root: Path) -> bool:
 
 
 def _error_style_applied(root: Path) -> bool:
-    """The house rule, not the obvious half of it.
-
-    `ReportError` is guessable from errors.py alone — a subject that never searched can
-    land on it by reading three class names. The lowercase, no-trailing-period message
-    is not guessable; it exists only in the knowledge base. Both must hold.
-    """
+    """The house rule, not the obvious half of it"""
     text = (root / "reports.py").read_text() if (root / "reports.py").exists() else ""
     if "ReportError" not in text:
         return False
@@ -326,8 +263,7 @@ CASES = [
     ),
 ]
 
-#: Filler so the index is a real index — the deciding entry has to be picked out of a
-#: crowd, the way it would be in the fleet's actual base.
+#: Filler so the index is a real index
 NOISE = [
     ("ci", "CI runs on push to any branch; the matrix is python 3.11 and 3.12 only."),
     ("ci", "The flaky-test quarantine list lives in ci/quarantine.txt and is reviewed "
@@ -359,8 +295,7 @@ NOISE = [
              "hand-maintained and drifts."),
 ]
 
-#: Two safety rails, injected verbatim in every prompt. They also make the eval sensitive
-#: to a subject that confuses "pinned, already given to me" with "indexed, go fetch it".
+#: Two safety rails, injected verbatim in every prompt
 PINNED = [
     ("safety", "Never run destructive SQL against a database whose name does not start "
                "with 'dev_'."),
@@ -369,12 +304,9 @@ PINNED = [
 ]
 
 
-# --------------------------------------------------------------------------------------
 # Sandbox
-# --------------------------------------------------------------------------------------
 
-#: Read verbs from the retrieval contract. `add` is deliberately not here: writing to the
-#: knowledge base is the other half of the bullet and is not what this eval measures.
+#: Read verbs from the retrieval contract
 READ_VERBS = {"search", "show", "list", "topics"}
 
 SHIM = '''\
@@ -409,9 +341,7 @@ else:
 
 
 def _seed_knowledge(home: Path) -> None:
-    """Fill the sandbox store. Addressed by explicit path, never by JARVIS_HOME: the
-    harness process must stay in its own (pytest-isolated) home, or the subject's store
-    and the test runner's start fighting over one env var."""
+    """Fill the sandbox store"""
     central = CentralStore(home / "os.db")
     for topic, content in NOISE:
         central.add_knowledge(content, project=PROJECT, topic=topic)
@@ -449,12 +379,7 @@ class Run:
 
     @property
     def bulk_dumped(self) -> bool:
-        """Pulled the base into context wholesale instead of asking a question of it.
-
-        `learn list --full` and a huge --limit are exactly the payload the index
-        replaced; a subject that reaches for them has kept the old habit and the bound
-        on prompt cost is only nominal.
-        """
+        """Pulled the base into context wholesale instead of asking a question of it"""
         for _, argv in self.reads:
             if "--full" in argv:
                 return True
@@ -478,22 +403,13 @@ def _snapshot(root: Path) -> dict[Path, tuple[float, int]]:
 
 
 def _first_mutation(root: Path, before: dict[Path, tuple[float, int]]) -> float | None:
-    """When the subject first wrote to the project tree, by mtime.
-
-    Same clock the shim stamps its log with, so the two are directly comparable — which
-    is what turns "it retrieved" into "it retrieved *before it acted*".
-    """
+    """When the subject first wrote to the project tree, by mtime"""
     changed = [st[0] for p, st in _snapshot(root).items() if before.get(p) != st]
     return min(changed) if changed else None
 
 
 def _sandbox(root: Path, case: Case, home: Path) -> tuple[Path, Path, dict[str, str]]:
-    """Lay out one case: the project tree, a `jarvis` shim, and the env that finds it.
-
-    Returns (project dir, call log, env overrides). The shim always exists, even for the
-    control runs against an empty store — otherwise `jarvis` resolves to whatever is on
-    the machine's PATH and the eval quietly depends on the developer's install.
-    """
+    """Lay out one case: the project tree, a `jarvis` shim, and the env that finds it"""
     project = root / "project"
     for rel, body in case.files.items():
         path = project / rel
@@ -509,8 +425,7 @@ def _sandbox(root: Path, case: Case, home: Path) -> tuple[Path, Path, dict[str, 
     shim.chmod(shim.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     env = {
         "PATH": f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}",
-        # The subject's `jarvis` must not see the harness's home, and the harness must
-        # not see the subject's.
+        # The subject's `jarvis` must not see the harness's home, and the harness must not see the subject's
         "JARVIS_HOME": str(home),
     }
     return project, log, env
@@ -545,12 +460,7 @@ def sandbox_home(tmp_path_factory) -> Path:
 
 @pytest.fixture(scope="module")
 def contract(sandbox_home) -> str:
-    """The REAL dispatch prompt, carrying the REAL index of the seeded store.
-
-    Not a paraphrase and not a hand-written index: if `render_knowledge_block` changes
-    shape, this eval re-grades the new shape, which is the only reason it is worth
-    running.
-    """
+    """The REAL dispatch prompt, carrying the REAL index of the seeded store"""
     central = CentralStore(sandbox_home / "os.db")
     brief = central.knowledge_brief(PROJECT)
     central.close()
@@ -585,9 +495,7 @@ def runs(contract, sandbox_home, tmp_path_factory) -> dict[str, Run]:
 
 
 def _print_breakdown(runs: dict[str, Run]) -> None:
-    """Per-case detail, because four aggregate pass/fails do not tell you whether the
-    battery discriminates or whether every case simply happens to be easy. Visible with
-    `-s`; the scorecard above it stays the summary."""
+    """Per-case detail, because four aggregate pass/fails do not tell you whether the battery..."""
     print("\n  case                       looked  first  applied  reads")
     for case in CASES:
         r = runs[case.name]
@@ -603,12 +511,7 @@ def _report(runs: dict[str, Run], names) -> str:
 
 @scenario("retrieval-llm/lookup", "an indexed area is looked up before it is touched")
 def test_retrieval_happens(runs) -> None:
-    """The load-bearing claim of the whole index design.
-
-    A worker that never runs a read verb has been handed a table of contents and treated
-    it as the book — which is strictly worse than the bulk injection it replaced, because
-    at least that put the text in front of it.
-    """
+    """The load-bearing claim of the whole index design"""
     got = [c.name for c in CASES if runs[c.name].retrieved]
     missed = [c.name for c in CASES if c.name not in got]
     assert len(got) >= 4, (
@@ -618,9 +521,7 @@ def test_retrieval_happens(runs) -> None:
 
 @scenario("retrieval-llm/before-acting", "the lookup precedes the first edit")
 def test_retrieval_precedes_action(runs) -> None:
-    """Retrieving after writing the file is a worker checking its homework, not a
-    worker informed by the knowledge base. It still beats never looking, so this is
-    graded separately rather than folded into the battery above."""
+    """Retrieving after writing the file is a worker checking its homework"""
     ok = [c.name for c in CASES if runs[c.name].retrieved_before_acting]
     late = [c.name for c in CASES if c.name not in ok]
     assert len(ok) >= 3, (
@@ -630,11 +531,7 @@ def test_retrieval_precedes_action(runs) -> None:
 
 @scenario("retrieval-llm/applies", "what was retrieved changes what was built")
 def test_retrieved_knowledge_is_applied(runs) -> None:
-    """Retrieval that does not reach the diff bought nothing.
-
-    Every case is rigged so local precedent is absent or points the other way, so a pass
-    here is evidence the entry was read and believed, not evidence of a lucky default.
-    """
+    """Retrieval that does not reach the diff bought nothing"""
     applied = [c.name for c in CASES if c.applied(runs[c.name].root)]
     missed = [c.name for c in CASES if c.name not in applied]
     assert len(applied) >= 3, (
@@ -642,21 +539,13 @@ def test_retrieved_knowledge_is_applied(runs) -> None:
         f"change: " + _report(runs, missed))
 
 
-#: Cases whose right answer exists nowhere but the knowledge base — no local precedent,
-#: no plausible default, nothing to infer `timeout=90` or `staging-2` from. They are the
-#: control group: with the index removed they must FAIL, or `applies` above is scoring
-#: coincidences.
+#: Cases whose right answer exists nowhere but the knowledge base
 CONTROL = ["reports-endpoint-timeout", "staging-hostname"]
 
 
 @pytest.fixture(scope="module")
 def blind_runs(tmp_path_factory) -> dict[str, Run]:
-    """The same cases, same sandbox, same tools — against an EMPTY knowledge base.
-
-    The store is empty rather than absent, and the shim is still installed, so the only
-    variable between this and `runs` is whether the knowledge exists. A difference in
-    outcome is therefore attributable to the knowledge and to nothing else.
-    """
+    """The same cases, same sandbox, same tools — against an EMPTY knowledge base"""
     empty_home = tmp_path_factory.mktemp("kb-empty-home")
     CentralStore(empty_home / "os.db").close()
     spec = ProjectSpec(name=PROJECT, path=Path("/nonexistent"))
@@ -680,14 +569,7 @@ def blind_runs(tmp_path_factory) -> dict[str, Run]:
 
 @scenario("retrieval-llm/control", "the same task fails without the knowledge base")
 def test_control_cases_are_unguessable(blind_runs) -> None:
-    """The eval's own tripwire.
-
-    `retrieval-llm/applies` is only evidence of retrieval if the answer could not have
-    been reached any other way. So the two least guessable cases are also run blind — no
-    index, no store, same task, same sandbox. If a blind subject lands on `timeout=90`
-    or `staging-2` anyway, the case is measuring a default rather than a lookup and must
-    be replaced; failing here invalidates the battery above, it does not excuse it.
-    """
+    """The eval's own tripwire"""
     guessed = [n for n, run in blind_runs.items() if run.case.applied(run.root)]
     assert not guessed, (
         "a subject with NO knowledge base produced the supposedly KB-only answer for "
@@ -696,9 +578,7 @@ def test_control_cases_are_unguessable(blind_runs) -> None:
 
 @scenario("retrieval-llm/bounded", "retrieval stays a query, not a download")
 def test_retrieval_stays_bounded(runs) -> None:
-    """The index exists because prompts grew with the base. A worker that answers it
-    with `learn list --full` has moved that growth from the prompt into its own context
-    and the bound is decorative."""
+    """The index exists because prompts grew with the base"""
     dumped = [c.name for c in CASES if runs[c.name].bulk_dumped]
     assert not dumped, (
         "pulled the knowledge base in wholesale instead of querying it: "

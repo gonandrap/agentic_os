@@ -1,16 +1,4 @@
-"""A validation round whose seats could not AUTHENTICATE waits. GitHub issue #778.
-
-The live failure is wo-ea5b9856, wo-3a7d9bda, wo-15f5d969 and wo-8d964c56, 2026-09-25/26:
-all four seats died in ~1.5s each with `failed (rc=1): Failed to authenticate: OAuth
-session expired and could not be refreshed` — the usage window had just reopened and many
-`claude` processes raced one OAuth refresh — and every one of those rounds was closed
-`escalated` on the FIRST failure, spent a round number and was never retried. The same
-accounts' worker turns recovered by themselves through `worker_session.PAUSE_AUTH`.
-
-These drive the REAL `Daemon._validate_work_order` and the real `validation.decide`: the
-defect spans the transport's classification, the seat, the panel's verdict and the round
-machine, and a test of any one of them alone passed throughout.
-"""
+"""A validation round whose seats could not AUTHENTICATE waits (#778)"""
 
 from __future__ import annotations
 
@@ -31,8 +19,7 @@ from jarvis.timeline import _describe
 from tests.test_validation_loop import (  # noqa: F401
     Validator, fleet, finish, passed)
 
-#: The refusal exactly as the four live rounds carried it — never reworded: the anchor in
-#: `claude_cli._AUTH_RE` is what this string has to keep matching.
+#: The refusal exactly as the four live rounds carried it
 AUTH = "Failed to authenticate: OAuth session expired and could not be refreshed"
 
 REFUSAL = "You've hit your session limit · resets 11:50pm (America/Los_Angeles)"
@@ -59,12 +46,11 @@ def _auth_events(store, wo_id):
             if db.from_json(e["payload"], {}).get("cause") == VALIDATION_AUTH_CAUSE]
 
 
-# -- 1. the transport: where the classification has to happen --------------------------
+# -- 1. the transport: where the classification has to happen
 
 
 def test_an_auth_failure_in_the_result_envelope_is_classified_at_the_transport():
-    """Spec §2. The seat sees an exception, so `_cli_failure` is the last place the text
-    is still the CLI's own — and `.auth.message` must keep the live string."""
+    """Spec §2"""
     envelope = '{"type":"result","subtype":"error","is_error":true,"result":"%s"}' % AUTH
     error = claude_cli._cli_failure(["-p", "judge"], 1, envelope, "")
 
@@ -74,8 +60,7 @@ def test_an_auth_failure_in_the_result_envelope_is_classified_at_the_transport()
 
 
 def test_the_transcript_shaped_stderr_carrier_is_classified_too():
-    """Spec §2. `claude -p` wrote neither result JSON nor stderr on 2026-08-27 and the
-    reason came back off the transcript, so the other carrier must classify as well."""
+    """Spec §2"""
     error = claude_cli._cli_failure(["-p", "judge"], 1, "", AUTH)
 
     assert isinstance(error, AuthFailureError)
@@ -83,8 +68,7 @@ def test_the_transcript_shaped_stderr_carrier_is_classified_too():
 
 
 def test_a_usage_refusal_in_the_same_envelope_still_wins():
-    """Spec §2: the auth branch sits AFTER the usage one. A spent window is the failure
-    that states a deadline, and reading one as an auth hold would drop that moment."""
+    """Spec §2: the auth branch sits AFTER the usage one"""
     envelope = '{"result":"%s\\n%s"}' % (REFUSAL, AUTH)
     error = claude_cli._cli_failure(["-p", "judge"], 1, envelope, "")
 
@@ -93,10 +77,7 @@ def test_a_usage_refusal_in_the_same_envelope_still_wins():
 
 
 def test_the_prefix_is_why_the_classification_cannot_live_on_op_raw():
-    """Spec §2, the correction this spec makes: `_AUTH_RE` is `^`-anchored under
-    MULTILINE — deliberately, so a worker writing PROSE about an expired login is not
-    read as one — and the seat's `raw` is the PREFIXED message. A classifier reading it
-    would silently keep escalating, which is the defect."""
+    """Spec §2, the correction this spec makes: `_AUTH_RE` is `^`-anchored under MULTILINE"""
     prefixed = str(claude_cli._cli_failure(["-p", "judge"], 1, "", "boom: " + AUTH))
 
     assert "failed (rc=1)" in prefixed
@@ -105,8 +86,7 @@ def test_the_prefix_is_why_the_classification_cannot_live_on_op_raw():
 
 def test_a_seat_that_could_not_authenticate_abstains_and_carries_it(monkeypatch,
                                                                     tmp_path):
-    """Spec §2: carried, never raised — one seat that cannot authenticate must not take
-    down a panel the other three answered. That call belongs to `decide`."""
+    """Spec §2: carried, never raised"""
     monkeypatch.setattr(claude_cli, "run_headless_result",
                         lambda *a, **k: (_ for _ in ()).throw(auth_error()))
     op = seats._run_seat("tester", "p", "s", "sonnet", 10, tmp_path,
@@ -116,7 +96,7 @@ def test_a_seat_that_could_not_authenticate_abstains_and_carries_it(monkeypatch,
     assert op.auth is not None and AUTH in op.auth.message
 
 
-# -- 2. the panel's classifier ---------------------------------------------------------
+# -- 2. the panel's classifier
 
 
 def _packet() -> EvidencePacket:
@@ -129,11 +109,7 @@ def _packet() -> EvidencePacket:
 
 @pytest.fixture()
 def panel(tmp_path, jarvis_home, monkeypatch):
-    """`decide` over opinions the test writes, with no seat ever called.
-
-    The classifier is the unit under test and the seats are scenery: what matters is
-    which exception one all-down round raises, and per-seat evidence exists nowhere else.
-    """
+    """`decide` over opinions the test writes, with no seat ever called"""
     store = ProjectStore(tmp_path / "proj")
     wo = store.create_work_order("t")
     row = store.open_validation_round(wo_id=wo["id"], fingerprint="f")
@@ -154,8 +130,7 @@ def _down(seat: str, **kw) -> seats.Opinion:
 
 
 def test_a_panel_that_could_not_authenticate_raises_rather_than_escalating(panel):
-    """Spec §1, step 2, and the defect in one line: `escalated` is COUNTED and terminal,
-    so the first auth failure spent the round and a user's attention."""
+    """Spec §1, step 2, and the defect in one line: `escalated` is COUNTED and terminal"""
     with pytest.raises(AuthFailureError) as caught:
         panel([_down(s, auth=AuthFailure(message=AUTH))
                for s in ("tester", "security", "architect", "product")])
@@ -164,9 +139,7 @@ def test_a_panel_that_could_not_authenticate_raises_rather_than_escalating(panel
 
 
 def test_one_seat_failing_on_auth_is_enough_when_no_seat_replied(panel):
-    """Spec §1: ANY seat for the auth branch, unlike the transient one below. Four seats
-    that each died differently with one of them refused on auth is still an account that
-    cannot answer, and retrying costs ~1.5s and zero tokens."""
+    """Spec §1: ANY seat for the auth branch, unlike the transient one below"""
     with pytest.raises(AuthFailureError):
         panel([_down("tester", auth=AuthFailure(message=AUTH)),
                seats.Opinion(seat="security", raw="boom", status="abstained",
@@ -174,8 +147,7 @@ def test_one_seat_failing_on_auth_is_enough_when_no_seat_replied(panel):
 
 
 def test_a_seat_carrying_both_a_refusal_and_an_auth_failure_takes_the_usage_branch(panel):
-    """Spec §1, the ordering pin: the usage-window branch is first and is today's
-    behaviour byte for byte."""
+    """Spec §1, the ordering pin: the usage-window branch is first and is today's behaviour byte for byte"""
     with pytest.raises(UsageLimitError) as caught:
         panel([_down("tester", refused=UsageLimit(message=REFUSAL, reset_at=1.0),
                      auth=AuthFailure(message=AUTH))])
@@ -184,9 +156,7 @@ def test_a_seat_carrying_both_a_refusal_and_an_auth_failure_takes_the_usage_bran
 
 
 def test_a_panel_that_is_genuinely_down_still_reaches_the_transport_budget(panel):
-    """Spec §1, step 3: ALL seats transient raises a PLAIN `ClaudeCliError`, so the
-    existing `_validation_outage` budget applies unchanged. Not a subclass — the branch
-    that must own this is the generic one."""
+    """Spec §1, step 3: ALL seats transient raises a PLAIN `ClaudeCliError`"""
     with pytest.raises(claude_cli.ClaudeCliError) as caught:
         panel([seats.Opinion(seat=s, raw="API Error: 503 upstream connect error",
                              status="abstained", replied=False)
@@ -196,13 +166,7 @@ def test_a_panel_that_is_genuinely_down_still_reaches_the_transport_budget(panel
 
 
 def test_a_seat_that_replied_garbage_still_escalates(panel, monkeypatch):
-    """Spec §1: the `replied` gate above the branch is untouched. A seat that replied,
-    even with something nobody can parse, counts as reached — and silence is not a pass,
-    so this is still a human's problem, raised by nothing.
-
-    The chair reaches no verdict, so `escalated` comes from where it always did — the
-    fall-through that fails toward the user — and never from the auth branch.
-    """
+    """Spec §1: the `replied` gate above the branch is untouched"""
     monkeypatch.setattr(claude_cli, "run_headless_result",
                         lambda *a, **k: claude_cli.HeadlessResult(
                             text="the chair said nothing parseable", usage={}))
@@ -213,12 +177,11 @@ def test_a_seat_that_replied_garbage_still_escalates(panel, monkeypatch):
     assert verdict["outcome"] == "escalated"
 
 
-# -- 3. the round machine: held, not spent --------------------------------------------
+# -- 3. the round machine: held, not spent
 
 
 def test_a_four_seat_auth_failure_holds_rather_than_escalating(fleet):
-    """Test (a). Five drains is far past the old behaviour, which closed the round
-    `escalated` on the first failure, flagged the user and never went again."""
+    """Test (a)"""
     validator = Validator(auth_error())
     fleet.daemon.validator = validator
     wo = fleet.dispatch()
@@ -247,12 +210,7 @@ def test_a_four_seat_auth_failure_holds_rather_than_escalating(fleet):
 
 
 def test_the_same_round_is_judged_by_itself_after_the_backoff(fleet, monkeypatch):
-    """Test (a), second half: no human anywhere in it, and the submitter spends round ONE.
-
-    The BACKOFF is shortened rather than the process clock moved: `validation_hold_until`
-    takes the latest moment for a round, so the hold still has to lapse on its own terms
-    (tests/test_validation_ci_hold.py's idiom, for its reason).
-    """
+    """Test (a), second half: no human anywhere in it, and the submitter spends round ONE"""
     monkeypatch.setattr("jarvis.daemon.AUTH_HOLD_BACKOFF", (-1.0,))
     fleet.daemon.validator = Validator(auth_error(), passed())
     wo = fleet.dispatch()
@@ -273,9 +231,7 @@ def test_the_same_round_is_judged_by_itself_after_the_backoff(fleet, monkeypatch
 @pytest.mark.parametrize("attempt,delay", [(1, 60.0), (2, 300.0), (3, 900.0),
                                           (4, 3600.0), (5, 3600.0), (6, 3600.0)])
 def test_the_backoff_is_one_minute_to_an_hour_and_never_gives_up(fleet, attempt, delay):
-    """Test (b). The last entry is a CAP, not a final attempt: what clears an auth failure
-    is a human running `/login`, which may be thirty seconds or next week away, and a
-    count that gave up would turn that into the spent round this spec is removing."""
+    """Test (b)"""
     store = ProjectStore(fleet.project)
     try:
         wo = store.create_work_order("t")
@@ -300,9 +256,7 @@ def test_the_backoff_is_one_minute_to_an_hour_and_never_gives_up(fleet, attempt,
 
 
 def test_an_auth_hold_spends_none_of_the_transport_budget(fleet, monkeypatch):
-    """Test (c) — Neo's hard condition, question 723. Three auth holds then three genuine
-    outages: if a hold counted, the third outage would arrive with the budget gone and
-    this would escalate one drain early."""
+    """Test (c) — Neo's hard condition, question 723"""
     monkeypatch.setattr("jarvis.daemon.AUTH_HOLD_BACKOFF", (-1.0,))
     fleet.daemon.validator = Validator(
         auth_error(), auth_error(), auth_error(),
@@ -324,8 +278,7 @@ def test_an_auth_hold_spends_none_of_the_transport_budget(fleet, monkeypatch):
 
 
 def test_an_all_seats_transient_round_still_escalates_after_three(fleet):
-    """Test (d), the other half: this spec routes the auth case AWAY from the outage
-    budget and changes nothing about the budget itself (#235's remaining half, #235)."""
+    """Test (d), the other half: this spec routes the auth case AWAY from the outage budget and changes... (#235)"""
     fleet.daemon.validator = Validator(claude_cli.ClaudeCliError("connection reset"))
     wo = fleet.dispatch()
     fleet.change(wo["id"], "print('one')\n")
@@ -341,8 +294,7 @@ def test_an_all_seats_transient_round_still_escalates_after_three(fleet):
 
 
 def test_a_genuine_usage_limit_behaves_exactly_as_today(fleet):
-    """Test (e). The window hold is the mechanism this one reuses, so a regression here
-    is the likeliest cost of adding a third cause."""
+    """Test (e)"""
     fleet.daemon.validator = Validator(refused(3600))
     wo = fleet.dispatch()
     fleet.change(wo["id"], "print('one')\n")
@@ -361,10 +313,7 @@ def test_a_genuine_usage_limit_behaves_exactly_as_today(fleet):
 
 def test_the_hold_lifts_on_the_backoff_alone_and_not_on_the_credentials_file(
         fleet, monkeypatch, signin):
-    """Test (10). Gating the re-run on `claude_cli.signin_changed_at` is Neo's REJECTED
-    design (question 723): it returns None for a keychain or `ANTHROPIC_API_KEY` sign-in,
-    and "cannot tell" there would strand the round for ever. Pinned so nobody reinstates
-    it quietly — the timing is identical with and without a sign-in."""
+    """Test (10)"""
     monkeypatch.setattr("jarvis.daemon.AUTH_HOLD_BACKOFF", (-1.0,))
     fleet.daemon.validator = Validator(auth_error(), passed())
     wo = fleet.dispatch()
@@ -396,13 +345,11 @@ def test_the_hold_lifts_on_the_backoff_alone_and_not_on_the_credentials_file(
         store.close()
 
 
-# -- 4. it must not be silent ---------------------------------------------------------
+# -- 4. it must not be silent
 
 
 def test_the_hold_reads_as_an_active_hold_on_every_surface(fleet):
-    """Test (h). `VALIDATION_CI_CAUSE`'s precedent exactly: `reopens_at` here is a RECHECK
-    INTERVAL, not a moment anything promised, so NO surface prints it — printing one as a
-    promise is the specific mistake (`invariants.CI_HOLD_NOTE`)."""
+    """Test (h)"""
     fleet.daemon.validator = Validator(auth_error())
     wo = fleet.dispatch()
     fleet.change(wo["id"], "print('one')\n")
@@ -428,8 +375,7 @@ def test_the_hold_reads_as_an_active_hold_on_every_surface(fleet):
 
 
 def test_the_hold_is_readable_on_the_timeline():
-    """A new CAUSE is as invisible as a new kind until `_describe` names it (kn-3f133363),
-    and this one must read as neither of the three it sits beside."""
+    """A new CAUSE is as invisible as a new kind until `_describe` names it (kn-3f133363)"""
     title, detail = _describe("validation_failed", {
         "round": 1, "cause": VALIDATION_AUTH_CAUSE, "reopens_at": 1_789_714_200.0,
         "attempt": 2, "error": AUTH})
@@ -441,8 +387,7 @@ def test_the_hold_is_readable_on_the_timeline():
 
 
 def test_the_new_cause_holds_the_round_like_the_two_before_it():
-    """Membership in `VALIDATION_HOLDING_CAUSES` is the whole scheduler change: a cause
-    missing from it holds once and then spins every tick for ever."""
+    """Membership in `VALIDATION_HOLDING_CAUSES` is the whole scheduler change: a cause missing from it..."""
     event = {"payload": '{"round": 1, "cause": "%s", "reopens_at": 70}'
                         % VALIDATION_AUTH_CAUSE}
 

@@ -1,20 +1,4 @@
-"""A dispatched worker's first Serena call must not fail with `No active project`.
-
-Spec docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md §5. The Claude Code plugin starts the
-Serena MCP server with fixed args carrying neither `--project` nor `--project-from-cwd`,
-and no Serena env var selects a project — so the first `find_symbol` of a dispatched turn
-fails and the worker falls back to grep. Jarvis therefore injects the activation call at
-`SessionStart`, as `additionalContext`, with the worktree path already filled in.
-
-Two measured facts these tests rely on and do not re-probe:
-  · `activate_project` accepts an ARBITRARY `session_id` string (`00000000` worked), so
-    the injected call needs no prior `initial_instructions` round-trip.
-  · activating by ABSOLUTE PATH works even though 108 registry entries share the name
-    `jarvis-os`, and it creates the registry entry itself when absent.
-
-`SessionStart` is driven the way tests/test_prefix_drift_hook.py drives it — the same
-`handle_hook` payload against the same project fixtures.
-"""
+"""A dispatched worker's first Serena call must not fail with `No active project` (docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md §5.)"""
 
 from __future__ import annotations
 
@@ -63,9 +47,7 @@ def context(project: Path, wo_id: str, cwd: Path | None = None, **extra: str) ->
 
 
 def test_session_start_injects_the_activate_call_with_the_worktree_path(wo, project):
-    """The path has to be IN the text. A worker told to activate "this project" has to
-    guess, and the main checkout is the wrong guess: its CLAUDE.md and its index are not
-    the branch the work order is on."""
+    """The path has to be IN the text"""
     tree = worktree(project, wo["id"])
     payload = session_start(tree)
 
@@ -73,21 +55,17 @@ def test_session_start_injects_the_activate_call_with_the_worktree_path(wo, proj
 
     assert payload["cwd"] in text
     assert ACTIVATE in text
-    # Every mention of the project root is part of the worktree path, never the root
-    # alone: the main checkout is a different branch and a different index.
+    # Every mention of the project root is part of the worktree path
     assert text.replace(str(tree), "") .count(str(project)) == 0
 
 
 def test_no_activate_context_outside_a_worker_session(project):
-    """A session the user opened themselves is theirs — the `JARVIS_WO_ID` /
-    `find_by_session` guard every other hook branch uses."""
+    """A session the user opened themselves is theirs"""
     assert handle_hook(session_start(project), {}) is None
 
 
 def test_the_activate_call_is_injected_with_no_serena_project_file_present(wo, project):
-    """Neo's ruling on question 1259: `activate_project` WRITES `.serena/project.yml`
-    itself, so gating on that file existing would skip the fresh worktree this whole
-    order exists for."""
+    """Neo's ruling on question 1259: `activate_project` WRITES `.serena/project.yml` itself"""
     tree = worktree(project, wo["id"])
     assert not (tree / ".serena" / "project.yml").exists()
 
@@ -95,9 +73,7 @@ def test_the_activate_call_is_injected_with_no_serena_project_file_present(wo, p
 
 
 def test_no_activate_context_when_the_project_deselected_serena(wo, project):
-    """`JARVIS_SERENA=0` means the server was removed from this worker's settings file.
-    Telling it to activate a project on a server it does not have is the incoherence
-    `wiring.serena_wired` exists to prevent — and the house style still rides."""
+    """`JARVIS_SERENA=0` means the server was removed from this worker's settings file"""
     text = context(project, wo["id"], JARVIS_SERENA="0")
 
     assert "activate_project" not in text
@@ -105,8 +81,7 @@ def test_no_activate_context_when_the_project_deselected_serena(wo, project):
 
 
 def test_the_house_style_still_rides_the_same_session_start_context(wo, project):
-    """The existing injection is unchanged and comes FIRST: it is the cached shape, and
-    the activation block is appended after it rather than in front of it."""
+    """The existing injection is unchanged and comes FIRST: it is the cached shape"""
     text = context(project, wo["id"])
 
     assert text.startswith(concision.house_style())
@@ -115,9 +90,7 @@ def test_the_house_style_still_rides_the_same_session_start_context(wo, project)
 
 
 def test_the_short_prefix_spelling_is_offered_as_the_alternative():
-    """Both spellings for one server, mirroring why `dispatch.SERENA_TOOL_PREFIXES` has
-    two entries: a plugin install produces the long prefix, `claude mcp add serena` the
-    short one, and Jarvis configures no MCP server itself so it cannot know which."""
+    """Both spellings for one server, mirroring why `dispatch.SERENA_TOOL_PREFIXES` has two entries: a..."""
     text = serena_activation_context(Path("/tmp/wt"))
 
     assert ACTIVATE in text

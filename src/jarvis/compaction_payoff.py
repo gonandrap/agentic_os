@@ -1,70 +1,4 @@
-"""Did each worker-conversation compaction the OS paid for actually pay off?
-
-The pure core of `scripts/compaction_payoff.py`, MOVED here verbatim so a product
-surface can reach it: `scripts/` is not on the package path for an installed `jarvis`,
-which is why these numbers never reached the CLI or the dashboard. The script keeps only
-its rendering and its `main`, and re-exports these objects — `fleetcost` is `quantile`'s
-second caller. Spec §1 of
-docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md.
-
-Deterministic and read-only: every SQLite database is opened `mode=ro`, transcripts are
-only read, no model is called.
-
-SOURCES
-  * The compactions and what each COST: central `os.db`, `agent_calls` rows with
-    `kind='compaction'` (`worker_session._record_compaction`). `cost_usd` is the CLI's
-    own figure. `since/until` filter on that row's `ts`.
-  * Where the compaction happened in the conversation: the `compact_boundary` system row
-    Claude Code writes into the session transcript (`usage.compactions_in`), matched to
-    the `agent_calls` row through the compact turn in the project store (`wo_turns`,
-    `label = "turn <seq>"`), falling back to the nearest boundary before the row's ts.
-  * Every API call the worker made: the transcript, via `usage.calls_of` (one `Call`
-    per deduped assistant message). Subagent transcripts (`<session>/subagents/*.jsonl`)
-    are counted separately and never priced into the counterfactual.
-  * Turn boundaries and whether the order is still live: the project store
-    (`wo_turns`, `work_orders.status`).
-  * Prices: `usage.price_for`, `usage.write_rate`, `usage.CACHE_READ_RATE` — the model
-    each call ACTUALLY used, at Anthropic list prices.
-
-METHOD, for one compaction C on work order W at time t
-  N   context just before C = the last main-chain call before t: its prompt
-      (input + cache_write + cache_read) plus its output, which the next call re-sends.
-  S   context just after C  = the FIRST main-chain call after t: its whole prompt.
-  R   tokens removed = max(0, N - S).
-      APPROXIMATION: S includes the relaunch prompt P that went out after C, which the
-      counterfactual would ALSO have carried, so the true removal is N + P - S. P is not
-      separable from the transcript's token counts, so R is a FLOOR (P is ~1-5k against
-      an R of ~100k). The CLI's own `preTokens/postTokens` are reported beside it but not
-      used: `postTokens` counts the summary only, not the ~40k static head (system prompt,
-      tools, CLAUDE.md) that survives every compaction, so pre - post overstates R.
-  Without C, every later main-chain call until the next compaction (any trigger) or the
-  end of the session would have carried R more prompt tokens. Each is priced at the rate
-  THAT call actually paid for its prefix:
-      * the first call after C, and any later call whose cache read went BACKWARDS (a
-        ttl-expiry / prefix-miss re-write): R x the call's cache-write rate (1.25x at the
-        5-minute TTL, more for a 1-hour write — `usage.write_rate`). For the first call
-        this is "the relaunch would have re-written N instead of S".
-      * a call that read its prefix from cache: R x 0.1.
-      * a call with no cache read and no cache write: R x 1.0.
-  If the session's next compaction is in range, it would have had R more tokens of plain
-  input to summarise: + R x 1.0.
-  savings = sum of the above;  net = savings - C.cost_usd;  paid_off = net > 0.
-  CAP: when a later call's counterfactual context (its own prompt + R) exceeds the
-  project's autocompact window (`worker.autocompact_window`, default
-  `catalog.DEFAULT_AUTOCOMPACT_WINDOW`), Claude Code would have auto-compacted there
-  anyway. Savings stop accruing at that call and the row is flagged `capped`; the auto-
-  compaction's own cost in the counterfactual is NOT credited, so a capped row is a floor.
-  OPEN: W is still live (not completed/cancelled/failed) and no later compaction has
-  closed C's segment — more savings may still come. Listed, but excluded from the
-  paid-off percentage and the break-even figures.
-  CHAINS: two compactions with no API call between them (the second summarising a
-  summary) are scored as a chain. The first gets no savings (its segment holds no call)
-  and is noted `back-to-back`; the second measures N before the chain and is noted
-  `chained`, so the chain's combined net is right and neither row invents a saving.
-  break_even_turn: the first post-C worker turn (1-based) by whose end cumulative
-  savings >= cost, or null. Turns come from `wo_turns` (compact turns excluded); with no
-  project store, a turn is approximated as a run of calls between cache re-writes.
-"""
+"""Did each worker-conversation compaction the OS paid for actually pay off? (docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md)"""
 
 from __future__ import annotations
 
@@ -81,17 +15,16 @@ from jarvis import paths, usage
 from jarvis.catalog import DEFAULT_AUTOCOMPACT_WINDOW
 from jarvis.usage import Call
 
-#: Work-order statuses after which no further turn can run in the session.
+#: Work-order statuses after which no further turn can run in the session
 TERMINAL_STATUSES = frozenset({"completed", "cancelled", "failed"})
-#: When the window is unbounded (`autocompact_window: null`), the model's own window.
+#: When the window is unbounded (`autocompact_window: null`), the model's own window
 MODEL_CONTEXT_WINDOW = 1_000_000
-#: How far after a compaction's recorded ts its transcript boundary may sit, in the
-#: fallback match (no project store): the row is written when the turn is reaped.
+#: How far after a compaction's recorded ts its transcript boundary may sit
 MATCH_SLACK_SECONDS = 30 * 60
 
 RATE_WRITE, RATE_READ, RATE_INPUT = "write", "read", "input"
 
-#: Stable JSON keys of one analysed row, in output order.
+#: Stable JSON keys of one analysed row, in output order
 ROW_KEYS = (
     "wo_id", "project", "session_id", "label", "ts", "when", "model", "ok",
     "cost_usd", "boundary_found", "cli_pre_tokens", "cli_post_tokens",
@@ -103,13 +36,11 @@ ROW_KEYS = (
 )
 
 
-# ---------------------------------------------------------------------------------------
-# Pure core: in-memory inputs -> rows -> summary. No I/O below until `gather`.
-# ---------------------------------------------------------------------------------------
+# Pure core: in-memory inputs -> rows -> summary
 
 @dataclass
 class Case:
-    """Everything one compaction's payoff is computed from, already loaded."""
+    """Everything one compaction's payoff is computed from, already loaded"""
 
     wo_id: str
     cost_usd: float
@@ -130,7 +61,7 @@ class Case:
 
 
 def prefix_rate(call: Call, previous: Call | None, first: bool) -> tuple[str, float]:
-    """(kind, multiple of the input price) this call paid for the prefix it carried."""
+    """(kind, multiple of the input price) this call paid for the prefix it carried"""
     if call.cache_read == 0 and call.cache_write == 0:
         return RATE_INPUT, 1.0
     if first or call.cache_read == 0 or (
@@ -140,17 +71,12 @@ def prefix_rate(call: Call, previous: Call | None, first: bool) -> tuple[str, fl
 
 
 def per_token(model: str) -> float:
-    """One input token at list price. Public for `quantile`'s reason: a second caller.
-
-    `fleetcost.tool_costs` prices a tool result's share of every later IN-WINDOW call
-    it rode along in, and that share is `result_tokens * rate * per_token(model)` — the same
-    arithmetic this module's own savings use, so it is reused rather than restated.
-    """
+    """One input token at list price"""
     return usage.price_for(model)[0] / 1_000_000
 
 
 def _turn_index(turns: Sequence[dict[str, Any]], ts: float) -> int | None:
-    """0-based index of the turn (in `turns`, sorted by start) a call at `ts` ran in."""
+    """0-based index of the turn (in `turns`, sorted by start) a call at `ts` ran in"""
     found = None
     for i, turn in enumerate(turns):
         if turn["started_at"] <= ts:
@@ -161,7 +87,7 @@ def _turn_index(turns: Sequence[dict[str, Any]], ts: float) -> int | None:
 
 
 def assess(case: Case) -> dict[str, Any]:
-    """One compaction's payoff. Pure: reads only `case`."""
+    """One compaction's payoff"""
     notes = list(case.notes)
     t = case.boundary["ts"] if case.boundary else case.ts
     later = sorted(b for b in case.later_boundaries if b > t)
@@ -213,14 +139,14 @@ def assess(case: Case) -> dict[str, Any]:
         next_extra = removed * 1.0 * per_token(model)
         per_call.append((end, next_extra))
 
-    # Turns after C, and the turn by which C had paid for itself.
+    # Turns after C, and the turn by which C had paid for itself
     if case.turns is not None:
         turns = sorted((tr for tr in case.turns
                         if tr.get("kind") != "compact" and t <= tr["started_at"] < end),
                        key=lambda tr: tr["started_at"])
         turn_starts = [{"started_at": tr["started_at"]} for tr in turns]
     else:
-        # Approximation: a turn starts at the first call and at every cache re-write.
+        # Approximation: a turn starts at the first call and at every cache re-write
         turn_starts, prev = [], None
         for i, call in enumerate(after):
             if prefix_rate(call, prev, first=(i == 0))[0] == RATE_WRITE:
@@ -278,7 +204,7 @@ def assess(case: Case) -> dict[str, Any]:
 
 
 def analyse(cases: Iterable[Case]) -> list[dict[str, Any]]:
-    """Every case assessed, oldest first."""
+    """Every case assessed, oldest first"""
     return sorted((assess(c) for c in cases), key=lambda r: r["ts"])
 
 
@@ -286,12 +212,12 @@ def quantile(values: Sequence[float], q: float) -> float | None:
     if not values:
         return None
     ordered = sorted(values)
-    # Nearest-rank: deterministic, and an actual observed value.
+    # Nearest-rank: deterministic, and an actual observed value
     return ordered[max(0, math.ceil(q * len(ordered)) - 1)]
 
 
 def summarise(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    """Fleet totals over analysed rows. Open rows count in the money, not in the rates."""
+    """Fleet totals over analysed rows"""
     closed = [r for r in rows if not r["open"]]
     paid = [r for r in closed if r["paid_off"]]
     cost = sum(r["cost_usd"] for r in rows)
@@ -321,16 +247,13 @@ def summarise(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "turns_after_p90": quantile(turns, 0.9),
         "break_even_turn_median": statistics.median(break_evens) if break_evens else None,
         "savings_per_turn_usd": round(per_turn, 4) if per_turn is not None else None,
-        # The fleet-level break-even: how many post-compaction turns, at the average
-        # saving per turn, it takes to recover the average compaction's cost.
+        # The fleet-level break-even: how many post-compaction turns
         "break_even_turns_fleet": (round((closed_cost / len(closed)) / per_turn, 2)
                                    if closed and per_turn else None),
     }
 
 
-# ---------------------------------------------------------------------------------------
-# I/O: read-only loading from $JARVIS_HOME, the project stores and the transcripts.
-# ---------------------------------------------------------------------------------------
+# I/O: read-only loading from $JARVIS_HOME, the project stores and the transcripts
 
 def connect_ro(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
@@ -339,7 +262,7 @@ def connect_ro(path: Path) -> sqlite3.Connection:
 
 
 def parse_when(text: str) -> float:
-    """A date or ISO datetime; naive values are UTC."""
+    """A date or ISO datetime; naive values are UTC"""
     when = datetime.fromisoformat(text)
     if when.tzinfo is None:
         when = when.replace(tzinfo=timezone.utc)
@@ -382,7 +305,7 @@ def _subagent_stamps(paths_: Sequence[Path]) -> list[float]:
 def gather(home: Path, *, since: float | None = None, until: float | None = None,
            project: str | None = None, wo: str | None = None,
            index: dict[str, list[Path]] | None = None) -> list[Case]:
-    """Load one Case per recorded compaction. Read-only throughout."""
+    """Load one Case per recorded compaction"""
     central = connect_ro(home / "os.db")
     try:
         projects = _project_info(central)
@@ -456,7 +379,7 @@ def gather(home: Path, *, since: float | None = None, until: float | None = None
 
 def _match_boundary(rec: dict[str, Any], turns: list[dict[str, Any]] | None,
                     bounds: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
-    """The transcript boundary this `agent_calls` row paid for."""
+    """The transcript boundary this `agent_calls` row paid for"""
     if not rec["ok"] or not bounds:
         return None
     label = rec["label"] or ""

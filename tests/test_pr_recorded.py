@@ -1,22 +1,4 @@
-"""An order that wrote code must carry its pull request (INV-PR-RECORDED).
-
-`tests/test_work_lands.py` proves the two landings that already refuse. This file proves
-the other half of the user's 2026-09-18 ruling: EVERY route that settles a work order
-either records the pull request, records a decision not to land, or refuses — and what
-the order authored goes on the record so an invariant can still ask months later, when
-the worktree is long deleted.
-
-THE FIXTURE SHAPES ARE THE THREE PRODUCTION ORDERS the ruling was made on, and each test
-names the one it is standing in for:
-
-* `wo-5eedc84d` — `pr_url` NULL in the record while PR #42 existed the whole time and
-  merged. The record simply never learned about it.
-* `wo-cd73c537` — `pr_url` records #81, which merged, while #116 is open on the same
-  branch with three unmerged commits. The record is STALE, which this predicate
-  deliberately does not judge.
-* `wo-5a6b2d6d` — a planner that completed over a WIP commit on `rescue/wo-5a6b2d6d`
-  with no pull request, ever. Nothing refused it and nothing has reported it since.
-"""
+"""An order that wrote code must carry its pull request (INV-PR-RECORDED) (#42)"""
 
 from __future__ import annotations
 
@@ -53,12 +35,7 @@ def _feature(salt: str, n: int = 30) -> str:
 
 @pytest.fixture()
 def started(jarvis_home, fake_claude, catalog_file, project):
-    """A real repository with a default branch — `test_work_lands.py`'s fixture.
-
-    `make_git_project` leaves an EMPTY repository, and with no default branch
-    `landing.authored` answers `unreadable`: nothing is refused and nothing is recorded,
-    so every assertion here would pass vacuously.
-    """
+    """A real repository with a default branch — `test_work_lands.py`'s fixture"""
     _git(project, "symbolic-ref", "HEAD", "refs/heads/trunk")
     (project / "app.py").write_text(_feature("base", 10))
     _git(project, "add", "-A")
@@ -75,7 +52,7 @@ def started(jarvis_home, fake_claude, catalog_file, project):
 
 def _order(project: Path, title: str = "add feature X", *, code: str | None = None,
            kind: str = "worker", branch: str | None = None) -> dict:
-    """A work order with a real worktree, optionally carrying one commit."""
+    """A work order with a real worktree, optionally carrying one commit"""
     wo = ops.create_work_order("proj_a", title)
     wt = project / ".claude" / "worktrees" / wo["id"]
     _git(project, "worktree", "add", "-q", "-b", branch or f"worktree-{wo['id']}",
@@ -97,20 +74,14 @@ def _order(project: Path, title: str = "add feature X", *, code: str | None = No
 
 
 def _gate_records(store: ProjectStore, wo_id: str, pr_url: str) -> None:
-    """Put `pr_url` on the record the way a planner's does — through an approved gate.
-
-    Written through `gates.apply_decision` rather than into the column, because what the
-    routing predicate reads is the `pr_url_recorded` event that path leaves behind
-    (2026-09-25 spec §4).
-    """
+    """Put `pr_url` on the record the way a planner's does — through an approved gate"""
     from jarvis import gates
 
     approval = store.add_approval(wo_id, gates.PR_MERGE, f"gh pr merge {pr_url} --squash")
     gates.apply_decision(store, approval["id"], verdict="approved",
                          reason="the plan's own docs PR", decided_by="neo")
     assert store.get_work_order(wo_id)["pr_url"] == pr_url
-    # The verdict message reaches the worker before its turn settles; left queued, it
-    # short-circuits `settle_work_order` before the branch under test.
+    # The verdict message reaches the worker before its turn settles
     for message in store.queued_messages(wo_id):
         store.mark_message(message["id"], "delivered")
 
@@ -141,7 +112,7 @@ def _violations(project: Path) -> list[invariants.Violation]:
 
 
 def _complete(project: Path, wo_id: str) -> None:
-    """Put an order into `completed` the way a pre-fix OS would have: straight in."""
+    """Put an order into `completed` the way a pre-fix OS would have: straight in"""
     store = ProjectStore(project)
     try:
         store.set_status(wo_id, "completed")
@@ -149,17 +120,12 @@ def _complete(project: Path, wo_id: str) -> None:
         store.close()
 
 
-# -- what every settlement now writes down --------------------------------------------
+# -- what every settlement now writes down
 
 
 def test_finishing_behind_a_pull_request_still_records_what_was_authored(started,
                                                                         project):
-    """wo-5eedc84d's shape, caught at the moment it could still be caught.
-
-    `unlanded_work` answers "nothing" for an order carrying a pull request WITHOUT
-    looking at the worktree — right for the refusal, useless for the record. This is the
-    only moment the worktree exists to say the order wrote code at all.
-    """
+    """wo-5eedc84d's shape, caught at the moment it could still be caught"""
     wo = _order(project, code="launcher")
 
     assert ops.finish(wo["id"], "opened a PR", pr_url=PR)["status"] == "waiting_pr_merge"
@@ -170,8 +136,7 @@ def test_finishing_behind_a_pull_request_still_records_what_was_authored(started
 
 
 def test_an_order_that_wrote_nothing_records_that_it_wrote_nothing(started, project):
-    """`commits: 0` and "nobody looked" must stay distinguishable, or an unreadable
-    settling reads afterwards as an exoneration."""
+    """`commits: 0` and "nobody looked" must stay distinguishable"""
     wo = _order(project, "answer a question")
 
     assert ops.finish(wo["id"], "no code needed")["status"] == "completed"
@@ -182,8 +147,7 @@ def test_an_order_that_wrote_nothing_records_that_it_wrote_nothing(started, proj
 
 
 def test_a_settling_that_could_not_read_the_worktree_records_no_claim(started, project):
-    """The worktree is deleted when a branch is reclaimed. "I cannot look" is not
-    "there is nothing there", and writing a zero here would exonerate the order."""
+    """The worktree is deleted when a branch is reclaimed"""
     wo = _order(project, code="launcher")
     _git(project, "worktree", "remove", "--force", str(wo["worktree_path"]))
 
@@ -192,12 +156,11 @@ def test_a_settling_that_could_not_read_the_worktree_records_no_claim(started, p
     assert "authored" not in _payload(project, wo["id"], "finished")
 
 
-# -- one test per settlement route: commits + no pull request never settles silently ---
+# -- one test per settlement route: commits + no pull request never settles silently
 
 
 def test_route_finish_refuses(started, project):
-    """ROUTE 1 — `ops.finish`, the worker reporting its own result. It RAISES: the
-    worker is listening and an exception is the only thing it reads."""
+    """ROUTE 1 — `ops.finish`, the worker reporting its own result"""
     wo = _order(project, code="launcher")
 
     with pytest.raises(ops.OpsError, match="--abandon"):
@@ -207,8 +170,7 @@ def test_route_finish_refuses(started, project):
 
 
 def test_route_finish_with_abandon_is_the_way_through(started, project):
-    """The pairing every refusal needs. The decision is what is enforced, not the
-    outcome — and the abandonment carries the evidence the refusal saw."""
+    """The pairing every refusal needs"""
     wo = _order(project, code="spike")
 
     out = ops.finish(wo["id"], "spiked it", abandon="the approach does not work")
@@ -219,9 +181,7 @@ def test_route_finish_with_abandon_is_the_way_through(started, project):
 
 
 def test_route_assumption_review_parks(started, project):
-    """ROUTE 2 — `ops.review_work_order`, the user accepting the assumptions. It PARKS
-    rather than raising: an exception would break the user's command, and
-    `park_unlanded` writes down what was there instead."""
+    """ROUTE 2 — `ops.review_work_order`, the user accepting the assumptions"""
     wo = _order(project, code="watchdogs")
     ops.assume(wo["id"], "polled every 30s")
     store = ProjectStore(project)
@@ -235,9 +195,7 @@ def test_route_assumption_review_parks(started, project):
 
 
 def test_route_neo_accepting_an_assumption_parks_too(started, project):
-    """ROUTE 3 — `ops.accept_assumption`, the OS settling an assumption on the user's
-    behalf (`validation.auto_review`). It shares `_land_after_acceptance` with the
-    user's route precisely so the two cannot disagree about this."""
+    """ROUTE 3 — `ops.accept_assumption`"""
     wo = _order(project, code="watchdogs")
     ops.assume(wo["id"], "polled every 30s")
     store = ProjectStore(project)
@@ -257,19 +215,7 @@ def test_route_neo_accepting_an_assumption_parks_too(started, project):
 
 def test_route_the_reconciler_settling_a_turn_no_longer_walks_past_the_guard(started,
                                                                             project):
-    """ROUTE 4 — THE HOLE. `Daemon.settle_work_order` completed any order whose turn
-    ended with a `result_summary` and no `pr_url`, straight to `completed`, without ever
-    asking `land_finished`. wo-5a6b2d6d's shape: a WIP commit, no pull request, ever.
-
-    It also UNPARKED: `park_unlanded` leaves `needs_review` behind and this ran a tick
-    later over the same done turn, completing the order it had just held.
-
-    **AND THE SECOND TICK IS THE HALF THAT IS EASY TO GET WRONG.** This branch re-derives
-    from the LATEST turn on EVERY tick, which is exactly why it unparked — so a park that
-    is not idempotent trades "unparks and completes" for "re-parks, re-flags and writes a
-    fresh `work_unlanded` every tick", the renotify-on-every-restart shape the user called
-    out. Ticked five times: still `needs_review`, still ONE record, still one flag.
-    """
+    """ROUTE 4 — THE HOLE"""
     wo = _order(project, code="scratch", branch=f"rescue/{_order.__name__}-wip")
     store = ProjectStore(project)
     try:
@@ -282,8 +228,7 @@ def test_route_the_reconciler_settling_a_turn_no_longer_walks_past_the_guard(sta
                                       store.get_work_order(wo["id"]))
             assert store.get_work_order(wo["id"])["status"] == "needs_review"
         events = store.events_of_kind(wo["id"], "work_unlanded")
-        # The flag is raised once and stays; a second `attention` event would be the
-        # same defect arriving through the notifier instead of the timeline.
+        # The flag is raised once and stays
         flags = store.events_of_kind(wo["id"], "attention")
     finally:
         store.close()
@@ -294,10 +239,7 @@ def test_route_the_reconciler_settling_a_turn_no_longer_walks_past_the_guard(sta
 
 
 def test_an_acked_park_is_not_re_flagged_by_the_next_tick(started, project):
-    """The same defect wearing the column instead of the event. `jarvis wo ack` puts the
-    flag down for good, and the quiet path in `park_unlanded` must not raise it again —
-    which is why that path asserts the status and leaves the flag to `true_blockers`,
-    the only derivation that honours `acknowledged_blockers`."""
+    """The same defect wearing the column instead of the event"""
     wo = _order(project, code="scratch")
     store = ProjectStore(project)
     try:
@@ -325,13 +267,7 @@ def test_an_acked_park_is_not_re_flagged_by_the_next_tick(started, project):
 
 def test_a_re_delivery_opens_a_new_episode_and_the_next_park_does_record(started,
                                                                         project):
-    """THE PAIRING FOR THE DEDUPE ABOVE, and the reason it is keyed on the EPISODE rather
-    than on "has this order ever been parked". A quiet second park would be the same
-    class of defect one step along: the order silently stops being recorded as unlanded
-    the moment it has been once. `work_unlanded_open` lapses on any `finished`,
-    `abandoned` or `pr_merged` since the park, so a work order sent back and delivered
-    again is judged afresh.
-    """
+    """THE PAIRING FOR THE DEDUPE ABOVE"""
     wo = _order(project, code="scratch")
     store = ProjectStore(project)
     try:
@@ -358,20 +294,7 @@ def test_a_re_delivery_opens_a_new_episode_and_the_next_park_does_record(started
 
 def test_route_the_reconciler_still_completes_an_order_that_wrote_nothing(started,
                                                                          project):
-    """The pairing, and the one that decides whether route 4's fix ships: the ~60
-    planners, investigations and knowledge-base writes must settle exactly as before.
-
-    **AND IT PINS THE ATTENTION CLEARING, which is no longer written here.** This branch
-    used to be `set_status("completed")` FOLLOWED BY `clear_attention`; both are now
-    `land_finished`'s. The status is the half a test reaches for and the flag is the half
-    that rots quietly — a settled order still holding an attention item asks the user for
-    something that is over, and no assertion on the status would ever notice.
-
-    The flag is raised deliberately before the tick, so this fails if the clearing goes
-    away rather than passing because there was nothing to clear. It is raised the way
-    this order really would carry one: `true_blockers`' line for a worker that stopped
-    mid-turn, from the tick before the one that settles it.
-    """
+    """The pairing, and the one that decides whether route 4's fix ships: the ~60 planners"""
     wo = _order(project, "answer a question")
     store = ProjectStore(project)
     try:
@@ -393,12 +316,7 @@ def test_route_the_reconciler_still_completes_an_order_that_wrote_nothing(starte
 
 def test_the_reconciler_never_parks_a_gate_recorded_pull_request_in_the_merge_queue(
         started, project):
-    """ROUTE 4's OTHER COLUMN READER. `settle_work_order`'s `elif fresh["pr_url"]` branch
-    parks a finished order in `waiting_pr_merge` off the RAW column, bypassing
-    `land_finished` entirely — so a planner whose merge was gated ended up in the merge
-    queue and in front of the validation panel, over a pull request that already merged
-    (2026-09-25 spec §4).
-    """
+    """ROUTE 4's OTHER COLUMN READER"""
     wo = _order(project, "plan the feature", kind="planner")
     store = ProjectStore(project)
     try:
@@ -418,10 +336,7 @@ def test_the_reconciler_never_parks_a_gate_recorded_pull_request_in_the_merge_qu
 
 
 def test_route_wo_done_records_rather_than_refusing(started, project):
-    """ROUTE 5 — `jarvis wo done`. It RECORDS and proceeds, and that is not silence: the
-    user typing it IS the decision, and the documented exit for a pull request that will
-    never merge (Neo question 430). Refusing would leave them no way to close the order.
-    """
+    """ROUTE 5 — `jarvis wo done`"""
     wo = _order(project, code="stranded")
 
     assert ops.mark_done(wo["id"])["status"] == "completed"
@@ -431,10 +346,7 @@ def test_route_wo_done_records_rather_than_refusing(started, project):
 
 
 def test_route_a_feature_manager_records_what_it_authored(started, project):
-    """ROUTE 6 — `Daemon._close_feature_manager`. A manager is told it writes no product
-    code and opens no pull request; one that did anyway used to complete with nothing
-    written down. It still completes — parking it would flag a settled feature — but the
-    evidence goes on the record, and the invariant is what reports it."""
+    """ROUTE 6 — `Daemon._close_feature_manager`"""
     fo = ops.create_feature_order("proj_a", "a feature", description="do the thing")
     store = ProjectStore(project)
     try:
@@ -460,13 +372,12 @@ def test_route_a_feature_manager_records_what_it_authored(started, project):
     assert [v.wo_id for v in _violations(project)] == [manager["id"]]
 
 
-# -- the invariant ---------------------------------------------------------------------
+# -- the invariant
 
 
 def test_the_invariant_reports_a_settled_order_that_wrote_code_with_no_pull_request(
         started, project):
-    """wo-5a6b2d6d's shape. The remedy names both ways out, because both are legitimate
-    and the OS is not entitled to choose between them."""
+    """wo-5a6b2d6d's shape"""
     wo = _order(project, code="design_doc")
     ops.finish(wo["id"], "wrote it", pr_url=PR)
     store = ProjectStore(project)
@@ -484,9 +395,7 @@ def test_the_invariant_reports_a_settled_order_that_wrote_code_with_no_pull_requ
 
 
 def test_the_invariant_is_silent_when_the_pull_request_is_recorded(started, project):
-    """wo-cd73c537's shape, and the scope line: #81 is recorded and merged while #116 is
-    open on the same branch. This predicate asks whether an identifier is PRESENT, never
-    whether it is CURRENT — that is a `gh` round trip and belongs to discovery."""
+    """wo-cd73c537's shape, and the scope line: #81 is recorded and merged while #116 is open on the same..."""
     wo = _order(project, code="console")
     ops.finish(wo["id"], "opened it", pr_url=PR)
     _complete(project, wo["id"])
@@ -495,8 +404,7 @@ def test_the_invariant_is_silent_when_the_pull_request_is_recorded(started, proj
 
 
 def test_the_invariant_is_silent_on_an_order_that_produced_no_code(started, project):
-    """THE NEGATIVE CONTROL THAT DECIDES WHETHER THIS SHIPS — 60 of the audit's 89
-    candidates. A planner, an investigation, a knowledge-base write."""
+    """THE NEGATIVE CONTROL THAT DECIDES WHETHER THIS SHIPS — 60 of the audit's 89 candidates"""
     wo = _order(project, "decide something")
     ops.finish(wo["id"], "decided")
 
@@ -505,9 +413,7 @@ def test_the_invariant_is_silent_on_an_order_that_produced_no_code(started, proj
 
 
 def test_an_abandonment_excuses_that_settling_and_not_the_next_one(started, project):
-    """An abandonment excuses the settling it was written with, and no more. Put
-    `work_abandoned` inside the predicate and an order excused once is excused for ever;
-    the test that catches it is "abandon, then finish again ordinarily"."""
+    """An abandonment excuses the settling it was written with, and no more"""
     wo = _order(project, code="spike")
     ops.finish(wo["id"], "spiked", abandon="not worth landing")
     assert _violations(project) == []
@@ -518,10 +424,7 @@ def test_an_abandonment_excuses_that_settling_and_not_the_next_one(started, proj
 
 
 def test_the_invariant_is_silent_on_an_order_nothing_ever_looked_at(started, project):
-    """wo-5eedc84d and wo-5a6b2d6d as they sit in production TODAY: settled long before
-    anything recorded what they authored. Structurally silent, and stated as a known gap
-    rather than an exoneration — the user accepted it, and these are being closed by
-    hand. Without this, a fleet's whole settled backlog would light up on upgrade."""
+    """wo-5eedc84d and wo-5a6b2d6d as they sit in production TODAY: settled long before anything recorded..."""
     wo = _order(project, code="launcher")
     _complete(project, wo["id"])
 
@@ -529,8 +432,7 @@ def test_the_invariant_is_silent_on_an_order_nothing_ever_looked_at(started, pro
 
 
 def test_the_invariant_costs_no_subprocess(started, project, monkeypatch):
-    """It is in `INVARIANTS`, not `SLOW_INVARIANTS`, and runs on every reconcile tick.
-    That is only defensible because it reads the record and never the repository."""
+    """It is in `INVARIANTS`, not `SLOW_INVARIANTS`, and runs on every reconcile tick"""
     wo = _order(project, code="launcher")
     ops.finish(wo["id"], "done", pr_url=PR)
     store = ProjectStore(project)
@@ -550,12 +452,11 @@ def test_the_invariant_costs_no_subprocess(started, project, monkeypatch):
     assert [v.wo_id for v in found] == [wo["id"]]
 
 
-# -- the record reader -----------------------------------------------------------------
+# -- the record reader
 
 
 def test_both_payload_shapes_are_read_and_a_bare_one_is_not_invented():
-    """`ops.finish` nests the record under `authored`; `park_unlanded` and `--abandon`
-    spread it at the top level beside their own keys. One reader serves both."""
+    """`ops.finish` nests the record under `authored`"""
     record = {"branch": "b", "base": "origin/trunk", "commits": 2, "dirty": ["x.py"]}
 
     assert landing.authored_in({"authored": record}).commits == 2
@@ -564,8 +465,7 @@ def test_both_payload_shapes_are_read_and_a_bare_one_is_not_invented():
 
 
 def test_the_newest_settlement_record_wins():
-    """A work order sent back and re-delivered authored something different by the end,
-    and the record of what it produced has to move with it."""
+    """A work order sent back and re-delivered authored something different by the end"""
     old = {"branch": "b", "base": "origin/trunk", "commits": 1, "dirty": []}
     new = {"branch": "b", "base": "origin/trunk", "commits": 4, "dirty": []}
 

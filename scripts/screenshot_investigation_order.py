@@ -1,23 +1,4 @@
-"""Screenshot the two investigation pages a reviewer has to see, for a PR's evidence.
-
-§2.9 of docs/superpowers/specs/2026-09-27-investigation-orders.md.
-`scripts/screenshot_improvement_order.py` is the shape it copies. Two investigations are
-seeded, because the two verdicts render differently and settle differently: a GAP that was
-FILED (classification, subject, root cause, evidence, issue url + the work order the
-expedited filing dispatched) and a WAITING_ON_USER (the one classification that raises
-attention, showing what the user owes).
-
-The state is built through `ops.create_investigation_order` / `ops.submit_verdict` and
-`jarvis.testing.a_verdict`, never by writing rows: the filing, the duplicate check and the
-attention flag are decisions `ops` owns, and a hand-written row would picture a state the
-OS cannot reach.
-
-`gh` IS THE SHIPPED FAKE (`scripts/screenshot_issue_references.py`' reason): a GAP files an
-EXPEDITED bug, so a real `gh` here would open a real issue on the real tracker. Everything
-else lives in a throwaway JARVIS_HOME, so it never touches the live OS:
-
-    uv run python scripts/screenshot_investigation_order.py
-"""
+"""Screenshot the two investigation pages a reviewer has to see, for a PR's evidence (docs/superpowers/specs/2026-09-27-investigation-orders.md)"""
 
 from __future__ import annotations
 
@@ -40,8 +21,7 @@ BUG_REPO = "gonandrap/agentic_os"
 ORIGIN = f"https://github.com/{BUG_REPO}.git"
 ISSUE = f"https://github.com/{BUG_REPO}/issues/812"
 
-# Both `why`s name their own subject: the page shows the id beside the text, and a
-# screenshot whose two ids disagree reads as a bug in the page.
+# Both `why`s name their own subject: the page shows the id beside the text
 GAP_WHY = ("{subject} has been `validating` for six hours with no turn in flight and no "
            "open Neo question. Find out what is holding it.")
 WAITING_WHY = ("{subject} has not moved in four hours and its worker is idle. Nothing on "
@@ -52,11 +32,7 @@ WAITING_CAUSE = ("Nothing is holding it mechanically: assumption as-4 has been p
 
 
 def _fake_gh(home: Path) -> None:
-    """The fake `gh` binary from the test harness, installed for a plain process.
-
-    `jarvis.testing.fake_gh` is a pytest fixture (it needs `monkeypatch`), so a script
-    installs the same FAKE_GH body itself rather than depending on pytest.
-    """
+    """The fake `gh` binary from the test harness, installed for a plain process"""
     from jarvis.testing import FAKE_GH
 
     gdir = home / "fake-gh"
@@ -69,21 +45,19 @@ def _fake_gh(home: Path) -> None:
     os.environ["FAKE_GH_DIR"] = str(gdir)
     os.environ["FAKE_GH_ISSUE_URL"] = ISSUE
     os.environ["JARVIS_BUG_REPO"] = BUG_REPO
-    # The fake READS STDIN on every call, so a run whose stdin is an open pipe leaves it
-    # blocking and the duplicate check dies on its 30s timeout. Hand every child an empty
-    # one instead of depending on how the script was launched.
+    # The fake READS STDIN on every call
     os.dup2(os.open(os.devnull, os.O_RDONLY), 0)
 
 
 def _subject(store, title: str, description: str) -> str:
-    """A stuck work order — what an investigation is opened ON."""
+    """A stuck work order — what an investigation is opened ON"""
     wo = store.create_work_order(title, description=description)
     store.update_work_order(wo["id"], status="validating")
     return str(wo["id"])
 
 
 def _investigating(store, inv_id: str, subject: str) -> str:
-    """The state the daemon leaves an investigation in: one investigator, `planning`."""
+    """The state the daemon leaves an investigation in: one investigator, `planning`"""
     child = store.create_work_order(f"investigate {subject}", kind="investigator",
                                     parent_id=inv_id, status="running",
                                     description="read-only diagnosis")
@@ -93,7 +67,7 @@ def _investigating(store, inv_id: str, subject: str) -> str:
 
 
 def seed() -> tuple[str, str]:
-    """A GAP investigation whose bug was filed, and a WAITING_ON_USER one."""
+    """A GAP investigation whose bug was filed, and a WAITING_ON_USER one"""
     from jarvis import ops
     from jarvis.central_store import CentralStore
     from jarvis.project_store import ProjectStore
@@ -102,8 +76,7 @@ def seed() -> tuple[str, str]:
     home = Path(os.environ["JARVIS_HOME"])
     _fake_gh(home)
     project = make_git_project(home, PROJECT)
-    # `issues.tracker_project` resolves the project by its git `origin`, and without it a
-    # GAP's expedited filing has no project to dispatch the work order into.
+    # `issues.tracker_project` resolves the project by its git `origin`
     subprocess.run(["git", "remote", "add", "origin", ORIGIN], cwd=project, check=True)
     catalog = home / "catalog.json"
     catalog.write_text(json.dumps({
@@ -139,7 +112,7 @@ def seed() -> tuple[str, str]:
     finally:
         store.close()
 
-    # WAITING_ON_USER first: it files nothing, so it cannot become the GAP's duplicate.
+    # WAITING_ON_USER first: it files nothing, so it cannot become the GAP's duplicate
     ops.submit_verdict(waiting["id"], a_verdict("WAITING_ON_USER",
                                                 subject=waiting_subject,
                                                 root_cause=WAITING_CAUSE,
@@ -182,8 +155,7 @@ def main() -> int:
     home = tempfile.mkdtemp()
     os.environ["JARVIS_HOME"] = home
     os.environ["JARVIS_TRANSCRIPT_ROOT"] = str(Path(home) / "transcripts")
-    # Inside a worker's process tree `JARVIS_SPEND_HOME` names the LIVE os.db — see
-    # `scripts/screenshot_improvement_order.py`.
+    # Inside a worker's process tree `JARVIS_SPEND_HOME` names the LIVE os.db
     os.environ["JARVIS_SPEND_HOME"] = home
     os.environ.pop("JARVIS_WO_ID", None)
     sys.path.insert(0, str(REPO / "src"))

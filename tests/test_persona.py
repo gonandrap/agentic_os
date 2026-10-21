@@ -1,13 +1,4 @@
-"""Structural guards on CLAUDE.md — the Jarvis persona file.
-
-These are cheap, deterministic checks. The LLM-graded behavioural evals live in
-evals/llm/test_jarvis_judgment.py and are opt-in (they cost real model calls).
-
-The invariant that matters: the eval loads CLAUDE.md as a *bare system prompt* with no
-cwd, no git, no repo. So the operator persona must come first and dominate; the dev-mode
-override must stay scoped and below it. Invert that ordering and the routing scenarios
-regress in a way only a paid eval run would catch.
-"""
+"""Structural guards on CLAUDE.md — the Jarvis persona file"""
 
 from __future__ import annotations
 
@@ -41,7 +32,7 @@ def test_persona_file_exists() -> None:
     ],
 )
 def test_operator_directives_precede_dev_mode(persona: str, directive: str) -> None:
-    """Operator content must be readable before any dev-mode override is reached."""
+    """Operator content must be readable before any dev-mode override is reached"""
     assert directive in persona, f"operator directive went missing: {directive!r}"
     dev_at = persona.index(DEV_MODE_HEADING)
     assert persona.index(directive) < dev_at, (
@@ -60,16 +51,12 @@ def test_dev_mode_override_is_present_and_scoped(persona: str) -> None:
 
 
 def test_dev_mode_documents_how_to_detect_the_checkout(persona: str) -> None:
-    """A mode switch nobody can evaluate is just prose."""
+    """A mode switch nobody can evaluate is just prose"""
     assert "git symbolic-ref" in persona
 
 
 def test_referenced_serena_memories_exist(persona: str) -> None:
-    """CLAUDE.md points sessions at the committed code map instead of re-exploring.
-
-    If a memory is renamed or dropped, that pointer rots silently and sessions go back to
-    burning tokens on rediscovery — which is the whole thing this setup prevents.
-    """
+    """CLAUDE.md points sessions at the committed code map instead of re-exploring"""
     assert MEMORY_DIR.is_dir(), f"{MEMORY_DIR} must be committed so it ships to production"
     for name in ("codebase-map", "work-order-lifecycle",
                  "dev-vs-prod-environments", "testing"):
@@ -88,19 +75,19 @@ def test_referenced_serena_memories_exist(persona: str) -> None:
     ],
 )
 def test_crib_sheet_documents_every_improvement_order_verb(persona: str, verb: str) -> None:
-    """An operator verb missing from the crib sheet is a verb the operator never uses."""
+    """An operator verb missing from the crib sheet is a verb the operator never uses"""
     assert verb in persona, f"crib sheet no longer documents {verb!r}"
 
 
 def test_improvement_order_block_expands_the_abbreviation(persona: str) -> None:
-    """Unexpanded, `io` reads as input/output and the whole block means nothing."""
+    """Unexpanded, `io` reads as input/output and the whole block means nothing"""
     assert '"io" = improvement' in persona, (
         'the io block must spell out that "io" = improvement order'
     )
 
 
 def test_improvement_orders_sit_with_the_other_order_types(persona: str) -> None:
-    """Order types are read as a group; a stray block is one the operator skips."""
+    """Order types are read as a group; a stray block is one the operator skips"""
     assert persona.index("jarvis io create") > persona.index("jarvis fo create"), (
         "the io block must follow the fo block, not precede it"
     )
@@ -110,18 +97,17 @@ def test_improvement_orders_sit_with_the_other_order_types(persona: str) -> None
 
 
 def test_prime_directives_still_precede_the_improvement_order_block(persona: str) -> None:
-    """Routing is the persona's first job; no command block may outrank it."""
+    """Routing is the persona's first job; no command block may outrank it"""
     assert persona.index("Route, don't do") < persona.index("jarvis io create"), (
         "the prime directives must still dominate the crib sheet"
     )
 
 
 def test_improvement_order_block_is_shorter_than_the_feature_order_block(persona: str) -> None:
-    """Crib-sheet bloat pushes the directives down the page and regresses the LLM evals."""
+    """Crib-sheet bloat pushes the directives down the page and regresses the LLM evals"""
     fo_at = persona.index("jarvis fo create")
     io_at = persona.index("jarvis io create")
-    # The io block ENDS where the investigate block starts, not at the backlog line:
-    # anything between them is a block of its own and must not be counted here.
+    # The io block ENDS where the investigate block starts
     investigate_at = persona.index("jarvis investigate")
     fo_block = persona[fo_at:io_at]
     io_block = persona[io_at:investigate_at]

@@ -1,8 +1,4 @@
-"""The payoff arithmetic of `scripts/compaction_payoff.py`, on synthetic inputs.
-
-No real state: every case is built in memory, priced on Opus ($5/MTok input), so each
-expected figure below is hand arithmetic over the rates in `usage`.
-"""
+"""The payoff arithmetic of `scripts/compaction_payoff.py`, on synthetic inputs"""
 
 from __future__ import annotations
 
@@ -45,7 +41,7 @@ def case(calls, **kw):
 
 
 def before():
-    # Last call before C: 149,898 prompt + 100 output + 2 input = N of 150,000.
+    # Last call before C: 149,898 prompt + 100 output + 2 input = N of 150,000
     return call(T - 600, read=140_000, write=9_898)
 
 
@@ -136,7 +132,7 @@ def test_capped_when_the_counterfactual_overflows_the_window():
              call(T + 140, read=250_000, write=500)]            # 250.5k + 100k > 300k
     row = cp.assess(case(calls, window=300_000))
     assert row["capped"] is True
-    # The first two calls count; the overflowing one and anything after do not.
+    # The first two calls count; the overflowing one and anything after do not
     assert row["savings_usd"] == pytest.approx(100_000 * PER * (1.25 + 0.1))
 
 
@@ -184,7 +180,7 @@ def test_break_even_counts_turns():
              {"seq": 4, "kind": "message", "started_at": T + 1_000}]
     calls = [before(), call(T + 120, read=13_000, write=36_998),
              call(T + 1_100, read=50_000, write=500)]
-    # Turn 3 saves $0.625, turn 4 $0.05: a $0.65 compaction breaks even in turn 2.
+    # Turn 3 saves $0.625, turn 4 $0.05: a $0.65 compaction breaks even in turn 2
     row = cp.assess(case(calls, turns=turns, cost_usd=0.65))
     assert row["turns_after"] == 2
     assert row["break_even_turn"] == 2
@@ -212,11 +208,7 @@ def test_rows_carry_every_stable_key():
 
 
 def test_the_script_re_exports_the_package_objects_themselves():
-    """The pure core lives in `jarvis.compaction_payoff`; the script re-exports it.
-
-    Identity, not equality: two copies of `assess` would fork the arithmetic silently.
-    Spec §1 of docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md.
-    """
+    """The pure core lives in `jarvis.compaction_payoff`; the script re-exports it (docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md)"""
     import jarvis.compaction_payoff as core
 
     assert cp.assess is core.assess

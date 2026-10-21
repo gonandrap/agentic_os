@@ -1,11 +1,4 @@
-"""Screenshot a spent grant beside a lapsed one on /gates.
-
-The defect issue 491 measured: both read `– expired`, so 23 of 26 production auto-merges
-looked like Neo letting a merge time out. `scripts/screenshot_held_gate.py` is the shape
-this copies.
-
-    uv run python scripts/screenshot_spent_gate.py
-"""
+"""Screenshot a spent grant beside a lapsed one on /gates"""
 
 from __future__ import annotations
 
@@ -23,7 +16,7 @@ PORT = 8809
 
 
 def seed() -> str:
-    """Two decided grants on one work order: one used, one nobody ever used."""
+    """Two decided grants on one work order: one used, one nobody ever used"""
     from jarvis import db, gates, ops
     from jarvis.central_store import CentralStore
     from jarvis.project_store import ProjectStore

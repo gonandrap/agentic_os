@@ -1,20 +1,4 @@
-"""Who is still buying the ONE-HOUR cache write, and which of the two faults that is.
-
-Issue 164 item 3; finding 3 of
-docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md.
-
-THE DISCRIMINATING FIXTURE IS THE ONE FILE THAT HOLDS BOTH HALVES, because that is the
-real shape: wo-2df8828c's transcript is a Jarvis-dispatched worker session whose worktree
-was reopened by hand after the order completed, and keying on the session id blames the OS
-for all 2.5M of a person's tokens. So the tests below mix the two inside one session
-wherever the arithmetic allows it — a fixture that is all one half passes under "classify
-the file" just as well as under "classify the turn".
-
-The second thing pinned throughout is the ASYMMETRY. `cache-1h-dispatched` is a defect in
-this repository; `cache-1h-foreign` is a line in a person's own configuration that Jarvis
-must never write. Every surface has to keep them apart, and a test that only checks a row
-exists would be green with the two merged.
-"""
+"""Who is still buying the ONE-HOUR cache write, and which of the two faults that is (docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md)"""
 
 from __future__ import annotations
 
@@ -48,7 +32,7 @@ def store(started):
 
 @pytest.fixture()
 def transcripts(tmp_path, monkeypatch):
-    """A fake `~/.claude/projects` tree — the only place a foreign session exists."""
+    """A fake `~/.claude/projects` tree — the only place a foreign session exists"""
     root = tmp_path / "transcripts"
     root.mkdir()
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
@@ -86,7 +70,7 @@ def wrote_1h(at: float, mid: str, tokens: int) -> dict:
 
 
 def _both_halves(transcripts, now, *, dispatched: int, foreign: int) -> None:
-    """ONE session file holding both — wo-2df8828c's shape, which is the whole point."""
+    """ONE session file holding both — wo-2df8828c's shape, which is the whole point"""
     transcripts("s-mixed", [
         prompt(now - DAY, sdk=True),
         wrote_1h(now - DAY + 1, "m1", dispatched),
@@ -96,19 +80,17 @@ def _both_halves(transcripts, now, *, dispatched: int, foreign: int) -> None:
 
 
 def _found(now, *, dispatched=0, foreign=0):
-    """An `HourWrites` list without touching a disk — for the prose tests below."""
+    """An `HourWrites` list without touching a disk — for the prose tests below"""
     return [inspection.HourWrites(session_id="s-mixed", directory="-somewhere",
                                   dispatched=dispatched, foreign=foreign,
                                   first_ts=now - DAY, last_ts=now - DAY)]
 
 
-# -- 1. the arithmetic and the two thresholds -----------------------------------------
+# -- 1. the arithmetic and the two thresholds
 
 
 def test_each_kind_answers_to_its_own_threshold(transcripts):
-    """Paired in both directions, because one threshold serving both would satisfy any
-    single-sided assertion. The dispatched floor is an order of magnitude lower, so the
-    middle case — over one, under the other — is the one that discriminates."""
+    """Paired in both directions, because one threshold serving both would satisfy any single-sided..."""
     now = 1_789_000_000.0
     cfg = InspectConfig(alarm_cache_1h_dispatched_tokens=50_000,
                         alarm_cache_1h_tokens=500_000)
@@ -127,8 +109,7 @@ def test_each_kind_answers_to_its_own_threshold(transcripts):
 
 
 def test_the_dispatched_alarm_comes_first_because_it_is_the_worse_finding(transcripts):
-    """`alarms`' ordering contract is most-actionable-first, and only one of these two
-    is a defect anybody here can fix."""
+    """`alarms`' ordering contract is most-actionable-first"""
     now = 1_789_000_000.0
     raised = inspection.hour_alarms(_found(now, dispatched=9_000_000, foreign=10_000_000),
                                     InspectConfig(), days=7)
@@ -137,9 +118,7 @@ def test_the_dispatched_alarm_comes_first_because_it_is_the_worse_finding(transc
 
 
 def test_the_foreign_reason_carries_the_remedy_and_says_it_is_not_ours_to_apply():
-    """THE HONEST CON, in the alarm rather than in a comment. The supervisor files a work
-    order off this text and nothing else, so the line to add has to be IN it — and so
-    does the limit, or the remedy proposed will be for Jarvis to write the file."""
+    """THE HONEST CON, in the alarm rather than in a comment"""
     now = 1_789_000_000.0
     (alarm,) = inspection.hour_alarms(_found(now, foreign=900_000), InspectConfig(),
                                       days=7)
@@ -153,24 +132,20 @@ def test_the_foreign_reason_carries_the_remedy_and_says_it_is_not_ours_to_apply(
 
 
 def test_the_dispatched_reason_blames_the_os_and_never_the_users_config():
-    """The opposite sentence for the opposite fault. If this one carried the personal
-    settings line, the supervisor would file a work order telling a person to fix a bug
-    in this repository."""
+    """The opposite sentence for the opposite fault"""
     now = 1_789_000_000.0
     (alarm,) = inspection.hour_alarms(_found(now, dispatched=900_000), InspectConfig(),
                                       days=7)
 
     assert "BREACH" in alarm.reason and "defect in the OS" in alarm.reason
-    # The claim is about the turns stamped `5m`, not about every process the OS starts:
-    # spec §5 of docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md.
+    # The claim is about the turns stamped `5m` (docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md)
     assert "wo_turns.cache_ttl" in alarm.reason and "5m" in alarm.reason
     assert "~/.claude/settings.json" not in alarm.reason
     assert "MUST NOT TRY" not in alarm.reason
 
 
 def test_the_premium_is_the_rate_difference_and_not_the_price():
-    """These tokens were written either way; the avoidable money is 2.0x - 1.25x, not the
-    whole write (kn-f94abf34 (0)). 1M tokens at Opus $5/MTok: 0.75 x 5 = $3.75."""
+    """These tokens were written either way"""
     assert inspection._hour_premium_usd(1_000_000) == pytest.approx(3.75)
 
     now = 1_789_000_000.0
@@ -179,7 +154,7 @@ def test_the_premium_is_the_rate_difference_and_not_the_price():
     assert "$3.75" in alarm.reason and "Opus list" in alarm.reason
 
 
-# -- 2. the daemon: who raises it, on what, and how often ------------------------------
+# -- 2. the daemon: who raises it, on what, and how often
 
 
 def _raise(daemon, store, transcripts, *, dispatched=0, foreign=0, now=None, **over):
@@ -205,14 +180,12 @@ def test_the_daemon_raises_one_alarm_per_fault_on_the_latest_settled_order(
         assert row["seq"] == NO_TURN          # it judged no turn
         assert row["source"] == "cost"
         assert row["alarm_status"] == "raised"     # on the supervisor's queue
-    # The carrier is a hook, not a subject: it must not be flagged for the user.
+    # The carrier is a hook, not a subject: it must not be flagged for the user
     assert not store.get_work_order(carrier["id"])["needs_attention"]
 
 
 def test_the_inbox_says_which_of_the_two_faults_it_is(started, store, transcripts):
-    """The inbox row is the DURABLE half — it is what reaches `jarvis status` and
-    Telegram. Two rows reading the same would merge the exact distinction this change
-    exists to make, and send the reader to the wrong file."""
+    """The inbox row is the DURABLE half — it is what reaches `jarvis status` and Telegram"""
     store.create_work_order("carrier", status="completed")
     _raise(started, store, transcripts, dispatched=90_000, foreign=900_000)
 
@@ -226,9 +199,7 @@ def test_the_inbox_says_which_of_the_two_faults_it_is(started, store, transcript
 
 def test_only_the_os_owning_project_scans(started, store, transcripts, tmp_path,
                                           jarvis_home, monkeypatch):
-    """A fleet reading carried once. Transcripts belong to no project, so N projects
-    raising it is N-1 copies of the same alarm — `schedule.JobContext` made this call
-    already for the OS-level doctor checks."""
+    """A fleet reading carried once"""
     from jarvis import schedule
 
     store.create_work_order("carrier", status="completed")
@@ -236,16 +207,13 @@ def test_only_the_os_owning_project_scans(started, store, transcripts, tmp_path,
     owner = schedule.os_owner((p.name, p.path) for p in started.catalog.projects)
     assert owner == project.name, "the single test project owns the install by fallback"
 
-    # Same project, now NOT the owner.
+    # Same project, now NOT the owner
     monkeypatch.setattr(Daemon, "_os_owner", lambda self: "somebody-else")
     assert _raise(started, store, transcripts, foreign=9_000_000) == []
 
 
 def test_it_is_raised_once_per_window_and_again_after_it(started, store, transcripts):
-    """The condition is STANDING — still true on the next pass, which is what makes it
-    different from a burning turn. Both halves: a second pass inside the window adds
-    nothing, and back-dating the row past the window lets it raise afresh. Without the
-    negative half a dedupe that never raises again would pass."""
+    """The condition is STANDING — still true on the next pass"""
     from jarvis import db
 
     store.create_work_order("carrier", status="completed")
@@ -262,25 +230,21 @@ def test_it_is_raised_once_per_window_and_again_after_it(started, store, transcr
 
 
 def test_the_off_switch_covers_this_too(started, store, transcripts):
-    """`inspect.enabled` is one switch for "raise nothing here" — a second way to turn
-    one thing off is a second way to be surprised by it."""
+    """`inspect.enabled` is one switch for "raise nothing here\""""
     store.create_work_order("carrier", status="completed")
     assert _raise(started, store, transcripts, foreign=9_000_000, enabled=False) == []
 
 
 def test_with_no_settled_order_nothing_is_raised_and_nothing_breaks(started, store,
                                                                     transcripts):
-    """`wo_alarms.wo_id` is a real foreign key and a young project has nothing to hang
-    one on. The finding is not lost — it is still true on the next pass."""
+    """`wo_alarms.wo_id` is a real foreign key and a young project has nothing to hang one on"""
     store.create_work_order("still running", status="running")
 
     assert _raise(started, store, transcripts, foreign=9_000_000) == []
 
 
 def test_a_quiet_fleet_raises_nothing(started, store, transcripts):
-    """What this looks like when it is WORKING, which is the state the fleet is in as
-    this ships: the user's own `FORCE_PROMPT_CACHING_5M` is holding and no 1h write has
-    been made anywhere since 2026-08-31."""
+    """What this looks like when it is WORKING"""
     from jarvis import db
 
     store.create_work_order("carrier", status="completed")
@@ -302,9 +266,7 @@ def test_a_quiet_fleet_raises_nothing(started, store, transcripts):
 
 
 def test_a_write_outside_the_window_is_not_in_it(started, store, transcripts):
-    """The window is a cohort, and a leak fixed a month ago must stop being reported.
-    Paired with the same tokens inside the window, or "raises nothing" would also be
-    satisfied by a scan that read no files at all."""
+    """The window is a cohort, and a leak fixed a month ago must stop being reported"""
     from jarvis import db
 
     store.create_work_order("carrier", status="completed")
@@ -325,18 +287,7 @@ def test_a_write_outside_the_window_is_not_in_it(started, store, transcripts):
 
 
 def test_the_real_loop_raises_these_on_the_offset_tick(started, store, transcripts):
-    """THE WIRE, and the only test that fails if `Daemon.tick` stops calling this at all.
-
-    Every other test here calls `check_cache_ttl` directly, which grades the method and
-    says nothing about whether the daemon ever reaches it — and because this feature
-    ships firing on NOTHING (the trailing windows are zero), a dead wire would not show
-    up in production either. So this drives `tick` itself, one tick short of the offset,
-    and asserts the alarms and the inbox rows come out the far end.
-
-    The thresholds are the SHIPPED defaults rather than a fixture's: `tick` reloads the
-    catalog first, so a config set on the in-memory object would not survive the call —
-    and grading the wire against what actually ships is the stronger claim anyway.
-    """
+    """THE WIRE, and the only test that fails if `Daemon.tick` stops calling this at all"""
     from jarvis import daemon as daemon_mod, db
 
     carrier = store.create_work_order("carrier", status="completed")
@@ -354,11 +305,11 @@ def test_the_real_loop_raises_these_on_the_offset_tick(started, store, transcrip
     assert set(daemon_mod.CACHE_1H_INBOX_TITLE.values()) <= titles
 
 
-# -- 3. the arm the turn ran on (spec 2026-10-15-the-hour-on-worker-turns-only.md §5) --
+# -- 3. the arm the turn ran on (spec 2026-10-15-the-hour-on-worker-turns-only.md §5)
 
 
 def _armed_turn(store, transcripts, now, *, arm: str, tokens: int) -> None:
-    """A dispatched 1h write inside a turn STAMPED with `arm`, in that turn's session."""
+    """A dispatched 1h write inside a turn STAMPED with `arm`, in that turn's session"""
     wo = store.create_work_order("armed", status="running", session_id="s-armed")
     turn = store.create_turn(wo["id"], kind="dispatch", prompt="go", cache_ttl=arm)
     store.conn.execute("UPDATE wo_turns SET started_at=?, ended_at=? WHERE id=?",
@@ -369,9 +320,7 @@ def _armed_turn(store, transcripts, now, *, arm: str, tokens: int) -> None:
 
 
 def test_an_hour_the_catalog_asked_for_raises_no_alarm(started, store, transcripts):
-    """The OS must not accuse itself of a defect it was told to have. The daemon builds
-    the `arms` index from `ProjectStore.turn_arms`; without it this is CACHE_1H_DISPATCHED
-    the moment a project opts in."""
+    """The OS must not accuse itself of a defect it was told to have"""
     from jarvis import db
 
     store.create_work_order("carrier", status="completed")
@@ -386,8 +335,7 @@ def test_an_hour_the_catalog_asked_for_raises_no_alarm(started, store, transcrip
 
 
 def test_the_same_write_on_the_control_arm_still_raises(started, store, transcripts):
-    """The pair: one stamp apart, and the breach is still reported. A suppression that
-    covered the whole fleet while an experiment ran would hide exactly this."""
+    """The pair: one stamp apart, and the breach is still reported"""
     from jarvis import db
 
     store.create_work_order("carrier", status="completed")
@@ -403,9 +351,7 @@ def test_the_same_write_on_the_control_arm_still_raises(started, store, transcri
 
 
 def test_one_tick_of_the_real_loop_does_not_scan(started, store, transcripts):
-    """The negative half of the pair above, and the reason the offset exists: tick 1 is
-    the daemon's FIRST, where a 20-second disk walk sits in front of every dispatch the
-    OS is starting. Same tree, same carrier, same defaults — only the tick differs."""
+    """The negative half of the pair above"""
     from jarvis import db
 
     store.create_work_order("carrier", status="completed")
@@ -418,17 +364,14 @@ def test_one_tick_of_the_real_loop_does_not_scan(started, store, transcripts):
 
 
 def test_the_offset_is_a_real_offset(started):
-    """The constant the pair above rests on, checked directly rather than by restating
-    `% period == offset` — an arithmetic identity cannot fail. What CAN fail is somebody
-    setting the offset back to 1, which silently returns the walk to the daemon's first
-    tick while both loop tests above keep passing on their own terms."""
+    """The constant the pair above rests on"""
     from jarvis import daemon as daemon_mod
 
     assert daemon_mod.CACHE_TTL_TICK_OFFSET != 1
     assert 0 < daemon_mod.CACHE_TTL_TICK_OFFSET < daemon_mod.CACHE_TTL_EVERY_TICKS
 
 
-# -- 3. the alarm actually reaches the supervisor --------------------------------------
+# -- 3. the alarm actually reaches the supervisor
 
 
 def _raised(started, store, transcripts):
@@ -438,10 +381,7 @@ def _raised(started, store, transcripts):
 
 
 def test_the_drain_hands_it_to_the_judge(started, store, transcripts):
-    """THE ENGAGEMENT PIN. A row in `wo_alarms` is not the deliverable — the ask is that
-    the SUPERVISOR is engaged. `_drain_project_alarms` declines an alarm by marking it
-    `skipped`, so that assertion is what discriminates: a settled carrier tripping an
-    exclusion would leave the table looking identical."""
+    """THE ENGAGEMENT PIN"""
     from jarvis.neo_store import NeoStore
 
     alarm = _raised(started, store, transcripts)
@@ -471,9 +411,7 @@ def test_the_drain_hands_it_to_the_judge(started, store, transcripts):
 
 def test_the_evidence_packet_carries_the_remedy_and_no_turn_number(started, store,
                                                                    transcripts):
-    """The judge sees the packet and never the alarm row. `raised on turn -1` is nonsense
-    a judge would have to interpret, and a packet missing the remedy line cannot produce
-    the work order the user asked for."""
+    """The judge sees the packet and never the alarm row"""
     from jarvis import supervisor
     from jarvis.catalog import SupervisorConfig
 
@@ -491,9 +429,7 @@ def test_the_evidence_packet_carries_the_remedy_and_no_turn_number(started, stor
 
 
 def test_the_supervisor_is_told_these_two_are_not_this_projects_fault(started):
-    """The persona is the only place the judge learns that the carrier means nothing and
-    that one of the two kinds is not the OS's to fix. Both prompts, because a judge that
-    escalates reads the second one."""
+    """The persona is the only place the judge learns that the carrier means nothing and that one of the..."""
     from jarvis import supervisor
 
     for prompt_text in (supervisor.SUPERVISOR_PERSONA,
@@ -503,15 +439,11 @@ def test_the_supervisor_is_told_these_two_are_not_this_projects_fault(started):
         assert "must never write" in prompt_text
 
 
-# -- 4. the guards around the two new kinds --------------------------------------------
+# -- 4. the guards around the two new kinds
 
 
 def test_each_alarm_family_owns_its_own_inbox_titles():
-    """WHY THERE ARE TWO DICTS. A dict named for one family is a thing a test reads
-    WHOLE — `test_rewrite_tax_alarm.test_the_carrier_is_not_flagged_for_attention`
-    asserts its two titles are exactly the two rows a raise produced — so a third entry
-    there silently changes what an existing assertion means. It did, and this pins the
-    separation rather than the accident."""
+    """WHY THERE ARE TWO DICTS"""
     from jarvis import daemon as daemon_mod
 
     assert set(daemon_mod.CACHE_1H_INBOX_TITLE) == {
@@ -521,15 +453,12 @@ def test_each_alarm_family_owns_its_own_inbox_titles():
 
 
 def test_a_probe_cannot_be_named_after_one_of_these_alarms():
-    """`probes.RESERVED_IDS` duplicates `inspection.ALARM_KINDS` as literals — probes
-    cannot import inspection without a cycle through catalog — so a collision would put
-    two different things under one name on `/alarms`."""
+    """`probes.RESERVED_IDS` duplicates `inspection.ALARM_KINDS` as literals"""
     assert set(inspection.ALARM_KINDS) == set(probes.RESERVED_IDS)
 
 
 def test_the_thresholds_are_settings_and_a_zero_is_refused_where_it_was_typed(tmp_path):
-    """A window of zero days reports nothing for ever and a token floor of zero alarms on
-    the first write any session makes; both arrive by a typo in `jarvis config set`."""
+    """A window of zero days reports nothing for ever and a token floor of zero alarms on the first write..."""
     def _catalog(**inspect):
         return {"os": {"defaults": {"model": "sonnet"}, "inspect": inspect},
                 "projects": [{"name": "p", "path": str(tmp_path)}]}

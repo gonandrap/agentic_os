@@ -1,40 +1,4 @@
-"""Does a dispatched worker's FIRST Serena call work, in a fresh worktree?
-
-The failure: the Claude Code plugin starts the Serena MCP server with fixed args carrying
-neither `--project` nor `--project-from-cwd`, and no Serena env var selects a project, so
-the first `find_symbol` of a dispatched turn comes back `No active project`. Spec
-docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md §5.
-
-TWO MODES, one real `claude -p` turn each, so each run bills tokens. Not a test.
-
-    uv run python scripts/probe_serena_activation.py                  # BEFORE
-    uv run python scripts/probe_serena_activation.py --wo <wo-id>     # AFTER
-
-BEFORE (no `--wo`): the settings carry the scratch id, which maps to no work-order
-record, so `SessionStart` injects nothing and the turn shows the raw failure — expect
-`No active project`.
-
-AFTER (`--wo <real-id>`): the settings carry a real work-order id, the hook maps it and
-injects `hooks.serena_activation_context`, and the same turn shows symbols.
-
-THREE PATHS THAT MUST NOT BE CONFLATED, each the subject of a wrong earlier revision:
-
-  CODE_ROOT    this checkout — where the scratch worktree is cut from, and where the
-               `jarvis` build under test lives. `jarvis` on the operator's PATH is the
-               PRODUCTION venv, and `dispatch._worker_path()` bakes that bindir into
-               `settings["env"]["PATH"]`, which WINS inside the session: left alone, the
-               `jarvis _hook` that runs is production's build, which has no
-               `serena_activation_context`, and the probe measures the old code.
-  STATE_ROOT   where the project DB is (`.jarvis/jarvis.db`). It is the MAIN checkout,
-               never a worktree, and it is what `JARVIS_PROJECT_PATH` must name or the
-               hook cannot map the session to a work order.
-  SCRATCH      a worktree id of its OWN, never the work-order id: `CODE_ROOT/.claude/
-               worktrees/<wo-id>` is the live session's own worktree.
-
-The 25-second wait is load-bearing: the Serena MCP server reports `pending` for the first
-seconds of a session, and a call made before it connects fails for a reason that has
-nothing to do with project activation.
-"""
+"""Does a dispatched worker's FIRST Serena call work, in a fresh worktree? (docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md §5.)"""
 
 from __future__ import annotations
 
@@ -56,11 +20,7 @@ from jarvis.dispatch import _write_worker_settings  # noqa: E402
 
 
 def state_root(code_root: Path) -> Path:
-    """The checkout holding `.jarvis/jarvis.db` — this one, or its parent repository.
-
-    A worktree's `.jarvis/` holds only `worker-settings`; the records live in the main
-    checkout, and a probe pointed at the worktree maps no session to any work order.
-    """
+    """The checkout holding `.jarvis/jarvis.db` — this one, or its parent repository"""
     parts = code_root.parts
     if len(parts) > 3 and parts[-3:-1] == (".claude", "worktrees"):
         return code_root.parents[2]
@@ -69,19 +29,10 @@ def state_root(code_root: Path) -> Path:
 
 STATE_ROOT = state_root(CODE_ROOT)
 
-#: Seconds to wait inside the session before the first MCP call. The server is `pending`
-#: for the first few; this is that with room to spare, and well under the 240s a single
-#: foreground Bash call may block (`hooks.MAX_FOREGROUND_SECONDS`).
+#: Seconds to wait inside the session before the first MCP call
 MCP_WARMUP_SECONDS = 25
 
-#: THE PROMPT MAY NOT MENTION ACTIVATION IN EITHER DIRECTION, and both directions were
-#: tried and were wrong. A revision that said "make ONE call … do not call any other
-#: tool" SUPPRESSED the behaviour under test: the injected block arrived (confirmed in
-#: the transcript) and the model obeyed the prohibition over it — 0 `activate_project`.
-#: A revision that said "obey any instruction already in this context about activating a
-#: Serena project" FAKED it: a dispatched worker gets no such sentence, so the run proved
-#: the injected string was correct and not that a worker acts on it, which is the claim.
-#: Hence a neutral ask, which is what a real work order looks like.
+#: THE PROMPT MAY NOT MENTION ACTIVATION IN EITHER DIRECTION
 PROMPT = """\
 Find the symbol `handle_hook` in src/jarvis/hooks.py. Use Serena's find_symbol.
 
@@ -94,13 +45,7 @@ def claude() -> str:
 
 
 def make_worktree(scratch_id: str) -> Path:
-    """A scratch worktree where dispatch predicts one: `<root>/.claude/worktrees/<id>`.
-
-    The path is not a free choice — `_write_worker_settings` computes its permission
-    rules and its CLAUDE.md excludes from exactly this layout. REFUSES an existing path:
-    a live session's worktree sits in the same directory and running the turn inside it
-    would measure that session's tree, not a fresh one.
-    """
+    """A scratch worktree where dispatch predicts one: `<root>/.claude/worktrees/<id>`"""
     tree = CODE_ROOT / ".claude" / "worktrees" / scratch_id
     if tree.exists():
         raise SystemExit(f"refusing: {tree} already exists — pass a unique --scratch id")
@@ -116,14 +61,7 @@ def drop_worktree(tree: Path) -> None:
 
 
 def settings_for(scratch_id: str, wo_id: str | None) -> Path:
-    """The worker's settings file, written by dispatch's own writer and then corrected.
-
-    Reused rather than reimplemented: a probe that hand-built this file would be
-    measuring a settings shape no dispatch ever produces. Two values are rewritten
-    afterwards, both for reasons in the module docstring — `env.PATH` so the hook runs
-    THIS build's `jarvis`, and `env.JARVIS_PROJECT_PATH` / `env.JARVIS_WO_ID` so the
-    hook can map the session to a record (or, with no `--wo`, provably cannot).
-    """
+    """The worker's settings file, written by dispatch's own writer and then corrected"""
     path = _write_worker_settings(ProjectSpec(name="jarvis-os", path=CODE_ROOT),
                                   {"id": scratch_id, "title": "serena probe"})
     settings = json.loads(path.read_text())
@@ -139,10 +77,7 @@ def settings_for(scratch_id: str, wo_id: str | None) -> Path:
 
 
 def hook_build(settings: Path) -> str:
-    """Which `jarvis` the settings' PATH resolves, and whether it has the fix.
-
-    The one line that says whether this run measured the new code or production's.
-    """
+    """Which `jarvis` the settings' PATH resolves, and whether it has the fix"""
     env_path = json.loads(settings.read_text())["env"]["PATH"]
     exe = shutil.which("jarvis", path=env_path)
     if not exe:
@@ -164,11 +99,7 @@ def transcript(session_id: str) -> Path | None:
 
 
 def tool_calls(path: Path) -> tuple[list[tuple[str, str]], dict[str, str]]:
-    """`[(tool_use_id, tool name)]` in call order, and every tool result by id.
-
-    De-duplicated by `tool_use_id`: a transcript carries each record more than once, and
-    counting lines reports a single call as two.
-    """
+    """`[(tool_use_id, tool name)]` in call order, and every tool result by id"""
     calls: list[tuple[str, str]] = []
     seen: set[str] = set()
     results: dict[str, str] = {}
@@ -194,12 +125,7 @@ def tool_calls(path: Path) -> tuple[list[tuple[str, str]], dict[str, str]]:
 
 
 def first_find_symbol(session_id: str) -> tuple[str | None, list[str]]:
-    """The FIRST `find_symbol` result of the turn, verbatim, and the tool call order.
-
-    The reading the spec asks for, and the only one that is honest under a neutral
-    prompt: the final assistant message is the model's prose and is not pinned by
-    anything now that the prompt no longer dictates it.
-    """
+    """The FIRST `find_symbol` result of the turn, verbatim, and the tool call order"""
     path = transcript(session_id)
     if path is None:
         return None, []

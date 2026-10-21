@@ -1,14 +1,4 @@
-"""Renders of the bill, captured as files, so the surface can be reviewed and not
-just asserted about.
-
-Every other test here asks "is the arithmetic right". This one asks the question a
-reviewer actually has — "show me the page" — and writes the answer to
-`$JARVIS_BILL_EVIDENCE`. It is skipped unless that is set, so it costs the suite
-nothing; run it with the variable pointed at a directory and the HTML lands there.
-
-It runs inside the ordinary test fixtures, which means it inherits the isolation gate:
-no live state, no live spend database, nothing but a temporary home.
-"""
+"""Renders of the bill, captured as files, so the surface can be reviewed and not just asserted about"""
 
 from __future__ import annotations
 
@@ -31,11 +21,7 @@ pytestmark = pytest.mark.skipif(not EVIDENCE, reason="set JARVIS_BILL_EVIDENCE=<
 
 
 def test_render_a_bill_with_every_actor_on_it(store, registered, transcripts, capsys):
-    """One order that spent in all three ways, rendered to HTML and to the terminal.
-
-    The OS half is the half the user could not see: a Neo answer, five panel seats, a
-    digest and the worker's own subprocesses, each on its own row and each expandable.
-    """
+    """One order that spent in all three ways, rendered to HTML and to the terminal"""
     from fastapi.testclient import TestClient
 
     wo = store.create_work_order("what an order with every kind of spend costs", "")
@@ -47,14 +33,10 @@ def test_render_a_bill_with_every_actor_on_it(store, registered, transcripts, ca
                                    at=1_005)],
                     {"agentType": "jarvis-architect",
                      "description": "Architect: validation panel decomposition"}),
-                   # The second one is the spec's case: every row mid-stream, so its
-                   # transcript reports 5 output tokens against the ~30,000 the turn's
-                   # envelope knows it spent (spec 2026-10-08 §1).
+                   # The second one is the spec's case: every row mid-stream
                    (placeholder_rows("s2", write=11_000, read=900_000, out=5, at=1_007),
                     {"agentType": "Explore", "description": "read the cost surfaces"})])
-    # The turn's own envelope COVERS both subagents, which is the real relationship —
-    # `modelUsage` counts every model call the turn made — so the transcript and the
-    # recorded turn agree and the bill has no gap line to explain.
+    # The turn's own envelope COVERS both subagents, which is the real relationship
     turn = add_turn(store, wo["id"], dict(recorded_usage(4.43), usage_v=2, input=82,
                                           cache_write=226_000 + 129_000 + 11_000,
                                           cache_read=3_000_000 + 2_000_000 + 900_000,
@@ -91,7 +73,7 @@ def test_render_a_bill_with_every_actor_on_it(store, registered, transcripts, ca
     b = ops.bill(wo["id"])
     assert b["checks"]["balanced"], b["checks"]["problems"]
     assert {line["key"] for line in b["actors"]} == {"worker", "jarvis", "subprocesses"}
-    # The residue is on the render under review, not only in the arithmetic suite.
+    # The residue is on the render under review, not only in the arithmetic suite
     assert any(line["label"] == "unattributed" for line in b["agents"])
     assert b["placeholder"]["subagent_calls"] == 1
 

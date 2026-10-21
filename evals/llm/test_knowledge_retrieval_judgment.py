@@ -1,56 +1,4 @@
-"""LLM-graded knowledge-retrieval evals: is the INDEX ITSELF aimable?
-
-Paired with `test_knowledge_retrieval.py`, which asks the bigger question — put a tooled
-subject in a sandbox with a real `jarvis`, and does it go and read, before acting, and
-apply what it read? That is the stronger measurement and it is the one to trust about
-worker behaviour.
-
-This file asks the narrower one it cannot: **is the index a good map?** Its subjects are
-tool-less and answer with a single command, which makes each case cheap enough to run
-eleven of them across two adversarial batteries — decoy discrimination (five billing and
-deploy entries, only one of them right) and phantom resistance (four areas the index does
-not cover at all). Neither is visible to a tooled subject, which can search three times,
-read the wrong entry, notice, and recover: the retry masks exactly the property being
-measured.
-
-The other half is that retrieval here is graded by RUNNING the subject's chosen search
-term against a real store rather than by matching its reply. That is what caught the
-phrase-search defect (below) — a tooled subject's second query hid it.
-
-
-Worker prompts no longer carry the knowledge base; they carry a bounded index of it
-(headline + id) and four commands for fetching the rest. That trade only pays if a model
-handed the index can (a) notice the entry it needs exists and (b) aim a retrieval at the
-right one — and a headline is 160 characters, so (b) is not free.
-
-Three batteries:
-
-  * knowledge/retrieve  — the answer sits behind an index headline. The worker must
-                          reach for the knowledge base rather than decide for itself
-                          (>= 6/7).
-  * knowledge/precision — when it names an id, it must name the RIGHT one. The index
-                          is deliberately full of adjacent decoys inside the same
-                          topic, because "there is something about deploys" is not
-                          findability; "it is THIS one" is (>= 5/6 of the replies
-                          that name an id).
-  * knowledge/no-phantom — the area is genuinely absent from the index. Searching is
-                          fine, inventing an id is not: a model that answers every
-                          situation with `learn show kn-something` would ace the first
-                          two batteries while being useless (>= 3/4).
-
-Retrieval is graded against a REAL store, not by string matching. When the reply
-searches instead of showing, the term it chose is run through
-`CentralStore.search_knowledge` and the target entry has to actually come back — so a
-plausible-looking `jarvis learn search "deployment"` that retrieves nothing is scored
-as the miss it is. That is also the early-warning system for the search backend, which is
-now FTS5/BM25 over a substring floor (docs/superpowers/specs/2026-08-24-ranked-knowledge-
-search.md). Stemming is in; SYNONYMS are not, and no lexical index can reach them — the
-day this battery starts failing on one is the day that becomes the next work order.
-
-Opt-in (spends tokens, needs a logged-in Claude Code):
-    JARVIS_EVALS_LLM=1 pytest evals/llm/test_knowledge_retrieval_judgment.py -q
-    JARVIS_EVALS_MODEL=opus  # optional, default sonnet
-"""
+"""LLM-graded knowledge-retrieval evals: is the INDEX ITSELF aimable?"""
 
 from __future__ import annotations
 
@@ -81,13 +29,7 @@ WO = {
                     "it somewhere they can pick it up."),
 }
 
-# The fixture knowledge base. Every body is long enough that its headline is a genuine
-# truncation — if these were one-liners the index would be the payload and the eval
-# would prove nothing. `key` is the eval's handle on the row; the worker never sees it.
-#
-# Topics carry DECOYS on purpose: two deploy entries, three billing entries. An index
-# that only lets a model conclude "there is something about deploys in here" has not
-# made anything findable.
+# The fixture knowledge base
 KB: list[tuple[str, str, str, str]] = [
     ("migrations-during-deploy", "deploy",
      "Schema migrations never run inside the deploy step. The deploy is blue/green, so "
@@ -166,8 +108,7 @@ INSTRUCTION = (
     "Situation: "
 )
 
-# The answer sits behind an index headline. Reaching for the knowledge base — by id or
-# by search — is the pass; deciding it alone is the miss.
+# The answer sits behind an index headline
 MUST_RETRIEVE = [
     ("rounding", "I am about to write the code that renders the billing amounts into "
      "the export file. I was going to format them with a plain two-decimal float "
@@ -188,9 +129,7 @@ MUST_RETRIEVE = [
      "migrations-during-deploy"),
 ]
 
-# The index says nothing about these. Searching is legitimate; asserting a specific
-# entry holds the answer is a hallucination, and a model that always reaches for
-# `learn show` would otherwise sweep the batteries above.
+# The index says nothing about these
 MUST_NOT_INVENT = [
     ("absent-csv-dialect", "I need to pick the CSV dialect for the export file — "
      "comma or semicolon separated, and whether to emit a header row."),
@@ -204,20 +143,13 @@ MUST_NOT_INVENT = [
 
 @pytest.fixture(scope="module")
 def neutral_cwd(tmp_path_factory) -> Path:
-    """Run the subject outside this repo, so its CLAUDE.md is not loaded on top of the
-    worker contract we are actually testing (same reason as the persona evals)."""
+    """Run the subject outside this repo"""
     return tmp_path_factory.mktemp("jarvis-knowledge-eval")
 
 
 @pytest.fixture(scope="module")
 def store(tmp_path_factory) -> CentralStore:
-    """A real central store holding KB. The eval grades retrieval by running the
-    worker's chosen search term through it, so this cannot be a stub.
-
-    Given an explicit db path rather than `$JARVIS_HOME`: the autouse `jarvis_home`
-    fixture is function-scoped and would repoint the env under this module-scoped
-    store between tests.
-    """
+    """A real central store holding KB"""
     home = tmp_path_factory.mktemp("jarvis-knowledge-home")
     central = CentralStore(path=home / "os.db")
     for key, topic, content, tags in KB:
@@ -227,29 +159,19 @@ def store(tmp_path_factory) -> CentralStore:
     return central
 
 
-# key -> kn-id, filled by the `store` fixture. The worker never sees the keys; they are
-# how the scenarios below name the entry each one should have retrieved.
+# key -> kn-id, filled by the `store` fixture
 IDS: dict[str, str] = {}
 
 
 @pytest.fixture(scope="module")
 def contract(store, tmp_path_factory) -> str:
-    """The REAL dispatch prompt, with the REAL index block. If the renderer changes,
-    this eval changes with it, which is the point."""
+    """The REAL dispatch prompt, with the REAL index block"""
     spec = ProjectSpec(name="billing_app",
                        path=tmp_path_factory.mktemp("billing_app"))
     brief = store.knowledge_brief("billing_app")
     prompt = build_worker_prompt(WO, spec, brief)
 
-    # Guard the eval's own premise. Every entry has to be reachable — its id in the
-    # index — and every entry a scenario TARGETS has to be there as a headline with its
-    # body withheld. Without this the suite would silently degrade into reading answers
-    # straight out of the prompt the day someone raises the injection default.
-    #
-    # Only the targets, not all of KB: `pr-conventions` and `secrets` are shorter than
-    # the headline budget, so their headline is legitimately the whole entry. That is
-    # what a real knowledge base looks like, and they are here as index filler, never
-    # as the answer to a scenario.
+    # Guard the eval's own premise
     assert "# Knowledge base" in prompt
     bodies = {key: content for key, _topic, content, _tags in KB}
     for key in bodies:
@@ -276,12 +198,7 @@ KN_ID = re.compile(r"kn-[0-9a-f]+")
 
 
 def retrieved(reply: str, target_id: str, store: CentralStore) -> tuple[bool, str]:
-    """Did this reply actually fetch the target entry? Returns (hit, how).
-
-    `show <id>` is checked against the id. A search is checked by RUNNING it: the term
-    the worker picked has to bring the target back out of the real store, so a
-    reasonable-sounding term that retrieves nothing counts as a miss rather than a pass.
-    """
+    """Did this reply actually fetch the target entry?"""
     if "jarvis learn show" in reply:
         ids = KN_ID.findall(reply)
         return (target_id in ids), f"show {ids}"
@@ -310,12 +227,7 @@ def test_worker_retrieves_what_the_index_advertises(replies, store):
 
 @scenario("knowledge/precision", "an index headline points at the RIGHT entry")
 def test_named_ids_are_the_right_ones(replies, store):
-    """Among replies that name an id at all, how many name the correct one?
-
-    This is the findability claim. The index carries adjacent decoys in the same topic
-    (two deploy entries, three billing ones), so picking the right id means the
-    headline carried enough to discriminate — not merely enough to notice the topic.
-    """
+    """Among replies that name an id at all, how many name the correct one?"""
     named, correct, wrong = 0, 0, []
     for name, _situation, key in MUST_RETRIEVE:
         ids = KN_ID.findall(replies[name])
@@ -335,16 +247,13 @@ def test_named_ids_are_the_right_ones(replies, store):
 
 @scenario("knowledge/no-phantom", "an absent area does not summon an invented entry")
 def test_absent_knowledge_is_not_invented(replies):
-    """Searching an area the index does not cover is fine — claiming a specific entry
-    holds the answer is not. Without this, a model that answers everything with
-    `jarvis learn show kn-whatever` would sweep the other two batteries."""
+    """Searching an area the index does not cover is fine"""
     known = set(IDS.values())
     bad = []
     for name, _situation in MUST_NOT_INVENT:
         reply = replies[name]
         ids = KN_ID.findall(reply)
-        # citing an id for an area the index is silent on is the failure, whether the
-        # id is fabricated or a real entry about something else entirely
+        # citing an id for an area the index is silent on is the failure
         if ids:
             bad.append(f"{name}: cited {ids} "
                        f"({'fabricated' if set(ids) - known else 'unrelated real entry'})"

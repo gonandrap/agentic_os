@@ -1,38 +1,4 @@
-"""The knowledge-retrieval eval must not be able to grade nothing.
-
-`evals/llm/test_knowledge_retrieval.py` is the only measurement anyone has of the claim
-the on-demand knowledge base rests on: that a worker handed an INDEX goes and reads the
-entry before it acts. It costs seven real agent runs, so it is opt-in and CI never runs
-it — which means every one of its failure modes is silent. The eval skips, the scorecard
-does not mention it, and the first sign of trouble is a paid run months later reporting a
-behavioural regression that is really harness drift.
-
-That is not hypothetical here. This eval's subject is configured through
-`claude_cli.run_headless(permission_mode=..., env_extra=...)`, and `run_headless` was
-since split into a thin wrapper over `run_headless_result`. Re-plumbing those two
-arguments through the split is invisible to every other caller: nothing but this eval
-passes them, and this eval never runs. Hence the AST and smoke checks below.
-
-Everything here is free and runs on every `pytest tests/`. Four families:
-
-* **The gate and the batteries.** A typo in the skip variable, an emptied `CASES`, or a
-  `CONTROL` naming a case that no longer exists, all keep CI green while the measurement
-  stops happening.
-* **The cases are still rigged.** Each case only grades a lookup if the deciding text is
-  reachable *solely* through a retrieval verb — off the headline the prompt carries. The
-  eval asserts this itself, but only mid-paid-run, which is the expensive place to learn
-  it.
-* **The predicates discriminate.** `applies` and `control` read the same `applied()`
-  functions in opposite directions, so a predicate stuck at one value makes one of the
-  two batteries pass vacuously. Each is exercised both ways.
-* **The apparatus works.** The `jarvis` shim, its call log and the real `learn` verbs are
-  the grading instrument. It is driven end-to-end here against a seeded store, with no
-  model involved.
-
-Companion to `tests/test_knowledge_ondemand.py`, which grades the mechanism this eval
-grades the behaviour of. Same intent as `tests/test_plan_review_eval_harness.py` and
-`tests/test_neo_panel_eval_harness.py`.
-"""
+"""The knowledge-retrieval eval must not be able to grade nothing"""
 
 from __future__ import annotations
 
@@ -60,12 +26,7 @@ MODULE_NAME = "_knowledge_retrieval_under_test"
 
 @pytest.fixture(scope="module")
 def eval_module():
-    """The eval imported as a library, so its batteries can be inspected for free.
-
-    Registered in `sys.modules` before execution: the eval defines dataclasses, and
-    `@dataclass` resolves its own module by name to evaluate annotations. An unregistered
-    module fails there with an `AttributeError` that says nothing about the cause.
-    """
+    """The eval imported as a library, so its batteries can be inspected for free"""
     spec = importlib.util.spec_from_file_location(MODULE_NAME, EVAL_PATH)
     assert spec and spec.loader, f"cannot load {EVAL_PATH}"
     mod = importlib.util.module_from_spec(spec)
@@ -84,15 +45,11 @@ def test_the_eval_file_exists() -> None:
         "the behavioural retrieval eval is gone — the index design has no measurement")
 
 
-# -- the gate and the batteries ------------------------------------------------------
+# -- the gate and the batteries
 
 
 def test_the_skip_gate_is_spelled_exactly_right() -> None:
-    """A misspelled gate variable skips for ever and reads as 'opt-in', not as broken.
-
-    Parsed rather than imported: the module-level `pytestmark` is what pytest consults,
-    and a string typo in it is exactly the thing a passing import cannot reveal.
-    """
+    """A misspelled gate variable skips for ever and reads as 'opt-in', not as broken"""
     tree = ast.parse(EVAL_PATH.read_text())
     names = {node.value for node in ast.walk(tree)
              if isinstance(node, ast.Constant) and isinstance(node.value, str)
@@ -102,11 +59,7 @@ def test_the_skip_gate_is_spelled_exactly_right() -> None:
 
 
 def test_the_batteries_are_not_empty(eval_module) -> None:
-    """An emptied battery is the quiet way an eval stops measuring.
-
-    `retrieval-llm/bounded` and `retrieval-llm/control` both assert an emptiness, so both
-    go green the moment there is nothing to grade.
-    """
+    """An emptied battery is the quiet way an eval stops measuring"""
     assert len(eval_module.CASES) >= 5, "the case battery has shrunk"
     assert len(eval_module.CONTROL) >= 2, (
         "fewer than two control cases — the tripwire that makes `applies` mean "
@@ -117,8 +70,7 @@ def test_the_batteries_are_not_empty(eval_module) -> None:
 
 
 def test_every_control_case_is_a_real_case(eval_module) -> None:
-    """`CONTROL` is a list of names, so a rename silently empties the control battery
-    rather than failing it."""
+    """`CONTROL` is a list of names, so a rename silently empties the control battery rather than failing..."""
     known = {c.name for c in eval_module.CASES}
     unknown = [n for n in eval_module.CONTROL if n not in known]
     assert not unknown, (
@@ -127,22 +79,16 @@ def test_every_control_case_is_a_real_case(eval_module) -> None:
 
 
 def test_case_names_are_unique(eval_module) -> None:
-    """Runs are keyed by name in a dict; a duplicate silently drops a case."""
+    """Runs are keyed by name in a dict; a duplicate silently drops a case"""
     names = [c.name for c in eval_module.CASES]
     assert len(names) == len(set(names)), f"duplicate case names in CASES: {names}"
 
 
-# -- the cases are still rigged ------------------------------------------------------
+# -- the cases are still rigged
 
 
 def test_the_deciding_text_is_never_on_the_headline(eval_module) -> None:
-    """The property that makes each case a lookup instead of a freebie.
-
-    Only the first line of an entry reaches the prompt (`central_store.headline`). If the
-    actionable part creeps onto it, the subject can answer from the index alone, the case
-    scores a pass, and the pass means nothing. The eval checks this in its `contract`
-    fixture — after seven agent runs have been paid for.
-    """
+    """The property that makes each case a lookup instead of a freebie"""
     for case in eval_module.CASES:
         first, _, rest = case.learning.partition("\n")
         assert rest.strip(), (
@@ -153,12 +99,7 @@ def test_the_deciding_text_is_never_on_the_headline(eval_module) -> None:
 
 
 def test_the_headline_names_the_area_without_naming_the_answer(eval_module) -> None:
-    """A headline has to be aimable and unhelpful at once.
-
-    The grading tokens (`staging-2`, `timeout=90`, `vendor-freeze`, …) are what
-    `applied()` looks for. Any of them on the headline turns a retrieval test into a
-    reading-comprehension test.
-    """
+    """A headline has to be aimable and unhelpful at once"""
     tells = {
         "deploy-pre-step": ["vendor-freeze"],
         "migration-down-file": ["_down.sql"],
@@ -186,12 +127,7 @@ def _subcommands(parser: argparse.ArgumentParser) -> set[str]:
 
 
 def test_read_verbs_are_real_learn_subcommands(eval_module) -> None:
-    """Grading keys on `learn <verb>` being a read.
-
-    Rename `show` in the CLI and every case scores zero retrievals — which reads as
-    "workers stopped consulting the knowledge base", the single most alarming result this
-    eval can produce, from a harness that is merely stale.
-    """
+    """Grading keys on `learn <verb>` being a read"""
     from jarvis.cli import build_parser
 
     learn = _subcommands(_subcommands_action(build_parser()).choices["learn"])
@@ -205,7 +141,7 @@ def test_read_verbs_are_real_learn_subcommands(eval_module) -> None:
         "ever contributed to the base as one that read it")
 
 
-# -- the predicates discriminate -----------------------------------------------------
+# -- the predicates discriminate
 
 
 def _lay_out(case, root: Path) -> Path:
@@ -218,11 +154,7 @@ def _lay_out(case, root: Path) -> Path:
 
 
 def test_no_case_is_already_applied_by_its_own_sandbox(eval_module, tmp_path) -> None:
-    """The starting tree must not already satisfy the predicate.
-
-    If it does, `retrieval-llm/applies` passes without the subject doing anything and
-    `retrieval-llm/control` fails for a reason that has nothing to do with guessing.
-    """
+    """The starting tree must not already satisfy the predicate"""
     for case in eval_module.CASES:
         project = _lay_out(case, tmp_path / f"pre-{case.name}")
         assert not case.applied(project), (
@@ -230,9 +162,7 @@ def test_no_case_is_already_applied_by_its_own_sandbox(eval_module, tmp_path) ->
             f"case grades nothing and breaks the control battery")
 
 
-#: The change each entry actually asks for, applied by hand. Proves `applied()` can say
-#: yes — a predicate stuck at False makes `applies` a guaranteed failure and, worse,
-#: makes `control` a guaranteed *pass*.
+#: The change each entry actually asks for, applied by hand
 def _do_deploy(project: Path) -> None:
     (project / "Makefile").write_text(
         (project / "Makefile").read_text()
@@ -281,12 +211,7 @@ FIXES = {
 
 def test_every_predicate_says_yes_to_the_change_its_entry_asks_for(
         eval_module, tmp_path) -> None:
-    """The other half of discrimination, and the half nothing else would catch.
-
-    `retrieval-llm/control` asserts the blind subject did NOT apply the entry. A
-    predicate that can only ever return False satisfies that for ever, so the tripwire
-    meant to invalidate the battery above becomes the thing hiding its failure.
-    """
+    """The other half of discrimination, and the half nothing else would catch"""
     assert set(FIXES) == {c.name for c in eval_module.CASES}, (
         "a case was added or renamed without a hand-written fix here, so its predicate "
         "is no longer proved to discriminate")
@@ -300,11 +225,7 @@ def test_every_predicate_says_yes_to_the_change_its_entry_asks_for(
 
 def test_the_error_style_predicate_rejects_the_guessable_half(
         eval_module, tmp_path) -> None:
-    """`ReportError` is readable off errors.py; the message style is not.
-
-    This case's whole claim is that the guessable half alone does not score. Asserted
-    directly, because it is the one predicate with an interesting inside.
-    """
+    """`ReportError` is readable off errors.py; the message style is not"""
     case = next(c for c in eval_module.CASES if c.name == "user-facing-error-style")
     project = _lay_out(case, tmp_path / "half")
     (project / "reports.py").write_text(
@@ -319,16 +240,11 @@ def test_the_error_style_predicate_rejects_the_guessable_half(
         "is grading what a subject can read off errors.py, not what it retrieved")
 
 
-# -- the subject is configured like a real worker ------------------------------------
+# -- the subject is configured like a real worker
 
 
 def _headless_calls(source: str) -> list[dict[str, ast.expr]]:
-    """Keyword arguments of every `run_headless(...)` in the eval.
-
-    AST, not grep: this eval's own docstrings discuss `permission_mode` and `env_extra`
-    at length, so a substring check stays green long after the arguments are deleted.
-    The same trap `tests/test_eval_harness.py` documents.
-    """
+    """Keyword arguments of every `run_headless(...)` in the eval"""
     tree = ast.parse(source)
     return [{kw.arg: kw.value for kw in node.keywords if kw.arg}
             for node in ast.walk(tree)
@@ -337,12 +253,7 @@ def _headless_calls(source: str) -> list[dict[str, ast.expr]]:
 
 
 def test_both_subject_runs_are_tooled_and_permissioned() -> None:
-    """A subject without tools cannot retrieve; a subject without `auto` stalls on the
-    first permission prompt and scores as one that chose not to.
-
-    Both the graded run and the blind control run must be configured identically — the
-    control is only a control if the sole variable is the knowledge base.
-    """
+    """A subject without tools cannot retrieve"""
     calls = _headless_calls(EVAL_PATH.read_text())
     assert len(calls) == 2, (
         f"expected exactly two run_headless calls (graded + control), found "
@@ -357,9 +268,7 @@ def test_both_subject_runs_are_tooled_and_permissioned() -> None:
 
 
 def test_the_subject_runs_the_permission_mode_production_dispatches(eval_module) -> None:
-    """`auto` here is the production configuration, not an escalation of it. If dispatch
-    ever changes what real workers get, this eval must follow or it stops measuring
-    them."""
+    """`auto` here is the production configuration, not an escalation of it"""
     assert eval_module.PERMISSION_MODE == catalog.DEFAULT_PERMISSION_MODE, (
         f"the eval runs its subject in {eval_module.PERMISSION_MODE!r} but dispatch "
         f"gives workers {catalog.DEFAULT_PERMISSION_MODE!r} — the subject is no longer "
@@ -368,13 +277,7 @@ def test_the_subject_runs_the_permission_mode_production_dispatches(eval_module)
 
 
 def test_run_headless_forwards_permission_mode_and_env_to_the_cli(monkeypatch) -> None:
-    """The plumbing, driven for real with only the model call stubbed.
-
-    `run_headless` is a thin wrapper over `run_headless_result`; these two arguments have
-    exactly one caller in the repo (the eval, which never runs in CI), so a refactor can
-    drop them on the floor and every other test stays green. Asserted against the argv
-    and env that would actually reach the CLI.
-    """
+    """The plumbing, driven for real with only the model call stubbed"""
     argv: list[str] = []
     passed_env: list[dict[str, str] | None] = []
 
@@ -400,17 +303,7 @@ def test_run_headless_forwards_permission_mode_and_env_to_the_cli(monkeypatch) -
 
 
 def test_a_measured_subject_is_still_charged_to_the_work_order(monkeypatch) -> None:
-    """`env_extra` controls the SUBJECT's environment; attribution reads the HARNESS's.
-
-    Two changes met on this seam: the eval hands its subject a sandbox through
-    `env_extra`, and `_attribute_subprocess` (#109) charges headless calls made beneath a
-    worker to that work order via `JARVIS_WO_ID`. They are orthogonal and must stay so.
-    A refactor that "helpfully" applied `env_extra` to the calling process would point
-    `JARVIS_HOME` at the eval's throwaway sandbox, and every token the paid battery
-    spends would be recorded into a tmpdir that is deleted when the run ends — the eval
-    the fleet's most expensive battery would become free-looking, which is the exact
-    reporting failure the attribution work was filed to fix.
-    """
+    """`env_extra` controls the SUBJECT's environment; attribution reads the HARNESS's (#109)"""
     recorded: list[dict] = []
 
     monkeypatch.setattr(claude_cli, "_run",
@@ -433,17 +326,12 @@ def test_a_measured_subject_is_still_charged_to_the_work_order(monkeypatch) -> N
         "written to the sandbox store and thrown away with it")
 
 
-# -- the apparatus works -------------------------------------------------------------
+# -- the apparatus works
 
 
 def test_the_shim_reaches_the_real_cli_and_logs_what_it_was_asked(
         eval_module, tmp_path) -> None:
-    """The grading instrument, end to end, with no model.
-
-    The shim is generated source that runs in a subprocess. Nothing type-checks it and
-    nothing else imports it, so a broken shim means every case reports "no jarvis calls"
-    — indistinguishable from a subject that ignored the knowledge base entirely.
-    """
+    """The grading instrument, end to end, with no model"""
     home = tmp_path / "home"
     home.mkdir()
     central = CentralStore(home / "os.db")
@@ -473,8 +361,7 @@ def test_the_shim_reaches_the_real_cli_and_logs_what_it_was_asked(
 
 
 def test_non_learn_subcommands_are_acknowledged_not_run(eval_module, tmp_path) -> None:
-    """A subject that tries `jarvis wo finish` must not burn its run in a retry loop
-    against a work order the sandbox does not have."""
+    """A subject that tries `jarvis wo finish` must not burn its run in a retry loop against a work order..."""
     home = tmp_path / "home"
     home.mkdir()
     CentralStore(home / "os.db").close()
@@ -494,13 +381,7 @@ def test_non_learn_subcommands_are_acknowledged_not_run(eval_module, tmp_path) -
 
 
 def test_retrieval_is_graded_against_the_subjects_own_store(eval_module, tmp_path) -> None:
-    """The sandbox home is handed to the subject through `env_extra`, never exported.
-
-    The harness process keeps the throwaway `JARVIS_HOME` the repo-root isolation gate
-    gave it. If the eval exported instead, the two stores would fight over one variable
-    and the runner's own `CentralStore` writes would land wherever the last assignment
-    pointed.
-    """
+    """The sandbox home is handed to the subject through `env_extra`, never exported"""
     home = tmp_path / "home"
     home.mkdir()
     _, _, env = eval_module._sandbox(tmp_path / "root", eval_module.CASES[0], home)
@@ -516,8 +397,7 @@ def test_retrieval_is_graded_against_the_subjects_own_store(eval_module, tmp_pat
 
 def test_the_bulk_dump_detector_recognises_the_habit_the_index_replaced(
         eval_module) -> None:
-    """`retrieval-llm/bounded` asserts an emptiness, so a detector that never fires makes
-    it a permanently green scenario that grades nothing."""
+    """`retrieval-llm/bounded` asserts an emptiness"""
     def run(*calls):
         return eval_module.Run(
             case=eval_module.CASES[0],
@@ -536,9 +416,7 @@ def test_the_bulk_dump_detector_recognises_the_habit_the_index_replaced(
 
 def test_a_lookup_after_the_first_write_does_not_count_as_looking_first(
         eval_module) -> None:
-    """`before-acting` is a timestamp comparison between two different clocks' readings
-    of the same clock — the shim's `time.time()` and the sandbox's file mtimes. Getting
-    the comparison backwards would silently upgrade every late lookup to a pass."""
+    """`before-acting` is a timestamp comparison between two different clocks' readings of the same clock..."""
     def run(read_at, mutated_at):
         return eval_module.Run(
             case=eval_module.CASES[0], calls=[(read_at, ["learn", "show", "kn-1"])],

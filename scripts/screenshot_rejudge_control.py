@@ -1,19 +1,4 @@
-"""Screenshot the RE-JUDGE control on the work-order page, for a PR's UI evidence.
-
-`scripts/screenshot_forced_round.py` is the shape this copies, and the two are about
-different halves: that one is about how a forced ROUND reads afterwards, this one is
-about the control that opens it and the diagnosis beside it.
-
-Three shots, because the claim has three parts and a shot of the button alone shows
-none of them: the diagnosis on a pull request whose head moved out from under the pass,
-the two lines the page reports after the button is actually pressed, and the control
-DISABLED on an order that may not be re-judged with the rule visible beside it.
-
-Writes PNGs to docs/screenshots/. Everything it touches lives in a temp `JARVIS_HOME`
-and a temp catalog, so it never reads or writes the live OS:
-
-    uv run python scripts/screenshot_rejudge_control.py
-"""
+"""Screenshot the RE-JUDGE control on the work-order page, for a PR's UI evidence"""
 
 from __future__ import annotations
 
@@ -30,8 +15,7 @@ SHOTS = REPO / "docs" / "screenshots"
 PORT = 8803
 
 PR = "https://github.com/gonandrap/agentic_os/pull/243"
-#: The real pair from wo-752eced8: the panel passed the first, then `origin/main` was
-#: merged into the branch to clear a conflict and the head became the second.
+#: The real pair from wo-752eced8: the panel passed the first
 JUDGED = "9ee728c739a1b2c3d4e5f60718293a4b5c6d7e8f"
 HEAD = "3a5ef7a343b2c1d0e9f8a7b6c5d4e3f2a1b09876"
 
@@ -44,12 +28,7 @@ def _repo(path: Path) -> None:
 
 
 def parked(store) -> str:
-    """A work order parked behind a pull request whose head has MOVED since the pass.
-
-    The hold is written by `Daemon._note_automerge_held`'s own payload shape rather than
-    invented here — the page reads that event and nothing else, so a shot built from a
-    different shape would be a picture of a surface nobody has.
-    """
+    """A work order parked behind a pull request whose head has MOVED since the pass"""
     from jarvis import ops
 
     wo = ops.create_work_order(
@@ -71,7 +50,7 @@ def parked(store) -> str:
 
 
 def settled(store) -> str:
-    """...and one the verb refuses, so the disabled control has something to explain."""
+    """...and one the verb refuses, so the disabled control has something to explain"""
     from jarvis import ops
 
     wo = ops.create_work_order("jarvis_os", "A negative slice is not a privileged action",
@@ -131,8 +110,7 @@ def shoot(held: str, closed: str) -> None:
         page.wait_for_timeout(200)
         page.screenshot(path=SHOTS / "rejudge-control.png")
 
-        # PRESSED FOR REAL, so the report in the shot is what `ops.force_validation`
-        # actually produced rather than a mock-up of it.
+        # PRESSED FOR REAL, so the report in the shot is what `ops.force_validation` actually produced rather...
         page.fill("textarea[name=reason]",
                   "origin/main was merged in to clear a conflict, so the pass is bound "
                   "to a commit that is no longer the head")

@@ -1,14 +1,4 @@
-"""The analyst: the one work order an improvement order dispatches.
-
-Section 3 of docs/superpowers/specs/2026-09-23-improvement-orders.md. Two halves, and
-they fail in different ways:
-
-* **The daemon files it.** A sibling loop beside the planner loop, idempotent by status,
-  and the paired control here is a FEATURE order in the same tick — the two loops read
-  the same table and a kind filter dropped on either side is invisible from one of them.
-* **The briefing is not the worker contract.** An analyst that silently inherits the
-  worker prompt is told to open a pull request, which is the one thing it must never do.
-"""
+"""The analyst: the one work order an improvement order dispatches (docs/superpowers/specs/2026-09-23-improvement-orders.md)"""
 
 from __future__ import annotations
 
@@ -37,7 +27,7 @@ def analysts(store) -> list[dict]:
     return [w for w in store.list_work_orders(limit=200) if w.get("kind") == "analyst"]
 
 
-# -- the daemon loop --------------------------------------------------------------------
+# -- the daemon loop
 
 
 def test_a_pending_improvement_order_gets_exactly_one_analyst(started, store,
@@ -49,8 +39,7 @@ def test_a_pending_improvement_order_gets_exactly_one_analyst(started, store,
     assert len(opened) == 1, opened
     wo = opened[0]
     assert wo["parent_id"] == improvement_order["id"]
-    # The observation VERBATIM: the record has to read the same in `jarvis wo show` as
-    # it does in `jarvis io show` (spec §3.1).
+    # The observation VERBATIM: the record has to read the same in `jarvis wo show` as it does in `jarvis...
     assert wo["description"] == improvement_order["description"]
 
     io = store.get_feature_order(improvement_order["id"])
@@ -83,7 +72,7 @@ def test_a_feature_order_in_the_same_tick_still_gets_a_planner_and_no_analyst(
     assert analysts(store)[0]["parent_id"].startswith("io-")
 
 
-# -- the briefing -----------------------------------------------------------------------
+# -- the briefing
 
 
 @pytest.fixture()
@@ -105,7 +94,7 @@ def test_the_analyst_is_told_to_produce_a_diagnosis_and_not_a_fix(analyst_prompt
 
 
 def test_the_analyst_must_argue_against_the_cheapest_fix(analyst_prompt):
-    """The corollary the whole feature exists for (spec §3.2.1)."""
+    """The corollary the whole feature exists for (spec §3.2.1)"""
     assert "cheapest fix" in analyst_prompt
     assert "why it is insufficient" in analyst_prompt
 
@@ -113,21 +102,19 @@ def test_the_analyst_must_argue_against_the_cheapest_fix(analyst_prompt):
 def test_the_terminal_action_is_the_report_and_never_wo_finish(analyst_prompt,
                                                                improvement_order):
     assert f"jarvis io report {improvement_order['id']} --from-file" in analyst_prompt
-    # An analyst that runs `wo finish` settles itself before the report is stored.
+    # An analyst that runs `wo finish` settles itself before the report is stored
     assert "which IS your finish" in analyst_prompt
 
 
 def test_the_analyst_briefing_names_wo_finish_as_the_redelivery(analyst_prompt):
-    """§5 of docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md:
-    resubmitting the report after a refusal is refused by the OS and would discard the
-    decisions already recorded on it, so the re-delivery is `jarvis wo finish`."""
+    """§5 of docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md: resubmitting the..."""
     assert "Do not run `jarvis wo finish`" not in analyst_prompt
     assert "jarvis wo finish" in analyst_prompt
     assert "does not touch" in analyst_prompt
 
 
 def test_the_analyst_is_never_told_to_open_a_pull_request(analyst_prompt):
-    """The worker contract's PR rule reaching an analyst is the failure mode §3.1 names."""
+    """The worker contract's PR rule reaching an analyst is the failure mode §3.1 names"""
     assert "open NO pull request" in analyst_prompt
     assert "with a pull request" not in analyst_prompt
 
@@ -151,10 +138,7 @@ def test_at_most_six_findings(analyst_prompt):
 
 
 def test_every_ref_shape_in_the_table_gets_its_command():
-    """The §3.3 mapping is the deliverable, and the fixture reaches only three of its
-    rows. Each shape is checked directly, including the unrecognised one — which is
-    LISTED rather than dropped: a ref the user attached and the OS cannot name is the
-    analyst's problem to solve, not the OS's to hide."""
+    """The §3.3 mapping is the deliverable, and the fixture reaches only three of its rows"""
     from jarvis.dispatch import _evidence_checklist
 
     lines = _evidence_checklist([
@@ -174,7 +158,7 @@ def test_every_ref_shape_in_the_table_gets_its_command():
     assert "nonsense-ref" in joined and "work out how to read it" in joined
 
 
-# -- controls: the other three kinds are untouched --------------------------------------
+# -- controls: the other three kinds are untouched
 
 
 def test_a_worker_still_gets_the_worker_contract(project):
@@ -199,14 +183,12 @@ def test_a_planner_still_names_its_seats_and_the_analyst_names_neither(project,
 
 
 def test_the_analyst_never_gets_the_workers_pr_title_rule(analyst_prompt):
-    """The worker contract's `[wo-…] ` title requirement reaching an analyst would be an
-    instruction to open the one thing it must never open."""
+    """The worker contract's `[wo-…] ` title requirement reaching an analyst would be an instruction to..."""
     assert "[wo-" not in analyst_prompt
 
 
 def test_the_investigator_never_gets_the_workers_pull_request_contract(project, store):
-    """§5 of docs/superpowers/specs/2026-09-27-investigation-orders.md: assert on the
-    ABSENCE, with the worker beside it — the same assertion passes on a missing branch."""
+    """§5 of docs/superpowers/specs/2026-09-27-investigation-orders.md: assert on the ABSENCE"""
     from jarvis.dispatch import build_worker_prompt, feature_context
 
     inv = store.create_feature_order("investigate wo-11111111", description="stuck",
@@ -221,7 +203,7 @@ def test_the_investigator_never_gets_the_workers_pull_request_contract(project, 
     worker = build_worker_prompt({"id": "wo-1", "title": "t", "description": "d",
                                   "kind": "worker"}, spec, None)
 
-    # Prohibition lines say "pull request" too, so read past them (kn-31f0f450).
+    # Prohibition lines say "pull request" too, so read past them (kn-31f0f450)
     body = "\n".join(line for line in investigator.splitlines()
                      if not any(w in line.lower()
                                 for w in ("not", "never", " no ", "cannot", "refus",
@@ -230,15 +212,12 @@ def test_the_investigator_never_gets_the_workers_pull_request_contract(project, 
                      "Co-Authored-By"):
         assert contract not in body, contract
     assert "jarvis investigate verdict" in investigator
-    # The control: the worker contract DOES carry the lines this kind must not see. Not
-    # "open a PR" — that prose now rides in `git_briefing`/--append-system-prompt
-    # (kn-dfdab9f8), not in the prompt positional.
+    # The control: the worker contract DOES carry the lines this kind must not see
     assert "--pr " in worker
 
 
 def test_a_manager_is_unaffected_by_the_feature_context_change(project, store):
-    """`feature_context` grew a second kind; a manager must still receive its REAL
-    children, not the analyst's empty list."""
+    """`feature_context` grew a second kind"""
     from jarvis.dispatch import build_worker_prompt, feature_context
 
     fo = store.create_feature_order("CSV export", description="an exporter")
@@ -256,9 +235,7 @@ def test_a_manager_is_unaffected_by_the_feature_context_change(project, store):
 
 
 def test_a_running_analyst_spends_a_project_slot(store, improvement_order):
-    """§3.1: `count_active` has NO kind filter and that is CORRECT here — an analyst is
-    short-lived like a planner, so it should spend a slot while it runs. Verified rather
-    than assumed (kn-52e51faf); the manager exemption is the only one."""
+    """§3.1: `count_active` has NO kind filter and that is CORRECT here"""
     before = store.count_active()
     wo = store.create_work_order(title="Analyse: x", description="d", origin="jarvis",
                                  kind="analyst", parent_id=improvement_order["id"])
@@ -276,7 +253,7 @@ def test_an_analyst_gets_no_planning_seats(project):
     assert any(p.name == "agent-seats" for p in planner), planner
 
 
-# -- delivery ---------------------------------------------------------------------------
+# -- delivery
 
 
 def test_the_dispatched_analyst_turn_carries_the_analyst_prompt(started, fake_claude,

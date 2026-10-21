@@ -1,15 +1,4 @@
-"""The evidence packet and the round fingerprint.
-
-Every test here is a PAIR. "The fingerprint did not move" is worthless on its own — a
-function that returns a constant passes it — so each inert case is asserted beside an
-identically-shaped case that is NOT inert, in the same test body. The same discipline
-applies to truncation ("cut" beside "not cut") and to the worktree ("gone" beside
-"present").
-
-Nothing here fakes git. The repositories are real, built with `make_git_project` plus the
-`_git` subprocess helper the bug-report and shipit suites already use, because the whole
-module is a reading of what git actually says and a fake would only test the fake.
-"""
+"""The evidence packet and the round fingerprint"""
 
 from __future__ import annotations
 
@@ -30,7 +19,7 @@ WO_FIELDS = {"id": "wo-1", "title": "Title", "description": "The brief",
 
 
 def _git(cwd: Path, *args: str) -> str:
-    """Run git with a pinned identity and no user or system config in sight."""
+    """Run git with a pinned identity and no user or system config in sight"""
     env = {"HOME": str(cwd), "PATH": os.environ.get("PATH", ""),
            "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
@@ -45,13 +34,7 @@ def _body(name: str, n: int, salt: str = "") -> str:
 
 @dataclass
 class Env:
-    """A project repo and one worker worktree cut from it.
-
-    The default branch is `trunk`, and `main` exists beside it pointing at the same
-    commit. That is deliberate: it is what makes the top two rungs of the merge-base
-    ladder distinguishable. If the remote's default were also `main`, rung 1 and rung 2
-    would both answer "origin/main" and neither test would prove anything.
-    """
+    """A project repo and one worker worktree cut from it"""
 
     project: Path
     worktree: Path
@@ -67,7 +50,7 @@ class Env:
 
 @pytest.fixture()
 def env(tmp_path) -> Env:
-    # No fixture commit: this suite builds `main` itself, one rung at a time.
+    # No fixture commit: this suite builds `main` itself, one rung at a time
     project = make_git_project(tmp_path, "proj", commit_spec=False)
     _git(project, "symbolic-ref", "HEAD", "refs/heads/trunk")
     (project / "app.py").write_text(_body("app", 30))
@@ -85,7 +68,7 @@ def env(tmp_path) -> Env:
 
 
 def _headers(diff: str) -> dict[str, str]:
-    """Split a unified diff into {path: section text}, independently of the module."""
+    """Split a unified diff into {path: section text}, independently of the module"""
     out: dict[str, str] = {}
     path, buf = "", []
     for line in diff.splitlines(keepends=True):
@@ -106,8 +89,7 @@ def _headers(diff: str) -> dict[str, str]:
 
 
 def test_an_empty_commit_does_not_move_the_fingerprint_but_a_byte_does(env):
-    """`head` is not in the hash; the diff is. Both halves in one test, because
-    "equal" and "a constant" are the same observation without the second half."""
+    """`head` is not in the hash; the diff is"""
     (env.worktree / "app.py").write_text(_body("app", 30, "edited"))
     _git(env.worktree, "commit", "-aqm", "real work")
     before = env.collect()
@@ -122,15 +104,13 @@ def test_an_empty_commit_does_not_move_the_fingerprint_but_a_byte_does(env):
 
 
 def test_summary_pr_url_and_base_are_not_in_the_fingerprint(env):
-    """Three collects of one worktree differing only in those, then one that differs
-    in the diff."""
+    """Three collects of one worktree differing only in those, then one that differs in the diff"""
     (env.worktree / "app.py").write_text(_body("app", 30, "edited"))
     plain = env.collect()
     reworded = env.collect(result_summary="a completely different summary",
                            pr_url="https://github.com/o/r/pull/9")
 
-    # A different rung of the ladder, resolving to the same commit: `base` moves and
-    # not one byte of the diff does.
+    # A different rung of the ladder
     _git(env.project, "symbolic-ref", "-d", "refs/remotes/origin/HEAD")
     rebased = env.collect()
     assert (plain.base, rebased.base) == ("origin/trunk", "origin/main")
@@ -154,10 +134,7 @@ def test_reflowed_declared_text_fingerprints_identically_but_a_changed_word_does
 
 
 def test_an_assumption_moves_the_fingerprint_and_the_users_verdict_on_it_does_not(env):
-    """A call the submitter declared is material the judge reads, so a submission that
-    adds one is not the same submission. Its review STATE is the user acting, not the
-    submitter producing evidence — and the third leg is the work order that filed none,
-    which must hash exactly as it did before any of this existed."""
+    """A call the submitter declared is material the judge reads"""
     (env.worktree / "app.py").write_text(_body("app", 30, "edited"))
     bare = env.collect()
     assert evidence.fingerprint(env.collect(assumptions=())) == \
@@ -173,13 +150,7 @@ def test_an_assumption_moves_the_fingerprint_and_the_users_verdict_on_it_does_no
 
 
 def test_prior_round_history_is_not_in_the_fingerprint_and_the_declared_evidence_is(env):
-    """The pin the whole field turns on. `history` is written by the OS and differs every
-    round by construction, so hashing it would make every unchanged resubmission look new
-    — `Daemon._preceding_round` would stop catching a submitter that changed nothing, and
-    every round already stored would change hash.
-
-    Paired with `declared`, which MUST move the hash: "the fingerprint ignores everything"
-    passes the first half on its own."""
+    """The pin the whole field turns on"""
     (env.worktree / "app.py").write_text(_body("app", 30, "edited"))
     bare = env.collect()
     carried = env.collect(history=[
@@ -195,9 +166,7 @@ def test_prior_round_history_is_not_in_the_fingerprint_and_the_declared_evidence
 
 
 def test_history_reaches_the_packet_as_blockers_with_no_seat_and_no_severity(env):
-    """The collector normalises, so no caller decides the shape — and what it drops is
-    the point: a `severity` word invites a second filter, and the second filter is the
-    one that disagrees with the first."""
+    """The collector normalises, so no caller decides the shape"""
     (env.worktree / "app.py").write_text(_body("app", 30, "edited"))
     packet = env.collect(history=[
         {"round": 1, "outcome": "rejected", "reason": "why",
@@ -211,8 +180,7 @@ def test_history_reaches_the_packet_as_blockers_with_no_seat_and_no_severity(env
 
 
 def test_the_same_worktree_fingerprints_identically_at_two_truncation_limits(env):
-    """The sharpest test in the file. Hashing `packet.diff` — the obvious implementation
-    — fails exactly here, and would make an integrity check depend on a display setting."""
+    """The sharpest test in the file"""
     for i in range(6):
         (env.worktree / f"f{i}.py").write_text(_body(f"f{i}", 60))
     _git(env.worktree, "add", "-A")
@@ -246,8 +214,7 @@ def test_truncation_reports_what_it_dropped_and_never_touches_the_file_list(env)
 
 
 def test_the_file_list_survives_a_limit_that_keeps_no_diff_at_all(env):
-    """`files` is what lets a seat say "you claim tests were added and no path under
-    tests/ is here" even when the patch itself was cut to nothing."""
+    """`files` is what lets a seat say "you claim tests were added and no path under tests/ is here" even..."""
     for i in range(40):
         (env.worktree / f"f{i:02d}.py").write_text(_body(f"f{i}", 20))
     _git(env.worktree, "add", "-A")
@@ -259,8 +226,7 @@ def test_the_file_list_survives_a_limit_that_keeps_no_diff_at_all(env):
 
 
 def test_every_kept_file_is_byte_identical_to_its_own_git_diff(env):
-    """Stronger than counting `@@` markers: the body under each header is compared with
-    what git prints for that single path, so a cut inside a hunk cannot pass."""
+    """Stronger than counting `@@` markers: the body under each header is compared with what git prints..."""
     for i in range(12):
         (env.worktree / f"f{i:02d}.py").write_text(_body(f"f{i}", 60))
     _git(env.worktree, "add", "-A")
@@ -273,8 +239,7 @@ def test_every_kept_file_is_byte_identical_to_its_own_git_diff(env):
 
 
 def test_a_changed_binary_file_does_not_break_the_boundary_rule(env):
-    """A binary diff carries no hunk at all, so an implementation that cuts on `@@`
-    mangles it and no corpus of text diffs would ever show that."""
+    """A binary diff carries no hunk at all"""
     png = env.worktree / "a_img.png"
     png.write_bytes(b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 2)
     _git(env.worktree, "add", "-A")
@@ -284,13 +249,12 @@ def test_a_changed_binary_file_does_not_break_the_boundary_rule(env):
         (env.worktree / f"z{i}.py").write_text(_body(f"z{i}", 60))
     _git(env.worktree, "add", "-A")
 
-    # The image appears twice: added in the committed half, modified in the working
-    # tree. Both sections are binary, and both must survive whole.
+    # The image appears twice: added in the committed half, modified in the working tree
     added = _git(env.worktree, "diff", "origin/trunk...HEAD", "--", "a_img.png")
     modified = _git(env.worktree, "diff", "HEAD", "--", "a_img.png")
     assert "Binary files" in added and "Binary files" in modified
 
-    # Room for the image and nothing else: it sorts first, so it is the file kept.
+    # Room for the image and nothing else: it sorts first, so it is the file kept
     cut = env.collect(diff_chars=len(added) + len(modified) + 10)
     assert cut.diff_truncated is True
     assert cut.diff == added + modified
@@ -299,18 +263,12 @@ def test_a_changed_binary_file_does_not_break_the_boundary_rule(env):
 
 
 # ------------------------------------------------------------------ the panel's trim
-#
-# The hunk-level confirm trim is GONE with the diff it fed:
-# docs/superpowers/specs/2026-10-14-neo-never-reads-a-diff.md. `_truncate` is the
-# panel's and is byte-identical; this marker is the regression pin that no section is
-# ever delivered in part.
 
 HUNK_MARKER = re.compile(r"\[(\d+) more hunk\(s\) of ([^\]]+) not shown\]")
 
 
 def test_the_panel_trim_still_drops_whole_files_at_its_own_budget(env):
-    """Invariant 1: `_truncate` is unchanged, so `collect_work_order` keeps the
-    all-or-nothing file rule and no section is ever delivered in part."""
+    """Invariant 1: `_truncate` is unchanged"""
     for i in range(12):
         (env.worktree / f"f{i:02d}.py").write_text(_body(f"f{i}", 60))
     _git(env.worktree, "add", "-A")
@@ -366,8 +324,7 @@ def test_rung_4_no_base_at_all_still_sees_uncommitted_work(env):
 
 
 def test_committed_and_uncommitted_work_both_reach_the_diff(env):
-    """The half most likely to be dropped, and its absence is invisible in every test
-    that remembers to commit."""
+    """The half most likely to be dropped"""
     (env.worktree / "app.py").write_text(_body("app", 30, "committed"))
     _git(env.worktree, "commit", "-aqm", "committed half")
     (env.worktree / "lib.py").write_text(_body("lib", 30, "still dirty"))
@@ -395,8 +352,7 @@ def test_a_missing_worktree_yields_an_empty_packet_and_no_exception(env):
 
 
 def test_a_missing_worktree_never_falls_back_to_the_project_root(env):
-    """Collecting the user's own checkout as "the worker's evidence" is a silent lie,
-    and it is the failure this test exists for."""
+    """Collecting the user's own checkout as "the worker's evidence" is a silent lie"""
     (env.project / "app.py").write_text(_body("app", 30, "the user's own edit"))
     assert _git(env.project, "diff", "--name-only", "HEAD").strip() == "app.py"  # dirty
 
@@ -406,9 +362,7 @@ def test_a_missing_worktree_never_falls_back_to_the_project_root(env):
 
 
 def test_the_branch_column_is_not_read(env):
-    """`work_orders.branch` is declared and written by nothing, so it is always NULL —
-    and it looks exactly like the column you want. Behavioural, so it survives a
-    refactor that a source grep would not notice."""
+    """`work_orders.branch` is declared and written by nothing, so it is always NULL"""
     (env.worktree / "app.py").write_text(_body("app", 30, "edited"))
     null = env.collect(branch=None)
     nonsense = env.collect(branch="no-such-branch")
@@ -420,7 +374,7 @@ def test_the_branch_column_is_not_read(env):
 
 
 def _imports(path: Path) -> set[str]:
-    """Every module a file imports, function bodies included."""
+    """Every module a file imports, function bodies included"""
     found: set[str] = set()
     for node in ast.walk(ast.parse(path.read_text())):
         if isinstance(node, ast.Import):
@@ -432,14 +386,7 @@ def _imports(path: Path) -> set[str]:
 
 
 def test_the_module_imports_nothing_that_could_have_seen_the_work():
-    """Walks the AST, function bodies included: the house style is a lazy import inside
-    the function that needs it, and a `sys.modules` check would miss every one.
-
-    `.github` earns its place on the module's own rule rather than as an exception: it
-    can only ask GitHub questions (`github.READ_ONLY_VERBS`, asserted by
-    `tests/test_github_artifact.py`), so importing it gives this module no way to talk
-    back to the submitter whose work it is gathering. Spec 2026-09-12 §2.
-    """
+    """Walks the AST, function bodies included: the house style is a lazy import inside the function that..."""
     found = _imports(Path(evidence.__file__))
     assert found == {"__future__", "hashlib", "logging", "subprocess", "dataclasses",
                      "pathlib", "typing", ".worker_session", ".github"}
@@ -449,36 +396,14 @@ def test_the_module_imports_nothing_that_could_have_seen_the_work():
 
 
 def test_only_the_round_machine_collects_evidence():
-    """The packet has exactly three readers: the two halves of one round, and the panel
-    the round hands it to.
-
-    `ops` collects it when a submission opens a round; `daemon` collects it again on its
-    own thread when that round is judged; `validation` names the type it renders into
-    seat prompts, and NAMES ONLY THAT — its import is under `TYPE_CHECKING`, so the panel
-    still cannot collect a packet of its own. Anything else appearing here is a module
-    that has started forming its own opinion about what a work order changed — which is
-    the coupling this leaf exists to avoid — so the list is asserted whole rather than
-    "nothing imports it".
-
-    `autoreview` LEFT this list: the confirmation question carries no diff, so it no
-    longer forms its own opinion about what a work order changed — which is the coupling
-    this leaf exists to avoid.
-    docs/superpowers/specs/2026-10-14-neo-never-reads-a-diff.md
-
-    `landing` is the one entry that is NOT a collector, and it is allowed for the reason
-    the list exists: it imports `base_ref` and `ProjectRef` precisely so that there is
-    one pinned merge-base ladder and one worktree stand-in rather than two. It never
-    calls `collect_work_order`, which the assertion below pins separately — a `landing`
-    that started collecting packets would be exactly the drift this guard is for.
-    """
+    """The packet has exactly three readers: the two halves of one round (docs/superpowers/specs/2026-10-14-neo-never-reads-a-diff.md)"""
     src = Path(evidence.__file__).parent
     names = {".evidence", "jarvis.evidence"}
     importers = [p.name for p in sorted(src.glob("*.py"))
                  if p.name != "evidence.py" and _imports(p) & names]
     assert importers == ["daemon.py", "landing.py", "ops.py", "validation.py"]
     assert "collect_work_order" not in (src / "landing.py").read_text()
-    # `autoreview` is `landing`'s case: it TRIMS a packet the daemon collected, reusing
-    # `_sections` and `_truncate` so there is one file-boundary truncator and not two.
+    # `autoreview` is `landing`'s case: it TRIMS a packet the daemon collected
     assert "collect_work_order" not in (src / "autoreview.py").read_text()
 
 
@@ -486,9 +411,7 @@ def test_only_the_round_machine_collects_evidence():
 
 
 def test_two_files_get_different_digests_and_only_the_edited_one_moves(env):
-    """The map's whole job: `validation.unanswered_submission` asks what MOVED between
-    two rounds, so a digest that also moved when a NEIGHBOUR changed would answer that
-    question wrong in both directions."""
+    """The map's whole job: `validation.unanswered_submission` asks what MOVED between two rounds"""
     (env.worktree / "app.py").write_text(_body("app", 30, "edited"))
     (env.worktree / "lib.py").write_text(_body("lib", 30, "edited"))
     _git(env.worktree, "commit", "-aqm", "both")
@@ -504,9 +427,7 @@ def test_two_files_get_different_digests_and_only_the_edited_one_moves(env):
 
 
 def test_a_rename_is_keyed_on_the_new_path_and_the_map_matches_files(env):
-    """The docstring's claim, and what makes the map usable beside `files`: a citation
-    is compared against these keys, so a key `packet.files` does not know is a path no
-    seat ever wrote."""
+    """The docstring's claim, and what makes the map usable beside `files`: a citation is compared against..."""
     (env.worktree / "pkg").mkdir()
     _git(env.worktree, "mv", "lib.py", "pkg/lib.py")
     _git(env.worktree, "commit", "-qm", "moved")
@@ -517,10 +438,7 @@ def test_a_rename_is_keyed_on_the_new_path_and_the_map_matches_files(env):
 
 
 def test_the_map_covers_a_file_whose_patch_was_DROPPED_by_truncation(env):
-    """`file_digests` runs before `_truncate`, and that ordering is the whole
-    correctness of the map: built from the kept text it would say every dropped file
-    stopped changing, which reads as "the submitter touched nothing" and bounces a round
-    that did the work."""
+    """`file_digests` runs before `_truncate`"""
     (env.worktree / "app.py").write_text(_body("app", 30, "edited"))
     (env.worktree / "lib.py").write_text(_body("lib", 30, "edited"))
     _git(env.worktree, "commit", "-aqm", "both")
@@ -532,13 +450,11 @@ def test_the_map_covers_a_file_whose_patch_was_DROPPED_by_truncation(env):
     for path in packet.dropped_files:
         assert path not in packet.diff, "a dropped file is not in the kept text"
         assert shas.get(path), f"{path} lost its digest to truncation"
-    # PRESENT is not enough: a map built from the kept text could still key every path
-    # and give the dropped ones some constant. Truncation must change the map not at all.
+    # PRESENT is not enough: a map built from the kept text could still key every path and give the...
     assert shas == whole
     assert set(shas) == set(packet.files)
 
-    # ...and the digest of a DROPPED file still moves when that file does, which is the
-    # direction `unanswered_submission` asks in. Without it the pair above is inert.
+    # ...and the digest of a DROPPED file still moves when that file does
     dropped = packet.dropped_files[0]
     (env.worktree / dropped).write_text(_body(dropped.split(".")[0], 30, "again"))
     _git(env.worktree, "commit", "-aqm", "the dropped one")
@@ -547,7 +463,7 @@ def test_the_map_covers_a_file_whose_patch_was_DROPPED_by_truncation(env):
     assert dict(after.file_shas)[dropped] != shas[dropped]
 
 
-# -- which commit a round judged -------------------------------------------------------
+# -- which commit a round judged
 
 
 def _packet(**over) -> evidence.EvidencePacket:
@@ -559,14 +475,7 @@ def _packet(**over) -> evidence.EvidencePacket:
 
 
 def test_judged_head_answers_for_a_feature_and_still_fails_closed_for_a_work_order():
-    """§5(a) of
-    docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md.
-
-    PAIRED, because the field means different things per path: on the feature path `head`
-    is `default_branch_head`'s resolved sha, which IS the commit the seats read; on a work
-    order's it is `headRefName` or a local HEAD, so `""` must stay the fail-closed answer
-    there or auto-merge moves.
-    """
+    """§5(a) of... (docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md)"""
     assert evidence.judged_head(_packet(unit="feature", head="f" * 40)) == "f" * 40
     assert evidence.judged_head(_packet(unit="feature", head="")) == ""
     assert evidence.judged_head(_packet()) == ""

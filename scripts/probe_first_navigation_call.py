@@ -1,32 +1,4 @@
-"""What makes a dispatched worker's FIRST code-navigation call a symbol call?
-
-THE MEASUREMENT, and it inverts the obvious reading: DEFERRAL is the cheap path, not
-presence. With the Serena read tools DEFERRED behind `ToolSearch` (the vendor default,
-`worker.tool_search` `on`/`cli`) the first code-navigation call was a symbol call 7/7.
-With the same tools PRESENT in the tool list with full schemas (`ENABLE_TOOL_SEARCH=false`,
-`worker.tool_search=off`) it was a symbol call 1/10 — and the failing first call was the
-same string every single time:
-
-    grep -rn "total_for" --include=*.py .
-
-Mechanism: the brief's `ToolSearch select:` line is an ACTION the worker executes, not an
-exhortation it weighs, and having paid a call to load `find_symbol` it then uses it.
-Presence deletes that step, and the grep prior wins. wo-ab5d81db; addendum under section 4
-of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md.
-
-Runs the eval's own harness (imported from `evals/llm/test_navigation_judgment.py`, never
-retyped) with the BRIEF and the ENV varied independently — the thing the eval itself
-cannot do, because each of its arms briefs with the setting it spawns with.
-
-NOT A TEST. Every run spawns a real `claude` turn and bills tokens; `JARVIS_EVALS_LLM=1`
-is set by this script because the eval module is gated on it.
-
-    uv run python scripts/probe_first_navigation_call.py v1-faithful --runs 10
-    uv run python scripts/probe_first_navigation_call.py --list
-
-One JSON line per run on stdout: the first navigation call, PASS/FAIL, and the whole tool
-log in order.
-"""
+"""What makes a dispatched worker's FIRST code-navigation call a symbol call? (docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md)"""
 
 from __future__ import annotations
 
@@ -51,9 +23,7 @@ spec.loader.exec_module(T)
 
 from jarvis import worker_brief  # noqa: E402
 
-#: A mandated FIRST call, substituted for `worker_brief.navigation_core` by the `v2-ritual`
-#: variant: the strongest wording tried, to test whether prose alone can beat the grep
-#: prior when the tools are present. It cannot.
+#: A mandated FIRST call, substituted for `worker_brief.navigation_core` by the `v2-ritual` variant:...
 RITUAL = [
     "# Finding code: your symbol tools are IN your tool list",
     "They are listed with full schemas — `find_symbol`, `find_referencing_symbols`, "
@@ -69,9 +39,7 @@ RITUAL = [
 
 #: variant -> (brief tool_search, env tool_search, py_nav_hook, patch navigation_core)
 VARIANTS = {
-    # what the eval fixture built in its tool-search arm BEFORE wo-ab5d81db: deferred
-    # wording, tools present. The mismatch was a harness defect, so it is a control and
-    # not a candidate.
+    # what the eval fixture built in its tool-search arm BEFORE wo-ab5d81db: deferred wording
     "v0-mismatched": ("cli", "off", "on", False),
     # the spawn the fleet would actually run with worker.tool_search=off
     "v1-faithful": ("off", "off", "on", False),
@@ -83,8 +51,7 @@ VARIANTS = {
     "v4-deferred": ("cli", "cli", "off", False),
     # tools present, hook OFF: is the hook doing anything to first-call order?
     "v5-faithful-nohook": ("off", "off", "off", False),
-    # deferral PINNED ON by Jarvis (ENABLE_TOOL_SEARCH=true) rather than left to the
-    # vendor default, with the hook live: the candidate shipped config.
+    # deferral PINNED ON by Jarvis (ENABLE_TOOL_SEARCH=true) rather than left to the vendor default
     "v6-deferral-pinned": ("on", "on", "on", False),
 }
 
@@ -93,12 +60,7 @@ QUESTION = ("Where is `total_for` defined in this repository, and which function
 
 
 def make_repo() -> Path:
-    """The eval's scratch repo, built from the eval's own fixtures.
-
-    Outside this checkout deliberately, for the reason the eval's `repo` fixture gives:
-    run from inside Jarvis, the subject would read this repo's CLAUDE.md — which itself
-    says to prefer Serena — and the probe would be measuring that file.
-    """
+    """The eval's scratch repo, built from the eval's own fixtures"""
     root = Path(tempfile.mkdtemp(prefix="navprobe-"))
     (root / "pricing.py").write_text(T.MODULE)
     (root / "checkout.py").write_text(T.CALLER)
@@ -138,7 +100,7 @@ def main() -> None:
         worker_brief.navigation_core = patched
 
     repo = make_repo()
-    # The eval's own helper, so the probe cannot drift from what the eval briefs with.
+    # The eval's own helper, so the probe cannot drift from what the eval briefs with
     brief = T.worker_briefing(repo, brief_ts)
     if patch:
         assert "YOUR FIRST CODE-NAVIGATION CALL" in brief

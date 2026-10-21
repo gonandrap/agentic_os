@@ -1,16 +1,4 @@
-"""The message bus: typed envelopes posted to a ROLE, delivered by a pure router.
-
-The substrate the validation panel stands on, and it has no callers yet — later work
-orders in that feature post to it. What these tests protect is therefore the *shape*
-rather than any feature built on it:
-
-* **the sender never resolves anything.** `delivered_wo_id` is written by the router and
-  by nothing else, which is the only record of who read an envelope;
-* **the router, not the sender, decides what happens when a role is unfilled** — a
-  deferral with no manager is filed as a backlog item here, exactly as it is today;
-* **the vocabulary is walked, not listed.** Adding a kind or an addressable role without
-  wiring it fails this file, instead of producing an `undeliverable` row months later.
-"""
+"""The message bus: typed envelopes posted to a ROLE, delivered by a pure router"""
 
 from __future__ import annotations
 
@@ -62,12 +50,7 @@ def a_work_order(store, title="implement the thing", **kw):
 
 
 def a_manager(store, fo_id, status="waiting_input"):
-    """A manager work order under `fo_id`.
-
-    `manager` joined WO_KINDS with the validation layer's vocabulary (wo-3ce42dc7), but
-    nothing creates one yet, so every manager in this file is built by hand. The router
-    only ever asks the database what kind a row is.
-    """
+    """A manager work order under `fo_id`"""
     wo_id = a_work_order(store, "own the feature", parent_id=fo_id, kind="manager")
     store.set_status(wo_id, status)
     return wo_id
@@ -82,7 +65,7 @@ def messages(store, wo_id):
 
 
 def sample_payload(cls):
-    """Build a payload of `cls` without naming any kind — see the vocabulary test."""
+    """Build a payload of `cls` without naming any kind — see the vocabulary test"""
     kw = {}
     for f in dataclasses.fields(cls):
         if f.default is not dataclasses.MISSING:
@@ -97,12 +80,11 @@ def feedback(**kw):
     return ReviewFeedback(**{**base, **kw})
 
 
-# -- posting resolves nothing --------------------------------------------------------
+# -- posting resolves nothing
 
 
 def test_post_queues_and_only_delivery_ever_resolves(store, central):
-    """Paired deliberately: without the second half, "the sender resolved nothing" cannot
-    be told apart from "the column is never written at all"."""
+    """Paired deliberately: without the second half"""
     wo_id = a_work_order(store)
     env_id = bus.post(store, subject=Subject(wo_id=wo_id), from_role="reviewer",
                       to_role="implementor", payload=feedback())
@@ -132,9 +114,7 @@ def test_an_envelope_to_the_implementor_reaches_the_subject_work_order(store, ce
 
 
 def test_the_manager_route_and_what_the_router_does_without_one(store, central):
-    """Both halves of the manager rule in one test: with a manager the envelope reaches
-    it; with none, the ROUTER files the backlog item itself rather than the sender
-    branching on whether a recipient exists."""
+    """Both halves of the manager rule in one test: with a manager the envelope reaches it"""
     fo_id = store.create_feature_order("ship the exporter")["id"]
     manager = a_manager(store, fo_id)
     child = a_work_order(store, parent_id=fo_id)
@@ -163,8 +143,7 @@ def test_the_manager_route_and_what_the_router_does_without_one(store, central):
 
 
 def test_feedback_to_a_cancelled_work_order_is_undeliverable(store, central):
-    """Paired with the live case: feedback that reached nobody must never look like
-    feedback that was acted on."""
+    """Paired with the live case: feedback that reached nobody must never look like feedback that was..."""
     live = a_work_order(store, "still running")
     dead = a_work_order(store, "cancelled halfway")
     store.set_status(dead, "cancelled")
@@ -184,8 +163,7 @@ def test_feedback_to_a_cancelled_work_order_is_undeliverable(store, central):
 
 
 def test_a_cancelled_manager_under_a_live_feature_flags_the_feature(store, central):
-    """A feature whose manager is gone cannot run its loop, and only the user can decide
-    what to do about that — so this one is not silently filed anywhere."""
+    """A feature whose manager is gone cannot run its loop"""
     fo_id = store.create_feature_order("ship the exporter")["id"]
     store.set_feature_status(fo_id, "executing")
     a_manager(store, fo_id, status="cancelled")
@@ -203,7 +181,7 @@ def test_a_cancelled_manager_under_a_live_feature_flags_the_feature(store, centr
     assert not central.list_backlog("proj_a")  # NOT quietly turned into a backlog item
 
 
-# -- ordering, transactionality, exactly-once ----------------------------------------
+# -- ordering, transactionality, exactly-once
 
 
 def test_envelopes_are_delivered_oldest_first(store, daemon, catalog_file):
@@ -219,8 +197,7 @@ def test_envelopes_are_delivered_oldest_first(store, daemon, catalog_file):
 
 
 def test_delivery_is_transactional(store, central, monkeypatch):
-    """The redelivery guard, and nothing else tests it: if the state moved without the
-    message, a daemon dying between the two would drop the envelope on the floor."""
+    """The redelivery guard, and nothing else tests it: if the state moved without the message"""
     wo_id = a_work_order(store)
     env_id = bus.post(store, subject=Subject(wo_id=wo_id), from_role="reviewer",
                       to_role="implementor", payload=feedback())
@@ -249,8 +226,7 @@ def test_ticking_twice_delivers_an_envelope_exactly_once(store, daemon, catalog_
 
 
 def test_an_empty_envelope_table_costs_one_query(store, daemon, catalog_file):
-    """With no envelope ever posted the OS behaves exactly as it does today: the new tick
-    step is one indexed lookup that finds nothing."""
+    """With no envelope ever posted the OS behaves exactly as it does today: the new tick step is one..."""
     seen: list[str] = []
     store.conn.set_trace_callback(seen.append)
     try:
@@ -261,8 +237,7 @@ def test_an_empty_envelope_table_costs_one_query(store, daemon, catalog_file):
 
 
 def test_the_daemon_tick_routes_envelopes(store, daemon):
-    """The wiring itself: `deliver_envelopes` is part of the tick, not just a method
-    somebody could call."""
+    """The wiring itself: `deliver_envelopes` is part of the tick, not just a method somebody could call"""
     wo_id = a_work_order(store)
     store.set_status(wo_id, "running")  # no session_id, so nothing is spawned from it
     bus.post(store, subject=Subject(wo_id=wo_id), from_role="reviewer",
@@ -273,7 +248,7 @@ def test_the_daemon_tick_routes_envelopes(store, daemon):
     assert [m["source"] for m in messages(store, wo_id)] == [bus.MESSAGE_SOURCE]
 
 
-# -- the typing at the boundary ------------------------------------------------------
+# -- the typing at the boundary
 
 
 def test_an_illegal_role_kind_or_state_is_refused(store):
@@ -311,7 +286,7 @@ def test_a_subject_is_exactly_one_of_a_work_order_and_a_feature(store):
 
 
 def test_post_refuses_a_payload_that_is_not_a_registered_dataclass(store):
-    """A bare dict getting through means the typing is decorative."""
+    """A bare dict getting through means the typing is decorative"""
     wo_id = a_work_order(store)
     with pytest.raises(BusError):
         bus.post(store, subject=Subject(wo_id=wo_id), from_role="reviewer",
@@ -324,8 +299,7 @@ def test_post_refuses_a_payload_that_is_not_a_registered_dataclass(store):
 
 
 def test_kind_always_matches_the_payload_type(store):
-    """The signature assertion is the one that survives a later refactor: a `kind`
-    parameter is the "kind disagrees with its payload" bug, reintroduced."""
+    """The signature assertion is the one that survives a later refactor: a `kind` parameter is the "kind..."""
     wo_id = a_work_order(store)
     fb = bus.post(store, subject=Subject(wo_id=wo_id), from_role="reviewer",
                   to_role="implementor", payload=feedback())
@@ -338,8 +312,7 @@ def test_kind_always_matches_the_payload_type(store):
 
 
 def test_a_stored_payload_that_no_longer_parses_is_undeliverable(store, central):
-    """Paired with a well-formed one: a malformed message is never delivered as a
-    message, and the reason lands in `note` where somebody can read it."""
+    """Paired with a well-formed one: a malformed message is never delivered as a message"""
     wo_id = a_work_order(store)
     broken = store.post_envelope(subject_wo_id=wo_id, from_role="reviewer",
                                  to_role="implementor", kind="review_feedback",
@@ -355,8 +328,7 @@ def test_a_stored_payload_that_no_longer_parses_is_undeliverable(store, central)
 
 
 def test_a_payload_survives_the_round_trip(store):
-    """Tuples are the trap: JSON has none, so `asks` comes back a list unless the parse
-    coerces it — and these dataclasses are frozen and compared by value."""
+    """Tuples are the trap: JSON has none, so `asks` comes back a list unless the parse coerces it"""
     wo_id = a_work_order(store)
     sent = feedback(asks=("add a failing test", "name the branch it covers"))
     env_id = bus.post(store, subject=Subject(wo_id=wo_id), from_role="reviewer",
@@ -365,13 +337,11 @@ def test_a_payload_survives_the_round_trip(store):
     assert bus.parse_payload(row["kind"], row["payload"]) == sent
 
 
-# -- the vocabulary is walked, not listed --------------------------------------------
+# -- the vocabulary is walked, not listed
 
 
 def test_every_kind_and_every_addressable_role_is_wired(store, central):
-    """Iterating the tuples is the whole value: a kind or a role added without a routing
-    rule fails here, instead of quietly producing `undeliverable` rows.
-    """
+    """Iterating the tuples is the whole value: a kind or a role added without a routing rule fails here"""
     assert set(bus.ADDRESSABLE_ROLES) | set(bus.SENDER_ONLY_ROLES) == set(ENVELOPE_ROLES)
     assert not set(bus.ADDRESSABLE_ROLES) & set(bus.SENDER_ONLY_ROLES)
 
@@ -396,12 +366,11 @@ def test_every_kind_and_every_addressable_role_is_wired(store, central):
         assert state in ENVELOPE_STATES
 
 
-# -- liveness: the bus owns its own -------------------------------------------------
+# -- liveness: the bus owns its own
 
 
 def test_inv_envelope_stuck_retries_and_then_gives_up(store, monkeypatch):
-    """Paired with a healthy envelope: an invariant that fires on healthy state is worse
-    than no invariant."""
+    """Paired with a healthy envelope: an invariant that fires on healthy state is worse than no invariant"""
     wo_id = a_work_order(store)
     stuck = bus.post(store, subject=Subject(wo_id=wo_id), from_role="reviewer",
                      to_role="implementor", payload=feedback())
@@ -427,8 +396,7 @@ def test_inv_envelope_stuck_retries_and_then_gives_up(store, monkeypatch):
 
 
 def test_inv_envelope_stuck_prefers_a_retry_that_works(store):
-    """The repair is a real delivery attempt, not a giving-up: `bus.deliver` is
-    transactional and therefore safe to run again."""
+    """The repair is a real delivery attempt"""
     wo_id = a_work_order(store)
     env_id = bus.post(store, subject=Subject(wo_id=wo_id), from_role="reviewer",
                       to_role="implementor", payload=feedback())
@@ -444,9 +412,7 @@ def test_inv_envelope_stuck_prefers_a_retry_that_works(store):
 
 
 def test_a_read_only_check_delivers_nothing(store):
-    """`jarvis doctor` without --repair promises to change nothing, and the repair here
-    would write to the CENTRAL store too — which no proxy over the project store can
-    intercept."""
+    """`jarvis doctor` without --repair promises to change nothing"""
     wo_id = a_work_order(store)
     env_id = bus.post(store, subject=Subject(wo_id=wo_id), from_role="reviewer",
                       to_role="implementor", payload=feedback())
@@ -462,14 +428,11 @@ def test_a_read_only_check_delivers_nothing(store):
     assert not messages(store, wo_id)
 
 
-# -- the seam ------------------------------------------------------------------------
+# -- the seam
 
 
 def test_the_bus_imports_nothing_above_the_two_stores():
-    """Walked as an AST rather than checked in `sys.modules`: this codebase's style is
-    lazy imports inside function bodies, which a loaded-modules check cannot see. Same
-    precedent as `test_neo_panel.py::test_neo_never_imports_the_panel`.
-    """
+    """Walked as an AST rather than checked in `sys.modules`: this codebase's style is lazy imports inside..."""
     tree = ast.parse(Path(bus.__file__).read_text())
     imported: list[str] = []
     for node in ast.walk(tree):

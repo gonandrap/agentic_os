@@ -1,20 +1,4 @@
-"""The assumptions view: one renderer, both surfaces, four objection end states.
-
-§8 of docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-runs.md.
-
-Three post-conditions outrank everything else here:
-
-1. **The historical row renders exactly as it does today.** Every assumption written
-   before the early pass shipped has all the new columns empty, and an empty column must
-   never read as an objection that was never delivered (kn-c712a5d6: a column is untested
-   until a test reads a row written before it).
-2. **The four end states are four different things** — in flight, delivered, withdrawn
-   because the order stopped first, undeliverable — and rendering any two of them the
-   same is the defect.
-3. **One renderer serves both surfaces.** `ops.assumption_line`'s strings are the page's
-   strings; a second formatter in `cli.py` or in the template is how a machine verdict
-   gets credited to the user on one surface.
-"""
+"""The assumptions view: one renderer, both surfaces, four objection end states (docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-runs.md)"""
 
 from __future__ import annotations
 
@@ -33,6 +17,9 @@ from jarvis.ui.app import create_app  # noqa: E402
 
 REASON = "the helper is not idempotent on retry, so the second call double-counts"
 NOW = 1_700_000_000.0
+#: The two withdrawal reasons, verbatim
+STOPPED = "the order stopped before it could be delivered"
+HANDED_BACK = "the order delivered its result and the decision is yours"
 
 
 @pytest.fixture()
@@ -42,24 +29,21 @@ def client(jarvis_home, fake_claude, catalog_file):
 
 
 def page_of(client, wo_id: str) -> str:
-    """The work order page, unescaped and whitespace-collapsed (test_ui.py:585)."""
+    """The work order page, unescaped and whitespace-collapsed (test_ui.py:585)"""
     return html.unescape(" ".join(client.get(f"/wo/proj_a/{wo_id}").text.split()))
 
 
 def objecting_order(store, *, delivered: float | None = None,
                     withdrawn: float | None = None, transport: str = "queue",
                     envelope_state: str = "queued", msg_status: str | None = None,
-                    verdict: str = "object"):
-    """An order with one assumption whose objection reached `envelope_state`.
-
-    Returns `(wo, assumption row with every derivation attached)` — the row both
-    surfaces read, which is `ops.assumptions_with_rulings`' and not the store's.
-    """
+                    verdict: str = "object", withdrawn_reason: str = "",
+                    status: str = "running"):
+    """An order with one assumption whose objection reached `envelope_state`"""
     wo = store.create_work_order(title="an order mid-flight", description="d")
     aid = store.add_assumption(wo["id"], "the API is idempotent")
     store.record_provisional(aid, verdict=verdict, reason=REASON, model="opus",
                              stakes="routine")
-    store.set_status(wo["id"], "running")
+    store.set_status(wo["id"], status)
     env_id = store.post_envelope(from_role="reviewer", to_role="implementor",
                                  kind="assumption_objection",
                                  payload={"reason": REASON},
@@ -76,6 +60,11 @@ def objecting_order(store, *, delivered: float | None = None,
         store.mark_objection_delivered(aid, delivered)
     if withdrawn:
         store.withdraw_objection(aid, withdrawn)
+    if withdrawn_reason:
+        # THE CARRIER OF THE REASON is the event and never the column: §3 of...
+        store.add_event(wo["id"], "autoreview_objection_withdrawn",
+                        {"assumption_id": aid, "n": 1, "reason": withdrawn_reason,
+                         "envelope_id": env_id})
     return store.get_work_order(wo["id"]), row_of(store, wo["id"], aid)
 
 
@@ -84,12 +73,11 @@ def row_of(store, wo_id: str, aid: int) -> dict:
                 if a["id"] == aid)
 
 
-# -- the historical row, which is the test that matters --------------------------------
+# -- the historical row, which is the test that matters
 
 
 def test_a_row_written_before_the_columns_renders_exactly_as_before(client, project):
-    """kn-c712a5d6. Every new column absent from the table, not merely empty: the row is
-    read back after the upgrade added them, which is the only shape live data has."""
+    """kn-c712a5d6"""
     wo = ops.create_work_order("proj_a", "task with a judgement call")
     store = ProjectStore(project)
     aid = store.add_assumption(wo["id"], "reused the existing exporter")
@@ -117,7 +105,7 @@ def test_a_row_written_before_the_columns_renders_exactly_as_before(client, proj
 
 
 def test_an_assumption_in_an_auto_review_off_project_grows_no_lines(client, project):
-    """Most of the fleet. The columns exist and are empty, which must read as silence."""
+    """Most of the fleet"""
     wo = ops.create_work_order("proj_a", "task with a judgement call")
     store = ProjectStore(project)
     aid = store.add_assumption(wo["id"], "kept the default timeout")
@@ -132,11 +120,11 @@ def test_an_assumption_in_an_auto_review_off_project_grows_no_lines(client, proj
     assert "waiting on the worker" not in page and "objection sent" not in page
 
 
-# -- the four end states ---------------------------------------------------------------
+# -- the four end states
 
 
-def test_the_four_end_states_each_read_differently(client, project):
-    """§8 item 3: four facts, four sentences. Any two spelled the same is the defect."""
+def test_the_five_end_states_each_read_differently(client, project):
+    """§8 item 3: five facts, five sentences"""
     store = ProjectStore(project)
     lines = {}
     _, flight = objecting_order(store)
@@ -144,19 +132,78 @@ def test_the_four_end_states_each_read_differently(client, project):
     _, delivered = objecting_order(store, delivered=NOW + 60)
     lines["delivered"] = ops.objection_line(delivered)
     _, withdrawn = objecting_order(store, withdrawn=NOW + 90,
-                                   envelope_state="withdrawn")
+                                   envelope_state="withdrawn",
+                                   withdrawn_reason=STOPPED)
     lines["withdrawn"] = ops.objection_line(withdrawn)
+    _, handed = objecting_order(store, withdrawn=NOW + 90, envelope_state="withdrawn",
+                                withdrawn_reason=HANDED_BACK, status="needs_review")
+    lines["handed_back"] = ops.objection_line(handed)
     _, dead = objecting_order(store, msg_status="failed")
     lines["dead"] = ops.objection_line(dead)
 
-    assert len(set(lines.values())) == 4, lines
+    assert len(set(lines.values())) == 5, lines
     assert lines["flight"].endswith("in flight")
     assert "delivered at " in lines["delivered"]
     assert "withdrawn at " in lines["withdrawn"]
-    assert "the order stopped before it could be delivered" in lines["withdrawn"]
+    assert STOPPED in lines["withdrawn"]
+    assert HANDED_BACK in lines["handed_back"]
     assert "UNDELIVERABLE" in lines["dead"]
     for line in lines.values():
         assert "objection sent to the worker over the queue at " in line
+
+
+def test_a_handed_back_objection_says_the_decision_is_yours(client, project):
+    """§3: the reason is read OFF THE ROW, and the fallback is the historical fact"""
+    store = ProjectStore(project)
+    wo, handed = objecting_order(store, withdrawn=NOW + 90,
+                                 envelope_state="withdrawn",
+                                 withdrawn_reason=HANDED_BACK, status="needs_review")
+
+    assert handed["objection_withdrawn_reason"] == HANDED_BACK
+    line = ops.objection_line(handed)
+    assert HANDED_BACK in line and STOPPED not in line
+    assert line in ops.assumption_line(handed)
+    assert line in page_of(client, wo["id"])
+
+    _, historical = objecting_order(store, withdrawn=NOW + 90,
+                                    envelope_state="withdrawn")
+
+    assert historical["objection_withdrawn_reason"] == ""
+    assert STOPPED in ops.objection_line(historical)
+
+
+def test_the_review_payload_names_the_objected_assumption(client, project):
+    """§4: the link the boundary was missing, on both surfaces, and the reason ONCE"""
+    store = ProjectStore(project)
+    wo, row = objecting_order(store, withdrawn=NOW + 90, envelope_state="withdrawn",
+                              withdrawn_reason=HANDED_BACK, status="needs_review")
+
+    review = ops.review_state(store, store.get_work_order(wo["id"]))
+
+    assert review["objected"] == [{"n": 1, "reason": REASON, "delivery": "handed_back"}]
+    assert "assumption #1" in review["objected_note"]
+    assert "the worker was never told" in review["objected_note"]
+    assert REASON not in review["objected_note"]
+    assert review["objected_note"] in "\n".join(ops.review_lines(review))
+
+    page = page_of(client, wo["id"])
+    assert review["objected_note"] in page
+    assert page.count(REASON) == 1
+    readable = cli._readable_review({"id": wo["id"], "review": review})["review"]
+    assert [line for line in readable if review["objected_note"] in line]
+    assert len([line for line in readable if REASON in line]) == 0
+
+
+def test_a_delivered_objection_does_not_say_the_worker_was_never_told(project):
+    """The one objected row where the worker WAS told"""
+    store = ProjectStore(project)
+    wo, _ = objecting_order(store, delivered=NOW + 60, status="needs_review")
+
+    review = ops.review_state(store, store.get_work_order(wo["id"]))
+
+    assert review["objected"][0]["delivery"] == "delivered"
+    assert "never told" not in review["objected_note"]
+    assert "left it as it is" in review["objected_note"]
 
 
 @pytest.mark.parametrize("kwargs,expected", [
@@ -169,8 +216,7 @@ def test_the_four_end_states_each_read_differently(client, project):
     ({"envelope_state": "delivered", "msg_status": "delivered"}, False),
 ])
 def test_undeliverable_is_a_carrier_state_and_only_those(project, kwargs, expected):
-    """§9's trigger, verbatim: the message row `failed`, or the envelope terminal and
-    not `delivered`. A queued objection is the normal case for the length of a turn."""
+    """§9's trigger, verbatim: the message row `failed`, or the envelope terminal and not `delivered`"""
     store = ProjectStore(project)
     _, row = objecting_order(store, **kwargs)
 
@@ -179,7 +225,7 @@ def test_undeliverable_is_a_carrier_state_and_only_those(project, kwargs, expect
 
 
 def test_a_row_with_no_objection_is_never_undeliverable(project):
-    """No `objection_envelope_id` is no objection, not a failed one."""
+    """No `objection_envelope_id` is no objection, not a failed one"""
     store = ProjectStore(project)
     wo = store.create_work_order(title="an order with no objection", description="d")
     aid = store.add_assumption(wo["id"], "nothing was ever objected to")
@@ -187,11 +233,11 @@ def test_a_row_with_no_objection_is_never_undeliverable(project):
     assert invariants.objection_undeliverable(store, row_of(store, wo["id"], aid)) is False
 
 
-# -- what the worker did, and the waiting line ------------------------------------------
+# -- what the worker did, and the waiting line
 
 
 def test_delivered_with_nothing_back_is_waiting_on_the_worker(client, project):
-    """§8 owns this line — it is what the order is waiting on, and it is not the user."""
+    """§8 owns this line — it is what the order is waiting on, and it is not the user"""
     store = ProjectStore(project)
     wo, row = objecting_order(store, delivered=NOW + 60)
 
@@ -202,8 +248,7 @@ def test_delivered_with_nothing_back_is_waiting_on_the_worker(client, project):
 
 
 def test_an_undelivered_objection_is_never_waiting_on_the_worker(project):
-    """Not delivered is the ambiguous fact: the worker was never told, so it owes
-    nothing. Both the queued case and the withdrawn one."""
+    """Not delivered is the ambiguous fact: the worker was never told, so it owes nothing"""
     store = ProjectStore(project)
     _, flight = objecting_order(store)
     _, withdrawn = objecting_order(store, withdrawn=NOW + 90)
@@ -213,7 +258,7 @@ def test_an_undelivered_objection_is_never_waiting_on_the_worker(project):
 
 
 def test_a_later_assumption_is_the_workers_answer(project):
-    """§6.5: read forward from the delivery. A new assumption IS an act of the worker."""
+    """§6.5: read forward from the delivery"""
     store = ProjectStore(project)
     wo, row = objecting_order(store, delivered=NOW + 60)
     store.add_assumption(wo["id"], "so I made the helper idempotent instead")
@@ -225,7 +270,7 @@ def test_a_later_assumption_is_the_workers_answer(project):
 
 
 def test_a_worker_message_is_the_workers_answer(project):
-    """`wo_messages` direction `agent_to_user` — the worker talking, not the OS."""
+    """`wo_messages` direction `agent_to_user` — the worker talking, not the OS"""
     store = ProjectStore(project)
     wo, row = objecting_order(store, delivered=NOW + 60)
     store.record_agent_reply(wo["id"], "fair — retry safety added in b3c1f0a")
@@ -237,7 +282,7 @@ def test_a_worker_message_is_the_workers_answer(project):
 
 
 def test_a_question_to_neo_is_the_workers_answer(project):
-    """It acted on the objection by asking, which is an answer to "did it read it"."""
+    """It acted on the objection by asking, which is an answer to "did it read it\""""
     store = ProjectStore(project)
     wo, row = objecting_order(store, delivered=NOW + 60)
     store.add_event(wo["id"], "question_asked",
@@ -249,7 +294,7 @@ def test_a_question_to_neo_is_the_workers_answer(project):
 
 
 def test_finishing_is_the_workers_answer(project):
-    """The worker stopped. It owes nothing further and the line must not say it does."""
+    """The worker stopped"""
     store = ProjectStore(project)
     wo, row = objecting_order(store, delivered=NOW + 60)
     store.add_event(wo["id"], "finished", {"summary": "shipped it unchanged"})
@@ -260,8 +305,7 @@ def test_finishing_is_the_workers_answer(project):
 
 
 def test_a_daemon_written_event_is_not_the_workers_answer(project):
-    """Only the four acts count. An OS event after delivery proves nothing about the
-    worker, and reading one as an answer would retire the waiting line silently."""
+    """Only the four acts count"""
     store = ProjectStore(project)
     wo, row = objecting_order(store, delivered=NOW + 60)
     store.add_event(wo["id"], "autoreview_held", {"assumption_id": row["id"], "n": 1,
@@ -273,12 +317,7 @@ def test_a_daemon_written_event_is_not_the_workers_answer(project):
 
 
 def test_an_act_before_the_delivery_is_not_a_response(project):
-    """Read FORWARD from `objection_delivered_ts`, never backwards: the worker cannot
-    have answered a message it had not yet received.
-
-    The delivery is stamped AHEAD of the clock, so the reply the store writes at `now()`
-    is genuinely earlier than it — the shape a real record has when the worker was mid-
-    sentence when the objection landed."""
+    """Read FORWARD from `objection_delivered_ts`"""
     from jarvis import db
 
     store = ProjectStore(project)
@@ -289,11 +328,11 @@ def test_an_act_before_the_delivery_is_not_a_response(project):
         row_of(store, wo["id"], row["id"]))
 
 
-# -- the pointer each surface adds for a panel hold --------------------------------------
+# -- the pointer each surface adds for a panel hold
 
 
 def panel_held_order(store, *, outcome: str, round_in_payload: int | None = 1):
-    """An order whose one pending assumption is held because the panel gave up."""
+    """An order whose one pending assumption is held because the panel gave up"""
     from jarvis import autoreview
 
     wo = store.create_work_order(title="an order the panel gave up on", description="d")
@@ -312,8 +351,7 @@ def panel_held_order(store, *, outcome: str, round_in_payload: int | None = 1):
 
 
 def test_a_panel_hold_links_to_the_round_it_names(client, project):
-    """AN ANCHOR THAT DOES NOT RESOLVE is the one failure a link test exists to catch: the
-    `href` the assumption block emits must match the `id` the validation section emits."""
+    """AN ANCHOR THAT DOES NOT RESOLVE is the one failure a link test exists to catch: the `href` the..."""
     store = ProjectStore(project)
     wo = panel_held_order(store, outcome="escalated")
     store.close()
@@ -326,8 +364,7 @@ def test_a_panel_hold_links_to_the_round_it_names(client, project):
 
 
 def test_a_panel_hold_with_no_round_recorded_gets_no_link(client, project):
-    """A payload written before the round was recorded: the sentence renders, the anchored
-    link does not, because there is no round number to point at."""
+    """A payload written before the round was recorded: the sentence renders"""
     store = ProjectStore(project)
     wo = panel_held_order(store, outcome="escalated", round_in_payload=None)
     store.close()
@@ -339,10 +376,7 @@ def test_a_panel_hold_with_no_round_recorded_gets_no_link(client, project):
 
 
 def test_a_confirm_spent_hold_reads_current_and_points_at_no_round(project):
-    """§8 row 8 of docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-hold-
-    an-assumption-for-ever.md: `jarvis wo show` prints the CURRENT sentence — the question
-    is no longer open — and adds NO `jarvis validation show` pointer, because the pointer
-    belongs to `panel_gave_up` and this hold is about a spent Neo question, not a round."""
+    """§8 row 8 of docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-hold-..."""
     from jarvis import autoreview
 
     store = ProjectStore(project)
@@ -371,12 +405,11 @@ def test_a_confirm_spent_hold_reads_current_and_points_at_no_round(project):
     assert "jarvis validation show" not in readable["auto_review"]
 
 
-# -- one renderer, both surfaces --------------------------------------------------------
+# -- one renderer, both surfaces
 
 
 def test_the_page_and_jarvis_wo_show_render_the_same_strings(client, project):
-    """test_ui.py:595's claim, one section along: the page's lines ARE
-    `ops.assumption_line`'s, so no surface can spell an objection its own way."""
+    """test_ui.py:595's claim, one section along: the page's lines ARE `ops.assumption_line`'s"""
     store = ProjectStore(project)
     wo, row = objecting_order(store, delivered=NOW + 60, transport="peer")
     store.record_agent_reply(wo["id"], "fair — retry safety added in b3c1f0a")
@@ -397,8 +430,7 @@ def test_the_page_and_jarvis_wo_show_render_the_same_strings(client, project):
 
 
 def test_the_page_shows_the_objection_in_the_specs_order(client, project):
-    """§8: text and status, then Neo's provisional reading, then the objection, then the
-    response. One ordering, because the user asked for it in that order."""
+    """§8: text and status, then Neo's provisional reading, then the objection, then the response"""
     store = ProjectStore(project)
     wo, row = objecting_order(store, delivered=NOW + 60)
     page = page_of(client, wo["id"])
@@ -410,12 +442,11 @@ def test_the_page_shows_the_objection_in_the_specs_order(client, project):
     assert at == sorted(at), at
 
 
-# -- §7 on a settled row ----------------------------------------------------------------
+# -- §7 on a settled row
 
 
 def test_a_confirmed_provisional_accept_reads_correctly_once_settled(client, project):
-    """§7: what the OS thought while the work ran AND what it thought once it saw the
-    result. Both readings on the row, with the decider naming the machine."""
+    """§7: what the OS thought while the work ran AND what it thought once it saw the result"""
     store = ProjectStore(project)
     wo = store.create_work_order(title="an order that landed", description="d")
     aid = store.add_assumption(wo["id"], "the exporter handles the empty case")
@@ -437,7 +468,7 @@ def test_a_confirmed_provisional_accept_reads_correctly_once_settled(client, pro
 
 
 def test_an_unconfirmed_provisional_accept_still_says_both_readings(client, project):
-    """The two readings disagreed, so the assumption is the user's and they get both."""
+    """The two readings disagreed, so the assumption is the user's and they get both"""
     store = ProjectStore(project)
     wo = store.create_work_order(title="an order that landed", description="d")
     aid = store.add_assumption(wo["id"], "the exporter handles the empty case")

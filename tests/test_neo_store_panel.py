@@ -1,9 +1,4 @@
-"""What `neo.db` has to know before a Neo panel can exist.
-
-Three storage facts (the `panel_opinions` table, the learnings' seat scope, the `SEATS`
-vocabulary) and one prerequisite bug fix (a question stranded in `answering` for ever,
-bl-3f5f1464). No panel runs here — this is the layer underneath one.
-"""
+"""What `neo.db` has to know before a Neo panel can exist"""
 
 from __future__ import annotations
 
@@ -24,15 +19,7 @@ def store(jarvis_home):
 
 def strand(store: NeoStore, question_id: int, age_seconds: float,
            attempts: int = 0) -> None:
-    """Park a question in `answering` as a dead drain would leave it.
-
-    THE REAL CAUSE CANNOT BE STAGED IN-PROCESS: it is the daemon dying (or throwing)
-    between `claim_next` and `record_answer`, and a test that kills its own interpreter
-    proves nothing about the row it leaves behind. So the row is written directly, in
-    exactly the state that crash produces, and the correctness argument that the cutoff
-    cannot fire underneath a LIVE call is carried by
-    `test_the_cutoff_outlives_the_longest_possible_neo_call` instead.
-    """
+    """Park a question in `answering` as a dead drain would leave it"""
     from jarvis import db
 
     store.conn.execute(
@@ -46,26 +33,19 @@ def statuses(store: NeoStore) -> dict[str, int]:
         "SELECT status, COUNT(*) c FROM questions GROUP BY status")}
 
 
-# -- the seat vocabulary ---------------------------------------------------------------
+# -- the seat vocabulary
 
 
 def test_seats_are_the_rostered_five():
-    """Two other work orders validate against this tuple (a catalog roster and a CLI
-    `--seat` argument), so its contents are the contract, not an implementation detail."""
+    """Two other work orders validate against this tuple (a catalog roster and a CLI `--seat` argument)"""
     assert neo_store.SEATS == ("premise", "record", "blast", "taste", "chair")
 
 
-# -- panel_opinions --------------------------------------------------------------------
+# -- panel_opinions
 
 
 def test_an_opinion_is_declared_a_child_of_its_question(store):
-    """The constraint, read off the database rather than off the CREATE statement.
-
-    `db.connect` sets `foreign_keys=ON`, so this cascade is live — and it has to be:
-    `purge_work_order` hard-DELETEs questions, and `questions.id` is an AUTOINCREMENT
-    rowid that SQLite reuses, so an orphan opinion would eventually reattach itself to
-    an unrelated question.
-    """
+    """The constraint, read off the database rather than off the CREATE statement"""
     fks = [dict(r) for r in store.conn.execute(
         "PRAGMA foreign_key_list(panel_opinions)")]
     assert len(fks) == 1
@@ -75,13 +55,7 @@ def test_an_opinion_is_declared_a_child_of_its_question(store):
 
 
 def test_deleting_a_work_order_takes_its_deliberation_but_not_its_learnings(store):
-    """The cascade end to end, with the control that makes it mean something.
-
-    `purge_work_order` deliberately KEEPS learnings and only cuts the back-link: what
-    Neo learned is durable knowledge about the user, not about the work order it came
-    from. So a test that only asserted "the opinions are gone" could not tell a correct
-    cascade from one that had quietly swallowed the learnings too.
-    """
+    """The cascade end to end, with the control that makes it mean something"""
     q = store.ask("proj_a", "wo-doomed", "may I merge this?", kind="approval")
     store.record_opinion(q["id"], "premise", reply="it only names shipit",
                          verdict="dismiss", route="fast", model="sonnet",
@@ -102,7 +76,7 @@ def test_deleting_a_work_order_takes_its_deliberation_but_not_its_learnings(stor
 
 
 def test_an_unknown_opinion_status_is_refused(store):
-    """The same refusal `ask()` gives an unknown kind: an assertion, not a silent row."""
+    """The same refusal `ask()` gives an unknown kind: an assertion, not a silent row"""
     q = store.ask("proj_a", "wo-1", "which delimiter?")
     with pytest.raises(AssertionError):
         store.record_opinion(q["id"], "blast", status="maybe")
@@ -112,8 +86,7 @@ def test_an_unknown_opinion_status_is_refused(store):
 
 
 def test_a_re_run_replaces_a_seats_opinion_rather_than_doubling_it(store):
-    """A question CAN be answered twice — `reclaim_stale` re-queues a stranded one — so
-    the panel re-records the same seats. One row per seat, last run wins, stable id."""
+    """A question CAN be answered twice"""
     q = store.ask("proj_a", "wo-1", "which delimiter?")
     first = store.record_opinion(q["id"], "premise", reply="stranded attempt",
                                  route="panel")
@@ -142,16 +115,11 @@ def test_opinions_read_back_what_the_seats_recorded(store):
     assert rows[1]["route"] == "", "only the premise seat routes"
 
 
-# -- learnings: the seat scope ---------------------------------------------------------
+# -- learnings: the seat scope
 
 
 def test_seat_scope_is_additive_and_the_default_is_global_only(store):
-    """The one thing about this feature that is easy to get backwards.
-
-    Asserting only that `seat="blast"` returns something would not distinguish a working
-    filter from a broken one: `[]` reads identically to "no blast learnings exist". So
-    every assertion here names the global row as well, in the same call.
-    """
+    """The one thing about this feature that is easy to get backwards"""
     store.add_learning("always default to CSV", project="proj_a")
     store.add_learning("a grep that merely names shipit ships nothing",
                        project="proj_a", seat="blast")
@@ -170,13 +138,11 @@ def test_seat_scope_is_additive_and_the_default_is_global_only(store):
         "always default to CSV", "one line when you agree"]
 
 
-# -- the stranded question -------------------------------------------------------------
+# -- the stranded question
 
 
 def test_the_cutoff_outlives_the_longest_possible_neo_call():
-    """A cutoff below the call timeout re-queues a question underneath a live call, and
-    the worker gets two answers to one question. This is the assertion that makes
-    `reclaim_stale` safe to run on a live queue."""
+    """A cutoff below the call timeout re-queues a question underneath a live call"""
     assert neo_store.STALE_ANSWERING_SECONDS > catalog.NeoConfig().timeout
 
 
@@ -201,9 +167,7 @@ def test_a_question_claimed_a_second_ago_is_left_alone(store):
 
 
 def test_no_other_status_is_touched(store):
-    """The whole histogram, not just the row under test: a WHERE clause that dropped
-    `status='answering'` would re-queue answered and escalated questions too, and
-    re-delivering a decided answer is worse than the bug being fixed."""
+    """The whole histogram, not just the row under test: a WHERE clause that dropped `status='answering'`..."""
     for kind, status in (("queued", "queued"), ("answered", "answered"),
                          ("escalated", "escalated"), ("failed", "failed")):
         q = store.ask("proj_a", "wo-1", f"a {kind} question")
@@ -230,8 +194,7 @@ def test_a_question_at_the_attempt_ceiling_fails_instead_of_looping(store):
 
 
 def test_a_question_stranded_before_this_shipped_is_not_exempt(store):
-    """`claimed_at` is NULL on every row written by the release in production — which is
-    where the questions this fix exists for actually are."""
+    """`claimed_at` is NULL on every row written by the release in production"""
     q = store.ask("proj_a", "wo-1", "which delimiter?")
     store.conn.execute(
         "UPDATE questions SET status='answering', claimed_at=NULL, ts=? WHERE id=?",
@@ -241,13 +204,7 @@ def test_a_question_stranded_before_this_shipped_is_not_exempt(store):
 
 
 def test_a_reclaimed_question_is_claimable_at_once_and_not_held_behind_a_backoff(store):
-    """The stale cutoff IS the backoff — `reclaim_stale` must not add a second one.
-
-    `release_claim` holds a re-queued question for 60s so a queue drained every few
-    seconds cannot spend the whole ladder in one tick (issue #235). This path has no
-    such problem: the row only qualifies after fifteen minutes in `answering`. Writing
-    a `retry_after` here made `neo_tick`'s rescue-and-answer a two-tick affair.
-    """
+    """The stale cutoff IS the backoff — `reclaim_stale` must not add a second one (#235)"""
     q = store.ask("proj_a", "wo-1", "which delimiter?")
     strand(store, q["id"], age_seconds=neo_store.STALE_ANSWERING_SECONDS + 60)
 
@@ -259,12 +216,7 @@ def test_a_reclaimed_question_is_claimable_at_once_and_not_held_behind_a_backoff
 
 def test_the_daemon_rescues_a_stranded_question_and_answers_it(
         jarvis_home, fake_claude, catalog_file, project):
-    """End to end through the real path: a row left in `answering` by a dead drain is
-    reclaimed by `neo_tick`, drained on the neo thread, and answered — in ONE tick.
-
-    Reclaiming after the queued count is read would have rescued it and then gone back to
-    sleep, so the assertion is on the answer, not on the status being `queued` again.
-    """
+    """End to end through the real path: a row left in `answering` by a dead drain is reclaimed by..."""
     from jarvis import ops
     from jarvis.catalog import load_catalog
     from jarvis.daemon import Daemon
