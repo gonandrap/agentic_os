@@ -3842,8 +3842,9 @@ class Daemon:
             steward.Candidate("investigation", "critical", project.name,
                               f"validation seats killed on {wo_id}",
                               evidence=(f"rc={killed.rc}",), parent_wo_id=wo_id),
-            catalog=self.catalog, store=store, central=self.central,
-            self_dispatch=self.self_dispatch)
+            # NOT `self.central`: this runs on a validation thread, and a sqlite
+            # connection belongs to the thread that opened it. The gate opens its own.
+            catalog=self.catalog, store=store, self_dispatch=self.self_dispatch)
         inv_id = (self._killed_investigation(store, project, wo_id, round_id, n, killed)
                   if decision.allowed else "")
         store.close_validation_round(
@@ -4976,7 +4977,7 @@ class Daemon:
                               str(dispatch.get("title") or ""),
                               evidence=(f"neo question {q['id']}",),
                               parent_wo_id=str(q["wo_id"])),
-            catalog=self.catalog, store=pstore, central=self.central,
+            catalog=self.catalog, store=pstore,
             self_dispatch=self.self_dispatch)
         if not decision.allowed:
             log.info("neo cleanup dispatch from %s not filed: steward %s (%s)",
@@ -4999,7 +5000,7 @@ class Daemon:
                 "from_wo": q["wo_id"],
             }}, decision), budget_usd=decision.budget_usd,
         )
-        steward.linked(decision, wo["id"], self.central)
+        steward.linked(decision, wo["id"])
         pstore.add_event(q["wo_id"], "neo_dispatched",
                          {"neo_question_id": q["id"], "cleanup_wo_id": wo["id"]})
         log.info("neo dispatched pre-approved cleanup %s from %s", wo["id"], q["wo_id"])
@@ -7345,7 +7346,7 @@ class Daemon:
                               f"`{fact.get('base') or 'main'}` is red",
                               evidence=(str(fact.get("run_url") or run_id or ""),),
                               parent_wo_id=str(fact.get("wo_id") or "")),
-            catalog=self.catalog, store=store, central=self.central,
+            catalog=self.catalog, store=store,
             self_dispatch=self.self_dispatch)
         if not self.self_dispatch:
             return  # the master switch (A12): decided and recorded, nothing filed
@@ -7401,7 +7402,7 @@ class Daemon:
                 {**fact, "issue_url": issue_url, "fix_wo_id": fix_wo_id,
                  "issue_os_filed": issue_os_filed})
         if fix_wo_id:
-            steward.linked(decision, fix_wo_id, self.central)
+            steward.linked(decision, fix_wo_id)
             log.info("[%s] %s is fixing the red default branch (%s)", project.name,
                      fix_wo_id, issue_url)
 
@@ -10475,13 +10476,13 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
             steward.Candidate("release", "major", project.name,
                               f"ship the fix for {url}", evidence=(url,),
                               parent_wo_id=str(wo["id"])),
-            catalog=self.catalog, store=store, central=self.central,
+            catalog=self.catalog, store=store,
             self_dispatch=self.self_dispatch)
         fresh = store.create_work_order(
             title=f"Ship the fix for {wo.get('title') or url}",
             description="", origin="jarvis",
             metadata=steward.stamped({self.RELEASE_BATCH_KEY: [url]}, decision))
-        steward.linked(decision, fresh["id"], self.central)
+        steward.linked(decision, fresh["id"])
         store.update_work_order(
             fresh["id"],
             description=self.RELEASE_BRIEF.format(wo_id=fresh["id"], fixes=line))

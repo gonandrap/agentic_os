@@ -223,11 +223,23 @@ machinery (`src/jarvis/budget.py`). That bounds the overshoot of any single orde
 }
 ```
 
-A project may override `weekly_usd` and `order_budget_usd`. The ledger is fleet-wide.
+The ledger is fleet-wide, so the steward reads these keys from `os.evolution` only. A
+project's `evolution` block keeps its existing `min_samples` meaning.
 
 ### 3.4 Provenance
 
-Work orders gain `origin_kind` and `generation` columns:
+*As built:* the provenance is a `steward` stamp in the order's metadata, written at
+creation, rather than new columns. The stamp holds `origin_kind`, `generation`,
+`severity`, `decision_id` and `mode`. Every decision, including the ones that dispatched
+nothing, is a row in `steward_decisions` (central `os.db`). Identical decisions within an
+hour are recorded once.
+
+There are two limits:
+- Investigations are feature orders, so their spend is not on the evolution ledger. Each
+  is capped at `worker.investigation_budget_usd`.
+- The ledger counts only stamped orders, so it starts at zero on deploy.
+
+As originally specified, work orders gain `origin_kind` and `generation`:
 - `origin_kind`: `user`, `user_expedite`, `panel`, `bug_agent`, `investigation`,
   `sweep`, `neo_rider`, `red_main`, `release` or `io_accepted`
 - `generation`: the parent's generation + 1 for OS-originated orders, 0 otherwise
