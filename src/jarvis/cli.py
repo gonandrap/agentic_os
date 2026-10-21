@@ -1365,6 +1365,10 @@ def build_parser() -> argparse.ArgumentParser:
     k.add_argument("--project", help="this project + global entries")
     k.add_argument("--topic")
     k.add_argument("--limit", type=int, default=20)
+    k = kn.add_parser("graph", help="(prototype) export the knowledge graph as GEXF for "
+                                    "Gephi Lite: entries, the orders that wrote and "
+                                    "retired them, learned gate rules, Neo learnings")
+    k.add_argument("-o", "--output", default="knowledge.gexf")
     k = kn.add_parser("show", help="full text of specific entries, by id")
     k.add_argument("ids", nargs="+")
     k = kn.add_parser("topics", help="topics and how many entries each holds")
@@ -4679,6 +4683,20 @@ def cmd_learn(args: argparse.Namespace) -> int:
             if missing:
                 raise OpsError(f"unknown knowledge id(s): {', '.join(sorted(missing))}")
             _print(rows, args.json)
+        elif args.kn_cmd == "graph":
+            import sqlite3
+
+            from . import kgraph
+            from .paths import neo_db_path
+
+            neo_path = neo_db_path()
+            neo = (sqlite3.connect(f"file:{neo_path}?mode=ro", uri=True)
+                   if neo_path.exists() else None)
+            nodes, edges = kgraph.graph_nodes_edges(
+                central.conn, neo, reads=central.knowledge_hit_counts())
+            Path(args.output).write_bytes(kgraph.to_gexf(nodes, edges))
+            print(f"{len(nodes)} nodes, {len(edges)} edges -> {args.output} "
+                  f"(open it in Gephi Lite: gephi.org/gephi-lite)")
         elif args.kn_cmd == "topics":
             topics = central.knowledge_topics(args.project)
             central.record_knowledge_read("topics", [{"topic": t} for t, _ in topics],
