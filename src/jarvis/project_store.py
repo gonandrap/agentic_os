@@ -1051,6 +1051,8 @@ ADDED_COLUMNS = {
         "objection_sent_ts": "REAL",
         "objection_delivered_ts": "REAL",
         "objection_withdrawn_ts": "REAL",
+        # The ordinary message that carried it LATE, when its own envelope never did (io-ce566253)
+        "objection_late_msg_id": "INTEGER",
         # THE SPEC SECTIONS THIS ASSUMPTION CITES — N of them under ONE labelled snapshot
         # in `spec_text` (Neo ruling Q1883), `spec_path`/`spec_which` being PARALLEL
         # NEWLINE LISTS of all N in that same order, one line each, so the pointer never
@@ -3271,12 +3273,19 @@ class ProjectStore:
             (envelope_id,)).fetchone()
         return dict(row) if row else None
 
-    def mark_objection_delivered(self, assumption_id: int,
-                                 ts: float | None = None) -> None:
+    def mark_objection_delivered(self, assumption_id: int, ts: float | None = None,
+                                 late_msg_id: int | None = None) -> None:
         """The worker ACTUALLY received it — not that the OS sent it"""
         self.conn.execute(
-            "UPDATE assumptions SET objection_delivered_ts=? WHERE id=?",
-            (db.now() if ts is None else ts, assumption_id))
+            "UPDATE assumptions SET objection_delivered_ts=?, objection_late_msg_id=? "
+            "WHERE id=?",
+            (db.now() if ts is None else ts, late_msg_id, assumption_id))
+
+    def undelivered_objections(self, wo_id: str) -> list[dict[str, Any]]:
+        """Objections never delivered, outstanding OR withdrawn — what a late message can carry"""
+        return [a for a in self.all_assumptions(wo_id)
+                if a.get("objection_envelope_id") is not None
+                and a.get("objection_delivered_ts") is None]
 
     def withdraw_objection(self, assumption_id: int, ts: float | None = None) -> None:
         """The order stopped before the objection could be delivered (§6.6)"""

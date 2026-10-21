@@ -324,6 +324,24 @@ A derived read, no table and no new write path (question 2009).
 * **No attention is raised for a held objection.** §9's `undeliverable` rule is untouched:
   nothing failed.
 
+### 7.1 Addendum 2026-10-21: a late delivery is recorded (io-ce566253, `redelivery-has-no-verb`)
+
+A withdrawn objection can still reach the worker if someone re-sends it as an ordinary
+message, which is what happened on wo-58ea1ef9 (message 3187). The record used to keep
+saying it was never delivered, so `ops.objection_response` could not say whether the
+worker acted on it. Now, when `Daemon.deliver_messages` delivers an inbound message that
+rides no envelope, `Daemon._stamp_late_objection_delivery` checks it against every
+objection on that order that was never delivered (outstanding or withdrawn). A message
+that QUOTES one — `ops.objection_quoted_in`: a verbatim run of at least half the reason and
+at least `OBJECTION_QUOTE_MIN_CHARS`, ignoring case and spacing — stamps
+`objection_delivered_ts` and links the message in `assumptions.objection_late_msg_id`. The
+withdrawal stays on the row, because both happened, and `ops.objection_line` reads
+"delivered late … in message N".
+
+There is deliberately **no resend verb**: re-delivery is not something the user should have
+to run, and a withdrawn objection that still matters belongs in a follow-up order. Nothing
+is backfilled. Assumption 1353 keeps its honest gap rather than a hand-stamped row.
+
 ## 8. The spec-document edits
 
 **A new file, this one, and not a new section in the 2026-09-23 spec.** Recommendation and

@@ -153,7 +153,7 @@ def test_messages_appear_as_prompt_and_reply():
     """Both directions are moments on the timeline; the words are the conversation's"""
     messages = [
         {"id": 1, "ts": 2.0, "direction": "user_to_agent", "content": "also cover EndNote",
-         "source": "ui"},
+         "source": "ui", "authored_by": "user"},
         {"id": 2, "ts": 3.0, "direction": "agent_to_user", "content": "done, EndNote covered",
          "source": "worker"},
     ]
@@ -245,7 +245,7 @@ def test_the_user_answering_still_reads_as_the_user():
     """Only Neo's own messages are relabelled; everything else inbound is the user"""
     events = [ev("escalation_answered", 3.0, neo_question_id=8)]
     messages = [{"ts": 4.0, "direction": "user_to_agent", "source": "ui",
-                 "content": "[Answer from the user] and gzip it"}]
+                 "authored_by": "user", "content": "[Answer from the user] and gzip it"}]
     entries = build_timeline({}, events, messages)
     assert [e["label"] for e in entries] == ["You messaged the worker"]
 
@@ -406,7 +406,8 @@ def test_the_timeline_points_at_a_message_instead_of_reprinting_it():
 def test_the_timeline_says_who_spoke_without_saying_what():
     """One label per speaker, and none of them carries the body"""
     messages = [
-        {"id": 1, "ts": 1.0, "direction": "user_to_agent", "source": "ui", "content": "a"},
+        {"id": 1, "ts": 1.0, "direction": "user_to_agent", "source": "ui", "content": "a",
+         "authored_by": "user"},
         {"id": 2, "ts": 2.0, "direction": "user_to_agent", "source": "neo", "content": "b"},
         {"id": 3, "ts": 3.0, "direction": "user_to_agent", "source": "pr-conflict",
          "content": "c"},
@@ -843,3 +844,46 @@ def test_turn_harvested_is_signal():
                                    authored={}, checkpoint="")], [])[0]
     assert empty["label"] == "Nothing to harvest"
     assert empty["detail"] == "the worktree was clean and the turn said nothing"
+
+
+def test_a_message_is_the_users_only_when_the_os_can_prove_it():
+    """Unstamped is Jarvis, whatever its source (io-ce566253 objection-reads-as-the-user)"""
+    from jarvis.timeline import _message_event_label, _message_label
+
+    base = {"direction": "user_to_agent", "content": "x"}
+    # The early objection: delivered off the bus, deliberately left unattributed
+    objection = {**base, "source": "bus", "authored_by": ""}
+    assert _message_label(objection) == "jarvis → worker"
+    assert _message_event_label(objection) == "Jarvis messaged the worker"
+    # A source nobody has heard of is no longer asserted to be the user
+    assert _message_label({**base, "source": "brand-new"}) == "jarvis → worker"
+    # A legacy row from before `authored_by` existed reads as Jarvis, honestly
+    assert _message_label({**base, "source": "ui"}) == "jarvis → worker"
+    typed = {**base, "source": "ui", "authored_by": "user"}
+    assert _message_label(typed) == "you → worker"
+    assert _message_event_label(typed) == "You messaged the worker"
+
+
+def test_the_conversation_and_the_gate_request_agree_on_the_users_words(tmp_path):
+    """`you → worker` is exactly the rows `ProjectStore.user_messages` returns"""
+    from jarvis import ops
+    from jarvis.project_store import MESSAGE_AUTHOR_USER, ProjectStore
+    from jarvis.timeline import AUTHOR_USER, _message_label
+
+    assert AUTHOR_USER == MESSAGE_AUTHOR_USER
+    store = ProjectStore(tmp_path)
+    try:
+        wo = store.create_work_order("t", "d")
+        for source, author in [("ui", MESSAGE_AUTHOR_USER), ("cli", MESSAGE_AUTHOR_USER),
+                               ("bus", ""), ("jarvis", ""), ("ui", ""),
+                               ("pr-conflict", ""), ("neo", "")]:
+            store.queue_message(wo["id"], f"{source}/{author}", source=source,
+                                authored_by=author)
+        store.queue_message(wo["id"], "reply", source="worker", direction="agent_to_user")
+        rendered = {m["id"] for m in store.list_messages(wo["id"])
+                    if _message_label(m) == "you → worker"}
+        assert rendered == {m["id"] for m in store.user_messages(wo["id"])}
+        assert len(rendered) == 2
+    finally:
+        store.close()
+    assert ops.user_authorship(relay=False) == ""

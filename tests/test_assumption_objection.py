@@ -730,3 +730,66 @@ def test_the_withdrawal_is_what_lets_the_confirmation_pass_run(started):
     assert invariants.OBJECTION_UNDELIVERABLE_BLOCKER not in blockers
     # THE POSITIVE CONTROL, or an empty list would pass the line above
     assert blockers == ["1 assumption pending your review"]
+
+
+# -- a late delivery is recorded, not lost (io-ce566253 redelivery-has-no-verb)
+
+
+def withdrawn_then_waiting_again(daemon, project, store):
+    """An objection withdrawn because the order settled, on an order that later runs again"""
+    wo, a = running_order(store)
+    daemon.auto_review(project, store)
+    daemon.deliver_envelopes(project, store)
+    store.set_status(wo["id"], "completed")
+    daemon.withdraw_stale_objections(project, store)
+    assert store.get_assumption(a["id"])["objection_withdrawn_ts"] is not None
+    store.set_status(wo["id"], "waiting_input", session_id="s-late")
+    return wo["id"], a
+
+
+def test_a_message_that_re_sends_a_withdrawn_objection_is_its_late_delivery(started):
+    """Stamped delivered and linked to the message, so `objection_response` can answer"""
+    project = spec(started)
+    store = ProjectStore(project.path)
+    wo_id, a = withdrawn_then_waiting_again(started, project, store)
+    # Reworded around the quote, as a person re-sending it would
+    ops.send_message(wo_id, "Re-sending an objection you never saw, on assumption #1.\n\n"
+                            f"Neo would have turned it down: {REASON.upper()}.\n\nAct on it.")
+    [msg] = store.queued_messages(wo_id)
+
+    started.deliver_messages(project, store)
+
+    row = store.get_assumption(a["id"])
+    assert row["objection_delivered_ts"] is not None
+    assert row["objection_late_msg_id"] == msg["id"]
+    # The withdrawal stays on the record: both happened
+    assert row["objection_withdrawn_ts"] is not None
+    store.record_agent_reply(wo_id, "done, made the helper idempotent")
+    act = ops.objection_response(store, row)
+    assert act is not None and act["kind"] == "message"
+    line = ops.objection_line(row)
+    assert f"message {msg['id']}" in line and "late" in line
+
+
+def test_a_message_that_does_not_quote_the_objection_delivers_nothing(started):
+    """Mentioning an objection is not carrying it"""
+    project = spec(started)
+    store = ProjectStore(project.path)
+    wo_id, a = withdrawn_then_waiting_again(started, project, store)
+    ops.send_message(wo_id, "about the objection on assumption #1: ignore it, ship it")
+
+    started.deliver_messages(project, store)
+
+    row = store.get_assumption(a["id"])
+    assert row["objection_delivered_ts"] is None
+    assert row["objection_late_msg_id"] is None
+
+
+def test_the_quote_rule_wants_a_real_quote():
+    """Half the reason verbatim, and never on a reason too short to tell from chance"""
+    a = {"provisional_reason": REASON}
+    assert ops.objection_quoted_in(f"see: {REASON}", a)
+    assert ops.objection_quoted_in(REASON[len(REASON) // 3:], a)
+    assert not ops.objection_quoted_in(REASON[:len(REASON) // 3], a)
+    assert not ops.objection_quoted_in("double-counts", {"provisional_reason": "double-counts"})
+    assert not ops.objection_quoted_in(REASON, {"provisional_reason": ""})

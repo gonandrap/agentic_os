@@ -5129,11 +5129,25 @@ class Daemon:
     def _stamp_objection_delivery(self, store: ProjectStore, msg_id: int) -> None:
         """An objection that actually went out is DELIVERED, stamped here and nowhere"""
         envelope = store.envelope_for_message(int(msg_id))
-        if not envelope or envelope["kind"] != "assumption_objection":
+        if envelope is None:
+            self._stamp_late_objection_delivery(store, msg_id)
+            return
+        if envelope["kind"] != "assumption_objection":
             return
         a = store.assumption_for_envelope(int(envelope["id"]))
         if a is not None and a.get("objection_delivered_ts") is None:
             store.mark_objection_delivered(int(a["id"]))
+
+    def _stamp_late_objection_delivery(self, store: ProjectStore, msg_id: int) -> None:
+        """An ordinary message that QUOTES an undelivered objection delivered it, late (io-ce566253)"""
+        from . import ops
+
+        msg = store.get_message(int(msg_id))
+        if not msg or msg.get("direction") != "user_to_agent":
+            return
+        for a in store.undelivered_objections(str(msg["wo_id"])):
+            if ops.objection_quoted_in(str(msg.get("content") or ""), a):
+                store.mark_objection_delivered(int(a["id"]), late_msg_id=int(msg_id))
 
     def withdraw_stale_objections(self, project: ProjectSpec,
                                   store: ProjectStore) -> None:

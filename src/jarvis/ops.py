@@ -3309,6 +3309,25 @@ def objection_response(store: ProjectStore, a: dict[str, Any], *,
     return min(acts, key=lambda act: act["ts"])
 
 
+#: The shortest verbatim run of an objection's reason that counts as quoting it (io-ce566253)
+OBJECTION_QUOTE_MIN_CHARS = 40
+
+
+def objection_quoted_in(content: str, a: dict[str, Any]) -> bool:
+    """Does `content` carry this objection — half its reason verbatim, case and spacing aside?"""
+    import difflib
+
+    def norm(text: str) -> str:
+        return " ".join(text.lower().split())
+
+    reason, body = norm(str(a.get("provisional_reason") or "")), norm(content)
+    if len(reason) < OBJECTION_QUOTE_MIN_CHARS or not body:
+        return False
+    run = difflib.SequenceMatcher(None, reason, body, autojunk=False).find_longest_match(
+        0, len(reason), 0, len(body)).size
+    return run >= max(OBJECTION_QUOTE_MIN_CHARS, len(reason) // 2)
+
+
 def objection_response_line(a: dict[str, Any]) -> str:
     """WHAT THE WORKER DID about the objection, or that it still owes an answer"""
     delivered = a.get("objection_delivered_ts")
@@ -3394,6 +3413,9 @@ def objection_line(a: dict[str, Any]) -> str:
     transport = str(a.get("objection_transport") or "") or "queue"
     sent = f" at {_stamp(a['objection_sent_ts'])}" if a.get("objection_sent_ts") else ""
     head = f"objection sent to the worker over the {transport}{sent}"
+    if a.get("objection_delivered_ts") and a.get("objection_late_msg_id"):
+        return (f"{head}, delivered late at {_stamp(a['objection_delivered_ts'])} "
+                f"in message {a['objection_late_msg_id']}")
     if a.get("objection_delivered_ts"):
         return f"{head}, delivered at {_stamp(a['objection_delivered_ts'])}"
     if a.get("objection_withdrawn_ts"):

@@ -748,33 +748,41 @@ UNAUTHORED_SOURCES = frozenset({"pr-conflict", "pr-checks", "background-orphan",
 #: `remedies.MESSAGE_SOURCE`, spelled out here for the reason `ALARM_KINDS` is: this module is a leaf... (docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md)
 SUPERVISOR_SOURCE = "supervisor"
 
+#: `project_store.MESSAGE_AUTHOR_USER`, spelled out for the same leaf reason (docs/superpowers/specs/2026-08-23-the-work-order-record.md §5)
+AUTHOR_USER = "user"
+
+#: Named machine speakers, as (conversation tag, timeline sentence)
+_SOURCE_SPEAKERS: dict[str, tuple[str, str]] = {
+    # `source="neo"` is written in exactly one place (`daemon._neo_drain`)
+    "neo": ("neo → worker", "Neo answered the worker"),
+    SUPERVISOR_SOURCE: ("supervisor → worker", "The supervisor messaged the worker"),
+}
+_JARVIS_SPEAKER = ("jarvis → worker", "Jarvis messaged the worker")
+_USER_SPEAKER = ("you → worker", "You messaged the worker")
+
+
+def _speaker(m: dict[str, Any]) -> tuple[str, str]:
+    """The user only when `authored_by` proves it, else a named machine or Jarvis — §5"""
+    named = _SOURCE_SPEAKERS.get(m.get("source") or "")
+    if named:
+        return named
+    if m.get("source") in UNAUTHORED_SOURCES:
+        return _JARVIS_SPEAKER
+    return _USER_SPEAKER if m.get("authored_by") == AUTHOR_USER else _JARVIS_SPEAKER
+
 
 def _message_label(m: dict[str, Any]) -> str:
-    """Who is speaking, from the message's own `source` — §5"""
+    """Who is speaking, as a tag over the words — §5"""
     if m.get("direction") != "user_to_agent":
         return "worker → you"
-    if m.get("source") == "neo":
-        return "neo → worker"
-    if m.get("source") == SUPERVISOR_SOURCE:
-        return "supervisor → worker"
-    if m.get("source") in UNAUTHORED_SOURCES:
-        return "jarvis → worker"
-    return "you → worker"
+    return _speaker(m)[0]
 
 
 def _message_event_label(m: dict[str, Any]) -> str:
-    """What happened, for the timeline — the same `source` rule, worded as an event"""
+    """What happened, for the timeline — the same speaker, worded as an event"""
     if m.get("direction") != "user_to_agent":
         return "Worker replied"
-    if m.get("source") == "neo":
-        # `source="neo"` is written in exactly one place (`daemon._neo_drain`)
-        return "Neo answered the worker"
-    if m.get("source") == SUPERVISOR_SOURCE:
-        # The same arm as `_message_label`'s
-        return "The supervisor messaged the worker"
-    if m.get("source") in UNAUTHORED_SOURCES:
-        return "Jarvis messaged the worker"
-    return "You messaged the worker"
+    return _speaker(m)[1]
 
 
 def _message_ref(m: dict[str, Any]) -> dict[str, Any] | None:
