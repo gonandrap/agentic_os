@@ -9,8 +9,7 @@ from pathlib import Path
 from functools import lru_cache
 from typing import Any, Callable, Mapping
 
-# User decision #11: every borrowed field a reviewer reads is tagged and bounded here,
-# with gates.py's constants and gates.py's idiom. No new limit and no new module.
+# User decision #11: every borrowed field a reviewer reads is tagged and bounded here
 from .provenance import (CONTEXT_LIMIT, DESCRIPTION_LIMIT, EVIDENCE_LIMIT, TITLE_LIMIT,
                          Borrowed, borrowed_context, borrowed_sections)
 
@@ -1080,8 +1079,7 @@ def _request_question(project: str, subject_id: str, remedy: Remedy, argument: s
         tail = ("Approve it to let the OS act, or deny it with a reason. Denying leaves "
                 "the alarm open and with the user, which is the safe answer whenever the "
                 "case for acting is not made.")
-    # Decision #11: the three fields the OS did not write are tagged and bounded, with
-    # `gates.build_request_question`'s idiom and its constants.
+    # Decision #11: the three fields the OS did not write are tagged and bounded
     author = "the user" if by_user else "the supervisor"
     parts = [
         f"SELF-HEAL REQUEST — gate `{GATE_KIND}`",
@@ -1099,7 +1097,7 @@ def _request_question(project: str, subject_id: str, remedy: Remedy, argument: s
         Borrowed(label=wants.lstrip("# ")[0].lower() + wants.lstrip("# ")[1:],
                  whose=author, text=reason, limit=DESCRIPTION_LIMIT,
                  absent="(no reason given)"),))
-    # An empty evidence packet is a FACT about an alarm's proposal and worth saying; on the user's path there is no packet to be empty
+    # An empty evidence packet is a FACT about an alarm's proposal and worth saying
     if evidence.strip():
         parts += borrowed_sections((
             Borrowed(label="the alarm's evidence packet",
@@ -1150,7 +1148,7 @@ def propose(pstore: Any, neo: Any, project: str, subject: dict[str, Any],
                      text=subject.get("title") or "", limit=TITLE_LIMIT),
             Borrowed(label="the alarm's reason", whose="the OS detector that raised it",
                      text=alarm.get("reason") or "", limit=CONTEXT_LIMIT))),
-        # THE EXISTING KIND: `neo_store.Q_KINDS` already carries approval and `Daemon._deliver_gate_verdict` looks its subject up in `approvals`; a new kind would fall through to `queue_message` and message the worker, the one act this feature is fenced against
+        # THE EXISTING KIND: `neo_store.Q_KINDS` already carries approval and `Daemon._deliver_gate_verdict`...
         kind="approval",
     )
     pstore.link_neo_question(approval["id"], question["id"])
@@ -1200,7 +1198,7 @@ def propose_fix(pstore: Any, neo: Any, project: str, subject: dict[str, Any],
         project, carrier,
         _request_question(project, subject_id, remedy, argument, "", reason,
                           by_user=True),
-        # Decision #11, `propose`'s bounds — here the second half is the user's reason.
+        # Decision #11, `propose`'s bounds — here the second half is the user's reason
         context=borrowed_context((
             Borrowed(label="the subject's title", whose="whoever filed it",
                      text=subject.get("title") or "", limit=TITLE_LIMIT),

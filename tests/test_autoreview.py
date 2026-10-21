@@ -2197,7 +2197,7 @@ def test_the_instruction_tells_the_reviewer_to_cite_the_section_not_escalate():
         assert "cite the section" in packet
 
 
-# -- the section the ASSUMPTION cites (user decision 2026-10-14, Neo learning #102) ----
+# -- the section the ASSUMPTION cites (user decision 2026-10-14, Neo learning #102)
 
 
 CITED_HEADER = "# THE SPEC SECTION THIS ASSUMPTION CITES"
@@ -2205,14 +2205,13 @@ CITED_TEXT = "## 4. Retries\n\nThree attempts, then park and say so."
 
 
 def citing(**over) -> dict:
-    """An assumption whose own cited section was resolved and stored at assume time."""
+    """An assumption whose own cited section was resolved and stored at assume time"""
     return assumption(**{"spec_path": "docs/superpowers/specs/2026-10-14-retries.md",
                          "spec_which": "4. Retries", "spec_text": CITED_TEXT, **over})
 
 
 def test_the_section_the_assumption_cites_rides_in_both_packets():
-    """It SUPPLEMENTS the work order's own spec block, never replaces it: one is the
-    section the order was built to, the other the section this sentence argues from."""
+    """It SUPPLEMENTS the work order's own spec block"""
     for build in (
         lambda neo_: autoreview.propose(SpecStore(), neo_, "p", CHILD, citing(),
                                         [assumption()]),
@@ -2225,7 +2224,7 @@ def test_the_section_the_assumption_cites_rides_in_both_packets():
         assert CITED_HEADER in packet
         assert ("docs/superpowers/specs/2026-10-14-retries.md § 4. Retries") in packet
         assert "Three attempts, then park and say so." in packet
-        # The work order's own section is still there, and first.
+        # The work order's own section is still there, and first
         assert SPEC_HEADER in packet and "retries three times and then parks" in packet
         assert packet.index(SPEC_HEADER) < packet.index(CITED_HEADER)
 
@@ -2243,8 +2242,7 @@ TWO_CITED = ("docs/a.md § 3:\n## 3. Errors\n\nThey raise.\n\n"
 
 
 def test_the_reference_line_names_every_section_that_was_cited():
-    """User decision 2026-10-15: the pointer columns are parallel newline lists, so the
-    reference line names ALL N — no reference is invisible on it."""
+    """User decision 2026-10-15: the pointer columns are parallel newline lists"""
     neo_ = FakeNeo(qrow())
 
     autoreview.propose(SpecStore(), neo_, "p", CHILD,
@@ -2285,11 +2283,11 @@ def test_the_truncation_note_repeats_every_cited_reference():
             "docs/a.md § 3; docs/b.md § Data model]") in packet
 
 
-# -- one budget, need-based, half as a FLOOR (Neo ruling Q1884) ------------------------
+# -- one budget, need-based, half as a FLOOR (Neo ruling Q1884)
 
 
 def doc_with(remedy_chars: int) -> str:
-    """The fixture document with `2. The remedy` grown to exactly `remedy_chars`."""
+    """The fixture document with `2"""
     head = "## 2. The remedy\n\n"
     return (f"# Design\n\n## 1. Why\n\nBecause.\n\n{head}"
             f"{'r' * (remedy_chars - len(head))}\n\n## 3. Later\n\nNo.\n")
@@ -2310,8 +2308,7 @@ def one_packet(doc: str, cited: str, chars: int) -> str:
 
 
 def test_neither_block_is_trimmed_when_both_fit():
-    """Q1884: each block takes only what it NEEDS. A flat half starved one block while
-    the other's half sat unused."""
+    """Q1884: each block takes only what it NEEDS"""
     packet = one_packet(doc_with(200), cite_of(3000), 4000)
 
     assert "spec section truncated" not in packet
@@ -2319,8 +2316,7 @@ def test_neither_block_is_trimmed_when_both_fit():
 
 
 def test_half_is_a_floor_the_under_floor_block_donates_its_remainder_from():
-    """200 + 9000 over a 4000 budget: the 200 stays whole and only the oversized block
-    is trimmed, to `chars - 200`."""
+    """200 + 9000 over a 4000 budget: the 200 stays whole and only the oversized block is trimmed"""
     packet = one_packet(doc_with(200), cite_of(9000), 4000)
 
     assert packet.count("spec section truncated") == 1
@@ -2349,10 +2345,7 @@ UNCITED = "THE-UNCITED-SENTENCE, which nobody asked about."
 
 
 def test_no_question_builder_can_emit_a_whole_spec_file():
-    """The regression the decision exists to prevent: a payload carrying a DOCUMENT. The
-    builders pinned by name: `propose`, `propose_confirmation`, `plans.build_plan_context`.
-    `ops.ask_question` is pinned by its sibling, tests/test_question_diet.py
-    ::test_ask_cannot_emit_a_whole_spec_file_even_citing_every_section."""
+    """The regression the decision exists to prevent: a payload carrying a DOCUMENT"""
     big = (f"# Design\n\n## 1. Why\n\n{UNCITED}\n" + "w" * 9000
            + "\n\n## 2. The remedy\n\n" + "r" * 9000 + "\n\n## 3. Later\n\n"
            + "l" * 9000 + "\n")
@@ -2372,8 +2365,7 @@ def test_no_question_builder_can_emit_a_whole_spec_file():
         assert UNCITED not in packet
         assert "w" * 100 not in packet      # §1 is not this child's section
         assert "l" * 100 not in packet      # nor is §3
-        # §2 IS this child's section, and arrives bounded by the budget — all of it bar
-        # the short cited section's need (Q1884).
+        # §2 IS this child's section, and arrives bounded by the budget
         longest = max(len(run) for run in re.findall(r"r+", packet))
         assert 0 < longest < 200
 

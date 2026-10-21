@@ -2225,7 +2225,7 @@ def fix_flag_notice(flag: str) -> str | None:
 
 
 def assume(wo_id: str, content: str) -> dict[str, Any]:
-    """Record an assumption: DB row + ASSUMPTIONS.md append + conditional review flag (#711); cited sections are resolved and snapshotted HERE (kn-924730d7), N of them in one labelled `spec_text` (Q1883) with `spec_path`/`spec_which` PARALLEL NEWLINE LISTS of all N in the same order (user decision 2026-10-15)"""
+    """Record an assumption: DB row + ASSUMPTIONS.md append + conditional review flag (#711)"""
     from . import sections
     from .invariants import neo_reviews_later
 
@@ -2770,7 +2770,7 @@ AUTOMERGE_TERMINAL = "automerge_merged"
 
 def automerge_checks_hold_spans(events: Iterable[Any], since: float, now: float,
                                 open_end: float) -> list[tuple[float, float]]:
-    """Every interval inside `[since, now]` the OS held a merge for GitHub's checks, each ending at the horizon a `gh` outage leaves (docs/superpowers/specs/2026-10-20-a-merge-held-for-running-checks-is-not-stuck.md §4)"""
+    """Every interval inside `[since, now]` the OS held a merge for GitHub's checks (docs/superpowers/specs/2026-10-20-a-merge-held-for-running-checks-is-not-stuck.md §4)"""
     from . import db
     from .automerge import HELD_CHECKS_RUNNING
 
@@ -7446,16 +7446,12 @@ def resume_feature_order(fo_id: str, fix: str = "",
 
 # -- Neo (OS answerer agent)
 
-#: The most ALL referenced sections together may ride to Neo — a TOTAL, never per section (per section, a text citing every heading delivered the whole document); cuts are announced, never silent
+#: The most ALL referenced sections together may ride to Neo
 SECTION_SNAPSHOT_CHARS = 6000
 
 
 def _section_candidates(path: Path, wo: dict[str, Any], ref_path: str) -> list[Path]:
-    """Every place this worker could be naming, in order of authority.
-
-    Split out of `_resolve_section` so a refusal can tell "no such file" from "no such
-    heading" without a second list that could disagree with the resolver's.
-    """
+    """Every place this worker could be naming, in order of authority"""
     candidates = []
     if Path(ref_path).is_absolute():
         candidates.append(Path(ref_path))
@@ -7483,12 +7479,7 @@ def _resolve_section(path: Path, wo: dict[str, Any], ref_path: str,
 
 
 def _water_fill(sizes: list[int], total: int) -> list[int]:
-    """What each block may spend of one `total`: equal share is a FLOOR, a block under its
-    share donates the remainder to the rest, repeated until stable.
-
-    Neo ruling Q1884 ("half is a FLOOR an under-floor block donates its remainder from")
-    generalised from 2 blocks to N. `autoreview._share` is the 2-block case at render time.
-    """
+    """What each block may spend of one `total`: equal share is a FLOOR"""
     allowed = list(sizes)
     open_ = set(range(len(sizes)))
     budget = total
@@ -7506,28 +7497,13 @@ def _water_fill(sizes: list[int], total: int) -> list[int]:
     return allowed
 
 
-#: The in-text form, shown in every refusal below. There is no `--section` flag: the
-#: reference lives inside the sentence (`sections.REF_RE`), and this is its one spelling.
+#: The in-text form, shown in every refusal below
 SECTION_FORM_HINT = 'from section 3 of design doc "docs/superpowers/specs/feature.md": …'
 
 
 def _section_blocks(path: Path, wo: dict[str, Any],
                     text: str) -> list[tuple[str, str, str]]:
-    """Every design-doc section this text cites, resolved: `(path, which, section)`.
-
-    Both `jarvis wo ask` and `jarvis wo assume` resolve through here, so the two verbs
-    cannot drift — user decision 2026-10-14 (Neo learning #102): Neo never receives a
-    full spec, only pointers to specific sections, resolved to those sections' text.
-
-    NO CARDINALITY CAP (Neo ruling Q1883): `validation.assumption_spec_chars` bounds the
-    text, never a count of sections. Two refusals, and each leaves the caller a move: a
-    document named with no section (nothing to resolve), and a reference that does not
-    resolve (the whole file is never substituted, and it is never silently dropped).
-
-    `SECTION_SNAPSHOT_CHARS` is ONE TOTAL over every resolved section, water-filled
-    (`_water_fill`), so citing every heading of a document cannot deliver the document —
-    on the `ask` path and in the stored `assumptions.spec_text` alike.
-    """
+    """Every design-doc section this text cites, resolved: `(path, which, section)` (#102)"""
     from . import sections
 
     refs = sections.find_refs(text)
@@ -7559,7 +7535,7 @@ def _section_blocks(path: Path, wo: dict[str, Any],
 
 
 def ask_question(wo_id: str, question: str, project_name: str | None = None) -> dict[str, Any]:
-    """(Workers) queue a question for Neo instead of stalling on the user: waiting_input with NO user-attention flag, every in-text section reference resolved HERE and snapshotted, their TOTAL bounded by `SECTION_SNAPSHOT_CHARS`, an unresolvable reference or a document named with no section both REFUSALS (`_section_blocks`)"""
+    """(Workers) queue a question for Neo instead of stalling on the user: waiting_input with NO..."""
     from .neo_store import NeoStore
 
     if len(question) > QUESTION_MAX_CHARS:
@@ -12099,7 +12075,7 @@ def _pr_poll_why(store: ProjectStore, wo: dict[str, Any],
     return PR_POLL_WHY
 
 
-#: ONE expression of one rule, registered under EVERY open status: `gates.sweep_unargued` has no status filter and filing an `awaiting_case` request does not park the row, so a held request outlives it (wo-715db5af, Neo 1987)
+#: ONE expression of one rule, registered under EVERY open status: `gates.sweep_unargued` has no...
 REVIEWS_GATE = _Pass(
     "Daemon._neo_drain",
     "a privileged-action request is open and the user does not hold it. "

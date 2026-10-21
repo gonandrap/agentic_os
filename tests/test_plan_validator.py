@@ -316,7 +316,7 @@ def test_the_rendered_plan_carries_what_a_reviewer_has_to_judge():
 
 
 def test_the_context_is_the_heading_outline_and_forbids_reading_disk():
-    """Neo ruling Q1880: the OUTLINE, never the document — a structural fingerprint, with its provenance and the refusal to go hunting (§5)"""
+    """Neo ruling Q1880: the OUTLINE, never the document"""
     plan = {"design_doc": "docs/superpowers/specs/x.md",
             "design_doc_content": "# X\n\n## 1. Shape\n\nOne module.\n\n### Detail\n\nNo.\n"}
 
@@ -345,8 +345,7 @@ def test_the_outline_carries_every_heading_in_order_and_no_body_prose():
 
 
 def test_an_unresolvable_document_is_refused_rather_than_substituted():
-    """The ask/assume path's refusal shape: nothing is substituted for a document that
-    does not resolve."""
+    """The ask/assume path's refusal shape: nothing is substituted for a document that does not resolve"""
     with pytest.raises(PlanError, match="docs/superpowers/specs/x.md"):
         build_plan_context({"design_doc": "docs/superpowers/specs/x.md",
                             "design_doc_content": ""}, "main @ abc1234")
