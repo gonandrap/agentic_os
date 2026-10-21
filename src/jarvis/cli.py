@@ -783,6 +783,10 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--feedback", default="",
                    help="your reasoning — teaches Neo, and on --reject is delivered "
                         "to the worker as guidance")
+    r.add_argument("--false-alarm", action="store_true",
+                   help="the high-stakes net was WRONG to hold these: record a defect "
+                        "in the net that fired (also read from 'false alarm' in "
+                        "--feedback)")
 
     x = wo.add_parser("cancel", help="cancel a work order")
     x.add_argument("wo_id")
@@ -3283,7 +3287,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
                           evidence=args.evidence, abandon=args.abandon), args.json)
     elif args.wo_cmd == "review":
         _print(ops.review_work_order(args.wo_id, accept=not args.reject,
-                                     feedback=args.feedback), args.json)
+                                     feedback=args.feedback,
+                                     false_alarm=args.false_alarm), args.json)
     elif args.wo_cmd == "cancel":
         _print(ops.cancel(args.wo_id), args.json)
     elif args.wo_cmd == "done":
@@ -4494,8 +4499,34 @@ def _ms(value: int | None) -> str:
 def _objection_line(counts: dict[str, Any]) -> str:
     """What the OS's objections did, in one clause — `ops.neo_stats_report`'s figures"""
     return (f"{counts['sent']} sent · {counts['delivered']} delivered · "
+            f"{counts.get('acted_on', 0)} acted on · "
             f"{counts['withdrawn']} withdrawn ({counts['stopped']} the order stopped, "
-            f"{counts['handed_back']} handed to you, {counts['other']} other)")
+            f"{counts['handed_back']} handed to you, {counts['other']} other) · "
+            f"withdrawal rate {_pct(counts.get('withdrawal_rate'))}")
+
+
+def _print_assumption_rows(a: dict[str, Any]) -> None:
+    """THE HEADLINE: what happened to each assumption ROW (io-51469add)"""
+    rates = a["rates"]
+    print(f"ASSUMPTIONS — {a['rows']} row{'' if a['rows'] == 1 else 's'}, "
+          f"{a['settled']} settled; the rate your review list shows")
+    print(f"  decided by Neo      {a['neo_decided']:>4}  {_pct(rates['neo_decided'])}")
+    print(f"  escalated to you    {a['neo_escalated']:>4}  "
+          f"{_pct(rates['neo_escalated'])}  (Neo saw it and it came to you)")
+    print(f"  never reached Neo   {a['never_reached_neo']:>4}  "
+          f"{_pct(rates['never_reached_neo'])}  (held before any model call)")
+    for code, n in sorted(a["never_reached_by_hold"].items(), key=lambda kv: -kv[1]):
+        print(f"    {code:<22} {n:>4}")
+    u = a["unsettled"]
+    age = ("" if u["median_age_days"] is None else
+           f", median age {u['median_age_days']}d, oldest {u['max_age_days']}d")
+    print(f"  still unsettled     {u['count']:>4}  ({u['reached_neo']} reached Neo, "
+          f"{u['never_reached_neo']} never did{age}) — out of the rates")
+    d, net = a["dropped_rulings"], a["stakes_net"]
+    print(f"  dropped rulings     {d['total']:>4}  ({d['re_asked']} re-asked; the rest "
+          f"came to you)")
+    print(f"  high-stakes net     {net['held']:>4} held · {net['false_alarms']} you "
+          f"called a false alarm · {_pct(net['false_alarm_rate'])}")
 
 
 def _print_neo_stats(res: dict[str, Any], as_json: bool) -> None:
@@ -4505,10 +4536,14 @@ def _print_neo_stats(res: dict[str, Any], as_json: bool) -> None:
         return
     q = res["questions"]
     window = f", last {res['days']}d" if res["days"] else ", all time"
-    print(f"{res['scope']}{window} — {q['asked']} question"
+    print(f"{res['scope']}{window} — {res['assumptions']['rows']} assumption row"
+          f"{'' if res['assumptions']['rows'] == 1 else 's'}, {q['asked']} question"
           f"{'' if q['asked'] == 1 else 's'} asked\n")
+    _print_assumption_rows(res["assumptions"])
+    print(f"  objections          {_objection_line(res['objections'])}\n")
 
-    print("OUTCOMES")
+    print("QUESTIONS — plumbing telemetry")
+    print(f"  note: {res['questions_note']}")
     print(f"  answered by Neo   {q['answered']}")
     print(f"  escalated         {q['escalated']}")
     print(f"  unreachable       {q['failed']}  (Neo was never reached — NOT judged)")
@@ -4519,8 +4554,6 @@ def _print_neo_stats(res: dict[str, Any], as_json: bool) -> None:
     # Its own figure, never blended into the escalation rate: a crash is not a decision
     print(f"  unreachable rate  {_pct(q['unreachable_rate'])}  "
           f"(same denominator — NOT escalations)")
-    # ONE LINE, beside the rate — §5 of docs/superpowers/specs/2026-10-20-an-objection-is-...
-    print(f"  objections        {_objection_line(res['objections'])}")
 
     if res["by_day"]:
         print("\nTHE TREND — one line per day, newest last")

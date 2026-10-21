@@ -248,6 +248,14 @@ def high_stakes_marker(text: str, *, tightened: bool = False) -> str:
     return ""
 
 
+def assumption_class(text: str, *, tightened: bool = False) -> str:
+    """The CLASS a user's ruling generalises to: the high-stakes word it carries, or routine"""
+    marker = high_stakes_marker(text, tightened=tightened)
+    if marker:
+        return f"an assumption that mentions {marker.lower()!r}"
+    return "a routine assumption (it carries no high-stakes word)"
+
+
 def tightened_verdict(text: str) -> Stakes:
     """The tightened net's answer in the CLASSIFIER's verdict type"""
     marker = high_stakes_marker(text, tightened=True)

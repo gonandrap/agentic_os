@@ -52,6 +52,10 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 log = logging.getLogger("jarvisd")
 
+#: The objection withdrawal rate's window, and the sample below which it is noise
+OBJECTION_ALARM_WINDOW_DAYS = 7
+OBJECTION_ALARM_MIN_SENT = 3
+
 #: Why an objection was taken back
 
 
@@ -865,6 +869,8 @@ class Daemon:
                     self.auto_review(project, store)
                     # Beside it, and AFTER it: the same tick that files an objection is the one that must take it back if...
                     self.withdraw_stale_objections(project, store)
+                    # After the withdrawals it counts, so a withdrawal this tick is in the rate
+                    self.check_objection_withdrawals(project, store)
                     # Immediately before the check that reads it
                     if sweep_landings:
                         self.refresh_landings(project, store)
@@ -5152,6 +5158,29 @@ class Daemon:
                 log.exception("[%s] objections for %s could not be withdrawn",
                               project.name, wo_id)
 
+    def check_objection_withdrawals(self, project: ProjectSpec,
+                                    store: ProjectStore) -> None:
+        """Withdrawals past `objection_withdrawal_alarm_rate` are the feature failing: inbox, once a window"""
+        rate = float(getattr(project.validation, "objection_withdrawal_alarm_rate", 1.0))
+        if rate >= 1.0:
+            return
+        since = time.time() - OBJECTION_ALARM_WINDOW_DAYS * 86400
+        counts = store.objection_counts(since=since)
+        sent, withdrawn = int(counts["sent"]), int(counts["withdrawn"])
+        if sent < OBJECTION_ALARM_MIN_SENT or withdrawn / sent <= rate:
+            return
+        title = f"Most of the OS's early objections on {project.name} never reached a worker"
+        if self.central.inbox_titled_since(project.name, title, since):
+            return
+        self.central.add_inbox(
+            project=project.name, level="warning", title=title,
+            body=f"{withdrawn} of {sent} objections sent in the last "
+                 f"{OBJECTION_ALARM_WINDOW_DAYS} days were withdrawn undelivered — "
+                 f"above this project's validation.objection_withdrawal_alarm_rate "
+                 f"({rate:.0%}). Neo's early reading is not reaching the work.\n"
+                 f"Sent / delivered / acted on / withdrawn: jarvis neo stats --project "
+                 f"{project.name} --days {OBJECTION_ALARM_WINDOW_DAYS}")
+
     def _withdraw_objection(self, store: ProjectStore, wo_id: str, *,
                             assumption: dict[str, Any] | None = None,
                             envelope: dict[str, Any] | None = None,
@@ -5454,8 +5483,9 @@ class Daemon:
             # CONDITION 7 IS RE-RUN THE WAY THE ASK RAN IT
             stakes=self._settle_stakes(project, wo, numbered))
         if not still.armed:
-            # A CONFIRMATION DROPPED FOR A TRANSIENT REASON IS ASKED AGAIN (#833)
-            retry = confirming and still.code in autoreview.TRANSIENT_DROPS
+            # A RULING DROPPED FOR A TRANSIENT REASON IS ASKED AGAIN, on either pass (#833)
+            retry = (still.code in autoreview.TRANSIENT_DROPS
+                     and str(wo.get("status") or "") not in TERMINAL_STATUSES)
             if not retry:
                 # Escalated rather than left `answered`: the assumption is the user's again
                 neo_store.mark(q["id"], "escalated", reason=still.reason,
@@ -5466,15 +5496,18 @@ class Daemon:
                 "assumption_id": assumption["id"], "n": numbered.get("n"),
                 "reason": still.reason, "stakes": ruling.stakes,
                 "model": ruling.model, "neo_question_id": q["id"],
-                "overridden": False, "dropped": still.code})
+                "overridden": False, "dropped": still.code, "re_asked": retry})
             if retry:
                 # §4.3, IN THIS ORDER and after the record of the drop is complete
+                fresh = ("confirmation will be asked against the delivered result"
+                         if confirming else "ruling will be asked once it waits on a review")
                 neo_store.supersede(
-                    q["id"],
-                    f"SUPERSEDED — the OS dropped its own ruling: {still.reason}. A "
-                    f"fresh confirmation will be asked against the delivered result.",
-                    still.reason)
-                pstore.clear_assumption_confirmation(assumption["id"])
+                    q["id"], f"SUPERSEDED — the OS dropped its own ruling: "
+                             f"{still.reason}. A fresh {fresh}.", still.reason)
+                if confirming:
+                    pstore.clear_assumption_confirmation(assumption["id"])
+                else:
+                    pstore.clear_assumption_question(assumption["id"])
             log.info("auto-review dropped its ruling on assumption #%s of %s: %s",
                      numbered.get("n"), wo["id"], still.reason)
             return

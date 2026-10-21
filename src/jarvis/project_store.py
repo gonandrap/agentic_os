@@ -3222,6 +3222,11 @@ class ProjectStore:
         self.conn.execute("UPDATE assumptions SET neo_question_id=? WHERE id=?",
                           (question_id, assumption_id))
 
+    def clear_assumption_question(self, assumption_id: int) -> None:
+        """Forget an ask the OS itself threw the ruling away on, so the next pass re-asks"""
+        self.conn.execute("UPDATE assumptions SET neo_question_id=NULL WHERE id=?",
+                          (assumption_id,))
+
     def assumption_for_question(self, question_id: int) -> dict[str, Any] | None:
         """The assumption this Neo question is ruling on, if any"""
         row = self.conn.execute(
@@ -3322,6 +3327,52 @@ class ProjectStore:
             by_reason[reason if reason in by_reason else "other"] += 1
         counts["by_reason"] = by_reason
         return counts
+
+    def assumption_review_facts(self, since: float | None = None) -> dict[str, Any]:
+        """Every assumption row since `since`, and what auto-review did to each (io-51469add)"""
+        from . import db as db_mod
+
+        bound = "" if since is None else " WHERE ts >= ?"
+        args: tuple[Any, ...] = () if since is None else (since,)
+        rows = db_mod.rows_to_dicts(self.conn.execute(
+            "SELECT id, wo_id, ts, status, decided_by, neo_question_id,"
+            f" confirm_question_id FROM assumptions{bound} ORDER BY ts, id",
+            args).fetchall())
+        asked: set[int] = set()
+        last_hold: dict[int, str] = {}
+        high_stakes: set[int] = set()
+        false_alarms: set[int] = set()
+        dropped = {"total": 0, "re_asked": 0}
+        for event in self.conn.execute(
+                "SELECT kind, payload FROM wo_events WHERE kind IN ('autoreview_asked',"
+                " 'autoreview_held', 'autoreview_escalated',"
+                " 'autoreview_stakes_false_alarm') ORDER BY ts").fetchall():
+            payload = db_mod.from_json(event["payload"], {})
+            aid = int(payload.get("assumption_id") or 0)
+            kind = event["kind"]
+            if kind == "autoreview_asked":
+                asked.add(aid)
+            elif kind == "autoreview_held":
+                code = str(payload.get("code") or "")
+                last_hold[aid] = code
+                if code == "high_stakes":
+                    high_stakes.add(aid)
+            elif kind == "autoreview_stakes_false_alarm":
+                false_alarms.add(aid)
+            elif payload.get("dropped"):
+                dropped["total"] += 1
+                dropped["re_asked"] += 1 if payload.get("re_asked") else 0
+        return {"rows": rows, "asked": asked, "last_hold": last_hold,
+                "high_stakes": high_stakes, "false_alarms": false_alarms,
+                "dropped": dropped}
+
+    def delivered_objections(self, since: float | None = None) -> list[dict[str, Any]]:
+        """Assumptions whose objection reached the worker, objection sent since `since`"""
+        bound = "" if since is None else " AND objection_sent_ts >= ?"
+        args: tuple[Any, ...] = () if since is None else (since,)
+        return db.rows_to_dicts(self.conn.execute(
+            "SELECT * FROM assumptions WHERE objection_envelope_id IS NOT NULL"
+            f" AND objection_delivered_ts IS NOT NULL{bound}", args).fetchall())
 
     def outstanding_objections(self, wo_id: str) -> list[dict[str, Any]]:
         """Objections that are neither delivered nor withdrawn — ONE query, two readers"""

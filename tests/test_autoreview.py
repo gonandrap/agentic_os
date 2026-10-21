@@ -2403,3 +2403,77 @@ def test_answered_questions_is_newest_first_and_keeps_every_kind(started):
         assert neo_store.answered_questions("wo-rec", limit=1) == got[:1]
     finally:
         neo_store.close()
+
+
+# -- a transient drop on the ASK path is re-asked (io-51469add, finding `dropped-rulings`)
+
+
+def test_an_ask_dropped_because_the_status_flipped_is_asked_again(started):
+    """The confirmation path's #833 retry, one path along: wo-764454c5, wo-8fd40f1a"""
+    store, wo = park(started, auto_review=True,
+                     assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
+    ask(started, store)
+    (first,) = questions()
+    store.set_status(wo["id"], "running", trigger="test")
+
+    drain(started)
+
+    row = store.all_assumptions(wo["id"])[0]
+    assert row["status"] == "pending" and row["neo_question_id"] is None
+    spent = next(q for q in questions() if q["id"] == first["id"])
+    # Never `escalated`: after the link is cleared nobody could answer it
+    assert spent["status"] == "answered"
+    (escalated,) = events(store, wo["id"], "autoreview_escalated")
+    assert escalated["dropped"] == autoreview.HELD_STATUS
+    assert escalated["re_asked"] is True
+    line = ops.autoreview_state(store, store.get_work_order(wo["id"]))["line"]
+    assert "goes back to Neo" in line and "left with you" not in line
+
+    store.set_status(wo["id"], "needs_review", trigger="test")
+    ask(started, store)
+
+    (second,) = [q for q in questions() if q["id"] != first["id"]]
+    assert store.all_assumptions(wo["id"])[0]["neo_question_id"] == second["id"]
+
+    drain(started)
+
+    row = store.all_assumptions(wo["id"])[0]
+    assert row["status"] == "accepted" and row["decided_by"] == "neo"
+
+
+def test_a_high_stakes_drop_on_the_ask_path_keeps_its_link_and_is_the_users(started):
+    """Non-transient codes are NEVER re-asked: the row really is the user's"""
+    store, wo = park(started, auto_review=True,
+                     assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
+    ask(started, store)
+    (first,) = questions()
+    row = store.all_assumptions(wo["id"])[0]
+    store.conn.execute("UPDATE assumptions SET content=? WHERE id=?", (SECRET, row["id"]))
+
+    drain(started)
+
+    row = store.all_assumptions(wo["id"])[0]
+    assert row["neo_question_id"] == first["id"]
+    assert questions()[0]["status"] == "escalated"
+    (escalated,) = events(store, wo["id"], "autoreview_escalated")
+    assert escalated["dropped"] == autoreview.HELD_HIGH_STAKES
+    assert escalated["re_asked"] is False
+
+    ask(started, store)
+    assert [q["id"] for q in questions()] == [first["id"]]
+
+
+def test_an_ask_dropped_on_a_cancelled_order_is_not_re_armed(started):
+    """`status` is transient only while the order can come back to `needs_review`"""
+    store, wo = park(started, auto_review=True,
+                     assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
+    ask(started, store)
+    (first,) = questions()
+    ops.cancel(wo["id"])
+
+    drain(started)
+
+    assert store.all_assumptions(wo["id"])[0]["neo_question_id"] == first["id"]
+    assert questions()[0]["status"] == "escalated"
+    (escalated,) = events(store, wo["id"], "autoreview_escalated")
+    assert escalated["re_asked"] is False
