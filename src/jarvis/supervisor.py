@@ -440,6 +440,60 @@ def _validation_lines(pstore: Any, fo_id: str, cfg: Any) -> list[str]:
     return lines
 
 
+#: What a work-order packet still has to fit after `_history_lines`, for its equal share
+WO_SECTIONS_AFTER_HISTORY = ("# The session, turn by turn",
+                             "# What was last said about this order")
+
+
+def _for(seconds: float) -> str:
+    hours = seconds / SECONDS_PER_HOUR
+    return f"{hours:.1f} hour(s)" if hours >= 1 else f"{seconds / SECONDS_PER_MINUTE:.0f} minute(s)"
+
+
+def _history_lines(pstore: Any, kind: str, order_id: str, budget: int) -> list[str]:
+    """The spans `ops.state_durations` reads, so the packet cannot be blind to a transition the OS recorded"""
+    from . import db, ops
+
+    now = db.now()
+    reading = (ops.state_durations(pstore, wo_id=order_id, now=now) if kind == "wo"
+               else ops.state_durations(pstore, fo_id=order_id, now=now))
+    lines = ["# Where it has been"]
+    if reading.current_status_since is not None:
+        lines.append(f"now: {reading.current_status} for "
+                     f"{_for(now - reading.current_status_since)}")
+    elif reading.current_status:
+        lines.append(f"now: {reading.current_status} (the recorded spans stop short of it)")
+    else:
+        lines.append("now: settled")
+    # Newest first within an equal share of the budget, then printed oldest first
+    kept: list[str] = []
+    spent = 0
+    for span in reversed(reading.spans):
+        line = (f"- {span.status} for {_for(span.seconds(now))}"
+                + (f" (entered by {span.trigger})" if span.trigger else "")
+                + (" [approximate]" if span.approximate else ""))
+        if kept and spent + len(line) > budget:
+            kept.append(f"…and {len(reading.spans) - len(kept)} earlier status(es)")
+            break
+        spent += len(line) + len("\n")
+        kept.append(line)
+    lines.extend(reversed(kept))
+    if kind == "wo":
+        # The verdict the stillness may be waiting on, which no status name says
+        rounds = pstore.validation_rounds(wo_id=order_id)
+        settled = [r for r in rounds if r["outcome"] != "pending"]
+        if rounds and rounds[-1]["outcome"] == "pending":
+            lines.append(f"validation round {rounds[-1]['round']} is open, opened "
+                         f"{_for(now - float(rounds[-1]['ts'] or now))} ago")
+        if settled:
+            last = settled[-1]
+            lines.append(f"latest validation round {last['round']}: {last['outcome']}, "
+                         f"opened {_for(now - float(last['ts'] or now))} ago")
+        elif not rounds:
+            lines.append("(it has never been through validation)")
+    return lines
+
+
 def _said_lines(pstore: Any, wo_id: str | None, cfg: Any) -> list[str]:
     """The last `cfg.quoted_turns` of `timeline.build_conversation`"""
     from . import timeline
@@ -506,11 +560,11 @@ def build_evidence(pstore: Any, subject: dict[str, Any],
                 _validation_lines(pstore, fo_id, cfg),
                 _said_lines(pstore, carrier["id"] if carrier else None, cfg)]
         # An equal share of the budget, so the tree's bound moves with the setting and this module goes on...
+        share = cfg.evidence_budget_chars // (len(sections) + len(rest) + 1)
         tree = ["# The child tree",
-                *_child_lines(pstore.feature_children(fo_id, kinds=WORKER_CHILDREN),
-                              cfg.evidence_budget_chars
-                              // (len(sections) + len(rest) + 1))]
-        sections += [rest[0], tree, *rest[1:]]
+                *_child_lines(pstore.feature_children(fo_id, kinds=WORKER_CHILDREN), share)]
+        history = _history_lines(pstore, "fo", fo_id, share)
+        sections += [rest[0], history, tree, *rest[1:]]
     else:
         from . import health
 
@@ -528,6 +582,10 @@ def build_evidence(pstore: Any, subject: dict[str, Any],
             f"title: {row.get('title')}",
             f"brief: {_clip(str(row.get('description') or ''), cfg.description_chars)}",
         ])
+        # Ahead of the transcript: a capped packet drops the session read before the status history
+        sections.append(_history_lines(
+            pstore, "wo", row["id"], cfg.evidence_budget_chars
+            // (len(sections) + 1 + len(WO_SECTIONS_AFTER_HISTORY))))
         sections.append(["# The session, turn by turn",
                          *_session_lines(row, inspect_cfg, pstore)])
         sections.append(_said_lines(pstore, row["id"], cfg))

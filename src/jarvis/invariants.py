@@ -832,12 +832,67 @@ def check_undeclared_delivery(store: ProjectStore) -> Iterator[Violation]:
         )
 
 
+#: A transition the spans recorded and the timeline did not (io-df4fa1e3)
+RECORD_BEHIND = "INV-RECORD-BEHIND"
+
+#: How far apart a span and its status event may be stamped and still be one transition
+RECORD_PAIR_SECONDS = 1.0
+
+#: The `validation_failed` cause INV-VALIDATION-STRANDED writes: not a hold, so nothing waits on it
+STRANDED_CAUSE = "stranded"
+
+
+def _span_on_record(store: ProjectStore, wo_id: str, span: dict[str, Any]) -> bool:
+    """Whether the timeline carries this span's transition"""
+    if not span["from_status"]:
+        # The creation span pairs with `created`, which `create_work_order` stamps separately
+        return bool(store.last_event_of_kind(wo_id, "created"))
+    ts = float(span["ts"])
+    return any(
+        (db.from_json(e["payload"], {}) or {}).get("status") == span["to_status"]
+        and abs(float(e["ts"]) - ts) <= RECORD_PAIR_SECONDS
+        for e in store.events_of_kind(wo_id, "status"))
+
+
+def _record_behind(store: ProjectStore, wo_id: str,
+                   spans: list[dict[str, Any]]) -> Iterator[Violation]:
+    """INV-RECORD-BEHIND — the newest span and the newest settled round, each with its event"""
+    # The NEWEST only: 268 historic claim spans predate the fix and are reported once, not every tick
+    tail = next((s for s in reversed(spans) if not s["approximate"]), None)
+    if tail is not None and not _span_on_record(store, wo_id, tail):
+        yield Violation(
+            invariant=RECORD_BEHIND, wo_id=wo_id,
+            detail=(f"the spans record a move to {tail['to_status']!r} (trigger "
+                    f"{tail['trigger'] or 'unnamed'}) and the timeline has no status "
+                    f"event for it, so `wo show` and Neo cannot see it"),
+            repair="none: the writer that skipped the event is the defect, and an "
+                   "event written now would invent its moment",
+            context={"span_id": tail["id"], "to_status": tail["to_status"],
+                     "ts": tail["ts"]})
+    settled = [r for r in store.validation_rounds(wo_id=wo_id) if r["outcome"] != "pending"]
+    if not settled:
+        return
+    last = settled[-1]
+    kind = f"validation_{last['outcome']}"
+    if not any((db.from_json(e["payload"], {}) or {}).get("round") == last["round"]
+               for e in store.events_of_kind(wo_id, kind)):
+        yield Violation(
+            invariant=RECORD_BEHIND, wo_id=wo_id,
+            detail=(f"validation round {last['round']} settled {last['outcome']!r} and "
+                    f"the timeline has no `{kind}` event for it"),
+            repair="none: the writer that skipped the event is the defect",
+            context={"round_id": last["id"], "round": last["round"],
+                     "outcome": last["outcome"]})
+
+
 def check_spans_reach_the_status(store: ProjectStore) -> Iterator[Violation]:
-    """INV-SPAN-BEHIND — a status write with no span is repaired where it is found (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md)"""
+    """INV-SPAN-BEHIND repairs a status with no span, INV-RECORD-BEHIND reports a span with no event (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md §2d3)"""
     readonly = getattr(store, "readonly", False)
     # Hidden too: hiding takes an order out of the listings
     for wo in store.list_work_orders(include_hidden=True):
         spans = store.state_spans(wo["id"])
+        # Before the repair below, whose approximate span this pairing skips anyway
+        yield from _record_behind(store, wo["id"], spans)
         tail = str(spans[-1]["to_status"]) if spans else ""
         status = str(wo["status"] or "")
         # No spans at all is `_backfill_wo_spans`' case, not this one
@@ -1939,10 +1994,14 @@ def check_validation_progresses(store: ProjectStore) -> Iterator[Violation]:
             if float(latest["ts"] or 0) > cutoff:
                 continue  # late, not abandoned
             age = int(now - float(latest["ts"] or 0))
-            store.close_validation_round(
-                int(latest["id"]), "failed",
-                f"the review was interrupted — round {latest['round']} was left open "
-                f"with nothing running it for {age}s")
+            reason = (f"the review was interrupted — round {latest['round']} was left "
+                      f"open with nothing running it for {age}s")
+            store.close_validation_round(int(latest["id"]), "failed", reason)
+            # The outcome on the timeline too, where `wo show` and Neo read it (INV-RECORD-BEHIND)
+            if id_col == "wo_id":
+                store.add_event(unit_id, "validation_failed",
+                                {"round": latest["round"], "round_id": latest["id"],
+                                 "cause": STRANDED_CAUSE, "reason": reason})
             yield Violation(
                 invariant="INV-VALIDATION-STRANDED",
                 wo_id=unit_id if id_col == "wo_id" else None,

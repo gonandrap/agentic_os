@@ -640,6 +640,9 @@ def test_a_conflict_give_up_is_read_and_not_merely_derived(started, project, fak
     store = ProjectStore(project)
     rnd = store.open_validation_round(wo_id=reviewing["id"], fingerprint="abc")
     store.close_validation_round(rnd["id"], "escalated", reason="three rounds, no deal")
+    # As `ops.escalate_validation_round` writes it, or INV-RECORD-BEHIND rightly objects
+    store.add_event(reviewing["id"], "validation_escalated",
+                    {"round": rnd["round"], "round_id": rnd["id"]})
     for _ in range(PR_REPAIR_MAX_ATTEMPTS + 1):
         poll(started, store)
         delivered(store, reviewing["id"])
