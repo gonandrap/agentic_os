@@ -1626,6 +1626,7 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
                           f"`jarvis wo unblock {wo_id}` cuts the hold"}
     hold = store.plan_hold(wo)
     if hold:
+        # Collapse onto one constant: https://github.com/gonandrap/agentic_os/issues/1099
         return {"what": "plan_assumptions", "stalled": False,
                 "detail": f"its feature's plan is waiting on you — {hold['n']} "
                           f"assumption(s) on {hold['planner_id']}; "

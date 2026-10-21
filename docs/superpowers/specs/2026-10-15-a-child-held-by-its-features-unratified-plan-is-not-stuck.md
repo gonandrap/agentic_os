@@ -123,6 +123,13 @@ named on the record rather than the family widened). NOT `pending` generally. Th
 `pending` threshold is correct and stays. `excluded_cause` has never been tunable — no new
 setting, no config key.
 
+Also out of scope and tracked, not forgotten: `ops.waiting_on` returns the bare string
+`'plan_assumptions'` and the same token is a member of `ops.USER_IS_NEEDED_WAITS` and
+`ops.FIX_USERS_MOVE`. `stuck.PLAN_ASSUMPTION_CAUSE` is a FOURTH reading of the same plan
+hold. Collapsing the three onto one constant touches `resume-auto`'s diagnosis vocabulary
+and is its own unit: https://github.com/gonandrap/agentic_os/issues/1099. A
+`# Collapse onto one constant` comment at the `waiting_on` return points there too.
+
 Root-cause note: this fixes the cause, not a symptom. The symptom patch would be to stop
 the sweep from investigating held children; the cause is that one of the OS's own
 withholding rules was never taught to the predicate that judges waiting.
