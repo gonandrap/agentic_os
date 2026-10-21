@@ -148,7 +148,7 @@ def test_every_predicate_is_an_imported_symbol():
     by_predicate: dict[str, list[ast.expr]] = {}
     for predicate, node in _pass_literals():
         by_predicate.setdefault(predicate, []).append(node)
-    # SETS, not counts: one `_Pass` literal may be registered under several statuses (the shared gate-sweep constant is, under all nine — wo-715db5af); an ORPHAN literal still fails
+    # SETS, not counts: one `_Pass` literal may be registered under several statuses (the shared...
     assert set(by_predicate) == {p.predicate for _, p in entries}, (
         "every `_Pass` literal in ops.py must be reachable from SCHEDULED_ACTORS")
     for status, p in entries:
@@ -173,7 +173,7 @@ def test_every_predicate_is_an_imported_symbol():
 
 
 def test_no_fallthrough(jarvis_home, project):
-    """STILL A PIN after wo-715db5af: the XOR holds over a status's OWN passes, not the shared gate-sweep pass registered under every open status"""
+    """STILL A PIN after wo-715db5af: the XOR holds over a status's OWN passes"""
     for status, entry in ops.SCHEDULED_ACTORS.items():
         own = tuple(p for p in entry.passes if p is not ops.REVIEWS_GATE)
         assert bool(entry.none_because) is not bool(own), (
@@ -384,15 +384,11 @@ def test_a_none_because_status_blocks_on_the_user(jarvis_home, project, status):
             invariants.true_blockers(store, wo) != []) == (None, True)
 
 
-# -- a HELD gate request outlives the status it was filed under ---------------------
-# wo-715db5af / Neo 1987: `gates.sweep_unargued` has no status filter (it iterates
-# `list_approvals(statuses=(AWAITING_CASE,))` project-wide) and `gates.file_request`
-# deliberately does not park the row that files an `awaiting_case` request. So the gate
-# pass belongs under EVERY open status, not `waiting_input` alone.
+# -- a HELD gate request outlives the status it was filed under
 
 @pytest.fixture()
 def gate_sweeper(fake_claude, catalog_file, project):
-    """`sweep(store)` — `Daemon.abandon_unargued_gates` over a gates-enabled project."""
+    """`sweep(store)` — `Daemon.abandon_unargued_gates` over a gates-enabled project"""
     data = json.loads(catalog_file.read_text(encoding="utf-8"))
     data["projects"][0]["gates"] = ["pr_merge"]
     catalog_file.write_text(json.dumps(data), encoding="utf-8")
@@ -411,17 +407,14 @@ def _hold_a_request(store: ProjectStore, wo_id: str) -> dict:
 
 
 def _expire_the_case(store: ProjectStore, approval_id: int) -> None:
-    """Wind the filing back past `case_ttl_seconds` rather than sleeping through it."""
+    """Wind the filing back past `case_ttl_seconds` rather than sleeping through it"""
     store.conn.execute("UPDATE approvals SET ts = ts - ? WHERE id=?",
                        (gates.DEFAULT_CASE_TTL_SECONDS + 60, approval_id))
 
 
 def test_a_held_request_on_a_running_ungoverned_row_names_the_gate_sweep(
         jarvis_home, project, gate_sweeper):
-    """The live shape on main, PAIRED WITH ITS PASS. `running` + an ungoverned origin:
-    `settles_turn` and `retries_turn` both decline on origin and no message is queued,
-    so before this the row derived None — while the sweep was going to close its
-    request regardless."""
+    """The live shape on main, PAIRED WITH ITS PASS"""
     store = ProjectStore(project)
     assert ("running", UNGOVERNED_ORIGINS[0]) in EXPECT_NEITHER, \
         "the premise: with no request this same row correctly derives neither"
@@ -431,7 +424,7 @@ def test_a_held_request_on_a_running_ungoverned_row_names_the_gate_sweep(
     actor = ops.scheduled_actor(store, wo)
     assert actor is not None and actor.predicate == "daemon.reviews_gate"
 
-    # The other half of the predicate rule: the pass named really does act on THIS row.
+    # The other half of the predicate rule: the pass named really does act on THIS row
     _expire_the_case(store, approval["id"])
     gate_sweeper(store)
 
@@ -442,8 +435,7 @@ def test_a_held_request_on_a_running_ungoverned_row_names_the_gate_sweep(
 @pytest.mark.parametrize("status", ["needs_review", "budget_exhausted"])
 def test_a_held_request_names_an_actor_on_a_none_because_status(jarvis_home, project,
                                                                 status):
-    """Those two statuses' `None` was unconditional; it is now the predicate's answer.
-    The `none_because` sentence stays — it is still why the row has no pass of its own."""
+    """Those two statuses' `None` was unconditional; it is now the predicate's answer"""
     store = ProjectStore(project)
     wo = _row(store, status, "jarvis")
     _hold_a_request(store, wo["id"])

@@ -35,12 +35,10 @@ Everything else — the compression rules, Auto-Clarity, the examples, the wenya
 modes — is upstream's text untouched. Refreshing from upstream means re-applying the
 four changes above, not overwriting the file.
 
-## Why it ships alongside `i-have-adhd`
+## Why it ships alongside `ponytail`
 
-They do different jobs and both are needed. caveman decides how many words a sentence
-costs. `i-have-adhd` decides what order the sentences go in, what is cut entirely, and
-that the first line is the answer. Compression without shaping gives a short pile;
-shaping without compression is what the September measurements found.
+They do different jobs. caveman decides how many words a sentence costs; `ponytail`
+decides how much change the work needs, and what a reviewer may ask for. No overlap.
 
 Neither is relied on to load itself. `concision.house_style` carries the operative rules
 of both into every turn through the `SessionStart` hook — that is the mechanism; these

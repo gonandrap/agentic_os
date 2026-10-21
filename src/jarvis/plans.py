@@ -349,7 +349,7 @@ conflicting-authority | ambiguous-intent | scope-too-large | privileged-action>\
 
 
 def build_plan_context(plan: dict[str, Any], source: str) -> str:
-    """The design document's HEADING OUTLINE — every heading line, in order, no body text; a structural fingerprint (Neo ruling Q1880) that travels WITH the question, and an unresolvable document is REFUSED, never substituted (docs/superpowers/specs/2026-09-25-plan-review-reads-the-spec-the-os-holds.md §5)"""
+    """The design document's HEADING OUTLINE (docs/superpowers/specs/2026-09-25-plan-review-reads-the-spec-the-os-holds.md §5)"""
     text = str(plan.get("design_doc_content") or "")
     outline = sections.heading_outline(text)
     if not outline:
