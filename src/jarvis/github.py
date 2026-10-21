@@ -112,6 +112,9 @@ PR_FIELDS = ("state,mergedAt,mergeable,mergeStateStatus,baseRefName,baseRefOid,"
 #: A check conclusion that means THE CODE IS WRONG — as opposed to merely not green
 RED_CONCLUSIONS = frozenset({"FAILURE", "TIMED_OUT", "ACTION_REQUIRED", "ERROR"})
 
+#: A check that stopped without judging the code: re-run it, never blame the worker (#1123)
+ABORTED_CONCLUSIONS = frozenset({"CANCELLED", "STARTUP_FAILURE", "STALE"})
+
 #: A check that has not finished
 UNFINISHED_STATUSES = frozenset({"QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED",
                                  "PENDING", "EXPECTED"})
@@ -194,6 +197,12 @@ class PullRequest:
         """The checks that have not finished yet, by name (#224)"""
         return tuple(c["name"] or "(unnamed check)" for c in self.checks
                      if c["status"].upper() in UNFINISHED_STATUSES)
+
+    @property
+    def aborted(self) -> tuple[dict[str, str], ...]:
+        """The checks that finished without a verdict, whole (#1123)"""
+        return tuple(c for c in self.checks
+                     if c["conclusion"].upper() in ABORTED_CONCLUSIONS)
 
     @property
     def checks_green(self) -> bool:

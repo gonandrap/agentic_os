@@ -601,6 +601,16 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         head = str(p.get("head_oid") or "")
         return ("GitHub is recomputing the pull request again",
                 f"head at {head[:10]}" if head else "")
+    # Cancelled CI, re-run once per head (#1123)
+    if kind == "ci_rerun_requested":
+        runs = ", ".join(str(i) for i in p.get("run_ids") or [])
+        return ("CI was cancelled — the OS re-ran it once",
+                f"{p.get('checks') or ''}; run {runs}" if runs else str(p.get("checks") or ""))
+    if kind == "ci_rerun_unrecoverable":
+        return ("Cancelled CI the OS will not re-run again — over to you",
+                str(p.get("blocker") or ""))
+    if kind == "ci_rerun_recovered":
+        return "Cancelled CI no longer holds the pull request", ""
     if kind == "pr_conflict_unresolved":
         return ("Merge conflict the worker could not resolve — over to you",
                 f"{p.get('attempts')} attempts")
