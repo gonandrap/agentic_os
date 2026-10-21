@@ -711,13 +711,22 @@ def ask_triage(project: str, issue_url: str, title: str, body: str,
                priority: str) -> int:
     """Queue the re-assessment"""
     from .neo_store import NeoStore
+    from .provenance import TITLE_LIMIT, Borrowed, borrowed_block
 
-    context = json.dumps({"issue_url": issue_url, "title": title,
+    # The title is bounded in the JSON record too: it rides to Neo as `context=`, and
+    # `triage_payload` reads it back as a work order's title, where 300 is already ample.
+    context = json.dumps({"issue_url": issue_url, "title": title[:TITLE_LIMIT],
                           "priority": priority, "body": body[:4000]})
+    # Decision #11: the title is borrowed text — whoever filed the bug wrote it — and it
+    # was the one field in this prompt with no bound. The body keeps its own slice.
+    quoted_title = borrowed_block(Borrowed(
+        label="the tracker issue's title", whose="the agent that filed the bug",
+        text=title, limit=TITLE_LIMIT))
     neo = NeoStore()
     try:
         q = neo.ask(project, "", TRIAGE_QUESTION.format(
-            priority=priority, rubric=PRIORITY_RUBRIC, url=issue_url, title=title,
+            priority=priority, rubric=PRIORITY_RUBRIC, url=issue_url,
+            title="\n" + quoted_title,
             levels=", ".join(f"`{p}`" for p in PRIORITIES), body=body[:4000]),
             context=context, kind="triage")
     finally:

@@ -69,6 +69,60 @@ def test_assumptions_flow(project):
     assert store.pending_assumptions(wo["id"]) == []
 
 
+def test_add_assumption_still_takes_two_positional_arguments(project):
+    """The cited-section columns are OPTIONAL keywords: every existing caller — the CLI,
+    `invariants.check_assumptions_persisted`, the screenshot scripts — keeps working and
+    writes NULL, which reads as "cited no section"."""
+    store = ProjectStore(project)
+    wo = store.create_work_order("x")
+
+    store.add_assumption(wo["id"], "assumed sqlite")
+    store.add_assumption(wo["id"], "errors raise", spec_path="docs/x.md",
+                         spec_which="3", spec_text="## 3. Errors\n\nThey raise.")
+
+    plain, cited = store.all_assumptions(wo["id"])
+    assert (plain["spec_path"], plain["spec_which"], plain["spec_text"]) == (None,) * 3
+    assert cited["spec_path"] == "docs/x.md" and cited["spec_which"] == "3"
+    assert "They raise." in cited["spec_text"]
+    store.close()
+
+
+def test_the_cited_section_columns_migrate_onto_a_pre_existing_database(project):
+    """Spec test 8: the three columns ship in `ADDED_COLUMNS`, so a database written before
+    them gets them on the next open. Old rows read NULL on all three — "cited no section"."""
+    store = ProjectStore(project)
+    wo_id = store.create_work_order("filed before the columns existed")["id"]
+    db_path = store.db_path
+    store.close()
+
+    conn = sqlite3.connect(db_path)
+    conn.executescript("""
+        DROP TABLE assumptions;
+        CREATE TABLE assumptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wo_id TEXT NOT NULL REFERENCES work_orders(id),
+            ts REAL NOT NULL,
+            content TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending'
+        );
+    """)
+    conn.execute("INSERT INTO assumptions (wo_id, ts, content) VALUES (?, 0.0, ?)",
+                 (wo_id, "assumed sqlite"))
+    conn.commit()
+    conn.close()
+
+    store = ProjectStore(project)
+    try:
+        store.add_assumption(wo_id, "errors raise", spec_path="docs/x.md",
+                             spec_which="3", spec_text="docs/x.md § 3:\n## 3. Errors")
+        old, cited = store.all_assumptions(wo_id)
+    finally:
+        store.close()
+    assert (old["spec_path"], old["spec_which"], old["spec_text"]) == (None,) * 3
+    assert (cited["spec_path"], cited["spec_which"]) == ("docs/x.md", "3")
+    assert "## 3. Errors" in cited["spec_text"]
+
+
 def test_assumptions_are_numbered_from_one_per_work_order(project):
     """`n` is what the timeline says instead of repeating the text"""
     store = ProjectStore(project)

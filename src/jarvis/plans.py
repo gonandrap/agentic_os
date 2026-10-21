@@ -306,9 +306,11 @@ APPROVE when all of these hold:
 - **The split follows the spec's boundaries.** Every child names the section of the
   design document it implements, and no two name the same one. Judge whether those
   sections are the feature's real functional seams or a decomposition the planner
-  reached for first and then carved the spec to fit. The spec is SUPPLIED WITH THIS
-  QUESTION, so do not read the repository for it; if it is marked TRUNCATED, do not
-  conclude the spec ends where the text ends.
+  reached for first and then carved the spec to fit. This question carries the spec's
+  HEADING OUTLINE — every heading of the document, in order, with no body text — so
+  judge the split against those boundaries and do not read the repository for the
+  document. The sections' CONTENT is not yours to judge: a child's brief against the
+  text of the section it names is the validation panel's review, not this one.
 - **Each child is nameable from its line.** You see one line per child — title,
   edges, section, acceptance — and NOT the full briefs: those were validated mechanically
   (they stand alone, or this never reached you) and are withheld on purpose, because
@@ -346,32 +348,24 @@ An escalation may carry one optional label, which is grouped and reported:
 conflicting-authority | ambiguous-intent | scope-too-large | privileged-action>\""""
 
 
-#: How much spec may ride in one plan question. 120,000 chars
-SPEC_CONTEXT_MAX_CHARS = 120_000
-
-
-def build_plan_context(plan: dict[str, Any], source: str,
-                       max_chars: int = SPEC_CONTEXT_MAX_CHARS) -> str:
-    """The spec the plan decomposes, as the reviewer must read it — text, not a path (docs/superpowers/specs/2026-09-25-plan-review-reads-the-spec-the-os-holds.md)"""
+def build_plan_context(plan: dict[str, Any], source: str) -> str:
+    """The design document's HEADING OUTLINE — every heading line, in order, no body text; a structural fingerprint (Neo ruling Q1880) that travels WITH the question, and an unresolvable document is REFUSED, never substituted (docs/superpowers/specs/2026-09-25-plan-review-reads-the-spec-the-os-holds.md §5)"""
     text = str(plan.get("design_doc_content") or "")
-    kept, omitted = sections.clip_at_heading(text, max_chars)
+    outline = sections.heading_outline(text)
+    if not outline:
+        raise PlanError([
+            f"{plan.get('design_doc')} does not resolve to a document with headings, so "
+            f"there is no outline to review"])
     lines = [
         f"SPEC UNDER REVIEW — {plan.get('design_doc')}, as committed on {source}.",
-        "This text IS the spec this plan decomposes. Judge against THIS text and nothing "
-        "else.",
+        "This OUTLINE — every heading of that document, in order, with no body text — is "
+        "the spec's",
+        "structure. Judge the decomposition against THESE boundaries and nothing else.",
         "Do NOT open this path on disk: the checkout you can reach is not the one this "
         "plan was",
         "written against, and reading it is how question 658 was answered wrongly.",
     ]
-    if omitted:
-        lines += [
-            "",
-            f"TRUNCATED at {len(kept)} of {len(text)} characters. The sections below "
-            f"were NOT included and you have not",
-            "seen them — do not conclude the spec stops where this text stops:",
-            *(f"  {line}" for line in omitted),
-        ]
-    return "\n".join([*lines, "", kept])
+    return "\n".join([*lines, "", *outline])
 
 
 def build_plan_question(fo: dict[str, Any], plan: dict[str, Any]) -> str:

@@ -16,7 +16,6 @@ from jarvis.plans import (
     render_plan,
     spec_problems,
 )
-from jarvis.sections import clip_at_heading
 from jarvis.testing import fixture_spec_section
 
 
@@ -316,44 +315,38 @@ def test_the_rendered_plan_carries_what_a_reviewer_has_to_judge():
 # -- the spec that travels with the question (issue #746)
 
 
-def test_the_context_carries_the_spec_and_forbids_reading_disk():
-    """§5: the reviewer gets the text, its provenance, and the refusal to go hunting"""
+def test_the_context_is_the_heading_outline_and_forbids_reading_disk():
+    """Neo ruling Q1880: the OUTLINE, never the document — a structural fingerprint, with its provenance and the refusal to go hunting (§5)"""
     plan = {"design_doc": "docs/superpowers/specs/x.md",
-            "design_doc_content": "# X\n\n## 1. Shape\n\nOne module.\n"}
+            "design_doc_content": "# X\n\n## 1. Shape\n\nOne module.\n\n### Detail\n\nNo.\n"}
 
     context = build_plan_context(plan, "main @ fb7739d")
 
     assert context.startswith(
         "SPEC UNDER REVIEW — docs/superpowers/specs/x.md, as committed on main @ fb7739d.")
     assert "Do NOT open this path on disk" in context
-    assert "One module." in context
-    assert "TRUNCATED" not in context
+    assert "# X" in context and "## 1. Shape" in context and "### Detail" in context
+    assert "One module." not in context and "No." not in context
 
 
-def test_a_clipped_spec_says_so_and_names_every_section_it_dropped():
-    """§10: a silently clipped spec the reviewer believes is whole recreates 658"""
+def test_the_outline_carries_every_heading_in_order_and_no_body_prose():
+    """Q1880: no clipping to judge — every heading survives, no body prose does"""
     body = "\n".join(f"## {n}. Piece {n}\n\nbody{n} " + "x" * 400
                      for n in range(1, 40))
     plan = {"design_doc": "docs/superpowers/specs/x.md", "design_doc_content": body}
 
-    context = build_plan_context(plan, "main @ abc1234", max_chars=2000)
+    context = build_plan_context(plan, "main @ abc1234")
 
-    assert "TRUNCATED at " in context and f" of {len(body)} characters" in context
-    assert "body1 " in context
-    assert "## 39. Piece 39" in context   # every omitted heading, verbatim
-    assert "body39 " not in context       # and none of their text
-
-
-def test_clipping_cuts_at_a_heading_and_never_mid_sentence():
-    doc = "# Top\n\nintro\n\n## 1. One\n\naaaa\n\n## 2. Two\n\nbbbb\n"
-
-    kept, omitted = clip_at_heading(doc, 35)
-
-    assert kept == "# Top\n\nintro\n\n## 1. One\n\naaaa"
-    assert omitted == ["## 2. Two"]
+    headings = [f"## {n}. Piece {n}" for n in range(1, 40)]
+    positions = [context.index(h) for h in headings]
+    assert positions == sorted(positions)
+    assert "body1 " not in context and "body39 " not in context
+    assert "x" * 100 not in context
 
 
-def test_a_document_that_fits_is_returned_whole_with_nothing_omitted():
-    doc = "# Top\n\n## 1. One\n\naaaa\n"
-
-    assert clip_at_heading(doc, 10_000) == (doc, [])
+def test_an_unresolvable_document_is_refused_rather_than_substituted():
+    """The ask/assume path's refusal shape: nothing is substituted for a document that
+    does not resolve."""
+    with pytest.raises(PlanError, match="docs/superpowers/specs/x.md"):
+        build_plan_context({"design_doc": "docs/superpowers/specs/x.md",
+                            "design_doc_content": ""}, "main @ abc1234")

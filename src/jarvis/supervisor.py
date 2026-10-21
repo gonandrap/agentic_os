@@ -821,22 +821,45 @@ def reassert_health(pstore: Any, project: str, subject: dict[str, Any]) -> dict[
 
 
 def escalation_context(evidence: str, verdict: dict[str, Any]) -> str:
-    """What Neo is handed with the question — §3"""
+    """What Neo is handed with the question — §3: the supervisor's own reading is APPENDED, never substituted, because Neo is headless and cannot look the packet up"""
+    # Decision #11: packet and model reasoning are both borrowed text, both bounded
+    from .provenance import (DESCRIPTION_LIMIT, EVIDENCE_LIMIT, Borrowed,
+                             borrowed_block)
+
     return "\n\n".join([
-        evidence,
+        borrowed_block(Borrowed(
+            label="the alarm's evidence packet",
+            whose="the OS's detectors, quoting the worker's own session",
+            text=evidence, limit=EVIDENCE_LIMIT)),
         "\n".join([
             "# What the supervisor made of it",
             "It could not settle this alarm and handed it to you.",
-            f"Its reasoning: {verdict['reason']}",
+            "Its reasoning:",
+            borrowed_block(Borrowed(label="the supervisor's reasoning",
+                                    whose="the supervisor model",
+                                    text=verdict["reason"],
+                                    limit=DESCRIPTION_LIMIT)),
         ]),
     ])
 
 
 def _question_for(verdict: dict[str, Any], alarm: dict[str, Any]) -> str:
-    """The one question put to Neo, never empty"""
-    return verdict["question"].strip() or (
-        f"The supervisor could not settle this alarm: {alarm['reason']}. "
-        f"Does this spend need the user?")
+    """The one question put to Neo, never empty: a model that escalates without filling `question` in has still judged, and an empty `questions` row is unanswerable by Neo and unreadable by the user it would be escalated to"""
+    # Decision #11: the model's question and the alarm's reason are borrowed text, bounded
+    from .provenance import DESCRIPTION_LIMIT, Borrowed, borrowed_block
+
+    asked = verdict["question"].strip()
+    if asked:
+        return borrowed_block(Borrowed(label="the supervisor's question",
+                                       whose="the supervisor model", text=asked,
+                                       limit=DESCRIPTION_LIMIT))
+    return "\n".join([
+        "The supervisor could not settle this alarm:",
+        borrowed_block(Borrowed(label="the alarm's reason",
+                                whose="the OS detector that raised it",
+                                text=alarm["reason"], limit=DESCRIPTION_LIMIT)),
+        "Does this spend need the user?",
+    ])
 
 
 def _apply(pstore: Any, neo_store: Any, central: Any, project: str, wo: dict[str, Any],

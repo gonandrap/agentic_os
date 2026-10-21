@@ -930,7 +930,7 @@ def test_a_confirmation_question_carries_no_diff_whatever_the_change_size(starte
 
 
 def test_a_change_that_is_only_a_huge_document_is_confirmed_rather_than_held(started):
-    """THE LIVE CASE, wo-09c60d79: the only changed file was a ~20,000-char spec document and the..."""
+    """THE LIVE CASE, wo-09c60d79: the only changed file was a ~20,000-char spec document; the trim kept nothing of it, so the pass held on `evidence_unreadable` and filed nothing. Nothing is trimmed now, so the question is FILED, driven through the daemon's ask pass. The sentence no longer NAMES the document (`jarvis wo assume` refuses a `.md` path with no section — user decision 2026-10-14, Neo learning #102); the live case is the DIFF being one huge document, which `only_a_doc` still builds"""
     spec_body = "spec line that says something about the change\n" * 420
     assert len(spec_body) > 19_000, "not the live case: the document is too small"
 
@@ -940,7 +940,7 @@ def test_a_change_that_is_only_a_huge_document_is_confirmed_rather_than_held(sta
 
     store, wo = with_diff(
         started, files=only_a_doc,
-        assumptions=("wrote the wording of docs/spec.md myself",))
+        assumptions=("wrote the wording of the new spec document myself",))
     provisional(store, wo)
 
     ask(started, store)

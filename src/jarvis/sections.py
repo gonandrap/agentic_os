@@ -16,6 +16,10 @@ REF_RE = re.compile(
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
 
+#: A markdown path named in free text. Markdown only: a design artifact is a `.md`
+#: document, and a source file named in the same sentence is not a spec citation.
+DOC_RE = re.compile(r"[\w./-]*[\w-]\.md\b")
+
 
 def find_refs(text: str) -> list[tuple[str, str]]:
     """Every (path, section) reference in the text, deduplicated in reading order"""
@@ -24,6 +28,25 @@ def find_refs(text: str) -> list[tuple[str, str]]:
         ref = (m.group(3).strip(), (m.group(1) or m.group(2)).strip())
         if ref not in out:
             out.append(ref)
+    return out
+
+
+def unreferenced_docs(text: str) -> list[str]:
+    """Markdown paths in the text that NO `find_refs` reference covers, in reading order.
+
+    The other half of the in-text form. A sentence that names a design document without
+    naming a section of it is the shape the user decision of 2026-10-14 (Neo learning
+    #102) refuses: Neo is handed cited SECTIONS — N under one labelled snapshot, bounded by
+    one total (`ops.SECTION_SNAPSHOT_CHARS`) — so "the spec says so" with a whole document
+    beside it has nothing to resolve. `ops` turns each of these into a refusal that shows
+    the asker the form above.
+    """
+    covered = {path for path, _which in find_refs(text)}
+    out: list[str] = []
+    for m in DOC_RE.finditer(text):
+        path = m.group(0)
+        if path not in covered and path not in out:
+            out.append(path)
     return out
 
 
@@ -40,6 +63,28 @@ def find_heading(markdown: str, which: str) -> int | None:
     return None
 
 
+def heading_outline(markdown: str) -> list[str]:
+    """Every heading line, in order, level included — and NO body text. THE ONE MATCHER.
+
+    Neo ruling Q1880: a plan review reads the spec's STRUCTURE, never the document.
+    """
+    return [f"{m.group(1)} {m.group(2)}" for m in HEADING_RE.finditer(markdown)]
+
+
+#: One labelled snapshot of N resolved sections, and the label's own shape. Neo ruling
+#: Q1883: a payload may carry several sections, so each body names the section it is.
+SECTION_LABEL_RE = re.compile(r"^(\S+\.md) § (.+):$", re.MULTILINE)
+
+
+def label_sections(blocks: list[tuple[str, str, str]]) -> str:
+    return "\n\n".join(f"{p} § {which}:\n{text}" for p, which, text in blocks)
+
+
+def labelled_sections(text: str) -> list[tuple[str, str]]:
+    """The `(path, which)` of every label `label_sections` wrote."""
+    return [(m.group(1), m.group(2)) for m in SECTION_LABEL_RE.finditer(text)]
+
+
 def extract_section(markdown: str, which: str) -> str | None:
     """One section of a markdown document, heading included, or None"""
     heads = [(m.start(), len(m.group(1)), m.group(2)) for m in HEADING_RE.finditer(markdown)]
@@ -53,19 +98,3 @@ def extract_section(markdown: str, which: str) -> str | None:
             end = pos
             break
     return markdown[start:end].rstrip()
-
-
-def clip_at_heading(markdown: str, max_chars: int) -> tuple[str, list[str]]:
-    """The prefix ending at the last heading that fits, and the heading LINES dropped (docs/superpowers/specs/2026-09-25-plan-review-reads-the-spec-the-os-holds.md)"""
-    if len(markdown) <= max_chars:
-        return markdown, []
-    heads = [(m.start(), m.group(0).strip()) for m in HEADING_RE.finditer(markdown)]
-    kept_end = 0
-    for pos, _line in heads:
-        if 0 < pos <= max_chars:
-            kept_end = pos
-    # No heading boundary inside the budget: a hard cut beats returning nothing
-    if kept_end == 0:
-        kept_end = max_chars
-    return (markdown[:kept_end].rstrip(),
-            [line for pos, line in heads if pos >= kept_end])
