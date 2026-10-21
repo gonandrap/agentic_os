@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -139,6 +140,7 @@ argv = sys.argv[1:]
 # detached processes and a worker prompt is far past the 4KB atomic-append ceiling, so
 # a single calls.jsonl loses and interleaves records under any real fan-out.
 os.makedirs(calls_dir, exist_ok=True)
+# clock-exempt: class 4 — a separate process, which cannot see the in-test patch of db.now
 _started = time.time()
 _record_path = os.path.join(calls_dir, f"{time.time_ns()}-{os.getpid()}.json")
 
@@ -227,6 +229,7 @@ def _write_call_record(finished=None):
     os.replace(tmp, _record_path)
 
 _write_call_record()
+# clock-exempt: class 4 — a separate process, which cannot see the in-test patch of db.now
 atexit.register(lambda: _write_call_record(time.time()))
 
 def opt(name, default=None):
@@ -384,6 +387,7 @@ elif "-p" in argv and ("--session-id" in argv or "--resume" in argv):
             # Sub-second, because the window it has to land inside is one turn of a test
             # that takes milliseconds: a stamp floored to the second lands BEFORE
             # `started_at` and `usage.said_in_session` drops it.
+            # clock-exempt: class 4 — a separate process, which cannot see the in-test patch of db.now
             now = time.time()
             stamp = (time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now))
                      + f".{int(now % 1 * 1000):03d}Z")
@@ -486,6 +490,7 @@ elif "-p" in argv and ("--session-id" in argv or "--resume" in argv):
             and os.environ.get("FAKE_CLAUDE_COMPACT") != "noop"):
         d = os.path.join(root, "-fake")
         os.makedirs(d, exist_ok=True)
+        # clock-exempt: class 4 — a separate process, which cannot see the in-test patch of db.now
         now = time.time()
         stamp = (time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now))
                  + f".{int(now % 1 * 1000):03d}Z")
@@ -2201,6 +2206,7 @@ def signin(tmp_path, monkeypatch):
             "refreshTokenExpiresAt": int((time.time() + refresh_expires_in) * 1000),
         }}))
         # ALWAYS stamped explicitly, including the `at=None` case, and from `time.time()`
+        # clock-exempt: class 4 — a real file mtime, coarse on 3.13 and not on 3.11/3.12
         stamp = time.time() if at is None else at
         os.utime(path, (stamp, stamp))
         return path
@@ -2246,6 +2252,50 @@ def project(tmp_path, claude_json):
     p = make_git_project(tmp_path, "proj_a")
     claude_json(p)  # trusted, like a real project the user works in
     return p
+
+
+#: Seed for every faked `db.now` — 2025-10-09T07:33:20Z, a constant, never time.time()
+TEST_EPOCH = 1760000000.0
+
+
+class _Clock:
+    """A faked `db.now` in four modes (docs/superpowers/specs/2026-10-15-no-test-reads-the-real-clock.md §1)"""
+
+    def __init__(self, at: float) -> None:
+        self.at = at
+        self._step = 0.0
+
+    def __call__(self) -> float:
+        at = self.at
+        self.at += self._step
+        return at
+
+    def advance(self, seconds: float, /) -> float:
+        """Move the clock by SECONDS — positional-only, so `advance(minutes=…)` is a TypeError"""
+        self.at += seconds
+        return self.at
+
+    def ticking(self) -> None:
+        """From here on, every read is strictly later than the last"""
+        self._step = 1.0
+
+    @contextlib.contextmanager
+    def moved(self, seconds: float, /):
+        """One block at a different instant, restored even if the block raises"""
+        before = self.at
+        self.at = before + seconds
+        try:
+            yield self
+        finally:
+            self.at = before
+
+
+@pytest.fixture()
+def clock(monkeypatch):
+    """A controlled `db.now`; NOT autouse — `db.now` stamps every row in all three databases"""
+    c = _Clock(TEST_EPOCH)
+    monkeypatch.setattr("jarvis.db.now", c)
+    return c
 
 
 @pytest.fixture()
