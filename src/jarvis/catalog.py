@@ -339,8 +339,11 @@ class ConcisionConfig:
     """The one number the concision machinery needs per project (docs/superpowers/specs/2026-09-19-concision-enforced.md)"""
 
     summary_max_words: int = concision.DEFAULT_SUMMARY_MAX_WORDS
-    #: The same bargain one surface over: `message_max_chars` = 0 turns the `jarvis wo send` / `wo assume`... (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
+    #: The same bargain one surface over: `message_max_chars` = 0 turns the `jarvis wo send`... (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
     message_max_chars: int = concision.DEFAULT_MESSAGE_MAX_CHARS
+    #: ONE DECISION per assumption, ONE question per ask: both 0 switch their check off (docs/superpowers/specs/2026-10-21-questions-to-neo-are-atomic.md §1)
+    assume_max_chars: int = concision.DEFAULT_ASSUME_MAX_CHARS
+    question_max_chars: int = concision.DEFAULT_QUESTION_MAX_CHARS
 
 
 # -- `jarvis inspect`: what counts as worth reporting, and what as worth interrupting for
@@ -1687,7 +1690,18 @@ def _parse_concision(raw: Any, base: ConcisionConfig | None = None,
     if 0 < chars < 1000:
         raise _err(f"{where}.message_max_chars of {chars} leaves no message that can "
                    f"pass; use 0 to switch the cap off")
-    return ConcisionConfig(summary_max_words=words, message_max_chars=chars)
+    # No floor clause for these two: 1000 IS the assume cap (spec §1)
+    assume_chars = int(raw.get("assume_max_chars", base.assume_max_chars))
+    if assume_chars < 0:
+        raise _err(f"{where}.assume_max_chars must be 0 (off) or more, got "
+                   f"{assume_chars}")
+    question_chars = int(raw.get("question_max_chars", base.question_max_chars))
+    if question_chars < 0:
+        raise _err(f"{where}.question_max_chars must be 0 (off) or more, got "
+                   f"{question_chars}")
+    return ConcisionConfig(summary_max_words=words, message_max_chars=chars,
+                           assume_max_chars=assume_chars,
+                           question_max_chars=question_chars)
 
 
 def _parse_bugs(raw: Any, base: BugsConfig | None = None,

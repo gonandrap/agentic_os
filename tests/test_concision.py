@@ -153,6 +153,58 @@ def test_a_project_can_switch_the_message_cap_off_but_not_set_a_nonsense_one():
             _parse_concision({"message_max_chars": bad})
 
 
+# -- the assumption and question caps (docs/superpowers/specs/2026-10-21-questions-to-neo-are-atomic.md §1)
+
+def test_the_two_new_caps_default_to_one_thousand_and_two_thousand():
+    from jarvis import concision, sections
+    from jarvis.catalog import _parse_concision
+
+    assert concision.DEFAULT_ASSUME_MAX_CHARS == 1000
+    assert concision.DEFAULT_QUESTION_MAX_CHARS == 2000
+    # `concision` owns the number; `sections` re-exports it
+    assert sections.QUESTION_MAX_CHARS == concision.DEFAULT_QUESTION_MAX_CHARS
+    assert _parse_concision({}).assume_max_chars == 1000
+    assert _parse_concision({}).question_max_chars == 2000
+
+
+@pytest.mark.parametrize("key", ["assume_max_chars", "question_max_chars"])
+def test_a_project_can_tune_or_switch_each_new_cap_off_but_not_go_negative(key):
+    from jarvis.catalog import CatalogError, _parse_concision
+
+    assert getattr(_parse_concision({key: 0}), key) == 0
+    assert getattr(_parse_concision({key: 400}), key) == 400
+    with pytest.raises(CatalogError, match=f"{key} must be 0"):
+        _parse_concision({key: -1})
+
+
+def test_both_new_caps_travel_to_the_worker_by_env(project, jarvis_home):
+    """The hook refuses before the shell expands anything, so it carries them as env"""
+    from jarvis import concision
+    from jarvis.catalog import ConcisionConfig
+
+    written = json.loads(
+        _write_worker_settings(_spec(project), {"id": "wo-conc06"}).read_text())
+    assert written["env"][concision.ASSUME_CAP_ENV] == "1000"
+    assert written["env"][concision.QUESTION_CAP_ENV] == "2000"
+
+    tighter = json.loads(_write_worker_settings(
+        _spec(project, concision=ConcisionConfig(assume_max_chars=300,
+                                                 question_max_chars=700)),
+        {"id": "wo-conc07"}).read_text())
+    assert concision.assume_cap(tighter["env"]) == 300
+    assert concision.question_cap(tighter["env"]) == 700
+
+
+@pytest.mark.parametrize("raw", [None, "", "nonsense", "-5"])
+def test_an_unusable_env_value_falls_back_to_the_default(raw):
+    from jarvis import concision
+
+    env = {} if raw is None else {concision.ASSUME_CAP_ENV: raw,
+                                  concision.QUESTION_CAP_ENV: raw}
+    assert concision.assume_cap(env) == concision.DEFAULT_ASSUME_MAX_CHARS
+    assert concision.question_cap(env) == concision.DEFAULT_QUESTION_MAX_CHARS
+
+
 # -- the subagent transport (SS5.1)
 
 def test_the_standing_prompt_travels_to_the_worker_by_env(project, jarvis_home):

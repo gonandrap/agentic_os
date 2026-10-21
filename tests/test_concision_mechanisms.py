@@ -223,6 +223,7 @@ def test_an_oversized_wo_send_is_refused_and_told_what_to_pass_instead():
 def test_an_oversized_wo_assume_is_refused():
     reason = _reason(_payload(f'jarvis wo assume wo-conc01 "{"y" * 7000}"'))
     assert "7000 characters" in reason and "wo assume" in reason
+    assert str(concision.DEFAULT_ASSUME_MAX_CHARS) in reason
 
 
 def test_an_oversized_question_is_refused_before_the_command_runs():
@@ -239,8 +240,37 @@ def test_the_hooks_question_cap_is_the_same_number_as_ops_enforces():
     from jarvis import sections
 
     assert concision.QUESTION_MAX_CHARS == sections.QUESTION_MAX_CHARS
-    assert _payload(f'jarvis wo ask wo-conc01 "{"q" * 3999}"') is None
-    assert _payload(f'jarvis wo ask wo-conc01 "{"q" * 4001}"') is not None
+    assert _payload(f'jarvis wo ask wo-conc01 "{"q" * 1999}"') is None
+    assert _payload(f'jarvis wo ask wo-conc01 "{"q" * 2001}"') is not None
+
+
+# -- one cap per kind, through the real hook (docs/superpowers/specs/2026-10-21-questions-to-neo-are-atomic.md §3)
+
+def test_each_kind_is_refused_at_its_own_cap_and_told_to_split():
+    """Test 11: `wo assume` at 1000, `wo ask` at 2000, `wo send` still at 6000"""
+    assume = _reason(_payload(f'jarvis wo assume wo-conc01 "{"y" * 1200}"'))
+    assert "1200 characters" in assume and "the cap is 1000" in assume
+    assert "assume" in assume and "split" in assume.lower()
+
+    ask = _reason(_payload(f'jarvis wo ask wo-conc01 "{"q" * 2500}"'))
+    assert "2500 characters" in ask and "the cap is 2000" in ask
+    assert "split" in ask.lower()
+
+    # `wo send` keeps its own 6000 unchanged
+    assert _payload(f'jarvis wo send wo-target "{"x" * 5000}"') is None
+    assert _reason(_payload(f'jarvis wo send wo-target "{"x" * 6001}"'))
+    assert _payload(f'jarvis wo assume wo-conc01 "{"y" * 1000}"') is None
+
+
+def test_each_kinds_cap_is_read_from_its_own_env_var():
+    assert _payload(f'jarvis wo assume wo-conc01 "{"y" * 1200}"',
+                    JARVIS_ASSUME_MAX_CHARS="0") is None
+    assert _payload(f'jarvis wo assume wo-conc01 "{"y" * 1200}"',
+                    JARVIS_ASSUME_MAX_CHARS="2000") is None
+    assert _payload(f'jarvis wo ask wo-conc01 "{"q" * 1500}"',
+                    JARVIS_QUESTION_MAX_CHARS="1000") is not None
+    assert _payload(f'jarvis wo ask wo-conc01 "{"q" * 2500}"',
+                    JARVIS_QUESTION_MAX_CHARS="0") is None
 
 
 @pytest.mark.parametrize("substitution,producer", [

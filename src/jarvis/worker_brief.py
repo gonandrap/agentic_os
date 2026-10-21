@@ -2,10 +2,26 @@
 
 from __future__ import annotations
 
-from .concision import DEFAULT_SUMMARY_MAX_WORDS as SUMMARY_MAX_WORDS
+from .concision import DEFAULT_ASSUME_MAX_CHARS, DEFAULT_SUMMARY_MAX_WORDS as SUMMARY_MAX_WORDS
 
 WO_PLACEHOLDER = "<wo-id>"
 PROJECT_PLACEHOLDER = "<project>"
+
+#: The one spelling of a spec citation (`sections.REF_RE`); there is no `--section` flag
+SECTION_FORM = 'from section 3 of design doc "docs/superpowers/specs/feature.md": …'
+
+
+def assume_shape(wo_id: str, *, tail: str = "", cite_spec: bool = True) -> str:
+    """The `wo assume` bullet every brief carries: ONE decision, the cap, the in-text reference form (docs/superpowers/specs/2026-10-21-questions-to-neo-are-atomic.md §5)"""
+    return (
+        f"- `jarvis wo assume {wo_id} \"...\"`: ONE DECISION you made with NO doubt "
+        f"— choice, rejected alternative, why; ≤{DEFAULT_ASSUME_MAX_CHARS} "
+        f"chars; a second decision is a second `jarvis wo assume` citing it "
+        f"(`per Q1234`/`per assumption #2`)."
+        # Dropped in the CORE only: `CORE_BUDGET_CHARS` leaves no room for it there
+        + (f" Cite a spec BY SECTION the same way (e.g. `{SECTION_FORM}`), never by "
+           f"pasting it and never by naming a whole document." if cite_spec else "")
+        + tail)
 
 #: Budget for the rendered core contract block (between "# Operating contract" and "# Full... (docs/superpowers/specs/2026-08-22-agent-concision.md)
 CORE_BUDGET_CHARS = 3900
@@ -121,6 +137,8 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
                   gate_names: tuple[str, ...] = (),
                   kind: str = "worker") -> list[str]:
     """The compressed operating contract: only the invariants a worker cannot be allowed to discover by..."""
+    from .sections import QUESTION_MAX_CHARS
+
     lines = [
         "# Operating contract",
         "You MUST follow it. This is the compressed core; the full contract with "
@@ -131,13 +149,13 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
         f"`[{wo_id}] {title[:40]}`. `gh pr create` with any other title is blocked.",
         f"- **Neo is your first responder. Any doubt goes to it.** "
         f"`jarvis wo ask {wo_id} \"<your question>\"`, then END YOUR TURN; the "
-        f"answer arrives as your next user turn, usually within a minute. This is "
-        f"the normal, expected way to work: it is not an escalation and it does not "
+        f"answer arrives as your next user turn, usually within a minute. "
+        f"Normal: it is not an escalation and it does not "
         f"interrupt the user. The trigger is DOUBT, not importance — if you catch "
         f"yourself weighing options or thinking \"either would work\", you are in "
         f"doubt: Ask BEFORE you build on it, not after. A question is one "
-        f"paragraph: the decision, the options, your recommendation — do not paste "
-        f"context.",
+        f"paragraph: the decision, the options, your recommendation — no pasted "
+        f"context; ≤{QUESTION_MAX_CHARS} chars.",
         "  - Do not talk yourself out of asking: \"It's reversible\", \"it's only "
         "an implementation detail\", \"I'll note it as an assumption\" are "
         "rationalisations for guessing.",
@@ -145,10 +163,9 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
             "  - But LOOK IT UP FIRST when a headline in the knowledge-base index "
             "below names the area you are unsure about — a lookup is not a doubt.",
         ] if has_knowledge else []),
-        f"- `jarvis wo assume {wo_id} \"...\"` is for the OTHER case, and it should "
-        f"be RARE: a call you made with NO doubt. Record EVERY such call, including "
-        f"the small and obvious ones — the work order record is the only audit "
-        f"trail anyone gets. Never a guess: if you are guessing, ask.",
+        assume_shape(wo_id, cite_spec=False,
+                     tail=" It should be RARE. Record EVERY such call, including "
+                          "the small and obvious ones: the only audit trail."),
         *([
             f"- READ the OS knowledge base before you touch an area it covers — it "
             f"is INDEXED at the end of this prompt, not pasted into it: "
@@ -297,15 +314,16 @@ def contract_section(wo_id: str = WO_PLACEHOLDER,
         "reason to go looking instead of recording a call you made with no doubt. "
         "(Your prompt carries the index only when the knowledge base has entries; "
         "with no index there is nothing to look up.)",
-        f"- `jarvis wo assume {wo_id} \"...\"` is for the OTHER case, and it "
-        f"should be RARE: a call you made with NO doubt — you followed an existing "
-        f"convention, the work order implied it, the codebase left one sensible "
-        f"option. Record EVERY such call, including the small and obvious ones "
-        f"(naming, file layout, which convention you followed, how you split the "
-        f"commits): recording is cheap and the work order record is the only audit "
-        f"trail anyone gets. An assumption is a disclosure of something you were "
-        f"SURE about. It is never a guess you are hoping nobody checks — if you "
-        f"are guessing, ask instead.",
+        assume_shape(wo_id, tail=" It is the OTHER case and should be RARE: you "
+                                 "followed an existing convention, the work order "
+                                 "implied it, the codebase left one sensible option. "
+                                 "Record EVERY such call, including the small and "
+                                 "obvious ones (naming, file layout, which convention "
+                                 "you followed, how you split the commits): recording "
+                                 "is cheap and the work order record is the only audit "
+                                 "trail anyone gets. It is a disclosure of something "
+                                 "you were SURE about, never a guess you are hoping "
+                                 "nobody checks — if you are guessing, ask instead."),
         f"- Found work that is real but is not THIS work order's job? Do not file "
         f"it yourself and do not leave a note: `jarvis wo defer {wo_id} \"<title>\" "
         f"--why \"<why it should not be done now>\"` (add `--neo-question <id>` if "

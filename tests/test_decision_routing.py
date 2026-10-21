@@ -61,7 +61,7 @@ def test_contract_says_ask_before_building(contract: str) -> None:
 
 def test_contract_makes_assumptions_the_rare_case(contract: str) -> None:
     assert "should be RARE" in contract
-    assert "a call you made with NO doubt" in contract
+    assert "ONE DECISION you made with NO doubt" in contract
 
 
 def test_contract_still_demands_every_assumption_be_recorded(contract: str) -> None:
@@ -97,6 +97,38 @@ def test_every_kinds_assume_line_cites_a_spec_by_section(kind, catalog_file) -> 
     assert any("never by pasting" in ln for ln in lines), lines
 
 
+#: Spec §5: the in-text reference form, keyword-anchored
+REF_FORM = ("Q1234", "assumption #2")
+
+
+@pytest.mark.parametrize("kind", ["planner", "analyst", "investigator", "manager"])
+def test_every_kinds_assume_guidance_asks_for_one_decision(kind, catalog_file) -> None:
+    """Test 10: an assumption carrying three decisions is what the cap and this shape fix"""
+    spec = load_catalog(catalog_file).projects[0]
+    prompt = build_worker_prompt({"id": "wo-k", "title": "t", "description": "d",
+                                  "kind": kind, "parent_id": "fo-1"}, spec,
+                                 knowledge=[])
+
+    lines = [ln for ln in prompt.splitlines() if "`jarvis wo assume" in ln]
+    assert lines, f"no assume guidance in the {kind} prompt"
+    for line in lines:
+        assert "ONE" in line, line
+    joined = "\n".join(lines)
+    assert "a second decision is a second `jarvis wo assume`" in joined
+    assert "1000" in joined
+    for form in REF_FORM:
+        assert form in joined, joined
+
+
+def test_the_default_brief_asks_for_one_decision_and_names_both_caps(contract) -> None:
+    """Test 10 for the two `worker_brief` sites"""
+    assert "ONE DECISION" in contract
+    assert "a second decision is a second `jarvis wo assume`" in contract
+    assert "1000" in contract and "2000" in contract
+    for form in REF_FORM:
+        assert form in contract
+
+
 def test_operation_template_mirrors_the_contract() -> None:
     """dispatch.py briefs the worker; OPERATION.md is what a human (or an agent started outside the OS)..."""
     from jarvis.bootstrap import ASSETS
@@ -110,6 +142,11 @@ def test_operation_template_mirrors_the_contract() -> None:
     assert "The trigger is **doubt**, not importance" in tmpl
     assert "this should be rare" in tmpl.lower()
     assert "no doubt" in tmpl
+    # Spec §5: one decision per assumption, and the in-text reference form
+    assert "one decision" in tmpl.lower()
+    assert "second `jarvis wo assume`" in tmpl
+    for form in REF_FORM:
+        assert form in tmpl
 
 
 # -- the user's verdict becomes a Neo learning

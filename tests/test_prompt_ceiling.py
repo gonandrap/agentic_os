@@ -168,14 +168,15 @@ def test_the_refusal_is_a_named_error_the_cli_can_render(jarvis_home, ceiling):
 
 def test_jarvis_wo_ask_prints_one_line_and_exits_nonzero(jarvis_home, fake_claude,
                                                          catalog_file, project,
-                                                         capsys):
+                                                         capsys, monkeypatch):
     """The CLI path a worker actually uses"""
     from jarvis import cli, ops
 
     before = claude_cli.MAX_OS_PROMPT_CHARS
     ops.start_os(str(catalog_file), foreground=True)
     wo = ops.create_work_order("proj_a", "build the exporter")
-    # Under `sections.QUESTION_MAX_CHARS` (4,000), so it is the STORE that refuses this
+    # The question cap is off, so it is the STORE that refuses this
+    monkeypatch.setattr(ops, "_concision_cap", lambda *_: 0)
     claude_cli.set_max_os_prompt_chars(3_000)
     try:
         rc = cli.main(["wo", "ask", wo["id"], MARKER + "x" * 3_400])
