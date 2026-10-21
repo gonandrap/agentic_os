@@ -378,6 +378,32 @@ USER_REWORK_REFUSED_BLOCKER = ("the rework you asked for was judged and the pane
                                "and decide: accept it, send the worker back with "
                                "another round (`validation.max_rounds`), or close it")
 
+#: THE SAME ROUND WITH NOBODY'S OPINION ON IT, and a separate sentence from
+#: `USER_REWORK_REFUSED_BLOCKER` above because that one is only true of the `handover`
+#: family: a user-rework round escalated on a `not_reviewed` cause — `bounce_exhausted`,
+#: `nothing_to_judge` or `repeat_submission` — had no seat judge it, so "the panel refused
+#: it" states an opinion nobody held and the order's own `review:` block says the opposite
+#: (GitHub issue 1106, live case wo-f2a57dd2). It also drops the `validation.max_rounds`
+#: remedy, which is a no-op here: the round was UNCOUNTED, so no counted budget was spent
+#: and another round would open on the same submission. Phrased for all three causes at
+#: once — "nothing new to judge" — because the family, not the cause, picks the wording
+#: (spec
+#: docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md
+#: §1, kn-bec32368: one escalation, one wording).
+#:
+#: NAMES THE NON-HANDOVER PAIR of `ops.escalation_next`, with no work-order id — a
+#: constant cannot carry one — and FREE OF ANY ELAPSED TIME AND OF THE SHA on
+#: `PARKED_BLOCKER`'s rule: `ack_attention` stores it verbatim and INV-ATTENTION-REASON
+#: re-derives and compares it, so a reason that ticked or named a commit could never be
+#: acknowledged. Re-derived from the round and the escalation event by
+#: `user_rework_unreviewed`.
+USER_REWORK_UNREVIEWED_BLOCKER = (
+    "the rework you asked for was never reviewed — the submission gave the panel nothing "
+    "new to judge, and no counted round was spent, so another round changes nothing: "
+    "send the worker back with "
+    '`jarvis wo review --reject --feedback "<what to change>"`, or land it without a '
+    'panel verdict with `jarvis wo review --feedback "<why>"`')
+
 #: What a work order says when the reviewer REFUSED the automatic merge of the commit the
 #: panel accepted — spec 2026-09-24 fix 4b. Nothing else will ever move that order:
 #: `automerge.propose` does not re-ask for a commit whose grant was refused, and the inbox
@@ -1174,9 +1200,22 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         from .ops import auto_review_at
         if auto_review_at(store.project_path):
             owed = [a for a in pending if not _os_is_confirming(a)]
+    # ONE COMPOUND LINE when the order is also out of money — §4 of docs/superpowers/
+    # specs/2026-10-20-a-work-order-at-its-budget-cap-is-not-stuck.md, Neo 2018. It
+    # REPLACES both constituents and is emitted in the slot the assumptions line
+    # occupies, which is the higher of the two: a surface printing only `reason[0]`
+    # would otherwise hide half the wait, and the money is what the order is parked on.
+    # `neo_reviews_later` can never skip it: `budget_exhausted` is absent from
+    # `PRE_DELIVERY_STATUSES`, so it is False in this status whatever `auto_review`
+    # says.
+    compound = False
     if owed and not neo_reviews_later(store, wo):
         n = len(owed)
-        blockers.append(f"{n} assumption{'s' if n != 1 else ''} pending your review")
+        compound = wo["status"] == budget.EXHAUSTED
+        clause = (f"{n} assumption{'s' if n != 1 else ''} "
+                  f"also await{'s' if n == 1 else ''} you")
+        blockers.append(f"{budget_blocker(store, wo)}; {clause}" if compound
+                        else f"{n} assumption{'s' if n != 1 else ''} pending your review")
     # A privileged action Neo declined to decide on. Nobody else can open that gate, and
     # the work order cannot proceed past it.
     for approval in store.escalated_approvals(wo["id"]):
@@ -1200,7 +1239,9 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # ABOVE `failed`, and above every wait below: an order in this status has nothing
     # else it can be waiting for, and the question the user is being asked is about
     # money rather than about the work.
-    if wo["status"] == budget.EXHAUSTED:
+    # ...unless the compound line above already carried it: neither constituent is ever
+    # printed twice (§4 of the 2026-10-20 spec).
+    if wo["status"] == budget.EXHAUSTED and not compound:
         blockers.append(budget_blocker(store, wo))
     if governed and wo["status"] == "failed":
         # TWO SENTENCES, and the second is the one the generic line got wrong: a session
@@ -1405,12 +1446,19 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         #    dropping the give-up because a decision is also open is the silent
         #    relabelling kn-78346a2d names — dropping it FOR GOOD, because accepting the
         #    assumption lands the work order and nothing re-derives it afterwards.
-        #    ONE OF TWO SENTENCES: a give-up on a round a USER rejection bought names
-        #    that cause instead (spec 2026-09-27 §5, Neo question 973).
+        #    ONE OF THREE SENTENCES: a give-up on a round a USER rejection bought names
+        #    that cause instead (spec 2026-09-27 §5, Neo question 973), and splits off the
+        #    one family where no seat judged the submission — `not_reviewed`, every other
+        #    family keeping the refusal sentence (GitHub issue 1106, spec 2026-10-14-an
+        #    -escalated-round-says-why-and-what-to-run-next.md §1). The `else` arm below
+        #    is the pre-existing one, for escalations a user rejection did NOT buy.
         elif validation_escalated(store, wo):
-            blockers.append(USER_REWORK_REFUSED_BLOCKER
-                            if user_rework_refused(store, wo)
-                            else VALIDATION_STUCK_BLOCKER)
+            if user_rework_unreviewed(store, wo):
+                blockers.append(USER_REWORK_UNREVIEWED_BLOCKER)
+            elif user_rework_refused(store, wo):
+                blockers.append(USER_REWORK_REFUSED_BLOCKER)
+            else:
+                blockers.append(VALIDATION_STUCK_BLOCKER)
         # 3. The landing refused to complete it over code that is on nothing but its own
         #    branch (`ops.park_unlanded`, GitHub issue #232). Above the idle line and
         #    not merged into it, because they are opposite facts about the same status:
@@ -1796,12 +1844,45 @@ def user_rework_refused(store: ProjectStore, wo: dict[str, Any]) -> bool:
     round carrying `ops.USER_REWORK_CAUSE` is one a user rejection bought, and a
     rejection of it with the counted budget spent is a different piece of news from the
     ordinary give-up (Neo question 973, live case wo-299daf2e).
+
+    THE FAMILY IS PART OF THE RULE and the round row cannot answer it: the condition that
+    escalated the round lives in the `validation_escalated` payload, so the row alone made
+    every `not_reviewed` escalation claim a panel refusal (GitHub issue 1106, spec
+    docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md
+    §1). THE MAPPING IS A BINARY SPLIT: `not_reviewed` is the only family that gets
+    `USER_REWORK_UNREVIEWED_BLOCKER`; `handover` is the judged-and-refused family and
+    keeps this sentence, and so do `unjudged` and `unrecorded` — issue 1106 prescribes
+    only the `not_reviewed` split, so moving them would be a behaviour change nobody
+    asked for.
+    """
+    family = _escalated_user_rework_family(store, wo)
+    return bool(family) and family != "not_reviewed"
+
+
+def user_rework_unreviewed(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """The same round with NO seat's opinion on it — `USER_REWORK_UNREVIEWED_BLOCKER`.
+
+    `user_rework_refused`'s sibling and the ONLY family it gives up: `not_reviewed` means
+    a round opened and nothing judged the submission (GitHub issue 1106, spec
+    docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md
+    §1).
+    """
+    return _escalated_user_rework_family(store, wo) == "not_reviewed"
+
+
+def _escalated_user_rework_family(store: ProjectStore, wo: dict[str, Any]) -> str:
+    """The escalation family of the latest round IF a user rejection bought it, else ``""``.
+
+    Keyed on the round's `id` and not its number, for `ops.escalation_cause`'s reason.
     """
     from . import ops as ops_mod
 
     latest = store.latest_validation_round(wo_id=wo["id"])
-    return bool(latest and latest["outcome"] == "escalated"
-                and str(latest["uncounted_cause"] or "") == ops_mod.USER_REWORK_CAUSE)
+    if not (latest and latest["outcome"] == "escalated"
+            and str(latest["uncounted_cause"] or "") == ops_mod.USER_REWORK_CAUSE):
+        return ""
+    cause = ops_mod.escalation_cause(store, wo_id=wo["id"], round_id=int(latest["id"]))
+    return ops_mod.ESCALATION_FAMILY.get(cause, "")
 
 
 def dead_dependencies(store: ProjectStore, wo: dict[str, Any]) -> list[dict[str, Any]]:

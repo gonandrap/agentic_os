@@ -520,7 +520,8 @@ def test_catalog_exposes_the_budget(jarvis_home):
                                 "knowledge_digest_chars": 300}, "projects": []})
     assert (cat.os.knowledge_inject_limit, cat.os.knowledge_digest_limit,
             cat.os.knowledge_digest_chars) == (2, 7, 300)
-    assert OsConfig().knowledge_digest_limit == 40
+    assert OsConfig().knowledge_digest_limit == 8
+    assert OsConfig().knowledge_pinned_chars == 360
 
 
 # -- `jarvis learn search` is an index, not a payload ------------------------------------

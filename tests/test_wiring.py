@@ -49,9 +49,12 @@ def test_the_shipped_default_wires_everything_and_writes_nothing(project, jarvis
     """The whole opt-out promise in one assertion: a project that never opens /config
     launches the session it launched before this block existed."""
     settings = _settings(project, WiringConfig())
-    for key in ("disableClaudeAiConnectors", "disableBundledSkills",
-                "enabledPlugins", "skillOverrides"):
+    for key in ("disableClaudeAiConnectors", "enabledPlugins", "skillOverrides"):
         assert key not in settings, f"{key} reached a worker at the shipped default"
+    # Claude Code's own bundled skills are the one default-off source (docs/os/architecture/worker-context.md).
+    assert settings["disableBundledSkills"] is True
+    from jarvis.catalog import DEFAULT_WORKER_DENIED_TOOLS
+    assert set(DEFAULT_WORKER_DENIED_TOOLS) <= set(settings["permissions"]["deny"])
     assert settings["env"]["JARVIS_SERENA"] == "1"
     assert set(serena_allow_rules()) <= set(settings["permissions"]["allow"])
 
@@ -362,7 +365,8 @@ def test_every_source_gets_the_lever_that_can_actually_unwire_it(monkeypatch, tm
     # A plugin the USER has turned off is not Jarvis's to list as wired.
     assert "off@m" not in levers
     # Unwiring the plugin unwires the server it provides — one lever, both rows.
-    applied = wiring.applied(WiringConfig(disabled_plugins=(SERENA,)), inv)
+    applied = wiring.applied(WiringConfig(bundled_skills=True,
+                                          disabled_plugins=(SERENA,)), inv)
     assert {i.name for i in applied.unwired} == {SERENA, "plugin:serena:serena"}
 
 

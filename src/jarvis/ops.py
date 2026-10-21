@@ -9986,7 +9986,7 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
     is the project's and not the order's, so the caller hoists it and only the CLIP is per
     candidate.
     """
-    from . import bus, holds, stuck, worker_session
+    from . import budget, bus, holds, stuck, worker_session
     from .central_store import base_red_hold_spans
     from .health import observer_kinds
     from .project_store import (FO_ID_PREFIXES, PLAN_ASSUMPTION_EVENT_KINDS,
@@ -10013,6 +10013,19 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         spans = holds.held(pstore, wo["id"], now=now)
         since = durations.current_status_since
         usage = [h for h in spans if h.cause == PAUSE_USAGE_LIMIT]
+        # AN ORDER AT ITS BUDGET CAP IS NOT STUCK (§2 of docs/superpowers/specs/
+        # 2026-10-20-a-work-order-at-its-budget-cap-is-not-stuck.md). `holds._OPEN` maps
+        # `budget_exhausted` to `holds.BUDGET`, so the span is read off `spans` above
+        # and needs no new read. WHILE THE STATUS STANDS AND NEVER AFTER:
+        # `_resume_after_budget` writes `budget_resumed` only on its one fully
+        # successful path, so on the other four the episode is still OPEN once the
+        # status has moved on, and an ungated union would discount the whole new status
+        # span for ever. kn-6e30d561 wants the discount to outlive the exclusion; here
+        # the status-span RESET does that — `since` moves to the raise, so the parked
+        # hours are not in the window being judged.
+        budget_spans = ([(max(h.started, since), min(h.finish(now), now))
+                         for h in spans if h.cause == holds.BUDGET]
+                        if wo["status"] == budget.EXHAUSTED else [])
         # A ROUND WAITING FOR GITHUB'S CHECKS IS NOT STUCK (§1 and §3 of
         # docs/superpowers/specs/2026-10-12-a-validation-round-waiting-for-ci-is-not-stuck.md).
         # `validating` ONLY: a round runs in parallel with `needs_review`, which is a wait
@@ -10055,11 +10068,11 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                     sorted((e for k in PLAN_ASSUMPTION_EVENT_KINDS
                             for e in pstore.events_of_kind(str(planner_id), k)),
                            key=lambda e: float(e["ts"])), since, now)
-        # The UNION and never the sum: a usage window can shut while CI runs (§4), or
-        # while the base is red.
+        # The UNION and never the sum: a usage window can shut while CI runs (§4),
+        # while the base is red, or while an order sits at its budget cap.
         discounted = holds.union_seconds(
             [(max(h.started, since), min(h.finish(now), now)) for h in usage]
-            + ci_spans + base_red_spans + plan_spans)
+            + ci_spans + base_red_spans + plan_spans + budget_spans)
         # §2.2 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md.
         edges = (pstore.unfinished_dependencies(wo["id"])
                  if wo["status"] == "pending" else [])
@@ -10091,6 +10104,13 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                             else VALIDATION_CI_CAUSE if ci_held
                             else stuck.BASE_RED_CAUSE
                             if base_red and wo["status"] == "waiting_pr_merge"
+                            # DOCUMENTARY, not load-bearing (§3 of the 2026-10-20
+                            # spec): a collision is impossible by construction except
+                            # with the fleet usage window above — the other arms are
+                            # scoped to `validating`, `waiting_pr_merge` and `pending`,
+                            # and an order has one status.
+                            else stuck.BUDGET_CAP_CAUSE
+                            if wo["status"] == budget.EXHAUSTED
                             else stuck.LIVE_DEPENDENCY if live_edges
                             # LAST in the chain, §2.4: a fleet fact outranks a fact
                             # about one feature's plan.
@@ -10302,12 +10322,10 @@ def submit_verdict(inv_id: str, doc: Any,
     * **The duplicate check happens HERE**, before anything is filed. A prompt
       instruction cannot be verified and a search in `ops` can be tested; #792
       duplicating #790 is the standing proof that the diligent version fails.
-    * **A GAP files an EXPEDITED bug** — `bugreport.report_bug(..., expedite=True)`,
+    * **A GAP files a bug, NOT expedited** — `bugreport.report_bug(..., expedite=False)`,
       called as a Python function and not by an agent shelling out, so the route cannot
-      skip the check above. THE CASCADE IS INTENDED and is the highest-consequence thing
-      in this feature: per kn-efaad866 and kn-ffb94e3a that files the issue, dispatches a
-      work order on it and ships a release when the fix lands. A fix that lands without
-      shipping leaves production broken, which is what every issue in §1.1 was.
+      skip the check above. It files the issue ONLY: the user picks it up with
+      `jarvis issues start` (os.autonomy.self_dispatch).
     * **Attention for `WAITING_ON_USER` only**, raised HERE at the transition and never
       re-derived on a tick (kn-089de524). A FILING FAILURE also raises it, and is not a
       classification: `gh` unreachable keeps the order `planning` so the verdict can be
@@ -10374,14 +10392,14 @@ def submit_verdict(inv_id: str, doc: Any,
                     actual=verdict["proposed_fix"]["actual"],
                     priority=verdict["proposed_fix"]["priority"],
                     project=name, wo_id=fo.get("plan_wo_id") or "",
-                    expedite=True)
+                    expedite=False)  # file only: the user picks it up (os.autonomy)
             except Exception as e:  # noqa: BLE001 — same case, one step later
                 filing_error = f"the bug could not be filed: {e}"
             else:
                 verdict["filed"] = {
                     "issue_url": filed.get("url"),
                     "wo_id": (filed.get("pickup") or {}).get("wo_id"),
-                    "expedited": True,
+                    "expedited": False,
                 }
 
     if filing_error:

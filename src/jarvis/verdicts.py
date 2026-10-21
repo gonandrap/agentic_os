@@ -269,7 +269,7 @@ def _parse_fix(raw: Any, problems: list[str]) -> dict[str, str]:
     if not isinstance(raw, dict):
         problems.append(
             f"a GAP verdict must carry `proposed_fix`, an object with "
-            f"{', '.join(PROPOSED_FIX_FIELDS)} — ops files it as an expedited bug, and "
+            f"{', '.join(PROPOSED_FIX_FIELDS)} — ops files it as a bug, and "
             f"nothing else in the verdict says what to file"
         )
         return {}

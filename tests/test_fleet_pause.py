@@ -234,3 +234,7 @@ def test_a_window_that_lasted_clears_the_breaker(os_up):
     fleet.announce(central, state)
 
     assert not central.get_state(fleet.BREAKER_KEY)
+
+
+# Written for the opt-in OS (os.autonomy.self_dispatch on, stuck sweep on).
+pytestmark = pytest.mark.usefixtures("self_dispatch_on")

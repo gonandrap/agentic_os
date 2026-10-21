@@ -1690,7 +1690,8 @@ def build_parser() -> argparse.ArgumentParser:
     # A SCHEDULING DECISION, kept out of --priority on purpose: the rating stays an
     # honest description of the defect (`issues.route_filing`).
     br.add_argument("--expedite", action="store_true",
-                    help="work on it NOW, whatever the priority: the issue is filed as "
+                    help="(the USER only — ignored inside a work-order session) "
+                         "work on it NOW, whatever the priority: the issue is filed as "
                          "usual and a work order is dispatched on it immediately, "
                          "instead of waiting on the tracker (or, for critical/blocker, "
                          "on Neo's re-assessment — which still runs and still settles "
@@ -5741,6 +5742,8 @@ def cmd_bug(args: argparse.Namespace) -> int:
                         expected=args.expected, actual=args.actual, steps=args.steps,
                         priority=args.priority, expedite=args.expedite,
                         project=args.project, wo_id=args.wo_id)
+    if result.get("note"):
+        print(f"note: {result['note']}", file=sys.stderr)
     if args.json:
         _print(result, True)
     else:

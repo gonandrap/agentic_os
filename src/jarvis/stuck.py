@@ -50,6 +50,9 @@ BASE_RED_CAUSE = "the default branch is red"
 #: plan-is-not-stuck.md.
 PLAN_ASSUMPTION_CAUSE = "its feature's unratified plan"
 
+#: §1 of docs/superpowers/specs/2026-10-20-a-work-order-at-its-budget-cap-is-not-stuck.md.
+BUDGET_CAP_CAUSE = "its budget cap"
+
 #: One sentence per cause, because the shipped one is false for both of the above: an
 #: exempt kind never clears, and a manager's hold clears when its feature speaks rather
 #: than by itself. `{cause}` and `{kind}` are the only slots.
@@ -73,6 +76,12 @@ EXCLUSION_REASON: Mapping[str, str] = {
                             "plan is ratified, and only you can ratify it — "
                             "`jarvis wo review <planner-id>` on the feature's planner "
                             "is what clears it, so nothing is judged while it stands"),
+    # §1 of the 2026-10-20 spec: the shipped sentence is FALSE here too — the OS
+    # launches no turn it cannot pay for, and only the user funds another.
+    BUDGET_CAP_CAUSE: ("the OS launches no turn it cannot pay for, and only you can "
+                       "fund another — `jarvis wo budget <id> <amount>` is what clears "
+                       "it, and closing the order is the other answer, so nothing is "
+                       "judged while it stands"),
 }
 
 #: The usage window's sentence, and the answer for any hold added later: all five of §2's
@@ -141,7 +150,11 @@ def assess(status: str, seconds_in_status: float, seconds_since_activity: float,
     the timeline while its tools run (§1 of the 2026-10-14 spec). So does a
     `waiting_pr_merge` order whose auto-merge the OS is itself holding because the default
     branch is red (`BASE_RED_CAUSE`, §1 of
-    docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md).
+    docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md). So
+    does an order parked at its budget cap (`BUDGET_CAP_CAUSE`, §1 of
+    docs/superpowers/specs/2026-10-20-a-work-order-at-its-budget-cap-is-not-stuck.md):
+    that one clears only when the user raises the cap, and nothing is hidden by it —
+    the order keeps its attention flag and `invariants.true_blockers` names the money.
 
     That CI one is an EXTENSION of kn-6e836793 (the user's 2026-09-27 ruling that the
     usage hold was the only one) on the record rather than a silent widening — the
