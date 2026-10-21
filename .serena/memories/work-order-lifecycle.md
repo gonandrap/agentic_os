@@ -116,6 +116,9 @@ to remove a ruling from the map as well as the payload. Workers cash an id in wi
 `jarvis learn show|search|list|topics`. Prompt cost is therefore flat in the size of the base;
 the worker that needs an entry pays one tool call for it.
 
+**Starting-context budget (10K est. tokens for Jarvis's share)** and the one OKF playbook
+per order (`os_map.brief_block`, bundle `docs/os/`): `docs/os/architecture/worker-context.md`.
+
 **Worktree**: turn 1 runs with `cwd=project.path` + `--worktree <wo-id>`; later turns run
 with `cwd=<that worktree>` and no flag (transcripts are keyed by creation cwd).
 

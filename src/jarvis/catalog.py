@@ -54,6 +54,8 @@ SAFETY_KEYS = (
     # the same act at two magnitudes — and a change here is invisible until the morning
     # it starts spending. docs/superpowers/specs/2026-09-14-the-scheduler.md §2.
     "*.schedule.*",
+    # Files work nobody typed: same class of act as the scheduler.
+    "os.autonomy.*",
     # What the OS is permitted to WATCH — and, once §6 of
     # docs/superpowers/specs/2026-09-27-self-evolution.md lands, the switch everything
     # it is permitted to DO about what it watched hangs off. It is here at the WATCHING stage
@@ -283,6 +285,10 @@ DEFAULT_WORKER_MCP_TOOL_TIMEOUT_MS = 300_000
 # Under a second is a typo — it would make every MCP call in the project fail — and it
 # arrives through `jarvis config set`, so it is refused where the message can name the key.
 WORKER_MCP_TOOL_TIMEOUT_MS_MIN = 1000
+
+#: Built-in tools a one-shot headless turn cannot use, removed from its tool list by deny rule (docs/os/architecture/worker-context.md).
+DEFAULT_WORKER_DENIED_TOOLS = ("Workflow", "ScheduleWakeup", "ReportFindings",
+                               "ListAgents", "Agent(statusline-setup)")
 
 
 def _parse_budget(raw: dict[str, Any], key: str, where: str,
@@ -527,6 +533,7 @@ class WorkerDefaults:
     # What one MCP tool call may take, in milliseconds — see
     # DEFAULT_WORKER_MCP_TOOL_TIMEOUT_MS and issue #845.
     mcp_tool_timeout_ms: int = DEFAULT_WORKER_MCP_TOOL_TIMEOUT_MS
+    denied_tools: tuple[str, ...] = DEFAULT_WORKER_DENIED_TOOLS
 
 
 # The validation panel's default roster: every seat in the vocabulary. Unlike Neo's
@@ -1061,10 +1068,8 @@ class UiHealthConfig:
 # -- `fleet_health`: when an order that has stopped moving gets investigated. §4 of
 # docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md.
 
-#: Ships ON. The sweep makes no model call — its whole cost is indexed reads — and the
-#: spend it can authorise is rationed twice over, by `max_per_day` and by
-#: `worker.investigation_budget_usd`.
-DEFAULT_FLEET_HEALTH_ENABLED = True
+#: Ships OFF: every investigation it opens is spend nobody typed (os.autonomy).
+DEFAULT_FLEET_HEALTH_ENABLED = False
 
 #: Minutes in status before one open status is over threshold. THE FIGURE IS THE USER'S,
 #: 2026-10-01: five minutes of idle — no tool call, no script running, no usage-limit hold
@@ -1419,12 +1424,7 @@ DEFAULT_BUGS_LABEL = "in progress"
 class BugsConfig:
     """How the tracker is labelled while the OS works on a bug it filed.
 
-    WHAT IS NOT HERE IS THE POINT. There is no `auto_work_order` switch: routing is by
-    priority and only by priority (the user's ruling of 2026-09-14 settling issue #240's
-    decision A), and what stops a filing committing the fleet to work is the rubric
-    (`issues.PRIORITY_RUBRIC`) plus Neo re-assessing every `critical`/`blocker` claim —
-    not a catalog key. A key that shipped off would have made that ruling's own
-    "critical and blocker automatically get a work order" unreachable.
+    Whether a confirmed claim dispatches at all is `os.autonomy.self_dispatch` (ships off).
 
     `label` is the whole of the in-progress signal: nothing derives it, and an issue
     carries it exactly while a live work order is on it (`issues.desired_state`). The
@@ -1451,6 +1451,22 @@ class ReleaseConfig:
     """
 
     refile_window_days: int = DEFAULT_RELEASE_REFILE_WINDOW_DAYS
+
+
+@dataclass
+class AutonomyConfig:
+    """Whether the OS may create orders nobody typed (bug pickups, riders, red-main fixes, releases)."""
+
+    self_dispatch: bool = False
+
+
+def _parse_autonomy(raw: Any) -> AutonomyConfig:
+    if not isinstance(raw, dict):
+        raise _err('"os.autonomy" must be an object')
+    value = raw.get("self_dispatch", False)
+    if not isinstance(value, bool):
+        raise _err(f"os.autonomy.self_dispatch must be true or false, got {value!r}")
+    return AutonomyConfig(self_dispatch=value)
 
 
 @dataclass
@@ -1528,7 +1544,8 @@ class WiringConfig:
     """
 
     claude_ai_connectors: bool = True
-    bundled_skills: bool = True
+    # Off by default: CLI-shipped skills (dataviz, loop, …) cost ~1.6K tokens per worker start.
+    bundled_skills: bool = False
     #: `<plugin>@<marketplace>` ids, as `claude plugin list` spells them.
     disabled_plugins: tuple[str, ...] = ()
     #: Skill names — user and project skills only. A PLUGIN's skills follow their
@@ -1927,8 +1944,9 @@ class OsConfig:
     # Knowledge reaches workers as an index they query on demand, so prompt cost stays
     # flat as the base grows. Only entries tagged `pinned` are pasted in full.
     knowledge_inject_limit: int = 8      # max pinned entries injected verbatim
-    knowledge_digest_limit: int = 40     # max index lines
-    knowledge_digest_chars: int = 4000   # hard char budget for those lines
+    knowledge_digest_limit: int = 8      # max index lines
+    knowledge_digest_chars: int = 1000   # hard char budget for those lines
+    knowledge_pinned_chars: int = 360    # per pinned entry; the rest is `jarvis learn show`
     # Entries matching the work order's own TITLE, surfaced as a pointer into the overflow.
     # A budget of its own, deliberately small and never taken out of the digest's: hints
     # eating the index would make the same base produce a different index size per title,
@@ -1954,6 +1972,7 @@ class OsConfig:
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     wiring: WiringConfig = field(default_factory=WiringConfig)
     worktree: WorktreeConfig = field(default_factory=WorktreeConfig)
+    autonomy: AutonomyConfig = field(default_factory=AutonomyConfig)
 
 
 @dataclass
@@ -3125,8 +3144,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         compact_min_context=_compact_min_context_or_err(os_raw),
         max_os_prompt_chars=_max_os_prompt_chars_or_err(os_raw),
         knowledge_inject_limit=int(os_raw.get("knowledge_inject_limit", 8)),
-        knowledge_digest_limit=int(os_raw.get("knowledge_digest_limit", 40)),
-        knowledge_digest_chars=int(os_raw.get("knowledge_digest_chars", 4000)),
+        knowledge_digest_limit=int(os_raw.get("knowledge_digest_limit", 8)),
+        knowledge_digest_chars=int(os_raw.get("knowledge_digest_chars", 1000)),
+        knowledge_pinned_chars=int(os_raw.get("knowledge_pinned_chars", 360)),
         knowledge_hint_limit=int(os_raw.get("knowledge_hint_limit", 3)),
         knowledge_hint_chars=int(os_raw.get("knowledge_hint_chars", 400)),
         neo=neo_cfg,
@@ -3148,6 +3168,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         schedule=_parse_schedule(os_raw.get("schedule", {})),
         wiring=_parse_wiring(os_raw.get("wiring", {})),
         worktree=_parse_worktree(os_raw.get("worktree", {})),
+        autonomy=_parse_autonomy(os_raw.get("autonomy", {})),
     )
     if os_cfg.default_permission_mode not in VALID_PERMISSION_MODES:
         raise _err(f"os.defaults.permission_mode {os_cfg.default_permission_mode!r} not in {sorted(VALID_PERMISSION_MODES)}")
@@ -3253,6 +3274,11 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
             raise _err(f"project {name}: worker.mcp_tool_timeout_ms must be >= "
                        f"{WORKER_MCP_TOOL_TIMEOUT_MS_MIN} (milliseconds — a ceiling "
                        f"under a second would fail every MCP call), got {mcp_timeout}")
+        denied_tools = w.get("denied_tools", list(DEFAULT_WORKER_DENIED_TOOLS))
+        if (not isinstance(denied_tools, list)
+                or not all(isinstance(t, str) and t for t in denied_tools)):
+            raise _err(f"project {name}: worker.denied_tools must be a list of tool "
+                       f"names, got {denied_tools!r}")
         worker = WorkerDefaults(
             model=w.get("model") or p.get("model") or os_cfg.default_model,
             effort=w.get("effort", os_cfg.default_effort),
@@ -3284,6 +3310,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                                        DEFAULT_INVESTIGATION_EFFORT),
             require_crew=require_crew,
             mcp_tool_timeout_ms=mcp_timeout,
+            denied_tools=tuple(denied_tools),
         )
         try:
             gate_cfg = GateConfig.parse(p.get("gates"))

@@ -443,6 +443,7 @@ def test_the_outstanding_child_label_raises_no_attention_flag(boot, store):
     assert not store.get_work_order(manager["id"])["needs_attention"]
 
 
+@pytest.mark.usefixtures("self_dispatch_on")  # the stuck sweep ships off (os.autonomy)
 def test_the_sweeps_brief_names_the_child(boot, store):
     """The sweep printed "nothing the record can name" over a record that named
     wo-d2d777dc, and that string reached the investigator verbatim."""

@@ -179,7 +179,10 @@ def test_a_planner_runs_on_ordinary_worker_permissions(planning, store, project)
 
     allow = settings["permissions"]["allow"]
     assert any(r.startswith("Write(") and planner_id in r for r in allow)
-    assert not settings["permissions"].get("deny")
+    # The only denies are the schema-trimming defaults (worker.denied_tools), none of
+    # which touches writing a file.
+    from jarvis.catalog import DEFAULT_WORKER_DENIED_TOOLS
+    assert set(settings["permissions"].get("deny", [])) <= set(DEFAULT_WORKER_DENIED_TOOLS)
 
 
 def test_a_planner_is_not_created_twice(planning, store):

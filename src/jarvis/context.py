@@ -58,6 +58,11 @@ MAX_BYTES = 4_000_000
 #: The inferred row's name, fixed so a reader can find it across turns.
 RESIDUAL = "claude_code_base"
 
+#: What Jarvis may put in a worker's window before it does any work (docs/os/architecture/worker-context.md).
+START_BUDGET_TOKENS = 10_000
+START_INGREDIENTS = ("append_system_prompt", "worker_prompt", "knowledge_index",
+                     "memory_files", "session_start_context")
+
 
 def caps() -> dict[str, int]:
     """The ceilings this measurement ran under — on the payload, not only in the code."""
@@ -232,6 +237,7 @@ def measure(project: Any, wo: dict[str, Any], turn: dict[str, Any],
                      note=why or "the --settings file: hooks, permissions, env"))
 
     rows.append(_memory_row(project, wo, turn))
+    rows.append(_session_start_row(project, wo, turn))
     rows.append(_agent_row(briefing))
     rows.append(_add_dirs_row(briefing))
     rows.append(_mcp_row(project))
@@ -269,6 +275,33 @@ def _memory_row(project: Any, wo: dict[str, Any],
                      "them")
 
 
+def session_start_text(serena: bool, cwd: Path) -> str:
+    """The `additionalContext` Jarvis's SessionStart hook injects, composed as the hook does."""
+    from . import concision, hooks
+
+    text = concision.house_style()
+    return text + hooks.serena_activation_context(cwd) if serena else text
+
+
+def _session_start_row(project: Any, wo: dict[str, Any],
+                       turn: dict[str, Any]) -> dict[str, Any]:
+    from . import wiring
+
+    text = session_start_text(wiring.serena_wired(project.wiring),
+                              _worktree_cwd(project, wo, turn))
+    return _row("session_start_context", _text_bytes(text),
+                note="the house style and Serena activation the SessionStart hook "
+                     "injects on every turn")
+
+
+def start_budget(ingredients: list[dict[str, Any]]) -> dict[str, Any]:
+    """Jarvis's share of a worker's starting window against START_BUDGET_TOKENS."""
+    tokens = sum(int(r["tokens"]) for r in ingredients
+                 if r.get("name") in START_INGREDIENTS and r.get("tokens") is not None)
+    return {"tokens": tokens, "budget": START_BUDGET_TOKENS,
+            "over": tokens > START_BUDGET_TOKENS}
+
+
 def _agent_row(briefing: dict[str, Any]) -> dict[str, Any]:
     name = briefing.get("agent")
     if not name:
@@ -302,8 +335,9 @@ def _add_dirs_row(briefing: dict[str, Any]) -> dict[str, Any]:
 def payload(project: Any, wo: dict[str, Any], turn: dict[str, Any],
             briefing: dict[str, Any], knowledge: Any = None) -> dict[str, Any]:
     """What `record` stores: the measurement plus everything needed to read it back."""
+    ingredients = measure(project, wo, turn, briefing, knowledge)
     return {"schema": SCHEMA, "caps": caps(), "token_bytes": TOKEN_BYTES,
-            "ingredients": measure(project, wo, turn, briefing, knowledge)}
+            "ingredients": ingredients, "start_budget": start_budget(ingredients)}
 
 
 # The meter wraps the WHOLE function, gate guard included: an order running at `off` still

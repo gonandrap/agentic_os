@@ -421,6 +421,12 @@ def _fast_probe(monkeypatch, **kw) -> None:
     monkeypatch.setattr(ops, "ui_health_config", lambda project=None: cfg)
 
 
+def _release_and_drain(gate, futs) -> None:
+    """Open the gate, then let every in-flight request finish before the client closes."""
+    gate.set()
+    cf.wait(futs, timeout=30)
+
+
 def _limiter(client) -> dict:
     return client.get("/healthz").json()["limiter"]
 
@@ -440,16 +446,16 @@ def test_the_pool_can_be_saturated_deterministically(started, monkeypatch):
     _fast_probe(monkeypatch)
     gate = threading.Event()
     pool = cf.ThreadPoolExecutor(max_workers=64)
+    futs: list = []
     try:
         with TestClient(_wedge_app(gate)) as client:
             try:
                 total = _limiter(client)["total"]
-                for _ in range(total):
-                    pool.submit(client.get, "/_wedge")
+                futs.extend(pool.submit(client.get, "/_wedge") for _ in range(total))
                 assert _wait_until(lambda: _limiter(client)["borrowed"] == total)
                 assert _limiter(client)["available"] == 0
             finally:
-                gate.set()
+                _release_and_drain(gate, futs)
     finally:
         pool.shutdown(wait=False)
 
@@ -461,12 +467,12 @@ def test_healthz_answers_while_the_pool_is_wedged_and_a_sync_route_cannot(
     _fast_probe(monkeypatch)
     gate = threading.Event()
     pool = cf.ThreadPoolExecutor(max_workers=64)
+    futs: list = []
     try:
         with TestClient(_wedge_app(gate)) as client:
             try:
                 total = _limiter(client)["total"]
-                for _ in range(total):
-                    pool.submit(client.get, "/_wedge")
+                futs.extend(pool.submit(client.get, "/_wedge") for _ in range(total))
                 assert _wait_until(lambda: _limiter(client)["borrowed"] == total)
                 assert _wait_until(
                     lambda: client.get("/healthz").json()["pool_healthy"] is False)
@@ -483,10 +489,11 @@ def test_healthz_answers_while_the_pool_is_wedged_and_a_sync_route_cannot(
                 assert body["probe_failure_reason"] == "pool_timeout"
 
                 control = pool.submit(client.get, "/_sync_control")
+                futs.append(control)
                 with pytest.raises(cf.TimeoutError):
                     control.result(timeout=3)
             finally:
-                gate.set()
+                _release_and_drain(gate, futs)
     finally:
         pool.shutdown(wait=False)
 
@@ -497,15 +504,15 @@ def test_a_trip_dumps_every_threads_stack_and_stamps_the_wedge(started, monkeypa
     _fast_probe(monkeypatch)
     gate = threading.Event()
     pool = cf.ThreadPoolExecutor(max_workers=64)
+    futs: list = []
     try:
         with TestClient(_wedge_app(gate)) as client:
             try:
                 total = _limiter(client)["total"]
-                for _ in range(total):
-                    pool.submit(client.get, "/_wedge")
+                futs.extend(pool.submit(client.get, "/_wedge") for _ in range(total))
                 assert _wait_until(lambda: uilog.read_wedge() is not None, timeout=30)
             finally:
-                gate.set()
+                _release_and_drain(gate, futs)
     finally:
         pool.shutdown(wait=False)
 
@@ -548,12 +555,12 @@ def test_a_wedge_that_never_saturates_the_pool_still_trips(started, monkeypatch)
 
     lock.acquire()
     pool = cf.ThreadPoolExecutor(max_workers=16)
+    futs: list = []
     try:
         with TestClient(app) as client:
             try:
                 total = _limiter(client)["total"]
-                for _ in range(11):
-                    pool.submit(client.get, "/_lockwait")
+                futs.extend(pool.submit(client.get, "/_lockwait") for _ in range(11))
                 assert _wait_until(
                     lambda: client.get("/healthz").json()["wedged"] is True,
                     timeout=15), "/healthz never reported wedged on an unsaturated pool"
@@ -569,6 +576,7 @@ def test_a_wedge_that_never_saturates_the_pool_still_trips(started, monkeypatch)
                 assert _wait_until(lambda: uilog.read_wedge() is not None, timeout=15)
             finally:
                 lock.release()
+                cf.wait(futs, timeout=30)
     finally:
         pool.shutdown(wait=True)
 

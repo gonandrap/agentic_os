@@ -245,3 +245,7 @@ def test_malformed_metadata_never_breaks_a_briefing(started, project, catalog_fi
     wo = dict(ops.create_work_order("proj_a", "ordinary task"), metadata=metadata)
     spec = load_catalog(catalog_file).projects[0]
     assert "PRE-APPROVED" not in build_worker_prompt(wo, spec, knowledge=[])
+
+
+# Written for the opt-in OS (os.autonomy.self_dispatch on, stuck sweep on).
+pytestmark = pytest.mark.usefixtures("self_dispatch_on")

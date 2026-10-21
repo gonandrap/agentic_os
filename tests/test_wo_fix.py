@@ -1497,3 +1497,7 @@ def test_a_crafted_pending_query_puts_no_words_on_the_page(client, catalog_file,
     assert "still pending" not in page.text
     assert "is filed and a reviewer decides it" not in page.text
     assert crafted not in page.text
+
+
+# Written for the opt-in OS (os.autonomy.self_dispatch on, stuck sweep on).
+pytestmark = pytest.mark.usefixtures("self_dispatch_on")

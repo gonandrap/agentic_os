@@ -319,3 +319,7 @@ def test_every_signal_spelling_reaches_the_same_branch(fleet, rc):
         assert _killed_events(store, wo["id"])[0]["rc"] == rc
     finally:
         store.close()
+
+
+# Written for the opt-in OS (os.autonomy.self_dispatch on, stuck sweep on).
+pytestmark = pytest.mark.usefixtures("self_dispatch_on")
