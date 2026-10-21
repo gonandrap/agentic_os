@@ -847,6 +847,7 @@ def _refusal_inbox(wo_id: str) -> list[dict]:
 
 def _oversized_confirmation(started, monkeypatch):
     """A parked order whose confirmation question is past the ceiling"""
+    monkeypatch.setattr(ops, "_concision_cap", lambda *_: 0)  # stored before the cap existed
     store, wo = park(started, auto_review=True,
                      assumptions=(_huge_assumption(),))
     provisional(store, wo)

@@ -7568,6 +7568,8 @@ def _cited_blocks(project: str, path: Path, wo: dict[str, Any], text: str) -> st
     from . import autoreview
     from .neo_store import NeoStore
 
+    if not (autoreview.cited_question_ids(text) or autoreview.cited_sibling_ns(text)):
+        return ""
     store = ProjectStore(path)
     try:
         siblings = store.all_assumptions(wo["id"]) or []

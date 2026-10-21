@@ -16,8 +16,8 @@ def assume_shape(wo_id: str, *, tail: str = "", cite_spec: bool = True) -> str:
     return (
         f"- `jarvis wo assume {wo_id} \"...\"`: ONE DECISION you made with NO doubt "
         f"— choice, rejected alternative, why; ≤{DEFAULT_ASSUME_MAX_CHARS} "
-        f"chars; a second decision is a second `jarvis wo assume` citing the "
-        f"first (`per Q1234`, `per assumption #2`)."
+        f"chars; a second decision is a second `jarvis wo assume` citing it "
+        f"(`per Q1234`/`per assumption #2`)."
         # Dropped in the CORE only: `CORE_BUDGET_CHARS` leaves no room for it there
         + (f" Cite a spec BY SECTION the same way (e.g. `{SECTION_FORM}`), never by "
            f"pasting it and never by naming a whole document." if cite_spec else "")
@@ -149,8 +149,8 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
         f"`[{wo_id}] {title[:40]}`. `gh pr create` with any other title is blocked.",
         f"- **Neo is your first responder. Any doubt goes to it.** "
         f"`jarvis wo ask {wo_id} \"<your question>\"`, then END YOUR TURN; the "
-        f"answer arrives as your next user turn, usually within a minute. This is "
-        f"normal: it is not an escalation and it does not "
+        f"answer arrives as your next user turn, usually within a minute. "
+        f"Normal: it is not an escalation and it does not "
         f"interrupt the user. The trigger is DOUBT, not importance — if you catch "
         f"yourself weighing options or thinking \"either would work\", you are in "
         f"doubt: Ask BEFORE you build on it, not after. A question is one "

@@ -971,7 +971,7 @@ def test_neo_tab_review_flow(client, daemon, project):
 
 #: A question of the shape that made this necessary (#53)
 LONG_QUESTION = ("Should the exporter emit CSV or JSON, given the constraints below? "
-                 * 30)
+                 * 25)
 
 
 def test_neo_tab_shortens_an_over_long_question_and_keeps_the_full_text_one_click_away(
