@@ -783,8 +783,7 @@ def test_no_overtaken_note_when_no_child_has_merged(started, store):
 # -- the spec the OS holds travels with the question (issue #746)
 
 
-#: A revision visible in the OUTLINE the review now carries (Neo ruling Q1880): a changed
-#: sentence is invisible there, so the revision adds a heading as well.
+#: A revision visible in the OUTLINE the review now carries (Neo ruling Q1880): a changed sentence is...
 REVISED = (FIXTURE_DESIGN_DOC_BODY.replace("Rows are dicts", "Rows are frozen records")
            + "\n## Frozen records\n\nNew in the revision.\n")
 
@@ -826,7 +825,7 @@ def plan_questions() -> list[dict]:
 
 
 def test_the_question_carries_the_spec_under_its_own_label(planning, store):
-    """1. The reviewer is handed the spec's outline, not the filename it used to go hunting for (Neo ruling Q1880: headings, no body text)"""
+    """1"""
     _, fo = planning
 
     out = ops.submit_plan(fo["id"], a_plan(child("reader")))

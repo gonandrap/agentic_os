@@ -5818,10 +5818,8 @@ class Daemon:
                                         str(p.get("reason") or ""),
                                         int(p.get("round") or 0))):
             return
-        store.add_event(wo_id, "automerge_held", {
-            "code": decision.code, "reason": decision.reason,
-            "judged_sha": decision.judged_sha, "head_sha": decision.head_sha,
-            "round": decision.round_n})
+        # THE PAYLOAD'S SHAPE HAS ONE DEFINITION, `automerge.hold_payload`
+        store.add_event(wo_id, "automerge_held", automerge.hold_payload(decision))
 
     def _warn_automerge_failed(self, project: ProjectSpec, store: ProjectStore,
                                wo: dict, decision: Any, reason: str) -> None:

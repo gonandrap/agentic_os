@@ -57,3 +57,12 @@ the report. Plus 15 mechanism tests in `tests/test_concision_mechanisms.py`.
 
 Design record: `docs/superpowers/specs/2026-09-19-concision-enforced.md`.
 Open calls with reversal criteria: `ASSUMPTIONS.md` 82 and 83.
+
+## 2026-10-21: ponytail replaces i-have-adhd
+
+`i-have-adhd` no longer ships to workers (`assets/skills/` copy deleted; the dashboard
+digest's own copy under `assets/digest/` stays). `ponytail` (verbatim, MIT,
+`assets/skills/ponytail/`) took its slot: house style's `## Scope` section carries its
+`full`-level rules; `concision.REVIEW_SCOPE` carries the reviewer half into every
+validation seat (`validation.build_seat_prompt`) and Neo's assumption persona carries a
+paragraph of it. `caveman` unchanged. `ASSUMPTIONS.md` 86.

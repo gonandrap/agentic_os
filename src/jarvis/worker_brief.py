@@ -600,7 +600,7 @@ def concision_section() -> str:
         "# Point, do not explain",
         "Three surfaces, one rule each. The HOUSE STYLE governs how you write all "
         "three and everything else — it is injected into every turn of your session "
-        "and its rules are your `caveman` and `i-have-adhd` skills "
+        "and its rules are your `caveman` and `ponytail` skills "
         "(docs/superpowers/specs/2026-09-19-concision-enforced.md). This section is "
         "what the style cannot know: which surface holds what.",
         "",

@@ -25,8 +25,14 @@ TURN_IN_FLIGHT_CAUSE = "a worker turn is in flight"
 #: §1 of docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md
 BASE_RED_CAUSE = "the default branch is red"
 
+#: §1 of docs/superpowers/specs/2026-10-20-a-merge-held-for-running-checks-is-not-stuck.md
+AUTOMERGE_CHECKS_CAUSE = "GitHub's checks on the merge commit"
+
 #: §2.1 of docs/superpowers/specs/2026-10-15-a-child-held-by-its-features-unratified-...
 PLAN_ASSUMPTION_CAUSE = "its feature's unratified plan"
+
+#: §2.1 of docs/superpowers/specs/2026-10-19-an-order-held-by-an-open-precondition-is-not-stuck.md
+PRECONDITION_CAUSE = "an open precondition"
 
 #: §1 of docs/superpowers/specs/2026-10-20-a-work-order-at-its-budget-cap-is-not-stuck.md
 BUDGET_CAP_CAUSE = "its budget cap"
@@ -46,11 +52,22 @@ EXCLUSION_REASON: Mapping[str, str] = {
                      "is broken and nothing merges onto a red base — it clears when the "
                      "base goes green, with no decision from you, so nothing is judged "
                      "while that is true"),
+    # §1: the default sentence is TRUE here and still says nothing a reader can act on
+    AUTOMERGE_CHECKS_CAUSE: ("the OS is holding this merge itself: GitHub has not finished "
+                             "running the checks on the commit the panel judged, and "
+                             "nothing merges a commit whose checks have not reported — it "
+                             "clears when they do, with no decision from you, so nothing "
+                             "is judged while that is true"),
     # §2.1: the shipped sentence is FALSE here
     PLAN_ASSUMPTION_CAUSE: ("this child is withheld from dispatch until its feature's "
                             "plan is ratified, and only you can ratify it — "
                             "`jarvis wo review <planner-id>` on the feature's planner "
                             "is what clears it, so nothing is judged while it stands"),
+    # §2.1: the shipped sentence is FALSE here too; both parties clear it
+    PRECONDITION_CAUSE: ("this order was created held until its precondition clears and "
+                         "the row is still open — the OS clears it when it resolves the "
+                         "ref, and `jarvis wo unblock <id>` is how you clear it yourself, "
+                         "so nothing is judged while it stands"),
     # §1 of the 2026-10-20 spec: the shipped sentence is FALSE here too
     BUDGET_CAP_CAUSE: ("the OS launches no turn it cannot pay for, and only you can "
                        "fund another — `jarvis wo budget <id> <amount>` is what clears "

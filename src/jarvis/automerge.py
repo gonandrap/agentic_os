@@ -120,6 +120,19 @@ def _held(code: str, reason: str, **fields: Any) -> Decision:
     return Decision(armed=False, code=code, reason=reason, **fields)
 
 
+def hold_payload(decision: Decision) -> dict[str, Any]:
+    """The `automerge_held` event payload, in ONE place"""
+    return {"code": decision.code, "reason": decision.reason,
+            "judged_sha": decision.judged_sha, "head_sha": decision.head_sha,
+            "round": decision.round_n}
+
+
+def hold_is_live(state: dict[str, Any] | None) -> bool:
+    """Is this `ops.automerge_state` row a hold the OS is making NOW, by the record?"""
+    return bool(state) and state.get("kind") == "automerge_held" \
+        and not state.get("stale")
+
+
 def held_base_moved(catch_up: Any, pr: Any, base_oid: str = "") -> Decision:
     """The hold a refused catch-up produces"""
     from . import ops

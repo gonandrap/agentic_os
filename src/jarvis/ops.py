@@ -2225,7 +2225,7 @@ def fix_flag_notice(flag: str) -> str | None:
 
 
 def assume(wo_id: str, content: str) -> dict[str, Any]:
-    """Record an assumption: DB row + ASSUMPTIONS.md append + conditional review flag (#711); cited sections are resolved and snapshotted HERE (kn-924730d7), N of them in one labelled `spec_text` (Q1883) with `spec_path`/`spec_which` PARALLEL NEWLINE LISTS of all N in the same order (user decision 2026-10-15)"""
+    """Record an assumption: DB row + ASSUMPTIONS.md append + conditional review flag (#711)"""
     from . import sections
     from .invariants import neo_reviews_later
 
@@ -2776,6 +2776,29 @@ AUTOMERGE_EVENTS = ("automerge_merged", "automerge_decided", "automerge_proposed
 
 #: The one event that is TERMINAL: nothing follows a merge
 AUTOMERGE_TERMINAL = "automerge_merged"
+
+
+def automerge_checks_hold_spans(events: Iterable[Any], since: float, now: float,
+                                open_end: float) -> list[tuple[float, float]]:
+    """Every interval inside `[since, now]` the OS held a merge for GitHub's checks (docs/superpowers/specs/2026-10-20-a-merge-held-for-running-checks-is-not-stuck.md §4)"""
+    from . import db
+    from .automerge import HELD_CHECKS_RUNNING
+
+    rows = sorted(events, key=lambda e: float(e["ts"]))
+    spans: list[tuple[float, float]] = []
+    for n, e in enumerate(rows):
+        if str(e["kind"]) != "automerge_held":
+            continue
+        payload = db.from_json(e["payload"], {}) or {}
+        if str(payload.get("code") or "") != HELD_CHECKS_RUNNING:
+            continue
+        nxt = next((r for r in rows[n + 1:] if str(r["kind"]) in AUTOMERGE_EVENTS), None)
+        # Nothing dates the end of an open hold but the horizon (§4)
+        ends = [open_end, now] + ([float(nxt["ts"])] if nxt is not None else [])
+        start, end = max(float(e["ts"]), since), min(ends)
+        if end > start:
+            spans.append((start, end))
+    return sorted(spans)
 
 
 def merge_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
@@ -4414,7 +4437,7 @@ def force_validation_state(store: ProjectStore, wo: dict[str, Any], *, project: 
     refusal = force_validation_refusal(store, wo, project=project, cfg=cfg)
     state: dict[str, Any] = dict(held or {})
     # A STALE HOLD IS TREATED AS NO HOLD (2026-09-27 spec §3): diagnosing from one would say the head...
-    if state.get("kind") != "automerge_held" or state.get("stale"):
+    if not automerge.hold_is_live(state):
         state = {}
     code = str(state.get("code") or "")
     judged = str(state.get("judged_sha") or "")
@@ -6446,8 +6469,8 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
     from .health import observer_kinds
     from .project_store import (FO_ID_PREFIXES, PLAN_ASSUMPTION_EVENT_KINDS,
                                 UNGOVERNED_ORIGINS, VALIDATION_CI_CAUSE,
-                                plan_hold_spans, validation_ci_hold_spans,
-                                validation_hold)
+                                plan_hold_spans, precondition_hold_spans,
+                                validation_ci_hold_spans, validation_hold)
     from .worker_session import PAUSE_USAGE_LIMIT
 
     thresholds = {s: cfg.threshold_seconds(s) for s in cfg.thresholds}
@@ -6482,6 +6505,16 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         # A MERGE THE OS IS ITSELF HOLDING ONTO A RED BASE IS NOT STUCK (§1 and §2 of... (docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md)
         base_red_spans = (base_red_hold_spans(red_episodes, since, now, base_red_until)
                           if wo["status"] == "waiting_pr_merge" else [])
+        # A MERGE THE OS IS ITSELF HOLDING FOR GITHUB'S RUNNING CHECKS IS NOT STUCK (§2 and §3 of...
+        automerge_checks_held, automerge_spans, am_note = False, [], ""
+        if wo["status"] == "waiting_pr_merge":
+            am_note = invariants.automerge_checks_note(automerge_state(pstore, wo))
+            automerge_checks_held = bool(am_note) and base_red_until >= now
+            # `events_of_kind` takes ONE kind
+            automerge_spans = automerge_checks_hold_spans(
+                [e for k in AUTOMERGE_EVENTS
+                 for e in pstore.events_of_kind(wo["id"], k)],
+                since, now, base_red_until)
         # A CHILD HELD BY ITS FEATURE'S UNRATIFIED PLAN IS NOT STUCK (§2.3 and §2.4 of...
         plan_held, plan_spans = False, []
         if (wo["status"] == "pending" and wo.get("parent_id")
@@ -6498,10 +6531,17 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                     sorted((e for k in PLAN_ASSUMPTION_EVENT_KINDS
                             for e in pstore.events_of_kind(str(planner_id), k)),
                            key=lambda e: float(e["ts"])), since, now)
+        # AN ORDER HELD BY AN OPEN PRECONDITION IS NOT STUCK (§2
+        pre_held, pre_spans = False, []
+        if wo["status"] == "pending":
+            pre_held = bool(pstore.open_preconditions(wo["id"]))
+            pre_spans = precondition_hold_spans(
+                pstore.preconditions_of(wo["id"]), since, now)
         # The UNION and never the sum: a usage window can shut while CI runs (§4)
         discounted = holds.union_seconds(
             [(max(h.started, since), min(h.finish(now), now)) for h in usage]
-            + ci_spans + base_red_spans + plan_spans + budget_spans)
+            + ci_spans + base_red_spans + plan_spans + automerge_spans
+            + budget_spans + pre_spans)
         # §2.2 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md
         edges = (pstore.unfinished_dependencies(wo["id"])
                  if wo["status"] == "pending" else [])
@@ -6525,9 +6565,13 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                             else VALIDATION_CI_CAUSE if ci_held
                             else stuck.BASE_RED_CAUSE
                             if base_red and wo["status"] == "waiting_pr_merge"
+                            # AFTER the red base and BEFORE the dependency: both are `waiting_pr_merge`-only and CAN co-occur
+                            else stuck.AUTOMERGE_CHECKS_CAUSE if automerge_checks_held
                             # DOCUMENTARY, not load-bearing (§3 of the 2026-10-20 spec): a collision is impossible by...
                             else stuck.BUDGET_CAP_CAUSE
                             if wo["status"] == budget.EXHAUSTED
+                            # Above both `pending` holds, §3.3 (Neo 1982): `status_label` keeps the same ranking
+                            else stuck.PRECONDITION_CAUSE if pre_held
                             else stuck.LIVE_DEPENDENCY if live_edges
                             # LAST in the chain, §2.4: a fleet fact outranks a fact about one feature's plan
                             else stuck.PLAN_ASSUMPTION_CAUSE if plan_held else ""),
@@ -6540,11 +6584,15 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         blocker = true_blockers(pstore, wo, now=now)
         out.append({
             "project": project_name, "wo": wo, "verdict": verdict,
-            # The outstanding-child note before the empty answer: one formatter shared with `status_label`
+            # The outstanding-child note before the empty answer: one formatter shared with `status_label` The...
             "blocker": (blocker[0] if blocker
                         else invariants.outstanding_children_note(pstore, wo)
+                        or invariants.precondition_note(
+                            pstore.open_preconditions(wo["id"]) if pre_held else [])
                         or invariants.plan_hold_note(
                             pstore.plan_hold(wo) if plan_held else None)
+                        # §5 of the 2026-10-20 spec, after the plan hold, which is `pending`-only and cannot co-occur with it
+                        or am_note
                         or "nothing the record can name"),
             "status_label": invariants.status_label(pstore, wo),
             "since": since, "activity": durations.last_activity_ts or since,
@@ -7423,16 +7471,12 @@ def resume_feature_order(fo_id: str, fix: str = "",
 
 # -- Neo (OS answerer agent)
 
-#: The most ALL referenced sections together may ride to Neo — a TOTAL, never per section (per section, a text citing every heading delivered the whole document); cuts are announced, never silent
+#: The most ALL referenced sections together may ride to Neo
 SECTION_SNAPSHOT_CHARS = 6000
 
 
 def _section_candidates(path: Path, wo: dict[str, Any], ref_path: str) -> list[Path]:
-    """Every place this worker could be naming, in order of authority.
-
-    Split out of `_resolve_section` so a refusal can tell "no such file" from "no such
-    heading" without a second list that could disagree with the resolver's.
-    """
+    """Every place this worker could be naming, in order of authority"""
     candidates = []
     if Path(ref_path).is_absolute():
         candidates.append(Path(ref_path))
@@ -7460,12 +7504,7 @@ def _resolve_section(path: Path, wo: dict[str, Any], ref_path: str,
 
 
 def _water_fill(sizes: list[int], total: int) -> list[int]:
-    """What each block may spend of one `total`: equal share is a FLOOR, a block under its
-    share donates the remainder to the rest, repeated until stable.
-
-    Neo ruling Q1884 ("half is a FLOOR an under-floor block donates its remainder from")
-    generalised from 2 blocks to N. `autoreview._share` is the 2-block case at render time.
-    """
+    """What each block may spend of one `total`: equal share is a FLOOR"""
     allowed = list(sizes)
     open_ = set(range(len(sizes)))
     budget = total
@@ -7483,28 +7522,13 @@ def _water_fill(sizes: list[int], total: int) -> list[int]:
     return allowed
 
 
-#: The in-text form, shown in every refusal below. There is no `--section` flag: the
-#: reference lives inside the sentence (`sections.REF_RE`), and this is its one spelling.
+#: The in-text form, shown in every refusal below
 SECTION_FORM_HINT = 'from section 3 of design doc "docs/superpowers/specs/feature.md": …'
 
 
 def _section_blocks(path: Path, wo: dict[str, Any],
                     text: str) -> list[tuple[str, str, str]]:
-    """Every design-doc section this text cites, resolved: `(path, which, section)`.
-
-    Both `jarvis wo ask` and `jarvis wo assume` resolve through here, so the two verbs
-    cannot drift — user decision 2026-10-14 (Neo learning #102): Neo never receives a
-    full spec, only pointers to specific sections, resolved to those sections' text.
-
-    NO CARDINALITY CAP (Neo ruling Q1883): `validation.assumption_spec_chars` bounds the
-    text, never a count of sections. Two refusals, and each leaves the caller a move: a
-    document named with no section (nothing to resolve), and a reference that does not
-    resolve (the whole file is never substituted, and it is never silently dropped).
-
-    `SECTION_SNAPSHOT_CHARS` is ONE TOTAL over every resolved section, water-filled
-    (`_water_fill`), so citing every heading of a document cannot deliver the document —
-    on the `ask` path and in the stored `assumptions.spec_text` alike.
-    """
+    """Every design-doc section this text cites, resolved: `(path, which, section)` (#102)"""
     from . import sections
 
     refs = sections.find_refs(text)
@@ -7572,7 +7596,7 @@ def _cited_blocks(project: str, path: Path, wo: dict[str, Any], text: str) -> st
 
 
 def ask_question(wo_id: str, question: str, project_name: str | None = None) -> dict[str, Any]:
-    """(Workers) queue a question for Neo instead of stalling on the user: waiting_input with NO user-attention flag, every in-text section reference resolved HERE and snapshotted, their TOTAL bounded by `SECTION_SNAPSHOT_CHARS`, an unresolvable reference or a document named with no section both REFUSALS (`_section_blocks`)"""
+    """(Workers) queue a question for Neo instead of stalling on the user: waiting_input with NO..."""
     from .neo_store import NeoStore
 
     name, path, wo = find_work_order(wo_id, project_name)
@@ -8454,6 +8478,7 @@ def rule_facts(store: ProjectStore, wo: dict[str, Any], *, now: float,
                sources: frozenset[str] | set[str] | None = None,
                project: str = "", max_rounds: int | None = None) -> Any:
     """One work order's `rules.Facts`"""
+    from . import automerge
     from . import budget as budget_mod
     from . import holds as holds_mod
     from . import invariants as invariants_mod
@@ -8511,9 +8536,8 @@ def rule_facts(store: ProjectStore, wo: dict[str, Any], *, now: float,
     if need("automerge"):
         state = automerge_state(store, wo)
         # A STALE HOLD IS NOT A CLAIM ABOUT NOW
-        if (state and state.get("kind") == "automerge_held"
-                and not state.get("stale")):
-            put("automerge_code", str(state.get("code") or ""))
+        if automerge.hold_is_live(state):
+            put("automerge_code", str((state or {}).get("code") or ""))
 
     if need("waiting_on"):
         put("waiting_on", str(waiting_on(store, wo).get("what") or ""))
@@ -12119,7 +12143,7 @@ def _pr_poll_why(store: ProjectStore, wo: dict[str, Any],
     return PR_POLL_WHY
 
 
-#: ONE expression of one rule, registered under EVERY open status: `gates.sweep_unargued` has no status filter and filing an `awaiting_case` request does not park the row, so a held request outlives it (wo-715db5af, Neo 1987)
+#: ONE expression of one rule, registered under EVERY open status: `gates.sweep_unargued` has no...
 REVIEWS_GATE = _Pass(
     "Daemon._neo_drain",
     "a privileged-action request is open and the user does not hold it. "

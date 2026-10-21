@@ -103,7 +103,7 @@ def test_plan_reviewer_persona_no_longer_judges_text_it_does_not_receive():
 
 
 def test_the_persona_describes_the_outline_the_question_actually_carries():
-    """Q1880: the question carries the spec's heading outline, so the persona must not promise spec text or a truncation marker that can no longer appear"""
+    """Q1880: the question carries the spec's heading outline"""
     assert "HEADING OUTLINE" in plans.PLAN_REVIEWER_PERSONA
     assert "TRUNCATED" not in plans.PLAN_REVIEWER_PERSONA
 
@@ -215,14 +215,13 @@ def test_unreferenced_docs_are_the_md_paths_no_reference_covers():
     assert sections.unreferenced_docs(covered) == []
     bare = "I read docs/superpowers/specs/exporter.md and went with CSV."
     assert sections.unreferenced_docs(bare) == ["docs/superpowers/specs/exporter.md"]
-    # Only markdown, and only once per path.
+    # Only markdown, and only once per path
     assert sections.unreferenced_docs("edited src/jarvis/ops.py and tests/t.py") == []
     assert sections.unreferenced_docs("a.md, a.md and b.md") == ["a.md", "b.md"]
 
 
 def test_heading_outline_is_every_heading_line_and_nothing_else():
-    """Neo ruling Q1880: a structural fingerprint for plan review. Same matcher
-    (`HEADING_RE`) as `find_heading`, so the outline and a resolved section agree."""
+    """Neo ruling Q1880: a structural fingerprint for plan review"""
     outline = sections.heading_outline(DESIGN_DOC)
 
     assert outline[:3] == ["# Exporter design", "## 1. Shape", "## 2. Data model"]
@@ -286,11 +285,7 @@ def test_a_referenced_section_reaches_neo_and_the_rest_of_the_doc_does_not(
     assert "union of keys" not in q["context"]  # the rest of the doc stayed home
 
 
-# -- one section, resolved or refused, for BOTH verbs ----------------------------------
-#
-# User decision 2026-10-14 (Neo learning #102): Neo never receives a full spec, only a
-# pointer to ONE specific section resolved to that section's text. A reference that does
-# not resolve is a REFUSAL, never a note in the context and never the whole file.
+# -- one section, resolved or refused, for BOTH verbs
 
 
 def _doc(project):
@@ -311,7 +306,7 @@ def _nothing_recorded(project, wo_id):
         assert store.all_assumptions(wo_id) == []
     finally:
         store.close()
-    # Spec invariant 2: a refused reference writes NOTHING, ASSUMPTIONS.md included.
+    # Spec invariant 2: a refused reference writes NOTHING, ASSUMPTIONS.md included
     md = project / "ASSUMPTIONS.md"
     assert not md.is_file() or wo_id not in md.read_text()
 
@@ -322,8 +317,7 @@ def _both_verbs(wo_id):
 
 
 def test_an_unresolvable_reference_is_refused_in_both_verbs(dispatched, project):
-    """The file is missing, or the heading is. Either way the asker is told which, and
-    nothing is recorded: a silently dropped reference is a question argued from nothing."""
+    """The file is missing, or the heading is"""
     daemon, wo = dispatched
     _doc(project)
 
@@ -355,8 +349,7 @@ TWO_REFS = ('Errors raise per section 3 of design doc '
 
 
 def test_two_cited_sections_both_resolve_in_both_verbs(dispatched, project):
-    """Neo ruling Q1883: NO cardinality cap. `validation.assumption_spec_chars` bounds the
-    text, never a count of sections."""
+    """Neo ruling Q1883: NO cardinality cap"""
     daemon, wo = dispatched
     _doc(project)
 
@@ -366,9 +359,7 @@ def test_two_cited_sections_both_resolve_in_both_verbs(dispatched, project):
 
 def test_assume_stores_every_cited_section_under_one_labelled_snapshot(dispatched,
                                                                       project):
-    """Q1883 + user decision 2026-10-15: three columns, N sections. Each body preceded by
-    its own `<path> § <which>:` line; the pointer columns are parallel newline lists of
-    ALL N, never the first alone."""
+    """Q1883 + user decision 2026-10-15: three columns, N sections"""
     daemon, wo = dispatched
     _doc(project)
 
@@ -389,8 +380,7 @@ def test_assume_stores_every_cited_section_under_one_labelled_snapshot(dispatche
 
 
 def test_assume_resolves_the_section_once_and_stores_the_snapshot(dispatched, project):
-    """kn-924730d7: the worker's worktree is gone by the time the review packet is built,
-    so the pointer is resolved HERE and the section stored on the row."""
+    """kn-924730d7: the worker's worktree is gone by the time the review packet is built"""
     daemon, wo = dispatched
     _doc(project)
 
@@ -561,14 +551,14 @@ def test_a_cited_sibling_assumption_is_accepted_on_both_verbs(dispatched, projec
         verb("Per assumptions 1 and 2, the exporter stays as it is.")
 
 
-# -- ONE TOTAL budget over every cited section (spec invariant 1 on the `ask` path) ----
+# -- ONE TOTAL budget over every cited section (spec invariant 1 on the `ask` path)
 
 
 UNCITED = "THE-UNCITED-SENTENCE, which nobody asked about."
 
 
 def _doc_of_six(project):
-    """A document whose every section is big, so citing them all would deliver it whole."""
+    """A document whose every section is big, so citing them all would deliver it whole"""
     body = f"# Design\n\n{UNCITED}\n"
     for n, letter in enumerate("abcdef", start=1):
         body += f"\n## {n}. Part {letter}\n\n{letter * 3000}\n"
@@ -579,9 +569,7 @@ def _doc_of_six(project):
 
 
 def test_ask_cannot_emit_a_whole_spec_file_even_citing_every_section(dispatched, project):
-    """Sibling of `test_autoreview.py::test_no_question_builder_can_emit_a_whole_spec_file`
-    for the `ask` verb: `ops.SECTION_SNAPSHOT_CHARS` is a TOTAL over all resolved sections,
-    so every heading cited still cannot carry the document."""
+    """Sibling of `test_autoreview.py::test_no_question_builder_can_emit_a_whole_spec_file` for the `ask`..."""
     daemon, wo = dispatched
     _, body = _doc_of_six(project)
     text = " and ".join(
@@ -603,8 +591,7 @@ def test_ask_cannot_emit_a_whole_spec_file_even_citing_every_section(dispatched,
 
 
 def test_ask_water_fills_so_a_short_section_donates_to_a_long_one(dispatched, project):
-    """Neo ruling Q1884 generalised to N: equal share is a FLOOR, a shorter section donates
-    its remainder, only oversized sections are trimmed."""
+    """Neo ruling Q1884 generalised to N: equal share is a FLOOR"""
     daemon, wo = dispatched
     doc = project / "docs" / "superpowers" / "specs" / "two.md"
     doc.parent.mkdir(parents=True, exist_ok=True)
