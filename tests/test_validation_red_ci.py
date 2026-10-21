@@ -1,16 +1,4 @@
-"""A pull request whose checks have FINISHED RED is sent back before the panel sits.
-
-GitHub issue 1025, live case wo-72c3d20b / PR #1005. `ci_pending` reads `status` and
-answers one of CI's three worlds, so a head whose checks had all COMPLETED red ran the
-ordinary path: four seats read a 150k-char diff, the tester seat rejected it for the one
-fact a single `gh` field already stated, and because that was round 3 of 3 the rejection
-escalated to the user.
-
-Spec: docs/superpowers/specs/2026-10-13-a-red-head-is-sent-back-before-the-panel.md
-
-These tests drive the REAL `Daemon._validate_work_order`. "No seat was reached" is the
-whole claim, and a unit test of the predicate alone would pass with the branch deleted.
-"""
+"""A pull request whose checks have FINISHED RED is sent back before the panel sits (#1005)"""
 
 from __future__ import annotations
 
@@ -25,7 +13,7 @@ from tests.test_validation_ci_hold import FILES, GREEN, PENDING, RED, _packet
 from tests.test_validation_loop import (  # noqa: F401
     Validator, fleet, finish, passed, rejected)
 
-#: One check red and one still running: the pull request has NOT finished reporting.
+#: One check red and one still running: the pull request has NOT finished reporting
 MIXED = [{"name": "unit (3.11)", "status": "COMPLETED", "conclusion": "FAILURE"},
          {"name": "evals", "status": "IN_PROGRESS", "conclusion": ""}]
 
@@ -44,7 +32,7 @@ def _sent(store, wo_id) -> list[str]:
 
 
 def _red_return(fleet, fake_gh, checks=RED, **kw):
-    """One red submission, returned. The work order is back with its worker."""
+    """One red submission, returned"""
     wo = fleet.dispatch(**kw)
     fleet.change(wo["id"], "x = 1")
     pr = finish(fleet, wo["id"])["pr_url"]
@@ -54,7 +42,7 @@ def _red_return(fleet, fake_gh, checks=RED, **kw):
     return wo, pr
 
 
-# -- 1. the predicate -----------------------------------------------------------------
+# -- 1. the predicate
 
 
 def test_a_finished_red_check_is_what_the_os_returns_for():
@@ -62,9 +50,7 @@ def test_a_finished_red_check_is_what_the_os_returns_for():
 
 
 def test_green_and_pending_and_the_two_non_answers_are_not_red():
-    """`()` is "nothing to send back for", and it covers the two shapes that are not
-    answers at all. The round machine reads "return it" from this and must not be handed
-    a return nothing happened for."""
+    """`()` is "nothing to send back for", and it covers the two shapes that are not answers at all"""
     assert evidence_mod.ci_failing(_packet(GREEN)) == ()
     assert evidence_mod.ci_failing(_packet(PENDING)) == ()
     assert evidence_mod.ci_failing(_packet([])) == ()
@@ -72,9 +58,7 @@ def test_green_and_pending_and_the_two_non_answers_are_not_red():
 
 
 def test_the_red_predicate_is_githubs_and_is_not_re_derived():
-    """`github.RED_CONCLUSIONS` stays the one definition of red in the OS (issue #224),
-    and a hand-built packet with no `conclusion` key at all must not raise: injected
-    validators and test fixtures build these by hand."""
+    """`github.RED_CONCLUSIONS` stays the one definition of red in the OS (issue #224)"""
     from jarvis import github
 
     for conclusion in github.RED_CONCLUSIONS:
@@ -83,14 +67,12 @@ def test_the_red_predicate_is_githubs_and_is_not_re_derived():
     assert evidence_mod.ci_failing(_packet([{"status": "COMPLETED"}])) == ()
 
 
-# -- 2. the return --------------------------------------------------------------------
+# -- 2. the return
 
 
 def test_a_completed_red_pull_request_seats_nobody_and_spends_no_counted_round(
         fleet, fake_gh):
-    """THE CLAIM OF THIS FILE. A seat adds nothing a machine check has already said, and
-    saying it cost a counted round out of a budget that exists to bound the worker's
-    attempts at a JUDGEMENT."""
+    """THE CLAIM OF THIS FILE"""
     never = Validator(passed())
     fleet.daemon.validator = never
     wo, _ = _red_return(fleet, fake_gh)
@@ -113,9 +95,7 @@ def test_a_completed_red_pull_request_seats_nobody_and_spends_no_counted_round(
 
 
 def test_the_envelope_names_the_checks_and_points_at_the_logs(fleet, fake_gh):
-    """A REFERENCE, NEVER A PAYLOAD. A failure log is unbounded, model-hostile input the
-    worker can fetch itself (2026-09-26-bounded-model-inputs.md), so the envelope names
-    the checks, points at `gh pr checks`, and says no round was spent."""
+    """A REFERENCE, NEVER A PAYLOAD"""
     fleet.daemon.validator = Validator(passed())
     wo, pr = _red_return(fleet, fake_gh)
 
@@ -132,9 +112,9 @@ def test_the_envelope_names_the_checks_and_points_at_the_logs(fleet, fake_gh):
         assert "unit (3.11)" in text
         assert f"gh pr checks {pr}" in text
         assert "no round" in text.lower() and "round 1 of 3" not in text
-        # The two legitimate remedies — issue 1025's gap 2 (spec §3.4, §6.2).
+        # The two legitimate remedies — issue 1025's gap 2 (spec §3.4, §6.2)
         assert "merge" in text.lower()
-        # No log text: the fake CI reported none, and nothing may invent any.
+        # No log text: the fake CI reported none, and nothing may invent any
         assert "Traceback" not in text and "assert" not in text
         for forbidden in ("panel", "seat", "validator"):
             assert forbidden not in text.lower(), f"the worker was told about {forbidden}"
@@ -147,8 +127,7 @@ def test_the_envelope_names_the_checks_and_points_at_the_logs(fleet, fake_gh):
 
 
 def test_the_record_says_which_checks_it_returned_for(fleet, fake_gh):
-    """GitHub's check list has moved on by the time anyone reads the record, so the
-    names ride on the event — and the timeline must not render this as a spent round."""
+    """GitHub's check list has moved on by the time anyone reads the record"""
     fleet.daemon.validator = Validator(passed())
     wo, _ = _red_return(fleet, fake_gh)
 
@@ -167,7 +146,7 @@ def test_the_record_says_which_checks_it_returned_for(fleet, fake_gh):
         store.close()
 
 
-# -- 3. the two worlds that are unchanged ---------------------------------------------
+# -- 3. the two worlds that are unchanged
 
 
 def test_a_green_pull_request_still_reaches_the_seats(fleet, fake_gh):
@@ -186,9 +165,7 @@ def test_a_green_pull_request_still_reaches_the_seats(fleet, fake_gh):
 
 def test_one_red_check_beside_one_still_running_holds_rather_than_returns(
         fleet, fake_gh):
-    """A pull request that has not finished reporting is a WAIT. The queued check may
-    change what the worker has to fix, so returning now would send an incomplete list of
-    names — and the `ci_pending` hold above this branch already owns the case."""
+    """A pull request that has not finished reporting is a WAIT"""
     wo = fleet.dispatch()
     fleet.change(wo["id"], "x = 1")
     panel = Validator(passed())
@@ -211,8 +188,7 @@ def test_one_red_check_beside_one_still_running_holds_rather_than_returns(
 
 def test_a_lapsed_hold_on_a_partly_red_pull_request_is_judged_not_returned(
         fleet, fake_gh, monkeypatch):
-    """After `CI_HOLD_DEADLINE_SECONDS` the fail-SAFE direction is the seats, not a
-    return on an incomplete list of names — which is why `not pending` is explicit."""
+    """After `CI_HOLD_DEADLINE_SECONDS` the fail-SAFE direction is the seats"""
     monkeypatch.setattr("jarvis.daemon.CI_HOLD_DEADLINE_SECONDS", -1.0)
     wo = fleet.dispatch()
     fleet.change(wo["id"], "x = 1")
@@ -229,8 +205,7 @@ def test_a_lapsed_hold_on_a_partly_red_pull_request_is_judged_not_returned(
 
 def test_with_the_key_at_zero_a_red_head_reaches_the_seats_exactly_as_before(
         fleet, fake_gh):
-    """`red_ci_returns: 0` is today's behaviour, which is what a project that disagrees
-    with this feature needs (spec §4.3)."""
+    """`red_ci_returns: 0` is today's behaviour"""
     fleet.reconfigure(red_ci_returns=0)
     wo = fleet.dispatch()
     fleet.change(wo["id"], "x = 1")
@@ -246,14 +221,12 @@ def test_with_the_key_at_zero_a_red_head_reaches_the_seats_exactly_as_before(
     assert (row["outcome"], bool(row["uncounted"])) == ("rejected", False)
 
 
-# -- 4. the cap -----------------------------------------------------------------------
+# -- 4. the cap
 
 
 def test_past_the_cap_the_seats_judge_the_red_head_and_it_escalates_as_before(
         fleet, fake_gh):
-    """No new terminal state: the branch's condition goes false and the round continues
-    as an ordinary counted one. So red CI alone never escalates, and a worker that cannot
-    get CI green reaches the user by the route that already exists."""
+    """No new terminal state: the branch's condition goes false and the round continues as an ordinary..."""
     fleet.reconfigure(red_ci_returns=1, max_rounds=1)
     panel = Validator(rejected())
     fleet.daemon.validator = panel
@@ -277,21 +250,18 @@ def test_past_the_cap_the_seats_judge_the_red_head_and_it_escalates_as_before(
         store.close()
 
 
-# -- 5. the guards --------------------------------------------------------------------
+# -- 5. the guards
 
 
 def test_an_unchanged_resubmission_after_a_return_is_exempt_until_the_cap(
         fleet, fake_gh):
-    """THE EXEMPTION THIS FEATURE CANNOT SHIP WITHOUT (spec §5.1). wo-72c3d20b's branch
-    was correct and could not pass CI alone: it needed sibling PR #1023 merged. The right
-    behaviour is to wait and resubmit the SAME branch, and `_repeat_submission` would
-    turn that into the attention item this spec removes, one round later."""
+    """THE EXEMPTION THIS FEATURE CANNOT SHIP WITHOUT (spec §5.1). wo-72c3d20b's branch was correct and... (#1023)"""
     fleet.reconfigure(red_ci_returns=2, max_rounds=3)
     panel = Validator(passed())
     fleet.daemon.validator = panel
     wo, pr = _red_return(fleet, fake_gh)
 
-    # Unchanged resubmission, CI still red: returned again, nobody seated.
+    # Unchanged resubmission, CI still red: returned again, nobody seated
     finish(fleet, wo["id"], summary="waited for the sibling")
     fleet.drain()
     fleet.tick()
@@ -304,7 +274,7 @@ def test_an_unchanged_resubmission_after_a_return_is_exempt_until_the_cap(
     finally:
         rows.close()
 
-    # Past the cap the repeat guard is live again on the same unchanged fingerprint.
+    # Past the cap the repeat guard is live again on the same unchanged fingerprint
     finish(fleet, wo["id"], summary="and again")
     fleet.drain()
 
@@ -320,8 +290,7 @@ def test_an_unchanged_resubmission_after_a_return_is_exempt_until_the_cap(
 
 def test_the_same_branch_once_ci_goes_green_is_judged_rather_than_refused(
         fleet, fake_gh):
-    """The other half of the exemption, and the live case's ending: the sibling merged,
-    nothing about this branch changed, and the panel has to read it."""
+    """The other half of the exemption"""
     panel = Validator(passed())
     fleet.daemon.validator = panel
     wo, pr = _red_return(fleet, fake_gh)
@@ -336,9 +305,7 @@ def test_the_same_branch_once_ci_goes_green_is_judged_rather_than_refused(
 
 def test_a_submission_after_a_return_is_a_counted_round_and_not_promoted(
         fleet, fake_gh):
-    """NO REBIND PROMOTION (spec §5.2). Promoting after a rebind is a budget argument —
-    the OS demanded a merge and the worker spent a round complying. Nothing was spent
-    here, so promoting would hand a worker free rounds for pushing a red commit."""
+    """NO REBIND PROMOTION (spec §5.2)"""
     panel = Validator(rejected())
     fleet.daemon.validator = panel
     wo, pr = _red_return(fleet, fake_gh)
@@ -359,10 +326,7 @@ def test_a_submission_after_a_return_is_a_counted_round_and_not_promoted(
 
 
 def test_a_return_can_be_the_last_judged_round_and_bounces_nobody(fleet, fake_gh):
-    """NO BOUNCE (spec §5.3). A red_ci round closes `rejected`, so `last_judged_round`
-    reaches it — and it fails open BECAUSE IT HAS NO OPINION ROWS: `cited_paths([])` is
-    empty and `unanswered_submission` returns None. A future change that gave this path a
-    synthetic opinion row would break that silently, which is why this is pinned."""
+    """NO BOUNCE (spec §5.3)"""
     panel = Validator(rejected())
     fleet.daemon.validator = panel
     wo, pr = _red_return(fleet, fake_gh)
@@ -390,10 +354,7 @@ def test_a_return_can_be_the_last_judged_round_and_bounces_nobody(fleet, fake_gh
 
 
 def test_the_seats_see_the_return_as_history_and_can_tell_what_it_was(fleet, fake_gh):
-    """`prior_round_history` filters on `COUNTED_VALIDATION_OUTCOMES`, so the return
-    DOES reach the next round's packet — with `blockers: []`, which keeps it out of the
-    answered-the-list machinery. Its reason must be self-describing so a seat cannot read
-    it as a quality finding a previous seat made (spec §5.4)."""
+    """`prior_round_history` filters on `COUNTED_VALIDATION_OUTCOMES`"""
     panel = Validator(passed())
     fleet.daemon.validator = panel
     wo, pr = _red_return(fleet, fake_gh)
@@ -411,16 +372,13 @@ def test_the_seats_see_the_return_as_history_and_can_tell_what_it_was(fleet, fak
 
 
 def test_a_red_feature_packet_cannot_reach_the_branch_at_all(fleet):
-    """Work-order rounds only (spec §6.1). The guard is the helper's own first clause,
-    in one place, for both loops: a feature packet's source is never `pull_request`."""
+    """Work-order rounds only (spec §6.1)"""
     packet = _packet(RED, source="feature")
     assert evidence_mod.ci_failing(packet) == ()
 
 
 def test_red_ci_is_an_uncounted_cause_and_never_a_holding_one(fleet):
-    """Because this SETTLES rather than holds, no hold accounting changes — and
-    `close_validation_round`'s assertion on the holding vocabulary is what keeps the two
-    from being confused (spec §6.3)."""
+    """Because this SETTLES rather than holds, no hold accounting changes"""
     from jarvis.project_store import VALIDATION_HOLDING_CAUSES
 
     assert ops.RED_CI_CAUSE == "red_ci"

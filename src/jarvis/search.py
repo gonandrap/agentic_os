@@ -1,15 +1,4 @@
-"""Fleet-wide artifact search: one query over every kind of record the OS keeps.
-
-The find-it-again verb. Listings answer "what wants me now" and hide settled work behind
-a count the user has to expand; this answers "where is that thing", so it reads SETTLED
-and HIDDEN records too — the completed work order somebody wants to re-read is the case
-it exists for. See docs/superpowers/specs/2026-09-23-artifact-search.md.
-
-Matching is substring, word-OR, weighted by field (db.score_sql) rather than an FTS5
-index per database: the corpus is a few hundred rows spread over N project databases
-plus os.db and neo.db, where triggers and a backfill guard in three schemas cost more
-than they return (Neo question 528).
-"""
+"""Fleet-wide artifact search: one query over every kind of record the OS keeps (docs/superpowers/specs/2026-09-23-artifact-search.md)"""
 
 from __future__ import annotations
 
@@ -21,8 +10,7 @@ from . import db
 if TYPE_CHECKING:
     from .project_store import ProjectStore
 
-# Every kind a search can return, in the order a tie is broken — the units of work
-# first, the records about them after.
+# Every kind a search can return, in the order a tie is broken
 KINDS = (
     "work_order",
     "feature_order",
@@ -35,14 +23,12 @@ KINDS = (
 
 SNIPPET_CHARS = 180
 
-# An id typed in full is a jump, not a search: it outranks everything else whatever the
-# rest of the query matched.
+# An id typed in full is a jump, not a search: it outranks everything else whatever the rest of the...
 EXACT_ID_BONUS = 100
 
 
 def _snippet(text: str, words: list[str], limit: int = SNIPPET_CHARS) -> str:
-    """The matched part of a body, not its first line: a hit the user cannot see the
-    reason for is a row they have to open to reject."""
+    """The matched part of a body, not its first line: a hit the user cannot see the reason for is a row..."""
     body = " ".join((text or "").split())
     if not body:
         return ""
@@ -58,8 +44,7 @@ def _hit(kind: str, *, id: str, project: str, title: str, status: str, ts: float
          score: float, body: str, words: list[str], url: str,
          ref: str) -> dict[str, Any]:
     snippet = _snippet(body, words)
-    # A knowledge entry's title IS the head of its body, and an order with no summary
-    # often repeats its title. A line restating the one above it is noise.
+    # A knowledge entry's title IS the head of its body
     if snippet[:40] == title[:40]:
         snippet = ""
     return {
@@ -92,9 +77,7 @@ def _from_project(store: "ProjectStore", name: str, words: list[str], kinds: set
                             words=words, url=f"/wo/{name}/{row['id']}",
                             ref=f"jarvis wo show {row['id']}"))
     if "feature_order" in kinds:
-        # Issue #997: every kind printed `/fo/` and `jarvis fo show`, so an improvement
-        # order's hit named a command that refuses the id. Function-local, like
-        # `_project_paths`: `ops` imports the stores.
+        # Issue #997: every kind printed `/fo/` and `jarvis fo show`
         from . import ops
         from .project_store import order_path
         for row in store.search_feature_orders(words, limit=limit):
@@ -126,14 +109,8 @@ def _from_project(store: "ProjectStore", name: str, words: list[str], kinds: set
 def search(query: str, *, project: str | None = None,
            kinds: tuple[str, ...] | None = None,
            limit: int = 30) -> list[dict[str, Any]]:
-    """Every artifact matching `query`, most relevant first.
-
-    `project` scopes the whole search to one project — the same verb the user reaches
-    for while looking at that project's page. Knowledge is scoped the way
-    `jarvis learn search` scopes it: that project plus the global entries.
-    """
-    # Imported here, not at module level: `build_parser` reads KINDS on EVERY cli
-    # invocation, and the stores pull in the whole data layer behind them.
+    """Every artifact matching `query`, most relevant first"""
+    # Imported here, not at module level: `build_parser` reads KINDS on EVERY cli invocation
     from .central_store import CentralStore, headline
     from .neo_store import NeoStore
     from .project_store import ProjectStore
@@ -204,6 +181,6 @@ def search(query: str, *, project: str | None = None,
 
 
 def counts(hits: list[dict[str, Any]]) -> list[tuple[str, int]]:
-    """How many hits of each kind, in KINDS order — the line a listing leads with."""
+    """How many hits of each kind, in KINDS order — the line a listing leads with"""
     return [(k, sum(1 for h in hits if h["kind"] == k)) for k in KINDS
             if any(h["kind"] == k for h in hits)]

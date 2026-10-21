@@ -1,9 +1,4 @@
-"""The project's OKF knowledge map, and the one playbook a worker's brief carries.
-
-A project that ships an Open Knowledge Format bundle at `docs/os/` (index -> playbooks
--> concepts) gets ONE playbook in its worker prompt, chosen by the order's kind and
-title, and fetches every deeper level on demand. docs/os/architecture/worker-context.md.
-"""
+"""The project's OKF knowledge map, and the one playbook a worker's brief carries (docs/os/architecture/worker-context.md)"""
 
 from __future__ import annotations
 
@@ -42,7 +37,7 @@ def _scalar(value: str) -> Any:
 
 
 def parse(text: str) -> tuple[dict[str, Any], str]:
-    """Frontmatter (the flat `key: value` subset OKF concepts here use) and body."""
+    """Frontmatter (the flat `key: value` subset OKF concepts here use) and body"""
     if not text.startswith("---\n"):
         return {}, text
     head, sep, body = text[4:].partition("\n---\n")
@@ -84,7 +79,7 @@ def _matches(term: str, text: str) -> bool:
 
 
 def classify(wo: dict[str, Any], books: list[Playbook]) -> Playbook | None:
-    """The first playbook, by rank, whose kind, child flag or keywords fit the order."""
+    """The first playbook, by rank, whose kind, child flag or keywords fit the order"""
     kind = str(wo.get("kind") or "worker")
     first_line = (wo.get("description") or "").strip().split("\n", 1)[0]
     text = f"{wo.get('title') or ''} {first_line}".lower()
@@ -100,13 +95,13 @@ def classify(wo: dict[str, Any], books: list[Playbook]) -> Playbook | None:
 
 
 def _localise(body: str) -> str:
-    """Bundle-relative links become repo paths a worker can open as they stand."""
+    """Bundle-relative links become repo paths a worker can open as they stand"""
     return _LINK.sub(lambda m: f"{m.group(1)} (`{BUNDLE_DIR.as_posix()}{m.group(2)}`)",
                      body)
 
 
 def brief_block(wo: dict[str, Any], project_path: Path) -> list[str]:
-    """The map section of a worker prompt: one playbook, everything else by path."""
+    """The map section of a worker prompt: one playbook, everything else by path"""
     root = bundle_root(project_path)
     if root is None:
         return []

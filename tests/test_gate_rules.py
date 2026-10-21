@@ -1,15 +1,4 @@
-"""The gate rule base, and the feedback loop that grows it.
-
-The behaviour under test has two halves that pull against each other, and a test file
-that only pins one of them is worse than none. The OS must LEARN — a false positive Neo
-has already ruled on must never be re-litigated, in this work order or the next project
-— and it must not be able to learn its way into shipping something unreviewed. So every
-test that widens the classifier is paired with one that pins what may never widen.
-
-The scenario throughout is the one that produced this work order: issue #104, a `git
-commit -F -` whose heredoc body mentions the release script, gated four times on
-wo-f49dab38 and dismissed by Neo four times.
-"""
+"""The gate rule base, and the feedback loop that grows it (#104)"""
 
 from __future__ import annotations
 
@@ -25,43 +14,27 @@ from jarvis.project_store import ProjectStore
 
 ALL_GATES = gates.GateConfig(enabled=frozenset(gates.KIND_NAMES))
 
-# The command from issue #104, near enough verbatim: a local commit whose MESSAGE talks
-# about the release path. It invokes no release script and ships nothing.
+# The command from issue #104, near enough verbatim: a local commit whose MESSAGE talks about the...
 HEREDOC_COMMIT = """git commit -F - <<'EOF'
 Reading a release script is not running one
 
 Narrow the recogniser so scripts/shipit.sh is not gated when it is only read.
 EOF"""
 
-# The same shape, different words, never reviewed by anybody. This is the one that
-# matters: clearing only the exact string reviewed is what the OS already did.
+# The same shape, different words, never reviewed by anybody
 ANOTHER_HEREDOC_COMMIT = """git add -A && git commit -F - <<'EOF'
 Document the staged flow in scripts/shipit.sh so the next release is boring
 EOF"""
 
-# A heredoc that is NOT prose: the body is a program and `bash` runs it. Structurally
-# identical to the case above right up to the pipe, which is the whole point.
+# A heredoc that is NOT prose: the body is a program and `bash` runs it
 HEREDOC_INTO_SHELL = """cat <<'EOF' | bash
 scripts/shipit.sh
 EOF"""
 
-# A one-line false positive: the release path sits in a quoted argument to a note-taking
-# command. Single-line, so it is the only shape a regex exemption may be learned from.
+# A one-line false positive: the release path sits in a quoted argument to a note-taking command
 QUOTED_NOTE = 'jarvis learn add "never run scripts/shipit.sh by hand" --topic releases'
 
-# The two defect SHAPES behind the five learned rules that were walkable on 2026-09-12
-# (wo-551f5e8c) — a negated class that forgets the newline, and a pattern with no end
-# anchor — written out here as fresh patterns over commands nobody ever dismissed.
-#
-# NOT the rules themselves, and this repository being public is the whole reason. The
-# five live patterns and the commands each one cleared are on the work-order record and
-# in the retraction reasons (`jarvis gate rules`), which are private state; publishing
-# the pair "this rule cleared this command" is the user's call and they have not made it.
-# Nothing is lost by the substitution: the floors under `Rule.clears` are indifferent to
-# what a pattern says, so a shape-for-shape stand-in exercises the same code identically.
-#
-# Each entry: the defect, a pattern exhibiting it, the single-line command it was written
-# for, and a command it WOULD clear without the fix.
+# The two defect SHAPES behind the five learned rules that were walkable on 2026-09-12 (wo-551f5e8c)...
 DEFECT_SHAPES = [
     ("a negated class that forgets the newline", "release",
      r"^\s*(?:cat|echo)(?:[^;&|`$]|2>&1)*$",
@@ -86,10 +59,7 @@ DEFECT_SHAPES = [
 ]
 BYPASS_IDS = [d[0] for d in DEFECT_SHAPES]
 
-# Issue #203, verbatim from `jarvis gate show 95` on prod jarvis-0.9.0: a read-only
-# classifier probe, gated as a release and refused 10 minutes later by `sweep_unargued`.
-# Everything after `-c` is one double-quoted argument that `python3` reads and no shell
-# ever re-parses.
+# Issue #203, verbatim from `jarvis gate show 95` on prod jarvis-0.9.0: a read-only classifier probe
 APPROVAL_95 = r'''python3 -c "
 import sys; sys.path.insert(0,'src')
 from jarvis import gate_rules as g
@@ -117,7 +87,7 @@ def classify(command, rules, central=None):
 
 
 def learn(central, command, *, exempt_pattern="", kind=None, pattern=None):
-    """Do to the rule base what a dismissal does, and return the new rule id."""
+    """Do to the rule base what a dismissal does, and return the new rule id"""
     action = classify(command, gate_rules.RuleSet.load(central))
     approval = {"id": 43, "wo_id": "wo-f49dab38", "kind": kind or action.kind,
                 "command": command, "matched": pattern or action.matched}
@@ -126,7 +96,7 @@ def learn(central, command, *, exempt_pattern="", kind=None, pattern=None):
                                       project="jarvis_os")
 
 
-# -- reading a command ----------------------------------------------------------------
+# -- reading a command
 
 
 def test_heredoc_bodies_are_found_including_the_indented_and_quoted_forms():
@@ -141,7 +111,7 @@ def test_heredoc_bodies_are_found_including_the_indented_and_quoted_forms():
 
 
 def test_a_here_string_is_not_a_heredoc():
-    """`<<<word` has no body. Treating it as one would blank the rest of the command."""
+    """`<<<word` has no body"""
     assert gate_rules.heredoc_spans("bash <<< 'scripts/shipit.sh'") == []
 
 
@@ -152,7 +122,7 @@ def test_an_unterminated_heredoc_body_runs_to_the_end_and_says_so():
 
 
 def test_command_names_ignore_heredoc_bodies_and_quoted_text():
-    """Every line of a commit message would otherwise read as another command."""
+    """Every line of a commit message would otherwise read as another command"""
     assert gate_rules.command_names(HEREDOC_COMMIT) == {"git commit"}
     assert gate_rules.command_names(ANOTHER_HEREDOC_COMMIT) == {"git add", "git commit"}
     assert gate_rules.command_names(HEREDOC_INTO_SHELL) == {"cat", "bash"}
@@ -166,14 +136,11 @@ def test_list_segments_split_on_lists_and_never_on_a_pipe():
     assert parts("cat a && cat b; cat c & cat d") == ["cat a", "cat b", "cat c", "cat d"]
     assert parts("cat a | bash") == ["cat a | bash"]
     assert parts("cat a 2>&1 | head") == ["cat a 2>&1 | head"]
-    # A separator inside a quoted argument or a heredoc body starts no new command — and
-    # neither does the opener's own newline. The body belongs to the command that owns
-    # it, so a commit message arrives as one span WITH the `git commit` that reads it;
-    # splitting there made every line of prose a command of its own (issue #233).
+    # A separator inside a quoted argument or a heredoc body starts no new command (#233)
     assert parts("git commit -m 'a && b'") == ["git commit -m 'a && b'"]
     body = "git commit -F - <<'EOF'\nfix a && ship b\nEOF"
     assert parts(body) == [body]
-    # The command AFTER the terminator is still a command: the merge is not the message.
+    # The command AFTER the terminator is still a command: the merge is not the message
     assert parts(body + "\ngh pr merge 1") == [body, "gh pr merge 1"]
 
 
@@ -185,28 +152,22 @@ def test_shape_reports_where_the_literal_landed():
 
 
 def test_a_literal_in_both_prose_and_code_reads_as_code():
-    """The settled convention: if you cannot tell whether the command runs the thing or
-    only mentions it, it runs it."""
+    """The settled convention: if you cannot tell whether the command runs the thing or only mentions it"""
     command = "git commit -F - <<EOF\nabout scripts/shipit.sh\nEOF\n./scripts/shipit.sh"
     assert gate_rules.shape_of(command, "shipit").position == gate_rules.CODE
 
 
-# -- the loop closing -----------------------------------------------------------------
+# -- the loop closing
 
 
 def test_the_heredoc_commit_from_issue_104_is_gated_before_anything_is_learned(rules):
-    """The bug as filed. This is the state the OS ships in, and it is correct until a
-    reviewer has actually ruled on the shape."""
+    """The bug as filed"""
     action = classify(HEREDOC_COMMIT, rules)
     assert action is not None and action.kind == "release"
 
 
 def test_a_dismissal_clears_the_shape_for_commands_nobody_reviewed(central):
-    """The whole work order, in one assertion.
-
-    Before: every commit message mentioning the release path costs a Neo review. After
-    one dismissal: none of them do — including this one, which no reviewer ever saw.
-    """
+    """The whole work order, in one assertion"""
     assert classify(ANOTHER_HEREDOC_COMMIT, gate_rules.RuleSet.load(central)) is not None
 
     learned = learn(central, HEREDOC_COMMIT)
@@ -228,30 +189,24 @@ def test_what_was_learned_is_recorded_with_its_provenance(central):
 
 
 def test_a_learned_rule_crosses_projects(central, tmp_path):
-    """Central, not per-project, and this is the reason: the user's complaint was that a
-    dismissal settles nothing for the next project."""
+    """Central, not per-project, and this is the reason: the user's complaint was that a dismissal settles..."""
     learn(central, HEREDOC_COMMIT)
     other = gate_rules.RuleSet.load(CentralStore())
     assert classify(ANOTHER_HEREDOC_COMMIT, other) is None
 
 
 def test_an_exemption_that_fires_is_counted(central):
-    """A learned rule with no hits generalised nothing. That has to be visible."""
+    """A learned rule with no hits generalised nothing"""
     rule_id = learn(central, HEREDOC_COMMIT)["learned"]
     classify(ANOTHER_HEREDOC_COMMIT, gate_rules.RuleSet.load(central), central=central)
     assert central.get_gate_rule(rule_id)["hits"] == 1
 
 
-# -- what learning may never do -------------------------------------------------------
+# -- what learning may never do
 
 
 def test_learning_the_commit_shape_does_not_clear_a_heredoc_piped_into_a_shell(central):
-    """The bypass this design exists to survive.
-
-    `git commit <<EOF … shipit … EOF` and `cat <<EOF | bash … shipit … EOF` differ only
-    in what consumes the body. If the exemption learned from the first cleared the
-    second, the feedback loop would be a hole in the gate rather than a fix for it.
-    """
+    """The bypass this design exists to survive"""
     learn(central, HEREDOC_COMMIT)
     after = gate_rules.RuleSet.load(central)
     assert classify(HEREDOC_INTO_SHELL, after) is not None
@@ -260,7 +215,7 @@ def test_learning_the_commit_shape_does_not_clear_a_heredoc_piped_into_a_shell(c
 
 
 def test_a_literal_in_executable_position_can_never_be_learned(central):
-    """No dismissal, however well-argued, generalises a real release into a rule."""
+    """No dismissal, however well-argued, generalises a real release into a rule"""
     result = learn(central, "./scripts/shipit.sh")
     assert result["learned"] is None
     assert "executable position" in " ".join(result["notes"])
@@ -281,9 +236,7 @@ def test_a_chain_containing_an_executor_is_never_exemptible():
 
 
 def test_an_executor_past_a_list_separator_leaves_the_shape_exemptible():
-    """Issue #194, in the generalisation logic rather than the match: `find` cannot reach
-    a heredoc body it is not in, so a dismissal of this shape still has something to
-    teach. Paired with the test above, which is the same sentence about a pipe."""
+    """Issue #194, in the generalisation logic rather than the match: `find` cannot reach a heredoc body..."""
     guarded = HEREDOC_COMMIT + "\n|| find . -name TODO"
     shape = gate_rules.shape_of(guarded, "shipit")
     assert shape.names == {"git commit"}
@@ -294,7 +247,7 @@ def test_an_executor_past_a_list_separator_leaves_the_shape_exemptible():
     assert piped.unlearnable_reason() == "its own command executes via bash"
 
 
-# -- the reviewer's own generalisation ------------------------------------------------
+# -- the reviewer's own generalisation
 
 
 def test_a_sound_reviewer_pattern_is_used_in_preference_to_the_structural_one(central):
@@ -316,8 +269,7 @@ def test_an_unsound_reviewer_pattern_is_refused(pattern, why):
 
 
 def test_a_reviewer_pattern_that_would_clear_a_real_release_is_refused(central):
-    """The backstop. A reviewer that proposes `shipit` as the exemption has described
-    every release there is; the OS declines and falls back to the structural rule."""
+    """The backstop"""
     result = learn(central, HEREDOC_COMMIT, exempt_pattern="shipit")
 
     assert "refused" in " ".join(result["notes"])
@@ -327,21 +279,18 @@ def test_a_reviewer_pattern_that_would_clear_a_real_release_is_refused(central):
 
 
 def test_a_multi_line_command_never_teaches_a_regex(central):
-    """Item 4 of wo-551f5e8c. A regex cannot say which line of a script it describes, so
-    a multi-line dismissal falls to the structural rule — the path a heredoc was always
-    meant to take — however sound the reviewer's pattern looks."""
+    """Item 4 of wo-551f5e8c"""
     result = learn(central, HEREDOC_COMMIT,
                    exempt_pattern=r"git commit -F - <<'?EOF'?[\s\S]*shipit")
 
     assert central.get_gate_rule(result["learned"])["test"] == "signature"
     assert "more than one line" in " ".join(result["notes"])
-    # The dismissal still buys what it was supposed to buy.
+    # The dismissal still buys what it was supposed to buy
     assert classify(HEREDOC_COMMIT, gate_rules.RuleSet.load(central)) is None
 
 
 def test_an_exemption_describing_only_a_prefix_is_refused():
-    """The defect that needed no newline: the pattern described a harmless prefix and
-    said nothing about the `&& gh pr merge` chained after it."""
+    """The defect that needed no newline: the pattern described a harmless prefix and said nothing about..."""
     _, _, pattern, _, walked = DEFECT_SHAPES[3]
     assert "whole command" in gate_rules.validate_pattern(pattern, walked)
 
@@ -350,8 +299,7 @@ def test_an_exemption_describing_only_a_prefix_is_refused():
                          ids=BYPASS_IDS)
 def test_every_bypass_shape_is_refused_at_learn_time(label, kind, pattern, original,
                                                      walked):
-    """Each shape fails validation against the single-line command it was written for,
-    so no pattern of that shape can enter the base again."""
+    """Each shape fails validation against the single-line command it was written for"""
     assert gate_rules.validate_pattern(pattern, original) != "", label
 
 
@@ -359,9 +307,7 @@ def test_every_bypass_shape_is_refused_at_learn_time(label, kind, pattern, origi
                          ids=BYPASS_IDS)
 def test_a_stored_bypass_rule_no_longer_clears_what_it_would_have(label, kind, pattern,
                                                                   original, walked):
-    """The regression proper, and it is deliberately blind to validation: the five real
-    rules were already IN the base, admitted before any of these checks existed.
-    `Rule.clears` is the floor that holds for a stored rule nobody can re-validate."""
+    """The regression proper, and it is deliberately blind to validation: the five real rules were already..."""
     rule = gate_rules.Rule(id="gr-stored", role=gate_rules.EXEMPT,
                            test=gate_rules.REGEX, pattern=pattern, kind=kind,
                            source="neo")
@@ -369,12 +315,12 @@ def test_a_stored_bypass_rule_no_longer_clears_what_it_would_have(label, kind, p
 
     # It still clears the command it legitimately describes...
     assert base.decide(original, gate_rules.KIND_NAMES) is not None
-    # ...and no longer clears the one it had no business clearing.
+    # ...and no longer clears the one it had no business clearing
     assert base.decide(walked, gate_rules.KIND_NAMES).match is not None, label
 
 
 def test_a_regex_exemption_never_clears_a_command_it_does_not_cover_entirely():
-    """The two floors under `Rule.clears`, stated directly."""
+    """The two floors under `Rule.clears`, stated directly"""
     rule = gate_rules.Rule(id="gr-x", role=gate_rules.EXEMPT, test=gate_rules.REGEX,
                            pattern=r"^echo hi$", kind="release", source="neo")
 
@@ -384,8 +330,7 @@ def test_a_regex_exemption_never_clears_a_command_it_does_not_cover_entirely():
 
 
 def test_a_structural_exemption_still_clears_the_multi_line_shape_it_is_for():
-    """The newline rule is scoped to regex exemptions on purpose: a heredoc IS multi-line,
-    and clearing that shape is what the signature path exists for (kn-0b2fdebb)."""
+    """The newline rule is scoped to regex exemptions on purpose: a heredoc IS multi-line"""
     rule = gate_rules.Rule(
         id="gr-y", role=gate_rules.EXEMPT, test=gate_rules.SIGNATURE, kind="release",
         pattern='{"kind": "release", "owner": "git commit", "position": "heredoc"}')
@@ -393,11 +338,7 @@ def test_a_structural_exemption_still_clears_the_multi_line_shape_it_is_for():
     assert rule.clears(HEREDOC_COMMIT, "release", "shipit")
 
 
-# Refusing a regex for a multi-line command makes the signature the ONLY route by which
-# one is ever cleared, so it carries the whole weight and needs the negative half. The
-# last two of these were real: both cleared the appended release before wo-551f5e8c
-# review round 1, because the delimiter line was not a delimiter line and the body ran
-# to the end of the string.
+# Refusing a regex for a multi-line command makes the signature the ONLY route by which one is ever...
 SIGNATURE_MUST_REFUSE = [
     ("a release appended below the terminator", HEREDOC_COMMIT + "\n./scripts/shipit.sh"),
     ("a blank line before it", HEREDOC_COMMIT + "\n\n./scripts/shipit.sh"),
@@ -423,8 +364,7 @@ def test_a_structural_exemption_refuses_a_release_the_heredoc_does_not_contain(l
 
 
 def test_no_rule_in_the_base_clears_a_multi_line_command_with_a_gated_verb_below():
-    """Item 2's acceptance test, swept rather than sampled: every reader the classifier
-    knows, above every command that must always gate."""
+    """Item 2's acceptance test, swept rather than sampled: every reader the classifier knows"""
     readers = ["cat README.md", "ls -la", "echo hi", "head -5 README.md",
                "sed -n '1,5p' README.md", "git ls-files", "tail -3 README.md",
                "grep -rn shipit src/", "uv run pytest tests/test_x.py",
@@ -435,8 +375,7 @@ def test_no_rule_in_the_base_clears_a_multi_line_command_with_a_gated_verb_below
         base = base.with_rule(gate_rules.Rule(
             id=f"gr-shape{i}", role=gate_rules.EXEMPT, test=gate_rules.REGEX,
             pattern=pattern, kind="", source="neo"))
-    # The signature path belongs in the sweep too: once a regex may not be learned from a
-    # multi-line command it is the only way one is ever cleared, so it carries the weight.
+    # The signature path belongs in the sweep too: once a regex may not be learned from a multi-line...
     base = base.with_rule(gate_rules.Rule(
         id="gr-sig", role=gate_rules.EXEMPT, test=gate_rules.SIGNATURE, kind="release",
         pattern='{"kind": "release", "owner": "git commit", "position": "heredoc"}'))
@@ -451,8 +390,7 @@ def test_no_rule_in_the_base_clears_a_multi_line_command_with_a_gated_verb_below
                     command
                 probed += 1
 
-    # A heredoc can only be joined with a newline: `&&` after it lands on the TERMINATOR
-    # line, which is inside the body rather than below it — see the test below.
+    # A heredoc can only be joined with a newline: `&&` after it lands on the TERMINATOR line
     for canary in canaries:
         command = f"{HEREDOC_COMMIT}\n{canary.pattern}"
         assert base.decide(command, gate_rules.KIND_NAMES).match is not None, command
@@ -463,43 +401,32 @@ def test_no_rule_in_the_base_clears_a_multi_line_command_with_a_gated_verb_below
 
 
 def test_delimiter_reuse_re_terminates_the_outer_heredoc_and_the_shell_agrees():
-    """The one combination the sweep above must NOT assert on, and why.
-
-    Appending `&& cat <<'EOF' | bash ... EOF` to a heredoc does not chain a second
-    command: the `&&` lands on a line that is not the delimiter, and the appended block's
-    own `EOF` closes the OUTER heredoc. Everything is one commit message. Verified
-    against real bash on 2026-09-12 — the payload never ran — so clearing it is correct,
-    and a future change that makes this gate is over-gating, not a fix.
-    """
+    """The one combination the sweep above must NOT assert on, and why"""
     command = f"{HEREDOC_COMMIT} && cat <<'EOF' | bash\nscripts/shipit.sh\nEOF"
     shape = gate_rules.shape_of(command, "shipit")
 
     assert shape is not None and shape.position == gate_rules.HEREDOC
     assert shape.owner == "git commit"
-    # The `&&` with a SINGLE-line release does chain, and that one must gate: no
-    # trailing delimiter, so the body is unterminated and nothing in it is prose.
+    # The `&&` with a SINGLE-line release does chain
     assert gate_rules.shape_of(f"{HEREDOC_COMMIT} && ./scripts/shipit.sh",
                                "shipit").position == gate_rules.CODE
 
 
 def test_an_empty_reviewer_pattern_is_not_a_pattern(central):
-    """`exempt_pattern: ""` must never reach the rule base as a regex matching
-    everything."""
+    """`exempt_pattern: ""` must never reach the rule base as a regex matching everything"""
     result = learn(central, HEREDOC_COMMIT, exempt_pattern="")
     assert central.get_gate_rule(result["learned"])["test"] == "signature"
 
 
-# -- the safety net itself -------------------------------------------------------------
+# -- the safety net itself
 
 
 def test_every_gate_kind_has_a_multi_line_canary():
-    """Item 3. Until wo-551f5e8c every canary was one line, so `jarvis gate rules` could
-    report `every command that must gate still gates` over an open release gate: the set
-    could not express the shape gr-391ba702 cleared."""
+    """Item 3"""
     seeds = gate_rules.RuleSet.from_seeds()
 
     def is_reader_then_gated(command: str) -> bool:
-        """Exactly two lines: something that can only read, then something that gates."""
+        """Exactly two lines: something that can only read, then something that gates"""
         head, sep, tail = command.partition("\n")
         return bool(sep) and "\n" not in tail and gate_rules.reads_only(head) and \
             seeds.decide(tail, gate_rules.KIND_NAMES).match is not None
@@ -507,35 +434,21 @@ def test_every_gate_kind_has_a_multi_line_canary():
     every = [(k, c) for k, c in gate_rules.SEED_CANARIES if "\n" in c]
     added = [(k, c) for k, c in every if is_reader_then_gated(c)]
 
-    # kn-e74988af: the filter must be shown to have EXCLUDED something, or a later change
-    # deleting the rows it was written for still passes on whatever else matches. Other
-    # multi-line canaries exist and are deliberately NOT of this shape — the heredoc
-    # piped into a shell, the `eval`, the issue #203 `python3 -c` probe.
+    # kn-e74988af: the filter must be shown to have EXCLUDED something (#203)
     assert len(added) < len(every), "the other multi-line canaries have gone"
-    # `self_heal` is excluded throughout: its command is a rendered intent string rather
-    # than a shell command, so it has no recogniser and no canary (kn-832cb8cb).
-    #
-    # `auto_merge` is excluded for the neighbouring reason and NOT the same one, which is
-    # worth spelling out because its command IS a real shell command: the OS builds and
-    # runs it. What it is not is a command any WORKER can type — nothing classifies into
-    # the kind, by design, so there is no attempt for a recogniser to catch and a canary
-    # would be asserting that a string gates into a kind it must never gate into.
-    # docs/superpowers/specs/2026-09-14-validated-auto-merge-design.md §8.
+    # `self_heal` is excluded throughout: its command is a rendered intent string rather than a shell... (docs/superpowers/specs/2026-09-14-validated-auto-merge-design.md §8.)
     assert {k for k, _ in added} == set(gates.KIND_NAMES) - {gate_rules.SELF_HEAL,
                                                              gate_rules.AUTO_MERGE}
 
 
 def test_the_multi_line_canary_report_fails_on_the_shape_that_walked_the_gate():
-    """The canary set earns its keep only if it is falsifiable. With the newline-blind
-    shape back in the base and the `Rule.clears` floor removed, the release canary must
-    go red — which is what the report could not say before wo-551f5e8c."""
+    """The canary set earns its keep only if it is falsifiable"""
     rule = gate_rules.Rule(id="gr-stored", role=gate_rules.EXEMPT,
                            test=gate_rules.REGEX, pattern=DEFECT_SHAPES[0][2],
                            kind="release", source="neo")
     unguarded = gate_rules.RuleSet.from_seeds().with_rule(rule)
 
-    # `clears` is what the fix hardened. Restore its pre-fix body verbatim — an
-    # unanchored `search` over the raw command — to recreate the state of the day.
+    # `clears` is what the fix hardened
     def unhardened(self, command, kind, _pattern):
         if self.role != gate_rules.EXEMPT or (self.kind and self.kind != kind):
             return False
@@ -549,8 +462,7 @@ def test_the_multi_line_canary_report_fails_on_the_shape_that_walked_the_gate():
 
 
 def test_the_newline_floor_refuses_to_run_with_nothing_to_probe():
-    """A floor that tested nothing would report every pattern sound — this module's own
-    green-over-an-open-gate failure, one level down. It must fail loudly instead."""
+    """A floor that tested nothing would report every pattern sound"""
     with mock.patch.object(gate_rules, "SEED_CANARIES",
                            (("release", "cat <<'EOF' | bash\nscripts/shipit.sh\nEOF"),)):
         with pytest.raises(AssertionError, match="single-line canary"):
@@ -558,8 +470,7 @@ def test_the_newline_floor_refuses_to_run_with_nothing_to_probe():
 
 
 def test_a_trailing_newline_does_not_decide_whether_an_exemption_applies():
-    """`"\\n" in command` and `fullmatch` must read the same string, or whitespace the
-    user never typed silently voids a rule."""
+    """`"\\n" in command` and `fullmatch` must read the same string"""
     rule = gate_rules.Rule(id="gr-z", role=gate_rules.EXEMPT, test=gate_rules.REGEX,
                            pattern=r"^echo hi$", kind="release", source="neo")
 
@@ -569,8 +480,7 @@ def test_a_trailing_newline_does_not_decide_whether_an_exemption_applies():
 
 
 def test_no_seeded_pattern_can_reach_across_a_newline():
-    """The audit item 2 asks for, over the patterns the OS itself ships. A negated class
-    that forgets `\\n` is the whole defect; `[^\\n]*` is the form that does not have it."""
+    """The audit item 2 asks for, over the patterns the OS itself ships"""
     classes = re.compile(r"\[\^([^\]]*)\]")
     for kind, pattern in gate_rules.SEED_MATCHES:
         for body in classes.findall(pattern):
@@ -580,7 +490,7 @@ def test_no_seeded_pattern_can_reach_across_a_newline():
 
 
 def test_check_canaries_catches_a_retracted_recogniser(central):
-    """The other way a gate goes quiet: not a bad exemption, a missing recogniser."""
+    """The other way a gate goes quiet: not a bad exemption, a missing recogniser"""
     shipit = [r for r in central.gate_rules(role="match")
               if r["pattern"] == "shipit"][0]
     central.retract_gate_rule(shipit["id"], "testing")
@@ -620,7 +530,7 @@ def test_seeding_is_idempotent_and_does_not_resurrect_a_retracted_rule(jarvis_ho
     seeded = len(first.gate_rules(include_retired=True))
     first.close()
 
-    # Re-opening runs the seeder again, as every `jarvis` command does.
+    # Re-opening runs the seeder again, as every `jarvis` command does
     second = CentralStore()
     try:
         assert len(second.gate_rules(include_retired=True)) == seeded
@@ -630,32 +540,25 @@ def test_seeding_is_idempotent_and_does_not_resurrect_a_retracted_rule(jarvis_ho
 
 
 def test_the_seed_fallback_restores_recognisers_and_no_exemptions():
-    """What an unreadable `os.db` leaves the hook with. It must err toward gating."""
+    """What an unreadable `os.db` leaves the hook with"""
     seeds = gate_rules.RuleSet.from_seeds()
     assert seeds.matchers()
     assert seeds.exemptions() == ()
     assert classify("./scripts/shipit.sh", seeds) is not None
 
 
-# -- the invoker test is positional (issue #203) --------------------------------------
+# -- the invoker test is positional (issue #203)
 
 
 def test_a_shell_invoker_named_inside_a_quoted_payload_does_not_disarm_blanking():
-    """Approval 95, verbatim: a read-only probe gated as a release.
-
-    Its payload names a shell-invoker keyword at offset 280 and the release script a few
-    characters later, both only as Python string literals. Searching the raw string for
-    the invoker matched the first, `scannable` handed the command back whole, and the
-    second then tripped the release gate on a command that runs nothing.
-    """
+    """Approval 95, verbatim: a read-only probe gated as a release"""
     assert gate_rules.scannable(APPROVAL_95) != APPROVAL_95
     assert "shipit" not in gate_rules.scannable(APPROVAL_95)
     assert classify(APPROVAL_95, gate_rules.RuleSet.from_seeds()) is None
 
 
 def test_a_shell_invoker_in_executable_position_still_scans_the_command_whole():
-    """The pairing. Positional means the keyword still counts where the shell reaches
-    it — quoting the payload of something that re-parses it buys nothing."""
+    """The pairing"""
     for command in ('sh -c "scripts/shipit.sh"',
                     'eval "bash scripts/shipit.sh"',
                     'echo x | xargs "./scripts/shipit.sh"'):
@@ -668,11 +571,7 @@ def test_a_shell_invoker_in_executable_position_still_scans_the_command_whole():
     '"bash" -c "gh pr merge 31"',
 ])
 def test_a_wrapper_whose_payload_names_no_invoker_was_never_gated(command):
-    """These two look like the positional test lost them. It did not: neither ever
-    gated. `_SHELL_INVOKER` wants `sh` then whitespace then a `-…c` flag, so bare
-    `bash <path>` never matched it, and in `"bash" -c` a quote sits where the
-    whitespace has to be. Pinned so the next reader does not re-file them as a
-    regression — the real one is below."""
+    """These two look like the positional test lost them"""
     assert classify(command, gate_rules.RuleSet.from_seeds()) is None
 
 
@@ -683,14 +582,7 @@ def test_a_wrapper_whose_payload_names_no_invoker_was_never_gated(command):
     'diff <(scripts/shipit.sh) old.txt',
 ])
 def test_a_substitution_gates_however_it_is_quoted(command):
-    """`$(…)`, backticks and `<(…)` RUN inside double quotes, so blanking the span they
-    sit in would hide code. `scannable` therefore tests `_SUBSTITUTION` before blanking,
-    the same way `reads_only` always has — the second of these regressed in review
-    round 1, when only `reads_only` made that call.
-
-    The cost is that prose quoting a literal `$(` gates. That is the loud failure and it
-    is the one to prefer: it costs a review, where the silent one ships.
-    """
+    """`$(…)`, backticks and `<(…)` RUN inside double quotes"""
     assert classify(command, gate_rules.RuleSet.from_seeds()) is not None
 
 
@@ -700,20 +592,7 @@ def test_a_substitution_gates_however_it_is_quoted(command):
     'docker exec c "bash -c \'scripts/shipit.sh\'"',
 ])
 def test_a_wrapper_that_executes_its_quoted_payload_is_a_known_miss(command):
-    """Issue #213, asserted as the miss it is rather than left unexamined.
-
-    `ssh` and `docker exec` run their quoted payload, and neither is a shell invoker by
-    this module's definition — so blanking deletes the gated literal and the invoker
-    naming it together. Unlike substitution, which needed no new vocabulary and is fixed
-    above, this needs a notion of "wrapper that executes its quoted argument".
-
-    The hole predates the positional test: the same wrappers with a plain payload, below,
-    never gated either. What changed is that the raw search used to catch the subset
-    whose payload happened to spell one of the three keywords.
-
-    **When #213 lands these assertions INVERT — they do not get deleted.** Each of these
-    commands must then gate, and this test is the list of what the fix has to catch.
-    """
+    """Issue #213, asserted as the miss it is rather than left unexamined"""
     assert classify(command, gate_rules.RuleSet.from_seeds()) is None
 
 
@@ -723,13 +602,7 @@ def test_a_wrapper_that_executes_its_quoted_payload_is_a_known_miss(command):
     'docker exec c "scripts/shipit.sh"',
 ])
 def test_the_wrapper_miss_is_older_than_the_positional_test(command):
-    """The control for the case above, and the reason it is a pre-existing hole rather
-    than one this fix opened: with no keyword in the payload there was nothing for the
-    raw search to catch, and these did not gate before the change either.
-
-    **Inverted by #213 too, not deleted** — a remote shell handed the release script is
-    the plainest case the fix must catch, and it is the one that never gated at all.
-    """
+    """The control for the case above (#213)"""
     assert classify(command, gate_rules.RuleSet.from_seeds()) is None
 
 
@@ -738,26 +611,18 @@ def test_the_wrapper_miss_is_older_than_the_positional_test(command):
     'ssh prod sh -c scripts/shipit.sh',
 ])
 def test_an_unquoted_wrapper_payload_still_gates(command):
-    """The boundary of that miss: nothing is blanked, so the literal is in plain sight
-    and the gate fires. Only the quoting hides it."""
+    """The boundary of that miss: nothing is blanked, so the literal is in plain sight and the gate fires"""
     assert classify(command, gate_rules.RuleSet.from_seeds()) is not None
 
 
 def test_a_reader_whose_argument_names_a_shell_invoker_still_only_reads():
-    """`reads_only` ran the same raw search, so a note about a shell cost a reader its
-    exemption. The exemption cannot widen: an invoker the shell reaches is never a
-    reader's argv0, so the test is belt-and-braces either way."""
+    """`reads_only` ran the same raw search, so a note about a shell cost a reader its exemption"""
     assert gate_rules.reads_only('grep -n "eval" src/jarvis/gate_rules.py')
     assert not gate_rules.reads_only('cat notes.md | xargs ./scripts/shipit.sh')
 
 
 def test_a_heredoc_handed_to_an_interpreter_is_a_canary():
-    """Approval 96, the conservative TRUE positive the fix must not turn into a miss:
-    a heredoc body is a program to `python3`, so no learned rule may ever clear it.
-
-    Pinned as a canary because `Shape.exemptible` already says so via `_EXECUTORS`, and a
-    property nothing tests is a property the next edit can drop.
-    """
+    """Approval 96, the conservative TRUE positive the fix must not turn into a miss: a heredoc body is a..."""
     command = "python3 - <<'PY'\nscripts/shipit.sh\nPY"
     assert command in [c for _, c in gate_rules.SEED_CANARIES]
     assert classify(command, gate_rules.RuleSet.from_seeds()) is not None
@@ -766,9 +631,7 @@ def test_a_heredoc_handed_to_an_interpreter_is_a_canary():
 
 
 def test_a_pinned_release_command_still_gates():
-    """2026-10-01 spec §7: the pinned command is the only release command the OS asks
-    for, and it is the most argument-shaped of the group — the shape a learned exemption
-    about "a long quoted argument" would most plausibly clear by accident."""
+    """2026-10-01 spec §7: the pinned command is the only release command the OS asks for"""
     command = ("scripts/shipit.sh --stage --wo wo-1234abcd "
                "--base 442729f0c1e4b7a9d3f5068b2c4e7a1d9b0f3c58")
     assert command in [c for _, c in gate_rules.SEED_CANARIES]
@@ -785,23 +648,19 @@ def test_learning_the_commit_shape_does_not_clear_an_interpreter_heredoc(central
     assert classify("python3 - <<'PY'\nscripts/shipit.sh\nPY", after) is not None
 
 
-# -- the known holes this mechanism now covers ----------------------------------------
+# -- the known holes this mechanism now covers
 
 
 def test_the_eval_in_prose_hole_is_closed(central):
-    """kn-1ecbbff2: the bare word `eval` anywhere used to turn off quote-blanking, so a
-    summary reporting "eval scorecard 36/36" and naming a gated verb was scanned as code
-    and gated. It cost a review every time, and no dismissal was needed to settle it —
-    the word is inside the quoted argument, where nothing re-parses it (issue #203).
-    """
+    """kn-1ecbbff2: the bare word `eval` anywhere used to turn off quote-blanking (#203)"""
     command = ('jarvis wo finish wo-1 --summary "eval scorecard 36/36; '
                'do not gh pr merge until reviewed"')
     assert classify(command, gate_rules.RuleSet.load(central)) is None
-    # …and the same words with nothing quoting them are still a merge.
+    # …and the same words with nothing quoting them are still a merge
     assert classify("gh pr merge 31", gate_rules.RuleSet.load(central)) is not None
 
 
-# -- end to end, through the hook and a verdict ---------------------------------------
+# -- end to end, through the hook and a verdict
 
 
 @pytest.fixture()
@@ -830,11 +689,7 @@ def _decision(result):
 
 
 def test_a_dismissal_through_the_hook_stops_the_next_worker_being_blocked(gated):
-    """The four-false-positives-in-one-work-order scenario, played forwards.
-
-    The first commit is blocked and reviewed. The second — different message, same shape,
-    the commit that would have been gate 41 — is never blocked at all.
-    """
+    """The four-false-positives-in-one-work-order scenario, played forwards"""
     assert _decision(gated.attempt(HEREDOC_COMMIT)) == "deny"
     approval = gated.store.list_approvals(gated.wo["id"])[0]
 
@@ -872,7 +727,7 @@ def test_the_timeline_records_what_was_learned(gated):
 
 
 def test_a_dismissal_that_teaches_nothing_says_so(gated):
-    """A real release dismissed by mistake must not silently look like a learned rule."""
+    """A real release dismissed by mistake must not silently look like a learned rule"""
     gated.attempt("./scripts/shipit.sh")
     approval = gated.store.list_approvals(gated.wo["id"])[0]
 

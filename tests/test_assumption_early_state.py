@@ -1,18 +1,4 @@
-"""The state an assumption judged mid-run is recorded in, and how it renders.
-
-§4 of docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-runs.md.
-Columns, store verbs, event kinds and the two shared renderers — delivered with no caller,
-so these tests are the only thing holding the names the five sections behind it call.
-
-TWO POST-CONDITIONS THIS FILE EXISTS FOR, and they outrank every other assertion here:
-
-1. `status` NEVER LEAVES `pending` on any of these paths (§4.1). Eight-plus call sites
-   read `pending` as "the user owes a decision", so a provisional verdict that moved it
-   would silently open the user's gate — the feature's stated failure mode.
-2. A ROW THAT PREDATES THE COLUMNS renders exactly as it did before (kn-c712a5d6). That
-   is most of the fleet: every historical assumption, and every project with early review
-   off.
-"""
+"""The state an assumption judged mid-run is recorded in, and how it renders (docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-runs.md)"""
 
 from __future__ import annotations
 
@@ -25,12 +11,7 @@ NEW_COLUMNS = tuple(ADDED_COLUMNS["assumptions"])
 
 
 def _aged_store(tmp_path):
-    """Today's schema with the new columns dropped — a database from the live release.
-
-    Built by dropping rather than from a frozen asset, for `test_schema_upgrade`'s
-    reason: an asset that predates the whole table would exercise `CREATE TABLE` and pass
-    with `ADDED_COLUMNS` forgotten, which is the failure this shape catches.
-    """
+    """Today's schema with the new columns dropped — a database from the live release"""
     proj = tmp_path / "aged"
     (proj / ".jarvis").mkdir(parents=True)
     store = ProjectStore(proj)
@@ -55,8 +36,7 @@ def test_the_columns_reach_a_database_that_predates_them(tmp_path):
         have = {r["name"] for r in
                 store.conn.execute("PRAGMA table_info(assumptions)").fetchall()}
         assert set(NEW_COLUMNS) <= have
-        # ...and the row written before them reads as "nothing ever judged this early",
-        # which is the only honest answer and the one every surface keys off.
+        # ...and the row written before them reads as "nothing ever judged this early"
         old = store.get_assumption(aid)
         assert old["provisional_verdict"] == ""
         assert old["objection_transport"] == ""
@@ -78,7 +58,7 @@ def test_the_columns_reach_a_database_that_predates_them(tmp_path):
 
 
 def test_a_provisional_verdict_does_not_settle_the_assumption(project):
-    """§4.1, the one edit this feature forbids. The negative control is the whole test."""
+    """§4.1, the one edit this feature forbids"""
     store = ProjectStore(project)
     wo = store.create_work_order(title="running order", description="")
     aid = store.add_assumption(wo["id"], "the API is idempotent")
@@ -107,11 +87,7 @@ def test_unclassified_is_what_no_stakes_means(project):
 
 
 def test_assumption_for_question_resolves_both_question_columns(project):
-    """The early question AND the confirmation question, §4.3.
-
-    A single-column lookup would resolve the confirmation question to nothing, and §7's
-    verdict would be dropped on the floor with the assumption left pending for ever.
-    """
+    """The early question AND the confirmation question, §4.3"""
     store = ProjectStore(project)
     wo = store.create_work_order(title="o", description="")
     aid = store.add_assumption(wo["id"], "a")
@@ -126,14 +102,7 @@ def test_assumption_for_question_resolves_both_question_columns(project):
 
 
 def test_clearing_the_confirmation_link_touches_nothing_else(project):
-    """§4.3 step 2 of docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-
-    hold-an-assumption-for-ever.md — the twin of `link_assumption_confirmation` above.
-
-    A verb of its own rather than `link_assumption_confirmation(aid, None)`: that
-    parameter is typed `int`, and a nullable overload would let the ASK path clear a link
-    by passing a falsy question id. The early reading and the status stay exactly as they
-    were — the next tick re-asks the CONFIRMATION, and nothing else is re-formed.
-    """
+    """§4.3 step 2 of docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-..."""
     store = ProjectStore(project)
     wo = store.create_work_order(title="o", description="")
     aid = store.add_assumption(wo["id"], "a")
@@ -155,7 +124,7 @@ def test_clearing_the_confirmation_link_touches_nothing_else(project):
 
 
 def test_outstanding_objections_is_neither_delivered_nor_withdrawn(project):
-    """One query, two readers — §6.6 withdraws from this list and §7 waits on it."""
+    """One query, two readers — §6.6 withdraws from this list and §7 waits on it"""
     store = ProjectStore(project)
     wo = store.create_work_order(title="o", description="")
     plain = store.add_assumption(wo["id"], "no objection at all")
@@ -179,11 +148,10 @@ def test_outstanding_objections_is_neither_delivered_nor_withdrawn(project):
 
 
 def test_an_envelope_says_which_message_it_became(project):
-    """`envelopes.delivered_msg_id`, §4.2 — the link §8 and §9 both have to follow."""
+    """`envelopes.delivered_msg_id`, §4.2 — the link §8 and §9 both have to follow"""
     store = ProjectStore(project)
     wo = store.create_work_order(title="o", description="")
-    # `review_feedback` and not the objection kind §6.2 adds: the link is the BUS's, not
-    # this feature's, and every envelope must carry it.
+    # `review_feedback` and not the objection kind §6.2 adds: the link is the BUS's
     env_id = store.post_envelope(from_role="reviewer", to_role="implementor",
                                  kind="review_feedback", subject_wo_id=wo["id"])
     assert store.envelopes(subject_wo_id=wo["id"])[0]["delivered_msg_id"] is None
@@ -194,11 +162,11 @@ def test_an_envelope_says_which_message_it_became(project):
     assert env["state"] == "delivered"
 
 
-# -- the renderers ------------------------------------------------------------
+# -- the renderers
 
 
 def test_a_historical_assumption_renders_exactly_as_it_did(project):
-    """The test that matters (§8): empty columns must read as "nothing happened"."""
+    """The test that matters (§8): empty columns must read as "nothing happened\""""
     pending = {"n": 1, "status": "pending", "content": "the API is idempotent",
                "provisional_verdict": "", "objection_transport": ""}
     assert ops.assumption_line(pending) == (
@@ -212,7 +180,7 @@ def test_a_historical_assumption_renders_exactly_as_it_did(project):
 
 
 def test_a_provisional_reading_is_never_credited_to_the_user():
-    """One renderer, and the phrase it builds names the machine (§4.4)."""
+    """One renderer, and the phrase it builds names the machine (§4.4)"""
     row = {"n": 1, "status": "pending", "content": "c",
            "provisional_verdict": "accept", "provisional_model": "opus-5"}
     phrase = ops.assumption_decider(row)
@@ -223,8 +191,7 @@ def test_a_provisional_reading_is_never_credited_to_the_user():
 
 
 def test_the_objection_line_tells_four_states_apart():
-    """In flight, delivered, withdrawn, undeliverable — rendering two the same is §8's
-    named defect."""
+    """In flight, delivered, withdrawn, undeliverable — rendering two the same is §8's named defect"""
     base = {"objection_envelope_id": 4, "objection_transport": "peer",
             "objection_sent_ts": 1_700_000_000.0}
     flight = ops.objection_line(base)
@@ -244,7 +211,7 @@ def test_the_objection_line_tells_four_states_apart():
 
 
 def test_the_early_reading_survives_on_a_settled_row():
-    """§7 hands the user both readings when they disagree, so the line carries both."""
+    """§7 hands the user both readings when they disagree, so the line carries both"""
     row = {"n": 1, "status": "accepted", "content": "c", "decided_by": "neo",
            "decided_model": "opus-5", "decided_reason": "confirmed against the diff",
            "provisional_verdict": "accept", "provisional_model": "opus-5",
@@ -254,7 +221,7 @@ def test_the_early_reading_survives_on_a_settled_row():
     assert "looks standard" in line
 
 
-# -- the event kinds ----------------------------------------------------------
+# -- the event kinds
 
 
 EARLY_KINDS = ("autoreview_provisional", "autoreview_objected",
@@ -263,9 +230,7 @@ EARLY_KINDS = ("autoreview_provisional", "autoreview_objected",
 
 
 def test_confirming_under_a_panel_that_gave_up_names_the_round():
-    """§7's tail call forwards the round the way it already forwards the outcome and the
-    stakes: a confirmation held by a give-up must say which round, or the one pass that
-    settles anything is the one whose hold says least."""
+    """§7's tail call forwards the round the way it already forwards the outcome and the stakes: a..."""
     from jarvis import autoreview
     from jarvis.catalog import ValidationConfig
 
@@ -287,8 +252,7 @@ def test_the_five_event_kinds_are_enumerated_once():
 
 
 def test_every_autoreview_kind_has_a_rank():
-    """`assumptions_with_rulings` indexes `_RULING_RANK` directly — a missing entry is a
-    KeyError on the work order page, not a cosmetic gap."""
+    """`assumptions_with_rulings` indexes `_RULING_RANK` directly"""
     assert set(ops.AUTOREVIEW_EVENTS) == set(ops._RULING_RANK)
     # the delivery pass outranks every early reading: only it settles anything
     assert ops._RULING_RANK["autoreview_confirmed"] > ops._RULING_RANK[
@@ -296,8 +260,7 @@ def test_every_autoreview_kind_has_a_rank():
 
 
 def test_every_autoreview_kind_has_its_own_summary_line():
-    """A kind with no branch falls through to "held —", which claims the OS refused to
-    judge an assumption it did judge."""
+    """A kind with no branch falls through to "held —\""""
     lines = {kind: ops._autoreview_line({"kind": kind, "n": 3, "verdict": "accept",
                                          "model": "opus-5", "reason": "because"})
              for kind in ops.AUTOREVIEW_EVENTS}
@@ -309,7 +272,7 @@ def test_every_autoreview_kind_has_its_own_summary_line():
 
 
 def test_every_autoreview_kind_has_a_timeline_label():
-    """kn-3f133363: a kind with no branch renders as generic prose that says nothing."""
+    """kn-3f133363: a kind with no branch renders as generic prose that says nothing"""
     for kind in ops.AUTOREVIEW_EVENTS:
         label, _detail = timeline._describe(
             kind, {"n": 3, "verdict": "accept", "model": "opus-5", "reason": "because",

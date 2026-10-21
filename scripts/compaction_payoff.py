@@ -49,14 +49,12 @@ from jarvis.compaction_payoff import (  # noqa: E402,F401
     summarise,
 )
 
-#: The pre-move private names, kept so a caller of either spelling gets the SAME object.
+#: The pre-move private names, kept so a caller of either spelling gets the SAME object
 _parse_when = parse_when
 _quantile = quantile
 
 
-# ---------------------------------------------------------------------------------------
 # Rendering
-# ---------------------------------------------------------------------------------------
 
 def _fmt_k(n: int | None) -> str:
     return "-" if n is None else f"{n / 1000:,.0f}k"

@@ -1,28 +1,4 @@
-"""Screenshot the REVIEW control an escalated round owes, for a PR's UI evidence.
-
-`scripts/screenshot_rejudge_control.py` is the shape this copies. Issue #816: a work
-order the panel gave up on named the ask and offered no way to answer it, because the
-only review form was gated on a pending assumption.
-
-Two shots, because the change has two claims and one shot shows neither on its own: the
-control existing at all on an order with NO assumption rows (and the `#pending` deep link
-landing on it), and the same order shape with ONE pending assumption, where the control
-renders ONCE and in the assumptions block.
-
-One shot per WRITTEN FAMILY too, which is how a contradictory header gets caught by eye
-rather than by a string assertion: the bare order is `rounds_spent` (`handover` — the panel
-rejected it), the held one is `nothing_to_judge` (`not_reviewed` — no seat judged it, so
-nothing was rejected and no seat opinion is recorded).
-
-The escalated state is built through `ops.finish` + `ops.escalate_validation_round`, never
-`store.set_status` (kn-303839ee): a hand-built state leaves no attention flag and is a
-picture of a surface nobody has.
-
-Writes PNGs to docs/screenshots/. Everything it touches lives in a temp `JARVIS_HOME`
-and a temp catalog, so it never reads or writes the live OS:
-
-    uv run python scripts/screenshot_review_control.py
-"""
+"""Screenshot the REVIEW control an escalated round owes, for a PR's UI evidence (#816)"""
 
 from __future__ import annotations
 
@@ -54,13 +30,7 @@ def _repo(path: Path) -> None:
 def _escalate(store, title: str, description: str, summary: str, *,
               cause: str | None = None, reason: str = REASON,
               judged: bool = True) -> str:
-    """A work order in the live shape of wo-659be188: `needs_review`, latest round
-    `escalated`. Same shape as `tests/test_ui.py::_escalate`, through the real path.
-
-    `cause` picks the family the page is a picture of. `judged=False` records NO seat
-    opinion, which is the whole point of a `not_reviewed` shot: a page showing seat
-    verdicts beside "was not reviewed" would be a picture of a contradiction.
-    """
+    """A work order in the live shape of wo-659be188: `needs_review`, latest round `escalated`"""
     from jarvis import ops
 
     wo = ops.create_work_order("jarvis_os", title, description)
@@ -144,7 +114,7 @@ def shoot(bare: str, held: str) -> None:
         browser = p.chromium.launch()
         page = browser.new_page(viewport={"width": 1280, "height": 900})
 
-        # The deep link, not a scroll: the shot proves `#pending` lands on the control.
+        # The deep link, not a scroll: the shot proves `#pending` lands on the control
         page.goto(f"{base}/wo/jarvis_os/{bare}#pending")
         page.wait_for_timeout(300)
         page.screenshot(path=SHOTS / "review-escalated-no-assumptions.png")

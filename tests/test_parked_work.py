@@ -1,22 +1,4 @@
-"""A work order that stopped, and nothing coming for it.
-
-Built from wo-a4bd6958, the planner of fo-6269be9a: its turn 4 ended cleanly at 12:03
-saying "Waiting on exact counts before I open the PR", and nothing happened for 7h13m
-until the user typed. Two separate failures produced that, and each has a test here.
-
-* The order was NOT invisible — it settled to `needs_review` and carried the attention
-  flag the whole time. It carried it for "assumptions pending review", a reason four
-  hours older than the parking, which named none of what had just happened. That is
-  `STALE_FINISH_BLOCKER`, and the rule it must obey is that it rides BESIDE the older
-  reason and never over it.
-* A work order the OS still calls `running` with a settled turn behind it had no check
-  at all: no branch of `true_blockers` looked at a `running` order. That is
-  `PARKED_BLOCKER`.
-
-The noise rule is the other half of the suite and most of its assertions: an order
-waiting on a dependency, a gate, Neo, a queued message, a scheduled retry or a turn in
-flight is waiting CORRECTLY and must stay silent.
-"""
+"""A work order that stopped, and nothing coming for it"""
 
 from __future__ import annotations
 
@@ -36,13 +18,12 @@ from jarvis.invariants import (
 from jarvis.neo_store import NeoStore
 from jarvis.project_store import ProjectStore
 
-#: Comfortably past the shipped 60-minute default, in seconds.
+#: Comfortably past the shipped 60-minute default, in seconds
 LONG_ENOUGH = 90 * 60
 
 
 def _parked_running(store: ProjectStore, title: str = "the parked one") -> dict:
-    """The shape `Daemon.settle_work_order` leaves behind when it never gets there: the
-    turn is reaped and done, the work order still says `running`, nothing is queued."""
+    """The shape `Daemon.settle_work_order` leaves behind when it never gets there: the turn is reaped and..."""
     wo = store.create_work_order(title)
     store.set_status(wo["id"], "running")
     turn = store.create_turn(wo["id"], "dispatch", "do the thing")
@@ -51,12 +32,7 @@ def _parked_running(store: ProjectStore, title: str = "the parked one") -> dict:
 
 
 def _wo_a4bd6958(store: ProjectStore) -> dict:
-    """wo-a4bd6958 itself: finished on an early turn, sent back to work, stopped again.
-
-    The `finished` event is what `settle_work_order` can never re-reach — it reads
-    `result_summary`, a column no later turn clears — and the assumptions are the older
-    flag that ended up speaking for the whole 7h13m.
-    """
+    """wo-a4bd6958 itself: finished on an early turn, sent back to work, stopped again"""
     wo = store.create_work_order("Plan: widen the supervisor")
     early = store.create_turn(wo["id"], "dispatch", "plan it")
     store.finish_turn(early["id"], "done", result="submitted the plan")
@@ -72,12 +48,7 @@ def _wo_a4bd6958(store: ProjectStore) -> dict:
 
 
 def _rewind(monkeypatch, seconds: float):
-    """Build the fixture `seconds` in the past, with the clock still MOVING.
-
-    Freezing `db.now` is not good enough here: the whole of `STALE_FINISH_BLOCKER` is
-    that one recorded moment is earlier than another, and a constant clock makes every
-    row in the fixture simultaneous. Returns the callable that puts the real one back.
-    """
+    """Build the fixture `seconds` in the past, with the clock still MOVING"""
     was = db.now
     base = was() - seconds
     ticks = iter(range(100_000))
@@ -86,11 +57,11 @@ def _rewind(monkeypatch, seconds: float):
 
 
 def _later(store: ProjectStore, wo_id: str) -> float:
-    """Long enough after this work order's last turn ended for the threshold to bite."""
+    """Long enough after this work order's last turn ended for the threshold to bite"""
     return float(store.latest_turn(wo_id)["ended_at"]) + LONG_ENOUGH
 
 
-# -- the two shapes it must catch ------------------------------------------------------
+# -- the two shapes it must catch
 
 
 def test_a_settled_turn_on_a_running_order_is_parked_once_the_threshold_passes(project):
@@ -103,8 +74,7 @@ def test_a_settled_turn_on_a_running_order_is_parked_once_the_threshold_passes(p
 
 
 def test_a_stale_finish_rides_beside_the_reason_it_was_masked_by(project):
-    """The 7h13m itself. The assumptions line stays first and stays the flag; the
-    parking is appended, so the user reads both instead of one replacing the other."""
+    """The 7h13m itself"""
     store = ProjectStore(project)
     wo = _wo_a4bd6958(store)
 
@@ -115,8 +85,7 @@ def test_a_stale_finish_rides_beside_the_reason_it_was_masked_by(project):
 
 
 def test_a_needs_review_order_whose_finish_is_current_says_nothing_extra(project):
-    """The noise rule at its sharpest: every review the user has not got to yet has a
-    settled turn behind it, and none of them is news."""
+    """The noise rule at its sharpest: every review the user has not got to yet has a settled turn behind..."""
     store = ProjectStore(project)
     wo = store.create_work_order("ordinary review")
     turn = store.create_turn(wo["id"], "dispatch", "do it")
@@ -132,7 +101,7 @@ def test_a_needs_review_order_whose_finish_is_current_says_nothing_extra(project
         "1 assumption pending your review"]
 
 
-# -- the noise rule --------------------------------------------------------------------
+# -- the noise rule
 
 
 def test_a_dependency_blocked_order_is_not_parked(project):
@@ -176,7 +145,7 @@ def test_an_order_with_a_turn_in_flight_is_not_parked(project):
 
 
 def test_a_queued_message_is_not_parked(project):
-    """The next turn is already written down; the daemon delivers it."""
+    """The next turn is already written down; the daemon delivers it"""
     store = ProjectStore(project)
     wo = _parked_running(store)
     store.queue_message(wo["id"], "carry on")
@@ -185,8 +154,7 @@ def test_a_queued_message_is_not_parked(project):
 
 
 def test_a_turn_waiting_on_its_scheduled_retry_is_not_parked(project):
-    """`retry_paused_turns` relaunches this one unaided, and `ops.waiting_on` had to
-    learn to say so — its fall-through called a booked retry a permission prompt."""
+    """`retry_paused_turns` relaunches this one unaided, and `ops.waiting_on` had to learn to say so"""
     store = ProjectStore(project)
     wo = store.create_work_order("hit the usage limit")
     store.set_status(wo["id"], "running")
@@ -201,13 +169,7 @@ def test_a_turn_waiting_on_its_scheduled_retry_is_not_parked(project):
 
 
 def test_an_idle_manager_is_never_parked(project):
-    """A project manager is idle BY DESIGN between its feature's messages — flagging one
-    would put a permanent second line on every feature order in the fleet.
-
-    The SILENCE IS BOUGHT BY THE STATUS, not by the kind (issue #264): `idle` is absent
-    from PARKABLE_STATUSES because "nothing is in flight" is its definition rather than
-    news about it, which is what replaced this function's `kind == 'manager'` carve-out.
-    """
+    """A project manager is idle BY DESIGN between its feature's messages (#264)"""
     store = ProjectStore(project)
     wo = store.create_work_order("manage the feature", kind="manager")
     store.set_status(wo["id"], "idle")
@@ -219,10 +181,7 @@ def test_an_idle_manager_is_never_parked(project):
 
 
 def test_a_manager_stranded_in_waiting_input_IS_parked(project):
-    """The other half, and the reason the kind carve-out had to go. A manager reaches
-    `waiting_input` only by ASKING for something; one sitting there with a finished turn
-    and nothing out has had its wait end without anything restarting it, and no reconciler
-    will notice. The carve-out silenced exactly that."""
+    """The other half, and the reason the kind carve-out had to go"""
     store = ProjectStore(project)
     wo = store.create_work_order("manage the feature", kind="manager")
     store.set_status(wo["id"], "waiting_input")
@@ -234,8 +193,7 @@ def test_a_manager_stranded_in_waiting_input_IS_parked(project):
 
 
 def test_an_injected_session_is_never_parked(project):
-    """It was never briefed on `jarvis wo finish`, so its silence proves nothing —
-    the same excuse `true_blockers` already makes for it."""
+    """It was never briefed on `jarvis wo finish`, so its silence proves nothing"""
     store = ProjectStore(project)
     wo = store.create_work_order("the user's own session", origin="injected")
     store.set_status(wo["id"], "running")
@@ -246,12 +204,11 @@ def test_an_injected_session_is_never_parked(project):
                          now=_later(store, wo["id"])) is None
 
 
-# -- the reconcile tick, and the surface --------------------------------------------
+# -- the reconcile tick, and the surface
 
 
 def test_the_reconciler_flags_a_parked_running_order(project, monkeypatch):
-    """INV-ATTENTION-MISSING must select `running` for this: a status it skips has its
-    blocker derived correctly and then never surfaced."""
+    """INV-ATTENTION-MISSING must select `running` for this: a status it skips has its blocker derived..."""
     store = ProjectStore(project)
     restore = _rewind(monkeypatch, LONG_ENOUGH)
     wo = _parked_running(store)
@@ -268,9 +225,7 @@ def test_the_reconciler_flags_a_parked_running_order(project, monkeypatch):
 
 def test_a_read_only_doctor_run_reports_the_parking_without_raising_it(
         project, monkeypatch):
-    """`jarvis doctor` runs every invariant through `invariants._ReadOnly`, which
-    swallows `flag_attention` — and `parked_reason` reaches `store.project_path` for its
-    threshold through that same proxy, which is a passthrough of a non-callable."""
+    """`jarvis doctor` runs every invariant through `invariants._ReadOnly`"""
     store = ProjectStore(project)
     restore = _rewind(monkeypatch, LONG_ENOUGH)
     wo = _parked_running(store)
@@ -303,9 +258,7 @@ def test_jarvis_status_names_the_parked_order_and_what_it_is_parked_on(
 
 def test_a_parked_child_is_named_on_its_feature_orders_rolled_up_line(
         project, catalog_file, monkeypatch):
-    """A feature's children get ONE rolled-up line instead of a line each, and
-    wo-a4bd6958 was a child — so the rollup is the only place `jarvis status` can say it.
-    """
+    """A feature's children get ONE rolled-up line instead of a line each, and wo-a4bd6958 was a child"""
     store = ProjectStore(project)
     fo = store.create_feature_order("widen the supervisor", "…")
     restore = _rewind(monkeypatch, LONG_ENOUGH)
@@ -325,8 +278,7 @@ def test_a_parked_child_is_named_on_its_feature_orders_rolled_up_line(
 
 def test_the_dashboard_shows_the_blocker_the_flag_could_not_carry(
         project, catalog_file, jarvis_home, fake_claude, monkeypatch):
-    """`attention_reason` is one column fed from `true_blockers[0]`, so a masked order
-    reports only the decision. Listings link; the work order's own page tells."""
+    """`attention_reason` is one column fed from `true_blockers[0]`"""
     from fastapi.testclient import TestClient
 
     from jarvis.ui.app import create_app
@@ -342,27 +294,24 @@ def test_the_dashboard_shows_the_blocker_the_flag_could_not_carry(
     client = TestClient(create_app(), follow_redirects=False)
 
     def second_blocker(text: str) -> str:
-        # The added paragraph exactly. Matched as markup rather than by counting the
-        # bare sentence, which also appears in the `attention` timeline event below it.
+        # The added paragraph exactly
         return f'<p class="st wrap tone-warn"><span class="i">◭</span>{text}</p>'
 
     page = client.get(f"/wo/proj_a/{masked['id']}").text
 
     assert "assumptions pending review" in page
     assert second_blocker(STALE_FINISH_BLOCKER) in page
-    # ...and nothing added to an order whose one reason already says it.
+    # ...and nothing added to an order whose one reason already says it
     other = client.get(f"/wo/proj_a/{ordinary['id']}").text
     assert second_blocker(PARKED_BLOCKER) not in other
     assert PARKED_BLOCKER in other
 
 
-# -- the threshold is a setting ------------------------------------------------------
+# -- the threshold is a setting
 
 
 def _register(catalog_file) -> None:
-    """What `jarvis start` does to the central store, minus starting anything: the
-    catalog `inspect_config_at` resolves against, and the project row `os_status` walks.
-    """
+    """What `jarvis start` does to the central store"""
     data = json.loads(catalog_file.read_text())
     central = CentralStore()
     try:
@@ -416,8 +365,7 @@ def test_disabling_the_inspect_alarms_disables_the_parked_check(project, catalog
 
 
 def test_the_parked_reason_does_not_move_with_the_clock(project):
-    """It is compared against `attention_reason` and stored by `ack_attention`, so a
-    reason carrying an elapsed time would be rewritten every tick and never stick."""
+    """It is compared against `attention_reason` and stored by `ack_attention`"""
     store = ProjectStore(project)
     wo = _parked_running(store)
     ended = float(store.latest_turn(wo["id"])["ended_at"])
@@ -436,11 +384,7 @@ def test_acknowledging_a_parked_order_puts_the_flag_down_for_good(project):
 
 
 def test_nothing_here_nudges_a_worker(project):
-    """The supervisor's gated remedy is the OS's one path into a worker's inbox
-    (docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md §5). This check
-    only raises a flag — wo-a4bd6958's own case is the argument: the suite run it was
-    waiting on died with its process, so "continue" would have resumed nothing.
-    """
+    """The supervisor's gated remedy is the OS's one path into a worker's inbox... (docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md §5)"""
     store = ProjectStore(project)
     wo = _parked_running(store)
     check_project(store)
@@ -449,19 +393,15 @@ def test_nothing_here_nudges_a_worker(project):
     assert store.get_work_order(wo["id"])["status"] == "running"
 
 
-# -- 2b: a head the OS has already judged is not an undelivered one ---------------------
+# -- 2b: a head the OS has already judged is not an undelivered one
 
-#: The commit the passing round judged. wo-3312682f's shape: the head never moved.
+#: The commit the passing round judged. wo-3312682f's shape: the head never moved
 JUDGED = "1f2e3d4c5b6a7980112233445566778899aabbcc"
 
 
 def _judged_then_replied(store: ProjectStore, monkeypatch, *, head: str,
                          judged: str) -> dict:
-    """wo-3312682f: delivered, judged green, then a reply turn the OS itself opened.
-
-    The reply is a GATE DISMISSAL, which is not a PR repair — so `PR_REPAIR_SOURCES`
-    cannot excuse it and only head equality can.
-    """
+    """wo-3312682f: delivered, judged green, then a reply turn the OS itself opened"""
     restore = _rewind(monkeypatch, 4 * LONG_ENOUGH)
     wo = store.create_work_order("delivered behind a pull request")
     first = store.create_turn(wo["id"], "dispatch", "do it")
@@ -482,8 +422,7 @@ def _judged_then_replied(store: ProjectStore, monkeypatch, *, head: str,
 
 def test_a_reply_turn_on_an_already_judged_head_is_not_a_stale_finish(project,
                                                                      monkeypatch):
-    """Spec §2b. The head the panel passed IS the head GitHub reports, so nothing is
-    undelivered — whatever opened the turn."""
+    """Spec §2b"""
     store = ProjectStore(project)
     wo = _judged_then_replied(store, monkeypatch, head=JUDGED, judged=JUDGED)
 
@@ -491,8 +430,7 @@ def test_a_reply_turn_on_an_already_judged_head_is_not_a_stale_finish(project,
 
 
 def test_a_round_that_recorded_no_commit_is_no_excuse(project, monkeypatch):
-    """Spec §2b: an EMPTY head is never read as equal. Pre-0.10.0 rounds recorded none,
-    so the check degrades to exactly what it did before."""
+    """Spec §2b: an EMPTY head is never read as equal"""
     store = ProjectStore(project)
     wo = _judged_then_replied(store, monkeypatch, head="", judged="")
 
@@ -501,7 +439,7 @@ def test_a_round_that_recorded_no_commit_is_no_excuse(project, monkeypatch):
 
 def test_a_head_that_moved_past_the_judged_commit_still_reports_the_stale_finish(
         project, monkeypatch):
-    """The worker pushed after the round passed: that IS something undeclared."""
+    """The worker pushed after the round passed: that IS something undeclared"""
     store = ProjectStore(project)
     wo = _judged_then_replied(store, monkeypatch, head="0" * 40, judged=JUDGED)
 
@@ -509,7 +447,7 @@ def test_a_head_that_moved_past_the_judged_commit_still_reports_the_stale_finish
 
 
 def test_the_merged_head_excuses_it_too(project, monkeypatch):
-    """The other member of the judged set: the newest `pr_merged` event's `head_oid`."""
+    """The other member of the judged set: the newest `pr_merged` event's `head_oid`"""
     store = ProjectStore(project)
     wo = _judged_then_replied(store, monkeypatch, head=JUDGED, judged="")
     store.add_event(wo["id"], "pr_merged", {"head_oid": JUDGED})

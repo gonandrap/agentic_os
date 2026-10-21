@@ -1,23 +1,4 @@
-"""Screenshot the debug page's navigation reading — the PR's UI evidence for spec §3.
-
-`_debug_anatomy.html` renders `u.nav_line` beside the `Tool profile` heading, and
-`inspection.nav_line` OMITS the `unclassified` clause when the count is zero: a reading
-that could not be taken must never print as a measured `0` (issue #227). A server-side
-test that greps for the string cannot show that the pair reads as a pair, so both states
-are captured side by side, from two REAL order pages whose readings differ in nothing
-else:
-
-  * WITH an unclassified count — `navigation — 2 symbol, 3 source nav, 1 unclassified`,
-    the three separate numbers all visible
-  * WITHOUT one — `navigation — 2 symbol, 3 source nav`, the clause ABSENT rather than
-    printed as zero
-
-Same 2 and same 3 on both sides deliberately: the only difference in the sentence is the
-clause, which is the claim. Everything lives in a temp `JARVIS_HOME` with its own
-transcript root, so it never touches the live OS:
-
-    uv run python scripts/screenshot_debug_anatomy_navigation.py
-"""
+"""Screenshot the debug page's navigation reading — the PR's UI evidence for spec §3 (#227)"""
 
 from __future__ import annotations
 
@@ -42,7 +23,7 @@ SLUG = "-proj"
 NOW = time.time()
 TURN = (NOW - 1800, NOW - 900)
 
-#: The two states, each as (session id, caption, the sentence asserted on its page).
+#: The two states, each as (session id, caption, the sentence asserted on its page)
 WITH_UNCLASSIFIED = "sess-nav-three-counts"
 WITHOUT_UNCLASSIFIED = "sess-nav-clause-omitted"
 EXPECTED = {
@@ -56,7 +37,7 @@ CAPTIONS = {
 }
 
 
-# -- the transcripts --------------------------------------------------------------------
+# -- the transcripts
 
 
 def stamp(at: float) -> str:
@@ -95,11 +76,7 @@ def tool_rows(start: float, end: float, tool_id: str, name: str,
 
 
 def classified_rows(base: float) -> list[dict]:
-    """2 symbol calls and 3 source-navigation `Bash` calls, every one classifiable.
-
-    The symbol names carry the `mcp__…__` prefix `navigation.is_symbol_call` strips, and
-    each `Bash` command names a `.py` path — which is what `navigates_source` reads.
-    """
+    """2 symbol calls and 3 source-navigation `Bash` calls, every one classifiable"""
     return [
         *tool_rows(base, base + 3, "t1", "mcp__plugin_serena_serena__find_symbol",
                    {"name_path_pattern": "Anatomy/nav_profile"}),
@@ -116,11 +93,7 @@ def classified_rows(base: float) -> list[dict]:
 
 
 def session_rows(base: float, *, unclassified: bool) -> list[dict]:
-    """One turn of navigation, with or without a `Bash` span that carries no command.
-
-    A `Bash` call recorded with only a `description` is UNCLASSIFIED rather than False:
-    the command text was never available, so nothing can be said about it (issue #227).
-    """
+    """One turn of navigation, with or without a `Bash` span that carries no command (#227)"""
     rows = [prompt_row(base, "You are the worker agent for this work order. "
                              "Find every caller of inspection.nav_line."),
             assistant_row(base + 1, "m1"),
@@ -132,11 +105,11 @@ def session_rows(base: float, *, unclassified: bool) -> list[dict]:
     return rows
 
 
-# -- the records ------------------------------------------------------------------------
+# -- the records
 
 
 def seed() -> tuple[str, list[tuple[str, str]]]:
-    """One project, two completed orders — one per state. Returns (project, [(sid, wo)])."""
+    """One project, two completed orders — one per state"""
     from jarvis import ops
     from jarvis.central_store import CentralStore
     from jarvis.project_store import ProjectStore
@@ -171,8 +144,7 @@ def seed() -> tuple[str, list[tuple[str, str]]]:
             store.update_work_order(wo["id"], session_id=session, status="completed")
             turn = store.create_turn(wo["id"], kind="dispatch", prompt="p")
             store.finish_turn(turn["id"], "done", result="ok", cost_usd=1.4, num_turns=6)
-            # The window is rewritten directly: `create_turn` stamps now, and the anatomy
-            # joins calls to turns BY these timestamps, so they must match the rows.
+            # The window is rewritten directly: `create_turn` stamps now
             store.conn.execute(
                 "UPDATE wo_turns SET started_at=?, ended_at=? WHERE id=?",
                 (TURN[0], TURN[1], turn["id"]))
@@ -195,8 +167,7 @@ def serve() -> None:
 
 
 def wait_for_server(timeout: float = 30.0) -> None:
-    """Block until the dashboard answers, and RAISE if it never does — a fixed sleep is
-    a race that leaves the PNG stale from the previous run."""
+    """Block until the dashboard answers, and RAISE if it never does"""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -209,11 +180,10 @@ def wait_for_server(timeout: float = 30.0) -> None:
                      f"— nothing was captured, so no screenshot is stale")
 
 
-# -- the shot ---------------------------------------------------------------------------
+# -- the shot
 
 
-# Two real pages side by side in one shot, iframes rather than two files because the PAIR
-# is the claim: the clause present, and the clause gone (`screenshot_feature_spec.PAIR`).
+# Two real pages side by side in one shot
 PAIR = """
 <html><body style="margin:0;font:13px system-ui;background:#0e1420;color:#c9d4e8">
 <div style="display:flex;gap:10px;padding:10px">
@@ -229,8 +199,7 @@ PAIR = """
 </body></html>
 """
 
-#: Puts the `Tool profile` heading at the top of its frame: the nav line renders directly
-#: beneath it, and a long page left unscrolled lands the sentence under the fold.
+#: Puts the `Tool profile` heading at the top of its frame: the nav line renders directly beneath it
 SCROLL_TO_TOOLS = """
 () => {
   const h = [...document.querySelectorAll('h2')]
@@ -243,11 +212,7 @@ SCROLL_TO_TOOLS = """
 
 
 def assert_on_page(page, project: str, wo_id: str, session: str) -> None:
-    """The sentence asserted on the REAL page before anything is captured.
-
-    A template that stopped rendering `nav_line`, or started printing `0 unclassified`,
-    must fail here rather than ship a blank picture of a reading nobody can read.
-    """
+    """The sentence asserted on the REAL page before anything is captured"""
     page.goto(f"http://127.0.0.1:{PORT}/wo/{project}/{wo_id}/debug")
     page.wait_for_selector("#block-anatomy")
     html = page.content()
@@ -255,8 +220,7 @@ def assert_on_page(page, project: str, wo_id: str, session: str) -> None:
     if expected not in html:
         raise SystemExit(f"not on the page for {session}: {expected!r} — nothing was "
                          f"captured")
-    # Scoped to the rendered panel and never to the whole page: the order's own title and
-    # session id carry the word too, and the claim is about the SENTENCE.
+    # Scoped to the rendered panel and never to the whole page: the order's own title and session id...
     panel = " ".join(page.locator("#block-anatomy .panel")
                      .filter(has_text="navigation —").inner_text().split())
     if panel != expected:

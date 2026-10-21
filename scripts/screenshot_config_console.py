@@ -1,10 +1,4 @@
-"""Screenshot the /config tab against a throwaway fleet, for a PR's UI evidence.
-
-Writes PNGs to docs/screenshots/. Everything it touches lives in a temp `JARVIS_HOME`
-and a temp catalog, so it never reads or writes the live OS:
-
-    uv run python scripts/screenshot_config_console.py
-"""
+"""Screenshot the /config tab against a throwaway fleet, for a PR's UI evidence"""
 
 from __future__ import annotations
 
@@ -22,8 +16,7 @@ PORT = 8799
 
 
 def seed() -> Path:
-    """A fleet with two projects and three configuration versions, so the page has a
-    history to show and every provenance case appears at least once."""
+    """A fleet with two projects and three configuration versions"""
     from jarvis import ops
     from jarvis.central_store import CentralStore
 
@@ -70,8 +63,7 @@ def shoot() -> None:
         page.goto(f"{base}/config")
         page.screenshot(path=SHOTS / "config-console-current.png")
 
-        # A project, reached by the picker rather than by scrolling past the fleet, and
-        # then one node of it: the two readings the page is built around.
+        # A project, reached by the picker rather than by scrolling past the fleet
         page.goto(f"{base}/config?scope=projects.jarvis_os")
         page.screenshot(path=SHOTS / "config-console-project.png")
         page.goto(f"{base}/config?scope=projects.jarvis_os&node=validation")
@@ -84,15 +76,12 @@ def shoot() -> None:
         page.wait_for_timeout(200)
         page.screenshot(path=SHOTS / "config-console-history.png")
 
-        # The diff is the last thing on the page, so `scroll_into_view_if_needed` stops
-        # with its heading at the bottom edge and shows none of it.
+        # The diff is the last thing on the page
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(200)
         page.screenshot(path=SHOTS / "config-console-diff.png")
 
-        # The refusal and the write, driven the way a user meets them: a safety setting
-        # toggled with an empty reason box, then with one. `ops` raises the first;
-        # the page flashes what it said and writes nothing.
+        # The refusal and the write, driven the way a user meets them: a safety setting toggled with an empty...
         page.goto(f"{base}/config?scope=os&node=validation")
         row = page.locator("tr", has=page.locator("td", has_text="validation.enabled"))
         row.first.locator("button").click()
@@ -105,7 +94,7 @@ def shoot() -> None:
         page.wait_for_load_state()
         page.screenshot(path=SHOTS / "config-console-toggled.png")
 
-        # ...and the thing the boolean toggle could not do at all: a number, edited.
+        # ...and the thing the boolean toggle could not do at all: a number, edited
         page.goto(f"{base}/config?scope=os&node=defaults")
         row = page.locator("tr", has=page.locator("td",
                                                   has_text="defaults.autocompact_window"))

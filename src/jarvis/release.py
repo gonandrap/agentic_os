@@ -1,52 +1,4 @@
-"""Staged releases — the daemon performs the restarts a self-ship must not.
-
-Why this exists: a worker `claude` process used to live inside jarvis.service's cgroup
-(systemd's default KillMode=control-group), so a deploy script that restarts the daemon
-killed the shipping worker mid-final-turn. The turn lands `is_error` and the work order
-settles "failed — review and retry" even though the release fully applied — that is
-exactly how wo-2fa7c0e9 shipped v0.5.1 perfectly and reported failure. Post-mortem:
-docs/superpowers/specs/2026-08-10-why-a-self-ship-reports-failure.md.
-
-Turns now run in their own transient units (`systemd_units`, issue #133), so a restart
-no longer reaches them and this handshake is belt-and-braces rather than the only thing
-standing between a deploy and a failed fleet. KEPT ANYWAY, deliberately: it is what makes
-the release *verifiable* — the marker is how a rebooted daemon proves the version landed
-— and the running-turn guard still holds the restart for the shipping worker on a host
-where the transient-unit transport is unavailable and the direct fallback is in use.
-
-So the deploy script gained a `--stage` mode: it performs every release step EXCEPT the
-service restarts and the notify, then writes a JSON marker file at
-`$JARVIS_HOME/run/pending_release.json`. This module is the daemon's half of the
-handshake:
-
-* **every tick** (`maybe_restart`, hooked from `Daemon.release_tick`): when the marker
-  is `staged` AND the shipping work order has no running turn — the worker has settled,
-  so the restart can no longer kill a report in flight; that guard is the whole point —
-  the daemon appends a timeline event, rewrites the marker to `restarting`, restarts
-  jarvis-ui.service inline (it never hosts us) and hands jarvis.service to a detached
-  transient unit via systemd-run, the same technique the deploy script itself uses
-  (PR #85): the restart outlives the daemon it kills.
-
-* **on boot** (`verify_on_boot`, hooked from `Daemon.run_forever`): the new daemon
-  proves the release actually applied — the production checkout's pyproject.toml
-  version equals the marker's, and ExecMainStartTimestamp of BOTH units is newer than
-  the restart. Never `is-active` and never `git describe`: both were true while 0.5.0
-  ran half-applied (kn-58429229). On success it settles the work order, queues the
-  user-facing notification through the project outbox (outbox → central inbox → every
-  sink, Telegram included), and deletes the marker. On failure the marker becomes
-  `failed_verification` with the reason and is NEVER deleted automatically — a release
-  the OS cannot prove landed is a human's to look at.
-
-Marker lifecycle (state → who writes it):
-    staged               the deploy script (--stage)
-    restarting           `maybe_restart`, immediately before it touches any unit
-    failed_verification  `verify_on_boot`, on any failed check (kept on disk)
-    (file deleted)       `verify_on_boot`, on success
-
-Every systemctl/systemd-run call goes through an injectable `SystemdRunner` so tests
-never touch real systemd. `check_release_marker` in invariants.py flags a marker stuck
-in flight for over an hour.
-"""
+"""Staged releases — the daemon performs the restarts a self-ship must not (docs/superpowers/specs/2026-08-10-why-a-self-ship-reports-failure.md)"""
 
 from __future__ import annotations
 
@@ -71,33 +23,24 @@ log = logging.getLogger("jarvisd.release")
 UI_UNIT = "jarvis-ui.service"
 DAEMON_UNIT = "jarvis.service"
 
-#: The key under a release work order's `metadata` that says "this order exists to ship
-#: fixes, and these are the ones it is shipping". HERE rather than on `Daemon`, whose
-#: `RELEASE_BATCH_KEY` is now an alias: `ops` needs the predicate and importing `daemon`
-#: at module level would be a cycle (2026-09-29 spec §1).
-#: SECOND READER: `ProjectStore.settled_release_orders` spells this value out as the SQL
-#: path `'$.release_for_issues'`, so changing it here means changing that query too.
+#: The key under a release work order's `metadata` that says "this order exists to ship fixes
 BATCH_KEY = "release_for_issues"
 
-#: Said once per BROKEN COMMIT when a release that delivered no release is re-parked to
-#: wait for the base to go green (2026-09-29 spec §1).
+#: Said once per BROKEN COMMIT when a release that delivered no release is re-parked to wait for the...
 RED_DEFER_EVENT = "release_deferred_red_base"
 
-#: Said ONCE PER EPISODE when that wait runs past `Daemon.RED_PARK_AFTER_SECONDS` and the
-#: release asks the user instead (§3).
+#: Said ONCE PER EPISODE when that wait runs past `Daemon.RED_PARK_AFTER_SECONDS` and the release asks...
 RED_PARK_EVENT = "release_park_red_base"
 
 
 def is_release_order(wo: dict[str, Any]) -> bool:
-    """Is this work order a release the OS filed? The batch in `metadata` is the test."""
+    """Is this work order a release the OS filed?"""
     from . import db
 
     meta = db.from_json(wo.get("metadata"), {}) or {}
     return isinstance(meta.get(BATCH_KEY), list)
 
-#: Where `scripts/install_prod_service.sh` installs the two units. Overridable so the
-#: suite can point a check at a rendered unit with no systemd anywhere near it — the
-#: same seam the script's own `--unit-dir` gives its tests.
+#: Where `scripts/install_prod_service.sh` installs the two units
 UNIT_DIR_ENV = "JARVIS_SYSTEMD_UNIT_DIR"
 
 
@@ -106,13 +49,7 @@ def unit_dir() -> Path:
 
 
 def unit_environment(unit: str, name: str) -> str | None:
-    """One `Environment=<name>=…` value from an installed unit, or None.
-
-    Reads the FILE, not `systemctl show`: what is on disk is what the next start will
-    use, and a stale unit that has not been reloaded is exactly the case worth catching.
-    Deliberately tolerant — a unit that is absent (no services installed) or unreadable
-    is not this function's problem to report.
-    """
+    """One `Environment=<name>=…` value from an installed unit, or None"""
     try:
         text = (unit_dir() / unit).read_text(encoding="utf-8")
     except OSError:
@@ -124,9 +61,7 @@ def unit_environment(unit: str, name: str) -> str | None:
             return line[len(prefix):].strip().strip('"')
     return None
 
-#: Where `scripts/install_prod_cli.sh` installs the production `jarvis` wrapper.
-#: Mirrors `UNIT_DIR_ENV` for the same reason, and is honoured by both halves: the
-#: script's `--bin-dir` default reads it too (issue 757).
+#: Where `scripts/install_prod_cli.sh` installs the production `jarvis` wrapper
 CLI_BIN_DIR_ENV = "JARVIS_CLI_BIN_DIR"
 
 
@@ -138,18 +73,12 @@ def cli_wrapper() -> Path:
     return cli_bin_dir() / "jarvis"
 
 
-#: How the invariant tells OUR wrapper from any other `jarvis` on PATH.
+#: How the invariant tells OUR wrapper from any other `jarvis` on PATH
 CLI_MARKER = "generated by scripts/install_prod_cli.sh"
 
 
 def cli_wrapper_facts() -> dict[str, Any] | None:
-    """What the installed `jarvis` wrapper does, or None if there is none to read.
-
-    Reads the FILE, like `unit_environment` and for the same reason: what is on disk is
-    what the next invocation uses, and a session that HAS the variables (a worker, the
-    daemon) is never the session that is broken. Equally tolerant — absent or unreadable
-    is None, not an error.
-    """
+    """What the installed `jarvis` wrapper does, or None if there is none to read"""
     try:
         text = cli_wrapper().read_text(encoding="utf-8")
     except OSError:
@@ -165,18 +94,12 @@ def cli_wrapper_facts() -> dict[str, Any] | None:
             target = line[len("exec "):].split()[0].strip('"').strip("'")
     return {"generated": CLI_MARKER in text, "target": target, "env": env}
 
-#: How long a `staged` marker may sit before the BOOT check stops waiting for the
-#: reconcile hook and verifies against `staged_at` instead. Generous on purpose: the
-#: normal path is minutes (the worker ends its turn, the next tick restarts), so a
-#: boot that finds a `staged` marker this old means the restart never happened — the
-#: daemon was down, or died between staging and restarting. Verifying then either
-#: proves the release landed anyway (someone restarted by hand) or parks the marker
-#: as `failed_verification` for a human, which beats waiting forever.
+#: How long a `staged` marker may sit before the BOOT check stops waiting for the reconcile hook and...
 STAGED_BOOT_GRACE = 30 * 60
 
 MARKER_NAME = "pending_release.json"
 
-#: The store lookup the daemon hands in: project name → its ProjectStore, or None.
+#: The store lookup the daemon hands in: project name → its ProjectStore, or None
 StoreLookup = Callable[[str], Optional["ProjectStore"]]
 
 
@@ -185,12 +108,7 @@ def marker_path() -> Path:
 
 
 def read_marker() -> dict[str, Any] | None:
-    """The marker as written, or None when absent or unreadable.
-
-    Corrupt JSON reads as None so the restart/verify paths never act on garbage; the
-    doctor invariant (`invariants.check_release_marker`) is what reports the file
-    itself being wrong.
-    """
+    """The marker as written, or None when absent or unreadable"""
     try:
         return json.loads(marker_path().read_text())
     except FileNotFoundError:
@@ -213,10 +131,7 @@ def delete_marker() -> None:
 
 
 class SystemdRunner:
-    """Every systemd interaction the release path performs, in one injectable seam.
-
-    Tests hand in a fake; nothing else in this module (or in daemon.py) shells out.
-    """
+    """Every systemd interaction the release path performs, in one injectable seam"""
 
     def _run(self, argv: list[str]) -> str:
         import subprocess
@@ -228,17 +143,11 @@ class SystemdRunner:
         return proc.stdout or ""
 
     def restart_unit(self, unit: str) -> None:
-        """Inline restart — only ever used for units that cannot host this process."""
+        """Inline restart — only ever used for units that cannot host this process"""
         self._run(["systemctl", "--user", "restart", unit])
 
     def restart_unit_detached(self, unit: str, tag: str) -> None:
-        """Restart `unit` from a transient systemd unit OUTSIDE our cgroup.
-
-        Restarting jarvis.service from inside it SIGTERMs the whole cgroup — this
-        daemon included — so the restart must outlive us. Same shape the deploy
-        script uses (PR #85): `--collect` reaps the transient unit, the short sleep
-        lets this process finish its tick and exit cleanly first.
-        """
+        """Restart `unit` from a transient systemd unit OUTSIDE our cgroup (#85)"""
         slug = re.sub(r"[^A-Za-z0-9-]", "-", tag)
         self._run([
             "systemd-run", "--user", "--collect",
@@ -248,12 +157,7 @@ class SystemdRunner:
         ])
 
     def unit_start_time(self, unit: str) -> float | None:
-        """When the unit's main process started, as a unix epoch — or None.
-
-        Read as ExecMainStartTimestampMonotonic (µs since boot) and converted via
-        CLOCK_BOOTTIME rather than parsing the human-readable ExecMainStartTimestamp,
-        whose format is locale/timezone prose. Same fact, machine-comparable.
-        """
+        """When the unit's main process started, as a unix epoch — or None"""
         out = self._run(["systemctl", "--user", "show", unit,
                          "--property=ExecMainStartTimestampMonotonic", "--value"])
         try:
@@ -266,17 +170,12 @@ class SystemdRunner:
         return boot_epoch + usec / 1e6
 
 
-# -- the reconcile-tick half ----------------------------------------------------------
+# -- the reconcile-tick half
 
 
 def maybe_restart(store_for: StoreLookup, runner: SystemdRunner | None = None,
                   now: float | None = None) -> str | None:
-    """Apply a staged release once its shipping worker has settled.
-
-    Returns what happened ("waiting" | "restarting" | None) for logs and tests.
-    Called after the daemon's settlement pass, so `running_turns` reflects the turns
-    this very tick reaped.
-    """
+    """Apply a staged release once its shipping worker has settled"""
     marker = read_marker()
     if not marker or marker.get("state") != "staged":
         return None
@@ -284,14 +183,12 @@ def maybe_restart(store_for: StoreLookup, runner: SystemdRunner | None = None,
     tag = marker.get("tag") or f"jarvis-{marker.get('version')}"
     store = store_for(marker.get("project") or "")
     if store is None:
-        # No store means no running-turn guard: restarting would be a guess about a
-        # worker we cannot see. Leave the marker; the doctor invariant flags it.
+        # No store means no running-turn guard: restarting would be a guess about a worker we cannot see
         log.warning("staged release %s names unknown project %r — not restarting",
                     tag, marker.get("project"))
         return None
     if any(t["wo_id"] == wo_id for t in store.running_turns()):
-        # The whole point of staging: the shipping worker is still mid-turn, and the
-        # restart would kill it exactly the way it killed wo-2fa7c0e9's final report.
+        # The whole point of staging: the shipping worker is still mid-turn
         return "waiting"
 
     store.add_event(wo_id, "release_restart", {
@@ -310,16 +207,12 @@ def maybe_restart(store_for: StoreLookup, runner: SystemdRunner | None = None,
     return "restarting"
 
 
-# -- the boot half --------------------------------------------------------------------
+# -- the boot half
 
 
 def verify_on_boot(store_for: StoreLookup, runner: SystemdRunner | None = None,
                    now: float | None = None) -> dict[str, Any] | None:
-    """Prove a restarting (or long-stranded staged) release actually applied.
-
-    Success: timeline event, the work order settled, the user notified, marker gone.
-    Failure: marker parked as `failed_verification` (never deleted), attention raised.
-    """
+    """Prove a restarting (or long-stranded staged) release actually applied"""
     marker = read_marker()
     if not marker:
         return None
@@ -344,9 +237,7 @@ def verify_on_boot(store_for: StoreLookup, runner: SystemdRunner | None = None,
     if prod_version != version:
         problems.append(
             f"production pyproject.toml says {prod_version!r}, expected {version!r}")
-    # ExecMainStartTimestamp on BOTH units, newer than the restart. Never `is-active`
-    # (both units were active throughout the 0.5.0 half-apply) and never git describe
-    # (correct and misleading at once) — kn-58429229's verification rule.
+    # ExecMainStartTimestamp on BOTH units, newer than the restart
     for unit in (DAEMON_UNIT, UI_UNIT):
         started = runner.unit_start_time(unit)
         if started is None:
@@ -406,28 +297,7 @@ def _report_failure(store: ProjectStore, wo_id: str, tag: str, reason: str) -> N
 
 
 def settle(store: ProjectStore, wo_id: str, tag: str, why: str | None = None) -> str:
-    """Move the shipping work order to `completed`, respecting kn-99d3f1d4's traps.
-
-    Returns a phrase for the notification body describing what was done.
-
-    `why` is which ENDING this was, and there is one function rather than two because
-    every trap below exists because it was a bug once; the first divergence a sibling
-    would grow is a release order completed over an assumption nobody answered (spec §5).
-    It defaults to the verify-on-boot wording, which is that path's, unchanged.
-
-    * `completed` — nothing to do beyond clearing any stale flag.
-    * `waiting_pr_merge` — left parked: it finished behind a pull request and the
-      merge is its real ending; the merge poller closes it (pulling it off the merge
-      queue here would complete it before anyone merged).
-    * pending assumptions — left in `needs_review`: completing over them would accept
-      them silently, the exact back door `wo ack`/`wo done` refuse.
-    * anything else (`failed` is the self-ship case, also `needs_review` without
-      assumptions, `waiting_input`, `running`) — settled through `ops.close_out`, the
-      same "this is over and it went fine" path a merged PR uses, plus the backlog
-      close that only ever happens at completion (kn-99d3f1d4 fact 4). `completed`
-      is stable against the reconciler: `settle_turns` only re-examines
-      running/waiting_input/dispatching.
-    """
+    """Move the shipping work order to `completed`, respecting kn-99d3f1d4's traps"""
     from . import ops
 
     why = why or f"release {tag} verified live"
@@ -450,18 +320,12 @@ def settle(store: ProjectStore, wo_id: str, tag: str, why: str | None = None) ->
     return f"completed (was {wo['status']})"
 
 
-#: Seconds of slack allowed on the tag-postdates-approval check — see its call site.
+#: Seconds of slack allowed on the tag-postdates-approval check — see its call site
 TAG_CLOCK_SLACK = 1.0
 
 
 def _tag_created_at(root: Path, tag: str) -> float | None:
-    """When the ANNOTATED tag object was made, or None if it cannot be read as one.
-
-    `taggerdate` and not `creatordate`: the latter falls back to the commit's date for a
-    lightweight tag, so a plain `git tag <name>` on an old commit would answer with that
-    commit's age and read as a release that happened long ago. A release always makes an
-    annotated tag; anything else here is "cannot tell", which is a refusal.
-    """
+    """When the ANNOTATED tag object was made, or None if it cannot be read as one"""
     try:
         out = subprocess.run(
             ["git", "-C", str(root), "for-each-ref", "--format=%(taggerdate:unix)",
@@ -478,15 +342,12 @@ def _tag_created_at(root: Path, tag: str) -> float | None:
         return None
 
 
-#: Every tag a release of this repository cuts. HARDCODED, not a setting (spec §3): the
-#: whole release path — `scripts/shipit.sh`, `_production_ref`'s `jarvis-X.Y.Z` rule,
-#: `DAEMON_UNIT` — is already this repository's, and a knob would imply the rest
-#: generalises.
+#: Every tag a release of this repository cuts
 RELEASE_TAG_GLOB = "jarvis-*"
 
 
 def _tag_version(tag: str) -> tuple[int, Any]:
-    """Sort key for a release tag: `(major, minor, patch)`, lexical for anything else."""
+    """Sort key for a release tag: `(major, minor, patch)`, lexical for anything else"""
     parts = tag.removeprefix("jarvis-").split(".")
     try:
         return (0, tuple(int(p) for p in parts))
@@ -495,29 +356,10 @@ def _tag_version(tag: str) -> tuple[int, Any]:
 
 
 def tags_containing(root: Path, shas: Sequence[str]) -> tuple[list[str], str]:
-    """The `jarvis-*` tags that carry EVERY one of `shas`, lowest version first.
-
-    `git tag --contains X` is ancestry — it lists the tags whose commit is a descendant
-    of X — and it is the only correct reading: release tags are descendants of `main`,
-    never ancestors (kn-179cd767), so "main is ahead of the tag" decides nothing
-    (kn-4f5aaa2b measured main 5 commits ahead while the fix was unshipped) and "the tag
-    list has not changed" answers a different question.
-
-    ONE INVOCATION PER SHA, intersected here: `git tag --contains A --contains B` is a
-    UNION, so a single call would report a tag carrying half a batch as carrying all of
-    it. A batch is one or two commits.
-
-    Returns `(tags, error)`. A non-empty error is "cannot tell" and every caller reads it
-    as a refusal, never as "no tags" — `_tag_created_at`'s direction. Lowest version
-    first because the first release that carried the whole batch is the honest answer,
-    and it is deterministic across ticks.
-    """
+    """The `jarvis-*` tags that carry EVERY one of `shas`, lowest version first"""
     if not shas:
         return [], "no payload commits to look for"
-    # FIRST, and best-effort: a tag another release path cut is not in this checkout
-    # until it is fetched, and the defect's window is minutes long — so a stale tag list
-    # is the normal state. A failed fetch can only make a tag unseen, which leaves the
-    # work order open (spec §3A).
+    # FIRST, and best-effort: a tag another release path cut is not in this checkout until it is fetched
     try:
         fetched = subprocess.run(
             ["git", "-C", str(root), "fetch", "--tags", "--quiet", "--force", "origin"],
@@ -547,43 +389,22 @@ def tags_containing(root: Path, shas: Sequence[str]) -> tuple[list[str], str]:
 
 @dataclass(frozen=True)
 class Overtaken:
-    """Has another release already carried a batch, and does the fleet RUN it.
+    """Has another release already carried a batch, and does the fleet RUN it"""
 
-    Built by `overtaken_by`. `error` is a refusal — "cannot tell" — and is never the same
-    claim as `tag == ""`, which is the ordinary "no release carries this yet".
-    """
-
-    #: The lowest `jarvis-*` tag containing the whole batch; `""` when none does.
+    #: The lowest `jarvis-*` tag containing the whole batch; `""` when none does
     tag: str = ""
-    #: Every containing tag, lowest version first.
+    #: Every containing tag, lowest version first
     tags: tuple[str, ...] = ()
-    #: `_production_ref`'s answer, when it could be read.
+    #: `_production_ref`'s answer, when it could be read
     deployed: str = ""
-    #: Production is at one of `tags`, with the file and git agreeing.
+    #: Production is at one of `tags`, with the file and git agreeing
     live: bool = False
-    #: Why nothing can be concluded; empty when something can.
+    #: Why nothing can be concluded; empty when something can
     error: str = ""
 
 
 def overtaken_by(project_root: Path, shas: Sequence[str]) -> Overtaken:
-    """Did another release already ship this payload, and is production running it.
-
-    The two halves run in different checkouts (spec §3): ancestry in the PROJECT's own
-    clone, where the tags and the objects are, and the deploy question in the PRODUCTION
-    checkout, read-only.
-
-    The production test is MEMBERSHIP in `tags`, deliberately not ancestry re-run there:
-    `git merge-base --is-ancestor` needs the payload object present, which a deploy clone
-    does not guarantee, and making it reliable would need a fetch into a checkout that is
-    a release tag and must never be written. Note what membership correctly refuses — a
-    later tag cut from an older base does not contain the fix, so production running it
-    leaves the order open.
-
-    BOTH READINGS of what production is, the file and git, on kn-58429229's rule and for
-    its reason: during the 0.5.0 half-apply the tag was checked out and the running code
-    was not it, so a check that reads one of the two is the check that was already fooled
-    once.
-    """
+    """Did another release already ship this payload, and is production running it"""
     tags, error = tags_containing(project_root, shas)
     if error:
         return Overtaken(error=error)
@@ -608,47 +429,7 @@ def overtaken_by(project_root: Path, shas: Sequence[str]) -> Overtaken:
 
 
 def verify_release_claim(store: ProjectStore, wo_id: str, version: str, tag: str) -> str:
-    """Did THIS WORK ORDER ship this release? `""` when it checks out, else why not.
-
-    THE PROVENANCE CHECK BEHIND `attested`, and the reason the validation panel may skip
-    a release round at all (spec
-    docs/superpowers/specs/2026-09-17-a-round-with-nothing-to-judge.md §4).
-
-    Three checks, and each one closes a hole the previous draft left open.
-
-    1. **Production is on exactly this version AND at exactly this tag.** The marker and
-       the timeline both say what a release DID, and neither is proof of it: a marker is
-       a JSON file under `$JARVIS_HOME/run/` and an event is a row, so a work order that
-       delivered nothing could write either (review round 1). The production checkout is
-       state no submitting worker owns. BOTH readings, on kn-58429229's rule and for its
-       reason — the version from the FILE and the ref from GIT answered differently
-       during the 0.5.0 half-apply, so a check that reads one of them is the check that
-       was already fooled once.
-
-    2. **This work order holds an APPROVED `release` gate that it actually used.** Check
-       1 alone proves that *a* release landed and stays true until the next one, so a
-       work order that delivered nothing could name the version production was ALREADY on
-       and replay it at no cost (review round 2). An `approvals` row reaching `approved`
-       is written by `ProjectStore.decide_approval` on a verdict from Neo or the user —
-       a worker cannot author one for itself — and `uses > 0` means the gate actually
-       opened for it. `dismissed` deliberately does not count: a dismissal records that
-       the recogniser was wrong and no authorisation at all.
-
-    3. **The tag was created after that authorisation.** Otherwise an order approved to
-       ship could still be credited with a tag that already existed when it was approved.
-
-    Never raises, and every "cannot tell" is a failure with a sentence: the caller turns
-    any non-empty return into an effect that is NOT attested, which sends the round to
-    the panel. A fleet with no production checkout, or one that does not gate releases,
-    therefore JUDGES its releases rather than voiding them — the safe direction, and the
-    reason none of this can fail open.
-
-    WHAT IS STILL NOT PROVEN, said out loud because a reader will otherwise assume it is:
-    nothing in the production checkout names a work order, so these checks bind the order
-    to an AUTHORISATION and a WINDOW rather than to the deploy itself. An order holding
-    its own approved release gate, whose tag postdates that approval, is as close as the
-    recorded state gets.
-    """
+    """Did THIS WORK ORDER ship this release? (docs/superpowers/specs/2026-09-17-a-round-with-nothing-to-judge.md §4)"""
     if not version or not tag:
         return "the release claim names no version or no tag"
     live = _production_version()
@@ -670,10 +451,7 @@ def verify_release_claim(store: ProjectStore, wo_id: str, version: str, tag: str
     made = _tag_created_at(root, tag)
     if made is None:
         return f"{tag} is not an annotated tag in the production checkout"
-    # `+ TAG_CLOCK_SLACK`: a tag's date has one-second resolution and the approval's does
-    # not, so a tag cut in the same second it was approved reads as fractionally older.
-    # The slack is spent on the honest side — a replay has to beat the approval by a
-    # whole second, and a real release is minutes of scripted work after it.
+    # `+ TAG_CLOCK_SLACK`: a tag's date has one-second resolution and the approval's does not
     if made + TAG_CLOCK_SLACK < authorised:
         return (f"{tag} already existed when {wo_id} was authorised to release, so this "
                 f"order did not cut it")
@@ -681,11 +459,7 @@ def verify_release_claim(store: ProjectStore, wo_id: str, version: str, tag: str
 
 
 def _production_version() -> str | None:
-    """The version the production checkout carries ON DISK.
-
-    Read from pyproject.toml as a file, never from git: `git describe` was correct
-    and misleading at once during the 0.5.0 half-apply (kn-58429229).
-    """
+    """The version the production checkout carries ON DISK"""
     try:
         text = (production_code_dir() / "pyproject.toml").read_text()
     except OSError:
@@ -696,28 +470,18 @@ def _production_version() -> str | None:
 
 @dataclass(frozen=True)
 class ProductionStatus:
-    """What the production checkout is, as git sees it. Built by `production_status`."""
+    """What the production checkout is, as git sees it"""
 
-    #: Tracked files modified since the tag was checked out, or None if git could not say.
+    #: Tracked files modified since the tag was checked out, or None if git could not say
     dirty: list[str] | None
-    #: The ref to restore the checkout to — the deployed tag, else the literal `HEAD`.
+    #: The ref to restore the checkout to — the deployed tag, else the literal `HEAD`
     ref: str
-    #: Why `dirty` is None; empty when it is not.
+    #: Why `dirty` is None; empty when it is not
     error: str
 
 
 def _production_ref(root: Path) -> str:
-    """The ref that restores the production checkout, resolved FROM GIT.
-
-    Never from `pyproject.toml`: that file is one of the things drift can touch, and a
-    remedy built from a drifted version names a tag nobody ever cut — so the pathspec
-    fails and the reader concludes the CHECK is broken rather than the checkout. Falls
-    back to `HEAD`, which restores the same tree whatever it is called.
-
-    Not to be confused with `_production_version`, which reads the file deliberately:
-    the release handshake is verifying what landed ON DISK, where git was correct and
-    misleading at once (kn-58429229). Different question, different source.
-    """
+    """The ref that restores the production checkout, resolved FROM GIT"""
     try:
         out = subprocess.run(
             ["git", "-C", str(root), "describe", "--tags", "--exact-match", "HEAD"],
@@ -729,23 +493,7 @@ def _production_ref(root: Path) -> str:
 
 
 def production_status(directory: Path | None = None) -> ProductionStatus:
-    """Is the production checkout still byte-identical to its tag, and how to fix it.
-
-    `dirty == []` is clean. `-uno`: untracked files are not drift. The deploy's
-    `git checkout -f` never removed them either, and `.venv/` and `.jarvis/` live there
-    by design.
-
-    `dirty is None` means git could not answer at all: not installed, the checkout
-    unreadable, or — the realistic one, since the daemon and the user are different uids
-    on the same tree — `detected dubious ownership`. Collapsing that into "clean" would
-    silence the invariant permanently on the one checkout it exists to watch, so the two
-    are distinguishable rather than both `[]`.
-
-    `ref` is here rather than at the call site so the `jarvis-X.Y.Z` naming rule stays in
-    this module, beside the `scripts/shipit.sh` counterpart that mints it.
-
-    Backs `invariants.check_production_clean`.
-    """
+    """Is the production checkout still byte-identical to its tag, and how to fix it"""
     root = directory or production_code_dir()
     ref = _production_ref(root)
     try:

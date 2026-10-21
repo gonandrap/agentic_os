@@ -1,87 +1,4 @@
-"""Token accounting: what a WORKER's conversation actually cost.
-
-This module reads the ledger Claude Code keeps for a worker's session: a JSONL
-transcript per session under `~/.claude/projects/<slug>/<session-id>.jsonl`, with a
-`usage` object on every assistant message. It attributes that spend back to the work
-order that caused it, via `work_orders.session_id`.
-
-Read-only, and deliberately outside the store layer: it derives a fact about a work
-order from a file Jarvis does not own and cannot repair, so there is nothing to
-persist and nothing to reconcile.
-
-THIS IS NOT THE WHOLE BILL, and it never was. A work order also costs whatever Jarvis
-itself spent on it — Neo answering its questions, the panel's seats deliberating, the
-digest shortening the result for the dashboard. Those are one-shot `claude -p` calls
-with no session Jarvis owns and nothing in their transcripts naming a work order, so
-they cannot be recovered this way at all: they are recorded as they happen, in
-`agent_usage`, and `ops.cost_report` adds the two together (and shows the split, because
-"the OS spent a third of this work order's tokens on itself" is the fact worth seeing).
-
-## The re-write tax, and why it gets its own number
-
-Every worker turn is a separate `claude -p --resume` process (`claude_cli.turn_args`).
-On the first API call of each turn after the first, the conversation prefix the
-previous turn had cached is invalidated and the whole accumulated context is re-sent
-as a cache WRITE, at 1.25x, instead of a cache READ at 0.1x — twice over, in fact, on
-two consecutive calls.
-
-A boundary goes cold for one of two reasons, and they have OPPOSITE remedies, which is
-why `rewrite_ttl_write`/`rewrite_prefix_write` split the tax by cause rather than
-reporting one number:
-
-- THE PREFIX MOVED. Claude Code's system prompt carries a dynamic per-machine section
-  including `git status`, so a worker — whose whole job is editing files in its
-  worktree — presents a different prefix next turn. Time is not the variable: a
-  10-second boundary after an edit is cold and a 54-minute one after a read-only turn
-  is warm. `dispatch._write_worker_settings` sets `includeGitInstructions: false`,
-  which removes the snapshot and is the ONLY switch that does
-  (`--exclude-dynamic-system-prompt-sections` merely relocates it). No cache TTL can
-  help here — the entry is alive and does not match.
-- THE ENTRY EXPIRED. The gap exceeded the write's TTL, so nothing survives, not even
-  the static system prompt. Only this half would be bought back by a longer TTL.
-
-Telling them apart is what makes the TTL decision answerable, and confusing them is how
-a 12-second boundary got read as a 14-minute one:
-`docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md`.
-
-What Jarvis controls is the number of boundaries, not their price — which is why
-`Daemon.deliver_messages` coalesces everything queued for a work order into one turn,
-and why this module reports `resume_boundaries` next to the tax.
-
-So `rewrite_excess` is the headline number this module exists to produce: in a
-perfectly cached session every token is written to the cache exactly once, and the
-total written can therefore never exceed the largest context the session reached.
-Everything above that line is a token Jarvis paid to send twice.
-
-    rewrite_excess = max(0, sum(cache_write) - max(context))
-
-That definition needs no threshold, which is the point — an earlier heuristic
-("a big write next to a small read") got the same answer here but only because
-this session's boundaries were stark.
-
-## Prices are a proxy, not a bill
-
-The dollar figures are Anthropic list prices, and the user is on a subscription: they
-are a common unit that lets a cache-read token be compared with an output token, not
-an invoice. Tokens are the primary figure everywhere; cost is derived and labelled.
-
-## A cache write is priced by its TTL, and Jarvis bought the expensive one for months
-
-A prompt-cache WRITE costs 1.25x base input at the 5-MINUTE TTL and 2x at the ONE-HOUR
-TTL; a read is 0.1x under either (kn-f94abf34, measured over 1,075 transcripts). Every
-write a Jarvis worker made before `FORCE_PROMPT_CACHING_5M` shipped was a 1h write, so
-pricing them all at 1.25x understated the largest avoidable line in the bill by up to
-60% of itself. Both rates live here and the SPLIT decides: `cache_creation` carries
-`ephemeral_1h_input_tokens` and `ephemeral_5m_input_tokens`, per assistant message in a
-transcript and per turn in a result envelope, and where it is present it is used. Where
-it is absent — an old row, a caller that has counts and nothing else — the 5-minute rate
-is the floor and the estimate stays where it always was, rather than guessing upward.
-
-THE FLOOR IS ONLY HONEST IF THE CALLER ACTUALLY HAS NO SPLIT TO GIVE. A caller that omits
-`priced()`'s `cache_1h`/`cache_5m` is claiming ignorance on the report's behalf, and two
-surfaces reading the same rows then disagree about the same tokens — see
-`docs/superpowers/specs/2026-08-22-the-five-minute-write-everywhere.md`.
-"""
+"""Token accounting: what a WORKER's conversation actually cost (docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md)"""
 
 from __future__ import annotations
 
@@ -95,8 +12,7 @@ from typing import Any, Iterator, Sequence
 
 TRANSCRIPT_ROOT_ENV = "JARVIS_TRANSCRIPT_ROOT"
 
-# List price in $ per million tokens, keyed by the family name that appears in the
-# model id (`claude-opus-5`, `claude-haiku-4-5-20251001`): (input, output).
+# List price in $ per million tokens
 PRICES: dict[str, tuple[float, float]] = {
     "opus": (5.0, 25.0),
     "fable": (10.0, 50.0),
@@ -107,45 +23,20 @@ DEFAULT_PRICE = PRICES["opus"]
 CACHE_WRITE_RATE = 1.25  # x input price, at the 5-minute TTL
 CACHE_WRITE_1H_RATE = 2.0  # x input price, at the 1-hour TTL
 CACHE_READ_RATE = 0.10  # x input price, under either TTL
-#: The TTL Jarvis buys (`claude_cli.PROMPT_CACHE_5M_ENV`). A boundary closer together
-#: than this cannot be an expiry, whatever else it looks like.
+#: The TTL Jarvis buys (`claude_cli.PROMPT_CACHE_5M_ENV`)
 WRITE_TTL_SECONDS = 300.0
 
-#: The share of ALL cache writes that must be TTL expiry before buying the 1-hour write
-#: starts paying. The premium is charged on every written token and recovered only on
-#: the ones a longer entry would have kept, so:
-#:
-#:     1h wins iff  rewrite_ttl_write / cache_write  >  0.75 / 1.90  =  39.5%
-#:
-#: Derived from the three rates above rather than written down, and defined HERE because
-#: two surfaces take the decision against it — `scripts/cache_ttl_cohort.py` and
-#: `invariants.check_cache_ttl_trigger`. The denominator is the trap (kn-1449447a (4)):
-#: the TTL's share of the RE-WRITE TAX is a different, much larger ratio, and reading
-#: that one against this number says "switch now" when the answer is "keep the 5-minute
-#: write". Nothing here compares a share of the tax to this.
+#: The share of ALL cache writes that must be TTL expiry before buying the 1-hour write starts paying
 TTL_BREAK_EVEN = (CACHE_WRITE_1H_RATE - CACHE_WRITE_RATE) / (
     (CACHE_WRITE_1H_RATE - CACHE_WRITE_RATE) + (CACHE_WRITE_RATE - CACHE_READ_RATE))
-#: There is no module-level default for the cold-prefix floor on purpose. It is
-#: `os.cold_prefix_floor`, every reader passes it in, and a caller with no catalog gets
-#: the catalog's own error rather than a number this module invented — a report that
-#: silently classified boundaries against a guessed threshold would print a finding the
-#: configuration never produced.
+#: There is no module-level default for the cold-prefix floor on purpose
 
-#: The four things a bill can be charged for, in the order they are rendered. Named here
-#: because every surface that breaks a line item down by class walks this list, and a
-#: class that exists in one renderer and not another is a token the reader cannot find.
+#: The four things a bill can be charged for, in the order they are rendered
 TOKEN_CLASSES = ("input", "cache_write", "cache_read", "output")
 
 
 def write_rate(cache_write: int, cache_1h: int = 0, cache_5m: int = 0) -> float:
-    """The multiple of base input price one cache-write token cost, given the TTL split.
-
-    The split is often a SAMPLE rather than the whole: a turn's result envelope reports
-    `cache_creation` for part of the turn while `modelUsage` reports the total written.
-    Its RATIO is what is used, applied to the whole — an 87/13 sample of a turn that
-    wrote 1.9M tokens prices those 1.9M at 1.89x. With no split at all the 5-minute rate
-    stands, which is the floor and what this module has always charged.
-    """
+    """The multiple of base input price one cache-write token cost, given the TTL split"""
     known = cache_1h + cache_5m
     if not cache_write or known <= 0:
         return CACHE_WRITE_RATE
@@ -155,13 +46,7 @@ def write_rate(cache_write: int, cache_1h: int = 0, cache_5m: int = 0) -> float:
 
 def class_costs(model: str, *, input: int = 0, cache_write: int = 0, cache_read: int = 0,
                 output: int = 0, cache_1h: int = 0, cache_5m: int = 0) -> dict[str, float]:
-    """What each class of token cost, at list — the line items of a bill.
-
-    One dict per call site rather than a single total, because "where did the money go"
-    is answered by the classes and not by their sum: a session whose bill is 70% cache
-    READ is behaving, and one whose bill is 70% cache WRITE is paying the re-write tax.
-    Keys are `TOKEN_CLASSES`, so a renderer can walk them without knowing the rates.
-    """
+    """What each class of token cost, at list — the line items of a bill"""
     in_rate, out_rate = price_for(model)
     return {
         "input": input * in_rate / 1e6,
@@ -173,11 +58,7 @@ def class_costs(model: str, *, input: int = 0, cache_write: int = 0, cache_read:
 
 
 def transcript_root() -> Path:
-    """Where Claude Code keeps its session transcripts.
-
-    `JARVIS_TRANSCRIPT_ROOT` overrides it so a test can point at a fixture tree; the
-    real location follows `CLAUDE_CONFIG_DIR`, which Claude Code itself honours.
-    """
+    """Where Claude Code keeps its session transcripts"""
     override = os.environ.get(TRANSCRIPT_ROOT_ENV)
     if override:
         return Path(override).expanduser()
@@ -187,12 +68,7 @@ def transcript_root() -> Path:
 
 
 def price_for(model: str) -> tuple[float, float]:
-    """Input and output $/MTok for a model id.
-
-    `<synthetic>` is Claude Code's placeholder for a message it generated itself (an
-    API error rendered as an assistant turn); it was never billed, so it prices at
-    zero rather than falling through to the Opus default.
-    """
+    """Input and output $/MTok for a model id"""
     if not model or model == "<synthetic>":
         return (0.0, 0.0)
     for family, price in PRICES.items():
@@ -203,13 +79,7 @@ def price_for(model: str) -> tuple[float, float]:
 
 @dataclass
 class Usage:
-    """Token totals for one or more sessions.
-
-    `context_peak` takes the max when two usages merge (the biggest context anything
-    reached); every other field is additive. `rewrite_excess` is computed per session
-    at read time and then summed, which is why it is a stored field and not a property
-    derived from the merged totals — a merged `context_peak` would understate it.
-    """
+    """Token totals for one or more sessions"""
 
     messages: int = 0
     input: int = 0
@@ -219,53 +89,28 @@ class Usage:
     context_peak: int = 0
     rewrite_excess: int = 0
     resume_boundaries: int = 0
-    #: Cache-write tokens observed AT a cold boundary, split by which of the two causes
-    #: the docstring describes produced it. These are raw observations and their sum is
-    #: NOT `rewrite_excess` — that has its own threshold-free definition. They exist to
-    #: carry the RATIO, which is the only part that merges honestly across sessions
-    #: (kn-7a2180ba: make the finer accounting a partition of the coarser, never an
-    #: addend). `rewrite_ttl_excess` applies the ratio and IS a partition.
+    #: Cache-write tokens observed AT a cold boundary
     rewrite_ttl_write: int = 0
     rewrite_prefix_write: int = 0
-    #: THE THIRD CAUSE, AND THE ONLY ONE THE OS CHOOSES TO PAY. A boundary the OS
-    #: compacted across (`worker_session.compact`) re-writes the summary, and it does so
-    #: seconds after the compaction call with the static head still served — which is
-    #: the exact shape of a PREFIX MISS. Counted separately or the remedy would read as
-    #: the defect it was bought to avoid, and `invariants.check_prefix_stable` would
-    #: report the prefix drifting on a fleet whose prefix had not moved.
+    #: THE THIRD CAUSE, AND THE ONLY ONE THE OS CHOOSES TO PAY
     rewrite_compact_write: int = 0
-    #: How many of `resume_boundaries` were the TTL expiring, and how many the OS
-    #: compacted across. The rest moved the prefix.
+    #: How many of `resume_boundaries` were the TTL expiring, and how many the OS compacted across
     boundaries_ttl: int = 0
     boundaries_compact: int = 0
-    #: Boundaries whose TTL-vs-prefix split was left OPEN — the caller had no
-    #: `os.cold_prefix_floor`. Counted in `resume_boundaries` and in no write bucket.
+    #: Boundaries whose TTL-vs-prefix split was left OPEN — the caller had no `os.cold_prefix_floor`
     boundaries_undecided: int = 0
-    #: Messages a WINDOW could not place: `timestamp` missing or malformed. Excluded
-    #: from every figure above and counted here, never dropped silently and never
-    #: counted as in-window. Always 0 with no window — nothing was excluded.
+    #: Messages a WINDOW could not place: `timestamp` missing or malformed
     undated_messages: int = 0
-    #: Messages whose EVERY row was a mid-stream snapshot (`stop_reason: null`), and the
-    #: placeholder output those rows did report. Their true output is not in the file and
-    #: nothing here estimates it: these two carry the disclosure instead
-    #: (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §1).
+    #: Messages whose EVERY row was a mid-stream snapshot (`stop_reason: null`) (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §1)
     placeholder_calls: int = 0
     placeholder_output: int = 0
     cost_by_model: dict[str, float] = field(default_factory=dict)
-    #: The TTL split of `cache_write`, where the source reported one. Their sum can be
-    #: LESS than `cache_write` (a partial sample) and is zero when nothing is known —
-    #: which is why they are kept beside it rather than instead of it. See `write_rate`.
+    #: The TTL split of `cache_write`, where the source reported one
     cache_1h: int = 0
     cache_5m: int = 0
-    #: What each class of token cost, at list, summed as usages merge. Carried rather
-    #: than re-derived from the totals because the write rate depends on a TTL split
-    #: that is exact per message and only approximate once messages are added together.
+    #: What each class of token cost, at list, summed as usages merge
     cost_by_class: dict[str, float] = field(default_factory=dict)
-    #: TOKENS by model — `{model: {input, cache_write, cache_read, output, ...}}`, the
-    #: same classes as the fields above. `cost_by_model` was never enough to subtract
-    #: one usage from another: the bill splits a turn into the agents that ran inside it
-    #: by taking the turn's totals MINUS its subagents', and a subtraction that mixes
-    #: models would move tokens between price bands. Per model, it cannot.
+    #: TOKENS by model — `{model: {input
     tokens_by_model: dict[str, dict[str, int]] = field(default_factory=dict)
 
     def __add__(self, other: Usage) -> Usage:
@@ -309,7 +154,7 @@ class Usage:
 
     @property
     def billed_input(self) -> int:
-        """Every input token the API was asked to process, however it was priced."""
+        """Every input token the API was asked to process, however it was priced"""
         return self.input + self.cache_write + self.cache_read
 
     @property
@@ -322,17 +167,12 @@ class Usage:
 
     @property
     def cached_input(self) -> int:
-        """Input tokens the cache served or stored — everything but the fresh ones."""
+        """Input tokens the cache served or stored — everything but the fresh ones"""
         return self.cache_write + self.cache_read
 
     @property
     def rewrite_cost_usd(self) -> float:
-        """What the re-written tokens cost ABOVE what reading them would have cost.
-
-        Priced at the blended input rate of the models actually used, so a session
-        that ran on Haiku is not charged Opus waste, and at the write rate the TTL
-        split actually implies: at the 1-hour TTL a re-write is 20x a read, not 12.5x.
-        """
+        """What the re-written tokens cost ABOVE what reading them would have cost"""
         rate = self._blended_input_rate()
         excess = write_rate(self.cache_write, self.cache_1h, self.cache_5m) \
             - CACHE_READ_RATE
@@ -340,23 +180,14 @@ class Usage:
 
     @property
     def rewrite_ttl_share(self) -> float | None:
-        """Of the tax, the fraction a longer cache TTL could have bought back.
-
-        None when no boundary was classified — an honest 'not measured', which the
-        renderers must not print as 0% (that would read as a finding).
-
-        A compacted boundary is in the DENOMINATOR and not the numerator: it is a
-        re-write that happened, so leaving it out would shrink the tax rather than
-        attribute it — but no longer a TTL one, because the OS chose to pay it in
-        exchange for a smaller conversation.
-        """
+        """Of the tax, the fraction a longer cache TTL could have bought back"""
         seen = (self.rewrite_ttl_write + self.rewrite_prefix_write
                 + self.rewrite_compact_write)
         return self.rewrite_ttl_write / seen if seen else None
 
     @property
     def rewrite_ttl_excess(self) -> int:
-        """`rewrite_excess` apportioned to TTL expiry; the remainder moved the prefix."""
+        """`rewrite_excess` apportioned to TTL expiry; the remainder moved the prefix"""
         share = self.rewrite_ttl_share
         return round(self.rewrite_excess * share) if share is not None else 0
 
@@ -399,20 +230,7 @@ class Usage:
 
 @dataclass
 class Call:
-    """ONE API call — the finest grain there is, and the one a turn is made of.
-
-    A worker turn is a whole agent loop: the model answers, a tool runs, the model is
-    called again with the result appended, until it stops. Every one of those calls
-    re-sends the conversation so far, so a turn's `cache_read` is a SUM over its calls
-    and not a size — 11 calls each re-reading a 55k conversation read 517k between them,
-    which is the question this record exists to answer (wo-e23252e4, turn 1).
-
-    One per assistant message in the transcript, which is exactly one per API call: on
-    that turn the 11 messages' counts sum to the CLI's own `modelUsage` totals to the
-    token, in all four classes. `ts` is when the call landed, and is what buckets a call
-    into the turn it ran in — the same last-turn-started-by-then rule the rest of the
-    bill uses.
-    """
+    """ONE API call — the finest grain there is, and the one a turn is made of"""
 
     ts: float = 0.0
     model: str = ""
@@ -422,19 +240,12 @@ class Call:
     output: int = 0
     cache_1h: int = 0
     cache_5m: int = 0
-    #: Whether any row of this message carried a `stop_reason`. False means its `output`
-    #: is a streaming placeholder and the real figure was never written
-    #: (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §1). True by
-    #: default: every other producer of a `Call` reports a figure it believes.
+    #: Whether any row of this message carried a `stop_reason` (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §1)
     sealed: bool = True
 
     @property
     def context(self) -> int:
-        """What this one call was asked to read — its share of the window.
-
-        THE figure a turn's `cache_read` is not: the context is what ONE call carried,
-        and it is the number that says whether a conversation is getting too big.
-        """
+        """What this one call was asked to read — its share of the window"""
         return self.input + self.cache_write + self.cache_read
 
     @property
@@ -453,16 +264,7 @@ class Call:
 
 @dataclass
 class Subagent:
-    """One subagent the session spawned, with enough about it to name a bill line.
-
-    `agent_type` and `description` come from the `.meta.json` Claude Code writes beside
-    each subagent transcript — "Explore", "Find worker session creation code". Without
-    them a bill can only offer `agent-ac837f05`, which answers "how much" and not the
-    question anyone actually has, which is "on what".
-
-    `started_at` is a unix timestamp, used to charge the subagent to the TURN it ran in
-    (the same last-turn-started-by-then rule everything else on the bill uses).
-    """
+    """One subagent the session spawned, with enough about it to name a bill line"""
 
     agent_id: str
     agent_type: str = ""
@@ -487,20 +289,14 @@ class Subagent:
 
 @dataclass
 class SessionUsage:
-    """One session's spend, with its subagents kept separate.
-
-    Subagents get their own line because they are a design choice a reader can act on:
-    on the planner that prompted this module they were a third of the bill.
-    """
+    """One session's spend, with its subagents kept separate"""
 
     session_id: str
     main: Usage = field(default_factory=Usage)
     subagents: Usage = field(default_factory=Usage)
     subagent_count: int = 0
     found: bool = False
-    #: One entry per subagent, in the order the transcripts were read. `subagents` is
-    #: their sum and stays the figure everything else uses; this is what lets the bill
-    #: put each of them on its own row instead of reporting a lump.
+    #: One entry per subagent, in the order the transcripts were read
     each_subagent: list[Subagent] = field(default_factory=list)
 
     @property
@@ -520,11 +316,7 @@ class SessionUsage:
 
 
 def _subagent_detail(path: Path, sub_usage: Usage) -> Subagent:
-    """Name and time one subagent transcript, from its meta file and its own rows.
-
-    Both sources are best-effort: a subagent whose meta file is missing still gets a
-    line, named for its file, because dropping it would take its tokens off the bill.
-    """
+    """Name and time one subagent transcript, from its meta file and its own rows"""
     meta: dict[str, Any] = {}
     meta_path = path.with_suffix(".meta.json")
     try:
@@ -541,18 +333,7 @@ def _subagent_detail(path: Path, sub_usage: Usage) -> Subagent:
 
 
 def rows(path: Path | str, needle: str = "") -> Iterator[dict[str, Any]]:
-    """Every JSON row of one transcript, in file order — the one line-reader.
-
-    A transcript is JSONL of mixed row types, and every reader in the OS wants a
-    different projection of it: token counts, prose, tool spans. They share this so a
-    change in how Claude Code writes a file lands in one place; a missing or corrupt
-    file yields nothing, which is what makes "no transcript" the same answer everywhere.
-
-    `needle` is a substring pre-filter applied to the RAW LINE before parsing. Most rows
-    in a transcript are of no interest to any one caller, and `json.loads` on a megabyte
-    of them is the whole cost of a read: `_assistant_messages` skips ~75% of the rows in
-    a real file this way. A caller that wants everything passes nothing.
-    """
+    """Every JSON row of one transcript, in file order — the one line-reader"""
     try:
         handle = Path(path).open(errors="replace")
     except OSError:
@@ -570,12 +351,7 @@ def rows(path: Path | str, needle: str = "") -> Iterator[dict[str, Any]]:
 
 
 def blocks_of(row: dict[str, Any], kind: str = "") -> list[dict[str, Any]]:
-    """The content blocks of a transcript row's message, optionally of one type.
-
-    A row's `message.content` is a list of blocks on an API message and a bare string on
-    some user rows; both shapes are real and neither is an error, so a caller asking for
-    blocks of a string message gets none rather than a crash.
-    """
+    """The content blocks of a transcript row's message, optionally of one type"""
     content = (row.get("message") or {}).get("content")
     if not isinstance(content, list):
         return []
@@ -584,7 +360,7 @@ def blocks_of(row: dict[str, Any], kind: str = "") -> list[dict[str, Any]]:
 
 
 def _time_span(path: Path) -> tuple[float, float]:
-    """When a transcript's rows start and end, as unix timestamps (0 if unreadable)."""
+    """When a transcript's rows start and end, as unix timestamps (0 if unreadable)"""
     first = last = 0.0
     for row in rows(path, '"timestamp"'):
         when = parse_stamp(row.get("timestamp"))
@@ -598,28 +374,17 @@ def parse_stamp(stamp: Any) -> float:
     if not isinstance(stamp, str):
         return 0.0
     try:
-        # Claude Code writes RFC-3339 with a literal Z, which `fromisoformat` accepts
-        # only from 3.11; the replace keeps this working the same on either.
+        # Claude Code writes RFC-3339 with a literal Z, which `fromisoformat` accepts only from 3.11
         return datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
     except ValueError:
         return 0.0
 
 
 def _assistant_messages(path: Path | str) -> list[dict[str, Any]]:
-    """The assistant messages in one transcript, deduped by message id.
-
-    THE TRAP: a single assistant message is written to the transcript several times —
-    once as each content block arrives, and again as its text grows. Every copy repeats
-    the same `usage` object except `output_tokens`, which climbs toward the final value.
-    Summing the rows therefore counts input two or three times over: the first
-    measurement of wo-cd73c537 read 2.7M cache-write tokens where the true figure is
-    1.03M. Keep one entry per message id, and take the MAX of each field rather than
-    the first — the first copy of a message reports `output_tokens: 1`.
-    """
+    """The assistant messages in one transcript, deduped by message id"""
     by_id: dict[str, dict[str, Any]] = {}
     order: list[str] = []
-    # The pre-filter: a row with no `usage` key cannot carry token counts, and most
-    # rows in a transcript are tool results or UI state.
+    # The pre-filter: a row with no `usage` key cannot carry token counts
     for row in rows(path, '"usage"'):
         if row.get("type") != "assistant":
             continue
@@ -629,82 +394,47 @@ def _assistant_messages(path: Path | str) -> list[dict[str, Any]]:
             continue
         entry = by_id.get(mid)
         if entry is None:
-            # `ts` rides along so a message can be placed in the TURN it ran in.
-            # First occurrence, not max: a message is rewritten as its text grows,
-            # and when the call LANDED is when its first row was written.
+            # `ts` rides along so a message can be placed in the TURN it ran in
             entry = by_id[mid] = {"model": message.get("model") or "",
                                   "ts": parse_stamp(row.get("timestamp")),
                                   "sealed": False}
             order.append(mid)
-        # `stop_reason` lives on `message` and not on `message.usage`, so the merge below
-        # cannot reach it (spec 2026-10-08-subagent-output-attribution §1).
+        # `stop_reason` lives on `message` and not on `message.usage`
         entry["sealed"] = entry["sealed"] or message.get("stop_reason") is not None
         for key, value in usage.items():
             if isinstance(value, int):
                 entry[key] = max(entry.get(key, 0), value)
-        # The TTL of the cache write, one level down. Flattened in rather than
-        # skipped with the rest of the nested values: it is not a detail but a
-        # PRICE — the same token costs 1.25x or 2x depending on which of these two
-        # it landed in (kn-f94abf34), and it is exact per message here.
+        # The TTL of the cache write, one level down
         creation = usage.get("cache_creation")
         if isinstance(creation, dict):
             for key in ("ephemeral_1h_input_tokens", "ephemeral_5m_input_tokens"):
                 value = creation.get(key)
                 if isinstance(value, int):
                     entry[key] = max(entry.get(key, 0), value)
-    # Filtered AFTER the merge, never per row: `ts` is the FIRST copy of a message and
-    # that copy can be the one carrying no counts yet.
+    # Filtered AFTER the merge, never per row: `ts` is the FIRST copy of a message and that copy can be...
     return [entry for entry in (by_id[mid] for mid in order) if _is_api_call(entry)]
 
 
-#: The token classes an API call is billed in. A message carrying none of them was not
-#: a call to the API — see `_is_api_call`.
+#: The token classes an API call is billed in
 _CALL_TOKEN_KEYS = ("input_tokens", "cache_creation_input_tokens",
                     "cache_read_input_tokens", "output_tokens")
 
 
 def _is_api_call(message: dict[str, Any]) -> bool:
-    """Whether a merged assistant message stands for a call to the API.
-
-    A `<synthetic>` row is Claude Code writing an assistant message ITSELF — the usage
-    notice, a cancellation — and it is not a call ANYWHERE: not in the count, not in the
-    tokens, and above all not in the CLOCK. `inspection._close_turns` reads the last
-    call's timestamp as the moment a turn stopped working, and one synthetic row written
-    beside the next prompt dragged wo-c83d7e93 turn 1's active end three hours past its
-    last real call, reporting 197 minutes of GENERATING for 66 seconds of work.
-
-    Zero tokens in every class is the same judgement made without the label: it is what
-    "was not billed" means, and it catches a placeholder Claude Code spells differently.
-    """
+    """Whether a merged assistant message stands for a call to the API"""
     if (message.get("model") or "") == SYNTHETIC_MODEL:
         return False
     return any(message.get(key, 0) for key in _CALL_TOKEN_KEYS)
 
 
-#: Claude Code's model id for a message it wrote itself rather than getting from the
-#: API — an auth refusal, a usage-limit notice, a cancellation. `price_for` already
-#: knows it costs nothing; `said_in_session` is the caller that reads what it SAYS.
+#: Claude Code's model id for a message it wrote itself rather than getting from the API
 SYNTHETIC_MODEL = "<synthetic>"
 
 
 def said_in_session(session_id: str, *, since: float = 0.0, until: float | None = None,
                     index: dict[str, list[Path]] | None = None,
                     root: Path | None = None) -> list[tuple[str, str]]:
-    """(model, text) for every assistant message in a session, in the order written.
-
-    NOT accounting — the one reader in this module that wants the prose rather than the
-    tokens, and it exists because the transcript is sometimes the ONLY record of why a
-    turn died (`worker_session._transcript_error`). It shares this module's index
-    because that index is the only reliable way to find a worker's transcript: the
-    directory is the slugified cwd the session was created in, which for a worker is a
-    worktree that may no longer exist.
-
-    `since`/`until` bound it to ONE TURN, and they are not optional in practice. A
-    session outlives the turn that failed in it: wo-c2793bf0's transcript holds the auth
-    refusal that killed turn 1 and, eight minutes later, an unrelated "No response
-    requested." from turn 2 — so the last synthetic message in the FILE is the wrong
-    answer to "why did this turn die".
-    """
+    """(model, text) for every assistant message in a session, in the order written"""
     if index is None:
         index = index_sessions(root)
     said: list[tuple[str, str]] = []
@@ -723,13 +453,7 @@ def said_in_session(session_id: str, *, since: float = 0.0, until: float | None 
 
 
 def calls_of(path: Path | str) -> list[Call]:
-    """Every API call in one transcript, in the order they were made.
-
-    The same messages `_usage_of` totals, kept apart instead of added up. Deliberately a
-    second walk over the file rather than a second return value: the totals are read on
-    every cost surface there is and the per-call detail on one, and paying for the split
-    only where it is asked for keeps `read_session` the cheap thing it has to stay.
-    """
+    """Every API call in one transcript, in the order they were made"""
     return [
         Call(
             ts=message.get("ts") or 0.0,
@@ -746,9 +470,7 @@ def calls_of(path: Path | str) -> list[Call]:
     ]
 
 
-#: Why one cache boundary happened. `UNDECIDED` is the TTL-vs-prefix split left OPEN
-#: because the caller could not reach `os.cold_prefix_floor` — it is never produced when a
-#: floor was passed, and it is not a fourth cause.
+#: Why one cache boundary happened
 BOUNDARY_COMPACTED = "compacted"
 BOUNDARY_TTL = "ttl"
 BOUNDARY_PREFIX = "prefix"
@@ -757,7 +479,7 @@ BOUNDARY_UNDECIDED = "undecided"
 
 @dataclass
 class Boundary:
-    """One place a conversation was re-written, and what re-wrote it."""
+    """One place a conversation was re-written, and what re-wrote it"""
 
     ts: float          # the call that paid for it
     cause: str
@@ -768,42 +490,21 @@ class Boundary:
 
 def classify_boundaries(calls: Sequence[Call], *, compactions: Sequence[float] = (),
                         cold_prefix_floor: int | None = None) -> list[Boundary]:
-    """Every cold boundary in a run of calls, with the cause each is attributed to.
-
-    THE OS'S ONE IMPLEMENTATION of "a cache read that went backwards is a boundary, and
-    here is what caused it". Lifted out of `_usage_of` so every surface that needs the
-    judgement reads the same one rather than restating it — `inspection.Turn.usage`
-    reported a structural zero on every turn of every order for want of it (issue #867).
-
-    ONE RUN OF CALLS, and the caller decides what a run is. `_usage_of` passes ONE FILE:
-    `session_calls` concatenates every segment of a session, so a session-wide run sees
-    an extra boundary between the last call of segment 1 and the first of segment 2 where
-    a per-file run sees none.
-
-    `cold_prefix_floor=None` yields `BOUNDARY_UNDECIDED` for anything the TTL test would
-    have decided. Rules 1 and 2 need no floor, so a boundary is still COUNTED and a
-    compacted one still LABELLED; the split is left open rather than guessed, for the
-    reason stated where the threshold is not defaulted (see `TTL_BREAK_EVEN` above).
-    """
+    """Every cold boundary in a run of calls, with the cause each is attributed to (#867)"""
     found: list[Boundary] = []
     previous_read: int | None = None
     previous_ts: float | None = None
     for call in calls:
         read = call.cache_read
         ts = call.ts or None
-        # A turn boundary shows up as the cache going BACKWARDS: this call read less
-        # of the prefix than the one before it did. Counting the drops rather than
-        # thresholding the write size keeps this free of magic numbers, and it lands
-        # on exactly (turns - 1) for every work order measured.
+        # A turn boundary shows up as the cache going BACKWARDS: this call read less of the prefix than the...
         if previous_read is not None and read < previous_read:
             # Expired, or the prefix moved: findings/2026-08-30-where-the-800-dollars-went.md
             gap = (ts - previous_ts) if (ts and previous_ts) else None
             expired = (gap is not None and gap >= WRITE_TTL_SECONDS
                        and cold_prefix_floor is not None
                        and read <= cold_prefix_floor)
-            # Tested FIRST: a compacted boundary reads the static head seconds after
-            # the summary landed, which is indistinguishable from a prefix miss by the
-            # gap-and-read test alone. See `Usage.rewrite_compact_write`.
+            # Tested FIRST: a compacted boundary reads the static head seconds after the summary landed
             if ts and previous_ts and any(previous_ts < c <= ts for c in compactions):
                 cause = BOUNDARY_COMPACTED
             elif expired:
@@ -822,13 +523,7 @@ def classify_boundaries(calls: Sequence[Call], *, compactions: Sequence[float] =
 
 def session_calls(session_id: str, root: Path | None = None,
                   index: dict[str, list[Path]] | None = None) -> list[Call]:
-    """The LEAD agent's API calls for one session, across every segment of it.
-
-    The lead agent only: a subagent writes its own transcript, and its calls belong to
-    its own row on the bill rather than to the session's. That is what keeps these
-    reconcilable — they sum to the turn's line MINUS its subagents, which is exactly the
-    lead-agent line the bill already computes.
-    """
+    """The LEAD agent's API calls for one session, across every segment of it"""
     if index is None:
         index = index_sessions(root)
     calls: list[Call] = []
@@ -841,23 +536,7 @@ def session_calls(session_id: str, root: Path | None = None,
 def cost_between(session_id: str, since: float, until: float,
                  root: Path | None = None,
                  index: dict[str, list[Path]] | None = None) -> float:
-    """List-price dollars the lead agent's API calls cost inside one turn's window.
-
-    THE FALLBACK FOR A TURN WHOSE RESULT ENVELOPE NEVER ARRIVED. A turn killed by a
-    reboot, an OOM, a `systemctl restart` or a cancel spent everything it spent and
-    wrote no `total_cost_usd`, and the column `budget.spent` sums is the only place the
-    enforcement looks (issue #471). The transcript is written as the calls land, so it
-    still holds them.
-
-    A FLOOR, NOT THE FIGURE. List prices rather than the CLI's own, and the lead agent
-    only — a subagent writes its own transcript (`session_calls`) and is not in this.
-    `wo_turns.cost_source` records which of the two readings wrote the column, so no
-    surface has to guess. Under-reporting here is the safe direction for a ceiling in
-    the way losing the whole turn is not.
-
-    The window is the same last-turn-started-by-then bucketing the bill uses, closed at
-    both ends against a turn that is still open (`until` is then "now").
-    """
+    """List-price dollars the lead agent's API calls cost inside one turn's window (#471)"""
     return sum(
         priced(call.model, input=call.input, cache_write=call.cache_write,
                cache_read=call.cache_read, output=call.output,
@@ -868,23 +547,7 @@ def cost_between(session_id: str, since: float, until: float,
 
 
 def compactions_in(path: Path | str) -> list[dict[str, Any]]:
-    """Every compaction in one transcript, oldest first, with what it did.
-
-    Claude Code writes a `system` row with `subtype: "compact_boundary"` at the moment
-    it compacts, carrying `compactMetadata`: `trigger` (`manual` for the `/compact` the
-    OS sends, `auto` for the window in `catalog.DEFAULT_AUTOCOMPACT_WINDOW`),
-    `preTokens` and `postTokens`. The compaction's own API CALL writes no assistant
-    message, so this row is the only trace of it in the file — `_assistant_messages`
-    cannot see one, and neither can any of the arithmetic built on it.
-
-    `preTokens`/`postTokens` are the CLI's own measurement of what the compaction
-    achieved (293,382 -> 4,697 on the probe that set `catalog.COMPACT_CONTEXT`), which
-    is what lets `worker_session` put a provable number on the timeline rather than an
-    assertion that it helped.
-
-    Both triggers are returned. What a later boundary needs to know is that the
-    conversation was REPLACED, and that is equally true whichever of the two did it.
-    """
+    """Every compaction in one transcript, oldest first, with what it did"""
     found = []
     for row in rows(path, '"compact_boundary"'):
         if row.get("type") != "system" or row.get("subtype") != "compact_boundary":
@@ -900,18 +563,14 @@ def compactions_in(path: Path | str) -> list[dict[str, Any]]:
 
 
 def compaction_stamps(path: Path | str) -> list[float]:
-    """When each compaction happened in one transcript, oldest first."""
+    """When each compaction happened in one transcript, oldest first"""
     return [c["ts"] for c in compactions_in(path)]
 
 
 def last_compaction(session_id: str, *, since: float = 0.0,
                     root: Path | None = None,
                     index: dict[str, list[Path]] | None = None) -> dict[str, Any] | None:
-    """The most recent compaction in a session, or None if it has never been compacted.
-
-    `since` bounds it to one turn, for `said_in_session`'s reason: a session outlives
-    the turn asking about it, and the caller wants the compaction IT just paid for.
-    """
+    """The most recent compaction in a session, or None if it has never been compacted"""
     if index is None:
         index = index_sessions(root)
     found: list[dict[str, Any]] = []
@@ -932,20 +591,13 @@ def _call_of(message: dict[str, Any]) -> Call:
 
 
 def _inside(ts: float, since: float | None, until: float | None) -> bool:
-    """Half-open, like every other window in the OS."""
+    """Half-open, like every other window in the OS"""
     return not ((since is not None and ts < since) or (until is not None and ts >= until))
 
 
 def _in_window(messages: list[dict[str, Any]], since: float | None,
                until: float | None) -> tuple[list[dict[str, Any]], int]:
-    """The messages inside the window, and how many could not be PLACED.
-
-    A message whose `timestamp` was missing or malformed has `ts == 0.0` (`parse_stamp`)
-    and is EXCLUDED AND COUNTED when a window is given — never silently dropped and
-    never counted as in-window, which would attribute spend to a window on no evidence.
-    With no window nothing is excluded, so there is nothing to disclose and the list is
-    returned unchanged (§5c of the window-selector spec).
-    """
+    """The messages inside the window, and how many could not be PLACED"""
     if since is None and until is None:
         return messages, 0
     inside = [m for m in messages if m.get("ts") and _inside(m["ts"], since, until)]
@@ -981,13 +633,12 @@ def _usage_of(path: Path, cold_prefix_floor: int, *, since: float | None = None,
                             ("cache_1h", hour), ("cache_5m", five)):
             counts[name] = counts.get(name, 0) + value
         usage.context_peak = max(usage.context_peak, plain + write + read)
-        # Counted, never estimated (spec 2026-10-08-subagent-output-attribution §1).
+        # Counted, never estimated (spec 2026-10-08-subagent-output-attribution §1)
         if not message.get("sealed", True):
             usage.placeholder_calls += 1
             usage.placeholder_output += out
         calls.append(_call_of(message))
-        # Per MESSAGE, where the TTL split is exact rather than a sample — which is the
-        # most accurate this estimate can be made without the CLI's own figure.
+        # Per MESSAGE, where the TTL split is exact rather than a sample
         classes = class_costs(model, input=plain, cache_write=write, cache_read=read,
                               output=out, cache_1h=hour, cache_5m=five)
         for name, value in classes.items():
@@ -996,14 +647,7 @@ def _usage_of(path: Path, cold_prefix_floor: int, *, since: float | None = None,
         cost = sum(classes.values())
         if cost:
             usage.cost_by_model[model] = usage.cost_by_model.get(model, 0.0) + cost
-    # ONE FILE at a time, which is what keeps this an exact refactor: a session-wide run
-    # would see a boundary between two segments where this walk sees none
-    # (`classify_boundaries`' own note). `read_session` calls this per path.
-    #
-    # CLASSIFIED OVER EVERY CALL IN THE FILE AND FILTERED AFTERWARDS: the classifier
-    # compares a call with its PREDECESSOR, so filtering the calls first would lose the
-    # boundary at the window's left edge — usually a cold start, the dearest event in it
-    # (§5c of docs/superpowers/specs/2026-10-07-cost-window-selector.md).
+    # ONE FILE at a time, which is what keeps this an exact refactor: a session-wide run would see a... (docs/superpowers/specs/2026-10-07-cost-window-selector.md)
     boundaries = classify_boundaries(
         calls if windowed is messages else [_call_of(m) for m in messages],
         compactions=compactions, cold_prefix_floor=cold_prefix_floor)
@@ -1015,14 +659,7 @@ def _usage_of(path: Path, cold_prefix_floor: int, *, since: float | None = None,
 
 
 def fold_boundaries(usage: Usage, boundaries: Sequence[Boundary]) -> None:
-    """Add a classified run of boundaries into a `Usage`'s six boundary fields.
-
-    Beside the classifier rather than in each caller: `_usage_of` and
-    `inspection.Turn.usage` fill the same keys, and two spellings of the fold is how one
-    key comes to mean two things on two surfaces. An `UNDECIDED` boundary lands in
-    `resume_boundaries` and in NO write bucket — `rewrite_ttl_share` then returns None,
-    which the renderers are already required not to print as 0%.
-    """
+    """Add a classified run of boundaries into a `Usage`'s six boundary fields"""
     for boundary in boundaries:
         usage.resume_boundaries += 1
         if boundary.cause == BOUNDARY_COMPACTED:
@@ -1040,19 +677,7 @@ def fold_boundaries(usage: Usage, boundaries: Sequence[Boundary]) -> None:
 def priced(model: str, *, input: int = 0, cache_write: int = 0, cache_read: int = 0,
            output: int = 0, messages: int = 0, cache_1h: int = 0,
            cache_5m: int = 0) -> Usage:
-    """Token counts a caller already holds, priced the same way a transcript's are.
-
-    The OS's own calls (`agent_usage`) arrive as counts from the CLI's result JSON rather
-    than as transcript rows, and their exact dollar figure comes from the CLI too. This
-    exists so they can ALSO be expressed in this module's currency — Anthropic list
-    prices — because that is the only way OS spend and worker spend can be added into one
-    number without mixing an exact figure with an estimate. The two accountings are kept
-    side by side everywhere else for the same reason; see `ops._turn_summary`.
-
-    No `context_peak` and no `rewrite_excess`: both are properties of a CONVERSATION, and
-    a one-shot OS call has none. Leaving them zero is what keeps a hundred Neo calls from
-    reading as a re-write problem they cannot have.
-    """
+    """Token counts a caller already holds, priced the same way a transcript's are"""
     usage = Usage(messages=messages, input=input, cache_write=cache_write,
                   cache_read=cache_read, output=output, cache_1h=cache_1h,
                   cache_5m=cache_5m)
@@ -1067,18 +692,7 @@ def priced(model: str, *, input: int = 0, cache_write: int = 0, cache_read: int 
 
 
 def index_sessions(root: Path | None = None) -> dict[str, list[Path]]:
-    """Map every session id Claude Code has a transcript for to its transcript files.
-
-    Built in one pass rather than globbing per work order: session ids are UUIDs and
-    so globally unique, but the directory they live under is the slugified cwd the
-    session was CREATED in, which for a worker is its worktree — not something Jarvis
-    can reconstruct reliably once the worktree is gone.
-
-    A LIST of files per id, because that cwd can change between segments of one
-    session, leaving a file under each slug. wo-2fa7c0e9's did — repo root, then its
-    worktree — and an index that kept one path per id read that work order as $0.51 /
-    1 turn where the true figure was three times that.
-    """
+    """Map every session id Claude Code has a transcript for to its transcript files"""
     root = root or transcript_root()
     index: dict[str, list[Path]] = {}
     if not root.is_dir():
@@ -1096,14 +710,7 @@ def read_session(session_id: str, cold_prefix_floor: int,
                  index: dict[str, list[Path]] | None = None,
                  *, since: float | None = None,
                  until: float | None = None) -> SessionUsage:
-    """Spend for one session id, subagents included but reported separately.
-
-    `cold_prefix_floor` is `os.cold_prefix_floor` and is REQUIRED: a caller that cannot
-    reach a catalog must fail rather than classify against a guessed threshold.
-
-    `since`/`until` are the half-open window a cost report was asked for, additive and
-    defaulted: a bill asks for the WHOLE order and must never pass them (§5c).
-    """
+    """Spend for one session id, subagents included but reported separately"""
     result = SessionUsage(session_id=session_id)
     if index is None:
         index = index_sessions(root)
@@ -1114,9 +721,7 @@ def read_session(session_id: str, cold_prefix_floor: int,
     for path in sorted(paths):
         result.main = result.main + _usage_of(path, cold_prefix_floor, since=since,
                                               until=until)
-        # Claude Code writes each subagent's own transcript beside the parent's, under
-        # a directory named for the parent session — beside whichever segment the
-        # subagent was spawned from.
+        # Claude Code writes each subagent's own transcript beside the parent's
         subagent_dir = path.with_suffix("") / "subagents"
         if subagent_dir.is_dir():
             for sub in sorted(subagent_dir.glob("*.jsonl")):
@@ -1125,63 +730,34 @@ def read_session(session_id: str, cold_prefix_floor: int,
                     result.subagents = result.subagents + sub_usage
                     result.subagent_count += 1
                     result.each_subagent.append(_subagent_detail(sub, sub_usage))
-    # A further segment file exists only because the session was resumed under a
-    # different cwd, so each one is a turn boundary the cache-read comparison cannot
-    # see (it never compares across files).
+    # A further segment file exists only because the session was resumed under a different cwd
     result.main.resume_boundaries += len(paths) - 1
     return result
 
 
-# --- Tool results -----------------------------------------------------------------
-#
-# WHAT A TOOL COST, which the rest of this module cannot see. The ledger above is keyed
-# by API CALL, and a tool result is not a call: it is a payload that rides along inside
-# every SUBSEQUENT call's prefix. `_usage_of` walks `_assistant_messages`, which
-# pre-filters the file on the needle `'"usage"'`, and a `tool_result` block lives on a
-# `user` row with no `usage` object — so the module that owns token accounting has never
-# read a tool result at all. The walk below is that reading, and nothing more: pairing
-# and sizing, no prices, no rollup, no catalog. The aggregation (classification by
-# command shape, the carried-cost arithmetic, the fleet denominators) is `fleetcost`'s,
-# which may import this; this must never import that.
-#
-# Spec: docs/superpowers/specs/2026-10-06-fleet-cost-per-tool.md §10.2-§10.3.
+# --- Tool results
 
-#: How a result's size was arrived at. The transcript carries NO per-result token count
-#: — token counts exist only in `message.usage` on `assistant` rows — so every size here
-#: is derived, and which way is reported per result rather than averaged away.
+#: How a result's size was arrived at
 BASIS_CONTEXT_DELTA = "context-delta"
 BASIS_CHARS = "chars"
 
-#: The caller of a tool call is THE FILE ITS ROW CAME FROM, which is `read_session`'s
-#: own split and not a second mechanism: Claude Code writes each subagent's transcript
-#: under `<segment>/subagents/*.jsonl`, and that is what makes `SessionUsage.subagents`
-#: separable from `main` one level up.
+#: The caller of a tool call is THE FILE ITS ROW CAME FROM
 CALLER_MAIN = "main"
 CALLER_SUBAGENT = "subagent"
 
-#: `background.ERROR_PREFIX`, duplicated rather than imported: this module is a leaf and
-#: `background` is not one. The text check is the LAST of the three error signals, after
-#: `is_error` on the block and `is_error`/`isError` on the sibling `toolUseResult`.
+#: `background.ERROR_PREFIX`, duplicated rather than imported: this module is a leaf and `background`...
 _RESULT_ERROR_PREFIX = "Error: "
 
 
 @dataclass
 class ToolResult:
-    """ONE tool call and what came back, as the transcript records it.
-
-    Sizes are tokens, like everything else in this module, and `token_basis` says which
-    estimator produced them. An UNMATCHED call — the turn was killed between the
-    `tool_use` and its result, the case `inspection.ToolSpan.ended == 0.0` models — is
-    returned with `matched=False`, no tokens and no basis. It is never zero-filled: a
-    call that produced nothing must not pull a tool's average down as though it had.
-    """
+    """ONE tool call and what came back, as the transcript records it"""
 
     tool_use_id: str
     name: str
     input: dict[str, Any] = field(default_factory=dict)
     caller: str = CALLER_MAIN
-    #: When the model ASKED (the `tool_use` row) and when the result LANDED. The second
-    #: is what bounds "every later call this result rode along in".
+    #: When the model ASKED (the `tool_use` row) and when the result LANDED
     call_ts: float = 0.0
     ts: float = 0.0
     chars: int = 0
@@ -1193,35 +769,18 @@ class ToolResult:
 
 def tool_results(path: Path | str, *, chars_per_token: float = 4.0,
                  ) -> list[ToolResult]:
-    """Every tool call in one transcript, paired with its result and sized.
-
-    ONE unfiltered pass, `rows(path)` with no needle. The needle `'"tool_'` would catch
-    both block types, but the sizing below also needs the `assistant` usage rows, the
-    prompt rows and the `compact_boundary` rows from the SAME ordered walk — the things
-    collected here are defined by their position relative to each other, exactly as
-    `inspection.read_transcript` is, and one unfiltered pass beats four filtered ones.
-
-    Returned in `tool_use` order, which makes the walk reproducible run to run.
-
-    `chars_per_token` is the divisor of the `chars` fallback and is `cost.chars_per_token`
-    FROM THE CATALOG (default 4.0): a model-family property the OS does not control and
-    therefore configuration, not a constant. It is a parameter because this module is a
-    leaf and must not import the catalog — the caller supplies it. Refused at or below
-    zero, the same rule the catalog applies, rather than inventing a size.
-    """
+    """Every tool call in one transcript, paired with its result and sized"""
     if chars_per_token <= 0:
         raise ValueError("chars_per_token must be > 0")
     path = Path(path)
     caller = CALLER_SUBAGENT if path.parent.name == "subagents" else CALLER_MAIN
     found: list[ToolResult] = []
     pending: dict[str, ToolResult] = {}
-    # The results that landed since the last API call: the ones the NEXT call's context
-    # growth paid for.
+    # The results that landed since the last API call: the ones the NEXT call's context growth paid for
     group: list[ToolResult] = []
     calls: dict[str, Call] = {}
     previous: Call | None = None
-    # A prompt row or a compaction between two calls means the context grew (or shrank)
-    # for a reason that is not the tool, so the exact basis is off for this group.
+    # A prompt row or a compaction between two calls means the context grew (or shrank) for a reason that...
     interrupted = False
 
     for row in rows(path):
@@ -1237,11 +796,7 @@ def tool_results(path: Path | str, *, chars_per_token: float = 4.0,
             if call is not None:
                 seen = calls.get(mid)
                 if seen is not None:
-                    # THE STREAMING DUPLICATE: one assistant message is written several
-                    # times as its text grows, every copy repeating the input counts and
-                    # climbing toward the final `output_tokens`. Merge by max into the
-                    # call already placed, the same rule `_assistant_messages` applies —
-                    # summing the copies would triple the context.
+                    # THE STREAMING DUPLICATE: one assistant message is written several times as its text grows
                     _merge_call(seen, call)
                 else:
                     _size_group(group, previous, call, interrupted, chars_per_token)
@@ -1264,27 +819,20 @@ def tool_results(path: Path | str, *, chars_per_token: float = 4.0,
         for block in blocks_of(row, "tool_result"):
             item = pending.pop(str(block.get("tool_use_id") or ""), None)
             if item is None:
-                # A result for a call this file never recorded. Ignored rather than
-                # invented: there is no name to charge it to.
+                # A result for a call this file never recorded
                 continue
             item.matched = True
             item.ts = parse_stamp(row.get("timestamp"))
             item.chars = len(_result_text(block.get("content")))
             item.is_error = _result_failed(block, row.get("toolUseResult"))
             group.append(item)
-    # A result after the LAST call of the session has no delta to be measured against.
+    # A result after the LAST call of the session has no delta to be measured against
     _size_group(group, previous, None, True, chars_per_token)
     return found
 
 
 def _is_prompt_row(row: dict[str, Any]) -> bool:
-    """Whether this row is the USER talking, rather than the agent's own loop.
-
-    `inspection._prompt_of`'s rule, reduced to the boolean this walk needs: of the three
-    kinds of `user` row only one is a prompt — a tool result is the loop, and an
-    `isMeta` row is Claude Code talking to itself (a skill's base directory, a hook's
-    output). Charging either to a tool is how the user's typing lands on a `Read`.
-    """
+    """Whether this row is the USER talking, rather than the agent's own loop"""
     if row.get("type") != "user":
         return False
     if row.get("promptSource") != "sdk" and (
@@ -1296,17 +844,12 @@ def _is_prompt_row(row: dict[str, Any]) -> bool:
     return bool(text.strip())
 
 
-#: A session's title is one line of a listing, not the prompt (usage-meter spec §6).
+#: A session's title is one line of a listing, not the prompt (usage-meter spec §6)
 PROMPT_TITLE_CHARS = 120
 
 
 def first_prompt(path: Path | str, *, limit: int = PROMPT_TITLE_CHARS) -> str:
-    """The first thing the USER typed in one transcript, collapsed and truncated.
-
-    Beside `_is_prompt_row` rather than built on `said_in_session`, which returns
-    ASSISTANT prose: what names a session the user never told Jarvis about is their own
-    opening line (usage-meter spec §6).
-    """
+    """The first thing the USER typed in one transcript, collapsed and truncated"""
     for row in rows(path):
         if not _is_prompt_row(row):
             continue
@@ -1320,12 +863,7 @@ def first_prompt(path: Path | str, *, limit: int = PROMPT_TITLE_CHARS) -> str:
 
 
 def _call_of_row(row: dict[str, Any]) -> tuple[Call | None, str]:
-    """The API call one assistant row stands for, with its message id, or (None, "").
-
-    The same two rejections `_assistant_messages` makes — no `usage` object, and
-    `_is_api_call` — so the calls this walk measures a delta between are exactly the
-    calls the rest of the module bills.
-    """
+    """The API call one assistant row stands for, with its message id, or (None, "")"""
     message = row.get("message") or {}
     counts, mid = message.get("usage"), message.get("id")
     if not isinstance(counts, dict) or not mid:
@@ -1352,7 +890,7 @@ def _call_of_row(row: dict[str, Any]) -> tuple[Call | None, str]:
 
 
 def _merge_call(into: Call, other: Call) -> None:
-    """Fold a repeated copy of one assistant message into the call already placed."""
+    """Fold a repeated copy of one assistant message into the call already placed"""
     into.input = max(into.input, other.input)
     into.cache_write = max(into.cache_write, other.cache_write)
     into.cache_read = max(into.cache_read, other.cache_read)
@@ -1363,23 +901,7 @@ def _merge_call(into: Call, other: Call) -> None:
 
 def _size_group(group: list[ToolResult], previous: Call | None, nxt: Call | None,
                 interrupted: bool, chars_per_token: float) -> None:
-    """Charge one batch of results with the tokens the next call carried them as.
-
-    `context-delta`, token-exact where it applies:
-
-        appended = context(N+1) - context(N) - output(N)
-
-    `Call.context` is the full prompt size of one API call, so the growth between two
-    consecutive calls of the same chain is what was appended between them — the results
-    of this group, plus the assistant message N itself, which `output(N)` removes. Split
-    across the group in proportion to characters, because parallel tool calls put
-    several results between one pair of calls and the transcript says nothing about
-    which of them was the big one.
-
-    Falls back to `chars` whenever the delta is not evidence: a prompt row or a
-    compaction between the two calls (`interrupted`), no next call, or a delta that did
-    not grow. The estimate is visible in `token_basis`, never silently mixed in.
-    """
+    """Charge one batch of results with the tokens the next call carried them as"""
     if not group:
         return
     delta = 0
@@ -1397,13 +919,7 @@ def _size_group(group: list[ToolResult], previous: Call | None, nxt: Call | None
 
 
 def _split_by_chars(total: int, weights: list[int]) -> list[int]:
-    """Split an exact total in proportion to character counts, losing nothing.
-
-    Largest remainder, ties to the earlier result: the parts MUST sum to `total`, since
-    the total is the one token-exact figure in this walk and a per-result rounding that
-    dropped its remainder would under-report every parallel call in the fleet. Equal
-    shares when nothing has any characters — an empty result still rode along.
-    """
+    """Split an exact total in proportion to character counts, losing nothing"""
     count = len(weights)
     if total <= 0 or count == 0:
         return [0] * count
@@ -1418,7 +934,7 @@ def _split_by_chars(total: int, weights: list[int]) -> list[int]:
 
 
 def _result_text(content: Any) -> str:
-    """A `tool_result` block's text: a bare string, or a list of text blocks."""
+    """A `tool_result` block's text: a bare string, or a list of text blocks"""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -1428,11 +944,7 @@ def _result_text(content: Any) -> str:
 
 
 def _result_failed(block: dict[str, Any], result: Any) -> bool:
-    """Whether this result reports an ERROR — `background._failed`'s precedence.
-
-    Kept apart rather than dropped: a refused call returns a two-line refusal, and
-    averaging it in with a 20k-token file dump moves the number a reader acts on.
-    """
+    """Whether this result reports an ERROR — `background._failed`'s precedence"""
     if block.get("is_error"):
         return True
     if isinstance(result, dict):

@@ -1,15 +1,4 @@
-"""A bug filed through Jarvis runs itself: work order, in-progress label, self-closing.
-
-Issue #240. `jarvis bug report` used to create a GitHub issue and forget it, so a tracker
-the OS wrote to was a tracker only a human maintained. These tests cover the three steps
-that were missing — the issue is picked up as work, the tracker says so, and it closes
-itself when the work LANDS — plus the things that make that safe to leave on for every
-agent in the fleet: the priority is a required input and the only thing that routes,
-a `critical`/`blocker` claim is re-assessed by Neo before anything is dispatched, the
-label comes back off when the work does not land, an unreachable `gh` or an unreachable
-Neo changes nothing and retries, and a human's own decisions about an issue are never
-overridden.
-"""
+"""A bug filed through Jarvis runs itself: work order, in-progress label, self-closing (#240)"""
 
 import ast
 import json
@@ -23,29 +12,23 @@ from jarvis import bugreport, cli, issues
 from jarvis.project_store import ProjectStore
 from jarvis.testing import FIXTURE_BUG_REPO
 
-#: Everything here happens on the repository `fake_gh` makes `bug_repo()` answer, which
-#: NOBODY OWNS (review round 2) — so a test that got past the fake `gh` would write to a
-#: repository that does not exist rather than to the live public tracker.
+#: Everything here happens on the repository `fake_gh` makes `bug_repo()` answer
 PR = f"https://github.com/{FIXTURE_BUG_REPO}/pull/9"
 PR_2 = f"https://github.com/{FIXTURE_BUG_REPO}/pull/10"
 
 
-# -- fixtures -------------------------------------------------------------------------
+# -- fixtures
 
 
 def _origin(path, repo=FIXTURE_BUG_REPO):
-    """Give a fixture checkout the `origin` that makes it the tracker's project."""
+    """Give a fixture checkout the `origin` that makes it the tracker's project"""
     subprocess.run(["git", "remote", "add", "origin",
                     f"https://github.com/{repo}.git"], cwd=path, check=True)
 
 
 @pytest.fixture()
 def fleet(jarvis_home, fake_claude, fake_gh, tmp_path, project, claude_json, monkeypatch):
-    """A started OS whose `proj_a` IS the OS's own tracker repo.
-
-    The one condition `issues.tracker_project` requires, made true separately from
-    everything else so a test can take it away: the checkout's `origin`.
-    """
+    """A started OS whose `proj_a` IS the OS's own tracker repo"""
     from jarvis import ops
 
     monkeypatch.delenv("JARVIS_WO_ID", raising=False)  # filed as the user, not an agent
@@ -73,7 +56,7 @@ def fleet(jarvis_home, fake_claude, fake_gh, tmp_path, project, claude_json, mon
             return load_catalog(catalog).project("proj_a")
 
         def sweep(self):
-            """One reconcile of the tracker, as the daemon runs it."""
+            """One reconcile of the tracker, as the daemon runs it"""
             from jarvis.catalog import load_catalog
             from jarvis.daemon import Daemon
             store = ProjectStore(project)
@@ -98,18 +81,12 @@ def fleet(jarvis_home, fake_claude, fake_gh, tmp_path, project, claude_json, mon
                 neo.close()
 
         def triage(self, **verdict):
-            """Deliver a Neo verdict for the queued triage question, as the drain does."""
+            """Deliver a Neo verdict for the queued triage question, as the drain does"""
             self.triage_raw(**{"escalate": False, "approve": True, "answer": "",
                                "reason": "because", **verdict})
 
         def triage_raw(self, **raw):
-            """The same, from Neo's REPLY rather than from a hand-built verdict.
-
-            Everything goes through `neo.parse_verdict` so no test can assert against a
-            shape Neo cannot emit (kn-89230548) — and so the fields `triage`'s defaults
-            supply can be left OUT, which is the whole of the question-493 defect: a
-            reply carrying neither `verdict` nor `approve`.
-            """
+            """The same, from Neo's REPLY rather than from a hand-built verdict"""
             from jarvis import neo
             from jarvis.catalog import load_catalog
             from jarvis.central_store import CentralStore
@@ -123,8 +100,7 @@ def fleet(jarvis_home, fake_claude, fake_gh, tmp_path, project, claude_json, mon
                 central.close()
 
         def blocker_wo(self, issue_url=None, title="wo send is lost"):
-            """A bug all the way through the rails: filed `blocker`, confirmed by Neo,
-            work order created. The starting point for every lifecycle test below."""
+            """A bug all the way through the rails: filed `blocker`, confirmed by Neo, work order created"""
             if issue_url:
                 self.gh.next_issue(issue_url)
             self.file_bug(title=title, priority="blocker")
@@ -132,7 +108,7 @@ def fleet(jarvis_home, fake_claude, fake_gh, tmp_path, project, claude_json, mon
             return self.wo_id(issue_url)
 
         def land(self, wo_id, pr_url=PR):
-            """The work order's code reaches `main`, and the tracker is reconciled."""
+            """The work order's code reaches `main`, and the tracker is reconciled"""
             from jarvis import ops
             store = ProjectStore(project)
             try:
@@ -143,7 +119,7 @@ def fleet(jarvis_home, fake_claude, fake_gh, tmp_path, project, claude_json, mon
             self.sweep()
 
         def releases(self):
-            """Every open work order filed to SHIP something, newest last."""
+            """Every open work order filed to SHIP something, newest last"""
             from jarvis import db
             from jarvis.daemon import Daemon
             from jarvis.project_store import OPEN_STATUSES
@@ -157,7 +133,7 @@ def fleet(jarvis_home, fake_claude, fake_gh, tmp_path, project, claude_json, mon
                 store.close()
 
         def wo_id(self, issue_url=None):
-            """The work order a confirmed triage created, if any."""
+            """The work order a confirmed triage created, if any"""
             store = ProjectStore(project)
             try:
                 rows = store.work_orders_for_issue(issue_url or fake_gh.issue_url)
@@ -170,17 +146,14 @@ def fleet(jarvis_home, fake_claude, fake_gh, tmp_path, project, claude_json, mon
 
 @pytest.fixture()
 def opted_out(jarvis_home, fake_claude, fake_gh, catalog_file):
-    """The shipped default: a fleet that has turned nothing on."""
+    """The shipped default: a fleet that has turned nothing on"""
     from jarvis import ops
     ops.start_os(str(catalog_file), foreground=True)
     return fake_gh
 
 
 def test_the_authenticated_login_is_read_once_and_a_failed_read_is_not_cached(fake_gh):
-    """Spec 2026-10-14 §4: one `gh api user` per process, because the account cannot
-    change under a running daemon — but `gh` down for one tick is TRANSIENT, so caching
-    that failure would leave red-base adoption off for the daemon's whole life and file a
-    duplicate issue per break for ever."""
+    """Spec 2026-10-14 §4: one `gh api user` per process"""
     def reads() -> int:
         return len([c for c in fake_gh.calls if c["argv"][:2] == ["api", "user"]])
 
@@ -192,18 +165,11 @@ def test_the_authenticated_login_is_read_once_and_a_failed_read_is_not_cached(fa
     assert issues.gh_login() == fake_gh.login and reads() == 2
 
 
-# -- what may write to GitHub ---------------------------------------------------------
+# -- what may write to GitHub
 
 
 def test_every_gh_command_this_module_builds_is_a_declared_issue_verb():
-    """`github.py`'s read-only proof, pointed the other way.
-
-    That module may build no write verb; this one is where the writes live, so the thing
-    worth pinning is that the SET of them is small, declared and cannot grow by accident.
-    A `["pr", "merge", …]` or a `["repo", "delete", …]` added anywhere in this file, at
-    any nesting depth, fails here — there is no way to add a GitHub write to the OS
-    without editing this test.
-    """
+    """`github.py`'s read-only proof, pointed the other way"""
     tree = ast.parse(Path(issues.__file__).read_text())
     verbs = set()
     for node in ast.walk(tree):
@@ -212,9 +178,7 @@ def test_every_gh_command_this_module_builds_is_a_declared_issue_verb():
         words = [e.value if isinstance(e, ast.Constant) else None for e in node.elts]
         if not all(isinstance(w, str) for w in words[:2]):
             continue
-        # A command verb is one bare word. The prose lists this module builds for the
-        # closing comment are strings too, and admitting them would make the guard
-        # report its own comment text as an undeclared command.
+        # A command verb is one bare word
         if not words[0] or not words[0].isidentifier():
             continue
         verbs.add((words[0], words[1]))
@@ -224,32 +188,17 @@ def test_every_gh_command_this_module_builds_is_a_declared_issue_verb():
         f"{sorted(verbs - set(issues.ISSUE_VERBS))}")
 
 
-#: The commands in a write module that WRITE NOTHING, and what each is for. Every one of
-#: them earns its place by making a write safe: `issue view` is what makes the label and
-#: close idempotent, `issue list` is the follow-up dedupe, and `repo view` is the privacy
-#: read that decides whether a seat's own words may be published at all (spec §9 of
-#: docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md). `api user` is the
-#: fourth: the login the OS files under, which is what tells its own red-base filing from
-#: a stranger's issue quoting the same run id (spec 2026-10-14 §4) before `start_work`
-#: turns that body into a privileged worker's brief.
+#: The commands in a write module that WRITE NOTHING, and what each is for (docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md)
 ISSUE_READS = {("issue", "view"), ("issue", "list"), ("repo", "view"),
                ("api", "user")}
 
 
 def test_the_declared_verbs_are_exactly_these_writes_and_these_three_reads():
-    """The AST test above answers "is every command declared?"; this one answers "which
-    commands are declared", which is the question a reader of ISSUE_VERBS has.
-
-    A `<=` check passes the moment a verb is ADDED to the tuple, so on its own it lets the
-    set grow with only a line of production code touched. Pinning the set exactly is what
-    makes a widening land here, in the place the decision gets recorded (`kn-2531869c`).
-    """
+    """The AST test above answers "is every command declared?\""""
     assert set(issues.ISSUE_VERBS) == ISSUE_READS | {
         ("issue", "edit"), ("issue", "comment"), ("issue", "close"),
         ("label", "create"), ("issue", "create"),
-        # The recurrence path's write: a gap that came back is linked to its original
-        # issue, which the OS normally already closed (spec §8 of
-        # docs/superpowers/specs/2026-09-27-self-evolution.md).
+        # The recurrence path's write: a gap that came back is linked to its original issue (docs/superpowers/specs/2026-09-27-self-evolution.md)
         ("issue", "reopen")}
 
 
@@ -263,8 +212,7 @@ def test_the_declared_verbs_are_exactly_these_writes_and_these_three_reads():
     "https://github.com/gonandrap/agentic_os/pull/7",        # not an issue
 ])
 def test_the_os_refuses_to_write_anywhere_but_its_own_tracker(url):
-    """The column is a string the record hands to a command run with the operator's
-    credentials — `github.UntrustedPullRequest`'s exposure, on the writing side."""
+    """The column is a string the record hands to a command run with the operator's credentials"""
     with pytest.raises(issues.IssueLifecycleError):
         issues.checked_issue_url(url)
 
@@ -274,37 +222,26 @@ def test_the_tracker_url_is_accepted():
     assert issues.checked_issue_url(url) == url
 
 
-# -- the second repository: a project's own tracker (user ruling, 2026-09-16) ----------
-#
-# The panel's follow-ups are filed on the project under review, so this module no longer
-# writes to exactly one repository. THE CHECK DID NOT GO AWAY, it gained a caller who
-# names the repository — and these pin that the widening is bounded rather than open.
+# -- the second repository: a project's own tracker (user ruling, 2026-09-16)
 
 
 def test_a_caller_may_name_its_own_repository_and_is_still_held_to_it():
-    """The new authority and its limit, in one pair. A URL on the repository the caller
-    named is accepted; one on any OTHER repository is refused just as hard as before —
-    so a URL out of the record still cannot redirect a write, which is the whole of the
-    exposure `github.UntrustedPullRequest` describes."""
+    """The new authority and its limit, in one pair"""
     ours = "https://github.com/acme/proj_a/issues/12"
     assert issues.checked_issue_url(ours, "acme/proj_a") == ours
     with pytest.raises(issues.IssueLifecycleError):
         issues.checked_issue_url(ours, "someone/else")
-    # ...and naming a repository does not relax the SHAPE rule either.
+    # ...and naming a repository does not relax the SHAPE rule either
     with pytest.raises(issues.IssueLifecycleError):
         issues.checked_issue_url("--repo=acme/proj_a", "acme/proj_a")
-    # ...nor does it let the HOST through. A URL is `<host>/<owner>/<repo>/issues/N` and
-    # the caller names only the middle: match on owner and repository alone and the
-    # project's real name under an attacker's host reads as the project's own.
+    # ...nor does it let the HOST through
     with pytest.raises(issues.IssueLifecycleError):
         issues.checked_issue_url("https://evil.example/acme/proj_a/issues/12",
                                  "acme/proj_a")
 
 
 def test_the_default_is_still_the_os_tracker():
-    """Every pre-existing caller passes no repository, so the bug-tracker lifecycle's
-    confinement is untouched by the widening. Without this the parameter could quietly
-    default to "anywhere" and every test above would still pass."""
+    """Every pre-existing caller passes no repository"""
     with pytest.raises(issues.IssueLifecycleError):
         issues.checked_issue_url("https://github.com/acme/proj_a/issues/12")
 
@@ -314,9 +251,7 @@ def test_the_default_is_still_the_os_tracker():
     "acme/proj_a extra", "acme/proj a", "acme/proj_a;rm",
 ])
 def test_a_repository_name_is_checked_before_it_becomes_an_argument(repo):
-    """`--repo` is the value that now VARIES per project, where it used to be one
-    constant — so it is held to an anchored shape for `checked_label`'s reason: `gh`
-    reads a leading `-` as a flag."""
+    """`--repo` is the value that now VARIES per project, where it used to be one constant"""
     with pytest.raises(issues.IssueLifecycleError):
         issues.checked_repo(repo)
 
@@ -325,12 +260,11 @@ def test_a_real_repository_name_is_accepted():
     assert issues.checked_repo("acme/proj_a") == "acme/proj_a"
 
 
-# -- is the destination private? the read that decides what may be published -----------
+# -- is the destination private? the read that decides what may be published
 
 
 def test_a_repository_github_calls_private_is_the_only_one_reported_private(fake_gh):
-    """Both answers off the same read, because "it returns False" is also true of a
-    function that never looks."""
+    """Both answers off the same read"""
     fake_gh.set_private(True)
     assert issues.repo_is_private("acme/proj_a") is True
     fake_gh.set_private(False)
@@ -343,24 +277,19 @@ def test_a_repository_github_calls_private_is_the_only_one_reported_private(fake
 ])
 def test_a_repository_the_os_cannot_read_is_treated_as_public(fake_gh, break_it,
                                                               message):
-    """FAIL CLOSED: a refusal and an unparseable answer reach the same branch as "public".
-    Unknown is not a third case — the finding text goes out only where the OS has
-    POSITIVELY established the destination is private (spec §9)."""
+    """FAIL CLOSED: a refusal and an unparseable answer reach the same branch as "public\""""
     getattr(fake_gh, break_it)(message)
     assert issues.repo_is_private("acme/proj_a") is False
 
 
 def test_a_repository_name_that_would_read_as_a_flag_is_never_sent(fake_gh):
-    """`gh repo view` takes the repository POSITIONALLY — it has no `--repo` flag — so
-    `checked_repo` is the only thing standing between a name and an argument `gh` would
-    read as an option. It raises, and the blanket `except` turns that into "not
-    private", which is the safe answer for a repository nobody could look up."""
+    """`gh repo view` takes the repository POSITIONALLY"""
     assert issues.repo_is_private("--json=isPrivate") is False
     assert [c for c in fake_gh.calls if c["argv"][:2] == ["repo", "view"]] == [], (
         "a name that failed the shape check still reached `gh`")
 
 
-# -- where an issue belongs, given its work order -------------------------------------
+# -- where an issue belongs, given its work order
 
 
 def _wo(store, status="pending", **fields):
@@ -384,7 +313,7 @@ def test_an_open_work_order_means_the_issue_is_in_progress(project, status):
 
 @pytest.mark.parametrize("status", ["cancelled", "failed"])
 def test_a_dead_work_order_hands_the_issue_back(project, status):
-    """Issue #240 C: a tracker that lies the other way is no better."""
+    """Issue #240 C: a tracker that lies the other way is no better"""
     store = ProjectStore(project)
     try:
         assert issues.desired_state(store, _wo(store, status)) == issues.RELEASED
@@ -393,9 +322,7 @@ def test_a_dead_work_order_hands_the_issue_back(project, status):
 
 
 def test_a_refused_pull_request_hands_the_issue_back_and_takes_it_again(project):
-    """The work order stays OPEN when its pull request is closed unmerged — and nothing
-    is under way, so the label must not claim otherwise. Reopening reverses it, because
-    the state is derived (`pr_closure_told`) rather than written down once."""
+    """The work order stays OPEN when its pull request is closed unmerged"""
     store = ProjectStore(project)
     try:
         wo = _wo(store, "needs_review")
@@ -416,9 +343,7 @@ def test_a_completed_work_order_closes_its_issue(project):
 
 
 def test_completed_over_work_that_never_landed_leaves_the_issue_open(project):
-    """Neo, question 289, and issue #232's gap on the tracker: `completed` alone does not
-    prove the code reached `main`, so an order the user closed over a stranded branch
-    takes its label off and leaves the issue for someone to decide about."""
+    """Neo, question 289, and issue #232's gap on the tracker: `completed` alone does not prove the code..."""
     store = ProjectStore(project)
     try:
         wo = _wo(store, "completed")
@@ -429,9 +354,7 @@ def test_completed_over_work_that_never_landed_leaves_the_issue_open(project):
 
 
 def test_a_merge_supersedes_an_earlier_stranding(project):
-    """The same episode arithmetic `work_abandoned` uses: a refusal stands only until the
-    work order is delivered again. Without this, an order parked once as unlanded could
-    never close its issue however it ended."""
+    """The same episode arithmetic `work_abandoned` uses: a refusal stands only until the work order is..."""
     store = ProjectStore(project)
     try:
         wo = _wo(store, "completed")
@@ -442,13 +365,11 @@ def test_a_merge_supersedes_an_earlier_stranding(project):
         store.close()
 
 
-# -- the priority is the only thing that routes ---------------------------------------
+# -- the priority is the only thing that routes
 
 
 def test_a_bug_report_without_a_priority_is_refused(fleet):
-    """The user's ruling: a required input, no default, no inference. A default would be
-    the OS deciding how serious someone else's bug is, and both available defaults are
-    wrong — `critical` lets a typo cut a release, `low` buries an urgent report."""
+    """The user's ruling: a required input, no default, no inference"""
     with pytest.raises(bugreport.BugReportError) as e:
         bugreport.report_bug(title="t", description="d", expected="e", actual="a")
     assert "priority" in str(e.value)
@@ -464,9 +385,7 @@ def test_an_unknown_priority_is_refused_with_the_rubric(fleet):
 
 
 def test_the_cli_will_not_file_a_bug_without_one(fleet, capsys):
-    """argparse refuses it before `report_bug` is reached: the flag is `required=True`
-    with the five levels as `choices`, so the rubric is in `--help` and a typo cannot
-    reach the tracker."""
+    """argparse refuses it before `report_bug` is reached: the flag is `required=True` with the five..."""
     with pytest.raises(SystemExit):
         cli.main(["bug", "report", "t", "-d", "d", "-e", "e", "-a", "a"])
     assert "--priority" in capsys.readouterr().err
@@ -474,8 +393,7 @@ def test_the_cli_will_not_file_a_bug_without_one(fleet, capsys):
 
 @pytest.mark.parametrize("level", ["low", "medium", "high"])
 def test_a_non_dispatching_bug_is_queued_and_never_asks_neo(fleet, level):
-    """Three of the five commit the fleet to nothing, so there is nothing to guard
-    against and no reason to spend a Neo call on them."""
+    """Three of the five commit the fleet to nothing"""
     from jarvis.central_store import CentralStore
     from jarvis.neo_store import NeoStore
 
@@ -491,8 +409,7 @@ def test_a_non_dispatching_bug_is_queued_and_never_asks_neo(fleet, level):
         assert not [q for q in neo.list_questions() if q.get("kind") == "triage"]
     finally:
         neo.close()
-    # AND NO SECOND QUEUE (kn-c5725f1f). The tracker is the tracker now; a backlog item
-    # beside the issue is a list the user stopped reading.
+    # AND NO SECOND QUEUE (kn-c5725f1f)
     central = CentralStore()
     try:
         assert not central.list_backlog()
@@ -502,8 +419,7 @@ def test_a_non_dispatching_bug_is_queued_and_never_asks_neo(fleet, level):
 
 @pytest.mark.parametrize("level", ["critical", "blocker"])
 def test_a_dispatching_claim_goes_to_neo_and_waits(fleet, level):
-    """The filing agent's rating is a CLAIM. Nothing is dispatched off it — the bug sits
-    on the tracker exactly like any other until Neo rules."""
+    """The filing agent's rating is a CLAIM"""
     pickup = fleet.file_bug(priority=level)["pickup"]
     assert pickup["neo_question_id"], "a critical/blocker claim must be re-assessed"
     assert not pickup["backlog_id"] and not pickup["wo_id"]
@@ -540,8 +456,7 @@ def test_neo_downgrading_leaves_it_in_the_backlog_and_corrects_the_label(fleet):
 
 
 def test_a_downgrade_that_names_no_level_lands_on_the_safe_one(fleet):
-    """Neo refusing to confirm is the whole signal; the level it landed on is detail. A
-    level nobody stated must never be guessed at upwards."""
+    """Neo refusing to confirm is the whole signal; the level it landed on is detail"""
     fleet.file_bug(priority="critical")
     fleet.triage(approve=False, answer="")
     assert f"priority: {issues.SAFE_DOWNGRADE}" in fleet.gh.issue()["labels"]
@@ -549,8 +464,7 @@ def test_a_downgrade_that_names_no_level_lands_on_the_safe_one(fleet):
 
 
 def test_a_downgrade_that_names_a_higher_level_is_not_a_confirmation(fleet):
-    """`deny` plus `blocker` in the answer is a contradiction, and the safe reading of a
-    contradiction is the refusal — not the level that would spend money."""
+    """`deny` plus `blocker` in the answer is a contradiction"""
     fleet.file_bug(priority="critical")
     fleet.triage(approve=False, answer="blocker")
     assert f"priority: {issues.SAFE_DOWNGRADE}" in fleet.gh.issue()["labels"]
@@ -558,9 +472,7 @@ def test_a_downgrade_that_names_a_higher_level_is_not_a_confirmation(fleet):
 
 
 def test_neo_confirming_in_the_answer_is_not_a_downgrade(fleet):
-    """Neo question 493, verbatim in shape: a reply with NO `verdict` and NO `approve`,
-    whose answer opens with the word `approve`. The OS told the user Neo had downgraded
-    the bug to `high` — a verdict Neo never gave, at a level nobody chose."""
+    """Neo question 493, verbatim in shape: a reply with NO `verdict` and NO `approve`"""
     fleet.file_bug(priority="critical")
     fleet.triage_raw(escalate=False,
                      answer="approve — confirmed critical: the OS lies to the user",
@@ -573,9 +485,7 @@ def test_neo_confirming_in_the_answer_is_not_a_downgrade(fleet):
 
 
 def test_a_verdict_nobody_could_parse_is_unconfirmed_not_a_downgrade(fleet):
-    """The third outcome `settle_triage` documents and never used to reach. A reply that
-    ruled on nothing must not become a confident sentence about a level Neo never named
-    — `SAFE_DOWNGRADE` is for a deny, not for output nobody could read."""
+    """The third outcome `settle_triage` documents and never used to reach"""
     from jarvis.central_store import CentralStore
 
     fleet.file_bug(priority="critical")
@@ -596,14 +506,7 @@ def test_a_verdict_nobody_could_parse_is_unconfirmed_not_a_downgrade(fleet):
 
 
 def test_a_level_in_the_answer_alone_downgrades_when_it_is_below_the_claim(fleet):
-    """Review round 1: the third route through `read_triage_verdict`, and the one that
-    writes the user-facing "Neo downgraded a `critical` bug to `X`" sentence.
-
-    Every OTHER downgrade test reaches the explicit-deny branch, because the fixture's
-    defaults supply `approve=False`. This is the shape production actually emitted —
-    neither `verdict` nor `approve`, the ruling in `answer` — with the ruling being a
-    level rather than the word `approve`.
-    """
+    """Review round 1: the third route through `read_triage_verdict`"""
     from jarvis.central_store import CentralStore
 
     fleet.file_bug(priority="critical")
@@ -624,10 +527,7 @@ def test_a_level_in_the_answer_alone_downgrades_when_it_is_below_the_claim(fleet
 
 def test_a_level_in_the_answer_alone_is_unconfirmed_when_it_is_not_below_the_claim(
         fleet):
-    """The companion, and the one that pins the ORDERING `downgrade_to` owns. `blocker`
-    is not a downgrade of `critical`, and with no verdict field beside it nobody denied
-    anything either — so there is nothing to act on and nothing to tell the user a level
-    about."""
+    """The companion, and the one that pins the ORDERING `downgrade_to` owns"""
     from jarvis.central_store import CentralStore
 
     fleet.file_bug(priority="critical")
@@ -648,21 +548,20 @@ def test_a_level_in_the_answer_alone_is_unconfirmed_when_it_is_not_below_the_cla
 
 
 def test_the_tracker_records_both_the_claim_and_the_verdict(fleet):
-    """The user's instruction: the disagreement is the signal that says whether the
-    rubric is working, so neither half may be overwritten silently."""
+    """The user's instruction: the disagreement is the signal that says whether the rubric is working"""
     from jarvis.central_store import CentralStore
 
     result = fleet.file_bug(priority="blocker")
     fleet.triage(approve=False, answer="medium", reason="bounded to one surface")
 
-    # PUBLIC: both levels, so the disagreement is visible on the tracker itself.
+    # PUBLIC: both levels, so the disagreement is visible on the tracker itself
     body = "\n".join(fleet.gh.issue()["comments"])
     assert "blocker" in body and "medium" in body
-    # And the ORIGINAL claim is in the issue body, where no re-assessment can move it.
+    # And the ORIGINAL claim is in the issue body, where no re-assessment can move it
     filed = [c for c in fleet.gh.calls if c["argv"][:2] == ["issue", "create"]][0]
     assert "blocker" in filed["stdin"]
     assert result["url"]
-    # PRIVATE: the reasoning, on the record the user reads, and NOT on the tracker.
+    # PRIVATE: the reasoning, on the record the user reads, and NOT on the tracker
     central = CentralStore()
     try:
         inbox = "\n".join((i["body"] or "") for i in central.unacked_inbox())
@@ -674,13 +573,7 @@ def test_the_tracker_records_both_the_claim_and_the_verdict(fleet):
 
 
 def test_neos_reasoning_never_reaches_the_public_tracker(fleet):
-    """Review round 2, and `closing_comment`'s rule on the other comment this OS writes.
-
-    Neo answers with fleet context behind it — learnings, other work orders, project
-    names, absolute paths — and a GitHub comment is indexed and cached whether or not it
-    is later deleted. Nobody reads this one before it leaves the machine, so the tracker
-    gets the two levels and the work order, and nothing a model wrote in prose.
-    """
+    """Review round 2, and `closing_comment`'s rule on the other comment this OS writes"""
     leak = ("promoted over /home/gonzalo/workspace/secret_client per kn-deadbeef; "
             "wo-000000 hit the same thing")
     fleet.file_bug(priority="blocker")
@@ -693,8 +586,7 @@ def test_neos_reasoning_never_reaches_the_public_tracker(fleet):
 
 
 def test_neo_escalating_dispatches_nothing_and_says_so(fleet):
-    """Fail closed. An unconfirmed `blocker` that quietly became a release is the worse
-    failure by a long way, so the refusal direction is fixed."""
+    """Fail closed"""
     from jarvis.central_store import CentralStore
 
     pickup = fleet.file_bug(priority="blocker")["pickup"]
@@ -712,7 +604,7 @@ def test_neo_escalating_dispatches_nothing_and_says_so(fleet):
 
 
 def test_a_filing_that_cannot_reach_neo_is_queued_not_dispatched(fleet, monkeypatch):
-    """Same refusal, one layer earlier: Neo unreachable at filing time."""
+    """Same refusal, one layer earlier: Neo unreachable at filing time"""
     def boom(*_a, **_k):
         raise RuntimeError("neo store is gone")
     monkeypatch.setattr(issues, "ask_triage", boom)
@@ -725,7 +617,7 @@ def test_a_filing_that_cannot_reach_neo_is_queued_not_dispatched(fleet, monkeypa
 
 
 def test_nothing_is_routed_when_no_project_owns_the_tracker(opted_out):
-    """The bug is filed and left for a human — the OS never invents a home for it."""
+    """The bug is filed and left for a human — the OS never invents a home for it"""
     result = bugreport.report_bug(title="t", description="d", expected="e", actual="a",
                                   priority="blocker")
     assert not result["pickup"]["wo_id"] and not result["pickup"]["backlog_id"]
@@ -733,8 +625,7 @@ def test_nothing_is_routed_when_no_project_owns_the_tracker(opted_out):
 
 
 def test_the_label_is_created_when_the_repository_does_not_have_it(fleet):
-    """GitHub refuses `--add-label` for a label the repository never defined, which would
-    otherwise make this feature fail on every tracker but the one it was written on."""
+    """GitHub refuses `--add-label` for a label the repository never defined"""
     fleet.gh.set_labels(["bug"])
     fleet.file_bug(priority="low")
     assert "priority: low" in fleet.gh.issue()["labels"]
@@ -742,8 +633,7 @@ def test_the_label_is_created_when_the_repository_does_not_have_it(fleet):
 
 
 def test_one_issue_never_gets_two_work_orders(fleet):
-    """Issue #240 D. The fake files every report at the same URL, which is exactly the
-    shape being guarded: the same bug reported twice."""
+    """Issue #240 D"""
     fleet.file_bug(priority="blocker")
     fleet.triage(approve=True)
     first = fleet.wo_id()
@@ -758,8 +648,7 @@ def test_one_issue_never_gets_two_work_orders(fleet):
 
 
 def test_a_settled_work_order_lets_the_issue_be_taken_up_again(fleet):
-    """A reopened issue must be able to get a fresh work order — the dedup is about LIVE
-    work, not about the issue ever having been looked at."""
+    """A reopened issue must be able to get a fresh work order"""
     fleet.file_bug(priority="blocker")
     fleet.triage(approve=True)
     first = fleet.wo_id()
@@ -779,8 +668,7 @@ def test_a_settled_work_order_lets_the_issue_be_taken_up_again(fleet):
 
 
 def test_the_user_is_told_what_actually_happened(fleet):
-    """`report_bug`'s own rule — never ping about a state that was not reached — applied
-    to the rest of the lifecycle. A claim awaiting Neo says exactly that."""
+    """`report_bug`'s own rule — never ping about a state that was not reached"""
     from jarvis.central_store import CentralStore
 
     pickup = fleet.file_bug(priority="blocker")["pickup"]
@@ -794,12 +682,11 @@ def test_the_user_is_told_what_actually_happened(fleet):
         "a queued claim must not read as a decision that was taken"
 
 
-# -- the issue closes itself ----------------------------------------------------------
+# -- the issue closes itself
 
 
 def test_a_merged_pull_request_closes_the_issue_with_the_record_on_it(fleet):
-    """Steps 3 and 4 of the workflow issue #240 asks for, and decision F: months later
-    the issue itself has to say what closed it."""
+    """Steps 3 and 4 of the workflow issue #240 asks for"""
     from jarvis import ops
 
     wo_id = fleet.blocker_wo()
@@ -818,16 +705,13 @@ def test_a_merged_pull_request_closes_the_issue_with_the_record_on_it(fleet):
     assert "in progress" not in issue["labels"]
     body = "\n".join(issue["comments"])
     assert wo_id in body and PR in body
-    # Review round 1: the work order id, the title and the PR — and NOTHING ELSE. The
-    # worker wrote `result_summary` for the internal record, with no idea anyone would
-    # publish it, and this tracker is public.
+    # Review round 1: the work order id, the title and the PR — and NOTHING ELSE
     assert "/home/gonzalo" not in body and "secret_client" not in body, \
         "worker prose must never reach a public issue unread"
 
 
 def test_the_issue_is_not_closed_while_the_work_order_is_merely_completed(fleet):
-    """Issue #232's gap, on the tracker this time: `completed` over a branch nobody
-    landed is not a reason to tell the world the bug is fixed."""
+    """Issue #232's gap, on the tracker this time: `completed` over a branch nobody landed is not a reason..."""
     wo_id = fleet.blocker_wo()
     store = fleet.store()
     try:
@@ -843,9 +727,7 @@ def test_the_issue_is_not_closed_while_the_work_order_is_merely_completed(fleet)
 
 
 def test_marking_a_bug_done_with_nothing_to_land_closes_it(fleet):
-    """Neo's ruling on question 289: a not-a-bug, a docs-only fix or an already-fixed
-    report has no pull request to wait for, and leaving its issue open for ever is the
-    hand-maintained tracker this whole issue is about."""
+    """Neo's ruling on question 289: a not-a-bug"""
     from jarvis import ops
 
     wo_id = fleet.blocker_wo()
@@ -887,7 +769,7 @@ def test_a_refused_pull_request_takes_the_label_off_and_puts_it_back(fleet):
     assert "in progress" in fleet.gh.issue()["labels"]
 
 
-# -- the sweep costs nothing when there is nothing to do ------------------------------
+# -- the sweep costs nothing when there is nothing to do
 
 
 def test_a_reconciled_issue_is_not_touched_again(fleet):
@@ -914,7 +796,7 @@ def test_a_project_that_never_filed_a_bug_pays_nothing(opted_out, catalog_file, 
         store.close()
 
 
-# -- `gh` unreachable: fail closed, say so once, retry --------------------------------
+# -- `gh` unreachable: fail closed, say so once, retry
 
 
 def test_an_unreachable_gh_changes_nothing_and_retries(fleet):
@@ -969,8 +851,7 @@ def test_the_user_hears_once_that_the_tracker_is_not_being_kept_up(fleet):
 
 def test_a_filing_says_so_when_the_priority_label_did_not_reach_the_tracker(
         fleet, monkeypatch):
-    """The issue exists, so the filing must not fail — but it must not claim the tracker
-    shows something it does not either."""
+    """The issue exists, so the filing must not fail"""
     def boom(*_a, **_k):
         raise issues.IssueLifecycleError("gh fell over")
     monkeypatch.setattr(issues, "set_priority_label", boom)
@@ -982,7 +863,7 @@ def test_a_filing_says_so_when_the_priority_label_did_not_reach_the_tracker(
     assert "did NOT reach the issue" in bugreport.pickup_note(result["pickup"])
 
 
-# -- never fight a human --------------------------------------------------------------
+# -- never fight a human
 
 
 def test_an_issue_a_human_already_closed_is_commented_on_but_not_reclosed(fleet):
@@ -1035,17 +916,11 @@ def test_a_human_closing_an_issue_under_a_live_work_order_is_not_undone(fleet):
     assert fleet.gh.issue()["state"] == "CLOSED", "the OS never reopens an issue"
 
 
-# -- and the sweep CONVERGES on what it found ------------------------------------------
-#
-# Issue #961. "Never fight a human" was only half of it: `apply` returns CLOSED for an
-# issue a person closed, `record_applied` stores `closed`, and `desired_state` goes on
-# saying IN_PROGRESS — so `want != stored` fires again on every tick, for ever. In
-# production that was 315 ticks on issue 837 in ten hours, and a fresh release work order
-# each time the previous one settled (wo-5f35e667, wo-10fbcea5).
+# -- and the sweep CONVERGES on what it found
 
 
 def _all_release_orders(fleet) -> list[str]:
-    """`fleet.releases()` reads the OPEN ones; a re-file shows up against ALL of them."""
+    """`fleet.releases()` reads the OPEN ones; a re-file shows up against ALL of them"""
     from jarvis import db
     from jarvis.daemon import Daemon
     store = fleet.store()
@@ -1058,8 +933,7 @@ def _all_release_orders(fleet) -> list[str]:
 
 
 def _record_ships(monkeypatch) -> list[str]:
-    """Every `ensure_release` the sweep makes, still calling through. `fleet.sweep()`
-    builds its own `Daemon`, so the recorder goes on the class."""
+    """Every `ensure_release` the sweep makes, still calling through"""
     from jarvis.daemon import Daemon
     seen: list[str] = []
     original = Daemon.ensure_release
@@ -1073,13 +947,7 @@ def _record_ships(monkeypatch) -> list[str]:
 
 
 def _closed_issue_under_a_live_order(fleet) -> str:
-    """The production shape (issues 792/836/837/843/903): `issue_state` is `closed` and
-    the order is LIVE again, so `desired_state` can never agree with the column.
-
-    How prod got there, in order: the fix landed and the tracker closed, then a landing
-    refusal re-parked the completed order (`ops.park_unlanded`). Writing the column by
-    hand instead would stop reproducing it the moment the lifecycle changes.
-    """
+    """The production shape (issues 792/836/837/843/903): `issue_state` is `closed` and the order is LIVE..."""
     from jarvis import issues, landing, ops
     wo_id = fleet.blocker_wo()
     fleet.land(wo_id)
@@ -1100,7 +968,7 @@ def _closed_issue_under_a_live_order(fleet) -> str:
 
 def test_a_human_closed_issue_is_reconciled_once_not_on_every_tick(fleet, monkeypatch,
                                                                    caplog):
-    """A CLOSED issue the sweep cannot change: the second tick does nothing at all."""
+    """A CLOSED issue the sweep cannot change: the second tick does nothing at all"""
     with caplog.at_level(logging.INFO, logger="jarvisd"):
         wo_id = _closed_issue_under_a_live_order(fleet)
         fleet.sweep()
@@ -1130,8 +998,7 @@ def test_a_human_closed_issue_is_reconciled_once_not_on_every_tick(fleet, monkey
 
 def test_a_settled_release_order_is_not_filed_again_for_an_already_closed_issue(
         fleet, monkeypatch):
-    """The expensive half of the same loop: occurrence 2 of a release that already went
-    out, as soon as occurrence 1 leaves the open list."""
+    """The expensive half of the same loop: occurrence 2 of a release that already went out"""
     _closed_issue_under_a_live_order(fleet)
     assert len(fleet.releases()) == 1, "the landing filed one"
     first = fleet.releases()[0]["id"]
@@ -1153,16 +1020,14 @@ def test_a_settled_release_order_is_not_filed_again_for_an_already_closed_issue(
     assert _all_release_orders(fleet) == [first], "one release order, ever"
 
 
-# -- a confirmed fix that LANDS ships a release ---------------------------------------
+# -- a confirmed fix that LANDS ships a release
 
 
 ISSUE_2 = f"https://github.com/{FIXTURE_BUG_REPO}/issues/8"
 
 
 def test_a_landed_confirmed_blocker_files_a_release_through_the_ordinary_path(fleet):
-    """The user's instruction: the automatic ship goes through the existing release
-    machinery, not around it. So what the OS files is a WORK ORDER told to run
-    `shipit.sh --stage`, which gates like any other — not a release of its own."""
+    """The user's instruction: the automatic ship goes through the existing release machinery"""
     fleet.land(fleet.blocker_wo())
 
     releases = fleet.releases()
@@ -1170,8 +1035,7 @@ def test_a_landed_confirmed_blocker_files_a_release_through_the_ordinary_path(fl
     brief = releases[0]["description"]
     assert f"scripts/shipit.sh --stage --wo {releases[0]['id']} --base <sha>" in brief, \
         "the brief must name the staged path, the order's own id and the pinned base"
-    # 2026-10-01 spec §5: the brief IS the interface, so it has to teach the resolution
-    # as well as the flag — an unpinned command brings back the gate-347 defect.
+    # 2026-10-01 spec §5: the brief IS the interface
     assert "newest commit on `origin/main`" in brief
     assert "invalidates the grant" in brief
     assert "gated" in brief, "the worker is told the gate is expected, not a failure"
@@ -1179,8 +1043,7 @@ def test_a_landed_confirmed_blocker_files_a_release_through_the_ordinary_path(fl
 
 
 def test_a_second_landed_blocker_joins_the_pending_release(fleet):
-    """Two blockers ten minutes apart are one release: the first has not gone out yet,
-    and a release ships whatever is on `main`."""
+    """Two blockers ten minutes apart are one release: the first has not gone out yet"""
     fleet.land(fleet.blocker_wo())
     first = fleet.releases()[0]["id"]
 
@@ -1195,8 +1058,7 @@ def test_a_second_landed_blocker_joins_the_pending_release(fleet):
 
 
 def test_a_settled_release_does_not_hold_the_next_fix_back(fleet):
-    """Batching is "one release IN FLIGHT", not "one release". Once it has shipped, the
-    next landed blocker earns its own."""
+    """Batching is "one release IN FLIGHT", not "one release\""""
     fleet.land(fleet.blocker_wo())
     first = fleet.releases()[0]["id"]
     store = fleet.store()
@@ -1212,9 +1074,7 @@ def test_a_settled_release_does_not_hold_the_next_fix_back(fleet):
 
 
 def test_a_fix_that_merely_completed_ships_nothing(fleet):
-    """Issue #240 B and the user's point 4: "ship once the work lands" means landed.
-    Cutting a release off a `completed` signal is issue #232's gap with a version number
-    on it."""
+    """Issue #240 B and the user's point 4: "ship once the work lands" means landed"""
     wo_id = fleet.blocker_wo()
     store = fleet.store()
     try:
@@ -1231,9 +1091,7 @@ def test_a_fix_that_merely_completed_ships_nothing(fleet):
 
 
 def test_a_blocker_that_produced_no_code_closes_its_issue_and_ships_nothing(fleet):
-    """The other route into CLOSED: a `blocker` that turned out to need no code. The
-    issue closes (Neo's ruling on question 289), and a release carrying nothing would be
-    a restart of the whole fleet for an empty tag."""
+    """The other route into CLOSED: a `blocker` that turned out to need no code"""
     wo_id = fleet.blocker_wo()
     store = fleet.store()
     try:
@@ -1247,13 +1105,7 @@ def test_a_blocker_that_produced_no_code_closes_its_issue_and_ships_nothing(flee
 
 
 def test_a_gate_recorded_pull_request_closes_the_issue_and_ships_nothing(fleet):
-    """The third reader of the column, audited: a RELEASE is the largest move `pr_url`
-    makes, and a gate-recorded one makes none (2026-09-25 spec §4).
-
-    The pairing is in the same assertion: the issue still CLOSES with the link on it, which
-    is what recording the gate's URL was for — only the ship is withheld, because nobody
-    declared that this order's code is what landed.
-    """
+    """The third reader of the column"""
     from jarvis import gates, ops
 
     wo_id = fleet.blocker_wo()
@@ -1275,8 +1127,7 @@ def test_a_gate_recorded_pull_request_closes_the_issue_and_ships_nothing(fleet):
 
 
 def test_a_landed_fix_for_a_backlog_priority_ships_nothing(fleet):
-    """Only `critical` and `blocker` commit the fleet to a release. A `high` the user
-    promoted themselves closes its issue and stops there."""
+    """Only `critical` and `blocker` commit the fleet to a release"""
     fleet.file_bug(priority="high")
     store = fleet.store()
     try:
@@ -1297,16 +1148,11 @@ def test_the_release_order_is_filed_once_however_often_the_sweep_runs(fleet):
     assert len(fleet.releases()) == 1
 
 
-# -- the record, and the question nobody is waiting on --------------------------------
+# -- the record, and the question nobody is waiting on
 
 
 def _escalate(fleet, reason="not enough evidence"):
-    """Drive the triage question to `escalated`, exactly as `neo.drain_queue` does.
-
-    The daemon's delivery and the question's own status are written by two different
-    callers — `_deliver_triage_verdict` and `drain_queue` — so a test that only calls the
-    first is testing the inbox row and nothing else.
-    """
+    """Drive the triage question to `escalated`, exactly as `neo.drain_queue` does"""
     from jarvis.neo_store import NeoStore
 
     q = fleet._last_triage()
@@ -1324,17 +1170,12 @@ def _escalate(fleet, reason="not enough evidence"):
     ("issue_released", "handed back"),
     ("issue_closed", "closed"),
     ("release_batched", "release"),
-    # The two the overtaken-release settlement adds (issue #784, its spec §6).
+    # The two the overtaken-release settlement adds (issue #784, its spec §6)
     ("release_overtaken", "already carries"),
     ("pr_merge_commit_recorded", "merge"),
 ])
 def test_every_event_this_feature_writes_has_a_label_a_reader_can_read(kind, label):
-    """kn-3f133363: falling through to the generic renderer is NOT the same claim as a
-    reader being able to see it — the fallback prints the bare kind beside a JSON blob.
-
-    The timeline is the ONLY surface these four have. The issue shows the result but
-    never when the OS decided it, and `issue_state` is a column nothing renders.
-    """
+    """kn-3f133363: falling through to the generic renderer is NOT the same claim as a reader being able..."""
     from jarvis import timeline
 
     text, _detail = timeline._describe(kind, {"issue_url": "u", "wo_id": "w"})
@@ -1343,7 +1184,7 @@ def test_every_event_this_feature_writes_has_a_label_a_reader_can_read(kind, lab
 
 
 def test_the_events_the_lifecycle_writes_reach_the_timeline(fleet):
-    """And the labels are reachable from real events, not only from `_describe`."""
+    """And the labels are reachable from real events, not only from `_describe`"""
     from jarvis import timeline
 
     wo_id = fleet.blocker_wo()
@@ -1359,10 +1200,7 @@ def test_the_events_the_lifecycle_writes_reach_the_timeline(fleet):
 
 
 def test_an_unconfirmed_triage_question_is_visible_and_points_at_the_backlog(fleet):
-    """kn-4edb0eb7: a Q_KIND is a claim about WHO IS WAITING, and for `triage` the answer
-    is nobody — its `wo_id` is empty. It must still reach the user, because an
-    unconfirmed `blocker` nobody hears about is the failure this path exists to prevent,
-    but pointed at the command that actually resolves it."""
+    """kn-4edb0eb7: a Q_KIND is a claim about WHO IS WAITING, and for `triage` the answer is nobody"""
     from jarvis import ops
 
     pickup = fleet.file_bug(priority="blocker")["pickup"]
@@ -1377,8 +1215,7 @@ def test_an_unconfirmed_triage_question_is_visible_and_points_at_the_backlog(fle
 
 
 def test_answering_a_triage_question_is_refused_and_names_the_right_command(fleet):
-    """The other half of the same guard. `ops.neo_answer_escalated` forwards every kind
-    it does not refuse, and the forward here would look up `wo_id=''`."""
+    """The other half of the same guard"""
     from jarvis import ops
 
     pickup = fleet.file_bug(priority="blocker")["pickup"]
@@ -1390,9 +1227,7 @@ def test_answering_a_triage_question_is_refused_and_names_the_right_command(flee
 
 
 def test_correcting_neo_on_a_triage_question_messages_nobody(fleet):
-    """kn-4edb0eb7's worst case: `neo review --correct` forwards to the worker whenever
-    the order is not terminal, and it is the command the OS itself tells the user to
-    run. The learning still lands — that is what teaches the rubric."""
+    """kn-4edb0eb7's worst case: `neo review --correct` forwards to the worker whenever the order is not..."""
     from jarvis import ops
     from jarvis.neo_store import NeoStore
 
@@ -1411,10 +1246,7 @@ def test_correcting_neo_on_a_triage_question_messages_nobody(fleet):
 
 
 def test_a_triage_question_is_closed_once_the_work_is_started(fleet):
-    """INV-NEO-ESCALATION-STALE, extended to the one kind whose subject is a TRACKER
-    ISSUE rather than a row in this project's database. Without it a claim the user has
-    already started work on goes on asking for a ruling nobody can give — the exact
-    production shape that invariant was written for."""
+    """INV-NEO-ESCALATION-STALE, extended to the one kind whose subject is a TRACKER ISSUE rather than a..."""
     from jarvis import invariants
     from jarvis.neo_store import NeoStore
 
@@ -1442,12 +1274,7 @@ def test_a_triage_question_is_closed_once_the_work_is_started(fleet):
         neo.close()
 
 
-# -- the route out: jarvis issues start ------------------------------------------------
-#
-# What `jarvis backlog promote` was for a bug that was not dispatched. The filing stopped
-# creating a backlog item (kn-c5725f1f, the user's instruction), so every surface that
-# says "this was not dispatched" now names this — and a named route that did not exist
-# would be worse than the queue it replaced.
+# -- the route out: jarvis issues start
 
 
 def test_starting_an_issue_creates_the_work_order_the_filing_did_not(fleet):
@@ -1461,15 +1288,13 @@ def test_starting_an_issue_creates_the_work_order_the_filing_did_not(fleet):
     assert wo["issue_url"] == fleet.issue_url
     assert wo["issue_priority"] == "high", "read off the tracker's own label"
     assert "in progress" in fleet.gh.issue()["labels"]
-    # NO RELEASE IS PROMISED. Only a confirmed critical/blocker ships one, and a brief
-    # that said otherwise would have the worker expecting a release that never comes.
+    # NO RELEASE IS PROMISED
     assert "release goes out" not in wo["description"]
     assert "user started work on it themselves" in wo["description"]
 
 
 def test_starting_the_same_issue_twice_hands_back_the_live_work_order(fleet):
-    """`promote_confirmed`'s dedupe (#240 D), reached from the other direction — which is
-    the reason `start_work` goes through it instead of calling `create_work_order`."""
+    """`promote_confirmed`'s dedupe (#240 D), reached from the other direction"""
     fleet.file_bug(priority="high")
     first = issues.start_work(fleet.issue_url)
     assert issues.start_work(fleet.issue_url)["wo_id"] == first["wo_id"]
@@ -1477,8 +1302,7 @@ def test_starting_the_same_issue_twice_hands_back_the_live_work_order(fleet):
 
 @pytest.mark.parametrize("ref", ["#7", "7"])
 def test_an_issue_number_resolves_against_the_projects_own_tracker(fleet, ref):
-    """The user typing what GitHub shows them. The number is resolved against the repo
-    the project owns and never against a host the string might have named."""
+    """The user typing what GitHub shows them"""
     fleet.file_bug(priority="high")
     assert issues.start_work(ref)["issue_url"] == fleet.issue_url
 
@@ -1494,8 +1318,7 @@ def test_starting_a_closed_issue_is_refused(fleet):
 
 
 def test_jarvis_issues_still_lists_and_start_is_a_subcommand(fleet, capsys):
-    """`jarvis issues [project]` keeps working verbatim -- `_normalise_issues` inserts
-    the implicit `list` -- and the new verb reaches `start_work`."""
+    """`jarvis issues [project]` keeps working verbatim -- `_normalise_issues` inserts the implicit `list`..."""
     fleet.file_bug(priority="high")
     assert cli.main(["issues"]) == 0
     assert cli.main(["issues", "proj_a"]) == 0
@@ -1504,13 +1327,12 @@ def test_jarvis_issues_still_lists_and_start_is_a_subcommand(fleet, capsys):
     assert fleet.issue_url in capsys.readouterr().out
 
 
-# -- expediting a filing --------------------------------------------------------------
+# -- expediting a filing
 
 
 @pytest.mark.parametrize("level", ["low", "medium", "high"])
 def test_expediting_a_non_dispatching_bug_dispatches_it_now(fleet, level):
-    """The flag's whole reason to exist: work starts at a level that commits the fleet
-    to nothing, without the rating being inflated to buy it."""
+    """The flag's whole reason to exist: work starts at a level that commits the fleet to nothing"""
     from jarvis import ops
     from jarvis.neo_store import NeoStore
 
@@ -1535,16 +1357,14 @@ def test_expediting_a_non_dispatching_bug_dispatches_it_now(fleet, level):
 
 @pytest.mark.parametrize("level", ["critical", "blocker"])
 def test_expediting_a_claim_dispatches_without_waiting_for_neo(fleet, level):
-    """The claim is still re-assessed — the label is what everyone else reads — but the
-    work no longer waits on the verdict."""
+    """The claim is still re-assessed"""
     from jarvis import ops
     pickup = fleet.file_bug(priority=level, expedite=True)["pickup"]
     assert pickup["wo_id"] == fleet.wo_id() != ""
     assert pickup["neo_question_id"], "the rating is still a claim and still checked"
     assert "in parallel" in pickup["reason"]
 
-    # The work is dispatched; the RATING is not granted. Only a verdict writes one on,
-    # because this column alone is what ships a release when the fix lands.
+    # The work is dispatched; the RATING is not granted
     _name, _path, wo = ops.find_work_order(pickup["wo_id"])
     assert not (wo["issue_priority"] or ""), "an unconfirmed claim is not a rating"
     assert f"priority: {level}" in fleet.gh.issue()["labels"], \
@@ -1553,8 +1373,7 @@ def test_expediting_a_claim_dispatches_without_waiting_for_neo(fleet, level):
 
 @pytest.mark.parametrize("level", ["critical", "blocker"])
 def test_an_expedited_claim_that_lands_first_still_ships_a_release(fleet, level):
-    """The race the flag creates: a one-line fix can land before Neo answers. The
-    release comes from the EXPEDITING, never from a rating — which is still empty."""
+    """The race the flag creates: a one-line fix can land before Neo answers"""
     from jarvis import ops
     pickup = fleet.file_bug(priority=level, expedite=True)["pickup"]
     fleet.land(pickup["wo_id"])
@@ -1565,8 +1384,7 @@ def test_an_expedited_claim_that_lands_first_still_ships_a_release(fleet, level)
 
 
 def test_an_expedited_claim_neo_could_not_be_asked_about_still_ships(monkeypatch, fleet):
-    """Neo unreachable fails closed on the RATING — the label and the order's copy of it
-    are untouched — and not on the user's scheduling act."""
+    """Neo unreachable fails closed on the RATING"""
     from jarvis import ops
     monkeypatch.setattr(issues, "ask_triage",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("neo is off")))
@@ -1584,9 +1402,7 @@ def test_an_expedited_claim_neo_could_not_be_asked_about_still_ships(monkeypatch
 
 @pytest.mark.parametrize("approve", [False, True])
 def test_a_verdict_after_the_landing_adds_no_second_release(fleet, approve):
-    """A verdict can only decide what has not happened yet. The expedited landing cut
-    the release; neither ruling reaches back to cut a second one. The label is still
-    corrected, which is what the tracker is for."""
+    """A verdict can only decide what has not happened yet"""
     pickup = fleet.file_bug(priority="blocker", expedite=True)["pickup"]
     fleet.land(pickup["wo_id"])
     fleet.triage(approve=approve, answer="" if approve else "medium", reason="r")
@@ -1597,8 +1413,7 @@ def test_a_verdict_after_the_landing_adds_no_second_release(fleet, approve):
 
 
 def test_a_downgrade_cannot_undo_an_expedited_work_order(fleet):
-    """Neo may move the rating; it may not stop work the user asked for. And the tracker
-    may not be told no work order was created when one is running."""
+    """Neo may move the rating; it may not stop work the user asked for"""
     from jarvis import ops
     pickup = fleet.file_bug(priority="blocker", expedite=True)["pickup"]
     fleet.triage(approve=False, answer="medium", reason="bounded to one command")
@@ -1610,8 +1425,7 @@ def test_a_downgrade_cannot_undo_an_expedited_work_order(fleet):
     assert pickup["wo_id"] in body
     assert "No work order was created" not in body
 
-    # THE HALF THE LABEL DOES NOT COVER: the work order carried the CLAIM, and a release
-    # on landing is cut from that column — `daemon.sync_issues`, guarded by `dispatches`.
+    # THE HALF THE LABEL DOES NOT COVER: the work order carried the CLAIM
     _name, _path, wo = ops.find_work_order(pickup["wo_id"])
     assert wo["issue_priority"] == "medium", "the claim may not outlive the verdict"
     assert not issues.dispatches(wo["issue_priority"]), \
@@ -1620,8 +1434,7 @@ def test_a_downgrade_cannot_undo_an_expedited_work_order(fleet):
 
 
 def test_a_downgraded_expedited_fix_still_ships(fleet):
-    """The same fact through the daemon: the downgrade moves the label and the rating,
-    and the flag the landing sweep now also reads is not Neo's to move."""
+    """The same fact through the daemon: the downgrade moves the label and the rating"""
     from jarvis import ops
     pickup = fleet.file_bug(priority="blocker", expedite=True)["pickup"]
     fleet.triage(approve=False, answer="medium", reason="bounded to one command")
@@ -1634,8 +1447,7 @@ def test_a_downgraded_expedited_fix_still_ships(fleet):
 
 
 def test_neo_confirming_an_expedited_claim_grants_it_the_release(fleet):
-    """The other verdict, and the other half of the rule: a CONFIRMED blocker is a
-    rating, so the work order gets it and landing ships the release it earned."""
+    """The other verdict, and the other half of the rule: a CONFIRMED blocker is a rating"""
     from jarvis import ops
     pickup = fleet.file_bug(priority="blocker", expedite=True)["pickup"]
     fleet.triage(approve=True)
@@ -1649,16 +1461,12 @@ def test_neo_confirming_an_expedited_claim_grants_it_the_release(fleet):
     assert len(fleet.releases()) == 1, "a confirmed blocker still ships on landing"
 
 
-# -- an expedited fix that LANDS ships a release --------------------------------------
-#
-# docs/superpowers/specs/2026-09-27-an-expedited-order-that-lands-ships-a-release.md.
-# The release used to be cut from the RATING alone, so the one route that deliberately
-# carries no rating shipped nothing and a human had to watch for the merge.
+# -- an expedited fix that LANDS ships a release
 
 
 @pytest.mark.parametrize("level", ["low", "medium", "high"])
 def test_an_expedited_low_bug_that_lands_ships_a_release(fleet, level):
-    """§2: a level `dispatches()` rejects, expedited, landed — one release carrying it."""
+    """§2: a level `dispatches()` rejects, expedited, landed — one release carrying it"""
     from jarvis import db
     from jarvis.daemon import Daemon
     pickup = fleet.file_bug(priority=level, expedite=True)["pickup"]
@@ -1672,8 +1480,7 @@ def test_an_expedited_low_bug_that_lands_ships_a_release(fleet, level):
 
 @pytest.mark.parametrize("level", ["low", "medium", "high"])
 def test_a_non_expedited_low_bug_that_lands_ships_nothing(fleet, level):
-    """The control: the same levels picked up with `jarvis issues start`. The FLAG is
-    what changed, not the landing."""
+    """The control: the same levels picked up with `jarvis issues start`"""
     fleet.file_bug(priority=level)
     started = issues.start_work(fleet.issue_url)
     fleet.land(started["wo_id"])
@@ -1682,7 +1489,7 @@ def test_a_non_expedited_low_bug_that_lands_ships_nothing(fleet, level):
 
 
 def test_two_expedited_fixes_landing_make_one_release(fleet):
-    """§3: the batching is inherited whole — two landings, one release order."""
+    """§3: the batching is inherited whole — two landings, one release order"""
     from jarvis import db
     from jarvis.daemon import Daemon
     second_url = f"https://github.com/{FIXTURE_BUG_REPO}/issues/2"
@@ -1705,8 +1512,7 @@ def test_two_expedited_fixes_landing_make_one_release(fleet):
 
 
 def test_an_expedited_order_records_that_it_was_expedited(fleet):
-    """§1: the flag is on the ROW at creation, and a filing nobody expedited reads
-    False rather than raising."""
+    """§1: the flag is on the ROW at creation"""
     from jarvis import db, ops
     third_url = f"https://github.com/{FIXTURE_BUG_REPO}/issues/3"
     pickup = fleet.file_bug(priority="low", expedite=True)["pickup"]
@@ -1722,8 +1528,7 @@ def test_an_expedited_order_records_that_it_was_expedited(fleet):
 
 
 def test_the_issue_survives_a_work_order_that_could_not_be_created(monkeypatch, fleet):
-    """The filing is the half that must never be lost: if the dispatch half fails, the
-    issue still exists and the note says how to start the work by hand."""
+    """The filing is the half that must never be lost: if the dispatch half fails"""
     monkeypatch.setattr(issues, "promote_confirmed",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db is gone")))
     pickup = fleet.file_bug(priority="blocker", expedite=True)["pickup"]
@@ -1737,7 +1542,7 @@ def test_the_issue_survives_a_work_order_that_could_not_be_created(monkeypatch, 
 
 @pytest.mark.parametrize("level", ["low", "blocker"])
 def test_filing_without_the_flag_is_unchanged(fleet, level):
-    """The default is today's behaviour at both ends of the rubric."""
+    """The default is today's behaviour at both ends of the rubric"""
     pickup = fleet.file_bug(priority=level)["pickup"]
     assert not pickup["wo_id"] and not pickup.get("expedited")
     assert not fleet.wo_id()
@@ -1745,12 +1550,12 @@ def test_filing_without_the_flag_is_unchanged(fleet, level):
 
 
 def test_the_cli_prints_the_work_order_it_expedited(fleet, capsys):
-    """A reporting agent reads one line, and the id has to be in it."""
+    """A reporting agent reads one line, and the id has to be in it"""
     assert cli.main(["bug", "report", "t", "-d", "d", "-e", "e", "-a", "a",
                      "-p", "low", "--expedite"]) == 0
     out = capsys.readouterr().out
     assert fleet.wo_id() in out and "expedited" in out
 
 
-# Written for the opt-in OS (os.autonomy.self_dispatch on, stuck sweep on).
+# Written for the opt-in OS (os.autonomy.self_dispatch on, stuck sweep on)
 pytestmark = pytest.mark.usefixtures("self_dispatch_on")

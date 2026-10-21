@@ -1,22 +1,4 @@
-"""`ops.evolution_report` — the one place section 9's numbers are computed.
-
-Spec: docs/superpowers/specs/2026-09-27-self-evolution.md §9. The CLI and the dashboard
-are later orders and BOTH render this dict verbatim, so every property worth pinning is
-pinned here: a renderer that derived a number of its own is how the two surfaces start
-disagreeing about what the registry says.
-
-The three house rules these tests exist to enforce:
-
-1. **Absent is never zero.** No armed rule is not a mechanical share of 0%, a detector
-   with no fires has no hit rate, and fewer than `min_samples` is not a median. Each
-   absence is `None` PLUS a sentence, and the sentence may not contain a digit that reads
-   as a measurement.
-2. **A failure never becomes a default answer.** A project store that will not open is
-   UNREADABLE in the payload, never a zero and never a false, and it takes nothing else
-   down with it.
-3. **Counting is of the right thing.** The mechanical share counts ORDERS, not fires, and
-   an order that both was mechanically resolved and was investigated is one order.
-"""
+"""`ops.evolution_report` — the one place section 9's numbers are computed (docs/superpowers/specs/2026-09-27-self-evolution.md §9.)"""
 
 from __future__ import annotations
 
@@ -35,8 +17,7 @@ from jarvis.central_store import CentralStore
 COND = {"all": [{"field": "status", "op": "eq", "value": "needs_review"},
                 {"field": "seconds_in_status", "op": "gte", "value": 3600}]}
 
-#: A Thursday, so the ISO-week Monday the bucketer resolves is unambiguous and a test
-#: that walks back one week cannot land on the same bucket.
+#: A Thursday, so the ISO-week Monday the bucketer resolves is unambiguous and a test that walks back...
 NOW = 1_760_000_000.0            # 2025-10-09T07:33:20Z
 DAY = 86400.0
 WEEK = 7 * DAY
@@ -44,12 +25,7 @@ WEEK = 7 * DAY
 
 @pytest.fixture()
 def store(jarvis_home):
-    """The registry, with the five builtin seed rows cleared.
-
-    `tests/test_rules_cli.py` gives the reason: this file counts rows, and the seeds are
-    proved where they are written. Counting them here too would make every assertion
-    here move the day a sixth rule is seeded.
-    """
+    """The registry, with the five builtin seed rows cleared"""
     s = CentralStore()
     s.conn.execute("DELETE FROM remedy_rules")
     s.conn.execute("DELETE FROM detectors")
@@ -60,12 +36,7 @@ def store(jarvis_home):
 
 @pytest.fixture()
 def clock(monkeypatch):
-    """A movable `db.now`, which is the ONLY sanctioned way to backdate a fire.
-
-    `record_rule_fire` stamps `db.now()` itself and takes no `ts`. Writing a timestamp in
-    with raw SQL behind the store's back would also skip the `hits`/`last_fired` bookkeeping
-    the same call owns, so the fixture that tests a window has to move the clock.
-    """
+    """A movable `db.now`, which is the ONLY sanctioned way to backdate a fire"""
     holder = {"t": NOW}
     monkeypatch.setattr(db, "now", lambda: holder["t"])
     return holder
@@ -73,8 +44,7 @@ def clock(monkeypatch):
 
 def _fire(store, clock, detector_id, *, order_id, outcome=rules.APPLIED,
           mode=rules.ARMED, at=NOW, cleared_after=None, project="proj_a"):
-    """One fire, backdated through the clock. ARMED by default because the default
-    outcome is `applied`, and nothing applies a remedy until a rule is armed (§6)."""
+    """One fire, backdated through the clock"""
     clock["t"] = at
     row = store.record_rule_fire(detector_id=detector_id, project=project,
                                  order_id=order_id, order_kind="work_order",
@@ -88,29 +58,21 @@ def _fire(store, clock, detector_id, *, order_id, outcome=rules.APPLIED,
 
 @pytest.fixture()
 def detector(store, clock):
-    """Registered ON the frozen clock, so the detector's own `ts` is inside the window
-    every test reports over — a row stamped with the real wall clock would sit in the
-    future of `NOW` and drop out of the timeline."""
+    """Registered ON the frozen clock"""
     return store.add_detector("stale-panel-hold", COND, project="proj_a",
                               summary="a panel hold nobody clears", source="io",
                               io_id="io-1", fix_wo_id="wo-9")
 
 
 def _arm(store, detector_id, at=NOW):
-    """Arm a detector the only way the schema allows today.
-
-    `arm_detector` ships with the alarm bridge (`central_store.py`'s `detectors` schema
-    comment), so the columns it will write — `status` and `armed_at` — are set here
-    directly. Both, because the report takes EITHER as "ever armed" — `armed_at` or a
-    `status` of armed.
-    """
+    """Arm a detector the only way the schema allows today"""
     store.conn.execute("UPDATE detectors SET status=?, armed_at=?, armed_by=? WHERE id=?",
                        (rules.ARMED, at, "the user", detector_id))
     store.conn.commit()
 
 
 def _investigation(store, tmp_path, subject, *, project="proj_a"):
-    """Register `project` and open one investigation on `subject`."""
+    """Register `project` and open one investigation on `subject`"""
     from jarvis.project_store import ProjectStore
 
     path = tmp_path / project
@@ -133,15 +95,11 @@ def _catalog(tmp_path, *, os_min=DEFAULT_EVOLUTION_MIN_SAMPLES, project_min=None
                    projects=[project])
 
 
-# -- the mechanical share ---------------------------------------------------------------
+# -- the mechanical share
 
 
 def test_the_mechanical_share_counts_orders_and_never_fires(store, detector, clock):
-    """One rule firing twice on one order and once on another is TWO orders.
-
-    Counting fires would report the share of a fleet that resolved itself as higher than
-    1.0 the moment any condition stood twice on the same order.
-    """
+    """One rule firing twice on one order and once on another is TWO orders"""
     _fire(store, clock, detector["id"], order_id="wo-1", cleared_after=60)
     _fire(store, clock, detector["id"], order_id="wo-1", cleared_after=60)
     _fire(store, clock, detector["id"], order_id="wo-2", cleared_after=60)
@@ -186,19 +144,13 @@ def test_an_empty_registry_has_no_share_and_the_note_carries_no_zero(store):
     assert share["value"] is None
     assert share["denominator"] == 0
     assert "no rule has been armed yet" in share["note"]
-    # The whole point of the sentence: a fabricated zero reads as a measurement of the
-    # fleet, when the truth is that nothing has been given the chance to resolve anything.
+    # The whole point of the sentence: a fabricated zero reads as a measurement of the fleet
     assert "0%" not in share["note"] and "0.0" not in share["note"]
 
 
 def test_an_investigation_with_no_armed_rule_is_no_share_at_all(
         store, detector, clock, tmp_path):
-    """The ordinary install: something was investigated and nothing was ever armed.
-
-    The denominator is 1, so a report deciding absence by the denominator renders `0%` —
-    a measurement nobody took. A fleet that has never armed a rule has NO mechanical
-    share.
-    """
+    """The ordinary install: something was investigated and nothing was ever armed"""
     _investigation(store, tmp_path, "wo-1")
 
     share = ops.evolution_report()["mechanical_share"]
@@ -210,11 +162,7 @@ def test_an_investigation_with_no_armed_rule_is_no_share_at_all(
 
 def test_an_armed_rule_with_nothing_stuck_says_so_and_not_that_nothing_is_armed(
         store, detector, clock):
-    """An armed rule and an empty window are a DIFFERENT absence from a bare install.
-
-    Same `value is None`, two reasons, and one of the two notes is false here: a scope
-    that armed a rule is not told "no rule has been armed yet".
-    """
+    """An armed rule and an empty window are a DIFFERENT absence from a bare install"""
     _arm(store, detector["id"])
 
     share = ops.evolution_report()["mechanical_share"]
@@ -228,7 +176,7 @@ def test_an_armed_rule_with_nothing_stuck_says_so_and_not_that_nothing_is_armed(
 
 def test_a_week_with_investigations_and_no_armed_rule_contributes_no_share(
         store, detector, clock, tmp_path):
-    """The series obeys the same rule: no armed rule is no point, not a point at zero."""
+    """The series obeys the same rule: no armed rule is no point, not a point at zero"""
     _investigation(store, tmp_path, "wo-1")
 
     assert ops.evolution_report()["mechanical_share"]["series"] == []
@@ -236,11 +184,7 @@ def test_a_week_with_investigations_and_no_armed_rule_contributes_no_share(
 
 def test_a_detector_armed_and_then_retracted_still_counts_as_ever_armed(
         store, detector, clock, tmp_path):
-    """`armed_at` survives the retraction, and the registry is append-only by design.
-
-    Keyed off the CURRENT status this reads as a fleet that never armed anything, when
-    the rows say a rule was armed and resolved nothing — which is a measured zero.
-    """
+    """`armed_at` survives the retraction, and the registry is append-only by design"""
     _arm(store, detector["id"])
     store.retract_detector(detector["id"], "fixed in code")
     _investigation(store, tmp_path, "wo-1")
@@ -252,8 +196,7 @@ def test_a_detector_armed_and_then_retracted_still_counts_as_ever_armed(
 
 
 def test_an_unknown_project_is_refused_and_the_fleet_is_not(store, tmp_path):
-    """A report for a name that does not exist would read as a project that learned
-    nothing. `cost_report`'s guard, and `project=None` stays the fleet."""
+    """A report for a name that does not exist would read as a project that learned nothing"""
     store.upsert_project("proj_a", str(tmp_path / "proj_a"))
 
     with pytest.raises(ops.OpsError) as excinfo:
@@ -265,11 +208,7 @@ def test_an_unknown_project_is_refused_and_the_fleet_is_not(store, tmp_path):
 
 def test_a_project_store_that_will_not_open_is_unreadable_not_a_zero(
         store, detector, clock, tmp_path, monkeypatch):
-    """House rule 2: a failure never becomes a default answer.
-
-    The project is NAMED in the payload and every other number survives — a store that
-    could not be read contributes no investigations and no claim that there were none.
-    """
+    """House rule 2: a failure never becomes a default answer"""
     path = tmp_path / "proj_a"
     path.mkdir()
     store.upsert_project("proj_a", str(path))
@@ -288,7 +227,7 @@ def test_a_project_store_that_will_not_open_is_unreadable_not_a_zero(
     assert report["per_rule"][0]["id"] == detector["id"]
 
 
-# -- the week bucketer ------------------------------------------------------------------
+# -- the week bucketer
 
 
 def test_two_fires_in_one_week_are_one_bucket_of_two(store, detector, clock):
@@ -307,11 +246,7 @@ def test_two_fires_in_one_week_are_one_bucket_of_two(store, detector, clock):
 
 def test_a_week_with_no_data_is_absent_from_the_series_not_a_zero_point(
         store, detector, clock):
-    """House rule 1 on the series: a week nothing happened in is ABSENT.
-
-    A point with `numerator: 0` would draw a line through weeks nobody measured, which reads
-    as "the share was zero then" rather than "there is nothing to say about then".
-    """
+    """House rule 1 on the series: a week nothing happened in is ABSENT"""
     _fire(store, clock, detector["id"], order_id="wo-1", at=NOW - DAY,
           cleared_after=60)
     _fire(store, clock, detector["id"], order_id="wo-2", at=NOW - 2 * WEEK,
@@ -325,7 +260,7 @@ def test_a_week_with_no_data_is_absent_from_the_series_not_a_zero_point(
     assert weeks == sorted(weeks) and len(set(weeks)) == 2
 
 
-# -- per rule ---------------------------------------------------------------------------
+# -- per rule
 
 
 def test_a_detector_that_never_fired_has_no_hit_rate(store, detector):
@@ -350,7 +285,7 @@ def test_a_median_under_min_samples_is_not_a_median(store, detector, clock,
     assert "fewer than the 3" in entry["median_cleared_seconds_note"]
 
 
-# -- stuck resolution -------------------------------------------------------------------
+# -- stuck resolution
 
 
 def test_stuck_resolution_under_min_samples_reports_insufficient_history(
@@ -391,7 +326,7 @@ def test_stuck_resolution_compares_once_both_sides_have_enough(
     assert entry["note"] is None
 
 
-# -- recurrences ------------------------------------------------------------------------
+# -- recurrences
 
 
 def _recur(store, detector_id, verdict, order_id):
@@ -401,13 +336,7 @@ def _recur(store, detector_id, verdict, order_id):
 
 def test_verdict_counts_cover_all_four_and_unreadable_stays_out_of_the_comparison(
         store, detector, clock):
-    """kn-289d4b89: `unreadable` and `not_armed` are not evidence about either half.
-
-    An unreadable recurrence is the record that nothing could be judged, and a not-armed
-    one is a statement about the switch above the rule. Folding either into
-    missed-vs-remedy_failed would attribute to the condition or the remedy a failure
-    neither of them had.
-    """
+    """kn-289d4b89: `unreadable` and `not_armed` are not evidence about either half"""
     _recur(store, detector["id"], rules.MISSED, "wo-1")
     _recur(store, detector["id"], rules.REMEDY_FAILED, "wo-2")
     for order in ("wo-3", "wo-4", "wo-5"):
@@ -440,7 +369,7 @@ def test_the_weaker_half_names_conditions_when_more_was_missed(store, detector):
 
 
 def test_an_equal_tie_of_one_says_time_and_not_1_times(store, detector):
-    """The noun agrees with the count the sentence already holds: "1 time", not "1 times"."""
+    """The noun agrees with the count the sentence already holds: "1 time", not "1 times\""""
     _recur(store, detector["id"], rules.MISSED, "wo-1")
     _recur(store, detector["id"], rules.REMEDY_FAILED, "wo-2")
 
@@ -457,7 +386,7 @@ def test_no_recurrence_at_all_is_its_own_sentence(store, detector):
     assert "no recurrence" in half["note"]
 
 
-# -- the timeline -----------------------------------------------------------------------
+# -- the timeline
 
 
 def test_the_timeline_folds_the_registry_and_omits_a_missing_link(store, detector,
@@ -474,18 +403,12 @@ def test_the_timeline_folds_the_registry_and_omits_a_missing_link(store, detecto
                                                  reverse=True)
     added = next(e for e in timeline if e["kind"] == "detector_added")
     assert added["links"]["io"] == "io-1"
-    # NO BROKEN URL: the detector carries no issue and no pull request, so neither key is
-    # there at all rather than present and empty.
+    # NO BROKEN URL: the detector carries no issue and no pull request
     assert "issue" not in added["links"] and "pr" not in added["links"]
 
 
 def test_a_knowledge_entry_reaches_the_timeline_with_its_work_order(store, clock):
-    """What the OS learned is half of §9's timeline, and the entry links its author.
-
-    The entry's project is NOT in the registry here, and the fleet report still carries
-    it — `jarvis learn list` lists it, and a reader that asked a scope reader once per
-    registered project would hide it while the detector beside it showed.
-    """
+    """What the OS learned is half of §9's timeline, and the entry links its author"""
     entry = store.add_knowledge("a panel hold nobody clears needs a nudge",
                                 project="proj_a", wo_id="wo-9")
 
@@ -498,7 +421,7 @@ def test_a_knowledge_entry_reaches_the_timeline_with_its_work_order(store, clock
 
 
 def test_a_gate_exemption_reaches_the_timeline_with_its_pattern(store, clock):
-    """The other half: what the OS learned is NOT a privileged action."""
+    """The other half: what the OS learned is NOT a privileged action"""
     rule = store.add_gate_rule("exempt", "substring", "scripts/release.sh",
                                reason="quoted in a grep pattern, it ships nothing",
                                wo_id="wo-12")
@@ -513,21 +436,20 @@ def test_a_gate_exemption_reaches_the_timeline_with_its_pattern(store, clock):
     assert event["links"] == {"fix_wo": "wo-12"}
 
 
-# -- min_samples resolution -------------------------------------------------------------
+# -- min_samples resolution
 
 
 def test_min_samples_takes_the_project_override_and_falls_back_to_the_fleet(
         store, tmp_path, monkeypatch):
     monkeypatch.setattr(ops, "resolve_catalog",
                         lambda *a, **k: _catalog(tmp_path, os_min=4, project_min=7))
-    # REGISTERED, because an unregistered name is now refused: the catalog and the
-    # project registry are different records, and this test is about the catalog.
+    # REGISTERED, because an unregistered name is now refused: the catalog and the project registry are...
     for name in ("proj_a", "proj_b"):
         store.upsert_project(name, str(tmp_path / name))
 
     assert ops.evolution_report("proj_a")["min_samples"] == 7
     assert ops.evolution_report()["min_samples"] == 4
-    # A project the catalog does not name keeps the fleet answer rather than raising.
+    # A project the catalog does not name keeps the fleet answer rather than raising
     assert ops.evolution_report("proj_b")["min_samples"] == 4
 
 

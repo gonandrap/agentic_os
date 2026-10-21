@@ -1,15 +1,4 @@
-"""Screenshot every end state of an objection on one page, for a PR's UI evidence (§8).
-
-The claim a passing UI test cannot make: a reader can tell an objection still in flight,
-one delivered and unanswered, one the worker answered, one withdrawn because the order
-stopped, and one that was NEVER DELIVERED apart — beside a historical assumption that
-grows no extra line at all, which is the contrast asserting one string cannot show.
-
-`scripts/screenshot_assumption_rulings.py` is the shape this copies, including the temp
-`JARVIS_HOME` that keeps it off the live OS:
-
-    uv run python scripts/screenshot_assumption_objection.py
-"""
+"""Screenshot every end state of an objection on one page, for a PR's UI evidence (§8)"""
 
 from __future__ import annotations
 
@@ -28,16 +17,7 @@ SHOT = "wo-assumption-objection.png"
 
 
 def seed() -> None:
-    """One work order carrying all four objection end states plus the two untouched rows.
-
-    Written through the stores rather than driven through a daemon, for
-    `screenshot_auto_review.py`'s reason: the picture is of a RENDERED record, and a Neo
-    drain would make it a picture of the fake model.
-
-    Timestamps are set explicitly because `ops.objection_response` reads FORWARD from
-    each delivery over the whole order's acts: row 2's "waiting on the worker" only holds
-    while no act of any other row falls after its delivery.
-    """
+    """One work order carrying all four objection end states plus the two untouched rows"""
     from jarvis.project_store import ASSUMPTION_DECIDER_OS, ProjectStore
 
     from jarvis.central_store import CentralStore
@@ -74,8 +54,7 @@ def seed() -> None:
                  envelope_state: str = "queued", msg_status: str | None = None) -> int:
         store.record_provisional(aid, verdict="object", reason=reason, model="opus",
                                  stakes="routine")
-        # `record_provisional` stamps wall clock; the reading has to precede the send it
-        # caused, or the picture shows an objection posted before it was formed.
+        # `record_provisional` stamps wall clock
         store.conn.execute("UPDATE assumptions SET provisional_ts=? WHERE id=?",
                            (t0 + offset - 60, aid))
         env_id = store.post_envelope(from_role="reviewer", to_role="implementor",
@@ -94,24 +73,23 @@ def seed() -> None:
             store.mark_envelope(env_id, envelope_state)
         return env_id
 
-    # 1. in flight: envelope queued, neither delivered nor withdrawn.
+    # 1. in flight: envelope queued, neither delivered nor withdrawn
     flight = assumption("retry on any 5xx, including 501", 0)
     objected(flight, "501 means the endpoint will never accept it — retrying is a loop",
              5 * 60)
 
-    # 2. delivered, unanswered. Its delivery is a minute ago, AFTER every other act on
-    # the order, which is what leaves "waiting on the worker since …" true.
+    # 2. delivered, unanswered
     waiting = assumption("wrote the attempt counter to the shared Redis key", 10 * 60)
     objected(waiting, "that key is read by the scheduler; a second writer races it",
              12 * 60, transport="peer")
     store.mark_objection_delivered(waiting, now - 60)
 
-    # 3. delivered and ANSWERED — the worker's next assumption (#4) is the act read back.
+    # 3. delivered and ANSWERED — the worker's next assumption (#4) is the act read back
     answered = assumption("capped the backoff at 60s", 20 * 60)
     objected(answered, "the spec says 5 attempts, and 60s caps it at 5 minutes", 22 * 60)
     store.mark_objection_delivered(answered, t0 + 25 * 60)
 
-    # 4. withdrawn under §6.6: the order stopped before the queue got to it.
+    # 4. withdrawn under §6.6: the order stopped before the queue got to it
     withdrawn = assumption("moved the counter to a per-endpoint key instead", 30 * 60)
     env = objected(withdrawn, "a per-endpoint key changes the metrics schema",
                    32 * 60, envelope_state="withdrawn")
@@ -120,17 +98,15 @@ def seed() -> None:
                     {"assumption_id": withdrawn, "n": 4, "envelope_id": env,
                      "reason": "the order stopped before the objection was delivered"})
 
-    # 5. UNDELIVERABLE (§9): the carrier gave up — the message row is `failed`.
+    # 5
     dead = assumption("dropped the dead-letter queue entirely", 45 * 60)
     objected(dead, "the dead-letter queue is how a lost delivery is ever found again",
              47 * 60, envelope_state="undeliverable", msg_status="failed")
 
-    # 6. THE DISCRIMINATING ROW: every early-pass column empty, so no extra line at all.
-    # A renderer that labelled every assumption would pass every other assertion here.
+    # 6
     assumption("put the new test beside the module's other tests", 50 * 60)
 
-    # 7. Settled, and its early reading STAYS (§7): the provisional accept and the
-    # confirmation read together, one badge and one "provisionally" beside it.
+    # 7
     confirmed = assumption("named the helper `_next_delay`, matching the two beside it",
                            55 * 60)
     store.record_provisional(confirmed, verdict="accept", model="opus", stakes="routine",

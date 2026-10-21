@@ -1,4 +1,4 @@
-"""docs/os is a conformant OKF bundle and each order gets one fitting playbook."""
+"""docs/os is a conformant OKF bundle and each order gets one fitting playbook"""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ def _concepts():
 
 
 def test_every_concept_has_a_type():
-    """OKF v0.2 conformance: every non-reserved file carries a non-empty `type`."""
+    """OKF v0.2 conformance: every non-reserved file carries a non-empty `type`"""
     assert _concepts()
     for path in _concepts():
         meta, _ = os_map.parse(path.read_text())

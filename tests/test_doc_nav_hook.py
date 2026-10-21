@@ -1,16 +1,4 @@
-"""A whole-file or oversized read of a SPEC is refused, naming `jarvis spec`.
-
-§5 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md. The bar is a catalog setting
-(`worker.doc_read_limit_lines`, fallback 200) and the switch is `worker.doc_nav_hook`,
-DEFAULT OFF — nothing here changes the behaviour of a running worker.
-
-§5.4 is a MATRIX: seven inputs by two switch states. With the key off or absent
-`doc_nav_decision` returns None for ALL seven, including the two it denies when on, so
-the pair that flips is only visible as fourteen cells.
-
-§5.2's MUST NOT: a small targeted dump (`head -40`, `sed -n '40,80p'`) and a markdown
-text search (`grep -rn`) pass. A blanket Bash refusal fails the section.
-"""
+"""A whole-file or oversized read of a SPEC is refused, naming `jarvis spec` (docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md)"""
 
 from __future__ import annotations
 
@@ -37,9 +25,7 @@ OFF_STATES = [
 
 @pytest.fixture
 def repo(tmp_path):
-    """A managed project: `.jarvis/` is how `hooks.find_project_root` resolves one
-    (kn-6c033672). NO `.serena/project.yml` on purpose — the doc arms are not gated on a
-    symbol index, because the mitigation they name is a `jarvis` command (§5.2)."""
+    """A managed project: `.jarvis/` is how `hooks.find_project_root` resolves one (kn-6c033672)"""
     (tmp_path / ".jarvis").mkdir()
     return tmp_path
 
@@ -63,10 +49,9 @@ def _denied(decision) -> bool:
         "hookSpecificOutput", {}).get("permissionDecision") == "deny"
 
 
-# -- §5.4: seven inputs by two switch states -------------------------------------------
+# -- §5.4: seven inputs by two switch states
 
-#: (id, payload builder, verdict with the key ON). The three PASS rows on the Bash side
-#: are the ones that keep this feature inside its MUST NOT.
+#: (id, payload builder, verdict with the key ON)
 MATRIX = [
     ("read-no-limit", lambda r: _read(SPEC, r), True),
     ("read-limit-40", lambda r: _read(SPEC, r, limit=40), False),
@@ -88,7 +73,7 @@ def test_the_matrix_with_the_key_on(repo, build, denies):
 @pytest.mark.parametrize("build", [b for _, b, _ in MATRIX],
                          ids=[i for i, _, _ in MATRIX])
 def test_the_matrix_with_the_key_off(repo, build, env):
-    """All seven return None, including the two the key denies when on."""
+    """All seven return None, including the two the key denies when on"""
     assert hooks.doc_nav_decision(build(repo), env) is None
 
 
@@ -97,26 +82,25 @@ def test_the_matrix_with_the_key_off(repo, build, env):
     f"head {SPEC}",
 ], ids=["cat", "bare-head"])
 def test_an_unranged_dump_is_refused(repo, command):
-    """§5.2: `None` from `_dump_span` means UNRANGED, which is over any bar."""
+    """§5.2: `None` from `_dump_span` means UNRANGED, which is over any bar"""
     assert _denied(hooks.doc_nav_decision(_bash(command, repo), ON))
 
 
 def test_a_read_over_the_bar_is_refused_and_one_at_it_is_not(repo):
-    """The bar governs the `Read` arm too, at its fallback 200."""
+    """The bar governs the `Read` arm too, at its fallback 200"""
     assert _denied(hooks.doc_nav_decision(_read(SPEC, repo, limit=2000), ON))
     assert hooks.doc_nav_decision(_read(SPEC, repo, limit=200), ON) is None
 
 
 def test_a_dump_of_a_non_spec_markdown_file_is_untouched(repo):
-    """`cat README.md` names a `.md` that is not a spec, so every named path must be
-    `is_spec_path` before the refusal fires."""
+    """`cat README.md` names a `.md` that is not a spec"""
     assert hooks.doc_nav_decision(_bash("cat README.md", repo), ON) is None
     assert hooks.doc_nav_decision(
         _bash(f"cat {SPEC} README.md", repo), ON) is None
 
 
 def test_the_deny_message_names_the_three_spec_commands(repo):
-    """The refusal IS the mitigation (§4.3), so it has to be actionable alone."""
+    """The refusal IS the mitigation (§4.3), so it has to be actionable alone"""
     reason = _reason(hooks.doc_nav_decision(_read(SPEC, repo), ON))
 
     assert "jarvis spec toc" in reason
@@ -124,13 +108,11 @@ def test_the_deny_message_names_the_three_spec_commands(repo):
     assert "jarvis spec search" in reason
 
 
-# -- §5.4 sixth proof: the bar is RESOLVED, not hardcoded -------------------------------
+# -- §5.4 sixth proof: the bar is RESOLVED, not hardcoded
 
 
 def test_a_project_setting_the_bar_is_honoured_by_both_arms(repo):
-    """A number resolved from a project's catalog and one hardcoded in `hooks.py` are
-    indistinguishable at the fallback. 80 is between the project's 50 and 200, so the
-    verdict FLIPS with the setting — on `Read` and on `Bash`, one shared bar."""
+    """A number resolved from a project's catalog and one hardcoded in `hooks.py` are indistinguishable at..."""
     at_50 = {**ON, "JARVIS_DOC_READ_LIMIT_LINES": "50"}
     at_200 = {**ON, "JARVIS_DOC_READ_LIMIT_LINES": "200"}
 
@@ -171,7 +153,7 @@ def test_the_catalog_carries_the_bar_fleet_wide_and_per_project():
     {"os": {"defaults": {"doc_read_limit_lines": 0}}},
 ], ids=["project-abc", "project-zero", "project-negative", "os-abc", "os-zero"])
 def test_a_bad_bar_is_refused_loudly_naming_the_key(raw):
-    """The CATALOG is where a bad value is rejected (the hook absorbs one quietly)."""
+    """The CATALOG is where a bad value is rejected (the hook absorbs one quietly)"""
     with pytest.raises(CatalogError) as e:
         catalog.parse_catalog(raw)
 
@@ -220,13 +202,12 @@ def _worker_env(project, worker=None, wo_id="wo-doc01") -> dict:
 
 
 def test_the_key_ships_off(project, jarvis_home):
-    """The off literal Jarvis actually writes into a worker's settings file. The single
-    best anti-flip pin (§5.5)."""
+    """The off literal Jarvis actually writes into a worker's settings file"""
     assert _worker_env(project)["JARVIS_DOC_NAV_HOOK"] == "off"
 
 
 def test_the_resolved_bar_reaches_the_worker_as_a_string(project, jarvis_home):
-    """Claude Code's settings `env` is a `Record<string,string>`."""
+    """Claude Code's settings `env` is a `Record<string,string>`"""
     assert _worker_env(project)["JARVIS_DOC_READ_LIMIT_LINES"] == "200"
     assert _worker_env(project, WorkerDefaults(doc_read_limit_lines=50),
                        wo_id="wo-doc02")["JARVIS_DOC_READ_LIMIT_LINES"] == "50"
@@ -240,12 +221,11 @@ def test_the_config_effect_table_names_both_keys():
     assert effects["*.doc_read_limit_lines"] == "next-dispatch"
 
 
-# -- §5.5: reachability, through `preflight_decision` and never the arm alone -----------
+# -- §5.5: reachability, through `preflight_decision` and never the arm alone
 
 
 def test_the_bash_arm_is_reached_before_the_jarvis_auto_allow(repo):
-    """`is_jarvis_command_chain` waves every `cd … && jarvis …` chain through, so an arm
-    placed after it passes its unit test and does nothing in production."""
+    """`is_jarvis_command_chain` waves every `cd … && jarvis …` chain through"""
     decision = hooks.preflight_decision(
         _bash(f"cd {repo} && sed -n '1,2000p' {SPEC}", repo), ON)
 
@@ -254,15 +234,13 @@ def test_the_bash_arm_is_reached_before_the_jarvis_auto_allow(repo):
 
 
 def test_the_read_branch_is_wired_into_preflight(repo):
-    """There is no `Read` branch in `preflight_decision` today, so a unit test on the
-    decision function alone is green with the branch never wired in."""
+    """There is no `Read` branch in `preflight_decision` today"""
     assert _denied(hooks.preflight_decision(_read(SPEC, repo), ON))
     assert hooks.preflight_decision(_read(SPEC, repo, limit=40), ON) is None
 
 
 def test_the_investigator_refusal_wins_over_a_navigation_one(repo):
-    """Position: the doc arm sits after `investigator_bash_decision`, so an
-    investigator's mutating command gets the investigator's own message."""
+    """Position: the doc arm sits after `investigator_bash_decision`"""
     env = {**ON, hooks.WO_KIND_ENV: "investigator"}
     decision = hooks.preflight_decision(
         _bash(f"jarvis wo send wo-2 hi && cat {SPEC}", repo), env)
@@ -274,8 +252,7 @@ def test_the_investigator_refusal_wins_over_a_navigation_one(repo):
 @pytest.mark.parametrize("value", ["abc", "", "0", "-5", None],
                          ids=["abc", "empty", "zero", "negative", "absent"])
 def test_a_malformed_bar_falls_back_to_200_and_never_raises(repo, value):
-    """A hook that raises takes every tool call in the session with it. A `"0"` that
-    resolved as the bar would refuse every targeted read in the fleet."""
+    """A hook that raises takes every tool call in the session with it"""
     env = dict(ON)
     if value is not None:
         env["JARVIS_DOC_READ_LIMIT_LINES"] = value
@@ -285,7 +262,7 @@ def test_a_malformed_bar_falls_back_to_200_and_never_raises(repo, value):
     assert hooks.preflight_decision(_bash(f"head -40 {SPEC}", repo), env) is None
 
 
-# -- §5.5: AST enclosures ---------------------------------------------------------------
+# -- §5.5: AST enclosures
 
 
 def _body(name):
@@ -306,8 +283,7 @@ def _called_names(node) -> set[str]:
 
 
 def test_the_decision_calls_the_shared_predicates_and_parses_no_range():
-    """`dumps_doc` OWNS the range extraction via `navigation._dump_span`. A second
-    extractor here would make the counter and the refusal disagree about 40 lines."""
+    """`dumps_doc` OWNS the range extraction via `navigation._dump_span`"""
     node = _body("doc_nav_decision")
     called = _called_names(node)
 
@@ -317,7 +293,7 @@ def test_the_decision_calls_the_shared_predicates_and_parses_no_range():
         assert forbidden not in called, forbidden
     names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
     assert "re" not in names
-    # The docstring CITES the spec path, so the literals are read off the CODE.
+    # The docstring CITES the spec path, so the literals are read off the CODE
     code = [s for s in node.body if not (isinstance(s, ast.Expr)
                                          and isinstance(s.value, ast.Constant))]
     literals = {n.value for s in code for n in ast.walk(s)
@@ -328,14 +304,12 @@ def test_the_decision_calls_the_shared_predicates_and_parses_no_range():
 
 @pytest.mark.parametrize("name", ["doc_nav_decision", "py_nav_decision"])
 def test_a_navigation_decision_never_allows(name):
-    """No `_allow` branch, EVER: it denies or it returns None, so it can hand out
-    nothing a gate would have caught. Today that contract is only a docstring claim."""
+    """No `_allow` branch, EVER: it denies or it returns None"""
     assert "_allow" not in _called_names(_body(name))
 
 
 def test_hooks_imports_neither_spec_index_nor_catalog():
-    """`hooks` runs on EVERY tool call of every managed worker, so an import here is a
-    fleet-wide per-command cost. §4.3's three command strings are literals instead."""
+    """`hooks` runs on EVERY tool call of every managed worker"""
     tree = ast.parse(inspect.getsource(hooks))
     imported = {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
     imported |= {a.name for n in ast.walk(tree)

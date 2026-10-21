@@ -1,7 +1,4 @@
-"""The PR body hook, and the three copies of the section list that must not drift.
-
-Design: docs/superpowers/specs/2026-08-24-a-pull-request-a-reviewer-can-read.md
-"""
+"""The PR body hook, and the three copies of the section list that must not drift (docs/superpowers/specs/2026-08-24-a-pull-request-a-reviewer-can-read.md)"""
 
 from __future__ import annotations
 
@@ -21,7 +18,7 @@ WO = {"JARVIS_WO_ID": "wo-1234abcd"}
 
 
 def _body(**sections: str) -> str:
-    """A body with every required section, overriding the ones named."""
+    """A body with every required section, overriding the ones named"""
     filled = {
         "Summary": "Adds the thing.",
         "Implementation notes": "- chose X over Y because Z",
@@ -46,12 +43,11 @@ def _decide(command: str, cwd: str = "", env: dict[str, str] | None = None):
     return hooks.preflight_decision(payload, WO if env is None else env)
 
 
-# -- the three copies of the section list -------------------------------------------
+# -- the three copies of the section list
 
 
 def test_both_templates_are_byte_identical():
-    """The skill ships the template to projects that have none of their own; a drifted
-    copy would teach a shape the hook rejects."""
+    """The skill ships the template to projects that have none of their own"""
     assert SKILL_TEMPLATE.read_bytes() == REPO_TEMPLATE.read_bytes()
 
 
@@ -62,7 +58,7 @@ def test_the_template_carries_exactly_the_sections_the_hook_requires():
 
 
 def test_the_skill_names_the_hook_and_the_bare_ref_rule():
-    """A rule enforced only by a hook is a trap: the skill has to state it first."""
+    """A rule enforced only by a hook is a trap: the skill has to state it first"""
     skill = (SKILL / "SKILL.md").read_text()
 
     assert "denied" in skill
@@ -75,8 +71,7 @@ def test_the_skill_names_the_hook_and_the_bare_ref_rule():
 
 
 def test_the_skill_and_its_template_reach_a_worker(tmp_path):
-    """kn-c9281024: a skill delivered by the wrong mechanism is silently never loaded.
-    Workers get `--add-dir <state>/agent-skills`, so both files have to land there."""
+    """kn-c9281024: a skill delivered by the wrong mechanism is silently never loaded"""
     from jarvis.bootstrap import install_agent_assets
 
     root = install_agent_assets(tmp_path)[0] / ".claude" / "skills" / SKILL.name
@@ -87,7 +82,7 @@ def test_the_skill_and_its_template_reach_a_worker(tmp_path):
 
 
 def test_the_worker_brief_stops_the_reading_that_produced_pr_143():
-    """The concision rule is what got cut too far; it has to name its own floor."""
+    """The concision rule is what got cut too far; it has to name its own floor"""
     from jarvis.worker_brief import concision_section
 
     text = concision_section()
@@ -97,7 +92,7 @@ def test_the_worker_brief_stops_the_reading_that_produced_pr_143():
     assert "screenshot" in text.lower()
 
 
-# -- the unfilled template is not a body --------------------------------------------
+# -- the unfilled template is not a body
 
 
 def test_the_bare_template_fails_every_section():
@@ -109,8 +104,7 @@ def test_the_bare_template_fails_every_section():
 
 
 def test_an_unfilled_evidence_table_is_empty_despite_its_header_row():
-    """The header and the row labels are template text. Only a filled cell past the
-    label counts — without that rule the table always looks answered."""
+    """The header and the row labels are template text"""
     table = ("| Kind | Command | Result |\n| --- | --- | --- |\n"
              "| Unit / integration | | |\n| UI | | |\n")
 
@@ -132,24 +126,21 @@ def test_a_section_holding_only_scaffolding_is_empty(content):
 
 
 def test_the_alarms_section_is_required_like_every_other():
-    """§7 of docs/superpowers/specs/2026-08-31-the-supervisor.md. The default in
-    `_body()` would turn every test above green without one of them proving the
-    section is enforced, so this asserts the deny string directly."""
+    """§7 of docs/superpowers/specs/2026-08-31-the-supervisor.md"""
     body = _body().replace("## Alarms raised", "## Alarms")
 
     assert hooks.pr_body_problems(body) == ["no `## Alarms raised` section"]
 
 
 def test_an_order_that_raised_no_alarm_still_answers_the_section():
-    """`None.` is content; a blank section is the one the hook sends back."""
+    """`None.` is content; a blank section is the one the hook sends back"""
     assert hooks.pr_body_problems(_body(**{"Alarms raised": "None."})) == []
     assert hooks.pr_body_problems(_body(**{"Alarms raised": "-"})) == [
         "`## Alarms raised` is still the empty template"]
 
 
 def test_the_screenshots_section_is_required_like_every_other():
-    """kn-aefb5cb3's vacuity trap: the `_body()` default above turns every other test
-    green whether or not the tuple was edited, so this asserts the deny directly."""
+    """kn-aefb5cb3's vacuity trap: the `_body()` default above turns every other test green whether or not..."""
     body = _body().replace("## Screenshots", "## Shots")
 
     assert hooks.pr_body_problems(body) == ["no `## Screenshots` section"]
@@ -164,7 +155,7 @@ def test_a_ui_change_answers_the_section_with_pictures_or_says_it_did_not():
         "`## Screenshots` is still the empty template"]
 
 
-# -- the image that renders broken --------------------------------------------------
+# -- the image that renders broken
 
 
 @pytest.mark.parametrize("target", [
@@ -195,7 +186,7 @@ def test_a_renderable_or_unrendered_image_passes(text):
 
 
 def test_the_first_broken_image_is_the_one_reported():
-    """One fix per deny, in body order — the retry re-runs the check for the rest."""
+    """One fix per deny, in body order — the retry re-runs the check for the rest"""
     body = _body(Screenshots="![a](https://example.com/a.png)\n![b](docs/b.png)")
 
     assert hooks.unrenderable_image(body) == "docs/b.png"
@@ -211,7 +202,7 @@ def test_a_complete_body_passes():
     assert hooks.pr_body_problems(_body()) == []
 
 
-# -- the bare `#N` ------------------------------------------------------------------
+# -- the bare `#N`
 
 
 @pytest.mark.parametrize("text", [
@@ -246,12 +237,11 @@ def test_a_deliberate_or_unrendered_ref_passes(text):
 
 
 def test_blanking_a_code_span_does_not_let_its_last_word_vouch_for_a_later_ref():
-    """`issue` inside a code span must not read as the word before a `#N` outside it —
-    which is what deleting the span rather than blanking it would do."""
+    """`issue` inside a code span must not read as the word before a `#N` outside it"""
     assert hooks.pr_body_problems(_body(Summary="`issue` #2")) != []
 
 
-# -- the hook, on real commands -----------------------------------------------------
+# -- the hook, on real commands
 
 
 def test_a_thin_body_is_denied_with_the_fix_named(tmp_path):
@@ -301,13 +291,12 @@ def test_the_hook_keeps_out_of_what_it_cannot_read(command):
 
 
 def test_interactive_sessions_are_untouched():
-    """No JARVIS_WO_ID: a human in a managed repo answers to the repo's own template."""
+    """No JARVIS_WO_ID: a human in a managed repo answers to the repo's own template"""
     assert _decide('gh pr create --title "x" --body "thin"', env={}) is None
 
 
 def test_the_title_rule_is_checked_before_the_body_rule():
-    """Both wrong: the title deny is the one that must come back, so a worker fixing
-    the body does not then discover the title was also wrong."""
+    """Both wrong: the title deny is the one that must come back"""
     out = _decide('gh pr create --title "x" --body "thin"')
 
     assert out is not None

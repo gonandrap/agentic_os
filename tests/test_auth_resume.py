@@ -1,27 +1,4 @@
-"""An auth-paused work order comes back by itself, once the user signs back in.
-
-The ask, in the user's words: "in the same way than we retry orders that got stuck when
-we hit the limits, once I authenticate, those 'auth_failed' orders should automatically
-resume."
-
-The design problem it sets, and what this suite pins down: the other two pause reasons
-resume on a DEADLINE, and an auth failure has none — it clears when a human runs
-`/login`, which may be in thirty seconds or next week. So the trigger is a state check
-worn as a clock. `claude_cli.signin_changed_at` reads the mtime of Claude Code's
-credentials file, `worker_session._auth_retry_at` hands it back as `retry_at` when it is
-newer than the failure, and `Daemon.retry_paused_turns` — which already runs fleet-wide
-every other tick — compares it to the clock exactly as it does for the other two.
-
-Three properties this must have, in the order the work order asked for them:
-
-  * NOT RELAUNCHED while the sign-in is unchanged, and relaunched once it changes. Both
-    halves matter: a fixed backoff would spawn a process per tick against an account
-    that cannot answer.
-  * FLEET-WIDE. Signing in is an account-level fact, not a per-project one.
-  * NEVER `failed`. `failed` is a DEPENDENCY_DEAD_STATUS, so it strands dependents and
-    fails the parent feature order — which is what a dead login did to fo-e353491c on
-    2026-08-27, the incident this whole change exists for.
-"""
+"""An auth-paused work order comes back by itself, once the user signs back in"""
 
 from __future__ import annotations
 
@@ -36,12 +13,11 @@ from jarvis.daemon import Daemon
 from jarvis.project_store import ProjectStore
 from jarvis.testing import make_git_project
 
-# -- the probe -------------------------------------------------------------------------
+# -- the probe
 
 
 def test_a_sign_in_the_os_cannot_see_is_not_a_sign_in(signin, monkeypatch):
-    """None means DO NOT RESUME, and it is the default: a macOS keychain and
-    `ANTHROPIC_API_KEY` both leave nothing at this path to read."""
+    """None means DO NOT RESUME, and it is the default: a macOS keychain and `ANTHROPIC_API_KEY` both..."""
     assert claude_cli.signin_changed_at() is None
 
 
@@ -54,18 +30,13 @@ def test_signing_in_is_the_file_changing(signin):
 
 
 def test_an_expired_refresh_token_is_not_evidence_of_anything(signin):
-    """`/login` REPLACES the refresh token rather than touching it, so a file whose
-    mtime moved while this stayed in the past was moved by something else."""
+    """`/login` REPLACES the refresh token rather than touching it"""
     signin(refresh_expires_in=-60)
     assert claude_cli.signin_changed_at() is None
 
 
 def test_a_bare_sign_in_is_later_than_the_turn_it_rescues(signin):
-    """The fixture's contract, asserted rather than assumed. A file's mtime comes from
-    the kernel's coarse clock and can land BEHIND a `time.time()` sampled just before it,
-    which made the sign-in read as the one that failed — `test_a_sign_in_after_the_failure
-    _makes_the_pause_due` went red on CI for 3.13 while 3.11 and 3.12 passed on the same
-    commit. Looped, because a race that fires once in a thousand proves nothing in one."""
+    """The fixture's contract, asserted rather than assumed"""
     for _ in range(200):
         ended = time.time()
         signin()
@@ -78,7 +49,7 @@ def test_a_credentials_file_it_cannot_parse_is_read_as_no_answer(signin):
     assert claude_cli.signin_changed_at() is None
 
 
-# -- the pause's clock ------------------------------------------------------------------
+# -- the pause's clock
 
 
 @pytest.fixture()
@@ -90,16 +61,7 @@ def store(tmp_path):
 
 
 def _auth_turn(store, ago: float = 3600.0):
-    """A turn that died on auth `ago` seconds back. Never "just now", and that matters.
-
-    `_auth_retry_at` resumes on a sign-in STRICTLY NEWER than the failure. A turn stamped
-    from `db.now()` and a credentials file stamped by the filesystem a moment later are
-    two different clocks at two different granularities, so "the sign-in came after"
-    was a coin flip — it came up tails on CI's 3.12 runner while 3.11 and 3.13 passed on
-    the same commit. Back-dating the FAILURE is the fix and forward-dating the sign-in is
-    not: the mtime becomes `retry_at` verbatim, so a future one is a pause that is not
-    due (see `jarvis.testing.signin`).
-    """
+    """A turn that died on auth `ago` seconds back"""
     turn = store.create_turn("wo-test", kind="message", prompt="do the thing")
     row = store.finish_turn(
         turn["id"], "failed",
@@ -110,8 +72,7 @@ def _auth_turn(store, ago: float = 3600.0):
 
 
 def test_the_sign_in_that_failed_is_not_the_one_that_fixes_it(store, signin):
-    """A sign-in OLDER than the turn is the one the turn died on. Without this the very
-    first tick after the failure would relaunch, and go on relaunching."""
+    """A sign-in OLDER than the turn is the one the turn died on"""
     turn = _auth_turn(store)
     signin(at=turn["ended_at"] - 60)
     pause = worker_session.turn_pause(store, "wo-test")
@@ -120,8 +81,7 @@ def test_the_sign_in_that_failed_is_not_the_one_that_fixes_it(store, signin):
 
 
 def test_a_sign_in_after_the_failure_makes_the_pause_due(store, signin):
-    """The test that caught the clock race. `_auth_turn` back-dates the failure by an
-    hour, so an un-stamped `/login` is unambiguously newer than it."""
+    """The test that caught the clock race"""
     _auth_turn(store)
     signin()
     pause = worker_session.turn_pause(store, "wo-test")
@@ -129,7 +89,7 @@ def test_a_sign_in_after_the_failure_makes_the_pause_due(store, signin):
     assert pause.resumable and pause.due()
 
 
-# -- end to end -------------------------------------------------------------------------
+# -- end to end
 
 
 @pytest.fixture()
@@ -139,24 +99,18 @@ def started(jarvis_home, fake_claude, catalog_file, project):
 
 
 def _tick(daemon):
-    """One tick with every cadence-gated pass firing — `tick` increments first."""
+    """One tick with every cadence-gated pass firing — `tick` increments first"""
     daemon.tick_count = 0
     daemon.tick()
 
 
 def _sign_in_after(signin, store, wo_id):
-    """`/login`, stamped a hair AFTER the turn that failed and still in the past.
-
-    The end-to-end tests cannot back-date their failure the way `_auth_turn` does — the
-    daemon writes it — so they anchor the sign-in to it instead. Both directions of the
-    comparison matter and pull opposite ways: strictly newer than the failure, or the
-    pause never becomes resumable; not in the future, or `due()` is false.
-    """
+    """`/login`, stamped a hair AFTER the turn that failed and still in the past"""
     return signin(at=store.latest_turn(wo_id)["ended_at"] + 0.001)
 
 
 def _park(daemon, store, fake_claude, settle_turns, title="ship the thing"):
-    """Run a work order into an auth pause and return its row."""
+    """Run a work order into an auth pause and return its row"""
     wo = ops.create_work_order("proj_a", title)
     _tick(daemon)
     assert settle_turns(store), "the auth-refused turn never settled"
@@ -168,8 +122,7 @@ def _park(daemon, store, fake_claude, settle_turns, title="ship the thing"):
 
 def test_it_waits_for_the_sign_in_and_then_comes_back(started, fake_claude, project,
                                                       settle_turns, signin):
-    """THE ASK. Both halves in one test, because either alone is satisfiable by a bug:
-    never resuming, or resuming on a timer that would hammer a dead account."""
+    """THE ASK"""
     daemon = started
     fake_claude.turns_auth_failed()
     store = ProjectStore(project)
@@ -195,9 +148,7 @@ def test_it_waits_for_the_sign_in_and_then_comes_back(started, fake_claude, proj
 
 def test_the_prompt_goes_again_verbatim(started, fake_claude, project, settle_turns,
                                         signin):
-    """An auth refusal happens BEFORE the turn reaches the model, so the conversation is
-    untouched and the work order's own dispatch prompt is what has to be re-sent — not
-    the "carry on" nudge a turn that died in flight gets (`worker_session.retry`)."""
+    """An auth refusal happens BEFORE the turn reaches the model"""
     daemon = started
     fake_claude.turns_auth_failed()
     store = ProjectStore(project)
@@ -214,9 +165,7 @@ def test_the_prompt_goes_again_verbatim(started, fake_claude, project, settle_tu
 
 def test_the_user_can_still_push_it_by_hand(started, fake_claude, project,
                                             settle_turns):
-    """The escape hatch for a sign-in the OS cannot see at all. `deliver_messages` holds
-    a queued message behind a pause that is coming back on its own — and an auth pause
-    with no sign-in never is, so holding on it would hold this for ever."""
+    """The escape hatch for a sign-in the OS cannot see at all"""
     daemon = started
     fake_claude.turns_auth_failed()
     store = ProjectStore(project)
@@ -230,12 +179,12 @@ def test_the_user_can_still_push_it_by_hand(started, fake_claude, project,
     store.close()
 
 
-# -- fleet-wide -------------------------------------------------------------------------
+# -- fleet-wide
 
 
 @pytest.fixture()
 def two_projects(tmp_path, claude_json, project):
-    """A catalog with a second project, so "fleet-wide" is more than a claim."""
+    """A catalog with a second project, so "fleet-wide" is more than a claim"""
     other = make_git_project(tmp_path, "proj_b")
     claude_json(other)
     path = tmp_path / "catalog-two.json"
@@ -252,9 +201,7 @@ def two_projects(tmp_path, claude_json, project):
 
 def test_one_sign_in_releases_every_project(jarvis_home, fake_claude, two_projects,
                                             project, settle_turns, signin):
-    """Authentication is an ACCOUNT-level fact. `retry_paused_turns` is called per
-    project, so the thing that could quietly go wrong is a recovery reaching only the
-    project the daemon happened to look at first."""
+    """Authentication is an ACCOUNT-level fact"""
     catalog_path, other = two_projects
     ops.start_os(str(catalog_path), foreground=True)
     daemon = Daemon(load_catalog(catalog_path))
@@ -270,7 +217,7 @@ def test_one_sign_in_releases_every_project(jarvis_home, fake_claude, two_projec
     assert b.get_work_order(wos["proj_b"]["id"])["status"] == "waiting_input"
 
     fake_claude.turns_recover()
-    # After the LATER of the two failures: one sign-in has to release both.
+    # After the LATER of the two failures: one sign-in has to release both
     signin(at=max(a.latest_turn(wos["proj_a"]["id"])["ended_at"],
                   b.latest_turn(wos["proj_b"]["id"])["ended_at"]) + 0.001)
     _tick(daemon)
@@ -282,14 +229,12 @@ def test_one_sign_in_releases_every_project(jarvis_home, fake_claude, two_projec
     b.close()
 
 
-# -- what must NOT happen ----------------------------------------------------------------
+# -- what must NOT happen
 
 
 def test_a_parked_child_does_not_fail_its_feature_order(started, fake_claude, project,
                                                         settle_turns):
-    """THE DAMAGE THIS ORDER EXISTS TO UNDO. `settle_features` fails a feature the
-    moment any child is `failed`, and `failed` is where a dead login used to put one —
-    so on 2026-08-27 fo-e353491c was failed at 11/12 by an expired OAuth session."""
+    """THE DAMAGE THIS ORDER EXISTS TO UNDO"""
     daemon = started
     fake_claude.turns_auth_failed()
     store = ProjectStore(project)
@@ -312,9 +257,7 @@ def test_a_parked_child_does_not_fail_its_feature_order(started, fake_claude, pr
 def test_the_attention_reason_names_the_sign_in_and_survives_a_tick(started, fake_claude,
                                                                     project,
                                                                     settle_turns):
-    """`waiting_input` renders as "Waiting on you" everywhere, and its generic blocker
-    steers the user at a session to type into. The action is `/login`, and
-    INV-ATTENTION-REASON only lets a reason stand if `true_blockers` re-derives it."""
+    """`waiting_input` renders as "Waiting on you" everywhere"""
     daemon = started
     fake_claude.turns_auth_failed()
     store = ProjectStore(project)
@@ -331,10 +274,7 @@ def test_the_attention_reason_names_the_sign_in_and_survives_a_tick(started, fak
 def test_resume_auto_names_the_sign_in_and_not_a_permission_prompt(started, fake_claude,
                                                                    project,
                                                                    settle_turns):
-    """`jarvis wo resume-auto` answers "what is this actually waiting on". A parked auth
-    order has the exact shape its fall-through calls an unanswered permission prompt —
-    `waiting_input`, nothing running, nothing queued — so it would send the user at the
-    one thing that cannot help."""
+    """`jarvis wo resume-auto` answers "what is this actually waiting on\""""
     daemon = started
     fake_claude.turns_auth_failed()
     store = ProjectStore(project)
@@ -348,10 +288,7 @@ def test_resume_auto_names_the_sign_in_and_not_a_permission_prompt(started, fake
 
 def test_a_parked_order_is_not_reported_as_an_overdue_retry(started, fake_claude,
                                                             project, settle_turns):
-    """INV-PAUSE-OVERDUE watches for a relaunch that should have happened and did not.
-    Waiting on an action the user has not taken is not overdue — `retry_at` is `NEVER`
-    — and reporting it would make the check cry wolf for the whole of every logged-out
-    night."""
+    """INV-PAUSE-OVERDUE watches for a relaunch that should have happened and did not"""
     daemon = started
     fake_claude.turns_auth_failed()
     store = ProjectStore(project)

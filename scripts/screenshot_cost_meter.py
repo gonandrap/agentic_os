@@ -1,27 +1,4 @@
-"""Screenshot the `/cost` USAGE METER section, for a PR's UI evidence.
-
-`scripts/screenshot_cost_window.py` is the shape this copies: a temp `JARVIS_HOME`, a
-temp catalog, synthetic state written through the real schema, the app served in a
-thread. The difference is WHAT the state has to prove, so every figure is seeded to make
-one clause of `usage_meter.sentence` appear:
-
-    a 5h span of readings a minute apart, WITH A RESET INSIDE IT (so the rise is summed
-    per segment) · three gap rows (a failed read is an unknown, never 0.0) · three
-    earlier clean calibration runs (so $/point reads `measured`, never the shipped seed)
-    · worker turns and a Neo call in the span (the Jarvis share) · and ONE SESSION
-    OUTSIDE every registered project (the "other sessions on this machine" clause)
-
-Spec docs/superpowers/specs/2026-10-08-usage-meter-samples-and-outside-spend.md §§4-9.
-
-The shot is CLIPPED from the page heading to just past the meter panel, so the sentence,
-the 5h/7d sparkline and the first heading of the listing BELOW it are legible in one
-image rather than a full-page strip. The script fails rather than reporting success when
-the rendered panel is not evidence: no sentence, no `<polyline>` with at least two
-points, a sentence missing the reset or outside-session clause, or a $/point labelled
-`seed`.
-
-    uv run python scripts/screenshot_cost_meter.py
-"""
+"""Screenshot the `/cost` USAGE METER section, for a PR's UI evidence (docs/superpowers/specs/2026-10-08-usage-meter-samples-and-outside-spend.md)"""
 
 from __future__ import annotations
 
@@ -41,8 +18,7 @@ PROJECT = "jarvis_os"
 MINUTE = 60.0
 HOUR = 3600.0
 
-#: The clip: the heading down to a little past the meter panel, so what the meter sits
-#: ABOVE is visible too.
+#: The clip: the heading down to a little past the meter panel
 CLIP = """() => {
   const panel = [...document.querySelectorAll('.panel')]
       .find(e => e.textContent.includes("The account's usage meter"));
@@ -52,7 +28,7 @@ CLIP = """() => {
   return {x: 0, y: Math.max(0, top), width: 1280, height: bottom - Math.max(0, top)};
 }"""
 
-#: What the panel actually says, read back out of the DOM rather than off the payload.
+#: What the panel actually says, read back out of the DOM rather than off the payload
 READ = """() => {
   const panel = [...document.querySelectorAll('.panel')]
       .find(e => e.textContent.includes("The account's usage meter"));
@@ -69,7 +45,7 @@ READ = """() => {
 
 
 def samples(rows) -> None:
-    """Write `usage_samples` through the real writer — `usage_meter.record`."""
+    """Write `usage_samples` through the real writer — `usage_meter.record`"""
     from jarvis import usage_meter
     from jarvis.central_store import CentralStore
 
@@ -85,12 +61,7 @@ def samples(rows) -> None:
 def run(start: float, *, n: int, first: float, last: float, resets: float,
         seven_resets: float, seven_first: float = 20.0, seven_last: float = 22.0,
         gaps: set[int] = frozenset()):
-    """`n` readings a minute apart, utilisation rising first -> last.
-
-    A member of `gaps` is a GAP ROW: `ok=0` with NULL percentages, which is what a failed
-    read is written as. Never 0.0 — 0.0 is a real reading that means the window just
-    reset (§4.2).
-    """
+    """`n` readings a minute apart, utilisation rising first -> last"""
     from jarvis.usage_meter import Sample
 
     step = (last - first) / (n - 1) if n > 1 else 0.0
@@ -110,7 +81,7 @@ def run(start: float, *, n: int, first: float, last: float, resets: float,
 
 
 def seed() -> None:
-    """The scene, placed on the real clock so `?window=5h` re-anchors onto it."""
+    """The scene, placed on the real clock so `?window=5h` re-anchors onto it"""
     from jarvis import db
     from jarvis.central_store import CentralStore
     from jarvis.testing import FleetCostFixture, make_git_project
@@ -137,14 +108,12 @@ def seed() -> None:
 
     fix = FleetCostFixture(home, project, root, catalog, name=PROJECT)
     now = db.now()
-    # `meter_window` anchors the span on the LATEST sample's `five_hour_resets_at`, so
-    # the boundary chosen here IS the end of the span the page reports.
+    # `meter_window` anchors the span on the LATEST sample's `five_hour_resets_at`
     reset_at = now
     since = reset_at - 5 * HOUR
     reset_mid = since + 180 * MINUTE
 
-    # $/point MEASURED, not the shipped seed: three clean 40-minute runs of 10 points at
-    # $8.20 each. Separated by more than `MAX_SPAN_GAP_SECONDS`, so each is its own run.
+    # $/point MEASURED, not the shipped seed: three clean 40-minute runs of 10 points at $8.20 each
     for offset in (-30 * HOUR, -28 * HOUR, -26 * HOUR):
         at = since + offset
         samples(run(at, n=40, first=0.0, last=10.0, resets=at + 3 * HOUR,
@@ -152,22 +121,16 @@ def seed() -> None:
         wo = fix.order("a calibration order")
         fix.turn(wo, started_at=at + MINUTE, ended_at=at + 2 * MINUTE, cost_usd=8.20)
 
-    # Segment 1: 10.0 -> 42.0 against the OLD boundary, with three failed reads in it.
-    # The 7d boundary is the SAME in both halves: only the 5h window resets here, which
-    # is why the 7d line climbs straight through the 5h line's fall.
+    # Segment 1: 10.0 -> 42.0 against the OLD boundary, with three failed reads in it
     seven_resets = reset_at + 4 * 86_400
     samples(run(since, n=180, first=10.0, last=42.0, resets=reset_mid,
                 seven_resets=seven_resets, seven_first=20.0, seven_last=26.6,
                 gaps={5, 6, 7}))
-    # Segment 2: the window has reset, so utilisation starts from the floor again. Every
-    # later segment starts at 0.0 BY DEFINITION (§4.4).
+    # Segment 2: the window has reset, so utilisation starts from the floor again
     samples(run(reset_mid, n=120, first=0.0, last=18.0, resets=reset_at,
                 seven_resets=seven_resets, seven_first=26.6, seven_last=31.0))
 
-    # Jarvis's own half: two orders' turns plus Neo answering between them (§7).
-    # Each order gets a TRANSCRIPT as well as a turn: the headline above the meter is
-    # token-sourced, so an order with only a turn row would put a ~$0.00 headline over a
-    # meter sentence saying Jarvis spent $36.90.
+    # Jarvis's own half: two orders' turns plus Neo answering between them (§7)
     one = fix.order("sample the account's usage meter every minute", session_id="sess-1")
     fix.turn(one, started_at=since + 20 * MINUTE, ended_at=since + 95 * MINUTE,
              cost_usd=21.50)
@@ -190,8 +153,7 @@ def seed() -> None:
     fix.os_call("validation_seat", ts=reset_mid + 40 * MINUTE, wo_id=two, cost_usd=0.90,
                 label="panel seat")
 
-    # THE OUTSIDE SESSION: a directory that is no registered project's slug, so no
-    # ownership record can claim it. $2.00 of cache write + $0.48 of output at Opus list.
+    # THE OUTSIDE SESSION: a directory that is no registered project's slug
     fix.transcript("1a9cd19d-0000-4000-8000-000000000001", [
         {"type": "user",
          "timestamp": _iso(since + 150 * MINUTE),

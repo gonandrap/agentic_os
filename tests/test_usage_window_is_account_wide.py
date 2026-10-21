@@ -1,18 +1,4 @@
-"""A spent usage window is a fact about the ACCOUNT, and every order it holds says so.
-
-GitHub issue #714. The window closed at 07:35 and reopened at 10:30. Two work orders
-happened to own a refused turn and rendered it; the third was between turns, parked with
-a validation round open beside it, and said nothing at all for three hours — its newest
-recorded reason a CI wait that had already expired.
-
-Three defects, one cause: every surface derived the hold from something the WORK ORDER
-owned. `pause_note` needs a refused turn of its own; `validation_hold_note` needs a
-`validation_failed` event that the tick's early return never wrote; `status_label` was
-handed the fleet reading and consulted it on the `pending` branch alone.
-
-And the inverse, in the same code: both hold causes rendered the usage sentence, so a
-round merely waiting on GitHub announced a spent window.
-"""
+"""A spent usage window is a fact about the ACCOUNT, and every order it holds says so (#714)"""
 
 from __future__ import annotations
 
@@ -41,8 +27,7 @@ def shut(in_seconds: float = 3600, wo_id: str = "wo-1") -> fleet_mod.Fleet:
 
 
 def shut_then_reopened() -> fleet_mod.Fleet:
-    """A reading taken DURING a window that has since reopened — `Fleet.at` is the tick's
-    own clock (`fleet.Fleet`), so this is a tick that really was held, an hour ago."""
+    """A reading taken DURING a window that has since reopened"""
     return fleet_mod.Fleet(3, 0, outage(-1), at=time.time() - 3600)
 
 
@@ -52,19 +37,18 @@ def held_events(store, wo_id: str) -> list[dict]:
 
 
 def parked(fleet, assume: bool = False) -> dict:
-    """A work order delivered, with round one open beside it."""
+    """A work order delivered, with round one open beside it"""
     wo = fleet.dispatch()
     fleet.change(wo["id"], "print('one')\n")
     finish(fleet, wo["id"])
     return wo
 
 
-# -- 1. the tick that skips a round must say that it skipped it -----------------------
+# -- 1. the tick that skips a round must say that it skipped it
 
 
 def test_a_round_the_shut_window_skips_records_the_hold(fleet):
-    """Defect 2, stated as a test. The early return wrote nothing at all, so the round's
-    newest recorded cause stayed whatever held it last — for the whole outage."""
+    """Defect 2, stated as a test"""
     validator = Validator(passed())
     fleet.daemon.validator = validator
     wo = parked(fleet)
@@ -89,8 +73,7 @@ def test_a_round_the_shut_window_skips_records_the_hold(fleet):
 
 
 def test_the_hold_is_written_once_however_many_ticks_the_window_spans(fleet):
-    """At a 5s tick the outage in #714 covered ~2,100 of them. One event per round per
-    window, or the timeline it is meant to explain becomes unreadable."""
+    """At a 5s tick the outage in #714 covered ~2,100 of them"""
     fleet.daemon.validator = Validator(passed())
     wo = parked(fleet)
     state = shut()
@@ -105,9 +88,7 @@ def test_the_hold_is_written_once_however_many_ticks_the_window_spans(fleet):
 
 
 def test_a_second_window_after_the_first_reopened_is_recorded_again(fleet):
-    """The dedupe is on the MOMENT, not on "has this round ever been held": a window
-    that reopened and shut again is a new fact, and a round that kept the old moment
-    would be judged as free the moment the first window's clock passed."""
+    """The dedupe is on the MOMENT, not on "has this round ever been held": a window that reopened and..."""
     fleet.daemon.validator = Validator(passed())
     wo = parked(fleet)
 
@@ -126,8 +107,7 @@ def test_a_second_window_after_the_first_reopened_is_recorded_again(fleet):
 
 
 def test_the_recorded_hold_does_not_outlast_the_window(fleet):
-    """THE DEFINITION OF DONE: no human touch anywhere. The round the outage skipped is
-    judged by the first tick after the moment the outage named."""
+    """THE DEFINITION OF DONE: no human touch anywhere"""
     validator = Validator(passed())
     fleet.daemon.validator = validator
     wo = parked(fleet)
@@ -150,8 +130,7 @@ def test_the_recorded_hold_does_not_outlast_the_window(fleet):
 
 
 def test_a_round_already_in_flight_is_left_alone(fleet):
-    """It was submitted before the window shut and the pool thread owns its outcome.
-    Recording a hold against it would put a second writer on the same round."""
+    """It was submitted before the window shut and the pool thread owns its outcome"""
     validator = Validator(passed())
     fleet.daemon.validator = validator
     validator.block()
@@ -172,12 +151,11 @@ def test_a_round_already_in_flight_is_left_alone(fleet):
         store.close()
 
 
-# -- 2. and the surfaces must read it ------------------------------------------------
+# -- 2. and the surfaces must read it
 
 
 def test_the_parked_work_order_names_the_window_it_is_waiting_on(fleet):
-    """The live failure: `needs_review` with a round open beside it, worker between
-    turns, and nothing anywhere said the account was shut."""
+    """The live failure: `needs_review` with a round open beside it"""
     fleet.daemon.validator = Validator(passed())
     wo = fleet.dispatch()
     fleet.change(wo["id"], "print('one')\n")
@@ -201,8 +179,7 @@ def test_the_parked_work_order_names_the_window_it_is_waiting_on(fleet):
 
 
 def test_a_validating_order_says_it_before_the_daemon_has_recorded_anything(fleet):
-    """The window can shut between two ticks, and a surface holding the fleet reading
-    does not have to wait for the daemon to write it down."""
+    """The window can shut between two ticks"""
     fleet.daemon.validator = Validator(passed())
     wo = parked(fleet)
 
@@ -217,8 +194,7 @@ def test_a_validating_order_says_it_before_the_daemon_has_recorded_anything(flee
 
 
 def test_a_running_order_between_turns_says_it_too(fleet):
-    """Defect 1. `pause_note` can only see a refusal THIS work order owns, and an order
-    that was not mid-turn when the window shut owns none."""
+    """Defect 1"""
     wo = fleet.dispatch()
 
     store = fleet.store()
@@ -232,7 +208,7 @@ def test_a_running_order_between_turns_says_it_too(fleet):
         store.close()
 
 
-# -- 3. ...and only the orders the window actually holds ------------------------------
+# -- 3. ...and only the orders the window actually holds
 
 
 @pytest.mark.parametrize("status", FLEET_HELD_STATUSES)
@@ -243,24 +219,22 @@ def test_every_status_the_os_would_start_something_for_carries_the_line(status):
 @pytest.mark.parametrize("status", ["needs_review", "waiting_pr_merge", "waiting_input",
                                     "idle", "completed", "budget_exhausted"])
 def test_the_line_stays_off_the_orders_the_window_is_not_what_holds(status):
-    """Neo, question 563. The user holds a review and GitHub holds a merge; saying the
-    window holds them would send a reader to wait for the wrong thing."""
+    """Neo, question 563"""
     assert fleet_hold_note({"status": status}, shut()) == ""
 
 
 def test_an_open_account_says_nothing_at_all():
-    """Including the slot cap, which holds a worker turn and never a work order's
-    explanation of itself — `fleet.Fleet.blocked` carries both."""
+    """Including the slot cap, which holds a worker turn and never a work order's explanation of itself"""
     assert fleet_hold_note({"status": "running"}, None) == ""
     assert fleet_hold_note({"status": "running"}, fleet_mod.Fleet(3, 0, None)) == ""
     assert fleet_hold_note({"status": "running"}, shut(-1)) == "", "a reopened window"
 
 
-# -- 4. the inverse defect: CI is not a usage window ----------------------------------
+# -- 4. the inverse defect: CI is not a usage window
 
 
 class _Events:
-    """A store, as much of one as `validation_hold_note` reads."""
+    """A store, as much of one as `validation_hold_note` reads"""
 
     def __init__(self, *payloads: str):
         self.rows = [{"payload": p} for p in payloads]
@@ -274,8 +248,7 @@ def _payload(cause: str, reopens_at: float) -> str:
 
 
 def test_a_round_waiting_on_ci_is_never_described_as_a_spent_window():
-    """The live text: "the Claude usage window is spent, the review resumes by itself at
-    10:31" over a pull request whose only problem was that CI had not finished."""
+    """The live text: "the Claude usage window is spent"""
     note = validation_hold_note(_Events(_payload(VALIDATION_CI_CAUSE,
                                                  time.time() + 60)), "wo-1", 1)
     assert note == CI_HOLD_NOTE
@@ -289,8 +262,7 @@ def test_a_round_held_by_the_window_still_names_the_window_and_the_moment():
 
 
 def test_the_cause_that_wins_is_the_one_the_tick_is_honouring():
-    """A window that shut while CI was still running holds for the LATER moment, and the
-    sentence has to be that hold's — not the one that has already lifted."""
+    """A window that shut while CI was still running holds for the LATER moment"""
     now = time.time()
     both = _Events(_payload(VALIDATION_CI_CAUSE, now + 60),
                    _payload(VALIDATION_HELD_CAUSE, now + 3600))

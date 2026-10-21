@@ -1,17 +1,4 @@
-"""Arming: a fire becomes an alarm and takes the gate that already exists.
-
-docs/superpowers/specs/2026-09-27-self-evolution.md §6.
-
-WHAT THESE TESTS ARE BUILT TO AVOID. A negative ("no approval was filed", "no second row")
-is green on a path that never ran, so every refusal here sits beside the positive it is the
-opposite of, in the same fixture. And nothing below writes `detectors.status` in SQL: the
-verbs under test (`arm_detector`, `ops.rules_arm`) are the only door, and a test that
-bypassed them would prove the daemon reads a column rather than that arming works.
-
-The bridge is asserted END TO END against the real stores: the alarm row, the `rule_fired`
-event, the `self_heal` approval and the `kind="approval"` Neo question are all read back
-from the databases `remedies.propose` wrote, not from a mock of it.
-"""
+"""Arming: a fire becomes an alarm and takes the gate that already exists (docs/superpowers/specs/2026-09-27-self-evolution.md §6.)"""
 
 from __future__ import annotations
 
@@ -31,13 +18,12 @@ COND = {"field": "status", "op": "eq", "value": "needs_review"}
 ARGUMENT = "ask the session where it got to"
 
 
-# -- the harness -----------------------------------------------------------------------
+# -- the harness
 
 
 def _write_catalog(tmp_path, project, *, remedies_allowed=None, rules_cfg=None,
                    project_rules=None):
-    """A catalog with the evaluation pass ON. `remedies_allowed=None` leaves the
-    supervisor's remedies at their shipped default (off, empty allow-list)."""
+    """A catalog with the evaluation pass ON"""
     os_cfg = {
         "defaults": {"model": "sonnet", "max_in_flight": 50},
         "notifications": {"sinks": ["log"]},
@@ -57,7 +43,7 @@ def _write_catalog(tmp_path, project, *, remedies_allowed=None, rules_cfg=None,
 
 @pytest.fixture()
 def boot(tmp_path, jarvis_home, fake_claude, project):
-    """Start the OS on a catalog built from keyword arguments; returns the Daemon."""
+    """Start the OS on a catalog built from keyword arguments; returns the Daemon"""
     def go(**kw):
         path = _write_catalog(tmp_path, project, **kw)
         ops.start_os(str(path), foreground=True)
@@ -80,8 +66,7 @@ def store(project):
 
 
 def _rule(central, *, argument=ARGUMENT, primitive="nudge", project="proj_a"):
-    """One detector with one remedy row, every seeded rule retracted so the only fire in
-    a test is this one's."""
+    """One detector with one remedy row"""
     for d in central.list_detectors():
         central.retract_detector(d["id"], "not under test")
     det = central.add_detector("gap-under-test", COND, project=project, source="user")
@@ -94,7 +79,7 @@ def _tick(daemon, store):
 
 
 def _armed_fire(daemon, central, store, *, status="needs_review"):
-    """Arm a fresh rule, put an order in its condition, run one pass; returns everything."""
+    """Arm a fresh rule, put an order in its condition, run one pass; returns everything"""
     det, rm = _rule(central)
     ops.rules_arm(det["id"], "three clean dry-run hits", by="gonzalo")
     wo = store.create_work_order("stuck in review", status=status)
@@ -119,7 +104,7 @@ def _inbox(central, needle):
             if needle in r["title"]]
 
 
-# -- (a) arm: the audit, the pair, and every refusal --------------------------------------
+# -- (a) arm: the audit, the pair, and every refusal
 
 
 def test_arm_audits_the_row_and_flips_the_detector_and_its_live_remedy_rows(central):
@@ -133,7 +118,7 @@ def test_arm_audits_the_row_and_flips_the_detector_and_its_live_remedy_rows(cent
     assert (out["armed_by"], out["armed_reason"]) == ("gonzalo", "three clean hits")
     assert out["armed_at"] is not None
     assert central.get_remedy_rule(rm["id"])["status"] == rules.ARMED
-    # A retracted remedy row is history; arming must not resurrect it.
+    # A retracted remedy row is history; arming must not resurrect it
     assert central.get_remedy_rule(dead["id"])["status"] == rules.RETRACTED
 
 
@@ -164,7 +149,7 @@ def test_arm_refuses_and_writes_nothing(central, case):
 
 
 def test_arming_a_detector_with_no_remedy_row_succeeds(central):
-    """The user's override on wo-2877145f, Neo question 1649: the alarm alone is the value."""
+    """The user's override on wo-2877145f, Neo question 1649: the alarm alone is the value"""
     det, rm = _rule(central)
     central.retract_remedy_rule(rm["id"], "gone")
 
@@ -189,7 +174,7 @@ def test_disarm_returns_the_set_to_dry_run_and_keeps_the_audit_of_the_arm(centra
 
 
 def test_the_pair_flips_in_one_transaction(central, monkeypatch):
-    """If the second UPDATE fails the first must not have landed."""
+    """If the second UPDATE fails the first must not have landed"""
     det, rm = _rule(central)
     real = central.conn
 
@@ -232,7 +217,7 @@ def test_a_detector_row_that_predates_the_writers_still_lists_shows_and_arms(
     assert out["detector"]["armed_by"] == "user"
 
 
-# -- (b) the announcement happens once ----------------------------------------------------
+# -- (b) the announcement happens once
 
 
 def test_arming_announces_once_at_info_and_a_reconcile_tick_adds_nothing(
@@ -265,7 +250,7 @@ def test_ops_arm_needs_a_reason_and_maps_store_refusals_to_ops_errors(boot, cent
     assert central.get_detector(det["id"])["status"] == rules.DRY_RUN
 
 
-# -- (c) the armed fire: an alarm, an event, a self_heal approval and a Neo question ----------
+# -- (c) the armed fire: an alarm, an event, a self_heal approval and a Neo question
 
 
 def test_an_armed_fire_raises_an_alarm_and_files_the_existing_gate(boot, central, store):
@@ -297,7 +282,7 @@ def test_an_armed_fire_raises_an_alarm_and_files_the_existing_gate(boot, central
     assert approval["id"] == alarm["remedy_approval_id"]
     (question,) = _neo_approvals()
     assert question["id"] == approval["neo_question_id"]
-    # A proposal is not an act: the order is untouched and nothing reached its session.
+    # A proposal is not an act: the order is untouched and nothing reached its session
     assert store.queued_messages(wo["id"]) == []
     assert store.get_work_order(wo["id"])["status"] == "needs_review"
     assert central.get_detector(det["id"])["hits"] == 1
@@ -305,8 +290,7 @@ def test_an_armed_fire_raises_an_alarm_and_files_the_existing_gate(boot, central
 
 def test_the_armed_pass_makes_no_network_call_and_spawns_no_subprocess(
         boot, central, store, monkeypatch):
-    """`NeoStore.ask` inserts a row and `propose` is stores and events — VERIFIED here,
-    not assumed, by making both seams explode and asserting the fire still lands."""
+    """`NeoStore.ask` inserts a row and `propose` is stores and events"""
     import socket
     import subprocess
 
@@ -322,11 +306,11 @@ def test_the_armed_pass_makes_no_network_call_and_spawns_no_subprocess(
     assert _fires(central, det)[0]["outcome"] == rules.PROPOSED
 
 
-# -- (c2) armed detector, no armed remedy: the alarm alone (wo-2877145f, Neo 1649) --------------
+# -- (c2) armed detector, no armed remedy: the alarm alone (wo-2877145f, Neo 1649)
 
 
 def _armed_without_remedy(daemon, central, store, *, how):
-    """An ARMED detector whose pair has no ARMED remedy row; one order in the condition."""
+    """An ARMED detector whose pair has no ARMED remedy row; one order in the condition"""
     det, rm = _rule(central)
     if how == "none":
         central.retract_remedy_rule(rm["id"], "gone")
@@ -394,7 +378,7 @@ def test_a_standing_condition_without_an_armed_remedy_is_one_fire_not_one_per_ti
     assert store.alarms_of(wo["id"])[0]["status"] == "informational"
 
 
-# -- (d) the allow-list refusal ----------------------------------------------------------
+# -- (d) the allow-list refusal
 
 
 def test_a_refused_proposal_is_recorded_in_propose_s_own_words_and_files_nothing(
@@ -411,7 +395,7 @@ def test_a_refused_proposal_is_recorded_in_propose_s_own_words_and_files_nothing
     assert counts["refused"] == 1 and counts["proposed"] == 0
     assert [a for a in store.list_approvals(wo["id"]) if a["kind"] == "self_heal"] == []
     assert _neo_approvals() == []
-    # A refusal is the GATE WORKING, not the rule being right: it is not a hit.
+    # A refusal is the GATE WORKING, not the rule being right: it is not a hit
     assert central.get_detector(det["id"])["hits"] == 0
 
 
@@ -436,7 +420,7 @@ def test_a_propose_that_raises_is_unreadable_with_the_exception_and_is_retried(
     assert store.claim_next_alarm() is None
     assert central.get_detector(det["id"])["hits"] == 0
 
-    # RETRYABLE: the unreadable fire is closed, so the next tick tries again.
+    # RETRYABLE: the unreadable fire is closed, so the next tick tries again
     monkeypatch.setattr(remedies, "propose", real)
     _tick(daemon, store)
     outcomes = sorted(f["outcome"] for f in _fires(central, det))
@@ -444,7 +428,7 @@ def test_a_propose_that_raises_is_unreadable_with_the_exception_and_is_retried(
     assert store.get_work_order(wo["id"])["status"] == "needs_review"
 
 
-# -- (e) THE COLLISION: the supervisor proposing on the same alarm ------------------------
+# -- (e) THE COLLISION: the supervisor proposing on the same alarm
 
 
 def test_the_supervisor_proposing_on_a_rules_alarm_is_declined_by_the_existing_refusal(
@@ -466,12 +450,12 @@ def test_the_supervisor_proposing_on_a_rules_alarm_is_declined_by_the_existing_r
     finally:
         neo.close()
     assert again["proposed"] is False and "already awaiting a verdict" in again["reason"]
-    # Still ONE gate request and ONE question: the collision filed nothing.
+    # Still ONE gate request and ONE question: the collision filed nothing
     assert len(store.list_approvals(wo["id"])) == 1
     assert len(_neo_approvals()) == 1
 
 
-# -- (f) NO_TURN renders as absent -------------------------------------------------------
+# -- (f) NO_TURN renders as absent
 
 
 def test_no_turn_renders_as_absent_in_the_cli_and_on_the_alarm_pages(
@@ -501,7 +485,7 @@ def test_no_turn_renders_as_absent_in_the_cli_and_on_the_alarm_pages(
     assert listing.status_code == 200 and "turn -1" not in listing.text
 
 
-# -- (g) dedupe: one fire, one alarm, a refire only after the clear ------------------------
+# -- (g) dedupe: one fire, one alarm, a refire only after the clear
 
 
 def test_a_standing_armed_condition_is_one_fire_and_refires_only_after_it_clears(
@@ -530,8 +514,7 @@ def test_a_standing_armed_condition_is_one_fire_and_refires_only_after_it_clears
 
 def test_a_moved_fingerprint_does_not_file_a_second_request_while_the_first_awaits(
         boot, central, store):
-    """The situation changes for reasons that are not a new gap (a queued message); the
-    standing condition's proposal is still pending, so it is HELD, not re-filed."""
+    """The situation changes for reasons that are not a new gap (a queued message)"""
     daemon = boot(remedies_allowed=["nudge"])
     det, _rm, wo, _ = _armed_fire(daemon, central, store)
     store.queue_message(wo["id"], "an unrelated message")
@@ -545,7 +528,7 @@ def test_a_moved_fingerprint_does_not_file_a_second_request_while_the_first_awai
 
 def test_a_refused_fire_does_not_hold_so_a_moved_fingerprint_records_a_new_fire(
         boot, central, store):
-    """Held only while the alarm is `proposed`; a refusal awaits no verdict."""
+    """Held only while the alarm is `proposed`; a refusal awaits no verdict"""
     daemon = boot()                 # remedies ship off: every armed fire is refused
     det, _rm, wo, _ = _armed_fire(daemon, central, store)
     (first,) = _fires(central, det)
@@ -563,7 +546,7 @@ def test_a_refused_fire_does_not_hold_so_a_moved_fingerprint_records_a_new_fire(
 
 def test_a_failed_post_propose_fingerprint_keeps_the_pre_action_one_and_still_records_the_fire(
         boot, central, store, monkeypatch):
-    """No fabricated value: the existing branch logs and keeps the pre-action string."""
+    """No fabricated value: the existing branch logs and keeps the pre-action string"""
     daemon = boot(remedies_allowed=["nudge"])
     det, _rm = _rule(central)
     ops.rules_arm(det["id"], "earned", by="gonzalo")
@@ -599,7 +582,7 @@ def test_a_dry_run_clearing_writes_no_rule_cleared_event(boot, central, store):
     assert _fires(central, det)[0]["mode"] == rules.DRY_RUN
 
 
-# -- (h) false positives and the interlock ----------------------------------------------------
+# -- (h) false positives and the interlock
 
 
 def _armed_fire_row(central, det, rm, order="wo-x", **kw):
@@ -722,16 +705,12 @@ def test_the_disarm_setting_defaults_to_two_and_a_bad_value_is_refused(
         parse_catalog(base)
 
 
-# -- (i) arming never moves the health fingerprint ------------------------------------------
+# -- (i) arming never moves the health fingerprint
 
 
 def test_the_three_kinds_are_observer_kinds_and_an_armed_fire_s_events_do_not_move_it(
         boot, central, store):
-    """Asserted on a REFUSED fire on purpose: it writes `rule_fired` and `remedy_refused`
-    and nothing else onto the order, so an unchanged fingerprint isolates exactly the
-    kinds §2's correctness rule is about. A PROPOSED fire also writes `gate_requested`,
-    which the fingerprint legitimately counts; `_fire_armed` therefore takes the FIRE's
-    fingerprint after the action, and the dedupe test below proves it engages."""
+    """Asserted on a REFUSED fire on purpose: it writes `rule_fired` and `remedy_refused` and nothing else..."""
     for kind in ("rule_fired", "rule_dry_run", "rule_cleared"):
         assert kind in health.observer_kinds()
 
@@ -751,7 +730,7 @@ def test_the_three_kinds_are_observer_kinds_and_an_armed_fire_s_events_do_not_mo
                                       "row": store.get_work_order(wo["id"])}) == before
 
 
-# -- (j) the vocabularies --------------------------------------------------------------------
+# -- (j) the vocabularies
 
 
 def test_the_event_vocabularies_agree_and_the_source_is_admitted(store):
@@ -767,7 +746,7 @@ def test_the_event_vocabularies_agree_and_the_source_is_admitted(store):
 
 
 def test_rule_dry_run_is_declared_and_written_by_nothing(boot, central, store):
-    """§5 forbids a timeline event in dry run, so the declared kind stays unwritten."""
+    """§5 forbids a timeline event in dry run, so the declared kind stays unwritten"""
     daemon = boot()
     det, _ = _rule(central)
     wo = store.create_work_order("stuck", status="needs_review")
@@ -788,7 +767,7 @@ def test_the_timeline_describes_the_three_kinds_and_links_the_alarm():
     assert timeline._ref("rule_fired", {"alarm_id": "al-1"})["id"] == "al-1"
 
 
-# -- the CLI ---------------------------------------------------------------------------------
+# -- the CLI
 
 
 def test_the_cli_arms_and_marks_false_positives_and_demands_a_reason(

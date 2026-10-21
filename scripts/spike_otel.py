@@ -1,30 +1,5 @@
 #!/usr/bin/env python3
-"""What does Claude Code's OpenTelemetry export ACTUALLY emit?
-
-Hand-run only. §9 of docs/superpowers/specs/2026-09-24-order-observability.md asks six questions
-about what arrives when `CLAUDE_CODE_ENABLE_TELEMETRY=1` and an OTLP endpoint are set
-around a real headless turn, and says the listener must "record everything and interpret
-nothing". This script is that listener plus one scratch turn. It prints MEASUREMENTS
-ONLY - metric names, log-event names, attribute keys, arrival times, and literal
-substring probes - and draws NO verdict about adopting OTEL. That verdict is the human
-deliverable; a script that pre-empted it would be answering a question nobody asked.
-
-    uv run python scripts/spike_otel.py --out /tmp/spike-otel-clean
-    uv run python scripts/spike_otel.py --mode killed --out /tmp/spike-otel-killed
-    uv run python scripts/spike_otel.py --mode dead --out /tmp/spike-otel-dead
-
-TWO THINGS THIS CANNOT ANSWER, and no run of it ever will:
-
-1. It measures ONE CLI version on ONE machine. Everything here is `claude --version` at
-   the moment of the run (recorded in the header); a later version can add, rename or
-   drop any name printed below.
-2. It measures A SINGLE WORKER, not many concurrent ones. §9 question 6 - the cost with
-   many concurrent headless workers each exporting - is NOT covered: one turn says
-   nothing about port contention, collector load or interleaved flushes.
-
-`scripts/spike_peer_message.py` is the shape this mirrors: stdlib only, `--out` workdir,
-one JSON object per event on stdout, a summary dict at the end and a written summary.json.
-"""
+"""What does Claude Code's OpenTelemetry export ACTUALLY emit? (docs/superpowers/specs/2026-09-24-order-observability.md)"""
 
 from __future__ import annotations
 
@@ -45,8 +20,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
-#: Grep handle for §9 question 2 ("does any payload carry tool parameters"). The prompt
-#: puts it inside Bash argument text, so its presence in ANY body is the evidence.
+#: Grep handle for §9 question 2 ("does any payload carry tool parameters")
 MARKER = "SPIKE-MARKER"
 
 PROMPT = f"""\
@@ -62,14 +36,11 @@ Harness session. Do exactly this and nothing else.
 4. Your FINAL message is one line: DONE
 """
 
-#: §9 prior (2): these switch telemetry off. Deleted from the child env so a run cannot
-#: silently measure a disabled exporter; the header says which were present.
+#: §9 prior (2): these switch telemetry off
 DISABLERS = ("DISABLE_TELEMETRY", "DO_NOT_TRACK",
              "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")
 
-#: Literal substrings searched over every decoded body. RAW EVIDENCE for §9 questions
-#: 2-4 (tool params, cache-write cause / TTL split / modelUsage, context composition).
-#: Found/not-found only - no term here implies a conclusion.
+#: Literal substrings searched over every decoded body
 PROBES = (MARKER, "sleep", "tool_input", "parameters", "ephemeral_5m", "ephemeral_1h",
           "cache_creation", "cache_read", "cacheCreation", "modelUsage",
           "system_prompt", "systemPrompt", "skill", "agent", "subagent", "context",
@@ -78,11 +49,7 @@ PROBES = (MARKER, "sleep", "tool_input", "parameters", "ephemeral_5m", "ephemera
 PRINTABLE_RUN = re.compile(rb"[ -~]{4,}")
 
 
-# --------------------------------------------------------------------------
-# Part 1: the listener. Accepts POST on ANY path - /v1/metrics, /v1/logs,
-# /v1/traces, or whatever a future version invents - because the question is what
-# arrives, not whether it matches a route we predicted.
-# --------------------------------------------------------------------------
+# Part 1: the listener
 
 class Recorder:
     def __init__(self, workdir: Path) -> None:
@@ -98,8 +65,7 @@ class Recorder:
             self.seq += 1
             seq = self.seq
         slug = re.sub(r"[^A-Za-z0-9]+", "-", path).strip("-") or "root"
-        # Written BEFORE parsing, unconditionally: the audit trail must survive a
-        # parse bug in anything below.
+        # Written BEFORE parsing, unconditionally: the audit trail must survive a parse bug in anything below
         (self.raw / f"{seq:04d}-{slug}.bin").write_bytes(body)
         raw = body
         if (headers.get("Content-Encoding") or "").lower() == "gzip":
@@ -126,8 +92,7 @@ class Recorder:
         try:
             row["json"] = json.loads(raw)
         except (ValueError, UnicodeDecodeError):
-            # Protobuf (or anything else non-JSON) still yields its metric and
-            # attribute names as ASCII runs, which is what §9 question 1 asks for.
+            # Protobuf (or anything else non-JSON) still yields its metric and attribute names as ASCII runs
             row["raw_repr"] = repr(raw)[:20000]
             row["printable_runs"] = [m.group(0).decode("ascii")
                                      for m in PRINTABLE_RUN.finditer(raw)]
@@ -163,8 +128,7 @@ def make_handler(rec: Recorder):
             self.end_headers()
 
         def log_message(self, fmt: str, *args: object) -> None:
-            """No-op: the default access log goes to stderr and would drown the
-            one-JSON-object-per-event stream this script IS."""
+            """No-op: the default access log goes to stderr and would drown the one-JSON-object-per-event stream..."""
 
     return Handler
 
@@ -177,11 +141,7 @@ def start_listener(workdir: Path) -> tuple[ThreadingHTTPServer, Recorder, int]:
     return srv, rec, port
 
 
-# --------------------------------------------------------------------------
-# Part 2: the turn runner. Argv and spawn shape mirror claude_cli.spawn_turn;
-# §9 names `env = {**os.environ, **cache_env()}` as the seam an adoption would use,
-# so the overlay below is exactly what production would have to add.
-# --------------------------------------------------------------------------
+# Part 2: the turn runner
 
 def claude() -> str:
     return os.environ.get("JARVIS_CLAUDE_BIN") or "claude"
@@ -205,8 +165,7 @@ def otel_env(port: int, protocol: str, interval_ms: int | None,
         "OTEL_EXPORTER_OTLP_PROTOCOL": protocol,
         "OTEL_EXPORTER_OTLP_ENDPOINT": f"http://127.0.0.1:{port}",
     }
-    # Left UNSET by default on purpose: §9 question 5 asks what the CLI's OWN default
-    # flush interval is, and naming one here would measure our setting instead.
+    # Left UNSET by default on purpose: §9 question 5 asks what the CLI's OWN default flush interval is
     if interval_ms is not None:
         overlay["OTEL_METRIC_EXPORT_INTERVAL"] = str(interval_ms)
         overlay["OTEL_LOGS_EXPORT_INTERVAL"] = str(interval_ms)
@@ -225,9 +184,7 @@ def spawn_turn(overlay: dict[str, str], outfile: Path,
         env.pop(k, None)
     outfile.parent.mkdir(parents=True, exist_ok=True)
     with outfile.open("wb") as out:
-        # errfile only for --mode dead, which must report stderr VERBATIM and so cannot
-        # have it interleaved into the JSON envelope on stdout. Left None everywhere
-        # else, keeping the clean/killed spawn byte-identical to before.
+        # errfile only for --mode dead, which must report stderr VERBATIM and so cannot have it interleaved...
         if errfile is None:
             return subprocess.Popen(args, cwd=REPO, env=env, stdin=subprocess.DEVNULL,
                                     stdout=out, stderr=subprocess.STDOUT,
@@ -237,22 +194,12 @@ def spawn_turn(overlay: dict[str, str], outfile: Path,
                                     stdout=out, stderr=err, start_new_session=True)
 
 
-#: Cap on the stderr text copied into summary.json for --mode dead. Stated in the
-#: payload beside the text, because this is output the SCRIPT did not write: a reader
-#: must be able to tell "that was all of it" from "that is where we stopped copying".
+#: Cap on the stderr text copied into summary.json for --mode dead
 STDERR_CAP = 20000
 
 
 def prove_port_closed() -> dict[str, object]:
-    """Pick a port and PROVE nothing listens on it, or abort.
-
-    Measuring against a port that turned out to be open would be a false negative:
-    some other server would answer the exporter's POSTs, the turn would see a working
-    endpoint, and the run would report "a dead endpoint is harmless" having never had
-    one. So: bind an ephemeral port to learn a free number, close it, then connect and
-    require a refusal. A successful connect means the number was reused between the
-    close and the probe - abort rather than measure the wrong thing.
-    """
+    """Pick a port and PROVE nothing listens on it, or abort"""
     holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         holder.bind(("127.0.0.1", 0))
@@ -280,10 +227,7 @@ def prove_port_closed() -> dict[str, object]:
     return proof
 
 
-# --------------------------------------------------------------------------
-# Part 3: harvesting. Every walk is GENERIC - shape-matched, not path-coded - so a
-# renamed nesting level still yields its keys instead of silently yielding none.
-# --------------------------------------------------------------------------
+# Part 3: harvesting
 
 def walk(obj: object):
     yield obj
@@ -334,8 +278,7 @@ def log_event_names(rows: list[dict[str, object]]) -> list[str]:
 
 
 def attribute_keys(rows: list[dict[str, object]]) -> list[str]:
-    """Any {"key": ..., "value": ...} pair anywhere: resource, datapoint or log record.
-    OTLP/JSON uses that shape at every level, so one generic walk beats three paths."""
+    """Any {"key": ..., "value": ...} pair anywhere: resource, datapoint or log record"""
     keys: set[str] = set()
     for row in rows:
         doc = row.get("json")
@@ -357,7 +300,7 @@ def _get(obj: object, key: str) -> list[object]:
 
 
 def _scalar(value: object) -> str:
-    """OTLP AnyValue: {"stringValue": "x"} / {"intValue": "1"} / a bare scalar."""
+    """OTLP AnyValue: {"stringValue": "x"} / {"intValue": "1"} / a bare scalar"""
     if isinstance(value, dict):
         for k in ("stringValue", "intValue", "doubleValue", "boolValue"):
             if k in value:
@@ -385,7 +328,7 @@ def probe(rows: list[dict[str, object]]) -> dict[str, bool]:
 
 
 def truncate(rows: list[dict[str, object]]) -> list[dict[str, object]]:
-    """Bodies capped in summary.json; the full ones are in <out>/raw/."""
+    """Bodies capped in summary.json; the full ones are in <out>/raw/"""
     out = []
     for row in rows:
         copy = dict(row)
@@ -400,21 +343,11 @@ def truncate(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     return out
 
 
-# --------------------------------------------------------------------------
-# Part 4: modes. One mode per invocation.
-# --------------------------------------------------------------------------
+# Part 4: modes
 
 def run_dead(a: argparse.Namespace, rec: Recorder, overlay: dict[str, str],
              workdir: Path, proof: dict[str, object]) -> dict[str, object]:
-    """--mode dead: same turn, endpoint pointed at a port NOTHING listens on.
-
-    This mode exists because the finding it backs was otherwise unreproducible: the
-    closed-port measurement in the findings document (rc=0, subtype success,
-    is_error false, one ordinary stdin warning on stderr) was taken with an ad-hoc
-    shell script that was never committed, so nobody could re-check it from the
-    artifact - wo-b2f8a660 review round 1, defect 1. Measurement only: the numbers and
-    the stderr text go into summary.json and this function draws no conclusion from them.
-    """
+    """--mode dead: same turn, endpoint pointed at a port NOTHING listens on"""
     outfile = workdir / "turn-dead.json"
     errfile = workdir / "turn-dead.stderr.txt"
     proc = spawn_turn(overlay, outfile, errfile=errfile)
@@ -443,8 +376,7 @@ def run_dead(a: argparse.Namespace, rec: Recorder, overlay: dict[str, str],
         info["result_is_error"] = envelope.get("is_error")
         info["result_duration_ms"] = envelope.get("duration_ms")
     info["stdout_file"] = str(outfile)
-    # No listener was started, so there is nothing to drain and --drain is not honoured
-    # here; said out loud so its absence does not read as a dropped wait.
+    # No listener was started, so there is nothing to drain and --drain is not honoured here
     info["drained"] = False
     print(json.dumps({"event": "turn-settled", **info}, default=str), flush=True)
     return info
@@ -456,8 +388,7 @@ def run_mode(a: argparse.Namespace, rec: Recorder,
     info: dict[str, object] = {"pid": proc.pid, "mode": a.mode}
 
     if a.mode == "killed":
-        # §9 question 5's second half: does a turn that DIES flush anything? Kill the
-        # whole group - `claude` is a shim, so killing the pid alone leaves node alive.
+        # §9 question 5's second half: does a turn that DIES flush anything?
         time.sleep(a.kill_after)
         before = len(rec.requests)
         try:
@@ -474,8 +405,7 @@ def run_mode(a: argparse.Namespace, rec: Recorder,
         info["turn_done_at_t"] = round(time.monotonic() - rec.t0, 2)
 
     print(json.dumps({"event": "turn-settled", **info}), flush=True)
-    # Drain: a slow flush arriving after the turn is exactly the evidence §9 wants,
-    # so keep serving well past the process.
+    # Drain: a slow flush arriving after the turn is exactly the evidence §9 wants
     time.sleep(a.drain)
 
     if a.mode == "killed":

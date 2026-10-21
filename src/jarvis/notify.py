@@ -1,10 +1,4 @@
-"""Notification routing: project outboxes -> central inbox -> sinks.
-
-Sinks are intentionally simple functions. `log` is always on; `telegram` activates when
-its env vars are present; `desktop` uses notify-send when available. Projects emit via
-`jarvis notify`, which writes their outbox — they never talk to sinks directly. That is
-the unified pipeline existing per-project Telegram scripts migrate to.
-"""
+"""Notification routing: project outboxes -> central inbox -> sinks"""
 
 from __future__ import annotations
 
@@ -26,62 +20,36 @@ from .project_store import ProjectStore
 
 LEVEL_EMOJI = {"info": "ℹ️", "warning": "⚠️", "critical": "🚨"}
 
-#: Kill switch for every sink whose effect leaves this process — Telegram (the user's
-#: phone) and desktop (their screen). Set by the test-isolation gate in the repo-root
-#: conftest, because a test run must never be able to reach the real user. `log` is
-#: exempt: it writes under $JARVIS_HOME, which the same gate has already sandboxed.
-#:
-#: This exists because it happened. On 2026-07-27 a worker's test run wrote inbox items
-#: into PRODUCTION os.db (workers inherit JARVIS_HOME=<production state>) and the live
-#: daemon dutifully Telegrammed the user two critical alerts about the fixture project
-#: `proj_a`, one carrying a deep link that 500'd.
+#: Kill switch for every sink whose effect leaves this process
 DISABLE_EXTERNAL_SINKS_ENV = "JARVIS_DISABLE_EXTERNAL_SINKS"
 
 
 def external_sinks_disabled() -> bool:
     return bool(os.environ.get(DISABLE_EXTERNAL_SINKS_ENV))
 
-#: Anchor on the work-order page marking whatever is waiting on the user
-#: (pending assumptions, the attention banner, otherwise the reply box).
+#: Anchor on the work-order page marking whatever is waiting on the user (pending assumptions
 PENDING_ANCHOR = "pending"
 
 
 def ui_base_url(catalog: Catalog) -> str:
-    """Root URL of the local dashboard, as a notification recipient should reach it."""
+    """Root URL of the local dashboard, as a notification recipient should reach it"""
     return catalog.os.ui_base_url or f"http://127.0.0.1:{catalog.os.ui_port}"
 
 
 def wo_url(catalog: Catalog, project: str, wo_id: str) -> str:
-    """Deep link to a work order's history, scrolled to what needs the user."""
+    """Deep link to a work order's history, scrolled to what needs the user"""
     quote = urllib.parse.quote
     return f"{ui_base_url(catalog)}/wo/{quote(project)}/{quote(wo_id)}#{PENDING_ANCHOR}"
 
 
 def neo_question_url(catalog: Catalog, question_id: Any) -> str:
-    """Deep link to one Neo question — its verdict, its reasoning, its answer box.
-
-    A notification reaches Telegram, where `jarvis neo show <id>` is a command the reader
-    cannot run: the user is on their phone. `wo_url`'s rule, one surface along.
-    """
+    """Deep link to one Neo question — its verdict, its reasoning, its answer box"""
     return f"{ui_base_url(catalog)}/neo/question/{urllib.parse.quote(str(question_id))}"
 
 
 def check_wo_link(central: CentralStore, catalog: Catalog, project: str,
                   wo_id: str) -> tuple[str | None, str]:
-    """`(url, problem)` — the deep link, or `None` and why it would dead-end.
-
-    A notification is often the user's only entry point into a work order, and until
-    this the link was built from whatever project name the emitter happened to pass:
-    no check that the project was registered or that the work order existed. Shipping
-    a link that is *guaranteed* to 404 is worse than shipping no link, because the user
-    cannot tell a stale link from a broken OS — the observed case was a test-fixture
-    project name reaching the real Telegram sink and the user following it into an
-    HTTP 500.
-
-    Checked against the same source `ops.find_work_order` uses (the registry, then the
-    project's own store), so agreeing with it is not a coincidence. `central` is passed
-    in rather than opened here to keep this honest under an isolated `$JARVIS_HOME`.
-    """
+    """`(url, problem)` — the deep link, or `None` and why it would dead-end"""
     paths = {p["name"]: Path(p["path"]) for p in central.list_projects()
              if p["status"] == "active"}
     if project not in paths:
@@ -101,13 +69,7 @@ def check_wo_link(central: CentralStore, catalog: Catalog, project: str,
 
 
 def _link_for(item: dict[str, Any], catalog: Catalog) -> tuple[str | None, str]:
-    """The link a sink should use for `item`.
-
-    `route_new_inbox` validates once per item and stashes the verdict; a sink called
-    directly (tests, one-off scripts) has no verdict to read and falls back to the
-    unvalidated URL — validation needs a `CentralStore`, and a sink must not go opening
-    one behind its caller's back.
-    """
+    """The link a sink should use for `item`"""
     if not item.get("wo_id"):
         return None, ""
     if "wo_link" in item:
@@ -125,8 +87,7 @@ def sink_log(item: dict[str, Any], catalog: Catalog) -> str:
             f"{stamp} [{item['level'].upper()}] {item['project']}: {item['title']}"
             + (f" — {item['body']}" if item["body"] else "")
             + (f" (wo={item['wo_id']})" if item.get("wo_id") else "")
-            # On disk too, so a dead link is diagnosable after the fact rather than
-            # only visible to whoever tapped it in Telegram.
+            # On disk too, so a dead link is diagnosable after the fact rather than only visible to whoever...
             + (f" [no deep link: {problem}]" if problem else "")
             + "\n"
         )
@@ -134,17 +95,10 @@ def sink_log(item: dict[str, Any], catalog: Catalog) -> str:
 
 
 def render_telegram(item: dict[str, Any], catalog: Catalog) -> str:
-    """The message body exactly as Telegram will receive it.
-
-    Split out from the send so a test can assert on what the user READS — the half that
-    was empty on the 2026-08-27 auth incident. Nothing here truncates: the body arrives
-    already clipped by whoever raised the notification (the reconciler cuts at 500), and
-    a second, invisible limit here is how a diagnosis loses its last sentence.
-    """
+    """The message body exactly as Telegram will receive it"""
     emoji = LEVEL_EMOJI.get(item["level"], "")
     esc = html.escape
-    # HTML (not Markdown): work order ids become tappable links into the local UI,
-    # and titles containing _ or * no longer break the parse.
+    # HTML (not Markdown): work order ids become tappable links into the local UI
     text = f"{emoji} <b>[{esc(item['project'])}]</b> {esc(item['title'])}"
     if item["body"]:
         text += f"\n{esc(item['body'])}"
@@ -153,8 +107,7 @@ def render_telegram(item: dict[str, Any], catalog: Catalog) -> str:
         if url:
             text += f'\n<a href="{esc(url, quote=True)}">{esc(item["wo_id"])}</a>'
         else:
-            # No link rather than a link that 404s: the user cannot tell a stale link
-            # from a broken dashboard, and guessing wrong costs them a debugging session.
+            # No link rather than a link that 404s: the user cannot tell a stale link from a broken dashboard
             text += f"\n{esc(item['wo_id'])} — <i>{esc(problem)}</i>"
     return text
 
@@ -203,13 +156,11 @@ SINKS: dict[str, Callable[[dict[str, Any], Catalog], str]] = {
 
 
 def route_new_inbox(central: CentralStore, catalog: Catalog) -> int:
-    """Send every 'new' inbox item through the configured sinks. Returns count."""
+    """Send every 'new' inbox item through the configured sinks"""
     sinks = list(dict.fromkeys(["log", *catalog.os.notification_sinks]))
     count = 0
     for item in central.new_inbox():
-        # Validate the deep link once, here, rather than in each sink: this is the last
-        # point at which the OS still owns the notification, and every sink downstream
-        # then agrees on whether there is a page to link to.
+        # Validate the deep link once, here
         if item.get("wo_id"):
             item["wo_link"], item["wo_link_problem"] = check_wo_link(
                 central, catalog, item["project"], item["wo_id"])

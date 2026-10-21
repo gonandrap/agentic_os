@@ -1,11 +1,4 @@
-"""Screenshot a `needs_review` work order that says why — issue 573's UI evidence.
-
-Three pages: the order flagged, the same order after the "Got it" button (the reason
-survives as "already seen"), and its timeline with the `acknowledged` event as prose.
-Everything lives in a temp `JARVIS_HOME`, so it never touches the live OS:
-
-    uv run python scripts/screenshot_needs_review_reason.py
-"""
+"""Screenshot a `needs_review` work order that says why — issue 573's UI evidence"""
 
 from __future__ import annotations
 
@@ -24,7 +17,7 @@ PORT = 8801
 
 
 def seed() -> str:
-    """One work order in the shape `Daemon.settle_work_order` leaves behind."""
+    """One work order in the shape `Daemon.settle_work_order` leaves behind"""
     from jarvis import ops
     from jarvis.central_store import CentralStore
     from jarvis.invariants import IDLE_NO_FINISH_BLOCKER

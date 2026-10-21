@@ -1,27 +1,4 @@
-"""The project manager order: the third work-order kind, and what it breaks.
-
-A feature order has no session, so a review that rejects one has nobody to tell. The
-**project manager order** is that somebody: one `kind='manager'` work order created
-alongside the children when a plan is released, which owns the feature's follow-through
-and is the addressee for anything the feature needs a human-shaped decision about.
-
-Two properties this file exists to protect, because neither is visible from any single
-function:
-
-* **With `os.validation.enabled` off, nothing changes.** No manager is created, plan
-  release is the call it always was, and every other test in the suite still passes
-  unedited. Every test below that needs a manager turns the flag on explicitly.
-* **A long-lived session breaks four things, and the first one stops the fleet.**
-  `count_active` has no kind filter, and a manager takes a turn every time its feature
-  reports for that feature's whole life — so two features in flight would spend a
-  `max_concurrent: 2` project's entire budget on bookkeeping.
-  `test_an_idle_manager_does_not_spend_a_concurrency_slot` is the important test in this
-  file; INV-MANAGER-SLOTS is the alarm that proves the exemption is still there.
-
-Every test that can be is PAIRED: the manager's special case and the ordinary worker's
-behaviour asserted side by side in one test, so a test that passes because the general
-case broke cannot look like a test that passes because the special case works.
-"""
+"""The project manager order: the third work-order kind, and what it breaks"""
 
 from __future__ import annotations
 
@@ -60,13 +37,7 @@ def a_plan(*keys: str) -> dict:
 
 @pytest.fixture()
 def boot(tmp_path, jarvis_home, fake_claude, project):
-    """Start the OS against a catalog this test wrote, so `os.validation.enabled` and
-    `max_concurrent` are part of the test rather than of a shared fixture.
-
-    Callable more than once in a test: `start_os` re-registers the catalog path, and
-    `ops.validation_enabled` reads it on demand, so a test can release one plan with the
-    flag off and the next with it on and compare the two.
-    """
+    """Start the OS against a catalog this test wrote"""
     def _boot(validation: bool = True, max_concurrent: int = 4,
               feature_units: bool = True) -> Daemon:
         data = {
@@ -96,12 +67,7 @@ def store(project):
 
 
 def release(daemon: Daemon, title: str, *keys: str) -> str:
-    """A feature order whose plan has been submitted and released. Returns its id.
-
-    The tick is what opens the planner and moves the feature to `planning`; the plan is
-    then submitted by hand rather than by that planner, because what these tests are
-    about is what RELEASE creates, not how the plan was written.
-    """
+    """A feature order whose plan has been submitted and released"""
     fo = ops.create_feature_order("proj_a", title, description=ASK)
     daemon.tick()
     ops.submit_plan(fo["id"], a_plan(*keys))
@@ -109,16 +75,11 @@ def release(daemon: Daemon, title: str, *keys: str) -> str:
     return str(fo["id"])
 
 
-# -- 1. creation -----------------------------------------------------------------------
+# -- 1. creation
 
 
 def test_a_released_plan_creates_a_manager_only_when_validation_is_enabled(boot, store):
-    """The pair that pins the feature flag: same plan, same project, both ways round.
-
-    The children must be IDENTICAL either way. A manager that changed what the user
-    reviewed — an extra edge, a different order — would make the flag a behaviour change
-    rather than an addition.
-    """
+    """The pair that pins the feature flag: same plan, same project, both ways round"""
     daemon = boot(validation=False)
     off = release(daemon, "CSV export (off)", "one", "two")
 
@@ -142,8 +103,7 @@ def test_a_released_plan_creates_a_manager_only_when_validation_is_enabled(boot,
 
 def test_the_manager_is_created_in_the_same_transaction_as_the_children(boot, store,
                                                                         monkeypatch):
-    """All-or-nothing, for the same reason the children are: a feature holding children
-    but no manager is a feature whose rejections have nowhere to go."""
+    """All-or-nothing, for the same reason the children are: a feature holding children but no manager is..."""
     daemon = boot(validation=True)
     fo = ops.create_feature_order("proj_a", "CSV export", description=ASK)
     daemon.tick()
@@ -161,20 +121,11 @@ def test_the_manager_is_created_in_the_same_transaction_as_the_children(boot, st
     assert store.get_feature_order(fo["id"])["status"] == "plan_review"
 
 
-# -- 2. the concurrency trap -----------------------------------------------------------
+# -- 2. the concurrency trap
 
 
 def test_an_idle_manager_does_not_spend_a_concurrency_slot(boot, store):
-    """THE test in this file. Two features' managers must not eat a `max_concurrent: 2`
-    project whole and leave `dispatch_pending` unable to claim anything again — a project
-    that stops with nothing anywhere saying why.
-
-    Paired with the control in the same test: two ORDINARY work orders holding a slot DO
-    take them. Without that half, a `count_active` that returned zero unconditionally
-    would pass the first half perfectly. The control runs them, rather than parking them
-    in the manager's own status: since issue #134 a parked order spends no slot whatever
-    its kind, so `waiting_input` would no longer tell the two apart.
-    """
+    """THE test in this file (#134)"""
     daemon = boot(validation=True, max_concurrent=2)
     spec = daemon.catalog.project("proj_a")
     for name in ("one", "two"):
@@ -189,7 +140,7 @@ def test_an_idle_manager_does_not_spend_a_concurrency_slot(boot, store):
 
     assert store.get_work_order(work["id"])["status"] != "pending"
 
-    # The control: two ordinary workers actually running, and the count sees them.
+    # The control: two ordinary workers actually running, and the count sees them
     store.set_status(work["id"], "completed")
     for i in range(2):
         busy = ops.create_work_order("proj_a", f"busy {i}", description="something")
@@ -204,19 +155,12 @@ def test_an_idle_manager_does_not_spend_a_concurrency_slot(boot, store):
 
 
 def test_inv_manager_slots_fires_when_the_exemption_is_removed(boot, store, monkeypatch):
-    """A canary that cannot be shown to fire is not a canary.
-
-    Silent on healthy state WITH a manager present (the first half — a checker that
-    fired on healthy state would spam the timeline every tick for ever), and loud the
-    moment `count_active` goes back to counting everything.
-    """
+    """A canary that cannot be shown to fire is not a canary"""
     daemon = boot(validation=True)
     fo_id = release(daemon, "CSV export", "one", "two")
     manager = store.manager_work_order(fo_id)
     assert manager is not None
-    # Mid-turn, because that is where the exemption still does work: since issue #134 a
-    # manager parked in `waiting_input` is outside the cap's set anyway, so a canary
-    # armed on a parked one would fire whether or not the kind filter survived.
+    # Mid-turn, because that is where the exemption still does work: since issue #134 a manager parked in...
     store.set_status(manager["id"], "running")
 
     def fired() -> list[invariants.Violation]:
@@ -243,20 +187,11 @@ def test_inv_manager_slots_fires_when_the_exemption_is_removed(boot, store, monk
     assert "wo-9652be2f" in violations[0].detail
 
 
-# -- 3. the manager is not a child -----------------------------------------------------
+# -- 3. the manager is not a child
 
 
 def test_a_feature_completes_while_its_manager_is_open(boot, store):
-    """`feature_children` filters to `kind='worker'`, so the manager cannot deadlock the
-    completion — and because it cannot, nothing else would ever close it, which is why
-    `settle_features` does it here.
-
-    `feature_units=False` is what this test has always been asking for and could not say
-    until the switch existed: a manager, and a feature that settles on its children. With
-    feature validation on, the last child landing sends the feature to the panel instead,
-    and the manager is closed by the pass — the same `_complete_feature`, one caller
-    further along. `tests/test_feature_validation.py` covers that route.
-    """
+    """`feature_children` filters to `kind='worker'`, so the manager cannot deadlock the completion"""
     daemon = boot(validation=True, feature_units=False)
     spec = daemon.catalog.project("proj_a")
     fo_id = release(daemon, "CSV export", "one", "two")
@@ -275,9 +210,7 @@ def test_a_feature_completes_while_its_manager_is_open(boot, store):
 
 
 def test_cancelling_the_manager_does_not_fail_the_feature(boot, store):
-    """Paired with the child that DOES fail it: the difference is the kind, and it comes
-    for free from `feature_children`'s positive filter rather than from a rule anyone
-    has to remember."""
+    """Paired with the child that DOES fail it: the difference is the kind"""
     daemon = boot(validation=True)
     spec = daemon.catalog.project("proj_a")
     fo_id = release(daemon, "CSV export", "one", "two")
@@ -296,8 +229,7 @@ def test_cancelling_the_manager_does_not_fail_the_feature(boot, store):
 
 
 def test_a_failed_feature_closes_its_manager_too(boot, store):
-    """Whichever way the feature ended, the manager ends with it. A live addressee under
-    a settled feature would take delivery of messages about work that is over."""
+    """Whichever way the feature ended, the manager ends with it"""
     daemon = boot(validation=True)
     spec = daemon.catalog.project("proj_a")
     fo_id = release(daemon, "CSV export", "one", "two")
@@ -312,8 +244,7 @@ def test_a_failed_feature_closes_its_manager_too(boot, store):
 
 
 def test_fo_cancel_cancels_the_manager(boot, store):
-    """`jarvis fo cancel` reaches down to every session the feature owns. The manager is
-    not a child, so — exactly like the planner — it has to be reached explicitly."""
+    """`jarvis fo cancel` reaches down to every session the feature owns"""
     daemon = boot(validation=True)
     fo_id = release(daemon, "CSV export", "one", "two")
     manager = store.manager_work_order(fo_id)
@@ -325,14 +256,12 @@ def test_fo_cancel_cancels_the_manager(boot, store):
     assert store.get_work_order(manager["id"])["status"] == "cancelled"
 
 
-# -- 4. settlement ---------------------------------------------------------------------
+# -- 4. settlement
 
 
 def test_an_idle_manager_settles_to_idle_without_attention(boot, store,
                                                            settle_turns):
-    """Idle by design on one side, idle by abandonment on the other, in one settlement
-    pass over one feature. Without the manager branch every feature order in the fleet
-    would carry a permanent false flag."""
+    """Idle by design on one side, idle by abandonment on the other"""
     daemon = boot(validation=True)
     spec = daemon.catalog.project("proj_a")
     fo_id = release(daemon, "CSV export", "one")
@@ -355,15 +284,7 @@ def test_an_idle_manager_settles_to_idle_without_attention(boot, store,
 
 def test_an_idle_manager_stays_unflagged_across_a_reconcile_tick(boot, store,
                                                                  settle_turns):
-    """Settling it quietly is only half the job: `true_blockers` derives
-    "worker is waiting on your input" from the status alone, and INV-ATTENTION-MISSING
-    repairs any unflagged blocked work order — so before the manager had a status of its
-    own the flag came straight back on the very next tick, which is where the user would
-    actually have seen it.
-
-    Paired in the same test with an ordinary worker parked in `waiting_input`, which must
-    still be flagged: `idle` has to buy accuracy, not silence.
-    """
+    """Settling it quietly is only half the job: `true_blockers` derives "worker is waiting on your input"..."""
     from jarvis.invariants import true_blockers
 
     daemon = boot(validation=True)
@@ -389,9 +310,7 @@ def test_an_idle_manager_stays_unflagged_across_a_reconcile_tick(boot, store,
 
 
 def test_a_manager_in_any_other_status_still_reaches_the_user(boot, store):
-    """The silence is bought by the `idle` status, not by the kind. A manager that FAILED
-    is a feature with no addressee left, which is exactly the thing the user has to
-    know."""
+    """The silence is bought by the `idle` status, not by the kind"""
     from jarvis.invariants import true_blockers
 
     daemon = boot(validation=True)
@@ -403,12 +322,11 @@ def test_a_manager_in_any_other_status_still_reaches_the_user(boot, store):
     assert true_blockers(store, store.get_work_order(manager["id"])) != []
 
 
-# -- 4b. what the record SAYS while it waits: §5 of docs/superpowers/specs/2026-10-12-a-
-# managers-by-design-idle-is-not-a-standstill.md, issue 1010's third complaint.
+# -- 4b. what the record SAYS while it waits: §5 of docs/superpowers/specs/2026-10-12-a
 
 
 def an_idle_manager(boot, store) -> tuple[str, dict, list[dict]]:
-    """A released feature whose manager is `idle` with both children outstanding."""
+    """A released feature whose manager is `idle` with both children outstanding"""
     daemon = boot(validation=True)
     fo_id = release(daemon, "CSV export", "one", "two")
     manager = store.manager_work_order(fo_id)
@@ -418,8 +336,7 @@ def an_idle_manager(boot, store) -> tuple[str, dict, list[dict]]:
 
 
 def test_an_idle_managers_label_names_the_children_it_waits_on(boot, store):
-    """A LABEL and not an obligation: "nothing is happening here" is only true of a
-    manager whose feature has finished with it, and the record names the children."""
+    """A LABEL and not an obligation: "nothing is happening here" is only true of a manager whose feature..."""
     fo_id, manager, children = an_idle_manager(boot, store)
 
     label = invariants.status_label(store, manager)
@@ -433,9 +350,7 @@ def test_an_idle_managers_label_names_the_children_it_waits_on(boot, store):
 
 
 def test_the_outstanding_child_label_raises_no_attention_flag(boot, store):
-    """DEVIATION 2, pinned: a `true_blockers` entry would make INV-ATTENTION-MISSING flag
-    EVERY manager in the fleet on every tick — issue 1010's one correct reading
-    (`needs_attention 0`) turned into a fleet-wide false positive."""
+    """DEVIATION 2, pinned: a `true_blockers` entry would make INV-ATTENTION-MISSING flag EVERY manager in..."""
     _fo_id, manager, _children = an_idle_manager(boot, store)
 
     assert invariants.true_blockers(store, manager) == []
@@ -445,8 +360,7 @@ def test_the_outstanding_child_label_raises_no_attention_flag(boot, store):
 
 @pytest.mark.usefixtures("self_dispatch_on")  # the stuck sweep ships off (os.autonomy)
 def test_the_sweeps_brief_names_the_child(boot, store):
-    """The sweep printed "nothing the record can name" over a record that named
-    wo-d2d777dc, and that string reached the investigator verbatim."""
+    """The sweep printed "nothing the record can name" over a record that named wo-d2d777dc"""
     _fo_id, manager, children = an_idle_manager(boot, store)
 
     row = next(r for r in ops.stuck_report("proj_a") if r["id"] == manager["id"])
@@ -454,12 +368,11 @@ def test_the_sweeps_brief_names_the_child(boot, store):
     assert children[0]["id"] in row["blocker"]
 
 
-# -- 5. the contract -------------------------------------------------------------------
+# -- 5. the contract
 
 
 def test_a_manager_is_told_the_feature_and_not_the_worker_contract(boot, store):
-    """It gets the feature's ask and its children, and none of the worker contract's
-    instructions to produce a change — paired with the worker's prompt, which has them."""
+    """It gets the feature's ask and its children"""
     daemon = boot(validation=True)
     spec = daemon.catalog.project("proj_a")
     fo_id = release(daemon, "CSV export", "one", "two")
@@ -474,25 +387,20 @@ def test_a_manager_is_told_the_feature_and_not_the_worker_contract(boot, store):
     for c in store.feature_children(fo_id):
         assert c["id"] in prompt
     assert "will not open a pull request" in prompt
-    # `--pr `, not "open a PR": the commit/PR prose rides in
-    # `git_briefing`/--append-system-prompt (kn-dfdab9f8), not the prompt positional.
+    # `--pr `, not "open a PR": the commit/PR prose rides in `git_briefing`/--append-system-prompt...
     assert "--pr " not in prompt
     assert f"jarvis wo finish {manager['id']}" not in prompt
     assert f"--parent {fo_id}" in prompt, "the one way it can file remediation work"
 
     worker_prompt = dispatch.build_worker_prompt(child, spec)
 
-    # Same substitution as above (kn-dfdab9f8).
+    # Same substitution as above (kn-dfdab9f8)
     assert "--pr " in worker_prompt
     assert f"jarvis wo finish {child['id']}" in worker_prompt
 
 
 def test_a_manager_gets_the_skills_and_neither_crew_nor_planning_seats(boot, project):
-    """`install_agent_assets` now names all three kinds, and a manager is none of them: it
-    gets the skills every session gets and no agent definitions at all. Pinned because it
-    is still a fall-through — a manager coordinates, it does not write the code, so the
-    worker crew (spec 2026-09-23-the-crew-a-worker-must-use.md §5) is not its to delegate
-    to, and nothing else in that function would notice if the branch moved."""
+    """`install_agent_assets` now names all three kinds"""
     boot(validation=True)
 
     manager_roots = bootstrap.install_agent_assets(project, "manager")
@@ -507,13 +415,11 @@ def test_a_manager_gets_the_skills_and_neither_crew_nor_planning_seats(boot, pro
     assert any("agent-seats" in str(r) for r in planner_roots)
 
 
-# -- 6. filing remediation work under the feature --------------------------------------
+# -- 6. filing remediation work under the feature
 
 
 def test_a_work_order_can_be_filed_under_an_open_feature(boot, store):
-    """What `--parent` buys, and it is the whole reason the manager's contract can be
-    carried out: a child the feature waits for and shows, not a stray work order beside
-    it. Paired with the same call without the flag, which is unchanged."""
+    """What `--parent` buys, and it is the whole reason the manager's contract can be carried out: a child..."""
     daemon = boot(validation=True)
     spec = daemon.catalog.project("proj_a")
     fo_id = release(daemon, "CSV export", "one")
@@ -538,13 +444,7 @@ def test_a_work_order_can_be_filed_under_an_open_feature(boot, store):
 
 
 def test_a_settled_feature_refuses_new_children(boot, store):
-    """Attaching a child to a completed feature would silently reopen a unit the user
-    has already been told about, and leave `settle_features` deciding what that means.
-
-    `feature_units=False` for the same reason as the completion test above: what is being
-    pinned is the refusal on a SETTLED feature, and the shortest honest way to a settled
-    one is the route that does not go through the panel.
-    """
+    """Attaching a child to a completed feature would silently reopen a unit the user has already been..."""
     daemon = boot(validation=True, feature_units=False)
     spec = daemon.catalog.project("proj_a")
     fo_id = release(daemon, "CSV export", "one")
@@ -558,9 +458,7 @@ def test_a_settled_feature_refuses_new_children(boot, store):
 
 
 def test_the_cli_carries_the_parent_flag_through(boot, store, capsys):
-    """The manager reaches this through the CLI, not through `ops`, so the wiring is
-    pinned end to end — a flag parsed and dropped would leave the contract naming a
-    command that silently does the wrong thing."""
+    """The manager reaches this through the CLI, not through `ops`, so the wiring is pinned end to end"""
     from jarvis import cli
 
     daemon = boot(validation=True)
@@ -576,31 +474,18 @@ def test_the_cli_carries_the_parent_flag_through(boot, store, capsys):
 
 
 def test_filing_under_an_unknown_feature_says_so(boot):
-    """The CLI only catches OpsError, so a typo'd id must not surface as a KeyError
-    traceback in the terminal."""
+    """The CLI only catches OpsError, so a typo'd id must not surface as a KeyError traceback in the..."""
     boot(validation=True)
 
     with pytest.raises(ops.OpsError, match="no feature order"):
         ops.create_work_order("proj_a", "orphan", description="x", parent_id="fo-nope")
 
 
-# -- 7. the bus finds it ---------------------------------------------------------------
+# -- 7. the bus finds it
 
 
 def test_an_envelope_to_the_manager_role_is_delivered_to_the_manager(boot, store):
-    """The first end-to-end proof that `bus.resolve` can find a real manager: nothing
-    created one until now, so the `to_role='manager'` half of the routing table had only
-    ever resolved to None.
-
-    The envelope is about a CHILD work order, which is the shape the validation loop
-    posts: the sender names a role and a subject and never learns who read it.
-
-    STOPS AT THE QUEUE, deliberately: what is under test here is `bus.resolve` finding
-    the manager, and the manager is left `running` because no settle pass is run. So this
-    proves nothing about waking one that is `idle` — see
-    `test_an_envelope_wakes_an_idle_manager_and_it_settles_back_to_idle` in §7, which
-    carries the same envelope the rest of the way through a real `daemon.tick`.
-    """
+    """The first end-to-end proof that `bus.resolve` can find a real manager: nothing created one until..."""
     daemon = boot(validation=True)
     spec = daemon.catalog.project("proj_a")
     fo_id = release(daemon, "CSV export", "one", "two")
@@ -628,17 +513,11 @@ def test_an_envelope_to_the_manager_role_is_delivered_to_the_manager(boot, store
     assert delivered["delivered_wo_id"] == manager["id"]
 
 
-# -- 6. `idle`: the status that says so (GitHub issue #264) ----------------------------
-#
-# docs/superpowers/specs/2026-09-16-an-idle-manager-is-not-waiting-on-you.md. Suppressing
-# the attention FLAG was never enough — six surfaces re-derive meaning from the status
-# alone — so these tests are about what each of them now says, not about the flag.
+# -- 6 (#264)
 
 
 def test_an_idle_manager_does_not_read_as_waiting_on_the_user(boot, store, settle_turns):
-    """The eleven hours in the issue were spent reading "Waiting on you" off a status,
-    with the flag already down. Paired with an ordinary `waiting_input` worker, which
-    must still read that way: `idle` has to buy accuracy, not silence."""
+    """The eleven hours in the issue were spent reading "Waiting on you" off a status"""
     from jarvis.timeline import STATUS_LABEL
     from jarvis.ui.app import FEATURED_STATUSES, STATUS_META
 
@@ -659,16 +538,13 @@ def test_an_idle_manager_does_not_read_as_waiting_on_the_user(boot, store, settl
     assert "idle" not in FEATURED_STATUSES, (
         "the dashboard's needs-me strip is for decisions somebody owes")
     assert "waiting on you" not in invariants.status_label(store, fresh).lower()
-    # The control, in the same test.
+    # The control, in the same test
     assert STATUS_LABEL["waiting_input"] == "Waiting on you"
 
 
 def test_resume_auto_names_the_idle_manager_instead_of_a_permission_prompt(
         boot, store, settle_turns):
-    """`waiting_on`'s fall-through called it an unanswered permission prompt — impossible
-    under `auto`, where nothing can prompt. And the nudge it offered bought one turn of
-    the manager saying nothing was needed, which is the loop the issue measured at 0.37
-    USD a lap: it must be refused, and no message may be queued."""
+    """`waiting_on`'s fall-through called it an unanswered permission prompt"""
     daemon = boot(validation=True)
     spec = daemon.catalog.project("proj_a")
     fo_id = release(daemon, "CSV export", "one")
@@ -692,10 +568,7 @@ def test_resume_auto_names_the_idle_manager_instead_of_a_permission_prompt(
 
 def test_a_manager_carried_over_in_waiting_input_is_migrated_on_the_first_tick(
         boot, store, settle_turns):
-    """Every manager alive when this release lands is parked in `waiting_input`, some of
-    them flagged. `settle_turns` is what migrates them, which is why `idle` is in its
-    sweep — and it must take the flag down itself: INV-ATTENTION-PHANTOM clears only
-    terminal rows, so a flag raised under the old status would outlive it for ever."""
+    """Every manager alive when this release lands is parked in `waiting_input`, some of them flagged"""
     daemon = boot(validation=True)
     spec = daemon.catalog.project("proj_a")
     fo_id = release(daemon, "CSV export", "one")
@@ -703,7 +576,7 @@ def test_a_manager_carried_over_in_waiting_input_is_migrated_on_the_first_tick(
     assert manager is not None
     daemon.tick()
     assert settle_turns(store), "the turns never ended"
-    # Exactly where 0.10.3 left it.
+    # Exactly where 0.10.3 left it
     store.set_status(manager["id"], "waiting_input")
     store.flag_attention(manager["id"], "worker is waiting on your input")
 
@@ -715,9 +588,7 @@ def test_a_manager_carried_over_in_waiting_input_is_migrated_on_the_first_tick(
 
 
 def test_a_manager_whose_question_neo_hands_back_still_reaches_the_user(boot, store):
-    """The bug the old `kind != 'manager'` carve-out was HIDING. A manager reaches
-    `waiting_input` only by asking, so the one case that exemption suppressed was the one
-    that most needed the user: Neo giving the question back."""
+    """The bug the old `kind != 'manager'` carve-out was HIDING"""
     from jarvis.neo_store import NeoStore
 
     daemon = boot(validation=True)
@@ -739,10 +610,7 @@ def test_a_manager_whose_question_neo_hands_back_still_reaches_the_user(boot, st
 
 def test_a_relaunched_manager_settles_back_to_idle(boot, store, settle_turns,
                                                    fake_claude, monkeypatch):
-    """`idle` is in RETRY_SWEEP_STATUSES because a manager's turn can be refused for the
-    usage limit, and a sweep that skipped it would strand the one work order a feature
-    routes everything through. The relaunch reads `running` while the turn is out — and
-    lands back in `idle`, not in `needs_review`."""
+    """`idle` is in RETRY_SWEEP_STATUSES because a manager's turn can be refused for the usage limit"""
     from jarvis import worker_session
 
     monkeypatch.setattr(worker_session, "RATE_LIMIT_MIN_DELAY", 0)
@@ -770,11 +638,7 @@ def test_a_relaunched_manager_settles_back_to_idle(boot, store, settle_turns,
 
 def test_a_message_rotting_on_an_idle_manager_still_reaches_the_user(project,
                                                                     monkeypatch):
-    """The one blocker `idle` may still derive, and the reason it is in
-    MESSAGE_STUCK_STATUSES at all. A feature routes everything through its manager,
-    so a message the manager will never see strands the feature silently — issue 43 one
-    level up. It inherited this coverage from `waiting_input`; moving the status without
-    moving the coverage would have dropped it."""
+    """The one blocker `idle` may still derive, and the reason it is in MESSAGE_STUCK_STATUSES at all"""
     from jarvis.invariants import MESSAGE_STUCK_BLOCKER, true_blockers
 
     store = ProjectStore(project)
@@ -782,7 +646,7 @@ def test_a_message_rotting_on_an_idle_manager_still_reaches_the_user(project,
         wo = store.create_work_order("manage the feature", kind="manager")
         store.set_status(wo["id"], "idle")  # no session_id: HOLD_NO_SESSION, unaccounted
         store.queue_message(wo["id"], "a child deferred something to you")
-        # Aged in the ROW, because `stuck_message` reads the clock itself.
+        # Aged in the ROW, because `stuck_message` reads the clock itself
         store.conn.execute("UPDATE wo_messages SET ts=ts-? WHERE wo_id=?",
                            (90 * 60, wo["id"]))
 
@@ -792,19 +656,11 @@ def test_a_message_rotting_on_an_idle_manager_still_reaches_the_user(project,
         store.close()
 
 
-# -- 7. what the migration must NOT touch ----------------------------------------------
-#
-# Review round 1. Since issue #264 the manager branch of `Daemon.settle_work_order` is a
-# REWRITE (`waiting_input` -> `idle`) plus an unflag, where it used to be a no-op for a
-# manager already parked. `waiting_input` is the only carrier of the fact that a manager
-# ASKED, so every test below poses a manager that asked, drives a REAL settle pass, and
-# asserts the status, the flag and the derived blocker all survive it. Hand-setting a
-# status and calling `true_blockers` directly — which §6's Neo test does — cannot catch a
-# settler that would have overwritten the status first, which is the point of these.
+# -- 7. what the migration must NOT touch
 
 
 def _manager_with_a_finished_turn(boot, store, settle_turns):
-    """A manager whose turn is DONE — the shape that reaches the branch under test."""
+    """A manager whose turn is DONE — the shape that reaches the branch under test"""
     daemon = boot(validation=True)
     spec = daemon.catalog.project("proj_a")
     fo_id = release(daemon, "CSV export", "one")
@@ -816,7 +672,7 @@ def _manager_with_a_finished_turn(boot, store, settle_turns):
 
 
 def _settled_idle(boot, store, settle_turns):
-    """A manager that has actually reached `idle` through the real settler."""
+    """A manager that has actually reached `idle` through the real settler"""
     daemon, spec, manager = _manager_with_a_finished_turn(boot, store, settle_turns)
     daemon.settle_turns(spec, store)
     assert store.get_work_order(manager["id"])["status"] == "idle", "the precondition"
@@ -825,27 +681,7 @@ def _settled_idle(boot, store, settle_turns):
 
 def test_an_envelope_wakes_an_idle_manager_and_it_settles_back_to_idle(boot, store,
                                                                       settle_turns):
-    """THE BEHAVIOUR THE MANAGER EXISTS FOR, end to end through a real `daemon.tick`.
-
-    Review round 2, and the gap it names is real: §5's
-    `test_an_envelope_to_the_manager_role_is_delivered_to_the_manager` stops at
-    `queued_messages` and never runs a delivery pass, and its manager is never settled,
-    so it is still `running` — it could not have caught a delivery path that keys off a
-    status tuple holding `waiting_input` and not `idle`. Nothing else did either: every
-    other test here poses a manager that is idle or that asked, and
-    `test_a_relaunched_manager_settles_back_to_idle` hand-builds its turn with
-    `store.create_turn`, which is the retry sweep's path and not delivery's.
-
-    Adding `idle` to MESSAGE_STUCK_STATUSES lets the OS report this path FAILING. This is
-    the other half: it succeeding. One tick routes the envelope AND delivers it — see the
-    ordering comment in `Daemon.tick` — so the assertions below are about the real
-    `deliver_envelopes` -> `deliver_messages` -> `worker_session.send` chain, with no
-    status filter anywhere in it that a manager could fall out of.
-
-    The FULL CYCLE is the point, not just the wake: idle -> message -> running -> idle. A
-    manager that woke once and then stuck in `running` would be the same silent stranding
-    one status further along.
-    """
+    """THE BEHAVIOUR THE MANAGER EXISTS FOR, end to end through a real `daemon.tick`"""
     daemon, spec, manager = _settled_idle(boot, store, settle_turns)
     before = store.latest_turn(manager["id"])["seq"]
     child = store.feature_children(manager["parent_id"])[0]
@@ -876,10 +712,7 @@ def test_an_envelope_wakes_an_idle_manager_and_it_settles_back_to_idle(boot, sto
 
 
 def test_a_user_message_wakes_an_idle_manager_too(boot, store, settle_turns):
-    """The other road in, and it is a different call: `ops.send_message` is what
-    `jarvis wo send` and the dashboard's box use, where the envelope above is what the
-    validation loop posts. Paired with it because they converge on `deliver_messages`
-    only if nothing between them filters on status."""
+    """The other road in, and it is a different call: `ops.send_message` is what `jarvis wo send` and the..."""
     daemon, spec, manager = _settled_idle(boot, store, settle_turns)
     before = store.latest_turn(manager["id"])["seq"]
 
@@ -896,13 +729,7 @@ def test_a_user_message_wakes_an_idle_manager_too(boot, store, settle_turns):
 
 def test_a_manager_parked_on_an_escalated_question_is_not_migrated(boot, store,
                                                                    settle_turns):
-    """Neo handed the question BACK, so the user owes an answer. A settle pass must not
-    relabel that "nothing to act on".
-
-    `neo_store.OPEN_Q_STATUSES` includes `escalated`, so `awaiting_neo` still answers for
-    it — asserted here rather than assumed, because that membership is the only thing
-    that makes this case reachable by the guard at all.
-    """
+    """Neo handed the question BACK, so the user owes an answer"""
     from jarvis.neo_store import NeoStore
 
     daemon, spec, manager = _manager_with_a_finished_turn(boot, store, settle_turns)
@@ -928,15 +755,7 @@ def test_a_manager_parked_on_an_escalated_question_is_not_migrated(boot, store,
 
 def test_a_manager_holding_an_unargued_gate_is_idle_not_waiting_on_you(boot, store,
                                                                        settle_turns):
-    """Fix 2 of docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md, and
-    the one deliberate behaviour change beyond the status itself.
-
-    A held request is the WORKER's move: nothing is owed by the user, and the manager's
-    feature is what wakes it. So the guard that holds a manager where it is reads
-    `user_facing_wait` — is somebody ELSE holding this — rather than `something_is_out`,
-    and a manager holding only an unargued gate falls through to `idle`, which is the
-    truthful label. The request itself is untouched and the command stays blocked.
-    """
+    """Fix 2 of docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md"""
     daemon, spec, manager = _manager_with_a_finished_turn(boot, store, settle_turns)
     store.set_status(manager["id"], "waiting_input")
     approval = store.add_approval(manager["id"], "pr_merge", "gh " + "pr merge 42",
@@ -955,8 +774,7 @@ def test_a_manager_holding_an_unargued_gate_is_idle_not_waiting_on_you(boot, sto
 
 def test_a_manager_parked_on_a_gate_under_review_is_not_migrated(boot, store,
                                                                  settle_turns):
-    """The other road, unchanged: a REVIEWER is holding a pending request, so the
-    manager really is waiting on somebody else and `waiting_input` is the truth."""
+    """The other road, unchanged: a REVIEWER is holding a pending request"""
     daemon, spec, manager = _manager_with_a_finished_turn(boot, store, settle_turns)
     store.set_status(manager["id"], "waiting_input")
     store.add_approval(manager["id"], "pr_merge", "gh " + "pr merge 42")
@@ -970,13 +788,7 @@ def test_a_manager_parked_on_a_gate_under_review_is_not_migrated(boot, store,
 def test_a_manager_parked_on_a_sign_in_keeps_its_status_and_its_flag(boot, store,
                                                                      settle_turns,
                                                                      signin):
-    """`_park_on_signin` raises AUTH_BLOCKER on a manager whose turn died on auth. The
-    settler must leave both alone — and, since the `kind != 'manager'` carve-out went,
-    `true_blockers` re-derives that blocker for a manager too, which it never did before.
-
-    The protection is `settle_work_order`'s early return on a FAILED turn, one branch
-    above everything §6 tests. Pinned here because nothing else pins it for a manager.
-    """
+    """`_park_on_signin` raises AUTH_BLOCKER on a manager whose turn died on auth"""
     daemon, spec, manager = _manager_with_a_finished_turn(boot, store, settle_turns)
     turn = store.create_turn(manager["id"], kind="message", prompt="a child reported")
     row = store.finish_turn(
@@ -994,10 +806,7 @@ def test_a_manager_parked_on_a_sign_in_keeps_its_status_and_its_flag(boot, store
 
 
 def test_the_migration_keeps_a_flag_that_survives_the_move(boot, store, settle_turns):
-    """The unflag is narrowed, not unconditional: it re-derives `true_blockers` against
-    the row AS IT NOW IS. A pending assumption is owed whatever the status, so it stays —
-    paired with §6's carried-over case, where the only blocker was the status itself and
-    the flag correctly goes down."""
+    """The unflag is narrowed, not unconditional: it re-derives `true_blockers` against the row AS IT NOW..."""
     daemon, spec, manager = _manager_with_a_finished_turn(boot, store, settle_turns)
     store.set_status(manager["id"], "waiting_input")
     store.add_assumption(manager["id"], "filed the third child as its own work order")
@@ -1011,16 +820,11 @@ def test_the_migration_keeps_a_flag_that_survives_the_move(boot, store, settle_t
     assert fresh["attention_reason"] == "1 assumption pending your review"
 
 
-# -- 7. the handoff never returns in silence -------------------------------------------
-#
-# docs/superpowers/specs/2026-10-07-a-settled-features-live-children-must-have-a-manager-or
-# -a-hold.md §(c). `_manager_handoff` tested `manager["status"] != "idle"` and returned, so
-# a feature reopened with a `completed` manager got neither the nudge nor
-# FEATURE_MANAGER_STALLED/SILENT. fo-ac00376e sat in `executing` for 5.4 days.
+# -- 7. the handoff never returns in silence
 
 
 def _judged(store: ProjectStore, fo_id: str) -> None:
-    """One settled round on the feature: the precondition the handoff is called under."""
+    """One settled round on the feature: the precondition the handoff is called under"""
     opened = store.open_validation_round(fo_id=fo_id, fingerprint="aaaa1111",
                                          summary="the exporter", evidence="pytest -q")
     store.close_validation_round(opened["id"], "rejected", "no test covers the branch")
@@ -1032,7 +836,7 @@ def _handoff_actions(store: ProjectStore, fo_id: str) -> list:
 
 
 def _ready_for_handoff(boot, store, *, validation: bool = True) -> tuple:
-    """An `executing` feature with a judged round and every live child `completed`."""
+    """An `executing` feature with a judged round and every live child `completed`"""
     daemon = boot(validation=validation)
     fo_id = release(daemon, "CSV export", "one")
     for child in store.feature_children(fo_id):
@@ -1042,8 +846,7 @@ def _ready_for_handoff(boot, store, *, validation: bool = True) -> tuple:
 
 
 def test_the_handoff_revives_a_settled_manager_instead_of_returning(boot, store):
-    """THE SILENT RETURN. A manager that is SETTLED has not "not finished reacting" — it
-    is gone, and the branch has to put one back before it can hand anything off."""
+    """THE SILENT RETURN"""
     daemon, spec, fo_id = _ready_for_handoff(boot, store)
     daemon._close_feature_manager(store, fo_id)
     assert store.manager_work_order(fo_id)["status"] == "completed"
@@ -1061,14 +864,7 @@ def test_the_handoff_revives_a_settled_manager_instead_of_returning(boot, store)
 
 
 def test_a_feature_with_no_manager_row_flags_once(boot, store):
-    """A manager carries the feature's whole conversation, so a fresh one would answer a
-    round of feedback briefed on nothing (spec, rejected alternative 6). Flagging names a
-    situation only the user can decide about.
-
-    THE DEDUPE RIDES ON `carrier_for_feature`, the general carrier rule, because this is
-    the one branch with no manager to hold the event: `ops.feature_event` returns False
-    for exactly this case. Not on the live `attention_reason`, which an ack NULLs — that
-    would re-notify on the very next tick, which is kn-089de524."""
+    """A manager carries the feature's whole conversation"""
     daemon, spec, fo_id = _ready_for_handoff(boot, store, validation=False)
     assert store.manager_work_order(fo_id) is None
     assert store.carrier_for_feature(fo_id) is not None, "the planner carries it"
@@ -1080,7 +876,7 @@ def test_a_feature_with_no_manager_row_flags_once(boot, store):
     assert fo["attention_reason"] == FEATURE_MANAGER_MISSING.format(fo_id=fo_id)
     assert store.manager_work_order(fo_id) is None, "flagged, never replaced"
 
-    # ...and the user acking it is not undone on the next tick.
+    # ...and the user acking it is not undone on the next tick
     store.clear_feature_attention(fo_id)
     for _ in range(2):
         daemon._manager_handoff(spec, store, store.get_feature_order(fo_id))
@@ -1089,9 +885,7 @@ def test_a_feature_with_no_manager_row_flags_once(boot, store):
 
 
 def test_a_running_manager_is_still_left_alone(boot, store):
-    """The control, and the behaviour that must not change: a manager that is running has
-    not finished reacting, so the branch returns exactly as it did — nothing posted,
-    nothing flagged, and no revival."""
+    """The control, and the behaviour that must not change: a manager that is running has not finished..."""
     daemon, spec, fo_id = _ready_for_handoff(boot, store)
     manager = store.manager_work_order(fo_id)
     store.set_status(manager["id"], "running")

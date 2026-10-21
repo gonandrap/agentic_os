@@ -1,10 +1,4 @@
-"""A dashboard failure has to be as visible to the OS as a daemon failure.
-
-The bug behind these tests: the work-order page 500'd, the traceback went to the systemd
-journal, and nothing else — not `jarvis status`, not `jarvis doctor`, not the inbox, not
-Telegram — knew anything had happened. The user's only signal was clicking a link and
-seeing "Internal Server Error". Each test below covers one surface that was blind.
-"""
+"""A dashboard failure has to be as visible to the OS as a daemon failure"""
 
 from __future__ import annotations
 
@@ -41,12 +35,10 @@ def _boom(msg: str = "kaboom") -> Exception:
         return e
 
 
-# -- the daemon tells the user ------------------------------------------------------
+# -- the daemon tells the user
 
 def test_daemon_raises_an_inbox_item_for_new_dashboard_errors(started, catalog_file):
-    """The daemon is what turns things the OS notices into things the user is told.
-    Nothing read `ui.log`, so a broken dashboard reached the user only if they happened
-    to be tailing a file."""
+    """The daemon is what turns things the OS notices into things the user is told"""
     d = Daemon(load_catalog(catalog_file))
     uilog.record_error("GET", "/wo/proj_a/wo-1", _boom("KeyError-ish"))
 
@@ -66,8 +58,7 @@ def test_daemon_raises_an_inbox_item_for_new_dashboard_errors(started, catalog_f
 
 def test_a_standing_dashboard_error_is_announced_once_not_every_tick(started,
                                                                     catalog_file):
-    """The daemon ticks every five seconds. Re-announcing the same failure each time
-    would bury the inbox — and Telegram — under one bug."""
+    """The daemon ticks every five seconds"""
     d = Daemon(load_catalog(catalog_file))
     uilog.record_error("GET", "/x", _boom())
 
@@ -104,12 +95,7 @@ def test_a_crash_loop_raises_one_item_not_hundreds(started, catalog_file):
 
 def test_the_first_tick_ever_does_not_alert_on_a_log_full_of_history(started,
                                                                     catalog_file):
-    """What 0.5.5 actually did to production. This watcher shipped a release after the
-    writer it reads, so the first tick met an existing `ui.log`, found no cursor in
-    `os_state`, resumed at byte 0 and sent the user a Telegram alert for four errors
-    that had been fixed for a week — a "the dashboard is broken" page about a dashboard
-    that was serving HTTP 200. Every fresh install walks into the same trap.
-    """
+    """What 0.5.5 actually did to production"""
     uilog.ui_log_path().parent.mkdir(parents=True, exist_ok=True)
     old = time.strftime(uilog._STAMP, time.localtime(time.time() - 7 * 24 * 3600))
     with uilog.ui_log_path().open("a") as f:
@@ -126,22 +112,20 @@ def test_the_first_tick_ever_does_not_alert_on_a_log_full_of_history(started,
     finally:
         central.close()
 
-    # And the cursor moved on, so a genuine error after it is still the next thing the
-    # user hears about — the history is skipped, not the file.
+    # And the cursor moved on, so a genuine error after it is still the next thing the user hears about
     uilog.record_error("GET", "/neo", _boom("a real, current failure"))
     assert d.check_ui_log() == 1
 
 
 def test_the_ui_watch_never_stalls_the_tick(started, catalog_file, monkeypatch):
-    """A tick that dies on the log watcher would stop dispatch, delivery and
-    reconciliation — the log watcher is the least important thing in it."""
+    """A tick that dies on the log watcher would stop dispatch, delivery and reconciliation"""
     d = Daemon(load_catalog(catalog_file))
     monkeypatch.setattr(uilog, "read_errors",
                         lambda *_: (_ for _ in ()).throw(OSError("disk gone")))
     d.tick()  # must not raise
 
 
-# -- `jarvis status` and `jarvis doctor` say so -------------------------------------
+# -- `jarvis status` and `jarvis doctor` say so
 
 def test_status_reports_dashboard_errors_and_asks_for_attention(started):
     quiet = ops.os_status()
@@ -168,28 +152,21 @@ def test_doctor_reports_dashboard_errors_at_the_os_level(started):
     assert res["violations"] >= 1
     assert [v["invariant"] for v in res["os"]] == ["INV-UI-HEALTHY"]
     assert "the page is down" in res["os"][0]["detail"]
-    # Not repairable: nothing here has a resolution derivable from state.
+    # Not repairable: nothing here has a resolution derivable from state
     assert not res["os"][0]["repaired"]
 
 
 def test_doctor_scoped_to_one_project_still_reports_the_dashboard(started):
-    """`--project` narrows which project's invariants run; the OS's own web UI is not
-    one of them, and filtering it out would hide the failure from the exact user who
-    scoped their check."""
+    """`--project` narrows which project's invariants run"""
     uilog.record_error("GET", "/", _boom("still broken"))
     assert ops.run_doctor(project="proj_a")["os"][0]["invariant"] == "INV-UI-HEALTHY"
 
 
-# -- the dashboard writes what the above reads --------------------------------------
+# -- the dashboard writes what the above reads
 
 def test_a_500_flows_all_the_way_from_the_browser_to_the_inbox(started, catalog_file,
                                                                monkeypatch):
-    """End to end, and the whole point of this work order: a user hits a broken page,
-    and without anyone tailing anything the OS ends up holding an inbox item about it.
-
-    `raise_server_exceptions=False` because Starlette re-raises after responding so the
-    server can log; a real browser still gets the page.
-    """
+    """End to end, and the whole point of this work order: a user hits a broken page"""
     client = TestClient(create_app(), follow_redirects=False,
                         raise_server_exceptions=False)
     real_os_status = ops.os_status
@@ -197,9 +174,7 @@ def test_a_500_flows_all_the_way_from_the_browser_to_the_inbox(started, catalog_
 
     assert client.get("/").status_code == 500
 
-    # Restore by hand, NOT monkeypatch.undo(): `undo` reverts *every* patch on the
-    # shared monkeypatch instance, including the JARVIS_HOME the `jarvis_home` fixture
-    # set — which points the rest of the test at the real fleet's state directory.
+    # Restore by hand, NOT monkeypatch.undo(): `undo` reverts *every* patch on the shared monkeypatch...
     monkeypatch.setattr(ops, "os_status", real_os_status)
     Daemon(load_catalog(catalog_file)).check_ui_log()
 
@@ -213,11 +188,10 @@ def test_a_500_flows_all_the_way_from_the_browser_to_the_inbox(started, catalog_
     assert ops.os_status()["ui"]["errors"] == 1
 
 
-# -- the access log -----------------------------------------------------------------
+# -- the access log
 
 def test_requests_land_in_the_access_log(started):
-    """"When I click on the link I get an internal server error" was impossible to
-    place in time because nothing recorded which links were followed."""
+    """"When I click on the link I get an internal server error" was impossible to place in time because..."""
     client = TestClient(create_app(), follow_redirects=False)
     client.get("/")
     client.get("/wo/proj_gone/wo-1")
@@ -229,8 +203,7 @@ def test_requests_land_in_the_access_log(started):
 
 def test_the_dashboards_own_refresh_poll_is_not_logged_unless_it_fails(started,
                                                                       monkeypatch):
-    """`/api/status` fires every 15s. Logged, it is ~95% of the file and buries the
-    user navigation the access log exists to show."""
+    """`/api/status` fires every 15s"""
     client = TestClient(create_app(), follow_redirects=False,
                         raise_server_exceptions=False)
     client.get("/api/status")
@@ -241,7 +214,7 @@ def test_the_dashboards_own_refresh_poll_is_not_logged_unless_it_fails(started,
     assert "[500] GET /api/status" in uilog.access_log_path().read_text()
 
 
-# -- time in each state (spec 2026-09-27-time-in-each-state §7) ----------------------
+# -- time in each state (spec 2026-09-27-time-in-each-state §7)
 
 @pytest.fixture()
 def browser(started):
@@ -249,7 +222,7 @@ def browser(started):
 
 
 def test_the_work_order_page_shows_time_in_state(browser, project):
-    """The fourth tab. Diagnostic, so it lives behind a tab and not above them."""
+    """The fourth tab"""
     store = ProjectStore(project)
     try:
         wo = store.create_work_order("ship the exporter")
@@ -264,15 +237,13 @@ def test_the_work_order_page_shows_time_in_state(browser, project):
     assert "tab-states" in page
     assert "Needs your review" in page              # a per-status row, labelled
     assert "Queued" in page                         # and the span it came from
-    # Two figures, labelled differently: equal numbers are the common case.
+    # Two figures, labelled differently: equal numbers are the common case
     assert "in this status" in page
     assert "nothing on the record for" in page
 
 
 def test_the_feature_page_labels_a_coarse_span_as_approximate(browser, project):
-    """The flag, on the surface: an unlabelled coarse span is the defect Neo's ruling
-    names. A feature that predates the table is reproduced by dropping its rows — the
-    next open of the store backfills the one approximate span."""
+    """The flag, on the surface: an unlabelled coarse span is the defect Neo's ruling names"""
     store = ProjectStore(project)
     try:
         fo = store.create_feature_order("CSV export", description="the whole ask")
@@ -287,10 +258,9 @@ def test_the_feature_page_labels_a_coarse_span_as_approximate(browser, project):
     assert "a feature order keeps no event trail" in page
 
 
-# -- a usage-limit hold on the page (spec 2026-09-30 §3) ----------------------------
+# -- a usage-limit hold on the page (spec 2026-09-30 §3)
 
-#: 5h24m in `running`, of which the order was let work 24m — figures deliberately away
-#: from a rounding edge, since the render happens a fraction of a second after `now`.
+#: 5h24m in `running`, of which the order was let work 24m
 HELD_WALL = 5 * 3600 + 24 * 60
 HELD_WORKED = 24 * 60
 
@@ -304,7 +274,7 @@ def _event_at(store: ProjectStore, wo_id: str, kind: str, ts: float,
 
 
 def _held_order(project, *, resumed: bool):
-    """Issue 887 on the page: 45m worked of 5h24m in `running`, the rest held."""
+    """Issue 887 on the page: 45m worked of 5h24m in `running`, the rest held"""
     from jarvis.worker_session import PAUSE_USAGE_LIMIT
 
     now = time.time()
@@ -335,7 +305,7 @@ def _held_order(project, *, resumed: bool):
 
 
 def test_a_status_never_held_renders_without_a_held_suffix(browser, project):
-    """The common case acquires no noise: no parenthesis, no `held`, no `wall`."""
+    """The common case acquires no noise: no parenthesis, no `held`, no `wall`"""
     store = ProjectStore(project)
     try:
         wo = store.create_work_order("ship the exporter")
@@ -356,7 +326,7 @@ def _text(page: str) -> str:
 
 
 def test_the_page_headlines_active_and_keeps_wall_beside_it(browser, project):
-    """`running 24m (5.0h held by a fleet usage limit, 5.4h wall)` — Neo 1130."""
+    """`running 24m (5.0h held by a fleet usage limit, 5.4h wall)` — Neo 1130"""
     wo = _held_order(project, resumed=True)
 
     page = browser.get(f"/wo/proj_a/{wo['id']}").text
@@ -368,7 +338,7 @@ def test_the_page_headlines_active_and_keeps_wall_beside_it(browser, project):
 
 
 def test_an_open_hold_reads_as_held_on_the_page(browser, project):
-    """While the hold is open the current-status line says HELD, not `in this status`."""
+    """While the hold is open the current-status line says HELD, not `in this status`"""
     wo = _held_order(project, resumed=False)
 
     page = browser.get(f"/wo/proj_a/{wo['id']}").text
@@ -378,7 +348,7 @@ def test_an_open_hold_reads_as_held_on_the_page(browser, project):
 
 
 def test_the_tab_badge_shows_active_not_wall(browser, project):
-    """A badge reading 5.4h on an order that was let work 24m is the issue's headline."""
+    """A badge reading 5.4h on an order that was let work 24m is the issue's headline"""
     wo = _held_order(project, resumed=False)
 
     page = browser.get(f"/wo/proj_a/{wo['id']}").text
@@ -387,14 +357,7 @@ def test_the_tab_badge_shows_active_not_wall(browser, project):
     assert '<span class="n">5.4h</span>' not in page
 
 
-# -- the wedge: the dashboard reports and heals it ----------------------------------
-#
-# docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md.
-# The measured shape: every page handler in `app.py` is a sync `def`, so one that never
-# returns saturates the single anyio threadpool for ever — anyio holds the token inside
-# `CancelScope(shield=True)`, so no timeout reclaims it and only a restart helps. These
-# tests reproduce that shape with a handler of their own; the CAUSE of the real one is
-# deliberately not reproduced, because it is not identified.
+# -- the wedge: the dashboard reports and heals it
 
 
 def _wedge_app(gate: threading.Event):
@@ -402,27 +365,27 @@ def _wedge_app(gate: threading.Event):
 
     @app.get("/_wedge")
     def wedge_handler():
-        """The holder. Its name is what the stack dump has to name."""
+        """The holder"""
         gate.wait()
         return {"ok": True}
 
     @app.get("/_sync_control")
     def sync_control():
-        """A SYNC route that does nothing — the control for `/healthz` being async."""
+        """A SYNC route that does nothing — the control for `/healthz` being async"""
         return {"ok": True}
 
     return app
 
 
 def _fast_probe(monkeypatch, **kw) -> None:
-    """The probe's knobs are catalog keys, so the test sets them through the resolver."""
+    """The probe's knobs are catalog keys, so the test sets them through the resolver"""
     cfg = UiHealthConfig(**{"probe_interval_seconds": 1, "probe_timeout_seconds": 1,
                             "trip_threshold": 2, **kw})
     monkeypatch.setattr(ops, "ui_health_config", lambda project=None: cfg)
 
 
 def _release_and_drain(gate, futs) -> None:
-    """Open the gate, then let every in-flight request finish before the client closes."""
+    """Open the gate, then let every in-flight request finish before the client closes"""
     gate.set()
     cf.wait(futs, timeout=30)
 
@@ -441,8 +404,7 @@ def _wait_until(predicate, timeout: float = 20.0) -> bool:
 
 
 def test_the_pool_can_be_saturated_deterministically(started, monkeypatch):
-    """The rig the next two tests stand on: every token borrowed by sync handlers that
-    never return. Capacity is READ from the limiter, never hardcoded at 40."""
+    """The rig the next two tests stand on: every token borrowed by sync handlers that never return"""
     _fast_probe(monkeypatch)
     gate = threading.Event()
     pool = cf.ThreadPoolExecutor(max_workers=64)
@@ -462,8 +424,7 @@ def test_the_pool_can_be_saturated_deterministically(started, monkeypatch):
 
 def test_healthz_answers_while_the_pool_is_wedged_and_a_sync_route_cannot(
         started, monkeypatch):
-    """The whole point of piece 1. The second half earns its keep: a SYNC route times
-    out in the same state, so this fails if anyone ever de-asyncs the endpoint."""
+    """The whole point of piece 1"""
     _fast_probe(monkeypatch)
     gate = threading.Event()
     pool = cf.ThreadPoolExecutor(max_workers=64)
@@ -499,8 +460,7 @@ def test_healthz_answers_while_the_pool_is_wedged_and_a_sync_route_cannot(
 
 
 def test_a_trip_dumps_every_threads_stack_and_stamps_the_wedge(started, monkeypatch):
-    """The assertion the whole work order exists for: a dump that does not name the
-    holder would leave the next occurrence as unexplained as this one."""
+    """The assertion the whole work order exists for: a dump that does not name the holder would leave the..."""
     _fast_probe(monkeypatch)
     gate = threading.Event()
     pool = cf.ThreadPoolExecutor(max_workers=64)
@@ -527,29 +487,23 @@ def test_a_trip_dumps_every_threads_stack_and_stamps_the_wedge(started, monkeypa
     assert "wedge_handler" in dump          # the holder, by name
     assert " in wait" in dump               # parked in threading.Event.wait
 
-    # kn-57fb4919: `[ERROR]` in ui.log is a parsed contract with three readers, and a
-    # wedge is not an unhandled exception.
+    # kn-57fb4919: `[ERROR]` in ui.log is a parsed contract with three readers
     ui_log = uilog.ui_log_path()
     assert "[ERROR]" not in (ui_log.read_text() if ui_log.exists() else "")
 
 
-# -- the detector is cause-independent (review round 1) -----------------------------
-#
-# The shipped probe only saw a SATURATED limiter. Production was not saturated — 11
-# threads against 40 tokens, a process-global lock held for ever (kn-5b1be5c3) — so
-# `_pool_ping` took a free token, returned at once, and `/healthz` said healthy while
-# every page hung. In-flight routed requests are tracked on the event loop instead.
+# -- the detector is cause-independent (review round 1)
 
 
 def test_a_wedge_that_never_saturates_the_pool_still_trips(started, monkeypatch):
-    """Issue #986's own shape: far fewer blocked handlers than tokens."""
+    """Issue #986's own shape: far fewer blocked handlers than tokens"""
     _fast_probe(monkeypatch, trip_threshold=1)
     lock = threading.Lock()
     app = create_app()
 
     @app.get("/_lockwait")
     def lock_waiter():
-        """The holder. Its name is what the stack dump has to name."""
+        """The holder"""
         with lock:
             return {"ok": True}
 
@@ -570,7 +524,7 @@ def test_a_wedge_that_never_saturates_the_pool_still_trips(started, monkeypatch)
                 assert body["probe_failure_reason"] == "inflight_stall"
                 assert body["inflight"] >= 1
                 assert body["oldest_inflight_seconds"] >= 1
-                # The discriminator: tokens were still free the whole time.
+                # The discriminator: tokens were still free the whole time
                 assert 11 < total
                 assert _limiter(client)["available"] > 0
                 assert _wait_until(lambda: uilog.read_wedge() is not None, timeout=15)
@@ -590,8 +544,7 @@ def _next_key(probe) -> int:
 
 
 def test_only_routed_requests_count_as_in_flight(started):
-    """A stream of 404s on unrouted paths must not read as a wedge: in the measured
-    fault they answered in 1ms while every routed page hung."""
+    """A stream of 404s on unrouted paths must not read as a wedge: in the measured fault they answered in..."""
     app = create_app()
     probe = app.state.pool_probe
     seen: dict = {}
@@ -621,13 +574,13 @@ def test_only_routed_requests_count_as_in_flight(started):
     assert client.get("/_raises").status_code == 500
     assert probe.oldest_inflight() is None     # cleared when it raised
 
-    # `/healthz` itself never counts, or the daemon's 5s poll would be the oldest entry.
+    # `/healthz` itself never counts, or the daemon's 5s poll would be the oldest entry
     client.get("/healthz")
     assert probe.oldest_inflight() is None
 
 
 def test_healthz_publishes_no_version_and_no_filesystem_path(started):
-    """`/healthz` is unauthenticated: it may not hand out a build version or a path."""
+    """`/healthz` is unauthenticated: it may not hand out a build version or a path"""
     body = TestClient(create_app()).get("/healthz").json()
 
     assert "version" not in body
@@ -637,11 +590,11 @@ def test_healthz_publishes_no_version_and_no_filesystem_path(started):
     assert str(uilog.stack_dump_path()) not in blob
 
 
-# -- the daemon detects it and heals it ---------------------------------------------
+# -- the daemon detects it and heals it
 
 
 class _FakeRunner:
-    """The `release_runner` seam, recording. No test touches real systemd."""
+    """The `release_runner` seam, recording"""
 
     def __init__(self) -> None:
         self.calls: list[tuple] = []
@@ -667,11 +620,7 @@ HEALTHY = {
 
 @pytest.fixture()
 def ui_unit(monkeypatch):
-    """`jarvis-ui.service` as systemd sees it — `active` unless a test says otherwise.
-
-    Patched in every test that can reach the check: the suite must never ask the real
-    user manager, where the machine's OWN dashboard may be running.
-    """
+    """`jarvis-ui.service` as systemd sees it — `active` unless a test says otherwise"""
     state = {"active": True}
     monkeypatch.setattr(systemd_units, "unit_active", lambda unit: state["active"])
     return state
@@ -679,7 +628,7 @@ def ui_unit(monkeypatch):
 
 @pytest.fixture()
 def wedged(started, catalog_file, monkeypatch, ui_unit):
-    """A daemon whose dashboard answers `/healthz` saying it is wedged."""
+    """A daemon whose dashboard answers `/healthz` saying it is wedged"""
     answers = [HEALTHY]
     monkeypatch.setattr(daemon_mod, "fetch_healthz",
                         lambda url, timeout: answers[0])
@@ -700,9 +649,7 @@ def _inbox() -> list[dict]:
 
 def test_a_dashboard_that_was_never_up_is_not_restarted(started, catalog_file,
                                                         monkeypatch, ui_unit):
-    """A connection failure with no healthy sighting ever is "nobody started the
-    dashboard", not a wedge — and a daemon that restarted jarvis-ui.service every tick
-    on a machine with no dashboard would be a worse defect than the one being fixed."""
+    """A connection failure with no healthy sighting ever is "nobody started the dashboard", not a wedge"""
     monkeypatch.setattr(daemon_mod, "fetch_healthz", lambda url, timeout: None)
     d = Daemon(load_catalog(catalog_file))
     d.release_runner = _FakeRunner()
@@ -724,7 +671,7 @@ def test_the_daemon_restarts_the_wedged_dashboard_once_inside_the_cooldown(wedge
     assert runner.calls == [("restart_unit", release.UI_UNIT),
                             ("restart_unit", release.UI_UNIT)]
 
-    # Every restart raises an inbox item naming the dump — no silent restarts, ever.
+    # Every restart raises an inbox item naming the dump — no silent restarts, ever
     items = _inbox()
     assert len(items) == 2
     assert "wedged" in items[0]["title"]
@@ -733,8 +680,7 @@ def test_the_daemon_restarts_the_wedged_dashboard_once_inside_the_cooldown(wedge
 
 
 def test_a_timeout_and_a_wedged_answer_are_the_same_verdict(wedged, monkeypatch):
-    """A wedged process answers nothing at all if the event loop went too, so a check
-    that only believed a 503 would miss the worse case."""
+    """A wedged process answers nothing at all if the event loop went too"""
     d, runner, _ = wedged
     monkeypatch.setattr(daemon_mod, "fetch_healthz", lambda url, timeout: None)
 
@@ -756,21 +702,17 @@ def test_the_daily_cap_stops_restarting_and_still_reaches_the_user(wedged):
     assert "3" in critical[0]["body"]        # the cap that is spent
     assert WEDGED["stack_dump"] in critical[0]["body"]
 
-    # It must not stop watching and must not fall silent — but one item per entry into
-    # the capped state, not one per tick.
+    # It must not stop watching and must not fall silent
     assert d.check_ui_health(now=t + 2400) == "capped"
     assert len([i for i in _inbox() if i["level"] == "critical"]) == 1
 
-    # …and restarting resumes once the 24h window rolls.
+    # …and restarting resumes once the 24h window rolls
     assert d.check_ui_health(now=t + 90000) == "restarted"
     assert len(runner.calls) == 4
 
 
 def test_a_deliberately_stopped_dashboard_is_not_a_wedge(wedged, ui_unit):
-    """`systemctl --user stop jarvis-ui` leaves the port refusing connections, which over
-    HTTP alone is indistinguishable from a dead event loop. The measured fault had the
-    unit `active (running)`; without that discriminator the OS would restart the
-    dashboard the user had just stopped, three times, and say so each time."""
+    """`systemctl --user stop jarvis-ui` leaves the port refusing connections"""
     d, runner, answers = wedged
     answers[0] = None                     # nothing is listening
     ui_unit["active"] = False
@@ -779,8 +721,7 @@ def test_a_deliberately_stopped_dashboard_is_not_a_wedge(wedged, ui_unit):
     assert runner.calls == []
     assert _inbox() == []
 
-    # The healthy sighting is left alone: the dashboard DID serve, and starting it again
-    # must not have to earn that back.
+    # The healthy sighting is left alone: the dashboard DID serve
     ui_unit["active"] = True
     answers[0] = WEDGED
     assert d.check_ui_health(now=1001.0) == "restarted"
@@ -788,9 +729,7 @@ def test_a_deliberately_stopped_dashboard_is_not_a_wedge(wedged, ui_unit):
 
 def test_a_failed_restart_says_so_once_and_still_spends_the_cooldown(wedged,
                                                                     monkeypatch):
-    """The other order — announce, then restart — claims a restart that never happened
-    and, with no timestamp written, leaves no cooldown: the next tick five seconds later
-    repeats the whole thing, one inbox item per tick."""
+    """The other order — announce, then restart"""
     d, runner, _ = wedged
 
     def boom(unit: str) -> None:
@@ -807,7 +746,7 @@ def test_a_failed_restart_says_so_once_and_still_spends_the_cooldown(wedged,
     assert "dbus: connection refused" in items[0]["body"]
     assert WEDGED["stack_dump"] in items[0]["body"]
 
-    # The attempt IS recorded, so the cooldown holds and nothing is said again.
+    # The attempt IS recorded, so the cooldown holds and nothing is said again
     assert d.check_ui_health(now=1010.0) == "cooldown"
     assert len(_inbox()) == 1
     assert len(runner.calls) == 1
@@ -827,15 +766,14 @@ def test_the_ui_health_check_is_off_when_the_catalog_says_so(started, catalog_fi
 
 def test_the_ui_health_check_never_stalls_the_tick(started, catalog_file, monkeypatch,
                                                    ui_unit):
-    """Same discipline as `check_ui_log`: the UI watch is the least important thing in
-    the tick."""
+    """Same discipline as `check_ui_log`: the UI watch is the least important thing in the tick"""
     monkeypatch.setattr(daemon_mod, "fetch_healthz",
                         lambda url, timeout: (_ for _ in ()).throw(OSError("no net")))
     Daemon(load_catalog(catalog_file)).tick()      # must not raise
 
 
 def test_doctor_reports_the_wedge_and_the_self_restarts(wedged):
-    """`jarvis doctor` reports, the daemon heals — the OS_INVARIANTS rule."""
+    """`jarvis doctor` reports, the daemon heals — the OS_INVARIANTS rule"""
     d, _, _ = wedged
     uilog.record_wedge(limiter=WEDGED["limiter"], uptime_seconds=14400.0,
                        version="0.10.0")
@@ -851,8 +789,7 @@ def test_doctor_reports_the_wedge_and_the_self_restarts(wedged):
 
 
 def test_doctor_stops_reporting_a_wedge_a_day_old(started):
-    """The restarted dashboard is a NEW process and never comes back to delete the
-    stamp, so a report that did not expire would say `wedged` for ever after one."""
+    """The restarted dashboard is a NEW process and never comes back to delete the stamp"""
     uilog.record_wedge(limiter=WEDGED["limiter"], uptime_seconds=1.0, version="0.10.0")
     stamp = uilog.read_wedge()
     old = time.time() - uilog.ERROR_WINDOW_SECONDS - 60

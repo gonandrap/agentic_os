@@ -1,11 +1,4 @@
-"""A repaired pull request goes back in the merge queue, and every line about it is true.
-
-GitHub issue #705: three compounding defects on one work order that had actually
-finished. The repair returned it to a status whose reason had evaporated mid-repair and
-nothing re-derived it (1); the attention line named assumptions nobody still owed a
-decision on and the invariant that owns that line declined to look (2); and the
-stale-finish check reported the OS's own repair turn as a worker that gave up (3).
-"""
+"""A repaired pull request goes back in the merge queue, and every line about it is true (#705)"""
 
 from __future__ import annotations
 
@@ -47,13 +40,7 @@ def conflicting(fake_gh):
 
 @pytest.fixture()
 def repaired(started, project, fake_gh, fake_claude, settle_turns):
-    """The live shape of wo-dd8668fa, up to the moment the conflict clears.
-
-    Finished behind a pull request with an assumption still pending, so it settles into
-    `needs_review`; nudged about a conflict from there; the user accepts the assumption
-    WHILE the repair turn is in flight; the worker ends its turn without finishing,
-    exactly as the nudge instructs.
-    """
+    """The live shape of wo-dd8668fa, up to the moment the conflict clears"""
     wo = ops.create_work_order("proj_a", "add feature X")
     started.tick()
     store = ProjectStore(project)
@@ -77,7 +64,7 @@ def repaired(started, project, fake_gh, fake_claude, settle_turns):
     return wo
 
 
-# -- (1) the status is re-derived when the episode closes ---------------------------
+# -- (1) the status is re-derived when the episode closes
 
 
 def test_the_repaired_order_goes_back_in_the_merge_queue(started, project, fake_gh,
@@ -97,8 +84,7 @@ def test_the_repaired_order_goes_back_in_the_merge_queue(started, project, fake_
 
 
 def test_the_timeline_says_the_os_did_it(started, project, fake_gh, repaired):
-    """"It fixed itself" has to be provable — and an unlabelled kind renders as its own
-    name beside a JSON blob and still looks fine on the page."""
+    """"It fixed itself" has to be provable"""
     store = ProjectStore(project)
     fake_gh.set_pr(PR, "OPEN")
     poll(started, store)
@@ -111,8 +97,7 @@ def test_the_timeline_says_the_os_did_it(started, project, fake_gh, repaired):
 
 
 def test_the_merge_then_ends_it_unattended(started, project, fake_gh, repaired):
-    """The point of defect 1: `waiting_pr_merge` is the only status auto-merge looks at,
-    so an order held out of it is out of the queue for ever."""
+    """The point of defect 1: `waiting_pr_merge` is the only status auto-merge looks at"""
     store = ProjectStore(project)
     fake_gh.set_pr(PR, "OPEN")
     poll(started, store)
@@ -125,8 +110,7 @@ def test_the_merge_then_ends_it_unattended(started, project, fake_gh, repaired):
 
 def test_a_still_pending_assumption_keeps_the_review(started, project, fake_gh,
                                                      repaired):
-    """The rule Neo question 275 set is untouched: only a reason that has GONE is
-    re-derived away."""
+    """The rule Neo question 275 set is untouched: only a reason that has GONE is re-derived away"""
     store = ProjectStore(project)
     ops.assume(repaired["id"], "and left the old exporter in place")
     fake_gh.set_pr(PR, "OPEN")
@@ -148,8 +132,7 @@ def test_a_closed_pull_request_is_never_re_queued(started, project, fake_gh, rep
 
 
 def test_an_order_no_repair_touched_is_left_alone(started, project, fake_gh):
-    """`repaired_since_finish` is the bound: without it this re-derives every
-    `needs_review` order holding a pull request."""
+    """`repaired_since_finish` is the bound: without it this re-derives every `needs_review` order holding..."""
     wo = ops.create_work_order("proj_a", "add feature X")
     ops.finish(wo["id"], "opened a PR", pr_url=PR)
     store = ProjectStore(project)
@@ -161,8 +144,7 @@ def test_an_order_no_repair_touched_is_left_alone(started, project, fake_gh):
 
 def test_the_invariant_reaches_an_order_already_stranded(started, project, fake_gh,
                                                          repaired):
-    """The orders the old code left behind — the episode is already closed, so no poll
-    will ever call `clear_pr_repair` on them again."""
+    """The orders the old code left behind"""
     store = ProjectStore(project)
     fake_gh.set_pr(PR, "OPEN")
     poll(started, store)
@@ -188,12 +170,11 @@ def test_the_invariant_is_quiet_once_it_has_settled(started, project, fake_gh,
     assert [v.invariant for v in check_project(store)] == []
 
 
-# -- (2) INV-ATTENTION-REASON is symmetrical ----------------------------------------
+# -- (2) INV-ATTENTION-REASON is symmetrical
 
 
 def test_a_decided_assumption_line_is_rewritten(started, project):
-    """The reverse direction, which used to be skipped by construction: the reason names
-    assumptions and the derived blocker does not."""
+    """The reverse direction, which used to be skipped by construction: the reason names assumptions and..."""
     wo = ops.create_work_order("proj_a", "add feature X")
     store = ProjectStore(project)
     store.set_status(wo["id"], "failed")
@@ -208,8 +189,7 @@ def test_a_decided_assumption_line_is_rewritten(started, project):
 
 
 def test_a_vaguer_but_true_assumption_line_is_left_alone(started, project):
-    """The XOR: `ops.assume`'s generic reason against a real pending decision is true,
-    and rewriting it would report a violation on every work order that files one."""
+    """The XOR: `ops.assume`'s generic reason against a real pending decision is true"""
     wo = ops.create_work_order("proj_a", "add feature X")
     ops.assume(wo["id"], "used tabs, not spaces")
     store = ProjectStore(project)
@@ -220,8 +200,7 @@ def test_a_vaguer_but_true_assumption_line_is_left_alone(started, project):
 
 
 def test_a_hook_reason_about_something_else_still_survives(started, project):
-    """The deliberate asymmetry that is NOT the bug: when neither the stored reason nor
-    the derived blocker is about assumptions, the specific one wins."""
+    """The deliberate asymmetry that is NOT the bug: when neither the stored reason nor the derived..."""
     wo = ops.create_work_order("proj_a", "add feature X")
     store = ProjectStore(project)
     store.set_status(wo["id"], "failed")
@@ -232,12 +211,11 @@ def test_a_hook_reason_about_something_else_still_survives(started, project):
         "needs permission to run `npm publish`"
 
 
-# -- (3) the OS does not punish a worker for obeying it -----------------------------
+# -- (3) the OS does not punish a worker for obeying it
 
 
 def test_a_repair_turn_is_not_a_worker_that_gave_up(started, project, repaired):
-    """`PR_CONFLICT_NUDGE` tells the worker in capitals not to call `jarvis wo finish`,
-    so a turn newer than the finish is the guaranteed outcome of the happy path."""
+    """`PR_CONFLICT_NUDGE` tells the worker in capitals not to call `jarvis wo finish`"""
     store = ProjectStore(project)
     row = store.get_work_order(repaired["id"])
     turn = store.latest_turn(repaired["id"])
@@ -253,7 +231,7 @@ def test_a_repair_turn_is_not_a_worker_that_gave_up(started, project, repaired):
 
 def test_a_turn_the_user_started_is_still_judged(started, project, repaired,
                                                  fake_claude, settle_turns):
-    """The exemption is about who opened the turn, not about the work order."""
+    """The exemption is about who opened the turn, not about the work order"""
     store = ProjectStore(project)
     ops.send_message(repaired["id"], "have another look at the exporter")
     started.tick_count = 1
@@ -271,9 +249,7 @@ def test_a_turn_the_user_started_is_still_judged(started, project, repaired,
 
 def test_a_nudge_batched_behind_a_users_message_reads_as_the_users(
         started, project, fake_gh, repaired, fake_claude, settle_turns):
-    """`Daemon._deliver` stamps only the FIRST message of a batch, and that is right:
-    the turn carried an instruction the OS did not write, so it is judged and it cannot
-    lift the merge hold."""
+    """`Daemon._deliver` stamps only the FIRST message of a batch"""
     store = ProjectStore(project)
     fake_gh.set_pr(PR, "OPEN")
     started.tick_count = 0                      # a tick that polls: clears the episode
@@ -307,24 +283,21 @@ def test_a_dispatch_turn_reports_no_source(started, project):
 
 def test_the_repair_sources_are_the_ones_the_nudge_writes(started, project, fake_gh,
                                                           repaired):
-    """The constant `parked_reason` reads and the one `nudge_pr_repair` writes cannot
-    drift: both derive from the repair names."""
+    """The constant `parked_reason` reads and the one `nudge_pr_repair` writes cannot drift: both derive..."""
     assert invariants.PR_REPAIR_SOURCES == tuple(r.source for r in ops.PR_REPAIRS)
 
 
 def test_every_repair_has_a_give_up_blocker_to_surface_it():
-    """A repair in one tuple and not the other derives a give-up nothing can say — the
-    asymmetry the comment at invariants.py:275-286 records as already costing a work
-    order."""
+    """A repair in one tuple and not the other derives a give-up nothing can say"""
     assert (tuple(r.name for r in ops.PR_REPAIRS)
             == tuple(n for n, _ in invariants.PR_REPAIR_BLOCKERS))
 
 
-# -- all three together -------------------------------------------------------------
+# -- all three together
 
 
 def test_the_user_is_asked_for_nothing_at_all(started, project, fake_gh, repaired):
-    """What the issue is actually about: the order is done, and the OS says so."""
+    """What the issue is actually about: the order is done, and the OS says so"""
     store = ProjectStore(project)
     fake_gh.set_pr(PR, "OPEN")
     poll(started, store)
@@ -339,15 +312,12 @@ def test_the_user_is_asked_for_nothing_at_all(started, project, fake_gh, repaire
     assert ops.os_status()["attention"] == []
 
 
-# -- the merge hold is only ever lifted by the repair that caused it -----------------
+# -- the merge hold is only ever lifted by the repair that caused it
 
 
 def test_a_later_user_turn_keeps_the_review(started, project, fake_gh, repaired,
                                             fake_claude, settle_turns):
-    """The bound `repaired_since_finish` does NOT give: it says an episode closed after
-    the finish, never that the episode is why the order is in `needs_review` NOW. A turn
-    the user opened that ends without `jarvis wo finish` is its own hold, and lifting it
-    would merge unattended."""
+    """The bound `repaired_since_finish` does NOT give: it says an episode closed after the finish"""
     store = ProjectStore(project)
     fake_gh.set_pr(PR, "OPEN")
     started.tick_count = 0                      # a tick that polls: clears the episode
@@ -369,15 +339,13 @@ def test_a_later_user_turn_keeps_the_review(started, project, fake_gh, repaired,
     poll(started, store)
 
     assert store.get_work_order(repaired["id"])["status"] == "needs_review"
-    # One, from the first poll — the order is not put back in the merge queue a second
-    # time, so nothing auto-merges it while the user's instruction is unanswered.
+    # One, from the first poll — the order is not put back in the merge queue a second time
     assert len(store.events_of_kind(repaired["id"], "pr_repair_resettled")) == 1
 
 
 def test_an_escalated_gate_keeps_it_out_of_the_merge_queue(started, project, fake_gh,
                                                            repaired):
-    """A gate Neo handed to the user is a blocker at any status, so it is derived on the
-    row the move WOULD produce, before anything is written."""
+    """A gate Neo handed to the user is a blocker at any status"""
     store = ProjectStore(project)
     approval = store.add_approval(repaired["id"], "release", "scripts/deploy.sh 0.5.4")
     store.mark_approval_escalated(approval["id"], "no justification was filed")
@@ -403,8 +371,7 @@ def test_a_panel_that_gave_up_keeps_the_review(started, project, fake_gh, repair
 
 def test_a_repair_does_not_resettle_over_a_give_up_hidden_by_a_later_round(
         started, project, fake_gh, repaired):
-    """ops.py:7120 must not fail open on a row that judged nothing. Spec
-    docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md §A."""
+    """ops.py:7120 must not fail open on a row that judged nothing (docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md §A.)"""
     store = ProjectStore(project)
     rnd = store.open_validation_round(wo_id=repaired["id"], fingerprint="abc")
     store.close_validation_round(rnd["id"], "escalated", reason="three rounds, no deal")
@@ -420,7 +387,7 @@ def test_a_repair_does_not_resettle_over_a_give_up_hidden_by_a_later_round(
 
 
 def test_unlanded_work_keeps_the_review(started, project, fake_gh, repaired):
-    """`ops.park_unlanded`'s episode: code on nothing but its own branch."""
+    """`ops.park_unlanded`'s episode: code on nothing but its own branch"""
     store = ProjectStore(project)
     store.add_event(repaired["id"], "work_unlanded", {"was": "needs_review"})
     fake_gh.set_pr(PR, "OPEN")
@@ -431,7 +398,7 @@ def test_unlanded_work_keeps_the_review(started, project, fake_gh, repaired):
 
 
 def test_a_queued_message_holds_the_resettle(started, project, fake_gh, repaired):
-    """Something is already on its way to the worker; the turn it opens decides."""
+    """Something is already on its way to the worker; the turn it opens decides"""
     store = ProjectStore(project)
     ops.send_message(repaired["id"], "one more thing")
     fake_gh.set_pr(PR, "OPEN")
@@ -443,7 +410,7 @@ def test_a_queued_message_holds_the_resettle(started, project, fake_gh, repaired
 
 def test_the_other_repairs_open_episode_holds_the_resettle(started, project, fake_gh,
                                                            repaired):
-    """Two repairs run independently, and an open one owns the status while it is."""
+    """Two repairs run independently, and an open one owns the status while it is"""
     store = ProjectStore(project)
     checks = next(r for r in ops.PR_REPAIRS if r.name == "checks")
     store.add_event(repaired["id"], checks.event("nudged"),
@@ -454,20 +421,19 @@ def test_the_other_repairs_open_episode_holds_the_resettle(started, project, fak
     assert store.get_work_order(repaired["id"])["status"] == "needs_review"
 
 
-# -- every repair nudge obeys the targeted-tests ruling (kn-356c724b) ----------------
+# -- every repair nudge obeys the targeted-tests ruling (kn-356c724b)
 
 
 @pytest.mark.parametrize("repair", ops.PR_REPAIRS, ids=lambda r: r.name)
 def test_every_repair_nudge_asks_for_targeted_tests_only(repair):
-    """A repair turn's nudge is often the last instruction in its context, so it cannot
-    contradict the dispatch brief by asking for the full suite."""
+    """A repair turn's nudge is often the last instruction in its context"""
     assert ops.TARGETED_TESTS_LINE in repair.template
     assert "run this project's tests" not in repair.template
 
 
 @pytest.mark.parametrize("repair", ops.PR_REPAIRS, ids=lambda r: r.name)
 def test_every_repair_nudge_still_renders(started, project, repaired, repair):
-    """Baking the line in must not leave an unresolved placeholder in any template."""
+    """Baking the line in must not leave an unresolved placeholder in any template"""
     store = ProjectStore(project)
     supplied = {"url", "attempt", "max_attempts"}
     fields = {name: f"<{name}>"
@@ -483,11 +449,7 @@ def test_every_repair_nudge_still_renders(started, project, repaired, repair):
     assert ops.TARGETED_TESTS_LINE in msg
 
 
-# -- an undeclared delivery heals itself --------------------------------------------
-#
-# docs/superpowers/specs/2026-10-07-an-undeclared-delivery-must-heal-itself.md: §2c of
-# the stale-blockers spec shipped a detector and no actor, so the order sat in
-# `needs_review` for ever holding an unjudged head. The poll is the actor.
+# -- an undeclared delivery heals itself
 
 JUDGED = "1" * 40
 PUSHED = "9" * 40
@@ -503,7 +465,7 @@ GREEN_CHECKS = [check("unit (3.11)", "SUCCESS"), check("evals", "SUCCESS")]
 
 
 def delivered(store, wo_id: str) -> list[dict]:
-    """Pretend the daemon delivered whatever is queued, and hand it back."""
+    """Pretend the daemon delivered whatever is queued, and hand it back"""
     msgs = store.queued_messages(wo_id)
     for m in msgs:
         store.mark_message(m["id"], "delivered")
@@ -512,13 +474,7 @@ def delivered(store, wo_id: str) -> list[dict]:
 
 @pytest.fixture()
 def undeclared(started, project, fake_gh):
-    """wo-f812739c's shape: judged, refused, then commits nobody declared.
-
-    Built on the store rather than on a worker's turn for the reason
-    `tests/test_pr_checks.py`'s `parked` is: the poll's inputs are the refusal, the
-    judged head, the session and the status, and a real rework turn adds a settle to
-    every assertion without adding an input.
-    """
+    """wo-f812739c's shape: judged, refused, then commits nobody declared"""
     wo = ops.create_work_order("proj_a", "add feature X")
     ops.finish(wo["id"], "opened a PR", pr_url=PR)
     store = ProjectStore(project)
@@ -533,7 +489,7 @@ def undeclared(started, project, fake_gh):
 
 
 def enable_validation(catalog_file, daemon) -> None:
-    """Turn the panel on in the catalog FILE, which is what `ops.finish` reads."""
+    """Turn the panel on in the catalog FILE, which is what `ops.finish` reads"""
     data = json.loads(catalog_file.read_text())
     data["os"]["validation"] = {"enabled": True}
     catalog_file.write_text(json.dumps(data))
@@ -542,8 +498,7 @@ def enable_validation(catalog_file, daemon) -> None:
 
 def test_an_undeclared_delivery_is_nudged_on_the_first_poll(started, project, fake_gh,
                                                             undeclared):
-    """THE defect: the detector was true and nothing acted. The push the poll SEES this
-    tick is the one it nudges about — the overlay, not the stale `wo` row."""
+    """THE defect: the detector was true and nothing acted"""
     store = ProjectStore(project)
 
     poll(started, store)
@@ -560,8 +515,7 @@ def test_an_undeclared_delivery_is_nudged_on_the_first_poll(started, project, fa
 
 def test_three_attempts_then_the_undeclared_delivery_asks_the_user(started, project,
                                                                    fake_gh, undeclared):
-    """Same cap and same give-up as the other two repairs, and the blocker is the one
-    `true_blockers` can re-derive."""
+    """Same cap and same give-up as the other two repairs"""
     store = ProjectStore(project)
 
     for n in range(invariants.PR_REPAIR_MAX_ATTEMPTS):
@@ -586,8 +540,7 @@ def test_three_attempts_then_the_undeclared_delivery_asks_the_user(started, proj
 
 
 def test_the_declaration_clears_the_episode(started, project, fake_gh, undeclared):
-    """Validation off (the shipped state): the finish parks it in the merge queue and the
-    next poll closes the episode, so no origin snapshot is left to replay."""
+    """Validation off (the shipped state): the finish parks it in the merge queue and the next poll closes..."""
     store = ProjectStore(project)
     poll(started, store)
     delivered(store, undeclared["id"])
@@ -606,9 +559,7 @@ def test_the_declaration_clears_the_episode(started, project, fake_gh, undeclare
 
 def test_the_declared_round_is_not_clobbered_by_the_episode(started, project, fake_gh,
                                                             undeclared, catalog_file):
-    """Validation on: the finish opens a round over the NEW head and the order parks
-    `validating` — a status this block is deliberately not bounded to, so the episode's
-    `was=needs_review` can never replace the open round (spec §2.5 step 7)."""
+    """Validation on: the finish opens a round over the NEW head and the order parks `validating`"""
     store = ProjectStore(project)
     poll(started, store)
     delivered(store, undeclared["id"])
@@ -625,9 +576,7 @@ def test_the_declared_round_is_not_clobbered_by_the_episode(started, project, fa
 
 def test_a_red_pull_request_is_nudged_about_the_build_first(started, project, fake_gh,
                                                             undeclared):
-    """One message per tick, and the right one: a worker asked to declare a head CI is
-    about to reject would declare the wrong commit. Bought by `heal_pull_request`'s
-    queued-message guard, not by an `elif` (spec §2.3)."""
+    """One message per tick, and the right one: a worker asked to declare a head CI is about to reject..."""
     store = ProjectStore(project)
     fake_gh.set_pr(PR, "OPEN", head_oid=PUSHED, checks=RED_CHECKS)
 
