@@ -11933,17 +11933,31 @@ def _pending_why(store: ProjectStore, wo: dict[str, Any],
     return f"`Daemon.dispatch_pending` owns this row and its turn is later: {delay}"
 
 
+#: ONE expression of one rule, registered under EVERY open status: `gates.sweep_unargued` has no status filter and filing an `awaiting_case` request does not park the row, so a held request outlives it (wo-715db5af, Neo 1987)
+REVIEWS_GATE = _Pass(
+    "Daemon._neo_drain",
+    "a privileged-action request is open and the user does not hold it. "
+    "`pass_name` holds one string and the predicate is the OR of two passes: "
+    "`Daemon._neo_drain` settles a pending non-escalated approval, and "
+    "`Daemon.abandon_unargued_gates` (via `gates.sweep_unargued`) closes a "
+    "held `awaiting_case` one on a timer (Neo 1570). Neither filters on status, and "
+    "filing an `awaiting_case` request does not park the row, so the request outlives "
+    "whatever status it was filed under",
+    "daemon.reviews_gate", reviews_gate)
+
 #: Keyed in `OPEN_STATUSES` order
 SCHEDULED_ACTORS: dict[str, ActorPasses] = {
     "pending": ActorPasses((
         _Pass("Daemon.dispatch_pending", _pending_why,
               "project_store.claim_sql_selects", claim_sql_selects),
+        REVIEWS_GATE,
     )),
     "dispatching": ActorPasses((
         _Pass("Daemon.settle_turns",
               "the claim is inside its grace or a turn is already on record, so the "
               "settler will move this row",
               "daemon.settles_turn", settles_turn),
+        REVIEWS_GATE,
     )),
     "running": ActorPasses((
         _Pass("Daemon.settle_turns",
@@ -11957,6 +11971,7 @@ SCHEDULED_ACTORS: dict[str, ActorPasses] = {
         _Pass("Daemon.deliver_messages",
               "a queued message is deliverable, so it goes out as the next turn",
               "daemon.delivers_message", delivers_message),
+        REVIEWS_GATE,
     )),
     "idle": ActorPasses((
         _Pass("Daemon.deliver_envelopes",
@@ -11965,6 +11980,7 @@ SCHEDULED_ACTORS: dict[str, ActorPasses] = {
               "including `bus.ChildrenLanded` from `Daemon.settle_features` via "
               "`ops.revive_feature_manager`",
               "ops.manager_awaiting_feature", manager_awaiting_feature),
+        REVIEWS_GATE,
     )),
     "waiting_input": ActorPasses((
         _Pass("Daemon.retry_paused_turns",
@@ -11976,13 +11992,7 @@ SCHEDULED_ACTORS: dict[str, ActorPasses] = {
         _Pass("Daemon._neo_drain",
               "Neo still holds the question this order is parked on",
               "daemon.answers_question", answers_question),
-        _Pass("Daemon._neo_drain",
-              "a privileged-action request is open and the user does not hold it. "
-              "`pass_name` holds one string and the predicate is the OR of two passes: "
-              "`Daemon._neo_drain` settles a pending non-escalated approval, and "
-              "`Daemon.abandon_unargued_gates` (via `gates.sweep_unargued`) closes a "
-              "held `awaiting_case` one on a timer (Neo 1570)",
-              "daemon.reviews_gate", reviews_gate),
+        REVIEWS_GATE,
     )),
     "validating": ActorPasses((
         _Pass("Daemon.validation_tick",
@@ -11993,11 +12003,12 @@ SCHEDULED_ACTORS: dict[str, ActorPasses] = {
               "the row carries a routing pull request, so the poll asks GitHub what "
               "became of it",
               "daemon.polls_pull_request", polls_pull_request),
+        REVIEWS_GATE,
     )),
     # The USER is the actor: `true_blockers`' four-way triage always yields a line for a governed order
-    "needs_review": ActorPasses(none_because=(
-        "no daemon pass — the user reviews it, and `invariants.true_blockers` is what "
-        "puts it in front of them")),
+    "needs_review": ActorPasses((REVIEWS_GATE,), none_because=(
+        "no daemon pass of its own — the user reviews it, and "
+        "`invariants.true_blockers` is what puts it in front of them")),
     "waiting_pr_merge": ActorPasses((
         # wo-d3a70c29: the poll still SELECTS a stalled row (`polls_pull_request` is untouched)
         _Pass("Daemon.poll_pull_requests",
@@ -12006,9 +12017,10 @@ SCHEDULED_ACTORS: dict[str, ActorPasses] = {
               "asks what became of it and some branch of it can move the row",
               "daemon.polls_and_can_act_on_pull_request",
               polls_and_can_act_on_pull_request),
+        REVIEWS_GATE,
     )),
     # Deliberately none: `project_store.NOT_RETRIED` excludes it and `Daemon.settle_work_order` returns...
-    "budget_exhausted": ActorPasses(none_because=(
+    "budget_exhausted": ActorPasses((REVIEWS_GATE,), none_because=(
         "no daemon pass, by design — the actor is the user via "
         "`ops.set_work_order_budget`, because raising the budget resumes the order")),
 }
