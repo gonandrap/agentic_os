@@ -1,4 +1,4 @@
-"""A notification raised WITH an attention flag is one incident: acking either settles both (io-d2a5dd69)"""
+"""A notification raised WITH an attention flag is one incident: acking either settles both..."""
 
 from __future__ import annotations
 
