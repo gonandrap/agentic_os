@@ -123,6 +123,10 @@ def test_every_core_command_string_parses():
     assert len(cmds) >= 5, "the core stopped teaching its commands inline"
     for cmd in cmds:
         tokens = [re.sub(r"<[^>]*>", "x", t) or "x" for t in shlex.split(cmd)][1:]
+        # Prose names a verb without its arguments ("a second `jarvis wo assume`");
+        # what this test guards is typo'd flags, not a bare mention
+        if all(t.isalpha() for t in tokens):
+            continue
         try:
             parser.parse_args(tokens)
         except SystemExit:
@@ -185,7 +189,7 @@ def test_contract_section_contains_everything_the_old_contract_had():
         "REBUILDING",
         "jarvis wo assume wo-brief01",
         "should be RARE",
-        "a call you made with NO doubt",
+        "ONE DECISION you made with NO doubt",
         "Record EVERY such call, including the small and obvious ones",
         "only audit trail",
         # Deferred work reached the backlog by the worker filing it itself until `jarvis wo defer` routed it...

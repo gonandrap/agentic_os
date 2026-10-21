@@ -1934,6 +1934,80 @@ def test_only_the_assumption_being_ruled_on_contributes_citations():
     assert "Q905" not in out
 
 
+#: Spec §4a: a sibling reference is keyword-anchored, and a bare `#n` matches nothing
+def test_a_cited_sibling_assumption_renders_with_its_ruling():
+    """Test 5"""
+    sibling = assumption(id=9, n=3, status="approved", decided_by="user",
+                         decided_reason="CSV is what the exporter already writes",
+                         content="wrote the header row")
+    cites = assumption(id=10, n=4, content="Per assumption #3, quoted every field")
+    out = record(siblings=[sibling, cites], ruling_on=cites)
+
+    assert "#3" in out
+    assert "wrote the header row" in out
+    assert "approved" in out
+    assert "by the user" in out
+    assert "CSV is what the exporter already writes" in out
+
+
+def test_several_siblings_cited_in_one_phrase_all_resolve():
+    first = assumption(id=9, n=2, content="wrote the header row")
+    second = assumption(id=11, n=3, content="quoted every field")
+    cites = assumption(id=10, n=4, content="Per assumptions 2 and 3, kept the shim")
+    out = record(siblings=[first, second, cites], ruling_on=cites)
+
+    assert "wrote the header row" in out and "quoted every field" in out
+
+
+def test_a_cited_high_stakes_sibling_is_still_withheld():
+    """Test 5's second half: citing a sibling does not lift the withholding net"""
+    sibling = assumption(id=9, n=3, status="pending",
+                         content="deleted the production database dump")
+    cites = assumption(id=10, n=4, content="Per assumption #3, kept the shim")
+    out = record(siblings=[sibling, cites], ruling_on=cites)
+
+    assert "production database dump" not in out
+    assert "withheld" in out
+
+
+def test_a_bare_number_in_the_text_cites_nothing():
+    """Test 7: `issue #832` and `PR #1090` are not references"""
+    sibling = assumption(id=9, n=2, content="wrote the header row")
+    cites = assumption(id=10, n=4, content="Followed issue #832 and PR #2, per #2")
+    out = record(siblings=[sibling, cites], ruling_on=cites)
+
+    assert "wrote the header row" not in out
+
+
+def test_the_scanner_is_keyword_anchored_for_both_kinds():
+    assert autoreview.cited_question_ids("per Q887 and neo question 888") == [887, 888]
+    assert autoreview.cited_question_ids("issue #832 and PR #1090") == []
+    assert autoreview.cited_sibling_ns("per assumption #2") == [2]
+    assert autoreview.cited_sibling_ns("per assumptions 2 and 3") == [2, 3]
+    assert autoreview.cited_sibling_ns("issue #832") == []
+
+
+def test_the_resolved_refs_on_the_ask_path_are_bounded_by_the_record_cap():
+    """Test 4's bound: `validation.decision_record_chars`, one resolver for both verbs"""
+    short = autoreview.cited_context(FakeNeo(qrow(id=887, answer="keep the shim")),
+                                     "wo-1", "Per Q887, and the footer?", [])
+    assert "Q887" in short and "keep the shim" in short
+
+    tight = autoreview.cited_context(
+        FakeNeo(qrow(id=887, answer="y" * 9000)), "wo-1", "Per Q887, and the footer?",
+        [], cfg=ValidationConfig(decision_record_chars=500))
+    assert "y" * 9000 not in tight
+    assert len(tight) < 1200
+
+
+def test_an_assumption_already_stored_over_the_cap_still_reviews():
+    """Test 9: the caps are write-time only — no length check in `autoreview`"""
+    stored = assumption(content="z" * 4000)
+    out = autoreview._ruling_question("p", WO, stored, [stored])   # noqa: SLF001
+
+    assert "z" * 4000 in out
+
+
 def test_a_cited_question_on_another_work_order_is_named_and_not_quoted():
     """Content from a different order has not been through this order's evidence gates"""
     cites = assumption(content="as Q887 decided")

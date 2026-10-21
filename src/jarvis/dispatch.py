@@ -151,8 +151,11 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         "JARVIS_DOC_READ_LIMIT_LINES": str(project.worker.doc_read_limit_lines),
         # The `jarvis wo finish --summary` word cap the PreToolUse hook enforces (spec 2026-09-19 SS5.3)
         "JARVIS_SUMMARY_MAX_WORDS": str(project.concision.summary_max_words),
-        # The character cap on a `jarvis wo send` / `wo assume` body
+        # The character cap on a `jarvis wo send` body
         concision.MESSAGE_CAP_ENV: str(project.concision.message_max_chars),
+        # The per-kind caps the hook refuses an over-cap assumption or question at (docs/superpowers/specs/2026-10-21-questions-to-neo-are-atomic.md §3)
+        concision.ASSUME_CAP_ENV: str(project.concision.assume_max_chars),
+        concision.QUESTION_CAP_ENV: str(project.concision.question_max_chars),
         # The standing worker instructions
         concision.STANDING_PROMPT_ENV: (wo.get("append_system_prompt")
                                         or project.worker.append_system_prompt or ""),
@@ -429,6 +432,7 @@ def _common_briefing(parts: list[str], wo: dict[str, Any], project: ProjectSpec,
 def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
                     knowledge: KnowledgeBrief | None = None) -> str:
     """The briefing for a feature order's planner"""
+    from . import worker_brief
     from .plans import CHILD_CAP, MAX_DESCRIPTION_CHARS, MIN_DESCRIPTION_CHARS
 
     fo_id = wo.get("parent_id") or "?"
@@ -598,11 +602,8 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"document by section in-text (e.g. `from section 3 of design doc "
         f"\"docs/superpowers/specs/feature.md\": …`), never by pasting it; the referenced section "
         f"is delivered to whoever answers automatically.",
-        f"- `jarvis wo assume {wo['id']} \"...\"` for a call you made with NO doubt. "
-        f"Record every one, including the small ones. Cite a spec BY SECTION in-text, "
-        f"the same shape (e.g. `from section 3 of design doc "
-        f"\"docs/superpowers/specs/feature.md\": …`), never by pasting it and never by "
-        f"naming a whole document.",
+        worker_brief.assume_shape(wo["id"],
+                                  tail=" Record every one, including the small ones."),
         f"- Work only inside your worktree (you start in it).",
         f"- File deferred work instead of leaving notes: `jarvis backlog add "
         f"{project.name} \"...\"` — including anything you decided was OUT of this "
@@ -669,7 +670,7 @@ def _analyst_prompt(wo: dict[str, Any], project: ProjectSpec,
                     knowledge: KnowledgeBrief | None = None,
                     feature: dict[str, Any] | None = None) -> str:
     """The briefing for an improvement order's analyst (docs/superpowers/specs/2026-09-23-improvement-orders.md)"""
-    from . import db
+    from . import db, worker_brief
     from .ops import EVIDENCE_REFS_KEY  # lazy: ops imports dispatch
 
     io_id = wo.get("parent_id") or "?"
@@ -782,11 +783,8 @@ def _analyst_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"- **Neo is your first responder. Any doubt goes to it.** `jarvis wo ask "
         f"{wo['id']} \"<your question>\"`, then END YOUR TURN; the answer arrives as your "
         f"next user turn, usually within a minute. The trigger is DOUBT, not importance.",
-        f"- `jarvis wo assume {wo['id']} \"...\"` for a call you made with NO doubt. "
-        f"Record every one, including the small ones. Cite a spec BY SECTION in-text "
-        f"(e.g. `from section 3 of design doc "
-        f"\"docs/superpowers/specs/feature.md\": …`), never by pasting it and never by "
-        f"naming a whole document.",
+        worker_brief.assume_shape(wo["id"],
+                                  tail=" Record every one, including the small ones."),
         "- Work only inside your worktree (you start in it).",
         *([f"- READ the OS knowledge base before you diagnose — it is indexed at the end "
            f"of this prompt, not pasted into it: `jarvis learn search \"<term>\" "
@@ -814,7 +812,7 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
                          knowledge: KnowledgeBrief | None = None,
                          feature: dict[str, Any] | None = None) -> str:
     """The briefing for an investigation order's investigator (docs/superpowers/specs/2026-09-27-investigation-orders.md)"""
-    from . import db, gaps, verdicts
+    from . import db, gaps, verdicts, worker_brief
     from .ops import SUBJECT_KEY  # lazy: ops imports dispatch
 
     inv_id = wo.get("parent_id") or "?"
@@ -954,8 +952,8 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "are faster than grep.",
         "Writes — EXACTLY four, and nothing else is permitted:",
         f"- `jarvis wo ask {wo['id']} \"<question>\"`",
-        f"- `jarvis wo assume {wo['id']} \"<call you made with no doubt, citing any "
-        f"spec by section in-text>\"`",
+        f"- `jarvis wo assume {wo['id']} \"<ONE decision you made with no doubt, citing "
+        f"any spec by section in-text>\"`",
         f"- `jarvis learn add \"...\" --project {project.name}`",
         f"- `jarvis investigate verdict {inv_id} --from-file verdict.json`",
         "**`jarvis bug report` and `jarvis issues start` are refused for this kind**, and "
@@ -970,11 +968,8 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"- **Neo is your first responder. Any doubt goes to it.** `jarvis wo ask "
         f"{wo['id']} \"<your question>\"`, then END YOUR TURN; the answer arrives as your "
         f"next user turn, usually within a minute. The trigger is DOUBT, not importance.",
-        f"- `jarvis wo assume {wo['id']} \"...\"` for a call you made with NO doubt. "
-        f"Record every one, including the small ones. Cite a spec BY SECTION in-text "
-        f"(e.g. `from section 3 of design doc "
-        f"\"docs/superpowers/specs/feature.md\": …`), never by pasting it and never by "
-        f"naming a whole document.",
+        worker_brief.assume_shape(wo["id"],
+                                  tail=" Record every one, including the small ones."),
         "- Work only inside your worktree (you start in it).",
         *([f"- READ the OS knowledge base before you diagnose — it is indexed at the end "
            f"of this prompt, not pasted into it: `jarvis learn search \"<term>\" "
@@ -1000,6 +995,8 @@ def _manager_prompt(wo: dict[str, Any], project: ProjectSpec,
                     knowledge: KnowledgeBrief | None = None,
                     feature: dict[str, Any] | None = None) -> str:
     """The briefing for a feature order's project manager"""
+    from . import worker_brief
+
     fo = (feature or {}).get("fo") or {}
     children = (feature or {}).get("children") or []
     fo_id = wo.get("parent_id") or "?"
@@ -1078,11 +1075,9 @@ def _manager_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"{wo['id']} \"<your question>\"`, then END YOUR TURN; the answer arrives as your "
         f"next user turn. The trigger is DOUBT, not importance. A question is one "
         f"paragraph: the decision, the options, your recommendation.",
-        f"- `jarvis wo assume {wo['id']} \"...\"` for a call you made with NO doubt. "
-        f"Record every one: this work order's record is the only account anyone gets of "
-        f"why the feature changed shape. Cite a spec BY SECTION in-text (e.g. `from "
-        f"section 3 of design doc \"docs/superpowers/specs/feature.md\": …`), never by "
-        f"pasting it and never by naming a whole document.",
+        worker_brief.assume_shape(
+            wo["id"], tail=" Record every one: this work order's record is the only "
+                           "account anyone gets of why the feature changed shape."),
         "- Do not run `jarvis wo finish` and do not open a pull request. Neither applies "
         "to you.",
         f"- Read what the fleet already knows before you decide anything: `jarvis learn "

@@ -423,6 +423,144 @@ def test_an_assumption_with_no_reference_at_all_is_recorded_as_before(dispatched
     assert (row["spec_path"], row["spec_which"], row["spec_text"]) == (None, None, None)
 
 
+# -- one decision per record (docs/superpowers/specs/2026-10-21-questions-to-neo-are-atomic.md) --
+
+
+def test_an_over_cap_assumption_is_refused_and_told_to_split(dispatched, project):
+    """Test 1: nothing recorded — no row, no ASSUMPTIONS.md append"""
+    daemon, wo = dispatched
+
+    with pytest.raises(ops.OpsError, match="split") as caught:
+        ops.assume(wo["id"], "z" * 1200)
+
+    msg = str(caught.value)
+    assert "1200 characters" in msg and "1000" in msg
+    assert "jarvis wo assume" in msg
+    _nothing_recorded(project, wo["id"])
+
+
+def test_an_over_cap_question_is_refused_with_the_split_and_reference_hint(dispatched,
+                                                                          project):
+    """Test 2"""
+    daemon, wo = dispatched
+
+    with pytest.raises(ops.OpsError, match="split") as caught:
+        ops.ask_question(wo["id"], "z" * 2500)
+
+    msg = str(caught.value)
+    assert "2500 characters" in msg and "2000" in msg
+    assert "Q" in msg
+    _nothing_recorded(project, wo["id"])
+
+
+def test_a_project_override_of_each_cap_is_honoured_and_zero_switches_it_off(
+        dispatched, project, catalog_file):
+    """Test 3: the ops-side check reads the project's own `concision` block"""
+    import json
+
+    daemon, wo = dispatched
+    document = json.loads(catalog_file.read_text())
+    document["projects"][0]["concision"] = {"assume_max_chars": 200,
+                                            "question_max_chars": 300}
+    catalog_file.write_text(json.dumps(document))
+
+    with pytest.raises(ops.OpsError, match="the cap is 200"):
+        ops.assume(wo["id"], "z" * 250)
+    with pytest.raises(ops.OpsError, match="the cap is 300"):
+        ops.ask_question(wo["id"], "z" * 350)
+
+    document["projects"][0]["concision"] = {"assume_max_chars": 0,
+                                            "question_max_chars": 0}
+    catalog_file.write_text(json.dumps(document))
+
+    ops.assume(wo["id"], "z" * 2500)
+    ops.ask_question(wo["id"], "z" * 2500)
+
+
+# -- in-text references, keyword-anchored (spec §4) -----------------------------------
+
+
+def _asked(wo_id: str, question: str) -> int:
+    """One question on this order, left unanswered"""
+    return ops.ask_question(wo_id, question)["question_id"]
+
+
+def _answer(qid: int, answer: str = "the user said: keep the shim") -> None:
+    neo = NeoStore()
+    try:
+        neo.record_answer(qid, answer, answered_by="user")
+    finally:
+        neo.close()
+
+
+def test_a_cited_earlier_question_reaches_neo_on_the_ask_path(dispatched, project):
+    """Test 4, `ask` half: `jarvis wo ask` resolved no reference at all before this"""
+    daemon, wo = dispatched
+    qid = _asked(wo["id"], "CSV or JSON by default?")
+    _answer(qid)
+
+    ops.ask_question(wo["id"], f"Per Q{qid}, should the header be written too?")
+
+    neo = NeoStore()
+    try:
+        context = neo.get(qid + 1)["context"]
+    finally:
+        neo.close()
+    assert f"Q{qid}" in context
+    assert "the user said: keep the shim" in context
+
+
+def test_an_unknown_or_foreign_reference_is_refused_in_both_verbs(dispatched, project):
+    """Test 6: nothing recorded in either verb"""
+    daemon, wo = dispatched
+    other = ops.create_work_order("proj_a", "another order")
+    daemon.tick()
+    foreign = _asked(other["id"], "what encoding?")
+
+    for verb in _both_verbs(wo["id"]):
+        with pytest.raises(ops.OpsError, match="no such question"):
+            verb("Per Q4242, kept the shim.")
+        with pytest.raises(ops.OpsError, match="another work order"):
+            verb(f"Per Q{foreign}, kept the shim.")
+        with pytest.raises(ops.OpsError, match="no assumption #7"):
+            verb("Per assumption #7, kept the shim.")
+    _nothing_recorded(project, wo["id"])
+
+
+def test_an_issue_or_pr_number_in_the_body_is_not_a_reference(dispatched, project):
+    """Test 7: a BARE `#n` matches nothing, or every body naming an issue would be refused"""
+    daemon, wo = dispatched
+
+    for verb in _both_verbs(wo["id"]):
+        verb("Followed issue #832 and PR #1090, and #7 of the checklist.")
+
+
+def test_a_question_asked_on_this_order_but_unanswered_is_accepted(dispatched, project):
+    """Test 8"""
+    daemon, wo = dispatched
+    qid = _asked(wo["id"], "CSV or JSON by default?")
+
+    ops.assume(wo["id"], f"Per Q{qid}, wrote the header.")
+    ops.ask_question(wo["id"], f"Per Q{qid}, should the footer go too?")
+
+    neo = NeoStore()
+    try:
+        context = neo.get(qid + 1)["context"]
+    finally:
+        neo.close()
+    assert "asked on this order, not answered" in context
+
+
+def test_a_cited_sibling_assumption_is_accepted_on_both_verbs(dispatched, project):
+    """Test 5's write half: the sibling is order-scoped, so `#2` resolves off this order"""
+    daemon, wo = dispatched
+    ops.assume(wo["id"], "wrote the header")
+    ops.assume(wo["id"], "and quoted every field")
+
+    for verb in _both_verbs(wo["id"]):
+        verb("Per assumptions 1 and 2, the exporter stays as it is.")
+
+
 # -- ONE TOTAL budget over every cited section (spec invariant 1 on the `ask` path) ----
 
 

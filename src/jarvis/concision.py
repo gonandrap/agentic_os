@@ -6,9 +6,6 @@ import os
 import re
 import shlex
 
-#: The cap on a question argument
-from .sections import QUESTION_MAX_CHARS as QUESTION_MAX_CHARS
-
 #: Words allowed in `jarvis wo finish --summary` before the PreToolUse hook refuses it
 DEFAULT_SUMMARY_MAX_WORDS = 120
 
@@ -92,29 +89,55 @@ def finish_summary(command: str) -> str | None:
     return None
 
 
-#: Characters allowed in a `jarvis wo send` / `wo assume` body before the PreToolUse hook refuses it
+#: Characters allowed in a `jarvis wo send` body before the PreToolUse hook refuses it
 DEFAULT_MESSAGE_MAX_CHARS = 6000
+
+#: Characters allowed in a `jarvis wo assume` body — ONE decision fits in them (docs/superpowers/specs/2026-10-21-questions-to-neo-are-atomic.md §1)
+DEFAULT_ASSUME_MAX_CHARS = 1000
+
+#: Characters allowed in a question argument; `sections.QUESTION_MAX_CHARS` re-exports it (docs/superpowers/specs/2026-10-21-questions-to-neo-are-atomic.md §1)
+DEFAULT_QUESTION_MAX_CHARS = 2000
+
+#: The name `ops`, `sections` and the tests read the question cap by
+QUESTION_MAX_CHARS = DEFAULT_QUESTION_MAX_CHARS
 
 #: Set per work order by `dispatch._write_worker_settings` from the catalog's...
 MESSAGE_CAP_ENV = "JARVIS_MESSAGE_MAX_CHARS"
+ASSUME_CAP_ENV = "JARVIS_ASSUME_MAX_CHARS"
+QUESTION_CAP_ENV = "JARVIS_QUESTION_MAX_CHARS"
+
+
+def _char_cap(env: dict[str, str] | None, name: str, default: int) -> int:
+    """One character cap off the environment: anything unusable gives the default"""
+    raw = (env if env is not None else os.environ).get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value >= 0 else default
 
 
 def message_cap(env: dict[str, str] | None = None) -> int:
     """The character cap on a message argument, or 0 when the check is off"""
-    raw = (env if env is not None else os.environ).get(MESSAGE_CAP_ENV)
-    if raw is None or raw == "":
-        return DEFAULT_MESSAGE_MAX_CHARS
-    try:
-        value = int(raw)
-    except ValueError:
-        return DEFAULT_MESSAGE_MAX_CHARS
-    return value if value >= 0 else DEFAULT_MESSAGE_MAX_CHARS
+    return _char_cap(env, MESSAGE_CAP_ENV, DEFAULT_MESSAGE_MAX_CHARS)
+
+
+def assume_cap(env: dict[str, str] | None = None) -> int:
+    """The character cap on a `wo assume` body, or 0 when the check is off"""
+    return _char_cap(env, ASSUME_CAP_ENV, DEFAULT_ASSUME_MAX_CHARS)
+
+
+def question_cap(env: dict[str, str] | None = None) -> int:
+    """The character cap on a question argument, or 0 when the check is off"""
+    return _char_cap(env, QUESTION_CAP_ENV, DEFAULT_QUESTION_MAX_CHARS)
 
 
 #: The `jarvis` subcommands whose text argument is capped
 _CAPPED: dict[tuple[str, str], str] = {
     ("wo", "send"): "message",
-    ("wo", "assume"): "message",
+    ("wo", "assume"): "assume",
     ("wo", "ask"): "question",
     ("neo", "ask"): "question",
 }

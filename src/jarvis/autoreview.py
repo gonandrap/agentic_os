@@ -26,6 +26,11 @@ QUESTION_KIND = "assumption"
 _CITED_QUESTION_RE = re.compile(
     r"\b(?:neo\s+question|question|neo|q)\s*#?\s*(\d{1,6})\b", re.IGNORECASE)
 
+#: A SIBLING assumption the text names. Keyword-anchored, because a bare `#n` must match
+#: NOTHING: bodies routinely carry `issue #832` and `PR #1090` (spec §4a).
+_CITED_SIBLING_RE = re.compile(r"\bassumptions?\b", re.IGNORECASE)
+_CITED_SIBLING_TAIL_RE = re.compile(r"\s*(?:,|and)?\s*#?\s*(\d{1,6})\b", re.IGNORECASE)
+
 #: How many cited ids one packet quotes
 _CITED_LIMIT = 5
 
@@ -750,13 +755,22 @@ high-stakes | no-learning-applies | evidence-insufficient>"
 """
 
 
-def sibling_line(s: dict[str, Any]) -> str:
+def sibling_line(s: dict[str, Any], *, cited: bool = False) -> str:
     """One sibling assumption as CONTEXT, with the high-stakes net applied to it too"""
     content = str(s.get("content") or "")
+    marker = " (cited by the text)" if cited else ""
     if high_stakes_marker(content):
-        return (f"  #{s['n']} [{s['status']}] (withheld — high-stakes, and the user's "
-                f"alone to decide)")
-    return f"  #{s['n']} [{s['status']}] {content[:200]}"
+        return (f"  #{s['n']}{marker} [{s['status']}] (withheld — high-stakes, and the "
+                f"user's alone to decide)")
+    return f"  #{s['n']}{marker} [{s['status']}] {content[:200]}"
+
+
+def _cited_sibling_item(s: dict[str, Any]) -> str:
+    """One CITED sibling: its text and its ruling, netted exactly as an uncited one (spec §4a)"""
+    item = _netted(f"#{s.get('n')} (cited by the text)",
+                   sibling_line(s, cited=True), (str(s.get("content") or ""),))
+    ruling = _user_ruling_item(s)
+    return f"{item}\n{ruling}" if ruling else item
 
 
 def decision_record(store: Any, neo: Any, wo_id: str, siblings: list[dict[str, Any]],
@@ -773,16 +787,19 @@ def decision_record(store: Any, neo: Any, wo_id: str, siblings: list[dict[str, A
             if s.get(column):
                 n_by_question[int(s[column])] = s.get("n")
 
-    cited_ids = _cited_question_ids(assumption)
+    content = str((assumption or {}).get("content") or "")
+    cited_ids = cited_question_ids(content)
+    cited_ns = set(cited_sibling_ns(content))
     by_id = {int(q["id"]): q for q in answered}
     # Cited FIRST and exempt from the cap: it is the single item most likely to be why this packet exists...
-    head = [_cited_item(neo, wo_id, qid, by_id.get(qid), n_by_question)
-            for qid in cited_ids]
+    head = cited_lines(neo, wo_id, content, siblings, by_id=by_id,
+                       n_by_question=n_by_question)
 
     items = [_question_item(q, n_by_question) for q in answered
              if int(q["id"]) not in cited_ids]
     items += [_message_item(m) for m in (store.user_messages(wo_id) or [])]
-    items += [line for s in siblings if (line := _user_ruling_item(s))]
+    items += [line for s in siblings
+              if s.get("n") not in cited_ns and (line := _user_ruling_item(s))]
 
     kept, dropped, spent = [], 0, 0
     for item in items:
@@ -805,14 +822,79 @@ def decision_record(store: Any, neo: Any, wo_id: str, siblings: list[dict[str, A
     return "\n".join(lines)
 
 
-def _cited_question_ids(assumption: dict[str, Any] | None) -> list[int]:
-    """Question ids the ASSUMPTION BEING RULED ON names, deduplicated, capped"""
+def cited_question_ids(text: str) -> list[int]:
+    """Question ids this text names, deduplicated, capped"""
     found: list[int] = []
-    for match in _CITED_QUESTION_RE.finditer(str((assumption or {}).get("content") or "")):
+    for match in _CITED_QUESTION_RE.finditer(text or ""):
         qid = int(match.group(1))
         if qid not in found:
             found.append(qid)
     return found[:_CITED_LIMIT]
+
+
+def cited_sibling_ns(text: str) -> list[int]:
+    """Sibling assumption numbers this text names: `assumption #2`, `assumptions 2 and 3` (spec §4a)"""
+    found: list[int] = []
+    for match in _CITED_SIBLING_RE.finditer(text or ""):
+        at = match.end()
+        while (tail := _CITED_SIBLING_TAIL_RE.match(text, at)) is not None:
+            n = int(tail.group(1))
+            if n not in found:
+                found.append(n)
+            at = tail.end()
+    return found[:_CITED_LIMIT]
+
+
+def cited_ref_problem(neo: Any, wo_id: str, text: str,
+                      siblings: list[dict[str, Any]]) -> str:
+    """Why an in-text reference cannot resolve, or `''` (spec §4c).
+
+    A question asked on THIS order and not yet answered is NOT a problem: it has a
+    rendering of its own. Sibling `n` is order-scoped, so "foreign" is a question-id case.
+    """
+    for qid in cited_question_ids(text):
+        row = neo.get(qid)
+        if row is None:
+            return f"question {qid} is cited, but there is no such question"
+        if str(row.get("wo_id") or "") != wo_id:
+            return (f"question {qid} is cited, but it belongs to another work order — "
+                    f"cite a question asked on this one")
+    numbers = {int(s["n"]) for s in siblings if s.get("n") is not None}
+    for n in cited_sibling_ns(text):
+        if n not in numbers:
+            return f"this order has no assumption #{n}"
+    return ""
+
+
+def cited_lines(neo: Any, wo_id: str, text: str, siblings: list[dict[str, Any]], *,
+                by_id: dict[int, dict[str, Any]] | None = None,
+                n_by_question: dict[int, Any] | None = None) -> list[str]:
+    """Every in-text reference in `text`, resolved and rendered — ONE resolver, both verbs"""
+    answered = by_id or {}
+    by_n = {int(s["n"]): s for s in siblings if s.get("n") is not None}
+    lines = [_cited_item(neo, wo_id, qid, answered.get(qid), n_by_question or {})
+             for qid in cited_question_ids(text)]
+    lines += [_cited_sibling_item(by_n[n]) for n in cited_sibling_ns(text)
+              if n in by_n]
+    return lines
+
+
+def cited_context(neo: Any, wo_id: str, text: str, siblings: list[dict[str, Any]], *,
+                  cfg: Any = None) -> str:
+    """The `jarvis wo ask` half of §4b: the same refs, bounded by `decision_record_chars`"""
+    chars = _record_chars(cfg)
+    kept, spent, dropped = [], 0, 0
+    for item in cited_lines(neo, wo_id, text, siblings):
+        if spent + len(item) + 1 > chars:
+            dropped += 1
+            continue
+        kept.append(item)
+        spent += len(item) + 1
+    if dropped:
+        # An omission stated, and LAST (kn-1485b845)
+        kept.append(f"  (… {dropped} cited item{'' if dropped == 1 else 's'} omitted — "
+                    f"the record is capped at {chars} characters)")
+    return "\n".join(kept)
 
 
 def _cited_item(neo: Any, wo_id: str, qid: int, answered: dict[str, Any] | None,

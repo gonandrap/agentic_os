@@ -341,14 +341,25 @@ def payload_reference_decision(payload: dict[str, Any],
             f"saw it, so the flood is paid for whatever the cap downstream then says.\n"
             f"  - {_INSTEAD}"
         )
-    cap = concision.message_cap(env)
+    # One cap per kind (docs/superpowers/specs/2026-10-21-questions-to-neo-are-atomic.md §3)
+    caps = {"message": concision.message_cap(env),
+            "assume": concision.assume_cap(env),
+            "question": concision.question_cap(env)}
     for subcommand, kind, text in concision.jarvis_payload_args(command):
-        limit = cap if kind == "message" else concision.QUESTION_MAX_CHARS
+        limit = caps.get(kind, 0)
         if not limit or len(text) <= limit:
             continue
+        split = ("\n  - SPLIT it: ONE decision per `jarvis wo assume` — the option "
+                 "taken, the strongest alternative rejected and why. A second "
+                 "decision is a second `jarvis wo assume`; cite the first in it "
+                 "by its `#n`."
+                 if kind == "assume" else
+                 "\n  - SPLIT it: ONE question per `jarvis wo ask`, and cite the "
+                 "first in the second by its `Q<id>`."
+                 if kind == "question" else "")
         return _deny(
             f"This `{subcommand}` {kind} is {len(text)} characters; the cap is "
-            f"{limit}.\n"
+            f"{limit}.{split}\n"
             f"  - {_INSTEAD}\n"
             f"  - A diff, a log, a file or a JSON dump never belongs in a `jarvis` "
             f"argument: it is read once by a model and paid for in every turn "

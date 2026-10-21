@@ -36,8 +36,8 @@ from .catalog import (
     parse_catalog,
     worker_stalls_on_prompts,
 )
-from . import (budget, bus, config_version, db, fleet, harvest, health, invariants,
-               observability, release, rules, timeline)
+from . import (budget, bus, concision, config_version, db, fleet, harvest, health,
+               invariants, observability, release, rules, timeline)
 from .release import RED_DEFER_EVENT, RED_PARK_EVENT
 from .agent_usage import (
     OBSERVE_CONTEXT, OBSERVE_INSPECT, OBSERVE_LIVE, OBSERVE_WHY,
@@ -2230,6 +2230,16 @@ def assume(wo_id: str, content: str) -> dict[str, Any]:
     from .invariants import neo_reviews_later
 
     name, path, wo = find_work_order(wo_id)
+    # ONE DECISION per assumption, refused never trimmed (docs/superpowers/specs/2026-10-21-questions-to-neo-are-atomic.md §2)
+    cap = _concision_cap(name, "assume_max_chars", concision.DEFAULT_ASSUME_MAX_CHARS)
+    if cap and len(content) > cap:
+        raise OpsError(
+            f"that assumption is {len(content)} characters; the cap is {cap}. An "
+            f"assumption is ONE DECISION — the option you took, the strongest "
+            f"alternative you rejected and why. Split it: a second decision is a "
+            f"second `jarvis wo assume`, and cite this one in that one by its `#n` "
+            f"(e.g. `per assumption #2`). Nothing was recorded.")
+    _cited_blocks(name, path, wo, content)
     cited = _section_blocks(path, wo, content)
     store = ProjectStore(path)
     try:
@@ -3530,6 +3540,23 @@ def config_version_line(version_id: str | None) -> str:
     if since is None:
         return f"{version_id} (no longer in the ledger)"
     return f"{version_id} ({since} versions since)" if since else version_id
+
+
+def concision_config(project: str | None = None) -> Any:
+    """The concision settings in force for `project` — or the OS's — or None"""
+    try:
+        catalog = resolve_catalog()
+        if project is None:
+            return catalog.os.concision
+        return catalog.project(project).concision
+    except (OpsError, CatalogError, OSError, ValueError):
+        return None
+
+
+def _concision_cap(project: str | None, field: str, default: int) -> int:
+    """One per-project character cap, falling back to the fleet default (docs/superpowers/specs/2026-10-21-questions-to-neo-are-atomic.md §2)"""
+    cfg = concision_config(project)
+    return default if cfg is None else int(getattr(cfg, field, default))
 
 
 def validation_config(project: str | None = None) -> Any:
@@ -7508,24 +7535,67 @@ def _section_blocks(path: Path, wo: dict[str, Any],
             for (ref_path, which, section), cap in zip(out, allowed)]
 
 
+#: The in-text form of a reference to an earlier question or a sibling assumption (spec §4)
+REF_FORM_HINT = "per Q1234 / per assumption #2"
+
+
+def _cited_blocks(project: str, path: Path, wo: dict[str, Any], text: str) -> str:
+    """Every in-text question or sibling reference this text names, RESOLVED.
+
+    One scanner and one resolver for both verbs, and they live in `autoreview` beside
+    `_CITED_QUESTION_RE` (spec §4). An unknown or foreign reference is a REFUSAL: nothing
+    is recorded, the same bargain `_section_blocks` already strikes for a spec section.
+    A reference to a question asked on THIS order and not yet answered is NOT a refusal —
+    it has a rendering of its own, and refusing it would stop a worker citing the
+    question it just asked.
+    """
+    from . import autoreview
+    from .neo_store import NeoStore
+
+    store = ProjectStore(path)
+    try:
+        siblings = store.all_assumptions(wo["id"]) or []
+    finally:
+        store.close()
+    neo = NeoStore()
+    try:
+        problem = autoreview.cited_ref_problem(neo, wo["id"], text, siblings)
+        if problem:
+            raise OpsError(
+                f"{problem}. The reference is what whoever answers reads, so nothing "
+                f"is recorded until it resolves. The form is in-text and "
+                f"keyword-anchored — {REF_FORM_HINT}.")
+        return autoreview.cited_context(neo, wo["id"], text, siblings,
+                                        cfg=validation_config(project))
+    finally:
+        neo.close()
+
+
 def ask_question(wo_id: str, question: str, project_name: str | None = None) -> dict[str, Any]:
     """(Workers) queue a question for Neo instead of stalling on the user: waiting_input with NO user-attention flag, every in-text section reference resolved HERE and snapshotted, their TOTAL bounded by `SECTION_SNAPSHOT_CHARS`, an unresolvable reference or a document named with no section both REFUSALS (`_section_blocks`)"""
     from .neo_store import NeoStore
 
-    if len(question) > QUESTION_MAX_CHARS:
+    name, path, wo = find_work_order(wo_id, project_name)
+    cap = _concision_cap(name, "question_max_chars",
+                         concision.DEFAULT_QUESTION_MAX_CHARS)
+    if cap and len(question) > cap:
         raise OpsError(
             f"that question is {len(question)} characters; the cap is "
-            f"{QUESTION_MAX_CHARS}. A question to Neo is one paragraph — the decision, "
-            f"the options, your recommendation — arguing from a design artifact it "
-            f"references in-text, e.g. `from section 3 of design doc "
+            f"{cap}. A question to Neo is ONE QUESTION, in one paragraph — the "
+            f"decision, the options, your recommendation — arguing from a design "
+            f"artifact it references in-text, e.g. `from section 3 of design doc "
             f"\"docs/superpowers/specs/feature.md\": …`. The referenced section is delivered to "
-            f"whoever answers, alongside your paragraph; you do not need to paste it."
+            f"whoever answers, alongside your paragraph; you do not need to paste it. "
+            f"Split it: a second question is a second `jarvis wo ask`, and cite this "
+            f"one in that one by its `Q<id>`. Nothing was recorded."
         )
 
-    name, path, wo = find_work_order(wo_id, project_name)
     context = f"{wo['title']}\n{(wo.get('description') or '')[:800]}"
     for ref_path, which, section in _section_blocks(path, wo, question):
         context += f"\n\nReferenced artifact — {ref_path} § {which}:\n{section}"
+    cited = _cited_blocks(name, path, wo, question)
+    if cited:
+        context += f"\n\nReferences this question names:\n{cited}"
     neo = NeoStore()
     try:
         q = neo.ask(name, wo_id, question, context=context)
@@ -7546,7 +7616,7 @@ def ask_question(wo_id: str, question: str, project_name: str | None = None) -> 
         out["warning"] = (
             f"that question is {len(question)} characters — aim for one paragraph, and "
             f"reference the design artifact section it argues from in-text instead of "
-            f"pasting context (the cap is {QUESTION_MAX_CHARS})"
+            f"pasting context (the cap is {cap or QUESTION_MAX_CHARS})"
         )
     return out
 

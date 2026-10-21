@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import re
 
+from . import concision
+
 #: A question that should have been a paragraph plus a reference
 QUESTION_WARN_CHARS = 1500
-QUESTION_MAX_CHARS = 4000
+#: `concision` owns the number; this is the name `ops` and the tests read it by (docs/superpowers/specs/2026-10-21-questions-to-neo-are-atomic.md §1)
+QUESTION_MAX_CHARS = concision.DEFAULT_QUESTION_MAX_CHARS
 
 #: `section 3 of ...
 REF_RE = re.compile(
