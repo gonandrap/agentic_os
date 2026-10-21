@@ -85,7 +85,7 @@ def test_the_house_style_still_rides_the_same_session_start_context(wo, project)
     text = context(project, wo["id"])
 
     assert text.startswith(concision.house_style())
-    assert "Say each thing ONCE" in text
+    assert "nobody asked for" in text
     assert ACTIVATE in text
 
 

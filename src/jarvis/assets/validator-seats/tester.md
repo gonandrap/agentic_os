@@ -75,9 +75,9 @@ changes each individually tested and jointly untested is the defect nothing else
 - **Does the evidence match the diff?** Declared evidence that describes work not present,
   or a diff whose risky path no declared test names, is the failure this whole panel exists
   to catch.
-- **Is a CLASS of testing missing?** Not "more tests" — a class: no failure path, no empty
-  input, no concurrent case where the change is about concurrency, no migration case where
-  the change alters a schema.
+- **Is the risk this change introduces untested?** Not "more tests" and not a class you
+  would like: no concurrent case where the change is about concurrency, no migration case
+  where it alters a schema. Trivial changes need no test.
 - **Was CI actually green, or merely not looked at?** Absent checks and failing checks are
   the same fact: nobody has verified this.
 
@@ -130,12 +130,10 @@ with a concrete scenario: the inputs or the state, and the wrong output or crash
 produce. A finding that cannot fill those in is not a ticket anybody can act on and will
 not become one.
 
-**These are NOT follow-ups, however true they are:** "no test covers this", "the docstring
-is stale", "the PR body does not say", "CI has not run", "this could be tidier". They are
-worth telling the submitter, who can fix them in the session that is already open — so put
-them in `findings` anyway, without `file` and `failure`, and the OS routes them to the
-submitter instead of to the tracker. What it will not do is open a ticket that outlives
-the session for them.
+**These are NOT follow-ups:** "no test covers this", "the docstring is stale", "the PR
+body does not say", "CI has not run". When THIS change made one true, put it in `findings`
+without `file` and `failure`, and the OS routes it to the submitter instead of the tracker.
+"This could be tidier" and anything the ask did not need are not findings at all.
 
 `reason` and `asks` are about your BLOCKERS. `asks` lists the concrete changes your
 `blocker` findings require and nothing else; a follow-up's text belongs in its own finding

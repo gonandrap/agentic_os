@@ -38,15 +38,14 @@ def test_the_skill_reaches_every_worker_and_can_be_model_invoked(project):
     from jarvis import bootstrap
 
     roots = bootstrap.install_agent_assets(project, kind="worker")
-    delivered = [r / ".claude" / "skills" / "i-have-adhd" / "SKILL.md" for r in roots]
+    delivered = [r / ".claude" / "skills" / "ponytail" / "SKILL.md" for r in roots]
     hit = [p for p in delivered if p.is_file()]
     assert hit, f"skill not delivered to any --add-dir root: {roots}"
     text = hit[0].read_text()
     assert "disable-model-invocation" not in text
-    # The description is what decides whether the model ever loads it
-    front = text.split("---")[1]
-    for surface in ("work-order message", "PR body", "code comment"):
-        assert surface in front, f"description does not mention {surface!r}"
+    assert "full (default)" in text
+    # Disabled by the user: neither delivered nor shipped
+    assert not any((r / ".claude" / "skills" / "i-have-adhd").exists() for r in roots)
 
 
 def test_caveman_is_adapted_and_says_so(project):
@@ -89,10 +88,10 @@ def test_both_skills_ship_their_licences(project):
     """Both copies are third-party MIT inside a GPL-3.0 repo"""
     from jarvis import bootstrap
 
-    for name in ("i-have-adhd", "caveman"):
+    for name in ("ponytail", "caveman"):
         assert "MIT License" in (ASSETS / "skills" / name / "LICENSE").read_text()
     roots = bootstrap.install_agent_assets(project, kind="worker")
-    for name in ("i-have-adhd", "caveman"):
+    for name in ("ponytail", "caveman"):
         assert any((r / ".claude" / "skills" / name / "LICENSE").is_file()
                    for r in roots), f"{name} licence did not reach the worker tree"
 

@@ -11968,7 +11968,7 @@ def _pr_poll_why(store: ProjectStore, wo: dict[str, Any],
     return PR_POLL_WHY
 
 
-#: ONE expression of one rule, registered under EVERY open status: `gates.sweep_unargued` has no status filter and filing an `awaiting_case` request does not park the row, so a held request outlives it (wo-715db5af, Neo 1987)
+#: ONE expression of one rule, registered under EVERY open status: `gates.sweep_unargued` has no...
 REVIEWS_GATE = _Pass(
     "Daemon._neo_drain",
     "a privileged-action request is open and the user does not hold it. "

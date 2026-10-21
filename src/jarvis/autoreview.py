@@ -702,6 +702,11 @@ libraries already in the project was used, an internal helper's signature, log w
 These are decisions in name only, and charging the user a review action for one is the
 cost this exists to remove.
 
+JUDGE IT AGAINST THE ASK (ponytail: the smallest change that fully solves it). Choosing the
+smaller option that still meets the ask is routine: accept it, and never object that the
+worker did not add a feature, option, abstraction, refactor, test or doc the ask does not
+need. An assumption that ADDS such scope, or drops part of the ask, is the opposite case.
+
 ESCALATE when the assumption CHANGES SOMETHING THE USER WOULD RECOGNISE: user-visible
 behaviour or wording, a default value, an API or CLI surface others call, a data shape
 written to disk, an error the user will see, scope the worker added or dropped, a

@@ -23,7 +23,7 @@ def test_an_overlong_summary_is_refused_and_told_where_the_detail_goes():
     reason = out["permissionDecisionReason"]
     assert "200 words" in reason and "cap is 120" in reason
     assert "final message of this turn" in reason
-    assert "i-have-adhd" in reason      # the skill load this denial exists to trigger
+    assert "caveman" in reason          # the skill load this denial exists to trigger
     assert "--evidence" in reason       # the other place detail legitimately goes
 
 
@@ -91,11 +91,11 @@ def test_the_house_style_carries_both_skills_and_the_rails():
 
     assert text.startswith(concision.HOUSE_STYLE_BEGIN)
     assert text.endswith(concision.HOUSE_STYLE_END)
-    assert "caveman" in text and "i-have-adhd" in text
+    assert "caveman" in text and "ponytail" in text and "i-have-adhd" not in text
     for compression in ("Drop articles", "No narration of your own tool calls"):
         assert compression in text, f"compression rule missing: {compression!r}"
-    for shaping in ("First line is the answer", "Say each thing ONCE"):
-        assert shaping in text, f"shaping rule missing: {shaping!r}"
+    for scope in ("smallest change that FULLY solves the ask", "nobody asked for"):
+        assert scope in text, f"scope rule missing: {scope!r}"
     for rail in ("Exact error strings", "not/never/no/only/except",
                  "Security warnings", "Failing test output"):
         assert rail in text, f"correctness rail missing from the house style: {rail!r}"
@@ -147,7 +147,7 @@ def test_a_subagent_is_handed_the_house_style_and_the_project_standing_prompt():
     assert out["hookEventName"] == "SubagentStart"
     context = out["additionalContext"]
     assert concision.HOUSE_STYLE_BEGIN in context
-    assert "Say each thing ONCE" in context
+    assert "nobody asked for" in context
     assert "Failing test output" in context
     assert STANDING in context
 

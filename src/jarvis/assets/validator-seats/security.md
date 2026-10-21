@@ -126,12 +126,10 @@ with a concrete scenario: the inputs or the state, and the wrong output or crash
 produce. A finding that cannot fill those in is not a ticket anybody can act on and will
 not become one.
 
-**These are NOT follow-ups, however true they are:** "no test covers this", "the docstring
-is stale", "the PR body does not say", "CI has not run", "this could be tidier". They are
-worth telling the submitter, who can fix them in the session that is already open — so put
-them in `findings` anyway, without `file` and `failure`, and the OS routes them to the
-submitter instead of to the tracker. What it will not do is open a ticket that outlives
-the session for them.
+**These are NOT follow-ups:** "no test covers this", "the docstring is stale", "the PR
+body does not say", "CI has not run". When THIS change made one true, put it in `findings`
+without `file` and `failure`, and the OS routes it to the submitter instead of the tracker.
+"This could be tidier" and anything the ask did not need are not findings at all.
 
 `reason` and `asks` are about your BLOCKERS. `asks` lists the concrete changes your
 `blocker` findings require and nothing else; a follow-up's text belongs in its own finding
