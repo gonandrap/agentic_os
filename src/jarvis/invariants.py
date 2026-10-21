@@ -822,7 +822,7 @@ def check_undeclared_delivery(store: ProjectStore) -> Iterator[Violation]:
         )
 
 
-#: A transition the spans recorded and the timeline did not (io-df4fa1e3 `record-omits-the-transitions`)
+#: A transition the spans recorded and the timeline did not (io-df4fa1e3)
 RECORD_BEHIND = "INV-RECORD-BEHIND"
 
 #: How far apart a span and its status event may be stamped and still be one transition
@@ -876,7 +876,7 @@ def _record_behind(store: ProjectStore, wo_id: str,
 
 
 def check_spans_reach_the_status(store: ProjectStore) -> Iterator[Violation]:
-    """INV-SPAN-BEHIND — a status write with no span is repaired where it is found; INV-RECORD-BEHIND reports a span or round with no event (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md)"""
+    """INV-SPAN-BEHIND repairs a status with no span, INV-RECORD-BEHIND reports a span with no event (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md §2d3)"""
     readonly = getattr(store, "readonly", False)
     # Hidden too: hiding takes an order out of the listings
     for wo in store.list_work_orders(include_hidden=True):
