@@ -530,7 +530,7 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
     from . import os_map, wiring, worker_brief
     from .gates import KINDS
 
-    live_gates =tuple(k.name for k in KINDS
+    live_gates = tuple(k.name for k in KINDS
                        if k.name in project.gates.enabled) if project.gates else ()
     parts = [
         f"You are the worker agent for Jarvis work order `{wo['id']}` in project "
