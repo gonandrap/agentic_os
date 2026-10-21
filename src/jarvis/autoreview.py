@@ -928,8 +928,7 @@ def _spec_block(spec: dict[str, str] | None, chars: int) -> str:
 
 
 def _bounded(text: str, chars: int, ref: str) -> str:
-    """`chars` of the section, with any cut ANNOUNCED IN WORDS and the reference repeated
-    so the reviewer can go and read the rest."""
+    """`chars` of the section, with any cut ANNOUNCED IN WORDS and the reference repeated so the reviewer..."""
     body = text[:chars]
     if len(text) > chars:
         body += (f"\n[spec section truncated — {len(body):,} of {len(text):,} chars; "
@@ -937,24 +936,14 @@ def _bounded(text: str, chars: int, ref: str) -> str:
     return body
 
 
-#: The SECOND spec block: the sections this ASSUMPTION cites, which need not be the
-#: section the work order was built to. User decision 2026-10-14 (Neo learning #102), and
-#: Neo's rulings on it: it SUPPLEMENTS the block above, never replaces it, and the two
-#: SHARE `validation.assumption_spec_chars` (Q1884). Resolved at `ops.assume` time and
-#: read off the row (`assumptions.spec_text`); nothing is read from disk here, because the
-#: worktree the path was valid in is gone by now.
+#: The SECOND spec block: the sections this ASSUMPTION cites (#102)
 CITED_HEADING = "# THE SPEC SECTION THIS ASSUMPTION CITES — authority you may CITE"
 CITED_INTRO = ("The assumption above argues from this section. Where it settles the "
                "assumption, rule on it and cite the section.")
 
 
 def _cited_ref(assumption: dict[str, Any]) -> str:
-    """Every reference the pointer columns name, read off them pairwise.
-
-    `spec_path`/`spec_which` are parallel newline lists in `spec_text`'s order, and ALL N
-    are named so none is invisible on the reference line (user decision 2026-10-15). A
-    length disagreement is reported, never crashed on and never silently dropped.
-    """
+    """Every reference the pointer columns name, read off them pairwise"""
     paths = (assumption.get("spec_path") or "").splitlines()
     whichs = (assumption.get("spec_which") or "").splitlines()
     refs = [f"{p or '(no path recorded)'} § {w or '(no section named)'}"
@@ -967,10 +956,7 @@ def _cited_ref(assumption: dict[str, Any]) -> str:
 
 
 def _cited_block(assumption: dict[str, Any], chars: int) -> str:
-    """The sections the assumption cites, as `ops.assume` labelled them.
-
-    Each body carries its own `<path> § <which>:` line (Neo ruling Q1883).
-    """
+    """The sections the assumption cites, as `ops.assume` labelled them"""
     text = (assumption.get("spec_text") or "").strip()
     ref = _cited_ref(assumption)
     return f"{CITED_HEADING} — {ref}\n{CITED_INTRO}\n{_bounded(text, chars, ref)}"
@@ -978,12 +964,7 @@ def _cited_block(assumption: dict[str, Any], chars: int) -> str:
 
 def _spec_blocks(assumption: dict[str, Any], spec: dict[str, str] | None,
                  chars: int) -> list[str]:
-    """The work order's spec block, then the sections the assumption cites if it cites any.
-
-    ONE budget, need-based, with half as a FLOOR (Neo ruling Q1884): a block under the
-    floor is whole and donates its remainder to the oversized one, so only a block that
-    is actually too long is trimmed. No new catalog setting.
-    """
+    """The work order's spec block, then the sections the assumption cites if it cites any"""
     cited = (assumption.get("spec_text") or "").strip()
     built_to = ((spec or {}).get("section_text") or "").strip()
     if not cited:
@@ -995,7 +976,7 @@ def _spec_blocks(assumption: dict[str, Any], spec: dict[str, str] | None,
 
 
 def _share(a: int, b: int, chars: int) -> tuple[int, int]:
-    """What each of two blocks of size `a` and `b` may spend of one `chars` budget."""
+    """What each of two blocks of size `a` and `b` may spend of one `chars` budget"""
     floor = chars // 2
     if a + b <= chars:
         return a, b

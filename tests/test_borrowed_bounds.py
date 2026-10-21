@@ -1,22 +1,4 @@
-"""Every builder that puts borrowed text in front of Neo BOUNDS it.
-
-User decision #11, Neo ruling on question 1945 (option a): a test pins the bounds
-rather than prose. The seven `neo.ask` builders and the call site each one renders into:
-
-* src/jarvis/gates.py:1024 `queue_for_review` (neo.ask at :1047)
-* src/jarvis/gates.py:830 `build_request_question` (rendered into that same ask)
-* src/jarvis/automerge.py:587 `_request_question`
-* src/jarvis/remedies.py:1494 `_request_question`
-* src/jarvis/remedies.py:1542 `propose` (neo.ask at :1595)
-* src/jarvis/remedies.py:1619 `propose_fix` (neo.ask at :1666)
-* src/jarvis/issues.py:1144 `ask_triage` (neo.ask at :1159)
-* src/jarvis/supervisor.py:1091 `_question_for` and :1074 `escalation_context`
-  (neo.ask at src/jarvis/supervisor.py:1224)
-
-Each case feeds 50000 characters into ONE borrowed field and asserts the rendered
-payload carries no more of it than that field's named constant in
-src/jarvis/provenance.py, and that the run arrives inside a borrowed block.
-"""
+"""Every builder that puts borrowed text in front of Neo BOUNDS it (#11)"""
 
 from __future__ import annotations
 
@@ -43,7 +25,7 @@ def _longest_run(text: str) -> int:
 
 
 class _Neo:
-    """Captures what reached `neo.ask` — the question and the context, nothing else."""
+    """Captures what reached `neo.ask` — the question and the context, nothing else"""
 
     def __init__(self) -> None:
         self.asked: list[tuple[str, str]] = []
@@ -61,7 +43,7 @@ class _Neo:
 
 
 class _Store:
-    """The reads `gates.queue_for_review` makes, and the writes it performs."""
+    """The reads `gates.queue_for_review` makes, and the writes it performs"""
 
     def __init__(self, approval: dict[str, Any]) -> None:
         self.approval = approval
@@ -86,7 +68,7 @@ class _Store:
 
 
 class _PStore:
-    """The `remedies` writes, stubbed: this test grades prompt text, not rows."""
+    """The `remedies` writes, stubbed: this test grades prompt text, not rows"""
 
     def add_approval(self, *a: Any, **k: Any) -> dict[str, Any]:
         return {"id": 7}
@@ -108,7 +90,7 @@ def _wo(**over: Any) -> dict[str, Any]:
     return {"id": "wo-1", "title": "t", "description": "d", **over}
 
 
-# -- one case per borrowed field -------------------------------------------------------
+# -- one case per borrowed field
 
 
 def _gates_request(field: str) -> str:
@@ -200,7 +182,7 @@ def _supervisor_question(field: str) -> str:
                                             verdict))
 
 
-#: (builder, borrowed field, the constant that bounds it).
+#: (builder, borrowed field, the constant that bounds it)
 CASES = [
     ("gates.build_request_question", "title", TITLE_LIMIT),
     ("gates.build_request_question", "description", DESCRIPTION_LIMIT),
@@ -254,15 +236,13 @@ def _render(builder: str, field: str, monkeypatch) -> str:
                          ids=[f"{b}:{f}" for b, f, _ in CASES])
 def test_every_borrowed_field_is_bounded_by_its_named_constant(builder, field, limit,
                                                                monkeypatch):
-    """An unbounded field is an unbounded prompt: 50000 characters in, at most `limit`
-    out, and the quotation arrives inside a marker so the reviewer can see whose it is."""
+    """An unbounded field is an unbounded prompt: 50000 characters in"""
     rendered = _render(builder, field, monkeypatch)
 
     assert HUGE not in rendered, f"{builder} renders {field} unbounded"
     assert _longest_run(rendered) <= limit, \
         f"{builder} lets {field} through at {_longest_run(rendered)} > {limit}"
-    # The triage prompt's JSON `context=` is a machine record the daemon reads back, so
-    # its two fields are bounded but not wrapped; the prose half quotes the title tagged.
+    # The triage prompt's JSON `context=` is a machine record the daemon reads back
     if builder == "issues.ask_triage" and field == "title":
         assert provenance.OPEN_MARKER in rendered
     if builder != "issues.ask_triage":

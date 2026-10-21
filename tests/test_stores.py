@@ -70,9 +70,7 @@ def test_assumptions_flow(project):
 
 
 def test_add_assumption_still_takes_two_positional_arguments(project):
-    """The cited-section columns are OPTIONAL keywords: every existing caller — the CLI,
-    `invariants.check_assumptions_persisted`, the screenshot scripts — keeps working and
-    writes NULL, which reads as "cited no section"."""
+    """The cited-section columns are OPTIONAL keywords: every existing caller"""
     store = ProjectStore(project)
     wo = store.create_work_order("x")
 
@@ -88,8 +86,7 @@ def test_add_assumption_still_takes_two_positional_arguments(project):
 
 
 def test_the_cited_section_columns_migrate_onto_a_pre_existing_database(project):
-    """Spec test 8: the three columns ship in `ADDED_COLUMNS`, so a database written before
-    them gets them on the next open. Old rows read NULL on all three — "cited no section"."""
+    """Spec test 8: the three columns ship in `ADDED_COLUMNS`"""
     store = ProjectStore(project)
     wo_id = store.create_work_order("filed before the columns existed")["id"]
     db_path = store.db_path
