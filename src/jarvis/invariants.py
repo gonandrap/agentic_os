@@ -71,7 +71,7 @@ def _billing_store() -> Iterator[Any]:
 def budget_blocker(store: ProjectStore, wo: dict[str, Any]) -> str:
     """The attention line for a work order parked in `budget_exhausted`"""
     with _billing_store() as central:
-        out = budget.exhaustion(store, central, wo)
+        out = budget.launch_refusal(store, central, wo)
     # None means the accounting no longer says it is spent: the user raised the budget and the tick that...
     return out.reason if out else BUDGET_SPENT_BLOCKER
 
@@ -1072,6 +1072,8 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
             # The budget was cleared and the tick that moves the status has not run
             return "budget spent — cleared, resuming shortly"
         line = f"budget spent — ${cap.spent_usd:.2f} of ${cap.cap_usd:.2f}"
+        if 0 < cap.remaining_usd < budget.LAUNCH_FLOOR_USD:
+            line += " (under one call left)"
         if cap.source != "feature":
             return line
         # `source == 'feature'` is the ALLOCATOR's word for "the family's cap" and says nothing about the...
@@ -2089,6 +2091,88 @@ def check_feature_failures_are_real(store: ProjectStore) -> Iterator[Violation]:
                      "stale_reason": row["attention_reason"],
                      "manager_revived": revived["id"] if revived else None},
         )
+
+
+INV_FEATURE_ORPHAN_CHILD = "INV-FEATURE-ORPHAN-CHILD"
+
+#: The marker that says a parent's flag was raised by INV-FEATURE-ORPHAN-CHILD
+ORPHAN_CHILD_MARK = " — nothing re-derives a settled order, so it is raised here: "
+
+#: What a SETTLED parent says when a child under it still needs the user
+ORPHAN_CHILD_BLOCKER = ("{wo_id} still needs you, and its {noun} {fo_id} is {status}"
+                        + ORPHAN_CHILD_MARK + "{reason}{more}")
+
+#: What each `feature_orders` kind is called on that line
+ORPHAN_PARENT_NOUN = {"feature": "feature order", "improvement": "improvement order",
+                      "investigation": "investigation"}
+
+
+def _orphaned_children(store: ProjectStore) -> dict[str, list[dict[str, Any]]]:
+    """Every settled parent's children that are live or flagged, unanswered for, by parent"""
+    from .project_store import TERMINAL_STATUSES as SETTLED_STATUSES
+
+    rows = db.rows_to_dicts(store.conn.execute(
+        "SELECT w.* FROM work_orders w JOIN feature_orders f ON w.parent_id=f.id "
+        f"WHERE f.status IN ({','.join('?' for _ in FO_TERMINAL_STATUSES)}) "
+        "AND w.kind != 'manager' AND w.hidden=0 ORDER BY w.created_at",
+        FO_TERMINAL_STATUSES).fetchall())
+    by_parent: dict[str, list[dict[str, Any]]] = {}
+    superseded: dict[str, set[str]] = {}
+    for wo in rows:
+        fo_id = str(wo["parent_id"])
+        live = wo["status"] not in SETTLED_STATUSES and not acknowledged(wo)
+        if not (wo["needs_attention"] or live):
+            continue
+        if fo_id not in superseded:
+            superseded[fo_id] = {s["wo_id"] for s in store.superseded_children(fo_id)}
+        if wo["id"] in superseded[fo_id]:
+            continue
+        by_parent.setdefault(fo_id, []).append(wo)
+    return by_parent
+
+
+def check_settled_parents_have_no_orphans(store: ProjectStore) -> Iterator[Violation]:
+    """INV-FEATURE-ORPHAN-CHILD — a settled feature"""
+    # Repaired on the tick, not behind --repair: a settled parent raises nothing ever again
+    readonly = getattr(store, "readonly", False)
+    orphans = _orphaned_children(store)
+    for fo_id, children in orphans.items():
+        fo = store.get_feature_order(fo_id)
+        first = children[0]
+        more = len(children) - 1
+        reason = ORPHAN_CHILD_BLOCKER.format(
+            wo_id=first["id"], noun=ORPHAN_PARENT_NOUN.get(fo.get("kind") or "feature",
+                                                          "order"),
+            fo_id=fo_id, status=fo["status"],
+            reason=(first.get("attention_reason") or "").strip()
+            or f"it is still `{first['status']}`",
+            more=f" (and {more} more child{'ren' if more != 1 else ''})" if more else "")
+        current = str(fo.get("attention_reason") or "")
+        if fo["needs_attention"] and ORPHAN_CHILD_MARK not in current:
+            continue  # it already asks for the user about something else: never overwrite that
+        if fo["needs_attention"] and current == reason:
+            continue  # raised on an earlier tick and still true
+        # The child's status and flag are left alone: settling it would discard whatever the flag was about
+        if not readonly:
+            store.flag_feature_attention(fo_id, reason)
+        yield Violation(
+            invariant=INV_FEATURE_ORPHAN_CHILD, subject_id=fo_id,
+            detail=(f"{fo_id} is `{fo['status']}` but {len(children)} child"
+                    f"{'ren' if len(children) != 1 else ''} under it "
+                    f"({', '.join(c['id'] for c in children)}) "
+                    f"{'are' if len(children) != 1 else 'is'} still live or flagged, "
+                    f"and nothing re-derives a settled order"),
+            repaired=True,
+            repair="raised on the parent with the child's reason; the child is untouched",
+            context={"fo_id": fo_id, "children": [c["id"] for c in children]},
+        )
+    # ...and the flag this check raised comes down once no child under that parent is owed
+    for fo in store.flagged_feature_orders():
+        if fo["id"] in orphans or ORPHAN_CHILD_MARK not in str(
+                fo.get("attention_reason") or ""):
+            continue
+        if not readonly:
+            store.clear_feature_attention(fo["id"])
 
 
 def _validation_timeout() -> int:
@@ -3333,6 +3417,8 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                    # and a `validating` row is invisible to all of them
     check_feature_failures_are_real,  # order-free: it reads and writes feature orders
                                    # only, which no work-order check looks at
+    check_settled_parents_have_no_orphans,  # after it: a reopened feature is no longer
+                                   # settled; it reads child flags and writes only the parent's
     check_neo_escalations_are_live,  # order-free: it writes to Neo's store only, and
                                    # touches no flag any other check reads
     check_proposed_remedies_are_live,  # after the flag checks: it RAISES a flag, and one

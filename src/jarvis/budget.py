@@ -228,8 +228,21 @@ class Ceiling:
 
     @property
     def exhausted(self) -> bool:
-        """Nothing left to spend"""
+        """Nothing left to spend — no floor: the cap stays the number the user typed"""
         return self.remaining_usd <= 0
+
+
+#: The LAUNCH floor: a turn is not spawned with less than this left (io-b521d17b, turn-below-one-call)
+LAUNCH_FLOOR_USD = 0.10
+
+#: Where 0.10 came from — a string, not a comment, so it is read and tested and never trimmed away
+LAUNCH_FLOOR_MEASUREMENT = (
+    "Measured 2026-10-21 over the 91 envelope-costed single-call turns "
+    "(wo_turns.num_turns=1) in jarvis_os's project db, 2026-08-09..2026-10-21: "
+    "min $0.048, p5 $0.090, p10 $0.113, median $0.274. Bound used: p10, rounded down — "
+    "9 of 10 single calls on record cost more, and wo-259f7b52 turn 2 (launched with "
+    "$0.053, spent $0.104) is refused under it. Re-run: SELECT cost_usd FROM wo_turns "
+    "WHERE num_turns=1 AND cost_usd>0 AND COALESCE(cost_source,'envelope')='envelope'")
 
 
 def ceiling(store: ProjectStore, central: CentralStore | None,
@@ -263,17 +276,31 @@ class Exhaustion:
     doing: str = ""
     #: What this child's family is CALLED — "feature", "investigation", "improvement order"
     family: str = "feature"
+    #: Money is left, but less than `LAUNCH_FLOOR_USD`: the cap is not reached, the next turn is refused
+    below_floor: bool = False
+    #: It ran out on its FIRST pass under an investigation's standing default: a sizing problem
+    first_pass: bool = False
 
     @property
     def reason(self) -> str:
         """The attention line, re-derivable by `invariants.true_blockers`"""
         c = self.ceiling
         where = f"its {self.family}'s slice" if c.source == "feature" else "its budget"
-        line = (f"budget spent — ${c.spent_usd:.2f} of {where} of ${c.cap_usd:.2f}"
-                f"; raise it with `jarvis wo budget <id> <amount>` or close it")
+        if self.below_floor:
+            line = (f"budget nearly spent — ${c.remaining_usd:.2f} left of {where} of "
+                    f"${c.cap_usd:.2f}, less than one call costs (${LAUNCH_FLOOR_USD:.2f}), "
+                    f"so no turn was started; raise it with `jarvis wo budget <id> "
+                    f"<amount>` or close it")
+        else:
+            line = (f"budget spent — ${c.spent_usd:.2f} of {where} of ${c.cap_usd:.2f}"
+                    f"; raise it with `jarvis wo budget <id> <amount>` or close it")
         if self.pool is not None:
             line += (f" (its {self.family} has ${self.pool.unreserved_usd:.2f} unreserved "
                      f"of ${self.pool.budget_usd:.2f})")
+        if self.first_pass:
+            line += (f" — it ran out on its FIRST pass, so the budget it was given (the "
+                     f"catalog's `worker.investigation_budget_usd` unless you set one) is "
+                     f"sized below what one pass costs, not overrun")
         return line
 
 
@@ -283,6 +310,12 @@ def exhaustion(store: ProjectStore, central: CentralStore | None,
     c = ceiling(store, central, wo)
     if c is None or not c.exhausted:
         return None
+    return _exhaustion_of(store, central, wo, c)
+
+
+def _exhaustion_of(store: ProjectStore, central: CentralStore | None,
+                   wo: dict[str, Any], c: Ceiling, below_floor: bool = False) -> Exhaustion:
+    """The `Exhaustion` for a ceiling already judged spent: the family's pool"""
     parent_pool = None
     family = "feature"
     parent_id = wo.get("parent_id")
@@ -298,7 +331,22 @@ def exhaustion(store: ProjectStore, central: CentralStore | None,
             family = family_prose(parent.get("kind"))[0]
     turn = store.latest_turn(wo["id"])
     doing = " ".join((turn or {}).get("prompt", "").split())[:200]
-    return Exhaustion(ceiling=c, pool=parent_pool, doing=doing, family=family)
+    first = (family == "investigation" and c.source == "feature"
+             and turn is not None and int(turn["seq"]) <= 1)
+    return Exhaustion(ceiling=c, pool=parent_pool, doing=doing, family=family,
+                      below_floor=below_floor, first_pass=first)
+
+
+def launch_refusal(store: ProjectStore, central: CentralStore | None,
+                   wo: dict[str, Any]) -> Exhaustion | None:
+    """May a turn START?"""
+    out = exhaustion(store, central, wo)
+    if out is not None:
+        return out
+    c = ceiling(store, central, wo)
+    if c is None or c.remaining_usd >= LAUNCH_FLOOR_USD:
+        return None
+    return _exhaustion_of(store, central, wo, c, below_floor=True)
 
 
 def feature_exhaustion(store: ProjectStore, central: CentralStore | None,
@@ -339,7 +387,7 @@ def escalate(store: ProjectStore, wo: dict[str, Any], out: Exhaustion) -> bool:
         title=f"{wo['id']} has spent its budget",
         # What it was in the middle of, which is the half a bare dollar figure cannot give: the user is...
         body=(out.reason + (f"\n\nIt was working on: {out.doing}" if out.doing else "")),
-        level="warning", wo_id=wo["id"], source="reconciler",
+        level="warning", wo_id=wo["id"], source="reconciler", paired=True,
     )
     return True
 

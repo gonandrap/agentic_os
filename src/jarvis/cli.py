@@ -1582,6 +1582,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                  "reopening)" if r.get("tripped") else ""))
     if st["attention"]:
         print(f"\n⚠ NEEDS YOUR ATTENTION ({len(st['attention'])}):")
+        print(f"   {ATTENTION_LIST_NOTE}")
         for a in st["attention"]:
             ident = a["wo_id"] or a.get("fo_id")
             print(f"  • [{a['project']}]{' ' + ident if ident else ''} {a['title']} "
@@ -1601,6 +1602,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     if st["inbox"]["unacked"]:
         print(f"\n📥 inbox: {st['inbox']['unacked']} unacked"
               f" ({st['inbox']['critical']} critical) — `jarvis inbox list`")
+        print(f"   {INBOX_LIST_NOTE}")
     neo = st.get("neo", {})
     if (neo.get("queued") or neo.get("unreviewed") or neo.get("escalated")
             or neo.get("failed")):
@@ -4996,13 +4998,20 @@ def cmd_bug(args: argparse.Namespace) -> int:
     return 0
 
 
+#: What each of the two lists IS and which command clears it
+ATTENTION_LIST_NOTE = ("derived from each order's state every tick; clears when the "
+                       "condition goes, or with `jarvis wo ack <id>`")
+INBOX_LIST_NOTE = ("a log of notifications; `jarvis inbox ack` marks them read — one "
+                   "raised with an attention flag lowers that flag too, unless a "
+                   "decision is pending")
+
+
 def cmd_inbox(args: argparse.Namespace) -> int:
     from .central_store import CentralStore
     central = CentralStore()
     try:
         if args.ib_cmd == "ack":
-            n = central.ack_inbox(args.inbox_id)
-            _print({"acked": n}, args.json)
+            _print(ops.ack_inbox(args.inbox_id), args.json)
         else:
             items = central.unacked_inbox()
             if args.json:

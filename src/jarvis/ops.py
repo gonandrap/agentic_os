@@ -3907,7 +3907,7 @@ def escalate_validation_round(store: ProjectStore, wo: dict[str, Any], round_id:
         title=ESCALATION_TITLE.format(
             unit=wo_id, n=n, verb=ESCALATION_VERB[ESCALATION_FAMILY[cause]]),
         body=escalation_body(reason), level="warning", wo_id=wo_id,
-        source="validation",
+        source="validation", paired=True,
     )
 
 
@@ -5522,7 +5522,61 @@ def ack_attention(wo_id: str | None = None, all_projects: bool = False,
                 acknowledged.append(wo["id"])
         finally:
             store.close()
-    return {"acknowledged": acknowledged, "skipped": skipped}
+    # ...and the notifications raised WITH those flags are the same incident
+    read = 0
+    if acknowledged:
+        central = CentralStore()
+        try:
+            read = sum(central.ack_paired_inbox(w) for w in acknowledged)
+        finally:
+            central.close()
+    return {"acknowledged": acknowledged, "skipped": skipped, "inbox_read": read}
+
+
+def ack_inbox(inbox_id: int | None = None) -> dict[str, Any]:
+    """`jarvis inbox ack` — mark notifications read"""
+    from .invariants import true_blockers
+
+    central = CentralStore()
+    try:
+        if inbox_id is None:
+            items = central.unacked_inbox()
+        else:
+            one = central.get_inbox(inbox_id)
+            items = [one] if one and one["status"] != "acked" else []
+        n = central.ack_inbox(inbox_id)
+    finally:
+        central.close()
+    paths = registered_project_paths()
+    lowered: list[str] = []
+    kept: list[dict[str, str]] = []
+    for it in items:
+        # A standalone notification has nothing paired to lower
+        if it.get("paired_reason") is None or not it.get("wo_id"):
+            continue
+        path = paths.get(it["project"])
+        if path is None or not path.is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            try:
+                wo = store.get_work_order(it["wo_id"])
+            except KeyError:
+                continue
+            # Only the SAME incident: a flag that has since moved on is a new thing to see
+            if not wo["needs_attention"] or wo.get("attention_reason") != it["paired_reason"]:
+                continue
+            blockers = true_blockers(store, wo)
+            if ack_refusal(wo, blockers) is not None:
+                # A pending decision is never dismissed by reading a notification
+                kept.append({"wo_id": wo["id"],
+                             "reason": ack_decision_blocker(blockers) or ""})
+                continue
+            store.ack_attention(wo["id"], blockers)
+            lowered.append(wo["id"])
+        finally:
+            store.close()
+    return {"acked": n, "attention_lowered": lowered, "attention_kept": kept}
 
 
 def ack_os_flag(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
@@ -11958,10 +12012,15 @@ def set_work_order_budget(wo_id: str, amount: float | None,
         cap = budget.ceiling(store, central, fresh)
         spend = budget.spent(store, central, wo_id)
         if fresh["status"] == budget.EXHAUSTED:
+            refused = budget.launch_refusal(store, central, fresh)
             if cap is not None and cap.exhausted:
                 note = _still_capped_note(
                     cap, spend.total_usd, _parent_of(store, fresh),
                     _feature_unreserved(store, central, fresh))
+            elif refused is not None:
+                # Raised, but by less than one call: the next turn would be refused, so it stays parked and says why
+                store.flag_attention(wo_id, refused.reason)
+                note = refused.reason
             else:
                 resumed, note = _resume_after_budget(store, name, fresh)
     finally:

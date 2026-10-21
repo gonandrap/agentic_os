@@ -763,12 +763,15 @@ def create_app() -> FastAPI:
         return response
 
     # Inside the factory, like every other same-tier import in this file: `cli` and `ui` are one tier and...
-    from ..cli import PART_LABELS, PART_SHORT, _held_phrase
+    from ..cli import (ATTENTION_LIST_NOTE, INBOX_LIST_NOTE, PART_LABELS, PART_SHORT,
+                       _held_phrase)
 
     templates = Jinja2Templates(directory=str(TEMPLATES))
     templates.env.globals.update(
         status_meta=STATUS_META, origin_meta=ORIGIN_META, gate_meta=GATE_META,
         gate_display=gate_display,
+        # What each list is and which command clears it — the same words `jarvis status` prints (io-d2a5dd69)
+        attention_list_note=ATTENTION_LIST_NOTE, inbox_list_note=INBOX_LIST_NOTE,
         # Every link to an order's page goes through this — see `order_path` (#997)
         order_path=order_path,
         # A round's word, tone and icon — the same tuple `ops.round_line` and `automerge.decide` render from (#581)
@@ -1821,11 +1824,7 @@ def create_app() -> FastAPI:
 
     @app.post("/inbox/ack")
     def ack(inbox_id: str = Form("")):
-        central = CentralStore()
-        try:
-            central.ack_inbox(int(inbox_id) if inbox_id else None)
-        finally:
-            central.close()
+        ops.ack_inbox(int(inbox_id) if inbox_id else None)
         return RedirectResponse("/inbox", status_code=303)
 
     @app.post("/backlog/promote/{item_id}")

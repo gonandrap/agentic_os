@@ -1235,3 +1235,96 @@ def test_a_live_investigator_with_no_verdict_still_parks(started, store):
 
 # Written for the opt-in OS (os.autonomy.self_dispatch on, stuck sweep on)
 pytestmark = pytest.mark.usefixtures("self_dispatch_on")
+
+
+# -- the LAUNCH floor (io-b521d17b, turn-below-one-call)
+
+
+def test_a_remainder_under_one_call_is_not_launched(started, store, fake_claude):
+    """A turn handed less than one call costs dies on its first call and overshoots its cap"""
+    wo = ops.create_work_order("proj_a", "nearly broke", description="do it",
+                               budget_usd=budget.LAUNCH_FLOOR_USD / 2)
+    started.tick()
+
+    row = store.get_work_order(wo["id"])
+    assert row["status"] == budget.EXHAUSTED
+    assert not worker_calls(fake_claude)
+    assert "less than one call costs" in row["attention_reason"]
+    assert f"${budget.LAUNCH_FLOOR_USD / 2:.2f} left" in row["attention_reason"]
+
+
+def test_the_floor_never_moves_the_cap_the_user_typed(started, store):
+    """`Ceiling.exhausted` and `remaining_usd` are untouched: the floor is a launch decision only"""
+    from jarvis.central_store import CentralStore
+
+    wo = ops.create_work_order("proj_a", "nearly broke", description="do it",
+                               budget_usd=0.50)
+    bill_the_turn(store, wo["id"], 0.47)
+    central = CentralStore()
+    try:
+        row = store.get_work_order(wo["id"])
+        cap = budget.ceiling(store, central, row)
+        assert cap.cap_usd == 0.50
+        assert cap.remaining_usd == pytest.approx(0.03)
+        assert not cap.exhausted
+        assert budget.exhaustion(store, central, row) is None
+        refused = budget.launch_refusal(store, central, row)
+        assert refused is not None and refused.below_floor
+    finally:
+        central.close()
+
+
+def test_a_remainder_at_the_floor_still_launches(started, store, fake_claude):
+    """The negative control: one call's worth left is a turn the OS may start"""
+    ops.create_work_order("proj_a", "funded", description="do it",
+                          budget_usd=budget.LAUNCH_FLOOR_USD)
+    started.tick()
+
+    assert fake_claude.wait_calls(lambda c: budget_flag(c) is not None)
+
+
+def test_the_floor_carries_its_measurement():
+    """The provenance sits beside the constant, re-runnable (the finding's DONE clause)"""
+    said = budget.LAUNCH_FLOOR_MEASUREMENT
+    assert "Measured 2026-10-21" in said and "Re-run:" in said
+    assert "Bound used: p10" in said
+
+
+# -- a first-pass exhaustion is a default-sizing signal (io-b521d17b)
+
+
+def test_an_investigation_spent_on_its_first_pass_says_the_default_is_undersized(
+        started, store):
+    inv = _an_investigation(store)
+    child = _the_one_child(started, store, inv, "investigator", spent=9.0)
+
+    line = store.get_work_order(child)["attention_reason"]
+    assert "FIRST pass" in line
+    assert "worker.investigation_budget_usd" in line
+
+
+def test_a_later_pass_is_an_ordinary_overrun(started, store):
+    """The control: a second turn spending the rest is not a sizing story"""
+    inv = _an_investigation(store)
+    child = store.create_work_order(f"work on {inv['id']}", description="look",
+                                    kind="investigator", parent_id=inv["id"])
+    store.update_feature_order(inv["id"], plan_wo_id=child["id"])
+    store.set_feature_status(inv["id"], "planning")
+    store.update_work_order(child["id"], budget_reserved_usd=inv["budget_usd"],
+                            status="running")
+    bill_the_turn(store, child["id"], 1.0)
+    bill_the_turn(store, child["id"], 9.0)
+    started.tick()
+
+    row = store.get_work_order(child["id"])
+    assert row["status"] == budget.EXHAUSTED
+    assert "FIRST pass" not in row["attention_reason"]
+
+
+def test_the_investigation_default_funds_two_measured_passes():
+    """Sized against what it bounds: the p90 first pass recorded beside the constant, twice"""
+    from jarvis import catalog
+
+    assert catalog.DEFAULT_INVESTIGATION_BUDGET_USD >= 2 * 1.73
+    said = catalog.DEFAULT_INVESTIGATION_BUDGET_MEASUREMENT
+    assert "Measured 2026-10-21" in said and "p90 $1.73" in said and "Re-run:" in said

@@ -108,7 +108,15 @@ DEFAULT_BUDGET_USD: float | None = None
 DEFAULT_FEATURE_BUDGET_USD: float | None = None
 
 # THE ONE NON-None SHIPPED BUDGET (docs/superpowers/specs/2026-09-27-investigation-orders.md)
-DEFAULT_INVESTIGATION_BUDGET_USD: float | None = 2.00
+DEFAULT_INVESTIGATION_BUDGET_USD: float | None = 4.00
+# Where 4.00 came from — a string, not a comment, so it is read and tested and never trimmed away
+DEFAULT_INVESTIGATION_BUDGET_MEASUREMENT = (
+    "Measured 2026-10-21 over the 86 investigator work orders in jarvis_os's project db "
+    "(2026-10-01..2026-10-20): first pass (wo_turns.seq=1) min $0.55, median $1.08, "
+    "p90 $1.73, max $2.28, 4 truncated at the old $2.00 cap. The old $2.00 was one pass, "
+    "so 3 of 3 investigations in io-b521d17b stopped budget_exhausted. Sized at two p90 "
+    "passes ($3.46), rounded up. Re-run: per work_orders.kind='investigator', the "
+    "wo_turns.cost_usd of seq=1")
 
 # Cheap by default for the same reason: a diagnosis is reading and quoting, not design
 DEFAULT_INVESTIGATION_MODEL = "sonnet"
