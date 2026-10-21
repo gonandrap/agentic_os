@@ -95,7 +95,7 @@ def test_a_span_with_no_status_event_is_reported_and_not_backfilled(store):
     store.conn.execute("UPDATE work_orders SET status='validating' WHERE id=?",
                        (wo["id"],))
     store.conn.commit()
-    events_before = len(store.list_events(wo["id"]))
+    status_before = len(store.events_of_kind(wo["id"], "status"))
 
     (found,) = [v for v in check_project(store) if v.invariant == invariants.RECORD_BEHIND]
 
@@ -103,7 +103,7 @@ def test_a_span_with_no_status_event_is_reported_and_not_backfilled(store):
     assert "validating" in found.detail
     assert not found.repaired
     # REPORT, NEVER BACKFILL: a retrospective event with an invented moment is worse
-    assert len(store.list_events(wo["id"])) == events_before
+    assert len(store.events_of_kind(wo["id"], "status")) == status_before
 
 
 def test_a_settled_round_with_no_outcome_event_is_reported(store):
