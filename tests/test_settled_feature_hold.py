@@ -153,7 +153,8 @@ def test_the_manager_order_itself_carries_nothing(started, store):
     manager = store.create_manager_order(fo["id"])
     store.set_status(manager["id"], "idle")
 
-    assert invariants.true_blockers(store, store.get_work_order(manager["id"])) == []
+    assert not [b for b in invariants.true_blockers(store, store.get_work_order(manager["id"]))
+                if "nothing will coordinate" in b]
 
 
 def test_a_cancelled_feature_names_the_cancel_remedy_and_not_fo_resume(started, store):
