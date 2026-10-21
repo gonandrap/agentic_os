@@ -180,7 +180,7 @@ def test_the_panels_packet_carries_the_childs_section(started, store, project):
     from jarvis import evidence, validation
 
     fo = release(started, store, "schema")
-    wo = store.feature_children(fo["id"])[0]
+    wo = store.feature_children(fo["id"], kinds=("worker",))[0]
 
     packet = evidence.collect_work_order(project, wo, declared="ran the suite",
                                          spec=specs.spec_of(store, wo))
@@ -206,7 +206,7 @@ def test_the_stored_section_is_what_the_plan_named(started, store):
     """`work_orders.spec_section` is a column because three readers need it"""
     fo = release(started, store, "schema")
 
-    wo = store.feature_children(fo["id"])[0]
+    wo = store.feature_children(fo["id"], kinds=("worker",))[0]
 
     assert wo["spec_section"] == child("schema")["spec_section"]
 
@@ -237,7 +237,7 @@ def test_a_childs_page_names_its_section_and_does_not_reprint_it(started, store,
                                                                  project, catalog_file):
     """THE ASK, at the surface the user actually reads: the order page says WHERE the rest of the work is..."""
     fo = release(started, store, "schema")
-    wo = store.feature_children(fo["id"])[0]
+    wo = store.feature_children(fo["id"], kinds=("worker",))[0]
     spec = specs.spec_of(store, wo)
     wo_id = wo["id"]
 

@@ -13,6 +13,7 @@ from .project_store import (
     COMPACT_TURN,
     FO_TERMINAL_STATUSES,
     TERMINAL_STATUSES,
+    WORKER_CHILDREN,
     ProjectStore,
 )
 
@@ -121,7 +122,8 @@ def family(store: ProjectStore, fo: dict[str, Any]) -> list[dict[str, Any]]:
         except KeyError:
             pass
     seen = {o["id"] for o in orders}
-    orders.extend(c for c in store.feature_children(fo["id"]) if c["id"] not in seen)
+    orders.extend(c for c in store.feature_children(fo["id"], kinds=WORKER_CHILDREN)
+                  if c["id"] not in seen)
     return orders
 
 
@@ -424,7 +426,7 @@ def investigation_default_for(project: ProjectSpec | None) -> float | None:
 
 def live_children(store: ProjectStore, fo_id: str) -> list[dict[str, Any]]:
     """The children of a feature that are still able to spend"""
-    return [c for c in store.feature_children(fo_id)
+    return [c for c in store.feature_children(fo_id, kinds=WORKER_CHILDREN)
             if c["status"] not in TERMINAL_STATUSES and c["status"] != EXHAUSTED]
 
 

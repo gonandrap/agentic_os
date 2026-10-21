@@ -66,19 +66,26 @@ from .project_store import (
     ASSUMPTION_DECIDER_OS,
     ASSUMPTION_DECIDER_USER,
     COUNTED_VALIDATION_OUTCOMES,
+    FAMILY_CHILD_KINDS,
+    FORCEABLE_STATUSES,
     FO_OPEN_STATUSES,
     FO_STATUSES,
     FO_TERMINAL_STATUSES,
     NO_TURN,
     OPEN_STATUSES,
-    FORCEABLE_STATUSES,
     OPEN_VALIDATION_OUTCOMES,
+    SETTLE_BY_FINISH,
+    SETTLE_IN_SESSION,
     TERMINAL_STATUSES,
+    WORKER_CHILDREN,
     WO_STATUSES,
     ProjectStore,
     claim_sql_selects,
+    decide_command,
     feature_status_label,
     is_feature_order_id,
+    kind_contract,
+    submission_artifacts,
     validation_standing,
 )
 
@@ -505,7 +512,10 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                         except KeyError:  # deleted out from under its children
                             by_id[parent_id] = {}
                 for fo_id, fo in by_id.items():
-                    kids = rolled_up.get(fo_id, [])
+                    # THE ACCESSOR `feature_progress` reads, so the label and the rollup agree
+                    owed = {k["id"] for k in rolled_up.get(fo_id, [])}
+                    kids = [k for k in store.feature_children(fo_id, kinds=None)
+                            if k["id"] in owed]
                     if not fo or not (fo["needs_attention"] or kids):
                         continue
                     reasons = []
@@ -529,8 +539,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                         "reason": body if improvement
                                   else f"{progress['label']} — {body}",
                         "rolled_up": [k["id"] for k in kids],
-                        "decide": (f"jarvis io review {fo_id}" if improvement
-                                   else f"jarvis fo show {fo_id}"),
+                        "decide": decide_command(fo.get("kind"), fo_id),
                     })
                 drift = settings_drift(path / ".claude" / "settings.json")
                 projects.append({
@@ -1617,7 +1626,7 @@ def _activity_of(store: ProjectStore, wo_id: str) -> list[tuple[float, str]]:
 
 def _family_of(store: ProjectStore, fo_id: str) -> list[str]:
     """Every work order a feature is made of: its children, its planner, its manager (docs/superpowers/specs/2026-09-30-time-in-state-counts-a-usage-limit-hold-as-running.md)"""
-    family = [c["id"] for c in store.feature_children(fo_id)]
+    family = [c["id"] for c in store.feature_children(fo_id, kinds=WORKER_CHILDREN)]
     fo = store.get_feature_order(fo_id)
     if fo.get("plan_wo_id"):
         family.append(str(fo["plan_wo_id"]))
@@ -2238,7 +2247,8 @@ def assume(wo_id: str, content: str) -> dict[str, Any]:
                                  "spec_which": "\n".join(w for _, w, _ in cited),
                                  "spec_text": sections.label_sections(cited)}
                                 if cited else {}))
-        if not neo_reviews_later(store, wo):
+        # An investigator's call is its diagnosis's audit trail, reviewed by nobody
+        if kind_contract(wo).assumptions_reviewed and not neo_reviews_later(store, wo):
             store.flag_attention(wo_id, "assumptions pending review")
     finally:
         store.close()
@@ -3261,7 +3271,7 @@ def _overtaken(store: ProjectStore, wo_id: str) -> dict[str, int] | None:
     fo = store.feature_order_for_planner(wo_id)
     if fo is None or fo.get("plan_wo_id") != wo_id:
         return None
-    children = store.feature_children(fo["id"])
+    children = store.feature_children(fo["id"], kinds=WORKER_CHILDREN)
     merged = sum(1 for c in children if store.events_of_kind(c["id"], "pr_merged"))
     return {"merged": merged, "of": len(children)} if merged else None
 
@@ -3623,7 +3633,8 @@ def authorship(store: ProjectStore, wo: dict[str, Any]) -> landing.Authored:
     from . import landing
 
     recorded = store.get_work_order(wo["id"])
-    return landing.authored(landing.worktree_of(store.project_path, recorded))
+    return landing.authored(landing.worktree_of(store.project_path, recorded),
+                            submission_artifacts(recorded))
 
 
 def unmerged_pull_request(store: ProjectStore, wo_id: str) -> str:
@@ -3781,7 +3792,7 @@ def land_when_cleared(store: ProjectStore, wo: dict[str, Any],
     """THE JOIN: where a finished work order sits, given BOTH gates over it (docs/superpowers/specs/2026-09-13-two-gates-not-a-chain.md §2)"""
     assert not (panel_cleared and panel_open), "the panel is settled or it is not"
     wo_id = wo["id"]
-    if store.pending_assumptions(wo_id):
+    if invariants.reviewable_assumptions(store, wo):
         store.set_status(wo_id, "needs_review")
         store.flag_attention(wo_id, "assumptions pending review")
         return "needs_review"
@@ -4509,7 +4520,7 @@ def unintegrated_children(project_path: Path, store: ProjectStore, fo_id: str, h
     from . import branchproof
 
     missing: list[tuple[dict[str, Any], str]] = []
-    for child in store.feature_children(fo_id):
+    for child in store.feature_children(fo_id, kinds=WORKER_CHILDREN):
         # The children `settle_features` counted
         if child["superseded"] or child["status"] != "completed":
             continue
@@ -4527,7 +4538,7 @@ def collect_feature_evidence(store: ProjectStore, project_path: Path,
     from . import evidence as evidence_mod
 
     children = []
-    for child in store.feature_children(fo["id"]):
+    for child in store.feature_children(fo["id"], kinds=WORKER_CHILDREN):
         last = store.latest_validation_round(wo_id=child["id"])
         children.append({**child, "declared": str((last or {}).get("evidence") or "")})
     return evidence_mod.collect_feature(project_path, fo, children, declared=declared,
@@ -4643,10 +4654,24 @@ def gate_still_open(wo_id: str, request: dict[str, Any]) -> str:
             f"a privileged action nobody ruled on. {way_on}")
 
 
-def unlanded_refusal(wo_id: str, summary: str, work: landing.Authored) -> str:
-    """Why this work order may not finish, and the three ways on (#232)"""
+def unlanded_refusal(wo: dict[str, Any], summary: str, work: landing.Authored) -> str:
+    """Why this work order may not finish, and only the ways on its OWN kind may take (#232)"""
     from . import landing as landing_mod
 
+    wo_id = str(wo["id"])
+    contract = kind_contract(wo)
+    if not contract.lands_code:
+        # NO LANDING ROUTE TO OFFER: commit, push and `--pr` are outside this kind's write surface
+        submit = contract.submit.format(fo_id=wo.get("parent_id") or "<order-id>")
+        files = ", ".join(f"`{f}`" for f in work.dirty[:5]) or work.describe()
+        return (
+            f"{wo_id} is the {wo.get('kind')} of its order: it does not land code, so "
+            f"nothing it leaves in its worktree can be delivered. Its artifact is "
+            f"`{contract.artifact}` and its submission is `{submit}` — but the worktree "
+            f"also holds {files}, which no submission consumes and no command of yours "
+            f"may land. End your turn naming those files: what happens to them is the "
+            f"user's call."
+        )
     named = landing_mod.pr_urls_in(summary)
     if named:
         lead = (f"Your summary names {named[0]}, but you did not pass it as `--pr`. "
@@ -4686,7 +4711,7 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
         # Read ONCE, before anything is written: a refused finish must leave the record exactly as it found...
         stranding = unlanded_work(store, _wo, pr_url or "")
         if stranding.produced and not abandon:
-            raise OpsError(unlanded_refusal(wo_id, summary, stranding))
+            raise OpsError(unlanded_refusal(_wo, summary, stranding))
         # `stranding` is the REFUSAL's reading and is deliberately empty for an order carrying a pull...
         work = stranding if stranding.base else authorship(store, _wo)
         fields: dict[str, Any] = {"result_summary": summary}
@@ -4763,7 +4788,14 @@ def mark_done(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
 
 def close_out(store: ProjectStore, wo: dict[str, Any], event: str, *, why: str,
               payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Settle a work order as `completed` and take its worker down with it"""
+    """Settle a work order as `completed` and take its worker down with it, from OUTSIDE it"""
+    if os.environ.get("JARVIS_WO_ID") == wo["id"]:
+        # THE CALLER IS INSIDE THE SESSION THIS WOULD KILL, and every write after it (io-d2a5dd69)
+        raise OpsError(
+            f"refusing to close {wo['id']} from inside its own session: closing it stops "
+            f"that session, and this process with it, before the close is recorded. A "
+            f"work order settles itself through its own contract command "
+            f"(`settle_in_session`), never through `close_out`.")
     stopped = stop_worker_session(wo, store)
     store.set_status(wo["id"], "completed")
     store.clear_attention(wo["id"])
@@ -4774,6 +4806,15 @@ def close_out(store: ProjectStore, wo: dict[str, Any], event: str, *, why: str,
                         {**{k: v for k, v in stopped.items() if k != "stopped"},
                          "reason": why})
     return stopped
+
+
+def settle_in_session(store: ProjectStore, wo: dict[str, Any], event: str, *,
+                      payload: dict[str, Any] | None = None) -> None:
+    """Settle a work order `completed` from INSIDE its own turn (io-d2a5dd69)"""
+    store.set_status(wo["id"], "completed", trigger="submitted")
+    store.clear_attention(wo["id"])
+    store.add_event(wo["id"], event, {**(payload or {}), "was": wo["status"],
+                                      "session_stopped": False})
 
 
 def mark_backlog_done(wo: dict[str, Any]) -> None:
@@ -5607,7 +5648,9 @@ def exempt_from_validation(store: ProjectStore, wo: dict[str, Any]) -> bool:
     """Is this submission one no panel round may open over?"""
     from . import verdicts
 
-    return wo.get("kind") == "investigator" and verdicts.verdict_stored(store, wo)
+    # THE KIND TABLE, not a kind name: a kind settled by its submission is never judged by a panel
+    return (kind_contract(wo).route == SETTLE_IN_SESSION
+            and verdicts.verdict_stored(store, wo))
 
 
 def validation_applies(cfg: Any, wo: dict[str, Any], store: ProjectStore) -> bool:
@@ -5844,8 +5887,9 @@ def find_feature_order(fo_id: str, project_name: str | None = None
 
 
 def feature_progress(store: ProjectStore, fo: dict[str, Any]) -> dict[str, Any]:
-    """How far along this feature order is, derived from its children every time"""
-    children = store.feature_children(fo["id"])
+    """How far along this family is, from the children its kind exists to run"""
+    children = store.feature_children(
+        fo["id"], kinds=FAMILY_CHILD_KINDS[fo.get("kind") or "feature"])
     done = sum(1 for c in children if c["status"] == "completed")
     return {
         "children": len(children),
@@ -6130,11 +6174,14 @@ def submit_findings(io_id: str, doc: Any,
                 "reason arrives as your next user turn and you revise from this session.",
     }
     if analyst_open:
-        # Only while it is still open
-        out["analyst"] = finish(
-            fo["plan_wo_id"],
-            f"submitted findings for {io_id}: {len(report['findings'])} findings",
-        )
+        # Only while it is still open; a refusal AFTER the report is stored is not a rejection
+        try:
+            out["analyst"] = _settle_submitter(
+                path, fo["plan_wo_id"],
+                f"submitted findings for {io_id}: {len(report['findings'])} findings",
+                "findings_submitted_settled", {"improvement_order": io_id})
+        except OpsError as e:
+            out["warning"] = submitter_unsettled("report", io_id, fo["plan_wo_id"], e)
     return out
 
 
@@ -6653,11 +6700,15 @@ def show_investigation_order(inv_id: str, project_name: str | None = None
     store = ProjectStore(path)
     try:
         investigator = None
+        calls: list[dict[str, Any]] = []
         if fo.get("plan_wo_id"):
             try:
                 row = store.get_work_order(fo["plan_wo_id"])
                 investigator = {k: row[k] for k in ("id", "title", "status",
                                                     "result_summary")}
+                # THE CALLS THE DIAGNOSIS RESTS ON: its audit trail, not a review item
+                calls = [{"n": a["n"], "content": a["content"]}
+                         for a in store.all_assumptions(row["id"])]
             except KeyError:
                 investigator = None  # deleted out from under it; the link was released
         alarms = store.alarms_for_feature(inv_id)
@@ -6672,6 +6723,7 @@ def show_investigation_order(inv_id: str, project_name: str | None = None
         "filed": verdict.get("filed") or None,
         "filing_error": verdict.get("filing_error") or "",
         "investigator": investigator,
+        "assumptions": calls,
         "status_label": feature_status_label("investigation", fo["status"]),
         "alarms": alarms,
     }
@@ -6781,24 +6833,12 @@ def submit_verdict(inv_id: str, doc: Any,
                 })
             except (KeyError, sqlite3.IntegrityError):
                 pass  # not this project's work order any more
-        settled: dict[str, Any] | None = None
         if fo.get("plan_wo_id"):
             store.add_event(fo["plan_wo_id"], "verdict_submitted", {
                 "investigation": inv_id, "classification": classification,
                 "classified_by": verdict["classified_by"],
                 "filed": (verdict.get("filed") or {}).get("issue_url"),
             })
-            try:
-                investigator = store.get_work_order(fo["plan_wo_id"])
-            except KeyError:
-                investigator = None  # deleted; the link was released
-            if investigator is not None:
-                summary = f"submitted a {classification} verdict for {inv_id}"
-                store.update_work_order(fo["plan_wo_id"], result_summary=summary)
-                settled = close_out(
-                    store, investigator, "verdict_submitted_settled", why=summary,
-                    payload={"investigation": inv_id,
-                             "classification": classification})
     finally:
         store.close()
 
@@ -6808,10 +6848,49 @@ def submit_verdict(inv_id: str, doc: Any,
         "classified_by": verdict["classified_by"],
         "note": "the investigation is settled — end your turn.",
     }
-    if settled is not None:
-        out["investigator"] = {"wo_id": fo["plan_wo_id"], "status": "completed",
-                               "session_stopped": settled["stopped"]}
+    if fo.get("plan_wo_id"):
+        # AFTER THE VERDICT IS DURABLE: a failure here is not a rejection
+        try:
+            settled = _settle_submitter(path, fo["plan_wo_id"],
+                                        f"submitted a {classification} verdict for "
+                                        f"{inv_id}", "verdict_submitted_settled",
+                                        {"investigation": inv_id,
+                                         "classification": classification})
+        except (OpsError, sqlite3.Error) as e:
+            out["warning"] = submitter_unsettled("verdict", inv_id, fo["plan_wo_id"], e)
+        else:
+            if settled is not None:
+                out["investigator"] = settled
     return out
+
+
+def _settle_submitter(path: Path, wo_id: str, summary: str, event: str,
+                      payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Settle the work order whose submission was just stored, BY ITS KIND'S ROUTE"""
+    store = ProjectStore(path)
+    try:
+        try:
+            wo = store.get_work_order(wo_id)
+        except KeyError:
+            return None  # deleted; the link was released
+        route = kind_contract(wo).route
+        if route == SETTLE_IN_SESSION:
+            store.update_work_order(wo_id, result_summary=summary)
+            settle_in_session(store, wo, event, payload=payload)
+            return {"wo_id": wo_id, "status": "completed", "session_stopped": False}
+    finally:
+        store.close()
+    if route == SETTLE_BY_FINISH:
+        return finish(wo_id, summary)
+    raise OpsError(f"{wo_id} is a {wo.get('kind') or 'worker'}, whose kind settles by "
+                   f"{route!r} and never by a submission")
+
+
+def submitter_unsettled(what: str, order_id: str, wo_id: str, error: Exception) -> str:
+    """The submission IS stored; only settling its work order failed (io-b521d17b)"""
+    return (f"your {what} for {order_id} IS stored and {order_id} has taken it — do "
+            f"NOT resubmit it. Only settling your work order {wo_id} failed, and that "
+            f"is the OS's to clear, not yours: {error}")
 
 
 def _verdict_duplicate(project: str, subject: str, verdict: dict[str, Any],
@@ -6873,7 +6952,7 @@ def show_feature_order(fo_id: str, project_name: str | None = None) -> dict[str,
                                   "attention_reason", "pr_url", "superseded")},
              "depends_on": store.dependencies(c),
              "status_label": invariants.status_label(store, c)}
-            for c in store.feature_children(fo_id)
+            for c in store.feature_children(fo_id, kinds=WORKER_CHILDREN)
         ]
         planner = None
         if fo.get("plan_wo_id"):
@@ -7073,7 +7152,9 @@ def submit_plan(fo_id: str, doc: Any,
         # The planner has no more to say until the review lands
         summary = f"submitted a plan for {fo_id}: {len(plan['children'])} work orders"
         try:
-            out["planner"] = finish(fo["plan_wo_id"], summary)
+            out["planner"] = _settle_submitter(path, fo["plan_wo_id"], summary,
+                                               "plan_submitted_settled",
+                                               {"feature_order": fo_id})
         except OpsError as e:
             # docs/superpowers/specs/2026-09-27-a-planner-submits-behind-its-spec-pull-request.md
             out["warning"] = _planner_unsettled(path, fo_id, fo["plan_wo_id"],
@@ -7322,7 +7403,7 @@ def cancel_feature_order(fo_id: str, project_name: str | None = None) -> dict[st
         raise OpsError(f"{fo_id} is already {fo['status']}")
     store = ProjectStore(path)
     try:
-        owned = store.feature_children(fo_id)
+        owned = store.feature_children(fo_id, kinds=WORKER_CHILDREN)
         if fo.get("plan_wo_id"):
             try:
                 owned.append(store.get_work_order(fo["plan_wo_id"]))
@@ -7406,7 +7487,7 @@ def resume_feature_order(fo_id: str, fix: str = "",
         )
     store = ProjectStore(path)
     try:
-        children = store.feature_children(fo_id)
+        children = store.feature_children(fo_id, kinds=WORKER_CHILDREN)
         dead = dead_feature_children(store, children)
         if dead:
             store.supersede_children(fo_id, [c["id"] for c in dead], note=fix)
@@ -10299,7 +10380,7 @@ def _cost_for_target(target: str, project: str | None,
                 pass
         units.extend(_unit_row(name, child, index, _turn_rows(store, child["id"]),
                                os_groups.get(child["id"], ()))
-                     for child in store.feature_children(fo["id"]))
+                     for child in store.feature_children(fo["id"], kinds=WORKER_CHILDREN))
     finally:
         store.close()
     return {"scope": fo["id"], "title": fo["title"], "status": fo["status"],
@@ -10416,7 +10497,7 @@ def navigation_report(target: str | None = None, project: str | None = None, *,
                         ids.append(store.get_work_order(planner_id))
                     except KeyError:
                         pass
-                ids.extend(store.feature_children(record["id"]))
+                ids.extend(store.feature_children(record["id"], kinds=WORKER_CHILDREN))
             finally:
                 store.close()
             scope_project = scope_project or name
@@ -10734,7 +10815,7 @@ def inspect_report(target: str, project: str | None = None, *,
             except KeyError:
                 pass
         units.extend(unit(name, child, store)
-                     for child in store.feature_children(fo["id"]))
+                     for child in store.feature_children(fo["id"], kinds=WORKER_CHILDREN))
     finally:
         store.close()
     cfg = settings(name)
@@ -11473,7 +11554,7 @@ def side_effects_of(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
 def feature_side_effects(store: ProjectStore, fo_id: str) -> list[dict[str, Any]]:
     """Every child's side effects, in the feature's own child order"""
     effects: list[dict[str, Any]] = []
-    for child in store.feature_children(fo_id):
+    for child in store.feature_children(fo_id, kinds=WORKER_CHILDREN):
         for effect in side_effects_of(store, str(child["id"])):
             effects.append({**effect, "wo_id": str(child["id"])})
     return effects

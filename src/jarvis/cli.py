@@ -3729,6 +3729,10 @@ def cmd_investigate(args: argparse.Namespace) -> int:
                 print()
                 for line in verdicts.render_verdict(detail["verdict"]):
                     print(line)
+            if detail["assumptions"]:
+                print("\nthe investigator's calls (on record, for nobody's review):")
+                for a in detail["assumptions"]:
+                    print(f"  {a['n']}. {a['content']}")
 
     elif args.inv_cmd == "cancel":
         _print(ops.cancel_investigation_order(args.inv_id, args.project), args.json)

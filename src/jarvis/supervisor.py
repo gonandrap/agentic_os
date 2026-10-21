@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 from . import claude_cli, health, holds, structured
+from .project_store import WORKER_CHILDREN
 
 log = logging.getLogger("supervisor")
 
@@ -506,7 +507,7 @@ def build_evidence(pstore: Any, subject: dict[str, Any],
                 _said_lines(pstore, carrier["id"] if carrier else None, cfg)]
         # An equal share of the budget, so the tree's bound moves with the setting and this module goes on...
         tree = ["# The child tree",
-                *_child_lines(pstore.feature_children(fo_id),
+                *_child_lines(pstore.feature_children(fo_id, kinds=WORKER_CHILDREN),
                               cfg.evidence_budget_chars
                               // (len(sections) + len(rest) + 1))]
         sections += [rest[0], tree, *rest[1:]]

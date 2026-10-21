@@ -62,7 +62,7 @@ def tick_until_reserved(daemon, store, fo_id: str, timeout: float = 15.0) -> dic
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         daemon.tick()
-        cut = [c for c in store.feature_children(fo_id) if c["budget_reserved_usd"]]
+        cut = [c for c in store.feature_children(fo_id, kinds=("worker",)) if c["budget_reserved_usd"]]
         if cut:
             return cut[0]
         time.sleep(0.05)
@@ -478,7 +478,7 @@ def test_two_parallel_children_are_never_handed_the_same_remainder(
     for _ in range(4):
         started.tick()
 
-    children = store.feature_children(fo["id"])
+    children = store.feature_children(fo["id"], kinds=("worker",))
     reserved = [c["budget_reserved_usd"] for c in children
                 if c["budget_reserved_usd"] is not None]
     assert len(reserved) == 2, [dict(c) for c in children]
@@ -513,7 +513,7 @@ def test_a_settled_child_releases_the_rest_of_its_slice(started, store):
     fo = a_feature(started, store, "reader", "writer", budget_usd=12.0)
     for _ in range(4):
         started.tick()
-    children = store.feature_children(fo["id"])
+    children = store.feature_children(fo["id"], kinds=("worker",))
 
     central = CentralStore()
     try:
@@ -535,7 +535,7 @@ def test_a_child_that_runs_out_is_told_what_its_feature_still_has(started, store
     fo = a_feature(started, store, "reader", "writer", budget_usd=12.0)
     for _ in range(4):
         started.tick()
-    child = store.feature_children(fo["id"])[0]
+    child = store.feature_children(fo["id"], kinds=("worker",))[0]
     bill_the_turn(store, child["id"], (child["budget_reserved_usd"] or 0) + 1)
 
     central = CentralStore()
@@ -553,7 +553,7 @@ def test_a_feature_stops_when_the_whole_family_has_spent_its_budget(started, sto
     fo = a_feature(started, store, "reader", "writer", budget_usd=12.0)
     for _ in range(4):
         started.tick()
-    for child in store.feature_children(fo["id"]):
+    for child in store.feature_children(fo["id"], kinds=("worker",)):
         bill_the_turn(store, child["id"], 9.0)
     started.tick()
 
@@ -569,7 +569,7 @@ def test_a_feature_with_no_budget_reserves_nothing(started, store):
     for _ in range(4):
         started.tick()
     assert all(c["budget_reserved_usd"] is None
-               for c in store.feature_children(fo["id"]))
+               for c in store.feature_children(fo["id"], kinds=("worker",)))
     assert budget.pool(store, None, store.get_feature_order(fo["id"])) is None
 
 
@@ -577,7 +577,7 @@ def test_topping_up_a_feature_puts_it_back_to_executing(started, store):
     fo = a_feature(started, store, "reader", budget_usd=12.0)
     for _ in range(4):
         started.tick()
-    for child in store.feature_children(fo["id"]):
+    for child in store.feature_children(fo["id"], kinds=("worker",)):
         bill_the_turn(store, child["id"], 20.0)
     started.tick()
     assert store.get_feature_order(fo["id"])["status"] == "budget_exhausted"
@@ -815,7 +815,7 @@ def test_a_child_stopped_on_its_slice_is_resumable_by_topping_the_child_up(
     fo = a_feature(started, store, "reader", "writer", budget_usd=20.0)
     for _ in range(4):
         started.tick()
-    child = store.feature_children(fo["id"])[0]
+    child = store.feature_children(fo["id"], kinds=("worker",))[0]
     slice_usd = child["budget_reserved_usd"]
     assert slice_usd, "the fixture never reserved, so the claim is vacuous"
 
@@ -858,7 +858,7 @@ def test_a_re_cut_never_promises_money_the_family_does_not_have(started, store):
     fo = a_feature(started, store, "reader", "writer", budget_usd=20.0)
     for _ in range(4):
         started.tick()
-    child = store.feature_children(fo["id"])[0]
+    child = store.feature_children(fo["id"], kinds=("worker",))[0]
     bill_the_turn(store, child["id"], (child["budget_reserved_usd"] or 0) + 0.5)
     started.tick()
 
@@ -1066,7 +1066,7 @@ def test_the_family_is_not_the_worker_children(started, store):
     fo = store.get_feature_order(inv["id"])
 
     assert [c["id"] for c in budget.family(store, fo)] == [child]
-    assert store.feature_children(inv["id"]) == []
+    assert store.feature_children(inv["id"], kinds=("worker",)) == []
 
 
 def test_a_planner_overspending_never_parks_the_feature(started, store):
@@ -1133,7 +1133,7 @@ def test_a_parked_feature_child_still_says_feature(started, store):
     fo = a_feature(started, store, "reader", "writer", budget_usd=12.0)
     for _ in range(4):
         started.tick()
-    child = store.feature_children(fo["id"])[0]
+    child = store.feature_children(fo["id"], kinds=("worker",))[0]
     bill_the_turn(store, child["id"], (child["budget_reserved_usd"] or 0) + 1)
 
     central = CentralStore()

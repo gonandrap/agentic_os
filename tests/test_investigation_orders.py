@@ -894,9 +894,9 @@ def _panel_on(catalog_file) -> None:
     Path(catalog_file).write_text(json.dumps(data))
 
 
-def test_a_verdict_settles_the_investigator_completed_and_stops_it(
+def test_a_verdict_settles_the_investigator_completed_in_its_own_session(
         started, store, catalog_file, fake_claude):
-    """§2.1: `close_out`, not `finish` — completed, flag down, session dead"""
+    """io-d2a5dd69: completed and flag down WITHOUT killing the session the verdict command runs in"""
     from jarvis.daemon import Daemon
 
     _panel_on(catalog_file)
@@ -917,8 +917,9 @@ def test_a_verdict_settles_the_investigator_completed_and_stops_it(
     assert row["result_summary"]
     kinds = [e["kind"] for e in store.list_events(investigator)]
     assert "verdict_submitted_settled" in kinds
-    assert "session_stopped" in kinds
-    assert not claude_cli.process_alive(turn["pid"])
+    # The caller is a child of this turn: stopping it would kill the command mid-write
+    assert "session_stopped" not in kinds
+    assert claude_cli.process_alive(turn["pid"])
     assert store.validation_rounds(wo_id=investigator) == []
 
 

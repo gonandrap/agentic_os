@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import (background, bugreport, bus, claude_cli, db, fleet, holds, inspection,
-               notify, release, usage_meter, worker_session)
+               notify, release, usage_meter, verdicts, worker_session)
 from . import budget as budget_mod
 from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import SETTLED_BACKLOG_STATUSES, CentralStore
@@ -42,6 +42,7 @@ from .project_store import (
     VALIDATION_AUTH_CAUSE,
     VALIDATION_CI_CAUSE,
     VALIDATION_HELD_CAUSE,
+    WORKER_CHILDREN,
     ProjectStore,
     resume_spends_slot,
     validation_hold_until,
@@ -848,6 +849,8 @@ class Daemon:
                 if reconcile:
                     # Immediately after the settlement above
                     self.clear_answered_investigations(project, store)
+                    # Beside it: the investigator's half of a settled investigation
+                    self.settle_landed_investigators(project, store)
                     # The agents roster holds ONLY the user's own sessions: workers are headless and never enter it
                     if sessions_by_project is not None:
                         self.track_injected_sessions(project, store, sessions_by_project)
@@ -1109,7 +1112,7 @@ class Daemon:
 
         # PASS TWO: THE CHILD SETTLEMENT, FEATURE-ONLY BY LIFECYCLE, `kind='feature'` WRITTEN OUT
         for fo in store.list_feature_orders(statuses=("executing",), kind="feature"):
-            children = store.feature_children(fo["id"])
+            children = store.feature_children(fo["id"], kinds=WORKER_CHILDREN)
             if not children:
                 continue  # released with nothing in it; nothing to settle against
             # A superseded child settles its feature NEITHER WAY
@@ -1324,7 +1327,8 @@ class Daemon:
                 if int(p.get("round") or 0) == n]
         covered = {wo_id for p in said if p.get("action") == "nudged"
                    for wo_id in (p.get("children") or ())}
-        landed = tuple(c["id"] for c in store.feature_children(fo_id)
+        landed = tuple(c["id"] for c in store.feature_children(fo_id,
+                                                               kinds=WORKER_CHILDREN)
                        if not c["superseded"] and float(c["created_at"]) > last["ts"])
         fresh = tuple(wo_id for wo_id in landed if wo_id not in covered)
         if fresh:
@@ -4315,6 +4319,10 @@ class Daemon:
                 return
             if pause and not pause.exhausted:
                 return
+            if verdicts.verdict_landed(store, wo):
+                # ASKED OF THE WORK, NOT THE PROCESS: a turn that died after its verdict is no failure
+                self._settle_landed_investigator(store, wo, why="turn_ended_after_verdict")
+                return
             if wo["status"] != "failed":
                 # THE ORDER IS `failed` EITHER WAY
                 delivered = invariants_mod.has_delivered(store, wo)
@@ -4375,7 +4383,7 @@ class Daemon:
             store.add_event(wo["id"], VALIDATION_LANDED, {"round_id": deferred})
             return
         if fresh.get("result_summary"):
-            if store.pending_assumptions(wo["id"]):
+            if invariants_mod.reviewable_assumptions(store, fresh):
                 if fresh["status"] != "needs_review":
                     store.set_status(wo["id"], "needs_review")
                     store.flag_attention(wo["id"], "assumptions pending review")
@@ -4425,6 +4433,40 @@ class Daemon:
 
             store.set_status(wo["id"], "needs_review")
             store.flag_attention(wo["id"], IDLE_NO_FINISH_BLOCKER)
+
+    @staticmethod
+    def _settle_landed_investigator(store: ProjectStore, wo: dict[str, Any], *,
+                                    why: str) -> None:
+        """`completed`, flag down, no notification: what `submit_verdict` writes (io-d2a5dd69)"""
+        from . import ops as ops_mod
+
+        if wo["status"] in ("completed", "cancelled"):
+            # Settled already; `failed` is not, since a stored verdict means it did not fail
+            store.clear_attention(wo["id"])
+            return
+        ops_mod.settle_in_session(store, wo, "verdict_settled_by_reconciler",
+                                  payload={"why": why})
+
+    def settle_landed_investigators(self, project: ProjectSpec,
+                                    store: ProjectStore) -> None:
+        """Retire the status or flag a landed investigator still holds (io-d2a5dd69)"""
+        for fo in store.list_feature_orders(statuses=("completed",),
+                                            kind="investigation"):
+            if not fo.get("plan_wo_id"):
+                continue
+            try:
+                wo = store.get_work_order(fo["plan_wo_id"])
+            except KeyError:
+                continue
+            if wo["status"] == "completed" and not wo["needs_attention"]:
+                continue
+            if wo["status"] == "cancelled" and not wo["needs_attention"]:
+                continue
+            if not verdicts.verdict_landed(store, wo):
+                continue
+            self._settle_landed_investigator(store, wo, why="verdict_already_landed")
+            log.info("[%s] %s: investigator of %s settled on its stored verdict (was %s)",
+                     project.name, wo["id"], fo["id"], wo["status"])
 
     def _park_on_signin(self, store: ProjectStore, wo: dict[str, Any],
                         pause: worker_session.TurnPause,

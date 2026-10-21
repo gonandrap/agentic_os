@@ -30,6 +30,8 @@ from .project_store import (
     UNGOVERNED_ORIGINS,
     VALIDATION_AUTH_CAUSE,
     VALIDATION_HELD_CAUSE,
+    WORKER_CHILDREN,
+    kind_contract,
     validation_hold,
 )
 
@@ -321,7 +323,7 @@ def dead_feature_children(store: ProjectStore,
 def outstanding_feature_children(store: ProjectStore,
                                  fo_id: str) -> list[dict[str, Any]]:
     """The children this feature has not finished with: non-settled, non-superseded"""
-    return _outstanding(store.feature_children(fo_id))
+    return _outstanding(store.feature_children(fo_id, kinds=WORKER_CHILDREN))
 
 
 def _outstanding(children: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -341,7 +343,7 @@ def outstanding_children_note(store: ProjectStore, wo: dict[str, Any]) -> str:
     if wo.get("kind") != "manager" or wo["status"] != "idle" or not wo.get("parent_id"):
         return ""
     fo_id = str(wo["parent_id"])
-    children = store.feature_children(fo_id)
+    children = store.feature_children(fo_id, kinds=WORKER_CHILDREN)
     outstanding = _outstanding(children)
     if not outstanding:
         return ""
@@ -558,11 +560,19 @@ def _os_is_confirming(a: dict[str, Any]) -> bool:
     return verdict == "object" and bool(a.get("objection_delivered_ts"))
 
 
+def reviewable_assumptions(store: ProjectStore,
+                           wo: dict[str, Any]) -> list[dict[str, Any]]:
+    """The pending assumptions that are the USER's to review (io-d2a5dd69)"""
+    if not kind_contract(wo).assumptions_reviewed:
+        return []
+    return store.pending_assumptions(wo["id"])
+
+
 def true_blockers(store: ProjectStore, wo: dict[str, Any],
                   now: float | None = None) -> list[str]:
     """The reasons this work order genuinely needs the user, derived from state alone"""
     blockers: list[str] = []
-    pending = store.pending_assumptions(wo["id"])
+    pending = reviewable_assumptions(store, wo)
     # §9: FIRST, because it is the more specific fact about the same assumption
     if any(objection_undeliverable(store, a) for a in pending):
         blockers.append(OBJECTION_UNDELIVERABLE_BLOCKER)
@@ -2078,7 +2088,7 @@ def check_feature_failures_are_real(store: ProjectStore) -> Iterator[Violation]:
             "SELECT id, attention_reason FROM feature_orders WHERE status='failed'"
     ).fetchall():
         fo_id = row["id"]
-        children = store.feature_children(fo_id)
+        children = store.feature_children(fo_id, kinds=WORKER_CHILDREN)
         if not children or dead_feature_children(store, children):
             continue
         store.set_feature_status(fo_id, "executing")

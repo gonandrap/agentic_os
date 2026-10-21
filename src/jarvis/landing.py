@@ -113,8 +113,8 @@ def worktree_of(project_path: Path, wo: dict[str, object]) -> Path | None:
     return worker_session.worktree_path(ProjectRef(project_path), wo)  # type: ignore[arg-type]
 
 
-def authored(worktree: Path | None) -> Authored:
-    """Has this worktree produced anything?"""
+def authored(worktree: Path | None, artifacts: tuple[str, ...] = ()) -> Authored:
+    """Has this worktree produced anything, its kind's own `artifacts` aside? (io-b521d17b)"""
     if worktree is None or not worktree.is_dir():
         return Authored(unreadable="no worktree on disk")
     base = base_ref(worktree)
@@ -127,7 +127,8 @@ def authored(worktree: Path | None) -> Authored:
     status = _git(worktree, "status", "--porcelain", "--untracked-files=all")
     if branch is None or count is None or status is None:
         return Authored(unreadable="git could not read the worktree")
-    dirty = tuple(line[3:] for line in status.splitlines() if line[3:])
+    dirty = tuple(line[3:] for line in status.splitlines()
+                  if line[3:] and line[3:] not in artifacts)
     return Authored(branch=branch.strip(), base=base,
                     commits=int(count.strip()) if count.strip().isdigit() else 0,
                     dirty=dirty)

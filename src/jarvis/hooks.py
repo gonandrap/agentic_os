@@ -22,7 +22,7 @@ from .navigation import (
     is_spec_path,
     navigates_source,
 )
-from .project_store import ProjectStore
+from .project_store import WO_KIND_CONTRACTS, ProjectStore
 
 # A Bash command every worker must be able to run without a permission prompt: a chain of `cd <dir>`...
 _SHELL_DANGEROUS = re.compile(r"[|;`$<>]")
@@ -671,8 +671,8 @@ def crew_edit_decision(payload: dict[str, Any],
     )
 
 
-#: The one file an investigator may write, relative to its worktree
-VERDICT_FILE = "verdict.json"
+#: The one file an investigator may write, relative to its worktree — its row in the kind table
+VERDICT_FILE = WO_KIND_CONTRACTS["investigator"].artifact
 
 #: `(program, subcommand)` pairs an investigator may run (docs/superpowers/specs/2026-09-27-investigation-orders.md)
 INVESTIGATOR_READS = frozenset({

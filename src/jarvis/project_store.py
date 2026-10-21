@@ -178,6 +178,56 @@ UNGOVERNED_ORIGINS = ("adhoc", "injected")
 # What a work order IS to the OS, which is not the same question as what it is about (docs/superpowers/specs/2026-09-27-investigation-orders.md)
 WO_KINDS = ("worker", "planner", "manager", "analyst", "investigator")
 
+#: How a kind's work order settles: through `ops.finish`'s join (assumptions, panel, landing)
+SETTLE_BY_FINISH = "finish"
+#: …or by its submission alone, written in the session that submits it and never stopping it
+SETTLE_IN_SESSION = "in_session"
+#: …or never: it idles between messages until its feature settles (#264)
+SETTLE_IDLE = "idle"
+
+
+@dataclass(frozen=True)
+class KindContract:
+    """What one work-order kind hands back, and how that settles it (io-b521d17b)"""
+
+    route: str
+    #: The worktree file its contract command consumes — never stranded work
+    artifact: str = ""
+    #: That contract command, with `{fo_id}` for the order it reports on
+    submit: str = ""
+    #: May it commit, push and open a pull request?
+    lands_code: bool = True
+    #: Are its assumptions the user's to review?
+    assumptions_reviewed: bool = True
+
+
+#: ONE ROW PER KIND, read by every submit path, `landing.authored`'s dirty set and the refusals
+WO_KIND_CONTRACTS: dict[str, KindContract] = {
+    "worker": KindContract(SETTLE_BY_FINISH),
+    "planner": KindContract(SETTLE_BY_FINISH, artifact="plan.json",
+                            submit="jarvis fo plan {fo_id} --from-file plan.json"),
+    "manager": KindContract(SETTLE_IDLE),
+    # By FINISH, not in session: a refused assumption is answered from the same session
+    "analyst": KindContract(SETTLE_BY_FINISH, artifact="report.json",
+                            submit="jarvis io report {fo_id} --from-file report.json",
+                            lands_code=False),
+    "investigator": KindContract(
+        SETTLE_IN_SESSION, artifact="verdict.json",
+        submit="jarvis investigate verdict {fo_id} --from-file verdict.json",
+        lands_code=False, assumptions_reviewed=False),
+}
+
+
+def kind_contract(wo: Mapping[str, Any]) -> KindContract:
+    """The contract row for this work order's kind"""
+    return WO_KIND_CONTRACTS[str(wo.get("kind") or "worker")]
+
+
+def submission_artifacts(wo: Mapping[str, Any]) -> tuple[str, ...]:
+    """The file this kind's contract command consumes, as `landing.authored` excludes it"""
+    artifact = kind_contract(wo).artifact
+    return (artifact,) if artifact else ()
+
 # A work order with a LIVE SESSION: dispatched, running, or parked mid-conversation on somebody else (#134)
 ACTIVE_STATUSES = ("dispatching", "running", "waiting_input", "validating")
 
@@ -248,6 +298,30 @@ FO_STATUS_LABELS: dict[str, dict[str, str]] = {
 def feature_status_label(kind: str | None, status: str) -> str:
     """What to PRINT for a feature-order status, given the row's kind"""
     return FO_STATUS_LABELS.get(kind or "feature", {}).get(status, status)
+
+
+#: The command that shows the user a family's decision, per kind — the CLI refuses the others
+FO_DECIDE_COMMANDS = {
+    "feature": "jarvis fo show {fo_id}",
+    "improvement": "jarvis io review {fo_id}",
+    "investigation": "jarvis investigate show {fo_id}",
+}
+
+
+def decide_command(kind: str | None, fo_id: str) -> str:
+    """`FO_DECIDE_COMMANDS` for one row"""
+    return FO_DECIDE_COMMANDS[kind or "feature"].format(fo_id=fo_id)
+
+
+#: Which child kinds a family's progress counts: the work it exists to get done
+FAMILY_CHILD_KINDS: dict[str, tuple[str, ...]] = {
+    "feature": ("worker",),
+    "improvement": ("analyst",),
+    "investigation": ("investigator",),
+}
+
+#: `feature_children(kinds=…)` for the callers that mean a feature's planned work orders
+WORKER_CHILDREN: tuple[str, ...] = ("worker",)
 
 
 def is_feature_order_id(unit_id: str) -> bool:
@@ -2187,9 +2261,12 @@ class ProjectStore:
         return {row["status"]: int(row["n"]) for row in rows}
 
     def flagged_feature_orders(self) -> list[dict[str, Any]]:
-        """Every feature order asking for the user, whatever its status OR KIND"""
+        """Every FAMILY asking for the user, by its own flag or a child's, whatever its KIND"""
         rows = self.conn.execute(
-            "SELECT * FROM feature_orders WHERE needs_attention=1 ORDER BY created_at DESC"
+            """SELECT * FROM feature_orders f WHERE f.needs_attention=1
+                   OR EXISTS (SELECT 1 FROM work_orders w WHERE w.parent_id=f.id
+                              AND w.needs_attention=1 AND w.hidden=0)
+               ORDER BY created_at DESC"""
         ).fetchall()
         return db.rows_to_dicts(rows)
 
@@ -2222,13 +2299,18 @@ class ProjectStore:
     def clear_feature_attention(self, fo_id: str) -> None:
         self.update_feature_order(fo_id, needs_attention=0, attention_reason=None)
 
-    def feature_children(self, fo_id: str) -> list[dict[str, Any]]:
-        """The feature order's child work orders, oldest first"""
-        rows = self.conn.execute(
-            "SELECT * FROM work_orders WHERE parent_id=? AND kind='worker' "
-            "ORDER BY created_at",
-            (fo_id,),
-        ).fetchall()
+    def feature_children(self, fo_id: str, *,
+                         kinds: tuple[str, ...] | None) -> list[dict[str, Any]]:
+        """The family's child work orders, oldest first: `kinds` REQUIRED, None for all"""
+        if kinds is None:
+            rows = self.conn.execute(
+                "SELECT * FROM work_orders WHERE parent_id=? ORDER BY created_at",
+                (fo_id,)).fetchall()
+        else:
+            marks = ",".join("?" * len(kinds))
+            rows = self.conn.execute(
+                f"SELECT * FROM work_orders WHERE parent_id=? AND kind IN ({marks}) "
+                "ORDER BY created_at", (fo_id, *kinds)).fetchall()
         answered = {s["wo_id"] for s in self.superseded_children(fo_id)}
         return [{**c, "superseded": c["id"] in answered}
                 for c in db.rows_to_dicts(rows)]
