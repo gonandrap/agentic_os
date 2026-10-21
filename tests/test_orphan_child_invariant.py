@@ -68,10 +68,11 @@ def test_the_flagged_parent_shows_on_the_default_listing(store, jarvis_home, fak
     """A settled parent is hidden behind --all; a flagged one is not"""
     ops.start_os(str(catalog_file), foreground=True)
     fo, _ = the_wo_6be2ab21_shape(store)
-    assert fo["id"] not in [r["id"] for r in ops.list_investigation_orders("proj_a")]
+    assert not store.get_feature_order(fo["id"])["needs_attention"]
 
     invariants.check_project(store)
 
+    assert store.get_feature_order(fo["id"])["needs_attention"]
     assert fo["id"] in [r["id"] for r in ops.list_investigation_orders("proj_a")]
 
 
