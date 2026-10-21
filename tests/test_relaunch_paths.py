@@ -18,10 +18,16 @@ DECISION = "compact_before_relaunch"
 EXEMPT: dict[str, str] = {
     "worker_session.start": "the transport itself; the decision is above it",
     "worker_session.send": "the transport itself; the decision is above it",
-    "worker_session.retry": "the transport itself; the decision is above it",
     "worker_session.compact": "the transport itself; the decision is above it",
     "worker_session._compact_or_withdraw": "the withdrawal wrapper around the action",
     "worker_session.compact_before_relaunch": "the decision itself",
+}
+
+
+#: A launcher that is not the transport and is not a compaction decision either
+GUARDED: dict[str, str] = {
+    # A paused `/compact` that already compacted has nothing to relaunch (io-12b7d873)
+    "worker_session.retry": "compaction_landed",
 }
 
 
@@ -108,7 +114,8 @@ def test_every_relaunch_path_reaches_the_shared_compaction_decision():
     assert sites, "the AST walk found no launch sites at all — a rename made it vacuous"
     bad = [f"{module}.py:{line} {qual} calls worker_session.{launcher}"
            for module, line, qual, launcher in sites
-           if qual not in EXEMPT and not _reaches_decision(module, qual)]
+           if qual not in EXEMPT and qual not in GUARDED
+           and not _reaches_decision(module, qual)]
     assert not bad, (
         "these relaunch paths launch a turn without asking "
         f"`worker_session.{DECISION}`:\n  " + "\n  ".join(bad)
@@ -146,3 +153,38 @@ def test_the_enclosing_names_resolved_here_do_not_collide():
         + "\n  ".join(clashes)
         + "\n\nKey `_functions` by `Class.name`, falling back to the bare name, before "
           "trusting what `_reaches_decision` says about these.")
+
+
+def test_retry_asks_whether_a_paused_compaction_already_landed():
+    """Its own case, not an exemption: the exemption is what let a summary be summarised (io-12b7d873)"""
+    for qual, question in GUARDED.items():
+        module, name = qual.split(".", 1)
+        body = _functions(ast.parse((SRC / f"{module}.py").read_text()))[name]
+        assert question in _called_names(body), (
+            f"{qual} must ask `{question}` before it relaunches anything")
+
+
+#: What a relaunch of a PAUSED turn must be gated on: the turn having FAILED
+STATE_QUESTIONS = {"turn_pause", "retries_turn"}
+
+
+def _asks_the_state(node: ast.AST) -> bool:
+    """Does this body diagnose a pause, or compare a turn's state to "failed"?"""
+    if STATE_QUESTIONS & _called_names(node):
+        return True
+    return any(isinstance(sub, ast.Constant) and sub.value == "failed"
+               for sub in ast.walk(node))
+
+
+def test_every_caller_of_retry_relaunches_only_a_failed_turn():
+    """A budget top-up handed `retry` a turn that had COMPLETED — wo-9f00e3b5's second compaction"""
+    callers = [(module, line, qual) for module, line, qual, launcher in _sites()
+               if launcher == "retry" and qual not in GUARDED]
+    assert callers, "no caller of worker_session.retry found — a rename made this vacuous"
+    bad = []
+    for module, line, qual in callers:
+        body = _functions(ast.parse((SRC / f"{module}.py").read_text()))[qual.split(".")[-1]]
+        if not _asks_the_state(body):
+            bad.append(f"{module}.py:{line} {qual}")
+    assert not bad, ("these hand `retry` a turn without asking whether it FAILED:\n  "
+                     + "\n  ".join(bad))

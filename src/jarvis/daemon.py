@@ -1585,6 +1585,11 @@ class Daemon:
             except Exception:  # noqa: BLE001 — one work order must not stall the rest
                 log.exception("[%s] retry of %s failed", project.name, wo["id"])
                 continue
+            if turn is None:
+                # The paused compaction had landed: what is queued behind it goes out on delivery
+                log.info("[%s] %s: compaction turn %s had landed, nothing relaunched",
+                         project.name, wo["id"], pause.turn["seq"])
+                continue
             if state is not None:
                 state.launched()
             if takes_a_slot:

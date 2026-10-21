@@ -1058,6 +1058,8 @@ ADDED_COLUMNS = {
         "context_json": "TEXT",
         # WHICH CACHE-TTL ARM this turn was launched on (catalog.VALID_WORKER_CACHE_TTL) (docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md)
         "cache_ttl": "TEXT NOT NULL DEFAULT ''",
+        # WHAT A COMPACTION TURN ACHIEVED: a boundary, `{}` for none, NULL never read
+        "compaction_json": "TEXT",
     },
     "validation_rounds": {
         # WHICH CONFIGURATION JUDGED THIS ROUND
@@ -2840,8 +2842,13 @@ class ProjectStore:
             (wo_id,)).fetchall()
         return {str(r["kind"]): int(r["n"]) for r in rows}
 
-    def list_events(self, wo_id: str, limit: int = 200) -> list[dict[str, Any]]:
-        """The NEWEST `limit` events, oldest first (io-df4fa1e3: the oldest 200 hid a long order's last week)"""
+    def list_events(self, wo_id: str, limit: int | None = 200, *,
+                    newest: bool = True) -> list[dict[str, Any]]:
+        """Events oldest first; `limit` keeps the NEWEST that many (io-df4fa1e3), None keeps all"""
+        if limit is None:
+            rows = self.conn.execute(
+                "SELECT * FROM wo_events WHERE wo_id=? ORDER BY ts, id", (wo_id,)).fetchall()
+            return db.rows_to_dicts(rows)
         rows = self.conn.execute(
             "SELECT * FROM (SELECT * FROM wo_events WHERE wo_id=? "
             "ORDER BY ts DESC, id DESC LIMIT ?) ORDER BY ts, id", (wo_id, limit)
@@ -3104,6 +3111,30 @@ class ProjectStore:
             "UPDATE wo_turns SET usage_json=?, cost_usd=COALESCE(?, cost_usd), "
             "cost_source=CASE WHEN ? IS NULL THEN cost_source ELSE ? END WHERE id=?",
             (usage_json, cost, cost, COST_FROM_ENVELOPE, turn_id))
+
+    def set_turn_compaction(self, turn_id: int, found: dict[str, Any] | None) -> None:
+        """Record what a compaction turn's transcript says it did — `found` None is NO boundary"""
+        record = ({"pre": int(found.get("pre") or 0), "post": int(found.get("post") or 0)}
+                  if found else {})
+        self.conn.execute("UPDATE wo_turns SET compaction_json=? WHERE id=?",
+                          (db.to_json(record), turn_id))
+
+    def settle_turn_landed(self, turn_id: int) -> None:
+        """A failed turn the record proves did what it was for: `done`, the error kept as history"""
+        self.conn.execute("UPDATE wo_turns SET state='done' WHERE id=? AND state='failed'",
+                          (turn_id,))
+
+    def compaction_turns_since(self, since: float) -> list[dict[str, Any]]:
+        """Every compaction turn started since `since`, with the turn before it, oldest first"""
+        rows = self.conn.execute(
+            """SELECT t.*, p.kind AS prev_kind, p.state AS prev_state,
+                      p.seq AS prev_seq, p.compaction_json AS prev_compaction_json
+                 FROM wo_turns t
+                 LEFT JOIN wo_turns p ON p.wo_id = t.wo_id AND p.seq = t.seq - 1
+                WHERE t.kind = ? AND t.started_at >= ?
+                ORDER BY t.started_at""",
+            (COMPACT_TURN, since)).fetchall()
+        return db.rows_to_dicts(rows)
 
     def latest_turn(self, wo_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(

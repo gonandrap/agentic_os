@@ -60,6 +60,22 @@ def _readable_conversation(detail: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+#: How many of a work order's newest events `jarvis wo show` renders by default
+WO_SHOW_EVENTS = 200
+
+
+def _readable_events(detail: dict[str, Any]) -> dict[str, Any]:
+    """The event counts as one sentence, and only when something was cut"""
+    row = dict(detail)
+    row.pop("events_shown", None)
+    hidden = row.pop("events_hidden", 0) or 0
+    if hidden:
+        row["events_hidden"] = (
+            f"{hidden} earlier event{'s' if hidden != 1 else ''} not shown — "
+            f"`jarvis wo show {row.get('id')} --events 0` renders them all")
+    return row
+
+
 def _readable_preconditions(detail: dict[str, Any]) -> dict[str, Any]:
     """The holds collapsed to one line each — §2.7"""
     row = dict(detail)
@@ -730,6 +746,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--project")
     s.add_argument("--debug", action="store_true",
                    help="include plumbing entries (message delivery, session hooks)")
+    s.add_argument("--events", type=int, default=WO_SHOW_EVENTS, metavar="N",
+                   help=f"how many of the NEWEST events the timeline renders (default "
+                        f"{WO_SHOW_EVENTS}); 0 renders every one")
 
     # §9.2 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md
     m = wo.add_parser("send", help="send feedback to the worker handling a work order — "
@@ -3202,7 +3221,10 @@ def cmd_wo(args: argparse.Namespace) -> int:
         name, path, wo = ops.find_work_order(args.wo_id, args.project)
         store = ProjectStore(path)
         try:
-            events = store.list_events(args.wo_id)
+            # THE NEWEST PAGE, and the cut said out loud (io-12b7d873)
+            events = store.list_events(args.wo_id, limit=args.events or None,
+                                       newest=True)
+            hidden = store.count_events(args.wo_id) - len(events)
             messages = store.list_messages(args.wo_id)
             detail = {
                 "project": name, **wo,
@@ -3213,6 +3235,9 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 "preconditions": ops.open_preconditions(store, wo),
                 # What has already been dismissed on this order, decoded
                 "seen_blockers": invariants.acknowledged(wo),
+                # Always present under `--json`: a quiet order and a cut one must read differently
+                "events_shown": len(events),
+                "events_hidden": hidden,
                 "timeline": build_timeline(wo, events, messages,
                                            include_debug=args.debug),
                 # What was said, in order, whoever spoke
@@ -3263,7 +3288,7 @@ def cmd_wo(args: argparse.Namespace) -> int:
             _readable_automerge(_readable_harvest(_readable_alarms(
                 _readable_time_in_state(_readable_rounds(_readable_issues(
                     _readable_self_evolution(_readable_preconditions(
-                        _readable_conversation(detail)))))))))))))
+                        _readable_events(_readable_conversation(detail))))))))))))))
                if not args.json else detail, args.json)
 
     elif args.wo_cmd == "send":

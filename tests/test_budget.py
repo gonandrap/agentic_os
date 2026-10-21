@@ -822,6 +822,10 @@ def test_a_child_stopped_on_its_slice_is_resumable_by_topping_the_child_up(
     # Billed rather than acted out through the fake CLI: exhaustion is answered from the ACCOUNTING
     store.set_status(child["id"], "running")
     bill_the_turn(store, child["id"], slice_usd + 1.0)
+    # CUT SHORT by the slice: a top-up relaunches only a turn that FAILED (io-12b7d873)
+    store.conn.execute("UPDATE wo_turns SET state='failed', error=? WHERE id=?",
+                       ("Reached maximum budget ($1.0)",
+                        store.latest_turn(child["id"])["id"]))
     started.tick()
     assert store.get_work_order(child["id"])["status"] == "budget_exhausted"
 

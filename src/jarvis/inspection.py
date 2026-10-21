@@ -1141,6 +1141,11 @@ ALARM_KINDS = {
                                "breach of the transport's 5-minute guarantee",
     CACHE_1H_FOREIGN_ALARM: "sessions Jarvis never dispatched bought the one-hour cache "
                             "write — reportable, not fixable from inside the OS",
+    # The compaction post-conditions, raised by `invariants.check_compactions_hold`
+    "compaction-chained": "a compaction run on a conversation the previous turn had "
+                          "already compacted — it summarised the summary",
+    "compaction-unproven": "a compaction recorded as done with no boundary and no "
+                           "achieved size — nothing shows it shrank the conversation",
 }
 
 

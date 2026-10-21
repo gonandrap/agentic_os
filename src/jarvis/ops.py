@@ -12096,14 +12096,24 @@ def _resume_after_budget(store: ProjectStore, project_name: str,
     )
     store.set_status(wo["id"], "running")
     store.clear_attention(wo["id"])
+    queued = store.queued_messages(wo["id"])
     # A RELAUNCH THIS ORDER IS ALREADY HOLDING IS THE RESUME
-    if any(m["source"] == worker_session.RESUME_SOURCE
-           for m in store.queued_messages(wo["id"])):
+    if any(m["source"] == worker_session.RESUME_SOURCE for m in queued):
         return True, "its queued relaunch goes out on the next tick"
+    # DECIDED BY THE TURN'S STATE, NOT ITS KIND: only a FAILED turn is relaunched (io-12b7d873)
+    if turn["state"] != "failed":
+        if queued:
+            return True, "its queued message goes out on the next tick"
+        return True, (f"nothing to relaunch — turn {turn['seq']} had finished; it "
+                      "settles from its record on the next tick")
     try:
         turn_row = worker_session.compact_before_relaunch(
             store, spec, wo, catalog.os.compact_min_context, pause=pause)
         fresh = turn_row or worker_session.retry(store, spec, wo, pause)
+        if fresh is None:
+            return True, (f"turn {turn['seq']}'s compaction had landed — "
+                          + ("its queued message goes out on the next tick" if queued
+                             else "nothing left to relaunch"))
     except budget.BudgetExhausted as e:
         budget.escalate(store, store.get_work_order(wo["id"]), e.exhausted)
         return False, "still has no headroom — it stopped again immediately"
