@@ -71,7 +71,7 @@ stops the order and its analyst. Orders already filed from accepted findings sta
 
 ## `jarvis investigate <wo-id|fo-id|io-id> --why "what you saw"`
 
-an INVESTIGATION order: one order is not moving and you want the cause. A read-only session reads the record and NEVER writes code — a hook refuses every write and every mutating command. It SETTLES ITSELF, unlike `io`, with one of four verdicts: GAP (files an EXPEDITED bug after a duplicate check, so the fix ships a release), WAITING_ON_USER (the only one that asks for you), TRANSIENT, ALREADY_TRACKED. One live per subject.
+an INVESTIGATION order: one order is not moving and you want the cause. A read-only session reads the record and NEVER writes code — a hook refuses every write and every mutating command. It SETTLES ITSELF, unlike `io`, with one of four verdicts: GAP (files an issue after a duplicate check, nothing dispatched), WAITING_ON_USER (the only one that asks for you), TRANSIENT, ALREADY_TRACKED. One live per subject.
 
 ## `jarvis investigate list / show <inv-id> / cancel <inv-id>`
 
