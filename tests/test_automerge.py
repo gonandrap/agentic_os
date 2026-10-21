@@ -1787,10 +1787,10 @@ def test_the_blocker_is_re_derivable_and_is_not_relabelled(started, project, fak
 
 def a_hold(store, wo_id: str, code: str, *, round_n: int, head_sha: str = JUDGED,
            reason: str = "round 1 is waiting for CI") -> None:
-    """One `automerge_held` event, exactly as `Daemon._note_automerge_held` writes it"""
-    store.add_event(wo_id, "automerge_held", {
-        "code": code, "reason": reason, "judged_sha": JUDGED, "head_sha": head_sha,
-        "round": round_n})
+    """One `automerge_held` event, through the writer's OWN payload builder"""
+    store.add_event(wo_id, "automerge_held", automerge.hold_payload(
+        automerge.Decision(armed=False, code=code, reason=reason, judged_sha=JUDGED,
+                           head_sha=head_sha, round_n=round_n)))
 
 
 def open_round(store, wo_id: str, outcome: str = "") -> int:
@@ -2057,3 +2057,171 @@ def test_the_round_line_beside_a_re_judging_hold_describes_the_round_and_no_hold
     assert line.startswith(f"round {running} · ")
     assert "pending" in line
     assert "held" not in line and "the head moved under the pass" not in line
+
+
+# -- a merge held for running checks is not stuck
+
+T0 = 1_700_000_000.0
+MINUTE = 60.0
+NOW = T0 + 60 * MINUTE
+#: A FRESH horizon for the cases that are not about staleness: §3's `min(now
+FRESH = NOW
+RUNNING_REASON = "CI has not finished on this commit — 1 check(s) still running"
+
+
+def am_event(kind: str, ts: float, **payload) -> dict:
+    """One `AUTOMERGE_EVENTS` row in the shape `ProjectStore.events_of_kind` returns"""
+    import json as _json
+
+    return {"kind": kind, "ts": ts, "payload": _json.dumps(payload)}
+
+
+def a_hold_event(ts: float, code: str = automerge.HELD_CHECKS_RUNNING,
+                 reason: str = RUNNING_REASON, round_n: int = 1,
+                 head_sha: str = JUDGED) -> dict:
+    """One `automerge_held` row whose PAYLOAD comes from the writer's own builder"""
+    return am_event("automerge_held", ts, **automerge.hold_payload(
+        automerge.Decision(armed=False, code=code, reason=reason, judged_sha=JUDGED,
+                           head_sha=head_sha, round_n=round_n)))
+
+
+def a_running_hold(ts: float, **over) -> dict:
+    return a_hold_event(ts, **over)
+
+
+def test_a_hold_is_a_span_to_the_next_automerge_event_of_any_kind():
+    """§4: the successor dates the end"""
+    rows = [a_running_hold(T0 + MINUTE),
+            am_event("automerge_proposed", T0 + 6 * MINUTE)]
+
+    assert ops.automerge_checks_hold_spans(rows, T0, NOW, FRESH) == \
+        [(T0 + MINUTE, T0 + 6 * MINUTE)]
+
+
+def test_a_later_hold_of_another_code_closes_the_span_too():
+    """§4: a hold that lapsed is superseded by SOME event, and a differently-coded hold is one"""
+    rows = [a_running_hold(T0 + MINUTE),
+            a_hold_event(T0 + 4 * MINUTE, code=automerge.HELD_CHECKS_FAILED,
+                         reason="CI failed: unit")]
+
+    assert ops.automerge_checks_hold_spans(rows, T0, NOW, FRESH) == \
+        [(T0 + MINUTE, T0 + 4 * MINUTE)]
+
+
+def test_two_holds_in_sequence_are_two_spans():
+    rows = [a_running_hold(T0 + MINUTE),
+            am_event("automerge_proposed", T0 + 3 * MINUTE),
+            a_running_hold(T0 + 10 * MINUTE),
+            am_event("automerge_failed", T0 + 12 * MINUTE)]
+
+    assert ops.automerge_checks_hold_spans(rows, T0, NOW, FRESH) == \
+        [(T0 + MINUTE, T0 + 3 * MINUTE), (T0 + 10 * MINUTE, T0 + 12 * MINUTE)]
+
+
+def test_a_hold_with_no_successor_ends_at_the_horizon():
+    """§4, and it SUPERSEDES Neo 1992's option (a): nothing dates the end"""
+    rows = [a_running_hold(T0 + MINUTE)]
+    horizon = T0 + 40 * MINUTE
+
+    assert ops.automerge_checks_hold_spans(rows, T0, NOW, horizon) == \
+        [(T0 + MINUTE, horizon)]
+
+
+def test_a_successor_after_the_horizon_is_clipped_at_the_horizon():
+    """§4's outage sentence: `gh` stopped answering"""
+    rows = [a_running_hold(T0 + MINUTE), am_event("automerge_proposed", T0 + 55 * MINUTE)]
+    horizon = T0 + 20 * MINUTE
+
+    assert ops.automerge_checks_hold_spans(rows, T0, NOW, horizon) == \
+        [(T0 + MINUTE, horizon)]
+
+
+def test_a_horizon_of_zero_yields_no_span_at_all():
+    """§3's degradation, both of its cases: no `checked_at` on the fact"""
+    rows = [a_running_hold(T0 + MINUTE), am_event("automerge_proposed", T0 + 6 * MINUTE)]
+
+    assert ops.automerge_checks_hold_spans(rows, T0, NOW, 0.0) == []
+
+
+def test_a_span_wholly_before_the_status_began_contributes_nothing():
+    rows = [a_running_hold(T0 - 20 * MINUTE),
+            am_event("automerge_proposed", T0 - 10 * MINUTE)]
+
+    assert ops.automerge_checks_hold_spans(rows, T0, NOW, FRESH) == []
+
+
+def test_the_spans_are_clipped_and_never_the_rows():
+    """§4, `plan_hold_spans`' rule: a hold that opened before the current status span is the normal case"""
+    rows = [a_running_hold(T0 - 10 * MINUTE),
+            am_event("automerge_proposed", T0 + 5 * MINUTE),
+            a_running_hold(T0 + 20 * MINUTE),
+            am_event("automerge_decided", T0 + 90 * MINUTE)]
+
+    assert ops.automerge_checks_hold_spans(rows, T0, NOW, FRESH) == \
+        [(T0, T0 + 5 * MINUTE), (T0 + 20 * MINUTE, NOW)]
+
+
+def test_rows_handed_over_out_of_order_are_still_walked_in_ts_order():
+    """The caller concatenates one `events_of_kind` read per kind, so the rows arrive grouped by kind"""
+    rows = [am_event("automerge_proposed", T0 + 6 * MINUTE), a_running_hold(T0 + MINUTE)]
+
+    assert ops.automerge_checks_hold_spans(rows, T0, NOW, FRESH) == \
+        [(T0 + MINUTE, T0 + 6 * MINUTE)]
+
+
+def live_hold_state(**over) -> dict:
+    """What `ops.automerge_state` returns over one live hold: the writer's payload plus the two keys that..."""
+    return {**automerge.hold_payload(
+        automerge.Decision(armed=False, code=automerge.HELD_CHECKS_RUNNING,
+                           reason=RUNNING_REASON, judged_sha=JUDGED, head_sha=JUDGED,
+                           round_n=1)),
+        "kind": "automerge_held", "ts": T0, **over}
+
+
+def test_the_note_names_the_commit_and_quotes_the_stored_reason():
+    """§5: the sentence the sweep's blocker column prints, built from what the poll wrote down"""
+    note = invariants.automerge_checks_note(live_hold_state())
+
+    assert note == (f"waiting for GitHub's checks on {JUDGED[:10]} — {RUNNING_REASON}")
+
+
+@pytest.mark.parametrize("state", [
+    None,
+    {"kind": "automerge_proposed", "approval_id": 1},
+    live_hold_state(stale=True),
+    live_hold_state(code=automerge.HELD_CHECKS_FAILED),
+    live_hold_state(code=automerge.HELD_CHECKS_NONE),
+    live_hold_state(code=automerge.HELD_BASE_RED),
+    live_hold_state(code=automerge.HELD_MERGE_STATE_UNCLEAN),
+    live_hold_state(code=automerge.HELD_SHA_MOVED),
+    live_hold_state(code=automerge.HELD_NOT_PASSED),
+    live_hold_state(code=automerge.HELD_ASSUMPTIONS),
+])
+def test_only_a_live_checks_running_hold_gets_a_note(state):
+    """§3's triple test, performed by the helper itself: every other code names something a person or a..."""
+    assert invariants.automerge_checks_note(state) == ""
+
+
+def test_the_stored_reason_is_flattened_and_clamped_for_the_column():
+    """The sweep's blocker COLUMN renders this verbatim"""
+    note = invariants.automerge_checks_note(
+        live_hold_state(reason="CI has not finished\non this commit — " + "x" * 300))
+
+    assert "\n" not in note
+    assert note.endswith("…")
+    assert len(note) <= len(f"waiting for GitHub's checks on {JUDGED[:10]} — ") + \
+        invariants.AUTOMERGE_CHECKS_REASON_CHARS
+
+
+def test_the_note_arms_no_flag_and_names_no_blocker(started, project):
+    """§5: FLAGLESS"""
+    store, wo = arm(started, project, auto_merge=True)
+    before = invariants.true_blockers(store, store.get_work_order(wo["id"]))
+    a_hold(store, wo["id"], automerge.HELD_CHECKS_RUNNING, round_n=1,
+           reason=RUNNING_REASON)
+
+    row = store.get_work_order(wo["id"])
+
+    assert invariants.automerge_checks_note(ops.automerge_state(store, row))
+    assert invariants.true_blockers(store, row) == before
+    assert list(invariants.check_blocked_work_is_surfaced(store)) == []
