@@ -1413,6 +1413,101 @@ def test_a_rejected_user_rework_round_with_no_budget_left_goes_to_the_user(
     assert invariants.SHA_MOVED_BLOCKER not in blockers
 
 
+# -- a user-rework round NOBODY judged, GitHub issue 1106 -------------------------------
+# The blocker above was decided from the round's `uncounted_cause` alone, and the
+# condition that escalated the round is in the `validation_escalated` payload — so every
+# `not_reviewed` escalation of a user-rework round claimed the panel had refused it
+# (wo-f2a57dd2: round 3 escalated on `repeat_submission`, no seat opined). Spec
+# docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md.
+
+
+def _escalated_user_rework(fleet, store, wo, project, *, cause: str) -> dict:
+    """An uncounted user-rework round escalated through the real op with `cause`."""
+    _user_rejected(store, wo)
+    row = ops.submit_for_validation(store, project, store.get_work_order(wo["id"]),
+                                    declared="did the rework", cfg=_cfg(fleet))
+    assert row is not None and row["uncounted_cause"] == ops.USER_REWORK_CAUSE
+    ops.escalate_validation_round(store, store.get_work_order(wo["id"]), int(row["id"]),
+                                  int(row["round"]), "nothing new to judge", cause=cause)
+    return store.get_work_order(wo["id"])
+
+
+def test_an_unreviewed_user_rework_round_does_not_claim_the_panel_refused_it(
+        tmp_path, project, jarvis_home, fake_claude, fake_gh):
+    """Issue 1106. `repeat_submission` is family `not_reviewed`: no seat judged, so the
+    refusal sentence — and its `validation.max_rounds` advice — is false twice over."""
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = parked(project, rounds=3)
+    row = _escalated_user_rework(fleet, store, wo, project,
+                                 cause=ops.ESCALATION_REPEAT_SUBMISSION)
+
+    blockers = invariants.true_blockers(store, row)
+
+    assert invariants.USER_REWORK_UNREVIEWED_BLOCKER in blockers
+    assert invariants.USER_REWORK_REFUSED_BLOCKER not in blockers
+    assert invariants.VALIDATION_STUCK_BLOCKER not in blockers
+
+
+def test_a_user_rework_round_with_no_recorded_cause_keeps_the_refused_sentence(
+        tmp_path, project, jarvis_home, fake_claude, fake_gh):
+    """Issue 1106 prescribes ONE split and `not_reviewed` is it: a legacy event with no
+    cause keeps the sentence it has always had, rather than a third user-visible case."""
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = parked(project, rounds=3)
+    row = _escalated_user_rework(fleet, store, wo, project,
+                                 cause=ops.ESCALATION_CAUSE_UNRECORDED)
+
+    blockers = invariants.true_blockers(store, row)
+
+    assert invariants.USER_REWORK_REFUSED_BLOCKER in blockers
+    assert invariants.USER_REWORK_UNREVIEWED_BLOCKER not in blockers
+    assert invariants.VALIDATION_STUCK_BLOCKER not in blockers
+
+
+def test_an_unjudged_user_rework_round_keeps_the_refused_sentence(
+        tmp_path, project, jarvis_home, fake_claude, fake_gh):
+    """Same for family `unjudged` (`no_verdict`): only `not_reviewed` moves."""
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = parked(project, rounds=3)
+    assert ops.ESCALATION_FAMILY[ops.ESCALATION_NO_VERDICT] == "unjudged"
+    row = _escalated_user_rework(fleet, store, wo, project,
+                                 cause=ops.ESCALATION_NO_VERDICT)
+
+    blockers = invariants.true_blockers(store, row)
+
+    assert invariants.USER_REWORK_REFUSED_BLOCKER in blockers
+    assert invariants.USER_REWORK_UNREVIEWED_BLOCKER not in blockers
+    assert invariants.VALIDATION_STUCK_BLOCKER not in blockers
+
+
+def test_the_unreviewed_sentence_names_the_two_routes_and_nothing_that_moves():
+    """`ack_attention` stores it verbatim and INV-ATTENTION-REASON compares it, so no
+    clock and no sha — and no `validation.max_rounds`, which buys nothing here."""
+    text = invariants.USER_REWORK_UNREVIEWED_BLOCKER
+
+    assert not any(ch.isdigit() for ch in text)
+    assert "max_rounds" not in text
+    assert 'jarvis wo review --reject --feedback "<what to change>"' in text
+    assert 'jarvis wo review --feedback "<why>"' in text
+    assert "refused" not in text and "judged and" not in text
+
+
+def test_the_unreviewed_blocker_can_be_acknowledged(
+        tmp_path, project, jarvis_home, fake_claude, fake_gh):
+    """The round trip the wording rule exists for: what `true_blockers` derives is what
+    `ack_attention` stores, so the flag goes down and stays down."""
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = parked(project, rounds=3)
+    row = _escalated_user_rework(fleet, store, wo, project,
+                                 cause=ops.ESCALATION_NOTHING_TO_JUDGE)
+    store.ack_attention(row["id"], invariants.true_blockers(store, row))
+
+    list(invariants.check_attention_reason_is_true(store))
+    list(invariants.check_blocked_work_is_surfaced(store))
+
+    assert not store.get_work_order(wo["id"])["needs_attention"]
+
+
 # -- a verdict bound to NO commit, spec 2026-10-16 --------------------------------------
 #
 # The same stall with the other hold code: the round passed and recorded nothing, because
