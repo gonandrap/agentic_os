@@ -1,21 +1,4 @@
-"""Screenshot the per-order token budget, for a PR's UI evidence.
-
-`scripts/screenshot_forced_round.py` is the shape this copies. Three shots, because the
-feature makes three separate claims about rendered surfaces:
-
-  budget-work-order.png   an order running under a ceiling: what it has spent, what is
-                          left, and the box that raises it
-  budget-exhausted.png    the same order once the money is gone: the new status word and
-                          the attention line that says how to un-stick it
-  budget-feature.png      a FAMILY budget: the rollup, and the part no live child has
-                          already claimed — the number a reader needs to decide whether
-                          to top up the child or the feature
-
-Writes PNGs to docs/screenshots/. Everything it touches lives in a temp `JARVIS_HOME` and
-a temp catalog, so it never reads or writes the live OS:
-
-    uv run python scripts/screenshot_budget.py
-"""
+"""Screenshot the per-order token budget, for a PR's UI evidence"""
 
 from __future__ import annotations
 
@@ -33,7 +16,7 @@ PORT = 8803
 
 
 def _repo(path: Path) -> None:
-    """An empty checkout, the shape `testing.make_git_project` builds for the suite."""
+    """An empty checkout, the shape `testing.make_git_project` builds for the suite"""
     import subprocess
 
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
@@ -41,22 +24,13 @@ def _repo(path: Path) -> None:
 
 
 def _bill(store, wo_id: str, usd: float) -> None:
-    """Spend money the way a worker does: a finished turn carrying a cost.
-
-    The turn is the real row the enforcement reads — `budget.spent` sums `wo_turns`
-    — so a change that stopped recording it shows up in the picture.
-    """
+    """Spend money the way a worker does: a finished turn carrying a cost"""
     turn = store.create_turn(wo_id, kind="message", prompt="work")
     store.finish_turn(turn["id"], "done", result="done", cost_usd=usd, num_turns=1)
 
 
 def orders(store) -> tuple[str, str, str]:
-    """One capped order still running, one that ran out, and a funded feature.
-
-    The exhausted one is parked by `budget.escalate` ITSELF rather than by setting the
-    status here: the status word, the attention line and the timeline event in the shot
-    are then whatever the real escalation produces.
-    """
+    """One capped order still running, one that ran out, and a funded feature"""
     from jarvis import budget, ops
     from jarvis.central_store import CentralStore
 
@@ -81,12 +55,7 @@ def orders(store) -> tuple[str, str, str]:
         "jarvis_os", "A budget per order",
         description="Cap what one order may spend, and stop it at the cap.",
         budget_usd=50.0)
-    # A family that has spent some and PROMISED some: one settled child, and one still
-    # running with a live reservation. Without the live reservation `unreserved` and the
-    # plain remainder would be the same number, and the shot would not show the one thing
-    # a family budget adds over a work order's ceiling. The children are written straight
-    # onto the store rather than planned, because a real planner is five model calls and
-    # the picture is of the arithmetic, not of the plan.
+    # A family that has spent some and PROMISED some: one settled child
     done = store.create_work_order("Read the CSV", parent_id=feature["id"],
                                    status="completed")
     live = store.create_work_order("Write the CSV", parent_id=feature["id"],

@@ -1,13 +1,4 @@
-"""Screenshot the three surfaces an improvement order renders on, for a PR's evidence.
-
-§6.1 and §6.3 of docs/superpowers/specs/2026-09-23-improvement-orders.md.
-`scripts/screenshot_bill_reading.py` is the shape it copies. Two orders are seeded: one
-parked in `plan_review` with a pending, an accepted and a rejected finding, and one with
-spend on both halves of its bill — the analyst's transcript and the order's own calls.
-Everything lives in a throwaway JARVIS_HOME, so it never touches the live OS:
-
-    uv run python scripts/screenshot_improvement_order.py
-"""
+"""Screenshot the three surfaces an improvement order renders on, for a PR's evidence (docs/superpowers/specs/2026-09-23-improvement-orders.md)"""
 
 from __future__ import annotations
 
@@ -26,7 +17,7 @@ PROJECT = "jarvis_os"
 
 
 def _analyst(store, io_id: str, session: str) -> dict:
-    """The improvement order's analyst — its planner-shaped child (§3.1)."""
+    """The improvement order's analyst — its planner-shaped child (§3.1)"""
     analyst = store.create_work_order("Analyse the first-turn reads",
                                       description="the observation", kind="analyst",
                                       parent_id=io_id, status="running")
@@ -39,7 +30,7 @@ def _analyst(store, io_id: str, session: str) -> dict:
 
 
 def _report() -> dict:
-    """Three findings, one per decision the page has to render."""
+    """Three findings, one per decision the page has to render"""
     from jarvis.testing import a_finding, a_report
 
     def orders(title: str, description: str) -> list[dict]:
@@ -86,8 +77,7 @@ def _report() -> dict:
 
 
 def seed() -> tuple[str, str]:
-    """A parked improvement order with three decided-differently findings, and a second
-    one whose bill has spend on both halves."""
+    """A parked improvement order with three decided-differently findings"""
     from jarvis import agent_usage, ops
     from jarvis.central_store import CentralStore
     from jarvis.project_store import ProjectStore
@@ -122,8 +112,7 @@ def seed() -> tuple[str, str]:
     try:
         _analyst(store, reviewed["id"], "sess-reviewed")
         _analyst(store, billed["id"], "sess-billed")
-        # A feature order beside them: the project block is only readable as "beside the
-        # feature-order block" if there is one.
+        # A feature order beside them: the project block is only readable as "beside the feature-order block"...
         fo = store.create_feature_order("Ship the reference importer",
                                         "OpenAlex, Crossref and a BibTeX fallback.")
         store.set_feature_status(fo["id"], "executing")
@@ -137,8 +126,7 @@ def seed() -> tuple[str, str]:
                                                "retrying a failed push, not a storm"},
                         project_name=PROJECT)
 
-    # Both halves of the bill non-zero: the analyst's own session, and what Jarvis spent
-    # on the order itself (the row §6.3 asks the page to name).
+    # Both halves of the bill non-zero: the analyst's own session
     root = Path(os.environ["JARVIS_TRANSCRIPT_ROOT"]) / "-proj"
     root.mkdir(parents=True, exist_ok=True)
     (root / "sess-billed.jsonl").write_text(json.dumps({
@@ -177,7 +165,7 @@ def shoot(reviewed: str, billed: str) -> None:
         page.screenshot(path=SHOTS / "improvement_order_page.png", full_page=True)
 
         page.goto(f"{base}/project/{PROJECT}")
-        # Cropped to the block itself: the whole project page is mostly work orders.
+        # Cropped to the block itself: the whole project page is mostly work orders
         box = page.locator("h3", has_text="Improvement orders").bounding_box()
         page.screenshot(path=SHOTS / "improvement_order_project_block.png",
                         full_page=True,
@@ -185,8 +173,7 @@ def shoot(reviewed: str, billed: str) -> None:
                               "height": 560})
 
         page.goto(f"{base}/cost/{PROJECT}/{billed}")
-        # The dashboard has no JavaScript, so every <details> is opened here rather than
-        # clicked one at a time.
+        # The dashboard has no JavaScript, so every <details> is opened here rather than clicked one at a time
         page.evaluate("document.querySelectorAll('details').forEach(d => d.open = true)")
         page.wait_for_timeout(200)
         page.screenshot(path=SHOTS / "improvement_order_bill.png", full_page=True)
@@ -197,9 +184,7 @@ def main() -> int:
     home = tempfile.mkdtemp()
     os.environ["JARVIS_HOME"] = home
     os.environ["JARVIS_TRANSCRIPT_ROOT"] = str(Path(home) / "transcripts")
-    # Inside a worker's process tree `JARVIS_SPEND_HOME` names the LIVE os.db, and
-    # `agent_usage.record` writes there rather than to the temp home — seeded spend would
-    # land on the running fleet's bill and never reach this screenshot.
+    # Inside a worker's process tree `JARVIS_SPEND_HOME` names the LIVE os.db
     os.environ["JARVIS_SPEND_HOME"] = home
     os.environ.pop("JARVIS_WO_ID", None)
     sys.path.insert(0, str(REPO / "src"))

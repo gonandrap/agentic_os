@@ -34,8 +34,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from jarvis import autoreview  # noqa: E402 — after the path insert
 
 SYNTHETIC = ROOT / "evals" / "data" / "stakes_corpus_synthetic.json"
-#: The bar §3.9 set for the A/B, and the bar the tightened net has to clear too: the
-#: shipped regex's own recall, at better than its precision.
+#: The bar §3.9 set for the A/B, and the bar the tightened net has to clear too: the shipped regex's...
 BAR_RECALL = 0.667
 BAR_PRECISION = 0.140
 

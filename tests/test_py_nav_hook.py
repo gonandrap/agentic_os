@@ -1,9 +1,4 @@
-"""A source-navigation Bash call at a `.py` path is refused, with the symbol call named.
-
-§6 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md. The deny message IS the
-mitigation: a refusal that does not name `find_symbol` and the `activate_project`
-fallback buys a reworded retry, not a symbol call.
-"""
+"""A source-navigation Bash call at a `.py` path is refused, with the symbol call named (docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md)"""
 
 from __future__ import annotations
 
@@ -22,7 +17,7 @@ ON = {"JARVIS_PY_NAV_HOOK": "on", "JARVIS_WO_ID": "wo-1"}
 
 @pytest.fixture
 def repo(tmp_path):
-    """A managed project WITH a symbol index: `.jarvis/` for `find_project_root`."""
+    """A managed project WITH a symbol index: `.jarvis/` for `find_project_root`"""
     (tmp_path / ".jarvis").mkdir()
     (tmp_path / ".serena").mkdir()
     (tmp_path / ".serena" / "project.yml").write_text("project_name: a\n")
@@ -56,13 +51,12 @@ def test_sed_n_and_cat_and_head_at_a_py_path_are_refused(repo, command):
 
 
 def test_a_grep_for_a_word_in_a_markdown_file_is_allowed(repo):
-    """The negative control. A hook that refuses genuine text search is a regression,
-    not a stricter version of this one."""
+    """The negative control"""
     assert hooks.py_nav_decision(_payload("grep -rn coupon README.md", repo), ON) is None
 
 
 def test_a_non_py_source_file_is_not_refused(repo):
-    """The suffix set is `(".py",)` only — narrower than the counter's wide set."""
+    """The suffix set is `(".py",)` only — narrower than the counter's wide set"""
     assert hooks.py_nav_decision(_payload("grep -rn x app.ts", repo), ON) is None
 
 
@@ -84,14 +78,13 @@ def test_the_deny_message_names_the_symbol_call_and_the_activation_fallback(repo
 
 
 def test_an_interactive_session_is_untouched(repo):
-    """Keyed on `JARVIS_WO_ID`: a session the user opened in a managed project is theirs."""
+    """Keyed on `JARVIS_WO_ID`: a session the user opened in a managed project is theirs"""
     assert hooks.py_nav_decision(_payload("cat src/a.py", repo),
                                  {"JARVIS_PY_NAV_HOOK": "on"}) is None
 
 
 def test_a_project_with_no_serena_index_is_untouched(tmp_path):
-    """No `.serena/project.yml` means no symbol index, and a worker with neither that nor
-    grep cannot read code at all."""
+    """No `.serena/project.yml` means no symbol index"""
     (tmp_path / ".jarvis").mkdir()
 
     assert hooks.py_nav_decision(_payload("cat src/a.py", tmp_path), ON) is None
@@ -106,7 +99,7 @@ def test_the_key_is_off_unless_turned_on(repo, env):
 
 
 def test_the_key_ships_off(project, jarvis_home):
-    """The off literal Jarvis actually writes into a worker's settings file."""
+    """The off literal Jarvis actually writes into a worker's settings file"""
     spec = ProjectSpec(name="proj_a", path=project, description="",
                        worker=WorkerDefaults())
     env = json.loads(
@@ -116,12 +109,7 @@ def test_the_key_ships_off(project, jarvis_home):
 
 
 def test_a_whole_file_read_of_a_py_is_refused_and_a_limited_one_is_not(repo):
-    """§5.1 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md: THE `.py` ARM HAS NO
-    SIZE THRESHOLD. A `Read` with no `limit` is whole-file and is refused; a `Read`
-    carrying ANY `limit` passes, however large. §1(a) is why — every expensive `.py`
-    `Read` passed no `limit` (487,048 tok over 133 calls) and every cheap one passed a
-    small one (1,242,656 tok over 1,422 calls). A test that only exercises a small
-    `limit` cannot tell "no threshold" from "a threshold someone will add later"."""
+    """§5.1 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md: THE `.py` ARM HAS NO SIZE..."""
     whole = {"tool_name": "Read", "tool_input": {"file_path": "src/a.py"},
              "cwd": str(repo)}
     limited = {"tool_name": "Read",
@@ -135,9 +123,7 @@ def test_a_whole_file_read_of_a_py_is_refused_and_a_limited_one_is_not(repo):
 
 
 def test_a_py_read_in_a_repo_with_no_serena_index_is_untouched(tmp_path):
-    """§5.1: the `Read` arm shares the `.serena/project.yml` precondition. The refusal
-    names `find_symbol`, so firing it where there is no symbol index strands the worker
-    with neither symbols nor a whole-file read."""
+    """§5.1: the `Read` arm shares the `.serena/project.yml` precondition"""
     (tmp_path / ".jarvis").mkdir()
     whole = {"tool_name": "Read", "tool_input": {"file_path": "src/a.py"},
              "cwd": str(tmp_path)}
@@ -151,16 +137,14 @@ def test_a_py_read_in_a_repo_with_no_serena_index_is_untouched(tmp_path):
 
 
 def test_a_py_read_with_no_cwd_is_untouched():
-    """No `cwd` means no project root to resolve, so the precondition cannot be checked
-    and the arm must not fire."""
+    """No `cwd` means no project root to resolve"""
     whole = {"tool_name": "Read", "tool_input": {"file_path": "src/a.py"}}
 
     assert hooks.preflight_decision(whole, ON) is None
 
 
 def test_a_read_of_a_non_py_path_is_untouched(repo):
-    """The suffix set stays `SOURCE_SUFFIXES`, so a `.md` `Read` is the doc arm's
-    business (tests/test_doc_nav_hook.py), not this one's."""
+    """The suffix set stays `SOURCE_SUFFIXES`"""
     md = {"tool_name": "Read", "tool_input": {"file_path": "docs/superpowers/specs/x.md"},
           "cwd": str(repo)}
 
@@ -168,9 +152,7 @@ def test_a_read_of_a_non_py_path_is_untouched(repo):
 
 
 def test_the_refusal_is_reached_before_the_jarvis_auto_allow(repo):
-    """The one that matters. `is_jarvis_command_chain` waves every `jarvis …` chain
-    through, so an arm after it passes its unit test and does nothing in production.
-    `navigates_source` masks quoted spans, so the unquoted `src/a.py` still denies."""
+    """The one that matters"""
     decision = hooks.preflight_decision(
         _payload(f'cd {repo} && grep -rn "def total_for" src/a.py', repo), ON)
 
@@ -183,8 +165,7 @@ def test_the_refusal_is_reached_before_the_jarvis_auto_allow(repo):
     "grep -rn coupon .",
 ])
 def test_a_tree_sweep_for_non_python_text_is_allowed(repo, command):
-    """Issue 936: the sweep arm ignored the suffix set, so every tree search anywhere in
-    the repo got the symbol-call refusal."""
+    """Issue 936: the sweep arm ignored the suffix set"""
     assert hooks.py_nav_decision(_payload(command, repo), ON) is None
 
 
@@ -205,8 +186,7 @@ def test_a_tree_sweep_scoped_to_python_is_refused(repo, command):
     "grep -rn coupon .",
 ])
 def test_a_tree_sweep_for_non_python_text_reaches_the_preflight_chain(repo, command):
-    """The arm sits before the `is_jarvis_command_chain` auto-allow, so the unit answer
-    and the production answer are the same one."""
+    """The arm sits before the `is_jarvis_command_chain` auto-allow"""
     assert hooks.preflight_decision(_payload(command, repo), ON) is None
 
 
@@ -219,15 +199,12 @@ def test_a_python_scoped_sweep_is_refused_through_the_preflight_chain(repo):
 
 
 def test_both_arms_use_the_counters_suffix_set_by_identity():
-    """§5.5 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md: ONE spelling of the
-    predicate. A second module constant here is the drift this tree has paid for twice —
-    the counter would stop agreeing with the refusal about what source is. A narrower
-    enforcement set arrives as a `worker.*` catalog key, never as a constant."""
+    """§5.5 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md: ONE spelling of the predicate"""
     assert not hasattr(hooks, "PY_NAV_SUFFIXES")
     assert hooks.SOURCE_SUFFIXES is navigation.SOURCE_SUFFIXES
 
     node = _body("py_nav_decision")
-    # The docstring QUOTES `.py`, so the literals are read off the CODE.
+    # The docstring QUOTES `.py`, so the literals are read off the CODE
     code = [s for s in node.body if not (isinstance(s, ast.Expr)
                                          and isinstance(s.value, ast.Constant))]
     suffix_args = [n.args[-1] for s in code for n in ast.walk(s)
@@ -246,8 +223,7 @@ def test_both_arms_use_the_counters_suffix_set_by_identity():
 
 
 def test_py_nav_runs_after_the_investigator_refusal(repo):
-    """Position: immediately AFTER `investigator_bash_decision`, so an investigator's
-    mutating command gets the investigator's own message."""
+    """Position: immediately AFTER `investigator_bash_decision`"""
     env = {**ON, hooks.WO_KIND_ENV: "investigator"}
     decision = hooks.preflight_decision(_payload("sed -i s/a/b/ src/a.py", repo), env)
 

@@ -1,9 +1,4 @@
-"""Eval fixtures + the scorecard reporter.
-
-Fixtures come from jarvis.testing (same isolated fake-claude world as tests/).
-Every eval carries a `scenario("category", "name")` marker; the reporter groups
-results by category, prints the scorecard, and writes evals/results.json.
-"""
+"""Eval fixtures + the scorecard reporter"""
 
 from __future__ import annotations
 
@@ -20,6 +15,7 @@ from jarvis.testing import (  # noqa: F401
     jarvis_home,
     make_git_project,
     project,
+    self_dispatch_on,
     settle_turns,
 )
 

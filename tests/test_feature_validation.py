@@ -1,30 +1,4 @@
-"""The feature round machine: the integrated diff, the rounds, and the manager's loop.
-
-A work order's panel judges one worktree. A FEATURE order's panel judges what the
-children's work adds up to on the default branch — which is the only place two children
-that are each individually correct can be seen to be jointly wrong. That is the whole
-marginal value of this loop, and everything below protects one of the four things that
-make it work:
-
-* **The base.** `feature_orders.base_sha` is written when the plan is released, and the
-  diff is everything between it and the default branch now. A feature with no base gets
-  no diff at all rather than a guessed one.
-* **The counter.** A rejection sends the feature back to `executing` so its manager can
-  file remediation work orders, and it comes back for round N+1 against the SAME budget.
-  Nothing else in the suite stops that loop running for ever.
-* **The addressee.** A feature order has no session, so the rejection is posted to the
-  ROLE `manager` and the router finds the work order that fills it. The manager reads
-  prose; it never learns that a panel of seats exists.
-* **The switches.** `os.validation.enabled` and `os.validation.feature_units` gate
-  OPENING a round and never settling one, so either can be turned off mid-flight without
-  stranding a feature — or its manager, waiting for a message that would never come.
-
-THE VALIDATOR IS INJECTED, and every test asserts on STORED ROWS AND CALL COUNTS. The
-feature ships disabled: a test that reaches this code without enabling it exercises the
-old path and still gets a perfectly good ending, so "an outcome came back" proves nothing
-about which machine produced it. Tests are PAIRED wherever a passing assertion could also
-be explained by the machine never having run.
-"""
+"""The feature round machine: the integrated diff, the rounds, and the manager's loop"""
 
 from __future__ import annotations
 
@@ -52,11 +26,11 @@ ASK = ("Add a CSV exporter to the reporting module, with a command that calls it
 SEATS = ("tester", "security")
 
 
-# -- the fixture: a real repository, a released plan, a fake panel -------------------
+# -- the fixture: a real repository, a released plan, a fake panel
 
 
 def _git(cwd: Path, *args: str) -> str:
-    """git with a pinned identity and no user or system config in sight."""
+    """git with a pinned identity and no user or system config in sight"""
     env = {"HOME": str(cwd), "PATH": os.environ.get("PATH", ""),
            "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
@@ -66,13 +40,7 @@ def _git(cwd: Path, *args: str) -> str:
 
 
 class Validator:
-    """The injected seam, driven by the test.
-
-    Records every entry — the call count is what most of these tests actually assert —
-    and answers with the queued outcomes in order, repeating the last one for ever after.
-    An outcome that is an exception is raised instead of returned, which is how a
-    transport outage is staged.
-    """
+    """The injected seam, driven by the test"""
 
     def __init__(self, *outcomes):
         self.outcomes = list(outcomes) or [passed()]
@@ -110,7 +78,7 @@ def rejected(reason: str = "the exporter and its caller disagree about the heade
 
 
 def _seats(verdict: str) -> list[dict]:
-    """What a panel hands back per seat — named, so the opinions are real rows."""
+    """What a panel hands back per seat — named, so the opinions are real rows"""
     return [{"seat": seat, "status": "ok", "verdict": verdict, "model": "sonnet",
              "latency_ms": 12,
              "reply": f"the {seat} seat says: {verdict} — the two halves disagree"}
@@ -152,7 +120,7 @@ def write_catalog(tmp_path: Path, project: Path, **validation) -> Path:
 
 
 class Fleet:
-    """One booted OS over a real git repository, plus the plumbing a feature needs."""
+    """One booted OS over a real git repository, plus the plumbing a feature needs"""
 
     def __init__(self, tmp_path, project, catalog_path):
         self.tmp_path = tmp_path
@@ -160,14 +128,9 @@ class Fleet:
         self.catalog_path = catalog_path
         self.daemon = Daemon(load_catalog(catalog_path))
 
-    # -- configuration ---------------------------------------------------------
+    # -- configuration
     def reconfigure(self, **validation) -> None:
-        """Rewrite the catalog on disk AND reload the daemon's copy.
-
-        Both halves matter: `ops.submit_feature` and `ops.review_plan` read the catalog
-        from disk (they run in the manager's process, not the daemon's), and the round
-        machine reads the daemon's own loaded copy.
-        """
+        """Rewrite the catalog on disk AND reload the daemon's copy"""
         write_catalog(self.tmp_path, self.project, **validation)
         self.daemon.catalog = load_catalog(self.catalog_path)
 
@@ -178,14 +141,9 @@ class Fleet:
     def store(self) -> ProjectStore:
         return ProjectStore(self.project)
 
-    # -- features --------------------------------------------------------------
+    # -- features
     def release(self, title: str, *keys: str) -> str:
-        """A feature order whose plan has been submitted and released. Returns its id.
-
-        The tick opens the planner and moves the feature to `planning`; the plan is then
-        submitted by hand rather than by that planner, because what these tests are about
-        is what happens AFTER release.
-        """
+        """A feature order whose plan has been submitted and released"""
         fo = ops.create_feature_order("proj_a", title, description=ASK)
         self.daemon.tick()
         ops.submit_plan(fo["id"], a_plan(*keys))
@@ -193,40 +151,31 @@ class Fleet:
         return str(fo["id"])
 
     def merge(self, name: str, text: str) -> str:
-        """A change landing on the default branch — a child's pull request, merged.
-
-        Committed in the PROJECT ROOT rather than in a worktree, because that is exactly
-        what the feature's diff reads: `base_sha...<default branch head>`.
-        """
+        """A change landing on the default branch — a child's pull request, merged"""
         (self.project / name).write_text(text)
         _git(self.project, "add", "-A")
         _git(self.project, "commit", "-qm", f"merge {name}")
         return _git(self.project, "rev-parse", "HEAD").strip()
 
     def land_children(self, fo_id: str, store: ProjectStore) -> None:
-        """Every child of this feature completed, with a result the packet can carry."""
+        """Every child of this feature completed, with a result the packet can carry"""
         for child in store.feature_children(fo_id):
             store.update_work_order(child["id"],
                                     result_summary=f"built {child['title']}")
             store.set_status(child["id"], "completed")
 
     def file_child(self, fo_id: str, store: ProjectStore, title: str) -> dict:
-        """What a manager does with review feedback: one work order under the feature."""
+        """What a manager does with review feedback: one work order under the feature"""
         return ops.create_work_order("proj_a", title, description="the review asked",
                                      parent_id=fo_id)
 
-    # -- the daemon ------------------------------------------------------------
+    # -- the daemon
     def tick(self) -> None:
         self.daemon.tick_count = 0
         self.daemon.tick()
 
     def drain(self, ticks: int = 2, timeout: float = 15.0) -> None:
-        """Tick, then wait for whatever it started off-thread to finish.
-
-        Twice by default: `settle_features` routes a finished feature to `validating`
-        AFTER `feature_validation_tick` has already run on that tick, so the first tick
-        opens the round and the second one judges it.
-        """
+        """Tick, then wait for whatever it started off-thread to finish"""
         for _ in range(ticks):
             self.tick()
             deadline = time.monotonic() + timeout
@@ -237,13 +186,7 @@ class Fleet:
 
 @pytest.fixture()
 def fleet(tmp_path, jarvis_home, fake_claude, claude_json):
-    """A booted OS over a REAL git repository, with feature validation enabled.
-
-    The default branch is named explicitly: the base ladder ends at `main`, and a repo
-    whose `git init` happened to name the branch something else would record no
-    `base_sha`, collect an empty diff, and make every escalation test pass for the wrong
-    reason.
-    """
+    """A booted OS over a REAL git repository, with feature validation enabled"""
     project = make_git_project(tmp_path, "proj_a")
     _git(project, "symbolic-ref", "HEAD", "refs/heads/main")
     _git(project, "add", "-A")
@@ -260,21 +203,17 @@ def envelopes(store: ProjectStore) -> list[dict]:
 
 
 def messages(store: ProjectStore, wo_id: str) -> list[dict]:
-    """What this work order has been SENT. `user_to_agent` only: the manager's own turns
-    land in the same table in the other direction, and counting those would make "it
-    received one message" true of a session that received none."""
+    """What this work order has been SENT"""
     return [dict(r) for r in store.conn.execute(
         "SELECT * FROM wo_messages WHERE wo_id=? AND direction='user_to_agent' "
         "ORDER BY id", (wo_id,)).fetchall()]
 
 
-# -- 1. the switches ------------------------------------------------------------------
+# -- 1. the switches
 
 
 def test_with_validation_off_a_finished_feature_completes_exactly_as_today(fleet):
-    """THE BYTE-IDENTICAL PIN. Everything else in this file is a behaviour change, and
-    this is the assertion that it is opt-in: no round, no envelope, no manager, and the
-    feature settles on its children the moment they land."""
+    """THE BYTE-IDENTICAL PIN"""
     fleet.reconfigure(enabled=False)
     fleet.daemon.validator = Validator(passed())
     store = fleet.store()
@@ -295,8 +234,7 @@ def test_with_validation_off_a_finished_feature_completes_exactly_as_today(fleet
 
 
 def test_with_validation_on_the_same_feature_waits_for_a_pass(fleet):
-    """The pair to the test above: same plan, same children, same merges — and it stops
-    in `validating` until something judges it."""
+    """The pair to the test above: same plan, same children, same merges"""
     validator = Validator(passed())
     fleet.daemon.validator = validator
     store = fleet.store()
@@ -318,8 +256,7 @@ def test_with_validation_on_the_same_feature_waits_for_a_pass(fleet):
         assert store.get_feature_order(fo_id)["status"] == "completed"
         assert store.latest_validation_round(fo_id=fo_id)["outcome"] == "passed"
         assert len(validator.calls) == 1
-        # A pass settles the feature, and settling it closes the manager: left open it
-        # would be a live addressee for messages about work that is over.
+        # A pass settles the feature, and settling it closes the manager: left open it would be a live...
         assert store.get_work_order(
             store.manager_work_order(fo_id)["id"])["status"] == "completed"
     finally:
@@ -327,10 +264,7 @@ def test_with_validation_on_the_same_feature_waits_for_a_pass(fleet):
 
 
 def _config_version(fleet, **validation) -> str:
-    """One row in the config ledger: this fleet's catalog with `os.validation` changed,
-    stored the way the console will store it. The catalog ON DISK is left alone, which is
-    what makes "judged under the stamp" distinguishable from "judged under the live
-    catalog"."""
+    """One row in the config ledger: this fleet's catalog with `os.validation` changed"""
     from jarvis import catalog as catalog_mod, config_version as cv
     from jarvis.central_store import CentralStore
 
@@ -346,9 +280,7 @@ def _config_version(fleet, **validation) -> str:
 
 
 def test_a_feature_round_is_stamped_with_the_configuration_it_was_opened_under(fleet):
-    """No column on `feature_orders`: a feature's rounds live in the same polymorphic
-    table as a work order's, so the round stamp already covers both (config-console
-    design §5)."""
+    """No column on `feature_orders`: a feature's rounds live in the same polymorphic table as a work..."""
     version = _config_version(fleet)
     fleet.daemon.validator = Validator(passed())
     store = fleet.store()
@@ -366,14 +298,7 @@ def test_a_feature_round_is_stamped_with_the_configuration_it_was_opened_under(f
 
 
 def test_a_feature_round_is_judged_under_its_stamp_and_not_the_live_catalog(fleet):
-    """The pair, and the reason the stamp is written at all (Neo, question 176): the
-    settle side must follow the version the round was OPENED under, or a catalog edit
-    mid-flight decides a round nobody judged under those terms.
-
-    Stamped `max_rounds=1`, live catalog 3: one rejection is the last round, so the
-    feature gives up instead of going back to its manager. Reading the live catalog
-    produces an ordinary rejection here, which is what makes the two distinguishable.
-    """
+    """The pair, and the reason the stamp is written at all (Neo"""
     _config_version(fleet, max_rounds=1)
     fleet.daemon.validator = Validator(rejected())
     store = fleet.store()
@@ -392,9 +317,7 @@ def test_a_feature_round_is_judged_under_its_stamp_and_not_the_live_catalog(flee
 
 
 def test_feature_units_off_validates_work_orders_and_not_features(fleet):
-    """THE PAIRING IS THE TEST. With `feature_units` false and `enabled` true the switch
-    is indistinguishable from validation being off unless a WORK order is seen to
-    validate on the same catalog, in the same test."""
+    """THE PAIRING IS THE TEST"""
     fleet.reconfigure(feature_units=False)
     validator = Validator(passed())
     validator.block()  # nothing must settle behind our backs
@@ -420,15 +343,11 @@ def test_feature_units_off_validates_work_orders_and_not_features(fleet):
         store.close()
 
 
-# -- 2. the base and the integrated diff ----------------------------------------------
+# -- 2. the base and the integrated diff
 
 
 def test_the_base_is_recorded_at_release_and_bounds_the_diff(fleet):
-    """`base_sha` is written when the plan is released, and everything between it and the
-    default branch now IS the feature.
-
-    Both halves asserted, because either alone is satisfied by a broken base: a commit
-    made BEFORE release must not appear, and one made after must."""
+    """`base_sha` is written when the plan is released"""
     validator = Validator(passed())
     fleet.daemon.validator = validator
     store = fleet.store()
@@ -451,8 +370,7 @@ def test_the_base_is_recorded_at_release_and_bounds_the_diff(fleet):
         assert "before.py" not in packet.files, (
             "the diff reaches back past the feature's own base")
         assert "def export" in packet.diff
-        # Each child's own account rides along: the integration question is asked against
-        # what the children claimed, one level down.
+        # Each child's own account rides along: the integration question is asked against what the children...
         assert [c["title"] for c in packet.children] == ["Build one", "Build two"]
         assert all(c["summary"] for c in packet.children)
     finally:
@@ -460,9 +378,7 @@ def test_the_base_is_recorded_at_release_and_bounds_the_diff(fleet):
 
 
 def test_a_feature_with_no_base_escalates_without_calling_the_panel(fleet):
-    """A guessed base produces a confidently wrong diff, so a feature order that predates
-    the column gets none. PAIRED with a feature that has one, on the same tick and the
-    same validator, so "zero calls" cannot mean "the machine never ran"."""
+    """A guessed base produces a confidently wrong diff"""
     validator = Validator(passed())
     fleet.daemon.validator = validator
     store = fleet.store()
@@ -487,15 +403,7 @@ def test_a_feature_with_no_base_escalates_without_calling_the_panel(fleet):
 
 
 def test_a_side_effect_does_not_excuse_a_feature_from_having_a_base(fleet):
-    """The two guards answer different questions and only one of them yields.
-
-    The files guard asks "was anything delivered"; the base guard asks "can we honestly
-    diff what was delivered". A knowledge write answers the first and says nothing about
-    the second — so exempting a baseless feature on the strength of one retraction sends
-    a feature whose file changes were never diffable to a panel that has just been told
-    not to read an empty diff as nothing delivered, and it could pass on the retraction
-    alone. Rejected in review, round 1; spec 2026-09-12 §5.
-    """
+    """The two guards answer different questions and only one of them yields"""
     from jarvis import ops
 
     validator = Validator(passed())
@@ -509,13 +417,7 @@ def test_a_side_effect_does_not_excuse_a_feature_from_having_a_base(fleet):
             ops.learn_add("something durable", wo_id=str(child["id"]))
         store.update_feature_order(fo_id, base_sha=None)
 
-        # ASSERT THE SIDE EFFECTS ACTUALLY REACH A FEATURE PACKET FIRST. Without this
-        # the test cannot tell the conditional base guard from the unconditional one it
-        # exists to pin: if `side_effects` were always empty, BOTH versions of the guard
-        # would escalate and this test would pass against the code it is meant to
-        # reject. Collected through the same function the daemon calls, which is where
-        # the children are aggregated (`ops.collect_feature_evidence` — `evidence.py`
-        # may not read a store). Rejected in review, round 2.
+        # ASSERT THE SIDE EFFECTS ACTUALLY REACH A FEATURE PACKET FIRST
         packet = ops.collect_feature_evidence(
             store, fleet.project, store.get_feature_order(fo_id),
             declared="", summary="", cfg=fleet.daemon.catalog.os.validation)
@@ -533,8 +435,7 @@ def test_a_side_effect_does_not_excuse_a_feature_from_having_a_base(fleet):
 
 
 def test_a_features_side_effects_are_the_union_of_its_childrens(fleet):
-    """The wiring the guard above depends on, asserted on its own so a break shows up as
-    a failure that NAMES it rather than as a base-guard test going quiet."""
+    """The wiring the guard above depends on"""
     from jarvis import ops
 
     store = fleet.store()
@@ -558,8 +459,7 @@ def test_a_features_side_effects_are_the_union_of_its_childrens(fleet):
 
 
 def test_a_feature_whose_children_merged_nothing_escalates(fleet):
-    """An empty diff never reaches the panel: a reviewer handed nothing to review will
-    approve it, and that one silent pass would make the whole feature theatre."""
+    """An empty diff never reaches the panel: a reviewer handed nothing to review will approve it"""
     validator = Validator(passed())
     fleet.daemon.validator = validator
     store = fleet.store()
@@ -580,17 +480,7 @@ def test_a_feature_whose_children_merged_nothing_escalates(fleet):
 
 def test_a_feature_whose_children_only_shipped_a_RELEASE_is_voided(
         fleet, tmp_path, monkeypatch):
-    """The same empty packet, through the same shared helper, ending the other way.
-
-    Without it a feature order whose children were releases escalates for exactly the
-    reason the work-order guard has just stopped escalating for, and the two guards
-    drift — Neo's condition on question 378; spec
-    docs/superpowers/specs/2026-09-17-a-round-with-nothing-to-judge.md §8.
-
-    The production checkout is REAL here for the reason tests/test_validation_void.py
-    gives at length: the timeline event is a claim, and only the deployed state attests
-    it. A feature inherits that through its children's effects like everything else.
-    """
+    """The same empty packet, through the same shared helper, ending the other way (docs/superpowers/specs/2026-09-17-a-round-with-nothing-to-judge.md §8.)"""
     validator = Validator(passed())
     fleet.daemon.validator = validator
 
@@ -603,9 +493,7 @@ def test_a_feature_whose_children_only_shipped_a_RELEASE_is_voided(
         fo_id = fleet.release("ship 0.11.0", "one")
         fleet.land_children(fo_id, store)  # a release merges nothing to the branch
         for child in store.feature_children(fo_id):
-            # The approved-and-used gate the attestation leans on, granted BEFORE the tag
-            # is cut — which is the order a real release happens in, and the order the
-            # provenance check requires.
+            # The approved-and-used gate the attestation leans on, granted BEFORE the tag is cut
             row = store.add_approval(str(child["id"]), "release", "ship 0.11.0",
                                      matched="shipit")
             store.decide_approval(int(row["id"]), "approved", "ready to ship", "neo")
@@ -634,17 +522,11 @@ def test_a_feature_whose_children_only_shipped_a_RELEASE_is_voided(
         store.close()
 
 
-# -- 3. the rejection, and who reads it -----------------------------------------------
+# -- 3. the rejection, and who reads it
 
 
 def test_a_rejection_reaches_the_manager_as_prose_and_names_no_seat(fleet):
-    """THE PAIRING IS THE TEST, and both halves are the design's first principle.
-
-    The manager is told what has to change and never learns that a panel exists — while
-    the round it came from records every seat by name. Asserting only the first half
-    passes just as well if the seats were never recorded; asserting only the second
-    passes if the message quoted them verbatim.
-    """
+    """THE PAIRING IS THE TEST, and both halves are the design's first principle"""
     validator = Validator(rejected())
     fleet.daemon.validator = validator
     store = fleet.store()
@@ -658,7 +540,7 @@ def test_a_rejection_reaches_the_manager_as_prose_and_names_no_seat(fleet):
         manager = store.manager_work_order(fo_id)
         rnd = store.latest_validation_round(fo_id=fo_id)
         assert rnd["outcome"] == "rejected"
-        # Back to `executing`, so the manager's remediation work orders can be claimed.
+        # Back to `executing`, so the manager's remediation work orders can be claimed
         assert store.get_feature_order(fo_id)["status"] == "executing"
         assert store.get_feature_order(fo_id)["needs_attention"] == 0
 
@@ -689,13 +571,7 @@ def test_a_rejection_reaches_the_manager_as_prose_and_names_no_seat(fleet):
 
 
 def test_a_rejected_feature_is_not_resubmitted_by_the_reconciler(fleet):
-    """`settle_features` opens round 1 and only round 1.
-
-    Its condition is "every child is completed", and after a rejection that is true again
-    the instant the children are looked at — so a reconciler that resubmitted would open
-    round 2 with the identical fingerprint on the very next tick, escalate on the repeat,
-    and cut the manager out of its own loop. Resubmission is the manager's act.
-    """
+    """`settle_features` opens round 1 and only round 1"""
     validator = Validator(rejected())
     fleet.daemon.validator = validator
     store = fleet.store()
@@ -715,17 +591,11 @@ def test_a_rejected_feature_is_not_resubmitted_by_the_reconciler(fleet):
         store.close()
 
 
-# -- 3b. and who tells the manager its answer landed (issue #480) ---------------------
+# -- 3b. and who tells the manager its answer landed (issue #480)
 
 
 def _until_idle(fleet, store, fo_id, limit: int = 6) -> dict:
-    """Tick until the manager has read whatever it was sent and gone idle again.
-
-    The manager's turn is a real `claude` call through the fake, so "it has finished
-    reacting" takes more than one tick and takes a different number of them depending on
-    what it was sent. Asserting on a fixed tick count would pin the fake's timing rather
-    than the handoff.
-    """
+    """Tick until the manager has read whatever it was sent and gone idle again"""
     for _ in range(limit):
         fleet.tick()
         manager = store.manager_work_order(fo_id)
@@ -735,12 +605,7 @@ def _until_idle(fleet, store, fo_id, limit: int = 6) -> dict:
 
 
 def _remediate(fleet, store, fo_id, title: str) -> dict:
-    """What a manager does with a rejection, in the order it really happens.
-
-    The work order is filed DURING the manager's turn and lands afterwards — the same
-    order `_manager_handoff` reads it in. Filing it once the manager has already gone
-    idle stages a sequence that cannot occur, and hides whether the handoff waited.
-    """
+    """What a manager does with a rejection, in the order it really happens"""
     child = fleet.file_child(fo_id, store, title)
     _until_idle(fleet, store, fo_id)
     fleet.merge(f"{title.replace(' ', '_')}.py", f"# {title}\n")
@@ -755,13 +620,7 @@ def _handoffs(store, fo_id) -> list[tuple]:
 
 
 def test_a_manager_is_told_when_the_children_it_filed_after_a_rejection_land(fleet):
-    """THE BUG (#480). A rejection asks the manager for remediation work orders, and a
-    manager is idle-until-messaged BY DESIGN — so with nothing posting "they landed", every
-    feature rejected even once parked for ever with all its children green.
-
-    Asserted on the MESSAGE the manager actually received, not just on the envelope: the
-    thing that unsticks the loop is the manager reading `jarvis fo submit`.
-    """
+    """THE BUG (#480)"""
     fleet.daemon.validator = Validator(rejected())
     store = fleet.store()
     try:
@@ -793,10 +652,7 @@ def test_a_manager_is_told_when_the_children_it_filed_after_a_rejection_land(fle
 
 
 def test_the_handoff_fires_once_per_round_however_many_ticks_run(fleet):
-    """A RECONCILER FIX IS NOT DONE AT ONE TICK (kn-089de524). This branch re-derives
-    every tick over children that stay `completed` for ever, so an unguarded post is one
-    envelope every five seconds — and the manager re-reading its whole conversation each
-    time."""
+    """A RECONCILER FIX IS NOT DONE AT ONE TICK (kn-089de524)"""
     fleet.daemon.validator = Validator(rejected())
     store = fleet.store()
     try:
@@ -816,16 +672,7 @@ def test_the_handoff_fires_once_per_round_however_many_ticks_run(fleet):
 
 
 def test_a_manager_that_answers_the_nudge_with_more_work_is_nudged_again(fleet):
-    """THE NUDGE INVITES EXACTLY THIS. `FEATURE_CHILDREN_LANDED` tells the manager that if
-    the feedback is not yet addressed it should file the work orders that would address it
-    and submit once THEY land — so a manager that files one more is doing what it was
-    asked, and the second landing has to reach it too.
-
-    Deduping on `(round, "nudged")` skips that second nudge and then flags the feature
-    STALLED against a manager that acted: a false report, and the feature parks one cycle
-    deeper. The key is the set of children already covered, so a round can nudge as many
-    times as the manager files.
-    """
+    """THE NUDGE INVITES EXACTLY THIS"""
     fleet.daemon.validator = Validator(rejected())
     store = fleet.store()
     try:
@@ -857,11 +704,7 @@ def test_a_manager_that_answers_the_nudge_with_more_work_is_nudged_again(fleet):
 
 
 def test_a_stall_after_a_fresh_nudge_still_reaches_the_user(fleet):
-    """The flag is keyed on what had been nudged when it was raised, for the same reason.
-
-    Round-keyed, the flag raised after the FIRST stall would suppress the second for ever —
-    so a manager that acted once, was nudged, and then went quiet would never be reported.
-    """
+    """The flag is keyed on what had been nudged when it was raised, for the same reason"""
     fleet.daemon.validator = Validator(rejected())
     store = fleet.store()
     try:
@@ -890,12 +733,7 @@ def test_a_stall_after_a_fresh_nudge_still_reaches_the_user(fleet):
 
 
 def test_a_manager_that_answers_a_rejection_with_no_work_orders_flags_the_feature(fleet):
-    """Neo, question 467: silence must not read as "still working".
-
-    A manager that read the feedback and filed nothing is indistinguishable from one that
-    never read it — except that it is idle with the message delivered. Nobody is going to
-    resubmit that feature, so it is the user's call, and the flag is what asks for it.
-    """
+    """Neo, question 467: silence must not read as "still working\""""
     fleet.daemon.validator = Validator(rejected())
     store = fleet.store()
     try:
@@ -918,12 +756,7 @@ def test_a_manager_that_answers_a_rejection_with_no_work_orders_flags_the_featur
 
 
 def test_the_nudge_is_not_repeated_and_the_stall_reaches_the_user(fleet):
-    """The fallback the issue asks for: nudged, and it still did not submit.
-
-    Two ticks of the same branch must not say the same thing twice, and the second thing
-    it says is not the first one again — a manager that was told and did nothing is a
-    different report from one that was never told.
-    """
+    """The fallback the issue asks for: nudged, and it still did not submit"""
     fleet.daemon.validator = Validator(rejected())
     store = fleet.store()
     try:
@@ -941,7 +774,7 @@ def test_the_nudge_is_not_repeated_and_the_stall_reaches_the_user(fleet):
         assert fo["attention_reason"] == FEATURE_MANAGER_STALLED.format(n=1, fo_id=fo_id)
         assert _handoffs(store, fo_id) == [(1, "nudged"), (1, "flagged")]
 
-        # ...and the user acknowledging it is not undone on the next tick.
+        # ...and the user acknowledging it is not undone on the next tick
         store.clear_feature_attention(fo_id)
         for _ in range(3):
             fleet.tick()
@@ -952,17 +785,7 @@ def test_the_nudge_is_not_repeated_and_the_stall_reaches_the_user(fleet):
 
 
 def test_nothing_is_said_while_the_rejection_is_still_on_its_way(fleet):
-    """THE RACE THE GUARD EXISTS FOR. On the tick right after `_reject_feature` every
-    child IS `completed` — they are the ones that were just judged — so a handoff that
-    only asked "are the children done?" would nudge, or flag, a manager that has not yet
-    been handed the feedback it is being judged for not acting on.
-
-    Delivery is SUPPRESSED rather than merely raced: within one tick `deliver_messages`
-    runs before `settle_features`, so on the fixture's timing the manager is already
-    running by the time the handoff looks at it — and the queued-envelope guard would
-    read as dead code. Held delivery is not hypothetical; the project cap holds exactly
-    this envelope (kn-54917ba7).
-    """
+    """THE RACE THE GUARD EXISTS FOR"""
     fleet.daemon.validator = Validator(rejected())
     store = fleet.store()
     try:
@@ -986,17 +809,11 @@ def test_nothing_is_said_while_the_rejection_is_still_on_its_way(fleet):
         store.close()
 
 
-# -- 4. the counter, and why the loop terminates --------------------------------------
+# -- 4. the counter, and why the loop terminates
 
 
 def test_the_round_counter_does_not_reset_when_the_feature_goes_back_to_executing(fleet):
-    """THE NON-TERMINATION GUARD, and nothing else tests it.
-
-    Rejection sends the feature back to `executing`; its manager files a work order, that
-    lands, and the feature is submitted again. That is round N+1 against the SAME budget.
-    A counter reset anywhere on that path — on the status change, on the new child, on the
-    resubmission — is a manager that can file work orders for ever.
-    """
+    """THE NON-TERMINATION GUARD, and nothing else tests it"""
     fleet.reconfigure(max_rounds=3)
     validator = Validator(rejected())
     fleet.daemon.validator = validator
@@ -1009,7 +826,7 @@ def test_the_round_counter_does_not_reset_when_the_feature_goes_back_to_executin
         assert store.counted_validation_rounds(fo_id=fo_id) == 1
 
         for n in (2, 3):
-            # What a manager does with feedback: file the work, let it land, resubmit.
+            # What a manager does with feedback: file the work, let it land, resubmit
             child = fleet.file_child(fo_id, store, f"fix round {n - 1}")
             fleet.merge(f"fix{n}.py", f"# remediation for round {n - 1}\n")
             store.update_work_order(child["id"], result_summary=f"fixed {n - 1}")
@@ -1027,20 +844,14 @@ def test_the_round_counter_does_not_reset_when_the_feature_goes_back_to_executin
         fo = store.get_feature_order(fo_id)
         assert fo["needs_attention"] == 1
         assert fo["attention_reason"] == VALIDATION_STUCK_BLOCKER
-        # The last round gave up, so no envelope was posted for it: asking for a fourth
-        # submission there is no round to judge is worse than saying nothing.
+        # The last round gave up, so no envelope was posted for it: asking for a fourth submission there is...
         assert len(envelopes(store)) == 2
     finally:
         store.close()
 
 
 def test_a_features_second_round_carries_what_its_first_one_asked_for(fleet):
-    """THE FEATURE CALL SITE, which the work-order tests cannot reach. `_validate_feature`
-    builds its packet through `ops.collect_feature_evidence`, so the history travels a
-    different path here and a wiring that was only done on the work-order side would leave
-    a feature's round 2 as blind as its round 1.
-
-    Paired with round 1, whose packet must carry no history section at all."""
+    """THE FEATURE CALL SITE, which the work-order tests cannot reach"""
     validator = Validator(rejected(), passed())
     fleet.daemon.validator = validator
     store = fleet.store()
@@ -1067,10 +878,7 @@ def test_a_features_second_round_carries_what_its_first_one_asked_for(fleet):
 
 
 def test_a_repeated_fingerprint_escalates_without_calling_the_panel(fleet):
-    """A submission identical to the one before it is not new evidence. PAIRED with a
-    resubmission that genuinely changed the diff, so "the panel was not called" cannot
-    mean "the panel was never wired in"; `max_rounds` is set high enough that neither
-    escalation can be the budget running out."""
+    """A submission identical to the one before it is not new evidence"""
     fleet.reconfigure(max_rounds=9)
     validator = Validator(rejected())
     fleet.daemon.validator = validator
@@ -1090,7 +898,7 @@ def test_a_repeated_fingerprint_escalates_without_calling_the_panel(fleet):
         fleet.drain()
         assert len(validator.calls) == 4
 
-        # The one that changed nothing resubmits the same words over the same tree.
+        # The one that changed nothing resubmits the same words over the same tree
         assert ops.submit_feature(stuck, "round 3", evidence="ran the suite")["round"] == 3
         fleet.merge("fix.py", "# what the review actually asked for\n")
         assert ops.submit_feature(moving, "round 3", evidence="ran the suite")["round"] == 3
@@ -1107,13 +915,11 @@ def test_a_repeated_fingerprint_escalates_without_calling_the_panel(fleet):
         store.close()
 
 
-# -- 5. what the user sees ------------------------------------------------------------
+# -- 5. what the user sees
 
 
 def test_validating_raises_no_attention_and_an_escalated_feature_does(fleet):
-    """`validating` is the system working, like `waiting_pr_merge`. Only the give-up
-    transition flags anyone — and both features below are in the same status, so the flag
-    is the only difference between them."""
+    """`validating` is the system working, like `waiting_pr_merge`"""
     validator = Validator(passed())
     validator.block()
     fleet.daemon.validator = validator
@@ -1146,7 +952,7 @@ def test_validating_raises_no_attention_and_an_escalated_feature_does(fleet):
 
 
 def test_jarvis_status_shows_a_feature_the_review_gave_up_on(fleet):
-    """The flag is only worth raising if it reaches the one surface the user reads."""
+    """The flag is only worth raising if it reaches the one surface the user reads"""
     validator = Validator(passed())
     fleet.daemon.validator = validator
     store = fleet.store()
@@ -1165,14 +971,11 @@ def test_jarvis_status_shows_a_feature_the_review_gave_up_on(fleet):
     assert items[0]["decide"] == f"jarvis fo show {fo_id}"
 
 
-# -- 6. what must not change ----------------------------------------------------------
+# -- 6. what must not change
 
 
 def test_a_failed_child_still_fails_the_feature_with_a_manager_open(fleet):
-    """`settle_features` still examines only `executing` features for the failure path —
-    that is what makes "flag once" true by construction — and an open manager must not be
-    mistaken for an unfinished child. No round is opened either: a feature with a dead
-    child has nothing to integrate."""
+    """`settle_features` still examines only `executing` features for the failure path"""
     validator = Validator(passed())
     fleet.daemon.validator = validator
     store = fleet.store()
@@ -1195,8 +998,7 @@ def test_a_failed_child_still_fails_the_feature_with_a_manager_open(fleet):
         assert validator.calls == []
         assert store.get_work_order(manager["id"])["status"] == "completed"
 
-        # Flag once, by construction: the feature has left `executing`, so the next tick
-        # cannot see it and cannot raise the flag again.
+        # Flag once, by construction: the feature has left `executing`
         store.clear_feature_attention(fo_id)
         fleet.daemon.settle_features(fleet.spec, store)
         assert store.get_feature_order(fo_id)["needs_attention"] == 0
@@ -1205,9 +1007,7 @@ def test_a_failed_child_still_fails_the_feature_with_a_manager_open(fleet):
 
 
 def test_fo_submit_refuses_a_feature_that_is_not_executing(fleet):
-    """Submitting a feature that is already under review asks for a second opinion on a
-    round in flight; submitting a settled one has misread the inbox. Both are refused with
-    what the feature is actually doing."""
+    """Submitting a feature that is already under review asks for a second opinion on a round in flight"""
     validator = Validator(passed())
     validator.block()
     fleet.daemon.validator = validator
@@ -1233,14 +1033,11 @@ def test_fo_submit_refuses_a_feature_that_is_not_executing(fleet):
         store.close()
 
 
-# -- 7. the kill switch ---------------------------------------------------------------
+# -- 7. the kill switch
 
 
 def test_the_kill_switch_drains_an_open_feature_round_instead_of_stranding_it(fleet):
-    """THE FLAG IS A SAFE STOP, NOT A TRAPDOOR — and for a feature it strands two things,
-    not one: the feature in `validating`, and its manager waiting for a message nobody
-    would ever send. Both halves asserted, plus the pair that shows a fresh feature under
-    the disabled flag taking today's path immediately."""
+    """THE FLAG IS A SAFE STOP, NOT A TRAPDOOR"""
     held = Validator(passed())
     held.block()
     fleet.daemon.validator = held
@@ -1279,9 +1076,7 @@ def test_the_kill_switch_drains_an_open_feature_round_instead_of_stranding_it(fl
 
 def test_with_no_validator_wired_an_open_feature_round_settles_unjudged(fleet,
                                                                         monkeypatch):
-    """A round with nothing to judge it settles its unit where the OS settles it with
-    validation switched off — never `passed`, because a round nobody judged must not read
-    as a verdict on any surface."""
+    """A round with nothing to judge it settles its unit where the OS settles it with validation switched..."""
     monkeypatch.setattr(Daemon, "_validator", staticmethod(lambda cfg: None))
     store = fleet.store()
     try:
@@ -1302,9 +1097,7 @@ def test_with_no_validator_wired_an_open_feature_round_settles_unjudged(fleet,
 
 
 def test_a_transport_outage_costs_the_feature_no_round(fleet):
-    """An outage is not a verdict. The round is retried against the same number, and the
-    budget it does spend is the outage budget — three, counted from the manager's
-    timeline so a daemon restart cannot hand it a fresh one."""
+    """An outage is not a verdict"""
     fleet.reconfigure(max_rounds=1)  # so a consumed round would show up immediately
     validator = Validator(claude_cli.ClaudeCliError("no seat answered"),
                           claude_cli.ClaudeCliError("no seat answered"),
@@ -1328,13 +1121,7 @@ def test_a_transport_outage_costs_the_feature_no_round(fleet):
 
 
 def test_a_feature_round_met_by_a_usage_window_waits_rather_than_spending_a_retry(fleet):
-    """The work-order twin is tests/test_validation_usage_limit.py — this is the half of
-    GitHub issue #235 that lives on the MANAGER's timeline.
-
-    `max_rounds=1` so that a consumed round would show up at once, and four drains is
-    past the whole transport budget: a window that cost the feature its retries would
-    have escalated by the last of them.
-    """
+    """The work-order twin is tests/test_validation_usage_limit.py (#235)"""
     from jarvis.claude_cli import UsageLimit, UsageLimitError
 
     fleet.reconfigure(max_rounds=1)
@@ -1361,12 +1148,7 @@ def test_a_feature_round_met_by_a_usage_window_waits_rather_than_spending_a_retr
 
 
 def test_a_feature_round_the_shut_window_skips_records_the_hold(fleet):
-    """GitHub issue #714 on the feature side. `feature_validation_tick` returns before
-    the first seat when the account is shut — correctly — and used to write nothing, so
-    a feature parked for a whole window had no recorded reason for any of it.
-
-    The twin is tests/test_usage_window_is_account_wide.py; the difference is only the
-    carrier, the manager's timeline (`_hold_feature_rounds_for_outage`)."""
+    """GitHub issue #714 on the feature side"""
     from jarvis import fleet as fleet_mod
     from jarvis.project_store import VALIDATION_HELD_CAUSE, validation_hold
 
@@ -1398,10 +1180,7 @@ def test_a_feature_round_the_shut_window_skips_records_the_hold(fleet):
 
 
 def test_a_held_feature_round_carries_the_cause_on_the_ROUND(fleet):
-    """GitHub issue #581 on the feature side, and the case that argued the shape of the
-    fix: this hold's event lives on the MANAGER's timeline, so nothing reading the
-    round's own subject could ever recover the cause from it. The round row is the only
-    carrier all three renderers can reach."""
+    """GitHub issue #581 on the feature side"""
     from jarvis.claude_cli import UsageLimit, UsageLimitError
     from jarvis.project_store import VALIDATION_HELD_CAUSE, validation_standing
 
@@ -1421,7 +1200,7 @@ def test_a_held_feature_round_carries_the_cause_on_the_ROUND(fleet):
         assert row["hold_cause"] == VALIDATION_HELD_CAUSE
         assert validation_standing(row) == ("held for the usage window", "active", "◑")
 
-        # The projection `jarvis fo show` and the feature's dashboard page read.
+        # The projection `jarvis fo show` and the feature's dashboard page read
         projected = ops.validation_rounds(store, fo_id=fo_id)[-1]
         assert projected["hold_cause"] == VALIDATION_HELD_CAUSE
         line = ops.round_line(projected)
@@ -1431,9 +1210,7 @@ def test_a_held_feature_round_carries_the_cause_on_the_ROUND(fleet):
 
 
 def test_a_feature_round_whose_seats_could_not_authenticate_is_held(fleet):
-    """GitHub issue #778 on the feature side, and the twin of the usage-window pair above:
-    an auth failure holds the round instead of escalating it, and the events live on the
-    MANAGER's timeline because `wo_events.wo_id` is a foreign key into `work_orders`."""
+    """GitHub issue #778 on the feature side"""
     from jarvis.claude_cli import AuthFailure, AuthFailureError
     from jarvis.project_store import (VALIDATION_AUTH_CAUSE, validation_hold,
                                       validation_standing)
@@ -1463,8 +1240,7 @@ def test_a_feature_round_whose_seats_could_not_authenticate_is_held(fleet):
         assert cause == VALIDATION_AUTH_CAUSE
         assert until > time.time()
 
-        # The STREAK is counted from those events, so a daemon restart does not hand the
-        # round a fresh schedule.
+        # The STREAK is counted from those events
         Daemon._feature_auth_held(fleet.daemon, store, store.get_feature_order(fo_id),
                                   int(row["id"]), 1, auth)
         attempts = [json.loads(e["payload"])["attempt"]
@@ -1476,10 +1252,7 @@ def test_a_feature_round_whose_seats_could_not_authenticate_is_held(fleet):
 
 
 def test_a_feature_with_no_manager_escalates_without_calling_the_panel(fleet):
-    """A feature whose plan was released while validation was off has no manager, so a
-    rejection would have no addressee and the round's own events would have no timeline
-    to live on. It escalates before the panel is called — Neo's ruling on question 153 —
-    and the pair is a feature that does have one, on the same tick."""
+    """A feature whose plan was released while validation was off has no manager"""
     validator = Validator(passed())
     fleet.daemon.validator = validator
     store = fleet.store()
@@ -1505,34 +1278,11 @@ def test_a_feature_with_no_manager_escalates_without_calling_the_panel(fleet):
         store.close()
 
 
-# -- 7. the give-up reaches the user (issue #199) -------------------------------------
+# -- 7. the give-up reaches the user (issue #199)
 
 
 def _outbox(store: ProjectStore, unit_id: str) -> list[dict]:
-    """The outbox rows this unit's give-up wrote, routed or not.
-
-    NOT `unrouted_notifications`: `Fleet.drain` ticks twice and `route_outbox` runs on
-    every tick, so a give-up escalated on the first tick is already `routed` by the time
-    the second one returns — and a test reading only the unrouted rows would see the
-    silence it was written to rule out.
-
-    SCOPED BY UNIT, because the fixture validates work orders too: `Fleet.release`
-    submits the plan, which finishes the PLANNER, and that work order gets a round of its
-    own — so an unfiltered read can carry a row this feature never wrote, and the
-    rejection pairing below would pass for the wrong reason.
-
-    THE PLANNER NO LONGER WRITES A GIVE-UP ROW: a submitted plan is an attested side
-    effect, so its round VOIDS rather than escalating on the empty worktree — spec
-    docs/superpowers/specs/2026-09-25-a-plan-submission-is-not-an-empty-packet.md.
-
-    THE SCOPE IS A MATCH ON THE TITLE, which makes the title's wording load-bearing as an
-    identifier — there is no `fo_id` column to filter on instead. So both halves are
-    ASSERTED rather than assumed: every row's title must start with a unit id, so a
-    reworded title fails here instead of silently making the filter match nothing; and
-    work-order validation is asserted to have RUN at all, over the planner's own round,
-    so "a rejection wrote no row" can never start passing because this fixture stopped
-    judging work orders.
-    """
+    """The outbox rows this unit's give-up wrote, routed or not (docs/superpowers/specs/2026-09-25-a-plan-submission-is-not-an-empty-packet.md)"""
     rows = [dict(r) for r in store.conn.execute(
         "SELECT * FROM notifications WHERE source='validation' ORDER BY id").fetchall()]
     assert all(r["title"].startswith(("wo-", "fo-")) for r in rows), (
@@ -1548,10 +1298,7 @@ def _outbox(store: ProjectStore, unit_id: str) -> list[dict]:
 
 
 def test_a_feature_give_up_notifies_and_a_rejection_stays_silent(fleet):
-    """PAIRED: a rejection has an addressee — the manager, over the bus — and pinging the
-    user per round would bury the one transition that actually needs them. The feature
-    id lives in the TITLE because the outbox carries no feature column, and naming the
-    manager in `wo_id` would send every sink to a session instead of to the rounds."""
+    """PAIRED: a rejection has an addressee"""
     fleet.reconfigure(max_rounds=2)
     fleet.daemon.validator = Validator(rejected("the exporter has no empty-set test"))
     store = fleet.store()
@@ -1578,8 +1325,7 @@ def test_a_feature_give_up_notifies_and_a_rejection_stays_silent(fleet):
 
 
 def test_the_feature_give_up_notification_reaches_the_central_inbox(fleet):
-    """The empty-diff give-up never calls the panel, so the notification is the only
-    thing that leaves the project at all — and `route_outbox` is what carries it."""
+    """The empty-diff give-up never calls the panel"""
     from jarvis.central_store import CentralStore
 
     fleet.daemon.validator = Validator(passed())
@@ -1606,11 +1352,11 @@ def test_the_feature_give_up_notification_reaches_the_central_inbox(fleet):
     assert (rows[0]["level"], rows[0]["project"]) == ("warning", "proj_a")
 
 
-# -- the prompt ceiling: a feature round refused, not retried ---------------------------
+# -- the prompt ceiling: a feature round refused, not retried
 
 
 def _feature_refusal(chars: int = 500_000) -> claude_cli.PromptTooLargeError:
-    """The transport's refusal as `Daemon._validate_feature` receives it."""
+    """The transport's refusal as `Daemon._validate_feature` receives it"""
     return claude_cli.PromptTooLargeError(
         f"refused a validation call: prompt {chars} chars + system prompt 0 chars "
         f"= {chars}, over the 400000-char ceiling (os.max_os_prompt_chars)",
@@ -1618,13 +1364,7 @@ def _feature_refusal(chars: int = 500_000) -> claude_cli.PromptTooLargeError:
 
 
 def test_a_refused_feature_round_escalates_once_and_burns_no_outage_retry(fleet):
-    """`Daemon._feature_refused`, BEHAVIOURALLY — `tests/test_prompt_ceiling.py` pins
-    only the order of its two `except` clauses.
-
-    Four drains is past the whole three-attempt outage budget, which the work-order
-    twin's test uses for the same reason: a refusal that took the retry path would have
-    spent every attempt by the last of them.
-    """
+    """`Daemon._feature_refused`, BEHAVIOURALLY"""
     from jarvis.central_store import CentralStore
 
     fleet.reconfigure(max_rounds=1)
@@ -1655,20 +1395,16 @@ def test_a_refused_feature_round_escalates_once_and_burns_no_outage_retry(fleet)
         central.close()
     assert len(rows) == 1
     assert rows[0]["level"] == "critical"
-    # The FEATURE id and no `wo_id`: naming the manager would point every sink at a
-    # session rather than at the rounds (`_feature_refused`).
+    # The FEATURE id and no `wo_id`: naming the manager would point every sink at a session rather than...
     assert fo_id in rows[0]["title"] and rows[0]["wo_id"] is None
     assert "os.max_os_prompt_chars" in rows[0]["body"]
 
 
-# -- the head a round judges must contain the children's merges -----------------------
-#
-# docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md
+# -- the head a round judges must contain the children's merges
 
 
 def _dangling_commit(fleet) -> str:
-    """A real commit that is NOT reachable from the default branch — a child merged
-    somewhere else, or merged after the local ref was last fetched."""
+    """A real commit that is NOT reachable from the default branch"""
     before = _git(fleet.project, "rev-parse", "HEAD").strip()
     sha = fleet.merge("sidecar.py", "sidecar = 1\n")
     _git(fleet.project, "reset", "--hard", before)
@@ -1677,19 +1413,19 @@ def _dangling_commit(fleet) -> str:
 
 def _pr_merged(store: ProjectStore, child_id: str, sha: str,
                *, minutes_ago: float = 0.0) -> None:
-    """What the merge poller records when a child's pull request lands."""
+    """What the merge poller records when a child's pull request lands"""
     store.add_event(child_id, "pr_merged", {"merge_commit": sha},
                     ts=time.time() - minutes_ago * 60)
 
 
 def _route(fleet, store, fo_id: str) -> bool:
-    """`_route_to_validation`'s bool: "dealt with" — a round opened OR a deferral."""
+    """`_route_to_validation`'s bool: "dealt with" — a round opened OR a deferral"""
     return fleet.daemon._route_to_validation(fleet.spec, store,
                                              store.get_feature_order(fo_id))
 
 
 def _landed_feature(fleet, store, *keys: str) -> str:
-    """A feature whose children have all completed over a real merge on the head."""
+    """A feature whose children have all completed over a real merge on the head"""
     fo_id = fleet.release("CSV export", *(keys or ("one",)))
     fleet.merge("exporter.py", "def export():\n    return 'a,b'\n")
     fleet.land_children(fo_id, store)
@@ -1697,9 +1433,7 @@ def _landed_feature(fleet, store, *keys: str) -> str:
 
 
 def test_the_default_branch_is_fetched_before_a_feature_is_collected(fleet, monkeypatch):
-    """§1. The judged head was as stale as the last unrelated `git fetch` anyone happened
-    to run in the checkout — nothing on the path fetched. ORDER IS THE ASSERTION: a fetch
-    after collection answers about a commit nobody judged."""
+    """§1"""
     calls: list[tuple] = []
     real_collect = evidence.collect_feature
     monkeypatch.setattr(branchproof, "fetch",
@@ -1717,8 +1451,7 @@ def test_the_default_branch_is_fetched_before_a_feature_is_collected(fleet, monk
 
         fleet.daemon.settle_features(fleet.spec, store)
 
-        # Two fetches: §2's ancestry check fetches first, then §1's. ORDER, not count —
-        # nothing is collected before a fetch.
+        # Two fetches: §2's ancestry check fetches first, then §1's
         assert [c[0] for c in calls] == ["fetch", "fetch", "collect"]
         assert calls[0][1] == fleet.project
         assert calls[0][2] == (evidence.base_ref(fleet.project),), (
@@ -1729,8 +1462,7 @@ def test_the_default_branch_is_fetched_before_a_feature_is_collected(fleet, monk
 
 
 def test_a_failed_fetch_is_logged_and_the_round_still_opens(fleet, monkeypatch):
-    """§1. A project with no network must still be able to validate; §2's check is what
-    catches the stale case regardless of why the fetch failed."""
+    """§1"""
     monkeypatch.setattr(branchproof, "fetch", lambda repo, *refs: False)
     fleet.daemon.validator = Validator(passed())
     store = fleet.store()
@@ -1746,8 +1478,7 @@ def test_a_failed_fetch_is_logged_and_the_round_still_opens(fleet, monkeypatch):
 
 
 def test_a_child_whose_merge_is_not_in_the_head_defers_the_round(fleet):
-    """§2. The measured failure of fo-ac00376e round 1: the panel was shown a head that
-    predated a child's merge and reported the child's work as missing."""
+    """§2"""
     fleet.daemon.validator = Validator(passed())
     store = fleet.store()
     try:
@@ -1760,16 +1491,14 @@ def test_a_child_whose_merge_is_not_in_the_head_defers_the_round(fleet):
         assert store.validation_rounds(fo_id=fo_id) == []
         fo = store.get_feature_order(fo_id)
         assert fo["status"] == "executing"
-        # Waiting is the system working, and the OS's rule is that waiting never flags.
+        # Waiting is the system working, and the OS's rule is that waiting never flags
         assert fo["needs_attention"] == 0
     finally:
         store.close()
 
 
 def test_settle_features_does_not_complete_a_deferred_feature(fleet):
-    """§2. The whole tick, not `_route_to_validation`: `True` means "dealt with, leave it
-    alone", and a `False` return here would COMPLETE the feature unjudged — strictly worse
-    than the false rejection this spec fixes."""
+    """§2"""
     fleet.daemon.validator = Validator(passed())
     store = fleet.store()
     try:
@@ -1788,9 +1517,7 @@ def test_settle_features_does_not_complete_a_deferred_feature(fleet):
 
 def test_a_deferred_feature_clears_itself_once_the_fetch_finds_the_merge(fleet,
                                                                         monkeypatch):
-    """§2. A deferral must be able to END. Every other defer test leaves the commit
-    dangling for ever, so the arm where the re-check finds the child integrated decides
-    whether a feature that defers once parks for ever."""
+    """§2"""
     fleet.daemon.validator = Validator(passed())
     store = fleet.store()
     try:
@@ -1802,8 +1529,7 @@ def test_a_deferred_feature_clears_itself_once_the_fetch_finds_the_merge(fleet,
         assert _route(fleet, store, fo_id) is True, "deferred, so: leave it alone"
         assert store.validation_rounds(fo_id=fo_id) == []
 
-        # What the production fetch does once the child's merge is upstream: the local
-        # default-branch ref moves forward over that commit.
+        # What the production fetch does once the child's merge is upstream: the local default-branch ref...
         monkeypatch.setattr(branchproof, "fetch",
                             lambda repo, *refs: bool(_git(repo, "reset", "--hard", sha))
                             or True)
@@ -1819,9 +1545,7 @@ def test_a_deferred_feature_clears_itself_once_the_fetch_finds_the_merge(fleet,
 
 
 def test_the_check_failing_defers_rather_than_completing_the_feature(fleet, monkeypatch):
-    """§2. `_defer_unintegrated_children` catches everything and answers True precisely so
-    its OWN failures cannot fall into `_route_to_validation`'s `except: return False` arm,
-    which `settle_features` reads as "complete this feature unjudged"."""
+    """§2"""
     validator = Validator(passed())
     fleet.daemon.validator = validator
     store = fleet.store()
@@ -1847,8 +1571,7 @@ def test_the_check_failing_defers_rather_than_completing_the_feature(fleet, monk
 
 
 def test_past_the_bound_the_feature_asks_the_user_and_still_opens_no_round(fleet):
-    """§3. A child merged into a sibling branch never becomes an ancestor of that head, so
-    an unbounded deferral parks the feature silently — issue #881's failure mode."""
+    """§3 (#881)"""
     fleet.daemon.validator = Validator(passed())
     store = fleet.store()
     try:
@@ -1863,7 +1586,7 @@ def test_past_the_bound_the_feature_asks_the_user_and_still_opens_no_round(fleet
         fo = store.get_feature_order(fo_id)
         assert fo["needs_attention"] == 1
         reason = fo["attention_reason"]
-        # Three things, because each points at a different remedy.
+        # Three things, because each points at a different remedy
         assert child["id"] in reason
         assert commit in reason
         assert evidence.default_branch_head(fleet.project) in reason
@@ -1874,8 +1597,7 @@ def test_past_the_bound_the_feature_asks_the_user_and_still_opens_no_round(fleet
 
 
 def test_one_defer_event_per_distinct_state(fleet):
-    """§3. A per-tick event would write a row a minute for fifteen minutes and then for
-    ever; crossing the bound IS news and gets the second row."""
+    """§3"""
     fleet.daemon.validator = Validator(passed())
     store = fleet.store()
     try:
@@ -1913,8 +1635,7 @@ def test_one_defer_event_per_distinct_state(fleet):
 
 
 def test_every_child_integrated_opens_the_round_as_today(fleet):
-    """§2. The no-regression pair: merge commits reachable from the head defer nothing,
-    and a child that delivered without a pull request contributes nothing to check."""
+    """§2"""
     validator = Validator(passed())
     fleet.daemon.validator = validator
     store = fleet.store()
@@ -1924,7 +1645,7 @@ def test_every_child_integrated_opens_the_round_as_today(fleet):
         fleet.land_children(fo_id, store)
         first, second = store.feature_children(fo_id)
         _pr_merged(store, first["id"], merged)   # landed on the head
-        # `second` has no pr_url and no merge event: it delivered without a PR.
+        # `second` has no pr_url and no merge event: it delivered without a PR
 
         assert _route(fleet, store, fo_id) is True, "nothing deferred: the round opened"
 
@@ -1941,10 +1662,7 @@ def test_every_child_integrated_opens_the_round_as_today(fleet):
 
 
 def test_a_failing_fetch_defers_rather_than_judging_a_stale_head(fleet, monkeypatch):
-    """§2 + Neo 1394. The arm the daemon's own precondition is supposed to make
-    unreachable: `_defer_unintegrated_children` says fine, the fetch fails, and `ops` is
-    what sees the unintegrated child. `_route_to_validation` must catch that EXPLICITLY —
-    reaching `except Exception: return False` completes the feature unjudged."""
+    """§2 + Neo 1394"""
     monkeypatch.setattr(branchproof, "fetch", lambda repo, *refs: False)
     monkeypatch.setattr(Daemon, "_defer_unintegrated_children",
                         lambda *a, **kw: False)
@@ -1968,9 +1686,7 @@ def test_a_failing_fetch_defers_rather_than_judging_a_stale_head(fleet, monkeypa
 
 
 def test_fo_submit_errors_to_the_caller_instead_of_deferring(fleet, monkeypatch):
-    """Neo 1394 holds: `ops` cannot defer — it has no next tick — so a manager's explicit
-    resubmission over a stale head fails loudly instead of opening a round nobody can
-    judge."""
+    """Neo 1394 holds: `ops` cannot defer"""
     monkeypatch.setattr(branchproof, "fetch", lambda repo, *refs: False)
     store = fleet.store()
     try:
@@ -1987,7 +1703,7 @@ def test_fo_submit_errors_to_the_caller_instead_of_deferring(fleet, monkeypatch)
 
         err = caught.value
         assert (err.child_id, err.commit, err.head) == (child["id"], commit, head)
-        # Three things, because each points at a different remedy.
+        # Three things, because each points at a different remedy
         for fact in (child["id"], commit, head):
             assert fact in str(err)
         assert store.validation_rounds(fo_id=fo_id) == []
@@ -1997,15 +1713,12 @@ def test_fo_submit_errors_to_the_caller_instead_of_deferring(fleet, monkeypatch)
 
 
 def test_the_two_merge_commit_event_literals_stay_equal():
-    """Drift and `ops.recorded_merge_commit` stops seeing the daemon's back-filled merge
-    commit, so a stale head is judged instead of refused. One source is impossible here:
-    `ops` imports `daemon` at module level, so `from . import ops` in daemon.py cycles."""
+    """Drift and `ops.recorded_merge_commit` stops seeing the daemon's back-filled merge commit"""
     assert Daemon.MERGE_COMMIT_EVENT == ops.MERGE_COMMIT_EVENT
 
 
 def test_a_feature_round_records_the_commit_it_judged(fleet):
-    """§5. `jarvis validation show <fo-id>` printed "commit not recorded" for every round a
-    feature had ever had, so a rejection could not later say what it rejected."""
+    """§5"""
     validator = Validator(passed())
     fleet.daemon.validator = validator
     store = fleet.store()
@@ -2024,8 +1737,7 @@ def test_a_feature_round_records_the_commit_it_judged(fleet):
 
 
 def test_the_judged_commit_is_recorded_on_the_escalate_paths_too(fleet):
-    """§5(b). Written immediately after collection and BEFORE the escalate/void guards:
-    it is a fact about the packet, so an escalation can still say what it was about."""
+    """§5(b)"""
     validator = Validator(passed())
     fleet.daemon.validator = validator
     store = fleet.store()
@@ -2038,8 +1750,7 @@ def test_the_judged_commit_is_recorded_on_the_escalate_paths_too(fleet):
         fleet.drain()
 
         head = evidence.default_branch_head(fleet.project)
-        # A feature with no base resolves no head either (`collect_feature`), so `""` is
-        # the honest record there and the empty-diff round carries the real commit.
+        # A feature with no base resolves no head either (`collect_feature`)
         for fo_id, why, judged in (
                 (baseless, "no recorded base commit", ""),
                 (empty, "nothing has changed on the default branch", head)):

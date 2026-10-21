@@ -1,46 +1,4 @@
-"""The plan a planner submits, and the structural checks it must survive.
-
-A feature order's planner finishes by handing back a dependency graph of child work
-orders (`jarvis fo plan <fo-id> --from-file plan.json`). This module owns that
-document's shape and validates it *before* anything is created.
-
-Why the validation is mechanical and lives here rather than in a reviewer's judgement:
-Neo, not the user, is the routine reviewer of plans (design section 5), and that
-reversal moves weight onto two backstops which the design calls load-bearing rather
-than nice-to-have. This is one of them. These checks run whether or not Neo is paying
-attention, they are pure Python over the submitted document, and — like
-`invariants.py` — they involve no LLM on purpose: the checker has to be more
-trustworthy than the thing it checks.
-
-The rejections, and what each is guarding:
-
-* **Cycles.** A plan is a graph and a graph can close on itself. Phase 1's dependency
-  edges are acyclic *by construction* — `ProjectStore.create_work_order` may only point
-  an edge at a row that already exists — but a plan is written all at once, before any
-  row exists, so that argument does not reach it. This is the real cycle check Phase 1's
-  docstring says is owed the moment edges stop being created strictly after their
-  targets.
-* **Unknown ids.** A `needs` naming nothing in the plan would silently become a child
-  with no edge at all, which is the failure that looks most like success.
-* **The child cap.** A bad plan spends one worker session per child, so the blast radius
-  of a plan Neo waves through has to be bounded. Over the cap the planner must say why,
-  in the submission, or it does not validate.
-* **Children whose description does not stand alone.** The one that matters most in
-  practice. The child worker never sees this plan — it sees only its own description —
-  so "as discussed in the plan" hands a worker a sentence pointing at a document it
-  cannot open. This project has already recorded the general form of that lesson: the
-  work order record must stand alone, because nobody reads worker transcripts.
-* **Children whose description does not stop**, and **a plan with no design document.**
-  The mirror of the rejection above and its consequence: a brief must stand alone as
-  INSTRUCTIONS, which is not a licence to restate the spec.
-* **A child that does not name its section of the spec**, two children naming the same
-  one, or a section that does not resolve. The spec's boundaries are what the split is
-  made of, so a plan that does not line up with them has not been cut.
-
-The last of those needs the spec's TEXT, which this module never reads from disk —
-`spec_problems` is the pure other half and `ops.submit_plan` is where the two meet. See
-docs/superpowers/specs/2026-08-29-spec-driven-feature-orders.md.
-"""
+"""The plan a planner submits, and the structural checks it must survive (docs/superpowers/specs/2026-08-29-spec-driven-feature-orders.md)"""
 
 from __future__ import annotations
 
@@ -49,35 +7,19 @@ from typing import Any
 
 from . import sections
 
-#: How many children a plan may contain before the planner owes an explanation.
-#: Eight, from the design. Not a per-project knob: a cap the user can raise is a cap
-#: that gets raised the first time it fires, which is precisely when it was working.
+#: How many children a plan may contain before the planner owes an explanation
 CHILD_CAP = 8
 
-#: Shortest description that can plausibly stand on its own. A worker gets this text and
-#: nothing else, so a one-line restatement of the title is not a brief. Deliberately
-#: generous — this is a floor against obvious under-specification, not a quality bar;
-#: judging whether a real paragraph is *good* enough is Neo's job, not a character count.
+#: Shortest description that can plausibly stand on its own
 MIN_DESCRIPTION_CHARS = 80
 
-#: Longest a child brief may be. The floor's argument does NOT run in reverse: a
-#: description that must stand alone is not one that should carry the design, and the
-#: child's own SECTION of the spec is now materialised beside it. 1500 was PR 125's
-#: number and it left room for a paraphrase; 600 leaves room for what the section does not
-#: say — the scope boundary and what done means. §1.3 of
-#: docs/superpowers/specs/2026-08-29-spec-driven-feature-orders.md.
+#: Longest a child brief may be (docs/superpowers/specs/2026-08-29-spec-driven-feature-orders.md)
 MAX_DESCRIPTION_CHARS = 600
 
-#: Plan-local child keys. The planner names its children so it can wire `needs` between
-#: them before any work-order id exists; these keys never leave the plan.
+#: Plan-local child keys
 KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 
-#: Phrases that point OUT of a child's own description at something the child worker will
-#: never see — the plan, a sibling, "above". Curated rather than clever: a false
-#: rejection costs the planner one revision and says exactly which phrase to fix, while a
-#: false acceptance costs a whole worker session that starts confused. Each entry must
-#: only match a genuine outward reference, which is why the "as described" family carries
-#: a negative lookahead for the cases that point back INTO the same text.
+#: Phrases that point OUT of a child's own description at something the child worker will never see
 DANGLING_PHRASES: tuple[tuple[str, str], ...] = (
     (r"\bas (?:discussed|described|outlined|specified|agreed|noted|explained|planned)\b"
      r"(?!\s+(?:below|here|in this))",
@@ -87,10 +29,7 @@ DANGLING_PHRASES: tuple[tuple[str, str], ...] = (
      "refers to the plan, which the child worker never receives"),
     (r"\bthe plan (?:above|says|describes|calls for)\b",
      "refers to the plan, which the child worker never receives"),
-    # Ordinals are deliberately NOT in this alternation. "The first step is to add the
-    # column" is exactly how a good standalone description opens, and rejecting it would
-    # teach planners to write worse prose to get past the checker. Only words that point
-    # at something OUTSIDE this description qualify.
+    # Ordinals are deliberately NOT in this alternation
     (r"\bthe (?:previous|preceding|other|sibling|earlier) "
      r"(?:work order|child|step|task|piece)\b",
      "refers to a sibling rather than saying what to do"),
@@ -102,12 +41,7 @@ DANGLING_PHRASES: tuple[tuple[str, str], ...] = (
 
 
 class PlanError(ValueError):
-    """A submitted plan that cannot be accepted. Message names every problem found.
-
-    One exception carrying all of them, not the first: a planner that has to re-submit
-    per problem burns a session round trip per line of the error it could have had at
-    once.
-    """
+    """A submitted plan that cannot be accepted"""
 
     def __init__(self, problems: list[str]):
         self.problems = problems
@@ -115,13 +49,7 @@ class PlanError(ValueError):
 
 
 def parse_plan(raw: Any) -> dict[str, Any]:
-    """Validate a submitted plan and return it normalised. Raises `PlanError`.
-
-    The returned document is what gets stored on the feature order and what the children
-    are created from, so normalisation happens here and exactly once: keys and titles
-    stripped, `needs` deduplicated in first-seen order, absent optional fields filled in.
-    Nothing downstream re-derives any of it.
-    """
+    """Validate a submitted plan and return it normalised"""
     problems: list[str] = []
     if not isinstance(raw, dict):
         raise PlanError([f"a plan must be a JSON object, got {type(raw).__name__}"])
@@ -171,13 +99,9 @@ def parse_plan(raw: Any) -> dict[str, Any]:
         children.append({
             "key": key, "title": title[:200], "description": description,
             "needs": needs,
-            # Which section of the spec this child implements. Resolved against the
-            # document's text in `spec_problems`, not here: this function never touches
-            # disk. §1.2 of the design document.
+            # Which section of the spec this child implements
             "spec_section": spec_section,
-            # Free-form and never validated: the test-lead seat that fills it lands in
-            # Phase 3, and a field the OS refuses to carry until then is a field Phase 3
-            # has to migrate. It rides along instead.
+            # Free-form and never validated: the test-lead seat that fills it lands in Phase 3
             "acceptance": str(entry.get("acceptance") or "").strip(),
         })
 
@@ -224,32 +148,14 @@ def parse_plan(raw: Any) -> dict[str, Any]:
     return {
         "summary": str(raw.get("summary") or "").strip(),
         "justification": justification,
-        # The feature's spec, relative to the repository root. REQUIRED: `fo plan`
-        # snapshots its content, dispatch materialises each child's own section beside
-        # it, and the feature's agent type is built from its `Agent profile` appendix.
-        # §1.1 of docs/superpowers/specs/2026-08-29-spec-driven-feature-orders.md.
+        # The feature's spec, relative to the repository root (docs/superpowers/specs/2026-08-29-spec-driven-feature-orders.md)
         "design_doc": design_doc,
         "children": children,
     }
 
 
 def spec_problems(plan: dict[str, Any], doc_text: str) -> list[str]:
-    """Whether the plan and the spec it names describe the same feature.
-
-    The half of the validation that needs the document's TEXT, kept pure and separate so
-    `parse_plan` never touches disk; `ops.submit_plan` reads the file and calls both.
-    Three rejections, all §2 of the design document:
-
-    * a `spec_section` that resolves to no heading — the child would be handed nothing,
-      and the panel would judge its diff against nothing;
-    * two children naming the same section — a boundary two work orders share is a
-      boundary the planner did not cut, which is the whole premise of splitting on the
-      spec rather than on the planner's intuition;
-    * no usable `Agent profile` appendix, which is `specs.profile_problems`.
-
-    Nothing here judges whether a section is any GOOD. That is the plan reviewer's job;
-    this only ensures there is something for it to review.
-    """
+    """Whether the plan and the spec it names describe the same feature"""
     from . import sections, specs
 
     problems: list[str] = []
@@ -285,7 +191,7 @@ def spec_problems(plan: dict[str, Any], doc_text: str) -> list[str]:
 
 
 def _description_problems(key: str, title: str, description: str) -> list[str]:
-    """Whether this child's description can stand on its own in front of a worker."""
+    """Whether this child's description can stand on its own in front of a worker"""
     problems = []
     if not description:
         problems.append(
@@ -324,14 +230,7 @@ def _description_problems(key: str, title: str, description: str) -> list[str]:
 
 
 def find_cycles(children: list[dict[str, Any]]) -> list[list[str]]:
-    """Every dependency cycle in the plan, each as the ring of keys that forms it.
-
-    Depth-first over the graph rather than a Kahn's-algorithm leftover set, because the
-    planner has to be told *which* keys close the loop in order to fix it — "these three
-    are cyclic" is actionable and "the graph is cyclic" is not. Only edges between known
-    keys are walked; unknown ids are already reported separately and would otherwise be
-    reported twice.
-    """
+    """Every dependency cycle in the plan, each as the ring of keys that forms it"""
     edges = {c["key"]: [d for d in c["needs"] if d != c["key"]] for c in children}
     edges = {k: [d for d in deps if d in edges] for k, deps in edges.items()}
     cycles: list[list[str]] = []
@@ -359,18 +258,7 @@ def find_cycles(children: list[dict[str, Any]]) -> list[list[str]]:
 
 
 def creation_order(children: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The children in an order where every child follows everything it needs.
-
-    Load-bearing rather than tidy: `ProjectStore.create_work_order` refuses an edge
-    pointing at a work order that does not exist yet, which is the property that keeps
-    the whole dependency graph acyclic by construction. Creating a plan's children in
-    this order is what lets a validated plan land through that check unchanged, instead
-    of needing a second pass that writes edges onto rows already created — the exact
-    move Phase 1 warns loses the property.
-
-    Assumes the plan validated, so the graph is acyclic; ties break on the order the
-    planner wrote them, which is the order it thought about them in.
-    """
+    """The children in an order where every child follows everything it needs"""
     by_key = {c["key"]: c for c in children}
     out: list[dict[str, Any]] = []
     placed: set[str] = set()
@@ -387,17 +275,7 @@ def creation_order(children: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
-#: The persona Neo wears to review a submitted plan. A third one, alongside the answerer
-#: and the gate reviewer, for the same reason the gate needed its own: the general
-#: persona is told to escalate anything that publishes or touches production, which is
-#: right for open questions and would send every plan straight to the user — the exact
-#: cost feature orders exist to remove.
-#:
-#: What makes this reviewer worth having is that it is STRUCTURALLY BLIND. Neo did not
-#: sit in the planning session; it holds the user's original ask and reads the
-#: decomposition cold. A scope check that has already followed the reasoning will
-#: rationalise it — every child looks necessary when it is judged against the plan
-#: instead of against the ask — so the independence is the evidence, not a formality.
+#: The persona Neo wears to review a submitted plan
 PLAN_REVIEWER_PERSONA = """You are Neo, reviewing a PLAN inside the Jarvis agentic OS.
 
 The user filed a feature order: one coarse ask, too big for a single work session. A
@@ -428,9 +306,11 @@ APPROVE when all of these hold:
 - **The split follows the spec's boundaries.** Every child names the section of the
   design document it implements, and no two name the same one. Judge whether those
   sections are the feature's real functional seams or a decomposition the planner
-  reached for first and then carved the spec to fit. The spec is SUPPLIED WITH THIS
-  QUESTION, so do not read the repository for it; if it is marked TRUNCATED, do not
-  conclude the spec ends where the text ends.
+  reached for first and then carved the spec to fit. This question carries the spec's
+  HEADING OUTLINE — every heading of the document, in order, with no body text — so
+  judge the split against those boundaries and do not read the repository for the
+  document. The sections' CONTENT is not yours to judge: a child's brief against the
+  text of the section it names is the validation panel's review, not this one.
 - **Each child is nameable from its line.** You see one line per child — title,
   edges, section, acceptance — and NOT the full briefs: those were validated mechanically
   (they stand alone, or this never reached you) and are withheld on purpose, because
@@ -468,56 +348,28 @@ An escalation may carry one optional label, which is grouped and reported:
 conflicting-authority | ambiguous-intent | scope-too-large | privileged-action>\""""
 
 
-#: How much spec may ride in one plan question. 120,000 chars, not §10's 40,000: every
-#: spec in this repo must fit unclipped or clipping becomes the common path — the largest
-#: is 99,602 bytes and the spec of this very incident is 42,776, so 40,000 would clip the
-#: document the bug was about.
-SPEC_CONTEXT_MAX_CHARS = 120_000
-
-
-def build_plan_context(plan: dict[str, Any], source: str,
-                       max_chars: int = SPEC_CONTEXT_MAX_CHARS) -> str:
-    """The spec the plan decomposes, as the reviewer must read it — text, not a path.
-
-    §5 of docs/superpowers/specs/2026-09-25-plan-review-reads-the-spec-the-os-holds.md:
-    a question that names its one load-bearing artifact instead of carrying it sends the
-    reviewer to whatever checkout it can reach, which is how question 658 judged a
-    revision nobody had pulled. The wording is asserted by test, not paraphrased.
-    """
+def build_plan_context(plan: dict[str, Any], source: str) -> str:
+    """The design document's HEADING OUTLINE — every heading line, in order, no body text; a structural fingerprint (Neo ruling Q1880) that travels WITH the question, and an unresolvable document is REFUSED, never substituted (docs/superpowers/specs/2026-09-25-plan-review-reads-the-spec-the-os-holds.md §5)"""
     text = str(plan.get("design_doc_content") or "")
-    kept, omitted = sections.clip_at_heading(text, max_chars)
+    outline = sections.heading_outline(text)
+    if not outline:
+        raise PlanError([
+            f"{plan.get('design_doc')} does not resolve to a document with headings, so "
+            f"there is no outline to review"])
     lines = [
         f"SPEC UNDER REVIEW — {plan.get('design_doc')}, as committed on {source}.",
-        "This text IS the spec this plan decomposes. Judge against THIS text and nothing "
-        "else.",
+        "This OUTLINE — every heading of that document, in order, with no body text — is "
+        "the spec's",
+        "structure. Judge the decomposition against THESE boundaries and nothing else.",
         "Do NOT open this path on disk: the checkout you can reach is not the one this "
         "plan was",
         "written against, and reading it is how question 658 was answered wrongly.",
     ]
-    if omitted:
-        lines += [
-            "",
-            f"TRUNCATED at {len(kept)} of {len(text)} characters. The sections below "
-            f"were NOT included and you have not",
-            "seen them — do not conclude the spec stops where this text stops:",
-            *(f"  {line}" for line in omitted),
-        ]
-    return "\n".join([*lines, "", kept])
+    return "\n".join([*lines, "", *outline])
 
 
 def build_plan_question(fo: dict[str, Any], plan: dict[str, Any]) -> str:
-    """The submitted plan as the reviewer reads it — a SKELETON, never the full briefs.
-
-    Whoever decides — Neo, or the user once Neo escalates — sees only this text and never
-    the planner's session, so it carries the case: the ask as the user wrote it, then the
-    decomposition. The ask comes FIRST and verbatim, because the one judgement being
-    asked for is whether the second answers the first.
-
-    The full child briefs are deliberately NOT here. Production questions #65–#67
-    reached 84KB by inlining every brief — text the user already reads through
-    `jarvis fo show` and the dashboard, and that Neo's review of the DECOMPOSITION does
-    not need. The briefs stay in the stored plan; the question names where.
-    """
+    """The submitted plan as the reviewer reads it — a SKELETON, never the full briefs (#65)"""
     parts = [
         f"FEATURE ORDER {fo['id']} — {fo['title']}",
         "",
@@ -535,12 +387,7 @@ def build_plan_question(fo: dict[str, Any], plan: dict[str, Any]) -> str:
 
 
 def render_plan_skeleton(plan: dict[str, Any]) -> list[str]:
-    """One line per child: key, title, edges, section, acceptance. Never the description.
-
-    The section IS part of the skeleton, unlike the brief: the reviewer's judgement is
-    whether the decomposition follows the spec's boundaries, and it cannot make that
-    judgement without seeing which boundary each child claims.
-    """
+    """One line per child: key, title, edges, section, acceptance"""
     lines = []
     if plan.get("summary"):
         lines.append(plan["summary"])
@@ -562,12 +409,7 @@ def render_plan_skeleton(plan: dict[str, Any]) -> list[str]:
 
 
 def render_plan(plan: dict[str, Any]) -> list[str]:
-    """The plan as lines a human reads — the reviewer's view, and `jarvis fo show`'s.
-
-    One renderer, so Neo reviews the same text the user sees when it escalates. Two
-    surfaces rendering a plan separately is how they come to disagree about what was
-    approved.
-    """
+    """The plan as lines a human reads — the reviewer's view, and `jarvis fo show`'s"""
     lines = []
     if plan.get("summary"):
         lines.append(plan["summary"])

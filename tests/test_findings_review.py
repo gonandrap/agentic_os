@@ -1,18 +1,4 @@
-"""`ops.review_findings` — the user deciding a findings report, finding by finding.
-
-Section 5 of docs/superpowers/specs/2026-09-23-improvement-orders.md. Four properties
-carry the section and each has tests here:
-
-* an accepted finding writes exactly ONE knowledge entry, through `ops.learn_add`, and
-  files its proposed orders with `parent_id` NULL and an `origin_io` back-link readable
-  from both ends;
-* the DECISION and the knowledge write are durable and the filing is best effort
-  (kn-652456b8) — but a filing failure is never silent: the flag stays up, an inbox row
-  is raised, and the order stays in `plan_review` for a retry;
-* a retry files what did not file and writes no second knowledge entry;
-* every finding decided completes the order, including an order whose findings were all
-  rejected.
-"""
+"""`ops.review_findings` — the user deciding a findings report, finding by finding (docs/superpowers/specs/2026-09-23-improvement-orders.md)"""
 
 from __future__ import annotations
 
@@ -44,7 +30,7 @@ def store(project):
 
 @pytest.fixture()
 def register_proj_b(tmp_path, claude_json, catalog_file):
-    """Register a SECOND project, on demand: a proposal's fix is frequently elsewhere."""
+    """Register a SECOND project, on demand: a proposal's fix is frequently elsewhere"""
     def register():
         other = make_git_project(tmp_path, "proj_b")
         claude_json(other)
@@ -59,7 +45,7 @@ def register_proj_b(tmp_path, claude_json, catalog_file):
 
 @pytest.fixture()
 def reviewable(started, store, improvement_order):
-    """An improvement order in `plan_review` with the shared report stored on it."""
+    """An improvement order in `plan_review` with the shared report stored on it"""
     analyst = store.create_work_order("analyse it", description="the observation",
                                       kind="planner", status="running")
     store.update_feature_order(improvement_order["id"], plan_wo_id=analyst["id"],
@@ -100,7 +86,7 @@ def learnings():
         neo.close()
 
 
-# -- accepting -------------------------------------------------------------------------
+# -- accepting
 
 def test_accepting_writes_one_knowledge_entry_and_files_the_proposed_order(reviewable,
                                                                           store):
@@ -114,8 +100,7 @@ def test_accepting_writes_one_knowledge_entry_and_files_the_proposed_order(revie
     assert entry["project"] == "proj_a"
     assert entry["tags"] == io["id"]
     assert entry["wo_id"] == analyst["id"]
-    # FIRST LINE is the root cause as a rule — it is the only part a worker's prompt
-    # index carries (§5.4).
+    # FIRST LINE is the root cause as a rule — it is the only part a worker's prompt index carries (§5.4)
     assert entry["content"].splitlines()[0].startswith("The dispatch brief names no "
                                                        "entry point")
     assert out["learnings"] == [entry["id"]]
@@ -184,7 +169,7 @@ def test_a_blank_project_on_a_proposal_falls_back_to_the_orders_own(reviewable, 
     assert ops.find_work_order(out["created"][0]["id"])[0] == "proj_a"
 
 
-# -- completion ------------------------------------------------------------------------
+# -- completion
 
 def test_every_finding_decided_completes_the_order_and_clears_the_flag(reviewable,
                                                                       store):
@@ -241,7 +226,7 @@ def test_accept_all_takes_every_pending_finding(reviewable, store):
         ["accepted", "accepted"]
 
 
-# -- rejecting -------------------------------------------------------------------------
+# -- rejecting
 
 def test_a_rejection_teaches_neo_and_writes_no_knowledge_entry(reviewable, store):
     io, _ = reviewable
@@ -261,11 +246,11 @@ def test_a_rejection_teaches_neo_and_writes_no_knowledge_entry(reviewable, store
     assert finding["status"] == "rejected"
     assert finding["feedback"] == reason
     assert "knowledge_id" not in finding
-    # §5.5: nothing else is built Neo-side.
+    # §5.5: nothing else is built Neo-side
     assert store.get_feature_order(io["id"])["plan_question_id"] is None
 
 
-# -- refusals --------------------------------------------------------------------------
+# -- refusals
 
 def test_a_feature_order_is_refused_and_named_for_the_verb_that_works(started, store):
     fo = store.create_feature_order("CSV export", description="the whole ask")
@@ -352,7 +337,7 @@ def test_a_finding_already_decided_is_refused(reviewable, store):
                 if k["topic"] == "os-failure-mode"]) == 1
 
 
-# -- the filing failure, and the retry --------------------------------------------------
+# -- the filing failure, and the retry
 
 def _proposal_into_an_unregistered_project(store, io_id):
     report = stored_report(store, io_id)
@@ -369,7 +354,7 @@ def test_a_filing_failure_keeps_the_decision_and_raises_the_user(reviewable, sto
 
     assert out["errors"] and "proj_b" in out["errors"][0]["error"]
     assert not out["created"]
-    # The decision and the knowledge entry are DURABLE (kn-652456b8).
+    # The decision and the knowledge entry are DURABLE (kn-652456b8)
     finding = finding_named(store, io["id"], "first-turn-reads")
     assert finding["status"] == "accepted"
     assert finding["knowledge_id"]
@@ -417,7 +402,7 @@ def test_retrying_the_accept_files_it_and_writes_no_second_entry(reviewable, sto
 
 def test_a_retry_files_the_order_and_changes_nothing_else_about_the_decision(
         reviewable, store, register_proj_b):
-    """§5.2: the decision STANDS and only the filing is retried."""
+    """§5.2: the decision STANDS and only the filing is retried"""
     io, _ = reviewable
     _proposal_into_an_unregistered_project(store, io["id"])
     ops.review_findings(io["id"], accept=["first-turn-reads"],
@@ -435,10 +420,10 @@ def test_a_retry_files_the_order_and_changes_nothing_else_about_the_decision(
     assert len(after["created_orders"]) == 1
 
 
-# -- what a worker actually sees -----------------------------------------------------------
+# -- what a worker actually sees
 
 def test_the_knowledge_entrys_first_line_is_the_root_cause_and_nothing_else():
-    """§5.4 and kn-8656d497: a worker's prompt carries first lines, never bodies."""
+    """§5.4 and kn-8656d497: a worker's prompt carries first lines, never bodies"""
     finding = a_finding(root_cause="The dispatch brief   names no entry\n  point at all.")
 
     first = findings.knowledge_text(finding).splitlines()[0]
@@ -448,7 +433,7 @@ def test_the_knowledge_entrys_first_line_is_the_root_cause_and_nothing_else():
 
 
 def test_the_review_event_renders_with_a_label(reviewable, store):
-    """kn-3f133363: an unlabelled kind renders as a bare string beside a JSON blob."""
+    """kn-3f133363: an unlabelled kind renders as a bare string beside a JSON blob"""
     io, analyst = reviewable
     ops.review_findings(io["id"], accept=["first-turn-reads"],
                         reject={"stale-code-map": "the map is about to be deleted"})
@@ -461,7 +446,7 @@ def test_the_review_event_renders_with_a_label(reviewable, store):
     assert entry["detail"] == "1 accepted, 1 rejected, 1 order(s) filed"
 
 
-# -- the back-link, read from the improvement order ---------------------------------------
+# -- the back-link, read from the improvement order
 
 def test_show_reports_each_filed_orders_live_status(reviewable, store):
     io, _ = reviewable
@@ -475,7 +460,7 @@ def test_show_reports_each_filed_orders_live_status(reviewable, store):
                      "title": "name the entry point in every dispatch brief",
                      "status": "pending"}
 
-    # LIVE, not the snapshot taken at filing (§5.3.1).
+    # LIVE, not the snapshot taken at filing (§5.3.1)
     store.update_work_order(filed_id, status="running")
     again = ops.show_improvement_order(io["id"])
     assert again["filed_orders"]["first-turn-reads"][0]["status"] == "running"
@@ -493,7 +478,7 @@ def test_show_reports_a_deleted_filed_order_as_deleted(reviewable, store):
     assert detail["by_decision"]["accepted"] == 1
 
 
-# -- the CLI ----------------------------------------------------------------------------
+# -- the CLI
 
 def test_cli_io_review_accepts_and_rejects_in_one_call(reviewable, store, capsys):
     io, _ = reviewable

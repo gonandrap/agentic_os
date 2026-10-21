@@ -1,14 +1,4 @@
-"""A turn may not END on a background task it never collected.
-
-§5 of docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md, issue
-868. This is what makes §4 safe: backgrounding the three long shapes is permitted
-BECAUSE ending the turn on one is not — the task dies with the `claude -p` process and
-nothing wakes anybody (issue #575).
-
-The evidence is the transcript, through `background.jobs_left_running`: one parser, two
-readers — `background.orphaned_in_turn` at reap and this hook at Stop. The rows here are
-the shape of a real one, as in tests/test_background_orphan.py.
-"""
+"""A turn may not END on a background task it never collected (docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md)"""
 
 from __future__ import annotations
 
@@ -29,10 +19,7 @@ SUITE = "uv run pytest tests/ -q"
 SESSION = "sess-stop"
 EVENT = "background_task_uncollected"
 
-#: How far into the past the fixture's turn starts. The guard bounds its scan with
-#: `until=time.time()`, so a turn stamped `now` puts the rows these tests write ON that
-#: bound: on CI the guard ran under 2 ms after `create_turn` and `+0.002` fell past
-#: `until`, so a collected job read as uncollected. Seconds of slack, not milliseconds.
+#: How far into the past the fixture's turn starts
 BACK_DATED = 60.0
 
 
@@ -76,8 +63,7 @@ def _poll(when: float, *, tool: str = "BashOutput", key: str = "bash_id",
 
 def _refused(when: float, *, call_id: str = "toolu_denied",
              command: str = "./server.sh") -> list[dict]:
-    """A launch a PreToolUse hook REFUSED: `is_error` on the result, and `toolUseResult`
-    a string starting with the harness's `Error: ` (real shape, a denied Bash call)."""
+    """A launch a PreToolUse hook REFUSED: `is_error` on the result"""
     return [
         {"type": "assistant", "timestamp": _stamp(when),
          "message": {"role": "assistant", "content": [
@@ -93,13 +79,13 @@ def _refused(when: float, *, call_id: str = "toolu_denied",
 
 @pytest.fixture()
 def worker(jarvis_home, fake_claude, catalog_file, project, tmp_path):
-    """A running work order mid-turn, with a transcript this test writes by hand."""
+    """A running work order mid-turn, with a transcript this test writes by hand"""
     ops.start_os(str(catalog_file), foreground=True)
     store = ProjectStore(project)
     wo = store.create_work_order("run the suite")
     store.set_status(wo["id"], "running")
     turn = store.create_turn(wo["id"], kind="message", prompt="go")
-    # Back-dated because the guard scans up to `until=time.time()`: see BACK_DATED.
+    # Back-dated because the guard scans up to `until=time.time()`: see BACK_DATED
     store.conn.execute("UPDATE wo_turns SET started_at=? WHERE id=?",
                        (time.time() - BACK_DATED, turn["id"]))
     store.conn.commit()
@@ -138,10 +124,7 @@ def worker(jarvis_home, fake_claude, catalog_file, project, tmp_path):
 
 
 def test_fixture_turn_is_back_dated(worker):
-    """The fixture's own post-condition: every row these tests write must be in the
-    past, because the guard bounds its scan with `until=time.time()`. A turn stamped
-    `now` split the `+0.001` launch from the `+0.002` poll on CI (under 2 ms) and read a
-    collected job as uncollected."""
+    """The fixture's own post-condition: every row these tests write must be in the past"""
     started = worker.started()
 
     assert time.time() - started >= BACK_DATED - 1
@@ -149,20 +132,19 @@ def test_fixture_turn_is_back_dated(worker):
 
 
 def test_turn_with_uncollected_bash_task_blocked(worker):
-    """The clear case, and the one this guard exists for: a background start with no
-    collection call at all in the turn."""
+    """The clear case, and the one this guard exists for: a background start with no collection call at..."""
     blocked = worker.guard(_launch(worker.started() + 0.001))
 
     assert blocked["decision"] == "block"
     assert "b51fl7bhe" in blocked["reason"]
     assert "BashOutput" in blocked["reason"] and "TaskOutput" in blocked["reason"]
     assert "3-4 minutes" in blocked["reason"]
-    # No `hookSpecificOutput`: the Stop hook has its own shape (`main_hook`).
+    # No `hookSpecificOutput`: the Stop hook has its own shape (`main_hook`)
     assert "hookSpecificOutput" not in blocked
 
 
 def test_turn_with_uncollected_agent_task_blocked(worker):
-    """The user's ruling, on the `Agent` half — Neo question 1047."""
+    """The user's ruling, on the `Agent` half — Neo question 1047"""
     blocked = worker.guard(_launch(
         worker.started() + 0.001, job_id="task_9c2", name="Agent",
         payload={"subagent_type": "jarvis-implementer", "description": "write it"}))
@@ -172,8 +154,7 @@ def test_turn_with_uncollected_agent_task_blocked(worker):
 
 
 def test_collected_task_does_not_block(worker):
-    """Never block on a task proven finished. Each of the three clears it, and
-    `jobs_left_running` already implements each."""
+    """Never block on a task proven finished"""
     started = worker.started()
     kill = {"type": "assistant", "timestamp": _stamp(started + 0.002),
             "message": {"role": "assistant", "content": [
@@ -192,13 +173,10 @@ def test_collected_task_does_not_block(worker):
 
 
 def test_refused_launch_does_not_block(worker):
-    """A launch `background_task_decision` DENIED started no process, so a turn ending
-    on it is ending on nothing. Blocking there would park a turn over a refusal the OS
-    itself wrote (§5 of
-    docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md)."""
+    """A launch `background_task_decision` DENIED started no process (docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md)"""
     assert worker.guard(_refused(worker.started() + 0.001)) is None
 
-    # The successful launch beside it is still the finding.
+    # The successful launch beside it is still the finding
     blocked = worker.guard([*_refused(worker.started() + 0.001),
                             *_launch(worker.started() + 0.002)])
     assert blocked["decision"] == "block"
@@ -207,8 +185,7 @@ def test_refused_launch_does_not_block(worker):
 
 
 def test_stop_hook_active_does_not_block_twice(worker):
-    """One continuation, not a loop: a lead that ignored the reason once is better
-    parked than spun, and a genuinely hung task must not make the turn unendable."""
+    """One continuation, not a loop: a lead that ignored the reason once is better parked than spun"""
     rows = _launch(worker.started() + 0.001)
     assert worker.guard(rows)["decision"] == "block"
 
@@ -223,7 +200,7 @@ def test_terminal_status_does_not_block(worker):
 
 
 def test_missing_transcript_does_not_block(worker, tmp_path):
-    """A guard that blocked on missing evidence would trap a worker with no way out."""
+    """A guard that blocked on missing evidence would trap a worker with no way out"""
     rows = _launch(worker.started() + 0.001)
 
     assert worker.guard(rows, session_id="") is None
@@ -240,8 +217,7 @@ def test_missing_transcript_does_not_block(worker, tmp_path):
 
 
 def test_held_gate_request_block_still_wins(worker):
-    """A gate request unargued is the stricter finding and should be the one the worker
-    reads, so this guard sits AFTER `held_request_turn_block` in `handle_hook`."""
+    """A gate request unargued is the stricter finding and should be the one the worker reads"""
     action = gates.classify("gh pr merge 31 --squash", ALL_GATES)
     worker.store.add_approval(worker.wo_id, action.kind, action.command,
                               matched=action.matched, status=gates.AWAITING_CASE)
@@ -255,8 +231,7 @@ def test_held_gate_request_block_still_wins(worker):
 
 
 def test_block_writes_a_timeline_event(worker):
-    """Nobody reads the worker's transcript: the record has to say why the turn was
-    held."""
+    """Nobody reads the worker's transcript: the record has to say why the turn was held"""
     blocked = worker.stop(_launch(worker.started() + 0.001))
     assert blocked["decision"] == "block"
 

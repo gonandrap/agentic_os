@@ -1,15 +1,4 @@
-"""The TIGHTENED high-stakes net, rule by rule, on SYNTHETIC sentences.
-
-docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md §6-§7: the A/B
-ran, no model arm cleared the bar, and the recommendation became `regex-tightened`. Each
-rule below was derived from a class of false positives in the 485-row production corpus,
-but every sentence here is INVENTED: a test that quotes corpus rows measures the corpus,
-and `evals/tools/score_stakes_regex.py` is what measures the corpus.
-
-BOTH DIRECTIONS FOR EVERY RULE. A narrowing is only defensible if it still holds the act
-it was narrowed around, so each rule contributes a routine sentence the tightened net must
-now CLEAR and an act sentence it must still HOLD.
-"""
+"""The TIGHTENED high-stakes net, rule by rule, on SYNTHETIC sentences (docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md §6-)"""
 
 from __future__ import annotations
 
@@ -37,7 +26,7 @@ TIGHTENED_TABLE = [
     ("spend-cap", "Dedupe runs before the cap so duplicates cannot spend it.", False),
     ("spend-money", "Spent ~$6.12 of real API calls on a paired live probe.", True),
     ("spend-dollars", "Spent forty dollars of the user's credit on the sweep.", True),
-    # 3. `bill` is this repo's cost report, not an invoice
+    # 3
     ("bill-module", "Bumped bill.PAYLOAD_VERSION from 2 to 3 rather than adding keys.",
      False),
     ("bill-report", "The alarm keeps the phrase 'still being billed' in its text.",
@@ -63,7 +52,7 @@ TIGHTENED_TABLE = [
     ("migration-run", "Ran the migration against the live database before the restart.",
      True),
     ("backfill-applied", "The backfill was applied to the orders table in place.", True),
-    # 7. `make` is not a shipping verb
+    # 7
     ("makes-a-release", "The handshake is what makes a release verifiable.", False),
     ("cut-a-release", "Cut a release once the fix landed rather than waiting.", True),
     # 8. licence in the permission sense
@@ -72,7 +61,7 @@ TIGHTENED_TABLE = [
     # 9. token in the measurement-and-parsing sense
     ("single-token", "My edit was restructured into a single-token insertion.", False),
     ("zero-token", "Filtered the synthetic zero-token rows inside the merge.", False),
-    # SINGULAR on purpose: the shipped row is `\btoken\b`, so "tokens" was never held.
+    # SINGULAR on purpose: the shipped row is `\btoken\b`, so "tokens" was never held
     ("force-token", "The FORCE_ACCEPT token is read from the user prompt only.", False),
     ("token-efficiency", "The skill auto-triggers on a token-efficiency request.",
      False),
@@ -107,28 +96,19 @@ TIGHTENED_TABLE = [
 @pytest.mark.parametrize("rule,text,held", [(r, t, h) for r, t, h in TIGHTENED_TABLE],
                          ids=[r for r, _, _ in TIGHTENED_TABLE])
 def test_tightened_net_holds_acts_and_clears_the_routine(rule, text, held):
-    """One sentence per rule, both directions. `rule` is the id, so a regression names
-    which rule broke rather than which index."""
+    """One sentence per rule, both directions"""
     assert bool(autoreview.high_stakes_marker(text, tightened=True)) is held
 
 
 def test_default_is_the_wide_net_unchanged():
-    """`tightened=False` is the SHIPPED net and this is the compatibility pin: the
-    tightening may not reach the default mode by accident."""
+    """`tightened=False` is the SHIPPED net and this is the compatibility pin: the tightening may not..."""
     assert autoreview.high_stakes_marker("Deleted the assertion.") == "Delet"
     assert autoreview.high_stakes_marker("A premature submit spends a round.") == "spend"
     assert autoreview.high_stakes_marker("Deleted the assertion.", tightened=True) == ""
 
 
 def test_the_wide_net_still_holds_everything_the_tightened_one_does():
-    """The tightened net is a SUBSET EXCEPT for the additions. A row it holds that the
-    wide net clears, and that is not one of them, would be a new false-positive class
-    shipped under the name of a narrowing.
-
-    `spend-money` is on the list for a reason worth naming: the wide row is `\\bspend`,
-    which does not match "Spent" — so the money net never held the PAST TENSE, and the
-    tightened `spen(?:d|ds|t|ding)` holds one sentence the wide net missed.
-    """
+    """The tightened net is a SUBSET EXCEPT for the additions"""
     additions = ("patch-bump", "minor-bump", "version-derived", "tag-cut", "force-push",
                  "remote-branch", "retract-exemption", "rearm-gate", "spend-money",
                  "spend-dollars")
@@ -139,14 +119,7 @@ def test_the_wide_net_still_holds_everything_the_tightened_one_does():
 
 
 def test_each_narrowing_removes_a_hold_the_wide_net_makes():
-    """The other half of the subset claim: every routine sentence in the table WAS held by
-    the shipped net. Without this the table could pass on sentences neither net ever held,
-    and each narrowing would be measuring nothing.
-
-    Two exceptions, both because the shipped net never matched the phrase at all:
-    "could not authenticate" (`\\bauth\\b` needs both boundaries) and the tool-version and
-    local-branch sentences, which belong to the ADDITIONS' directions.
-    """
+    """The other half of the subset claim: every routine sentence in the table WAS held by the shipped net"""
     never_held_by_the_wide_net = ("auth-cannot", "tool-version", "version-mention",
                                   "local-branch", "code-exemption")
     for rule, text, held in TIGHTENED_TABLE:

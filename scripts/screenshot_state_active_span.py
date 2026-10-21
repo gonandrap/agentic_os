@@ -1,16 +1,4 @@
-"""Screenshot the "Time in state" panel telling the live truth under an open span.
-
-Fix 4 of docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md: an open span
-used to say only "still in it", naming the transition that opened it, while a subagent's
-transcript kept growing underneath. `scripts/screenshot_held_gate.py` is the shape this
-copies. Seed: a work order enters `running` on a `gate_abandoned` trigger 45 minutes ago,
-every DB table (`wo_events`, `wo_turns`, `wo_messages`, `validation_rounds`, `approvals`)
-is backdated to or before that moment, and a session transcript plus one
-`subagents/*.jsonl` file sit on disk with mtime ~30 seconds old — the incident's own
-shape, where the LEAD's transcript is quiet and its implementer's is not.
-
-    uv run python scripts/screenshot_state_active_span.py
-"""
+"""Screenshot the "Time in state" panel telling the live truth under an open span (docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md)"""
 
 from __future__ import annotations
 
@@ -32,7 +20,7 @@ THIRTY_SEC = 30.0
 
 def _transcript(config_dir: Path, cwd: Path, session_id: str, *, subagent: str = "",
                 mtime: float) -> Path:
-    """Same shape as `tests/test_time_in_state.py::_transcript` — mtime is the fact."""
+    """Same shape as `tests/test_time_in_state.py::_transcript` — mtime is the fact"""
     munged = "".join(c if c.isalnum() else "-" for c in str(cwd))
     base = config_dir / "projects" / munged
     path = (base / f"{session_id}.jsonl" if not subagent
@@ -44,7 +32,7 @@ def _transcript(config_dir: Path, cwd: Path, session_id: str, *, subagent: str =
 
 
 def seed(config_dir: Path) -> str:
-    """An order stuck `gate_abandoned` 45 minutes ago while a subagent still types."""
+    """An order stuck `gate_abandoned` 45 minutes ago while a subagent still types"""
     from jarvis import ops
     from jarvis.central_store import CentralStore
     from jarvis.project_store import ProjectStore
@@ -76,13 +64,10 @@ def seed(config_dir: Path) -> str:
     now = time.time()
     entered = now - FORTY_FIVE_MIN
 
-    # The transition an abandoned gate leaves behind — one span, one trigger.
+    # The transition an abandoned gate leaves behind — one span, one trigger
     pstore.set_status(wo["id"], "running", trigger="gate_abandoned")
 
-    # Every table backdated to or before `entered`: the DB genuinely went quiet there,
-    # so anything newer must come from the transcript source, not from a DB race. Both
-    # spans move — the creation span too, or its unmoved "now" timestamp would sort
-    # AFTER the backdated running span and flip which one reads as open.
+    # Every table backdated to or before `entered`: the DB genuinely went quiet there
     pstore.conn.execute(
         "UPDATE wo_state_spans SET ts=? WHERE order_id=? AND to_status<>'running'",
         (entered - 600, wo["id"]))
@@ -94,7 +79,7 @@ def seed(config_dir: Path) -> str:
                         (entered - 600, wo["id"]))
     pstore.conn.commit()
 
-    # The transcript: the lead's own file old, the subagent's beside it fresh.
+    # The transcript: the lead's own file old, the subagent's beside it fresh
     cwd = pstore.project_path
     _transcript(config_dir, cwd, session_id, mtime=entered)
     _transcript(config_dir, cwd, session_id, subagent="implementer.jsonl",

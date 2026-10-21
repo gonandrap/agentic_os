@@ -1,62 +1,4 @@
-"""Writing to the tracker: the second half of a bug the OS filed itself.
-
-`bugreport` creates a GitHub issue and stops there, which made the OS's own tracker a
-thing only a human could maintain — issue #240. This module is the rest of the
-lifecycle: the issue is LABELLED when a work order picks it up, and CLOSED, with a
-comment naming the work order and the pull request, when that work lands.
-
-## Why this is not in `github.py`
-
-`github.py`'s whole claim is that it cannot write, and a test walks its AST to prove it
-(the validation panel's blind review rests on that — see its module docstring). So every
-`gh` WRITE the OS performs lives here instead, and `ISSUE_VERBS` below names each one,
-held to the same AST test in `tests/test_issue_lifecycle.py`. "What can Jarvis write to
-GitHub" therefore has exactly one answer, in one file, in a list.
-
-## Which repositories the OS may write to
-
-TWO, and the second arrived with the validation panel's follow-ups (user ruling,
-2026-09-16). The bug-tracker lifecycle above writes to `bugreport.bug_repo()`. A panel
-follow-up is filed on **the repository of the project under review** — the finding is
-about that project's code and belongs on that project's tracker, not on the OS's.
-
-**The rule that replaced "one constant repository" is not weaker, and the distinction is
-where the repository NAME comes from.** It is never a string out of the record and never
-anything a model wrote: it is `github.origin_repo(<the project's checkout>)`, a local
-`git remote get-url origin` already declared in `github.GIT_READS`. `checked_repo`
-then holds that name to an anchored shape before it can be an argument, and
-`checked_issue_url` holds every URL to an anchored shape AND to the repository the
-CALLER named — so a URL out of the record still cannot redirect a write, which is the
-whole of what `github.UntrustedPullRequest` spells out. What changed is who names the
-repository, not whether one is checked.
-
-## What may be published on one
-
-A second question, and it is not the same as which repository: `repo_is_private` is the
-allowlist a validation follow-up's TEXT is held to. No prose a model wrote goes to a
-tracker the OS could not establish is private — the rule §8 of
-docs/superpowers/specs/2026-09-14-a-filed-bug-runs-itself.md states for the OS's own
-tracker, applied to the project's (spec §9 of
-docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md).
-
-## Desired state, not a sequence of pokes
-
-The OS never fires "label it now" at GitHub and hopes. `desired_state` turns a work
-order's status into one of three tracker states, `apply` moves the issue there, and the
-`issue_state` column records what was last applied — so the daemon's sweep asks
-`needs_sync`, costs nothing while there is nothing to do, and RETRIES for free when `gh`
-is unreachable. That is what makes E (fail closed, never half-apply) and D (idempotency,
-reopening, a human who closed it first) fall out of the design rather than out of a
-guard per call site.
-
-It is NOT a bare comparison: `apply` may return a state that is not the desired one, so
-`needs_sync` carries the terminal case a comparison alone could never converge on — a
-column latched at CLOSED (issue #961,
-docs/superpowers/specs/2026-10-07-a-closed-issue-the-os-cannot-move-converges.md).
-
-The OS never fights a human. An issue a person reopened or closed by hand is left where
-they put it — `apply` re-reads the issue before it writes, and records what it found.
-"""
+"""Writing to the tracker: the second half of a bug the OS filed itself (#240)"""
 
 from __future__ import annotations
 
@@ -72,113 +14,62 @@ from .github import GhUnavailable, GitHubError
 
 log = logging.getLogger("jarvis.issues")
 
-#: Every `gh` command this module builds, as the (verb, subverb) pair that opens the
-#: argument list. ALL OF THESE ARE WRITES except `issue view`, which is the read that
-#: makes the writes idempotent. `tests/test_issue_lifecycle.py` walks this module's AST
-#: and holds every argument list against this tuple — the same mechanism that keeps
-#: `github.py` read-only, pointed the other way: a command added here has to be added
-#: deliberately, in a commit that also edits the test.
+#: Every `gh` command this module builds, as the (verb, subverb) pair that opens the argument list
 ISSUE_VERBS = (("issue", "view"), ("issue", "edit"), ("issue", "comment"),
                ("issue", "close"), ("label", "create"),
-               # Added deliberately, in the commit that also edited the AST test — which
-               # is the mechanism working, not a hole in it. `issue create` files a
-               # validation follow-up; `issue list` is the READ that dedupes it, and it
-               # is here rather than in `github.py` because that module may build no
-               # command against a repository it was not given by `origin`.
+               # Added deliberately, in the commit that also edited the AST test
                ("issue", "create"), ("issue", "list"),
-               # `issue reopen` is the recurrence path's write (spec §8): the OS links a
-               # gap that came back to its ORIGINAL issue instead of filing a second
-               # report, and an original the OS already fixed is normally closed. Declared
-               # here, and pinned in `test_the_declared_verbs_are_exactly_these_writes_
-               # and_these_three_reads`, so widening this set stays a reviewed decision
-               # (`kn-2531869c`).
+               # `issue reopen` is the recurrence path's write (spec §8): the OS links a gap that came back to its...
                ("issue", "reopen"),
-               # A READ, in a list that is otherwise writes — same shape as
-               # `("issue", "list")` above. It is here rather than in `github.py` for
-               # that module's own reason: it may build no command against a repository
-               # it was not given by `origin`. `repo_is_private` is what decides whether
-               # a seat's words may be published at all.
+               # A READ, in a list that is otherwise writes — same shape as `("issue", "list")` above
                ("repo", "view"),
-               # A READ of the AUTHENTICATED ACCOUNT, against no repository at all:
-               # `gh_login`. The red-base adoption filter needs the login the OS files
-               # issues under to tell its own filing from a stranger's quoting the same
-               # run id (spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §4), and a
-               # filter that cannot read it adopts nothing.
+               # A READ of the AUTHENTICATED ACCOUNT, against no repository at all: `gh_login`
                ("api", "user"))
 
-#: One round trip against GitHub's API. Same budget as `github.GH_TIMEOUT`, and for the
-#: same reason: the daemon's reconcile tick must not block on a network problem.
+#: One round trip against GitHub's API
 GH_TIMEOUT = 30
 
-#: THE ONLY HOST this OS writes an issue to. `gh` talks to github.com and every URL the
-#: OS mints (`ops.issue_url_for`, and `gh issue create`'s own output) is on it, so this
-#: is a statement of fact rather than a policy — and it is what `checked_issue_url` holds
-#: a URL out of a RECORD to, since a record's issue URL can come from a brief.
+#: THE ONLY HOST this OS writes an issue to
 ISSUE_HOST = "github.com"
 
-#: The ONLY shape an issue URL may have before it becomes an argument — anchored at both
-#: ends, `https://` required, which is also what makes a leading `-` unreachable so no
-#: argument can be read as a `gh` flag. `github.PR_URL_RE`'s twin.
+#: The ONLY shape an issue URL may have before it becomes an argument
 ISSUE_URL_RE = re.compile(
     r"^https://([A-Za-z0-9.-]+)/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/issues/([0-9]+)$")
 
-#: The three tracker states a work order can want its issue to be in. `RELEASED` is
-#: pointedly not `IN_PROGRESS` minus a label: it is "open, and nobody is working on it",
-#: which is where a cancelled or failed work order must leave the tracker (issue #240 C).
+#: The three tracker states a work order can want its issue to be in (#240)
 IN_PROGRESS = "in-progress"
 RELEASED = "released"
 CLOSED = "closed"
 
-#: What an untracked work order reports, so callers never have to special-case None.
+#: What an untracked work order reports, so callers never have to special-case None
 UNTRACKED = ""
 
-#: The colour and blurb a freshly created label gets. GitHub refuses `--add-label` for a
-#: label the repository does not have, and the fleet's tracker is not guaranteed to carry
-#: whatever name the catalog names, so the label is ensured before the first add.
+#: The colour and blurb a freshly created label gets
 LABEL_COLOUR = "0e8a16"
 LABEL_DESCRIPTION = "A Jarvis work order is on this."
 
 
-# -- priority: the only thing that routes a filed bug --------------------------------
-#
-# The user's ruling, 2026-09-14, settling issue #240's decision A. Every bug carries one
-# of five levels; `critical` and `blocker` get a work order and a release once it lands,
-# and the other three are queued in the backlog for the user to promote when they choose.
-# Nothing else routes — no per-project switch, no inference, no default.
+# -- priority: the only thing that routes a filed bug
 
-#: Lowest to highest. Order matters: `downgrade_to` compares positions.
+#: Lowest to highest
 PRIORITIES = ("low", "medium", "high", "critical", "blocker")
 
-#: The two that spend money. They are the ONLY ones Neo re-assesses, because they are the
-#: only ones that commit the fleet to anything — the other three commit it to a row in a
-#: list the user reads at their leisure.
+#: The two that spend money
 DISPATCHING_PRIORITIES = ("critical", "blocker")
 
-#: The highest level that commits the fleet to nothing. Where a downgrade lands when Neo
-#: did not name a level: still a refusal to dispatch, which is the safe direction.
+#: The highest level that commits the fleet to nothing
 SAFE_DOWNGRADE = "high"
 
 
 def priority_label(level: str) -> str:
-    """The tracker's own copy of the priority, so it shows without opening the OS."""
+    """The tracker's own copy of the priority, so it shows without opening the OS"""
     return f"priority: {checked_priority(level)}"
 
 
-#: Every priority label, for the sweep that has to take the old one off before putting the
-#: new one on. Derived, so a sixth level can never be half-implemented.
+#: Every priority label, for the sweep that has to take the old one off before putting the new one on
 PRIORITY_LABELS = tuple(f"priority: {p}" for p in PRIORITIES)
 
-#: WHAT THE LEVELS MEAN, written once and shown wherever a level is asked for or judged:
-#: the `jarvis bug report` interface, the error when the flag is missing, and the prompt
-#: Neo re-assesses against. One text, because a rubric that exists in two wordings is two
-#: rubrics — and the whole point is that the levels mean the same thing to every agent in
-#: the fleet.
-#:
-#: THE TOP TWO ARE DEFINED BY EFFECT ON THE FLEET, never by how much the bug annoyed
-#: whoever hit it. That is the user's instruction and it is also the only definition that
-#: survives self-rating: an agent that has just lost an hour to something will call it
-#: critical, and "did this stop work, lose state, or make the OS lie" is a question it
-#: cannot answer in its own favour.
+#: WHAT THE LEVELS MEAN, written once and shown wherever a level is asked for or judged: the `jarvis...
 PRIORITY_RUBRIC = """\
 blocker  — the fleet cannot work. Work orders cannot be dispatched, the daemon is down
            or wedged, or every worker in a project is stuck behind this. Nobody can make
@@ -200,12 +91,7 @@ the fleet, not the inconvenience to you."""
 
 
 def checked_priority(level: str) -> str:
-    """`level` if it is one of the five. Raises `ValueError` otherwise.
-
-    A plain `ValueError` rather than an `IssueLifecycleError`: the callers that validate
-    a priority are the CLI and `report_bug`, neither of which is talking to GitHub, and
-    each wraps it in the error type its own audience reads.
-    """
+    """`level` if it is one of the five"""
     got = (level or "").strip().lower()
     if got not in PRIORITIES:
         raise ValueError(
@@ -220,19 +106,7 @@ def dispatches(level: str) -> bool:
 
 
 def downgrade_to(claimed: str, stated: str) -> str:
-    """Where a Neo downgrade lands, given what (if anything) Neo named.
-
-    **ONLY EVER CALLED ON A VERDICT THAT SAID `deny`** — see `read_triage_verdict`, which
-    routes a verdict nobody could parse to `unconfirmed` instead. `SAFE_DOWNGRADE` is a
-    refusal to dispatch a claim Neo explicitly refused to confirm; it is not a level to
-    put in front of the user when Neo never ruled at all.
-
-    FAILS TOWARDS NOT DISPATCHING, in both of the two ways this can go wrong. A level Neo
-    did not state, or stated unintelligibly, becomes `SAFE_DOWNGRADE`; and a "downgrade"
-    that names a level at or above the claim is not a downgrade at all, so it becomes
-    `SAFE_DOWNGRADE` too rather than confirming by the back door. Neo refusing to confirm
-    is the whole signal; the exact level it landed on is detail.
-    """
+    """Where a Neo downgrade lands, given what (if anything) Neo named"""
     try:
         level = checked_priority(stated)
     except ValueError:
@@ -243,26 +117,19 @@ def downgrade_to(claimed: str, stated: str) -> str:
 
 
 class IssueLifecycleError(GitHubError):
-    """The tracker could not be moved, and nothing about it was changed.
-
-    A subclass of `GitHubError` on purpose rather than a second exception family: to
-    every caller in the OS "GitHub could not be reached or refused" is one case with one
-    response (log it, tell the user once, retry next tick), and the `reason` vocabulary
-    that case is described by already lives there.
-    """
+    """The tracker could not be moved, and nothing about it was changed"""
 
 
 @dataclass(frozen=True)
 class Issue:
-    """What `gh issue view --json state,labels,number,title,url` says, and nothing more."""
+    """What `gh issue view --json state,labels,number,title,url` says, and nothing more"""
 
     url: str
     number: int
-    #: GitHub's own enum, uppercased: OPEN or CLOSED.
+    #: GitHub's own enum, uppercased: OPEN or CLOSED
     state: str
     labels: tuple[str, ...]
-    #: The issue's own headline. Cached by the reference index so a Jarvis surface can
-    #: name an issue without a network call, and empty for every caller that does not.
+    #: The issue's own headline
     title: str = ""
 
     @property
@@ -270,42 +137,26 @@ class Issue:
         return self.state == "CLOSED"
 
     def has(self, label: str) -> bool:
-        """Case-insensitively, because GitHub matches labels that way and a catalog
-        that spells the label `In Progress` must not add a second one beside it."""
+        """Case-insensitively, because GitHub matches labels that way and a catalog that spells the label `In..."""
         low = label.strip().lower()
         return any(l.lower() == low for l in self.labels)
 
 
 def issue_number(url: str) -> int:
-    """The issue's number, or 0 if `url` is not an issue URL at all."""
+    """The issue's number, or 0 if `url` is not an issue URL at all"""
     match = ISSUE_URL_RE.match(url or "")
     return int(match.group(4)) if match else 0
 
 
 def checked_issue_url(url: str, repo: str | None = None) -> str:
-    """`url` if the OS may write to it. Raises `IssueLifecycleError` otherwise.
-
-    Stricter than `github.checked_pr_url`'s origin test, and deliberately so: that one
-    skips its repository check when `origin` cannot be read, because losing PR polling
-    over a moved checkout would be worse than the exposure. There is no degraded case
-    here — the caller always knows which repository it means — so a URL that is not on
-    that repository is refused outright.
-
-    `repo` DEFAULTS to the OS's own tracker and is passed explicitly by the follow-up
-    path, which writes to the project under review instead (see the module docstring).
-    The check is the same either way: the caller names the repository, and a URL out of
-    the record cannot disagree with it.
-    """
+    """`url` if the OS may write to it"""
     match = ISSUE_URL_RE.match(url or "")
     if match is None:
         raise IssueLifecycleError(
             f"{url!r} is not an issue URL this OS will write to",
             GitHubError.URL_REFUSED)
     want = (repo or bug_repo()).lower()
-    # THE HOST COUNTS, and is checked before the repository so the message names the
-    # actual objection. A URL is `<host>/<owner>/<repo>/issues/N`, so reading only the
-    # middle two accepts the project's real owner and repository under a host nobody
-    # chose — and this function is the last thing between a URL and a `gh` write.
+    # THE HOST COUNTS, and is checked before the repository so the message names the actual objection
     if match.group(1).lower() != ISSUE_HOST:
         raise IssueLifecycleError(
             f"{url!r} is on {match.group(1)}, but this OS only writes to {ISSUE_HOST}",
@@ -318,27 +169,16 @@ def checked_issue_url(url: str, repo: str | None = None) -> str:
     return url
 
 
-#: The ONLY shape a label may have before it becomes an argument. Anchored, no leading
-#: `-`, and a character set that cannot produce one — the same rule as `ISSUE_URL_RE` and
-#: for the same reason (review round 1): the label is the OTHER argv value this module
-#: interpolates, it comes from a catalog key that needs no `--reason` to change, and
-#: `gh` would read a leading dash as a flag. 50 is GitHub's own ceiling.
+#: The ONLY shape a label may have before it becomes an argument
 LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._:/-]{0,49}$")
 
 
-#: The ONLY shape a repository may have before it becomes a `--repo` argument. Anchored
-#: and dash-free at the front for `LABEL_RE`'s reason: `gh` reads a leading `-` as a flag,
-#: and this value now varies per project instead of being one constant.
+#: The ONLY shape a repository may have before it becomes a `--repo` argument
 REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 def checked_repo(repo: str) -> str:
-    """`repo` if it may become a `gh --repo` argument. Raises otherwise.
-
-    Its callers derive the name from `github.origin_repo`, which reads the checkout's own
-    `origin`. That is already trustworthy; this is the layer that stays true when some
-    later caller derives it from somewhere else.
-    """
+    """`repo` if it may become a `gh --repo` argument"""
     if not REPO_RE.match(repo or ""):
         raise IssueLifecycleError(
             f"{repo!r} is not a repository this OS will send to GitHub — it must be "
@@ -348,12 +188,7 @@ def checked_repo(repo: str) -> str:
 
 
 def checked_label(label: str) -> str:
-    """`label` if it may become a `gh` argument. Raises `IssueLifecycleError` otherwise.
-
-    Also enforced at catalog-parse time (`catalog._parse_bugs`), which is where the
-    message can name the key. This is the layer that cannot be skipped: a project row
-    edited by hand reaches `gh` through here whatever the parser saw.
-    """
+    """`label` if it may become a `gh` argument"""
     if not LABEL_RE.match(label or ""):
         raise IssueLifecycleError(
             f"{label!r} is not a label this OS will send to GitHub — it must start with "
@@ -364,17 +199,7 @@ def checked_label(label: str) -> str:
 
 def _run(args: list[str], *, url: str, tolerate: str = "",
          stdin: str | None = None) -> str:
-    """One `gh` call. Raises `IssueLifecycleError` unless `tolerate` matches its stderr.
-
-    `tolerate` is the one concession to `gh`'s habit of failing on a no-op: creating a
-    label that already exists is exit 1 with "already exists" on stderr, and that is the
-    success case for `ensure_label`.
-
-    `stdin` feeds `--body-file -`. It is a parameter here rather than a second copy of
-    this function because a body long enough to need stdin is exactly a body whose call
-    needs the same timeout, the same `gh`-missing message and the same rule that remote
-    text is logged and never raised.
-    """
+    """One `gh` call"""
     shown = "`gh " + " ".join(args[:2]) + f" {url}`"
     try:
         proc = subprocess.run([gh_bin(), *args], input=stdin, capture_output=True,
@@ -390,18 +215,14 @@ def _run(args: list[str], *, url: str, tolerate: str = "",
         detail = (proc.stderr or proc.stdout or "").strip() or f"exit {proc.returncode}"
         if tolerate and tolerate.lower() in detail.lower():
             return ""
-        # The remote text is LOGGED, never raised into `reason` — `github.GitHubError`.
+        # The remote text is LOGGED, never raised into `reason` — `github.GitHubError`
         log.info("%s failed: %s", shown, detail)
         raise IssueLifecycleError(f"{shown} failed: {detail}", GitHubError.REFUSED)
     return proc.stdout or ""
 
 
 def view(url: str, repo: str | None = None) -> Issue:
-    """Read the issue at `url`. Raises `IssueLifecycleError` on any doubt.
-
-    `repo` is `checked_issue_url`'s: it DEFAULTS to the OS's own tracker and is named
-    explicitly by the follow-up paths, which read issues on the project under review.
-    """
+    """Read the issue at `url`"""
     url = checked_issue_url(url, repo)
     stdout = _run(["issue", "view", url, "--json", "number,state,labels,title,url"],
                   url=url)
@@ -424,12 +245,7 @@ def view(url: str, repo: str | None = None) -> Issue:
 
 
 def ensure_label(label: str, repo: str | None = None) -> None:
-    """Make sure the repository carries `label`, so `--add-label` cannot fail over it.
-
-    Tolerates the already-exists failure rather than asking first: one call in the common
-    case instead of two, and `gh label create` is the only thing that can answer the
-    question without a race anyway.
-    """
+    """Make sure the repository carries `label`, so `--add-label` cannot fail over it"""
     repo = checked_repo(repo or bug_repo())
     _run(["label", "create", checked_label(label), "--repo", repo,
           "--color", LABEL_COLOUR, "--description", LABEL_DESCRIPTION],
@@ -447,74 +263,36 @@ def remove_label(url: str, label: str, repo: str | None = None) -> None:
 
 
 def comment(url: str, body: str, repo: str | None = None) -> None:
-    """Add a comment, with the body on stdin rather than in argv.
-
-    Same reason `bugreport.create_issue` does it: a comment carries a summary and
-    several links, and argv has a length limit that stdin does not.
-    """
+    """Add a comment, with the body on stdin rather than in argv"""
     url = checked_issue_url(url, repo)
     _run(["issue", "comment", url, "--body-file", "-"], url=url, stdin=body)
 
 
 def reopen(url: str, body: str) -> None:
-    """Reopen the issue, carrying `body` as the comment that explains why.
-
-    ONE call for `close`'s exact reason: two have a gap in which the comment lands and
-    the reopen does not, and the retry would then post the comment again. `gh issue
-    reopen --comment` is atomic from this side.
-    """
+    """Reopen the issue, carrying `body` as the comment that explains why"""
     _run(["issue", "reopen", checked_issue_url(url), "--comment", body], url=url)
 
 
 def close(url: str, body: str) -> None:
-    """Close the issue, carrying `body` as the closing comment.
-
-    ONE call, not a comment followed by a close: two calls have a gap in which the
-    comment lands and the close does not, and the retry would then post the comment
-    again. `gh issue close --comment` is atomic from this side.
-    """
+    """Close the issue, carrying `body` as the closing comment"""
     _run(["issue", "close", checked_issue_url(url), "--comment", body], url=url)
 
 
-# -- what the tracker should say, given what the work order is doing ----------------
+# -- what the tracker should say, given what the work order is doing
 
 
-# -- validation follow-ups: the panel's non-blocking findings, on the project's tracker --
-#
-# User ruling, 2026-09-16: a finding the panel judged the work shippable WITHOUT is filed
-# as a GitHub issue on the project under review, not as a row in the OS's backlog. Spec
-# §4 of docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md, whose §4.2 said
-# `CentralStore.add_backlog`; the ruling supersedes it and nothing else in §4 moved.
+# -- validation follow-ups: the panel's non-blocking findings, on the project's tracker
 
-#: What marks an issue as the panel's rather than a person's. It is BOTH halves of the
-#: mechanism: the label the filing applies, and the term the dedupe searches on — so an
-#: issue the panel filed is findable without reading every issue on the tracker.
+#: What marks an issue as the panel's rather than a person's
 FOLLOW_UP_LABEL = "validation follow-up"
 
-#: The colour and blurb `FOLLOW_UP_LABEL` is created with, distinct from the bug label's
-#: green so the two read apart at a glance on a tracker carrying both.
+#: The colour and blurb `FOLLOW_UP_LABEL` is created with
 FOLLOW_UP_COLOUR = "c5def5"
 FOLLOW_UP_DESCRIPTION = "Raised by the Jarvis validation panel; not a blocker."
 
 
 def repo_is_private(repo: str) -> bool:
-    """True only when GitHub SAID this repository is private; False on any doubt.
-
-    THE ALLOWLIST THE FILING RESTS ON. A follow-up carries a seat's own prose, written by
-    a model that does not know it will be published, and §8 of
-    docs/superpowers/specs/2026-09-14-a-filed-bug-runs-itself.md forbids publishing that
-    to a public tracker. So the text goes out only where the OS has POSITIVELY
-    established the destination is private, and every other answer — `gh` missing, a
-    refusal, a timeout, a repository this installation cannot read, output that will not
-    parse — reaches the same branch as "public". "Unknown" is not a third case.
-
-    NOT CACHED. A repository flipped private-to-public between rounds must be seen; one
-    round trip per round is the same budget the dedupe read already spends.
-
-    THE REPOSITORY IS POSITIONAL: `gh repo view` has no `--repo` flag (gh 2.86), unlike
-    every other command in this module. `checked_repo` is therefore load-bearing twice
-    over — it is what stops the name being read as a flag.
-    """
+    """True only when GitHub SAID this repository is private; False on any doubt (docs/superpowers/specs/2026-09-14-a-filed-bug-runs-itself.md)"""
     try:
         stdout = _run(["repo", "view", checked_repo(repo), "--json", "isPrivate"],
                       url=repo)
@@ -526,34 +304,19 @@ def repo_is_private(repo: str) -> bool:
 
 
 def file_follow_up(repo: str, title: str, body: str) -> str:
-    """File one follow-up on `repo` and return its issue URL.
-
-    The body travels on stdin (`--body-file -`) for `bugreport.create_issue`'s reason:
-    a finding carries the seat's detail plus a provenance footer, and argv has a length
-    limit that stdin does not.
-
-    **THE LABEL IS ENSURED FIRST, and that is not belt-and-braces.** `gh` refuses
-    `--label` for a label the repository does not define (`kn-eefc35a8` fact 1), and
-    unlike the OS's own tracker these repositories have never been asked to carry one —
-    the FIRST follow-up on every project in the fleet would fail without this.
-    """
+    """File one follow-up on `repo` and return its issue URL"""
     repo = checked_repo(repo)
     ensure_follow_up_label(repo)
     stdout = _run(["issue", "create", "--repo", repo, "--title", title,
                    "--label", FOLLOW_UP_LABEL, "--body-file", "-"],
                   url=repo, stdin=body)
     url = (stdout or "").strip().splitlines()[-1] if (stdout or "").strip() else ""
-    # Held to the shape AND to the repository we just named, exactly as every other URL
-    # in this module is: the answer came back over a pipe, and it becomes an argument.
+    # Held to the shape AND to the repository we just named
     return checked_issue_url(url, repo)
 
 
 def ensure_follow_up_label(repo: str) -> None:
-    """`ensure_label` with the follow-up's own colour and blurb.
-
-    Not `ensure_label(FOLLOW_UP_LABEL, repo)`: that one describes a label meaning "a work
-    order is on this", which is the opposite of what a follow-up is — nobody is on it.
-    """
+    """`ensure_label` with the follow-up's own colour and blurb"""
     repo = checked_repo(repo)
     _run(["label", "create", checked_label(FOLLOW_UP_LABEL), "--repo", repo,
           "--color", FOLLOW_UP_COLOUR, "--description", FOLLOW_UP_DESCRIPTION],
@@ -561,27 +324,14 @@ def ensure_follow_up_label(repo: str) -> None:
 
 
 def issues_mentioning(repo: str, term: str) -> list[dict[str, Any]]:
-    """Every issue on `repo` whose BODY mentions `term`, open or closed.
-
-    `follow_ups_filed`'s read with the label dropped — §2.5 of
-    docs/superpowers/specs/2026-09-27-investigation-orders.md, where the question is "has
-    this cause already been filed BY ANYONE", so restricting to the panel's own label
-    would miss every issue a human filed and re-file it.
-
-    **`--state all`, and that keyword is the whole correctness of this**, for the reason
-    spelled out below: a closed duplicate that drops out of the answer is re-filed for
-    ever. An unreachable `gh` raises; `ops.submit_verdict` turns that into an attention
-    item rather than settling the order silently.
-    """
+    """Every issue on `repo` whose BODY mentions `term`, open or closed (docs/superpowers/specs/2026-09-27-investigation-orders.md)"""
     repo = checked_repo(repo)
     term = (term or "").strip()
     if not term:
         return []
     stdout = _run(["issue", "list", "--repo", repo, "--state", "all",
                    "--search", f"{term} in:body", "--limit", "100",
-                   # `author` and `body` are ADDITIVE: the red-base adoption filter needs
-                   # both to tell the OS's own filing from a stranger's quoting the same
-                   # run id (spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §4).
+                   # `author` and `body` are ADDITIVE: the red-base adoption filter needs both to tell the OS's own...
                    "--json", "number,title,url,state,author,body"], url=repo)
     try:
         rows = json.loads(stdout or "[]")
@@ -590,28 +340,17 @@ def issues_mentioning(repo: str, term: str) -> list[dict[str, Any]]:
     return [r for r in rows if isinstance(r, dict) and r.get("url")]
 
 
-#: `gh_login`'s process cache, holding at most the one answer. A list rather than
-#: `lru_cache` because a FAILED read must not be cached (see below).
+#: `gh_login`'s process cache, holding at most the one answer
 _GH_LOGIN: list[str] = []
 
 
 def reset_gh_login() -> None:
-    """Forget the cached login. For fixtures that install a different fake `gh`."""
+    """Forget the cached login"""
     _GH_LOGIN.clear()
 
 
 def gh_login() -> str:
-    """The login `gh` is authenticated as — the account the OS files issues under.
-
-    READ ONCE PER PROCESS: it cannot change under a running daemon, and the caller (the
-    red-base adoption filter, spec §4) already spends one `gh` call on its search. An
-    unreachable or unauthenticated `gh` answers `""`, and `""` matches no author, so the
-    failing direction is ADOPT NOTHING and file afresh.
-
-    A FAILED READ IS NOT CACHED. `gh` being down for one tick is transient, and caching
-    the failure would leave adoption off for the daemon's whole life — one duplicate
-    filing per break, for ever, which is the 1007/1010 cost this spec exists to remove.
-    """
+    """The login `gh` is authenticated as — the account the OS files issues under"""
     if _GH_LOGIN:
         return _GH_LOGIN[0]
     try:
@@ -624,23 +363,7 @@ def gh_login() -> str:
 
 
 def follow_ups_filed(repo: str, unit_id: str) -> list[dict[str, Any]]:
-    """Every follow-up the panel has already filed on `repo` for one unit.
-
-    The dedupe's source of truth, and it is the TRACKER rather than any local record for
-    the reason the backlog was before the ruling: "has this already been filed" is a
-    question about the destination.
-
-    **`--state all`, and that keyword is the whole correctness of this.** `gh issue list`
-    defaults to OPEN issues only. A follow-up the user has since closed would drop out of
-    the answer, the dedupe would stop seeing it, and every subsequent round would file it
-    again — for ever. It is the exact trap `CentralStore.list_backlog`'s `status="open"`
-    default set on the path this replaced, one layer out.
-
-    Searched by LABEL AND by the unit id in the body, so the query is one round trip per
-    round rather than one per finding, and it cannot match a person's own issue that
-    happens to share a title. An unreachable `gh` raises; the caller decides what a round
-    that could not read the tracker does.
-    """
+    """Every follow-up the panel has already filed on `repo` for one unit"""
     repo = checked_repo(repo)
     stdout = _run(["issue", "list", "--repo", repo, "--state", "all",
                    "--label", checked_label(FOLLOW_UP_LABEL),
@@ -653,34 +376,19 @@ def follow_ups_filed(repo: str, unit_id: str) -> list[dict[str, Any]]:
     return [r for r in rows if isinstance(r, dict) and r.get("url")]
 
 
-# -- recurrences: the gap came back and the OS already had a rule for it ---------------
-#
-# docs/superpowers/specs/2026-09-27-self-evolution.md §8. The OS links, it never duplicates: the
-# ORIGINAL issue is reopened if closed and commented on if open, and carries this label so
-# "a rule we already shipped did not hold" is visible on the tracker without reading the
-# thread. `ops.record_recurrence` is the one caller.
+# -- recurrences: the gap came back and the OS already had a rule for it
 
-#: What marks the original issue as a regression rather than a fresh report. Only a label:
-#: unlike `FOLLOW_UP_LABEL` it is NOT the dedupe's search term, because the search runs
-#: against issues filed before this label existed (`recurrence_issues`).
+#: What marks the original issue as a regression rather than a fresh report
 REGRESSION_LABEL = "regression"
 
-#: Its own colour and blurb, distinct from the bug label's green and the follow-up's blue,
-#: so a tracker carrying all three reads apart at a glance. The blurb says what the label
-#: MEANS rather than who applied it: a reader seeing it needs to know the OS already
-#: shipped a rule for this, which is the fact a second report would have hidden.
+#: Its own colour and blurb, distinct from the bug label's green and the follow-up's blue
 REGRESSION_COLOUR = "d93f0b"
 REGRESSION_DESCRIPTION = ("This gap recurred: Jarvis already had a detector for it and "
                           "the rule did not hold.")
 
 
 def ensure_regression_label(repo: str) -> None:
-    """`ensure_label` with the regression's own colour and blurb.
-
-    Not `ensure_label(REGRESSION_LABEL, repo)`: that one describes a label meaning "a work
-    order is on this", and a recurrence comment states the opposite — the OS already ran
-    an order on this gap and the gap is back.
-    """
+    """`ensure_label` with the regression's own colour and blurb"""
     repo = checked_repo(repo)
     _run(["label", "create", checked_label(REGRESSION_LABEL), "--repo", repo,
           "--color", REGRESSION_COLOUR, "--description", REGRESSION_DESCRIPTION],
@@ -689,28 +397,7 @@ def ensure_regression_label(repo: str) -> None:
 
 def recurrence_issues(detector_id: str, gap_class: str,
                       repo: str | None = None) -> list[dict[str, Any]]:
-    """Issues on the tracker about this DETECTOR and this GAP CLASS, open or closed.
-
-    **THE SEARCH KEYS ON THE CAUSE, AND NEVER ON THE ORDER ID.** kn-2b03830f retracted
-    and reversed kn-5d8a396a on exactly this point: an issue whose body names an order id
-    is usually about a DIFFERENT cause — a validation follow-up the panel filed on that
-    order, an earlier filing that happened to quote it — so an order-id hit links a
-    recurrence to the wrong issue, and the recurrence comment then lands on a thread about
-    something else. The detector id and the gap class are what the recurrence is about,
-    and they are what identifies the original. Never a proposed title either: titles are
-    written by whoever filed, and two reports of one gap rarely share one.
-
-    **`--state all`, and that keyword carries the correctness.** `gh issue list` defaults
-    to OPEN issues only, which is `follow_ups_filed`'s reason restated one layer out and
-    sharper here: the original of a gap the OS already FIXED is normally CLOSED, so
-    without this the one issue worth finding is the one that drops out of the answer — and
-    a closed original that cannot be found can never be reopened, which is the duplicate
-    §8 exists to prevent.
-
-    `repo` defaults to the OS's own tracker. Output that will not parse returns [], the
-    same answer as "nothing filed": the caller files no comment either way and says so in
-    `filed_note`. An unreachable `gh` raises, and `ops.record_recurrence` records that.
-    """
+    """Issues on the tracker about this DETECTOR and this GAP CLASS, open or closed"""
     repo = checked_repo(repo or bug_repo())
     stdout = _run(["issue", "list", "--repo", repo, "--state", "all",
                    "--search", f"{detector_id} {gap_class} in:body", "--limit", "100",
@@ -722,22 +409,12 @@ def recurrence_issues(detector_id: str, gap_class: str,
     return [r for r in rows if isinstance(r, dict) and r.get("url")]
 
 
-# -- back-references: how many work orders have pointed at this issue ----------------
-#
-# The half of the relation that did not exist before: an issue recorded only the order
-# that CREATED it, so "three separate pieces of work have now run into this" was not a
-# fact anything could state. The count is a PRIORITY SIGNAL — the user's words — which is
-# why the admitting set is small and lives in `project_store.ISSUE_LINK_KINDS`, and why
-# over-counting would be worse than not counting at all.
+# -- back-references: how many work orders have pointed at this issue
 
-#: What the count is written as, both here and on the tracker. A LABEL rather than a
-#: line in the body: it shows on the issue LIST, which is where a person scanning a
-#: tracker decides what to open, and maintaining it is `set_priority_label`'s exact shape
-#: — take the stale one off, put the current one on — rather than a new write verb.
+#: What the count is written as, both here and on the tracker
 REFERENCE_LABEL_PREFIX = "referenced: "
 
-#: Matches any reference label, whatever the number, so the stale one can be found on an
-#: issue without the OS having to remember what it last wrote there.
+#: Matches any reference label, whatever the number
 REFERENCE_LABEL_RE = re.compile(r"^referenced: [0-9]+$")
 
 REFERENCE_LABEL_COLOUR = "d4c5f9"
@@ -749,16 +426,7 @@ def reference_label(count: int) -> str:
 
 
 def set_reference_label(url: str, count: int, repo: str) -> None:
-    """Make the issue's reference label say `count`, and say it once.
-
-    THE STALE ONE COMES OFF FIRST, for `set_priority_label`'s reason: GitHub keeps every
-    label you add, so an issue that went from two references to three would carry both
-    numbers and the scan the label exists for would read the wrong one.
-
-    **IT NEVER TOUCHES A CLOSED ISSUE.** A person closing an issue is the end of it, and
-    relabelling one afterwards is the OS arguing with them — the rule `apply` already
-    holds for the work-order label, here for a label with even less claim to insist.
-    """
+    """Make the issue's reference label say `count`, and say it once"""
     issue = view(url, repo)
     if issue.closed:
         return
@@ -772,15 +440,7 @@ def set_reference_label(url: str, count: int, repo: str) -> None:
 
 
 def ensure_reference_label(repo: str, count: int) -> None:
-    """Define `referenced: <count>` on `repo`, so `--add-label` cannot fail over it.
-
-    THE EXACT LABEL, not a template: `gh` refuses `--add-label` for a name the repository
-    does not define (`kn-eefc35a8` fact 1), and each count is a name of its own. The
-    repository therefore accumulates one definition per number it has ever seen, which is
-    the price of the count being visible on the issue LIST — where a person scanning a
-    tracker decides what to open — and is bounded by how many work orders ever point at
-    one issue.
-    """
+    """Define `referenced: <count>` on `repo`, so `--add-label` cannot fail over it"""
     repo = checked_repo(repo)
     _run(["label", "create", checked_label(reference_label(count)), "--repo", repo,
           "--color", REFERENCE_LABEL_COLOUR, "--description",
@@ -788,14 +448,7 @@ def ensure_reference_label(repo: str, count: int) -> None:
 
 
 def reference_comment(unit_id: str, project: str, kind: str, title: str = "") -> str:
-    """What the issue says when a further work order points at it.
-
-    JARVIS OS TERMS ONLY — the work order id, the project name, and which of the three
-    ways it is linked. The tracker is public and the rule `closing_comment` states holds
-    here unchanged: whoever reads this follows the work-order id for the detail, which is
-    exactly what it is here for. The order's TITLE is included only when the caller has
-    one it is willing to publish; `desired_state`'s callers pass none.
-    """
+    """What the issue says when a further work order points at it"""
     how = {"raised": "raised this finding",
            "assigned": "was dispatched to fix this",
            "cited": "cites this issue in its brief"}.get(kind, "references this issue")
@@ -808,27 +461,7 @@ def reference_comment(unit_id: str, project: str, kind: str, title: str = "") ->
 
 
 def desired_state(store: Any, wo: dict[str, Any]) -> str:
-    """Where this work order says its issue belongs. The whole policy, in one function.
-
-    Three answers and every one of them is DERIVED FROM THE RECORD, never asserted when
-    something happens — the rule kn-b437a0e5 states for attention and which holds for the
-    same reason here: a tracker state written by one event and never re-derived goes on
-    being true after the thing that made it true has stopped.
-
-    * **`IN_PROGRESS`** — the work order is open and nobody has refused its work.
-    * **`RELEASED`** (open, unlabelled) — three cases in one predicate. The order failed
-      or was cancelled; or its pull request was closed unmerged, which `pr_closure_told`
-      answers and which REVERSES ITSELF when the pull request is reopened; or the user
-      closed it by hand over code that never landed, which is `work_unlanded_open`. In
-      all three nothing is under way, so the label would be a lie — issue #240 C.
-    * **`CLOSED`** — the order completed with nothing left stranded. Two routes reach it
-      and they are not the same claim: a merged pull request (`ops.complete_merged` — the
-      landing signal, the answer issue #232 says `completed` alone cannot give), and a
-      `jarvis wo done` over an order that produced no code to land at all. The second is
-      Neo's ruling on question 289, off the asymmetry `ops.mark_done` already embodies:
-      it RECORDS unlanded work rather than refusing it, so the same `work_unlanded_open`
-      that keeps a stranded order out of `CLOSED` lets a not-a-bug or a docs-only one in.
-    """
+    """Where this work order says its issue belongs (#240)"""
     from .project_store import OPEN_STATUSES
 
     wo_id = wo["id"]
@@ -840,55 +473,14 @@ def desired_state(store: Any, wo: dict[str, Any]) -> str:
 
 
 def needs_sync(store: Any, wo: dict[str, Any]) -> bool:
-    """Is there anything left the sweep MAY do to this issue? Issue #961.
-
-    The comparison `desired_state(...) != issue_state` has no fixed point on its own,
-    because `apply` is allowed to return a state that is not the desired one: it returns
-    CLOSED for an issue a person already closed, whatever the want was, so an order whose
-    want is IN_PROGRESS or RELEASED over a closed issue disagrees with its column for
-    ever — one `gh issue view`, one log line and one duplicate `issue_closed` event per
-    tick, per order.
-
-    So a stored CLOSED is TERMINAL. It is where a person (or a converged pass) put the
-    issue and there is nothing left to do there: `apply` would return CLOSED again, the
-    column already says it, and the comment went out on the sweep that discovered the
-    close. The loss is that a human REOPENING is not re-labelled by this sweep, which is
-    `apply`'s existing never-fight-a-human rule reached one step earlier and without the
-    `gh` call. Full reasoning:
-    docs/superpowers/specs/2026-10-07-a-closed-issue-the-os-cannot-move-converges.md.
-
-    The latch lives here and not in the daemon because `record_applied` has a second
-    caller (`promote_confirmed`), so both read the same policy. `desired_state` STAYS
-    PURE — derived from the work order alone, never from `issue_state`; putting the latch
-    there would let the filing path RE-CLOSE an issue a human reopened (Neo question
-    1410).
-    """
+    """Is there anything left the sweep MAY do to this issue? (#961)"""
     if (wo.get("issue_state") or "") == CLOSED:
         return False
     return desired_state(store, wo) != (wo.get("issue_state") or "")
 
 
 def closing_comment(wo: dict[str, Any]) -> str:
-    """What the issue says about its own closure, months later.
-
-    The id, the title and the pull request, and NOTHING ELSE. That list is the whole
-    decision (issue #240 F): whoever reads this issue next must be able to get from it to
-    the work order and to the code, and everything beyond that is data leaving the
-    machine.
-
-    **`result_summary` IS DELIBERATELY NOT HERE** (review round 1). It is worker prose
-    written for the internal record by a worker that does not know it will be published,
-    and it routinely carries absolute paths, internal project names and raw error text.
-    Publishing it to a PUBLIC tracker with nobody reading it first is not something the
-    user agreed to: the consent `bugs` collects is described everywhere — the config
-    docstring, the CLAUDE.md crib, the `report-jarvis-bug` skill — as closing the issue
-    "with the work order and the PR on it". Widening what is published is a change to
-    what that sentence means, not an implementation detail, and it would apply
-    retroactively to every tracked order the moment it shipped.
-
-    Anyone who wants the detail follows the work-order id, which is exactly what it is
-    here for.
-    """
+    """What the issue says about its own closure, months later (#240)"""
     parts = [f"Closed by Jarvis work order `{wo['id']}` — {wo.get('title') or ''}".strip()
              + "."]
     if wo.get("pr_url"):
@@ -901,25 +493,7 @@ def closing_comment(wo: dict[str, Any]) -> str:
 
 
 def apply(store: Any, wo: dict[str, Any], label: str) -> str:
-    """Move this work order's issue to where `desired_state` says it belongs.
-
-    Returns the state the tracker is now in, for the caller to record in `issue_state`.
-    Raises `IssueLifecycleError` if anything could not be done, having done as little as
-    possible — the caller records nothing and the next sweep tries again.
-
-    **IT NEVER FIGHTS A HUMAN.** The issue is re-read first, and an issue a person has
-    already closed is left closed whatever the work order is doing: the OS does not
-    reopen, and it records what it found so it stops asking. Reopening is therefore a
-    person's prerogative in both directions — reopen a closed issue and the sweep leaves
-    it alone too, because the work order that closed it is settled and its desired state
-    has not changed.
-
-    **THE ORDER OF THE TWO WRITES IN THE CLOSING CASE IS LOAD-BEARING.** The label comes
-    off BEFORE the close, so a close that fails is retried against an issue that is still
-    open and gets its comment exactly once. Closing first and failing on the label would
-    leave the next sweep facing an already-closed issue with `issue_state` unwritten,
-    which is the one shape that posts a duplicate comment.
-    """
+    """Move this work order's issue to where `desired_state` says it belongs"""
     url = checked_issue_url(wo.get("issue_url") or "")
     want = desired_state(store, wo)
     issue = view(url)
@@ -928,8 +502,7 @@ def apply(store: Any, wo: dict[str, Any], label: str) -> str:
         if issue.has(label):
             remove_label(url, label)
         if issue.closed:
-            # Someone closed it first. Say what closed it anyway — the record is the
-            # point (issue #240 F) — but only on the sweep that discovers it.
+            # Someone closed it first (#240)
             if (wo.get("issue_state") or "") != CLOSED:
                 comment(url, closing_comment(wo))
         else:
@@ -946,22 +519,11 @@ def apply(store: Any, wo: dict[str, Any], label: str) -> str:
     return want
 
 
-# -- picking the issue up: the step between "filed" and "being worked on" -----------
+# -- picking the issue up: the step between "filed" and "being worked on"
 
 
 def tracker_project(catalog: Any, repo: str | None = None) -> Any:
-    """The project that would FIX a bug on `repo`, or None if none would.
-
-    ONE condition, and it is the project's own: its git `origin` IS that repository. The
-    project that NOTICED the bug has no say — `jarvis bug report` runs wherever the
-    symptom appeared, and that project pays for nothing.
-
-    There is deliberately no opt-in switch beside it any more. Routing is by priority and
-    only by priority (the user's ruling of 2026-09-14): what stops a filing committing the
-    fleet to work is the rubric plus Neo's re-assessment, not a catalog key — and a key
-    that shipped off would have made the ruling's own "critical and blocker automatically
-    get a work order" unreachable.
-    """
+    """The project that would FIX a bug on `repo`, or None if none would"""
     from . import github
 
     want = (repo or bug_repo()).lower()
@@ -972,9 +534,7 @@ def tracker_project(catalog: Any, repo: str | None = None) -> Any:
     return None
 
 
-#: What the worker is told to do, above the issue body. The worker sees ONLY the
-#: description, so the issue URL has to be in it — `jarvis bug report` is the only thing
-#: that knows the two belong together.
+#: What the worker is told to do, above the issue body
 WORK_ORDER_BRIEF = """\
 Fix {url}.
 
@@ -990,8 +550,7 @@ not open a second issue for the same thing.
 
 {body}"""
 
-#: `WORK_ORDER_BRIEF`'s `why`, one per route in. They differ in the only thing the worker
-#: could act on differently: whether a release follows the landing.
+#: `WORK_ORDER_BRIEF`'s `why`, one per route in
 TRIAGED_WHY = """\
 This bug is `{priority}`, confirmed by Neo against the OS's own rubric, which is why it \
 became a work order at all. A release goes out once your fix LANDS."""
@@ -1001,62 +560,37 @@ EXPEDITED_WHY = """\
 This bug is `{priority}` on the tracker and the filing EXPEDITED it: work starts now, \
 whatever the rating says.{tail}"""
 
-#: The key under an expedited work order's `metadata` that says the USER asked for this
-#: in production now. On the work order and not the issue because the issue's labels are
-#: the RATING, which is Neo's to move (`settle_work_order_priority`); a scheduling act
-#: that a downgrade could erase would be the defect again. In `metadata` and not a column
-#: for `RELEASE_BATCH_KEY`'s reason: one boolean, read by one daemon step, joined by
-#: nothing.
+#: The key under an expedited work order's `metadata` that says the USER asked for this in production...
 EXPEDITED_KEY = "expedited"
 
-#: `EXPEDITED_WHY`'s tail on a `critical`/`blocker` filing. Expediting does not skip the
-#: re-assessment, it only stops the work WAITING for it — so the worker is told that the
-#: rating on this order is still open, and what that costs it: nothing it can act on.
+#: `EXPEDITED_WHY`'s tail on a `critical`/`blocker` filing
 EXPEDITED_TRIAGE_TAIL = """ That rating is a CLAIM and Neo is re-assessing it in \
 parallel, so this work order carries no rating of its own yet — if the fix lands first, \
 it lands without the release a confirmed `blocker` would have shipped. Neo confirming \
 writes the rating on, and a release follows then. None of that is yours to wait for: \
 the work is yours to do now."""
 
-#: THE ROUTE OUT, written once. Every surface that tells the user a bug was not
-#: dispatched names this — the notification, the filing note, the tracker comment — and
-#: naming a command that does not exist is exactly what this replaced.
+#: THE ROUTE OUT, written once
 START_COMMAND = "jarvis issues start {url}"
+
+def self_dispatch(catalog: Any) -> bool:
+    """`os.autonomy.self_dispatch`: may a confirmed claim dispatch work nobody typed?"""
+    autonomy = getattr(getattr(catalog, "os", None), "autonomy", None)
+    return bool(getattr(autonomy, "self_dispatch", False))
+
+
+def self_dispatch_configured() -> bool:
+    """`self_dispatch` of the resolved fleet catalog; an unreadable catalog reads as off"""
+    from .ops import resolve_catalog
+    try:
+        return self_dispatch(resolve_catalog())
+    except Exception:  # noqa: BLE001 — fail closed: no catalog, no self-dispatch
+        return False
+
 
 def route_filing(issue_url: str, title: str, body: str, priority: str,
                  repo: str | None = None, expedite: bool = False) -> dict[str, Any]:
-    """Everything that happens to a freshly filed bug, before anyone is told about it.
-
-    Returns what ACTUALLY happened, always — it never raises, because by the time it runs
-    the issue exists and an exception here would report "not filed" about a bug that was
-    (`bugreport.report_bug`'s rule). Every outcome carries a `reason` the user reads.
-
-    **THE TRACKER IS WHERE EVERY BUG LANDS**, whatever its priority, and that is what
-    makes failing closed the default rather than a branch. A `critical` or `blocker`
-    filing is a CLAIM: the issue is labelled like any other and a `triage` question goes
-    to Neo, and only Neo confirming it becomes a work order. So a Neo that is off,
-    unreachable or unintelligible leaves the bug exactly where it is — on the tracker,
-    visible, and marked unconfirmed — which is the direction the user asked for. There is
-    no path from a filing to a work order that does not go through a verdict.
-
-    **AND NO SECOND QUEUE.** This used to open a `jarvis backlog` item beside the issue,
-    and then tell the user to `jarvis backlog promote` it. The user stopped reading the
-    backlog when GitHub issues replaced it (kn-c5725f1f), so that item was a queue nobody
-    saw. `start_work` is the route out now, and it starts from the issue.
-
-    `low`, `medium` and `high` are not re-assessed. They commit the fleet to nothing, so
-    there is nothing to guard against.
-
-    **`expedite` IS A SCHEDULING DECISION, NOT A RATING.** It dispatches the work order
-    now at every level, so the user can say "work on this today" without inflating a
-    priority that has to stay an honest description of the defect. It does NOT skip the
-    re-assessment of a `critical`/`blocker` claim: that question is still asked, in
-    parallel, because the `priority:` label is what the tracker shows everyone else and
-    a claim nobody checked would stay on it. The verdict SETTLES THE RATING — the label
-    and the work order's own copy of it, which is what decides a release on landing — and
-    until it arrives an expedited claim carries no rating at all. What the verdict cannot
-    do is un-dispatch the work (`settle_triage`).
-    """
+    """Everything that happens to a freshly filed bug, before anyone is told about it"""
     from .catalog import CatalogError
     from .central_store import CentralStore
     from .ops import OpsError, registered_project_paths, resolve_catalog
@@ -1064,7 +598,8 @@ def route_filing(issue_url: str, title: str, body: str, priority: str,
     out: dict[str, Any] = {"priority": priority, "wo_id": "", "backlog_id": "",
                            "project": "", "neo_question_id": 0, "reason": ""}
     try:
-        spec = tracker_project(resolve_catalog(), repo)
+        catalog = resolve_catalog()
+        spec = tracker_project(catalog, repo)
     except (CatalogError, OpsError, FileNotFoundError, OSError) as e:
         out["reason"] = f"the fleet catalog could not be read ({e})"
         return out
@@ -1078,26 +613,18 @@ def route_filing(issue_url: str, title: str, body: str, priority: str,
                          f"run `jarvis start` before bugs can be picked up")
         return out
 
-    # The tracker's own copy of the level, first: it is the one piece of this that is
-    # useful even if everything below fails, because it is what the issue shows to
-    # somebody who never opens the OS.
+    # The tracker's own copy of the level
     try:
         set_priority_label(issue_url, priority)
     except GitHubError as e:
         out["label_error"] = str(e)
 
     if expedite:
-        # Before the triage question, so the work order exists whatever Neo does next —
-        # the whole point of the flag is that the work does not wait on a verdict.
+        # Before the triage question, so the work order exists whatever Neo does next
         try:
             out["wo_id"] = promote_confirmed(
                 spec, {"issue_url": issue_url, "title": title, "body": body,
-                       # NO RELEASE OFF AN UNCONFIRMED CLAIM. A release on landing is cut
-                       # from this column (`daemon.sync_issues`), so an expedited
-                       # `critical`/`blocker` is dispatched carrying NO rating at all
-                       # until Neo confirms one — `settle_triage` writes the settled
-                       # level onto the order. The claim itself is not lost: it is in the
-                       # brief below, in the issue body and on the `priority:` label.
+                       # NO RELEASE OFF AN UNCONFIRMED CLAIM
                        "priority": "" if dispatches(priority) else priority},
                 metadata={EXPEDITED_KEY: True},
                 why=EXPEDITED_WHY.format(
@@ -1117,13 +644,16 @@ def route_filing(issue_url: str, title: str, body: str, priority: str,
                              f"`{START_COMMAND.format(url=issue_url)}`")
         return out
 
-    # `expedite` appends to the sentence above; a plain filing has none and writes its
-    # own. Two different statements, kept apart so neither reads as the other.
+    # `expedite` appends to the sentence above; a plain filing has none and writes its own
     try:
         out["neo_question_id"] = ask_triage(spec.name, issue_url, title, body, priority)
         if expedite:
             out["reason"] += (f"; Neo is re-assessing the `{priority}` claim in "
                               f"parallel and can still move the rating, not the work")
+        elif not self_dispatch(catalog):
+            out["reason"] = (f"`{priority}` claimed — Neo is re-assessing the rating; "
+                             f"nothing is dispatched either way, start it yourself with "
+                             f"`{START_COMMAND.format(url=issue_url)}`")
         else:
             out["reason"] = (f"`{priority}` claimed — Neo is re-assessing it against the "
                              f"rubric; a work order is created only if Neo confirms")
@@ -1140,12 +670,7 @@ def route_filing(issue_url: str, title: str, body: str, priority: str,
 
 
 def set_priority_label(issue_url: str, level: str) -> None:
-    """Make the issue carry exactly one priority label: this one.
-
-    Every other level comes OFF, which is what makes this usable for a re-assessment as
-    well as for a filing — Neo downgrading a claim must not leave the tracker showing
-    both. Reads the issue first, so a re-run costs one call and writes nothing.
-    """
+    """Make the issue carry exactly one priority label: this one"""
     want = priority_label(level)
     issue = view(issue_url)
     for stale in PRIORITY_LABELS:
@@ -1156,9 +681,7 @@ def set_priority_label(issue_url: str, level: str) -> None:
         add_label(issue_url, want)
 
 
-#: The question Neo re-assesses a `critical`/`blocker` claim with. The rubric travels WITH
-#: it rather than being left to Neo's learnings: this is the text the claim is judged
-#: against, so it has to be the same text the filing agent was shown (`PRIORITY_RUBRIC`).
+#: The question Neo re-assesses a `critical`/`blocker` claim with
 TRIAGE_QUESTION = """\
 A fleet agent filed a Jarvis OS bug and rated it `{priority}`. That rating is a CLAIM, \
 not a verdict, and it is the only thing standing between this report and a work order \
@@ -1186,21 +709,24 @@ Title: {title}
 
 def ask_triage(project: str, issue_url: str, title: str, body: str,
                priority: str) -> int:
-    """Queue the re-assessment. Returns the Neo question id.
-
-    The question row IS the pending-triage record — there is no second table and no
-    `pending` column anywhere. Everything the daemon needs to act on the verdict travels
-    in `context` as JSON, which means a triage that is never answered leaves no state to
-    clean up and nothing that could disagree with the tracker.
-    """
+    """Queue the re-assessment"""
     from .neo_store import NeoStore
+    from .provenance import TITLE_LIMIT, Borrowed, borrowed_block
 
-    context = json.dumps({"issue_url": issue_url, "title": title,
+    # The title is bounded in the JSON record too: it rides to Neo as `context=`, and
+    # `triage_payload` reads it back as a work order's title, where 300 is already ample.
+    context = json.dumps({"issue_url": issue_url, "title": title[:TITLE_LIMIT],
                           "priority": priority, "body": body[:4000]})
+    # Decision #11: the title is borrowed text — whoever filed the bug wrote it — and it
+    # was the one field in this prompt with no bound. The body keeps its own slice.
+    quoted_title = borrowed_block(Borrowed(
+        label="the tracker issue's title", whose="the agent that filed the bug",
+        text=title, limit=TITLE_LIMIT))
     neo = NeoStore()
     try:
         q = neo.ask(project, "", TRIAGE_QUESTION.format(
-            priority=priority, rubric=PRIORITY_RUBRIC, url=issue_url, title=title,
+            priority=priority, rubric=PRIORITY_RUBRIC, url=issue_url,
+            title="\n" + quoted_title,
             levels=", ".join(f"`{p}`" for p in PRIORITIES), body=body[:4000]),
             context=context, kind="triage")
     finally:
@@ -1209,11 +735,7 @@ def ask_triage(project: str, issue_url: str, title: str, body: str,
 
 
 def triage_payload(q: dict[str, Any]) -> dict[str, Any]:
-    """The filing facts back out of a triage question, or `{}` if it is not one.
-
-    Empty rather than raising: the delivery path runs inside the Neo drain, where one
-    unreadable row must not stop the queue.
-    """
+    """The filing facts back out of a triage question, or `{}` if it is not one"""
     if q.get("kind") != "triage":
         return {}
     try:
@@ -1223,21 +745,7 @@ def triage_payload(q: dict[str, Any]) -> dict[str, Any]:
     return payload if isinstance(payload, dict) and payload.get("issue_url") else {}
 
 
-#: What the tracker records about the re-assessment. BOTH FACTS, ALWAYS — the claim and
-#: the verdict — because their disagreement is the signal that says whether the rubric is
-#: working, and a comment that only showed the surviving level would delete it.
-#: What the TRACKER is told about a re-assessment: the two levels and where the bug went.
-#:
-#: **NEO'S REASONING IS DELIBERATELY NOT HERE** (review round 2), for the same reason
-#: `closing_comment` carries no `result_summary`. It is model prose written for the
-#: internal record by a model that does not know it will be published, and Neo answers
-#: with fleet context behind it — learnings, other work orders, project names, paths. A
-#: GitHub comment is indexed and cached whether or not it is later deleted, and nobody
-#: reads this one before it leaves the machine.
-#:
-#: The reasoning still travels with both levels, on the RECORD the user asked for it on:
-#: the Neo question row holds it verbatim (`jarvis neo show <id>`), and the inbox row
-#: `daemon._deliver_triage_verdict` writes carries the head of it. Neither is public.
+#: What the tracker records about the re-assessment
 TRIAGE_COMMENT = """\
 **Priority re-assessed by Neo:** filed as `{claimed}` → **`{settled}`**.
 
@@ -1253,13 +761,7 @@ def triage_comment(claimed: str, settled: str, tail: str) -> str:
 
 
 def record_applied(store: Any, wo: dict[str, Any], label: str) -> str:
-    """`apply`, plus the two writes that stop it being asked again for nothing.
-
-    The column and the event are one unit with the GitHub call: written only after it
-    succeeded, which is the whole of "fail closed and never half-apply" (#240 E). Shared
-    by the filing path and the daemon sweep so there is one place that decides what
-    counts as applied.
-    """
+    """`apply`, plus the two writes that stop it being asked again for nothing (#240)"""
     applied = apply(store, wo, label)
     store.update_work_order(wo["id"], issue_state=applied)
     store.add_event(wo["id"], f"issue_{applied.replace('-', '_')}",
@@ -1267,26 +769,11 @@ def record_applied(store: Any, wo: dict[str, Any], label: str) -> str:
     return applied
 
 
-# -- acting on the verdict ------------------------------------------------------------
+# -- acting on the verdict
 
 
 def read_triage_verdict(claimed: str, verdict: dict[str, Any]) -> tuple[str, str]:
-    """`(outcome, settled)` — what Neo actually ruled on a priority claim.
-
-    THE THIRD OUTCOME IS NOT A FALLBACK, IT IS THE DEFAULT. Until this, anything that was
-    not `approve` was reported as a `downgraded`, and `downgrade_to` supplied a level, so
-    a reply nobody could parse reached the user as "Neo downgraded a `critical` bug to
-    `high`" — a sentence in which every word was invented. `downgraded` now requires that
-    Neo RULED: either the parser read an explicit verdict (`neo._verdict_stated`) or the
-    answer's first word says so in as many letters.
-
-    The answer's first word is read at all because `TRIAGE_QUESTION` tells Neo to put its
-    level there, which is exactly what primes a model to put its RULING there too — and
-    it is the reply the fleet observed (question 493: `answer: approve — confirmed
-    critical`, no `verdict` field, reported to the user as a downgrade). Read here and not
-    in `neo._gate_verdict` on purpose: prose in `answer` must never be able to open a
-    gate, where the only way through is an explicit yes.
-    """
+    """`(outcome, settled)` — what Neo actually ruled on a priority claim"""
     from .neo import _VERDICT_ALIASES
 
     stated = ((verdict.get("answer") or "").strip().split() or [""])[0]
@@ -1296,56 +783,23 @@ def read_triage_verdict(claimed: str, verdict: dict[str, Any]) -> tuple[str, str
     if verdict.get("approve"):
         return ("confirmed", claimed)
     if verdict.get("verdict_stated"):
-        # An explicit deny whose answer opens with "approve" is a reply contradicting
-        # itself; neither half may be acted on.
+        # An explicit deny whose answer opens with "approve" is a reply contradicting itself
         return (("unconfirmed", claimed) if said == "approved"
                 else ("downgraded", downgrade_to(claimed, stated)))
 
-    # No verdict field at all: `approve` is False only because that is what it defaults
-    # to, so the answer is the only thing that can carry a ruling.
+    # No verdict field at all: `approve` is False only because that is what it defaults to
     if said == "approved":
         return ("confirmed", claimed)
     if said in ("denied", "dismissed"):
         return ("downgraded", downgrade_to(claimed, stated))
-    # `downgrade_to` OWNS THE ORDERING (review round 1): it already answers "is this a
-    # level below the claim", and a second comparison here would be a second answer to
-    # that question on the path that writes the "Neo downgraded a `critical` bug to `X`"
-    # sentence. It folds both refusals onto `SAFE_DOWNGRADE`, so a level that came back
-    # unchanged is one it accepted — and anything else is a level Neo did not state
-    # BELOW the claim, which with no verdict field is nothing to act on.
+    # `downgrade_to` OWNS THE ORDERING (review round 1): it already answers "is this a level below the...
     return (("downgraded", stated) if downgrade_to(claimed, stated) == stated
             else ("unconfirmed", claimed))
 
 
 def settle_triage(catalog: Any, q: dict[str, Any], verdict: dict[str, Any]
                   ) -> dict[str, Any]:
-    """Route a bug now that Neo has ruled on its priority. The daemon's whole triage step.
-
-    Three outcomes, and only the first one dispatches anything:
-
-    * **confirmed** (`verdict: approve`) — the work order is created and the backlog item
-      is marked promoted. A release follows when the fix LANDS, which is `sync_issues`'
-      job and not this one.
-    * **downgraded** (`verdict: deny`) — the priority label is corrected and nothing is
-      dispatched. If an EXPEDITED filing already dispatched one, that work order stays
-      (the flag is a scheduling decision the verdict has no say in) but its
-      `issue_priority` is corrected too, so the claim cannot leave a release behind it —
-      `settle_work_order_priority`.
-    * **unconfirmed** (escalated, or output nobody could parse) — nothing at all, not
-      even a tracker comment: no verdict was reached, so there is no second level to put
-      beside the claim. The claim stands on the record as a claim and the user is told.
-      The refusal direction is the point: an unconfirmed `blocker` that quietly became a
-      release is the worse failure.
-
-    Which of the three a verdict is, is `read_triage_verdict`'s decision and nothing here
-    may re-derive it.
-
-    The tracker gets a comment carrying BOTH levels in every case where a verdict was
-    reached, because the disagreement between the claim and the verdict is what tells the
-    user whether the rubric is working. NEO'S REASONING IS NOT ON IT — see
-    `TRIAGE_COMMENT`; it rides the internal record instead, where `out["reason"]` carries
-    it in full for the caller to put in front of the user.
-    """
+    """Route a bug now that Neo has ruled on its priority"""
     from .central_store import CentralStore
 
     payload = triage_payload(q)
@@ -1357,8 +811,7 @@ def settle_triage(catalog: Any, q: dict[str, Any], verdict: dict[str, Any]
                            "issue_url": url, "wo_id": "",
                            "backlog_id": payload.get("backlog_id") or ""}
 
-    # In full and on every outcome: this is the private half of the record, and the two
-    # places it goes (the inbox row, `jarvis neo show`) are the ones that may hold it.
+    # In full and on every outcome: this is the private half of the record
     out["reason"] = verdict.get("reason") or ""
 
     if verdict.get("escalate") or verdict.get("failed"):
@@ -1376,12 +829,10 @@ def settle_triage(catalog: Any, q: dict[str, Any], verdict: dict[str, Any]
         out["reason"] = f"project {q.get('project')!r} is no longer in the catalog"
         return out
 
-    if out["outcome"] == "confirmed":
+    if out["outcome"] == "confirmed" and self_dispatch(catalog):
         out["wo_id"] = promote_confirmed(spec, payload)
         if out["backlog_id"]:
-            # Only a question asked BEFORE the backlog item stopped being created can
-            # have one. Kept so an upgrade cannot leave an in-flight triage's item open
-            # for ever; nothing written today reaches this.
+            # Only a question asked BEFORE the backlog item stopped being created can have one
             central = CentralStore()
             try:
                 central.mark_backlog(out["backlog_id"], "promoted",
@@ -1391,18 +842,11 @@ def settle_triage(catalog: Any, q: dict[str, Any], verdict: dict[str, Any]
 
     out["existing_wo_id"] = out["wo_id"] or live_work_order(spec, url)
     if out["existing_wo_id"]:
-        # NEVER ONLY THE LABEL. This is the moment a rating stops being a claim, and the
-        # work order's copy of it is the one that decides a release on landing
-        # (`daemon.sync_issues`) — an expedited order is waiting here for its first
-        # rating, a downgraded one for its correction. No-op when they already agree.
+        # NEVER ONLY THE LABEL
         out["repriced_wo_id"] = settle_work_order_priority(
             spec, out["existing_wo_id"], claimed, out["settled"])
 
-    # LAST, and after everything that touches the work order: a tracker comment that
-    # failed must not undo a promotion or a rating that succeeded, and the sweep
-    # re-labels anyway. An EXPEDITED filing already has a work order, so "no work order
-    # was created" would be the tracker saying something untrue about a downgrade that
-    # dispatched nothing itself.
+    # LAST, and after everything that touches the work order: a tracker comment that failed must not undo...
     try:
         set_priority_label(url, out["settled"])
         comment(url, triage_comment(
@@ -1418,17 +862,7 @@ def settle_triage(catalog: Any, q: dict[str, Any], verdict: dict[str, Any]
 
 def settle_work_order_priority(spec: Any, wo_id: str, claimed: str,
                                settled: str) -> str:
-    """Write the level Neo SETTLED on onto a live work order. Returns the id it changed,
-    or `""` when the order already carried that level or has gone.
-
-    **A CLAIM MAY NOT BUY A RELEASE, AND ONLY A VERDICT MAY SELL ONE.**
-    `daemon.sync_issues` cuts a release when a fix lands off `issue_priority` alone, so
-    an expedited `critical`/`blocker` is dispatched with that column EMPTY — no verdict
-    exists yet, and a claim that could ship a release is the one thing the re-assessment
-    is there to prevent. This is the other end: the confirm writes the rating on, so the
-    release follows; a downgrade writes the lower one, so it does not. An order that
-    lands before any verdict ships nothing, which is the direction to fail in.
-    """
+    """Write the level Neo SETTLED on onto a live work order"""
     from .project_store import ProjectStore
 
     store = ProjectStore(spec.path)
@@ -1448,13 +882,7 @@ def settle_work_order_priority(spec: Any, wo_id: str, claimed: str,
 
 
 def live_work_order(spec: Any, issue_url: str) -> str:
-    """The id of the non-terminal work order on this issue, or `""`.
-
-    One issue, one live work order (#240 D). It is also what makes a tracker comment
-    truthful when the two routes in cross: a bug expedited at filing already has a work
-    order by the time Neo downgrades its claim, and `settle_triage` may not tell the
-    tracker none was created.
-    """
+    """The id of the non-terminal work order on this issue, or `""` (#240)"""
     from .project_store import TERMINAL_STATUSES, ProjectStore
 
     store = ProjectStore(spec.path)
@@ -1468,12 +896,7 @@ def live_work_order(spec: Any, issue_url: str) -> str:
 
 
 def was_expedited(wo: dict[str, Any]) -> bool:
-    """Did the user expedite this work order's filing?
-
-    The one reader of `EXPEDITED_KEY`, so the daemon never hand-rolls the metadata parse
-    and a row written before the flag existed answers False rather than raising.
-    A release on landing is cut from this OR the rating (`daemon.sync_issues`).
-    """
+    """Did the user expedite this work order's filing?"""
     from . import db
 
     return bool((db.from_json(wo.get("metadata"), {}) or {}).get(EXPEDITED_KEY))
@@ -1481,23 +904,7 @@ def was_expedited(wo: dict[str, Any]) -> bool:
 
 def promote_confirmed(spec: Any, payload: dict[str, Any], why: str = "",
                       metadata: dict[str, Any] | None = None) -> str:
-    """Create the work order a confirmed `critical`/`blocker` earned. Returns its id.
-
-    **NO SECOND WORK ORDER FOR ONE ISSUE** (#240 D). An issue that already has a LIVE work
-    order hands that one back; one whose work orders have all settled is free to get
-    another, which is exactly what a reopened issue needs.
-
-    `why` is the brief's second paragraph, so the OTHER two routes in — `start_work`, and
-    an EXPEDITED filing (`route_filing`) — reuse every other thing this does: that dedupe,
-    `issue_url`/`issue_priority`, the in-progress label. Only a confirmed
-    `critical`/`blocker` is told a release is coming, and an expedited claim's
-    `issue_priority` is rewritten if Neo later downgrades it
-    (`settle_work_order_priority`).
-
-    `metadata` is written AT CREATION rather than by a follow-up update, because the
-    daemon can claim and dispatch the row before a second write lands — the reason
-    `ops.create_work_order` takes it at all.
-    """
+    """Create the work order a confirmed `critical`/`blocker` earned (#240)"""
     from .ops import create_work_order
     from .project_store import ProjectStore
 
@@ -1515,8 +922,7 @@ def promote_confirmed(spec: Any, payload: dict[str, Any], why: str = "",
         origin="jarvis", issue_url=url, issue_priority=priority, metadata=metadata)
     store = ProjectStore(spec.path)
     try:
-        # Label it now rather than only on the next sweep: the promotion and the tracker
-        # saying so should not be a poll interval apart. A failure is retried there.
+        # Label it now rather than only on the next sweep: the promotion and the tracker saying so should not...
         try:
             record_applied(store, store.get_work_order(wo["id"]), spec.bugs.label)
         except GitHubError as e:
@@ -1527,8 +933,7 @@ def promote_confirmed(spec: Any, payload: dict[str, Any], why: str = "",
 
 
 def issue_body(url: str, repo: str | None = None) -> str:
-    """The issue's text. Its own call because `Issue` is cached by the reference index,
-    where a body nobody reads would be the largest field in the cache."""
+    """The issue's text"""
     url = checked_issue_url(url, repo)
     try:
         payload = json.loads(_run(["issue", "view", url, "--json", "body"], url=url))
@@ -1538,7 +943,7 @@ def issue_body(url: str, repo: str | None = None) -> str:
 
 
 def issue_priority(issue: Issue) -> str:
-    """The level the tracker itself is carrying, or `""` if nobody has rated it."""
+    """The level the tracker itself is carrying, or `""` if nobody has rated it"""
     for level in PRIORITIES:
         if issue.has(priority_label(level)):
             return level
@@ -1546,11 +951,7 @@ def issue_priority(issue: Issue) -> str:
 
 
 def issue_ref_url(target: str, repo: str) -> str:
-    """`#123`, `123` or a whole URL — one issue URL. Raises on anything else.
-
-    A bare number is resolved against `repo` and never against whatever host the string
-    might have named, which is `checked_issue_url`'s rule arriving one step earlier.
-    """
+    """`#123`, `123` or a whole URL — one issue URL"""
     from .ops import issue_url_for
 
     ref = (target or "").strip()
@@ -1565,18 +966,7 @@ def issue_ref_url(target: str, repo: str) -> str:
 
 
 def start_work(target: str, project: str | None = None) -> dict[str, Any]:
-    """Open a work order on a tracker issue. THE ROUTE A BUG THAT WAS NOT DISPATCHED TAKES.
-
-    It used to be `jarvis backlog promote <bl-id>`, because every filing left a backlog
-    item behind. GitHub issues replaced the backlog as the tracker (kn-c5725f1f, the
-    user's instruction), so the filing no longer creates one — and a notification that
-    still named `backlog promote` would be pointing at a route that no longer exists.
-
-    `promote_confirmed` does the work, which is the point of reusing it: the "no second
-    work order for one issue" dedupe, `issue_url`/`issue_priority` and the in-progress
-    label are all decisions already made there, and a second implementation of any of
-    them would be a second answer to the same question.
-    """
+    """Open a work order on a tracker issue"""
     from . import github
     from .ops import OpsError, registered_project_paths, resolve_catalog
 

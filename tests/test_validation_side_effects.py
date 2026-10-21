@@ -1,9 +1,4 @@
-"""The round machine's empty guards, end to end. Issue #200, spec 2026-09-12 §5.
-
-These drive the real `Daemon._validate_work_order` through a real `ops.finish`, because
-the defect was never in one function: the packet said "no files" honestly and the guard
-read that as "nothing delivered". Only the whole path shows it.
-"""
+"""The round machine's empty guards, end to end (#200)"""
 
 from __future__ import annotations
 
@@ -26,9 +21,7 @@ def _round(fleet, wo_id):
 
 
 def test_a_submission_with_nothing_at_all_is_still_escalated_unjudged(fleet):
-    """The negative control, and the half of the guard that must NOT move: a reviewer
-    handed nothing will rubber-stamp it, and that single silent pass would make the
-    whole panel theatre."""
+    """The negative control, and the half of the guard that must NOT move: a reviewer handed nothing will..."""
     seen = Validator(passed())
     fleet.daemon.validator = seen
     wo = fleet.dispatch()  # no change to the worktree at all
@@ -42,8 +35,7 @@ def test_a_submission_with_nothing_at_all_is_still_escalated_unjudged(fleet):
 
 
 def test_a_knowledge_only_submission_reaches_the_panel(fleet):
-    """Issue #200's live case, in one test: wo-28405ea1 retracted a fleet-wide
-    instruction, and the packet the panel never saw said it had changed nothing."""
+    """Issue #200's live case, in one test: wo-28405ea1 retracted a fleet-wide instruction"""
     seen = Validator(passed())
     fleet.daemon.validator = seen
     wo = fleet.dispatch()
@@ -63,8 +55,7 @@ def test_a_knowledge_only_submission_reaches_the_panel(fleet):
 
 
 def test_the_retracted_text_reaches_the_seats(fleet):
-    """A summary line is not enough to judge a retraction on — the question is whether
-    the text that was retired deserved to be."""
+    """A summary line is not enough to judge a retraction on"""
     seen = Validator(passed())
     fleet.daemon.validator = seen
     wo = fleet.dispatch()
@@ -82,9 +73,7 @@ def test_the_retracted_text_reaches_the_seats(fleet):
 # --------------------------------------------------------------- the repeat guard
 
 def test_two_rounds_retracting_different_entries_are_both_judged(fleet):
-    """The guard one step past the one issue #200 named: without `side_effects_sha` in
-    the fingerprint, round 2 escalates as "identical to round 1" and the false
-    escalation simply moves one guard along (spec §5)."""
+    """The guard one step past the one issue #200 named: without `side_effects_sha` in the fingerprint"""
     seen = Validator(rejected("try again"), passed())
     fleet.daemon.validator = seen
     wo = fleet.dispatch()
@@ -105,7 +94,7 @@ def test_two_rounds_retracting_different_entries_are_both_judged(fleet):
 
 
 def test_resubmitting_the_identical_side_effects_is_still_caught_as_a_repeat(fleet):
-    """The other half. Widening the hash must not switch the repeat guard off."""
+    """The other half"""
     seen = Validator(rejected("try again"), passed())
     fleet.daemon.validator = seen
     wo = fleet.dispatch()

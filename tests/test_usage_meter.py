@@ -1,9 +1,4 @@
-"""The account's usage meter: sampler, schema, segment sum, estimator, cadence.
-
-Spec docs/superpowers/specs/2026-10-08-usage-meter-samples-and-outside-spend.md §§1-5, 8.
-Tests 1-14, 24-28, 38-42 of its §13. No test performs a request: `fetch(opener=…)` is the
-seam and `JARVIS_CLAUDE_CREDENTIALS` keeps `token()` on a sandbox file.
-"""
+"""The account's usage meter: sampler, schema, segment sum, estimator, cadence (docs/superpowers/specs/2026-10-08-usage-meter-samples-and-outside-spend.md)"""
 
 from __future__ import annotations
 
@@ -24,7 +19,7 @@ MINUTE = 60.0
 T0 = 1_760_000_000.0
 
 
-# -- fixtures ---------------------------------------------------------------------------
+# -- fixtures
 
 
 @pytest.fixture()
@@ -49,7 +44,7 @@ def central(jarvis_home):
 
 
 def payload(**over) -> dict:
-    """The shape measured on this account 2026-10-08."""
+    """The shape measured on this account 2026-10-08"""
     body = {
         "five_hour": {"utilization": 44.0, "resets_at": "2026-10-08T17:20:00Z"},
         "seven_day": {"utilization": 12.5, "resets_at": "2026-10-13T04:00:00Z"},
@@ -63,7 +58,7 @@ def payload(**over) -> dict:
 
 
 class FakeOpener:
-    """`urlopen`'s shape: a context manager with `.status` and `.read()`."""
+    """`urlopen`'s shape: a context manager with `.status` and `.read()`"""
 
     def __init__(self, body=None, *, status: int = 200, raises: Exception | None = None):
         self.body = body
@@ -96,7 +91,7 @@ def rows(central: CentralStore) -> list[dict]:
         central.conn.execute("SELECT * FROM usage_samples ORDER BY id").fetchall())
 
 
-# -- 1-7. sampler and schema ------------------------------------------------------------
+# -- 1-7. sampler and schema
 
 
 def test_a_measured_payload_writes_one_ok_row(central, credentials):
@@ -153,7 +148,7 @@ FAILURES = {
 
 @pytest.mark.parametrize("case", sorted(FAILURES))
 def test_every_failure_writes_exactly_one_gap_row(case, central, credentials):
-    """A gap row is the only honest answer: 0.0 would read as a window reset (§2)."""
+    """A gap row is the only honest answer: 0.0 would read as a window reset (§2)"""
     usage_meter.sample_once(central, opener=FAILURES[case])
 
     (row,) = rows(central)
@@ -188,7 +183,7 @@ def test_no_log_no_reason_and_no_column_carries_the_token_or_the_body(
         assert secret not in logged
 
 
-# -- 8-14. the segment sum --------------------------------------------------------------
+# -- 8-14. the segment sum
 
 
 def sample(ts: float, pct: float | None, resets: float, *, key: str = "five_hour",
@@ -210,7 +205,7 @@ def test_a_span_with_no_reset_is_end_minus_start():
 
 
 def test_a_reset_inside_the_span_sums_two_segments():
-    """End-minus-start is asserted to be the WRONG answer, so a refactor to it fails."""
+    """End-minus-start is asserted to be the WRONG answer, so a refactor to it fails"""
     rows_ = (series(T0, [10.0, 40.0], T0 + 3600)
              + series(T0 + 2 * MINUTE, [3.0, 9.0], T0 + 7200))
     found = usage_meter.segments(rows_, since=T0, until=T0 + 10 * MINUTE,
@@ -233,8 +228,7 @@ def test_a_drop_with_resets_at_unchanged_is_a_boundary_and_an_anomaly():
 
 
 def test_two_resets_inside_one_span_give_three_segments():
-    # The resets are a window apart and the span holds them: two 5h resets inside ten
-    # minutes is what the post-condition of the 2026-10-13 spec clamps.
+    # The resets are a window apart and the span holds them: two 5h resets inside ten minutes is what the...
     rows_ = (series(T0, [10.0, 40.0], T0 + 3600)
              + series(T0 + 5 * 3600, [3.0, 9.0], T0 + 6 * 3600)
              + series(T0 + 10 * 3600, [1.0, 6.0], T0 + 11 * 3600))
@@ -282,17 +276,15 @@ def test_gap_rows_are_excluded_from_segments_and_counted_in_coverage():
     assert found.coverage.longest_gap_seconds == pytest.approx(4 * MINUTE)
 
 
-# -- the reset tolerance and the segment bound ------------------------------------------
-# docs/superpowers/specs/2026-10-13-usage-meter-spurious-resets.md, cases 1-5.
+# -- the reset tolerance and the segment bound
 
-#: Four CONSECUTIVE production readings of the same 17:00:00 reset: the endpoint
-#: guarantees `resets_at` to the window, not to the microsecond.
+#: Four CONSECUTIVE production readings of the same 17:00:00 reset: the endpoint guarantees...
 JITTER = [1791882000.49662, 1791882000.479002, 1791882000.321001, 1791881999.789849]
 WEEK = 7 * 86_400.0
 
 
 def test_sub_second_resets_at_jitter_is_not_a_reset():
-    """The production case: 287 reported resets over a week where none happened."""
+    """The production case: 287 reported resets over a week where none happened"""
     rows_ = [sample(T0 + i * MINUTE, 87.0 * i / 99, JITTER[i % 4]) for i in range(100)]
 
     found = usage_meter.segments(rows_, since=T0, until=T0 + WEEK, key="five_hour")
@@ -318,8 +310,7 @@ def test_a_genuine_advance_of_one_window_is_still_a_reset():
 
 
 def test_resets_at_moving_backwards_is_an_anomaly_and_not_a_boundary():
-    """A window's reset instant never retreats: the endpoint contradicting itself is
-    visible in `anomalies` and does NOT break a segment at 0.0."""
+    """A window's reset instant never retreats: the endpoint contradicting itself is visible in..."""
     rows_ = (series(T0, [10.0, 40.0], T0 + 7200)
              + series(T0 + 2 * MINUTE, [42.0, 44.0], T0 + 7200 - 3600))
 
@@ -371,7 +362,7 @@ def test_a_segment_rising_more_than_the_whole_window_is_clamped_and_marked():
     assert found.delta_points == pytest.approx(100.0)
 
 
-# -- 24-28. dollars per point -----------------------------------------------------------
+# -- 24-28. dollars per point
 
 
 RESETS = T0 + 9 * 3600
@@ -379,7 +370,7 @@ RESETS = T0 + 9 * 3600
 
 def run(start: float, *, minutes: int, points: float, base: float = 0.0,
         resets: float = RESETS):
-    """One run of consecutive ok samples rising `points` over `minutes`."""
+    """One run of consecutive ok samples rising `points` over `minutes`"""
     return [sample(start + i * MINUTE, base + points * i / (minutes - 1), resets)
             for i in range(minutes)]
 
@@ -434,7 +425,7 @@ def test_no_clean_span_falls_back_to_the_seed(central, jarvis_home):
 
 @pytest.mark.parametrize("case", ["reset", "gap", "short", "flat"])
 def test_each_exclusion_rule_empties_the_basis(case, central, jarvis_home):
-    """Each construction is 40 minutes and 10 points — enough but for the ONE rule."""
+    """Each construction is 40 minutes and 10 points — enough but for the ONE rule"""
     if case == "reset":
         rows_ = (run(T0, minutes=20, points=5.0)
                  + run(T0 + 20 * MINUTE, minutes=20, points=5.0, resets=T0 + 14 * 3600))
@@ -456,14 +447,13 @@ def test_each_exclusion_rule_empties_the_basis(case, central, jarvis_home):
 
 
 def test_the_band_widens_with_the_number_of_contributing_spans():
-    """Quantisation is ±1 point PER SPAN, so the same total points over more spans is a
-    wider band (§5)."""
+    """Quantisation is ±1 point PER SPAN, so the same total points over more spans is a wider band (§5)"""
     one = usage_meter.band(total_usd=60.0, total_points=30.0, spans=1)
     three = usage_meter.band(total_usd=60.0, total_points=30.0, spans=3)
     assert three[0] < one[0] and three[1] > one[1]
 
 
-# -- 38-42. cadence, the once-per-streak notice, the invariant --------------------------
+# -- 38-42. cadence, the once-per-streak notice, the invariant
 
 
 def gap_rows(central: CentralStore, count: int, *, start: float = T0) -> None:
@@ -505,7 +495,7 @@ def test_the_sampler_fires_once_per_tick_not_once_per_project(
 
 def test_a_sampler_exception_records_a_gap_row_and_does_not_take_the_tick_down(
         jarvis_home, catalog_file, credentials, fake_claude, caplog, monkeypatch):
-    """Not a transport failure — the SAMPLER itself raising, which `fetch` never sees."""
+    """Not a transport failure — the SAMPLER itself raising, which `fetch` never sees"""
     from jarvis.catalog import load_catalog
     from jarvis.daemon import Daemon
 
@@ -524,7 +514,7 @@ def test_a_sampler_exception_records_a_gap_row_and_does_not_take_the_tick_down(
     (row,) = rows(daemon.central)
     assert row["ok"] == 0 and "RuntimeError" in row["reason"]
     assert any("usage meter sampler failed" in r.getMessage() for r in caplog.records)
-    # The rest of the tick still ran: the project was touched after the sampler failed.
+    # The rest of the tick still ran: the project was touched after the sampler failed
     assert daemon.central.get_project("proj_a")["last_seen"] is not None
 
 
@@ -597,7 +587,7 @@ def test_a_fresh_ok_row_keeps_the_stale_invariant_silent(central):
 
 
 def test_the_stale_invariant_is_derived_from_rows_with_no_daemon(central):
-    """No daemon has ever run here: the rows alone fire it (§8)."""
+    """No daemon has ever run here: the rows alone fire it (§8)"""
     reason = "credentials file has no claudeAiOauth.accessToken"
     now = db.now()
     usage_meter.record(central, usage_meter.Sample(ts=now - 21 * MINUTE, ok=True,

@@ -1,33 +1,4 @@
-"""The message bus: envelopes addressed to a ROLE, delivered by a pure router.
-
-Nothing in Jarvis addresses anything directly. A work order does not talk to the project
-manager and a validation panel does not talk to a work order: every cross-entity message
-is an **envelope** posted to a *role* about a *subject*, and this module works out who
-fills that role. The sender never names a recipient and never learns who read it.
-
-The point is extension. A new participant costs a routing rule here — one row of the
-table below — rather than an edit to everything that might want to reach it.
-
-Three things are load-bearing and easy to lose in a refactor:
-
-* **`post` takes no `kind`.** The kind is derived from the payload's type, so the single
-  most likely defect in a hand-rolled bus — a `kind` that disagrees with its payload — is
-  unrepresentable rather than validated after the fact. Adding a `kind` parameter back
-  for flexibility is that bug, reintroduced.
-* **The router, not the sender, decides what happens when a role is unfilled.** A sender
-  that has to ask "does the recipient exist?" is a sender coupled to its recipient. See
-  `deliver`: a deferral with no manager is filed as a backlog item by the router itself,
-  which is exactly today's behaviour.
-* **Delivery rides the existing queue.** `deliver` calls `store.queue_message`, and
-  `Daemon.deliver_messages` turns that into the next turn on the session exactly as
-  `jarvis wo send` does. There is no second dispatch path, for the same reason feature
-  orders reused `claim_next_pending` rather than inventing a scheduler.
-
-Layering: this module imports `project_store` and `central_store` and nothing above them.
-It must never import `daemon`, `ops`, `panel`, `validation` or `neo` — the daemon is the
-only module that knows about the bus and its posters together, and a test walks this
-file's AST to keep it that way.
-"""
+"""The message bus: envelopes addressed to a ROLE, delivered by a pure router"""
 
 from __future__ import annotations
 
@@ -44,32 +15,23 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 log = logging.getLogger("jarvis.bus")
 
-#: How many routing attempts an envelope gets before INV-ENVELOPE-STUCK steps in. The
-#: number is not the point: what matters is that a message nobody will ever receive stops
-#: looking like one that was delivered.
+#: How many routing attempts an envelope gets before INV-ENVELOPE-STUCK steps in
 DELIVERY_ATTEMPT_CEILING = 5
 
-#: `source` on the `wo_messages` row an envelope becomes. Tells a delivered envelope apart
-#: from a `jarvis wo send` in the work order record, which is the only way to read back
-#: what the worker was actually reacting to.
+#: `source` on the `wo_messages` row an envelope becomes
 MESSAGE_SOURCE = "bus"
 
 
 class BusError(Exception):
-    """A message that cannot be posted or cannot be parsed back out of the database."""
+    """A message that cannot be posted or cannot be parsed back out of the database"""
 
 
-# -- the subject and the typed payloads ---------------------------------------------
-#
-# The columns are TEXT, so the typing has to live at the boundary and it has to be strong
-# there: everything else in this feature stands on this pipe, and a role misspelled at a
-# call site must fail at that call site rather than surface weeks later as an
-# `undeliverable` row nobody reads.
+# -- the subject and the typed payloads
 
 
 @dataclass(frozen=True, slots=True)
 class Subject:
-    """What an envelope is ABOUT: a work order or a feature order, never both."""
+    """What an envelope is ABOUT: a work order or a feature order, never both"""
 
     wo_id: str | None = None
     fo_id: str | None = None
@@ -82,7 +44,7 @@ class Subject:
 
 @dataclass(frozen=True, slots=True)
 class ReviewFeedback:
-    """A reviewer's verdict travelling back to whoever must act on it."""
+    """A reviewer's verdict travelling back to whoever must act on it"""
 
     round: int
     outcome: str               # rejected | escalated
@@ -92,13 +54,7 @@ class ReviewFeedback:
 
 @dataclass(frozen=True, slots=True)
 class DeferralRequest:
-    """Work found on the way that is not this work order's job.
-
-    `why` and `description` are different things and both are carried: `why` is the
-    argument for deferring — it becomes the backlog row's `origin_note` — while
-    `description` is the brief for whoever eventually picks the item up. A deferral
-    usually has the first and often lacks the second, so only `description` is optional.
-    """
+    """Work found on the way that is not this work order's job"""
 
     title: str
     why: str
@@ -108,11 +64,7 @@ class DeferralRequest:
 
 @dataclass(frozen=True, slots=True)
 class ChildrenLanded:
-    """The work orders filed after round `round` have all completed.
-
-    The only event that reaches an idle manager from the reconciler rather than from a
-    reviewer or a worker — see `Daemon._manager_handoff` for why it has to exist.
-    """
+    """The work orders filed after round `round` have all completed"""
 
     round: int
     children: tuple[str, ...] = ()
@@ -121,60 +73,41 @@ class ChildrenLanded:
 
 @dataclass(frozen=True, slots=True)
 class AssumptionObjection:
-    """The OS disagreeing with an assumption while the worker is still typing.
-
-    NOT `ReviewFeedback`: that payload's `round` and `outcome` describe a validation
-    round, and an objection is not one — it is guidance that settles nothing, sent to a
-    worker mid-task (docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-
-    worker-still-runs.md §6.2).
-    """
+    """The OS disagreeing with an assumption while the worker is still typing"""
 
     assumption_n: int
     reason: str
     question_id: int | None = None
 
 
-#: kind -> the dataclass that IS that kind. Every entry in `ENVELOPE_KINDS` must appear
-#: here; a test walks the tuple rather than listing the kinds, so a kind added without a
-#: payload type fails the suite instead of producing an `undeliverable` row months later.
+#: kind -> the dataclass that IS that kind
 PAYLOADS: dict[str, type] = {
     "review_feedback": ReviewFeedback,
     "deferral_request": DeferralRequest,
     "children_landed": ChildrenLanded,
     "assumption_objection": AssumptionObjection,
 }
-#: Every payload type, as one name. Widened rather than spelled out at each signature so
-#: that adding a kind is one entry in PAYLOADS and nothing else.
+#: Every payload type, as one name
 Payload = ReviewFeedback | DeferralRequest | ChildrenLanded | AssumptionObjection
 
-#: The reverse lookup `post` derives `kind` from. Built from PAYLOADS so the two cannot
-#: drift.
+#: The reverse lookup `post` derives `kind` from
 KINDS: dict[type, str] = {cls: kind for kind, cls in PAYLOADS.items()}
 
-#: Roles the router can actually resolve — the whole routing table lives in `resolve`.
+#: Roles the router can actually resolve — the whole routing table lives in `resolve`
 ADDRESSABLE_ROLES = ("implementor", "manager")
-#: Roles that only ever send. `reviewer` has no session of its own: a panel is called,
-#: it is not messaged. `reconciler` is the daemon's own tick, which is nobody's addressee
-#: by construction — the whole point of a reconciler is that it re-derives rather than
-#: waits.
+#: Roles that only ever send
 SENDER_ONLY_ROLES = ("reviewer", "reconciler")
 
 
 def parse_payload(kind: str, payload_json: str | None) -> Payload:
-    """Rebuild a stored payload as the dataclass its `kind` names.
-
-    Raises BusError if it no longer fits — a schema that moved, a hand-written row, a
-    kind with no type. An envelope whose payload does not parse is never delivered as a
-    malformed message; `deliver` marks it `undeliverable` with the reason in `note`.
-    """
+    """Rebuild a stored payload as the dataclass its `kind` names"""
     cls = PAYLOADS.get(kind)
     if cls is None:
         raise BusError(f"no payload type is registered for kind {kind!r}")
     data = db.from_json(payload_json, None)
     if not isinstance(data, dict):
         raise BusError(f"payload is not a JSON object: {payload_json!r}")
-    # JSON has no tuples, so a `tuple[str, ...]` field comes back as a list. Coerced
-    # rather than accepted, because these dataclasses are frozen and compared by value.
+    # JSON has no tuples, so a `tuple[str, ...]` field comes back as a list
     tuple_fields = {f.name for f in fields(cls) if "tuple" in str(f.type)}
     data = {k: (tuple(v) if k in tuple_fields and isinstance(v, list) else v)
             for k, v in data.items()}
@@ -184,19 +117,12 @@ def parse_payload(kind: str, payload_json: str | None) -> Payload:
         raise BusError(f"payload does not fit {cls.__name__}: {e}") from e
 
 
-# -- posting -------------------------------------------------------------------------
+# -- posting
 
 
 def post(store: ProjectStore, *, subject: Subject, from_role: str, to_role: str,
          payload: Payload) -> int:
-    """Queue an envelope. Returns its id.
-
-    NEVER resolves — resolution is delivery's job, and a sender that resolved would be a
-    sender that knows who it is talking to. Raises BusError on an unknown role or a
-    payload of no known kind.
-
-    There is no `kind` parameter on purpose: see the module docstring.
-    """
+    """Queue an envelope"""
     kind = KINDS.get(type(payload))
     if kind is None:
         raise BusError(
@@ -210,16 +136,11 @@ def post(store: ProjectStore, *, subject: Subject, from_role: str, to_role: str,
         from_role=from_role, to_role=to_role, kind=kind, payload=asdict(payload))
 
 
-# -- routing -------------------------------------------------------------------------
+# -- routing
 
 
 def _feature_of(store: ProjectStore, envelope: dict[str, Any]) -> str | None:
-    """The feature order this envelope's subject belongs to, if any.
-
-    For a feature-order subject that is the subject itself; for a work-order subject it
-    is its `parent_id`, which is NULL for the standalone work orders that are nearly all
-    of them.
-    """
+    """The feature order this envelope's subject belongs to, if any"""
     if envelope["subject_fo_id"]:
         return envelope["subject_fo_id"]
     try:
@@ -230,19 +151,7 @@ def _feature_of(store: ProjectStore, envelope: dict[str, Any]) -> str | None:
 
 
 def resolve(store: ProjectStore, envelope: dict[str, Any]) -> str | None:
-    """Which work order fills `to_role` for this envelope's subject? None if nobody.
-
-    PURE with respect to the bus: it reads, it does not write. The routing table is the
-    whole of it —
-
-    | `to_role`     | resolves to                                                  |
-    |---------------|--------------------------------------------------------------|
-    | `implementor` | the subject work order itself                                 |
-    | `manager`     | the `kind='manager'` work order under the subject's feature   |
-
-    A settled work order (completed, cancelled, failed) fills no role: it has no live
-    session to resume, so queueing a message for it would be a message nobody reads.
-    """
+    """Which work order fills `to_role` for this envelope's subject?"""
     to_role = envelope["to_role"]
     if to_role == "implementor":
         wo_id = envelope["subject_wo_id"]
@@ -264,16 +173,11 @@ def resolve(store: ProjectStore, envelope: dict[str, Any]) -> str | None:
     return None  # a send-only role — nobody is listening on it, by design
 
 
-# -- delivery ------------------------------------------------------------------------
+# -- delivery
 
 
 def origin_note(payload: DeferralRequest) -> str:
-    """The `origin_note` a deferral becomes, wherever it is filed from.
-
-    ONE function, called by the router's own filing path and quoted verbatim into the
-    command the manager is handed, because a note whose wording depends on which side
-    filed it is a relationship you cannot query for.
-    """
+    """The `origin_note` a deferral becomes, wherever it is filed from"""
     note = payload.why
     if payload.neo_question_id is not None:
         note = f"{note} (Neo question {payload.neo_question_id})"
@@ -281,30 +185,13 @@ def origin_note(payload: DeferralRequest) -> str:
 
 
 def _q(value: str) -> str:
-    """Double-quote a value for the shell command a recipient is shown.
-
-    Not `shlex.quote`: that switches to single quotes on anything interesting, and the
-    text here is prose read by an agent that has to be able to see its own title in it.
-    """
+    """Double-quote a value for the shell command a recipient is shown"""
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def render(payload: Payload, *, project: str = "",
            origin_wo_id: str | None = None, origin_fo_id: str | None = None) -> str:
-    """The text the recipient's session actually receives.
-
-    Says what happened and nothing about WHO said it: the recipient is never told which
-    entity posted the envelope, because knowing would couple it back. The envelope's
-    SUBJECT is a different thing and it does travel — a manager asked to record which
-    work order suggested a deferral has to be told which work order that is. It learns
-    what the message is about, never who chose to send it.
-
-    The keyword arguments are the router's context, filled in by `deliver`; they only
-    reach a `DeferralRequest`, where they become the exact `jarvis backlog add`
-    invocation the recipient is asked to run. Naming the command rather than describing
-    it is the whole point: prose that says "record where it came from" loses the
-    relationship the first time a manager paraphrases it.
-    """
+    """The text the recipient's session actually receives"""
     if isinstance(payload, ReviewFeedback):
         lines = [f"Review feedback (round {payload.round}): {payload.outcome}.", "",
                  payload.reason]
@@ -314,8 +201,7 @@ def render(payload: Payload, *, project: str = "",
         lines += ["", "Act on this and continue your work order."]
         return "\n".join(lines)
     if isinstance(payload, AssumptionObjection):
-        # §6 of docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-
-        # still-runs.md: a running worker reads this mid-task.
+        # §6 of docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker- still-runs.md: a...
         lines = [f"The OS disagrees with assumption #{payload.assumption_n} you "
                  f"recorded.", "", payload.reason, "",
                  "This is the OS's own reading (Neo), not the user's words, and it "
@@ -354,17 +240,9 @@ def render(payload: Payload, *, project: str = "",
 
 def deliver(store: ProjectStore, central: CentralStore, envelope: dict[str, Any],
             *, project: str = "") -> str:
-    """Route one envelope. Returns its new state.
-
-    `project` is the project's catalog name, needed only to file a backlog item when a
-    deferral has no manager to reach. The daemon knows it authoritatively and passes it;
-    an empty value is resolved from the central project registry, which is what lets a
-    caller holding only a store — `invariants.check_envelopes_move` — route as well.
-    """
+    """Route one envelope"""
     env_id = int(envelope["id"])
-    # Counted before anything can fail, and outside the delivery transaction, so an
-    # envelope that cannot be routed climbs towards the ceiling instead of retrying for
-    # ever (see ProjectStore.bump_envelope_attempt).
+    # Counted before anything can fail
     store.bump_envelope_attempt(env_id)
     try:
         payload = parse_payload(envelope["kind"], envelope["payload"])
@@ -382,9 +260,7 @@ def deliver(store: ProjectStore, central: CentralStore, envelope: dict[str, Any]
                                                           payload, project=project)),
                                source=MESSAGE_SOURCE)
     except Exception as e:  # noqa: BLE001 — one bad envelope must not stop the tick
-        # The transaction rolled back, so the envelope is exactly as it was: still
-        # `queued`, with no message queued against it. It will be retried on the next
-        # tick, and INV-ENVELOPE-STUCK picks it up if the retries never take.
+        # The transaction rolled back, so the envelope is exactly as it was: still `queued`
         log.warning("envelope %s could not be delivered to %s: %s", env_id, target, e)
         return "queued"
     return "delivered"
@@ -392,19 +268,7 @@ def deliver(store: ProjectStore, central: CentralStore, envelope: dict[str, Any]
 
 def nothing_queued_to_manager(store: ProjectStore, fo_id: str,
                               manager_wo_id: str) -> bool:
-    """Has nobody spoken to this feature's manager? §2.2 of docs/superpowers/specs/
-    2026-10-12-a-managers-by-design-idle-is-not-a-standstill.md.
-
-    ONE reading, because two of them is the defect that spec exists to remove.
-    `Daemon._manager_handoff` computed exactly this inline — "one with a queued message,
-    or with the rejection envelope still queued against its feature, has not started" —
-    and `ops.stuck_scan` needs the same answer to tell a manager waiting correctly from
-    one that is stranded. A sweep that disagreed with the nudge would judge an order the
-    daemon was about to wake.
-
-    HERE because this module owns envelopes, `queued` and `ADDRESSABLE_ROLES`: the
-    `to_role == "manager"` string is its vocabulary, not the sweep's.
-    """
+    """Has nobody spoken to this feature's manager? §2.2 of docs/superpowers/specs/..."""
     if store.queued_messages(manager_wo_id):
         return False
     return not any(e["state"] == "queued" and e["to_role"] == "manager"
@@ -414,12 +278,7 @@ def nothing_queued_to_manager(store: ProjectStore, fo_id: str,
 def _context(store: ProjectStore, central: CentralStore, envelope: dict[str, Any],
              payload: Payload, *,
              project: str) -> dict[str, Any]:
-    """What `render` needs beyond the payload, for the kinds that need anything.
-
-    Only a deferral does, and resolving it costs a walk to the feature order and
-    possibly a central lookup — so this stays keyed on the payload type rather than
-    being computed for every envelope the tick delivers.
-    """
+    """What `render` needs beyond the payload, for the kinds that need anything"""
     if not isinstance(payload, DeferralRequest):
         return {}
     return {"project": project or project_name(store, central),
@@ -429,20 +288,7 @@ def _context(store: ProjectStore, central: CentralStore, envelope: dict[str, Any
 
 def _unfilled(store: ProjectStore, central: CentralStore, envelope: dict[str, Any],
               payload: Payload, *, project: str) -> str:
-    """Nobody fills the role. THE ROUTER decides what happens — never the sender.
-
-    Three cases, and they are different verdicts rather than one shrug:
-
-    * a `deferral_request` with no manager — a work order with no parent feature, which
-      is the overwhelmingly common case today — is filed as a backlog item by the router
-      itself. That is exactly today's behaviour, preserved;
-    * `review_feedback` with no implementor (the work order was cancelled or deleted) is
-      `undeliverable`, because feedback that reached nobody must never look like feedback
-      that was acted on;
-    * a manager that exists but is cancelled while its feature is still open is
-      `undeliverable` AND flags the feature: a feature whose manager is gone cannot run
-      its loop, and only the user can decide what to do about that.
-    """
+    """Nobody fills the role"""
     env_id = int(envelope["id"])
     to_role = envelope["to_role"]
 
@@ -463,9 +309,7 @@ def _unfilled(store: ProjectStore, central: CentralStore, envelope: dict[str, An
 
     if envelope["kind"] == "deferral_request" and isinstance(payload, DeferralRequest):
         name = project or project_name(store, central)
-        # The SAME three columns the manager's `jarvis backlog add` invocation fills in.
-        # A relationship that is only recorded on one of the two filing paths is worse
-        # than one recorded on neither: nothing notices until somebody queries it.
+        # The SAME three columns the manager's `jarvis backlog add` invocation fills in
         item = central.add_backlog(
             name, payload.title, payload.description or payload.why,
             origin_wo_id=envelope["subject_wo_id"],
@@ -483,15 +327,5 @@ def _unfilled(store: ProjectStore, central: CentralStore, envelope: dict[str, An
 
 
 def project_name(store: ProjectStore, central: CentralStore) -> str:
-    """The catalog name of the project this store belongs to.
-
-    The daemon passes the name it already holds; this is the fallback for a caller that
-    has only a store, and it is a lookup rather than a guess — the registry maps name to
-    path, so the path resolves back. A project not in the registry falls back to its
-    directory name, which is what `jarvis adopt` would have named it.
-
-    The lookup itself lives on `CentralStore`: the validation panel needs the same answer
-    from the same starting point, and it may not import this module (a panel returns a
-    value; posting is the round machine's job). One implementation, two callers.
-    """
+    """The catalog name of the project this store belongs to"""
     return central.project_name_for_path(store.project_path)

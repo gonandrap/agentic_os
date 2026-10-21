@@ -1,18 +1,4 @@
-"""`jarvis inspect` — where a session's TIME went, and the alarm for a burning turn.
-
-Two halves, and they are tested from opposite ends.
-
-The REPORT is pinned against a real session, `tests/data/transcripts` — the planner of
-fo-306b8f48, reduced to its skeleton by `scripts/redact_transcript.py`. Its three cache
-writes are the reason this module exists (a cold start, a re-write twelve seconds after
-the previous call, a re-write after a 450-second block) and no synthetic file would
-reproduce them except by being told the answer. Every number asserted below was measured
-from the unredacted transcript before this code existed.
-
-The ALARM is tested synthetically, because what matters about it is not arithmetic but
-restraint: it must fire once, on the turn that is still running, and never again after
-the user has put it down.
-"""
+"""`jarvis inspect` — where a session's TIME went, and the alarm for a burning turn"""
 
 from __future__ import annotations
 
@@ -33,26 +19,16 @@ FIXTURE_SESSION = "ec8236c7-b418-4f09-80f0-1edea61f099f"
 
 @pytest.fixture()
 def real_session(monkeypatch):
-    """The committed skeleton of wo-5a6b2d6d's planner session."""
+    """The committed skeleton of wo-5a6b2d6d's planner session"""
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(FIXTURE_ROOT))
     return inspection.read_session(FIXTURE_SESSION)
 
 
-# -- the three findings the command exists to produce ----------------------------------
+# -- the three findings the command exists to produce
 
 
 def test_the_wall_clock_splits_the_way_the_method_says(real_session):
-    """`docs/findings/anatomy-of-an-expensive-turn.md`'s summary table, to the second:
-    1886s of wall clock, 582s blocked on a subagent join, 52s executing tools.
-
-    CORRECTED from 576/58 by issue #845: the session's two foreground `Agent` spans (2.8s
-    and 2.9s) are a JOIN and were being counted as tools the lead ran. Six seconds move
-    between two buckets; the wall clock and the finding's conclusion are unchanged.
-
-    The question that started this: a DESIGN-ONLY agent with three 14-minute turns. A
-    third of it was the lead agent asleep with no API call in flight, which is invisible
-    to every token-based surface Jarvis had.
-    """
+    """`docs/findings/anatomy-of-an-expensive-turn.md`'s summary table"""
     part = real_session.partition()
 
     assert round(part["wall"]) == 1886
@@ -62,11 +38,7 @@ def test_the_wall_clock_splits_the_way_the_method_says(real_session):
 
 
 def test_the_method_s_66_percent_is_generating_plus_idle(real_session):
-    """THE ONE PLACE THIS DEPARTS FROM THE METHOD, and it is a decomposition rather than
-    a disagreement. The method charges everything outside a tool span to the model, which
-    on this session folds in 46 seconds during which no `claude -p` process existed —
-    invisible here, and ELEVEN DAYS on a fleet turn whose work order was parked in
-    `waiting_input`. Split out, the method's figure is still recoverable exactly."""
+    """THE ONE PLACE THIS DEPARTS FROM THE METHOD, and it is a decomposition rather than a disagreement"""
     part = real_session.partition()
 
     assert round(part["generating"] + part["idle"]) == 1252  # the method's number
@@ -75,11 +47,7 @@ def test_the_method_s_66_percent_is_generating_plus_idle(real_session):
 
 
 def test_each_turn_matches_the_method_s_per_turn_table(real_session):
-    """§2: 865s / 139s blocked / 23s tools, then 885s / 443s / 20s, then 136s / 0 / 9s.
-
-    CORRECTED from 136/26 and 440/23 for the reason above (issue #845): each of the first
-    two turns delegated once in the foreground, and those ~3s are a wait, not a tool.
-    """
+    """§2: 865s / 139s blocked / 23s tools, then 885s / 443s / 20s, then 136s / 0 / 9s (#845)"""
     rows = [(round(t.wall), round(t.blocked), round(t.tools))
             for t in real_session.turns]
 
@@ -89,28 +57,25 @@ def test_each_turn_matches_the_method_s_per_turn_table(real_session):
 
 
 def test_the_three_big_writes_are_told_apart_by_cause(real_session):
-    """THE point of the command. Two of these are ~180k tokens each and look identical
-    on a bill; one is the cache expiring and one is a defect, and they have completely
-    different fixes."""
+    """THE point of the command"""
     start = real_session.turns[0].started
     at = {round((w.ts - start) / 60, 2): w for w in real_session.writes}
     assert sorted(at) == [0.04, 14.53, 23.57]
 
     cold, miss, expiry = at[0.04], at[14.53], at[23.57]
     assert (cold.written, cold.read, cold.cause) == (45_169, 0, inspection.COLD_START)
-    # Twelve seconds. NOT the TTL — a resumed turn re-writing a prefix that is still warm.
+    # Twelve seconds
     assert (miss.written, miss.read, miss.cause) == (157_098, 15_862,
                                                      inspection.PREFIX_MISS)
     assert round(miss.gap, 1) == 12.4
-    # 450 seconds, and the cache is a 5-minute one: this one genuinely expired.
+    # 450 seconds, and the cache is a 5-minute one: this one genuinely expired
     assert (expiry.written, expiry.read, expiry.cause) == (193_139, 0,
                                                            inspection.TTL_EXPIRY)
     assert expiry.gap > inspection.TTL_5M
 
 
 def test_every_blocking_join_is_named_by_what_it_waited_on(real_session):
-    """A task id is not an answer. The join is resolved through the subagent meta file
-    Claude Code writes beside the transcript."""
+    """A task id is not an answer"""
     joins = real_session.joins()
 
     assert [round(s.seconds) for s in joins] == [440, 136]
@@ -119,30 +84,20 @@ def test_every_blocking_join_is_named_by_what_it_waited_on(real_session):
 
 
 def test_the_tool_profile_prices_reading_the_whole_codebase(real_session):
-    """§3.6: 55 Bash calls at 0.8s each. Individually invisible, collectively 45 seconds
-    — which is why optimising how an agent searches a codebase would save nothing."""
+    """§3.6: 55 Bash calls at 0.8s each"""
     rows = {r["name"]: r for r in real_session.tool_profile()}
 
     assert rows["Bash"]["calls"] == 55
     assert round(rows["Bash"]["seconds"], 1) == 45.6
     assert round(rows["Bash"]["mean"], 1) == 0.8
-    # The summary table's "58s across 79 calls": the profile counts all 81 tool calls,
-    # and the 2 joins are the ones charged to `blocked` rather than to tool execution.
+    # The summary table's "58s across 79 calls": the profile counts all 81 tool calls
     assert sum(r["calls"] for r in real_session.tool_profile()) == 81
     assert rows["TaskOutput"]["calls"] == 2
     assert rows["TaskOutput"]["seconds"] > rows["Bash"]["seconds"] * 10
 
 
 def test_the_one_hour_cache_was_never_once_requested(real_session):
-    """§3.2, and the finding is a ZERO — a number no surface stated before this one.
-
-    THE METHOD'S ABSOLUTE TOTAL IS WRONG AND ITS CONCLUSION IS NOT. §3.2 reports
-    1,797,566 cache-write tokens; that is the sum over transcript ROWS, and a single
-    assistant message is written once per content block, so it counts the same API
-    response up to three times (the trap `usage._assistant_messages` exists for). Deduped
-    by message id the lead agent wrote 569,173. The ratio the finding rests on — 1h
-    against 5m — is unaffected, because the duplicates inflate both sides equally.
-    """
+    """§3.2, and the finding is a ZERO — a number no surface stated before this one"""
     split = real_session.cache_ttl()
 
     assert split["cache_1h"] == 0
@@ -151,8 +106,7 @@ def test_the_one_hour_cache_was_never_once_requested(real_session):
 
 
 def test_the_peak_context_is_reported_per_turn(real_session):
-    """§1 step 1 asks for it per turn, and per turn is the only grain that answers "how
-    large did the conversation get before that re-write"."""
+    """§1 step 1 asks for it per turn"""
     peaks = [t.context_peak for t in real_session.turns]
 
     assert peaks == sorted(peaks) and peaks[-1] == 233_585
@@ -160,8 +114,7 @@ def test_the_peak_context_is_reported_per_turn(real_session):
 
 
 def test_each_turn_says_why_it_happened(real_session):
-    """Quoted from the injected prompt. A turn Jarvis started for two reasons at once
-    reports both — `Daemon.deliver_messages` coalesces, so one would be a false story."""
+    """Quoted from the injected prompt"""
     kinds = [[t.kind for t in turn.triggers] for turn in real_session.turns]
 
     assert kinds == [["dispatch"],
@@ -171,19 +124,17 @@ def test_each_turn_says_why_it_happened(real_session):
 
 
 def test_the_report_reads_the_same_session_jarvis_cost_does(real_session):
-    """The two commands must cut the session at the same points or they cannot be laid
-    beside each other. Every API call the bill counts lands in exactly one turn."""
+    """The two commands must cut the session at the same points or they cannot be laid beside each other"""
     calls = usage.session_calls(FIXTURE_SESSION)
 
     assert sum(len(t.calls) for t in real_session.turns) == len(calls)
 
 
-# -- the reader's own honesty ----------------------------------------------------------
+# -- the reader's own honesty
 
 
 def test_a_session_with_no_transcript_is_absent_not_empty(monkeypatch, tmp_path):
-    """`jarvis cost`'s rule, held to: an unmeasurable clock and an idle one are
-    different answers."""
+    """`jarvis cost`'s rule, held to: an unmeasurable clock and an idle one are different answers"""
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(tmp_path))
 
     anatomy = inspection.read_session("nothing-here")
@@ -211,8 +162,7 @@ def assistant_row(at: float, mid: str, *, write: int = 0, read: int = 0,
                   ttl_5m: int = 0) -> dict:
     counts: dict = {"input_tokens": 0, "cache_creation_input_tokens": write,
                     "cache_read_input_tokens": read, "output_tokens": 1}
-    # Only written when a test asks for it: most rows in the wild predate the split, and
-    # `one_hour_writes` has to read their absence as "not the expensive write".
+    # Only written when a test asks for it: most rows in the wild predate the split
     if ttl_1h or ttl_5m:
         counts["cache_creation"] = {"ephemeral_1h_input_tokens": ttl_1h,
                                     "ephemeral_5m_input_tokens": ttl_5m}
@@ -260,9 +210,7 @@ def write_transcript(tmp_path, monkeypatch):
 
 
 def test_two_prompts_coalesced_into_one_turn_are_one_turn(write_transcript):
-    """`Daemon.deliver_messages` sends everything queued as ONE turn. Counting prompts
-    instead of turns would double the turn count of every work order that ever had a
-    message arrive while a subagent was finishing."""
+    """`Daemon.deliver_messages` sends everything queued as ONE turn"""
     session = write_transcript("coalesced", [
         prompt_row(1000, "<task-notification>x"),
         prompt_row(1000.02, "[Neo, answering for the user] yes"),
@@ -277,8 +225,7 @@ def test_two_prompts_coalesced_into_one_turn_are_one_turn(write_transcript):
 
 
 def test_a_human_typing_into_a_worker_session_starts_a_turn(write_transcript):
-    """An injected or picked-up session has turns Jarvis never sent. Reading only the
-    `sdk` ones fused a real session's last two days into one 'turn'."""
+    """An injected or picked-up session has turns Jarvis never sent"""
     session = write_transcript("adopted", [
         prompt_row(0, "You are the worker agent for wo-1"),
         assistant_row(10, "m1"),
@@ -293,8 +240,7 @@ def test_a_human_typing_into_a_worker_session_starts_a_turn(write_transcript):
 
 
 def test_a_skill_loading_does_not_cut_a_turn_in_half(write_transcript):
-    """`isMeta` rows are Claude Code talking to itself. One of them sits in the middle
-    of the real fixture's second turn."""
+    """`isMeta` rows are Claude Code talking to itself"""
     session = write_transcript("meta", [
         prompt_row(0, "You are the worker agent for wo-1"),
         assistant_row(10, "m1"),
@@ -307,15 +253,12 @@ def test_a_skill_loading_does_not_cut_a_turn_in_half(write_transcript):
 
 def test_a_turn_ends_at_its_last_api_call_not_at_a_row_written_days_later(
         write_transcript):
-    """A transcript can be appended to long after its last call — an old-transport
-    session picked up by hand under the same id. One such file charged a 21-minute turn
-    with twelve days of wall clock, and every fleet percentile above the median was that
-    gap rather than the work."""
+    """A transcript can be appended to long after its last call"""
     day = 86_400
     session = write_transcript("appended", [
         prompt_row(0, "You are the worker agent for wo-1"),
         assistant_row(60, "m1"),
-        # No prompt row: the rows below are outside anything `usage` can count.
+        # No prompt row: the rows below are outside anything `usage` can count
         {"type": "assistant", "timestamp": stamp(12 * day),
          "message": {"content": [{"type": "text", "text": "much later"}]}},
     ])
@@ -327,8 +270,7 @@ def test_a_turn_ends_at_its_last_api_call_not_at_a_row_written_days_later(
 
 
 def test_an_unfinished_tool_call_is_counted_but_not_timed(write_transcript):
-    """A turn killed mid-call. Reporting zero seconds would subtract exactly the time
-    the reader is hunting for."""
+    """A turn killed mid-call"""
     session = write_transcript("killed", [
         prompt_row(0, "You are the worker agent for wo-1"),
         {"type": "assistant", "timestamp": stamp(10),
@@ -346,19 +288,16 @@ def test_an_unfinished_tool_call_is_counted_but_not_timed(write_transcript):
     assert (row["calls"], row["unfinished"], row["mean"]) == (1, 1, 0.0)
 
 
-# -- a turn nothing was ever observed doing --------------------------------------------
+# -- a turn nothing was ever observed doing
 
 
 def api_call(at: float, output: int = 1) -> usage.Call:
-    """One real, billed API call — what the fifth bucket exists to require."""
+    """One real, billed API call — what the fifth bucket exists to require"""
     return usage.Call(ts=at, model="claude-opus-5", output=output)
 
 
 def test_a_turn_with_no_api_call_is_not_reported_as_generating():
-    """THE REGRESSION (issue 227). `generating` was the remainder of a four-way
-    partition, so a turn that made no call and ran no tool had every second of its wall
-    clock charged to it — rendering identically to a turn that really did generate for
-    an hour. wo-f1ce0f24 turn 3: 65.3 minutes, `gen 100%`, 0 calls, peak 0, $0.00."""
+    """THE REGRESSION (issue 227)"""
     turn = inspection.Turn(seq=1, started=0.0, ended=65 * 60)
 
     assert turn.generating == 0.0
@@ -368,9 +307,7 @@ def test_a_turn_with_no_api_call_is_not_reported_as_generating():
 
 
 def test_a_long_turn_that_really_generated_still_says_generating():
-    """THE NEGATIVE CONTROL, and the half that rots (kn-67364b3a): the new bucket must
-    not be passing by swallowing every long turn. Same wall clock as the case above,
-    with calls to vouch for it."""
+    """THE NEGATIVE CONTROL, and the half that rots (kn-67364b3a): the new bucket must not be passing by..."""
     turn = inspection.Turn(seq=1, started=0.0, ended=65 * 60)
     turn.calls = [api_call(60.0), api_call(64 * 60)]
     turn.active_ended = 64 * 60
@@ -382,8 +319,7 @@ def test_a_long_turn_that_really_generated_still_says_generating():
 
 
 def test_the_partition_still_sums_to_the_wall_clock_with_five_buckets():
-    """A percentage table that no longer adds to 100 is worse than the bug it replaced,
-    and the fifth bucket is exactly the kind of addition that breaks one."""
+    """A percentage table that no longer adds to 100 is worse than the bug it replaced"""
     stalled = inspection.Turn(seq=1, started=0.0, ended=600.0)
     worked = inspection.Turn(seq=2, started=600.0, ended=1_200.0)
     worked.calls = [api_call(900.0)]
@@ -396,7 +332,7 @@ def test_the_partition_still_sums_to_the_wall_clock_with_five_buckets():
     assert part["unaccounted"] == pytest.approx(600.0)
 
 
-# -- classifying a cache write ---------------------------------------------------------
+# -- classifying a cache write
 
 
 def call(at: float, write: int, read: int = 0, cache_1h: int = 0) -> usage.Call:
@@ -405,9 +341,7 @@ def call(at: float, write: int, read: int = 0, cache_1h: int = 0) -> usage.Call:
 
 
 def test_a_small_write_seconds_after_the_last_call_is_the_cache_working():
-    """THE trap this classification has to avoid. Inside a turn every call writes the
-    delta it just added — a short gap, so the gap test alone calls it a prefix-miss. The
-    floor is what makes the label mean something."""
+    """THE trap this classification has to avoid"""
     calls = [call(0, 50_000), call(1, 900), call(2, 1_200)]
     floor = InspectConfig().report_write_floor
 
@@ -417,8 +351,7 @@ def test_a_small_write_seconds_after_the_last_call_is_the_cache_working():
 
 
 def test_a_one_hour_write_is_not_called_a_defect_for_surviving_ten_minutes():
-    """Every Jarvis write before `FORCE_PROMPT_CACHING_5M` was a 1h write. Testing an
-    old transcript against 300 seconds would report an honest expiry as a defect."""
+    """Every Jarvis write before `FORCE_PROMPT_CACHING_5M` was a 1h write"""
     hour = [call(0, 50_000, cache_1h=50_000), call(600, 200_000)]
     five = [call(0, 50_000), call(600, 200_000)]
     floor = InspectConfig().report_write_floor
@@ -427,16 +360,12 @@ def test_a_one_hour_write_is_not_called_a_defect_for_surviving_ten_minutes():
     assert inspection.classify_writes(five, floor)[1].cause == inspection.TTL_EXPIRY
 
 
-# -- the live alarm --------------------------------------------------------------------
+# -- the live alarm
 
 
 def burning(*, wall: float = 0.0, write: int = 0, join: float = 0.0,
             calls: int = 1) -> tuple:
-    """A one-turn anatomy that trips exactly the condition asked for.
-
-    IT MAKES AN API CALL BY DEFAULT, because every alarm below it is about SPEND and a
-    turn with no call has not spent anything (issue 227). `calls=0` is the stalled turn.
-    """
+    """A one-turn anatomy that trips exactly the condition asked for"""
     turn = inspection.Turn(seq=1, started=0.0, ended=wall)
     turn.calls = [api_call(1.0 + n) for n in range(calls)]
     if join:
@@ -465,7 +394,7 @@ def test_each_threshold_raises_its_own_alarm():
 
 
 def awaiting(*, since: float, wall: float, calls: int = 0) -> tuple:
-    """A one-turn anatomy whose last row is an input — a request is in flight."""
+    """A one-turn anatomy whose last row is an input — a request is in flight"""
     turn = inspection.Turn(seq=1, started=since, ended=since + wall)
     turn.awaiting_since = since
     turn.calls = [api_call(since + 1.0 + n) for n in range(calls)]
@@ -473,7 +402,7 @@ def awaiting(*, since: float, wall: float, calls: int = 0) -> tuple:
 
 
 def test_a_turn_whose_last_row_is_an_input_is_awaiting_and_not_stalled():
-    """Spec §1: the absence of an assistant row is a request in flight, not a dead turn."""
+    """Spec §1: the absence of an assistant row is a request in flight, not a dead turn"""
     cfg = InspectConfig()
     anatomy, now = awaiting(since=1_000.0, wall=cfg.alarm_awaiting_minutes * 60 - 60)
 
@@ -482,7 +411,7 @@ def test_a_turn_whose_last_row_is_an_input_is_awaiting_and_not_stalled():
 
 
 def test_past_the_awaiting_threshold_exactly_one_informational_alarm_is_raised():
-    """Spec §2 branch 1."""
+    """Spec §2 branch 1"""
     cfg = InspectConfig()
     anatomy, now = awaiting(since=1_000.0, wall=cfg.alarm_awaiting_minutes * 60 + 60)
 
@@ -495,13 +424,11 @@ def test_past_the_awaiting_threshold_exactly_one_informational_alarm_is_raised()
 
 
 def test_a_billed_turn_awaiting_a_tool_result_still_raises_the_long_turn_alarm():
-    """THE TWO ARE INDEPENDENT, NOT EXCLUSIVE. `awaiting_since` is set on every
-    `tool_result` row, so a healthy turn 27 calls deep is awaiting at the sampling
-    moment — an `elif` here would make `long-turn` unraisable on most running turns."""
+    """THE TWO ARE INDEPENDENT, NOT EXCLUSIVE"""
     cfg = InspectConfig()
     anatomy, now = awaiting(since=1_000.0, wall=cfg.alarm_turn_minutes * 60 + 60,
                             calls=3)
-    # Awaiting only since the last tool result, well inside the awaiting threshold.
+    # Awaiting only since the last tool result, well inside the awaiting threshold
     anatomy.turns[0].awaiting_since = now - 60
 
     kinds = [a.kind for a in inspection.alarms(anatomy, cfg, now=now, dispatched=0.0)]
@@ -510,8 +437,7 @@ def test_a_billed_turn_awaiting_a_tool_result_still_raises_the_long_turn_alarm()
 
 
 def test_a_long_billed_turn_can_raise_both():
-    """Both findings are true at once: it is being billed AND the current request has
-    completed nothing for an hour."""
+    """Both findings are true at once: it is being billed AND the current request has completed nothing..."""
     cfg = InspectConfig()
     anatomy, now = awaiting(since=1_000.0, wall=cfg.alarm_turn_minutes * 60 + 60,
                             calls=3)
@@ -522,7 +448,7 @@ def test_a_long_billed_turn_can_raise_both():
 
 
 def test_the_awaiting_clock_is_the_active_one():
-    """The user's 2026-09-18 ruling: a held order is obeying, not answering slowly."""
+    """The user's 2026-09-18 ruling: a held order is obeying, not answering slowly"""
     cfg = InspectConfig()
     anatomy, now = awaiting(since=1_000.0, wall=cfg.alarm_awaiting_minutes * 60 + 60)
     anatomy.holds = [inspection.Hold(cause="usage_window", started=1_000.0, ended=now)]
@@ -531,9 +457,7 @@ def test_the_awaiting_clock_is_the_active_one():
 
 
 def test_the_stalled_turn_alarm_is_never_raised_live():
-    """Spec §2 branch 2: the evidence for "the work never started" was an absence, and
-    the absence is what this spec proves unreliable. `worker_session.TURN_STALL_SECONDS`
-    judges the PROCESS and still catches a genuinely hung turn."""
+    """Spec §2 branch 2: the evidence for "the work never started" was an absence"""
     cfg = InspectConfig()
     stalled, now = burning(wall=cfg.alarm_turn_minutes * 60 + 1, calls=0)
 
@@ -541,7 +465,7 @@ def test_the_stalled_turn_alarm_is_never_raised_live():
 
 
 def test_a_historical_stalled_turn_row_still_renders():
-    """Spec §2: the kind and its legend stay for the rows already in `wo_alarms`."""
+    """Spec §2: the kind and its legend stay for the rows already in `wo_alarms`"""
     row = {"kind": inspection.STALL_ALARM, "source": "cost"}
 
     assert ops.alarm_kind_label(row, {}) == "stalled-turn"
@@ -549,7 +473,7 @@ def test_a_historical_stalled_turn_row_still_renders():
 
 
 def test_awaiting_is_derived_in_the_walk_read_transcript_already_does(write_transcript):
-    """Spec §1: no second pass, no new file read."""
+    """Spec §1: no second pass, no new file read"""
     session = write_transcript("s", [
         prompt_row(1_000.0, "You are the worker agent for wo-1"),
         assistant_row(1_030.0, "m1"),
@@ -563,7 +487,7 @@ def test_awaiting_is_derived_in_the_walk_read_transcript_already_does(write_tran
 
 
 def test_a_tool_result_reopens_the_wait(write_transcript):
-    """Spec §1: the model is answering again after every tool_result too."""
+    """Spec §1: the model is answering again after every tool_result too"""
     session = write_transcript("s", [
         prompt_row(1_000.0, "You are the worker agent for wo-1"),
         *tool_rows(1_030.0, 1_060.0, "t1", "Bash"),
@@ -575,7 +499,7 @@ def test_a_tool_result_reopens_the_wait(write_transcript):
 
 
 def test_the_turn_dict_carries_awaiting_additively():
-    """Spec §1: the rule `subagents` was added under."""
+    """Spec §1: the rule `subagents` was added under"""
     turn = inspection.Turn(seq=1, started=1_000.0, ended=1_060.0)
     turn.awaiting_since = 1_000.0
 
@@ -586,7 +510,7 @@ def test_the_turn_dict_carries_awaiting_additively():
 
 
 def test_the_awaiting_sentence_is_written_once_for_every_surface():
-    """Spec §1: one formatter, so no surface invents a second vocabulary."""
+    """Spec §1: one formatter, so no surface invents a second vocabulary"""
     turn = inspection.Turn(seq=1, started=1_000.0, ended=1_060.0)
     turn.awaiting_since = 1_000.0
 
@@ -597,16 +521,12 @@ def test_the_awaiting_sentence_is_written_once_for_every_surface():
 
 
 def test_the_stall_is_named_before_the_long_turn_alarm_could_call_it_spend():
-    """A stall must be diagnosable while it is still a stall. Fifteen minutes of silence
-    is already fifteen times the p99 time-to-first-call; the hour the long-turn alarm
-    waits is another forty-five minutes of the user being told nothing."""
+    """A stall must be diagnosable while it is still a stall"""
     assert InspectConfig().alarm_stalled_minutes < InspectConfig().alarm_turn_minutes
 
 
 def test_the_long_turn_alarm_states_what_the_turn_actually_cost():
-    """NO ALARM MAY ASSERT SPEND IT DID NOT READ. The per-turn cost record already
-    existed and no layer consulted it — the supervisor asserted "BILLED IN FULL" in the
-    same sentence as "zero context peak"."""
+    """NO ALARM MAY ASSERT SPEND IT DID NOT READ"""
     cfg = InspectConfig()
     anatomy, now = burning(wall=cfg.alarm_turn_minutes * 60 + 1, calls=3)
 
@@ -617,8 +537,7 @@ def test_the_long_turn_alarm_states_what_the_turn_actually_cost():
 
 
 def test_the_alarm_measures_the_running_turn_against_the_wall_clock():
-    """A turn that is GENERATING has written no row for minutes. Judged against its own
-    last line it reports how long ago it spoke, not how long it has been running."""
+    """A turn that is GENERATING has written no row for minutes"""
     anatomy, _ = burning(wall=60)
     cfg = InspectConfig(alarm_turn_minutes=10)
 
@@ -628,8 +547,7 @@ def test_the_alarm_measures_the_running_turn_against_the_wall_clock():
 
 
 def test_nothing_is_raised_about_a_turn_that_is_already_paid_for():
-    """Only the LAST turn is judged. An alarm about spend the user cannot now prevent is
-    the noise that gets a cost alarm ignored."""
+    """Only the LAST turn is judged"""
     spent = inspection.Turn(seq=1, started=0.0, ended=9_999.0)
     quiet = inspection.Turn(seq=2, started=10_000.0, ended=10_060.0)
     anatomy = inspection.Anatomy(session_id="s", found=True, turns=[spent, quiet])
@@ -639,9 +557,7 @@ def test_nothing_is_raised_about_a_turn_that_is_already_paid_for():
 
 def test_a_join_still_open_past_the_cache_ttl_is_raised_from_the_live_file(
         write_transcript):
-    """End to end, and the one threshold that is principled rather than empirical: past
-    the TTL the prefix is cold, so the wait converts into a re-write. It is what the
-    450-second block in the fixture bought."""
+    """End to end, and the one threshold that is principled rather than empirical: past the TTL the prefix..."""
     session = write_transcript("blocked", [
         prompt_row(0, "You are the worker agent for wo-1"),
         assistant_row(5, "m1"),
@@ -664,8 +580,7 @@ def test_a_join_still_open_past_the_cache_ttl_is_raised_from_the_live_file(
 
 
 def test_a_join_that_came_back_is_not_an_alarm(write_transcript):
-    """Only an OPEN join. A subagent that has already returned cost what it cost and the
-    turn moved on."""
+    """Only an OPEN join"""
     session = write_transcript("returned", [
         prompt_row(0, "You are the worker agent for wo-1"),
         *tool_rows(10, 400, "t1", "TaskOutput", {"task_id": "abc"}),
@@ -674,16 +589,11 @@ def test_a_join_that_came_back_is_not_an_alarm(write_transcript):
     assert inspection.live_alarms(session, InspectConfig(), now=500, dispatched=0.0) == []
 
 
-# -- a foreground delegation is a WAIT, and a hung subagent call is the alarm -----------
-#
-# docs/superpowers/specs/2026-09-29-a-runaway-tool-call-is-not-a-slow-subagent.md,
-# issue #845.
+# -- a foreground delegation is a WAIT, and a hung subagent call is the alarm
 
 
 def test_a_foreground_delegation_is_a_wait_and_not_a_tool_the_lead_ran(write_transcript):
-    """Spec §1. `Agent` returns immediately only when the subagent is BACKGROUNDED; a
-    foreground call blocks the lead until the subagent returns, so its seconds are
-    `blocked` and not `tools`."""
+    """Spec §1"""
     session = write_transcript("delegated", [
         prompt_row(0, "You are the worker agent for wo-1"),
         *tool_rows(10, 130, "t1", "Agent", {"description": "write the spec"}),
@@ -698,8 +608,7 @@ def test_a_foreground_delegation_is_a_wait_and_not_a_tool_the_lead_ran(write_tra
 
 
 def test_a_backgrounded_agent_is_not_a_wait(write_transcript):
-    """The other half of §1, and why `backgrounded` is read from the RAW `tool_use`
-    input: `run_in_background: true` hands the wait to `TaskOutput`."""
+    """The other half of §1, and why `backgrounded` is read from the RAW `tool_use` input:..."""
     session = write_transcript("backgrounded", [
         prompt_row(0, "You are the worker agent for wo-1"),
         *tool_rows(10, 130, "t1", "Agent",
@@ -716,12 +625,7 @@ def test_a_backgrounded_agent_is_not_a_wait(write_transcript):
 
 def delegation_transcript(write_transcript, *, session: str, sub_rows: list[dict],
                           background: bool = False, label: str = "") -> str:
-    """A lead whose foreground `Agent` span is still open, plus one subagent transcript.
-
-    The `Agent` input carries a `description` and no task id, which is what Claude Code
-    actually writes — so the subagent is UNATTACHED and the alarm has to scan the
-    session's anatomies rather than one turn's children.
-    """
+    """A lead whose foreground `Agent` span is still open, plus one subagent transcript"""
     inp: dict = {"description": "write the spec", "subagent_type": "jarvis-spec-writer"}
     if background:
         inp["run_in_background"] = True
@@ -755,9 +659,7 @@ def hung_sub_rows(at: float = 130.0) -> list[dict]:
 
 
 def test_a_working_subagent_raises_nothing_however_long_the_delegation(write_transcript):
-    """Spec §2 test 1, THE REGRESSION GUARD: 43 of the fleet's 272 foreground
-    delegations run past 20 minutes and nearly all of them are real work. Elapsed wait
-    alone is not evidence of a hang."""
+    """Spec §2 test 1, THE REGRESSION GUARD: 43 of the fleet's 272 foreground delegations run past 20..."""
     session = delegation_transcript(write_transcript, session="working",
                                     sub_rows=healthy_sub_rows())
 
@@ -766,8 +668,7 @@ def test_a_working_subagent_raises_nothing_however_long_the_delegation(write_tra
 
 
 def test_a_backgrounded_delegation_is_never_considered_by_the_join_loop(write_transcript):
-    """Spec §2 test 2. Not a join at all, so the hang evidence is never even read — the
-    wait it defers is `TaskOutput`'s."""
+    """Spec §2 test 2"""
     session = delegation_transcript(write_transcript, session="bg-hung",
                                     sub_rows=hung_sub_rows(), background=True)
     anatomy = inspection.read_session(session)
@@ -779,8 +680,7 @@ def test_a_backgrounded_delegation_is_never_considered_by_the_join_loop(write_tr
 
 
 def test_a_hung_subagent_tool_call_raises_one_join_alarm_that_names_it(write_transcript):
-    """Spec §2 tests 3 and §2c: the alarm names the hung TOOL and the subagent it found,
-    which is what issue #845 asks for."""
+    """Spec §2 tests 3 and §2c: the alarm names the hung TOOL and the subagent it found (#845)"""
     cfg = InspectConfig()
     session = delegation_transcript(write_transcript, session="hung",
                                     sub_rows=hung_sub_rows(),
@@ -792,14 +692,13 @@ def test_a_hung_subagent_tool_call_raises_one_join_alarm_that_names_it(write_tra
     assert [a.kind for a in raised] == [inspection.JOIN_ALARM]
     assert "mcp__serena__search_for_pattern" in raised[0].reason
     assert "jarvis-spec-writer" in raised[0].reason
-    # The pattern itself, through `_detail_of` — the bound and the redaction already in
-    # place, and the thing the user needs to see to know what to stop writing.
+    # The pattern itself, through `_detail_of`
     assert HUNG_PATTERN[:20] in raised[0].reason
     assert "jarvis inspect wo-1" in raised[0].reason
 
 
 def test_a_subagent_tool_call_under_the_threshold_is_not_a_hang(write_transcript):
-    """The threshold is a threshold: one minute into an MCP call is normal."""
+    """The threshold is a threshold: one minute into an MCP call is normal"""
     session = delegation_transcript(write_transcript, session="slow-not-hung",
                                     sub_rows=hung_sub_rows())
 
@@ -808,8 +707,7 @@ def test_a_subagent_tool_call_under_the_threshold_is_not_a_hang(write_transcript
 
 
 def test_task_output_still_alarms_on_elapsed_wait_alone(write_transcript):
-    """Spec §2a, unchanged byte for byte: a pure wait with no subagent transcript of its
-    own to inspect, judged on the 5-minute cache TTL."""
+    """Spec §2a, unchanged byte for byte: a pure wait with no subagent transcript of its own to inspect"""
     cfg = InspectConfig()
     session = write_transcript("collected", [
         prompt_row(0, "You are the worker agent for wo-1"),
@@ -826,8 +724,7 @@ def test_task_output_still_alarms_on_elapsed_wait_alone(write_transcript):
 
 
 def synthetic_row(at: float, mid: str, text: str) -> dict:
-    """The zero-token assistant message Claude Code writes ITSELF — the usage-limit
-    notice, and the copy of it laid down beside the next prompt."""
+    """The zero-token assistant message Claude Code writes ITSELF"""
     return {
         "type": "assistant", "timestamp": stamp(at),
         "message": {"id": mid, "model": usage.SYNTHETIC_MODEL,
@@ -837,8 +734,7 @@ def synthetic_row(at: float, mid: str, text: str) -> dict:
     }
 
 
-# wo-c83d7e93's real shape: 66 seconds of work at 08:22, the session limit, then the
-# next turn dispatched at the 11:40 reset.
+# wo-c83d7e93's real shape: 66 seconds of work at 08:22
 LIMIT_HIT, RESET = 30_133.0, 42_008.0
 
 
@@ -854,11 +750,7 @@ def session_limit_transcript(write_transcript, session: str = "limited") -> str:
 
 
 def test_a_turn_the_transcript_has_not_reached_yet_is_not_judged(write_transcript):
-    """THE DISPATCH RACE, and it is the whole of the fleet's `long-turn` history. Between
-    Jarvis opening the turn row and `claude` writing that turn's first row, the last
-    transcript turn is still the PREVIOUS one, so `now - turn.started` measures the
-    inter-turn gap: 197 minutes across a usage-limit window on three orders, 16.2 hours
-    on a fourth parked overnight."""
+    """THE DISPATCH RACE, and it is the whole of the fleet's `long-turn` history"""
     session = write_transcript("raced", [
         prompt_row(LIMIT_HIT, "You are the worker agent for wo-1"),
         assistant_row(LIMIT_HIT + 60, "m1"),
@@ -874,8 +766,7 @@ def test_a_turn_the_transcript_has_not_reached_yet_is_not_judged(write_transcrip
 
 def test_the_alarm_returns_once_the_dispatched_turn_is_in_the_transcript(
         write_transcript):
-    """The guard is evidence, not suppression: the moment the new turn writes its prompt
-    row it is judged, and against its OWN start."""
+    """The guard is evidence, not suppression: the moment the new turn writes its prompt row it is judged"""
     session = session_limit_transcript(write_transcript)
     two_hours = RESET + 2 + 2 * 3600
 
@@ -884,15 +775,12 @@ def test_the_alarm_returns_once_the_dispatched_turn_is_in_the_transcript(
 
     assert [a.kind for a in raised] == [inspection.TURN_ALARM]
     assert "running 120 minutes" in raised[0].reason
-    # "still being billed" now carries what it is billed FOR, so a turn wedged with no
-    # call in flight cannot hide behind the wall clock.
+    # "still being billed" now carries what it is billed FOR
     assert "1 API call, the last one 119m ago" in raised[0].reason
 
 
 def test_a_synthetic_row_is_not_an_api_call_anywhere(write_transcript):
-    """`<synthetic>` is Claude Code writing an assistant message itself and it was never
-    billed, so counting one as a call misreports the turn three ways at once: the call
-    count, the context peak, and — the one that matters — the moment it stopped working."""
+    """`<synthetic>` is Claude Code writing an assistant message itself and it was never billed"""
     session = session_limit_transcript(write_transcript)
 
     first, second = inspection.read_session(session).turns
@@ -905,9 +793,7 @@ def test_a_synthetic_row_is_not_an_api_call_anywhere(write_transcript):
 
 def test_the_dead_gap_after_a_session_limit_is_idle_and_not_generating(
         write_transcript):
-    """The acceptance case. The trailing `<synthetic>` two seconds before the next prompt
-    dragged `active_ended` to the end of the turn, `idle` collapsed to zero, and `jarvis
-    inspect` reported 197.8 minutes of GENERATING for 66 seconds of real work."""
+    """The acceptance case"""
     session = session_limit_transcript(write_transcript)
 
     first, _ = inspection.read_session(session).turns
@@ -925,45 +811,27 @@ def test_the_alarm_can_be_turned_off():
 
 
 def test_the_defaults_are_the_measured_ones():
-    """They are load-bearing: each was set where it fires on a small minority of the
-    fleet's real work orders, and a change to one is a change to how often the user is
-    interrupted. See `catalog.InspectConfig`."""
+    """They are load-bearing: each was set where it fires on a small minority of the fleet's real work..."""
     cfg = InspectConfig()
 
     assert (cfg.alarm_turn_minutes, cfg.alarm_join_seconds,
             cfg.alarm_write_tokens) == (60, 300, 300_000)
-    # The hang evidence behind a foreground delegation's join alarm (issue #845). ONE
-    # opinion about how long a single tool call may take: the same boundary as
-    # `alarm_join_seconds` and as the `MCP_TOOL_TIMEOUT` every worker is launched with.
+    # The hang evidence behind a foreground delegation's join alarm (issue #845)
     assert cfg.alarm_subagent_tool_minutes == 5
     assert cfg.alarm_subagent_tool_minutes * 60 == cfg.alarm_join_seconds
-    # p99 of time-to-first-API-call over the fleet's 4,543 turns is 61 seconds, so this
-    # is fifteen times a slow start and fires on 0.26% of them.
+    # p99 of time-to-first-API-call over the fleet's 4,543 turns is 61 seconds
     assert cfg.alarm_stalled_minutes == 15
-    # The measured slow response was 19 minutes, so anything under the hour would
-    # re-raise the very case the spec exists to stop reporting.
+    # The measured slow response was 19 minutes
     assert cfg.alarm_awaiting_minutes == 60
     assert cfg.alarm_join_seconds == inspection.TTL_5M
-    # The report is deliberately far more talkative than the alarm: the same blocking
-    # join is worth a line at 30s and worth interrupting someone at 300s.
+    # The report is deliberately far more talkative than the alarm: the same blocking join is worth a...
     assert (cfg.report_write_floor, cfg.report_join_floor) == (20_000, 30)
     assert cfg.report_join_floor < cfg.alarm_join_seconds
     assert cfg.report_write_floor < cfg.alarm_write_tokens
 
 
 def test_nothing_in_the_module_hard_codes_a_threshold():
-    """THE MAGIC-NUMBER GUARD, and it is the reason this test is worth its noise: the
-    thresholds are policy and they belong in the catalog, so a later change that reaches
-    for a literal instead of a setting fails here rather than in review.
-
-    WHAT IS EXEMPT IS EVERYTHING THAT IS NOT A CHOICE. `TTL_5M`/`TTL_1H` are the two
-    durations Anthropic's cache actually offers; `1e6` is the unit its prices are quoted
-    in. Neither is a number anyone gets to set, so neither belongs in a catalog — and
-    listing them here rather than widening the rule is what keeps the rule meaning
-    something. `NAMED_SESSIONS` is the one judgement call in the list: it bounds how much
-    of a list an alarm's prose carries, which is a display decision like
-    `DEFAULT_INSPECT_QUOTE_CHARS` and not a condition anything fires on.
-    """
+    """THE MAGIC-NUMBER GUARD, and it is the reason this test is worth its noise: the thresholds are..."""
     import ast
     import inspect as stdlib_inspect
 
@@ -971,15 +839,9 @@ def test_nothing_in_the_module_hard_codes_a_threshold():
     allowed = {0, 1, 2, 4, 60, 300.0, 3600.0,   # indices, seconds-per-minute, the TTLs
                1e6,                             # tokens per million: the price unit
                inspection.NAMED_SESSIONS,       # a display bound, see the docstring
-               # A measurement of the order two files are written in (spec 2026-09-27
-               # §3), not a judgement anyone gets to set — so not a catalog setting.
+               # A measurement of the order two files are written in (spec 2026-09-27 §3)
                inspection.TURN_BIND_TOLERANCE_SECONDS,
-               # The parameter caps (spec §4a) are a STRUCTURAL bound on how big one
-               # report may get, not a per-project judgement about what is expensive —
-               # no catalog wants its own answer to "may this print a megabyte". 6 and
-               # 20 are `autoreview`'s credential-length tests, copied with the shapes.
-               # Same reasoning for the leaf walk's depth bound: a guard against blowing
-               # the stack on a worker's JSON, not a project's choice (review round 2).
+               # The parameter caps (spec §4a) are a STRUCTURAL bound on how big one report may get
                6, 20, inspection._PARAM_WALK_MAX_DEPTH,
                *inspection.PARAM_CAPS.as_dict().values()}
     literals = {node.value for node in ast.walk(tree)
@@ -991,12 +853,11 @@ def test_nothing_in_the_module_hard_codes_a_threshold():
         "a threshold belongs in catalog.InspectConfig, not in the code that reads it")
 
 
-# -- configuration ---------------------------------------------------------------------
+# -- configuration
 
 
 def test_the_thresholds_are_settable_through_the_config_console():
-    """`os.inspect.*`, which `config_version.resolve` picks up reflectively — so
-    `jarvis config set` reaches it with no edit to the console."""
+    """`os.inspect.*`, which `config_version.resolve` picks up reflectively"""
     from jarvis import config_version
 
     cat = catalog.parse_catalog({"os": {"inspect": {"alarm_turn_minutes": 20}},
@@ -1005,18 +866,12 @@ def test_the_thresholds_are_settable_through_the_config_console():
 
     assert cat.os.inspect.alarm_turn_minutes == 20
     assert resolved["os.inspect.alarm_turn_minutes"] == 20
-    # A default, materialised — which is what makes `jarvis config get` able to answer
-    # for a key nobody has ever set.
+    # A default, materialised — which is what makes `jarvis config get` able to answer for a key nobody...
     assert resolved["os.inspect.alarm_write_tokens"] == 300_000
 
 
 def test_a_project_overrides_one_threshold_and_inherits_the_rest(tmp_path):
-    """Field-level inheritance, the shape `_parse_validation` established (kn-6ca2bcd9).
-
-    It matters here because a threshold is a claim about what is NORMAL, and normal
-    differs by project: an hour-long turn is routine where the work is a design document
-    and a symptom where it is a one-file fix.
-    """
+    """Field-level inheritance, the shape `_parse_validation` established (kn-6ca2bcd9)"""
     from jarvis import config_version
 
     cat = catalog.parse_catalog({
@@ -1038,8 +893,7 @@ def test_a_project_overrides_one_threshold_and_inherits_the_rest(tmp_path):
 
 
 def test_the_hang_threshold_is_settable_fleet_wide_and_per_project(tmp_path):
-    """Spec §2 test 5. A project whose MCP server is genuinely slow raises it; the rest
-    of `InspectConfig` still inherits field by field."""
+    """Spec §2 test 5"""
     from jarvis import config_version
 
     cat = catalog.parse_catalog({
@@ -1060,14 +914,12 @@ def test_the_hang_threshold_is_settable_fleet_wide_and_per_project(tmp_path):
                                  "alarm_stalled_minutes", "alarm_awaiting_minutes",
                                  "alarm_subagent_tool_minutes"])
 def test_a_threshold_of_zero_is_refused_rather_than_flagging_everything(key):
-    """Zero would report every write a session makes and flag every work order the fleet
-    runs — and it arrives by a typo in a `jarvis config set`, so it is caught where the
-    message can name the key."""
+    """Zero would report every write a session makes and flag every work order the fleet runs"""
     with pytest.raises(catalog.CatalogError, match=key):
         catalog.parse_catalog({"os": {"inspect": {key: 0}}, "projects": []})
 
 
-# -- the command, and the daemon -------------------------------------------------------
+# -- the command, and the daemon
 
 
 @pytest.fixture()
@@ -1096,9 +948,7 @@ def test_inspect_reports_a_work_order_by_its_session(started, monkeypatch):
 
 
 def test_every_bucket_of_the_partition_has_a_label_on_the_page():
-    """The renderers walk `PARTS` through these, so a bucket missing from either dict
-    renders as silently absent and the percentages stop summing to 100 — the failure the
-    fifth bucket was most likely to introduce (issue 227)."""
+    """The renderers walk `PARTS` through these"""
     from jarvis import cli
 
     assert tuple(cli.PART_LABELS) == inspection.PARTS
@@ -1106,15 +956,7 @@ def test_every_bucket_of_the_partition_has_a_label_on_the_page():
 
 
 def test_the_dashboards_partition_is_keyed_off_parts():
-    """THE THIRD SURFACE THE BRIEF NAMES — and it now exists: `/wo/{p}/{id}/debug` renders
-    an `Anatomy` (spec §7 of docs/superpowers/specs/2026-09-24-order-observability.md), which is the
-    case this test's previous form said to convert it to when it arrived.
-
-    So the pin moves from "the dashboard reads no anatomy" to the property that actually
-    protects a fifth bucket: the page walks `PARTS` and takes its wording from
-    `cli.PART_LABELS`/`PART_SHORT` rather than keeping a list of its own, so a bucket
-    cannot exist in one renderer and be silently absent from the other.
-    """
+    """THE THIRD SURFACE THE BRIEF NAMES (docs/superpowers/specs/2026-09-24-order-observability.md)"""
     import ast
     from pathlib import Path
 
@@ -1138,22 +980,19 @@ def test_the_dashboards_partition_is_keyed_off_parts():
 
 
 def test_the_spend_line_refuses_to_claim_money_for_a_turn_with_no_calls():
-    """The precondition in code, not only in the docstring. `alarms` branches on
-    `Turn.observed` before it gets here, so this is for the SECOND caller: it must fail
-    visibly rather than raise `ValueError` out of `max()` inside a reconcile tick."""
+    """The precondition in code, not only in the docstring"""
     empty = inspection.Turn(seq=1, started=0.0, ended=3_900.0)
 
     said = inspection._spend_so_far(empty, now=3_900.0)
 
     assert "NO API CALL" in said
-    # And it names no figure, so nothing downstream can quote it as spend.
+    # And it names no figure, so nothing downstream can quote it as spend
     assert "$" not in said and "token" not in said
 
 
 def test_the_turn_line_says_no_api_call_before_it_says_anything_about_duration(
         capsys):
-    """Part 2 of issue 227. `0 calls` and `peak 0` were already printed BESIDE a number
-    that contradicted them and nothing reconciled the three."""
+    """Part 2 of issue 227"""
     from jarvis import cli
 
     stalled = inspection.Turn(seq=3, started=0.0, ended=65 * 60)
@@ -1168,7 +1007,7 @@ def test_the_turn_line_says_no_api_call_before_it_says_anything_about_duration(
 
 
 def test_a_turn_awaiting_the_model_is_not_flagged_as_having_made_no_call(capsys):
-    """Spec §1: the flag is a claim about the API, and here a request is in flight."""
+    """Spec §1: the flag is a claim about the API, and here a request is in flight"""
     from jarvis import cli
 
     turn = inspection.Turn(seq=3, started=1_000.0, ended=1_000.0 + 65 * 60)
@@ -1180,7 +1019,7 @@ def test_a_turn_awaiting_the_model_is_not_flagged_as_having_made_no_call(capsys)
     line = next(l for l in capsys.readouterr().out.splitlines() if "turn  3" in l)
 
     assert cli.AWAITING_FLAG in line and cli.NO_CALL_FLAG not in line
-    # One column, so the split after it stays a column whichever flag is printed.
+    # One column, so the split after it stays a column whichever flag is printed
     assert cli.FLAG_WIDTH >= max(len(cli.AWAITING_FLAG), len(cli.NO_CALL_FLAG))
 
 
@@ -1193,8 +1032,7 @@ def test_a_work_order_with_no_session_reports_no_transcript(started):
 
 
 def test_inspect_names_the_biggest_os_side_input_for_the_order(started, capsys):
-    """Spec §3, docs/superpowers/specs/2026-09-26-bounded-model-inputs.md: `jarvis
-    inspect` names the biggest OS-side input for the order it is inspecting."""
+    """Spec §3, docs/superpowers/specs/2026-09-26-bounded-model-inputs.md: `jarvis inspect` names the..."""
     from jarvis import agent_usage, cli
 
     wo = ops.create_work_order("proj_a", "an order Neo answered twice")
@@ -1219,8 +1057,7 @@ def test_inspect_names_the_biggest_os_side_input_for_the_order(started, capsys):
 
 
 def test_an_order_whose_os_calls_measured_nothing_names_none(started):
-    """NEVER a fabricated number: a call recorded before the columns existed reads 0,
-    and 0 is not a size."""
+    """NEVER a fabricated number: a call recorded before the columns existed reads 0, and 0 is not a size"""
     from jarvis import agent_usage
 
     wo = ops.create_work_order("proj_a", "an order from before the sizes existed")
@@ -1234,8 +1071,7 @@ def test_an_order_whose_os_calls_measured_nothing_names_none(started):
 
 def test_a_burning_turn_reaches_the_user_the_way_everything_else_does(
         started, monkeypatch, tmp_path):
-    """The live half. The reconciler already ticks and `jarvis status` already has an
-    attention list; a cost alarm does not get a channel of its own."""
+    """The live half"""
     from jarvis.project_store import ProjectStore
 
     root = tmp_path / "projects"
@@ -1246,18 +1082,16 @@ def test_a_burning_turn_reaches_the_user_the_way_everything_else_does(
 
     store = ProjectStore(ops.find_work_order(wo["id"])[1])
     try:
-        # A turn row is opened `running` before the process is spawned, which is exactly
-        # the state this check exists to look at.
+        # A turn row is opened `running` before the process is spawned
         turn = store.create_turn(wo["id"], "dispatch", "go")
         started_at = turn["started_at"]
         (root / "-proj" / "burning.jsonl").write_text("".join(json.dumps(r) + "\n" for r in [
-            # AFTER the turn row, as `claude` writes it: a transcript turn older than the
-            # dispatch is the PREVIOUS turn and `alarms` refuses to judge one.
+            # AFTER the turn row, as `claude` writes it: a transcript turn older than the dispatch is the...
             prompt_row(started_at + 1, "You are the worker agent for wo-1"),
             assistant_row(started_at + 5, "m1"),
         ]))
         store.update_work_order(wo["id"], status="running", session_id="burning")
-        # Two hours in: past the 60-minute default and still billing.
+        # Two hours in: past the 60-minute default and still billing
         monkeypatch.setattr("jarvis.daemon.time.time", lambda: started_at + 2 * 3600)
         daemon.check_burning_turns(daemon.catalog.projects[0], store)
 
@@ -1267,8 +1101,7 @@ def test_a_burning_turn_reaches_the_user_the_way_everything_else_does(
         assert "still being billed" in flagged["attention_reason"]
         assert len(events) == 1
 
-        # The row and the event are one raise: the row is the identity, the event is
-        # the dedupe memory, and the event's payload points at the row.
+        # The row and the event are one raise: the row is the identity
         alarms = store.alarms_of(wo["id"])
         assert len(alarms) == 1
         assert alarms[0]["id"].startswith("al-")
@@ -1276,16 +1109,13 @@ def test_a_burning_turn_reaches_the_user_the_way_everything_else_does(
         assert alarms[0]["seq"] == 1
         assert json.loads(events[0]["payload"])["alarm_id"] == alarms[0]["id"]
 
-        # AND NEVER AGAIN FOR THIS TURN. The user putting the flag down must not bring
-        # the same sentence back on the next tick — that is how a cost alarm becomes
-        # noise, and then it is worse than nothing.
+        # AND NEVER AGAIN FOR THIS TURN
         store.clear_attention(wo["id"])
         daemon.check_burning_turns(daemon.catalog.projects[0], store)
 
         assert store.get_work_order(wo["id"])["needs_attention"] == 0
         assert len(store.events_of_kind(wo["id"], "cost_alarm")) == 1
-        # The half a single-tick test cannot see, and the one that costs a model call
-        # per tick per alarm once the supervisor reads this table.
+        # The half a single-tick test cannot see
         assert len(store.alarms_of(wo["id"])) == 1
     finally:
         store.close()
@@ -1293,7 +1123,7 @@ def test_a_burning_turn_reaches_the_user_the_way_everything_else_does(
 
 def test_a_slow_response_is_recorded_and_never_escalated(
         started, monkeypatch, tmp_path):
-    """END TO END, spec §2's "what must not escalate means mechanically"."""
+    """END TO END, spec §2's "what must not escalate means mechanically\""""
     from jarvis.project_store import ProjectStore
 
     root = tmp_path / "projects"
@@ -1306,7 +1136,7 @@ def test_a_slow_response_is_recorded_and_never_escalated(
     try:
         turn = store.create_turn(wo["id"], "dispatch", "go")
         at = turn["started_at"]
-        # A prompt and nothing after it: a request is in flight, no block has landed.
+        # A prompt and nothing after it: a request is in flight, no block has landed
         (root / "-proj" / "slow.jsonl").write_text(
             json.dumps(prompt_row(at + 1, "You are the worker agent for wo-1")) + "\n")
         store.update_work_order(wo["id"], status="running", session_id="slow")
@@ -1316,20 +1146,20 @@ def test_a_slow_response_is_recorded_and_never_escalated(
         (alarm,) = store.alarms_of(wo["id"])
         assert alarm["kind"] == inspection.SLOW_RESPONSE_ALARM
         assert alarm["status"] == "informational"
-        # The queue's own predicate is the enforcement — no new filter anywhere.
+        # The queue's own predicate is the enforcement — no new filter anywhere
         assert store.claim_next_alarm() is None
         assert store.get_work_order(wo["id"])["needs_attention"] == 0
-        # The timeline and the dedupe memory are unchanged.
+        # The timeline and the dedupe memory are unchanged
         assert len(store.events_of_kind(wo["id"], "cost_alarm")) == 1
     finally:
         store.close()
 
 
-# -- the review surface: reading the alarms back, and answering one --------------------
+# -- the review surface: reading the alarms back, and answering one
 
 
 def _burning(daemon, monkeypatch, tmp_path, title="the long one"):
-    """One work order with a live `long-turn` alarm against it. Returns its id."""
+    """One work order with a live `long-turn` alarm against it"""
     from jarvis.project_store import ProjectStore
 
     root = tmp_path / "projects"
@@ -1354,9 +1184,7 @@ def _burning(daemon, monkeypatch, tmp_path, title="the long one"):
 
 
 def test_an_alarm_can_be_read_back_off_the_fleet(started, monkeypatch, tmp_path):
-    """`jarvis wo show` puts one alarm on one timeline. Reviewing them is the opposite
-    question — which orders across the fleet have any — and `events_of_kind` cannot
-    answer it without reading every work order there is."""
+    """`jarvis wo show` puts one alarm on one timeline"""
     wo_id = _burning(started, monkeypatch, tmp_path)
 
     rows = ops.list_cost_alarms()
@@ -1366,13 +1194,12 @@ def test_an_alarm_can_be_read_back_off_the_fleet(started, monkeypatch, tmp_path)
     assert rows[0]["project"] == "proj_a"
     assert rows[0]["seq"] == 1
     assert "still being billed" in rows[0]["reason"]
-    # `live` is the ONE derived field: it is a property of the order, not of the event.
+    # `live` is the ONE derived field: it is a property of the order, not of the event
     assert rows[0]["live"] is True
 
 
 def test_acking_answers_the_ask_and_keeps_the_record(started, monkeypatch, tmp_path):
-    """The whole point of the alarm being a timeline event rather than a flag: the user
-    can put the ask down without erasing what the fleet spent."""
+    """The whole point of the alarm being a timeline event rather than a flag: the user can put the ask..."""
     wo_id = _burning(started, monkeypatch, tmp_path)
     ops.ack_attention(wo_id, project_name="proj_a")
 
@@ -1384,8 +1211,7 @@ def test_acking_answers_the_ask_and_keeps_the_record(started, monkeypatch, tmp_p
 
 def test_the_alarms_page_lists_the_live_one_and_offers_the_ack(
         started, monkeypatch, tmp_path):
-    """The dashboard half of the same read. Asserted on the page a user actually gets,
-    not on the context dict, because the ack button is the thing under test."""
+    """The dashboard half of the same read"""
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
 
@@ -1399,7 +1225,7 @@ def test_the_alarms_page_lists_the_live_one_and_offers_the_ack(
     assert "still being billed" in page
     assert f'action="/wo/proj_a/{wo_id}/ack"' in page
     assert 'name="back" value="alarms"' in page
-    # The nav badge counts ORDERS, not events: several alarms on one turn are one ask.
+    # The nav badge counts ORDERS, not events: several alarms on one turn are one ask
     assert 'alarms<span class="nav-badge">1</span>' in page.replace(" <span", "<span")
 
     ack = client.post(f"/wo/proj_a/{wo_id}/ack", data={"back": "alarms"})
@@ -1413,7 +1239,7 @@ def test_the_alarms_page_lists_the_live_one_and_offers_the_ack(
 
 def test_acking_from_the_order_s_own_page_still_lands_there(
         started, monkeypatch, tmp_path):
-    """`back` must not change the behaviour of the button that was already there."""
+    """`back` must not change the behaviour of the button that was already there"""
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
 
@@ -1429,7 +1255,7 @@ def test_acking_from_the_order_s_own_page_still_lands_there(
 
 def test_the_cli_answers_the_same_question_as_the_page(
         started, monkeypatch, tmp_path, capsys):
-    """The CLI is the OS: no dashboard surface may be the only way to read something."""
+    """The CLI is the OS: no dashboard surface may be the only way to read something"""
     from jarvis import cli
 
     wo_id = _burning(started, monkeypatch, tmp_path)
@@ -1444,8 +1270,7 @@ def test_the_cli_answers_the_same_question_as_the_page(
 
 def test_every_alarm_has_an_id_and_one_work_order_s_can_be_read_alone(
         started, monkeypatch, tmp_path, capsys):
-    """PR 159 shipped an alarm with no identity, so "link to THIS alarm" was not
-    expressible. `--wo` is the read a worker makes when it writes its pull request."""
+    """PR 159 shipped an alarm with no identity, so "link to THIS alarm" was not expressible"""
     from jarvis import cli
 
     wo_id = _burning(started, monkeypatch, tmp_path, title="the burning one")
@@ -1455,7 +1280,7 @@ def test_every_alarm_has_an_id_and_one_work_order_s_can_be_read_alone(
 
     assert [r["wo_id"] for r in rows] == [wo_id], "the other order's alarm is not here"
     assert rows[0]["id"].startswith("al-")
-    # Frozen for sections 2, 3 and 5, which are written against these keys.
+    # Frozen for sections 2, 3 and 5, which are written against these keys
     assert rows[0]["alarm_status"] == "raised"
     assert (rows[0]["verdict"], rows[0]["note"], rows[0]["neo_question_id"]) == (
         None, None, None)
@@ -1466,8 +1291,7 @@ def test_every_alarm_has_an_id_and_one_work_order_s_can_be_read_alone(
     assert rows[0]["id"] in out
     assert other not in out
 
-    # And the listing that was already there renders as it did before: the alarm id is
-    # section 4's to put on the surfaces, not this one's.
+    # And the listing that was already there renders as it did before: the alarm id is section 4's to put...
     assert cli.main(["alarms"]) == 0
     every = capsys.readouterr().out
     assert wo_id in every and other in every
@@ -1476,9 +1300,7 @@ def test_every_alarm_has_an_id_and_one_work_order_s_can_be_read_alone(
 
 def test_the_alarm_status_is_not_the_thing_the_page_calls_live(
         started, monkeypatch, tmp_path):
-    """`live` is a property of the ORDER's attention flag. Deriving it from the row's
-    own status instead would make an answered alarm disappear from the ask before the
-    user had put the flag down — and leave it there after they had."""
+    """`live` is a property of the ORDER's attention flag"""
     from jarvis.project_store import ProjectStore
 
     wo_id = _burning(started, monkeypatch, tmp_path)
@@ -1501,21 +1323,14 @@ def test_the_alarm_status_is_not_the_thing_the_page_calls_live(
     assert ops.list_cost_alarms()[0]["live"] is False
 
 
-# -- who is still buying the one-hour write --------------------------------------------
-#
-# Finding 3 of docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md. The
-# value of this reading is entirely in the SPLIT: the same tokens mean a defect in this
-# OS or a person's own session, and those have unrelated fixes.
+# -- who is still buying the one-hour write
 
-#: Before every timestamp below, so `since` is inert unless a test says otherwise.
+#: Before every timestamp below, so `since` is inert unless a test says otherwise
 ALL_OF_IT = -1.0
 
 
 def test_one_transcript_holding_both_halves_is_split_per_turn(write_transcript):
-    """THE CASE THE DESIGN TURNS ON, and it is wo-2df8828c's real shape: a dispatched
-    worker session whose worktree was reopened by hand after the order completed, so one
-    file and one session id hold both. Paired — a reader that classified the FILE rather
-    than each turn would satisfy either half alone."""
+    """THE CASE THE DESIGN TURNS ON, and it is wo-2df8828c's real shape: a dispatched worker session whose..."""
     write_transcript("both", [
         prompt_row(0, "You are the worker agent for wo-1"),
         assistant_row(10, "m1", write=900, ttl_1h=900),
@@ -1530,9 +1345,7 @@ def test_one_transcript_holding_both_halves_is_split_per_turn(write_transcript):
 
 
 def test_a_coalesced_turn_with_one_typed_prompt_is_not_jarvis_s(write_transcript):
-    """`Daemon.deliver_messages` coalesces, so a turn has several triggers. One of them
-    typed means a person was at the keyboard, and `dispatched` is a claim about the
-    PROCESS — getting it wrong accuses the OS of a defect it does not have."""
+    """`Daemon.deliver_messages` coalesces, so a turn has several triggers"""
     write_transcript("mixed", [
         prompt_row(0, "<task-notification>done"),
         prompt_row(0.02, "actually, do this instead", sdk=False),
@@ -1545,11 +1358,7 @@ def test_a_coalesced_turn_with_one_typed_prompt_is_not_jarvis_s(write_transcript
 
 
 def test_a_subagent_inherits_its_parents_classification_either_way(write_transcript):
-    """Subagent transcripts carry NO `promptSource` — measured over every one on this
-    machine, 1,002 user rows and not a single field. So classifying them on their own
-    evidence reads every subagent as a person's, which would hide the breach this exists
-    to catch. Both directions in one test, because inheriting only one of them is
-    indistinguishable from a constant."""
+    """Subagent transcripts carry NO `promptSource`"""
     write_transcript("dispatched-parent", [
         prompt_row(0, "You are the worker agent for wo-1"),
         assistant_row(10, "m1", write=10, ttl_1h=10),
@@ -1567,9 +1376,7 @@ def test_a_subagent_inherits_its_parents_classification_either_way(write_transcr
 
 
 def test_an_unknown_ttl_is_not_counted_as_the_expensive_one(write_transcript):
-    """A row written before Claude Code reported the split has no `cache_creation` at
-    all. Reading that absence as 1h would fire this on every old transcript in the fleet
-    — `usage`'s module note calls the 5-minute rate the floor, and so does this."""
+    """A row written before Claude Code reported the split has no `cache_creation` at all"""
     write_transcript("cheap", [
         prompt_row(0, "hi", sdk=False),
         assistant_row(10, "m1", write=8_000, ttl_5m=8_000),
@@ -1584,9 +1391,7 @@ def test_an_unknown_ttl_is_not_counted_as_the_expensive_one(write_transcript):
 
 
 def test_since_cuts_on_the_write_not_on_the_session(write_transcript):
-    """A session outlives a window: wo-2df8828c's was still being written to four days
-    after its work order completed. So one old write and one new one report only the
-    new one, and the span reported is the WRITES' own."""
+    """A session outlives a window: wo-2df8828c's was still being written to four days after its work..."""
     day = 86_400
     write_transcript("long-lived", [
         prompt_row(0, "hi", sdk=False),
@@ -1606,9 +1411,7 @@ def _arms(session: str, arm: str, *, start: float = -1.0,
 
 @pytest.mark.parametrize("arm", ["1h", "cli"])
 def test_an_hour_bought_on_purpose_is_deliberate_and_not_a_breach(write_transcript, arm):
-    """§5 of docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md: the
-    oracle is the per-turn stamp, so the OS stops accusing itself of a defect it was told
-    to have."""
+    """§5 of docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md: the oracle is the..."""
     write_transcript("armed", [
         prompt_row(0, "You are the worker agent for wo-1"),
         assistant_row(10, "m1", write=9_000, ttl_1h=9_000),
@@ -1621,9 +1424,7 @@ def test_an_hour_bought_on_purpose_is_deliberate_and_not_a_breach(write_transcri
 
 
 def test_the_same_write_on_the_five_minute_arm_is_still_a_breach(write_transcript):
-    """The real fault, and the reason the alarm is not suppressed while an arm runs: a 1h
-    write from a turn stamped `5m` is a plumbing mistake, and the experiment's window is
-    exactly when one is most likely."""
+    """The real fault, and the reason the alarm is not suppressed while an arm runs: a 1h write from a..."""
     write_transcript("control", [
         prompt_row(0, "You are the worker agent for wo-1"),
         assistant_row(10, "m1", write=900_000, ttl_1h=900_000),
@@ -1638,8 +1439,7 @@ def test_the_same_write_on_the_five_minute_arm_is_still_a_breach(write_transcrip
 
 def test_an_unstamped_turn_is_dispatched_because_unknown_is_not_a_licence(
         write_transcript):
-    """Both ways of having no stamp: no index at all, and an index with no interval
-    covering the write."""
+    """Both ways of having no stamp: no index at all, and an index with no interval covering the write"""
     write_transcript("unstamped", [
         prompt_row(0, "You are the worker agent for wo-1"),
         assistant_row(10, "m1", write=900_000, ttl_1h=900_000),
@@ -1654,8 +1454,7 @@ def test_an_unstamped_turn_is_dispatched_because_unknown_is_not_a_licence(
 
 
 def test_a_foreign_write_is_untouched_by_any_arm(write_transcript):
-    """A person's own `claude` is not an arm, so the foreign half and its remedy line are
-    the same whatever the stamp says (spec, out of scope)."""
+    """A person's own `claude` is not an arm"""
     write_transcript("typed", [
         prompt_row(0, "have a look", sdk=False),
         assistant_row(10, "m1", write=900_000, ttl_1h=900_000),
@@ -1670,8 +1469,7 @@ def test_a_foreign_write_is_untouched_by_any_arm(write_transcript):
 
 
 def test_the_breach_alarm_names_the_arm_it_is_about_and_the_hour_bought_on_purpose():
-    """The reason can no longer claim every 1h write breaks a fleet-wide guarantee, and a
-    reader has to be able to see the deliberate total without being alarmed by it."""
+    """The reason can no longer claim every 1h write breaks a fleet-wide guarantee"""
     found = [inspection.HourWrites(session_id="s", directory="-proj",
                                    dispatched=900_000, deliberate=4_000_000,
                                    first_ts=0.0, last_ts=0.0)]
@@ -1684,8 +1482,7 @@ def test_the_breach_alarm_names_the_arm_it_is_about_and_the_hour_bought_on_purpo
 
 
 def test_the_biggest_offender_is_first(write_transcript):
-    """The caller quotes the top of this list into an alarm, so the order is the ranking
-    by what it cost rather than whatever the filesystem returned."""
+    """The caller quotes the top of this list into an alarm"""
     write_transcript("small", [
         prompt_row(0, "hi", sdk=False),
         assistant_row(10, "m1", write=50, ttl_1h=50),
@@ -1699,12 +1496,11 @@ def test_the_biggest_offender_is_first(write_transcript):
         ["big", "small"]
 
 
-# -- tool parameters: redaction, bounds, additivity (spec §4a) -------------------------
+# -- tool parameters: redaction, bounds, additivity (spec §4a)
 
 
 def test_a_private_key_block_is_named_and_never_quoted():
-    """The marker names the SHAPE. Quoting the match would move the credential out of
-    the transcript and into the report — `kn-deef42ea`, one table along."""
+    """The marker names the SHAPE"""
     body = ("-----BEGIN OPENSSH PRIVATE KEY-----\n"
             "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAA\n"
             "-----END OPENSSH PRIVATE KEY-----")
@@ -1763,12 +1559,11 @@ def test_a_credential_assignment_loses_its_value(line, leak):
     "curl https://api.example.com/v1/models",
 ])
 def test_a_line_that_carries_no_credential_is_left_exactly_as_it_is(line):
-    """The negative control. Redacting a placeholder or a mention would make the report
-    useless for the case it exists for: reading what the worker actually ran."""
+    """The negative control"""
     assert inspection.redact_param(line) == line
 
 
-# -- shapes that carry a credential with no credential-named key beside it -------------
+# -- shapes that carry a credential with no credential-named key beside it
 
 
 @pytest.mark.parametrize("line, leak", [
@@ -1780,8 +1575,7 @@ def test_a_line_that_carries_no_credential_is_left_exactly_as_it_is(line):
      "wJalrXUtnFEMI2K7MDENG"),
 ])
 def test_an_inline_credential_assignment_loses_its_value(line, leak):
-    """The commonest way a credential reaches `params["command"]`: an assignment that is
-    not the whole line, in front of the command it is for."""
+    """The commonest way a credential reaches `params["command"]`: an assignment that is not the whole..."""
     out = inspection.redact_param(line)
 
     assert inspection.CREDENTIAL_VALUE_MARKER in out
@@ -1877,8 +1671,7 @@ def test_a_credential_flag_keeps_the_flag_it_was_passed_to():
 
 
 def test_a_bare_token_in_a_bash_command_never_reaches_the_payload(write_transcript):
-    """The transcript-level proof for the shapes that need no assignment: a token with
-    nothing around it naming it, straight into `params["command"]`."""
+    """The transcript-level proof for the shapes that need no assignment: a token with nothing around it..."""
     secret = "ghp_A1b2C3d4E5f6G7h8I9j0"
     session = write_transcript("bare-token", [
         prompt_row(0, "You are the worker agent for wo-1"),
@@ -1905,7 +1698,7 @@ def test_an_inline_assignment_never_reaches_the_payload(write_transcript):
 
 
 def test_a_secret_in_a_bash_command_never_reaches_the_payload(write_transcript):
-    """Redaction runs BEFORE the value is stored, not at render time — spec §4a."""
+    """Redaction runs BEFORE the value is stored, not at render time — spec §4a"""
     secret = "sk-live-0ff1ce9a7b3c2d"
     session = write_transcript("leaky", [
         prompt_row(0, "You are the worker agent for wo-1"),
@@ -1950,8 +1743,7 @@ def test_the_span_cap_drops_the_keys_that_do_not_fit(write_transcript):
 
 
 def test_the_turn_budget_empties_a_later_span_s_params(write_transcript):
-    """Once a turn has spent its budget every later span reports `{}` AND says which
-    keys it dropped — a report that truncates silently is not reproducible."""
+    """Once a turn has spent its budget every later span reports `{}` AND says which keys it dropped"""
     spans = inspection.PARAM_CAPS.per_turn // inspection.PARAM_CAPS.per_span
     rows = [prompt_row(0, "You are the worker agent for wo-1")]
     for i in range(spans + 1):
@@ -1975,7 +1767,7 @@ def test_the_caps_are_stated_in_the_payload(real_session):
 
 
 def test_the_real_session_grows_keys_and_changes_none(real_session):
-    """Additivity against the committed session: `detail` is what it always was."""
+    """Additivity against the committed session: `detail` is what it always was"""
     span = real_session.turns[0].spans[0].as_dict()
 
     assert span["detail"] == "List repo structure"
@@ -1985,14 +1777,14 @@ def test_the_real_session_grows_keys_and_changes_none(real_session):
             "finished"} <= set(span)
 
 
-# -- subagent anatomy (spec §4b) -------------------------------------------------------
+# -- subagent anatomy (spec §4b)
 
 
 TASK = "a7b62083-1111-2222-3333-444455556666"
 
 
 def sub_rows(base: float, *, write: int = 0, read: int = 0) -> list[dict]:
-    """A subagent transcript: one prompt, two calls, one tool span."""
+    """A subagent transcript: one prompt, two calls, one tool span"""
     return [
         prompt_row(base, "do the thing", sdk=False),
         assistant_row(base + 1, "s-m1", write=write, read=read),
@@ -2002,7 +1794,7 @@ def sub_rows(base: float, *, write: int = 0, read: int = 0) -> list[dict]:
 
 
 def parent_rows(task_id: str = TASK, *, tool: str = "TaskOutput") -> list[dict]:
-    """A parent session whose turn 1 joins on `task_id` and whose turn 2 does not."""
+    """A parent session whose turn 1 joins on `task_id` and whose turn 2 does not"""
     return [
         prompt_row(1000, "You are the worker agent for wo-1"),
         assistant_row(1001, "m1", write=30_000),
@@ -2022,7 +1814,7 @@ def write_meta(tmp_path, session_id: str, task_id: str, label: str) -> None:
 
 def test_a_subagent_s_turns_writes_and_peak_hang_off_the_turn_that_joined_it(
         write_transcript, tmp_path):
-    """Spec §4b: the subagent's own anatomy, attached to the parent turn that names it."""
+    """Spec §4b: the subagent's own anatomy, attached to the parent turn that names it"""
     session = write_transcript(
         "nested", parent_rows(),
         subagents={f"agent-{TASK}": sub_rows(1100, write=25_000, read=5_000)})
@@ -2040,9 +1832,7 @@ def test_a_subagent_s_turns_writes_and_peak_hang_off_the_turn_that_joined_it(
 
 
 def test_attaching_a_subagent_changes_no_parent_number(write_transcript, tmp_path):
-    """THE PARTITION RULE (kn-7a2180ba): a subagent is drawn OUT of its parent turn,
-    never added to it. The same session read with and without the transcript present
-    must be identical in every parent figure."""
+    """THE PARTITION RULE (kn-7a2180ba): a subagent is drawn OUT of its parent turn, never added to it"""
     without = inspection.read_session(
         write_transcript("partition-a", parent_rows())).as_dict()
     with_sub = inspection.read_session(write_transcript(
@@ -2062,8 +1852,7 @@ def test_attaching_a_subagent_changes_no_parent_number(write_transcript, tmp_pat
 
 def test_a_subagent_s_prefix_miss_is_never_folded_into_the_parent_s_writes(
         write_transcript):
-    """A parent turn that merely waited on a join did not pay that write — attributing
-    it upward names the wrong turn as the prefix break (spec §4b)."""
+    """A parent turn that merely waited on a join did not pay that write"""
     anatomy = inspection.read_session(write_transcript(
         "own-writes", parent_rows(),
         subagents={f"agent-{TASK}": sub_rows(1100, write=400_000, read=5_000)}))
@@ -2074,14 +1863,11 @@ def test_a_subagent_s_prefix_miss_is_never_folded_into_the_parent_s_writes(
     assert inspection.PREFIX_MISS not in [w.cause for w in anatomy.writes]
 
 
-# -- the floor, named: an empty floored list is never an absence (spec 2026-10-02 §1) --
+# -- the floor, named: an empty floored list is never an absence (spec 2026-10-02 §1)
 
 
 def under_floor_rows(base: float, *, count: int = 6, write: int = 5_000) -> list[dict]:
-    """A subagent of many writes, every one of them under `report_write_floor`.
-
-    wo-fb7c0fc2's `a8e11a7e` shape, scaled: 115 writes, largest 19,381, none at 20,000.
-    """
+    """A subagent of many writes, every one of them under `report_write_floor`"""
     rows: list[dict] = [prompt_row(base, "do the thing", sdk=False)]
     rows += [assistant_row(base + 1 + i, f"u-m{i}", write=write,
                            read=100_000 + 1_000 * i)
@@ -2091,8 +1877,7 @@ def under_floor_rows(base: float, *, count: int = 6, write: int = 5_000) -> list
 
 def test_a_subagent_whose_every_write_is_under_the_floor_reports_the_total_anyway(
         write_transcript):
-    """§1.1: `writes` empty is "nothing AT THAT FLOOR", and the threshold-free figures
-    beside it are the only thing that can say so."""
+    """§1.1: `writes` empty is "nothing AT THAT FLOOR\""""
     anatomy = inspection.read_session(write_transcript(
         "under-floor", parent_rows(),
         subagents={f"agent-{TASK}": under_floor_rows(1100)}))
@@ -2115,8 +1900,7 @@ def test_a_subagent_that_wrote_nothing_is_a_different_answer_from_under_the_floo
 
 
 def test_a_subagent_whose_cache_read_goes_backwards_has_one_boundary(write_transcript):
-    """§1.2: `usage.classify_boundaries` over THIS subagent's calls, reused and not
-    reimplemented."""
+    """§1.2: `usage.classify_boundaries` over THIS subagent's calls, reused and not reimplemented"""
     rows = [prompt_row(1100, "do the thing", sdk=False),
             assistant_row(1101, "b-m1", write=5_000, read=200_000),
             assistant_row(1102, "b-m2", write=5_000, read=1_000)]
@@ -2133,8 +1917,7 @@ def test_a_subagent_whose_cache_read_goes_backwards_has_one_boundary(write_trans
 
 def test_a_continuous_subagent_has_no_boundary_and_a_structural_zero_tax(
         write_transcript):
-    """The structural zero §1.5 must label: a monotonic subagent whose written volume
-    never exceeds its own context peak pays NO re-write tax, by arithmetic."""
+    """The structural zero §1.5 must label: a monotonic subagent whose written volume never exceeds its..."""
     anatomy = inspection.read_session(
         write_transcript("sub-monotonic", parent_rows(),
                          subagents={f"agent-{TASK}": under_floor_rows(1100)}),
@@ -2147,8 +1930,7 @@ def test_a_continuous_subagent_has_no_boundary_and_a_structural_zero_tax(
 
 def test_an_unknown_cold_prefix_floor_is_undecided_and_never_zero_prefix_misses(
         write_transcript):
-    """§1.2: `None` yields `BOUNDARY_UNDECIDED`, so 0 prefix misses can never be read
-    as a finding."""
+    """§1.2: `None` yields `BOUNDARY_UNDECIDED`, so 0 prefix misses can never be read as a finding"""
     rows = [prompt_row(1100, "do the thing", sdk=False),
             assistant_row(1101, "u-m1", write=5_000, read=200_000),
             assistant_row(1500, "u-m2", write=5_000, read=1_000)]
@@ -2162,10 +1944,7 @@ def test_an_unknown_cold_prefix_floor_is_undecided_and_never_zero_prefix_misses(
 
 
 def test_api_call_count_and_the_api_calls_property_can_disagree(write_transcript):
-    """WHY `api_call_count` is a field and not the existing property: a subagent
-    transcript with no prompt row yields NO turns (`read_transcript` opens one only at a
-    prompt), so the property counts 0 calls over 0 turns while two were made. The
-    threshold-free total has to be readable as a rate either way (§1.1)."""
+    """WHY `api_call_count` is a field and not the existing property: a subagent transcript with no prompt..."""
     rows = [assistant_row(1101, "h-m1", write=5_000, read=100_000),
             assistant_row(1102, "h-m2", write=5_000, read=101_000)]
     anatomy = inspection.read_session(write_transcript(
@@ -2177,7 +1956,7 @@ def test_api_call_count_and_the_api_calls_property_can_disagree(write_transcript
 
 
 def test_the_five_new_fields_are_on_the_payload(write_transcript):
-    """`as_dict()` carries them, because the dashboard DERIVES NOTHING (§1.1)."""
+    """`as_dict()` carries them, because the dashboard DERIVES NOTHING (§1.1)"""
     anatomy = inspection.read_session(
         write_transcript("sub-payload", parent_rows(),
                          subagents={f"agent-{TASK}": under_floor_rows(1100)}),
@@ -2190,7 +1969,7 @@ def test_the_five_new_fields_are_on_the_payload(write_transcript):
 
 
 def test_both_rewrite_blocks_have_the_same_keys(write_transcript):
-    """One spelling of that dict (§1.1): two is how one key comes to mean two things."""
+    """One spelling of that dict (§1.1): two is how one key comes to mean two things"""
     anatomy = inspection.read_session(
         write_transcript("rewrite-keys", parent_rows(),
                          subagents={f"agent-{TASK}": under_floor_rows(1100)}),
@@ -2201,8 +1980,7 @@ def test_both_rewrite_blocks_have_the_same_keys(write_transcript):
 
 
 def test_a_subagent_no_span_names_is_unattached_and_on_no_turn(write_transcript):
-    """Issue 227's mistake was inventing a parent the record does not name: no timestamp
-    fallback, so an unnamed subagent is REPORTED as unattached."""
+    """Issue 227's mistake was inventing a parent the record does not name: no timestamp fallback"""
     orphan = "deadbeef-0000-0000-0000-000000000000"
     anatomy = inspection.read_session(write_transcript(
         "orphan", parent_rows(), subagents={f"agent-{orphan}": sub_rows(1100)}))
@@ -2214,8 +1992,7 @@ def test_a_subagent_no_span_names_is_unattached_and_on_no_turn(write_transcript)
 
 def test_a_join_whose_detail_name_joins_already_rewrote_still_attaches(
         write_transcript, tmp_path):
-    """`_name_joins` turns the bare id into "label (id)"; matching the bare string only
-    would drop every labelled subagent — the common case."""
+    """`_name_joins` turns the bare id into "label (id)\""""
     session = write_transcript(
         "renamed", parent_rows(), subagents={f"agent-{TASK}": sub_rows(1100)})
     write_meta(tmp_path, session, TASK, "explorer")
@@ -2235,14 +2012,13 @@ def test_an_agent_span_attaches_as_well_as_a_taskoutput_one(write_transcript):
 
 def test_a_subagent_of_a_subagent_is_counted_and_the_depth_read_is_stated(
         write_transcript, tmp_path):
-    """`_subagent_transcripts` globs ONE level, so say which depth was read rather than
-    implying completeness (spec §4b)."""
+    """`_subagent_transcripts` globs ONE level"""
     session = write_transcript(
         "deep", parent_rows(), subagents={f"agent-{TASK}": sub_rows(1100)})
     deeper = (tmp_path / "projects" / "-proj" / session / "subagents"
               / f"agent-{TASK}" / "subagents")
     deeper.mkdir(parents=True)
-    # TWO, so the count is not trivially satisfied by any non-zero answer.
+    # TWO, so the count is not trivially satisfied by any non-zero answer
     for stem in ("agent-child-one", "agent-child-two"):
         (deeper / f"{stem}.jsonl").write_text(
             "".join(json.dumps(r) + "\n" for r in sub_rows(1150)))
@@ -2255,9 +2031,7 @@ def test_a_subagent_of_a_subagent_is_counted_and_the_depth_read_is_stated(
 
 
 def test_only_the_taskoutput_span_carries_the_task_id_in_a_real_transcript(real_session):
-    """What `_names` can actually join on. An `Agent` span's params are a `description`
-    and nothing else, so the id it spawned is NOT there; the `TaskOutput` span's
-    `task_id` parameter is the only join in the committed transcript."""
+    """What `_names` can actually join on"""
     spawns = [s for s in real_session.spans if s.name in inspection.SPAWN_TOOLS]
     ids = set(real_session.subagent_labels)
 
@@ -2271,8 +2045,7 @@ def test_only_the_taskoutput_span_carries_the_task_id_in_a_real_transcript(real_
 
 
 def test_a_meta_only_directory_adds_nothing_to_the_real_session(real_session):
-    """The committed session has `.meta.json` files and NO subagent transcripts: the new
-    keys must EXIST and be empty. Absent is not zero."""
+    """The committed session has `.meta.json` files and NO subagent transcripts: the new keys must EXIST..."""
     payload = real_session.as_dict()
 
     assert real_session.subagent_labels  # the meta files are there
@@ -2281,12 +2054,11 @@ def test_a_meta_only_directory_adds_nothing_to_the_real_session(real_session):
     assert all(t["subagents"] == [] for t in payload["turns"])
 
 
-# -- `detail` is redacted too (spec §4a, decided on wo-5f4d8611 q687) ------------------
+# -- `detail` is redacted too (spec §4a, decided on wo-5f4d8611 q687)
 
 
 def test_a_secret_in_a_bash_command_never_reaches_the_detail(write_transcript):
-    """`_detail_of` prefers `command`, so an undescribed `Bash` call put the raw command
-    line in the payload while `params` beside it was redacted."""
+    """`_detail_of` prefers `command`"""
     secret = "sk-live-0ff1ce9a7b3c2d"
     anatomy = inspection.read_session(write_transcript("leaky-detail", [
         prompt_row(0, "You are the worker agent for wo-1"),
@@ -2300,8 +2072,7 @@ def test_a_secret_in_a_bash_command_never_reaches_the_detail(write_transcript):
 
 
 def test_detail_is_redacted_before_it_is_truncated(write_transcript):
-    """Order matters: truncating first would cut the header short and print the head of
-    the credential. A cut marker is a cosmetic loss; half a secret is not."""
+    """Order matters: truncating first would cut the header short and print the head of the credential"""
     secret = "sk-live-0ff1ce9a7b3c2dAAAABBBBCCCCDDDDEEEEFFFF"
     command = 'curl -H "Authorization: Bearer ' + secret + '" https://x'
     cfg = InspectConfig(quote_chars=len(command) - 20)
@@ -2314,15 +2085,14 @@ def test_detail_is_redacted_before_it_is_truncated(write_transcript):
 
 
 def test_redacting_detail_changes_nothing_in_the_committed_session(real_session):
-    """The no-op proof: the real session carries no secrets, so every pinned `detail`
-    reads exactly as it always did."""
+    """The no-op proof: the real session carries no secrets"""
     details = [s.detail for t in real_session.turns for s in t.spans]
 
     assert details and all(d == inspection.redact_param(d) for d in details)
     assert real_session.turns[0].spans[0].detail == "List repo structure"
 
 
-# -- the visual pass on `jarvis inspect` (spec §4c) ------------------------------------
+# -- the visual pass on `jarvis inspect` (spec §4c)
 
 
 def rendered(anatomy: inspection.Anatomy, **kwargs) -> None:
@@ -2412,8 +2182,7 @@ def test_a_deeper_subagent_says_its_levels_were_not_read(
 
 def test_an_under_floor_subagent_never_renders_as_no_large_writes(
         write_transcript, capsys):
-    """§1.4: the string `no large writes` is DELETED. An empty floored list reads as a
-    floor, with the threshold-free total in the sentence."""
+    """§1.4: the string `no large writes` is DELETED"""
     session = write_transcript(
         "floor-render", parent_rows(),
         subagents={f"agent-{TASK}": under_floor_rows(1100)})
@@ -2440,7 +2209,7 @@ def test_a_subagent_that_wrote_nothing_says_so(write_transcript, capsys):
 
 def test_a_continuous_subagent_s_zero_tax_is_rendered_as_structural(
         write_transcript, capsys):
-    """§1.4: the zero is the FINDING, worded so it can never read as "nothing here"."""
+    """§1.4: the zero is the FINDING, worded so it can never read as "nothing here\""""
     session = write_transcript("structural-render", parent_rows(),
                                subagents={f"agent-{TASK}": under_floor_rows(1100)})
 
@@ -2452,8 +2221,7 @@ def test_a_continuous_subagent_s_zero_tax_is_rendered_as_structural(
 
 def test_the_unread_depth_line_survives_the_new_states(
         write_transcript, tmp_path, capsys):
-    """`SUBAGENT_DEPTH_READ` stays 1 and the unread-depth labelling q1215 requires
-    stays exactly as it was (§1.4)."""
+    """`SUBAGENT_DEPTH_READ` stays 1 and the unread-depth labelling q1215 requires stays exactly as it was..."""
     session = write_transcript(
         "floor-deep-render", parent_rows(),
         subagents={f"agent-{TASK}": under_floor_rows(1100)})
@@ -2481,13 +2249,11 @@ def test_an_unattached_subagent_gets_its_own_section(write_transcript, capsys):
     assert "no span named" in out and orphan in out
 
 
-# -- nested tool inputs, and values that end at a quote (spec §4a, review round 2) -----
+# -- nested tool inputs, and values that end at a quote (spec §4a, review round 2)
 
 
 def test_a_secret_in_a_nested_edit_never_reaches_the_payload(write_transcript):
-    """A `MultiEdit` input is a list of dicts, so the credential is a LEAF — and before
-    round 2 it was redacted only after `json.dumps`, where neither assignment regex can
-    see it (escaped newlines, one line, quotes in the way)."""
+    """A `MultiEdit` input is a list of dicts, so the credential is a LEAF"""
     session = write_transcript("nested-edit", [
         prompt_row(0, "You are the worker agent for wo-1"),
         *tool_rows(1, 2, "t1", "MultiEdit",
@@ -2509,7 +2275,7 @@ def test_a_secret_in_a_list_of_strings_never_reaches_the_payload(write_transcrip
 
     assert "abc123def456" not in json.dumps(span.as_dict())
     assert "--quiet" in span.params["args"]
-    # Non-string scalars pass through the walk untouched.
+    # Non-string scalars pass through the walk untouched
     assert "7" in span.params["args"] and "null" in span.params["args"]
 
 
@@ -2533,10 +2299,7 @@ def test_a_secret_two_levels_down_in_a_dict_never_reaches_the_payload(write_tran
 ])
 def test_a_credential_under_a_credential_named_key_never_reaches_the_payload(
         write_transcript, payload, leak):
-    """Round 3 blocker 1: `_redact_leaves` redacted key and value as SEPARATE strings, so
-    the name-AND-value test never ran on the pair. None of these values matches a shape,
-    and the dumped `{"password": "hunter2000000"}` matches neither assignment regex — the
-    whole-line one is anchored at ^, the inline one needs `=`. So all four printed."""
+    """Round 3 blocker 1: `_redact_leaves` redacted key and value as SEPARATE strings"""
     session = write_transcript(f"pair-{list(payload)[0]}-{len(leak)}", [
         prompt_row(0, "You are the worker agent for wo-1"),
         *tool_rows(1, 2, "t1", "mcp__deploy__run", payload),
@@ -2548,8 +2311,7 @@ def test_a_credential_under_a_credential_named_key_never_reaches_the_payload(
 
 
 def test_a_placeholder_under_a_credential_named_key_survives_unchanged(write_transcript):
-    """The negative control the pair test must not break: a report that redacts
-    `password=changeme` is useless for reading what the worker actually ran."""
+    """The negative control the pair test must not break: a report that redacts `password=changeme` is..."""
     session = write_transcript("pair-placeholder", [
         prompt_row(0, "You are the worker agent for wo-1"),
         *tool_rows(1, 2, "t1", "mcp__deploy__run", {"password": "changeme"}),
@@ -2560,9 +2322,7 @@ def test_a_placeholder_under_a_credential_named_key_survives_unchanged(write_tra
 
 
 def test_two_keys_that_redact_alike_are_both_kept(write_transcript):
-    """Round 3 follow-up: the dict keys are redacted in a comprehension, so two distinct
-    keys collapsing to one marker silently dropped an entry — against `_params_of`'s
-    promise that every key is kept, shortened or listed as dropped."""
+    """Round 3 follow-up: the dict keys are redacted in a comprehension"""
     walked = inspection._redact_leaves(
         {"TOKEN=abc123def456": 1, "TOKEN=zzz999yyy888": 2})
 
@@ -2572,8 +2332,7 @@ def test_two_keys_that_redact_alike_are_both_kept(write_transcript):
 
 def test_a_leaf_marker_is_not_marked_a_second_time_by_the_serialised_pass(
         write_transcript):
-    """Belt and braces must not read as two findings: the leaf pass and the line pass
-    both see the same text, and the marker must appear ONCE."""
+    """Belt and braces must not read as two findings: the leaf pass and the line pass both see the same..."""
     session = write_transcript("double-mark", [
         prompt_row(0, "You are the worker agent for wo-1"),
         *tool_rows(1, 2, "t1", "Bash", {"parts": ["TOKEN=abc123def456"]}),
@@ -2584,11 +2343,7 @@ def test_a_leaf_marker_is_not_marked_a_second_time_by_the_serialised_pass(
 
 
 def test_a_pathologically_deep_input_is_bounded_and_not_reported():
-    """Round 3 blocker 2: the old version passed only because 40 levels of escaped JSON
-    pushed the secret past `ParamCaps.per_value` — a SHORTER deep input printed it, since
-    `redact_param` cannot match `"TOKEN": "abc123def456"` at all. Walk the value directly
-    so the cap cannot be what hides it: below the bound nothing is reported, and the
-    marker states the bound."""
+    """Round 3 blocker 2: the old version passed only because 40 levels of escaped JSON pushed the secret..."""
     nested: object = {"TOKEN": "abc123def456"}
     for _ in range(inspection._PARAM_WALK_MAX_DEPTH + 2):
         nested = {"next": nested}
@@ -2601,7 +2356,7 @@ def test_a_pathologically_deep_input_is_bounded_and_not_reported():
 
 
 def test_a_nested_input_is_redacted_before_it_is_capped(write_transcript):
-    """Order, not an extra allowance: the walk runs first and `ParamCaps` still bites."""
+    """Order, not an extra allowance: the walk runs first and `ParamCaps` still bites"""
     session = write_transcript("nested-cap", [
         prompt_row(0, "You are the worker agent for wo-1"),
         *tool_rows(1, 2, "t1", "MultiEdit",
@@ -2621,8 +2376,7 @@ def test_a_nested_input_is_redacted_before_it_is_capped(write_transcript):
     ('bash -c "printf %s ${VARS[API_KEY=abc123def456]}"', "abc123def456"),
 ])
 def test_an_assignment_that_ends_at_a_quote_or_bracket_loses_its_value(line, leak):
-    """It used to fail OPEN: the closing quote was captured INTO the value, so the
-    credential test rejected it on a character the shell never gave it (round 2)."""
+    """It used to fail OPEN: the closing quote was captured INTO the value"""
     out = inspection.redact_param(line)
 
     assert inspection.CREDENTIAL_VALUE_MARKER in out
@@ -2638,8 +2392,7 @@ def test_an_assignment_that_ends_at_a_quote_or_bracket_loses_its_value(line, lea
      "sh -c (PASSWORD=<redacted: a credential value> ./deploy)"),
 ])
 def test_the_quote_around_a_redacted_value_survives(line, redacted):
-    """The marker replaces the VALUE only: the redacted line must still read as the
-    command that was run."""
+    """The marker replaces the VALUE only: the redacted line must still read as the command that was run"""
     assert inspection.redact_param(line) == redacted
 
 
@@ -2654,13 +2407,11 @@ def test_a_credential_flag_inside_quotes_loses_its_value(line, leak):
     assert leak not in out
 
 
-# -- binding transcript turns to the OS's own numbering ---------------------------------
-#
-# Spec docs/superpowers/specs/2026-09-27-a-request-in-flight-is-not-a-stalled-turn.md §3.
+# -- binding transcript turns to the OS's own numbering
 
 
 def _numbered(write_transcript, starts: list[float], session: str = "numbered") -> str:
-    """One transcript turn per entry, each with an assistant row so the next one opens."""
+    """One transcript turn per entry, each with an assistant row so the next one opens"""
     rows: list[dict] = []
     for i, at in enumerate(starts):
         rows.append(prompt_row(at, f"<task-notification> turn {i}"))
@@ -2669,13 +2420,11 @@ def _numbered(write_transcript, starts: list[float], session: str = "numbered") 
 
 
 def test_turn_numbers_match_the_turn_files_across_a_compaction(write_transcript):
-    """§3's measured case, wo-dbea82cf: 11 `wo_turns` rows, 10 transcript turns, and the
-    `/compact` turn leaves no prompt row of its own. Every later number shifted by one,
-    so the alarm said turn 11 and `jarvis inspect` said turn 10 about one turn."""
+    """§3's measured case, wo-dbea82cf: 11 `wo_turns` rows"""
     os_starts = [(1, 0.0), (2, 100.0), (3, 200.0), (4, 300.0), (5, 400.0),
                  (6, 420.0), (7, 500.0), (8, 600.0), (9, 700.0), (10, 800.0),
                  (11, 900.0)]
-    # The turn file is written 3-4s before the transcript's prompt row (§3's tolerance).
+    # The turn file is written 3-4s before the transcript's prompt row (§3's tolerance)
     session = _numbered(write_transcript,
                         [4.0, 104.0, 204.0, 304.0, 424.0, 504.0, 604.0, 704.0,
                          804.0, 904.0])
@@ -2688,7 +2437,7 @@ def test_turn_numbers_match_the_turn_files_across_a_compaction(write_transcript)
 
 
 def test_read_session_without_turn_starts_still_numbers_one_to_n(write_transcript):
-    """The regression guard for every existing caller — §3's first rule."""
+    """The regression guard for every existing caller — §3's first rule"""
     session = _numbered(write_transcript, [0.0, 100.0, 200.0], session="plain")
 
     anatomy = inspection.read_session(session)
@@ -2699,8 +2448,7 @@ def test_read_session_without_turn_starts_still_numbers_one_to_n(write_transcrip
 
 
 def test_two_transcript_turns_on_one_os_turn_are_parts_of_it(write_transcript):
-    """§3: the compaction shape read forwards. Both keep the `seq`; `part` tells them
-    apart, and `jarvis inspect` renders part 2 as `turn 1 (continued)`."""
+    """§3: the compaction shape read forwards"""
     session = _numbered(write_transcript, [4.0, 50.0, 104.0], session="parts")
 
     anatomy = inspection.read_session(
@@ -2711,8 +2459,7 @@ def test_two_transcript_turns_on_one_os_turn_are_parts_of_it(write_transcript):
 
 
 def test_a_transcript_turn_before_the_first_os_turn_is_unrecorded(write_transcript):
-    """§3: what an injected or adopted session looks like. Never -1 — `NO_TURN` belongs
-    to `wo_alarms` and this module must not import a store."""
+    """§3: what an injected or adopted session looks like"""
     session = _numbered(write_transcript, [10.0, 104.0], session="injected")
 
     anatomy = inspection.read_session(session, turn_starts=[(1, 100.0)])
@@ -2723,8 +2470,7 @@ def test_a_transcript_turn_before_the_first_os_turn_is_unrecorded(write_transcri
 
 
 def test_an_os_turn_with_no_transcript_turn_is_reported_not_dropped(write_transcript):
-    """§3: the `/compact` case. `Anatomy.unmatched_os_turns` carries it and the renderer
-    prints a line per entry rather than letting the number vanish."""
+    """§3: the `/compact` case"""
     session = _numbered(write_transcript, [4.0, 304.0], session="unmatched")
 
     anatomy = inspection.read_session(
@@ -2735,24 +2481,19 @@ def test_an_os_turn_with_no_transcript_turn_is_reported_not_dropped(write_transc
     assert anatomy.as_dict()["unmatched_os_turns"] == [2, 3]
 
 
-# -- the measurement of the fix: a polled turn against a blocked one -------------------
-#
-# §9 of docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md. The
-# pair is the point: without the negative twin the positive proves only that the fixture
-# is short.
+# -- the measurement of the fix: a polled turn against a blocked one
 
 SUITE_RUN = {"command": "uv run pytest tests/ -q", "run_in_background": True}
 CHECK_INS = (260.0, 500.0, 740.0, 980.0, 1220.0)
 
 
 def _polled_turn(write_transcript) -> str:
-    """Twenty minutes of background suite, collected every four minutes."""
+    """Twenty minutes of background suite, collected every four minutes"""
     rows = [prompt_row(0, "You are the worker agent for wo-1"),
             assistant_row(10, "m0", write=45_000),
             *tool_rows(20, 20.2, "t-launch", "Bash", SUITE_RUN)]
     for i, at in enumerate(CHECK_INS):
-        # Each check-in is inside `TTL_5M` of the previous call, so its own delta write
-        # is a PREFIX_MISS at worst and never an expiry, and the read is charged at 0.1x.
+        # Each check-in is inside `TTL_5M` of the previous call
         rows.append(assistant_row(at - 1, f"m{i + 1}", write=25_000, read=150_000))
         rows.extend(tool_rows(at, at + 1.0, f"t{i}", "BashOutput",
                               {"bash_id": "b51fl7bhe"}))
@@ -2760,12 +2501,11 @@ def _polled_turn(write_transcript) -> str:
 
 
 def _blocked_turn(write_transcript) -> str:
-    """The same twenty minutes as ONE foreground join, and nothing collected."""
+    """The same twenty minutes as ONE foreground join, and nothing collected"""
     return write_transcript("blocked", [
         prompt_row(0, "You are the worker agent for wo-1"),
         assistant_row(10, "m0", write=45_000),
-        # No `tool_result`: the join is still open at `now`, which is the shape every one
-        # of the 85 measured re-writes had.
+        # No `tool_result`: the join is still open at `now`
         {"type": "assistant", "timestamp": stamp(20),
          "message": {"id": "m1", "model": "claude-opus-5",
                      "usage": {"input_tokens": 0, "cache_creation_input_tokens": 0,
@@ -2778,11 +2518,7 @@ def _blocked_turn(write_transcript) -> str:
 
 
 def test_polled_turn_has_no_mid_turn_ttl_expiry(write_transcript):
-    """The fix, measured on the clock it is about: every gap is under `TTL_5M`, so no
-    write in the turn is a `TTL_EXPIRY` and no join is open long enough to alarm.
-
-    Pins the MEASUREMENT, not new code — `inspection` is unchanged — and it is issue
-    868's named acceptance criterion, so it stays green from arrival."""
+    """The fix, measured on the clock it is about: every gap is under `TTL_5M`"""
     anatomy = inspection.read_session(_polled_turn(write_transcript))
     (turn,) = anatomy.turns
 
@@ -2795,11 +2531,7 @@ def test_polled_turn_has_no_mid_turn_ttl_expiry(write_transcript):
 
 
 def test_the_same_twenty_minutes_as_one_join_still_produces_both(write_transcript):
-    """The negative twin. Same wall clock, one blocking call: the conversation is
-    re-sent at the write rate and the OS raises the join alarm that says so.
-
-    Pins the MEASUREMENT of issue 868's fix, not new code: it is what stops the positive
-    twin proving only that its fixture is short."""
+    """The negative twin"""
     anatomy = inspection.read_session(_blocked_turn(write_transcript))
 
     expiries = [w for w in anatomy.writes if w.cause == inspection.TTL_EXPIRY]
@@ -2810,8 +2542,7 @@ def test_the_same_twenty_minutes_as_one_join_still_produces_both(write_transcrip
 
 
 def test_turn_starts_hands_inspection_the_pairs_it_binds_on(started):
-    """`ProjectStore.turn_starts` is the only new read §3 needs: `(seq, started_at)`,
-    in seq order, for `read_session(turn_starts=...)`."""
+    """`ProjectStore.turn_starts` is the only new read §3 needs: `(seq"""
     from jarvis.project_store import ProjectStore
 
     wo = ops.create_work_order("proj_a", "numbered")
@@ -2826,11 +2557,7 @@ def test_turn_starts_hands_inspection_the_pairs_it_binds_on(started):
         store.close()
 
 
-# -- a boundary is classified once, and every turn gets its own -------------------------
-#
-# Spec docs/superpowers/specs/2026-09-29-inspect-boundary-classification.md, issue #867:
-# `Turn.usage` summed `usage.priced()`, which classifies nothing, so every
-# classification key of every turn was structurally zero.
+# -- a boundary is classified once, and every turn gets its own
 
 COLD_FLOOR = 5_000
 
@@ -2843,11 +2570,7 @@ def _compact_boundary_row(at: float, pre: int = 293_382, post: int = 4_697) -> d
 
 @pytest.fixture()
 def three_turns(write_transcript) -> str:
-    """Three turns: an ordinary one, one that COMPACTED, one that came back past the TTL.
-
-    One boundary per cause the session can have, in two different turns — which is the
-    only shape that can tell "attributed to its own turn" from "summed and smeared".
-    """
+    """Three turns: an ordinary one, one that COMPACTED, one that came back past the TTL"""
     return write_transcript("s-boundaries", [
         prompt_row(0.0, "dispatch"),
         assistant_row(5.0, "a", write=200_000, read=0),
@@ -2855,8 +2578,7 @@ def three_turns(write_transcript) -> str:
         prompt_row(60.0, "keep going"),
         assistant_row(65.0, "c", write=5_000, read=203_000),
         _compact_boundary_row(70.0),
-        # Seconds after the summary landed: the static head, and by gap and read alone
-        # indistinguishable from a prefix miss.
+        # Seconds after the summary landed: the static head
         assistant_row(90.0, "d", write=15_380, read=12_776),
         prompt_row(600.0, "after the cache expired"),
         assistant_row(605.0, "e", write=120_000, read=0),
@@ -2864,21 +2586,20 @@ def three_turns(write_transcript) -> str:
 
 
 def test_the_turn_that_compacted_reports_its_own_compacted_boundary(three_turns):
-    """#867's ask, and the only assertion in the issue that was ever about the fix."""
+    """#867's ask, and the only assertion in the issue that was ever about the fix"""
     cfg = InspectConfig(report_write_floor=10_000)
     anatomy = inspection.read_session(three_turns, cfg, cold_prefix_floor=COLD_FLOOR)
 
     assert [t.usage.boundaries_compact for t in anatomy.turns] == [0, 1, 0]
     assert anatomy.turns[1].usage.rewrite_compact_write == 15_380
-    # …and the same write, labelled by the other classifier, on the same turn.
+    # …and the same write, labelled by the other classifier, on the same turn
     compacted = [w for w in anatomy.writes if w.cause == inspection.COMPACTION]
     assert [w.written for w in compacted] == [15_380]
     assert anatomy.turns[1].started <= compacted[0].ts <= anatomy.turns[1].ended
 
 
 def test_a_turn_reports_the_boundary_that_fell_in_it_and_one_context_peak(three_turns):
-    """The per-turn `usage` block's keys were all structurally zero (spec §1.2), and
-    `context_peak` was emitted twice under one name with one of the two always 0."""
+    """The per-turn `usage` block's keys were all structurally zero (spec §1.2)"""
     anatomy = inspection.read_session(three_turns, cold_prefix_floor=COLD_FLOOR)
 
     assert [t.usage.resume_boundaries for t in anatomy.turns] == [0, 1, 1]
@@ -2891,9 +2612,7 @@ def test_a_turn_reports_the_boundary_that_fell_in_it_and_one_context_peak(three_
 
 
 def test_the_session_total_agrees_with_jarvis_cost_and_with_its_own_turns(three_turns):
-    """Two grains and a third surface, laid side by side — the rule
-    `test_the_cohort_script_classifies_boundaries_exactly_as_the_bill_does` already
-    enforces for `scripts/compaction_cohort.py`."""
+    """Two grains and a third surface, laid side by side"""
     anatomy = inspection.read_session(three_turns, cold_prefix_floor=COLD_FLOOR)
     block = anatomy.as_dict()["rewrite"]
     theirs = usage.read_session(three_turns, COLD_FLOOR).total
@@ -2913,14 +2632,12 @@ def test_the_session_total_agrees_with_jarvis_cost_and_with_its_own_turns(three_
     assert summed.resume_boundaries == block["boundaries"]
     assert summed.boundaries_compact == block["compact_boundaries"]
     assert summed.rewrite_ttl_write == block["ttl_write"]
-    # `Usage.__add__` takes the MAX of `context_peak`, so summing turns yields the
-    # session's peak rather than a nonsense total.
+    # `Usage.__add__` takes the MAX of `context_peak`
     assert summed.context_peak == anatomy.as_dict()["context_peak"]
 
 
 def test_an_unknown_floor_counts_every_boundary_and_guesses_no_cause(three_turns):
-    """`jarvis inspect` over a moved catalog must not fail and must not invent the
-    threshold (spec §4, rejected alternative 4). `UNDECIDED` is what that costs."""
+    """`jarvis inspect` over a moved catalog must not fail and must not invent the threshold (spec §4"""
     known = inspection.read_session(three_turns, cold_prefix_floor=COLD_FLOOR)
     anatomy = inspection.read_session(three_turns)
     block = anatomy.as_dict()["rewrite"]
@@ -2929,16 +2646,14 @@ def test_an_unknown_floor_counts_every_boundary_and_guesses_no_cause(three_turns
     assert block["compact_boundaries"] == 1  # rule 2 needs no floor
     assert block["ttl_write"] == 0 and block["prefix_write"] == 0
     assert block["undecided_boundaries"] == block["boundaries"] - 1
-    # The turn whose only boundary was left open: nothing in any write bucket, so the
-    # share is `None` — "not measured", which a renderer must not print as 0%.
+    # The turn whose only boundary was left open: nothing in any write bucket, so the share is `None`
     open_turn = anatomy.turns[2].usage
     assert open_turn.boundaries_undecided == 1 and open_turn.resume_boundaries == 1
     assert open_turn.rewrite_ttl_share is None
 
 
 def test_the_boundary_census_is_printed_and_not_only_in_the_json(three_turns, capsys):
-    """A `--json`-only field nobody can see is half a fix. With the split left open the
-    line says so instead of printing "0 expired", which would read as a finding."""
+    """A `--json`-only field nobody can see is half a fix"""
     rendered(inspection.read_session(three_turns, cold_prefix_floor=COLD_FLOOR))
     assert "boundaries 2 — 0 prefix, 1 expired, 1 compacted" in capsys.readouterr().out
 
@@ -2950,14 +2665,12 @@ def test_the_boundary_census_is_printed_and_not_only_in_the_json(three_turns, ca
 
 
 def test_the_cold_prefix_floor_is_none_when_no_catalog_can_be_reached(jarvis_home):
-    """`ops.inspect_config`'s guarantee: a report over files on disk must not fail
-    because a catalog has moved. Unlike it, this falls back to None and not a number."""
+    """`ops.inspect_config`'s guarantee: a report over files on disk must not fail because a catalog has..."""
     assert ops.cold_prefix_floor() is None
 
 
 def _sealed_before_the_fields(anatomy: inspection.Anatomy) -> dict:
-    """A unit whose subagent carries NO threshold-free figures — the shape every seal
-    written before spec 2026-10-02 §1.1 added them rehydrates to."""
+    """A unit whose subagent carries NO threshold-free figures"""
     unit = {"wo_id": "wo-1", "title": "t", **anatomy.as_dict()}
     for turn in unit["turns"]:
         for sub in turn["subagents"]:
@@ -2969,9 +2682,7 @@ def _sealed_before_the_fields(anatomy: inspection.Anatomy) -> dict:
 
 def test_a_subagent_sealed_before_the_fields_blames_the_seal_not_the_writes(
         write_transcript, capsys):
-    """§1.4's FOURTH state: absent is not zero. `wrote nothing to the cache` over a
-    subagent that wrote 334,427 tokens is worse than the `no large writes` it replaced
-    (wo-fb7c0fc2, a8e11a7e)."""
+    """§1.4's FOURTH state: absent is not zero"""
     from jarvis import cli
 
     session = write_transcript("old-seal-render", parent_rows(),
@@ -2988,7 +2699,7 @@ def test_a_subagent_sealed_before_the_fields_blames_the_seal_not_the_writes(
 
 
 def test_a_measured_zero_still_renders_as_wrote_nothing(write_transcript, capsys):
-    """The state the fourth one must not swallow: `total_written == 0` is measured."""
+    """The state the fourth one must not swallow: `total_written == 0` is measured"""
     from jarvis import cli
 
     session = write_transcript("measured-zero-render", parent_rows(),
@@ -2999,13 +2710,11 @@ def test_a_measured_zero_still_renders_as_wrote_nothing(write_transcript, capsys
     assert cli.SUB_NO_WRITES in out and cli.SUB_NOT_SEALED not in out
 
 
-# -- the navigation reading (spec §3, the cache-anatomy-and-navigation-split) ----------
+# -- the navigation reading (spec §3, the cache-anatomy-and-navigation-split)
 
 
 def test_a_bash_span_is_classified_from_the_raw_input_not_the_detail(write_transcript):
-    """§3: classified from the RAW input, where the command is — `_detail_of` prefers the
-    model's `description`, so a reading taken off `detail` would classify prose. The
-    redacted shape carries no `command` at all and is UNCLASSIFIED, never False."""
+    """§3: classified from the RAW input, where the command is"""
     session = write_transcript("nav-raw", [
         prompt_row(0, "You are the worker agent for wo-1"),
         *tool_rows(1, 2, "t1", "Bash", {"command": "grep -rn total_for src/pricing.py",
@@ -3026,7 +2735,7 @@ def test_a_bash_span_is_classified_from_the_raw_input_not_the_detail(write_trans
 
 
 def nav_rows() -> list[dict]:
-    """2 symbol calls, 3 source reads, 1 text search and 1 bookkeeping read."""
+    """2 symbol calls, 3 source reads, 1 text search and 1 bookkeeping read"""
     return [
         prompt_row(0, "You are the worker agent for wo-1"),
         *tool_rows(1, 2, "s1", "mcp__serena__find_symbol", {"name_path_pattern": "a"}),
@@ -3042,8 +2751,7 @@ def nav_rows() -> list[dict]:
 
 
 def test_the_nav_profile_counts_symbol_calls_and_source_greps(write_transcript):
-    """§3's contract, and `search_for_pattern` is the negative control: a text search
-    wearing a Serena name counts as neither."""
+    """§3's contract, and `search_for_pattern` is the negative control: a text search wearing a Serena..."""
     anatomy = inspection.read_session(write_transcript("nav-profile", nav_rows()))
 
     assert anatomy.nav_profile() == {"symbol_calls": 2, "source_nav_calls": 3,
@@ -3051,9 +2759,7 @@ def test_the_nav_profile_counts_symbol_calls_and_source_greps(write_transcript):
 
 
 def test_a_redacted_transcript_reports_unclassified_not_zero(real_session):
-    """The anti-vacuity test of §3: the committed fixture has NO `command` key anywhere
-    (`scripts/redact_transcript.py` kept only `description`), so its 55 Bash calls cannot
-    be classified — and absent is not zero (issue #227)."""
+    """The anti-vacuity test of §3: the committed fixture has NO `command` key anywhere... (#227)"""
     nav = real_session.nav_profile()
 
     assert nav["unclassified"] == 55
@@ -3061,7 +2767,7 @@ def test_a_redacted_transcript_reports_unclassified_not_zero(real_session):
 
 
 def test_the_tool_profile_is_unchanged_by_the_nav_block(real_session):
-    """§3: `nav_profile()` is a SIBLING of `tool_profile()`, never a replacement."""
+    """§3: `nav_profile()` is a SIBLING of `tool_profile()`, never a replacement"""
     rows = {r["name"]: r for r in real_session.tool_profile()}
 
     assert rows["Bash"]["calls"] == 55
@@ -3072,8 +2778,7 @@ def test_the_tool_profile_is_unchanged_by_the_nav_block(real_session):
 
 
 def test_the_nav_counts_are_printed_in_the_tools_block(write_transcript, capsys):
-    """A `--json`-only field nobody can see is half a fix, and the unclassified count
-    prints as a word rather than as a zero."""
+    """A `--json`-only field nobody can see is half a fix"""
     rows = [*nav_rows(), *tool_rows(8, 9, "b1", "Bash", {"description": "no command"})]
     rendered(inspection.read_session(write_transcript("nav-render", rows)))
     out = capsys.readouterr().out

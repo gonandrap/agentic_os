@@ -1,10 +1,4 @@
-"""Screenshot what a reasonless safety write looks like on /config, for a PR's evidence.
-
-Companion to `screenshot_config_console.py` and seeded the same way — a throwaway
-`JARVIS_HOME` and a temp catalog, never the live OS:
-
-    uv run python scripts/screenshot_config_reasonless_write.py
-"""
+"""Screenshot what a reasonless safety write looks like on /config, for a PR's evidence"""
 
 from __future__ import annotations
 
@@ -22,8 +16,7 @@ PORT = 8798
 
 
 def seed() -> Path:
-    """The production case: a catalog with no validation block anywhere, then the two
-    writes that used to be refused — pinning the default in, and taking it back out."""
+    """The production case: a catalog with no validation block anywhere"""
     from jarvis import ops
     from jarvis.central_store import CentralStore
 
@@ -69,8 +62,7 @@ def shoot() -> None:
         page.wait_for_timeout(200)
         page.screenshot(path=SHOTS / "config-document-only-history.png")
 
-        # The gate that is NOT weakened: a toggle that moves the effective value still
-        # refuses an empty reason box, and the flash now names the command to retry.
+        # The gate that is NOT weakened: a toggle that moves the effective value still refuses an empty...
         page.goto(f"{base}/config?scope=projects.jarvis_os&node=validation")
         row = page.locator("tr", has=page.locator("td", has_text="validation.enabled"))
         row.first.locator("button").click()

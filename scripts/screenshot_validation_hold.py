@@ -1,14 +1,4 @@
-"""Screenshot a validation round HELD by the usage window, for a PR's UI evidence.
-
-Issue #235. The held round is shot BESIDE a round genuinely stuck on the user, because
-the whole claim is that the two no longer read alike: one says a moment, the other asks
-for a decision.
-
-Writes PNGs to docs/screenshots/. Everything it touches lives in a temp `JARVIS_HOME`
-and a temp catalog, so it never reads or writes the live OS:
-
-    uv run python scripts/screenshot_validation_hold.py
-"""
+"""Screenshot a validation round HELD by the usage window, for a PR's UI evidence (#235)"""
 
 from __future__ import annotations
 
@@ -61,8 +51,7 @@ def seed() -> tuple[str, str]:
                     {"round": 1, "cause": "usage_limit", "reopens_at": reopens,
                      "error": REFUSAL})
 
-    # The pair: a round that really did give up and really does want the user. Shot so
-    # the two are compared rather than each believed on its own.
+    # The pair: a round that really did give up and really does want the user
     stuck = store.create_work_order("add the CSV exporter")
     store.set_status(stuck["id"], "needs_review")
     other = store.open_validation_round(wo_id=stuck["id"], fingerprint="1a2b3c4d5e6f7a8b")

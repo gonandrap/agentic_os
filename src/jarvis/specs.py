@@ -1,19 +1,4 @@
-"""A feature order's spec: its sections, its agent profile, and where both are put.
-
-The spec is the feature's one artifact — see
-docs/superpowers/specs/2026-08-29-spec-driven-feature-orders.md. This module owns
-everything the OS does WITH that document once a planner has written it: cutting out the
-section a child implements, cutting out the `Agent profile` appendix, and materialising
-each where a worker's Claude session can reach it.
-
-Split from `sections.py` on purpose. That module is generic markdown surgery with no idea
-what a feature order is; this one knows about plans, work orders and `.jarvis/`, and knows
-nothing about how a heading is found.
-
-**Everything here degrades to None or a no-op.** A feature with no spec, a spec with no
-agent profile, a `.jarvis/` that will not take a write — none of those may stop a work
-order dispatching (§3 of the spec).
-"""
+"""A feature order's spec: its sections, its agent profile, and where both are put (docs/superpowers/specs/2026-08-29-spec-driven-feature-orders.md)"""
 
 from __future__ import annotations
 
@@ -30,31 +15,23 @@ if TYPE_CHECKING:  # pragma: no cover
 
 log = logging.getLogger(__name__)
 
-#: The appendix every spec must carry. Matched as a heading substring, case-insensitively,
-#: by `sections.extract_section` — so "## Appendix: Agent profile" and "## Agent Profile"
-#: both resolve, and the planner is not made to reproduce a heading byte for byte.
+#: The appendix every spec must carry
 AGENT_PROFILE = "Agent profile"
 
-#: Shortest agent profile that is a profile rather than a placeholder. A heading with one
-#: line under it would produce an agent definition whose whole persona is its own title.
+#: Shortest agent profile that is a profile rather than a placeholder
 MIN_PROFILE_CHARS = 120
 
-#: Filesystem-safe slug for the generated agent's `name:`. Feature-order ids are already
-#: `fo-<hex>`, so this only ever has work to do if id minting changes.
+#: Filesystem-safe slug for the generated agent's `name:`
 _SLUG_RE = re.compile(r"[^a-z0-9-]+")
 
 
 def feature_dir(project_path: Path, fo_id: str) -> Path:
-    """Where everything materialised for one feature lives.
-
-    Under the project's gitignored `.jarvis/` tree rather than in any worktree: a child
-    branches from the default branch, and the spec is on the PLANNER's unmerged branch.
-    """
+    """Where everything materialised for one feature lives"""
     return project_path / ".jarvis" / "features" / fo_id
 
 
 def agent_root(project_path: Path, fo_id: str) -> Path:
-    """The directory handed to `--add-dir` so `--add-dir/.claude/agents/` is found."""
+    """The directory handed to `--add-dir` so `--add-dir/.claude/agents/` is found"""
     return feature_dir(project_path, fo_id) / "agent"
 
 
@@ -63,17 +40,12 @@ def agent_name(fo_id: str) -> str:
 
 
 def agent_profile(doc_text: str) -> str:
-    """The spec's `Agent profile` appendix, or "" when it has none."""
+    """The spec's `Agent profile` appendix, or "" when it has none"""
     return (sections.extract_section(doc_text or "", AGENT_PROFILE) or "").strip()
 
 
 def profile_problems(doc_text: str) -> list[str]:
-    """Why this spec cannot produce an agent type. Empty when it can.
-
-    Separate from `agent_profile` because the two callers want different things: the
-    plan validator wants the reason to hand back to the planner, and dispatch wants the
-    text or nothing.
-    """
+    """Why this spec cannot produce an agent type"""
     profile = agent_profile(doc_text)
     if not profile:
         return [
@@ -93,12 +65,7 @@ def profile_problems(doc_text: str) -> list[str]:
 
 
 def render_agent(fo_id: str, title: str, profile: str) -> str:
-    """The agent definition file's bytes.
-
-    NO `tools:` key, and that is the decision rather than the omission: kn-44fb3e42
-    established that `tools:` is enforced by the CLI, and a child worker needs every tool
-    it would otherwise have. See §3 of the design document.
-    """
+    """The agent definition file's bytes"""
     name = agent_name(fo_id)
     desc = (title or fo_id).replace("\n", " ").strip()[:180]
     body = profile.strip()
@@ -113,12 +80,7 @@ def render_agent(fo_id: str, title: str, profile: str) -> str:
 
 def install_agent(project_path: Path, fo_id: str, title: str,
                   doc_text: str) -> str | None:
-    """Write the feature's agent definition; return its name, or None.
-
-    Idempotent — the same bytes are rewritten on every dispatch, so a definition someone
-    deleted heals itself and a feature released before this existed acquires one on its
-    next dispatch (§3, "Lifecycle").
-    """
+    """Write the feature's agent definition; return its name, or None"""
     profile = agent_profile(doc_text)
     if not profile:
         return None
@@ -128,18 +90,14 @@ def install_agent(project_path: Path, fo_id: str, title: str,
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(render_agent(fo_id, title, profile))
     except OSError as e:
-        # A persona is never worth a work order: §3, "Degradation is silent and total".
+        # A persona is never worth a work order: §3, "Degradation is silent and total"
         log.warning("could not write the agent type for %s: %s", fo_id, e)
         return None
     return name
 
 
 def remove_agent(project_path: Path, fo_id: str) -> bool:
-    """Drop the feature's agent type. True when there was one to drop.
-
-    Called when the feature order settles. The spec snapshot stays in the plan, so
-    `jarvis fo agent <fo-id>` can rebuild it.
-    """
+    """Drop the feature's agent type"""
     root = agent_root(project_path, fo_id)
     if not root.exists():
         return False
@@ -148,7 +106,7 @@ def remove_agent(project_path: Path, fo_id: str) -> bool:
 
 
 def plan_of(store: ProjectStore, fo_id: str) -> dict[str, Any]:
-    """The feature's stored plan, or `{}` for anything missing or unplanned."""
+    """The feature's stored plan, or `{}` for anything missing or unplanned"""
     try:
         fo = store.get_feature_order(fo_id)
     except KeyError:
@@ -157,17 +115,7 @@ def plan_of(store: ProjectStore, fo_id: str) -> dict[str, Any]:
 
 
 def _plan_section_for_title(plan: dict[str, Any], title: str) -> str:
-    """The section the plan's item of this TITLE names, or "" when it does not resolve.
-
-    The title is the only join that exists: `create_plan_children` keeps no plan key on
-    the work-order row and `work_orders` has no `plan_key` column.
-
-    EXACT AND UNIQUE, on the user's ruling on Neo question 1690. No normalisation, no
-    prefix, no fuzzy comparison, and two plan children of one title resolve to nothing —
-    a near-match writes the WRONG section into a column four readers trust, and the
-    assumption reviewer then cites it as authority. Nothing is the behaviour of today,
-    which is merely unhelpful.
-    """
+    """The section the plan's item of this TITLE names, or "" when it does not resolve"""
     if not title:
         return ""
     found = [str(c.get("spec_section") or "").strip()
@@ -177,20 +125,7 @@ def _plan_section_for_title(plan: dict[str, Any], title: str) -> str:
 
 
 def spec_of(store: ProjectStore, wo: dict[str, Any]) -> dict[str, str] | None:
-    """This work order's spec, section included, or None.
-
-    The single lookup behind three readers — the worker's prompt, the materialised
-    section file and the validation panel's packet — so none of them can disagree about
-    which section a child was given. Returns `repo_path`, `content` (the whole spec),
-    `section` (its heading name or number, as the plan wrote it) and `section_text` (the
-    extracted section, "" when it does not resolve).
-
-    A planner or a manager has no section of its own: both own the whole feature.
-
-    An empty `work_orders.spec_section` falls back to the parent plan's item and HEALS the
-    row, so the four readers and the row itself cannot disagree. Spec §2.1 of
-    docs/superpowers/specs/2026-10-13-an-assumption-review-payload-carries-its-spec-section.md
-    """
+    """This work order's spec, section included, or None (docs/superpowers/specs/2026-10-13-an-assumption-review-payload-carries-its-spec-section.md)"""
     if not wo.get("parent_id") or wo.get("kind") in ("planner", "manager"):
         return None
     plan = plan_of(store, wo["parent_id"])
@@ -209,17 +144,7 @@ def spec_of(store: ProjectStore, wo: dict[str, Any]) -> dict[str, str] | None:
 
 
 def spec_link(store: ProjectStore, wo: dict[str, Any]) -> dict[str, str] | None:
-    """Where this order's spec can be READ. None for a standalone work order.
-
-    Any order with a parent — planner, manager or child — §5(a) of
-    docs/superpowers/specs/2026-09-28-a-feature-spec-you-can-open.md. Deliberately NOT
-    `spec_of`, which answers None for a planner by design and must keep doing so: three
-    readers depend on "a planner has no section of its own".
-
-    Returns `fo_id`, `repo_path`, `source` (the revision, "" when the plan predates it
-    being recorded) and `anchor` — "" unless a child's `spec_section` resolves. It
-    carries NO content: the page is the pointer, not a second copy.
-    """
+    """Where this order's spec can be READ (docs/superpowers/specs/2026-09-28-a-feature-spec-you-can-open.md)"""
     from .ui import markdown  # stdlib-only module; no FastAPI, no Jinja
 
     fo_id = str(wo.get("parent_id") or "")
@@ -239,15 +164,7 @@ def spec_link(store: ProjectStore, wo: dict[str, Any]) -> dict[str, str] | None:
 
 def materialize(project_path: Path, fo_id: str, wo_id: str,
                 spec: dict[str, str]) -> dict[str, str]:
-    """Write the spec and this child's section under `.jarvis/`; return the paths.
-
-    Two files, and the ORDER they are named to the worker is the token saving: the
-    section is what the child is meant to read, and the whole spec is the wider context
-    it reaches for only when the section is not enough (§4).
-
-    Keys present only when the corresponding write succeeded, so a caller that renders
-    `spec.get("section_path")` degrades to naming the document alone.
-    """
+    """Write the spec and this child's section under `.jarvis/`; return the paths"""
     out: dict[str, str] = {"repo_path": spec["repo_path"]}
     root = feature_dir(project_path, fo_id)
     try:

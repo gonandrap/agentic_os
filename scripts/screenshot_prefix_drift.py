@@ -1,14 +1,4 @@
-"""Screenshot a work order whose prompt prefix moved, for a PR's UI evidence.
-
-Finding 4 action 1. The `prefix_drift` event has ONE surface — the work order's
-timeline — so what `timeline._describe` renders is the whole of what a reader ever sees
-of it, and its detail line is long enough to be a wrapping question rather than a
-string-assertion one. `scripts/screenshot_wo_alarm_record.py` is the shape this copies;
-everything lives in a temp `JARVIS_HOME` and a temp catalog, so it never touches the
-live OS.
-
-    uv run python scripts/screenshot_prefix_drift.py
-"""
+"""Screenshot a work order whose prompt prefix moved, for a PR's UI evidence"""
 
 from __future__ import annotations
 
@@ -26,8 +16,7 @@ PORT = 8799
 
 
 def seed() -> str:
-    """One order carrying both shapes of the event: a version that moved, which is
-    quoted, and a digest that moved, which is not."""
+    """One order carrying both shapes of the event: a version that moved"""
     from jarvis import ops
     from jarvis.central_store import CentralStore
     from jarvis.project_store import ProjectStore

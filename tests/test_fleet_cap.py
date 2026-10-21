@@ -1,18 +1,4 @@
-"""The account, which is not a project (src/jarvis/fleet.py).
-
-On 2026-09-02 every ready child of fo-6269be9a was dispatched at once. Three of the four
-paid 51-72 seconds of Opus time to be told the session window was already spent, and when
-it reopened all four resumed in the same second — 362k + 361k + 325k + 322k tokens
-re-written at the cache-WRITE rate, and four `uv run pytest` runs on one machine.
-
-Two mechanisms, tested separately because they fail separately:
-  * a cap on worker turns in flight, fleet-wide, because the limit is the ACCOUNT's
-  * a hold on dispatch while Claude is refusing turns, to the reset the refusal named
-
-The refusal itself was already recognised (`worker_session.turn_pause`, and
-test_rate_limit_retry.py); what was missing is that ONE work order learning the window is
-spent tells the OS nothing about the other three.
-"""
+"""The account, which is not a project (src/jarvis/fleet.py)"""
 
 from __future__ import annotations
 
@@ -29,13 +15,10 @@ from jarvis.daemon import Daemon
 from jarvis.project_store import ProjectStore
 from jarvis.testing import make_git_project
 
-#: The refusal all four workers got, verbatim off their turn results.
+#: The refusal all four workers got, verbatim off their turn results
 REFUSAL = "You've hit your session limit · resets 11:40am (America/Los_Angeles)"
 
-#: The incident, as `.jarvis/turns/<wo>/<seq>.json` recorded it: when the turn ended, and
-#: how much API time it had already billed. Three of the four are NOT the free 0ms/$0
-#: refusal the usage-limit path was designed around — they ran a minute of Opus first,
-#: which is exactly the spend a fleet-wide hold exists to stop the siblings repeating.
+#: The incident, as `.jarvis/turns/<wo>/<seq>.json` recorded it: when the turn ended
 INCIDENT = [
     ("wo-0a512472", "2026-09-02T15:23:16Z", 51940, 0.61),
     ("wo-c83d7e93", "2026-09-02T15:23:17Z", 59347, 1.00),
@@ -67,26 +50,21 @@ def _catalog(tmp_path, projects: dict[str, object], max_in_flight: int | None = 
 
 @pytest.fixture()
 def two_projects(tmp_path, claude_json, project):
-    """A catalog with a second project, so "fleet-wide" is more than a claim."""
+    """A catalog with a second project, so "fleet-wide" is more than a claim"""
     other = make_git_project(tmp_path, "proj_b")
     claude_json(other)
     return project, other
 
 
 def _tick(daemon):
-    """One tick with the retry pass ON (the daemon runs it every RETRY_EVERY_TICKS)."""
+    """One tick with the retry pass ON (the daemon runs it every RETRY_EVERY_TICKS)"""
     daemon.tick_count = 0
     daemon.tick()
 
 
 def _refuse(store: ProjectStore, wo_id: str, ended: float, api_ms: int,
             error: str = REFUSAL):
-    """The turn the CLI refused, recorded the way `worker_session.poll` records it.
-
-    `ended_at` is written directly because `finish_turn` stamps the wall clock, and the
-    whole point of replaying 2026-09-02 is that the reset is resolved against the moment
-    the turn ENDED rather than against the clock of whoever is asking.
-    """
+    """The turn the CLI refused, recorded the way `worker_session.poll` records it"""
     turn = store.create_turn(wo_id, kind="dispatch", prompt="do the thing")
     store.finish_turn(turn["id"], "failed", error=error,
                       terminal_reason="api_error", api_error_status=429)
@@ -95,12 +73,11 @@ def _refuse(store: ProjectStore, wo_id: str, ended: float, api_ms: int,
     return store.latest_turn(wo_id)
 
 
-# -- the setting -----------------------------------------------------------------------
+# -- the setting
 
 
 def test_the_cap_is_fleet_wide_with_no_per_project_override(tmp_path, project):
-    """One number, because the account is not divided among projects. A project that
-    named its own share would be naming a share of something it does not own."""
+    """One number, because the account is not divided among projects"""
     cat = load_catalog(_catalog(tmp_path, {"proj_a": project}, max_in_flight=7))
     assert cat.os.max_in_flight == 7
     assert not hasattr(cat.projects[0], "max_in_flight")
@@ -113,13 +90,12 @@ def test_the_cap_has_a_default_and_refuses_a_nonsense_one(tmp_path, project):
         load_catalog(_catalog(tmp_path, {"proj_a": project}, max_in_flight=0))
 
 
-# -- the cap ---------------------------------------------------------------------------
+# -- the cap
 
 
 def test_the_cap_holds_back_an_over_limit_dispatch(jarvis_home, fake_claude, tmp_path,
                                                    project):
-    """THE THING THAT DID NOT EXIST. Four ready children were dispatched at once because
-    nothing counted turns across the fleet; with a cap of 2 the third waits."""
+    """THE THING THAT DID NOT EXIST"""
     catalog_path = _catalog(tmp_path, {"proj_a": project}, max_in_flight=2)
     ops.start_os(str(catalog_path), foreground=True)
     daemon = Daemon(load_catalog(catalog_path))
@@ -140,9 +116,7 @@ def test_the_cap_holds_back_an_over_limit_dispatch(jarvis_home, fake_claude, tmp
 
 def test_a_held_back_order_is_never_left_claimed_with_no_turn(jarvis_home, fake_claude,
                                                               tmp_path, project):
-    """The cap is checked BEFORE the claim. Claimed-then-held would leave the order in
-    `dispatching` with no turn, which `settle_work_order` fails as "worker turn never
-    started" — a cap that manufactured the failure it exists to prevent."""
+    """The cap is checked BEFORE the claim"""
     catalog_path = _catalog(tmp_path, {"proj_a": project}, max_in_flight=1)
     ops.start_os(str(catalog_path), foreground=True)
     daemon = Daemon(load_catalog(catalog_path))
@@ -161,9 +135,7 @@ def test_a_held_back_order_is_never_left_claimed_with_no_turn(jarvis_home, fake_
 
 def test_the_cap_counts_the_whole_fleet_not_one_project(jarvis_home, fake_claude,
                                                         tmp_path, two_projects):
-    """A per-project cap could not have prevented the incident and no arrangement of
-    them can: with one order ready in each of two projects and a cap of 1, exactly one
-    turn goes out — and the second project's pass must see the first project's launch."""
+    """A per-project cap could not have prevented the incident and no arrangement of them can: with one..."""
     a, b = two_projects
     catalog_path = _catalog(tmp_path, {"proj_a": a, "proj_b": b}, max_in_flight=1)
     ops.start_os(str(catalog_path), foreground=True)
@@ -181,12 +153,7 @@ def test_the_cap_counts_the_whole_fleet_not_one_project(jarvis_home, fake_claude
 
 
 def test_a_turn_parked_on_a_question_does_not_spend_a_fleet_slot(tmp_path, project):
-    """The unit is a turn in flight, NOT an active work order (kn-5c32dde8).
-
-    Since issue #134 the PROJECT cap agrees about a parked order, so the shape that
-    keeps the two apart is the second half: a usage-limit pause leaves its work order
-    `running`, which holds a project slot while drawing nothing from the account.
-    """
+    """The unit is a turn in flight, NOT an active work order (kn-5c32dde8) (#134)"""
     store = ProjectStore(project)
     wo = store.create_work_order("parked on a question", origin="manual")
     turn = store.create_turn(wo["id"], kind="dispatch", prompt="go")
@@ -206,13 +173,11 @@ def test_a_turn_parked_on_a_question_does_not_spend_a_fleet_slot(tmp_path, proje
     store.close()
 
 
-# -- the outage ------------------------------------------------------------------------
+# -- the outage
 
 
 def test_the_four_refusals_are_one_outage_and_burn_no_retries(tmp_path, project):
-    """REPLAYING 2026-09-02. Four turns, the same refusal, three of them already a
-    minute deep in Opus time. Every one is a usage-limit pause rather than a transient
-    429, all four name the same reopening, and none is on its second attempt."""
+    """REPLAYING 2026-09-02"""
     store = ProjectStore(project)
     for wo_id, stamp, api_ms, _cost in INCIDENT:
         store.create_work_order(wo_id, origin="manual", wo_id=wo_id)
@@ -228,8 +193,7 @@ def test_the_four_refusals_are_one_outage_and_burn_no_retries(tmp_path, project)
             "enter the backoff")
         assert pause.attempts == 1, f"{wo_id} burned a retry"
         assert not pause.exhausted
-    # 11:40am America/Los_Angeles on the day of the incident, which every refusal states
-    # and every turn ended before.
+    # 11:40am America/Los_Angeles on the day of the incident
     reopens = {p.reset_at for p in pauses.values() if p is not None}
     assert len(reopens) == 1, f"the same window resolved to {len(reopens)} moments"
 
@@ -244,7 +208,7 @@ def test_the_four_refusals_are_one_outage_and_burn_no_retries(tmp_path, project)
 
 
 def test_one_inbox_entry_for_the_outage_not_four(jarvis_home, tmp_path, project):
-    """Four entries saying the same sentence is not four times the information."""
+    """Four entries saying the same sentence is not four times the information"""
     store = ProjectStore(project)
     central = CentralStore()
     for wo_id, stamp, api_ms, _cost in INCIDENT:
@@ -253,7 +217,7 @@ def test_one_inbox_entry_for_the_outage_not_four(jarvis_home, tmp_path, project)
         _refuse(store, wo_id, _epoch(stamp), api_ms)
 
     now = _epoch("2026-09-02T16:40:00Z")
-    # Every tick between the refusal and the reset re-derives the same outage.
+    # Every tick between the refusal and the reset re-derives the same outage
     said = [fleet.announce(central, fleet.read(3, {"proj_a": store}, now=now))
             for _ in range(5)]
     assert said == [True, False, False, False, False]
@@ -262,8 +226,7 @@ def test_one_inbox_entry_for_the_outage_not_four(jarvis_home, tmp_path, project)
     assert "usage limit" in entries[0]["title"]
     assert entries[0]["wo_id"] in {wo_id for wo_id, *_ in INCIDENT}
 
-    # A LATER outage is news again — the receipt is cleared the moment nothing is
-    # refused, so a second window does not go unannounced behind the first one's flag.
+    # A LATER outage is news again — the receipt is cleared the moment nothing is refused
     after = _epoch("2026-09-02T18:41:00Z")
     assert fleet.announce(central, fleet.read(3, {"proj_a": store}, now=after)) is False
     _refuse(store, "wo-0a512472", after, 0)
@@ -275,11 +238,8 @@ def test_one_inbox_entry_for_the_outage_not_four(jarvis_home, tmp_path, project)
 def test_a_refusal_in_one_project_holds_dispatch_in_another(jarvis_home, fake_claude,
                                                             tmp_path, two_projects,
                                                             settle_turns, monkeypatch):
-    """THE SECOND HALF OF THE INCIDENT. One work order learning the window is spent used
-    to tell the OS nothing about the others, so each of them paid to find out."""
-    # The hold ends at `TurnPause.retry_at`, which is floored at 60s past the refusal so
-    # that nothing retries into the same one. Real for the fleet too — the account said
-    # no a moment ago — but not what this test is about, and no test can wait it out.
+    """THE SECOND HALF OF THE INCIDENT"""
+    # The hold ends at `TurnPause.retry_at`
     monkeypatch.setattr(worker_session, "RATE_LIMIT_MIN_DELAY", 0)
     a, b = two_projects
     catalog_path = _catalog(tmp_path, {"proj_a": a, "proj_b": b}, max_in_flight=5)
@@ -301,7 +261,7 @@ def test_a_refusal_in_one_project_holds_dispatch_in_another(jarvis_home, fake_cl
     assert sb.latest_turn(later["id"]) is None, "it paid to learn what was already known"
     assert not sb.get_work_order(later["id"])["needs_attention"]
 
-    # The window reopens; the held order goes out on the next pass with nobody typing.
+    # The window reopens; the held order goes out on the next pass with nobody typing
     fake_claude.turns_recover()
     sa.conn.execute("UPDATE wo_turns SET error=? WHERE id=?",
                     ("Claude AI usage limit reached|1000000000",
@@ -313,8 +273,7 @@ def test_a_refusal_in_one_project_holds_dispatch_in_another(jarvis_home, fake_cl
 
 
 def test_an_exhausted_refusal_stops_holding_the_fleet(tmp_path, project):
-    """A refusal nobody will retry is on its way to `failed` and asking for the user.
-    Holding the account on it would stop the fleet for ever on one mis-parse."""
+    """A refusal nobody will retry is on its way to `failed` and asking for the user"""
     store = ProjectStore(project)
     store.create_work_order("stuck", origin="manual", wo_id="wo-stuck")
     store.set_status("wo-stuck", "running")
@@ -330,13 +289,9 @@ def test_an_exhausted_refusal_stops_holding_the_fleet(tmp_path, project):
 
 def test_the_retry_pass_is_staggered_by_the_cap(jarvis_home, fake_claude, tmp_path,
                                                 project, settle_turns, monkeypatch):
-    """WHERE THE CACHE MONEY WENT. Four siblings refused by one window come due in the
-    same second; resuming together re-wrote 1.37M tokens and ran four test suites on one
-    machine. Nothing is lost by staggering — a turn held here is picked up by the next
-    pass, because the pause is re-derived and stays due."""
+    """WHERE THE CACHE MONEY WENT"""
     monkeypatch.setattr(worker_session, "RATE_LIMIT_MIN_DELAY", 0)
-    # Four dispatched under a cap that does not bind, so all four are really parked —
-    # then the cap the resume has to obey.
+    # Four dispatched under a cap that does not bind, so all four are really parked
     ops.start_os(str(_catalog(tmp_path, {"proj_a": project}, max_in_flight=4)),
                  foreground=True)
     open_wide = Daemon(load_catalog(
@@ -351,8 +306,7 @@ def test_the_retry_pass_is_staggered_by_the_cap(jarvis_home, fake_claude, tmp_pa
     assert all(worker_session.turn_pause(store, wo["id"]) is not None for wo in wos), \
         "every sibling should be parked on the usage limit"
 
-    # The window reopens for all four in the same second, which is what happened at
-    # 18:40Z on 2026-09-02.
+    # The window reopens for all four in the same second, which is what happened at 18:40Z on 2026-09-02
     fake_claude.turns_recover()
     fake_claude.hold_turns()
     store.conn.execute("UPDATE wo_turns SET error=? WHERE state='failed'",
@@ -368,12 +322,11 @@ def test_the_retry_pass_is_staggered_by_the_cap(jarvis_home, fake_claude, tmp_pa
     store.close()
 
 
-# -- what the user sees ------------------------------------------------------------------
+# -- what the user sees
 
 
 def test_a_held_back_order_says_what_it_is_waiting_for(tmp_path, project):
-    """`jarvis status` renders through `status_label`, so saying it here says it
-    everywhere. A bare "pending" promises "will start as soon as a slot frees"."""
+    """`jarvis status` renders through `status_label`, so saying it here says it everywhere"""
     store = ProjectStore(project)
     wo = store.create_work_order("waiting", origin="manual")
     row = store.get_work_order(wo["id"])
@@ -386,8 +339,7 @@ def test_a_held_back_order_says_what_it_is_waiting_for(tmp_path, project):
         project="proj_a", wo_id="wo-0a512472",
         reopens_at=time.time() + 3600, message=REFUSAL))
     assert "usage window is spent" in invariants.status_label(store, row, held)
-    # No fleet view, no fleet clause: a caller holding one project's store cannot know,
-    # and a guess would be worse than the bare status.
+    # No fleet view, no fleet clause: a caller holding one project's store cannot know
     assert invariants.status_label(store, row) == "pending"
     store.close()
 
@@ -413,16 +365,11 @@ def test_jarvis_status_names_the_cap_and_does_not_raise_attention(
         "waiting for a slot must not reach the attention strip")
 
 
-# -- a hold that says so ---------------------------------------------------------------
+# -- a hold that says so
 
 
 def _held_by_the_cap(fake_claude, tmp_path, project, settle_turns, monkeypatch):
-    """Four siblings refused by one window, then swept under `max_in_flight=2`.
-
-    The staging of `test_the_retry_pass_is_staggered_by_the_cap` above, reused: what the
-    two held orders SAY about themselves is a different question from whether they were
-    held, and it needs the same incident to ask it of.
-    """
+    """Four siblings refused by one window, then swept under `max_in_flight=2`"""
     monkeypatch.setattr(worker_session, "RATE_LIMIT_MIN_DELAY", 0)
     ops.start_os(str(_catalog(tmp_path, {"proj_a": project}, max_in_flight=4)),
                  foreground=True)
@@ -452,9 +399,7 @@ def _held_by_the_cap(fake_claude, tmp_path, project, settle_turns, monkeypatch):
 
 def test_a_cap_held_resume_says_so_on_the_record(jarvis_home, fake_claude, tmp_path,
                                                  project, settle_turns, monkeypatch):
-    """A hold that writes nothing is a hold nothing can read: the note went on promising
-    a retry whose moment had passed, and INV-PAUSE-OVERDUE called the OS broken for
-    obeying its own cap."""
+    """A hold that writes nothing is a hold nothing can read: the note went on promising a retry whose..."""
     store, capped, held = _held_by_the_cap(fake_claude, tmp_path, project,
                                            settle_turns, monkeypatch)
     for wo in held:
@@ -467,7 +412,7 @@ def test_a_cap_held_resume_says_so_on_the_record(jarvis_home, fake_claude, tmp_p
         assert payload["seq"] == pause.turn["seq"]
         assert payload["reason"] == pause.reason
 
-    # The same hold, restated inside the dedupe window: one event, not one per sweep.
+    # The same hold, restated inside the dedupe window: one event, not one per sweep
     _tick(capped)
     for wo in held:
         assert len(store.events_of_kind(wo["id"], invariants.RETRY_HELD_EVENT)) == 1, (
@@ -477,8 +422,7 @@ def test_a_cap_held_resume_says_so_on_the_record(jarvis_home, fake_claude, tmp_p
 
 def test_a_cap_held_order_does_not_promise_a_retry(jarvis_home, fake_claude, tmp_path,
                                                    project, settle_turns, monkeypatch):
-    """The one string every surface prints. While the slot is what it is waiting for,
-    "retrying by itself at 15:50" is a promise about a moment already gone."""
+    """The one string every surface prints"""
     store, _capped, held = _held_by_the_cap(fake_claude, tmp_path, project,
                                             settle_turns, monkeypatch)
     label = invariants.status_label(store, held[0])
@@ -490,12 +434,7 @@ def test_a_cap_held_order_does_not_promise_a_retry(jarvis_home, fake_claude, tmp
 
 
 def _refused_at(store: ProjectStore, wo_id: str, *, ended: float, reset: float):
-    """A usage-limit refusal that names `reset`, on a turn that ended at `ended`.
-
-    The reset is written as the epoch the parser takes verbatim, so one order can be
-    staged not-due (it is what `fleet.read` builds the outage from) and another due (it
-    is the one the sweep reaches) against the same clock.
-    """
+    """A usage-limit refusal that names `reset`, on a turn that ended at `ended`"""
     store.create_work_order(wo_id, origin="manual", wo_id=wo_id)
     store.set_status(wo_id, "running")
     _refuse(store, wo_id, ended, 0,
@@ -505,11 +444,7 @@ def _refused_at(store: ProjectStore, wo_id: str, *, ended: float, reset: float):
 
 def test_an_outage_hold_is_recorded_and_does_not_stall_the_sweep(jarvis_home, tmp_path,
                                                                  project):
-    """The outage half of the same hold, and the one that dereferences `state.outage`
-    inside the per-order loop: an exception there stalls every resume in the project.
-    The cause recorded is `fleet_outage` and NOT `fleet_cap` — the words for an outage
-    belong to `fleet_hold_note` (issue #714), and the event exists for the invariant
-    suppression, which an outage hold needs exactly as a cap hold does."""
+    """The outage half of the same hold (#714)"""
     now = time.time()
     catalog_path = _catalog(tmp_path, {"proj_a": project}, max_in_flight=3)
     ops.start_os(str(catalog_path), foreground=True)
@@ -532,8 +467,7 @@ def test_an_outage_hold_is_recorded_and_does_not_stall_the_sweep(jarvis_home, tm
     assert store.events_of_kind(shut["id"], invariants.RETRY_HELD_EVENT) == [], (
         "it was not due — the record is only for an order that was going to relaunch")
 
-    # `fleet_hold_note` owns these words for the statuses it is gated on; the note says
-    # them only where that gate is shut and the sentence would otherwise be lost.
+    # `fleet_hold_note` owns these words for the statuses it is gated on
     assert due["status"] in invariants.FLEET_HELD_STATUSES
     assert invariants.pause_note(store, store.get_work_order(due["id"])) == ""
     store.set_status(due["id"], "needs_review")
@@ -544,9 +478,7 @@ def test_an_outage_hold_is_recorded_and_does_not_stall_the_sweep(jarvis_home, tm
 
 
 def test_a_project_cap_hold_names_the_slot_it_waits_for(jarvis_home, tmp_path, project):
-    """The second door, with the fleet wide open: a resume out of `needs_review` takes a
-    `max_concurrent` slot it is not already holding, and being held for one is as silent
-    as the fleet cap was."""
+    """The second door, with the fleet wide open: a resume out of `needs_review` takes a `max_concurrent`..."""
     now = time.time()
     catalog_path = _catalog(tmp_path, {"proj_a": project}, max_in_flight=50,
                             max_concurrent=1, name="catalog-project-cap.json")
@@ -577,10 +509,7 @@ def test_a_project_cap_hold_names_the_slot_it_waits_for(jarvis_home, tmp_path, p
 
 def test_a_due_resume_takes_the_slot_before_a_pending_dispatch(
         jarvis_home, fake_claude, tmp_path, project, settle_turns, monkeypatch):
-    """THE ORDERING `tick` ALREADY HAS, pinned. A resume continues a conversation whose
-    prefix is paid for and whose work is half done; a dispatch starts one that re-sends
-    its whole context for the rest of its life. Reordering two lines in `tick` breaks
-    this and nothing else."""
+    """THE ORDERING `tick` ALREADY HAS, pinned"""
     monkeypatch.setattr(worker_session, "RATE_LIMIT_MIN_DELAY", 0)
     ops.start_os(str(_catalog(tmp_path, {"proj_a": project}, max_in_flight=4)),
                  foreground=True)

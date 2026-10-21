@@ -1,10 +1,4 @@
-"""Jarvis behavioral scorecard (deterministic).
-
-What Jarvis PROMISES: `jarvis status` tells the exact truth about what needs the
-user (no false alarms, no misses), work routes to the right project with the right
-metadata, feedback reaches the right worker, and the safety rails (dependencies,
-reviews, drift, dead sessions) actually rail.
-"""
+"""Jarvis behavioral scorecard (deterministic)"""
 
 from __future__ import annotations
 
@@ -24,7 +18,7 @@ scenario = pytest.mark.scenario
 
 @pytest.fixture()
 def fleet(jarvis_home, fake_claude, tmp_path, claude_json, make_two_projects):
-    """Two-project fleet, started, with a tickable daemon."""
+    """Two-project fleet, started, with a tickable daemon"""
     return make_two_projects
 
 
@@ -49,7 +43,7 @@ def make_two_projects(jarvis_home, fake_claude, tmp_path, claude_json):
 
 
 def session_of(project_path, wo_id) -> str:
-    """The work order's session id — assigned at dispatch, and fixed for its lifetime."""
+    """The work order's session id — assigned at dispatch, and fixed for its lifetime"""
     store = ProjectStore(project_path)
     try:
         return store.get_work_order(wo_id)["session_id"]
@@ -58,8 +52,7 @@ def session_of(project_path, wo_id) -> str:
 
 
 def turn_calls(fake_claude, resumed=None, expect=0):
-    """Worker-turn invocations. `expect` waits for that many: a turn is a detached
-    process, so it records itself a moment after the call that launched it returned."""
+    """Worker-turn invocations"""
     def match(c):
         argv = c["argv"]
         if "-p" not in argv:
@@ -75,7 +68,7 @@ def turn_calls(fake_claude, resumed=None, expect=0):
     return [c for c in fake_claude.calls if match(c)]
 
 
-# -- 1. status truthfulness: flag exactly what needs the user -----------------------
+# -- 1. status truthfulness: flag exactly what needs the user
 
 @scenario("jarvis/status-truth", "quiet fleet reports healthy with zero attention")
 def test_quiet_is_quiet(fleet):
@@ -157,7 +150,7 @@ def test_dead_turn_flagged(fleet, fake_claude, settle_turns):
                for a in st["attention"]), st["attention"]
 
 
-# -- 2. routing: right project, right metadata, right limits -----------------------
+# -- 2. routing: right project, right metadata, right limits
 
 @scenario("jarvis/routing", "work order dispatches in ITS project with per-project defaults")
 def test_project_isolation_and_defaults(fleet, fake_claude):
@@ -219,13 +212,10 @@ def test_prompt_contract(fleet, fake_claude):
     for must in ("upgrade deps", "careful please", f"jarvis wo assume {wo['id']}",
                  f"jarvis wo ask {wo['id']}", f"jarvis wo finish {wo['id']}",
                  "never bump major versions",
-                 # the knowledge base must arrive as something the worker can query,
-                 # not only as whatever happened to fit in the prompt
+                 # the knowledge base must arrive as something the worker can query
                  "jarvis learn search", "jarvis learn show <id>"):
         assert must in prompt, f"contract element missing: {must}"
-    # kn-dfdab9f8: the git rules are stated once, in the briefing that rides in
-    # --append-system-prompt, so asserting them on the prompt positional alone would
-    # measure a composition no worker is ever spawned with.
+    # kn-dfdab9f8: the git rules are stated once
     assert "--append-system-prompt" in argv, (
         "spawn carries no --append-system-prompt: the git briefing never reaches the worker")
     briefing = argv[argv.index("--append-system-prompt") + 1]
@@ -234,7 +224,7 @@ def test_prompt_contract(fleet, fake_claude):
         "Never commit to or push the default branch")
 
 
-# -- 3. feedback routing --------------------------------------------------------------
+# -- 3. feedback routing
 
 @scenario("jarvis/feedback", "feedback waits while the worker runs, delivers when idle")
 def test_feedback_waits_then_delivers(fleet, fake_claude, settle_turns):
@@ -271,7 +261,7 @@ def test_feedback_unknown_wo(fleet):
         ops.send_message("wo-nonexistent", "hello?")
 
 
-# -- 4. safety rails -------------------------------------------------------------------
+# -- 4. safety rails
 
 @scenario("jarvis/safety-rails", "backlog promotion blocks on unfinished dependencies")
 def test_backlog_dependency_rail(fleet):
@@ -308,12 +298,7 @@ def test_backlog_closure(fleet):
 @scenario("jarvis/safety-rails",
           "the user's own sessions are left alone until they inject one")
 def test_sessions_are_opt_in(fleet, fake_claude):
-    """A session running in a project directory belongs to whoever started it.
-
-    Jarvis used to adopt these on sight and then drive them — renaming the session and
-    resuming it headlessly with a worker briefing, so the user's own conversation got
-    turns they never typed (GitHub issue 47). Now it is theirs until they hand it over.
-    """
+    """A session running in a project directory belongs to whoever started it"""
     d = fleet["daemon"]
     claude_cli.spawn_background(prompt="rogue", cwd=fleet["a"], name="side quest")
     d.tick_count = 0

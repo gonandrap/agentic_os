@@ -1,10 +1,4 @@
-"""The dashboard half of `jarvis pause` / `jarvis resume` (issue #843).
-
-The brake shipped CLI-only; a user looking at the dashboard could not see that the fleet
-was stopped, nor stop it. These pin the banner every page carries, the three controls,
-and that each control is the COMMAND — `ops.pause_fleet` / `ops.resume_fleet` — writing
-the same record `jarvis status` reads.
-"""
+"""The dashboard half of `jarvis pause` / `jarvis resume` (issue #843)"""
 
 from __future__ import annotations
 
@@ -46,7 +40,7 @@ def _pending(project) -> dict:  # noqa: ARG001 — the fixture registers proj_a
     return wo
 
 
-# -- the banner ------------------------------------------------------------------------
+# -- the banner
 
 
 def test_no_banner_and_a_pause_form_while_the_fleet_runs(client):
@@ -90,7 +84,7 @@ def test_the_ramp_is_shown_when_one_is_in_force(client):
     assert BANNER not in page
 
 
-# -- the controls ----------------------------------------------------------------------
+# -- the controls
 
 
 def test_the_pause_form_pauses_the_fleet(client):
@@ -101,7 +95,7 @@ def test_the_pause_form_pauses_the_fleet(client):
 
 
 def test_a_second_pause_press_does_not_wipe_the_allow_list(client, project):
-    """Re-pausing REPLACES the allow-list; a page rendered before the pause must not."""
+    """Re-pausing REPLACES the allow-list; a page rendered before the pause must not"""
     wo = _pending(project)
     ops.pause_fleet(reason="first", allow=[wo["id"]])
     r = client.post("/fleet/pause", data={"reason": "second", "next": "/"})
@@ -171,9 +165,7 @@ def test_let_through_when_not_paused_is_flashed(client, project):
                                           ("investigation", "inv")])
 def test_the_allow_list_links_each_order_kind_to_its_own_page(client, project, kind,
                                                               segment):
-    """Issue #997 in the banner: the strip branched on `fo-`, so an allow-listed
-    `io-`/`inv-` id fell through to `find_work_order`, resolved to None and lost its
-    link entirely."""
+    """Issue #997 in the banner: the strip branched on `fo-`"""
     from jarvis.ui.app import _order_href
 
     store = ProjectStore(project)
@@ -188,7 +180,7 @@ def test_the_allow_list_links_each_order_kind_to_its_own_page(client, project, k
 
 
 def test_an_order_that_no_longer_resolves_has_no_link(client):
-    """The function VALIDATES existence — a stale allow-list entry is text, not a 404."""
+    """The function VALIDATES existence — a stale allow-list entry is text, not a 404"""
     from jarvis.ui.app import _order_href
 
     assert _order_href("io-nosuch00") is None

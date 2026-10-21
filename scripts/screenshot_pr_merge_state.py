@@ -1,17 +1,4 @@
-"""Screenshot the work-order page's pull-request state line, for a PR's UI evidence.
-
-TWO states, because one picture of a line that renders proves nothing about the
-derivation: an order with a `pr_merged` event, which reads `⑃ state: MERGED at <sha10>`
-under the link, and an order carrying the same pull request with NO such event, which
-must show the link and NO state line at all. An empty state means nothing has looked
-yet, never "did not merge" (`ops.merge_state`, spec
-docs/superpowers/specs/2026-09-25-a-gate-records-the-pull-request.md §7).
-
-Writes PNGs to docs/screenshots/. Everything it touches lives in a temp `JARVIS_HOME`
-and a temp catalog, so it never reads or writes the live OS:
-
-    uv run python scripts/screenshot_pr_merge_state.py
-"""
+"""Screenshot the work-order page's pull-request state line, for a PR's UI evidence (docs/superpowers/specs/2026-09-25-a-gate-records-the-pull-request.md §7)"""
 
 from __future__ import annotations
 
@@ -33,13 +20,13 @@ HEAD = "9f3c1ad20b7e4856c9d1f0a2b3c4d5e6f7089aab"
 
 
 def _repo(path: Path) -> None:
-    """An empty checkout, the shape `testing.make_git_project` builds for the suite."""
+    """An empty checkout, the shape `testing.make_git_project` builds for the suite"""
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
     (path / "README.md").write_text("# jarvis_os\n")
 
 
 def order(store, title: str, *, merged: bool) -> str:
-    """One order parked behind a pull request, with or without a landing observed."""
+    """One order parked behind a pull request, with or without a landing observed"""
     from jarvis import ops
 
     wo = ops.create_work_order("jarvis_os", title,
@@ -48,8 +35,7 @@ def order(store, title: str, *, merged: bool) -> str:
                                "still has the link on its record.")
     ops.finish(wo["id"], "opened a pull request", pr_url=PR)
     if merged:
-        # The event `Daemon.refresh_landings` writes when GitHub says it landed — the
-        # only source of MERGED, never the `pr_state` column (kn-dbc4971d).
+        # The event `Daemon.refresh_landings` writes when GitHub says it landed
         store.add_event(wo["id"], "pr_merged", {
             "pr_url": PR, "head_oid": HEAD, "source": "landing_sweep",
             "merged_at": "2026-09-25T21:14:07Z"})
@@ -71,9 +57,7 @@ def seed() -> list[str]:
         "os": {"ui": {"port": 8787}},
         "projects": [{"name": "jarvis_os", "path": str(project),
                       "description": "the OS itself",
-                      # Off, so `finish` settles straight to `waiting_pr_merge`: a round
-                      # in flight would put this page's validation section in the shot
-                      # and say nothing about the line being demonstrated.
+                      # Off, so `finish` settles straight to `waiting_pr_merge`: a round in flight would put this page's...
                       "validation": {"enabled": False}}],
     }, indent=2))
     store = CentralStore()
