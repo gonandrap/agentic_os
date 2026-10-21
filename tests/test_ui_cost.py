@@ -1,13 +1,4 @@
-"""The dashboard's spend surfaces: the `/cost` page and the per-work-order line.
-
-`jarvis cost` shipped with no dashboard surface at all, so the one question the feature
-exists to answer — where did my tokens go — could only be asked from a terminal.
-`tests/test_usage.py` covers the transcript parser and `tests/test_cost_report.py` the
-attribution; what is left here is mostly the ways a spend figure can LIE. A pruned
-transcript rendered as zero turns a gap in the evidence into a claim about the spend, and
-a page that 500s reading a file Jarvis does not own takes a decision surface down with
-it.
-"""
+"""The dashboard's spend surfaces: the `/cost` page and the per-work-order line"""
 
 from __future__ import annotations
 
@@ -34,7 +25,7 @@ def client(jarvis_home, fake_claude, catalog_file):
 
 @pytest.fixture()
 def transcript(tmp_path, monkeypatch):
-    """Write a fake Claude Code transcript and point `usage` at it."""
+    """Write a fake Claude Code transcript and point `usage` at it"""
     root = tmp_path / "transcripts"
     (root / "-proj").mkdir(parents=True)
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
@@ -55,9 +46,7 @@ def transcript(tmp_path, monkeypatch):
 
     def write(session_id: str, *, write_tok: int = 0, read: int = 0, out: int = 0,
               at: float | None = None, subagents: list[dict] | None = None):
-        """One session. `subagents` names each with its own `write_tok`/`read`/`out`, and
-        `placeholder=True` stages the two mid-stream rows Claude Code writes for a
-        message whose sealed row never arrives (spec 2026-10-08 §1)."""
+        """One session"""
         (root / "-proj" / f"{session_id}.jsonl").write_text(
             json.dumps(row(f"m-{session_id}", write_tok, read, out, at, "end_turn"))
             + "\n")
@@ -76,7 +65,7 @@ def transcript(tmp_path, monkeypatch):
 
 
 def give_session(project, wo_id: str, session_id: str) -> None:
-    """Attach a session to a work order — the join `cost_report` reads spend through."""
+    """Attach a session to a work order — the join `cost_report` reads spend through"""
     store = ProjectStore(project)
     try:
         store.conn.execute("UPDATE work_orders SET session_id=? WHERE id=?",
@@ -92,27 +81,20 @@ def test_cost_page_lists_work_orders_dearest_first(client, project, transcript):
     transcript("sess-dear", write_tok=900_000, out=50_000)
     give_session(project, cheap["id"], "sess-cheap")
     give_session(project, dear["id"], "sess-dear")
-    # The page reports the current usage week by default, and an order is in a window
-    # through its TURNS (§5a of the window-selector spec).
+    # The page reports the current usage week by default
     add_recorded_turn(project, cheap["id"], 0.0, 1_000)
     add_recorded_turn(project, dear["id"], 0.0, 1_000)
 
     page = client.get("/cost")
     assert page.status_code == 200
     assert page.text.index("a large ask") < page.text.index("a small ask")
-    # Said on the page, not only in the docs: the user is on a subscription, so a bare
-    # dollar figure is most likely to be misread as an invoice.
+    # Said on the page, not only in the docs: the user is on a subscription
     assert "not a bill" in page.text
 
 
 def test_cost_page_says_when_a_transcript_is_gone_instead_of_saying_zero(
         client, project, transcript):
-    """An unmeasurable cost and a zero cost are different answers.
-
-    Rendering them the same is the one thing this page must never do: someone opens it
-    precisely to find out where the bill came from, and a silent omission invites a
-    conclusion the evidence does not support.
-    """
+    """An unmeasurable cost and a zero cost are different answers"""
     wo = ops.create_work_order("proj_a", "measured long ago")
     give_session(project, wo["id"], "sess-that-was-pruned")
     add_recorded_turn(project, wo["id"], 0.0, 1_000)
@@ -137,13 +119,7 @@ def test_cost_page_can_be_scoped_to_one_project(client, project, transcript):
 
 def test_the_work_order_page_shows_two_numbers_and_a_way_in(client, project,
                                                             transcript):
-    """Total tokens, total dollars, and a link. Nothing else.
-
-    The line this replaced tried to say the whole bill in one row — worker, jarvis,
-    tokens, turns, re-write tax — and a reader could not answer any of the four
-    questions it raised (wo-4576667e). The itemisation moved to the bill, which has
-    room for it; what stays here is the two figures and the door.
-    """
+    """Total tokens, total dollars, and a link"""
     wo = ops.create_work_order("proj_a", "priced task")
     transcript("sess-priced", write_tok=200_000, out=10_000)
     give_session(project, wo["id"], "sess-priced")
@@ -157,12 +133,7 @@ def test_the_work_order_page_shows_two_numbers_and_a_way_in(client, project,
 
 def test_the_work_order_page_bills_each_turn_where_the_reader_already_is(client,
                                                                          project):
-    """The same bill, turn by turn, on the page the conversation is on.
-
-    Asked for explicitly (wo-4576667e): the bill has to be readable for the whole order
-    AND for one turn of it, and the turns have to add up to the order. Expandable, so a
-    page opened to read a conversation does not open on a token table.
-    """
+    """The same bill, turn by turn, on the page the conversation is on"""
     wo = ops.create_work_order("proj_a", "billed in place")
     add_recorded_turn(project, wo["id"], 0.05, 48_000)
     add_recorded_turn(project, wo["id"], 0.07, 90_000)
@@ -178,11 +149,7 @@ def test_the_work_order_page_bills_each_turn_where_the_reader_already_is(client,
 
 
 def test_a_message_carries_what_answering_it_cost(client, project):
-    """A message is an ask; the turn it set going is what was paid for.
-
-    Shown on the message and labelled as the turn's line, never as a second charge —
-    `wo_turns.msg_id` is the join, and the figure is the one already in the totals.
-    """
+    """A message is an ask; the turn it set going is what was paid for"""
     wo = ops.create_work_order("proj_a", "asked and answered")
     add_recorded_turn(project, wo["id"], 0.05, 48_000)
     store = ProjectStore(project)
@@ -203,7 +170,7 @@ def test_a_message_carries_what_answering_it_cost(client, project):
 
 def test_a_work_order_with_no_transcript_shows_no_cost_line_at_all(client, project,
                                                                    transcript):
-    """Not "$0.00" — the work order has not been dispatched, so nothing is known."""
+    """Not "$0.00" — the work order has not been dispatched, so nothing is known"""
     wo = ops.create_work_order("proj_a", "never dispatched")
     page = client.get(f"/wo/proj_a/{wo['id']}")
     assert page.status_code == 200
@@ -212,12 +179,7 @@ def test_a_work_order_with_no_transcript_shows_no_cost_line_at_all(client, proje
 
 def test_a_broken_transcript_read_never_takes_the_work_order_page_down(
         client, project, monkeypatch):
-    """The work order page carries the gate decision and the assumption review.
-
-    A spend figure is the least important thing on it, so a failure reading files Jarvis
-    does not own — Claude Code prunes them on its own schedule and owns their format —
-    has to cost the line, not the page.
-    """
+    """The work order page carries the gate decision and the assumption review"""
     wo = ops.create_work_order("proj_a", "still readable")
 
     def boom(*args, **kwargs):
@@ -233,11 +195,7 @@ def test_a_broken_transcript_read_never_takes_the_work_order_page_down(
 def add_recorded_turn(project, wo_id: str, cost: float, peak: int,
                       window: int = 1_000_000, at: float | None = None,
                       extra: dict | None = None) -> None:
-    """A settled turn with its recorded usage envelope, as `_reap` would leave it.
-
-    `at` is an explicit start time: the store stamps `db.now()`, so without it only the
-    CURRENT window can be built — and a window selector is tested by what it leaves out.
-    """
+    """A settled turn with its recorded usage envelope, as `_reap` would leave it"""
     store = ProjectStore(project)
     try:
         kind = "message" if store.list_turns(wo_id) else "dispatch"
@@ -271,8 +229,7 @@ def test_cost_page_links_each_work_order_to_its_turn_drilldown(client, project,
 
 
 def test_the_drilldown_shows_the_turn_table_and_context_growth(client, project):
-    """The page this feature exists for: a bloated work order's cost curve, turn by
-    turn — each turn's own cost and its context peak against the model's window."""
+    """The page this feature exists for: a bloated work order's cost curve, turn by turn"""
     wo = ops.create_work_order("proj_a", "bloating one")
     add_recorded_turn(project, wo["id"], 0.05, 48_000)
     add_recorded_turn(project, wo["id"], 0.07, 90_000)
@@ -287,7 +244,7 @@ def test_the_drilldown_shows_the_turn_table_and_context_growth(client, project):
 
 def test_the_drilldown_labels_a_transcript_only_work_order_an_estimate(
         client, project, transcript):
-    """The fallback path must never dress an estimate up as the record."""
+    """The fallback path must never dress an estimate up as the record"""
     wo = ops.create_work_order("proj_a", "pre capture")
     transcript("sess-pre", write_tok=200_000, out=10_000)
     give_session(project, wo["id"], "sess-pre")
@@ -296,22 +253,16 @@ def test_the_drilldown_labels_a_transcript_only_work_order_an_estimate(
     assert page.status_code == 200
     assert "the conversation, from its transcript" in page.text
     assert "no turns on record at all" in page.text
-    # The spend is real and itemised even so, and it lands on the line that says it
-    # belongs to no turn rather than being quietly attributed to one.
+    # The spend is real and itemised even so
     assert "outside any turn" in page.text
 
 
-# -- what Jarvis itself spent ---------------------------------------------------------
-#
-# The half of the bill that had no surface at all: Neo answering the work order's
-# questions, the panel's seats deliberating on them, the digest shortening the result.
-# The page has to show the TOTAL and the SPLIT — a total alone hides that the OS spends
-# on a work order at all, and a worker figure alone reads as the whole bill.
+# -- what Jarvis itself spent
 
 
 def add_os_calls(wo_id: str, *, seats: int = 0, neo_calls: int = 0,
                  output: int = 1_000) -> None:
-    """Record OS-side calls against a work order, as the daemon's would be."""
+    """Record OS-side calls against a work order, as the daemon's would be"""
     from jarvis import agent_usage
 
     for i in range(neo_calls):
@@ -339,27 +290,23 @@ def test_the_cost_page_splits_the_fleet_total_into_workers_and_jarvis(
     assert page.status_code == 200
     assert "workers ~$" in page.text and "jarvis ~$" in page.text
     assert "7 calls" in page.text
-    # And per work order, with what the spend went ON: five seats is a shape a total
-    # can never make visible.
+    # And per work order, with what the spend went ON: five seats is a shape a total can never make...
     assert "5 panel seat" in page.text and "2 Neo answering" in page.text
 
 
 def test_a_work_order_with_no_transcript_still_shows_what_jarvis_spent_on_it(
         client, project):
-    """The OS's own calls are the OS's own record. They do not depend on a file Claude
-    Code is free to prune, so pruning must not hide them."""
+    """The OS's own calls are the OS's own record"""
     wo = ops.create_work_order("proj_a", "pruned but not free")
     give_session(project, wo["id"], "sess-long-gone")
     add_os_calls(wo["id"], neo_calls=3)
 
     fleet = client.get("/cost")
-    # "$x+": the jarvis half is known, the worker half is not — never a bare total that
-    # would read as the whole bill.
+    # "$x+": the jarvis half is known, the worker half is not
     assert "+" in fleet.text and "no transcript left to measure" in fleet.text
     assert "jarvis ~$" in fleet.text
 
-    # The work order page keeps its two figures; the bill is where the halves are named,
-    # and the OS's half is on it even though the transcript is gone.
+    # The work order page keeps its two figures
     page = client.get(f"/wo/proj_a/{wo['id']}")
     assert "details →" in page.text
     bill = client.get(f"/cost/proj_a/{wo['id']}")
@@ -369,12 +316,7 @@ def test_a_work_order_with_no_transcript_still_shows_what_jarvis_spent_on_it(
 
 def test_the_bill_names_every_actor_and_the_tokens_each_spent(client, project,
                                                               transcript):
-    """The user's fourth question: where are the tokens per actor.
-
-    A dollar figure per half was never the missing thing — the tokens were, because a
-    total in tokens beside a total in dollars that describe different scopes is what
-    made the old line unreadable.
-    """
+    """The user's fourth question: where are the tokens per actor"""
     wo = ops.create_work_order("proj_a", "priced with help")
     transcript("sess-helped", write_tok=200_000, out=10_000)
     give_session(project, wo["id"], "sess-helped")
@@ -385,15 +327,13 @@ def test_the_bill_names_every_actor_and_the_tokens_each_spent(client, project,
     assert "worker&#39;s own session" in page.text  # Jinja escapes the apostrophe
     assert "what Jarvis spent on this order" in page.text
     assert "1 call" in page.text
-    # Tokens beside dollars on every actor line, not only on the headline.
+    # Tokens beside dollars on every actor line, not only on the headline
     assert "210k" in page.text and "26k" in page.text
 
 
 def test_the_bill_page_names_the_residue_and_what_it_could_not_measure(
         client, project, transcript):
-    """§7 and §9: the residue row, the placeholder sentence, and the three states a
-    reader must be able to tell apart — a residue, a measured zero, and a seal written
-    before the measurement existed (which renders as nothing, never as a zero)."""
+    """§7 and §9: the residue row, the placeholder sentence"""
     now = time.time()
     wo = ops.create_work_order("proj_a", "with a placeholder subagent")
     transcript("sess-residue", write_tok=1_000, read=5_000, out=6_000, at=now + 5,
@@ -410,11 +350,11 @@ def test_the_bill_page_names_the_residue_and_what_it_could_not_measure(
     assert "unattributed" in page.text
     assert "API calls report placeholder" in page.text
     assert "a measured zero" not in page.text
-    # The reworded captions, which used to assert the difference IS the subagents.
+    # The reworded captions, which used to assert the difference IS the subagents
     assert "what no transcript accounts\n  for" in page.text
     assert "NEITHER accounts for" in page.text
 
-    # A bill with no placeholder call anywhere says so — a measured zero.
+    # A bill with no placeholder call anywhere says so — a measured zero
     plain = ops.create_work_order("proj_a", "nothing hidden")
     transcript("sess-plain-ph", write_tok=1_000, out=500, at=now + 5)
     give_session(project, plain["id"], "sess-plain-ph")
@@ -423,7 +363,7 @@ def test_the_bill_page_names_the_residue_and_what_it_could_not_measure(
     assert "a measured zero" in plain_page.text
     assert "API calls report placeholder" not in plain_page.text
 
-    # And a seal from before the measurement renders NEITHER (§9).
+    # And a seal from before the measurement renders NEITHER (§9)
     store = ProjectStore(project)
     try:
         sealed = {k: v for k, v in ops.bill(plain["id"], live=True).items()
@@ -438,13 +378,7 @@ def test_the_bill_page_names_the_residue_and_what_it_could_not_measure(
 
 
 def test_the_bill_says_which_way_a_turn_it_cannot_re_read_was_counted(client, project):
-    """Two superseded readings, and they are wrong in OPPOSITE directions.
-
-    A version-1 turn counted a fraction of itself and a version-2 one counted the whole
-    resumed session (issue #470). Both survive only where the result JSON is gone, both
-    are labelled, and one label for both would tell half the readers the wrong story
-    about which way their bill is off.
-    """
+    """Two superseded readings, and they are wrong in OPPOSITE directions (#470)"""
     wo = ops.create_work_order("proj_a", "counted before the fix")
     store = ProjectStore(project)
     try:
@@ -471,11 +405,7 @@ def test_the_bill_says_which_way_a_turn_it_cannot_re_read_was_counted(client, pr
 
 
 def test_the_bill_gives_each_panel_seat_its_own_line(client, project):
-    """The standing ruling — one row per seat, never one per question — rendered.
-
-    Which seat is dear is exactly what a panel's price is asked about, and an aggregate
-    answers it for none of them.
-    """
+    """The standing ruling — one row per seat, never one per question — rendered"""
     wo = ops.create_work_order("proj_a", "panelled")
     add_recorded_turn(project, wo["id"], 0.05, 48_000)
     add_os_calls(wo["id"], seats=5, neo_calls=1)
@@ -489,12 +419,7 @@ def test_the_bill_gives_each_panel_seat_its_own_line(client, project):
 
 
 def test_the_bill_says_so_when_jarvis_spent_nothing(client, project):
-    """Zero here is a real answer — the work order asked Neo nothing — and it is worth
-    saying, because a line that is simply absent reads as a line that was left out.
-
-    This is the user's first question about the old surface ("not a single token spent
-    on the OS that wasn't jarvis?"): what is NOT on the bill has to be named too.
-    """
+    """Zero here is a real answer — the work order asked Neo nothing"""
     wo = ops.create_work_order("proj_a", "self-sufficient")
     add_recorded_turn(project, wo["id"], 0.05, 48_000)
 
@@ -506,13 +431,13 @@ def test_the_bill_says_so_when_jarvis_spent_nothing(client, project):
 
 
 def test_the_cost_tab_is_reachable_from_every_page(client):
-    """A surface nobody can find is the bug this work order was filed about."""
+    """A surface nobody can find is the bug this work order was filed about"""
     assert '<a href="/cost"' in client.get("/").text
     assert 'class="here"' in client.get("/cost").text
 
 
 def add_subprocess_calls(wo_id: str, n: int = 4, label: str = "pytest") -> None:
-    """Spend the worker made BELOW itself — `claude` processes its own tool call ran."""
+    """Spend the worker made BELOW itself — `claude` processes its own tool call ran"""
     from jarvis import agent_usage
 
     for _ in range(n):
@@ -525,9 +450,7 @@ def add_subprocess_calls(wo_id: str, n: int = 4, label: str = "pytest") -> None:
 
 def test_the_cost_page_shows_subprocess_spend_as_its_own_class(client, project,
                                                                transcript):
-    """Three figures under the headline, not two. A work order that ran an eval suite and
-    one that asked Neo four questions are spending differently, and folding them together
-    loses exactly the distinction someone reading an expensive work order came for."""
+    """Three figures under the headline, not two"""
     wo = ops.create_work_order("proj_a", "shipped the release")
     transcript("sess-shipped", write_tok=100_000, out=5_000)
     give_session(project, wo["id"], "sess-shipped")
@@ -538,13 +461,12 @@ def test_the_cost_page_shows_subprocess_spend_as_its_own_class(client, project,
     assert page.status_code == 200
     assert "subprocesses ~$" in page.text
     assert "4 claude processes" in page.text
-    # Still counted apart from Jarvis's own overhead, which was one call, not five.
+    # Still counted apart from Jarvis's own overhead, which was one call, not five
     assert "1 call" in page.text
 
 
 def test_the_drilldown_groups_subprocess_spend_by_what_ran_it(client, project):
-    """One `pytest evals/llm` is forty calls. The OS's per-call table is the right shape
-    for five panel seats and the wrong one for forty eval scenarios."""
+    """One `pytest evals/llm` is forty calls"""
     wo = ops.create_work_order("proj_a", "ran the evals")
     add_recorded_turn(project, wo["id"], 0.05, 48_000)
     add_subprocess_calls(wo["id"], n=40, label="pytest")
@@ -556,11 +478,7 @@ def test_the_drilldown_groups_subprocess_spend_by_what_ran_it(client, project):
 
 
 def test_the_cost_page_shows_the_fleet_distribution(client, project):
-    """The page could say which order cost the most and not what normal looks like.
-
-    Same keys as `jarvis cost --fleet --json`, computed once by `ops.fleet_cost` — a
-    second computation on the page is how two surfaces start disagreeing about a number.
-    """
+    """The page could say which order cost the most and not what normal looks like"""
     wo = ops.create_work_order("proj_a", "the typical one")
     add_recorded_turn(project, wo["id"], 0.05, 48_000)
 
@@ -574,7 +492,7 @@ def test_the_cost_page_shows_the_fleet_distribution(client, project):
 
 def test_the_cost_page_survives_a_fleet_section_that_cannot_be_built(client, project,
                                                                      monkeypatch):
-    """The distribution is a SECTION. Losing it must not take the listing down with it."""
+    """The distribution is a SECTION"""
     monkeypatch.setattr(ops, "fleet_cost",
                         lambda **_k: (_ for _ in ()).throw(ops.OpsError("no catalog")))
 
@@ -584,12 +502,7 @@ def test_the_cost_page_survives_a_fleet_section_that_cannot_be_built(client, pro
     assert "What the work cost" in page.text
 
 
-# -- the window selector ---------------------------------------------------------------
-#
-# docs/superpowers/specs/2026-10-07-cost-window-selector.md. The page could report one
-# usage week and nothing else, and its two halves measured different populations. Every
-# test here is about the two halves moving TOGETHER, and about a bad parameter being a
-# refusal rather than a week's figures under the label the reader picked.
+# -- the window selector
 
 
 def last_week(**kwargs) -> dict:
@@ -597,7 +510,7 @@ def last_week(**kwargs) -> dict:
 
 
 def test_the_default_window_is_unchanged(client, project):
-    """Invisible until something is picked: no parameters, and it is still the week."""
+    """Invisible until something is picked: no parameters, and it is still the week"""
     wo = ops.create_work_order("proj_a", "ran this week")
     add_recorded_turn(project, wo["id"], 0.05, 48_000)
 
@@ -609,7 +522,7 @@ def test_the_default_window_is_unchanged(client, project):
 
 
 def test_a_past_week_moves_both_halves(client, project):
-    """Defect 3's acceptance test: the listing and the distribution report one window."""
+    """Defect 3's acceptance test: the listing and the distribution report one window"""
     before = ops.create_work_order("proj_a", "ran last week")
     now = ops.create_work_order("proj_a", "ran this week")
     add_recorded_turn(project, before["id"], 0.05, 48_000,
@@ -622,7 +535,7 @@ def test_a_past_week_moves_both_halves(client, project):
     assert past.status_code == 200 and current.status_code == 200
     assert before["id"] in past.text and now["id"] not in past.text
     assert now["id"] in current.text and before["id"] not in current.text
-    # The distribution counts the same population as the listing above it.
+    # The distribution counts the same population as the listing above it
     assert "1 order with a turn in it" in past.text
     assert "1 order with a turn in it" in current.text
 
@@ -642,12 +555,11 @@ def test_a_past_5h_window(client, project):
 
 
 def test_a_custom_range(client, project):
-    """The `datetime-local` form round-trips, and the form pre-fills with the window."""
+    """The `datetime-local` form round-trips, and the form pre-fills with the window"""
     wo = ops.create_work_order("proj_a", "inside the typed range")
     at = ops.cost_window(window="week")["since"] + 3_600
     add_recorded_turn(project, wo["id"], 0.05, 48_000, at=at)
-    # Rendered AND parsed in the page's display zone, which with no `?tz=` is the
-    # catalog's `week_reset_zone` (§11) — not UTC.
+    # Rendered AND parsed in the page's display zone
     zone = ZoneInfo(ops.cost_zone())
     fmt = "%Y-%m-%dT%H:%M"
     since = datetime.fromtimestamp(at - 600, zone).strftime(fmt)
@@ -669,8 +581,7 @@ def test_a_custom_range(client, project):
     ("window=week&since=2026-10-01T04:00", "pass one or the other, not both"),
 ])
 def test_invalid_params_refuse_rather_than_falling_back(client, project, query, message):
-    """The one failure mode a selector must not have: a week's figures under the wrong
-    label. Every bad parameter is a refusal."""
+    """The one failure mode a selector must not have: a week's figures under the wrong label"""
     wo = ops.create_work_order("proj_a", "ran this week")
     add_recorded_turn(project, wo["id"], 0.05, 48_000)
 
@@ -684,7 +595,7 @@ def test_invalid_params_refuse_rather_than_falling_back(client, project, query, 
 
 def test_the_selector_survives_a_fleet_section_that_cannot_be_built(client, project,
                                                                     monkeypatch):
-    """Losing the distribution must not lose the window the reader picked."""
+    """Losing the distribution must not lose the window the reader picked"""
     wo = ops.create_work_order("proj_a", "ran last week")
     add_recorded_turn(project, wo["id"], 0.05, 48_000,
                       at=last_week()["since"] + 3_600)
@@ -700,7 +611,7 @@ def test_the_selector_survives_a_fleet_section_that_cannot_be_built(client, proj
 
 @pytest.fixture()
 def two_project_client(jarvis_home, fake_claude, tmp_path, project, claude_json):
-    """A fleet of TWO registered projects — `/cost` with no scope reads every store."""
+    """A fleet of TWO registered projects — `/cost` with no scope reads every store"""
     from jarvis.testing import make_git_project
 
     other = make_git_project(tmp_path, "proj_b")
@@ -717,7 +628,7 @@ def two_project_client(jarvis_home, fake_claude, tmp_path, project, claude_json)
 
 
 def os_call_now(project_name: str, wo_id: str, cost: float = 0.25) -> None:
-    """One recorded OS call, stamped now — so it lands in the DEFAULT window."""
+    """One recorded OS call, stamped now — so it lands in the DEFAULT window"""
     from jarvis.central_store import CentralStore
 
     central = CentralStore()
@@ -731,9 +642,7 @@ def os_call_now(project_name: str, wo_id: str, cost: float = 0.25) -> None:
 
 
 def test_the_default_window_survives_two_projects_with_os_calls(two_project_client):
-    """The fleet-wide page: `_os_groups` returns BOTH projects' ids, and each store is
-    opened in turn. Looking a foreign id up in the open store raises `KeyError`, so this
-    is the shape in which `/cost` with no parameters 500s."""
+    """The fleet-wide page: `_os_groups` returns BOTH projects' ids, and each store is opened in turn"""
     client, other = two_project_client
     a = ops.create_work_order("proj_a", "proj_a asked Neo")
     b = ops.create_work_order("proj_b", "proj_b asked Neo")
@@ -758,7 +667,7 @@ def test_the_window_is_in_the_url(client, project):
 
 
 def test_the_reader_can_pick_the_display_zone(client, project):
-    """§11: the zone is DISPLAY ONLY, and a bad one is a refusal with a sentence."""
+    """§11: the zone is DISPLAY ONLY, and a bad one is a refusal with a sentence"""
     berlin = ops.cost_window(window="week", tz="Europe/Berlin")
     default = ops.cost_window(window="week")
 
@@ -767,14 +676,14 @@ def test_the_reader_can_pick_the_display_zone(client, project):
     assert page.status_code == 200
     assert berlin["local_label"] in page.text
     assert default["local_label"] not in page.text
-    # No number moved: the label is the only difference.
+    # No number moved: the label is the only difference
     assert (berlin["since"], berlin["until"]) == (default["since"], default["until"])
     assert default["label"] in page.text
     assert 'name="tz"' in page.text and 'value="Europe/Berlin"' in page.text
 
     bad = client.get("/cost?tz=Mars/Olympus")
     assert bad.status_code == 200
-    # The template escapes the quotes the sentence puts round the zone name.
+    # The template escapes the quotes the sentence puts round the zone name
     assert "tz must be an IANA time zone name" in bad.text
     assert "Mars/Olympus" in bad.text
     assert "is not a zone this report knows" in bad.text
@@ -790,26 +699,24 @@ def test_the_picked_zone_rides_on_every_window_link(client, project):
 
 
 def test_a_custom_range_is_parsed_in_the_picked_zone(client, project):
-    """One clock: the form is rendered AND parsed in the zone the reader picked."""
+    """One clock: the form is rendered AND parsed in the zone the reader picked"""
     page = client.get("/cost?since=2026-10-20T10:00&until=2026-10-20T12:00"
                       "&tz=Europe/Berlin")
 
     assert page.status_code == 200
-    # Berlin was CEST (UTC+2) on that date, so 10:00 local is 08:00 UTC.
+    # Berlin was CEST (UTC+2) on that date, so 10:00 local is 08:00 UTC
     assert "2026-10-20 08:00 to 2026-10-20 10:00 UTC" in page.text
     assert 'name="since" value="2026-10-20T10:00"' in page.text
     assert 'name="until" value="2026-10-20T12:00"' in page.text
     assert "Europe/Berlin" in page.text and "UTC — the clock" not in page.text
-    # An explicit offset submitted by hand is still honoured.
+    # An explicit offset submitted by hand is still honoured
     explicit = client.get("/cost?since=2026-10-20T10:00:00%2B00:00"
                           "&until=2026-10-20T12:00:00%2B00:00&tz=Europe/Berlin")
     assert "2026-10-20 10:00 to 2026-10-20 12:00 UTC" in explicit.text
 
 
 def test_every_cost_surface_says_the_figure_is_a_floor(client, project):
-    """Unconditional, and identical on both pages — `ops.COST_FLOOR_NOTE` is the single
-    source. A caveat that appears in one surface and not another is one the reader learns
-    to ignore."""
+    """Unconditional, and identical on both pages — `ops.COST_FLOOR_NOTE` is the single source"""
     wo = ops.create_work_order("proj_a", "nothing spent below itself")
     add_recorded_turn(project, wo["id"], 0.05, 48_000)
 
@@ -819,13 +726,12 @@ def test_every_cost_surface_says_the_figure_is_a_floor(client, project):
         assert "is a floor" in page.text, url
 
 
-# -- a feature order's own spend -------------------------------------------------------
+# -- a feature order's own spend
 
 
 def test_the_feature_bill_shows_the_parents_own_calls_beside_its_orders(
         client, project, improvement_order):
-    """The list under "the orders under it" sums to the headline only with this row:
-    calls Jarvis made against the parent itself belong to no child."""
+    """The list under "the orders under it" sums to the headline only with this row: calls Jarvis made..."""
     from jarvis.bill import OWN_LABEL
 
     io = improvement_order
@@ -848,17 +754,11 @@ def test_the_feature_bill_grows_no_own_row_when_there_is_no_own_spend(
     assert OWN_LABEL not in page.text
 
 
-# -- the usage meter, above the listing (tests 36 and 44) ------------------------------
+# -- the usage meter, above the listing (tests 36 and 44)
 
 
 def meter_samples_in_the_current_5h_window(n: int = 240) -> None:
-    """`n` readings per minute ending a moment ago, with the real boundary an hour out —
-    so the window `resolve_window` re-anchors on contains every one of them.
-
-    240 by default, i.e. the four hours of the re-anchored window that have already
-    happened: under `MIN_RELIABLE_COVERAGE_SHARE` the meter derives no dollar figure
-    (docs/superpowers/specs/2026-10-13-usage-meter-spurious-resets.md).
-    """
+    """`n` readings per minute ending a moment ago, with the real boundary an hour out (docs/superpowers/specs/2026-10-13-usage-meter-spurious-resets.md)"""
     from jarvis import db, usage_meter
     from jarvis.central_store import CentralStore
 
@@ -876,8 +776,7 @@ def meter_samples_in_the_current_5h_window(n: int = 240) -> None:
 
 
 def test_the_meter_sentence_and_the_sparkline_are_above_the_listing(client, project):
-    """One sentence, built once in `usage_meter.sentence` and rendered VERBATIM: two
-    wordings of the same arithmetic is a difference the reader has to explain (§9)."""
+    """One sentence, built once in `usage_meter.sentence` and rendered VERBATIM: two wordings of the same..."""
     wo = ops.create_work_order("proj_a", "an order in this window")
     add_recorded_turn(project, wo["id"], 0.05, 48_000)
     meter_samples_in_the_current_5h_window()
@@ -893,7 +792,7 @@ def test_the_meter_sentence_and_the_sparkline_are_above_the_listing(client, proj
 
 
 def test_an_unreliable_meter_shows_the_marker_and_no_dollars_per_point(client, project):
-    """12 readings in a 5h window: the page says so and prints no $/point figure."""
+    """12 readings in a 5h window: the page says so and prints no $/point figure"""
     wo = ops.create_work_order("proj_a", "an order in this window")
     add_recorded_turn(project, wo["id"], 0.05, 48_000)
     meter_samples_in_the_current_5h_window(12)
@@ -909,8 +808,7 @@ def test_an_unreliable_meter_shows_the_marker_and_no_dollars_per_point(client, p
 
 
 def test_a_broken_meter_leaves_the_listing_rendered(client, project, monkeypatch):
-    """Its own `try`, exactly as the distribution section has: the meter reads a
-    different table and losing it must not take the older, load-bearing half down."""
+    """Its own `try`, exactly as the distribution section has: the meter reads a different table and..."""
     wo = ops.create_work_order("proj_a", "still listed")
     add_recorded_turn(project, wo["id"], 0.05, 48_000)
 
@@ -926,7 +824,7 @@ def test_a_broken_meter_leaves_the_listing_rendered(client, project, monkeypatch
 
 
 def test_the_cost_page_writes_nothing(client, project):
-    """A read must never write — the rule the whole alarm path is arranged around (§8)."""
+    """A read must never write — the rule the whole alarm path is arranged around (§8)"""
     from jarvis.central_store import CentralStore
 
     add_recorded_turn(project, ops.create_work_order("proj_a", "read only")["id"],

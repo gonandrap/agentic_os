@@ -1,16 +1,4 @@
-"""One claimability rule, two queries, same SQL text.
-
-Section 4 of
-docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md:
-`claim_next_pending`'s WHERE clause and the read-only `why_not_claimable` are the SAME
-`_ClaimRule.sql` strings, so the two can never drift. Three pins:
-
-1. agreement — each refusal passes the row over AND is named by the reader
-2. same text — every rule's `sql` is verbatim in both queries, and the UPDATE is one
-   statement (its atomicity is why two ticks cannot claim the same row)
-3. kn-3bde1bf2 — a held row is passed over INSIDE the row selection, so the oldest held
-   row does not starve younger unblocked ones
-"""
+"""One claimability rule, two queries, same SQL text (docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md)"""
 
 from __future__ import annotations
 
@@ -28,7 +16,7 @@ def store(jarvis_home, project):
 
 
 class _SpyConn:
-    """Delegates to the real connection, keeping every SQL string executed."""
+    """Delegates to the real connection, keeping every SQL string executed"""
 
     def __init__(self, conn):
         self._conn = conn
@@ -46,7 +34,7 @@ def _oldest(store: ProjectStore, wo_id: str) -> None:
     store.conn.execute("UPDATE work_orders SET created_at=0 WHERE id=?", (wo_id,))
 
 
-# -- the four refusals, each as the only pending row --------------------------------
+# -- the four refusals, each as the only pending row
 
 def _held_by_dependency(store: ProjectStore) -> str:
     dep = store.create_work_order("dependency", status="running")
@@ -65,6 +53,12 @@ def _held_by_retry_after(store: ProjectStore) -> str:
     return wo["id"]
 
 
+def _held_by_precondition(store: ProjectStore) -> str:
+    wo = store.create_work_order("the 5a predicate fix")
+    store.add_precondition(wo["id"], "bl-d5baa28b")
+    return wo["id"]
+
+
 def _held_by_plan_assumption(store: ProjectStore) -> str:
     fo = store.create_feature_order("CSV export")
     planner = store.create_work_order("plan it", kind="planner", parent_id=fo["id"],
@@ -79,6 +73,8 @@ HOLDS = [
     ("max_parallel", _held_by_max_parallel),
     ("retry_after", _held_by_retry_after),
     ("plan_assumption", _held_by_plan_assumption),
+    # §2.2 of docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md
+    ("precondition", _held_by_precondition),
 ]
 
 
@@ -115,11 +111,11 @@ def test_the_selection_rule_refuses_a_row_the_claim_never_looks_at(store, field,
 
 
 def test_a_row_that_is_not_there_is_the_selection_rule_refusing(store):
-    """Not None: a deleted id must never read as claimable and earn an actor."""
+    """Not None: a deleted id must never read as claimable and earn an actor"""
     assert store.claim_refusal({"id": "wo-nosuch"}) is _rule("selection")
 
 
-# -- same text ----------------------------------------------------------------------
+# -- same text
 
 def test_both_queries_are_built_from_the_same_rule_sql(store):
     wo = store.create_work_order("ordinary work")
@@ -142,17 +138,56 @@ def test_both_queries_are_built_from_the_same_rule_sql(store):
 
 def test_every_rule_carries_a_reason(store):
     assert [r.code for r in CLAIM_RULES] == [
-        "selection", "retry_after", "dependency", "max_parallel", "plan_assumption"]
+        "selection", "precondition", "retry_after", "dependency", "max_parallel",
+        "plan_assumption"]
     assert all(r.why.strip() for r in CLAIM_RULES)
-    assert [r.delayed for r in CLAIM_RULES] == [False, True, True, True, True]
+    assert [r.delayed for r in CLAIM_RULES] == [False, True, True, True, True, True]
 
 
-# -- kn-3bde1bf2: the hold is in the row SELECTION, so it starves nothing ------------
+# -- §2.2: the precondition rule, ranked at index 1
+
+def test_a_held_row_is_passed_over_and_nothing_at_all_is_written(store):
+    """§3.2: the claim takes the younger free row and leaves the held one untouched"""
+    held = _held_by_precondition(store)
+    _oldest(store, held)
+    free = store.create_work_order("unrelated")["id"]
+    spans = store.conn.execute("SELECT COUNT(*) c FROM wo_state_spans "
+                               "WHERE order_id=?", (held,)).fetchone()["c"]
+    events = store.conn.execute("SELECT COUNT(*) c FROM wo_events "
+                                "WHERE wo_id=?", (held,)).fetchone()["c"]
+
+    assert store.claim_next_pending()["id"] == free
+    assert store.claim_next_pending() is None
+
+    row = store.get_work_order(held)
+    assert row["status"] == "pending"
+    assert row["dispatch_attempts"] == 0
+    assert row["retry_after"] is None
+    assert not row["needs_attention"]
+    assert store.conn.execute("SELECT COUNT(*) c FROM wo_state_spans WHERE order_id=?",
+                              (held,)).fetchone()["c"] == spans
+    assert store.conn.execute("SELECT COUNT(*) c FROM wo_events WHERE wo_id=?",
+                              (held,)).fetchone()["c"] == events
+
+
+def test_the_precondition_outranks_a_live_dependency(store):
+    """§3.3: index 1, so `claim_refusal` names the condition the order was CREATED with rather than a..."""
+    dep = store.create_work_order("dependency", status="running")
+    wo = store.create_work_order("child", depends_on=[dep["id"]])
+    store.add_precondition(wo["id"], "bl-d5baa28b")
+
+    row = store.get_work_order(wo["id"])
+    assert store.claim_refusal(row).code == "precondition"
+    assert store.why_not_claimable(row) == _rule("precondition").why
+
+
+# -- kn-3bde1bf2: the hold is in the row SELECTION, so it starves nothing
 
 @pytest.mark.parametrize(("code", "make"), [
     ("dependency", _held_by_dependency),
     ("plan_assumption", _held_by_plan_assumption),
-], ids=["dependency", "plan_assumption"])
+    ("precondition", _held_by_precondition),
+], ids=["dependency", "plan_assumption", "precondition"])
 def test_the_oldest_held_row_does_not_starve_younger_ones(store, code, make):
     held = make(store)
     _oldest(store, held)

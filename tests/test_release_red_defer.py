@@ -1,12 +1,4 @@
-"""A release blocked by a red `main` retries itself — issue #838.
-
-docs/superpowers/specs/2026-09-29-a-release-blocked-by-a-red-main-retries-itself.md
-
-The live case is wo-fc61d0cd: gate 310 approved, `scripts/shipit.sh --stage` ran, `main`
-turned red under it (5a4e14d, #829) while it waited for CI, and the worker correctly
-refused to ship an older green commit. The order settled `needs_review` and the expedited
-fix sat on `main` unreleased until a human typed something. The re-park lives here.
-"""
+"""A release blocked by a red `main` retries itself — issue #838"""
 
 from __future__ import annotations
 
@@ -22,7 +14,7 @@ from jarvis.daemon import Daemon
 from jarvis.project_store import ProjectStore
 
 ISSUE = "https://github.com/acme/proj/issues/826"
-#: The incident's own broken commit on `main`.
+#: The incident's own broken commit on `main`
 RED_SHA = "5a4e14d0000000000000000000000000000000ff"
 RUN_URL = "https://github.com/acme/proj/actions/runs/36273250195"
 
@@ -42,12 +34,7 @@ def store(project):
 
 @pytest.fixture(autouse=True)
 def os_identity(project, monkeypatch, origins):
-    """`proj_a` IS the OS, so `hold_red_release` runs at all: the hold is scoped to the
-    project that is the OS, by `origin` since issue 956.
-
-    Through `schedule._ORIGIN_CACHE`, not a real remote: a remote on a fixture project
-    arms every other origin-gated path in the daemon. `test_scheduler` owns the real one.
-    """
+    """`proj_a` IS the OS, so `hold_red_release` runs at all: the hold is scoped to the project that is..."""
     from pathlib import Path
 
     from jarvis import schedule
@@ -59,7 +46,7 @@ def os_identity(project, monkeypatch, origins):
 
 
 def release_order(store: ProjectStore, *, status: str = "running") -> str:
-    """A release order mid-run: the batch in its metadata, no release delivered."""
+    """A release order mid-run: the batch in its metadata, no release delivered"""
     wo = store.create_work_order("Ship the fix", status=status,
                                  metadata={release.BATCH_KEY: [ISSUE]})
     return str(wo["id"])
@@ -67,7 +54,7 @@ def release_order(store: ProjectStore, *, status: str = "running") -> str:
 
 def base_health(*, red: bool = True, checked_at: float | None = -1.0,
                 head_sha: str = RED_SHA) -> None:
-    """The stored reading `Daemon.poll_default_branch` writes, in its own shape."""
+    """The stored reading `Daemon.poll_default_branch` writes, in its own shape"""
     fact = {"red": red, "base": "main", "workflow": "ci", "run_id": 36273250195,
             "run_url": RUN_URL, "head_sha": head_sha if red else "", "wo_id": ""}
     if checked_at is not None:
@@ -85,20 +72,17 @@ def events(store: ProjectStore, wo_id: str, kind: str) -> list[dict]:
 
 
 def backdate(store: ProjectStore, wo_id: str, kind: str, seconds: float) -> None:
-    """Age every event of one kind, so a threshold measured from it has passed."""
+    """Age every event of one kind, so a threshold measured from it has passed"""
     store.conn.execute("UPDATE wo_events SET ts=? WHERE wo_id=? AND kind=?",
                        (db.now() - seconds, wo_id, kind))
     store.conn.commit()
 
 
-# -- 1: the red reading -----------------------------------------------------------
+# -- 1: the red reading
 
 
 def test_red_reading_reparks_release_to_pending(started, store):
-    """§1: a release that delivered no release, over a red base, goes back to `pending`
-    with a hold — not to the user. And `hold_dispatch` writes `retry_after` ONLY:
-    `dispatch_attempts` is `release_dispatch_claim`'s ladder, and a deferral for a reason
-    outside the order must not spend a launch."""
+    """§1: a release that delivered no release, over a red base, goes back to `pending` with a hold"""
     rel = release_order(store)
     base_health()
 
@@ -115,8 +99,7 @@ def test_red_reading_reparks_release_to_pending(started, store):
 
 
 def test_the_defer_event_is_said_once_per_broken_commit(started, store):
-    """kn-7b122cd9, `_say_base_is_red`'s rule: the same broken commit is the same news;
-    `main` breaking again on a different commit is not."""
+    """kn-7b122cd9, `_say_base_is_red`'s rule: the same broken commit is the same news"""
     rel = release_order(store)
     base_health()
 
@@ -133,13 +116,12 @@ def test_the_defer_event_is_said_once_per_broken_commit(started, store):
     assert [e["head_sha"][:8] for e in said] == ["5a4e14d0", "bbbbbbbb"]
 
 
-# -- 2: the unusable reading ------------------------------------------------------
+# -- 2: the unusable reading
 
 
 @pytest.mark.parametrize("reading", ["absent", "unparseable", "no_checked_at", "stale"])
 def test_unusable_reading_reparks_like_red(started, store, reading):
-    """§1, Neo's explicit condition: only a FRESH GREEN reading parks on the user. An
-    unusable fact is not evidence that `main` is fine."""
+    """§1, Neo's explicit condition: only a FRESH GREEN reading parks on the user"""
     rel = release_order(store)
     if reading == "unparseable":
         central = CentralStore()
@@ -162,13 +144,11 @@ def test_unusable_reading_reparks_like_red(started, store, reading):
     assert len(events(store, rel, ops.RED_DEFER_EVENT)) == 1
 
 
-# -- 3: the fresh green reading ---------------------------------------------------
+# -- 3: the fresh green reading
 
 
 def test_fresh_green_reading_parks_on_the_user(started, store):
-    """The only route to the user inside the threshold: the base is buildable and the
-    release still delivered nothing, so today's behaviour stands. The assumption is the
-    live case's — wo-fc61d0cd recorded one and settled `needs_review`."""
+    """The only route to the user inside the threshold: the base is buildable and the release still..."""
     rel = release_order(store)
     store.add_assumption(rel, "shipping the older green commit is not acceptable")
     base_health(red=False)
@@ -181,14 +161,12 @@ def test_fresh_green_reading_parks_on_the_user(started, store):
     assert events(store, rel, ops.RED_DEFER_EVENT) == []
 
 
-# -- 4: the green tick, and the re-dispatch that reuses the conversation ----------
+# -- 4: the green tick, and the re-dispatch that reuses the conversation
 
 
 def test_green_tick_clears_the_hold_and_dispatch_reruns_it(
         started, store, project, monkeypatch, fake_claude):
-    """§5: the re-dispatch RESUMES — the order still carries the session that holds the
-    approved gate and the reasoning about the red base, and `--session-id` on a session
-    that exists is refused by the CLI."""
+    """§5: the re-dispatch RESUMES — the order still carries the session that holds the approved gate and..."""
     from jarvis import ci
 
     rel = release_order(store)
@@ -214,7 +192,7 @@ def test_green_tick_clears_the_hold_and_dispatch_reruns_it(
 
 
 def _resumable(daemon: Daemon, store: ProjectStore, project, wo_id: str) -> str:
-    """The state a re-parked order is really in: a session on disk and a worktree."""
+    """The state a re-parked order is really in: a session on disk and a worktree"""
     from jarvis import claude_cli, worker_session
 
     session = "11111111-2222-4333-8444-555555555555"
@@ -229,13 +207,11 @@ def _resumable(daemon: Daemon, store: ProjectStore, project, wo_id: str) -> str:
     return session
 
 
-# -- 5: past the long threshold ---------------------------------------------------
+# -- 5: past the long threshold
 
 
 def test_past_the_long_threshold_it_parks_naming_the_red_run(started, store):
-    """§3: six hours of red `main` and the release stops waiting. The attention line
-    names the RED RUN and is re-derivable by `true_blockers`, or INV-ATTENTION-REASON
-    relabels it on the next tick."""
+    """§3: six hours of red `main` and the release stops waiting"""
     rel = release_order(store)
     base_health()
     ops.finish(rel, "blocked")
@@ -251,9 +227,7 @@ def test_past_the_long_threshold_it_parks_naming_the_red_run(started, store):
     assert blockers[0] == wo["attention_reason"]
     assert "ci" in blockers[0] and RED_SHA[:10] in blockers[0] and RUN_URL in blockers[0]
 
-    # Second call, nothing changed: `park_unlanded`'s episode discipline — no second
-    # event and no re-flag, so nothing renotifies. A `finished` between the two would be
-    # a re-DELIVERY, which is a new episode and does record.
+    # Second call, nothing changed: `park_unlanded`'s episode discipline
     store.clear_attention(rel)
 
     assert ops.defer_red_release(store, "proj_a", wo) == "needs_review"
@@ -263,8 +237,7 @@ def test_past_the_long_threshold_it_parks_naming_the_red_run(started, store):
 
 
 def test_the_threshold_runs_from_the_pending_hold_too(started, store):
-    """§3: the dispatch hold (#807) and the mid-run re-park share one clock, so an order
-    held red for six hours before it ever ran is not given six more."""
+    """§3: the dispatch hold (#807) and the mid-run re-park share one clock"""
     rel = release_order(store, status="pending")
     store.add_event(rel, Daemon.RED_HOLD_EVENT, {"head_sha": RED_SHA, "base": "main"})
     backdate(store, rel, Daemon.RED_HOLD_EVENT, Daemon.RED_PARK_AFTER_SECONDS + 60)
@@ -275,13 +248,11 @@ def test_the_threshold_runs_from_the_pending_hold_too(started, store):
     assert len(events(store, rel, ops.RED_PARK_EVENT)) == 1
 
 
-# -- the predicate ------------------------------------------------------------------
+# -- the predicate
 
 
 def test_a_delivered_release_is_never_re_parked(started, store, tmp_path, monkeypatch):
-    """§1: ANY release effect, verified or not, counts as delivered — a claim that is
-    unverified only because the restart has not happened yet must never be re-dispatched
-    into a second `shipit.sh` run."""
+    """§1: ANY release effect, verified or not, counts as delivered"""
     rel = release_order(store)
     base_health()
     marker = release.marker_path()
@@ -297,7 +268,7 @@ def test_a_delivered_release_is_never_re_parked(started, store, tmp_path, monkey
 
 
 def test_an_ordinary_work_order_is_untouched(started, store):
-    """The predicate is `release_for_issues` in the metadata and nothing else."""
+    """The predicate is `release_for_issues` in the metadata and nothing else"""
     wo = ops.create_work_order("proj_a", "fix the bug")
     base_health()
 
@@ -307,11 +278,11 @@ def test_an_ordinary_work_order_is_untouched(started, store):
     assert events(store, wo["id"], ops.RED_DEFER_EVENT) == []
 
 
-# -- 6: the tick that is the only step touching a held release --------------------
+# -- 6: the tick that is the only step touching a held release
 
 
 def _red_runs(monkeypatch, sha: str = RED_SHA) -> None:
-    """`ci.base_runs` answering red on the base's newest head."""
+    """`ci.base_runs` answering red on the base's newest head"""
     from jarvis import ci
 
     monkeypatch.setattr(ci, "base_runs", lambda *a, **k: (
@@ -321,12 +292,7 @@ def _red_runs(monkeypatch, sha: str = RED_SHA) -> None:
 
 def test_the_daemon_tick_parks_a_release_held_red_past_the_threshold(
         started, store, monkeypatch):
-    """§3: the threshold has to fire on the step that VISITS a held release.
-
-    `defer_red_release` runs only when a worker DELIVERS, so a release re-parked to
-    `pending` is touched by `hold_red_release` alone — which only ever extended the
-    hold. A `main` red for a day left the release silently `pending` with no attention.
-    """
+    """§3: the threshold has to fire on the step that VISITS a held release"""
     rel = release_order(store, status="pending")
     store.add_event(rel, Daemon.RED_HOLD_EVENT, {"head_sha": RED_SHA, "base": "main"})
     backdate(store, rel, Daemon.RED_HOLD_EVENT, Daemon.RED_PARK_AFTER_SECONDS + 60)
@@ -341,14 +307,14 @@ def test_the_daemon_tick_parks_a_release_held_red_past_the_threshold(
     assert invariants.true_blockers(store, wo)[0] == wo["attention_reason"]
     assert "ci" in wo["attention_reason"] and RED_SHA[:10] in wo["attention_reason"]
 
-    # A parked order leaves the `pending` population, so the park cannot repeat.
+    # A parked order leaves the `pending` population, so the park cannot repeat
     started.hold_red_release(spec, store)
     assert len(events(store, rel, ops.RED_PARK_EVENT)) == 1
 
 
 def test_the_tick_under_the_threshold_only_extends_the_hold(
         started, store, monkeypatch):
-    """§3's near miss: one minute short of six hours is still an ordinary red base."""
+    """§3's near miss: one minute short of six hours is still an ordinary red base"""
     rel = release_order(store, status="pending")
     store.add_event(rel, Daemon.RED_HOLD_EVENT, {"head_sha": RED_SHA, "base": "main"})
     backdate(store, rel, Daemon.RED_HOLD_EVENT, Daemon.RED_PARK_AFTER_SECONDS - 60)
@@ -364,8 +330,7 @@ def test_the_tick_under_the_threshold_only_extends_the_hold(
 
 
 def test_the_first_red_tick_never_parks(started, store, monkeypatch):
-    """§3's ordering: `_say_base_is_red` is what writes RED_HOLD_EVENT, so on the first
-    red tick `first_red_hold` is None and there is no clock to be past."""
+    """§3's ordering: `_say_base_is_red` is what writes RED_HOLD_EVENT"""
     rel = release_order(store, status="pending")
     _red_runs(monkeypatch)
 

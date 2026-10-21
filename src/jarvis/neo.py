@@ -1,22 +1,4 @@
-"""Neo — the OS-level answerer agent.
-
-Workers ask questions (`jarvis wo ask`) instead of stalling on the user. Neo answers
-them AS the user: a headless Claude call with a stable persona + the user's accumulated
-learnings, question-specific context last.
-
-Token economics drive the design:
-  * The persona + learnings travel as the system prompt and are byte-stable across
-    calls, so consecutive answers share a cached prefix.
-  * The queue drains FIFO and back-to-back — every answer after the first lands
-    inside the Anthropic prompt-cache TTL (~5 min), so the shared prefix is a cache
-    read, not a re-process.
-  * Learnings render append-only (oldest first): user feedback extends the prefix
-    instead of rewriting it.
-
-Neo escalates instead of guessing: anything irreversible, credential-touching,
-production-impacting, or genuinely unknowable about the user's intent goes to the
-user as an attention item.
-"""
+"""Neo — the OS-level answerer agent"""
 
 from __future__ import annotations
 
@@ -29,8 +11,7 @@ from .neo_store import ESCALATION_CAUSES_CHOSEN, NeoStore
 
 log = logging.getLogger("neo")
 
-# Keep in sync with the OPERATION.md / worker-contract wording: workers are told the
-# answer arrives as their next user turn.
+# Keep in sync with the OPERATION.md / worker-contract wording: workers are told the answer arrives...
 ANSWER_PREFIX = "[Neo, answering for the user]"
 
 PERSONA = """You are Neo, the user's delegate inside the Jarvis agentic OS.
@@ -86,57 +67,17 @@ An escalation may carry one optional label, which is grouped and reported:
   "cause": "<on an escalation, name the cause from this list; omit it if none fits: \
 high-stakes | no-learning-applies>"
 Either may carry one optional cleanup dispatch:
-  "dispatch": {"title": "<short: which record is wrong>", "description": "<the full brief>"}"""
+  "dispatch": {"title": "<short: which record is wrong>", "description": "<the full brief>"}
+`dispatch` is a FIELD of that one JSON object, never a second object after it (issue #1098)."""
 
 
-# The learnings block is the one part of Neo's prompt that grows without limit. Every
-# `jarvis neo learn` appends an entry IN FULL, `learnings_limit` bounds the row count and
-# nothing bounded the size, and unlike the project knowledge base — which ships workers an
-# index and lets them fetch what they need — Neo cannot look anything up: its calls run
-# headless with the question as their only input, so an index would be no index at all.
-# Measured on the production ledger, 16 learnings were 23.4k of a 27.2k-character system
-# prompt, and that rides on EVERY Neo call — five times over on a panel round.
-#
-# 20,000 IS A CEILING, NOT A CUT, AND THE DIFFERENCE IS THE POINT. Neo's whole job is to
-# spend its own tokens so the user does not spend attention, and at measured production
-# rates the entire headless side of the OS — Neo, digests, the panel — is 2.5% of the
-# fleet's bill. Trading a third of the user's accumulated rulings for ~1% of spend would
-# be a bad deal. What is NOT acceptable is the unbounded case: nothing stopped this block
-# reaching 100k, and at that size it is both expensive and unreadable by the model. So the
-# budget is set just under today's ledger — it evicts the six oldest entries now and holds
-# the line from here.
-#
-# WATCH THE CLIFF WHEN TUNING THIS. Eviction is by age and the entries differ in size by
-# more than 10x (479 chars against 5,266 on the same ledger), so one bloated learning can
-# displace ten good ones and a small budget change can move the count a long way: 24,000
-# keeps all 16, 20,000 keeps 10, 16,000 keeps 5. The real remedy is distilling the giants
-# rather than raising this number — filed as a backlog item.
+# The learnings block is the one part of Neo's prompt that grows without limit
 LEARNINGS_CHAR_BUDGET = 20000
 
 
 def render_learnings(rows: list[dict[str, Any]],
                      budget: int = LEARNINGS_CHAR_BUDGET) -> list[str]:
-    """The learnings block, capped in characters, newest kept.
-
-    OLDEST-FIRST TRUNCATION, for the same reason `NeoStore.learnings` returns rows
-    oldest-first: the block is append-only, so an ordinary new learning extends the
-    cached prompt prefix instead of rewriting it. Dropping from the FRONT is what keeps
-    that true — trimming the newest would move the boundary on every single addition.
-    Going over budget shifts the prefix once, exactly as overflowing `learnings_limit`
-    already did.
-
-    THE OMISSION IS STATED, and it is stated LAST. Silence would be the worse failure:
-    the persona above tells Neo that a budget which quietly truncates something the user
-    mandated is worse than no budget, and a ruling that vanished without trace is that
-    failure with no way to notice it. Last, because the note is the only line whose text
-    changes when the drop count changes — everything above it stays byte-identical and
-    stays cached.
-
-    THE NEWEST ENTRY IS ALWAYS KEPT, even alone over budget. A learning the user recorded
-    a minute ago is the likeliest one the next question turns on, and a block that came
-    back empty because a single entry was too long would be a silent, total regression
-    dressed up as a cap.
-    """
+    """The learnings block, capped in characters, newest kept"""
     if not rows:
         return ["(none yet — escalate when unsure)"]
     lines = [f"- [{r['project'] or 'global'}] {r['content']}" for r in rows]
@@ -160,19 +101,7 @@ def render_learnings(rows: list[dict[str, Any]],
 def build_system_prompt(store: NeoStore, project: str, learnings_limit: int = 50,
                         kind: str = "question",
                         learnings_chars: int = LEARNINGS_CHAR_BUDGET) -> str:
-    """Persona + learnings. Byte-stable across questions (per project and kind) so
-    consecutive headless calls of the same kind share a cached prompt prefix.
-
-    Each kind gets its own persona, and for the same reason in all three cases: the
-    general answerer persona is told to escalate anything that publishes or touches
-    production, which is right for open questions and would send every release — every
-    plan whose children mention shipping, and every cost alarm, since an alarm is about
-    spend by construction — straight to the user, which is the attention cost all three
-    features exist to remove.
-
-    Each persona lives in the module that OWNS the kind, never here: the prose is judged
-    beside the code that files the question.
-    """
+    """Persona + learnings"""
     from .autoreview import ASSUMPTION_REVIEWER_PERSONA
     from .gates import REVIEWER_PERSONA
     from .plans import PLAN_REVIEWER_PERSONA
@@ -193,18 +122,14 @@ def build_question_prompt(q: dict[str, Any]) -> str:
         f"Work order: {q['wo_id']}",
     ]
     if q.get("context"):
-        # A plan question's context IS the subject — the spec being judged (§5). Under a
-        # label reading "work order context" the reviewer treats it as background.
+        # A plan question's context IS the subject — the spec being judged (§5)
         label = "Spec under review" if q.get("kind") == "plan" else "Work order context"
         parts.append(f"{label}:\n{q['context']}")
     parts += ["", f"Worker question:\n{q['question']}"]
     return "\n".join(parts)
 
 
-# What Neo may write in `verdict`, and the status it means. Both the bare verb and the
-# past participle are accepted: the persona asks for "approve", the database stores
-# "approved", and a model that writes the other one is not making a mistake worth
-# escalating over.
+# What Neo may write in `verdict`, and the status it means
 _VERDICT_ALIASES = {
     "approve": "approved", "approved": "approved",
     "deny": "denied", "denied": "denied", "reject": "denied", "rejected": "denied",
@@ -213,19 +138,7 @@ _VERDICT_ALIASES = {
 
 
 def _gate_verdict(data: dict[str, Any]) -> str:
-    """The gate verdict Neo reached: `approved`, `denied` or `dismissed`.
-
-    Reads the `verdict` field, falling back to the older boolean `approve`. The fallback
-    is not politeness — it is required during a release. Neo's persona lives in the
-    deployed code but its LEARNINGS live in the production state directory, so the two
-    can disagree across an upgrade in either direction: a Neo still emitting the old
-    shape must keep working, and a `verdict` this build did not expect must not silently
-    open a gate.
-
-    Anything unrecognised falls back to the boolean, which defaults to False. Output that
-    says nothing intelligible therefore denies rather than approves: the only way through
-    a gate is an explicit yes.
-    """
+    """The gate verdict Neo reached: `approved`, `denied` or `dismissed`"""
     raw = data.get("verdict")
     if isinstance(raw, str):
         verdict = _VERDICT_ALIASES.get(raw.strip().lower())
@@ -235,13 +148,7 @@ def _gate_verdict(data: dict[str, Any]) -> str:
 
 
 def _verdict_stated(data: dict[str, Any]) -> bool:
-    """Did Neo actually RULE, or is `denied` only what `_gate_verdict` fell back to?
-
-    `_gate_verdict` collapses the two, which is right for a gate — no explicit yes, no
-    gate — and wrong for every caller that has a third outcome for output nobody could
-    parse. Without this a reply that named no verdict at all is indistinguishable from a
-    deliberate refusal, and `issues.read_triage_verdict` would have to guess.
-    """
+    """Did Neo actually RULE, or is `denied` only what `_gate_verdict` fell back to?"""
     raw = data.get("verdict")
     if isinstance(raw, str) and _VERDICT_ALIASES.get(raw.strip().lower()):
         return True
@@ -249,13 +156,7 @@ def _verdict_stated(data: dict[str, Any]) -> bool:
 
 
 def parse_dispatch(data: Any) -> dict[str, str] | None:
-    """Normalise the optional `dispatch` block — Neo filing a pre-approved work order
-    to correct a self-contradicting ledger (see PERSONA).
-
-    A dispatch with no title is dropped rather than guessed at: the title is what the
-    user sees in `jarvis wo list`, and "(untitled)" work orders appearing on their own
-    is how a helpful feature becomes noise.
-    """
+    """Normalise the optional `dispatch` block"""
     if not isinstance(data, dict):
         return None
     title = str(data.get("title") or "").strip()
@@ -266,27 +167,13 @@ def parse_dispatch(data: Any) -> dict[str, str] | None:
 
 
 def _escalation_cause(raw: Any) -> str:
-    """The model's `cause` label, or `""` — §2 of docs/superpowers/specs/2026-10-01-neo-observability.md.
-
-    NEVER RAISES, AND NEVER REJECTS THE VERDICT. A missing or unrecognised cause is a
-    label absent from an otherwise valid decision; rejecting it would route a perfectly
-    good verdict through `_unparseable_verdict` and reach the user as an escalation the
-    model never made — question 388's bug one field along. `""` stores as NULL and renders
-    "not recorded".
-
-    Only `ESCALATION_CAUSES_CHOSEN` is accepted: a model naming a FAILED-class member is
-    describing something it cannot know about.
-    """
+    """The model's `cause` label, or `""` — §2 of docs/superpowers/specs/2026-10-01-neo-observability.md"""
     cause = str(raw or "").strip().lower()
     return cause if cause in ESCALATION_CAUSES_CHOSEN else ""
 
 
 def _validate_verdict(data: dict[str, Any]) -> dict[str, Any]:
-    """Normalise a parsed Neo reply into the verdict dict, or raise.
-
-    `escalate` is the field that says this is a Neo verdict at all rather than some other
-    JSON object the model happened to emit, so its absence is a bad shape, not a default.
-    """
+    """Normalise a parsed Neo reply into the verdict dict, or raise"""
     if "escalate" not in data:
         raise structured.InvalidOutput("no `escalate` field in Neo's reply")
     verdict = _gate_verdict(data)
@@ -298,73 +185,57 @@ def _validate_verdict(data: dict[str, Any]) -> dict[str, Any]:
         "approve": verdict == "approved",
         "verdict_stated": _verdict_stated(data),
         "dispatch": parse_dispatch(data.get("dispatch")),
-        # Carried through unvalidated on purpose: whether a proposed exemption may exist
-        # is decided by `gate_rules.propose_exemption`, against canary commands this layer
-        # knows nothing about. Truncating it is the only judgement made here, and that is
-        # about the size of a database column, not the content of a rule.
+        # Carried through unvalidated on purpose: whether a proposed exemption may exist is decided by...
         "exempt_pattern": str(data.get("exempt_pattern") or "")[:400],
-        # `exempt_pattern`'s treatment, for the same reason one kind along: what counts
-        # as a high-stakes assumption is `autoreview`'s judgement, and this layer must not
-        # acquire an opinion about a vocabulary it does not own. Absent on every other
-        # kind, which reads as `routine` there and is never consulted.
+        # `exempt_pattern`'s treatment, for the same reason one kind along: what counts as a high-stakes...
         "stakes": str(data.get("stakes") or "")[:20].strip().lower(),
-        # Read exactly as `stakes` is — normalised, never trusted, never fatal. §2 of
-        # docs/superpowers/specs/2026-10-01-neo-observability.md.
+        # Read exactly as `stakes` is — normalised (docs/superpowers/specs/2026-10-01-neo-observability.md)
         "cause": _escalation_cause(data.get("cause")),
     }
 
 
-#: Prefix of the `reason` a synthetic escalation carries. A constant rather than a
-#: literal in two files because `answer_question` recognises this path by it, and a
-#: prefix that drifted would silently stop the diagnostic log below from ever firing.
+#: Prefix of the `reason` a synthetic escalation carries
 UNPARSEABLE_PREFIX = "unparseable Neo output: "
 
 
 def _unparseable_verdict(raw: str) -> dict[str, Any]:
-    """The fail-safe: output Neo cannot be held to becomes an escalation to the user.
-
-    Deliberately NOT a retry. An answer nobody can read must never reach a worker as an
-    answer, and asking again would spend a call to find that out — so this path fails
-    toward the user's attention, which is the failure the OS can recover from.
-
-    The 120-character clip is for the SURFACES — this reason is what the escalation, the
-    daemon log line and the Telegram push all print, and none of them wants three
-    kilobytes. The full text is logged separately by `answer_question`; see the note
-    there for why that mattered.
-    """
+    """The fail-safe: output Neo cannot be held to becomes an escalation to the user"""
     return {"escalate": True, "answer": "", "approve": False, "verdict": "denied",
             "verdict_stated": False, "dispatch": None,
-            # The one FAILED-class member written in this module, and the OS writes it in
-            # the fail-safe rather than copying it off a reply (spec §2).
+            # The one FAILED-class member written in this module
             "cause": "unparseable-reply",
             "reason": f"{UNPARSEABLE_PREFIX}{(raw or '')[:120]}"}
 
 
+def _fold_split_reply(raw: str) -> dict[str, Any]:
+    """Last chance before the fail-safe: one verdict split across two JSON objects (#1098)"""
+    objects = structured.parse_json_objects(raw)
+    if len(objects) < 2:
+        return _unparseable_verdict(raw)
+    ruling = [o for o in objects if "escalate" in o]
+    if len(ruling) != 1:
+        return _unparseable_verdict(raw)
+    verdict = dict(ruling[0])
+    if verdict.get("dispatch") is None:
+        for other in objects:
+            if other is not ruling[0] and other.get("dispatch") is not None:
+                verdict["dispatch"] = other["dispatch"]
+                break
+    try:
+        return _validate_verdict(verdict)
+    except Exception:
+        return _unparseable_verdict(raw)
+
+
 def parse_verdict(raw: str) -> dict[str, Any]:
-    """Parse Neo's strict-JSON reply, tolerating fenced or chatty output.
-    Unparseable output is treated as an escalation — never deliver garbage.
-
-    `verdict` carries the ruling on an approval request; `approve` is kept alongside it
-    as the boolean the old contract used, so callers that only ask "did this open a
-    gate" still read correctly. Note that a dismissal leaves `approve` False: it clears
-    the command without authorising anything, and code that conflates the two would put
-    an approval back into the audit trail.
-
-    `dispatch` is absent on almost every answer; None means "nothing to clean up".
-    """
-    return structured.coerce(raw, _validate_verdict, on_invalid=_unparseable_verdict)
+    """Parse Neo's strict-JSON reply, tolerating fenced or chatty output"""
+    return structured.coerce(raw, _validate_verdict, on_invalid=_fold_split_reply)
 
 
 def answer_question(store: NeoStore, q: dict[str, Any], model: str,
                     learnings_limit: int = 50, timeout: int = 300,
                     record: Any = None) -> dict[str, Any]:
-    """One Neo call for one claimed question. Returns the parsed verdict.
-
-    `record(kind, usage=…, …)` is the accounting seam (`agent_usage.record` by default):
-    answering a worker's question costs tokens, and they belong to the work order that
-    asked. Recorded before the reply is parsed, because an unparseable answer was paid
-    for just the same.
-    """
+    """One Neo call for one claimed question"""
     from . import agent_usage
     from .paths import ensure_home
 
@@ -374,12 +245,9 @@ def answer_question(store: NeoStore, q: dict[str, Any], model: str,
     prompt = build_question_prompt(q)
     result = claude_cli.run_headless_result(
         prompt, system_prompt=system, model=model, timeout=timeout,
-        # Neutral cwd: running from a project dir would pull that repo's
-        # CLAUDE.md/context into Neo's prompt (and break prefix stability).
+        # Neutral cwd: running from a project dir would pull that repo's CLAUDE.md/context into Neo's prompt...
         cwd=ensure_home(),
-        # This call records itself, three lines down, with the question it answered.
-        # Leaving the transport's own attribution on would double-count it whenever the
-        # daemon's environment happens to carry a work order — see `claude_cli`.
+        # This call records itself, three lines down, with the question it answered
         records_itself="neo_answer",
     )
     record("neo_answer", usage=result, project=q.get("project") or "",
@@ -387,21 +255,11 @@ def answer_question(store: NeoStore, q: dict[str, Any], model: str,
            model=result.model or model, question_id=q.get("id"))
     verdict = parse_verdict(result.text)
     if verdict["reason"].startswith(UNPARSEABLE_PREFIX):
-        # THE FULL REPLY, ONCE, HERE. Every other surface clips it to 120 characters,
-        # which is right for a notification and useless for a diagnosis: question 145's
-        # root cause (a single missing `}` at character 3161) was only reachable by
-        # digging Neo's raw text out of a `~/.claude` session transcript by hand, and a
-        # transcript is not something the OS owns or can promise will still be there.
-        # An unparseable reply is rare and already costs the user an interruption; it
-        # can afford the log lines.
+        # THE FULL REPLY, ONCE, HERE
         log.warning("neo question %s: reply could not be parsed (%d chars) — full raw "
                     "reply follows:\n%s", q.get("id"), len(result.text or ""),
                     result.text or "")
-    # THE MODEL THAT ACTUALLY ANSWERED, as the transport reported it — not the `model`
-    # argument, which is what was asked for. Additive, so every existing consumer reads
-    # by key and is untouched (`panel.decide`'s note). `autoreview` records it against
-    # the assumption it settles: a machine verdict a person reads back in six months is
-    # only judgeable if the record says which model reached it.
+    # THE MODEL THAT ACTUALLY ANSWERED, as the transport reported it
     return {**verdict, "model": result.model or model}
 
 
@@ -409,36 +267,7 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
                 deliver: Any = None, max_questions: int = 50,
                 answer: Any = None, unreachable: Any = None,
                 refused: Any = None) -> list[dict[str, Any]]:
-    """Answer every queued question in FIFO order, back-to-back.
-
-    `deliver(question, verdict)` is called per question with the outcome — the
-    daemon uses it to route answers to workers and escalations to the user. The
-    drain is sequential BY DESIGN: ordering + tight spacing keep Neo's shared
-    prompt prefix warm in the Anthropic cache.
-
-    `unreachable(question, detail)` is the OTHER outcome, and it is a SEPARATE HOOK
-    rather than a flag on a verdict because there is no verdict: nothing was decided, so
-    there is nothing for `deliver`'s per-kind branches to apply. Fired only once the
-    retries are genuinely spent — spec
-    docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §2.
-
-    `refused(question, error)` is the THIRD outcome and a third hook for the same
-    reason: the OS built a prompt past its own ceiling, so no call was made, no retry
-    can help, and the user is told once. Spec §4:
-    docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
-
-    `answer(store, question, model, learnings_limit) -> verdict` is HOW a question gets
-    answered, defaulting to `answer_question` — one headless call, one agent. It is the
-    seam the multi-agent panel is injected through (`daemon._neo_drain` passes
-    `panel.decide` bound to the catalog when the panel is enabled).
-
-    THE SEAM IS A KEYWORD RATHER THAN AN IMPORT, AND THAT IS THE WHOLE POINT. The design
-    says "`answer_question` becomes a caller of the panel" and "if the panel's first seat
-    fails, fall back to today's single-agent path" — which taken literally is `neo`
-    importing `panel` while `panel` imports `neo`, an import cycle in a codebase that has
-    none. This module must never know that panels exist; falling back to the single agent
-    is then simply not passing `answer=`.
-    """
+    """Answer every queued question in FIFO order, back-to-back (docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §2.)"""
     answer = answer or answer_question
     results = []
     for _ in range(max_questions):
@@ -448,8 +277,7 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
         try:
             verdict = answer(store, q, model, learnings_limit)
         except claude_cli.UsageLimitError as e:
-            # BEFORE the generic outage below, and the ordering is the fix: a spent
-            # window is not a transport fault and must not spend a retry (issue #235).
+            # BEFORE the generic outage below (#235)
             from .worker_session import RATE_LIMIT_FALLBACK_DELAY
 
             reopens = e.limit.reset_at or (time.time() + RATE_LIMIT_FALLBACK_DELAY)
@@ -458,12 +286,7 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
             results.append({"question": q, "verdict": None, "outcome": "held"})
             continue
         except claude_cli.PromptTooLargeError as e:
-            # BEFORE the generic outage below — it is a `ClaudeCliError` subclass, so
-            # Python would never reach a clause placed after it — and `max_attempts=0`
-            # for `InputTooLargeError`'s reason: the OS built this prompt past its own
-            # ceiling, so the same call fails the same way for ever. No synthesised
-            # verdict and no `deliver`: nothing was decided. Spec §4:
-            # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+            # BEFORE the generic outage below (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
             outcome = store.release_claim(q["id"], f"prompt too large: {e}",
                                           max_attempts=0)
             log.error("neo question %s was refused before it was sent: %s", q["id"], e)
@@ -472,11 +295,7 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
             results.append({"question": q, "verdict": None, "outcome": outcome})
             continue
         except claude_cli.InputTooLargeError as e:
-            # BEFORE the generic outage below, and the ordering is the mechanism: the
-            # same call will fail the same way for ever, so `max_attempts=0` gives up at
-            # the first attempt rather than parking a worker for three stale sweeps.
-            # Still no synthesised verdict. Spec §5:
-            # docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
+            # BEFORE the generic outage below (docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md)
             outcome = store.release_claim(q["id"], f"input too large: {e}",
                                           max_attempts=0)
             log.error("neo question %s could not be sent: %s", q["id"], e)
@@ -485,10 +304,7 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
             results.append({"question": q, "verdict": None, "outcome": outcome})
             continue
         except claude_cli.ClaudeCliError as e:
-            # A CALL THAT NEVER HAPPENED IS NOT A VERDICT. No `mark("failed")`, no
-            # synthesised `{escalate: True}` and no `deliver` — question 388 reached the
-            # user as an escalation Neo had never made, because all three were here. The
-            # claim goes back so the retry path that already exists owns the row.
+            # A CALL THAT NEVER HAPPENED IS NOT A VERDICT
             outcome = store.release_claim(q["id"], str(e))
             log.error("neo could not be reached for question %s (%s): %s",
                       q["id"], outcome, e)
@@ -497,17 +313,15 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
             results.append({"question": q, "verdict": None, "outcome": outcome})
             continue
         if verdict["escalate"]:
-            # Spec §2 of docs/superpowers/specs/2026-10-01-neo-observability.md.
+            # Spec §2 of docs/superpowers/specs/2026-10-01-neo-observability.md
             store.mark(q["id"], "escalated", reason=verdict["reason"],
                        cause=verdict.get("cause") or "")
             log.info("neo escalated question %s: %s", q["id"], verdict["reason"])
         else:
-            # `text`, not `answer`: `answer` is the injected answerer above, and rebinding
-            # it here made the second question of every drain call a string.
+            # `text`, not `answer`: `answer` is the injected answerer above
             text = verdict["answer"]
             if q.get("kind") in ("approval", "plan"):
-                # A ruling lives in `verdict`, not in prose. Record it as the answer too
-                # so `jarvis neo show` and the review surfaces read plainly.
+                # A ruling lives in `verdict`, not in prose
                 text = (verdict.get("verdict") or "denied").upper()
             store.record_answer(q["id"], text, answered_by="neo",
                                 reason=verdict["reason"])
@@ -520,19 +334,14 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
 
 
 def learning_from_review(q: dict[str, Any], feedback: str) -> str:
-    """Distill a corrected answer into a learning Neo will see next time."""
+    """Distill a corrected answer into a learning Neo will see next time"""
     return (f"When a worker asked: \"{q['question'][:200]}\" — I answered: "
             f"\"{(q.get('answer') or '')[:200]}\". The user corrected me: {feedback}")
 
 
 def learning_from_assumption_review(wo: dict[str, Any], assumptions: list[dict[str, Any]],
                                     accepted: bool, feedback: str) -> str:
-    """Distill the user's verdict on a work order's assumptions into a learning.
-
-    Neo's other learning source (reviews of its own answers) only fires once Neo is
-    already answering. This one fires on the decisions the user is making TODAY, so
-    Neo arrives at its first question with the user's taste already in the prompt.
-    """
+    """Distill the user's verdict on a work order's assumptions into a learning"""
     what = "; ".join(f"\"{a['content'][:200]}\"" for a in assumptions[:5]) or "(none recorded)"
     verdict = "accepted" if accepted else "rejected"
     return (f"On work order \"{wo.get('title', '')[:120]}\" a worker decided: {what}. "

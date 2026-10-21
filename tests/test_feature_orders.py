@@ -1,20 +1,4 @@
-"""Feature orders: the planned unit of work above the work order.
-
-Phase 2 of the feature-order design. The loop under test is
-`jarvis fo create` -> the daemon opens ONE planner work order -> the planner submits a
-validated plan -> Neo releases it or sends it back -> the children are created with real
-dependency edges and the ordinary claim-time filter dispatches them in order.
-
-Two properties this file is written to protect, because both are easy to lose in a
-refactor and neither is visible from any single function:
-
-* **Nothing about an ordinary work order changes.** The migration is additive and a
-  project that never files a feature order must behave exactly as before. See
-  `test_an_ordinary_work_order_is_untouched_by_any_of_this`.
-* **A child work order is an ordinary work order.** No new scheduler, no new status, no
-  new dispatch path — the parent is a row that owns them, and the edges between them are
-  the Phase 1 `depends_on` edges.
-"""
+"""Feature orders: the planned unit of work above the work order"""
 
 from __future__ import annotations
 
@@ -68,17 +52,12 @@ def child(key: str, needs: list[str] | None = None, extra: str = "") -> dict:
 
 
 def a_plan(*children: dict, **extra) -> dict:
-    # The fake Neo reads the plan-review QUESTION, which is a skeleton without the
-    # briefs (wo-e4a359cb) — a FORCE_* marker buried in a child's description would
-    # never reach it. Surface any marker into the summary, which the skeleton carries.
+    # The fake Neo reads the plan-review QUESTION, which is a skeleton without the briefs (wo-e4a359cb)
     markers = " ".join(sorted({m for c in children
                                for m in ("FORCE_APPROVE", "FORCE_REJECT")
                                if m in c["description"]}))
     return {"summary": f"an exporter {markers}".strip(),
-            # Every plan must stand on a design document. The fixture project ships one
-            # (`jarvis.testing.FIXTURE_DESIGN_DOC`), so naming it here keeps the design
-            # rule out of tests that are about something else; the rule itself is tested
-            # in tests/test_plan_validator.py.
+            # Every plan must stand on a design document
             "design_doc": FIXTURE_DESIGN_DOC,
             "children": list(children), **extra}
 
@@ -89,7 +68,7 @@ ASK = ("Add a CSV exporter to the reporting module, with a command that calls it
 
 @pytest.fixture()
 def planning(started, store):
-    """A feature order whose planner has been opened and dispatched."""
+    """A feature order whose planner has been opened and dispatched"""
     daemon = started
     fo = ops.create_feature_order("proj_a", "CSV export", description=ASK)
     daemon.tick()
@@ -106,7 +85,7 @@ def planner_of(store, fo_id: str) -> dict:
     return store.get_work_order(store.get_feature_order(fo_id)["plan_wo_id"])
 
 
-# -- creation ---------------------------------------------------------------------------
+# -- creation
 
 
 def test_a_feature_order_starts_pending_and_plans_nothing_by_itself(started, store):
@@ -118,13 +97,12 @@ def test_a_feature_order_starts_pending_and_plans_nothing_by_itself(started, sto
 
 
 def test_a_feature_order_without_a_description_is_refused(started):
-    """A work order can survive a bare title because a human reads it. A feature order's
-    first reader is a planner in a fresh session, and it will decompose four words."""
+    """A work order can survive a bare title because a human reads it"""
     with pytest.raises(ops.OpsError, match="needs a description"):
         ops.create_feature_order("proj_a", "CSV export")
 
 
-# -- the planner ------------------------------------------------------------------------
+# -- the planner
 
 
 def test_the_daemon_opens_exactly_one_planner(planning, store):
@@ -135,7 +113,7 @@ def test_the_daemon_opens_exactly_one_planner(planning, store):
     assert planner["kind"] == "planner"
     assert planner["parent_id"] == fo["id"]
     assert planner["status"] in ("dispatching", "running")
-    # ONE child, not a fan-out. The daemon never decomposes anything itself.
+    # ONE child, not a fan-out
     assert len(store.list_work_orders()) == 1
 
 
@@ -144,33 +122,22 @@ def test_the_planner_carries_the_ask_verbatim_and_a_planner_briefing(planning, s
     _, fo = planning
     planner = planner_of(store, fo["id"])
 
-    # On the record: what the user actually asked for, so `jarvis wo show` and
-    # `jarvis fo show` read the same.
+    # On the record: what the user actually asked for
     assert planner["description"] == ASK
-    # In the briefing: the planner contract, not the worker one.
+    # In the briefing: the planner contract, not the worker one
     call = fake_claude.wait_calls(lambda c: "--session-id" in c["argv"], count=1)[0]
     prompt = call["argv"][-1]
     assert "You are the PLANNER" in prompt
     assert f"jarvis fo plan {fo['id']} --from-file" in prompt
     assert "Do not build the feature" in prompt
-    # The rule the whole plan lives or dies on has to be in there.
+    # The rule the whole plan lives or dies on has to be in there
     assert "sees its own description plus its section, and nothing else" in prompt
-    # And `fo plan` is its finish — `jarvis wo finish` is only the re-delivery after a
-    # refusal (2026-10-14-an-unanswered-refusal-must-name-itself.md §5).
+    # And `fo plan` is its finish — `jarvis wo finish` is only the re-delivery after a refusal...
     assert "IS your finish" in prompt
 
 
 def test_a_planner_runs_on_ordinary_worker_permissions(planning, store, project):
-    """A DELIBERATE choice, pinned here so changing it has to be deliberate too.
-
-    The design wants a planner that cannot produce product code, but the planner is a
-    work order rather than a subagent, so it has no CLI-enforced `tools:` restriction —
-    only the settings `permissions` path. A deny broad enough to stop product code also
-    stops the two things a planner MUST do: write the plan.json it submits, and produce
-    a design document whose pull request the design makes the base of the children's
-    stack. So the rule is carried in the briefing prose in this phase, and the hard
-    posture waits for the seats, which can express it declaratively.
-    """
+    """A DELIBERATE choice, pinned here so changing it has to be deliberate too"""
     _, fo = planning
     planner_id = fo["plan_wo_id"]
 
@@ -179,12 +146,13 @@ def test_a_planner_runs_on_ordinary_worker_permissions(planning, store, project)
 
     allow = settings["permissions"]["allow"]
     assert any(r.startswith("Write(") and planner_id in r for r in allow)
-    assert not settings["permissions"].get("deny")
+    # The only denies are the schema-trimming defaults (worker.denied_tools)
+    from jarvis.catalog import DEFAULT_WORKER_DENIED_TOOLS
+    assert set(settings["permissions"].get("deny", [])) <= set(DEFAULT_WORKER_DENIED_TOOLS)
 
 
 def test_a_planner_is_not_created_twice(planning, store):
-    """Idempotence is by status, not by a flag: the feature order leaves `pending` in
-    the same call that files the planner."""
+    """Idempotence is by status, not by a flag: the feature order leaves `pending` in the same call that..."""
     daemon, fo = planning
     daemon.tick()
     daemon.tick()
@@ -193,8 +161,7 @@ def test_a_planner_is_not_created_twice(planning, store):
 
 
 def test_an_ordinary_work_order_is_untouched_by_any_of_this(started, store):
-    """The migration is additive. A project that never files a feature order must not be
-    able to tell that feature orders exist."""
+    """The migration is additive"""
     wo = ops.create_work_order("proj_a", "an ordinary job")
 
     row = store.get_work_order(wo["id"])
@@ -203,7 +170,7 @@ def test_an_ordinary_work_order_is_untouched_by_any_of_this(started, store):
     assert store.claim_next_pending()["id"] == wo["id"]
 
 
-# -- plan submission --------------------------------------------------------------------
+# -- plan submission
 
 
 def test_submitting_a_plan_parks_it_for_review_and_settles_the_planner(planning, store):
@@ -213,20 +180,15 @@ def test_submitting_a_plan_parks_it_for_review_and_settles_the_planner(planning,
 
     assert out["status"] == "plan_review"
     assert store.get_feature_order(fo["id"])["status"] == "plan_review"
-    # `jarvis fo plan` IS the planner's `jarvis wo finish` — nothing is left running.
+    # `jarvis fo plan` IS the planner's `jarvis wo finish` — nothing is left running
     assert planner_of(store, fo["id"])["result_summary"]
-    # Still nothing created: the plan is a proposal until it is released.
+    # Still nothing created: the plan is a proposal until it is released
     assert [w for w in store.list_work_orders() if w["kind"] == "worker"] == []
 
 
 def test_a_planner_whose_merge_was_gated_settles_completed_and_not_into_the_queue(
         planning, store):
-    """The gate records the pull request; ROUTING still needs a submitter's `--pr`.
-
-    Issue #742 and the 2026-09-25 spec §3: a gate-derived URL is not a declaration, so a
-    planner keeps settling `completed` and no validation round opens over a pull request
-    that already merged.
-    """
+    """The gate records the pull request; ROUTING still needs a submitter's `--pr` (#742)"""
     from jarvis import gates
 
     _, fo = planning
@@ -268,7 +230,7 @@ def test_a_plan_cannot_be_submitted_to_a_feature_order_that_is_not_planning(star
         ops.submit_plan(fo["id"], a_plan(child("a")))
 
 
-# -- Neo's review -----------------------------------------------------------------------
+# -- Neo's review
 
 
 def released(daemon, store, fo_id: str) -> dict:
@@ -287,13 +249,13 @@ def test_neo_releasing_a_plan_creates_the_children_with_their_edges(planning, st
     children = store.feature_children(fo["id"])
     assert [c["title"] for c in children] == ["Build schema", "Build api"]
     assert all(c["parent_id"] == fo["id"] and c["kind"] == "worker" for c in children)
-    # The plan's local keys became real work-order ids on a real Phase 1 edge.
+    # The plan's local keys became real work-order ids on a real Phase 1 edge
     assert store.dependencies(children[1]) == [children[0]["id"]]
     assert store.dependencies(children[0]) == []
 
 
 def test_the_children_are_dispatched_in_dependency_order(planning, store):
-    """No new scheduler: the claim-time filter Phase 1 shipped does all of it."""
+    """No new scheduler: the claim-time filter Phase 1 shipped does all of it"""
     daemon, fo = planning
     ops.submit_plan(fo["id"], a_plan(child("schema", extra="FORCE_APPROVE"),
                                      child("api", needs=["schema"])))
@@ -314,16 +276,14 @@ def test_neo_sending_a_plan_back_returns_it_to_planning_with_the_reason(planning
 
     assert fo["status"] == "planning"
     assert store.feature_children(fo["id"]) == []
-    # The reason reaches the planner as a message, so it revises in the SAME session
-    # rather than starting cold.
+    # The reason reaches the planner as a message
     queued = store.list_messages(fo["plan_wo_id"])
     assert any("sent back" in m["content"] and "child two needs more context"
                in m["content"] for m in queued)
 
 
 def test_a_rejected_plan_can_be_resubmitted_from_plan_review(planning, store):
-    """The feature order is `planning` after a rejection, but a planner mid-revision may
-    also still be sitting in `plan_review` — both have to accept a resubmission."""
+    """The feature order is `planning` after a rejection"""
     daemon, fo = planning
     ops.submit_plan(fo["id"], a_plan(child("first")))
 
@@ -347,9 +307,7 @@ def test_neo_escalating_puts_the_feature_order_in_front_of_the_user(planning, st
 
 
 def test_a_plan_at_the_cap_goes_to_the_user_even_when_neo_releases_it(planning, store):
-    """The cap is one of the two backstops the Neo-reviews-plans default rests on, and a
-    backstop the reviewer can wave through is not one. Neo is still ASKED — its reading
-    is what makes a large graph reviewable — but it does not get to release it."""
+    """The cap is one of the two backstops the Neo-reviews-plans default rests on"""
     daemon, fo = planning
     ops.submit_plan(fo["id"], a_plan(
         child("c0", extra="FORCE_APPROVE"),
@@ -363,14 +321,12 @@ def test_a_plan_at_the_cap_goes_to_the_user_even_when_neo_releases_it(planning, 
     assert f"over the cap of {plans.CHILD_CAP}" in fo["attention_reason"]
     assert "approve" in fo["attention_reason"]  # Neo's reading, attached
     assert store.feature_children(fo["id"]) == []
-    # WHO decided, on the row `jarvis neo stats` groups by: the cap did, not Neo —
-    # docs/superpowers/specs/2026-10-01-neo-observability.md §1.
+    # WHO decided, on the row `jarvis neo stats` groups by: the cap did, not Neo (docs/superpowers/specs/2026-10-01-neo-observability.md §1.)
     assert question(fo["plan_question_id"])["escalation_cause"] == "scope-over-cap"
 
 
 def test_a_plan_under_the_cap_is_released_by_neo_alone(planning, store):
-    """The control for the test above: the cap must not be so eager that the ordinary
-    case still costs the user a decision — that is the whole cost this feature removes."""
+    """The control for the test above: the cap must not be so eager that the ordinary case still costs the..."""
     daemon, fo = planning
     ops.submit_plan(fo["id"], a_plan(
         child("c0", extra="FORCE_APPROVE"),
@@ -383,7 +339,7 @@ def test_a_plan_under_the_cap_is_released_by_neo_alone(planning, store):
     assert fo["needs_attention"] == 0
 
 
-# -- the user's own decision --------------------------------------------------------------
+# -- the user's own decision
 
 
 def test_the_user_can_release_an_escalated_plan(planning, store):
@@ -408,8 +364,7 @@ def test_the_user_rejecting_needs_a_reason(planning, store):
 
 
 def test_neos_verdict_is_dropped_if_the_user_got_there_first(planning, store):
-    """Both deciders share one function, so the loser of the race has to be a no-op
-    rather than a second decision applied on top of the first."""
+    """Both deciders share one function"""
     daemon, fo = planning
     ops.submit_plan(fo["id"], a_plan(child("schema", extra="FORCE_APPROVE")))
     ops.review_plan(fo["id"], accept=False, feedback="wrong shape", decided_by="user")
@@ -420,12 +375,12 @@ def test_neos_verdict_is_dropped_if_the_user_got_there_first(planning, store):
     assert store.feature_children(fo["id"]) == []
 
 
-# -- settling: how a feature order ends ------------------------------------------------------
+# -- settling: how a feature order ends
 
 
 @pytest.fixture()
 def executing(planning, store):
-    """A released feature order with two children, `schema` then `api`."""
+    """A released feature order with two children, `schema` then `api`"""
     daemon, fo = planning
     ops.submit_plan(fo["id"], a_plan(child("schema", extra="FORCE_APPROVE"),
                                      child("api", needs=["schema"])))
@@ -449,10 +404,7 @@ def test_a_feature_order_completes_only_when_every_child_has(executing, store):
 
 
 def test_a_child_waiting_for_its_pr_to_merge_does_not_count_as_done(executing, store):
-    """The strict rule Phase 1 shipped for dependency edges, applied to the parent: a
-    feature is done when its code is on the default branch, not when it is on branches.
-    The merge poller closes each child a couple of minutes after the user merges, so
-    this costs nobody a step."""
+    """The strict rule Phase 1 shipped for dependency edges"""
     daemon, fo, schema, api = executing
     store.set_status(schema["id"], "completed")
     store.set_status(api["id"], "waiting_pr_merge")
@@ -477,9 +429,7 @@ def test_one_failed_child_fails_the_feature_and_says_which(executing, store):
 
 def test_a_cancelled_child_also_fails_the_feature_but_words_it_as_cancellation(
         executing, store):
-    """It did not settle successfully, so `completed` would be a lie — but a cancellation
-    is a decision already taken, and a failure is a problem to diagnose. They ask the
-    user for different things, so they must not read the same."""
+    """It did not settle successfully, so `completed` would be a lie"""
     daemon, fo, schema, api = executing
 
     store.set_status(schema["id"], "cancelled")
@@ -492,8 +442,7 @@ def test_a_cancelled_child_also_fails_the_feature_but_words_it_as_cancellation(
 
 
 def test_a_failed_feature_flags_once_and_not_every_tick(executing, store):
-    """Flag-once is true by construction, not by bookkeeping: a feature that fails leaves
-    `executing` in the same call that raises the flag, so the next tick never sees it."""
+    """Flag-once is true by construction"""
     daemon, fo, schema, api = executing
     store.set_status(schema["id"], "failed")
     daemon.tick()
@@ -506,8 +455,7 @@ def test_a_failed_feature_flags_once_and_not_every_tick(executing, store):
 
 
 def test_a_feature_order_still_planning_is_never_settled(planning, store):
-    """Only `executing` is looked at. A feature with no children yet has none completed,
-    and a settle step that did not check the status would call that `failed`."""
+    """Only `executing` is looked at"""
     daemon, fo = planning
 
     daemon.tick()
@@ -516,8 +464,7 @@ def test_a_feature_order_still_planning_is_never_settled(planning, store):
 
 
 def test_a_completed_feature_closes_the_backlog_item_it_came_from(started, store):
-    """A feature order has no `finish` — nobody reports its result, it is derived — so
-    the courtesy `ops.mark_backlog_done` does for a work order has to happen here."""
+    """A feature order has no `finish`"""
     from jarvis.central_store import CentralStore
 
     daemon = started
@@ -550,13 +497,13 @@ def test_promoting_a_backlog_item_as_a_feature_plans_it_instead_of_dispatching_i
 
         assert out["fo_id"].startswith("fo-")
         assert backlog_item(central, item["id"])["promoted_wo_id"] == out["fo_id"]
-        # Nothing dispatched: a feature order is planned before anything runs.
+        # Nothing dispatched: a feature order is planned before anything runs
         assert store.list_work_orders() == []
     finally:
         central.close()
 
 
-# -- cancellation ---------------------------------------------------------------------------
+# -- cancellation
 
 
 def test_cancelling_a_feature_order_stops_everything_it_owns(planning, store):
@@ -568,7 +515,7 @@ def test_cancelling_a_feature_order_stops_everything_it_owns(planning, store):
     out = ops.cancel_feature_order(fo["id"])
 
     assert store.get_feature_order(fo["id"])["status"] == "cancelled"
-    # A feature order that stopped while its children kept running would be a label.
+    # A feature order that stopped while its children kept running would be a label
     assert {c["status"] for c in store.feature_children(fo["id"])} == {"cancelled"}
     assert fo["plan_wo_id"] not in out["cancelled_work_orders"]  # already settled
 
@@ -581,7 +528,7 @@ def test_a_settled_feature_order_cannot_be_cancelled_again(planning, store):
         ops.cancel_feature_order(fo["id"])
 
 
-# -- surfaces ---------------------------------------------------------------------------------
+# -- surfaces
 
 
 def test_show_renders_the_tree_and_the_plan(planning, store):
@@ -597,14 +544,13 @@ def test_show_renders_the_tree_and_the_plan(planning, store):
     assert "Build schema" in detail["plan_text"]
     api = detail["children"][1]
     assert api["depends_on"] == [detail["children"][0]["id"]]
-    # The derived label, so the tree does not claim a blocked child is about to start.
+    # The derived label, so the tree does not claim a blocked child is about to start
     assert api["status_label"].startswith("pending — blocked by")
 
 
 def test_an_escalated_plan_is_one_attention_line_naming_the_feature_order(planning,
                                                                           store):
-    """One line per feature order, never one per child: the strip that names everything
-    is the strip that stops being read."""
+    """One line per feature order, never one per child: the strip that names everything is the strip that..."""
     daemon, fo = planning
     ops.submit_plan(fo["id"], a_plan(child("schema")))
     released(daemon, store, fo["id"])
@@ -614,13 +560,12 @@ def test_an_escalated_plan_is_one_attention_line_naming_the_feature_order(planni
     items = [a for a in status["attention"] if a.get("fo_id") == fo["id"]]
     assert len(items) == 1
     assert items[0]["decide"] == f"jarvis fo show {fo['id']}"
-    # And NOT as a raw Neo escalation telling the user to `jarvis neo answer`.
+    # And NOT as a raw Neo escalation telling the user to `jarvis neo answer`
     assert not [a for a in status["attention"] if a["status"] == "neo_escalated"]
 
 
 def test_the_cli_round_trips_a_plan_through_a_file(planning, store, tmp_path, capsys):
-    """`--from-file`, not an argument: a plan is a long string full of repo paths, which
-    is exactly the input that trips the privileged-action classifier."""
+    """`--from-file`, not an argument: a plan is a long string full of repo paths"""
     from jarvis import cli
 
     daemon, fo = planning
@@ -636,8 +581,7 @@ def test_the_cli_round_trips_a_plan_through_a_file(planning, store, tmp_path, ca
 
 
 def test_the_cli_refuses_a_plan_file_that_is_not_json(planning, tmp_path, capsys):
-    """A planner reads this message and nothing else, so it has to say what is wrong
-    with the file rather than surfacing a traceback."""
+    """A planner reads this message and nothing else"""
     from jarvis import cli
 
     _, fo = planning
@@ -649,16 +593,11 @@ def test_the_cli_refuses_a_plan_file_that_is_not_json(planning, tmp_path, capsys
     assert "not valid JSON" in capsys.readouterr().err
 
 
-# -- a planner assumption holds its feature --------------------------------------------
-#
-# docs/superpowers/specs/2026-09-24-a-planner-assumption-holds-its-feature.md. The
-# assumption is attached to a work order and the unit it governs is the feature, so a
-# child of an unratified plan is neither dispatched nor merged. Derived, silent, and it
-# writes nothing: the held child stays `pending`, as a dependency-blocked one does.
+# -- a planner assumption holds its feature
 
 
 def a_released_feature(daemon, store, *keys: str) -> dict:
-    """A feature whose children exist, are independent, and have not been dispatched."""
+    """A feature whose children exist, are independent, and have not been dispatched"""
     fo = ops.create_feature_order("proj_a", "CSV export", description=ASK)
     daemon.tick()
     ops.submit_plan(fo["id"], a_plan(*[child(k, extra="FORCE_APPROVE") for k in keys]))
@@ -667,11 +606,7 @@ def a_released_feature(daemon, store, *keys: str) -> dict:
 
 def a_bare_feature(store, *, status: str = "pending", assumptions: int = 1,
                    planner_status: str = "completed") -> tuple[dict, dict, dict]:
-    """`(feature, planner, child)` built from rows — no planner session, no plan.
-
-    What the hold reads is a `plan_wo_id` and a pending assumption row; the plan
-    machinery decides nothing here.
-    """
+    """`(feature, planner, child)` built from rows — no planner session, no plan"""
     fo = store.create_feature_order("CSV export", description=ASK)
     planner = store.create_work_order("plan it", kind="planner", parent_id=fo["id"],
                                       status=planner_status)
@@ -693,8 +628,7 @@ def test_a_planner_assumption_holds_its_features_children(started, store):
 
 
 def test_a_held_child_does_not_starve_the_queue(started, store):
-    """The property §2.2 rests on: the filter is in the ROW SELECTION, so the held child
-    is passed over inside the statement that picks the next row."""
+    """The property §2.2 rests on: the filter is in the ROW SELECTION"""
     held = a_released_feature(started, store, "schema")
     store.add_assumption(held["plan_wo_id"], "the export table gets a new column")
     clear = a_released_feature(started, store, "api")
@@ -709,8 +643,7 @@ def test_a_held_child_does_not_starve_the_queue(started, store):
 
 
 def test_the_planner_itself_is_never_held_by_its_own_assumptions(started, store):
-    """Holding it would deadlock the feature for ever: the planner is dispatched before
-    the plan exists, and it is the only thing that can produce one."""
+    """Holding it would deadlock the feature for ever: the planner is dispatched before the plan exists"""
     _, planner, _ = a_bare_feature(store, planner_status="pending")
 
     assert store.claim_next_pending()["id"] == planner["id"]
@@ -718,7 +651,7 @@ def test_the_planner_itself_is_never_held_by_its_own_assumptions(started, store)
 
 
 def test_a_running_child_is_untouched_by_a_new_plan_hold(started, store):
-    """The hold is on STARTING and on LANDING. Work in flight is not wrong yet (§4.4)."""
+    """The hold is on STARTING and on LANDING"""
     _, planner, kid = a_bare_feature(store, status="running", assumptions=0)
     store.update_work_order(kid["id"], session_id="sess-1")
     store.add_assumption(planner["id"], "the export table gets a new column")
@@ -732,8 +665,7 @@ def test_a_running_child_is_untouched_by_a_new_plan_hold(started, store):
 
 
 def test_plan_hold_and_the_claim_query_agree(started, store):
-    """The guard on §2.1's one duplication: the claim filter cannot call `plan_hold` (it
-    must stay inside the atomic UPDATE), so the two are pinned against each other."""
+    """The guard on §2.1's one duplication: the claim filter cannot call `plan_hold` (it must stay inside..."""
     _, _, held_kid = a_bare_feature(store)
     _, _, clear_kid = a_bare_feature(store, assumptions=0)
     _, planner, _ = a_bare_feature(store, planner_status="pending")
@@ -751,7 +683,7 @@ def test_plan_hold_and_the_claim_query_agree(started, store):
 
 
 def test_a_planner_with_no_pending_assumptions_holds_nothing(started, store):
-    """NEGATIVE. A settled assumption is not a decision anyone owes."""
+    """NEGATIVE"""
     fo = a_released_feature(started, store, "schema")
     store.add_assumption(fo["plan_wo_id"], "the export table gets a new column")
     ops.review_work_order(fo["plan_wo_id"])
@@ -762,7 +694,7 @@ def test_a_planner_with_no_pending_assumptions_holds_nothing(started, store):
 
 
 def test_a_work_order_with_no_feature_holds_nothing(started, store):
-    """NEGATIVE. Parentless — nearly every work order — and answered from the row."""
+    """NEGATIVE"""
     a_bare_feature(store)
     loose = ops.create_work_order("proj_a", "an ordinary job")
 
@@ -771,8 +703,7 @@ def test_a_work_order_with_no_feature_holds_nothing(started, store):
 
 
 def test_ruling_the_last_assumption_dispatches_on_the_next_tick(started, store):
-    """§2.5: nothing pokes anything. `dispatch_pending` runs every tick, and that is the
-    whole self-healing story — one command from the user, no second."""
+    """§2.5: nothing pokes anything"""
     fo = a_released_feature(started, store, "schema")
     store.add_assumption(fo["plan_wo_id"], "the export table gets a new column")
     started.tick()
@@ -785,8 +716,7 @@ def test_ruling_the_last_assumption_dispatches_on_the_next_tick(started, store):
 
 
 def test_a_held_child_raises_no_attention(started, store):
-    """Waiting is not an attention item — the rule a dependency edge and a slot already
-    follow. `true_blockers` gets no branch, so INV-ATTENTION-MISSING stays quiet."""
+    """Waiting is not an attention item — the rule a dependency edge and a slot already follow"""
     from jarvis import invariants
 
     fo = a_released_feature(started, store, "schema")
@@ -800,8 +730,7 @@ def test_a_held_child_raises_no_attention(started, store):
 
 
 def test_the_hold_reads_as_blocked_by_the_plan(started, store):
-    """Ranked above the dependency and slot labels: of the three true sentences it is the
-    one naming a move a person has to make."""
+    """Ranked above the dependency and slot labels: of the three true sentences it is the one naming a..."""
     from jarvis import invariants
 
     fo = a_released_feature(started, store, "schema")
@@ -816,12 +745,11 @@ def test_the_hold_reads_as_blocked_by_the_plan(started, store):
     assert f"jarvis wo review {fo['plan_wo_id']}" in label
 
 
-# -- the note: children already merged (§2.6) ------------------------------------------
+# -- the note: children already merged (§2.6)
 
 
 def test_an_overtaken_assumption_says_children_already_merged(started, store):
-    """The fact the user needs in order to rule — never a ruling. The row stays pending:
-    the OS answering the user's own question is the bug, one level up (§4.3)."""
+    """The fact the user needs in order to rule — never a ruling"""
     fo = a_released_feature(started, store, "schema", "api", "docs")
     planner_id = fo["plan_wo_id"]
     store.add_assumption(planner_id, "the export table gets a new column")
@@ -839,7 +767,7 @@ def test_an_overtaken_assumption_says_children_already_merged(started, store):
 
 
 def test_no_overtaken_note_when_no_child_has_merged(started, store):
-    """NEGATIVE, both ways: nothing landed, and a work order that is not a planner."""
+    """NEGATIVE, both ways: nothing landed, and a work order that is not a planner"""
     fo = a_released_feature(started, store, "schema", "api")
     store.add_assumption(fo["plan_wo_id"], "the export table gets a new column")
     plain = ops.create_work_order("proj_a", "an ordinary job")
@@ -852,14 +780,12 @@ def test_no_overtaken_note_when_no_child_has_merged(started, store):
     assert ops.assumptions_with_rulings(store, plain["id"])[0]["overtaken"] is None
 
 
-# -- the spec the OS holds travels with the question (issue #746) ----------------------
-#
-# docs/superpowers/specs/2026-09-25-plan-review-reads-the-spec-the-os-holds.md. Two
-# halves: the spec rides in the question's context (A), and it stays equal to the
-# COMMITTED copy for as long as the review is open (B).
+# -- the spec the OS holds travels with the question (issue #746)
 
 
-REVISED = FIXTURE_DESIGN_DOC_BODY.replace("Rows are dicts", "Rows are frozen records")
+#: A revision visible in the OUTLINE the review now carries (Neo ruling Q1880): a changed sentence is...
+REVISED = (FIXTURE_DESIGN_DOC_BODY.replace("Rows are dicts", "Rows are frozen records")
+           + "\n## Frozen records\n\nNew in the revision.\n")
 
 
 def git(repo, *args) -> None:
@@ -874,7 +800,7 @@ def commit_spec(repo, text: str, message: str = "spec: revise") -> None:
 
 
 def planner_worktree(project, store, fo_id: str, branch: str = "feat/plan"):
-    """The planner's worktree, as a dispatched planner would have created it."""
+    """The planner's worktree, as a dispatched planner would have created it"""
     planner = planner_of(store, fo_id)
     path = project / ".claude" / "worktrees" / (planner["worktree"] or planner["id"])
     git(project, "worktree", "add", "-q", "-b", branch, str(path))
@@ -899,28 +825,27 @@ def plan_questions() -> list[dict]:
 
 
 def test_the_question_carries_the_spec_under_its_own_label(planning, store):
-    """1. The reviewer is handed the text, not the filename it used to go hunting for."""
+    """1"""
     _, fo = planning
 
     out = ops.submit_plan(fo["id"], a_plan(child("reader")))
 
     q = question(out["neo_question_id"])
-    assert "An empty result set writes the header" in q["context"]
+    assert "## 3. Failure handling" in q["context"]
+    assert "An empty result set writes the header" not in q["context"]
     assert "Do NOT open this path on disk" in q["context"]
     assert "Spec under review:" in neo_mod.build_question_prompt(q)
 
 
 def test_a_spec_merged_after_submission_is_what_the_review_reads(planning, store,
                                                                  project):
-    """2. Issue #746 by name: revised, committed, merged, and the review moves with it."""
+    """2 (#746)"""
     daemon, fo = planning
     worktree = planner_worktree(project, store, fo["id"])
     out = ops.submit_plan(fo["id"], a_plan(child("reader")))
     old_qid = out["neo_question_id"]
 
-    # The squash merge: the revision lands on the default branch and the planner's
-    # worktree is reclaimed. No merge predicate anywhere — the rung that is READABLE
-    # decides (§7).
+    # The squash merge: the revision lands on the default branch and the planner's worktree is reclaimed
     commit_spec(project, REVISED)
     git(project, "worktree", "remove", "--force", str(worktree))
 
@@ -930,14 +855,14 @@ def test_a_spec_merged_after_submission_is_what_the_review_reads(planning, store
     assert question(old_qid)["answer"] == f"SUPERSEDED by question {old_qid + 1}"
     assert refreshed["plan_question_id"] == old_qid + 1
     new = question(refreshed["plan_question_id"])
-    assert "Rows are frozen records" in new["context"]
+    assert "## Frozen records" in new["context"]
     assert re.search(r"as committed on main @ [0-9a-f]{7}", new["context"])
     assert json.loads(refreshed["plan"])["design_doc_content"] == REVISED
 
 
 def test_an_unmerged_revision_is_read_from_the_branch_never_from_main(planning, store,
                                                                      project):
-    """3. Question 658's exact shape: main's older copy must not win."""
+    """3"""
     daemon, fo = planning
     worktree = planner_worktree(project, store, fo["id"])
     ops.submit_plan(fo["id"], a_plan(child("reader")))
@@ -947,13 +872,14 @@ def test_an_unmerged_revision_is_read_from_the_branch_never_from_main(planning, 
     daemon.tick()
 
     new = question(store.get_feature_order(fo["id"])["plan_question_id"])
-    assert "Rows are frozen records" in new["context"]
-    assert "Rows are dicts" not in new["context"]
+    assert "## Frozen records" in new["context"]      # the branch's copy
+    assert "## Frozen records" in REVISED and "## Frozen records" \
+        not in FIXTURE_DESIGN_DOC_BODY                # ...and main's older copy lacks it
     assert "as committed on branch feat/plan @ " in new["context"]
 
 
 def test_an_uncommitted_edit_is_invisible(planning, store, project):
-    """4. The working tree is never read, so a dirty spec is no divergence at all."""
+    """4"""
     daemon, fo = planning
     worktree = planner_worktree(project, store, fo["id"])
     out = ops.submit_plan(fo["id"], a_plan(child("reader")))
@@ -968,7 +894,7 @@ def test_an_uncommitted_edit_is_invisible(planning, store, project):
 
 def test_a_spec_with_no_committed_copy_is_refused_and_names_the_commit(planning, store,
                                                                       project):
-    """5. §11: the refusal is the ruling applied at its source, with the fix named."""
+    """5. §11: the refusal is the ruling applied at its source, with the fix named"""
     _, fo = planning
     doc = a_plan(child("reader"))
     doc["design_doc"] = "docs/superpowers/specs/uncommitted.md"
@@ -983,7 +909,7 @@ def test_a_spec_with_no_committed_copy_is_refused_and_names_the_commit(planning,
 
 
 def test_an_untouched_spec_costs_no_neo_call_however_many_ticks(planning, store):
-    """6. The hash is what keeps this off the every-tick cadence's bill."""
+    """6"""
     daemon, fo = planning
     out = ops.submit_plan(fo["id"], a_plan(child("reader")))
 
@@ -997,7 +923,7 @@ def test_an_untouched_spec_costs_no_neo_call_however_many_ticks(planning, store)
 def test_a_question_the_user_holds_is_told_about_the_revision_not_replaced(planning,
                                                                           store,
                                                                           project):
-    """7. Superseding an escalated question would close a row the user is looking at."""
+    """7"""
     daemon, fo = planning
     out = ops.submit_plan(fo["id"], a_plan(child("reader")))  # no FORCE_: it escalates
     daemon._neo_drain()
@@ -1014,7 +940,7 @@ def test_a_question_the_user_holds_is_told_about_the_revision_not_replaced(plann
 
 def test_a_verdict_in_flight_cannot_land_on_a_refreshed_plan(planning, store, project,
                                                              monkeypatch):
-    """8. The pointer, not the question row, is what protects the decision."""
+    """8"""
     daemon, fo = planning
     out = ops.submit_plan(fo["id"], a_plan(child("reader")))
     old_qid = out["neo_question_id"]
@@ -1045,7 +971,7 @@ def test_a_verdict_in_flight_cannot_land_on_a_refreshed_plan(planning, store, pr
 
 def test_nothing_readable_leaves_the_review_exactly_as_it_was(planning, store, project,
                                                               caplog):
-    """9. A stale spec the reviewer was told IS the spec beats no spec."""
+    """9"""
     daemon, fo = planning
     out = ops.submit_plan(fo["id"], a_plan(child("reader")))
     git(project, "rm", "-q", "--", FIXTURE_DESIGN_DOC)
@@ -1063,7 +989,7 @@ def test_nothing_readable_leaves_the_review_exactly_as_it_was(planning, store, p
 
 def test_a_revision_the_plan_no_longer_fits_goes_back_to_the_planner(planning, store,
                                                                      project):
-    """10. §9 step 5: never refresh under a plan the new text no longer satisfies."""
+    """10. §9 step 5: never refresh under a plan the new text no longer satisfies"""
     daemon, fo = planning
     ops.submit_plan(fo["id"], a_plan(child("reader")))
     section = fixture_spec_section("reader")
@@ -1081,9 +1007,9 @@ def test_a_revision_the_plan_no_longer_fits_goes_back_to_the_planner(planning, s
                                                              {})["reason"]
 
 
-def test_a_spec_over_the_bound_is_clipped_in_the_question_and_whole_in_the_plan(
+def test_the_question_carries_the_spec_outline_and_the_plan_the_whole_text(
         planning, store, project):
-    """11. Clipping is a rendering of the QUESTION. The children keep the whole text."""
+    """11, under Neo ruling Q1880: the question is an OUTLINE rendering; the children keep the whole text"""
     _, fo = planning
     big = FIXTURE_DESIGN_DOC_BODY + "\n".join(
         f"\n## Padding {n}\n\n" + "x" * 4000 for n in range(40))
@@ -1092,8 +1018,8 @@ def test_a_spec_over_the_bound_is_clipped_in_the_question_and_whole_in_the_plan(
     out = ops.submit_plan(fo["id"], a_plan(child("reader")))
 
     q = question(out["neo_question_id"])
-    assert "TRUNCATED at " in q["context"]
-    assert "## Padding 39" in q["context"]     # the omitted headings, verbatim
+    assert "## Padding 0" in q["context"] and "## Padding 39" in q["context"]
+    assert "x" * 100 not in q["context"]       # every heading, no body prose
     assert len(q["context"]) < len(big)
     assert json.loads(store.get_feature_order(fo["id"])["plan"])["design_doc_content"] \
         == big
@@ -1101,16 +1027,14 @@ def test_a_spec_over_the_bound_is_clipped_in_the_question_and_whole_in_the_plan(
 
 def test_a_refreshed_spec_reaches_the_children_and_the_feature_agent(planning, store,
                                                                      project):
-    """12. `design_doc_content` has four other readers and all of them improve."""
+    """12"""
     daemon, fo = planning
     ops.submit_plan(fo["id"], a_plan(child("reader", extra="FORCE_APPROVE")))
     revised = REVISED.replace("You are a Python engineer working on the exporter.",
                               "You are a Python engineer who writes frozen records.")
     commit_spec(project, revised)
 
-    # `ops` directly, not `daemon.tick()`: a tick followed by a drain in the same test
-    # races on the project registry whatever runs in the planning band (a bare
-    # `time.sleep` in that seam reproduces it). The daemon seam is covered by test 2.
+    # `ops` directly, not `daemon.tick()`: a tick followed by a drain in the same test races on the...
     assert ops.refresh_plan_spec(fo["id"])["refreshed"]
     daemon._neo_drain()    # and then the release
 
@@ -1121,17 +1045,11 @@ def test_a_refreshed_spec_reaches_the_children_and_the_feature_agent(planning, s
     assert "frozen records" in definition.read_text()
 
 
-# -- a child's section is derivable, not written once ----------------------------------
-#
-# §2.1 of
-# docs/superpowers/specs/2026-10-13-an-assumption-review-payload-carries-its-spec-section.md
-# `work_orders.spec_section` is written once at plan release, so a row
-# whose column is NULL leaves every reader of `spec_of` equally blind — the worker prompt,
-# the panel packet, the dashboard and the assumption reviewer.
+# -- a child's section is derivable, not written once
 
 
 def _with_plan(store, *children: dict) -> tuple[dict, list[dict]]:
-    """A released feature whose plan is written straight to the row, with its children."""
+    """A released feature whose plan is written straight to the row, with its children"""
     fo = store.create_feature_order("CSV export", description=ASK)
     plan = a_plan(*children)
     plan["design_doc_content"] = FIXTURE_DESIGN_DOC_BODY
@@ -1140,8 +1058,7 @@ def _with_plan(store, *children: dict) -> tuple[dict, list[dict]]:
 
 
 def test_a_child_with_no_recorded_section_resolves_it_from_the_plan_and_adopts_it(store):
-    """§2.1. The join is the title, exact; the heal makes the ROW true, not just one
-    prompt."""
+    """§2.1"""
     _, (kid,) = _with_plan(store, child("reader"))
     store.update_work_order(kid["id"], spec_section=None)
 
@@ -1154,8 +1071,7 @@ def test_a_child_with_no_recorded_section_resolves_it_from_the_plan_and_adopts_i
 
 
 def test_the_heal_runs_once_and_the_fallback_is_not_re_entered(store, monkeypatch):
-    """§2.1. Healing makes the fallback dead code on every subsequent read, which is what
-    keeps a title join cheap."""
+    """§2.1"""
     _, (kid,) = _with_plan(store, child("reader"))
     store.update_work_order(kid["id"], spec_section=None)
     specs.spec_of(store, store.get_work_order(kid["id"]))
@@ -1170,8 +1086,7 @@ def test_the_heal_runs_once_and_the_fallback_is_not_re_entered(store, monkeypatc
 
 
 def test_a_recorded_section_that_disagrees_with_the_plan_is_never_overwritten(store):
-    """§2.1, the user's ruling on question 1690: a corrected section is owned by whoever
-    corrected it."""
+    """§2.1, the user's ruling on question 1690: a corrected section is owned by whoever corrected it"""
     _, (kid,) = _with_plan(store, child("reader"))
     corrected = fixture_spec_section("by-hand")
     assert corrected != fixture_spec_section("reader")
@@ -1184,8 +1099,7 @@ def test_a_recorded_section_that_disagrees_with_the_plan_is_never_overwritten(st
 
 
 def test_two_plan_children_sharing_one_title_resolve_to_nothing(store):
-    """§2.1: the match must be UNIQUE. A near-match writes the wrong section into a column
-    four readers trust."""
+    """§2.1: the match must be UNIQUE"""
     twin = child("writer")
     twin["title"] = child("reader")["title"]
     _, kids = _with_plan(store, child("reader"), twin)
@@ -1199,7 +1113,7 @@ def test_two_plan_children_sharing_one_title_resolve_to_nothing(store):
 
 
 def test_a_title_in_no_plan_item_resolves_to_nothing(store):
-    """§2.1: absent resolves to nothing, never to a guess."""
+    """§2.1: absent resolves to nothing, never to a guess"""
     _, (kid,) = _with_plan(store, child("reader"))
     store.update_work_order(kid["id"], spec_section=None, title="Something else")
 
@@ -1210,7 +1124,7 @@ def test_a_title_in_no_plan_item_resolves_to_nothing(store):
 
 
 def test_a_planner_and_a_manager_still_have_no_section_of_their_own(store):
-    """§2.1: three readers depend on `spec_of` answering None for both."""
+    """§2.1: three readers depend on `spec_of` answering None for both"""
     fo, _ = _with_plan(store, child("reader"))
     planner = store.create_work_order("Plan CSV export", parent_id=fo["id"],
                                       kind="planner")
@@ -1220,30 +1134,24 @@ def test_a_planner_and_a_manager_still_have_no_section_of_their_own(store):
     assert specs.spec_of(store, manager) is None
 
 
-# -- the spec a person can open ---------------------------------------------------------
-#
-# docs/superpowers/specs/2026-09-28-a-feature-spec-you-can-open.md. The document the OS
-# HOLDS is the one every surface shows — it works before any pull request exists — and
-# which revision that is has to be RECORDED, never invented.
+# -- the spec a person can open
 
 
 def test_submitting_a_plan_records_which_revision_the_snapshot_came_from(planning,
                                                                          store):
-    """§4. Set in the same statement as the content, so the two cannot disagree."""
+    """§4"""
     _, fo = planning
     ops.submit_plan(fo["id"], a_plan(child("schema")))
 
     plan = db.from_json(store.get_feature_order(fo["id"])["plan"], {})
     assert plan["design_doc_content"].startswith("# Exporter design")
-    # `landing.committed_text`'s own words, verbatim — re-wording them here would make
-    # the page and the Neo question describe one snapshot two ways.
+    # `landing.committed_text`'s own words, verbatim
     assert re.match(r"(branch \S+|origin/\S+|\S+) @ [0-9a-f]{4,}",
                     plan["design_doc_source"]), plan["design_doc_source"]
 
 
 def test_spec_link_points_a_planner_and_a_child_at_the_same_document(planning, store):
-    """§5(a). `spec_of` still answers None for a planner; this is the second, narrow
-    projection beside it."""
+    """§5(a)"""
     daemon, fo = planning
     ops.submit_plan(fo["id"], a_plan(child("schema", extra="FORCE_APPROVE")))
     released(daemon, store, fo["id"])
@@ -1259,14 +1167,14 @@ def test_spec_link_points_a_planner_and_a_child_at_the_same_document(planning, s
 
     child_link = specs.spec_link(store, kid)
     assert child_link is not None and child_link["anchor"]
-    # A standalone work order has no plan and therefore no spec to point at.
+    # A standalone work order has no plan and therefore no spec to point at
     ordinary = ops.create_work_order("proj_a", "an ordinary job")
     assert specs.spec_link(store, store.get_work_order(ordinary["id"])) is None
 
 
 def test_the_cli_prints_one_section_and_not_the_whole_document(planning, store,
                                                               capsys):
-    """Spec test 6. The terminal gets MARKDOWN — the HTML renderer serves the page."""
+    """Spec test 6"""
     from jarvis import cli
 
     _, fo = planning
@@ -1300,7 +1208,7 @@ def test_the_cli_refuses_a_feature_with_no_plan_and_names_its_state(planning, ca
 
 
 def test_wo_show_carries_the_spec_link_for_a_planner(planning, store, capsys):
-    """§6. A planner's `spec_section` column is NULL, so today it says nothing at all."""
+    """§6"""
     from jarvis import cli
 
     _, fo = planning
@@ -1312,8 +1220,7 @@ def test_wo_show_carries_the_spec_link_for_a_planner(planning, store, capsys):
     assert detail["spec"]["repo_path"] == FIXTURE_DESIGN_DOC
     assert detail["spec"]["fo_id"] == fo["id"]
 
-    # And for a person: the document, the revision, and THE COMMAND — never a URL, since
-    # the CLI does not know the dashboard's host.
+    # And for a person: the document, the revision, and THE COMMAND
     assert cli.main(["wo", "show", fo["plan_wo_id"]]) == 0
     human = capsys.readouterr().out
     assert f"jarvis fo spec {fo['id']}" in human
@@ -1321,10 +1228,7 @@ def test_wo_show_carries_the_spec_link_for_a_planner(planning, store, capsys):
 
 
 def test_a_failed_flagged_feature_order_still_lists(started, store):
-    """Obligation 6 of docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md.
-    `failed` is SETTLED and it is also the status a feature order raises its flag in —
-    `settle_features` writes both in one call — so an open-only listing drops the flag on
-    the floor at the exact moment it means the most."""
+    """Obligation 6 of docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md"""
     fo = ops.create_feature_order("proj_a", "CSV export", description=ASK)
     quiet = ops.create_feature_order("proj_a", "another ask", description=ASK)
     store.set_feature_status(fo["id"], "failed")
@@ -1339,17 +1243,17 @@ def test_a_failed_flagged_feature_order_still_lists(started, store):
 
 
 def test_the_github_link_is_omitted_rather_than_guessed(project):
-    """§6. A 404 from a URL the OS assembled reads as the spec having been deleted."""
+    """§6"""
     from jarvis import github
     from jarvis.testing import with_origin
 
-    # No origin: nothing to build an owner/repo from.
+    # No origin: nothing to build an owner/repo from
     assert github.blob_url(project, FIXTURE_DESIGN_DOC) is None
 
     with_origin(project)
     url = github.blob_url(project, FIXTURE_DESIGN_DOC)
     assert url is not None
     assert url.startswith("https://github.com/acme/proj/blob/")
-    # Built on the SHA, so it keeps showing what the page showed after main moves.
+    # Built on the SHA, so it keeps showing what the page showed after main moves
     assert re.search(rf"/blob/[0-9a-f]{{40}}/{FIXTURE_DESIGN_DOC}$", url), url
     assert github.blob_url(project, "") is None

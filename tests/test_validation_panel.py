@@ -1,17 +1,4 @@
-"""`validation.decide` end to end, against the fake `claude` and the stored rows.
-
-TWO THINGS THIS FILE IS BUILT AROUND.
-
-**The fake's validator branch must be the one that answers.** `chair` is a legal seat name
-in Neo's roster and in the validator's, so a validation chair answered by the Neo branch
-comes back a perfectly well-formed Neo verdict carrying no outcome at all — and a lenient
-`decide` would read that as a pass, giving a green suite that exercised nothing. The first
-test asserts the two branches answer in different shapes, in one test, on the same fake.
-
-**Assertions are on STORED ROWS AND CALL COUNTS**, never on "a verdict came back". The whole
-feature is a claim about what was actually judged: how many seats ran, what each said, and
-which of them the outcome came from.
-"""
+"""`validation.decide` end to end, against the fake `claude` and the stored rows"""
 
 from __future__ import annotations
 
@@ -55,9 +42,7 @@ def cfg(**kw) -> ValidationConfig:
 
 
 def headless(fake) -> list[dict]:
-    """Every SEAT call of the round. The priming call (`priming` below) is not one: it
-    carries no mandate and casts no opinion, and folding it in here would add one to
-    every roster assertion in this file."""
+    """Every SEAT call of the round"""
     return [c for c in fake.calls if "-p" in c["argv"] and not _is_priming(c)]
 
 
@@ -71,22 +56,19 @@ def _is_priming(call: dict) -> bool:
 
 
 def seat_of(call: dict) -> str | None:
-    """Which seat this call is — read from the USER prompt, where the mandate and its
-    header live now. The system prompt is the packet, shared by every seat."""
+    """Which seat this call is — read from the USER prompt, where the mandate and its header live now"""
     argv = call["argv"]
     prompt = argv[argv.index("-p") + 1]
     return next((s for s in VALIDATOR_SEATS
                  if f"# Jarvis validation seat: {s}" in prompt), None)
 
 
-# -- the fake answers the right roster --------------------------------------------------
+# -- the fake answers the right roster
 
 
 def test_the_priming_call_is_billed_to_the_round(store, round_row, jarvis_home,
                                                  fake_claude):
-    """It is a real call on the round's behalf. The question this panel has to keep
-    answering is what it costs against the review it replaces, and a call the bill cannot
-    see is a saving nobody can check — the same rule `_record` states for the seats."""
+    """It is a real call on the round's behalf"""
     from jarvis.central_store import CentralStore
 
     validation.decide(store, dict(round_row), packet(), cfg())
@@ -101,14 +83,7 @@ def test_the_priming_call_is_billed_to_the_round(store, round_row, jarvis_home,
 
 def test_a_validation_chair_and_a_neo_chair_get_different_replies(jarvis_home,
                                                                   fake_claude):
-    """THE COLLISION, asserted in one test. Both calls are `chair`; only the header
-    differs. If the Neo branch answered the validation call, the reply below would carry
-    `escalate` and no `outcome`, and `decide` would have nothing to read a verdict from.
-
-    The two headers arrive by different doors now, exactly as they do in production: a
-    validation seat's is in the USER turn, because its system prompt is the packet the
-    whole round shares; a Neo seat's is still in its system prompt.
-    """
+    """THE COLLISION, asserted in one test"""
     validator = claude_cli.run_headless_result(
         "# Jarvis validation seat: chair", system_prompt="the packet")
     neo = claude_cli.run_headless_result(
@@ -122,8 +97,7 @@ def test_a_validation_chair_and_a_neo_chair_get_different_replies(jarvis_home,
 
 def test_fail_seat_takes_down_exactly_one_validator_seat(store, round_row, jarvis_home,
                                                          fake_claude):
-    """Degradation is per seat: one abstains and the rest proceed. Keyed on its own
-    variable so that failing a validation `chair` cannot also fail Neo's."""
+    """Degradation is per seat: one abstains and the rest proceed"""
     fake_claude.fail_seat("security", roster="validator")
 
     validation.decide(store, round_row, packet(), cfg())
@@ -136,8 +110,7 @@ def test_fail_seat_takes_down_exactly_one_validator_seat(store, round_row, jarvi
 
 def test_failing_a_neo_seat_does_not_touch_the_validation_panel(store, round_row,
                                                                 jarvis_home, fake_claude):
-    """The other half of the pairing: one shared variable would have taken the validation
-    chair down here, and the test above would still have passed."""
+    """The other half of the pairing: one shared variable would have taken the validation chair down here"""
     fake_claude.fail_seat("chair")   # Neo's roster, by default
 
     validation.decide(store, round_row, packet(), cfg())
@@ -146,7 +119,7 @@ def test_failing_a_neo_seat_does_not_touch_the_validation_panel(store, round_row
     assert rows["chair"]["status"] == "ok"
 
 
-# -- what one round records and returns ---------------------------------------------------
+# -- what one round records and returns
 
 
 def test_decide_records_one_opinion_per_seat_and_returns_the_contract_keys(
@@ -169,8 +142,7 @@ def test_decide_records_one_opinion_per_seat_and_returns_the_contract_keys(
 
 def test_the_four_seats_run_blind_and_the_chair_sees_them_all(store, round_row,
                                                               jarvis_home, fake_claude):
-    """Blind means none of the four was given another's reply; the chair, and only the
-    chair, is shown all four."""
+    """Blind means none of the four was given another's reply"""
     validation.decide(store, round_row, packet(), cfg())
 
     calls = {seat_of(c): c["argv"][c["argv"].index("-p") + 1] for c in headless(fake_claude)}
@@ -206,9 +178,7 @@ def test_the_per_seat_model_and_timeout_reach_the_calls(store, round_row, jarvis
 
 def test_a_seat_whose_markdown_does_not_ship_records_failed_without_stalling(
         store, round_row, jarvis_home, fake_claude, monkeypatch, tmp_path):
-    """`VALIDATOR_SEATS` is the vocabulary, not this build's shipped set: a catalog may
-    name a seat whose definition arrives in a later release. Recorded `failed` rather than
-    `abstained` — a seat that CANNOT run is not one that timed out."""
+    """`VALIDATOR_SEATS` is the vocabulary"""
     seat_dir = tmp_path / "seats"
     seat_dir.mkdir()
     for s in ("security", "chair"):
@@ -226,11 +196,7 @@ def test_a_seat_whose_markdown_does_not_ship_records_failed_without_stalling(
 
 
 def _spy_on_recorded_opinions(monkeypatch) -> list:
-    """Every Opinion the round actually recorded, captured at `validation._record`.
-
-    The real recorder, so what is asserted is what the round built — the point of review
-    round 1 being that a hand-built Opinion proves nothing about a construction site.
-    """
+    """Every Opinion the round actually recorded, captured at `validation._record`"""
     captured: list = []
     real = validation._record                                      # noqa: SLF001
 
@@ -244,13 +210,7 @@ def _spy_on_recorded_opinions(monkeypatch) -> list:
 
 def test_a_validation_seat_this_build_does_not_ship_is_marked_unavailable(
         store, round_row, jarvis_home, fake_claude, monkeypatch, tmp_path):
-    """REVIEW ROUND 1 of wo-3b2244d4, driving the REAL construction site.
-
-    `validation.py`'s `SeatError` branch records `status='failed'`, a word it shares with
-    a seat that replied unparseably. `unavailable` is the marker that tells the two
-    apart, and it is set HERE and nowhere else — asserting it on a hand-built Opinion
-    would prove nothing about this branch.
-    """
+    """REVIEW ROUND 1 of wo-3b2244d4, driving the REAL construction site"""
     seat_dir = tmp_path / "seats"
     seat_dir.mkdir()
     for s in ("security", "chair"):
@@ -270,8 +230,7 @@ def test_a_validation_seat_this_build_does_not_ship_is_marked_unavailable(
 
 def test_a_validation_seat_that_could_not_be_reached_is_not_marked_unavailable(
         store, round_row, jarvis_home, fake_claude, monkeypatch):
-    """The counterpart: a transport fault is unreached but RETRYABLE, so it must never
-    pick up the marker that exempts a seat from retrying for ever."""
+    """The counterpart: a transport fault is unreached but RETRYABLE"""
     fake_claude.fail_seat("tester", roster="validator")
 
     captured = _spy_on_recorded_opinions(monkeypatch)
@@ -284,14 +243,12 @@ def test_a_validation_seat_that_could_not_be_reached_is_not_marked_unavailable(
     )
 
 
-# -- who outranks whom ----------------------------------------------------------------------
+# -- who outranks whom
 
 
 def test_a_security_veto_outranks_a_chair_that_would_have_passed(store, round_row,
                                                                   jarvis_home, fake_claude):
-    """PAIRED with the control below. The chair's default reply in the fake is `passed`,
-    so this asserts the veto beat a pass that was genuinely on the table — and it asserts
-    the chair was never even asked, on the stored rows and the call count."""
+    """PAIRED with the control below"""
     result = validation.decide(
         store, round_row, packet(declared="FORCE_BLOCK_SECURITY"), cfg())
 
@@ -309,8 +266,7 @@ def test_a_security_veto_outranks_a_chair_that_would_have_passed(store, round_ro
 def test_the_same_packet_without_the_veto_passes_through_the_chair(store, round_row,
                                                                     jarvis_home,
                                                                     fake_claude):
-    """The control for the test above: without the veto the chair runs, is recorded, and
-    its outcome is what comes back."""
+    """The control for the test above: without the veto the chair runs"""
     result = validation.decide(store, round_row, packet(), cfg())
 
     rows = {r["seat"]: r for r in store.validation_opinions(round_row["id"])}
@@ -329,9 +285,7 @@ def test_a_tester_veto_rejects_too(store, round_row, jarvis_home, fake_claude):
 
 def test_an_architect_objection_does_not_reject_and_the_chair_still_rules(
         store, round_row, jarvis_home, fake_claude):
-    """The seat holds no veto: it blocks in its reply and the panel proceeds to the chair,
-    which passes. Paired with the security test above, which is the same reply from a seat
-    that does hold one."""
+    """The seat holds no veto: it blocks in its reply and the panel proceeds to the chair, which passes"""
     result = validation.decide(
         store, round_row, packet(declared="FORCE_BLOCK_ARCHITECT"), cfg())
 
@@ -352,7 +306,7 @@ def test_a_chair_that_rejects_is_the_outcome(store, round_row, jarvis_home, fake
         "the chair's own words, narrowed to the vocabulary the store accepts")
 
 
-# -- failing toward the user, never toward a pass --------------------------------------------
+# -- failing toward the user, never toward a pass
 
 
 def test_a_chair_reply_with_no_outcome_escalates(store, round_row, jarvis_home,
@@ -376,8 +330,7 @@ def test_a_chair_reply_that_will_not_parse_escalates(store, round_row, jarvis_ho
 
 def test_every_seat_going_down_escalates_rather_than_passing(store, round_row,
                                                               jarvis_home, fake_claude):
-    """The chair would otherwise synthesise from four abstentions and could pass work
-    nothing judged — the one outcome this feature cannot produce."""
+    """The chair would otherwise synthesise from four abstentions and could pass work nothing judged"""
     fake_claude.fail_seat("tester", "security", "architect", "maintainer",
                           roster="validator")
 
@@ -389,9 +342,7 @@ def test_every_seat_going_down_escalates_rather_than_passing(store, round_row,
 
 def test_a_chair_that_cannot_be_reached_is_total_failure(store, round_row, jarvis_home,
                                                           fake_claude):
-    """Not a seat abstaining: there is no verdict without the chair. The round machine
-    catches this, marks the round `failed` and retries without consuming a round — so the
-    abstention has to be RECORDED before the exception leaves."""
+    """Not a seat abstaining: there is no verdict without the chair"""
     fake_claude.fail_seat("chair", roster="validator")
 
     with pytest.raises(claude_cli.ClaudeCliError):
@@ -409,19 +360,14 @@ def test_a_panel_with_no_chair_escalates(store, round_row, jarvis_home, fake_cla
 
 
 def test_the_reason_is_capped(store, round_row, jarvis_home, fake_claude):
-    """It is quoted inside `daemon.REVIEW_FEEDBACK`, which the bus frames again."""
+    """It is quoted inside `daemon.REVIEW_FEEDBACK`, which the bus frames again"""
     result = validation.decide(
         store, round_row, packet(declared="FORCE_BLOCK_SECURITY"), cfg())
 
     assert len(result["reason"]) <= validation.REASON_LIMIT
 
 
-# -- a killed panel raises rather than escalating (issue #1039) -----------------------
-#
-# Spec §3: docs/superpowers/specs/
-# 2026-10-14-a-killed-validation-panel-opens-an-investigation.md. Over SYNTHESISED
-# opinions, which the auth-hold file does for the same reason: the classifier is the unit
-# under test and per-seat evidence of a kill exists nowhere else.
+# -- a killed panel raises rather than escalating (issue #1039)
 
 KILLED = claude_cli.Killed(
     message="claude -p judge... was killed by a signal (rc=143) and wrote nothing",
@@ -449,8 +395,7 @@ def _silent(seat: str, **kw):
 
 
 def test_a_killed_panel_raises_rather_than_escalating(panel):
-    """Spec §3 and the defect in one line: `escalated` is terminal and spent the user's
-    attention on an event the record held no rc for."""
+    """Spec §3 and the defect in one line: `escalated` is terminal and spent the user's attention on an..."""
     with pytest.raises(claude_cli.KilledError) as caught:
         panel([_silent(s, killed=KILLED)
                for s in ("tester", "security", "architect", "maintainer")])
@@ -459,15 +404,14 @@ def test_a_killed_panel_raises_rather_than_escalating(panel):
 
 
 def test_one_killed_seat_is_enough_when_no_seat_replied(panel):
-    """Spec §3: first-match like the refusal and auth clauses, not an all-seats rule — one
-    killed seat in a panel where nobody replied is already the event."""
+    """Spec §3: first-match like the refusal and auth clauses, not an all-seats rule"""
     with pytest.raises(claude_cli.KilledError):
         panel([_silent("tester", killed=KILLED),
                _silent("security")])
 
 
 def test_a_refusal_and_an_auth_failure_each_still_win_over_a_kill(panel):
-    """Spec §3, the two ordering pins inside the same block."""
+    """Spec §3, the two ordering pins inside the same block"""
     with pytest.raises(claude_cli.UsageLimitError):
         panel([_silent("tester", killed=KILLED,
                        refused=claude_cli.UsageLimit(message="limit · resets 9am",
@@ -478,8 +422,7 @@ def test_a_refusal_and_an_auth_failure_each_still_win_over_a_kill(panel):
 
 
 def test_a_kill_wins_over_the_transport_branch(panel):
-    """Spec §3: the transport branch would state an outage nobody observed — `cause:
-    "transport"` — and spend the outage budget on it."""
+    """Spec §3: the transport branch would state an outage nobody observed"""
     with pytest.raises(claude_cli.KilledError) as caught:
         panel([_silent("tester", killed=KILLED),
                _silent("security", killed=KILLED)])
@@ -489,8 +432,7 @@ def test_a_kill_wins_over_the_transport_branch(panel):
 
 def test_one_killed_seat_beside_one_that_replied_takes_the_ordinary_path(
         panel, jarvis_home, fake_claude):
-    """Spec §3: the `replied` gate above the block is untouched, so a panel that was
-    reached is judged — the kill is carried and raises nothing."""
+    """Spec §3: the `replied` gate above the block is untouched, so a panel that was reached is judged"""
     from jarvis import seats
 
     verdict = panel([_silent("tester", killed=KILLED),
@@ -500,19 +442,18 @@ def test_one_killed_seat_beside_one_that_replied_takes_the_ordinary_path(
     assert verdict["outcome"] in {"passed", "rejected", "escalated"}
 
 
-# -- the seam ---------------------------------------------------------------------------------
+# -- the seam
 
 
 def test_the_validator_is_none_when_validation_is_disabled():
-    """The feature ships disabled, and at that default not one seat is ever called."""
+    """The feature ships disabled, and at that default not one seat is ever called"""
     assert Daemon._validator(ValidationConfig()) is None
     assert Daemon._validator(ValidationConfig(enabled=False)) is None
 
 
 def test_the_validator_is_the_real_panel_when_enabled(store, round_row, jarvis_home,
                                                        fake_claude):
-    """PAIRED with the row above, and asserted by DRIVING it rather than by its type: a
-    callable that returned a canned pass would satisfy `is not None` perfectly."""
+    """PAIRED with the row above, and asserted by DRIVING it rather than by its type: a callable that..."""
     validator = Daemon._validator(cfg())
 
     assert validator is not None
@@ -526,7 +467,7 @@ def test_the_validator_is_the_real_panel_when_enabled(store, round_row, jarvis_h
 
 def test_the_validator_carries_the_catalogs_settings(store, round_row, jarvis_home,
                                                       fake_claude):
-    """The seam hands `_validator` the config once; every round it judges must use it."""
+    """The seam hands `_validator` the config once; every round it judges must use it"""
     validator = Daemon._validator(cfg(roster=("tester", "chair"),
                                       seat_models={"tester": "haiku"}))
 

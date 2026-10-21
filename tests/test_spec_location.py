@@ -1,21 +1,11 @@
-"""Specs live in exactly one place: `docs/superpowers/specs/`.
-
-A second spec directory under `docs/` grew for two months because the feature-order
-planner prompt's `design_doc` placeholder named it, and it was the only place in the OS
-that told an agent where a spec file goes. These guard against it coming back — by the
-directory's own path, and by the literal prefix in any tracked file, which is how the
-drift spread.
-
-The forbidden literal is composed below rather than written out, so this file does not
-trip its own check.
-"""
+"""Specs live in exactly one place: `docs/superpowers/specs/`"""
 
 from __future__ import annotations
 
 import subprocess
 from pathlib import Path
 
-# Composed so this file does not itself contain the forbidden literal.
+# Composed so this file does not itself contain the forbidden literal
 FORBIDDEN = "docs/" + "specs/"
 CANONICAL = "docs/superpowers/specs/"
 

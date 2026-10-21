@@ -1,10 +1,4 @@
-"""`jarvis wo retry` — the named way to relaunch a `failed` work order.
-
-docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md. The revive existed as an
-unnamed side effect of `wo send`; these tests are about the NAME having a refusal, a
-record and a surface, and about the two things the spec forbids: no status write, and no
-user stamp on the OS's own relaunch note.
-"""
+"""`jarvis wo retry` — the named way to relaunch a `failed` work order (docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md)"""
 
 from __future__ import annotations
 
@@ -23,7 +17,7 @@ def daemon(jarvis_home, fake_claude, catalog_file, project):
 
 
 def a_failed_order(daemon, project, title: str = "build the exporter") -> dict:
-    """A dispatched order whose worker died without delivering — the issue's own shape."""
+    """A dispatched order whose worker died without delivering — the issue's own shape"""
     wo = ops.create_work_order("proj_a", title)
     daemon.tick()
     store = ProjectStore(project)
@@ -53,9 +47,7 @@ def test_retry_queues_one_message_and_records_who_asked(daemon, project):
 
 
 def test_a_message_less_retry_is_the_os_speaking_not_the_user(daemon, project):
-    """§3: `RETRY_NOTE` verbatim, and `user_messages` — the reader that feeds a gate
-    request — must NOT return it. An OS literal stamped `user` would let a worker quote
-    the OS back to the gate panel as the user authorising something."""
+    """§3: `RETRY_NOTE` verbatim, and `user_messages`"""
     wo = a_failed_order(daemon, project)
 
     out = ops.retry(wo["id"], project_name="proj_a", relay=True)
@@ -74,8 +66,7 @@ def test_a_message_less_retry_is_the_os_speaking_not_the_user(daemon, project):
 
 
 def test_a_retry_with_a_message_is_attributed_to_the_user(daemon, project, monkeypatch):
-    # The suite is routinely run BY a worker, which inherits `JARVIS_WO_ID` — and
-    # `user_authorship` refuses a stamp to one, which is the point of that check.
+    # The suite is routinely run BY a worker, which inherits `JARVIS_WO_ID`
     monkeypatch.delenv("JARVIS_WO_ID", raising=False)
     wo = a_failed_order(daemon, project)
 
@@ -113,8 +104,7 @@ def test_every_other_status_is_refused_in_one_sentence(daemon, project, status):
 
 
 def test_an_order_that_never_opened_a_conversation_is_refused(daemon, project):
-    """§4 refusal 2, reachable through `release_dispatch_claim`: `wo send` queues a
-    message `delivery_hold` holds for ever; `retry` refuses instead."""
+    """§4 refusal 2, reachable through `release_dispatch_claim`: `wo send` queues a message..."""
     wo = ops.create_work_order("proj_a", "task")
     store = ProjectStore(project)
     try:
@@ -136,16 +126,14 @@ def test_an_order_that_never_opened_a_conversation_is_refused(daemon, project):
 
 
 def test_the_revive_actually_happens_on_the_next_tick(daemon, project):
-    """End to end — a row written is not a relaunch. §5: the order stays `failed` and
-    stays flagged until the turn goes out."""
+    """End to end — a row written is not a relaunch. §5: the order stays `failed` and stays flagged until..."""
     wo = a_failed_order(daemon, project)
 
     ops.retry(wo["id"], project_name="proj_a")
 
     store = ProjectStore(project)
     try:
-        # §5: the flag is down already and that is cosmetic — `true_blockers`
-        # re-derives it every tick until the turn actually goes out.
+        # §5: the flag is down already and that is cosmetic
         assert store.get_work_order(wo["id"])["status"] == "failed"
     finally:
         store.close()
@@ -160,8 +148,7 @@ def test_the_revive_actually_happens_on_the_next_tick(daemon, project):
 
 
 def test_a_pending_assumption_is_not_buried_by_a_retry(daemon, project):
-    """§5: `wo ack` and `wo done` refuse on one; a retry buries nothing, so it is told
-    rather than blocked."""
+    """§5: `wo ack` and `wo done` refuse on one; a retry buries nothing, so it is told rather than blocked"""
     wo = ops.create_work_order("proj_a", "task")
     daemon.tick()
     ops.assume(wo["id"], "the exporter writes CSV")

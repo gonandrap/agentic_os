@@ -1,9 +1,4 @@
-"""A spec without a problem and a fix is refused at the Write.
-
-§8 of docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md. At `jarvis wo
-finish` the spec is already committed and in the pull request, so the correction costs a
-validation round; at the Write it costs one retry inside the turn.
-"""
+"""A spec without a problem and a fix is refused at the Write (docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md)"""
 
 from __future__ import annotations
 
@@ -47,15 +42,14 @@ def test_heading_match_is_case_insensitive():
 
 
 def test_body_mention_is_not_a_heading():
-    """A spec that merely says "the problem" in a sentence has not got a section."""
+    """A spec that merely says "the problem" in a sentence has not got a section"""
     body = "# Title\n\nThe problem is real and the fix is obvious.\n\n## Notes\n\nx\n"
 
     assert _decision(_write(SPEC, body)) == "deny"
 
 
 def test_edit_not_checked():
-    """An Edit payload carries a fragment, not the document — checking it would refuse
-    every legitimate incremental edit to a conforming spec."""
+    """An Edit payload carries a fragment, not the document"""
     assert _write(SPEC, "one changed paragraph", tool="Edit") is None
 
 
@@ -69,15 +63,13 @@ def test_no_op_for_non_worker_session():
 
 
 def test_planner_design_doc_is_not_checked():
-    """A feature spec is a different shape — sections a child each implements, plus the
-    `Agent profile` appendix — and `plans` validates it on those terms."""
+    """A feature spec is a different shape"""
     env = dict(ENV, JARVIS_WO_KIND="planner")
     assert _write(SPEC, "# Title\n", env=env) is None
 
 
 def test_either_missing_is_a_refusal_not_only_both():
-    """OR, not AND. A document with a problem and no fix is the exact defect the user
-    raised on wo-dd8668fa; requiring both to be absent would let it straight through."""
+    """OR, not AND"""
     problem_only = "# T\n\n## The problem\n\nBroken.\n"
     fix_only = "# T\n\n## The fix\n\nMechanism.\n"
     neither = "# T\n\n## Notes\n\nx\n"

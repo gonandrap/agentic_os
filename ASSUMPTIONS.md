@@ -604,3 +604,34 @@ for every call to be recorded here instead. These are those calls.
     project. The brief edit that removes the "ceases to exist" contradiction (spec SS7)
     is NOT claimed to change behaviour and is not measured; the injection is, by
     `evals/llm/test_house_style_ab.py`.
+
+84. **A worker starts with at most 10K estimated tokens of Jarvis's own text**
+    (`context.START_BUDGET_TOKENS`, chars/4; `tests/test_worker_start_budget.py`). Four
+    defaults moved to pay for it, each reversible in the catalog: `wiring.bundled_skills`
+    is now OFF (Claude Code's own skills, not the user's: the opt-out ruling for the user's
+    plugins, skills and servers is unchanged); `worker.denied_tools` removes `Workflow`,
+    `ScheduleWakeup`, `ReportFindings`, `ListAgents` and `Agent(statusline-setup)` from a
+    worker's tool list; pinned knowledge renders its first `os.knowledge_pinned_chars`
+    (360) plus its id instead of in full; the round-robin index is 8 lines / 1000 chars.
+    Investigators and analysts get a one-line gate pointer instead of the gate protocol.
+    Measured in `docs/os/architecture/worker-context.md`.
+
+85. **The OS knowledge map is a Google OKF v0.2 bundle at `docs/os/`** (index, then
+    playbooks, then concepts). Concepts point at `.serena/memories/`, specs and
+    `jarvis learn` ids rather than copying them. A worker's brief carries ONE playbook,
+    chosen by order kind, a feature parent, or keywords in the title and the first line of
+    the description (`os_map.classify`); every other level is a file path it opens on
+    demand. CLAUDE.md's crib sheet is one line per command; the reasoning moved verbatim
+    to `docs/os/operator/*.md`.
+
+86. **`ponytail` replaces `i-have-adhd` for every agent; reviewers judge against the ask.**
+    Per the user, 2026-10-21: workers make the smallest complete change and reviewers do
+    not ask for what nobody asked for. `ponytail` is vendored verbatim
+    (`src/jarvis/assets/skills/ponytail/`) and its `full`-level rules ride the house style
+    in place of i-have-adhd's `## Shape`; `concision.REVIEW_SCOPE` is appended to every
+    validation seat's prompt, and the seat mandates lost the bullets that invited unasked
+    work (the architect's "where the decision lives", the maintainer's "silent failure",
+    the tester's "missing class"). `caveman` stays: it governs wording, ponytail governs
+    scope. The dashboard digest keeps its own i-have-adhd prompt: it rewrites a question
+    for the user to read and shapes no agent's work. Reversal criterion: if reviewed work
+    starts missing callers or tests the ask needed, restore the removed seat bullets first.

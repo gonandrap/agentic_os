@@ -1,18 +1,4 @@
-"""A message the user sent that the worker will never see — GitHub issue 43.
-
-The issue's root cause is gone: `Daemon.deliver_messages` skipped any session that was
-not `is_finished`, and `blocked` is neither, so a worker waiting on a gate verdict never
-received one. PR 46 replaced supervised background sessions with the headless turn
-runtime and that guard with `worker_session.busy`, so no state can be permanently
-undeliverable any more.
-
-What the issue asked for and nothing built is the second half: the SILENCE. The row stays
-`queued`, which from every surface looks exactly like one about to go out, and
-`ops.waiting_on` answered `queued_message` — a member of `IN_FLIGHT_WAITS` — so the fleet
-reported healthy while fifteen messages across four work orders rotted, a gate verdict
-among them. These tests are that half: the flag, the diagnosis, and the four waits that
-must stay silent because something else already owns them.
-"""
+"""A message the user sent that the worker will never see — GitHub issue 43"""
 
 from __future__ import annotations
 
@@ -30,12 +16,12 @@ from jarvis.invariants import (
 )
 from jarvis.project_store import ProjectStore
 
-#: Comfortably past the shipped 60-minute default, in seconds.
+#: Comfortably past the shipped 60-minute default, in seconds
 LONG_ENOUGH = 90 * 60
 
 
 def _sent_and_never_delivered(store: ProjectStore, status: str = "running") -> dict:
-    """A work order whose turn is reaped and whose message never went out."""
+    """A work order whose turn is reaped and whose message never went out"""
     wo = store.create_work_order("the one that was sent feedback")
     store.update_work_order(wo["id"], session_id="sess-1")
     turn = store.create_turn(wo["id"], "dispatch", "do the thing")
@@ -46,11 +32,11 @@ def _sent_and_never_delivered(store: ProjectStore, status: str = "running") -> d
 
 
 def _now(store: ProjectStore, wo_id: str) -> float:
-    """Long enough after the message was queued for the threshold to bite."""
+    """Long enough after the message was queued for the threshold to bite"""
     return float(store.queued_messages(wo_id)[0]["ts"]) + LONG_ENOUGH
 
 
-# -- what it catches -------------------------------------------------------------------
+# -- what it catches
 
 
 def test_a_message_nobody_delivered_becomes_a_blocker(project):
@@ -62,8 +48,7 @@ def test_a_message_nobody_delivered_becomes_a_blocker(project):
 
 
 def test_the_blocker_carries_no_elapsed_time(project):
-    """INV-ATTENTION-REASON compares it against `attention_reason` and `ack_attention`
-    stores it verbatim, so a reason that ticked could never be acknowledged."""
+    """INV-ATTENTION-REASON compares it against `attention_reason` and `ack_attention` stores it verbatim"""
     store = ProjectStore(project)
     wo = _sent_and_never_delivered(store)
 
@@ -89,7 +74,7 @@ def test_the_invariant_flags_it_and_names_the_message(project):
 
 
 def test_doctor_describes_the_flag_instead_of_raising_it(project):
-    """`jarvis doctor` without --repair is a pure read (`invariants._ReadOnly`)."""
+    """`jarvis doctor` without --repair is a pure read (`invariants._ReadOnly`)"""
     store = ProjectStore(project)
     wo = _sent_and_never_delivered(store)
     _age_the_message(store, wo["id"])
@@ -102,8 +87,7 @@ def test_doctor_describes_the_flag_instead_of_raising_it(project):
 
 
 def test_it_never_overwrites_an_older_decision_the_user_owes(project):
-    """kn-78346a2d's rule: a work order can owe an assumption review AND be missing a
-    message. The flag keeps the most actionable reason; the message is the second line."""
+    """kn-78346a2d's rule: a work order can owe an assumption review AND be missing a message"""
     store = ProjectStore(project)
     wo = _sent_and_never_delivered(store, status="needs_review")
     store.add_assumption(wo["id"], "one call I made")
@@ -117,10 +101,7 @@ def test_it_never_overwrites_an_older_decision_the_user_owes(project):
 
 
 def test_resume_auto_says_what_is_holding_it_and_does_not_send_another(project):
-    """MESSAGE_STUCK_BLOCKER sends the user here, so this command has to be able to
-    answer — and `stalled` must stay False, because a nudge is another message into the
-    same stalled queue.
-    """
+    """MESSAGE_STUCK_BLOCKER sends the user here, so this command has to be able to answer"""
     store = ProjectStore(project)
     wo = _sent_and_never_delivered(store)
     assert ops.waiting_on(store, wo)["what"] == "queued_message"
@@ -135,20 +116,7 @@ def test_resume_auto_says_what_is_holding_it_and_does_not_send_another(project):
 
 
 def test_a_stuck_message_speaks_instead_of_the_parked_line(project):
-    """One stopped worker, one sentence: PARKED_BLOCKER would only say it went quiet.
-
-    THE FIXTURE HAS TO BE OLD IN THE ROWS, not in a `now` argument, and the STATUS is the
-    other half of it: `waiting_pr_merge` with no `pr_url` is a row NO DAEMON PASS SELECTS,
-    so nobody else owns it and the sentence here is this suite's to choose.
-
-    ASSERTED ON `true_blockers`, which is where the choosing happens since §5a
-    (docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md):
-    `parked_reason` answers one question now — is a pass coming — and `message_stuck` is
-    no longer one of its exemptions, because the parked tail is already skipped whenever a
-    line on the list names the stop. The second half is the negative control: with the
-    message delivered, the same fixture IS parked, so a suite that had simply stopped
-    reporting either sentence fails here.
-    """
+    """One stopped worker, one sentence: PARKED_BLOCKER would only say it went quiet (docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md)"""
     store = ProjectStore(project)
     wo = _sent_and_never_delivered(store, status="waiting_pr_merge")
     _age_the_message(store, wo["id"])
@@ -163,14 +131,11 @@ def test_a_stuck_message_speaks_instead_of_the_parked_line(project):
     assert parked_reason(store, wo) == PARKED_BLOCKER
 
 
-# -- the hold it names, one test per branch ---------------------------------------------
-# `stuck_message`'s reason is read by a doctor invariant AND by `ops.waiting_on`, so the
-# `worker_session.PAUSE_NOUN` lookup in two of these runs in front of the user.
+# -- the hold it names, one test per branch
 
 
 def test_it_names_a_missing_session(project):
-    """`deliver_messages` skips an order with no `session_id`, and nothing carries the
-    message into a dispatch prompt — so one that never dispatches holds it for ever."""
+    """`deliver_messages` skips an order with no `session_id`"""
     store = ProjectStore(project)
     wo = store.create_work_order("dispatched nowhere")
     store.set_status(wo["id"], "running")
@@ -182,8 +147,7 @@ def test_it_names_a_missing_session(project):
 
 
 def test_it_names_a_retry_that_came_due_and_never_happened(project):
-    """The pause is resumable and its moment has passed: INV-PAUSE-OVERDUE's subject,
-    with the user's message waiting behind it."""
+    """The pause is resumable and its moment has passed: INV-PAUSE-OVERDUE's subject"""
     store = ProjectStore(project)
     wo = _paused(store, f"Claude usage limit reached|{int(db.now()) - 3600}",
                  "usage_limit")
@@ -193,12 +157,7 @@ def test_it_names_a_retry_that_came_due_and_never_happened(project):
 
 
 def test_a_pause_that_will_never_retry_does_not_hold_delivery(project):
-    """An auth pause whose sign-in has not changed since the turn died: `retry_at` is
-    `NEVER`, so nothing will relaunch that turn and the message is the only thing that
-    can restart the conversation. `delivery_hold` therefore returns None and the message
-    is diagnosed as one the pass was FREE to send — which is the finding, because if it
-    really cannot be sent `Daemon._deliver` marks it `failed` and flags.
-    """
+    """An auth pause whose sign-in has not changed since the turn died: `retry_at` is `NEVER`"""
     store = ProjectStore(project)
     wo = _paused(store, "Invalid API key · Please run /login", "auth_error")
 
@@ -207,10 +166,7 @@ def test_a_pause_that_will_never_retry_does_not_hold_delivery(project):
 
 
 def test_the_delivery_pass_and_the_diagnosis_read_the_same_decision(project):
-    """The seam review round 2 asked for. A fourth skip added to `deliver_messages`
-    used to leave the diagnosis saying "the delivery pass has not attempted it" about a
-    message the pass had just declined; both now go through `delivery_hold`, so a hold
-    it reports is a hold the loop honours and vice versa."""
+    """The seam review round 2 asked for"""
     store = ProjectStore(project)
     free = _sent_and_never_delivered(store)
     _age_the_message(store, free["id"])
@@ -227,18 +183,13 @@ def test_the_delivery_pass_and_the_diagnosis_read_the_same_decision(project):
     assert stuck_message(store, held) is None
 
 
-# -- every reader of the new `waiting_on` answer ----------------------------------------
-# `message_stuck` is a new value of `waiting_on()["what"]`. These pin what each of its
-# three readers does with it, so a fourth reader arrives to a vocabulary with a
-# demonstrated meaning rather than to an unhandled case (review round 3).
+# -- every reader of the new `waiting_on` answer
 
 
 def test_resume_auto_refuses_to_nudge_even_where_a_worker_could_prompt(project,
                                                                       jarvis_home,
                                                                       catalog_file):
-    """The reader review round 3 named. Every other refusal in `resume_in_auto` is bought
-    by `could_prompt` being False, so under a prompting mode a stuck order would fall
-    through to the nudge — and the nudge is another row on the queue that is stuck."""
+    """The reader review round 3 named"""
     ops.start_os(str(catalog_file), foreground=True)
     store = ProjectStore(project)
     wo = _sent_and_never_delivered(store)
@@ -258,9 +209,7 @@ def test_resume_auto_refuses_to_nudge_even_where_a_worker_could_prompt(project,
 
 def test_the_work_order_page_says_what_is_holding_the_message(project, jarvis_home,
                                                               catalog_file):
-    """The UI reader. It branches on `waiting.what == 'prompt'` and renders `detail`
-    otherwise, so `message_stuck` reaches the page as its diagnosis — and the
-    resume-auto button, which is offered only for `prompt`, stays hidden."""
+    """The UI reader"""
     from fastapi.testclient import TestClient
 
     from jarvis.ui.app import create_app
@@ -280,16 +229,14 @@ def test_the_work_order_page_says_what_is_holding_the_message(project, jarvis_ho
 
 
 def test_the_parked_check_is_the_third_reader(project):
-    """`invariants.SPOKEN_FOR_WAITS`. Covered in full by
-    `test_a_stuck_message_speaks_instead_of_the_parked_line`; this pins the membership
-    itself so a future edit to IN_FLIGHT_WAITS cannot silently drop it."""
+    """`invariants.SPOKEN_FOR_WAITS`"""
     from jarvis.invariants import IN_FLIGHT_WAITS, SPOKEN_FOR_WAITS
 
     assert "message_stuck" in SPOKEN_FOR_WAITS
     assert "message_stuck" not in IN_FLIGHT_WAITS  # nothing is in flight for it
 
 
-# -- the noise rule: every wait something else already owns -----------------------------
+# -- the noise rule: every wait something else already owns
 
 
 def test_a_fresh_message_is_not_stuck(project):
@@ -300,8 +247,7 @@ def test_a_fresh_message_is_not_stuck(project):
 
 
 def test_a_message_behind_a_turn_in_flight_is_not_stuck(project):
-    """Delivery waits for the turn by design; a turn that runs too long is
-    `inspect.alarm_turn_minutes`' subject."""
+    """Delivery waits for the turn by design"""
     store = ProjectStore(project)
     wo = _sent_and_never_delivered(store)
     store.create_turn(wo["id"], "message", "an earlier message")
@@ -310,8 +256,7 @@ def test_a_message_behind_a_turn_in_flight_is_not_stuck(project):
 
 
 def test_a_message_behind_a_booked_retry_is_not_stuck(project):
-    """A usage limit legitimately holds a message until the reset. INV-PAUSE-OVERDUE is
-    what fires if the relaunch then does not happen."""
+    """A usage limit legitimately holds a message until the reset"""
     store = ProjectStore(project)
     wo = store.create_work_order("hit the usage limit")
     store.update_work_order(wo["id"], session_id="sess-1")
@@ -327,8 +272,7 @@ def test_a_message_behind_a_booked_retry_is_not_stuck(project):
 
 
 def test_a_message_on_an_undispatched_order_is_not_stuck(project):
-    """It goes out as the order's second turn, and a dependency-blocked order is never an
-    attention item just for waiting."""
+    """It goes out as the order's second turn"""
     store = ProjectStore(project)
     first = store.create_work_order("the one it waits for")
     wo = store.create_work_order("the waiter", depends_on=[first["id"]])
@@ -340,7 +284,7 @@ def test_a_message_on_an_undispatched_order_is_not_stuck(project):
 
 
 def test_an_acknowledged_stuck_message_stays_reported_but_stops_flagging(project):
-    """`jarvis wo ack` answers the user's flag; it does not make the fleet healthy."""
+    """`jarvis wo ack` answers the user's flag; it does not make the fleet healthy"""
     store = ProjectStore(project)
     wo = _sent_and_never_delivered(store)
     _age_the_message(store, wo["id"])
@@ -353,7 +297,7 @@ def test_an_acknowledged_stuck_message_stays_reported_but_stops_flagging(project
     assert not store.get_work_order(wo["id"])["needs_attention"]
 
 
-# -- the threshold is a setting, not a constant (kn-67cdb54b) ---------------------------
+# -- the threshold is a setting, not a constant (kn-67cdb54b)
 
 
 def test_the_threshold_is_per_project(project):
@@ -370,8 +314,7 @@ def test_the_threshold_is_per_project(project):
 
 
 def test_a_zero_threshold_is_refused_rather_than_clamped():
-    """Zero would call every message the fleet has just queued stuck, and it arrives by
-    a typo in a `jarvis config set` that the parser is the last place able to name."""
+    """Zero would call every message the fleet has just queued stuck"""
     from jarvis.catalog import CatalogError
 
     with pytest.raises(CatalogError, match="messaging.stuck_minutes"):
@@ -382,11 +325,11 @@ def test_the_shipped_default_is_an_hour():
     assert DEFAULT_MESSAGING_STUCK_MINUTES == 60
 
 
-# -- helpers ---------------------------------------------------------------------------
+# -- helpers
 
 
 def _paused(store: ProjectStore, error: str, terminal_reason: str) -> dict:
-    """A work order whose last turn died in a pause, with an aged message behind it."""
+    """A work order whose last turn died in a pause, with an aged message behind it"""
     wo = store.create_work_order("parked on the way through")
     store.update_work_order(wo["id"], session_id="sess-1")
     store.set_status(wo["id"], "running")
@@ -394,27 +337,19 @@ def _paused(store: ProjectStore, error: str, terminal_reason: str) -> dict:
     store.finish_turn(turn["id"], "failed", error=error, terminal_reason=terminal_reason)
     store.queue_message(wo["id"], "carry on")
     _age_the_message(store, wo["id"])
-    # The turn too: a usage-limit pause is anchored to it (`retry_at` is at least
-    # `ended + RATE_LIMIT_MIN_DELAY`), so a turn that died a moment ago is never overdue
-    # however far back the refusal's own reset moment is set.
+    # The turn too: a usage-limit pause is anchored to it (`retry_at` is at least `ended +...
     _age_the_turn(store, wo["id"])
     return store.get_work_order(wo["id"])
 
 
 def _age_the_turn(store: ProjectStore, wo_id: str) -> None:
-    """Age the settled turn past `inspect.alarm_parked_minutes`, so `parked_reason` gets
-    as far as asking `ops.waiting_on` at all."""
+    """Age the settled turn past `inspect.alarm_parked_minutes`"""
     store.conn.execute(
         "UPDATE wo_turns SET started_at=started_at-?, ended_at=ended_at-? WHERE wo_id=?",
         (LONG_ENOUGH, LONG_ENOUGH, wo_id))
 
 
 def _age_the_message(store: ProjectStore, wo_id: str) -> None:
-    """Age the queued message past the threshold in the ROW rather than on the clock.
-
-    `check_project` and `ops.waiting_on` read `time.time()` themselves and take no `now`,
-    so the fixture is what has to move — and moving `db.now` instead would make every
-    other row in the fixture move with it.
-    """
+    """Age the queued message past the threshold in the ROW rather than on the clock"""
     store.conn.execute("UPDATE wo_messages SET ts=ts-? WHERE wo_id=?",
                        (LONG_ENOUGH, wo_id))

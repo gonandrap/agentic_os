@@ -1,9 +1,4 @@
-"""Cancelling (or deleting) a work order must not leave its worker running.
-
-A cancelled work order nobody reads any more, but its worker turn keeps going: burning
-tokens and editing the worktree. Cancel therefore kills the turn it started — best
-effort, and never at the cost of the status change itself.
-"""
+"""Cancelling (or deleting) a work order must not leave its worker running"""
 
 from __future__ import annotations
 
@@ -22,7 +17,7 @@ def started(jarvis_home, fake_claude, catalog_file, project):
 
 
 def running_wo(daemon, project, fake_claude):
-    """A dispatched work order with a live turn in flight."""
+    """A dispatched work order with a live turn in flight"""
     fake_claude.hold_turns()  # the turn blocks, so it is genuinely still running
     wo = ops.create_work_order("proj_a", "task to cancel")
     daemon.tick()
@@ -84,8 +79,7 @@ def test_delete_also_kills_the_worker_turn(started, fake_claude, project):
 
 
 def test_cancel_releases_a_legacy_background_session(started, fake_claude, project):
-    """A work order dispatched before headless turns has no turn to kill, but it does
-    have a background agent — and cancelling must still take that down."""
+    """A work order dispatched before headless turns has no turn to kill"""
     daemon = started
     wo = ops.create_work_order("proj_a", "legacy work order")
     claude_cli.spawn_background(prompt="legacy", cwd=project,

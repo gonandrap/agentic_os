@@ -24,12 +24,10 @@ import shutil
 import sys
 from pathlib import Path
 
-#: Row-level fields the analysis reads. Everything else — cwd, gitBranch, version, uuid,
-#: the parent chain — is either machine-identifying or unused.
+#: Row-level fields the analysis reads
 KEEP = ("type", "timestamp", "promptSource", "isMeta", "requestId", "sessionId")
 
-#: How much of an injected prompt survives. Long enough for `inspection.TRIGGERS` to
-#: match on it, short enough that no sentence anyone wrote comes with it.
+#: How much of an injected prompt survives
 PROMPT_HEAD = 48
 
 
@@ -38,14 +36,13 @@ def _blocks(content: object) -> list[dict]:
 
 
 def redact_row(row: dict) -> dict | None:
-    """One transcript row, stripped to its skeleton, or None if it carries nothing."""
+    """One transcript row, stripped to its skeleton, or None if it carries nothing"""
     out = {k: row[k] for k in KEEP if k in row}
     if not out.get("type"):
         return None
     message = row.get("message")
     if not isinstance(message, dict):
-        # A `attachment` / `worktree-state` / UI row: kept only for its type and clock,
-        # which is what proves the reader ignores them.
+        # A `attachment` / `worktree-state` / UI row: kept only for its type and clock
         return out if "timestamp" in out else None
 
     kept: dict = {}
@@ -62,8 +59,7 @@ def redact_row(row: dict) -> dict | None:
             kind = block.get("type")
             if kind == "tool_use":
                 payload = block.get("input") or {}
-                # `description` is the agent's own label for the call and is what the
-                # report prints; `task_id` is the join to a subagent. Nothing else.
+                # `description` is the agent's own label for the call and is what the report prints
                 keep_input = {k: payload[k] for k in ("description", "task_id")
                               if isinstance(payload.get(k), str)}
                 blocks.append({"type": kind, "id": block.get("id"),
@@ -94,8 +90,7 @@ def main(argv: list[str]) -> int:
             if small:
                 sink.write(json.dumps(small) + "\n")
 
-    # The subagent META files, and only those: they are what turns "blocked 450s on
-    # a6e6596b" into a sentence, and they hold a type and a description and nothing else.
+    # The subagent META files, and only those: they are what turns "blocked 450s on a6e6596b" into a...
     subagents = source.with_suffix("") / "subagents"
     if subagents.is_dir():
         into = out_dir / source.stem / "subagents"

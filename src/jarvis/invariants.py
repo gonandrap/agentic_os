@@ -1,37 +1,4 @@
-"""Post-conditions — the OS checking that its own state still means what it says.
-
-Every action the OS takes has an intended effect. An event log does not prove the effect
-survived: `attention {"reason": "assumptions pending review"}` records that we set a
-reason, not that the reason is still true ninety seconds later when an unrelated hook
-overwrites it. That exact sequence shipped two work orders to the dashboard labelled
-"waiting for your input" when what they actually needed was an assumption review — every
-component behaved correctly and the resulting state was a lie.
-
-So invariants here are **steady-state predicates**, not write-time assertions. They are
-re-evaluated on every reconcile tick against the database as it currently is, which is
-the only way to catch state that was correct when written and went wrong afterwards.
-
-Three rules for this module:
-
-1. **No LLM, ever.** These are cheap SQL-level predicates. Determinism is the point:
-   the checker must be more trustworthy than the thing it checks.
-2. **Repair only what is unambiguous.** A violation with exactly one correct resolution
-   derivable from state (a stale reason, a phantom flag) is repaired automatically and
-   the repair is recorded. Anything else is reported and left alone.
-3. **Report once, not every tick.** Callers dedupe on `Violation.key`; a standing
-   violation must not spam the timeline or the inbox.
-
-Adding an invariant: write a `_check_*` generator yielding `Violation`s and register it
-in `INVARIANTS`. Give it a stable id — ids appear in work order timelines and in
-`jarvis doctor` output, so renaming one rewrites history.
-
-REGISTER IT IN `OS_INVARIANTS` INSTEAD when what it checks is a fact about the OS rather
-than about one project — the dashboard, the production checkout, the fleet's cache
-configuration. Those take no store, run once per `jarvis doctor` rather than once per
-project, and never run on the daemon's reconcile tick. Putting a fleet-wide check in
-`INVARIANTS` is not a smaller mistake than the reverse: it reports one decision once per
-project, which is how a finding becomes noise.
-"""
+"""Post-conditions — the OS checking that its own state still means what it says"""
 
 from __future__ import annotations
 
@@ -45,10 +12,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
 
 from . import budget, db, worker_session
-# A leaf module (logging, subprocess, dataclasses): the import cannot cycle back here.
-from .automerge import HELD_NOT_PASSED, HELD_SHA_MOVED
-# Same leaf argument: `autoreview` imports only `navigation`, `specs`, `catalog` and
-# `stakes` at module scope, and none of those reaches this module.
+# A leaf module (logging, subprocess, dataclasses): the import cannot cycle back here
+from .automerge import HELD_NOT_PASSED, HELD_SHA_MOVED, HELD_SHA_UNRECORDED
+# Same leaf argument: `autoreview` imports only `navigation`
 from .autoreview import REFUSAL_UNANSWERED_REASON
 from .catalog import DEFAULT_VALIDATION_MAX_ROUNDS, DEFAULT_VALIDATION_TIMEOUT
 from .neo_store import USER_HELD_Q_STATUSES
@@ -71,45 +37,21 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from .fleet import Fleet
     from .project_store import ProjectStore
 
-#: Statuses a work order can still reach `needs_review` from under its own steam — it
-#: has not delivered yet. `autoreview.decide`'s condition 2 is the reason this tuple
-#: exists: Neo judges an assumption only in `needs_review`, so in a project that has
-#: opted in, an assumption recorded here is Neo's to decide on delivery and not the
-#: user's to decide now (GitHub issue #711). Every other status is absent deliberately —
-#: `failed`, `budget_exhausted`, `waiting_pr_merge` and the terminal pair never reach
-#: Neo's review, so an assumption pending in one of them IS the user's.
+#: Statuses a work order can still reach `needs_review` from under its own steam (#711)
 PRE_DELIVERY_STATUSES = ("pending", "dispatching", "running", "idle", "waiting_input",
                          "validating")
 
-# Statuses where nothing can possibly be pending: the work order is over.
+# Statuses where nothing can possibly be pending: the work order is over
 TERMINAL_STATUSES = ("completed", "cancelled")
 
-#: What a work order says when the pull request it was parked behind was closed without
-#: being merged. Lives here rather than at the call site because `true_blockers` is the
-#: only source of attention reasons — INV-ATTENTION-REASON rewrites any flag it cannot
-#: derive, so a reason raised by `Daemon.poll_pull_requests` and not repeated here would
-#: silently become the generic IDLE_NO_FINISH_BLOCKER below on the next reconcile tick.
-#: The fallback when an order is parked in `budget_exhausted` but the accounting no
-#: longer says so — the user raised the budget and the reconcile tick that would move the
-#: status has not run yet. Says the status and nothing it cannot stand behind.
+#: What a work order says when the pull request it was parked behind was closed without being merged
 BUDGET_SPENT_BLOCKER = ("budget spent — raise it with `jarvis wo budget <id> <amount>` "
                         "or close the order")
 
 
 @contextmanager
 def _billing_store() -> Iterator[Any]:
-    """A `CentralStore` for the Jarvis half of a bill, or None if it will not open.
-
-    EVERY READER OF A BUDGET FIGURE GOES THROUGH HERE. `budget.spent` reads the Jarvis
-    half — Neo answers, panel seats, digests — only from a CentralStore, so a caller
-    passing None prints the worker half alone against the whole cap and contradicts the
-    surfaces that opened one (issue #692: a status chip 7.58 under the cap on an order
-    parked for exceeding it).
-
-    A store that will not open DEGRADES rather than raises: the figure is then derived
-    from the worker's turns alone, which understates the spend rather than inventing one,
-    and an unopenable database must not take the whole attention list down with it.
-    """
+    """A `CentralStore` for the Jarvis half of a bill, or None if it will not open (#692)"""
     from .central_store import CentralStore
 
     central = None
@@ -125,331 +67,146 @@ def _billing_store() -> Iterator[Any]:
 
 
 def budget_blocker(store: ProjectStore, wo: dict[str, Any]) -> str:
-    """The attention line for a work order parked in `budget_exhausted`.
-
-    The `CentralStore` it opens is paid for only by an order ALREADY in this status — a
-    handful fleet-wide — because the caller checks the status first; `true_blockers` runs
-    against every work order on every tick and must not open a second database for the
-    ones with no budget.
-    """
+    """The attention line for a work order parked in `budget_exhausted`"""
     with _billing_store() as central:
         out = budget.exhaustion(store, central, wo)
-    # None means the accounting no longer says it is spent: the user raised the budget
-    # and the tick that moves the status has not run yet.
+    # None means the accounting no longer says it is spent: the user raised the budget and the tick that...
     return out.reason if out else BUDGET_SPENT_BLOCKER
 
 
 PR_CLOSED_BLOCKER = "pull request closed without merging — the work was not accepted"
 
-#: What a work order says when settling it would have stranded the code it wrote
-#: (`ops.park_unlanded`, GitHub issue #232). Phrased as the decision the user owes rather
-#: than as a fault: landing it and dropping it are both fine endings, and only silence is
-#: not. Here rather than at the call site under PR_CLOSED_BLOCKER's obligation above.
+#: What a work order says when settling it would have stranded the code it wrote (`ops.park_unlanded` (#232)
 UNLANDED_BLOCKER = ("work not landed — merge its pull request, or record that it is "
                     "being abandoned")
 
-#: How many times the OS asks a worker to repair its own pull request before it asks the
-#: user instead. ONE cap for both repairs — the conflict and the red build — because
-#: they are the same mechanism with a different message; see §4 of
-#: docs/superpowers/specs/2026-08-22-a-work-order-heals-its-own-pull-request.md and §3
-#: of 2026-09-13-a-work-order-never-sits-on-a-red-pull-request.md. Shared VALUE, separate
-#: BUDGETS: a branch that conflicted twice last week still gets three tries at a red
-#: build, because they are different problems and `ops.PrRepair` counts them apart.
+#: How many times the OS asks a worker to repair its own pull request before it asks the user instead (docs/superpowers/specs/2026-08-22-a-work-order-heals-its-own-pull-request.md)
 PR_REPAIR_MAX_ATTEMPTS = 3
 
-#: The statuses in which a pull request can SIT WITH NOBODY MOVING IT AND A WORKER CAN BE
-#: ASKED TO FIX IT — so the statuses the poll may NUDGE in (`Daemon.PR_POLL_STATUSES` is
-#: built from this tuple) and the only ones in which either repair blocker below may be
-#: derived. ONE home for the set, because the two have to agree: a status the poll nudges
-#: in but `true_blockers` does not derive for raises a give-up flag nothing can
-#: re-derive, and INV-ATTENTION-REASON relabels it on the next tick; a status derived for
-#: but never polled asserts a repair that cannot be happening. Issue #224 widened the poll
-#: and this is what keeps the pair honest.
-#:
-#: THE POLL IS NOW THE WIDER OF THE TWO. It also visits `validating`, where a round can
-#: sit for minutes while the user merges the pull request by hand — but it does nothing
-#: there except notice the merge or the closure, precisely so this pairing still holds.
-#: `Daemon.PR_POLL_STATUSES` carries the argument; the bound is enforced in the loop.
-#:
-#: Every member is open or `failed`, so INV-ATTENTION-MISSING selects it and surfaces the
-#: give-up. That obligation stopped being a trap when the gate started deriving its
-#: statuses: there is no second list to fall out of.
-#:
-#: The in-flight statuses are deliberately absent — see `Daemon.PR_POLL_STATUSES` — and so
-#: are the terminal ones, which is not merely tidiness: a hand-merged RED pull request
-#: ends in `ops.complete_merged`, never in `clear_pr_repair`, so its episode stays open
-#: for ever and an ungated derivation would leave a finished work order saying "do not
-#: merge it as it stands".
+#: The statuses in which a pull request can SIT WITH NOBODY MOVING IT AND A WORKER CAN BE ASKED TO FIX... (#224)
 PR_REPAIR_STATUSES = ("waiting_pr_merge", "needs_review", "waiting_input", "failed")
 
-#: The NAME of each repair, which is also the name of its timeline events
-#: (`pr_<name>_nudged`/`_cleared`/`_unresolved`), its message source (`pr-<name>`) and
-#: the episode `ProjectStore.pr_repair_attempts` counts. They live here, beside the
-#: status set, for exactly the reason that set does: `ops.PrRepair` is constructed FROM
-#: these, and `true_blockers` below derives FROM these, so the two cannot be renamed
-#: apart. Spelling one as a literal at either site is the poll/derivation disagreement
-#: PR_REPAIR_STATUSES exists to prevent, one level down — a rename would silently stop
-#: the blocker deriving, and nothing would fail loudly.
-#:
-#: Here rather than in `ops` because `ops` imports this module; the direction cannot be
-#: reversed without a cycle.
+#: The NAME of each repair, which is also the name of its timeline events...
 PR_CONFLICT_REPAIR = "conflict"
 PR_CHECKS_REPAIR = "checks"
-#: The third: the worker pushed past a refusal and never declared it, so the OS asks it
-#: to run `jarvis wo finish`. Spec
-#: docs/superpowers/specs/2026-10-07-an-undeclared-delivery-must-heal-itself.md §2.1.
-#:
-#: PR_REPAIR_STATUSES IS NOT WIDENED FOR IT: `UNDECLARED_DELIVERY_STATUSES` is a strict
-#: subset, so the pairing stated above holds unedited and this blocker is derivable in
-#: every status its detector can fire in.
+#: The third: the worker pushed past a refusal and never declared it (docs/superpowers/specs/2026-10-07-an-undeclared-delivery-must-heal-itself.md §2.1.)
 PR_UNDECLARED_REPAIR = "undeclared"
 
-#: `ops.PrRepair.source` for all three repairs — the `wo_messages.source` a nudge is
-#: queued under. Derived from the names above at the one site that owns them, so
-#: `parked_reason` cannot drift from what `nudge_pr_repair` writes.
+#: `ops.PrRepair.source` for all three repairs — the `wo_messages.source` a nudge is queued under
 PR_REPAIR_SOURCES = (f"pr-{PR_CONFLICT_REPAIR}", f"pr-{PR_CHECKS_REPAIR}",
                      f"pr-{PR_UNDECLARED_REPAIR}")
 
-#: THE THREE EVENTS OF THE INHERITED-FAILURE HEAL, named here for the reason the repair
-#: names above are: `ops` writes them, `status_label` below derives from them, and `ops`
-#: imports this module so the dependency cannot go the other way. A literal spelled at
-#: either site is a rename that silently stops the status line deriving.
-#:
-#: `pr_base_health` is written ONLY ON A TRANSITION — the base going red, or going green
-#: again. That is what lets `base_red_note` answer in ONE indexed read: the newest row is
-#: the current state, so nothing has to be compared against a second event kind.
+#: THE THREE EVENTS OF THE INHERITED-FAILURE HEAL
 PR_BASE_HEALTH_EVENT = "pr_base_health"
-#: The heal itself: the OS merged the base into this branch so CI rebuilds against a base
-#: that works. Spec §4 — the recovery has to be a fact on the record, not a mystery.
+#: The heal itself: the OS merged the base into this branch so CI rebuilds against a base that works
 PR_BASE_UPDATED_EVENT = "pr_base_updated"
-#: GitHub refused the update. Spends the attempt for that base sha exactly as a success
-#: does, so a repeatedly-refusing pull request falls through to the worker once and stays
-#: there rather than being retried every two minutes.
+#: GitHub refused the update
 PR_BASE_UPDATE_FAILED_EVENT = "pr_base_update_failed"
 
-#: The finding when a project's DEFAULT BRANCH is red — the fleet-level fact, not one
-#: pull request's inherited failure. In `INVARIANTS` and never `OS_INVARIANTS`: `main` of
-#: project P is P's fact, and this has to reach the reconcile tick, which is the path that
-#: reports and notifies (spec
-#: docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §3).
+#: The finding when a project's DEFAULT BRANCH is red (docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §3)
 INV_BASE_RED = "INV-BASE-BRANCH-RED"
 
-#: The fix work order for that red branch is SETTLED and the branch is still red — the
-#: one place the OS is out of moves, so it owes the user a decision rather than acting
-#: (spec docs/superpowers/specs/2026-10-14-a-red-main-dispatches-its-own-fix.md §5, Neo
-#: 1738: `jarvis wo retry` is the user's by contract, and a second dispatch is an uncapped
-#: spend loop whose environmental causes kill the replacement too).
+#: The fix work order for that red branch is SETTLED and the branch is still red (docs/superpowers/specs/2026-10-14-a-red-main-dispatches-its-own-fix.md §5)
 INV_BASE_FIX_DEAD = "INV-BASE-FIX-DEAD"
 
-#: A completed work order whose recorded pull request has not merged. Shared with `ops`,
-#: which closes the report the moment `--abandon` records the decision (spec
-#: docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md §8).
+#: A completed work order whose recorded pull request has not merged (docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md §8)
 INV_WORK_LANDED = "INV-WORK-LANDED"
 
-#: What a work order says while its base is broken. NOT an attention reason and NOT a
-#: blocker: nobody owes a decision, the OS is waiting for a build that is already
-#: running, and `true_blockers` deliberately does not derive it. It exists because the
-#: alternative is silence — a work order sitting in `waiting_pr_merge` with a red pull
-#: request and no nudge being sent looks identical to one the OS has forgotten.
-#:
-#: FREE OF ANY ELAPSED TIME, on PARKED_BLOCKER's rule, and free of the base's sha as
-#: well: this string is rendered on every listing and a label that ticked would make two
-#: consecutive renders of one unchanged work order disagree.
+#: What a work order says while its base is broken
 BASE_RED_NOTE = ("waiting for `{base}` to go green — the base's own build is red, so "
                  "nothing this branch pushes can pass")
 
-#: What a work order says when its pull request conflicts and the worker could not fix
-#: it in PR_REPAIR_MAX_ATTEMPTS attempts — one of the two things that make a
-#: `waiting_pr_merge` work order an attention item (spec §4). Re-derived below from the
-#: work order's own timeline, under the same obligation as PR_CLOSED_BLOCKER (spec §5).
+#: What a work order says when its pull request conflicts and the worker could not fix it in...
 PR_CONFLICT_BLOCKER = ("merge conflicts the worker could not resolve — the pull request "
                        "needs you")
 
-#: The other one: CI is red on the pull request and the worker could not get it green.
-#: Under exactly the same obligation, and it reaches a work order in ANY status that
-#: carries a pull request — a red build in `needs_review` is the user being asked to
-#: merge something broken, which is the case issue #224 was filed about.
+#: The other one: CI is red on the pull request and the worker could not get it green (#224)
 PR_CHECKS_BLOCKER = ("the pull request's checks are failing and the worker could not fix "
                      "them — do not merge it as it stands")
 
-#: The third: the worker answered a refusal with commits and never declared them, and the
-#: OS could not get it to. Same obligation as the two above — no count, no sha and no
-#: elapsed time, because `ack_attention` stores it verbatim and INV-ATTENTION-REASON
-#: compares it (kn-681db233 point 3).
+#: The third: the worker answered a refusal with commits and never declared them
 PR_UNDECLARED_BLOCKER = ("the worker pushed commits answering your refusal and would not "
                          "declare them — nothing has been judged, so decide what to do "
                          "with the branch as it stands")
 
-#: THE TWO GIVE-UPS, PAIRED AND ORDERED, because `true_blockers` derives them from this
-#: tuple at ONE site. They were derived at two — the red build above the `needs_review`
-#: triage and the conflict below it — and after issue #224 widened both onto
-#: PR_REPAIR_STATUSES that asymmetry had teeth: in the statuses it added, a conflict
-#: give-up was derived and then outranked by the panel-gave-up line, so it was computed
-#: and never read. `attention_reason` is one column fed from `blockers[0]` (kn-d4d5a967),
-#: which makes "derived below something else" and "not derived" the same thing to the
-#: user, and being derived-but-unread is the silence this whole work order exists to
-#: close. One tuple, one ranking, one comment.
-#:
-#: Conflict first: a pull request that will not merge at all is not waiting on its
-#: checks, and if a worker somehow spent both budgets that is the one to act on.
-#:
-#: UNDECLARED LAST, for the same reason conflict is first: a branch that will not merge
-#: and a branch that is red are facts about the artifact, while this is a fact about the
-#: paperwork over an artifact that may be fine (spec
-#: docs/superpowers/specs/2026-10-07-an-undeclared-delivery-must-heal-itself.md §2.1).
+#: THE TWO GIVE-UPS, PAIRED AND ORDERED (docs/superpowers/specs/2026-10-07-an-undeclared-delivery-must-heal-itself.md §2.1)
 PR_REPAIR_BLOCKERS = ((PR_CONFLICT_REPAIR, PR_CONFLICT_BLOCKER),
                       (PR_CHECKS_REPAIR, PR_CHECKS_BLOCKER),
                       (PR_UNDECLARED_REPAIR, PR_UNDECLARED_BLOCKER))
 
-#: The event `ops.rejudge_moved_head` writes when it will NOT re-judge a moved head: the
-#: round it would open is the one that reaches `validation.max_rounds`, and that last
-#: round belongs to the user (spec
-#: docs/superpowers/specs/2026-09-19-a-moved-head-re-judges-itself.md section 4).
+#: The event `ops.rejudge_moved_head` writes when it will NOT re-judge a moved head: the round it... (docs/superpowers/specs/2026-09-19-a-moved-head-re-judges-itself.md)
 REJUDGE_DECLINED_EVENT = "validation_rejudge_declined"
 
-#: What a work order says when its pull request is green and mergeable, its verdict names
-#: an older commit, and the OS has run out of rounds to bind a new one with. THE ONLY
-#: `sha_moved` STALL THAT REACHES THE USER: every other one the OS now re-judges itself,
-#: silently, which is why a HELD auto-merge is still deliberately not an attention item
-#: (`Daemon._note_automerge_held`). A hold is transient — the next tick may clear it — and
-#: a REFUSAL is not: it is a reviewer's final answer about a commit nothing will re-propose,
-#: and AUTOMERGE_DENIED_BLOCKER below is its attention item (spec 2026-09-24 fix 4b).
-#:
-#: Re-derived below from the timeline rather than raised where the decline is written —
-#: kn-089de524: a flag written on a reconciler's path re-raises itself every tick and
-#: overwrites `jarvis wo ack`.
+#: What a work order says when its pull request is green and mergeable
 SHA_MOVED_BLOCKER = ("the panel's verdict names an older commit and no rounds are left "
                      "to bind a new one — merge it yourself, re-judge it "
                      "(`jarvis validation force`), or give it another round "
                      "(`validation.max_rounds`) and the OS re-judges it itself")
 
-#: The OTHER `sha_moved` stall that reaches the user, and the reason it needs its own
-#: sentence: the OS asked for the merge, re-judged its resolution `ops.REBIND_MAX` times
-#: and the panel still refuses it. `SHA_MOVED_BLOCKER` above would offer
-#: `validation.max_rounds`, which the rebind arm never reads — advice that does nothing
-#: (spec docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.5).
-#: "twice" is `ops.REBIND_MAX`, spelled out here rather than imported: this module is
-#: below `ops` in the import order, and the bound is a constant of the design.
+#: The OTHER `sha_moved` stall that reaches the user (docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.5)
 REBIND_EXHAUSTED_BLOCKER = ("the OS re-judged the merge it asked for twice and the "
                             "panel still refuses it — read the review and decide: "
                             "merge it yourself, or send the worker back")
 
-#: THE THIRD SENTENCE IN THIS FAMILY, and the one that names the LIVE cause: the rework
-#: the user asked for when they rejected on review was judged — outside the budget, as
-#: Neo's ruling on question 973 requires — and the panel refused it with no counted
-#: round left. `VALIDATION_STUCK_BLOCKER` would say only "the review could not be
-#: satisfied", which hides that this round was the user's own ask; the two `sha_moved`
-#: sentences above describe a merge nobody judged, which is the opposite of what
-#: happened here.
-#:
-#: Re-derived from the round by `user_rework_refused` for kn-089de524's reason: a flag
-#: `Daemon._escalate` writes is rewritten by INV-ATTENTION-REASON on the next tick
-#: unless `true_blockers` can derive it.
+#: THE STALL WITH NO COMMIT AT ALL (docs/superpowers/specs/2026-10-16-a-verdict-bound-to-no-commit-re-judges-itself.md §4)
+SHA_UNRECORDED_BLOCKER = ("the panel passed this without recording which commit it "
+                          "judged — it read a worktree, not the pull request — and no "
+                          "rounds are left to bind one: merge it yourself, re-judge it "
+                          "(`jarvis validation force`), or give it another round "
+                          "(`validation.max_rounds`) and the OS re-judges it itself")
+
+#: THE SAME STALL WITH NO DECLINE BEHIND IT (docs/superpowers/specs/2026-10-16-a-verdict-bound-to-no-commit-re-judges-itself.md §4b)
+SHA_UNRECORDED_SPENT_BLOCKER = ("the panel passed this without recording which commit it "
+                                "judged, the OS re-judged it itself and that round could "
+                                "not read the pull request either — so no round will bind "
+                                "one: merge it yourself, or re-judge it "
+                                "(`jarvis validation force`) once GitHub is reachable")
+
+#: THE THIRD SENTENCE IN THIS FAMILY
 USER_REWORK_REFUSED_BLOCKER = ("the rework you asked for was judged and the panel "
                                "refused it, and no rounds are left — read the review "
                                "and decide: accept it, send the worker back with "
                                "another round (`validation.max_rounds`), or close it")
 
-#: What a work order says when the reviewer REFUSED the automatic merge of the commit the
-#: panel accepted — spec 2026-09-24 fix 4b. Nothing else will ever move that order:
-#: `automerge.propose` does not re-ask for a commit whose grant was refused, and the inbox
-#: row `automerge.record_verdict` writes is a notification, not a flag.
-#:
-#: NAMES THE REFUSAL, not the absent merge, and ends with all three routes — they answer
-#: three different situations: the reviewer was over-cautious, the reviewer was right
-#: about the code, and the pull request is one nobody will land.
-#:
-#: NAMES NO REFUSER: the attribution already rides on the record, in `ops._automerge_line`'s
-#: "{decision} by {by}" for `automerge_decided`, and the two verdict paths have different
-#: deciders — Neo deciding, and the USER denying a request Neo escalated write the same row,
-#: so naming one here would tell the user Neo refused their own decision.
-#:
-#: FREE OF ANY ELAPSED TIME AND OF THE SHA, on PARKED_BLOCKER's rule: `ack_attention`
-#: stores this verbatim and INV-ATTENTION-REASON compares it, so a reason that ticked or
-#: that named a commit could never be acknowledged.
+#: THE SAME ROUND WITH NOBODY'S OPINION ON IT (docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md §1)
+USER_REWORK_UNREVIEWED_BLOCKER = (
+    "the rework you asked for was never reviewed — the submission gave the panel nothing "
+    "new to judge, and no counted round was spent, so another round changes nothing: "
+    "send the worker back with "
+    '`jarvis wo review --reject --feedback "<what to change>"`, or land it without a '
+    'panel verdict with `jarvis wo review --feedback "<why>"`')
+
+#: What a work order says when the reviewer REFUSED the automatic merge of the commit the panel...
 AUTOMERGE_DENIED_BLOCKER = ("the automatic merge of the commit the panel accepted was "
                             "refused, so nothing will land this pull request by itself "
                             "— merge it by hand, push a fix and re-judge it "
                             "(`jarvis validation force`), or close it with "
                             "`jarvis wo done`")
 
-#: What a work order says when the validation panel gave up on it: it kept resubmitting
-#: and the panel kept rejecting, until the round budget ran out. Nothing automatic is
-#: left to try, and only the user can say whether the work is good enough or the
-#: reviewer is wrong. Subject to exactly the obligation PR_CLOSED_BLOCKER describes
-#: above — INV-ATTENTION-REASON rewrites any attention reason `true_blockers` cannot
-#: re-derive, so repeating it here is mandatory rather than cosmetic.
-#:
-#: A round that is merely OPEN raises nothing at all: `validating` is the OS working,
-#: not a decision anyone owes, which is why that status has no branch below. The second
-#: reason stopped applying — INV-ATTENTION-MISSING no longer skips `validating`, it
-#: selects it and finds nothing — so the absent branch is the whole of the silence.
+#: What a work order says when the validation panel gave up on it: it kept resubmitting and the panel...
 VALIDATION_STUCK_BLOCKER = ("the review could not be satisfied — the work needs your "
                             "judgement")
 
-#: THE SAME GIVE-UP, ONE STATUS LATER. `VALIDATION_STUCK_BLOCKER` above is raised only in
-#: `needs_review`; accepting the assumptions lands the order in `waiting_pr_merge`
-#: (`ops.land_when_cleared`) and nothing re-derives it there, so the panel's give-up went
-#: silent for 47h on wo-3615faf7 (issue 902). A SEPARATE SENTENCE because the remedy is
-#: different: in `needs_review` the user decides the work, here the work is decided and
-#: the PULL REQUEST is what will not move — `jarvis wo review` has nothing to review and
-#: would send them looking for a prompt that is not there.
-#:
-#: FREE OF ANY ELAPSED TIME AND OF THE SHA, on AUTOMERGE_DENIED_BLOCKER's rule:
-#: `ack_attention` stores this verbatim and INV-ATTENTION-REASON compares it, so a reason
-#: that ticked could never be acknowledged.
+#: THE SAME GIVE-UP, ONE STATUS LATER
 PARKED_GIVE_UP_BLOCKER = ("the panel gave up on this and no commit was ever accepted, so "
                           "the automatic merge will never arm — merge it yourself, "
                           "re-judge it (`jarvis validation force`), or give it another "
                           "round (`validation.max_rounds`)")
 
-#: What a work order says when its turn died because Claude Code could not authenticate
-#: (`worker_session.PAUSE_AUTH`). Nothing here is wrong with the work and nothing is wrong
-#: with the API: the account cannot answer until a human signs in, and then it can. So
-#: this asks for the ONE action that helps and promises the rest — `Daemon._park_on_signin`
-#: holds the order in `waiting_input` and `retry_paused_turns` relaunches it fleet-wide
-#: within a tick of the sign-in.
-#:
-#: Under the same obligation as PR_CLOSED_BLOCKER above: `_park_on_signin` raises it and
-#: this module must be able to re-derive it, or INV-ATTENTION-REASON relabels it on the
-#: next tick with a sentence that sends the user hunting for a bug in the work.
+#: What a work order says when its turn died because Claude Code could not authenticate...
 AUTH_BLOCKER = ("Claude Code could not authenticate — sign in again and it resumes "
                 "by itself")
 
-#: What a work order says when its worker went quiet without `jarvis wo finish`. Says
-#: what HAPPENED, not merely that the turn ended: the worker stopped mid-task, and — the
-#: half a user cannot see and reliably guesses wrong — nothing it may have left running
-#: survived, because a turn is one `claude -p` process and no event wakes a worker when a
-#: background job finishes. wo-2df8828c signed off on "I'll be re-invoked when it
-#: finishes" and read as merely mislabelled; the eval had in fact died with the turn.
-#:
-#: `Daemon.settle_work_order` flags it and `true_blockers` re-derives it, from here, for
-#: the reason PR_CLOSED_BLOCKER gives above. They said two different sentences for one
-#: state until this constant existed.
-#: ENDS WITH THE WAY OUT, like PARKED_BLOCKER and STALE_FINISH_BLOCKER below. It said
-#: "review the session" and stopped there, which is a diagnosis with no action — issue
-#: 573's third fault. Changing the string invalidates every existing ack of it (they are
-#: stored verbatim), so those orders re-flag once, which is the point: none of them ever
-#: named a command.
+#: What a work order says when its worker went quiet without `jarvis wo finish`
 IDLE_NO_FINISH_BLOCKER = ("the worker stopped mid-task without `jarvis wo finish` — "
                           "nothing it started is still running; read its last message, "
                           "then `jarvis wo send` or `jarvis wo done`")
 
-#: WHAT THE IDLE LINE ABOVE SAID ABOUT A HOLD IT DOES NOT DESCRIBE: the worker DID
-#: deliver, the user refused an assumption, and the delivery is older than the refusal.
-#: COMPOSED from the autoreview sentence rather than re-spelled, because the same fact
-#: reaches the user twice — as the hold on `jarvis wo show` and as this line — and two
-#: spellings of one sentence pass every behavioural test and drift anyway (kn-4ea33fe6).
-#: §1 of docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md
-#:
-#: TWO WHOLE SENTENCES AND NOT ONE WITH A SLOT: `remedies.render_attention` interpolates
-#: only values matching `_ID_PATTERN`, and `"analyst"` is not an id, so a per-kind suffix
-#: cannot travel through a declared slot (§1). Free of any elapsed time and of any count,
-#: on PARKED_BLOCKER's rule.
+#: WHAT THE IDLE LINE ABOVE SAID ABOUT A HOLD IT DOES NOT DESCRIBE: the worker DID deliver (docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md)
 REFUSAL_UNANSWERED_BLOCKER = (
     f"{REFUSAL_UNANSWERED_REASON} — read your refusal, then `jarvis wo send` telling it "
     f"what to change; it re-delivers with `jarvis wo finish`")
-#: The same hold on a kind whose own submission verb REPLACES the stored document.
+#: The same hold on a kind whose own submission verb REPLACES the stored document
 REFUSAL_UNANSWERED_DOC_BLOCKER = (
     f"{REFUSAL_UNANSWERED_REASON} — it delivered a document, not code, and resubmitting "
     f"that document would replace it and discard the decisions you have already "
@@ -457,157 +214,68 @@ REFUSAL_UNANSWERED_DOC_BLOCKER = (
     f"with `jarvis wo finish`, which records the delivery and does not touch the "
     f"document")
 
-#: The kinds whose FIRST delivery used a verb of their own (`jarvis io report`,
-#: `jarvis fo plan`), both of which REPLACE the stored document — so re-delivering
-#: through them after a refusal discards the user's decisions on it. Filed here, beside
-#: its only reader, and NOT beside `project_store.WO_KINDS`: that tuple is the column
-#: vocabulary, and a membership rule about `ops` submission verbs filed there invites
-#: readers who want something else from it (§2).
-#:
-#: `investigator` is absent because `jarvis investigate verdict` settles through
-#: `close_out` rather than `finish`, so it reaches `completed` and never sits in
-#: `needs_review`; `manager` is absent because it is `idle`, never `needs_review`.
+#: The kinds whose FIRST delivery used a verb of their own (`jarvis io report`
 DOCUMENT_DELIVERY_KINDS = ("planner", "analyst")
 
-#: Both sentences above contain the word "assumption", so `true_blockers`' tail would
-#: read a list holding one as nothing-but-assumption-reviews and stack `parked_reason` on
-#: a line that already names the exit (§4).
+#: Both sentences above contain the word "assumption"
 REFUSAL_HELD_BLOCKERS = frozenset({REFUSAL_UNANSWERED_BLOCKER,
                                    REFUSAL_UNANSWERED_DOC_BLOCKER})
 
-#: What a `failed` work order says when there is nothing more specific to say. A CONSTANT
-#: because `Daemon.settle_work_order` raises it and `true_blockers` re-derives it: the two
-#: carried different spellings of this one state ("worker turn failed" at the write site),
-#: so INV-ATTENTION-REASON relabelled every such flag on the next tick.
+#: What a `failed` work order says when there is nothing more specific to say
 WORKER_FAILED_BLOCKER = "worker failed — review and retry"
 
-#: What a `failed` work order says when its turn died AFTER it had delivered —
-#: wo-604b5b99, whose session was killed in a stampede cleanup with PR #839 open. Spec
-#: §(a), docs/superpowers/specs/2026-10-07-a-settled-features-live-children-must-have-a-
-#: manager-or-a-hold.md.
-#:
-#: Under IDLE_NO_FINISH_BLOCKER's own obligation: `Daemon.settle_work_order` raises it and
-#: `true_blockers` re-derives it from here, or INV-ATTENTION-REASON relabels it on the next
-#: tick. FREE OF ANY ELAPSED TIME, on PARKED_BLOCKER's rule — `ack_attention` stores it
-#: verbatim.
+#: What a `failed` work order says when its turn died AFTER it had delivered (#839)
 TURN_DIED_AFTER_DELIVERY_BLOCKER = (
     "its worker's session died after the work was delivered — the delivery is on record, "
     "and the order is `failed` because the turn never finished, not because the work did; "
     "`jarvis wo retry` resumes the session where it died, `jarvis wo done` closes it, and "
     "`jarvis wo review` decides any assumption still pending")
 
-#: `kind` of the event the settler writes on that path, so the record never reads as a
-#: clean delivery. Here rather than in `daemon` because the writer is the daemon and the
-#: reader is the derivation above: the two must not drift.
+#: `kind` of the event the settler writes on that path, so the record never reads as a clean delivery
 TURN_DIED_AFTER_DELIVERY_EVENT = "turn_died_after_delivery"
 
 SECONDS_PER_MINUTE = 60  # a unit, not a setting
 SECONDS_PER_HOUR = 3600  # ditto
 
-#: What a work order says when its turn has ended, nothing is in flight, and the OS is
-#: still calling it work in progress. FREE OF ANY ELAPSED TIME, deliberately: this string
-#: is compared against `attention_reason` by INV-ATTENTION-REASON and stored verbatim by
-#: `ProjectStore.ack_attention`, so a reason that ticked would be rewritten every
-#: reconcile and could never be acknowledged.
+#: What a work order says when its turn has ended
 PARKED_BLOCKER = ("the worker parked mid-task — nothing is in flight to move it; read "
                   "its last message, then `jarvis wo send` or `jarvis wo done`")
 
-#: The other shape of the same fact, and the one that cost wo-a4bd6958 seven hours: the
-#: work order HAS a recorded finish, was sent back to work afterwards, and stopped again
-#: without finishing. `Daemon.settle_work_order` reads `result_summary` as a lifetime
-#: fact, so no later turn can reach its IDLE_NO_FINISH branch — the order settles under
-#: whatever the earlier finish left behind and says nothing about the turn that stopped.
+#: The other shape of the same fact
 STALE_FINISH_BLOCKER = ("the worker went back to work after finishing and stopped again "
                         "without finishing — its recorded summary is older than its last "
                         "turn; read that turn, then `jarvis wo send`")
 
-#: NO LONGER CONSULTED BY `parked_reason`, and left here saying so rather than deleted:
-#: §5a of docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md
-#: replaced this list with `ops.scheduled_actor` over `OPEN_STATUSES`, and the feature's
-#: explicit MUST NOT is adding `validating` to it — the fix the next reader will reach
-#: for. Each reason below is now DERIVED: `validating` by the round predicate, `pending`
-#: by the claim SQL, `waiting_pr_merge` by the poll's, `idle` by the manager's.
-#:
-#: EVERYTHING BELOW IS THIS LIST'S HISTORICAL RECORD — why each status was in or out while
-#: the list WAS the gate — and not the current rule. Kept because it records decisions
-#: with reasons; read it as history, never as a justification for a gate that is gone.
-#:
-#: Where "nothing is in flight" is worth saying. `validating` is excluded because the
-#: round machine owns that work order and INV-VALIDATION-STRANDED already watches it;
-#: `pending` has no turn to be parked after; `waiting_pr_merge` is waiting on
-#: `Daemon.poll_pull_requests`, which is in flight by definition.
-#:
-#: `idle` is absent because "nothing is in flight" is the DEFINITION of that status
-#: rather than news about it. That absence is what replaced `parked_reason`'s
-#: `kind == "manager"` carve-out: the status now carries the fact the carve-out was
-#: asserting, so a manager in any OTHER status is judged like anything else.
+#: NO LONGER CONSULTED BY `parked_reason` (docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md)
 PARKABLE_STATUSES = ("dispatching", "running", "waiting_input", "needs_review")
 
-#: What an OPEN work order says when `ops.scheduled_actor` names nobody and no other
-#: blocker says what the user must DO. It names the STATUS and the ABSENCE and nothing
-#: else: PARKED_BLOCKER carries a cause, this carries only that no pass selects the row
-#: (§5b, docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md).
-#:
-#: PRODUCED ONLY BY `true_blockers`, under the trap `PR_CLOSED_BLOCKER` documents:
-#: INV-ATTENTION-REASON rewrites any attention reason `true_blockers` cannot re-derive,
-#: so the same sentence raised anywhere else is relabelled on the next tick.
-#:
-#: FREE OF ANY ELAPSED TIME, under the rule PARKED_BLOCKER states above: the reason is
-#: compared against `attention_reason` and stored verbatim by `ProjectStore.ack_attention`,
-#: so a reason that ticked could never be acknowledged.
+#: What an OPEN work order says when `ops.scheduled_actor` names nobody and no other blocker says what... (docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md)
 NO_ACTOR_BLOCKER = ("nothing is going to act on this: no daemon pass selects a "
                     "`{status}` work order in this state — read its record, then "
                     "`jarvis wo send`, `jarvis wo retry` or `jarvis wo done`")
 
-#: What a work order says when something the user sent it is still sitting in the queue
-#: and the worker has never seen it. GitHub issue 43: the delivery loop held messages for
-#: ever with no timeline event, no retry counter and no invariant, so Neo's gate verdict,
-#: two `jarvis wo send` messages and the documented cure all failed silently and the
-#: fleet went on reporting healthy.
-#:
-#: FREE OF ANY ELAPSED TIME, under the rule PARKED_BLOCKER states: INV-ATTENTION-REASON
-#: compares this against `attention_reason` and `ProjectStore.ack_attention` stores it
-#: verbatim, so a reason that ticked could never be acknowledged. The minutes and the
-#: hold go in the violation's detail, which nothing compares.
+#: What a work order says when something the user sent it is still sitting in the queue and the worker...
 MESSAGE_STUCK_BLOCKER = ("a message you sent is still queued and the worker has not seen "
                          "it — `jarvis wo resume-auto` for what is holding it")
 
-#: Where an undelivered message is a defect rather than a wait. `pending` is absent
-#: because an undispatched order's message goes out as its second turn and a
-#: dependency-blocked order is never an attention item just for waiting (its
-#: unrecoverable case is DEAD_DEPENDENCY_BLOCKER's); `validating` because a round in
-#: flight is the OS working and owes nobody a decision (no longer because a status gate
-#: skipped it — INV-ATTENTION-MISSING selects `validating` now); the terminal pair
-#: because INV-ATTENTION-PHANTOM clears any flag raised there, so the two checks would
-#: fight every tick.
-#:
-#: `idle` IS here, and it is the one thing an idle manager can still owe the user. It
-#: inherited the coverage rather than gaining it — a manager used to sit in
-#: `waiting_input` — and dropping it while moving the status would have made every stuck
-#: message to a feature's only addressee invisible.
+#: Where an undelivered message is a defect rather than a wait
 MESSAGE_STUCK_STATUSES = ("dispatching", "running", "idle", "waiting_input",
                           "needs_review", "failed", "waiting_pr_merge")
 
-#: The `ops.waiting_on` answers that mean the OS itself will do the next thing, with
-#: nobody typing. A list of what IS coming rather than a second guess at what is not:
-#: everything else that function can answer means the work order has stopped.
+#: The `ops.waiting_on` answers that mean the OS itself will do the next thing, with nobody typing
 IN_FLIGHT_WAITS = ("turn_running", "queued_message", "neo_question", "gate_with_neo",
                    "retry_pending", "signin", "pending")
 
-#: What `parked_reason` stays silent about. `message_stuck` is the one answer that means
-#: the work order HAS stopped and is still not this check's to report: `true_blockers`
-#: raises MESSAGE_STUCK_BLOCKER for it directly, and that sentence names what the user is
-#: missing where PARKED_BLOCKER would only say the worker went quiet.
+#: What `parked_reason` stays silent about
 SPOKEN_FOR_WAITS = IN_FLIGHT_WAITS + ("message_stuck",)
 
-#: `parked_reason`'s `actor` default: NOBODY HAS DERIVED A VERDICT YET, so derive one.
-#: Distinct from None, which is itself a verdict — that no daemon pass will act (§2).
+#: `parked_reason`'s `actor` default: NOBODY HAS DERIVED A VERDICT YET, so derive one
 ACTOR_NOT_DERIVED = object()
 
 
 @dataclass
 class Violation:
-    """One invariant found false, with whatever the checker did about it."""
+    """One invariant found false, with whatever the checker did about it"""
 
     invariant: str
     detail: str
@@ -615,28 +283,18 @@ class Violation:
     repaired: bool = False
     repair: str = ""
     context: dict[str, Any] = field(default_factory=dict)
-    #: How loudly the notification arrives. `warning` for every violation that predates
-    #: this field, so it is additive; a checker that must not land beside a stale
-    #: attention flag says `critical` (spec
-    #: docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §5).
+    #: How loudly the notification arrives (docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §5)
     level: str = "warning"
-    #: NOT REPAIRABLE, AND A DECISION IS OWED BY THE USER. Non-empty means the blocker
-    #: sentence, authored by the checker, naming the decision and the command that takes
-    #: it — and it must carry NO elapsed time and nothing else that changes tick to tick,
-    #: or it can never be acked down (spec
-    #: docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md §1).
+    #: NOT REPAIRABLE, AND A DECISION IS OWED BY THE USER (docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md §1)
     owed: str = ""
-    #: DEDUPE IDENTITY for a violation that is not about a work order — a feature order,
-    #: say. Carried separately from `wo_id` precisely because `wo_id` also ROUTES:
-    #: attention flags, timeline events and the notification key on it (spec
-    #: docs/superpowers/specs/2026-10-13-an-assumption-review-payload-carries-its-spec-section.md
-    #: §2.3, Neo 1695).
+    #: DEDUPE IDENTITY for a violation that is not about a work order — a feature order, say (docs/superpowers/specs/2026-10-13-an-assumption-review-payload-carries-its-spec-section.md §2.3)
     subject_id: str | None = None
+    #: What the NOTIFICATION says, when `detail` holds text that must not leave the record (docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md §2.5)
+    notice: str = ""
 
     @property
     def key(self) -> tuple[str, str | None]:
-        """Identity for dedupe: the same invariant failing on the same SUBJECT is one
-        standing problem, however many ticks it survives."""
+        """Identity for dedupe: the same invariant failing on the same SUBJECT is one standing problem"""
         return (self.invariant, self.subject_id or self.wo_id)
 
     def __str__(self) -> str:
@@ -645,24 +303,12 @@ class Violation:
         return f"{self.invariant} — {where}{self.detail}{fixed}"
 
 
-#: What a FEATURE order says when one of its children ended badly. Two reasons rather
-#: than one because they ask the user for different things: a failed child is a problem
-#: to diagnose, a cancelled one is a decision already taken whose consequences for the
-#: rest of the feature have not been. Both are formatted with the child's id.
-#:
-#: Unlike the two constants around them these are NOT re-derived by `true_blockers` —
-#: that function answers "what does this WORK ORDER need from me", and a feature order is
-#: not a work order, so INV-ATTENTION-REASON never sees these and cannot relabel them.
-#: They live here anyway so that every reason the OS puts in front of the user is written
-#: in one file. If a feature-order invariant is ever added, it inherits the obligation:
-#: whatever derives the flag has to be able to produce these strings.
+#: What a FEATURE order says when one of its children ended badly
 FEATURE_CHILD_FAILED = "{id} failed — this feature cannot finish without it"
 FEATURE_CHILD_CANCELLED = ("{id} was cancelled — this feature will not deliver what the "
                            "plan promised")
 
-#: What a FEATURE order says when a merged child's commit never reached the head a round
-#: would judge, past the bound. §3 of
-#: docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md
+#: What a FEATURE order says when a merged child's commit never reached the head a round would judge (docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md)
 FEATURE_CHILD_NOT_INTEGRATED = (
     "{id}'s merge commit {commit} is not in {head}, the commit on the default branch a "
     "review would judge — so a panel would report its work as missing. Nothing has been "
@@ -671,29 +317,7 @@ FEATURE_CHILD_NOT_INTEGRATED = (
 
 def dead_feature_children(store: ProjectStore,
                           children: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The children that fail their feature: ended badly, and not answered for.
-
-    ONE function because `Daemon.settle_features` and `check_feature_failures_are_real`
-    must agree exactly. A settler that fails a feature on a child the invariant then
-    un-fails it on is an infinite loop, and the user watches it flap on every tick. That
-    obligation is also why the exemption below lives HERE and not in one caller.
-
-    EXEMPT: a `failed` child carrying `TURN_DIED_AFTER_DELIVERY_EVENT`. Its session died
-    after the work was delivered — wo-604b5b99, whose turn was killed in a stampede
-    cleanup with PR #839 open — and that is the turn's failure, not the feature's. Keyed
-    on the EVENT and never on a live `has_delivered`: the event names the CAUSE, where a
-    `pr_url` is a coincidence that would quietly exempt every failed order holding one.
-
-    The intended consequence: such a child is dead to NEITHER rule. Unlike a `superseded`
-    child it does not count towards completion either, so the feature stays `executing`
-    until the user acts on the child — `jarvis wo retry` or `jarvis wo done`. That is
-    honest: there is an open pull request outstanding.
-
-    NO FEATURE-LEVEL REMEDY, deliberately: a feature holding only such a child is
-    `executing`, which `jarvis fo resume` refuses, and widening `ops.resume_feature_order`
-    to supersede the exempt child would drop that open pull request out of the feature's
-    completion accounting in silence.
-    """
+    """The children that fail their feature: ended badly, and not answered for (#839)"""
     dead = [c for c in children
             if c["status"] in ("failed", "cancelled")
             and not c.get("superseded")]
@@ -704,50 +328,24 @@ def dead_feature_children(store: ProjectStore,
 
 def outstanding_feature_children(store: ProjectStore,
                                  fo_id: str) -> list[dict[str, Any]]:
-    """The children this feature has not finished with: non-settled, non-superseded.
-
-    §2.2 of docs/superpowers/specs/2026-10-12-a-managers-by-design-idle-is-not-a-
-    standstill.md. BESIDE `dead_feature_children` and for its reason: that answers "which
-    children fail this feature" over the same rows under the same superseded rule, and two
-    readers that must agree exactly — `ops.stuck_scan` and `status_label` — get ONE
-    function. The superseded rule is `Daemon.settle_features`' own: a superseded child
-    settles its feature neither way, so it is not outstanding either.
-
-    NOT `budget.live_children`, which excludes `budget_exhausted` because an exhausted
-    child cannot spend. An exhausted child is very much outstanding to a manager: only the
-    user can fund another turn, and the manager is waiting for that.
-    """
+    """The children this feature has not finished with: non-settled, non-superseded"""
     return _outstanding(store.feature_children(fo_id))
 
 
 def _outstanding(children: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The rule itself, over rows already read — `outstanding_children_note` needs both
-    the whole list and the outstanding one and must not read the table twice."""
+    """The rule itself, over rows already read"""
     from .project_store import TERMINAL_STATUSES as SETTLED_STATUSES
 
     return [c for c in children
             if c["status"] not in SETTLED_STATUSES and not c.get("superseded")]
 
 
-#: How many outstanding children the note names before it stops listing them. A label is
-#: read at a glance; the child tree is where the rest are.
+#: How many outstanding children the note names before it stops listing them
 OUTSTANDING_CHILDREN_NAMED = 3
 
 
 def outstanding_children_note(store: ProjectStore, wo: dict[str, Any]) -> str:
-    """Why an idle manager is idle, as one phrase — `""` when it is not that case.
-
-    ONE formatter, shared by `status_label` and `ops.stuck_scan`'s `blocker` field, so the
-    label and the sweep's brief cannot drift. The sweep printed "nothing the record can
-    name" over a record naming wo-d2d777dc (issue 1010), and that string reached an
-    investigator verbatim.
-
-    Gated on kind, status and `parent_id` — `PR_REPAIR_STATUSES`' rule two branches below
-    in `status_label`: only a manager pays the read. FLAGLESS by construction, and that is
-    the whole of deviation 2: this is a LABEL and `true_blockers` gets no branch, so
-    INV-ATTENTION-MISSING stays quiet without an exception. An outstanding child needs
-    nobody.
-    """
+    """Why an idle manager is idle, as one phrase — `""` when it is not that case"""
     if wo.get("kind") != "manager" or wo["status"] != "idle" or not wo.get("parent_id"):
         return ""
     fo_id = str(wo["parent_id"])
@@ -762,64 +360,32 @@ def outstanding_children_note(store: ProjectStore, wo: dict[str, Any]) -> str:
 
 
 def has_delivered(store: ProjectStore, wo: dict[str, Any]) -> bool:
-    """Has this work order produced something a person has to decide about?
-
-    The STATUS is unchanged: a turn that dies after a delivery still settles `failed`
-    (`Daemon.settle_work_order`) — `needs_review` is the queue the user works through to
-    decide on delivered work, and a turn that died mid-flight does not belong in it. What
-    the delivery buys is the `TURN_DIED_AFTER_DELIVERY_EVENT` event the settler writes,
-    which is what exempts the child from the dead-child predicate.
-
-    A pull request and an assumption are artefacts the order cannot take back. NOT
-    `result_summary`: a worker can write one and keep working, so it does not say the
-    order has nothing left to run.
-    """
+    """Has this work order produced something a person has to decide about?"""
     return bool(wo.get("pr_url")) or bool(store.all_assumptions(wo["id"]))
 
 
-#: What a live child says when the feature it belongs to has settled under it —
-#: wo-3db50904 and wo-0cb6dc6b, which kept running under a `failed` fo-ac00376e with no
-#: addressee for the `manager` role and nothing on their faces to say so. A HOLD and never
-#: a reopen (Neo question 1393): reopening the feature at the fork flaps, because
-#: `Daemon.settle_features` re-fails it on the next tick off the same dead child.
-#:
-#: FREE OF ANY ELAPSED TIME, on PARKED_BLOCKER's rule, and derived by `true_blockers`
-#: alone — no call site raises it, so nothing can drift from it.
+#: What a live child says when the feature it belongs to has settled under it
 SETTLED_FEATURE_BLOCKER = ("its feature order {fo_id} is {status} — nothing will "
                            "coordinate this work order until the feature is live "
                            "again; {remedy}")
 
-#: One remedy per settled status, because the way out genuinely differs: `jarvis fo
-#: resume` refuses anything but `failed` (`ops.resume_feature_order`), so naming it under
-#: a cancelled feature would send the user at a command that errors.
+#: One remedy per settled status, because the way out genuinely differs: `jarvis fo resume` refuses...
 SETTLED_FEATURE_REMEDY = {
     "failed": "`jarvis fo resume {fo_id}`",
     "cancelled": "`jarvis wo cancel {wo_id}` if this work order is not wanted either",
     "completed": "`jarvis wo done {wo_id}`, or `jarvis wo cancel {wo_id}`",
 }
 
-#: What a work order says when something it depends on can never complete. A dependency
-#: that is `cancelled` or `failed` will not come back, so the dependent would sit in
-#: `pending` for ever with nothing on its face to say why — the stranded row the
-#: feature-order design warns about. Same rule as PR_CLOSED_BLOCKER above: an attention
-#: reason must be re-derivable by `true_blockers` or the next tick relabels it.
+#: What a work order says when something it depends on can never complete
 DEAD_DEPENDENCY_BLOCKER = "blocked by a dependency that can never complete"
 
-#: What a release order says when it stopped waiting for a red base and asked the user
-#: (2026-09-29 spec §3). NAMES THE RED RUN, not the release: the user is being asked
-#: about a build, and the release is waiting on it rather than on anything about itself.
-#:
-#: FREE OF ANY ELAPSED TIME, under PARKED_BLOCKER's rule — the hours are the THRESHOLD,
-#: which is a constant, and never a clock that ticks between two reconciles.
+#: What a release order says when it stopped waiting for a red base and asked the user (2026-09-29...
 RELEASE_BASE_RED_BLOCKER = ("`{base}` has been red for {hours}h — `{workflow}` failed at "
                             "{sha} ({run_url}). The release is waiting on that build, "
                             "not on anything about the release.")
 
 
-#: What a work order says when an OS-built prompt for it was past the ceiling, so the
-#: call was never made. NUMBERS AND IDENTIFIERS ONLY — never a fragment of the prompt:
-#: this string is rendered to the user and read back by the digest model. Spec §4:
-#: docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+#: What a work order says when an OS-built prompt for it was past the ceiling (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
 OS_PROMPT_REFUSED_BLOCKER = (
     "the OS built a {call} prompt of {total} chars for this work order ({prompt} + "
     "{system} system), over the {ceiling}-char ceiling (os.max_os_prompt_chars), so "
@@ -828,12 +394,7 @@ OS_PROMPT_REFUSED_BLOCKER = (
 
 
 def os_prompt_refused_blocker(said: dict[str, Any]) -> str:
-    """OS_PROMPT_REFUSED_BLOCKER filled from the event the refusing call site wrote.
-
-    ONE renderer for both ends, RELEASE_BASE_RED_BLOCKER's rule: the call site flags it
-    and this module re-derives it, or INV-ATTENTION-REASON relabels the flag on the
-    next reconcile tick.
-    """
+    """OS_PROMPT_REFUSED_BLOCKER filled from the event the refusing call site wrote"""
     return OS_PROMPT_REFUSED_BLOCKER.format(
         call=said.get("call") or "model", total=said.get("total") or 0,
         prompt=said.get("prompt_chars") or 0,
@@ -842,11 +403,7 @@ def os_prompt_refused_blocker(said: dict[str, Any]) -> str:
 
 
 def release_base_red_blocker(said: dict[str, Any]) -> str:
-    """RELEASE_BASE_RED_BLOCKER filled from the park event `ops.defer_red_release` wrote.
-
-    ONE renderer for both ends: `ops` flags it and this module re-derives it, or
-    INV-ATTENTION-REASON relabels the flag on the next tick (PR_CLOSED_BLOCKER's rule).
-    """
+    """RELEASE_BASE_RED_BLOCKER filled from the park event `ops.defer_red_release` wrote"""
     from .daemon import Daemon
 
     return RELEASE_BASE_RED_BLOCKER.format(
@@ -856,57 +413,49 @@ def release_base_red_blocker(said: dict[str, Any]) -> str:
         run_url=said.get("run_url") or "")
 
 
-#: §9: the objection the OS sent about an assumption died on the way to the worker — its
-#: message spent its retries, or its envelope ended in a terminal state that is not
-#: `delivered`. Nobody but the user can move it now, because the worker was never told.
-#: SAYS "assumption" ON PURPOSE: INV-ATTENTION-REASON's strict branch and the
-#: `parked_reason` fallback both key off `_mentions_assumptions`, so a reason that did
-#: not name one would be rewritten within a tick. Same obligation as PR_CLOSED_BLOCKER:
-#: `true_blockers` re-derives it, free of any elapsed time.
+#: §9: the objection the OS sent about an assumption died on the way to the worker
 OBJECTION_UNDELIVERABLE_BLOCKER = ("the OS objected to an assumption and the objection "
                                    "never reached the worker — decide it yourself")
 
 
-# -- the derivation everything else is checked against ------------------------------
+# -- the derivation everything else is checked against
 
 
 def rejudge_exhausted(store: ProjectStore, wo: dict[str, Any]) -> bool:
-    """Is this order parked on a head the OS declined to re-judge, and still on it?
-
-    TWO FACTS, and the second is what keeps this from sticking: the OS recorded a decline
-    for some commit, and the newest automatic-merge hold is still `sha_moved` on THAT
-    commit. A branch that moves again clears the flag by itself — the next tick either
-    re-judges the new head (the budget is only spent for the round it counted) or
-    declines afresh and raises this again against the new commit.
-
-    Derived, never stored. `ops.rejudge_moved_head` writes the decline;
-    INV-ATTENTION-MISSING puts the flag up from here, which is the path that honours
-    `acknowledged_blockers` (kn-089de524).
-
-    A decline caused by `ops.REBIND_EXHAUSTED` is NOT one of these — that one is
-    `rebind_exhausted` below, and the remedy this one names would do nothing for it.
-    """
-    return _parked_on_a_decline(store, wo, rebind=False)
+    """Is this order parked on a head the OS declined to re-judge, and still on it?"""
+    return _parked_on_a_decline(store, wo, rebind=False, code=HELD_SHA_MOVED)
 
 
 def rebind_exhausted(store: ProjectStore, wo: dict[str, Any]) -> bool:
-    """The same question about the OTHER decline: the OS re-judged the merge it asked
-    for `ops.REBIND_MAX` times and the panel still refuses it.
+    """The same question about the OTHER decline: the OS re-judged the merge it asked for `ops.REBIND_MAX`..."""
+    return _parked_on_a_decline(store, wo, rebind=True, code=HELD_SHA_MOVED)
 
-    A separate derivation because the remedy is different and `SHA_MOVED_BLOCKER`'s is
-    then FALSE: it offers `validation.max_rounds`, and the rebind arm never reads it
-    (spec 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.5).
-    """
-    return _parked_on_a_decline(store, wo, rebind=True)
+
+def sha_unrecorded_exhausted(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """The same question about the stall with NO commit bound: the round passed on a worktree"""
+    return _parked_on_a_decline(store, wo, rebind=False, code=HELD_SHA_UNRECORDED)
+
+
+def sha_unrecorded_rejudge_spent(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """The stall with no commit bound AND NO DECLINE: the OS spent its one round on this very head and..."""
+    from . import ops as ops_mod
+
+    held = store.events_of_kind(wo["id"], "automerge_held")
+    if not held:
+        return False
+    newest = db.from_json(held[-1]["payload"], {})
+    if str(newest.get("code") or "") != HELD_SHA_UNRECORDED:
+        return False
+    head = str(newest.get("head_sha") or "")
+    if not head or head not in ops_mod.rejudged_heads(store, str(wo["id"])):
+        return False
+    return store.validated_head(
+        store.latest_validation_round(wo_id=wo["id"])) != head
 
 
 def _parked_on_a_decline(store: ProjectStore, wo: dict[str, Any], *,
-                         rebind: bool) -> bool:
-    """The three facts both derivations above share, read for one `cause` only.
-
-    The decline dedupe is per head across both causes, so one head carries one decline
-    with one cause and the two can never both fire (spec §4.5).
-    """
+                         rebind: bool, code: str) -> bool:
+    """The three facts the derivations above share, read for one `cause` and one hold `code` only"""
     from . import ops as ops_mod
 
     declined = [e for e in store.events_of_kind(wo["id"], REJUDGE_DECLINED_EVENT)
@@ -918,40 +467,20 @@ def _parked_on_a_decline(store: ProjectStore, wo: dict[str, Any], *,
     if not held:
         return False
     newest = db.from_json(held[-1]["payload"], {})
-    if str(newest.get("code") or "") != HELD_SHA_MOVED:
+    if str(newest.get("code") or "") != code:
         return False
     head = str(newest.get("head_sha") or "")
     if not head or not any(
             str(db.from_json(e["payload"], {}).get("head_sha") or "") == head
             for e in declined):
         return False
-    # ...AND NOTHING HAS BOUND A VERDICT TO THAT COMMIT SINCE. A hold is only written
-    # when the merge is declined, so an armed one writes nothing and the newest hold
-    # goes on describing a stall that is over — the user forces the round the machine
-    # left them, it passes, and this would still be flagging them about it.
+    # ...AND NOTHING HAS BOUND A VERDICT TO THAT COMMIT SINCE
     return store.validated_head(
         store.latest_validation_round(wo_id=wo["id"])) != head
 
 
 def automerge_denied(store: ProjectStore, wo: dict[str, Any]) -> bool:
-    """Was this order's automatic merge REFUSED, on the commit the panel still names?
-
-    Shaped on `rejudge_exhausted` above and derived for the same reason: `record_verdict`
-    runs on the daemon's verdict-delivery arm, so a flag written there re-raises itself
-    every tick over `jarvis wo ack` (kn-089de524). Spec 2026-09-24 fix 4b.
-
-    THREE FACTS. The newest verdict is `denied` or `dismissed` — both, because `apply`
-    refuses on anything but `approved`, so a dismissal stalls the order exactly as a
-    denial does while meaning the reviewer reached for the wrong verb. The commit that
-    verdict was bound to is still the one the panel's verdict names, read from the single
-    source `decide` is forbidden to re-derive. And nothing has moved past it: a
-    `sha_moved` hold newer than the verdict, on a different commit, is a push, and the
-    re-judge path owns the order from there — which is what makes the flag self-clearing
-    within a tick rather than permanent.
-
-    An ESCALATED request writes no `automerge_decided` row and reaches the user through
-    `store.escalated_approvals` above, so it is never double-flagged.
-    """
+    """Was this order's automatic merge REFUSED, on the commit the panel still names?"""
     from .automerge import decided_sha
 
     decided = store.events_of_kind(wo["id"], "automerge_decided")
@@ -961,8 +490,7 @@ def automerge_denied(store: ProjectStore, wo: dict[str, Any]) -> bool:
     if str(verdict.get("decision") or "") not in ("denied", "dismissed"):
         return False
     sha = decided_sha(verdict)
-    # A row carrying neither `head_sha` nor a command to parse one from is not a verdict
-    # anyone can act on: it predates the record this flag depends on, and is ignored.
+    # A row carrying neither `head_sha` nor a command to parse one from is not a verdict anyone can act...
     if not sha or store.validated_head(
             store.latest_validation_round(wo_id=wo["id"])) != sha:
         return False
@@ -976,32 +504,7 @@ def automerge_denied(store: ProjectStore, wo: dict[str, Any]) -> bool:
 
 
 def parked_on_a_give_up(store: ProjectStore, wo: dict[str, Any]) -> bool:
-    """Is the panel's give-up the thing holding this parked pull request?
-
-    TWO FACTS: the latest validation round ESCALATED, and the newest automatic-merge hold
-    is `not_passed` — the one code `decide` reaches when no commit was ever accepted, so
-    it is the precise statement that the give-up is what the merge waits on. Without the
-    second fact this fires on every parked order in a project running with `auto_merge`
-    off, which writes no hold at all and where the pull request merges on GitHub with
-    nothing stuck. The hold check is folded in here rather than left to the branch for
-    the reason `rejudge_exhausted` above folds in its own: both facts answer one
-    question, and a predicate answering half of it would carry a name that lied.
-
-    Derived, never stored. A flag written where the hold is written sits on the daemon's
-    poll path and re-raises itself over `jarvis wo ack` every tick (kn-089de524);
-    INV-ATTENTION-MISSING raises it from here, which is the path that honours
-    `acknowledged_blockers`.
-
-    SELF-CLEARING by construction, and without waiting for a poll. Fact 1 reads the last
-    JUDGED round, so a later round that PASSES clears it on the same tick, with no new
-    hold event — and one that merely opens does not, per spec
-    docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md §A.
-    Fact 2 clears it when the hold changes code — the head
-    moved, CI went red, the pull request closed — each of which has its own sentence and
-    its own machinery, and this one must not sit over them.
-
-    Spec 2026-10-01-an-escalated-round-on-a-parked-order-raises-nothing.md.
-    """
+    """Is the panel's give-up the thing holding this parked pull request? (docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md §A.)"""
     if not validation_escalated(store, wo):
         return False
     held = store.events_of_kind(wo["id"], "automerge_held")
@@ -1012,21 +515,7 @@ def parked_on_a_give_up(store: ProjectStore, wo: dict[str, Any]) -> bool:
 
 
 def neo_reviews_later(store: ProjectStore, wo: dict[str, Any]) -> bool:
-    """Are this order's pending assumptions Neo's to decide on delivery, not the user's?
-
-    Issue #711: a worker recording an assumption mid-turn flagged "Needs you" for the
-    rest of the turn, in a project whose assumptions the OS decides itself. Nothing was
-    owed — `Daemon.auto_review` only looks at `needs_review` — and the order read as
-    stalled while the worker was still typing.
-
-    NOT a suppression that outlives the turn: the moment the order parks in
-    `needs_review` this is False again, so either Neo settles the assumptions or the
-    blocker comes straight back — including every case Neo holds (`autoreview.decide`
-    conditions 4-7).
-
-    The catalog read sits behind the caller's `pending` check, which is empty for almost
-    every work order on almost every tick (`parked_reason`'s ordering note).
-    """
+    """Are this order's pending assumptions Neo's to decide on delivery, not the user's? (#711)"""
     if wo["status"] not in PRE_DELIVERY_STATUSES:
         return False
     from .ops import auto_review_at
@@ -1035,18 +524,7 @@ def neo_reviews_later(store: ProjectStore, wo: dict[str, Any]) -> bool:
 
 
 def objection_undeliverable(store: ProjectStore, a: dict[str, Any]) -> bool:
-    """Did the OS's objection about this assumption die on the way to the worker? (§9)
-
-    UNDELIVERABLE IS A STATE, NOT AN ELAPSED TIME, and there is deliberately no deadline:
-    a timeout would put a clock on how long a worker may think, and the OS has no basis
-    for that number. Two states say it and only two — the objection's `wo_messages` row
-    is `failed` (its retries are spent), or its envelope is terminal and not `delivered`.
-    `objection_delivered_ts` being NULL by itself is NEVER the trigger: that is the
-    normal case for the whole length of a turn.
-
-    The two reads sit behind the `objection_envelope_id` check, which is NULL on almost
-    every pending assumption on almost every tick (`parked_reason`'s ordering note).
-    """
+    """Did the OS's objection about this assumption die on the way to the worker? (§9)"""
     env_id = a.get("objection_envelope_id")
     if env_id is None:
         return False
@@ -1060,19 +538,12 @@ def objection_undeliverable(store: ProjectStore, a: dict[str, Any]) -> bool:
         msg = store.get_message(int(msg_id))
         if msg is not None and msg["status"] == "failed":
             return True
-    # Terminal and not delivered: nobody filled the role, or nobody could act. `queued`
-    # is normal operation and `withdrawn` is §6.6 — the order stopped, nothing failed.
+    # Terminal and not delivered: nobody filled the role, or nobody could act
     return str(env.get("state") or "") in ("undeliverable", "handled_by_router")
 
 
 def _confirmation_is_open(question_id: int) -> bool:
-    """Is Neo still holding this confirmation question? Cross-DB and best-effort.
-
-    `awaiting_neo`'s precedent below and `ops._unreachable_asks`', including the failure
-    direction: an unreadable `neo.db`, or a link that resolves to nothing, must fail
-    TOWARD the user — so this answers False and the blocker appears. One row read per
-    pending assumption that carries a link, on an order already in `needs_review`.
-    """
+    """Is Neo still holding this confirmation question?"""
     from .neo_store import NEO_HELD_Q_STATUSES, NeoStore
 
     try:
@@ -1087,21 +558,7 @@ def _confirmation_is_open(question_id: int) -> bool:
 
 
 def _os_is_confirming(a: dict[str, Any]) -> bool:
-    """Is the OS's own confirmation pass (§7) holding this assumption, not the user?
-
-    Two rows, and in both the user owes nothing: an accepted one is being confirmed
-    against the diff, and an objected-and-DELIVERED one is waiting on the WORKER to
-    answer. An objection still in flight is neither, so it is not here.
-
-    **`accept` IS NOT ENOUGH ON ITS OWN** (2026-09-28 spec §7, issue #833). The column is
-    written once and never cleared, so it could not tell a confirmation in flight from one
-    dropped in February — and the rows in that spec's §1.1 were suppressed from the
-    attention list for hours while the user could not close them either. A link that is
-    NOT there is a confirmation still to come, or one §4 cleared to re-ask, and suppresses
-    as it always did; a link to a question Neo has finished with does not.
-
-    The `object` branch is untouched: it is about a delivered objection and the worker.
-    """
+    """Is the OS's own confirmation pass (§7) holding this assumption, not the user? (#833)"""
     verdict = str(a.get("provisional_verdict") or "")
     if verdict == "accept":
         qid = int(a.get("confirm_question_id") or 0)
@@ -1111,146 +568,71 @@ def _os_is_confirming(a: dict[str, Any]) -> bool:
 
 def true_blockers(store: ProjectStore, wo: dict[str, Any],
                   now: float | None = None) -> list[str]:
-    """The reasons this work order genuinely needs the user, derived from state alone.
-
-    Ordered most-actionable first, so `[0]` is the canonical attention reason. This is
-    the single source of truth for "what does this work order want from me" — the UI
-    banner, the attention list and the invariants below all have to agree with it, and
-    any of them disagreeing is a bug in that surface, not here.
-    """
+    """The reasons this work order genuinely needs the user, derived from state alone"""
     blockers: list[str] = []
     pending = store.pending_assumptions(wo["id"])
-    # §9: FIRST, because it is the more specific fact about the same assumption.
+    # §9: FIRST, because it is the more specific fact about the same assumption
     if any(objection_undeliverable(store, a) for a in pending):
         blockers.append(OBJECTION_UNDELIVERABLE_BLOCKER)
     owed = pending
     if pending and wo["status"] == "needs_review":
-        # `neo_reviews_later` covers the PRE-DELIVERY statuses (#711) and is False here,
-        # so the flag is re-read: a project that has since turned auto_review OFF never
-        # runs the confirmation pass, and suppressing the blocker then would be silence
-        # with nothing behind it. `failed` and `budget_exhausted` are deliberately NOT
-        # gated — no confirmation pass ever reaches them, so those assumptions ARE the
-        # user's.
+        # `neo_reviews_later` covers the PRE-DELIVERY statuses (#711) and is False here
         from .ops import auto_review_at
         if auto_review_at(store.project_path):
             owed = [a for a in pending if not _os_is_confirming(a)]
+    # ONE COMPOUND LINE when the order is also out of money
+    compound = False
     if owed and not neo_reviews_later(store, wo):
         n = len(owed)
-        blockers.append(f"{n} assumption{'s' if n != 1 else ''} pending your review")
-    # A privileged action Neo declined to decide on. Nobody else can open that gate, and
-    # the work order cannot proceed past it.
+        compound = wo["status"] == budget.EXHAUSTED
+        clause = (f"{n} assumption{'s' if n != 1 else ''} "
+                  f"also await{'s' if n == 1 else ''} you")
+        blockers.append(f"{budget_blocker(store, wo)}; {clause}" if compound
+                        else f"{n} assumption{'s' if n != 1 else ''} pending your review")
+    # A privileged action Neo declined to decide on
     for approval in store.escalated_approvals(wo["id"]):
         blockers.append(
             f"gate approval needed: {approval['kind']} (request {approval['id']})"
         )
-    # Two of the blockers below only exist because Jarvis dispatched the worker and
-    # briefed it on the contract (`jarvis wo finish`, worktree, OPERATION.md). A session
-    # the user started and injected got none of that — no JARVIS_WO_ID, no briefing — so
-    # it cannot signal completion and its session ending is not a failure. Holding it to
-    # the contract anyway made every such session a guaranteed attention item.
-    # See Daemon.retire_ungoverned.
+    # Two of the blockers below only exist because Jarvis dispatched the worker and briefed it on the...
     governed = wo.get("origin") not in UNGOVERNED_ORIGINS
-    # OUT OF MONEY, and the reason is REBUILT rather than read off `attention_reason`:
-    # this function is the only source of attention reasons — INV-ATTENTION-REASON
-    # rewrites any flag it cannot derive — so a line `budget.escalate` wrote and this did
-    # not repeat would be replaced by a generic one on the next reconcile tick. Rebuilt
-    # from live accounting, so the figures in it stay current as the panel spends, and it
-    # states the feature's unreserved remainder for a child whose slice ran out.
-    #
-    # ABOVE `failed`, and above every wait below: an order in this status has nothing
-    # else it can be waiting for, and the question the user is being asked is about
-    # money rather than about the work.
-    if wo["status"] == budget.EXHAUSTED:
+    # OUT OF MONEY, and the reason is REBUILT rather than read off `attention_reason`: this function is...
+    if wo["status"] == budget.EXHAUSTED and not compound:
         blockers.append(budget_blocker(store, wo))
     if governed and wo["status"] == "failed":
-        # TWO SENTENCES, and the second is the one the generic line got wrong: a session
-        # that died AFTER the work was delivered did not "fail" in any sense the user can
-        # act on by retrying blind — there is a pull request and there may be assumptions.
-        # The read sits behind the status check, so no other work order pays for it.
-        # Spec §(a), docs/superpowers/specs/2026-10-07-a-settled-features-live-children-
-        # must-have-a-manager-or-a-hold.md
+        # TWO SENTENCES, and the second is the one the generic line got wrong: a session that died AFTER the...
         died = store.events_of_kind(wo["id"], TURN_DIED_AFTER_DELIVERY_EVENT)
         blockers.append(TURN_DIED_AFTER_DELIVERY_BLOCKER if died
                         else WORKER_FAILED_BLOCKER)
-    # AN INVARIANT THE OS CANNOT REPAIR, WHICH OWES THE USER A DECISION. UNGATED BY
-    # STATUS, and that is the point rather than an oversight: INV-WORK-LANDED fires on
-    # `completed`, and a settled order is exactly what every branch here used to skip —
-    # so an open pull request nobody merged had no surface but the inbox. The sentence is
-    # the checker's own and reaches the flag through this function, so
-    # INV-ATTENTION-REASON can re-derive it and a Claude Code hook cannot relabel it.
-    # Ranked here documentarily, for the next owed checker: nothing it can co-occur with
-    # today, since every later branch is gated on an open or parked status. Spec
-    # docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md §3
+    # AN INVARIANT THE OS CANNOT REPAIR, WHICH OWES THE USER A DECISION (docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md §3)
     for report in store.owed_violations(wo["id"]):
         blockers.append(report["owed"])
-    # AN OS-BUILT PROMPT WAS REFUSED AS TOO LARGE (spec §4,
-    # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md). Above the waits below
-    # and above the `needs_review` triage, because it outranks both of the generic
-    # sentences it would otherwise sit under: a question Neo "could not answer" and a
-    # panel that "could not be satisfied" both point the user at the wrong remedy when
-    # the cause is a prompt nobody ever sent. Gated on the status so no settled work
-    # order pays for the query, as the neighbouring blockers are.
+    # AN OS-BUILT PROMPT WAS REFUSED AS TOO LARGE (spec §4 (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
     if wo["status"] in OPEN_STATUSES:
         refusal = store.os_prompt_refusal_open(wo["id"])
         if refusal is not None:
             blockers.append(os_prompt_refused_blocker(refusal))
-    # Parked on the user's Claude Code sign-in (`Daemon._park_on_signin`). Before the
-    # `waiting_input` branch below, whose generic "waiting on your input" would send the
-    # user looking for a session to type into — the thing to do is `/login`, and once
-    # they have, nothing else is asked of them. The query sits behind the status check so
-    # no other work order pays for it.
+    # Parked on the user's Claude Code sign-in (`Daemon._park_on_signin`)
     auth_parked = False
     if governed and wo["status"] == "waiting_input":
         pause = worker_session.turn_pause(store, wo["id"])
         auth_parked = pause is not None and pause.reason == worker_session.PAUSE_AUTH
         if auth_parked:
             blockers.append(AUTH_BLOCKER)
-    # Blocked on a prompt is real whoever started the session: nobody else can unstick it.
-    # A worker waiting on the DELEGATE is the exception, and there are two ways to be
-    # waiting on it — a gate still with Neo, and a question still with Neo. Routing both
-    # away from the user is the entire point of having a delegate, so each stays silent
-    # until Neo either decides or hands it back.
-    #
-    # The question half is what GitHub issue 100 was: `jarvis wo ask` parks the work
-    # order here without flagging attention, and this line put the flag straight back on
-    # the next tick — "worker is waiting on your input" about a worker waiting on Neo,
-    # steering the user at `jarvis wo resume-auto`, which cannot help. Three of five
-    # sampled `jarvis_os` work orders had it.
-    #
-    # A MANAGER used to be the second exception, on the grounds that it sits in
-    # `waiting_input` for its feature's entire life. It has its own status now (`idle`,
-    # issue #264) and the exception is gone — which fixes a bug the exception was
-    # hiding. A manager reaches `waiting_input` only by asking, so the one case it USED
-    # to suppress was the case that most needed the user: Neo handing its question back.
+    # Blocked on a prompt is real whoever started the session: nobody else can unstick it (#264)
     if wo["status"] == "waiting_input" and not auth_parked:
         question = awaiting_neo(wo["id"])
         if question is not None and question["status"] in USER_HELD_Q_STATUSES:
-            # Neo handed the decision back. That IS the user's, and it gets a reason
-            # naming the question rather than the generic one below, which would send
-            # them looking for a session to type into.
+            # Neo handed the decision back
             blockers.append(neo_question_blocker(question))
         elif (question is None and not waiting_on_neo_gate(store, wo)
                 and not store.queued_messages(wo["id"])):
-            # A queued message is the reply already on its way: `ops.send_message` clears
-            # the flag the moment the user writes it, and this line put it back on the
-            # next tick — for the seconds between queueing and delivery, the user was
-            # asked again for something they had just done. A delivery that FAILS raises
-            # its own, more specific flag (`Daemon._deliver`), so nothing is lost.
+            # A queued message is the reply already on its way: `ops.send_message` clears the flag the moment the...
             blockers.append("worker is waiting on your input")
-    # A dependency that will never complete. Ordinary blocking is silent on purpose —
-    # `pending — blocked by …` is a listing label, not a decision anyone owes — but a
-    # dependency that is cancelled or failed cannot clear itself, so the work order will
-    # wait for ever and only the user can choose between cancelling it and cutting the
-    # edge (`jarvis wo unblock`). That is the difference between waiting and stranded.
+    # A dependency that will never complete
     if wo["status"] == "pending" and dead_dependencies(store, wo):
         blockers.append(DEAD_DEPENDENCY_BLOCKER)
-    # THE FEATURE THIS CHILD BELONGS TO HAS SETTLED UNDER IT. A fact about the work
-    # order's context rather than about its own delivery, so it sits below the assumptions
-    # line it must not displace and above the `needs_review` triage. Gated on the status
-    # and on the column so no other work order pays for the read; a manager is skipped,
-    # because `_close_feature_manager` settling it with its feature is correct. Spec §(b),
-    # docs/superpowers/specs/2026-10-07-a-settled-features-live-children-must-have-a-
-    # manager-or-a-hold.md
+    # THE FEATURE THIS CHILD BELONGS TO HAS SETTLED UNDER IT
     if (wo["status"] in OPEN_STATUSES and wo.get("parent_id")
             and wo.get("kind") != "manager"):
         try:
@@ -1262,154 +644,72 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
             blockers.append(SETTLED_FEATURE_BLOCKER.format(
                 fo_id=parent["id"], status=parent["status"],
                 remedy=remedy.format(fo_id=parent["id"], wo_id=wo["id"])))
-    # A RELEASE THAT WAITED OUT THE THRESHOLD ON A RED BASE (2026-09-29 spec §3). Gated
-    # on the status so no other work order pays the query; the ordinary re-park raises
-    # nothing at all, because `pending` behind a hold is the OS waiting, not the user.
+    # A RELEASE THAT WAITED OUT THE THRESHOLD ON A RED BASE (2026-09-29 spec §3)
     if wo["status"] == "needs_review":
         park = store.release_red_park_open(wo["id"])
         if park is not None:
             blockers.append(release_base_red_blocker(park))
-    # A PULL REQUEST THE OS TRIED TO REPAIR AND COULD NOT — conflicts, a red build, or
-    # both. Derived at ONE site from PR_REPAIR_BLOCKERS, in that tuple's order; see its
-    # note for what being derived at two sites cost.
-    #
-    # ABOVE the `needs_review` triage below, on the same precedent that ranks the closed
-    # pull request first there: each is a fact about the outside world, and each changes
-    # what the user does next — they were about to merge. The status still says
-    # `needs_review`, which is the rest of the story.
-    #
-    # BELOW PR_CLOSED_BLOCKER IS THE ONE RANKING THIS DOES NOT HAVE TO MAKE, and that is
-    # by construction rather than by luck: `ops.record_pr_closed` — the only writer of
-    # `pr_state='CLOSED'` — closes both episodes before it flags anything, so a refused
-    # pull request has no give-up left to outrank its refusal. Without that a red pull
-    # request later closed unmerged would say "do not merge it as it stands" over the
-    # news that nobody is going to, which is kn-b6977de3's shape exactly: a true line
-    # hiding a truer one.
-    #
-    # UNGUARDED BY `pending`, for the reason case 2 below is: a pull request can be red
-    # while an assumption is still undecided, and those are two independent things owed.
-    #
-    # Gated on PR_REPAIR_STATUSES, not on `pr_url` alone: an episode is only ever closed
-    # by a poll, and a terminal work order is not polled. A hand-merged red pull request
-    # ends in `complete_merged` with its episode still open, and an ungated derivation
-    # would leave a finished work order saying "do not merge it as it stands" for ever.
-    # The status check also keeps both queries off every work order that cannot be in one.
+    # A PULL REQUEST THE OS TRIED TO REPAIR AND COULD NOT — conflicts, a red build, or both
     if wo["status"] in PR_REPAIR_STATUSES:
         for repair, blocker in PR_REPAIR_BLOCKERS:
             if store.pr_repair_attempts(wo["id"], repair) >= PR_REPAIR_MAX_ATTEMPTS:
                 blockers.append(blocker)
-    # A PULL REQUEST THE OS CANNOT RE-JUDGE. The head moved past the verdict and the
-    # round budget is spent, so the one remedy left is a person's — the spec's section 4,
-    # and the ONLY `sha_moved` case that reaches this list. Gated on the status so no
-    # other work order pays for the two reads.
+    # CANCELLED CI THE OS'S ONE RE-RUN DID NOT CLEAR — the column keeps the green path free of reads (#1123)
+    ci_stuck = ci_checks_stuck(store, wo)
+    if ci_stuck:
+        blockers.append(ci_stuck)
+    # A PULL REQUEST THE OS CANNOT RE-JUDGE
     if wo["status"] == "waiting_pr_merge" and rejudge_exhausted(store, wo):
         blockers.append(SHA_MOVED_BLOCKER)
-    # THE SAME STALL WITH THE OTHER CAUSE, and the two cannot both fire: the decline
-    # dedupe is per head across both (spec 2026-09-27 §4.5).
+    # THE SAME STALL WITH THE OTHER CAUSE
     if wo["status"] == "waiting_pr_merge" and rebind_exhausted(store, wo):
         blockers.append(REBIND_EXHAUSTED_BLOCKER)
-    # A MERGE THE REVIEWER REFUSED. Nothing re-asks for that commit, so the order would
-    # otherwise sit parked for ever with nothing owed by anyone (spec 2026-09-24 fix 4b).
-    # Gated on the status for the same reason as the branch above, and ordered after it
-    # documentarily: the two cannot both be true — that one needs the newest hold to be
-    # `sha_moved` on the judged head, this one needs no such hold.
+    # AND THE STALL WITH NO COMMIT BOUND AT ALL (spec 2026-10-16 §4)
+    if wo["status"] == "waiting_pr_merge" and sha_unrecorded_exhausted(store, wo):
+        blockers.append(SHA_UNRECORDED_BLOCKER)
+    # ...AND THE SAME STALL THE OS ALREADY SPENT ITS ROUND ON
+    if wo["status"] == "waiting_pr_merge" and sha_unrecorded_rejudge_spent(store, wo):
+        blockers.append(SHA_UNRECORDED_SPENT_BLOCKER)
+    # A MERGE THE REVIEWER REFUSED
     if wo["status"] == "waiting_pr_merge" and automerge_denied(store, wo):
         blockers.append(AUTOMERGE_DENIED_BLOCKER)
-    # THE GIVE-UP, SURVIVING INTO THE STATUS THAT DROPPED IT (issue 902). Ranked last of
-    # the four documentarily: none of them can co-occur, proved in section 4 of spec
-    # 2026-10-01-an-escalated-round-on-a-parked-order-raises-nothing.md.
+    # THE GIVE-UP, SURVIVING INTO THE STATUS THAT DROPPED IT (issue 902)
     if wo["status"] == "waiting_pr_merge" and parked_on_a_give_up(store, wo):
         blockers.append(PARKED_GIVE_UP_BLOCKER)
     if governed and wo["status"] == "needs_review":
-        # In the body, the pattern `auto_review_at` above already uses: `ops` imports
-        # this module.
+        # In the body, the pattern `auto_review_at` above already uses: `ops` imports this module
         from .ops import refusal_answered
 
-        # THREE WAYS TO ARRIVE AT `needs_review`, ranked, and each asking the user for
-        # something different. The `not pending` guards are PER LINE and not on the
-        # branch head, which is the whole subtlety here: only ONE of the three can be
-        # true at the same time as an undecided assumption, and hoisting the guard back
-        # up — where it sat until issue 212 — silently drops that one.
-        #
-        # 1. A closed pull request: the work WAS delivered and then refused, so there is
-        #    nothing to review in the session — the question is what to do about the
-        #    refusal. Ranked first among the three: a fact about the outside world
-        #    supersedes whatever the panel thought.
-        #
-        #    NOW UNGUARDED, and it used to carry `not pending` on the argument that a
-        #    work order holding an undecided assumption had by construction never reached
-        #    `waiting_pr_merge`, the only status the poll looked at — so `pr_state` could
-        #    never say CLOSED here. Issue #224 widened the poll to `needs_review`, which
-        #    is exactly where such a work order sits, so the co-occurrence is reachable
-        #    and the guard had quietly become a way to hide a refusal behind a pending
-        #    decision. Same reasoning as case 2 below: two independent things owed, and
-        #    the assumptions line is appended ABOVE this one anyway, so nothing is
-        #    relabelled by letting both through.
+        # THREE WAYS TO ARRIVE AT `needs_review`, ranked, and each asking the user for something different (#224)
         if wo.get("pr_state") == "CLOSED":
             blockers.append(PR_CLOSED_BLOCKER)
-        # 2. The panel ran its rounds and could not be satisfied. UNGUARDED, and that is
-        #    the thing to preserve: since issue 212 a round runs while the user decides
-        #    (`ops.land_when_cleared`), so the panel can give up on a work order whose
-        #    assumption is still outstanding. They are two independent things owed, and
-        #    dropping the give-up because a decision is also open is the silent
-        #    relabelling kn-78346a2d names — dropping it FOR GOOD, because accepting the
-        #    assumption lands the work order and nothing re-derives it afterwards.
-        #    ONE OF TWO SENTENCES: a give-up on a round a USER rejection bought names
-        #    that cause instead (spec 2026-09-27 §5, Neo question 973).
+        # 2
         elif validation_escalated(store, wo):
-            blockers.append(USER_REWORK_REFUSED_BLOCKER
-                            if user_rework_refused(store, wo)
-                            else VALIDATION_STUCK_BLOCKER)
-        # 3. The landing refused to complete it over code that is on nothing but its own
-        #    branch (`ops.park_unlanded`, GitHub issue #232). Above the idle line and
-        #    not merged into it, because they are opposite facts about the same status:
-        #    that one says the worker produced nothing anyone can see, this one says it
-        #    produced something nobody can see. Guarded for the reason below, and
-        #    unreachable with an assumption pending anyway — the landing that parks it
-        #    only runs once the user's gate has cleared.
+            if user_rework_unreviewed(store, wo):
+                blockers.append(USER_REWORK_UNREVIEWED_BLOCKER)
+            elif user_rework_refused(store, wo):
+                blockers.append(USER_REWORK_REFUSED_BLOCKER)
+            else:
+                blockers.append(VALIDATION_STUCK_BLOCKER)
+        # 3 (#232)
         elif not pending and store.work_unlanded_open(wo["id"]):
             blockers.append(UNLANDED_BLOCKER)
-        # 3b. The user refused an assumption and nothing has delivered since. Below the
-        #     unlanded line — code stranded on a branch is the more urgent fact and names
-        #     a different decision — and above the idle line, which would call a worker
-        #     that DID deliver one that stopped mid-task. The `PR_UNDECLARED_BLOCKER`
-        #     guard is because that blocker is the same refusal WITH commits behind it,
-        #     appended earlier from `PR_REPAIR_BLOCKERS`; without it both lines appear
-        #     and the second is the weaker. Spec §3,
-        #     docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md
+        # 3b (docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md)
         elif (not pending and PR_UNDECLARED_BLOCKER not in blockers
                 and not refusal_answered(store, wo["id"])):
             blockers.append(REFUSAL_UNANSWERED_DOC_BLOCKER
                             if wo.get("kind") in DOCUMENT_DELIVERY_KINDS
                             else REFUSAL_UNANSWERED_BLOCKER)
-        # 4. Nothing more specific: the worker stopped without finishing. Guarded,
-        #    because a `needs_review` holding a pending assumption is doing exactly what
-        #    that status is for, and this line would call it a worker that gave up.
+        # 4
         elif not pending:
             blockers.append(IDLE_NO_FINISH_BLOCKER)
-    # A message the user sent that the worker will never see (GitHub issue 43). Derived
-    # here rather than flagged at the delivery site because `deliver_messages` never runs
-    # for these — the hold is the absence of an attempt, so there is no call site to
-    # raise it from — and because INV-ATTENTION-REASON rewrites any reason this function
-    # cannot re-derive. Above the parked line on purpose: both say the worker has
-    # stopped, and this one also says what the user is missing.
+    # A message the user sent that the worker will never see (GitHub issue 43)
     if stuck_message(store, wo, now=now) is not None:
         blockers.append(MESSAGE_STUCK_BLOCKER)
-    # LAST, and never INSTEAD of anything: a work order can be parked and also owe the
-    # user a decision, and overwriting the decision with the parking is exactly the
-    # silent relabelling kn-78346a2d describes. It is appended only when nothing already
-    # here has told the user the worker has stopped — an assumption review is the one
-    # blocker that says who owes what without saying anything about the session behind
-    # it, which is how wo-a4bd6958 sat for 7h13m under a four-hour-old assumptions line.
-    # ...and the two refusal lines are NOT assumption reviews, though they name one: they
-    # say plenty about the session behind them, which is the rule this tail applies (§4,
-    # docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md).
+    # LAST, and never INSTEAD of anything: a work order can be parked and also owe the user a decision (docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md)
     if all(_mentions_assumptions(b) and b not in REFUSAL_HELD_BLOCKERS
            for b in blockers):
-        # ONE VERDICT PER ORDER PER DERIVATION (§5d's cost clause): derived here, handed
-        # to `parked_reason`, and read again by the arm below — never once per arm. Only
-        # an OPEN row is asked: `ops.SCHEDULED_ACTORS` is keyed by `OPEN_STATUSES` and
-        # raises on anything else, and a settled order must not pay for the question.
+        # ONE VERDICT PER ORDER PER DERIVATION (§5d's cost clause): derived here
         actor: Any = ACTOR_NOT_DERIVED
         if wo["status"] in OPEN_STATUSES:
             from .ops import scheduled_actor
@@ -1418,60 +718,33 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         parked = parked_reason(store, wo, now=now, actor=actor)
         if parked:
             blockers.append(parked)
-        # NOBODY OWNS IT, AND NOTHING IS OWED. LAST, behind the parked tail and
-        # behind its guard rather than a second copy of it (Neo's precedence ruling): the
-        # parked line carries the CAUSE where this carries only the absence, so a
-        # worker-stopped line already on the list is the better sentence. `governed`
-        # because an `adhoc` or `injected` row genuinely has no actor BY DESIGN — both
-        # the settler and the retry sweep skip it — and is asked for nothing
-        # (`Daemon.retire_ungoverned`, INV-ADHOC-LEGACY-RETIRED).
-        #
-        # `not blockers` INSIDE the reused guard, not instead of it: §5b says NO
-        # USER-OWED BLOCKER, and the guard above answers the narrower question of whether
-        # any line says the WORKER stopped. An assumption review passes that guard while
-        # being exactly a thing the user owes — every `needs_review` order holding one
-        # would otherwise be told twice that nobody owns it.
+        # NOBODY OWNS IT, AND NOTHING IS OWED
         elif governed and actor is None and not blockers:
             blockers.append(NO_ACTOR_BLOCKER.format(status=wo["status"]))
-    # What the user has already looked at and dismissed stops being a blocker — but only
-    # exactly that. Anything new still gets through (a pending assumption never can be
-    # acknowledged away; `jarvis wo ack` refuses).
+    # What the user has already looked at and dismissed stops being a blocker — but only exactly that
     return [b for b in blockers if b not in acknowledged(wo)]
 
 
-def acknowledged(wo: dict[str, Any]) -> list[str]:
-    """What has already been dismissed on this work order, decoded from the column.
+def ci_checks_stuck(store: ProjectStore, wo: dict[str, Any]) -> str:
+    """The give-up line for cancelled CI on the head the poll last saw, or "" (#1123)"""
+    from . import ci_rerun
 
-    ONE READER FOR A COLUMN THAT IS STORED AS RAW JSON, because it is also the only
-    durable record of WHY a settled work order was ever flagged: `attention_reason` is
-    NULLed the moment the flag goes down, so every surface that answers "why is this in
-    `needs_review`?" reads this instead (issue 573's second fault). `true_blockers`
-    filters against the same list, so the two can never disagree about what counts as
-    seen.
-    """
+    stuck = str(wo.get("pr_checks_stuck_head") or "")
+    if (not stuck or wo["status"] not in ci_rerun.CI_WAIT_STATUSES
+            or stuck != str(wo.get("pr_head_oid") or "")):
+        return ""
+    found = ci_rerun.episode(store, wo["id"], stuck).stuck
+    return str((found or {}).get("blocker") or "")
+
+
+def acknowledged(wo: dict[str, Any]) -> list[str]:
+    """What has already been dismissed on this work order, decoded from the column"""
     return db.from_json(wo.get("acknowledged_blockers"), []) or []
 
 
 def stuck_message(store: ProjectStore, wo: dict[str, Any],
                   now: float | None = None) -> tuple[dict[str, Any], str] | None:
-    """The message this work order was sent and will never receive, and what holds it.
-
-    `None` while delivery is still accounted for. Four waits are excused, and each is
-    excused because something else already owns it — a second check saying the same thing
-    later is how one problem becomes two lines on the attention list:
-
-    * a status outside MESSAGE_STUCK_STATUSES, whose own note says who owns each one;
-    * anything younger than `messaging.stuck_minutes`;
-    * and the two `worker_session.delivery_hold` marks `accounted` — a turn in flight,
-      and a retry the OS has booked and not yet missed.
-
-    THE HOLD IS NOT RE-DERIVED HERE. `delivery_hold` is the same call
-    `Daemon.deliver_messages` skips on, so "the delivery pass declined this" and "this is
-    why" cannot drift; asking the same questions again independently is how they would.
-    What is left over — no hold at all, or one nothing owns — is the shape GitHub issue
-    43 measured: nothing is coming, and no surface says so. The reason names the hold
-    rather than the symptom, because the blocker string cannot (MESSAGE_STUCK_BLOCKER).
-    """
+    """The message this work order was sent and will never receive, and what holds it"""
     from .ops import messaging_config_at
 
     if wo["status"] not in MESSAGE_STUCK_STATUSES:
@@ -1484,21 +757,15 @@ def stuck_message(store: ProjectStore, wo: dict[str, Any],
     minutes = int(messaging_config_at(store.project_path).stuck_minutes)
     if now - float(oldest["ts"]) < minutes * SECONDS_PER_MINUTE:
         return None
-    hold = worker_session.delivery_hold(store, wo, now=now)
+    hold = worker_session.message_hold(store, wo, oldest, now=now)
     if hold is not None and hold.accounted:
         return None
-    # No hold at all is its own finding: the pass was free to send and the message is
-    # still here, which is a daemon that is not turning the queue.
+    # No hold at all is its own finding: the pass was free to send and the message is still here
     return oldest, hold.reason if hold else "the delivery pass has not attempted it"
 
 
 def _parked_minutes(store: ProjectStore) -> tuple[bool, int]:
-    """Whether the parked check is armed for THIS project, and after how long.
-
-    Per project like every other `inspect.alarm_*` number, and behind the same
-    `inspect.enabled` switch — that flag is `InspectConfig`'s single "raise nothing here",
-    and a second way to turn one thing off is a second way to be surprised by it.
-    """
+    """Whether the parked check is armed for THIS project, and after how long"""
     from .ops import inspect_config_at
 
     cfg = inspect_config_at(store.project_path)
@@ -1506,17 +773,7 @@ def _parked_minutes(store: ProjectStore) -> tuple[bool, int]:
 
 
 def judged_heads(store: ProjectStore, wo_id: str) -> set[str]:
-    """Every commit of this work order the OS has already judged, or seen land.
-
-    Two rows and no network: `ProjectStore.validated_head` of the LATEST round (the
-    existing documented predicate, which already prefers `carried_head_sha` — reading the
-    columns here instead would be a second home for the rule), and the `head_oid` of the
-    newest `pr_merged` event.
-
-    EMPTY IS NEVER A MEMBER. Pre-0.10.0 rounds recorded no commit (kn-48dadcce) and an
-    order polled before `pr_head_oid` shipped has none either; reading "" as equal would
-    turn "nothing was recorded" into "it matches".
-    """
+    """Every commit of this work order the OS has already judged, or seen land"""
     from .project_store import ProjectStore as _Store
 
     merged = store.events_of_kind(wo_id, "pr_merged")
@@ -1529,18 +786,16 @@ def judged_heads(store: ProjectStore, wo_id: str) -> set[str]:
 
 
 def _head_already_judged(store: ProjectStore, wo: dict[str, Any]) -> bool:
-    """Is the head the poll last saw one of `judged_heads`? Spec §2b."""
+    """Is the head the poll last saw one of `judged_heads`?"""
     current = str(wo.get("pr_head_oid") or "")
     return bool(current) and current in judged_heads(store, wo["id"])
 
 
-#: `wo_alarms.kind` for §2c's detector, and the statuses it is asked about — the ones a
-#: refusal can leave an order parked in. A terminal order has nothing left to declare.
+#: `wo_alarms.kind` for §2c's detector, and the statuses it is asked about
 UNDECLARED_DELIVERY_KIND = "undeclared_delivery"
 UNDECLARED_DELIVERY_STATUSES = ("needs_review", "waiting_pr_merge", "waiting_input")
 
-#: What the OS asks the worker to do about an undeclared delivery. The FINDING's words,
-#: which the supervisor's judge reads and a gate reviewer rules on.
+#: What the OS asks the worker to do about an undeclared delivery
 UNDECLARED_DELIVERY_REASON = (
     "the user refused an assumption on this work order and the worker has pushed "
     "commits since without running `jarvis wo finish`, so nothing has declared them and "
@@ -1548,21 +803,7 @@ UNDECLARED_DELIVERY_REASON = (
 
 
 def undeclared_delivery(store: ProjectStore, wo: dict[str, Any]) -> bool:
-    """Has this worker pushed past a refusal without declaring it? Spec §2c of
-    docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
-
-    `ops.refusal_answered` is CALLED rather than re-derived, and a finish OR a passed
-    user-rework round answers the refusal: the user forcing that round IS the
-    declaration, and once a panel has passed the pushed head, nudging the worker for a
-    `wo finish` is noise (spec
-    docs/superpowers/specs/2026-10-08-a-passed-forced-round-answers-a-refusal.md).
-    This is the detector the OS lacked, so that an unanswered refusal
-    with commits behind it self-heals into a nudge instead of parking on the user for
-    ever.
-
-    Head movement is the observation, and it reuses §2b's column — so no network read of
-    its own. An EMPTY head is never movement: "" is "not recorded".
-    """
+    """Has this worker pushed past a refusal without declaring it? (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md)"""
     from .ops import refusal_answered
 
     current = str(wo.get("pr_head_oid") or "")
@@ -1573,38 +814,13 @@ def undeclared_delivery(store: ProjectStore, wo: dict[str, Any]) -> bool:
 
 
 def check_undeclared_delivery(store: ProjectStore) -> Iterator[Violation]:
-    """INV-UNDECLARED-DELIVERY — raise the finding; the supervisor decides what to do.
-
-    A FINDING, NEVER AN ALARM: `add_alarm`'s one call site is fenced by
-    `Daemon.check_burning_turns`' `(kind, seq)` dedupe and this is not on that path.
-    Nothing here acts on a work order — the supervisor's judge reaches
-    `remedies.propose(..., "nudge")`, which files a gate request, and only a live grant
-    lets `remedies.apply` say anything to a worker.
-
-    SILENT WHILE THE POLL IS HEALING IT. `ops.PR_UNDECLARED` made the poll the actor for
-    this condition, so the finding is now the GIVE-UP's — see the clause below.
-
-    Raised ONCE per order while the condition stands: a finding per reconcile tick would
-    fill `/alarms` with the same row for ever, which is the noise `last_alarm_of_kind`
-    exists to prevent one queue along.
-    """
-    # `add_finding` is not one of the proxy's blocked mutators, so the checker skips the
-    # write itself and still REPORTS — `check_neo_escalations_are_live`'s shape.
+    """INV-UNDECLARED-DELIVERY — raise the finding; the supervisor decides what to do"""
+    # `add_finding` is not one of the proxy's blocked mutators
     readonly = getattr(store, "readonly", False)
     for wo in store.list_work_orders(statuses=UNDECLARED_DELIVERY_STATUSES):
         if not undeclared_delivery(store, wo):
             continue
-        # THE OS IS ON IT: the nudge is the response, and the give-up is what reaches the
-        # user. Spec
-        # docs/superpowers/specs/2026-10-07-an-undeclared-delivery-must-heal-itself.md §2.4.
-        #
-        # `session_id` because `Daemon.heal_pull_request` returns on its absence before
-        # anything else — an order whose worker session is gone can never be nudged, so
-        # suppressing here would be silence for ever. NOT gave-up because
-        # `pr_repair_gave_up` is "has the OS said it is stopping" and is episode-scoped,
-        # so a cleared-then-reopened case starts silent again. Attempts `== 0` is
-        # deliberately NOT a clause: the next poll tick is two minutes away, and a
-        # finding raised in that window is one the OS answers itself.
+        # THE OS IS ON IT: the nudge is the response, and the give-up is what reaches the user (docs/superpowers/specs/2026-10-07-an-undeclared-delivery-must-heal-itself.md §2.4.)
         if wo.get("session_id") and not store.pr_repair_gave_up(wo["id"],
                                                                 PR_UNDECLARED_REPAIR):
             continue
@@ -1624,33 +840,18 @@ def check_undeclared_delivery(store: ProjectStore) -> Iterator[Violation]:
 
 
 def check_spans_reach_the_status(store: ProjectStore) -> Iterator[Violation]:
-    """INV-SPAN-BEHIND — a status write with no span is repaired where it is found.
-
-    Spec §2d2 of
-    docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md. The
-    fix is at the writer and `_backfill_wo_spans` now fills gaps, but neither can heal
-    this shape: a status written round `set_status` leaves no `status` event to replay,
-    so the disagreement between the span tail and `work_orders.status` is the only
-    evidence there is. The repair is one `approximate` span at the order's `updated_at`,
-    which is the only time the record holds for a write that recorded none.
-
-    Repairs on the daemon tick rather than behind `--repair`, for
-    `check_neo_escalations_are_live`' reason: appending a span creates nothing,
-    authorises nothing and moves no order.
-    """
+    """INV-SPAN-BEHIND — a status write with no span is repaired where it is found (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md)"""
     readonly = getattr(store, "readonly", False)
-    # Hidden too: hiding takes an order out of the listings, not out of the record
-    # `jarvis inspect` and the dashboard bill against.
+    # Hidden too: hiding takes an order out of the listings
     for wo in store.list_work_orders(include_hidden=True):
         spans = store.state_spans(wo["id"])
         tail = str(spans[-1]["to_status"]) if spans else ""
         status = str(wo["status"] or "")
-        # No spans at all is `_backfill_wo_spans`' case, not this one.
+        # No spans at all is `_backfill_wo_spans`' case, not this one
         if not spans or tail == status:
             continue
         if not readonly:
-            # Never BEFORE the span it follows: `state_spans` orders by ts, so a repair
-            # stamped earlier than the tail would reorder the history it is mending.
+            # Never BEFORE the span it follows: `state_spans` orders by ts
             at = max(float(wo["updated_at"] or db.now()), float(spans[-1]["ts"]))
             store._record_span(wo["id"], "wo", tail, status, trigger="repair",
                                ts=at, approximate=True)
@@ -1669,48 +870,11 @@ def check_spans_reach_the_status(store: ProjectStore) -> Iterator[Violation]:
 def parked_reason(store: ProjectStore, wo: dict[str, Any],
                   now: float | None = None,
                   actor: Any = ACTOR_NOT_DERIVED) -> str | None:
-    """Why nothing is going to happen to this work order — or None if something is.
-
-    THE PREDICATE IS `ops.scheduled_actor`, NOT A SECOND OPINION. That function answers
-    "which daemon pass will act on this row next" over the passes' OWN predicates, so
-    the attention list cannot come to disagree with the passes about one work order.
-    Deriving the same split again here is the defect this reads instead of repeating
-    (§5a, docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md).
-
-    It was `ops.waiting_on` and `SPOKEN_FOR_WAITS` / `IN_FLIGHT_WAITS` until that spec.
-    NO CALL TO `waiting_on` MAY COME BACK: section 6 rebases that function on this same
-    verdict, and an edge from here to it would close the cycle.
-
-    `actor` is the verdict a caller has ALREADY derived — `true_blockers` computes it
-    once per order per tick and hands it over. `ACTOR_NOT_DERIVED` (the default, and
-    deliberately not None) means derive it here; None means a caller derived it and
-    nobody will act.
-
-    Two shapes, and the second is why this is not merely the first. An order the OS still
-    calls `running` with a finished turn behind it is INVISIBLY stopped — nothing derived
-    a blocker for that shape before this. An order that finished, was sent back to
-    work and stopped again is VISIBLY stopped and flagged for the wrong thing, which is
-    what `STALE_FINISH_BLOCKER` says.
-
-    Ordered cheapest first, and that ordering is load-bearing rather than tidy: this runs
-    from `true_blockers`, which runs for every work order on every reconcile tick, and
-    the catalog read and the verdict's indexed reads both sit behind the two free row
-    checks. No model, no transcript.
-    """
+    """Why nothing is going to happen to this work order — or None if something is (docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md)"""
     if wo.get("origin") in UNGOVERNED_ORIGINS:
-        # An injected session was never briefed on `jarvis wo finish`, so a turn of its
-        # that ends without one is not a worker parking mid-task. A manager used to be
-        # excused here too (issue #264); what excuses it NOW is the verdict —
-        # `ops.scheduled_actor` names `ops.manager_awaiting_feature` for an idle manager
-        # with a live feature — so neither the kind nor the old PARKABLE_STATUSES reason
-        # ("`idle` is not in the list") applies: `idle` IS in `OPEN_STATUSES` (§5a).
+        # An injected session was never briefed on `jarvis wo finish` (#264)
         return None
-    # OPEN, and that is the whole gate: `PARKABLE_STATUSES` stops being consulted (§5a),
-    # and `validating` is NOT added to it — the list is not the question any more. The
-    # bound is `OPEN_STATUSES` because `ops.SCHEDULED_ACTORS` is keyed by exactly those
-    # nine statuses and raises `KeyError` on anything else, and this function has three
-    # callers outside `true_blockers` (`ops.os_status`, `ops.diagnose`, `ui.app`) that
-    # pass rows in any status at all.
+    # OPEN, and that is the whole gate: `PARKABLE_STATUSES` stops being consulted (§5a)
     if wo["status"] not in OPEN_STATUSES:
         return None
     turn = store.latest_turn(wo["id"])
@@ -1723,21 +887,14 @@ def parked_reason(store: ProjectStore, wo: dict[str, Any],
     ended = float(turn["ended_at"])
     if now - ended < minutes * SECONDS_PER_MINUTE:
         return None
-    # ...and how much of that silence was the OS itself (`holds`, user ruling
-    # 2026-09-18). BELOW the wall-clock test and never above it: this reads the whole
-    # timeline, and the ordering note on this function is load-bearing — every work
-    # order pays for every line here on every reconcile tick, and only the handful that
-    # have already been quiet for an hour pay for this one.
+    # ...and how much of that silence was the OS itself (`holds`, user ruling 2026-09-18)
     from . import holds as holds_mod
 
     spans = holds_mod.held(store, wo["id"], now=now)
     if (now - ended) - sum(h.overlap(ended, now, now) for h in spans) \
             < minutes * SECONDS_PER_MINUTE:
         return None
-    # SOMEBODY IS GOING TO ACT ON IT, and that is the one thing that makes a silence not
-    # a parking. In the same position the `waiting_on` read held, under the same cost
-    # ordering: below the free row checks, the turn read, the threshold and the
-    # `holds.held` overlap, so only a row already quiet for an hour pays for it.
+    # SOMEBODY IS GOING TO ACT ON IT, and that is the one thing that makes a silence not a parking
     if actor is ACTOR_NOT_DERIVED:
         from .ops import scheduled_actor
 
@@ -1746,115 +903,70 @@ def parked_reason(store: ProjectStore, wo: dict[str, Any],
         return None
     finished = store.events_of_kind(wo["id"], "finished")
     if (finished and float(finished[-1]["ts"]) < float(turn["started_at"])
-            # ...UNLESS THE OS OPENED THAT TURN ITSELF. `PR_CONFLICT_NUDGE` and
-            # `PR_CHECKS_NUDGE` tell the worker in capitals not to call `jarvis wo
-            # finish` again, so a turn newer than the finish is the GUARANTEED outcome
-            # of the documented happy path, for both repairs, for every project — and
-            # reporting it sent the user to `jarvis wo send` against a worker whose pull
-            # request was already green (issue #705 defect 3). The instruction and the
-            # check were written against each other.
+            # ...UNLESS THE OS OPENED THAT TURN ITSELF (#705)
             and store.turn_opened_by(turn) not in PR_REPAIR_SOURCES
-            # ...OR THE HEAD IS ONE THE OS HAS ALREADY JUDGED OR SEEN LAND. Spec §2b of
-            # docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md:
-            # the allowlist above answers "why was this turn opened" and is being asked
-            # "is anything undelivered", so every new OS-opened turn kind was a new false
-            # blocker. This asks the question that cannot go stale, and it stays local —
-            # `rejudge_exhausted` is the precedent.
+            # ...OR THE HEAD IS ONE THE OS HAS ALREADY JUDGED OR SEEN LAND (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md)
             and not _head_already_judged(store, wo)):
         return STALE_FINISH_BLOCKER
-    # A `needs_review` order with no stale finish is doing exactly what that status says,
-    # and is already flagged for it. A second line on every review the user has not got
-    # to yet is the noise this check exists to avoid producing.
+    # A `needs_review` order with no stale finish is doing exactly what that status says
     return None if wo["status"] == "needs_review" else PARKED_BLOCKER
 
 
 def validation_escalated(store: ProjectStore, wo: dict[str, Any]) -> bool:
-    """Did this work order's most recent validation round give up and ask for a human?
-
-    The panel's last WORD, not the last ROW BY NUMBER. An escalation is undone by a
-    VERDICT, by `jarvis wo review`, or by a merge — never by a row that judged nothing,
-    and `pending`, `failed` and `void` all judged nothing. All five readers come through
-    here, so the status, the flag, the `wo show` block, the dashboard form and the repair
-    refusal are one fact.
-
-    Spec docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md §A.
-    """
+    """Did this work order's most recent validation round give up and ask for a human? (docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md §A.)"""
     judged = store.last_judged_round(wo_id=wo["id"])
     return bool(judged and judged["outcome"] == "escalated")
 
 
 def user_rework_refused(store: ProjectStore, wo: dict[str, Any]) -> bool:
-    """Was the give-up above the panel refusing the rework the USER asked for?
+    """Was the give-up above the panel refusing the rework the USER asked for? (docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md §1)"""
+    family = _escalated_user_rework_family(store, wo)
+    return bool(family) and family != "not_reviewed"
 
-    The same latest-round rule as `validation_escalated`, read one column further: a
-    round carrying `ops.USER_REWORK_CAUSE` is one a user rejection bought, and a
-    rejection of it with the counted budget spent is a different piece of news from the
-    ordinary give-up (Neo question 973, live case wo-299daf2e).
-    """
+
+def user_rework_unreviewed(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """The same round with NO seat's opinion on it — `USER_REWORK_UNREVIEWED_BLOCKER` (docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md §1)"""
+    return _escalated_user_rework_family(store, wo) == "not_reviewed"
+
+
+def _escalated_user_rework_family(store: ProjectStore, wo: dict[str, Any]) -> str:
+    """The escalation family of the latest round IF a user rejection bought it, else ``""``"""
     from . import ops as ops_mod
 
     latest = store.latest_validation_round(wo_id=wo["id"])
-    return bool(latest and latest["outcome"] == "escalated"
-                and str(latest["uncounted_cause"] or "") == ops_mod.USER_REWORK_CAUSE)
+    if not (latest and latest["outcome"] == "escalated"
+            and str(latest["uncounted_cause"] or "") == ops_mod.USER_REWORK_CAUSE):
+        return ""
+    cause = ops_mod.escalation_cause(store, wo_id=wo["id"], round_id=int(latest["id"]))
+    return ops_mod.ESCALATION_FAMILY.get(cause, "")
 
 
 def dead_dependencies(store: ProjectStore, wo: dict[str, Any]) -> list[dict[str, Any]]:
-    """Dependencies of this work order that can never be satisfied.
-
-    Cancelled, failed, or deleted out from under it. Anything else is merely not done
-    yet, which is the normal condition of a dependency and asks nothing of anyone.
-    """
+    """Dependencies of this work order that can never be satisfied"""
     return [dep for dep in store.unfinished_dependencies(wo["id"])
             if dependency_is_dead(dep)]
 
 
 def dependency_is_dead(dep: Mapping[str, Any]) -> bool:
-    """One row of `ProjectStore.unfinished_dependencies`: can this edge NEVER clear?
-
-    §2.3 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md: one
-    definition, shared with `ops.stuck_scan`.
-    """
+    """One row of `ProjectStore.unfinished_dependencies`: can this edge NEVER clear? (docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md)"""
     return dep["status"] in DEPENDENCY_DEAD_STATUSES or dep["status"] == "missing"
 
 
 def usage_hold_note(until: float) -> str:
-    """"the Claude usage window is spent, …" — the PANEL's twin of `pause_note` above.
-
-    Worded to match the worker-side sentence deliberately: one window refuses a worker
-    turn and a validation seat alike, and a user reading a quiet fleet at midnight should
-    not have to learn that these are two different things (GitHub issue #235).
-
-    Takes the MOMENT rather than a store because three surfaces need it off three
-    different carriers — the held round's own `reason`, `status_label`, and
-    `parallel_round_note` — and a helper that fetched for itself would have to be written
-    three times to reach them.
-    """
+    """"the Claude usage window is spent, …" — the PANEL's twin of `pause_note` above (#235)"""
     return ("the Claude usage window is spent, the review resumes by itself at "
             f"{clock(until)}")
 
 
-#: The OTHER hold, and it names no moment on purpose — `reopens_at` on a CI hold is the
-#: recheck interval, not a deadline GitHub stated, so printing it promises a minute that
-#: means nothing. The timeline says it this way already (`timeline.py`, `ci_pending`) and
-#: this is the label's half of the same sentence.
+#: The OTHER hold, and it names no moment on purpose
 CI_HOLD_NOTE = "waiting for GitHub to finish running the checks"
 
-#: The THIRD hold, and it names no moment either — `reopens_at` on an auth hold is the
-#: recheck interval (spec
-#: docs/superpowers/specs/2026-09-26-the-panel-must-not-mistake-an-auth-failure-for-a-verdict.md §7).
-#: The wording is `worker_session.PAUSE_NOUN[PAUSE_AUTH]`'s: one expired sign-in stops a
-#: worker turn and a validation seat alike, and a user reading a quiet fleet must not have
-#: to learn that those are two different things.
+#: The THIRD hold, and it names no moment either (docs/superpowers/specs/2026-09-26-the-panel-must-not-mistake-an-auth-failure-for-a-verdict.md §7)
 AUTH_HOLD_NOTE = "waiting for Claude Code authentication"
 
 
 def validation_hold_note(store: ProjectStore, wo_id: str, round_no: int) -> str:
-    """Why this round is not being judged, or "" for a round that is not held.
-
-    THE CAUSE DECIDES THE SENTENCE. Rendering `usage_hold_note` for both of them told
-    every reader that a round merely waiting on CI was out of usage budget — untrue, and
-    untrue in the direction that makes a fleet look broken (GitHub issue #714).
-    """
+    """Why this round is not being judged, or "" for a round that is not held (#714)"""
     until, cause = validation_hold(store.events_of_kind(wo_id, "validation_failed"),
                                    round_no)
     if until <= time.time():
@@ -1867,17 +979,7 @@ def validation_hold_note(store: ProjectStore, wo_id: str, round_no: int) -> str:
 
 
 def parallel_round_note(store: ProjectStore, wo_id: str) -> str:
-    """" — review round N is running in parallel", or "" when none is.
-
-    ONE HOME, because two surfaces say it and a reword that landed in only one of them
-    would be two surfaces disagreeing about the same work order — the drift PR 65 is the
-    standing example of. `status_label` appends it to a status; `ops.waiting_on` appends
-    it to a diagnosis, and both are read by a user asking "is anything happening".
-
-    `RUNNABLE_VALIDATION_OUTCOMES` and not the wider open set: a `rejected` round is
-    waiting on the SUBMITTER, and saying the panel is still reading would send the user
-    looking for something to wait for.
-    """
+    """" — review round N is running in parallel", or "" when none is"""
     latest = store.latest_validation_round(wo_id=wo_id)
     if latest and latest["outcome"] in RUNNABLE_VALIDATION_OUTCOMES:
         held = validation_hold_note(store, wo_id, int(latest["round"]))
@@ -1888,20 +990,7 @@ def parallel_round_note(store: ProjectStore, wo_id: str) -> str:
 
 
 def base_red_note(store: ProjectStore, wo_id: str) -> str:
-    """"waiting for `main` to go green", or "" when the base is not the problem.
-
-    ONE INDEXED READ, and the write side is what buys that: `pr_base_health` is recorded
-    only when the base CHANGES state, so the newest row IS the current answer and no
-    second kind has to be read to know whether it is stale. An unconditional pair of
-    reads here would cost every listing in the fleet a query per work order, every time,
-    to notice a change that almost never happened.
-
-    **Derived, never fetched.** Whether the base is red is a question for GitHub, and
-    this module may not ask it — `poll_pull_requests` is where the network lives, and an
-    invariant that shelled out to `gh` would put a subprocess behind `jarvis wo list`.
-    So the poll writes down what it learned and this reads it back, which is the same
-    division `ops.automerge_state` makes and for the same reason.
-    """
+    """"waiting for `main` to go green", or "" when the base is not the problem"""
     from . import db
 
     rows = store.events_of_kind(wo_id, PR_BASE_HEALTH_EVENT)
@@ -1913,24 +1002,12 @@ def base_red_note(store: ProjectStore, wo_id: str) -> str:
     return BASE_RED_NOTE.format(base=payload.get("base") or "its base")
 
 
-#: Statuses an ACCOUNT-WIDE outage actually holds: the OS itself would start a turn or a
-#: validation seat for one of these if the window were open. `needs_review` and
-#: `waiting_pr_merge` are deliberately absent — the user and GitHub hold those, not the
-#: window (GitHub issue #714, Neo question 563).
+#: Statuses an ACCOUNT-WIDE outage actually holds: the OS itself would start a turn or a validation... (#714)
 FLEET_HELD_STATUSES = ("pending", "dispatching", "running", "validating")
 
 
 def fleet_hold_note(wo: dict[str, Any], fleet: Fleet | None) -> str:
-    """"the Claude usage window is spent, reopening at …" for an order the window holds.
-
-    THE OUTAGE IS A FACT ABOUT THE ACCOUNT (`fleet.Outage`), and `pause_note` beside this
-    one can only see a refusal THIS work order owns — so an order that was between turns
-    when the window shut said nothing about it for three hours while its neighbours,
-    which happened to be mid-turn, said it plainly (GitHub issue #714).
-
-    Never overrides a more specific note: a refused turn names its own retry, and a held
-    round names the review. This is the answer for the orders that have neither.
-    """
+    """"the Claude usage window is spent, reopening at …" for an order the window holds (#714)"""
     if fleet is None or not fleet.shut():
         return ""
     if wo["status"] not in FLEET_HELD_STATUSES:
@@ -1939,14 +1016,7 @@ def fleet_hold_note(wo: dict[str, Any], fleet: Fleet | None) -> str:
 
 
 def plan_hold_note(hold: dict[str, Any] | None) -> str:
-    """One sentence for a `ProjectStore.plan_hold` row, `""` for no hold.
-
-    ONE HOME, TWO READERS (kn-432d0f19): `status_label` and the sweep's blocker column
-    (`ops.stuck_scan`) both print it, and §1(2) of docs/superpowers/specs/2026-10-15-a-
-    child-held-by-its-features-unratified-plan-is-not-stuck.md is what happens when they
-    each compose their own — one row saying "nothing the record can name" beside one
-    naming the plan and the review command.
-    """
+    """One sentence for a `ProjectStore.plan_hold` row, `""` for no hold"""
     if not hold:
         return ""
     n = hold["n"]
@@ -1955,62 +1025,68 @@ def plan_hold_note(hold: dict[str, Any] | None) -> str:
             f"review — `jarvis wo review {hold['planner_id']}`)")
 
 
+def precondition_note(rows: list[dict[str, Any]]) -> str:
+    """One sentence for a `ProjectStore.open_preconditions` result, `""` for no rows"""
+    if not rows:
+        return ""
+    refs = ", ".join(row["ref"] for row in rows)
+    notes = "; ".join(row["note"] for row in rows if row["note"])
+    note = (f"held until {refs} clears "
+            f"(`jarvis wo unblock {rows[0]['wo_id']}`)")
+    return f"{note} — {notes}" if notes else note
+
+
+#: §5 of docs/superpowers/specs/2026-10-20-a-merge-held-for-running-checks-is-not-stuck.md
+AUTOMERGE_CHECKS_NOTE = "waiting for GitHub's checks on {sha} — {reason}"
+
+#: The STORED reason, clamped to one line for the sweep's blocker column, which renders it verbatim
+AUTOMERGE_CHECKS_REASON_CHARS = 120
+
+
+def automerge_checks_note(state: dict[str, Any] | None) -> str:
+    """One sentence for a `checks_running` auto-merge hold, `""` for anything else"""
+    from .automerge import HELD_CHECKS_RUNNING, hold_is_live
+
+    if not hold_is_live(state) or state is None:
+        return ""
+    if str(state.get("code") or "") != HELD_CHECKS_RUNNING:
+        return ""
+    reason = " ".join(str(state.get("reason") or "").split())
+    if len(reason) > AUTOMERGE_CHECKS_REASON_CHARS:
+        reason = reason[:AUTOMERGE_CHECKS_REASON_CHARS - 1] + "…"
+    return AUTOMERGE_CHECKS_NOTE.format(
+        sha=str(state.get("head_sha") or "")[:10] or "the merge commit",
+        reason=reason or "no reason recorded")
+
+
 def status_label(store: ProjectStore, wo: dict[str, Any],
                  fleet: Fleet | None = None) -> str:
-    """How this work order's status should read to a human.
-
-    `pending` alone promises "will start as soon as a slot frees", which is a lie for a
-    row that is waiting on another work order — possibly for days. Every surface that
-    prints a status renders it through here, so the CLI listing, `jarvis status` and the
-    dashboard cannot drift apart on the answer. (They have before: a dashboard listing
-    and its own header disagreed about what needed the user because each derived it
-    separately — see the FEATURED_STATUSES fix in PR 65.)
-    """
-    # FIRST, and deliberately so. `validating` is in ACTIVE_STATUSES (it holds a slot),
-    # and everything past the two early returns below is unreachable for any status but
-    # `pending` — so a validating label written anywhere further down this function is
-    # dead code, and nothing else in this file would catch that.
+    """How this work order's status should read to a human"""
+    # FIRST, and deliberately so
     if wo["status"] == "validating":
         latest = store.latest_validation_round(wo_id=wo["id"])
         round_no = latest["round"] if latest else 1
-        # The budget is the shipped default rather than this project's configured
-        # `os.validation.max_rounds`: every surface renders a status through here, and
-        # this function is handed a store and a row — no catalog is in reach, and
-        # threading one through every caller to print a number is not worth it.
+        # The budget is the shipped default rather than this project's configured `os.validation.max_rounds`:...
         label = f"validating — review round {round_no} of {DEFAULT_VALIDATION_MAX_ROUNDS}"
-        # Why nothing is happening, when the answer is a spent window rather than a slow
-        # reviewer. Without it the label promises a review that is in fact waiting hours.
-        # The round's own hold first; the account-wide one when the round has recorded
-        # nothing yet — the window can shut between two ticks.
+        # Why nothing is happening, when the answer is a spent window rather than a slow reviewer
         held = (validation_hold_note(store, wo["id"], int(round_no))
                 or fleet_hold_note(wo, fleet))
         return f"{label} — {held}" if held else label
     if wo["status"] in ACTIVE_STATUSES:
         note = pause_note(store, wo) or neo_wait_note(wo) or fleet_hold_note(wo, fleet)
         return f"{wo['status']} — {note}" if note else wo["status"]
-    # OUT OF MONEY, and ABOVE the pause note: a work order can hold a booked retry AND
-    # be over its budget, and only one of the two is going to happen. `NOT_RETRIED` is
-    # what makes that true — the sweep never relaunches this status — so a label naming
-    # the retry would promise a turn that is never coming.
-    #
-    # Rendered with the figures rather than the bare word, because this is the string
-    # every listing prints and "budget_exhausted" alone sends the reader to a second
-    # command to learn the one thing they need: how much more it would take.
+    # OUT OF MONEY, and ABOVE the pause note: a work order can hold a booked retry AND be over its...
     if wo["status"] == budget.EXHAUSTED:
-        # A real billing store, like every other reader of this figure: the label and
-        # the Budget line on the same page must not disagree by the Jarvis half.
+        # A real billing store, like every other reader of this figure: the label and the Budget line on the...
         with _billing_store() as central:
             cap = budget.ceiling(store, central, wo)
         if cap is None:
-            # The budget was cleared and the tick that moves the status has not run.
+            # The budget was cleared and the tick that moves the status has not run
             return "budget spent — cleared, resuming shortly"
         line = f"budget spent — ${cap.spent_usd:.2f} of ${cap.cap_usd:.2f}"
         if cap.source != "feature":
             return line
-        # `source == 'feature'` is the ALLOCATOR's word for "the family's cap" and says
-        # nothing about the parent's kind, so the noun comes from the kind table every
-        # other surface reads (`ops.family_prose`) — this label and the budget card sit
-        # on the same page and called the same family two different things.
+        # `source == 'feature'` is the ALLOCATOR's word for "the family's cap" and says nothing about the...
         from .ops import family_prose
         parent = None
         if wo.get("parent_id"):
@@ -2019,121 +1095,67 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
             except KeyError:
                 parent = None
         return f"{line} (its {family_prose((parent or {}).get('kind'))[0]}'s slice)"
-    # A booked retry on one of the settled-looking statuses the sweep reaches and the
-    # branch above does not (issue #259). Ranked over the round note below it: a turn the
-    # transport dropped is why nothing is moving, and it names the moment that changes.
+    # A booked retry on one of the settled-looking statuses the sweep reaches and the branch above does... (#259)
     parked = pause_note(store, wo)
     if parked:
         return f"{wo['status']} — {parked}"
-    # Below the pause note above, which names a moment this one cannot: a manager whose
-    # turn was refused IS coming back, and "idle" alone would read as the steady state.
+    # Below the pause note above, which names a moment this one cannot: a manager whose turn was refused...
     if wo["status"] == "idle":
-        # Naming the children when there are any (spec §5): "waiting for a message" is
-        # true of a manager whose feature has finished with it, and says nothing about one
-        # whose child is still in flight.
+        # Naming the children when there are any (spec §5): "waiting for a message" is true of a manager...
         note = outstanding_children_note(store, wo)
         return f"idle — {note}" if note else \
             "idle — waiting for a message from its feature"
-    # `needs_review` no longer means the panel is waiting for the user: since issue 212
-    # the round runs in parallel with the assumption review, and a status that said only
-    # "needs_review" would hide the half of the work that is still moving.
+    # `needs_review` no longer means the panel is waiting for the user: since issue 212 the round runs in...
     if wo["status"] == "needs_review":
         note = parallel_round_note(store, wo["id"])
         if note:
             return f"{wo['status']}{note}"
-    # WHY NOTHING IS BEING NUDGED. Below the round note, which names a thing actually in
-    # flight, and gated on carrying a pull request in a status the poll reaches — so the
-    # extra indexed read is paid by parked work orders and by nothing else. Without it a
-    # work order whose base is broken is indistinguishable from one the OS forgot: the
-    # poll deliberately spends no repair attempt in that window (spec §3), so there is no
-    # nudge, no attention item and, until this, nothing said at all.
+    # WHY NOTHING IS BEING NUDGED
     if wo["status"] in PR_REPAIR_STATUSES and wo.get("pr_url"):
         note = base_red_note(store, wo["id"])
         if note:
             return f"{wo['status']} — {note}"
     if wo["status"] != "pending":
         return wo["status"]
-    # ABOVE the dependency and slot labels, inverting their order: those two clear
-    # themselves, and this one clears only when a person rules on the plan. Of the three
-    # true sentences it is the one naming a move (spec §2.3). Flagless — `true_blockers`
-    # gets no branch, so INV-ATTENTION-MISSING stays quiet without an exception.
+    # FIRST of the four pending answers: of them it is the only one that may never clear without a...... (docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md)
+    note = precondition_note(store.open_preconditions(wo["id"]))
+    if note:
+        return f"pending — {note}"
+    # ABOVE the dependency and slot labels
     note = plan_hold_note(store.plan_hold(wo))
     if note:
         return f"pending — {note}"
     blockers = store.unfinished_dependencies(wo["id"])
     if blockers:
         return f"pending — blocked by {', '.join(dep['id'] for dep in blockers)}"
-    # Ranked below the dependency label deliberately: a work order waiting on a sibling's
-    # merge is not going to start when a slot frees, so naming the slot would be the less
-    # true of the two answers. Neither raises attention — a slot always frees, so this is
-    # the system working, not a decision anyone owes (the same rule that keeps a merely
-    # unfinished dependency silent).
+    # Ranked below the dependency label deliberately: a work order waiting on a sibling's merge is not...
     cap = _slot_cap(store, wo)
     if cap:
         parent, limit, active = cap
         return (f"pending — waiting for a slot in {parent} "
                 f"({active}/{limit} children running)")
-    # LAST, and only for a caller that HAS the fleet's state: this one is a fact about
-    # the account rather than about the work order, so it is the least specific of the
-    # three answers — and a caller holding one project's store cannot know it. `None`
-    # renders the bare "pending" the surface would have printed anyway, rather than a
-    # guess. Like the two above, it raises no attention: the window reopens and the slot
-    # frees, neither of which is a decision anyone owes (`fleet.blocked`).
+    # LAST, and only for a caller that HAS the fleet's state: this one is a fact about the account rather...
     held = fleet.blocked(wo["id"]) if fleet is not None else ""
     if held:
         return f"pending — {held}"
     return "pending"
 
 
-#: How long past its own deadline a paused turn may sit before the OS says so.
-#: `Daemon.retry_paused_turns` runs every `RETRY_EVERY_TICKS` ticks — about ten seconds
-#: — so this is two orders of magnitude of slack: long enough that a busy tick or a
-#: momentarily unreachable CLI never cries wolf, short enough that nobody loses an
-#: evening to it. See `check_paused_turns_resume`.
+#: How long past its own deadline a paused turn may sit before the OS says so
 PAUSE_OVERDUE_GRACE = 15 * 60
 
-#: What `Daemon.retry_paused_turns` writes when it looks at a due pause and defers the
-#: relaunch — the fleet cap, the project cap, or the account-wide outage. A hold that
-#: produced no record is the whole of GitHub issue #752: the note went on promising a
-#: retry whose moment had passed, and the check below called the OS broken for obeying
-#: its own cap. Spec docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md §1.
+#: What `Daemon.retry_paused_turns` writes when it looks at a due pause and defers the relaunch (docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md §1.)
 RETRY_HELD_EVENT = "retry_held"
 
-#: At most one `retry_held` per order per five minutes, which is what makes a five-hour
-#: window cost ~60 events instead of ~1,800 at the sweep's ten-second cadence.
+#: At most one `retry_held` per order per five minutes
 RETRY_HELD_RESTATE = 5 * 60
 
-#: How long a reader treats the newest hold as LIVE. Deliberately here, beside the other
-#: two, because the inequality between the three is the whole design and is invisible if
-#: they live apart: restate < fresh < grace. Restated every 5 minutes an ongoing hold
-#: always has an event newer than 10 — a full restate interval of slack for a tick that
-#: slipped — and a hold that ENDED goes stale inside 10, so the check below comes back
-#: within ten minutes of the last word the sweep said. Setting the restate at the grace
-#: itself would let a live hold go 15 minutes unstated, exactly while the check decides.
+#: How long a reader treats the newest hold as LIVE
 RETRY_HELD_FRESH_FOR = 2 * RETRY_HELD_RESTATE
 
 
 def clock(ts: float) -> str:
-    """A moment as the reader's own clock reads it, WITH THE DATE unless it is today.
-
-    A bare "%H:%M" is only unambiguous within the day it is written, and the pause note
-    is read exactly where that breaks. Through the twelve hours wo-b4f207ad was stuck the
-    dashboard promised "retrying by itself at 12:00" while meaning the NEXT day's noon,
-    which is why the user believed the retry was overdue rather than mis-scheduled (PR
-    129). The parse that caused that is fixed, but the ambiguity is not the parse: a
-    7-day window legitimately resets days out ("resets Aug 29, 9:50am") and would still
-    render as a bare "09:50" tomorrow.
-
-    Local wall-clock, not the timezone the CLI quoted: the reader is at this machine, and
-    a time they have to convert is a time they will misread.
-
-    "Today" is read through `time.time()` rather than by calling `time.localtime()` with
-    no argument. Same answer in production, and NOT the same thing: the no-argument form
-    reads the C clock directly, so it is a SECOND clock this function cannot be told
-    about — a caller that pins one of them moves half of the comparison and gets an
-    answer belonging to neither. That is the same two-clocks-for-one-question mistake as
-    the bug this whole change exists to fix, so there is one clock here.
-    """
+    """A moment as the reader's own clock reads it, WITH THE DATE unless it is today"""
     when = time.localtime(ts)
     if when[:3] == time.localtime(time.time())[:3]:
         return time.strftime("%H:%M", when)
@@ -2141,7 +1163,7 @@ def clock(ts: float) -> str:
 
 
 def _span(seconds: float) -> str:
-    """A duration in the coarsest unit that still says something — "8h", "12m"."""
+    """A duration in the coarsest unit that still says something — "8h", "12m\""""
     if seconds >= 3600:
         return f"{seconds / 3600:.0f}h"
     return f"{max(seconds, 60) / 60:.0f}m"
@@ -2149,18 +1171,7 @@ def _span(seconds: float) -> str:
 
 def retry_hold(store: ProjectStore, wo: dict[str, Any], pause: Any,
                now: float | None = None) -> dict[str, Any] | None:
-    """The `retry_held` payload explaining why this due pause has not relaunched, if it
-    is still live: same turn `seq`, written inside `RETRY_HELD_FRESH_FOR`.
-
-    ONE READER FOR BOTH SURFACES — the note below and INV-PAUSE-OVERDUE — because they
-    are answering the same question from opposite ends ("why is nothing happening" and
-    "is this silence a defect"), and derived separately they would drift into a label
-    naming a hold the check was firing about.
-
-    The `seq` match is load-bearing, not tidiness: the event is about ONE pause, so a
-    later turn makes it meaningless, and a reader that could not tell would suppress a
-    violation about a different failure. Same rule as `ops.resumed_from`.
-    """
+    """The `retry_held` payload explaining why this due pause has not relaunched"""
     from . import db
 
     if pause is None:
@@ -2178,14 +1189,7 @@ def retry_hold(store: ProjectStore, wo: dict[str, Any], pause: Any,
 
 
 def _retry_hold_note(wo: dict[str, Any], hold: dict[str, Any]) -> str | None:
-    """That hold in words — or None for a cause this OS does not write.
-
-    From the PAYLOAD rather than a live `Fleet`: the sweep's decision depended on the
-    figures at the instant it ran, and by the time a surface asks, the fleet may be idle
-    while the order is still parked. The fleet-cap parenthesis is `Fleet.blocked()`'s own
-    clause verbatim, so `jarvis status`'s header and a work order's line say the same
-    thing in the same words.
-    """
+    """That hold in words — or None for a cause this OS does not write"""
     cause = hold.get("cause")
     if cause == "fleet_cap":
         return (f"waiting for a free in-flight slot ({hold.get('in_flight')} of "
@@ -2201,9 +1205,7 @@ def _retry_hold_note(wo: dict[str, Any], hold: dict[str, Any]) -> str | None:
                 f"({hold.get('in_flight')} of {hold.get('cap')} worker turns in flight "
                 f"until {clock(float(hold.get('until') or 0))})")
     if cause == "fleet_outage":
-        # `fleet_hold_note` owns these words wherever it is gated to speak them; a second
-        # source for one sentence is the drift this spec pays for elsewhere. Said here
-        # only for the statuses it is NOT gated on, which would otherwise lose it.
+        # `fleet_hold_note` owns these words wherever it is gated to speak them
         if wo["status"] in FLEET_HELD_STATUSES:
             return ""
         return ("the Claude usage window is spent, reopening at "
@@ -2212,48 +1214,20 @@ def _retry_hold_note(wo: dict[str, Any], hold: dict[str, Any]) -> str | None:
 
 
 def pause_note(store: ProjectStore, wo: dict[str, Any]) -> str:
-    """Why this work order is not moving and when it will move again — or "" normally.
-
-    `running` alone promises "a worker is working on this", which is a lie for a
-    conversation the transport dropped — the usage window spent, or the API itself
-    failing. It keeps its status and its slot on purpose (see `worker_session`, and
-    `Daemon.retry_paused_turns` relaunches it) — but the user looking at a dashboard at
-    midnight is owed the reason nothing is happening, and the time it will happen again.
-
-    Every surface renders this one string (the CLI through `status_label`, the dashboard
-    through `ops.os_status`) so they cannot disagree about the answer. `clock` carries
-    the date whenever the retry is not today, which a usage window over 24h out and every
-    7-day reset genuinely is.
-
-    The transient line names the attempt as well as the clock, because unlike a usage
-    window — which reopens once, at a stated time — a backoff can be on its fourth of
-    five, and "retrying at 14:07" without that reads as a promise it might not keep.
-
-    SCOPED TO `RETRY_SWEEP_STATUSES`, which is the set this sentence is a promise about:
-    it says the OS will relaunch the turn, so it must be readable exactly where the
-    sweep will. Since issue #259 that includes the three settled-looking statuses a
-    refused turn can land on, where the note was blank and the work order looked simply
-    finished.
-    """
+    """Why this work order is not moving and when it will move again — or "" normally (#259)"""
     if wo["status"] not in RETRY_SWEEP_STATUSES:
         return ""
     pause = worker_session.turn_pause(store, wo["id"])
     if pause is None or pause.exhausted:
         return ""
-    # ABOVE all three branches below, including the auth one: they say what the pause is
-    # waiting for, this says the wait is over and something else is now in the way — the
-    # strictly more current fact about the same pause. A user who has just signed in
-    # would otherwise still read "resuming once you sign in again" while their relaunch
-    # queued behind the cap. Spec §2a of
-    # docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md.
+    # ABOVE all three branches below (docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md)
     hold = retry_hold(store, wo, pause)
     if hold is not None:
         note = _retry_hold_note(wo, hold)
         if note is not None:
             return note
     if pause.reason == worker_session.PAUSE_AUTH:
-        # The one pause with no moment to name — it resumes on an ACTION. `clock` would
-        # be asked to render `NEVER`, and any time it could print would be a guess.
+        # The one pause with no moment to name — it resumes on an ACTION
         return "Claude Code sign-in expired, resuming once you sign in again"
     when = clock(pause.retry_at)
     if pause.reason == worker_session.PAUSE_USAGE_LIMIT:
@@ -2264,13 +1238,7 @@ def pause_note(store: ProjectStore, wo: dict[str, Any]) -> str:
 
 
 def neo_wait_note(wo: dict[str, Any]) -> str:
-    """"with Neo …" for a work order parked on a question — or "" for anything else.
-
-    `waiting_input` renders as "Waiting on you" everywhere (`timeline.STATUS_LABEL`), and
-    for the whole time Neo holds a question that label is false: it can be minutes, and
-    the user reads it as a demand. The note says who actually has it. Display only — what
-    costs attention is `true_blockers`, and nothing here changes that.
-    """
+    """"with Neo …" for a work order parked on a question — or "" for anything else"""
     if wo["status"] != "waiting_input":
         return ""
     question = awaiting_neo(wo["id"])
@@ -2282,12 +1250,7 @@ def neo_wait_note(wo: dict[str, Any]) -> str:
 
 
 def _slot_cap(store: ProjectStore, wo: dict[str, Any]) -> tuple[str, int, int] | None:
-    """`(feature id, max_parallel, active children)` when this work order's feature order
-    is already running as many children as it allows, else None.
-
-    A parentless work order — nearly all of them — is answered from the row it was handed
-    and costs no query, the same shape `ops.blocked_by` uses for `depends_on`.
-    """
+    """`(feature id, max_parallel, active children)` when this work order's feature order is already..."""
     parent = wo.get("parent_id")
     if not parent or wo.get("kind") != "worker":
         return None
@@ -2307,44 +1270,13 @@ def _mentions_assumptions(reason: str | None) -> bool:
 
 
 def waiting_on_neo_gate(store: ProjectStore, wo: dict[str, Any]) -> bool:
-    """True when this work order is parked on a privileged-action request the user does
-    not hold. Not a user blocker either way — but for two different reasons.
-
-    A `pending` request is with Neo. An `awaiting_case` one is with the WORKER, which
-    still asks the user for nothing: it is held precisely because nobody has argued it
-    yet, and the OS closes it as abandoned on a timer if nobody ever does
-    (`gates.sweep_unargued`).
-    Omitting the second reads the park as the generic "waiting on your input" — the
-    false flag GitHub issue 100 was, arrived at down a different road.
-    """
+    """True when this work order is parked on a privileged-action request the user does not hold"""
     return (any(not a["escalated"] for a in store.pending_approvals(wo["id"]))
             or bool(store.held_approvals(wo["id"])))
 
 
 def awaiting_neo(wo_id: str) -> dict[str, Any] | None:
-    """The question this work order is parked on, or None — read from Neo's own DB.
-
-    THE ONE PREDICATE for "is this work order waiting on the delegate rather than on the
-    user", and the answer to the same false page arriving from three directions at once
-    (GitHub issue 100): `true_blockers` below, the idle-`Notification` branch of
-    `hooks.handle`, and `Daemon.settle_work_order` each decided independently what an
-    idle `waiting_input` worker meant, and each decided "the user". `ops.ask_question`
-    flips the status to `waiting_input` WITHOUT flagging attention precisely so that it
-    does not — and all three undid that within a tick of the worker ending its turn.
-
-    Read `q["status"]` to know who is holding it: `neo_store.NEO_HELD_Q_STATUSES` is
-    Neo's and costs the user nothing, `USER_HELD_Q_STATUSES` is the user's.
-
-    Cross-DB and deliberately so — a question's state lives in `neo.db` and mirroring it
-    into a column here would drift the first time a daemon dies between the two writes.
-    The cost is bounded by the callers: every one of them asks only about a work order
-    already sitting in `waiting_input`, which is a handful of rows fleet-wide.
-
-    Best-effort, and it fails TOWARDS the user: an unreadable `neo.db` returns None, so
-    the generic blocker surfaces and the work order is visible-but-mislabelled rather
-    than silently stalled. That is the direction `check_blocked_work_is_surfaced` calls
-    the dangerous one.
-    """
+    """The question this work order is parked on, or None — read from Neo's own DB"""
     from .neo_store import NeoStore
 
     try:
@@ -2361,62 +1293,18 @@ def awaiting_neo(wo_id: str) -> dict[str, Any] | None:
 
 
 def something_is_out(store: ProjectStore, wo_id: str) -> bool:
-    """Is this work order parked on somebody, rather than merely having nothing to do?
-
-    ONE RESOLVER, and kn-4ea33fe6 is why it is a function rather than a rule written
-    twice: `end_wait_if_nothing_is_out` asks it to decide whether a wait has ENDED, and
-    `Daemon.settle_work_order`'s manager branch asks it to decide whether a manager is
-    free to be re-statused `idle`. Those two disagreeing means a manager parked on a gate
-    is quietly relabelled "nothing to act on" — muted, out of the dashboard's needs-me
-    strip, and refused a nudge — which is the bug issue #264 exists to remove, recreated.
-
-    `held_approvals` counts as out, and it is the clause a caller inheriting this from
-    `settle_work_order`'s `pending_approvals` check would drop. Nobody is REVIEWING a
-    held request, so it is not "with a reviewer" — and it parks NOTHING: since fix 2 of
-    docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md `gates.file_request`
-    writes `waiting_input` only down the PENDING road. The work order is still out all the
-    same: the command is blocked, the `gates.case_ttl_seconds` clock is running, and the
-    only thing that can close the request is the worker's own next command.
-
-    WHAT IS OUT, not who is waited on — `user_facing_wait` below is the other question,
-    and the pair lives here together so the two cannot drift.
-    """
+    """Is this work order parked on somebody, rather than merely having nothing to do? (#264)"""
     return bool(store.pending_approvals(wo_id) or store.held_approvals(wo_id)
                 or awaiting_neo(wo_id))
 
 
 def user_facing_wait(store: ProjectStore, wo_id: str) -> bool:
-    """Is somebody ELSE holding this work order — a reviewer, or Neo?
-
-    The narrower half of the pair above, and the discriminator for the one status that
-    says "Waiting on you". A HELD gate request is excluded on purpose: it is the
-    WORKER's move, its only exit is the worker's own next command, and nothing about it
-    is owed by the user — which is the whole of fix 2.
-
-    Beside `something_is_out` rather than in a caller, because the two are read against
-    each other: `settle_work_order` asks this one before writing a status and that one
-    before deciding a manager is free (kn-4ea33fe6).
-    """
+    """Is somebody ELSE holding this work order — a reviewer, or Neo?"""
     return bool(store.pending_approvals(wo_id) or awaiting_neo(wo_id))
 
 
 def end_wait_if_nothing_is_out(store: ProjectStore, wo_id: str) -> bool:
-    """Take a work order out of `waiting_input` once nothing is holding it there.
-
-    Every wait in the OS parks the work order here — `gates.request`, `ops.ask_question`
-    — and every one of them has to end it again, because a status that outlives its wait
-    is read as a USER blocker by everything downstream: `jarvis status`, the dashboard,
-    and `true_blockers` above, which renders it as "worker is waiting on your input".
-
-    One function for all of them, because the condition is not per-wait: what ends a wait
-    is that NOTHING is out, and a gate verdict delivered while a question is still with
-    Neo has not ended anything. Three call sites had three copies of a two-thirds-right
-    version of this (`gates.apply_decision`, `Daemon._neo_drain`, and `neo_answer_escalated`,
-    which had none at all and left the flag to come straight back on the next tick).
-
-    Narrow on the other side too: only FROM `waiting_input`, so a work order cancelled or
-    settled while it waited keeps where it got to. Returns whether it moved.
-    """
+    """Take a work order out of `waiting_input` once nothing is holding it there"""
     if store.get_work_order(wo_id)["status"] != "waiting_input":
         return False
     if something_is_out(store, wo_id):
@@ -2426,13 +1314,7 @@ def end_wait_if_nothing_is_out(store: ProjectStore, wo_id: str) -> bool:
 
 
 def neo_question_blocker(question: dict[str, Any]) -> str:
-    """The attention reason for a question Neo has handed back to the user.
-
-    One function so the reason `Daemon._neo_drain` writes at escalation time and the one
-    `true_blockers` re-derives on every tick afterwards are the same string — kn-78346a2d:
-    a flag whose reason `true_blockers` cannot re-derive is relabelled behind the user's
-    back, and the relabelling is silent.
-    """
+    """The attention reason for a question Neo has handed back to the user"""
     if question["status"] == "failed":
         return (f"Neo could not answer question {question['id']} — "
                 f"answer it: `jarvis neo answer {question['id']} \"…\"`")
@@ -2440,20 +1322,11 @@ def neo_question_blocker(question: dict[str, Any]) -> str:
             f"answer it: `jarvis neo answer {question['id']} \"…\"`")
 
 
-# -- invariants ---------------------------------------------------------------------
+# -- invariants
 
 
 def check_attention_reason_is_true(store: ProjectStore) -> Iterator[Violation]:
-    """INV-ATTENTION-REASON — a flagged work order's reason must name the real blocker.
-
-    The observed failure: a work order settles into `needs_review` with
-    "assumptions pending review", then Claude Code's routine idle Notification fires a
-    minute later and the hook stamps "Claude is waiting for your input" over it. The
-    user is sent looking for a question that does not exist while the actual action —
-    approve or reject the assumptions — sits unlabelled below it.
-
-    Repairable: the correct reason is derivable from state.
-    """
+    """INV-ATTENTION-REASON — a flagged work order's reason must name the real blocker"""
     for wo in store.list_work_orders(include_hidden=True):
         if not wo["needs_attention"]:
             continue
@@ -2461,20 +1334,7 @@ def check_attention_reason_is_true(store: ProjectStore) -> Iterator[Violation]:
         if not blockers:
             continue
         reason = wo.get("attention_reason") or ""
-        # Only assumptions are enforced strictly. For other blockers a hook-supplied
-        # reason ("needs permission to run X") is more specific than anything we can
-        # derive, and clobbering it would repeat the very bug this invariant exists for.
-        #
-        # XOR, since issue #705 defect 2. This used to repair only a reason that FAILED
-        # to name pending assumptions; the reverse — a count of assumptions nobody still
-        # owes a decision on — was skipped by construction and therefore immortal,
-        # printed first on `jarvis status` for as long as the flag was up. A stale count
-        # is not more specific than anything, it is simply wrong.
-        #
-        # NOT "either side mentions assumptions": both mentioning them is `ops.assume`'s
-        # generic "assumptions pending review" against a real pending decision, which is
-        # true and merely vaguer — and repairing it reports a violation against every
-        # work order that files an assumption.
+        # Only assumptions are enforced strictly (#705)
         if _mentions_assumptions(blockers[0]) == _mentions_assumptions(reason):
             continue
         store.flag_attention(wo["id"], blockers[0])
@@ -2489,17 +1349,7 @@ def check_attention_reason_is_true(store: ProjectStore) -> Iterator[Violation]:
 
 
 def check_repaired_work_rejoins_the_merge_queue(store: ProjectStore) -> Iterator[Violation]:
-    """INV-REPAIR-RESETTLED — a repaired pull request goes back in the merge queue.
-
-    Issue #705 defect 1. `ops.clear_pr_repair` re-derives the status as it closes the
-    episode, which fixes every repair from here on; this is what reaches the orders
-    already stranded by the version that did not, and it is the standing guarantee that
-    nothing else can strand one again — `waiting_pr_merge` is the only status the
-    auto-merge poll looks at, so an order held out of it is out of the queue for ever.
-
-    Repairable, and `ops.resettle_after_repair` is the single derivation — the flag it
-    leaves is re-derived from `true_blockers`, so this cannot relabel anything.
-    """
+    """INV-REPAIR-RESETTLED — a repaired pull request goes back in the merge queue (#705)"""
     from . import ops as ops_mod
 
     for wo in store.list_work_orders(statuses=("needs_review",), include_hidden=True):
@@ -2519,26 +1369,7 @@ def check_repaired_work_rejoins_the_merge_queue(store: ProjectStore) -> Iterator
 
 
 def check_adhoc_not_governed(store: ProjectStore) -> Iterator[Violation]:
-    """INV-ADHOC-NOT-GOVERNED — an injected session must not be judged as a worker.
-
-    A session the user started and handed over with `jarvis wo inject` is a *mirror*,
-    not a dispatch: it never received the worker contract and has no way to call
-    `jarvis wo finish`. Judging it against that contract parked it in `needs_review`
-    (IDLE_NO_FINISH_BLOCKER) the moment it ended a turn, and in
-    `failed` ("worker session disappeared") the moment the user cleaned it up — one live
-    fleet accumulated fifteen of these, one of which was the session the user was
-    talking to. (Back then Jarvis adopted these sessions on its own; it no longer does,
-    which is why `adhoc` rows still on disk get the same treatment as `injected` ones.)
-
-    `true_blockers` stops *new* ones. This retires the records already on disk, so the
-    fix reaches a running fleet on the next reconcile tick instead of waiting for the
-    user to hand-clear a dashboard.
-
-    Repairable: with no contract there is no verdict to make. The record, its timeline
-    and whatever reply was captured all stay; only the demand for the user goes away.
-    Anything the session genuinely left pending (an assumption it filed itself) is left
-    exactly where it is.
-    """
+    """INV-ADHOC-NOT-GOVERNED — an injected session must not be judged as a worker"""
     for wo in store.list_work_orders(statuses=("failed", "needs_review"),
                                      include_hidden=True):
         if (wo["origin"] not in UNGOVERNED_ORIGINS
@@ -2558,31 +1389,8 @@ def check_adhoc_not_governed(store: ProjectStore) -> Iterator[Violation]:
 
 
 def check_legacy_adhoc_retired(store: ProjectStore) -> Iterator[Violation]:
-    """INV-ADHOC-LEGACY-RETIRED — a session Jarvis adopted on its own is let go.
-
-    Jarvis used to adopt every Claude session running under a registered project path
-    into an `origin="adhoc"` work order, and then track it. It no longer does: adoption
-    is now the user's explicit act (`jarvis wo inject`), so nothing follows those rows
-    any more.
-
-    That is why leaving them alone is not the neutral option. A row parked in
-    `waiting_input` is a genuine user blocker — "worker is waiting on your input" is
-    true whoever started the session, so `true_blockers` does not suppress it — and with
-    nothing left to refresh it, it would ask for the user forever, about a session that
-    may have ended weeks ago. This closes them once, at the point of upgrade.
-
-    Repairable: the record, its timeline, its captured replies and any assumptions all
-    stay exactly as they are; only the demand for the user goes away, which is the same
-    treatment `Daemon.retire_ungoverned` gives a session that ends normally. A row with
-    assumptions still pending is left alone: the user owes it an answer, and that is a
-    real blocker, not adoption noise.
-
-    Idempotent: a retired row is `completed`, so a re-run finds nothing. Only `adhoc`
-    rows are touched — `injected` ones were handed over deliberately and are still
-    tracked.
-    """
-    # Adoption only ever produced these two statuses, and no path moves an adhoc row to
-    # `pending`/`dispatching`. `failed`/`needs_review` are INV-ADHOC-NOT-GOVERNED's.
+    """INV-ADHOC-LEGACY-RETIRED — a session Jarvis adopted on its own is let go"""
+    # Adoption only ever produced these two statuses
     for wo in store.list_work_orders(statuses=("running", "waiting_input"),
                                      include_hidden=True):
         if wo["origin"] != "adhoc" or store.pending_assumptions(wo["id"]):
@@ -2604,27 +1412,7 @@ def check_legacy_adhoc_retired(store: ProjectStore) -> Iterator[Violation]:
 
 
 def check_no_orphan_gate_requests(store: ProjectStore) -> Iterator[Violation]:
-    """INV-GATE-ORPHAN — a gate request must not outlive the work order that filed it.
-
-    A gate is a control on something about to happen. Once its work order is completed,
-    cancelled or failed there is no worker left to run the command, so an approval could
-    permit nothing and a denial could stop nothing — and yet the request keeps sitting in
-    `jarvis gate list --pending`, and if Neo escalated it, in the user's attention list
-    and inbox, asking them to authorise an action that has either already happened or
-    never will.
-
-    That is the state wo-52a6164d ended in: `completed`, the release shipped, and a
-    pending gate still demanding permission to ship it. Read from the outside, the gate
-    looks like it failed to hold — which is worse than a missing control, because it
-    teaches the operator that the ones still standing mean nothing either.
-
-    Repairable: close the request as superseded. It is not a verdict and authorises
-    nothing (see `ProjectStore.supersede_approval`); the command string stays blocked.
-
-    Held requests count. One is further from a verdict than a pending one, not closer:
-    no question exists for Neo to answer, and the only thing that would ever have closed
-    it is a worker that is gone.
-    """
+    """INV-GATE-ORPHAN — a gate request must not outlive the work order that filed it"""
     for wo in store.list_work_orders(statuses=TERMINAL_STATUSES, include_hidden=True):
         for approval in store.open_approvals(wo["id"]):
             store.supersede_approval(approval["id"], (
@@ -2645,21 +1433,7 @@ def check_no_orphan_gate_requests(store: ProjectStore) -> Iterator[Violation]:
 
 
 def check_no_phantom_attention(store: ProjectStore) -> Iterator[Violation]:
-    """INV-ATTENTION-PHANTOM — a work order with nothing pending must not ask for you.
-
-    Covers the "I acked it and it is still in my face" case: a lingering flag with
-    nothing behind it is pure noise on the dashboard and in the attention list.
-
-    IT USED TO SAY that once a work order is completed or cancelled there is nothing the
-    user can act on, and that is now false: an unrepairable invariant owes a DECISION and
-    derives a blocker on a settled order (INV-WORK-LANDED on an open pull request). So the
-    test is the derivation and not the status — it clears only what `true_blockers` cannot
-    re-derive. Narrow by construction: no other branch of `true_blockers` fires for
-    `completed` or `cancelled`, and `failed` is not terminal. Spec
-    docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md §5
-
-    Repairable: clear the flag.
-    """
+    """INV-ATTENTION-PHANTOM — a work order with nothing pending must not ask for you (docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md §5)"""
     for wo in store.list_work_orders(statuses=TERMINAL_STATUSES, include_hidden=True):
         if not wo["needs_attention"]:
             continue
@@ -2677,21 +1451,7 @@ def check_no_phantom_attention(store: ProjectStore) -> Iterator[Violation]:
 
 
 def check_assumption_flags_are_owed(store: ProjectStore) -> Iterator[Violation]:
-    """INV-ATTENTION-PREMATURE — an assumption flag Neo, not the user, is going to answer.
-
-    The self-heal half of issue #711: every order flagged before the fix, and any flagged
-    by a route that does not ask `neo_reviews_later`, drops the flag on the next tick
-    rather than needing a hand-clear.
-
-    NARROWER THAN "true_blockers is empty", deliberately. A flag raised by a Claude Code
-    hook carries a reason this module cannot derive — that is the case
-    INV-ATTENTION-REASON refuses to clobber — so clearing every underivable flag here
-    would delete the more specific line. Only a reason that NAMES assumptions is touched,
-    and only while `neo_reviews_later` holds.
-
-    Repairable: clear the flag. The assumptions themselves are untouched and still on
-    `jarvis wo show`.
-    """
+    """INV-ATTENTION-PREMATURE — an assumption flag Neo, not the user, is going to answer (#711)"""
     for wo in store.list_work_orders(statuses=PRE_DELIVERY_STATUSES, include_hidden=True):
         if not wo["needs_attention"]:
             continue
@@ -2699,9 +1459,7 @@ def check_assumption_flags_are_owed(store: ProjectStore) -> Iterator[Violation]:
             continue
         if not (store.pending_assumptions(wo["id"]) and neo_reviews_later(store, wo)):
             continue
-        # An undeliverable objection raises a real blocker on a RUNNING order, which
-        # INV-ATTENTION-MISSING selects, so without this the flag is cleared here
-        # and INV-ATTENTION-MISSING re-raises it on the same tick, for ever.
+        # An undeliverable objection raises a real blocker on a RUNNING order
         if any(_mentions_assumptions(b) for b in true_blockers(store, wo)):
             continue
         store.clear_attention(wo["id"])
@@ -2716,18 +1474,8 @@ def check_assumption_flags_are_owed(store: ProjectStore) -> Iterator[Violation]:
 
 
 def check_blocked_work_is_surfaced(store: ProjectStore) -> Iterator[Violation]:
-    """INV-ATTENTION-MISSING — work that needs the user must actually say so.
-
-    The mirror of the two above, and the more dangerous direction: a work order stuck
-    with pending assumptions but no attention flag never appears in `jarvis status`, the
-    attention list or the dashboard strip. It is invisibly stalled, which is how a fleet
-    quietly stops moving.
-
-    Repairable: raise the flag with the derived reason.
-    """
-    # Every status `true_blockers` can derive for, derived rather than restated, so no
-    # second list can fall behind it (spec
-    # docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md §5c).
+    """INV-ATTENTION-MISSING — work that needs the user must actually say so"""
+    # Every status `true_blockers` can derive for (docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md §5c)
     statuses = OPEN_STATUSES + ("failed",)
     for wo in store.list_work_orders(statuses=statuses, include_hidden=True):
         if wo["needs_attention"]:
@@ -2747,35 +1495,7 @@ def check_blocked_work_is_surfaced(store: ProjectStore) -> Iterator[Violation]:
 
 
 def check_messages_are_delivered(store: ProjectStore) -> Iterator[Violation]:
-    """INV-MESSAGE-STUCK — a message queued for a worker must not sit undelivered for ever.
-
-    GitHub issue 43, and the paragraph below is the state of the OS BEFORE this check
-    existed — present tense would read as a description of how it still works and invite
-    the next reader to undo it (kn-88615da4).
-
-    `Daemon.deliver_messages` held a message on four paths and every one of them WAS
-    silent: the row stayed `queued`, which from the outside is indistinguishable from one
-    about to go out, and `ops.waiting_on` answered `queued_message` for it — a member of
-    IN_FLIGHT_WAITS, so `parked_reason` read the hold as the OS being about to act and
-    every surface reported the work order healthy. Fifteen messages across four work
-    orders were rotting when the issue was filed, including a gate verdict and the user's
-    own two follow-ups. Today `waiting_on` answers `message_stuck` instead, SPOKEN_FOR_WAITS
-    catches it, and the blocker below is what the user reads.
-
-    The predicate and its four excused waits are `stuck_message`'s. What is added here
-    is the DIAGNOSIS, which is the reason this is its own invariant rather than a line of
-    INV-ATTENTION-MISSING: that check can only say "needs the user", and the useful fact
-    is which message, for how long, and what is holding it.
-
-    The repair is the flag, raised through `true_blockers` and never with a reason of its
-    own — a work order can owe the user an assumption review AND be missing a message,
-    and overwriting the first with the second is the silent relabelling kn-78346a2d
-    describes. Runs immediately before INV-ATTENTION-MISSING, which skips anything
-    already flagged, so the flag goes up exactly once whichever of the two sees it first.
-    A blocker the user has acknowledged leaves `true_blockers` and the flag stays down;
-    the violation is still reported, because `jarvis doctor` answers "is this healthy",
-    not "have you been told".
-    """
+    """INV-MESSAGE-STUCK — a message queued for a worker must not sit undelivered for ever"""
     readonly = getattr(store, "readonly", False)
     now = time.time()
     for wo in store.list_work_orders(statuses=MESSAGE_STUCK_STATUSES,
@@ -2802,16 +1522,7 @@ def check_messages_are_delivered(store: ProjectStore) -> Iterator[Violation]:
 
 
 def check_assumptions_persisted(store: ProjectStore) -> Iterator[Violation]:
-    """INV-ASSUMPTION-PERSISTED — every recorded assumption must exist as a row.
-
-    The timeline saying "Assumption recorded" is a claim about a write. This checks the
-    write: an `assumption` event whose content has no matching row is an assumption the
-    worker believes it filed, the user will never be asked about, and no other surface
-    can show — the review queue reads rows, not events.
-
-    Repairable: the event payload carries the full content, so the row is reconstructed
-    from it. Matching is by exact content, so a re-run never duplicates.
-    """
+    """INV-ASSUMPTION-PERSISTED — every recorded assumption must exist as a row"""
     for wo in store.list_work_orders(include_hidden=True):
         events = [e for e in store.list_events(wo["id"], limit=1000)
                   if e.get("kind") == "assumption"]
@@ -2843,13 +1554,7 @@ def check_assumptions_persisted(store: ProjectStore) -> Iterator[Violation]:
 
 
 def check_attention_has_reason(store: ProjectStore) -> Iterator[Violation]:
-    """INV-ATTENTION-BLANK — a flagged work order must say what it wants.
-
-    "Needs you" with an empty reason is indistinguishable from noise, and it is the
-    fastest way to teach an operator to ignore the attention strip.
-
-    Repairable when a blocker is derivable; reported otherwise.
-    """
+    """INV-ATTENTION-BLANK — a flagged work order must say what it wants"""
     for wo in store.list_work_orders(include_hidden=True):
         if not wo["needs_attention"] or (wo.get("attention_reason") or "").strip():
             continue
@@ -2869,28 +1574,7 @@ def check_attention_has_reason(store: ProjectStore) -> Iterator[Violation]:
 
 
 def check_envelopes_move(store: ProjectStore) -> Iterator[Violation]:
-    """INV-ENVELOPE-STUCK — an envelope must not sit in the queue for ever.
-
-    The message bus (src/jarvis/bus.py) is the pipe every cross-entity message in the
-    validation loop travels down, and a `queued` envelope is a message nobody will ever
-    receive. From the outside it looks exactly like one that was delivered: the row is
-    there, the payload is there, and nothing says the recipient never saw it. The bus has
-    to own that liveness itself rather than wait for a later feature to notice.
-
-    Predicate: still `queued` after `bus.DELIVERY_ATTEMPT_CEILING` routing attempts. The
-    daemon turns the queue every tick, so an envelope only accumulates attempts by
-    failing — a delivery that raised and rolled back, over and over.
-
-    Repairable, and unambiguously so, which is rare for this module: `bus.deliver` is
-    transactional and therefore safe to run again, so the repair is to attempt delivery
-    once more. If that attempt leaves it `queued` too, THAT was the final attempt and the
-    envelope is marked `undeliverable` with the reason in `note` — which is the whole
-    point, because an undeliverable message is a fact the record must carry, while a
-    queued one is a lie of omission.
-
-    Reported once by construction: every path out of here leaves the envelope in a state
-    that is no longer `queued`, so the next tick finds nothing to say.
-    """
+    """INV-ENVELOPE-STUCK — an envelope must not sit in the queue for ever"""
     from .bus import DELIVERY_ATTEMPT_CEILING, deliver
 
     stuck = [e for e in store.queued_envelopes()
@@ -2898,9 +1582,7 @@ def check_envelopes_move(store: ProjectStore) -> Iterator[Violation]:
     if not stuck:
         return
     if getattr(store, "readonly", False):
-        # `jarvis doctor` without --repair. The retry would write to the CENTRAL store
-        # too (a deferral with no manager is filed as a backlog item), which no proxy
-        # over the project store can intercept — so the retry is described, not run.
+        # `jarvis doctor` without --repair
         for env in stuck:
             yield _envelope_violation(env, repair="would retry delivery once more")
         return
@@ -2929,34 +1611,7 @@ def check_envelopes_move(store: ProjectStore) -> Iterator[Violation]:
 
 
 def check_neo_escalations_are_live(store: ProjectStore) -> Iterator[Violation]:
-    """INV-NEO-ESCALATION-STALE — a question held by the user must still be answerable.
-
-    `ops._neo_attention` lists every `escalated` or `failed` question of every kind, so
-    one whose decision was taken elsewhere goes on asking the user for a ruling nobody
-    can give. Three were doing that in production, the oldest for a fortnight, and none
-    was of kind `question`: an `approval` question is closed only through
-    `approvals.neo_question_id`, a `plan` question only through
-    `feature_orders.plan_question_id` and an `alarm` question only through
-    `wo_alarms.neo_question_id` — and every one of those subjects can move that pointer
-    or retire without closing what it pointed at.
-
-    The point fixes (`ops.submit_plan`, `ops.cancel_feature_order`, `gates.open_gate`,
-    `ops.review_alarm`) close them as the pointer moves, which is the only moment that
-    can name what replaced it. This derives the same fact from the subject's current
-    state instead, so a site that forgets costs one tick rather than for ever — and it is
-    what clears the rows already stranded.
-
-    LIVE means the subject still has this decision open: a `pending` approval, a feature
-    order in `plan_review`, or an `escalated` alarm — each still pointing at this very
-    question. Everything else is moot, which is the same "only the LATEST round counts"
-    reading `validation_escalated` uses. A question whose subject this project does not
-    know is left alone — that is how another project's rows are skipped, since the checks
-    run per project while Neo's database is OS-wide.
-
-    Repairs on the daemon tick rather than behind `--repair` as INV-MANAGER-MISSING does:
-    closing a question the OS can prove is moot creates nothing, authorises nothing and
-    overwrites no verdict (`NeoStore.supersede` is guarded on the open statuses).
-    """
+    """INV-NEO-ESCALATION-STALE — a question held by the user must still be answerable"""
     from .neo_store import USER_HELD_Q_STATUSES, NeoStore
     from .ops import registered_project_paths
 
@@ -2966,15 +1621,7 @@ def check_neo_escalations_are_live(store: ProjectStore) -> Iterator[Violation]:
         held = [q for q in neo.list_questions(statuses=USER_HELD_Q_STATUSES)
                 if q["kind"] in ("approval", "plan", "alarm", "triage",
                                  "assumption", "question")]
-        # `triage` is the one kind whose subject is not a row in THIS database — it is a
-        # central backlog item, and the question carries no work order at all (issue
-        # #240). So ownership cannot be read off the project store the way the other
-        # three read it, and without this the same question would be reported by every
-        # project on the same tick. Resolved once, and only when there is one to resolve.
-        #
-        # `assumption` needs none of this: its subject IS a row in this database, reached
-        # by `assumption_for_question`, so a question belonging to another project reads
-        # as a missing row and is left alone — the rule all the non-`triage` kinds share.
+        # `triage` is the one kind whose subject is not a row in THIS database (#240)
         mine = (registered_project_paths()
                 if any(q["kind"] == "triage" for q in held) else {})
         for q in held:
@@ -2989,16 +1636,12 @@ def check_neo_escalations_are_live(store: ProjectStore) -> Iterator[Violation]:
             if moot is None:
                 continue
             answer, why = moot
-            # Neo's store is OS-wide, so the `_ReadOnly` proxy over the project store
-            # cannot intercept this write — the checker has to skip it itself.
+            # Neo's store is OS-wide, so the `_ReadOnly` proxy over the project store cannot intercept this write...
             if not readonly:
                 neo.supersede(q["id"], answer, why)
             yield Violation(
                 invariant="INV-NEO-ESCALATION-STALE",
-                # A plan question names the FEATURE order when its planner is gone
-                # (`ops.submit_plan`), and the daemon writes this id onto the work
-                # order's timeline — an FK the events table enforces. Report it
-                # unattached rather than crash the reporting loop.
+                # A plan question names the FEATURE order when its planner is gone (`ops.submit_plan`)
                 wo_id=q["wo_id"] if _is_work_order(store, q["wo_id"]) else None,
                 detail=(f"Neo question {q['id']} ({q['kind']}) was still {q['status']} "
                         f"to the user, but {why}"),
@@ -3020,7 +1663,7 @@ def _is_work_order(store: ProjectStore, wo_id: str) -> bool:
 
 def _stale_approval_question(store: ProjectStore,
                              q: dict[str, Any]) -> tuple[str, str] | None:
-    """(answer, why) if this approval question is moot, else None."""
+    """(answer, why) if this approval question is moot, else None"""
     approval = store.approval_for_question(q["id"])
     if approval is None or approval["status"] == "pending":
         return None
@@ -3031,7 +1674,7 @@ def _stale_approval_question(store: ProjectStore,
 
 def _stale_plan_question(store: ProjectStore,
                          q: dict[str, Any]) -> tuple[str, str] | None:
-    """(answer, why) if this plan question is moot, else None."""
+    """(answer, why) if this plan question is moot, else None"""
     fo = store.feature_order_for_planner(q["wo_id"])
     if fo is None:
         return None
@@ -3047,15 +1690,7 @@ def _stale_plan_question(store: ProjectStore,
 
 def _stale_alarm_question(store: ProjectStore,
                           q: dict[str, Any]) -> tuple[str, str] | None:
-    """(answer, why) if this alarm question is moot, else None.
-
-    A MISSING ROW IS LEFT ALONE, as in both siblings: the checks run per project against
-    an OS-wide `neo.db`, so "no such alarm here" is how another project's rows are
-    skipped and cannot be told apart from a subject that has gone. The one way it could
-    genuinely go — deleting the work order, which cascades `wo_alarms` — already erases
-    the question itself (`ops.delete_work_order` → `NeoStore.purge_work_order`), so
-    nothing is leaked by declining to guess.
-    """
+    """(answer, why) if this alarm question is moot, else None"""
     alarm = store.alarm_for_question(q["id"])
     if alarm is None or alarm["status"] == "escalated":
         return None
@@ -3065,17 +1700,7 @@ def _stale_alarm_question(store: ProjectStore,
 
 def _stale_assumption_question(store: ProjectStore,
                                q: dict[str, Any]) -> tuple[str, str] | None:
-    """(answer, why) if this assumption question is moot, else None.
-
-    An assumption question Neo escalated is held by the user, and the way they answer it
-    is `jarvis wo review` — which settles the assumption and never touches the question.
-    So the row would go on asking for a ruling that has already been given, which is
-    exactly the shape this invariant exists to catch.
-
-    A MISSING ROW IS LEFT ALONE, as in all three siblings: the checks run per project
-    against an OS-wide `neo.db`, so "no such assumption here" is how another project's
-    rows are skipped and cannot be told apart from a subject that has gone.
-    """
+    """(answer, why) if this assumption question is moot, else None"""
     assumption = store.assumption_for_question(q["id"])
     if assumption is None or assumption["status"] == "pending":
         return None
@@ -3085,25 +1710,7 @@ def _stale_assumption_question(store: ProjectStore,
 
 def _stale_worker_question(store: ProjectStore,
                            q: dict[str, Any]) -> tuple[str, str] | None:
-    """(answer, why) if this worker question is moot, else None. Spec §2a of
-    docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
-
-    The one kind with NO subject pointer at all — `jarvis wo ask` writes a question and
-    nothing in any store points back at it — so the five siblings' shape, reading the
-    subject's current state, cannot be written here. The timeline carries the fact
-    instead: the user REVIEWED a delivery made after the question was asked, and settled
-    it that way.
-
-    Both halves are needed and neither is enough. A `finished` alone is the WORKER's act
-    rather than the user's answer (Neo's ruling), and a `reviewed` alone could be a
-    verdict on a delivery older than the question. The `reviewed` event is the user's
-    verdict and nothing else: `ops.review_work_order` is its only writer, and the
-    autoreview path settles assumptions without one — so a machine verdict can never
-    supersede a question here.
-
-    A MISSING ROW IS LEFT ALONE, as in all five siblings: the checks run per project
-    against an OS-wide `neo.db`, so a work order this project does not know is skipped.
-    """
+    """(answer, why) if this worker question is moot, else None (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md)"""
     if not _is_work_order(store, q["wo_id"]):
         return None
     asked = float(q["ts"])
@@ -3123,17 +1730,7 @@ def _stale_worker_question(store: ProjectStore,
 
 def _stale_triage_question(store: ProjectStore,
                            q: dict[str, Any]) -> tuple[str, str] | None:
-    """(answer, why) if this priority re-assessment is moot, else None. Issue #240.
-
-    The subject of a `triage` question is THE ISSUE, not a work order — this is the only
-    kind with no work order behind it at all. So "still live" means nobody has started
-    the work yet: once a live work order is on that issue, the rating cannot change
-    anything and the escalation is asking for a ruling nobody would act on.
-
-    It used to be the backlog item the filing left behind, and the item is still checked
-    when one is there — a question asked before `route_filing` stopped creating them
-    (kn-c5725f1f). The issue test is the one that applies to anything asked since.
-    """
+    """(answer, why) if this priority re-assessment is moot, else None (#240)"""
     from . import issues
     from .central_store import CentralStore
     from .project_store import TERMINAL_STATUSES
@@ -3141,8 +1738,7 @@ def _stale_triage_question(store: ProjectStore,
     payload = issues.triage_payload(q)
     url = (payload or {}).get("issue_url") or ""
     if not url:
-        # A question whose context nobody can parse. `settle_triage` already refuses to
-        # act on one, and closing it here would guess at what it was about.
+        # A question whose context nobody can parse
         return None
     for wo in store.work_orders_for_issue(url):
         if wo["status"] not in TERMINAL_STATUSES:
@@ -3168,24 +1764,7 @@ def _stale_triage_question(store: ProjectStore,
 
 
 def check_proposed_remedies_are_live(store: ProjectStore) -> Iterator[Violation]:
-    """INV-REMEDY-PROPOSAL-STALE — a proposal nobody can answer must not sit for ever.
-
-    An alarm at `proposed` is holding the attention flag up on behalf of a gate request
-    that a reviewer is expected to decide. When that request has been closed some other
-    way — superseded by `gates.open_gate`, expired by the sweep, or gone with a deleted
-    row — nothing else moves the alarm, and it goes on saying "the OS is waiting for
-    permission" about a request that no longer exists.
-
-    ABSENCE IS DECISIVE HERE, WHICH IS THE OPPOSITE OF `_stale_alarm_question`'s RULE,
-    and the difference is which database the subject lives in. That check runs per
-    project against an OS-WIDE `neo.db`, so "no such alarm here" is how another project's
-    rows are skipped and cannot be told apart from a subject that has gone. An approval
-    is in THIS project's database beside the alarm that points at it, and the pointer is
-    an id this project wrote — so a missing row means missing, not "somebody else's".
-
-    `approved` is left alone: `Daemon.remedy_tick` is about to apply it, and closing it
-    here would race the application it is waiting for.
-    """
+    """INV-REMEDY-PROPOSAL-STALE — a proposal nobody can answer must not sit for ever"""
     from .supervisor import ALARM_BLOCKER
 
     readonly = getattr(store, "readonly", False)
@@ -3231,48 +1810,7 @@ def _envelope_violation(env: dict[str, Any], repair: str) -> Violation:
 
 
 def check_paused_turns_resume(store: ProjectStore) -> Iterator[Violation]:
-    """INV-PAUSE-OVERDUE — a paused turn whose wait is over must actually be relaunched.
-
-    THE LIVENESS GUARANTEE `Daemon.retry_paused_turns` OWES, and the reason it is owed is
-    that the pass failing to fire is INVISIBLE. A work order paused for the usage limit
-    keeps its status and its slot on purpose (see `worker_session`), so from every
-    surface it looks like one that is being handled: `running`, no attention flag, and a
-    note promising it will retry by itself. `TurnPause.attempts` only rises when a retry
-    is ATTEMPTED, so a pass that never fires leaves it at 1 of 8 for ever — `exhausted`
-    is unreachable, and the path that hands an out-of-retries work order to the user can
-    never be taken. Nothing else in the OS is watching.
-
-    That is not hypothetical. wo-b4f207ad and four siblings sat silently stuck for twelve
-    hours because the reset moment was re-resolved against the asking clock and ran away
-    each time it arrived (PR 129); the parse is fixed, but a clock skew, a catalog
-    omission, or an exception inside the pass would all reproduce the same silent day.
-    This checks the OUTCOME instead of any one cause, so it survives the next one.
-
-    Predicate: a governed work order in `RETRY_SWEEP_STATUSES` whose pause came due more
-    than `PAUSE_OVERDUE_GRACE` ago. THE SAME TUPLE THE PASS WALKS, and it has to be: a
-    check scoped narrower than the loop it audits is blind in exactly the rows the loop
-    never reaches, which is how issue #259 went unreported while `stuck_message` named it
-    on demand. The pass runs every `RETRY_EVERY_TICKS` ticks — about ten
-    seconds — so the grace is two orders of magnitude of slack, and anything reported
-    here is stuck rather than merely waiting its turn.
-
-    `resumable`, not `exhausted`, because an auth pause is neither due nor exhausted
-    while the sign-in has not changed: its `retry_at` is `NEVER`, and there is nothing
-    overdue about a wait for an action the user has not taken yet. It becomes ordinary
-    the moment they sign in — `retry_at` lands in the recent past, and this holds the
-    relaunch to the same grace as the other two.
-
-    REPORT-ONLY, and deliberately not repairable. The repair is to relaunch the turn,
-    which is `retry_paused_turns`'s whole job; doing it here too would be a second
-    relaunch path to keep in step with the first, which is the exact duplication
-    `turn_pause` exists to prevent. An unrepaired violation raises a notification, and
-    being told once that the OS's self-healing is not healing is worth more than a quiet
-    second mechanism that hides it.
-
-    Self-clearing: a relaunch makes the new turn the latest, so `turn_pause` returns None
-    and there is nothing left to report. Exhausted pauses are skipped because the retry
-    pass skips them too — those already reach the user through the attention flag.
-    """
+    """INV-PAUSE-OVERDUE — a paused turn whose wait is over must actually be relaunched (#259)"""
     for wo in store.list_work_orders(statuses=RETRY_SWEEP_STATUSES):
         if wo["origin"] in UNGOVERNED_ORIGINS:
             continue  # the user's own session; Jarvis does not drive it
@@ -3284,11 +1822,7 @@ def check_paused_turns_resume(store: ProjectStore) -> Iterator[Violation]:
             continue
         if pause is None or not pause.resumable:
             continue
-        # The sweep looked at this one and deferred it; nothing is broken. Suppressed
-        # only by a positive, recent, turn-matched statement from the pass that owes the
-        # relaunch — absence of evidence is still a violation, and a hold that ends
-        # without one ages out inside `RETRY_HELD_FRESH_FOR`. Spec §2b of
-        # docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md.
+        # The sweep looked at this one and deferred it; nothing is broken (docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md)
         if retry_hold(store, wo, pause) is not None:
             continue
         overdue = time.time() - pause.retry_at
@@ -3308,34 +1842,7 @@ def check_paused_turns_resume(store: ProjectStore) -> Iterator[Violation]:
 
 
 def check_pause_deadline_stable(store: ProjectStore) -> Iterator[Violation]:
-    """INV-PAUSE-DRIFT — a pause's deadline must still be the one it was given.
-
-    THE COMPANION TO INV-PAUSE-OVERDUE, AND THE ONE THAT WOULD ACTUALLY HAVE CAUGHT
-    wo-b4f207ad. Overdue-ness cannot see a runaway deadline: while the reset moment was
-    being re-resolved against the asking clock it was ALWAYS in the future, so
-    `now > retry_at` was never true and an overdue check would have stayed silent for
-    the entire twelve hours. The two predicates cover the two ways self-healing fails —
-    the pass not running, and the pass being told the wrong moment — and neither sees
-    the other's.
-
-    Predicate: the reset `worker_session._diagnose` derives now must still match the one
-    `worker_session.settle_turn` recorded on the `turn_paused` event when the turn died.
-    That event is written at the one moment nobody has to reason about — the refusal is
-    in hand and the clock IS the turn's clock — so it is the closest thing to a
-    measurement the OS has. Under the bug the two diverge by exactly a day the instant
-    the stated reset passes, which is within a reconcile tick of when it matters.
-
-    This costs the derivation nothing extra: the pause is already computed for
-    INV-PAUSE-OVERDUE's sake on the same tick, and the event read is kind-filtered.
-
-    Matched by turn `seq`, not just by work order: a conversation refused twice has two
-    `turn_paused` events and comparing the newest against an older turn's deadline would
-    invent a violation. Skipped when the payload predates this field, or when the message
-    named no readable moment (`reset_at` is None) — there is nothing to disagree with.
-
-    Report-only. A disagreement means the derivation is wrong, and which of the two
-    numbers to believe is exactly the judgement an invariant must not make on its own.
-    """
+    """INV-PAUSE-DRIFT — a pause's deadline must still be the one it was given"""
     for wo in store.list_work_orders(statuses=RETRY_SWEEP_STATUSES):
         if wo["origin"] in UNGOVERNED_ORIGINS:
             continue
@@ -3355,8 +1862,7 @@ def check_pause_deadline_stable(store: ProjectStore) -> Iterator[Violation]:
         recorded = payload.get("reset_at")
         if recorded is None or payload.get("seq") != pause.turn["seq"]:
             continue
-        # The reset is a clock time rounded to the minute, so a sub-minute difference is
-        # the rounding and not a drift. A real one is a whole day.
+        # The reset is a clock time rounded to the minute
         if abs(float(recorded) - pause.reset_at) <= 60:
             continue
         yield Violation(
@@ -3373,26 +1879,7 @@ def check_pause_deadline_stable(store: ProjectStore) -> Iterator[Violation]:
 
 
 def check_no_lost_feedback(store: ProjectStore) -> Iterator[Violation]:
-    """INV-ENVELOPE-LOST — a message that reached nobody must not pass for one that did.
-
-    `check_envelopes_move` above is about liveness: an envelope still `queued` is one
-    the bus has not given up on. This one is about the ending it gives up INTO.
-    `undeliverable` means the router found no work order filling the role — review
-    feedback for a work order that was cancelled, or a feature whose manager is gone —
-    and from the outside that is indistinguishable from delivered: the row is there, the
-    payload is there, and the unit is simply waiting for a reply that will never come.
-
-    Reported, never repaired. There is nothing to derive here — the recipient does not
-    exist — so the only honest action is to tell someone, which is exactly the shape of
-    the OS-level checks.
-
-    **Scoped to units that are still open.** An undeliverable envelope is permanent, and
-    a check that reported every one of them for ever would mean a project's `jarvis
-    doctor` never printed a clean bill again — and a signal that can only ever say
-    "something is wrong" is one an operator learns to skip. Once the subject is settled
-    or cancelled the lost message can no longer cost anything, and it stays on the
-    unit's own page and in `jarvis validation show` for the permanent record.
-    """
+    """INV-ENVELOPE-LOST — a message that reached nobody must not pass for one that did"""
     for env in store.envelopes():
         if env["state"] != "undeliverable":
             continue
@@ -3405,18 +1892,13 @@ def check_no_lost_feedback(store: ProjectStore) -> Iterator[Violation]:
                 still_open = (store.get_feature_order(env["subject_fo_id"])["status"]
                               in FO_OPEN_STATUSES)
         except KeyError:
-            # Deleted out from under the envelope. Nothing is waiting on it any more,
-            # which is the same conclusion as a settled subject.
+            # Deleted out from under the envelope
             still_open = False
         if not still_open:
             continue
         lost = (f"envelope {env['id']} ({env['kind']} to role {env['to_role']}) "
                 f"about {subject} reached nobody: {env['note'] or 'undeliverable'}")
-        # LEADS WITH WHAT IS SETTLED for a lost `manager` envelope: the user read the
-        # SUBJECT as the completed order, because the settled fact arrived last or not at
-        # all. Derived, never stored, and only the manager case had a second order in it
-        # to confuse. Spec §(d), docs/superpowers/specs/2026-10-07-a-settled-features-live-
-        # children-must-have-a-manager-or-a-hold.md
+        # LEADS WITH WHAT IS SETTLED for a lost `manager` envelope: the user read the SUBJECT as the...
         manager, fo_id = None, None
         if env["to_role"] == "manager":
             from .bus import _feature_of
@@ -3444,41 +1926,7 @@ def check_no_lost_feedback(store: ProjectStore) -> Iterator[Violation]:
 
 
 def check_validation_progresses(store: ProjectStore) -> Iterator[Violation]:
-    """INV-VALIDATION-STRANDED — a unit under review must not sit on an open round for ever.
-
-    Nothing outside the daemon moves a unit whose round is open: it raises no attention
-    flag and `settle_work_order` returns early for it. Both are right while a round is in
-    flight, and together they mean a daemon that dies mid-round leaves the unit invisibly
-    stalled with nothing left in the OS that will ever look at it again.
-
-    Predicate: latest round still `pending`, opened longer than TWICE
-    `os.validation.timeout` ago — one timeout is what a round is allowed to take, so a
-    round at 1.2x its budget is late rather than abandoned.
-
-    **The work-order half looks for the ROUND, not for `status='validating'`** (GitHub
-    issue 212, spec docs/superpowers/specs/2026-09-13-two-gates-not-a-chain.md §3): a
-    work order with pending assumptions holds its round while parked in `needs_review`,
-    and the status query this replaced would have let exactly that one sit for ever. It
-    is bounded to `OPEN_STATUSES` instead — a cancelled work order's abandoned round must
-    not be handed back to a machine that would judge and then land the work the user
-    stopped.
-
-    Repaired by closing the round `failed`, not `escalated`: `counted_validation_rounds`
-    ignores `failed`, so the interruption costs the submitter no round, and
-    `Daemon.validation_tick` picks up `pending` AND `failed` — closing it is what hands
-    the unit back. Under `jarvis doctor` without `--repair`, `_ReadOnly` blocks the write.
-
-    Covers FEATURE orders too. Nothing sets one to `validating` yet (a sibling work order
-    adds that loop), and an invariant covering half the units would look like one
-    covering all of them.
-
-    SECOND ARM, work orders only: a round that PASSED and never landed — same defect, a
-    unit under review nothing will move again, in its other state. See
-    `_passed_round_never_landed`.
-
-    THIRD ARM, work orders only: a panel give-up parked in the merge queue. See
-    `_give_up_parked_in_the_merge_queue`.
-    """
+    """INV-VALIDATION-STRANDED — a unit under review must not sit on an open round for ever (docs/superpowers/specs/2026-09-13-two-gates-not-a-chain.md §3)"""
     per_round = _validation_timeout()
     threshold = 2 * per_round
     now = time.time()
@@ -3526,25 +1974,7 @@ def check_validation_progresses(store: ProjectStore) -> Iterator[Violation]:
 
 
 def _passed_round_never_landed(store: ProjectStore) -> Iterator[Violation]:
-    """INV-VALIDATION-STRANDED, second arm — a round that PASSED and never landed.
-
-    `Daemon._validate_work_order` lands a passed round only while no worker turn is in
-    flight and delegates the rest to `Daemon.settle_work_order`, which returns early for
-    exactly the `validating` status a deferral is always taken under. So the landing is
-    held in ONE control-flow path and nowhere in the STATE, and three measured orders sat
-    `validating` on a passed round for 2-8 days with the merge poll, the conflict repair
-    and the auto-merge gate never run over delivered, passed work.
-
-    Predicate, work orders only: `status='validating'`, latest round `passed`, no worker
-    turn in flight. No threshold of its own — a passed round is finished being judged, so
-    once nothing is typing there is nothing left that could move it.
-
-    Repaired by the settler's own act, `ops.land_when_cleared` on a RE-READ row, then the
-    daemon's `VALIDATION_LANDED` event with the round id so the settler cannot land the
-    same round twice.
-
-    Spec docs/superpowers/specs/2026-10-09-a-passed-round-that-never-landed-is-stranded.md.
-    """
+    """INV-VALIDATION-STRANDED, second arm — a round that PASSED and never landed (docs/superpowers/specs/2026-10-09-a-passed-round-that-never-landed-is-stranded.md)"""
     from .daemon import VALIDATION_LANDED
 
     rows = store.conn.execute(
@@ -3571,9 +2001,7 @@ def _passed_round_never_landed(store: ProjectStore) -> Iterator[Violation]:
         context = {"round_id": latest["id"], "round": latest["round"],
                    "unit": "work order", "fo_id": None}
         if readonly:
-            # `jarvis doctor` without --repair. `land_finished` reaches
-            # `CentralStore.mark_backlog`, which no proxy over the project store can
-            # intercept — so the landing is described, not run.
+            # `jarvis doctor` without --repair
             yield Violation(
                 invariant="INV-VALIDATION-STRANDED", wo_id=wo_id, detail=detail,
                 repaired=True,
@@ -3594,28 +2022,12 @@ def _passed_round_never_landed(store: ProjectStore) -> Iterator[Violation]:
         )
 
 
-#: The event the third arm writes when it puts a give-up back on the user's list.
+#: The event the third arm writes when it puts a give-up back on the user's list
 GIVE_UP_REPARKED = "give_up_reparked"
 
 
 def _give_up_parked_in_the_merge_queue(store: ProjectStore) -> Iterator[Violation]:
-    """INV-VALIDATION-STRANDED, third arm — a panel give-up parked in the merge queue.
-
-    `waiting_pr_merge` is not in `SETTLE_STATUSES`, so nothing re-derives it: one wrong
-    write stands for ever, and fixing the predicate above only stops new ones. Orders
-    already parked need a write.
-
-    Predicate, work orders only: `parked_on_a_give_up` REUSED WHOLE — both of
-    kn-c9a58876's facts at once, the panel's last word and the newest `automerge_held`
-    being `not_passed` — then nothing pending for the `needs_review` arm to decide, then
-    nothing typing. A project running with `auto_merge` off writes no hold, so this does
-    not fire there and its healthy pull request stays on the merge poll.
-
-    NO `flag_attention`: kn-089de524 — `check_blocked_work_is_surfaced` raises it from
-    `true_blockers`, the only path that honours `jarvis wo ack`.
-
-    Spec docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md §B.
-    """
+    """INV-VALIDATION-STRANDED, third arm — a panel give-up parked in the merge queue (docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md §B.)"""
     rows = store.conn.execute(
         "SELECT id FROM work_orders WHERE status='waiting_pr_merge'").fetchall()
     readonly = getattr(store, "readonly", False)
@@ -3647,7 +2059,7 @@ def _give_up_parked_in_the_merge_queue(store: ProjectStore) -> Iterator[Violatio
             )
             continue
         store.set_status(wo_id, "needs_review", trigger=GIVE_UP_REPARKED)
-        # `round` beside the id so `timeline` can name it without a lookup.
+        # `round` beside the id so `timeline` can name it without a lookup
         store.add_event(wo_id, GIVE_UP_REPARKED,
                         {"round_id": int(judged["id"]), "round": int(judged["round"]),
                          "was": "waiting_pr_merge"})
@@ -3660,27 +2072,7 @@ def _give_up_parked_in_the_merge_queue(store: ProjectStore) -> Iterator[Violatio
 
 
 def check_feature_failures_are_real(store: ProjectStore) -> Iterator[Violation]:
-    """INV-FEATURE-FALSE-FAILURE — a failed feature whose children all recovered goes back.
-
-    `Daemon.settle_features` only ever looks at `executing` features. That is what makes
-    "flag once, at feature level" true by construction — and it is also what makes
-    `failed` TERMINAL. A child that recovers after the feature settled (a retry, a
-    `jarvis wo done` on a wrongly-flagged failure, a late merge) leaves the feature failed
-    for ever, carrying a stale reason that names a work order which is now `completed`.
-    That is how fo-e353491c sat with 12/12 children done and nothing in the OS that would
-    ever look again.
-
-    Predicate: `failed`, has children, and `dead_feature_children` finds none — the exact
-    function the settler fails on, so the two cannot disagree.
-
-    Repair: back to `executing`, flag cleared. It DECIDES NOTHING. `settle_features` gets
-    the feature on the next tick and completes it, or opens a validation round, exactly as
-    it would have the first time.
-
-    Repaired on the daemon tick rather than behind `--repair`, unlike INV-MANAGER-MISSING:
-    the state admits one reading, and the failure mode is silence — a settled feature
-    raises nothing, ever again, so nobody comes looking.
-    """
+    """INV-FEATURE-FALSE-FAILURE — a failed feature whose children all recovered goes back"""
     for row in store.conn.execute(
             "SELECT id, attention_reason FROM feature_orders WHERE status='failed'"
     ).fetchall():
@@ -3690,14 +2082,11 @@ def check_feature_failures_are_real(store: ProjectStore) -> Iterator[Violation]:
             continue
         store.set_feature_status(fo_id, "executing")
         store.clear_feature_attention(fo_id)
-        # A reopened feature with a `completed` manager has no addressee for its next
-        # round's feedback. Spec §(c), docs/superpowers/specs/2026-10-07-a-settled-
-        # features-live-children-must-have-a-manager-or-a-hold.md
+        # A reopened feature with a `completed` manager has no addressee for its next round's feedback
         from .ops import lower_settled_feature_holds, revive_feature_manager
 
         revived = revive_feature_manager(store, fo_id, why="INV-FEATURE-FALSE-FAILURE")
-        # ...and the children's holds go down with it: SETTLED_FEATURE_BLOCKER is now
-        # false and nothing re-derives a stored flag.
+        # ...and the children's holds go down with it: SETTLED_FEATURE_BLOCKER is now false and nothing...
         lower_settled_feature_holds(store, children)
         yield Violation(
             invariant="INV-FEATURE-FALSE-FAILURE",
@@ -3715,71 +2104,26 @@ def check_feature_failures_are_real(store: ProjectStore) -> Iterator[Violation]:
 
 
 def _validation_timeout() -> int:
-    """How long one validation round is allowed to take, per the LIVE catalog.
-
-    From the catalog rather than `DEFAULT_VALIDATION_TIMEOUT` because this number decides
-    a write: a project that raised the value would otherwise have its healthy long rounds
-    closed out from under it. (`status_label` makes the opposite call — it only prints a
-    number.) Falls back to the default when no catalog is readable; an invariant must
-    never be the thing that raises.
-    """
+    """How long one validation round is allowed to take, per the LIVE catalog"""
     from .ops import validation_config
 
     timeout = getattr(validation_config(), "timeout", None)
     return int(timeout) if timeout else DEFAULT_VALIDATION_TIMEOUT
 
 
-#: How many consecutive failed sweeps mean the sweep itself is broken rather than
-#: unlucky. A transport blip fails one or two; a prompt that can never satisfy its own
-#: validator fails every one, for ever. Ten is comfortably past noise and is reached in
-#: a few hours at the shipped cadence — against the 2215 that went unreported.
+#: How many consecutive failed sweeps mean the sweep itself is broken rather than unlucky
 HEALTH_SWEEP_FAILURE_RUN = 10
 
-#: How recent the newest failure must be for the run to still be happening. The canary
-#: claims the sweep IS SPENDING model calls, which is a statement about now: a run with
-#: nothing in it for two hours has stopped — fixed, disabled, or the daemon is down —
-#: and reporting it alarms on history. Four missed sweeps at the default 30-minute floor.
+#: How recent the newest failure must be for the run to still be happening
 HEALTH_SWEEP_FAILURE_WINDOW_MINUTES = 120
 
 
 def check_health_sweep_produces_judgements(store: ProjectStore) -> Iterator[Violation]:
-    """INV-HEALTH-SWEEP-MUTE — a sweep that never judges anything must not bill silently.
-
-    THIS CHECK IS THE POINT OF ISSUE #216, more than either line of the fix it shipped
-    with. The sweep could never satisfy its own validator and ran 2215 times anyway, for
-    $101.78 and no finding — with no error, no flag and no stuck work order to show for
-    it. A failure mode of "works, costs money, produces nothing" needs a heartbeat rather
-    than a comment, because the other two halves of the fix are exactly the kind an
-    innocent edit undoes with every test still green. §4.1 of docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md.
-
-    Predicate: of the project's last `HEALTH_SWEEP_FAILURE_RUN` sweeps, every one failed,
-    AND the newest of them is inside `HEALTH_SWEEP_FAILURE_WINDOW_MINUTES`. `outcome=
-    'clear'` is a healthy sweep and the common one, so a working project clears this on
-    its first tick and pays a single indexed read for it.
-
-    THE WINDOW IS NOT TIDINESS. Without it this check reported the first deploy of its
-    own fix, five seconds after the daemon booted, on the history the fix was written
-    for — and a sweep that has been SWITCHED OFF would alarm for ever, because with no
-    sweeps running no new row ever arrives to push the old ones out. A run still going
-    is still reported however long ago it started; what ages out is a run with nothing
-    recent in it.
-
-    NOT repairable, and it must not try. The rows are honest — they record what really
-    happened — and the defect is in the prompt or the transport, neither of which is
-    derivable from state. The detail carries the most recent `health_reviews.detail`,
-    which for the #216 shape is the model's reply itself and names the problem outright.
-
-    Silent on a project that has never swept: the sweep ships disabled, and no rows is
-    not a run of failures.
-    """
+    """INV-HEALTH-SWEEP-MUTE — a sweep that never judges anything must not bill silently (#216)"""
     if store.health_sweep_hold() is not None:
-        # The check claims the sweep IS SPENDING model calls right now. During a
-        # usage-limit hold it is spending none.
+        # The check claims the sweep IS SPENDING model calls right now
         return
-    # HELD ROWS ARE FILTERED OUT BEFORE THE LAST TEN ARE TAKEN, not skipped in the loop.
-    # Two consequences, both wanted: ten holds can never trip it, and a hold in the
-    # middle of a genuine failure run does not RESET that run either — a window that
-    # interrupted a broken prompt did not fix the prompt.
+    # HELD ROWS ARE FILTERED OUT BEFORE THE LAST TEN ARE TAKEN, not skipped in the loop
     recent = store.recent_health_reviews(HEALTH_SWEEP_FAILURE_RUN, include_held=False)
     if len(recent) < HEALTH_SWEEP_FAILURE_RUN:
         return
@@ -3790,8 +2134,7 @@ def check_health_sweep_produces_judgements(store: ProjectStore) -> Iterator[Viol
         return
     yield Violation(
         invariant="INV-HEALTH-SWEEP-MUTE",
-        # FAILING, never held: the word "held" is reserved for the usage-limit rows, so
-        # the two are never confused in an inbox line.
+        # FAILING, never held: the word "held" is reserved for the usage-limit rows
         detail=(f"the last {HEALTH_SWEEP_FAILURE_RUN} health sweeps all FAILED (the "
                 f"account's usage window is a hold, not a failure), so the sweep is "
                 f"spending model calls and producing no judgement. Most recent "
@@ -3801,17 +2144,12 @@ def check_health_sweep_produces_judgements(store: ProjectStore) -> Iterator[Viol
     )
 
 
-#: How long the OS's own sweep may produce no judgement before the user is told. Six
-#: missed sweeps at the shipped 30-minute floor: long enough that a transport blip, a
-#: daemon restart or one capped tick cannot trip it, short enough that a sweep switched
-#: off by a bad edit is reported the same working day. Time inside a live usage-limit
-#: hold does not count against it.
+#: How long the OS's own sweep may produce no judgement before the user is told
 OS_HEALTH_SWEEP_DARK_MINUTES = 180
 
 
 def _live_catalog() -> Any:
-    """The registered catalog, or None. `_validation_timeout`'s rule: best-effort, and
-    an invariant must never be the thing that raises."""
+    """The registered catalog, or None"""
     try:
         from .ops import resolve_catalog
 
@@ -3821,16 +2159,7 @@ def _live_catalog() -> Any:
 
 
 def _os_owning_project(store: ProjectStore) -> Any:
-    """This store's `ProjectSpec` if it is the project that runs the OS, else None.
-
-    Derived, NEVER hardcoded: `schedule.os_project` over the live catalog, compared on the
-    RESOLVED PATH rather than on a name, because a store knows its directory and not
-    what the catalog calls it.
-
-    Identity is BY GIT ORIGIN (issue 956). Asked by path containment this check was dead
-    in production, where the running package is in the deployed checkout and no catalog
-    path contains it.
-    """
+    """This store's `ProjectSpec` if it is the project that runs the OS, else None"""
     from . import schedule
 
     catalog = _live_catalog()
@@ -3849,12 +2178,7 @@ def _os_owning_project(store: ProjectStore) -> Any:
 
 
 def _health_hold_seconds(store: ProjectStore, since: float, until: float) -> float:
-    """How much of `[since, until]` the account's usage window was shut for.
-
-    Summed from the `held` rows' `[ts, reopens_at]` intervals — the same active-clock
-    shape the duration alarms use. Overlapping windows are merged so a per-unit hold and
-    the account's own hold are not counted twice.
-    """
+    """How much of `[since, until]` the account's usage window was shut for"""
     spans = []
     for row in store.conn.execute(
             "SELECT ts, reopens_at FROM health_reviews WHERE outcome='held' "
@@ -3873,55 +2197,23 @@ def _health_hold_seconds(store: ProjectStore, since: float, until: float) -> flo
 
 
 def check_os_health_sweep_alive(store: ProjectStore) -> Iterator[Violation]:
-    """INV-OS-HEALTH-SWEEP-DARK — the OS's own health sweep must never be dark.
-
-    USER RULE, 2026-09-28 (kn-7312c7de): the project that runs the OS must ALWAYS have
-    the sweep on and producing judgements. Nothing enforced it, and two things worked
-    against it — `supervisor.health_enabled` ships False, and `jarvis config set` reached
-    both switches like any other key. §4 refuses the write; this is the liveness half,
-    because a catalog edited by hand bypasses `ops` entirely.
-
-    RUNS ONLY ON THE OS-OWNING PROJECT. INV-HEALTH-SWEEP-MUTE answers "is this project's
-    sweep broken" for every project; this answers "is the OS's own sweep alive" for one,
-    and it is deliberately loud where that one says nothing (its docstring's "silent on a
-    project that has never swept" is correct for an ordinary project and is exactly the
-    blind spot here).
-
-    NOT repairable: re-enabling the sweep would be the OS editing the user's catalog, and
-    a failing sweep's cause is not derivable from state. The detail names WHICH of the
-    three causes it is, because they have three different fixes.
-
-    Time inside a usage-limit hold does not count: a sweep that is silent only because
-    the account was is not dark (spec
-    docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §5).
-    """
+    """INV-OS-HEALTH-SWEEP-DARK — the OS's own ENABLED health sweep must never be dark (docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §5)"""
     spec = _os_owning_project(store)
     if spec is None:
         return
     name = spec.name
     supervisor = getattr(spec, "supervisor", None)
-    for key, on in (("supervisor.enabled", getattr(supervisor, "enabled", False)),
-                    ("supervisor.health_enabled",
-                     getattr(supervisor, "health_enabled", False))):
-        if not on:
-            yield Violation(
-                invariant="INV-OS-HEALTH-SWEEP-DARK",
-                detail=(f"the OS's own health sweep is DISABLED ({key}=false) and must "
-                        f"not be — {name} runs the OS itself, and its sweep must always "
-                        f"be on and producing judgements (user rule, 2026-09-28)"),
-                level="critical", context={"project": name, "cause": "disabled",
-                                           "key": key},
-            )
-            return
+    # Off in the catalog is a recorded user choice, not darkness; only an ENABLED sweep can be dark
+    if not (getattr(supervisor, "enabled", False)
+            and getattr(supervisor, "health_enabled", False)):
+        return
 
     now = db.now()
     window = OS_HEALTH_SWEEP_DARK_MINUTES * 60
     judged = store.conn.execute(
         "SELECT ts FROM health_reviews WHERE outcome IN ('clear','findings') "
         "ORDER BY ts DESC, id DESC LIMIT 1").fetchone()
-    # With no judgement ever recorded the clock starts at the window's own edge: the
-    # check then fires as soon as a full window has passed with the account awake, which
-    # is what "enabled but never scheduled" looks like from the outside.
+    # With no judgement ever recorded the clock starts at the window's own edge: the check then fires as...
     since = float(judged["ts"]) if judged else now - window
     dark = (now - since) - _health_hold_seconds(store, since, now)
     if dark < window:
@@ -3949,27 +2241,7 @@ def check_os_health_sweep_alive(store: ProjectStore) -> Iterator[Violation]:
 
 
 def check_stuck_sweep_alive(store: ProjectStore) -> Iterator[Violation]:
-    """INV-STUCK-SWEEP-DARK — the sweep must never be the thing that is stuck. §8.
-
-    AN OS-LEVEL FACT REGISTERED PER PROJECT, and `check_os_health_sweep_alive` above is
-    both the SHAPE this copies (named causes, one `Violation`, `level="critical"`, not
-    repairable) and the REGISTRATION precedent: it too reads a fleet-wide fact and still
-    sits in `INVARIANTS`, short-circuiting on `_os_owning_project`. `OS_INVARIANTS` is
-    run by `jarvis doctor` ALONE, and only `Daemon.check_invariants` writes the
-    `violation_reports` rows `ops.os_status` builds its critical attention items from —
-    so a check registered there can never put an item on the attention list, and a
-    failing or dark sweep left `jarvis status` reading HEALTHY (review round 1). Hence
-    the OS-owning project runs it, exactly one project per tick, and the fleet-wide
-    sweep is reported ONCE rather than once per project.
-
-    Two causes, because they have two different fixes. No `disabled` cause, unlike the OS
-    sweep's: `fleet_health.enabled=false` is a legal choice for a project. No hold discount
-    either — the sweep makes no model call, so a usage window cannot silence it, and a
-    fleet pause is recorded as a RUN with `opened=0` rather than as no run at all.
-
-    Not repairable, for `check_os_health_sweep_alive`'s stated reason: a failing sweep's
-    cause is not derivable from state.
-    """
+    """INV-STUCK-SWEEP-DARK — the sweep must never be the thing that is stuck. §8"""
     from .central_store import CentralStore
     from .daemon import Daemon
 
@@ -3983,8 +2255,7 @@ def check_stuck_sweep_alive(store: ProjectStore) -> Iterator[Violation]:
         run = db.from_json(central.get_state(Daemon.STUCK_RUN_KEY), None)
     finally:
         central.close()
-    # The FLEET number, off `catalog.os` the way `Daemon.stuck_tick` reads `max_per_day`:
-    # one fleet-wide run record cannot be judged by an arbitrary project's answer.
+    # The FLEET number, off `catalog.os` the way `Daemon.stuck_tick` reads `max_per_day`: one fleet-wide...
     window = catalog.os.fleet_health.sweep_dark_minutes * 60
     if run and str(run.get("error") or ""):
         yield Violation(
@@ -3996,9 +2267,7 @@ def check_stuck_sweep_alive(store: ProjectStore) -> Iterator[Violation]:
         )
         return
     if run is None:
-        # NEVER SWEPT is only dark while the OS is UP. A stopped daemon sweeps nothing by
-        # construction and `jarvis status` already says so, so firing here would report a
-        # fresh install as broken. The first tick writes the row.
+        # NEVER SWEPT is only dark while the OS is UP
         from .daemon import daemon_running
 
         if not daemon_running():
@@ -4017,94 +2286,7 @@ def check_stuck_sweep_alive(store: ProjectStore) -> Iterator[Violation]:
 
 
 def check_work_lands(store: ProjectStore) -> Iterator[Violation]:
-    """INV-WORK-LANDED — a completed work order's pull request must have merged.
-
-    THE STANDING ANSWER TO "what has this fleet delivered that nobody merged". The audit
-    behind GitHub issue #232 was a one-off that found six stranded orders across 209, two
-    of them pull requests open for seven weeks carrying ~3,100 lines, and it should not
-    have to be repeated by hand.
-
-    **IT JUDGES THE PULL REQUEST, NOT THE DIFF** — a deliberate narrowing, ruled by the
-    user on 2026-09-18 after this check reported seven completed `jarvis_os` orders as
-    unlanded and five were false positives. `src/jarvis/landing.py`'s docstring carries
-    the evidence and the ruling verbatim; the short version is that the content test it
-    used to run survives a squash merge and does not survive a refactor, so work that
-    merged months ago and was rewritten since read as absent.
-
-    Four states, and only the middle two are violations:
-
-    * merged -> satisfied. No arithmetic. Merged is the answer.
-    * open -> delivered and WAITING ON A MERGE. The remedy says so: this is not stranded
-      work, it is work nobody has merged, and telling the user to "rescue" it would send
-      them looking for something that is sitting in a pull request.
-    * closed unmerged -> delivered and REFUSED. Somebody decided, on GitHub, where the
-      work order could not see it, and the order is still claiming `completed`.
-    * NO PULL REQUEST -> out of scope, silent. See the next paragraph: that is another
-      invariant's question, and this one would answer it wrong.
-
-    **THIS CHECK IS HALF A CHAIN, AND THE OTHER HALF IS INV-PR-RECORDED** (work order
-    `wo-2005a89b`). Read them together or neither of them is safe.
-
-    * INV-PR-RECORDED holds the front: an order that CHANGED CODE may not settle with an
-      empty `pr_url`. It is what makes the column trustworthy, and it is the reason the
-      filter below is allowed to be `if not wo["pr_url"]: continue` — a skip that would
-      otherwise be a silent exemption for exactly the orders this exists for. `pr_url` is
-      NULL on the live `wo-5eedc84d`, which merged pull request #42, and that order is
-      INV-PR-RECORDED's to report, not this one's.
-    * THIS check holds the back: once the order is completed, the pull request it recorded
-      must have merged.
-    * The `wo-cd73c537` shape — a `pr_url` naming a MERGED #81 while #116 carries the rest
-      of the work and is open — reads as `landed` here and is silent. Said plainly rather
-      than worked around: this check judges the pull request the order RECORDED. A
-      `pr_url` that names the wrong pull request is a recording defect, which is the front
-      half of the chain, per the user's ruling of 2026-09-18: *"If there is any code
-      change made in an order, then pr_url must not be empty, and the invariant should
-      rely on that pr_url to check the change lands on main once the order gets
-      completed."*
-
-    Scoped to `completed`, and only that. `waiting_pr_merge` is a merge queue the poll
-    already watches; `cancelled` and `failed` never claimed the work was done. `completed`
-    is the status that makes the claim, which is the one worth checking. HIDDEN ORDERS
-    ARE INCLUDED, on `poll_pull_requests`' reasoning: hiding drops a record from listings,
-    it does not mean the record may go on saying something untrue.
-
-    **IT NEVER ASKS GITHUB.** That is what keeps it cheap enough for the daemon's sweep —
-    it is a pure timeline read with no subprocess at all. `Daemon.refresh_landings` makes
-    the round trip, reading the order's own `pr_url`, and writes what GitHub said to the
-    timeline as a `landing_seen` event; this reads the latest one.
-
-    **AN ORDER NOTHING HAS READ YET IS SILENT ABOUT ITS PULL REQUEST, AND SAYS SO OUT
-    LOUD** — `INV-LANDING-AUDIT-FRESH`, the second violation this function yields, and it
-    is here because review round 1 caught the alternative being a lie. The refresh is the
-    daemon's, so this check has no data until the first sweep; without that second
-    violation `jarvis doctor` printed "✓ all OS invariants hold" on a project with
-    genuinely unmerged work, which is an audit with NO DATA reading identically to a clean
-    bill of health. That is the single worst thing a checker can do, and it is worse than
-    the false positives this rewrite removed, because nothing shows it happening.
-
-    So: one project-level line, no `wo_id`, naming how many orders in the population have
-    never been read or were last read more than `landing.FRESH_FOR_SECONDS` ago. It shrinks
-    as the sweep fills in and disappears in steady state; it stands for ever on a project
-    whose daemon is not running, which is exactly what is true. The freshness window is
-    `landing`'s and not the daemon's precisely so the two halves cannot disagree — a
-    second copy of that number would let the audit go quiet at the moment it stopped
-    knowing anything.
-
-    `repair=False` changes nothing about either answer: there is no write on this path.
-
-    **AN ORDER THE USER CLOSED BY HAND IS EXCLUDED.** `jarvis wo done` over unlanded
-    work is the one landing that records instead of refusing (`ops.mark_done`), and its
-    `work_unlanded` event carries `closed_by: marked_done`. That event IS the decision
-    this sweep asks for, so it excuses the order exactly as `abandoned` does — otherwise
-    the sweep names it every hour with a remedy telling the user to run a different
-    command on an order they already closed, which is how a checker gets switched off.
-    Both exclusions lapse the same way: the episode arithmetic in `work_unlanded_open`
-    and `work_abandoned` retires a decision as soon as the work is delivered again.
-
-    Not repairable, and it must not try. What to do with an unmerged pull request — merge
-    it, re-open it, drop it — is exactly the decision `--abandon` exists to record, and
-    deriving one is not the OS's to make.
-    """
+    """INV-WORK-LANDED — a completed work order's pull request must have merged (#232)"""
     from . import landing
 
     population = 0
@@ -4119,21 +2301,16 @@ def check_work_lands(store: ProjectStore) -> Iterator[Violation]:
         population += 1
         seen = store.events_of_kind(wo_id, "landing_seen")
         if not seen or db.now() - float(seen[-1]["ts"] or 0.0) >= landing.FRESH_FOR_SECONDS:
-            # No current answer about this pull request. COUNTED, never guessed at, and
-            # reported once below rather than per order — see the docstring.
+            # No current answer about this pull request
             unchecked += 1
             continue
         found = landing.from_record(wo_id, db.from_json(seen[-1]["payload"], {}))
         if not found.unsettled:
             continue
-        # The two remedies differ in their FIRST clause, because the two states differ in
-        # what the reader has to go and do: an open pull request is one click, a closed
-        # one is a decision somebody already made and has to be reversed or ratified.
+        # The two remedies differ in their FIRST clause
         remedy = ("Merge it" if found.verdict == landing.AWAITING_MERGE
                   else "Re-open and merge it")
-        # BUILT ONCE and assigned to both: it is the detail AND the owed decision, and a
-        # second copy would be a second sentence to keep free of elapsed time. Spec
-        # docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md §6
+        # BUILT ONCE and assigned to both: it is the detail AND the owed decision (docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md §6)
         sentence = (f"completed, but its pull request has not merged: {found.detail}. "
                     f"{remedy}, or record the decision to drop it with `jarvis wo "
                     f"finish {wo_id} --summary \"...\" --abandon \"<why>\"`.")
@@ -4162,54 +2339,7 @@ def check_work_lands(store: ProjectStore) -> Iterator[Violation]:
 
 
 def check_pull_request_recorded(store: ProjectStore) -> Iterator[Violation]:
-    """INV-PR-RECORDED — a settled work order that wrote code must carry its pull request.
-
-    THE GUARANTEE INV-WORK-LANDED RESTS ON. That check judges the recorded pull request
-    and nothing else, which is only safe if something else holds `pr_url` populated for
-    every order that produced code; this is that something. The two read as a chain: this
-    one says the identifier exists, that one says the work behind it reached the default
-    branch. Ruled by the user on 2026-09-18 — "if there is any code change made in an
-    order, then pr_url must not be empty, and the invariant should rely on that pr_url"
-    (docs/superpowers/specs/2026-09-18-an-order-that-wrote-code-carries-its-pull-request.md).
-
-    **THE POPULATION COMES OFF THE TIMELINE, NEVER OFF THE REPOSITORY** (Neo question
-    429). Every settlement route now writes what the order authored onto the event it
-    already writes — `ops.finish`, `ops.park_unlanded`, `finish --abandon`,
-    `Daemon._close_feature_manager` — because `landing.authored` is exact only while the
-    worktree exists, and a worktree is gone long before anyone audits. So this is a pure
-    SQL-and-JSON read, cheap enough for `INVARIANTS` rather than `SLOW_INVARIANTS`, and
-    it never asks git or `gh` anything.
-
-    The price is that it is STRUCTURALLY SILENT on anything settled before it shipped:
-    `wo-5a6b2d6d` — a planner that completed over a WIP commit on `rescue/wo-5a6b2d6d`
-    with no pull request, ever — carries no such record and is reported by nothing. The
-    user accepted that explicitly; those orders are being closed by hand, and this exists
-    to stop the next one. `landing.authored_in` keeps "nobody looked" distinct from
-    "produced nothing" so the silence is a known gap rather than an exoneration.
-
-    Three exemptions, each a decision somebody WROTE DOWN, and all three lapse the same
-    way — `work_abandoned`'s episode arithmetic retires a decision the moment the work is
-    delivered again:
-
-    * a recorded `pr_url`, which is the whole point;
-    * `finish --abandon`, the worker saying this is deliberately not being landed;
-    * `jarvis wo done`, whose `work_unlanded {closed_by: marked_done}` is the user's own
-      decision and the documented exit for a pull request that will never merge (Neo
-      question 430; `ops.mark_done` records rather than refusing, and always has).
-
-    **THE STALE `pr_url` IS OUT OF SCOPE**, and deliberately: `wo-cd73c537` records #81,
-    which merged, while #116 carries the rest of its work and is open. This predicate
-    asks whether an identifier is PRESENT, which is a fact the record holds; asking
-    whether it is CURRENT is a `gh` round trip per settled order and belongs with the
-    daemon polls that already have a network — and NEITHER OF THEM DOES IT TODAY:
-    `Daemon.poll_pull_requests` asks about the pull request an order is parked behind,
-    `Daemon.refresh_landings` about the one it recorded, and both read `pr_url` rather
-    than looking for a branch's live pull request. Filed as `bl-2aabaee8`.
-
-    Not repairable. An empty `pr_url` has two resolutions — find the pull request that
-    exists, or record that none ever will — and nothing in the database distinguishes
-    them. Discovery is what closes the gap once it can write back, and it is the daemon's.
-    """
+    """INV-PR-RECORDED — a settled work order that wrote code must carry its pull request (docs/superpowers/specs/2026-09-18-an-order-that-wrote-code-carries-its-pull-request.md)"""
     from . import landing
 
     for wo in store.list_work_orders(statuses=("completed",), include_hidden=True):
@@ -4239,37 +2369,7 @@ def check_pull_request_recorded(store: ProjectStore) -> Iterator[Violation]:
 
 
 def check_manager_slots(store: ProjectStore) -> Iterator[Violation]:
-    """INV-MANAGER-SLOTS — a project manager order must not spend a concurrency slot.
-
-    `ProjectStore.count_active` is what `Daemon.dispatch_pending` compares against
-    `max_concurrent`, and it excludes `kind='manager'` on purpose: a manager runs a turn
-    every time its feature reports and is idle in between, for the whole life of that
-    feature, because coordinating is what it is FOR. Counted, two features in flight
-    would spend a `max_concurrent: 2` project's whole budget on bookkeeping and the
-    project would stop claiming work altogether.
-
-    That failure is why this check exists rather than a comment. It degrades into "the
-    project has gone quiet", which nobody reports as a bug and no other surface shows —
-    there is no error, no flag and no stuck work order, just a queue that stops moving.
-    Written as a canary for the same reason `check_gate_canaries` is: the protection can
-    be regressed by an innocent-looking edit years from now, so it is re-derived from live
-    state instead of trusted.
-
-    Predicate: `count_active()` equals the number of work orders in SLOT_STATUSES whose
-    kind is not `manager` — the cap's set since issue #134, NOT `ACTIVE_STATUSES`. Both
-    sides are computed here, one through the method under test and one directly in SQL,
-    so the check cannot pass by sharing the bug — which is also why it does not count
-    `list_work_orders`, whose `limit` would quietly under-report on exactly the busy
-    project where a lost slot hurts most.
-
-    NOT repairable, and it must not try: a code regression is not derivable from state,
-    and there is nothing in the database to fix — writing to rows here would corrupt
-    healthy data in response to a bug in a query. The detail names `count_active` so
-    whoever reads `jarvis doctor` knows where to look.
-
-    Silent on healthy state, including the overwhelmingly common state of no manager at
-    all: with none, both sides count the same rows and the difference is zero.
-    """
+    """INV-MANAGER-SLOTS — a project manager order must not spend a concurrency slot (#134)"""
     counted = store.count_active()
     marks = ",".join("?" for _ in SLOT_STATUSES)
     row = store.conn.execute(
@@ -4297,23 +2397,11 @@ def check_manager_slots(store: ProjectStore) -> Iterator[Violation]:
     )
 
 
-# -- configuration checks (catalog, not database state) ------------------------------
+# -- configuration checks (catalog, not database state)
 
 
 def check_gate_deny_conflict(spec: Any) -> Iterator[Violation]:
-    """INV-GATE-DENY-CONFLICT — an enabled gate must not also be denied outright.
-
-    A gate and a `deny` rule for the same command are not belt-and-braces, they are a
-    contradiction that resolves against the gate. Claude Code evaluates deny rules
-    regardless of what a PreToolUse hook returned, so the approved retry is blocked too
-    — and every surface reports success along the way: the request is filed, Neo reviews
-    it, Neo approves it, the timeline says `gate_opened`. Only the command silently never
-    runs, which reads to the user as the worker being incompetent rather than the
-    catalog being wrong.
-
-    Not repairable: the fix is an edit to the user's catalog, which is theirs to make.
-    Reported with the exact rule to delete.
-    """
+    """INV-GATE-DENY-CONFLICT — an enabled gate must not also be denied outright"""
     from .gates import deny_conflicts
 
     if not spec.gates:
@@ -4335,12 +2423,7 @@ def check_gate_deny_conflict(spec: Any) -> Iterator[Violation]:
 
 
 def check_catalog(catalog: Any, project: str | None = None) -> list[Violation]:
-    """Config-level post-conditions over the catalog itself.
-
-    Separate from the store checks below because the subject is different: these predict
-    that the OS *cannot* do something it has been configured to do, which no amount of
-    database state will reveal.
-    """
+    """Config-level post-conditions over the catalog itself"""
     found: list[Violation] = []
     for spec in catalog.projects:
         if project and spec.name != project:
@@ -4349,49 +2432,14 @@ def check_catalog(catalog: Any, project: str | None = None) -> list[Violation]:
     return found
 
 
-# -- OS-level checks ($JARVIS_HOME state, not any project's database) -----------------
+# -- OS-level checks ($JARVIS_HOME state, not any project's database)
 
-#: How long a pending-release marker may sit in flight before it is a fault. The whole
-#: staged flow is minutes end to end (worker settles → restart → boot verification), so
-#: an hour means a hand-off was dropped: the daemon never ran, the restart never landed,
-#: or the boot check never fired.
+#: How long a pending-release marker may sit in flight before it is a fault
 RELEASE_MARKER_STALE_AFTER = 3600.0
 
 
 def check_gate_canaries() -> Iterator[Violation]:
-    """INV-GATE-CANARY — every command that must gate still gates.
-
-    The gate recognisers are no longer constants; they are rows the OS writes itself when
-    a reviewer dismisses a false positive (see gate_rules.py). That is the point — it is
-    how the classifier stops re-asking a question already answered — and it is also the
-    one change that could quietly disarm a gate. A learned exemption is canary-tested
-    before it is admitted, but "tested once, at birth" is not the property worth having:
-    rules accumulate, a later one can interact with an earlier one, and a user may retract
-    a recogniser without seeing what it was holding up.
-
-    So the check is re-derived from the LIVE table, and it asks the only question that
-    matters about a self-modifying classifier: does a real `shipit`, a real `gh pr merge`,
-    a real `systemctl restart` still get stopped? Failure here means something can now
-    ship unreviewed, which is the failure this whole subsystem exists to prevent, and it
-    is invisible from every other surface — nothing looks wrong when a gate simply never
-    fires.
-
-    WHERE IT RUNS, precisely, because the answer is narrower than "continuously" and the
-    difference matters to anyone relying on it. This is an `OS_INVARIANTS` member, and
-    `check_os()` is called by `jarvis doctor` — NOT by the daemon's reconcile tick, which
-    runs the per-project `INVARIANTS` only. So this is a periodic audit the user (or a
-    cron) triggers, not a live guard.
-
-    That is sufficient because it is the third line of defence, not the first two. A rule
-    is canary-tested before it is ever admitted (`gate_rules.propose_exemption`), and
-    `ops.retract_gate_rule` re-runs the whole set the moment a recogniser is retracted and
-    hands the failures straight back to whoever retracted it. What is left for this check
-    is slow drift — rules accumulating until two of them interact — which is exactly the
-    kind of fault an audit catches and a per-tick check would only find sooner.
-
-    Not repairable automatically: which rule to retract is a judgement about what the user
-    meant, and the wrong choice re-breaks the thing the exemption was fixing.
-    """
+    """INV-GATE-CANARY — every command that must gate still gates"""
     from .central_store import CentralStore
     from .gate_rules import RuleSet
 
@@ -4414,24 +2462,7 @@ def check_gate_canaries() -> Iterator[Violation]:
 
 
 def check_release_marker(now: float | None = None) -> list[Violation]:
-    """INV-RELEASE-MARKER-STALE — a staged release must not sit unapplied for an hour.
-
-    The marker (`$JARVIS_HOME/run/pending_release.json`) is a hand-off between the
-    deploy script's `--stage` mode and the daemon (src/jarvis/release.py): `staged`
-    waits for the shipping worker to settle, `restarting` waits for the new daemon to
-    verify on boot. Both are meant to clear within minutes, so either state an hour on
-    is a release the fleet believes is in flight and nothing is advancing.
-
-    `failed_verification` is deliberately NOT flagged: that state already raised
-    attention on the work order and an inbox warning when it was written, and it stays
-    on disk until a human resolves it — reporting it hourly would say the same thing
-    twice. An unreadable marker IS flagged, whatever it says: no state can clear it.
-
-    OS-level, not per-project (it reads $JARVIS_HOME, not a project store), so it is
-    not in `INVARIANTS`; `ops.run_doctor` calls it directly.
-
-    Not repairable: which half of the hand-off died is not derivable from the file.
-    """
+    """INV-RELEASE-MARKER-STALE — a staged release must not sit unapplied for an hour"""
     from . import release
 
     marker = release.read_marker()
@@ -4461,31 +2492,11 @@ def check_release_marker(now: float | None = None) -> list[Violation]:
     )]
 
 
-# -- OS-level invariants --------------------------------------------------------------
-#
-# The project checks above are predicates over one project's store. These are predicates
-# over the OS itself, so they take no store and run once per `jarvis doctor`, not once
-# per project. They are never repairable: nothing here has a resolution derivable from
-# state — a crashed dashboard needs a person.
-#
-# `check_release_marker` above is the same class of check but predates this registry and
-# is still called directly by `ops.run_doctor`; it takes a `now` override the registry
-# has no way to pass.
+# -- OS-level invariants
 
 
 def check_ui_healthy() -> Iterator[Violation]:
-    """INV-UI-HEALTHY — the OS's own dashboard must not be throwing 500s.
-
-    The dashboard used to fail in a blind spot: uvicorn printed the traceback to the
-    systemd journal and nothing else recorded it, so an HTTP 500 on the work-order page
-    was invisible to `jarvis status`, to `jarvis doctor`, to the inbox and to every
-    agent that can read `$JARVIS_HOME` but not `journalctl`. A user who was not already
-    tailing a log had no way to learn the web UI was broken. `uilog` now keeps the
-    errors next to the databases; this is the check that reads them back.
-
-    Not repairable: reported only. The window is `uilog.ERROR_WINDOW_SECONDS`, so this
-    clears itself once the dashboard has been quiet for a day.
-    """
+    """INV-UI-HEALTHY — the OS's own dashboard must not be throwing 500s"""
     from . import uilog
 
     recent, total = uilog.recent_errors()
@@ -4503,18 +2514,7 @@ def check_ui_healthy() -> Iterator[Violation]:
 
 
 def check_ui_wedged() -> Iterator[Violation]:
-    """INV-UI-WEDGED — the dashboard has stopped serving and said so about itself.
-
-    The other half of `check_ui_healthy`, and the half that was missing: that one reads
-    `[ERROR]` entries, and a WEDGE raises no exception at all — every routed page went
-    silent while `systemctl` reported `active (running)` and `ui.log` stayed empty, so
-    silence was indistinguishable from health. §5 of
-    docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md.
-
-    Reads the stamp the UI process writes through `uilog`, never by parsing `ui.log`.
-    Never repairable, like every member of `OS_INVARIANTS`: `jarvis doctor` reports and
-    the daemon heals.
-    """
+    """INV-UI-WEDGED — the dashboard has stopped serving and said so about itself (docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md)"""
     from . import release, uilog
 
     stamp = uilog.read_wedge()
@@ -4525,9 +2525,7 @@ def check_ui_wedged() -> Iterator[Violation]:
         since = float(stamp.get("since") or 0)
     except (TypeError, ValueError):
         return
-    # Window-based, exactly as `check_ui_healthy` is and for its reason: the restarted
-    # dashboard is a new process and never comes back to delete the stamp, so a report
-    # that did not expire would say "wedged" for ever after one wedge.
+    # Window-based, exactly as `check_ui_healthy` is and for its reason: the restarted dashboard is a new...
     if not last or time.time() - last > uilog.ERROR_WINDOW_SECONDS:
         return
     age = max(0.0, time.time() - since) if since else 0.0
@@ -4550,7 +2548,7 @@ def check_ui_wedged() -> Iterator[Violation]:
 
 
 def _ui_restart_counts() -> tuple[int, int, bool]:
-    """Self-restarts inside the rolling 24h, the cap, and whether it is spent."""
+    """Self-restarts inside the rolling 24h, the cap, and whether it is spent"""
     from . import db, ops, uilog
     from .central_store import CentralStore
 
@@ -4575,23 +2573,7 @@ def _ui_restart_counts() -> tuple[int, int, bool]:
 
 
 def check_config_drift() -> Iterator[Violation]:
-    """INV-CONFIG-DRIFT — the catalog on disk must be the version the ledger calls head.
-
-    The ledger is only evidence if it describes the file the fleet is actually running,
-    and `jarvis config` is not the only way that file changes: a hand edit, an `scp`, a
-    restore of a backup copy all move it behind the record's back. Content addressing
-    makes the check one hash (spec §3, §6).
-
-    A `jarvis doctor` check ONLY — an `OS_INVARIANTS` member, and `check_os()`'s single
-    caller is `ops.run_doctor`. Deliberately not on the daemon's reconcile tick: a hand
-    edit is legitimate, `Daemon.reload_catalog` has already applied it, and a fleet that
-    filed an inbox item every time someone opened their editor would teach the user to
-    ignore the one that matters.
-
-    Not repairable, and the two repairs are opposites: `adopt` keeps the file and moves
-    the record, `restore` keeps the record and moves the file. Nothing in the state says
-    which of them the user meant.
-    """
+    """INV-CONFIG-DRIFT — the catalog on disk must be the version the ledger calls head"""
     from . import config_version
     from .central_store import CentralStore
 
@@ -4608,9 +2590,7 @@ def check_config_drift() -> Iterator[Violation]:
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return  # unreadable or not JSON is a louder problem, and not this one's
-    # The DOCUMENTS, not the ids: a release-rebase row is addressed by document AND
-    # build (§6.1), so an id comparison would report permanent drift after an upgrade
-    # that moved a default — on a file nobody has touched.
+    # The DOCUMENTS, not the ids: a release-rebase row is addressed by document AND build (§6.1)
     if config_version.canonicalise(document) == config_version.canonicalise(
             head["document"]):
         return
@@ -4627,31 +2607,12 @@ def check_config_drift() -> Iterator[Violation]:
 
 
 def check_service_path() -> Iterator[Violation]:
-    """INV-SERVICE-PATH — the installed units' PATH must reach `gh`.
-
-    A unit's `Environment=PATH=` is the daemon's PATH and therefore every worker's
-    (`claude_cli.spawn_turn` copies `os.environ`), so a `gh` missing from it means
-    `gh pr create` dies at the end of a work order, `jarvis bug report` fails fleet-wide
-    and PR-merge polling is silently off — issues #41 and #90.
-
-    Those were fixed in `scripts/install_prod_service.sh`, and the fix then sat on disk
-    unapplied for a release and a half, because installing the units is a one-time
-    manual step and nothing ever compared what the script renders with what is
-    installed. This is that comparison, narrowed to the part that has actually broken.
-
-    Reads the FILE, not `systemctl show`: what is on disk is what the next start uses.
-    `bugreport.heal_path` repairs the running process, so the live daemon can be healthy
-    while the unit that starts it is not — checking `os.environ` would report nothing.
-
-    A `jarvis doctor` check only (see `check_config_drift` on why `OS_INVARIANTS` stays
-    off the reconcile tick). Not repairable: rewriting a systemd unit and reloading the
-    manager is a privileged action, not something a read-only check may do.
-    """
+    """INV-SERVICE-PATH — the installed units' PATH must reach `gh` (#41)"""
     from . import bugreport, release
 
     gh = bugreport.gh_bin()
     if os.sep not in gh:
-        return  # `gh` is nowhere on this machine: a real problem, but not this one's,
+        return  # `gh` is nowhere on this machine: a real problem, but not this one's
                 # and `bugreport.gh_missing_message` already explains that one
     gh_dir = str(Path(gh).parent)
     stale = [unit for unit in (release.DAEMON_UNIT, release.UI_UNIT)
@@ -4673,29 +2634,7 @@ def check_service_path() -> Iterator[Violation]:
 
 
 def check_production_clean() -> Iterator[Violation]:
-    """INV-PROD-CLEAN — the production checkout must be byte-identical to its tag.
-
-    "Reproduce in prod, fix it in dev, ship it" is only trustworthy while prod is
-    exactly what the tag says. Drift there is invisible: nothing errors, `jarvis
-    --version` merely gains a `-dirty` suffix, and the next deploy's `git checkout -f`
-    erases the evidence. Issue #202 went unnoticed for nine releases because the only
-    symptom was a version string nobody read.
-
-    Reports tracked modifications only (`-uno`): untracked files are not drift — `.venv/`
-    and `.jarvis/` live in that checkout by design, and the deploy never removed them.
-    No exemption list, unlike `scripts/shipit.sh`'s clean-tree precondition: the OS's
-    managed-artifact writes land in the DEV checkout registered in the catalog, never in
-    the production one, so anything modified here is genuinely unexplained.
-
-    The ref the remedy names comes from git (`release.production_status`), never from the
-    checkout's `pyproject.toml` — that file is one of the things drift can touch, and a
-    remedy built from a drifted version names a tag nobody cut.
-
-    A `jarvis doctor` check only (see `check_config_drift` on why `OS_INVARIANTS` stays
-    off the reconcile tick). Not repairable: discarding files in a checkout is
-    destructive, and the drift is the one thing worth looking at before it is thrown
-    away.
-    """
+    """INV-PROD-CLEAN — the production checkout must be byte-identical to its tag (#202)"""
     from . import release
     from .paths import production_code_dir
 
@@ -4733,26 +2672,7 @@ def check_production_clean() -> Iterator[Violation]:
 
 
 def check_prod_cli() -> Iterator[Violation]:
-    """INV-PROD-CLI — the `jarvis` a human types must mean production.
-
-    Issue 757. `JARVIS_HOME`, `PRODUCTION_CODE` and `JARVIS_ENV` live only in the two
-    systemd units, so they reach the daemon and every worker it spawns and reach nothing
-    typed in a shell: `jarvis` is command-not-found, and the obvious fallback — the
-    deployed venv's binary by full path — runs production CODE against `~/.jarvis`, the
-    DEV instance's state, with no error and with the dashboard badge saying `production`.
-    `scripts/install_prod_cli.sh` installs a wrapper carrying those three exports; this
-    is the third member of the family `check_service_path` and `check_production_clean`
-    started, watching an install step a human runs once and nothing ever compares.
-
-    Reads the FILE, not `os.environ`: a session that HAS the variables is not the session
-    that is broken. Keys on the MACHINE's deployment, not `paths.deployment_env()` —
-    the subject is the interactive shell, which is neither instance, so `jarvis doctor`
-    run from the dev checkout on a host that also runs production does report, and must.
-
-    A `jarvis doctor` check only (see `check_config_drift` on why `OS_INVARIANTS` stays
-    off the reconcile tick). Not repairable: writing an executable onto the user's PATH
-    is an install action, not a derivation a read-only check may perform.
-    """
+    """INV-PROD-CLI — the `jarvis` a human types must mean production"""
     from . import release
     from .paths import production_code_dir
 
@@ -4781,8 +2701,7 @@ def check_prod_cli() -> Iterator[Violation]:
                "expected_target": expected_target, "expected_home": expected_home,
                "generated": facts["generated"]}
     if not facts["generated"]:
-        # Most likely a dev install pointing at ~/.jarvis — the defect's second half. The
-        # detail says it was not generated here, so a deliberate install can be kept.
+        # Most likely a dev install pointing at ~/.jarvis — the defect's second half
         yield Violation(
             invariant="INV-PROD-CLI",
             detail=(f"{wrapper} is a `jarvis` this OS did not generate (no "
@@ -4805,32 +2724,11 @@ def check_prod_cli() -> Iterator[Violation]:
         )
 
 
-# -- cache health ----------------------------------------------------------------------
-#
-# Two post-conditions on the fleet's cache configuration, from findings 2 and 4 of
-# docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md. Both are OS-level
-# and not per-project: each decides something there is exactly one of, and a per-project
-# copy would report one fleet decision once per project.
-#
-# NEITHER WALKS A TRANSCRIPT. They read `bill.cache_writes_since`, which is an indexed
-# query and a JSON parse per sealed order — the objection finding 2 raised against doing
-# this at all was the cost of the scan, and on this machine a full walk is ~5 minutes
-# over 4,642 transcripts. The price is that both see only bills sealed at
-# `bill.PAYLOAD_VERSION` 3 or later, which each violation says out loud.
+# -- cache health
 
 
 def _cache_health() -> tuple[Any, Any] | None:
-    """The fleet's cache-write cohort, and the config that judges it. None if no catalog.
-
-    Summed across every active project, because both readers are asking about the fleet.
-    A project whose path has gone is skipped rather than reported: that is
-    `ops.run_doctor`'s own finding to make, and it makes it per project.
-
-    Recomputed by each check rather than shared between them. Two indexed queries per
-    project per `jarvis doctor` run is not worth a memo that outlives the run it was
-    taken in — the whole point of a post-condition is that it reads the state as it
-    currently is.
-    """
+    """The fleet's cache-write cohort, and the config that judges it"""
     from . import bill
     from .central_store import CentralStore
     from .ops import resolve_catalog
@@ -4859,23 +2757,13 @@ def _cache_health() -> tuple[Any, Any] | None:
 
 
 def _thin_cohort(cfg: Any, writes: Any) -> bool:
-    """THE ANSWER TO "it cries wolf on a quiet day", and it is a silence, not a caveat.
-
-    Below either floor both checks yield nothing at all rather than a hedged finding: a
-    fleet that settled three orders yesterday HAS a ratio, and reporting it with a note
-    about the volume still puts a number in front of a reader who will act on it. The
-    two floors answer different questions — too few orders is one order's shape wearing
-    the fleet's name, too few boundaries is one 300k write's — so either alone lets the
-    other case through (`catalog.DEFAULT_CACHE_HEALTH_MIN_ORDERS`).
-    """
+    """THE ANSWER TO "it cries wolf on a quiet day", and it is a silence, not a caveat"""
     return (writes.orders < cfg.cache_health_min_orders
             or writes.boundaries < cfg.cache_health_min_boundaries)
 
 
 def _cohort_note(cfg: Any, writes: Any) -> str:
-    """What was actually measured. Said on both violations, because the number they
-    report is over Jarvis's own worker sessions and the command they send the reader to
-    is over every transcript on the machine — two populations, one decision."""
+    """What was actually measured"""
     from . import bill
 
     skipped = ""
@@ -4892,26 +2780,7 @@ def _cohort_note(cfg: Any, writes: Any) -> str:
 
 
 def check_cache_ttl_trigger() -> Iterator[Violation]:
-    """INV-CACHE-TTL-TRIGGER — the 1-hour cache write has started paying, and nobody
-    would have noticed.
-
-    Finding 2 kept the 5-minute write and its action was "re-measure monthly"; its own
-    stated con was that the trigger needs a person to remember, and for two weeks nobody
-    did. This is the reminder, and it is a post-condition rather than a reminder because
-    the crossing is a fact about the fleet's own bill.
-
-    THE COMPARISON IS THE ENTIRE HAZARD OF THIS CHECK. `usage.TTL_BREAK_EVEN` is a share
-    of ALL CACHE WRITES, because the 1-hour premium is charged on every written token.
-    The TTL's share of the RE-WRITE TAX is a different ratio over a much smaller
-    denominator, it runs at about double, and comparing THAT against 39.5% says "switch
-    now" when the answer is "keep the 5-minute write" — the error PR #160's own draft
-    made (kn-1449447a (4)). `bill.CacheWrites.ttl_share_of_tax` exists only to be printed
-    beside the deciding ratio here, never to be compared with anything, and
-    `tests/test_cache_health.py` pins that a cohort straddling the two stays quiet.
-
-    Reports rather than decides: switching the TTL is a fleet-wide config change and
-    `scripts/cache_ttl_cohort.py` is what prices it against the wider population.
-    """
+    """INV-CACHE-TTL-TRIGGER — the 1-hour cache write has started paying, and nobody would have noticed (#160)"""
     from . import usage as usage_mod
 
     health = _cache_health()
@@ -4946,19 +2815,7 @@ def check_cache_ttl_trigger() -> Iterator[Violation]:
 
 
 def _prefix_witness(cfg: Any, limit: int = 200) -> str:
-    """Which of the suspects the SessionStart hook actually watched move — "" if none.
-
-    `hooks.note_prefix` fingerprints the inputs to the prompt prefix once per turn and
-    records a `prefix_drift` event when one moves. It cannot see a cache boundary, so it
-    never adjudicates — but this check has the opposite problem: it knows the prefix got
-    worse and has only the suspect list below to offer about WHY. Reading the hook's
-    events here is what turns "check these three things" into "the Claude Code version
-    changed on 12 Sep", and it is the only place the two signals meet.
-
-    Empty rather than hedged when it saw nothing, so the suspect list it narrows is
-    printed either way: the hook is young, most of the fleet's settled orders predate it,
-    and an absence here is not evidence that nothing moved. One indexed query per project.
-    """
+    """Which of the suspects the SessionStart hook actually watched move — "" if none"""
     from collections import Counter
 
     from . import hooks, timeline
@@ -4993,9 +2850,7 @@ def _prefix_witness(cfg: Any, limit: int = 200) -> str:
                 seen[name] += 1
                 latest[name] = max(latest.get(name, 0.0), event["ts"])
 
-    # A dead ingredient is reported even when nothing moved, and BEFORE the movers: the
-    # reader's next step turns on which suspects were actually being watched, and the
-    # suspect list below would otherwise be read as four checks when it was three.
+    # A dead ingredient is reported even when nothing moved
     dark = ""
     if blind:
         unwatched = ", ".join(sorted(timeline.PREFIX_INGREDIENT_LABEL.get(name, name)
@@ -5019,8 +2874,7 @@ def _prefix_witness(cfg: Any, limit: int = 200) -> str:
 
 
 def _date(ts: float) -> str:
-    """"12 Sep", in local wall-clock for the reason `clock` gives at length: the reader is
-    at this machine, and a time they have to convert is a time they will misread."""
+    """"12 Sep", in local wall-clock for the reason `clock` gives at length: the reader is at this..."""
     return time.strftime("%d %b", time.localtime(ts))
 
 
@@ -5090,25 +2944,7 @@ def check_prefix_stable() -> Iterator[Violation]:
 
 
 def check_os_identity() -> Iterator[Violation]:
-    """INV-OS-IDENTITY — the OS's own project must be identifiable.
-
-    Issue 956: `schedule.os_project` returning None makes the three release guards, the
-    health-sweep invariant and the config refusal all INERT, and inert is invisible —
-    production filed six release orders for fixes it was already running before anyone
-    looked. Every one of those callers is right to do nothing on None, so None is the
-    thing that has to be reported rather than acted on.
-
-    KEYED ON A CANDIDATE EXISTING, never on None alone: a pip-installed OS driving
-    projects that are not it has no candidate and no identity, and that deployment is
-    correct. What fires is a catalog that HOLDS a checkout of this repository while
-    identity still resolves to nothing, and AMBIGUITY is the only way that happens: two
-    or more projects on this code's origin. That is the complete set — a single candidate
-    always resolves, and a path whose origin cannot be read is never a candidate, since
-    `os_candidates` keeps only paths whose origin EQUALS this code's.
-
-    NOT repairable: which of two checkouts of this repository is the OS is the user's to
-    say, by removing one from the catalog.
-    """
+    """INV-OS-IDENTITY — the OS's own project must be identifiable"""
     from . import schedule
 
     catalog = _live_catalog()
@@ -5132,14 +2968,7 @@ def check_os_identity() -> Iterator[Violation]:
 
 
 def check_usage_meter_stale() -> Iterator[Violation]:
-    """INV-USAGE-METER-STALE — the account's usage meter has not been readable for N
-    minutes.
-
-    Account-wide, so OS-level and not per project. DERIVED FROM THE ROWS and nothing
-    else — the newest sample and the length of the trailing run of gap rows — so it cannot
-    go stale against an `os_state` key anyone forgot to clear. §8 of
-    docs/superpowers/specs/2026-10-08-usage-meter-samples-and-outside-spend.md.
-    """
+    """INV-USAGE-METER-STALE — the account's usage meter has not been readable for N minutes (docs/superpowers/specs/2026-10-08-usage-meter-samples-and-outside-spend.md)"""
     from . import usage_meter
     from .catalog import CostConfig
     from .central_store import CentralStore
@@ -5194,7 +3023,7 @@ OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
 
 
 def check_os() -> list[Violation]:
-    """Run the OS-level invariants. Read-only by construction."""
+    """Run the OS-level invariants"""
     found: list[Violation] = []
     for check in OS_INVARIANTS:
         try:
@@ -5208,35 +3037,14 @@ def check_os() -> list[Violation]:
 
 
 def check_schedule_progresses(store: ProjectStore) -> Iterator[Violation]:
-    """INV-SCHEDULE-HELD — a recurring job that has wanted to fire for days.
-
-    The scheduler holds SILENTLY by design: a job whose previous order has not settled
-    does not fire, does not queue, and does not flag anything, because a stack of
-    identical daily orders is the alarm nobody reads (`schedule.decide`). The cost of
-    that choice is that a scheduler which has quietly stopped looks exactly like one that
-    is politely waiting, and the difference is invisible on every surface. This is the
-    difference, and it is why `scheduled_jobs` persists the hold rather than recomputing
-    it: what matters is how long, and only the row remembers.
-
-    `held_alarm_intervals` whole intervals, three by default — a doctor order the user
-    has not reviewed by lunchtime is a normal Tuesday, and reporting that would put the
-    scheduler on the attention list for working correctly.
-
-    NOT REPAIRABLE, and it must not try: the remedy is to settle the order that is in the
-    way (or to decide it never will be), which is a judgement about that work, not a
-    derivation. Silent on a project whose scheduler is OFF, or which does not run the
-    job any more — `check_health_sweep_produces_judgements`' lesson, where a switched-off
-    mechanism with rows still on disk would otherwise alarm for ever.
-    """
+    """INV-SCHEDULE-HELD — a recurring job that has wanted to fire for days"""
     from .ops import schedule_config_at
     from .schedule import held_seconds
 
     cfg = schedule_config_at(store.project_path)
     if not cfg.enabled:
         return
-    # `db.now`, not `time.time`: `held_since` was written from that clock by
-    # `record_schedule_hold`, and judging a stored moment against a different clock is
-    # how a check comes to disagree with the thing it is checking (kn-e6373014).
+    # `db.now`, not `time.time`: `held_since` was written from that clock by `record_schedule_hold`
     now = db.now()
     limit = cfg.held_alarm_intervals * cfg.interval_seconds
     for state in store.list_schedule_states():
@@ -5260,33 +3068,7 @@ def check_schedule_progresses(store: ProjectStore) -> Iterator[Violation]:
 
 
 def check_budgets_are_enforced(store: ProjectStore) -> Iterator[Violation]:
-    """INV-BUDGET-OVERSPENT — an order past its ceiling that is still able to spend.
-
-    The post-condition behind the whole feature, stated as the OS's own claim rather than
-    as a test's: a work order with a budget is either inside it or parked in
-    `budget_exhausted`. Anything else means the next dispatch, message delivery or retry
-    will hand `claude` a negative remainder — or, if a caller ever skips
-    `worker_session._launch`, no cap at all.
-
-    THE REPAIR IS THE SETTLER'S OWN. `Daemon.settle_work_order` parks a spent order every
-    tick, so a violation here is not "nobody has parked it yet" — it is that something is
-    keeping it out of that branch, and the one thing that can is a status the settler
-    returns early on. Reporting rather than repairing keeps this a check on the settler
-    instead of a second implementation of it.
-
-    EXCEPT WHERE THE SETTLER DECLINES ON PURPOSE. An order whose validation round is
-    still runnable is deliberately left unparked so the panel can finish judging work
-    that is already delivered, and an invariant that flagged that window would report the
-    OS's own design as a defect on every tick — noise that teaches the reader to ignore
-    the line. The exemption is narrow by construction: it is the same predicate the
-    settler branches on, so if that branch is ever widened this check widens with it, and
-    a round that is not runnable is judged like anything else. Nothing escapes for long —
-    a panel round cannot outlive `validation.timeout`.
-
-    Silent for every order with no budget, which is the fleet as it stands: `ceiling`
-    returns None on a row with neither a budget nor a reservation, so this costs one
-    indexed read per open order and yields nothing.
-    """
+    """INV-BUDGET-OVERSPENT — an order past its ceiling that is still able to spend"""
     from . import budget as budget_mod
     from .central_store import CentralStore
 
@@ -5302,8 +3084,7 @@ def check_budgets_are_enforced(store: ProjectStore) -> Iterator[Violation]:
             cap = budget_mod.ceiling(store, central, wo)
             if cap is None or not cap.exhausted:
                 continue
-            # The window the settler declines on purpose. Asked AFTER the cap, so the
-            # query is paid for only by an order that is actually over its ceiling.
+            # The window the settler declines on purpose
             outcome = (store.latest_validation_round(wo_id=wo["id"]) or {}).get("outcome")
             if outcome in RUNNABLE_VALIDATION_OUTCOMES:
                 continue
@@ -5323,22 +3104,7 @@ def check_budgets_are_enforced(store: ProjectStore) -> Iterator[Violation]:
 
 
 def check_default_branch_green(store: ProjectStore) -> Iterator[Violation]:
-    """This project's default branch is red, and the OS says so ONCE, out loud.
-
-    Spec docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §3. The
-    incident: `main` was red for ~4h after the OS's own merge broke it and no surface said
-    anything, because every base-health fact the OS held was per work order and written
-    only for an order whose own pull request was failing.
-
-    **DERIVED, NEVER FETCHED**, under `base_red_note`'s rule: an invariant that shelled
-    out to `gh` would put a subprocess behind `jarvis wo list`. `Daemon.poll_default_
-    branch` writes the reading; this reads it back. The reading's own freshness is the
-    merge pause's business (`BASE_HEALTH_FRESH_SECONDS`) and not this one's: a fact that
-    has stopped being refreshed is still the last thing the OS knows, and the remedy — a
-    commit on the default branch — does not expire.
-
-    Not repairable, and it must not try.
-    """
+    """This project's default branch is red, and the OS says so ONCE, out loud (docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §3.)"""
     from .central_store import CentralStore
 
     central = None
@@ -5358,15 +3124,13 @@ def check_default_branch_green(store: ProjectStore) -> Iterator[Violation]:
     sha = str(fact.get("head_sha") or "")
     wo_id = str(fact.get("wo_id") or "")
     blamed = f", merged by the OS for {wo_id}" if wo_id else ""
-    # Spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §5: the order producing that
-    # commit, and nothing that moves tick to tick — the sentence is the dedupe key.
+    # Spec 2026-10-14-a-red-main-dispatches-its-own-fix.md §5: the order producing that commit
     fix_wo_id = str(fact.get("fix_wo_id") or "")
     issue_url = str(fact.get("issue_url") or "")
     dead = _dead_base_fix(store, fix_wo_id)
     tail = _base_fix_decision(dead, fix_wo_id, issue_url)
     if dead:
-        # §5's third branch: the detail STATES the state; the owed violation below TAKES
-        # the decision.
+        # §5's third branch: the detail STATES the state; the owed violation below TAKES the decision
         remedy = (f"The remedy is a commit on `{base}`; {fix_wo_id} was dispatched to "
                   f"produce it and is now `{dead}`, so the OS is out of moves — it "
                   f"dispatches no second fix order and never retries a dead turn "
@@ -5391,7 +3155,7 @@ def check_default_branch_green(store: ProjectStore) -> Iterator[Violation]:
     )
     if not dead:
         return
-    # NO elapsed time and nothing that changes tick to tick — `Violation.owed`'s rule.
+    # NO elapsed time and nothing that changes tick to tick — `Violation.owed`'s rule
     owed = (f"{fix_wo_id}, the work order fixing the red default branch `{base}`, "
             f"settled `{dead}` without clearing it, and the OS will not open another. "
             f"{tail}")
@@ -5407,14 +3171,7 @@ def check_default_branch_green(store: ProjectStore) -> Iterator[Violation]:
 
 
 def _base_fix_decision(dead: str, fix_wo_id: str, issue_url: str) -> str:
-    """THE DECISION a dead base-fix order leaves the user, naming only a command that can
-    actually run.
-
-    `jarvis wo retry` is `failed`-ONLY by contract: it refuses a delivered or cancelled
-    order, and a deleted row has no session to resume. Naming it there would print a
-    command that cannot succeed. Nothing in here moves tick to tick — `Violation.owed`'s
-    rule.
-    """
+    """THE DECISION a dead base-fix order leaves the user, naming only a command that can actually run"""
     if not dead:
         return ""
     if dead == "failed":
@@ -5428,12 +3185,7 @@ def _base_fix_decision(dead: str, fix_wo_id: str, issue_url: str) -> str:
 
 
 def _dead_base_fix(store: ProjectStore, fix_wo_id: str) -> str:
-    """The terminal status of the red base's fix order, `""` while it can still fix it.
-
-    Spec docs/superpowers/specs/2026-10-14-a-red-main-dispatches-its-own-fix.md §5. The
-    work order's own `TERMINAL_STATUSES`, which includes `failed` — this module's local
-    constant of that name does not — and a row that is GONE reads as terminal.
-    """
+    """The terminal status of the red base's fix order, `""` while it can still fix it (docs/superpowers/specs/2026-10-14-a-red-main-dispatches-its-own-fix.md §5.)"""
     from .project_store import TERMINAL_STATUSES as SETTLED_STATUSES
 
     if not fix_wo_id:
@@ -5445,44 +3197,17 @@ def _dead_base_fix(store: ProjectStore, fix_wo_id: str) -> str:
     return status if status in SETTLED_STATUSES else ""
 
 
-#: How many feature orders the pointer check reads. `list_feature_orders` caps at 200 by
-#: default and the predicate is over EVERY row a project has ever had.
+#: How many feature orders the pointer check reads
 SPEC_POINTER_ROWS = 100000
 
 INV_SPEC_POINTER_REAL = "INV-SPEC-POINTER-REAL"
 
 
 def check_spec_pointer_resolves(store: ProjectStore) -> Iterator[Violation]:
-    """INV-SPEC-POINTER-REAL — a plan's `design_doc` names a file that is really there.
-
-    `plan["design_doc"]` is what `specs.spec_link` renders on `jarvis wo show` and the
-    work order's page, and what `ops.spec_section` is given. `spec_of` resolves TEXT from
-    `plan["design_doc_content"]`, a snapshot, so a pointer that opens nothing keeps every
-    reader working and is invisible until somebody tries to OPEN the document — which is
-    what fo-69ba1cc4 did. Nothing reported it: the only guard scans TRACKED FILES
-    (tests/test_spec_location.py), and a dead pointer lives in a database row
-    (kn-ba3945bf, kn-818facbf).
-
-    THE ORACLE IS THE COMMITTED REF, never this checkout:
-    docs/superpowers/specs/2026-10-14-inv-spec-pointer-real-reads-the-integration-branch.md.
-    `.exists()` made the verdict a fact about whether somebody had pulled — a false
-    violation for fo-f02d33af, whose spec was on `origin/main` — and hid the mirror case,
-    a pointer that opens only because an uncommitted file sits in one person's tree. A row
-    the ladder cannot answer for yields nothing at all (§2.4).
-
-    Settled features included, on `check_work_lands`' reasoning: hiding drops a record
-    from listings, it does not mean the record may go on saying something untrue.
-
-    The repair is by BASENAME and is generic on purpose. A literal rewrite from the legacy
-    prefix to the canonical one would fix the rows that exist today and nothing else — not
-    a spec renamed, not one moved within the canonical directory, not a project whose
-    specs live elsewhere. Exactly one tracked file of that basename is repointed; zero or
-    more than one owes the user a decision. Spec §2.3 of
-    docs/superpowers/specs/2026-10-13-an-assumption-review-payload-carries-its-spec-section.md
-    """
+    """INV-SPEC-POINTER-REAL — a plan's `design_doc` names a file that is really there (docs/superpowers/specs/2026-10-14-inv-spec-pointer-real-reads-the-integration-branch.md)"""
     from . import landing
 
-    # One memo for the whole sweep: the remote is refreshed at most once — spec §2.2.
+    # One memo for the whole sweep: the remote is refreshed at most once — spec §2.2
     fetched: set[str] = set()
     for fo in store.list_feature_orders(statuses=None, kind=None,
                                         limit=SPEC_POINTER_ROWS):
@@ -5513,8 +3238,7 @@ def check_spec_pointer_resolves(store: ProjectStore) -> Iterator[Violation]:
                 context={"fo_id": fo_id, "was": doc, "now": matches[0]},
             )
             continue
-        # NO elapsed time and nothing that changes tick to tick, or the item can never be
-        # acked down — `Violation.owed`'s rule.
+        # NO elapsed time and nothing that changes tick to tick, or the item can never be acked down
         where = (f"{len(matches)} tracked files carry that name: "
                  f"{', '.join(matches[:10])}" if matches
                  else "no tracked file carries that name")
@@ -5531,21 +3255,14 @@ def check_spec_pointer_resolves(store: ProjectStore) -> Iterator[Violation]:
 
 
 def _planner_row(store: ProjectStore, fo: dict[str, Any]) -> dict[str, Any] | None:
-    """The feature's planner row, for the ladder's first rung.
-
-    `ops._planner_work_order`'s query, deliberately re-stated rather than imported: this
-    module must not depend on `ops`.
-    """
+    """The feature's planner row, for the ladder's first rung"""
     if not fo.get("plan_wo_id"):
         return None
     return store.get_work_order(fo["plan_wo_id"])
 
 
 def _tracked_with_basename(root: Path, ref: str, name: str) -> list[str]:
-    """Paths called `name` ON `ref` — the same ref the existence question was answered
-    from, because the single-match branch WRITES the answer back. Spec §2.3 of
-    docs/superpowers/specs/2026-10-14-inv-spec-pointer-real-reads-the-integration-branch.md
-    """
+    """Paths called `name` ON `ref` — the same ref the existence question was answered from (docs/superpowers/specs/2026-10-14-inv-spec-pointer-real-reads-the-integration-branch.md)"""
     try:
         out = subprocess.run(["git", "ls-tree", "-r", "--name-only", "-z", ref],
                              cwd=str(root), capture_output=True, text=True, check=False)
@@ -5556,46 +3273,66 @@ def _tracked_with_basename(root: Path, ref: str, name: str) -> list[str]:
     return sorted(p for p in out.stdout.split("\0") if p and Path(p).name == name)
 
 
+INV_PRECONDITION_UNWIRED = "INV-PRECONDITION-UNWIRED"
+
+
+def check_precondition_is_wired(store: ProjectStore) -> Iterator[Violation]:
+    """INV-PRECONDITION-UNWIRED — a brief that says "do not start" must be held by state (docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md)"""
+    from . import preconditions
+
+    for wo in store.list_work_orders(statuses=OPEN_STATUSES, include_hidden=True):
+        matched = preconditions.states_hold(wo["title"], wo["description"] or "")
+        if not matched:
+            continue
+        if store.dependencies(wo) or store.open_preconditions(wo["id"]):
+            continue
+        yield Violation(
+            invariant=INV_PRECONDITION_UNWIRED,
+            wo_id=wo["id"],
+            detail=f"its brief states a stop condition — \"{matched}\" — and nothing "
+                   f"holds it back, so the claim takes it: wire the hold "
+                   f"(`--blocked-by`/`--depends-on` at creation) or delete the sentence",
+            repaired=False,
+            owed="",
+            # The matched sentence is the USER's text: it stays on the record and never rides outward into a...
+            notice=f"{wo['id']}: its brief states an unwired stop condition and nothing "
+                   f"holds it back, so the claim takes it — wire the hold "
+                   f"(`--blocked-by`/`--depends-on` at creation) or delete the sentence; "
+                   f"`jarvis wo show {wo['id']}` quotes it",
+            context={"matched": matched},
+        )
+
+
 INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_default_branch_green,    # first and order-free: a pure read of the central
-                                   # reading, repairing nothing and touching no flag any
-                                   # other check derives
+                                   # reading, repairing nothing and touching no flag any other check derives
     check_assumptions_persisted,   # rows first: the others read pending_assumptions
     check_no_orphan_gate_requests,  # ...and gates before the flag checks: an orphan
                                     # request is a blocker they would otherwise believe
     check_repaired_work_rejoins_the_merge_queue,  # BEFORE the reason checks: it moves
-                                   # the status they derive a reason from, so running it
-                                   # after would label an order for a status it is about
-                                   # to leave — and re-label it on the next tick
+                                   # the status they derive a reason from
     check_attention_reason_is_true,
     check_adhoc_not_governed,      # retire before the flag checks judge the leftovers
     check_legacy_adhoc_retired,    # ...and before them, let go of what nothing tracks
     check_no_phantom_attention,
-    check_assumption_flags_are_owed,  # ...and its pre-delivery sibling. Order-free
-                                   # against INV-ATTENTION-MISSING, which derives the
-                                   # same `true_blockers` and so will not put back what
-                                   # this clears — beside its sibling because they are
-                                   # one question asked of two sets of statuses
+    check_assumption_flags_are_owed,  # ...and its pre-delivery sibling
+                                   # against INV-ATTENTION-MISSING, which derives the same `true_blockers` and so will not put back what...
     check_messages_are_delivered,  # before INV-ATTENTION-MISSING, which skips anything
-                                   # already flagged: whichever sees it first raises the
-                                   # same `true_blockers[0]`, so the flag goes up once
+                                   # already flagged: whichever sees it first raises the same `true_blockers[0]`
     check_blocked_work_is_surfaced,
     check_attention_has_reason,
+    check_precondition_is_wired,   # order-free: a pure read that repairs nothing, raises
+                                   # no flag and writes no status, so nothing else in the tuple reads its output
     check_pull_request_recorded,   # order-free: a pure timeline read that repairs
-                                   # nothing and touches no flag. NOT a SLOW_INVARIANT —
-                                   # it asks the record, never the repository
+                                   # nothing and touches no flag
     check_manager_slots,           # a canary, not a state check: it repairs nothing and
                                    # is unaffected by the order it runs in
-    check_health_sweep_produces_judgements,  # ditto: a pure read of the sweep ledger,
+    check_health_sweep_produces_judgements,  # ditto: a pure read of the sweep ledger
                                    # repairing nothing and read by nothing else
-    check_os_health_sweep_alive,   # NOT in SLOW_INVARIANTS: it shells out to nothing,
-                                   # and a liveness check that runs hourly is a liveness
-                                   # check with an hour of blind spot
+    check_os_health_sweep_alive,   # NOT in SLOW_INVARIANTS: it shells out to nothing
+                                   # and a liveness check that runs hourly is a liveness check with an hour of blind spot
     check_stuck_sweep_alive,       # ...and beside it for the same reason: a fleet-wide
-                                   # fact short-circuited on `_os_owning_project`, HERE
-                                   # and not in `OS_INVARIANTS` because only this
-                                   # tuple's checks reach the attention list (round 1).
-                                   # Shells out to nothing either
+                                   # fact short-circuited on `_os_owning_project`
     check_paused_turns_resume,     # ditto: a pure read of what the retry pass did or
                                    # did not do, with nothing to repair
     check_pause_deadline_stable,   # ...and its companion: the pass can also be failing
@@ -5603,20 +3340,18 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_schedule_progresses,     # ditto, one mechanism over: a pure read of the
                                    # scheduler's clock, repairing nothing
     check_budgets_are_enforced,    # ditto again: it reports what the settler did not do
-                                   # and repairs nothing, so nothing depends on where it
-                                   # sits
-    check_validation_progresses,   # after the flag checks: its repair touches no flag,
+                                   # and repairs nothing, so nothing depends on where it sits
+    check_validation_progresses,   # after the flag checks: its repair touches no flag
                                    # and a `validating` row is invisible to all of them
     check_feature_failures_are_real,  # order-free: it reads and writes feature orders
                                    # only, which no work-order check looks at
     check_neo_escalations_are_live,  # order-free: it writes to Neo's store only, and
                                    # touches no flag any other check reads
     check_proposed_remedies_are_live,  # after the flag checks: it RAISES a flag, and one
-                                   # raised before them is read as phantom attention on
-                                   # an alarm `true_blockers` cannot re-derive
+                                   # raised before them is read as phantom attention on an alarm `true_blockers` cannot re-derive
     check_undeclared_delivery,     # order-free: it raises a FINDING and touches no flag
                                    # and no status, so nothing else here reads its output
-    check_spans_reach_the_status,  # order-free: it appends a span and changes no status,
+    check_spans_reach_the_status,  # order-free: it appends a span and changes no status
                                    # and nothing else here reads `wo_state_spans`
     check_envelopes_move,          # last: it delivers, and delivery changes work orders
     check_no_lost_feedback,        # ...and after it, because that delivery is what
@@ -5624,39 +3359,17 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
 )
 
 
-#: Invariants whose cost scales with the SETTLED BACKLOG rather than with live work.
-#: `check_work_lands` walks every completed order a project has ever had, for ever, where
-#: every other check here is bounded by what is currently in flight — so a mature project
-#: would pay its whole history twice a minute on the reconcile cadence to answer a
-#: question about work that stopped moving months ago. Hence OFF by default and their own
-#: cadence, as `Daemon.PR_POLL_EVERY_TICKS` does for a related reason.
-#:
-#: THIS USED TO SAY "invariants that shell out", and that is no longer what they are:
-#: since the landing check began judging the pull request instead of the diff it runs no
-#: subprocess at all (`Daemon.refresh_landings` is where the round trip went). The
-#: cadence is unchanged because the reason for it was always the population, not the
-#: `git` calls. `jarvis doctor` always runs them: a human who typed the command is
-#: waiting for the answer, and the answer is the point of the command.
+#: Invariants whose cost scales with the SETTLED BACKLOG rather than with live work
 SLOW_INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_work_lands,
     check_spec_pointer_resolves,  # both properties of this class and neither of the fast
-                                  # one: its population is every feature order a project
-                                  # has ever had, and its repair lists the whole
-                                  # repository to answer a question about a document that
-                                  # changes when somebody MOVES A FILE
+                                  # one: its population is every feature order a project has ever had
 )
 
 
 def check_project(store: ProjectStore, repair: bool = True,
                   slow: bool = False) -> list[Violation]:
-    """Run every invariant over one project. Returns the violations found.
-
-    With `repair=False` the checks run against a read-only view of the store, so
-    reporting never mutates state — that is what `jarvis doctor` uses before the user
-    has decided whether to let it touch anything.
-
-    `slow` adds `SLOW_INVARIANTS`, which read the repository rather than the database.
-    """
+    """Run every invariant over one project"""
     target = store if repair else _ReadOnly(store)
     found: list[Violation] = []
     for check in (*INVARIANTS, *(SLOW_INVARIANTS if slow else ())):
@@ -5671,35 +3384,21 @@ def check_project(store: ProjectStore, repair: bool = True,
 
 
 class _ReadOnly:
-    """Store proxy that swallows repairs, so `check_project(repair=False)` is a pure read.
-
-    Only the handful of mutators the invariants above call are intercepted; everything
-    else passes straight through. A `Violation` produced against this proxy still claims
-    `repaired=True` — it describes the repair that *would* be applied — so callers that
-    ask for no repair must present it as proposed, not done (`jarvis doctor` does).
-    """
+    """Store proxy that swallows repairs, so `check_project(repair=False)` is a pure read"""
 
     _BLOCKED = ("flag_attention", "clear_attention", "add_assumption", "add_event",
                 "set_status", "update_work_order", "supersede_approval",
-                # The bus. `queue_message` is here because delivering an envelope IS a
-                # queued message, and a read-only doctor run must not send one.
+                # The bus
                 "mark_envelope", "bump_envelope_attempt", "deliver_envelope",
                 "queue_message", "flag_feature_attention",
-                # INV-VALIDATION-STRANDED's repair. Reporting a stranded round must not
-                # be the thing that ends it.
+                # INV-VALIDATION-STRANDED's repair
                 "close_validation_round",
-                # INV-FEATURE-FALSE-FAILURE's. Ditto: reporting that a feature is wrongly
-                # failed must not be the thing that un-fails it.
+                # INV-FEATURE-FALSE-FAILURE's
                 "set_feature_status", "clear_feature_attention",
-                # INV-SPEC-POINTER-REAL's. A read-only doctor run must not rewrite a plan
-                # before the user has agreed to let it touch anything.
+                # INV-SPEC-POINTER-REAL's
                 "update_feature_order")
 
-    #: How a checker asks "am I allowed to change anything?". Needed by
-    #: `check_envelopes_move`, whose repair also writes to the CENTRAL store — a proxy
-    #: over the project store cannot intercept that, so the checker has to skip the work
-    #: rather than have it swallowed. Absent on a real ProjectStore, so `getattr(store,
-    #: "readonly", False)` is the test.
+    #: How a checker asks "am I allowed to change anything?"
     readonly = True
 
     def __init__(self, store: ProjectStore):

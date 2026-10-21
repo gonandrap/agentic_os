@@ -1,26 +1,4 @@
-"""A work order parked on a Neo question costs the user nothing until Neo hands it back.
-
-GitHub issue 100. `jarvis wo ask` exists to keep a decision off the user's plate:
-`ops.ask_question` parks the work order in `waiting_input` WITHOUT flagging attention,
-and says so in its own docstring. Three separate places then decided, independently and
-within a minute, that an idle worker in `waiting_input` meant "the user is being asked":
-
-  * `invariants.true_blockers` — the flag came back on the next reconcile tick, and the
-    self-check announced it had *repaired* an inconsistency while creating one;
-  * the `Notification` branch of `hooks.handle_hook` — Claude Code's routine idle prompt,
-    ~1 min after the turn ends, stamped "Claude is waiting for your input" over it;
-  * `Daemon.settle_work_order` — a turn that ended with no queued message and no
-    `jarvis wo finish` was filed as `needs_review` + IDLE_NO_FINISH_BLOCKER.
-
-Three of five sampled `jarvis_os` work orders had it, and the remedy the attention line
-offered (`jarvis wo resume-auto`) could not help: `auto` is the fleet-wide default, so
-the flip it performs is `auto → auto`, and all it really does is spend a conversation
-re-send on a worker that was waiting correctly.
-
-Every test here pins the SPECIFIC combination that shipped past the suite —
-`waiting_input` PLUS an open question — because each of the three sites was already
-tested, in isolation, against state that never had both.
-"""
+"""A work order parked on a Neo question costs the user nothing until Neo hands it back"""
 
 from __future__ import annotations
 
@@ -50,37 +28,25 @@ GENERIC_BLOCKER = "worker is waiting on your input"
 
 
 def ignored_reason(store: ProjectStore, wo_id: str) -> str:
-    """The reason the `Notification` branch recorded for swallowing the idle prompt.
-
-    Asserted on rather than merely counted: the reason is the only record of WHICH wait
-    the work order was parked on, so a test that checks the event exists and stops there
-    goes green on a version that has collapsed every wait into one string.
-    """
+    """The reason the `Notification` branch recorded for swallowing the idle prompt"""
     ignored = [e for e in store.list_events(wo_id) if e["kind"] == "notification_ignored"]
     assert len(ignored) == 1, f"expected exactly one notification_ignored, got {ignored}"
     return json.loads(ignored[0]["payload"])["reason"]
 
 
-# -- fixtures -------------------------------------------------------------------------
+# -- fixtures
 
 
 @pytest.fixture()
 def started(jarvis_home, fake_claude, catalog_file, project):
-    """The OS running against the fixture catalog — `permission_mode` falls to `auto`,
-    exactly as the production catalog does."""
+    """The OS running against the fixture catalog"""
     ops.start_os(str(catalog_file), foreground=True)
     return Daemon(load_catalog(catalog_file))
 
 
 def park_on_a_question(store: ProjectStore, title: str = "build the exporter",
                        status: str = "queued", kind: str = "question") -> tuple[dict, dict]:
-    """A work order in the state `jarvis wo ask` leaves behind: `waiting_input`, not
-    flagged, with one open question in Neo's DB. Returns `(work order, question)`.
-
-    Built through the two stores rather than through `ops.ask_question` so the state can
-    be posed at any point of the question's lifecycle; `test_the_live_sequence_…` below
-    walks the real path end to end.
-    """
+    """A work order in the state `jarvis wo ask` leaves behind: `waiting_input`"""
     wo = store.create_work_order(title)
     store.set_status(wo["id"], "waiting_input")
     neo = NeoStore()
@@ -94,7 +60,7 @@ def park_on_a_question(store: ProjectStore, title: str = "build the exporter",
     return store.get_work_order(wo["id"]), q
 
 
-# -- 1. the derivation: invariants.true_blockers ---------------------------------------
+# -- 1. the derivation: invariants.true_blockers
 
 
 @pytest.mark.parametrize("status", ["queued", "answering"])
@@ -107,26 +73,20 @@ def test_a_question_neo_still_holds_is_not_a_user_blocker(project, status):
 
 @pytest.mark.parametrize("status", ["escalated", "failed"])
 def test_a_question_neo_hands_back_is_a_user_blocker(project, status):
-    """The other half, and the half that must not regress in the fixing: Neo escalating
-    IS Neo handing the decision over, and a question it could not answer at all has
-    nobody else left to answer it."""
+    """The other half, and the half that must not regress in the fixing: Neo escalating IS Neo handing the..."""
     store = ProjectStore(project)
     wo, q = park_on_a_question(store, status=status)
 
     blockers = true_blockers(store, wo)
 
     assert blockers == [neo_question_blocker(q)]
-    # …and it names the way through, rather than the generic line that used to send the
-    # user at a session to type into.
+    # …and it names the way through, rather than the generic line that used to send the user at a session...
     assert f"jarvis neo answer {q['id']}" in blockers[0]
     assert GENERIC_BLOCKER not in blockers
 
 
 def test_an_answered_question_stops_suppressing_anything(project):
-    """The suppression is scoped to the wait, not to the work order. Once Neo has
-    answered, a work order still sitting in `waiting_input` is back to being whatever it
-    was before — `Daemon._neo_drain` moves it on, and if that ever fails to happen the
-    user must hear about it."""
+    """The suppression is scoped to the wait, not to the work order"""
     store = ProjectStore(project)
     wo, q = park_on_a_question(store)
     neo = NeoStore()
@@ -139,16 +99,7 @@ def test_an_answered_question_stops_suppressing_anything(project):
 
 
 def test_a_reply_already_queued_is_not_a_reason_to_ask_again(project):
-    """The last few seconds of the same wait. `ops.send_message` clears the flag as the
-    user writes; until the daemon delivers, `waiting_input` stands — and the invariant
-    put the flag back within a tick, asking the user for something they had just done.
-
-    THE SESSION ID IS THE PREMISE, not decoration: `worker_session.delivery_hold` returns
-    HOLD_NO_SESSION for a row that has none, so `daemon.delivers_message` would not select
-    and `true_blockers` would NOT be `[]` at all — no actor is derived, so it carries
-    NO_ACTOR_BLOCKER
-    (docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md
-    §5b). A real `waiting_input` row got there through a settled turn, so it has one."""
+    """The last few seconds of the same wait (docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md §5b)"""
     store = ProjectStore(project)
     wo = store.create_work_order("blocked task")
     store.update_work_order(wo["id"], session_id="sess-1")
@@ -156,7 +107,7 @@ def test_a_reply_already_queued_is_not_a_reason_to_ask_again(project):
     store.finish_turn(turn["id"], "done", result="waiting on your reply")
     store.set_status(wo["id"], "waiting_input")
     store.queue_message(wo["id"], "yes, go ahead", source="user")
-    # §5b: `[]` because `Daemon.deliver_messages` owns the row, not because nothing derived.
+    # §5b: `[]` because `Daemon.deliver_messages` owns the row, not because nothing derived
     assert ops.scheduled_actor(store, store.get_work_order(wo["id"])).predicate == (
         "daemon.delivers_message")
 
@@ -164,9 +115,7 @@ def test_a_reply_already_queued_is_not_a_reason_to_ask_again(project):
 
 
 def test_a_gate_question_is_left_to_the_gate_machinery(project):
-    """`kind='approval'` shadows a row in the project store's approvals table, which
-    `true_blockers` already reads. Counting it here too would report one gate twice, in
-    two vocabularies."""
+    """`kind='approval'` shadows a row in the project store's approvals table"""
     store = ProjectStore(project)
     wo, _ = park_on_a_question(store, kind="approval")
 
@@ -174,9 +123,7 @@ def test_a_gate_question_is_left_to_the_gate_machinery(project):
 
 
 def test_an_unreadable_neo_db_fails_towards_the_user(project, monkeypatch):
-    """Cross-DB reads fail; the question is which way. A silent stall is the dangerous
-    direction (`check_blocked_work_is_surfaced` exists for it), so an unreadable
-    `neo.db` must degrade to the old, noisy behaviour rather than to silence."""
+    """Cross-DB reads fail; the question is which way"""
     store = ProjectStore(project)
     wo, _ = park_on_a_question(store)
 
@@ -189,12 +136,11 @@ def test_an_unreadable_neo_db_fails_towards_the_user(project, monkeypatch):
     assert true_blockers(store, wo) == [GENERIC_BLOCKER]
 
 
-# -- 2. the invariant that flagged it: INV-ATTENTION-MISSING ---------------------------
+# -- 2. the invariant that flagged it: INV-ATTENTION-MISSING
 
 
 def test_the_self_check_no_longer_flags_a_work_order_parked_on_neo(project):
-    """The observed production sequence, verbatim: worker asks, ~20s later the reconcile
-    tick reports `INV-ATTENTION-MISSING` "repaired" and the user is paged."""
+    """The observed production sequence"""
     store = ProjectStore(project)
     wo, _ = park_on_a_question(store)
 
@@ -205,11 +151,7 @@ def test_the_self_check_no_longer_flags_a_work_order_parked_on_neo(project):
 
 
 def test_the_self_check_still_surfaces_an_escalation(project):
-    """The mirror. A question Neo sent up must be flagged even if nothing else flagged
-    it — `reclaim_stale` marks a question `failed` with a bare UPDATE, and `neo_tick` now
-    posts the flag itself (2026-09-26-an-unreachable-neo-question-is-not-a-question-in-
-    flight.md §5, asserted in tests/test_transport_resilience.py), so this invariant is
-    the net UNDER that notification rather than the only thing that raises it."""
+    """The mirror"""
     store = ProjectStore(project)
     wo, q = park_on_a_question(store, status="failed")
 
@@ -223,8 +165,7 @@ def test_the_self_check_still_surfaces_an_escalation(project):
 
 
 def test_the_escalation_reason_survives_repeated_ticks(project):
-    """kn-78346a2d: a reason `true_blockers` cannot re-derive is silently relabelled.
-    The daemon and the derivation share one function precisely so this cannot drift."""
+    """kn-78346a2d: a reason `true_blockers` cannot re-derive is silently relabelled"""
     store = ProjectStore(project)
     wo, q = park_on_a_question(store, status="escalated")
 
@@ -234,13 +175,12 @@ def test_the_escalation_reason_survives_repeated_ticks(project):
     assert store.get_work_order(wo["id"])["attention_reason"] == neo_question_blocker(q)
 
 
-# -- 3. the hook: Claude Code's idle prompt --------------------------------------------
+# -- 3. the hook: Claude Code's idle prompt
 
 
 @pytest.mark.parametrize("status", ["queued", "answering"])
 def test_the_idle_prompt_does_not_page_the_user_while_neo_has_it(project, status):
-    """`waiting_input` is in the branch's allowed statuses, so a parked worker sails
-    past the settled-order guard and the idle prompt flags it a minute later."""
+    """`waiting_input` is in the branch's allowed statuses"""
     store = ProjectStore(project)
     wo, _ = park_on_a_question(store, status=status)
 
@@ -259,8 +199,7 @@ def test_the_idle_prompt_does_not_page_the_user_while_neo_has_it(project, status
 
 
 def test_the_idle_prompt_does_not_overwrite_an_escalation(project):
-    """The kn-78346a2d failure in its original form: the generic idle message stamped
-    over the one reason that says what to do."""
+    """The kn-78346a2d failure in its original form: the generic idle message stamped over the one reason..."""
     store = ProjectStore(project)
     wo, q = park_on_a_question(store, status="escalated")
     store.flag_attention(wo["id"], neo_question_blocker(q))
@@ -275,8 +214,7 @@ def test_the_idle_prompt_does_not_overwrite_an_escalation(project):
 
 
 def test_the_idle_prompt_is_ignored_while_a_gate_is_with_neo(project):
-    """Same shape, the other wait: `gates.request` parks the work order in
-    `waiting_input` too, and the worker was told to end its turn there."""
+    """Same shape, the other wait: `gates.request` parks the work order in `waiting_input` too"""
     store = ProjectStore(project)
     wo = store.create_work_order("ship it")
     store.set_status(wo["id"], "waiting_input")
@@ -295,9 +233,7 @@ def test_the_idle_prompt_is_ignored_while_a_gate_is_with_neo(project):
 
 
 def test_the_idle_prompt_is_ignored_while_a_gate_awaits_the_worker_s_case(project):
-    """GitHub issue 197, the fourth road in. A hook-filed request is HELD
-    (`gates.AWAITING_CASE`) and never reaches `pending_approvals` — kn-30036661 names the
-    readers taught about held requests, and this one was missed."""
+    """GitHub issue 197, the fourth road in"""
     store = ProjectStore(project)
     wo = store.create_work_order("ship it")
     store.set_status(wo["id"], "running")
@@ -307,10 +243,7 @@ def test_the_idle_prompt_is_ignored_while_a_gate_awaits_the_worker_s_case(projec
                                             store.get_work_order(wo["id"]), action,
                                             hold=True)
     assert question is None and approval["status"] == gates.AWAITING_CASE
-    # `running`: a held request parks nothing, since fix 2 of
-    # docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md. The suppression
-    # below never read the status — it reads `held_approvals` — which is exactly why it
-    # survives the change.
+    # `running`: a held request parks nothing (docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md)
     assert store.get_work_order(wo["id"])["status"] == "running"
 
     handle_hook(
@@ -322,17 +255,13 @@ def test_the_idle_prompt_is_ignored_while_a_gate_awaits_the_worker_s_case(projec
     fresh = store.get_work_order(wo["id"])
     assert not fresh["needs_attention"]
     assert store.unrouted_notifications() == []
-    # NOT interchangeable with the pending reason above, and this is what stops the two
-    # branches being merged back into one: a held request is with the worker, and the
-    # timeline must not say a reviewer was holding something nobody had argued for.
+    # NOT interchangeable with the pending reason above
     assert ignored_reason(store, wo["id"]) == \
         "idle prompt while parked on a privileged-action gate awaiting the worker's case"
 
 
 def test_a_real_permission_prompt_still_reaches_the_user(project):
-    """The case the hook exists for. A `waiting_input` work order with nothing out —
-    no question, no gate — is the one thing only the user can clear, and the guard must
-    not swallow it."""
+    """The case the hook exists for"""
     store = ProjectStore(project)
     wo = store.create_work_order("real work")
     store.set_status(wo["id"], "running")
@@ -349,19 +278,11 @@ def test_a_real_permission_prompt_still_reaches_the_user(project):
     assert "permission" in fresh["attention_reason"]
 
 
-# -- 4. the reconciler: Daemon.settle_work_order ---------------------------------------
+# -- 4. the reconciler: Daemon.settle_work_order
 
 
 def test_settling_parks_a_worker_that_asked_neo(started, project, settle_turns):
-    """A worker that ends its turn on `jarvis wo ask` has done exactly what the contract
-    asks of it. Before this, the `else` branch caught it — `needs_review` plus
-    IDLE_NO_FINISH_BLOCKER — whenever Neo had not answered within the tick.
-
-    `Daemon.settle_turns` directly rather than `tick`: a full tick also kicks the Neo
-    drain onto its thread pool, which would answer the question out from under the
-    assertion. The race is the test's, not the OS's, and losing it would make this pass
-    for the wrong reason (kn-95a32178).
-    """
+    """A worker that ends its turn on `jarvis wo ask` has done exactly what the contract asks of it"""
     daemon = started
     spec = daemon.catalog.project("proj_a")
     wo = ops.create_work_order("proj_a", "build the exporter")
@@ -380,14 +301,7 @@ def test_settling_parks_a_worker_that_asked_neo(started, project, settle_turns):
 
 
 def test_settling_still_files_a_genuinely_idle_worker(started, project, settle_turns):
-    """The control: the same settlement pass, the same ended turn, no question. This
-    must still reach the user, or the fix has bought silence rather than accuracy.
-
-    The flag and its re-derivation are pinned to the same constant here (kn-78346a2d).
-    They were two different sentences for one state, so the dashboard banner and the
-    attention list disagreed about what had gone wrong — and neither said the part the
-    user cannot see, that whatever the worker left running died with its turn.
-    """
+    """The control: the same settlement pass, the same ended turn, no question"""
     daemon = started
     spec = daemon.catalog.project("proj_a")
     wo = ops.create_work_order("proj_a", "build the exporter")
@@ -404,13 +318,11 @@ def test_settling_still_files_a_genuinely_idle_worker(started, project, settle_t
     assert true_blockers(store, fresh) == [IDLE_NO_FINISH_BLOCKER]
 
 
-# -- 5. the drain: what the answer does to the wait ------------------------------------
+# -- 5. the drain: what the answer does to the wait
 
 
 def test_answering_ends_the_wait(started, project):
-    """Mirror of `gates.apply_decision`. The answer is out; what the work order waits on
-    now is the OS delivering it, and `waiting_input` outliving that reads as a user
-    blocker on every surface (this is what PR 99 fixed for gates)."""
+    """Mirror of `gates.apply_decision`"""
     daemon = started
     wo = ops.create_work_order("proj_a", "build the exporter")
     daemon.tick()
@@ -428,8 +340,7 @@ def test_answering_ends_the_wait(started, project):
 
 
 def test_answering_one_of_two_questions_keeps_the_wait(started, project):
-    """Narrow on both sides, like the gate path: one answer does not end a wait another
-    question is still holding, and the work order must not be reported as moving."""
+    """Narrow on both sides, like the gate path: one answer does not end a wait another question is still..."""
     daemon = started
     wo = ops.create_work_order("proj_a", "build the exporter")
     daemon.tick()
@@ -451,9 +362,7 @@ def test_answering_one_of_two_questions_keeps_the_wait(started, project):
 
 
 def test_the_users_answer_ends_the_wait_for_good(started, project):
-    """`jarvis neo answer` cleared the attention flag and left `waiting_input` behind, so
-    `true_blockers` derived the flag again on the next tick — the user answered and was
-    asked again seconds later."""
+    """`jarvis neo answer` cleared the attention flag and left `waiting_input` behind"""
     daemon = started
     wo = ops.create_work_order("proj_a", "build the exporter")
     daemon.tick()
@@ -495,14 +404,11 @@ def test_escalation_keeps_the_work_order_parked_and_names_the_question(started, 
     assert true_blockers(store, fresh) == [neo_question_blocker(q)]
 
 
-# -- 5b. what it is waiting on when the user owes a review too --------------------------
+# -- 5b. what it is waiting on when the user owes a review too
 
 
 def test_a_needs_review_park_outranks_the_workers_own_escalated_question(project):
-    """`waiting_on` is ordered like `true_blockers`, and on this pair it was the reverse
-    of what the user owes: an order parked for review with an open worker question
-    reported the question. `true_blockers` lists the `needs_review` reasons first, so the
-    two only agree after this."""
+    """`waiting_on` is ordered like `true_blockers`"""
     store = ProjectStore(project)
     wo, _q = park_on_a_question(store, status="escalated")
     store.set_status(wo["id"], "needs_review")
@@ -513,8 +419,7 @@ def test_a_needs_review_park_outranks_the_workers_own_escalated_question(project
 
 
 def test_a_question_escalated_on_an_unparked_order_still_reports_the_question(project):
-    """The other half: the re-rank is scoped to the `needs_review` park. Everywhere else
-    the escalation is the blocker and demoting it would hide it."""
+    """The other half: the re-rank is scoped to the `needs_review` park"""
     store = ProjectStore(project)
     wo, q = park_on_a_question(store, status="escalated")
 
@@ -524,12 +429,11 @@ def test_a_question_escalated_on_an_unparked_order_still_reports_the_question(pr
     assert answer["detail"] == neo_question_blocker(q)
 
 
-# -- 6. what the user reads ------------------------------------------------------------
+# -- 6. what the user reads
 
 
 def test_the_listing_says_who_is_holding_it(project):
-    """`waiting_input` renders as "Waiting on you" everywhere. For the whole time Neo
-    holds the question that is false, and it can be minutes."""
+    """`waiting_input` renders as "Waiting on you" everywhere"""
     store = ProjectStore(project)
     wo, q = park_on_a_question(store)
 
@@ -547,9 +451,7 @@ def test_the_listing_says_when_neo_has_handed_it_back(project):
 
 
 def test_an_escalation_is_one_attention_line_not_two(started, project):
-    """The escalated question already carries its own line, with the text and the
-    command. The work order's own flag saying the same thing less well is the noise the
-    gate rollup was built to avoid."""
+    """The escalated question already carries its own line, with the text and the command"""
     daemon = started
     wo = ops.create_work_order("proj_a", "build the exporter")
     daemon.tick()

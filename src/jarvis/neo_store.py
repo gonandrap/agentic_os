@@ -1,10 +1,4 @@
-"""Neo's store: $JARVIS_HOME/neo.db
-
-Neo is the OS-level answerer agent: it responds to worker questions on the user's
-behalf. This DB is Neo's own (separate from os.db by design): the question queue,
-every answer Neo gave, the user's reviews of those answers, and the learnings
-distilled from them.
-"""
+"""Neo's store: $JARVIS_HOME/neo.db"""
 
 from __future__ import annotations
 
@@ -15,7 +9,7 @@ from typing import Any
 from . import db
 from .paths import ensure_home, neo_db_path
 
-# Question lifecycle.
+# Question lifecycle
 Q_STATUSES = (
     "queued",     # waiting for Neo
     "answering",  # claimed by the Neo drain loop
@@ -23,86 +17,27 @@ Q_STATUSES = (
     "escalated",  # Neo declined — the user must answer
     "failed",     # answering errored; surfaced as attention
 )
-# Review lifecycle of an answered question.
+# Review lifecycle of an answered question
 REVIEW_STATUSES = ("unreviewed", "approved", "corrected")
 
-# The two halves of "still open", and WHO is holding it. The split is what lets the rest
-# of the OS tell a work order parked on its delegate from one parked on the user:
-# `jarvis wo ask` exists to keep a decision off the user's plate, so while Neo has the
-# question nothing may ask for them — and the moment Neo hands it back, something must.
-#
-# `failed` sits with the user deliberately. It is where `reclaim_stale` puts a question
-# Neo could not answer after MAX_ANSWER_ATTEMPTS, and nothing else will pick it up.
+# The two halves of "still open", and WHO is holding it
 NEO_HELD_Q_STATUSES = ("queued", "answering")
 USER_HELD_Q_STATUSES = ("escalated", "failed")
 OPEN_Q_STATUSES = NEO_HELD_Q_STATUSES + USER_HELD_Q_STATUSES
 
-# What Neo is being asked for. `question` is an open decision ("which library?");
-# `approval` is a privileged-action gate ("may I merge this PR?"); `plan` is a feature
-# order's decomposition ("release these six work orders?"); `alarm` is a cost alarm the
-# supervisor could not settle ("is this turn worth what it is spending?"). Each of the
-# latter three gets its own persona — see gates.py, plans.py and supervisor.py.
-#
-# `plan` is deliberately NOT routed through the approvals table even though the shape
-# rhymes: `approvals` is a receipt for one command string, and its `dismissed` count is
-# the OS's classifier false-positive rate. Plan reviews are neither, and mixing them in
-# would corrupt the one metric that says whether the gate recognisers are improving.
-#
-# ADDING A KIND IS SEVEN EDITS, NOT FOUR (kn-4edb0eb7, which extends kn-9b18a8eb, and §3
-# of docs/superpowers/specs/2026-08-31-the-supervisor.md). The four: this tuple, a
-# `deliver()` branch in `Daemon._neo_drain`, the `ops._neo_attention` filter, and the
-# `invariants.check_neo_escalations_are_live` filter (which also needs a
-# `_stale_<kind>_question` predicate). The three that are easiest to miss are the
-# USER-FACING ANSWER PATHS, and every one of them ends in `queue_message`:
-# `ops.neo_answer_escalated`, `ops.neo_review`'s `--correct` tail, and the `answer_form`
-# macro in `ui/templates/_question.html`. A kind that skips any of them speaks to a
-# worker that is not waiting — or, for `triage`, to one that does not exist.
-#
-# `alarm` still has the `--correct` tail open; `assumption` closed all three.
-#
-# `triage` is the odd one out, deliberately: it is the only kind with NO work order
-# behind it, so its `wo_id` is EMPTY. A bug filed through `jarvis bug report` has an
-# issue and nothing else, and the whole point of the question is to decide whether it
-# earns a work order at all (issue #240, and the user's ruling of 2026-09-14). Everything
-# its verdict has to act on travels in `context` as JSON — see `issues.ask_triage`. Its
-# real resolution is `jarvis issues start`, which is what all seven sites above are told.
-#
-# `assumption` is the one the OS files ITSELF, against a work order parked in
-# `needs_review` — see `autoreview.py`. Like `triage` and `alarm` nobody asked it, so its
-# answer must never reach the worker: the worker finished before the question existed.
+# What Neo is being asked for (docs/superpowers/specs/2026-08-31-the-supervisor.md)
 Q_KINDS = ("question", "approval", "plan", "alarm", "triage", "assumption")
 
-# The panel's seats — see docs/superpowers/specs/2026-08-02-neo-team-design.md.
-# `premise` asks whether this was even the question that was asked (and routes),
-# `record` checks the standing rulings, `blast` owns the blast radius and the only veto,
-# `taste` speaks for the user's intent and attention. `chair` is not a fifth opinion: it
-# synthesises the others into the one strict-JSON verdict `neo.parse_verdict` accepts.
-#
-# The vocabulary lives HERE, in the lowest layer, rather than in the panel module: the
-# catalog roster validator and the CLI's `--seat` validator both need it and neither
-# should have to depend on the other.
+# The panel's seats — see docs/superpowers/specs/2026-08-02-neo-team-design.md
 SEATS = ("premise", "record", "blast", "taste", "chair")
 
-#: The alarm supervisor's learnings live in this table too, scoped by the same `seat`
-#: column — §6 of docs/superpowers/specs/2026-08-31-the-supervisor.md.
+#: The alarm supervisor's learnings live in this table too, scoped by the same `seat` column (docs/superpowers/specs/2026-08-31-the-supervisor.md)
 SUPERVISOR_SEAT = "supervisor"
 
-# The seat values a LEARNING may legally carry, which is a wider vocabulary than the
-# panel's roster. `SUPERVISOR_SEAT` is deliberately NOT in `SEATS`: that constant is what
-# `catalog` parses a roster against, so adding it there would let a catalog seat the
-# supervisor on Neo's panel, where it has no definition and no mandate. `ops.validate_seat`
-# widens against this; every roster validator stays on `SEATS`.
+# The seat values a LEARNING may legally carry, which is a wider vocabulary than the panel's roster
 LEARNING_SCOPES = SEATS + (SUPERVISOR_SEAT,)
 
-# WHY an escalation happened, as one groupable label — §1 of
-# docs/superpowers/specs/2026-10-01-neo-observability.md. Here, beside the vocabularies above, for
-# `SEATS`' reason exactly: the personas, the CLI and the report all need it and none
-# should have to depend on another.
-#
-# THREE TUPLES, because "who decided" has THREE answers (Neo's ruling on question 1170)
-# and one tuple invites a report that adds them up. CHOSEN is a label the model picked,
-# and every member is tied to the persona text that asks for it (no member exists that no
-# persona mentions).
+# WHY an escalation happened, as one groupable label (docs/superpowers/specs/2026-10-01-neo-observability.md)
 ESCALATION_CAUSES_CHOSEN = (
     "high-stakes",
     "no-learning-applies",
@@ -113,12 +48,7 @@ ESCALATION_CAUSES_CHOSEN = (
     "evidence-insufficient",
     "user-decision",
 )
-# OVERRIDDEN is the third answer and the largest escalation population: NEO ANSWERED AND
-# THE OS DID NOT TAKE THE ANSWER. Every member is derived mechanically by
-# `autoreview.escalation_cause` from facts the code holds — a stakes word, a denial with
-# no machine rejection behind it, a child count — and NONE is ever read off a reply or
-# matched out of prose. The four daemon sites that re-mark a question `escalated` after
-# Neo answered write these, and `kind='assumption'` is the kind they cover.
+# OVERRIDDEN is the third answer and the largest escalation population: NEO ANSWERED AND THE OS DID...
 ESCALATION_CAUSES_OVERRIDDEN = (
     "stakes-high",            # Neo accepted and flagged it high; the OS obeyed
     "stakes-unclassified",    # no readable stakes, and silence is not routine
@@ -126,14 +56,7 @@ ESCALATION_CAUSES_OVERRIDDEN = (
     "neo-denied",             # `verdict: deny`, and there is no machine rejection
     "scope-over-cap",         # children at or over `plans.CHILD_CAP`
 )
-# FAILED is derived by the OS at the code path too, and the distinction from OVERRIDDEN
-# is that NEO NEVER ANSWERED AT ALL.
-#
-# `classifier-unreachable` / `classifier-unparseable` were REMOVED: `stakes`'
-# `HIGH_UNREACHABLE` / `HIGH_UNPARSEABLE` reach `autoreview.HELD_HIGH_STAKES`, which
-# holds the review before any question row exists, so nothing could ever write them. A
-# class nothing can write is better documented as invisible than left in the enum (Neo,
-# question 1170) — the report names it, through `ops.NEO_ESCALATION_INVISIBLE_NOTE`.
+# FAILED is derived by the OS at the code path too
 ESCALATION_CAUSES_FAILED = (
     "transport-unreachable",
     "attempts-exhausted",
@@ -143,45 +66,21 @@ ESCALATION_CAUSES_FAILED = (
 ESCALATION_CAUSES = (ESCALATION_CAUSES_CHOSEN + ESCALATION_CAUSES_OVERRIDDEN
                      + ESCALATION_CAUSES_FAILED)
 
-# How one seat's contribution ended. A seat that errors or times out is recorded as
-# `abstained` and the panel proceeds; `failed` is for a call that came back unusable.
+# How one seat's contribution ended
 OPINION_STATUSES = ("ok", "abstained", "failed")
 
-# A question claimed for answering longer than this is treated as stranded and returned
-# to the queue (see `NeoStore.reclaim_stale`).
-#
-# THIS MUST EXCEED THE LONGEST A LIVE NEO CALL CAN TAKE (`catalog.NeoConfig.timeout`,
-# 300s — pinned by a test). A cutoff below it re-queues a question out from under a call
-# that is still running, and the worker gets two answers to one question.
+# A question claimed for answering longer than this is treated as stranded and returned to the queue...
 STALE_ANSWERING_SECONDS = 900
 
-# How many times a question may be returned to the queue before it is given up on. The
-# initial claim is not an attempt: `attempts` counts the reclaims, so this is the number
-# of RETRIES. A question at the ceiling is marked `failed` rather than re-queued —
-# `queued` would loop for ever and `answering` would strand it again, and `failed` is the
-# only status the existing surfaces already render as attention.
+# How many times a question may be returned to the queue before it is given up on
 MAX_ANSWER_ATTEMPTS = 3
 
-#: `answer_reason` on a question nobody could put to a model. THE WORD THE SURFACES READ:
-#: `failed` is one status covering two facts, and this prefix is what tells "Neo was never
-#: reached" from "Neo was reached and could not settle it" wherever only the reason is to
-#: hand. Spec docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §2.
+#: `answer_reason` on a question nobody could put to a model (docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §2.)
 UNREACHABLE_PREFIX = "neo could not be reached: "
 
 
 class QuestionTooLargeError(ValueError):
-    """`ask` refused to persist a question past the ceiling. Spec §4:
-    docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
-
-    A `ValueError` subclass so every existing handler still catches it, NAMED so the
-    `jarvis wo ask` path can render it as one loud line: a worker told the size, the
-    ceiling and the setting can shorten and retry, and a traceback tells it nothing.
-
-    The sizes ride as `question_chars` / `context_chars` / `ceiling` and NOT as `limit`,
-    `claude_cli.PromptTooLargeError`'s rule: `seats._run_seat` does
-    `refused=getattr(e, "limit", None)` and an int there poisons a `UsageLimit`.
-    `Daemon.prompt_refusal_payload` renders both refusals from these.
-    """
+    """`ask` refused to persist a question past the ceiling (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)"""
 
     def __init__(self, message: str, *, question_chars: int, context_chars: int,
                  ceiling: int) -> None:
@@ -191,19 +90,12 @@ class QuestionTooLargeError(ValueError):
         self.ceiling = ceiling
 
 
-#: How long a question held back by a transport failure waits before it may be claimed
-#: again, indexed by how many attempts it has already spent.
-#:
-#: WITHOUT A BACKOFF THE RETRIES ARE NOT RETRIES. `Daemon.neo_tick` drains on every tick,
-#: so an un-delayed re-queue spends the whole ceiling inside three tick intervals and the
-#: question reaches the user seconds after the outage began — GitHub issue #235's mistake,
-#: which the validation panel already learned once (`Daemon._validation_held`). An outage
-#: measured in hours needs a ladder measured in minutes.
+#: How long a question held back by a transport failure waits before it may be claimed again (#235)
 RETRY_BACKOFF_SECONDS = (60.0, 300.0, 900.0)
 
 
 def retry_delay(attempts: int) -> float:
-    """Seconds to hold a question that has already spent `attempts` attempts."""
+    """Seconds to hold a question that has already spent `attempts` attempts"""
     return RETRY_BACKOFF_SECONDS[min(max(attempts, 0), len(RETRY_BACKOFF_SECONDS) - 1)]
 
 
@@ -257,37 +149,23 @@ CREATE INDEX IF NOT EXISTS idx_q_review ON questions(review_status);
 CREATE INDEX IF NOT EXISTS idx_learn_project ON learnings(project);
 """
 
-# Columns added after the first release. `CREATE TABLE IF NOT EXISTS` is a no-op on an
-# existing database, so new columns must be ALTERed in on open — every live instance
-# already has a neo.db from before these existed.
+# Columns added after the first release
 ADDED_COLUMNS = {
     "questions": {
         "kind": "TEXT NOT NULL DEFAULT 'question'",
-        # Stranded-question recovery. `claimed_at` is NULL on every row that predates
-        # this, which `reclaim_stale` reads as "as stale as it is old" — the questions
-        # already parked in `answering` on a live instance are exactly the ones the fix
-        # exists for, so they must not be exempt from it.
+        # Stranded-question recovery
         "attempts": "INTEGER NOT NULL DEFAULT 0",
         "claimed_at": "REAL",
-        # Transport backoff (`release_claim`). NULL — every row that predates this, and
-        # every row that has never failed — reads as "claimable now", which is what
-        # `claim_next`'s COALESCE says.
+        # Transport backoff (`release_claim`)
         "retry_after": "REAL",
-        # The dashboard's shortened rendering of an over-long question, as JSON — see
-        # `jarvis.digest`. NULL means "never attempted", which is what every row that
-        # predates this feature is, and what the daemon looks for. It is a DISPLAY
-        # artefact: nothing that reaches Neo, a worker or a learning is built from it.
+        # The dashboard's shortened rendering of an over-long question, as JSON — see `jarvis.digest`
         "digest": "TEXT",
-        # Why this escalation happened — §1 of docs/superpowers/specs/2026-10-01-neo-observability.md.
-        # NULLABLE, and NOT `NOT NULL DEFAULT ''` like its siblings above: this column is
-        # read by a GROUP BY, where an empty-string bucket beside the real causes reads as
-        # one more cause. NULL on every pre-existing row and never backfilled from prose.
+        # Why this escalation happened — §1 of docs/superpowers/specs/2026-10-01-neo-observability.md
         "escalation_cause": "TEXT",
     },
     "learnings": {
         "seat": "TEXT NOT NULL DEFAULT ''",
-        # Retraction. NULL on every pre-existing row, which reads as "standing" — the
-        # ledger was append-only until now, so nothing that predates this is retired.
+        # Retraction
         "retired_at": "REAL",
         "retired_reason": "TEXT",
     },
@@ -315,24 +193,18 @@ class NeoStore:
     def close(self) -> None:
         self.conn.close()
 
-    # -- questions -------------------------------------------------------------
+    # -- questions
 
     def ask(self, project: str, wo_id: str, question: str, context: str = "",
             kind: str = "question") -> dict[str, Any]:
         assert kind in Q_KINDS, kind
-        # REFUSE, never trim, and never persist: a question is stored before it is ever
-        # sent, so the store is the last place that can refuse one, and a trimmed
-        # question would be answered as if it were the question asked (Neo, q1078,
-        # option A). The SAME ceiling as the transport's rather than a second setting:
-        # it is a backstop, not the binding limit, and one number cannot fall out of
-        # step with itself. Spec §4:
-        # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+        # REFUSE, never trim, and never persist: a question is stored before it is ever sent (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
         from . import claude_cli
 
         size = len(question) + len(context)
         ceiling = claude_cli.MAX_OS_PROMPT_CHARS
         if size > ceiling:
-            # Numbers only — no fragment of the question: this reaches the inbox.
+            # Numbers only — no fragment of the question: this reaches the inbox
             raise QuestionTooLargeError(
                 f"refused to store a {kind}: question + context is {size} chars, over "
                 f"the {ceiling}-char ceiling (os.max_os_prompt_chars) — shorten it and "
@@ -351,29 +223,17 @@ class NeoStore:
         return dict(row) if row else None
 
     def revise_question(self, question_id: int, question: str) -> bool:
-        """Rewrite an OPEN question's text where it stands. Returns whether it changed.
-
-        The subject gained a fact the reviewer has to see — a gate request whose worker
-        came back and made its case (`gates.amend_request`). Rewriting beats asking again:
-        a second row is a second question about one decision, and every pointer at the
-        first one (`approvals.neo_question_id`) would have to move with it.
-
-        Guarded on OPEN_Q_STATUSES for the same reason `supersede` is: a decided question
-        is a record of what was actually asked, and editing it would make the answer
-        beneath it read as a reply to text nobody was shown.
-        """
+        """Rewrite an OPEN question's text where it stands"""
         q = self.get(question_id)
         if q is None or q["status"] not in OPEN_Q_STATUSES:
             return False
-        # The digest is a rendering of the old text — see `set_digest`. Clearing it puts
-        # the row back in `questions_needing_digest` so the dashboard re-derives one.
+        # The digest is a rendering of the old text — see `set_digest`
         self.conn.execute("UPDATE questions SET question=?, digest=NULL WHERE id=?",
                           (question, question_id))
         return True
 
     def claim_next(self) -> dict[str, Any] | None:
-        """Atomically claim the OLDEST queued question (FIFO — answering in order
-        keeps Neo's shared prompt prefix warm in the Anthropic cache)."""
+        """Atomically claim the OLDEST queued question (FIFO"""
         now = db.now()
         cur = self.conn.execute(
             """UPDATE questions SET status='answering', claimed_at=?
@@ -388,27 +248,9 @@ class NeoStore:
 
     def reclaim_stale(self, older_than: float = STALE_ANSWERING_SECONDS,
                       max_attempts: int = MAX_ANSWER_ATTEMPTS) -> dict[str, list[int]]:
-        """Unstick questions parked in `answering` by a drain that never finished.
-
-        `claim_next` sets `answering` and, until this existed, NOTHING ever set it back:
-        `neo.drain_queue` rescues only `ClaudeCliError` and the daemon wraps the whole
-        drain in a bare `except`. A daemon restart mid-drain — or any other exception —
-        therefore parked the question for ever, and the worker that asked it waited for
-        ever (bl-3f5f1464).
-
-        Rows past `older_than` seconds go back to `queued` with `attempts` incremented.
-        A row already at `max_attempts` is marked `failed` instead: `queued` would loop
-        for ever, `answering` would re-strand it, and `failed` is the status the OS
-        already surfaces as attention.
-
-        `older_than` MUST exceed the Neo call timeout — see STALE_ANSWERING_SECONDS.
-
-        Returns {"requeued": [id, ...], "failed": [id, ...]}.
-        """
+        """Unstick questions parked in `answering` by a drain that never finished"""
         cutoff = db.now() - older_than
-        # Give up FIRST, then re-queue: doing it the other way round would increment a
-        # row to the ceiling and then fail it in the same call, spending an attempt the
-        # question never got to use.
+        # Give up FIRST, then re-queue: doing it the other way round would increment a row to the ceiling and...
         failed = [
             int(r["id"])
             for r in self.conn.execute(
@@ -424,12 +266,7 @@ class NeoStore:
                 (max_attempts, cutoff),
             ).fetchall()
         ]
-        # NO `retry_after` here, unlike `release_claim`. The backoff exists so a unit
-        # returned to a queue drained every few seconds is not re-claimed instantly
-        # (issue #235) — and this path is already gated on `older_than`, fifteen minutes
-        # of waiting the question has ALREADY served. Another minute on top delays a
-        # rescue that is overdue, and `reclaim_stale_alarms` re-queues bare for the same
-        # reason. The stale cutoff IS the backoff.
+        # NO `retry_after` here, unlike `release_claim` (#235)
         requeued = [
             int(r["id"])
             for r in self.conn.execute(
@@ -445,19 +282,12 @@ class NeoStore:
         return {"requeued": requeued, "failed": failed}
 
     def clear_retry_hold(self, question_id: int) -> None:
-        """Make a held question claimable NOW — the user asking again is not a retry."""
+        """Make a held question claimable NOW — the user asking again is not a retry"""
         self.conn.execute("UPDATE questions SET retry_after=NULL WHERE id=?",
                           (question_id,))
 
     def hold_claim(self, question_id: int, detail: str, reopens_at: float) -> str:
-        """Park a claimed question until a stated moment, SPENDING NO ATTEMPT.
-
-        The usage limit is the one failure that says when it ends, so there is nothing to
-        guess and nothing to ration — `Daemon._validation_held`'s reasoning, and issue
-        #235's: a three-strike ladder sized for a blip retired a round in fifteen seconds
-        against an outage the inbox had measured at 11.2 hours. Always `"queued"`: a
-        window that will reopen is never a reason to ask the user anything.
-        """
+        """Park a claimed question until a stated moment, SPENDING NO ATTEMPT (#235)"""
         self.conn.execute(
             "UPDATE questions SET status='queued', claimed_at=NULL, retry_after=?, "
             "answer_reason=? WHERE id=?",
@@ -466,30 +296,14 @@ class NeoStore:
 
     def release_claim(self, question_id: int, detail: str,
                       max_attempts: int = MAX_ANSWER_ATTEMPTS) -> str:
-        """Hand a claimed question back after a call that produced NO ANSWER AT ALL.
-
-        `reclaim_stale`'s decision, taken at the moment of the failure instead of fifteen
-        minutes later: a transport fault is knowable the instant it happens, and waiting
-        for the stale sweep to notice would park the worker that asked for a quarter of an
-        hour per attempt. The two must agree, so the statuses, the ceiling and the
-        give-up-before-requeue ordering are all the same here.
-
-        Returns `"queued"` (retryable, `attempts` incremented) or `"unreachable"` (the
-        retries are genuinely spent and the row is `failed`, for the user).
-
-        THIS IS THE WHOLE OF THE FIX FOR QUESTION 388. What it replaces wrote `failed` at
-        `attempts=0` and synthesised an escalation from the crash — spec
-        docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §2.
-        """
+        """Hand a claimed question back after a call that produced NO ANSWER AT ALL (docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §2.)"""
         q = self.get(question_id)
         if q is None:
             return "unreachable"
         attempts = int(q["attempts"] or 0)
         reason = f"{UNREACHABLE_PREFIX}{detail}"
         if attempts >= max_attempts:
-            # `max_attempts=0` is the REFUSAL contract: the only callers that pass it are
-            # the prompt/input ceiling clauses, where no call was ever made. §1 of
-            # docs/superpowers/specs/2026-10-01-neo-observability.md.
+            # `max_attempts=0` is the REFUSAL contract: the only callers that pass it are the prompt/input... (docs/superpowers/specs/2026-10-01-neo-observability.md)
             cause = "prompt-refused" if max_attempts == 0 else "transport-unreachable"
             self.conn.execute(
                 "UPDATE questions SET status='failed', claimed_at=NULL, answer_reason=?, "
@@ -512,25 +326,7 @@ class NeoStore:
         )
 
     def supersede(self, question_id: int, answer: str, reason: str) -> bool:
-        """Close an open question whose decision was taken somewhere else. Returns
-        whether it closed.
-
-        A question row is only ever closed through the pointer its subject holds
-        (`approvals.neo_question_id`, `feature_orders.plan_question_id`), and a subject
-        that moves that pointer or retires leaves what it pointed at open for ever —
-        three of these were sitting in production attention, the oldest for a fortnight.
-        Whoever moves the pointer calls this; `invariants.check_neo_escalations_are_live`
-        is the backstop that derives the same fact when nobody did.
-
-        `answered_by='os'` rather than a new `superseded` status: nothing about the
-        lifecycle is new here — the question was decided, just not on this row — and a
-        status addition would cost the surface churn kn-a42253df describes for nothing.
-        It is also what keeps these out of the review queue, since every review surface
-        (`counts`, `questions_needing_digest`) already reads `answered_by='neo'`.
-
-        Guarded on OPEN_Q_STATUSES so a real verdict is never overwritten: the invariant
-        and the point fix can both fire on the same row, and the second must be a no-op.
-        """
+        """Close an open question whose decision was taken somewhere else"""
         q = self.get(question_id)
         if q is None or q["status"] not in OPEN_Q_STATUSES:
             return False
@@ -539,8 +335,7 @@ class NeoStore:
 
     def mark(self, question_id: int, status: str, reason: str = "",
              cause: str = "") -> None:
-        # `cause` is ESCALATION_CAUSES or "" for "not recorded" — §2 of
-        # docs/superpowers/specs/2026-10-01-neo-observability.md.
+        # `cause` is ESCALATION_CAUSES or "" for "not recorded" (docs/superpowers/specs/2026-10-01-neo-observability.md)
         assert status in Q_STATUSES, status
         assert cause == "" or cause in ESCALATION_CAUSES, cause
         self.conn.execute(
@@ -550,31 +345,16 @@ class NeoStore:
             (status, reason, cause, question_id),
         )
 
-    # -- digests (the dashboard's shortened rendering — see `jarvis.digest`) ----
+    # -- digests (the dashboard's shortened rendering — see `jarvis.digest`)
 
     def set_digest(self, question_id: int, digest: str) -> None:
-        """Record the digest, or the recorded failure to produce one.
-
-        Either way the column stops being NULL, which is what takes the row out of
-        `questions_needing_digest`. Writing the failure is deliberate: see
-        `digest.encode_failure`.
-        """
+        """Record the digest, or the recorded failure to produce one"""
         self.conn.execute("UPDATE questions SET digest=? WHERE id=?",
                           (digest, question_id))
 
     def questions_needing_digest(self, min_chars: int,
                                  limit: int = 20) -> list[dict[str, Any]]:
-        """Long questions the user will actually be shown, that nobody has digested yet.
-
-        THE STATUS FILTER IS THE COST CONTROL. A digest is one extra model call, so only
-        the questions that reach a human's eyes on the `/neo` page earn one: the ones
-        escalated to them, the ones that failed, and the answers awaiting their review.
-        A question still `queued` or `answering` is deliberately excluded — it renders as
-        a 160-character line in the in-flight strip and is about to change status anyway.
-
-        Newest first: the questions the user is looking at now are the ones worth
-        spending the call on if the batch is capped.
-        """
+        """Long questions the user will actually be shown, that nobody has digested yet"""
         return db.rows_to_dicts(self.conn.execute(
             """SELECT * FROM questions
                 WHERE digest IS NULL
@@ -587,11 +367,7 @@ class NeoStore:
         ).fetchall())
 
     def purge_work_order(self, wo_id: str) -> int:
-        """Forget the questions asked by a deleted work order.
-
-        Learnings survive: what Neo learned is durable knowledge about the user, not
-        about the work order it happened to come from — only the back-link is cut.
-        """
+        """Forget the questions asked by a deleted work order"""
         self.conn.execute(
             """UPDATE learnings SET question_id=NULL WHERE question_id IN
                (SELECT id FROM questions WHERE wo_id=?)""",
@@ -600,15 +376,7 @@ class NeoStore:
         return self.conn.execute("DELETE FROM questions WHERE wo_id=?", (wo_id,)).rowcount
 
     def open_questions(self, wo_id: str) -> list[dict[str, Any]]:
-        """Questions this work order is still parked on, oldest first.
-
-        `kind='question'` only, and that exclusion is load-bearing rather than tidy. An
-        `approval` question shadows a row in the PROJECT store's approvals table, which
-        `invariants.true_blockers` already reads (`_waiting_on_neo_gate`,
-        `escalated_approvals`); returning it here too would report one gate twice, in two
-        different vocabularies. A `plan` question hangs off the planner work order, and
-        that work order calls `jarvis wo finish` as it submits — it is never left waiting.
-        """
+        """Questions this work order is still parked on, oldest first"""
         return db.rows_to_dicts(self.conn.execute(
             f"""SELECT * FROM questions
                 WHERE wo_id=? AND kind='question'
@@ -618,16 +386,7 @@ class NeoStore:
         ).fetchall())
 
     def answered_questions(self, wo_id: str, limit: int = 20) -> list[dict[str, Any]]:
-        """Decisions already taken on this work order, NEWEST FIRST.
-
-        `open_questions`' other half, and the two differences are both deliberate. The
-        order is reversed because the caller caps the text it can carry
-        (`validation.decision_record_chars`) and the newest ruling is the one that
-        supersedes. And there is NO `kind` filter: that exclusion is load-bearing above
-        because an open `approval` is a gate reported elsewhere, while here every row is a
-        ruling on this order — an `approval` the user answered is exactly the authority a
-        reviewer escalated for want of (GitHub issue #832).
-        """
+        """Decisions already taken on this work order, NEWEST FIRST (#832)"""
         return db.rows_to_dicts(self.conn.execute(
             """SELECT * FROM questions WHERE wo_id=? AND status='answered'
                ORDER BY ts DESC, id DESC LIMIT ?""",
@@ -652,8 +411,7 @@ class NeoStore:
 
     def search_questions(self, words: Sequence[str], project: str = "",
                          limit: int = 50) -> list[dict[str, Any]]:
-        """Questions matching `words`, answered ones included: a ruling the user wants
-        to find again is by definition already answered."""
+        """Questions matching `words`, answered ones included: a ruling the user wants to find again is by..."""
         expr, params = db.score_sql(words, {
             "question": 3, "wo_id": 2, "answer": 1, "answer_reason": 1, "context": 1,
             "review_feedback": 1,
@@ -668,15 +426,7 @@ class NeoStore:
 
     def question_outcomes(self, project: str = "",
                           since: float | None = None) -> list[dict[str, Any]]:
-        """Every question in the window, grouped on (kind, project, day, outcome).
-
-        One query behind every count in `ops.neo_stats_report` — §4 of
-        docs/superpowers/specs/2026-10-01-neo-observability.md. `answered_by` rides in the key because
-        `answered_by='os'` is a SUPERSEDED question, which is neither Neo answering nor
-        Neo handing back and must not reach the escalation rate's denominator.
-
-        The day bucket is SQL's, as `counts`' GROUP BY above already is.
-        """
+        """Every question in the window, grouped on (kind, project, day, outcome) (docs/superpowers/specs/2026-10-01-neo-observability.md)"""
         where, params = [], []
         if project:
             where.append("project=?")
@@ -695,8 +445,7 @@ class NeoStore:
 
     def escalation_cause_counts(self, project: str = "",
                                 since: float | None = None) -> list[dict[str, Any]]:
-        """`GROUP BY escalation_cause` over the handed-back questions. NULL included: the
-        bucket that says how many escalations predate cause recording (spec §4)."""
+        """`GROUP BY escalation_cause` over the handed-back questions"""
         where = ["status IN ('escalated','failed')"]
         params: list[Any] = []
         if project:
@@ -712,12 +461,7 @@ class NeoStore:
 
     def questions_per_order(self, project: str = "",
                             since: float | None = None) -> list[dict[str, Any]]:
-        """Questions in the window by the order that asked, TRIAGE EXCLUDED.
-
-        A triage question has no work order behind it and its `wo_id` is empty (`Q_KINDS`),
-        so dividing it by an order count would be arithmetic over two populations — spec
-        §4. They stay in `question_outcomes`.
-        """
+        """Questions in the window by the order that asked, TRIAGE EXCLUDED"""
         where = ["kind != 'triage'", "wo_id != ''"]
         params: list[Any] = []
         if project:
@@ -744,7 +488,7 @@ class NeoStore:
         ).fetchone()["c"]
         return {**by_status, "unreviewed": unreviewed}
 
-    # -- review loop -----------------------------------------------------------
+    # -- review loop
 
     def review(self, question_id: int, approved: bool, feedback: str = "") -> dict[str, Any]:
         q = self.get(question_id)
@@ -757,24 +501,12 @@ class NeoStore:
         )
         return self.get(question_id)  # type: ignore[return-value]
 
-    # -- panel deliberation --------------------------------------------------------
+    # -- panel deliberation
 
     def record_opinion(self, question_id: int, seat: str, reply: str = "",
                        verdict: str = "", route: str = "", status: str = "ok",
                        model: str = "", latency_ms: int = 0) -> dict[str, Any]:
-        """Store one seat's contribution to one decision.
-
-        `route` is set by the `premise` seat alone (`fast` or `panel`); every other seat
-        leaves it empty. A seat that errored or timed out is recorded with
-        `status='abstained'` and the panel proceeds — that row is the evidence it ran.
-
-        ONE ROW PER SEAT PER QUESTION, LAST RUN WINS. A question can genuinely be
-        answered twice: `reclaim_stale` returns a stranded one to the queue, so a second
-        panel run re-records the same seats. The upsert replaces the stranded attempt,
-        because the deliberation a human wants to read is the one behind the answer that
-        actually reached the worker (ruled by Neo, question 55). The row `id` survives
-        the overwrite, so a surface holding a handle to an opinion keeps it.
-        """
+        """Store one seat's contribution to one decision"""
         assert status in OPINION_STATUSES, status
         self.conn.execute(
             """INSERT INTO panel_opinions
@@ -795,26 +527,17 @@ class NeoStore:
         return dict(row)
 
     def opinions(self, question_id: int) -> list[dict[str, Any]]:
-        """Every seat's opinion on one question, in the order the seats first reported.
-
-        Ordered by `id` rather than `ts` so a partial re-run cannot reshuffle the rows a
-        reader has already seen. Panel deliberation is inspectable on demand and is
-        never delivered to the worker or placed in the inbox.
-        """
+        """Every seat's opinion on one question, in the order the seats first reported"""
         return db.rows_to_dicts(self.conn.execute(
             "SELECT * FROM panel_opinions WHERE question_id=? ORDER BY id",
             (question_id,),
         ).fetchall())
 
-    # -- learnings ---------------------------------------------------------------
+    # -- learnings
 
     def add_learning(self, content: str, project: str = "", source: str = "manual",
                      question_id: int | None = None, seat: str = "") -> dict[str, Any]:
-        """Record a learning. `seat=""` (the default) means every seat sees it.
-
-        A seat-scoped learning teaches the seat that got a decision wrong instead of all
-        of them — and, critically, it stays OUT of the default query. See `learnings`.
-        """
+        """Record a learning"""
         cur = self.conn.execute(
             "INSERT INTO learnings (ts, project, content, source, question_id, seat) "
             "VALUES (?,?,?,?,?,?)",
@@ -824,16 +547,7 @@ class NeoStore:
         return dict(row)
 
     def retract_learning(self, learning_id: int, reason: str) -> dict[str, Any]:
-        """Retire a learning the user has superseded. NOT a delete.
-
-        The row stays in the table and keeps being returned by `all_learnings` — that
-        is the audit trail, and it is the whole reason this is an UPDATE. What changes
-        is that `learnings` stops returning it, so it leaves Neo's system prompt.
-
-        Retracting an already-retired learning RAISES rather than quietly re-stamping
-        it: the original reason and timestamp are the record of when the user changed
-        their mind, and a second retraction would overwrite both with no gain.
-        """
+        """Retire a learning the user has superseded"""
         if not reason.strip():
             raise ValueError("a retraction needs a reason: what supersedes this learning?")
         row = self.conn.execute(
@@ -853,28 +567,7 @@ class NeoStore:
 
     def learnings(self, project: str = "", limit: int = 50, seat: str = "",
                   include_retired: bool = False) -> list[dict[str, Any]]:
-        """Learnings relevant to a project (its own + global), OLDEST first.
-
-        Oldest-first keeps the rendered learnings block append-only: a new learning
-        extends Neo's prompt prefix instead of rewriting it, so previously cached
-        prefix bytes stay valid. When over the limit, the newest N are kept (rendered
-        still in ascending order — a one-time prefix shift per overflow).
-
-        THE SEAT SCOPE IS ADDITIVE, AND THE DEFAULT IS NOT "EVERYTHING". No `seat`
-        argument — and `seat=""` — return ONLY global rows; `seat="blast"` returns the
-        global rows PLUS that seat's. The no-argument case is load-bearing:
-        `neo.build_system_prompt` calls it that way for the single-agent path, so a
-        seat-scoped learning leaking into it would silently rewrite a prompt prefix that
-        has to stay byte-stable, and the panel ships disabled.
-
-        RETIRED LEARNINGS ARE EXCLUDED BY DEFAULT, and the default is what matters: this
-        is the method every prompt builder reads, including the panel's per-seat one,
-        which lives in another module. Filtering here rather than in
-        `neo.build_system_prompt` is what makes a seat-scoped prompt correct without its
-        author having to know retraction exists (ruled by Neo, question 56). Audit
-        surfaces — `all_learnings`, and `jarvis neo learnings` — pass
-        `include_retired=True` and say so on the row.
-        """
+        """Learnings relevant to a project (its own + global), OLDEST first"""
         retired = "" if include_retired else " AND retired_at IS NULL"
         rows = self.conn.execute(
             f"""SELECT * FROM (
@@ -887,37 +580,19 @@ class NeoStore:
         return db.rows_to_dicts(rows)
 
     def all_learnings(self, limit: int = 200) -> list[dict[str, Any]]:
-        """Every learning regardless of project scope (review surfaces).
-
-        This is the AUDIT surface, so it returns retired learnings too, carrying their
-        `retired_at` and `retired_reason`. A retraction retires a ruling; it does not
-        erase that the user once held it.
-        """
+        """Every learning regardless of project scope (review surfaces)"""
         rows = self.conn.execute(
             "SELECT * FROM learnings ORDER BY ts DESC LIMIT ?", (limit,)
         ).fetchall()
         return db.rows_to_dicts(rows)
 
-    # -- export ------------------------------------------------------------------
+    # -- export
 
-    #: The tables `export` dumps, in the order they appear in the document.
+    #: The tables `export` dumps, in the order they appear in the document
     EXPORT_TABLES = ("questions", "learnings", "panel_opinions")
 
     def export(self) -> dict[str, list[dict[str, Any]]]:
-        """The whole ledger: every table, every row, every column, no truncation.
-
-        Prime directive 1 forbids reading `neo.db` directly, so this is the only way
-        anything outside the OS gets at Neo's record — the panel eval replaying the
-        question corpus is the first caller (`jarvis neo export --json`).
-
-        `SELECT *` rather than a hand-written column list is deliberate. A column added
-        to any of these tables ships in the export the day it lands, instead of being
-        silently dropped until someone notices the field they wanted was never there.
-
-        The document carries NO wall-clock field and every table is ordered by `id`, so
-        two consecutive exports of an unchanged database are byte-identical and a diff
-        between two of them shows only what actually changed.
-        """
+        """The whole ledger: every table, every row, every column, no truncation"""
         return {
             table: db.rows_to_dicts(
                 self.conn.execute(f"SELECT * FROM {table} ORDER BY id").fetchall())

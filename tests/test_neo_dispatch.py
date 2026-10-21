@@ -1,11 +1,4 @@
-"""Neo files its own pre-approved work order when the ledger contradicts itself.
-
-The learnings and the knowledge base are append-only, so a superseded ruling stays
-visible next to the one that replaced it until somebody writes the correction. Neo is
-the only reader positioned to notice — it is holding both entries while it answers —
-so it gets to file the cleanup, already authorised, instead of leaving a note nobody
-reads.
-"""
+"""Neo files its own pre-approved work order when the ledger contradicts itself"""
 
 from __future__ import annotations
 
@@ -24,8 +17,7 @@ from jarvis.project_store import PRE_APPROVED_KEY, ProjectStore
 
 @pytest.fixture()
 def gated_catalog(tmp_path, project):
-    """A catalog whose only project gates every privileged action — the one shape in
-    which an `approval` question exists at all."""
+    """A catalog whose only project gates every privileged action"""
     data = {
         "os": {"defaults": {"model": "sonnet"},
                "notifications": {"sinks": ["log"]}},
@@ -46,7 +38,7 @@ def started(jarvis_home, fake_claude, catalog_file, project):
 
 @pytest.fixture()
 def asked(started):
-    """A dispatched work order whose question makes Neo file a cleanup."""
+    """A dispatched work order whose question makes Neo file a cleanup"""
     daemon = started
     wo = ops.create_work_order("proj_a", "build the exporter")
     daemon.tick()
@@ -69,7 +61,7 @@ def cleanup_of(project) -> dict:
     return made[0]
 
 
-# -- parsing -------------------------------------------------------------------------
+# -- parsing
 
 def test_dispatch_is_absent_from_an_ordinary_verdict() -> None:
     v = neo_mod.parse_verdict('{"escalate": false, "answer": "go", "reason": "r"}')
@@ -90,9 +82,7 @@ def test_dispatch_is_parsed_when_present() -> None:
     '{"escalate": false, "answer": "a", "reason": "r", "dispatch": null}',
 ])
 def test_a_titleless_dispatch_is_dropped(blob: str) -> None:
-    """The title is what the user sees in `jarvis wo list`. An untitled work order
-    appearing on its own is how a helpful feature turns into noise, so a malformed
-    dispatch is discarded rather than guessed at — the answer still delivers."""
+    """The title is what the user sees in `jarvis wo list`"""
     v = neo_mod.parse_verdict(blob)
     assert v["dispatch"] is None
     assert v["answer"] == "a"
@@ -102,7 +92,7 @@ def test_garbage_output_carries_no_dispatch() -> None:
     assert neo_mod.parse_verdict("not json at all")["dispatch"] is None
 
 
-# -- the daemon acting on it ---------------------------------------------------------
+# -- the daemon acting on it
 
 def test_cleanup_work_order_is_filed(asked, project) -> None:
     cleanup = cleanup_of(project)
@@ -112,7 +102,7 @@ def test_cleanup_work_order_is_filed(asked, project) -> None:
 
 
 def test_the_answer_still_reaches_the_worker(asked, project) -> None:
-    """Filing the cleanup is separate work — it must never stand in for answering."""
+    """Filing the cleanup is separate work — it must never stand in for answering"""
     daemon, wo = asked
     store = ProjectStore(project)
     try:
@@ -124,8 +114,7 @@ def test_the_answer_still_reaches_the_worker(asked, project) -> None:
 
 
 def test_the_cleanup_says_how_to_correct_an_append_only_store(asked, project) -> None:
-    """There is no retraction in either store, so a worker told to 'clean up' with no
-    further steer would go looking for a delete that does not exist."""
+    """There is no retraction in either store"""
     description = cleanup_of(project)["description"]
     assert "append-only" in description
     assert "jarvis learn add" in description
@@ -140,8 +129,7 @@ def test_the_cleanup_is_marked_pre_approved(asked, project) -> None:
 
 
 def test_the_origin_work_order_records_it(asked, project) -> None:
-    """The user's audit trail: the work order they were watching says where the new
-    one came from."""
+    """The user's audit trail: the work order they were watching says where the new one came from"""
     daemon, wo = asked
     store = ProjectStore(project)
     try:
@@ -161,9 +149,7 @@ def test_no_dispatch_means_no_work_order(started, project) -> None:
 
 
 def test_an_escalation_can_still_file_the_cleanup(started, project) -> None:
-    """Deliberate: a contradicting record is often exactly WHY Neo cannot decide. If
-    escalating suppressed the dispatch, the feature would be dead in the case that
-    motivated it — the user gets the question AND the record gets fixed."""
+    """Deliberate: a contradicting record is often exactly WHY Neo cannot decide"""
     daemon = started
     wo = ops.create_work_order("proj_a", "risky task")
     daemon.tick()
@@ -173,9 +159,7 @@ def test_an_escalation_can_still_file_the_cleanup(started, project) -> None:
 
 
 def test_a_cleanup_never_files_another_cleanup(started, project) -> None:
-    """Neo answers the cleanup worker's questions too. Without this guard a
-    contradiction Neo cannot resolve would file a fresh work order on every round trip,
-    and the user would wake up to a queue of them."""
+    """Neo answers the cleanup worker's questions too"""
     daemon = started
     wo = ops.create_work_order("proj_a", "seed", origin="jarvis")
     daemon.tick()
@@ -191,8 +175,7 @@ def test_a_cleanup_never_files_another_cleanup(started, project) -> None:
 
 def test_gate_reviews_never_dispatch(jarvis_home, fake_claude, gated_catalog,
                                      project) -> None:
-    """The reviewer persona knows nothing about cleanups, so anything that looked like
-    a dispatch on an approval would be a parse artefact, not a decision."""
+    """The reviewer persona knows nothing about cleanups"""
     ops.start_os(str(gated_catalog), foreground=True)
     daemon = Daemon(load_catalog(gated_catalog))
     wo = ops.create_work_order("proj_a", "shipping task")
@@ -209,7 +192,7 @@ def test_gate_reviews_never_dispatch(jarvis_home, fake_claude, gated_catalog,
     assert [w for w in work_orders(project) if w["origin"] == "neo"] == []
 
 
-# -- what the cleanup worker is told -------------------------------------------------
+# -- what the cleanup worker is told
 
 def test_the_worker_is_told_not_to_ask_permission(asked, project, catalog_file) -> None:
     cleanup = cleanup_of(project)
@@ -220,9 +203,7 @@ def test_the_worker_is_told_not_to_ask_permission(asked, project, catalog_file) 
 
 
 def test_the_pre_approval_is_scoped_not_blanket(asked, project, catalog_file) -> None:
-    """The whole contract above tells the worker to ask on any doubt. This marker
-    carves out one decision, and says so — otherwise a cleanup worker reads 'approved'
-    as 'stop asking', which is a far larger change than was intended."""
+    """The whole contract above tells the worker to ask on any doubt"""
     cleanup = cleanup_of(project)
     spec = load_catalog(catalog_file).projects[0]
     prompt = build_worker_prompt(cleanup, spec, knowledge=[])
@@ -240,8 +221,11 @@ def test_ordinary_work_orders_get_no_such_briefing(started, project, catalog_fil
                                       '{"pre_approved": "yes"}'])
 def test_malformed_metadata_never_breaks_a_briefing(started, project, catalog_file,
                                                     metadata) -> None:
-    """A dispatch is the rare path; a briefing that raises would take down every
-    worker launch with it."""
+    """A dispatch is the rare path; a briefing that raises would take down every worker launch with it"""
     wo = dict(ops.create_work_order("proj_a", "ordinary task"), metadata=metadata)
     spec = load_catalog(catalog_file).projects[0]
     assert "PRE-APPROVED" not in build_worker_prompt(wo, spec, knowledge=[])
+
+
+# Written for the opt-in OS (os.autonomy.self_dispatch on, stuck sweep on)
+pytestmark = pytest.mark.usefixtures("self_dispatch_on")

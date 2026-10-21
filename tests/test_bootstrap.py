@@ -114,7 +114,7 @@ SKILL = ".claude/skills/jarvis-inject-session/SKILL.md"
 
 
 def test_bootstrap_installs_the_inject_skill(project):
-    """The user's own sessions only ever load <project>/.claude/skills/."""
+    """The user's own sessions only ever load <project>/.claude/skills/"""
     report = bootstrap_project(spec(project))
     body = (project / SKILL).read_text()
     assert "name: jarvis-inject-session" in body
@@ -125,8 +125,7 @@ def test_bootstrap_installs_the_inject_skill(project):
 
 
 def test_inject_skill_uses_the_session_id_claude_exports(project):
-    """The id comes from the environment Claude Code sets, never from a guess, and a
-    missing one has to fail out loud rather than inject an empty string."""
+    """The id comes from the environment Claude Code sets"""
     bootstrap_project(spec(project))
     body = (project / SKILL).read_text()
     assert 'jarvis wo inject "$CLAUDE_CODE_SESSION_ID"' in body
@@ -149,8 +148,7 @@ def test_inject_skill_heals_local_edits_but_spares_the_user_s_own(project):
 
 
 def test_inject_skill_is_not_handed_to_workers(project):
-    """A worker session is already a work order; self-injection would file a second
-    record against the same session id."""
+    """A worker session is already a work order"""
     from jarvis.bootstrap import install_agent_assets
     root = install_agent_assets(project)[0]
     names = {p.name for p in (root / ".claude" / "skills").iterdir()}
@@ -177,7 +175,7 @@ def test_operation_md_preserves_specifics(project):
     assert current in op.read_text().split("\n", 1)[0]
 
 
-# -- the worker contract: `jarvis wo finish --evidence` -------------------------------
+# -- the worker contract: `jarvis wo finish --evidence`
 
 
 def _rendered_operation(project) -> str:
@@ -186,18 +184,13 @@ def _rendered_operation(project) -> str:
 
 
 def _evidence_prose(text: str, window: int = 900) -> str:
-    """The prose around `--evidence`, which is what the no-leaking rule governs.
-
-    The rest of either document is not in scope and must not be: OPERATION.md's Serena
-    section says "architecture" repeatedly, and a whole-document search would fail on
-    that rather than on anything about the reviewer.
-    """
+    """The prose around `--evidence`, which is what the no-leaking rule governs"""
     at = text.index("--evidence")
     return text[max(0, at - window):at + window]
 
 
 def _worker_prompt(project, project_spec=None) -> str:
-    """What a running worker actually reads — the same call the daemon makes."""
+    """What a running worker actually reads — the same call the daemon makes"""
     from jarvis.dispatch import build_worker_prompt
     from jarvis.project_store import ProjectStore
 
@@ -210,10 +203,7 @@ def _worker_prompt(project, project_spec=None) -> str:
 
 
 def test_both_worker_texts_teach_the_evidence_flag(project):
-    """OPERATION.md is what a worker reads if it goes LOOKING; the dispatched prompt is
-    what it reads without looking. They answer different questions and both have to
-    carry the flag, or the half that does not silently trains the behaviour we are
-    trying to end."""
+    """OPERATION.md is what a worker reads if it goes LOOKING"""
     op, prompt = _rendered_operation(project), _worker_prompt(project)
 
     for text, where in ((op, "OPERATION.md"), (prompt, "the worker prompt")):
@@ -225,18 +215,7 @@ def test_both_worker_texts_teach_the_evidence_flag(project):
 
 
 def test_neither_worker_text_reveals_who_reads_the_evidence(project):
-    """The implementor and the reviewer do not know about each other — a design rule,
-    not a style note. From the worker's side this is review feedback and nothing more.
-
-    PAIRED with the positive assertion on purpose: "the words panel, seat and validator
-    are absent" is satisfied perfectly by a paragraph that was never written, so the
-    absence proves nothing on its own.
-
-    Scoped to the evidence prose rather than the whole document, and on WORD boundaries:
-    OPERATION.md talks about a project's "architecture" all over its Serena section, and
-    an unanchored substring search would fail on that instead of on anything this rule
-    is about.
-    """
+    """The implementor and the reviewer do not know about each other — a design rule, not a style note"""
     from jarvis.project_store import VALIDATOR_SEATS
 
     for where, text in (("OPERATION.md", _rendered_operation(project)),
@@ -251,18 +230,7 @@ def test_neither_worker_text_reveals_who_reads_the_evidence(project):
 
 
 def test_no_post_block_exit_asks_the_worker_to_re_type_the_command(project):
-    """The advice a blocked worker is given must be advice it can RUN.
-
-    A session in a git worktree runs under an isolation guard that inspects a command's
-    arguments and refuses any text it cannot prove is not a git operation — which is
-    most of what trips a gate (kn-dd415e5d, spec 2026-09-12 §8). Every exit reached
-    AFTER a block therefore addresses the request by number. The pre-block `request` is
-    the one exception and is marked as such in both documents: nothing has been filed
-    yet, so there is no number to use.
-
-    Asserted on the RENDERED text of both, because this is a property of what the worker
-    reads, and the two documents are written in different places by different code.
-    """
+    """The advice a blocked worker is given must be advice it can RUN"""
     from jarvis.gates import GateConfig
     from jarvis.worker_brief import render_section
 
@@ -281,8 +249,7 @@ def test_no_post_block_exit_asks_the_worker_to_re_type_the_command(project):
                 continue
             verb = line.split()[2]
             if verb in ("contest", "explain"):
-                # Neither is reachable before a block: there is nothing to contest and
-                # nothing to explain until the OS has matched something.
+                # Neither is reachable before a block: there is nothing to contest and nothing to explain until the...
                 assert "<request-number>" in line, (
                     f"{where} offers a post-block exit that re-types the command: {line}")
             elif verb == "request":
@@ -292,10 +259,7 @@ def test_no_post_block_exit_asks_the_worker_to_re_type_the_command(project):
 
 
 def test_the_template_version_was_bumped_for_the_new_contract(project):
-    """Without the bump the paragraph never reaches an already-bootstrapped project —
-    the version comments in bootstrap.py are three separate records of exactly that
-    mistake. Pinned to the value this work order shipped, so a later edit to the
-    template that forgets the bump fails here rather than in production."""
+    """Without the bump the paragraph never reaches an already-bootstrapped project"""
     from jarvis.bootstrap import TEMPLATE_VERSION
 
     assert TEMPLATE_VERSION >= 9
@@ -303,8 +267,7 @@ def test_the_template_version_was_bumped_for_the_new_contract(project):
 
 
 def test_an_already_bootstrapped_project_is_regenerated_by_the_bump(project):
-    """The bump's whole job. A repo carrying the previous version's OPERATION.md is
-    rewritten on the next bootstrap and comes away with the new paragraph."""
+    """The bump's whole job"""
     bootstrap_project(spec(project))
     op = project / "OPERATION.md"
     from jarvis.bootstrap import TEMPLATE_VERSION
@@ -317,11 +280,11 @@ def test_an_already_bootstrapped_project_is_regenerated_by_the_bump(project):
     assert "--evidence" in op.read_text()
 
 
-# -- issue 279: the OS must not dirty a tree it never commits to ----------------------
+# -- issue 279: the OS must not dirty a tree it never commits to
 
 
 def _commit_all(path):
-    """Make the fixture repo actually OWN its files — `make_git_project` only inits."""
+    """Make the fixture repo actually OWN its files — `make_git_project` only inits"""
     import subprocess
 
     for args in (["add", "-A"],
@@ -330,7 +293,7 @@ def _commit_all(path):
 
 
 def _restamp(op, version):
-    """Rewrite the version marker in place, simulating a repo left behind by a bump."""
+    """Rewrite the version marker in place, simulating a repo left behind by a bump"""
     from jarvis.bootstrap import TEMPLATE_VERSION
 
     op.write_text(op.read_text().replace(f"template v{TEMPLATE_VERSION}",
@@ -338,11 +301,7 @@ def _restamp(op, version):
 
 
 def test_regenerating_an_unchanged_operation_md_writes_nothing(project):
-    """The loop's first half: a second bootstrap must not rewrite an identical file.
-
-    The old check matched `template vN` in the first line, so staleness was decided by
-    a proxy for the content rather than by the content. Comparing the render is exact.
-    """
+    """The loop's first half: a second bootstrap must not rewrite an identical file"""
     bootstrap_project(spec(project))
     op = project / "OPERATION.md"
     before = op.stat().st_mtime_ns
@@ -354,9 +313,7 @@ def test_regenerating_an_unchanged_operation_md_writes_nothing(project):
 
 
 def test_a_stale_gates_section_is_regenerated_under_an_unchanged_version(project):
-    """The proxy was wrong in the other direction too: a gates section that no longer
-    matched the catalog was frozen in place because the first line still named the
-    current template version (kn-12153552)."""
+    """The proxy was wrong in the other direction too: a gates section that no longer matched the catalog..."""
     from jarvis.gates import GateConfig
 
     bootstrap_project(spec(project))
@@ -368,9 +325,7 @@ def test_a_stale_gates_section_is_regenerated_under_an_unchanged_version(project
 
 
 def test_a_committed_operation_md_is_never_overwritten(project):
-    """The invariant that terminates the loop: the OS never commits, so writing over a
-    tracked file leaves the tree dirty for ever and `git pull --ff-only` refuses before
-    every release. Drift is reported for a human instead."""
+    """The invariant that terminates the loop: the OS never commits"""
     bootstrap_project(spec(project))
     op = project / "OPERATION.md"
     _restamp(op, 3)
@@ -386,8 +341,7 @@ def test_a_committed_operation_md_is_never_overwritten(project):
 
 
 def test_force_config_regenerates_a_committed_operation_md(project):
-    """The escape hatch the warning names — without it a maintainer who bumps
-    TEMPLATE_VERSION has no supported way to produce the new committed render."""
+    """The escape hatch the warning names"""
     from jarvis.bootstrap import TEMPLATE_VERSION
 
     bootstrap_project(spec(project))
@@ -402,8 +356,7 @@ def test_force_config_regenerates_a_committed_operation_md(project):
 
 
 def test_an_untracked_operation_md_is_still_refreshed(project):
-    """The rule is about ownership, not staleness: a project that does not commit its
-    contract keeps getting it refreshed."""
+    """The rule is about ownership, not staleness: a project that does not commit its contract keeps..."""
     from jarvis.bootstrap import TEMPLATE_VERSION
 
     bootstrap_project(spec(project))
@@ -416,14 +369,7 @@ def test_an_untracked_operation_md_is_still_refreshed(project):
 
 
 def test_the_template_does_not_prescribe_the_foreground_for_long_work(project):
-    """§6 of docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md,
-    on the fourth copy of the superseded sentence. OPERATION.md is what a worker reads if
-    it goes LOOKING, so a foreground wait left here contradicts the hook that refuses one
-    — and the v13 bump would ship the contradiction to every managed repo.
-
-    Pinned on the TEMPLATE, not the render, because the template is what an editor
-    touches next.
-    """
+    """§6 of docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md"""
     from jarvis.bootstrap import ASSETS
 
     template = (ASSETS / "OPERATION.md.tmpl").read_text()
@@ -433,25 +379,15 @@ def test_the_template_does_not_prescribe_the_foreground_for_long_work(project):
     for rhythm in ("run_in_background", "BashOutput", "3-4 minutes", "240 seconds",
                    "uncollected"):
         assert rhythm in template, rhythm
-    # Still true, and still there: nothing about backgrounding changes what starts the
-    # next turn, or what a turn ending on a promise costs.
+    # Still true, and still there: nothing about backgrounding changes what starts the next turn
     assert "Exactly three things start your next turn" in template
     assert "I'll pick this up when the background run finishes" in template
-    # …and the rendered contract carries it, which is the copy a worker reads.
+    # …and the rendered contract carries it, which is the copy a worker reads
     assert "3-4 minutes" in _rendered_operation(project)
 
 
 def test_this_repos_committed_operation_md_matches_its_generator():
-    """The drift that made issue 279: the committed contract sat at template v7 while
-    the generator rendered v11, so every `jarvis start` rewrote it and nothing ever
-    committed the result. With the write now refused on a tracked file, a forgotten
-    regeneration would instead freeze this repo's own contract four versions behind —
-    so the committed bytes are pinned here, and a TEMPLATE_VERSION bump that does not
-    ship the regenerated file fails in CI rather than in production.
-
-    The gate list is this project's catalog answer, duplicated because the catalog is
-    untracked (kn-12153552). Regenerate with `jarvis adopt . --force-config`.
-    """
+    """The drift that made issue 279: the committed contract sat at template v7 while the generator..."""
     from pathlib import Path
 
     from jarvis.bootstrap import operation_specifics, render_operation_md
@@ -471,8 +407,7 @@ def test_this_repos_committed_operation_md_matches_its_generator():
 
 
 def test_install_agent_assets_returns_three_roots_for_worker(project, jarvis_home):
-    """Spec 2026-09-23-the-crew-a-worker-must-use.md SS5: skills, the crew, and nothing
-    of the planner's."""
+    """Spec 2026-09-23-the-crew-a-worker-must-use.md SS5: skills, the crew, and nothing of the planner's"""
     from jarvis.bootstrap import install_agent_assets
 
     roots = install_agent_assets(project, kind="worker")

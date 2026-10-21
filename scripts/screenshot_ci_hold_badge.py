@@ -1,16 +1,4 @@
-"""Screenshot a round HELD FOR CI beside one that genuinely failed, for issue #581.
-
-`scripts/screenshot_forced_round.py` is the shape this copies. Two rounds on one work
-order, because the pair is the whole claim: both are stored `outcome='failed'`, and only
-`hold_cause` says that the first is waiting for GitHub and the second is a reviewer the
-OS could not reach. A shot of the waiting badge alone would not show what it is different
-FROM — nor that the red ✗ still means what it always meant.
-
-Writes PNGs to docs/screenshots/. Everything it touches lives in a temp `JARVIS_HOME` and
-a temp catalog, so it never reads or writes the live OS:
-
-    uv run python scripts/screenshot_ci_hold_badge.py
-"""
+"""Screenshot a round HELD FOR CI beside one that genuinely failed, for issue #581"""
 
 from __future__ import annotations
 
@@ -33,7 +21,7 @@ OUTAGE = "the validator could not be reached: claude exited 1 after 0 tokens"
 
 
 def _repo(path: Path) -> None:
-    """An empty checkout, the shape `testing.make_git_project` builds for the suite."""
+    """An empty checkout, the shape `testing.make_git_project` builds for the suite"""
     import subprocess
 
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
@@ -41,13 +29,7 @@ def _repo(path: Path) -> None:
 
 
 def order(store) -> str:
-    """One work order parked behind a pull request, with the pair of rounds.
-
-    THE CLOSES GO THROUGH `close_validation_round`, not a hand-written UPDATE: the badge
-    is evidence that the real write path records the cause, so a change that stopped
-    passing `hold_cause` shows up in the picture instead of being papered over here. Only
-    the panel's VERDICT is faked, because a real one would need five model calls.
-    """
+    """One work order parked behind a pull request, with the pair of rounds"""
     from jarvis import ops
     from jarvis.project_store import VALIDATION_CI_CAUSE
 

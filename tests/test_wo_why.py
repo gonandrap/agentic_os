@@ -1,21 +1,4 @@
-"""`jarvis wo why` — the diagnosis report, §6 of the order-observability spec
-(docs/superpowers/specs/2026-09-24-order-observability.md).
-
-The question it answers is the one §1 measured as the most-asked: "this order has not
-moved in three hours. What is it waiting for, and what do I type?" Everything it prints
-already existed, scattered over three surfaces that each showed a slice, so the tests here
-are about the AGGREGATION and about the four honesty rules the spec puts on it:
-
-* two sources that disagree are BOTH reported and neither wins — a silent pick is how
-  #197 and #711 reached the user as a confidently wrong sentence;
-* absent is never zero (issue #227) — no turn, no transcript and no timeline each get
-  `None` plus a sentence, because an unmeasurable clock and an idle one are different
-  answers;
-* a call that never reached the model has made no judgement (pinned `kn-40db1828`), so it
-  is reported as UNREACHABLE and never as something the model decided;
-* only commands the OS would accept right now are offered — offering one that will be
-  refused teaches the user to distrust the surface.
-"""
+"""`jarvis wo why` — the diagnosis report (docs/superpowers/specs/2026-09-24-order-observability.md)"""
 
 from __future__ import annotations
 
@@ -40,7 +23,7 @@ def started(jarvis_home, fake_claude, catalog_file, project):
 
 @pytest.fixture()
 def validating_catalog(tmp_path, project):
-    """The one fleet shape where a round can be forced: the panel is ON."""
+    """The one fleet shape where a round can be forced: the panel is ON"""
     data = {
         "os": {"defaults": {"model": "sonnet", "max_in_flight": 50},
                "validation": {"enabled": True},
@@ -54,23 +37,18 @@ def validating_catalog(tmp_path, project):
 
 
 def an_order(daemon, title: str = "build the exporter") -> dict:
-    """A dispatched work order — one tick, one worker."""
+    """A dispatched work order — one tick, one worker"""
     wo = ops.create_work_order("proj_a", title)
     daemon.tick()
     return wo
 
 
 def at(monkeypatch, ts: float):
-    """Write the next store rows as if the clock read `ts`.
-
-    `add_event` stamps with `db.now()` and nothing lets a caller pass a moment, so a hold
-    of a stated length can only be built by moving the clock. Patched on `db` because
-    that is the module `project_store` calls through.
-    """
+    """Write the next store rows as if the clock read `ts`"""
     monkeypatch.setattr(db, "now", lambda: ts)
 
 
-# -- 1. the blocker and the status label agree -------------------------------------------
+# -- 1. the blocker and the status label agree
 
 
 def test_assumptions_blocker_agrees_with_the_user_blockers(started, project):
@@ -83,18 +61,17 @@ def test_assumptions_blocker_agrees_with_the_user_blockers(started, project):
     assert d["project"] == "proj_a"
     assert d["blocker"]["what"] == "assumptions"
     assert d["needs_you"] and "assumption" in d["needs_you"][0].lower()
-    # The point of the report: on an order where both sources can see the same fact they
-    # say the same thing, and the user is told nothing about a conflict that is not there.
+    # The point of the report: on an order where both sources can see the same fact they say the same...
     assert d["disagreements"] == []
     assert d["status_label"]
 
 
-# -- 2. where two disagree, both are reported --------------------------------------------
+# -- 2. where two disagree, both are reported
 
 
 def test_disagreement_reported_when_the_blocker_does_not_need_the_user(started,
                                                                       monkeypatch):
-    """`true_blockers` wants the user; `waiting_on` says a turn is in flight."""
+    """`true_blockers` wants the user; `waiting_on` says a turn is in flight"""
     wo = an_order(started)
     ops.assume(wo["id"], "exporting CSV by default")
     monkeypatch.setattr(ops, "waiting_on", lambda store, w: {
@@ -107,13 +84,13 @@ def test_disagreement_reported_when_the_blocker_does_not_need_the_user(started,
     sentence = d["disagreements"][0]
     assert "waiting_on" in sentence and "true_blockers" in sentence
     assert "turn_running" in sentence
-    # Neither answer is dropped and neither is crowned.
+    # Neither answer is dropped and neither is crowned
     assert d["blocker"]["what"] == "turn_running"
     assert d["needs_you"]
 
 
 def test_disagreement_reported_when_nothing_needs_the_user(started, monkeypatch):
-    """The other direction: `waiting_on` names a user wait `true_blockers` does not."""
+    """The other direction: `waiting_on` names a user wait `true_blockers` does not"""
     wo = an_order(started)
     monkeypatch.setattr(ops, "waiting_on", lambda store, w: {
         "what": "assumptions", "stalled": False,
@@ -129,7 +106,7 @@ def test_disagreement_reported_when_nothing_needs_the_user(started, monkeypatch)
     assert d["needs_you"] == []
 
 
-# -- 3. absent is never zero -------------------------------------------------------------
+# -- 3. absent is never zero
 
 
 def test_an_order_with_no_turn_reports_none_and_says_so(started, project):
@@ -141,11 +118,11 @@ def test_an_order_with_no_turn_reports_none_and_says_so(started, project):
     assert d["clock"]["last_turn"] != 0
     assert d["clock"]["turn_open"] is False
     assert "note" in d["clock"] and d["clock"]["note"]
-    # And the report says out loud that it read the record rather than the process.
+    # And the report says out loud that it read the record rather than the process
     assert "jarvis watch" in d["clock"]["live_note"]
 
 
-# -- 4. no transcript means the residual is unmeasurable, not nil ------------------------
+# -- 4. no transcript means the residual is unmeasurable, not nil
 
 
 def test_missing_transcript_leaves_the_residual_none(started):
@@ -160,12 +137,10 @@ def test_missing_transcript_leaves_the_residual_none(started):
     assert "transcript" in residual["note"]
 
 
-# -- 5. a call that never reached the model decided nothing ------------------------------
+# -- 5. a call that never reached the model decided nothing
 
 
-#: Words that would turn an unreachable call into a judgement it never made. Asserted
-#: against the block rather than the payload: the rest of the report legitimately talks
-#: about reviews and escalations.
+#: Words that would turn an unreachable call into a judgement it never made
 JUDGEMENT_WORDS = ("decision", "decided", "escalat", "refus", "verdict", "answered it")
 
 
@@ -188,7 +163,7 @@ def test_a_failed_os_call_is_reported_as_unreachable(started):
         assert word not in blob, word
 
 
-# -- 6. only commands the OS would accept right now --------------------------------------
+# -- 6. only commands the OS would accept right now
 
 
 def commands(d: dict) -> list[str]:
@@ -224,7 +199,7 @@ def test_validation_force_is_offered_when_it_would_be_accepted(jarvis_home, fake
 
 
 def test_unblock_is_offered_bare_when_a_dependency_is_dead(started, project):
-    """A stranded order: the default form cuts the dead edge, so it is the one offered."""
+    """A stranded order: the default form cuts the dead edge, so it is the one offered"""
     first = ops.create_work_order("proj_a", "the thing it builds on")
     second = ops.create_work_order("proj_a", "the dependent", depends_on=[first["id"]])
     store = ProjectStore(project)
@@ -240,7 +215,7 @@ def test_unblock_is_offered_bare_when_a_dependency_is_dead(started, project):
 
 
 def test_unblock_needs_all_when_the_dependency_is_still_live(started, project):
-    """A live edge: `unblock_work_order` refuses the bare form, so only --all shows."""
+    """A live edge: `unblock_work_order` refuses the bare form, so only --all shows"""
     first = ops.create_work_order("proj_a", "the thing it builds on")
     second = ops.create_work_order("proj_a", "the dependent", depends_on=[first["id"]])
 
@@ -253,7 +228,7 @@ def test_unblock_needs_all_when_the_dependency_is_still_live(started, project):
     assert "LIVE" in why
 
 
-# -- 6b. a capped list is never presented as the whole of it ---------------------------
+# -- 6b. a capped list is never presented as the whole of it
 
 
 def test_os_calls_report_their_cap_and_the_counts_as_a_floor(started):
@@ -267,7 +242,7 @@ def test_os_calls_report_their_cap_and_the_counts_as_a_floor(started):
     assert calls["calls"] == 2 and calls["limit"] == 2 and calls["capped"] is True
     assert "capped at the newest 2 calls" in calls["note"]
     assert "floor" in calls["note"]
-    # The human listing's arithmetic, done here so the renderer only slices.
+    # The human listing's arithmetic, done here so the renderer only slices
     assert calls["shown_limit"] == 1 and calls["more"] == 1
 
 
@@ -290,11 +265,11 @@ def test_ack_is_withheld_while_assumptions_are_pending(started):
     d = ops.diagnose(wo["id"])
 
     assert not any(c.startswith("jarvis wo ack") for c in commands(d))
-    # The command that IS the way through is the one `waiting_on` already names.
+    # The command that IS the way through is the one `waiting_on` already names
     assert f"jarvis wo review {wo['id']}" in d["blocker"]["detail"]
 
 
-# -- 7. the holds, with the open one marked ----------------------------------------------
+# -- 7. the holds, with the open one marked
 
 
 def test_holds_are_listed_and_by_cause_sums_to_them(started, project, monkeypatch):
@@ -320,17 +295,13 @@ def test_holds_are_listed_and_by_cause_sums_to_them(started, project, monkeypatc
     assert [e for e in held["episodes"] if e["open"]] == [held["open"]]
     total = sum(e["seconds"] for e in held["episodes"])
     assert sum(held["by_cause"].values()) == pytest.approx(total, abs=2.0)
-    # Biggest first, so a reader's eye lands on the hold that cost the afternoon.
+    # Biggest first, so a reader's eye lands on the hold that cost the afternoon
     assert list(held["by_cause"]) == ["neo_question", "gate"]
 
 
 def test_the_report_closes_a_synthesised_hold_the_round_ended(started, project,
                                                               monkeypatch):
-    """`jarvis wo why` is 2d1's reader: `_diagnose_holds` calls `holds.held`, so a hold
-    the round's verdict ended must read closed HERE, where the user asks. wo-3615faf7
-    read 11.7h open instead of 57m, and an eternally open hold also suppresses genuine
-    park blockers — `parked_reason` subtracts hold seconds before it decides. Spec §2d1
-    of docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md."""
+    """`jarvis wo why` is 2d1's reader: `_diagnose_holds` calls `holds.held` (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md)"""
     from jarvis.holds import PAUSE_USAGE_LIMIT
     from jarvis.project_store import VALIDATION_HELD_CAUSE
 
@@ -354,15 +325,14 @@ def test_the_report_closes_a_synthesised_hold_the_round_ended(started, project,
     assert held["episodes"][0]["seconds"] == pytest.approx(3600, abs=2.0)
 
 
-# -- 8. a settled order diagnoses cleanly ------------------------------------------------
+# -- 8. a settled order diagnoses cleanly
 
 
 def test_a_completed_order_says_how_it_settled(started, project, settle_turns):
     wo = an_order(started)
     store = ProjectStore(project)
     try:
-        # The dispatch turn is a real process; a work order with one still in flight is
-        # waiting on the turn, whatever its status column says.
+        # The dispatch turn is a real process
         assert settle_turns(store)
         store.set_status(wo["id"], "completed")
     finally:
@@ -378,7 +348,87 @@ def test_a_completed_order_says_how_it_settled(started, project, settle_turns):
     assert not any(c.startswith("jarvis wo resume-auto") for c in commands(d))
 
 
-# -- 9. the CLI hands the dict over unchanged --------------------------------------------
+# -- 8b. the scheduled actor rides on the debug surface
+
+
+def test_the_diagnosis_carries_the_scheduled_actor(started, project):
+    wo = an_order(started)
+    store = ProjectStore(project)
+    try:
+        row = store.get_work_order(wo["id"])
+        actor = ops.scheduled_actor(store, row)
+        assert actor is not None, "the premise: this row HAS a daemon pass coming for it"
+    finally:
+        store.close()
+
+    d = ops.diagnose(wo["id"])
+
+    assert d["actor"] == {"pass_name": actor.pass_name, "why": actor.why,
+                          "predicate": actor.predicate}
+
+
+def test_a_row_with_no_actor_reports_the_key_present_and_none(started, project):
+    wo = an_order(started)
+    store = ProjectStore(project)
+    try:
+        store.set_status(wo["id"], "needs_review")
+        row = store.get_work_order(wo["id"])
+        assert ops.scheduled_actor(store, row) is None, \
+            "the premise: `needs_review` has no daemon pass — the user is the actor"
+    finally:
+        store.close()
+
+    d = ops.diagnose(wo["id"])
+
+    # Absent must not be how "no actor" is spelled (issue #227's rule)
+    assert "actor" in d
+    assert d["actor"] is None
+
+
+def test_a_settled_order_reports_no_actor_rather_than_raising(started, project,
+                                                              settle_turns):
+    """`scheduled_actor` is keyed on OPEN_STATUSES and raises off them by design"""
+    wo = an_order(started)
+    store = ProjectStore(project)
+    try:
+        assert settle_turns(store)
+        store.set_status(wo["id"], "completed")
+    finally:
+        store.close()
+
+    assert ops.diagnose(wo["id"])["actor"] is None
+
+
+def test_cli_prints_the_actor_under_waiting_on(started, project, capsys):
+    wo = an_order(started)
+    store = ProjectStore(project)
+    try:
+        actor = ops.scheduled_actor(store, store.get_work_order(wo["id"]))
+        assert actor is not None
+    finally:
+        store.close()
+
+    assert cli.main(["wo", "why", wo["id"]]) == 0
+    out = capsys.readouterr().out
+
+    assert actor.pass_name in out and actor.predicate in out and actor.why in out
+    assert out.index("waiting on:") < out.index(actor.pass_name)
+
+
+def test_cli_says_when_no_daemon_pass_will_act(started, project, capsys):
+    wo = an_order(started)
+    store = ProjectStore(project)
+    try:
+        store.set_status(wo["id"], "needs_review")
+    finally:
+        store.close()
+
+    assert cli.main(["wo", "why", wo["id"]]) == 0
+
+    assert "no daemon pass will act on this order" in capsys.readouterr().out
+
+
+# -- 9. the CLI hands the dict over unchanged
 
 
 def test_cli_json_round_trips_the_ops_dict(started, capsys):
@@ -408,17 +458,16 @@ def test_cli_human_rendering_names_the_blocker(started, capsys):
 
     assert wo["id"] in out
     assert f"jarvis wo review {wo['id']}" in out
-    # The listing is cut at the payload's depth and the remainder comes from the payload
-    # too — 200 lines of call table in a terminal is not a diagnosis.
+    # The listing is cut at the payload's depth and the remainder comes from the payload too
     assert out.count("  answered  ") == ops.OS_CALLS_SHOWN
     assert "… and 2 older call(s)" in out
 
 
-# -- 10. every command offered is one the OS would accept -------------------------------
+# -- 10. every command offered is one the OS would accept
 
 
 def test_ack_is_offered_and_the_real_command_accepts_it(started, project):
-    """The offer and the acceptance agree — one predicate, `ops.ack_refusal`."""
+    """The offer and the acceptance agree — one predicate, `ops.ack_refusal`"""
     wo = an_order(started)
     store = ProjectStore(project)
     try:
@@ -435,7 +484,7 @@ def test_ack_is_offered_and_the_real_command_accepts_it(started, project):
 
 
 def test_a_withheld_ack_is_explained(started, project):
-    """§6.5: a command not offered says why, like a withheld `validation force`."""
+    """§6.5: a command not offered says why, like a withheld `validation force`"""
     wo = an_order(started)
     ops.assume(wo["id"], "exporting CSV by default")
 
@@ -448,7 +497,7 @@ def test_a_withheld_ack_is_explained(started, project):
 
 
 def test_no_attention_flag_means_no_ack_offer_and_no_refusal(started, project):
-    """Nothing to ack and nothing to refuse either."""
+    """Nothing to ack and nothing to refuse either"""
     wo = ops.create_work_order("proj_a", "nobody flagged this")
 
     d = ops.diagnose(wo["id"])
@@ -472,7 +521,7 @@ def test_resume_auto_is_offered_when_nothing_is_coming_by_itself(started, projec
 
 
 def test_resume_auto_is_withheld_from_an_idle_manager(started, project):
-    """`manager_idle` is in `NUDGE_IS_WRONG`: the nudge buys one turn of nothing."""
+    """`manager_idle` is in `NUDGE_IS_WRONG`: the nudge buys one turn of nothing"""
     wo = ops.create_work_order("proj_a", "the feature's manager")
     store = ProjectStore(project)
     try:
@@ -487,13 +536,7 @@ def test_resume_auto_is_withheld_from_an_idle_manager(started, project):
 
 
 def test_resume_auto_is_withheld_when_a_nudge_is_actively_wrong(started, monkeypatch):
-    """The `NUDGE_IS_WRONG` arm itself, which store state cannot reach.
-
-    Both entries — `message_stuck` and `manager_idle` — report `stalled=False` from real
-    store rows, so the offer is already withheld by the `stalled` test above them in
-    `_diagnose_commands`. The arm exists for a `what` in that mapping arriving stalled,
-    which no store shape produces, so the blocker is stated directly here.
-    """
+    """The `NUDGE_IS_WRONG` arm itself, which store state cannot reach"""
     wo = an_order(started)
     monkeypatch.setattr(ops, "waiting_on", lambda store, w: {
         "what": "message_stuck", "stalled": True,
@@ -508,8 +551,7 @@ def test_an_escalated_gate_offers_both_verdicts(started, project):
     wo = an_order(started)
     store = ProjectStore(project)
     try:
-        # The command text is never read by the report (kn-1791a5e6: a gate's command is
-        # a privileged line a worker proposed), so the fixture states none.
+        # The command text is never read by the report (kn-1791a5e6: a gate's command is a privileged line a...
         approval = store.add_approval(wo["id"], "release", "<the proposed command>")
         store.mark_approval_escalated(approval["id"], "Neo would not decide this one")
         assert store.escalated_approvals(wo["id"])
@@ -522,7 +564,7 @@ def test_an_escalated_gate_offers_both_verdicts(started, project):
     assert f'jarvis gate deny {approval["id"]} --reason "…"' in commands(d)
 
 
-# -- 11. a found transcript gives the residual a number ---------------------------------
+# -- 11. a found transcript gives the residual a number
 
 
 def _stamp(at: float) -> str:
@@ -530,8 +572,7 @@ def _stamp(at: float) -> str:
 
 
 def _transcript(session: str, rows: list[dict]) -> str:
-    """One session file where `usage.index_sessions` looks — `jarvis_home` points that
-    at an empty tree, so nothing else is on disk."""
+    """One session file where `usage.index_sessions` looks"""
     directory = Path(os.environ[usage.TRANSCRIPT_ROOT_ENV]) / "-proj"
     directory.mkdir(parents=True, exist_ok=True)
     (directory / f"{session}.jsonl").write_text(
@@ -572,7 +613,7 @@ def test_a_live_turn_reports_the_clock_open(started):
     assert d["clock"]["last_turn"]["state"] == "running"
 
 
-# -- 12. absent notes are absent, not blank --------------------------------------------
+# -- 12. absent notes are absent, not blank
 
 
 def test_an_order_with_no_notes_reports_all_three_as_none(started):
@@ -583,16 +624,14 @@ def test_an_order_with_no_notes_reports_all_three_as_none(started):
     assert notes == {"parked": None, "pause": None, "fleet_hold": None}
 
 
-# -- 13. a failed order is offered the retry, and only a failed one ----------------------
-# docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md §6 and §7.
+# -- 13. a failed order is offered the retry, and only a failed one
 
 
 def _failed(started, project, session: bool = True) -> dict:
     wo = an_order(started) if session else ops.create_work_order("proj_a", "never opened")
     store = ProjectStore(project)
     try:
-        # The turn DIED — without ending it the diagnosis is `turn_running`, which is the
-        # honest answer while a process is alive.
+        # The turn DIED — without ending it the diagnosis is `turn_running`
         turn = store.latest_turn(wo["id"])
         if turn is not None:
             store.finish_turn(turn["id"], "failed")
@@ -610,8 +649,7 @@ def test_a_failed_order_is_offered_the_retry_and_its_blocker_names_it(started, p
     assert d["blocker"]["what"] == "failed"
     assert d["blocker"]["stalled"] is False
     assert f"jarvis wo retry {wo['id']}" in d["blocker"]["detail"]
-    # FIRST: on a failed order it is the only command that moves the work, and the list
-    # is read top down.
+    # FIRST: on a failed order it is the only command that moves the work, and the list is read top down
     assert d["commands"][0]["command"] == f"jarvis wo retry {wo['id']}"
     assert not any(f"wo retry {wo['id']}" in r for r in d["refusals"])
 
@@ -626,8 +664,7 @@ def test_a_failed_order_with_no_session_reports_the_retry_as_refused(started, pr
 
 
 def test_no_healthy_order_is_told_why_it_cannot_be_retried(started):
-    """The `elif` guard: a running order does not want a line explaining a mechanism
-    that does not apply to it."""
+    """The `elif` guard: a running order does not want a line explaining a mechanism that does not apply..."""
     wo = an_order(started)
 
     d = ops.diagnose(wo["id"])
