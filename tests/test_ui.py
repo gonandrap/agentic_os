@@ -20,7 +20,7 @@ from jarvis.ui.app import create_app  # noqa: E402
 
 
 @pytest.fixture()
-def client(jarvis_home, fake_claude, catalog_file):
+def client(jarvis_home, fake_claude, catalog_file, live_daemon):
     ops.start_os(str(catalog_file), foreground=True)
     return TestClient(create_app(), follow_redirects=False)
 

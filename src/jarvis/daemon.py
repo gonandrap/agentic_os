@@ -80,6 +80,9 @@ def _limiter_line(figures: dict[str, Any]) -> str:
 
 
 RECONCILE_EVERY_TICKS = 6  # refresh `claude agents --json` every N ticks (injected only)
+
+#: Reconcile stamp an outside reader judges liveness by; spec 2026-10-16 §2a
+RECONCILE_TICK_KEY = "reconcile_tick"
 SECONDS_PER_HOUR = 3600    # a unit, not a setting
 #: Ask GitHub about parked pull requests every N ticks — ~2 minutes at the default 5s interval
 PR_POLL_EVERY_TICKS = 24
@@ -907,6 +910,12 @@ class Daemon:
 
         from .notify import route_new_inbox
         route_new_inbox(self.central, self.catalog)
+
+        # LAST, so a reconcile pass that hangs goes dark instead of reporting itself alive (docs/superpowers/specs/2026-10-16-a-stopped-daemon-is-a-liveness-gap.md)
+        if reconcile:
+            self.central.set_state(RECONCILE_TICK_KEY, db.to_json(
+                {"ts": db.now(),
+                 "interval": RECONCILE_EVERY_TICKS * self.poll_interval}))
 
     def seal_bills(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Freeze the bill of every order that has settled and has none yet"""

@@ -1923,7 +1923,7 @@ def _stuck_attention(catalog) -> list:
 
 
 def test_a_standing_critical_violation_reaches_the_attention_list(
-        jarvis_home, project, catalog_file, monkeypatch):
+        jarvis_home, project, catalog_file, monkeypatch, live_daemon):
     """Neo 1084: `jarvis status` read HEALTHY over a standing critical violation"""
     from jarvis.catalog import load_catalog
     from jarvis.daemon import Daemon

@@ -9,6 +9,7 @@ from jarvis.testing import (  # noqa: F401
     fleet_fixture,
     improvement_order,
     jarvis_home,
+    live_daemon,
     local_base,
     make_git_project,
     origins,

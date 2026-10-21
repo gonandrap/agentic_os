@@ -38,7 +38,7 @@ def ignored_reason(store: ProjectStore, wo_id: str) -> str:
 
 
 @pytest.fixture()
-def started(jarvis_home, fake_claude, catalog_file, project):
+def started(jarvis_home, fake_claude, catalog_file, project, live_daemon):
     """The OS running against the fixture catalog"""
     ops.start_os(str(catalog_file), foreground=True)
     return Daemon(load_catalog(catalog_file))
