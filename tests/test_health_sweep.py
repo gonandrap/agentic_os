@@ -2313,7 +2313,6 @@ def test_each_blocker_id_comes_from_its_canonical_source(store, monkeypatch):
     # with no `pr_url` as a hole where no daemon pass selects it, so `true_blockers`
     # raises `invariants.NO_ACTOR_BLOCKER` and the id is `user`, never `pull-request`.
     assert health.blocker(store, subject(parked), cfg) == "user"
-    assert health.blocker(store, subject(parked), cfg) != "pull-request"
 
     # 4. ONE ID PER TRANSPORT CAUSE, each an OPEN `holds.Hold` of its own cause (Neo
     # q1241). Collapsed under `usage-limit` they could not be narrowed apart.

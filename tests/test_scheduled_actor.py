@@ -476,7 +476,7 @@ def test_a_done_turn_the_settler_will_not_move_does_not_name_the_settler(
 
     actor = ops.scheduled_actor(store, row)
 
-    assert actor is None or actor.pass_name != "Daemon.settle_turns"
+    assert actor is None
     settler(store)
     moved = store.get_work_order(wo["id"])
     assert (moved["status"], bool(moved["needs_attention"])) == ("running", False)
