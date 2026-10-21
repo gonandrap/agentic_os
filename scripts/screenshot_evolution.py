@@ -1,20 +1,4 @@
-"""Screenshot `/evolution` twice — seeded and empty — for a PR's UI evidence.
-
-§9 of docs/superpowers/specs/2026-09-27-self-evolution.md. The pair is the point:
-
-* `evolution-fleet.png` — a registry with two detectors, fires across three ISO weeks,
-  closed fires so a median exists, and two recurrences. Every section has rows.
-* `evolution-absent.png` — an EMPTY registry, which is what every install starts with.
-  It must read "no rule has been armed yet, so there is no mechanical share to report —
-  which is not a share of zero" where a lesser page would print `0%`.
-
-Seeding copies `tests/test_evolution_report.py`: fires are backdated by moving
-`jarvis.db.now`, which is the only sanctioned way — `record_rule_fire` stamps the clock
-itself and takes no `ts`. Offsets are relative to the REAL clock, not the test's frozen
-constant, so every fire lands inside the report's 90-day window whenever this is re-run.
-
-    uv run python scripts/screenshot_evolution.py
-"""
+"""Screenshot `/evolution` twice — seeded and empty — for a PR's UI evidence (docs/superpowers/specs/2026-09-27-self-evolution.md)"""
 
 from __future__ import annotations
 
@@ -35,7 +19,7 @@ WEEK = 7 * DAY
 
 
 def boot() -> None:
-    """A one-project fleet, the shape `scripts/screenshot_alarm_question.py` boots."""
+    """A one-project fleet, the shape `scripts/screenshot_alarm_question.py` boots"""
     from jarvis import ops
     from jarvis.central_store import CentralStore
     from jarvis.testing import make_git_project
@@ -57,7 +41,7 @@ def boot() -> None:
 
 
 def empty_registry() -> None:
-    """Clear the builtin seed rows, so the absent shot is a genuinely empty registry."""
+    """Clear the builtin seed rows, so the absent shot is a genuinely empty registry"""
     from jarvis.central_store import CentralStore
 
     store = CentralStore()
@@ -68,7 +52,7 @@ def empty_registry() -> None:
 
 
 def seed() -> None:
-    """Two detectors, fires across three ISO weeks, closed fires, two recurrences."""
+    """Two detectors, fires across three ISO weeks, closed fires, two recurrences"""
     from jarvis import db, rules
     from jarvis.central_store import CentralStore
 
@@ -106,9 +90,7 @@ def seed() -> None:
                 store.close_rule_fire(row["id"],
                                       now=float(row["ts"]) + cleared_after)
 
-        # Three ISO weeks, so `by_gap_class` and the week table both have rows, and more
-        # than `evolution.min_samples` closed fires on each side so a median and the
-        # dry-run/armed comparison both exist.
+        # Three ISO weeks, so `by_gap_class` and the week table both have rows
         for n, (order, secs) in enumerate(
                 (("wo-101", 7200), ("wo-102", 5400), ("wo-103", 4800))):
             fire(panel["id"], order, at=real_now() - 2 * WEEK - n * DAY,

@@ -1,30 +1,4 @@
-"""Screenshot the `/cost` WINDOW SELECTOR, for a PR's UI evidence.
-
-`scripts/screenshot_bill_reading.py` is the shape this copies: a temp `JARVIS_HOME`, a
-temp catalog, synthetic state written through the real schema, the app served in a
-thread. The difference is that every figure here is a question about WHEN, so the state
-is placed on a CHOSEN clock — four orders, one per window:
-
-    the current usage week · the previous week · a 5h slice · and one six weeks back
-    that must appear in NO shot
-
-so the shots differ in the only way that makes them evidence. Seven shots, because the
-claim has seven parts: the default is still the usage week, a past week moves every
-number, a 5h slice is reportable at all, a custom range round-trips through the form,
-A BAD PARAMETER IS REFUSED rather than silently reported as the week (§3 of
-docs/superpowers/specs/2026-10-07-cost-window-selector.md), the DISPLAY ZONE can be
-picked and labels the page in it, and a bad zone is refused the same way (§11).
-
-Each shot is CLIPPED from the page heading to the bottom of the headline panel, so the
-selector row, both window labels and the totals are legible in one image rather than a
-full-page strip. The default/previous-week pair is compared before the script exits: an
-identical pair is worthless as evidence, so it fails rather than reporting success. The
-Europe/Berlin shot is compared against the default week the other way round — §11's
-display-only rule says changing the zone must move NO number, so an unequal headline
-total fails.
-
-    uv run python scripts/screenshot_cost_window.py
-"""
+"""Screenshot the `/cost` WINDOW SELECTOR, for a PR's UI evidence (docs/superpowers/specs/2026-10-07-cost-window-selector.md)"""
 
 from __future__ import annotations
 
@@ -43,7 +17,7 @@ SHOTS = REPO / "docs" / "screenshots"
 PORT = 8809
 PROJECT = "jarvis_os"
 
-#: The clip: the heading, the selector row and the headline totals, nothing below.
+#: The clip: the heading, the selector row and the headline totals, nothing below
 CLIP = """() => {
   const p = [...document.querySelectorAll('p')]
       .find(e => e.textContent.trim().startsWith('~$'));
@@ -67,13 +41,7 @@ HEADLINE = """() => {
 
 
 def os_call(wo_id: str, at: float, *, read: int, out: int) -> None:
-    """One `agent_calls` row WITH tokens — Neo answering between a worker's turns.
-
-    Written here rather than through `FleetCostFixture.os_call`, which stamps zero
-    tokens: every figure on the page is list-priced from tokens, so a zero-token row
-    would put the jarvis half of the headline at $0.00 in every shot and the evidence
-    would show only the worker half moving with the window.
-    """
+    """One `agent_calls` row WITH tokens — Neo answering between a worker's turns"""
     from jarvis.central_store import CentralStore
 
     central = CentralStore()
@@ -89,17 +57,12 @@ def os_call(wo_id: str, at: float, *, read: int, out: int) -> None:
 
 
 def stamp(ts: float, zone: str) -> str:
-    """The seconds-less shape `<input type="datetime-local">` submits.
-
-    Rendered in the page's DISPLAY zone, because that is the clock the form is now
-    parsed in (§11). Stamping UTC here put the custom shot's range hours off its seeded
-    orders and the shot read $0.00.
-    """
+    """The seconds-less shape `<input type="datetime-local">` submits"""
     return datetime.fromtimestamp(ts, tz=ZoneInfo(zone)).strftime("%Y-%m-%dT%H:%M")
 
 
 def seed() -> dict[str, str]:
-    """Four orders in four windows; returns the query strings the shots use."""
+    """Four orders in four windows; returns the query strings the shots use"""
     from jarvis import ops
     from jarvis.central_store import CentralStore
     from jarvis.testing import FleetCostFixture, make_git_project
@@ -126,8 +89,7 @@ def seed() -> dict[str, str]:
 
     fix = FleetCostFixture(home, project, root, catalog, name=PROJECT)
 
-    # The windows themselves come from the resolver under test, so the state is placed
-    # by the same arithmetic the page reports with.
+    # The windows themselves come from the resolver under test
     week = ops.cost_window(window="week", offset=0)
     prev = ops.cost_window(window="week", offset=-1)
     sess = ops.cost_window(window="5h", offset=-1)
@@ -158,7 +120,7 @@ def seed() -> dict[str, str]:
         ])
         os_call(wo_id, at + 120, read=read // 4, out=out // 4)
 
-    # The zone read the way the page reads it, never a constant imported from catalog.
+    # The zone read the way the page reads it, never a constant imported from catalog
     zone = ops.cost_zone()
     return {
         "wo-cost-window-week": "",
@@ -227,7 +189,7 @@ def main() -> int:
               f"nothing, or reports the default week, is not evidence of a range",
               file=sys.stderr)
         return 1
-    # §11: the display zone is display only, so the total under it may not move.
+    # §11: the display zone is display only, so the total under it may not move
     berlin = seen["wo-cost-window-tz"]
     if berlin != default:
         print(f"FAIL: ?tz=Europe/Berlin reads {berlin} and the default week reads "

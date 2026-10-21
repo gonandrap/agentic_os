@@ -1,14 +1,4 @@
-"""Health probes: what counts as a work order or feature order going badly.
-
-§2 of docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md. NOTHING IN
-THIS MODULE RAISES A FINDING OR MAKES A MODEL CALL — it ships the list §4's sweep reads.
-
-A leaf with no `jarvis` imports, so `catalog` can hold a `tuple[HealthProbe, ...]` the
-way it already holds a `GateConfig`. The prose lives here rather than in `catalog.py`
-for the reason `gates.REVIEWER_PERSONA` and `plans.PLAN_REVIEWER_PERSONA` live in the
-modules that own their kinds: a persona belongs beside the thing it judges, and a
-catalog full of paragraphs is a catalog nobody can read for its settings.
-"""
+"""Health probes: what counts as a work order or feature order going badly (docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md)"""
 
 from __future__ import annotations
 
@@ -16,19 +6,13 @@ import re
 from dataclasses import dataclass, replace
 from typing import Any, Iterable, Mapping, Sequence
 
-#: The two things a probe can be pointed at. `subjects` is refused against this at
-#: catalog-parse time, because a probe armed for nothing is a setting that silently
-#: does nothing.
+#: The two things a probe can be pointed at
 SUBJECTS = ("work_order", "feature_order")
 
-#: A probe id is the alarm's `probe` column and a surface's grouping key, so it is
-#: spelled one way only.
+#: A probe id is the alarm's `probe` column and a surface's grouping key, so it is spelled one way only
 ID_PATTERN = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 
-#: `inspection`'s alarm kinds, which a probe id may NOT take: the two would read as one
-#: thing on `/alarms`, in `jarvis alarms` and in `alarms_across`. Duplicated as literals
-#: rather than imported — `inspection` imports `catalog`, which imports this module, so
-#: the import would be a cycle. `tests/test_probes.py` pins the two equal.
+#: `inspection`'s alarm kinds, which a probe id may NOT take: the two would read as one thing on...
 RESERVED_IDS = ("long-turn", "stalled-turn", "slow-model-response",
                 "long-join", "big-rewrite",
                 "rewrite-tax-prefix", "rewrite-tax-ttl",
@@ -37,11 +21,7 @@ RESERVED_IDS = ("long-turn", "stalled-turn", "slow-model-response",
 
 @dataclass(frozen=True)
 class HealthProbe:
-    """One symptom, addressed to the supervisor.
-
-    Frozen because the shipped list is module-level state shared by every project's
-    resolved config: `resolve` returns a new tuple and never edits one in place.
-    """
+    """One symptom, addressed to the supervisor"""
 
     id: str
     title: str
@@ -50,12 +30,7 @@ class HealthProbe:
     enabled: bool = True
 
 
-# -- the shipped list -------------------------------------------------------------------
-#
-# CONTENT, NOT SCAFFOLDING (§2). Each prompt says what the symptom IS, what in the
-# evidence packet would show it, what would innocently look like it, and what to do with
-# a symptom that is visible but unexplained. A one-line prompt produces a detector that
-# fires on everything, and the `reason` it produces is what the user reads on /alarms.
+# -- the shipped list
 
 DEFAULT_PROBES: tuple[HealthProbe, ...] = (
     HealthProbe(
@@ -150,24 +125,7 @@ DEFAULT_PROBES: tuple[HealthProbe, ...] = (
 
 def resolve(base: Sequence[HealthProbe],
             override: Iterable[Mapping[str, Any]]) -> tuple[HealthProbe, ...]:
-    """Merge an override list over `base` BY ID, returning a new tuple.
-
-    THE MERGE RULE IS THE DECISION (§2). An entry whose id matches replaces only the
-    fields it names; a new id appends; a probe the override does not name is inherited
-    unchanged. Wholesale replacement was rejected because "watch for one more thing
-    here" would then mean re-declaring the whole list, which silently stops tracking the
-    fleet's later edits — `kn-6ca2bcd9`'s failure, one level down. A project can DISABLE
-    an inherited probe and cannot delete it, so what the fleet watches for stays legible
-    on every project's read.
-
-    `override` entries are PARTIAL: `{"id": …}` plus whatever fields were named, already
-    typed by `catalog._parse_probes`. That is what "named fields" means, and it is why
-    this takes mappings rather than `HealthProbe`s — a `HealthProbe` cannot express
-    "prompt was not mentioned".
-
-    `base` is never mutated: the shipped `DEFAULT_PROBES` is shared by every project's
-    resolved config.
-    """
+    """Merge an override list over `base` BY ID, returning a new tuple"""
     out = list(base)
     at = {p.id: i for i, p in enumerate(out)}
     for entry in override:
@@ -182,12 +140,11 @@ def resolve(base: Sequence[HealthProbe],
 
 
 def armed(probes: Iterable[HealthProbe], subject_kind: str) -> tuple[HealthProbe, ...]:
-    """The enabled probes that apply to one kind of subject, in list order."""
+    """The enabled probes that apply to one kind of subject, in list order"""
     return tuple(p for p in probes if p.enabled and subject_kind in p.subjects)
 
 
-#: The sweep's reply shape. Appended LAST so it is the final word in the system prompt,
-#: and worded to override the persona explicitly — §4.1 of docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md.
+#: The sweep's reply shape (docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md)
 SWEEP_CONTRACT = """# Your output, which REPLACES the shape described above
 
 You are not reviewing a cost alarm. There is no `decision` to make here and no alarm to
@@ -205,21 +162,7 @@ checklist above."""
 
 
 def render_checklist(probes: Sequence[HealthProbe]) -> str:
-    """The checklist §4 puts in the supervisor's system prompt.
-
-    Empty in, empty out — and that is load-bearing: `supervisor.build_system_prompt`
-    appends nothing at all when there are no probes, so the cost review's prompt prefix
-    stays byte-identical to what it was before this feature existed.
-
-    The id is rendered beside the title because a finding names its probe by id (§4's
-    output contract); the ORDER is the resolved list's, so a reader of
-    `jarvis supervisor probes` sees the list in the order the model saw it.
-
-    IT ALSO CARRIES `SWEEP_CONTRACT`, because the persona this is appended to demands
-    the COST REVIEW's `{"decision": ...}` and nothing else in the sweep's prompt ever
-    said otherwise. Here rather than in the persona (whose prefix the cost review
-    shares), and last rather than first (order is the fix, not the wording) — §4.1 of docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md.
-    """
+    """The checklist §4 puts in the supervisor's system prompt (docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md)"""
     if not probes:
         return ""
     lines = [

@@ -1,18 +1,4 @@
-"""A validation round whose seats were KILLED BY A SIGNAL is re-judged, and investigated.
-
-GitHub issue #1039. The live failure is wo-ab6c309d round 1: all four seats exited 143
-(SIGTERM) within the same second, at the same elapsed time, with no bytes on either
-stream — one external event, not four model failures. The empty detail classified as
-nothing at all, so the round closed `escalated` and the order sat in `needs_review` for
-nine hours with no rc, no co-incidence and no pointer to what else happened at 18.5s.
-
-Spec: docs/superpowers/specs/
-2026-10-14-a-killed-validation-panel-opens-an-investigation.md §4.
-
-These drive the REAL `Daemon._validate_work_order`, like `tests/test_validation_auth_hold.py`
-and for the same reason: the defect spans the transport's classification, the seat, the
-panel's verdict and the round machine, and a test of any one alone passed throughout.
-"""
+"""A validation round whose seats were KILLED BY A SIGNAL is re-judged, and investigated (#1039)"""
 
 from __future__ import annotations
 
@@ -26,7 +12,7 @@ from jarvis.project_store import ProjectStore
 from tests.test_validation_loop import (  # noqa: F401
     Validator, fleet, finish, passed)
 
-#: The message `claude_cli._cli_failure` builds for the incident's own exit code.
+#: The message `claude_cli._cli_failure` builds for the incident's own exit code
 KILLED_MESSAGE = "claude -p judge... was killed by a signal (rc=143) and wrote nothing"
 
 
@@ -57,12 +43,11 @@ def _submitted(fleet, **catalog):
     return wo
 
 
-# -- 1. the round is closed `failed` and re-judged, not parked -------------------------
+# -- 1. the round is closed `failed` and re-judged, not parked
 
 
 def test_a_killed_panel_closes_the_round_failed_and_spends_no_round(fleet):
-    """Spec §4, steps 2 and 3: `counted_validation_rounds` ignores a `failed` round, so
-    the submitter pays nothing and the next tick picks the SAME round up."""
+    """Spec §4, steps 2 and 3: `counted_validation_rounds` ignores a `failed` round"""
     fleet.daemon.validator = Validator(killed())
     wo = _submitted(fleet)
 
@@ -86,8 +71,7 @@ def test_a_killed_panel_closes_the_round_failed_and_spends_no_round(fleet):
 
 
 def test_the_same_round_is_judged_again_on_the_next_tick(fleet):
-    """Spec §4, step 2: no new re-judge mechanism and no human anywhere in it — the
-    submitter still spends round ONE."""
+    """Spec §4, step 2: no new re-judge mechanism and no human anywhere in it"""
     fleet.daemon.validator = Validator(killed(), passed())
     wo = _submitted(fleet)
 
@@ -103,9 +87,7 @@ def test_the_same_round_is_judged_again_on_the_next_tick(fleet):
 
 
 def test_the_cause_is_its_own_and_never_transport(fleet):
-    """Spec §4, step 3: every surface that reads these payloads tells the two apart only
-    by this string, and `cause: "transport"` would be the OS stating an outage it never
-    observed."""
+    """Spec §4, step 3: every surface that reads these payloads tells the two apart only by this string"""
     fleet.daemon.validator = Validator(killed())
     wo = _submitted(fleet)
 
@@ -121,13 +103,11 @@ def test_the_cause_is_its_own_and_never_transport(fleet):
         store.close()
 
 
-# -- 2. the investigation ---------------------------------------------------------------
+# -- 2. the investigation
 
 
 def test_the_first_kill_files_an_investigation_carrying_the_facts_by_reference(fleet):
-    """Spec §4a: what a fresh session with no memory of this needs — the seats by name
-    with their rc, latency and status, the round, the moments, and the pointers to check.
-    REFERENCE, NEVER PAYLOAD: no seat reply is copied in (rejected alternative 6)."""
+    """Spec §4a: what a fresh session with no memory of this needs"""
     fleet.daemon.validator = Validator(killed())
     wo = _submitted(fleet)
 
@@ -146,8 +126,7 @@ def test_the_first_kill_files_an_investigation_carrying_the_facts_by_reference(f
 
 
 def test_a_second_kill_finds_the_first_investigation_and_files_nothing(fleet):
-    """Spec §4a: `ops.live_investigation` is asked FIRST, so the filing is naturally
-    idempotent across retries and no `OpsError` per tick reaches the log."""
+    """Spec §4a: `ops.live_investigation` is asked FIRST"""
     fleet.daemon.validator = Validator(killed())
     wo = _submitted(fleet)
 
@@ -164,8 +143,7 @@ def test_a_second_kill_finds_the_first_investigation_and_files_nothing(fleet):
 
 
 def test_a_filing_that_raises_never_costs_the_round_its_record(fleet, monkeypatch):
-    """Spec §4a: a lost race between two ticks must not kill the round. The close and the
-    event are the work order's own record and land even when no investigation exists."""
+    """Spec §4a: a lost race between two ticks must not kill the round"""
     monkeypatch.setattr(ops, "create_investigation_order",
                         lambda *a, **k: (_ for _ in ()).throw(ops.OpsError("raced")))
     fleet.daemon.validator = Validator(killed())
@@ -183,12 +161,11 @@ def test_a_filing_that_raises_never_costs_the_round_its_record(fleet, monkeypatc
         store.close()
 
 
-# -- 3. the bound is a catalog key, and the escalation points at the investigation ------
+# -- 3. the bound is a catalog key, and the escalation points at the investigation
 
 
 def test_at_the_bound_the_order_escalates_naming_the_investigation(fleet):
-    """Spec §4b: at `validation.killed_retries` the user is asked, and the sentence
-    attaches the investigation id so they have somewhere to go that is not a retry."""
+    """Spec §4b: at `validation.killed_retries` the user is asked"""
     fleet.daemon.validator = Validator(killed())
     wo = _submitted(fleet, killed_retries=2)
 
@@ -216,7 +193,7 @@ def test_at_the_bound_the_order_escalates_naming_the_investigation(fleet):
 
 
 def test_the_escalation_says_so_when_no_investigation_could_be_filed(fleet, monkeypatch):
-    """Spec §4b: it never names an id that does not exist."""
+    """Spec §4b: it never names an id that does not exist"""
     monkeypatch.setattr(ops, "create_investigation_order",
                         lambda *a, **k: (_ for _ in ()).throw(ops.OpsError("raced")))
     fleet.daemon.validator = Validator(killed())
@@ -236,7 +213,7 @@ def test_the_escalation_says_so_when_no_investigation_could_be_filed(fleet, monk
 
 
 def test_zero_retries_escalates_on_the_first_kill(fleet):
-    """Spec §4b: `0` is legal and is what a fleet that never wants a re-judge sets."""
+    """Spec §4b: `0` is legal and is what a fleet that never wants a re-judge sets"""
     fleet.daemon.validator = Validator(killed())
     wo = _submitted(fleet, killed_retries=0)
 
@@ -249,12 +226,11 @@ def test_zero_retries_escalates_on_the_first_kill(fleet):
         store.close()
 
 
-# -- 4. the two counters can never see each other (user ruling, Neo 1705 condition i) --
+# -- 4. the two counters can never see each other (user ruling, Neo 1705 condition i)
 
 
 def test_kills_spend_none_of_the_transport_budget(fleet):
-    """The pin: three kills under a bound of five must not escalate. If the kill were
-    folded into the transport count, `VALIDATION_OUTAGE_LIMIT` would give up at three."""
+    """The pin: three kills under a bound of five must not escalate"""
     fleet.daemon.validator = Validator(killed())
     wo = _submitted(fleet, killed_retries=5)
 
@@ -270,8 +246,7 @@ def test_kills_spend_none_of_the_transport_budget(fleet):
 
 
 def test_transport_outages_spend_none_of_the_kill_budget(fleet):
-    """The other direction: two transport outages under `killed_retries: 1` must not
-    escalate — the kill counter cannot see an outage's events either."""
+    """The other direction: two transport outages under `killed_retries: 1` must not escalate"""
     fleet.daemon.validator = Validator(claude_cli.ClaudeCliError("connection reset"))
     wo = _submitted(fleet, killed_retries=1)
 
@@ -287,12 +262,11 @@ def test_transport_outages_spend_none_of_the_kill_budget(fleet):
         store.close()
 
 
-# -- 5. the branch sits before the generic outage one ----------------------------------
+# -- 5. the branch sits before the generic outage one
 
 
 def test_the_killed_branch_takes_precedence_over_the_generic_outage(fleet):
-    """`KilledError` is a `ClaudeCliError` subclass, so a clause after the generic
-    `if failure is not None` would never be reached (spec §4)."""
+    """`KilledError` is a `ClaudeCliError` subclass"""
     store = ProjectStore(fleet.project)
     try:
         wo = store.create_work_order("t")
@@ -321,5 +295,5 @@ def test_every_signal_spelling_reaches_the_same_branch(fleet, rc):
         store.close()
 
 
-# Written for the opt-in OS (os.autonomy.self_dispatch on, stuck sweep on).
+# Written for the opt-in OS (os.autonomy.self_dispatch on, stuck sweep on)
 pytestmark = pytest.mark.usefixtures("self_dispatch_on")

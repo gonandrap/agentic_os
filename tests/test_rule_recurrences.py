@@ -1,23 +1,4 @@
-"""The recurrence ledger: a rule that already exists and did not hold.
-
-Spec: docs/superpowers/specs/2026-09-27-self-evolution.md §8. Three properties carry the
-weight, and §8 names the tests for each because a verdict derived wrong files the finding
-against the wrong half of the rule.
-
-1. **Every verdict is derived from a REAL fire record**, written through
-   `CentralStore.record_rule_fire`, never from a hand-set dict field. A test that sets
-   `{"outcome": "refused"}` by hand proves `rules.recurrence_verdict` reads a key, not
-   that the ledger and the firing pass agree about what a fire is.
-2. **The ledger is the source of truth and the tracker a mirror.** `gh` unreachable
-   leaves the row written, `filed_note` carrying the failure, and `ops.record_recurrence`
-   returning normally.
-3. **The tracker search keys on the CAUSE, never on the order id** (kn-2b03830f, which
-   retracted and reversed kn-5d8a396a), and keeps `--state all` so a closed original can
-   still be reopened.
-
-Nothing here reaches the real `gh` or the network: the `issues` functions are replaced,
-and the test-isolation gate already blocks the binary underneath them.
-"""
+"""The recurrence ledger: a rule that already exists and did not hold (docs/superpowers/specs/2026-09-27-self-evolution.md §8.)"""
 
 from __future__ import annotations
 
@@ -55,11 +36,7 @@ def _detector(store, **kw):
 
 
 def _arm(store, det):
-    """Arm a detector through `CentralStore.arm_detector`, the verb §6 brought.
-
-    It refuses a detector with no live remedy row — "a rule may act" needs something to
-    act WITH — so this adds the one the real flow always has before arming.
-    """
+    """Arm a detector through `CentralStore.arm_detector`, the verb §6 brought"""
     if not store.remedy_rules_for(det["id"]):
         store.add_remedy_rule(det["id"], "nudge", argument="ask where it got to")
     return store.arm_detector(det["id"], by="test", reason="armed for the fixture")
@@ -75,7 +52,7 @@ def _fire(store, det, outcome, **kw):
 
 
 class _Tracker:
-    """What the tracker was asked to do, with no `gh` behind it."""
+    """What the tracker was asked to do, with no `gh` behind it"""
 
     def __init__(self):
         self.state = "OPEN"
@@ -111,7 +88,7 @@ def tracker(monkeypatch):
     return _Tracker().install(monkeypatch)
 
 
-# -- one test per verdict, each from a real fire record ---------------------------------
+# -- one test per verdict, each from a real fire record
 
 
 def test_a_dry_run_detector_gives_not_armed(store, tracker):
@@ -128,7 +105,7 @@ def test_a_dry_run_detector_gives_not_armed(store, tracker):
 
 def test_an_armed_detector_with_no_fire_on_the_order_gives_missed(store, tracker):
     det = _arm(store, _detector(store))
-    # A fire on a DIFFERENT order is not evidence about this one.
+    # A fire on a DIFFERENT order is not evidence about this one
     _fire(store, det, rules.PROPOSED, order_id="wo-someone-else")
     out = ops.record_recurrence(gap_class=GAP, project="proj_a", order_id=ORDER)
     assert out["verdict"] == rules.MISSED
@@ -153,8 +130,7 @@ def test_an_unreadable_fire_gives_its_own_verdict_and_never_missed(store, tracke
 
 
 def test_the_callers_note_and_the_verdict_note_are_different_keys(store, tracker):
-    """Two sentences with two audiences, so two names: the row carries what the CALLER
-    passed and `verdict_note` is the OS's sentence about the verdict (spec §8)."""
+    """Two sentences with two audiences"""
     det = _arm(store, _detector(store))
     _fire(store, det, rules.PROPOSED)
     out = ops.record_recurrence(gap_class=GAP, project="proj_a", order_id=ORDER,
@@ -165,7 +141,7 @@ def test_the_callers_note_and_the_verdict_note_are_different_keys(store, tracker
 
 
 def test_a_cleared_fire_is_still_the_evidence_the_verdict_reads(store, tracker):
-    """`open_rule_fire` sees only UNCLEARED fires, and a cleared one still happened."""
+    """`open_rule_fire` sees only UNCLEARED fires, and a cleared one still happened"""
     det = _arm(store, _detector(store))
     fire = _fire(store, det, rules.PROPOSED)
     store.close_rule_fire(fire["id"])
@@ -173,7 +149,7 @@ def test_a_cleared_fire_is_still_the_evidence_the_verdict_reads(store, tracker):
     assert out["verdict"] == rules.REMEDY_FAILED
 
 
-# -- the fourth path, which has no verdict: the tracker could not be reached ------------
+# -- the fourth path, which has no verdict: the tracker could not be reached
 
 
 def test_gh_unreachable_leaves_the_row_written_and_says_so(store, tracker, monkeypatch):
@@ -189,7 +165,7 @@ def test_gh_unreachable_leaves_the_row_written_and_says_so(store, tracker, monke
     assert out["verdict"] == rules.REMEDY_FAILED
     assert GitHubError.NO_GH in out["filed_note"]
     assert "no gh on PATH" in out["filed_note"]
-    # The ledger kept it, and kept the failure with it.
+    # The ledger kept it, and kept the failure with it
     rows = store.list_recurrences(detector_id=det["id"])
     assert len(rows) == 1 and rows[0]["filed_note"] == out["filed_note"]
 
@@ -203,7 +179,7 @@ def test_a_refusal_from_gh_is_recorded_rather_than_raised(store, tracker, monkey
     assert out["recorded"] is True and "gh refused" in out["filed_note"]
 
 
-# -- the search: keyed on the cause, never on the order id -----------------------------
+# -- the search: keyed on the cause, never on the order id
 
 
 def test_the_tracker_search_keys_on_the_cause_and_never_on_the_order(store, monkeypatch):
@@ -225,7 +201,7 @@ def test_the_tracker_search_keys_on_the_cause_and_never_on_the_order(store, monk
     assert det["id"] in search and GAP in search
     assert ORDER not in search
     assert not any(ORDER in a for a in argv)
-    # Nothing was found, so nothing was filed, and the row still exists.
+    # Nothing was found, so nothing was filed, and the row still exists
     assert out["recorded"] is True
     assert "no original issue" in out["filed_note"]
 
@@ -239,7 +215,7 @@ def test_a_hit_from_the_search_is_the_issue_that_is_commented(store, tracker):
     assert [u for u, _ in tracker.commented] == [FIXTURE_ISSUE_URL]
 
 
-# -- reopen or comment, and the label either way ---------------------------------------
+# -- reopen or comment, and the label either way
 
 
 def test_a_closed_original_is_reopened_and_never_duplicated(store, tracker):
@@ -261,13 +237,13 @@ def test_an_open_original_is_commented_on_and_not_reopened(store, tracker):
     assert tracker.reopened == []
     assert tracker.labelled == [(FIXTURE_ISSUE_URL, issues.REGRESSION_LABEL)]
     assert "commented" in out["filed_note"]
-    # The redaction boundary: what reaches the public tracker is the four fields only.
+    # The redaction boundary: what reaches the public tracker is the four fields only
     body = tracker.commented[0][1]
     assert ORDER in body and GAP in body and det["id"] in body
     assert "needs_review" not in body
 
 
-# -- no detector at all: a new gap, and never an invented verdict -----------------------
+# -- no detector at all: a new gap, and never an invented verdict
 
 
 def test_no_detector_for_the_gap_class_is_a_new_gap(store, tracker):
@@ -282,7 +258,7 @@ def test_no_detector_for_the_gap_class_is_a_new_gap(store, tracker):
     assert tracker.commented == [] and tracker.reopened == []
 
 
-# -- the store verbs ------------------------------------------------------------------
+# -- the store verbs
 
 
 def test_add_recurrence_increments_the_detector_counter(store):
@@ -337,8 +313,7 @@ def test_the_filed_note_is_written_in_place_afterwards(store):
 
 
 def test_a_live_database_reaches_the_new_table(jarvis_home):
-    """The property `test_rules_store.py`'s docstring names: a new table is untested
-    until something writes it, closes the store and reads it back from the file."""
+    """The property `test_rules_store.py`'s docstring names: a new table is untested until something..."""
     first = CentralStore()
     try:
         det = _detector(first)
@@ -356,7 +331,7 @@ def test_a_live_database_reaches_the_new_table(jarvis_home):
     assert rows[0]["verdict"] == rules.REMEDY_FAILED
 
 
-# -- the reader the verdict owes (Neo question 974) -------------------------------------
+# -- the reader the verdict owes (Neo question 974)
 
 
 def test_rules_show_carries_the_recurrences_and_the_cli_prints_them(store, tracker,
@@ -380,7 +355,7 @@ def test_a_detector_with_no_recurrences_prints_none(store, capsys):
     assert "recurrence " not in capsys.readouterr().out
 
 
-# -- the gh client: one wrapper, and the regression label ------------------------------
+# -- the gh client: one wrapper, and the regression label
 
 
 def test_reopen_and_the_label_go_through_the_existing_run(monkeypatch):
@@ -388,8 +363,7 @@ def test_reopen_and_the_label_go_through_the_existing_run(monkeypatch):
     monkeypatch.setattr(issues, "_run",
                         lambda args, *, url, tolerate="", stdin=None:
                         seen.append(list(args)) or "")
-    # `checked_issue_url` holds an unqualified URL to the OS's OWN tracker, so the URL
-    # here is built from it rather than from the fixture repo.
+    # `checked_issue_url` holds an unqualified URL to the OS's OWN tracker
     url = f"https://github.com/{bugreport.bug_repo()}/issues/7"
     issues.reopen(url, "it came back")
     issues.ensure_regression_label("owner/repo")

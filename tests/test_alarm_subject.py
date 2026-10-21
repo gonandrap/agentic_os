@@ -1,16 +1,4 @@
-"""An alarm can name a FEATURE ORDER as its subject and a probe as its source — §1 of
-docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md.
-
-NOTHING RAISES A HEALTH FINDING YET and no model is called anywhere in this module. The
-fixtures write findings through `ProjectStore.add_finding` outright, which is the whole
-of what this section ships: §4 is what will decide to call it.
-
-THE FIXTURE THAT DISCRIMINATES IS `_diverged`. For every alarm on the tree today the
-subject IS the carrier, so swapping "title comes from the subject" for "title comes from
-the carrier" is a no-op on the entire suite. Only a feature and a carrier with different
-titles and different statuses can tell the two rules apart, and only an attention flag on
-the carrier alone can prove `live` did not move with them.
-"""
+"""An alarm can name a FEATURE ORDER as its subject and a probe as its source (docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md)"""
 
 from __future__ import annotations
 
@@ -46,11 +34,7 @@ def _feature(store, title="the feature", status="executing"):
 
 
 def _diverged(store, *, flag=True):
-    """One feature and one carrier that disagree about everything a surface renders.
-
-    `the feature` is `executing`; `the carrier` is `running`; the attention flag is on
-    the CARRIER only. Returns (fo_id, carrier_wo_id, alarm_id).
-    """
+    """One feature and one carrier that disagree about everything a surface renders"""
     fo_id = _feature(store)
     carrier = store.create_work_order("the carrier", parent_id=fo_id, kind="manager",
                                       status="running")["id"]
@@ -70,14 +54,11 @@ def _client():
     return TestClient(create_app(), follow_redirects=False)
 
 
-# -- the carrier ---------------------------------------------------------------------
+# -- the carrier
 
 
 def test_the_carrier_ladder_has_a_rung_for_every_shape_of_feature(store):
-    """`ops.feature_event`'s manager-only rule returns None for essentially every
-    feature on the fleet — a manager exists only where a plan was released with
-    validation on — so the general rule needs the three lower rungs, and each is
-    asserted against a feature that has ONLY that rung."""
+    """`ops.feature_event`'s manager-only rule returns None for essentially every feature on the fleet"""
     bare = _feature(store, "never planned", status="pending")
     assert store.carrier_for_feature(bare) is None
 
@@ -104,9 +85,7 @@ def test_the_carrier_ladder_has_a_rung_for_every_shape_of_feature(store):
 
 
 def test_a_finding_whose_subject_and_fo_id_disagree_is_refused(store):
-    """The pairing the schema cannot carry — no CHECK, because `_migrate` runs on every
-    store open over live databases. Both directions, because enforcing one and not the
-    other still lets a feature finding land with nothing to point at."""
+    """The pairing the schema cannot carry"""
     fo_id = _feature(store)
     carrier = store.create_work_order("the carrier", parent_id=fo_id)["id"]
 
@@ -119,8 +98,7 @@ def test_a_finding_whose_subject_and_fo_id_disagree_is_refused(store):
         store.add_finding(carrier, kind="stalled-plan", reason=FIRED, fo_id=fo_id)
     assert "subject_kind" in str(spurious.value) and fo_id in str(spurious.value)
 
-    # The positive partner: the pairing that agrees lands, so the two refusals above
-    # are not simply a function that rejects everything.
+    # The positive partner: the pairing that agrees lands
     ok = store.add_finding(carrier, kind="stalled-plan", reason=FIRED,
                            subject_kind="feature_order", fo_id=fo_id)
     assert (ok["subject_kind"], ok["fo_id"], ok["seq"]) == ("feature_order", fo_id,
@@ -128,9 +106,7 @@ def test_a_finding_whose_subject_and_fo_id_disagree_is_refused(store):
 
 
 def test_a_feature_finding_is_claimable_and_the_claim_carries_its_subject(store):
-    """`claim_next_alarm`'s WHERE is on `status` alone, so "it was claimable" grades
-    nothing on its own — §4 reads the claimed dict, and every field it will branch on
-    has to survive the RETURNING."""
+    """`claim_next_alarm`'s WHERE is on `status` alone, so "it was claimable" grades nothing on its own"""
     _, _, alarm_id = _diverged(store)
 
     claimed = store.claim_next_alarm()
@@ -143,9 +119,7 @@ def test_a_feature_finding_is_claimable_and_the_claim_carries_its_subject(store)
 
 
 def test_findings_about_one_feature_read_back_together_across_two_carriers(store):
-    """`alarms_of` is by carrier and `alarms_for_feature` is by subject. A feature
-    reached through two carriers has its record in two places, and only the second read
-    puts it back together."""
+    """`alarms_of` is by carrier and `alarms_for_feature` is by subject"""
     fo_id = _feature(store)
     first = store.create_work_order("first carrier", parent_id=fo_id)["id"]
     second = store.create_work_order("second carrier", parent_id=fo_id)["id"]
@@ -158,14 +132,11 @@ def test_findings_about_one_feature_read_back_together_across_two_carriers(store
     assert len(store.alarms_for_feature(fo_id)) == 2
 
 
-# -- the published dict --------------------------------------------------------------
+# -- the published dict
 
 
 def test_the_dict_gains_four_keys_and_the_subject_id_is_right_for_both_kinds(store):
-    """`kn-4d8449f1` closed this dict at sixteen and four surfaces bind rather than
-    validate it. Both subject kinds in ONE test: `subject_id` falling back to `wo_id`
-    is the half that keeps every existing surface rendering, and asserting only the
-    feature case would leave it ungraded."""
+    """`kn-4d8449f1` closed this dict at sixteen and four surfaces bind rather than validate it"""
     fo_id, _, finding = _diverged(store)
     legacy = store.create_work_order("a burning turn")["id"]
     store.add_alarm(legacy, "long-turn", 1, "still being billed")
@@ -187,10 +158,7 @@ def test_the_dict_gains_four_keys_and_the_subject_id_is_right_for_both_kinds(sto
 
 
 def test_the_title_and_status_are_the_subject_s_while_live_stays_the_carrier_s(store):
-    """The one substitution that makes every template render a feature finding with no
-    template change — and the one field that must NOT follow it. Acking clears the ask
-    and must not erase the record, so `live` stays the carrier's attention flag, which
-    is the only flag with an `acknowledged_blockers` column to make an ack stick."""
+    """The one substitution that makes every template render a feature finding with no template change"""
     _, carrier, finding = _diverged(store)
     store.close()
 
@@ -209,9 +177,7 @@ def test_the_title_and_status_are_the_subject_s_while_live_stays_the_carrier_s(s
 
 
 def test_the_alarm_detail_read_resolves_the_subject_with_no_fo_id_argument(store):
-    """`ops._find_alarm` reaches `alarms_across(wo_id=…)` and never passes `fo_id`, so
-    a join made conditional on that filter would leave this page — and the badge, and
-    `jarvis alarms show` — showing the CARRIER's title. This is that read, verbatim."""
+    """`ops._find_alarm` reaches `alarms_across(wo_id=…)` and never passes `fo_id`"""
     _, _, finding = _diverged(store)
     store.close()
 
@@ -223,8 +189,7 @@ def test_the_alarm_detail_read_resolves_the_subject_with_no_fo_id_argument(store
 
 def test_a_legacy_row_survives_three_store_opens_with_the_defaults_a_surface_binds(
         store, started):
-    """The real risk is not the column count, it is a default landing somewhere a
-    surface reads. `_migrate` runs on every open, so the row is read after three."""
+    """The real risk is not the column count, it is a default landing somewhere a surface reads"""
     wo_id = store.create_work_order("a burning turn")["id"]
     store.add_alarm(wo_id, "long-turn", 1, "still being billed")
     path = store.project_path
@@ -240,18 +205,11 @@ def test_a_legacy_row_survives_three_store_opens_with_the_defaults_a_surface_bin
     assert row["probe"] is None
 
 
-# -- the reads -----------------------------------------------------------------------
+# -- the reads
 
 
 def test_the_badge_and_the_page_count_subjects_and_not_carriers(store):
-    """BOTH HALVES OR THE TEST GRADES NOTHING. "several subjects sharing one carrier
-    count as several" is satisfied by deleting the `set()` and counting rows; only
-    "findings on ONE feature through TWO carriers count as one" proves it is still a
-    set, and only over subjects.
-
-    THREE features on one carrier and ONE across two, deliberately lopsided: with the
-    symmetric fixture (two and two) subjects and carriers both come to three and the
-    wrong key is green. Here it is 4 subjects, 3 carriers, 5 rows — one number each."""
+    """BOTH HALVES OR THE TEST GRADES NOTHING"""
     from jarvis.ui.app import alarm_badge
 
     shared = store.create_work_order("one carrier, three features",
@@ -276,14 +234,12 @@ def test_the_badge_and_the_page_count_subjects_and_not_carriers(store):
     assert alarm_badge() == 4, "three shared-carrier subjects, plus one split subject"
 
     page = _client().get("/alarms").text
-    # The ack form is per group, so counting its actions counts the groups the page
-    # decided on — the badge and the page could otherwise disagree silently.
+    # The ack form is per group, so counting its actions counts the groups the page decided on
     assert page.count('/ack"') == 4
 
 
 def test_the_page_links_a_feature_finding_at_the_feature(store):
-    """A reader who followed a link about a feature must land on the feature. The
-    carrier is where the finding was FILED and is plumbing."""
+    """A reader who followed a link about a feature must land on the feature"""
     fo_id, carrier, finding = _diverged(store)
     store.close()
 
@@ -297,8 +253,7 @@ def test_the_page_links_a_feature_finding_at_the_feature(store):
 
 
 def test_the_cli_filters_by_feature_and_by_source(store, capsys):
-    """`jarvis alarms --fo` and `--source`. The CLI is the OS: §6 and a future PR body
-    both need these reads, so they exist here rather than on the page alone."""
+    """`jarvis alarms --fo` and `--source`"""
     from jarvis import cli
 
     fo_id, _, finding = _diverged(store)
@@ -320,9 +275,7 @@ def test_the_cli_filters_by_feature_and_by_source(store, capsys):
 
 def test_jarvis_alarms_show_says_no_turn_and_never_prints_turn_minus_one(store,
                                                                         capsys):
-    """`seq` is NOT NULL and a subject-level finding stores the sentinel, so without a
-    reading of its own the first health finding prints `turn -1` at the user. The cost
-    alarm in the same test is what proves the turn number did not simply disappear."""
+    """`seq` is NOT NULL and a subject-level finding stores the sentinel"""
     from jarvis import cli
 
     _, _, finding = _diverged(store)
@@ -339,13 +292,11 @@ def test_jarvis_alarms_show_says_no_turn_and_never_prints_turn_minus_one(store,
     assert "turn 1" in capsys.readouterr().out
 
 
-# -- the vocabularies ----------------------------------------------------------------
+# -- the vocabularies
 
 
 def test_the_two_hand_maintained_event_vocabularies_agree():
-    """`timeline` is a leaf and may not import a store, so the list is written down
-    twice. A kind in only one of them gets no `_ref`, and every deep link on the page
-    dies with no error anywhere."""
+    """`timeline` is a leaf and may not import a store, so the list is written down twice"""
     from jarvis import timeline
     from jarvis.project_store import ALARM_EVENT_KINDS
 
@@ -354,17 +305,7 @@ def test_the_two_hand_maintained_event_vocabularies_agree():
 
 
 def test_the_values_later_sections_write_are_declared_here():
-    """Declared now, including the ones nothing in this diff writes: two sections
-    editing the same tuple is a conflict for no reason. `update_alarm` asserts against
-    these tuples, so a missing value is a sibling's assertion failure, not a bad row.
-
-    `invariant` joined `ALARM_SOURCES` for the same reason: a finding raised by a
-    post-condition (`invariants.check_undeclared_delivery`) rather than by a model or by
-    a cost reading, and the source is what tells the reader which of the three it was.
-
-    `rule` joined it for §6 of docs/superpowers/specs/2026-09-27-self-evolution.md: a fire
-    of an ARMED detector, and the three `rule_*` event kinds with it. `rule_dry_run` is
-    declared and written by nothing, because §5 forbids a timeline event in dry run."""
+    """Declared now, including the ones nothing in this diff writes: two sections editing the same tuple... (docs/superpowers/specs/2026-09-27-self-evolution.md)"""
     from jarvis.project_store import (ALARM_EVENT_KINDS, ALARM_SOURCES, ALARM_STATUSES,
                                       ALARM_SUBJECTS, ALARM_VERDICTS)
 

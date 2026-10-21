@@ -1,14 +1,4 @@
-"""Work orders that end in a pull request: `waiting_pr_merge`, and the title prefix.
-
-Two halves of the same idea — a PR is where a work order leaves the OS and becomes
-something a human has to act on, so the OS has to (a) keep saying so until they act,
-and (b) leave the work order id on the artifact they are looking at.
-
-`waiting_pr_merge` is deliberately NOT an attention item: it is a merge queue the user
-works through, not a decision blocking the fleet, and the "NEEDS YOU" strip stops being
-read the moment everything finished ends up in it — with one exception, the conflict
-nobody could heal, which the last section covers.
-"""
+"""Work orders that end in a pull request: `waiting_pr_merge`, and the title prefix"""
 
 from __future__ import annotations
 
@@ -41,7 +31,7 @@ def started(jarvis_home, fake_claude, catalog_file, project):
     return Daemon(load_catalog(catalog_file))
 
 
-# -- the state ----------------------------------------------------------------------
+# -- the state
 
 
 def test_finish_with_a_pr_parks_the_work_order(started, project):
@@ -64,7 +54,7 @@ def test_finish_without_a_pr_still_completes(started, project):
 
 
 def test_waiting_pr_merge_is_open_but_never_asks_for_the_user(started, project):
-    """The whole point: it stays visible without spending the attention budget."""
+    """The whole point: it stays visible without spending the attention budget"""
     wo = ops.create_work_order("proj_a", "add feature X")
     ops.finish(wo["id"], "opened a PR", pr_url=PR)
 
@@ -80,7 +70,7 @@ def test_waiting_pr_merge_is_open_but_never_asks_for_the_user(started, project):
 
 
 def test_pending_assumptions_outrank_the_pr(started, project):
-    """A merge before the decision would accept the assumptions by the back door."""
+    """A merge before the decision would accept the assumptions by the back door"""
     wo = ops.create_work_order("proj_a", "add feature X")
     ops.assume(wo["id"], "used tabs, not spaces")
 
@@ -94,7 +84,7 @@ def test_pending_assumptions_outrank_the_pr(started, project):
 
 
 def test_the_reconciler_leaves_it_parked(started, project, fake_claude, settle_turns):
-    """Settlement re-runs every tick; without the pr_url branch it would complete it."""
+    """Settlement re-runs every tick; without the pr_url branch it would complete it"""
     wo = ops.create_work_order("proj_a", "add feature X")
     started.tick()
     store = ProjectStore(project)
@@ -130,7 +120,7 @@ def test_cli_finish_passes_the_pr_through(started, project, capsys):
 
 
 def test_cli_list_puts_running_then_pr_merges_first(started, project, capsys):
-    """`jarvis wo list` orders by what the user can act on, like the dashboard."""
+    """`jarvis wo list` orders by what the user can act on, like the dashboard"""
     running = ops.create_work_order("proj_a", "still going")
     merging = ops.create_work_order("proj_a", "waiting on a merge")
     pending = ops.create_work_order("proj_a", "not started yet")  # newest: listed first
@@ -147,18 +137,12 @@ def test_cli_list_puts_running_then_pr_merges_first(started, project, capsys):
     assert pending["id"] in order
 
 
-# -- the way back from `needs_review` -------------------------------------------------
-#
-# `finish` routes a work order with pending assumptions to `needs_review` even when it
-# carries a PR — the decision outranks the merge. So the review is the ONLY route back,
-# and it has to put the work order where `finish` would have if the assumptions had never
-# existed. Settling it as `completed` instead loses the PR twice over: off the user's
-# open list, and out of the merge poll that would have ended it for them.
+# -- the way back from `needs_review`
 
 
 @pytest.fixture()
 def reviewable_pr(started, project):
-    """Finished behind a PR, held in `needs_review` by one pending assumption."""
+    """Finished behind a PR, held in `needs_review` by one pending assumption"""
     wo = ops.create_work_order("proj_a", "add feature X")
     ops.assume(wo["id"], "used tabs, not spaces")
     assert ops.finish(wo["id"], "opened a PR", pr_url=PR)["status"] == "needs_review"
@@ -179,7 +163,7 @@ def test_accepting_the_assumptions_parks_the_pr_instead_of_completing(
 
 def test_the_parked_work_order_is_still_polled_after_a_review(
         started, project, fake_gh, reviewable_pr):
-    """The point of parking it: the merge still ends the work order unattended."""
+    """The point of parking it: the merge still ends the work order unattended"""
     ops.review_work_order(reviewable_pr["id"], accept=True, feedback="tabs are fine")
     fake_gh.set_pr(PR, "MERGED")
     store = ProjectStore(project)
@@ -190,7 +174,7 @@ def test_the_parked_work_order_is_still_polled_after_a_review(
 
 
 def test_accepting_without_a_pr_still_completes(started, project):
-    """Unchanged for the ordinary case — only a PR-carrying work order is held back."""
+    """Unchanged for the ordinary case — only a PR-carrying work order is held back"""
     wo = ops.create_work_order("proj_a", "answered a question")
     ops.assume(wo["id"], "read it as a question, not a code change")
     ops.finish(wo["id"], "no code needed")
@@ -203,8 +187,7 @@ def test_accepting_without_a_pr_still_completes(started, project):
 
 def test_a_review_after_the_pr_was_closed_does_not_re_park_it(
         started, project, fake_gh, parked):
-    """A CLOSED pull request is never going to merge, so the merge queue is the one
-    place this must not go back to — the next poll would only flag it again."""
+    """A CLOSED pull request is never going to merge"""
     fake_gh.set_pr(PR, "CLOSED")
     store = ProjectStore(project)
     poll(started, store)
@@ -217,17 +200,7 @@ def test_a_review_after_the_pr_was_closed_does_not_re_park_it(
 
 def test_a_second_pull_request_is_not_judged_by_the_first_ones_closure(
         started, project, fake_gh, parked):
-    """PAIRED with the test above, and the pairing is the point: the same `CLOSED` in
-    `pr_state` means opposite things at the two landings, so only one of them may read
-    it.
-
-    `Daemon.poll_pull_requests` writes that column and never clears it. A worker whose
-    pull request was closed, who was sent back and who opened a NEW one still carries
-    the old verdict — so a landing that believed it would drop a live pull request
-    straight out of the merge queue and close the backlog item under it. The review
-    above is the one caller that can know the column is current, because the parking it
-    is ending is what the poll was polling.
-    """
+    """PAIRED with the test above, and the pairing is the point: the same `CLOSED` in `pr_state` means..."""
     second = "https://github.com/acme/proj/pull/8"
     fake_gh.set_pr(PR, "CLOSED")
     store = ProjectStore(project)
@@ -243,8 +216,7 @@ def test_a_second_pull_request_is_not_judged_by_the_first_ones_closure(
 
 
 def test_rejecting_leaves_the_work_order_where_it_was(started, project, reviewable_pr):
-    """A rejection is not an ending: the worker gets guidance and the PR is still its
-    problem, so nothing about the merge queue changes."""
+    """A rejection is not an ending: the worker gets guidance and the PR is still its problem"""
     out = ops.review_work_order(reviewable_pr["id"], accept=False,
                                 feedback="No — spaces, like the rest of the file")
 
@@ -253,24 +225,19 @@ def test_rejecting_leaves_the_work_order_where_it_was(started, project, reviewab
         reviewable_pr["id"])["status"] == "needs_review"
 
 
-# -- the merge poll -----------------------------------------------------------------
-#
-# The other half of `waiting_pr_merge`: the OS finding out on its own that the pull
-# request was dealt with, so a merge the user already performed does not also cost them
-# a `jarvis wo done`. Everything here goes through the fake `gh` — the real one is
-# unreachable under the test-isolation gate, which is the point.
+# -- the merge poll
 
 
 @pytest.fixture()
 def parked(started, project, fake_gh):
-    """A work order finished behind PR, with `gh` ready to be told what happened."""
+    """A work order finished behind PR, with `gh` ready to be told what happened"""
     wo = ops.create_work_order("proj_a", "add feature X")
     ops.finish(wo["id"], "opened a PR", pr_url=PR)
     return wo
 
 
 def poll(daemon, store):
-    """Run the poll step alone, without the rest of the tick around it."""
+    """Run the poll step alone, without the rest of the tick around it"""
     daemon.poll_pull_requests(daemon.catalog.project("proj_a"), store)
 
 
@@ -292,7 +259,7 @@ def test_a_merged_pr_completes_the_work_order(started, project, fake_gh, parked)
 
 
 def test_an_open_pr_is_left_exactly_where_it_was(started, project, fake_gh, parked):
-    """The common case: one `gh` call, no write, no attention."""
+    """The common case: one `gh` call, no write, no attention"""
     fake_gh.set_pr(PR, "OPEN")
     store = ProjectStore(project)
 
@@ -305,7 +272,7 @@ def test_an_open_pr_is_left_exactly_where_it_was(started, project, fake_gh, park
 
 
 def test_a_closed_pr_asks_for_the_user(started, project, fake_gh, parked):
-    """Closed without merging means the delivered work was refused — that needs them."""
+    """Closed without merging means the delivered work was refused — that needs them"""
     fake_gh.set_pr(PR, "CLOSED")
     store = ProjectStore(project)
 
@@ -322,12 +289,7 @@ def test_a_closed_pr_asks_for_the_user(started, project, fake_gh, parked):
 
 def test_the_closed_pr_reason_survives_the_reconciler(started, project, fake_gh,
                                                       parked):
-    """INV-ATTENTION-REASON rewrites any reason `true_blockers` cannot derive.
-
-    Without the PR_CLOSED_BLOCKER branch this work order would keep its status but be
-    relabelled with the generic IDLE_NO_FINISH_BLOCKER, sending the
-    user to read a worker session that did nothing wrong.
-    """
+    """INV-ATTENTION-REASON rewrites any reason `true_blockers` cannot derive"""
     fake_gh.set_pr(PR, "CLOSED")
     store = ProjectStore(project)
     poll(started, store)
@@ -339,9 +301,7 @@ def test_the_closed_pr_reason_survives_the_reconciler(started, project, fake_gh,
 
 
 def test_a_closed_pr_is_only_reported_once(started, project, fake_gh, parked):
-    """`needs_review` is polled now (issue #224), so a closed pull request stays in the
-    poll's selection instead of dropping out of it. Unguarded, `record_pr_closed` would
-    write a `pr_closed` event and re-flag the user every couple of minutes for ever."""
+    """`needs_review` is polled now (issue #224)"""
     fake_gh.set_pr(PR, "CLOSED")
     store = ProjectStore(project)
 
@@ -355,17 +315,13 @@ def test_a_closed_pr_is_only_reported_once(started, project, fake_gh, parked):
 
 def test_a_reopened_then_reclosed_pr_tells_the_user_again(started, project, fake_gh,
                                                           parked):
-    """The PAIR of the test above, and the reason its guard is derived from the timeline
-    rather than from `pr_state`: that column is stale by construction and nothing used to
-    clear it (kn-dbc4971d), so a guard reading it would latch on the first closure and
-    the second refusal would never reach the user — this bug's own silence, reintroduced
-    by the guard against it."""
+    """The PAIR of the test above, and the reason its guard is derived from the timeline rather than from..."""
     store = ProjectStore(project)
     fake_gh.set_pr(PR, "CLOSED")
     poll(started, store)
     assert store.get_work_order(parked["id"])["attention_reason"] == PR_CLOSED_BLOCKER
 
-    # Reopened: the refusal has been withdrawn, so the record must stop asserting it.
+    # Reopened: the refusal has been withdrawn, so the record must stop asserting it
     fake_gh.set_pr(PR, "OPEN", mergeable="MERGEABLE")
     poll(started, store)
     row = store.get_work_order(parked["id"])
@@ -385,9 +341,7 @@ def test_a_reopened_then_reclosed_pr_tells_the_user_again(started, project, fake
 
 def test_a_reopen_does_not_move_the_work_order_back_to_the_merge_queue(
         started, project, fake_gh, parked):
-    """Reopening is a button press, not a decision. The work was refused and what to do
-    about that is still the user's; putting the order back on the merge queue would take
-    the item off their list on GitHub's say-so."""
+    """Reopening is a button press, not a decision"""
     store = ProjectStore(project)
     fake_gh.set_pr(PR, "CLOSED")
     poll(started, store)
@@ -399,7 +353,7 @@ def test_a_reopen_does_not_move_the_work_order_back_to_the_merge_queue(
 
 
 def test_a_closed_pr_is_still_the_users_to_close(started, project, fake_gh, parked):
-    """Refused work is not failed work: the ordinary exits still apply."""
+    """Refused work is not failed work: the ordinary exits still apply"""
     fake_gh.set_pr(PR, "CLOSED")
     store = ProjectStore(project)
     poll(started, store)
@@ -411,7 +365,7 @@ def test_a_closed_pr_is_still_the_users_to_close(started, project, fake_gh, park
 
 
 def test_nothing_parked_means_no_subprocess(started, project, fake_gh):
-    """A fleet with no open pull requests must not pay for this step at all."""
+    """A fleet with no open pull requests must not pay for this step at all"""
     ops.create_work_order("proj_a", "still going")
     ops.finish(ops.create_work_order("proj_a", "no PR here")["id"], "done")
 
@@ -421,7 +375,7 @@ def test_nothing_parked_means_no_subprocess(started, project, fake_gh):
 
 
 def test_a_merged_pr_closes_the_backlog_item_behind_it(started, project, fake_gh):
-    """Promotion links the two; only the ending was missing."""
+    """Promotion links the two; only the ending was missing"""
     central = CentralStore()
     item = central.add_backlog("proj_a", "add feature X")
     wo = ops.promote_backlog(item["id"])
@@ -437,8 +391,7 @@ def test_a_merged_pr_closes_the_backlog_item_behind_it(started, project, fake_gh
 
 def test_an_unreadable_gh_warns_once_and_leaves_the_work_order_parked(
         started, project, fake_gh, parked):
-    """Silence would leave a dead feature the user never learns about; every poll would
-    make the inbox unreadable. Once per daemon run is the whole of it."""
+    """Silence would leave a dead feature the user never learns about"""
     fake_gh.fail("gh: not authenticated")
     store = ProjectStore(project)
 
@@ -454,9 +407,7 @@ def test_an_unreadable_gh_warns_once_and_leaves_the_work_order_parked(
 
 def test_a_gh_that_is_not_there_is_diagnosed_as_path_not_credentials(
         started, project, parked, monkeypatch):
-    """Issue #90. `gh` never ran, so the keyring cannot be the problem — and the user
-    who acts on 'set GH_TOKEN' spends their afternoon on the wrong thing while the real
-    cause (the systemd unit's PATH) sits there unmentioned."""
+    """Issue #90"""
     monkeypatch.setenv("JARVIS_GH_BIN", "/nonexistent/gh")
     monkeypatch.setenv("PATH", "/opt/only-this-dir")
     store = ProjectStore(project)
@@ -471,8 +422,7 @@ def test_a_gh_that_is_not_there_is_diagnosed_as_path_not_credentials(
 
 
 def test_a_missing_gh_raises_the_type_that_says_so(monkeypatch):
-    """The daemon branches on this type to pick its remedy, so it is part of the
-    contract and not an implementation detail of `pr_view`."""
+    """The daemon branches on this type to pick its remedy"""
     monkeypatch.setenv("JARVIS_GH_BIN", "/nonexistent/gh")
 
     with pytest.raises(github.GhUnavailable):
@@ -481,7 +431,7 @@ def test_a_missing_gh_raises_the_type_that_says_so(monkeypatch):
 
 
 def test_one_unreadable_pr_does_not_hide_the_others(started, project, fake_gh, parked):
-    """A deleted repo or a typo'd URL is one work order's problem, not the project's."""
+    """A deleted repo or a typo'd URL is one work order's problem, not the project's"""
     other = ops.create_work_order("proj_a", "add feature Y")
     ops.finish(other["id"], "opened a PR", pr_url="https://github.com/acme/proj/pull/8")
     fake_gh.set_pr("https://github.com/acme/proj/pull/8", "MERGED")  # PR itself unknown
@@ -494,7 +444,7 @@ def test_one_unreadable_pr_does_not_hide_the_others(started, project, fake_gh, p
 
 
 def test_the_poll_runs_on_its_own_cadence(started, project, fake_gh, parked):
-    """Every tick would be four times the API calls for no perceptible gain."""
+    """Every tick would be four times the API calls for no perceptible gain"""
     fake_gh.set_pr(PR, "OPEN")
 
     started.tick_count = 0
@@ -508,8 +458,7 @@ def test_the_poll_runs_on_its_own_cadence(started, project, fake_gh, parked):
 
 
 def test_a_merge_notifies_nobody(started, project, fake_gh, parked):
-    """`route_new_inbox` has no level filter, so any row here Telegrams the user — about
-    a merge they just performed. `jarvis wo done` is silent; so is this."""
+    """`route_new_inbox` has no level filter, so any row here Telegrams the user"""
     fake_gh.set_pr(PR, "MERGED")
     store = ProjectStore(project)
 
@@ -519,20 +468,12 @@ def test_a_merge_notifies_nobody(started, project, fake_gh, parked):
     assert store.get_work_order(parked["id"])["status"] == "completed"
 
 
-# -- healing a conflicting pull request ---------------------------------------------
-#
-# docs/superpowers/specs/2026-08-22-a-work-order-heals-its-own-pull-request.md, whose
-# §1 is the complaint: a work order parked behind a stale branch needed the user to type
-# "go and resolve the conflicts" at it — a message with no decision in it.
+# -- healing a conflicting pull request
 
 
 @pytest.fixture()
 def parked_worker(project, parked):
-    """`parked`, plus the worker session every real one has: `waiting_pr_merge` is
-    reached through `jarvis wo finish`, which only a dispatched worker can call.
-
-    Healing needs one — there is no point queueing a message for a conversation that
-    does not exist — so these tests must not inherit a fixture that lacks it."""
+    """`parked`, plus the worker session every real one has: `waiting_pr_merge` is reached through `jarvis..."""
     ProjectStore(project).update_work_order(parked["id"], session_id="sess-1")
     return parked
 
@@ -542,7 +483,7 @@ def conflicting(fake_gh, base: str = "main") -> None:
 
 
 def delivered(store, wo_id: str) -> list[dict]:
-    """Pretend the daemon delivered whatever is queued, and hand it back."""
+    """Pretend the daemon delivered whatever is queued, and hand it back"""
     msgs = store.queued_messages(wo_id)
     for m in msgs:
         store.mark_message(m["id"], "delivered")
@@ -568,9 +509,7 @@ def test_a_conflicting_pr_asks_the_worker_to_resolve_it(started, project, fake_g
 
 def test_the_conflict_nudge_asks_the_user_for_nothing(started, project, fake_gh,
                                                       parked_worker):
-    """The point of the feature: a conflict costs the user nothing until it cannot be
-    healed. The status does not move either — delivery is what resumes the worker, and
-    that is a whole tick away."""
+    """The point of the feature: a conflict costs the user nothing until it cannot be healed"""
     conflicting(fake_gh)
     store = ProjectStore(project)
 
@@ -584,8 +523,7 @@ def test_the_conflict_nudge_asks_the_user_for_nothing(started, project, fake_gh,
 
 
 def test_a_second_poll_does_not_nudge_twice(started, project, fake_gh, parked_worker):
-    """Between queueing and delivery the work order is still parked_worker, and a duplicate
-    nudge costs the worker a duplicated turn."""
+    """Between queueing and delivery the work order is still parked_worker"""
     conflicting(fake_gh)
     store = ProjectStore(project)
 
@@ -597,9 +535,7 @@ def test_a_second_poll_does_not_nudge_twice(started, project, fake_gh, parked_wo
 
 
 def test_a_work_order_with_no_session_is_left_alone(started, project, fake_gh, parked):
-    """`parked` without the session stamp: `deliver_messages` skips a work order with no
-    conversation, so a nudge queued here would never go out — and would then block every
-    later one, spending the whole budget without a single attempt."""
+    """`parked` without the session stamp: `deliver_messages` skips a work order with no conversation"""
     conflicting(fake_gh)
     store = ProjectStore(project)
 
@@ -612,9 +548,7 @@ def test_a_work_order_with_no_session_is_left_alone(started, project, fake_gh, p
 
 def test_the_worker_is_woken_and_parks_itself_back(started, project, fake_gh,
                                                    fake_claude, settle_turns):
-    """End to end through the real tick: the conflict resumes the finished session and
-    settlement returns the work order to the merge queue by itself — no second `jarvis
-    wo finish`, so no second validation round (spec §3)."""
+    """End to end through the real tick: the conflict resumes the finished session and settlement returns..."""
     wo = ops.create_work_order("proj_a", "add feature X")
     started.tick()
     store = ProjectStore(project)
@@ -638,8 +572,7 @@ def test_the_worker_is_woken_and_parks_itself_back(started, project, fake_gh,
 
 def test_three_attempts_and_then_it_is_the_users_problem(started, project, fake_gh,
                                                          parked_worker):
-    """A conflict that survives three merges is usually the stacked-PR trap of
-    kn-0a5c449c, which no amount of merging fixes."""
+    """A conflict that survives three merges is usually the stacked-PR trap of kn-0a5c449c"""
     conflicting(fake_gh)
     store = ProjectStore(project)
 
@@ -675,9 +608,7 @@ def test_giving_up_is_recorded_once_however_long_it_stays_broken(started, projec
 
 
 def test_the_give_up_reason_survives_the_reconciler(started, project, fake_gh, parked_worker):
-    """`true_blockers` is the only source of attention reasons, and a status
-    INV-ATTENTION-MISSING does not select has its blockers derived and then never
-    surfaced (spec §5)."""
+    """`true_blockers` is the only source of attention reasons"""
     conflicting(fake_gh)
     store = ProjectStore(project)
     for _ in range(PR_REPAIR_MAX_ATTEMPTS + 1):
@@ -695,8 +626,7 @@ def test_the_give_up_reason_survives_the_reconciler(started, project, fake_gh, p
 
 def test_a_healthy_parked_work_order_is_still_never_flagged(started, project, fake_gh,
                                                             parked_worker):
-    """`waiting_pr_merge` derives a blocker for the conflict case alone; the ordinary
-    merge queue must stay out of the "NEEDS YOU" strip."""
+    """`waiting_pr_merge` derives a blocker for the conflict case alone"""
     fake_gh.set_pr(PR, "OPEN")
     store = ProjectStore(project)
 
@@ -708,8 +638,7 @@ def test_a_healthy_parked_work_order_is_still_never_flagged(started, project, fa
 
 def test_resolving_the_conflict_clears_it_and_restores_the_budget(started, project,
                                                                   fake_gh, parked_worker):
-    """The budget is per episode: a branch that conflicts again next week gets three
-    fresh attempts, not attempt four (spec §4)."""
+    """The budget is per episode: a branch that conflicts again next week gets three fresh attempts"""
     conflicting(fake_gh)
     store = ProjectStore(project)
     for _ in range(PR_REPAIR_MAX_ATTEMPTS + 1):
@@ -764,9 +693,7 @@ def test_a_pr_that_merged_after_conflicting_still_completes(started, project, fa
 
 
 def test_unknown_mergeability_is_not_a_conflict(started, project, fake_gh, parked_worker):
-    """GitHub computes mergeability lazily and asking is what starts it, so the poll
-    right after a push routinely gets UNKNOWN. Acting on it would nudge a worker whose
-    push has just fixed everything."""
+    """GitHub computes mergeability lazily and asking is what starts it"""
     fake_gh.set_pr(PR, "OPEN", mergeable="UNKNOWN")
     store = ProjectStore(project)
 
@@ -778,7 +705,7 @@ def test_unknown_mergeability_is_not_a_conflict(started, project, fake_gh, parke
 
 def test_unknown_mergeability_does_not_clear_a_conflict_either(started, project,
                                                               fake_gh, parked_worker):
-    """"Not known to conflict" is not "known to merge"."""
+    """"Not known to conflict" is not "known to merge\""""
     conflicting(fake_gh)
     store = ProjectStore(project)
     poll(started, store)
@@ -792,8 +719,7 @@ def test_unknown_mergeability_does_not_clear_a_conflict_either(started, project,
 
 def test_the_timeline_shows_the_attempts_and_credits_nobody_with_them(
         started, project, fake_gh, parked_worker):
-    """When the flag finally fires, the user has to see what was already tried without
-    asking — and must not read a message they never wrote as their own (spec §6)."""
+    """When the flag finally fires, the user has to see what was already tried without asking"""
     conflicting(fake_gh)
     store = ProjectStore(project)
     for _ in range(PR_REPAIR_MAX_ATTEMPTS + 1):
@@ -813,7 +739,7 @@ def test_the_timeline_shows_the_attempts_and_credits_nobody_with_them(
         "attempt 1 of 3", "attempt 2 of 3", "attempt 3 of 3"]
 
 
-# -- reading GitHub -----------------------------------------------------------------
+# -- reading GitHub
 
 
 def test_pr_view_parses_the_state(fake_gh):
@@ -837,8 +763,7 @@ def test_pr_view_reads_mergeability_and_the_base_branch(fake_gh):
 
 
 def test_a_pr_with_no_mergeability_is_no_conflict(fake_gh):
-    """Merged and closed pull requests answer null, and so must read as "no conflict"
-    rather than crashing the poll that has always only asked about the state."""
+    """Merged and closed pull requests answer null"""
     fake_gh.set_pr(PR, "MERGED", merged_at="2026-08-22T10:00:00Z")
 
     pr = github.pr_view(PR)
@@ -848,28 +773,19 @@ def test_a_pr_with_no_mergeability_is_no_conflict(fake_gh):
 
 
 def test_pr_view_reads_the_head_sha_and_survives_its_absence(fake_gh):
-    """`headRefOid` is the one field this repository's landing sweep added to PR_FIELDS.
-
-    On a MERGED pull request it is the sha that merged, and `ops.complete_merged` writes
-    it onto the `pr_merged` event because that event is the only place it can live
-    (kn-dbc4971d: `pr_state` is stale by construction). Asserted HERE, at the parse, and
-    not only through `landing.assess(pr_head_oid=...)`: the two are joined by a payload
-    key and a JSON field name, and a typo in either would leave the exact Mode C rung
-    permanently dormant — which looks precisely like a fleet with nothing stranded.
-    """
+    """`headRefOid` is the one field this repository's landing sweep added to PR_FIELDS"""
     sha = "9f1c2ab4d5e6f708192a3b4c5d6e7f8091a2b3c4"
     fake_gh.set_pr(PR, "MERGED", merged_at="2026-08-02T10:00:00Z", head_oid=sha)
 
     assert github.pr_view(PR).head_oid == sha
 
-    # And the fleet that predates the field: GitHub answers, the sha is simply absent.
+    # And the fleet that predates the field: GitHub answers, the sha is simply absent
     fake_gh.set_pr(OTHER_PR, "MERGED", merged_at="2026-08-02T10:00:00Z")
     assert github.pr_view(OTHER_PR).head_oid == ""
 
 
 def test_pr_view_raises_rather_than_guessing(fake_gh):
-    """An unreadable pull request must never look like an unmerged one: guessing OPEN
-    parks a merged work order forever, guessing CLOSED demands the user for nothing."""
+    """An unreadable pull request must never look like an unmerged one: guessing OPEN parks a merged work..."""
     fake_gh.fail("HTTP 401: Bad credentials")
 
     with pytest.raises(github.GitHubError) as e:
@@ -878,12 +794,12 @@ def test_pr_view_raises_rather_than_guessing(fake_gh):
 
 
 def test_the_isolation_gate_stops_a_test_reaching_real_github():
-    """No `fake_gh` fixture: the blocked stub must answer, not the real `gh`."""
+    """No `fake_gh` fixture: the blocked stub must answer, not the real `gh`"""
     with pytest.raises(github.GitHubError):
         github.pr_view(PR)
 
 
-# -- the PR title prefix ------------------------------------------------------------
+# -- the PR title prefix
 
 
 @pytest.mark.parametrize("command", [
@@ -932,7 +848,7 @@ def test_the_hook_keeps_out_of_everything_else(command):
 
 
 def test_interactive_sessions_are_untouched():
-    """No JARVIS_WO_ID: a human in a managed repo has no work order to name."""
+    """No JARVIS_WO_ID: a human in a managed repo has no work order to name"""
     assert hooks.preflight_decision(
         {"tool_name": "Bash",
          "tool_input": {"command": 'gh pr create --title "Add feature X"'}},
@@ -941,7 +857,7 @@ def test_interactive_sessions_are_untouched():
 
 
 def test_the_worker_briefing_names_the_required_prefix(catalog_file):
-    """A rule enforced only by a hook is a trap; the contract has to state it first."""
+    """A rule enforced only by a hook is a trap; the contract has to state it first"""
     from jarvis.dispatch import build_worker_prompt
 
     prompt = build_worker_prompt(
@@ -953,36 +869,23 @@ def test_the_worker_briefing_names_the_required_prefix(catalog_file):
 
 
 def test_the_operation_contract_names_it_too(started, project):
-    """OPERATION.md is what a worker reads when the briefing is not in front of it."""
+    """OPERATION.md is what a worker reads when the briefing is not in front of it"""
     contract = (project / "OPERATION.md").read_text()
 
     assert "[$JARVIS_WO_ID]" in contract
     assert "--pr <url>" in contract
 
 
-# -- a repair attempt the worker was never allowed to make ---------------------------
-#
-# GitHub issue #469,
-# docs/superpowers/specs/2026-09-19-an-attempt-the-worker-could-not-make.md. A pending
-# gate refuses every non-read call in the worker's session (`hooks.pending_turn_block`),
-# so a nudge delivered into one dies in twenty seconds without the conflict being read.
-# All three attempts went that way and the order was stranded for ever.
+# -- a repair attempt the worker was never allowed to make
 
 
 def gate(store, wo_id: str, kind: str = "pr_merge", status: str = "pending") -> dict:
-    """A privileged-action request sitting in front of a reviewer.
-
-    The command string is a placeholder rather than a real one: nothing here reads it,
-    and a literal privileged command in a test file is itself blocked by the gate
-    recogniser — which is how this very work order met issue #469's cousin.
-    """
+    """A privileged-action request sitting in front of a reviewer (#469)"""
     return store.add_approval(wo_id, kind, f"<gated command for {PR}>", status=status)
 
 
 def argue(store, request: dict) -> dict:
-    """The worker making its case — the one door out of `awaiting_case`, and the only
-    production caller of `ProjectStore.start_review`, which is where a held request
-    gets the `pending_at` that makes it start refusing the worker's commands."""
+    """The worker making its case — the one door out of `awaiting_case`"""
     neo = NeoStore()
     try:
         gates.queue_for_review(
@@ -998,8 +901,7 @@ def argue(store, request: dict) -> dict:
 
 def test_a_pending_gate_defers_the_nudge_instead_of_spending_an_attempt(
         started, project, fake_gh, parked_worker):
-    """THE defect. The poller asked three times in four minutes and every turn died at
-    the same block, without the conflict being read once."""
+    """THE defect"""
     conflicting(fake_gh)
     store = ProjectStore(project)
     gate(store, parked_worker["id"])
@@ -1016,7 +918,7 @@ def test_a_pending_gate_defers_the_nudge_instead_of_spending_an_attempt(
 
 def test_the_deferral_is_recorded_once_however_long_the_review_takes(
         started, project, fake_gh, parked_worker):
-    """Six hours of two-minute polls is 180 rows if this is not deduped."""
+    """Six hours of two-minute polls is 180 rows if this is not deduped"""
     conflicting(fake_gh)
     store = ProjectStore(project)
     request = gate(store, parked_worker["id"])
@@ -1037,7 +939,7 @@ def test_the_deferral_is_recorded_once_however_long_the_review_takes(
 
 def test_deciding_the_gate_lets_the_repair_start(started, project, fake_gh,
                                                  parked_worker):
-    """Nothing was spent, so resuming is just the next tick doing its job."""
+    """Nothing was spent, so resuming is just the next tick doing its job"""
     conflicting(fake_gh)
     store = ProjectStore(project)
     request = gate(store, parked_worker["id"])
@@ -1052,8 +954,7 @@ def test_deciding_the_gate_lets_the_repair_start(started, project, fake_gh,
 
 def test_a_gate_the_worker_must_still_argue_does_not_defer_anything(
         started, project, fake_gh, parked_worker):
-    """`awaiting_case` blocks the END of a turn, not the work in it — so it is not an
-    excuse. The predicate here is the one `hooks.pending_turn_block` enforces."""
+    """`awaiting_case` blocks the END of a turn, not the work in it — so it is not an excuse"""
     conflicting(fake_gh)
     store = ProjectStore(project)
     gate(store, parked_worker["id"], status="awaiting_case")
@@ -1065,9 +966,7 @@ def test_a_gate_the_worker_must_still_argue_does_not_defer_anything(
 
 def test_a_budget_spent_entirely_behind_a_gate_is_given_back_when_it_is_decided(
         started, project, fake_gh, parked_worker):
-    """The other half: an order already stranded when this shipped, and the race where
-    the worker files its own gate mid-repair. Three refusals, a verdict six hours
-    later, and before this nothing in the OS would ever nudge it again."""
+    """The other half: an order already stranded when this shipped"""
     conflicting(fake_gh)
     store = ProjectStore(project)
     request = gate(store, parked_worker["id"])
@@ -1092,8 +991,7 @@ def test_a_budget_spent_entirely_behind_a_gate_is_given_back_when_it_is_decided(
 
 def test_a_budget_the_worker_actually_spent_is_not_given_back(started, project,
                                                               fake_gh, parked_worker):
-    """The negative control, and the one that keeps the give-up meaning something: the
-    worker was let at the conflict three times and could not fix it."""
+    """The negative control, and the one that keeps the give-up meaning something: the worker was let at..."""
     conflicting(fake_gh)
     store = ProjectStore(project)
     for _ in range(PR_REPAIR_MAX_ATTEMPTS + 1):
@@ -1112,8 +1010,7 @@ def test_a_budget_the_worker_actually_spent_is_not_given_back(started, project,
 
 def test_one_genuine_attempt_among_the_refusals_keeps_the_give_up(
         started, project, fake_gh, parked_worker):
-    """EVERY nudge, not some of them: a partial refund would need the episode boundary
-    to be a number rather than an event, and the give-up still says something true."""
+    """EVERY nudge, not some of them: a partial refund would need the episode boundary to be a number..."""
     conflicting(fake_gh)
     store = ProjectStore(project)
     poll(started, store)                                # attempt 1: nothing in the way
@@ -1133,8 +1030,7 @@ def test_one_genuine_attempt_among_the_refusals_keeps_the_give_up(
 
 def test_the_refund_happens_once_and_the_loop_terminates(started, project, fake_gh,
                                                          parked_worker):
-    """A re-armed episode gives up again for real, and cannot be re-armed a second
-    time: the guard means no nudge after the refund can go out under a gate."""
+    """A re-armed episode gives up again for real"""
     conflicting(fake_gh)
     store = ProjectStore(project)
     request = gate(store, parked_worker["id"])
@@ -1156,8 +1052,7 @@ def test_the_refund_happens_once_and_the_loop_terminates(started, project, fake_
 
 def test_a_request_nobody_ever_argued_never_blocked_anything(started, project, fake_gh,
                                                              parked_worker):
-    """`gate_open_at` excludes a request abandoned unargued: it never reached the
-    status that refuses a worker's commands, so it excuses nothing."""
+    """`gate_open_at` excludes a request abandoned unargued: it never reached the status that refuses a..."""
     conflicting(fake_gh)
     store = ProjectStore(project)
     request = gate(store, parked_worker["id"], status="awaiting_case")
@@ -1176,16 +1071,7 @@ def test_a_request_nobody_ever_argued_never_blocked_anything(started, project, f
 
 def test_a_held_request_nobody_argues_never_refunds_anything(started, project, fake_gh,
                                                              parked_worker):
-    """The loop this change nearly shipped, pinned shut.
-
-    One `awaiting_case` request, never argued and never decided, sitting on the work
-    order for ever. It refuses the end of a turn and nothing else, so the worker really
-    did get its three attempts and really did fail — the give-up is true and must stand.
-    An earlier `gate_open_at` counted the request anyway (open, not abandoned, no
-    verdict) and handed the whole budget back, every episode, clearing attention each
-    time: an unattended burn, which is issue #469 pointed the wrong way. Two episodes
-    here, because once is not a termination argument.
-    """
+    """The loop this change nearly shipped, pinned shut (#469)"""
     conflicting(fake_gh)
     store = ProjectStore(project)
     gate(store, parked_worker["id"], status="awaiting_case")
@@ -1217,8 +1103,7 @@ def test_a_held_request_nobody_argues_never_refunds_anything(started, project, f
 
 def test_the_refund_is_capped_at_one_per_work_order(started, project, fake_gh,
                                                     parked_worker):
-    """The braces, tested apart from the belt: a second episode that satisfies every
-    refund condition is still not refunded, so no predicate bug can make this loop."""
+    """The braces, tested apart from the belt: a second episode that satisfies every refund condition is..."""
     conflicting(fake_gh)
     store = ProjectStore(project)
     for episode in range(2):
@@ -1241,11 +1126,7 @@ def test_the_refund_is_capped_at_one_per_work_order(started, project, fake_gh,
 
 def test_the_migration_refunds_an_order_stranded_before_this_shipped(
         started, project, fake_gh, parked_worker):
-    """`pending_at` is a NEW column, so every row that was already stranded has none —
-    including issue #469's own work order. `_backfill_pending_at` is what refunds
-    those, and it is the one path no other test here can reach: they all file their
-    gate through the new `add_approval`, which stamps the column at birth.
-    """
+    """`pending_at` is a NEW column, so every row that was already stranded has none (#469)"""
     conflicting(fake_gh)
     store = ProjectStore(project)
     request = gate(store, parked_worker["id"])
@@ -1273,10 +1154,7 @@ def test_the_migration_refunds_an_order_stranded_before_this_shipped(
 
 def test_a_nudge_sent_before_the_case_was_made_is_a_real_attempt(
         started, project, fake_gh, parked_worker):
-    """The near side of the `[pending_at, decided_at)` boundary. The request existed
-    when this nudge went out, but it was still `awaiting_case` and refused nothing the
-    worker needed — so that attempt was real, and one real attempt is enough to keep
-    the give-up (`test_one_genuine_attempt_among_the_refusals_keeps_the_give_up`)."""
+    """The near side of the `[pending_at, decided_at)` boundary"""
     conflicting(fake_gh)
     store = ProjectStore(project)
     request = gate(store, parked_worker["id"], status="awaiting_case")
@@ -1300,11 +1178,7 @@ def test_a_nudge_sent_before_the_case_was_made_is_a_real_attempt(
 
 def test_a_held_request_starts_blocking_the_moment_the_case_is_made(
         started, project, fake_gh, parked_worker):
-    """The far side of the same boundary, and the only test of `start_review` writing
-    the column: argue the request first and every nudge after it is one the worker
-    could not make, so the whole budget comes back. Leave `pending_at` unwritten there
-    and it stays NULL for ever — the request would refuse the worker's commands while
-    counting as an excuse for nothing."""
+    """The far side of the same boundary"""
     conflicting(fake_gh)
     store = ProjectStore(project)
     request = gate(store, parked_worker["id"], status="awaiting_case")

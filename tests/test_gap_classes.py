@@ -1,11 +1,4 @@
-"""The gap class registry — Appendix A.2 of
-docs/superpowers/specs/2026-09-27-investigation-orders.md.
-
-Two tiers, and only one of them is closed: `GAP_CLASSES` is closed BY THIS FILE, while
-`checked_slug` checks shape and never membership. A test that conflated the two would
-delete the one case an investigation exists for — the first occurrence of a mechanism
-nobody has named yet.
-"""
+"""The gap class registry — Appendix A.2 of docs/superpowers/specs/2026-09-27-investigation-orders.md"""
 
 from __future__ import annotations
 
@@ -52,8 +45,7 @@ def test_by_invariant_skips_the_classes_with_no_detector_yet():
 
 
 def test_the_unwired_precondition_class_is_the_only_one_with_a_detector():
-    """§2.5 of docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md:
-    the first entry in this registry to ship a real detector."""
+    """§2.5 of docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md: the first entry in..."""
     armed = {slug for slug, c in gaps.GAP_CLASSES.items() if c.detector}
     assert armed == {"unwired-precondition"}
     assert (gaps.by_invariant()["INV-PRECONDITION-UNWIRED"]

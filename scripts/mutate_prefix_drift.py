@@ -1,26 +1,5 @@
 #!/usr/bin/env python
-"""Mutation-test the prefix-drift battery: plant a drift, assert the right file goes red.
-
-    uv run python scripts/mutate_prefix_drift.py
-
-A green battery proves nothing until each of its scenarios has been shown to fail for
-the reason it claims to watch (kn-45bae078 item 3). This plants each drift in PRODUCTION
-code one at a time, runs both owning test files, restores the tree, and checks the
-observed owner against the one declared below. Exits non-zero on any disagreement, so
-the table in the pull request is reproducible rather than asserted.
-
-WHY THIS IS A COMMITTED SCRIPT AND NOT A SHELL LOOP (review round 2). The first version
-was ad-hoc and decided "red" by grepping stdout for lines starting with `FAILED`. A
-mutation that breaks module IMPORT produces `ERROR ... during collection` instead, which
-that grep cannot see — so the most broken outcome available was scored as a pass, and a
-false row reached the pull request and the knowledge base. Red is `returncode != 0`
-here, which is the one reading that cannot miss a way for a run to go wrong.
-
-TEST CALL SITES ARE NEVER EDITED. A mutation must be a change a real commit could make,
-and a rename that updates the definition but not its own module's use of it is a
-NameError, not a drift — it takes every test down and measures nothing (that was case A
-above). `RENAME` therefore edits the definition AND `OS_INVARIANTS` together.
-"""
+"""Mutation-test the prefix-drift battery: plant a drift, assert the right file goes red"""
 
 from __future__ import annotations
 
@@ -99,16 +78,14 @@ MUTATIONS: list[tuple[str, str, list[tuple[str, str]], set[str]]] = [
 
 
 def _red(target: str) -> bool:
-    """Did this file go red? Any non-zero exit — a failure, a collection ERROR, a crash."""
+    """Did this file go red?"""
     return subprocess.run(
         [sys.executable, "-m", "pytest", target, "-q", "--no-header", "-p", "no:randomly"],
         cwd=ROOT, capture_output=True, text=True).returncode != 0
 
 
 def _drop_pycache() -> None:
-    """.pyc invalidation keys on source mtime+size, so a same-size edit restored within
-    the same second loads STALE bytecode and the next mutation looks spuriously
-    undetected (kn-45bae078)."""
+    """.pyc invalidation keys on source mtime+size"""
     for pc in (ROOT / "src").rglob("__pycache__"):
         shutil.rmtree(pc, ignore_errors=True)
 

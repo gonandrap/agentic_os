@@ -1,33 +1,4 @@
-"""Shorten an over-long worker question into something the user can act on.
-
-Neo keeps receiving the question in full — its judgement is only as good as what it
-reads. This module is about the OTHER reader: the human opening `/neo` to review what
-Neo did. A worker that pastes a 7,000-character feature-order brief into
-`jarvis wo ask` produces a page nobody finishes, and a review nobody finishes is a
-review that did not happen.
-
-So the dashboard renders a DIGEST — one model call, cheap model, shaped by the vendored
-`i-have-adhd` output style (`assets/digest/`, MIT, see the README there) — and keeps the
-verbatim text one disclosure away.
-
-THREE PROPERTIES THIS MODULE EXISTS TO HOLD.
-
-**The digest is display, never input.** Nothing here is passed to Neo, to a worker, or
-into a learning. It is computed after the question has already been answered and is read
-only by the dashboard, so a bad digest costs the user a confusing paragraph, never a
-wrong decision. That is what makes a formatting-grade model the right call.
-
-**The shape is guaranteed by the validator, not by the prompt.** The user asked for
-bullets, options and a highlighted recommendation. Asking a model for markdown and
-hoping gets you prose with dashes in it about a third of the time; asking for strict
-JSON through `structured.request` and validating the fields means the template can rely
-on them existing. It also means the page renders no model-authored HTML — the fields go
-through Jinja's autoescaping as text.
-
-**A missing digest is a working page.** Every failure mode here ends with the raw
-question rendered exactly as it is today. There is no state in which the user is shown a
-digest INSTEAD of a question they cannot get back to.
-"""
+"""Shorten an over-long worker question into something the user can act on"""
 
 from __future__ import annotations
 
@@ -39,50 +10,33 @@ from . import claude_cli, structured
 from .bootstrap import ASSETS
 from .catalog import DEFAULT_DIGEST_MAX_QUESTION_CHARS
 
-#: The vendored output style. DELIBERATELY NOT under `assets/agents/` or
-#: `assets/skills/`: `bootstrap._rebuild` copytrees both of those into every project, so
-#: a prompt dropped there becomes a subagent or a worker skill. See the README beside it.
+#: The vendored output style
 SKILL_PATH = ASSETS / "digest" / "i-have-adhd.SKILL.md"
 
-#: First line of the digest system prompt. Machine-readable on purpose, exactly like
-#: `panel.SEAT_HEADER`: it tells anything reading the call (the test fake keys on it)
-#: which kind of call this is, without depending on the vendored prose.
+#: First line of the digest system prompt
 DIGEST_HEADER = "# Jarvis dashboard digest"
 
-#: Below this many characters a question is already readable and gets no digest. Every
-#: digest is a real model call, so the threshold is what keeps a one-line question from
-#: costing one. Questions on the `/neo` page are typically 100-400 characters; the one
-#: that prompted this feature (#53) was ~7,000.
+#: Below this many characters a question is already readable and gets no digest (#53)
 MIN_CHARS = 800
 
-#: Caps, enforced in the validator rather than only asked for in the prompt. The skill's
-#: own rule 9 is "cap lists at 5 items"; a model that ignores it must not be able to put
-#: twelve bullets on the page, because twelve bullets is the problem this feature exists
-#: to remove.
+#: Caps, enforced in the validator rather than only asked for in the prompt
 MAX_BULLETS = 5
 MAX_OPTIONS = 5
 
-#: How much of a long field survives. Generous — this is a guard against a model that
-#: pasted the question back, not a style rule.
+#: How much of a long field survives
 MAX_FIELD_CHARS = 600
 
-#: How much of the question the model is SHOWN. `MAX_FIELD_CHARS` bounds only the reply,
-#: so q722 bought up to two digest calls at 151,700 chars each. The digest is
-#: display-only — the full text is on the record — which is why clipping is right here
-#: and refusing is right in `neo_store.ask`. Default measured in
-#: `catalog.DEFAULT_DIGEST_MAX_QUESTION_CHARS`. Spec §4:
-#: docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+#: How much of the question the model is SHOWN (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
 MAX_QUESTION_CHARS = DEFAULT_DIGEST_MAX_QUESTION_CHARS
 
-#: The clip is LABELLED and the label is INSIDE the prompt the model reads, so the
-#: headline it writes is honest about what it saw (same spec section).
+#: The clip is LABELLED and the label is INSIDE the prompt the model reads
 CLIP_NOTICE = ("\n\n[clipped for this summary: {cut} characters of the question were "
                "cut here. The full question is on the work-order record — summarise "
                "only what you were shown, and say it is partial.]")
 
 
 def clip(question: str, max_chars: int = MAX_QUESTION_CHARS) -> str:
-    """The question as the digest model sees it: whole, or clipped and labelled."""
+    """The question as the digest model sees it: whole, or clipped and labelled"""
     if len(question) <= max_chars:
         return question
     return question[:max_chars] + CLIP_NOTICE.format(cut=len(question) - max_chars)
@@ -117,25 +71,17 @@ Output STRICT JSON, nothing else, with exactly these keys:
 """
 
 
-#: The transport. Tools stripped: the digest must be a rewriting of the text it was
-#: handed and nothing else. A tooled callee asked to summarise a question about
-#: `src/jarvis/panel.py` will go and READ `src/jarvis/panel.py`, and then the page shows
-#: the reader a description of the code instead of a shortening of the question — a
-#: failure mode that looks like a good answer, which is the worst kind.
-#:
-#: The declaration that the daemon records this call itself — through
-#: `structured.request`'s `on_usage` seam — travels with the call, in `summarise`.
+#: The transport
 CALL = partial(claude_cli.run_headless_result, tools="")
 
 
 class DigestError(RuntimeError):
-    """A digest could not be produced for this question."""
+    """A digest could not be produced for this question"""
 
 
 @lru_cache(maxsize=1)
 def load_skill() -> str:
-    """The vendored output style, verbatim. Cached: a file on disk that only changes
-    when the build does."""
+    """The vendored output style, verbatim"""
     if not SKILL_PATH.is_file():
         raise DigestError(f"the digest output style does not ship in this build ({SKILL_PATH})")
     return SKILL_PATH.read_text().strip()
@@ -143,11 +89,7 @@ def load_skill() -> str:
 
 @lru_cache(maxsize=1)
 def build_system_prompt() -> str:
-    """Header, then the vendored style verbatim, then what to emit.
-
-    Byte-stable across every question, like Neo's own prompt and for the same reason:
-    consecutive digests in one daemon pass share a cached prefix.
-    """
+    """Header, then the vendored style verbatim, then what to emit"""
     return "\n\n".join([DIGEST_HEADER, load_skill(), INSTRUCTIONS.strip()])
 
 
@@ -156,12 +98,7 @@ def _text_field(value: Any) -> str:
 
 
 def _list_field(value: Any, cap: int) -> list[str]:
-    """A list of non-empty one-liners, capped.
-
-    A model that answers with a bare string instead of a list is not making a mistake
-    worth throwing an otherwise-good digest away for: wrap it. A model that answers with
-    a list of dicts is, so `str()` never runs on one — the entry is dropped.
-    """
+    """A list of non-empty one-liners, capped"""
     if isinstance(value, str):
         value = [value]
     if not isinstance(value, list):
@@ -171,12 +108,7 @@ def _list_field(value: Any, cap: int) -> list[str]:
 
 
 def validate(data: dict[str, Any]) -> dict[str, Any]:
-    """Normalise a reply into the four fields the template renders.
-
-    Only `headline` is required, and it is required strictly: a digest whose first line
-    is empty is a blank box where the question used to be. Everything else degrades to
-    empty, because a question with no options really does have no options.
-    """
+    """Normalise a reply into the four fields the template renders"""
     headline = _text_field(data.get("headline"))
     if not headline:
         raise structured.InvalidOutput("the digest has no `headline`")
@@ -192,33 +124,23 @@ def summarise(question: str, *, model: str, timeout: int = 120,
               call: Callable[..., Any] = CALL,
               max_chars: int = MAX_QUESTION_CHARS,
               on_usage: Callable[[Any], None] | None = None) -> dict[str, Any]:
-    """One digest for one question. Raises rather than returning a broken shape.
-
-    Two attempts: unlike Neo's answering path — which must fail SAFE, turning garbage
-    into an escalation the user sees — there is nothing safe to fall back to here, and
-    nothing is riding on the second call but a nicer paragraph. `on_invalid=None` lets
-    the failure reach the caller, which records it and moves on (see
-    `Daemon._digest_batch`).
-    """
+    """One digest for one question"""
     from .paths import ensure_home
 
     return structured.request(
-        # Clipped and labelled before it becomes the prompt — see `clip`.
+        # Clipped and labelled before it becomes the prompt — see `clip`
         clip(question, max_chars),
         validate=validate,
         system_prompt=build_system_prompt(),
         model=model,
         attempts=2,
         timeout=timeout,
-        # Neutral cwd, for the same reason Neo uses one: running from a project
-        # directory would pull that repo's CLAUDE.md into the prompt.
+        # Neutral cwd, for the same reason Neo uses one: running from a project directory would pull that...
         cwd=ensure_home(),
         call=call,
-        # Declared only when a recorder exists: `on_usage` is optional here, and a
-        # declaration with nobody recording is refused (spec §5).
+        # Declared only when a recorder exists: `on_usage` is optional here
         records_itself="digest" if on_usage is not None else "",
-        # A digest is an extra call per question that the user never asked for, so what
-        # it costs belongs on the work order's bill beside the answer it shortens.
+        # A digest is an extra call per question that the user never asked for
         on_usage=on_usage,
     )
 
@@ -228,11 +150,7 @@ def needs_digest(question: str, min_chars: int = MIN_CHARS) -> bool:
     return len(question or "") >= min_chars
 
 
-# -- storage encoding ---------------------------------------------------------------
-#
-# The digest lives in one TEXT column as JSON. It is a display artefact with no
-# queryable structure — nothing ever selects on a bullet — so a table of its own would
-# buy an extra join and a second cascade to keep in step with `questions`.
+# -- storage encoding
 
 
 def encode(view: dict[str, Any]) -> str:
@@ -240,23 +158,12 @@ def encode(view: dict[str, Any]) -> str:
 
 
 def encode_failure(reason: str) -> str:
-    """A recorded failure, so it is not retried for ever.
-
-    The column is NULL until a digest has been ATTEMPTED, and the daemon only picks up
-    NULLs, so a failure must write something or every tick would spend another call on
-    the same question. One attempt per question, ever: the cost of not retrying is a
-    question that renders in full — which is exactly today's behaviour — and the cost of
-    retrying is an unbounded spend the user never asked for.
-    """
+    """A recorded failure, so it is not retried for ever"""
     return json.dumps({"error": str(reason)[:500]})
 
 
 def decode(raw: str | None) -> dict[str, Any] | None:
-    """The stored digest, or None when there is nothing renderable.
-
-    None covers all three of "not attempted yet", "attempted and failed" and "the row
-    predates this feature", and the template treats them identically: show the question.
-    """
+    """The stored digest, or None when there is nothing renderable"""
     if not raw:
         return None
     try:
@@ -269,8 +176,7 @@ def decode(raw: str | None) -> dict[str, Any] | None:
 
 
 def failure_reason(raw: str | None) -> str:
-    """Why the digest for this row is missing, for a log or a debug surface. Empty when
-    it was never attempted."""
+    """Why the digest for this row is missing, for a log or a debug surface"""
     if not raw:
         return ""
     try:
@@ -281,10 +187,6 @@ def failure_reason(raw: str | None) -> str:
 
 
 def skill_attribution() -> str:
-    """One line naming what shaped the digest, for the page footer.
-
-    The style is someone else's work under a permissive licence; a surface built out of
-    it says so.
-    """
+    """One line naming what shaped the digest, for the page footer"""
     return ("shortened with the i-have-adhd output style "
             "(github.com/ayghri/i-have-adhd, MIT)")

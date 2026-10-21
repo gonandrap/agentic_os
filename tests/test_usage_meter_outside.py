@@ -1,9 +1,4 @@
-"""Outside-Jarvis spend: the ownership predicate and the transcript walk.
-
-Spec docs/superpowers/specs/2026-10-08-usage-meter-samples-and-outside-spend.md §6.
-Tests 15-23 of its §13. No test touches the real `~/.claude` tree: `fleet_fixture`
-points `usage.TRANSCRIPT_ROOT_ENV` at a tmp directory.
-"""
+"""Outside-Jarvis spend: the ownership predicate and the transcript walk (docs/superpowers/specs/2026-10-08-usage-meter-samples-and-outside-spend.md §6.)"""
 
 from __future__ import annotations
 
@@ -48,7 +43,7 @@ def register(path: str, name: str) -> None:
         central.close()
 
 
-# -- 15-18, ownership -------------------------------------------------------------------
+# -- 15-18, ownership
 
 
 def test_owned_worker_session_excluded_lead_and_subagent(fleet_fixture):
@@ -100,7 +95,7 @@ def test_agent_calls_session_id_is_owned(fleet_fixture):
     assert walk(fleet_fixture) == []
 
 
-# -- 19-20, attribution -----------------------------------------------------------------
+# -- 19-20, attribution
 
 
 def test_unregistered_directory_reports_no_project(fleet_fixture):
@@ -126,11 +121,11 @@ def test_colliding_slugs_attribute_to_the_longer_match(fleet_fixture):
     found = walk(fleet_fixture)
 
     assert [s.project for s in found] == ["jarvis_os"]
-    # A bare prefix test cannot split the pair — the wrong answer, pinned.
+    # A bare prefix test cannot split the pair — the wrong answer, pinned
     assert directory.startswith(nav_volume.slug_of("/ws/jarvis"))
 
 
-# -- 21-23, the walk --------------------------------------------------------------------
+# -- 21-23, the walk
 
 
 def test_span_cuts_through_one_file(fleet_fixture):

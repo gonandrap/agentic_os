@@ -1,4 +1,4 @@
-"""Catalog: the JSON file describing the fleet of projects Jarvis manages."""
+"""Catalog: the JSON file describing the fleet of projects Jarvis manages"""
 
 from __future__ import annotations
 
@@ -13,10 +13,7 @@ from . import claude_cli
 from . import concision
 from . import health as health_mod
 from . import probes as probes_mod
-# The ceiling's constants live in `claude_cli` and are imported HERE, not the other way
-# round: catalog -> project_store -> claude_cli is already a chain, so the reverse
-# import is a cycle. Spec §4:
-# docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+# The ceiling's constants live in `claude_cli` and are imported HERE (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
 from .claude_cli import DEFAULT_MAX_OS_PROMPT_CHARS, MAX_OS_PROMPT_CHARS_MIN
 from . import schedule as schedule_mod
 from .gates import GateConfig
@@ -25,56 +22,33 @@ from .navigation import (DOC_DIRS, DOC_DUMP_COMMANDS, DOC_SUFFIXES, NAV_COMMANDS
 from .neo_store import Q_KINDS, SEATS
 from .project_store import VALIDATOR_SEATS
 
-# Dotted-path globs (fnmatch) over a resolved config map naming the settings that are
-# SAFETY rather than money: they change what a worker is allowed to do. Earns its place
-# by buying exactly two things and no more — a louder confirmation, and a mandatory
-# `--reason` on the version row. See
-# docs/superpowers/specs/2026-08-27-the-config-console.md §7, and §11.5 for what the
-# list is not yet sure of.
+# Dotted-path globs (fnmatch) over a resolved config map naming the settings that are SAFETY rather... (docs/superpowers/specs/2026-08-27-the-config-console.md §7)
 SAFETY_KEYS = (
     "*.permission_mode",
     "*.gates.*",
-    # `*.` rather than `os.`: a project's own validation block is the same switch with a
-    # smaller blast radius, and the per-project form is the sentence the design's
-    # acceptance walk is written in (§10.3).
+    # `*.` rather than `os.`: a project's own validation block is the same switch with a smaller blast...
     "*.validation.*",
     "os.neo.enabled",
-    # Same class of act as turning Neo off: it removes a reviewer, and the change is
-    # invisible on every surface until the thing it was reviewing goes wrong.
+    # Same class of act as turning Neo off: it removes a reviewer
     "os.supervisor.enabled",
-    # And the same again for the health sweep, which is a separate watcher with a
-    # separate switch — docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md §2.
+    # And the same again for the health sweep, which is a separate watcher with a separate switch (docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md §2.)
     "os.supervisor.health_enabled",
-    # What the OS is permitted to DO, not merely to watch (§5). `*.` rather than `os.`
-    # for `*.validation.*`'s reason: the per-project form is the same switch with a
-    # smaller blast radius, and both halves — the flag and the allow-list — widen it.
+    # What the OS is permitted to DO, not merely to watch (§5)
     "*.supervisor.remedies.*",
-    # The whole scheduler block, not just its switch. It is the only thing in the OS
-    # that files work with nobody asking, so enabling it and shortening its interval are
-    # the same act at two magnitudes — and a change here is invisible until the morning
-    # it starts spending. docs/superpowers/specs/2026-09-14-the-scheduler.md §2.
+    # The whole scheduler block, not just its switch (docs/superpowers/specs/2026-09-14-the-scheduler.md §2.)
     "*.schedule.*",
-    # Files work nobody typed: same class of act as the scheduler.
+    # Files work nobody typed: same class of act as the scheduler
     "os.autonomy.*",
-    # How much of that the steward may spend, and how deep it may go. Same act at a
-    # different magnitude. docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md
-    # `min_samples` is a reporting floor, not spend, so the steward's keys are named.
+    # How much of that the steward may spend, and how deep it may go (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md)
     "os.evolution.weekly_usd", "os.evolution.critical_weekly_usd",
     "os.evolution.yield_above_usd", "os.evolution.order_budget_usd",
     "os.evolution.max_depth", "os.evolution.*_min_refs", "os.evolution.min_precision",
     "os.evolution.mode",
-    # What the OS is permitted to WATCH — and, once §6 of
-    # docs/superpowers/specs/2026-09-27-self-evolution.md lands, the switch everything
-    # it is permitted to DO about what it watched hangs off. It is here at the WATCHING stage
-    # deliberately: the registry is a table of admitted heuristics that a person arms one
-    # at a time, so the moment the fleet starts evaluating them is the moment a reader
-    # needs on the record, not the later moment one of them first acts. `*.` rather than
-    # `os.` for `*.validation.*`'s reason: the per-project form is the same switch with a
-    # smaller blast radius.
+    # What the OS is permitted to WATCH (docs/superpowers/specs/2026-09-27-self-evolution.md)
     "*.rules.*",
 )
 
-# Mirrors `claude --permission-mode` choices exactly (CLI rejects anything else).
+# Mirrors `claude --permission-mode` choices exactly (CLI rejects anything else)
 VALID_PERMISSION_MODES = {
     "acceptEdits",
     "auto",
@@ -84,237 +58,80 @@ VALID_PERMISSION_MODES = {
     "plan",
 }
 
-# Default worker mode. `auto` runs routine tools (grep, edits, scripts, tests, git)
-# without a prompt per action — the only way a `--bg` worker can run unattended, since
-# a background session can't answer a prompt. Sensitive paths stay protected by the
-# project's PreToolUse deny guards (catalog settings_overrides), which fire in every
-# mode; `auto` does not weaken those. See ASSUMPTIONS.md §9.
+# Default worker mode
 DEFAULT_PERMISSION_MODE = "auto"
 
-# Whether `auto` mode's bash-first steer reaches a worker, and in which variant. §1 of
-# docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md.
-#
-# A STRING ENUM and not a boolean: `cli` is the only value under which Jarvis asserts no
-# answer about a vendor behaviour it does not own, and a boolean cannot express it. The
-# DEFAULT DISABLES rather than relaxing — `relaxed` is a softer copy of the instruction
-# that beat Jarvis's own navigation posture at a measured 0% hit rate over 276
-# transcripts (kn-8107745e, io-edacb3ea). `strict` exists for the deterministic arm of
-# evals/llm/test_navigation_judgment.py: the variant is otherwise a per-session statsig
-# cohort draw, and an arm whose strength comes from a draw is not a measurement.
+# Whether `auto` mode's bash-first steer reaches a worker (docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md)
 VALID_BASH_FIRST = ("off", "relaxed", "strict", "cli")
 DEFAULT_WORKER_BASH_FIRST = "off"
 
-# Whether a worker's MCP tools are DEFERRED behind `ToolSearch` or listed with full
-# schemas. §4 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md.
-#
-# A STRING ENUM for VALID_BASH_FIRST's reason: `cli` asserts no answer about a vendor
-# behaviour Jarvis does not own, and writes no key. DEFAULT `on`: Jarvis PINS deferral
-# rather than leaving it to the vendor default, because deferral is what makes a worker's
-# first navigation call a symbol call — 7/7 deferred against 1/10 with the tools present
-# (wo-ab5d81db), which makes `off` a measured regression on that outcome. §4 addendum of
-# docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md.
+# Whether a worker's MCP tools are DEFERRED behind `ToolSearch` or listed with full schemas. §4 of... (docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md)
 VALID_TOOL_SEARCH = ("off", "on", "cli")
 DEFAULT_WORKER_TOOL_SEARCH = "on"
 
-# WHICH PROMPT-CACHE TTL a worker TURN's writes are billed at. §1 of
-# docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md.
-#
-# `5m` forces FORCE_PROMPT_CACHING_5M (today's behaviour, the control arm), `1h` sets
-# ENABLE_PROMPT_CACHING_1H and no 5m key, `cli` writes nothing. DEFAULT `5m`: the fleet
-# arithmetic says do not switch (TTL-expiry 10.6% of cache writes against a 39.5%
-# break-even), and the worker-only number has never been measured because there was no
-# way to measure it. OS-side calls (`claude_cli._run`) are not an arm and never switch.
+# WHICH PROMPT-CACHE TTL a worker TURN's writes are billed at. §1 of... (docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md)
 VALID_WORKER_CACHE_TTL = ("5m", "1h", "cli")
 DEFAULT_WORKER_CACHE_TTL = "5m"
 
-# Whether `hooks.py_nav_decision` refuses a worker's source-navigating Bash call at a
-# `.py` path. §6 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md.
-#
-# TWO STATES and not three: `cli` exists only where Jarvis defers to a vendor behaviour
-# it does not own, and this hook is entirely Jarvis's own. DEFAULT OFF, and the flip is
-# SEQUENCED rather than refused: the hook measures ZERO contribution to first-call order
-# (with the Serena tools present the first navigation call was a symbol call 0/3 with the
-# hook off and 0/2 with it on; with them deferred 2/2 both ways), and on fleet-wide a
-# worker cannot search the tree for ANY text — issue 936, `navigation._sweeps_the_tree`
-# ignores its suffixes argument. wo-d2d777dc owns that fix; flip after it lands
-# (wo-ab5d81db).
+# Whether `hooks.py_nav_decision` refuses a worker's source-navigating Bash call at a `.py` path. §6... (docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md)
 VALID_PY_NAV_HOOK = ("off", "on")
 DEFAULT_WORKER_PY_NAV_HOOK = "off"
 
-# Whether `hooks.doc_nav_decision` refuses a whole-file or oversized read of a SPEC —
-# §5 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md. TWO STATES, modelled on
-# VALID_PY_NAV_HOOK above and for its reason: the hook is entirely Jarvis's own.
-# DEFAULT OFF — nothing in that spec ships on, so merging it changes the behaviour of no
-# running worker.
+# Whether `hooks.doc_nav_decision` refuses a whole-file or oversized read of a SPEC (docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md)
 VALID_DOC_NAV_HOOK = ("off", "on")
 DEFAULT_WORKER_DOC_NAV_HOOK = "off"
 
-# THE BAR BOTH DOC ARMS SHARE, in lines: a `Read` with a larger `limit` (or none at all)
-# and a `cat`/`head`/`sed -n` naming a wider range are refused. 200 because §1's table
-# prices `head … .md` at 317 tokens a call while the measured evasion is
-# `sed -n '1,2000p'` (§1(c): 1.25M tokens over 2,189 Bash calls) — the arm exists for the
-# 2,000-line range, not for the 40-line one.
-#
-# THIS IS THE KEY'S FALLBACK AND NOT THE RESOLVED NUMBER: a catalog setting rather than a
-# module constant in `hooks.py`, so a project can raise or lower it, and the hook reads
-# the value `dispatch` resolved into the worker's environment.
+# THE BAR BOTH DOC ARMS SHARE, in lines: a `Read` with a larger `limit` (or none at all) and a...
 DEFAULT_WORKER_DOC_READ_LIMIT_LINES = 200
-# Zero or a negative would make the bar a blanket refusal of every targeted read, which
-# is the feature's own MUST NOT reached by a typo. It arrives through `jarvis config
-# set`, so it is refused where the message can name the key — the HOOK absorbs a bad
-# value quietly instead, because it runs on every tool call.
+# Zero or a negative would make the bar a blanket refusal of every targeted read
 WORKER_DOC_READ_LIMIT_LINES_MIN = 1
 
-# Model every worker runs on unless the catalog overrides it (os.defaults.model, a
-# project's `model`, or per work order via `jarvis wo create --model`). Passed straight
-# through to `claude --model`, so it accepts a full model id (pinned, as here) or an
-# alias like `opus`/`sonnet` (which floats to whatever is latest in that tier).
+# Model every worker runs on unless the catalog overrides it (os.defaults.model
 DEFAULT_MODEL = "claude-opus-5"
 
-# Modes in which a `--bg` worker never stalls waiting for a human: `auto` (classifier
-# vets each action), `bypassPermissions` (no checks), and `dontAsk` (unlisted tools are
-# denied, not prompted). Every OTHER mode — acceptEdits, manual/default, plan — prompts
-# on tool calls a real task needs (git, tests, scripts), and a background session can't
-# answer, so it hangs. `worker_stalls_on_prompts()` flags those for the user.
+# Modes in which a `--bg` worker never stalls waiting for a human: `auto` (classifier vets each...
 AUTONOMOUS_PERMISSION_MODES = {"auto", "bypassPermissions", "dontAsk"}
 
 
 def worker_stalls_on_prompts(mode: str) -> bool:
-    """True when a background worker in this permission mode will block on a prompt."""
+    """True when a background worker in this permission mode will block on a prompt"""
     return mode not in AUTONOMOUS_PERMISSION_MODES
 
 
-# Default simultaneous work orders per project; the rest queue (catalog-tunable per
-# project, or fleet-wide via os.defaults.max_concurrent). A slot is spent by a turn that
-# is executing, not by a record waiting on somebody — `project_store.SLOT_STATUSES`.
+# Default simultaneous work orders per project
 DEFAULT_MAX_CONCURRENT = 5
 
 
-# -- the account, which is not a project -------------------------------------------
-#
-# `max_concurrent` above caps a PROJECT. The thing that ran out on 2026-09-02 was the
-# ACCOUNT: four children of one feature order launched together, and three of them paid
-# 51-72s of Opus time to be told the session window was already spent. A per-project cap
-# could not have prevented that and no arrangement of per-project caps can, because the
-# limit is not divided among projects. Hence one number, fleet-wide, with no per-project
-# override to layer: the resource being rationed is shared, so a project that named its
-# own share would be naming a share of something it does not own.
-#
-# THE UNIT IS A TURN IN FLIGHT (`wo_turns.state='running'`), not a work-order status.
-# The two now agree about parked orders — issue #134 took `waiting_input` and
-# `validating` out of `count_active` for the same reason this cap never counted them —
-# but they still differ: a usage-limit pause leaves its order `running`, spending a
-# project slot while it draws nothing from the account. See src/jarvis/fleet.py.
-#
-# 3, because the incident ran four Opus workers plus a planner while Neo answers and
-# validation-panel seats drew on the same account (Neo, question 219). It leaves headroom
-# for those without serialising the fleet.
+# -- the account, which is not a project
 DEFAULT_MAX_IN_FLIGHT = 3
 
 
-# How large a worker's conversation is allowed to grow before Claude Code compacts it
-# (`claude --autocompact <tokens>`). This is the single biggest lever the OS has on its
-# own bill and it is on by default — see
-# docs/superpowers/specs/2026-08-10-resume-cost-and-the-cache.md.
-#
-# WHY A NUMBER AND NOT "auto": left alone, a worker on a 1M-token model does not compact
-# until ~800k, so every API call it makes re-reads the whole conversation. Cache READ is
-# 56% of everything Jarvis spends (kn-1485b845) and it is linear in this number: 146 API
-# calls against a 250-290k context cost 26.3M read tokens in fifteen minutes, measured on
-# wo-996c7344 and wo-67d4f8b0. Bounding the context bounds every one of those reads.
-#
-# WHAT THE NUMBER MEANS: it is the effective context WINDOW, not the trigger point. The
-# CLI takes min(model window, this) and arms auto-compact at a model-table fraction of
-# it, so 400,000 caps a worker's context a little under 400k rather than at it.
-#
-# WHY 400,000 AND NOT LESS: the cost of setting it too low is a worker that compacts
-# mid-task and loses detail. The first value shipped was 150,000, which sits close enough
-# to real work to bite — 10% of sessions peak over 120k and 6% over 150k (kn-f94abf34) —
-# so the orders it truncated were the long ones, exactly where losing detail hurts most.
-# 400,000 is the user's ruling on wo-6808dd2d. It still halves what an unbounded worker on
-# a 1M model would reach (~800k before it compacts at all), so the bound and its linear
-# saving on every cache read remain; it just leaves compaction an exception rather than a
-# routine event. The CLI accepts 100k-1M and rejects anything outside; a project can move
-# it either way, or set it to null to opt out and take the model's own window.
+# How large a worker's conversation is allowed to grow before Claude Code compacts it (`claude... (docs/superpowers/specs/2026-08-10-resume-cost-and-the-cache.md)
 DEFAULT_AUTOCOMPACT_WINDOW = 400_000
-# A STANDING DOLLAR BUDGET for every new order in a project, in US dollars, or None for
-# no ceiling — which is the default and is what the OS did before budgets existed. An OS
-# that starts refusing to work because of a number nobody set would be worse than the
-# problem, so nothing here is populated by default and a project opts in.
-#
-# Two settings rather than one scaled from the other. A feature order's budget bounds its
-# whole family (planner, manager, every child), and nothing at the moment the default is
-# written knows how many children a feature will have — so a per-work-order number says
-# nothing useful about a family, and a multiple of it would be a guess wearing a
-# configuration's clothes. A project that sets only one gets a ceiling on that kind of
-# order alone.
-#
-# Resolved at CREATION and stamped onto the row, unlike `autocompact_window` just above,
-# which is re-read from the catalog on every turn. Deliberately the opposite choice: a
-# budget is a contract about ONE order that `jarvis wo show` has to be able to state, and
-# lowering a fleet default must not strand work the user already authorised at the old
-# number. See src/jarvis/budget.py.
+# A STANDING DOLLAR BUDGET for every new order in a project, in US dollars, or None for no ceiling
 DEFAULT_BUDGET_USD: float | None = None
 DEFAULT_FEATURE_BUDGET_USD: float | None = None
 
-# THE ONE NON-None SHIPPED BUDGET, and §2.8 of
-# docs/superpowers/specs/2026-09-27-investigation-orders.md is why: an investigation's
-# caller is a daemon loop, not a human typing, so an uncapped default is an uncapped loop.
-# An investigation reads records and quotes lines — it should cost cents, and one that
-# costs more than the order it is diagnosing is not worth having.
-#
-# A named constant so the figure is a ONE-LINE edit. PENDING CONFIRMATION: no measurement
-# picked it, the nearest datum being `jarvis cost` on the improvement orders run in this
-# checkout (§7.1).
+# THE ONE NON-None SHIPPED BUDGET (docs/superpowers/specs/2026-09-27-investigation-orders.md)
 DEFAULT_INVESTIGATION_BUDGET_USD: float | None = 2.00
 
-# Cheap by default for the same reason: a diagnosis is reading and quoting, not design.
-# An ALIAS rather than a pinned id, unlike DEFAULT_MODEL: "whatever is currently cheap in
-# that tier" is the intent here, and pinning it would freeze the price.
+# Cheap by default for the same reason: a diagnosis is reading and quoting, not design
 DEFAULT_INVESTIGATION_MODEL = "sonnet"
 DEFAULT_INVESTIGATION_EFFORT = "low"
 
-# A CEILING ON ONE MCP TOOL CALL, in milliseconds, read by Claude Code itself from
-# `MCP_TOOL_TIMEOUT` in the worker's environment (issue #845: Serena's
-# `search_for_pattern` backtracked catastrophically and burned 18m50s of CPU on one call
-# that never returned — nothing bounded it, and it ended when the work order did).
-#
-# FIVE MINUTES, and the figure is the OS's existing cost boundary rather than a new one:
-# it is the 5-minute prompt-cache TTL `claude_cli.PROMPT_CACHE_5M_ENV` buys and what
-# `DEFAULT_INSPECT_ALARM_JOIN_SECONDS` is set to. A call that outlives the cache has
-# already cost the conversation a re-write; letting it run further buys nothing. Every
-# legitimate Serena/context7 call in this fleet's transcripts is sub-minute.
-#
-# A catalog setting and not a literal because a project with a genuinely slow MCP server
-# must be able to RAISE it — which is also why `dispatch` sets it in its `env.update`
-# block rather than in `assets/settings.base.json`, where the catalog cannot reach.
+# A CEILING ON ONE MCP TOOL CALL (#845)
 DEFAULT_WORKER_MCP_TOOL_TIMEOUT_MS = 300_000
-# Under a second is a typo — it would make every MCP call in the project fail — and it
-# arrives through `jarvis config set`, so it is refused where the message can name the key.
+# Under a second is a typo — it would make every MCP call in the project fail
 WORKER_MCP_TOOL_TIMEOUT_MS_MIN = 1000
 
-#: Built-in tools a one-shot headless turn cannot use, removed from its tool list by deny rule (docs/os/architecture/worker-context.md).
+#: Built-in tools a one-shot headless turn cannot use (docs/os/architecture/worker-context.md)
 DEFAULT_WORKER_DENIED_TOOLS = ("Workflow", "ScheduleWakeup", "ReportFindings",
                                "ListAgents", "Agent(statusline-setup)")
 
 
 def _parse_budget(raw: dict[str, Any], key: str, where: str,
                   default: float | None) -> float | None:
-    """Validate a dollar budget. An explicit null means "no ceiling".
-
-    Rejected at load time for the reason the autocompact window is: a bad value would
-    otherwise surface as a refused `claude` invocation on the first dispatch, hours after
-    the edit that caused it. Zero is refused rather than read as "no ceiling" — it looks
-    like an instruction to spend nothing, and silently inverting that is the one
-    misreading that costs money.
-
-    `NaN` IS REFUSED HERE AND NOT ONLY IN `budget.parse_amount`, because `json.loads`
-    accepts a bare `NaN` literal, so a catalog can carry one and this is the only thing
-    between it and every new order in the project. Its danger is spelled out in that
-    function: a NaN budget fails OPEN while rendering as enabled, and stamped on a
-    project default it does so fleet-wide and silently. `isinstance(value, float)` is
-    true of it, and so is `not (value <= 0)`.
-    """
+    """Validate a dollar budget"""
     if key not in raw:
         return default
     value = raw[key]
@@ -333,143 +150,44 @@ def _parse_budget(raw: dict[str, Any], key: str, where: str,
 AUTOCOMPACT_MIN = 100_000    # `claude --autocompact` rejects anything under this
 AUTOCOMPACT_MAX = 1_000_000  # ... or over this
 
-# A cold cache boundary that kept NOTHING was the entry expiring; one that still served
-# the static head of the system prompt was the prefix moving, and no TTL would have
-# helped it. This is the ceiling separating them, and it is configurable because it is a
-# property of THIS FLEET'S PROMPTS — the static head is a project's CLAUDE.md plus the
-# worker briefing, so a fleet of terse projects sits lower and a verbose one higher.
-#
-# IT SITS AT `os.` AND NOT AT `os.defaults.`, WHICH IS THE DELIBERATE PART. Everything
-# under `os.defaults` is a value a project may override, and per-project is the shape
-# this setting most looks like it wants — the static head is literally per project. It
-# is not offered, because the two surfaces that consume the threshold (the fleet cost
-# view and scripts/cache_ttl_cohort.py) walk TRANSCRIPTS rather than work orders and
-# cannot cheaply tell which project a session belonged to. A per-project override would
-# therefore be honoured for a single order's bill and silently ignored by every
-# aggregate — a knob that looks like a feature and behaves like a bug. Offer it only
-# together with session-to-project attribution in those two readers (Neo, question 191).
-#
-# Reasoning and the measured populations:
-# docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md.
+# A cold cache boundary that kept NOTHING was the entry expiring (docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md)
 DEFAULT_COLD_PREFIX_FLOOR = 5_000
-#: Guard rail on the above, and configurable for the same reason it is: a fleet whose
-#: static heads are unusually large needs room to raise the floor. Only the SCHEMA
-#: defaults are literals here; both values are `os.` keys the config console can change
-#: without a release.
+#: Guard rail on the above, and configurable for the same reason it is: a fleet whose static heads are...
 DEFAULT_COLD_PREFIX_FLOOR_MAX = 100_000
 
 # -- CACHE HEALTH: the window and the floors `invariants.check_cache_ttl_trigger` and
-# `invariants.check_prefix_stable` judge the FLEET's cache configuration over.
-#
-# At `os.` and not at `os.defaults.` for the reason above, and here the reason is even
-# less arguable: both checks decide something there is only one of — the write TTL every
-# worker is launched with, and the `includeGitInstructions` line in
-# `dispatch._write_worker_settings`. A per-project value would be a per-project answer to
-# a fleet-wide question, and the check would report one decision once per project.
 
-#: The cohort window both checks measure over. NEVER all history: the split between the
-#: two causes is drifting, and an average over everything averages the trend away
-#: (kn-1449447a (5)). Thirty days because that is what `bill.COHORT_COMMAND` tells the
-#: reader to run — the doctor and the script differ on population, and they should not
-#: also differ on window.
+#: The cohort window both checks measure over
 DEFAULT_CACHE_HEALTH_WINDOW_DAYS = 30
 
-#: Below this many MEASURED orders in the window, both checks report nothing at all. THE
-#: ANSWER TO "a quiet day gives a wild ratio": a fleet that settled three work orders has
-#: a ratio, and it is one order's shape wearing the fleet's name. Measured on this
-#: machine 2026-09-16: 51 sealed orders in the trailing 7 days and 226 in 30, so an
-#: ordinary week clears this twice over while a genuinely quiet window does not.
+#: Below this many MEASURED orders in the window, both checks report nothing at all
 DEFAULT_CACHE_HEALTH_MIN_ORDERS = 20
 
-#: …and the floor that actually bounds the noise, because the ratios are token-weighted
-#: and a single boundary can carry a 300k write. Below this many observed boundaries the
-#: window is a handful of events, not a rate. Measured on the same run: 294 boundaries in
-#: 7 days, 752 in 30 — so this is about a sixth of a normal week, and each boundary is at
-#: most 2% of the count at the floor itself. Both floors are needed: too few orders is
-#: one order's shape, too few boundaries is one boundary's.
+#: …and the floor that actually bounds the noise
 DEFAULT_CACHE_HEALTH_MIN_BOUNDARIES = 50
 
-#: Prefix-invalidation writes as a share of ALL cache writes, above which the prefix fix
-#: is reported as drifting. Measured over the sealed-bill population on 2026-09-16:
-#: 34.6% over 7 days, 35.2% over 30. Set above that deliberately — the same choice
-#: `DEFAULT_INSPECT_ALARM_REWRITE_PREFIX_SHARE` makes — so the check reports the prefix
-#: GETTING WORSE rather than restating the standing figure the findings doc already
-#: recorded. There is no principled break-even for this one, unlike the TTL's: it is an
-#: empirical "is this still the number it was".
+#: Prefix-invalidation writes as a share of ALL cache writes
 DEFAULT_CACHE_HEALTH_PREFIX_SHARE = 0.45
 
 
-# -- COMPACTION AT AN EXPIRED BOUNDARY ------------------------------------------------
-#
-# The third remedy for the re-write tax, and the only one that acts at the moment the
-# cost is about to be paid. `DEFAULT_AUTOCOMPACT_WINDOW` bounds how large a conversation
-# may GROW; the one-hour write (`usage.TTL_BREAK_EVEN`) buys a longer entry for every
-# token; this compacts a conversation whose entry has ALREADY expired, before the next
-# prompt re-sends it. Spec: docs/superpowers/specs/2026-09-18-compact-past-the-ttl.md.
-#
-# WHY IT PAYS, measured live on 2026-09-18 with a paired probe over a 293,377-token
-# conversation (both arms forked from one base, both past the write TTL):
-#
-#   no compaction   294,007 tokens re-sent as a cache WRITE at 1.25x   $1.853
-#   /compact then   282,595 tokens re-sent as PLAIN INPUT at 1.0x      $1.621
-#   the same prompt 28,156-token context (15,380 written, 12,776 read) $0.128
-#
-# Two effects, and the second is much the larger. The re-send itself gets 20% cheaper
-# because the CLI does not cache-write a compaction call. And the conversation that
-# every later call in that turn re-reads collapses from 293k to 28k — the transcript's
-# own `compact_boundary` record puts it at 293,382 tokens in and 4,697 out, the rest of
-# the 28k being the static head every call carries anyway.
+# -- COMPACTION AT AN EXPIRED BOUNDARY
 
-#: Output tokens one compaction produces. MEASURED on the probe above (8,052 for a
-#: 293k conversation; 3,336 for a 26k one), and it is the dominant cost of compacting a
-#: SMALL conversation — output is 5x input at Opus list, so a summary that saves
-#: nothing still costs ~$0.20. The whole reason there is a floor at all.
+#: Output tokens one compaction produces
 COMPACT_SUMMARY_OUTPUT = 8_052
 
-#: What a session's context weighs on the call AFTER a compaction, in tokens. Measured
-#: at 28,156 from a 293k conversation and 26,866 from a 26k one — near enough constant
-#: across an 11x range of inputs, because what survives is the static head plus a
-#: summary whose size is set by the summarisation prompt rather than by what it
-#: summarises (4,697 and 4,078 tokens respectively, per the transcript's own
-#: `compact_boundary` row). That near-constancy is what makes the break-even below a
-#: function of one variable.
+#: What a session's context weighs on the call AFTER a compaction, in tokens
 COMPACT_CONTEXT = 28_156
 
-#: …of which this much is a cache WRITE on that call; the remainder is the static head,
-#: served as a read. Split out because the two are priced 12.5x apart.
+#: …of which this much is a cache WRITE on that call
 COMPACT_FIRST_WRITE = 15_380
 
-#: THE FLOOR: the smallest context worth compacting, in tokens. Below it the re-write
-#: is cheaper than the compaction call, so the OS lets the boundary go cold and pays it.
-#:
-#: MEASURED, not chosen — `scripts/compaction_cohort.py` prices every TTL-expired
-#: boundary in the fleet's own transcripts under the model above and reports the net
-#: saving by context band. Over the 30 days to 2026-09-19, 414 such boundaries:
-#:
-#:     25k-50k     33% of boundaries net-positive, median -$0.14
-#:     50k-100k    60% net-positive, median +$0.06 to +$0.36, worst -$0.21
-#:     100k-150k   80% net-positive, median +$0.39
-#:     150k-200k   94%,  200k+  100% net-positive, median +$1.11
-#:
-#: 100,000 is the lowest band where four boundaries in five pay. It is set where the
-#: MAJORITY flips rather than where the MEAN does, because this fires unattended on
-#: every work order: everything under it is worth $13.15 of a $552 saving, and half of
-#: those boundaries would have lost money. Buying 2.4% of the benefit back would mean
-#: being wrong about half the small cases, unsupervised, for ever.
+#: THE FLOOR: the smallest context worth compacting, in tokens
 DEFAULT_COMPACT_MIN_CONTEXT: int | None = 100_000
 
-#: Guard rail on the above, for the reason `DEFAULT_COLD_PREFIX_FLOOR_MAX` is one: a
-#: fleet may move the floor, and a typo that moved it to 600 would compact every
-#: boundary in sight at a loss.
+#: Guard rail on the above, for the reason `DEFAULT_COLD_PREFIX_FLOOR_MAX` is one: a fleet may move...
 COMPACT_MIN_CONTEXT_MIN = 10_000
 
-#: How much of a Neo question the DIGEST model is shown (`os.neo.digest_max_question_chars`).
-#: MEASURED over production's `neo.db`, 991 questions at or over `digest.MIN_CHARS`:
-#: median 3,110, p90 12,098, p95 65,261, p99 135,141, max 151,652. The distribution has
-#: a knee — 88% sit under 10,000 — and everything past it is one shape: an `assumption`
-#: row carrying a pasted diff, not a longer question. 20,000 clears p90 with headroom
-#: and caps the worst digest input at 20k instead of 151.7k (q722 bought two calls at
-#: that size). Spec §4: docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+#: How much of a Neo question the DIGEST model is shown (`os.neo.digest_max_question_chars`) (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
 DEFAULT_DIGEST_MAX_QUESTION_CHARS = 20_000
 
 
@@ -478,13 +196,7 @@ _MISSING = object()
 
 def _parse_autocompact(raw: dict[str, Any], key: str, where: str,
                        default: int | None) -> int | None:
-    """Validate an autocompact window. An explicit null means "no bound".
-
-    Raises ValueError; callers wrap it with `_err` so the message carries the field.
-    Absent and null are deliberately DIFFERENT here: absent inherits the default (which
-    is a real bound), null is the opt-out. A project that wants the model's own window
-    back has to say so, because silence must not disable a cost control.
-    """
+    """Validate an autocompact window"""
     value = raw.get(key, _MISSING)
     if value is _MISSING:
         return default
@@ -501,7 +213,7 @@ def _parse_autocompact(raw: dict[str, Any], key: str, where: str,
 
 
 class CatalogError(ValueError):
-    """Raised when the catalog file is invalid."""
+    """Raised when the catalog file is invalid"""
 
 
 @dataclass
@@ -509,154 +221,72 @@ class WorkerDefaults:
     model: str | None = None
     effort: str | None = None
     permission_mode: str = DEFAULT_PERMISSION_MODE
-    # Spec 2026-10-01-the-steer-that-beat-the-brief.md §1 — see VALID_BASH_FIRST.
+    # Spec 2026-10-01-the-steer-that-beat-the-brief.md §1 — see VALID_BASH_FIRST
     bash_first: str = DEFAULT_WORKER_BASH_FIRST
-    # Spec 2026-10-02-serena-the-cheap-path.md §4 — see VALID_TOOL_SEARCH.
+    # Spec 2026-10-02-serena-the-cheap-path.md §4 — see VALID_TOOL_SEARCH
     tool_search: str = DEFAULT_WORKER_TOOL_SEARCH
-    # Spec 2026-10-15-the-hour-on-worker-turns-only.md §1 — see VALID_WORKER_CACHE_TTL.
+    # Spec 2026-10-15-the-hour-on-worker-turns-only.md §1 — see VALID_WORKER_CACHE_TTL
     cache_ttl: str = DEFAULT_WORKER_CACHE_TTL
-    # Spec 2026-10-02-serena-the-cheap-path.md §6 — see VALID_PY_NAV_HOOK.
+    # Spec 2026-10-02-serena-the-cheap-path.md §6 — see VALID_PY_NAV_HOOK
     py_nav_hook: str = DEFAULT_WORKER_PY_NAV_HOOK
-    # Spec 2026-10-06-navigate-specs-like-code.md §5 — see VALID_DOC_NAV_HOOK.
+    # Spec 2026-10-06-navigate-specs-like-code.md §5 — see VALID_DOC_NAV_HOOK
     doc_nav_hook: str = DEFAULT_WORKER_DOC_NAV_HOOK
-    # The bar both doc arms share — see DEFAULT_WORKER_DOC_READ_LIMIT_LINES.
+    # The bar both doc arms share — see DEFAULT_WORKER_DOC_READ_LIMIT_LINES
     doc_read_limit_lines: int = DEFAULT_WORKER_DOC_READ_LIMIT_LINES
     append_system_prompt: str | None = None
-    # None = no bound (the model's own window stands). See DEFAULT_AUTOCOMPACT_WINDOW.
+    # None = no bound (the model's own window stands)
     autocompact_window: int | None = DEFAULT_AUTOCOMPACT_WINDOW
-    # None = no ceiling, which is the default everywhere. See DEFAULT_BUDGET_USD.
+    # None = no ceiling, which is the default everywhere
     budget_usd: float | None = DEFAULT_BUDGET_USD
     feature_budget_usd: float | None = DEFAULT_FEATURE_BUDGET_USD
-    # An INVESTIGATION order's family (the order plus its one investigator), and the model
-    # and effort its investigator runs on. Non-None by design — see
-    # DEFAULT_INVESTIGATION_BUDGET_USD and §2.8 of
-    # docs/superpowers/specs/2026-09-27-investigation-orders.md.
+    # An INVESTIGATION order's family (the order plus its one investigator) (docs/superpowers/specs/2026-09-27-investigation-orders.md)
     investigation_budget_usd: float | None = DEFAULT_INVESTIGATION_BUDGET_USD
     investigation_model: str | None = DEFAULT_INVESTIGATION_MODEL
     investigation_effort: str | None = DEFAULT_INVESTIGATION_EFFORT
-    # Whether the lead must delegate file edits to its crew. §7 of
-    # docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md
+    # Whether the lead must delegate file edits to its crew. §7 of... (docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md)
     require_crew: bool = True
-    # What one MCP tool call may take, in milliseconds — see
-    # DEFAULT_WORKER_MCP_TOOL_TIMEOUT_MS and issue #845.
+    # What one MCP tool call may take, in milliseconds (#845)
     mcp_tool_timeout_ms: int = DEFAULT_WORKER_MCP_TOOL_TIMEOUT_MS
     denied_tools: tuple[str, ...] = DEFAULT_WORKER_DENIED_TOOLS
 
 
-# The validation panel's default roster: every seat in the vocabulary. Unlike Neo's
-# DEFAULT_ROSTER, which is short because most of its seats have no definition shipped
-# yet, this one names all five — the panel's whole point is the four independent lenses
-# plus a chair, and a default that quietly dropped one would remove a check and tell
-# nobody. A seat whose markdown has not shipped yet still PARSES (see
-# `_parse_validation`); it fails loudly at run time instead of refusing to boot.
+# The validation panel's default roster: every seat in the vocabulary
 DEFAULT_VALIDATION_ROSTER = VALIDATOR_SEATS
 
-# Per-seat call timeout, seconds. Longer than the Neo panel's 120: a validator seat
-# reads a diff of up to `diff_chars` before it says anything.
+# Per-seat call timeout, seconds
 DEFAULT_VALIDATION_TIMEOUT = 300
 
-# How many times a unit may be sent back before the loop gives up and asks a human.
+# How many times a unit may be sent back before the loop gives up and asks a human
 DEFAULT_VALIDATION_MAX_ROUNDS = 3
 
-# How many times a work order whose CI has finished RED is sent back WITHOUT seating the
-# panel and without spending a counted round. 3 is `invariants.PR_REPAIR_MAX_ATTEMPTS`'s
-# number for the same question one authority earlier in the lifecycle. Spec §4:
-# docs/superpowers/specs/2026-10-13-a-red-head-is-sent-back-before-the-panel.md
+# How many times a work order whose CI has finished RED is sent back WITHOUT seating the panel and... (docs/superpowers/specs/2026-10-13-a-red-head-is-sent-back-before-the-panel.md)
 DEFAULT_VALIDATION_RED_CI_RETURNS = 3
 
-# How many times a round whose seats were KILLED BY A SIGNAL is re-judged before the OS
-# gives up on it and asks the user. A fleet that restarts its daemon during deploys wants
-# a different number from one that does not, which is why this is a key and not a
-# constant (Neo question 1705, condition ii). Spec §4b:
-# docs/superpowers/specs/2026-10-14-a-killed-validation-panel-opens-an-investigation.md
+# How many times a round whose seats were KILLED BY A SIGNAL is re-judged before the OS gives up on... (docs/superpowers/specs/2026-10-14-a-killed-validation-panel-opens-an-investigation.md)
 DEFAULT_VALIDATION_KILLED_RETRIES = 3
 
-# Truncation limit for the diff a seat is shown. MEASURED, not chosen: at 0.384
-# tokens/char a round's shared prefix is 76,347 tokens here, which under the shared-cache
-# layout costs less than HALF what 60,000 cost when every seat wrote its own copy
-# (125,973 against 261,388 input-equivalent tokens). 300,000 is affordable too and is
-# refused on CONTEXT — 137,621 prefix tokens leaves too little of a 200k window for the
-# packet's other sections and the seat's own reasoning, and a seat that overflows
-# abstains. PR #206, the change every seat of wo-a6af01f0 complained it could not read,
-# is 150,380 chars. Spec §6:
-# docs/superpowers/specs/2026-09-13-a-round-the-panel-can-afford.md
+# Truncation limit for the diff a seat is shown (#206)
 DEFAULT_VALIDATION_DIFF_CHARS = 150000
 
-# Characters of DECISION RECORD one assumption-review packet may carry — the order's own
-# answered questions, the user's messages and their rulings on sibling assumptions. Newest
-# first, and what it evicts is stated in the packet rather than dropped silently. Per
-# project because that is what the user asked for on this key. Spec §3:
-# docs/superpowers/specs/2026-09-28-an-assumption-review-reads-the-orders-own-rulings.md
+# Characters of DECISION RECORD one assumption-review packet may carry (docs/superpowers/specs/2026-09-28-an-assumption-review-reads-the-orders-own-rulings.md)
 DEFAULT_VALIDATION_DECISION_RECORD_CHARS = 6000
 
-# Characters of SPEC SECTION the same packet may carry — the authority an assumption cites
-# when it says "per the spec", absent until GitHub issue #1035. `decision_record_chars`'s
-# number because it is the same packet, the same uncached per-assumption call and the other
-# authority block beside the record. It is the LARGEST block that question carries: no
-# diff travels with it (docs/superpowers/specs/2026-10-14-neo-never-reads-a-diff.md).
+# Characters of SPEC SECTION the same packet may carry (#1035)
 DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS = 6000
 
-# How many follow-up findings ONE ORDER may file, across every round it is judged in.
-#
-# PER ORDER SINCE wo-3619e6e4, and that is the whole of what went wrong: applied per
-# ROUND, a unit judged four times filed four times the cap — twenty issues on
-# wo-0a9ba9b3. What the order has already raised is subtracted before this bounds
-# anything.
-#
-# The near-duplicates this comment used to accept are gone with it: the dedupe keys on
-# the (file, symbol) a finding names plus its claim (`ops.follow_up_claim`), not on the
-# sentence a seat happened to write that round. Spec §4.4:
-# docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md
+# How many follow-up findings ONE ORDER may file, across every round it is judged in (docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md)
 DEFAULT_VALIDATION_FOLLOW_UP_CAP = 5
 
-# How long the reconciler may wait for a merged child's commit to appear on the default
-# branch before it stops deferring the feature's round and asks the user. §3 of
-# docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md
+# How long the reconciler may wait for a merged child's commit to appear on the default branch before... (docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md)
 DEFAULT_VALIDATION_FEATURE_MERGE_WAIT_MINUTES = 15
 
-#: Which net answers "is this assumption high-stakes?" before any model call
-#: (docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md SS3.4).
-#:
-#: * `regex` — today's behaviour exactly: `autoreview.high_stakes_marker` decides, no
-#:   model call is made and nothing new is written. THE SHIPPED DEFAULT.
-#: * `shadow` — both run and THE REGEX STILL DECIDES. The disagreement is recorded as an
-#:   `autoreview_stakes_disagreed` event and nothing else about the order changes.
-#: * `classifier` — the model's verdict decides.
-#: * `regex-tightened` — `autoreview.HIGH_STAKES_TIGHTENED` decides. NO MODEL CALL either,
-#:   so it costs what `regex` costs. THE RECOMMENDATION of the 2026-09-25 spec §7 after
-#:   the A/B: no model arm cleared the bar on 485 hand-labelled production assumptions and
-#:   haiku answered 7.5% of a repeat run differently, which for a safety net is
-#:   disqualifying on its own. Not the default — `regex` is, so the shipped behaviour is
-#:   unchanged until a project opts in.
+#: Which net answers "is this assumption high-stakes?" before any model call... (docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md)
 STAKES_CLASSIFIER_MODES = ("regex", "shadow", "classifier", "regex-tightened")
 
 
 @dataclass
 class ValidationConfig:
-    """An independent panel judging a work order's or feature order's claim of done.
-
-    SHIPS DISABLED, and that is a requirement rather than caution: at this default the
-    OS must behave exactly as it does today — same statuses reached, same events, same
-    number of `claude` calls, and not one row in `validation_rounds`. A round is roughly
-    five headless calls over a diff of up to `diff_chars`, up to `max_rounds` times, on
-    every unit in the fleet, so enabling it is a catalog edit gated on a measurement.
-
-    THAT RULE HAS ONE RULED CARVE-OUT (Neo, question 309 on wo-38e26be0, 2026-09-15;
-    kn-a88a56b6). It governs a field that ADDS panel behaviour, where the default decides
-    whether the behaviour happens at all. It does not govern a field whose behaviour change
-    is already unconditional elsewhere in the same feature: where the panel's rejection
-    semantics have already changed with no knob, a field that only chooses between
-    preserving the finding as a ticket and discarding it silently is not gated on a
-    measurement, because the measurement — do the seats classify blocking vs non-blocking
-    correctly — is taken by the eval regardless of the field's value. Such a field may ship
-    default True. Named instance: the follow-up-filing field from the 2026-09-15
-    panel-blocks-on-blockers feature
-    (docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md §5.4).
-
-    `seat_models` and `chair_model` are empty by default, meaning "use the project's
-    model"; the fallback is resolved where it is used, not here, for the same reason
-    `PanelConfig` does it — a nested dataclass cannot see its parent's fields.
-    """
+    """An independent panel judging a work order's or feature order's claim of done (docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md §5.4)"""
 
     enabled: bool = False
     roster: tuple[str, ...] = DEFAULT_VALIDATION_ROSTER
@@ -664,325 +294,112 @@ class ValidationConfig:
     chair_model: str = ""
     timeout: int = DEFAULT_VALIDATION_TIMEOUT
     max_rounds: int = DEFAULT_VALIDATION_MAX_ROUNDS
-    # Spec §4:
-    # docs/superpowers/specs/2026-10-13-a-red-head-is-sent-back-before-the-panel.md
+    # Spec §4: docs/superpowers/specs/2026-10-13-a-red-head-is-sent-back-before-the-panel.md
     red_ci_returns: int = DEFAULT_VALIDATION_RED_CI_RETURNS
-    # Spec §4b:
-    # docs/superpowers/specs/2026-10-14-a-killed-validation-panel-opens-an-investigation.md
+    # Spec §4b: docs/superpowers/specs/2026-10-14-a-killed-validation-panel-opens-an-investigation.md
     killed_retries: int = DEFAULT_VALIDATION_KILLED_RETRIES
     diff_chars: int = DEFAULT_VALIDATION_DIFF_CHARS
     decision_record_chars: int = DEFAULT_VALIDATION_DECISION_RECORD_CHARS
-    # GitHub issue #1035: the spec section an assumption review reads.
+    # GitHub issue #1035: the spec section an assumption review reads
     assumption_spec_chars: int = DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS
-    # Whether a FEATURE order validates as a whole once its children are done, which is
-    # a separate question from whether its children each validated: the feature is the
-    # only level at which "does this add up to what was asked" can be judged.
+    # Whether a FEATURE order validates as a whole once its children are done
     feature_units: bool = True
-    # §3 of
-    # docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md
+    # §3 of... (docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md)
     feature_merge_wait_minutes: int = DEFAULT_VALIDATION_FEATURE_MERGE_WAIT_MINUTES
-    # WHETHER THE OS MAY MERGE THIS PROJECT'S PULL REQUESTS ITSELF, once the panel has
-    # accepted the exact commit at the head and CI is green
-    # (docs/superpowers/specs/2026-09-14-validated-auto-merge-design.md).
-    #
-    # PER PROJECT, and the inheritance is this block's ordinary field-level fallback: a
-    # project that names a value keeps it, a project that does not takes the OS answer —
-    # the same shape as every `inspect.alarm_*` threshold. So authority is granted one
-    # project at a time, and a project that has never opted in is never merged by the OS
-    # however the fleet is configured.
-    #
-    # SHIPS FALSE at both levels. This is not caution about a setting, it is the only
-    # thing in the catalog that decides whether the OS holds merge authority at all, and
-    # `*.validation.*` already puts it behind `jarvis config set`'s mandatory `--reason`
-    # and a recorded config version. It is ALSO read beside `enabled`, never instead of
-    # it: turning the panel off stops auto-merge with it, because the acceptance this
-    # rides on is the panel's.
+    # WHETHER THE OS MAY MERGE THIS PROJECT'S PULL REQUESTS ITSELF (docs/superpowers/specs/2026-09-14-validated-auto-merge-design.md)
     auto_merge: bool = False
-    # WHETHER THE OS MAY DECIDE THIS PROJECT'S PENDING ASSUMPTIONS ITSELF, instead of
-    # holding the work order until the user rules on each one
-    # (docs/superpowers/specs/2026-09-15-neo-decides-an-assumption.md).
-    #
-    # The same shape as `auto_merge` above in every respect — per project, ordinary
-    # field-level fallback, `*.validation.*` so `jarvis config set` demands a reason and
-    # stamps a config version, ships FALSE at both levels — and for the same reason: it
-    # is an authority the user held, handed to the OS one project at a time.
-    #
-    # Read BESIDE `enabled`, never instead of it. The reviewer this rides on is Neo, but
-    # what makes an accepted assumption safe to land is that the panel judged the work it
-    # was part of; turning the panel off must stop this with it.
+    # WHETHER THE OS MAY DECIDE THIS PROJECT'S PENDING ASSUMPTIONS ITSELF (docs/superpowers/specs/2026-09-15-neo-decides-an-assumption.md)
     auto_review: bool = False
-    # WHETHER A NON-BLOCKING FINDING IS KEPT AS A BACKLOG ITEM, or discarded. `False`
-    # does not restore the old behaviour — the panel stopped rejecting over one with no
-    # knob at all — it only throws the finding away, so this is the named instance of the
-    # carve-out above and it ships True. `kn-a88a56b6` is the discriminator; do not
-    # re-decide it here. Spec §4.5:
-    # docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md
-    #
-    # Per project by the same field-level fallback as `auto_merge` and `auto_review`.
+    # WHETHER A NON-BLOCKING FINDING IS KEPT AS A BACKLOG ITEM, or discarded (docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md)
     follow_ups: bool = True
-    # The cap above, per project. See DEFAULT_VALIDATION_FOLLOW_UP_CAP.
+    # The cap above, per project
     max_follow_ups: int = DEFAULT_VALIDATION_FOLLOW_UP_CAP
-    # WHICH NET DECIDES THAT AN ASSUMPTION IS HIGH-STAKES before any model call
-    # (docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md SS3.4).
-    # `regex`, `shadow`, `classifier` or `regex-tightened` — see STAKES_CLASSIFIER_MODES.
-    # `regex-tightened` is the A/B's RECOMMENDATION (spec SS7) and calls nothing either.
-    #
-    # NOT A BOOLEAN because `shadow` is the entire point: a boolean
-    # offers "measure it in production" and "swap it" with nothing in between, and this
-    # net guards the one authority the user hands over one project at a time. Ships
-    # `regex`, which is today's behaviour exactly — no call, no row, no event.
-    #
-    # Same field-level fallback as every flag in this block.
+    # WHICH NET DECIDES THAT AN ASSUMPTION IS HIGH-STAKES before any model call... (docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md)
     stakes_classifier: str = "regex"
 
 
-# -- the house style: how terse the OS holds its workers ---------------------------------
+# -- the house style: how terse the OS holds its workers
 
 
 @dataclass(frozen=True)
 class ConcisionConfig:
-    """The one number the concision machinery needs per project.
-
-    Design: docs/superpowers/specs/2026-09-19-concision-enforced.md SS5.3. Per project
-    as well as fleet-wide, with `_parse_inspect`'s field-level inheritance.
-
-    `summary_max_words` = 0 turns the `jarvis wo finish --summary` refusal OFF for the
-    project, which is why zero is ACCEPTED here where `_parse_inspect` refuses it. The
-    two mean opposite things: an inspect count of zero would make an alarm fire on
-    everything, whereas a cap of zero makes a refusal fire on nothing. Off is a position
-    a project is entitled to take; an alarm that cries wolf is not.
-    """
+    """The one number the concision machinery needs per project (docs/superpowers/specs/2026-09-19-concision-enforced.md)"""
 
     summary_max_words: int = concision.DEFAULT_SUMMARY_MAX_WORDS
-    #: The same bargain one surface over: `message_max_chars` = 0 turns the `jarvis wo
-    #: send` / `wo assume` payload refusal off for the project (§5 of
-    #: docs/superpowers/specs/2026-09-26-bounded-model-inputs.md).
+    #: The same bargain one surface over: `message_max_chars` = 0 turns the `jarvis wo send` / `wo assume`... (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
     message_max_chars: int = concision.DEFAULT_MESSAGE_MAX_CHARS
 
 
 # -- `jarvis inspect`: what counts as worth reporting, and what as worth interrupting for
-#
-# EVERY NUMBER HERE WAS MEASURED, over the 438 worker turns and 118 dispatched work orders
-# on this machine at the time it shipped, and none of them is a round number chosen
-# because it looked reasonable. The measured firing rate is stated beside each one,
-# because that rate is what a person is really choosing when they change it. Method and
-# figures: docs/superpowers/specs/2026-08-30-the-anatomy-of-a-turn.md §6.
-#
-# The `report_` pair only decide what `jarvis inspect` PRINTS. The `alarm_` trio decide
-# when the OS interrupts the user about a turn that is still running, which is a much
-# higher bar — hence 300s against 30s for the same blocking join, and 300k against 20k for
-# the same cache write. They are prefixed rather than nested so that a reader of
-# `jarvis config show` cannot mistake one for the other; confusing the two would either
-# flood the attention list or empty the report.
 
-#: A cache write below this is the conversation's own growth rather than a re-send of it,
-#: and labelling it by the gap alone would call the cache working a defect. The method's
-#: own figure (`docs/findings/anatomy-of-an-expensive-turn.md` §1 step 5: "flag every
-#: write over ~20k"), kept because it is what the worked example was derived with.
+#: A cache write below this is the conversation's own growth rather than a re-send of it (docs/findings/anatomy-of-an-expensive-turn.md)
 DEFAULT_INSPECT_REPORT_WRITE_FLOOR = 20_000
 
-#: A blocking join shorter than this is not worth a line of its own. Well under the
-#: alarm's threshold on purpose: the report is read deliberately and can afford detail
-#: the attention list cannot.
+#: A blocking join shorter than this is not worth a line of its own
 DEFAULT_INSPECT_REPORT_JOIN_FLOOR = 30
 
-#: How much of a turn's triggering prompt is quoted. A terminal line, and the quote is
-#: there to identify the prompt rather than to reproduce it.
+#: How much of a turn's triggering prompt is quoted
 DEFAULT_INSPECT_QUOTE_CHARS = 140
 
-#: A turn still running after this long is burning money now.
-#:
-#: MEASURED IN ACTIVE TIME, NOT WALL CLOCK (`holds`, and the user's ruling of
-#: 2026-09-18): wall clock minus every interval the OS's own record says the order was
-#: held. A turn that spans a spent usage window is not slow, it is obeying, and an alarm
-#: that cannot tell those apart teaches the user to ignore alarms.
-#:
-#: SIXTY SURVIVES THE CHANGE OF CLOCK, and was re-measured rather than carried over. Over
-#: this fleet's 674 transcript turns on 2026-09-18 (307 of them held for something), an
-#: hour fires on 22.7% of turns by wall clock and 13.8% by active time — so moving the
-#: denominator removes two of every five alarms without touching a turn that genuinely
-#: worked for an hour. Raising it as well would silence the ones the user does want: the
-#: false alarms were the held ones, and they are gone by construction now. It still sits
-#: well below `worker_session.TURN_STALL_SECONDS` (6h), which reports a different fact:
-#: hung, not expensive.
+#: A turn still running after this long is burning money now
 DEFAULT_INSPECT_ALARM_TURN_MINUTES = 60
 
-#: A turn that has been open this long WITHOUT MAKING A SINGLE API CALL. Not a spend
-#: threshold at all — its finding is that nothing was spent, and it is the detector issue
-#: 227 asked for after a 65-minute dead turn was reported as 65 minutes of generation.
-#: MEASURED over the 4,543 worker turns on this machine: the p99 time from a turn opening
-#: to its first API call is 61 seconds and exactly ONE turn in 3,811 took longer than ten
-#: minutes, so fifteen is far outside a slow start; it fires on 12 turns, 0.26%. Below
-#: `DEFAULT_INSPECT_ALARM_TURN_MINUTES` on purpose — a stall must be named a stall before
-#: the long-turn alarm's hour is up, or the first thing the user hears about it is a claim
-#: about money.
-#:
-#: ALSO IN ACTIVE TIME now, for the reason above it: "the work never started" is a claim
-#: about the work, and a turn the OS was holding had not been allowed to start one. The
-#: change only makes this stricter, so the number stands — re-measured on 2026-09-18 over
-#: the same 674 turns, the p99 time to first call is 80 seconds and the worst is 177, so
-#: fifteen minutes is still two orders of magnitude outside a slow start.
+#: A turn that has been open this long WITHOUT MAKING A SINGLE API CALL
 DEFAULT_INSPECT_ALARM_STALLED_MINUTES = 15
 
-#: A request in flight this long with no completed content block — `slow-model-response`,
-#: docs/superpowers/specs/2026-09-27-a-request-in-flight-is-not-a-stalled-turn.md §2.
-#: MEASURED: the event that produced the spec was 4,057 output tokens in 19 minutes at
-#: ~3.5 tok/s, so a threshold below the hour would re-raise the very case the spec exists
-#: to stop reporting. On the ACTIVE clock, like the two above it.
+#: A request in flight this long with no completed content block (docs/superpowers/specs/2026-09-27-a-request-in-flight-is-not-a-stalled-turn.md §2.)
 DEFAULT_INSPECT_ALARM_AWAITING_MINUTES = 60
 
-#: A blocking join still open after this long. THE ONLY THRESHOLD HERE THAT IS PRINCIPLED
-#: RATHER THAN EMPIRICAL: it is the 5-minute cache TTL itself, past which the prefix is
-#: certainly cold and the wait will be paid for a second time as a re-write. Fires on 2%.
-#:
-#: STAYS ON THE WALL CLOCK while the two above moved to active time, and that is the
-#: whole point of deciding per threshold rather than sweeping the file. What this
-#: measures is a cache entry ageing out, and the entry expires in real seconds whether
-#: or not the OS was allowing the order to work. It is also a JOIN — the lead agent
-#: waiting on its own subagent — which is the order's own choice and the one wait the
-#: user's ruling explicitly kept on the books.
+#: A blocking join still open after this long
 DEFAULT_INSPECT_ALARM_JOIN_SECONDS = 300
 
-#: A subagent's last tool call still unfinished after this long — the evidence that turns
-#: an open foreground delegation from "a subagent is working" into "something is hung"
-#: (issue #845). FIVE MINUTES, and the number is not free-standing: it is the same
-#: boundary as `DEFAULT_INSPECT_ALARM_JOIN_SECONDS` above and the same as the
-#: `MCP_TOOL_TIMEOUT` every worker is launched with, so the OS holds ONE opinion about
-#: how long a single tool call may take. The issue asked for "well before 60 min" —
-#: `alarm_turn_minutes`, the only thing that would eventually have fired — and this is
-#: twelve times earlier than that. No legitimate Serena or context7 call in this fleet's
-#: transcripts takes a minute; the hang in #845 took nineteen.
-#:
-#: IN MINUTES, not seconds, because every other "how long may this run" setting on
-#: `InspectConfig` is in minutes; `alarm_join_seconds` is in seconds because it is a
-#: cache TTL and not a judgement about work.
+#: A subagent's last tool call still unfinished after this long (#845)
 DEFAULT_INSPECT_ALARM_SUBAGENT_TOOL_MINUTES = 5
 
-#: One call re-sending this much of the conversation. p95 of the largest re-write per work
-#: order (the median is 130,519), so it fires on 5% — about $1.88 at Opus list prices in a
-#: single event.
+#: One call re-sending this much of the conversation. p95 of the largest re-write per work order (the...
 DEFAULT_INSPECT_ALARM_WRITE_TOKENS = 300_000
 
-#: How long a work order may sit with its turn ended and nothing in flight before
-#: `invariants.parked_reason` calls it parked. THE ONE THRESHOLD HERE THAT IS NOT ABOUT
-#: SPEND: the other three ask "is this costing too much", this one asks "is anything
-#: going to happen to this at all". An hour rather than minutes because the ordinary
-#: settlement path moves a finished turn within one reconcile tick, so anything still
-#: sitting here an hour later is not slow, it is stopped — wo-a4bd6958 sat 7h13m.
-#:
-#: IN ACTIVE TIME TOO, which for a stopped order means "an hour in which nothing was
-#: holding it". `parked_reason` already refused to flag most held orders, but by an
-#: inventory (`SPOKEN_FOR_WAITS`) rather than by a clock — so a hold with no matching
-#: entry in that tuple still cost the user a line. Subtracting the recorded holds makes
-#: the refusal follow from the measurement instead of from a list someone has to keep
-#: complete. The hour is unchanged: it was always a claim about how long a silence has
-#: to run before it means something, and taking the OS's own waiting out of that silence
-#: only makes the claim truer.
+#: How long a work order may sit with its turn ended and nothing in flight before...
 DEFAULT_INSPECT_ALARM_PARKED_MINUTES = 60
 
-# -- the AGGREGATE half of the re-write tax. Everything above judges one live turn;
-# these five judge a PROJECT over a cohort window of settled orders, which is the
-# standing condition no surface raised (issue 164 item 1, finding 1 of
-# docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md).
-#
-# NONE OF THESE FIVE — NOR THE TWO `cache_1h` ONES BELOW — MOVES TO ACTIVE TIME, and that
-# is a decision rather than an oversight. Every one of them judges a count of TOKENS or a
-# share of a BILL; there is no duration in any numerator for a hold to come out of. The
-# `_window_days` figures are calendar time and stay calendar time: they choose which
-# settled orders are in the cohort, and an order that spent four hours held was still
-# settled last Tuesday.
+# -- the AGGREGATE half of the re-write tax
 
-#: The cohort window, in days. NOT ALL HISTORY, and that is the point (kn-1449447a (5)):
-#: the split between the two causes is drifting, and an average over everything ever
-#: sealed reports the trend away.
+#: The cohort window, in days
 DEFAULT_INSPECT_ALARM_REWRITE_WINDOW_DAYS = 7
 
-#: What fraction of the window's bill went on re-sending conversations whose PROMPT
-#: PREFIX had moved — the cause no cache TTL can touch. MEASURED over this fleet's sealed
-#: bills on 2026-09-14: jarvis_os sits at 10.5% over the trailing 7 days and 11.1% over
-#: 30. Set above that deliberately, so the alarm reports the tax GETTING WORSE rather than
-#: restating a standing figure the findings doc already recorded; a project that wants the
-#: standing figure raised lowers it with `jarvis config set <p>
-#: inspect.alarm_rewrite_prefix_share`.
+#: What fraction of the window's bill went on re-sending conversations whose PROMPT PREFIX had moved
 DEFAULT_INSPECT_ALARM_REWRITE_PREFIX_SHARE = 0.15
 
-#: The same fraction for the other cause: the cache entry EXPIRING. Measured at 10.3% (7
-#: days) and 10.9% (30) on the same run, so the two causes are at near parity on this
-#: fleet now — itself the drift kn-1449447a (5) predicted.
-#:
-#: THIS IS NOT THE TRIGGER FOR SWITCHING THE WRITE TTL, and confusing the two is the trap
-#: kn-1449447a (4) exists for: that decision is `rewrite_ttl_write / cache_write` against
-#: 39.5%, a different ratio over a much larger denominator, and it runs at about half this
-#: one. This is a share of the BILL.
+#: The same fraction for the other cause: the cache entry EXPIRING
 DEFAULT_INSPECT_ALARM_REWRITE_TTL_SHARE = 0.15
 
-#: A share computed over fewer settled orders than this is one order's shape rather than
-#: the project's. Measured: it excludes openclaw_sandbox's single $28.26 order sitting at
-#: 31.8%, which is a work order to look at and not a project to alarm on.
+#: A share computed over fewer settled orders than this is one order's shape rather than the project's
 DEFAULT_INSPECT_ALARM_REWRITE_MIN_ORDERS = 5
 
-#: …and below this much spend in the window a percentage is arithmetic on noise. Measured:
-#: it excludes shared_schedule ($0.54 over 3 orders) and painforwisdom ($2.32 over 4)
-#: without excluding anything that had money in it. Zero is legal — see
-#: `INSPECT_MONEY_KEYS`.
+#: …and below this much spend in the window a percentage is arithmetic on noise
 DEFAULT_INSPECT_ALARM_REWRITE_MIN_USD = 10.0
 
-# -- who is still buying the ONE-HOUR cache write. The two above judge a project's own
-# sealed bills; these two judge the TRANSCRIPT TREE, including sessions the OS never
-# dispatched and has no other record of (issue 164 item 3, finding 3 of
-# docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md).
+# -- who is still buying the ONE-HOUR cache write
 
-#: The window, in days. Seven for `DEFAULT_INSPECT_ALARM_REWRITE_WINDOW_DAYS`' reason and
-#: one of its own: the condition this detects is a SETTING going missing — a fresh
-#: machine, a new shell profile — and a week is short enough that the leak is named while
-#: the change that caused it is still recent.
+#: The window, in days
 DEFAULT_INSPECT_ALARM_CACHE_1H_WINDOW_DAYS = 7
 
-#: One-hour tokens written in the window by sessions JARVIS DID NOT DISPATCH. THIS IS A
-#: LEAK DETECTOR AND NOT A HEADLINE SAVING, and the threshold says so: the 1h premium on
-#: 500k tokens is ~$1.88 at Opus list, so this is not sized to catch money, it is sized to
-#: catch the setting disappearing before a year of it adds up. MEASURED on this machine
-#: 2026-09-16: zero 1h tokens in the trailing 7 and 14 days (the user's own
-#: `FORCE_PROMPT_CACHING_5M` is holding), against ~3.8M/week in the ten days before it was
-#: set — so this fires within a week of the line being lost and never on a quiet one. Set
-#: above the median offending session (87k) so one afternoon's hand-opened `claude` is not
-#: an alarm.
+#: One-hour tokens written in the window by sessions JARVIS DID NOT DISPATCH
 DEFAULT_INSPECT_ALARM_CACHE_1H_TOKENS = 500_000
 
-#: The same, for turns JARVIS ITSELF dispatched — a BREACH of `claude_cli.cache_env`, and
-#: a defect in this OS rather than in anyone's personal config. An order of magnitude
-#: lower because it is a different finding, not a smaller one: a worker turn writes
-#: 100-300k at a boundary, so this catches a SINGLE breached turn while staying above a
-#: stray row. The last one the fleet had was 299,610 tokens over 2026-08-22/23, before
-#: the transport fix reached production.
+#: The same, for turns JARVIS ITSELF dispatched
 DEFAULT_INSPECT_ALARM_CACHE_1H_DISPATCHED_TOKENS = 50_000
 
-#: `InspectConfig` fields that are a FRACTION, not a count. `_parse_inspect` refuses every
-#: other field below 1, which would reject every legal value of these two.
+#: `InspectConfig` fields that are a FRACTION, not a count
 INSPECT_FRACTION_KEYS = ("alarm_rewrite_prefix_share", "alarm_rewrite_ttl_share")
 
-#: …and the one that is money. Zero is legal here and nowhere else: a project may ask to
-#: hear about its re-write tax however little it spent.
+#: …and the one that is money
 INSPECT_MONEY_KEYS = ("alarm_rewrite_min_usd",)
 
 
 @dataclass
 class InspectConfig:
-    """What `jarvis inspect` reports, and when the OS raises a turn that is still running.
-
-    Per project as well as fleet-wide, with field-level inheritance (`_parse_inspect`):
-    a project that names one key keeps the OS answer for the rest. That matters because
-    the alarm thresholds are a statement about what is NORMAL, and normal differs by
-    project — an hour-long turn is routine where the work is a design document and a
-    symptom where it is a one-file fix.
-
-    `enabled` turns only the ALARMS off, never the report: `jarvis inspect` reads files
-    that are already on disk and costs nothing until someone runs it, whereas the alarm
-    reads a transcript per running work order per reconcile tick. It covers
-    `alarm_parked_minutes` too (`invariants._parked_minutes`) and the `alarm_rewrite_`
-    five (`Daemon.check_rewrite_tax`) — one switch for "raise nothing here", because a
-    second way to turn one thing off is a second way to be surprised by it.
-    """
+    """What `jarvis inspect` reports, and when the OS raises a turn that is still running"""
 
     enabled: bool = True
     report_write_floor: int = DEFAULT_INSPECT_REPORT_WRITE_FLOOR
@@ -1007,61 +424,29 @@ class InspectConfig:
 
 
 # -- `ui_health`: the dashboard's own liveness, and the self-heal that answers it
-#
-# §6 of docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md.
-# EVERY NUMBER HERE CAME OUT OF ONE MEASURED OUTAGE (production, 2026-10-08, ~4h of
-# uptime then every routed page silent for 4 minutes), which is exactly why none of them
-# is a module constant in the code that uses it: the next measurement moves them, and a
-# threshold that needs a release to change is one that stays wrong.
 
-#: Seconds between liveness probes. Matches `REFRESH_SECONDS = 15` (`ui/app.py`), the rate
-#: the dashboard already reloads itself at: a probe rarer than the traffic it watches
-#: learns about the wedge later than the user does, and a much denser one adds threadpool
-#: traffic for nothing.
+#: Seconds between liveness probes
 DEFAULT_UI_HEALTH_PROBE_INTERVAL_SECONDS = 15
 
-#: How long one probe may wait for the threadpool. ABOVE the slowest legitimate page
-#: measured on the wedge day (`GET /cost 15424ms`), or a healthy-but-busy `/cost` build
-#: reads as a wedge. The real pool was saturated for minutes, not seconds, so waiting
-#: past the worst honest page costs the detector nothing.
+#: How long one probe may wait for the threadpool
 DEFAULT_UI_HEALTH_PROBE_TIMEOUT_SECONDS = 20
 
-#: Consecutive failed probes before the process dumps its own stacks. Three at 15s is ~45s
-#: of total page unavailability — past any `/cost` burst, far inside the ~4 minutes the
-#: measured wedge went unanswered (05:38:27 to 05:42:58).
+#: Consecutive failed probes before the process dumps its own stacks
 DEFAULT_UI_HEALTH_TRIP_THRESHOLD = 3
 
-#: The DAEMON's own deadline on `GET /healthz`. Small, because the endpoint touches
-#: nothing: anything slower than a few seconds is itself the finding, and the daemon must
-#: not spend a reconcile tick waiting.
+#: The DAEMON's own deadline on `GET /healthz`
 DEFAULT_UI_HEALTH_HEALTHZ_TIMEOUT_SECONDS = 5
 
-#: No self-restart within this long of the last one. Longer than the whole measured
-#: outage, so the real case needs exactly one restart; short enough that a second genuine
-#: wedge the same hour is still healed. Stops a restart loop against a dashboard that
-#: wedges on boot.
+#: No self-restart within this long of the last one
 DEFAULT_UI_HEALTH_RESTART_COOLDOWN_SECONDS = 300
 
-#: Self-restarts allowed in a rolling 24h. A wedge took ~4 hours of uptime to appear, so
-#: three a day is well above the observed rate and the fourth is evidence of a different,
-#: worse fault that wants the user rather than another restart.
+#: Self-restarts allowed in a rolling 24h
 DEFAULT_UI_HEALTH_MAX_RESTARTS_PER_DAY = 3
 
 
 @dataclass
 class UiHealthConfig:
-    """How the dashboard reports its own wedge, and when the OS restarts it.
-
-    Per project as well as fleet-wide, with `_parse_inspect`'s field-level inheritance
-    (`_parse_ui_health`): a project naming one key keeps the OS answer for the rest. The
-    dashboard is the OS's own process, so the fleet answer is the one the probe and the
-    daemon read — the per-project block exists because this is a settings namespace like
-    every other and splitting the shape would be the surprise.
-
-    `enabled` is ONE switch for "probe and heal nothing": the probe, the stack dump, the
-    daemon's check and its restart. A second way to turn one thing off is a second way to
-    be surprised by it (`InspectConfig.enabled`'s reason).
-    """
+    """How the dashboard reports its own wedge, and when the OS restarts it"""
 
     enabled: bool = True
     probe_interval_seconds: int = DEFAULT_UI_HEALTH_PROBE_INTERVAL_SECONDS
@@ -1073,18 +458,11 @@ class UiHealthConfig:
 
 
 # -- `fleet_health`: when an order that has stopped moving gets investigated. §4 of
-# docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md.
 
-#: Ships OFF: every investigation it opens is spend nobody typed (os.autonomy).
+#: Ships OFF: every investigation it opens is spend nobody typed (os.autonomy)
 DEFAULT_FLEET_HEALTH_ENABLED = False
 
-#: Minutes in status before one open status is over threshold. THE FIGURE IS THE USER'S,
-#: 2026-10-01: five minutes of idle — no tool call, no script running, no usage-limit hold
-#: — means something is wrong, and thirty minutes of it is unacceptable. `running` is
-#: still judged on time since the last ACTIVITY and not since entry
-#: (`stuck.ACTIVITY_STATUSES`), which is what makes a five-minute number safe for a turn
-#: that is working: a long turn that keeps calling tools is never over threshold.
-#: Neo 1073 set the earlier entries; SUPERSEDED BY THE USER, Neo 1148 accepting.
+#: Minutes in status before one open status is over threshold
 DEFAULT_FLEET_HEALTH_THRESHOLDS: dict[str, int] = {
     "pending": 30,
     "dispatching": 5,
@@ -1095,74 +473,34 @@ DEFAULT_FLEET_HEALTH_THRESHOLDS: dict[str, int] = {
     "waiting_input": 60,
 }
 
-#: The answer for an open status the mapping does not name — `idle`, `budget_exhausted`,
-#: and anything added to `WO_STATUSES` later, which is watched on the day it ships rather
-#: than silently unwatched. The user's 2026-10-01 bar, Neo 1148: an unnamed open status
-#: idle for half an hour is reported.
+#: The answer for an open status the mapping does not name
 DEFAULT_FLEET_HEALTH_FALLBACK_MINUTES = 30
 
-#: How long one subject waits before a second investigation, Neo 1073. It holds even when
-#: the fingerprint has changed: "it moved" and "it is better" are not the same claim (§6b).
+#: How long one subject waits before a second investigation, Neo 1073
 DEFAULT_FLEET_HEALTH_COOLDOWN_MINUTES = 720
 
-#: Investigations the sweep may open in a day, FLEET-WIDE and counted from the records
-#: themselves (§6c). Neo 1073 set 4; Neo 1148 raised it to 48 under the user's tighter
-#: bar, because at five-minute sensitivity a cap of 4 is spent in the first hour and then
-#: fails CLOSED exactly when a genuinely stuck order appears.
-#: `worker.investigation_budget_usd` is the real money ceiling, so this cap rations
-#: BURSTS rather than the day. The per-subject cooldown
-#: (`DEFAULT_FLEET_HEALTH_COOLDOWN_MINUTES`) is unchanged, Neo 1148 explicitly: one stuck
-#: order must not eat the burst.
+#: Investigations the sweep may open in a day, FLEET-WIDE and counted from the records themselves (§6c)
 DEFAULT_FLEET_HEALTH_MAX_PER_DAY = 48
 
-#: Ticks between sweeps of one project — 5 minutes at the default 5s `poll_interval`.
-#: A CATALOG CONFIG AND NOT A MODULE CONSTANT, per Neo 1086, which overrides §5: the user
-#: has turned down the module-constant precedent before and prefers a per-project config.
-#: 5 minutes and not 30 (Neo 1148): a 30-minute cadence cannot see a 5-minute idle —
-#: detection would lag the threshold by up to six times the threshold itself.
+#: Ticks between sweeps of one project — 5 minutes at the default 5s `poll_interval`
 DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS = 60
 
-#: How long the stuck sweep itself may be silent before the user is told
-#: (`invariants.check_stuck_sweep_alive`, §8) — `OS_HEALTH_SWEEP_DARK_MINUTES`' value and
-#: its reasoning: a daemon restart or one capped tick cannot trip it, and a sweep switched
-#: off by a bad edit is named the same working day. A FLEET number, see
-#: `FLEET_HEALTH_FLEET_ONLY_KEYS`.
+#: How long the stuck sweep itself may be silent before the user is told...
 DEFAULT_FLEET_HEALTH_SWEEP_DARK_MINUTES = 180
 
-#: How long one project's red-base episodes are REMEMBERED, so the sweep's discount
-#: outlives the hold by a status span — §2 "The retention bound is a CATALOG KEY" of
-#: docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md, Neo's one
-#: condition on 1818. Seven days covers a red base spanning a weekend plus the status span
-#: after it and keeps the stored JSON a handful of pairs. HOURS and not minutes:
-#: `thresholds` and every `*_minutes` measure a sweep's patience, this measures memory,
-#: and `10080` would read as a typo.
+#: How long one project's red-base episodes are REMEMBERED (docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md)
 DEFAULT_FLEET_HEALTH_RED_EPISODE_RETENTION_HOURS = 168
 
-#: `FleetHealthConfig` fields that are a MAPPING, not a count — `INSPECT_FRACTION_KEYS`'
-#: arrangement. Excluded from the reflective `>= 1` loop and validated per entry instead,
-#: because an unknown status there must be REFUSED naming `OPEN_STATUSES` rather than
-#: silently leaving that status unwatched.
+#: `FleetHealthConfig` fields that are a MAPPING, not a count — `INSPECT_FRACTION_KEYS`' arrangement
 FLEET_HEALTH_MAP_KEYS = ("thresholds",)
 
-#: Work-order kinds the sweep never judges — §2.1 of docs/superpowers/specs/2026-10-12-a-
-#: managers-by-design-idle-is-not-a-standstill.md. A CATALOG KEY and not a module constant
-#: (kn-1cec46b5, Neo 1596): a kind the sweep must not judge is the same class of decision
-#: as a threshold. `investigator` only — diagnosing the diagnostician is a loop with a
-#: budget attached, and `investigation` is a FEATURE-order kind no `work_orders` row can
-#: hold (`project_store.WO_KINDS`), so shipping it would only fail its own validator.
-#: `manager` is deliberately ABSENT: a manager's exemption is a property of its SITUATION
-#: (§2.2) and a stranded one must still be caught.
+#: Work-order kinds the sweep never judges
 DEFAULT_FLEET_HEALTH_EXEMPT_KINDS: tuple[str, ...] = ("investigator",)
 
-#: `FleetHealthConfig` fields that are a LIST, not a count. Skipped by the reflective
-#: `>= 1` loop in `_parse_fleet_health` for `FLEET_HEALTH_MAP_KEYS`' reason — comparing a
-#: tuple with an int raises `TypeError` — and validated per element instead.
+#: `FleetHealthConfig` fields that are a LIST, not a count
 FLEET_HEALTH_LIST_KEYS = ("exempt_kinds",)
 
-#: `FleetHealthConfig` fields that are a FLEET number and are REFUSED on a project, each
-#: with the reason the refusal states. `max_per_day` rations a fleet-wide daily cap;
-#: `sweep_dark_minutes` bounds the silence of ONE fleet-wide run record
-#: (`Daemon.STUCK_RUN_KEY`). No arrangement of per-project numbers can express either.
+#: `FleetHealthConfig` fields that are a FLEET number and are REFUSED on a project
 FLEET_HEALTH_FLEET_ONLY_KEYS: dict[str, str] = {
     "max_per_day": "No arrangement of per-project numbers can ration a fleet-wide "
                    "daily cap.",
@@ -1174,22 +512,7 @@ FLEET_HEALTH_FLEET_ONLY_KEYS: dict[str, str] = {
 
 @dataclass
 class FleetHealthConfig:
-    """When the OS decides one order has stopped moving, and how often it may say so.
-
-    Per project as well as fleet-wide, with `_parse_inspect`'s field-level inheritance
-    (`_parse_fleet_health`) — and `thresholds` inherits PER STATUS, so a project naming one
-    status keeps the fleet answer for the other eight (`probes.resolve`'s merge-by-id rule,
-    for its reason).
-
-    `max_per_day` and `sweep_dark_minutes` are FLEET numbers and are refused on a project
-    (`FLEET_HEALTH_FLEET_ONLY_KEYS`): no arrangement of per-project numbers can ration a
-    fleet-wide daily cap, nor bound the silence of one fleet-wide run record.
-
-    There is no money key here and there must not be one — Neo's one condition on 1073.
-    `max_per_day` rations the number of sessions and `worker.investigation_budget_usd`
-    rations each one; two answers to "what may this cost" is how a ceiling stops being
-    checkable.
-    """
+    """When the OS decides one order has stopped moving, and how often it may say so"""
 
     enabled: bool = DEFAULT_FLEET_HEALTH_ENABLED
     thresholds: dict[str, int] = field(
@@ -1197,70 +520,49 @@ class FleetHealthConfig:
     fallback_minutes: int = DEFAULT_FLEET_HEALTH_FALLBACK_MINUTES
     cooldown_minutes: int = DEFAULT_FLEET_HEALTH_COOLDOWN_MINUTES
     max_per_day: int = DEFAULT_FLEET_HEALTH_MAX_PER_DAY
-    #: Neo 1086: how often this project is swept, per project rather than a constant.
+    #: Neo 1086: how often this project is swept, per project rather than a constant
     sweep_every_ticks: int = DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS
-    #: Fleet-only: how long the sweep's own run record may be silent (§8).
+    #: Fleet-only: how long the sweep's own run record may be silent (§8)
     sweep_dark_minutes: int = DEFAULT_FLEET_HEALTH_SWEEP_DARK_MINUTES
-    #: Kinds this project's sweep never judges. Overridden WHOLE and not merged per
-    #: element, unlike `thresholds`: a kind list is one policy statement, and a merging
-    #: list could only ever grow — un-exempting a kind would be inexpressible.
+    #: Kinds this project's sweep never judges
     exempt_kinds: tuple[str, ...] = DEFAULT_FLEET_HEALTH_EXEMPT_KINDS
-    #: §2 of docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md.
+    #: §2 of docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md
     red_episode_retention_hours: int = DEFAULT_FLEET_HEALTH_RED_EPISODE_RETENTION_HOURS
 
     def threshold_seconds(self, status: str) -> float:
-        """This status's threshold, in the seconds `stuck.assess` compares — the named one
-        or the fallback, so every open status has an answer."""
+        """This status's threshold, in the seconds `stuck.assess` compares"""
         return float(self.thresholds.get(status, self.fallback_minutes)) * 60.0
 
 
-# -- `jarvis navigation`: what counts as NAVIGATION, as data rather than code. q1216,
-# §2.3 of
-# docs/superpowers/specs/2026-10-02-subagent-cache-anatomy-and-the-navigation-split.md:
-# re-measuring under a different definition of "navigation" must not need a release.
+# -- `jarvis navigation`: what counts as NAVIGATION, as data rather than code. q1216
 
-# §3 of the 2026-10-02 navigation split: ONE definition, in the stdlib-only leaf.
+# §3 of the 2026-10-02 navigation split: ONE definition, in the stdlib-only leaf
 
-#: Bash commands that count as reading or searching code. EXACTLY §5.3's set and no more:
-#: the BEFORE figure (41.3%) was measured with these six, and a wider set makes the AFTER
-#: figure incomparable rather than better.
+#: Bash commands that count as reading or searching code
 DEFAULT_NAVIGATION_BASH_COMMANDS = NAV_COMMANDS
 
-#: Symbol tools, BARE — `navigation.is_symbol_call` strips the `mcp__<server>__` prefix,
-#: because both `mcp__serena__` and `mcp__plugin_serena_serena__` exist in this fleet.
-#: `search_for_pattern` is DELIBERATELY ABSENT: it is text search with a Serena name, and
-#: counting it as a symbol call is the vacuity trap kn-a397fb52 documents.
+#: Symbol tools, BARE — `navigation.is_symbol_call` strips the `mcp__<server>__` prefix
 DEFAULT_NAVIGATION_SYMBOL_TOOLS = SYMBOL_TOOLS
 
-#: The TOOLS that are text search. `Bash` is not here and must not be — a worker runs all
-#: sorts of legitimate shell; the COMMAND is classified instead.
+#: The TOOLS that are text search
 DEFAULT_NAVIGATION_TEXT_SEARCH_TOOLS = TEXT_SEARCH_TOOLS
 
-#: Which files make a read a CODE read. `.py` because that is what the 41.3% measured.
+#: Which files make a read a CODE read
 DEFAULT_NAVIGATION_CODE_SUFFIXES = SOURCE_SUFFIXES
 
-#: Which files make a read a DOC read. A sibling of `code_suffixes`, never a widening of
-#: it: `navigates_source`'s meaning is the fleet's published baseline (§2.2). Data rather
-#: than code so re-measuring needs no release.
-#: docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §3.2.
+#: Which files make a read a DOC read (docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §3.2.)
 DEFAULT_NAVIGATION_DOC_SUFFIXES = DOC_SUFFIXES
 
-#: Which path components make a file a DOC by location. Not a suffix: entries carry no
-#: leading dot.
+#: Which path components make a file a DOC by location
 DEFAULT_NAVIGATION_DOC_DIRS = DOC_DIRS
 
-#: The Bash commands that DUMP a doc. `grep`/`rg`/`find` are absent by decision — text
-#: search in markdown stays legal and counting it would price a legitimate call as waste.
-#: docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §3.2.
+#: The Bash commands that DUMP a doc (docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §3.2.)
 DEFAULT_NAVIGATION_DOC_DUMP_COMMANDS = DOC_DUMP_COMMANDS
 
-#: The default window for a wide scope, in days. Seven, for
-#: `DEFAULT_INSPECT_ALARM_REWRITE_WINDOW_DAYS`' reason: a share averaged over all history
-#: reports the trend away, and the trend is the whole question after `worker.bash_first`.
+#: The default window for a wide scope, in days
 DEFAULT_NAVIGATION_WINDOW_DAYS = 7
 
-#: The `NavigationConfig` fields that are a PATTERN LIST, so `_parse_navigation` can
-#: refuse all seven the same way. An empty one reports 0% everywhere and looks like a win.
+#: The `NavigationConfig` fields that are a PATTERN LIST
 NAVIGATION_PATTERN_KEYS = ("bash_commands", "symbol_tools", "text_search_tools",
                            "code_suffixes", "doc_suffixes", "doc_dirs",
                            "doc_dump_commands")
@@ -1268,15 +570,7 @@ NAVIGATION_PATTERN_KEYS = ("bash_commands", "symbol_tools", "text_search_tools",
 
 @dataclass
 class NavigationConfig:
-    """What `jarvis navigation` calls navigation, and over how long.
-
-    Per project as well as fleet-wide, with `_parse_inspect`'s field-level inheritance
-    (`_parse_navigation`): a project that names one key keeps the OS answer for the rest,
-    so no caller consults two objects.
-
-    `enabled` is carried for the shape every other block here has; this report reads
-    files that are already on disk and costs nothing until someone runs it.
-    """
+    """What `jarvis navigation` calls navigation, and over how long"""
 
     enabled: bool = True
     bash_commands: tuple[str, ...] = DEFAULT_NAVIGATION_BASH_COMMANDS
@@ -1289,41 +583,30 @@ class NavigationConfig:
     window_days: int = DEFAULT_NAVIGATION_WINDOW_DAYS
 
 
-#: Shipped defaults of `CostConfig`. The usage week resets Monday 21:00
-#: America/Los_Angeles — VERIFIED: Mon 2026-09-28 21:00 PDT = 2026-09-29 04:00 UTC.
+#: Shipped defaults of `CostConfig`
 DEFAULT_COST_WEEK_RESET_WEEKDAY = 0        # Monday, `datetime.weekday()` numbering
 DEFAULT_COST_WEEK_RESET_HOUR = 21
 DEFAULT_COST_WEEK_RESET_ZONE = "America/Los_Angeles"
 DEFAULT_COST_PERCENTILE = 0.9
 DEFAULT_COST_MAX_ORDERS = 500
-#: The `chars` fallback's divisor, where the exact `context-delta` basis does not apply.
-#: A model-family property the OS does not control, and UNCALIBRATED against the fleet —
-#: which is why every figure derived from it reports its `token_basis` counts beside it.
+#: The `chars` fallback's divisor, where the exact `context-delta` basis does not apply
 DEFAULT_COST_CHARS_PER_TOKEN = 4.0
 DEFAULT_COST_TOOL_ROWS = 20
-#: The 5h grid's length, a SLICE OF THE WEEK and not Anthropic's session accounting —
-#: §2 of docs/superpowers/specs/2026-10-07-cost-window-selector.md.
+#: The 5h grid's length, a SLICE OF THE WEEK and not Anthropic's session accounting (docs/superpowers/specs/2026-10-07-cost-window-selector.md)
 DEFAULT_COST_SESSION_WINDOW_HOURS = 5.0
-#: The usage meter — §§4, 5 and 8 of
-#: docs/superpowers/specs/2026-10-08-usage-meter-samples-and-outside-spend.md. Settings
-#: rather than module constants for the standing rider's reason: every one of them is a
-#: belief about an account the OS does not control.
+#: The usage meter — §§4, 5 and 8 of... (docs/superpowers/specs/2026-10-08-usage-meter-samples-and-outside-spend.md)
 DEFAULT_COST_METER_NEAREST_SECONDS = 300
 DEFAULT_COST_METER_CALIBRATION_MIN_MINUTES = 30
 DEFAULT_COST_METER_CALIBRATION_MIN_POINTS = 5
 DEFAULT_COST_METER_CALIBRATION_DAYS = 7
-#: Measured on this machine 2026-10-08: ~$0.82 of list-price spend per 5h point. The
-#: SEED, labelled as one everywhere it is shown and never printed as a measurement.
+#: Measured on this machine 2026-10-08: ~$0.82 of list-price spend per 5h point
 DEFAULT_COST_METER_DOLLARS_PER_POINT = 0.82
-#: Fifteen consecutive failed minutes is a broken token or a broken network, where three
-#: is a blip.
+#: Fifteen consecutive failed minutes is a broken token or a broken network, where three is a blip
 DEFAULT_COST_METER_STALE_MINUTES = 15
 DEFAULT_COST_METER_GAP_NOTICE_SAMPLES = 10
-#: Rows of the outside-session table SHOWN. The cap is on rows, never on the dollars
-#: counted: the remainder stays in `total_usd` and is disclosed as `n` (§9).
+#: Rows of the outside-session table SHOWN
 DEFAULT_COST_METER_OUTSIDE_ROWS = 10
-#: The two alarm shares and the floor under both (§8). A quarter of a $1 window is 25
-#: cents, and alarming on it would teach the user to ignore the alarm.
+#: The two alarm shares and the floor under both (§8)
 DEFAULT_COST_METER_OUTSIDE_ALERT_SHARE = 0.25
 DEFAULT_COST_METER_RESIDUAL_ALERT_SHARE = 0.25
 DEFAULT_COST_METER_ALERT_MIN_USD = 5.0
@@ -1331,18 +614,7 @@ DEFAULT_COST_METER_ALERT_MIN_USD = 5.0
 
 @dataclass
 class CostConfig:
-    """What `jarvis cost --fleet` reports over, and where its default window starts.
-
-    Per project as well as fleet-wide, with `_parse_cost`'s field-level inheritance: a
-    project naming one key keeps the OS answer for the rest. Neo's rider on
-    wo-38456776 — no module constant for anything tunable — and the reason is that all
-    eight of these move: a DST shift and an Anthropic policy change both move the reset,
-    what counts as the tail of the distribution differs by project, and the tokens-per-
-    character of a model family is Anthropic's to change.
-
-    Spec §6 of docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md, and §10.10
-    of its per-tool addendum for the last two.
-    """
+    """What `jarvis cost --fleet` reports over, and where its default window starts (docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md)"""
 
     week_reset_weekday: int = DEFAULT_COST_WEEK_RESET_WEEKDAY
     week_reset_hour: int = DEFAULT_COST_WEEK_RESET_HOUR
@@ -1365,11 +637,7 @@ class CostConfig:
     meter_alert_min_usd: float = DEFAULT_COST_METER_ALERT_MIN_USD
 
 
-#: The legal observability levels and the shipped default, as LITERALS. `observability.py`
-#: owns the vocabulary (`observability.LEVELS`) and asserts the same three; the strings are
-#: repeated here rather than imported so the dependency runs one way only — that module
-#: reads a config object and catalog importing it back would be the cycle.
-#: docs/superpowers/specs/2026-09-24-order-observability.md §10.
+#: The legal observability levels and the shipped default, as LITERALS (docs/superpowers/specs/2026-09-24-order-observability.md §10.)
 OBSERVABILITY_LEVELS = ("off", "normal", "full")
 DEFAULT_OBSERVABILITY_LEVEL = "normal"
 
@@ -1402,67 +670,38 @@ class ObservabilityConfig:
 
 
 # -- message delivery: how long a queued message may stay undelivered before the OS
-# calls it stuck. A threshold a surface judges by, so it is a setting and not a module
-# constant (kn-67cdb54b), and ABOVE `ProjectSpec` for the `field(default_factory=…)`
-# reason kn-6ca2bcd9 gives.
 
-#: `Daemon.deliver_messages` sends within one reconcile tick, so this is not a
-#: latency bar — it is the point past which every ACCOUNTED wait has been excused by
-#: `invariants.stuck_message` and what is left is a message the worker will never see.
-#: An hour rather than minutes for `DEFAULT_INSPECT_ALARM_PARKED_MINUTES`' reason: the
-#: one unaccounted wait that is legitimately long is a project whose `max_concurrent`
-#: slots are all full, and flagging that after minutes would put a line on the
-#: attention list for a fleet that is merely busy.
+#: `Daemon.deliver_messages` sends within one reconcile tick, so this is not a latency bar
 DEFAULT_MESSAGING_STUCK_MINUTES = 60
 
 
-# -- the bug lifecycle: what happens to a GitHub issue `jarvis bug report` files. Issue
-# #240, and `docs/superpowers/specs/2026-09-14-a-filed-bug-runs-itself.md`. Per project
-# with a fleet fallback, on `_parse_inspect`'s shape, and the project it is read from is
-# THE ONE THAT WOULD DO THE WORK — never the one that noticed the bug. Any agent in the
-# fleet can run `jarvis bug report`, so the project that pays for the work is the only
-# one whose consent means anything.
+# -- the bug lifecycle: what happens to a GitHub issue `jarvis bug report` files
 
-#: The label that says the OS has picked an issue up. Wording from issue #240 itself.
+#: The label that says the OS has picked an issue up (#240)
 DEFAULT_BUGS_LABEL = "in progress"
 
 
 @dataclass
 class BugsConfig:
-    """How the tracker is labelled while the OS works on a bug it filed.
-
-    Whether a confirmed claim dispatches at all is `os.autonomy.self_dispatch` (ships off).
-
-    `label` is the whole of the in-progress signal: nothing derives it, and an issue
-    carries it exactly while a live work order is on it (`issues.desired_state`). The
-    priority labels beside it are not configurable — they are the vocabulary itself
-    (`issues.PRIORITY_LABELS`), and a fleet that renamed them would have a tracker its
-    own rubric no longer describes.
-    """
+    """How the tracker is labelled while the OS works on a bug it filed"""
 
     label: str = DEFAULT_BUGS_LABEL
 
 
-#: How far back `Daemon.refile_dropped_fixes` looks. A release order settles within minutes
-#: to hours of its batch landing; two weeks covers one the user leaves over a holiday.
+#: How far back `Daemon.refile_dropped_fixes` looks
 DEFAULT_RELEASE_REFILE_WINDOW_DAYS = 14
 
 
 @dataclass
 class ReleaseConfig:
-    """How long a settled release order's dropped batch stays worth re-filing.
-
-    Per project as well as fleet-wide, with `_parse_inspect`'s field-level inheritance:
-    the answer is a claim about THIS project's release cadence, and a project that ships
-    weekly has a different one from a project that ships twice a year.
-    """
+    """How long a settled release order's dropped batch stays worth re-filing"""
 
     refile_window_days: int = DEFAULT_RELEASE_REFILE_WINDOW_DAYS
 
 
 @dataclass
 class AutonomyConfig:
-    """Whether the OS may create orders nobody typed (bug pickups, riders, red-main fixes, releases)."""
+    """Whether the OS may create orders nobody typed (bug pickups, riders, red-main fixes, releases)"""
 
     self_dispatch: bool = False
 
@@ -1478,135 +717,61 @@ def _parse_autonomy(raw: Any) -> AutonomyConfig:
 
 @dataclass
 class MessagingConfig:
-    """When a message queued for a worker stops being in flight and becomes a defect.
-
-    Per project as well as fleet-wide, with the field-level inheritance `_parse_inspect`
-    uses, and for the same reason: "how long is too long" is a claim about what is
-    normal, and a project that runs one work order at a time queues behind itself far
-    more than one that runs five.
-    """
+    """When a message queued for a worker stops being in flight and becomes a defect"""
 
     stuck_minutes: int = DEFAULT_MESSAGING_STUCK_MINUTES
 
 
 # -- pull requests: how long GitHub may go without recomputing one before the OS stops
-# calling its own poll an actor for it. wo-d3a70c29, Neo question 1830.
 
-#: Half an hour. GitHub computes mergeability LAZILY and asking is what starts it, so
-#: UNKNOWN right after a push is the NORMAL state (kn-5e93939e) — the threshold has to
-#: clear every ordinary push before it clears a stall. PR #995 sat UNKNOWN for ~7h.
+#: Half an hour (#995)
 DEFAULT_PULL_REQUESTS_RECOMPUTE_STALL_MINUTES = 30
 
 
 @dataclass
 class PullRequestsConfig:
-    """When GitHub's silence about a pull request stops being a wait and becomes a stall.
-
-    `MessagingConfig`'s shape exactly — one field, fleet-wide with `_parse_inspect`'s
-    field-level inheritance — and behind NO `enabled` switch on purpose: this is an
-    ingredient of `daemon.pr_recompute_stalled`, a predicate every surface reads through
-    `ops.scheduled_actor`, not an alarm anyone can turn off. A fleet with validation and
-    inspection both off still has to be able to say nobody is going to act.
-    """
+    """When GitHub's silence about a pull request stops being a wait and becomes a stall"""
 
     recompute_stall_minutes: int = DEFAULT_PULL_REQUESTS_RECOMPUTE_STALL_MINUTES
 
 
-# -- the scheduler: the OS filing a work order nobody typed. ABOVE `ProjectSpec` for the
-# `field(default_factory=…)` reason kn-6ca2bcd9 gives, and a catalog setting rather than a
-# module constant for kn-67cdb54b's: "how often, and which jobs" is policy the user holds
-# an opinion about. Reasoning: docs/superpowers/specs/2026-09-14-the-scheduler.md §2.
+# -- the scheduler: the OS filing a work order nobody typed
 
-#: Daily, which is the cadence the ask named. Hours rather than a cron expression on
-#: purpose: a cron string can express "every minute", and the first mechanism that spends
-#: money on its own should not be one typo away from doing so.
+#: Daily, which is the cadence the ask named
 DEFAULT_SCHEDULE_INTERVAL_HOURS = 24
 
-#: How many whole intervals a job may sit HELD — wanting to fire, blocked behind its own
-#: unsettled previous order — before `invariants.check_schedule_progresses` reports it.
-#: Three rather than one: a doctor order the user has not got round to reviewing is a
-#: normal Tuesday, and flagging that would put the scheduler itself on the attention list
-#: for the crime of working. Three days of silence is a scheduler that has stopped.
+#: How many whole intervals a job may sit HELD
 DEFAULT_SCHEDULE_HELD_ALARM_INTERVALS = 3
 
 
 @dataclass
 class WiringConfig:
-    """Which of the USER'S OWN MCP servers, skills and plugins reach this project's
-    workers. Read `wiring.py` for the levers; spec
-    docs/superpowers/specs/2026-09-16-per-project-wiring.md §2 for why they are these.
-
-    OPT-OUT, and that is the whole shape (user ruling, 2026-09-16): every default here
-    means "wired", so a project that never opens /config launches exactly the session it
-    launched before this block existed, and a server the user installs next month is
-    wired everywhere without a catalog edit. What a project stores is its DEVIATION.
-
-    Mixed polarity is deliberate and the page hides it: the two flags name a block
-    nothing can subdivide (the claude.ai connectors move as one, and Claude Code's
-    bundled skills likewise), while the two lists name individuals. Both render as one
-    checkbox per row, so "wired" is the only word a reader meets.
-
-    The lists REPLACE rather than merge when a project overrides them — `ScheduleConfig.
-    jobs`' rule (kn-6ca2bcd9), for its reason: inheritance is field-level.
-    """
+    """Which of the USER'S OWN MCP servers, skills and plugins reach this project's workers (docs/superpowers/specs/2026-09-16-per-project-wiring.md §2)"""
 
     claude_ai_connectors: bool = True
-    # Off by default: CLI-shipped skills (dataviz, loop, …) cost ~1.6K tokens per worker start.
+    # Off by default: CLI-shipped skills (dataviz, loop, …) cost ~1.6K tokens per worker start
     bundled_skills: bool = False
-    #: `<plugin>@<marketplace>` ids, as `claude plugin list` spells them.
+    #: `<plugin>@<marketplace>` ids, as `claude plugin list` spells them
     disabled_plugins: tuple[str, ...] = ()
-    #: Skill names — user and project skills only. A PLUGIN's skills follow their
-    #: plugin: Claude Code ignores `skillOverrides` for a plugin-sourced skill.
+    #: Skill names — user and project skills only
     disabled_skills: tuple[str, ...] = ()
 
 
-#: Tracked files an installed TOOL owns and rewrites. `.serena/project.yml` is the case
-#: that named the class: Serena regenerates it from its own template on activation — in
-#: the worker's worktree, seconds into turn 1 — so `git add -A` stages ~120 lines of
-#: vendor comments into a pull request about something else. Adding the next one is a
-#: `jarvis config set`, not a release. Spec docs/superpowers/specs/
-#: 2026-09-25-serena-config-churn-and-tool-managed-files.md.
+#: Tracked files an installed TOOL owns and rewrites
 DEFAULT_TOOL_MANAGED_PATHS = (".serena/project.yml",)
 
 
 @dataclass
 class WorktreeConfig:
-    """What is true of a WORKER'S worktree specifically, and not of the shared checkout.
+    """What is true of a WORKER'S worktree specifically, and not of the shared checkout"""
 
-    The one lever so far marks each `tool_managed_paths` entry `skip-worktree` in the
-    worktree's index (`hooks.mark_tool_managed_paths`): the tool keeps rewriting the file,
-    the worker keeps reading it, and git stops reporting it as modified. The shared
-    checkout is deliberately untouched — a schema upgrade there is the user's to see and
-    commit.
-
-    The list REPLACES rather than merges when a project overrides it — `WiringConfig`'s
-    rule (kn-6ca2bcd9), for its reason: inheritance is field-level.
-    """
-
-    #: Repo-relative paths. Absolute paths and `..` are refused by `_parse_worktree`:
-    #: the value is handed to `git -C <worktree>`.
+    #: Repo-relative paths
     tool_managed_paths: tuple[str, ...] = DEFAULT_TOOL_MANAGED_PATHS
 
 
 @dataclass
 class ScheduleConfig:
-    """Recurring work orders: whether, how often, and which.
-
-    TWO SWITCHES RATHER THAN ONE, `RemedyConfig`'s pattern and for a sharper reason: this
-    is the only thing in the OS that files work — and therefore spends the user's money —
-    with nobody asking. `enabled` ships FALSE, so a fleet that upgrades into this feature
-    schedules nothing until somebody says so, while `jobs` still carries a meaningful
-    default roster so turning it on is one setting and not two.
-
-    `jobs` names ids of `schedule.JOBS`; an unknown one is a `CatalogError` naming the
-    known ids (`GateConfig.parse`'s rule — a typo must not silently leave a job unset).
-    It REPLACES rather than merges when a project overrides it, for the reason
-    `seat_models` does (kn-6ca2bcd9): inheritance is field-level and this is one field.
-
-    Per project as well as fleet-wide, with `_parse_inspect`'s field-level inheritance:
-    "should this project be swept daily" is exactly the kind of claim that differs by
-    project — an OS checkout wants it, an archived repo does not.
-    """
+    """Recurring work orders: whether, how often, and which"""
 
     enabled: bool = False
     interval_hours: int = DEFAULT_SCHEDULE_INTERVAL_HOURS
@@ -1619,90 +784,57 @@ class ScheduleConfig:
 
 
 # -- the supervisor: it JUDGES a cost alarm, so every number it judges by is a setting
-# rather than a module constant (kn-67cdb54b). Reasoning, and why none of it belongs in
-# `InspectConfig`: docs/superpowers/specs/2026-08-31-the-supervisor.md §2.
-#
-# ABOVE `ProjectSpec`, which uses it via `field(default_factory=…)` — below it is a
-# NameError at import (kn-6ca2bcd9).
 
 DEFAULT_SUPERVISOR_MODEL = "opus"
 DEFAULT_SUPERVISOR_TIMEOUT = 300
 DEFAULT_SUPERVISOR_LEARNINGS_LIMIT = 50
 
-#: Past this an alarm is skipped unjudged: spend the user can no longer prevent.
+#: Past this an alarm is skipped unjudged: spend the user can no longer prevent
 DEFAULT_SUPERVISOR_MAX_AGE_HOURS = 24
 
-#: MUST EXCEED `timeout`, or a claim is reclaimed out from under a call that is still
-#: running and one alarm is judged twice. `_parse_supervisor` refuses a catalog that
-#: breaks the relation.
+#: MUST EXCEED `timeout`, or a claim is reclaimed out from under a call that is still running and one...
 DEFAULT_SUPERVISOR_STALE_REVIEWING_SECONDS = 900
 DEFAULT_SUPERVISOR_MAX_REVIEW_ATTEMPTS = 3
 
-#: The evidence packet's ceiling and the clips that fill it. `conversation_` and
-#: `description_` are prefixed because both measure quoted characters (kn-67cdb54b).
+#: The evidence packet's ceiling and the clips that fill it
 DEFAULT_SUPERVISOR_EVIDENCE_BUDGET_CHARS = 8000
 DEFAULT_SUPERVISOR_CONVERSATION_QUOTE_CHARS = 400
 DEFAULT_SUPERVISOR_QUOTED_TURNS = 3
 DEFAULT_SUPERVISOR_DESCRIPTION_CHARS = 500
 
-#: What the user is told, and how much of an unusable reply is kept as the reason.
+#: What the user is told, and how much of an unusable reply is kept as the reason
 DEFAULT_SUPERVISOR_NOTE_CHARS = 200
 DEFAULT_SUPERVISOR_REASON_CHARS = 200
 
 # -- the health sweep's numbers, created here so §4 touches no catalog code and the two
-# can be reviewed apart. NOTHING IN THIS RELEASE READS THEM:
-# docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md §2 ships the list
-# and §4 ships the trigger that reads it.
 
-#: How often the sweep runs, and the floor between two looks at the SAME unit — a unit
-#: nothing has happened to is not judged twice.
+#: How often the sweep runs, and the floor between two looks at the SAME unit
 DEFAULT_SUPERVISOR_HEALTH_EVERY_TICKS = 20
 DEFAULT_SUPERVISOR_HEALTH_MIN_INTERVAL_MINUTES = 30
 
-#: How long a unit's fingerprint may sit still before that stillness is itself the thing
-#: worth looking at (§4's `stale` clause).
+#: How long a unit's fingerprint may sit still before that stillness is itself the thing worth looking...
 DEFAULT_SUPERVISOR_HEALTH_STALE_MINUTES = 720
 
-#: The per-tick ceiling: the sweep is the standing cost of watching, so it is bounded
-#: before it is enabled rather than after a bill arrives.
+#: The per-tick ceiling: the sweep is the standing cost of watching
 DEFAULT_SUPERVISOR_HEALTH_MAX_UNITS_PER_TICK = 4
 
-#: Every armed probe rides in ONE system prompt, so both of these bound that prompt.
+#: Every armed probe rides in ONE system prompt, so both of these bound that prompt
 DEFAULT_SUPERVISOR_MAX_ENABLED_PROBES = 12
 DEFAULT_SUPERVISOR_PROBE_PROMPT_CHARS = 800
 
 
 @dataclass(frozen=True)
 class RemedyConfig:
-    """What the supervisor is permitted to PROPOSE doing about a unit it judged ill —
-    docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md §5.
-
-    TWO SWITCHES RATHER THAN ONE, DELIBERATELY. `enabled: true` with `allowed: []` means
-    the supervisor may reason about remedies and nothing is ever applied — a genuinely
-    useful shipping state, and the one the fleet should run first. Collapsing them into
-    a single flag would make "let me watch it want to act" unexpressible.
-
-    Ships with both off. `allowed` names ids of `remedies.REMEDIES`; an unknown one is a
-    `CatalogError` naming the known ids, `GateConfig.parse`'s rule and for its reason — a
-    typo must not silently leave a permission unset.
-
-    Defined ABOVE `SupervisorConfig` because it is reached through
-    `field(default_factory=...)`, which is a `NameError` at import the other way round
-    (kn-67cdb54b).
-    """
+    """What the supervisor is permitted to PROPOSE doing about a unit it judged ill (docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md §5.)"""
 
     enabled: bool = False
     allowed: tuple[str, ...] = ()
 
 
-#: How many samples a median in the evolution report needs before it is reported as one
-#: (§9 of docs/superpowers/specs/2026-09-27-self-evolution.md). A median over fewer than
-#: three samples is one sample wearing a statistic's name.
+#: How many samples a median in the evolution report needs before it is reported as one (§9 of... (docs/superpowers/specs/2026-09-27-self-evolution.md)
 DEFAULT_EVOLUTION_MIN_SAMPLES = 3
 
-#: The steward's ledger (§3.3 of
-#: docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md).
-#: List-price USD over a rolling 7 days; placeholders sized from the 2026-10-20 measurement.
+#: The steward's ledger (§3.3 of... (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md)
 DEFAULT_EVOLUTION_WEEKLY_USD = 150.0
 DEFAULT_EVOLUTION_CRITICAL_WEEKLY_USD = 60.0
 DEFAULT_EVOLUTION_YIELD_ABOVE_USD = 900.0
@@ -1711,34 +843,16 @@ DEFAULT_EVOLUTION_MAX_DEPTH = 1
 DEFAULT_EVOLUTION_MAJOR_MIN_REFS = 1
 DEFAULT_EVOLUTION_MEDIUM_MIN_REFS = 3
 DEFAULT_EVOLUTION_MIN_PRECISION = 0.2
-#: `shadow` decides and records but changes no dispatch; `enforce` applies the decision.
+#: `shadow` decides and records but changes no dispatch; `enforce` applies the decision
 EVOLUTION_MODES = ("shadow", "enforce")
 
 
 @dataclass
 class EvolutionConfig:
-    """What the §9 evolution report needs before it believes its own numbers.
-    docs/superpowers/specs/2026-09-27-self-evolution.md.
-
-    `min_samples` is the floor under every median the report prints. Not a module
-    constant in `ops` because how much history a project needs before it trusts its
-    medians is a judgement about that project, and the report's notes say "fewer than N"
-    — so the N a reader is shown and the N the report applied are one value, read once.
-
-    Its own section rather than `rules.min_samples`: `rules` is the off switch for the
-    EVALUATION pass (§5.2) and the floor governs a READ of history that runs whether or
-    not the pass is armed. Neo (q1575) said `evolution.min_samples`, this work order
-    shipped `rules.min_samples`, and the user overruled that — so later §9 tunables land
-    here beside it, and `rules` keeps only what arms a rule.
-
-    Per project as well as fleet-wide, with `_parse_inspect`'s field-level inheritance
-    (`_parse_evolution`): a project naming one key keeps the OS answer for the rest.
-    """
+    """What the §9 evolution report needs before it believes its own numbers.... (docs/superpowers/specs/2026-09-27-self-evolution.md)"""
 
     min_samples: int = DEFAULT_EVOLUTION_MIN_SAMPLES
-    # The steward (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md
-    # §3.3). Read from `os.evolution` only: the ledger is fleet-wide, so a project override
-    # of these is parsed (the dataclass is shared) and ignored.
+    # The steward (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md...
     weekly_usd: float = DEFAULT_EVOLUTION_WEEKLY_USD
     critical_weekly_usd: float = DEFAULT_EVOLUTION_CRITICAL_WEEKLY_USD
     yield_above_usd: float = DEFAULT_EVOLUTION_YIELD_ABOVE_USD
@@ -1752,41 +866,16 @@ class EvolutionConfig:
 
 @dataclass
 class RulesConfig:
-    """Whether the self-evolution registry is EVALUATED at all. §5.2 of
-    docs/superpowers/specs/2026-09-27-self-evolution.md.
-
-    SHIPS OFF, and off means `Daemon.rules_tick` returns before it reads anything — not
-    "runs in dry run". The distinction matters because the detectors themselves are
-    already in `dry_run` and a reader who saw the pass running would reasonably conclude
-    the fleet had opted in to the feature when all it had done was upgrade. `jarvis rules
-    list` says which of the two it is, and that sentence is the only thing standing
-    between "no rule has ever matched" and "nothing has ever looked".
-
-    Per project as well as fleet-wide, with `_parse_inspect`'s field-level inheritance
-    (`_parse_rules`): a project that names one key keeps the OS answer for the rest. The
-    shape is the house one so the arming threshold and the remedy allow-list §6 adds do
-    not arrive as a second config object.
-
-    What does NOT belong here is §9's reporting floor: it was `rules.min_samples` and the
-    user reversed that, so it is `EvolutionConfig.min_samples`. This section is about
-    arming rules, not about reading their history.
-    """
+    """Whether the self-evolution registry is EVALUATED at all. §5.2 of... (docs/superpowers/specs/2026-09-27-self-evolution.md)"""
 
     enabled: bool = False
-    #: How many person-marked false positives an ARMED detector may collect before it
-    #: returns to `dry_run` (§6). A setting rather than a `rules.py` constant, so a project
-    #: with a noisier fleet can be stricter. Resolved for the FIRE's project.
+    #: How many person-marked false positives an ARMED detector may collect before it returns to `dry_run`...
     false_positive_disarm: int = 2
 
 
 @dataclass
 class SupervisorConfig:
-    """The agent that reviews a cost alarm and either acks it or wants Neo — §2.
-
-    SHIPS DISABLED: a wrong ack makes a burning turn invisible, which is a strict
-    regression on what PR 159 shipped. Field-level per-project inheritance
-    (`_parse_supervisor`), as `_parse_inspect` does it.
-    """
+    """The agent that reviews a cost alarm and either acks it or wants Neo — §2"""
 
     enabled: bool = False
     model: str = DEFAULT_SUPERVISOR_MODEL
@@ -1802,27 +891,19 @@ class SupervisorConfig:
     note_chars: int = DEFAULT_SUPERVISOR_NOTE_CHARS
     reason_chars: int = DEFAULT_SUPERVISOR_REASON_CHARS
 
-    # The health sweep. `probes` is a whole immutable list rather than a scalar, so
-    # `jarvis config set <p> supervisor.probes` addresses all of it at once and a single
-    # probe is not editable from the console — a catalog file edit is the intended
-    # route (§2), and bl-8e47dd53 tracks the console form.
+    # The health sweep
     probes: tuple[probes_mod.HealthProbe, ...] = probes_mod.DEFAULT_PROBES
     health_enabled: bool = False
     health_every_ticks: int = DEFAULT_SUPERVISOR_HEALTH_EVERY_TICKS
     health_min_interval_minutes: int = DEFAULT_SUPERVISOR_HEALTH_MIN_INTERVAL_MINUTES
     health_stale_minutes: int = DEFAULT_SUPERVISOR_HEALTH_STALE_MINUTES
     health_max_units_per_tick: int = DEFAULT_SUPERVISOR_HEALTH_MAX_UNITS_PER_TICK
-    # Which re-derivable reasons count as explaining a still unit, so a stale look at it
-    # is a free re-assertion rather than a model call. A whole immutable list, addressed
-    # at once for `probes`' reason, and a SETTING rather than a module constant: Neo
-    # q1217's one condition and kn-1cec46b5's standing rule.
+    # Which re-derivable reasons count as explaining a still unit
     health_reassert_blockers: tuple[str, ...] = health_mod.BLOCKERS
     max_enabled_probes: int = DEFAULT_SUPERVISOR_MAX_ENABLED_PROBES
     probe_prompt_chars: int = DEFAULT_SUPERVISOR_PROBE_PROMPT_CHARS
 
-    # What it may PROPOSE doing about what it finds (§5). A whole block rather than a
-    # scalar, for `probes`' reason: `jarvis config set <p> supervisor.remedies.allowed`
-    # addresses the permission as one list.
+    # What it may PROPOSE doing about what it finds (§5)
     remedies: RemedyConfig = field(default_factory=RemedyConfig)
 
 
@@ -1835,14 +916,9 @@ class ProjectSpec:
     worker: WorkerDefaults = field(default_factory=WorkerDefaults)
     settings_overrides: dict[str, Any] = field(default_factory=dict)
     max_concurrent: int = DEFAULT_MAX_CONCURRENT
-    # Privileged actions this project's workers may attempt under review rather than
-    # not at all (see gates.py). Off by default: enabling a gate widens what a worker
-    # can do, so it is always a deliberate per-project choice.
+    # Privileged actions this project's workers may attempt under review rather than not at all (see...
     gates: GateConfig = field(default_factory=GateConfig)
-    # Already RESOLVED against `os.validation`: `_parse_validation` is handed the OS
-    # config as its base, so every field here is the answer for this project and no
-    # caller has to consult two objects. See
-    # docs/superpowers/specs/2026-08-27-the-config-console.md §1.2.
+    # Already RESOLVED against `os.validation`: `_parse_validation` is handed the OS config as its base (docs/superpowers/specs/2026-08-27-the-config-console.md §1.2.)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     inspect: InspectConfig = field(default_factory=InspectConfig)
     ui_health: UiHealthConfig = field(default_factory=UiHealthConfig)
@@ -1864,36 +940,19 @@ class ProjectSpec:
     raw: dict[str, Any] = field(default_factory=dict)
 
 
-# The seats the panel runs by default. Deliberately NOT `neo_store.SEATS`: `record`,
-# `blast` and `taste` have no definition shipped yet, and a default roster naming safety
-# seats that cannot run would be worse than a short one that says what it is.
+# The seats the panel runs by default
 DEFAULT_ROSTER = ("premise", "chair")
 
-# Which question kinds the panel may answer by default. `plan` is excluded on purpose: a
-# feature order's plan review has its own reviewed persona (`plans.PLAN_REVIEWER_PERSONA`)
-# that the seats' mandates say nothing about, so including it would silently swap a
-# reviewed persona for one written for a different job on the day someone enables this.
+# Which question kinds the panel may answer by default
 DEFAULT_PANEL_KINDS = ("question", "approval")
 
-# Per-seat call timeout. Well below Neo's own 300s: the seats run concurrently but inside
-# the daemon's single Neo thread, so the whole FIFO drain — and every worker parked behind
-# it — waits on the slowest seat.
+# Per-seat call timeout
 DEFAULT_PANEL_TIMEOUT = 120
 
 
 @dataclass
 class PanelConfig:
-    """Neo answering as a panel of profiled seats instead of as one agent.
-
-    SHIPS DISABLED, and that is a requirement rather than caution: at this default the
-    OS's behaviour must be byte-identical to the single-agent path — same number of
-    Claude calls, same system prompt, same message to the worker. Enabling it is a
-    catalog edit, gated on a measurement that does not exist yet.
-
-    `seat_models` and `chair_model` are both empty by default, meaning "use
-    `NeoConfig.model`"; a nested dataclass cannot see its parent's field at construction,
-    so the fallback is resolved where it is used (`panel.seat_model`).
-    """
+    """Neo answering as a panel of profiled seats instead of as one agent"""
 
     enabled: bool = False
     roster: tuple[str, ...] = DEFAULT_ROSTER
@@ -1906,22 +965,15 @@ class PanelConfig:
 
 @dataclass
 class NeoConfig:
-    """Neo, the OS answerer agent (responds to worker questions as the user)."""
+    """Neo, the OS answerer agent (responds to worker questions as the user)"""
     enabled: bool = True
     model: str = "opus"
     learnings_limit: int = 50
-    # NOTE: parsed and never read — Neo's calls take `run_headless`'s own 300s default.
-    # Filed as bl-9a925d2e. Do not quietly start honouring it: a knob nobody could use
-    # that suddenly bites changes live Neo behaviour under cover of an unrelated change.
+    # NOTE: parsed and never read — Neo's calls take `run_headless`'s own 300s default
     timeout: int = 300
-    # Which model shortens an over-long question for the dashboard (`jarvis.digest`).
-    # A cheap one on purpose: the digest is display-only — it never reaches Neo, a
-    # worker or a learning — so this is a formatting job, not a judgement one.
-    # SET IT TO "" TO TURN DIGESTING OFF: no model named, no call made, and the page
-    # falls back to rendering every question in full, which is what it did before.
+    # Which model shortens an over-long question for the dashboard (`jarvis.digest`)
     digest_model: str = "haiku"
-    #: How much of a question the digest model is shown, clipped and LABELLED — spec §4,
-    #: docs/superpowers/specs/2026-09-26-bounded-model-inputs.md.
+    #: How much of a question the digest model is shown, clipped and LABELLED (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
     digest_max_question_chars: int = DEFAULT_DIGEST_MAX_QUESTION_CHARS
     panel: PanelConfig = field(default_factory=PanelConfig)
 
@@ -1931,59 +983,48 @@ class OsConfig:
     default_model: str = DEFAULT_MODEL
     default_effort: str | None = None
     default_permission_mode: str = DEFAULT_PERMISSION_MODE
-    # Spec 2026-10-01-the-steer-that-beat-the-brief.md §1 — see VALID_BASH_FIRST.
+    # Spec 2026-10-01-the-steer-that-beat-the-brief.md §1 — see VALID_BASH_FIRST
     default_bash_first: str = DEFAULT_WORKER_BASH_FIRST
-    # Spec 2026-10-02-serena-the-cheap-path.md §4 — see VALID_TOOL_SEARCH.
+    # Spec 2026-10-02-serena-the-cheap-path.md §4 — see VALID_TOOL_SEARCH
     default_tool_search: str = DEFAULT_WORKER_TOOL_SEARCH
-    # Spec 2026-10-15-the-hour-on-worker-turns-only.md §1 — see VALID_WORKER_CACHE_TTL.
+    # Spec 2026-10-15-the-hour-on-worker-turns-only.md §1 — see VALID_WORKER_CACHE_TTL
     default_cache_ttl: str = DEFAULT_WORKER_CACHE_TTL
-    # Spec 2026-10-02-serena-the-cheap-path.md §6 — see VALID_PY_NAV_HOOK.
+    # Spec 2026-10-02-serena-the-cheap-path.md §6 — see VALID_PY_NAV_HOOK
     default_py_nav_hook: str = DEFAULT_WORKER_PY_NAV_HOOK
-    # Spec 2026-10-06-navigate-specs-like-code.md §5 — see VALID_DOC_NAV_HOOK.
+    # Spec 2026-10-06-navigate-specs-like-code.md §5 — see VALID_DOC_NAV_HOOK
     default_doc_nav_hook: str = DEFAULT_WORKER_DOC_NAV_HOOK
-    # Its bar, fleet-wide — see DEFAULT_WORKER_DOC_READ_LIMIT_LINES.
+    # Its bar, fleet-wide — see DEFAULT_WORKER_DOC_READ_LIMIT_LINES
     default_doc_read_limit_lines: int = DEFAULT_WORKER_DOC_READ_LIMIT_LINES
     default_max_concurrent: int = DEFAULT_MAX_CONCURRENT
-    #: Fleet-wide worker turns in flight. No `ProjectSpec` twin on purpose — see
-    #: DEFAULT_MAX_IN_FLIGHT.
+    #: Fleet-wide worker turns in flight
     max_in_flight: int = DEFAULT_MAX_IN_FLIGHT
     default_autocompact_window: int | None = DEFAULT_AUTOCOMPACT_WINDOW
     default_budget_usd: float | None = DEFAULT_BUDGET_USD
     default_feature_budget_usd: float | None = DEFAULT_FEATURE_BUDGET_USD
-    #: Read by the cost surfaces, not by a worker launch — see DEFAULT_COLD_PREFIX_FLOOR.
+    #: Read by the cost surfaces, not by a worker launch — see DEFAULT_COLD_PREFIX_FLOOR
     cold_prefix_floor: int = DEFAULT_COLD_PREFIX_FLOOR
     cold_prefix_floor_max: int = DEFAULT_COLD_PREFIX_FLOOR_MAX
-    #: Read by the two `jarvis doctor` cache-health post-conditions, which judge the
-    #: fleet and not a project — see DEFAULT_CACHE_HEALTH_WINDOW_DAYS.
+    #: Read by the two `jarvis doctor` cache-health post-conditions
     cache_health_window_days: int = DEFAULT_CACHE_HEALTH_WINDOW_DAYS
     cache_health_min_orders: int = DEFAULT_CACHE_HEALTH_MIN_ORDERS
     cache_health_min_boundaries: int = DEFAULT_CACHE_HEALTH_MIN_BOUNDARIES
     cache_health_prefix_share: float = DEFAULT_CACHE_HEALTH_PREFIX_SHARE
-    #: The smallest context the OS will compact past an expired cache, or None to never
-    #: compact. Fleet-wide for `DEFAULT_CACHE_HEALTH_WINDOW_DAYS`' reason and one more:
-    #: the break-even is a property of the prompt cache's prices, which no project has
-    #: its own copy of. See DEFAULT_COMPACT_MIN_CONTEXT.
+    #: The smallest context the OS will compact past an expired cache, or None to never compact
     compact_min_context: int | None = DEFAULT_COMPACT_MIN_CONTEXT
-    #: Backstop ceiling on one OS-side model call's combined prompt. No off switch —
-    #: see `_max_os_prompt_chars_or_err` and DEFAULT_MAX_OS_PROMPT_CHARS.
+    #: Backstop ceiling on one OS-side model call's combined prompt
     max_os_prompt_chars: int = DEFAULT_MAX_OS_PROMPT_CHARS
     notification_sinks: list[str] = field(default_factory=lambda: ["log"])
     telegram_token_env: str = "JARVIS_TELEGRAM_TOKEN"
     telegram_chat_id_env: str = "JARVIS_TELEGRAM_CHAT_ID"
     ui_port: int = 8787
-    # Where notification deep links point. Empty = http://127.0.0.1:<ui_port>;
-    # set it when the UI is reachable under another host (tunnel, LAN, reverse proxy).
+    # Where notification deep links point
     ui_base_url: str = ""
-    # Knowledge reaches workers as an index they query on demand, so prompt cost stays
-    # flat as the base grows. Only entries tagged `pinned` are pasted in full.
+    # Knowledge reaches workers as an index they query on demand
     knowledge_inject_limit: int = 8      # max pinned entries injected verbatim
     knowledge_digest_limit: int = 8      # max index lines
     knowledge_digest_chars: int = 1000   # hard char budget for those lines
     knowledge_pinned_chars: int = 360    # per pinned entry; the rest is `jarvis learn show`
-    # Entries matching the work order's own TITLE, surfaced as a pointer into the overflow.
-    # A budget of its own, deliberately small and never taken out of the digest's: hints
-    # eating the index would make the same base produce a different index size per title,
-    # and `ops._index_cost` would stop being comparable across orders.
+    # Entries matching the work order's own TITLE, surfaced as a pointer into the overflow
     knowledge_hint_limit: int = 3         # max title-matched hint lines
     knowledge_hint_chars: int = 400       # hard char budget for those lines
     neo: NeoConfig = field(default_factory=NeoConfig)
@@ -2033,12 +1074,7 @@ def _positive_int_or_err(os_raw: dict[str, Any], key: str, default: int) -> int:
 
 
 def _cold_prefix_floor_or_err(os_raw: dict[str, Any]) -> tuple[int, int]:
-    """`os.cold_prefix_floor` and its guard rail, validated at boot not at report time.
-
-    Rejected here for the same reason the autocompact window is: a bad value would
-    otherwise surface far from its cause — as a cost report quietly reclassifying every
-    boundary, which reads as a finding rather than as a config error.
-    """
+    """`os.cold_prefix_floor` and its guard rail, validated at boot not at report time"""
     ceiling = _positive_int_or_err(os_raw, "cold_prefix_floor_max",
                                    DEFAULT_COLD_PREFIX_FLOOR_MAX)
     if ceiling <= 0:
@@ -2052,18 +1088,7 @@ def _cold_prefix_floor_or_err(os_raw: dict[str, Any]) -> tuple[int, int]:
 
 
 def _compact_min_context_or_err(os_raw: dict[str, Any]) -> int | None:
-    """`os.compact_min_context`, validated at boot. An explicit null means "never".
-
-    Absent and null differ here exactly as they do for the autocompact window, and for
-    the same reason: silence inherits the measured default, and switching a cost control
-    off has to be said out loud. Null is the ONLY off switch — there is deliberately no
-    `enabled` flag and no per-order opt-in, because an automatic remedy nobody has to
-    remember is the whole point (the pinned self-healing learning).
-
-    The floor under the floor is `COMPACT_MIN_CONTEXT_MIN`: below it the compaction
-    costs more than the re-write it replaces on every boundary the fleet has ever
-    recorded, so a value there is a typo rather than a policy.
-    """
+    """`os.compact_min_context`, validated at boot"""
     value = os_raw.get("compact_min_context", _MISSING)
     if value is _MISSING:
         return DEFAULT_COMPACT_MIN_CONTEXT
@@ -2080,16 +1105,7 @@ def _compact_min_context_or_err(os_raw: dict[str, Any]) -> int | None:
 
 
 def _max_os_prompt_chars_or_err(os_raw: dict[str, Any]) -> int:
-    """`os.max_os_prompt_chars`, validated at boot. NO null and no off switch.
-
-    A backstop with an off switch is not a backstop, which is why this differs from
-    `_compact_min_context_or_err`: switching a cost control off is a policy, switching
-    a safety limit off is the bug it exists to catch.
-
-    `MAX_OS_PROMPT_CHARS_MIN` sits just above the measured worst case (285,929 chars, a
-    feature chair round). Below it the ceiling refuses every validation seat — the panel
-    would decide nothing, silently — so a value there is refused where it was typed.
-    """
+    """`os.max_os_prompt_chars`, validated at boot"""
     value = os_raw.get("max_os_prompt_chars", DEFAULT_MAX_OS_PROMPT_CHARS)
     if isinstance(value, bool) or not isinstance(value, int):
         raise _err(f"os.max_os_prompt_chars must be a whole number of characters, "
@@ -2102,14 +1118,7 @@ def _max_os_prompt_chars_or_err(os_raw: dict[str, Any]) -> int:
 
 
 def _digest_max_question_chars_or_err(neo_raw: dict[str, Any]) -> int:
-    """`os.neo.digest_max_question_chars` — see DEFAULT_DIGEST_MAX_QUESTION_CHARS.
-
-    THE FLOOR IS `digest.MIN_CHARS`, read from that module rather than copied, so the
-    two cannot drift. Below it every digested question is clipped to less than the
-    length that earned it a digest call at all. The import is local because `digest`
-    imports this module. Spec §4:
-    docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
-    """
+    """`os.neo.digest_max_question_chars` — see DEFAULT_DIGEST_MAX_QUESTION_CHARS (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)"""
     from .digest import MIN_CHARS
 
     value = neo_raw.get("digest_max_question_chars", DEFAULT_DIGEST_MAX_QUESTION_CHARS)
@@ -2125,12 +1134,7 @@ def _digest_max_question_chars_or_err(neo_raw: dict[str, Any]) -> int:
 
 
 def _cache_health_or_err(os_raw: dict[str, Any]) -> tuple[int, int, int, float]:
-    """The cache-health window and its three floors, validated at boot.
-
-    Rejected here rather than at report time for `_cold_prefix_floor_or_err`'s reason:
-    a bad value would surface as a post-condition that never fires, or one that fires on
-    three orders — a config error wearing a finding's clothes.
-    """
+    """The cache-health window and its three floors, validated at boot"""
     days = _positive_int_or_err(os_raw, "cache_health_window_days",
                                 DEFAULT_CACHE_HEALTH_WINDOW_DAYS)
     if days < 1:
@@ -2161,13 +1165,7 @@ def _autocompact_or_err(raw: dict[str, Any], key: str, where: str,
 
 
 def _doc_read_limit_or_err(raw: dict[str, Any], where: str, default: int) -> int:
-    """`worker.doc_read_limit_lines`: an int ABOVE ZERO, and the message names the key.
-
-    §5.3 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md. This is where a bad value
-    is rejected LOUDLY; `hooks.doc_nav_decision` absorbs one quietly, because it runs on
-    every tool call and a hook that raises breaks the whole session. Both are needed:
-    validation cannot see a settings file edited by hand.
-    """
+    """`worker.doc_read_limit_lines`: an int ABOVE ZERO, and the message names the key (docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md)"""
     value = raw.get("doc_read_limit_lines", default)
     try:
         lines = int(value)
@@ -2188,27 +1186,13 @@ def load_catalog(path: str | Path) -> Catalog:
     except json.JSONDecodeError as e:
         raise _err(f"invalid JSON in {path}: {e}") from e
     cat = parse_catalog(data, source_path=path)
-    # Arm the transport backstop here: every startup path — daemon boot, `ops`, the CLI
-    # — loads the catalog from a file through this one function (Neo, q1077). Spec §4:
-    # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+    # Arm the transport backstop here: every startup path (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
     claude_cli.set_max_os_prompt_chars(cat.os.max_os_prompt_chars)
     return cat
 
 
 def _parse_panel(raw: Any) -> PanelConfig:
-    """`os.neo.panel`, validated against the vocabularies it names.
-
-    A roster naming a seat that does not exist, or a kind that is not a question kind, is
-    a CatalogError rather than a silently dropped entry — the same rule an invalid
-    `permission_mode` follows, and for a sharper reason here: every seat past `premise` is
-    a safety check, so a typo that quietly drops one removes a check and tells nobody.
-
-    `neo_store.SEATS` is the vocabulary, NOT the set of seats shipped in this build. A
-    roster may name a seat whose definition arrives in a later release: that is a config
-    written ahead of the code, and it is caught loudly at run time (the seat records a
-    `failed` opinion and the panel proceeds) rather than refusing to boot the whole fleet
-    over a name the OS does recognise.
-    """
+    """`os.neo.panel`, validated against the vocabularies it names"""
     if not isinstance(raw, dict):
         raise _err('"os.neo.panel" must be an object')
     roster = tuple(raw.get("roster", DEFAULT_ROSTER))
@@ -2244,22 +1228,7 @@ def _parse_panel(raw: Any) -> PanelConfig:
 
 def _parse_validation(raw: Any, base: ValidationConfig | None = None,
                       where: str = "os.validation") -> ValidationConfig:
-    """`os.validation` — or a project's override of it — against the seat vocabulary.
-
-    `base` is what an omitted key falls through to, and it is the whole mechanism behind
-    per-project validation: `os.validation` parses against the shipped defaults, then
-    each project parses against the OS answer, so a project naming one key inherits the
-    other seven (design doc §1.2). `where` only labels the error messages.
-
-    Modelled on `_parse_panel`, and it makes the same distinction for the same reason:
-    `project_store.VALIDATOR_SEATS` is the VOCABULARY, not the set of seats whose
-    markdown ships in this build. A roster may name a seat whose definition arrives in a
-    later release — config written ahead of the code — and that must parse; the missing
-    definition is caught loudly at run time (the seat records a `failed` opinion and the
-    panel proceeds) rather than refusing to boot the whole fleet. A name that is not in
-    the vocabulary at all is a different thing: a typo that would silently remove a
-    reviewer, so it is a CatalogError naming it.
-    """
+    """`os.validation` — or a project's override of it — against the seat vocabulary"""
     base = base or ValidationConfig()
     if not isinstance(raw, dict):
         raise _err(f'"{where}" must be an object')
@@ -2283,13 +1252,11 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         raise _err(f"{where}.max_rounds must be >= 1")
     red_ci_returns = int(raw.get("red_ci_returns", base.red_ci_returns))
     if red_ci_returns < 0:
-        # 0 is legal and means "never return": send every red head to the seats, which
-        # is today's behaviour exactly. `max_rounds` is >= 1 because a unit with zero
-        # rounds can never be judged at all; zero returns is not that (spec §4.3).
+        # 0 is legal and means "never return": send every red head to the seats
         raise _err(f"{where}.red_ci_returns must be >= 0")
     killed_retries = int(raw.get("killed_retries", base.killed_retries))
     if killed_retries < 0:
-        # 0 is legal and means "escalate on the first kill" (spec §4b).
+        # 0 is legal and means "escalate on the first kill" (spec §4b)
         raise _err(f"{where}.killed_retries must be >= 0")
     diff_chars = int(raw.get("diff_chars", base.diff_chars))
     if diff_chars < 1:
@@ -2305,20 +1272,17 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
     stakes_classifier = str(
         raw.get("stakes_classifier", base.stakes_classifier) or "regex")
     if stakes_classifier not in STAKES_CLASSIFIER_MODES:
-        # The `roster` precedent: refused loudly rather than shrugged to the default,
-        # because a typo here silently decides which net guards the settle path — and
-        # falling back would read as the feature being off.
+        # The `roster` precedent: refused loudly rather than shrugged to the default
         raise _err(f"{where}.stakes_classifier is {stakes_classifier!r}, which is not "
                    f"one of {list(STAKES_CLASSIFIER_MODES)}")
     feature_merge_wait_minutes = int(
         raw.get("feature_merge_wait_minutes", base.feature_merge_wait_minutes))
     if feature_merge_wait_minutes < 0:
-        # 0 is legal and means "never defer": check once, flag immediately.
+        # 0 is legal and means "never defer": check once, flag immediately
         raise _err(f"{where}.feature_merge_wait_minutes must be >= 0")
     max_follow_ups = int(raw.get("max_follow_ups", base.max_follow_ups))
     if max_follow_ups < 0:
-        # 0 is legal and is NOT the same setting as `follow_ups: false`: it files
-        # nothing while leaving every dropped finding counted on the round's event.
+        # 0 is legal and is NOT the same setting as `follow_ups: false`: it files nothing while leaving every...
         raise _err(f"{where}.max_follow_ups must be >= 0")
     return ValidationConfig(
         enabled=bool(raw.get("enabled", base.enabled)),
@@ -2334,40 +1298,21 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         assumption_spec_chars=assumption_spec_chars,
         feature_units=bool(raw.get("feature_units", base.feature_units)),
         feature_merge_wait_minutes=feature_merge_wait_minutes,
-        # Same field-level fallback as every flag in this block — see `auto_merge` below.
+        # Same field-level fallback as every flag in this block — see `auto_merge` below
         follow_ups=bool(raw.get("follow_ups", base.follow_ups)),
         max_follow_ups=max_follow_ups,
-        # `base.auto_merge` is the fleet answer when this project names nothing, and the
-        # shipped `False` when the fleet names nothing either — the field-level fallback
-        # that makes this per-project rather than global. A project opts in by naming it.
+        # `base.auto_merge` is the fleet answer when this project names nothing
         auto_merge=bool(raw.get("auto_merge", base.auto_merge)),
-        # Same fallback, same reason — see `ValidationConfig.auto_review`.
+        # Same fallback, same reason — see `ValidationConfig.auto_review`
         auto_review=bool(raw.get("auto_review", base.auto_review)),
-        # Same fallback again — see `ValidationConfig.stakes_classifier`.
+        # Same fallback again — see `ValidationConfig.stakes_classifier`
         stakes_classifier=stakes_classifier,
     )
 
 
 def _parse_inspect(raw: Any, base: InspectConfig | None = None,
                    where: str = "os.inspect") -> InspectConfig:
-    """`os.inspect`, or a project's override of it, with absurd values refused.
-
-    `base` is what an omitted key falls through to — the same field-level inheritance
-    `_parse_validation` uses (kn-6ca2bcd9): `os.inspect` parses against the shipped
-    defaults and each project parses against the OS answer, so a project naming one key
-    inherits the rest and no caller ever has to consult two objects.
-
-    Every COUNT is REFUSED rather than clamped below 1. Zero would report every write a
-    session makes and flag every work order the fleet runs — the exact failure the
-    defaults were measured to avoid — and it arrives by a typo in a `jarvis config set`,
-    so it is caught where the message can name the key.
-
-    THE THREE VOCABULARIES ARE KEPT APART because one rule cannot serve them: a SHARE is
-    refused outside `(0, 1]` — above 1 it is not a stricter alarm, it is one that can
-    never fire — and the one MONEY floor is refused below 0, since zero is a project
-    asking to hear about its tax however little it spent. Running either through the
-    ">= 1" rule would reject every legal value.
-    """
+    """`os.inspect`, or a project's override of it, with absurd values refused"""
     base = base or InspectConfig()
     if not isinstance(raw, dict):
         raise _err(f'"{where}" must be an object')
@@ -2425,19 +1370,7 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
 
 def _parse_ui_health(raw: Any, base: UiHealthConfig | None = None,
                      where: str = "os.ui_health") -> UiHealthConfig:
-    """`os.ui_health`, or a project's override of it — `_parse_inspect`'s shape exactly.
-
-    Field-level inheritance (kn-6ca2bcd9): `os.ui_health` parses against the shipped
-    defaults and each project against the OS answer, so a project naming one key inherits
-    the rest and no caller consults two objects.
-
-    ONE vocabulary here, unlike `_parse_inspect`: every field is a count or a duration,
-    so every one is refused below 1 rather than clamped. Zero means something different
-    and wrong in each of them — a probe that never sleeps, a timeout that always expires,
-    a trip on the first hiccup, a cooldown that allows a restart loop, a cap that can
-    never heal — and all of them arrive by a typo in a `jarvis config set`, so it is
-    caught where the message can name the key.
-    """
+    """`os.ui_health`, or a project's override of it — `_parse_inspect`'s shape exactly"""
     base = base or UiHealthConfig()
     if not isinstance(raw, dict):
         raise _err(f'"{where}" must be an object')
@@ -2463,15 +1396,7 @@ def _parse_ui_health(raw: Any, base: UiHealthConfig | None = None,
 
 def _parse_fleet_health(raw: Any, base: FleetHealthConfig | None = None,
                         where: str = "os.fleet_health") -> FleetHealthConfig:
-    """`os.fleet_health`, or a project's override of it — `_parse_inspect`'s shape.
-
-    Field-level inheritance, and `thresholds` inherits per STATUS rather than whole: a
-    project disabling one threshold must not drop the other eight.
-
-    Three refusals, each where the message can name the key — `GateConfig.parse`'s rule
-    that a typo must not silently leave a status unwatched, and `fleet.py`'s opening
-    paragraph for the third.
-    """
+    """`os.fleet_health`, or a project's override of it — `_parse_inspect`'s shape"""
     from .project_store import OPEN_STATUSES, WO_KINDS
 
     base = base or FleetHealthConfig()
@@ -2493,8 +1418,7 @@ def _parse_fleet_health(raw: Any, base: FleetHealthConfig | None = None,
         if int(minutes) < 1:
             raise _err(f"{where}.thresholds.{status} must be >= 1")
         thresholds[status] = int(minutes)
-    # A WHOLE-FIELD override. The EMPTY list is allowed and means "judge every kind": a
-    # meaningful policy, unlike `os.navigation`'s empty pattern list.
+    # A WHOLE-FIELD override
     exempt_kinds = base.exempt_kinds
     if "exempt_kinds" in raw:
         named_kinds = raw["exempt_kinds"]
@@ -2502,8 +1426,7 @@ def _parse_fleet_health(raw: Any, base: FleetHealthConfig | None = None,
                 or not all(isinstance(k, str) for k in named_kinds):
             raise _err(f'"{where}.exempt_kinds" must be a list of strings')
         for k in named_kinds:
-            # Refused rather than ignored: a typo that silently exempted nothing is how a
-            # manager stays watched after somebody tried to stop it.
+            # Refused rather than ignored: a typo that silently exempted nothing is how a manager stays watched...
             if k not in WO_KINDS:
                 raise _err(f"{where}.exempt_kinds: {k!r} is not a work-order kind "
                            f"(known: {sorted(WO_KINDS)})")
@@ -2531,15 +1454,7 @@ def _parse_fleet_health(raw: Any, base: FleetHealthConfig | None = None,
 
 def _parse_navigation(raw: Any, base: NavigationConfig | None = None,
                       where: str = "os.navigation") -> NavigationConfig:
-    """`os.navigation`, or a project's override of it — `_parse_inspect`'s field-level
-    inheritance exactly: a project naming one key keeps the OS answer for the rest, so
-    no caller consults two objects.
-
-    Three refusals, each because the failure is silent otherwise: a pattern list that is
-    not a list of strings; an EMPTY pattern list, which makes an empty classifier report
-    0% everywhere and read as a win; and a window below a day or a suffix with no leading
-    dot, both of which measure nothing while looking measured.
-    """
+    """`os.navigation`, or a project's override of it"""
     base = base or NavigationConfig()
     if not isinstance(raw, dict):
         raise _err(f'"{where}" must be an object')
@@ -2562,10 +1477,9 @@ def _parse_navigation(raw: Any, base: NavigationConfig | None = None,
         symbol_tools=patterns("symbol_tools", base.symbol_tools),
         text_search_tools=patterns("text_search_tools", base.text_search_tools),
         code_suffixes=patterns("code_suffixes", base.code_suffixes),
-        # docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §3.2.
+        # docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §3.2
         doc_suffixes=patterns("doc_suffixes", base.doc_suffixes),
-        # docs/superpowers/specs/2026-10-13-a-confirmation-question-with-a-zero-character-
-        # diff.md: the confirmation tier (c) reads this, so it is NOT a suffix list.
+        # docs/superpowers/specs/2026-10-13-a-confirmation-question-with-a-zero-character- diff.md: the...
         doc_dirs=frozenset(patterns("doc_dirs", tuple(base.doc_dirs))),
         doc_dump_commands=patterns("doc_dump_commands", base.doc_dump_commands),
         window_days=int(raw.get("window_days", base.window_days)),
@@ -2582,25 +1496,7 @@ def _parse_navigation(raw: Any, base: NavigationConfig | None = None,
 
 def _parse_cost(raw: Any, base: CostConfig | None = None,
                 where: str = "os.cost") -> CostConfig:
-    """`os.cost`, or a project's override of it, with absurd values refused.
-
-    `base` is the same field-level inheritance `_parse_inspect` uses (kn-6ca2bcd9):
-    `os.cost` parses against the shipped defaults and each project parses against the OS
-    answer, so no caller consults two objects.
-
-    THE FOUR VOCABULARIES ARE KEPT APART because `_parse_inspect`'s ">= 1" rule serves
-    none of them. A WEEKDAY is 0..6 and a reset HOUR is 0..23 — zero is LEGAL in both,
-    and ">= 1" would reject Monday and midnight. A PERCENTILE is refused outside
-    `(0, 1)`, both ends exclusive: 0 names no observation and 1 is the maximum, which the
-    report already carries beside it. A COUNT of orders to walk is refused below 1, where
-    zero would report an empty distribution rather than fail. A ZONE must construct a
-    `ZoneInfo` or the window is silently wrong every week, so it is refused naming the
-    value typed. A DIVISOR (`chars_per_token`) is refused at or below zero, where the
-    rule is not ">= 1" because 3.5 characters per token is a legal belief about a model
-    family; a ROW COUNT (`tool_rows`) takes the count rule.
-
-    Spec §6 of docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md.
-    """
+    """`os.cost`, or a project's override of it, with absurd values refused (docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md)"""
     base = base or CostConfig()
     if not isinstance(raw, dict):
         raise _err(f'"{where}" must be an object')
@@ -2653,13 +1549,11 @@ def _parse_cost(raw: Any, base: CostConfig | None = None,
                    f"a divisor, and a negative one would report negative tokens")
     if cfg.tool_rows < 1:
         raise _err(f"{where}.tool_rows must be >= 1")
-    # A LENGTH, not a count: 2.5 hours is a legal belief about the grid, so the test is
-    # strictly positive (§7 of the window-selector spec).
+    # A LENGTH, not a count: 2.5 hours is a legal belief about the grid
     if cfg.session_window_hours <= 0:
         raise _err(f"{where}.session_window_hours must be > 0 — "
                    f"{cfg.session_window_hours} is not a length of time")
-    # The meter's seven. Each takes the vocabulary it belongs to: LENGTHS and a DIVISOR
-    # are refused at or below zero, COUNTS below 1 (§§4, 5, 8 of the usage-meter spec).
+    # The meter's seven
     for name in ("meter_nearest_seconds", "meter_calibration_min_minutes",
                  "meter_calibration_min_points", "meter_calibration_days",
                  "meter_dollars_per_point"):
@@ -2671,13 +1565,12 @@ def _parse_cost(raw: Any, base: CostConfig | None = None,
         if getattr(cfg, name) < 1:
             raise _err(f"{where}.{name} must be >= 1 — zero would fire on the first "
                        f"failed read, which is a blip and not an outage")
-    # A SHARE of the implied spend, so strictly inside (0, 1]: zero alarms on every
-    # window and above one can never fire (§8).
+    # A SHARE of the implied spend, so strictly inside (0
     for name in ("meter_outside_alert_share", "meter_residual_alert_share"):
         if not 0 < getattr(cfg, name) <= 1:
             raise _err(f"{where}.{name} must be inside (0, 1] — {getattr(cfg, name)} "
                        f"is not a share of the implied spend")
-    # A FLOOR in dollars, and zero is legal: it means every window is big enough.
+    # A FLOOR in dollars, and zero is legal: it means every window is big enough
     if cfg.meter_alert_min_usd < 0:
         raise _err(f"{where}.meter_alert_min_usd must be >= 0 — "
                    f"{cfg.meter_alert_min_usd} is not an amount of money")
@@ -2692,13 +1585,7 @@ def _parse_cost(raw: Any, base: CostConfig | None = None,
 
 def _parse_observability(raw: Any, base: ObservabilityConfig | None = None,
                         where: str = "os.observability") -> ObservabilityConfig:
-    """`os.observability`, or a project's override of it — field-level, like
-    `_parse_inspect`: `os.observability` parses against the shipped default and each
-    project against the OS answer, so one caller reads one object.
-
-    An unknown level is REFUSED naming the legal three, on `GateConfig.parse`'s rule: a
-    typo in `jarvis config set` must not silently leave debugging off.
-    """
+    """`os.observability`, or a project's override of it"""
     base = base or ObservabilityConfig()
     if not isinstance(raw, dict):
         raise _err(f'"{where}" must be an object')
@@ -2711,15 +1598,7 @@ def _parse_observability(raw: Any, base: ObservabilityConfig | None = None,
 
 def _parse_rules(raw: Any, base: RulesConfig | None = None,
                  where: str = "os.rules") -> RulesConfig:
-    """`os.rules`, or a project's override of it — field-level, like `_parse_inspect`.
-
-    `false_positive_disarm` is a COUNT and is refused below 1: zero would demote an armed
-    detector the moment it was armed, which makes `jarvis rules arm` a no-op that
-    announces itself (§6, Neo's ruling that this is a catalog setting and not a constant).
-
-    `enabled` needs no validation: a boolean whose default is the shipped `False` when
-    neither the fleet nor the project names it.
-    """
+    """`os.rules`, or a project's override of it — field-level, like `_parse_inspect`"""
     base = base or RulesConfig()
     if not isinstance(raw, dict):
         raise _err(f'"{where}" must be an object')
@@ -2735,13 +1614,7 @@ def _parse_rules(raw: Any, base: RulesConfig | None = None,
 
 def _parse_evolution(raw: Any, base: EvolutionConfig | None = None,
                      where: str = "os.evolution") -> EvolutionConfig:
-    """`os.evolution`, or a project's override of it — field-level, like `_parse_inspect`.
-
-    `min_samples` is validated the way `_parse_concision` refuses a negative cap: 1 is
-    the floor, because a "median" over zero samples is not a statistic that could be
-    computed at all, and the report's own note promises the reader a number of samples it
-    waited for.
-    """
+    """`os.evolution`, or a project's override of it — field-level, like `_parse_inspect`"""
     base = base or EvolutionConfig()
     if not isinstance(raw, dict):
         raise _err(f'"{where}" must be an object')
@@ -2754,8 +1627,7 @@ def _parse_evolution(raw: Any, base: EvolutionConfig | None = None,
         if value < 0:
             raise _err(f"{where}.{key} must be 0 or more, got {value}")
         money[key] = value
-    # `critical_weekly_usd` above `weekly_usd` is not refused: the steward checks both,
-    # so the smaller binds, and lowering the weekly cap alone stays a one-key change.
+    # `critical_weekly_usd` above `weekly_usd` is not refused: the steward checks both
     counts = {}
     for key in ("max_depth", "major_min_refs", "medium_min_refs"):
         value = int(raw.get(key, getattr(base, key)))
@@ -2774,12 +1646,7 @@ def _parse_evolution(raw: Any, base: EvolutionConfig | None = None,
 
 def _parse_concision(raw: Any, base: ConcisionConfig | None = None,
                      where: str = "os.concision") -> ConcisionConfig:
-    """`os.concision`, or a project's override of it — field-level, like `_parse_inspect`.
-
-    Negative is refused; zero is not (see `ConcisionConfig`). A cap below the refusal
-    message's own length would deny every finish and leave the worker no shape of
-    summary that passes, so the floor is the smallest cap a real headline fits in.
-    """
+    """`os.concision`, or a project's override of it — field-level, like `_parse_inspect`"""
     base = base or ConcisionConfig()
     if not isinstance(raw, dict):
         raise _err(f'"{where}" must be an object')
@@ -2800,22 +1667,14 @@ def _parse_concision(raw: Any, base: ConcisionConfig | None = None,
 
 def _parse_bugs(raw: Any, base: BugsConfig | None = None,
                 where: str = "os.bugs") -> BugsConfig:
-    """`os.bugs`, or a project's override of it — field-level, like `_parse_inspect`.
-
-    An empty label is refused rather than silently disabling the in-progress signal:
-    `jarvis config set <p> bugs.label ""` is a plausible typo, and a tracker that
-    quietly stopped saying which issues are being worked is the failure issue #240 is
-    about.
-    """
+    """`os.bugs`, or a project's override of it — field-level, like `_parse_inspect` (#240)"""
     base = base or BugsConfig()
     if not isinstance(raw, dict):
         raise _err(f'"{where}" must be an object')
     label = str(raw.get("label", base.label) or "").strip()
     if not label:
         raise _err(f"{where}.label must not be empty")
-    # SHAPE, not just non-emptiness (review round 1). This string becomes a `gh` argument
-    # (`issues.checked_label` is the layer that cannot be skipped); catching it here is
-    # what lets the message name the key the typo is in.
+    # SHAPE, not just non-emptiness (review round 1)
     from .issues import LABEL_RE
     if not LABEL_RE.match(label):
         raise _err(f"{where}.label must start with a letter or digit and use only "
@@ -2825,12 +1684,7 @@ def _parse_bugs(raw: Any, base: BugsConfig | None = None,
 
 def _parse_release(raw: Any, base: ReleaseConfig | None = None,
                    where: str = "os.release") -> ReleaseConfig:
-    """`os.release`, or a project's override of it — field-level, like `_parse_inspect`.
-
-    Refused rather than clamped below 1, for that function's reason: a window of 0 days
-    means the sweep can never see anything, and it arrives by a typo in a
-    `jarvis config set` that this is the last place able to name.
-    """
+    """`os.release`, or a project's override of it — field-level, like `_parse_inspect`"""
     base = base or ReleaseConfig()
     if not isinstance(raw, dict):
         raise _err(f'"{where}" must be an object')
@@ -2845,12 +1699,7 @@ def _parse_release(raw: Any, base: ReleaseConfig | None = None,
 
 def _parse_messaging(raw: Any, base: MessagingConfig | None = None,
                      where: str = "os.messaging") -> MessagingConfig:
-    """`os.messaging`, or a project's override of it — field-level, like `_parse_inspect`.
-
-    Refused rather than clamped below 1, for that function's reason: zero would call
-    every message the fleet has just queued stuck, and it arrives by a typo in a
-    `jarvis config set` that this is the last place able to name.
-    """
+    """`os.messaging`, or a project's override of it — field-level, like `_parse_inspect`"""
     base = base or MessagingConfig()
     if not isinstance(raw, dict):
         raise _err(f'"{where}" must be an object')
@@ -2865,12 +1714,7 @@ def _parse_messaging(raw: Any, base: MessagingConfig | None = None,
 
 def _parse_pull_requests(raw: Any, base: PullRequestsConfig | None = None,
                          where: str = "os.pull_requests") -> PullRequestsConfig:
-    """`os.pull_requests`, or a project's override — field-level, like `_parse_messaging`.
-
-    Refused rather than clamped below 1 for that function's reason, with one of its own:
-    zero would call every fresh UNKNOWN a stall, and a fresh UNKNOWN is what an ordinary
-    push looks like (kn-5e93939e).
-    """
+    """`os.pull_requests`, or a project's override — field-level, like `_parse_messaging`"""
     base = base or PullRequestsConfig()
     if not isinstance(raw, dict):
         raise _err(f'"{where}" must be an object')
@@ -2886,16 +1730,7 @@ def _parse_pull_requests(raw: Any, base: PullRequestsConfig | None = None,
 
 def _parse_wiring(raw: Any, base: WiringConfig | None = None,
                   where: str = "os.wiring") -> WiringConfig:
-    """`os.wiring`, or a project's override of it — field-level, like `_parse_inspect`.
-
-    The ids are NOT validated against what the machine currently has, and that is the
-    one decision here worth stating. A catalog is read by the daemon on a box where the
-    user's Claude configuration can change under it — uninstall a plugin and a list that
-    named it would fail the whole catalog, taking the fleet down over a deselection that
-    has simply come true. An id naming nothing is inert, exactly as an allow rule naming
-    an absent tool is (`dispatch.SERENA_TOOL_PREFIXES`); `jarvis config wiring` is where
-    a stale entry is visible, and it says so there.
-    """
+    """`os.wiring`, or a project's override of it — field-level, like `_parse_inspect`"""
     base = base or WiringConfig()
     if not isinstance(raw, dict):
         raise _err(f'"{where}" must be an object')
@@ -2917,12 +1752,7 @@ def _parse_wiring(raw: Any, base: WiringConfig | None = None,
 
 def _parse_worktree(raw: Any, base: WorktreeConfig | None = None,
                     where: str = "os.worktree") -> WorktreeConfig:
-    """`os.worktree`, or a project's override of it — field-level, like `_parse_wiring`.
-
-    An absolute path and any entry containing `..` fail the whole catalog: the value is
-    handed to `git -C <worktree> update-index`, and a path escaping the worktree would
-    mark a file in the shared checkout — which is the one place Part B must not touch.
-    """
+    """`os.worktree`, or a project's override of it — field-level, like `_parse_wiring`"""
     base = base or WorktreeConfig()
     if not isinstance(raw, dict):
         raise _err(f'"{where}" must be an object')
@@ -2941,12 +1771,7 @@ def _parse_worktree(raw: Any, base: WorktreeConfig | None = None,
 
 def _parse_schedule(raw: Any, base: ScheduleConfig | None = None,
                    where: str = "os.schedule") -> ScheduleConfig:
-    """`os.schedule`, or a project's override of it — field-level, like `_parse_inspect`.
-
-    `jobs` is validated against `schedule.JOBS` rather than accepted as written: an id
-    that names no job would otherwise be a job that silently never runs, and the whole
-    point of this block is that the user can tell what the OS is about to do on its own.
-    """
+    """`os.schedule`, or a project's override of it — field-level, like `_parse_inspect`"""
     base = base or ScheduleConfig()
     if not isinstance(raw, dict):
         raise _err(f'"{where}" must be an object')
@@ -2972,22 +1797,13 @@ def _parse_schedule(raw: Any, base: ScheduleConfig | None = None,
     return cfg
 
 
-#: Fields of `SupervisorConfig` that are NOT whole numbers. The reflective parse below
-#: casts everything else with `int()`, so a non-numeric field missing from this set is a
-#: `TypeError` on every catalog load — or, for a bool, a silent `int(False) == 0` that
-#: trips the `>= 1` floor instead and blames the wrong key.
+#: Fields of `SupervisorConfig` that are NOT whole numbers
 _SUPERVISOR_NON_NUMERIC = ("enabled", "model", "probes", "health_enabled", "remedies",
                            "health_reassert_blockers")
 
 
 def _parse_remedies(raw: Any, base: RemedyConfig, where: str) -> RemedyConfig:
-    """`supervisor.remedies`, or a project's override of it — field-level, like the rest.
-
-    An unknown id is refused with the known ones named. Same call `GateConfig.parse`
-    makes about an unknown gate name and for the same reason: a permission the user
-    believes they granted, silently unset, is the failure this whole block exists to
-    make impossible.
-    """
+    """`supervisor.remedies`, or a project's override of it — field-level, like the rest"""
     from . import remedies as remedies_mod
 
     if raw is None:
@@ -3006,12 +1822,7 @@ def _parse_remedies(raw: Any, base: RemedyConfig, where: str) -> RemedyConfig:
 
 
 def _parse_blockers(raw: Any, base: tuple[str, ...], where: str) -> tuple[str, ...]:
-    """`supervisor.health_reassert_blockers`, or a project's override — field-level.
-
-    `_parse_remedies`' shape exactly, including the refusal of an unknown id with the
-    known ones named: a setting the user believes they changed, silently unset, is the
-    failure this block exists to prevent.
-    """
+    """`supervisor.health_reassert_blockers`, or a project's override — field-level"""
     if raw is None:
         return tuple(base)
     if isinstance(raw, (str, bytes)) or not isinstance(raw, (list, tuple)):
@@ -3026,13 +1837,7 @@ def _parse_blockers(raw: Any, base: tuple[str, ...], where: str) -> tuple[str, .
 
 def _parse_probes(raw: Any, base: tuple[probes_mod.HealthProbe, ...],
                   where: str) -> tuple[probes_mod.HealthProbe, ...]:
-    """`supervisor.probes` merged over `base` by id — `probes.resolve`'s rule (§2).
-
-    Shape is refused HERE, where the message can name the offending id, and the merge
-    happens in `probes` because the merge rule is that module's decision. An entry names
-    only the fields it changes, so an unknown key is IGNORED rather than refused — the
-    same forward compatibility `parse_catalog` gives every other block.
-    """
+    """`supervisor.probes` merged over `base` by id — `probes.resolve`'s rule (§2)"""
     if raw is None:
         return tuple(base)
     if not isinstance(raw, list):
@@ -3078,8 +1883,7 @@ def _parse_probes(raw: Any, base: tuple[probes_mod.HealthProbe, ...],
 
 
 def _check_probes(cfg: SupervisorConfig, where: str) -> None:
-    """The refusals that need the RESOLVED list and the numbers beside it, so they run
-    after both exist."""
+    """The refusals that need the RESOLVED list and the numbers beside it, so they run after both exist"""
     for probe in cfg.probes:
         if probe.id in probes_mod.RESERVED_IDS:
             raise _err(f"{where}: probe id {probe.id!r} is one of `jarvis inspect`'s "
@@ -3098,15 +1902,7 @@ def _check_probes(cfg: SupervisorConfig, where: str) -> None:
 
 def _parse_supervisor(raw: Any, base: SupervisorConfig | None = None,
                       where: str = "os.supervisor") -> SupervisorConfig:
-    """`os.supervisor`, or a project's override of it — §2, and `_parse_inspect`'s shape.
-
-    Every number is refused below 1, and `timeout` at or above `stale_reviewing_seconds`:
-    below that cutoff a claim is reclaimed out from under a call that is still running
-    and one alarm is judged twice. The numeric fields are read reflectively so a field
-    added above reaches the catalog with no edit here — which is why the exclusion set is
-    a named constant and every non-number must join it. Excluding a field is only half
-    the fix: it must then be read explicitly below, or the catalog can never set it.
-    """
+    """`os.supervisor`, or a project's override of it — §2, and `_parse_inspect`'s shape"""
     base = base or SupervisorConfig()
     if not isinstance(raw, dict):
         raise _err(f'"{where}" must be an object')
@@ -3165,11 +1961,11 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         default_permission_mode=defaults.get("permission_mode", DEFAULT_PERMISSION_MODE),
         default_bash_first=defaults.get("bash_first", DEFAULT_WORKER_BASH_FIRST),
         default_tool_search=defaults.get("tool_search", DEFAULT_WORKER_TOOL_SEARCH),
-        # Spec 2026-10-15-the-hour-on-worker-turns-only.md §1.
+        # Spec 2026-10-15-the-hour-on-worker-turns-only.md §1
         default_cache_ttl=defaults.get("cache_ttl", DEFAULT_WORKER_CACHE_TTL),
-        # Spec 2026-10-02-serena-the-cheap-path.md §6.
+        # Spec 2026-10-02-serena-the-cheap-path.md §6
         default_py_nav_hook=defaults.get("py_nav_hook", DEFAULT_WORKER_PY_NAV_HOOK),
-        # Spec 2026-10-06-navigate-specs-like-code.md §5.
+        # Spec 2026-10-06-navigate-specs-like-code.md §5
         default_doc_nav_hook=defaults.get("doc_nav_hook", DEFAULT_WORKER_DOC_NAV_HOOK),
         default_doc_read_limit_lines=_doc_read_limit_or_err(
             defaults, "os.defaults.doc_read_limit_lines",
@@ -3226,23 +2022,23 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
     )
     if os_cfg.default_permission_mode not in VALID_PERMISSION_MODES:
         raise _err(f"os.defaults.permission_mode {os_cfg.default_permission_mode!r} not in {sorted(VALID_PERMISSION_MODES)}")
-    # Spec 2026-10-01-the-steer-that-beat-the-brief.md §1.
+    # Spec 2026-10-01-the-steer-that-beat-the-brief.md §1
     if os_cfg.default_bash_first not in VALID_BASH_FIRST:
         raise _err(f"os.defaults.bash_first {os_cfg.default_bash_first!r} not in "
                    f"{sorted(VALID_BASH_FIRST)}")
-    # Spec 2026-10-02-serena-the-cheap-path.md §4.
+    # Spec 2026-10-02-serena-the-cheap-path.md §4
     if os_cfg.default_tool_search not in VALID_TOOL_SEARCH:
         raise _err(f"os.defaults.tool_search {os_cfg.default_tool_search!r} not in "
                    f"{sorted(VALID_TOOL_SEARCH)}")
-    # Spec 2026-10-15-the-hour-on-worker-turns-only.md §1.
+    # Spec 2026-10-15-the-hour-on-worker-turns-only.md §1
     if os_cfg.default_cache_ttl not in VALID_WORKER_CACHE_TTL:
         raise _err(f"os.defaults.cache_ttl {os_cfg.default_cache_ttl!r} not in "
                    f"{sorted(VALID_WORKER_CACHE_TTL)}")
-    # Spec 2026-10-02-serena-the-cheap-path.md §6.
+    # Spec 2026-10-02-serena-the-cheap-path.md §6
     if os_cfg.default_py_nav_hook not in VALID_PY_NAV_HOOK:
         raise _err(f"os.defaults.py_nav_hook {os_cfg.default_py_nav_hook!r} not in "
                    f"{sorted(VALID_PY_NAV_HOOK)}")
-    # Spec 2026-10-06-navigate-specs-like-code.md §5.
+    # Spec 2026-10-06-navigate-specs-like-code.md §5
     if os_cfg.default_doc_nav_hook not in VALID_DOC_NAV_HOOK:
         raise _err(f"os.defaults.doc_nav_hook {os_cfg.default_doc_nav_hook!r} not in "
                    f"{sorted(VALID_DOC_NAV_HOOK)}")
@@ -3258,8 +2054,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
     projects_raw = data.get("projects", [])
     if not isinstance(projects_raw, list):
         raise _err('"projects" must be a list')
-    # An empty fleet is valid: a standby instance (e.g. a fresh production
-    # deployment) boots with no projects and has them onboarded later.
+    # An empty fleet is valid: a standby instance (e.g. a fresh production deployment) boots with no...
 
     projects: list[ProjectSpec] = []
     seen: set[str] = set()
@@ -3281,33 +2076,27 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         pmode = w.get("permission_mode", os_cfg.default_permission_mode)
         if pmode not in VALID_PERMISSION_MODES:
             raise _err(f"project {name}: worker.permission_mode {pmode!r} invalid")
-        # Spec 2026-10-01-the-steer-that-beat-the-brief.md §1 — this message IS what
-        # `jarvis config set <project> worker.bash_first` shows: `ops.set_config`
-        # re-parses the document to validate.
+        # Spec 2026-10-01-the-steer-that-beat-the-brief.md §1
         bash_first = w.get("bash_first", os_cfg.default_bash_first)
         if bash_first not in VALID_BASH_FIRST:
             raise _err(f"project {name}: worker.bash_first {bash_first!r} not in "
                        f"{sorted(VALID_BASH_FIRST)}")
-        # Spec 2026-10-02-serena-the-cheap-path.md §4 — this message IS what
-        # `jarvis config set <project> worker.tool_search` shows.
+        # Spec 2026-10-02-serena-the-cheap-path.md §4
         tool_search = w.get("tool_search", os_cfg.default_tool_search)
         if tool_search not in VALID_TOOL_SEARCH:
             raise _err(f"project {name}: worker.tool_search {tool_search!r} not in "
                        f"{sorted(VALID_TOOL_SEARCH)}")
-        # Spec 2026-10-15-the-hour-on-worker-turns-only.md §1 — this message IS what
-        # `jarvis config set <project> worker.cache_ttl` shows.
+        # Spec 2026-10-15-the-hour-on-worker-turns-only.md §1
         cache_ttl = w.get("cache_ttl", os_cfg.default_cache_ttl)
         if cache_ttl not in VALID_WORKER_CACHE_TTL:
             raise _err(f"project {name}: worker.cache_ttl {cache_ttl!r} not in "
                        f"{sorted(VALID_WORKER_CACHE_TTL)}")
-        # Spec 2026-10-02-serena-the-cheap-path.md §6 — this message IS what
-        # `jarvis config set <project> worker.py_nav_hook` shows.
+        # Spec 2026-10-02-serena-the-cheap-path.md §6
         py_nav_hook = w.get("py_nav_hook", os_cfg.default_py_nav_hook)
         if py_nav_hook not in VALID_PY_NAV_HOOK:
             raise _err(f"project {name}: worker.py_nav_hook {py_nav_hook!r} not in "
                        f"{sorted(VALID_PY_NAV_HOOK)}")
-        # Spec 2026-10-06-navigate-specs-like-code.md §5 — this message IS what
-        # `jarvis config set <project> worker.doc_nav_hook` shows.
+        # Spec 2026-10-06-navigate-specs-like-code.md §5
         doc_nav_hook = w.get("doc_nav_hook", os_cfg.default_doc_nav_hook)
         if doc_nav_hook not in VALID_DOC_NAV_HOOK:
             raise _err(f"project {name}: worker.doc_nav_hook {doc_nav_hook!r} not in "
@@ -3460,7 +2249,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
 
 
 def validate_paths(catalog: Catalog) -> list[str]:
-    """Return human-readable problems with project paths (missing dir, not a git repo)."""
+    """Return human-readable problems with project paths (missing dir, not a git repo)"""
     problems = []
     for p in catalog.projects:
         if not p.path.is_dir():

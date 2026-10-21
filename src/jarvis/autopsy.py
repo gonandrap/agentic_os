@@ -1,49 +1,4 @@
-"""The sealed autopsy: one order's anatomy frozen onto its row, so it outlives the files.
-
-`inspection.read_session` answers "where did this order's time and context go" by walking
-the transcripts Claude Code wrote — the session file, the subagent files beside it, the
-result envelopes. Claude Code prunes all of them on its own schedule, so an order
-inspected long after it settled reports a clock that got SHORTER as its evidence aged,
-which is `bill`'s kn-3629fa87 one level up. This module freezes the reading at settle.
-
-## The seal is not the rendering, and that is the trap this module exists to avoid
-
-`Anatomy.as_dict` is a RENDER: `Turn.as_dict` emits `api_calls: len(self.calls)` and a
-folded `usage`, and carries neither `Turn.calls` nor `active_ended`. Rehydrate from it and
-`observed` goes False, `usage` empty, `context_peak` 0 — `supervisor` would print "NO API
-CALL WAS EVER MADE — it cost nothing." for a turn that made 32 (issue #227, recreated
-inside the persistence meant to fix it). So `to_seal` and `from_seal` are a dedicated
-round-trippable pair over the dataclass FIELDS, and `as_dict` stays the SINGLE render
-contract, computed FROM the rehydrated object.
-
-## Seal only what expires
-
-HOLDS ARE NOT SEALED: `holds.held` reads the OS's own per-project database, which never
-expires, and sealing would freeze an episode that was OPEN at seal time. `from_seal` takes
-`spans=` exactly as `read_session` does and re-runs `inspection._attach_holds`.
-`wo_turns.usage_json` and `wo_turns.context_json` are not sealed either: already durable.
-The module legends (`hold_causes`, `PARTS`, `subagent_depth_read`, `param_caps`) are
-re-derived at render, so a raised cap is reflected on an old seal. And span `params` are
-sealed AT `full` AND AT NO OTHER LEVEL: tool parameters are what that level buys, which is
-§6 of docs/superpowers/specs/2026-09-27-order-autopsy-durability.md — redacted file contents and Bash
-command lines in a store that does not expire, so at `normal` the payload holds no `params`
-key at all rather than an empty one.
-
-## Nothing is ever silently dropped
-
-Every cap folds rather than truncates, and a fold carries NUMBERS that reconcile against
-the uncapped reading: folded span seconds per tool name (so they add back to both
-`Turn.tools` and `Turn.blocked`), and folded calls as per-model sums with a message count,
-a context peak, a TTL split and a cache-write total — the four figures `Turn.usage`,
-`Turn.context_peak`, `Anatomy.cache_ttl` and `Anatomy.rewrite_excess` would otherwise
-misreport. `from_seal` never invents a synthetic call to stand in for a folded one: a
-fabricated row would read as an API call that happened.
-
-## What turns it on
-
-`records_autopsy` is the observability level: every order is sealed unless its project (or
-the order itself) is at `off`, which is §5 of the spec above and the user's ruling.
-"""
+"""The sealed autopsy: one order's anatomy frozen onto its row, so it outlives the files (#227)"""
 
 from __future__ import annotations
 
@@ -55,63 +10,50 @@ from . import db, inspection, navigation, observability
 from . import usage as usage_mod
 from .bill import TURN_CALL_LIMIT  # ONE definition of "how many calls a seal keeps"
 
-#: Schema version of a SEALED payload. Bump it when a field is added that a reader of an
-#: old seal would otherwise never get; `_upgrade_seal` re-derives such a seal ONCE, from
-#: the stored payload alone.
-#:
-#: 1 — the original payload.
-#: 2 — `ToolSpan.navigates_source`, the navigation reading of §3.
+#: Schema version of a SEALED payload
 PAYLOAD_VERSION = 2
 
-#: How many tool spans one TURN carries into a seal, the dearest by seconds. A long turn
-#: can run to thousands of spans and a seal is stored, not derived on demand; the rest are
-#: folded into `spans_folded` with their seconds per tool name, never dropped.
+#: How many tool spans one TURN carries into a seal, the dearest by seconds
 TURN_SPAN_LIMIT = 500
 
-#: How many subagents one TURN carries. Depth was already bounded by
-#: `inspection.SUBAGENT_DEPTH_READ`; breadth was not.
+#: How many subagents one TURN carries
 SUBAGENT_LIMIT = 20
 
-#: The whole payload's ceiling, in bytes of JSON. Reached only by a pathological order,
-#: and then the DROP ORDER below applies — announced, never silent.
+#: The whole payload's ceiling, in bytes of JSON
 PAYLOAD_CEILING = 1_000_000
 
 NORMAL, FULL = "normal", "full"
-#: A seal written before `autopsy_level` existed. A THIRD state: without it "no params" is
-#: ambiguous between "sealed at `normal`" and "this order ran no tools".
+#: A seal written before `autopsy_level` existed
 UNKNOWN = "unknown"
 
-#: What the ceiling gives up, in order. The two params rungs bite on a `full` seal only:
-#: params are sealed at `full` and at no other level, which is §6.
+#: What the ceiling gives up, in order
 _DROP_ORDER = ("params", "subagent_params", "subagent_spans", "spans_over_limit")
 
-#: Per-turn keys that hold folded NUMBERS rather than sealed objects — carried across an
-#: upgrade verbatim, because the stored payload is the only place they exist.
+#: Per-turn keys that hold folded NUMBERS rather than sealed objects
 _FOLD_KEYS = ("spans_folded", "calls_folded", "subagents_folded")
 
 
 def records_autopsy(wo: dict[str, Any], cfg: Any) -> bool:
-    """Whether this order's autopsy is sealed at all — §5: every level but `off` seals."""
+    """Whether this order's autopsy is sealed at all — §5: every level but `off` seals"""
     return observability.level_for(wo, cfg) != observability.OFF
 
 
 def level_of(payload: dict[str, Any]) -> str:
-    """The level a stored payload was sealed at, or `UNKNOWN` for one that predates it."""
+    """The level a stored payload was sealed at, or `UNKNOWN` for one that predates it"""
     return str(payload.get("autopsy_level") or UNKNOWN)
 
 
-# -- sealing ---------------------------------------------------------------------------
+# -- sealing
 
 
 def _span(span: inspection.ToolSpan, *, params: bool) -> dict[str, Any]:
-    # `backgrounded` at EVERY level: `ToolSpan.is_join` derives from it (Neo 1124).
+    # `backgrounded` at EVERY level: `ToolSpan.is_join` derives from it (Neo 1124)
     row: dict[str, Any] = {"name": span.name, "tool_id": span.tool_id,
                            "started": span.started, "ended": span.ended,
                            "detail": span.detail, "backgrounded": span.backgrounded,
-                           # §3: at EVERY level, for `backgrounded`'s reason — the
-                           # command it was derived from is only sealed at `full`.
+                           # §3: at EVERY level, for `backgrounded`'s reason
                            "navigates_source": span.navigates_source}
-    # §6: the parameters are what `full` buys, so at `normal` none of the three keys exist.
+    # §6: the parameters are what `full` buys, so at `normal` none of the three keys exist
     if params:
         row["params"] = span.params
         row["params_truncated"] = span.params_truncated
@@ -132,7 +74,7 @@ def _write(write: inspection.Write) -> dict[str, Any]:
 
 
 def _boundary(boundary: usage_mod.Boundary) -> dict[str, Any]:
-    # Spec §3: the census expires with the transcript, so it is sealed (holds are not).
+    # Spec §3: the census expires with the transcript, so it is sealed (holds are not)
     return {"ts": boundary.ts, "cause": boundary.cause,
             "cache_write": boundary.cache_write, "cache_read": boundary.cache_read,
             "gap": boundary.gap}
@@ -144,11 +86,7 @@ def _prompt(prompt: inspection.Prompt) -> dict[str, Any]:
 
 
 def _fold_spans(spans: Sequence[inspection.ToolSpan]) -> dict[str, Any]:
-    """The folded spans as numbers: count, total seconds, and seconds per tool NAME.
-
-    Per name and not per join-ness: `inspection.JOIN_TOOLS` derives the second from the
-    first, so one set of numbers reconciles against `Turn.tools` AND `Turn.blocked`.
-    """
+    """The folded spans as numbers: count, total seconds, and seconds per tool NAME"""
     by_name: dict[str, float] = {}
     for span in spans:
         by_name[span.name] = by_name.get(span.name, 0.0) + span.seconds
@@ -169,12 +107,7 @@ def _merge_folds(first: dict[str, Any] | None,
 
 
 def _fold_calls(calls: Sequence[usage_mod.Call]) -> dict[str, Any]:
-    """The folded calls as the four numbers a fold would otherwise falsify.
-
-    `usage.priced` prices per model, so the per-model sums carry a message count; the
-    context peak is the MAX of the folded calls and never a sum, because a context is what
-    one call carried.
-    """
+    """The folded calls as the four numbers a fold would otherwise falsify"""
     by_model: dict[str, dict[str, int]] = {}
     ttl = {"cache_1h": 0, "cache_5m": 0, "unknown": 0}
     for call in calls:
@@ -204,7 +137,7 @@ def _turn(turn: inspection.Turn, *, params: bool) -> dict[str, Any]:
         "ended": turn.ended, "active_ended": turn.active_ended,
         "awaiting_since": turn.awaiting_since,
         "triggers": [_prompt(p) for p in turn.triggers],
-        # Back in transcript order: the seal is read as a story, not as a ranking.
+        # Back in transcript order: the seal is read as a story, not as a ranking
         "spans": [_span(s, params=params)
                   for s in sorted(kept_spans, key=lambda s: s.started)],
         "calls": [_call(c) for c in sorted(kept_calls, key=lambda c: c.ts)],
@@ -224,33 +157,27 @@ def _subagent(sub: inspection.SubagentAnatomy, *, params: bool) -> dict[str, Any
     return {"task_id": sub.task_id, "label": sub.label, "deeper": sub.deeper,
             "turns": [_turn(t, params=params) for t in sub.turns],
             "writes": [_write(w) for w in sub.writes],
-            # THRESHOLD-FREE, and sealed for the reason spec 2026-10-02 §1.3 gives: a
-            # field the seal drops silently becomes zero on every settled order.
+            # THRESHOLD-FREE, and sealed for the reason spec 2026-10-02 §1.3 gives: a field the seal drops...
             "total_written": sub.total_written, "max_write": sub.max_write,
             "write_floor": sub.write_floor, "api_call_count": sub.api_call_count,
             "boundaries": [_boundary(b) for b in sub.boundaries]}
 
 
 def to_seal(anatomy: inspection.Anatomy, *, level: str) -> dict[str, Any]:
-    """One reading, as the payload frozen onto `work_orders.autopsy_json`.
-
-    `level` is the CALLER'S argument and is recorded from day one: with no gate this
-    child's `seal_autopsies` can only pass `normal`, and §5 is what makes `full` reachable.
-    """
-    # §6: the tool parameters are what `full` buys, decided once for the whole payload.
+    """One reading, as the payload frozen onto `work_orders.autopsy_json`"""
+    # §6: the tool parameters are what `full` buys, decided once for the whole payload
     params = level == FULL
     payload = {
         "payload_v": PAYLOAD_VERSION,
         "autopsy_level": level,
         "session_id": anatomy.session_id,
         "found": anatomy.found,
-        # The floors this reading was taken at: a seal taken at 20000 holds NO write
-        # below 20000, ever, and a report that cannot say so is not reproducible.
+        # The floors this reading was taken at: a seal taken at 20000 holds NO write below 20000
         "write_floor": anatomy.write_floor,
         "join_floor": anatomy.join_floor,
         "unmatched_os_turns": list(anatomy.unmatched_os_turns),
         "writes": [_write(w) for w in anatomy.writes],
-        # Classified ONCE over the session and attributed per turn on the way back in.
+        # Classified ONCE over the session and attributed per turn on the way back in
         "boundaries": [_boundary(b) for b in anatomy.boundaries],
         "unattached_subagents": [_subagent(s, params=params)
                                  for s in anatomy.unattached_subagents],
@@ -260,11 +187,7 @@ def to_seal(anatomy: inspection.Anatomy, *, level: str) -> dict[str, Any]:
 
 
 def _fit(payload: dict[str, Any]) -> dict[str, Any]:
-    """Bring one payload under `PAYLOAD_CEILING`, announcing what it gave up.
-
-    The drop order is `_DROP_ORDER` and each rung is recorded in `dropped_for_size`, the
-    way `params_truncated` and `params_dropped` already announce a truncation.
-    """
+    """Bring one payload under `PAYLOAD_CEILING`, announcing what it gave up"""
     dropped: list[str] = []
     for rung in _DROP_ORDER:
         if len(db.to_json(payload)) <= PAYLOAD_CEILING:
@@ -290,7 +213,7 @@ def _subagent_turns(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _drop_params(turns: Sequence[dict[str, Any]]) -> bool:
-    """Rung 1 and 2: the tool parameters, which only a `full` seal carries — §6."""
+    """Rung 1 and 2: the tool parameters, which only a `full` seal carries — §6"""
     gone = False
     for turn in turns:
         for span in turn.get("spans") or []:
@@ -300,7 +223,7 @@ def _drop_params(turns: Sequence[dict[str, Any]]) -> bool:
 
 
 def _fold_stored_spans(turn: dict[str, Any]) -> bool:
-    """Fold every span this turn still carries into its own numbers."""
+    """Fold every span this turn still carries into its own numbers"""
     spans = turn.get("spans") or []
     if not spans:
         return False
@@ -325,18 +248,11 @@ _RUNGS = {
 }
 
 
-# -- rehydrating -----------------------------------------------------------------------
+# -- rehydrating
 
 
 def _nav_of(row: dict[str, Any]) -> bool | None:
-    """The span's navigation reading, or None when this payload never held one.
-
-    §3: NO default and never `bool(...)` — `bool(None)` is a measured False over a call
-    nobody classified (kn-4d32fe12). A v1 payload is re-derived from the stored
-    `params["command"]` where there is one, and that re-derivation is LOSSY: at `normal`
-    no params were sealed and a `params_dropped` key cannot be recovered, so those spans
-    stay unclassified rather than becoming zero.
-    """
+    """The span's navigation reading, or None when this payload never held one"""
     if "navigates_source" in row:
         return row["navigates_source"]
     command = str((row.get("params") or {}).get("command") or "")
@@ -385,8 +301,7 @@ def _read_turn(row: dict[str, Any]) -> inspection.Turn:
                                     source=p.get("source", "sdk"))
                   for p in row.get("triggers") or []],
         spans=[_read_span(s) for s in row.get("spans") or []],
-        # NO synthetic call for a folded one: a fabricated row would be read as an API
-        # call that happened. The fold's numbers are in the payload and stay there.
+        # NO synthetic call for a folded one: a fabricated row would be read as an API call that happened
         calls=[_read_call(c) for c in row.get("calls") or []],
         subagents=[_read_subagent(s) for s in row.get("subagents") or []])
 
@@ -397,9 +312,7 @@ def _read_subagent(row: dict[str, Any]) -> inspection.SubagentAnatomy:
         deeper=row.get("deeper", 0),
         turns=[_read_turn(t) for t in row.get("turns") or []],
         writes=[_read_write(w) for w in row.get("writes") or []],
-        # NO `0` DEFAULT (spec 2026-10-02 §1.3, as it lands on seals written BEFORE the
-        # keys existed): absent must stay distinguishable from a measured zero, or the
-        # renderer says `wrote nothing to the cache` about 334,427 tokens.
+        # NO `0` DEFAULT (spec 2026-10-02 §1.3
         total_written=row.get("total_written"),
         max_write=row.get("max_write"),
         write_floor=row.get("write_floor"),
@@ -409,14 +322,7 @@ def _read_subagent(row: dict[str, Any]) -> inspection.SubagentAnatomy:
 
 def from_seal(payload: dict[str, Any], *,
               spans: Sequence[inspection.Hold]) -> inspection.Anatomy:
-    """A stored payload back as an `Anatomy`, ready to render through `as_dict`.
-
-    `spans` is REQUIRED — spec §3: defaulted to none, a forgotten argument rehydrates a
-    held order with `held` 0 and the wrong held/active partition, silently.
-    `spans` is `holds.held` for the order, passed in exactly as `read_session` takes it
-    and for the same reason: the holds live in the OS's own database, which never expires,
-    so they are re-attached live rather than frozen.
-    """
+    """A stored payload back as an `Anatomy`, ready to render through `as_dict`"""
     anatomy = inspection.Anatomy(
         session_id=payload.get("session_id", ""),
         found=bool(payload.get("found")),
@@ -432,16 +338,16 @@ def from_seal(payload: dict[str, Any], *,
         unmatched_os_turns=list(payload.get("unmatched_os_turns") or []),
         holds=list(spans))
     inspection._attach_holds(anatomy.turns, anatomy.holds)
-    # Spec §3: the sealed census, back in the turn that paid for each boundary.
+    # Spec §3: the sealed census, back in the turn that paid for each boundary
     inspection._attach_boundaries(anatomy.turns, anatomy.boundaries)
     return anatomy
 
 
-# -- the seal on the row ---------------------------------------------------------------
+# -- the seal on the row
 
 
 def unseal(order: dict[str, Any]) -> dict[str, Any] | None:
-    """The autopsy frozen onto this order when it settled, if there is one."""
+    """The autopsy frozen onto this order when it settled, if there is one"""
     raw = order.get("autopsy_json")
     if not raw:
         return None
@@ -456,12 +362,7 @@ def unseal(order: dict[str, Any]) -> dict[str, Any] | None:
 def seal(project: str, path: Path, order: dict[str, Any], *,
          index: dict[str, list[Path]] | None = None,
          level: str = NORMAL) -> dict[str, Any]:
-    """Read a settled order's session and freeze the reading onto the order. Idempotent.
-
-    The argument construction is `ops.inspect_report`'s, deliberately: one definition of
-    "this order's anatomy" — `inspection.read_session` and NOT `usage.read_session`, two
-    different functions sharing a name.
-    """
+    """Read a settled order's session and freeze the reading onto the order"""
     from . import holds, ops
     from .project_store import ProjectStore
 
@@ -486,32 +387,20 @@ def seal(project: str, path: Path, order: dict[str, Any], *,
     return payload
 
 
-# -- the versioned re-seal -------------------------------------------------------------
+# -- the versioned re-seal
 
 
 def _upgrade_seal(project: str, path: Path, order: dict[str, Any],
                   sealed: dict[str, Any]) -> dict[str, Any] | None:
-    """Re-derive a seal written before this module sealed a field it seals now.
-
-    FROM THE STORED PAYLOAD ONLY, and that is the one place a naive copy of
-    `bill._upgrade_seal` is wrong: a bill re-reads its sources, but an autopsy's sources
-    are transcripts that Claude Code has probably pruned by the time a version is bumped,
-    and a fresh reading of a pruned transcript would overwrite good data with `found:
-    false`. A caller that DOES have a fresh reading to offer asks `adopts_fresh_reading`.
-
-    `autopsy_sealed_at` is preserved — when the order settled is not changed by
-    re-deriving its payload — and `resealed_at` records that the re-derivation happened.
-    Returns None when there is nothing to upgrade or the upgrade cannot be done, and the
-    old seal stands. Never raises: a seal that cannot be upgraded is still a seal.
-    """
+    """Re-derive a seal written before this module sealed a field it seals now"""
     from .project_store import ProjectStore
 
     if (sealed.get("payload_v") or 1) >= PAYLOAD_VERSION:
         return None
     try:
-        # Spec §3: the upgrade re-derives the payload only, so it attaches no live holds.
+        # Spec §3: the upgrade re-derives the payload only, so it attaches no live holds
         fresh = to_seal(from_seal(sealed, spans=[]), level=level_of(sealed))
-        # The folds are numbers no rehydration can recover, so they come across verbatim.
+        # The folds are numbers no rehydration can recover, so they come across verbatim
         for old, new in zip(sealed.get("turns") or [], fresh["turns"]):
             for key in _FOLD_KEYS:
                 if key in old:
@@ -532,7 +421,7 @@ def _upgrade_seal(project: str, path: Path, order: dict[str, Any],
 
 
 def _counts(payload: dict[str, Any]) -> dict[str, int]:
-    """What one SEALED payload holds, folded remainders included."""
+    """What one SEALED payload holds, folded remainders included"""
     turns = payload.get("turns") or []
     spans = sum(len(t.get("spans") or []) + (t.get("spans_folded") or {}).get("count", 0)
                 for t in turns)
@@ -550,18 +439,7 @@ def _fresh_counts(anatomy: inspection.Anatomy) -> dict[str, int]:
 
 def adopts_fresh_reading(sealed: dict[str, Any],
                          fresh: inspection.Anatomy) -> bool:
-    """May a FRESH reading replace this seal? By STRUCTURED COUNTS, at the SAME FLOORS.
-
-    An autopsy has NO monotone quantity, which is why this is not `bill`'s "never shrink":
-    a parser fix can yield fewer spans and a raised floor fewer writes. So a fresh reading
-    is adopted only when it found the transcript AND its turns, spans, calls and writes are
-    EACH at least the seal's, taken at the floors the seal was taken at — a fresh read at a
-    higher floor showing fewer writes is a floor artefact and is refused.
-
-    Never by rendered prose (`bill._corrects_a_reading`'s lesson): an English sentence gets
-    rewritten, and a set difference over sentences made every pre-edit seal look like a
-    reading that had just lost evidence.
-    """
+    """May a FRESH reading replace this seal?"""
     if not fresh.found:
         return False
     if (fresh.write_floor, fresh.join_floor) != (sealed.get("write_floor"),
@@ -571,20 +449,11 @@ def adopts_fresh_reading(sealed: dict[str, Any],
     return all(now[key] >= was[key] for key in was)
 
 
-# -- the read chokepoint ---------------------------------------------------------------
-#
-# THE AUTHORITY SPLIT, and it is a rule rather than a remark (spec §2): the BILL is the
-# authority for MONEY, because it prefers the result envelope via `ops._turn_usage`; the
-# AUTOPSY is the authority for the CLOCK and for context, because it is transcript
-# arithmetic. They already disagree on real orders and the bill already discloses that it
-# does — a later "fix" that makes them agree breaks one of the two.
+# -- the read chokepoint
 
 DERIVED, SEALED = "derived", "sealed"
 
-#: The three levels as three DIFFERENT sentences. `full` is unreachable until §6 and the
-#: rendering carries it anyway: hard-coding two is what makes "no params" ambiguous one
-#: level down. These describe the LEVEL a seal was taken at, which is a different question
-#: from what §6 says about an EMPTY `params`.
+#: The three levels as three DIFFERENT sentences
 _LEVEL_NOTES = {
     UNKNOWN: ("this autopsy was sealed before the level was recorded, so what it kept is "
               "not stated on it"),
@@ -594,9 +463,7 @@ _LEVEL_NOTES = {
            "redacted"),
 }
 
-#: An EMPTY `params` as three DIFFERENT claims (§6). A different question from
-#: `_LEVEL_NOTES`, which describes what the level keeps: this one says what the emptiness
-#: MEANS, and one sentence for all three would make the level's answer read as the order's.
+#: An EMPTY `params` as three DIFFERENT claims (§6)
 _PARAMS_NOTES = {
     UNKNOWN: ("this autopsy predates the recorded level, so whether it ever held tool "
               "parameters cannot be told from it"),
@@ -606,33 +473,23 @@ _PARAMS_NOTES = {
            "none to record"),
 }
 
-#: The FOURTH claim, and the one that outranks all three above (§6): the params were
-#: recorded at this level and then given up by the ceiling's rungs. Missing from this SEAL,
-#: never from this ORDER — which is the opposite of what `_PARAMS_NOTES[FULL]` would say.
+#: The FOURTH claim, and the one that outranks all three above (§6): the params were recorded at this...
 _PARAMS_DROPPED_NOTE = ("{which} tool parameters were recorded at this level and then "
                         "dropped to fit the payload ceiling, so they are missing from "
                         "this SEAL and not from this ORDER")
 
-#: Which rungs went, as the sentence's subject. Rung 1 is the lead's params, rung 2 the
-#: nested subagents' — and only rung 1 going is why the dropped case cannot wait behind
-#: `any_params`.
+#: Which rungs went, as the sentence's subject
 _DROPPED_WHICH = {
     ("params",): "the lead's",
     ("subagent_params",): "the nested subagents'",
     ("params", "subagent_params"): "the lead's and the nested subagents'",
 }
 
-#: Rule (b) at the state that is neither a reading nor a seal: no session was ever
-#: recorded, so there is nothing to read and nothing was frozen.
+#: Rule (b) at the state that is neither a reading nor a seal: no session was ever recorded
 NOT_RECORDED_NOTE = ("no session id on this order and no sealed autopsy: its clock is "
                      "NOT RECORDED, which is not the same claim as zero")
 
-#: Asked below a sealed floor with the transcript gone, the seal answers at ITS floors and
-#: says what that costs. TWO DIFFERENT BLINDNESSES, so two sentences: the writes were cut
-#: at seal time by `classify_writes` and are genuinely absent, while the spans are all
-#: there and only the cheapest of a long turn were FOLDED — `Anatomy.joins()` filters at
-#: render. One sentence for both would overstate the join half, which is the same defect
-#: as understating it.
+#: Asked below a sealed floor with the transcript gone
 _FLOOR_LEAD = ("the transcript is gone, so this reading is the SEALED one, reported at "
                "the floors it can speak for rather than the ones asked for:")
 _FLOOR_WRITE_NOTE = ("its writes were filtered at seal time at a write floor of "
@@ -642,8 +499,7 @@ _FLOOR_JOIN_NOTE = ("the cheapest spans of a long turn are folded into `spans_fo
                     "seal time, so below the sealed join floor of {join:.0f}s a folded "
                     "span is missing from the list rather than absent from the session.")
 
-#: Derived while a seal EXISTS. Rule (a) is about attribution, and "derived" alone cannot
-#: be told from an order that never had a seal at all.
+#: Derived while a seal EXISTS
 _DERIVED_BELOW_NOTE = ("derived from the session transcript at a write floor of "
                        "{write:,} tokens and a join floor of {join:.0f}s BECAUSE that is "
                        "below this order's seal, taken at {sealed_write:,} tokens and "
@@ -651,18 +507,13 @@ _DERIVED_BELOW_NOTE = ("derived from the session transcript at a write floor of 
 
 
 def autopsy_level_note(level: str) -> str:
-    """What a seal taken at `level` kept — three states, three sentences."""
+    """What a seal taken at `level` kept — three states, three sentences"""
     return _LEVEL_NOTES.get(level, _LEVEL_NOTES[UNKNOWN])
 
 
 def params_note(level: str, any_params: bool,
                 dropped: Sequence[str] = ()) -> str:
-    """What an EMPTY `params` means at this level — §6. Nothing, when there are any.
-
-    The CEILING is answered first and before `any_params`: with only rung 1 gone the
-    subagents' params are still there, so a short-circuit would leave the lead's missing
-    ones unexplained, and at `full` with both gone the "ran no tools" sentence is false.
-    """
+    """What an EMPTY `params` means at this level — §6"""
     went = tuple(rung for rung in ("params", "subagent_params") if rung in dropped)
     if went:
         return _PARAMS_DROPPED_NOTE.format(which=_DROPPED_WHICH[went])
@@ -673,16 +524,11 @@ def params_note(level: str, any_params: bool,
 
 def _at_floors(sealed: dict[str, Any], spans: Sequence[inspection.Hold],
                write: Any, join: Any) -> inspection.Anatomy:
-    """One stored payload back, reported at the floors it can actually speak for.
-
-    The requested floors are carried VERBATIM and never coerced: rule (a) is equality of
-    the rendered payload, and an `int` floor answered as a `float` is a disagreement.
-    """
+    """One stored payload back, reported at the floors it can actually speak for"""
     anatomy = from_seal(sealed, spans=spans)
     was_write = sealed.get("write_floor") or anatomy.write_floor
     was_join = sealed.get("join_floor") or anatomy.join_floor
-    # Filtered DOWN only: a seal taken at 20000 holds no write below 20000, so a lower
-    # request is answered at the SEALED floor and `floor_note` says so.
+    # Filtered DOWN only: a seal taken at 20000 holds no write below 20000
     if write >= was_write:
         anatomy.write_floor = write
         anatomy.writes = [w for w in anatomy.writes if w.written >= write]
@@ -707,7 +553,7 @@ def _keys(value: Any) -> set[str]:
 def _provenance(source: str, *, anatomy: inspection.Anatomy,
                 sealed: dict[str, Any] | None, floor_note: str = "",
                 note: str = "") -> dict[str, Any]:
-    """Which reading answered, as sentences — the renderers compose none of their own."""
+    """Which reading answered, as sentences — the renderers compose none of their own"""
     level = level_of(sealed) if sealed is not None else UNKNOWN
     at = sealed.get("sealed_at") if sealed is not None else None
     if not note:
@@ -722,10 +568,9 @@ def _provenance(source: str, *, anatomy: inspection.Anatomy,
     return {"source": source, "sealed_at": at, "level": level,
             "level_note": autopsy_level_note(level) if sealed is not None else "",
             "write_floor": anatomy.write_floor, "join_floor": anatomy.join_floor,
-            # Whether the reading carries tool parameters at all: a derived one does, a
-            # seal only at `full` (§6).
+            # Whether the reading carries tool parameters at all: a derived one does, a seal only at `full` (§6)
             "params": any_params,
-            # §6: what an EMPTY `params` means, which the level alone cannot say.
+            # §6: what an EMPTY `params` means, which the level alone cannot say
             "params_note": params_note(level, any_params,
                                        (sealed or {}).get("dropped_for_size") or ()),
             "floor_note": floor_note, "note": note}
@@ -738,26 +583,7 @@ def anatomy_for(wo: dict[str, Any], cfg: Any, *,
                 turn_starts: Sequence[tuple[int, float]] = (),
                 cold_prefix_floor: int | None = None
                 ) -> tuple[inspection.Anatomy, dict[str, Any]]:
-    """This order's anatomy, and which reading answered — §4's ONE chokepoint.
-
-    Prefers the seal, because the transcript it was taken from expires and the seal does
-    not. Beside it comes the provenance every surface PRINTS: a disagreement nobody can
-    attribute is a disagreement nobody can fix, which is the operational half of rule (a).
-
-    THE FLOORS DECIDE WHETHER THE SEAL CAN ANSWER AT ALL. Asked for a floor at or above
-    the sealed one the seal answers, with its writes filtered down to what was asked.
-    Asked for one BELOW it the transcript answers while it exists; once it is gone the
-    seal answers at ITS floors and `floor_note` names them, because a short list handed
-    back under a lower floor reads as "there were none".
-
-    `live=True` reads the transcript anyway — `bill.build(..., live=True)`'s parameter and
-    its justification, the thing a test comparing a seal against a fresh reading needs.
-
-    `turn_starts` and `cold_prefix_floor` widen the signature §4 states, deliberately:
-    dropped, every caller loses the OS's own turn numbering (spec 2026-09-27 §3) and the
-    boundary split falls back to UNDECIDED. It lives HERE and not in `ops` because
-    `supervisor` calls it and imports only `claude_cli` and `structured`, below `ops`.
-    """
+    """This order's anatomy, and which reading answered — §4's ONE chokepoint"""
     session = str(wo.get("session_id") or "")
     write, join = cfg.report_write_floor, cfg.report_join_floor
     sealed = None if live else unseal(wo)
@@ -790,8 +616,7 @@ def anatomy_for(wo: dict[str, Any], cfg: Any, *,
     if session:
         fresh = derive()
         return fresh, _provenance(DERIVED, anatomy=fresh, sealed=None)
-    # Rule (b)'s third state: no session, no seal, nothing to read — and never a zero
-    # (issue #227). `inspect_report`'s own no-session path, kept through the chokepoint.
+    # Rule (b)'s third state: no session, no seal, nothing to read — and never a zero (issue #227)
     anatomy = inspection.Anatomy(session_id="", holds=list(spans), write_floor=write,
                                  join_floor=join)
     return anatomy, _provenance(DERIVED, anatomy=anatomy, sealed=None,

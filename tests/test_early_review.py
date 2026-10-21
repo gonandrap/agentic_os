@@ -1,20 +1,4 @@
-"""Neo judges an assumption while the worker is still typing, and settles nothing.
-
-docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-runs.md §5.
-
-Three properties, and the third is the one the whole feature rests on:
-
-* **`decide_early` is a table and is tested as one**, without a daemon and without a
-  network — `test_autoreview.py`'s reason for testing `decide` that way.
-* **BOTH VERDICTS ARE FORMED HERE AND NEITHER IS SENT.** An acceptance and an objection
-  both end as a row and an event; turning `object` into a message is §6's, and a test here
-  that asserted a message would be asserting a section this one does not own.
-* **NOTHING SETTLES.** Asserted from every side a settle could show up on — the row, the
-  pending list, the work order's status, the timeline — and then in the strong form, with
-  `ops.accept_assumption` monkeypatched to raise for the drain's duration. That function
-  lands the work order behind it, so calling it on a ruling formed with no diff is the
-  failure this feature cannot have.
-"""
+"""Neo judges an assumption while the worker is still typing, and settles nothing (docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-runs.md §5.)"""
 
 from __future__ import annotations
 
@@ -28,7 +12,7 @@ from jarvis.daemon import Daemon
 from jarvis.neo_store import NeoStore
 from jarvis.project_store import ProjectStore
 
-#: `test_autoreview.ROUTINE`'s shape: an assumption no reviewer would hold.
+#: `test_autoreview.ROUTINE`'s shape: an assumption no reviewer would hold
 ROUTINE = "named the helper `_render_row`, matching the two beside it"
 
 RUNNING = {"id": "wo-1", "status": "running", "title": "t", "description": "d"}
@@ -49,7 +33,7 @@ def decide_early(**kw):
                                    kw.pop("config", None) or cfg(), **kw)
 
 
-# -- `decide_early`: the condition table, one test per condition ------------------------
+# -- `decide_early`: the condition table, one test per condition
 
 
 def test_a_routine_assumption_on_a_running_work_order_is_put_to_neo():
@@ -66,8 +50,7 @@ def test_neither_half_of_the_switch_arms_it_alone(kw):
                                     "waiting_pr_merge", "completed", "cancelled",
                                     "validating", "budget_exhausted", ""])
 def test_only_an_order_with_a_worker_at_a_keyboard_is_reviewed_early(status):
-    """The objection this arms is guidance to somebody mid-task. On every status here
-    there is nobody to tell, and `needs_review` is `decide`'s pass, not this one's."""
+    """The objection this arms is guidance to somebody mid-task"""
     d = decide_early(wo={**RUNNING, "status": status})
     assert not d.armed and d.code == autoreview.HELD_STATUS
 
@@ -80,8 +63,7 @@ def test_an_assumption_somebody_already_settled_is_not_reopened(status):
 
 @pytest.mark.parametrize("verdict", ["accept", "object"])
 def test_an_assumption_this_pass_has_already_judged_is_not_judged_again(verdict):
-    """Its own hold code, and not `settled`: the row is still pending and still the
-    user's — what exists is an opinion, and a second one would overwrite the first."""
+    """Its own hold code, and not `settled`: the row is still pending and still the user's"""
     d = decide_early(assumption=assumption(provisional_verdict=verdict))
     assert d.code == autoreview.HELD_JUDGED and verdict in d.reason
 
@@ -96,13 +78,12 @@ def test_the_early_hold_names_the_round_and_what_it_said():
     assert d.code == autoreview.HELD_PANEL_GAVE_UP and d.round == 4
     assert "gave up on round 4" in d.reason
     assert "the seats could not agree" in d.reason
-    # ...and the tail this pass owns is unchanged: nothing is ruled on while it waits.
+    # ...and the tail this pass owns is unchanged: nothing is ruled on while it waits
     assert "does not rule on its assumptions while it waits for you" in d.reason
 
 
 def test_a_hold_with_no_round_named_is_still_a_sentence():
-    """Every caller that names no round — and every table test here — must still read as
-    prose rather than as "round 0"."""
+    """Every caller that names no round"""
     d = decide_early(round_outcome="escalated")
     assert d.round == 0 and "round" not in d.reason
     assert d.reason.startswith("the validation panel gave up and put this work order")
@@ -121,7 +102,7 @@ def test_a_refusal_the_worker_has_not_answered_holds_everything_behind_it():
 def test_an_assumption_is_asked_about_once_and_never_again():
     d = decide_early(assumption=assumption(neo_question_id=41))
     assert d.code == autoreview.HELD_ASKED and "41" in d.reason
-    # ...and the question being delivered does not block itself, `decide`'s rule.
+    # ...and the question being delivered does not block itself, `decide`'s rule
     assert decide_early(assumption=assumption(neo_question_id=41),
                         asked_question_id=41).armed
 
@@ -133,22 +114,19 @@ def test_the_regex_net_holds_a_high_stakes_assumption_before_a_call_is_made():
 
 
 def test_the_settle_guard_is_untouched_and_still_refuses_a_running_order():
-    """**`decide` IS NOT EDITED BY THIS FEATURE.** It is the only guard on
-    `ops.accept_assumption` -> `ops.land_when_cleared`, so the same row that arms
-    `decide_early` must still hold it — two functions, two failure directions."""
+    """**`decide` IS NOT EDITED BY THIS FEATURE.** It is the only guard on `ops.accept_assumption` ->..."""
     a = assumption()
     assert decide_early(assumption=a).armed
     held = autoreview.decide(a, RUNNING, cfg())
     assert not held.armed and held.code == autoreview.HELD_STATUS
 
 
-# -- the daemon: both verdicts, on a running order --------------------------------------
+# -- the daemon: both verdicts, on a running order
 
 
 @pytest.fixture()
 def started(jarvis_home, fake_claude, catalog_file, project, monkeypatch):
-    # `test_autoreview.started`'s reason: these tests stand in for the user at the
-    # console, and `ops._refuse_worker_write` refuses a worker on purpose.
+    # `test_autoreview.started`'s reason: these tests stand in for the user at the console
     monkeypatch.delenv("JARVIS_WO_ID", raising=False)
     ops.start_os(str(catalog_file), foreground=True)
     return Daemon(load_catalog(catalog_file))
@@ -156,12 +134,7 @@ def started(jarvis_home, fake_claude, catalog_file, project, monkeypatch):
 
 def running(daemon, *, auto_review: bool = True,
             assumptions: tuple[str, ...] = (ROUTINE,)) -> tuple[ProjectStore, dict]:
-    """A work order MID-TURN, with assumptions its worker recorded as it went.
-
-    `test_autoreview.park`'s opposite number and deliberately much smaller: there is no
-    pull request, no validation round and no result summary, because the whole point is
-    that none of that exists yet.
-    """
+    """A work order MID-TURN, with assumptions its worker recorded as it went"""
     spec = daemon.catalog.project("proj_a")
     spec.validation.enabled = True
     spec.validation.auto_review = auto_review
@@ -194,12 +167,7 @@ def events(store, wo_id: str, kind: str) -> list[dict]:
 
 
 def nothing_settled(store, wo_id: str) -> None:
-    """EVERY SIDE A SETTLE WOULD SHOW UP ON. Called by both verdicts' tests.
-
-    A provisional verdict is, to every existing caller, byte-for-byte a pending
-    assumption (§4.1) — so this asserts the row, the list every gate reads, the work
-    order's own status and the timeline, rather than any one of them.
-    """
+    """EVERY SIDE A SETTLE WOULD SHOW UP ON"""
     (row,) = store.all_assumptions(wo_id)
     assert row["status"] == "pending"
     assert row["decided_by"] == ""
@@ -211,11 +179,7 @@ def nothing_settled(store, wo_id: str) -> None:
 
 @pytest.fixture()
 def no_settling(monkeypatch):
-    """THE STRONG FORM: `ops.accept_assumption` may not be reached at all.
-
-    Asserting the row afterwards proves the state; this proves the CALL was never made,
-    which is what stops a future edit settling and then tidying up after itself.
-    """
+    """THE STRONG FORM: `ops.accept_assumption` may not be reached at all"""
     def boom(*a, **kw):
         raise AssertionError("the early pass must never settle an assumption")
 
@@ -247,8 +211,7 @@ def test_an_agreement_is_recorded_as_provisional_and_settles_nothing(
 
 def test_a_disagreement_is_recorded_as_an_objection_and_nothing_else(
         started, no_settling):
-    """§5.3's seam: the verdict is written down and this section STOPS. No message, no
-    envelope, no escalation to the user — the objection is §6's to send, off this row."""
+    """§5.3's seam: the verdict is written down and this section STOPS"""
     store, wo = running(started, assumptions=(f"FORCE_DENY — {ROUTINE}",))
 
     ask(started, store)
@@ -261,11 +224,10 @@ def test_a_disagreement_is_recorded_as_an_objection_and_nothing_else(
     assert row["provisional_model"]
     (event,) = events(store, wo["id"], "autoreview_provisional")
     assert event["verdict"] == "object" and event["reason"] == row["provisional_reason"]
-    # NOT the user's problem: Neo disagreed with a worker that is still typing, which is
-    # the whole licence for this feature.
+    # NOT the user's problem: Neo disagreed with a worker that is still typing
     assert questions()[0]["status"] != "escalated"
     assert events(store, wo["id"], "autoreview_escalated") == []
-    # §6 files and sends. Nothing here does.
+    # §6 files and sends
     assert row["objection_envelope_id"] is None
     assert row["objection_transport"] == ""
     assert store.list_messages(wo["id"]) == []
@@ -280,10 +242,7 @@ def test_a_disagreement_is_recorded_as_an_objection_and_nothing_else(
 ])
 def test_a_verdict_the_os_cannot_form_records_nothing_and_leaves_it_pending(
         started, no_settling, prefix, escalated):
-    """§5.3's third outcome. **AN OVERRIDE IS NOT AN OBJECTION**: `read_ruling` returns
-    the same `accept=False` for "Neo declined" and "Neo accepted, stakes high", and a
-    high-stakes assumption is never objected to (§2). A failed call is not an answer
-    either — the pinned fleet learning — so it forms no verdict of any kind."""
+    """§5.3's third outcome. **AN OVERRIDE IS NOT AN OBJECTION**: `read_ruling` returns the same..."""
     store, wo = running(started, assumptions=(f"{prefix} — {ROUTINE}".lstrip(" —"),))
 
     ask(started, store)
@@ -299,8 +258,7 @@ def test_a_verdict_the_os_cannot_form_records_nothing_and_leaves_it_pending(
 
 def test_an_override_in_the_early_pass_records_why_the_os_escalated(started,
                                                                    no_settling):
-    """Neo ANSWERED and the OS re-marked the question, so without a cause this escalation
-    renders "not recorded" for ever — docs/superpowers/specs/2026-10-01-neo-observability.md §1."""
+    """Neo ANSWERED and the OS re-marked the question (docs/superpowers/specs/2026-10-01-neo-observability.md §1.)"""
     store, _wo = running(started, assumptions=(f"FORCE_ACCEPT_HIGH — {ROUTINE}",))
 
     ask(started, store)
@@ -318,10 +276,7 @@ def test_an_override_in_the_early_pass_records_why_the_os_escalated(started,
 
 def test_a_worker_that_finishes_while_neo_thinks_does_not_turn_the_ruling_into_a_settle(
         started, no_settling):
-    """THE RACE, and it is why the pass that asked is read off the record rather than
-    from the status at delivery. Neo was asked about an intention; the work order arriving
-    at `needs_review` first does not turn that answer into a judgement of the result, and
-    §7 asks again with the diff in hand before anything settles."""
+    """THE RACE, and it is why the pass that asked is read off the record rather than from the status at..."""
     store, wo = running(started, assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
     ask(started, store)
     store.set_status(wo["id"], "needs_review")
@@ -337,8 +292,7 @@ def test_a_worker_that_finishes_while_neo_thinks_does_not_turn_the_ruling_into_a
 
 
 def test_a_high_stakes_assumption_mid_run_is_never_asked_about_at_all(started):
-    """Both nets, in this pass too (§2). The first one is about TEXT, so it also holds
-    the sentence out of the sibling context of the routine assumption beside it."""
+    """Both nets, in this pass too (§2)"""
     store, wo = running(started, assumptions=(
         "used the live production credentials in the smoke test",
         f"FORCE_ACCEPT — {ROUTINE}"))
@@ -354,10 +308,7 @@ def test_a_high_stakes_assumption_mid_run_is_never_asked_about_at_all(started):
 
 
 def test_the_early_pass_never_touches_a_confirmation_link(started):
-    """§10.5 of docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-hold-an-
-    assumption-for-ever.md: the regression guard that §4's clear and §6's split live on
-    the CONFIRMATION path alone. The early pass files no confirmation, so it can produce
-    neither new code and has no link to clear."""
+    """§10.5 of docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-hold-an-..."""
     store, wo = running(started, assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
 
     ask(started, store)
@@ -390,7 +341,5 @@ def test_asking_twice_asks_once_and_a_recorded_verdict_stops_a_third(started):
     ask(started, store)
 
     assert len(questions()) == 1
-    # The second pass held on `asked` and the third on `judged_early`, and NEITHER is
-    # recorded: both are the pass working, and a tick's worth of events for the rest of a
-    # worker's run would bury the ones that mean something.
+    # The second pass held on `asked` and the third on `judged_early`
     assert events(store, wo["id"], "autoreview_held") == []

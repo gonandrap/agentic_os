@@ -1,55 +1,4 @@
-"""When a work order was NOT ALLOWED TO WORK — the other half of `inspection`'s clock.
-
-`inspection` partitions a session's WALL CLOCK: generating, blocked on a subagent,
-running tools, idle. That partition answers "what was this turn doing" and cannot answer
-"could it have been doing anything at all", and the difference is not academic. On
-2026-09-18 two work orders read as 59% and 67% idle over six and five hours; the account's
-usage window had been spent for four of those hours, so the OS was holding them exactly as
-designed. Reporting that as waste — and alarming on it — is the OS asking the user to look
-at something the OS itself created and understands.
-
-So there are two clocks. WALL is how long it took in the real world and is never deleted:
-it is the honest answer to "how long did this take". ACTIVE is wall minus every interval
-the OS's own record says the order was held, and it is the one a threshold belongs on.
-
-## The record is the timeline, not a reconstruction
-
-Every hold the OS imposes is already written down as a PAIR of timeline events — one that
-opens it and one that closes it, correlated by an id in the payload. `turn_paused` /
-`turn_resumed` carry the refused turn's `seq`; `question_asked` / `neo_answered` carry the
-Neo question id; `gate_requested` / `gate_decided` carry the approval id. So a hold window
-is read off the record rather than inferred from the shape of a gap, which is the one way
-to get "held 3.9h by a fleet usage limit" right instead of plausible. `_OPEN` and `_CLOSE`
-below are that pairing, and adding a cause is a row in each rather than a new walk.
-
-A hold with no closing event is STILL HELD and runs to `now`. That is not a gap in the
-data — it is the live case, and it is the one the alarm is judged against.
-
-## Two rules that make the arithmetic safe
-
-CLIPPED TO THE GAPS BETWEEN TURNS. A hold is only subtracted where no `claude -p` process
-of this work order was alive. Some holds legitimately overlap a running turn — a message
-queued while the worker is mid-task waits for it to finish, a validation round runs in
-PARALLEL with a `needs_review` park (issue 212) — and subtracting those seconds would
-delete time the order spent working, which is the opposite of the mistake this module
-exists to fix. The clip also makes `held <= idle` true by construction, which is what lets
-`inspection` report the residual as the honest "nothing was holding it" number.
-
-It is also why subagent time survives untouched, with no special case: `blocked` is inside
-a running turn, so nothing can ever be subtracted from it. The work order that commissioned
-this said so in as many words — 130 minutes of blocking on its own subagent is the order's
-own choice and is exactly what an alarm should still see.
-
-MERGED, EARLIEST START WINS. Two causes can overlap (a gate escalated while the usage
-window is spent). The overlap is counted ONCE, and attributed to whichever started first —
-so the per-cause figures always sum to the total and a reader can never be told the same
-four hours twice under two names.
-
-A DEPENDENCY EDGE HOLDS NOTHING MEASURABLE, and that is an enumeration result rather than
-an omission: an order blocked on a dependency has not been dispatched, so it has no turn,
-no transcript and no wall clock for a hold to intersect. `jarvis wo list` already says
-`pending — blocked by …` and nothing here can improve on it.
-"""
+"""When a work order was NOT ALLOWED TO WORK — the other half of `inspection`'s clock"""
 
 from __future__ import annotations
 
@@ -62,9 +11,7 @@ from .project_store import (VALIDATION_AUTH_CAUSE, VALIDATION_HELD_CAUSE,
                             ProjectStore)
 from .worker_session import PAUSE_AUTH, PAUSE_TRANSIENT, PAUSE_USAGE_LIMIT
 
-#: The three transport pauses, named by `worker_session` and carried verbatim in
-#: `turn_paused`'s `reason`. Imported rather than re-spelled: the payload is written by
-#: that module and a second copy of these strings is a drift waiting to happen.
+#: The three transport pauses, named by `worker_session` and carried verbatim in `turn_paused`'s...
 TRANSPORT = frozenset({PAUSE_USAGE_LIMIT, PAUSE_TRANSIENT, PAUSE_AUTH})
 
 NEO_QUESTION = "neo_question"
@@ -73,9 +20,7 @@ VALIDATION = "validation"
 BUDGET = "budget"
 MESSAGE = "message"
 
-#: What completes the sentence "held 3.9h by …". Here rather than at each surface so the
-#: report, the alarm and the dashboard cannot call one hold three different things — the
-#: rule `worker_session.PAUSE_NOUN` already follows for its own third of this table.
+#: What completes the sentence "held 3.9h by …"
 HOLD_CAUSES = {
     PAUSE_USAGE_LIMIT: "a fleet usage limit",
     PAUSE_TRANSIENT: "a Claude API outage",
@@ -87,27 +32,14 @@ HOLD_CAUSES = {
     MESSAGE: "a message waiting to be delivered",
 }
 
-#: Which cause explains the other when two start at the same instant. NOT cosmetic, and
-#: not a guess about importance: these holds CAUSE one another, and the merge below would
-#: otherwise name the symptom. `Daemon.deliver_messages` holds a queued message for
-#: exactly as long as the transport is paused (kn-fa875823), so a message and a spent
-#: usage window open on the same reap and the window is the answer — wo-16a488ee's
-#: 197-minute hold on 2026-09-18 reported as "a message waiting to be delivered" until
-#: this existed, which is a true sentence that hides the only useful one. Lower sorts
-#: first; the transport pauses lead because nothing in the OS outranks the account.
+#: Which cause explains the other when two start at the same instant
 _RANK = {PAUSE_USAGE_LIMIT: 0, PAUSE_TRANSIENT: 0, PAUSE_AUTH: 0,
          BUDGET: 1, GATE: 2, NEO_QUESTION: 3, VALIDATION: 4, MESSAGE: 5}
 
-#: Shorter than this and a hold is the reconcile loop's own granularity rather than
-#: anything that happened — a round opened and settled inside one tick, a question Neo
-#: answered in the same second. Dropped so a report does not carry a line per non-event.
+#: Shorter than this and a hold is the reconcile loop's own granularity rather than anything that...
 _MIN_HOLD = 1.0
 
-#: Timeline kind -> (cause, the payload field correlating it with its closer). A cause of
-#: `None` means the event NAMES its own — `turn_paused` carries `reason`, which is how one
-#: row here covers all three transport pauses without pretending they are one thing.
-#: A key of `None` means the hold is unkeyed: at most one can be open at a time, so the
-#: next closer of that cause ends it.
+#: Timeline kind -> (cause, the payload field correlating it with its closer)
 _OPEN: dict[str, tuple[str | None, str | None]] = {
     "turn_paused": (None, "seq"),
     "question_asked": (NEO_QUESTION, "neo_question_id"),
@@ -118,15 +50,11 @@ _OPEN: dict[str, tuple[str | None, str | None]] = {
     "message_queued": (MESSAGE, "msg_id"),
 }
 
-#: Timeline kind -> (the causes it can close, the payload field, whether that field is a
-#: LIST of keys). `turn_resumed` names the turn it is retrying rather than its own, and
-#: `message_delivered` closes everything it flushed in one go — both are why the field is
-#: named per kind instead of assumed.
+#: Timeline kind -> (the causes it can close, the payload field, whether that field is a LIST of keys)
 _CLOSE: dict[str, tuple[frozenset[str], str | None, bool]] = {
     "turn_resumed": (TRANSPORT, "retried_seq", False),
     "turn_cancelled": (TRANSPORT, "seq", False),
-    # No `seq` in its payload, and rightly: giving up ends the pause whatever turn it
-    # was on. An unkeyed closer ends every open hold of its causes.
+    # No `seq` in its payload, and rightly: giving up ends the pause whatever turn it was on
     "turn_retries_exhausted": (TRANSPORT, None, False),
     "neo_answered": (frozenset({NEO_QUESTION}), "neo_question_id", False),
     "escalation_answered": (frozenset({NEO_QUESTION}), "neo_question_id", False),
@@ -147,26 +75,7 @@ _CLOSE: dict[str, tuple[frozenset[str], str | None, bool]] = {
 
 @dataclass(frozen=True)
 class Hold:
-    """One interval this work order was not permitted to run, and what held it.
-
-    `ended` is None while the hold is still on. Not `now` frozen at read time: a reader
-    that stores one of these and re-renders it later would otherwise report a hold as
-    over because it once asked the clock.
-
-    THREE FIELDS AND NO FREE TEXT, WHICH IS A SECURITY BOUNDARY RATHER THAN MINIMALISM.
-    An earlier draft carried a `detail` lifted from the opening event's payload — the
-    refusal message, the question, the gate's command — and `as_dict` published it
-    through `jarvis inspect --json`. Every one of those sources is text this OS does not
-    control: a gate's command is the privileged shell line a worker proposed, which in
-    this repository routinely embeds a tokenised remote, and a transport pause's `error`
-    is a VCS stderr tail, which is kn-1791a5e6's leak verbatim. Truncating is not a
-    defence there (the credential is at the FRONT of the URL), and scrubbing is a
-    denylist that only removes the leak somebody already thought of. A timing report has
-    no use for any of it: what a reader needs is the CAUSE, and `HOLD_CAUSES` is a fixed
-    table of our own sentences. The reset moment is not lost with it — the timeline keeps
-    `reset_at` on the `turn_paused` payload, and `invariants.pause_note` is what renders
-    it to a person. Adding a field here means publishing it; think first.
-    """
+    """One interval this work order was not permitted to run, and what held it"""
 
     cause: str
     started: float
@@ -182,11 +91,11 @@ class Hold:
 
     @property
     def phrase(self) -> str:
-        """"a fleet usage limit" — what completes "held 3.9h by …"."""
+        """"a fleet usage limit" — what completes "held 3.9h by …\""""
         return HOLD_CAUSES.get(self.cause, self.cause)
 
     def overlap(self, start: float, end: float, now: float | None = None) -> float:
-        """Seconds of this hold that fall inside `[start, end]`."""
+        """Seconds of this hold that fall inside `[start, end]`"""
         return max(0.0, min(self.finish(now), end) - max(self.started, start))
 
     def as_dict(self, now: float | None = None) -> dict[str, Any]:
@@ -197,12 +106,7 @@ class Hold:
 
 def held(store: ProjectStore, wo_id: str, *,
          now: float | None = None) -> list[Hold]:
-    """Every interval the OS's record says this work order was held, oldest first.
-
-    One indexed read of the timeline and one of the turns — no model, no transcript, and
-    nothing written. Cheap enough to run per running work order per reconcile tick, which
-    is what `Daemon.check_burning_turns` does with it.
-    """
+    """Every interval the OS's record says this work order was held, oldest first"""
     now = time.time() if now is None else now
     spans = _episodes(store.list_events(wo_id, limit=_EVENT_LIMIT))
     spans = _outside(spans, _working(store.list_turns(wo_id), now), now)
@@ -211,16 +115,7 @@ def held(store: ProjectStore, wo_id: str, *,
 
 def held_family(store: ProjectStore, wo_ids: Sequence[str], *,
                 now: float | None = None) -> list[Hold]:
-    """Every interval NO member of this family could run — a feature order's hold.
-
-    A feature has no timeline of its own (`wo_events.wo_id` is a foreign key into
-    `work_orders`), so its hold is its family's, exactly as `ops._last_activity` reads its
-    activity. The three steps are not interchangeable: the raw `_episodes` of every member
-    are clipped against the UNION of every member's turns — a child held by the usage limit
-    while a sibling types is not a held feature — and only then merged, so two children
-    held by the same fleet limit count once. Spec §1 of
-    docs/superpowers/specs/2026-09-30-time-in-state-counts-a-usage-limit-hold-as-running.md
-    """
+    """Every interval NO member of this family could run — a feature order's hold (docs/superpowers/specs/2026-09-30-time-in-state-counts-a-usage-limit-hold-as-running.md)"""
     now = time.time() if now is None else now
     episodes: list[Hold] = []
     turns: list[dict[str, Any]] = []
@@ -231,9 +126,7 @@ def held_family(store: ProjectStore, wo_ids: Sequence[str], *,
     return _merge(_outside(episodes, _working(turns, now), now), now)
 
 
-#: Enough timeline for any conversation the fleet has run. `list_events` takes the OLDEST
-#: `limit` rows, so a cap that bit would drop the RECENT holds — the ones a live alarm is
-#: judged against — and report a busy work order as never held at all.
+#: Enough timeline for any conversation the fleet has run
 _EVENT_LIMIT = 10_000
 
 
@@ -242,9 +135,7 @@ def _key(payload: dict[str, Any], field: str | None) -> Any:
 
 
 
-#: What ends a hold `_episodes` synthesised for a held round. The keyed `VALIDATION`
-#: closers plus the two resubmissions: every one of them is a round the hold cannot
-#: outlive. Spec §2d1.
+#: What ends a hold `_episodes` synthesised for a held round
 _SYNTHESIS_CLOSERS = frozenset({
     "validation_submitted", "validation_forced", "validation_passed",
     "validation_rejected", "validation_escalated", "validation_void",
@@ -254,19 +145,14 @@ _SYNTHESIS_CLOSERS = frozenset({
 
 def _close_synthesised(open_holds: dict[tuple[str, Any], Hold], done: list[Hold],
                        cause: str, ts: float) -> None:
-    """End the unkeyed hold synthesised for a held round, if one is open."""
+    """End the unkeyed hold synthesised for a held round, if one is open"""
     hold = open_holds.pop((cause, None), None)
     if hold is not None:
         done.append(Hold(hold.cause, hold.started, max(ts, hold.started)))
 
 
 def _episodes(events: Sequence[dict[str, Any]]) -> list[Hold]:
-    """Pair the timeline's opening and closing events into raw hold spans.
-
-    Closers are applied BEFORE openers on the same event, so a kind that is both — a
-    `validation_submitted` that both ends a usage-limit hold on the panel and starts the
-    round's own — closes the old one rather than being swallowed by it.
-    """
+    """Pair the timeline's opening and closing events into raw hold spans"""
     open_holds: dict[tuple[str, Any], Hold] = {}
     done: list[Hold] = []
     for event in events:
@@ -287,23 +173,17 @@ def _episodes(events: Sequence[dict[str, Any]]) -> list[Hold]:
                     hold = open_holds.pop((cause, key))
                     done.append(Hold(hold.cause, hold.started,
                                      max(ts, hold.started)))
-        # Every terminal of a held round ends the synthesised hold, not only the
-        # resubmission — spec §2d1 of
-        # docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
+        # Every terminal of a held round ends the synthesised hold, not only the resubmission (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md)
         if kind in _SYNTHESIS_CLOSERS:
             for synthesised in (PAUSE_USAGE_LIMIT, PAUSE_AUTH):
                 _close_synthesised(open_holds, done, synthesised, ts)
-        # A round the panel could not run because the usage window was spent closes the
-        # round and holds the WORK ORDER until the window reopens — a usage-limit hold
-        # with no `turn_paused` behind it, because no worker turn was ever launched into
-        # it. Ended by the next submission, which is the OS reopening the round itself.
+        # A round the panel could not run because the usage window was spent closes the round and holds the...
         if kind == "validation_failed" and payload.get("cause") == VALIDATION_HELD_CAUSE:
-            # The unkeyed slot never loses an episode silently — spec §2d1 point 2.
+            # The unkeyed slot never loses an episode silently — spec §2d1 point 2
             _close_synthesised(open_holds, done, PAUSE_USAGE_LIMIT, ts)
             open_holds[(PAUSE_USAGE_LIMIT, None)] = Hold(PAUSE_USAGE_LIMIT, ts)
             continue
-        # The same synthesis for a round whose seats could not authenticate — spec
-        # docs/superpowers/specs/2026-09-26-the-panel-must-not-mistake-an-auth-failure-for-a-verdict.md §7.
+        # The same synthesis for a round whose seats could not authenticate (docs/superpowers/specs/2026-09-26-the-panel-must-not-mistake-an-auth-failure-for-a-verdict.md §7.)
         if kind == "validation_failed" and payload.get("cause") == VALIDATION_AUTH_CAUSE:
             _close_synthesised(open_holds, done, PAUSE_AUTH, ts)
             open_holds[(PAUSE_AUTH, None)] = Hold(PAUSE_AUTH, ts)
@@ -323,7 +203,7 @@ def _episodes(events: Sequence[dict[str, Any]]) -> list[Hold]:
 
 
 def _working(turns: Sequence[dict[str, Any]], now: float) -> list[tuple[float, float]]:
-    """When a `claude -p` process of this work order was alive, merged and in order."""
+    """When a `claude -p` process of this work order was alive, merged and in order"""
     spans = sorted((float(t["started_at"]),
                     float(t["ended_at"]) if t["ended_at"] else now) for t in turns)
     merged: list[tuple[float, float]] = []
@@ -337,11 +217,7 @@ def _working(turns: Sequence[dict[str, Any]], now: float) -> list[tuple[float, f
 
 def _outside(spans: Sequence[Hold], working: Sequence[tuple[float, float]],
              now: float) -> list[Hold]:
-    """`spans` with every second a worker turn was running cut out of them.
-
-    See the module note: a hold that overlaps a live turn is the OS queueing something
-    behind work that IS happening, and subtracting it would delete the work.
-    """
+    """`spans` with every second a worker turn was running cut out of them"""
     out: list[Hold] = []
     for hold in spans:
         cursor, end = hold.started, hold.finish(now)
@@ -359,15 +235,7 @@ def _outside(spans: Sequence[Hold], working: Sequence[tuple[float, float]],
 
 
 def _merge(spans: Sequence[Hold], now: float) -> list[Hold]:
-    """Overlaps counted once, attributed to whichever hold started first.
-
-    The alternative — letting two causes both claim the same four hours — makes the
-    per-cause figures sum past the total, and a reader who adds them up is then told the
-    OS lost track of an afternoon.
-
-    `_RANK` breaks the tie, and a tie is the common case rather than the exotic one: two
-    holds that open on the same reap of the same turn start at the same float.
-    """
+    """Overlaps counted once, attributed to whichever hold started first"""
     out: list[Hold] = []
     cursor = float("-inf")
     for hold in sorted(spans, key=lambda h: (h.started, _RANK.get(h.cause, 9))):
@@ -381,16 +249,7 @@ def _merge(spans: Sequence[Hold], now: float) -> list[Hold]:
 
 
 def union_seconds(intervals: Sequence[tuple[float, float]]) -> float:
-    """The measure of the UNION of these intervals — overlapping seconds counted once.
-
-    §4 of docs/superpowers/specs/2026-10-12-a-validation-round-waiting-for-ci-is-not-stuck.md:
-    `ops.stuck_scan` discounts the usage holds AND the CI hold spans, and a usage window
-    can shut while CI runs. Summing them would tell a reader the same minutes twice under
-    two names, which is the rule `_merge` already states for `Hold`s.
-
-    Pure arithmetic over pairs: no `Hold`, no cause, no clock. A caller with `Hold`s
-    clips them itself (`Hold.overlap`'s bounds) and hands the pairs in.
-    """
+    """The measure of the UNION of these intervals — overlapping seconds counted once (docs/superpowers/specs/2026-10-12-a-validation-round-waiting-for-ci-is-not-stuck.md)"""
     total, cursor = 0.0, float("-inf")
     for start, end in sorted(intervals):
         if end <= start or end <= cursor:  # empty, or already covered
@@ -402,7 +261,7 @@ def union_seconds(intervals: Sequence[tuple[float, float]]) -> float:
 
 def by_cause(spans: Sequence[Hold], start: float, end: float,
              now: float | None = None) -> dict[str, float]:
-    """Seconds held inside `[start, end]`, per cause, biggest first."""
+    """Seconds held inside `[start, end]`, per cause, biggest first"""
     totals: dict[str, float] = {}
     for hold in spans:
         seconds = hold.overlap(start, end, now)

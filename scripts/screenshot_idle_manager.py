@@ -1,15 +1,4 @@
-"""Screenshot what an idle manager now looks like, for issue #264's UI evidence.
-
-The claim a passing UI test cannot make: a person reading the dashboard and the work
-order can tell that this manager wants nothing from them. So the seed pairs it with an
-ordinary work order genuinely parked in `waiting_input` — the picture has to show the
-difference, not just the absence.
-
-Writes PNGs to docs/screenshots/. Everything it touches lives in a temp `JARVIS_HOME`
-and a temp catalog, so it never reads or writes the live OS:
-
-    uv run python scripts/screenshot_idle_manager.py
-"""
+"""Screenshot what an idle manager now looks like, for issue #264's UI evidence"""
 
 from __future__ import annotations
 
@@ -27,7 +16,7 @@ PORT = 8799
 
 
 def seed() -> tuple[str, str]:
-    """The manager and its control, under one feature order."""
+    """The manager and its control, under one feature order"""
     from jarvis.central_store import CentralStore
     from jarvis.project_store import ProjectStore
 
@@ -64,7 +53,7 @@ def seed() -> tuple[str, str]:
                              "until a message arrives — no action to take right now.")
     store.set_status(manager["id"], "idle")
 
-    # The control, in the same project: genuinely blocked on the user.
+    # The control, in the same project: genuinely blocked on the user
     parked = store.create_work_order(title="Add the --since flag to the exporter",
                                      description="filter rows by start date")
     store.update_work_order(parked["id"], session_id="1b90aa77-real-block")
@@ -91,10 +80,10 @@ def shoot(manager_id: str) -> None:
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page(viewport={"width": 1280, "height": 900})
-        # The listing: the manager is NOT in the needs-me strip, the control is.
+        # The listing: the manager is NOT in the needs-me strip, the control is
         page.goto(f"{base}/project/jarvis_os")
         page.screenshot(path=SHOTS / "idle-manager-project.png")
-        # The page itself: the badge, and the line that says what it waits for.
+        # The page itself: the badge, and the line that says what it waits for
         page.goto(f"{base}/wo/jarvis_os/{manager_id}")
         page.screenshot(path=SHOTS / "idle-manager-work-order.png")
         browser.close()

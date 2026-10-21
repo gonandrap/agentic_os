@@ -1,29 +1,16 @@
-"""Every open work order has an actor or a blocker — never neither.
-
-Section 3 of
-docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md:
-`ops.scheduled_actor` answers "somebody is going to act on this" from the row alone,
-over the predicates the daemon passes themselves use. Four pins:
-
-1. coverage — every `(status, origin)` pair derives an actor or a blocker, and the
-   pairs that correctly derive NEITHER are a table with a sentence each
-2. population — the registry's keys are exactly `OPEN_STATUSES`
-3. the predicate rule — every entry's test IS the module-level symbol its `predicate`
-   path names (imported from the pass's module, or `ops`' own public contract), never a
-   lambda and never a condition restated in the registry
-4. no fallthrough — a status missing from the registry raises rather than guessing
-"""
+"""Every open work order has an actor or a blocker — never neither (docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md)"""
 
 from __future__ import annotations
 
 import ast
 import importlib
+import json
 import time
 from pathlib import Path
 
 import pytest
 
-from jarvis import invariants, ops
+from jarvis import gates, invariants, ops
 from jarvis.catalog import DEFAULT_PULL_REQUESTS_RECOMPUTE_STALL_MINUTES, load_catalog
 from jarvis.daemon import (
     SETTLE_STATUSES,
@@ -47,8 +34,7 @@ PR = "https://github.com/acme/proj/pull/7"
 
 GATED = "gh " + "pr merge 42"  # split so the recogniser does not gate this file
 
-#: (status, origin) pairs that correctly derive NEITHER an actor nor a blocker,
-#: each mapped to the one sentence saying why.
+#: (status, origin) pairs that correctly derive NEITHER an actor nor a blocker
 EXPECT_NEITHER: dict[tuple[str, str], str] = {
     ("dispatching", "adhoc"):
         "`Daemon.settle_turns` skips `UNGOVERNED_ORIGINS` and `true_blockers` derives "
@@ -76,7 +62,7 @@ def _params() -> list:
 
 
 def _row(store: ProjectStore, status: str, origin: str) -> dict:
-    """The minimal realistic row for this status: what the passes select on."""
+    """The minimal realistic row for this status: what the passes select on"""
     kw: dict = {"origin": origin, "status": status}
     if status == "budget_exhausted":
         kw["budget_usd"] = 1.0
@@ -99,8 +85,7 @@ def test_an_actor_or_a_blocker_never_neither(jarvis_home, project, status, origi
     blockers = invariants.true_blockers(store, wo)
     why = EXPECT_NEITHER.get((status, origin))
     if why is not None:
-        # The table bites both ways: an exemption that started deriving something is
-        # a stale exemption, which is the defect this feature deletes one level up.
+        # The table bites both ways: an exemption that started deriving something is a stale exemption
         assert actor is None, f"{status}/{origin} now derives {actor} — {why}"
         assert blockers == [], f"{status}/{origin} now derives {blockers} — {why}"
     else:
@@ -114,7 +99,7 @@ def test_every_open_status_is_in_the_registry():
 
 
 def _ops_imports() -> dict[str, str]:
-    """name -> module it was imported from, for every `from . import`/`from .x import`."""
+    """name -> module it was imported from, for every `from . import`/`from .x import`"""
     tree = ast.parse(Path(ops.__file__).read_text(encoding="utf-8"))
     found: dict[str, str] = {}
     for node in ast.walk(tree):
@@ -127,7 +112,7 @@ def _ops_imports() -> dict[str, str]:
 
 
 def _module_level_names(module) -> set[str]:
-    """Names the module DEFINES at top level — functions and constants, no imports."""
+    """Names the module DEFINES at top level — functions and constants, no imports"""
     tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
     out: set[str] = set()
     for node in tree.body:
@@ -141,7 +126,7 @@ def _module_level_names(module) -> set[str]:
 
 
 def _pass_literals() -> list[tuple[str, ast.expr]]:
-    """(`predicate`, the expression written as `test`) per `_Pass(...)` in ops.py."""
+    """(`predicate`, the expression written as `test`) per `_Pass(...)` in ops.py"""
     tree = ast.parse(Path(ops.__file__).read_text(encoding="utf-8"))
     out: list[tuple[str, ast.expr]] = []
     for node in ast.walk(tree):
@@ -156,19 +141,15 @@ def _pass_literals() -> list[tuple[str, ast.expr]]:
 
 
 def test_every_predicate_is_an_imported_symbol():
-    """`predicate` names where the test LIVES, and the registry passes that symbol.
-
-    kn-787b7c27: one public contract per question. A predicate may live in `ops` (the
-    layer daemon imports) or in the pass's own module, but the registry must reference
-    it BY NAME — never a lambda, never the condition restated inline.
-    """
+    """`predicate` names where the test LIVES, and the registry passes that symbol"""
     imported = _ops_imports()
     entries = [(status, p) for status, entry in ops.SCHEDULED_ACTORS.items()
                for p in entry.passes]
     by_predicate: dict[str, list[ast.expr]] = {}
     for predicate, node in _pass_literals():
         by_predicate.setdefault(predicate, []).append(node)
-    assert sum(len(v) for v in by_predicate.values()) == len(entries), (
+    # SETS, not counts: one `_Pass` literal may be registered under several statuses (the shared...
+    assert set(by_predicate) == {p.predicate for _, p in entries}, (
         "every `_Pass` literal in ops.py must be reachable from SCHEDULED_ACTORS")
     for status, p in entries:
         module, _, name = p.predicate.rpartition(".")
@@ -192,20 +173,22 @@ def test_every_predicate_is_an_imported_symbol():
 
 
 def test_no_fallthrough(jarvis_home, project):
+    """STILL A PIN after wo-715db5af: the XOR holds over a status's OWN passes"""
     for status, entry in ops.SCHEDULED_ACTORS.items():
-        assert bool(entry.none_because) is not bool(entry.passes), (
+        own = tuple(p for p in entry.passes if p is not ops.REVIEWS_GATE)
+        assert bool(entry.none_because) is not bool(own), (
             f"{status}: `none_because` must be non-empty exactly when there are no "
-            "passes")
+            "passes other than the shared gate-sweep constant")
     store = ProjectStore(project)
     wo = store.create_work_order("add feature X")
     with pytest.raises(KeyError):
         ops.scheduled_actor(store, {**wo, "status": "completed"})
 
 
-# -- the predicates said NO: what the registry derives, and what the pass does ------
+# -- the predicates said NO: what the registry derives, and what the pass does
 
 def _age_past_grace(store: ProjectStore, wo_id: str) -> dict:
-    """Backdate the claim past `TURN_CLAIM_GRACE_SECONDS` and re-read the row."""
+    """Backdate the claim past `TURN_CLAIM_GRACE_SECONDS` and re-read the row"""
     store.conn.execute("UPDATE work_orders SET updated_at=? WHERE id=?",
                        (time.time() - TURN_CLAIM_GRACE_SECONDS - 60, wo_id))
     return store.get_work_order(wo_id)
@@ -213,7 +196,7 @@ def _age_past_grace(store: ProjectStore, wo_id: str) -> dict:
 
 @pytest.fixture()
 def settler(fake_claude, catalog_file, project):
-    """`settler(store)` — `Daemon.settle_turns` over one project, driven directly."""
+    """`settler(store)` — `Daemon.settle_turns` over one project, driven directly"""
     catalog = load_catalog(catalog_file)
     daemon, spec = Daemon(catalog), catalog.projects[0]
 
@@ -235,10 +218,7 @@ def test_waiting_pr_merge_without_a_pr_url_derives_no_actor(jarvis_home, project
     assert ops.scheduled_actor(store, wo) is None
 
 
-# -- `waiting_pr_merge`: an actor only while GitHub is still recomputing ------------
-# wo-d3a70c29, from PR #995 / wo-cdee6f9b: the branch moved to 88cac10, the pull
-# request's head stayed at 0488753, and mergeability never left UNKNOWN — so the poll
-# kept selecting the row, every acting branch declined, and nothing ever asked the user.
+# -- `waiting_pr_merge`: an actor only while GitHub is still recomputing
 
 STALLED_HEAD, STALLED_TIP = "0488753", "88cac10"
 
@@ -251,9 +231,7 @@ def _parked_on_a_pr(store: ProjectStore, **cache) -> dict:
 
 def test_a_pull_request_github_stopped_recomputing_derives_no_actor(jarvis_home,
                                                                     project):
-    """#995's own row. The poll still SELECTS it (`daemon.polls_pull_request` is
-    untouched, so a resync can still clear the stall); what it no longer is, is an
-    answer to "somebody is going to act on this"."""
+    """#995's own row"""
     store = ProjectStore(project)
     wo = _parked_on_a_pr(store, pr_head_oid=STALLED_HEAD, pr_ref_oid=STALLED_TIP,
                          pr_mergeable_unknown_since=time.time())
@@ -262,8 +240,7 @@ def test_a_pull_request_github_stopped_recomputing_derives_no_actor(jarvis_home,
 
 
 def test_a_fresh_unknown_is_an_ordinary_push_and_keeps_its_actor(jarvis_home, project):
-    """kn-5e93939e: UNKNOWN right after a push is NORMAL — GitHub computes mergeability
-    lazily and asking is what starts it. Nothing may fire on a fresh one."""
+    """kn-5e93939e: UNKNOWN right after a push is NORMAL"""
     store = ProjectStore(project)
     wo = _parked_on_a_pr(store, pr_head_oid=STALLED_HEAD, pr_ref_oid=STALLED_HEAD,
                          pr_mergeable_unknown_since=time.time())
@@ -274,8 +251,7 @@ def test_a_fresh_unknown_is_an_ordinary_push_and_keeps_its_actor(jarvis_home, pr
 
 
 def test_an_unknown_past_the_threshold_derives_no_actor(jarvis_home, project):
-    """Condition (b) alone: head and tip agree, and GitHub has simply stopped answering
-    the mergeability question for longer than `pull_requests.recompute_stall_minutes`."""
+    """Condition (b) alone: head and tip agree"""
     store = ProjectStore(project)
     stale = time.time() - (DEFAULT_PULL_REQUESTS_RECOMPUTE_STALL_MINUTES + 1) * 60
     wo = _parked_on_a_pr(store, pr_head_oid=STALLED_HEAD, pr_ref_oid=STALLED_HEAD,
@@ -285,8 +261,7 @@ def test_an_unknown_past_the_threshold_derives_no_actor(jarvis_home, project):
 
 
 def test_an_unobserved_tip_never_disqualifies(jarvis_home, project):
-    """Empty is NOT RECORDED and never a sha that could match one: a row the poll has
-    not read a remote tip for keeps its actor."""
+    """Empty is NOT RECORDED and never a sha that could match one: a row the poll has not read a remote..."""
     store = ProjectStore(project)
     wo = _parked_on_a_pr(store, pr_head_oid=STALLED_HEAD, pr_ref_oid="")
 
@@ -297,9 +272,7 @@ def test_an_unobserved_tip_never_disqualifies(jarvis_home, project):
 
 def test_a_claim_past_its_grace_is_a_hole_the_settler_still_fails(jarvis_home, project,
                                                                  settler):
-    # Spec lines 27-29: the grace is the only thing telling "just claimed" from "the
-    # daemon died between the two writes" — so None here means a hole for the user, not
-    # a claimed actor, and the settler's failure write is what puts it in front of them.
+    # Spec lines 27-29: the grace is the only thing telling "just claimed" from "the daemon died between...
     store = ProjectStore(project)
     wo = store.create_work_order("add feature X", status="dispatching")
     wo = _age_past_grace(store, wo["id"])
@@ -369,7 +342,7 @@ def test_reviews_gate_only_when_the_user_does_not_hold_it(jarvis_home, project,
     assert reviews_gate(store, wo) is expected
 
 
-# -- `pending`: the claim SQL is the actor, and a DELAY is still that actor ----------
+# -- `pending`: the claim SQL is the actor, and a DELAY is still that actor
 
 def test_a_claimable_pending_order_names_the_dispatch_pass(jarvis_home, project):
     store = ProjectStore(project)
@@ -381,8 +354,7 @@ def test_a_claimable_pending_order_names_the_dispatch_pass(jarvis_home, project)
 @pytest.mark.parametrize(("code", "make"), HOLDS, ids=[c for c, _ in HOLDS])
 def test_a_delayed_pending_order_still_names_the_dispatch_pass(jarvis_home, project,
                                                                code, make):
-    """A live dependency, a cap, a backoff and a held plan are all WAITING CORRECTLY:
-    the turn is later, the actor is the same, and nothing here raises attention."""
+    """A live dependency, a cap, a backoff and a held plan are all WAITING CORRECTLY: the turn is later"""
     store = ProjectStore(project)
     wo = store.get_work_order(make(store))
     actor = ops.scheduled_actor(store, wo)
@@ -410,3 +382,65 @@ def test_a_none_because_status_blocks_on_the_user(jarvis_home, project, status):
     wo = _row(store, status, "jarvis")
     assert (ops.scheduled_actor(store, wo),
             invariants.true_blockers(store, wo) != []) == (None, True)
+
+
+# -- a HELD gate request outlives the status it was filed under
+
+@pytest.fixture()
+def gate_sweeper(fake_claude, catalog_file, project):
+    """`sweep(store)` — `Daemon.abandon_unargued_gates` over a gates-enabled project"""
+    data = json.loads(catalog_file.read_text(encoding="utf-8"))
+    data["projects"][0]["gates"] = ["pr_merge"]
+    catalog_file.write_text(json.dumps(data), encoding="utf-8")
+    catalog = load_catalog(catalog_file)
+    daemon, spec = Daemon(catalog), catalog.projects[0]
+    assert spec.gates, "the premise: the project gates `pr_merge`, so the sweep runs"
+
+    def run(store: ProjectStore) -> None:
+        daemon.abandon_unargued_gates(spec, store)
+
+    return run
+
+
+def _hold_a_request(store: ProjectStore, wo_id: str) -> dict:
+    return store.add_approval(wo_id, "pr_merge", GATED, status="awaiting_case")
+
+
+def _expire_the_case(store: ProjectStore, approval_id: int) -> None:
+    """Wind the filing back past `case_ttl_seconds` rather than sleeping through it"""
+    store.conn.execute("UPDATE approvals SET ts = ts - ? WHERE id=?",
+                       (gates.DEFAULT_CASE_TTL_SECONDS + 60, approval_id))
+
+
+def test_a_held_request_on_a_running_ungoverned_row_names_the_gate_sweep(
+        jarvis_home, project, gate_sweeper):
+    """The live shape on main, PAIRED WITH ITS PASS"""
+    store = ProjectStore(project)
+    assert ("running", UNGOVERNED_ORIGINS[0]) in EXPECT_NEITHER, \
+        "the premise: with no request this same row correctly derives neither"
+    wo = _row(store, "running", UNGOVERNED_ORIGINS[0])
+    approval = _hold_a_request(store, wo["id"])
+
+    actor = ops.scheduled_actor(store, wo)
+    assert actor is not None and actor.predicate == "daemon.reviews_gate"
+
+    # The other half of the predicate rule: the pass named really does act on THIS row
+    _expire_the_case(store, approval["id"])
+    gate_sweeper(store)
+
+    closed = store.get_approval(approval["id"])
+    assert (closed["status"], closed["closed_as"]) == ("expired", "abandoned")
+
+
+@pytest.mark.parametrize("status", ["needs_review", "budget_exhausted"])
+def test_a_held_request_names_an_actor_on_a_none_because_status(jarvis_home, project,
+                                                                status):
+    """Those two statuses' `None` was unconditional; it is now the predicate's answer"""
+    store = ProjectStore(project)
+    wo = _row(store, status, "jarvis")
+    _hold_a_request(store, wo["id"])
+
+    actor = ops.scheduled_actor(store, wo)
+
+    assert actor is not None and actor.predicate == "daemon.reviews_gate"
+    assert ops.SCHEDULED_ACTORS[status].none_because

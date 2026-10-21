@@ -1,21 +1,4 @@
-"""The supervisor hands an alarm it cannot settle to Neo, and Neo hands back advice.
-
-§3 of docs/superpowers/specs/2026-08-31-the-supervisor.md.
-
-WHAT THESE TESTS ARE BUILT TO AVOID, and it is one thing said three ways.
-
-`assert store.queued_messages(wo_id) == []` is green on a drain that never ran, green on
-a supervisor that was never enabled, and green on a verdict that carried no dispatch. So
-every negative here is paired with a positive in the SAME test — the alarm row moved off
-`escalated`, or an `alarm_advice` event exists, or a call was counted — and the
-no-cleanup assertion is made against a verdict that genuinely asks for one
-(`FORCE_DISPATCH`).
-
-The branch this file exists for is `Daemon._neo_drain`'s `deliver()`: without the
-`alarm` arm, a non-escalating verdict falls through to `pstore.queue_message` and speaks
-to a worker mid-turn, re-sending its whole conversation at the cache-write rate — the
-exact cost the alarm was raised to report.
-"""
+"""The supervisor hands an alarm it cannot settle to Neo, and Neo hands back advice (docs/superpowers/specs/2026-08-31-the-supervisor.md)"""
 
 from __future__ import annotations
 
@@ -31,13 +14,11 @@ from jarvis.daemon import Daemon
 from jarvis.neo_store import NeoStore
 from jarvis.project_store import ProjectStore
 
-#: Put in a work order's description, this reaches the supervisor's evidence packet and
-#: makes it escalate — and then travels on inside the escalation context, where the fake
-#: reads the alarm-reviewer tokens beside it.
+#: Put in a work order's description
 ESCALATE = "FORCE_SUPERVISOR_ESCALATE"
 
 
-# -- fixtures --------------------------------------------------------------------------
+# -- fixtures
 
 
 def _stamp(at: float) -> str:
@@ -46,11 +27,7 @@ def _stamp(at: float) -> str:
 
 
 def _rows(at: float) -> str:
-    """The smallest transcript `inspection.live_alarms` will raise a `long-turn` on.
-
-    Its prompt row lands AFTER `at`, as `claude` writes it: a transcript turn older than
-    the dispatch is the previous turn, and `alarms` refuses to judge one.
-    """
+    """The smallest transcript `inspection.live_alarms` will raise a `long-turn` on"""
     return "".join(json.dumps(r) + "\n" for r in [
         {"type": "user", "timestamp": _stamp(at + 1), "message": {"content": "go"},
          "promptSource": "sdk"},
@@ -63,8 +40,7 @@ def _rows(at: float) -> str:
 
 
 def _enable(catalog_file: Path, **overrides) -> None:
-    """The supervisor on, EXPLICITLY, in every test that wants it. A fixture default
-    would make `tests/test_supervisor.py`'s ships-disabled pin unfalsifiable."""
+    """The supervisor on, EXPLICITLY, in every test that wants it"""
     data = json.loads(catalog_file.read_text())
     data["os"]["supervisor"] = {"enabled": True, **overrides}
     catalog_file.write_text(json.dumps(data))
@@ -77,11 +53,7 @@ def started(jarvis_home, fake_claude, catalog_file, project):
 
 
 def _burning(daemon, monkeypatch, tmp_path, description: str, status: str = "running"):
-    """One work order with a live `long-turn` alarm, raised the way the daemon raises it.
-
-    `description` is how a test speaks to both agents: it is quoted into the evidence
-    packet, which is the supervisor's prompt AND — via the escalation context — Neo's.
-    """
+    """One work order with a live `long-turn` alarm, raised the way the daemon raises it"""
     root = tmp_path / "projects"
     (root / "-proj").mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
@@ -103,7 +75,7 @@ def _burning(daemon, monkeypatch, tmp_path, description: str, status: str = "run
 
 
 def _supervise(daemon, timeout: float = 20.0) -> None:
-    """One supervisor tick, waited out on the daemon's OWN guard rather than a sleep."""
+    """One supervisor tick, waited out on the daemon's OWN guard rather than a sleep"""
     daemon.supervisor_tick()
     deadline = time.monotonic() + timeout
     while daemon.supervisor_draining and time.monotonic() < deadline:
@@ -148,11 +120,7 @@ def _inbox(wo_id: str) -> list[dict]:
 
 @pytest.fixture()
 def escalated(started, catalog_file, monkeypatch, tmp_path):
-    """An alarm the supervisor has escalated, with its `alarm` question sitting queued.
-
-    Nothing has drained Neo yet, which is what makes this the fixture for both halves:
-    the question as it is FILED, and then whatever `_neo_drain` does with it.
-    """
+    """An alarm the supervisor has escalated, with its `alarm` question sitting queued"""
     def go(extra: str = "", status: str = "running"):
         _enable(catalog_file)
         daemon = started()
@@ -163,15 +131,11 @@ def escalated(started, catalog_file, monkeypatch, tmp_path):
     return go
 
 
-# -- the question the supervisor files -------------------------------------------------
+# -- the question the supervisor files
 
 
 def test_the_escalation_becomes_a_neo_question_and_reaches_no_worker(escalated):
-    """§3's done condition on the filing side.
-
-    The empty-messages assertion is paired with the row that proves a drain really ran:
-    a `questions` row of kind `alarm` that `wo_alarms.neo_question_id` points at.
-    """
+    """§3's done condition on the filing side"""
     _daemon, wo_id = escalated()
 
     alarm = _alarm(wo_id)
@@ -190,13 +154,12 @@ def test_the_escalation_becomes_a_neo_question_and_reaches_no_worker(escalated):
 
     assert _events(wo_id, "alarm_escalated") == [
         {"alarm_id": alarm["id"], "neo_question_id": alarm["neo_question_id"]}]
-    # THE NEGATIVE, and the two rows above are what stop it being vacuous.
+    # THE NEGATIVE, and the two rows above are what stop it being vacuous
     assert _messages(wo_id) == []
 
 
 def test_the_question_carries_the_evidence_packet_and_the_supervisors_reading(escalated):
-    """Neo's call is headless and it can look NOTHING up, so a thin context is a thin
-    answer — this is the whole value of the escalation."""
+    """Neo's call is headless and it can look NOTHING up, so a thin context is a thin answer"""
     _daemon, wo_id = escalated()
     alarm = _alarm(wo_id)
 
@@ -216,11 +179,7 @@ def test_the_question_carries_the_evidence_packet_and_the_supervisors_reading(es
 
 def test_an_escalation_on_a_settled_order_asks_no_question_and_still_reaches_the_user(
         escalated):
-    """Neo can advise nothing about a session that has stopped, so the call is not spent.
-
-    The negative — no `questions` row — is paired with the inbox row, because "no
-    question was filed" is also true of a supervisor that crashed.
-    """
+    """Neo can advise nothing about a session that has stopped, so the call is not spent"""
     _daemon, wo_id = escalated(status="completed")
 
     alarm = _alarm(wo_id)
@@ -240,15 +199,11 @@ def test_an_escalation_on_a_settled_order_asks_no_question_and_still_reaches_the
     assert "completed" in row["body"]
 
 
-# -- what the drain does with the answer -----------------------------------------------
+# -- what the drain does with the answer
 
 
 def test_neos_advice_acks_the_alarm_and_still_reaches_no_worker(escalated):
-    """THE BRANCH-ORDER TEST. A `kind='alarm'` question with a NON-escalating verdict is
-    exactly the shape that falls through to `queue_message` when the `deliver()` arm is
-    missing — so `wo_messages` empty and no `neo_answered` event are the assertions, and
-    the `alarm_advice` event beside them is what proves the drain ran at all.
-    """
+    """THE BRANCH-ORDER TEST"""
     daemon, wo_id = escalated()
     before = _alarm(wo_id)
 
@@ -263,14 +218,13 @@ def test_neos_advice_acks_the_alarm_and_still_reaches_no_worker(escalated):
     assert _events(wo_id, "alarm_advice") == [
         {"alarm_id": alarm["id"], "neo_question_id": before["neo_question_id"],
          "answer": alarm["note"]}]
-    # The pair. Either alone is green on a drain that never happened.
+    # The pair
     assert _messages(wo_id) == []
     assert _events(wo_id, "neo_answered") == []
 
 
 def test_the_advice_reaches_the_user_as_an_inbox_row_pointing_at_the_alarm(escalated):
-    """The row the user gets INSTEAD of an attention item. It carries the alarm's own
-    page, because a note with no way back to the evidence is a claim, not a report."""
+    """The row the user gets INSTEAD of an attention item"""
     daemon, wo_id = escalated()
     daemon._neo_drain()
 
@@ -283,15 +237,7 @@ def test_the_advice_reaches_the_user_as_an_inbox_row_pointing_at_the_alarm(escal
 
 
 def test_the_advice_leaves_a_blocker_the_user_never_saw_standing(escalated):
-    """`ops.ack_os_flag`, never `ops.ack_attention` — issue 573.
-
-    Settling an ALARM says the alarm is judged. It says nothing about the work order's
-    own blockers, and the ack path used to write all of them into
-    `acknowledged_blockers` as if the user had dismissed them — permanently, because
-    `true_blockers` filters them out for ever afterwards. So the order carries a blocker
-    of its own here, and the assertions are that it is still flagged, that the column is
-    still NULL, and that no `acknowledged` event claims otherwise.
-    """
+    """`ops.ack_os_flag`, never `ops.ack_attention` — issue 573"""
     daemon, wo_id = escalated()
     store = ProjectStore(ops.find_work_order(wo_id)[1])
     try:
@@ -315,9 +261,7 @@ def test_the_advice_leaves_a_blocker_the_user_never_saw_standing(escalated):
 
 
 def test_the_advice_puts_the_flag_down_when_nothing_else_blocks(escalated):
-    """The other half of `ack_os_flag`: with no blocker left the flag it raised goes
-    down, and the user's own earlier dismissals are still on the row — `clear_attention`
-    would have NULLed them."""
+    """The other half of `ack_os_flag`: with no blocker left the flag it raised goes down"""
     daemon, wo_id = escalated()
     store = ProjectStore(ops.find_work_order(wo_id)[1])
     try:
@@ -341,8 +285,7 @@ def test_the_advice_puts_the_flag_down_when_nothing_else_blocks(escalated):
 
 
 def test_neo_handing_the_alarm_back_leaves_it_escalated_and_flags_the_user(escalated):
-    """The other outcome. The alarm STAYS `escalated` — it is the user's now — and the
-    inbox row names the command that really decides it, never `jarvis neo answer`."""
+    """The other outcome"""
     daemon, wo_id = escalated(extra="FORCE_ALARM_NEO_ESCALATE")
     before = _alarm(wo_id)
 
@@ -369,12 +312,7 @@ def test_neo_handing_the_alarm_back_leaves_it_escalated_and_flags_the_user(escal
 
 
 def test_an_alarm_verdict_never_files_a_cleanup_work_order(escalated, project):
-    """A cleanup dispatched off a COST OBSERVATION is a work order nobody asked for.
-
-    `FORCE_DISPATCH` is the point: asserting "no cleanup was created" against a verdict
-    that never asked for one grades nothing at all, and this file's whole reason for
-    existing is that such an assertion passes on the broken build too.
-    """
+    """A cleanup dispatched off a COST OBSERVATION is a work order nobody asked for"""
     daemon, wo_id = escalated(extra="FORCE_DISPATCH")
 
     store = ProjectStore(project)
@@ -392,13 +330,12 @@ def test_an_alarm_verdict_never_files_a_cleanup_work_order(escalated, project):
         store.close()
     assert len(after) == before
     assert [w for w in after if w["origin"] == "neo"] == []
-    # The positive partner: the verdict WAS delivered, it just filed nothing.
+    # The positive partner: the verdict WAS delivered, it just filed nothing
     assert _alarm(wo_id)["status"] == "acked"
 
 
 def test_a_verdict_for_an_alarm_the_user_already_decided_is_dropped(escalated):
-    """`ops.review_alarm` is the close site for the question, and the drop guard is what
-    stops Neo's late verdict overwriting the decision the user has already taken."""
+    """`ops.review_alarm` is the close site for the question"""
     daemon, wo_id = escalated()
     alarm_id = _alarm(wo_id)["id"]
     ops.review_alarm(alarm_id, approved=False,
@@ -411,7 +348,7 @@ def test_a_verdict_for_an_alarm_the_user_already_decided_is_dropped(escalated):
     assert alarm["review_status"] == "corrected"
     assert _events(wo_id, "alarm_advice") == []
     assert _messages(wo_id) == []
-    # The positive: the question WAS closed, by the review rather than by the drain.
+    # The positive: the question WAS closed, by the review rather than by the drain
     neo = NeoStore()
     try:
         assert neo.get(alarm["neo_question_id"])["answered_by"] == "os"
@@ -420,10 +357,7 @@ def test_a_verdict_for_an_alarm_the_user_already_decided_is_dropped(escalated):
 
 
 def test_the_review_surfaces_light_up_off_the_pointer_this_section_writes(escalated):
-    """§5 already reads `neo_advice` through `wo_alarms.neo_question_id`; until §3 there
-    was never a pointer to follow, so the field was permanently NULL and the page was
-    untestable. This is the seam between the two, asserted once from the shared read
-    rather than twice from each surface."""
+    """§5 already reads `neo_advice` through `wo_alarms.neo_question_id`"""
     daemon, wo_id = escalated()
     alarm_id = _alarm(wo_id)["id"]
     assert ops.alarm_detail(alarm_id)["neo_advice"] is None
@@ -435,21 +369,13 @@ def test_the_review_surfaces_light_up_off_the_pointer_this_section_writes(escala
     assert detail["neo_question_status"] == "answered"
 
 
-# -- `jarvis status` must not offer the wrong command ----------------------------------
+# -- `jarvis status` must not offer the wrong command
 
 
 @pytest.mark.parametrize("kind", ["approval", "plan", "alarm"])
 def test_a_question_carried_by_its_own_surface_is_not_offered_to_neo_answer(
         jarvis_home, kind):
-    """Each of these is reported by the thing that carries the decision, so telling the
-    user to `jarvis neo answer` one sends them to the wrong command — `jarvis gate
-    approve`, `jarvis fo approve`, `jarvis alarms review`.
-
-    Parametrised over the kinds rather than written once for `alarm`: a fifth kind added
-    without its filter entry is the defect this catches, and the `question` case below is
-    the control that keeps the whole thing from passing on a filter that drops
-    everything.
-    """
+    """Each of these is reported by the thing that carries the decision"""
     neo = NeoStore()
     try:
         q = neo.ask("proj_a", "wo-1", "does this need you?", kind=kind)
@@ -464,22 +390,11 @@ def test_a_question_carried_by_its_own_surface_is_not_offered_to_neo_answer(
     assert [h["id"] for h in held] == [control["id"]]
 
 
-# -- the other door into the worker ----------------------------------------------------
+# -- the other door into the worker
 
 
 def test_answering_an_alarm_question_on_the_neo_surfaces_is_refused(escalated):
-    """THE SECOND WAY AN ALARM COULD REACH A WORKER, and it is not through `deliver()`.
-
-    Neo handing the alarm back leaves an `escalated` question, and every escalated
-    question is answerable through `ops.neo_answer_escalated` — which calls
-    `send_message` into the worker AND `clear_attention`, so one `jarvis neo answer`
-    would do the thing §3 forbids absolutely and wipe the user's own dismissals on the
-    way past (Neo, question 209).
-
-    The refusal names the command that really decides it. The negative — no message —
-    is paired with the alarm still being escalated, which is what makes it a live path
-    rather than an already-closed one.
-    """
+    """THE SECOND WAY AN ALARM COULD REACH A WORKER, and it is not through `deliver()`"""
     daemon, wo_id = escalated(extra="FORCE_ALARM_NEO_ESCALATE")
     daemon._neo_drain()
     qid = _alarm(wo_id)["neo_question_id"]
@@ -498,9 +413,7 @@ def test_answering_an_alarm_question_on_the_neo_surfaces_is_refused(escalated):
 
 
 def test_the_neo_page_sends_an_alarm_question_to_the_alarms_tab(escalated):
-    """The template's half of the same guard, beside the `approval` branch that has been
-    there since the gate flow — a box that errors on submit is a box that should not have
-    been rendered."""
+    """The template's half of the same guard"""
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
 
@@ -518,17 +431,11 @@ def test_the_neo_page_sends_an_alarm_question_to_the_alarms_tab(escalated):
     assert "still running" in page
 
 
-# -- the persona -----------------------------------------------------------------------
+# -- the persona
 
 
 def test_the_alarm_kind_gets_its_own_persona_and_the_others_are_untouched(jarvis_home):
-    """The general answerer persona escalates anything touching production, and an alarm
-    is about spend by construction — so without its own framing every alarm reaches the
-    user and this whole path has bought nothing.
-
-    The byte-identity of the `question` prompt is the other half: the kind map growing
-    must not move the cached prefix every other Neo call shares.
-    """
+    """The general answerer persona escalates anything touching production"""
     from jarvis import neo as neo_mod
     from jarvis.gates import REVIEWER_PERSONA
     from jarvis.plans import PLAN_REVIEWER_PERSONA
@@ -544,17 +451,14 @@ def test_the_alarm_kind_gets_its_own_persona_and_the_others_are_untouched(jarvis
         assert alarm != default
         assert not alarm.startswith(REVIEWER_PERSONA)
         assert not alarm.startswith(PLAN_REVIEWER_PERSONA)
-        # Byte-stable per kind, which is what keeps consecutive alarm reviews on one
-        # cached prefix — the property the FIFO drain is built around.
+        # Byte-stable per kind, which is what keeps consecutive alarm reviews on one cached prefix
         assert alarm == neo_mod.build_system_prompt(store, "proj_a", kind="alarm")
     finally:
         store.close()
 
 
 def test_the_persona_lives_with_the_code_that_files_the_question(jarvis_home):
-    """`neo.py` holds no reviewer prose: `REVIEWER_PERSONA` comes from `gates`,
-    `PLAN_REVIEWER_PERSONA` from `plans` and this one from `supervisor`, so each is read
-    and reviewed beside the code that decides when to ask."""
+    """`neo.py` holds no reviewer prose: `REVIEWER_PERSONA` comes from `gates`"""
     source = Path(__import__("jarvis.neo", fromlist=["neo"]).__file__).read_text()
 
     assert "ALARM_REVIEWER_PERSONA" in source
@@ -570,17 +474,10 @@ def test_the_persona_lives_with_the_code_that_files_the_question(jarvis_home):
 ])
 def test_the_packet_says_which_of_the_three_session_shapes_is_burning(
         kind, parent, expected):
-    """An alarm is always raised against a work order, but `WO_KINDS` has three members
-    and two of them belong to a FEATURE order (PR 173 review). An hour is routine on a
-    planner reading a codebase and a symptom on a one-file worker, so the judge is shown
-    which it is rather than told to weigh something it cannot see.
-
-    Parametrised across all three plus the no-`kind` row: a helper that returned the same
-    sentence for everything would satisfy any single case.
-    """
+    """An alarm is always raised against a work order"""
     assert expected in supervisor._what_it_is(
         {"kind": kind, "parent_id": parent})
-    # Non-vacuous: the three shapes must actually differ from one another.
+    # Non-vacuous: the three shapes must actually differ from one another
     said = {supervisor._what_it_is({"kind": k, "parent_id": "fo-1"})
             for k in ("worker", "planner", "manager")}
     assert len(said) == 3
@@ -588,9 +485,7 @@ def test_the_packet_says_which_of_the_three_session_shapes_is_burning(
 
 def test_both_judges_are_shown_the_session_shape_in_the_same_packet(
         started, monkeypatch, tmp_path):
-    """`build_evidence` is the supervisor's prompt AND, forwarded as the escalation
-    context, Neo's — so one line reaches both readers and they cannot disagree about what
-    kind of session they are looking at."""
+    """`build_evidence` is the supervisor's prompt AND, forwarded as the escalation context, Neo's"""
     daemon = started()
     wo_id = _burning(daemon, monkeypatch, tmp_path, description="a long brief")
     store = ProjectStore(ops.find_work_order(wo_id)[1])
@@ -611,9 +506,7 @@ def test_both_judges_are_shown_the_session_shape_in_the_same_packet(
 
 
 def test_the_alarm_reviewer_is_told_not_to_escalate_on_spend_alone():
-    """The one instruction that separates this persona from the general one. Asserted
-    because getting it wrong is invisible: every alarm would simply reach the user, which
-    is indistinguishable from the feature being switched off."""
+    """The one instruction that separates this persona from the general one"""
     persona = supervisor.ALARM_REVIEWER_PERSONA
 
     assert "DO NOT ESCALATE MERELY BECAUSE MONEY WAS SPENT" in persona

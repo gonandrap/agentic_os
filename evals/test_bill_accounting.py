@@ -1,21 +1,4 @@
-"""Does the bill account for every token, measured against the raw records?
-
-`tests/test_bill.py` checks that the bill is internally consistent — that its parts sum
-to its whole. That is necessary and it is not the claim the page makes. A bill can be
-perfectly self-consistent and still be missing a third of the spend, which is exactly
-what the surface it replaced was doing: it reported the turns whose result JSON survived
-and said nothing about the rest.
-
-So the ground truth here is computed INDEPENDENTLY of `jarvis.bill`, out of the three
-places spend is actually stored — `wo_turns.usage_json`, the `agent_calls` table, and
-Claude Code's session transcript — and the bill is compared against it. An eval that
-re-derived the total the same way the code does would only be able to prove the code
-agrees with itself.
-
-Every scenario runs the REAL dispatch path against the fake `claude` CLI, so what is
-being measured includes the capture (`derive_turn_usage`), the persistence and the
-reader, not just the arithmetic at the end.
-"""
+"""Does the bill account for every token, measured against the raw records?"""
 
 from __future__ import annotations
 
@@ -31,16 +14,11 @@ from jarvis.project_store import ProjectStore
 scenario = pytest.mark.scenario
 
 
-# -- ground truth, from the stores rather than from the bill ---------------------------
+# -- ground truth, from the stores rather than from the bill
 
 
 def raw_spend(project_path, wo_id: str) -> dict[str, int]:
-    """Every token recorded against one work order, summed straight out of storage.
-
-    Deliberately naive and deliberately duplicated from nothing: two readings of the
-    same rows that agree are evidence, and a helper shared with the implementation
-    would be one reading twice.
-    """
+    """Every token recorded against one work order, summed straight out of storage"""
     totals = {"input": 0, "cache_write": 0, "cache_read": 0, "output": 0}
     store = ProjectStore(project_path)
     try:
@@ -81,18 +59,7 @@ def message_row(mid: str, when: float, **tokens) -> dict:
 def plant_subagent(fleet, root, wo_id: str, *, write: int, out: int,
                    agent_type: str = "Explore",
                    description: str = "check the schema") -> None:
-    """Write the session transcript Claude Code would have written, subagent and all.
-
-    Not a stub of `read_session`: the eval is about whether the OS finds a subagent
-    where the tool ACTUALLY puts it — beside the parent transcript, under a directory
-    named for the parent session, with a `.meta.json` naming what it was for.
-
-    The two files together are built to sum to what the turns already recorded, because
-    that is the real relationship: `modelUsage` counts subagents, so a session's
-    transcript (main + subagents) equals its turns. Planting a subagent whose tokens
-    were NOT already inside the turn would be testing a situation that cannot happen and
-    would hide the double count this partition exists to prevent.
-    """
+    """Write the session transcript Claude Code would have written, subagent and all"""
     store = ProjectStore(fleet["path"])
     try:
         wo = store.get_work_order(wo_id)
@@ -135,9 +102,7 @@ def os_call(wo_id: str, kind: str, label: str = "", **over) -> None:
 
 @pytest.fixture()
 def transcripts(tmp_path, monkeypatch):
-    """A transcript tree of this eval's own. The fake `claude` writes no session file,
-    so anything about reading one has to plant it — and must never be able to reach the
-    real `~/.claude/projects` while doing so."""
+    """A transcript tree of this eval's own"""
     root = tmp_path / "transcripts"
     root.mkdir()
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
@@ -146,11 +111,7 @@ def transcripts(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def fleet(jarvis_home, project, fake_claude, catalog_file):
-    """The OS started over one project, with a daemon to drive dispatch by hand.
-
-    The real path on purpose: this eval is about what the OS actually records, so a
-    turn has to be dispatched, run by the fake CLI and reaped the way a live one is.
-    """
+    """The OS started over one project, with a daemon to drive dispatch by hand"""
     from jarvis.catalog import load_catalog
     from jarvis.daemon import Daemon
 
@@ -159,7 +120,7 @@ def fleet(jarvis_home, project, fake_claude, catalog_file):
 
 
 def dispatched(fleet, settle_turns, title: str = "an order", turns: int = 1):
-    """A work order taken through the real dispatch path, with `turns` settled turns."""
+    """A work order taken through the real dispatch path, with `turns` settled turns"""
     wo = ops.create_work_order("proj_a", title)
     store = ProjectStore(fleet["path"])
     try:
@@ -174,16 +135,12 @@ def dispatched(fleet, settle_turns, title: str = "an order", turns: int = 1):
     return wo
 
 
-# -- the scenarios ---------------------------------------------------------------------
+# -- the scenarios
 
 
 @scenario("bill accounting", "the bill totals every token in the stores")
 def test_the_bill_equals_the_raw_records(fleet, settle_turns):
-    """The headline claim: nothing recorded is left off the bill.
-
-    All three classes of spend on one order, because the failure that motivated this is
-    a whole class going missing rather than a rounding difference.
-    """
+    """The headline claim: nothing recorded is left off the bill"""
     wo = dispatched(fleet, settle_turns, "an order that asked for help", turns=3)
     os_call(wo["id"], "neo_answer", "question", question_id=1)
     for seat in ("premise", "record", "blast", "taste", "chair"):
@@ -198,13 +155,7 @@ def test_the_bill_equals_the_raw_records(fleet, settle_turns):
 
 @scenario("bill accounting", "a turn's tokens are the whole turn, not its tail")
 def test_the_recorded_turn_is_the_model_usage_total(fleet, settle_turns):
-    """The correction this feature turned on, end to end through the real capture.
-
-    The fake CLI reports `usage` as the tail of the turn and `modelUsage` as the whole
-    of it, in the proportion the real one does. A turn recorded from the wrong object
-    understates by roughly two thirds — and the fake is built so that this test is the
-    thing that notices.
-    """
+    """The correction this feature turned on, end to end through the real capture"""
     wo = dispatched(fleet, settle_turns, "one turn")
 
     b = ops.bill(wo["id"])
@@ -218,15 +169,7 @@ def test_the_recorded_turn_is_the_model_usage_total(fleet, settle_turns):
 
 @scenario("bill accounting", "a turn's tokens are its own, not the session's so far")
 def test_a_conversation_is_billed_once_per_turn(fleet, settle_turns):
-    """The same correction one turn along, which is where it was wrong for months.
-
-    The fake CLI reports `modelUsage` and `total_cost_usd` as running totals for the
-    resumed session, because the real one has since 2.1.277. A three-turn order
-    therefore has to come to three times a one-turn order — summing what each envelope
-    reports comes to SIX times it, and that is the 3-6x every multi-turn bill carried
-    (issue #470). Asserted against the single-turn figures above rather than against
-    the stores, which hold whatever the capture put there.
-    """
+    """The same correction one turn along, which is where it was wrong for months (#470)"""
     wo = dispatched(fleet, settle_turns, "three turns of one conversation", turns=3)
 
     b = ops.bill(wo["id"])
@@ -274,10 +217,7 @@ def test_a_feature_orders_bill_is_its_orders(fleet, settle_turns):
     assert b["checks"]["balanced"], b["checks"]["problems"]
     assert sum(o["total"]["tokens"]["total"] for o in b["orders"]) \
         == b["total"]["tokens"]["total"]
-    # THE PLANNER COUNTS. The daemon plans a pending feature order itself, and that
-    # session is usually the dearest thing an unfinished feature has spent — a bill
-    # that listed only the children would understate exactly the feature someone is
-    # asking about.
+    # THE PLANNER COUNTS
     store = ProjectStore(fleet["path"])
     try:
         planner = store.get_feature_order(fo["id"])["plan_wo_id"]
@@ -292,8 +232,7 @@ def test_a_feature_orders_bill_is_its_orders(fleet, settle_turns):
 @scenario("bill accounting", "spend survives a pruned transcript")
 def test_an_order_with_no_transcript_still_bills_what_was_recorded(fleet,
                                                                   settle_turns):
-    """Recorded turns and `agent_calls` are the OS's own records and outlive the
-    transcript Claude Code prunes on its own schedule."""
+    """Recorded turns and `agent_calls` are the OS's own records and outlive the transcript Claude Code..."""
     wo = dispatched(fleet, settle_turns, "pruned but not free", turns=2)
     os_call(wo["id"], "neo_answer", "question", question_id=1)
 
@@ -307,8 +246,7 @@ def test_an_order_with_no_transcript_still_bills_what_was_recorded(fleet,
 
 @scenario("bill accounting", "an order that spent nothing says so")
 def test_an_undispatched_order_is_empty_not_wrong(fleet):
-    """Zero is a real answer here, and it must still balance — an empty bill that
-    reported a phantom line would be the same failure in the other direction."""
+    """Zero is a real answer here, and it must still balance"""
     wo = ops.create_work_order("proj_a", "never dispatched")
 
     b = ops.bill(wo["id"])
@@ -320,8 +258,7 @@ def test_an_undispatched_order_is_empty_not_wrong(fleet):
 
 @scenario("bill accounting", "the CLI and the dashboard bill the same order alike")
 def test_one_payload_behind_both_surfaces(fleet, settle_turns, capsys):
-    """Two renderers, one payload. The moment they compute their own totals, a user
-    reading the terminal and a user reading the page are told different things."""
+    """Two renderers, one payload"""
     from jarvis import cli
 
     wo = dispatched(fleet, settle_turns, "rendered twice", turns=2)
@@ -339,13 +276,7 @@ def test_one_payload_behind_both_surfaces(fleet, settle_turns, capsys):
 @scenario("bill accounting", "agents sum to the worker, subagents included")
 def test_every_agent_of_an_order_is_the_workers_whole_session(fleet, settle_turns,
                                                               transcripts):
-    """The identity the user stated, through the real dispatch path.
-
-    A subagent transcript is planted beside the worker's session exactly where Claude
-    Code writes one, so `read_session` finds it the way it does in production. The claim
-    under test is not "the numbers look right" but that the agent rows are a PARTITION:
-    they sum to the worker's session, and the worker plus the OS is the order.
-    """
+    """The identity the user stated, through the real dispatch path"""
     wo = dispatched(fleet, settle_turns, "an order that spawned help")
     os_call(wo["id"], "neo_answer", "question", question_id=1)
     plant_subagent(fleet, transcripts, wo["id"], write=400, out=30)
@@ -356,8 +287,7 @@ def test_every_agent_of_an_order_is_the_workers_whole_session(fleet, settle_turn
     agents = sum(line["tokens"]["total"] for line in b["agents"])
     assert agents == worker["tokens"]["total"]
     assert worker["tokens"]["total"] < b["total"]["tokens"]["total"]  # the OS spent too
-    # The subagent is itemised and named, and the worker's total did NOT grow by it:
-    # its tokens were already inside the turn's own modelUsage figure.
+    # The subagent is itemised and named
     labels = {line["label"] for line in b["agents"]}
     assert "Explore · check the schema" in labels
     assert bill_tokens(b) == raw_spend(fleet["path"], wo["id"])
@@ -366,9 +296,7 @@ def test_every_agent_of_an_order_is_the_workers_whole_session(fleet, settle_turn
 
 @scenario("bill accounting", "a settled order's bill is sealed, not recomputed")
 def test_the_daemon_seals_a_settled_orders_bill(fleet, settle_turns):
-    """A bill is built from evidence that expires. The tick freezes it while it is
-    still there, and every later reading comes from the freeze — which is the only
-    reason the figure a user cites today is the figure they can cite next year."""
+    """A bill is built from evidence that expires"""
     wo = dispatched(fleet, settle_turns, "an order to be sealed")
     os_call(wo["id"], "neo_answer", "question", question_id=1)
     ops.finish(wo["id"], summary="done")
@@ -386,7 +314,7 @@ def test_the_daemon_seals_a_settled_orders_bill(fleet, settle_turns):
     assert sealed["total"]["tokens"] == live["total"]["tokens"]
     assert sealed["accuracy"]["sealed_at"] == row["bill_sealed_at"]
     assert sealed["checks"]["balanced"], sealed["checks"]["problems"]
-    # The seal is the whole payload, not a headline: everything the page draws survives.
+    # The seal is the whole payload, not a headline: everything the page draws survives
     assert sealed["actors"] and sealed["turns"] and sealed["agents"]
     assert sum(line["tokens"]["total"] for line in sealed["turns"]) \
         == sealed["total"]["tokens"]["total"]

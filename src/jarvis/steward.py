@@ -1,15 +1,4 @@
-"""The steward: what the OS may spend on itself (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md)
-
-Every finder the OS runs is a model asked "what is wrong?", and a model asked that almost
-never answers "nothing". The brakes (`os.autonomy.self_dispatch`) made evolution either off
-or unbounded; this module is the steering between the two: ONE place the OS asks "may I
-spend on this?", answered by rules over a ledger. No model call, by design — a model
-enforcing its own budget is the defect the spec exists for (§4). Models RATE (the severity
-a candidate arrives with); this module DECIDES.
-
-`gate` is the only entry point a dispatch site calls. In `shadow` mode it records what it
-would have done and hands back today's behaviour; in `enforce` it applies the decision.
-"""
+"""The steward: what the OS may spend on itself (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md)"""
 
 from __future__ import annotations
 
@@ -27,52 +16,47 @@ if TYPE_CHECKING:  # pragma: no cover
 
 log = logging.getLogger(__name__)
 
-# §3.0 — one scale, least to most severe.
+# §3.0 — one scale, least to most severe
 SEVERITIES = ("cosmetic", "minor", "medium", "major", "critical", "blocker")
 LOW = ("cosmetic", "minor")
 URGENT = ("critical", "blocker")
-#: `jarvis bug report --priority` on the §3.0 scale.
+#: `jarvis bug report --priority` on the §3.0 scale
 BUG_PRIORITY_SEVERITY = {"low": "minor", "medium": "medium", "high": "major",
                          "critical": "critical", "blocker": "blocker"}
 
-#: Where OS-originated work comes from (§3.4). The steward never sees user-typed work.
+#: Where OS-originated work comes from (§3.4)
 ORIGIN_KINDS = ("bug_agent", "investigation", "neo_rider", "red_main", "release",
                 "remedy", "panel")
 
 OUTCOMES = ("dispatch", "queue", "drop", "ask")
 
-#: The work-order metadata key every steward-dispatched order carries: its provenance.
+#: The work-order metadata key every steward-dispatched order carries: its provenance
 STAMP_KEY = "steward"
 
 WINDOW_SECONDS = 7 * 86400
 PRECISION_WINDOW_SECONDS = 28 * 86400
-#: A detector is judged on at least this many dispatched orders before it can be throttled.
+#: A detector is judged on at least this many dispatched orders before it can be throttled
 PRECISION_MIN_SAMPLES = 5
 
-#: Events on a work order that mean the USER engaged with it (§3.2 decision 2).
+#: Events on a work order that mean the USER engaged with it (§3.2 decision 2)
 USER_TOUCH_EVENTS = ("reviewed", "retry_requested", "budget_set", "budget_resumed")
 
 
 def severity_rank(level: str) -> int:
-    """Position on the §3.0 scale; an unknown word ranks as `medium`, neither ignored nor urgent."""
+    """Position on the §3.0 scale; an unknown word ranks as `medium`, neither ignored nor urgent"""
     level = (level or "").strip().lower()
     return SEVERITIES.index(level) if level in SEVERITIES else SEVERITIES.index("medium")
 
 
 def normalise(level: str) -> str:
-    """A rating on the §3.0 scale. Bug priorities map; anything unknown reads as `medium`."""
+    """A rating on the §3.0 scale"""
     level = (level or "").strip().lower()
     level = BUG_PRIORITY_SEVERITY.get(level, level)
     return level if level in SEVERITIES else "medium"
 
 
 def apply_evidence(level: str, evidence: Sequence[str]) -> str:
-    """§3.0's evidence rule: `major` or above without evidence is lowered one level.
-
-    Applied by code, never by the rater: the eval (PR #1122) caught haiku rating an
-    unclosed file `medium` and writing a failure scenario for it, so a rating is only
-    trusted as far as the thing it points at exists.
-    """
+    """§3.0's evidence rule: `major` or above without evidence is lowered one level (#1122)"""
     level = normalise(level)
     if severity_rank(level) >= severity_rank("major") and not any(
             str(e).strip() for e in evidence):
@@ -82,16 +66,16 @@ def apply_evidence(level: str, evidence: Sequence[str]) -> str:
 
 @dataclass
 class Candidate:
-    """One piece of work the OS proposes for itself."""
+    """One piece of work the OS proposes for itself"""
 
     origin_kind: str
     severity: str
     project: str
     subject: str
     evidence: tuple[str, ...] = ()
-    #: The order whose run caused this one — what `generation` is counted from.
+    #: The order whose run caused this one — what `generation` is counted from
     parent_wo_id: str = ""
-    #: Distinct orders referencing the subject (`jarvis issues`' count), when it has one.
+    #: Distinct orders referencing the subject (`jarvis issues`' count), when it has one
     refs: int = 0
 
     def __post_init__(self) -> None:
@@ -100,7 +84,7 @@ class Candidate:
 
 @dataclass
 class Ledger:
-    """Rolling 7-day spend, list-price USD (§3.2 decision 3)."""
+    """Rolling 7-day spend, list-price USD (§3.2 decision 3)"""
 
     evolution_usd: float = 0.0
     critical_usd: float = 0.0
@@ -116,7 +100,7 @@ class Decision:
     claimed_severity: str
     generation: int
     mode: str
-    #: Whether the caller may dispatch NOW. Shadow mode: today's answer. Enforce: the rule's.
+    #: Whether the caller may dispatch NOW
     allowed: bool = False
     budget_usd: float | None = None
     decision_id: int = 0
@@ -128,7 +112,7 @@ class Decision:
 
 
 def stamp_of(wo: Mapping[str, Any] | None) -> dict[str, Any]:
-    """An order's steward provenance, or {} for one the steward never decided."""
+    """An order's steward provenance, or {} for one the steward never decided"""
     if not wo:
         return {}
     meta = db.from_json(wo.get("metadata"), {}) or {}
@@ -137,13 +121,7 @@ def stamp_of(wo: Mapping[str, Any] | None) -> dict[str, Any]:
 
 
 def lineage(store: ProjectStore | None, parent_wo_id: str) -> tuple[int, str]:
-    """(generation the candidate WOULD have, origin kind of its parent or '').
-
-    Generation 0 is user-originated work. A parent the steward never stamped is treated as
-    user-originated: before the steward, the only orders with no stamp are the ones that
-    did not pass through it, and counting them as generation 0 errs toward allowing work,
-    never toward a cascade that cannot be broken (the cap still applies one level down).
-    """
+    """(generation the candidate WOULD have, origin kind of its parent or '')"""
     if store is None or not parent_wo_id:
         return 1, ""
     try:
@@ -156,13 +134,13 @@ def lineage(store: ProjectStore | None, parent_wo_id: str) -> tuple[int, str]:
 
 def decide(c: Candidate, cfg: EvolutionConfig, ledger: Ledger, *, generation: int,
            parent_kind: str = "", throttled: bool = False) -> tuple[str, str, str, str]:
-    """(outcome, rule, reason, severity) — §3.2 decision 1, first matching rule wins. Pure."""
+    """(outcome, rule, reason, severity) — §3.2 decision 1, first matching rule wins"""
     severity = apply_evidence(c.severity, c.evidence)
     room = cfg.weekly_usd - ledger.evolution_usd
     if severity in LOW:
         return "drop", "low-severity", f"`{severity}` is never worth an order", severity
     if c.origin_kind == "release":
-        # A7: releases ship what already landed; counted on the ledger, not gated by it.
+        # A7: releases ship what already landed; counted on the ledger, not gated by it
         return "dispatch", "release", "a landed fix ships", severity
     if generation > cfg.max_depth:
         return ("queue", "max-depth",
@@ -210,7 +188,7 @@ def _project_stores(catalog: Catalog) -> Iterable[tuple[str, Path]]:
 
 
 def stamped_orders(store: ProjectStore, since: float) -> list[dict[str, Any]]:
-    """Every order the steward dispatched that was created since `since`."""
+    """Every order the steward dispatched that was created since `since`"""
     rows = store.conn.execute(
         "SELECT * FROM work_orders WHERE created_at>=? AND metadata LIKE ?",
         (since, f'%"{STAMP_KEY}"%')).fetchall()
@@ -219,12 +197,7 @@ def stamped_orders(store: ProjectStore, since: float) -> list[dict[str, Any]]:
 
 def ledger(catalog: Catalog, central: CentralStore | None = None, *,
            now: float | None = None) -> Ledger:
-    """The rolling-7-day ledger, fleet-wide.
-
-    Evolution spend is each stamped order's bill so far PLUS what is still reserved on it
-    (its budget minus its spend, while open), so two candidates decided in one tick cannot
-    both spend the same remainder — the family-budget rule, one level up.
-    """
+    """The rolling-7-day ledger, fleet-wide"""
     from . import budget
     from .project_store import OPEN_STATUSES, ProjectStore
 
@@ -268,7 +241,7 @@ def touched(store: ProjectStore, wo_id: str) -> bool:
 
 
 def precision(catalog: Catalog, *, now: float | None = None) -> dict[str, tuple[int, int]]:
-    """{origin_kind: (touched, dispatched)} over the last 28 days of stamped orders."""
+    """{origin_kind: (touched, dispatched)} over the last 28 days of stamped orders"""
     from .project_store import ProjectStore
 
     since = (now if now is not None else db.now()) - PRECISION_WINDOW_SECONDS
@@ -286,7 +259,7 @@ def precision(catalog: Catalog, *, now: float | None = None) -> dict[str, tuple[
 
 
 def throttled(cfg: EvolutionConfig, counts: Mapping[str, tuple[int, int]]) -> set[str]:
-    """Detectors below `min_precision` on enough samples to say so (§3.2 decision 2)."""
+    """Detectors below `min_precision` on enough samples to say so (§3.2 decision 2)"""
     return {kind for kind, (hit, total) in counts.items()
             if total >= PRECISION_MIN_SAMPLES and hit / total < cfg.min_precision}
 
@@ -297,14 +270,7 @@ def throttled(cfg: EvolutionConfig, counts: Mapping[str, tuple[int, int]]) -> se
 def gate(c: Candidate, *, catalog: Catalog, store: ProjectStore | None = None,
          central: CentralStore | None = None, self_dispatch: bool | None = None,
          now: float | None = None) -> Decision:
-    """Decide, record, and say whether the caller may dispatch now.
-
-    `self_dispatch` is today's answer at the call site (A12: still the master switch).
-    Shadow: `allowed` IS that answer and nothing else changes. Enforce: `allowed` is the
-    decision AND the switch. Never raises: a steward that cannot read its ledger falls back
-    to today's behaviour and says so in the log, because a failed read must not become a
-    silent change in what the OS dispatches.
-    """
+    """Decide, record, and say whether the caller may dispatch now"""
     from .central_store import CentralStore
 
     cfg = catalog.os.evolution
@@ -340,8 +306,7 @@ def gate(c: Candidate, *, catalog: Catalog, store: ProjectStore | None = None,
                           "severity": severity, "mode": mode}
         repeat = _repeat_of(central, c, outcome, now)
         if repeat:
-            # A site the daemon re-asks every tick (a red `main`, a held order) gets ONE
-            # row per hour, not one per tick: the table is read by a person.
+            # A site the daemon re-asks every tick (a red `main`
             decision.decision_id = repeat
             decision.stamp["decision_id"] = repeat
             return decision
@@ -364,13 +329,13 @@ def gate(c: Candidate, *, catalog: Catalog, store: ProjectStore | None = None,
             central.close()
 
 
-#: How long an identical decision is not recorded again.
+#: How long an identical decision is not recorded again
 REPEAT_SECONDS = 3600
 
 
 def _repeat_of(central: CentralStore, c: Candidate, outcome: str,
                now: float | None) -> int:
-    """The id of the same decision about the same subject in the last hour, or 0."""
+    """The id of the same decision about the same subject in the last hour, or 0"""
     since = (now if now is not None else db.now()) - REPEAT_SECONDS
     row = central.conn.execute(
         "SELECT id FROM steward_decisions WHERE ts>=? AND project=? AND origin_kind=? "
@@ -380,12 +345,12 @@ def _repeat_of(central: CentralStore, c: Candidate, outcome: str,
 
 
 def stamped(metadata: Mapping[str, Any] | None, decision: Decision) -> dict[str, Any]:
-    """`metadata` with the decision's provenance on it — written AT CREATION (`ops.create_work_order`)."""
+    """`metadata` with the decision's provenance on it — written AT CREATION (`ops.create_work_order`)"""
     return {**(metadata or {}), STAMP_KEY: decision.stamp}
 
 
 def linked(decision: Decision, wo_id: str, central: CentralStore | None = None) -> None:
-    """Record which order a decision led to. Best effort: the order exists either way."""
+    """Record which order a decision led to"""
     if not decision.decision_id or not wo_id:
         return
     from .central_store import CentralStore
@@ -407,7 +372,7 @@ def linked(decision: Decision, wo_id: str, central: CentralStore | None = None) 
 
 def digest(catalog: Catalog, central: CentralStore, *, now: float | None = None
            ) -> dict[str, Any]:
-    """§3.2 decision 2's one artefact: spend by detector, what was held back, precision."""
+    """§3.2 decision 2's one artefact: spend by detector, what was held back, precision"""
     now = now if now is not None else db.now()
     cfg = catalog.os.evolution
     book = ledger(catalog, central, now=now)
@@ -445,7 +410,7 @@ def render_digest(d: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
-#: os_state key holding when the weekly digest last went to the inbox.
+#: os_state key holding when the weekly digest last went to the inbox
 DIGEST_STATE_KEY = "steward_digest_at"
 
 
@@ -456,7 +421,7 @@ def digest_due(central: CentralStore, *, now: float | None = None) -> bool:
 
 def send_digest(catalog: Catalog, central: CentralStore, *, now: float | None = None
                 ) -> int:
-    """One inbox item a week; 0 when the steward decided nothing that week."""
+    """One inbox item a week; 0 when the steward decided nothing that week"""
     now = now if now is not None else db.now()
     d = digest(catalog, central, now=now)
     central.set_state(DIGEST_STATE_KEY, str(now))

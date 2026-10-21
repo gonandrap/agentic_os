@@ -1,17 +1,4 @@
-"""install.sh — the curl-able installer new users land on.
-
-The contract it has to keep:
-  * installs a RELEASE TAG (jarvis-X.Y.Z), never `main`, even though the script itself
-    is fetched from main;
-  * picks the newest tag by NUMBER, so jarvis-0.1.10 wins over jarvis-0.1.9;
-  * leaves an existing catalog alone (re-running it is the upgrade path);
-  * tells the user how to onboard a project when it's done.
-
-These drive the real install.sh in --dry-run against a throwaway local remote, so
-nothing is downloaded, installed, or written outside tmp_path. The one test that
-performs a REAL install is opt-in (JARVIS_TEST_INSTALL=1) because it needs uv/pipx
-and the network.
-"""
+"""install.sh — the curl-able installer new users land on"""
 
 from __future__ import annotations
 
@@ -28,8 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALL_SH = REPO_ROOT / "install.sh"
 README = REPO_ROOT / "README.md"
 
-#: The URL the README (and the world) tells people to curl. Kept in one place so the
-#: doc and the script can be checked against each other.
+#: The URL the README (and the world) tells people to curl
 CURL_URL = "https://raw.githubusercontent.com/gonandrap/agentic_os/main/install.sh"
 
 
@@ -39,7 +25,7 @@ def _git(repo: Path, *args: str) -> str:
 
 
 def _remote_with_tags(tmp_path: Path, *tags: str) -> Path:
-    """A bare repo standing in for GitHub, carrying the given tags."""
+    """A bare repo standing in for GitHub, carrying the given tags"""
     work = tmp_path / "work"
     work.mkdir()
     (work / "pyproject.toml").write_text('[project]\nname = "jarvis-os"\nversion = "0.0.0"\n')
@@ -58,7 +44,7 @@ def _remote_with_tags(tmp_path: Path, *tags: str) -> Path:
 
 def _install(tmp_path: Path, *args: str, remote: Path | None = None,
              env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-    """Run install.sh --dry-run, pointed entirely at tmp_path."""
+    """Run install.sh --dry-run, pointed entirely at tmp_path"""
     cmd = ["bash", str(INSTALL_SH), "--dry-run",
            "--bin-dir", str(tmp_path / "bin"),
            "--catalog", str(tmp_path / "home" / "catalog.json")]
@@ -80,7 +66,7 @@ def test_is_executable():
 
 
 def test_help_works_without_a_script_file_on_disk():
-    """`curl … | bash -s -- --help` has no $0 to read, so the help must be inline."""
+    """`curl … | bash -s -- --help` has no $0 to read, so the help must be inline"""
     r = subprocess.run(["bash", "-s", "--", "--help"], stdin=INSTALL_SH.open(),
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
@@ -96,7 +82,7 @@ def test_installs_the_newest_release_tag_not_main(tmp_path):
 
 
 def test_newest_tag_is_compared_numerically(tmp_path):
-    """Lexical sorting would pick 0.1.9 — the tenth patch release must win."""
+    """Lexical sorting would pick 0.1.9 — the tenth patch release must win"""
     remote = _remote_with_tags(tmp_path, "jarvis-0.1.9", "jarvis-0.1.10")
     r = _install(tmp_path, remote=remote)
     assert r.returncode == 0, r.stderr
@@ -140,7 +126,7 @@ def test_installs_the_ui_extra_by_default_and_skips_it_on_demand(tmp_path):
 
 
 def test_never_installs_over_an_existing_catalog(tmp_path):
-    """Re-running the installer is the upgrade path; the fleet must survive it."""
+    """Re-running the installer is the upgrade path; the fleet must survive it"""
     remote = _remote_with_tags(tmp_path, "jarvis-1.0.0")
     catalog = tmp_path / "home" / "catalog.json"
     catalog.parent.mkdir(parents=True)
@@ -152,14 +138,7 @@ def test_never_installs_over_an_existing_catalog(tmp_path):
 
 
 def _interpreter_dir(tmp_path: Path) -> Path:
-    """A directory holding a `python3.13` this test's restricted PATH can find.
-
-    The prerequisite gate wants uv, pipx or Python >= 3.13, and a test that narrows PATH
-    to the system directories is at the mercy of whatever the distro ships — Ubuntu 24.04
-    LTS ships 3.12, so `/usr/bin:/bin` alone fails the gate for a reason that has nothing
-    to do with what the test is about. Symlinking the RUNNING interpreter (which is >=
-    3.13 by `requires-python`) keeps the gate satisfied without weakening it.
-    """
+    """A directory holding a `python3.13` this test's restricted PATH can find"""
     shim = tmp_path / "interp"
     shim.mkdir(exist_ok=True)
     (shim / "python3.13").symlink_to(sys.executable)
@@ -167,7 +146,7 @@ def _interpreter_dir(tmp_path: Path) -> Path:
 
 
 def test_warns_when_the_bin_dir_is_not_on_path(tmp_path):
-    """Workers and hooks invoke `jarvis` by name — a silent off-PATH install is a trap."""
+    """Workers and hooks invoke `jarvis` by name — a silent off-PATH install is a trap"""
     remote = _remote_with_tags(tmp_path, "jarvis-1.0.0")
     path = f"{_interpreter_dir(tmp_path)}:/usr/bin:/bin"
     r = _install(tmp_path, remote=remote, env={"PATH": path})
@@ -176,17 +155,9 @@ def test_warns_when_the_bin_dir_is_not_on_path(tmp_path):
 
 
 def test_an_interpreter_below_the_floor_is_refused_rather_than_used(tmp_path):
-    """The other side of raising `requires-python` to >= 3.13 (2026-09-19), and the
-    reason it is a real narrowing rather than a rename: a machine whose newest Python is
-    3.12 — Ubuntu 24.04 LTS, today — is now told so instead of getting an install that
-    fails later. The message has to name the way out, because `uv` provisions its own
-    interpreter and is the one-line fix."""
+    """The other side of raising `requires-python` to >= 3.13 (2026-09-19)"""
     remote = _remote_with_tags(tmp_path, "jarvis-1.0.0")
-    # Shims FIRST on PATH so they shadow whatever the machine ships, and one per
-    # candidate the probe tries. Each exits non-zero for the version check, which is
-    # what "older than 3.13" looks like to `python_ok`. The system directories stay on
-    # PATH because the installer needs git and tar; uv and pipx are not in them, here
-    # or on a GitHub runner, so the gate has nothing else to fall back to.
+    # Shims FIRST on PATH so they shadow whatever the machine ships, and one per candidate the probe tries
     old = tmp_path / "old"
     old.mkdir()
     for name in ("python3.13", "python3", "python"):
@@ -210,15 +181,14 @@ def test_tells_the_user_how_to_onboard_a_project(tmp_path):
 
 
 def test_readme_leads_with_the_curl_one_liner():
-    """A new user's first screen has to contain the install command."""
+    """A new user's first screen has to contain the install command"""
     first_screen = "\n".join(README.read_text().splitlines()[:30])
     assert CURL_URL in first_screen, "the curl one-liner must be in the README's first 30 lines"
     assert "curl -fsSL" in first_screen
 
 
 def test_readme_does_not_point_at_the_pypi_name():
-    """`jarvis-os` on PyPI is an unrelated project — those instructions installed the
-    wrong software (see the work order's assumptions)."""
+    """`jarvis-os` on PyPI is an unrelated project"""
     text = README.read_text()
     assert "uv tool install jarvis-os" not in text
     assert "pipx install jarvis-os" not in text
@@ -227,11 +197,7 @@ def test_readme_does_not_point_at_the_pypi_name():
 @pytest.mark.skipif(not os.environ.get("JARVIS_TEST_INSTALL"),
                     reason="set JARVIS_TEST_INSTALL=1 to run a real install (needs uv/pipx)")
 def test_real_install_from_a_tagged_remote(tmp_path):
-    """End-to-end: tag this checkout as a release, install it, run the binary.
-
-    Isolated by UV_TOOL_DIR/--bin-dir/JARVIS_HOME, so it cannot disturb the jarvis the
-    developer actually uses.
-    """
+    """End-to-end: tag this checkout as a release, install it, run the binary"""
     if not shutil.which("uv") and not shutil.which("pipx"):
         pytest.skip("needs uv or pipx")
     src = tmp_path / "src"

@@ -1,15 +1,4 @@
-"""`jarvis navigation` — the fleet's read volume, split by side.
-
-Spec: docs/superpowers/specs/2026-10-02-subagent-cache-anatomy-and-the-navigation-split.md
-§2 and test-plan item 6. The reader moved out of `navigation` under §3 of
-`.jarvis/features/fo-b9a3fb06/sections/wo-f4b04708.md`; the classifier it now calls is
-pinned by `tests/test_navigation.py`.
-
-NO TEST HERE READS A LIVE TRANSCRIPT. Every tree is written under
-`monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, …)`, the pattern
-`tests/test_inspection.py`'s `write_transcript` fixture set, with the root `conftest.py`
-isolation gate as the floor under it.
-"""
+"""`jarvis navigation` — the fleet's read volume, split by side (docs/superpowers/specs/2026-10-02-subagent-cache-anatomy-and-the-navigation-split.md §2)"""
 
 import json
 import os
@@ -23,7 +12,7 @@ from jarvis.catalog import NavigationConfig
 CFG = NavigationConfig()
 
 
-# -- fixture plumbing ------------------------------------------------------------------
+# -- fixture plumbing
 
 def tool_use_row(tool_id: str, name: str, **payload) -> dict:
     return {"type": "assistant",
@@ -39,7 +28,7 @@ def tool_result_row(tool_id: str, content) -> dict:
 
 @pytest.fixture()
 def tree(tmp_path, monkeypatch):
-    """A transcript root the OS reads instead of `~/.claude/projects`."""
+    """A transcript root the OS reads instead of `~/.claude/projects`"""
     root = tmp_path / "projects"
     root.mkdir(parents=True)
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
@@ -61,7 +50,7 @@ def tree(tmp_path, monkeypatch):
     return write
 
 
-# -- attribution: bytes land on the call that produced them ---------------------------
+# -- attribution: bytes land on the call that produced them
 
 def test_result_bytes_are_attributed_to_the_producing_tool_use(tree):
     path = tree("s1", [
@@ -88,7 +77,7 @@ def test_result_bytes_are_attributed_to_the_producing_tool_use(tree):
 
 
 def test_an_unknown_tool_use_id_is_reported_and_never_in_a_share(tree):
-    """REPORTED, never silently dropped and never in a share's numerator."""
+    """REPORTED, never silently dropped and never in a share's numerator"""
     path = tree("s2", [
         tool_use_row("t1", "Bash", command="cat src/x.py"),
         tool_result_row("t1", "x" * 40),
@@ -117,13 +106,12 @@ def test_other_bash_and_read_tool_calls_are_counted_apart(tree):
     assert vol.read_tool_calls == 1
     assert vol.result_bytes == 6
     assert vol.code_nav_bash_bytes == 0
-    # A zero share is a FINDING; it is not None, because the corpus was measured.
+    # A zero share is a FINDING; it is not None, because the corpus was measured
     assert vol.code_nav_share() == 0.0
 
 
 def test_the_reader_uses_the_strict_classifier_not_a_token_match(tree):
-    """§3: a `.py` inside a quoted string is prose, and a bookkeeping read is not
-    navigation."""
+    """§3: a `.py` inside a quoted string is prose, and a bookkeeping read is not navigation"""
     path = tree("s9", [
         tool_use_row("t1", "Bash", command='git commit -m "fix pricing.py"'),
         tool_result_row("t1", "x" * 11),
@@ -138,7 +126,7 @@ def test_the_reader_uses_the_strict_classifier_not_a_token_match(tree):
     assert vol.code_nav_bash_bytes == 0
 
 
-# -- the side split, which comes from the PATH ----------------------------------------
+# -- the side split, which comes from the PATH
 
 def test_the_side_split_comes_from_the_path_with_one_lead_and_two_subagents(tree):
     tree("s4", [
@@ -164,7 +152,7 @@ def test_the_side_split_comes_from_the_path_with_one_lead_and_two_subagents(tree
     assert sub.symbol_bytes == 20
     assert sub.result_bytes == 70
     assert sub.code_nav_share() == pytest.approx(50 / 70)
-    # Both keys always present, so a renderer never tests for one.
+    # Both keys always present, so a renderer never tests for one
     assert set(vol.sides) == set(nav_volume.SIDES)
 
 
@@ -176,8 +164,7 @@ def test_a_session_with_no_transcript_is_not_found(tree):
 
 
 def test_an_empty_corpus_has_no_share_rather_than_a_zero_one(tree):
-    """None and NEVER 0.0: a zero share is a finding and an unmeasured one is not,
-    which is `usage.rewrite_ttl_share`'s rule."""
+    """None and NEVER 0.0: a zero share is a finding and an unmeasured one is not"""
     vol = nav_volume.read_session("nothing-here", CFG)
 
     assert vol.sides[nav_volume.SIDE_LEAD].code_nav_share() is None
@@ -185,7 +172,7 @@ def test_an_empty_corpus_has_no_share_rather_than_a_zero_one(tree):
     assert vol.as_dict()["sides"]["lead"]["code_nav_share"] is None
 
 
-# -- the fleet path: read_tree, and its window ----------------------------------------
+# -- the fleet path: read_tree, and its window
 
 def test_read_tree_walks_leads_and_subagents_and_names_the_window(tree):
     tree("s5", [tool_use_row("t1", "Bash", command="cat src/a.py"),
@@ -221,13 +208,7 @@ def test_days_excludes_a_file_by_mtime_before_opening_it(tree):
 
 
 def test_a_sibling_project_with_a_shared_slug_prefix_is_not_folded_in(tree):
-    """`slug_of` maps EVERY non-alphanumeric character to `-`, so `/ws/jarvis`'s slug is
-    a bare-`startswith` prefix of `/ws/jarvis_os`'s. PR 927 review: three of four seats.
-
-    Two layers, because `slug_of` is not injective: the separator rule rejects a slug
-    that merely shares characters, and `slug_exclude` — the catalog's other projects —
-    rejects a sibling whose own slug is longer and matches too.
-    """
+    """`slug_of` maps EVERY non-alphanumeric character to `-`"""
     mine = nav_volume.slug_of("/ws/jarvis")
     theirs = nav_volume.slug_of("/ws/jarvis_os")
     tree("lead", [tool_use_row("t1", "Bash", command="cat src/a.py"),
@@ -243,20 +224,18 @@ def test_a_sibling_project_with_a_shared_slug_prefix_is_not_folded_in(tree):
 
     vol = nav_volume.read_tree(cfg=CFG, slug_prefix=mine, slug_exclude=(theirs,))
 
-    # The project's own transcript and its own worktree's — and NEITHER of the sibling's.
+    # The project's own transcript and its own worktree's — and NEITHER of the sibling's
     assert vol.sides[nav_volume.SIDE_LEAD].transcripts == 2
     assert vol.sides[nav_volume.SIDE_LEAD].result_bytes == 30
 
-    # And the separator rule on its own: a prefix that is not followed by the `-` a path
-    # separator becomes is not a parent directory, it is a different path.
+    # And the separator rule on its own: a prefix that is not followed by the `-` a path separator...
     partial = nav_volume.read_tree(cfg=CFG, slug_prefix=nav_volume.slug_of("/ws/jarvi"))
     assert partial.sides[nav_volume.SIDE_LEAD].transcripts == 0
     assert partial.found is False
 
 
 def test_a_sibling_projects_slug_comes_from_the_catalog(tree, monkeypatch):
-    """The exclusion list is not guessed: it is every OTHER project the catalog names
-    whose slug would match this one's too."""
+    """The exclusion list is not guessed: it is every OTHER project the catalog names whose slug would..."""
     from pathlib import Path
 
     from jarvis import ops
@@ -281,9 +260,7 @@ def test_a_sibling_projects_slug_comes_from_the_catalog(tree, monkeypatch):
 
 
 def test_both_readers_agree_about_what_a_subagent_file_is(tree):
-    """ONE pattern, named once: `_subagents_of` globbed `*.jsonl` and `read_tree`
-    `agent-*.jsonl`, so the per-order and the fleet report could disagree about the same
-    session. `agent-*.jsonl` is the layout the module docstring documents."""
+    """ONE pattern, named once: `_subagents_of` globbed `*.jsonl` and `read_tree` `agent-*.jsonl`"""
     tree("s10", [tool_use_row("t1", "Bash", command="cat src/a.py"),
                  tool_result_row("t1", "x" * 10)],
          subagents={"agent-aaa": [tool_use_row("u1", "Grep", pattern="f"),
@@ -309,7 +286,7 @@ def test_a_missing_root_is_an_honest_absence(tmp_path, monkeypatch):
     assert vol.as_dict()["found"] is False
 
 
-# -- the payload: the renderer derives nothing ----------------------------------------
+# -- the payload: the renderer derives nothing
 
 CALL_KEYS = ("symbol_calls", "text_search_calls", "nav_bash_calls",
              "code_nav_bash_calls", "other_bash_calls", "read_tool_calls",
@@ -338,8 +315,7 @@ def test_as_dict_carries_every_number_the_renderer_prints(tree):
 
 
 def test_the_per_order_payload_omits_the_six_call_keys_and_keeps_every_byte_key(tree):
-    """Neo q1242: per-order call counts are the sealed-span ones in
-    `inspection.nav_profile`, so this reader reports byte volumes and the side split."""
+    """Neo q1242: per-order call counts are the sealed-span ones in `inspection.nav_profile`"""
     tree("s9", [tool_use_row("t1", "Bash", command="cat src/a.py"),
                 tool_result_row("t1", "x" * 10)],
          subagents={"agent-1": [tool_use_row("t2", "Grep", pattern="x"),
@@ -354,8 +330,7 @@ def test_the_per_order_payload_omits_the_six_call_keys_and_keeps_every_byte_key(
 
 
 def test_the_fleet_payload_still_carries_all_six_call_counts(tree):
-    """Neo q1242: the FLEET surface is unchanged — only the per-order reader projects
-    the call counts away."""
+    """Neo q1242: the FLEET surface is unchanged — only the per-order reader projects the call counts away"""
     tree("s10", [tool_use_row("t1", "Bash", command="cat src/a.py"),
                  tool_result_row("t1", "x" * 10)])
 
@@ -368,7 +343,7 @@ def test_the_fleet_payload_still_carries_all_six_call_counts(tree):
 
 
 def test_folding_per_order_volumes_keeps_the_rollup_per_order(tree):
-    """Neo q1242: a rollup of per-order volumes is still per-order."""
+    """Neo q1242: a rollup of per-order volumes is still per-order"""
     tree("s11", [tool_use_row("t1", "Bash", command="cat src/a.py"),
                  tool_result_row("t1", "x" * 10)])
     tree("s12", [tool_use_row("t2", "Bash", command="cat src/b.py"),
@@ -383,8 +358,7 @@ def test_folding_per_order_volumes_keeps_the_rollup_per_order(tree):
 
 
 def test_nav_volume_imports_usage_catalog_and_the_leaf_and_nothing_else_of_jarvis():
-    """A LEAF module: a report over files on disk must not fail because a catalog or a
-    database moved. `inspection`'s constraint, for its reason."""
+    """A LEAF module: a report over files on disk must not fail because a catalog or a database moved"""
     import ast
 
     tree_src = ast.parse(open(nav_volume.__file__).read())
@@ -402,11 +376,10 @@ def test_nav_volume_imports_usage_catalog_and_the_leaf_and_nothing_else_of_jarvi
     assert local == {"catalog", "usage", "navigation"}
 
 
-# -- ops and the CLI ------------------------------------------------------------------
+# -- ops and the CLI
 
 def test_navigation_config_falls_back_to_the_defaults_not_to_none():
-    """`ops.inspect_config`'s shape: every default here is a pattern list with a
-    measured justification, and having none would mean having no report."""
+    """`ops.inspect_config`'s shape: every default here is a pattern list with a measured justification"""
     from jarvis import ops
 
     cfg = ops.navigation_config("no-such-project")
@@ -416,12 +389,10 @@ def test_navigation_config_falls_back_to_the_defaults_not_to_none():
 
 
 def test_the_fleet_report_requires_an_explicit_scope(tree):
-    """`~/.claude/projects` is 2.7G and 11,889 lead transcripts: a no-argument
-    `jarvis navigation` must not walk it."""
+    """`~/.claude/projects` is 2.7G and 11,889 lead transcripts: a no-argument `jarvis navigation` must..."""
     from jarvis import ops
 
-    # Against the CONSTANT, not a copy of its words: the CLI and the dashboard quote
-    # that string, so a reworded refusal must fail here and nowhere else.
+    # Against the CONSTANT, not a copy of its words: the CLI and the dashboard quote that string
     with pytest.raises(ops.OpsError) as caught:
         ops.navigation_report()
     assert str(caught.value) == ops.NAVIGATION_NEEDS_SCOPE
@@ -449,8 +420,7 @@ def test_the_cli_prints_the_shares_and_the_before_line(tree, capsys):
 
 
 def test_the_before_note_names_its_reproducing_command_and_both_sides_apart():
-    """Neo q1246: the §5.3 figure is not reproducible, so the restatement must carry the
-    exact command and lead/subagent separately rather than one blended share."""
+    """Neo q1246: the §5.3 figure is not reproducible"""
     note = nav_volume.BEFORE_NOTE
 
     assert "jarvis navigation --project jarvis_os --days 36500" in note
@@ -460,7 +430,7 @@ def test_the_before_note_names_its_reproducing_command_and_both_sides_apart():
 
 
 def test_the_cli_prints_no_call_columns_on_a_per_order_payload(tree, capsys):
-    """Neo q1242: the renderer branches off `calls_reported` and derives nothing."""
+    """Neo q1242: the renderer branches off `calls_reported` and derives nothing"""
     from jarvis import cli
 
     tree("s13", [tool_use_row("t1", "Bash", command="cat src/a.py"),
@@ -493,9 +463,7 @@ def test_the_cli_fleet_path_runs_end_to_end(tree, capsys):
 
 
 def test_both_reports_resolve_a_target_through_one_helper(monkeypatch):
-    """`jarvis inspect` and `jarvis navigation` must never disagree about what an id
-    means, so the feature-order-first lookup is written once and the ONLY difference is
-    explicit: whether a target that is no id at all may be read as a project name."""
+    """`jarvis inspect` and `jarvis navigation` must never disagree about what an id means"""
     from jarvis import ops
 
     tried: list[str] = []
@@ -511,21 +479,18 @@ def test_both_reports_resolve_a_target_through_one_helper(monkeypatch):
     monkeypatch.setattr(ops, "find_feature_order", no_feature)
     monkeypatch.setattr(ops, "find_work_order", no_work_order)
 
-    # `navigation`'s third resolution, and it is the only thing the flag changes.
+    # `navigation`'s third resolution, and it is the only thing the flag changes
     assert ops._resolve_report_target("proj_a", None, project_fallback=True) == (
         ops._TARGET_PROJECT, None, None, None)
     assert tried == ["feature_order", "work_order"]
 
-    # `inspect`'s: a target that resolves to nothing is the work-order lookup's error,
-    # unchanged, because there is no third thing a time report could mean.
+    # `inspect`'s: a target that resolves to nothing is the work-order lookup's error
     with pytest.raises(ops.OpsError, match="no such work order"):
         ops._resolve_report_target("proj_a", None)
 
 
 def test_a_mistyped_order_id_is_not_read_as_a_project_name(monkeypatch):
-    """`jarvis navigation wo-deadbeef` must say the work order does not exist, not that
-    there is no project of that name: `project_fallback` turned EVERY failure into the
-    project reading (PR 927 review)."""
+    """`jarvis navigation wo-deadbeef` must say the work order does not exist"""
     from jarvis import ops
 
     def no_feature(target, project=None):
@@ -541,14 +506,13 @@ def test_a_mistyped_order_id_is_not_read_as_a_project_name(monkeypatch):
         with pytest.raises(ops.OpsError, match=f"no work order {mistyped}"):
             ops._resolve_report_target(mistyped, None, project_fallback=True)
 
-    # A target that is no id at all still has the third reading this flag exists for.
+    # A target that is no id at all still has the third reading this flag exists for
     assert ops._resolve_report_target("proj_a", None, project_fallback=True) == (
         ops._TARGET_PROJECT, None, None, None)
 
 
 def test_a_non_positive_days_window_is_refused(tree):
-    """`--days 0` disabled the window the `--fleet` opt-in exists to enforce: the walk it
-    bounds is 2.7G. Against the CONSTANT, as the scope refusal is."""
+    """`--days 0` disabled the window the `--fleet` opt-in exists to enforce: the walk it bounds is 2.7G"""
     from jarvis import ops
 
     for days in (0, -1):
@@ -557,16 +521,12 @@ def test_a_non_positive_days_window_is_refused(tree):
         assert str(caught.value) == ops.NAVIGATION_DAYS_POSITIVE
     assert "--days" in ops.NAVIGATION_DAYS_POSITIVE
 
-    # None still means the catalog's window, unchanged.
+    # None still means the catalog's window, unchanged
     assert ops.navigation_report(fleet=True)["window_days"] == 7
 
 
 def test_inspect_reads_the_transcripts_again_only_when_asked(monkeypatch):
-    """`jarvis inspect` opened every transcript twice — once in `inspection.read_session`
-    and once more through `nav_volume.read_session` (PR 927 review). The second pass is
-    now a caller's request, and `cli.cmd_inspect` — which PRINTS the section — is the
-    caller that makes it; the dashboard's debugging page renders nothing from it.
-    """
+    """`jarvis inspect` opened every transcript twice"""
     from jarvis import nav_volume as nav_mod
     from jarvis import ops
 
@@ -597,7 +557,7 @@ def test_inspect_reads_the_transcripts_again_only_when_asked(monkeypatch):
 
 
 class _NoStore:
-    """A project store that answers the two reads `inspect_report`'s unit makes."""
+    """A project store that answers the two reads `inspect_report`'s unit makes"""
 
     def turn_starts(self, wo_id):
         return []
@@ -613,13 +573,7 @@ class _NoStore:
 
 
 def test_cmd_navigation_renders_both_sides_with_the_payloads_own_counts(tree, capsys):
-    """END TO END through `cmd_navigation`'s renderer, which `--json` never reaches.
-
-    The counts are asserted against the PAYLOAD as well as against literals, so a
-    renderer that derived its own number — summing both sides, or re-reading the tree —
-    fails here rather than disagreeing with the dashboard (PR 65). The FLEET surface,
-    because only that payload carries call counts (`calls_reported`, Neo q1242).
-    """
+    """END TO END through `cmd_navigation`'s renderer, which `--json` never reaches"""
     from jarvis import cli, ops
 
     tree("s9", [tool_use_row("t1", "mcp__serena__find_symbol", name_path_pattern="x"),
@@ -643,12 +597,10 @@ def test_cmd_navigation_renders_both_sides_with_the_payloads_own_counts(tree, ca
             f"{sub['text_search_calls']:>4} text-search") in out
 
 
-# -- the doc counters: §3.2 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md -------
+# -- the doc counters: §3.2 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md
 
 def test_bytes_by_tool_folds_across_a_lead_and_two_subagent_transcripts(tree):
-    """THE FOLD, and it is why the field is a `Counter`: `_merge` folds every field with
-    `+` over `vars()`, and a plain `dict[str, int]` raises `TypeError` there. A
-    single-transcript test passes vacuously."""
+    """THE FOLD, and it is why the field is a `Counter`: `_merge` folds every field with `+` over..."""
     tree("d1", [
         tool_use_row("t1", "Read", file_path="/tmp/a.py"),
         tool_result_row("t1", "x" * 100),
@@ -675,7 +627,7 @@ def test_bytes_by_tool_folds_across_a_lead_and_two_subagent_transcripts(tree):
 
 
 def test_whole_file_read_calls_count_a_read_with_no_limit_only(tree):
-    """§1(a): `limit is None` IS the predicate, answerable from `tool_input` alone."""
+    """§1(a): `limit is None` IS the predicate, answerable from `tool_input` alone"""
     path = tree("d2", [
         tool_use_row("t1", "Read", file_path="/tmp/a.py", limit=200),
         tool_result_row("t1", "x" * 10),
@@ -706,8 +658,7 @@ def test_doc_read_bytes_are_the_markdown_half_of_read_tool_bytes(tree):
 
 
 def test_doc_dump_bash_calls_go_through_the_shipped_classifier(tree):
-    """`grep` over a `.md` is text search and stays legal — this feature's MUST NOT
-    (§1.1). A `pytest` run is no dump either."""
+    """`grep` over a `.md` is text search and stays legal — this feature's MUST NOT (§1.1)"""
     path = tree("d4", [
         tool_use_row("t1", "Bash", command="cat docs/a.md"),
         tool_result_row("t1", "x" * 70),
@@ -724,7 +675,7 @@ def test_doc_dump_bash_calls_go_through_the_shipped_classifier(tree):
 
 
 def test_the_doc_before_note_is_a_second_note_and_both_reach_the_payload(tree):
-    """§2.2: `BEFORE_NOTE` is not edited — §1's figures travel as a second note."""
+    """§2.2: `BEFORE_NOTE` is not edited — §1's figures travel as a second note"""
     tree("d5", [tool_use_row("t1", "Bash", command="cat src/a.py"),
                 tool_result_row("t1", "x" * 10)])
 
@@ -736,8 +687,7 @@ def test_the_doc_before_note_is_a_second_note_and_both_reach_the_payload(tree):
 
 
 def test_the_doc_before_note_names_its_corpus_its_date_and_its_figures():
-    """A RECORDED BASELINE, not an assertion: the acceptance criterion is that the
-    command reproduces a number (§3.2)."""
+    """A RECORDED BASELINE, not an assertion: the acceptance criterion is that the command reproduces a..."""
     note = nav_volume.DOC_BEFORE_NOTE
 
     assert "877 transcripts" in note
@@ -752,7 +702,7 @@ def test_the_doc_before_note_names_its_corpus_its_date_and_its_figures():
 
 
 def test_the_catalog_doc_defaults_are_the_leafs_sets_and_not_a_second_definition():
-    """Identity, not equality: a copied body passes equality and then drifts (§2.5)."""
+    """Identity, not equality: a copied body passes equality and then drifts (§2.5)"""
     from jarvis import catalog, navigation
 
     assert catalog.DEFAULT_NAVIGATION_DOC_SUFFIXES is navigation.DOC_SUFFIXES
@@ -794,8 +744,7 @@ def test_the_cli_prints_the_doc_figures_and_the_doc_before_line(tree, capsys):
 
 
 def test_the_cli_prints_no_doc_call_columns_on_a_per_order_payload(tree, capsys):
-    """§3.2's second trap: new CALL counters are gated on `calls_reported`, new BYTE
-    counters are not."""
+    """§3.2's second trap: new CALL counters are gated on `calls_reported`, new BYTE counters are not"""
     from jarvis import cli
 
     tree("d7", [tool_use_row("t1", "Read", file_path="/tmp/docs/spec.md"),

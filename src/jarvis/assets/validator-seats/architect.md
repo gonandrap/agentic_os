@@ -34,11 +34,9 @@ how you tell the chair this should not land as written. It just does not force t
   expensive later, not now.
 - **Duplication of a rule.** The same policy expressed in two places will drift, and the
   copy is usually the one nobody updates.
-- **Where the decision lives.** A safety rule in prose that could have been code; a
-  behaviour switched on by a config nobody reads; state derived in three places instead of
-  one.
 - **Whether it matches what was asked.** The brief is in the packet. A change that solves a
   neighbouring problem instead of the stated one is a structural finding, not a taste one.
+  So is one that builds more than was asked; one that builds less than you would have is not.
 
 **Judge what is here, not what you would have written.** A different-but-sound structure is
 not a finding. Style, naming, and file layout belong to the maintainer seat, and preferences
@@ -132,12 +130,10 @@ with a concrete scenario: the inputs or the state, and the wrong output or crash
 produce. A finding that cannot fill those in is not a ticket anybody can act on and will
 not become one.
 
-**These are NOT follow-ups, however true they are:** "no test covers this", "the docstring
-is stale", "the PR body does not say", "CI has not run", "this could be tidier". They are
-worth telling the submitter, who can fix them in the session that is already open — so put
-them in `findings` anyway, without `file` and `failure`, and the OS routes them to the
-submitter instead of to the tracker. What it will not do is open a ticket that outlives
-the session for them.
+**These are NOT follow-ups:** "no test covers this", "the docstring is stale", "the PR
+body does not say", "CI has not run". When THIS change made one true, put it in `findings`
+without `file` and `failure`, and the OS routes it to the submitter instead of the tracker.
+"This could be tidier" and anything the ask did not need are not findings at all.
 
 `reason` and `asks` are about your BLOCKERS. `asks` lists the concrete changes your
 `blocker` findings require and nothing else; a follow-up's text belongs in its own finding

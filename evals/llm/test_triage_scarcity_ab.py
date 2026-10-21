@@ -1,44 +1,4 @@
-"""Three-arm A/B: can a reviewer be made to file only what is really needed?
-
-The self-evolution loop burns tokens because every finder the OS runs (the panel, the
-investigators, the bug filers) is a model asked "what is wrong?", and a model asked that
-almost never answers "nothing". Filing is free to the filer; the order it buys is not.
-
-The subject is a cheap model (haiku) reviewing one small module with TWELVE seeded issues
-of known severity (evals/data/triage/inventory_key.json): one major, four medium, three
-minor, four cosmetic. A model that treats this the way a busy engineer would files the
-major and the mediums and leaves the rest alone.
-
-ARMS
-    baseline   — "review this code, report every issue". The panel today.
-    scarcity   — the same model told resources are restricted: each filed issue is a paid
-                 work order, file only what a user or operator would actually notice,
-                 filing nothing is fine. Pure prompt; the model decides what to file.
-    mechanism  — the baseline prompt, but every finding must carry a severity and a
-                 concrete failure scenario; CODE then drops anything below `medium` and
-                 anything without a scenario. The model classifies, the gate decides.
-
-THE ASSERTION is on `scarcity`, because that is the claim under test: in EVERY run it
-files the major and files no minor or cosmetic issue. The other two arms are reported
-beside it so the prompt can be compared with no intervention and with a mechanical gate.
-
-FIRST RESULT (2026-10-20, haiku, 5 runs/arm, ~$0.001 a call): baseline filed 13-14
-findings a run, 5-6 of them minor/cosmetic. Scarcity filed 4: the major every run, no
-low issue ever, and missed the same medium every run (`swallowed-error`) — a scarce
-reviewer's blind spot is the silent failure. The mechanism arm leaked once: haiku rated
-the unclosed file `medium` and wrote a failure for it, so a gate that trusts the model's
-own severity is only as good as that rating.
-
-GRADING is deterministic: the code is shown with line numbers, each finding must cite
-one, and a finding maps to the seeded issue whose anchor line it names (±1 line). A
-finding that maps to nothing is `unseeded` — not necessarily wrong, but work the key did
-not ask for.
-
-Opt-in (spends real tokens, needs a logged-in Claude Code):
-    JARVIS_EVALS_LLM=1 pytest evals/llm/test_triage_scarcity_ab.py -q -s
-    JARVIS_EVALS_N=3                 # runs per arm, default 3
-    JARVIS_EVALS_TRIAGE_MODEL=haiku  # the reviewer, default haiku
-"""
+"""Three-arm A/B: can a reviewer be made to file only what is really needed?"""
 
 from __future__ import annotations
 
@@ -99,7 +59,7 @@ ARMS = tuple(PROMPTS)
 
 
 def gate(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The mechanism arm's filter: severity at least medium AND a stated failure."""
+    """The mechanism arm's filter: severity at least medium AND a stated failure"""
     return [f for f in findings
             if str(f.get("severity", "")).lower() not in LOW
             and str(f.get("failure_scenario") or "").strip()]
@@ -152,7 +112,7 @@ def parse(text: str) -> list[dict[str, Any]] | None:
 
 
 def grade(run: Run, key: dict[str, Any]) -> Run:
-    """Map each filed finding to the nearest seeded issue within one line."""
+    """Map each filed finding to the nearest seeded issue within one line"""
     for finding in run.filed:
         try:
             line = int(finding["line"])
@@ -172,7 +132,7 @@ def grade(run: Run, key: dict[str, Any]) -> Run:
 
 
 def review(arm: str, key: dict[str, Any], cwd: Path) -> Run:
-    """One hermetic call: no tools, no repo, the listing and the arm's prompt only."""
+    """One hermetic call: no tools, no repo, the listing and the arm's prompt only"""
     result = claude_cli.run_headless_result(
         "MODULE inventory.py\n\n" + key["listing"], system_prompt=PROMPTS[arm],
         model=MODEL, cwd=cwd, tools="", timeout=180)

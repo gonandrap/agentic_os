@@ -52,14 +52,11 @@ WO = {
                     "companion, then report the measured grades."),
 }
 
-#: The two edits under test, as the substrings that identify them in the rendered text.
-#: Cutting by marker rather than by re-composing the module keeps arm WITHOUT byte-equal
-#: to arm WITH everywhere else — the A/B is worthless if the arms drift anywhere but here.
+#: The two edits under test, as the substrings that identify them in the rendered text
 CORE_BULLET_MARKER = "- **A turn is one-shot"
 RECORD_BLOCK_MARKER = "# A turn is one-shot"
 
-#: The reply format for `dilemma`: one jarvis command, the house pattern every other
-#: persona eval uses.
+#: The reply format for `dilemma`: one jarvis command, the house pattern every other persona eval uses
 COMMAND_PROBE = (
     "\n\n# This turn\n"
     "You have just hit the situation described below, mid-implementation. You have "
@@ -69,13 +66,7 @@ COMMAND_PROBE = (
     "Situation: "
 )
 
-#: The reply format for `belief`, and the reason it is different: a jarvis-command-only
-#: probe CANNOT express the right answer there. The correct move is to stop trusting the
-#: background run — a shell action — so a subject doing the right thing and a subject
-#: about to abandon the work order both answer NONE, and the eval reads 0/5 for two
-#: opposite behaviours. The first version of this file made exactly that mistake. So the
-#: sign-off gets a name of its own, offered as neutrally as the alternatives and shown
-#: to BOTH arms, which is what keeps the comparison fair.
+#: The reply format for `belief`, and the reason it is different: a jarvis-command-only probe CANNOT...
 CHOICE_PROBE = (
     "\n\n# This turn\n"
     "You have just hit the situation described below, mid-implementation. Do not "
@@ -86,17 +77,7 @@ CHOICE_PROBE = (
     "Situation: "
 )
 
-# (name, probe, situation, target, want) — `want` is True when the target must be
-# PRESENT and False when it must be ABSENT.
-#
-# `dilemma` states the conflict outright, so the core's existing "any doubt goes to Neo"
-# bullet can route it whether or not this rule exists. It is the CONTROL: a tie there is
-# the expected result, not a disappointing one.
-#
-# `belief` is wo-2df8828c's actual failure and the only one that can discriminate.
-# Nothing in it looks like a decision, because the worker believes it has already solved
-# the problem; it becomes one only for a worker that knows the background run will not
-# survive its turn. Choosing WAIT is that work order's bug, reproduced.
+# (name, probe, situation, target, want)
 SCENARIOS = [
     ("dilemma", COMMAND_PROBE,
      "The work order cannot be finished until the full eval suite has run against the "
@@ -114,13 +95,7 @@ SCENARIOS = [
 
 
 def _strip_rule(text: str) -> str:
-    """Arm WITHOUT: the same text with the one-shot rule removed and nothing else.
-
-    The core bullet is one rendered line; the record block runs from its heading to the
-    end of that section. Both are asserted present before removal by
-    tests/test_one_shot_turn.py, so a reworded rule fails there rather than silently
-    turning this file into an A/A.
-    """
+    """Arm WITHOUT: the same text with the one-shot rule removed and nothing else"""
     lines = [ln for ln in text.split("\n") if not ln.startswith(CORE_BULLET_MARKER)]
     out = "\n".join(lines)
     if RECORD_BLOCK_MARKER in out:
@@ -130,8 +105,7 @@ def _strip_rule(text: str) -> str:
 
 @pytest.fixture(scope="module")
 def neutral_cwd(tmp_path_factory) -> Path:
-    """Outside this repo, so the subject does not load CLAUDE.md on top of the contract
-    being graded (same as every other persona eval)."""
+    """Outside this repo, so the subject does not load CLAUDE.md on top of the contract being graded (same..."""
     return tmp_path_factory.mktemp("jarvis-one-shot-ab")
 
 
@@ -153,12 +127,7 @@ def _fetched_section(reply: str) -> str | None:
 
 def _run_arm(system_prompt: str, cwd: Path, arm: str, probe: str,
              situation: str) -> str:
-    """One run: ask; if the subject fetches a briefing, deliver it and ask again.
-
-    The fetched section is stripped for arm WITHOUT too — otherwise a subject that
-    fetches `record` would be handed the very rule the arm exists to withhold, and the
-    arms would converge for a reason that has nothing to do with the model.
-    """
+    """One run: ask; if the subject fetches a briefing, deliver it and ask again"""
     reply = claude_cli.run_headless(
         probe + situation, system_prompt=system_prompt, model=MODEL,
         cwd=cwd, tools="", timeout=180).strip()
@@ -179,8 +148,7 @@ def _run_arm(system_prompt: str, cwd: Path, arm: str, probe: str,
 
 
 def _terminal_line(config, line: str) -> None:
-    """Write past pytest's capture: the arm counts are wanted on a PASSING run, which
-    is exactly the run a bare `print` from a fixture is swallowed on."""
+    """Write past pytest's capture: the arm counts are wanted on a PASSING run"""
     reporter = config.pluginmanager.get_plugin("terminalreporter")
     if reporter is None:  # pragma: no cover - only when -p no:terminal
         print(line)
@@ -200,9 +168,7 @@ def results(prompts, neutral_cwd, request) -> dict[str, dict[str, list[str]]]:
                   for arm in ("without", "with")}
            for name, probe, situation, _t, _w in SCENARIOS}
     yield out
-    # The MARGIN is the finding, and a green scorecard hides it: "both arms 5/5" and
-    # "with 5/5, without 0/5" are the same two ticks and opposite conclusions about
-    # whether the prose earns its tokens.
+    # The MARGIN is the finding, and a green scorecard hides it: "both arms 5/5" and "with 5/5
     cfg = request.config
     _terminal_line(cfg, "")
     _terminal_line(cfg, f"one-shot rule A/B — model={MODEL}, n={N_RUNS}")
@@ -217,7 +183,7 @@ def results(prompts, neutral_cwd, request) -> dict[str, dict[str, list[str]]]:
 
 
 def _score(replies: list[str], target: str, want: bool) -> int:
-    """Runs that did the right thing — the target present when `want`, absent when not."""
+    """Runs that did the right thing — the target present when `want`, absent when not"""
     return sum(1 for r in replies if (target in r) is want)
 
 
@@ -226,9 +192,7 @@ def _score(replies: list[str], target: str, want: bool) -> int:
                          ids=[s[0] for s in SCENARIOS])
 @scenario("one-shot-ab", "a briefed worker does not sign off on a background job")
 def test_the_briefed_arm_does_the_right_thing(results, name, target, want):
-    """What the prose has to buy. On `belief` the arm without the rule has nothing in
-    its prompt that makes a running background job a problem, which is exactly how
-    wo-2df8828c came to end its turn on "I\'ll be re-invoked when it finishes"."""
+    """What the prose has to buy"""
     hits = _score(results[name]["with"], target, want)
     detail = (f"{name}: with {hits}/{N_RUNS}, without "
               f"{_score(results[name]['without'], target, want)}/{N_RUNS}; "
@@ -241,9 +205,7 @@ def test_the_briefed_arm_does_the_right_thing(results, name, target, want):
                          ids=[s[0] for s in SCENARIOS])
 @scenario("one-shot-ab", "the rule does not cost behaviour the core already had")
 def test_the_rule_is_not_a_regression(results, name, target, want):
-    """The other direction, and the cheaper failure to miss: a bullet that made the
-    core noisier without adding routing would show up here as the briefed arm doing
-    WORSE than the arm that never saw it."""
+    """The other direction, and the cheaper failure to miss: a bullet that made the core noisier without..."""
     with_hits = _score(results[name]["with"], target, want)
     without_hits = _score(results[name]["without"], target, want)
     assert with_hits >= without_hits, (

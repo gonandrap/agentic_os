@@ -1,9 +1,4 @@
-"""The steward: one gate over what the OS may spend on itself.
-
-docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md.
-The rules are pinned one per test against `decide` (pure); the ledger, the precision
-throttle and shadow-versus-enforce are pinned through `gate` against real stores.
-"""
+"""The steward: one gate over what the OS may spend on itself (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md)"""
 
 from __future__ import annotations
 
@@ -61,7 +56,7 @@ def test_past_max_depth_is_queued_never_dispatched():
 
 
 def test_a_detector_chasing_its_own_work_is_queued():
-    """The 10-generation chain of 2026-10-20: the sweep investigating its own fix orders."""
+    """The 10-generation chain of 2026-10-20: the sweep investigating its own fix orders"""
     c = cand(origin_kind="investigation", severity="critical")
     assert outcome(c, parent_kind="investigation") == ("queue", "self-reference")
 
@@ -218,7 +213,7 @@ def test_a_stamp_survives_the_metadata_round_trip(fleet):
 
 
 def test_an_identical_decision_within_the_hour_is_one_row(fleet):
-    """A red `main` is re-asked every tick; the table is read by a person."""
+    """A red `main` is re-asked every tick; the table is read by a person"""
     make, store = fleet
     first = steward.gate(cand(severity="minor"), catalog=make(), store=store)
     again = steward.gate(cand(severity="minor"), catalog=make(), store=store)
@@ -259,7 +254,7 @@ def test_a_week_with_no_decisions_sends_nothing(fleet):
 
 
 def test_the_cli_shows_each_decision_with_its_rule(fleet, capsys):
-    """`decisions` reads only the record, so it needs no catalog."""
+    """`decisions` reads only the record, so it needs no catalog"""
     from jarvis import cli
 
     make, store = fleet

@@ -1,15 +1,4 @@
-"""Screenshot what a work order held on an unargued gate now says about itself.
-
-Two surfaces: `/gates` files an `awaiting_case` row under "Awaiting the worker's case",
-and the work-order page. Fix 2 of
-docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md stopped
-`gates.file_request` writing `waiting_input` for a held (`hold=True`) request — the
-command stays blocked, but nothing is owed by the user, so the order reads plain Running:
-no "Waiting on you" line, no attention flag. `scripts/screenshot_health_surfaces.py` is
-the shape this copies.
-
-    uv run python scripts/screenshot_held_gate.py
-"""
+"""Screenshot what a work order held on an unargued gate now says about itself (docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md)"""
 
 from __future__ import annotations
 
@@ -27,7 +16,7 @@ PORT = 8803
 
 
 def seed() -> str:
-    """One work order parked on a request the worker recorded and never argued."""
+    """One work order parked on a request the worker recorded and never argued"""
     from jarvis import gates, ops
     from jarvis.central_store import CentralStore
     from jarvis.project_store import ProjectStore
@@ -56,10 +45,7 @@ def seed() -> str:
     _, path, _ = ops.find_work_order(wo["id"], "jarvis_os")
     pstore = ProjectStore(path)
     pstore.set_status(wo["id"], "running")
-    # The attempt, not the request: the worker ran it rather than asking, so the row is
-    # recorded with the placeholder case and in front of nobody (gates.AWAITING_CASE).
-    # `hold=True`'s own road (gates.file_request, fix 2): no status write here — the
-    # order stays `running`, not `waiting_input`, because nothing is owed by the user.
+    # The attempt, not the request: the worker ran it rather than asking
     pstore.add_approval(wo["id"], kind="release", command="./scripts/" + "shipit.sh",
                         matched="ship" + "it",
                         justification=gates.NO_CASE_JUSTIFICATION,
@@ -87,8 +73,7 @@ def shoot(wo_id: str) -> None:
         page.goto(f"http://127.0.0.1:{PORT}/gates")
         heading = page.get_by_role("heading", name="Awaiting the worker's case")
         head = heading.bounding_box()
-        # The panel this heading owns, not "the second panel on the page": which index
-        # that is depends on whether anything is escalated.
+        # The panel this heading owns, not "the second panel on the page": which index that is depends on...
         panel = heading.locator(
             "xpath=following-sibling::div[contains(@class,'panel')][1]").bounding_box()
         page.screenshot(path=SHOTS / "gates-awaiting-case.png", full_page=True, clip={

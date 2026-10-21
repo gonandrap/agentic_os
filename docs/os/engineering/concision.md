@@ -7,5 +7,7 @@ tags: [concision, house style]
 ---
 # Concision
 
-- Worker rules: `jarvis brief concision`; house style: the `caveman` and `i-have-adhd` skills.
+- Worker rules: `jarvis brief concision`; house style: the `caveman` and `ponytail` skills.
+- Reviewers (validation seats, Neo's assumption review): `concision.REVIEW_SCOPE`, ponytail's scope rules.
+- CI: `scripts/trim_comments.py --check` fails on a comment or docstring past one line.
 - Enforcement: Serena `read_memory concision-enforcement`.

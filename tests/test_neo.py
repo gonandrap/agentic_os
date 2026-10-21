@@ -1,5 +1,4 @@
-"""Neo: worker questions queue → Neo answers as the user (or escalates) →
-answers deliver to workers → the user reviews → corrections become learnings."""
+"""Neo: worker questions queue → Neo answers as the user (or escalates) → answers deliver to workers →..."""
 
 from __future__ import annotations
 
@@ -25,7 +24,7 @@ def started(jarvis_home, fake_claude, catalog_file, project):
 
 @pytest.fixture()
 def asked(started, project):
-    """A dispatched work order with one question queued for Neo."""
+    """A dispatched work order with one question queued for Neo"""
     daemon = started
     wo = ops.create_work_order("proj_a", "build the exporter")
     daemon.tick()
@@ -34,18 +33,13 @@ def asked(started, project):
 
 
 def drain(daemon):
-    """Run the Neo drain synchronously (the daemon thread pool is async)."""
+    """Run the Neo drain synchronously (the daemon thread pool is async)"""
     daemon._neo_drain()
 
 
 
 def _neo_calls(fake_claude) -> list[dict]:
-    """Neo's headless calls only.
-
-    Worker turns are `claude -p` invocations too since the transport moved off
-    background sessions, so "has -p" no longer identifies Neo on its own: a turn is the
-    one carrying a session id.
-    """
+    """Neo's headless calls only"""
     return [c for c in fake_claude.calls
             if "-p" in c["argv"]
             and "--session-id" not in c["argv"] and "--resume" not in c["argv"]]
@@ -75,15 +69,7 @@ def test_ask_queues_and_parks_worker(asked, project):
 
 
 def test_the_work_order_record_points_at_what_was_asked(asked, project, capsys):
-    """The record must lead a reader to the question — it no longer reproduces it.
-
-    Before the question id was stored, `question_asked` said nothing at all and the
-    record read as an answer to nothing. It then carried the whole question inline,
-    which put the same paragraph on the page twice: once as the event, once as the
-    answer's message beneath it. What it carries now is a REFERENCE to the one record
-    that holds the question and its answer together — a link on the dashboard, and the
-    id the CLI's own question command takes.
-    """
+    """The record must lead a reader to the question — it no longer reproduces it"""
     import json as _json
 
     from jarvis import cli
@@ -99,8 +85,7 @@ def test_the_work_order_record_points_at_what_was_asked(asked, project, capsys):
 
 
 def test_a_question_event_with_no_id_still_says_what_was_asked():
-    """Nowhere to point, and the ask is still on the record — in the conversation,
-    which renders it from the event payload and never needed the id."""
+    """Nowhere to point, and the ask is still on the record"""
     from jarvis.timeline import build_conversation, build_timeline
 
     events = [{"ts": 1.0, "kind": "question_asked", "payload": {"question": "CSV?"}}]
@@ -187,7 +172,7 @@ def test_escalation_reaches_the_user(asked, project):
 
 
 def test_garbage_output_escalates_not_delivers(asked, project):
-    """Unparseable model output must never reach a worker as an answer."""
+    """Unparseable model output must never reach a worker as an answer"""
     daemon, wo, _ = asked
     ops.ask_question(wo["id"], "FORCE_GARBAGE: what about the schema?")
     drain(daemon)
@@ -271,8 +256,7 @@ def test_correction_requires_feedback(asked):
 
 
 def test_learnings_shape_future_answers(asked, fake_claude):
-    """The feedback loop: a correction appears in Neo's next system prompt, and the
-    prompt grows append-only so the previously cached prefix stays valid."""
+    """The feedback loop: a correction appears in Neo's next system prompt"""
     daemon, wo, _ = asked
     drain(daemon)
     calls = _neo_calls(fake_claude)
@@ -291,16 +275,7 @@ def test_learnings_shape_future_answers(asked, fake_claude):
 
 
 def test_a_seat_scoped_learning_does_not_move_neos_cached_prefix(jarvis_home):
-    """A learning routed to one panel seat must be invisible to the single-agent path.
-
-    The panel ships disabled, so the default-configured OS must behave byte-identically
-    to today — and `build_system_prompt` calls `store.learnings(project)` with no seat.
-    A seat-scoped learning leaking into that query would rewrite the cached prompt
-    prefix every time someone taught a seat something, for no behavioural gain.
-
-    The second half is what stops the first from passing vacuously: a filter that
-    returned nothing at all would satisfy "the prompt did not move" perfectly.
-    """
+    """A learning routed to one panel seat must be invisible to the single-agent path"""
     store = NeoStore()
     try:
         store.add_learning("Always default to CSV", project="proj_a")
@@ -321,18 +296,7 @@ def test_a_seat_scoped_learning_does_not_move_neos_cached_prefix(jarvis_home):
 
 def test_with_the_panel_disabled_neo_answers_exactly_as_before(started, project,
                                                                fake_claude):
-    """THE REGRESSION PIN FOR THE WHOLE PANEL FEATURE.
-
-    Every work order in this feature ships the panel DISABLED, and the promise at that
-    default is not "roughly the same" — it is byte-identical behaviour: the same number of
-    Claude calls, the same system prompt bytes, the same message to the worker, and
-    nothing at all in `panel_opinions`. If a change alters what a default-configured Neo
-    does, it is wrong, and this is where that is caught.
-
-    Asserted on COUNTS and on STORED ROWS rather than on "a verdict came back": the fake
-    returns a valid non-escalating verdict for any prompt at all, so "Neo answered" is
-    true of a panel run, a single-agent run and very nearly anything else.
-    """
+    """THE REGRESSION PIN FOR THE WHOLE PANEL FEATURE"""
     daemon = started
     wo = ops.create_work_order("proj_a", "build the exporter")
     daemon.tick()
@@ -385,7 +349,7 @@ def test_neo_disabled_via_catalog(jarvis_home, fake_claude, tmp_path, project, c
 
 
 def test_daemon_tick_triggers_drain(asked):
-    """The real path: tick() notices queued questions and drains on the neo thread."""
+    """The real path: tick() notices queued questions and drains on the neo thread"""
     daemon, wo, _ = asked
     daemon.neo_tick()
     daemon.neo_pool.shutdown(wait=True)  # join the drain thread
@@ -396,13 +360,7 @@ def test_daemon_tick_triggers_drain(asked):
         neo.close()
 
 
-# -- inspecting the panel's deliberation ------------------------------------------------
-#
-# The panel itself is another work order's (`src/jarvis/panel.py`); everything below
-# drives the SURFACES over the rows it writes, so the opinions are seeded with
-# `NeoStore.record_opinion` directly. That is not a shortcut around a real panel run —
-# there is no panel to run yet — and every assertion here is about what the CLI and the
-# dashboard do with rows that exist, which is exactly what these surfaces own.
+# -- inspecting the panel's deliberation
 
 
 def seed_opinions(question_id: int = 1, seats=("premise", "record", "blast")) -> None:
@@ -440,12 +398,7 @@ def test_show_panel_lists_every_seat_with_its_status_verdict_and_latency(asked, 
 
 
 def test_show_without_panel_carries_no_deliberation_into_its_json(asked, capsys):
-    """The default document is exactly the question record.
-
-    Anything consuming `jarvis neo show <id> --json` must not silently start carrying
-    deliberation it never asked to see — "inspectable on demand" is a promise about the
-    default, not only about the dashboard.
-    """
+    """The default document is exactly the question record"""
     import json as _json
 
     from jarvis import cli
@@ -466,8 +419,7 @@ def test_show_without_panel_carries_no_deliberation_into_its_json(asked, capsys)
     assert set(doc) == expected_keys
     assert "panel_opinions" not in doc
 
-    # …and the same command WITH --panel does carry them, so the assertion above is
-    # about suppression rather than about the rows being missing.
+    # …and the same command WITH --panel does carry them
     cli.main(["neo", "show", "1", "--panel", "--json"])
     panelled = _json.loads(capsys.readouterr().out)
     assert set(panelled) == expected_keys | {"panel_opinions"}
@@ -485,17 +437,7 @@ def test_show_panel_on_a_question_no_panel_deliberated_says_so(asked, capsys):
 
 
 def test_deliberation_is_never_pushed_yet_is_always_reachable(asked, project, capsys):
-    """The design's hard line, as one test with both halves.
-
-    (a) The answer that reaches the worker is the chair's and nothing else: no seat name
-    appears in the queued message, and none appears in the inbox either.
-    (b) Those very opinions ARE readable through `jarvis neo show --panel`.
-
-    Half (b) is what makes half (a) mean something. Without it the test would pass just
-    as well against a database that stored no deliberation at all — it would be
-    asserting that absent rows are absent. Together they say the deliberation was
-    present and reachable at the moment it was absent from everything pushed.
-    """
+    """The design's hard line, as one test with both halves"""
     from jarvis import cli
 
     daemon, wo, _ = asked
@@ -534,7 +476,7 @@ def test_deliberation_is_never_pushed_yet_is_always_reachable(asked, project, ca
         assert seat in shown
 
 
-# -- seat-scoped corrections ------------------------------------------------------------
+# -- seat-scoped corrections
 
 
 def test_a_seat_scoped_correction_teaches_only_that_seat(asked, capsys):
@@ -550,8 +492,7 @@ def test_a_seat_scoped_correction_teaches_only_that_seat(asked, capsys):
     try:
         globals_only = neo.learnings("proj_a")
         blasts = neo.learnings("proj_a", seat="blast")
-        # Naming the row in BOTH calls is the point: an empty list would satisfy "not in
-        # the default scope" perfectly while meaning the learning was never written.
+        # Naming the row in BOTH calls is the point: an empty list would satisfy "not in the default scope"...
         assert not any("shipit" in learning["content"] for learning in globals_only)
         assert any("shipit" in learning["content"] for learning in blasts)
         assert [learning["seat"] for learning in blasts
@@ -561,11 +502,7 @@ def test_a_seat_scoped_correction_teaches_only_that_seat(asked, capsys):
 
 
 def test_an_unscoped_correction_still_behaves_exactly_as_before(asked, project):
-    """The negative control for the whole feature: no `--seat`, no change.
-
-    Mirrors `test_correction_becomes_learning_and_reaches_worker` — a global learning,
-    visible in the default scope, forwarded to the worker.
-    """
+    """The negative control for the whole feature: no `--seat`, no change"""
     from jarvis import cli
 
     daemon, wo, _ = asked
@@ -591,7 +528,7 @@ def test_an_unscoped_correction_still_behaves_exactly_as_before(asked, project):
 
 
 def test_a_seat_correction_on_a_question_no_panel_answered_is_refused(asked, capsys):
-    """No panel ran ⇒ there is no seat that got it wrong, and NOTHING is written."""
+    """No panel ran ⇒ there is no seat that got it wrong, and NOTHING is written"""
     from jarvis import cli
 
     daemon, _, _ = asked
@@ -611,8 +548,7 @@ def test_a_seat_correction_on_a_question_no_panel_answered_is_refused(asked, cap
 
 
 def test_a_seat_that_did_not_opine_is_refused_even_though_a_panel_ran(asked, capsys):
-    """The fast route runs `premise` alone, so "a panel ran" does not mean this seat saw
-    the question. Correcting a seat that never read it teaches the wrong reader."""
+    """The fast route runs `premise` alone, so "a panel ran" does not mean this seat saw the question"""
     from jarvis import cli
 
     daemon, _, _ = asked
@@ -661,7 +597,7 @@ def test_an_unknown_seat_is_refused_before_anything_is_written(asked, capsys):
         neo.close()
 
 
-# -- the ledger commands ----------------------------------------------------------------
+# -- the ledger commands
 
 
 def test_export_of_an_empty_home_is_empty_collections_not_an_error(jarvis_home, capsys):
@@ -697,8 +633,7 @@ def test_export_round_trips_every_row_and_every_column(asked, capsys):
     assert doc == expected
     assert len(doc["learnings"]) == 2
     assert len(doc["panel_opinions"]) == 3
-    # every column, not a whitelist: a seat-scoped learning is in there WITH its scope,
-    # and every row carries the `ts` a replay needs to order the corpus by.
+    # every column, not a whitelist: a seat-scoped learning is in there WITH its scope
     assert {learning["seat"] for learning in doc["learnings"]} == {"", "blast"}
     for table in doc.values():
         for row in table:
@@ -706,17 +641,7 @@ def test_export_round_trips_every_row_and_every_column(asked, capsys):
 
 
 def test_export_emits_every_column_the_tables_actually_have(asked, capsys):
-    """No hand-written whitelist: the columns come from the tables themselves.
-
-    `test_export_round_trips_every_row_and_every_column` compares the CLI against
-    `NeoStore.export()`, so it cannot catch a whitelist — both sides would drop the same
-    column. This asks SQLite what the columns ARE and demands all of them, which is what
-    makes the guarantee survive the next migration.
-
-    It is not hypothetical: `retired_at`/`retired_reason` were added to `learnings` by a
-    concurrent work order after this export was written, and reached the document with
-    no change here.
-    """
+    """No hand-written whitelist: the columns come from the tables themselves"""
     import json as _json
 
     from jarvis import cli
@@ -748,8 +673,7 @@ def test_export_emits_every_column_the_tables_actually_have(asked, capsys):
 
 
 def test_two_consecutive_exports_are_byte_identical(asked, capsys):
-    """No wall-clock field anywhere in the document — a diff of two exports has to show
-    what changed in the ledger, not that time passed."""
+    """No wall-clock field anywhere in the document"""
     from jarvis import cli
 
     daemon, _, _ = asked
@@ -765,8 +689,7 @@ def test_two_consecutive_exports_are_byte_identical(asked, capsys):
 
 
 def test_learnings_print_when_they_were_recorded(jarvis_home, capsys):
-    """bl-8427e451: the human listing carried no timestamps, so a learning could not be
-    lined up against the decision that produced it."""
+    """bl-8427e451: the human listing carried no timestamps"""
     import time as _time
 
     from jarvis import cli
@@ -787,12 +710,7 @@ def test_learnings_print_when_they_were_recorded(jarvis_home, capsys):
 
 
 def test_learnings_json_is_documented_on_the_subcommand_and_round_trips(jarvis_home, capsys):
-    """`--json` is accepted in either position ALREADY — `cli.main` strips it from argv
-    wherever it appears — so the behavioural half of bl-8427e451 was true before this
-    work order. What was missing is that `jarvis neo learnings --help` never said so,
-    which is why the backlog item was filed at all. Assert the help text, or this test
-    passes against an unchanged parser.
-    """
+    """`--json` is accepted in either position ALREADY"""
     import json as _json
 
     from jarvis import cli
@@ -816,8 +734,7 @@ def test_learnings_json_is_documented_on_the_subcommand_and_round_trips(jarvis_h
 
 
 def test_learnings_seat_filter_shows_a_seat_scoped_row_the_default_hides(jarvis_home, capsys):
-    """The sibling of the seat-scoped correction: a ledger command that could never
-    display the row `neo review --seat` had just written would be a dead end."""
+    """The sibling of the seat-scoped correction: a ledger command that could never display the row `neo..."""
     import json as _json
 
     from jarvis import cli
@@ -847,8 +764,7 @@ def test_learnings_seat_filter_shows_a_seat_scoped_row_the_default_hides(jarvis_
 
 def test_learnings_with_an_unknown_seat_is_refused_rather_than_silently_narrowed(
         jarvis_home, capsys):
-    """`learnings(project, seat="typo")` returns the global rows and looks like a
-    working filter. Refuse instead."""
+    """`learnings(project, seat="typo")` returns the global rows and looks like a working filter"""
     from jarvis import cli
 
     capsys.readouterr()
@@ -858,40 +774,23 @@ def test_learnings_with_an_unknown_seat_is_refused_rather_than_silently_narrowed
 
 def test_parse_verdict_tolerates_fences():
     v = neo_mod.parse_verdict('```json\n{"escalate": false, "answer": "go", "reason": "r"}\n```')
-    # `verdict`/`approve` are only meaningful for approval requests, and absent means
-    # "not approved" — an answer that never mentions either must never open a gate.
+    # `verdict`/`approve` are only meaningful for approval requests, and absent means "not approved"
     assert v == {"escalate": False, "answer": "go", "reason": "r",
                  "approve": False, "verdict": "denied", "dispatch": None,
-                 # `denied` here is a FALLBACK, not a ruling, and a caller with a third
-                 # outcome for output nobody could parse has to be able to tell.
+                 # `denied` here is a FALLBACK, not a ruling
                  "verdict_stated": False,
-                 # An answer that proposes no gate exemption proposes none: the empty
-                 # string must never reach the rule base as a pattern that matches
-                 # everything.
+                 # An answer that proposes no gate exemption proposes none: the empty string must never reach the rule...
                  "exempt_pattern": "",
-                 # And an answer that classifies no stakes classifies none. Only the
-                 # `assumption` kind reads this, and `autoreview.read_ruling` treats an
-                 # empty string as `routine` — which is safe ONLY because accepting
-                 # needs an explicit `approve` as well, never the absence of a warning.
+                 # And an answer that classifies no stakes classifies none
                  "stakes": "",
-                 # And an answer that names no escalation cause names none: "" stores as
-                 # NULL and renders "not recorded" (spec §2).
+                 # And an answer that names no escalation cause names none: "" stores as NULL and renders "not...
                  "cause": ""}
     v = neo_mod.parse_verdict("total nonsense")
     assert v["escalate"] is True
 
 
 def test_parse_verdict_recovers_a_reply_missing_only_its_final_brace():
-    """Question 145, reduced: Neo answered clearly, left off one `}`, and the user was
-    interrupted for a decision Neo had already made.
-
-    The greedy span stopped at the nested `dispatch` object's brace rather than the
-    outer one, so `json.loads` failed and the fail-safe escalated a settled answer. What
-    makes this worth a regression test rather than a one-line fix is the direction of
-    the damage: the fail-safe is CORRECT to escalate what it cannot read, so nothing
-    downstream was ever going to catch this — the only place it can be fixed is at the
-    point where the bytes are read.
-    """
+    """Question 145, reduced: Neo answered clearly"""
     v = neo_mod.parse_verdict(
         '{"escalate": false, "answer": "(b) is right", "reason": "agrees with (b)", '
         '"dispatch": {"title": "t", "description": "d"}')
@@ -901,12 +800,7 @@ def test_parse_verdict_recovers_a_reply_missing_only_its_final_brace():
 
 
 def test_parse_verdict_still_escalates_a_reply_cut_off_mid_answer():
-    """The other half of the same boundary, and the more important one.
-
-    A reply whose `answer` string was cut short cannot be repaired without inventing the
-    end of it, so it keeps failing toward the user. A worker being handed half a ruling
-    it cannot tell from a whole one is the failure this fail-safe exists to prevent.
-    """
+    """The other half of the same boundary, and the more important one"""
     v = neo_mod.parse_verdict('{"escalate": false, "answer": "(b) is right because it ke')
     assert v["escalate"] is True
     assert v["answer"] == ""
@@ -914,7 +808,7 @@ def test_parse_verdict_still_escalates_a_reply_cut_off_mid_answer():
 
 
 def test_parse_verdict_folds_a_dispatch_emitted_as_a_second_object():
-    """Issue #1098: Neo answered, then emitted its dispatch as a SECOND object."""
+    """Issue #1098: Neo answered, then emitted its dispatch as a SECOND object"""
     v = neo_mod.parse_verdict(
         '{"escalate": false, "answer": "x", "reason": "y"}\n'
         'Dispatch filed alongside the answer:\n'
@@ -926,7 +820,7 @@ def test_parse_verdict_folds_a_dispatch_emitted_as_a_second_object():
 
 
 def test_two_objects_that_both_rule_still_escalate():
-    """Two verdicts is a reply that said two things — the fold refuses to pick one."""
+    """Two verdicts is a reply that said two things — the fold refuses to pick one"""
     v = neo_mod.parse_verdict(
         '{"escalate": false, "answer": "x", "reason": "y"}\n'
         '{"escalate": true, "answer": "", "reason": "z"}')
@@ -936,13 +830,7 @@ def test_two_objects_that_both_rule_still_escalate():
 
 def test_answer_question_logs_the_full_raw_reply_when_it_cannot_be_parsed(
         jarvis_home, monkeypatch, caplog):
-    """Every SURFACE clips the raw reply to 120 characters — the escalation reason, the
-    daemon log line, the Telegram push — which is right for a notification and useless
-    for a diagnosis. Question 145's root cause sat at character 3161 and was only
-    reachable by hand-digging a `~/.claude` session transcript, which is not a file the
-    OS owns or can promise still exists. One log line, once, on a path that is rare and
-    already costs the user an interruption.
-    """
+    """Every SURFACE clips the raw reply to 120 characters"""
     from jarvis import claude_cli
 
     raw = '{"escalate": false, "answer": "' + "x" * 500 + '", "reason": "cut off here'
@@ -962,8 +850,7 @@ def test_answer_question_logs_the_full_raw_reply_when_it_cannot_be_parsed(
 
 def test_answer_question_does_not_log_a_reply_it_could_parse(
         jarvis_home, monkeypatch, caplog):
-    """The corollary: a working answer is not three kilobytes of log noise per question.
-    Paired with the test above so the trigger cannot silently widen to every reply."""
+    """The corollary: a working answer is not three kilobytes of log noise per question"""
     from jarvis import claude_cli
 
     raw = '{"escalate": false, "answer": "go", "reason": "r"}'
@@ -979,18 +866,14 @@ def test_answer_question_does_not_log_a_reply_it_could_parse(
     assert not [r for r in caplog.records if "raw reply" in r.getMessage()]
 
 
-# -- escalation causes (spec §1/§2, docs/superpowers/specs/2026-10-01-neo-observability.md) --------
-#
-# The grouping the report exists to provide, and the one rule that governs it: a label
-# the model did not pick is NULL, never a guess and never a synthetic escalation.
+# -- escalation causes (spec §1/§2, docs/superpowers/specs/2026-10-01-neo-observability.md)
 
-#: The wording every persona's `cause` field uses, verbatim. The test below reads the
-#: SHIPPED prose through it — mem:neo-panel's rule.
+#: The wording every persona's `cause` field uses, verbatim
 CAUSE_MARKER = "name the cause from this list; omit it if none fits:"
 
 
 def _persona_causes(text: str) -> list[str]:
-    """The cause members one persona actually offers the model."""
+    """The cause members one persona actually offers the model"""
     out: list[str] = []
     for chunk in text.split(CAUSE_MARKER)[1:]:
         listed = chunk.split('>"')[0]
@@ -1008,12 +891,7 @@ def test_parse_verdict_normalises_a_cause_the_persona_offered():
 @pytest.mark.parametrize("raw_cause", ["", '"nonsense"', '"transport-unreachable"',
                                        "null", "17"])
 def test_a_cause_that_is_not_a_chosen_member_reads_empty_and_keeps_the_verdict(raw_cause):
-    """Absent, unknown, or a FAILED-class member the model cannot know about.
-
-    None of them may reject the verdict: `structured.coerce`'s `on_invalid` is
-    `_unparseable_verdict`, so raising here would manufacture an escalation Neo never
-    made — question 388's bug one field along.
-    """
+    """Absent, unknown, or a FAILED-class member the model cannot know about"""
     tail = f', "cause": {raw_cause}' if raw_cause else ""
     v = neo_mod.parse_verdict(
         '{"escalate": false, "answer": "use CSV", "reason": "r"' + tail + "}")
@@ -1028,8 +906,7 @@ def test_unparseable_output_carries_the_mechanical_cause():
 
 
 def test_every_chosen_cause_is_asked_for_by_at_least_one_persona():
-    """Asserted over the SHIPPED prose: the enum is what the report groups on, and the
-    persona text is the only thing that makes a member reachable."""
+    """Asserted over the SHIPPED prose: the enum is what the report groups on"""
     from jarvis import autoreview, gates, plans, supervisor
     from jarvis.neo_store import ESCALATION_CAUSES_CHOSEN
 
@@ -1043,8 +920,7 @@ def test_every_chosen_cause_is_asked_for_by_at_least_one_persona():
     offered = {name: _persona_causes(text) for name, text in personas.items()}
     for name, members in offered.items():
         assert members, f"{name} offers no cause at all"
-        # No persona names a member outside the enum: a label the report cannot group is
-        # one the model was asked for and nobody can read.
+        # No persona names a member outside the enum: a label the report cannot group is one the model was...
         for member in members:
             assert member in ESCALATION_CAUSES_CHOSEN, (name, member)
     every = {m for members in offered.values() for m in members}
@@ -1052,9 +928,7 @@ def test_every_chosen_cause_is_asked_for_by_at_least_one_persona():
 
 
 def test_the_three_classes_are_disjoint_and_sum_to_the_enum():
-    """Three tuples because "who decided" has three answers (Neo, question 1170). One
-    tuple would invite a report that adds them up, which is the reading this exists to
-    prevent."""
+    """Three tuples because "who decided" has three answers (Neo, question 1170)"""
     from jarvis.neo_store import (ESCALATION_CAUSES, ESCALATION_CAUSES_CHOSEN,
                                   ESCALATION_CAUSES_FAILED,
                                   ESCALATION_CAUSES_OVERRIDDEN)
@@ -1071,9 +945,7 @@ def test_the_three_classes_are_disjoint_and_sum_to_the_enum():
 
 
 def test_a_model_may_never_name_an_overridden_cause(jarvis_home):
-    """These five are facts about what the OS did with Neo's answer. A model claiming one
-    is describing something it cannot know, so `parse_verdict` drops it — and a persona
-    that offered one would be asking for a label nobody could trust."""
+    """These five are facts about what the OS did with Neo's answer"""
     from jarvis import autoreview, gates, plans, supervisor
     from jarvis.neo_store import ESCALATION_CAUSES_OVERRIDDEN
 
@@ -1138,7 +1010,7 @@ def test_the_escalate_branch_writes_the_cause_to_the_row(jarvis_home):
 
 
 def test_a_transport_failure_and_a_refused_prompt_write_their_own_causes(jarvis_home):
-    """Derived by the OS at the code path, never read off a reply (spec §1)."""
+    """Derived by the OS at the code path, never read off a reply (spec §1)"""
     from jarvis import claude_cli
     from jarvis.neo_store import MAX_ANSWER_ATTEMPTS
 
@@ -1182,7 +1054,7 @@ def test_a_stranded_claim_given_up_on_records_attempts_exhausted(jarvis_home):
 
 
 def test_a_usage_limit_hold_writes_no_cause(jarvis_home):
-    """A window that will reopen is not an escalation (spec §1)."""
+    """A window that will reopen is not an escalation (spec §1)"""
     neo = NeoStore()
     try:
         q = neo.ask("proj_a", "wo-1", "which?")

@@ -1,15 +1,4 @@
-"""Screenshot `/neo/question/<id>` for an alarm question, for a PR's UI evidence.
-
-§3 of docs/superpowers/specs/2026-08-31-the-supervisor.md — the one-line safety branch
-in `_question.html`: an alarm question shows a link to the alarms tab where every other
-kind shows a reply box, because a reply here would message a worker mid-turn.
-`scripts/screenshot_wo_alarm_record.py` is the shape it copies.
-
-The `question` question beside it is the CONTROL: the point of the picture is that the
-two render differently, and one page showing no reply box proves nothing on its own.
-
-    uv run python scripts/screenshot_alarm_question.py
-"""
+"""Screenshot `/neo/question/<id>` for an alarm question, for a PR's UI evidence (docs/superpowers/specs/2026-08-31-the-supervisor.md)"""
 
 from __future__ import annotations
 
@@ -27,7 +16,7 @@ PORT = 8799
 
 
 def seed() -> tuple[int, int]:
-    """An escalated alarm question and an escalated ordinary question, side by side."""
+    """An escalated alarm question and an escalated ordinary question, side by side"""
     from jarvis import ops
     from jarvis.central_store import CentralStore
     from jarvis.neo_store import NeoStore

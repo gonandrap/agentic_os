@@ -1,23 +1,4 @@
-"""The plan-review eval must not be able to skip itself into silence.
-
-`evals/llm/test_plan_review_judgment.py` costs real money, so it is opt-in and CI
-never runs it. Same trap as the panel eval's harness test: a typo in the gate
-variable, an empty battery, or plumbing that quietly grades nothing keeps CI green
-while the measurement never runs. Everything here is free and runs on every
-`pytest tests/`.
-
-Two properties are specific to THIS eval:
-
-* **The battery is skeleton-shaped by construction.** The whole point of the eval is
-  to grade Neo on the question shape production ships after wo-e4a359cb. Every
-  question must come out of `plans.build_plan_question`, carry no child briefs (the
-  FAT_MARKER control proves the briefs were really fat), and stay an order of
-  magnitude under the 84KB questions the diet replaced.
-* **The plumbing reaches the real plan-review path.** A canned-model smoke run drives
-  `collect_verdicts` end-to-end — store, `kind="plan"`, persona selection, verdict
-  parsing — with only the model call stubbed, so a refactor that breaks the wiring
-  fails here, not silently in an eval nobody runs.
-"""
+"""The plan-review eval must not be able to skip itself into silence"""
 
 from __future__ import annotations
 
@@ -58,15 +39,13 @@ def test_the_battery_is_skeleton_shaped(eval_module):
     assert len(battery) == 7
     assert len({name for name, _ in battery}) == 7, "colliding scenario names"
     for name, question in battery:
-        # Composed by the shipped skeleton renderer, briefs withheld.
+        # Composed by the shipped skeleton renderer, briefs withheld
         assert "Release this plan?" in question, name
         assert eval_module.FAT_MARKER not in question, (
             f"{name}: a child brief leaked into the question")
         assert len(question) < 10_000, (
             f"{name}: {len(question)} chars — the diet this eval guards is gone")
-    # Control in the same test: the briefs the questions withhold really are fat. Stated
-    # against the shipped ceiling rather than a literal, because that ceiling has moved
-    # twice (1500, then 600) and a hard number turns this control into a chore.
+    # Control in the same test: the briefs the questions withhold really are fat
     from jarvis.plans import MAX_DESCRIPTION_CHARS
 
     fat = eval_module._child("k", "t", "a")
@@ -75,7 +54,7 @@ def test_the_battery_is_skeleton_shaped(eval_module):
 
 
 def test_a_canned_model_drives_the_real_plumbing(eval_module, tmp_path, monkeypatch):
-    """Everything but the judgment: store, kind='plan', persona, parse, collection."""
+    """Everything but the judgment: store, kind='plan', persona, parse, collection"""
     from jarvis import claude_cli
 
     calls = []
@@ -93,7 +72,7 @@ def test_a_canned_model_drives_the_real_plumbing(eval_module, tmp_path, monkeypa
     assert set(verdicts) == {n for n, _ in
                              eval_module.MUST_RELEASE + eval_module.MUST_BLOCK}
     assert all(v["verdict"] == "approved" for v in verdicts.values())
-    # kind="plan" selected the plan-review persona, not the general answerer.
+    # kind="plan" selected the plan-review persona, not the general answerer
     assert all("reviewing a PLAN" in c["system"] for c in calls)
-    # And each call carried its scenario's skeleton question.
+    # And each call carried its scenario's skeleton question
     assert sum("Release this plan?" in c["prompt"] for c in calls) == len(calls)

@@ -1,14 +1,4 @@
-"""A release order overtaken mid-CI-wait settles itself — issue #784.
-
-docs/superpowers/specs/2026-09-26-a-release-order-overtaken-mid-ci-wait-settles-itself.md
-
-Twice measured (wo-e5816dd7, wo-4301a7a6): a release work order the daemon filed sat open
-after the release it was going to cut had already shipped, and a worker turn was spent
-running two git commands to close it. The arithmetic lives here instead.
-
-Real local repositories, real `git tag --contains`: the defect is an ancestry question and
-a fake would let the wrong field pass (kn-179cd767, kn-4f5aaa2b).
-"""
+"""A release order overtaken mid-CI-wait settles itself — issue #784"""
 
 from __future__ import annotations
 
@@ -32,7 +22,7 @@ LATER_TAG = "jarvis-0.10.25"
 OLD_TAG = "jarvis-0.10.20"
 
 
-# -- fixtures -------------------------------------------------------------------------
+# -- fixtures
 
 
 def sha(repo: Path, rev: str = "HEAD") -> str:
@@ -42,20 +32,20 @@ def sha(repo: Path, rev: str = "HEAD") -> str:
 
 
 def land(repo: Path, name: str) -> str:
-    """One commit on `main`, as a squash merge leaves it. Returns its sha."""
+    """One commit on `main`, as a squash merge leaves it"""
     (repo / name).write_text(name)
     commit(repo, f"squash: {name}", name)
     return sha(repo)
 
 
 def tag(repo: Path, name: str, rev: str = "HEAD") -> None:
-    """An ANNOTATED tag, which is what the release path cuts."""
+    """An ANNOTATED tag, which is what the release path cuts"""
     subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
                     "tag", "-a", name, "-m", name, rev], check=True)
 
 
 def on_a_branch(repo: Path, name: str) -> str:
-    """A commit that never reached `main` — a pull request's `headRefOid`."""
+    """A commit that never reached `main` — a pull request's `headRefOid`"""
     subprocess.run(["git", "-C", str(repo), "checkout", "-q", "-b", name], check=True)
     head = land(repo, f"{name}.txt")
     subprocess.run(["git", "-C", str(repo), "checkout", "-q", "main"], check=True)
@@ -74,19 +64,13 @@ def store(project):
     s.close()
 
 
-#: This repository, as `github.origin_repo` returns it for every checkout of it.
+#: This repository, as `github.origin_repo` returns it for every checkout of it
 OS_REPO = ("gonandrap", "agentic_os")
 
 
 @pytest.fixture(autouse=True)
 def os_identity(project, monkeypatch, origins):
-    """`proj_a` IS the OS — the guards below run on no other project (issue 956).
-
-    The install and `proj_a` are given ONE ORIGIN through the cache rather than a real
-    remote: `with_origin` arms every other origin-gated path in the daemon, and this file
-    then spent three minutes reaching for a remote that does not exist. Real remotes and
-    real `git remote get-url` are `test_scheduler`'s job.
-    """
+    """`proj_a` IS the OS — the guards below run on no other project (issue 956)"""
     from jarvis import schedule
 
     install = str(Path(schedule.__file__).resolve().parent)
@@ -96,11 +80,7 @@ def os_identity(project, monkeypatch, origins):
 
 @pytest.fixture()
 def deploy(tmp_path, monkeypatch):
-    """Put the production checkout at a tag, with a pyproject.toml version to match.
-
-    BOTH readings, because `overtaken_by` checks both (kn-58429229): the ref from git and
-    the version from the file.
-    """
+    """Put the production checkout at a tag, with a pyproject.toml version to match"""
     root = tmp_path / "production"
     monkeypatch.setenv("PRODUCTION_CODE", str(root))
 
@@ -120,11 +100,7 @@ def deploy(tmp_path, monkeypatch):
 
 def release_order(store: ProjectStore, project: Path, *, shas: dict[str, str],
                   status: str = "running") -> str:
-    """A release order as `ensure_release` files it, with its batch already resolved.
-
-    `shas` maps issue url to the merge commit of the fix that closed it: one fixing work
-    order per entry, carrying the `pr_merged` event that records it (§2).
-    """
+    """A release order as `ensure_release` files it, with its batch already resolved"""
     rel = store.create_work_order("Ship the fix", status=status,
                                   metadata={Daemon.RELEASE_BATCH_KEY: []})
     for url, merge_commit in shas.items():
@@ -133,7 +109,7 @@ def release_order(store: ProjectStore, project: Path, *, shas: dict[str, str],
 
 
 def batch_in(store: ProjectStore, rel_id: str, url: str, merge_commit: str) -> str:
-    """One more landed fix joining an open release order, `ensure_release`'s way."""
+    """One more landed fix joining an open release order, `ensure_release`'s way"""
     meta = db.from_json(store.get_work_order(rel_id).get("metadata"), {})
     store.update_work_order(rel_id, metadata=db.to_json(
         {**meta, Daemon.RELEASE_BATCH_KEY: [*meta[Daemon.RELEASE_BATCH_KEY], url]}))
@@ -148,7 +124,7 @@ def batch_in(store: ProjectStore, rel_id: str, url: str, merge_commit: str) -> s
 
 
 def step(daemon: Daemon, store: ProjectStore) -> None:
-    """The settlement step alone, without the rest of the tick around it."""
+    """The settlement step alone, without the rest of the tick around it"""
     daemon.settle_shipped_releases(daemon.catalog.project("proj_a"), store)
 
 
@@ -161,12 +137,11 @@ def events(store: ProjectStore, wo_id: str, kind: str) -> list[dict]:
             for e in store.events_of_kind(wo_id, kind)]
 
 
-# -- 1 & 2: the ancestry test, on real git --------------------------------------------
+# -- 1 & 2: the ancestry test, on real git
 
 
 def test_a_tag_containing_the_whole_batch_is_found_and_half_a_batch_is_not(project):
-    """`git tag --contains A --contains B` is a UNION, so one call would report a tag
-    carrying half the batch as carrying all of it. The intersection is what this pins."""
+    """`git tag --contains A --contains B` is a UNION"""
     first = land(project, "fix-one.txt")
     tag(project, TAG)
     second = land(project, "fix-two.txt")
@@ -176,13 +151,12 @@ def test_a_tag_containing_the_whole_batch_is_found_and_half_a_batch_is_not(proje
 
     tag(project, LATER_TAG)
     assert release.tags_containing(project, [first, second]) == ([LATER_TAG], "")
-    # Ordered by version, lowest first: the first release carrying the whole batch.
+    # Ordered by version, lowest first: the first release carrying the whole batch
     assert release.tags_containing(project, [first]) == ([TAG, LATER_TAG], "")
 
 
 def test_the_squash_trap_a_branch_tip_is_in_no_tag(project):
-    """`automerge._merge_args` merges with `--squash`, so `headRefOid` is NEVER an
-    ancestor of `main`. Comparing it against a tag waits for ever."""
+    """`automerge._merge_args` merges with `--squash`, so `headRefOid` is NEVER an ancestor of `main`"""
     head_ref_oid = on_a_branch(project, "feature")
     land(project, "fix-one.txt")
     tag(project, TAG)
@@ -190,7 +164,7 @@ def test_the_squash_trap_a_branch_tip_is_in_no_tag(project):
     assert release.tags_containing(project, [head_ref_oid]) == ([], "")
 
 
-# -- 3: the whole point ---------------------------------------------------------------
+# -- 3: the whole point
 
 
 def test_a_release_already_shipped_and_deployed_completes_the_order(
@@ -210,13 +184,12 @@ def test_a_release_already_shipped_and_deployed_completes_the_order(
     assert not store.get_work_order(rel)["needs_attention"]
 
 
-# -- 4: a tag nobody deployed ---------------------------------------------------------
+# -- 4: a tag nobody deployed
 
 
 def test_a_containing_tag_production_is_behind_says_so_exactly_once(
         project, store, daemon, deploy):
-    """Neo question 751 option B: a tag nobody deployed does not pay the debt, so the
-    order stays open — and the note is written once per TAG, never once per tick."""
+    """Neo question 751 option B: a tag nobody deployed does not pay the debt, so the order stays open"""
     land(project, "old.txt")
     tag(project, OLD_TAG)
     landed = land(project, "fix-one.txt")
@@ -234,9 +207,7 @@ def test_a_containing_tag_production_is_behind_says_so_exactly_once(
     assert said[0]["tag"] == TAG
     assert said[0]["deployed"] == OLD_TAG
 
-    # A SECOND fix joins the open batch (`ensure_release` batches while the order waits),
-    # and only a later tag carries it. The user hears about that tag too — dedupe by kind
-    # alone would have gone silent here.
+    # A SECOND fix joins the open batch (`ensure_release` batches while the order waits)
     second = land(project, "fix-two.txt")
     tag(project, LATER_TAG)
     batch_in(store, rel, ISSUE + "-b", second)
@@ -246,11 +217,11 @@ def test_a_containing_tag_production_is_behind_says_so_exactly_once(
     assert [s["tag"] for s in said] == [TAG, LATER_TAG]
 
 
-# -- 5: every refusal in §7 -----------------------------------------------------------
+# -- 5: every refusal in §7
 
 
 def unresolved(project, store, daemon, deploy, landed):
-    """No recorded merge commit, and `gh` cannot answer — the payload is half known."""
+    """No recorded merge commit, and `gh` cannot answer — the payload is half known"""
     tag(project, TAG)
     deploy(project, TAG)
     return release_order(store, project, shas={ISSUE: ""})
@@ -308,7 +279,7 @@ def a_marker_names_this_order(project, store, daemon, deploy, landed):
 ], ids=lambda f: f.__name__)
 def test_every_refusal_leaves_the_work_order_exactly_as_it_was(
         project, store, daemon, deploy, fake_gh, setup):
-    """§7: it never fails open. No event, no status change, no flag — retried next tick."""
+    """§7: it never fails open"""
     fake_gh.fail("gh: could not connect")
     landed = land(project, "fix-one.txt")
     rel = setup(project, store, daemon, deploy, landed)
@@ -319,7 +290,7 @@ def test_every_refusal_leaves_the_work_order_exactly_as_it_was(
     assert snapshot(store, rel) == before
 
 
-# -- 6: `settle`'s traps, through the new caller -------------------------------------
+# -- 6: `settle`'s traps, through the new caller
 
 
 def test_a_pending_assumption_is_not_accepted_by_the_back_door(
@@ -350,13 +321,12 @@ def test_an_order_behind_a_pull_request_stays_parked_on_its_merge(
     assert not events(store, rel, "release_completed")
 
 
-# -- 7: the back-fill is paid once ---------------------------------------------------
+# -- 7: the back-fill is paid once
 
 
 def test_the_back_fill_of_a_merge_commit_costs_one_gh_call_ever(
         project, store, daemon, deploy, fake_gh):
-    """A fix that merged before §2 shipped has no recorded sha. One `pr_view` resolves
-    it, and the event it writes is what the next tick reads instead."""
+    """A fix that merged before §2 shipped has no recorded sha"""
     landed = land(project, "fix-one.txt")
     tag(project, TAG)
     tag(project, OLD_TAG, rev="HEAD~1")
@@ -378,12 +348,12 @@ def test_the_back_fill_of_a_merge_commit_costs_one_gh_call_ever(
     assert len(events(store, rel, "release_overtaken")) == 1
 
 
-# -- 8: what the common case costs ---------------------------------------------------
+# -- 8: what the common case costs
 
 
 def test_with_no_open_release_order_the_step_only_reads_and_spawns_nothing(
         project, store, daemon, monkeypatch):
-    """§4's budget, executed rather than commented."""
+    """§4's budget, executed rather than commented"""
     store.create_work_order("something else", status="running")
     spawned: list[list[str]] = []
     real = subprocess.run
@@ -403,8 +373,7 @@ def test_with_no_open_release_order_the_step_only_reads_and_spawns_nothing(
 
 def test_a_project_that_does_not_own_the_os_pays_nothing(
         project, store, daemon, monkeypatch, tmp_path):
-    """§8: the test reads `paths.production_code_dir()` and globs `jarvis-*`, both facts
-    about the OS's own release path. A second project gets exactly today's behaviour."""
+    """§8: the test reads `paths.production_code_dir()` and globs `jarvis-*`"""
     land(project, "fix-one.txt")
     release_order(store, project, shas={ISSUE: sha(project)})
     monkeypatch.setattr(daemon, "_os_project", lambda: "someone-else")
@@ -422,16 +391,11 @@ def test_a_project_that_does_not_own_the_os_pays_nothing(
     assert spawned == []
 
 
-# -- the hook ------------------------------------------------------------------------
+# -- the hook
 
 
 def test_the_tick_runs_the_step_after_the_issue_sweep(project, daemon, monkeypatch):
-    """§4: inside the existing `if poll_prs:` block, immediately after
-    `sync_issue_references` — so after `sync_issues`, which is what files these orders.
-
-    And the red-base hold immediately BEFORE `dispatch_pending` (2026-09-27 spec §5):
-    a release order filed late in one tick is claimed early in the next, so a hold
-    running after dispatch would hold nothing on the first opportunity."""
+    """§4: inside the existing `if poll_prs:` block, immediately after `sync_issue_references`"""
     order: list[str] = []
     for name in ("hold_red_release", "dispatch_pending", "poll_pull_requests",
                  "sync_issues", "sync_issue_references", "settle_shipped_releases"):
@@ -445,17 +409,12 @@ def test_the_tick_runs_the_step_after_the_issue_sweep(project, daemon, monkeypat
                      "sync_issues", "sync_issue_references", "settle_shipped_releases"]
 
 
-# -- the red-`main` hold ---------------------------------------------------------------
-#
-# docs/superpowers/specs/2026-09-27-an-expedited-order-that-lands-ships-a-release.md §5.
-# `ensure_release` files unless production already runs the payload (#934), so the hold is
-# on DISPATCH: a call skipped because the base was red never comes back, and the fix would
-# be dropped from every future batch.
+# -- the red-`main` hold
 
 
 def run(sha_: str, conclusion: str = "failure", workflow: str = "tests",
         run_id: int = 1, status: str = "completed"):
-    """One base run, as `ci.base_runs` normalises it."""
+    """One base run, as `ci.base_runs` normalises it"""
     from jarvis import ci
     return ci.Run(run_id=run_id, head_sha=sha_, conclusion=conclusion, status=status,
                   started_at=1.0, workflow=workflow)
@@ -463,7 +422,7 @@ def run(sha_: str, conclusion: str = "failure", workflow: str = "tests",
 
 @pytest.fixture()
 def base_ci(monkeypatch):
-    """What `ci.base_runs` answers for the base branch, newest first."""
+    """What `ci.base_runs` answers for the base branch, newest first"""
     from jarvis import ci
 
     state: dict = {"runs": (), "error": None, "calls": []}
@@ -479,7 +438,7 @@ def base_ci(monkeypatch):
 
 
 def pending_release(store: ProjectStore) -> str:
-    """A release order waiting to be claimed — what the hold acts on."""
+    """A release order waiting to be claimed — what the hold acts on"""
     rel = store.create_work_order("Ship the fix", status="pending",
                                   metadata={Daemon.RELEASE_BATCH_KEY: [ISSUE]})
     return str(rel["id"])
@@ -490,7 +449,7 @@ def hold(daemon: Daemon, store: ProjectStore) -> None:
 
 
 def test_a_red_main_holds_a_pending_release(project, store, daemon, base_ci):
-    """§5: red base, so the order is not claimable and the timeline says why."""
+    """§5: red base, so the order is not claimable and the timeline says why"""
     rel = pending_release(store)
     base_ci["runs"] = (run("deadbeefcafe"),)
 
@@ -504,7 +463,7 @@ def test_a_red_main_holds_a_pending_release(project, store, daemon, base_ci):
 
 
 def test_a_green_main_lets_the_release_go(project, store, daemon, base_ci):
-    """The other half: nothing is written and the order is claimed."""
+    """The other half: nothing is written and the order is claimed"""
     rel = pending_release(store)
     base_ci["runs"] = (run("deadbeefcafe", conclusion="success"),)
 
@@ -517,8 +476,7 @@ def test_a_green_main_lets_the_release_go(project, store, daemon, base_ci):
 
 
 def test_a_still_red_main_says_so_once_per_commit(project, store, daemon, base_ci):
-    """kn-7b122cd9: a code per CONDITION is also a code per WORLD. Same broken commit is
-    the same news; a DIFFERENT broken commit is not."""
+    """kn-7b122cd9: a code per CONDITION is also a code per WORLD"""
     rel = pending_release(store)
     base_ci["runs"] = (run("aaaaaaaaaaaa"),)
 
@@ -537,8 +495,7 @@ def test_a_still_red_main_says_so_once_per_commit(project, store, daemon, base_c
 
 
 def test_an_unreadable_ci_does_not_hold_the_release(project, store, daemon, base_ci):
-    """§5: an unreadable base must never strand the user's release on a `gh` outage.
-    The brief still tells the worker to check, and the ship is a gated action."""
+    """§5: an unreadable base must never strand the user's release on a `gh` outage"""
     from jarvis.github import GitHubError
     rel = pending_release(store)
     base_ci["error"] = GitHubError("gh is off", GitHubError.NO_GH)
@@ -552,8 +509,7 @@ def test_an_unreadable_ci_does_not_hold_the_release(project, store, daemon, base
 
 
 def test_a_red_hold_never_shortens_a_dispatch_backoff(project, store, daemon, base_ci):
-    """`dispatch_attempts` and its ladder belong to `release_dispatch_claim`. A red hold
-    may extend that backoff, never shorten it, and green may not erase it."""
+    """`dispatch_attempts` and its ladder belong to `release_dispatch_claim`"""
     rel = pending_release(store)
     for _ in range(3):
         store.release_dispatch_claim(rel, "claude would not launch", max_attempts=10)
@@ -565,7 +521,7 @@ def test_a_red_hold_never_shortens_a_dispatch_backoff(project, store, daemon, ba
     hold(daemon, store)
     assert float(store.get_work_order(rel)["retry_after"]) == backoff
 
-    # The ladder LAPSED, and the base is green: still not this step's to erase.
+    # The ladder LAPSED, and the base is green: still not this step's to erase
     store.update_work_order(rel, retry_after=db.now() - 1)
     lapsed = float(store.get_work_order(rel)["retry_after"])
     base_ci["runs"] = (run("aaaaaaaaaaaa", conclusion="success"),)
@@ -575,19 +531,11 @@ def test_a_red_hold_never_shortens_a_dispatch_backoff(project, store, daemon, ba
     assert row["dispatch_attempts"] == attempts
 
 
-# -- the deferred release ------------------------------------------------------------
-#
-# docs/superpowers/specs/2026-09-29-a-release-blocked-by-a-red-main-retries-itself.md §4.
+# -- the deferred release
 
 
 def test_overtaken_settles_a_release_deferred_in_pending(project, store, daemon, deploy):
-    """§4: a release re-parked into `pending` by a red base is still settled when a newer
-    release ships its batch.
-
-    Works today by the accident of one tuple's contents — `pending` is the FIRST entry of
-    `OPEN_STATUSES` and `_settle_shipped_release` has no status guard at all — and either
-    would break it silently. This is the pin.
-    """
+    """§4: a release re-parked into `pending` by a red base is still settled when a newer release ships..."""
     from jarvis.project_store import OPEN_STATUSES
 
     assert "pending" in OPEN_STATUSES
@@ -603,9 +551,7 @@ def test_overtaken_settles_a_release_deferred_in_pending(project, store, daemon,
     assert len(events(store, rel, "release_completed")) == 1
 
 
-# -- a landed fix batched into a release order that already finished — issue #945 -------
-#
-# docs/superpowers/specs/2026-10-06-a-landed-fix-batched-into-a-release-order-that-already-finished.md
+# -- a landed fix batched into a release order that already finished — issue #945
 
 OTHER = "https://github.com/acme/proj/issues/900"
 
@@ -615,11 +561,7 @@ def sweep(daemon: Daemon, store: ProjectStore) -> None:
 
 
 def batch_urls(store: ProjectStore) -> dict[str, list[str]]:
-    """Every work order carrying a release batch, by id — the urls in it.
-
-    `batches` below answers the other question (which ORDERS carry one) and the two
-    cannot share a name.
-    """
+    """Every work order carrying a release batch, by id — the urls in it"""
     out = {}
     for wo in store.list_work_orders(include_hidden=True):
         meta = db.from_json(wo.get("metadata"), {}) or {}
@@ -629,13 +571,12 @@ def batch_urls(store: ProjectStore) -> dict[str, list[str]]:
     return out
 
 
-# -- §3.1-3.3: selection ---------------------------------------------------------------
+# -- §3.1-3.3: selection
 
 
 def test_a_finished_candidate_is_skipped_and_a_fresh_order_is_filed(
         project, store, daemon):
-    """wo-29f44978 reproduced: `needs_review` is in `OPEN_STATUSES`, so the fix joined a
-    batch whose worker had already delivered and no tag ever carried it (§1.1)."""
+    """wo-29f44978 reproduced: `needs_review` is in `OPEN_STATUSES`"""
     landed = land(project, "fix-one.txt")
     rel = release_order(store, project, shas={OTHER: landed}, status="needs_review")
     store.add_event(rel, "finished", {"summary": "No release cut: nothing to ship"})
@@ -651,7 +592,7 @@ def test_a_finished_candidate_is_skipped_and_a_fresh_order_is_filed(
 
 
 def test_a_still_running_candidate_still_batches(project, store, daemon):
-    """§1.2: two blockers ten minutes apart still make one release."""
+    """§1.2: two blockers ten minutes apart still make one release"""
     landed = land(project, "fix-one.txt")
     rel = release_order(store, project, shas={OTHER: landed})
     fix = landed_fix(store, ISSUE, landed)
@@ -667,8 +608,7 @@ def test_a_still_running_candidate_still_batches(project, store, daemon):
 @pytest.mark.parametrize("finished", [True, False])
 def test_an_url_already_in_a_batch_adds_nothing_and_files_nothing(
         project, store, daemon, finished):
-    """§1.3: read before any write, and it holds when the holder is FINISHED too — the
-    sweep rescues that url, and a second release order filed here would race it."""
+    """§1.3: read before any write, and it holds when the holder is FINISHED too"""
     landed = land(project, "fix-one.txt")
     rel = release_order(store, project, shas={ISSUE: landed})
     if finished:
@@ -685,11 +625,11 @@ def test_an_url_already_in_a_batch_adds_nothing_and_files_nothing(
     assert list(batch_urls(store)) == [rel], "no second release order"
 
 
-# -- §3.4-3.8: the sweep ---------------------------------------------------------------
+# -- §3.4-3.8: the sweep
 
 
 def test_the_sweep_refiles_an_unshipped_entry_exactly_once(project, store, daemon):
-    """The issue's last sentence: settling must never drop a fix no live tag carries."""
+    """The issue's last sentence: settling must never drop a fix no live tag carries"""
     landed = land(project, "fix-one.txt")
     rel = release_order(store, project, shas={ISSUE: landed}, status="completed")
     fix_id = db.from_json(store.events_of_kind(rel, "release_batched")[0]["payload"],
@@ -715,9 +655,7 @@ def test_the_sweep_refiles_an_unshipped_entry_exactly_once(project, store, daemo
 
 def test_the_sweep_files_nothing_when_a_tag_carries_the_entry(project, store, daemon,
                                                              monkeypatch):
-    """§2.3: a containing tag accounts for the entry — whether production runs it is the
-    deploy question and belongs to `_settle_shipped_release`. Then the order is CLEARED,
-    so every later pass does zero git work."""
+    """§2.3: a containing tag accounts for the entry"""
     landed = land(project, "fix-one.txt")
     tag(project, TAG)
     rel = release_order(store, project, shas={ISSUE: landed}, status="completed")
@@ -741,8 +679,7 @@ def test_the_sweep_files_nothing_when_a_tag_carries_the_entry(project, store, da
 
 def test_the_sweep_pays_nothing_for_a_project_that_does_not_own_the_os(
         project, store, daemon, monkeypatch):
-    """§2.1: it reads `jarvis-*` tags and the production checkout, both facts about this
-    repository. Mirrors `test_a_project_that_does_not_own_the_os_pays_nothing`."""
+    """§2.1: it reads `jarvis-*` tags and the production checkout, both facts about this repository"""
     landed = land(project, "fix-one.txt")
     release_order(store, project, shas={ISSUE: landed}, status="completed")
     monkeypatch.setattr(daemon, "_os_owner", lambda: "someone-else")
@@ -761,8 +698,7 @@ def test_the_sweep_pays_nothing_for_a_project_that_does_not_own_the_os(
 
 
 def test_the_tick_runs_the_sweep_after_the_settlement_step(project, daemon, monkeypatch):
-    """§2.1: AFTER `settle_shipped_releases`, so an order that settles on this tick is
-    read in its settled state by the next pass, and on the `poll_prs` beat."""
+    """§2.1: AFTER `settle_shipped_releases`"""
     order: list[str] = []
     for name in ("poll_pull_requests", "sync_issues", "sync_issue_references",
                  "settle_shipped_releases", "refile_dropped_fixes"):
@@ -778,8 +714,7 @@ def test_the_tick_runs_the_sweep_after_the_settlement_step(project, daemon, monk
 
 def test_a_filing_that_files_nothing_is_not_a_refile(project, store, daemon,
                                                      monkeypatch):
-    """§2.3.4: `ensure_release` can decline to file — nothing to ship. No marker, so the
-    url stays in the window and the next pass tries again."""
+    """§2.3.4: `ensure_release` can decline to file — nothing to ship"""
     landed = land(project, "fix-one.txt")
     rel = release_order(store, project, shas={ISSUE: landed}, status="completed")
     calls: list[str] = []
@@ -798,8 +733,7 @@ def test_a_filing_that_files_nothing_is_not_a_refile(project, store, daemon,
 
 def test_an_unreadable_tag_list_files_nothing_and_is_retried(project, store, daemon,
                                                             monkeypatch):
-    """§2.3: fail closed. Read as "not shipped", a `git fetch` failure would file a
-    release order per poll."""
+    """§2.3: fail closed"""
     landed = land(project, "fix-one.txt")
     rel = release_order(store, project, shas={ISSUE: landed}, status="completed")
     monkeypatch.setattr(release, "overtaken_by",
@@ -813,11 +747,11 @@ def test_an_unreadable_tag_list_files_nothing_and_is_retried(project, store, dae
     assert events(store, rel, Daemon.RELEASE_BATCH_CLEARED_EVENT) == []
 
 
-# -- §2.2: the window is a setting, not a constant -------------------------------------
+# -- §2.2: the window is a setting, not a constant
 
 
 def window_daemon(catalog_file: Path, *, days: int) -> Daemon:
-    """A daemon whose `proj_a` sets `release.refile_window_days`."""
+    """A daemon whose `proj_a` sets `release.refile_window_days`"""
     data = json.loads(catalog_file.read_text())
     data["projects"][0]["release"] = {"refile_window_days": days}
     catalog_file.write_text(json.dumps(data))
@@ -825,7 +759,7 @@ def window_daemon(catalog_file: Path, *, days: int) -> Daemon:
 
 
 def age(store: ProjectStore, wo_id: str, seconds: float) -> None:
-    """Push a settled order's `updated_at` back — what the sweep's window reads."""
+    """Push a settled order's `updated_at` back — what the sweep's window reads"""
     row = store.get_work_order(wo_id)
     store.conn.execute("UPDATE work_orders SET updated_at=? WHERE id=?",
                        (row["updated_at"] - seconds, wo_id))
@@ -846,15 +780,14 @@ def test_the_refile_window_is_per_project(project):
 
 @pytest.mark.parametrize("days", [0, -1])
 def test_a_window_below_a_day_is_refused_rather_than_clamped(days):
-    """Zero days means the sweep can never see anything, and it arrives by a typo in a
-    `jarvis config set` that the parser is the last place able to name."""
+    """Zero days means the sweep can never see anything"""
     with pytest.raises(CatalogError, match=r"release\.refile_window_days"):
         parse_catalog({"os": {"release": {"refile_window_days": days}},
                        "projects": []})
 
 
 def test_the_sweep_honours_the_projects_window(project, store, catalog_file):
-    """§2.2: how long a dropped fix stays worth re-filing is the project's claim."""
+    """§2.2: how long a dropped fix stays worth re-filing is the project's claim"""
     outside = land(project, "fix-old.txt")
     inside = land(project, "fix-new.txt")
     old = release_order(store, project, shas={OTHER: outside}, status="completed")
@@ -871,15 +804,11 @@ def test_the_sweep_honours_the_projects_window(project, store, catalog_file):
             for e in events(store, new, Daemon.RELEASE_REFILED_EVENT)] == [ISSUE]
 
 
-# -- no release is filed for a fix a live tag already carries — issue #934 ------------
-#
-# `ensure_release` batched only against OPEN release orders, so once the previous release
-# settled the next landed fix always earned a new one — five times a worker turn, a gate
-# and a tag whose only commit was its own version bump (issue 837 was eight tags behind).
+# -- no release is filed for a fix a live tag already carries — issue #934
 
 
 def landed_fix(store: ProjectStore, url: str, merge_commit: str) -> dict:
-    """The FIXING order as `sync_issues` hands it to `ensure_release`."""
+    """The FIXING order as `sync_issues` hands it to `ensure_release`"""
     fix = store.create_work_order("fix the bug", status="completed", issue_url=url)
     store.update_work_order(fix["id"], pr_url=PR)
     payload = {"pr_url": PR, "head_oid": "branchtip"}
@@ -890,12 +819,12 @@ def landed_fix(store: ProjectStore, url: str, merge_commit: str) -> dict:
 
 
 def filing(daemon: Daemon, store: ProjectStore, fix: dict) -> str:
-    """The filing step alone, without the rest of the issue sweep around it."""
+    """The filing step alone, without the rest of the issue sweep around it"""
     return daemon.ensure_release(daemon.catalog.project("proj_a"), store, fix)
 
 
 def batches(store: ProjectStore) -> list[dict]:
-    """Every order carrying a release batch — what `ensure_release` files or joins."""
+    """Every order carrying a release batch — what `ensure_release` files or joins"""
     return [w for w in store.list_work_orders(include_hidden=True)
             if isinstance(db.from_json(w.get("metadata"), {}).get(
                 Daemon.RELEASE_BATCH_KEY), list)]
@@ -921,10 +850,7 @@ def test_a_fix_a_live_tag_already_carries_files_no_release_at_all(
 
 def test_the_production_layout_still_knows_which_project_is_the_os(
         project, store, deploy, tmp_path, fake_gh):
-    """ISSUE 956, six duplicate release orders. The guard asked `os_owner`, which resolves
-    by PATH CONTAINMENT: with the install in the deployed checkout no catalog path contains
-    it, so the answer was whatever is first in catalog order and the guard never passed.
-    """
+    """ISSUE 956, six duplicate release orders"""
     import json
 
     other = make_git_project(tmp_path / "others", "shared_schedule")
@@ -950,8 +876,7 @@ def test_the_production_layout_still_knows_which_project_is_the_os(
 
 def test_a_fix_a_live_tag_already_carries_does_not_join_an_open_batch_either(
         project, store, daemon, deploy):
-    """The guard runs BEFORE the batch loop: joining would put a shipped fix in the next
-    release's notes and keep that order open on work already live."""
+    """The guard runs BEFORE the batch loop: joining would put a shipped fix in the next release's notes..."""
     landed = land(project, "fix-one.txt")
     tag(project, TAG)
     deploy(project, TAG)
@@ -998,8 +923,7 @@ def nothing_carries_it_yet(project, store, daemon, deploy, landed):
 ], ids=lambda f: f.__name__)
 def test_everything_short_of_already_live_still_files_a_release(
         project, store, daemon, deploy, fake_gh, setup):
-    """An unreadable repository or production checkout must NEVER strand a release —
-    `an unreadable CI does not hold` points the same way."""
+    """An unreadable repository or production checkout must NEVER strand a release"""
     fake_gh.fail("gh: could not connect")
     landed = land(project, "fix-one.txt")
     fix = setup(project, store, daemon, deploy, landed)
@@ -1012,8 +936,7 @@ def test_everything_short_of_already_live_still_files_a_release(
 
 def test_a_project_that_does_not_own_the_os_files_exactly_as_before(
         project, store, daemon, deploy, monkeypatch):
-    """`overtaken_by` reads `jarvis-*` tags and the OS's own production checkout, so a
-    second project keeps today's behaviour — `settle_shipped_releases`' guard."""
+    """`overtaken_by` reads `jarvis-*` tags and the OS's own production checkout"""
     landed = land(project, "fix-one.txt")
     tag(project, TAG)
     deploy(project, TAG)
@@ -1026,5 +949,5 @@ def test_a_project_that_does_not_own_the_os_files_exactly_as_before(
     assert events(store, fix["id"], Daemon.ALREADY_SHIPPED_EVENT) == []
 
 
-# Written for the opt-in OS (os.autonomy.self_dispatch on, stuck sweep on).
+# Written for the opt-in OS (os.autonomy.self_dispatch on, stuck sweep on)
 pytestmark = pytest.mark.usefixtures("self_dispatch_on")
