@@ -1825,7 +1825,11 @@ class ProjectStore:
         row = cur.fetchone()
         if row is not None and cur.rowcount == 1:
             # The claim stays ONE statement; the span is written beside it in the same transaction (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md)
-            self._record_span(row["id"], "wo", "pending", "dispatching", trigger="claim")
+            at = db.now()
+            self._record_span(row["id"], "wo", "pending", "dispatching", trigger="claim",
+                              ts=at)
+            # ...and its timeline line, at the same moment as `set_status` writes both
+            self.add_event(row["id"], "status", {"status": "dispatching"}, ts=at)
         return dict(row) if row else None
 
     def claim_refusal(self, wo: dict[str, Any]) -> _ClaimRule | None:
@@ -2745,8 +2749,10 @@ class ProjectStore:
         return {str(r["kind"]): int(r["n"]) for r in rows}
 
     def list_events(self, wo_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        """The NEWEST `limit` events, oldest first (io-df4fa1e3: the oldest 200 hid a long order's last week)"""
         rows = self.conn.execute(
-            "SELECT * FROM wo_events WHERE wo_id=? ORDER BY ts LIMIT ?", (wo_id, limit)
+            "SELECT * FROM (SELECT * FROM wo_events WHERE wo_id=? "
+            "ORDER BY ts DESC, id DESC LIMIT ?) ORDER BY ts, id", (wo_id, limit)
         ).fetchall()
         return db.rows_to_dicts(rows)
 

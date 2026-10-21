@@ -689,6 +689,11 @@ scheduled_actor: Daemon.settle_turns - the settler sweeps this status and a turn
 title: write the design doc
 brief: a long brief about the console
 
+# Where it has been
+now: running (the recorded spans stop short of it)
+- pending for 0 minute(s)
+(it has never been through validation)
+
 # The session, turn by turn
 - turn 1: 120s wall (30s generating, 0s blocked, 0s tools, 90s idle, 0s unaccounted), 1 API call costing 1 tokens / $0.00, context peak 0
     started by [dispatch] You are the worker agent for wo-1
