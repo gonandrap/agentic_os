@@ -1,19 +1,4 @@
-"""Screenshot the bill's fourth actor class — what LOOKING at an order cost (§10 of
-docs/superpowers/specs/2026-09-24-order-observability.md).
-
-Two shots, because the class has two renderings and a reviewer has to see both:
-
-  1. `bill-observability-class.png` — the by-actor view of an order somebody looked at:
-     the observability line at `0.00` beside a worker line that is not zero. The zero is
-     the claim, so it has to be visible NEXT TO real money or it reads as a bug.
-  2. `bill-observability-absent.png` — the "What is not on this bill" panel of an order
-     nobody looked at: the sentence says "not recorded" and never `0.00`, because absent
-     is not zero (Neo's ruling on question 766).
-
-Everything lives in a temp `JARVIS_HOME`, so it never touches the live OS:
-
-    uv run python scripts/screenshot_observability_class.py
-"""
+"""Screenshot the bill's fourth actor class (docs/superpowers/specs/2026-09-24-order-observability.md)"""
 
 from __future__ import annotations
 
@@ -66,8 +51,7 @@ def seed() -> tuple[str, str, str]:
     unseen = ops.create_work_order("jarvis_os", "an order nobody has looked at")
     store = ProjectStore(project)
     try:
-        # A real worker line on both orders: the point of shot 1 is the zero BESIDE
-        # money, and an empty bill would show neither the class nor the contrast.
+        # A real worker line on both orders: the point of shot 1 is the zero BESIDE money
         for wo_id, turns in ((looked["id"], ((4.11, (612_000, 41_000, 6_300)),
                                              (1.86, (240_000, 12_500, 2_100)))),
                              (unseen["id"], ((2.40, (310_000, 18_000, 3_400)),))):
@@ -80,7 +64,7 @@ def seed() -> tuple[str, str, str]:
     finally:
         store.close()
 
-    # The envelope the meter writes for a mechanical path: a wall clock, and zeros.
+    # The envelope the meter writes for a mechanical path: a wall clock, and zeros
     for kind in ("observe_live", "observe_why", "observe_inspect", "observe_live"):
         agent_usage.record(kind, project="jarvis_os", wo_id=looked["id"],
                            usage={"wall_ms": 340, "total_cost_usd": 0.0, "input": 0,
@@ -96,8 +80,7 @@ def serve() -> None:
     uvicorn.run(create_app(), host="127.0.0.1", port=PORT, log_level="warning")
 
 
-#: Clip to the heading plus the panel under it. A full-page shot of a bill puts the point
-#: of either image off screen, and a reviewer should not have to hunt for it.
+#: Clip to the heading plus the panel under it
 SECTION_CLIP = """
 (heading) => {
   const h = [...document.querySelectorAll('h2')]
@@ -129,8 +112,7 @@ def shoot(project: str, looked: str, unseen: str) -> None:
             clip = page.evaluate(SECTION_CLIP, heading)
             if clip is None:
                 raise SystemExit(f"no '{heading}' section on the bill for {wo_id}")
-            # `full_page` with a clip: the section can sit below the viewport, and a clip
-            # against the viewport-sized image is refused as outside it.
+            # `full_page` with a clip: the section can sit below the viewport
             page.screenshot(path=SHOTS / name, clip=clip, full_page=True)
         browser.close()
 
@@ -138,9 +120,7 @@ def shoot(project: str, looked: str, unseen: str) -> None:
 def main() -> int:
     home = tempfile.mkdtemp()
     os.environ["JARVIS_HOME"] = home
-    # `agent_usage.record` writes to $JARVIS_SPEND_HOME when it is set, and it IS set in
-    # any process a work order spawned — without this the seeded rows land in the live
-    # accounting DB instead of the temp one.
+    # `agent_usage.record` writes to $JARVIS_SPEND_HOME when it is set
     os.environ["JARVIS_SPEND_HOME"] = home
     os.environ.pop("JARVIS_WO_ID", None)
     sys.path.insert(0, str(REPO / "src"))

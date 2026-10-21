@@ -1,24 +1,4 @@
-"""The remedy: a closed vocabulary, a mandatory gate, and the daemon that applies it.
-
-§5 of docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md.
-
-WHAT THESE TESTS ARE BUILT TO AVOID, and it is the same trap three times over.
-
-* A NEGATIVE ASSERTION IS GREEN ON A PATH THAT NEVER RAN. "no approval was filed" passes
-  when the supervisor never ran at all, "no message was queued" passes when the remedy
-  never ran, and `{"decision": "propose"}` already yields `failed` on the tree this
-  section starts from, because `_validate` refused anything outside `{ack, escalate}`.
-  So every refusal here is asserted IN THE SAME TEST as the positive it is the opposite
-  of, and every "nothing happened" is paired with a patched acting function whose call
-  count is asserted to be zero and then, in the same fixture, to be one.
-* `needs_attention == 0` GRADES NOTHING: `ProjectStore.clear_attention` reaches it too,
-  and that is the exact regression the nudge path forbids. What discriminates is a
-  re-derivable blocker surviving in `acknowledged_blockers`, which only
-  `ops.ack_attention` writes.
-* A test that reaches the daemon without arming remedies exercises the disabled path and
-  still gets a perfectly good result. `_arm` is called explicitly in every test that
-  wants it, never from a fixture.
-"""
+"""The remedy: a closed vocabulary, a mandatory gate, and the daemon that applies it (docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md)"""
 
 from __future__ import annotations
 
@@ -34,15 +14,13 @@ import pytest
 from jarvis import catalog, db, gates, ops, remedies, supervisor
 from jarvis.project_store import ProjectStore
 
-# The alarm-raising and drain helpers are §2's, reused verbatim so this section is
-# tested against the rows the real raiser produces rather than hand-written ones.
+# The alarm-raising and drain helpers are §2's
 from test_supervisor import _alarm, _burning, _drain, _supervisor_calls
 
 
 @pytest.fixture()
 def started(jarvis_home, fake_claude, catalog_file, project):
-    """`test_supervisor.started`, redeclared: a fixture is module-scoped in pytest and
-    only the helper FUNCTIONS above cross the file boundary."""
+    """`test_supervisor.started`, redeclared: a fixture is module-scoped in pytest and only the helper..."""
     from jarvis.catalog import load_catalog
     from jarvis.daemon import Daemon
 
@@ -51,7 +29,7 @@ def started(jarvis_home, fake_claude, catalog_file, project):
 
 
 def _arm(catalog_file: Path, *allowed: str, enabled: bool = True) -> None:
-    """Turn the supervisor on AND arm remedies. Explicit in every test that wants it."""
+    """Turn the supervisor on AND arm remedies"""
     data = json.loads(catalog_file.read_text())
     data["os"]["supervisor"] = {"enabled": True,
                                 "remedies": {"enabled": enabled,
@@ -82,12 +60,7 @@ def _neo_questions() -> list[dict]:
 
 
 def _proposed(started, catalog_file, monkeypatch, tmp_path, token, *allowed):
-    """One work order carrying a live alarm the supervisor has just proposed a remedy on.
-
-    Driven through the REAL path — the fake `claude` answers a real supervisor review —
-    because the contract under test is what the daemon does with the verdict, and a
-    hand-written `wo_alarms` row would prove nothing about `_validate` or `_apply`.
-    """
+    """One work order carrying a live alarm the supervisor has just proposed a remedy on"""
     _arm(catalog_file, *allowed)
     daemon = started()
     wo_id = _burning(daemon, monkeypatch, tmp_path, description=token)
@@ -95,15 +68,11 @@ def _proposed(started, catalog_file, monkeypatch, tmp_path, token, *allowed):
     return daemon, wo_id
 
 
-# -- 1. the registry is closed ---------------------------------------------------------
+# -- 1. the registry is closed
 
 
 def test_the_first_three_shipped_remedies_are_pinned_by_name_and_order():
-    """Adding a remedy must be a test-breaking, reviewed act rather than a prompt edit.
-
-    Both directions in one test: an id that is not there raises, an id that is returns
-    the row, and the whole vocabulary equals the shipped tuple.
-    """
+    """Adding a remedy must be a test-breaking, reviewed act rather than a prompt edit"""
     with pytest.raises(KeyError):
         remedies.get("restart-the-daemon")
 
@@ -111,14 +80,9 @@ def test_the_first_three_shipped_remedies_are_pinned_by_name_and_order():
     assert nudge.id == "nudge"
     assert nudge.headline and nudge.blast
     assert tuple(remedies.REMEDIES) == remedies.SHIPPED_REMEDIES
-    # The three this section shipped, in order and first: the self-evolution spec's §4
-    # widened the registry behind them and changed nothing about them, so the three names
-    # and their order are still the property worth pinning here. The nine-entry closure
-    # is graded in `test_the_registry_is_closed_at_nine_...` below.
+    # The three this section shipped
     assert remedies.SHIPPED_REMEDIES[:3] == ("nudge", "unblock", "file_work_order")
-    # Not a restatement of the line above: it is what makes the registry a REGISTRY
-    # rather than one hard-coded action, and it is the property the AST pin below keys
-    # its allow-list off.
+    # Not a restatement of the line above: it is what makes the registry a REGISTRY rather than one...
     assert len({r.apply.__name__ for r in remedies.REMEDIES.values()}) == len(
         remedies.REMEDIES)
     assert remedies.REMEDIES["unblock"].subjects == ("work_order",)
@@ -128,15 +92,7 @@ def test_the_first_three_shipped_remedies_are_pinned_by_name_and_order():
 
 
 def _waiting_on_slugs() -> set[str]:
-    """Every `what` slug `ops.waiting_on` can answer, read off its AST.
-
-    OFF THE SOURCE AND NOT OFF A LIST HERE, `test_the_acting_calls_stay_inside_the_handlers`'
-    reason one function along: a copy of the vocabulary in the test file is green the day
-    the function's answers and the copy diverge, which is exactly the day a `covers` entry
-    starts pointing at a slug nobody answers. The `{"what": wo["status"]}` arm is not a
-    literal and its statuses are added by hand — the only dynamic arm, checked by the
-    assertion below that every literal arm is still found.
-    """
+    """Every `what` slug `ops.waiting_on` can answer, read off its AST"""
     import ast
     from pathlib import Path
 
@@ -155,9 +111,7 @@ def _waiting_on_slugs() -> set[str]:
 
 
 def test_every_covers_slug_is_a_real_blocker_and_no_two_remedies_claim_one():
-    """`covers` is the mapping `ops.FIX_MATCHES` used to be, moved ON to the remedy (Neo
-    q839). A slug nothing answers means a remedy nothing can reach, and a slug with two
-    owners is a registry defect rather than a choice `ops.fix` may make."""
+    """`covers` is the mapping `ops.FIX_MATCHES` used to be, moved ON to the remedy (Neo q839)"""
     real = _waiting_on_slugs()
     claimed: dict[str, str] = {}
     for remedy in remedies.REMEDIES.values():
@@ -167,16 +121,12 @@ def test_every_covers_slug_is_a_real_blocker_and_no_two_remedies_claim_one():
             assert slug not in claimed, f"{slug} claimed by {claimed[slug]} and {remedy.id}"
             claimed[slug] = remedy.id
     assert claimed == {"prompt": "nudge", "pending": "unblock"}
-    # The empty tuple is a decision and not an omission: it writes code, clears no blocker
-    # mechanically, and stays reachable only by being named.
+    # The empty tuple is a decision and not an omission: it writes code
     assert remedies.REMEDIES["file_work_order"].covers == ()
 
 
 def test_resolve_answers_a_code_match_and_none_for_an_unclaimed_slug():
-    """`resolve` is `covering`'s replacement (the user's design addition, superseding Neo
-    q839's table-free lookup with the same one-lookup-function seam fo-69ba1cc4's data
-    rows will back): a `RemedyMatch` naming the primitive, empty `params`, `source=="code"`
-    — and still None for anything unclaimed."""
+    """`resolve` is `covering`'s replacement (the user's design addition"""
     nudge = remedies.resolve("prompt")
     assert nudge == remedies.RemedyMatch(remedy="nudge", params={}, source="code")
     unblock = remedies.resolve("pending")
@@ -186,8 +136,7 @@ def test_resolve_answers_a_code_match_and_none_for_an_unclaimed_slug():
 
 
 def test_resolve_raises_when_two_remedies_claim_the_same_slug(monkeypatch):
-    """Paired with the green registry above: the guard is asserted to BITE, or the test
-    that says the registry is clean is grading nothing."""
+    """Paired with the green registry above: the guard is asserted to BITE"""
     clash = remedies.Remedy(**{**vars(remedies.REMEDIES["file_work_order"]),
                                "covers": ("prompt",)})
     monkeypatch.setitem(remedies.REMEDIES, "file_work_order", clash)
@@ -196,9 +145,7 @@ def test_resolve_raises_when_two_remedies_claim_the_same_slug(monkeypatch):
 
 
 def test_resolve_raises_when_a_row_names_a_primitive_absent_from_remedies(monkeypatch):
-    """The row/primitive split, ahead of fo-69ba1cc4's data rows actually arriving: a slug
-    that resolves to an id `REMEDIES` does not have is a malformed rule and must not come
-    back as a usable `RemedyMatch` — that would fail later, further from the cause."""
+    """The row/primitive split, ahead of fo-69ba1cc4's data rows actually arriving: a slug that resolves..."""
     ghost = remedies.Remedy(**{**vars(remedies.REMEDIES["unblock"]),
                                "id": "no-such-primitive", "covers": ("pending",)})
     monkeypatch.setitem(remedies.REMEDIES, "unblock", ghost)
@@ -207,9 +154,7 @@ def test_resolve_raises_when_a_row_names_a_primitive_absent_from_remedies(monkey
 
 
 def test_the_catalog_refuses_a_remedy_the_os_does_not_have(tmp_path):
-    """An unknown id is a `CatalogError` naming the known ones, `GateConfig.parse`'s rule
-    — a typo must not silently leave a permission unset. Paired with the id that IS
-    known, since "parse_catalog raised" is also what a broken block does."""
+    """An unknown id is a `CatalogError` naming the known ones, `GateConfig.parse`'s rule"""
     with pytest.raises(catalog.CatalogError, match="nudge, unblock"):
         catalog.parse_catalog({"os": {"supervisor": {"remedies": {
             "allowed": ["reboot"]}}}, "projects": []})
@@ -218,14 +163,12 @@ def test_the_catalog_refuses_a_remedy_the_os_does_not_have(tmp_path):
         "enabled": True, "allowed": ["nudge"]}}},
         "projects": [{"name": "p", "path": str(tmp_path)}]})
     assert cat.os.supervisor.remedies == catalog.RemedyConfig(True, ("nudge",))
-    # Field-level inheritance, `_parse_inspect`'s shape: the project said nothing and
-    # gets the fleet's answer.
+    # Field-level inheritance, `_parse_inspect`'s shape: the project said nothing and gets the fleet's...
     assert cat.projects[0].supervisor.remedies.allowed == ("nudge",)
 
 
 def test_the_permission_is_a_safety_key_and_reaches_the_config_console(tmp_path):
-    """What the OS may DO is a safety key, like `os.neo.enabled` — and both halves of it
-    have to be addressable, or a project can arm a remedy the console cannot show."""
+    """What the OS may DO is a safety key, like `os.neo.enabled`"""
     from jarvis import config_version
 
     assert "*.supervisor.remedies.*" in catalog.SAFETY_KEYS
@@ -240,10 +183,7 @@ def test_the_permission_is_a_safety_key_and_reaches_the_config_console(tmp_path)
 
 
 def test_the_self_heal_gate_exists_and_nothing_classifies_into_it():
-    """Every other kind exists to catch a command a worker typed; this one is filed
-    programmatically. Both halves: it IS a kind, and `classify` returns it for nothing —
-    including `gate_rules`' own canary corpus, which is the set of strings the OS
-    believes are the most privileged things anyone can run."""
+    """Every other kind exists to catch a command a worker typed; this one is filed programmatically"""
     from jarvis import gate_rules
 
     assert gates.SELF_HEAL == "self_heal"
@@ -260,17 +200,17 @@ def test_the_self_heal_gate_exists_and_nothing_classifies_into_it():
     for command in corpus:
         action = gates.classify(command, everything_on)
         assert action is None or action.kind != "self_heal", command
-    # The positive partner: the corpus is not simply inert — every canary still gates.
+    # The positive partner: the corpus is not simply inert — every canary still gates
     assert all(gates.classify(c, everything_on) is not None
                for _, c in gate_rules.SEED_CANARIES)
 
 
-# -- 2. the grant is mandatory ---------------------------------------------------------
+# -- 2. the grant is mandatory
 
 
 @pytest.fixture()
 def granted(started, catalog_file, monkeypatch, tmp_path):
-    """A proposed `nudge` with its `self_heal` approval sitting `pending`."""
+    """A proposed `nudge` with its `self_heal` approval sitting `pending`"""
     daemon, wo_id = _proposed(started, catalog_file, monkeypatch, tmp_path,
                               "FORCE_SUPERVISOR_PROPOSE", "nudge")
     (approval,) = _approvals(wo_id)
@@ -295,9 +235,7 @@ def _apply_now(wo_id: str, project: str = "proj_a") -> str:
 @pytest.mark.parametrize("status", ["pending", "denied", "dismissed", "expired"])
 def test_no_grant_no_remedy_and_the_handler_is_never_reached(granted, monkeypatch,
                                                              status):
-    """THE CENTRAL SAFETY PROPERTY. `pytest.raises` alone would pass on a `RemedyRefused`
-    thrown AFTER the message went out, so the handler is patched and its call count is
-    what is asserted — the only evidence that nothing reached the session."""
+    """THE CENTRAL SAFETY PROPERTY"""
     _daemon, wo_id, approval_id = granted
     calls: list[tuple] = []
     monkeypatch.setitem(
@@ -309,8 +247,7 @@ def test_no_grant_no_remedy_and_the_handler_is_never_reached(granted, monkeypatc
     try:
         if status == "expired":
             store.decide_approval(approval_id, "approved", "yes", "test")
-            # Genuinely past its window, rather than a `status` column that says so:
-            # `usable_grant` re-checks the clock and never trusts the row.
+            # Genuinely past its window, rather than a `status` column that says so: `usable_grant` re-checks the...
             store.conn.execute("UPDATE approvals SET expires_at=? WHERE id=?",
                                (db.now() - 1, approval_id))
         elif status != "pending":
@@ -325,9 +262,7 @@ def test_no_grant_no_remedy_and_the_handler_is_never_reached(granted, monkeypatc
 
 
 def test_an_approved_grant_delivers_exactly_once_and_is_spent(granted, monkeypatch):
-    """The positive partner of the four refusals above, in the same fixture: one call,
-    and `uses == 1` — which is what proves the grant was SPENT through `gates.open_gate`
-    rather than read around."""
+    """The positive partner of the four refusals above, in the same fixture: one call, and `uses == 1`"""
     _daemon, wo_id, approval_id = granted
     calls: list[tuple] = []
     monkeypatch.setitem(
@@ -360,19 +295,13 @@ def _store_messages(wo_id: str) -> list[dict]:
         store.close()
 
 
-# -- 3. the allow-list bites before the gate -------------------------------------------
+# -- 3. the allow-list bites before the gate
 
 
 @pytest.mark.parametrize("enabled,allowed", [(False, ("nudge",)), (True, ())])
 def test_a_remedy_the_catalog_forbids_files_nothing_and_says_why(
         started, catalog_file, monkeypatch, tmp_path, fake_claude, enabled, allowed):
-    """The user must never be asked to approve something their own catalog forbids. Both
-    switches, separately, because `enabled: true` with an empty allow-list is a shipping
-    state in its own right and would be lost if one flag stood for both.
-
-    The call count is the positive partner: "no approval was filed" is green when the
-    supervisor never ran at all, which is precisely what a mis-parsed catalog produces.
-    """
+    """The user must never be asked to approve something their own catalog forbids"""
     _arm(catalog_file, *allowed, enabled=enabled)
     daemon = started()
     wo_id = _burning(daemon, monkeypatch, tmp_path,
@@ -386,7 +315,7 @@ def test_a_remedy_the_catalog_forbids_files_nothing_and_says_why(
     assert "remedies" in (alarm["verdict_reason"] or "")
     assert _approvals(wo_id) == []
     assert not [q for q in _neo_questions() if q["kind"] == "approval"]
-    # And the OS said so out loud rather than only writing a column.
+    # And the OS said so out loud rather than only writing a column
     from jarvis.central_store import CentralStore
 
     central = CentralStore()
@@ -399,12 +328,7 @@ def test_a_remedy_the_catalog_forbids_files_nothing_and_says_why(
 
 def test_an_armed_remedy_files_one_request_and_leaves_the_work_order_alone(
         started, catalog_file, monkeypatch, tmp_path, fake_claude):
-    """The positive partner of the two refusals above.
-
-    `waiting_input` is the defect this asserts against: `gates.file_request` parks a
-    running work order, and a worker that never asked for a gate is read as waiting on
-    the USER by `jarvis status`, the dashboard and `invariants.true_blockers`.
-    """
+    """The positive partner of the two refusals above"""
     daemon, wo_id = _proposed(started, catalog_file, monkeypatch, tmp_path,
                               "FORCE_SUPERVISOR_PROPOSE", "nudge")
     assert len(_supervisor_calls(fake_claude)) == 1
@@ -424,35 +348,26 @@ def test_an_armed_remedy_files_one_request_and_leaves_the_work_order_alone(
 
     questions = [q for q in _neo_questions() if q["kind"] == "approval"]
     assert len(questions) == 1
-    # The remedy in words, not merely the symptom: the reviewer is ruling on the ACTION.
+    # The remedy in words, not merely the symptom: the reviewer is ruling on the ACTION
     assert remedies.REMEDIES["nudge"].blast in questions[0]["question"]
     assert questions[0]["id"] == approval["neo_question_id"]
 
     store = _store(wo_id)
     try:
         assert store.get_work_order(wo_id)["status"] == "running"
-        # Nothing has reached the session: a proposal is not an act.
+        # Nothing has reached the session: a proposal is not an act
         assert store.queued_messages(wo_id) == []
         assert store.get_work_order(wo_id)["needs_attention"] == 1
     finally:
         store.close()
 
 
-# -- 3b. a finding raised by an INVARIANT travels the same intake -----------------------
+# -- 3b. a finding raised by an INVARIANT travels the same intake
 
 
 def test_an_invariant_finding_carries_an_undeclared_delivery_to_the_nudge(
         started, catalog_file, project, fake_claude):
-    """Spec §2c of
-    docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
-
-    STARTS AT `invariants.check_project`, not at a hand-written alarm row: the promise is
-    that a worker which pushed past a refusal without finishing gets NUDGED, and the only
-    thing that can prove it is the whole path — the detector raises a `source='invariant'`
-    finding, the supervisor's real intake claims and judges it, and the judge's `nudge`
-    reaches `remedies.propose`. A test that filed the finding and called `propose` itself
-    grades `propose`, which §5 already grades.
-    """
+    """Spec §2c of docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md"""
     from jarvis import invariants
     from test_invariants import DELIVERED, PUSHED, _refused_then_pushed
 
@@ -490,35 +405,21 @@ def test_an_invariant_finding_carries_an_undeclared_delivery_to_the_nudge(
     assert questions[0]["id"] == approval["neo_question_id"]
 
 
-# -- 4. the acting calls stay inside the handlers ---------------------------------------
+# -- 4. the acting calls stay inside the handlers
 
 
 def test_the_acting_calls_stay_inside_the_handlers():
-    """THE PIN ON THE ACTING MODULE, and it is deliberately NOT an import walk.
-
-    `tests/test_neo_panel.py::test_neo_never_imports_the_panel` walks `ast.Import` only,
-    which grades nothing here: `remedies.py` legitimately imports `ops`. Reachability is
-    not decidable from an AST; ENCLOSURE is, so the property stated is that every
-    acting name in this module is inside one of the registry's own handlers.
-    """
+    """THE PIN ON THE ACTING MODULE, and it is deliberately NOT an import walk"""
     source = Path(remedies.__file__).read_text()
     tree = ast.parse(source)
     forbidden = {"send_message", "queue_message", "unblock_work_order", "cancel",
                  "cancel_work_order", "set_status", "create_work_order",
-                 # The eight acts §4 of the self-evolution spec added. WIDENED AND NEVER
-                 # LOOSENED: every one of them moves a head, a flag, a gate or a verdict
-                 # on a work order nobody asked the OS to touch, which is the whole
-                 # population this pin exists for.
+                 # The eight acts §4 of the self-evolution spec added
                  "update_branch", "abandon_approval", "flag_attention",
                  "clear_attention", "force_validation", "carry_merge_chain",
                  "record_base_update", "record_base_update_failed"}
     handlers = {r.apply.__name__ for r in remedies.REMEDIES.values()}
-    #: THE ONE EXEMPTION, as a (name, function) PAIR rather than a name, so it cannot
-    #: widen to `flag_attention` anywhere else in the module. `_flag_and_tell` is the
-    #: REFUSAL path — a reviewer denied the remedy, so the symptom goes back in front of
-    #: the user — and it predates §4 by a whole section. It is not an act a rule can name:
-    #: no `Remedy.apply` reaches it, and `raise_attention`, which IS the rule-nameable
-    #: version of the same call, is pinned to its own handler by the loop below.
+    #: THE ONE EXEMPTION, as a (name, function) PAIR rather than a name
     allowed_pairs = {("flag_attention", "_flag_and_tell")}
 
     enclosing: dict[ast.AST, str] = {}
@@ -545,8 +446,7 @@ def test_the_acting_calls_stay_inside_the_handlers():
 
 
 def test_the_pin_would_catch_the_move_it_forbids():
-    """A guard nobody has ever seen fail is a guard nobody knows works. The same shape,
-    over source that acts from outside a handler."""
+    """A guard nobody has ever seen fail is a guard nobody knows works"""
     tree = ast.parse("from . import ops\n"
                      "def helper(wo):\n    ops.queue_message(wo, 'hi')\n")
     fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef))
@@ -556,31 +456,24 @@ def test_the_pin_would_catch_the_move_it_forbids():
 
 
 def test_the_supervisors_own_pin_is_untouched_and_still_passes():
-    """§5 widens what the OS may do and changes NOTHING about what `supervisor.py` may
-    name. Re-run here as well as in its own file so a diff that edits both is caught by
-    the one that is about the boundary."""
+    """§5 widens what the OS may do and changes NOTHING about what `supervisor.py` may name"""
     tree = ast.parse(Path(supervisor.__file__).read_text())
     forbidden = {"cancel", "cancel_work_order", "set_status", "send_message",
                  "queue_message"}
     named = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
     named |= {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
     assert not (named & forbidden), sorted(named & forbidden)
-    # And the persona's first line, which `testing.py`'s fake and
-    # `test_supervisor._supervisor_calls` both match on: rewriting it makes every
-    # `_supervisor_calls(...) == []` assertion in the repository vacuously true.
+    # And the persona's first line, which `testing.py`'s fake and `test_supervisor._supervisor_calls`...
     assert supervisor.SUPERVISOR_PERSONA.splitlines()[0] == (
         "You are the SUPERVISOR inside the Jarvis agentic OS.")
 
 
-# -- the verdict shapes ----------------------------------------------------------------
+# -- the verdict shapes
 
 
 def test_a_propose_naming_no_remedy_fails_while_a_valid_one_proposes(
         started, catalog_file, monkeypatch, tmp_path, fake_claude):
-    """BOTH HALVES IN ONE TEST, because the failing half is green on an empty diff:
-    `_validate` refused every decision outside `{ack, escalate}` before this section, so
-    `{"decision": "propose", "remedy": "reboot"}` already left `failed` with no approval
-    and the flag up. Only the valid half grades the change."""
+    """BOTH HALVES IN ONE TEST, because the failing half is green on an empty diff: `_validate` refused..."""
     _arm(catalog_file, "nudge")
     daemon = started()
     bad = _burning(daemon, monkeypatch, tmp_path, title="the bad one",
@@ -612,13 +505,7 @@ def test_a_propose_naming_no_remedy_fails_while_a_valid_one_proposes(
 
 def test_the_second_remedy_really_cuts_a_dead_edge_and_only_a_dead_one(
         started, catalog_file, monkeypatch, tmp_path):
-    """`unblock` is what makes the registry a registry rather than one action wearing a
-    dict, so it is exercised for real rather than asserted about.
-
-    Both directions in one test: an edge to a CANCELLED dependency is cut, and an edge to
-    a live one in the same work order is not — which is the `drop_all` this path may
-    never reach.
-    """
+    """`unblock` is what makes the registry a registry rather than one action wearing a dict"""
     from jarvis.central_store import CentralStore
 
     _arm(catalog_file, "unblock")
@@ -652,13 +539,7 @@ def test_the_second_remedy_really_cuts_a_dead_edge_and_only_a_dead_one(
 
 
 def test_a_feature_subject_is_nudged_through_its_carrier(started, catalog_file):
-    """A feature order has no session, so §1's `carrier_for_feature` is what the nudge
-    speaks through — the REAL one, since §1 landed before this did.
-
-    Both rungs: a feature with a carrier gets the message on the CARRIER, and a feature
-    with none refuses rather than raising, which is the difference between "there was
-    nothing to speak to" and a bug.
-    """
+    """A feature order has no session, so §1's `carrier_for_feature` is what the nudge speaks through"""
     from jarvis.central_store import CentralStore
 
     _arm(catalog_file, "nudge")
@@ -697,8 +578,7 @@ def test_a_feature_subject_is_nudged_through_its_carrier(started, catalog_file):
 
 
 def test_a_remedy_that_does_not_apply_to_this_subject_is_refused():
-    """`unblock` is a work-order remedy. The subject check is a pure predicate, so it is
-    asserted as one — with the pair that makes it discriminating."""
+    """`unblock` is a work-order remedy"""
     assert remedies.subject_kind({"wo_id": "wo-1"}) == "work_order"
     assert remedies.subject_kind(
         {"wo_id": "wo-1", "subject_kind": "feature_order"}) == "feature_order"
@@ -707,31 +587,23 @@ def test_a_remedy_that_does_not_apply_to_this_subject_is_refused():
 
 
 def test_the_gate_reviewer_is_told_not_to_dismiss_a_self_heal_request():
-    """A `self_heal` request rides `kind='approval'`, so Neo reads it under
-    `gates.REVIEWER_PERSONA` — whose FIRST and highest-priority instruction is to dismiss
-    anything that runs no privileged command, which is every proposal this feature will
-    ever file. Left alone the feature is inert AND the dismissal path would derive an
-    `exempt_pattern` from an intent string. Neo ruled on q224: carve it out at the top.
-    """
+    """A `self_heal` request rides `kind='approval'`, so Neo reads it under `gates.REVIEWER_PERSONA`"""
     persona = " ".join(gates.REVIEWER_PERSONA.split())
     anchor = persona.index("SELF-HEAL REQUEST")
     assert anchor < persona.index("PREMISE CHECK"), \
         "the carve-out must be read before the check it switches off"
     assert "NEVER DISMISS ONE" in persona
     assert "never propose an `exempt_pattern` for one" in persona
-    # It is scoped: the other kinds keep every rule, including the one this suite's
-    # ordering test pins.
+    # It is scoped: the other kinds keep every rule, including the one this suite's ordering test pins
     assert "Everything below is about the other kinds." in persona
-    # And it is reachable — the anchor is the literal the request actually opens with.
+    # And it is reachable — the anchor is the literal the request actually opens with
     question = remedies._request_question(
         "proj_a", "wo-1", remedies.REMEDIES["nudge"], "where are you?", "", "stalled")
     assert question.startswith("SELF-HEAL REQUEST")
 
 
 def test_the_gate_reviewers_ordering_pin_still_holds_with_the_carve_out():
-    """The carve-out is prose inserted above a persona whose clause ORDER is load-bearing
-    and pinned in `tests/test_gates.py`. Re-run that pin here so a later edit to my
-    section fails in my file too, rather than only in a sibling's."""
+    """The carve-out is prose inserted above a persona whose clause ORDER is load-bearing and pinned in..."""
     persona = gates.REVIEWER_PERSONA
     assert (persona.index("PREMISE CHECK")
             < persona.index("DISMISS when the command performs no privileged action")
@@ -740,22 +612,18 @@ def test_the_gate_reviewers_ordering_pin_still_holds_with_the_carve_out():
             < persona.index("ESCALATE to the user"))
 
 
-# -- 5. the gate verdict, and the end-to-end pair ---------------------------------------
+# -- 5. the gate verdict, and the end-to-end pair
 
 
 def test_a_self_heal_verdict_queues_no_worker_message_but_a_pr_merge_still_does(
         granted, monkeypatch, tmp_path):
-    """`gates.apply_decision` messages the worker on EVERY verdict, which is right for a
-    worker that ran a command and wrong for a session that never asked. BOTH SIDES IN
-    ONE TEST: "no message" alone would pass if the guard had disabled messaging outright.
-    """
+    """`gates.apply_decision` messages the worker on EVERY verdict"""
     from jarvis.central_store import CentralStore
 
     _daemon, wo_id, approval_id = granted
     store, central = _store(wo_id), CentralStore()
     try:
-        # Parked by something else entirely. A `self_heal` verdict set no wait, so it
-        # must not end one — `end_wait_if_nothing_is_out` is skipped for this kind.
+        # Parked by something else entirely
         store.set_status(wo_id, "waiting_input")
         gates.apply_decision(store, approval_id, verdict="denied",
                              reason="not warranted", decided_by="user",
@@ -770,7 +638,7 @@ def test_a_self_heal_verdict_queues_no_worker_message_but_a_pr_merge_still_does(
         assert len(queued) == 1
         assert queued[0]["source"] == "gate"
         assert "gh pr merge 1 --squash" in queued[0]["content"]
-        # ...and the shared tail still runs for a real gate: the wait it set is ended.
+        # ...and the shared tail still runs for a real gate: the wait it set is ended
         assert store.get_work_order(wo_id)["status"] == "running"
     finally:
         central.close()
@@ -778,7 +646,7 @@ def test_a_self_heal_verdict_queues_no_worker_message_but_a_pr_merge_still_does(
 
 
 def test_a_denied_proposal_leaves_the_alarm_with_the_user_and_the_flag_up(granted):
-    """The user refused the remedy and the symptom it was for has not gone anywhere."""
+    """The user refused the remedy and the symptom it was for has not gone anywhere"""
     from jarvis.central_store import CentralStore
 
     _daemon, wo_id, approval_id = granted
@@ -803,10 +671,7 @@ def test_a_denied_proposal_leaves_the_alarm_with_the_user_and_the_flag_up(grante
 
 
 def test_jarvis_gate_deny_does_not_take_the_alarms_flag_back_down(granted):
-    """`ops.decide_gate` clears attention after every verdict — the flag an ESCALATED
-    gate raised, which the user has just answered. For a `self_heal` denial the flag
-    standing afterwards is the ALARM's and is not stale, and nothing re-derives a live
-    alarm in `true_blockers`, so clearing it here would put it down for good."""
+    """`ops.decide_gate` clears attention after every verdict"""
     _daemon, wo_id, approval_id = granted
     ops.decide_gate(approval_id, "denied", "no", project_name="proj_a")
 
@@ -820,19 +685,7 @@ def test_jarvis_gate_deny_does_not_take_the_alarms_flag_back_down(granted):
 
 def test_the_end_to_end_pair_from_proposal_to_a_delivered_nudge(
         started, catalog_file, monkeypatch, tmp_path):
-    """PROPOSE, THEN APPLY, AND THE USER'S OWN BLOCKER LEFT STANDING.
-
-    §5 asked for an earlier ack to be "still on the row", which `ops.ack_attention`
-    could never deliver (kn-b133acce). Issue 573 settled it a level up: applying a
-    remedy settles the ALARM and must acknowledge NOTHING on the user's behalf, so the
-    ack path is `ops.ack_os_flag`.
-
-    Give the order a blocker `true_blockers` genuinely re-derives (`status='failed'`
-    makes "worker failed — review and retry" live), let the remedy run, and require it
-    to be STILL FLAGGED with the column still NULL. `ack_attention` would lower the flag
-    and record a dismissal the user never made; `clear_attention` would NULL the column
-    and discard the dismissals they did.
-    """
+    """PROPOSE, THEN APPLY, AND THE USER'S OWN BLOCKER LEFT STANDING"""
     daemon, wo_id = _proposed(started, catalog_file, monkeypatch, tmp_path,
                               "FORCE_SUPERVISOR_PROPOSE", "nudge")
     store = _store(wo_id)
@@ -869,8 +722,7 @@ def test_the_end_to_end_pair_from_proposal_to_a_delivered_nudge(
         assert payload["remedy"] == "nudge"
         assert wo_id in payload["result"]
         assert store.get_approval(approval_id)["uses"] == 1
-        # The grant was spent through the gate's own machinery, so the audit trail says
-        # so in the gate's own vocabulary rather than only in the remedy's.
+        # The grant was spent through the gate's own machinery
         (opened,) = store.events_of_kind(wo_id, "gate_opened")
         assert json.loads(opened["payload"])["clearance"] == "approved"
     finally:
@@ -878,7 +730,7 @@ def test_the_end_to_end_pair_from_proposal_to_a_delivered_nudge(
 
 
 def _remedy_tick(daemon, timeout: float = 20.0) -> None:
-    """One remedy tick, waited out on the daemon's own guard rather than on a sleep."""
+    """One remedy tick, waited out on the daemon's own guard rather than on a sleep"""
     daemon.remedy_tick()
     deadline = time.monotonic() + timeout
     while daemon.remedy_applying and time.monotonic() < deadline:
@@ -887,22 +739,19 @@ def _remedy_tick(daemon, timeout: float = 20.0) -> None:
 
 
 def test_the_tick_applies_nothing_while_the_gate_is_still_pending(granted):
-    """The negative partner of the end-to-end pair, and it needs one: a tick that
-    applied nothing because it was never wired up would look identical."""
+    """The negative partner of the end-to-end pair"""
     daemon, wo_id, _approval_id = granted
     _remedy_tick(daemon)
     assert _store_messages(wo_id) == []
     assert _alarm(wo_id)["status"] == "proposed"
 
 
-# -- 6. the stale-proposal invariant ----------------------------------------------------
+# -- 6. the stale-proposal invariant
 
 
 def test_the_invariant_closes_an_abandoned_proposal_and_leaves_a_live_one_alone(
         started, catalog_file, monkeypatch, tmp_path):
-    """ONE TEST, TWO ALARMS. The untouched partner is compared row-to-row with `==`
-    before and after: "the other one is still proposed" would pass on a check that
-    rewrote every column it touched."""
+    """ONE TEST, TWO ALARMS"""
     from jarvis.invariants import check_project
 
     _arm(catalog_file, "nudge")
@@ -935,17 +784,7 @@ def test_the_invariant_closes_an_abandoned_proposal_and_leaves_a_live_one_alone(
         store.close()
 
 
-# -- 6. §4 of the self-evolution spec: the parameter schema and the precondition --------
-#
-# docs/superpowers/specs/2026-09-27-self-evolution.md §4. The six new primitives each WRAP an
-# existing call rather than reimplementing one, so what is graded here is the seam the
-# rest of the feature stands on — `params` (Neo 904), `can_apply`, and the closed tables
-# that keep both honest. THE FIVE ACTING HANDLERS ARE TESTED BELOW TOO
-# (`_apply_carry_verdict`, `_apply_update_branch`, `_apply_drop_hold`,
-# `_apply_lower_attention`, `_apply_force_rejudge`): each is a fresh copy of the daemon's
-# own orchestration (review round 1, assumption [4]) and not a thin pass-through to code
-# already covered by `tests/test_rejudge_moved_head.py` or the catch-up suite, so a test
-# that stopped at the seam would leave every one of them unexercised.
+# -- 6. §4 of the self-evolution spec: the parameter schema and the precondition
 
 PR_URL = "https://github.com/acme/proj/pull/7"
 JUDGED_SHA = "aaaa1111aaaa2222aaaa3333aaaa4444aaaa5555"
@@ -953,12 +792,7 @@ MOVED_SHA = "bbbb1111bbbb2222bbbb3333bbbb4444bbbb5555"
 
 
 def _wo(project: Path, **cols) -> tuple[ProjectStore, dict]:
-    """A work order written STRAIGHT into the project store, with no daemon and no CLI.
-
-    Every `can_apply` predicate is read-only and local by contract, so the cheapest
-    subject that satisfies the contract is the right fixture for it: a row. The one test
-    that needs the fleet (a registered project, a catalog on disk) boots one and says why.
-    """
+    """A work order written STRAIGHT into the project store, with no daemon and no CLI"""
     store = ProjectStore(project)
     wo = store.create_work_order("add feature X")
     if cols:
@@ -967,15 +801,14 @@ def _wo(project: Path, **cols) -> tuple[ProjectStore, dict]:
 
 
 def _judged(store: ProjectStore, wo_id: str, sha: str = JUDGED_SHA) -> None:
-    """One settled, passed round on `sha` — what `ProjectStore.validated_head` reads."""
+    """One settled, passed round on `sha` — what `ProjectStore.validated_head` reads"""
     row = store.open_validation_round(wo_id=wo_id, fingerprint="fp1", round=1)
     store.set_validation_head(row["id"], sha)
     store.close_validation_round(row["id"], "passed", "")
 
 
 def _head_moved(store: ProjectStore, wo_id: str, head: str = MOVED_SHA) -> None:
-    """The newest head the OS RECORDED ITSELF. `can_apply` may not ask GitHub, so a
-    locally recorded head is the only one it can compare a verdict against."""
+    """The newest head the OS RECORDED ITSELF"""
     from jarvis import invariants
 
     store.add_event(wo_id, invariants.PR_BASE_UPDATED_EVENT,
@@ -985,10 +818,7 @@ def _head_moved(store: ProjectStore, wo_id: str, head: str = MOVED_SHA) -> None:
 
 
 def test_the_registry_is_closed_at_nine_and_every_new_one_takes_a_work_order():
-    """§4 widens the vocabulary in ONE reviewed diff, and the closure is what makes that
-    true (kn-6c252734). NINE, not ten: `retry_neo_question` is in the spec's table and is
-    DROPPED on Neo 908 and filed on the backlog, so a registry of ten would mean somebody
-    built it without the review that decision asked for."""
+    """§4 widens the vocabulary in ONE reviewed diff, and the closure is what makes that true (kn-6c252734)"""
     assert tuple(remedies.REMEDIES) == remedies.SHIPPED_REMEDIES
     assert len(remedies.SHIPPED_REMEDIES) == 9
     assert "retry_neo_question" not in remedies.REMEDIES
@@ -998,14 +828,12 @@ def test_the_registry_is_closed_at_nine_and_every_new_one_takes_a_work_order():
         remedy = remedies.get(remedy_id)
         assert remedy.headline and remedy.blast
         assert remedy.subjects == ("work_order",)
-    # Still one handler each: the registry is a REGISTRY rather than nine names for one
-    # action, and that is the property the AST pin keys its allow-list off.
+    # Still one handler each: the registry is a REGISTRY rather than nine names for one action
     assert len({r.apply.__name__ for r in remedies.REMEDIES.values()}) == 9
 
 
 def test_the_three_shipped_remedies_keep_the_permissive_default():
-    """The seam must not change what already ships. The first three take no parameters
-    and refuse nothing in advance — their refusals stay in `apply`, where they were."""
+    """The seam must not change what already ships"""
     for remedy_id in ("nudge", "unblock", "file_work_order"):
         remedy = remedies.get(remedy_id)
         assert remedy.params == ()
@@ -1014,9 +842,7 @@ def test_the_three_shipped_remedies_keep_the_permissive_default():
 
 
 def test_every_param_type_is_a_key_of_the_closed_table_and_names_are_unique():
-    """`Param.type` is a STRING rather than a Python type because the sibling section
-    validates rows read back out of a database column, and a closed table is what makes
-    that safe. A duplicate name would make `check_params` grade one of the two."""
+    """`Param.type` is a STRING rather than a Python type because the sibling section validates rows read..."""
     assert set(remedies.PARAM_TYPES) == {"str", "int", "bool"}
     for remedy in remedies.REMEDIES.values():
         names = [p.name for p in remedy.params]
@@ -1027,9 +853,7 @@ def test_every_param_type_is_a_key_of_the_closed_table_and_names_are_unique():
 
 
 def test_check_params_names_every_problem_at_once():
-    """The house rule `plans.parse_plan` and `findings.parse_report` follow: a parser
-    that reports the first problem makes its caller fix one thing per round trip, and the
-    caller here is a model writing a rule."""
+    """The house rule `plans.parse_plan` and `findings.parse_report` follow: a parser that reports the..."""
     remedy = remedies.get("drop_hold")
     problem = remedy.check_params({"cause": 7, "colour": "blue"})
 
@@ -1039,21 +863,16 @@ def test_check_params_names_every_problem_at_once():
     assert "colour" in problem                       # unknown
     assert "cause" in problem and "int" in problem   # wrong type
     assert remedy.check_params({"cause": "gate", "reason": "the gate went away"}) == ""
-    # A bool is not a str, whatever duck typing would say, and an int is not a bool: a
-    # rule that wrote `true` where prose belongs has made a mistake worth naming.
+    # A bool is not a str, whatever duck typing would say
     assert remedies.get("force_rejudge").check_params({"reason": True})
-    # And the fourth kind, from spec commit 2920441: a value outside `Param.choices`. It
-    # is named in the SAME sentence as the rest, for the same round-trip reason.
+    # And the fourth kind, from spec commit 2920441: a value outside `Param.choices`
     both = remedies.get("raise_attention").check_params({"template": "nope",
                                                          "colour": "blue"})
     assert "nope" in both and "colour" in both and both.count(".") <= 1
 
 
 def test_update_branch_can_apply_reads_the_local_holds_only(project):
-    """Positive and negative together: a parked order with a pull request and nothing in
-    flight may be caught up, and the same order with a message queued may not. The seven
-    guards belong to the daemon; the ones repeated here are the LOCAL ones, because
-    `can_apply` makes no network call and no subprocess."""
+    """Positive and negative together: a parked order with a pull request and nothing in flight may be..."""
     from jarvis import invariants, ops
 
     store, wo = _wo(project, pr_url=PR_URL, status="waiting_pr_merge")
@@ -1078,10 +897,7 @@ def test_update_branch_can_apply_reads_the_local_holds_only(project):
 
 
 def test_carry_verdict_can_apply_wants_a_verdict_and_a_head_that_moved(project):
-    """The carry exists for a head the verdict does not yet cover, so both halves have to
-    be there: a passed round, and a NEWER head the OS recorded. kn-907c9a61 — the proof
-    itself is not re-implemented here and is not re-implemented in the handler either;
-    both call `branchproof` and `ops.carry_merge_chain` in the daemon's own order."""
+    """The carry exists for a head the verdict does not yet cover"""
     store, wo = _wo(project, pr_url=PR_URL, status="waiting_pr_merge")
     remedy = remedies.get("carry_verdict")
     try:
@@ -1097,9 +913,7 @@ def test_carry_verdict_can_apply_wants_a_verdict_and_a_head_that_moved(project):
 
 
 def test_force_rejudge_can_apply_is_the_commands_own_refusal(project, catalog_file):
-    """`ops.force_validation_refusal` VERBATIM, and the sharing is structural rather than
-    a copied predicate (kn-4ea33fe6): the dashboard, `jarvis validation force` and this
-    field have to refuse the same work orders in the same words."""
+    """`ops.force_validation_refusal` VERBATIM"""
     from jarvis import ops
 
     data = json.loads(catalog_file.read_text())
@@ -1122,9 +936,7 @@ def test_force_rejudge_can_apply_is_the_commands_own_refusal(project, catalog_fi
 
 
 def test_lower_attention_can_apply_asks_true_blockers(project):
-    """The predicate that OWNS the column being cleared. `invariants.true_blockers`
-    re-derives the attention reason every tick (INV-ATTENTION-REASON), so a flag it still
-    derives would go straight back up and the remedy would be a lie on the record."""
+    """The predicate that OWNS the column being cleared"""
     from jarvis import invariants
 
     store, wo = _wo(project)
@@ -1145,11 +957,7 @@ def test_lower_attention_can_apply_asks_true_blockers(project):
 
 
 def test_drop_hold_refuses_every_cause_but_the_gate_by_name(project):
-    """NEO 908. A hold has no row — `holds.py` derives episodes from timeline events — so
-    ending one means writing its CLOSING event, and for every cause but the gate that
-    event would assert something false (a `validation_passed` no panel returned). The
-    refusal NAMES the cause asked for, because a rule author reading "refused" learns
-    nothing about which causes v1 does take."""
+    """NEO 908"""
     from jarvis import holds
 
     store, wo = _wo(project)
@@ -1160,7 +968,7 @@ def test_drop_hold_refuses_every_cause_but_the_gate_by_name(project):
             assert cause in refusal, cause
             assert holds.GATE in refusal, cause
 
-        # The gate cause with nothing held is still a refusal, and a different one.
+        # The gate cause with nothing held is still a refusal, and a different one
         assert "gate" in remedy.can_apply(store, wo, {"cause": holds.GATE, "reason": "r"})
 
         store.add_approval(wo["id"], "deploy", "a privileged command a worker proposed",
@@ -1172,12 +980,7 @@ def test_drop_hold_refuses_every_cause_but_the_gate_by_name(project):
 
 def test_raise_attention_takes_a_template_key_and_refuses_an_unknown_one_three_ways(
         project):
-    """§4 of docs/superpowers/specs/2026-09-27-self-evolution.md as corrected by spec commit 2920441:
-    `raise_attention` RENDERS its reason and never relays one. The parameter is a key from
-    a closed tuple, so an unknown key must be refused at every one of the three doors —
-    and the first of them, `check_params`, is the insert-time refusal the correction asks
-    for: the sibling validates a rule's remedy row against `Remedy.params`, so a key
-    outside `choices` never reaches a database row at all."""
+    """§4 of docs/superpowers/specs/2026-09-27-self-evolution.md as corrected by spec commit 2920441:..."""
     from jarvis import invariants
 
     remedy = remedies.get("raise_attention")
@@ -1195,7 +998,7 @@ def test_raise_attention_takes_a_template_key_and_refuses_an_unknown_one_three_w
 
         assert remedy.check_params({"template": "auth"}) == ""
         assert remedy.can_apply(store, wo, {"template": "auth"}) == ""
-        # And the idempotence check still grades the RENDERED sentence.
+        # And the idempotence check still grades the RENDERED sentence
         store.flag_attention(wo["id"], invariants.AUTH_BLOCKER)
         already = store.get_work_order(wo["id"])
         assert "already" in remedy.can_apply(store, already, {"template": "auth"})
@@ -1204,11 +1007,7 @@ def test_raise_attention_takes_a_template_key_and_refuses_an_unknown_one_three_w
 
 
 def test_no_param_value_reaches_the_rendered_attention_sentence():
-    """THE CORRECTION ITSELF. A rule row is data an investigation WROTE, and a remedy that
-    passed it through to the attention list would be a path from a worker's prose to a
-    command the user is told to type. So every key of the table is rendered here with a
-    params dict full of prose, and the sentence is asserted to be the bare `invariants`
-    constant — identity, not equality, so a re-spelled copy fails too."""
+    """THE CORRECTION ITSELF"""
     from jarvis import invariants
 
     prose = {"reason": "rm -rf / and run jarvis release", "note": "<script>"}
@@ -1221,11 +1020,21 @@ def test_no_param_value_reaches_the_rendered_attention_sentence():
         assert slots == (), f"{key} declares a slot; widen this test with it"
 
 
+def test_the_refusal_templates_render_verbatim():
+    """§5 of docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md: TWO whole..."""
+    from jarvis import invariants
+
+    assert remedies.render_attention("refusal_unanswered") is \
+        invariants.REFUSAL_UNANSWERED_BLOCKER
+    assert remedies.render_attention("refusal_unanswered_document") is \
+        invariants.REFUSAL_UNANSWERED_DOC_BLOCKER
+    choices = remedies.get("raise_attention").params[0].choices
+    for key in ("refusal_unanswered", "refusal_unanswered_document"):
+        assert key in remedies.ATTENTION_TEMPLATES and key in choices
+
+
 def test_attention_slots_interpolate_validated_ids_only(monkeypatch):
-    """V1 DECLARES NO SLOTS — every template above is `slots=()` — so this grades the
-    MACHINERY on a synthetic template, which is what the next template with an id in it
-    will land on. A slot value that is not an id is refused with a sentence and never
-    interpolated; the `#<digits>` form is an issue number, the rest are record ids."""
+    """V1 DECLARES NO SLOTS — every template above is `slots=()`"""
     from jarvis import invariants
 
     monkeypatch.setattr(invariants, "_TEST_SLOTTED", "{wo_id} is stuck", raising=False)
@@ -1246,9 +1055,7 @@ def test_attention_slots_interpolate_validated_ids_only(monkeypatch):
 
 
 def test_can_apply_writes_nothing_at_all(project):
-    """READ-ONLY IS THE CONTRACT, and it is what lets the mechanical gate and `dry-run`
-    call it on every candidate without acting. Graded on the row AND on the event count,
-    because a predicate that recorded "I was asked" would pass a row-only check."""
+    """READ-ONLY IS THE CONTRACT, and it is what lets the mechanical gate and `dry-run` call it on every..."""
     from jarvis import invariants
 
     store, wo = _wo(project, pr_url=PR_URL, status="waiting_pr_merge")
@@ -1270,21 +1077,7 @@ def test_can_apply_writes_nothing_at_all(project):
 
 
 def test_importing_remedies_does_not_import_invariants():
-    """THE LAYERING, and it is why `render_attention()` fetches the constant lazily.
-
-    This module has NO `jarvis` import at module scope — `ops`, `db`, `gates` and
-    `supervisor` are all imported inside function bodies — because the sibling rules
-    section is specified as a leaf that may import it beside stdlib, `db` and `catalog`.
-    A module-level `from .invariants import …` drags `project_store`, `neo_store`,
-    `budget`, `worker_session`, `catalog` and `automerge` in behind it, eagerly, for
-    every importer.
-
-    IN A SUBPROCESS, because by the time this file runs the suite has imported half the
-    OS and `sys.modules` would make the assertion vacuous. `tests/test_neo_panel.py::
-    test_neo_never_imports_the_panel` states its own boundary for the same reason and
-    walks an AST instead; an AST cannot see this one, since what is under test is what a
-    lazily-imported module pulls in TRANSITIVELY rather than which names are written.
-    """
+    """THE LAYERING, and it is why `render_attention()` fetches the constant lazily"""
     probe = ("import sys; import jarvis.remedies as r; "
              "assert 'jarvis.invariants' not in sys.modules, "
              "'jarvis.invariants was imported eagerly'; "
@@ -1297,18 +1090,12 @@ def test_importing_remedies_does_not_import_invariants():
     assert done.returncode == 0, done.stderr
 
 
-# -- 7. the five acting handlers themselves ---------------------------------------------
-#
-# Review round 1, assumption [4]: each of these is a fresh copy of the daemon's own
-# orchestration and not a pass-through to code the seam tests above already exercise, so
-# every one is driven through `REMEDIES[id].apply` — never the private `_apply_*` name —
-# so the test goes through the same door a verdict does.
+# -- 7. the five acting handlers themselves
 
 
 def test_carry_verdict_apply_happy_binds_the_round_to_the_moved_head(project,
                                                                        monkeypatch):
-    """Proofs (a) and (b) both hold: the diff is unchanged and the walked chain's newest
-    commit IS the live head, so `ops.carry_merge_chain` finds facts and writes them."""
+    """Proofs (a) and (b) both hold: the diff is unchanged and the walked chain's newest commit IS the..."""
     from jarvis import branchproof, ci, github
 
     store, wo = _wo(project, pr_url=PR_URL, status="waiting_pr_merge")
@@ -1335,9 +1122,7 @@ def test_carry_verdict_apply_happy_binds_the_round_to_the_moved_head(project,
 
 
 def test_carry_verdict_apply_refuses_when_the_diffs_differ(project, monkeypatch):
-    """THE CASE THE PANEL CALLED OUT: proof (b) is what decides whether an unjudged
-    commit may reach `main`, and a merge whose resolution touched authored content must
-    refuse even though proof (a)'s chain would otherwise hold."""
+    """THE CASE THE PANEL CALLED OUT: proof (b) is what decides whether an unjudged commit may reach..."""
     from jarvis import branchproof, ci, github, ops
 
     store, wo = _wo(project, pr_url=PR_URL, status="waiting_pr_merge")
@@ -1368,8 +1153,7 @@ def test_carry_verdict_apply_refuses_when_the_diffs_differ(project, monkeypatch)
 
 
 def test_carry_verdict_apply_refuses_on_an_empty_chain(project, monkeypatch):
-    """`base_merge_chain` found no run of merges connecting `judged` to `head` — proof (a)
-    fails even though the diffs (proof (b)) agree."""
+    """`base_merge_chain` found no run of merges connecting `judged` to `head`"""
     from jarvis import branchproof, ci, github, ops
 
     store, wo = _wo(project, pr_url=PR_URL, status="waiting_pr_merge")
@@ -1396,8 +1180,7 @@ def test_carry_verdict_apply_refuses_on_an_empty_chain(project, monkeypatch):
 
 
 def test_carry_verdict_apply_refuses_when_the_fetch_fails(project, monkeypatch):
-    """A fetch that failed means nothing local is comparable — refused before either
-    proof is even attempted, so neither `diff_fingerprint` nor `base_merge_chain` runs."""
+    """A fetch that failed means nothing local is comparable"""
     from jarvis import branchproof, ci, github, ops
 
     store, wo = _wo(project, pr_url=PR_URL, status="waiting_pr_merge")
@@ -1430,9 +1213,7 @@ def test_carry_verdict_apply_refuses_when_the_fetch_fails(project, monkeypatch):
 
 def test_update_branch_apply_refuses_when_the_head_moved_past_the_verdict(project,
                                                                             monkeypatch):
-    """THE NARROWED WINDOW the handler's docstring names: the head is re-read
-    immediately before the update, and a head the panel never read must not be merged
-    into — so `ci.update_branch` is never reached."""
+    """THE NARROWED WINDOW the handler's docstring names: the head is re-read immediately before the..."""
     from jarvis import ci, github
 
     store, wo = _wo(project, pr_url=PR_URL, status="waiting_pr_merge")
@@ -1455,9 +1236,7 @@ def test_update_branch_apply_refuses_when_the_head_moved_past_the_verdict(projec
 
 def test_update_branch_apply_records_the_failure_and_spends_the_attempt(project,
                                                                            monkeypatch):
-    """GitHub refused the update: the branch is exactly where it was, so this is a
-    refusal rather than a failure — and `record_base_update_failed` marks the attempt
-    spent for THIS base sha (`ops.base_heal_spent`), so it is not retried for ever."""
+    """GitHub refused the update: the branch is exactly where it was"""
     from jarvis import ci, github, invariants, ops
 
     store, wo = _wo(project, pr_url=PR_URL, status="waiting_pr_merge")
@@ -1480,10 +1259,7 @@ def test_update_branch_apply_records_the_failure_and_spends_the_attempt(project,
         assert len(events) == 1
         assert db.from_json(events[0]["payload"], {})["reason"] == \
             github.GitHubError.REFUSED
-        # `ops.catch_up_attempts` counts only a SUCCESSFUL update (`PR_BASE_UPDATED_EVENT`
-        # with `cause="behind"`), so a refused one does not move it — the bound a refused
-        # attempt actually spends is `base_heal_spent`, keyed on the base sha, which is
-        # what stops the same refusal being retried against the same base for ever.
+        # `ops.catch_up_attempts` counts only a SUCCESSFUL update (`PR_BASE_UPDATED_EVENT` with...
         assert ops.base_heal_spent(store, wo["id"], "c0c0c0c0") is True
     finally:
         store.close()
@@ -1491,8 +1267,7 @@ def test_update_branch_apply_records_the_failure_and_spends_the_attempt(project,
 
 def test_update_branch_apply_happy_merges_the_base_and_records_the_new_head(project,
                                                                               monkeypatch):
-    """`gh pr update-branch` succeeded: the record names both the commit that was judged
-    and the one the merge produced."""
+    """`gh pr update-branch` succeeded: the record names both the commit that was judged and the one the..."""
     from jarvis import ci, github, invariants
 
     store, wo = _wo(project, pr_url=PR_URL, status="waiting_pr_merge")
@@ -1521,10 +1296,7 @@ def test_update_branch_apply_happy_merges_the_base_and_records_the_new_head(proj
 
 def test_update_branch_apply_refuses_a_queued_message_before_touching_github(project,
                                                                                 monkeypatch):
-    """Review round 2's blocking defect: `apply` only checked the re-read head against
-    the verdict, and never repeated `_in_flight`'s message guard — so a grant approved
-    after a message queued could still move the branch a worker has not seen the message
-    about yet. The guard now runs BEFORE `github.pr_view`, so neither call is reached."""
+    """Review round 2's blocking defect: `apply` only checked the re-read head against the verdict"""
     from jarvis import ci, github
 
     store, wo = _wo(project, pr_url=PR_URL, status="waiting_pr_merge")
@@ -1552,8 +1324,7 @@ def test_update_branch_apply_refuses_a_queued_message_before_touching_github(pro
 
 def test_update_branch_apply_refuses_an_open_validation_round_before_touching_github(
         project, monkeypatch):
-    """The same defect, the round guard: a grant approved before a round opened must not
-    move the head the seats reading it are judging (Neo question 283, review round 2)."""
+    """The same defect, the round guard: a grant approved before a round opened must not move the head the..."""
     from jarvis import ci, github
 
     store, wo = _wo(project, pr_url=PR_URL, status="waiting_pr_merge")
@@ -1581,10 +1352,7 @@ def test_update_branch_apply_refuses_an_open_validation_round_before_touching_gi
 
 def test_update_branch_apply_refuses_past_the_catch_up_bound_before_touching_github(
         project, monkeypatch):
-    """The third guard `_can_update_branch` carries and `apply` did not (review round 2):
-    `ops.CATCH_UP_MAX` recorded catch-ups mean a base moving faster than the OS can keep
-    this branch caught up with is a person's problem, not another merge — checked, again,
-    before any GitHub call."""
+    """The third guard `_can_update_branch` carries and `apply` did not (review round 2):..."""
     from jarvis import ci, github, invariants, ops
 
     store, wo = _wo(project, pr_url=PR_URL, status="waiting_pr_merge")
@@ -1614,8 +1382,7 @@ def test_update_branch_apply_refuses_past_the_catch_up_bound_before_touching_git
 
 def test_force_rejudge_apply_refuses_with_no_reason_and_calls_nothing(project,
                                                                         monkeypatch):
-    """The reason is stored ON THE ROUND, so an unreasoned rule row is refused before
-    `ops.force_validation` is ever asked to open one."""
+    """The reason is stored ON THE ROUND"""
     from jarvis import ops
 
     store, wo = _wo(project)
@@ -1633,8 +1400,7 @@ def test_force_rejudge_apply_refuses_with_no_reason_and_calls_nothing(project,
 
 def test_force_rejudge_apply_surfaces_ops_error_and_names_the_round_on_success(
         project, monkeypatch):
-    """`ops.OpsError` becomes `RemedyRefused` carrying its own sentence; a success names
-    the round `ops.force_validation` opened and the reason verbatim."""
+    """`ops.OpsError` becomes `RemedyRefused` carrying its own sentence"""
     from jarvis import ops
 
     store, wo = _wo(project)
@@ -1662,8 +1428,7 @@ def test_force_rejudge_apply_surfaces_ops_error_and_names_the_round_on_success(
 
 def test_lower_attention_apply_happy_clears_a_flag_true_blockers_no_longer_derives(
         project):
-    """`invariants.true_blockers` re-derives nothing from a bare `pending` work order, so
-    the flag `apply` clears is one the next reconcile tick would have cleared anyway."""
+    """`invariants.true_blockers` re-derives nothing from a bare `pending` work order"""
     from jarvis import invariants
 
     store, wo = _wo(project)
@@ -1677,10 +1442,7 @@ def test_lower_attention_apply_happy_clears_a_flag_true_blockers_no_longer_deriv
 
 
 def test_lower_attention_apply_re_reads_the_row_and_refuses_on_a_fresh_blocker(project):
-    """THE RE-READ THE DOCSTRING PROMISES: `subject` is captured stale, on purpose,
-    before a pending assumption lands — so a caller passing the row it read at the top of
-    the tick must not have the flag taken down from under a blocker nothing else asks
-    about again."""
+    """THE RE-READ THE DOCSTRING PROMISES: `subject` is captured stale"""
     from jarvis import invariants
 
     store, wo = _wo(project)
@@ -1699,16 +1461,13 @@ def test_lower_attention_apply_re_reads_the_row_and_refuses_on_a_fresh_blocker(p
 
 
 def test_drop_hold_apply_happy_abandons_the_open_gate_request(project):
-    """Closes the request `expired`/`abandoned` — never a verdict — and the command it
-    named stays blocked, which is the whole point of ending a hold nobody argued."""
+    """Closes the request `expired`/`abandoned`"""
     store, wo = _wo(project)
     try:
         approval = store.add_approval(
             wo["id"], "deploy", "a privileged command a worker proposed",
             status="awaiting_case")
-        # `add_approval` already writes the paired `gate_requested` event carrying this
-        # approval's id — `_open_gate_episode` reads exactly that event, so nothing
-        # further needs writing here.
+        # `add_approval` already writes the paired `gate_requested` event carrying this approval's id
 
         sentence = remedies.REMEDIES["drop_hold"].apply(
             store, None, "proj_a", wo, {},
@@ -1723,8 +1482,7 @@ def test_drop_hold_apply_happy_abandons_the_open_gate_request(project):
 
 
 def test_drop_hold_apply_refuses_a_non_gate_cause_and_writes_nothing(project):
-    """NEO 908: every cause but the gate has no end-it-now call behind it, so the refusal
-    names the cause asked for and touches no row."""
+    """NEO 908: every cause but the gate has no end-it-now call behind it"""
     store, wo = _wo(project)
     try:
         events = len(store.list_events(wo["id"]))
@@ -1738,8 +1496,7 @@ def test_drop_hold_apply_refuses_a_non_gate_cause_and_writes_nothing(project):
 
 
 def test_drop_hold_apply_refuses_with_no_reason_and_leaves_the_approval_open(project):
-    """The reason is the whole record of why a request nobody decided was closed, so an
-    unreasoned call must not touch the approval at all."""
+    """The reason is the whole record of why a request nobody decided was closed"""
     store, wo = _wo(project)
     try:
         approval = store.add_approval(
@@ -1756,9 +1513,7 @@ def test_drop_hold_apply_refuses_with_no_reason_and_leaves_the_approval_open(pro
 
 
 def test_drop_hold_apply_refuses_with_no_gate_request_open_at_all(project):
-    """The one `drop_hold` apply case not yet covered: `_open_gate_episode` finds nothing
-    because none was ever filed, so this is refused the same as any other unsatisfied
-    precondition — nothing written, no event, no approval touched (there is none)."""
+    """The one `drop_hold` apply case not yet covered: `_open_gate_episode` finds nothing because none was..."""
     store, wo = _wo(project)
     try:
         events = len(store.list_events(wo["id"]))
@@ -1776,9 +1531,7 @@ def test_drop_hold_apply_refuses_with_no_gate_request_open_at_all(project):
 
 
 def test_raise_attention_apply_happy_flags_the_invariants_constant_verbatim(project):
-    """`apply` renders through the closed table and writes exactly the `invariants`
-    constant the template names — never a re-spelled copy — so `true_blockers` and this
-    remedy can never read the same blocker as two different sentences."""
+    """`apply` renders through the closed table and writes exactly the `invariants` constant the template..."""
     from jarvis import invariants
 
     store, wo = _wo(project)
@@ -1795,9 +1548,7 @@ def test_raise_attention_apply_happy_flags_the_invariants_constant_verbatim(proj
 
 
 def test_raise_attention_apply_refuses_an_unknown_template_and_writes_nothing(project):
-    """The third of the three doors `test_raise_attention_takes_a_template_key_...`
-    already names: `apply` itself refuses a key outside the closed table, and a refusal
-    at this door must leave the flag exactly where it was."""
+    """The third of the three doors `test_raise_attention_takes_a_template_key_...` already names: `apply`..."""
     store, wo = _wo(project)
     try:
         before = store.get_work_order(wo["id"])

@@ -1,13 +1,4 @@
-"""Screenshot a work order's record carrying a cost alarm, for a PR's UI evidence.
-
-§4 of docs/superpowers/specs/2026-08-31-the-supervisor.md. Writes PNGs to
-docs/screenshots/; `scripts/screenshot_config_console.py` is the shape it copies.
-Everything lives in a temp `JARVIS_HOME` and a temp catalog, so it never touches the
-live OS, and the supervisor is never turned on — every column it would fill is written
-here directly, because a picture is not worth a real model call:
-
-    uv run python scripts/screenshot_wo_alarm_record.py
-"""
+"""Screenshot a work order's record carrying a cost alarm, for a PR's UI evidence (docs/superpowers/specs/2026-08-31-the-supervisor.md)"""
 
 from __future__ import annotations
 
@@ -25,8 +16,7 @@ PORT = 8798
 
 
 def seed() -> str:
-    """One order with an alarm the supervisor escalated and Neo then settled — the
-    longest of the four shapes, so all four event kinds appear on one page."""
+    """One order with an alarm the supervisor escalated and Neo then settled"""
     from jarvis import ops
     from jarvis.central_store import CentralStore
     from jarvis.project_store import ProjectStore

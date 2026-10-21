@@ -1,21 +1,4 @@
-"""The mechanical gate a fix order passes before the validation panel is paid.
-
-§7.2 of docs/superpowers/specs/2026-09-27-self-evolution.md. `rules.precheck` is PURE —
-the rows, the order's row and the triggering order's facts all arrive as arguments — so
-every outcome below is a unit test with no store, no clock and no network.
-
-WHAT IS BEING PROTECTED HERE. The refusal's words are the feature's only forcing
-function: the pre-check never registers a detector or a remedy for the submitter (§7.2,
-"it refuses, it does not create"), so a refusal that does not say WHICH thing is missing
-and HOW to supply it is the dead end kn-85265170 is about. Each test therefore asserts
-the sentence's load-bearing nouns, not merely that something was refused.
-
-THE TWO STATES THAT ARE DELIBERATELY NOT ONE: `trigger_facts=None` with nothing named is
-a REFUSAL (a detector that has never been shown to fire is unproven), and a trigger order
-that was named and could not be READ is a PASS carrying `trigger_unreadable`. Collapsing
-them would either refuse an order for the OS's own lost record or let an unproven rule
-through. Both are asserted below.
-"""
+"""The mechanical gate a fix order passes before the validation panel is paid (docs/superpowers/specs/2026-09-27-self-evolution.md)"""
 
 from __future__ import annotations
 
@@ -33,27 +16,27 @@ FIX_ORDER = {"id": "wo-fix", "gap_class": "stale-hold", "detector_id": "dt-match
 
 
 def facts(**values):
-    """The TRIGGERING order's recorded facts. Only what is passed is recorded."""
+    """The TRIGGERING order's recorded facts"""
     return rules.Facts(project="acme", order_id="wo-trigger", order_kind="worker",
                        values=values, now=1000.0)
 
 
 def rows(**kwargs):
-    """One live remedy row under `dt-match`, overridable field by field."""
+    """One live remedy row under `dt-match`, overridable field by field"""
     return {"dt-match": [{"id": "rr-1", "primitive": "nudge", "params": {},
                           "argument": "ask it", **kwargs}]}
 
 
-# -- the ordinary order, which is almost every order ------------------------------------
+# -- the ordinary order, which is almost every order
 
 
 def test_an_empty_gap_class_is_not_pre_checked_at_all():
-    """§7.1: an empty `gap_class` is the ordinary case and skips every gate."""
+    """§7.1: an empty `gap_class` is the ordinary case and skips every gate"""
     assert rules.precheck([], {}, {"id": "wo-1", "gap_class": ""}, None) is None
     assert rules.precheck([], {}, {"id": "wo-1"}, None) is None
 
 
-# -- the five outcomes ------------------------------------------------------------------
+# -- the five outcomes
 
 
 def test_a_gap_class_with_no_live_detector_is_refused_by_name():
@@ -89,8 +72,7 @@ def test_only_the_named_remedy_rule_counts_when_the_order_names_one():
 
 
 def test_a_condition_that_does_not_match_is_refused_with_the_leaf_that_failed():
-    """A REAL EVALUATION, never a syntax check — and `explain`'s absence clause is the
-    part that tells a rule author their rule is aimed at the wrong orders."""
+    """A REAL EVALUATION, never a syntax check"""
     out = rules.precheck([MATCHING], rows(), FIX_ORDER, facts(status="pending"))
     assert out and "dt-match" in out and "wo-trigger" in out
     assert "did not match because" in out and "status" in out
@@ -122,15 +104,13 @@ def test_a_live_detector_a_live_remedy_and_a_matching_condition_pass():
 
 
 def test_an_undeterminable_precondition_is_not_a_refusal():
-    """kn-b7deec8f: `can_apply` with nothing able to answer is a THIRD state. It is not
-    collapsed into "yes" — the pass is on the other three checks and this one is left
-    unanswered for the packet to state — and it is never a refusal."""
+    """kn-b7deec8f: `can_apply` with nothing able to answer is a THIRD state"""
     assert rules.precheck([MATCHING], rows(), FIX_ORDER, facts(status="running")) is None
     assert rules.precheck([MATCHING], rows(), FIX_ORDER, facts(status="running"),
                           precondition=lambda primitive, params: None) is None
 
 
-# -- the triggering order, and the two states that are not one --------------------------
+# -- the triggering order, and the two states that are not one
 
 
 def test_no_triggering_order_at_all_is_refused_in_the_specs_own_words():
@@ -143,28 +123,24 @@ def test_no_triggering_order_at_all_is_refused_in_the_specs_own_words():
 
 
 def test_a_trigger_order_that_could_not_be_read_lets_the_submission_through():
-    """Named but unreadable — deleted, or in another project. The pinned ruling: never
-    fabricate an answer from a failure. UNREADABLE is recorded and the panel judges."""
+    """Named but unreadable — deleted, or in another project"""
     assert rules.precheck(
         [MATCHING], rows(), FIX_ORDER, None,
         trigger_unreadable="wo-trigger is not in this project's database") is None
 
 
 def test_an_unreadable_trigger_does_not_excuse_a_missing_detector():
-    """The pass-through is about the CONDITION, which cannot be evaluated. Existence is
-    still decided here — §7.2's step 1 needs no facts at all."""
+    """The pass-through is about the CONDITION, which cannot be evaluated"""
     out = rules.precheck([], rows(), FIX_ORDER, None,
                          trigger_unreadable="deleted")
     assert out and "stale-hold" in out
 
 
-# -- a NAMED trigger the records do not have: the submitter's own input ------------------
+# -- a NAMED trigger the records do not have: the submitter's own input
 
 
 def test_a_named_trigger_the_records_do_not_have_is_refused_in_the_constants_own_words():
-    """The round-2 defect: a made-up `--trigger-wo-id` used to pass checks 3 and 4
-    unevaluated, so any fix order could skip the dry run by naming an id that does not
-    exist. The id came from the submitter, so it is INPUT and it refuses."""
+    """The round-2 defect: a made-up `--trigger-wo-id` used to pass checks 3 and 4 unevaluated"""
     out = rules.precheck([MATCHING], rows(), FIX_ORDER, None,
                          trigger_missing="wo-does-not-exist")
     assert out == (
@@ -177,8 +153,7 @@ def test_a_named_trigger_the_records_do_not_have_is_refused_in_the_constants_own
 
 
 def test_a_missing_detector_still_beats_a_missing_trigger():
-    """Deepest-stage precedence is unchanged: check 1 refuses before check 3 is reached,
-    so the submitter is told about the detector it never registered."""
+    """Deepest-stage precedence is unchanged: check 1 refuses before check 3 is reached"""
     out = rules.precheck([], rows(), FIX_ORDER, None,
                          trigger_missing="wo-does-not-exist")
     assert out and "stale-hold" in out and "--detector-id" in out
@@ -186,15 +161,14 @@ def test_a_missing_detector_still_beats_a_missing_trigger():
 
 
 def test_a_missing_trigger_leaves_no_unproven_note():
-    """A candidate that REFUSES may not leave a note: the notes describe checks that
-    passed unevaluated, and a refusal has not passed anything."""
+    """A candidate that REFUSES may not leave a note: the notes describe checks that passed unevaluated"""
     notes: list[str] = []
     assert rules.precheck([MATCHING], rows(), FIX_ORDER, None,
                           trigger_missing="wo-gone", unproven=notes) is not None
     assert notes == []
 
 
-# -- deepest-stage precedence (recorded assumption 2) -----------------------------------
+# -- deepest-stage precedence (recorded assumption 2)
 
 
 def test_the_deepest_refusal_wins_when_detectors_fail_at_different_stages():
@@ -213,7 +187,7 @@ def test_an_unparseable_detector_loses_to_a_specific_no_match():
     assert "dt-broken" not in out
 
 
-# -- the notes: a check that PASSED UNEVALUATED is recorded -----------------------------
+# -- the notes: a check that PASSED UNEVALUATED is recorded
 
 
 def test_an_unreadable_trigger_leaves_a_note_naming_check_3():
@@ -227,7 +201,7 @@ def test_an_unreadable_trigger_leaves_a_note_naming_check_3():
 
 
 def test_an_undeterminable_precondition_leaves_a_note_naming_check_4():
-    """(iv) no precondition injected at all, and (iii) the primitive declares none."""
+    """(iv) no precondition injected at all, and (iii) the primitive declares none"""
     notes: list[str] = []
     assert rules.precheck([MATCHING], rows(), FIX_ORDER, facts(status="running"),
                           unproven=notes) is None
@@ -259,13 +233,11 @@ def test_a_passing_precondition_leaves_no_note():
     assert notes == []
 
 
-# -- purity -----------------------------------------------------------------------------
+# -- purity
 
 
 def test_precheck_reaches_no_store(monkeypatch):
-    """rules.py is a LEAF (§3): stdlib plus db, catalog, remedies. A pre-check that
-    opened a store would make the gate untestable in one step and would drag a database
-    into `Daemon._validate_work_order`'s hot band."""
+    """rules.py is a LEAF (§3): stdlib plus db, catalog, remedies"""
     import jarvis.rules as module
 
     assert "central_store" not in module.__dict__

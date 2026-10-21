@@ -1,20 +1,4 @@
-"""A `needs_review` work order says why, and nobody acks for the user.
-
-Issue 573: an order sat in `needs_review` for 2.6 days with `attention_reason: None`,
-`needs_attention: 0` and no reason on any surface. Three faults stacked, one test group
-each:
-
-* the supervisor's alarm ack ran through `ops.ack_attention` — the USER's blanket
-  dismissal — and so buried an `IDLE_NO_FINISH_BLOCKER` the user had never seen, for
-  ever, since `true_blockers` filters acknowledged blockers permanently;
-* `needs_review` kept its reason only in `attention_reason`, which every ack NULLs, so
-  the reason and the status were never durable together;
-* `IDLE_NO_FINISH_BLOCKER` named no command, unlike both its siblings.
-
-The alarm-ack paths themselves are graded where they live (`test_supervisor.py`,
-`test_remedies.py`, `test_alarm_escalation.py`); this file grades the shared primitive
-and the surfaces.
-"""
+"""A `needs_review` work order says why, and nobody acks for the user"""
 
 from __future__ import annotations
 
@@ -38,7 +22,7 @@ from jarvis.ui.app import create_app
 
 @pytest.fixture()
 def registered(jarvis_home, catalog_file, project):
-    """proj_a on the registry, so `ops` can find a work order by id. No daemon."""
+    """proj_a on the registry, so `ops` can find a work order by id"""
     ops.start_os(str(catalog_file), foreground=True)
     return project
 
@@ -50,7 +34,7 @@ def client(jarvis_home, fake_claude, catalog_file):
 
 
 def _idle_needs_review(project, title: str = "the one that went quiet") -> dict:
-    """`Daemon.settle_work_order`'s shape: a worker that stopped without finishing."""
+    """`Daemon.settle_work_order`'s shape: a worker that stopped without finishing"""
     wo = ops.create_work_order("proj_a", title)
     store = ProjectStore(project)
     try:
@@ -61,22 +45,20 @@ def _idle_needs_review(project, title: str = "the one that went quiet") -> dict:
         store.close()
 
 
-# -- (c) the blocker names the way out -------------------------------------------------
+# -- (c) the blocker names the way out
 
 
 def test_the_idle_blocker_ends_with_a_command_like_both_its_siblings():
-    """A diagnosis with no action is half an attention item. Its two siblings for the
-    same family — the worker has stopped — both end with the way out."""
+    """A diagnosis with no action is half an attention item"""
     for blocker in (IDLE_NO_FINISH_BLOCKER, PARKED_BLOCKER, STALE_FINISH_BLOCKER):
         assert "`jarvis wo send`" in blocker
 
 
-# -- (a) an ack the OS makes for itself dismisses nothing -------------------------------
+# -- (a) an ack the OS makes for itself dismisses nothing
 
 
 def test_ack_os_flag_leaves_a_blocker_the_user_never_saw_standing(registered):
-    """The bug itself, at the primitive. The flag was raised for an alarm; the order's
-    own blocker has nothing to do with it and must survive, reason and all."""
+    """The bug itself, at the primitive"""
     project = registered
     wo = _idle_needs_review(project)
 
@@ -89,15 +71,14 @@ def test_ack_os_flag_leaves_a_blocker_the_user_never_saw_standing(registered):
         assert row["attention_reason"] == IDLE_NO_FINISH_BLOCKER
         assert row["acknowledged_blockers"] is None
         assert store.events_of_kind(wo["id"], "acknowledged") == []
-        # And it is still on the attention list, tick after tick.
+        # And it is still on the attention list, tick after tick
         assert true_blockers(store, row) == [IDLE_NO_FINISH_BLOCKER]
     finally:
         store.close()
 
 
 def test_ack_os_flag_puts_the_flag_down_when_nothing_is_left(registered):
-    """The other half, and the reason it is not `clear_attention`: the user's own
-    earlier dismissals are still on the row afterwards."""
+    """The other half, and the reason it is not `clear_attention`: the user's own earlier dismissals are..."""
     project = registered
     wo = ops.create_work_order("proj_a", "quiet")
     store = ProjectStore(project)
@@ -121,8 +102,7 @@ def test_ack_os_flag_puts_the_flag_down_when_nothing_is_left(registered):
 
 
 def test_ack_os_flag_re_raises_against_the_blocker_that_is_actually_left(registered):
-    """The flag the OS raised said "cost alarm"; what is really owed is the idle
-    worker. Re-derived, so the user reads the true reason rather than a stale one."""
+    """The flag the OS raised said "cost alarm"; what is really owed is the idle worker"""
     project = registered
     wo = _idle_needs_review(project)
     store = ProjectStore(project)
@@ -142,8 +122,7 @@ def test_ack_os_flag_re_raises_against_the_blocker_that_is_actually_left(registe
 
 
 def test_ack_os_flag_writes_no_timeline_row_when_the_reason_is_unchanged(registered):
-    """`flag_attention` writes an event per call, and this runs once per alarm decision
-    on orders the reconciler is also flagging — restating the same reason is noise."""
+    """`flag_attention` writes an event per call"""
     project = registered
     wo = _idle_needs_review(project)
     store = ProjectStore(project)
@@ -163,7 +142,7 @@ def test_ack_os_flag_writes_no_timeline_row_when_the_reason_is_unchanged(registe
 
 
 def test_the_users_own_ack_still_records_who_made_it(registered):
-    """`jarvis wo ack` is unchanged — and now says on the record that it was them."""
+    """`jarvis wo ack` is unchanged — and now says on the record that it was them"""
     project = registered
     wo = _idle_needs_review(project)
 
@@ -180,12 +159,11 @@ def test_the_users_own_ack_still_records_who_made_it(registered):
         store.close()
 
 
-# -- (b) the reason survives the ack, on every surface ---------------------------------
+# -- (b) the reason survives the ack, on every surface
 
 
 def test_the_cli_show_carries_what_was_already_seen(registered, capsys):
-    """`jarvis wo show` on an acked `needs_review` used to print `attention_reason:
-    None` and nothing else — 2.6 days with no answer to "why is this here?"."""
+    """`jarvis wo show` on an acked `needs_review` used to print `attention_reason: None` and nothing else..."""
     project = registered
     wo = _idle_needs_review(project)
     ops.ack_attention(wo["id"])
@@ -217,15 +195,15 @@ def test_the_dashboard_page_says_why_after_the_got_it_button(client, project):
     page = client.get(f"/wo/proj_a/{wo['id']}")
 
     assert "already seen" in page.text
-    # The dashboard escapes the backticks' contents, not the words around them.
+    # The dashboard escapes the backticks' contents, not the words around them
     assert "stopped mid-task without" in page.text
 
 
-# -- (d) the acknowledgement reads as prose --------------------------------------------
+# -- (d) the acknowledgement reads as prose
 
 
 def test_the_acknowledged_event_is_prose_and_names_who_acked(registered):
-    """It reached the user as `{"blockers": ["…\\u2014 nothing it started…"]}`."""
+    """It reached the user as `{"blockers": ["…\\u2014 nothing it started…"]}`"""
     project = registered
     wo = _idle_needs_review(project)
     ops.ack_attention(wo["id"])
@@ -244,8 +222,7 @@ def test_the_acknowledged_event_is_prose_and_names_who_acked(registered):
 
 
 def test_a_legacy_acknowledgement_is_attributed_to_nobody(registered):
-    """Rows written before `by` existed include the ones the OS wrote on the user's
-    behalf. Claiming those were theirs would restate the bug on the timeline."""
+    """Rows written before `by` existed include the ones the OS wrote on the user's behalf"""
     project = registered
     wo = _idle_needs_review(project)
     store = ProjectStore(project)
@@ -261,8 +238,7 @@ def test_a_legacy_acknowledgement_is_attributed_to_nobody(registered):
 
 
 def test_acknowledged_decodes_the_column_for_every_surface(registered):
-    """One reader, so `true_blockers` and the surfaces can never disagree about what
-    counts as seen."""
+    """One reader, so `true_blockers` and the surfaces can never disagree about what counts as seen"""
     project = registered
     wo = _idle_needs_review(project)
     store = ProjectStore(project)

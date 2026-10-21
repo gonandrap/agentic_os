@@ -52,23 +52,13 @@ def _day(text: str) -> float:
 
 
 def _rates(model: str) -> tuple[float, float]:
-    """(input $/Mtok, output multiple of input) for the model that made a call."""
+    """(input $/Mtok, output multiple of input) for the model that made a call"""
     price = usage.price_for(model)
     return price[0], price[1] / price[0]
 
 
 def boundaries(calls: list, compactions: list[float], floor: int) -> list[dict]:
-    """Every TTL-EXPIRED boundary in one session, with the rest of its turn attached.
-
-    The classification is `usage._usage_of`'s, restated over the same calls because
-    that one totals what this one has to keep apart: a boundary is a call that read
-    LESS than the call before it, and it is an expiry when the gap reached the write
-    TTL and nothing but the static head survived.
-
-    A boundary the session ALREADY compacted across is skipped: there is nothing left
-    to compact there, and counting it would credit this change with a saving the fleet
-    has already taken (`usage.Usage.rewrite_compact_write`).
-    """
+    """Every TTL-EXPIRED boundary in one session, with the rest of its turn attached"""
     out: list[dict] = []
     for i, call in enumerate(calls):
         if i == 0:
@@ -92,7 +82,7 @@ def boundaries(calls: list, compactions: list[float], floor: int) -> list[dict]:
 
 
 def price(boundary: dict) -> tuple[float, float]:
-    """(before, after) for one boundary, in dollars at list prices."""
+    """(before, after) for one boundary, in dollars at list prices"""
     call, rest = boundary["call"], boundary["rest"]
     context = boundary["context"]
     rate, out_rate = _rates(call.model)
@@ -116,11 +106,7 @@ def price(boundary: dict) -> tuple[float, float]:
 
 
 def _classify(calls: list, compactions: list[float], floor: int) -> usage.Usage:
-    """`usage._usage_of`'s boundary accounting over calls already in memory.
-
-    Only the three fields the prefix guard needs. Re-stated rather than re-read for the
-    reason above; `tests/test_compaction.py` pins it against the real one.
-    """
+    """`usage._usage_of`'s boundary accounting over calls already in memory"""
     total = usage.Usage()
     previous = None
     for call in calls:
@@ -157,9 +143,7 @@ def main(argv: list[str] | None = None) -> int:
 
     rows: list[dict] = []
     sessions = 0
-    # The aggregate the prefix guard is read off, accumulated from the SAME walk. Every
-    # transcript is opened once: at ~0.07s each, a second pass over a month of them is
-    # five minutes of re-reading for numbers already in hand (kn-4b2ef07f (3)).
+    # The aggregate the prefix guard is read off, accumulated from the SAME walk
     fleet = usage.Usage()
     for session_id, paths in usage.index_sessions().items():
         started, _ = usage._time_span(sorted(paths)[0])
@@ -217,11 +201,7 @@ def main(argv: list[str] | None = None) -> int:
               f"worst ${min(delta):>7.3f}  "
               f"median calls after {statistics.median(r['calls'] for r in band):>4.0f}")
 
-    # THE OTHER GUARD, and the one a saving can quietly break. Both cache-health
-    # post-conditions are RATIOS over every written token, so removing the TTL writes
-    # raises every other share without anything getting worse. What the prefix check
-    # would read after this ships is arithmetic, not a guess, so it is printed here
-    # beside the saving that causes it (`invariants.check_prefix_stable`).
+    # THE OTHER GUARD, and the one a saving can quietly break
     removed = sum(r["write"] for r in fired)
     added = COMPACT_FIRST_WRITE * len(fired)
     after_writes = fleet.cache_write - removed + added

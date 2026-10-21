@@ -1,23 +1,4 @@
-"""A database written by the release that is live must reach today's schema on open.
-
-This covers all three of the schemas a release can move: the per-project `jarvis.db`
-(`ProjectStore`), Neo's own `neo.db` (`NeoStore`) and the central `os.db`
-(`CentralStore`). They have the same mechanism and therefore the same trap.
-
-`ProjectStore.__init__` runs `CREATE TABLE IF NOT EXISTS` — which is a **no-op** on a
-table that already exists. So a brand new table arrives on an upgrade for free, but a new
-*column* on an existing table does not: it has to be declared in `ADDED_COLUMNS`, which is
-the only thing that ever emits `ALTER TABLE`. Forgetting that is silent at write time and
-fatal at read time, on live data only — never in a test that builds its database fresh.
-
-This is the test that builds it stale instead. `tests/data/schema-<tag>.sql` is the schema
-as shipped in the release currently in production; opening a database built from it with
-today's code must produce exactly what today's code produces from nothing.
-
-**When this fails after you add a column:** add it to `ADDED_COLUMNS` too — the base
-`CREATE TABLE` alone only reaches new installs. When a new release ships, refresh the
-asset from the new tag (`git show <tag>:src/jarvis/project_store.py`).
-"""
+"""A database written by the release that is live must reach today's schema on open"""
 
 from __future__ import annotations
 
@@ -44,7 +25,7 @@ def schema_of(conn: sqlite3.Connection) -> dict[str, set[str]]:
 
 @pytest.fixture()
 def current(tmp_path) -> dict[str, set[str]]:
-    """What today's code builds from nothing."""
+    """What today's code builds from nothing"""
     store = ProjectStore(tmp_path / "fresh")
     try:
         return schema_of(store.conn)
@@ -54,7 +35,7 @@ def current(tmp_path) -> dict[str, set[str]]:
 
 @pytest.fixture()
 def current_neo(tmp_path) -> dict[str, set[str]]:
-    """The same, for Neo's database."""
+    """The same, for Neo's database"""
     store = NeoStore(tmp_path / "fresh-neo.db")
     try:
         return schema_of(store.conn)
@@ -64,7 +45,7 @@ def current_neo(tmp_path) -> dict[str, set[str]]:
 
 @pytest.fixture()
 def current_central(tmp_path) -> dict[str, set[str]]:
-    """The same, for the central database."""
+    """The same, for the central database"""
     store = CentralStore(tmp_path / "fresh-os.db")
     try:
         return schema_of(store.conn)
@@ -97,12 +78,7 @@ def test_a_database_from_the_live_release_upgrades_in_full(tmp_path, current):
 
 
 def test_neos_database_from_the_live_release_upgrades_in_full(tmp_path, current_neo):
-    """`neo.db` had no upgrade test at all until the panel work needed one.
-
-    It is the harder of the two to notice: the OS opens exactly one `neo.db`, in the
-    user's `JARVIS_HOME`, which every test replaces with an empty one — so a forgotten
-    `ADDED_COLUMNS` entry here is invisible until production reads the column.
-    """
+    """`neo.db` had no upgrade test at all until the panel work needed one"""
     path = tmp_path / "legacy-neo.db"
     old = sqlite3.connect(path)
     old.executescript(SHIPPED_NEO_SCHEMA.read_text())
@@ -117,8 +93,7 @@ def test_neos_database_from_the_live_release_upgrades_in_full(tmp_path, current_
         assert {"attempts", "claimed_at"} <= after["questions"]
         assert "seat" in after["learnings"]
         assert "panel_opinions" in after, "a new TABLE arrives for free — this one didn't"
-        # and the upgraded database actually works: the new columns are readable, and
-        # the legacy rows they were bolted onto default to the global/unclaimed reading
+        # and the upgraded database actually works: the new columns are readable
         q = store.ask("proj_a", "wo-1", "which delimiter?")
         assert q["attempts"] == 0 and q["claimed_at"] is None
         assert store.add_learning("global", project="proj_a")["seat"] == ""
@@ -137,13 +112,7 @@ def test_neos_database_from_the_live_release_upgrades_in_full(tmp_path, current_
 
 def test_the_central_database_from_the_live_release_upgrades_in_full(
         tmp_path, current_central):
-    """`os.db` had NO upgrade mechanism at all until retraction needed one.
-
-    `CentralStore.__init__` ran `executescript(SCHEMA)` and nothing else, so the first
-    column ever added to a central table had to bring `ADDED_COLUMNS` + `_migrate()`
-    with it — otherwise the column reaches new installs only, and every live `os.db`
-    raises `no such column` the moment a read names it.
-    """
+    """`os.db` had NO upgrade mechanism at all until retraction needed one"""
     path = tmp_path / "legacy-os.db"
     old = sqlite3.connect(path)
     old.executescript(SHIPPED_CENTRAL_SCHEMA.read_text())
@@ -155,9 +124,7 @@ def test_the_central_database_from_the_live_release_upgrades_in_full(
     try:
         after = schema_of(store.conn)
         assert {"retired_at", "retired_reason"} <= after["knowledge"]
-        # and the upgraded database actually works end to end: a legacy-shaped table
-        # accepts a write, the new column defaults to "standing", and both the prompt
-        # feed and the retraction round-trip on it
+        # and the upgraded database actually works end to end: a legacy-shaped table accepts a write
         row = store.add_knowledge("always run make lint", project="proj_a", topic="ci")
         live = store.add_knowledge("prefer uv over pip", project="")
         assert [r["content"] for r in store.relevant_knowledge("proj_a")] == [
@@ -179,12 +146,7 @@ def test_the_central_database_from_the_live_release_upgrades_in_full(
 
 
 def test_the_input_size_columns_arrive_on_an_existing_agent_calls_table(tmp_path):
-    """`agent_calls` predates them, so `CREATE TABLE IF NOT EXISTS` is a no-op on a live
-    `os.db` and only `ADDED_COLUMNS` reaches one. Spec §3,
-    docs/superpowers/specs/2026-09-26-bounded-model-inputs.md.
-
-    0 on a pre-existing row means NOT MEASURED, never "an empty prompt".
-    """
+    """`agent_calls` predates them, so `CREATE TABLE IF NOT EXISTS` is a no-op on a live `os.db` and only... (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)"""
     path = tmp_path / "legacy-os.db"
     old = sqlite3.connect(path)
     old.executescript(SHIPPED_CENTRAL_SCHEMA.read_text())
@@ -221,9 +183,7 @@ def test_the_input_size_columns_arrive_on_an_existing_agent_calls_table(tmp_path
 
 
 def test_the_latency_column_arrives_on_an_existing_agent_calls_table(tmp_path):
-    """NULLABLE, unlike `prompt_chars` beside it: a sub-millisecond call rounds to 0, so
-    0 cannot mean "not measured" here. Spec §3, docs/superpowers/specs/2026-10-01-neo-observability.md.
-    """
+    """NULLABLE, unlike `prompt_chars` beside it: a sub-millisecond call rounds to 0 (docs/superpowers/specs/2026-10-01-neo-observability.md)"""
     path = tmp_path / "legacy-latency.db"
     old = sqlite3.connect(path)
     old.executescript(SHIPPED_CENTRAL_SCHEMA.read_text())
@@ -257,10 +217,7 @@ def test_the_latency_column_arrives_on_an_existing_agent_calls_table(tmp_path):
 
 
 def test_the_escalation_cause_column_arrives_on_an_existing_questions_table(tmp_path):
-    """NULL on every pre-existing row, and NOT `NOT NULL DEFAULT ''`: the column is read
-    by a GROUP BY, where an empty-string bucket reads as a ninth cause. Spec §1,
-    docs/superpowers/specs/2026-10-01-neo-observability.md — and NO backfill from prose.
-    """
+    """NULL on every pre-existing row (docs/superpowers/specs/2026-10-01-neo-observability.md)"""
     path = tmp_path / "legacy-cause.db"
     old = sqlite3.connect(path)
     old.executescript(SHIPPED_NEO_SCHEMA.read_text())
@@ -284,14 +241,7 @@ def test_the_escalation_cause_column_arrives_on_an_existing_questions_table(tmp_
 
 
 def test_the_config_version_ledger_and_its_index_arrive_on_a_central_upgrade(tmp_path):
-    """`schema_of` returns `{table: {columns}}`, so an index is invisible to every
-    column comparison in this file — including the one directly above, which would pass
-    with `idx_os_config_versions_ts` missing.
-
-    The table itself arrives free on `CREATE TABLE IF NOT EXISTS`; the index does so only
-    because it is in `SCHEMA` beside it. Same trap as the validation tables' partial
-    unique indexes, one database over.
-    """
+    """`schema_of` returns `{table: {columns}}`"""
     path = tmp_path / "legacy-os.db"
     old = sqlite3.connect(path)
     old.executescript(SHIPPED_CENTRAL_SCHEMA.read_text())
@@ -317,15 +267,7 @@ def test_the_config_version_ledger_and_its_index_arrive_on_a_central_upgrade(tmp
 
 
 def test_the_usage_json_column_reaches_a_database_that_already_has_wo_turns(tmp_path):
-    """`wo_turns` already ships in the live release, so `usage_json` cannot arrive
-    with the `CREATE TABLE` — it must be in `ADDED_COLUMNS`.
-
-    The stale database is built by dropping the column from today's schema rather
-    than from a frozen asset: the project asset (0.1.11) predates `wo_turns`
-    entirely, so the upgrade it exercises creates the whole table fresh and would
-    pass with `ADDED_COLUMNS` forgotten — exactly the silent failure this file
-    exists to catch.
-    """
+    """`wo_turns` already ships in the live release"""
     proj = tmp_path / "legacy"
     (proj / ".jarvis").mkdir(parents=True)
     ProjectStore(proj).close()                      # today's schema...
@@ -348,8 +290,7 @@ def test_the_usage_json_column_reaches_a_database_that_already_has_wo_turns(tmp_
 
 
 def test_reopens_at_reaches_a_database_that_already_has_health_reviews(tmp_path):
-    """`health_reviews` already ships, so the hold's moment cannot arrive with the
-    `CREATE TABLE` — spec 2026-09-28-a-usage-limit-is-not-a-failed-sweep §1."""
+    """`health_reviews` already ships, so the hold's moment cannot arrive with the `CREATE TABLE`"""
     proj = tmp_path / "legacy-health"
     (proj / ".jarvis").mkdir(parents=True)
     store = ProjectStore(proj)
@@ -372,12 +313,7 @@ def test_reopens_at_reaches_a_database_that_already_has_health_reviews(tmp_path)
 
 
 def test_the_columns_the_turn_runtime_reads_survive_the_upgrade(tmp_path):
-    """The specific fields this transport depends on, named so a failure says which.
-
-    `session_id` and `worktree` predate headless turns but became load-bearing with
-    them: the first is now the conversation's permanent identity, the second is the
-    directory a turn must resume from.
-    """
+    """The specific fields this transport depends on, named so a failure says which"""
     proj = tmp_path / "legacy"
     (proj / ".jarvis").mkdir(parents=True)
     old = sqlite3.connect(proj / ".jarvis" / "jarvis.db")
@@ -402,14 +338,7 @@ def test_the_columns_the_turn_runtime_reads_survive_the_upgrade(tmp_path):
 
 
 def test_base_sha_reaches_a_database_that_already_has_feature_orders(tmp_path):
-    """`feature_orders` ships in the live release, so `base_sha` cannot arrive with the
-    `CREATE TABLE` — it must be in `ADDED_COLUMNS`.
-
-    Same construction, and the same reason, as the `usage_json` test above: the frozen
-    project asset (0.1.11) predates feature orders entirely, so the upgrade it exercises
-    creates the whole table fresh and would pass with `ADDED_COLUMNS` forgotten. The
-    stale database is therefore built by aging today's schema by one column instead.
-    """
+    """`feature_orders` ships in the live release, so `base_sha` cannot arrive with the `CREATE TABLE`"""
     proj = tmp_path / "legacy"
     (proj / ".jarvis").mkdir(parents=True)
     ProjectStore(proj).close()                      # today's schema...
@@ -431,13 +360,7 @@ def test_base_sha_reaches_a_database_that_already_has_feature_orders(tmp_path):
 
 
 def test_kind_reaches_a_database_that_already_has_feature_orders(tmp_path):
-    """Same construction as `base_sha` above, and the same reason.
-
-    Per `kn-c712a5d6` the column is untested until a test WRITES both values and a test
-    reads a row that PREDATES it — so this asserts the aged row reads back exactly
-    `'feature'` AND that the behaviour that value unlocks still holds: it is still in
-    `jarvis fo list`'s store verb, whose filter is now positive on `kind`.
-    """
+    """Same construction as `base_sha` above, and the same reason"""
     proj = tmp_path / "legacy"
     (proj / ".jarvis").mkdir(parents=True)
     store = ProjectStore(proj)                      # today's schema...
@@ -464,9 +387,7 @@ def test_kind_reaches_a_database_that_already_has_feature_orders(tmp_path):
 
 
 def test_the_validation_tables_and_their_partial_indexes_arrive_on_an_upgrade(tmp_path):
-    """A new TABLE arrives for free on `CREATE TABLE IF NOT EXISTS` — its INDEXES only
-    do if they are in `SCHEMA` too, and the whole polymorphic design rests on two
-    partial unique indexes that no column comparison would ever notice were missing."""
+    """A new TABLE arrives for free on `CREATE TABLE IF NOT EXISTS`"""
     proj = tmp_path / "legacy"
     (proj / ".jarvis").mkdir(parents=True)
     old = sqlite3.connect(proj / ".jarvis" / "jarvis.db")
@@ -494,15 +415,7 @@ def test_the_validation_tables_and_their_partial_indexes_arrive_on_an_upgrade(tm
 
 def test_config_version_reaches_a_database_that_already_has_rounds_and_work_orders(
         tmp_path):
-    """`validation_rounds` already ships, so the round's stamp cannot arrive with the
-    `CREATE TABLE` — same construction, and same reason, as `usage_json` above: the
-    frozen project asset predates the table entirely and would create it fresh.
-
-    The work-order half is the LOUD failure. `dispatch.dispatch_work_order` splats its
-    resolved dict into `update_work_order`, which builds its SQL from the keys with no
-    whitelist, so a stamp added without the `ADDED_COLUMNS` entry raises `no such
-    column` on every dispatch — on live databases only.
-    """
+    """`validation_rounds` already ships, so the round's stamp cannot arrive with the `CREATE TABLE`"""
     proj = tmp_path / "legacy"
     (proj / ".jarvis").mkdir(parents=True)
     ProjectStore(proj).close()                      # today's schema...
@@ -532,9 +445,7 @@ def test_config_version_reaches_a_database_that_already_has_rounds_and_work_orde
 
 def test_legacy_cost_alarms_are_backfilled_exactly_once_however_often_the_store_opens(
         tmp_path):
-    """`_migrate` runs in `ProjectStore.__init__` — every CLI invocation and every
-    reconcile of every project, not once per release. A test that opens the store once
-    and counts rows cannot tell a guarded backfill from an unguarded one."""
+    """`_migrate` runs in `ProjectStore.__init__`"""
     proj = tmp_path / "legacy"
     (proj / ".jarvis").mkdir(parents=True)
     old = sqlite3.connect(proj / ".jarvis" / "jarvis.db")
@@ -564,21 +475,12 @@ def test_legacy_cost_alarms_are_backfilled_exactly_once_however_often_the_store_
     assert rows[0]["reason"] == "being billed"
     assert rows[0]["ts"] == 2.0, "dated when it was raised, not when it was backfilled"
     assert rows[0]["id"].startswith("al-")
-    # SKIPPED, not RAISED: `raised` is the supervisor's work queue, and history landing
-    # in it would spend one model call per legacy alarm on turns that ended weeks ago.
+    # SKIPPED, not RAISED: `raised` is the supervisor's work queue
     assert {r["status"] for r in rows} == {"skipped"}
 
 
 def test_assumptions_that_predate_the_new_columns_still_read_as_the_users(tmp_path):
-    """The schema tests above compare SHAPES. This one has a ROW in the stale database.
-
-    Auto-review added five columns to `assumptions`, and the one that matters is
-    `decided_by`: `''` means the user, because every row written before the column
-    existed was, by construction, theirs. That is an assumption about what `ALTER TABLE
-    … DEFAULT ''` does to existing rows, and it is load-bearing — `ops.assumption_decider`
-    reads a blank as "you", so a NULL arriving instead would make an old row render as
-    the OS's decision. A shape comparison cannot see that; only a row can.
-    """
+    """The schema tests above compare SHAPES"""
     from jarvis import ops
     from jarvis.project_store import ProjectStore as PS
 
@@ -602,7 +504,7 @@ def test_assumptions_that_predate_the_new_columns_still_read_as_the_users(tmp_pa
 
     assert row["content"] == "picked postgres over sqlite"
     assert row["status"] == "accepted"
-    # The five new columns arrived with their defaults, and the blank reads as the user.
+    # The five new columns arrived with their defaults, and the blank reads as the user
     assert row["decided_by"] == ""
     assert row["decided_reason"] == "" and row["decided_model"] == ""
     assert row["decided_config_version"] is None and row["neo_question_id"] is None
@@ -612,14 +514,7 @@ def test_assumptions_that_predate_the_new_columns_still_read_as_the_users(tmp_pa
 
 def test_a_turn_that_predates_the_context_ledger_reads_as_not_recorded(tmp_path,
                                                                       monkeypatch):
-    """kn-c712a5d6: a column is untested until a test WRITES it and a test reads a row
-    that PREDATES it. `tests/test_context.py` covers the write; this is the other half.
-
-    The frozen 0.1.11 asset has no `wo_turns` at all, so the table is built here in its
-    pre-ledger shape — which is the live database this migration actually meets: one whose
-    `wo_turns` arrived in a later release and whose rows have no `context_json`. NULL must
-    read as "not recorded", never as an empty table or a zero-sized window.
-    """
+    """kn-c712a5d6: a column is untested until a test WRITES it and a test reads a row that PREDATES it"""
     from jarvis import ops
     from jarvis.project_store import ProjectStore as PS
 
@@ -662,17 +557,7 @@ def test_a_turn_that_predates_the_context_ledger_reads_as_not_recorded(tmp_path,
 
 
 def test_an_order_that_predates_the_self_evolution_columns_is_not_a_fix_order(tmp_path):
-    """§7.1 of docs/superpowers/specs/2026-09-27-self-evolution.md, and the half that is
-    easy to skip: `tests/test_stores.py` WRITES the four columns on a fresh database,
-    and this READS a row written before they existed.
-
-    `work_orders` already ships, so the columns reach a live database only through
-    `ADDED_COLUMNS` — omitting them there makes every live database fail on read while
-    every new install passes its tests. Nullable and no backfill: a pre-existing row
-    reads NULL on all four, which says "not a fix order", and that is true of every row
-    written before this feature. `rules.precheck` returns None for exactly that row, so
-    the gate is invisible to the fleet's ordinary work.
-    """
+    """§7.1 of docs/superpowers/specs/2026-09-27-self-evolution.md"""
     from jarvis import rules
 
     proj = tmp_path / "legacy-fix-order"
@@ -701,15 +586,7 @@ def test_an_order_that_predates_the_self_evolution_columns_is_not_a_fix_order(tm
 
 
 def test_an_order_that_predates_the_autopsy_column_reads_as_never_sealed(tmp_path):
-    """kn-c712a5d6's other half for `autopsy_json`: `tests/test_autopsy.py` writes the
-    column, and this reads a row that PREDATES it.
-
-    The frozen 0.1.11 asset has no autopsy pair at all, so the migration is what must add
-    it. NULL is the honest answer for an order that settled before the seal existed — never
-    an empty payload, which would read as "this order did nothing" — and such a row stays
-    on the queue, which is exactly how the backlog of already-settled orders gets read
-    while their transcripts are still on disk.
-    """
+    """kn-c712a5d6's other half for `autopsy_json`: `tests/test_autopsy.py` writes the column"""
     from jarvis import autopsy
 
     proj = tmp_path / "legacy-autopsy"
@@ -735,13 +612,12 @@ def test_an_order_that_predates_the_autopsy_column_reads_as_never_sealed(tmp_pat
         store.close()
 
 
-#: An arbitrary epoch the backfill fixtures hang off.
+#: An arbitrary epoch the backfill fixtures hang off
 SPAN_T0 = 1_700_000_000.0
 
 
 def legacy_with_history(tmp_path) -> Path:
-    """A database from the live release holding one work order's status events and one
-    feature order, and no `wo_state_spans` at all."""
+    """A database from the live release holding one work order's status events and one feature order"""
     import json
 
     proj = tmp_path / "legacy-spans"
@@ -768,12 +644,7 @@ def spans_of(store: ProjectStore, order_id: str) -> list[tuple]:
 
 
 def test_status_events_are_backfilled_as_spans_exactly(tmp_path):
-    """The historical status trail, reproduced — spec §3 of
-    docs/superpowers/specs/2026-09-27-time-in-each-state.md.
-
-    The duplicate consecutive event is the one the store now prevents at the source; a
-    zero-length span for it in the history would inflate the entry count.
-    """
+    """The historical status trail, reproduced (docs/superpowers/specs/2026-09-27-time-in-each-state.md)"""
     store = ProjectStore(legacy_with_history(tmp_path))       # the upgrade
     try:
         assert spans_of(store, "wo-old") == [
@@ -787,12 +658,7 @@ def test_status_events_are_backfilled_as_spans_exactly(tmp_path):
 
 
 def test_a_historical_feature_order_gets_one_approximate_span(tmp_path):
-    """A feature order has no event trail, so its history is one coarse span and says so.
-
-    The row is written straight into `feature_orders` rather than through
-    `create_feature_order`, because what is under test is a feature order that predates
-    the spans table — the shipped asset has no `feature_orders` at all.
-    """
+    """A feature order has no event trail, so its history is one coarse span and says so"""
     proj = legacy_with_history(tmp_path)
     first = ProjectStore(proj)
     try:
@@ -813,7 +679,7 @@ def test_a_historical_feature_order_gets_one_approximate_span(tmp_path):
 
 
 def test_the_backfill_is_idempotent_across_opens(tmp_path):
-    """`_migrate` runs in `__init__` — every CLI invocation and every reconcile."""
+    """`_migrate` runs in `__init__` — every CLI invocation and every reconcile"""
     proj = legacy_with_history(tmp_path)
     first = ProjectStore(proj)
     try:

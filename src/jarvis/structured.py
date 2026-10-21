@@ -1,35 +1,4 @@
-"""Ask a model for strict JSON, validate it, and optionally retry.
-
-Models asked for "reply with JSON and nothing else" mostly comply, and the rest of the
-time they fence it, apologise before it, or explain it afterwards. Every caller that
-wants a machine-readable answer therefore needs the same three steps — pull one object
-out of chatty text, check its shape, decide what to do when it is wrong — and the third
-step is the one worth sharing, because the two sensible answers to it are opposites:
-
-* **Fail safe.** Neo's live answering path (`neo.parse_verdict`) turns an unusable reply
-  into a synthetic escalation, so a garbled answer reaches the user instead of a worker.
-  That is `on_invalid=<a fallback>` with `attempts=1`: never retry, never raise, always
-  return something the caller can act on.
-* **Retry.** A caller that can afford a second round trip asks again, with the
-  validator's complaint appended, and lets the failure propagate if that fails too.
-  That is `attempts=2, on_invalid=None`.
-
-`coerce` is exactly `request`'s `attempts=1` body applied to a reply already in hand —
-`request`'s final attempt calls it, so the two cannot drift apart. Nothing here holds
-policy of its own: `parse_json_object` returns `None` rather than raising or inventing an
-empty dict, and `validate` belongs to the caller.
-
-ONE REPAIR IS ATTEMPTED, AND ONLY ONE. A reply that is complete except for the closing
-brackets is closed and re-parsed (`close_unterminated`); anything cut off mid-value is
-not, because the two failures look nothing alike from the caller's side. The first costs
-a byte and, for Neo, an unnecessary interruption of the user. The second would cost a
-worker a truncated answer it could not tell from a whole one.
-
-THE RETRY APPENDS TO THE USER PROMPT ONLY. `system_prompt` is passed through byte-identical
-on every attempt, because that is what keeps consecutive calls inside the Anthropic
-prompt cache — a retry that rewrote the system prompt would cost a full cache miss, and
-prefix stability is the reason Neo's prompt is built the way it is (see `neo`'s docstring).
-"""
+"""Ask a model for strict JSON, validate it, and optionally retry"""
 
 from __future__ import annotations
 
@@ -40,35 +9,22 @@ from typing import Any, Callable
 
 from . import claude_cli
 
-#: The default transport. A caller of `request` that records its calls itself through
-#: `on_usage` declares that with `records_itself=`; one that does not is attributed by the
-#: transport, which is what an eval or a script wants.
+#: The default transport
 DEFAULT_CALL = claude_cli.run_headless_result
 
-#: One JSON object out of possibly-fenced, possibly-chatty output. GREEDY on purpose:
-#: it spans from the first `{` to the LAST `}`, so a nested object survives and a
-#: trailing ``` fence does not. The cost is that two separate objects in one reply match
-#: as one unparseable span — a reply that said two things is not a reply that said one,
-#: so refusing it is the right answer rather than silently taking the first. That case
-#: survives the `close_unterminated` repair untouched, because two whole objects are
-#: already bracket-balanced and the repair only ever APPENDS closers.
-#: `tests/test_structured.py` pins this input by input.
+#: One JSON object out of possibly-fenced, possibly-chatty output
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
-#: Prefix for the complaint appended to the user prompt on a retry.
+#: Prefix for the complaint appended to the user prompt on a retry
 RETRY_NOTE = "Your previous reply could not be used: "
 
 
 class InvalidOutput(ValueError):
-    """The model's reply was not the JSON object the caller asked for.
-
-    Raised by `coerce`/`request` when nothing parses. A `validate` callback is welcome to
-    raise it too, but is not required to — anything it raises is caught the same way.
-    """
+    """The model's reply was not the JSON object the caller asked for"""
 
 
 def _load_object(text: str) -> dict[str, Any] | None:
-    """`json.loads(text)` when it yields an object, `None` on anything else."""
+    """`json.loads(text)` when it yields an object, `None` on anything else"""
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
@@ -77,29 +33,7 @@ def _load_object(text: str) -> dict[str, Any] | None:
 
 
 def close_unterminated(text: str) -> str | None:
-    """`text` plus the `}`/`]` its still-open containers need, or `None`.
-
-    CLOSERS ONLY, and that restraint is the whole safety argument. An unterminated
-    string is not closed, a dangling comma is not trimmed, a missing value is not
-    invented — those are the shapes a reply cut off MID-VALUE takes, and a repair that
-    guessed at them would hand a caller half an answer wearing a whole answer's shape.
-    What this repairs is the one failure it costs nothing to be sure about: a model that
-    finished its last value and then forgot the brackets around it. Everything else still
-    fails to parse, and for Neo still fails toward the user (see `neo.parse_verdict`).
-
-    `None` means "not repairable this way": already balanced (so the caller's parse
-    failed for some other reason, and appending nothing cannot change that), ended inside
-    a string, ended on a bare number, or closed a bracket it never opened. Note the scan
-    is STRING-AWARE — a naive count calls `{"a": "}"}` unbalanced.
-
-    THE NUMBER IS THE SUBTLE ONE. `{"n": 12` closes to `{"n": 12}` and parses, so nothing
-    downstream would ever know the reply might have been cut out of the middle of 123456;
-    a digit is the only JSON token whose prefix is itself a valid token. Strings are
-    refused because they need a quote invented, and `true`/`false`/`null` are
-    self-delimiting, so numbers are the one case where closers alone silently change a
-    value rather than failing. Refused for that reason, at the cost of an escalation in
-    the case where the model merely forgot the brace after a number.
-    """
+    """`text` plus the `}`/`]` its still-open containers need, or `None`"""
     stack: list[str] = []
     in_string = escaped = False
     for ch in text:
@@ -124,24 +58,7 @@ def close_unterminated(text: str) -> str | None:
 
 
 def parse_json_object(raw: str) -> dict[str, Any] | None:
-    """Pull one JSON object out of `raw`, or return `None`.
-
-    No policy: `None` means "there was nothing to parse", not "an empty answer". A caller
-    that wants an exception or a fallback builds it on top — see `coerce`.
-
-    When nothing decodes, ONE repair is attempted: `close_unterminated` appends the
-    closing brackets an otherwise-complete object is missing. That is not politeness to a
-    sloppy model, it is a measured cost — Neo answered question 145 with 3161 characters
-    of perfect JSON and no final `}` (`stop_reason: end_turn`, so not even a truncation),
-    the greedy span stopped at the nested `dispatch` block's brace, and one absent byte
-    escalated a settled answer to the user. Three spans are tried, longest shot last: the
-    greedy match, which drops trailing prose; everything from the first `{`, which is all
-    there is when the closing brace never arrived at all and `_JSON_RE` therefore never
-    matched; and that same tail with a trailing ``` fence off it. Trimming the fence is
-    not a rewrite of the model's JSON — it is the same thing the greedy expression
-    already does to its right edge, done for a reply whose last brace is missing and
-    whose fence therefore has nothing to hide behind.
-    """
+    """Pull one JSON object out of `raw`, or return `None`"""
     raw = raw or ""
     start = raw.find("{")
     if start < 0:
@@ -161,18 +78,27 @@ def parse_json_object(raw: str) -> dict[str, Any] | None:
     return None
 
 
+def parse_json_objects(raw: str) -> list[dict[str, Any]]:
+    """Every successive top-level JSON OBJECT in `raw`, prose between them skipped (#1098)"""
+    raw = raw or ""
+    decoder = json.JSONDecoder()
+    out: list[dict[str, Any]] = []
+    i = raw.find("{")
+    while i >= 0:
+        try:
+            data, end = decoder.raw_decode(raw, i)
+        except json.JSONDecodeError:
+            i = raw.find("{", i + 1)
+            continue
+        if isinstance(data, dict):
+            out.append(data)
+        i = raw.find("{", max(end, i + 1))
+    return out
+
+
 def coerce(raw: str, validate: Callable[[dict[str, Any]], Any],
            on_invalid: Callable[[str], Any] | None = None) -> Any:
-    """Parse + validate a reply already in hand. `request`'s `attempts=1` body.
-
-    Returns `validate(parsed)`. If nothing parses, or `validate` raises, hands the RAW
-    string to `on_invalid` and returns whatever that returns; with `on_invalid=None` the
-    failure propagates instead.
-
-    Any exception from `validate` is caught, not just `InvalidOutput`: `on_invalid` is a
-    fail-safe, and a fail-safe that only covers the failures someone anticipated is not
-    one. Pass `on_invalid=None` when you would rather see the traceback.
-    """
+    """Parse + validate a reply already in hand"""
     try:
         return _parse_and_validate(raw, validate)
     except Exception:
@@ -188,35 +114,11 @@ def request(prompt: str, *, validate: Callable[[dict[str, Any]], Any],
             call: Callable[..., Any] = DEFAULT_CALL,
             on_usage: Callable[[Any], None] | None = None,
             records_itself: str = "") -> Any:
-    """Ask a model for strict JSON and return the validated value.
-
-    Makes at most `attempts` calls. Each failed attempt appends the validator's complaint
-    to the USER prompt (never the system prompt — see the module docstring) and asks
-    again from scratch. After the last attempt the reply goes through `coerce`, so
-    `on_invalid` decides between a fallback value and a raised exception.
-
-    `call` is the model transport, defaulting to `DEFAULT_CALL`; it is
-    called as `call(prompt, system_prompt=…, model=…, timeout=…, cwd=…)`. Override it to
-    strip the callee's tools (`functools.partial(claude_cli.run_headless_result,
-    tools="")`) or, in a test, to record what was asked. A transport that returns a bare
-    string still works — see `claude_cli.unpack_headless`. Transport failures —
-    `claude_cli.ClaudeCliError` — propagate untouched: a call that never happened is not
-    invalid output, and callers already tell those two apart (see `neo.drain_queue`).
-
-    `records_itself` is the `agent_calls.kind` the caller's own `on_usage` writes, passed
-    to `call` ONLY when non-empty so no test fake's captured kwargs change (spec §5).
-    Declaring it WITHOUT an `on_usage` is refused: this function forwards a declaration
-    rather than making one, and a declaration nobody records is the #749 hole.
-
-    `on_usage(envelope)` is called ONCE PER ATTEMPT, before the reply is validated. A
-    retry is a second call the OS paid for, and an accounting that only recorded the
-    attempt that happened to parse would quietly under-report exactly the calls that went
-    worst. See `agent_usage`.
-    """
+    """Ask a model for strict JSON and return the validated value (#749)"""
     if attempts < 1:
         raise ValueError(f"attempts must be at least 1, got {attempts}")
     if records_itself and on_usage is None:
-        # Before the first attempt, so a refused call spends nothing (spec §2).
+        # Before the first attempt, so a refused call spends nothing (spec §2)
         raise claude_cli.AttributionRefused(
             f"records_itself={records_itself!r} says this caller records the call itself "
             "and no on_usage was given: nothing would record it. Pass an "

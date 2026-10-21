@@ -1,37 +1,4 @@
-"""The verdict an investigator submits, and the structural checks it must survive.
-
-An investigation order's investigator finishes by handing back a verdict: what is wrong
-with ONE subject, why, and which of four things the OS should do about it
-(`jarvis investigate verdict <inv-id> --from-file verdict.json`). This module owns that
-document's shape and validates it *before* anything is stored, anything is filed, or any
-of the user's attention is spent.
-
-A leaf module beside `findings.py` and deliberately NOT inside it — §2.4 of
-docs/superpowers/specs/2026-09-27-investigation-orders.md. `findings.parse_report` is a
-MULTI-finding document with `MAX_FINDINGS`, per-finding `key` slugs and `proposed_orders`;
-a verdict is exactly one diagnosis whose required payload depends on its classification.
-One parser for both would branch on document shape in every function, which is how a
-validator stops being more trustworthy than the thing it checks. What IS shared is the
-evidence rule: `findings.parse_evidence` and `findings.MIN_QUOTE_CHARS` are imported, so
-there is one definition of what a quote is.
-
-The rejections, and what each is guarding:
-
-* **A payload that does not match its classification.** The one structural rule, because
-  a verdict whose payload contradicts its classification is the failure that most looks
-  like success: a `GAP` with no `proposed_fix` settles an order having filed nothing, and
-  a `TRANSIENT` carrying `user_owes` says the user owes something while telling the OS to
-  wait.
-* **A `proposed_fix` `bugreport.report_bug` would refuse.** `ops` files a GAP as an
-  expedited bug and that call needs `expected` and `actual` (§2.5). Refusing here costs
-  one revision; refusing there costs a settled order with nothing filed.
-* **Evidence that cannot be checked**, on `findings`' floor.
-* **A subject that is not this order's.** A verdict about something else is not a verdict
-  about this order.
-* **A document over `MAX_VERDICT_CHARS`.** A diagnosis cites commands and quotes decisive
-  lines; a pasted diff or transcript is what this refuses, on
-  `sections.QUESTION_MAX_CHARS`' pattern.
-"""
+"""The verdict an investigator submits, and the structural checks it must survive (docs/superpowers/specs/2026-09-27-investigation-orders.md)"""
 
 from __future__ import annotations
 
@@ -45,24 +12,19 @@ from . import findings, gaps
 if TYPE_CHECKING:  # pragma: no cover
     from .project_store import ProjectStore
 
-#: The four decisions an investigation can reach about its subject. A classification is a
-#: decision about THE SUBJECT, not about the codebase in general.
+#: The four decisions an investigation can reach about its subject
 CLASSIFICATIONS = ("GAP", "WAITING_ON_USER", "TRANSIENT", "ALREADY_TRACKED")
 
-#: Shared with `findings`, never re-declared: two floors for one rule drift, and the
-#: investigator's quotes come out of the same records an analyst's do.
+#: Shared with `findings`, never re-declared: two floors for one rule drift
 MIN_QUOTE_CHARS = findings.MIN_QUOTE_CHARS
 
-#: Shortest a prose field can be and still be a diagnosis rather than a label.
+#: Shortest a prose field can be and still be a diagnosis rather than a label
 MIN_FIELD_CHARS = findings.MIN_FIELD_CHARS
 
-#: How big the whole submitted document may be. A BOUND ON INPUTS, not a storage limit:
-#: the investigator lives in `gh pr diff` and `jarvis inspect`, and the failure mode is a
-#: pasted diff — #797 is the standing example of a payload that could never fit anywhere
-#: it was going. Cite the command and quote the decisive line instead.
+#: How big the whole submitted document may be (#797)
 MAX_VERDICT_CHARS = 20000
 
-#: Required beyond the common four, per classification.
+#: Required beyond the common four, per classification
 REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "GAP": ("proposed_fix",),
     "WAITING_ON_USER": ("user_owes",),
@@ -70,9 +32,7 @@ REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "ALREADY_TRACKED": ("duplicate_of",),
 }
 
-#: Forbidden per classification — the other half of the same rule, spelled rather than
-#: derived: "everything not required is forbidden" would be wrong the first time a
-#: classification grows a legitimate optional field.
+#: Forbidden per classification — the other half of the same rule
 FORBIDDEN_FIELDS: dict[str, tuple[str, ...]] = {
     "GAP": ("user_owes", "unsticks", "duplicate_of"),
     "WAITING_ON_USER": ("proposed_fix", "unsticks"),
@@ -80,29 +40,16 @@ FORBIDDEN_FIELDS: dict[str, tuple[str, ...]] = {
     "ALREADY_TRACKED": ("proposed_fix",),
 }
 
-#: Every field of a `proposed_fix`, and nothing is optional: `report_bug` refuses without
-#: `expected`/`actual`, `priority` is never inferred (its own ruling), and a description
-#: that does not brief a stranger briefs nobody.
-#: `detector` and `remedy` are Appendix A.3's addition, appended with no per-field
-#: exception: `detector` is the predicate over STATE that would have recognised this, and
-#: `remedy` the `remedies.REMEDIES` id that clears it (or `none`, with the reason it is
-#: unsafe to automate). They are the fix order's acceptance criteria — a fix that turns
-#: the symptom green and leaves the OS just as blind is what they refuse.
+#: Every field of a `proposed_fix`
 PROPOSED_FIX_FIELDS = ("title", "description", "expected", "actual", "priority",
                        "detector", "remedy")
 
-#: What `duplicate_of` may name: a tracker issue (`#n` or a URL) or an order id. Anything
-#: else is a sentence, and a sentence is not a link the user can follow.
+#: What `duplicate_of` may name: a tracker issue (`#n` or a URL) or an order id
 _DUPLICATE_RE = re.compile(r"^(?:#\d+|https?://\S+|(?:wo|fo|io|inv)-[0-9a-f]+)$")
 
 
 class VerdictError(ValueError):
-    """A submitted verdict that cannot be accepted. Message names every problem found.
-
-    One exception carrying all of them, not the first: an investigator that has to
-    re-submit per problem burns a session round trip per line of the error it could have
-    had at once. Mirrors `findings.FindingsError` and `plans.PlanError`.
-    """
+    """A submitted verdict that cannot be accepted"""
 
     def __init__(self, problems: list[str]):
         self.problems = problems
@@ -110,16 +57,7 @@ class VerdictError(ValueError):
 
 
 def parse_verdict(raw: Any, subject: str = "") -> dict[str, Any]:
-    """Validate a submitted verdict and return it normalised.
-
-    Raises `VerdictError` carrying EVERY problem, never the first one found. `subject` is
-    the order's RECORDED subject when the caller has one (`ops.submit_verdict` always
-    does); empty means "do not check it", which is what a direct validator test wants.
-
-    Nothing about filing is written here — `filed`, `classified_by`,
-    `submitted_classification` and `filing_error` are `ops`' to write (§2.4), and keeping
-    them out is what lets this stay pure.
-    """
+    """Validate a submitted verdict and return it normalised"""
     problems: list[str] = []
     if not isinstance(raw, dict):
         raise VerdictError(
@@ -179,18 +117,7 @@ def parse_verdict(raw: Any, subject: str = "") -> dict[str, Any]:
 
 
 def _gap_class(raw: dict[str, Any], problems: list[str]) -> str:
-    """The class slug, required on ALL FOUR classifications — Appendix A.3.
-
-    SHAPE ONLY, via `gaps.checked_slug`: a well-formed slug nobody has registered is
-    accepted, because the first occurrence of a mechanism nobody has named is exactly the
-    case an investigation exists for (A.2's two tiers). Checking membership in
-    `gaps.GAP_CLASSES` here would force the investigator to pick the nearest existing slug
-    and record a lie.
-
-    Required on `WAITING_ON_USER` and `TRANSIENT` too: "four investigations on
-    `awaiting-signin` and every one ended WAITING_ON_USER" is a finding about the OS, and
-    excluding the non-GAP classifications would delete exactly that signal.
-    """
+    """The class slug, required on ALL FOUR classifications — Appendix A.3"""
     raw_value = raw.get("gap_class")
     if not str(raw_value or "").strip():
         problems.append(
@@ -209,11 +136,7 @@ def _gap_class(raw: dict[str, Any], problems: list[str]) -> str:
 
 def _payload(classification: str, raw: dict[str, Any],
              problems: list[str]) -> dict[str, Any]:
-    """The classification-dependent half, required and forbidden together.
-
-    Together rather than in two passes: the two rules are one statement about one
-    classification, and an investigator reading the error has to see both halves of it.
-    """
+    """The classification-dependent half, required and forbidden together"""
     out: dict[str, Any] = {}
     for name in FORBIDDEN_FIELDS[classification]:
         if raw.get(name):
@@ -264,12 +187,11 @@ def _why_forbidden(classification: str, name: str) -> str:
 
 
 def _parse_fix(raw: Any, problems: list[str]) -> dict[str, str]:
-    """The bug report a GAP verdict names. Validated against what `report_bug` demands,
-    so a verdict that passes here cannot fail at filing time for a missing field."""
+    """The bug report a GAP verdict names"""
     if not isinstance(raw, dict):
         problems.append(
             f"a GAP verdict must carry `proposed_fix`, an object with "
-            f"{', '.join(PROPOSED_FIX_FIELDS)} — ops files it as an expedited bug, and "
+            f"{', '.join(PROPOSED_FIX_FIELDS)} — ops files it as a bug, and "
             f"nothing else in the verdict says what to file"
         )
         return {}
@@ -293,11 +215,7 @@ def _parse_fix(raw: Any, problems: list[str]) -> dict[str, str]:
 
 
 def _parse_unsticks(raw: Any, problems: list[str]) -> dict[str, str]:
-    """Why a TRANSIENT verdict settles silently: the mechanism that clears it, and when.
-
-    Both halves required. "It will sort itself out" with no mechanism is the reading that
-    leaves an order parked for ever while the record says it is fine.
-    """
+    """Why a TRANSIENT verdict settles silently: the mechanism that clears it, and when"""
     if not isinstance(raw, dict):
         problems.append(
             "a TRANSIENT verdict must carry `unsticks`, an object with `what` (the "
@@ -315,18 +233,7 @@ def _parse_unsticks(raw: Any, problems: list[str]) -> dict[str, str]:
 
 
 def verdict_stored(store: ProjectStore, wo: dict[str, Any]) -> bool:
-    """Is THIS investigator's verdict already filed? One premise, two readers.
-
-    §2.2 and §2.4 of docs/superpowers/specs/2026-10-01-a-submitted-verdict-must-settle-
-    its-investigator.md. HERE and not in `ops`, because `budget.escalate` is the other
-    reader and `budget` importing `ops` is a cycle; the store is an argument so this
-    stays a question about rows.
-
-    TRUE THE INSTANT `update_feature_order(plan=…)` COMMITS, which is what makes it
-    survive the race §2.2 is about: the verdict is stored before the status is written
-    and before the turn exits, so a cap crossed in between is still a cap crossed on
-    work that is already over.
-    """
+    """Is THIS investigator's verdict already filed?"""
     from . import db
 
     if wo.get("kind") != "investigator" or not wo.get("parent_id"):
@@ -339,22 +246,13 @@ def verdict_stored(store: ProjectStore, wo: dict[str, Any]) -> bool:
 
 
 def settle_headline(inv_id: str, verdict: dict[str, Any]) -> str:
-    """The attention line a WAITING_ON_USER verdict raises — §2.5, step 6.
-
-    The only classification that raises attention, so this says what the user OWES and
-    where, not that an investigation finished.
-    """
+    """The attention line a WAITING_ON_USER verdict raises — §2.5, step 6"""
     return (f"{inv_id}: {verdict.get('subject', '')} is waiting on you — "
             f"{verdict.get('user_owes', '')} (`jarvis investigate show {inv_id}`)")
 
 
 def render_verdict(verdict: dict[str, Any]) -> list[str]:
-    """One verdict as lines a human reads: the decision first, then the argument.
-
-    The classification leads, because it is what decides whether anything was filed and
-    whether the user owes something — `jarvis investigate show` and the dashboard page
-    both open on it (§2.9).
-    """
+    """One verdict as lines a human reads: the decision first, then the argument"""
     lines = [
         f"  classification: {verdict.get('classification', '')}"
         + (f" [{verdict['gap_class']}"

@@ -1,15 +1,4 @@
-"""The supervisor: it reads an alarm and acks it, wants Neo, or proposes a remedy.
-
-docs/superpowers/specs/2026-08-31-the-supervisor.md §2, widened by §5 of
-docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md. Every threshold is
-`catalog.SupervisorConfig`; the module holds no numbers of its own.
-
-THE VERDICT VOCABULARY IS EXACTLY `{ack, escalate, propose}`, AND `propose` IS STILL NOT
-AN ACTION. This module names an id from `remedies.REMEDIES` and files a gate request; it
-never messages a worker, cancels a turn or sets a status, and it holds no remedy's prose,
-target or handler — a safety rule pinned by an AST walk over this file, not by the
-persona (`tests/test_supervisor.py`). `remedies.py` acts, and only under a grant.
-"""
+"""The supervisor: it reads an alarm and acks it, wants Neo, or proposes a remedy (docs/superpowers/specs/2026-08-31-the-supervisor.md §2)"""
 
 from __future__ import annotations
 
@@ -196,63 +185,28 @@ An escalation may carry one optional label, which is grouped and reported:
   "cause": "<on an escalation, name the cause from this list; omit it if none fits: \
 evidence-insufficient | user-decision>\""""
 
-#: User-facing copy: inbox rows reach every sink, Telegram included. Here rather than at
-#: the two call sites because §2's ack and §3's advice are the same row to a reader, and
-#: two copies of a title is how they come to word it differently.
+#: User-facing copy: inbox rows reach every sink, Telegram included
 ACK_INBOX_TITLE = "Supervisor cleared an alarm on {wo_id}"
 ADVICE_INBOX_TITLE = "Neo cleared an alarm on {wo_id}"
 ESCALATED_INBOX_TITLE = "A cost alarm needs you: {alarm_id}"
 
-#: The alarm's own page — the anchor `/alarms` cannot be, since a list has no per-row
-#: identity. Mirrors `timeline._ref`'s `alarm` kind, which is where a work order's
-#: timeline points at the same object.
+#: The alarm's own page — the anchor `/alarms` cannot be, since a list has no per-row identity
 ALARM_PATH = "/alarms/{project}/{alarm_id}"
 
-#: The attention reason an unsettled alarm carries. One string, because the supervisor
-#: writes it when it cannot reach Neo and the daemon writes it when Neo hands the alarm
-#: back, and a flag worded two ways reads as two different problems.
+#: The attention reason an unsettled alarm carries
 ALARM_BLOCKER = "cost alarm {alarm_id} needs you — `jarvis alarms show {alarm_id}`"
 
-#: `verdict_reason` on an alarm Neo answered. NAMES NEO because the column is read on
-#: `/alarms` and by `jarvis alarms show` beside alarms the supervisor settled alone, and
-#: those are two different judgements by two different agents.
+#: `verdict_reason` on an alarm Neo answered
 NEO_ANSWERED_REASON = "escalated to Neo, which answered: {reason}"
 
-#: `review` recognises the unreadable-output path by this prefix, as `neo` does.
+#: `review` recognises the unreadable-output path by this prefix, as `neo` does
 UNREADABLE_PREFIX = "unreadable supervisor output: "
 
 
 def build_system_prompt(store: Any, project: str,
                         learnings_limit: int | None = None,
                         probes: Any = (), armed_remedies: Any = ()) -> str:
-    """Persona + learnings + (optionally) a symptom checklist, byte-stable per project
-    so consecutive reviews share a cached prefix.
-
-    `probes=()` MUST PRODUCE EXACTLY WHAT THIS FUNCTION PRODUCED BEFORE THE CHECKLIST
-    EXISTED, down to the byte, and a committed literal in `tests/test_probes.py` pins it.
-    The
-    cost review (§2 of the supervisor spec) and the health sweep
-    (docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md §4) share this
-    function, and a checklist header appended unconditionally would move the cost
-    review's cached prefix and silently reprice every review. The checklist is APPENDED
-    rather than interleaved for the same reason: the sweep's prompt extends the review's
-    prefix instead of forking it.
-
-    `neo_store.SUPERVISOR_SEAT` is a LEARNING SCOPE, not a panel seat — see
-    `neo_store.LEARNING_SCOPES`. Rendering goes through `neo.render_learnings` so the
-    character budget, the oldest-first truncation that keeps this block append-only and
-    the "N older learnings not shown" note are the ones Neo and every panel seat already
-    obey; a second renderer is how the blocks come to differ.
-
-    `armed_remedies` obeys the same rule as `probes` and for the same reason: the empty
-    default must leave the prompt byte-identical, so a project that arms nothing pays
-    nothing and the cost review's cached prefix does not move. WHICH remedies are armed
-    is per project, so the list cannot live in the persona constant — the persona says
-    what `propose` means and this says what may be proposed here (§5).
-
-    `None` means `catalog.SupervisorConfig.learnings_limit` — the default lives there,
-    not here.
-    """
+    """Persona + learnings + (optionally) a symptom checklist (docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md §4)"""
     from . import neo, probes as probes_mod, remedies as remedies_mod
     from .catalog import SupervisorConfig
     from .neo_store import SUPERVISOR_SEAT
@@ -274,25 +228,7 @@ def build_system_prompt(store: Any, project: str,
 
 
 def learning_from_review(alarm: dict[str, Any], feedback: str) -> str:
-    """Distil the user's correction of a verdict into what the next review is shown.
-
-    Separate from `neo.learning_from_review` rather than a widening of it: that one takes
-    a Neo question and an alarm is not one, so accepting both shapes would put a branch in
-    the middle of Neo's own review path for no gain (§6).
-
-    Nothing here is clipped. Every component but `feedback` is already bounded by a
-    `SupervisorConfig` setting at the moment it was written, and the one that is not is
-    the user's own ruling — which is exactly the text `render_learnings` is written never
-    to drop silently.
-
-    TWO WIDENINGS, AND THE COST WORDING IS BYTE-IDENTICAL EITHER SIDE OF THEM (§6 of
-    docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md). A health
-    finding's `kind` is a probe id, not a cost alarm's kind, and "on a no-progress alarm"
-    would teach the next review a vocabulary the OS does not have. And a `propose`
-    verdict IS the remedy: without naming it and its argument, "you were right that it
-    was stuck, wrong to nudge it" and "you should have nudged it" distil to the same
-    sentence.
-    """
+    """Distil the user's correction of a verdict into what the next review is shown (docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md)"""
     subject = (f"a {alarm.get('probe')} health finding"
                if alarm.get("source") == "health" else f"a {alarm.get('kind')} alarm")
     decided = alarm.get("verdict")
@@ -310,32 +246,19 @@ def _clip(text: str, limit: int) -> str:
 
 
 def _what_it_is(wo: dict[str, Any]) -> str:
-    """What KIND of session is burning, in the judge's words.
-
-    Every alarm is raised against a `work_orders` row (`Daemon.check_burning_turns` walks
-    the running ones), but `WO_KINDS` has five members: two belong to a FEATURE order, one
-    to an IMPROVEMENT order and one to an INVESTIGATION, so "a work order" alone hides the
-    thing that most
-    changes what normal looks like. A planner reading a whole codebase for an hour is
-    doing its job; a worker doing the same on a one-file fix is not. Reported as evidence
-    rather than instructed in the persona, because a judge told to weigh something it
-    cannot see is being asked to guess (PR 173 review).
-    """
+    """What KIND of session is burning, in the judge's words"""
     parent = wo.get("parent_id")
     kind = wo.get("kind") or "worker"
     belongs = f" of feature order {parent}" if parent else ""
     if kind == "analyst":
-        # §3.1 of the improvement-orders spec: it reads records and writes no code, so
-        # read-heavy is normal and product-code edits are the abnormality worth naming.
+        # §3.1 of the improvement-orders spec: it reads records and writes no code
         owns = f" of improvement order {parent}" if parent else ""
         return (f"the ANALYST{owns} — one session reading OS "
                 f"records through the CLI to diagnose a root cause, so it is expected "
                 f"to be read-heavy; a long GENERATING stretch, or any sign of it "
                 f"editing product code, is not")
     if kind == "investigator":
-        # §2.2 of docs/superpowers/specs/2026-09-27-investigation-orders.md, and it says
-        # the sharper thing: its writes are REFUSED by a hook, so a long stretch of
-        # retried denied tool calls is the abnormality — not the reading.
+        # §2.2 of docs/superpowers/specs/2026-09-27-investigation-orders.md
         owns = f" of investigation {parent}" if parent else ""
         return (f"the INVESTIGATOR{owns} — one read-only session diagnosing one stuck "
                 f"order through the CLI, so it is expected to be read-heavy and to end "
@@ -355,26 +278,17 @@ def _what_it_is(wo: dict[str, Any]) -> str:
 
 def _session_lines(wo: dict[str, Any], inspect_cfg: Any,
                    pstore: Any = None) -> list[str]:
-    """The per-turn split — `live_alarms`' own read, re-rendered. No model call.
-
-    THE HOLDS COME WITH IT, and this is the surface where leaving them out costs the
-    most: the reader is a model deciding whether to spend the user's attention, and a
-    turn reported as 18,510 seconds of wall clock with no mention that 14,364 of them
-    were a spent usage window is the OS asking for a judgement on a condition it created
-    itself. `pstore` is optional only so a caller without one degrades to the old lines
-    rather than raising inside an evidence packet.
-    """
+    """The per-turn split — `live_alarms`' own read, re-rendered"""
     from . import autopsy, holds, inspection, ops
 
     session_id = wo.get("session_id") or ""
     if not session_id:
         return ["(the work order has no session)"]
     spans = holds.held(pstore, wo["id"]) if pstore is not None else []
-    # Spec 2026-09-27 §3: the OS's own turn numbers, degrading to 1..N without a store.
+    # Spec 2026-09-27 §3: the OS's own turn numbers, degrading to 1..N without a store
     turn_starts = pstore.turn_starts(wo["id"]) if pstore is not None else []
     try:
-        # Spec 2026-09-27 §4: through the chokepoint, off the full store row this is
-        # already called with, so a settled order's evidence outlives its transcript.
+        # Spec 2026-09-27 §4: through the chokepoint
         anatomy, provenance = autopsy.anatomy_for(
             wo, inspect_cfg, spans=spans, turn_starts=turn_starts,
             cold_prefix_floor=ops.cold_prefix_floor())
@@ -384,23 +298,17 @@ def _session_lines(wo: dict[str, Any], inspect_cfg: Any,
         return ["(no transcript found for this session)"]
 
     lines = []
-    # ONLY when a seal answered (Neo q1080): the derived case is what this packet has
-    # always said, and it is byte-pinned. Said FIRST, like `stalled` below and for its
-    # reason — it changes what every number after it means.
+    # ONLY when a seal answered (Neo q1080): the derived case is what this packet has always said
     if provenance["source"] == autopsy.SEALED:
         lines.append(f"- {provenance['note']} {provenance['level_note']}"
                      + (f" {provenance['floor_note']}" if provenance["floor_note"]
                         else ""))
     for turn in anatomy.turns:
-        # THE COST IS AN INPUT, NOT AN INFERENCE FROM THE DURATION (issue 227). The
-        # per-turn record already existed and no layer read it, so a 65-minute turn that
-        # made no call at all was escalated as "BILLED IN FULL" in the same sentence as
-        # "zero context peak". A turn that bought nothing says so before its clock.
+        # THE COST IS AN INPUT, NOT AN INFERENCE FROM THE DURATION (issue 227)
         spend = turn.usage
         split = ", ".join(f"{getattr(turn, part):.0f}s {part}"
                           for part in inspection.PARTS)
-        # AWAITING FIRST (spec of 2026-09-27 §1): THIS is the line that fed the judge,
-        # and an absent assistant row means a request in flight, not a dead turn.
+        # AWAITING FIRST (spec of 2026-09-27 §1): THIS is the line that fed the judge
         if turn.awaiting:
             stalled = (f"{inspection.awaiting_note(turn)} — nothing has COMPLETED yet; "
                        "this is not a stall. ")
@@ -408,10 +316,7 @@ def _session_lines(wo: dict[str, Any], inspect_cfg: Any,
             stalled = ""
         else:
             stalled = "NO API CALL WAS EVER MADE — it cost nothing. "
-        # Said BEFORE the split, like `stalled` above and for its reason: it changes what
-        # every number after it means, and a judge that reads it last has already decided.
-        # Only where the two clocks differ — a line saying "120s wall, 120s active" on
-        # every unheld turn is the noise that gets the held one skimmed past.
+        # Said BEFORE the split, like `stalled` above and for its reason: it changes what every number after...
         held_by = turn.held_by()
         for cause, seconds in held_by.items():
             stalled += (f"{seconds:.0f}s of this turn was HELD by "
@@ -429,31 +334,26 @@ def _session_lines(wo: dict[str, Any], inspect_cfg: Any,
     for join in anatomy.joins():
         lines.append(f"- blocked {join.seconds:.0f}s on {join.name}: {join.detail}")
     for write in anatomy.writes:
-        # The cause label is what separates an explicable re-write from a defect.
+        # The cause label is what separates an explicable re-write from a defect
         lines.append(f"- cache write {write.written:,} tokens [{write.cause}]: "
                      f"{write.note}")
     return lines or ["(the session has no turns yet)"]
 
 
-#: A child the plan has finished with. Everything else is still in flight, and a health
-#: probe about a feature is nearly always about what is still in flight.
+#: A child the plan has finished with
 SETTLED_CHILD_STATUSES = ("completed", "cancelled")
 
-#: The order the child tree is CLIPPED in, worst first. Named buckets rather than four
-#: integer ranks because `test_nothing_in_the_module_hard_codes_a_threshold` allows this
-#: module no numeric literal, and the names read better than the numbers would anyway.
+#: The order the child tree is CLIPPED in, worst first
 CHILD_TRIAGE = ("failed", "blocked", "unfinished", "settled")
 
-#: A feature with no carrier has nothing on record that anyone said about it, and saying
-#: so is not the same as saying nothing.
+#: A feature with no carrier has nothing on record that anyone said about it
 NO_CARRIER_LINE = ("(no work order carries this feature, so nothing said about it is on "
                    "record)")
 
 
 def _feature_lines(fo: dict[str, Any], carrier: dict[str, Any] | None,
                    cfg: Any) -> list[str]:
-    """`updated_at` IS the status clock: `set_feature_status` goes through
-    `update_feature_order`, which stamps it on every move."""
+    """`updated_at` IS the status clock: `set_feature_status` goes through `update_feature_order`"""
     from . import db
 
     held = max(0.0, db.now() - float(fo.get("updated_at") or 0.0)) / SECONDS_PER_HOUR
@@ -470,9 +370,7 @@ def _feature_lines(fo: dict[str, Any], carrier: dict[str, Any] | None,
 
 
 def _child_rank(child: dict[str, Any]) -> tuple[int, float]:
-    """What survives the clip when the tree does not fit: what is wrong, then what is
-    stuck, then what is oldest and unfinished. A judge shown only the completed half of
-    a feature would call a collapsing one healthy."""
+    """What survives the clip when the tree does not fit: what is wrong"""
     from . import db
 
     status = str(child.get("status") or "")
@@ -501,15 +399,7 @@ def _child_line(child: dict[str, Any]) -> str:
 
 
 def _child_lines(children: list[dict[str, Any]], budget: int) -> list[str]:
-    """The tree, bounded WITHIN its section — it is the one section that scales with the
-    feature rather than with the settings, so whole-section clipping alone would let a
-    twelve-child feature push every later section off the end.
-
-    Chosen by `_child_rank`, RENDERED in the plan's own order: `feature_children` is
-    oldest-first because creation order IS the dependency order, and reading the graph
-    out of order costs the judge its structure. The omission is counted for the same
-    reason the packet's own is stated.
-    """
+    """The tree, bounded WITHIN its section"""
     kept: set[str] = set()
     spent = 0
     for child in sorted(children, key=_child_rank):
@@ -529,9 +419,7 @@ def _child_lines(children: list[dict[str, Any]], budget: int) -> list[str]:
 
 
 def _answered_lines(pstore: Any, fo_id: str) -> list[str]:
-    """What the user already ruled on with `jarvis fo resume`. Without it the supervisor
-    re-reports a decision that has been taken — see §3 on why that is the worst thing
-    this feature could do."""
+    """What the user already ruled on with `jarvis fo resume`"""
     lines = ["# What the user has already answered for"]
     for entry in pstore.superseded_children(fo_id):
         lines.append(f"- {entry.get('wo_id')}: {entry.get('note') or '(no note given)'}")
@@ -552,9 +440,7 @@ def _validation_lines(pstore: Any, fo_id: str, cfg: Any) -> list[str]:
 
 
 def _said_lines(pstore: Any, wo_id: str | None, cfg: Any) -> list[str]:
-    """The last `cfg.quoted_turns` of `timeline.build_conversation`, for a work order or
-    for a feature's CARRIER — one read, because two renderings of what was said is how
-    two surfaces come to quote different things."""
+    """The last `cfg.quoted_turns` of `timeline.build_conversation`"""
     from . import timeline
 
     said = ["# What was last said about this order"]
@@ -571,14 +457,7 @@ def _said_lines(pstore: Any, wo_id: str | None, cfg: Any) -> list[str]:
     return said
 
 
-#: What `blocked: …` says for each `health.BLOCKERS` id, plus the feature answer. The
-#: sentences are the OS's own, because this is a line a judge WEIGHS: alarm al-4bb82f7e
-#: said "the packet does not show why" about an order correctly waiting on a dependency,
-#: and the reason was a column the OS already held.
-#:
-#: The three TRANSPORT ids say WHICH hold it is, and the words are READ FROM
-#: `holds.HOLD_CAUSES` rather than written again here (Neo q1241): the same packet shows
-#: the hold line, and a second wording of one cause drifts from it.
+#: What `blocked: …` says for each `health.BLOCKERS` id, plus the feature answer
 BLOCKED_SENTENCES = {
     "user": "it is waiting on a decision only the user can take",
     "dependency": "it is waiting on a dependency that has not completed",
@@ -593,23 +472,7 @@ BLOCKED_SENTENCES = {
 def build_evidence(pstore: Any, subject: dict[str, Any],
                    alarm: dict[str, Any] | None,
                    cfg: Any = None, inspect_cfg: Any = None) -> str:
-    """Everything the supervisor is shown, under `cfg.evidence_budget_chars`.
-
-    `subject` is `{"kind": "work_order" | "feature_order", "row": <the store row>}`.
-    One builder for both, not two: the alarm section, the budget and the stated omission
-    are the same discipline whichever is being judged, and the work-order packet's bytes
-    are a cached prompt prefix that a second implementation would drift from (§3).
-
-    `alarm=None` IS THE HEALTH SWEEP, which runs before any alarm exists (§4): the alarm
-    section is omitted entirely rather than synthesised. A fabricated row would put a
-    `kind` and a `reason` the OS never raised into the judge's prompt, and the judge
-    cannot tell an invented fact from a recorded one. `review_health` states why it is
-    looking in its own header instead. Neo settled this on question 223.
-
-    THE WORKER'S TRANSCRIPT IS NOT IN HERE and must not be added — see §2 for why. The
-    clip is stated rather than silent: a judge that cannot see it was shown a fraction
-    weighs the fraction as the whole.
-    """
+    """Everything the supervisor is shown, under `cfg.evidence_budget_chars`"""
     from . import db
     from .catalog import InspectConfig, SupervisorConfig
     from .project_store import NO_TURN
@@ -621,8 +484,7 @@ def build_evidence(pstore: Any, subject: dict[str, Any],
     if alarm is not None:
         standing = max(0.0, db.now() - float(alarm.get("ts") or 0.0))
         minutes = standing / SECONDS_PER_MINUTE
-        # A subject-level finding was raised on no turn, and `-1` reaching the
-        # supervisor's own prompt is nonsense it would have to interpret (§3).
+        # A subject-level finding was raised on no turn
         seq = alarm.get("seq")
         raised = ("raised on no particular turn" if seq == NO_TURN
                   else f"raised on turn {seq}")
@@ -635,16 +497,14 @@ def build_evidence(pstore: Any, subject: dict[str, Any],
 
     row = subject["row"]
     if subject["kind"] == "feature_order":
-        # No `_session_lines` here: a feature has no session, and reading the carrier's
-        # would show the judge a transcript of work that is not what it is judging.
+        # No `_session_lines` here: a feature has no session
         fo_id = row["id"]
         carrier = pstore.carrier_for_feature(fo_id)
         rest = [_feature_lines(row, carrier, cfg),
                 _answered_lines(pstore, fo_id),
                 _validation_lines(pstore, fo_id, cfg),
                 _said_lines(pstore, carrier["id"] if carrier else None, cfg)]
-        # An equal share of the budget, so the tree's bound moves with the setting and
-        # this module goes on holding no numbers of its own. `+ 1` counts the tree.
+        # An equal share of the budget, so the tree's bound moves with the setting and this module goes on...
         tree = ["# The child tree",
                 *_child_lines(pstore.feature_children(fo_id),
                               cfg.evidence_budget_chars
@@ -653,16 +513,16 @@ def build_evidence(pstore: Any, subject: dict[str, Any],
     else:
         from . import health
 
-        # ABSENT when there is no blocker, never `blocked: none`: an unblocked order's
-        # packet keeps its current bytes (it is the cached prefix of every review), and a
-        # line asserting the absence of a blocker is a claim the judge would weigh where
-        # silence is the status quo it already reads.
+        # ABSENT when there is no blocker
         blocked = health.blocker(pstore, subject, cfg)
+        # ABSENT with no actor for the reason just above
+        actor = health.actor(pstore, subject)
         sections.append([
             "# The work order",
             f"{row.get('id')} [{row.get('status')}] on "
             f"{row.get('model') or '(default model)'}",
             f"this session is {_what_it_is(row)}",
+            *([f"scheduled_actor: {actor.pass_name} - {actor.why}"] if actor else []),
             *([f"blocked: {BLOCKED_SENTENCES.get(blocked, blocked)}"] if blocked else []),
             f"title: {row.get('title')}",
             f"brief: {_clip(str(row.get('description') or ''), cfg.description_chars)}",
@@ -671,7 +531,7 @@ def build_evidence(pstore: Any, subject: dict[str, Any],
                          *_session_lines(row, inspect_cfg, pstore)])
         sections.append(_said_lines(pstore, row["id"], cfg))
 
-    # Whole sections, never a mid-line cut: half a cache-write line reads as a fact.
+    # Whole sections, never a mid-line cut: half a cache-write line reads as a fact
     packet: list[str] = []
     spent = 0
     for section in sections:
@@ -688,20 +548,7 @@ def build_evidence(pstore: Any, subject: dict[str, Any],
 
 
 def _validate(data: dict[str, Any], note_chars: int) -> dict[str, Any]:
-    """Normalise a parsed reply into the verdict dict, or raise.
-
-    A MISSING `decision` IS A BAD SHAPE, NOT A DEFAULT — it is what says this is a
-    supervisor verdict at all. `neo._validate_verdict` makes the same call about
-    `escalate`. Defaulting to `ack` would hide a burning turn; to `escalate` would
-    record a judgement nobody made.
-
-    A `propose` NAMING NO REMEDY, OR ONE THE REGISTRY DOES NOT HAVE, IS THE SAME KIND OF
-    BAD SHAPE and is deliberately NOT downgraded to `escalate`. A judge that asked for
-    an action it could not name did not mean to escalate, and recording that it did puts
-    a judgement nobody made on the record — the failure this whole function exists to
-    refuse. Whether the project ALLOWS the named remedy is a separate question and not
-    this one: it is answered by `remedies.propose`, which can say so on the alarm.
-    """
+    """Normalise a parsed reply into the verdict dict, or raise"""
     from . import remedies
 
     decision = str(data.get("decision") or "").strip().lower()
@@ -733,33 +580,18 @@ def _validate(data: dict[str, Any], note_chars: int) -> dict[str, Any]:
 
 
 def _failed_verdict(raw: str, reason_chars: int) -> dict[str, Any]:
-    """The fail-safe, and IT ESCALATES: a failure must never become an ack, which would
-    put the flag down on a turn that is still spending money.
-
-    `failed` is what puts the alarm at `failed` rather than at `escalated` — nobody
-    judged it. `Daemon._neo_drain` reads Neo's equivalent flag the same way.
-    """
+    """The fail-safe, and IT ESCALATES: a failure must never become an ack"""
     return {"decision": "escalate", "note": "", "question": "", "remedy": "",
             "argument": "", "failed": True,
             "reason": f"{UNREADABLE_PREFIX}{(raw or '')[:reason_chars]}"}
 
 
-#: `verdict_reason` on an alarm nobody could put to a model — `neo_store.UNREACHABLE_PREFIX`
-#: one layer down, and the string `_apply` keys the retry off.
+#: `verdict_reason` on an alarm nobody could put to a model
 UNREACHABLE_PREFIX = "the supervisor could not be reached: "
 
 
 def _transport_failure(exc: Exception, reason_chars: int) -> dict[str, Any]:
-    """A call that never happened, which `structured.request`'s `on_invalid` does NOT
-    cover — `ClaudeCliError` propagates untouched by design (kn-9b18a8eb). Without this
-    the review raises out of the daemon's own thread pool.
-
-    `decision` IS EMPTY, not `escalate`. Its sibling `_failed_verdict` names one because a
-    reply nobody could read still has to fail toward the user; nothing decided this one at
-    all, and a `decision` key that reads `escalate` is a judgement in the record that no
-    model made. `_apply` routes on `unreachable` before it reads either — spec
-    docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §4.
-    """
+    """A call that never happened, which `structured.request`'s `on_invalid` does NOT cover (docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §4.)"""
     return {"decision": "", "note": "", "question": "", "remedy": "",
             "argument": "", "failed": True, "unreachable": True,
             "reason": f"{UNREACHABLE_PREFIX}{str(exc)[:reason_chars]}"}
@@ -768,23 +600,13 @@ def _transport_failure(exc: Exception, reason_chars: int) -> dict[str, Any]:
 def review(pstore: Any, neo_store: Any, project: str, wo: dict[str, Any],
            alarm: dict[str, Any], cfg: Any, record: Any = None,
            central: Any = None, inspect_cfg: Any = None) -> dict[str, Any]:
-    """Judge one claimed alarm and record the outcome. Returns the verdict.
-
-    `project` is named because `ProjectStore` holds a path, not a name, and the name is
-    what the prompt is stable per, what the `agent_calls` row is filed under and what
-    routes the inbox row. `record` is the accounting seam (`agent_usage.record`), called
-    per ATTEMPT: an unreadable reply was paid for just the same.
-
-    ALL THREE FAILURE SHAPES END AT `status='failed'` WITH THE FLAG UP, and they arrive
-    by two routes — see `_failed_verdict` and `_transport_failure`.
-    """
+    """Judge one claimed alarm and record the outcome"""
     from . import agent_usage
     from .central_store import CentralStore
     from .paths import ensure_home
 
     record = record or agent_usage.record
-    # Hoisted out of the call because the ESCALATION carries it: Neo answers from the
-    # question and its context alone, so a thin context is a thin answer (§3).
+    # Hoisted out of the call because the ESCALATION carries it: Neo answers from the question and its...
     evidence = build_evidence(pstore, {"kind": "work_order", "row": wo}, alarm,
                               cfg, inspect_cfg)
     try:
@@ -795,16 +617,13 @@ def review(pstore: Any, neo_store: Any, project: str, wo: dict[str, Any],
                                               armed_remedies=cfg.remedies.allowed
                                               if cfg.remedies.enabled else ()),
             model=cfg.model,
-            # Neo's FAIL-SAFE shape, not the panel chair's retry shape: asking again
-            # spends a call to learn the same thing, and the fallback already reaches
-            # the user, which is where an unanswerable alarm was going anyway.
+            # Neo's FAIL-SAFE shape, not the panel chair's retry shape: asking again spends a call to learn the...
             attempts=1,
             on_invalid=lambda raw: _failed_verdict(raw, cfg.reason_chars),
             timeout=cfg.timeout,
-            # Neutral cwd, Neo's reason: a project directory would pull its CLAUDE.md in
-            # and break prefix stability.
+            # Neutral cwd, Neo's reason: a project directory would pull its CLAUDE.md in and break prefix...
             cwd=ensure_home(),
-            # This call is recorded by `on_usage`, below, under the same kind.
+            # This call is recorded by `on_usage`, below, under the same kind
             records_itself="supervisor",
             on_usage=agent_usage.recorder(
                 "supervisor", project=project, wo_id=wo["id"],
@@ -824,16 +643,9 @@ def review(pstore: Any, neo_store: Any, project: str, wo: dict[str, Any],
     return verdict
 
 
-# -- the health sweep ------------------------------------------------------------------
-#
-# §4 of docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md. ONE MODEL
-# CALL PER UNIT, NOT ONE PER PROBE: the checklist rides in the system prompt beside the
-# persona and the learnings, so N probes over M units on every sweep is one call per unit
-# sharing a byte-stable cached prefix per project, rather than N x M calls asking the
-# same thing in pieces.
+# -- the health sweep
 
-#: What the judge is told about WHY it is being asked now. "nothing has moved" and
-#: "something just moved" are different questions; a judge shown neither answers a third.
+#: What the judge is told about WHY it is being asked now
 HEALTH_WHY = {
     "first-look": "This unit has never been checked before. Judge it as it stands.",
     "changed": "Its record has moved since the last check.",
@@ -841,17 +653,14 @@ HEALTH_WHY = {
              "is why you are being asked now.",
 }
 
-#: The sweep's user prompt opens with this, above the evidence packet.
+#: The sweep's user prompt opens with this, above the evidence packet
 HEALTH_HEADER = "# Why you are looking now"
 
-#: The attention reason a finding puts on the CARRIER, and there are two because a
-#: finding about a FEATURE lands on a work order that is not itself in trouble: that flag
-#: has to say which record to open, and a finding about the carrier itself does not.
+#: The attention reason a finding puts on the CARRIER
 HEALTH_BLOCKER = "{reason}"
 HEALTH_FEATURE_BLOCKER = "{fo_id}: {reason}"
 
-#: `health_reviews.detail` recognises the unreadable-output path by this prefix, as
-#: `review` does with `UNREADABLE_PREFIX`.
+#: `health_reviews.detail` recognises the unreadable-output path by this prefix
 UNREADABLE_SWEEP_PREFIX = "unreadable health sweep output: "
 
 NO_CARRIER_DETAIL = ("no work order carries this feature, so a finding about it has "
@@ -860,16 +669,7 @@ NO_CARRIER_DETAIL = ("no work order carries this feature, so a finding about it 
 
 def _validate_findings(data: dict[str, Any], armed_ids: set[str],
                        cfg: Any) -> dict[str, Any]:
-    """Normalise a parsed sweep reply, or raise.
-
-    A MISSING `findings` IS A BAD SHAPE, NOT AN EMPTY ONE — it is what says this is a
-    sweep reply at all, exactly the call `_validate` makes about `decision`. Defaulting
-    it to `[]` would read every unreadable reply as a clean bill of health.
-
-    A probe id nobody armed is DROPPED rather than raised on: a hallucinated id is one
-    bad finding, not a bad reply, and refusing the whole reply over it throws away the
-    findings that were good.
-    """
+    """Normalise a parsed sweep reply, or raise"""
     if "findings" not in data:
         raise structured.InvalidOutput("no `findings` field in the sweep's reply")
     findings = []
@@ -889,36 +689,14 @@ def _validate_findings(data: dict[str, Any], armed_ids: set[str],
 
 
 def _nothing_found(reason: str) -> dict[str, Any]:
-    """THE FAIL-SAFE, AND ITS POLARITY IS THE OPPOSITE OF `_failed_verdict`'S.
-
-    `review`'s fallback ESCALATES, because output nobody can read must not become an ack
-    that hides a burning turn. This one FINDS NOTHING, because output nobody can read
-    must not become an attention item the user cannot trace to anything.
-
-    Both obey one rule — a failure never invents a judgement — and they land on opposite
-    sides of it because the judgements point in opposite directions. Do not "fix" either
-    one to match the other.
-    """
+    """THE FAIL-SAFE, AND ITS POLARITY IS THE OPPOSITE OF `_failed_verdict`'S"""
     return {"findings": [], "failed": True, "reason": reason}
 
 
 def review_health(pstore: Any, neo_store: Any, project: str, subject: dict[str, Any],
                   probes: Any, cfg: Any, trigger: str, record: Any = None,
                   inspect_cfg: Any = None) -> dict[str, Any]:
-    """Judge one open unit against the project's armed probes; raise what is wrong.
-
-    `subject` is `build_evidence`'s dict. Returns the reply plus the alarm ids raised.
-
-    THE FINGERPRINT IS COMPUTED HERE rather than passed in, so the ledger row records the
-    state that was actually judged. The daemon computed one a moment earlier to decide
-    whether to look at all; if the unit moved in between, this is the honest value and
-    the next sweep sees a `changed` trigger for a change that really happened.
-
-    AND THEN IT STOPS. A finding is an ordinary alarm: `_drain_project_alarms` claims it,
-    `review` judges it, and every surface downstream already exists. Two model calls per
-    finding buys one review path, one surface and one memory — the sweep answers *is
-    something wrong*, the review answers *does the user need to know*.
-    """
+    """Judge one open unit against the project's armed probes; raise what is wrong"""
     from . import agent_usage, health, probes as probes_mod
     from .paths import ensure_home
     from .project_store import NO_TURN
@@ -930,8 +708,7 @@ def review_health(pstore: Any, neo_store: Any, project: str, subject: dict[str, 
     carrier = (pstore.carrier_for_feature(subject_id) if kind == "feature_order"
                else row)
     if carrier is None:
-        # Refused BEFORE the call, not after: a finding with nowhere to be recorded is a
-        # model call bought and thrown away.
+        # Refused BEFORE the call, not after: a finding with nowhere to be recorded is a model call bought...
         pstore.record_health_review(kind, subject_id, fingerprint=fingerprint,
                                     trigger=trigger, outcome="failed",
                                     detail=NO_CARRIER_DETAIL)
@@ -950,26 +727,21 @@ def review_health(pstore: Any, neo_store: Any, project: str, subject: dict[str, 
             system_prompt=build_system_prompt(neo_store, project, cfg.learnings_limit,
                                               probes=armed),
             model=cfg.model,
-            # The FAIL-SAFE shape, as `review` uses it: asking again spends a call to
-            # learn the same thing, and this fallback reaches nobody at all, so a retry
-            # buys silence one tick earlier at the price of a second bill.
+            # The FAIL-SAFE shape, as `review` uses it: asking again spends a call to learn the same thing
             attempts=1,
             on_invalid=lambda raw: _nothing_found(
                 f"{UNREADABLE_SWEEP_PREFIX}{_clip(raw, cfg.reason_chars)}"),
             timeout=cfg.timeout,
-            # Neutral cwd, `review`'s reason: a project directory pulls its CLAUDE.md in
-            # and breaks prefix stability.
+            # Neutral cwd, `review`'s reason: a project directory pulls its CLAUDE.md in and breaks prefix...
             cwd=ensure_home(),
-            # This call is recorded by `on_usage`, below, under the same kind.
+            # This call is recorded by `on_usage`, below, under the same kind
             records_itself="health",
             on_usage=agent_usage.recorder(
                 "health", project=project, wo_id=carrier["id"], label=trigger,
                 model=cfg.model, record=record),
         )
     except claude_cli.UsageLimitError as exc:
-        # BEFORE the generic outage below, and the ordering is the fix: a spent window
-        # is not a transport fault and must not be recorded as a broken sweep
-        # (issue #235's lesson, kn-96bc2417; `neo.drain_queue` src/jarvis/neo.py:418).
+        # BEFORE the generic outage below (#235)
         from .worker_session import RATE_LIMIT_FALLBACK_DELAY
 
         reopens = exc.limit.reset_at or (time.time() + RATE_LIMIT_FALLBACK_DELAY)
@@ -981,16 +753,12 @@ def review_health(pstore: Any, neo_store: Any, project: str, subject: dict[str, 
                  project, subject_id)
         return {**_nothing_found(exc.limit.message), "raised": [], "outcome": "held"}
     except claude_cli.ClaudeCliError as exc:
-        # `on_invalid` does NOT cover this: `ClaudeCliError` propagates untouched by
-        # design (kn-9b18a8eb), and without this the sweep raises out of the daemon's
-        # own thread pool.
+        # `on_invalid` does NOT cover this: `ClaudeCliError` propagates untouched by design (kn-9b18a8eb)
         reply = _nothing_found(f"the health sweep could not be reached: "
                                f"{_clip(str(exc), cfg.reason_chars)}")
 
     if reply["failed"]:
-        # THE FINGERPRINT IS NOT RECORDED AS REVIEWED — `last_health_review` skips a
-        # `failed` row — so the next tick looks again rather than counting a failure as
-        # a look. No alarm and no event either: a failure never becomes a judgement.
+        # THE FINGERPRINT IS NOT RECORDED AS REVIEWED
         pstore.record_health_review(kind, subject_id, fingerprint=fingerprint,
                                     trigger=trigger, outcome="failed",
                                     detail=reply["reason"])
@@ -998,7 +766,7 @@ def review_health(pstore: Any, neo_store: Any, project: str, subject: dict[str, 
                     reply["reason"])
         return {**reply, "raised": [], "outcome": "failed"}
 
-    # READ BEFORE THIS SWEEP'S OWN ROW IS WRITTEN, or it deduplicates its own findings.
+    # READ BEFORE THIS SWEEP'S OWN ROW IS WRITTEN, or it deduplicates its own findings
     already = pstore.probes_reported_at(kind, subject_id, fingerprint)
     raised = []
     for finding in reply["findings"]:
@@ -1020,9 +788,7 @@ def review_health(pstore: Any, neo_store: Any, project: str, subject: dict[str, 
     pstore.record_health_review(
         kind, subject_id, fingerprint=fingerprint, trigger=trigger, outcome=outcome,
         findings=len(reply["findings"]),
-        # What the sweep REPORTED, not what it raised: this is the dedupe memory, and
-        # recording only what was raised would let a deduped probe raise again two
-        # sweeps later at the same unchanged fingerprint.
+        # What the sweep REPORTED, not what it raised: this is the dedupe memory
         detail=",".join(f["probe"] for f in reply["findings"]))
     pstore.add_event(carrier["id"], "health_reviewed",
                      {"subject_kind": kind, "subject_id": subject_id,
@@ -1037,31 +803,13 @@ def review_health(pstore: Any, neo_store: Any, project: str, subject: dict[str, 
 
 
 def reassert_health(pstore: Any, project: str, subject: dict[str, Any]) -> dict[str, Any]:
-    """Carry the prior judgement forward at an unchanged fingerprint — ONE ROW, NO CALL.
-
-    A sibling of `review_health` because the thing it writes is the thing `review_health`
-    writes, and a second writer of `health_reviews` belongs beside the first. The spend
-    decision is `health.due`'s (trigger `re-assert`); all this does is record it.
-
-    THE FINGERPRINT IS COMPUTED HERE, `review_health`'s reason: the row must record the
-    state actually judged. NO ALARM, NO `health_finding`, NO `flag_attention` and no
-    `health_reviewed` event — the fingerprint is identical, so `probes_reported_at`
-    already returns every probe the prior review named and `review_health` would have
-    deduped all of them. The event means "a judge looked", and none did.
-
-    The row IS counted by `last_health_review` and by `last_health_attempt_ts`,
-    deliberately in both cases: the first slides the stale window forward, so a
-    re-assertion costs at most one row per window, and the second floors the next look
-    exactly as a paid stale review does.
-    """
+    """Carry the prior judgement forward at an unchanged fingerprint — ONE ROW, NO CALL"""
     from . import health
 
     kind, subject_id = subject["kind"], subject["row"]["id"]
     prior = pstore.last_health_review(kind, subject_id)
     if prior is None:
-        # Unreachable through `due`, which only answers `re-assert` with a prior
-        # `findings` row. Refused rather than invented: this function copies a judgement
-        # and never makes one.
+        # Unreachable through `due`, which only answers `re-assert` with a prior `findings` row
         log.warning("[%s] nothing to re-assert about %s", project, subject_id)
         return {"outcome": None, "trigger": health.REASSERT}
     pstore.record_health_review(
@@ -1073,14 +821,8 @@ def reassert_health(pstore: Any, project: str, subject: dict[str, Any]) -> dict[
 
 
 def escalation_context(evidence: str, verdict: dict[str, Any]) -> str:
-    """What Neo is handed with the question — §3.
-
-    THE SUPERVISOR'S OWN READING IS APPENDED RATHER THAN SUBSTITUTED. Neo's call is
-    headless and it can look nothing up, so dropping the packet to save tokens would
-    leave it ruling on a one-line summary of a judgement it is being asked to re-take.
-    """
-    # Decision #11: the packet and the model's reasoning are both borrowed text, and
-    # both were unbounded. `gates.build_request_question`'s idiom and its constants.
+    """What Neo is handed with the question — §3: the supervisor's own reading is APPENDED, never substituted, because Neo is headless and cannot look the packet up"""
+    # Decision #11: packet and model reasoning are both borrowed text, both bounded
     from .provenance import (DESCRIPTION_LIMIT, EVIDENCE_LIMIT, Borrowed,
                              borrowed_block)
 
@@ -1102,15 +844,8 @@ def escalation_context(evidence: str, verdict: dict[str, Any]) -> str:
 
 
 def _question_for(verdict: dict[str, Any], alarm: dict[str, Any]) -> str:
-    """The one question put to Neo, never empty.
-
-    A model that escalates without filling `question` in has still made a real judgement
-    — `_validate` will not invent a decision, but it does tolerate a missing question —
-    and a `questions` row with no text is unanswerable by Neo AND unreadable by the user
-    it would then be escalated to.
-    """
-    # Decision #11: the model's question and the alarm's reason are borrowed text, and
-    # both reached Neo whole.
+    """The one question put to Neo, never empty: a model that escalates without filling `question` in has still judged, and an empty `questions` row is unanswerable by Neo and unreadable by the user it would be escalated to"""
+    # Decision #11: the model's question and the alarm's reason are borrowed text, bounded
     from .provenance import DESCRIPTION_LIMIT, Borrowed, borrowed_block
 
     asked = verdict["question"].strip()
@@ -1130,20 +865,13 @@ def _question_for(verdict: dict[str, Any], alarm: dict[str, Any]) -> str:
 def _apply(pstore: Any, neo_store: Any, central: Any, project: str, wo: dict[str, Any],
            alarm: dict[str, Any], verdict: dict[str, Any], evidence: str,
            cfg: Any) -> None:
-    """Write the verdict down. THE ALARM ROW IS THE MEMORY: `invariants.true_blockers`
-    has no branch for a live cost alarm, so there is no blocker string to acknowledge
-    and only §1's dedupe keeps the flag down. That is exactly why the ack below is
-    `ops.ack_os_flag` and not the user's one. See §2.
-    """
+    """Write the verdict down"""
     from . import db, ops
 
     alarm_id = alarm["id"]
     decided = db.now()
     if verdict.get("unreachable"):
-        # NOT `failed`: nobody judged this, so the alarm goes back on the queue with the
-        # attempt spent rather than out of it. `failed` at attempts=0 is what left every
-        # unreachable alarm permanently unjudged — `NeoStore.release_claim`'s defect, one
-        # queue along.
+        # NOT `failed`: nobody judged this
         outcome = pstore.release_alarm_claim(alarm_id, verdict["reason"],
                                              cfg.max_review_attempts)
         log.warning("supervisor could not be reached for %s (%s): %s",
@@ -1171,11 +899,7 @@ def _apply(pstore: Any, neo_store: Any, central: Any, project: str, wo: dict[str
                      {"alarm_id": alarm_id, "verdict": "ack",
                       "reason": verdict["reason"], "note": verdict["note"]})
 
-    # THROUGH `ops.ack_os_flag`, which takes down the flag THIS alarm raised and leaves
-    # every other blocker standing. `ops.ack_attention` — what this called until issue
-    # 573 — is the USER saying they have seen it, and acking an alarm is not that: it
-    # dismissed blockers the user was never shown, for ever. `clear_attention` is wrong
-    # for the opposite reason: it would discard the user's own earlier dismissals.
+    # THROUGH `ops.ack_os_flag`, which takes down the flag THIS alarm raised and leaves every other...
     try:
         ops.ack_os_flag(wo["id"])
     except ops.OpsError as exc:
@@ -1189,18 +913,7 @@ def _apply(pstore: Any, neo_store: Any, central: Any, project: str, wo: dict[str
 def _propose(pstore: Any, neo_store: Any, central: Any, project: str,
              wo: dict[str, Any], alarm: dict[str, Any], verdict: dict[str, Any],
              evidence: str, cfg: Any) -> None:
-    """Hand the named remedy to `remedies.propose`, which owns every write — §5.
-
-    THE ATTENTION FLAG STAYS UP WHILE A PROPOSAL IS OUT, and it needs nothing here: the
-    raise already put it up and nothing in this branch takes it down. The OS wants to do
-    something to the user's work and has not been told it may, which is exactly what the
-    flag says.
-
-    A REFUSAL IS THE USER'S TO READ. `propose` writes the reason on the alarm and files
-    nothing; the flag alone would evaporate on a settled order
-    (`invariants.check_no_phantom_attention`), so the inbox row is the durable half and
-    it goes through the same `_flag_the_user` an unaskable escalation uses.
-    """
+    """Hand the named remedy to `remedies.propose`, which owns every write — §5"""
     from . import remedies
 
     outcome = remedies.propose(
@@ -1219,14 +932,7 @@ def _propose(pstore: Any, neo_store: Any, central: Any, project: str,
 def _escalate(pstore: Any, neo_store: Any, central: Any, project: str,
               wo: dict[str, Any], alarm: dict[str, Any], verdict: dict[str, Any],
               evidence: str, decided: float) -> None:
-    """Hand the alarm to Neo — §3. The verdict is recorded either way.
-
-    `alarm_reviewed` still carries the verdict, exactly as §2 wrote it, and
-    `alarm_escalated` carries the handoff. Two events rather than one widened payload:
-    §4's renderer and `ALARM_EVENT_KINDS` were frozen against that split, and the
-    conversation surface reads `alarm_reviewed`'s `note` — empty by contract here —
-    while the timeline reads its `reason`.
-    """
+    """Hand the alarm to Neo — §3"""
     from .project_store import OPEN_STATUSES
 
     alarm_id = alarm["id"]
@@ -1235,10 +941,7 @@ def _escalate(pstore: Any, neo_store: Any, central: Any, project: str,
     reviewed = {"alarm_id": alarm_id, "verdict": "escalate",
                 "reason": verdict["reason"], "note": ""}
 
-    # NOTHING TO ASK ABOUT. Neo can advise nothing about a session that has stopped: the
-    # spend is a fact, the turn cannot be steered, and the only reading left is the
-    # user's. Filing the question anyway would spend a call to reach that conclusion and
-    # leave a row `neo_store.supersede` then has to clean up.
+    # NOTHING TO ASK ABOUT
     if wo["status"] not in OPEN_STATUSES:
         pstore.update_alarm(alarm_id, **fields)
         pstore.add_event(wo["id"], "alarm_reviewed", reviewed)
@@ -1259,13 +962,7 @@ def _escalate(pstore: Any, neo_store: Any, central: Any, project: str,
 
 def _flag_the_user(pstore: Any, central: Any, project: str, wo: dict[str, Any],
                    alarm: dict[str, Any], reason: str, why: str) -> None:
-    """Put an unsettled alarm in front of the user without going through Neo.
-
-    THE INBOX ROW IS THE DURABLE HALF, and the attention flag alone is not enough:
-    `invariants.check_no_phantom_attention` clears the flag on any work order that has
-    settled, which is exactly the case this path exists for, so an escalation that only
-    raised the flag would evaporate on the next reconcile tick.
-    """
+    """Put an unsettled alarm in front of the user without going through Neo"""
     alarm_id = alarm["id"]
     pstore.flag_attention(wo["id"], ALARM_BLOCKER.format(alarm_id=alarm_id))
     central.add_inbox(project=project, level="warning",

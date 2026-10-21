@@ -1,25 +1,4 @@
-"""A work order's record, in two readings.
-
-`build_conversation` is **what was said** — the exchange, in order, whoever spoke.
-`build_timeline` is **what happened** — the sequence of events, each one pointing at
-the record that holds the detail rather than reproducing it
-(docs/superpowers/specs/2026-08-23-the-work-order-record.md §1, §3).
-
-The two are not the same list rendered twice. Neither is complete without the other,
-and each has exactly one thing the other must not carry:
-
-- The worker's question to Neo is a `wo_events` row, never a message. Read the
-  messages alone and Neo's answer arrives with nothing above it to answer, which is
-  what the conversation showed until `build_conversation` existed.
-- A message body belongs to the conversation. Merged into the timeline as well — as
-  every message was — the timeline becomes a second, worse copy of it.
-
-See docs/superpowers/specs/2026-08-24-the-conversation-owns-what-was-said.md.
-
-`wo_events` also mixes two audiences. The user wants the story; the rest (message
-delivery bookkeeping, Claude Code session hooks, turn boundaries, session binding)
-exists to debug the circuitry, and is held back unless explicitly requested.
-"""
+"""A work order's record, in two readings (docs/superpowers/specs/2026-08-23-the-work-order-record.md §1)"""
 
 from __future__ import annotations
 
@@ -27,9 +6,7 @@ import json
 import time
 from typing import Any
 
-#: `ops.ESCALATION_FAMILY`'s three written families, as the literals this module is
-#: allowed to hold — it imports nothing from `jarvis`, so tests/test_timeline.py pins
-#: these against the dict rather than a comment promising they match.
+#: `ops.ESCALATION_FAMILY`'s three written families, as the literals this module is allowed to hold
 ESCALATION_HANDOVER = frozenset({
     "rounds_spent", "user_rework_ceiling", "rebinds_spent"})
 ESCALATION_NOT_REVIEWED = frozenset({
@@ -37,8 +14,7 @@ ESCALATION_NOT_REVIEWED = frozenset({
 ESCALATION_UNJUDGED = frozenset({
     "no_verdict", "validator_unreachable", "prompt_refused", "panel_killed"})
 
-# Plumbing: how a message got carried, which session was bound, when a turn ended.
-# None of it tells the user anything about the work itself.
+# Plumbing: how a message got carried, which session was bound, when a turn ended
 DEBUG_KINDS = frozenset({
     "message_queued",           # queued for delivery — the message body is the signal
     "delivering",               # delivery attempt
@@ -50,56 +26,38 @@ DEBUG_KINDS = frozenset({
     "tool_managed_paths",       # which tool-owned files the worktree's index now hides
     "permission_mode_changed",  # worker permission plumbing
     "notification_ignored",     # idle prompt on an already-settled work order
-    # Same moment as the message carrying the answer, so the message is the entry — §5.
+    # Same moment as the message carrying the answer, so the message is the entry — §5
     "neo_answered",
     "escalation_answered",
-    # THE SWEEP LOOKING, which is not the same event as the sweep FINDING something.
-    # `health_finding` is a signal and stays one; this fires on every sweep including
-    # the clear ones, which on a long-running order is dozens a day. §4 of
-    # docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md keeps the
-    # ledger of looking out of the surfaces for exactly this reason; the same argument
-    # applies to the default timeline.
+    # THE SWEEP LOOKING, which is not the same event as the sweep FINDING something (docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md)
     "health_reviewed",
-    # The retry sweep DEFERRING a relaunch, restated every five minutes for as long as
-    # the cap holds. `invariants.pause_note` is the user-facing half of one hold — one
-    # sentence — and twelve rows an hour of "still queued" would bury the work in
-    # `jarvis wo show`. Same argument as `health_reviewed` above; spec §1 of
-    # docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md.
+    # The retry sweep DEFERRING a relaunch, restated every five minutes for as long as the cap holds (docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md)
     "retry_held",
 })
 
-#: `background.EVENT`, spelled out here for the reason `SUPERVISOR_SOURCE` is: this
-#: module is a leaf and opens nothing. A test pins the two equal. Spec
-#: docs/superpowers/specs/2026-09-22-a-dead-background-job-is-not-a-live-one.md.
+#: `background.EVENT`, spelled out here for the reason `SUPERVISOR_SOURCE` is: this module is a leaf... (docs/superpowers/specs/2026-09-22-a-dead-background-job-is-not-a-live-one.md)
 BACKGROUND_ORPHANED = "background_orphaned"
 BACKGROUND_NUDGED = "background_nudged"
 BACKGROUND_UNRESOLVED = "background_unresolved"
 
 #: What the conversation prints ABOVE a message whose turn left a background job behind
-#: — `build_conversation`'s `void` field, spec §3. It retracts the promise without
-#: touching the words: the message is what the worker said, and this is what the OS
-#: knows about it. Free of any elapsed time, so it reads the same the hour it is written
-#: and two days later.
 VOID_MESSAGE = ("⚠ VOID — the turn that wrote this ended while {jobs} was still "
                 "running, and a turn is one process: the job died with it. Nothing this "
                 "message describes as running has run since.")
 
-#: How much of a command survives into a job's label — `background.COMMAND_CHARS`, and
-#: pinned equal to it by the same test.
+#: How much of a command survives into a job's label
 JOB_COMMAND_CHARS = 80
 
 STATUS_LABEL = {
     "pending": "Queued",
     "dispatching": "Dispatching worker",
     "running": "Running",
-    # NOT "Waiting on you". A manager between its feature's messages asks nothing of
-    # anybody, and eleven hours of it reading otherwise is GitHub issue #264.
+    # NOT "Waiting on you" (#264)
     "idle": "Idle — waiting for its feature",
     "waiting_input": "Waiting on you",
     "validating": "Under review by the validation panel",
     "needs_review": "Needs your review",
-    # The two `ops.state_durations` was built for, and both printed as raw tokens until
-    # it named them (spec 2026-09-27-time-in-each-state §4 rule 5).
+    # The two `ops.state_durations` was built for
     "waiting_pr_merge": "Waiting for its pull request to merge",
     "budget_exhausted": "Budget spent",
     "completed": "Completed",
@@ -108,24 +66,19 @@ STATUS_LABEL = {
 }
 
 
-#: What the OS read off disk when a turn died without writing a result. A SIGNAL kind and
-#: deliberately not in `DEBUG_KINDS`: it is the only statement about the WORK that a
-#: failed turn leaves behind (spec docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md §5).
+#: What the OS read off disk when a turn died without writing a result (docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md §5)
 TURN_HARVESTED = "turn_harvested"
 
 
 def event_level(kind: str) -> str:
-    """"debug" for plumbing, "signal" for anything the user should see by default.
-
-    Unknown kinds are signal — better to show an unclassified event than to swallow it.
-    """
+    """"debug" for plumbing, "signal" for anything the user should see by default"""
     if kind.startswith("hook:") or kind in DEBUG_KINDS:
         return "debug"
     return "signal"
 
 
 def _clock(reset_at: Any) -> str:
-    """A usage-limit reset moment as local wall-clock, or "" if there was none."""
+    """A usage-limit reset moment as local wall-clock, or "" if there was none"""
     if not isinstance(reset_at, (int, float)):
         return ""
     return time.strftime("%H:%M", time.localtime(float(reset_at)))
@@ -152,50 +105,31 @@ def _neo_question_id(p: dict[str, Any]) -> int | None:
         return None
 
 
-#: The kinds carrying one alarm's life, frozen in §1 of
-#: docs/superpowers/specs/2026-08-31-the-supervisor.md and grown by §1 of
-#: docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md. Spelled out here
-#: rather than imported from `project_store`: this module is a leaf and opens no store.
-#: A test asserts equality with `project_store.ALARM_EVENT_KINDS` — one growing without
-#: the other stops `_ref` resolving the new kinds, with no error anywhere.
+#: The kinds carrying one alarm's life (docs/superpowers/specs/2026-08-31-the-supervisor.md)
 ALARM_KINDS = frozenset({"cost_alarm", "alarm_reviewed", "alarm_escalated",
                          "alarm_advice", "health_finding", "health_reviewed",
                          "remedy_proposed", "remedy_applied", "remedy_refused",
                          "rule_fired", "rule_dry_run", "rule_cleared"})
 
-#: `project_store.NO_TURN`, duplicated for `ALARM_KINDS`' reason — a leaf may not import
-#: a store — and pinned equal to it by the same test. A `cost_alarm` carrying it judged
-#: no turn: see `_describe`.
+#: `project_store.NO_TURN`, duplicated for `ALARM_KINDS`' reason
 NO_TURN = -1
 
 
 def _ref(kind: str, p: dict[str, Any]) -> dict[str, Any] | None:
-    """The record this entry points at, or None. Surface-neutral by design — §3.
-
-    Never a URL and never an anchor: the dashboard resolves a `neo_question` to
-    `/neo/question/<id>`, an `alarm` to `/alarms/<project>/<al-id>` and a `message` to
-    the conversation turn `build_conversation` gave the same id, while `jarvis wo show`
-    prints the label and the CLI's own commands reach the same three records.
-    """
+    """The record this entry points at, or None"""
     if kind == "question_asked":
         qid = _neo_question_id(p)
         if qid is not None:
             return {"kind": "neo_question", "id": qid, "label": f"question #{qid}"}
     if kind in ALARM_KINDS:
-        # The alarm, even on the two kinds that also carry a `neo_question_id`: a ref is
-        # singular, and the alarm's own page is where the verdict, Neo's question and the
-        # review control all are (§4, §5).
-        #
-        # A `cost_alarm` row written before §1 has no `alarm_id` and so gets no ref — a
-        # pointer that cannot resolve is not a saving, corollary 1 of §1.
+        # The alarm, even on the two kinds that also carry a `neo_question_id`: a ref is singular
         alarm_id = p.get("alarm_id")
         if alarm_id:
             return {"kind": "alarm", "id": str(alarm_id), "label": f"alarm {alarm_id}"}
     return None
 
 
-#: Each ingredient of the prompt prefix in the words a reader can act on, since the
-#: payload's keys are the names `hooks.PREFIX_INGREDIENTS` uses and those name the code.
+#: Each ingredient of the prompt prefix in the words a reader can act on
 PREFIX_INGREDIENT_LABEL = {
     "cli_version": "the Claude Code version",
     "git_briefing": "the git briefing Jarvis adds to every turn",
@@ -205,11 +139,7 @@ PREFIX_INGREDIENT_LABEL = {
 
 
 def _prefix_changes(p: dict[str, Any]) -> str:
-    """"the Claude Code version (2.1.271 -> 2.1.272) changed", from the drift payload.
-
-    A version moved is quoted and a digest moved is not: the before/after of a hash is
-    the question restated, while the before/after of a version is the answer.
-    """
+    """"the Claude Code version (2.1.271 -> 2.1.272) changed", from the drift payload"""
     changed = p.get("changed") or []
     before, after = p.get("before") or {}, p.get("after") or {}
     parts = []
@@ -227,7 +157,7 @@ def _prefix_changes(p: dict[str, Any]) -> str:
 
 
 def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
-    """(label, detail) in plain language for one event, from its payload alone."""
+    """(label, detail) in plain language for one event, from its payload alone"""
     if kind == "created":
         return "Work order created", ""  # the title and description are already above
     if kind == "status":
@@ -235,20 +165,26 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         return STATUS_LABEL.get(status, status or "Status changed"), ""
     if kind == "dispatched":
         return "Worker dispatched", p.get("worktree") or ""
+    # §2.6 of docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md
+    if kind == "precondition_added":
+        return (f"Held until {p.get('ref') or 'something'} clears",
+                p.get("note") or "")
+    if kind == "precondition_cleared":
+        by = "the OS" if p.get("by") == "os" else "you"
+        return (f"Hold on {p.get('ref') or 'something'} cleared by {by}",
+                p.get("note") or "")
     if kind == "dispatch_deferred_for_compaction":
-        # The prompt is QUEUED, not sent: the audit trail is this, then `compacted`,
-        # then `message_delivered` (spec 2026-09-29 §3.6).
+        # The prompt is QUEUED, not sent: the audit trail is this
         return ("Dispatch held behind a compaction",
                 "the prompt goes out once the conversation is summarised")
-    # §7: the verdict on THIS order, written here because the investigator's own work
-    # order is not what a reader of this one opens.
+    # §7: the verdict on THIS order, written here because the investigator's own work order is not what a...
     if kind == "investigation_verdict":
         return (f"Investigated: {p.get('classification') or 'no classification'}",
                 " · ".join(x for x in (p.get("investigation"), p.get("filed")) if x))
     if kind == "turn_failed":
         return "Worker turn failed", (p.get("error") or "")[:200]
     if kind == TURN_HARVESTED:
-        # §5 of docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md.
+        # §5 of docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md
         if p.get("empty"):
             return ("Nothing to harvest",
                     "the worktree was clean and the turn said nothing")
@@ -266,19 +202,10 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         if p.get("said"):
             parts.append("its last message")
         return "Harvested what the turn left behind", ", ".join(parts)
-    # The self-healing trio. Deliberately NOT filed under "Worker turn failed": nothing
-    # about the WORK went wrong — the transport did, either by refusing the turn (the
-    # usage window) or by dropping it (the API) — and the OS puts itself right. What the
-    # reader needs is the pause, the resume, and only if it comes to that, the point at
-    # which the OS gave up and it became their problem.
-    #
-    # `reason` distinguishes the two. It is absent on rows written before transient
-    # retries existed, and those were all usage-limit ones, so its absence reads as that
-    # — which is why the legacy kinds below need no payload migration.
+    # The self-healing trio
     if kind in ("turn_paused", "rate_limited"):
         if p.get("reason") == "auth":
-            # The only one of the three that names what the READER has to do: the other
-            # two resume on a clock, this one resumes on them.
+            # The only one of the three that names what the READER has to do: the other two resume on a clock
             return ("Paused — Claude Code sign-in expired",
                     f"{p.get('error') or ''} · resuming when you sign in again")
         if p.get("reason") == "transient":
@@ -304,19 +231,13 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                 f"{p.get('attempts')} {what} retries: {p.get('error') or ''}")
     if kind == "turn_cancelled":
         return "Worker turn cancelled", ""
-    # A SIGNAL AND NOT PLUMBING, unlike `turn_started`/`turn_ended` beside it. The OS
-    # spent a model call on the conversation rather than on the work, and it dropped
-    # detail the worker had: that is a thing that happened TO this work order, and the
-    # pinned self-healing learning asks for it to be provable rather than asserted.
+    # A SIGNAL AND NOT PLUMBING, unlike `turn_started`/`turn_ended` beside it
     if kind == "compacting":
         return "Compacting the conversation", p.get("reason") or ""
     if kind == "compacted":
-        # `ok` is absent on the hook's own event (`hooks.note_compaction`), which only
-        # ever fires for a compaction that already happened — so missing means true.
+        # `ok` is absent on the hook's own event (`hooks.note_compaction`)
         if p.get("ok") is False:
-            # The conversation is INTACT and the next prompt still pays the re-write.
-            # Saying "compacted" here would put a saving on the record that the bill
-            # will not show.
+            # The conversation is INTACT and the next prompt still pays the re-write
             return "Compaction failed", str(p.get("error") or "")
         before, after = p.get("before"), p.get("after")
         if isinstance(before, int) and isinstance(after, int) and before:
@@ -326,48 +247,28 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "attention":
         return "Needs you", p.get("reason") or ""
     if kind == "acknowledged":
-        # Reached the user as an escaped JSON blob until issue 573. WHO acked is part of
-        # the claim, not decoration: rows written before `ProjectStore.ack_attention`
-        # recorded it carry no `by`, and those are attributed to nobody rather than to
-        # the user — some of them were the OS acking on their behalf, which is the bug.
+        # Reached the user as an escaped JSON blob until issue 573
         who = p.get("by")
         return (f"Acknowledged by {who}" if who else "Acknowledged",
                 "\n".join(str(b) for b in (p.get("blockers") or [])))
     if kind == "cost_alarm":
-        # Its own line rather than folded into "Needs you": only the FIRST alarm of a
-        # turn raises the flag, so the rest exist only here, and this is the row that
-        # says a turn was already known to be expensive while it was still running.
-        #
-        # …EXCEPT for the aggregate kinds, which judge no turn (`seq == NO_TURN`) and
-        # land on an order that has already settled. "while it runs" would be a claim
-        # about a running turn on a row where none is running, which is the class of
-        # false statement `inspection._spend_so_far` exists to prevent on the other
-        # surface.
+        # Its own line rather than folded into "Needs you": only the FIRST alarm of a turn raises the flag
         if p.get("seq") == NO_TURN:
             return "A standing cost finding on this project", p.get("reason") or ""
         return "Costing money while it runs", p.get("reason") or ""
-    # The supervisor's three. Same trap as the validation kinds below, already paid for
-    # once here: `event_level` calls an unknown kind "signal", so a kind with no branch
-    # renders as its own name beside a JSON blob and looks fine on the page.
+    # The supervisor's three
     if kind == "alarm_reviewed":
-        # The verdict's REASON, which is for the record. `note` is speech addressed to
-        # the user and belongs to the conversation, which renders it from this same
-        # payload — a fallback here would print it twice on one page (§4).
+        # The verdict's REASON, which is for the record
         verb = ("cleared this alarm" if p.get("verdict") == "ack"
                 else "could not settle this alarm")
         return f"The supervisor {verb}", p.get("reason") or ""
     if kind == "alarm_escalated":
         qid = _neo_question_id(p)
-        # The question number as text, not as the ref: this entry spends its one pointer
-        # on the alarm, whose page quotes the question beside the verdict anyway.
+        # The question number as text, not as the ref: this entry spends its one pointer on the alarm
         return "Alarm handed to Neo", f"question #{qid}" if qid is not None else ""
     if kind == "alarm_advice":
         return "Neo advised the supervisor", ""  # the answer is in the conversation
-    # The health sweep's two and the remedy's three (§6 of
-    # docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md). A PROBE ID
-    # and a REMEDY ID are database values, so they ride in the detail rather than in the
-    # label: this module is a leaf and cannot reach the catalog that holds a probe's
-    # title, which `/alarms` renders instead.
+    # The health sweep's two and the remedy's three (§6 of... (docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md)
     if kind == "health_finding":
         return "The supervisor found something wrong", p.get("reason") or ""
     if kind == "health_reviewed":
@@ -376,15 +277,7 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                 f"{p.get('trigger') or 'swept'} · "
                 + (f"{found} finding(s)" if found else "nothing found"))
     if kind == "remedy_proposed":
-        # PERMISSION ASKED, NOTHING DONE, and the label has to carry that alone: this
-        # entry and `remedy_applied` sit next to each other on a settled order, and a
-        # reader who takes the first for the act goes looking for an effect only the
-        # second one had.
-        #
-        # NO `alarm_id` MEANS THE USER ASKED (§11 of
-        # docs/superpowers/specs/2026-09-24-order-observability.md): `remedies.propose_fix` writes no
-        # alarm row because none was raised, and naming the supervisor here would credit a
-        # judgement nobody made.
+        # PERMISSION ASKED, NOTHING DONE (docs/superpowers/specs/2026-09-24-order-observability.md)
         detail = f"{p.get('remedy') or 'a remedy'}: {p.get('argument') or ''}"
         if not p.get("alarm_id"):
             return ("A fix you asked for needs permission", detail)
@@ -395,16 +288,11 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
             return ("The OS applied the fix you asked for", detail)
         return ("The supervisor acted", detail)
     if kind == "remedy_refused":
-        # Two payload shapes arrive here — the catalog refusing to file the proposal at
-        # all, and a reviewer denying it — and `by` is what tells them apart (§5).
+        # Two payload shapes arrive here
         by = f" by {p['by']}" if p.get("by") else ""
         return (f"The {p.get('remedy') or 'proposed'} remedy was refused{by}",
                 p.get("reason") or "")
-    # The self-evolution registry's three (§6 of
-    # docs/superpowers/specs/2026-09-27-self-evolution.md). An ARMED rule's fire is the OS
-    # noticing a known gap, not a supervisor's judgement, and the label says which.
-    # `rule_dry_run` is rendered for completeness although nothing writes it (§5 forbids
-    # a timeline event in dry run).
+    # The self-evolution registry's three (§6 of docs/superpowers/specs/2026-09-27-self-evolution.md)
     if kind == "rule_fired":
         return ("A rule recognised a known gap",
                 f"{p.get('detector_id') or ''}: {p.get('reason') or ''}")
@@ -412,8 +300,7 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         return ("A rule would have fired (dry run)", p.get("detector_id") or "")
     if kind == "rule_cleared":
         return ("The gap a rule recognised has cleared", p.get("detector_id") or "")
-    # The analyst's terminal action (`ops.submit_findings`). Labelled here because an
-    # unlabelled kind renders as a bare string beside a JSON blob — kn-3f133363.
+    # The analyst's terminal action (`ops.submit_findings`)
     if kind == "findings_submitted":
         n = p.get("findings")
         return ("Findings submitted",
@@ -427,11 +314,9 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         n = p.get("n")  # the number, not the text — §4
         return (f"Assumption #{n} recorded" if n else "Assumption recorded"), ""
     if kind == "question_asked":
-        # Never the text, with or without an id: the conversation renders the ask from
-        # this same payload, so a fallback here would print it twice on one page. `_ref`
-        # is the way to the question's own record, where the ANSWER is beside it.
+        # Never the text, with or without an id: the conversation renders the ask from this same payload
         return "Worker asked a question", ""
-    # Debug (see DEBUG_KINDS); they still render, with no detail, when asked for.
+    # Debug (see DEBUG_KINDS); they still render, with no detail, when asked for
     if kind == "neo_answered":
         return "Neo answered the worker", ""
     if kind == "neo_dispatched":
@@ -443,31 +328,18 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         verb = "accepted" if p.get("accepted") else "rejected"
         count = p.get("count")
         return f"Assumptions {verb}", f"{count} assumption(s)" if count else ""
-    # Auto-review's (`ops.AUTOREVIEW_EVENTS`, all of them), and they belong directly
-    # under `reviewed` because they are the
-    # same act by a different hand. THE VERB SAYS WHO: "accepted" above is the user, so
-    # every line here names the OS, on the surface that narrates what happened to a work
-    # order. `ops.autoreview_state` renders only the NEWEST of these as its one-line
-    # summary, so an order where the OS decided two assumptions and left a third is
-    # readable nowhere else — and a kind with no branch here falls through to the generic
-    # renderer, which `event_level` labels "signal": it looks fine on the page and tells
-    # the reader nothing (kn-3f133363).
+    # Auto-review's (`ops.AUTOREVIEW_EVENTS`
     if kind == "autoreview_asked":
         return (f"Asked Neo to rule on assumption #{p.get('n')}",
                 f"question {p['neo_question_id']}" if p.get("neo_question_id") else "")
     if kind == "autoreview_accepted":
-        # The model is in the label, not the detail: "the OS accepted it" and "THIS model
-        # accepted it" are different claims, and the record must never make the weaker one
-        # look like the user's. Same words as `ops.assumption_decider` for one reason.
+        # The model is in the label, not the detail: "the OS accepted it" and "THIS model accepted it" are...
         model = p.get("model") or "model not recorded"
         return (f"Assumption #{p.get('n')} accepted by the OS "
                 f"(Neo, {model}) — not by you",
                 p.get("reason") or "no reason recorded")
     if kind == "autoreview_escalated":
-        # `dropped` means the OS had a ruling and threw it away because the state moved
-        # under it (spec §5.1). Worth saying: "left with you" alone would read as Neo
-        # declining, and a reader deciding whether to trust the feature needs the two
-        # apart.
+        # `dropped` means the OS had a ruling and threw it away because the state moved under it (spec §5.1)
         why = " — the OS dropped its ruling when the work order changed" if p.get(
             "dropped") else ""
         return (f"Assumption #{p.get('n')} left with you{why}",
@@ -475,11 +347,7 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "autoreview_held":
         return (f"The OS would not decide assumption #{p.get('n')}",
                 p.get("reason") or "no reason recorded")
-    # ...and the early pass's five (docs/superpowers/specs/2026-09-23-an-assumption-
-    # judged-while-the-worker-still-runs.md §4.4). Same rule as above — THE VERB SAYS
-    # WHO — plus one this half must never lose: an early verdict SETTLES NOTHING, and a
-    # line that reads like a decision would tell the user their gate had opened when it
-    # had not.
+    # ...and the early pass's five (docs/superpowers/specs/2026-09-23-an-assumption-...
     if kind == "autoreview_provisional":
         verdict = p.get("verdict") or "judged"
         model = p.get("model") or "model not recorded"
@@ -487,9 +355,7 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                 f"typing: {verdict}, provisionally (Neo, {model}) — nothing settled",
                 p.get("reason") or "no reason recorded")
     if kind == "autoreview_objected":
-        # The transport is in the detail, not the label: "the worker was told" is the
-        # claim, and it is only true once `autoreview_objection_withdrawn` has not
-        # happened — which is the next line when it does.
+        # The transport is in the detail
         how = p.get("transport") or "queue"
         return (f"The OS objected to assumption #{p.get('n')} and sent it to the worker",
                 f"over the {how}: {p.get('reason') or 'no reason recorded'}")
@@ -498,8 +364,7 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                 f"never told",
                 p.get("reason") or "no reason recorded")
     if kind == "autoreview_confirmed":
-        # `autoreview_accepted`'s words and its reason: the model belongs in the label,
-        # because "the OS accepted it" and "THIS model accepted it" are different claims.
+        # `autoreview_accepted`'s words and its reason: the model belongs in the label
         model = p.get("model") or "model not recorded"
         return (f"Assumption #{p.get('n')} confirmed against the result and accepted "
                 f"by the OS (Neo, {model}) — not by you",
@@ -511,31 +376,22 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "learning_captured":
         return "Learning captured", p.get("topic") or ""
     if kind == "prefix_drift":
-        # Labelled an early warning on the surface too, and not only in the code that
-        # computes it: `jarvis doctor`'s INV-PREFIX-DRIFT reads what the API actually
-        # billed, this reads what went into the prompt, and a reader who meets this line
-        # first must not take it for the measurement (hooks.note_prefix).
+        # Labelled an early warning on the surface too
         return ("Prompt prefix moved — early warning, not a measurement",
                 f"{_prefix_changes(p)}. This turn's cached prefix was probably re-written, "
                 f"so the conversation so far was re-sent; `jarvis doctor` reports what it "
                 f"actually cost.")
     if kind == "gate_requested":
-        # The seat, when a subagent tripped the gate. `add_approval` only writes the key
-        # when there is one, so the unqualified line is still what a plain worker gets.
+        # The seat, when a subagent tripped the gate
         who = f" (seat `{p['agent_type']}`)" if p.get("agent_type") else ""
-        # A held request was RECORDED, not asked: the worker ran the command and no
-        # reviewer has been shown anything. "Asked permission" would credit it with a
-        # review that has not started — see gates.AWAITING_CASE.
-        # A CONTEST is not a request for permission, and a record that says it is would
-        # be read later as an attempt at the action — see spec 2026-09-12 §1.
+        # A held request was RECORDED, not asked: the worker ran the command and no reviewer has been shown...
         verb = ("Contested the `%s` gate match — says this performs no privileged action"
                 % (p.get("kind") or "gate") if p.get("contested")
                 else "Ran a gated command — request recorded, awaiting its case"
                 if p.get("held") else f"Asked permission to {p.get('kind') or 'act'}")
         return (f"{verb}{who}", p.get("command") or "")
     if kind == "gate_amended":
-        # Not a second request — the same one, better argued. Said that way because a
-        # reader counting attempts at a privileged action must not count this as one.
+        # Not a second request — the same one, better argued
         return (f"Made the case for the pending `{p.get('kind') or 'gate'}` request",
                 p.get("command") or "")
     if kind == "gate_decided":
@@ -543,67 +399,38 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         return (f"{verb} by {p.get('by') or '?'}: {p.get('kind') or 'gate'}",
                 p.get("reason") or "")
     if kind == "gate_dismissed":
-        # Deliberately not phrased as a verdict on the worker. Nothing was authorised and
-        # nothing was refused: the OS's own recogniser misfired, and the record has to say
-        # so plainly or it reads later as a release someone waved through.
+        # Deliberately not phrased as a verdict on the worker
         return (f"Not a privileged action — the `{p.get('kind') or 'gate'}` gate matched "
                 f"this by mistake ({p.get('by') or '?'})",
                 p.get("reason") or "")
     if kind == "gate_superseded":
-        # Neither a verdict nor a dismissal: the question stopped being answerable. Said
-        # plainly so the record cannot be read as "someone approved this quietly".
+        # Neither a verdict nor a dismissal: the question stopped being answerable
         return (f"Gate request closed unanswered — the `{p.get('kind') or 'gate'}` "
                 f"question no longer applies", p.get("reason") or "")
     if kind == "gate_abandoned":
-        # Not a denial. Nobody reviewed it, so nobody refused it — and on the evidence
-        # this is usually the worker routing around a recogniser false positive, which
-        # is why `abandoned_count` exists. Spec 2026-09-12 §4.
+        # Not a denial
         return (f"Gate request abandoned — no case was ever made for the "
                 f"`{p.get('kind') or 'gate'}` block, and nothing was decided",
                 p.get("reason") or "")
     if kind == "gate_escalated":
         return "Gate approval escalated to you", p.get("reason") or ""
     if kind == "gate_opened":
-        # The moment the privileged command actually ran — the most audit-relevant
-        # entry a work order can have, so it is never debug. Unless it was never
-        # privileged, in which case calling it "the approved command" would write the
-        # exact falsehood the dismissed verdict exists to keep out of the record.
+        # The moment the privileged command actually ran
         if p.get("clearance") == "dismissed":
             return (f"Ran the command the `{p.get('kind') or 'gate'}` gate had matched "
                     f"by mistake", "no privileged action was authorised")
         return (f"Ran the approved {p.get('kind') or 'command'}",
                 f"use {p.get('use')} of {p.get('of')}")
-    # The validation loop. Seven kinds rather than one with an outcome in the payload,
-    # because each is the whole story a reader wants at a glance — and each gets a
-    # LABEL of its own here. `event_level` returns "signal" for anything it does not
-    # know, so these arriving unclassified would look fine on the timeline while
-    # rendering as a bare kind and a JSON blob.
+    # The validation loop
     if kind == "validation_submitted":
         rnd = p.get("round")
         return ("Submitted for validation",
                 f"round {rnd}" if rnd else "")
     if kind == "validation_forced":
-        # A SIXTH kind, and the only one no worker produced — `jarvis validation force`,
-        # a person re-opening the round. It says so in the LABEL rather than only in the
-        # detail: the whole point of the command is that a forced re-judgement must not
-        # read afterwards like a worker re-delivering, and the timeline is where that
-        # reading happens. The reason is the ask the operator answered, so like
-        # `validation_rejected` it is shown rather than folded away.
-        #
-        # AND THE OS FORCES ONE TOO now that a moved head re-judges itself (spec
-        # docs/superpowers/specs/2026-09-19-a-moved-head-re-judges-itself.md §5). The
-        # label separates them for the reason it exists in the first place: a round no
-        # person asked for must not read afterwards as one they did.
+        # A SIXTH kind, and the only one no worker produced (docs/superpowers/specs/2026-09-19-a-moved-head-re-judges-itself.md §5)
         rnd, was = p.get("round"), p.get("was")
         who = "by the OS" if str(p.get("by") or "") == "os" else "by hand"
-        # A REBIND says so beside the number: round 4 under `max_rounds` 3 reads as a
-        # spent budget otherwise (spec 2026-09-27 §4.3).
-        #
-        # ...AND SO DOES THE OTHER UNCOUNTED CAUSE, which is NOT a rebind: nobody merged
-        # anything, the user asked for the rework, and the line has to say so. `cause`
-        # is `ops.USER_REWORK_CAUSE` / `ops.REBIND_CAUSE`, quoted as a literal like
-        # "patch_id" below because this module imports nothing from `jarvis`. A row
-        # written before the cause existed carries only `rebind`, and reads as one.
+        # A REBIND says so beside the number: round 4 under `max_rounds` 3 reads as a spent budget otherwise...
         cause = str(p.get("cause") or ("rebind" if p.get("rebind") else ""))
         spent = (", no round spent — the rework you asked for"
                  if cause == "user_rework"                  # ops.USER_REWORK_CAUSE
@@ -613,16 +440,12 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                 f"{p.get('reason') or ''}"
                 + (f" (was {was})" if was else ""))
     if kind == "validation_head_carried":
-        # THE ROUND THAT WAS NOT SPENT, and Neo's second condition for allowing it (spec
-        # docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §4): a
-        # carry has to be auditable from `jarvis wo show` alone. Both causes render
-        # through one branch, for `ProjectStore.validated_head`'s one-home reason.
+        # THE ROUND THAT WAS NOT SPENT, and Neo's second condition for allowing it (spec... (docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §4)
         judged = str(p.get("judged_sha") or "")
         now = str(p.get("carried_head_sha") or "")
         n = len(p.get("chain") or ()) or 1
         base = p.get("base") or "the base"
-        # Not every walked merge is a merge of the base since Neo question 806 widened
-        # proof (a): one the judged commit already contained counts too (§3.2 item 6).
+        # Not every walked merge is a merge of the base since Neo question 806 widened proof (a): one the...
         bases = p.get("merged_base_shas")
         n_base = n if bases is None else len(bases)
         how = (f"{n} merge(s) of {base} and nothing else" if n_base == n else
@@ -632,9 +455,7 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                 f"round {p.get('round')} passed on {judged[:10]}; it now covers "
                 f"{now[:10]}, which is {judged[:10]} plus {how}")
     if kind == "validation_carry_refused":
-        # The other half, and it must NAME THE PROOF: "someone resolved a conflict" and
-        # "the daemon could not reach GitHub" are different news, and the round about to
-        # be spent is only justified by the first.
+        # The other half, and it must NAME THE PROOF: "someone resolved a conflict" and "the daemon could not...
         head, proof = str(p.get("head_sha") or ""), str(p.get("proof") or "")
         detail = {
             "patch_id": (f"the diff on {head[:10]} is not the diff round "
@@ -647,11 +468,7 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         }.get(proof, str(p.get("detail") or "the proof could not be made"))
         return "Verdict not carried — re-judging", detail
     if kind == "validation_rejudge_declined":
-        # The one moved head the OS will NOT re-judge: the round it would open is the
-        # last one, and that one is the user's (same spec, §4).
-        # ...and the OTHER decline, which `max_rounds` cannot answer: the OS re-judged
-        # the merge it asked for as often as it may (spec
-        # 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.5).
+        # The one moved head the OS will NOT re-judge: the round it would open is the last one
         head = str(p.get("head_sha") or "")[:10]
         if str(p.get("cause") or "") == "rebind_exhausted":     # ops.REBIND_EXHAUSTED
             return ("Left for you to re-judge",
@@ -661,29 +478,20 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                 f"the head is now {head} and round "
                 f"{p.get('next_round')} of {p.get('max_rounds')} would be the last")
     if kind == "validation_follow_ups_filed":
-        # A SEVENTH kind, and the only one that is not a verdict: the round's
-        # non-blocking remarks, filed as issues on the project's own tracker instead of
-        # sent back (spec §4.6, and the user's ruling of 2026-09-16 on where they go).
-        # NO SEAT IS NAMED — the payload carries them, and the timeline is read by the
-        # submitter; which reviewer said it belongs in the issue body and on
-        # `jarvis validation show` (spec §4.7).
+        # A SEVENTH kind, and the only one that is not a verdict: the round's non-blocking remarks
         items = [i for i in (p.get("items") or ()) if isinstance(i, dict)]
         kept = [i for i in (p.get("withheld") or ()) if isinstance(i, dict)]
         dropped, failed = int(p.get("dropped") or 0), int(p.get("failed") or 0)
         parts = [f"#{i.get('number')}" if i.get("number") else str(i.get("url") or "")
                  for i in items]
-        # KEPT IS NOT FILED AND NOT LOST, and the label has to be able to say the third
-        # thing: no issue was opened because the text may not be published there, and the
-        # finding is on the record in full (`ops.file_validation_follow_ups`).
+        # KEPT IS NOT FILED AND NOT LOST
         if kept:
             parts.append(f"{len(kept)} kept on the internal record"
                          + (f" — {p['reason']}" if p.get("reason") and not failed
                             else ""))
         if dropped:
             parts.append(f"{dropped} more over the cap")
-        # A FINDING THAT COULD NOT BE FILED IS THE INTERESTING ONE. Filing crosses a
-        # network, so it can fail where the backlog row it replaced could not, and a
-        # reader who is not told simply never learns the remark existed.
+        # A FINDING THAT COULD NOT BE FILED IS THE INTERESTING ONE
         if failed:
             parts.append(f"{failed} could not be filed"
                          + (f" — {p['reason']}" if p.get("reason") else ""))
@@ -700,41 +508,23 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "validation_passed":
         return "Validation passed", p.get("reason") or ""
     if kind == "validation_rejected":
-        # The reason IS the ask the worker has to answer, so unlike the "answered"
-        # kinds above it is shown here: nothing else in the timeline carries it.
-        #
-        # A REJECTED USER-REWORK ROUND SAYS NO ROUND WAS SPENT, for the reason the
-        # forced line above does: the row number runs past `max_rounds` and a reader
-        # counting it against the budget concludes it is gone when it is untouched
-        # (Neo question 973). "user_rework" is `ops.USER_REWORK_CAUSE`.
+        # The reason IS the ask the worker has to answer
         if str(p.get("uncounted_cause") or "") == "user_rework":
             return ("Validation rejected — sent back, no round spent (the rework you "
                     "asked for)", p.get("reason") or "")
-        # Spec §7:
-        # docs/superpowers/specs/2026-10-13-a-red-head-is-sent-back-before-the-panel.md
+        # Spec §7: docs/superpowers/specs/2026-10-13-a-red-head-is-sent-back-before-the-panel.md
         if str(p.get("uncounted_cause") or "") == "red_ci":
             return ("Validation rejected — sent back unjudged, no round spent (CI was "
                     "red)", p.get("reason") or "")
         return "Validation rejected — sent back", p.get("reason") or ""
     if kind == "validation_bounced":
-        # NO ROUND WAS SPENT and the line has to say so, or a reader counts this against
-        # `max_rounds` and concludes the budget is gone when it is untouched. The paths
-        # are the whole justification — spec
-        # docs/superpowers/specs/2026-09-22-a-round-must-answer-the-list.md §7.
+        # NO ROUND WAS SPENT and the line has to say so (docs/superpowers/specs/2026-09-22-a-round-must-answer-the-list.md §7.)
         cited = ", ".join(str(c) for c in (p.get("cited") or ()))
         return (f"Sent back without a review round — nothing round "
                 f"{p.get('after_round')} asked about changed",
                 f"unchanged since that round: {cited}" if cited else "")
     if kind == "validation_escalated":
-        # WHICH FAMILY, not merely that a round escalated: "gave up" read as "nobody
-        # judged this" for the three causes that are a REJECTION being handed over (spec
-        # docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md
-        # §1, issue #1040), and the rejection wording read as a DECISION for the three
-        # where no seat judged the submission at all — hence the third set. The verbs are
-        # `ops.ESCALATION_VERB`'s, quoted as literals like "user_rework" above because
-        # this module imports nothing from `jarvis`; tests/test_timeline.py pins all three
-        # sets against `ops.ESCALATION_FAMILY`. A payload written before the field existed
-        # has no cause and says so.
+        # WHICH FAMILY, not merely that a round escalated: "gave up" read as "nobody judged this" for the... (docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md §1)
         cause = str(p.get("cause") or "")
         if cause in ESCALATION_HANDOVER:
             return ("Validation was rejected and handed to you", p.get("reason") or "")
@@ -745,42 +535,27 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                     p.get("reason") or "")
         return ("Validation was escalated — over to you", p.get("reason") or "")
     if kind == "validation_void":
-        # NOT a give-up and NOT a verdict, and the label has to say both: nobody judged
-        # this, and nobody needs to. A reader who takes it for an escalation goes looking
-        # for a decision the OS is not waiting on.
+        # NOT a give-up and NOT a verdict
         return ("Validation voided — nothing for a reviewer to judge",
                 p.get("reason") or "")
     if kind == "validation_failed":
-        # A FIFTH kind, and the one most easily misread: nothing judged the work here.
-        # A reader who takes this for a rejection goes looking for something to fix that
-        # nobody ever asked for, so each cause gets a sentence of its own.
+        # A FIFTH kind, and the one most easily misread: nothing judged the work here
         if p.get("cause") == "no_validator":
             return ("Validation skipped — no validator was configured",
                     p.get("reason") or "")
         if p.get("cause") == "ci_pending":  # project_store.VALIDATION_CI_CAUSE
-            # A FOURTH cause, and the most ordinary thing on this list: the pull request
-            # was submitted and GitHub has not finished running the checks the panel
-            # judges the declared evidence against. Nothing is wrong and nobody is
-            # needed. The line names the checks rather than the moment — unlike the
-            # usage window below, CI does not say when it will be done, and "waiting for
-            # unit (3.11)" is what a reader can go and look at.
+            # A FOURTH cause, and the most ordinary thing on this list: the pull request was submitted and GitHub...
             waiting = ", ".join(str(c) for c in (p.get("pending") or ()))
             return ("Validation waiting for CI",
                     f"still running: {waiting}" if waiting else "")
         if p.get("cause") == "usage_limit":  # project_store.VALIDATION_HELD_CAUSE
-            # A THIRD cause, and the one a reader must not take for either of the others:
-            # nothing is wrong, nobody is needed, and the round goes again by itself. The
-            # moment is the whole content of the line (GitHub issue #235).
+            # A THIRD cause, and the one a reader must not take for either of the others: nothing is wrong (#235)
             when = _clock(p.get("reopens_at"))
             return ("Validation held — the Claude usage window is spent",
                     (f"resuming by itself at {when}" if when else "")
                     + (f" · {p.get('error')}" if p.get("error") else ""))
         if p.get("cause") == "auth":  # project_store.VALIDATION_AUTH_CAUSE
-            # A FIFTH cause, and the one whose old reading cost four work orders a round
-            # and a user each (GitHub issue #778): the seats were reached and refused for
-            # want of a sign-in, which is neither a verdict nor a reviewer being down. NO
-            # `_clock(reopens_at)`, unlike the usage window above — that moment is a
-            # recheck interval, not a deadline anything stated (spec §7).
+            # A FIFTH cause, and the one whose old reading cost four work orders a round and a user each (GitHub... (#778)
             attempt = p.get("attempt")
             return ("Validation held — Claude Code could not authenticate",
                     f"attempt {attempt}: {p.get('error') or ''}")
@@ -788,20 +563,48 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         return ("Validation could not be run — the reviewer was unreachable",
                 f"attempt {attempt}: {p.get('error') or ''}" if attempt
                 else (p.get("error") or ""))
-    # The conflict-healing loop, on the timeline so that a give-up arrives with the
-    # record of what was already tried (spec §6 of
-    # docs/superpowers/specs/2026-08-22-a-work-order-heals-its-own-pull-request.md).
+    # The conflict-healing loop, on the timeline so that a give-up arrives with the record of what was... (docs/superpowers/specs/2026-08-22-a-work-order-heals-its-own-pull-request.md)
     if kind == "pr_conflict_nudged":
         of = p.get("of")
         return ("Merge conflict — asked the worker to resolve it",
                 f"attempt {p.get('attempt')} of {of}" if of else "")
     if kind == "pr_conflict_cleared":
         return "Merge conflict resolved", ""
+    # wo-d3a70c29: evidence, not an alarm
+    if kind == "pr_recompute_stalled":
+        # TWO CONDITIONS, TWO SENTENCES
+        ref, head = str(p.get("ref_oid") or ""), str(p.get("head_oid") or "")
+        title = "GitHub stopped recomputing the pull request"
+        if ref and head:
+            return title, (f"branch at {ref[:10]}, pull request head at {head[:10]}")
+        since = _clock(p.get("unknown_since"))
+        return title, (f"mergeability unanswered since {since}" if since
+                       else "mergeability unanswered")
+    # ...and the remedy, which the OS now performs instead of the user (wo-7ec57748)
+    if kind == "pr_resync_started":
+        ref, head = str(p.get("ref_oid") or ""), str(p.get("head_oid") or "")
+        return ("Closing and reopening the pull request to make GitHub recompute it",
+                (f"branch at {ref[:10]}, pull request head at {head[:10]}"
+                 if ref and head else str(p.get("pr_url") or "")))
+    if kind == "pr_resync_done":
+        # TWO WRITERS, ONE EVENT KIND, told apart by `observed`: the OS's own reopen returning
+        if p.get("observed"):
+            head = str(p.get("head_oid") or "")
+            return ("Pull request is open again — the resync window is over",
+                    f"head at {head[:10]}" if head else "")
+        return "Pull request closed and reopened — waiting for GitHub to answer", ""
+    if kind == "pr_resync_failed":
+        # THE STAGE IS THE WHOLE POINT: a close that failed changed nothing
+        return (f"Could not {p.get('stage') or 'resync'} the pull request to resync it",
+                str(p.get("error") or p.get("reason") or ""))
+    if kind == "pr_resync_cleared":
+        head = str(p.get("head_oid") or "")
+        return ("GitHub is recomputing the pull request again",
+                f"head at {head[:10]}" if head else "")
     if kind == "pr_conflict_unresolved":
         return ("Merge conflict the worker could not resolve — over to you",
                 f"{p.get('attempts')} attempts")
-    # Issue #469: the two lines that say an attempt was NOT spent, and why. Neither
-    # asks anything of the user — the gate is the item that does.
+    # Issue #469: the two lines that say an attempt was NOT spent, and why
     if kind == "pr_conflict_deferred":
         return ("Merge conflict — waiting for gate "
                 f"{p.get('approval_id')} before asking the worker",
@@ -809,9 +612,7 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "pr_conflict_rearmed":
         return ("Merge conflict — attempts given back, the gate had refused them",
                 f"{p.get('attempts')} attempts restored")
-    # The same three for the other repair (issue #224). Separate lines rather than one
-    # parameterised pair: the words a user reads about a red build are not the words
-    # they read about a conflict, and this function is a vocabulary, not a mechanism.
+    # The same three for the other repair (issue #224)
     if kind == "pr_checks_nudged":
         of = p.get("of")
         return ("Failing checks — asked the worker to fix them",
@@ -830,35 +631,25 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "pr_checks_rearmed":
         return ("Failing checks — attempts given back, the gate had refused them",
                 f"{p.get('attempts')} attempts restored")
-    # "It fixed itself" has to be PROVABLE, which is the whole reason this event exists
-    # rather than a bare status change (issue #705).
+    # "It fixed itself" has to be PROVABLE (#705)
     if kind == "pr_repair_resettled":
         return ("Back in the merge queue — the reason it was held is gone",
                 f"was {p.get('was')}" if p.get("was") else "")
-    # ...and the inverse move, for the same reason. Spec §B of
-    # docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md.
+    # ...and the inverse move, for the same reason (docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md)
     if kind == "give_up_reparked":
         return ("Back on your list — the panel's give-up was never decided",
                 ", ".join(x for x in (f"was {p.get('was')}" if p.get("was") else "",
                                       f"round {p.get('round')}" if p.get("round")
                                       else "")
                           if x))
-    # THE ONLY `automerge_*` KINDS WITH LABELS HERE, and deliberately: every other one is
-    # rendered by `ops.automerge_state` as the mechanism's one-line state on the work
-    # order. These two are excluded from `ops.AUTOMERGE_EVENTS` — the state after either
-    # is "merged" — so the timeline is the only surface they have, and without a label
-    # they fall through to the kind plus a raw JSON payload (issue #253, spec §5.5).
-    #
-    # Two kinds and not one: only the first is a cleanup. Saying "the cleanup" about a
-    # merge command that TIMED OUT sends the reader hunting a branch deletion that was
-    # never attempted (`automerge.AFTER_MERGE_EVENT`).
+    # THE ONLY `automerge_*` KINDS WITH LABELS HERE (#253)
     if kind == "automerge_cleanup_failed":
         return ("The merge landed; the cleanup after it did not",
                 (p.get("reason") or "")[:200])
     if kind == "automerge_command_unfinished":
         return ("The merge command never finished — GitHub says the merge landed",
                 (p.get("reason") or "")[:200])
-    # Spec 2026-09-28 §3.1: the OS refused before GitHub heard anything.
+    # Spec 2026-09-28 §3.1: the OS refused before GitHub heard anything
     if kind == "automerge_base_stale":
         head = str(p.get("head_sha") or "")
         base = str(p.get("base") or "the base")
@@ -868,11 +659,7 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                 f"{head[:10] or 'an unknown commit'}, and {base} is now "
                 f"at {oid[:10] or 'a commit the OS could not read'}, which that commit "
                 f"does not contain — catching the branch up instead")
-    # THE TRACKER SIDE OF THE RECORD (issue #240). `issues.record_applied` writes one of
-    # these three after — and only after — GitHub accepted the change, so each is the
-    # evidence that a claim on the public tracker is now true. The timeline is their only
-    # surface: the issue itself shows the result, not when the OS decided it, and
-    # `issue_state` is a column nothing renders. kn-3f133363.
+    # THE TRACKER SIDE OF THE RECORD (issue #240)
     if kind == "issue_in_progress":
         return "Its GitHub issue says work is under way", p.get("issue_url") or ""
     if kind == "issue_released":
@@ -881,56 +668,41 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "issue_closed":
         return "Its GitHub issue was closed", p.get("issue_url") or ""
     if kind == "release_batched":
-        # On the RELEASE order, naming the fix it is carrying. Written once per fix, so a
-        # batched release reads as the list of bugs the next version closes.
+        # On the RELEASE order, naming the fix it is carrying
         return ("Carrying a landed fix into the next release",
                 " — ".join(x for x in (p.get("issue_url"), p.get("wo_id")) if x))
     if kind == "release_overtaken":
-        # On the RELEASE order: another release already carries its batch, and production
-        # has not caught up. Open on purpose, so the line says what it is waiting for —
-        # issue #784's spec §6, and kn-3f133363 for why it is not left to the fallback.
+        # On the RELEASE order: another release already carries its batch, and production has not caught up (#784)
         return ("Another release already carries these fixes",
                 p.get("detail") or (p.get("tag") or ""))
     if kind == "release_held_red_base":
-        # On the RELEASE order: the base is red, so the ship is deferred rather than
-        # attempted. Deduped per head sha, so one line per broken commit.
+        # On the RELEASE order: the base is red, so the ship is deferred rather than attempted
         return ("Holding the release — the base branch is red",
                 p.get("detail") or (p.get("base") or ""))
     if kind == "release_deferred_red_base":
-        # On the RELEASE order, mid-run: it delivered no release because the base is not
-        # buildable, so it waits rather than asking the user (2026-09-29 spec §1). Same
-        # head-sha dedupe as the hold above, one line per broken commit.
+        # On the RELEASE order, mid-run: it delivered no release because the base is not buildable
         return ("Waiting to ship — the base branch is not buildable",
                 p.get("detail") or (p.get("base") or ""))
     if kind == "release_park_red_base":
-        # ...and the end of that wait: past `Daemon.RED_PARK_AFTER_SECONDS` the release
-        # asks the user, once per episode (§3).
+        # ...and the end of that wait: past `Daemon.RED_PARK_AFTER_SECONDS` the release asks the user
         return ("Stopped waiting for the base branch and asked you",
                 p.get("detail") or (p.get("base") or ""))
     if kind == "release_completed":
-        # The ending itself, whichever path reached it: `why` is which one (release.py
-        # `settle`), and it is the whole difference between "we shipped it" and
-        # "somebody else did and the fleet is on it".
+        # The ending itself, whichever path reached it: `why` is which one (release.py `settle`)
         return "The release this order was filed for is done", p.get("why") or ""
     if kind == "pr_merge_commit_recorded":
-        # On the FIXING order, and NOT the branch tip: the commit the squash merge put on
-        # `main`, back-filled for a pull request that merged before the poller read it.
+        # On the FIXING order, and NOT the branch tip: the commit the squash merge put on `main`
         return ("Recorded the commit its merge put on the base branch",
                 p.get("merge_commit") or "")
     if kind == "deferral_submitted":
-        # The worker deciding something is not its job is a scope decision, and the
-        # timeline is the only place the user ever sees it: the item itself lands on the
-        # backlog, where nothing points back at this work order's story.
+        # The worker deciding something is not its job is a scope decision
         return ("Deferred something out of scope", p.get("title") or "")
     if kind == BACKGROUND_ORPHANED:
-        # The detector, on the timeline beside the void it puts on the message itself —
-        # spec §2. Names the jobs, because the id is what a reader checks against `ps`
-        # and what the OS's own alarm quoted.
+        # The detector, on the timeline beside the void it puts on the message itself — spec §2
         return ("A background job died with the turn that started it",
                 _job_labels(p) + " — nothing it was told to do has run")
     if kind == BACKGROUND_NUDGED:
-        # Says the OS did it, for `pr_checks_nudged`'s reason one surface along: a
-        # message nobody typed must not read afterwards as one the user sent.
+        # Says the OS did it, for `pr_checks_nudged`'s reason one surface along: a message nobody typed must...
         of = p.get("of")
         return ("Sent back to run it in the foreground",
                 f"attempt {p.get('attempt')} of {of}" if of else "")
@@ -940,11 +712,11 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "finished":
         return "Finished", p.get("summary") or ""
     if kind == "marked_done":
-        # The user closed it, not the worker — worth telling apart on the record.
+        # The user closed it, not the worker — worth telling apart on the record
         return "Marked done by you", (
             "the worker's turn was stopped" if p.get("session_stopped") else "")
     if kind == "retry_requested":
-        # §8 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+        # §8 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md
         return ("You retried this order",
                 "with your message" if p.get("authored")
                 else "the OS's own relaunch note — you sent no message")
@@ -955,38 +727,20 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         if p.get("repaired"):
             return "OS self-check repaired this", f"{detail} → {p.get('repair') or ''}"
         return "OS self-check failed", detail
-    # Unclassified or debug: show the kind and its raw payload.
+    # Unclassified or debug: show the kind and its raw payload
     return kind, json.dumps(p, sort_keys=True) if p else ""
 
 
-#: Message sources nobody decided: no user typed them, and no delegate chose to send
-#: them on the user's behalf either. Both are pull-request repairs a poll writes on
-#: seeing GitHub report CONFLICTING or a failed check (§6 of
-#: docs/superpowers/specs/2026-08-22-a-work-order-heals-its-own-pull-request.md, and
-#: docs/superpowers/specs/2026-09-13-a-work-order-never-sits-on-a-red-pull-request.md).
-#: The third is `background.SOURCE`: the note a resume carries when the last turn ended
-#: on a background job the OS caught dying with it (§4 of
-#: docs/superpowers/specs/2026-09-22-a-dead-background-job-is-not-a-live-one.md).
-#: The fourth is `worker_session.RESUME_SOURCE`: the relaunch queued behind a compaction
-#: (§3.5 of
-#: docs/superpowers/specs/2026-09-29-one-compaction-decision-on-every-relaunch.md).
+#: Message sources nobody decided: no user typed them (docs/superpowers/specs/2026-08-22-a-work-order-heals-its-own-pull-request.md)
 UNAUTHORED_SOURCES = frozenset({"pr-conflict", "pr-checks", "background-orphan",
                                 "relaunch"})
 
-#: `remedies.MESSAGE_SOURCE`, spelled out here for the reason `ALARM_KINDS` is: this
-#: module is a leaf and opens nothing. A test pins the two equal. Deliberately NOT a
-#: member of `UNAUTHORED_SOURCES` above — an unauthored message is one nobody decided,
-#: and the supervisor decided this one, under a grant it had to be given first (§6 of
-#: docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md).
+#: `remedies.MESSAGE_SOURCE`, spelled out here for the reason `ALARM_KINDS` is: this module is a leaf... (docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md)
 SUPERVISOR_SOURCE = "supervisor"
 
 
 def _message_label(m: dict[str, Any]) -> str:
-    """Who is speaking, from the message's own `source` — §5.
-
-    The conversation's label: two parties and an arrow, because the reader is looking
-    at the words. The timeline wants a sentence instead; see `_message_event_label`.
-    """
+    """Who is speaking, from the message's own `source` — §5"""
     if m.get("direction") != "user_to_agent":
         return "worker → you"
     if m.get("source") == "neo":
@@ -999,21 +753,14 @@ def _message_label(m: dict[str, Any]) -> str:
 
 
 def _message_event_label(m: dict[str, Any]) -> str:
-    """What happened, for the timeline — the same `source` rule, worded as an event.
-
-    A timeline entry is a sentence about a moment, not a speaker tag: the body it used
-    to carry is a click away in the conversation, and "Neo → worker" over an empty
-    detail says less than "Neo answered the worker" does.
-    """
+    """What happened, for the timeline — the same `source` rule, worded as an event"""
     if m.get("direction") != "user_to_agent":
         return "Worker replied"
     if m.get("source") == "neo":
-        # `source="neo"` is written in exactly one place (`daemon._neo_drain`), and only
-        # for the message carrying an answer — so this cannot mislabel anything else.
+        # `source="neo"` is written in exactly one place (`daemon._neo_drain`)
         return "Neo answered the worker"
     if m.get("source") == SUPERVISOR_SOURCE:
-        # The same arm as `_message_label`'s, and it needs its own: without it a nudge
-        # the user never sent reads on the timeline as "You messaged the worker".
+        # The same arm as `_message_label`'s
         return "The supervisor messaged the worker"
     if m.get("source") in UNAUTHORED_SOURCES:
         return "Jarvis messaged the worker"
@@ -1021,11 +768,7 @@ def _message_event_label(m: dict[str, Any]) -> str:
 
 
 def _message_ref(m: dict[str, Any]) -> dict[str, Any] | None:
-    """The conversation turn this entry points at, or None if it has no id.
-
-    Corollary 1 of §1 in reverse: an id that cannot be resolved is not a pointer, so a
-    message the store never gave an id keeps its text on the timeline instead.
-    """
+    """The conversation turn this entry points at, or None if it has no id"""
     mid = m.get("id")
     if mid is None:
         return None
@@ -1033,11 +776,7 @@ def _message_ref(m: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _job_labels(p: dict[str, Any]) -> str:
-    """The jobs in a `background_orphaned` payload, named for a person.
-
-    `background.Job.label`'s wording, written out again for the reason the constants
-    above are: this module imports nothing. A test pins the two renderings equal.
-    """
+    """The jobs in a `background_orphaned` payload, named for a person"""
     named = []
     for job in (p.get("jobs") or ()):
         if not isinstance(job, dict):
@@ -1051,12 +790,7 @@ def _job_labels(p: dict[str, Any]) -> str:
 
 
 def _voided(events: list[dict[str, Any]]) -> dict[Any, str]:
-    """Which messages the OS has since contradicted, keyed by message id — spec §3.
-
-    DERIVED at render time from the event the reaper wrote, never stored beside the
-    message: the fact has one home, every surface that builds the conversation reads it
-    from here, and no column had to be added to carry a second copy of it.
-    """
+    """Which messages the OS has since contradicted, keyed by message id — spec §3"""
     void: dict[Any, str] = {}
     for e in events:
         if e.get("kind") != BACKGROUND_ORPHANED:
@@ -1069,31 +803,14 @@ def _voided(events: list[dict[str, Any]]) -> dict[Any, str]:
 
 def build_conversation(events: list[dict[str, Any]],
                        messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Everything that was SAID about this work order, in the order it was said.
-
-    Messages are only half of it. The worker's question to Neo is a `question_asked`
-    event — `ops.neo_ask` writes the text into its payload precisely so that a record
-    built from the project store alone can show what was asked — and without it the
-    conversation opens on Neo's answer to a question that appears nowhere.
-
-    The supervisor's note and Neo's advice on a cost alarm arrive the same way and for
-    the same reason (§4). A VERDICT is not speech and stays on the timeline; a note
-    addressed to the user, and the advice that produced it, are.
-
-    Each turn: {ts, kind, who, content, anchor, ref, msg_id, source, status, inbound}.
-    `anchor` is the id every surface gives the turn, so that a timeline entry's
-    `{"kind": "message", "id": …}` ref resolves to the words. Stays pure — it never
-    opens a store, and in particular never opens Neo's.
-    """
+    """Everything that was SAID about this work order, in the order it was said"""
     turns: list[dict[str, Any]] = []
     for e in events:
         kind = e.get("kind")
         if kind not in ("question_asked", "alarm_reviewed", "alarm_advice"):
             continue
         p = _payload(e)
-        # `note` is empty by contract when the supervisor escalates, so the same guard
-        # that keeps a text-less question out also keeps an escalation's verdict out.
-        # An empty bubble is worse than no bubble; the timeline still has the event.
+        # `note` is empty by contract when the supervisor escalates
         text = str(p.get({"question_asked": "question", "alarm_reviewed": "note",
                           "alarm_advice": "answer"}[kind]) or "")
         if not text:
@@ -1121,8 +838,7 @@ def build_conversation(events: list[dict[str, Any]],
         mid = m.get("id")
         turns.append({
             "ts": m.get("ts") or 0.0, "kind": "message", "who": _message_label(m),
-            # BEFORE `content`, so the CLI's generic printer renders the retraction
-            # above the words it retracts rather than below them (spec §3).
+            # BEFORE `content`, so the CLI's generic printer renders the retraction above the words it retracts...
             "void": void.get(mid, ""),
             "content": m.get("content") or "",
             "anchor": f"msg-{mid}" if mid is not None else "",
@@ -1137,23 +853,14 @@ def build_conversation(events: list[dict[str, Any]],
 def build_timeline(wo: dict[str, Any], events: list[dict[str, Any]],
                    messages: list[dict[str, Any]],
                    *, include_debug: bool = False) -> list[dict[str, Any]]:
-    """Merge events and messages into time-ordered entries saying WHAT HAPPENED.
-
-    Each entry: {ts, level, kind, label, detail, ref}. Debug entries are omitted unless
-    `include_debug`. Stays pure — it never opens a store.
-
-    Messages are here as moments, not as text: they are what makes the timeline a
-    sequence rather than a list of lifecycle changes, and their words are the
-    conversation's, one `ref` away.
-    """
+    """Merge events and messages into time-ordered entries saying WHAT HAPPENED"""
     entries: list[dict[str, Any]] = []
     seen_assumptions = 0
     for e in events:
         kind = e.get("kind", "")
         payload = _payload(e)
         if kind == "assumption":
-            # Rows written before `add_assumption` stored `n` are numbered here, by the
-            # same rule and therefore to the same numbers — §4.
+            # Rows written before `add_assumption` stored `n` are numbered here
             seen_assumptions += 1
             payload = {**payload, "n": payload.get("n") or seen_assumptions}
         level = event_level(kind)

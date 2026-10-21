@@ -124,9 +124,7 @@ def test_the_cited_section_columns_migrate_onto_a_pre_existing_database(project)
 
 
 def test_assumptions_are_numbered_from_one_per_work_order(project):
-    """`n` is what the timeline says instead of repeating the text, so it has to be a
-    POSITION within this work order — a row id would start the second work order's list
-    at 3 — and it has to survive a review, which is what turns the list into a subset."""
+    """`n` is what the timeline says instead of repeating the text"""
     store = ProjectStore(project)
     a, b = store.create_work_order("a"), store.create_work_order("b")
     first = store.add_assumption(a["id"], "assumed sqlite")
@@ -135,12 +133,11 @@ def test_assumptions_are_numbered_from_one_per_work_order(project):
 
     assert [x["n"] for x in store.all_assumptions(a["id"])] == [1, 2]
     assert [x["n"] for x in store.all_assumptions(b["id"])] == [1]
-    # The event says the same number, so the timeline and the listing agree.
+    # The event says the same number, so the timeline and the listing agree
     events = [e for e in store.list_events(a["id"]) if e["kind"] == "assumption"]
     assert [json.loads(e["payload"])["n"] for e in events] == [1, 2]
 
-    # Reviewing #1 leaves #2 called #2. Renumbering the remainder would rewrite what the
-    # timeline already said about an assumption nobody touched.
+    # Reviewing #1 leaves #2 called #2
     store.review_assumption(first, "accepted")
     assert [x["n"] for x in store.pending_assumptions(a["id"])] == [2]
     store.close()
@@ -201,11 +198,7 @@ def test_knowledge_relevance(jarvis_home):
 
 
 def test_status_counts_are_not_capped_by_the_listing_limit(project):
-    """Counted in SQL, so a project with more history than one page still adds up.
-
-    `list_work_orders` stops at `limit`; counting its result would under-report exactly
-    where the count matters most.
-    """
+    """Counted in SQL, so a project with more history than one page still adds up"""
     store = ProjectStore(project)
     for i in range(5):
         store.set_status(store.create_work_order(f"done {i}")["id"], "completed")
@@ -221,26 +214,15 @@ def test_status_counts_are_not_capped_by_the_listing_limit(project):
     assert len(store.list_work_orders(limit=2)) == 2  # the listing still pages
 
 
-# -- the validation panel's storage ---------------------------------------------------
-#
-# Rounds hang off EITHER a work order or a feature order. That polymorphism is where
-# every trap in this table lives, and each test below pairs the thing that must fail
-# with the thing that must still work — because the two obvious wrong schemas each pass
-# one half cleanly.
+# -- the validation panel's storage
 
 
 def test_validating_sits_between_the_worker_and_the_review(project):
-    """The INDEX, not mere membership.
-
-    WO_STATUSES is the order the dashboard renders status counts in, so a status
-    appended at the end passes every `in` test and still reads wrong on the page.
-    """
+    """The INDEX, not mere membership"""
     assert WO_STATUSES.index("validating") == WO_STATUSES.index("needs_review") - 1
     assert FO_STATUSES.index("validating") == FO_STATUSES.index("executing") + 1
     assert FO_STATUSES.index("validating") == FO_STATUSES.index("completed") - 1
-    # A unit under validation holds a live session — so it is open, and it spends a
-    # feature's `max_parallel` — but no turn is in flight, so it spends no
-    # `max_concurrent` slot (issue #134) and it is not settled.
+    # A unit under validation holds a live session (#134)
     assert "validating" in OPEN_STATUSES and "validating" in ACTIVE_STATUSES
     assert "validating" not in SLOT_STATUSES
     assert "validating" in FO_OPEN_STATUSES
@@ -250,13 +232,7 @@ def test_validating_sits_between_the_worker_and_the_review(project):
 
 def test_a_round_number_is_unique_per_subject_but_the_two_subjects_are_independent(
         project):
-    """The partial indexes have to actually bite.
-
-    `UNIQUE (wo_id, fo_id, round)` is the natural-looking schema and it enforces
-    NOTHING: every row has a NULL in one id column and SQLite treats NULLs as distinct.
-    It would pass the coexistence half below — which is the half that feels interesting
-    — and fail both duplicate halves, so the three have to be asserted together.
-    """
+    """The partial indexes have to actually bite"""
     store = ProjectStore(project)
     wo = store.create_work_order("x")
     fo = store.create_feature_order("f")
@@ -331,7 +307,7 @@ def test_deleting_a_feature_order_takes_its_rounds_and_leaves_its_siblings(proje
 
 
 def test_a_seat_speaking_twice_replaces_its_opinion(project):
-    """A retried seat must leave one row, not two: the arbiter counts verdicts."""
+    """A retried seat must leave one row, not two: the arbiter counts verdicts"""
     store = ProjectStore(project)
     wo = store.create_work_order("x")
     rnd = store.open_validation_round(wo_id=wo["id"], fingerprint="f")
@@ -396,23 +372,12 @@ def test_the_manager_the_analyst_and_the_investigator_are_the_other_kinds(projec
         store.create_work_order("x", kind="supervisor")
 
 
-# -- write transactions and a second connection ---------------------------------------
-#
-# The daemon reaches one project database from several threads at once, each with its
-# OWN connection (`Daemon._validate_feature`). WAL lets a reader and a writer coexist,
-# with ONE exception: a transaction that READS before it WRITES holds a snapshot, and
-# the upgrade to a write fails outright if anyone committed after that snapshot was
-# taken. The failure is SQLITE_BUSY_SNAPSHOT — `database is locked`, raised WITHOUT
-# consulting `busy_timeout`, so nothing configured in `db.connect` can wait it out.
+# -- write transactions and a second connection
 
 
 def _writes_from_another_thread(project) -> tuple[threading.Thread, threading.Event,
                                                   threading.Event]:
-    """A second connection committing one row, on the daemon's side of the fence.
-
-    Opened INSIDE the thread: a sqlite connection belongs to the thread that made it,
-    which is why the daemon's validate pool opens its own (`Daemon._validate_feature`).
-    """
+    """A second connection committing one row, on the daemon's side of the fence"""
     go, done = threading.Event(), threading.Event()
 
     def interloper() -> None:
@@ -428,10 +393,7 @@ def _writes_from_another_thread(project) -> tuple[threading.Thread, threading.Ev
 
 
 def test_releasing_a_plan_survives_a_commit_from_another_connection(project):
-    """The race that flaked CI: `review_plan` creating a feature's children while the
-    daemon's validate thread commits to the same database. The interloper is let in
-    between the transaction's first read and its first write — the one window in which
-    a snapshot exists to go stale."""
+    """The race that flaked CI: `review_plan` creating a feature's children while the daemon's validate..."""
     store = ProjectStore(project)
     fo = store.create_feature_order("a feature", description="the ask")
     plan = [{"key": "one", "title": "Build one", "description": "d", "needs": []},
@@ -442,8 +404,7 @@ def test_releasing_a_plan_survives_a_commit_from_another_connection(project):
     read = False
 
     def let_the_other_thread_in(sql: str) -> None:
-        """Fires as each statement starts, so arming on the INSERT puts the interloper
-        after the SELECT has taken the snapshot and before the write is attempted."""
+        """Fires as each statement starts"""
         nonlocal read
         head = sql.strip().split()[0].upper()
         if head == "SELECT":
@@ -465,10 +426,7 @@ def test_releasing_a_plan_survives_a_commit_from_another_connection(project):
 
 
 def test_only_db_write_transaction_opens_a_transaction():
-    """THE GUARD. The hazard above is invisible at the call site — a bare `BEGIN` reads
-    exactly like the safe thing — so the rule is checked on the source rather than left
-    to review. Every `BEGIN`/`COMMIT`/`ROLLBACK` in `src/jarvis` must be inside
-    `db.write_transaction`, which is the one place that knows to make it IMMEDIATE."""
+    """THE GUARD"""
     body, first = inspect.getsourcelines(db.write_transaction)
     allowed = range(first, first + len(body))
     offenders = []
@@ -486,9 +444,7 @@ def test_only_db_write_transaction_opens_a_transaction():
             if head not in ("BEGIN", "COMMIT", "ROLLBACK"):
                 continue
             if path.name == "db.py" and node.lineno in allowed:
-                # The one it is allowed to run, and only in its IMMEDIATE form: a
-                # deferred BEGIN here would put the hazard back in every call site at
-                # once, and it reads identically.
+                # The one it is allowed to run, and only in its IMMEDIATE form: a deferred BEGIN here would put the...
                 if head == "BEGIN" and sql.value.strip().upper() != "BEGIN IMMEDIATE":
                     offenders.append(f"{path.name}:{node.lineno} deferred BEGIN")
                 continue
@@ -500,11 +456,8 @@ def test_only_db_write_transaction_opens_a_transaction():
 
 
 def test_approvals_of_kind_is_not_bounded_by_the_generic_listings_window(project):
-    """`list_approvals` answers the 200 NEWEST rows of every kind, so one kind's row can
-    fall out of the window behind ordinary gate traffic. This query is per kind and per
-    status, so it cannot."""
-    # Fixture commands stay non-commands: a real `gh pr merge …` literal here trips the
-    # privileged-action recogniser on every write of this file and gates the session.
+    """`list_approvals` answers the 200 NEWEST rows of every kind"""
+    # Fixture commands stay non-commands: a real `gh pr merge …` literal here trips the privileged-action...
     store = ProjectStore(project)
     wo = store.create_work_order("x")
     wanted = store.add_approval(wo["id"], "self_heal", "fix wo-1", status="pending")
@@ -518,14 +471,11 @@ def test_approvals_of_kind_is_not_bounded_by_the_generic_listings_window(project
                                store.list_approvals(statuses=("approved",))]
     found = store.approvals_of_kind("self_heal", "approved")
     assert [a["id"] for a in found] == [wanted["id"]]
-    # One status only: the approved list never carries a pending row.
+    # One status only: the approved list never carries a pending row
     assert store.approvals_of_kind("self_heal", "pending") == []
 
 
-# -- the per-order observability override ----------------------------------------------
-#
-# §10 of docs/superpowers/specs/2026-09-24-order-observability.md, on `budget_usd`'s precedent:
-# nullable, and NULL is "this order has no answer" and not `off`.
+# -- the per-order observability override
 
 
 def test_the_observability_column_is_written_at_creation_and_by_the_setter(project):
@@ -546,8 +496,7 @@ def test_the_observability_column_is_written_at_creation_and_by_the_setter(proje
 
 
 def test_a_row_that_predates_the_column_has_no_answer_and_is_not_off(project):
-    """A pre-existing row: the column was added by `ADDED_COLUMNS`, so it is NULL — which
-    the resolver must treat as "no answer" and fall through to the config."""
+    """A pre-existing row: the column was added by `ADDED_COLUMNS`, so it is NULL"""
     from jarvis import observability
     from jarvis.catalog import ObservabilityConfig
 
@@ -563,17 +512,11 @@ def test_a_row_that_predates_the_column_has_no_answer_and_is_not_off(project):
     assert observability.records_context(row, ObservabilityConfig()) is True
 
 
-# -- what a fix order carries ----------------------------------------------------------
-#
-# §7.1 of docs/superpowers/specs/2026-09-27-self-evolution.md. Four nullable columns, no
-# backfill: every pre-existing row reads "not a fix order", which is true. The other half
-# of this pair — a row written BEFORE the columns existed — is in
-# tests/test_schema_upgrade.py, because a new column is untested until both exist.
+# -- what a fix order carries
 
 
 def test_the_self_evolution_columns_are_written_at_creation(project):
-    """Set STRUCTURALLY and never inferred from prose (kn-5d8a396a): they arrive as
-    keyword arguments, and nothing anywhere scans a description for them."""
+    """Set STRUCTURALLY and never inferred from prose (kn-5d8a396a): they arrive as keyword arguments"""
     store = ProjectStore(project)
     wo = store.create_work_order(
         "close the stale-hold gap", description="no slug appears in this text",
@@ -586,19 +529,14 @@ def test_the_self_evolution_columns_are_written_at_creation(project):
     assert row["remedy_rule_id"] == "rr-3"
     assert row["trigger_wo_id"] == "wo-trigger"
 
-    # The ordinary order, which is almost every order: all four NULL, and the empty
-    # string is stored as NULL so one reading of "not a fix order" reaches every reader.
+    # The ordinary order, which is almost every order: all four NULL
     plain = store.get_work_order(store.create_work_order("ordinary")["id"])
     assert [plain["gap_class"], plain["detector_id"], plain["remedy_rule_id"],
             plain["trigger_wo_id"]] == [None, None, None, None]
 
 
 def test_an_uncounted_round_records_why_it_is_uncounted(project):
-    """Two causes now open a round outside the budget — the OS's own merge rebind and
-    the rework a USER asked for — and each has its own bound, so a counter that could
-    not tell them apart would let one spend the other's budget (spec
-    docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md,
-    Neo question 973)."""
+    """Two causes now open a round outside the budget (docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md)"""
     from jarvis import ops
 
     store = ProjectStore(project)

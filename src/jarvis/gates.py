@@ -1,47 +1,4 @@
-"""Gated actions — privileged operations a worker may attempt but not unilaterally do.
-
-A worker developing the OS needs to be able to *ship*: merge its PR, cut a release.
-The first cut of that guard rail was a hard `deny` rule in the catalog, which is a wall,
-not a gate — it stops the action and there is no way through it short of the user editing
-their catalog. Progress on the OS stalled behind exactly that wall.
-
-This module replaces the wall with a gate. A worker attempts the real command; the
-PreToolUse hook classifies it, blocks *this* attempt, and files an approval request that
-Neo reviews independently. When Neo approves, the worker is resumed and the retry goes
-through. The user's attention is spent only when Neo declines to decide.
-
-## Why the hook cannot simply wait
-
-Two hard constraints shape the design, and both are load-bearing:
-
-1. **A PreToolUse hook cannot lift a `deny` rule.** From the Claude Code permission
-   docs: *"Hook decisions don't bypass permission rules. Claude Code evaluates deny and
-   ask rules regardless of what a PreToolUse hook returns: a matching deny rule blocks
-   the call."* So a gated action must NOT also be denied in the project's settings — the
-   deny wins and the gate can never open. `INV-GATE-DENY-CONFLICT` (invariants.py)
-   exists solely to catch that misconfiguration, because it fails silently otherwise:
-   the request reaches Neo, Neo approves, and the retry is still blocked.
-2. **The hook is synchronous and short (30s); a Neo review takes minutes.** So the hook
-   never waits for a verdict. It denies the attempt with an explanation, and approval
-   arrives later through the ordinary message-delivery path — the same one
-   `jarvis wo ask` already uses. The worker retries and the second attempt is allowed.
-
-## Scope of a grant
-
-An approval authorises one command, for one work order, for a short window
-(`GRANT_TTL_SECONDS`), a bounded number of times (`GRANT_MAX_USES`). "Merge PR #31" must
-not silently become "and also cut a release", or "and merge whatever you like tomorrow".
-Matching is on the exact command string for that reason: a grant is a receipt for a
-specific act, not a capability the worker keeps.
-
-## Where the recognisers went
-
-They are no longer here. What counts as an *attempt* at a privileged action is data in
-`os.db`, seeded from the constants that used to live in this file and grown from the
-dismissal verdicts this module records — see `gate_rules.py` for why, and for the safety
-net (canaries) that makes a self-modifying classifier something other than a hole. This
-file keeps the lifecycle: what a gate MEANS, who reviews it, and what a verdict does.
-"""
+"""Gated actions — privileged operations a worker may attempt but not unilaterally do (#31)"""
 
 from __future__ import annotations
 
@@ -104,92 +61,40 @@ __all__ = [
     "summarise", "sweep_unargued",
 ]
 
-# How long an approval stays usable, and how many attempts it covers. The window is
-# short because it is a receipt for an act the worker is about to perform, not standing
-# authority. More than one use because a real `gh pr merge` can fail on a transient
-# (out-of-date branch, failing check) and forcing a fresh Neo round trip for the retry
-# is the sort of friction this whole feature exists to remove.
+# How long an approval stays usable, and how many attempts it covers
 GRANT_TTL_SECONDS = 3600
 GRANT_MAX_USES = 3
 
 APPROVAL_STATUSES = ("awaiting_case", "pending", "approved", "denied", "dismissed",
                      "expired")
 
-# Filed, recorded, and DELIBERATELY not in front of a reviewer yet: the worker ran the
-# command instead of asking, so the only justification on the row is the placeholder
-# below. Nothing in the OS acts on a request in this status — no Neo question exists for
-# it — until the worker comes back and makes its case, which is the one transition out of
-# it (`queue_for_review`). See docs/superpowers/specs/2026-09-11-holding-an-unargued-gate.md.
-#
-# The alternative, filing straight to Neo and letting a late case amend the row, loses the
-# race it depends on: the daemon polls every 5s and the worker's next tool call costs a
-# model turn, so the reviewer reads the placeholder first nearly every time.
+# Filed, recorded, and DELIBERATELY not in front of a reviewer yet: the worker ran the command... (docs/superpowers/specs/2026-09-11-holding-an-unargued-gate.md)
 AWAITING_CASE = "awaiting_case"
 
-# How long a held request waits for its case — or its contest — before the OS abandons it.
-# Per-project via `gates.case_ttl_seconds` (kn-67cdb54b). Why it must sit UNDER the prompt
-# cache's TTL, and the measurement behind 240s: spec 2026-09-12 §7.
+# How long a held request waits for its case — or its contest — before the OS abandons it
 DEFAULT_CASE_TTL_SECONDS = 240.0
 
-#: The clamp ceiling. Duplicates `usage.WRITE_TTL_SECONDS` rather than importing it —
-#: `gates` is on the PreToolUse hook's path and `usage` is not — so a test pins the two
-#: literals against each other. Spec §7.
+#: The clamp ceiling
 CASE_TTL_CEILING_SECONDS = 300.0
 
-# The verdicts a reviewer can reach. `dismissed` is not a softer denial and not a quieter
-# approval — it answers a different question.
-#
-# The first three statuses shipped without it, and the omission produced a contradiction
-# the user was made to arbitrate twice, both times coherently and in opposite directions.
-# When a recogniser fires on a command that performs no privileged action — a deploy
-# script's name quoted inside a grep pattern, a PR body that cites a path — every
-# available verdict recorded something false. `approved` asserts that a privileged action
-# was reviewed and authorised, leaving an audit trail implying a real deploy was vetted.
-# `denied` asserts the worker made a bad request and tells it not to retry, blocking a
-# command that was never privileged. Escalating spends the user's attention on an OS bug,
-# which is the exact cost the gate exists to avoid. The identical command was denied once
-# and approved once as a direct result.
-#
-# `dismissed` says the only true thing: the classifier was wrong. It clears the command,
-# records no authorisation, and is counted separately so the false-positive rate is a
-# number someone can watch rather than an anecdote.
+# The verdicts a reviewer can reach
 VERDICTS = ("approved", "denied", "dismissed")
 
-# What the justification says when the hook filed the request because the worker ran the
-# command instead of asking. It is a placeholder for a case nobody made — so `amend_request`
-# REPLACES it rather than appending under it, and the hook's own advice ("run `jarvis gate
-# request` to make the case properly") is what produces the amendment. Named here because
-# both writer and reader must agree on the string: see GitHub issue 185.
+# What the justification says when the hook filed the request because the worker ran the command...
 NO_CASE_JUSTIFICATION = ("(none — the worker ran the command directly rather than filing "
                          "a request, so no case was made for it)")
 
-#: Every form of the placeholder opens with this, and no case a worker writes does. The
-#: readers key on the prefix rather than on `NO_CASE_JUSTIFICATION` itself, because there
-#: is now more than one of them — see `no_case_justification`.
+#: Every form of the placeholder opens with this, and no case a worker writes does
 NO_CASE_PREFIX = "(none"
 
 
 def is_no_case(justification: str) -> bool:
-    """True when `justification` is a placeholder rather than a case someone made."""
+    """True when `justification` is a placeholder rather than a case someone made"""
     return not justification.strip() or justification.strip().startswith(NO_CASE_PREFIX)
 
 
 def no_case_justification(command: str, prior_id: int | None = None) -> str:
-    """The placeholder for a request nobody argued — saying only what is established.
-
-    `NO_CASE_JUSTIFICATION` used to be the only answer, and it is an ACCUSATION: it tells
-    every later reader that the worker went round the gate. Gate 123 recorded it against
-    a worker whose blocked command WAS `jarvis gate request` — the inverse of what
-    happened, in an append-only record, about the one thing the gate exists to catch
-    (issue #233). So the placeholder now reports what the classifier can actually
-    establish, and the accusation is kept for the case where it is true: no filing
-    anywhere in the chain, no mention of one, and no request already on the record.
-
-    Note what the first branch does NOT say. A chain may both file a request and run the
-    action (`gh pr merge … && jarvis gate request …`), so the exculpation stops at "not
-    established" rather than claiming the worker asked — a record that clears a worker it
-    cannot vouch for is the same defect pointing the other way.
-    """
+    """The placeholder for a request nobody argued — saying only what is established (#233)"""
     from .gate_rules import files_a_claim, list_segments
 
     pointer = ("" if prior_id is None else
@@ -207,11 +112,10 @@ def no_case_justification(command: str, prior_id: int | None = None) -> str:
         return "(none recorded with this attempt." + pointer + ")"
     return NO_CASE_JUSTIFICATION
 
-# The string every reader of a contested request keys on — the persona's carve-out and the
-# test fake's branch. Spec 2026-09-12 §1.
+# The string every reader of a contested request keys on
 CONTEST_HEADER = "CONTESTED GATE MATCH"
 
-# Appended when a reviewer tries to APPROVE a contest. Why it is coerced to a denial: §2.
+# Appended when a reviewer tries to APPROVE a contest
 CONTEST_NOT_AN_AUTHORISATION = (
     "(Recorded as a REFUSAL, not an authorisation. This was a contest: the worker argued "
     "that the command performs no privileged action, and made no case for performing one. "
@@ -222,13 +126,7 @@ CONTEST_NOT_AN_AUTHORISATION = (
 
 @dataclass(frozen=True)
 class GateConfig:
-    """Which gates are live for a project, plus any extra recognisers it needs.
-
-    Empty `enabled` means gating is off, which is the default for every project. Gates
-    change what a worker is allowed to do, so they are opt-in per project: switching
-    them on fleet-wide would put a Neo review in front of every `gh pr merge` in every
-    repo, which trades one bottleneck for a slower one.
-    """
+    """Which gates are live for a project, plus any extra recognisers it needs"""
 
     enabled: frozenset[str] = frozenset()
     extra_patterns: dict[str, tuple[str, ...]] = field(default_factory=dict)
@@ -241,8 +139,7 @@ class GateConfig:
         return json.dumps({
             "enabled": sorted(self.enabled),
             "patterns": {k: list(v) for k, v in sorted(self.extra_patterns.items())},
-            # Rides along to the worker so the hook can tell it how long it has to make
-            # the case. A deadline the blocked worker is not told is not a deadline.
+            # Rides along to the worker so the hook can tell it how long it has to make the case
             "case_ttl_seconds": self.case_ttl_seconds,
         }, sort_keys=True)
 
@@ -258,8 +155,7 @@ class GateConfig:
 
     @classmethod
     def parse(cls, data: Any) -> GateConfig:
-        """Build from catalog JSON. Unknown gate names are an error worth raising at
-        catalog-load time, not a silently-ignored typo that leaves a gate open."""
+        """Build from catalog JSON"""
         if data in (None, False):
             return cls()
         if data is True:
@@ -309,8 +205,7 @@ class GateConfig:
             raise ValueError('"gates.case_ttl_seconds" must be positive — a held request '
                              'that never expires is the leak this setting bounds')
         if ttl >= CASE_TTL_CEILING_SECONDS:
-            # Clamped, not refused: a settings file from the previous release legally
-            # carries 600 and this runs inside the PreToolUse hook — spec §7.
+            # Clamped, not refused: a settings file from the previous release legally carries 600 and this runs...
             log.warning(
                 "gates.case_ttl_seconds=%.0f is at or past the %.0fs prompt-cache TTL; "
                 "clamped to %.0f. A worker parked longer than the cache lives re-sends "
@@ -322,15 +217,13 @@ class GateConfig:
 
 @dataclass(frozen=True)
 class GatedAction:
-    """A command recognised as an attempt at a privileged action."""
+    """A command recognised as an attempt at a privileged action"""
 
     kind: str
     summary: str
     command: str
     matched: str  # the pattern that fired — shown to the reviewer, and to the user
-    # Which row of the rule base fired. `builtin` rules are seeded, `neo`/`user` ones were
-    # learned; a reviewer looking at a request deserves to know which, because "the OS has
-    # always thought this" and "the OS decided this last Tuesday" are different claims.
+    # Which row of the rule base fired
     rule_id: str = ""
 
 
@@ -339,16 +232,7 @@ _SUMMARIES = {k.name: k.summary for k in KINDS}
 
 def classify(command: str, config: GateConfig, rules: RuleSet | None = None,
              central: CentralStore | None = None) -> GatedAction | None:
-    """The gate this Bash command trips, or None.
-
-    The recognisers come from the rule base rather than from this file — `rules` is what
-    the OS currently believes, learned exemptions included. Omitting it loads them, which
-    is the right default for a caller that just wants an answer and the wrong one for the
-    hook, which already has a store open and should not pay for a second.
-
-    Passing `central` in addition lets a cleared command be *counted*: an exemption that
-    never fires is a rule that generalised nothing, and that is worth being able to see.
-    """
+    """The gate this Bash command trips, or None"""
     if not command or not config.enabled:
         return None
     ruleset = rules if rules is not None else RuleSet.load(central)
@@ -365,44 +249,25 @@ def classify(command: str, config: GateConfig, rules: RuleSet | None = None,
                        rule_id=decision.match.rule_id)
 
 
-# -- what pull request a merge command names ------------------------------------------
+# -- what pull request a merge command names
 
-#: A literal pull-request URL sitting in the command. `github.PR_URL_RE` without the
-#: anchors, because here it is one token inside a longer string.
+#: A literal pull-request URL sitting in the command
 _PR_URL_IN = re.compile(
     r"https://[A-Za-z0-9.-]+/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[0-9]+")
 
-#: `gh pr merge 735 --squash`, flags in any position before the number.
+#: `gh pr merge 735 --squash`, flags in any position before the number
 _PR_NUMBER_IN = re.compile(r"\bgh\s+pr\s+merge\s+(?:-{1,2}[^\s]+\s+)*?([0-9]+)\b")
 
-#: `--repo owner/name` / `-R owner/name`: the number is then about THAT repository, not
-#: about `origin`, and composing it against `origin` would record a different pull request
-#: than the one the command merges.
+#: `--repo owner/name` / `-R owner/name`: the number is then about THAT repository
 _REPO_FLAG_IN = re.compile(r"(?:--repo[=\s]|-R\s*)([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)")
 
-#: `gh api --method PUT repos/<owner>/<repo>/pulls/735/merge` — owner and repo in-string,
-#: and worker-supplied, so they are checked against `origin` like any other.
+#: `gh api --method PUT repos/<owner>/<repo>/pulls/735/merge`
 _PR_API_IN = re.compile(
     r"\brepos/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/pulls/([0-9]+)/merge\b")
 
 
 def pull_request_in(command: str, cwd: Path | None) -> str:
-    """The pull request a merge command names, checked, or `""`.
-
-    Three shapes resolve offline and the rest resolve to nothing — a branch ref and a
-    bare `gh pr merge --auto` need a `gh pr view`, and no network call belongs on a
-    decision path. See the shape table in
-    docs/superpowers/specs/2026-09-25-a-gate-records-the-pull-request.md §1.
-
-    **THE COMMAND IS WORKER-WRITTEN TEXT** (kn-c748e0fe). Nothing is returned that
-    `github.checked_pr_url` did not return: a string `gh` could read as a flag, and a
-    well-formed URL on somebody else's repository, are both refused rather than recorded
-    — including the `repos/o/r/pulls/N/merge` form, whose owner and repo the worker
-    chose. `UntrustedPullRequest` reads as "no pull request", because refusing to record
-    is the safe direction (spec §2). A `--repo`/`-R` beside a bare number is read too, so
-    a number about somebody else's repository is refused rather than composed against
-    `origin` and recorded as this project's.
-    """
+    """The pull request a merge command names, checked, or `""` (docs/superpowers/specs/2026-09-25-a-gate-records-the-pull-request.md §1.)"""
     from . import github
 
     text = command or ""
@@ -415,8 +280,7 @@ def pull_request_in(command: str, cwd: Path | None) -> str:
     elif api:
         url = f"https://github.com/{api.group(1)}/{api.group(2)}/pull/{api.group(3)}"
     elif number:
-        # The host is not in the command, and `checked_pr_url` constrains owner and repo
-        # rather than host — `origin_repo` is a local `git remote get-url`, no network.
+        # The host is not in the command, and `checked_pr_url` constrains owner and repo rather than host
         named = _REPO_FLAG_IN.search(text)
         repo = (named.group(1), named.group(2)) if named else github.origin_repo(cwd)
         if repo is not None:
@@ -429,13 +293,13 @@ def pull_request_in(command: str, cwd: Path | None) -> str:
         return ""
 
 
-# -- misconfiguration that silently shuts a gate --------------------------------------
+# -- misconfiguration that silently shuts a gate
 
 _BASH_RULE = re.compile(r"^Bash\((.*)\)$", re.IGNORECASE)
 
 
 def _deny_rule_core(rule: str) -> str | None:
-    """The literal part of a `Bash(...)` deny rule, or None for non-Bash rules."""
+    """The literal part of a `Bash(...)` deny rule, or None for non-Bash rules"""
     m = _BASH_RULE.match(rule.strip())
     if not m:
         return None
@@ -444,13 +308,7 @@ def _deny_rule_core(rule: str) -> str | None:
 
 def deny_conflicts(config: GateConfig, deny_rules: Iterable[str]
                    ) -> list[tuple[str, str]]:
-    """Deny rules that would block an enabled gate. Returns (gate name, rule) pairs.
-
-    This is the one misconfiguration that fails *silently and completely*: the worker
-    files a request, Neo reviews it, Neo approves it, the worker retries — and the retry
-    is still blocked, because Claude Code evaluates deny rules before it looks at what a
-    hook returned. Everything logs success and nothing ships. Hence a dedicated check.
-    """
+    """Deny rules that would block an enabled gate"""
     conflicts: list[tuple[str, str]] = []
     cores = [(rule, _deny_rule_core(rule)) for rule in deny_rules]
     for kind in KINDS:
@@ -466,20 +324,16 @@ def deny_conflicts(config: GateConfig, deny_rules: Iterable[str]
     return conflicts
 
 
-# -- what a blocked worker is told to do ----------------------------------------------
+# -- what a blocked worker is told to do
 
 
 def kind_of(name: str) -> GateKind | None:
-    """One `GateKind` by name, or None."""
+    """One `GateKind` by name, or None"""
     return next((k for k in KINDS if k.name == name), None)
 
 
 def asks(kind: str) -> tuple[str, str]:
-    """What `--why` and `--evidence` should contain FOR THIS GATE — spec 2026-09-12 §6.
-
-    An unknown kind falls back to the field defaults rather than raising: this renders
-    the text a blocked worker reads, and a `KeyError` would leave it with no advice.
-    """
+    """What `--why` and `--evidence` should contain FOR THIS GATE — spec 2026-09-12 §6"""
     found = kind_of(kind)
     if found is None:
         return GateKind(name=kind, summary="").why_ask, GateKind(name=kind,
@@ -488,22 +342,14 @@ def asks(kind: str) -> tuple[str, str]:
 
 
 def _handle(wo_id: str, command: str, approval_id: int | str | None) -> str:
-    """How an exit ADDRESSES the blocked command: by request id where one exists.
-
-    Why not by command string — the worktree isolation guard refuses exactly the text
-    that trips a gate: spec 2026-09-12 §8, kn-f0daada6.
-    """
+    """How an exit ADDRESSES the blocked command: by request id where one exists"""
     return str(approval_id) if approval_id is not None else f"{wo_id} \"{command}\""
 
 
 def request_command(wo_id: str, command: str, kind: str = "",
                     why: str = "", evidence: str = "",
                     approval_id: int | str | None = None) -> str:
-    """The command that puts a case for a real privileged action in front of a reviewer.
-
-    Placeholders come from the KIND (spec 2026-09-12 §6); pass `why`/`evidence` to
-    override, as a listing does with ellipses.
-    """
+    """The command that puts a case for a real privileged action in front of a reviewer"""
     kind_why, kind_evidence = asks(kind)
     return (f"jarvis gate request {_handle(wo_id, command, approval_id)} "
             f"--why \"{why or f'<{kind_why}>'}\" "
@@ -513,27 +359,20 @@ def request_command(wo_id: str, command: str, kind: str = "",
 def contest_command(wo_id: str, command: str,
                     why: str = "<why this performs no privileged action>",
                     approval_id: int | str | None = None) -> str:
-    """The command that disputes the MATCH rather than arguing for the action.
-
-    No per-kind ask, deliberately: the claim is the same whichever recogniser fired — §6.
-    """
+    """The command that disputes the MATCH rather than arguing for the action"""
     return (f"jarvis gate contest {_handle(wo_id, command, approval_id)} "
             f"--why \"{why}\"")
 
 
 def explain_command(command: str, approval_id: int | str | None = None) -> str:
-    """The diagnosis step, addressed the same way — see `_handle`."""
+    """The diagnosis step, addressed the same way — see `_handle`"""
     handle = str(approval_id) if approval_id is not None else f"\"{command}\""
     return f"jarvis gate explain {handle}"
 
 
 def exits_advice(wo_id: str, command: str, kind: str = "",
                  approval_id: int | str | None = None) -> str:
-    """The two ways out of a block, and the diagnosis that picks between them.
-
-    ONE RENDERER for every surface that blocks a worker (kn-467d1ecd). Why `explain`
-    leads: docs/superpowers/specs/2026-09-12-contesting-a-gate-match.md §3.
-    """
+    """The two ways out of a block, and the diagnosis that picks between them (docs/superpowers/specs/2026-09-12-contesting-a-gate-match.md §3.)"""
     return (
         f"TWO WAYS OUT. If you cannot tell which you need, ask the OS first — it reports "
         f"where the matched literal sits and whether the shell would run it:\n"
@@ -558,28 +397,9 @@ def exits_advice(wo_id: str, command: str, kind: str = "",
     )
 
 
-# -- the request Neo reviews ---------------------------------------------------------
+# -- the request Neo reviews
 
-# Neo's ordinary persona is told to escalate anything "production-impacting" or that
-# "publishes" — correct for open questions, and fatal here: every release would go
-# straight to the user and the gate would be a slower version of the wall it replaced.
-# Gate reviews therefore get their own mandate, with the standard the user actually
-# applies: is this the work order's own reviewed work, shipped the normal way?
-#
-# The PREMISE CHECK comes first, and its position is the fix, not a stylistic choice. The
-# earlier persona OPENED by asserting "a worker tried to run a command that ships code",
-# then required of every approval that "work landed on a branch, in a pull request, with
-# checks passing" — which a misclassified `grep` can never satisfy, so the closest-fitting
-# clause left was DENY. The persona structurally forced the wrong answer on false
-# positives; Neo was following it correctly. "Was this even a gated action" has to be
-# answered BEFORE "should this gated action proceed", because it is a question about a
-# different subject: the classifier, not the worker.
-#
-# And the `self_heal` carve-out sits ABOVE it for the same reason it exists at all: a
-# self_heal row's `command` is a rendered intent, so the premise check — first, and
-# highest priority — describes it exactly, and the persona would have forced DISMISS on
-# every proposal and then asked for an `exempt_pattern` derived from prose. See spec
-# 2026-09-02, §5.
+# Neo's ordinary persona is told to escalate anything "production-impacting" or that "publishes"
 REVIEWER_PERSONA ="""You are Neo, reviewing a PRIVILEGED ACTION REQUEST inside the \
 Jarvis agentic OS.
 
@@ -766,15 +586,7 @@ HISTORY_LIMIT = 8
 
 
 def render_history(rows: Iterable[dict[str, Any]]) -> list[str]:
-    """The work order's earlier gate requests, as the reviewer's duplicate check.
-
-    Without this a reviewer judges every request as if it were the first. That is how
-    wo-52a6164d escalated a release to the user thirty-seven seconds after Neo had
-    approved the same release: the worker re-ran the approved command with `| tail -40`
-    appended, the exact-string grant did not match, the hook filed an unjustified request
-    — and "unjustified real release" is a textbook escalation when you cannot see that
-    the identical action was authorised a moment ago and has already run.
-    """
+    """The work order's earlier gate requests, as the reviewer's duplicate check"""
     rows = [r for r in rows][:HISTORY_LIMIT]
     if not rows:
         return []
@@ -796,21 +608,7 @@ USER_MESSAGE_CHARS = 700
 
 
 def render_user_messages(rows: Iterable[dict[str, Any]]) -> list[str]:
-    """The user's own words to this work order, as the reviewer's authorisation check.
-
-    Without this the reviewer cannot see an instruction the user gave the worker, ever:
-    the request carries the work order's description and the worker's prose and nothing
-    the user said after dispatch. That is how gate 85 went to the user for a decision
-    they had made in writing twelve minutes earlier (`jarvis wo send`, msg-797, "resolve
-    the conflicts and merge the PR, I authorize it").
-
-    ONLY rows `ProjectStore.user_messages` could attribute to the human. Rendering the
-    last N messages regardless of author would be worse than not rendering any: a worker
-    has a shell and could file its own approval into its own conversation, and the panel
-    would read it as the user's. Absent rather than present-and-empty when there are
-    none — a blank section reads as "the user said nothing", which is a claim this
-    function is not entitled to make about a work order predating the stamp.
-    """
+    """The user's own words to this work order, as the reviewer's authorisation check"""
     rows = [r for r in rows][:USER_MESSAGE_LIMIT]
     if not rows:
         return []
@@ -833,24 +631,7 @@ def build_request_question(action: GatedAction, wo: dict[str, Any],
                            agent_type: str | None = None,
                            history: Iterable[dict[str, Any]] = (),
                            user_messages: Iterable[dict[str, Any]] = ()) -> str:
-    """Render the approval request Neo (or the user) reads.
-
-    Whoever decides sees only this text — never the worker's session — so it has to
-    carry the case by itself: what is being attempted, under which work order, why the
-    worker believes it is ready, whatever it offered as proof, what the USER has said to
-    this work order since it was dispatched, and what this same work order has already
-    been told about the same gate.
-
-    That fifth item is `user_messages`, and it is passed IN rather than fetched here for
-    the same reason the other four are: a reviewer that goes and looks things up makes
-    `jarvis gate show` a partial account of what it saw, and makes two runs of the same
-    review differ. See `render_user_messages`.
-
-    `agent_type` names the SEAT when a subagent tripped the gate. The work order still
-    owns the request — its lead is answerable for what its team did — but the reviewer
-    is being asked to judge an attempt, and an attempt by a seat that was never meant to
-    run commands is a different fact from the same attempt by the lead.
-    """
+    """Render the approval request Neo (or the user) reads"""
     actor = f"The `{agent_type}` seat of work order {wo['id']}" if agent_type \
         else f"The worker for work order {wo['id']}"
     parts = [
@@ -864,8 +645,7 @@ def build_request_question(action: GatedAction, wo: dict[str, Any],
         f"Work order: {wo['id']}",
         "",
     ]
-    # EVERY UNTRUSTED FIELD THIS BUILDER RENDERS, enumerated — spec 2026-09-24 fix 1.
-    # The TITLE is one of them: whoever filed the order wrote it.
+    # EVERY UNTRUSTED FIELD THIS BUILDER RENDERS, enumerated — spec 2026-09-24 fix 1
     parts += borrowed_sections((
         Borrowed(label=WO_TITLE, whose=WO_TITLE_WHOSE, text=wo.get("title") or "",
                  limit=TITLE_LIMIT, absent="The work order has no title."),
@@ -874,7 +654,7 @@ def build_request_question(action: GatedAction, wo: dict[str, Any],
         Borrowed(label="the worker's justification for this request",
                  whose=f"the worker of {wo['id']}", text=justification,
                  absent="The worker gave no justification — treat that as a red flag."),
-        # Labelled with what THIS gate asked for — 2026-09-12 §6.
+        # Labelled with what THIS gate asked for — 2026-09-12 §6
         Borrowed(label=f"the evidence the worker supplied ({asks(action.kind)[1]})",
                  whose=f"the worker of {wo['id']}", text=evidence,
                  limit=EVIDENCE_LIMIT),
@@ -892,8 +672,7 @@ def build_request_question(action: GatedAction, wo: dict[str, Any],
 
 
 def describe_match(command: str, pattern: str) -> list[str]:
-    """Where the matched literal sits — `jarvis gate explain`'s analysis, handed to the
-    reviewer unasked. The one input to a contest the worker did not write. Spec §1."""
+    """Where the matched literal sits — `jarvis gate explain`'s analysis, handed to the reviewer unasked"""
     from .gate_rules import reads_only, shape_of
 
     shape = shape_of(command, pattern)
@@ -902,7 +681,7 @@ def describe_match(command: str, pattern: str) -> list[str]:
     if reads_only(command):
         lines.append("Every command in the chain is read-only.")
     if shape and not shape.exemptible:
-        # The one thing that makes an otherwise convincing contest wrong (kn-986fc008).
+        # The one thing that makes an otherwise convincing contest wrong (kn-986fc008)
         lines.append("A dismissal of this could NOT be generalised into a standing rule "
                      "— by this reading the shell could still run the literal.")
     return lines
@@ -912,8 +691,7 @@ def build_contest_question(action: GatedAction, wo: dict[str, Any], argument: st
                            agent_type: str | None = None,
                            history: Iterable[dict[str, Any]] = (),
                            user_messages: Iterable[dict[str, Any]] = ()) -> str:
-    """Render a CONTESTED match for the reviewer — a different question from
-    `build_request_question`, not a variant of it. Spec 2026-09-12 §1."""
+    """Render a CONTESTED match for the reviewer"""
     actor = f"the `{agent_type}` seat of work order {wo['id']}" if agent_type \
         else f"the worker for work order {wo['id']}"
     parts = [
@@ -933,9 +711,7 @@ def build_contest_question(action: GatedAction, wo: dict[str, Any], argument: st
         f"Work order: {wo['id']}",
         "",
     ]
-    # The same enumeration, on the same rule — spec 2026-09-24 fix 1, and the open
-    # question that spec left, which the lead's assumption settled: this builder renders
-    # borrowed text by the same route, so it sits inside the boundary.
+    # The same enumeration, on the same rule
     parts += borrowed_sections((
         Borrowed(label=WO_TITLE, whose=WO_TITLE_WHOSE, text=wo.get("title") or "",
                  limit=TITLE_LIMIT, absent="The work order has no title."),
@@ -961,7 +737,7 @@ def build_contest_question(action: GatedAction, wo: dict[str, Any], argument: st
     return "\n".join(parts)
 
 
-# -- filing a request ----------------------------------------------------------------
+# -- filing a request
 
 
 def file_request(store: ProjectStore, neo: Any, project: str, wo: dict[str, Any],
@@ -969,35 +745,14 @@ def file_request(store: ProjectStore, neo: Any, project: str, wo: dict[str, Any]
                  max_uses: int = GRANT_MAX_USES, agent_type: str | None = None,
                  hold: bool = False, contested: bool = False,
                  ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """Record an approval request. Returns (approval, question), question None if held.
-
-    One path for both entry points — the hook (a worker that just ran the command) and
-    `jarvis gate request` (a worker making its case first) — so a gate behaves the same
-    however it was reached.
-
-    `hold` is what makes the two differ in the one way they must. The hook has no case to
-    pass on, so it files `AWAITING_CASE`: recorded, the command blocked, and NO Neo
-    question yet, because the case is still coming. `queue_for_review` is the only way
-    out. It does NOT park the work order — fix 2 of
-    docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md; see the status
-    write below.
-
-    The request rides the existing Neo queue rather than a parallel review pipeline,
-    which is what gives it escalation-to-user, `jarvis neo list` and answer delivery
-    without reimplementing any of them.
-
-    `agent_type` reaches here only from the hook: `jarvis gate request` is a shell
-    command, so whoever ran it had a shell, and the seats have none.
-    """
+    """Record an approval request (docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md)"""
     approval = store.add_approval(
         wo["id"], action.kind, action.command, matched=action.matched,
         justification=justification, evidence=evidence, max_uses=max_uses,
         agent_type=agent_type, status=AWAITING_CASE if hold else "pending",
         contested=contested,
     )
-    # The park rides with `queue_for_review`, which is the ONLY door to `pending` — so
-    # the worker is parked exactly when a reviewer is holding it, however that road was
-    # reached (here, or `jarvis gate request` on a row this filed held).
+    # The park rides with `queue_for_review`, which is the ONLY door to `pending`
     question = None if hold else queue_for_review(store, neo, project, wo, action,
                                                   approval)
     return approval, question
@@ -1005,12 +760,8 @@ def file_request(store: ProjectStore, neo: Any, project: str, wo: dict[str, Any]
 
 def question_text(store: ProjectStore, wo: dict[str, Any], action: GatedAction,
                   approval: dict[str, Any]) -> str:
-    """The reviewer's page for this request, whichever kind of claim it carries.
-
-    The SINGLE place the two renderers are chosen between, so a contest cannot reach a
-    reviewer dressed as an authorisation request by some second path — spec §2.
-    """
-    # Read before the question, so the reviewer's history is everything BUT this request.
+    """The reviewer's page for this request, whichever kind of claim it carries"""
+    # Read before the question, so the reviewer's history is everything BUT this request
     history = [a for a in store.list_approvals(wo["id"], limit=HISTORY_LIMIT)
                if a["id"] != approval["id"]]
     user_messages = store.user_messages(wo["id"], USER_MESSAGE_LIMIT)
@@ -1024,23 +775,10 @@ def question_text(store: ProjectStore, wo: dict[str, Any], action: GatedAction,
 
 def queue_for_review(store: ProjectStore, neo: Any, project: str, wo: dict[str, Any],
                      action: GatedAction, approval: dict[str, Any]) -> dict[str, Any]:
-    """Put a recorded request in front of a reviewer. Returns the Neo question.
-
-    The single door from `AWAITING_CASE` to `pending`, and the single place a reviewer's
-    question text is first written — so "no reviewer ever reads a request nobody argued
-    for" is a property of one function rather than a convention six callers must keep.
-
-    …and, since fix 2 of
-    docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md, the single place
-    the work order is PARKED. `waiting_input` renders "Waiting on you" everywhere, which
-    is true of a request under review and false of a held one, whose only exit is the
-    worker's own next command. Being the one door, this parks exactly the orders
-    somebody else is holding, whichever road reached it — the hook's `file_request`, or
-    `jarvis gate request` attaching a case to a row filed held.
-    """
+    """Put a recorded request in front of a reviewer (docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md)"""
     question = neo.ask(
         project, wo["id"], question_text(store, wo, action, approval),
-        # Spec 2026-09-24 fix 1: `context=` is the field that carried the defect.
+        # Spec 2026-09-24 fix 1: `context=` is the field that carried the defect
         context=borrowed_context((
             Borrowed(label=WO_TITLE, whose=WO_TITLE_WHOSE, text=wo.get("title") or "",
                      limit=TITLE_LIMIT),
@@ -1049,20 +787,14 @@ def queue_for_review(store: ProjectStore, neo: Any, project: str, wo: dict[str, 
         kind="approval",
     )
     store.start_review(approval["id"], question["id"])
-    # The worker has nothing to do until a verdict lands. Saying so keeps the reconciler
-    # from reading the idle session as "finished without `jarvis wo finish`" and filing
-    # it for review — a request under review is a wait, not an abandonment. Read from the
-    # STORE, not from `wo`, which a caller may have been holding since before the hold.
+    # The worker has nothing to do until a verdict lands
     if store.get_work_order(wo["id"])["status"] in ("running", "dispatching"):
         store.set_status(wo["id"], "waiting_input")
     return question
 
 
 def abandoned_message(approval: dict[str, Any], ttl_seconds: float) -> str:
-    """What the worker is told when its held request timed out. NOT a verdict.
-
-    This message is what makes `expired` affordable where it was not before — spec §4.
-    """
+    """What the worker is told when its held request timed out"""
     return (
         f"[Gate {approval['id']} ABANDONED — no case was made within "
         f"{int(ttl_seconds // 60)} minutes]\n\n"
@@ -1080,26 +812,13 @@ def abandoned_message(approval: dict[str, Any], ttl_seconds: float) -> str:
 
 
 def abandoned_reason(ttl_seconds: float) -> str:
-    """What the record says about a request nobody argued and nobody reviewed.
-
-    A function, not a literal: the migration keys on its prefix and the screenshot script
-    seeds a row with it, so a second copy would name a stale window — §4, §7.
-    """
+    """What the record says about a request nobody argued and nobody reviewed"""
     return (f"no case was made for it within {int(ttl_seconds // 60)} minutes, and the "
             f"match was never contested. Nobody reviewed it.")
 
 
 def sweep_unargued(store: ProjectStore, ttl_seconds: float) -> list[dict[str, Any]]:
-    """Close every held request whose case never came. Returns the rows it closed.
-
-    The cost of holding a request back from review is that nothing else will ever close
-    it: there is no question for Neo to answer and no escalation for the user to see, so
-    without this a worker that wandered off leaves an unargued privileged action open for
-    ever. The clock starts at filing, and it is the project's (`gates.case_ttl_seconds`).
-
-    ABANDONED, NOT DENIED — the reversal of the original design; spec 2026-09-12 §4 has
-    the argument. The command string stays blocked either way.
-    """
+    """Close every held request whose case never came"""
     from . import db
     from .invariants import end_wait_if_nothing_is_out
 
@@ -1112,22 +831,14 @@ def sweep_unargued(store: ProjectStore, ttl_seconds: float) -> list[dict[str, An
                                      reason=abandoned_reason(ttl_seconds))
         store.queue_message(row["wo_id"], abandoned_message(row, ttl_seconds),
                             source="gate")
-        # The request parked the work order; the close has to unpark it — same reason and
-        # same narrow guard as `apply_decision`.
+        # The request parked the work order; the close has to unpark it
         end_wait_if_nothing_is_out(store, row["wo_id"])
         closed.append(row)
     return closed
 
 
 def _merge_case(existing: str, addition: str) -> str:
-    """The prior case plus the new one, as one field a reviewer reads top to bottom.
-
-    The placeholder is a statement that no case exists, so a real case REPLACES it —
-    leaving it above an amendment would keep telling the reviewer the exact falsehood
-    issue 185 is about. Anything else the worker wrote stands and the new text is
-    appended under it: the first case may be what a reviewer has already partly read,
-    and silently overwriting it would lose an argument nobody retracted.
-    """
+    """The prior case plus the new one, as one field a reviewer reads top to bottom"""
     prior = existing.strip()
     addition = addition.strip()
     if not addition:
@@ -1142,21 +853,7 @@ def _merge_case(existing: str, addition: str) -> str:
 def amend_request(store: ProjectStore, neo: Any, wo: dict[str, Any],
                   action: GatedAction, approval: dict[str, Any],
                   justification: str = "", evidence: str = "") -> dict[str, Any]:
-    """Attach a case to a request that is already pending. Returns the amended approval.
-
-    The alternative — filing a second request — is reviewer-shopping in effect even when
-    it is not in intent (kn-76b155a0), and the alternative to that, refusing the
-    amendment, throws the worker's text away, which is issue 185 itself. So the case goes
-    onto the standing request and the reviewer's question text is rewritten in place.
-
-    IN PLACE, never a fresh question re-linked to this approval: `daemon._deliver_gate_verdict`
-    resolves the approval through `approvals.neo_question_id`, so moving that pointer
-    while a verdict is in flight strands the verdict with nothing to apply it to.
-
-    A question Neo is mid-review on, or one already escalated to the user, is amended
-    all the same — the reviewer may have read the earlier text, and the caller is told so
-    rather than the worker losing the case for a race it cannot see.
-    """
+    """Attach a case to a request that is already pending"""
     from .neo_store import OPEN_Q_STATUSES
 
     amended = store.amend_approval(
@@ -1171,37 +868,16 @@ def amend_request(store: ProjectStore, neo: Any, wo: dict[str, Any],
     return amended
 
 
-# -- opening the gate ------------------------------------------------------------------
+# -- opening the gate
 
 
 def open_gate(store: ProjectStore, grant: dict[str, Any],
               neo: NeoStore | None = None) -> dict[str, Any]:
-    """Spend one use of a grant, and close the requests it has just made moot.
-
-    The second half is what stops a work order finishing while a gate for the very action
-    it completed is still sitting in the user's attention list. A grant is scoped to an
-    exact command string, so the worker that retries an approved command with a pipe
-    appended files a second request for the same action — and then, string mismatch
-    resolved, runs the approved one anyway. The moment that grant opens, the second
-    request is a question about something that has already happened under authorisation.
-
-    Only requests of the same kind whose command CONTAINS the approved command are
-    closed: the approved action plus decoration, never the reverse (a shorter command is
-    a different action — dropping `--stage` from a deploy is what restarts the fleet).
-    Closing authorises nothing, so the narrow risk of closing one too many is bounded:
-    the command stays blocked and a retry files a fresh request for a real review.
-
-    Only an `approved` grant supersedes. A dismissal says the recogniser was wrong about
-    one string; whether it was also wrong about a different string is Neo's call, not a
-    substring match's.
-    """
+    """Spend one use of a grant, and close the requests it has just made moot"""
     approval = store.consume_grant(grant["id"])
     if approval["status"] != "approved":
         return approval
-    # Held requests are swept too. One filed by the hook is the likeliest duplicate there
-    # is — the decorated retry that tripped the gate is exactly how the second row gets
-    # written — and leaving it would keep an unargued request open for an action that has
-    # already run under authorisation.
+    # Held requests are swept too
     for pending in (store.pending_approvals(approval["wo_id"])
                     + store.held_approvals(approval["wo_id"])):
         if pending["id"] == approval["id"] or pending["kind"] != approval["kind"]:
@@ -1213,10 +889,7 @@ def open_gate(store: ProjectStore, grant: dict[str, Any],
             f"{approval['id']}, which this command only wraps — nothing is left to "
             f"authorise or refuse, and no authorisation is implied by closing it"
         ))
-        # The approval closes; its Neo question does not, and if Neo had escalated that
-        # question it went on asking the user to rule on an action that had already run
-        # (production question 118, still in the attention list a week later). Only
-        # `decide_gate` ever closed one of these, and this path is not it.
+        # The approval closes; its Neo question does not
         if neo is not None and pending["neo_question_id"]:
             neo.supersede(
                 pending["neo_question_id"],
@@ -1227,11 +900,9 @@ def open_gate(store: ProjectStore, grant: dict[str, Any],
     return approval
 
 
-# -- deciding ------------------------------------------------------------------------
+# -- deciding
 
-# What the worker is told when a gate opens. It has to name the command, because a
-# grant is scoped to that exact string: a worker that retries a "tidied up" variant
-# trips the gate again and cannot understand why.
+# What the worker is told when a gate opens
 def approved_message(approval: dict[str, Any], reason: str, by: str) -> str:
     return (
         f"[Gate {approval['id']} APPROVED by {by}] {reason}\n\n"
@@ -1243,7 +914,7 @@ def approved_message(approval: dict[str, Any], reason: str, by: str) -> str:
 
 
 def denied_message(approval: dict[str, Any], reason: str, by: str) -> str:
-    # A denied CONTEST refuses a different claim, so it has to say which one — §2.
+    # A denied CONTEST refuses a different claim, so it has to say which one — §2
     if approval.get("contested"):
         return (
             f"[Gate {approval['id']} — CONTEST REJECTED by {by}] {reason}\n\n"
@@ -1263,26 +934,10 @@ def denied_message(approval: dict[str, Any], reason: str, by: str) -> str:
     )
 
 
-# A dismissal has to tell the worker three things a grant does not: that nothing was
-# authorised, that nothing about its request was wrong, and that clearing a command
-# string is not the same as clearing the action the string talks ABOUT. A worker told
-# only "you may proceed" learns to treat the gate as a formality; a worker told "you were
-# denied" learns to avoid a command that was always fine. Neither is true here.
-#
-# The third one is the trap that produced this wording. A dismissed command is very often
-# a `jarvis gate request` for some genuinely privileged action — the recogniser fires on
-# the action named inside the quoted argument. "Run it again" then reads as "re-file",
-# and if the real action is ALREADY sitting with a reviewer the worker opens a second,
-# better-argued request for it while the first is undecided. That is reviewer-shopping in
-# effect, whatever the worker intended, so the message has to rule it out where the worker
-# reads it rather than leaving it to a learning nobody consults mid-turn.
+# A dismissal has to tell the worker three things a grant does not: that nothing was authorised
 def dismissed_message(approval: dict[str, Any], reason: str, by: str,
                       learned: dict[str, Any] | None = None) -> str:
-    # What the OS learned is told to the worker, not just written to the record. A worker
-    # that has just lost a turn to a false positive is the one participant who can tell
-    # whether the generalisation is right, and it is about to write a PR body and a
-    # summary describing this work — the same prose that tripped the gate in the first
-    # place.
+    # What the OS learned is told to the worker, not just written to the record
     footer = ""
     if learned and learned.get("learned"):
         footer = (f"\n\nThe OS learned from this. Rule {learned['learned']} now clears "
@@ -1326,18 +981,7 @@ def learn_from_dismissal(central: CentralStore, approval: dict[str, Any],
                          reason: str, decided_by: str,
                          exempt_pattern: str = "",
                          project: str = "") -> dict[str, Any]:
-    """Turn a dismissal into a standing rule, and report what happened either way.
-
-    This is the feedback loop, and it is three lines of consequence: a reviewer said "the
-    classifier was wrong about this shape", and the classifier now knows. Before this
-    existed the same reviewer said the same thing on four requests in one work order, and
-    the OS forgot each time.
-
-    Never raises. A rule base that cannot be written to is a degradation — the gate still
-    works, it just stops learning — and turning it into an exception would convert a
-    missed improvement into a failed verdict, blocking a worker over the OS's own
-    bookkeeping.
-    """
+    """Turn a dismissal into a standing rule, and report what happened either way"""
     from . import gate_rules
 
     try:
@@ -1366,25 +1010,10 @@ def apply_decision(store: ProjectStore, approval_id: int, verdict: str,
                    reason: str, decided_by: str,
                    central: CentralStore | None = None,
                    exempt_pattern: str = "", project: str = "") -> dict[str, Any]:
-    """Record a verdict and queue the worker's resume message.
-
-    Shared by Neo's drain and the user's `jarvis gate approve/deny/dismiss`, so a gate
-    resolved by either route leaves identical state behind. Returns the updated row.
-
-    A dismissal emits `gate_dismissed` rather than `gate_decided`, deliberately. The two
-    are not the same event: `gate_decided` is the record of a privileged action being
-    ruled on, and folding false positives into it would inflate exactly the audit trail
-    the separate verdict exists to keep honest.
-
-    A dismissal ALSO teaches the classifier — see `learn_from_dismissal`. What was learned
-    (or why nothing could be) rides on the same event rather than a new one, so that the
-    timeline reads as one fact about one request: the recogniser was wrong, and here is
-    what the OS did about it.
-    """
+    """Record a verdict and queue the worker's resume message"""
     if verdict not in VERDICTS:
         raise ValueError(f"unknown verdict {verdict!r} — expected one of {list(VERDICTS)}")
-    # A CONTEST CAN NEVER BECOME AN AUTHORISATION — coerced here rather than raised,
-    # because the caller is usually the daemon and there is no human to tell. Spec §2.
+    # A CONTEST CAN NEVER BECOME AN AUTHORISATION
     filed = store.get_approval(approval_id)
     if filed is not None and filed["contested"] and verdict == "approved":
         verdict = "denied"
@@ -1404,25 +1033,7 @@ def apply_decision(store: ProjectStore, approval_id: int, verdict: str,
         finally:
             if own:
                 store_c.close()
-    # A `self_heal` request was filed by the OS against a session that never asked, so
-    # the two moves this function makes for a worker are both wrong for it. The message
-    # is addressed to nobody: on a denial it is noise delivered into a running turn —
-    # precisely the act this gate exists to fence — and on an approval it is redundant,
-    # because the remedy itself is the intervention. And there is no wait to end: nothing
-    # set one, since `remedies.propose` deliberately does not park the work order.
-    #
-    # ONE GUARD IN THE SHARED FUNCTION, NOT A SECOND DECISION PATH. Two paths over one
-    # table is how the two come to leave different state behind; everything below —
-    # `decide_approval`, the `gate_decided`/`gate_dismissed` event, dismissal learning —
-    # is inherited unchanged. See
-    # docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md §5.
-    #
-    # `auto_merge` joins it on both counts and for the same two reasons. The worker
-    # finished long ago and is parked in `waiting_pr_merge`, so a queued message would
-    # start a turn on a work order nobody asked to reopen; and `automerge.propose` never
-    # parked it, so there is no wait here to end. What the verdict does instead is
-    # RECORD — the next pull-request poll finds the grant and re-verifies the head SHA
-    # before merging, which is why nothing is merged from inside this function.
+    # A `self_heal` request was filed by the OS against a session that never asked (docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md §5.)
     filed_by_the_os = approval["kind"] in (SELF_HEAL, AUTO_MERGE)
     if approval["kind"] == SELF_HEAL:
         from . import remedies
@@ -1459,28 +1070,7 @@ def apply_decision(store: ProjectStore, approval_id: int, verdict: str,
             "kind": approval["kind"],
             "reason": reason,
         })
-    # Reverse what `request` did to the status. It parked the work order in
-    # `waiting_input` because a gate request is a wait; the verdict ends the wait, and a
-    # status that outlives it is read as a USER blocker by everything downstream —
-    # `jarvis status`, the dashboard, and `invariants.true_blockers`, which renders it as
-    # "worker is waiting on your input".
-    #
-    # That reading is wrong in both directions. A worker is very often still mid-turn
-    # here: the hook reports the verdict inline, so a dismissal never interrupted it at
-    # all. And when it did end its turn, what it waits on is the queued verdict message —
-    # the OS's move, not the user's. On wo-52a6164d (the 0.5.4 self-ship) two dismissals
-    # inside one turn left the work order reading `waiting_input` for forty minutes while
-    # it worked, and the user was asked to unstick a worker that had never stalled.
-    #
-    # Narrow on both sides. Only from `waiting_input`, so a work order that has since
-    # been cancelled or settled keeps where it got to; and only once nothing else is out,
-    # since a second request still with Neo — or one escalated to the user, which
-    # `pending_approvals` also returns — is still a genuine wait. `end_wait_if_nothing_is_out`
-    # counts an unanswered Neo QUESTION as out too: this work order can be waiting on both.
-    #
-    # A `self_heal` or `auto_merge` verdict skips it entirely, for the reason at the top
-    # of the guard: there was no wait to end, so the only thing this could do here is
-    # move a status nothing in this flow set.
+    # Reverse what `request` did to the status
     _record_pull_request(store, approval, verdict)
     if not filed_by_the_os:
         from .invariants import end_wait_if_nothing_is_out
@@ -1491,24 +1081,7 @@ def apply_decision(store: ProjectStore, approval_id: int, verdict: str,
 
 def _record_pull_request(store: ProjectStore, approval: dict[str, Any],
                          verdict: str) -> None:
-    """Write the pull request an APPROVED merge authorised, if the record has none.
-
-    The second source for `work_orders.pr_url`, and the only one a planner ever reaches:
-    `ops.finish` is fed by `jarvis wo finish --pr`, and `ops.submit_plan` settles the
-    planner without one, so a planner that opened, gated and merged a pull request
-    recorded nothing (issue #742, wo-83e4183c).
-
-    Four conditions, each doing work. `approved` only — a denial never ran the command
-    and a DISMISSAL asserts the command was not a privileged action at all, so neither is
-    evidence of a merge. The two merge kinds only. A URL the parser could resolve and
-    `github.checked_pr_url` accepted. And an empty column, so a submitter's declaration
-    is never overwritten by a gate's inference.
-
-    `pr_url_recorded` rather than a second `finished {pr_url}`: the record has to say
-    where the column came from, because only a declaration routes the merge queue
-    (`ops.declared_pull_request`). Nothing here raises: a verdict that fails to record a
-    URL must still be a verdict. Spec §3.
-    """
+    """Write the pull request an APPROVED merge authorised, if the record has none (#742)"""
     try:
         if verdict != "approved" or approval["kind"] not in (PR_MERGE, AUTO_MERGE):
             return
@@ -1526,7 +1099,7 @@ def _record_pull_request(store: ProjectStore, approval: dict[str, Any],
 
 
 def summarise(approvals: Iterable[dict[str, Any]]) -> str:
-    """One-line rendering of a work order's gate history, for status output."""
+    """One-line rendering of a work order's gate history, for status output"""
     rows = list(approvals)
     if not rows:
         return "no gate requests"

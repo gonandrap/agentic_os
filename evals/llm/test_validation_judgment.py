@@ -1,63 +1,4 @@
-"""LLM-graded validation evals: do the panel's seats reject the right things?
-
-Opt-in (spends tokens, needs a logged-in Claude Code):
-    JARVIS_EVALS_LLM=1 pytest evals/llm/test_validation_judgment.py -q
-    JARVIS_EVALS_MODEL=opus  # optional, default sonnet
-
-`validation.decide` runs four profiled seats blind over an `evidence.EvidencePacket`,
-applies the veto table in `validation.arbitrate`, and — only if no veto seat forced a
-rejection — synthesises through a chair. Validation ships DISABLED; enabling it is a
-catalog edit gated on a measurement, and this file is that measurement's synthetic half.
-It answers open question 1 of `docs/superpowers/specs/2026-08-08-validation-panel-design.md`
-("do the seats reject the right things?") and, through `FEATURE_CASES`, question 3 ("is the
-integrated feature diff a reviewable object?").
-
-THE PRODUCTION-CORPUS REPLAY IS NOT HERE, AND ITS ABSENCE IS DELIBERATE — the same three
-reasons `evals/llm/test_neo_panel_judgment.py` records, unchanged: the repo-root
-`conftest.py` gate redirects `JARVIS_HOME` before collection so an eval physically cannot
-read production state and a corpus would have to be a checked-in fixture; this repository
-is PUBLIC and real submissions carry project names, PR numbers and worker prose, so
-checking one in is a publication decision; and labelling it is a user decision, not a
-worker's. The replay is filed on the backlog, and nothing here substitutes for it.
-
-WHAT IS MEASURED HERE, all of it invented, none of it production data:
-
-  * `MUST_REJECT`   — work-order submissions with one clear defect each, which the panel
-                      must not pass (>= MUST_REJECT_FLOOR of 4)
-  * `MUST_PASS`     — work-order submissions with nothing to fix, which the panel must not
-                      bounce (>= MUST_PASS_FLOOR of 3). The failure mode this battery
-                      grades is the expensive one: a rejection loop spends exactly the
-                      attention this feature exists to save.
-  * `MUST_PASS_WITH_FOLLOW_UPS`
-                    — THE PROPERTY THE 2026-09-15 FEATURE IS JUDGED ON: small, correct
-                      submissions that are also obviously improvable. They must land in
-                      ONE round, the seats must still have raised follow-ups, and none of
-                      those may have reached the submitter. Passed, with findings, silent.
-  * `MUST_REJECT_WITH_FOLLOW_UPS`
-                    — and the half that keeps it honest: the SAME submission carrying a
-                      real defect and cosmetic remarks. The defect must block; the
-                      remarks must file. A rubber stamp scores full marks on the battery
-                      above and fails here.
-  * `FEATURE_CASES` — the half of the feature nothing else in the OS can judge: an
-                      integration defect INVISIBLE CHILD BY CHILD, plus a feature that
-                      integrates cleanly. Both directions, because a panel that rejected
-                      every feature would score full marks on the defect alone.
-  * degradation     — one VETO-HOLDING seat forced down; the panel must still return a
-                      well-formed outcome, and must not pass the work it could not judge.
-
-NOTHING HERE ASSERTS COST OR LATENCY. There is no baseline in this repo, and a test that
-failed on cost would spend real money to be flaky. The per-submission call count, the
-wall-clock and the diff size are PRINTED — separately for work-order and feature units,
-because a feature diff is much larger and that difference is the number the user needs in
-order to decide whether to enable `feature_units`.
-
-THE RUN WRITES ITS OWN BASELINE. Every paid run rewrites `BASELINE_PATH` with each seat's
-verdict on each case, the score per battery, the thresholds in force, `n`, the model and
-the date. It is CHECKED IN, so a later worker can recalibrate a threshold — or see which
-seat moved — by reading the file rather than by spending the money again.
-`tests/test_validation_eval_harness.py` holds the file and this module's thresholds to
-each other.
-"""
+"""LLM-graded validation evals: do the panel's seats reject the right things? (docs/superpowers/specs/2026-08-08-validation-panel-design.md)"""
 
 from __future__ import annotations
 
@@ -83,100 +24,60 @@ pytestmark = [
 scenario = pytest.mark.scenario
 MODEL = os.environ.get("JARVIS_EVALS_MODEL", "sonnet")
 
-#: The invented project every submission below belongs to. A NAME NO FLEET USES: the
-#: packet prose and the standing instruction are rendered into prompts and stored in a
-#: checked-in baseline, and this repository is public.
+#: The invented project every submission below belongs to
 PROJECT = "ledgerproj"
 
-#: The whole seat vocabulary, which is also `catalog.DEFAULT_VALIDATION_ROSTER`. Named
-#: here so that a roster shrunk in the catalog cannot silently shrink what is graded.
+#: The whole seat vocabulary, which is also `catalog.DEFAULT_VALIDATION_ROSTER`
 FULL_ROSTER = VALIDATOR_SEATS
 
-#: Where the run files what each seat actually said. Checked in — see the module
-#: docstring: it is the record that makes the next recalibration free.
+#: Where the run files what each seat actually said
 BASELINE_PATH = Path(__file__).with_name("validation_baseline.json")
 
-# -- the thresholds, and they are stated here rather than buried in an assert ------------
-#
-# Calibrated against the run recorded in `BASELINE_PATH` and never above what that run
-# scored — a floor above anything ever measured is a test that fails the first time it
-# costs money. `tests/test_validation_eval_harness.py` enforces both halves of that.
+# -- the thresholds, and they are stated here rather than buried in an assert
 
-#: Of 4 defective work-order submissions, how many the panel must refuse.
+#: Of 4 defective work-order submissions, how many the panel must refuse
 MUST_REJECT_FLOOR = 4
 
-#: Of 3 clean work-order submissions, how many the panel must let through. A rejection
-#: loop is the failure mode that makes this panel cost more than it saves, so this floor
-#: is not a lower bar than the one above — it is the same bar, pointed the other way.
+#: Of 3 clean work-order submissions, how many the panel must let through
 MUST_PASS_FLOOR = 3
 
-#: Of 3 small, correct, obviously improvable work-order submissions, how many the panel
-#: must let through IN ONE ROUND. Equal to `n`, the `FEATURE_CASES` shape: this battery is
-#: the property the whole feature is judged on (spec §6), and "two of three land" is not
-#: the claim — it is the treadmill with a better score.
+#: Of 3 small, correct, obviously improvable work-order submissions
 MUST_PASS_WITH_FOLLOW_UPS_FLOOR = 3
 
-#: Of those same 3, how many must raise at least one follow-up that NAMES ITS CODE — a
-#: `file` and a `failure`, the two `ops.follow_up_admissible` requires before a remark may
-#: become a ticket. Not equal to `n`: a submission whose remarks are all genuine nits is a
-#: correct outcome with nothing to file.
+#: Of those same 3, how many must raise at least one follow-up that NAMES ITS CODE
 ANCHORED_FOLLOW_UP_FLOOR = 2
 
-#: Of 2 submissions carrying a real defect AND cosmetic remarks, how many the panel must
-#: refuse. Also equal to `n`. THE MIRROR THE FEATURE NEEDS: nothing else in the suite
-#: separates "blocks on blockers" from "rubber-stamps anything small".
+#: Of 2 submissions carrying a real defect AND cosmetic remarks, how many the panel must refuse
 MUST_REJECT_WITH_FOLLOW_UPS_FLOOR = 2
 
-#: The case the veto scenario is graded on, and it is NAMED rather than discovered. Both
-#: veto seats blocked this one in the recorded run, and a test asking whether SOME case
-#: took the veto path is satisfied by whichever one happens to (`kn-abb7356b`).
+#: The case the veto scenario is graded on, and it is NAMED rather than discovered
 VETO_CASE = "raw-sql-where-a-store-method-exists"
 
-#: The seat taken down for the degradation scenario. A VETO HOLDER, and not the chair:
-#: losing the chair is total failure by design (`_run_chair` re-raises), and losing
-#: `architect` or `maintainer` measures nothing, because neither can force an outcome in
-#: the first place. `tester` rather than `security` because the degraded submission below
-#: is a testing lie — so what is graded is whether the panel still fails safe on the
-#: absent seat's own home ground.
+#: The seat taken down for the degradation scenario
 DEGRADED_SEAT = "tester"
 
-#: Which case the degraded panel judges. Its defect is a declared-evidence claim the diff
-#: contradicts, which every remaining seat can read for itself.
+#: Which case the degraded panel judges
 DEGRADED_CASE = "evidence-contradicts-diff"
 
-#: The one feature case that must come back passed. Named as a constant because the score
-#: written into the baseline has to know which direction each feature case points, and a
-#: second literal spelling of it is a second thing to keep in step.
+#: The one feature case that must come back passed
 CLEAN_FEATURE_CASE = "integrates-cleanly"
 
-# -- the project's standing instruction ---------------------------------------------------
+# -- the project's standing instruction
 
-#: Seeded into the eval's own knowledge base and rendered into every seat's system prompt
-#: by `validation.render_knowledge`. The `todo-instead-of-backlog` case has NO OTHER
-#: DEFECT — it ships a tested change with one deferral comment — so without this entry in
-#: the prompt that case is unreachable, and the harness companion asserts the fixture
-#: seeds it.
+#: Seeded into the eval's own knowledge base and rendered into every seat's system prompt by...
 TODO_INSTRUCTION = (
     "Deferred work goes in the backlog, never a TODO comment in the code. A TODO left "
     "in a diff is work that has left the record: nobody is told about it and nothing "
     "schedules it. File it and name the item, or do it now."
 )
 
-#: A second entry, and its job is to be IGNORED. Every clean submission below is also
-#: judged against the standing instructions, so a base with exactly one rule in it grades
-#: a panel that could pass everything by matching one string. This one is true of the
-#: invented project and violated by nothing in any battery.
+#: A second entry, and its job is to be IGNORED
 UNRELATED_INSTRUCTION = (
     "Money is Decimal everywhere in this codebase, never float. A float amount that "
     "reaches the ledger is a rounding error nobody can reconstruct afterwards."
 )
 
-# -- battery one: work-order submissions the panel MUST NOT pass ---------------------------
-#
-# Each entry is (name, title, brief, summary, declared evidence, diff), all literal
-# strings so a reviewer of this public repo reads what is graded off the page. Each case
-# carries EXACTLY ONE defect: a case with two is a case that cannot tell you which one the
-# panel saw.
+# -- battery one: work-order submissions the panel MUST NOT pass
 
 MUST_REJECT = [
     (
@@ -325,7 +226,7 @@ diff --git a/tests/test_report.py b/tests/test_report.py
     ),
 ]
 
-# -- battery two: work-order submissions the panel MUST NOT bounce -------------------------
+# -- battery two: work-order submissions the panel MUST NOT bounce
 
 MUST_PASS = [
     (
@@ -514,19 +415,7 @@ diff --git a/tests/test_intake.py b/tests/test_intake.py
     ),
 ]
 
-# -- battery three: small, correct, and obviously improvable -------------------------------
-#
-# THE BATTERY THE FEATURE IS JUDGED ON, and the one battery here whose cases are chosen to
-# give the seats something to say. Spec §6:
-# docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md
-#
-# Each submission is correct, tested, and small — and carries remarks any reviewer would
-# make: a terse name, a docstring that says nothing, a computation written twice. Under the
-# rule this feature replaced, every one of these was a rejection with a fresh crop of
-# findings next round. The measurement is that they land in ONE round AND that the remarks
-# were still raised: a battery the seats pass by finding NOTHING would score identically
-# with this feature reverted, which is the trap `test_the_improvements_were_filed_not_argued`
-# exists to close.
+# -- battery three: small, correct, and obviously improvable
 
 MUST_PASS_WITH_FOLLOW_UPS = [
     (
@@ -774,13 +663,7 @@ diff --git a/tests/test_intake.py b/tests/test_intake.py
     ),
 ]
 
-# -- battery four: a real defect standing beside remarks that are not ----------------------
-#
-# THE DISCRIMINATION THIS FEATURE CLAIMS, and the only thing in the suite that measures it.
-# Every case here carries ONE defect that must change before the work ships AND remarks
-# that must not cost a round — the same submission, so the panel cannot score by being
-# lenient or by being strict. A feature that files everything scores full marks on the
-# battery above and fails here, which is the point of the pairing (spec §6).
+# -- battery four: a real defect standing beside remarks that are not
 
 MUST_REJECT_WITH_FOLLOW_UPS = [
     (
@@ -878,12 +761,7 @@ diff --git a/tests/test_accounts.py b/tests/test_accounts.py
     ),
 ]
 
-# -- battery five: FEATURE orders, where the diff is integrated merged work ----------------
-#
-# (name, title, brief, summary, declared evidence, diff, children), where each child is
-# (id, title, what it claimed to do, what it declared as evidence). THE FIRST CASE IS THE
-# WHOLE REASON FEATURE-LEVEL VALIDATION EXISTS: both children pass on their own diff and
-# are jointly wrong, so nothing below the feature can see it.
+# -- battery five: FEATURE orders, where the diff is integrated merged work
 
 FEATURE_CASES = [
     (
@@ -1086,28 +964,17 @@ diff --git a/tests/test_currency_integration.py b/tests/test_currency_integratio
     ),
 ]
 
-# -- machinery ------------------------------------------------------------------------------
+# -- machinery
 
 
 def _cfg() -> ValidationConfig:
-    """The panel as it would run, on the eval's model.
-
-    `enabled` IS LEFT FALSE, deliberately. `validation.decide` never reads it — the round
-    machine does, upstream — so setting it would change nothing here except to put
-    `enabled=True` in a public file for someone to copy into a catalog.
-    """
+    """The panel as it would run, on the eval's model"""
     return ValidationConfig(roster=FULL_ROSTER,
                             seat_models={seat: MODEL for seat in FULL_ROSTER})
 
 
 def _files_and_stat(diff: str) -> tuple[tuple[str, ...], str]:
-    """The file list and `git diff --stat`, derived from the diff itself.
-
-    Derived rather than written out beside it: the tester seat leans on the file list to
-    check a claim of coverage ("you say you added tests and no file under `tests/` is
-    here"), and a hand-written list that disagreed with the patch would grade the seat on
-    a packet git could never produce.
-    """
+    """The file list and `git diff --stat`, derived from the diff itself"""
     files: list[str] = []
     counts: dict[str, list[int]] = {}
     current = ""
@@ -1135,12 +1002,7 @@ def _files_and_stat(diff: str) -> tuple[tuple[str, ...], str]:
 
 
 def _packet(case: tuple, unit: str, subject_id: str) -> evidence.EvidencePacket:
-    """One invented submission as the packet `validation.decide` reads.
-
-    Built through the real dataclass and fingerprinted by the real `evidence.fingerprint`,
-    so what the seats read here is the shape `collect_work_order` hands them for a real
-    tree. `diff_sha` is the digest of the whole diff, which is what the fingerprint hashes.
-    """
+    """One invented submission as the packet `validation.decide` reads"""
     name, title, brief, summary, declared, diff = case[:6]
     children = case[6] if len(case) > 6 else ()
     files, stat = _files_and_stat(diff)
@@ -1156,27 +1018,13 @@ def _packet(case: tuple, unit: str, subject_id: str) -> evidence.EvidencePacket:
 
 
 def _seat_of(prompt: str) -> str:
-    """Which seat this call is, read off `validation.SEAT_HEADER` in its USER TURN.
-
-    That header is a DIFFERENT literal from `panel.SEAT_HEADER` precisely so that `chair`
-    can be told apart between the two rosters, and keying on it is how one seat is taken
-    down without touching `validation.py`. It travels in the user prompt: the system
-    prompt is the packet, shared byte-for-byte by every seat of a round, so reading the
-    seat off it would name no seat at all — and a forced outage that silently stops
-    forcing grades a healthy panel while reporting a degraded one.
-    """
+    """Which seat this call is, read off `validation.SEAT_HEADER` in its USER TURN"""
     return next((s for s in FULL_ROSTER
                  if validation.SEAT_HEADER.format(seat=s) in prompt), "")
 
 
 class Meter:
-    """Wraps `claude_cli.run_headless_result`: counts what a decision costs, and can force
-    exactly one seat to fail.
-
-    Wrapping the real function rather than replacing it — every call underneath still
-    reaches a real model, so what is graded is the real panel. The counting exists only to
-    print a line a human reads; nothing asserts on it.
-    """
+    """Wraps `claude_cli.run_headless_result`: counts what a decision costs"""
 
     def __init__(self, fail_seat: str = ""):
         self._real = claude_cli.run_headless_result
@@ -1187,7 +1035,7 @@ class Meter:
                  **kwargs: Any) -> Any:
         seat = _seat_of(prompt)
         if seat and seat == self.fail_seat:
-            # Not counted: no call was made, and the cost reading must not bill for one.
+            # Not counted: no call was made, and the cost reading must not bill for one
             raise claude_cli.ClaudeCliError(
                 f"forced outage of the {seat} seat (eval fixture, no call was made)")
         self.calls.append(seat or "unattributed")
@@ -1195,7 +1043,7 @@ class Meter:
 
 
 class Run:
-    """One `validation.decide`, with what it cost and what it stored."""
+    """One `validation.decide`, with what it cost and what it stored"""
 
     def __init__(self, name: str, unit: str, packet: evidence.EvidencePacket,
                  result: dict[str, Any], opinions: list[dict[str, Any]],
@@ -1218,29 +1066,15 @@ class Run:
 
     @property
     def filed(self) -> list[dict[str, Any]]:
-        """The follow-ups `decide` handed back for `ops` to file as tickets.
-
-        The CONTRACT KEY, not a re-derivation from the stored replies: what the submitter
-        was spared is exactly what came out of this key, and a battery graded on a private
-        re-reading of the seats' JSON would stay green if `_follow_ups` stopped returning
-        any of it."""
+        """The follow-ups `decide` handed back for `ops` to file as tickets"""
         raw = self.result.get("follow_ups")
         return list(raw) if isinstance(raw, (list, tuple)) else []
 
     def severities(self) -> dict[str, int]:
-        """How many findings of each severity the SEATS THEMSELVES wrote, counted off the
-        stored replies rather than off `findings()`.
-
-        Deliberately not `validation.findings`: that normaliser reads an unreadable
-        severity as `follow_up` and synthesises a blocker for a seat that objected without
-        naming one, both of which are fail-safes about the CODE. What this battery grades
-        is whether the seats classify, so it counts the words they actually emitted.
-        """
+        """How many findings of each severity the SEATS THEMSELVES wrote"""
         out = {validation.BLOCKER: 0, validation.FOLLOW_UP: 0}
         for row in self.opinions:
-            # The chair is excluded here for the same reason `_follow_ups` excludes it: a
-            # chair finding would be a chair-originated judgement, which its mandate
-            # forbids, and counting one would grade the wrong seat's classification.
+            # The chair is excluded here for the same reason `_follow_ups` excludes it: a chair finding would be...
             if row["seat"] == "chair":
                 continue
             data = structured.parse_json_object(str(row.get("reply") or ""))
@@ -1255,20 +1089,14 @@ class Run:
         return out
 
     def seat(self, seat: str) -> dict[str, Any] | None:
-        """The stored `validation_opinions` row for one seat, or None if it has none.
-
-        Read back out of the store rather than off the returned `seats` list: the row is
-        what `jarvis validation show` renders, so the row is what should be graded.
-        """
+        """The stored `validation_opinions` row for one seat, or None if it has none"""
         return next((o for o in self.opinions if o["seat"] == seat), None)
 
 
 def _decide(store: ProjectStore, name: str, case: tuple, unit: str, subject_id: str,
             meter: Meter) -> Run:
     packet = _packet(case, unit, subject_id)
-    # `open_validation_round` refuses anything but exactly one of the two, which is the
-    # store enforcing what the CHECK constraint enforces: a round hangs off a work order
-    # or off a feature order, never both.
+    # `open_validation_round` refuses anything but exactly one of the two
     is_wo = unit == "work_order"
     round_row = store.open_validation_round(
         wo_id=subject_id if is_wo else None, fo_id=None if is_wo else subject_id,
@@ -1286,11 +1114,7 @@ def _decide(store: ProjectStore, name: str, case: tuple, unit: str, subject_id: 
 
 
 def _terminal_line(config: Any, line: str) -> None:
-    """Write straight to the terminal, past pytest's capture.
-
-    A `print` from a fixture is swallowed on a passing run, and these numbers are only
-    useful on a passing run — they are the cost reading, not a failure diagnostic.
-    """
+    """Write straight to the terminal, past pytest's capture"""
     reporter = config.pluginmanager.get_plugin("terminalreporter")
     if reporter is None:  # pragma: no cover - only when -p no:terminal
         print(line)
@@ -1304,13 +1128,7 @@ def _terminal_line(config: Any, line: str) -> None:
 
 
 def _report(config: Any, runs: dict[str, Run]) -> None:
-    """The cost and latency reading, WORK-ORDER AND FEATURE UNITS SEPARATELY.
-
-    Separately because that difference is the number the user needs: a feature packet is
-    the integrated diff of every child, and whether it is affordable — and whether it is
-    even a reviewable object — is open question 3 of the design. One combined average
-    would hide exactly the comparison the question asks for.
-    """
+    """The cost and latency reading, WORK-ORDER AND FEATURE UNITS SEPARATELY"""
     groups = [
         ("work_order (must-reject)", [c[0] for c in MUST_REJECT]),
         ("work_order (must-pass)", [c[0] for c in MUST_PASS]),
@@ -1341,24 +1159,17 @@ def _report(config: Any, runs: dict[str, Run]) -> None:
 
 
 def _blocking(row: dict[str, Any]) -> Any:
-    """Whether a seat raised the flag `arbitrate` reads, or None if it said nothing usable.
-
-    Recorded in the baseline because the veto table turns on this one key: a battery that
-    starts failing is a different investigation depending on whether the veto seats
-    stopped blocking or the chair started passing.
-    """
+    """Whether a seat raised the flag `arbitrate` reads, or None if it said nothing usable"""
     data = structured.parse_json_object(str(row.get("reply") or ""))
     return bool(data.get("blocking")) if isinstance(data, dict) else None
 
 
 def _score(runs: dict[str, Run]) -> dict[str, int]:
-    """What this run actually scored, per battery — the numbers the floors are set from."""
+    """What this run actually scored, per battery — the numbers the floors are set from"""
     return {
         "MUST_REJECT": sum(1 for c in MUST_REJECT if runs[c[0]].outcome != "passed"),
         "MUST_PASS": sum(1 for c in MUST_PASS if runs[c[0]].outcome == "passed"),
-        # BOTH HALVES OF THE CASE, scored together on purpose: a submission that passed
-        # because every seat found nothing is not this battery's property, and scoring the
-        # outcome alone would record it as one.
+        # BOTH HALVES OF THE CASE, scored together on purpose: a submission that passed because every seat...
         "MUST_PASS_WITH_FOLLOW_UPS": sum(
             1 for c in MUST_PASS_WITH_FOLLOW_UPS
             if runs[c[0]].outcome == "passed" and runs[c[0]].filed),
@@ -1372,13 +1183,7 @@ def _score(runs: dict[str, Run]) -> dict[str, int]:
 
 
 def _write_baseline(runs: dict[str, Run]) -> None:
-    """What every seat said, filed beside the thresholds it calibrated.
-
-    The point is that the NEXT recalibration is free: a floor that has to move can be
-    moved against this record instead of against a second paid run. `n` and the date are
-    stored with it because a score means nothing without the size of the battery it came
-    from or the day the model was asked.
-    """
+    """What every seat said, filed beside the thresholds it calibrated"""
     scores = _score(runs)
     payload = {
         "generated": time.strftime("%Y-%m-%d"),
@@ -1407,9 +1212,7 @@ def _write_baseline(runs: dict[str, Run]) -> None:
                 "unit": run.unit,
                 "outcome": run.outcome,
                 "reason": run.reason[:600],
-                # What the severity split actually did on this submission, so the next
-                # worker can see whether a battery moved because the seats stopped
-                # classifying or because the chair started weighing it differently.
+                # What the severity split actually did on this submission
                 "severities": run.severities(),
                 "filed": [{"seat": f.get("seat"), "title": f.get("title")}
                           for f in run.filed],
@@ -1426,19 +1229,12 @@ def _write_baseline(runs: dict[str, Run]) -> None:
     BASELINE_PATH.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
-# -- the one paid fixture ---------------------------------------------------------------
+# -- the one paid fixture
 
 
 @pytest.fixture(scope="module")
 def runs(tmp_path_factory, request):
-    """Every submission this file grades, judged once.
-
-    Module-scoped and built in one pass, mirroring production: the daemon validates one
-    unit at a time through one store. The saving inside a round is the SHARED prefix —
-    `build_shared_prefix` is byte-identical across the seats of one submission and is
-    written once by `decide`'s priming call — so what a per-test fixture would throw away
-    is the module's own warm-up, not that.
-    """
+    """Every submission this file grades, judged once"""
     home = tmp_path_factory.mktemp("validation-llm-home")
     os.environ["JARVIS_HOME"] = str(home)
     project_path = home / PROJECT
@@ -1481,21 +1277,16 @@ def runs(tmp_path_factory, request):
 
 
 def _verdicts(run: Run) -> dict[str, str]:
-    """Every seat's stored verdict, for a failure message that says WHO moved."""
+    """Every seat's stored verdict, for a failure message that says WHO moved"""
     return {o["seat"]: f"{o['status']}/{o['verdict'] or '-'}" for o in run.opinions}
 
 
-# -- battery one: the panel must not pass defective work -----------------------------------
+# -- battery one: the panel must not pass defective work
 
 
 @scenario("validation-llm/must-reject", "defective submissions are not passed")
 def test_defective_submissions_are_not_passed(runs):
-    """Threshold: at least MUST_REJECT_FLOOR of 4, calibrated against the run recorded in
-    `validation_baseline.json`.
-
-    `!= "passed"` rather than `== "rejected"`: an escalation is the panel refusing to
-    clear work it could not judge, which is the safe direction and reaches the user rather
-    than the merge queue. What must never happen is a pass."""
+    """Threshold: at least MUST_REJECT_FLOOR of 4"""
     caught = [c[0] for c in MUST_REJECT if runs[c[0]].outcome != "passed"]
     missed = {c[0]: _verdicts(runs[c[0]]) for c in MUST_REJECT if c[0] not in caught}
     assert len(caught) >= MUST_REJECT_FLOOR, (
@@ -1504,10 +1295,7 @@ def test_defective_submissions_are_not_passed(runs):
 
 @scenario("validation-llm/rejection-is-actionable", "a rejection says what to do")
 def test_a_rejection_tells_the_submitter_what_to_change(runs):
-    """A rejection the submitter cannot act on is a wasted round, and they get `max_rounds`
-    of them. The reason is delivered verbatim through the bus, so an empty one — or the
-    `UNSTATED_REJECTION` placeholder, which means a seat blocked and wrote nothing — costs
-    a whole round and teaches nothing."""
+    """A rejection the submitter cannot act on is a wasted round, and they get `max_rounds` of them"""
     empty = {c[0]: runs[c[0]].outcome for c in MUST_REJECT
              if runs[c[0]].outcome != "passed"
              and (len(runs[c[0]].reason.split()) < 8
@@ -1515,16 +1303,12 @@ def test_a_rejection_tells_the_submitter_what_to_change(runs):
     assert not empty, f"these rejections carry nothing the submitter can act on: {empty}"
 
 
-# -- battery two: the panel must not bounce clean work --------------------------------------
+# -- battery two: the panel must not bounce clean work
 
 
 @scenario("validation-llm/must-pass", "clean submissions are not bounced")
 def test_clean_submissions_are_passed(runs):
-    """Threshold: at least MUST_PASS_FLOOR of 3.
-
-    The mirror of the battery above and not the lesser half of it. A panel that rejects
-    everything scores full marks up there and is worse than no panel at all: every wrong
-    rejection is a re-run the submitter pays for and a round the unit cannot get back."""
+    """Threshold: at least MUST_PASS_FLOOR of 3"""
     passed = [c[0] for c in MUST_PASS if runs[c[0]].outcome == "passed"]
     bounced = {c[0]: runs[c[0]].reason[:200] for c in MUST_PASS if c[0] not in passed}
     assert len(passed) >= MUST_PASS_FLOOR, (
@@ -1533,31 +1317,19 @@ def test_clean_submissions_are_passed(runs):
 
 @scenario("validation-llm/a-pass-carries-no-feedback", "a passing round says nothing")
 def test_a_pass_carries_no_reason(runs):
-    """`decide` empties the reason on a pass, and the contract says a passing round carries
-    none. Graded on real chair output because the code path that empties it is one line: a
-    chair that put its verdict in `reason` would look fine in every unit test and would
-    still reach whoever renders a passing round."""
+    """`decide` empties the reason on a pass, and the contract says a passing round carries none"""
     talkative = {c[0]: runs[c[0]].reason[:120] for c in MUST_PASS
                  if runs[c[0]].outcome == "passed" and runs[c[0]].reason.strip()}
     assert not talkative, f"a passing round came back with feedback on it: {talkative}"
 
 
-# -- battery three: a small correct change lands in ONE round ------------------------------
+# -- battery three: a small correct change lands in ONE round
 
 
 @scenario("validation-llm/must-pass-with-follow-ups",
           "a small correct change that could be improved passes in one round")
 def test_an_improvable_submission_passes_in_one_round(runs):
-    """THE PROPERTY THE FEATURE IS JUDGED ON. Spec §6:
-    docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md
-
-    Threshold MUST_PASS_WITH_FOLLOW_UPS_FLOOR, equal to `n`, and that is not the usual
-    floor-with-headroom: the measured failure this feature replaced was a hundred-line
-    change taking five rounds and never landing, so "most of them land" is the same defect
-    with a better score.
-
-    IN ONE ROUND is the whole claim and it is what `runs` gives for free — every case is
-    judged exactly once, so a pass here is a pass on the first showing."""
+    """THE PROPERTY THE FEATURE IS JUDGED ON (docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md)"""
     landed = [c[0] for c in MUST_PASS_WITH_FOLLOW_UPS if runs[c[0]].outcome == "passed"]
     bounced = {c[0]: runs[c[0]].reason[:250] for c in MUST_PASS_WITH_FOLLOW_UPS
                if c[0] not in landed}
@@ -1570,15 +1342,7 @@ def test_an_improvable_submission_passes_in_one_round(runs):
           "the remarks on a passing submission are filed and none of them reach the "
           "submitter")
 def test_the_improvements_were_filed_not_argued(runs):
-    """THE CONTROL WITHOUT WHICH THE TEST ABOVE MEASURES NOTHING, and both halves are here
-    because each one alone has a cheap way to be green.
-
-    A panel that found NOTHING in these submissions would score full marks above and would
-    score identically with this feature reverted — so the first assertion is that remarks
-    WERE raised. And remarks raised are only filed if none of them reached the party who
-    would have to spend a round on them — so the second is that the round carries no
-    reason at all. Passed, with findings, and silent to the submitter: that is the
-    feature."""
+    """THE CONTROL WITHOUT WHICH THE TEST ABOVE MEASURES NOTHING"""
     silent = {c[0] for c in MUST_PASS_WITH_FOLLOW_UPS
               if runs[c[0]].outcome == "passed" and not runs[c[0]].filed}
     assert not silent, (
@@ -1595,17 +1359,7 @@ def test_the_improvements_were_filed_not_argued(runs):
           "the remarks that are filed name a file and a failure, so they can become "
           "tickets")
 def test_a_filed_remark_carries_its_anchors(runs):
-    """WHETHER A LIVE SEAT FILLS THE SCHEMA THE TRACKER GATE READS (spec §10.5).
-
-    Since wo-3619e6e4 a follow-up only becomes an issue if it names the `file` it is wrong
-    in and the `failure` it produces; anything else is round feedback to the submitter.
-    Every deterministic test of that gate hands it a hand-built dict, so a mandate the
-    seats ignore would file NOTHING fleet-wide and no test in the repository would move.
-
-    The floor is not `n`: a submission whose only remarks are genuine nits is a correct
-    outcome with nothing anchored. What must not happen is a whole battery of obviously
-    improvable code producing not one remark a tracker could carry.
-    """
+    """WHETHER A LIVE SEAT FILLS THE SCHEMA THE TRACKER GATE READS (spec §10.5)"""
     anchored = {c[0] for c in MUST_PASS_WITH_FOLLOW_UPS
                 if any(ops.follow_up_admissible(f) for f in runs[c[0]].filed)}
     assert len(anchored) >= ANCHORED_FOLLOW_UP_FLOOR, (
@@ -1613,18 +1367,13 @@ def test_a_filed_remark_carries_its_anchors(runs):
         f"raises is inadmissible and nothing is ever filed: anchored {sorted(anchored)}")
 
 
-# -- battery four: the defect blocks and the nits do not ------------------------------------
+# -- battery four: the defect blocks and the nits do not
 
 
 @scenario("validation-llm/must-reject-with-follow-ups",
           "a real defect still blocks when the panel also had nits")
 def test_a_defect_standing_beside_nits_still_blocks(runs):
-    """THE RUBBER-STAMP CHECK. A feature that files everything would pass this work, and
-    every other battery here would still be green — `MUST_REJECT`'s cases carry one clean
-    defect each and nothing to be lenient about.
-
-    `!= "passed"` for the same reason as `MUST_REJECT`: an escalation is the panel
-    refusing to clear work it could not judge, and what must never happen is a pass."""
+    """THE RUBBER-STAMP CHECK"""
     blocked = [c[0] for c in MUST_REJECT_WITH_FOLLOW_UPS
                if runs[c[0]].outcome != "passed"]
     let_through = {c[0]: _verdicts(runs[c[0]]) for c in MUST_REJECT_WITH_FOLLOW_UPS
@@ -1637,15 +1386,7 @@ def test_a_defect_standing_beside_nits_still_blocks(runs):
 @scenario("validation-llm/severity-discriminates",
           "the defect is classified a blocker and the nits are not")
 def test_the_nits_beside_a_defect_are_filed_rather_than_argued(runs):
-    """THE DISCRIMINATION, and it is measured on ONE submission at a time rather than
-    across the batteries — a panel that blocks on everything scores full marks on the test
-    above, and a panel that files everything scores full marks on battery three. Only a
-    case holding both can tell them apart, and only if both severities are read off the
-    same case.
-
-    Counted off the seats' OWN words (`Run.severities`), because what is graded here is
-    whether a reviewer can tell the two apart — not whether `validation.findings`
-    normalises a reply, which a free test already pins."""
+    """THE DISCRIMINATION, and it is measured on ONE submission at a time rather than across the batteries..."""
     for case in MUST_REJECT_WITH_FOLLOW_UPS:
         run = runs[case[0]]
         counted = run.severities()
@@ -1661,14 +1402,7 @@ def test_the_nits_beside_a_defect_are_filed_rather_than_argued(runs):
 @scenario("validation-llm/veto-still-short-circuits",
           "a veto seat blocking rejects without the chair being asked")
 def test_a_veto_rejects_and_the_chair_is_never_asked(runs):
-    """THE GUARD RAIL THIS FEATURE MAY NOT HAVE MOVED. Named on ONE case rather than
-    discovered across the battery: "some case took the veto path" is satisfied by whichever
-    one happens to, and the case that stopped doing so is the one it would then hide
-    (`kn-abb7356b`).
-
-    `arbitrate` runs before the chair and nothing it returns can be a pass, so a blocking
-    veto seat must still end the round on its own words. The absence of a chair row is what
-    proves the short circuit: a chair that ran and agreed looks identical in the outcome."""
+    """THE GUARD RAIL THIS FEATURE MAY NOT HAVE MOVED"""
     run = runs[VETO_CASE]
     blocking = [o["seat"] for o in run.opinions
                 if o["seat"] in validation.VETO_SEATS and _blocking(o)]
@@ -1682,21 +1416,13 @@ def test_a_veto_rejects_and_the_chair_is_never_asked(runs):
         "the safety rule out of a prompt is gone")
 
 
-# -- battery five: the feature level, which is the point of feature validation -------------
+# -- battery five: the feature level, which is the point of feature validation
 
 
 @scenario("validation-llm/feature-integration-defect",
           "a defect that spans two children is caught at the feature level")
 def test_the_feature_panel_catches_what_no_child_could(runs):
-    """THE MEASUREMENT THIS BATTERY EXISTS FOR, and open question 3 of the design.
-
-    Both children of this feature pass on their own diff: one renames `post_entry` and
-    updates every caller that existed when it ran; the other adds `reversal.py`, which
-    calls `post_entry`, and tests it through a monkeypatched journal so its own suite is
-    green either way. Merged, the reversal path calls a function that no longer exists.
-    Nothing below the feature can see that — it is the defect the integrated diff was
-    added to catch, and if the panel misses it, `feature_units` buys latency and nothing
-    else."""
+    """THE MEASUREMENT THIS BATTERY EXISTS FOR, and open question 3 of the design"""
     run = runs["stale-caller-across-two-children"]
     assert run.outcome != "passed", (
         "the integrated feature passed with a caller of a renamed function in it — "
@@ -1706,12 +1432,7 @@ def test_the_feature_panel_catches_what_no_child_could(runs):
 
 @scenario("validation-llm/feature-clean", "a feature that integrates cleanly is passed")
 def test_a_clean_feature_is_passed(runs):
-    """The control, and without it the test above proves nothing: a panel that rejected
-    every feature diff on sight would score full marks on the defect.
-
-    Also the honest reading of open question 3 — if a correct integrated diff cannot get
-    through, the feature packet is not a reviewable object at this size, and the answer is
-    a different roster, not a lower bar."""
+    """The control, and without it the test above proves nothing: a panel that rejected every feature diff..."""
     run = runs[CLEAN_FEATURE_CASE]
     assert run.outcome == "passed", (
         f"a clean integrated feature was {run.outcome}: {run.reason[:400]} — "
@@ -1721,9 +1442,7 @@ def test_a_clean_feature_is_passed(runs):
 @scenario("validation-llm/feature-reads-the-children",
           "the feature verdict is about the integration, not one child")
 def test_the_feature_rejection_names_the_seam(runs):
-    """A rejection that only repeats what a child's own panel would have said is a feature
-    panel not doing the feature's job. The seam here has one name in it — the function
-    that was renamed — and a reason that cannot mention it is not about the integration."""
+    """A rejection that only repeats what a child's own panel would have said is a feature panel not doing..."""
     run = runs["stale-caller-across-two-children"]
     seam = ("post_entry", "record_entry", "reversal")
     named = [word for word in seam if word in run.reason]
@@ -1731,18 +1450,13 @@ def test_the_feature_rejection_names_the_seam(runs):
         f"the feature rejection never names the seam {seam}: {run.reason[:400]!r}")
 
 
-# -- degradation ------------------------------------------------------------------------------
+# -- degradation
 
 
 @scenario("validation-llm/degradation",
           "a veto seat down still yields a well-formed outcome")
 def test_the_panel_survives_a_veto_seat_going_down(runs):
-    """A seat outage must not become a stalled unit, and it must not become a malformed
-    outcome either: the round machine writes this straight into a `validation_rounds` row
-    and posts the reason to whoever must act on it.
-
-    Paired with an assertion that the seat really was down. Without it, "a well-formed
-    outcome came back" is what a fully healthy panel also produces."""
+    """A seat outage must not become a stalled unit"""
     run = runs["degraded"]
     down = run.seat(DEGRADED_SEAT)
     assert down is not None, f"no {DEGRADED_SEAT} row at all — the outage was not recorded"
@@ -1751,9 +1465,7 @@ def test_the_panel_survives_a_veto_seat_going_down(runs):
         "healthy panel")
 
     result = run.result
-    # EXACT, not `>=`: this is the contract the round machine reads, and a key it does not
-    # know is a key nothing stores. `follow_ups` is the fourth and it was added with the
-    # severity split — a degraded panel still owes `ops` a list to file, empty or not.
+    # EXACT, not `>=`: this is the contract the round machine reads
     assert set(result) == {"outcome", "reason", "seats", "follow_ups"}, sorted(result)
     assert result["outcome"] in ("passed", "rejected", "escalated"), result["outcome"]
     assert isinstance(result["reason"], str)
@@ -1769,33 +1481,20 @@ def test_the_panel_survives_a_veto_seat_going_down(runs):
 @scenario("validation-llm/degradation-fails-safe",
           "a veto seat down does not pass work nobody could judge")
 def test_a_seat_going_down_does_not_pass_the_submission(runs):
-    """The hard limit, and the direction is the whole point: the chair's mandate says
-    silence is never agreement.
-
-    The degraded submission is `evidence-contradicts-diff` — a declared "all tests pass"
-    over a diff that deletes the assertion — so the lie is legible to every seat still up.
-    Losing the seat whose home ground that is must fail toward a rejection, never toward
-    clearing it."""
+    """The hard limit, and the direction is the whole point: the chair's mandate says silence is never..."""
     run = runs["degraded"]
     assert run.outcome != "passed", (
         f"passed a submission whose evidence the diff contradicts with {DEGRADED_SEAT} "
         f"down: {run.reason[:200]!r}")
 
 
-# -- what the seats read --------------------------------------------------------------------
+# -- what the seats read
 
 
 @scenario("validation-llm/standing-instruction",
           "a project's standing instruction decides a verdict")
 def test_a_standing_instruction_is_enforced_and_cited(runs):
-    """`render_knowledge` puts the project's own rules in every seat's prompt and tells the
-    seats to cite the `kn-` id when one decides their verdict. This case has NO OTHER
-    DEFECT — the change is tested and the test is non-vacuous — so a rejection here can
-    only have come from the instruction.
-
-    The citation is graded on the STORED opinions rather than on the delivered reason: the
-    id is stored with the opinion so a rejection can be traced back to the rule that caused
-    it, and the submitter's message is prose."""
+    """`render_knowledge` puts the project's own rules in every seat's prompt and tells the seats to cite..."""
     run = runs["todo-instead-of-backlog"]
     assert run.outcome != "passed", (
         "a diff carrying a TODO passed under a standing instruction that forbids one — "
@@ -1810,20 +1509,7 @@ def test_a_standing_instruction_is_enforced_and_cited(runs):
 @scenario("validation-llm/no-deliberation-leaks",
           "the panel is never narrated to the submitter")
 def test_the_deliberation_does_not_reach_the_submitter(runs):
-    """The reason is delivered verbatim to whoever must fix the work, and the deliberation
-    never leaves the room — `_message` strips attribution in code, but only on the path it
-    controls. Whether a chair handed four colleagues' replies resists summarising them is a
-    judgement, and judgement is what this file is for.
-
-    The control is in the same test: the seats' opinions ARE readable from the store for
-    these same decisions, so a green here cannot mean "nothing deliberated".
-
-    THE BARE SEAT NAME AS AN ACTOR IS IN THE LIST, and it was added because the loose list
-    reported green on a real leak: a chair opened a rejection with "Three seats found
-    nothing wrong, but the maintainer caught…", which matched nothing when only
-    "maintainer seat" was forbidden. `the maintainer` is narration wherever it appears in
-    a message addressed to the submitter — unlike the bare word `security`, which is
-    ordinary English about a diff and is deliberately NOT matched."""
+    """The reason is delivered verbatim to whoever must fix the work"""
     narration = ("tester seat", "security seat", "architect seat", "maintainer seat",
                  "the chair", "the panel", "the seats", "one seat", "seats agree",
                  "seats disagree", "panel agrees", "the roster", "a vote", "unanimous",

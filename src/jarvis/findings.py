@@ -1,37 +1,4 @@
-"""The findings report an analyst submits, and the structural checks it must survive.
-
-An improvement order's analyst finishes by handing back a report: what is going wrong,
-why, and what to do about it (`jarvis io report <io-id> --from-file report.json`). This
-module owns that document's shape and validates it *before* anything is stored or any
-of the user's attention is spent.
-
-Why the validation is mechanical and lives here rather than in a reviewer's judgement:
-the same argument that makes `plans.py` load-bearing. This report is a structured
-document the user is about to ACT on — finding by finding, each decision spending
-worker sessions — so the check on it has to be more trustworthy than the thing it
-checks. Pure Python over the submitted document, no LLM, no database, no disk.
-
-The rejections, and what each is guarding:
-
-* **No summary, no findings, a missing/malformed/duplicated `key`.** `key` is how
-  `jarvis io review` and the dashboard address one finding; without it a decision has
-  nothing to land on.
-* **The findings cap.** The ATTENTION cap, the same shape and the same argument as
-  `plans.CHILD_CAP`: a report the user will not read changes nothing. Over it the
-  analyst must say why, in the submission, or it does not validate.
-* **Prose fields under the floor.** `symptom`, `root_cause`, `why_insufficient` and
-  `recommendation` each carry an argument. Short prose is the failure mode for
-  `why_insufficient` specifically — "it does not fix the root cause" is a restatement,
-  not an argument.
-* **Evidence that cannot be checked.** A finding with no source or no quote asks the
-  user to trust the analyst's session, which nobody reads.
-* **Proposed orders that would not brief anyone.** A proposed order becomes a real work
-  order whose worker sees its description and nothing else, so the description runs
-  through `plans._description_problems` — reused, never re-implemented, and its trap is
-  inherited with it: ORDINALS ARE NOT OUTWARD REFERENCES.
-
-§4 of docs/superpowers/specs/2026-09-23-improvement-orders.md.
-"""
+"""The findings report an analyst submits, and the structural checks it must survive (docs/superpowers/specs/2026-09-23-improvement-orders.md)"""
 
 from __future__ import annotations
 
@@ -39,40 +6,24 @@ from typing import Any
 
 from . import plans
 
-#: How many findings a report may carry before the analyst owes an explanation. This is
-#: the ATTENTION cap, not a storage limit: the user reads every finding and decides it,
-#: and a report they will not read changes nothing. Same shape and same argument as
-#: `plans.CHILD_CAP`.
+#: How many findings a report may carry before the analyst owes an explanation
 MAX_FINDINGS = 6
 
-#: Shortest a prose field can be and still be an argument rather than a label. Aimed at
-#: `why_insufficient` above all — "it does not fix the root cause" is a restatement of
-#: the question. Deliberately a floor against obvious under-specification, not a quality
-#: bar; judging whether a real paragraph is GOOD is the user's job at review time.
+#: Shortest a prose field can be and still be an argument rather than a label
 MIN_FIELD_CHARS = 40
 
-#: Shortest quote that can still be found again in the thing it was quoted from. Under
-#: this it is a fragment the user cannot grep for, which defeats the point of quoting.
+#: Shortest quote that can still be found again in the thing it was quoted from
 MIN_QUOTE_CHARS = 20
 
-#: Finding keys. Reused from `plans` rather than declared a second time: a finding key
-#: plays exactly the role a plan child key plays — a short, stable, report-local handle
-#: the review verb addresses — and two regexes for one rule drift.
+#: Finding keys
 KEY_RE = plans.KEY_RE
 
-#: What a proposed order may become. Nothing is defaulted: `type` decides whether the
-#: user gets one work order or a whole feature order out of this finding, and picking
-#: that on the analyst's behalf is picking what the analyst meant.
+#: What a proposed order may become
 ORDER_TYPES = ("work", "feature")
 
 
 class FindingsError(ValueError):
-    """A submitted report that cannot be accepted. Message names every problem found.
-
-    One exception carrying all of them, not the first: an analyst that has to re-submit
-    per problem burns a session round trip per line of the error it could have had at
-    once. Mirrors `plans.PlanError`.
-    """
+    """A submitted report that cannot be accepted"""
 
     def __init__(self, problems: list[str]):
         self.problems = problems
@@ -80,18 +31,7 @@ class FindingsError(ValueError):
 
 
 def parse_report(raw: Any) -> dict[str, Any]:
-    """Validate a submitted findings report and return it normalised.
-
-    Raises `FindingsError` carrying EVERY problem, never the first one found. The
-    returned document is what gets stored on the improvement order and what the review
-    verb and the dashboard read, so normalisation happens here and exactly once: strings
-    stripped, absent optional fields filled in, unknown keys dropped. Nothing downstream
-    re-derives any of it.
-
-    No `status` or decision field is written here. `ops.submit_findings` sets every
-    finding `status='pending'` when it stores, and the review verb writes the decisions;
-    keeping that out of the validator is what lets it stay pure.
-    """
+    """Validate a submitted findings report and return it normalised"""
     problems: list[str] = []
     if not isinstance(raw, dict):
         raise FindingsError(
@@ -121,8 +61,7 @@ def parse_report(raw: Any) -> dict[str, Any]:
                 f"{where}: `key` must be a short lowercase slug "
                 f"([a-z0-9][a-z0-9_-]*), got {key!r}"
             )
-            # Substitute a placeholder so every later message about this entry still
-            # locates it, exactly as `parse_plan` does.
+            # Substitute a placeholder so every later message about this entry still locates it
             key = f"?{i}"
         elif key in seen_keys:
             problems.append(f"{where}: duplicate key {key!r}")
@@ -156,8 +95,7 @@ def parse_report(raw: Any) -> dict[str, Any]:
 
 
 def _field_problems(key: str, name: str, value: str) -> list[str]:
-    """Whether one prose field carries an argument. Missing and too-short are distinct
-    messages: they are different mistakes and have different fixes."""
+    """Whether one prose field carries an argument"""
     if not value:
         return [f"finding {key!r}: `{name}` is required"]
     if len(value) < MIN_FIELD_CHARS:
@@ -170,12 +108,7 @@ def _field_problems(key: str, name: str, value: str) -> list[str]:
 
 
 def parse_evidence(key: str, raw: Any, problems: list[str]) -> list[dict[str, str]]:
-    """The quoted record behind a finding. Every message locates the finding by key AND
-    the entry by its 1-based index, because that is how the analyst finds it again.
-
-    PUBLIC because `verdicts.py` imports it — §2.4 of
-    docs/superpowers/specs/2026-09-27-investigation-orders.md: two leaves, one dependency
-    edge, one definition of what a quote is."""
+    """The quoted record behind a finding (docs/superpowers/specs/2026-09-27-investigation-orders.md)"""
     if not isinstance(raw, list) or not raw:
         problems.append(
             f"finding {key!r}: `evidence` must be a non-empty list — a finding with "
@@ -208,12 +141,7 @@ def parse_evidence(key: str, raw: Any, problems: list[str]) -> list[dict[str, st
 
 
 def _parse_orders(key: str, raw: Any, problems: list[str]) -> list[dict[str, str]]:
-    """The work this finding proposes, if any.
-
-    An EMPTY list is accepted and never produces a problem: a finding whose
-    recommendation is "do nothing, and here is why" is legitimate and valuable, and
-    forcing an order out of it is how an analyst is pushed into inventing work (§4.2).
-    """
+    """The work this finding proposes, if any"""
     if raw is None:
         return []
     if not isinstance(raw, list):
@@ -239,10 +167,7 @@ def _parse_orders(key: str, raw: Any, problems: list[str]) -> list[dict[str, str
             problems.append(f"{where}: `project` must be a string, got "
                             f"{type(project).__name__}")
             project = ""
-        # This description becomes a real brief read cold by a stranger — the worker
-        # created from it sees the description and never this report — and there is ONE
-        # standard for that in this codebase. Reused, not re-implemented, so its trap is
-        # inherited with it: ORDINALS ARE NOT OUTWARD REFERENCES.
+        # This description becomes a real brief read cold by a stranger
         description = str(item.get("description") or "").strip()
         problems += plans._description_problems(f"{key}/order {n}", title, description)
         out.append({"type": order_type, "project": str(project or "").strip(),
@@ -251,14 +176,7 @@ def _parse_orders(key: str, raw: Any, problems: list[str]) -> list[dict[str, str
 
 
 def knowledge_text(finding: dict[str, Any]) -> str:
-    """The knowledge-base entry an accepted finding becomes (§5.4).
-
-    THE FIRST LINE IS THE ROOT CAUSE STATED AS A RULE, alone on its line and with its
-    whitespace collapsed. Per kn-8656d497 and kn-0281d10b an entry body never reaches a
-    worker's prompt — an index of first lines does, truncated to 160 characters — so the
-    first line is the only part most workers ever see unprompted, and a first line that
-    said "This finding is about…" would spend the whole budget saying nothing.
-    """
+    """The knowledge-base entry an accepted finding becomes (§5.4)"""
     root = " ".join(str(finding.get("root_cause") or "").split())
     lines = [root, ""]
     lines += [f"Symptom: {finding.get('symptom', '')}", ""]
@@ -268,8 +186,7 @@ def knowledge_text(finding: dict[str, Any]) -> str:
     evidence = finding.get("evidence") or []
     if evidence:
         lines += ["", "Evidence:"]
-        # Attributed on the quote's OWN line: a source a line away is one the reader has
-        # to reassemble. Same rule as `render_finding`.
+        # Attributed on the quote's OWN line: a source a line away is one the reader has to reassemble
         lines += [f"  - {item.get('quote', '')!r} ({item.get('source', '')})"
                   for item in evidence]
     orders = finding.get("proposed_orders") or []
@@ -281,12 +198,7 @@ def knowledge_text(finding: dict[str, Any]) -> str:
 
 def rejection_learning(io: dict[str, Any], finding: dict[str, Any], feedback: str,
                        decided_by: str = "user") -> str:
-    """What Neo is taught when the user refuses a finding (§5.5).
-
-    Shaped like `neo.learning_from_assumption_review`, because it is the same teaching
-    signal from the same user at the same kind of moment: what was claimed, and what the
-    user said about it.
-    """
+    """What Neo is taught when the user refuses a finding (§5.5)"""
     root = " ".join(str(finding.get("root_cause") or "").split())
     return (f"On improvement order \"{str(io.get('title', ''))[:120]}\" an analyst found: "
             f"\"{root[:300]}\". The user rejected that ({decided_by}): {feedback}")
@@ -294,15 +206,7 @@ def rejection_learning(io: dict[str, Any], finding: dict[str, Any], feedback: st
 
 def render_finding(finding: dict[str, Any],
                    filed: list[dict[str, Any]] | None = None) -> list[str]:
-    """One finding as lines a human reads: the argument, the record behind it, the work.
-
-    Every quote is attributed to its source on the same line, because a quote whose
-    source is a line away is one the reader has to reassemble.
-
-    `filed` is the orders this finding actually produced, with their CURRENT status,
-    resolved by `ops.show_improvement_order` — §5.3.1: a back-link nothing renders is a
-    column, not a link. Optional, so every caller from before review existed is unchanged.
-    """
+    """One finding as lines a human reads: the argument, the record behind it, the work"""
     lines = [
         f"  symptom: {finding.get('symptom', '')}",
         f"  root cause: {finding.get('root_cause', '')}",
@@ -316,8 +220,7 @@ def render_finding(finding: dict[str, Any],
             lines.append(f"    - {item.get('quote', '')!r} ({item.get('source', '')})")
     orders = finding.get("proposed_orders") or []
     if not orders:
-        # One line rather than an empty section: "do nothing, and here is why" is a real
-        # finding, and a blank heading reads like something failed to render.
+        # One line rather than an empty section: "do nothing
         lines.append("  no proposed orders")
     else:
         lines.append("  proposed orders:")
@@ -339,12 +242,7 @@ def render_finding(finding: dict[str, Any],
 def render_report(report: dict[str, Any],
                   filed_orders: dict[str, list[dict[str, Any]]] | None = None
                   ) -> list[str]:
-    """The report as lines a human reads — `jarvis io show`'s view, and the dashboard's.
-
-    One renderer, so the two surfaces cannot drift: two places rendering a report
-    separately is how they come to disagree about what was decided. Mirrors
-    `plans.render_plan`.
-    """
+    """The report as lines a human reads — `jarvis io show`'s view, and the dashboard's"""
     lines: list[str] = []
     if report.get("summary"):
         lines += [report["summary"], ""]
@@ -361,12 +259,7 @@ def render_report(report: dict[str, Any],
 
 
 def review_headline(io: dict[str, Any], report: dict[str, Any]) -> str:
-    """The counts-first line the attention reason uses (§6.2).
-
-    It names `jarvis io review <io-id>` because an attention item whose instruction
-    names no command is one the user has to guess at. Counts before prose: the one thing
-    the user needs from the status line is how many decisions are still owed.
-    """
+    """The counts-first line the attention reason uses (§6.2)"""
     findings = report.get("findings") or []
     accepted = sum(1 for f in findings if (f.get("status") or "pending") == "accepted")
     rejected = sum(1 for f in findings if (f.get("status") or "pending") == "rejected")

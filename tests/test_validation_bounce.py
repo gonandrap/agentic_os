@@ -1,13 +1,4 @@
-"""A resubmission that answers nothing the last round asked about never reaches the panel.
-
-Spec docs/superpowers/specs/2026-09-22-a-round-must-answer-the-list.md. Two measured
-failures, one predicate — wo-2005a89b round 3 (only tests changed, behaviour re-judged and
-flipped) and wo-0a9ba9b3 round 2 (none of the five asks touched, a full round spent).
-
-THE SEATS HERE REPLY IN JSON. `validation.findings` parses a seat's reply, and the prose
-replies `tests/test_validation_loop.py` uses parse to no findings at all — which is the
-FAIL-OPEN case, so a test built on those would pass with the whole feature deleted.
-"""
+"""A resubmission that answers nothing the last round asked about never reaches the panel (docs/superpowers/specs/2026-09-22-a-round-must-answer-the-list.md)"""
 
 from __future__ import annotations
 
@@ -25,12 +16,7 @@ from tests.test_validation_loop import (  # noqa: F401
 
 
 def edit(fleet, wo_id: str, text: str, name: str) -> None:
-    """A committed change at a NESTED path.
-
-    `Fleet.change` writes to the worktree root, and a root-level `app.py` is exactly what
-    `validation.cited_paths` refuses to read as a citation — one directory separator is
-    the whole difference between a path and a sentence's subject.
-    """
+    """A committed change at a NESTED path"""
     tree = fleet.worktree(wo_id)
     path = tree / name
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -40,7 +26,7 @@ def edit(fleet, wo_id: str, text: str, name: str) -> None:
 
 
 def rejecting(*paths: str) -> dict:
-    """A rejection whose blockers CITE files — what a real seat's JSON looks like."""
+    """A rejection whose blockers CITE files — what a real seat's JSON looks like"""
     reply = json.dumps({
         "verdict": "reject",
         "reason": "the change is not covered",
@@ -70,7 +56,7 @@ def events(fleet, wo_id: str, kind: str) -> list[dict]:
 
 
 def rejected_once(fleet, wo_id: str, *cited: str) -> Validator:
-    """Round 1, rejected, citing `cited`. Leaves the work order back with its worker."""
+    """Round 1, rejected, citing `cited`"""
     v = fleet.daemon.validator = Validator(rejecting(*cited))
     edit(fleet, wo_id, "print('one')\n", "src/app.py")
     finish(fleet, wo_id)
@@ -80,7 +66,7 @@ def rejected_once(fleet, wo_id: str, *cited: str) -> Validator:
     return v
 
 
-# -- the rule itself, in isolation ---------------------------------------------------
+# -- the rule itself, in isolation
 
 
 def test_cited_paths_reads_title_and_detail_and_drops_a_line_number():
@@ -92,26 +78,23 @@ def test_cited_paths_reads_title_and_detail_and_drops_a_line_number():
 
 
 def test_a_bare_filename_is_not_a_citation():
-    """`budget.py` is as often a sentence's subject as a path, and one false citation
-    bounces real work."""
+    """`budget.py` is as often a sentence's subject as a path, and one false citation bounces real work"""
     assert validation.cited_paths([{"title": "budget.py is wrong", "detail": ""}]) == ()
 
 
-#: wo-5ef5f42c round 2's real anchor, and the illustrative command its prose carried.
+#: wo-5ef5f42c round 2's real anchor, and the illustrative command its prose carried
 INCIDENT_SPEC = "docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md"
 INCIDENT_PROSE = "run sed -n '40,80p' docs/superpowers/specs/x.md to see how it reads"
 
 
 def anchored(path: str, prose: str = INCIDENT_PROSE) -> dict:
-    """A blocker as `validation.findings` normalises one: all three anchor keys."""
+    """A blocker as `validation.findings` normalises one: all three anchor keys"""
     return {"severity": validation.BLOCKER, "file": path, "symbol": "", "failure": "",
             "title": "the spec is not navigable", "detail": prose}
 
 
 def test_an_anchored_blocker_cites_its_anchor_and_never_its_prose():
-    """wo-5ef5f42c round 2: both blockers named the real spec in `file` and quoted
-    `docs/superpowers/specs/x.md` as an example, so the prose regex cited a path that exists nowhere
-    and bounced a commit that DID change the spec — twice, to BOUNCE_EXHAUSTED."""
+    """wo-5ef5f42c round 2: both blockers named the real spec in `file` and quoted... (docs/superpowers/specs/x.md)"""
     assert validation.cited_paths([anchored(INCIDENT_SPEC)]) == (INCIDENT_SPEC,)
     assert validation.unanswered_submission(
         {"outcome": "rejected"}, [anchored(INCIDENT_SPEC)],
@@ -119,7 +102,7 @@ def test_an_anchored_blocker_cites_its_anchor_and_never_its_prose():
 
 
 def test_an_anchor_and_a_prose_only_blocker_are_both_read():
-    """Mixed sets: the anchor replaces that finding's prose and nobody else's."""
+    """Mixed sets: the anchor replaces that finding's prose and nobody else's"""
     found = [anchored(INCIDENT_SPEC),
              {"file": "", "symbol": "", "failure": "",
               "title": "src/jarvis/budget.py is wrong", "detail": ""}]
@@ -133,8 +116,7 @@ def test_a_blank_anchor_falls_back_to_the_prose():
 
 
 def test_a_citation_no_filesystem_can_find_lets_the_panel_judge():
-    """A prose-only blocker citing a path that is nowhere — not in either map, not on
-    disk — is no list at all, which is the fail-open §5 already promises."""
+    """A prose-only blocker citing a path that is nowhere"""
     found = [{"file": "", "title": "look at docs/superpowers/specs/x.md", "detail": ""}]
     assert validation.unanswered_submission(
         {"outcome": "rejected"}, found, {"src/app.py": "1"}, {"src/app.py": "2"},
@@ -142,8 +124,7 @@ def test_a_citation_no_filesystem_can_find_lets_the_panel_judge():
 
 
 def test_the_filter_does_not_fail_open_onto_a_real_file():
-    """An anchored real file the submission never touched still bounces, and the tuple
-    the submitter is shown is that file."""
+    """An anchored real file the submission never touched still bounces"""
     found = [anchored("src/app.py")]
     assert validation.unanswered_submission(
         {"outcome": "rejected"}, found, {"notes/notes.py": "1"},
@@ -151,8 +132,7 @@ def test_the_filter_does_not_fail_open_onto_a_real_file():
 
 
 def test_with_no_predicate_the_two_maps_are_the_only_test():
-    """`exists=None` means there is no filesystem source: a path in `before` or `now` is
-    kept exactly as before, one in neither is not."""
+    """`exists=None` means there is no filesystem source: a path in `before` or `now` is kept exactly as..."""
     found = [{"file": "", "title": "a/b.py is wrong", "detail": ""}]
     assert validation.unanswered_submission(
         {"outcome": "rejected"}, found,
@@ -162,8 +142,7 @@ def test_with_no_predicate_the_two_maps_are_the_only_test():
 
 
 def test_the_returned_tuple_is_the_filtered_list():
-    """Only the surviving citations reach the bounce message — a path nothing can find
-    would read to the submitter as a file they must change."""
+    """Only the surviving citations reach the bounce message"""
     found = [anchored("src/app.py"),
              {"file": "", "title": "and docs/superpowers/specs/x.md", "detail": ""}]
     assert validation.unanswered_submission(
@@ -203,28 +182,24 @@ def test_blockers_that_cite_nothing_let_the_panel_judge():
 ])
 def test_a_citation_matches_a_moved_path_only_at_a_directory_boundary(cited, moved,
                                                                       touched):
-    """`_touched` decides whether real work is bounced. A suffix that did not have to
-    start at a separator would match `store.py` against `project_store.py` and let a
-    round that answered nothing through; an exact-only rule would bounce the seat that
-    quoted the path without its `src/` prefix."""
+    """`_touched` decides whether real work is bounced"""
     assert validation._touched(cited, frozenset({moved, "unrelated/x.py"})) is touched
 
 
 def test_the_short_citation_reaches_the_rule_and_not_just_the_helper():
-    """The suffix branch is only worth anything if `unanswered_submission` uses it."""
+    """The suffix branch is only worth anything if `unanswered_submission` uses it"""
     found = [{"title": "jarvis/budget.py is wrong", "detail": ""}]
     assert validation.unanswered_submission(
         {"outcome": "rejected"}, found, {"a.py": "1"},
         {"src/jarvis/budget.py": "2"}) is None
-    # `exists` keeps it: a short citation for a file that IS there is a citation, and
-    # only a path no source can find is dropped (spec §5).
+    # `exists` keeps it: a short citation for a file that IS there is a citation
     assert validation.unanswered_submission(
         {"outcome": "rejected"}, found, {"a.py": "1"},
         {"src/jarvis/budgets.py": "2"}, exists=lambda p: True) == ("jarvis/budget.py",)
 
 
 def test_one_cited_path_touched_is_enough():
-    """SOME of the list goes to the panel — only NONE short-circuits (spec §5)."""
+    """SOME of the list goes to the panel — only NONE short-circuits (spec §5)"""
     found = [{"title": "a/b.py and a/c.py are wrong", "detail": ""}]
     assert validation.unanswered_submission(
         {"outcome": "rejected"}, found,
@@ -238,7 +213,7 @@ def test_the_paths_are_returned_when_none_of_them_moved():
         {"a/b.py": "1"}, {"a/b.py": "1", "a/z.py": "9"}) == ("a/b.py",)
 
 
-# -- the round records what it judged -------------------------------------------------
+# -- the round records what it judged
 
 
 def test_a_judged_round_records_a_digest_per_file(fleet):
@@ -253,14 +228,7 @@ def test_a_judged_round_records_a_digest_per_file(fleet):
 
 
 def test_a_round_that_predates_the_column_lets_the_panel_judge(tmp_path):
-    """The fail-open the spec promises costs a live submitter nothing.
-
-    Every round judged before this work order landed recorded no map, and `''` reads as
-    "not recorded" and never as "the submitter touched nothing" — otherwise the first
-    resubmission on every upgraded database would be bounced for work it did do. The
-    column is DROPPED and the store reopened, because a fresh database gets it from the
-    `CREATE TABLE` and would pass with the migration forgotten.
-    """
+    """The fail-open the spec promises costs a live submitter nothing"""
     proj = tmp_path / "legacy"
     (proj / ".jarvis").mkdir(parents=True)
     store = ProjectStore(proj)                          # today's schema...
@@ -286,7 +254,7 @@ def test_a_round_that_predates_the_column_lets_the_panel_judge(tmp_path):
         store.close()
 
 
-# -- failure 2: a resubmission that answers none of the list ---------------------------
+# -- failure 2: a resubmission that answers none of the list
 
 
 def test_a_submission_touching_none_of_the_cited_paths_never_reaches_the_panel(fleet):
@@ -302,13 +270,7 @@ def test_a_submission_touching_none_of_the_cited_paths_never_reaches_the_panel(f
 
 
 def test_a_bounce_parks_even_when_the_LATEST_round_is_not_the_one_it_read(fleet):
-    """The bounce reads `last_judged_round`, which walks BACK past `failed` and `void`
-    rows — so the latest row can be one the bounce never looked at, and letting the join
-    re-derive the status from it lands unreviewed work in the merge queue.
-
-    The `void` here is the row `Daemon._void` writes (a redelivery with nothing in it):
-    settled, and NOT counted, so `last_judged_round` still answers round 1.
-    """
+    """The bounce reads `last_judged_round`, which walks BACK past `failed` and `void` rows"""
     wo = fleet.dispatch()
     rejected_once(fleet, wo["id"], "src/app.py")
     store = fleet.store()
@@ -332,7 +294,7 @@ def test_a_bounce_parks_even_when_the_LATEST_round_is_not_the_one_it_read(fleet)
 
 
 def test_the_bounce_spends_no_round(fleet):
-    """The next real submission is still round 2 — spec §5."""
+    """The next real submission is still round 2 — spec §5"""
     wo = fleet.dispatch()
     v = rejected_once(fleet, wo["id"], "src/app.py")
 
@@ -348,7 +310,7 @@ def test_the_bounce_spends_no_round(fleet):
 
 
 def test_the_bounce_names_the_paths_it_checked(fleet):
-    """The user's ruling on Neo question 518: a bounce that leaves no trace is silence."""
+    """The user's ruling on Neo question 518: a bounce that leaves no trace is silence"""
     wo = fleet.dispatch()
     rejected_once(fleet, wo["id"], "src/app.py")
     edit(fleet, wo["id"], "# unrelated\n", "notes/notes.py")
@@ -365,8 +327,7 @@ def test_the_bounce_goes_back_to_the_worker_as_feedback(fleet):
     edit(fleet, wo["id"], "# unrelated\n", "notes/notes.py")
     finish(fleet, wo["id"])
 
-    # THE ENVELOPE, not a message: `bus.post` never resolves, and a test that ticked
-    # first would be asserting the router's work rather than the bounce's.
+    # THE ENVELOPE, not a message: `bus.post` never resolves
     store = fleet.store()
     try:
         [env] = [e for e in store.queued_envelopes()
@@ -380,9 +341,7 @@ def test_the_bounce_goes_back_to_the_worker_as_feedback(fleet):
 
 
 def test_a_citation_absent_from_the_worktree_reaches_the_panel(fleet):
-    """The fleet half of the real-file filter: `ops.unanswered_paths` resolves the work
-    order's worktree and passes `exists`, so a round whose only citation is a path that
-    is not in the tree bounces nothing (spec §5)."""
+    """The fleet half of the real-file filter: `ops.unanswered_paths` resolves the work order's worktree..."""
     wo = fleet.dispatch()
     v = rejected_once(fleet, wo["id"], "docs/superpowers/specs/x.md")
     v.outcomes = [passed()]
@@ -408,11 +367,11 @@ def test_touching_a_cited_path_reaches_the_panel(fleet):
     assert [r["outcome"] for r in rounds(fleet, wo["id"])] == ["rejected", "passed"]
 
 
-# -- failure 1: the behaviour was rejected and is unchanged ----------------------------
+# -- failure 1: the behaviour was rejected and is unchanged
 
 
 def test_a_test_only_round_is_bounced_when_the_behaviour_was_rejected(fleet):
-    """wo-2005a89b round 3, exactly: only a test moved, and round 1 rejected src/app.py."""
+    """wo-2005a89b round 3, exactly: only a test moved, and round 1 rejected src/app.py"""
     wo = fleet.dispatch()
     v = rejected_once(fleet, wo["id"], "src/app.py")
 
@@ -425,8 +384,7 @@ def test_a_test_only_round_is_bounced_when_the_behaviour_was_rejected(fleet):
 
 
 def test_a_test_only_round_reaches_the_panel_when_the_tests_were_what_was_rejected(fleet):
-    """The case the work order says must NOT be refused: round 1 asked for coverage and
-    the resubmission is the coverage."""
+    """The case the work order says must NOT be refused: round 1 asked for coverage and the resubmission..."""
     wo = fleet.dispatch()
     v = rejected_once(fleet, wo["id"], "tests/test_app.py")
     v.outcomes = [passed()]
@@ -439,7 +397,7 @@ def test_a_test_only_round_reaches_the_panel_when_the_tests_were_what_was_reject
     assert [r["outcome"] for r in rounds(fleet, wo["id"])] == ["rejected", "passed"]
 
 
-# -- the ceiling -----------------------------------------------------------------------
+# -- the ceiling
 
 
 def test_the_third_bounce_asks_the_user_and_the_flag_survives_a_reconcile(fleet):
@@ -458,11 +416,10 @@ def test_the_third_bounce_asks_the_user_and_the_flag_survives_a_reconcile(fleet)
     store = fleet.store()
     try:
         assert store.get_work_order(wo["id"])["status"] == "needs_review"
-        # The flag is RE-DERIVED every tick; a give-up with no round behind it loses it.
+        # The flag is RE-DERIVED every tick; a give-up with no round behind it loses it
         assert VALIDATION_STUCK_BLOCKER in true_blockers(
             store, store.get_work_order(wo["id"]))
-        # The escalated round is a ROUND, so it carries the map like any other: the next
-        # submission reads it through `last_judged_round` and would fail open on a blank.
+        # The escalated round is a ROUND
         given_up = store.last_judged_round(wo_id=wo["id"])
         assert int(given_up["round"]) == 2
         shas = ProjectStore.validation_file_shas(given_up)
@@ -472,7 +429,7 @@ def test_the_third_bounce_asks_the_user_and_the_flag_survives_a_reconcile(fleet)
 
 
 def test_a_panel_round_in_between_restarts_the_count(fleet):
-    """`consecutive` is true by construction — the key is the round bounced after."""
+    """`consecutive` is true by construction — the key is the round bounced after"""
     wo = fleet.dispatch()
     v = rejected_once(fleet, wo["id"], "src/app.py")
 

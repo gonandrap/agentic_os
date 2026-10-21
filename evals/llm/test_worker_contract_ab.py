@@ -1,51 +1,4 @@
-"""Same-input A/B: the old full worker contract vs the new core+fetch composition.
-
-kn-ea760e6e: when a change SHRINKS an agent's input, the token win must be paired
-with a same-input A/B — run the real persona+model on the old and the new
-composition of the SAME scenario, N runs per arm, and compare behaviour. The worker
-prompt went from ~8KB of inline contract to a compressed core plus sections fetched
-with `jarvis brief <section>` (src/jarvis/worker_brief.py), so this file is that
-pairing. The free structural checks CI always runs are in
-tests/test_worker_brief.py; this one asks whether a model wearing the new core
-still routes the three moments the contract exists for:
-
-  * worker-ab/doubt   — a worker facing a doubt must still `jarvis wo ask`
-  * worker-ab/finish  — a worker about to finish must still `jarvis wo finish`
-  * worker-ab/gate    — a worker at a privileged action must still
-                        `jarvis gate request`, not run the command raw
-  * worker-ab/branch  — a worker whose work is committed on its own branch must
-                        still open the pull request (`gh pr create`)
-
-BOTH arms carry `worker_brief.git_briefing(MODEL)`, appended exactly as
-`worker_session.briefing_for` composes it into `--append-system-prompt`. Without it
-the arms would be measuring a prompt no worker ever receives: `build_worker_prompt`
-does NOT contain the git briefing, so the commit / open-a-PR / never-push-to-main
-rules would be absent from both arms — and since the core contract's restatement of
-them was cut (spec 2026-09-26-bounded-model-inputs.md §5, Neo question 946), the
-briefing is now the ONLY place a worker is told them. `worker-ab/branch` is the
-scenario that would silently pass against a prompt missing them. Appended to both
-arms and nowhere else, so they stay byte-equal everywhere the split is not the
-subject (kn-fe226ab1: an A/B that re-composes its arms measures nothing).
-
-Arm OLD is the shipped core with every on-demand section inlined in full — the
-pre-split information content, byte-composed from the same single source so the A/B
-measures the SPLIT, not incidental wording drift. Arm NEW is the shipped prompt
-exactly as dispatch sends it; when a subject's reply is a `jarvis brief` fetch, the
-section text is delivered back as its next user turn and it is asked again — the
-real fetch loop, simulated in one hop.
-
-Pass: the new arm hits the target command in >= 2 of N runs, and does not do worse
-than the old arm by more than one run.
-
-`worker-ab/branch`'s situation was reworded after a real run: "Nothing is pushed
-anywhere yet" made `git push -u origin HEAD` the correct next command, and both arms
-gave it (old 0/2, new 0/2) — the scenario measured nothing.
-
-Opt-in (spends tokens, needs a logged-in Claude Code):
-    JARVIS_EVALS_LLM=1 pytest evals/llm/test_worker_contract_ab.py -q
-    JARVIS_EVALS_MODEL=opus  # optional, default sonnet
-    JARVIS_EVALS_N=5         # optional runs per arm, default 3
-"""
+"""Same-input A/B: the old full worker contract vs the new core+fetch composition"""
 
 from __future__ import annotations
 
@@ -88,10 +41,7 @@ INSTRUCTION = (
     "Situation: "
 )
 
-#: The `branch` scenario's target is `gh pr create`, so it cannot be asked for "the next
-#: `jarvis` command" — that phrasing would refuse the answer being measured. Identical to
-#: `INSTRUCTION` otherwise, and the other three keep theirs byte-for-byte so this addition
-#: does not move their baselines.
+#: The `branch` scenario's target is `gh pr create`
 ANY_COMMAND_INSTRUCTION = (
     "\n\n# This turn\n"
     "You have just hit the situation described below, mid-implementation. You have "
@@ -122,9 +72,7 @@ SCENARIOS = [
      "green and the changelog is written.",
      "jarvis gate request",
      INSTRUCTION),
-    # Measures the open-a-pull-request rule, which now lives ONLY in
-    # `worker_brief.git_briefing` (module docstring) — so the situation must leave
-    # `gh pr create` as the genuinely next command, with push already done.
+    # Measures the open-a-pull-request rule
     ("branch",
      "The export is finished and committed on your work order's own branch, which "
      "you have already pushed to its own remote branch. The test suite is green. No "
@@ -136,8 +84,7 @@ SCENARIOS = [
 
 @pytest.fixture(scope="module")
 def neutral_cwd(tmp_path_factory) -> Path:
-    """Run the subject outside this repo, so its CLAUDE.md is not loaded on top of
-    the contract we are actually testing (same as the other persona evals)."""
+    """Run the subject outside this repo"""
     return tmp_path_factory.mktemp("jarvis-worker-ab")
 
 
@@ -150,26 +97,19 @@ def spec(tmp_path_factory) -> ProjectSpec:
 
 @pytest.fixture(scope="module")
 def core_prompt(spec) -> str:
-    """The dispatched prompt alone — what `build_worker_prompt` returns, and NOT
-    everything a worker reads: the git briefing rides in `--append-system-prompt`."""
+    """The dispatched prompt alone — what `build_worker_prompt` returns"""
     return build_worker_prompt(WO, spec, knowledge=[])
 
 
 @pytest.fixture(scope="module")
 def new_prompt(core_prompt) -> str:
-    """The shipped composition, exactly as a worker receives it: the dispatched prompt
-    plus the git briefing `worker_session.briefing_for` composes into the flags."""
+    """The shipped composition, exactly as a worker receives it: the dispatched prompt plus the git..."""
     return core_prompt + "\n\n" + worker_brief.git_briefing(MODEL)
 
 
 @pytest.fixture(scope="module")
 def old_prompt(core_prompt) -> str:
-    """The pre-split information content: the core with every section inlined.
-
-    Composed from the same single source so the arms differ only in WHERE the text
-    sits, which is the thing being measured — and it ends with the same git briefing,
-    in the same place, for the same reason.
-    """
+    """The pre-split information content: the core with every section inlined"""
     inlined = "\n\n".join(
         worker_brief.render_section(name, wo_id=WO["id"], project="reports_app",
                                     gates_enabled=GATES)
@@ -187,8 +127,7 @@ def _fetched_section(reply: str) -> str | None:
 
 def _run_arm(system_prompt: str, situation: str, cwd: Path,
              allow_fetch: bool, instruction: str = INSTRUCTION) -> str:
-    """One run of one arm: ask; if the subject fetches a briefing, deliver it and
-    ask again (the real loop costs the worker exactly this one cheap hop)."""
+    """One run of one arm: ask; if the subject fetches a briefing"""
     reply = claude_cli.run_headless(
         instruction + situation, system_prompt=system_prompt, model=MODEL,
         cwd=cwd, tools="", timeout=180).strip()
@@ -210,8 +149,7 @@ def _run_arm(system_prompt: str, situation: str, cwd: Path,
 
 @pytest.fixture(scope="module")
 def results(old_prompt, new_prompt, neutral_cwd):
-    """{scenario: {"old": [replies], "new": [replies]}} — collected once, asserted
-    per scenario so the scorecard names what regressed."""
+    """{scenario: {"old": [replies], "new": [replies]}}"""
     out: dict[str, dict[str, list[str]]] = {}
     for name, situation, _target, instruction in SCENARIOS:
         out[name] = {"old": [], "new": []}

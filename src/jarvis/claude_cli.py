@@ -1,8 +1,4 @@
-"""Thin wrapper around the `claude` CLI.
-
-All interaction with Claude Code goes through here so tests can substitute a fake
-`claude` executable (JARVIS_CLAUDE_BIN) and so a different backend can be swapped in.
-"""
+"""Thin wrapper around the `claude` CLI"""
 
 from __future__ import annotations
 
@@ -30,84 +26,48 @@ from . import systemd_units
 
 log = logging.getLogger("jarvisd.claude")
 
-#: `claude` location override, mirroring bugreport's GH_BIN_ENV. Tests point it at a
-#: fake; the test-isolation gate points it at a stub that refuses to run.
+#: `claude` location override, mirroring bugreport's GH_BIN_ENV
 CLAUDE_BIN_ENV = "JARVIS_CLAUDE_BIN"
 
-#: Buy the 5-minute prompt cache (write 1.25x) rather than the one-hour one (2x), on
-#: EVERY `claude` process Jarvis starts — `_run` and `spawn_turn` are the only two that
-#: do, and both apply it. The value matters as much as the key: the CLI accepts exactly
-#: "1"/"true"/"yes"/"on". Why it is forced rather than left to the CLI's default, and
-#: what would reverse the decision:
-#: docs/superpowers/specs/2026-08-22-the-five-minute-write-everywhere.md
+#: Buy the 5-minute prompt cache (write 1.25x) rather than the one-hour one (2x) (docs/superpowers/specs/2026-08-22-the-five-minute-write-everywhere.md)
 PROMPT_CACHE_5M_ENV = {"FORCE_PROMPT_CACHING_5M": "1"}
 
+#: Buy the ONE-HOUR write instead, for the `worker.cache_ttl` arm that asks for it (docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md)
+PROMPT_CACHE_1H_ENV_KEY = "ENABLE_PROMPT_CACHING_1H"
 
-#: WHICH TRANSPORT this session's turns run on, declared rather than assumed. Every rule
-#: that depends on a turn being one-shot (the PreToolUse backgrounding refusal, the crew
-#: rules) reads this key instead of hardcoding today's answer — hardcode it and the day
-#: `spawn_background` acquires a production caller, every refusal becomes a lie the OS
-#: tells its own workers. §3 of
-#: docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md
+#: Every variable this decision OWNS
+CACHE_TTL_KEYS = (*PROMPT_CACHE_5M_ENV, PROMPT_CACHE_1H_ENV_KEY)
+
+
+#: WHICH TRANSPORT this session's turns run on, declared rather than assumed (docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md)
 TURN_TRANSPORT_ENV = "JARVIS_TURN_TRANSPORT"
 TRANSPORT_HEADLESS = "headless"      # spawn_turn: `claude -p`, one-shot
 TRANSPORT_BACKGROUND = "background"  # spawn_background: `claude --bg`, supervisor-owned
 
 
 def cache_env(explicit: dict[str, str] | None = None) -> dict[str, str]:
-    """The 5-minute cache flag, overlaid by whatever a caller asked for EXPLICITLY.
-
-    Three levels of precedence: the ambient environment loses, this default sits above
-    it, an explicit `env_extra` above that. Callers therefore merge the result in
-    opposite directions depending on which they hold — see the spec's "where the flag
-    lives" section.
-    """
+    """The 5-minute cache flag, overlaid by whatever a caller asked for EXPLICITLY"""
     return {**PROMPT_CACHE_5M_ENV, **(explicit or {})}
 
 
-#: Above this many BYTES a system prompt goes to the CLI in a file rather than in argv.
-#: `MAX_ARG_STRLEN` is 32 pages — 131,072 bytes — per ARGUMENT, whatever `ARG_MAX` says,
-#: and exceeding it is an `OSError` from `execve` rather than anything the CLI can
-#: report. Half the ceiling, so a caller near the line cannot cross it by a few bytes of
-#: prose. Small callers keep the argv door: a CLI build without
-#: `--append-system-prompt-file` then still answers Neo and the digest. Spec §5:
-#: docs/superpowers/specs/2026-09-13-a-round-the-panel-can-afford.md
+#: Above this many BYTES a system prompt goes to the CLI in a file rather than in argv (docs/superpowers/specs/2026-09-13-a-round-the-panel-can-afford.md)
 SYSTEM_PROMPT_ARGV_LIMIT = 64 * 1024
 
-#: Above this many BYTES the USER prompt goes to the CLI on STDIN rather than in argv.
-#: Same number and same reasoning as `SYSTEM_PROMPT_ARGV_LIMIT`, and a SEPARATE constant
-#: because the two doors are different mechanisms (`--append-system-prompt-file` vs
-#: stdin). Spec: docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
+#: Above this many BYTES the USER prompt goes to the CLI on STDIN rather than in argv (docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md)
 PROMPT_ARGV_LIMIT = 64 * 1024
 
-#: The BACKSTOP ceiling on `prompt + system_prompt` for one OS-side call, in chars.
-#: MEASURED: the largest legitimate OS call is 285,929 chars — `validation._run_chair`
-#: on a FEATURE round (`build_shared_prefix` over an `EvidencePacket` at the shipped
-#: 150,000-char diff cap, spec_section 20,000, description 8,000, declared 4,000,
-#: summary 2,000, 120 files, 30 dropped_files, 6 side_effects, 3 history rounds, 8
-#: children, with the real 592-entry `jarvis_os` knowledge brief: system 246,274, plus
-#: `build_chair_prompt` over 4 blocking opinions at 39,655). Work-order chair 281,548;
-#: non-chair feature seat 254,572; largest non-validation call a Neo approval at 71,818.
-#: 400,000 leaves ~40% headroom for knowledge-base growth and the packet's unbounded
-#: fields while staying near 100k tokens, well inside a 200k window.
-#: Spec §4: docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+#: The BACKSTOP ceiling on `prompt + system_prompt` for one OS-side call, in chars (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
 DEFAULT_MAX_OS_PROMPT_CHARS = 400_000
 
-#: A floor guard just above the measured worst case: a ceiling below this silently
-#: disables validation, which is worse than the bug being fixed. `catalog` refuses one
-#: at boot. Spec §4: docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+#: A floor guard just above the measured worst case: a ceiling below this silently disables... (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
 MAX_OS_PROMPT_CHARS_MIN = 300_000
 
-#: The live ceiling. Module-level and seeded from the default, overridden ONCE at
-#: startup by `set_max_os_prompt_chars` — Neo, question 1077: a caller with no ceiling
-#: is exactly the bug this fixes, whereas a stale-but-safe default is not.
-#: The two constants live HERE and `catalog` imports them, because the other direction
-#: is a cycle: catalog -> project_store -> claude_cli.
+#: The live ceiling
 MAX_OS_PROMPT_CHARS = DEFAULT_MAX_OS_PROMPT_CHARS
 
 
 def set_max_os_prompt_chars(limit: int) -> None:
-    """Arm the backstop from the catalog, at startup. Spec §4 (see above)."""
+    """Arm the backstop from the catalog, at startup"""
     global MAX_OS_PROMPT_CHARS
     MAX_OS_PROMPT_CHARS = int(limit)
 
@@ -117,27 +77,11 @@ class ClaudeCliError(RuntimeError):
 
 
 class InputTooLargeError(ClaudeCliError):
-    """`execve` refused the argv: one argument was past `MAX_ARG_STRLEN`.
-
-    A ClaudeCliError subclass so existing handlers still catch it, but a SEPARATE class
-    because it is deterministic: the same call will fail the same way for ever, so a
-    retry is only a delay. Distinguished from every transient outage by that fact.
-    Spec §4: docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
-    """
+    """`execve` refused the argv: one argument was past `MAX_ARG_STRLEN` (docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md)"""
 
 
 class PromptTooLargeError(ClaudeCliError):
-    """The combined prompt was past `MAX_OS_PROMPT_CHARS` and the call was not made.
-
-    A ClaudeCliError subclass so every existing handler treats it as a transport
-    failure that decides nothing, but a SEPARATE class because it is deterministic:
-    the same call will fail the same way for ever, so a retry is only a delay.
-
-    The sizes ride as `prompt_chars` / `system_prompt_chars` / `ceiling` and NOT as
-    `limit`: `seats._run_seat` does `refused=getattr(e, "limit", None)` and puts what
-    it finds on the Opinion as a `UsageLimit`, so an int there would poison it.
-    Spec §4: docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
-    """
+    """The combined prompt was past `MAX_OS_PROMPT_CHARS` and the call was not made (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)"""
 
     def __init__(self, message: str, *, prompt_chars: int, system_prompt_chars: int,
                  ceiling: int) -> None:
@@ -148,13 +92,7 @@ class PromptTooLargeError(ClaudeCliError):
 
 
 class AttributionRefused(RuntimeError):
-    """A caller's `records_itself` declaration was not one it could make.
-
-    DELIBERATELY NOT a `ClaudeCliError`: the seat paths in `seats`, `panel` and
-    `validation` each turn those into an abstention, so a refusal caught there would be
-    silent — the bug being fixed wearing the fix's clothes. See §4 of
-    docs/superpowers/specs/2026-09-25-attribution-is-not-a-callers-choice.md.
-    """
+    """A caller's `records_itself` declaration was not one it could make (docs/superpowers/specs/2026-09-25-attribution-is-not-a-callers-choice.md)"""
 
 
 @contextlib.contextmanager
@@ -169,11 +107,7 @@ def _prompt_file(text: str) -> Iterator[str]:
 @contextlib.contextmanager
 def _system_prompt_arg(system_prompt: str | None, *,
                        keep_default_context: bool = False) -> Iterator[list[str]]:
-    """The flags that carry a system prompt, and the temporary file when it needs one.
-
-    REPLACES the CLI's default prompt unless `keep_default_context`. Spec:
-    docs/superpowers/specs/2026-09-25-a-headless-call-that-starts-from-nothing.md
-    """
+    """The flags that carry a system prompt, and the temporary file when it needs one (docs/superpowers/specs/2026-09-25-a-headless-call-that-starts-from-nothing.md)"""
     if not system_prompt:
         yield []
         return
@@ -188,9 +122,7 @@ def _system_prompt_arg(system_prompt: str | None, *,
     if len(raw) <= SYSTEM_PROMPT_ARGV_LIMIT:
         yield ["--system-prompt", system_prompt]
         return
-    # No `--system-prompt-file` exists on CLI 2.1.282, so past the argv ceiling the
-    # CALLER'S OWN bytes split across both doors — a stub that talks about the prompt
-    # measured as an injection attempt and the model refused it.
+    # No `--system-prompt-file` exists on CLI 2.1.282
     cut = SYSTEM_PROMPT_ARGV_LIMIT
     while cut > 0 and raw[cut] & 0xC0 == 0x80:  # never cut a UTF-8 sequence in half
         cut -= 1
@@ -201,8 +133,7 @@ def _system_prompt_arg(system_prompt: str | None, *,
 
 @contextlib.contextmanager
 def _empty_mcp_config() -> Iterator[list[str]]:
-    """`--mcp-config` naming a server-free file: `--strict-mcp-config` alone still
-    leaves the user's configured servers' schemas in the request."""
+    """`--mcp-config` naming a server-free file: `--strict-mcp-config` alone still leaves the user's..."""
     with tempfile.NamedTemporaryFile("w", suffix=".json", prefix="jarvis-mcp-",
                                      encoding="utf-8", delete=True) as fh:
         json.dump({"mcpServers": {}}, fh)
@@ -226,15 +157,9 @@ def version() -> str:
 def _run(args: list[str], cwd: Path | None = None, timeout: int = 120,
          env_extra: dict[str, str] | None = None,
          stdin_text: str | None = None) -> str:
-    """One `claude` call, waited for. `stdin_text` is the prompt's second door.
-
-    `input=None` leaves stdin inherited exactly as before, so no existing caller
-    changes. `encoding="utf-8"` rather than bare `text=True`: the locale encoding would
-    raise `UnicodeEncodeError` on a non-ASCII prompt under `LANG=C`. Spec §2:
-    docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
-    """
+    """One `claude` call, waited for (docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md)"""
     env = os.environ.copy()
-    # `env_extra` is caller intent and must win over the cache default; ambient env loses.
+    # `env_extra` is caller intent and must win over the cache default; ambient env loses
     env.update(cache_env(env_extra))
     try:
         proc = subprocess.run(
@@ -252,7 +177,7 @@ def _run(args: list[str], cwd: Path | None = None, timeout: int = 120,
     except subprocess.TimeoutExpired as e:
         raise ClaudeCliError(f"`claude {' '.join(args[:3])}...` timed out after {timeout}s") from e
     except OSError as e:
-        # AFTER `FileNotFoundError`, which is an `OSError` and keeps its own message.
+        # AFTER `FileNotFoundError`, which is an `OSError` and keeps its own message
         if e.errno == errno.E2BIG:
             raise InputTooLargeError(
                 f"`{claude_bin()}` could not be started: the input was too large for the "
@@ -265,39 +190,21 @@ def _run(args: list[str], cwd: Path | None = None, timeout: int = 120,
 
 
 def _is_signal_rc(rc: int) -> bool:
-    """Was this exit a signal death, in EITHER of the two spellings?
-
-    `rc < 0` is Python's own, when `subprocess` reaps a signalled child; `137`/`143` are
-    128+9 and 128+15, the shell's, which is what the CLI wrapper produced in the incident
-    behind GitHub issue #1039.
-    """
+    """Was this exit a signal death, in EITHER of the two spellings? (#1039)"""
     return rc < 0 or rc in (137, 143)
 
 
 def _cli_failure(args: list[str], rc: int, stdout: str, stderr: str) -> ClaudeCliError:
-    """The exception a non-zero `claude` exit deserves, CLASSIFIED and untruncated.
-
-    THE ENVELOPE'S OWN `result` IS READ BEFORE ANYTHING IS CUT, and GitHub issue #235 is
-    why. A usage-limit refusal exits rc=1 with the refusal in the result JSON's `result`
-    field, and truncating raw stdout to 500 chars severed it at exactly the byte that
-    field begins — every validation seat on 2026-09-13 stored `…"speed":"standard"},"`
-    and the cause was unrecoverable. Reading the field first both keeps the message and
-    is what lets `usage_limit` below see the refusal at all.
-
-    `stderr` still wins over raw stdout for everything that is not a result envelope:
-    that is where `claude --version` and `claude agents --json` put their complaints.
-    """
+    """The exception a non-zero `claude` exit deserves, CLASSIFIED and untruncated (#235)"""
     detail = _result_field(stdout) or stderr.strip() or stdout.strip()
     limit = usage_limit(detail)
     if limit is not None:
         return UsageLimitError(limit)
-    # AFTER the window and against the UNPREFIXED text: spec
-    # docs/superpowers/specs/2026-09-26-the-panel-must-not-mistake-an-auth-failure-for-a-verdict.md §2.
+    # AFTER the window and against the UNPREFIXED text: spec... (docs/superpowers/specs/2026-09-26-the-panel-must-not-mistake-an-auth-failure-for-a-verdict.md §2.)
     auth = auth_failure(detail)
     if auth is not None:
         return AuthFailureError(auth)
-    # AFTER both of those and ONLY on an empty detail: spec §1,
-    # docs/superpowers/specs/2026-10-14-a-killed-validation-panel-opens-an-investigation.md
+    # AFTER both of those and ONLY on an empty detail: spec §1 (docs/superpowers/specs/2026-10-14-a-killed-validation-panel-opens-an-investigation.md)
     if not detail and _is_signal_rc(rc):
         return KilledError(Killed(
             message=f"claude {' '.join(args[:4])}... was killed by a signal (rc={rc}) "
@@ -308,7 +215,7 @@ def _cli_failure(args: list[str], rc: int, stdout: str, stderr: str) -> ClaudeCl
 
 
 def _result_field(stdout: str) -> str:
-    """`result` out of an `--output-format json` envelope, or "" for anything else."""
+    """`result` out of an `--output-format json` envelope, or "" for anything else"""
     try:
         data = json.loads(stdout)
     except ValueError:  # JSONDecodeError is a subclass; plain text is the common case
@@ -318,11 +225,7 @@ def _result_field(stdout: str) -> str:
     return str(data.get("result") or "").strip()
 
 
-# Claude Code's session-state vocabulary, as emitted by `claude agents --json` and by
-# the supervisor's own `~/.claude/jobs/<id>/state.json` (verified against CLI 2.1.220).
-# NOTE: there is no "running" here — that word belongs to Jarvis's *work order* status
-# vocabulary (see project_store.WO_STATUSES). Conflating the two silently misreads every
-# healthy worker as needing the user, so always go through the helpers below.
+# Claude Code's session-state vocabulary
 ACTIVE_STATES = frozenset({"working", "starting", "queued"})
 BLOCKED_STATES = frozenset({"blocked"})
 FINISHED_STATES = frozenset({"done", "failed", "cancelled"})
@@ -330,7 +233,7 @@ FINISHED_STATES = frozenset({"done", "failed", "cancelled"})
 
 @dataclass
 class BgSession:
-    """A background session as reported by `claude agents --json`."""
+    """A background session as reported by `claude agents --json`"""
     id: str
     session_id: str
     cwd: str
@@ -341,24 +244,23 @@ class BgSession:
 
     @property
     def is_active(self) -> bool:
-        """The agent is making progress on its own — nothing is wanted from the user."""
+        """The agent is making progress on its own — nothing is wanted from the user"""
         return self.state in ACTIVE_STATES
 
     @property
     def is_blocked(self) -> bool:
-        """The agent stopped mid-turn on a permission prompt or a question."""
+        """The agent stopped mid-turn on a permission prompt or a question"""
         return self.state in BLOCKED_STATES
 
     @property
     def is_finished(self) -> bool:
-        """The turn ended, whether it succeeded, failed or was cancelled."""
+        """The turn ended, whether it succeeded, failed or was cancelled"""
         return self.state in FINISHED_STATES
 
 
 def list_background_sessions(cwd: Path | None = None, include_done: bool = True,
                              timeout: int = 60) -> list[BgSession]:
-    """The Claude sessions the user has open. `timeout` is short for interactive callers
-    (a web request must not hang on a slow CLI) and generous for the daemon."""
+    """The Claude sessions the user has open"""
     args = ["agents", "--json"]
     if include_done:
         args.append("--all")
@@ -398,24 +300,7 @@ def _briefing_args(
     autocompact_window: int | None = None,
     agent: str | None = None,
 ) -> list[str]:
-    """The flags that constitute a worker's briefing, in one place.
-
-    A resumed session RE-DERIVES its system prompt, model, effort, permission mode
-    and reachable directories from the argv it is launched with — it does not
-    inherit them from the transcript. So every path that starts a worker turn
-    (initial dispatch, bg resume-fork, headless resume) must pass the same set, or
-    the worker silently loses the project's standing instructions and the OS skills
-    from that turn onwards. Shared here so a new launch path cannot forget one.
-
-    `autocompact_window` is here for that same re-derivation reason and it is the
-    load-bearing case: it caps how large the conversation may grow, so a turn that
-    omitted it would let the context past the bound and every later turn would carry
-    the excess for the rest of the work order's life. None means "no flag", which is
-    the CLI's own behaviour — the model's full window, no early compaction.
-
-    Callers must not append a bare positional after these: `--add-dir` is variadic
-    and would swallow it (fence with `--` first, as spawn_background does).
-    """
+    """The flags that constitute a worker's briefing, in one place"""
     args: list[str] = []
     if model:
         args += ["--model", model]
@@ -428,17 +313,10 @@ def _briefing_args(
     if settings_file:
         args += ["--settings", str(settings_file)]
     if autocompact_window:
-        # `--autocompact <auto|tokens>`, single-valued. The CLI parses a bare integer
-        # and rejects anything outside 100k-1M; `catalog._parse_autocompact` enforces
-        # the same range up front so a bad catalog fails at boot rather than on the
-        # first dispatch.
+        # `--autocompact <auto|tokens>`, single-valued
         args += ["--autocompact", str(autocompact_window)]
     if agent:
-        # The LEAD session's persona, not a subagent type. Verified live with a control
-        # on 2026-08-29: the definition is resolved out of `<add-dir>/.claude/agents/`,
-        # and without the matching `--add-dir` the CLI exits with "not found" rather than
-        # falling back — so this flag and that directory travel together or not at all.
-        # §3 of docs/superpowers/specs/2026-08-29-spec-driven-feature-orders.md.
+        # The LEAD session's persona, not a subagent type (docs/superpowers/specs/2026-08-29-spec-driven-feature-orders.md)
         args += ["--agent", agent]
     for d in add_dirs or []:
         args += ["--add-dir", str(d)]
@@ -460,28 +338,7 @@ def spawn_background(
     autocompact_window: int | None = None,
     agent: str | None = None,
 ) -> str | None:
-    """Spawn a native Claude Code background session; returns the job id if the
-    CLI reported one.
-
-    The supervisor daemon assigns the session id (a --session-id flag is ignored for
-    --bg dispatches — verified empirically), so the work order is bound to its session
-    afterwards: the SessionStart hook reports the real id, and the reconciler falls
-    back to matching the unique `[WO <id>]` name.
-
-    With resume_session_id, the new background agent continues that conversation
-    (fork semantics: full context carried over, fresh session id — verified live).
-    This is how user feedback is delivered while keeping the worker visible in the
-    agents view.
-
-    add_dirs are extra directories the session may reach; Claude also loads skills from
-    each `<dir>/.claude/skills/`, which is how the OS ships its own skills to a worker
-    whose worktree contains only tracked files.
-
-    settings_file carries the FULL settings for the worker (OS-injected project
-    settings merged with per-work-order env like JARVIS_WO_ID). It must be passed
-    explicitly: the worker runs in a fresh git worktree, and the project's
-    .claude/settings.json — being deliberately untracked — does not exist there.
-    """
+    """Spawn a native Claude Code background session; returns the job id if the CLI reported one"""
     args: list[str] = ["--bg", "--name", name]
     if resume_session_id:
         args += ["--resume", resume_session_id]
@@ -489,15 +346,10 @@ def spawn_background(
         args += ["--worktree", worktree]
     args += _briefing_args(model, effort, permission_mode, append_system_prompt,
                            settings_file, add_dirs, autocompact_window, agent)
-    # `--` fences the prompt off from option parsing. Without it a variadic option
-    # (`--add-dir <directories...>` is one) keeps consuming positionals and swallows
-    # the prompt as a directory: the session boots with nothing to do and parks at
-    # the welcome screen forever, which reads as "created but never started".
-    # It also lets a prompt begin with a dash. Never append anything after this.
+    # `--` fences the prompt off from option parsing
     args.append("--")
     args.append(prompt)
-    # This transport is supervisor-owned, and says so: §3 of
-    # docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md.
+    # This transport is supervisor-owned (docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md)
     out = _run(args, cwd=cwd, timeout=120,
                env_extra={TURN_TRANSPORT_ENV: TRANSPORT_BACKGROUND})
     m = _JOB_ID_RE.search(out or "")
@@ -505,11 +357,7 @@ def spawn_background(
 
 
 def stop_session(bg_id: str) -> bool:
-    """Release a background session from the supervisor (`claude stop <id>`).
-
-    Required before a headless resume: a session still owned by a live bg agent
-    refuses `--resume` (verified live). Safe on already-stopped sessions.
-    """
+    """Release a background session from the supervisor (`claude stop <id>`)"""
     try:
         _run(["stop", bg_id], timeout=30)
         return True
@@ -517,12 +365,12 @@ def stop_session(bg_id: str) -> bool:
         return False
 
 
-# -- worker turns (the transport every worker conversation runs on) --------------------
+# -- worker turns (the transport every worker conversation runs on)
 
 
 @dataclass
 class TurnResult:
-    """The parsed outcome of one headless turn (`claude -p --output-format json`)."""
+    """The parsed outcome of one headless turn (`claude -p --output-format json`)"""
 
     ok: bool
     result: str = ""
@@ -531,37 +379,18 @@ class TurnResult:
     cost_usd: float | None = None
     num_turns: int | None = None
     subtype: str = ""
-    #: Why the CLI's query loop stopped (`terminal_reason`), verbatim. One of a closed
-    #: set the CLI defines — `api_error`, `aborted_streaming`, `aborted_tools`,
-    #: `prompt_too_long`, `max_turns`, `completed`, … — and the first half of the
-    #: structured evidence `transient_failure` classifies a retriable turn from.
-    #: "" when the envelope carried none (a very old outfile, or a bypassed loop).
+    #: Why the CLI's query loop stopped (`terminal_reason`), verbatim
     terminal_reason: str = ""
-    #: The HTTP status of the API error, when the failure was one. The CLI's own schema
-    #: documents it as "HTTP status code of the API error", and it is the other half of
-    #: that evidence: 500+ is the transport, 429 is the usage window.
+    #: The HTTP status of the API error, when the failure was one
     api_error_status: int | None = None
-    #: Compact usage envelope derived from the result JSON (see `derive_turn_usage`).
-    #: None when the CLI emitted no `usage` object — old outfiles, crashed turns.
+    #: Compact usage envelope derived from the result JSON (see `derive_turn_usage`)
     usage: dict[str, Any] | None = None
 
 
-#: Which reading of a result envelope produced a stored `usage_json`. Bumped when the
-#: MEANING of the numbers changes, so a persisted row can be re-derived rather than
-#: silently compared against rows counted a different way.
-#:
-#: 1 — token totals taken from the envelope's top-level `usage` object.
-#: 2 — token totals taken from `modelUsage`, read as what the turn alone spent. Wrong
-#:     from CLI 2.1.277 on, where that block is a session running total.
-#: 3 — token totals are the turn's own share of `modelUsage`: its DELTA against the
-#:     previous turn's reading where the envelope continues one, and the whole of it
-#:     where it does not (`_continues_previous`).
+#: Which reading of a result envelope produced a stored `usage_json`
 USAGE_SCHEMA_VERSION = 3
 
-#: The four token classes, as this envelope names them and as the two accountings in a
-#: result JSON name them. Written out once because the mapping is the whole of the
-#: difference between `modelUsage` (per model, complete) and `usage` (per turn, lead
-#: agent only).
+#: The four token classes, as this envelope names them and as the two accountings in a result JSON...
 _MODEL_TOKEN_KEYS = {
     "input": "inputTokens",
     "cache_write": "cacheCreationInputTokens",
@@ -578,23 +407,10 @@ _TOKEN_CLASSES = tuple(_MODEL_TOKEN_KEYS)
 
 
 def _reported_of(envelope: dict[str, Any] | None) -> dict[str, Any] | None:
-    """The CUMULATIVE reading a stored envelope was derived from, or None.
-
-    A version-3 envelope carries it verbatim (`reported`) so the next turn never has to
-    re-read an outfile. A version-2 one holds the raw `modelUsage` figures in its own
-    totals, which is the same thing under another name. A version-1 one holds top-level
-    `usage` instead and is NOT a baseline: it predates the cumulative CLI by a month, so
-    the turn after it is read whole rather than diffed against a number that never
-    accumulated.
-    """
+    """The CUMULATIVE reading a stored envelope was derived from, or None"""
     if not isinstance(envelope, dict):
         return None
-    # THE VERSION IS ASKED FIRST, and the `reported` block cannot overrule it. A turn
-    # whose result carried no `modelUsage` at all is stamped version 1 and still gets a
-    # `reported` block — with an empty `by_model` and the file's own `total_cost_usd`.
-    # Read as a baseline it is monotone in every class by being empty, so the turn after
-    # it reads as a continuation and has those dollars subtracted from it: a number that
-    # never accumulated, taken off one that might not have either.
+    # THE VERSION IS ASKED FIRST, and the `reported` block cannot overrule it
     if (envelope.get("usage_v") or 1) < 2:
         return None
     reported = envelope.get("reported")
@@ -615,27 +431,7 @@ def _sum_classes(by_model: dict[str, Any]) -> dict[str, int]:
 
 def _continues_previous(reported: dict[str, Any], previous: dict[str, Any] | None,
                         own: dict[str, int]) -> bool:
-    """Is this envelope's `modelUsage` a running total that already contains `previous`?
-
-    THE CLASSIFIER, and the reason this module cannot simply subtract. `modelUsage` is
-    per-turn up to CLI 2.1.274 and session-cumulative from 2.1.277 (measured: issue #470
-    and docs/superpowers/findings/2026-09-19-the-turn-that-billed-the-session.md), the
-    envelope carries no version, and subtracting unconditionally deflates every turn
-    written before the change. Three conditions, each of which a continuation must meet:
-
-    * SAME SESSION. A different accumulator cannot contain this one's history. Tested
-      only when BOTH readings name one: a version-2 baseline recorded no session id, and
-      an unknown is not a difference — treating it as one would leave the turn after a
-      pruned result JSON carrying the whole session again.
-    * MONOTONE in every token class. A total that went down is a new process's total —
-      the reset case, where the file's own figure IS the turn.
-    * THE IMPLIED DELTA COVERS THE TURN'S OWN `usage`. That object is the lead agent's
-      spend for this turn alone and never exceeds the turn's true total, so it is a
-      FLOOR: a "delta" smaller than it cannot be this turn's spend, which is what a
-      per-turn envelope looks like when you try to diff it. Where the envelope reports
-      no `usage` at all — an API error that never returned one — there is no floor to
-      test and monotonicity decides alone.
-    """
+    """Is this envelope's `modelUsage` a running total that already contains `previous`? (#470)"""
     if previous is None:
         return False
     here, before_id = reported.get("session_id") or "", previous.get("session_id") or ""
@@ -653,63 +449,7 @@ def _continues_previous(reported: dict[str, Any], previous: dict[str, Any] | Non
 
 def derive_turn_usage(data: dict[str, Any],
                       previous: dict[str, Any] | None = None) -> dict[str, Any] | None:
-    """The turn's exact accounting, compacted from one result envelope.
-
-    The raw JSON on disk (`<project>/.jarvis/turns/<wo>/<seq>.json`) stays the source
-    of truth; this dict is what `wo_turns.usage_json` persists so the record outlives
-    the file. Exact by construction — every number is the CLI's own, never a list-price
-    estimate:
-
-    `previous` is the PRECEDING TURN's envelope of the same work order, and it is what
-    makes this a per-turn figure rather than a session one — see below. None is correct
-    for a first turn and for any one-shot call, where there is no history to subtract.
-
-    * token totals come from `modelUsage`, summed across the models the turn used, and
-      `by_model` keeps them split (a turn that fell back to a cheaper model is a fact
-      about the bill, not noise);
-    * `iterations` is a SAMPLE of the turn, not a list of its API calls. It was read as
-      one-entry-per-call and it is not: across 199 live result files it holds exactly
-      one entry in 196 of them, and that entry covers the whole turn's cache-write in
-      only 4 — on wo-e23252e4 turn 1 it carried 679 of the turn's 58,913 written tokens
-      while the turn made ELEVEN calls. So it bounds `context_peak` from below (any real
-      call's context is a real context) and it cannot count calls at all; the count now
-      comes from the transcript, where one assistant message is exactly one API call
-      (`usage.calls_of`), and `api_calls` is left None here rather than guessed;
-    * the ephemeral 1h/5m split comes from `usage.cache_creation`, the only place it is
-      reported at all;
-    * `context_window` and per-model `costUSD` come from `modelUsage`.
-
-    WHY `modelUsage` AND NOT `usage`, AND WHY IT MUST BE DIFFED. `modelUsage` is the
-    complete accounting — it contains the turn's subagents and the side-model calls the
-    top-level `usage` object omits — and `usage` is the lead agent's own spend for this
-    turn. From CLI 2.1.277 `modelUsage` and `total_cost_usd` became RUNNING TOTALS for
-    the resumed session, so the complete figure is complete about the wrong span, and
-    summing it over a work order's turns counts turn 1 once per turn that follows it.
-    `_continues_previous` decides which reading an envelope is, per turn, and the totals
-    here are that turn's share; `reported` keeps the raw cumulative reading so the next
-    turn can be diffed against it without re-reading this file.
-
-    THE VERSION-2 NOTE REASONED FROM THE RIGHT EVIDENCE BACKWARDS, and this replaces it.
-    It observed `usage` running at "33-60% of `modelUsage`" and concluded `usage` was
-    undercounting; that ratio is what a per-turn delta looks like against a cumulative
-    total. Its other two proofs are artefacts of the same thing: `modelUsage` agrees
-    with the whole transcript on the LAST turn of a session (a running total's final
-    value is the total), and `costUSD` sums to `total_cost_usd` within one file because
-    both are cumulative. Measured over the 814 result files on the dev machine, before
-    2.1.277 `modelUsage` equals `usage` on 93% of them — the residue is subagents, not a
-    fraction — and blind subtraction across that era loses a median 15% of every bill
-    (docs/superpowers/findings/2026-09-19-the-turn-that-billed-the-session.md).
-
-    THE 1h/5m SPLIT IS A SAMPLE, not a partition of `cache_write`: it is reported for
-    whatever part of the turn the top-level `usage` speaks for, and `cache_1h + cache_5m`
-    is therefore usually less than `cache_write`. `usage.write_rate` uses its RATIO for
-    exactly that reason, and the two must not be presented as adding up to the whole.
-
-    Returns None when there is neither a `modelUsage` block nor a `usage` object (a
-    result written before the CLI carried either, or a crashed turn) — an absence,
-    never a zero. When only `usage` is present the totals fall back to it and the
-    envelope is stamped version 1, which is the honest label for those numbers.
-    """
+    """The turn's exact accounting, compacted from one result envelope (docs/superpowers/findings/2026-09-19-the-turn-that-billed-the-session.md)"""
     raw_usage = data.get("usage")
     usage: dict[str, Any] = raw_usage if isinstance(raw_usage, dict) else {}
     models = {name: mu for name, mu in (data.get("modelUsage") or {}).items()
@@ -724,7 +464,7 @@ def derive_turn_usage(data: dict[str, Any],
         + (i.get("cache_creation_input_tokens") or 0)
         for i in iterations
     ] or [
-        # No per-call breakdown: the whole-turn totals still bound the context.
+        # No per-call breakdown: the whole-turn totals still bound the context
         (usage.get("input_tokens") or 0)
         + (usage.get("cache_read_input_tokens") or 0)
         + (usage.get("cache_creation_input_tokens") or 0)
@@ -742,10 +482,7 @@ def derive_turn_usage(data: dict[str, Any],
     }
     before = _reported_of(previous)
     continues = _continues_previous(reported, before, own)
-    # THE DOLLARS ARE CLASSIFIED ON THEIR OWN, before any of this is spent — see
-    # `_cost_delta`. The verdict is sticky across the session because one turn cheaper
-    # than the one before it proves the column is per-turn for good, while a rise proves
-    # nothing either way.
+    # THE DOLLARS ARE CLASSIFIED ON THEIR OWN, before any of this is spent — see `_cost_delta`
     cost, cost_per_turn = _cost_delta(
         reported["total_cost_usd"],
         (before or {}).get("total_cost_usd") if continues else None,
@@ -755,9 +492,7 @@ def derive_turn_usage(data: dict[str, Any],
     by_model = [
         {
             "model": name,
-            # A model absent from the previous reading is new to the session, so its
-            # whole figure is this turn's however the envelope is read; one that went
-            # DOWN cannot be a continuation of the one before it either.
+            # A model absent from the previous reading is new to the session
             **_model_delta(counts, prior.get(name) if continues else None,
                            cost_per_turn),
             "context_window": models[name].get("contextWindow"),
@@ -774,17 +509,12 @@ def derive_turn_usage(data: dict[str, Any],
         "usage_v": version,
         "total_cost_usd": cost,
         **totals,
-        # WHAT THE ENVELOPE SAID, before the delta — the baseline the NEXT turn is
-        # diffed against, and the only thing that makes this derivation re-runnable
-        # once the result JSON is pruned.
+        # WHAT THE ENVELOPE SAID, before the delta
         "reported": reported,
         "continues": continues,
         "cache_1h": cache_creation.get("ephemeral_1h_input_tokens") or 0,
         "cache_5m": cache_creation.get("ephemeral_5m_input_tokens") or 0,
-        # NOT the number of API calls, and it never was — see the note above. A count
-        # this envelope cannot know is left absent rather than guessed: `bill._attach_
-        # calls` fills it from the transcript, where one assistant message IS one call,
-        # and a turn whose transcript is gone honestly shows no count at all.
+        # NOT the number of API calls, and it never was — see the note above
         "api_calls": None,
         "iterations_sampled": len(iterations),
         "num_turns": data.get("num_turns"),
@@ -799,8 +529,7 @@ def derive_turn_usage(data: dict[str, Any],
 
 def _model_delta(counts: dict[str, Any], before: dict[str, Any] | None,
                  cost_per_turn: bool = False) -> dict[str, Any]:
-    """One model's share of a turn: its reading less the previous turn's, or the whole
-    of it where there is no continuation to subtract."""
+    """One model's share of a turn: its reading less the previous turn's"""
     if before is None or any((counts.get(c) or 0) < (before.get(c) or 0)
                              for c in _TOKEN_CLASSES):
         return {c: counts.get(c) or 0 for c in _TOKEN_CLASSES} | {
@@ -813,24 +542,7 @@ def _model_delta(counts: dict[str, Any], before: dict[str, Any] | None,
 
 def _cost_delta(now: float | None, before: float | None,
                 per_turn: bool) -> tuple[float | None, bool]:
-    """This turn's DOLLARS, decided on the dollars alone, and what they proved.
-
-    The tokens' verdict does not carry over. The two columns are reported by different
-    code in the CLI and `kn-da437b27` has jarvis spawning a NEW PROCESS per turn, which
-    is a shape where `modelUsage` could accumulate while the bill did not — and a cost
-    that is not monotone against the previous reading is not a running total, whatever
-    the tokens did. Subtracting there billed every turn but the first $0 on the one
-    column `budget.spent` enforces: silent, and in the spending direction.
-
-    So the subtraction happens only where it is defensible, and where it is not the
-    envelope's own figure stands. Nothing is clamped: a clamp is how a disagreement
-    between the two columns became a zero instead of a number somebody could question.
-
-    ONE DROP SETTLES THE WHOLE SESSION. A bill that falls cannot be a running total, and
-    the CLI does not change its mind mid-session, so `per_turn` rides forward — without
-    it only the cheaper turn would keep its figure and the next dearer one would go back
-    to being diffed against it.
-    """
+    """This turn's DOLLARS, decided on the dollars alone, and what they proved"""
     if now is None:
         return None, per_turn
     if before is None:
@@ -842,24 +554,7 @@ def _cost_delta(now: float | None, before: float | None,
     return now - before, False
 
 
-#: The prompt that compacts a resumed session, and the whole of the transport for it.
-#: There is no `--compact` flag: `/compact` is a LOCAL command the CLI declares
-#: `supportsNonInteractive: true`, so it runs under `-p --resume` like any other prompt
-#: and returns a normal result envelope with an empty `result`.
-#:
-#: FOUR MEASURED PROPERTIES, verified on 2.1.277 on 2026-09-18 (the probe and its
-#: numbers: docs/superpowers/specs/2026-09-18-compact-past-the-ttl.md):
-#:
-#:  * the session id does not move — the summary is written into the same transcript,
-#:    behind a `compact_boundary` system row (`usage.compaction_stamps`);
-#:  * the call is charged as PLAIN INPUT, not as a cache write, so at an already-cold
-#:    boundary it re-sends the conversation at 1.0x where the next prompt would have
-#:    re-sent it at 1.25x;
-#:  * it writes no assistant message, so `usage.read_session` — and therefore the bill
-#:    and every cache-health check — cannot see what it cost. That is why
-#:    `worker_session._reap` records it in `agent_usage` instead;
-#:  * it is idempotent enough to retry: compacting an already-compacted conversation
-#:    summarises a summary, which is cheap and loses little.
+#: The prompt that compacts a resumed session, and the whole of the transport for it (docs/superpowers/specs/2026-09-18-compact-past-the-ttl.md)
 COMPACT_PROMPT = "/compact"
 
 
@@ -880,14 +575,7 @@ def turn_args(
     max_budget_usd: float | None = None,
     prompt_via_stdin: bool = False,
 ) -> list[str]:
-    """argv for one worker turn. Split out from `spawn_turn` so tests can assert on it.
-
-    `--session-id` on the opening turn, `--resume` on every one after. Both name the
-    SAME id: unlike `--bg --resume` (which forks the conversation under a supervisor-
-    assigned id), a headless resume reuses the id it is given — `--fork-session` exists
-    to opt into the other behaviour. That is what lets Jarvis mint the id up front and
-    treat it as immutable for the work order's lifetime.
-    """
+    """argv for one worker turn"""
     args = ["-p", "--output-format", "json",
             "--resume" if resume else "--session-id", session_id]
     if name:
@@ -897,82 +585,40 @@ def turn_args(
     args += _briefing_args(model, effort, permission_mode, append_system_prompt,
                            settings_file, add_dirs, autocompact_window, agent)
     if max_budget_usd is not None:
-        # THE ENFORCEMENT POINT for a per-order budget (src/jarvis/budget.py, which
-        # documents the flag's measured behaviour in full). Three facts shape its use
-        # here, and none of them is in `claude --help`:
-        #
-        #  * the cap is PER INVOCATION — a resumed session's earlier spend does not count
-        #    against it — so the value passed is `budget - spent so far`, recomputed by
-        #    `worker_session.briefing_for` on every single turn, and NOT the budget;
-        #  * it is checked between API calls, so the turn overshoots by up to one call;
-        #  * the CLI only honours it with `--print`, which is why it lives HERE and not
-        #    in `_briefing_args`: `spawn_background` shares that helper and would take
-        #    the flag silently and ignore it, capping nothing while reading as capped.
-        #
-        # Formatted rather than str()'d so a computed remainder never reaches argv in
-        # scientific notation, which the CLI's parser does not accept.
+        # THE ENFORCEMENT POINT for a per-order budget (src/jarvis/budget.py
         args += ["--max-budget-usd", f"{max_budget_usd:.6f}"]
     if prompt_via_stdin:
-        # Neither the fence nor the prompt: with no prompt in argv there is nothing to
-        # fence. Spec §3: docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
+        # Neither the fence nor the prompt: with no prompt in argv there is nothing to fence (docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md)
         return args
-    # Same fence, same reason as `spawn_background`: `--add-dir` and `--tools` are both
-    # variadic and will eat the prompt as an option value if it arrives bare. Nothing
-    # may be appended after this.
+    # Same fence, same reason as `spawn_background`: `--add-dir` and `--tools` are both variadic and will...
     args += ["--", prompt]
     return args
 
 
 @dataclass
 class SpawnedTurn:
-    """What a launched turn is tracked by: always a pid, and a unit when it got one."""
+    """What a launched turn is tracked by: always a pid, and a unit when it got one"""
 
     pid: int | None
-    #: The transient systemd unit the turn runs in, or None on the direct path. Recorded
-    #: on the turn row rather than re-derived, so `cancel` stops the unit that exists.
+    #: The transient systemd unit the turn runs in, or None on the direct path
     unit: str | None = None
 
 
 def spawn_turn(prompt: str, cwd: Path, session_id: str, outfile: Path,
                errfile: Path, resume: bool = False, unit: str | None = None,
+               cache: dict[str, str] | None = None,
                **kwargs: Any) -> SpawnedTurn:
-    """Start one worker turn; returns the pid to track it by and the unit it runs in.
-
-    TWO TRANSPORTS, chosen per spawn by `systemd_units.use_transient_units()`:
-
-    * **Transient unit** (the fleet, where the daemon is a `.service`). The turn runs in
-      its own cgroup, so `systemctl restart jarvis` — a deploy, a crash-restart, `jarvis
-      stop` — no longer SIGTERMs it along with the daemon (issue #133). The pid recorded
-      is the UNIT's main process, i.e. the `claude` itself and not the `systemd-run` that
-      enqueued it, so everything downstream (`process_alive`, `kill_process_group`, the
-      reap) keeps working on a real pid exactly as before.
-    * **Direct `Popen`** (a dev checkout, `jarvis start --foreground`, any host without
-      systemd, and every test). Detached with `start_new_session=True`: a turn can run for
-      hours, and its own process group is what lets `cancel()` take the whole tree down.
-
-    Falling back is deliberate and silent-but-logged: if `systemd-run` is missing or
-    refuses, the turn still starts on the direct path. A transport problem must never be
-    the reason the fleet stops dispatching.
-
-    stdin is /dev/null because `claude -p` otherwise spends three seconds waiting for
-    input that is never coming, on every turn.
-
-    The cache flag rides in the environment as well as in the settings file, so the
-    property holds for a turn launched without one. `os.environ` is overlaid FIRST here
-    (it is ambient, not intent) — the opposite order from `_run`. Both transports build
-    that same environment, which is the whole reason they share this one function.
-    """
+    """Start one worker turn; returns the pid to track it by and the unit it runs in (#133)"""
     outfile.parent.mkdir(parents=True, exist_ok=True)
-    # THE PROMPT FILE BELONGS TO THE TURN, like `<seq>.json` and `<seq>.err`, and
-    # `worker_session._reap` deletes it: this function returns before the detached
-    # `claude` has read its stdin. Spec §3:
-    # docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
+    # THE PROMPT FILE BELONGS TO THE TURN (docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md)
     big = len(prompt.encode()) > PROMPT_ARGV_LIMIT
     promptfile = outfile.with_suffix(".prompt") if big else None
     if promptfile is not None:
         promptfile.write_text(prompt, encoding="utf-8")
     args = turn_args(prompt, session_id, resume, prompt_via_stdin=big, **kwargs)
-    env = {**os.environ, **cache_env()}
+    # Stripped first so the `cli` arm's ABSENCE survives a daemon whose own process carries the flag
+    env = {k: v for k, v in os.environ.items() if k not in CACHE_TTL_KEYS}
+    env.update(cache_env() if cache is None else cache)
     if unit and systemd_units.use_transient_units():
         prefix = systemd_units.run_prefix(
             unit, cwd=cwd, outfile=outfile, errfile=errfile, env=env,
@@ -980,8 +626,7 @@ def spawn_turn(prompt: str, cwd: Path, session_id: str, outfile: Path,
             stdin=promptfile,
         )
         try:
-            # No redirection here: the unit's own StandardOutput= writes the result file,
-            # and `systemd-run`'s chatter is captured so it can never land in it.
+            # No redirection here: the unit's own StandardOutput= writes the result file
             done = subprocess.run([*prefix, claude_bin(), *args], capture_output=True,
                                   text=True, timeout=60)
         except (OSError, subprocess.SubprocessError) as e:
@@ -992,9 +637,7 @@ def spawn_turn(prompt: str, cwd: Path, session_id: str, outfile: Path,
                 pid = systemd_units.main_pid(unit)
                 if pid:
                     return SpawnedTurn(pid=pid, unit=unit)
-                # The unit started but never told us its pid. It IS running, so it must
-                # not be started a second time: record it with a placeholder pid and let
-                # `worker_session.poll` fall back to asking the unit whether it is alive.
+                # The unit started but never told us its pid
                 log.warning("unit %s started but reported no MainPID", unit)
                 return SpawnedTurn(pid=None, unit=unit)
             log.warning("systemd-run failed for %s (%s): %s — spawning directly",
@@ -1003,9 +646,7 @@ def spawn_turn(prompt: str, cwd: Path, session_id: str, outfile: Path,
         with contextlib.ExitStack() as stack:
             out = stack.enter_context(outfile.open("w"))
             err = stack.enter_context(errfile.open("w"))
-            # The child inherits a dup of the fd, so the parent's handle closing here is
-            # harmless. DEVNULL for the small case, unchanged: that is what stops the
-            # three-second wait.
+            # The child inherits a dup of the fd, so the parent's handle closing here is harmless
             stdin: Any = subprocess.DEVNULL
             if promptfile is not None:
                 stdin = stack.enter_context(promptfile.open("rb"))
@@ -1030,16 +671,7 @@ def spawn_turn(prompt: str, cwd: Path, session_id: str, outfile: Path,
 
 def read_turn_result(outfile: Path, errfile: Path | None = None,
                      previous: dict[str, Any] | None = None) -> TurnResult | None:
-    """Parse a finished turn's output. None means "nothing usable there (yet)".
-
-    The caller decides what None means: still running (the process is alive) or a
-    turn that died without saying anything (it is not).
-
-    `previous` is the preceding turn's usage envelope, and every caller that has one
-    must pass it: without it a turn under CLI 2.1.277+ reports the whole session's
-    spend as its own (`derive_turn_usage`), and `cost_usd` — which is what a budget is
-    enforced against — reports the session's bill as this turn's.
-    """
+    """Parse a finished turn's output"""
     try:
         raw = outfile.read_text()
     except OSError:
@@ -1059,12 +691,7 @@ def read_turn_result(outfile: Path, errfile: Path | None = None,
         except OSError:
             stderr_tail = ""
     ok = not data.get("is_error")
-    # `errors` is the CLI's own list of what went wrong, and it is the ONLY place some
-    # failures say anything at all: a turn stopped by `--max-budget-usd` writes no
-    # `result` field and no stderr, so without this the record would read "turn reported
-    # is_error" about a turn whose envelope said "Reached maximum budget ($5.00)".
-    # Below `result` in the fallback chain because when both exist `result` is the
-    # worker's own voice, which is the more useful of the two.
+    # `errors` is the CLI's own list of what went wrong
     errors = " · ".join(str(e) for e in (data.get("errors") or []) if e)
     turn_usage = derive_turn_usage(data, previous)
     return TurnResult(
@@ -1073,94 +700,36 @@ def read_turn_result(outfile: Path, errfile: Path | None = None,
         session_id=data.get("session_id") or "",
         error="" if ok else (data.get("result") or errors or stderr_tail
                              or "turn reported is_error"),
-        # THIS TURN's dollars, not the session's: the same delta the usage envelope
-        # carries, so `wo_turns.cost_usd` — the column `budget.spent` sums — means the
-        # same thing on every row of a work order. Only a result with no usage at all
-        # falls back to the envelope's own figure.
+        # THIS TURN's dollars, not the session's: the same delta the usage envelope carries
         cost_usd=turn_usage["total_cost_usd"] if turn_usage
         else data.get("total_cost_usd"),
         num_turns=data.get("num_turns"),
         subtype=data.get("subtype") or "",
         terminal_reason=data.get("terminal_reason") or "",
         api_error_status=_int_or_none(data.get("api_error_status")),
-        # Derived on the failed path too: the usage rides on a failed result JSON just
-        # the same (a 429'd turn has already paid for everything up to the refusal).
+        # Derived on the failed path too: the usage rides on a failed result JSON just the same (a 429'd turn...
         usage=turn_usage,
     )
 
 
 def _int_or_none(value: Any) -> int | None:
-    """`api_error_status` is declared nullable AND optional, so absent, null and a
-    number are all legal. Anything else is a shape this parser does not know."""
+    """`api_error_status` is declared nullable AND optional, so absent, null and a number are all legal"""
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
-# -- the usage limit ----------------------------------------------------------------
-#
-# Claude Code refuses a turn outright once the account's usage window is spent, and it
-# says so *in the turn's own result* rather than on stderr. The refusal is free and
-# instant — `duration_api_ms: 0`, `total_cost_usd: 0` — so from the outside it is
-# indistinguishable from any other `is_error` turn, and Jarvis used to fail the work
-# order and wait for a human to come back after midnight and retry it by hand.
-#
-# The message carries the one fact needed to recover unattended: WHEN the window
-# reopens. Parsing it here, deterministically and with no LLM anywhere, is what lets
-# `worker_session.turn_pause` and `Daemon.retry_paused_turns` resume the conversation by
-# themselves. Observed live on wo-2fa7c0e9 turn 4:
-#
-#     You've hit your session limit · resets 11:50pm (America/Los_Angeles)
-#
-# THE MESSAGE IS ASSEMBLED, NOT WRITTEN, and matching the assembly is what makes this
-# survive the next model launch. Read out of the CLI's own string table (2.1.226): the
-# body is `You've hit your ${label}${suffix}`, the label comes from ONE table keyed by
-# rate-limit type, and the suffix is ` · resets ${when}`.
-#
-#     five_hour                   session limit        <- the 5-hour window
-#     seven_day                   weekly limit         <- the 7-day window
-#     seven_day_opus              Opus limit
-#     seven_day_sonnet            Sonnet limit
-#     seven_day_overage_included  Fable 5 limit        <- per-MODEL, and it is named
-#     overage                     usage credit limit
-#
-# So the label carries a MODEL NAME that changes with the fleet, and enumerating the
-# words in it is a guarantee of missing the next one — this parser did miss "Fable 5
-# limit" and "usage credit limit" until the user asked. What does not change is the
-# shape: the word "limit", then "resets", then a moment. That pair is what is matched.
-#
-# The suffix is also the reason a SPEND cap is deliberately left alone. Those render
-# ` · run /usage-credits to raise it` instead of a reset, so they never match, and they
-# should not: a spend cap does not reopen on its own and the user has to act.
-#
-# The moment itself has three renderings, all three handled (`_reset_moment`), because
-# the CLI picks between them by how far away the reset is:
-#
-#     under 24h    resets 11:50pm (America/Los_Angeles)      <- the 5-hour case
-#     over 24h     resets Aug 14, 9:50am (America/Los_Angeles)  <- typically the 7-day
-#     new year     resets Dec 31, 2027, 11:50pm (…)
-#     relative     resets in 2h 15m                          <- fast mode
+# -- the usage limit
 
 
 @dataclass(frozen=True)
 class UsageLimit:
-    """A turn Claude Code refused because the usage window is spent.
-
-    `reset_at` is the epoch moment the window reopens, or None when the message named a
-    reset but no time this parser could read — the caller then falls back to a fixed
-    delay rather than guessing a moment.
-    """
+    """A turn Claude Code refused because the usage window is spent"""
 
     message: str
     reset_at: float | None
 
 
 class UsageLimitError(ClaudeCliError):
-    """`claude` refused the call outright: the account's usage window is spent.
-
-    A `ClaudeCliError` subclass, so every caller that already catches one keeps working
-    unchanged; what it adds is `limit`, and with it the moment the window reopens. That
-    is the whole difference between a fault to retry in seconds and a window to wait out
-    for hours — see `Daemon._validation_held` (GitHub issue #235).
-    """
+    """`claude` refused the call outright: the account's usage window is spent (#235)"""
 
     def __init__(self, limit: UsageLimit) -> None:
         super().__init__(limit.message)
@@ -1169,23 +738,14 @@ class UsageLimitError(ClaudeCliError):
 
 @dataclass
 class Killed:
-    """A seat whose process was killed by a signal and said nothing at all."""
+    """A seat whose process was killed by a signal and said nothing at all"""
 
     message: str
     rc: int
 
 
 class KilledError(ClaudeCliError):
-    """`claude` was KILLED BY A SIGNAL and wrote nothing: one external event, not a model
-    failure.
-
-    `UsageLimitError`'s shape and a `ClaudeCliError` subclass for its reason: every
-    existing `except claude_cli.ClaudeCliError` keeps working unchanged and what this adds
-    is `killed`, and with it the rc. The difference from the two above is that NOTHING
-    about the process explains it — a retry can neither name what killed it nor stop it
-    recurring — so the caller opens an investigation rather than waiting
-    (`Daemon._validation_killed`, GitHub issue #1039).
-    """
+    """`claude` was KILLED BY A SIGNAL and wrote nothing: one external event, not a model failure (#1039)"""
 
     def __init__(self, killed: Killed) -> None:
         super().__init__(killed.message)
@@ -1193,41 +753,20 @@ class KilledError(ClaudeCliError):
 
 
 class AuthFailureError(ClaudeCliError):
-    """`claude` could not authenticate: the OAuth session expired, the login lapsed.
-
-    `UsageLimitError`'s shape, and a `ClaudeCliError` subclass for its reason: every
-    existing `except claude_cli.ClaudeCliError` keeps working unchanged and what this adds
-    is `auth`. The difference from the window is that NO deadline exists — what clears it
-    is a human — so the caller holds on a schedule rather than on a stated moment
-    (`Daemon._validation_auth_held`, GitHub issue #778).
-    """
+    """`claude` could not authenticate: the OAuth session expired, the login lapsed (#778)"""
 
     def __init__(self, auth: AuthFailure) -> None:
         super().__init__(auth.message)
         self.auth = auth
 
 
-#: The legacy shape, and the only one that states the moment unambiguously:
-#: "Claude AI usage limit reached|1786344785". Kept as a belt-and-braces branch, NOT
-#: verified: that literal is absent from 2.1.226's string table (the only
-#: "usage limit reached" in there is inside Claude Code's own auth-error classifier),
-#: so it is either gone or composed somewhere strings cannot see. It costs one regex and
-#: it is the shape older tooling keys on, so removing it would only lose coverage.
+#: The legacy shape, and the only one that states the moment unambiguously: "Claude AI usage limit...
 _LIMIT_EPOCH_RE = re.compile(r"usage limit reached\s*\|\s*(\d{10,13})", re.IGNORECASE)
 
-#: A spent window, matched by SHAPE rather than by wording: the word "limit" and then a
-#: reset, close together. Matching the label instead would mean listing the model names
-#: it can contain ("Fable 5 limit", "Opus limit", …) and silently missing whichever one
-#: ships next — see the table above.
-#:
-#: The proximity is what keeps this honest. It runs against the error text of EVERY
-#: failed turn, which can be a tail of the worker's own stderr, and a false positive
-#: would retry a genuinely broken turn until the cap stops it. Prose mentioning a limit
-#: does not go on to name a reset time sixty characters later; this message always does.
+#: A spent window, matched by SHAPE rather than by wording: the word "limit" and then a reset
 _LIMIT_RE = re.compile(r"\blimits?\b.{0,60}?\bresets?\b", re.IGNORECASE | re.DOTALL)
 
-#: "resets in 2h 15m" — the relative rendering (fast mode). The easiest of the three:
-#: no timezone, no calendar, nothing to resolve against a clock that might disagree.
+#: "resets in 2h 15m" — the relative rendering (fast mode)
 _RESET_IN_RE = re.compile(
     r"""resets?\s+in\s+
         (?:(?P<days>\d+)\s*d\b\s*)?
@@ -1238,10 +777,7 @@ _RESET_IN_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
-#: The absolute renderings: "resets 11:50pm (America/Los_Angeles)" under 24h,
-#: "resets Aug 14, 9:50am (…)" over it, and the same with a year when the reset falls in
-#: the next one. Every part before the hour is optional because the CLI drops whichever
-#: ones it judges obvious, and the minutes go too when they are zero ("resets 3pm").
+#: The absolute renderings: "resets 11:50pm (America/Los_Angeles)" under 24h
 _RESET_RE = re.compile(
     r"""resets?\s+(?:at\s+)?
         (?:(?P<month>[A-Za-z]{3,9})\s+(?P<day>\d{1,2})\s*,?\s*
@@ -1259,26 +795,19 @@ _MONTHS = {m: i for i, m in enumerate(
 
 
 def usage_limit(text: str | None, *, now: float | None = None) -> UsageLimit | None:
-    """Read a failed turn's error as a usage-limit refusal, or None if it is not one.
-
-    None is the answer for every ordinary failure, so callers can use this as the
-    predicate itself. A message that names a limit but no reset at all is also None:
-    prose about limits (a worker's own log line, a stderr tail) mentions the word far
-    more often than the CLI refuses a turn, and "resets …" is what tells the two apart.
-    """
+    """Read a failed turn's error as a usage-limit refusal, or None if it is not one"""
     if not text:
         return None
     epoch = _LIMIT_EPOCH_RE.search(text)
     if epoch:
         raw = int(epoch.group(1))
-        # 13 digits is milliseconds, 10 is seconds; both shapes have been seen.
+        # 13 digits is milliseconds, 10 is seconds; both shapes have been seen
         return UsageLimit(message=_summarise(text),
                           reset_at=float(raw / 1000 if raw > 1e11 else raw))
     if not _LIMIT_RE.search(text):
         return None
     ref = time.time() if now is None else now
-    # The relative form first: "resets in 2h 15m" needs no timezone and no calendar, so
-    # where it is offered it is the more trustworthy of the two.
+    # The relative form first: "resets in 2h 15m" needs no timezone and no calendar
     relative = _RESET_IN_RE.search(text)
     if relative and any(relative.group(g) for g in
                         ("days", "hours", "minutes", "seconds")):
@@ -1291,8 +820,7 @@ def usage_limit(text: str | None, *, now: float | None = None) -> UsageLimit | N
 
 
 def _duration(m: re.Match[str]) -> float:
-    """Seconds in a "2d 3h 15m" clause. Absent units are zero, never an error: the CLI
-    drops the ones that would read as zero rather than printing them."""
+    """Seconds in a "2d 3h 15m" clause"""
     return (int(m.group("days") or 0) * 86400
             + int(m.group("hours") or 0) * 3600
             + int(m.group("minutes") or 0) * 60
@@ -1304,19 +832,7 @@ def _summarise(text: str) -> str:
 
 
 def _reset_moment(m: re.Match[str], now: float) -> float | None:
-    """The epoch moment a "resets …" clause names, or None if it does not name one.
-
-    The clause gives a wall-clock time in some timezone and, usually, no date at all, so
-    the moment is resolved against `now`: the next occurrence of that clock time, in that
-    zone. That is exactly the rule a human applies reading it, and it is why an
-    unparseable zone falls back to the daemon's own clock rather than to UTC.
-
-    A date appears once the reset is more than 24h away, which is the ordinary case for
-    the 7-day window, and a YEAR appears with it only when the reset falls in the next
-    one. The year is read rather than skipped because skipping it does not fail loudly:
-    "Aug 14, 2027, 9:50am" would otherwise parse its year as the hour and quietly
-    schedule a retry for 8pm tonight.
-    """
+    """The epoch moment a "resets …" clause names, or None if it does not name one"""
     hour = int(m.group("hour"))
     minute = int(m.group("minute") or 0)
     ampm = (m.group("ampm") or "").replace(".", "").lower()
@@ -1338,9 +854,7 @@ def _reset_moment(m: re.Match[str], now: float) -> float | None:
                                minute=minute, second=0, microsecond=0)
         except ValueError:
             return None  # e.g. "Feb 30"
-        # A date with no year is next year's when it has already gone past — the
-        # December-to-January case, and the only one worth handling. When the message
-        # states the year there is nothing to infer, so this must not fire.
+        # A date with no year is next year's when it has already gone past
         if not year and when < ref - timedelta(days=180):
             try:
                 when = when.replace(year=when.year + 1)
@@ -1354,12 +868,7 @@ def _reset_moment(m: re.Match[str], now: float) -> float | None:
 
 
 def _zone(name: str | None) -> tzinfo | None:
-    """The named timezone, or the machine's own if it is missing or unknown.
-
-    Falling back to local rather than UTC is the conservative choice: the daemon runs on
-    the same machine the user reads the clock on, so a mis-parse lands minutes or hours
-    out instead of half a day, and the retry floor absorbs the rest.
-    """
+    """The named timezone, or the machine's own if it is missing or unknown"""
     if name:
         try:
             return ZoneInfo(name.strip())
@@ -1368,59 +877,10 @@ def _zone(name: str | None) -> tzinfo | None:
     return datetime.now().astimezone().tzinfo
 
 
-# -- the transport failing under us ---------------------------------------------------
-#
-# The other way a turn dies without the work being wrong: the API was busy or broken.
-# `wo-4f460495` turn 2 hit a 500 five hours into a work order, and because nothing in
-# the OS recognised it the order sat in `failed` for TWENTY-SEVEN HOURS until the user
-# came back and typed "retry" by hand. Claude's models get busy; an OS that needs a
-# human for that is not self-healing.
-#
-# THIS ONE IS STRUCTURED, WHICH THE USAGE LIMIT WAS NOT. The result envelope carries two
-# fields the OS used to drop on the floor, both verified live on that very turn and both
-# in the CLI's own published result schema:
-#
-#     terminal_reason: "api_error"        # why the query loop stopped
-#     api_error_status: 500               # "HTTP status code of the API error"
-#
-# So there is no prose to parse. The usage-limit matcher above has to key on the SHAPE
-# of an assembled English sentence because the CLI states the reset nowhere else; here
-# the CLI hands over a status code, and matching an integer beats matching a sentence in
-# every way that matters — no model name to rot, no wording to change, no false positive
-# from a worker's own log line quoting an error it read.
-#
-# WHY 500-AND-UP AND NOTHING ELSE (Neo, question 126). Every failed turn the live fleet
-# has ever recorded — ten of them — is one of exactly three shapes:
-#
-#     api_error + 429                          6   the usage window; `usage_limit` owns it
-#     api_error + 500                          1   this, and it stalled for 27h
-#     aborted_streaming / aborted_tools        3   no status at all
-#
-# 429 is deliberately NOT retried here. It is the usage limit's own code, and the branch
-# above already handles the recoverable form of it; the form it declines to touch is a
-# SPEND cap, which never reopens on its own. Sending 429 down this path would auto-retry
-# a cap that needs the user, which is precisely the mistake `usage_limit` was written to
-# avoid.
-#
-# The aborts are excluded for a different reason: they land mid-tool-use, so the turn may
-# have half-run a side effect, and replaying that is worse than asking. They are also the
-# one class the CLI's own telemetry does not count as an error (`m3n` returns false for
-# both), which is a hint they are not simply "the API broke".
-#
-# THE TEXT BRANCH IS A FALLBACK, NOT THE MECHANISM. Two cases reach us with no status:
-# a turn reaped before these columns existed, and the CLI's own status-less transient
-# wordings — it assembles those from a fixed table, so they are matched as literals:
-#
-#     API Error: Connection to the API was lost (ECONNRESET). This is usually temporary…
-#     API Error: Repeated 529 Overloaded errors. The API is at capacity …
-#
-# Both are prefixed `API Error: `, which is what keeps prose that merely mentions one of
-# them (a worker's stderr, this very comment quoted into a log) from matching.
+# -- the transport failing under us
 
 
-#: The transient wordings the CLI assembles when the failure carried no HTTP status,
-#: read out of 2.1.235's string table. Anchored on the `API Error: ` prefix the CLI puts
-#: in front of every one of them, so only the CLI's own voice matches.
+#: The transient wordings the CLI assembles when the failure carried no HTTP status
 _TRANSIENT_TEXT_RE = re.compile(
     r"API Error:.{0,200}?(?:"
     r"Connection to the API was lost"
@@ -1431,18 +891,12 @@ _TRANSIENT_TEXT_RE = re.compile(
 )
 
 #: The status the CLI names in the message body when the envelope's own field is missing
-#: — "API Error: 500 Internal server error". Only 5xx: see the comment above on 429.
 _TRANSIENT_STATUS_RE = re.compile(r"API Error:\s*(5\d\d)\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
 class TransientFailure:
-    """A turn the transport lost, not one the work broke.
-
-    `status` is the HTTP status when there was one, and None for the connection-lost and
-    at-capacity shapes, which name no code. Nothing decides anything from it — it is
-    what the timeline shows the user so "retrying" is a claim they can check.
-    """
+    """A turn the transport lost, not one the work broke"""
 
     message: str
     status: int | None
@@ -1450,29 +904,18 @@ class TransientFailure:
 
 def transient_failure(text: str | None, *, terminal_reason: str | None = None,
                       api_error_status: int | None = None) -> TransientFailure | None:
-    """Read a failed turn as a transient transport failure, or None if it is not one.
-
-    None for every ordinary failure, so callers use it as the predicate itself — and
-    None for a usage-limit refusal too, which `usage_limit` owns end to end. The two are
-    checked in that order everywhere, and this function re-checks it rather than trusting
-    the caller: a 429 that reached here would otherwise auto-retry a spend cap.
-
-    Structured evidence wins whenever the envelope carried any. Only when it carried
-    none does the text get a look, which is what stops a worker's stderr quoting an
-    error message from parking its own work order on a retry loop.
-    """
+    """Read a failed turn as a transient transport failure, or None if it is not one"""
     if not text:
         return None
     if usage_limit(text) is not None:
         return None  # the window, not the transport — the branch above owns it
     if api_error_status is not None:
-        # The CLI said what happened. Believe it and read nothing into the prose.
+        # The CLI said what happened
         if api_error_status < 500:
             return None
         return TransientFailure(message=_summarise(text), status=api_error_status)
     if terminal_reason and terminal_reason != "api_error":
-        # It stopped for a reason it named, and that reason was not the API: an abort,
-        # a prompt too long, the turn cap. None of those get better by being repeated.
+        # It stopped for a reason it named
         return None
     named = _TRANSIENT_STATUS_RE.search(text)
     if named:
@@ -1482,45 +925,20 @@ def transient_failure(text: str | None, *, terminal_reason: str | None = None,
     return None
 
 
-# -- the budget ran out ---------------------------------------------------------------
+# -- the budget ran out
 
-#: `terminal_reason` and `subtype` on an envelope the CLI stopped for `--max-budget-usd`.
-#: Measured on 2026-09-18 against the real API; the full envelope, and what else it does
-#: and does not carry, is documented at the top of src/jarvis/budget.py.
+#: `terminal_reason` and `subtype` on an envelope the CLI stopped for `--max-budget-usd`
 BUDGET_TERMINAL_REASON = "budget_exhausted"
 BUDGET_SUBTYPE = "error_max_budget_usd"
 
 
 def stopped_for_budget(result: TurnResult) -> bool:
-    """Did `claude` stop this turn because it hit its budget?
-
-    STRUCTURED FIELDS ONLY, never the prose, for the reason `transient_failure` gives at
-    length: this repo's own workers write about budget exhaustion, and a text match would
-    let a worker quoting the error park its own work order. Both fields are read because
-    they are two independent statements of the same fact, and a CLI build carrying only
-    one of them must still be recognised.
-    """
+    """Did `claude` stop this turn because it hit its budget?"""
     return (result.terminal_reason == BUDGET_TERMINAL_REASON
             or result.subtype == BUDGET_SUBTYPE)
 
 
-# -- the account cannot answer ---------------------------------------------------------
-#
-# A THIRD WAY A TURN DIES WITHOUT THE WORK BEING WRONG, and the one that does NOT come
-# back on its own: Claude Code could not authenticate. The OAuth session expired, the
-# login lapsed, the key is wrong. No deadline exists, because what clears it is a human
-# running `/login` — see `worker_session.PAUSE_AUTH` for what the OS does about that.
-#
-# WHERE IT SHOWS UP IS THE POINT. On the 2026-08-27 incident (wo-c2793bf0, wo-5def741d,
-# wo-2df8828c) `claude -p` exited writing NEITHER the result JSON nor a byte of stderr —
-# it wrote the reason into its own session transcript as a `<synthetic>` assistant
-# message and quit. So this runs mostly against text `worker_session._transcript_error`
-# recovered from there, and only sometimes against a result envelope.
-#
-# MATCHED AT THE START OF A LINE, unlike the two above. There is no `API Error: ` prefix
-# to key on and no reset clause to demand, so the anchor is all that separates the CLI's
-# own standalone one-line refusal from a worker discussing one — and in this repo, whose
-# workers write about this very failure, that is not a theoretical collision.
+# -- the account cannot answer
 _AUTH_RE = re.compile(
     r"^\s*(?:"
     r"Failed to authenticate"
@@ -1536,27 +954,19 @@ _AUTH_RE = re.compile(
 
 @dataclass(frozen=True)
 class AuthFailure:
-    """A turn refused because Claude Code could not authenticate."""
+    """A turn refused because Claude Code could not authenticate"""
 
     message: str
 
 
 def auth_failure(text: str | None) -> AuthFailure | None:
-    """Read a failed turn as an authentication failure, or None if it is not one.
-
-    None for every ordinary failure, so callers use it as the predicate itself. Asked
-    BEFORE the other two everywhere (`worker_session._diagnose`): an auth refusal is the
-    one thing here that retrying cannot fix, and reading one as transient would spend
-    five backoff attempts against an account that cannot answer any of them.
-    """
+    """Read a failed turn as an authentication failure, or None if it is not one"""
     if not text or not _AUTH_RE.search(text):
         return None
     return AuthFailure(message=_summarise(text))
 
 
-#: Where Claude Code keeps the OAuth session it signs in with and refreshes. Overridable
-#: like every other path this module reads, so a test can never reach the developer's own
-#: sign-in — `testing.gate_environment` points it at the sandbox.
+#: Where Claude Code keeps the OAuth session it signs in with and refreshes
 CREDENTIALS_ENV = "JARVIS_CLAUDE_CREDENTIALS"
 
 
@@ -1568,22 +978,7 @@ def credentials_path() -> Path:
 
 
 def signin_changed_at() -> float | None:
-    """When Claude Code's stored sign-in last changed, or None if nothing can be said.
-
-    THE CLOCK AN AUTH PAUSE WAITS ON (`worker_session.PAUSE_AUTH`), and it is a file's
-    mtime rather than a deadline because an auth failure has none: it clears when a human
-    runs `/login`. That rewrites this file, and so does every token refresh that
-    SUCCEEDS, while a session that cannot be refreshed rewrites nothing. So "changed
-    since the turn died" is the whole of the evidence, it costs one `stat`, and it can
-    become true only once per rewrite — which is what stops `Daemon.retry_paused_turns`
-    hammering an account that cannot answer.
-
-    None means DO NOT RESUME, by either route. The file is unreadable, so the sign-in
-    lives somewhere this cannot see (a macOS keychain, `ANTHROPIC_API_KEY`). Or the
-    refresh token has expired, which `/login` REPLACES rather than touches — so an mtime
-    moved by anything else is not evidence of a sign-in. `jarvis wo send <id> "retry"` is
-    the way back from both (Neo, question 169).
-    """
+    """When Claude Code's stored sign-in last changed, or None if nothing can be said"""
     path = credentials_path()
     try:
         changed = path.stat().st_mtime
@@ -1599,26 +994,7 @@ def signin_changed_at() -> float | None:
 
 
 def process_alive(pid: int | None) -> bool:
-    """Is this turn's process still running?
-
-    Three cases, in the order they are asked, because no single check covers them all:
-
-    1. **Still our child** (the usual case — same daemon that launched it).
-       `waitpid(WNOHANG)` is authoritative *and* reaps it. `os.kill(pid, 0)` is not
-       enough here: a detached child nobody waits on becomes a **zombie**, and signalling
-       a zombie succeeds, so a finished turn would read as running forever.
-    2. **Ours, but mid-launch.** `waitpid` returns 0 for a child that has forked but not
-       yet exec'd, which is correct. Inspecting `/proc` instead would not be: in that
-       window the cmdline is still the *parent's*, so a cmdline test declares a
-       just-launched turn dead and reaps it before it has written anything. That is
-       exactly what CI caught.
-    3. **No longer our child** — jarvisd restarted, so the turn was reparented to init
-       (which reaps it, making `kill` honest again). Only here is the `/proc` cmdline
-       consulted, purely as a pid-reuse guard: a turn can run for hours, and a recycled
-       pid read as "still running" would hang its work order forever. Matching is on a
-       whole path component, never a substring — `claude` appears in plenty of unrelated
-       command lines, this suite's own `.claude/worktrees/*/.venv/bin/python` included.
-    """
+    """Is this turn's process still running?"""
     if not pid:
         return False
     try:
@@ -1644,7 +1020,7 @@ def process_alive(pid: int | None) -> bool:
 
 
 def kill_process_group(pid: int | None) -> bool:
-    """Terminate a turn and everything it spawned. False if it was already gone."""
+    """Terminate a turn and everything it spawned"""
     if not pid:
         return False
     try:
@@ -1660,60 +1036,28 @@ def kill_process_group(pid: int | None) -> bool:
 
 @dataclass
 class HeadlessResult:
-    """One `claude -p` one-shot call: what it said, and what it cost.
-
-    `usage` is the SAME envelope `derive_turn_usage` compacts out of a worker turn's
-    result JSON, so the OS's own calls (Neo, the panel's seats, the digest) and its
-    workers' turns are accounted in one shape and can be added up together. None when
-    the CLI emitted no usage object — an old CLI, or output that did not parse as JSON
-    at all — which is an absence, never a zero.
-    """
+    """One `claude -p` one-shot call: what it said, and what it cost"""
 
     text: str
     usage: dict[str, Any] | None = None
     session_id: str = ""
-    #: The model that actually served the call, read back from `modelUsage` where the
-    #: CLI reports it and falling back to the one that was asked for. Recorded because
-    #: the caller's `--model` may be an alias, and an OS call priced against the wrong
-    #: family is a wrong number in the only report that says what Jarvis costs.
+    #: The model that actually served the call
     model: str = ""
-    #: How big this call's own input was, in characters. Measurement only, no cap —
-    #: spec §3, docs/superpowers/specs/2026-09-26-bounded-model-inputs.md.
+    #: How big this call's own input was, in characters (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
     prompt_chars: int = 0
     system_prompt_chars: int = 0
-    #: How long the subprocess took, in milliseconds. 0 means NOT MEASURED, which is what
-    #: a hand-built result is — §3 of docs/superpowers/specs/2026-10-01-neo-observability.md.
+    #: How long the subprocess took, in milliseconds. 0 means NOT MEASURED (docs/superpowers/specs/2026-10-01-neo-observability.md)
     latency_ms: int = 0
 
 
 def _attribute_subprocess(result: HeadlessResult, record: Any = None) -> None:
-    """Record a headless call made from inside a work order's process tree.
-
-    A worker's environment carries `JARVIS_WO_ID` (`dispatch._write_worker_settings`),
-    and a `--settings` env block reaches the CLI's own `process.env`, not just its
-    children — so every subprocess the worker spawns inherits it, however deep. Its
-    presence here therefore means one thing: this call is being made BENEATH a worker,
-    and its tokens are that work order's cost.
-
-    Nothing else can establish that. The call gets a session id Jarvis never minted, a
-    transcript under whatever cwd it ran in, and no mention of a work order anywhere in
-    it — the same dead end that forced the OS's own calls to be recorded at the moment
-    they return (`agent_usage`). Recorded here, on the one seam every Jarvis-transport
-    call passes through, rather than at each caller: the callers are eval suites and
-    scripts that have no idea they are inside a work order.
-
-    `ok` follows whether an envelope came back at all: a call the CLI answered with
-    something unparseable was paid for just the same, and a zero-token row that says so
-    is a different fact from no row.
-    """
+    """Record a headless call made from inside a work order's process tree"""
     wo_id = os.environ.get("JARVIS_WO_ID", "").strip()
     if not wo_id:
         return
     from . import agent_usage
 
-    # What RAN the call, not where it ran. An eval suite's cwd is a fresh pytest tmp dir
-    # per scenario, so labelling by directory yields forty labels naming nothing; the
-    # program name groups the forty into the one line a reader wants ("pytest: 44 calls").
+    # What RAN the call, not where it ran
     label = Path(sys.argv[0]).name if sys.argv and sys.argv[0] else ""
     (record or agent_usage.record)(
         agent_usage.WORKER_SUBPROCESS, usage=result.usage,
@@ -1722,41 +1066,20 @@ def _attribute_subprocess(result: HeadlessResult, record: Any = None) -> None:
 
 
 def model_of(result: HeadlessResult) -> str:
-    """The model to price a headless call at. `"unknown"` when it was never captured.
-
-    Never `""`: an empty model prices at ZERO in `usage.price_for` (that branch is for
-    `<synthetic>`, which was never billed), so a real call whose model went unrecorded
-    would silently cost nothing — the exact bug this accounting exists to fix.
-    """
+    """The model to price a headless call at"""
     return result.model or "unknown"
 
 
-#: How far out the caller walk looks before refusing. Every real stack here is shallow
-#: (transport, an OS function, the daemon or a fixture); past this a frame claiming to be
-#: the OS is not evidence of one. Spec's Open section.
+#: How far out the caller walk looks before refusing
 _CALLER_FRAME_CAP = 20
 
-#: Modules that FORWARD a caller's declaration instead of making one. Skipped by the walk
-#: and never counted as the OS frame that authorises: `structured.request` and
-#: `seats.run_blind` take `records_itself`/`kind` from whoever called them, so counting
-#: their frames means an eval calling either one authorises itself. The real declarers —
-#: `supervisor`, `digest`, `neo`, `panel`, `validation` — sit BEHIND them on the stack and
-#: still authorise. Spec §3.
+#: Modules that FORWARD a caller's declaration instead of making one
 _FORWARDERS = frozenset({"jarvis.claude_cli", "jarvis.structured", "jarvis.seats"})
 
 
 @dataclass(frozen=True)
 class Authorisation:
-    """A checked declaration, minted where the frames prove it and carried where they do not.
-
-    `seats._run_seat` runs on a `ThreadPoolExecutor` thread whose only jarvis frame is
-    `seats` itself — a forwarder — and a context flag would not travel either, because
-    `ThreadPoolExecutor` does not propagate contextvars. So the check runs on the CALLING
-    thread, where `panel`/`validation` are live, and this token is its result.
-
-    MINTING IS THE CHECK: the only constructor path runs `_check_records_itself`, so
-    `Authorisation("digest")` from an eval is refused exactly as the keyword is. Spec §3.
-    """
+    """A checked declaration, minted where the frames prove it and carried where they do not"""
 
     kind: str
 
@@ -1765,12 +1088,12 @@ class Authorisation:
 
 
 def authorise(kind: str) -> Authorisation:
-    """Mint an `Authorisation` for `kind` on THIS thread, or raise `AttributionRefused`."""
+    """Mint an `Authorisation` for `kind` on THIS thread, or raise `AttributionRefused`"""
     return Authorisation(kind)
 
 
 def _check_kind(kind: str) -> None:
-    """Spec §2 conditions 1 and 2: the kind itself, with nothing said about the caller."""
+    """Spec §2 conditions 1 and 2: the kind itself, with nothing said about the caller"""
     from . import agent_usage
 
     if kind not in agent_usage.KIND_LABELS:
@@ -1785,20 +1108,14 @@ def _check_kind(kind: str) -> None:
 
 
 def _check_records_itself(kind: str) -> None:
-    """Raise `AttributionRefused` unless `kind` is a declaration this caller can make.
-
-    Spec §2 and §3: the kind must be one the OS accounts under and not the one this
-    transport writes, and an OS code path must be on the stack — a frame's module is a
-    fact about where code lives, and an argument would be forgeable by the caller with the
-    motive to forge it.
-    """
+    """Raise `AttributionRefused` unless `kind` is a declaration this caller can make"""
     _check_kind(kind)
     nearest = ""
     frame: Any = sys._getframe(1)
     seen = 0
     while frame is not None and seen < _CALLER_FRAME_CAP:
         module = frame.f_globals.get("__name__", "")
-        # A forwarder's frame is not evidence of an OS declaration — see `_FORWARDERS`.
+        # A forwarder's frame is not evidence of an OS declaration — see `_FORWARDERS`
         if module not in _FORWARDERS:
             nearest = nearest or module
             if module == "jarvis" or module.startswith("jarvis."):
@@ -1819,95 +1136,28 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
                         env_extra: dict[str, str] | None = None,
                         settings: Path | str | None = None,
                         keep_default_context: bool = False) -> HeadlessResult:
-    """One-shot headless call (`claude -p`), with its accounting kept.
-
-    The transport every OS-side agent runs on — Neo, the panel's seats, the dashboard
-    digest. Same call `run_headless` makes; the difference is that the usage object the
-    CLI puts in its own result JSON is READ rather than thrown away. Jarvis spends real
-    tokens answering its workers' questions, and a spend nobody records is a spend
-    nobody can see (see `agent_usage`, which is where these envelopes are persisted).
-
-    Used by Neo: the system prompt (persona + learnings) is byte-stable across
-    calls, so consecutive invocations within the Anthropic cache TTL share a
-    cached prefix — question-specific content rides in `prompt`, after it.
-
-    `tools` selects the callee's built-in tool set: `None` (default) leaves it
-    alone, `""` strips every tool, or a comma-separated list ("Read,Bash").
-    Strip them when the answer must come from the prompt rather than from the
-    machine — a tooled callee will happily go read the real state and answer
-    about *that*. Note this is availability, not permission: `--allowedTools`
-    and `--disallowedTools` do not remove a tool, and under
-    `permissions.defaultMode: auto` they do not stop it being used either.
-
-    `""` ALSO SENDS `--strict-mcp-config`, because `--tools ""` does not: it strips the
-    built-ins and leaves every configured MCP server's schemas in the request, so what a
-    "tool-free" callee could reach was the user's global MCP configuration (spec §4,
-    docs/superpowers/specs/2026-09-13-a-round-the-panel-can-afford.md). The two halves of
-    "judge the prompt and only the prompt" travel together, and neither is a caller's to
-    remember.
-
-    `records_itself` names the `agent_calls.kind` the caller writes for this call ITSELF
-    (the OS's own sites — Neo, the panel's seats, the digest — record the work order and
-    the question, which this seam cannot know). Empty, the default, means the transport
-    attributes the call (`_attribute_subprocess`). It is not a kill switch: a declaration
-    is checked before anything runs and refused with `AttributionRefused` unless the kind
-    is a real OS kind and an OS code path is on the stack — see
-    docs/superpowers/specs/2026-09-25-attribution-is-not-a-callers-choice.md.
-
-    An `Authorisation` is accepted in its place: the frame check already ran where the
-    token was minted, which is how the seats reach here off a pool thread (spec §3).
-
-    `permission_mode` and `env_extra` exist for the other direction: running a
-    subject that is *supposed* to touch the machine, in a controlled one. A
-    headless callee cannot answer a permission prompt any more than a `--bg`
-    worker can, so a tooled call needs the same `auto` mode dispatch gives real
-    workers; `env_extra` is how the sandbox gets on its PATH. Note it does NOT
-    suppress attribution: a measured subject still spends the work order's tokens,
-    and `env_extra` overriding `PATH` leaves `JARVIS_WO_ID` untouched.
-
-    THE CALL STARTS FROM NOTHING: `system_prompt` REPLACES the CLI's default prompt, and
-    a prompt-only call (`tools=""`) also loses the user's setting sources, MCP servers
-    and skills. A tooled callee keeps them, because they carry its permissions — Neo's
-    carve-out, question 670. `keep_default_context` appends instead, and is for an eval
-    whose SUBJECT is that default environment (only
-    `evals/llm/test_navigation_judgment.py`, which measures whether a worker reaches for
-    Serena); `settings` passes `--settings` for the same one. Spec:
-    docs/superpowers/specs/2026-09-25-a-headless-call-that-starts-from-nothing.md
-
-    THE INPUT IS MEASURED, AND CAPPED BY A BACKSTOP: past `MAX_OS_PROMPT_CHARS` the
-    call is REFUSED with `PromptTooLargeError` before anything runs, never trimmed
-    silently (spec §3 and §4,
-    docs/superpowers/specs/2026-09-26-bounded-model-inputs.md). A call that raises
-    `ClaudeCliError` produces no `HeadlessResult`, so its size is recorded NOWHERE —
-    a deliberate gap: there is no row for a call that never came back.
-    """
-    # FIRST, before any argument is built or any subprocess runs: a refused call spends
-    # nothing (spec §2).
+    """One-shot headless call (`claude -p`), with its accounting kept (docs/superpowers/specs/2026-09-13-a-round-the-panel-can-afford.md)"""
+    # FIRST, before any argument is built or any subprocess runs: a refused call spends nothing (spec §2)
     if isinstance(records_itself, Authorisation):
-        # Already checked where the frames proved it (spec §3). The kind is re-read off the
-        # token, so a token is never a way to declare a kind it was not minted for.
+        # Already checked where the frames proved it (spec §3)
         _check_kind(records_itself.kind)
     elif records_itself:
         _check_records_itself(records_itself)
-    # How big our own input was, kept whether or not the reply parses (spec §3,
-    # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md).
+    # How big our own input was, kept whether or not the reply parses (spec §3 (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
     prompt_chars = len(prompt)
     system_prompt_chars = len(system_prompt or "")
-    # THE BACKSTOP, spec §4 of the same spec — here beside the attribution check, so a
-    # refused call spends nothing and writes no `agent_calls` row.
+    # THE BACKSTOP, spec §4 of the same spec
     if prompt_chars + system_prompt_chars > MAX_OS_PROMPT_CHARS:
         kind = (records_itself.kind if isinstance(records_itself, Authorisation)
                 else (records_itself or "unattributed"))
-        # NUMBERS AND IDENTIFIERS ONLY — never a fragment of the prompt: this message
-        # reaches the inbox, which the user reads and the digest sends to a model.
+        # NUMBERS AND IDENTIFIERS ONLY — never a fragment of the prompt: this message reaches the inbox
         raise PromptTooLargeError(
             f"refused a {kind} call: prompt {prompt_chars} chars + system prompt "
             f"{system_prompt_chars} chars = {prompt_chars + system_prompt_chars}, "
             f"over the {MAX_OS_PROMPT_CHARS}-char ceiling (os.max_os_prompt_chars)",
             prompt_chars=prompt_chars, system_prompt_chars=system_prompt_chars,
             ceiling=MAX_OS_PROMPT_CHARS)
-    # THE PROMPT'S SECOND DOOR, spec §2:
-    # docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
+    # THE PROMPT'S SECOND DOOR, spec §2: docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
     over = len(prompt.encode()) > PROMPT_ARGV_LIMIT
     args: list[str] = ["-p", *([] if over else [prompt]), "--output-format", "json",
                        "--no-session-persistence"]
@@ -1921,18 +1171,12 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
         args += ["--permission-mode", permission_mode]
     with contextlib.ExitStack() as stack:
         if tools == "":
-            # `--tools ""` strips the BUILT-IN tools and leaves every MCP server's
-            # schemas in the request, reachable. See spec §4: a seat asked to name its
-            # tools listed eleven Google Drive verbs. "Judges the prompt and only the
-            # prompt" is what `tools=""` means, so these ship together — no servers, no
-            # setting sources (hence no hooks, no plugins) and no skills.
+            # `--tools ""` strips the BUILT-IN tools and leaves every MCP server's schemas in the request
             args += ["--strict-mcp-config", *stack.enter_context(_empty_mcp_config()),
                      "--setting-sources", "", "--disable-slash-commands"]
         args += stack.enter_context(
             _system_prompt_arg(system_prompt, keep_default_context=keep_default_context))
-        # AROUND THE SUBPROCESS AND NOTHING ELSE — §3 of
-        # docs/superpowers/specs/2026-10-01-neo-observability.md: argument assembly and JSON parsing
-        # are not the model's time.
+        # AROUND THE SUBPROCESS AND NOTHING ELSE (docs/superpowers/specs/2026-10-01-neo-observability.md)
         started = time.monotonic()
         out = _run(args, cwd=cwd, timeout=timeout, env_extra=env_extra,
                    stdin_text=prompt if over else None)
@@ -1943,8 +1187,7 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
     except json.JSONDecodeError:
         pass
     if not isinstance(data, dict):
-        # Not JSON at all, or not an object: the text is still the answer (that is what
-        # `run_headless` has always returned here), and there is nothing to account.
+        # Not JSON at all, or not an object: the text is still the answer (that is what `run_headless` has...
         result = HeadlessResult(text=out, model=model or "",
                                 prompt_chars=prompt_chars,
                                 system_prompt_chars=system_prompt_chars,
@@ -1958,20 +1201,14 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
             system_prompt_chars=system_prompt_chars,
             latency_ms=latency_ms,
             session_id=data.get("session_id") or "",
-            # One key is the ordinary case; more than one means the call was served by
-            # several models and no single name is honest, so the requested one stands.
+            # One key is the ordinary case; more than one means the call was served by several models and no...
             model=(served[0] if len(served) == 1 else "") or model or "",
         )
     if result.usage is not None:
-        # Injected HERE rather than inside `derive_turn_usage`: a worker turn's envelope
-        # comes off a result JSON that cannot say how big the prompt was, and must not
-        # grow keys it cannot honestly fill. The seats, the panel and `worker_session`
-        # pass `usage=result.usage` to `agent_usage.record`, so without this the OS-side
-        # sizes would record as zero (spec §3).
+        # Injected HERE rather than inside `derive_turn_usage`: a worker turn's envelope comes off a result...
         result.usage["prompt_chars"] = prompt_chars
         result.usage["system_prompt_chars"] = system_prompt_chars
-        # Same reason one field along: the sites that hand over `usage=result.usage` never
-        # see the dataclass — §3 of docs/superpowers/specs/2026-10-01-neo-observability.md.
+        # Same reason one field along: the sites that hand over `usage=result.usage` never see the dataclass... (docs/superpowers/specs/2026-10-01-neo-observability.md)
         result.usage["latency_ms"] = latency_ms
     if not records_itself:
         _attribute_subprocess(result, record)
@@ -1986,18 +1223,7 @@ def run_headless(prompt: str, system_prompt: str | None = None,
                  env_extra: dict[str, str] | None = None,
                  settings: Path | str | None = None,
                  keep_default_context: bool = False) -> str:
-    """`run_headless_result`, keeping only the text.
-
-    Kept for callers that have nothing to account against — and for the `call=` seams,
-    whose fakes return a plain string. Anything the OS pays for should call
-    `run_headless_result` and record what comes back.
-
-    It still ATTRIBUTES, and that is the point of passing `records_itself` through: the
-    LLM-graded evals reach the model through this wrapper, and they are the spend issue
-    #103 was filed about. `permission_mode`/`env_extra` ride through for the same
-    callers — the retrieval eval's tooled subject is both the thing being measured and,
-    when the eval runs inside a work order, a real charge against it.
-    """
+    """`run_headless_result`, keeping only the text (#103)"""
     return run_headless_result(prompt, system_prompt=system_prompt, model=model,
                                cwd=cwd, timeout=timeout, tools=tools,
                                records_itself=records_itself, record=record,
@@ -2007,19 +1233,14 @@ def run_headless(prompt: str, system_prompt: str | None = None,
 
 
 def unpack_headless(value: HeadlessResult | str) -> tuple[str, dict[str, Any] | None]:
-    """(text, usage) from whichever of the two a transport seam returned.
-
-    The `call=` seam in `structured.request` predates usage capture and its test fakes
-    return bare strings. Rather than force every one of them to grow a dataclass, both
-    shapes are accepted here: a string is text with nothing to account.
-    """
+    """(text, usage) from whichever of the two a transport seam returned"""
     if isinstance(value, HeadlessResult):
         return value.text, value.usage
     return value, None
 
 
 def session_transcript_path(cwd: Path, session_id: str) -> Path:
-    """Location of the session transcript (~/.claude/projects/<munged-cwd>/<id>.jsonl)."""
+    """Location of the session transcript (~/.claude/projects/<munged-cwd>/<id>.jsonl)"""
     config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
     munged = "".join(c if c.isalnum() else "-" for c in str(cwd))
     return config_dir / "projects" / munged / f"{session_id}.jsonl"

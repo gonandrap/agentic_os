@@ -1,14 +1,4 @@
-"""The /config page's wiring section (issue #164 item 4).
-
-Its own file rather than a block in tests/test_ui_config.py: this section reads the
-USER'S machine, so every test here has to install a fixed inventory first, and mixing
-that fixture into the settings-table suite would make a page that shells out to `claude`
-one forgotten monkeypatch away.
-
-The write path underneath is proved in tests/test_wiring.py. What is proved here is the
-PAGE: that it shows what the user has, that it never offers a control it cannot honour,
-and that it distinguishes "still reading" from "you have nothing".
-"""
+"""The /config page's wiring section (issue #164 item 4)"""
 
 from __future__ import annotations
 
@@ -25,7 +15,7 @@ from jarvis.ui.app import create_app  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def not_a_worker(monkeypatch):
-    """The suite is routinely run BY a worker, and `ops.set_config` refuses one."""
+    """The suite is routinely run BY a worker, and `ops.set_config` refuses one"""
     monkeypatch.delenv("JARVIS_WO_ID", raising=False)
 
 
@@ -37,12 +27,7 @@ def client(jarvis_home, fake_claude, catalog_file):
 
 @pytest.fixture()
 def inventory(monkeypatch):
-    """A fixed inventory in the cache, so the page never shells out to `claude`.
-
-    Installed into `wiring._STATE` rather than over `discover`, because what the page
-    calls is `cached()` — and the states it has to render (populated, still reading) are
-    that function's answers, not discovery's.
-    """
+    """A fixed inventory in the cache, so the page never shells out to `claude`"""
     def install(items):
         inv = wiring.Inventory(items=list(items), ts=time.time())
         monkeypatch.setattr(wiring, "_STATE", {"inventory": inv, "thread": None})
@@ -72,13 +57,12 @@ def test_the_section_lists_what_the_user_has_and_wires_all_of_it(client, invento
     page = client.get("/config?scope=projects.proj_a").text
     assert "● wired" in row(page, "claude.ai Gmail")
     assert "unwire" in row(page, "serena@m")
-    # The constraint the user made load-bearing, said on the page that could break it.
+    # The constraint the user made load-bearing, said on the page that could break it
     assert "written back to it" in page
 
 
 def test_the_one_row_with_a_measurement_behind_it_carries_it(client, inventory):
-    """The claude.ai block is the only row this feature has evidence about, so it is
-    the only row that claims any — and the claim is the finding's, to its own limit."""
+    """The claude.ai block is the only row this feature has evidence about"""
     inventory([wiring.Item(kind="mcp", name="claude.ai Gmail", source="claude.ai",
                            lever=wiring.LEVER_CONNECTORS)])
     assert "83.7%" in row(client.get("/config").text, "claude.ai Gmail")
@@ -86,9 +70,7 @@ def test_the_one_row_with_a_measurement_behind_it_carries_it(client, inventory):
 
 def test_a_server_with_no_lever_is_not_offered_a_control_it_cannot_honour(client,
                                                                          inventory):
-    """`/mcp disable` writes the user's own Claude configuration, which this feature may
-    not — so a hand-added server has no lever, and a button that silently did nothing
-    would be worse than no button."""
+    """`/mcp disable` writes the user's own Claude configuration, which this feature may not"""
     inventory([wiring.Item(kind="mcp", name="hand-added", source="your Claude config",
                            note="only `/mcp disable` unwires this one")])
     cell = row(client.get("/config").text, "hand-added")
@@ -127,9 +109,7 @@ def test_an_unknown_lever_is_a_flash_not_a_500(client, inventory):
 
 def test_a_read_that_has_not_finished_says_so_rather_than_showing_an_empty_list(
         client, monkeypatch):
-    """An empty list would claim the user has no MCP servers. `claude mcp list`
-    health-checks every server over the network, so the first read runs BEHIND the
-    page — and the page has to say which of the two states it is showing."""
+    """An empty list would claim the user has no MCP servers"""
     monkeypatch.setattr(wiring, "cached", lambda **_k: None)
     assert "reading your Claude configuration" in client.get("/config").text
 
@@ -146,8 +126,7 @@ def test_a_machine_whose_claude_cli_cannot_be_read_still_renders_the_settings(
 
 
 def test_nothing_is_behind_a_tab_here_either(client, inventory):
-    """§8's rule for this page: Playwright's inner_text() skips display:none, so text
-    inside a shut tab panel is unassertable from a browser test."""
+    """§8's rule for this page: Playwright's inner_text() skips display:none"""
     inventory([wiring.Item(kind="skill", name="mine", source="your skills directory",
                            lever=f"{wiring.LEVER_SKILL}mine")])
     page = client.get("/config").text

@@ -1,49 +1,4 @@
-"""Five-arm A/B: does a model read an assumption's stakes better than the regex?
-
-Design: docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md SS3.9.
-
-`autoreview.high_stakes_marker` fires on 91 of the fleet's 498 assumptions and only ~13 of
-those commit to an act — roughly 14% precision — while missing a release cut, a live
-exemption retracted and a force-updated branch. THE ACCEPTANCE BAR IS RECALL: precision is
-what is being bought, recall is what must not be sold. An arm that beats the regex on
-precision and loses one true high-stakes case fails.
-
-THE CORPUS. `$JARVIS_STAKES_CORPUS` if it exists (default
-`$JARVIS_HOME/evals/stakes_corpus.json`), else the committed synthetic fixture. The real
-one is 498 rows of verbatim production assumption prose and this repository is PUBLIC, so
-it is NOT committed (Neo, question 650); `evals/tools/build_stakes_corpus.py` regenerates
-it from a live fleet, and paraphrasing was considered and rejected — a paraphrase changes
-the exact tokens the regex fires on, so the regex arm would be scored on rewritten text
-and the A/B would be measuring the paraphraser. WHICH corpus ran is printed with the
-results, because the two are not comparable numbers.
-
-Rows marked `uncertain: true` are labels nobody has checked. They are EXCLUDED from the
-assertion and reported separately.
-
-THE RUN IS LONG AND RESUMABLE. The corpus is hundreds of rows and each row is a `claude
--p` subprocess, so the calls go through a thread pool and every reply is cached on disk
-keyed by `(model, row_id, run_index)`. An interrupted run resumes without re-buying the
-calls already paid for, and the cache is thrown away whenever the PROMPT or the CORPUS
-changes — a cache serving replies to a question that has since been reworded is the one
-way this eval could lie.
-
-LATENCY STAYS HONEST UNDER BOTH. `Call.latency_ms` is measured around each subprocess
-individually, so it is a real per-call latency and NOT divided by the pool width; what the
-pool changes is the arm's WALL CLOCK, which is reported beside it. A cached call carries
-the latency and cost measured on the real call it replaces — a resumed run therefore
-reports the same table as a fresh one — and is counted in the `cached` column so a
-fully-fresh run and a resumed one are distinguishable.
-
-Opt-in (spends real tokens, needs a logged-in Claude Code):
-    JARVIS_EVALS_LLM=1 pytest evals/llm/test_stakes_classifier_ab.py -q
-    JARVIS_EVALS_N=3                     # runs of the candidate (haiku) arm, default 3
-    JARVIS_EVALS_STAKES_CEILING_N=1      # runs of the sonnet arm, default 1: sonnet is a
-                                         # ceiling, not a candidate, and the dearest arm
-    JARVIS_EVALS_STAKES_ARM=haiku        # the candidate under assertion
-    JARVIS_EVALS_CONCURRENCY=8           # classifier calls in flight, default 8
-    JARVIS_EVALS_STAKES_CACHE=...        # cache file, default beside the corpus;
-                                         # set it EMPTY to disable the cache
-"""
+"""Five-arm A/B: does a model read an assumption's stakes better than the regex? (docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md)"""
 
 from __future__ import annotations
 
@@ -70,9 +25,7 @@ pytestmark = [
 scenario = pytest.mark.scenario
 
 N_RUNS = int(os.environ.get("JARVIS_EVALS_N", "3"))
-#: SS3.9 arm 5 is a CEILING — how well the reading can be done at all — not something that
-#: could ship. One run answers that, and it is the dearest arm, so it does not pay for the
-#: candidate's run count. Clamped to at least 1: an arm with no runs has no metrics.
+#: SS3.9 arm 5 is a CEILING — how well the reading can be done at all — not something that could ship
 CEILING_N = max(1, int(os.environ.get("JARVIS_EVALS_STAKES_CEILING_N", "1")))
 CONCURRENCY = max(1, int(os.environ.get("JARVIS_EVALS_CONCURRENCY", "8")))
 HAIKU = "claude-haiku-4-5-20251001"
@@ -80,21 +33,14 @@ SONNET = "claude-sonnet-5"
 CORPUS_ENV = "JARVIS_STAKES_CORPUS"
 CACHE_ENV = "JARVIS_EVALS_STAKES_CACHE"
 CACHE_DEFAULT_NAME = "stakes_ab_cache.json"
-#: Entries buffered before the cache is rewritten. The point of the cache is surviving an
-#: interrupt, so it is written DURING the run; rewriting the whole file per call would
-#: cost more than the calls it protects.
+#: Entries buffered before the cache is rewritten
 CACHE_FLUSH_EVERY = 20
 SYNTHETIC = Path(__file__).resolve().parents[1] / "data" / "stakes_corpus_synthetic.json"
 
-#: The arm the feature would ship as `validation.stakes_classifier: classifier`. SS3.4
-#: leaves the choice to this eval: haiku alone if its recall holds, `regex OR haiku`
-#: otherwise. Override to score a different candidate without editing the file.
+#: The arm the feature would ship as `validation.stakes_classifier: classifier`
 CANDIDATE = os.environ.get("JARVIS_EVALS_STAKES_ARM", "haiku")
 
-#: `regex-tightened` is FREE, like `regex`: both are pure matchers, so the arm costs no
-#: call and is scored on every row. It is here because it is what the measurement
-#: RECOMMENDED (§7) — the model arms are the ones that have to justify their bill against
-#: it, and an A/B that reported only the arms that call would hide the answer.
+#: `regex-tightened` is FREE, like `regex`: both are pure matchers
 ARMS = ("regex", "regex-tightened", "haiku", "regex-or-haiku",
         "regex-prefilter-then-haiku-confirms", "sonnet")
 
@@ -110,11 +56,7 @@ def corpus_path() -> Path:
 
 
 def cache_path(corpus: Path) -> Path | None:
-    """Where replies are cached, or None when `$JARVIS_EVALS_STAKES_CACHE` is set EMPTY.
-
-    Default: beside the corpus, so the production corpus and the synthetic fixture do not
-    share one file (they are not comparable numbers, and the fingerprint would thrash).
-    """
+    """Where replies are cached, or None when `$JARVIS_EVALS_STAKES_CACHE` is set EMPTY"""
     named = os.environ.get(CACHE_ENV)
     if named is None:
         return corpus.parent / CACHE_DEFAULT_NAME
@@ -123,12 +65,7 @@ def cache_path(corpus: Path) -> Path | None:
 
 
 def fingerprint(corpus: Path) -> dict[str, str]:
-    """EVERYTHING THAT CHANGES WHAT IS BEING MEASURED, hashed.
-
-    The persona, the question template and the corpus text. A cache that outlives a
-    reworded prompt does not fail the eval, it answers it with measurements of a question
-    nobody asks any more — the one failure mode a stale cache has here.
-    """
+    """EVERYTHING THAT CHANGES WHAT IS BEING MEASURED, hashed"""
     def digest(text: str | bytes) -> str:
         raw = text.encode() if isinstance(text, str) else text
         return hashlib.sha256(raw).hexdigest()[:16]
@@ -138,20 +75,12 @@ def fingerprint(corpus: Path) -> dict[str, str]:
             "corpus": digest(corpus.read_bytes())}
 
 
-#: A model arm whose transport failed on more than this share of its calls IS NOT SCORED.
-#: 2% because a handful of timeouts across hundreds of rows moves no metric, and anything
-#: above it does: the poisoned run of 2026-09-25 reported haiku at 0.04 precision off a
-#: failure rate of 86%.
+#: A model arm whose transport failed on more than this share of its calls IS NOT SCORED. 2% because a...
 FAILURE_RATE_CEILING = 0.02
 
 
 def _poisoned_entry(entry: dict[str, Any]) -> bool:
-    """Was this cached entry written by a call that never reached the API?
-
-    `reached` when the field is there. LEGACY entries (written before it existed) are
-    dropped only on the outage's exact signature — unreadable AND free — because a readable
-    reply is a real judgement whatever it cost.
-    """
+    """Was this cached entry written by a call that never reached the API?"""
     if "reached" in entry:
         return not entry.get("reached")
     return not entry.get("parsed") and float(entry.get("cost_usd") or 0.0) == 0.0
@@ -159,20 +88,7 @@ def _poisoned_entry(entry: dict[str, Any]) -> bool:
 
 @dataclass
 class Call:
-    """One classifier call on one row.
-
-    `latency_ms` is measured around this call's own subprocess, so it stays a real
-    per-call latency under the thread pool rather than a contended one. `cached` marks a
-    reply read back from disk: it carries the latency and cost MEASURED ON THE REAL CALL
-    it replaces, and adds no new ones.
-
-    **`reached` IS SET EXPLICITLY AND IS NEVER INFERRED.** False only on `_classify`'s
-    exception path — the model was never asked — and True wherever a reply came back,
-    readable or not. It is NOT derived from `cost_usd == 0.0`, which a cheap call served
-    off a cached prefix really does report. `reached=False` means there is no judgement
-    here: the `high=True` it carries is the shipped HOLD rule, not a verdict, and it must
-    reach neither the cache nor a precision figure.
-    """
+    """One classifier call on one row"""
 
     row_id: str
     high: bool
@@ -185,20 +101,14 @@ class Call:
 
 @dataclass
 class CallCache:
-    """Replies on disk, keyed `(model, row_id, run_index)`, so an interrupted run resumes.
-
-    Written during the run and replaced atomically: a run killed mid-flight leaves a
-    readable file naming every call that had completed.
-    """
+    """Replies on disk, keyed `(model, row_id, run_index)`, so an interrupted run resumes"""
 
     path: Path | None
     fp: dict[str, str]
     entries: dict[str, dict[str, Any]] = field(default_factory=dict)
-    #: Why the file on disk was thrown away, printed with the results. Empty when it was
-    #: used or when there was none.
+    #: Why the file on disk was thrown away, printed with the results
     discarded: str = ""
-    #: How many entries the load DROPPED while keeping the rest, and why. A repair, not a
-    #: discard: every call that did reach the API survives.
+    #: How many entries the load DROPPED while keeping the rest, and why
     repaired: str = ""
     hits: int = 0
     _pending: int = 0
@@ -244,12 +154,7 @@ class CallCache:
                     reached=True)
 
     def put(self, model: str, row_id: str, run: int, call: Call) -> None:
-        """NOTHING THAT DID NOT REACH THE API IS EVER STORED, so a re-run retries it.
-
-        The defect this exists for: 1280 of the 2026-09-25 run's 1485 haiku entries were
-        made while the session's usage limit was in force and were cached anyway, and the
-        scorecard then reported the outage as haiku scoring 0.04 precision.
-        """
+        """NOTHING THAT DID NOT REACH THE API IS EVER STORED, so a re-run retries it"""
         if self.path is None or not call.reached:
             return
         with self._lock:
@@ -276,12 +181,7 @@ class CallCache:
 def classify_runs(rows: list[dict[str, Any]], model: str, cwd: Path, runs: int,
                   cache: CallCache, run_offset: int = 0) -> tuple[list[list[Call]],
                                                                   float]:
-    """`runs` passes over `rows`, cache-first, the misses through a thread pool.
-
-    Each `_classify` is an independent subprocess, so the pool is safe. Returns the runs
-    in corpus order plus the WALL CLOCK of the whole arm — the number that moves with
-    `$JARVIS_EVALS_CONCURRENCY`, as opposed to the per-call latency, which does not.
-    """
+    """`runs` passes over `rows`, cache-first, the misses through a thread pool"""
     out: list[list[Call]] = []
     pending: list[tuple[int, int, dict[str, Any]]] = []
     for run in range(runs):
@@ -318,9 +218,7 @@ class Metrics:
     mean_latency_ms: float = 0.0
     p95_latency_ms: float = 0.0
     mean_cost_usd: float = 0.0
-    #: TWO DIFFERENT FINDINGS, never one column: `failed` is the transport — the model was
-    #: never reached and made no judgement — and `unparsed` is a reply that came back and
-    #: could not be read. Both used to land as `parsed=False`.
+    #: TWO DIFFERENT FINDINGS, never one column: `failed` is the transport
     failed: int = 0
     unparsed: int = 0
     misses: list[str] = field(default_factory=list)
@@ -342,25 +240,12 @@ def corpus() -> dict[str, Any]:
 
 @pytest.fixture(scope="module")
 def neutral_cwd(tmp_path_factory) -> Path:
-    """Outside this repo, so the classifier does not load CLAUDE.md on top of the one
-    sentence it is meant to read — `neo.answer_question`'s reason for the same cwd."""
+    """Outside this repo, so the classifier does not load CLAUDE.md on top of the one sentence it is meant..."""
     return tmp_path_factory.mktemp("jarvis-stakes-ab")
 
 
 def _classify(row: dict[str, Any], model: str, cwd: Path) -> Call:
-    """One call, and WHETHER IT HAPPENED AT ALL is part of the answer.
-
-    `tools=""` strips every built-in tool AND sends `--strict-mcp-config`
-    (claude_cli.py:1522): a tooled callee "will happily go read the real state and answer
-    about *that*", which is a different classifier from the one shipping. The same string
-    the daemon passes, so this measures the daemon's call.
-
-    The exception path returns `reached=False`. It still carries `high=True`, which is the
-    daemon's shipped HOLD rule, but nothing downstream may read that as a verdict.
-
-    Attributed by the transport: outside the `jarvis` package, so it bills to
-    `JARVIS_WO_ID` and declares no kind of its own.
-    """
+    """One call, and WHETHER IT HAPPENED AT ALL is part of the answer"""
     started = time.monotonic()
     try:
         result = claude_cli.run_headless_result(
@@ -377,11 +262,7 @@ def _classify(row: dict[str, Any], model: str, cwd: Path) -> Call:
 
 def _score(rows: list[dict[str, Any]], predicted: dict[str, bool],
            calls: list[Call]) -> Metrics:
-    """Precision, recall and F1 on the `high` class, plus what the calls cost.
-
-    An arm with no positives at all scores 0 precision rather than dividing by zero — and
-    0 is the honest reading: it found nothing.
-    """
+    """Precision, recall and F1 on the `high` class, plus what the calls cost"""
     tp = sum(1 for r in rows if r["label"] == "high" and predicted.get(r["id"]))
     fp = sum(1 for r in rows if r["label"] != "high" and predicted.get(r["id"]))
     fn = sum(1 for r in rows if r["label"] == "high" and not predicted.get(r["id"]))
@@ -404,8 +285,7 @@ def _score(rows: list[dict[str, Any]], predicted: dict[str, bool],
 
 
 def _terminal_line(config, line: str) -> None:
-    """Write past pytest's capture: the margin is the finding, and a green scorecard that
-    hides it is the failure (`test_house_style_ab.py`'s reason)."""
+    """Write past pytest's capture: the margin is the finding"""
     reporter = config.pluginmanager.get_plugin("terminalreporter")
     if reporter is None:  # pragma: no cover - only with -p no:terminal
         print(line)
@@ -420,10 +300,7 @@ def _terminal_line(config, line: str) -> None:
 
 @pytest.fixture(scope="module")
 def results(corpus, neutral_cwd, request) -> dict[str, Any]:
-    """Every arm scored — haiku N_RUNS times, sonnet CEILING_N times. The two model arms
-    are the only calls made; the two derived arms are composed from haiku's answers and
-    the regex, so `regex OR haiku` and the prefilter arm are measured on the SAME replies
-    rather than on fresh ones. One cache spans both arms: its key carries the model."""
+    """Every arm scored — haiku N_RUNS times, sonnet CEILING_N times"""
     rows = corpus["rows"]
     scored = corpus["scored"]
     regex = {r["id"]: bool(autoreview.high_stakes_marker(r["text"])) for r in rows}
@@ -446,8 +323,7 @@ def results(corpus, neutral_cwd, request) -> dict[str, Any]:
     per_run["regex-or-haiku"] = [
         _score(scored, {c.row_id: c.high or regex[c.row_id] for c in run}, run)
         for run in model_runs["haiku"]]
-    # The prefilter arm calls ONLY where the regex fired, so it inherits every miss
-    # (SS3.9 arm 4) and pays for a fraction of the calls.
+    # The prefilter arm calls ONLY where the regex fired
     per_run["regex-prefilter-then-haiku-confirms"] = [
         _score(scored,
                {c.row_id: regex[c.row_id] and c.high for c in run},
@@ -474,13 +350,7 @@ def results(corpus, neutral_cwd, request) -> dict[str, Any]:
     poisoned = poisoned_arms(per_run)
     if poisoned:
         _terminal_line(cfg, f"  NOT MEASURABLE — {_poison_note(poisoned)}")
-    # `ms/call` is per-subprocess and unaffected by the pool; `wall s` is the arm's
-    # elapsed time and is what the pool width moves — 0 for the arms that make no calls of
-    # their own. `cached` counts replies read back from disk; their latency and cost were
-    # measured on the real call they replace.
-    # `failed` is calls that NEVER REACHED the API (no judgement was made); `unparsed` is
-    # replies that came back unreadable. Separate columns because they are separate
-    # findings and one of them invalidates the row it sits on.
+    # `ms/call` is per-subprocess and unaffected by the pool
     _terminal_line(cfg, f"  {'arm':<38} {'prec':>6} {'recall':>7} {'F1':>6} "
                         f"{'F1 sd':>6} {'calls':>6} {'cached':>7} {'failed':>7} "
                         f"{'unparsed':>9} {'ms/call':>8} "
@@ -542,11 +412,7 @@ def _candidate_predictions(arm: str, regex: dict[str, bool],
 
 
 def poisoned_arms(per_run: dict[str, list[Metrics]]) -> list[tuple[str, float, int, int]]:
-    """Which MODEL arms made too many calls that never reached the API, worst first.
-
-    Only the two arms that call — the derived arms are composed from haiku's replies, so a
-    poisoned haiku poisons them and naming it once is the whole finding.
-    """
+    """Which MODEL arms made too many calls that never reached the API, worst first"""
     out: list[tuple[str, float, int, int]] = []
     for arm in ("haiku", "sonnet"):
         runs = per_run.get(arm) or []
@@ -568,12 +434,7 @@ def _poison_note(poisoned: list[tuple[str, float, int, int]]) -> str:
 
 
 def _skip_if_poisoned(results: dict[str, Any]) -> None:
-    """The other assertions SKIP on a poisoned run rather than pass.
-
-    Their precision and recall are computed over holds nobody ruled on, so a green tick
-    here is the defect: the poisoned run scored the candidate's recall at 0.98 while the
-    model had answered 205 of 1485 calls.
-    """
+    """The other assertions SKIP on a poisoned run rather than pass"""
     poisoned = poisoned_arms(results["per_run"])
     if poisoned:
         pytest.skip(f"arm not measurable — {_poison_note(poisoned)}")
@@ -581,15 +442,7 @@ def _skip_if_poisoned(results: dict[str, Any]) -> None:
 
 @scenario("stakes-classifier-ab", "no arm is scored off calls that never happened")
 def test_no_arm_reports_numbers_from_calls_that_never_reached_the_model(results):
-    """THE MEASUREMENT'S OWN PRE-CONDITION, and it is an assertion because a printed
-    warning did not stop it: the run of 2026-09-25 reported haiku precision 0.04 to two
-    decimals when 1280 of its 1485 calls had been refused by the usage limit and cached.
-
-    `HELD` stays the right SHIPPED behaviour for the daemon — an unreachable classifier
-    must not let an assumption through. But a measurement is not a decision, and recording
-    a verdict for a model that was never reached is the NEVER-FABRICATE-A-DEFAULT-FROM-A-
-    FAILURE learning (kn-32434cef) in an eval.
-    """
+    """THE MEASUREMENT'S OWN PRE-CONDITION"""
     poisoned = poisoned_arms(results["per_run"])
 
     assert not poisoned, f"REFUSING TO SCORE — {_poison_note(poisoned)}"
@@ -597,10 +450,7 @@ def test_no_arm_reports_numbers_from_calls_that_never_reached_the_model(results)
 
 @scenario("stakes-classifier-ab", "the candidate never loses a high-stakes case")
 def test_the_candidate_recall_is_at_least_the_regexs(results):
-    """THE SAFETY HALF, and the bar SS3.9 names. A false negative is the only expensive
-    direction — a hold costs the user exactly what every assumption costs them today, and
-    a miss decides in their name something they never delegated. Worst run, not the mean:
-    an arm that loses a case one run in three loses it in production too."""
+    """THE SAFETY HALF, and the bar SS3.9 names"""
     _skip_if_poisoned(results)
     regex = statistics.mean(m.recall for m in results["per_run"]["regex"])
     runs = results["per_run"][CANDIDATE]
@@ -615,8 +465,7 @@ def test_the_candidate_recall_is_at_least_the_regexs(results):
 
 @scenario("stakes-classifier-ab", "the candidate is strictly more precise")
 def test_the_candidate_precision_beats_the_regexs(results):
-    """THE THING BEING BOUGHT. Equal precision is a feature that costs a model call per
-    assumption and buys nothing — an un-asserted number would let that ship green."""
+    """THE THING BEING BOUGHT"""
     _skip_if_poisoned(results)
     regex = statistics.mean(m.precision for m in results["per_run"]["regex"])
     candidate = statistics.mean(m.precision for m in results["per_run"][CANDIDATE])
@@ -629,9 +478,7 @@ def test_the_candidate_precision_beats_the_regexs(results):
 
 @scenario("stakes-classifier-ab", "the answer is stable across identical calls")
 def test_the_candidate_answers_the_same_way_twice(results):
-    """A classifier that answers differently on two identical calls is a fact about the
-    arm, and it is the reason `shadow` keys its event on the verdict as well as the row.
-    Reported as a real result rather than hidden: the bar is loose, the number is not."""
+    """A classifier that answers differently on two identical calls is a fact about the arm"""
     _skip_if_poisoned(results)
     runs = results["per_run"][CANDIDATE]
     if len(runs) < 2:
@@ -645,8 +492,7 @@ def test_the_candidate_answers_the_same_way_twice(results):
 
 @scenario("stakes-classifier-ab", "the corpus discriminates the arms")
 def test_the_corpus_contains_cases_both_nets_can_get_wrong(results):
-    """An A/B on a corpus every arm scores 1.0 on proves nothing. The corpus has to carry
-    both failure directions: routine rows the regex holds, and acts it cannot see."""
+    """An A/B on a corpus every arm scores 1.0 on proves nothing"""
     _skip_if_poisoned(results)
     rows = results["corpus"]["scored"]
     regex = results["regex"]

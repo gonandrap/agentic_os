@@ -1,10 +1,4 @@
-"""Work order timeline: signal vs debug.
-
-The raw `wo_events` table mixes two very different things — the story of the work
-order (what was asked, what was decided, what came back) and the plumbing that
-carries it (message delivery, session hooks, turn boundaries). The timeline shows
-the story by default; the plumbing is debug and only surfaces on request.
-"""
+"""Work order timeline: signal vs debug"""
 
 from __future__ import annotations
 
@@ -14,12 +8,9 @@ SIGNAL_KINDS = [
     "created", "dispatched", "status", "attention", "assumption",
     "question_asked", "reviewed",
     "finished",
-    # A turn that failed or was cancelled is the story, not the plumbing: it is why
-    # the work order stopped.
+    # A turn that failed or was cancelled is the story, not the plumbing: it is why the work order stopped
     "turn_failed", "turn_cancelled",
-    # So is a turn Claude Code refused for the usage limit, and so is the OS putting
-    # itself right afterwards — that recovery is the answer to "why did it start again
-    # on its own at midnight", which is a question only the timeline can answer.
+    # So is a turn Claude Code refused for the usage limit
     "rate_limited", "rate_limit_retry", "rate_limit_exhausted",
     "turn_paused", "turn_resumed", "turn_retries_exhausted",
 ]
@@ -27,9 +18,7 @@ DEBUG_KINDS = [
     "message_queued", "delivering", "message_delivered",
     "turn_started", "turn_ended", "session_released", "permission_mode_changed",
     "hook:SessionStart", "hook:Stop", "hook:SessionEnd", "hook:Notification",
-    # An answer is the message it was queued as, not the bookkeeping beside it. Both
-    # writers do the two in the same breath, so as signal these cost the reader a line
-    # that says an answer arrived, directly above the answer.
+    # An answer is the message it was queued as, not the bookkeeping beside it
     "neo_answered", "escalation_answered",
 ]
 
@@ -51,7 +40,7 @@ def test_unknown_hook_events_are_debug():
 
 
 def test_unknown_kinds_default_to_signal():
-    """Better to show an unclassified event than to silently swallow it."""
+    """Better to show an unclassified event than to silently swallow it"""
     assert event_level("brand_new_kind") == "signal"
 
 
@@ -70,9 +59,7 @@ def test_debug_events_included_when_asked():
 
 
 def test_created_entry_does_not_restate_the_work_order():
-    """Every surface that renders this timeline puts the title and description at the
-    top of the same page, so an opening entry repeating them is the reader's first
-    scroll spent on text they have just read."""
+    """Every surface that renders this timeline puts the title and description at the top of the same..."""
     wo = {"title": "Fix the citation exporter", "description": "BibTeX output drops DOIs"}
     entry = build_timeline(wo, [ev("created", 1.0, origin="jarvis")], [])[0]
     assert entry["label"] == "Work order created"
@@ -95,11 +82,7 @@ def test_signal_entries_read_as_prose_not_json():
 
 
 def test_a_cleanup_failure_reads_as_a_sentence_and_not_a_json_dump():
-    """THE TIMELINE IS THIS KIND'S ONLY SURFACE. Every other `automerge_*` event is
-    rendered by `ops.automerge_state` as the mechanism's state line on the work order;
-    this one is deliberately not in `ops.AUTOMERGE_EVENTS`, because the state after it
-    is "merged". Unregistered it still appeared — unknown kinds are signal — as the bare
-    kind plus its payload as JSON, which is written and not seen (issue #253)."""
+    """THE TIMELINE IS THIS KIND'S ONLY SURFACE (#253)"""
     entry = build_timeline({}, [ev("automerge_cleanup_failed", 1.0,
                                    reason="cannot delete branch 'worktree-wo-1'",
                                    head_sha="a1b2c3d")], [])[0]
@@ -110,9 +93,7 @@ def test_a_cleanup_failure_reads_as_a_sentence_and_not_a_json_dump():
 
 
 def test_a_merge_that_timed_out_is_not_described_as_a_cleanup():
-    """The two landed shapes are separate kinds precisely so this sentence differs: a
-    timed-out merge attempted no branch deletion, and calling it a cleanup failure sends
-    the reader hunting one (issue #253, spec §5.5)."""
+    """The two landed shapes are separate kinds precisely so this sentence differs: a timed-out merge... (#253)"""
     entry = build_timeline({}, [ev("automerge_command_unfinished", 1.0,
                                    reason="the merge command did not complete: timeout",
                                    head_sha="a1b2c3d")], [])[0]
@@ -123,10 +104,7 @@ def test_a_merge_that_timed_out_is_not_described_as_a_cleanup():
 
 
 def test_a_merge_refused_because_the_base_moved_says_which_commit_moved():
-    """Spec 2026-09-28 §3.1: the OS refused before GitHub heard anything, so the sentence
-    has to name BOTH commits — the one a round passed on and the one the base is at —
-    because "the merge was refused" about an unmoved head is what gate 308's reviewer was
-    told and could not act on."""
+    """Spec 2026-09-28 §3.1: the OS refused before GitHub heard anything"""
     entry = build_timeline({}, [ev("automerge_base_stale", 1.0, head_sha="fa85f88ccd0",
                                    base="main", base_oid="37fe650fab0", round=2,
                                    reason="the base moved")], [])[0]
@@ -136,12 +114,32 @@ def test_a_merge_refused_because_the_base_moved_says_which_commit_moved():
     assert "{" not in entry["label"] + entry["detail"]
 
 
+def test_a_stall_with_a_tip_observed_names_both_commits():
+    """wo-d3a70c29 condition (a): the evidence IS the disagreement, so both shas"""
+    entry = build_timeline({}, [ev("pr_recompute_stalled", 1.0,
+                                   head_oid="0488753aaaa", ref_oid="88cac10bbbb",
+                                   branch="worktree-wo-cdee6f9b",
+                                   mergeable="UNKNOWN")], [])[0]
+    assert entry["label"] == "GitHub stopped recomputing the pull request"
+    assert "branch at 88cac10bbb" in entry["detail"]
+    assert "pull request head at 0488753aa" in entry["detail"]
+    assert "{" not in entry["label"] + entry["detail"]
+
+
+def test_a_stall_with_no_tip_observed_says_the_clock_and_names_no_branch():
+    """Condition (b): nothing was compared"""
+    entry = build_timeline({}, [ev("pr_recompute_stalled", 1.0,
+                                   head_oid="0488753aaaa", ref_oid="",
+                                   mergeable="UNKNOWN",
+                                   unknown_since=1.0)], [])[0]
+    assert entry["label"] == "GitHub stopped recomputing the pull request"
+    assert entry["detail"].startswith("mergeability unanswered since ")
+    assert "branch at" not in entry["detail"]
+    assert "{" not in entry["label"] + entry["detail"]
+
+
 def test_a_reparked_give_up_reads_as_a_sentence_and_not_a_json_dump():
-    """THE TIMELINE IS THIS KIND'S ONLY SURFACE, and the move it records is the OS taking
-    a status back — so "it fixed itself" has to be provable, as it is for
-    `pr_repair_resettled` (kn-3f133363). Unregistered it falls through to the bare kind
-    plus a JSON payload. Spec §B of
-    docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md."""
+    """THE TIMELINE IS THIS KIND'S ONLY SURFACE, and the move it records is the OS taking a status back (docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md)"""
     entry = build_timeline({}, [ev("give_up_reparked", 1.0, round_id=12, round=4,
                                    was="waiting_pr_merge")], [])[0]
     assert entry["level"] == "signal"
@@ -152,7 +150,7 @@ def test_a_reparked_give_up_reads_as_a_sentence_and_not_a_json_dump():
 
 
 def test_messages_appear_as_prompt_and_reply():
-    """Both directions are moments on the timeline; the words are the conversation's."""
+    """Both directions are moments on the timeline; the words are the conversation's"""
     messages = [
         {"id": 1, "ts": 2.0, "direction": "user_to_agent", "content": "also cover EndNote",
          "source": "ui"},
@@ -174,7 +172,7 @@ def test_entries_are_ordered_by_time():
 
 
 def test_message_plumbing_events_never_duplicate_the_message_itself():
-    """`delivering`/`message_delivered` are debug; the message content is the signal."""
+    """`delivering`/`message_delivered` are debug; the message content is the signal"""
     events = [ev("message_queued", 1.0, msg_id=1), ev("delivering", 2.0, msg_id=1),
               ev("message_delivered", 3.0, msg_id=1)]
     messages = [{"ts": 1.0, "direction": "user_to_agent", "content": "the ask"}]
@@ -183,18 +181,10 @@ def test_message_plumbing_events_never_duplicate_the_message_itself():
     assert entries[0]["detail"] == "the ask"
 
 
-# -- rendered details ----------------------------------------------------------------
-# Every kind below reads a payload key. A renderer that reads a key no writer stores
-# renders an empty detail forever, and asserting only on event_level (as the tests
-# above do) cannot see it — that is exactly how the empty "Worker asked a question"
-# entry shipped. These tests assert the DETAIL, so a key that goes unwritten fails here.
-#
-# Second face of the same trap: a detail that renders text the reader already has
-# elsewhere on the page. Each test below names the surface it is duplicated from — see
-# §7 of docs/superpowers/specs/2026-08-23-the-work-order-record.md.
+# -- rendered details
 
 def test_question_asked_points_at_the_question_instead_of_reprinting_it():
-    """Only the question's own record holds it and its answer together."""
+    """Only the question's own record holds it and its answer together"""
     events = [ev("question_asked", 1.0, neo_question_id=7,
                  question="CSV or JSON for the export default?")]
     entry = build_timeline({}, events, [])[0]
@@ -204,8 +194,7 @@ def test_question_asked_points_at_the_question_instead_of_reprinting_it():
 
 
 def test_a_question_event_with_no_id_has_nothing_to_point_at():
-    """It still does not reprint the text: the conversation renders the ask from this
-    same payload, so a fallback here would print it twice on one page."""
+    """It still does not reprint the text: the conversation renders the ask from this same payload"""
     events = [ev("question_asked", 1.0, question="what was asked")]
     entry = build_timeline({}, events, [])[0]
     assert entry["ref"] is None
@@ -213,16 +202,14 @@ def test_a_question_event_with_no_id_has_nothing_to_point_at():
 
 
 def test_most_entries_point_at_nothing():
-    """`ref` is present on every entry and set on almost none: a template that reads it
-    must not have to ask whether the key is there."""
+    """`ref` is present on every entry and set on almost none: a template that reads it must not have to..."""
     entries = build_timeline({}, [ev("created", 1.0), ev("finished", 2.0, summary="s")],
                              [{"ts": 3.0, "direction": "agent_to_user", "content": "x"}])
     assert [e["ref"] for e in entries] == [None, None, None]
 
 
 def test_assumptions_are_numbered_rather_than_repeated():
-    """The page that shows this timeline lists the assumptions themselves, numbered the
-    same way — so the text here was the same paragraph twice, feet apart."""
+    """The page that shows this timeline lists the assumptions themselves, numbered the same way"""
     events = [ev("assumption", 1.0, content="assuming UTF-8 input", n=1),
               ev("assumption", 2.0, content="assuming ISO dates", n=2)]
     entries = build_timeline({}, events, [])
@@ -232,7 +219,7 @@ def test_assumptions_are_numbered_rather_than_repeated():
 
 
 def test_assumptions_written_before_they_were_numbered_are_numbered_here():
-    """Rows on disk carry no `n`; positional numbering gives the writer's answer."""
+    """Rows on disk carry no `n`; positional numbering gives the writer's answer"""
     events = [ev("assumption", 1.0, content="first"),
               ev("assumption", 2.0, content="second"),
               ev("assumption", 3.0, content="third", n=3)]
@@ -242,7 +229,7 @@ def test_assumptions_written_before_they_were_numbered_are_numbered_here():
 
 
 def test_neos_answer_is_one_line_and_says_neo_said_it():
-    """It used to be two lines, and the survivor was misattributed to the user."""
+    """It used to be two lines, and the survivor was misattributed to the user"""
     events = [ev("question_asked", 1.0, neo_question_id=7),
               ev("neo_answered", 3.0, neo_question_id=7)]
     messages = [{"id": 1, "ts": 4.0, "direction": "user_to_agent", "source": "neo",
@@ -255,7 +242,7 @@ def test_neos_answer_is_one_line_and_says_neo_said_it():
 
 
 def test_the_user_answering_still_reads_as_the_user():
-    """Only Neo's own messages are relabelled; everything else inbound is the user."""
+    """Only Neo's own messages are relabelled; everything else inbound is the user"""
     events = [ev("escalation_answered", 3.0, neo_question_id=8)]
     messages = [{"ts": 4.0, "direction": "user_to_agent", "source": "ui",
                  "content": "[Answer from the user] and gzip it"}]
@@ -264,7 +251,7 @@ def test_the_user_answering_still_reads_as_the_user():
 
 
 def test_the_bookkeeping_is_still_on_the_record_for_anyone_who_asks():
-    """Debug, not deleted — the moment Neo answered is an audit fact."""
+    """Debug, not deleted — the moment Neo answered is an audit fact"""
     events = [ev("neo_answered", 3.0, neo_question_id=7),
               ev("escalation_answered", 5.0, neo_question_id=8)]
     entries = build_timeline({}, events, [], include_debug=True)
@@ -275,8 +262,7 @@ def test_the_bookkeeping_is_still_on_the_record_for_anyone_who_asks():
 
 
 def test_answers_are_not_repeated_on_top_of_their_message():
-    """Both answer paths queue the answer as a message in the same breath, so the
-    text is already the next line — an event detail here would print it twice."""
+    """Both answer paths queue the answer as a message in the same breath"""
     events = [ev("question_asked", 1.0, neo_question_id=7),
               ev("neo_answered", 3.0, neo_question_id=7),
               ev("escalation_answered", 5.0, neo_question_id=8)]
@@ -286,15 +272,14 @@ def test_answers_are_not_repeated_on_top_of_their_message():
                  "content": "[user] and gzip it"}]
     entries = build_timeline({}, events, messages)
     assert [e["detail"] for e in entries if e["kind"] == "message"] == ["", ""]
-    # ...and the answers themselves are still on the record, once each — over there.
+    # ...and the answers themselves are still on the record, once each — over there
     assert [c["content"] for c in build_conversation(events, messages)] == [
         "[Neo] go with CSV", "[user] and gzip it"]
 
 
 def test_cli_wo_show_hides_debug_entries_by_default(jarvis_home, fake_claude,
                                                     catalog_file, capsys):
-    """`jarvis wo show` speaks the same timeline as the web UI, with --debug to
-    reveal the plumbing."""
+    """`jarvis wo show` speaks the same timeline as the web UI, with --debug to reveal the plumbing"""
     import json as _json
 
     from jarvis import cli, ops
@@ -317,11 +302,7 @@ def test_cli_wo_show_hides_debug_entries_by_default(jarvis_home, fake_claude,
 
 
 def test_a_failed_round_never_reads_as_a_rejection():
-    """The kind a reader is most likely to misread. `validation_failed` means NOTHING
-    JUDGED THE WORK — a transport outage, or no validator configured at all — and a
-    reader who takes it for a rejection goes looking for something to fix that nobody
-    asked for. Both causes are asserted, because they are two different sentences, and
-    both are asserted to differ from what a real rejection renders as."""
+    """The kind a reader is most likely to misread"""
     entries = build_timeline({}, [
         ev("validation_failed", 1.0, round=1, cause="transport", attempt=2,
            error="connection reset"),
@@ -339,15 +320,7 @@ def test_a_failed_round_never_reads_as_a_rejection():
 
 
 def test_the_four_validation_events_read_as_four_different_things():
-    """The LABELS, not the level.
-
-    `event_level` returns "signal" for any kind it does not recognise, so asserting
-    these four are signal is vacuous — it passes just as well when `_describe` has never
-    heard of them and renders the raw kind beside a JSON blob. What has to be true is
-    that a reader can tell submitted from passed from rejected from escalated, so the
-    four rendered labels are asserted distinct, and one known-debug kind is asserted in
-    the same test to prove the classifier is still discriminating at all.
-    """
+    """The LABELS, not the level"""
     events = [
         ev("validation_submitted", 1.0, round=2),
         ev("validation_passed", 2.0, reason="tests cover the change"),
@@ -372,21 +345,10 @@ def test_the_validating_status_change_has_a_human_label():
     assert entry["label"] == "Under review by the validation panel"
 
 
-# --- The conversation owns what was SAID; the timeline points at it ---------------
-#
-# §3's rule was applied to the event half of `build_timeline` and to nothing else, which
-# left the record with a hole and a duplicate:
-#
-#   * the worker's question to Neo is an EVENT, never a message, so the conversation
-#     showed Neo's answer with nothing above it to answer;
-#   * every message was merged into the timeline with its whole body, so the timeline
-#     was a second, worse copy of the conversation.
-#
-# Both are the same missing half — a home for what was said. See
-# docs/superpowers/specs/2026-08-24-the-conversation-owns-what-was-said.md.
+# --- The conversation owns what was SAID; the timeline points at it
 
 def test_the_conversation_carries_the_question_the_worker_asked():
-    """The ask and its answer are one exchange; the ask was only ever an event."""
+    """The ask and its answer are one exchange; the ask was only ever an event"""
     events = [ev("question_asked", 1.0, neo_question_id=7,
                  question="CSV or JSON for the export default?")]
     messages = [{"id": 3, "ts": 2.0, "direction": "user_to_agent", "source": "neo",
@@ -400,7 +362,7 @@ def test_the_conversation_carries_the_question_the_worker_asked():
 
 
 def test_the_conversation_is_ordered_by_when_it_was_said():
-    """Questions and messages interleave — they are turns in one exchange."""
+    """Questions and messages interleave — they are turns in one exchange"""
     events = [ev("question_asked", 3.0, neo_question_id=7, question="second"),
               ev("dispatched", 2.0, worktree="wt")]
     messages = [{"id": 1, "ts": 1.0, "direction": "user_to_agent", "source": "ui",
@@ -411,21 +373,20 @@ def test_the_conversation_is_ordered_by_when_it_was_said():
 
 
 def test_the_conversation_holds_nothing_that_was_not_said():
-    """Lifecycle events are the timeline's business, not the conversation's."""
+    """Lifecycle events are the timeline's business, not the conversation's"""
     events = [ev("created", 1.0), ev("status", 2.0, status="running"),
               ev("finished", 3.0, summary="done")]
     assert build_conversation(events, []) == []
 
 
 def test_a_question_with_no_recorded_text_is_not_a_silent_turn():
-    """`question` has been written since the event existed, but a row that lacks it
-    must not render an empty speech bubble — corollary 1 of §1."""
+    """`question` has been written since the event existed"""
     convo = build_conversation([ev("question_asked", 1.0, neo_question_id=7)], [])
     assert convo == []
 
 
 def test_every_conversation_turn_can_be_pointed_at():
-    """The timeline's whole saving depends on the anchor resolving."""
+    """The timeline's whole saving depends on the anchor resolving"""
     events = [ev("question_asked", 1.0, neo_question_id=7, question="q?")]
     messages = [{"id": 42, "ts": 2.0, "direction": "agent_to_user", "content": "a"}]
     assert [c["anchor"] for c in build_conversation(events, messages)] == [
@@ -433,7 +394,7 @@ def test_every_conversation_turn_can_be_pointed_at():
 
 
 def test_the_timeline_points_at_a_message_instead_of_reprinting_it():
-    """The conversation tab is showing the reader this exact text a click away."""
+    """The conversation tab is showing the reader this exact text a click away"""
     messages = [{"id": 528, "ts": 4.0, "direction": "user_to_agent", "source": "neo",
                  "content": "[Neo, answering for the user] A now, B filed, C rejected."}]
     entry = build_timeline({}, [], messages)[0]
@@ -443,7 +404,7 @@ def test_the_timeline_points_at_a_message_instead_of_reprinting_it():
 
 
 def test_the_timeline_says_who_spoke_without_saying_what():
-    """One label per speaker, and none of them carries the body."""
+    """One label per speaker, and none of them carries the body"""
     messages = [
         {"id": 1, "ts": 1.0, "direction": "user_to_agent", "source": "ui", "content": "a"},
         {"id": 2, "ts": 2.0, "direction": "user_to_agent", "source": "neo", "content": "b"},
@@ -461,8 +422,7 @@ def test_the_timeline_says_who_spoke_without_saying_what():
 
 
 def test_a_message_with_no_id_still_says_what_it_said():
-    """Nothing to point at, so the text is all there is — the same fallback the
-    question entry has, and for the same reason."""
+    """Nothing to point at, so the text is all there is"""
     entry = build_timeline({}, [], [{"ts": 1.0, "direction": "agent_to_user",
                                      "content": "no id here"}])[0]
     assert entry["ref"] is None
@@ -470,31 +430,20 @@ def test_a_message_with_no_id_still_says_what_it_said():
 
 
 def test_the_timeline_never_reprints_the_question_either():
-    """It has a home now: the conversation. The id-less case is not a licence to
-    print it twice, because the conversation renders it from the payload, not the id."""
+    """It has a home now: the conversation"""
     events = [ev("question_asked", 1.0, question="what was asked")]
     entry = build_timeline({}, events, [])[0]
     assert entry["detail"] == ""
     assert build_conversation(events, [])[0]["content"] == "what was asked"
 
 
-# -- the cost alarm on the order's own record ---------------------------------------
-# §4 of docs/superpowers/specs/2026-08-31-the-supervisor.md. The events are constructed
-# here rather than produced by running a supervisor: the four kinds are frozen in §1 and
-# the judge emitting three of them is a separate piece.
+# -- the cost alarm on the order's own record
 
 
 def test_the_four_alarm_events_read_as_four_different_things():
-    """The LABELS, in the shape the validation kinds forced.
-
-    `event_level` returns "signal" for any kind it has never heard of, so asserting
-    these four are signal passes just as well when `_describe` renders each as its own
-    name beside a JSON blob. What has to be true is that a reader can tell the raise
-    from the verdict from the hand-off from the advice.
-    """
+    """The LABELS, in the shape the validation kinds forced"""
     events = [
-        # Spelled out: `ev`'s first parameter is the event kind and this payload has a
-        # `kind` of its own — inspection's, the threshold that fired.
+        # Spelled out: `ev`'s first parameter is the event kind and this payload has a `kind` of its own
         {"ts": 1.0, "kind": "cost_alarm",
          "payload": {"kind": "turn_minutes", "seq": 3, "alarm_id": "al-1a2b",
                      "reason": "turn has been running 94 minutes"}},
@@ -511,17 +460,14 @@ def test_the_four_alarm_events_read_as_four_different_things():
     assert len(set(labels)) == 4, labels
     assert all(label and label != entries[i]["kind"]
                for i, label in enumerate(labels)), labels
-    # The verdict's reason is the record's, and nothing else on either surface has it.
+    # The verdict's reason is the record's, and nothing else on either surface has it
     assert entries[1]["detail"] == "a long test run, not a stuck turn"
     assert entries[2]["detail"] == "question #12"
     assert event_level("message_delivered") == "debug"
 
 
 def test_the_renderer_knows_exactly_the_kinds_the_store_freezes():
-    """`timeline` is a leaf and must not import a store, so the four kinds are spelled
-    out in both places. This is the only thing stopping the copies drifting — a fifth
-    kind added to the store and not here gets no ref and no label, and `event_level`
-    calls it signal, so it renders as a bare name beside a JSON blob and looks fine."""
+    """`timeline` is a leaf and must not import a store, so the four kinds are spelled out in both places"""
     from jarvis.project_store import ALARM_EVENT_KINDS
     from jarvis.timeline import ALARM_KINDS
 
@@ -529,8 +475,7 @@ def test_the_renderer_knows_exactly_the_kinds_the_store_freezes():
 
 
 def test_a_verdict_reads_as_what_it_decided():
-    """`alarm_reviewed` carries both verdicts, and "cleared" on an escalation would be
-    the one falsehood this line is able to tell."""
+    """`alarm_reviewed` carries both verdicts"""
     acked, escalated = (build_timeline({}, [ev("alarm_reviewed", 1.0, alarm_id="al-1",
                                                verdict=v, reason=v)], [])[0]
                         for v in ("ack", "escalate"))
@@ -539,9 +484,7 @@ def test_a_verdict_reads_as_what_it_decided():
 
 
 def test_every_alarm_event_points_at_the_alarm():
-    """One `al-` id reaches every surface that knows about that alarm, so all four kinds
-    spend their one pointer on it — the two carrying a Neo question id included, whose
-    deliberation the alarm's own page quotes anyway."""
+    """One `al-` id reaches every surface that knows about that alarm"""
     for kind in ("cost_alarm", "alarm_reviewed", "alarm_escalated", "alarm_advice"):
         entry = build_timeline({}, [ev(kind, 1.0, alarm_id="al-1a2b",
                                        neo_question_id=12)], [])[0]
@@ -550,8 +493,7 @@ def test_every_alarm_event_points_at_the_alarm():
 
 
 def test_an_alarm_raised_before_the_table_existed_has_nothing_to_point_at():
-    """`cost_alarm` events predating §1 carry no `alarm_id`, and the backfill gives
-    those rows ids the EVENT never learns. A ref that cannot resolve is not a pointer."""
+    """`cost_alarm` events predating §1 carry no `alarm_id`"""
     entry = build_timeline({}, [{"ts": 1.0, "kind": "cost_alarm",
                                  "payload": {"kind": "turn_minutes", "seq": 1,
                                              "reason": "94 minutes"}}], [])[0]
@@ -560,9 +502,7 @@ def test_an_alarm_raised_before_the_table_existed_has_nothing_to_point_at():
 
 
 def test_the_conversation_carries_the_note_and_the_advice_and_no_verdict():
-    """What was SAID about the alarm: a note addressed to the user, and the advice
-    behind it. The raise, the verdict and the hand-off are events — they happened,
-    nobody said them — and tuple equality is what catches one leaking in here."""
+    """What was SAID about the alarm: a note addressed to the user, and the advice behind it"""
     events = [
         ev("cost_alarm", 1.0, alarm_id="al-1a2b", reason="94 minutes"),
         ev("alarm_escalated", 2.0, alarm_id="al-1a2b", neo_question_id=12),
@@ -583,8 +523,7 @@ def test_the_conversation_carries_the_note_and_the_advice_and_no_verdict():
 
 
 def test_the_timeline_never_reprints_the_note_or_the_advice():
-    """Both have a home in the conversation, rendered from these same payloads, so a
-    fallback detail here would print each twice on one page."""
+    """Both have a home in the conversation"""
     events = [ev("alarm_reviewed", 1.0, alarm_id="al-1", verdict="ack", reason="fine",
                  note="it is re-running the suite"),
               ev("alarm_advice", 2.0, alarm_id="al-1", answer="let it finish")]
@@ -594,18 +533,14 @@ def test_the_timeline_never_reprints_the_note_or_the_advice():
 
 
 def test_an_escalation_is_not_an_empty_speech_bubble():
-    """`note` is empty by contract when the supervisor escalates (§2), so the verdict
-    that reached no words must not open a bubble saying nothing."""
+    """`note` is empty by contract when the supervisor escalates (§2)"""
     assert build_conversation([ev("alarm_reviewed", 1.0, alarm_id="al-1",
                                   verdict="escalate", reason="cannot tell",
                                   note="")], []) == []
 
 
 def test_every_alarm_status_has_a_reading_a_person_can_use():
-    """All eight, because the supervisor ships OFF and `raised` is therefore the common
-    case — an example built from `acked` alone would grade the interesting one only.
-    The ids are asserted too: they are what makes the line reachable rather than a
-    count of things the reader cannot open."""
+    """All eight, because the supervisor ships OFF and `raised` is therefore the common case"""
     from jarvis.ops import ALARM_STANDING, alarm_standing_line
     from jarvis.project_store import ALARM_STATUSES
 
@@ -619,15 +554,14 @@ def test_every_alarm_status_has_a_reading_a_person_can_use():
     assert alarm_standing_line([{"id": "al-1a2b", "status": "acked"},
                                 {"id": "al-3c4d", "status": "escalated"}]) == (
         "2 (1 acked by the supervisor, 1 escalated to Neo) — al-1a2b, al-3c4d")
-    # The supervisor off, which is every fleet today.
+    # The supervisor off, which is every fleet today
     assert alarm_standing_line([{"id": "al-1a2b", "status": "raised"}]) == (
         "1 (1 raised) — al-1a2b")
 
 
 def test_cli_wo_show_says_where_the_alarms_stand(jarvis_home, fake_claude,
                                                  catalog_file, capsys):
-    """The header line, and the rows behind it. An order with no alarm keeps the
-    document it had before the supervisor existed — which is most of them."""
+    """The header line, and the rows behind it"""
     import json as _json
 
     from jarvis import cli, ops
@@ -656,28 +590,18 @@ def test_cli_wo_show_says_where_the_alarms_stand(jarvis_home, fake_claude,
 
     cli.main(["wo", "show", wo["id"], "--json"])
     rows = _json.loads(capsys.readouterr().out)["alarms"]
-    # The `wo_alarms` rows in full, not `ops.list_cost_alarms`' fleet-wide dict: this is
-    # one order's own record and that dict's join columns are already on the document.
+    # The `wo_alarms` rows in full, not `ops.list_cost_alarms`' fleet-wide dict: this is one order's own...
     assert [r["id"] for r in rows] == [acked["id"], escalated["id"]]
     assert rows[0]["note"] == "it is re-running the suite"
     assert rows[0]["seq"] == 3 and rows[0]["kind"] == "turn_minutes"
     assert "title" not in rows[0] and "alarm_status" not in rows[0]
 
 
-# -- auto-review's four ----------------------------------------------------------------
-#
-# docs/superpowers/specs/2026-09-15-neo-decides-an-assumption.md §4. `ops.autoreview_state`
-# renders the NEWEST of these as one summary line, which is the right thing for the header
-# and not a substitute for the timeline: an order where the OS decided two assumptions and
-# left a third has the other two readable nowhere else.
+# -- auto-review's four
 
 
 def test_the_four_auto_review_events_read_as_four_different_things():
-    """Same trap the alarm kinds and the validation kinds paid for: `event_level` calls
-    an unknown kind "signal", so a kind with NO branch in `_describe` renders as its own
-    name beside a JSON blob and looks fine on the page. Asserting they are signal is
-    therefore vacuous — what has to be true is that a reader can tell the ask from the
-    acceptance from the escalation from the hold."""
+    """Same trap the alarm kinds and the validation kinds paid for: `event_level` calls an unknown kind..."""
     events = [
         ev("autoreview_asked", 1.0, assumption_id=1, n=1, neo_question_id=41),
         ev("autoreview_accepted", 2.0, assumption_id=1, n=1, decided_by="neo",
@@ -698,9 +622,7 @@ def test_the_four_auto_review_events_read_as_four_different_things():
 
 
 def test_an_accepted_assumption_says_the_os_decided_it_and_names_the_model():
-    """THE RECORD POST-CONDITION, on the surface that narrates the order. A label saying
-    only "Assumption #1 accepted" would sit beside `reviewed`'s "Assumptions accepted" —
-    the USER's row — and nothing on the page would tell them apart."""
+    """THE RECORD POST-CONDITION, on the surface that narrates the order"""
     entries = build_timeline({}, [
         ev("autoreview_accepted", 1.0, assumption_id=1, n=1, decided_by="neo",
            model="claude-opus-5", reason="a naming convention, not a decision"),
@@ -713,8 +635,7 @@ def test_an_accepted_assumption_says_the_os_decided_it_and_names_the_model():
 
 
 def test_a_model_the_record_does_not_have_is_said_so_on_the_timeline_too():
-    """`ops.assumption_decider`'s words, because a row rendered "(Neo, )" reads as a
-    rendering bug and invites the reader to discount the attribution with it."""
+    """`ops.assumption_decider`'s words"""
     entries = build_timeline({}, [
         ev("autoreview_accepted", 1.0, assumption_id=1, n=1, decided_by="neo",
            reason="unchanged behaviour"),
@@ -724,11 +645,7 @@ def test_a_model_the_record_does_not_have_is_said_so_on_the_timeline_too():
 
 
 def test_an_escalated_round_is_labelled_by_its_family_and_never_gave_up():
-    """Spec 2026-10-14-an-escalated-round-says-why-and-what-to-run-next §1: all three
-    `handover` causes are a REJECTION handed over and "gave up" read as the opposite,
-    while the three `not_reviewed` ones are the inverse — nothing was rejected, so the
-    handover wording claimed a decision nobody made. A legacy payload with no `cause`
-    field promises nothing."""
+    """Spec 2026-10-14-an-escalated-round-says-why-and-what-to-run-next §1: all three `handover` causes..."""
     from jarvis import ops
     from jarvis.timeline import _describe
 
@@ -752,9 +669,7 @@ def test_an_escalated_round_is_labelled_by_its_family_and_never_gave_up():
 
 
 def test_the_timelines_families_are_the_os_s_own_and_its_verbs_too():
-    """`timeline` imports nothing from `jarvis`, so the literals it holds are pinned
-    here: a cause added to `ops.ESCALATION_FAMILY` without a label would otherwise read
-    as the legacy sentence in production."""
+    """`timeline` imports nothing from `jarvis`"""
     from jarvis import ops
     from jarvis.timeline import (ESCALATION_HANDOVER, ESCALATION_NOT_REVIEWED,
                                  ESCALATION_UNJUDGED, _describe)
@@ -772,9 +687,7 @@ def test_the_timelines_families_are_the_os_s_own_and_its_verbs_too():
 
 
 def test_a_dropped_ruling_is_not_narrated_as_neo_declining():
-    """Spec §5.1's escalation carries `dropped` when the OS HAD a ruling and threw it
-    away because the state moved under it. "Left with you" alone would read as Neo
-    declining, and a reader deciding whether to trust the feature needs the two apart."""
+    """Spec §5.1's escalation carries `dropped` when the OS HAD a ruling and threw it away because the..."""
     plain, dropped = build_timeline({}, [
         ev("autoreview_escalated", 1.0, assumption_id=1, n=1,
            reason="Neo would have turned this down"),
@@ -788,9 +701,7 @@ def test_a_dropped_ruling_is_not_narrated_as_neo_declining():
 
 
 def test_an_auto_review_event_with_no_reason_still_says_something():
-    """Every one of these rows exists to carry a WHY, so an empty payload is the one
-    shape that must not render a blank cell — it would read as "no reason" rather than
-    as a record that lost one."""
+    """Every one of these rows exists to carry a WHY"""
     entries = build_timeline({}, [
         ev("autoreview_accepted", 1.0, n=1),
         ev("autoreview_escalated", 2.0, n=2),
@@ -801,10 +712,7 @@ def test_an_auto_review_event_with_no_reason_still_says_something():
 
 
 def test_a_carried_verdict_and_a_refused_carry_both_render_and_name_the_proof():
-    """docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §4, Neo's
-    second condition: a round the OS did NOT spend must be auditable from `jarvis wo show`
-    alone, and a refusal has to say which of the two proofs failed — "someone resolved a
-    conflict" and "the daemon could not reach GitHub" are different news."""
+    """docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §4"""
     carried, refused = build_timeline({}, [
         ev("validation_head_carried", 1.0, cause="base_merge_chain", round=1,
            judged_sha="709582ae53000000", carried_head_sha="c2120424ba000000",
@@ -821,13 +729,11 @@ def test_a_carried_verdict_and_a_refused_carry_both_render_and_name_the_proof():
     assert "c2120424ba" in refused["detail"] and "resolved content" in refused["detail"]
 
 
-# -- a rebind: the round the OS's own merge costs nobody -------------------------------
-# spec docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.5
+# -- a rebind: the round the OS's own merge costs nobody
 
 
 def test_the_two_rejudge_declines_are_told_apart_by_their_cause():
-    """One decline says the round budget is spent and offers `validation.max_rounds`;
-    the other is about a bound that never reads it. Same label, different news."""
+    """One decline says the round budget is spent and offers `validation.max_rounds`"""
     from jarvis import ops
     from jarvis.timeline import _describe
 
@@ -862,13 +768,11 @@ def test_a_rebind_reads_as_a_round_nobody_was_charged_for():
     assert "does not count against validation.max_rounds" in detail
 
 
-# -- a rework the USER asked for: the second uncounted cause ---------------------------
-# Neo question 973, live case wo-299daf2e.
+# -- a rework the USER asked for: the second uncounted cause
 
 
 def test_a_user_rework_round_reads_as_the_rework_the_user_asked_for():
-    """Not a rebind: nobody merged anything, so a line about a conflict resolution
-    would misdescribe the record — and no round was spent either way."""
+    """Not a rebind: nobody merged anything"""
     from jarvis import ops
     from jarvis.timeline import _describe
 
@@ -900,8 +804,7 @@ def test_a_rejected_user_rework_round_says_no_round_was_spent():
 
 
 def test_an_old_forced_row_with_no_cause_still_reads_as_a_rebind():
-    """No surface may print a wrong sentence for a row written before the cause
-    existed: `rebind: true` and no `cause` is a rebind."""
+    """No surface may print a wrong sentence for a row written before the cause existed: `rebind: true`..."""
     from jarvis import ops
     from jarvis.timeline import _describe
 
@@ -913,10 +816,7 @@ def test_an_old_forced_row_with_no_cause_still_reads_as_a_rebind():
 
 
 def test_a_retry_says_who_asked_for_it_and_whether_they_said_anything():
-    """§8 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md, and kn-3f133363:
-    an unlabelled kind renders as a bare kind plus a JSON blob while `event_level` calls
-    it signal. THE VERB SAYS WHO — this event is only ever written by a user-facing
-    surface and must never read afterwards as something the OS decided."""
+    """§8 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md"""
     entries = build_timeline({}, [ev("retry_requested", 1.0, msg_id=4, authored=True),
                                   ev("retry_requested", 2.0, msg_id=5, authored=False)],
                              [])
@@ -929,8 +829,7 @@ def test_a_retry_says_who_asked_for_it_and_whether_they_said_anything():
 
 
 def test_turn_harvested_is_signal():
-    """What the OS read off disk when a turn died is the story, not the plumbing —
-    docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md §5."""
+    """What the OS read off disk when a turn died is the story, not the plumbing (docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md §5.)"""
     from jarvis.timeline import TURN_HARVESTED
 
     assert event_level(TURN_HARVESTED) == "signal"

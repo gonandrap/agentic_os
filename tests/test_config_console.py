@@ -1,9 +1,4 @@
-"""The config console's write path: `jarvis config` and the `ops` functions behind it.
-
-docs/superpowers/specs/2026-08-27-the-config-console.md §3, §7, §8. The ledger's own
-arithmetic (canonical form, ids, `resolve`) is proved in `tests/test_config_version.py`;
-what is proved here is the WRITE — its order, what it refuses, and who may perform it.
-"""
+"""The config console's write path: `jarvis config` and the `ops` functions behind it (docs/superpowers/specs/2026-08-27-the-config-console.md §3)"""
 
 from __future__ import annotations
 
@@ -19,8 +14,7 @@ from jarvis.central_store import CentralStore
 DOCUMENT = {
     "os": {"defaults": {"model": "opus"}},
     "projects": [
-        # Distinct paths: OS identity is per `origin` per path (issue 956), and two
-        # projects on one path are two candidates and so no OS at all.
+        # Distinct paths: OS identity is per `origin` per path (issue 956)
         {"name": "proj_a", "path": "/tmp", "description": "one"},
         {"name": "proj_b", "path": "/var/tmp", "description": "two"},
     ],
@@ -29,16 +23,13 @@ DOCUMENT = {
 
 @pytest.fixture(autouse=True)
 def not_a_worker(monkeypatch):
-    """The suite is routinely run BY a worker, which inherits `JARVIS_WO_ID` — and the
-    lockout under test reads exactly that. The isolation gate cannot scrub it globally:
-    `testing._bills_real_tokens` needs it to attribute a real-model eval's spend.
-    """
+    """The suite is routinely run BY a worker, which inherits `JARVIS_WO_ID`"""
     monkeypatch.delenv("JARVIS_WO_ID", raising=False)
 
 
 @pytest.fixture()
 def catalog(tmp_path) -> Path:
-    """A registered catalog, the way `jarvis start` leaves one."""
+    """A registered catalog, the way `jarvis start` leaves one"""
     path = tmp_path / "catalog.json"
     path.write_text(json.dumps(DOCUMENT, indent=4))  # deliberately NOT canonical
     store = CentralStore()
@@ -69,14 +60,13 @@ def document_of(path: Path) -> dict:
     return json.loads(path.read_text())
 
 
-# --- the write path: validate, rewrite the file, record the row ----------------------
+# --- the write path: validate, rewrite the file, record the row
 
 def test_a_set_rewrites_the_file_canonically_and_records_the_version(catalog):
     res = ops.set_config("os.ui.port", 9001)
 
     assert document_of(catalog)["os"]["ui"]["port"] == 9001
-    # The file is rewritten FROM the canonical document, which is what makes the stored
-    # id address the bytes on disk — a hand-indented catalog is reflowed (§3).
+    # The file is rewritten FROM the canonical document
     assert catalog.read_text() == cv.canonicalise(document_of(catalog)) + "\n"
     assert head()["id"] == res["version"]["id"] == cv.version_id(document_of(catalog))
     assert res["version"]["actor"] == "user"
@@ -85,8 +75,7 @@ def test_a_set_rewrites_the_file_canonically_and_records_the_version(catalog):
 
 
 def test_a_document_that_would_not_parse_is_refused_before_the_file_is_touched(catalog):
-    """Validate → write → record, in that order (§3). Getting this backwards leaves a
-    catalog the daemon cannot load, which is every project in the fleet, not one."""
+    """Validate → write → record, in that order (§3)"""
     before = catalog.read_text()
 
     with pytest.raises(ops.OpsError, match="permission_mode"):
@@ -97,9 +86,7 @@ def test_a_document_that_would_not_parse_is_refused_before_the_file_is_touched(c
 
 
 def test_the_temp_file_is_a_sibling_of_the_catalog(catalog, monkeypatch):
-    """`os.replace` is atomic within one filesystem and RAISES across two, so a temp
-    file under /tmp turns the rename into a failure on any machine whose $JARVIS_HOME
-    is a separate mount."""
+    """`os.replace` is atomic within one filesystem and RAISES across two"""
     seen: list[tuple[Path, Path]] = []
     real = os.replace
 
@@ -125,11 +112,10 @@ def test_an_edit_that_changes_nothing_writes_no_new_version(catalog):
     store.close()
 
 
-# --- the key space: the project positional SCOPES the path (Neo, q175) ---------------
+# --- the key space: the project positional SCOPES the path (Neo, q175)
 
 def test_the_project_positional_scopes_the_path(catalog):
-    """§10.3's acceptance sentence. The path is relative to the project, and it lands
-    in that project's entry — the key space is flat, the document is not."""
+    """§10.3's acceptance sentence"""
     res = ops.set_config("validation.enabled", True, project="proj_a", reason="trying it")
 
     assert res["path"] == "projects.proj_a.validation.enabled"
@@ -145,8 +131,7 @@ def test_an_absolute_path_is_accepted_beside_the_project_it_names(catalog):
 
 @pytest.mark.parametrize("path", ["os.ui.port", "projects.proj_b.max_concurrent"])
 def test_a_path_that_disagrees_with_the_project_positional_is_refused(catalog, path):
-    """The half that matters: without it, `set proj_a projects.proj_b.…` silently edits
-    a project the user did not name."""
+    """The half that matters: without it"""
     with pytest.raises(ops.OpsError, match="not a path under project 'proj_a'"):
         ops.set_config(path, 1, project="proj_a", reason="x")
     assert no_head()
@@ -162,12 +147,11 @@ def test_an_unknown_project_is_named_with_the_ones_that_exist(catalog):
         ops.set_config("max_concurrent", 2, project="nope")
 
 
-# --- --reason, mandatory on the safety keys and only there ---------------------------
+# --- --reason, mandatory on the safety keys and only there
 
 @pytest.mark.parametrize("project,path,value", [
     (None, "os.validation.enabled", True),
-    # `False`, not `True`: `os.neo.enabled` ships ON, and a set to the value already in
-    # force is the write this refusal must NOT catch.
+    # `False`, not `True`: `os.neo.enabled` ships ON
     (None, "os.neo.enabled", False),
     ("proj_a", "worker.permission_mode", "acceptEdits"),
     ("proj_a", "gates.enabled", ["pr_merge"]),
@@ -190,8 +174,7 @@ def test_a_money_setting_needs_no_reason(catalog):
 
 
 def test_a_no_op_write_of_a_safety_setting_needs_no_reason(catalog):
-    """The premise of the refusal — "it goes on the version row" — is false here: the
-    document already says this, so `add_config_version` dedupes and there is no row."""
+    """The premise of the refusal — "it goes on the version row\""""
     ops.set_config("validation.enabled", True, project="proj_a", reason="trying it")
 
     again = ops.set_config("validation.enabled", True, project="proj_a")
@@ -203,9 +186,7 @@ def test_a_no_op_write_of_a_safety_setting_needs_no_reason(catalog):
 
 
 def test_pinning_a_safety_setting_at_its_default_needs_no_reason(catalog):
-    """Writing `false` where `false` was already in force moves the PROVENANCE, not the
-    permission: the file now says what the default said. Nothing a worker may do moves,
-    so there is nothing to justify."""
+    """Writing `false` where `false` was already in force moves the PROVENANCE"""
     res = ops.set_config("validation.enabled", False, project="proj_a")
 
     assert res["change"]["kind"] == "pinned"
@@ -215,8 +196,7 @@ def test_pinning_a_safety_setting_at_its_default_needs_no_reason(catalog):
 
 
 def test_a_document_only_write_is_never_reported_as_a_value_change(catalog):
-    """`~ …validation.enabled: false → false` claims a safety setting was changed when
-    only its provenance moved. Both surfaces render the honest kind."""
+    """`~ …validation.enabled: false → false` claims a safety setting was changed when only its provenance..."""
     res = ops.set_config("validation.enabled", False, project="proj_a")
 
     assert "→" not in cli._cfg_change(res["change"])
@@ -224,8 +204,7 @@ def test_a_document_only_write_is_never_reported_as_a_value_change(catalog):
 
 
 def test_an_unset_that_leaves_the_effective_value_alone_needs_no_reason(catalog):
-    """The same rule at the other end (§7): clearing a key whose written value equals
-    its default changes nothing either."""
+    """The same rule at the other end (§7): clearing a key whose written value equals its default changes..."""
     ops.set_config("validation.enabled", False, project="proj_a")
 
     res = ops.unset_config("validation.enabled", project="proj_a")
@@ -237,8 +216,7 @@ def test_an_unset_that_leaves_the_effective_value_alone_needs_no_reason(catalog)
 
 
 def test_a_real_safety_change_still_refuses_and_names_the_retry(catalog):
-    """The gate is not weakened, and the refusal now says the whole command to type
-    rather than only the flag it wants."""
+    """The gate is not weakened, and the refusal now says the whole command to type rather than only the..."""
     with pytest.raises(ops.OpsError) as e:
         ops.set_config("validation.enabled", True, project="proj_a")
 
@@ -256,9 +234,7 @@ def test_an_unset_that_moves_the_effective_value_still_demands_a_reason(catalog)
 
 
 def test_adopt_never_demands_a_reason_because_it_changes_nothing(catalog):
-    """Every other write path refuses a safety change without one. `adopt` cannot: the
-    edit already happened on disk and the fleet is already running it, so refusing would
-    leave the record behind the file — the drift this command exists to close."""
+    """Every other write path refuses a safety change without one"""
     catalog.write_text(json.dumps({**DOCUMENT, "os": {"validation": {"enabled": True}}}))
 
     res = ops.adopt_config()
@@ -266,7 +242,7 @@ def test_adopt_never_demands_a_reason_because_it_changes_nothing(catalog):
     assert [c["path"] for c in res["changes"] if c["path"].endswith("validation.enabled")]
 
 
-# --- the worker lockout (§7): the layer that actually stops one ----------------------
+# --- the worker lockout (§7): the layer that actually stops one
 
 @pytest.mark.parametrize("call", [
     lambda: ops.set_config("os.ui.port", 9001),
@@ -275,9 +251,7 @@ def test_adopt_never_demands_a_reason_because_it_changes_nothing(catalog):
     lambda: ops.adopt_config(),
 ])
 def test_a_worker_session_may_not_write_configuration(catalog, monkeypatch, call):
-    """`ProjectSpec.gates` is empty by default and `hooks.preflight_decision` allows any
-    `jarvis` command chain, so on an ungated project the `config_write` gate protects
-    nobody. This refusal is what does."""
+    """`ProjectSpec.gates` is empty by default and `hooks.preflight_decision` allows any `jarvis` command..."""
     monkeypatch.setenv("JARVIS_WO_ID", "wo-deadbeef")
     before = catalog.read_text()
 
@@ -289,15 +263,14 @@ def test_a_worker_session_may_not_write_configuration(catalog, monkeypatch, call
 
 
 def test_reading_configuration_is_not_blocked_for_a_worker(catalog, monkeypatch):
-    """The lockout is on the WRITE path only — a worker that cannot read what it is
-    running under has been given a different problem."""
+    """The lockout is on the WRITE path only"""
     monkeypatch.setenv("JARVIS_WO_ID", "wo-deadbeef")
     assert ops.config_get("os.defaults.model")["value"] == "opus"
     assert ops.config_show()["resolved"]["os.ui.port"] == 8787
     assert ops.config_history() == []
 
 
-# --- the apply class the user is told about (§4.2) -----------------------------------
+# --- the apply class the user is told about (§4.2)
 
 @pytest.mark.parametrize("path,cls", [
     ("os.validation.enabled", "hot"),
@@ -311,13 +284,10 @@ def test_reading_configuration_is_not_blocked_for_a_worker(catalog, monkeypatch)
     ("os.ui.port", "restart"),
     ("projects.p.path", "restart"),
     ("projects.p.settings_overrides.hooks", "restart"),
-    # No APPLY_RULES entry, and `hot` is correct: nothing is baked into a worker's
-    # settings file, the value is read when the report runs (§2.3 of
-    # docs/superpowers/specs/2026-10-02-subagent-cache-anatomy-and-the-navigation-split.md).
+    # No APPLY_RULES entry, and `hot` is correct: nothing is baked into a worker's settings file (docs/superpowers/specs/2026-10-02-subagent-cache-anatomy-and-the-navigation-split.md)
     ("projects.x.navigation.bash_commands", "hot"),
     ("os.navigation.window_days", "hot"),
-    # Re-resolved per probe round and per daemon tick, so no restart is needed (§6 of
-    # docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md).
+    # Re-resolved per probe round and per daemon tick (docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md)
     ("os.ui_health.probe_interval_seconds", "hot"),
     ("projects.p.ui_health.trip_threshold", "hot"),
 ])
@@ -326,8 +296,7 @@ def test_every_class_in_the_design_table(path, cls):
 
 
 def test_a_ui_health_key_can_be_set_fleet_wide_and_per_project(catalog):
-    """Every new key must reach the console and the file: a threshold nobody can change
-    without a release is the thing §6 exists to prevent."""
+    """Every new key must reach the console and the file: a threshold nobody can change without a release..."""
     fleet = ops.set_config("os.ui_health.trip_threshold", 5)
     mine = ops.set_config("ui_health.probe_interval_seconds", 30, project="proj_a")
 
@@ -335,8 +304,7 @@ def test_a_ui_health_key_can_be_set_fleet_wide_and_per_project(catalog):
     assert mine["path"] == "projects.proj_a.ui_health.probe_interval_seconds"
     assert fleet["apply"] == mine["apply"] == "hot"
     assert ops.config_show()["resolved"]["os.ui_health.trip_threshold"] == 5
-    # Field-level inheritance, through the console: the project's own key is set and the
-    # fleet's answer is still the one it reads for the rest.
+    # Field-level inheritance, through the console: the project's own key is set and the fleet's answer...
     assert ops.config_show()[
         "resolved"]["projects.proj_a.ui_health.trip_threshold"] == 5
 
@@ -349,7 +317,7 @@ def test_settings_overrides_says_why_it_is_inert_rather_than_accepting_it_silent
     assert "bootstrap_project" in res["note"] and "jarvis start" in res["note"]
 
 
-# --- unset ---------------------------------------------------------------------------
+# --- unset
 
 def test_unset_drops_the_key_and_reports_the_default_it_falls_back_to(catalog):
     ops.set_config("os.defaults.model", "sonnet")
@@ -366,7 +334,7 @@ def test_unsetting_a_key_the_file_never_set_says_so(catalog):
         ops.unset_config("os.ui.port")
 
 
-# --- get and show --------------------------------------------------------------------
+# --- get and show
 
 def test_get_distinguishes_a_written_setting_from_a_default(catalog):
     assert ops.config_get("os.defaults.model")["written"] is True
@@ -383,8 +351,7 @@ def test_show_scopes_to_one_project_plus_the_fleet_settings_it_runs_under(catalo
 
 
 def test_show_says_which_paths_the_document_sets_and_which_are_defaults(catalog):
-    """`config_get`'s "set in the catalog" answer, for every key at once — the half of
-    provenance the /config page cannot get from the ledger (§8, Neo q180)."""
+    """`config_get`'s "set in the catalog" answer, for every key at once"""
     written = ops.config_show()["written"]
 
     assert "os.defaults.model" in written
@@ -392,8 +359,7 @@ def test_show_says_which_paths_the_document_sets_and_which_are_defaults(catalog)
 
 
 def test_show_of_a_version_reads_its_own_document_not_the_file(catalog):
-    """A stored version's provenance is the document that was stored with it: the file
-    has moved on, and reading it here would date-stamp an old version with new facts."""
+    """A stored version's provenance is the document that was stored with it: the file has moved on"""
     row = ops.set_config("os.ui.port", 9999)["version"]
     ops.unset_config("os.ui.port")
 
@@ -402,7 +368,7 @@ def test_show_of_a_version_reads_its_own_document_not_the_file(catalog):
 
 
 def test_show_flags_a_file_the_ledger_has_never_seen(catalog):
-    """The drift the invariant will report, visible in the command that reads config."""
+    """The drift the invariant will report, visible in the command that reads config"""
     before = ops.config_show()
     assert before["drift"] is True and before["version"] is None
 
@@ -410,7 +376,7 @@ def test_show_flags_a_file_the_ledger_has_never_seen(catalog):
     assert ops.config_show()["drift"] is False
 
 
-# --- adopt ---------------------------------------------------------------------------
+# --- adopt
 
 def test_adopt_records_a_hand_edited_file_once(catalog):
     first = ops.adopt_config()
@@ -435,7 +401,7 @@ def test_adopt_records_what_the_hand_edit_changed(catalog):
     assert paths["os.defaults.model"]["new"] == "sonnet"
 
 
-# --- history and diff ----------------------------------------------------------------
+# --- history and diff
 
 def test_history_is_newest_first_and_marks_the_applied_version(catalog):
     ops.set_config("os.ui.port", 9001)
@@ -447,9 +413,7 @@ def test_history_is_newest_first_and_marks_the_applied_version(catalog):
 
 
 def test_a_project_filter_keeps_fleet_wide_versions_and_drops_other_projects(catalog):
-    """An `os.` change reaches every project's effective config — project settings
-    resolve against `os.defaults` at parse time — so the filter only drops versions that
-    touch nothing but somebody else."""
+    """An `os.` change reaches every project's effective config"""
     fleet = ops.set_config("os.defaults.model", "sonnet")
     mine = ops.set_config("max_concurrent", 3, project="proj_a")
     theirs = ops.set_config("max_concurrent", 7, project="proj_b")
@@ -473,12 +437,10 @@ def test_an_ambiguous_or_unknown_version_id_says_which(catalog):
         ops.config_diff("cfg-nope", "cfg-nope")
 
 
-# --- restore -------------------------------------------------------------------------
+# --- restore
 
 def test_restore_puts_the_document_back_and_makes_it_the_head(catalog):
-    """The property that makes `restore` a REMEDY for drift rather than a cause of it
-    (§3): ids are content-addressed, so restoring writes no row — the head must move to
-    the restored id, or the record permanently names a document nobody is running."""
+    """The property that makes `restore` a REMEDY for drift rather than a cause of it (§3): ids are..."""
     first = ops.set_config("os.ui.port", 9001)["version"]["id"]
     ops.set_config("os.ui.port", 9002)
 
@@ -504,7 +466,7 @@ def test_restore_needs_a_reason_when_it_moves_a_safety_setting(catalog):
     assert res["classes"] == ["hot"]
 
 
-# --- values --------------------------------------------------------------------------
+# --- values
 
 @pytest.mark.parametrize("text,value", [
     ("true", True), ("false", False), ("3", 3), ("null", None),
@@ -514,7 +476,7 @@ def test_a_value_is_json_when_it_parses_as_json_and_a_string_otherwise(text, val
     assert ops.parse_config_value(text) == value
 
 
-# --- the gate: a worker's attempt is recognised, and can never be exempted -----------
+# --- the gate: a worker's attempt is recognised, and can never be exempted
 
 def test_every_config_write_verb_is_recognised_as_a_privileged_action():
     ruleset = gate_rules.RuleSet.from_seeds()
@@ -523,23 +485,20 @@ def test_every_config_write_verb_is_recognised_as_a_privileged_action():
         match = ruleset.decide(f"jarvis config {verb} os.validation.enabled false",
                                kinds).match
         assert match is not None and match.kind == "config_write", verb
-    # The read commands must NOT gate: a recogniser broad enough to catch them spends a
-    # Neo review every time a worker looks at what it is running under.
+    # The read commands must NOT gate: a recogniser broad enough to catch them spends a Neo review every...
     assert ruleset.decide("jarvis config show proj_a", kinds).match is None
     assert ruleset.decide("jarvis config history --json", kinds).match is None
 
 
 def test_the_config_write_canaries_can_never_be_learned_away():
-    """The recursion the canary cuts (§7): the console can turn gates off, so the
-    command that turns them off must never acquire a learned exemption."""
+    """The recursion the canary cuts (§7): the console can turn gates off"""
     ruleset = gate_rules.RuleSet.from_seeds()
     assert ruleset.check_canaries() == []
     assert [c for k, c in gate_rules.SEED_CANARIES if k == "config_write"]
 
 
 def test_the_new_builtin_reaches_a_database_seeded_by_an_earlier_release():
-    """`_seed_gate_rules` returns early on a matching version key, so a kind added
-    without bumping `SEED_VERSION` never reaches a live os.db (§7)."""
+    """`_seed_gate_rules` returns early on a matching version key"""
     assert gate_rules.SEED_VERSION != "1"
 
     store = CentralStore()
@@ -555,19 +514,16 @@ def test_the_new_builtin_reaches_a_database_seeded_by_an_earlier_release():
     assert "config_write" in kinds
 
 
-# --- the CLI -------------------------------------------------------------------------
+# --- the CLI
 
 def test_the_acceptance_sentence_runs_end_to_end(catalog, capsys):
-    """§10.3, minus the daemon half the reload work order owns: the sentence the user
-    actually asked for, typed the way they would type it."""
+    """§10.3, minus the daemon half the reload work order owns: the sentence the user actually asked for"""
     rc = cli.main(["config", "set", "proj_a", "validation.enabled", "true",
                    "--reason", "trying it"])
     out = capsys.readouterr().out
 
     assert rc == 0
-    # `false → true` rather than `+ … = true`: the old value is read off the RESOLVED
-    # map, which yields `projects.<name>.validation.*` now that `ProjectSpec.validation`
-    # exists — `resolve()` walks the dataclasses, so it needed no edit here (kn-fdd57936).
+    # `false → true` rather than `+ … = true`: the old value is read off the RESOLVED map
     assert "~ projects.proj_a.validation.enabled: false → true" in out
     assert "SAFETY SETTING" in out
     assert "hot — in force on the daemon's next tick" in out
@@ -612,21 +568,11 @@ def test_an_unregistered_catalog_says_how_to_name_one(tmp_path, capsys):
     assert '"opus"' in capsys.readouterr().out
 
 
-# --- the OS's own health sweep may not be switched off -------------------------------
-#
-# docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §4. USER RULE,
-# 2026-09-28 (kn-7312c7de). Refused in `ops`, so the CLI and the dashboard's console
-# inherit it from one place. The OS project is derived with no first-in-catalog fallback,
-# so a test project IS the OS only by sharing an `origin` with the running install.
+# --- the OS's own health sweep may not be switched off
 
 @pytest.fixture()
 def os_project(monkeypatch):
-    """`proj_a` (path `/tmp`) and the running install share one `origin`.
-
-    Through `schedule._ORIGIN_CACHE` rather than a real remote on `/tmp`: identity is a
-    `git remote get-url` per path since issue 956, and this file has no checkout to give
-    one to.
-    """
+    """`proj_a` (path `/tmp`) and the running install share one `origin`"""
     from jarvis import schedule
 
     install = str(Path(schedule.__file__).resolve().parent)
@@ -656,8 +602,7 @@ def test_turning_the_os_projects_own_sweep_off_is_refused(os_project, catalog, p
 
 def test_unsetting_the_switch_back_to_its_false_default_is_refused_too(os_project,
                                                                         catalog):
-    """`health_enabled` ships False, so an unset is a way of turning it off — which is
-    why the predicate is on the RESOLVED document and not on the value written."""
+    """`health_enabled` ships False, so an unset is a way of turning it off"""
     ops.set_config("projects.proj_a.supervisor.health_enabled", True,
                    reason="the OS watches itself")
     ops.set_config("projects.proj_a.supervisor.enabled", True, reason="same")
@@ -672,7 +617,7 @@ def test_unsetting_the_switch_back_to_its_false_default_is_refused_too(os_projec
 
 
 def test_a_catalog_holding_no_install_has_no_os_project_to_protect(catalog):
-    """§4: no first-in-catalog fallback, and no project here is a checkout of the OS."""
+    """§4: no first-in-catalog fallback, and no project here is a checkout of the OS"""
     res = ops.set_config("projects.proj_a.supervisor.health_enabled", False,
                          reason="proj_a is not the OS")
 
@@ -682,7 +627,7 @@ def test_a_catalog_holding_no_install_has_no_os_project_to_protect(catalog):
 
 @pytest.mark.parametrize("path", ["supervisor.health_enabled", "supervisor.enabled"])
 def test_the_same_write_on_an_ordinary_project_is_allowed(os_project, catalog, path):
-    """§4 only stops the OS's own project opting out. Everyone else opts in and out."""
+    """§4 only stops the OS's own project opting out"""
     res = ops.set_config(path, False, project="proj_b", reason="not the OS's own")
 
     assert res["path"] == f"projects.proj_b.{path}"
