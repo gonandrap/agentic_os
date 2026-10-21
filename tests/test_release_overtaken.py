@@ -1024,3 +1024,7 @@ def test_a_project_that_does_not_own_the_os_files_exactly_as_before(
 
     assert [w["id"] for w in batches(store)] == [rel]
     assert events(store, fix["id"], Daemon.ALREADY_SHIPPED_EVENT) == []
+
+
+# Written for the opt-in OS (os.autonomy.self_dispatch on, stuck sweep on).
+pytestmark = pytest.mark.usefixtures("self_dispatch_on")

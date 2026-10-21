@@ -682,11 +682,11 @@ def _submitted(started, store, classification: str, **over):
     return inv["id"], investigator, out
 
 
-def test_a_gap_is_filed_by_ops_as_an_expedited_bug(started, store):
+def test_a_gap_is_filed_by_ops_as_an_unexpedited_bug(started, store):
     inv_id, investigator, out = _submitted(started, store, "GAP")
     assert out["classification"] == "GAP"
     assert out["filed"]["issue_url"] == started.issue_url
-    assert out["filed"]["wo_id"]          # --expedite dispatched one (§2.5)
+    assert not out["filed"]["wo_id"] and not out["filed"]["expedited"]  # file only
     row = store.get_feature_order(inv_id)
     assert row["status"] == "completed"
     assert not row["needs_attention"], "only WAITING_ON_USER raises attention"
@@ -736,7 +736,7 @@ def test_an_issue_that_merely_names_the_subject_is_not_the_duplicate(started, st
 
     assert out["classification"] == "GAP"
     assert out["filed"]["issue_url"]
-    assert out["filed"]["wo_id"]
+    assert not out["filed"]["wo_id"]
     assert out["classified_by"] != "ops"
     stored = json.loads(store.get_feature_order(inv["id"])["plan"])
     assert stored["classified_by"] != "ops"
@@ -1372,7 +1372,7 @@ def test_the_gap_bullet_does_not_require_a_stuck_subject(store, project_spec):
     assert "designed wait" in gap_bullet.lower()
     # The two sentences about filing stay verbatim.
     assert "Name the bug to file in `proposed_fix`." in gap_bullet
-    assert ("THE OS FILES IT, expedited, after its own duplicate search — which is why "
+    assert ("THE OS FILES IT as an issue, after its own duplicate search — which is why "
             "you do not file it and cannot.") in gap_bullet
     # kn-4fb740a9 carries the scope warning and the precedent; the prompt must not.
     assert "1009" not in gap_bullet and "1020" not in gap_bullet
@@ -1710,3 +1710,7 @@ def test_verdict_reaches_the_subject_timeline(started, store):
     assert payload["investigation"] == inv["id"]
     assert "investigation_verdict" in health.observer_kinds()
     assert fp() == before
+
+
+# Written for the opt-in OS (os.autonomy.self_dispatch on, stuck sweep on).
+pytestmark = pytest.mark.usefixtures("self_dispatch_on")

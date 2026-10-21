@@ -152,6 +152,8 @@ not release anything yourself."""
 #: `_apply_file_work_order`'s refusal, hoisted to module level so §11's entry point can
 #: state it BEFORE a grant is filed instead of after one was spent — one home for the rule,
 #: because a second copy passes every behavioural test and drifts anyway (kn-4ea33fe6).
+SELF_DISPATCH_OFF = ("{origin} proposed `file_work_order`, but os.autonomy.self_dispatch is "
+                     "off: an alarm files no work nobody typed — nothing was done")
 NO_ARGUMENT = ("{origin} proposed `file_work_order` with no argument — there is nothing "
                "to brief a work order with")
 
@@ -666,10 +668,14 @@ def _apply_file_work_order(pstore: Any, central: Any, project: str,
     """
     from . import ops
 
+    from .issues import self_dispatch_configured
+
     argument = intent.argument
     origin = intent.alarm_id or intent.subject_id
     if not argument:
         raise RemedyRefused(NO_ARGUMENT.format(origin=origin))
+    if intent.alarm_id is not None and not self_dispatch_configured():
+        raise RemedyRefused(SELF_DISPATCH_OFF.format(origin=origin))
     reason = intent.reason.strip()
     # §11: the alarm brief sends the worker to `jarvis alarms show`, which is a row that
     # does not exist when the user asked. See `USER_FIX_BRIEF`.

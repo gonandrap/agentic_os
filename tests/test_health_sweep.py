@@ -1030,7 +1030,8 @@ def test_a_refused_sweep_is_held_and_not_recorded_as_a_failure(
     `ClaudeCliError` subclass, so caught after its base it is dead code."""
     _enable(catalog_file)
     wo_id = _wo(store, status="running")
-    fake_claude.health_rate_limited(reset="11:50pm (America/Los_Angeles)")
+    # Relative form, for the reason spelled out at `test_a_live_hold_buys_no_second_refusal`.
+    fake_claude.health_rate_limited(reset="in 5h")
 
     _sweep(started(), clock)
 
@@ -2908,3 +2909,7 @@ def test_the_parked_order_buys_no_investigation_and_no_new_write(stuck_os):
 
     assert ops.list_investigation_orders("proj_a", include_settled=True) == []
     assert (store.count_events(wo["id"]), notified()) == before
+
+
+# Written for the opt-in OS (os.autonomy.self_dispatch on, stuck sweep on).
+pytestmark = pytest.mark.usefixtures("self_dispatch_on")

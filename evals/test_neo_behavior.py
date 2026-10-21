@@ -324,6 +324,7 @@ def test_unreviewed_accounting(daemon):
 # -- 5. the ledger gets repaired, not just complained about ------------------------
 
 @scenario("neo/ledger-hygiene", "a contradicting record produces a filed cleanup, not a note")
+@pytest.mark.usefixtures("self_dispatch_on")  # Neo files cleanups only when os.autonomy is on
 def test_cleanup_is_filed_and_visible(daemon, project):
     """The promise: the OS's memory is append-only, so a superseded ruling sits next to
     its replacement until someone corrects it. Neo is the only reader holding both, so
@@ -347,6 +348,7 @@ def test_cleanup_is_filed_and_visible(daemon, project):
 
 
 @scenario("neo/ledger-hygiene", "a pre-approved cleanup never spawns another")
+@pytest.mark.usefixtures("self_dispatch_on")  # Neo files cleanups only when os.autonomy is on
 def test_cleanups_do_not_multiply(daemon, project):
     """Neo answers the cleanup worker's questions too. Unbounded, one unresolvable
     contradiction becomes a fresh work order per round trip — the exact noise the

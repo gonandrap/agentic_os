@@ -40,13 +40,15 @@ def _origin(path, repo=FIXTURE_BUG_REPO):
 
 
 @pytest.fixture()
-def fleet(jarvis_home, fake_claude, fake_gh, tmp_path, project, claude_json):
+def fleet(jarvis_home, fake_claude, fake_gh, tmp_path, project, claude_json, monkeypatch):
     """A started OS whose `proj_a` IS the OS's own tracker repo.
 
     The one condition `issues.tracker_project` requires, made true separately from
     everything else so a test can take it away: the checkout's `origin`.
     """
     from jarvis import ops
+
+    monkeypatch.delenv("JARVIS_WO_ID", raising=False)  # filed as the user, not an agent
 
     _origin(project)
     catalog = tmp_path / "catalog-bugs.json"
@@ -1748,3 +1750,7 @@ def test_the_cli_prints_the_work_order_it_expedited(fleet, capsys):
                      "-p", "low", "--expedite"]) == 0
     out = capsys.readouterr().out
     assert fleet.wo_id() in out and "expedited" in out
+
+
+# Written for the opt-in OS (os.autonomy.self_dispatch on, stuck sweep on).
+pytestmark = pytest.mark.usefixtures("self_dispatch_on")

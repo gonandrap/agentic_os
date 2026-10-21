@@ -3319,6 +3319,7 @@ def test_the_open_span_says_when_it_last_moved(client, daemon, project):
     assert "still in it · active" in html.unescape(page)
 
 
+@pytest.mark.usefixtures("self_dispatch_on")
 def test_stuck_report_is_the_only_arithmetic(client, project, capsys):
     """§7 of docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-
     investigated.md: one reader, two renderers, and neither computes a number."""
@@ -3353,6 +3354,7 @@ def test_stuck_report_is_the_only_arithmetic(client, project, capsys):
     assert wo["id"] in page and "jarvis rules list" in page
 
 
+@pytest.mark.usefixtures("self_dispatch_on")
 def test_the_terminal_names_the_blocker_too(client, project, capsys):
     """Parity fix: `jarvis stuck` prints the blocker `/stuck` already renders.
 

@@ -1249,3 +1249,7 @@ def test_the_hold_reason_and_the_detail_name_the_order_and_never_change(
     assert len(reasons) == 1 and fix in reasons.pop()
     assert len([n for n in store.unrouted_notifications()
                 if invariants.INV_BASE_RED in n["title"]]) == 1
+
+
+# Written for the opt-in OS (os.autonomy.self_dispatch on, stuck sweep on).
+pytestmark = pytest.mark.usefixtures("self_dispatch_on")
