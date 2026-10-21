@@ -1,73 +1,35 @@
-"""What a worker is told, split into a minimal core and full briefings on demand.
-
-The opening prompt used to carry the whole ~8KB operating contract — every worker
-paying for the gate protocol, the navigation posture and the finishing prose whether
-or not that territory ever came up in its session. This module is the single source
-for the replacement: a compressed core of only the load-bearing invariants
-(`core_contract`), an index of the full sections (`section_index`), and the sections
-themselves, fetched with `jarvis brief <section>` — the same map-plus-retrieval-verb
-pattern the knowledge base already uses on these same workers.
-
-Single-sourced on purpose: `dispatch.build_worker_prompt` composes the core from here
-and `cli.cmd_brief` renders the full sections from here, so there is no second copy
-to drift. The planner's prompt is NOT split (one session per feature, already
-reviewed as a unit); it still borrows `navigation_section` and `gates_section` in
-full via dispatch's `_common_briefing`.
-
-Two invariants inherited from the knowledge base work:
-
-* kn-97c41de7 — the prompt never points at a resource that may not exist. Sections
-  are static text, so `jarvis brief` always answers; the `gates` hook only appears
-  for projects with gates enabled, and the knowledge read bullet stays conditional
-  on a non-empty knowledge base, exactly as before the split.
-* kn-ea760e6e — a shrunk prompt ships with a same-input A/B eval:
-  evals/llm/test_worker_contract_ab.py runs the old and new composition of the same
-  scenarios against the real model. tests/test_worker_brief.py holds the free
-  harness checks CI always runs.
-"""
+"""What a worker is told, split into a minimal core and full briefings on demand"""
 
 from __future__ import annotations
 
-from .concision import DEFAULT_SUMMARY_MAX_WORDS as SUMMARY_MAX_WORDS
+from .concision import DEFAULT_ASSUME_MAX_CHARS, DEFAULT_SUMMARY_MAX_WORDS as SUMMARY_MAX_WORDS
 
 WO_PLACEHOLDER = "<wo-id>"
 PROJECT_PLACEHOLDER = "<project>"
 
-#: Budget for the rendered core contract block (between "# Operating contract" and
-#: "# Full briefings"), excluding the work order's own description and the knowledge
-#: index. Enforced by tests/test_worker_brief.py.
-#:
-#: Raised from 2500 in wo-322cd6f8: the original figure was set against a 2080-char
-#: core, and PR 124's `--evidence` bullet spent all of that headroom. A bullet earns
-#: its place here only if a worker that lacks it does damage BEFORE it would think to
-#: fetch the section — which is why concision is here rather than fetch-only
-#: (docs/superpowers/specs/2026-08-22-agent-concision.md SS6). Raise it again only on
-#: that test, not to make room.
-#:
-#: Raised again in wo-b1088ed9 for the one-shot-turn bullet, which passes that test
-#: exactly: a worker that does not know a turn ends its process backgrounds a long job
-#: and signs off expecting a wake-up, and the damage — the work lost, the money spent —
-#: is done before any section could be fetched.
-#:
-#: Raised again for the "Your crew" block (spec 2026-09-23-the-crew-a-worker-must-use.md
-#: SS6), which passes the same test: a lead that does not know it has seats edits the tree
-#: itself, and the hook refuses the call — the confusion happens on the FIRST edit, before
-#: any section could be fetched.
-#: Raised again, by the same admission test, for the poll rhythm (spec
-#: 2026-09-29-a-lead-must-not-block-past-its-cache.md SS6a): a lead that does not know
-#: long work is BACKGROUNDED and polled hits the refusal on its first long call and pays
-#: a mid-turn cache re-write, both before any section could be fetched.
+#: The one spelling of a spec citation (`sections.REF_RE`); there is no `--section` flag
+SECTION_FORM = 'from section 3 of design doc "docs/superpowers/specs/feature.md": …'
+
+
+def assume_shape(wo_id: str, *, tail: str = "", cite_spec: bool = True) -> str:
+    """The `wo assume` bullet every brief carries: ONE decision, the cap, the in-text reference form (docs/superpowers/specs/2026-10-21-questions-to-neo-are-atomic.md §5)"""
+    return (
+        f"- `jarvis wo assume {wo_id} \"...\"`: ONE DECISION you made with NO doubt "
+        f"— choice, rejected alternative, why; ≤{DEFAULT_ASSUME_MAX_CHARS} "
+        f"chars; a second decision is a second `jarvis wo assume` citing it "
+        f"(`per Q1234`/`per assumption #2`)."
+        # Dropped in the CORE only: `CORE_BUDGET_CHARS` leaves no room for it there
+        + (f" Cite a spec BY SECTION the same way (e.g. `{SECTION_FORM}`), never by "
+           f"pasting it and never by naming a whole document." if cite_spec else "")
+        + tail)
+
+#: Budget for the rendered core contract block (between "# Operating contract" and "# Full... (docs/superpowers/specs/2026-08-22-agent-concision.md)
 CORE_BUDGET_CHARS = 3900
 
 
-# -- the git briefing, replacing Claude Code's own ---------------------------------------
+# -- the git briefing, replacing Claude Code's own
 
-# Model id -> the name Claude Code puts in the Co-Authored-By trailer, copied from the
-# CLI's own table (2.1.233) so a Jarvis-written commit is indistinguishable from one
-# written under the built-in instructions. Longest-prefix matched, so a dated id like
-# `claude-haiku-4-5-20251001` resolves; anything unrecognised — including a floating
-# alias such as `opus`, whose target only the CLI knows — falls back to the CLI's own
-# fallback, plain "Claude". A generic trailer is correct; a wrong model name is not.
+# Model id -> the name Claude Code puts in the Co-Authored-By trailer
 MODEL_ATTRIBUTION_NAMES: dict[str, str] = {
     "claude-fable-5": "Claude Fable 5",
     "claude-mythos-5": "Claude Mythos 5",
@@ -78,44 +40,19 @@ MODEL_ATTRIBUTION_NAMES: dict[str, str] = {
     "claude-haiku-4-5": "Claude Haiku 4.5",
 }
 
-#: The PR footer, verbatim from the CLI bundle.
+#: The PR footer, verbatim from the CLI bundle
 PR_ATTRIBUTION = "🤖 Generated with [Claude Code](https://claude.com/claude-code)"
 
 
 def attribution_name(model: str | None) -> str:
-    """The display name for the Co-Authored-By trailer."""
+    """The display name for the Co-Authored-By trailer"""
     m = (model or "").strip().lower()
     hit = [k for k in MODEL_ATTRIBUTION_NAMES if m.startswith(k)]
     return MODEL_ATTRIBUTION_NAMES[max(hit, key=len)] if hit else "Claude"
 
 
 def git_briefing(model: str | None = None) -> str:
-    """The git conventions, as a STATIC block Jarvis owns.
-
-    Workers run with `includeGitInstructions: false`, which switches off three things
-    the CLI would otherwise build into the system prompt: the git-status snapshot, the
-    long "Committing changes with git" workflow, and the lean "# Git" block carrying
-    the attribution trailers. The snapshot is the reason — it is recomputed from the
-    working tree at every `--resume`, so it changed the moment the worker edited a
-    file, and a changed system prompt invalidates the cached prefix for the ENTIRE
-    conversation. Measured on 2.1.233: turn 2 of a resumed worker wrote 10,983 tokens
-    and read 15,995 (the static prompt alone) with the snapshot on, against 552 written
-    and 26,113 read with it off. See docs/superpowers/specs/
-    2026-08-15-a-stable-prefix-for-resumed-workers.md.
-
-    The other two blocks are collateral, so this restates them — which is the whole
-    trick, and the linked best-practice rule: the same content, from a surface that
-    cannot move between turns. It is parameterised only by the work order's model,
-    which is frozen at dispatch (and is part of the cache key anyway), so the rendered
-    text is byte-identical for every turn of a given work order.
-
-    Deliberately NOT a copy of the CLI's "commit only when the user asks": for a worker
-    the work order IS the ask. Copying that line verbatim would contradict the commit and
-    PR rules below — and THIS BLOCK IS NOW THE ONLY PLACE THOSE RULES ARE STATED. The
-    core operating contract used to restate them; that prose was cut to pay for the
-    pass-a-reference rule (Neo question 946), so a trim here removes them from the
-    worker's prompt altogether.
-    """
+    """The git conventions, as a STATIC block Jarvis owns"""
     return "\n".join([
         "# Git",
         "",
@@ -139,7 +76,7 @@ def git_briefing(model: str | None = None) -> str:
 
 
 class UnknownSection(KeyError):
-    """Asked for a briefing section that does not exist."""
+    """Asked for a briefing section that does not exist"""
 
     def __init__(self, name: str) -> None:
         self.name = name
@@ -151,8 +88,7 @@ class UnknownSection(KeyError):
         return self.args[0]
 
 
-# One line per section, mirrored into the core's index. The hook has to sell the
-# fetch: it is the only thing a worker knows about the section before paying for it.
+# One line per section, mirrored into the core's index
 SECTION_HOOKS: dict[str, str] = {
     "contract": "the complete operating contract, with the reasoning the core omits",
     "gates": "the privileged-action protocol: requests, verdicts, and what a "
@@ -177,12 +113,7 @@ def render_section(name: str, *, wo_id: str | None = None,
                    gates_enabled: tuple[str, ...] | None = None,
                    serena: bool = True,
                    tool_search: str = "cli") -> str:
-    """One full section, rendered with real ids when the caller has them.
-
-    Read-only and total: every listed name renders non-empty text with placeholders
-    for anything unknown, because a worker mid-session must never fetch a briefing
-    and get an error back (kn-97c41de7, applied to the OS's own sections).
-    """
+    """One full section, rendered with real ids when the caller has them"""
     wo = wo_id or WO_PLACEHOLDER
     proj = project or PROJECT_PLACEHOLDER
     if name == "contract":
@@ -200,39 +131,31 @@ def render_section(name: str, *, wo_id: str | None = None,
     raise UnknownSection(name)
 
 
-# -- the core ---------------------------------------------------------------------------
+# -- the core
 
 def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
                   gate_names: tuple[str, ...] = (),
                   kind: str = "worker") -> list[str]:
-    """The compressed operating contract: only the invariants a worker cannot be
-    allowed to discover by fetching.
+    """The compressed operating contract: only the invariants a worker cannot be allowed to discover by..."""
+    from .sections import QUESTION_MAX_CHARS
 
-    Every sentence here survived the LLM evals that shaped the full contract
-    (evals/llm/test_worker_judgment.py and the A/B in test_worker_contract_ab.py):
-    the ask/assume routing, the doubt trigger, the named rationalisations and the
-    last-message-is-the-record rule are behaviourally load-bearing and stay in the
-    opening prompt. Everything explanatory moved behind `jarvis brief`.
-    """
     lines = [
         "# Operating contract",
         "You MUST follow it. This is the compressed core; the full contract with "
         "all its reasoning is one read-only command away — see the index below.",
-        # The commit/PR half of this bullet is gone from the CORE: `git_briefing` states
-        # both in every prompt, and the room bought the pass-a-reference rule below (Neo
-        # question 946). The full `contract` section still carries it.
+        # The commit/PR half of this bullet is gone from the CORE: `git_briefing` states both in every...
         "- Work only inside your assigned worktree (you start in it).",
         f"- **The PR title MUST start with `[{wo_id}] `** — e.g. "
         f"`[{wo_id}] {title[:40]}`. `gh pr create` with any other title is blocked.",
         f"- **Neo is your first responder. Any doubt goes to it.** "
         f"`jarvis wo ask {wo_id} \"<your question>\"`, then END YOUR TURN; the "
-        f"answer arrives as your next user turn, usually within a minute. This is "
-        f"the normal, expected way to work: it is not an escalation and it does not "
+        f"answer arrives as your next user turn, usually within a minute. "
+        f"Normal: it is not an escalation and it does not "
         f"interrupt the user. The trigger is DOUBT, not importance — if you catch "
         f"yourself weighing options or thinking \"either would work\", you are in "
         f"doubt: Ask BEFORE you build on it, not after. A question is one "
-        f"paragraph: the decision, the options, your recommendation — do not paste "
-        f"context.",
+        f"paragraph: the decision, the options, your recommendation — no pasted "
+        f"context; ≤{QUESTION_MAX_CHARS} chars.",
         "  - Do not talk yourself out of asking: \"It's reversible\", \"it's only "
         "an implementation detail\", \"I'll note it as an assumption\" are "
         "rationalisations for guessing.",
@@ -240,10 +163,9 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
             "  - But LOOK IT UP FIRST when a headline in the knowledge-base index "
             "below names the area you are unsure about — a lookup is not a doubt.",
         ] if has_knowledge else []),
-        f"- `jarvis wo assume {wo_id} \"...\"` is for the OTHER case, and it should "
-        f"be RARE: a call you made with NO doubt. Record EVERY such call, including "
-        f"the small and obvious ones — the work order record is the only audit "
-        f"trail anyone gets. Never a guess: if you are guessing, ask.",
+        assume_shape(wo_id, cite_spec=False,
+                     tail=" It should be RARE. Record EVERY such call, including "
+                          "the small and obvious ones: the only audit trail."),
         *([
             f"- READ the OS knowledge base before you touch an area it covers — it "
             f"is INDEXED at the end of this prompt, not pasted into it: "
@@ -287,8 +209,7 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
         f"what the user and Neo decide from. The summary is the HEADLINE — capped "
         f"at {SUMMARY_MAX_WORDS} words, longer REFUSED — your final message is the "
         f"report, and where detail goes.",
-        # What to do when review feedback asks for more moved into `record_section`
-        # (Neo question 946): this bullet paid for the one below it, and nothing was lost.
+        # What to do when review feedback asks for more moved into `record_section` (Neo question 946): this...
         f"- Add `--evidence \"<what you ran and what it showed>\"` to that same "
         f"finish: the tests, evals and checks you ran, and what they reported. It says "
         f"how you know it works, and review feedback may ask for more.",
@@ -297,8 +218,7 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
         f"SHA, path with a line range, or the command that reproduces it. An "
         f"oversized argument and a `$(git diff …)` are refused before the command "
         f"runs.",
-        # spec 2026-09-23-the-crew-a-worker-must-use.md SS6 — worker only; a planner
-        # has its own team prose in `dispatch._planner_prompt`.
+        # spec 2026-09-23-the-crew-a-worker-must-use.md SS6
         *([
             "",
             "# Your crew",
@@ -315,15 +235,13 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
     return lines
 
 
-#: The `navigation` hook for a project that has deselected Serena. The index line is in
-#: EVERY worker's opening prompt, so leaving "Serena first" there would advertise a
-#: server the same dispatch removed — `gated` below is the same rule for gates.
+#: The `navigation` hook for a project that has deselected Serena
 NO_SERENA_HOOK = ("Glob and Grep — how to find code here, and what a text search "
                   "cannot answer")
 
 
 def section_index(wo_id: str, gated: bool, serena: bool = True) -> list[str]:
-    """The map of the full sections, mirroring the knowledge-index pattern."""
+    """The map of the full sections, mirroring the knowledge-index pattern"""
     lines = [
         "# Full briefings on demand",
         "This prompt is the minimum. The full text behind each part of it is "
@@ -341,11 +259,10 @@ def section_index(wo_id: str, gated: bool, serena: bool = True) -> list[str]:
     return lines
 
 
-# -- the full sections ------------------------------------------------------------------
+# -- the full sections
 
 def _question_shape(wo_id: str) -> list[str]:
-    """The full question protocol, shared by the contract section (single source for
-    the sentences the question-diet tests pin)."""
+    """The full question protocol, shared by the contract section (single source for the sentences the..."""
     from .sections import QUESTION_MAX_CHARS
 
     return [
@@ -376,8 +293,7 @@ def _question_shape(wo_id: str) -> list[str]:
 
 def contract_section(wo_id: str = WO_PLACEHOLDER,
                      project: str = PROJECT_PLACEHOLDER) -> str:
-    """The complete operating contract — the pre-split text, moved rather than
-    lost. tests/test_worker_brief.py pins its load-bearing phrases one by one."""
+    """The complete operating contract"""
     lines = [
         "# Operating contract — full text",
         "You MUST follow this contract (it mirrors the project's OPERATION.md — do "
@@ -398,15 +314,16 @@ def contract_section(wo_id: str = WO_PLACEHOLDER,
         "reason to go looking instead of recording a call you made with no doubt. "
         "(Your prompt carries the index only when the knowledge base has entries; "
         "with no index there is nothing to look up.)",
-        f"- `jarvis wo assume {wo_id} \"...\"` is for the OTHER case, and it "
-        f"should be RARE: a call you made with NO doubt — you followed an existing "
-        f"convention, the work order implied it, the codebase left one sensible "
-        f"option. Record EVERY such call, including the small and obvious ones "
-        f"(naming, file layout, which convention you followed, how you split the "
-        f"commits): recording is cheap and the work order record is the only audit "
-        f"trail anyone gets. An assumption is a disclosure of something you were "
-        f"SURE about. It is never a guess you are hoping nobody checks — if you "
-        f"are guessing, ask instead.",
+        assume_shape(wo_id, tail=" It is the OTHER case and should be RARE: you "
+                                 "followed an existing convention, the work order "
+                                 "implied it, the codebase left one sensible option. "
+                                 "Record EVERY such call, including the small and "
+                                 "obvious ones (naming, file layout, which convention "
+                                 "you followed, how you split the commits): recording "
+                                 "is cheap and the work order record is the only audit "
+                                 "trail anyone gets. It is a disclosure of something "
+                                 "you were SURE about, never a guess you are hoping "
+                                 "nobody checks — if you are guessing, ask instead."),
         f"- Found work that is real but is not THIS work order's job? Do not file "
         f"it yourself and do not leave a note: `jarvis wo defer {wo_id} \"<title>\" "
         f"--why \"<why it should not be done now>\"` (add `--neo-question <id>` if "
@@ -452,7 +369,7 @@ def contract_section(wo_id: str = WO_PLACEHOLDER,
 
 
 def record_section(wo_id: str = WO_PLACEHOLDER) -> str:
-    """What the outside world sees, plus the finishing protocol in full."""
+    """What the outside world sees, plus the finishing protocol in full"""
     lines = [
         "# What the outside world sees",
         "The work order record IS this conversation, as far as anyone else is "
@@ -557,13 +474,7 @@ def record_section(wo_id: str = WO_PLACEHOLDER) -> str:
     return "\n".join(lines)
 
 
-#: The ToolSearch recovery call, as the worker must type it. Both prefixes in ONE select
-#: — `mcp__serena__` from `claude mcp add serena`, `mcp__plugin_serena_serena__` from a
-#: plugin install (`dispatch.SERENA_TOOL_PREFIXES`) — because an absent name is silently
-#: ignored and the rest of the select survives: probed on 2.1.284, where a select naming
-#: both spellings of `find_symbol` on a plugin install returned only the plugin one. Four
-#: tools, not eleven: these are the ones the defect is about. §3 item 1 of
-#: docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md.
+#: The ToolSearch recovery call, as the worker must type it (docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md)
 NAV_SELECT_TOOLS = ("find_symbol", "find_referencing_symbols", "get_symbols_overview",
                     "activate_project")
 NAV_SELECT_LINE = "select:" + ",".join(
@@ -572,12 +483,7 @@ NAV_SELECT_LINE = "select:" + ",".join(
     for prefix in ("mcp__serena__", "mcp__plugin_serena_serena__"))
 
 
-#: The markdown half of the posture, and it is INDEPENDENT of Serena: the specs are
-#: navigated with a `jarvis` verb over headings, not with a symbol index, so a project
-#: that deselected Serena still gets it. The three command strings are §4.3 of
-#: docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md, quoted verbatim —
-#: `jarvis spec show` does not exist. Measured cause (§1(b) of that spec): 199 whole-file
-#: `.md` reads at 5,187 tokens each, and the prompt is what decides the FIRST call.
+#: The markdown half of the posture (docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md)
 _MARKDOWN_NAV = [
     "# Finding things in specs and docs: navigate them like code",
     "A spec is a tree of headings, so read the heading you need and not the file: "
@@ -591,31 +497,8 @@ _MARKDOWN_NAV = [
 
 
 def navigation_core(serena: bool = True, tool_search: str = "cli") -> list[str]:
-    """The navigation posture INLINE in the bare worker prompt — spec §3.
-
-    Cause 3 of the defect: an ordinary lead gets one index line pointing at
-    `jarvis brief navigation` and the measured fetch behaviour is that it does not
-    fetch, so the posture never reaches the session the brief was written for. The
-    planner and the analyst already get the full section inline through
-    `dispatch._common_briefing`.
-
-    Composed AFTER `section_index` rather than inside the core: the core has 38 chars of
-    headroom against CORE_BUDGET_CHARS and every sentence in it is A/B-graded as a unit
-    (evals/llm/test_worker_contract_ab.py), so 500 ungraded chars in there would dilute a
-    claim, not just a number.
-
-    `serena=False` renders the MARKDOWN half alone (`_MARKDOWN_NAV`) and no symbol half:
-    ruled by spec 2026-10-06-navigate-specs-like-code.md §6.1, because navigating a spec
-    needs no symbol index, so swallowing it inside the Serena branch would withhold the
-    posture from the projects that never had it. The symbol half still goes: the index
-    already swaps in NO_SERENA_HOOK and the fetched section already carries the grep
-    posture.
-
-    `tool_search="off"` means `dispatch` wrote `ENABLE_TOOL_SEARCH=false`, so the tools
-    are in the tool list with full schemas: the DEFERRED wording and the recovery call
-    would be a falsehood and a wasted call (spec 2026-10-02-serena-the-cheap-path.md §4).
-    """
-    # Spec 2026-10-06-navigate-specs-like-code.md §6.1.
+    """The navigation posture INLINE in the bare worker prompt — spec §3"""
+    # Spec 2026-10-06-navigate-specs-like-code.md §6.1
     if not serena:
         return list(_MARKDOWN_NAV)
     tail = [
@@ -626,7 +509,7 @@ def navigation_core(serena: bool = True, tool_search: str = "cli") -> list[str]:
         "`grep -rn \"def foo\"`.",
         "- `activate_project` on the repo root if a call says no project is active.",
     ]
-    # Spec 2026-10-02-serena-the-cheap-path.md §4.
+    # Spec 2026-10-02-serena-the-cheap-path.md §4
     if tool_search == "off":
         return [
             "# Finding code: your symbol tools are IN your tool list",
@@ -650,19 +533,7 @@ def navigation_core(serena: bool = True, tool_search: str = "cli") -> list[str]:
 
 
 def navigation_section(serena: bool = True, tool_search: str = "cli") -> str:
-    """Serena before grep, for every session Jarvis dispatches.
-
-    Prose rather than a capability restriction, and it has to be: a worker needs
-    `Grep` and `Bash` for its actual job, so the seats' trick of simply not
-    granting the tool is not available. The two cases are separate BRANCHES rather
-    than one hedged paragraph: `dispatch` writes `JARVIS_SERENA` from the project's
-    real wiring, so each branch can state its own case unconditionally.
-
-    `serena=False` is the one case Jarvis DOES know about: the project deselected it
-    on /config, so `dispatch` did not wire it. Recommending it there would send every
-    worker to try a tool the same dispatch removed — so the text changes rather than
-    the worker discovering it.
-    """
+    """Serena before grep, for every session Jarvis dispatches"""
     if not serena:
         return "\n".join([
             "# Navigating the code: Glob and Grep",
@@ -681,7 +552,7 @@ def navigation_section(serena: bool = True, tool_search: str = "cli") -> str:
             "- Read a file's imports and its module docstring before its body: on a "
             "project with a written map, the map is cheaper than the code.",
             "",
-            # Spec 2026-10-06-navigate-specs-like-code.md §6.
+            # Spec 2026-10-06-navigate-specs-like-code.md §6
             *_MARKDOWN_NAV,
         ])
     lines = [
@@ -712,23 +583,19 @@ def navigation_section(serena: bool = True, tool_search: str = "cli") -> str:
         "- If the symbol tools say no project is active, `activate_project` on the "
         "repo root first.",
         "",
-        # Spec 2026-10-06-navigate-specs-like-code.md §6.
+        # Spec 2026-10-06-navigate-specs-like-code.md §6
         *_MARKDOWN_NAV,
     ]
     return "\n".join(lines)
 
 
 def concision_section() -> str:
-    """The three surfaces this OS is verbose on, and what each is allowed to hold.
-
-    Design and the probe behind the output-style half:
-    docs/superpowers/specs/2026-08-22-agent-concision.md — this section is SS6.
-    """
+    """The three surfaces this OS is verbose on, and what each is allowed to hold (docs/superpowers/specs/2026-08-22-agent-concision.md)"""
     lines = [
         "# Point, do not explain",
         "Three surfaces, one rule each. The HOUSE STYLE governs how you write all "
         "three and everything else — it is injected into every turn of your session "
-        "and its rules are your `caveman` and `i-have-adhd` skills "
+        "and its rules are your `caveman` and `ponytail` skills "
         "(docs/superpowers/specs/2026-09-19-concision-enforced.md). This section is "
         "what the style cannot know: which surface holds what.",
         "",
@@ -782,13 +649,7 @@ def concision_section() -> str:
 
 def gates_section(wo_id: str = WO_PLACEHOLDER,
                   enabled: tuple[str, ...] | None = None) -> str:
-    """The full privileged-action protocol.
-
-    With `enabled` (the project's live gates, as dispatch and the worker's
-    JARVIS_GATES env know them) only those are listed, exactly as the old briefing
-    did; without project context every kind is described, with a note, because the
-    section must always render something true.
-    """
+    """The full privileged-action protocol"""
     from .gates import KINDS
 
     live = [k for k in KINDS if k.name in enabled] if enabled else list(KINDS)
@@ -797,10 +658,7 @@ def gates_section(wo_id: str = WO_PLACEHOLDER,
         "These actions are reviewed before they run — an independent reviewer "
         "(Neo, the user's delegate) decides, and approval lets you proceed:",
     ]
-    # Each kind is listed WITH the two questions its own request has to answer. The
-    # reviewer is shown nothing but what the worker wrote, so a worker told to supply a
-    # PR number for a service restart supplies the wrong thing and the verdict is decided
-    # on it. Spec 2026-09-12 §6.
+    # Each kind is listed WITH the two questions its own request has to answer
     for k in live:
         lines += [
             f"- `{k.name}` — {k.summary}",
@@ -882,7 +740,7 @@ def gates_section(wo_id: str = WO_PLACEHOLDER,
 
 
 def knowledge_section(project: str = PROJECT_PLACEHOLDER) -> str:
-    """How to use the knowledge base — both halves, in full."""
+    """How to use the knowledge base — both halves, in full"""
     lines = [
         "# The OS knowledge base",
         "It is the fleet's only durable memory, and your prompt carries an INDEX "

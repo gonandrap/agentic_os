@@ -1,19 +1,4 @@
-"""Screenshot the budget line while a turn is STILL RUNNING, for a PR's UI evidence.
-
-`scripts/screenshot_budget_at_creation.py` is the shape this copies. The line it shoots
-is the one issue #471 was filed against: it read `Budget: $0.00 of $30.00` directly
-under a bill chip saying `~$3.25`, because a turn writes the CLI's own cost only when it
-ends and the recorded total was the only thing on the page.
-
-  budget-in-flight.png    the work order page mid-turn: `~$25.00 of $30.00`, the `~`
-                          marking the half of that figure that is a list-price estimate
-                          off the live transcript
-
-Writes the PNG to docs/screenshots/. Everything it touches lives in a temp `JARVIS_HOME`,
-a temp catalog and a temp transcript root, so it never reads or writes the live OS:
-
-    uv run python scripts/screenshot_budget_in_flight.py
-"""
+"""Screenshot the budget line while a turn is STILL RUNNING, for a PR's UI evidence (#471)"""
 
 from __future__ import annotations
 
@@ -38,7 +23,7 @@ def stamp(ts: float) -> str:
 
 
 def transcript(started_at: float) -> None:
-    """One $25 opus call inside the running turn's window."""
+    """One $25 opus call inside the running turn's window"""
     from jarvis import usage
 
     root = Path(os.environ[usage.TRANSCRIPT_ROOT_ENV]) / "-proj"

@@ -1,14 +1,4 @@
-"""Screenshot the spec page and the three links into it, for issue #826's UI evidence.
-
-docs/superpowers/specs/2026-09-28-a-feature-spec-you-can-open.md. The claim a passing
-test cannot make: the document the OS HOLDS is readable by a person, before any pull
-request exists, and every link that points into it lands on a heading that is there.
-
-Writes PNGs to docs/screenshots/. Everything it touches lives in a temp `JARVIS_HOME`
-and a temp catalog, so it never reads or writes the live OS:
-
-    uv run python scripts/screenshot_feature_spec.py
-"""
+"""Screenshot the spec page and the three links into it, for issue #826's UI evidence"""
 
 from __future__ import annotations
 
@@ -26,10 +16,9 @@ PORT = 8807
 
 REPO_PATH = "docs/superpowers/specs/2026-09-27-self-evolution.md"
 SOURCE = "branch wo-1170d758 @ 4f2a1c9"
-SECTION = "3"          # the child's section: "## 3. Failure handling"
+SECTION = "3"          # the child's section: "## 3
 
-# A realistic planner-authored document: numbered headings, a fenced bash block whose
-# `#` comment must NOT become a heading, a list, bold, inline code and a bare URL.
+# A realistic planner-authored document: numbered headings
 DOC = """# Self-evolution: the OS files its own repairs
 
 The OS already knows when a post-condition fails. It cannot yet turn that into work.
@@ -104,7 +93,7 @@ PLAN = {
 
 
 def seed() -> tuple[str, str, str]:
-    """One planned feature: the planner that wrote the spec, and a child with a section."""
+    """One planned feature: the planner that wrote the spec, and a child with a section"""
     from jarvis.central_store import CentralStore
     from jarvis.project_store import ProjectStore
 
@@ -157,8 +146,7 @@ def serve() -> None:
     uvicorn.run(create_app(), host="127.0.0.1", port=PORT, log_level="warning")
 
 
-# Two real pages, side by side in one shot: the link and where it lands. Iframes rather
-# than two files because the pair IS the claim — a fragment pointing at no id is the bug.
+# Two real pages, side by side in one shot: the link and where it lands
 PAIR = """
 <html><body style="margin:0;font:13px system-ui;background:#111;color:#ddd">
 <div style="padding:4px 10px">the child's work-order page — the spec line it now carries</div>
@@ -179,24 +167,23 @@ def shoot(fo_id: str, planner_id: str, kid_id: str) -> None:
         browser = p.chromium.launch()
         page = browser.new_page(viewport={"width": 1280, "height": 900})
 
-        # 1. The document itself, with its provenance line.
+        # 1
         page.goto(f"{base}/spec/jarvis_os/{fo_id}")
         page.screenshot(path=SHOTS / "feature-spec-page.png")
 
-        # 2. The planner's page — the case that had NOTHING before.
+        # 2
         page.goto(f"{base}/wo/jarvis_os/{planner_id}")
         page.screenshot(path=SHOTS / "feature-spec-planner-link.png")
 
-        # 3. The feature page: the spec path is a link, and so is each child's "§ N".
+        # 3
         page.goto(f"{base}/fo/jarvis_os/{fo_id}")
         page.screenshot(path=SHOTS / "feature-spec-feature-page.png")
 
-        # 4. The pair: the child's line, and the heading its fragment resolves to.
+        # 4
         page.set_content(PAIR.format(child=f"{base}/wo/jarvis_os/{kid_id}",
                                      spec=f"{base}/spec/jarvis_os/{fo_id}#{anchor}"))
         page.wait_for_timeout(700)
-        # The anchor put at the top of its frame explicitly: a long document scrolled by
-        # the fragment alone can land the heading under the frame's own fold.
+        # The anchor put at the top of its frame explicitly: a long document scrolled by the fragment alone...
         page.frames[-1].evaluate(
             "id => { const el = document.getElementById(id);"
             " window.scrollTo(0, el.getBoundingClientRect().top + window.scrollY - 8); }",

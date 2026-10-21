@@ -1,5 +1,4 @@
-"""Jarvis web dashboard — server-rendered, zero JS, reads the same stores and calls
-the same ops functions as the CLI. Binds to localhost by default (no auth in MVP)."""
+"""Jarvis web dashboard — server-rendered"""
 
 from __future__ import annotations
 
@@ -44,12 +43,7 @@ TEMPLATES = Path(__file__).parent / "templates"
 
 
 def _fleet_if_held(wos: list[dict]) -> "fleet.Fleet | None":
-    """The account's state for these orders, or None — `ops.fleet_if_held`.
-
-    A call rather than a page-local rule: the CLI listings ask the same question, and a
-    page that answered it for itself is how two surfaces come to disagree about the same
-    work order. Was `pending`-only, which is the narrowness issue #714 is about.
-    """
+    """The account's state for these orders, or None — `ops.fleet_if_held` (#714)"""
     return ops.fleet_if_held(wos)
 
 
@@ -57,36 +51,26 @@ STATUS_META = {
     "pending":       {"word": "pending",     "icon": "◌", "tone": "muted"},
     "dispatching":   {"word": "dispatching", "icon": "◍", "tone": "active"},
     "running":       {"word": "running",     "icon": "●", "tone": "active"},
-    # Toned `muted`, not `warn`, and absent from FEATURED_STATUSES below: a manager
-    # between its feature's messages is the OS at rest, not a decision anyone owes
-    # (issue #264).
+    # Toned `muted`, not `warn`, and absent from FEATURED_STATUSES below: a manager between its feature's... (#264)
     "idle":          {"word": "idle",           "icon": "◎", "tone": "muted"},
     "waiting_input": {"word": "waiting on you", "icon": "◉", "tone": "warn"},
-    # Toned `active`, not `warn`: a round in flight is the OS working, and nothing is
-    # being asked of the user. Templates index this dict BY STATUS — every one of them
-    # via `.get(status, <the raw status>)`, so the cost of a missing key is not a
-    # traceback but every surface quietly printing the bare word instead of the meaning.
+    # Toned `active`, not `warn`: a round in flight is the OS working
     "validating":    {"word": "under review",   "icon": "◑", "tone": "active"},
     "needs_review":  {"word": "needs review",   "icon": "◭", "tone": "warn"},
     "waiting_pr_merge": {"word": "waiting for PR merge", "icon": "⑃", "tone": "ok"},
-    # Toned `warn` rather than `bad`: nothing went wrong with the work, it ran out of
-    # money, and the thing to do about it is a decision rather than a diagnosis.
+    # Toned `warn` rather than `bad`: nothing went wrong with the work
     "budget_exhausted": {"word": "budget spent", "icon": "◒", "tone": "warn"},
     "completed":     {"word": "completed",   "icon": "✓", "tone": "ok"},
     "failed":        {"word": "failed",      "icon": "✗", "tone": "bad"},
     "cancelled":     {"word": "cancelled",   "icon": "–", "tone": "muted"},
 }
-# A feature order's own lifecycle. Separate from STATUS_META rather than merged into it:
-# the words overlap ("pending", "completed") but they mean different things — a pending
-# work order is queued for a worker, a pending feature order has not been decomposed yet
-# — and one table serving both would have to pick one meaning for the shared keys.
+# A feature order's own lifecycle
 FO_STATUS_META = {
     "pending":     {"word": "not planned yet", "icon": "◌", "tone": "muted"},
     "planning":    {"word": "planning",     "icon": "◍", "tone": "active"},
     "plan_review": {"word": "plan in review", "icon": "◭", "tone": "warn"},
     "executing":   {"word": "executing",    "icon": "●", "tone": "active"},
-    # A feature order validates as a whole once every child is done — same reading as
-    # the work-order entry above, one level up.
+    # A feature order validates as a whole once every child is done
     "validating":  {"word": "under review",  "icon": "◑", "tone": "active"},
     "budget_exhausted": {"word": "budget spent", "icon": "◒", "tone": "warn"},
     "completed":   {"word": "completed",    "icon": "✓", "tone": "ok"},
@@ -97,84 +81,46 @@ ORIGIN_META = {
     "jarvis": {"word": "jarvis", "framework": True},
     "ui":     {"word": "ui",     "framework": True},
     "manual": {"word": "manual", "framework": False},
-    # `injected` is not a warning: the user handed this session over on purpose. `adhoc`
-    # is the legacy marker from when Jarvis adopted sessions on its own, and stays one.
+    # `injected` is not a warning: the user handed this session over on purpose
     "injected": {"word": "injected", "framework": True},
     "adhoc":  {"word": "ad-hoc", "framework": False},
-    # Framework-spawned like `jarvis`, but nobody asked for it by hand: Neo filed it
-    # itself to correct a contradicting ledger entry.
+    # Framework-spawned like `jarvis`
     "neo":    {"word": "neo",    "framework": True},
 }
 LEVEL_TONE = {"info": "muted", "warning": "warn", "critical": "bad"}
-# Privileged-action gates. `pending` splits in two on the page — with Neo (costs the
-# user nothing) vs escalated to the user — so it carries the neutral mark here.
-# `dismissed` is neutral-toned on purpose: nothing was permitted and nothing was
-# refused, so neither the ok nor the bad colour tells the truth about it.
+# Privileged-action gates
 GATE_META = {
-    # Recorded, unargued, in front of nobody. Its own word because calling it "pending"
-    # would tell the reader a reviewer is holding it when the worker is — gates.AWAITING_CASE.
+    # Recorded, unargued, in front of nobody
     "awaiting_case": {"word": "awaiting case", "icon": "✎", "tone": "warn"},
     "pending":   {"word": "pending",   "icon": "◌", "tone": "warn"},
     "approved":  {"word": "approved",  "icon": "✓", "tone": "ok"},
     "denied":    {"word": "denied",    "icon": "✗", "tone": "bad"},
     "dismissed": {"word": "not a gate", "icon": "⊘", "tone": "muted"},
     "expired":   {"word": "expired",   "icon": "–", "tone": "muted"},
-    # Not a status but a DISPLAY state: `expired` with `closed_as='abandoned'`. Its own
-    # word because nobody reviewed it — calling that "expired" alongside a lapsed grant
-    # hides the one gate outcome that is evidence of a classifier defect (spec 2026-09-12).
+    # Not a status but a DISPLAY state: `expired` with `closed_as='abandoned'`
     "abandoned": {"word": "abandoned, never reviewed", "icon": "⊗", "tone": "muted"},
-    # Same treatment, opposite outcome: `expired` with `closed_as='spent'` was approved
-    # and then USED. Toned `ok` because it is a success, and it is the overwhelming
-    # majority of decided gates — muting it made a working auto-merge pipeline read as
-    # Neo letting every merge lapse (spec 2026-09-19 §1).
+    # Same treatment, opposite outcome: `expired` with `closed_as='spent'` was approved and then USED
     "spent": {"word": "spent", "icon": "✓", "tone": "ok"},
 }
 
 
 def gate_display(g: dict) -> str:
-    """The key this gate renders under, which is not always its status: `expired` splits
-    by `closed_as` — spec 2026-09-19 §1. One function because three surfaces read
-    `GATE_META` and a ternary copied into each is how one of them comes to disagree.
-    `cli._gate_display` is the CLI's twin, kept in step by test_gates.
-    """
+    """The key this gate renders under, which is not always its status: `expired` splits by `closed_as`"""
     if g["status"] == "expired" and g["closed_as"] in ("spent", "abandoned"):
         return g["closed_as"]
     return g["status"]
 
 
-# How often the dashboard re-reads OS state. Not a page reload — the browser swaps
-# the live regions in place (see dashboard.html), so in-progress typing survives.
+# How often the dashboard re-reads OS state
 REFRESH_SECONDS = 15
 
-# The open statuses worth a row of their own, in this order: the two that owe the user a
-# decision, then what is being worked on right now, then what is waiting for them to go
-# and merge it. Only `pending` and `dispatching` collapse into a count line, the way
-# settled work orders do — the point of the page is "what needs me", and a work order the
-# OS has not started yet needs nobody.
-#
-# `needs_review` and `waiting_input` are here because invariants.true_blockers names them
-# as genuine blockers, and a listing that disagrees with that is a bug in the listing.
-# Collapsing them was one: a project whose only open work was three `needs_review` orders
-# counted them in the header and then said "nothing running and nothing to merge" in the
-# same breath. Status, not the attention flag, decides: `jarvis wo ack` puts the flag down
-# for good, and an acked work order that vanished from the only listing of open work would
-# be unfindable.
-# `budget_exhausted` is featured for the same reason `needs_review` and `waiting_input`
-# are: `invariants.true_blockers` names it a genuine blocker, and a listing that disagrees
-# with that is a bug in the listing. FIRST, because it is the only one of them the user
-# cannot answer by reading — the order is stopped and spending nothing until they decide.
+# The open statuses worth a row of their own
 FEATURED_STATUSES = ("budget_exhausted", "needs_review", "waiting_input", "running",
                      "waiting_pr_merge")
 
 
 def group_open(wos: list[dict], revealed: str = "") -> tuple[list[dict], list[dict]]:
-    """Split open work orders into the featured rows and the rest.
-
-    The rest come back only when the user has expanded them (`revealed` is their status
-    or "all"); the caller renders the counts either way, so nothing is hidden silently.
-    Featured rows are ordered by FEATURED_STATUSES, then by whatever order they arrived
-    in (newest first out of the store).
-    """
+    """Split open work orders into the featured rows and the rest"""
     featured = [wo for status in FEATURED_STATUSES for wo in wos
                 if wo["status"] == status]
     rest = [wo for wo in wos if wo["status"] not in FEATURED_STATUSES]
@@ -183,7 +129,7 @@ def group_open(wos: list[dict], revealed: str = "") -> tuple[list[dict], list[di
 
 
 def _counts_by_status(statuses) -> list[tuple[str, int]]:
-    """(status, n) pairs in WO_STATUSES order — a stable line, not dict order."""
+    """(status, n) pairs in WO_STATUSES order — a stable line, not dict order"""
     counted = Counter(statuses)
     return [(s, counted[s]) for s in WO_STATUSES if counted.get(s)]
 
@@ -199,12 +145,7 @@ def fmt_age(ts: float | None) -> str:
 
 
 def fmt_left(ts: float | None) -> str:
-    """How long until a deadline — the mirror of `fmt_age`, for the one thing on these
-    pages whose next event is a clock rather than a person (`gates.sweep_unargued`).
-
-    "any moment now" rather than a negative: the sweep runs on the reconcile tick, so a
-    deadline that has passed means the sweep is due, not that it was missed.
-    """
+    """How long until a deadline — the mirror of `fmt_age`"""
     if not ts:
         return "–"
     d = ts - time.time()
@@ -214,21 +155,14 @@ def fmt_left(ts: float | None) -> str:
 
 
 def fmt_ts(ts: float | None) -> str:
-    """An absolute local date-time. `fmt_age` answers "how long ago", which is the right
-    question for a running thing and the wrong one for a bill: a sealed bill's date is a
-    fact about the record, not a countdown, and "412d" is not a date anyone can cite."""
+    """An absolute local date-time"""
     if not ts:
         return "–"
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
 
 def _offset_param(raw: str) -> int:
-    """`?offset=` as an int, refused in the OS's own vocabulary rather than by FastAPI.
-
-    §3 of docs/superpowers/specs/2026-10-07-cost-window-selector.md: a framework 422 on
-    a cost page is a dead end, and a silent fallback to the current window would report
-    one window while the reader believes they picked another.
-    """
+    """`?offset=` as an int, refused in the OS's own vocabulary rather than by FastAPI (docs/superpowers/specs/2026-10-07-cost-window-selector.md)"""
     if not raw:
         return 0
     try:
@@ -239,30 +173,19 @@ def _offset_param(raw: str) -> int:
 
 
 def _window_inputs(window: dict) -> dict[str, str]:
-    """The active window as `datetime-local` values, so the custom form pre-fills.
-
-    Rendered in the window's DISPLAY zone, because the route parses the submitted
-    strings in that same zone: the page speaks ONE clock (§11 of
-    docs/superpowers/specs/2026-10-07-cost-window-selector.md). The CLI's naive
-    `--since` is still UTC — that flag's clock is not redefined here.
-    """
+    """The active window as `datetime-local` values, so the custom form pre-fills (docs/superpowers/specs/2026-10-07-cost-window-selector.md)"""
     fmt = "%Y-%m-%dT%H:%M"
     tzinfo = ZoneInfo(window["zone"])
     out = {key: datetime.fromtimestamp(window[key], tzinfo).strftime(fmt)
            for key in ("since", "until")}
-    # The zone form carries a custom range with its OFFSET, so re-rendering it in a new
-    # zone moves no boundary: changing zone is display only (§11).
+    # The zone form carries a custom range with its OFFSET
     out.update({f"{key}_fixed": datetime.fromtimestamp(window[key], tzinfo).isoformat()
                 for key in ("since", "until")})
     return out
 
 
 def _in_zone(raw: str, zone: str) -> float | str:
-    """A naive datetime-local string as the epoch it means IN `zone` (§11).
-
-    A string carrying an explicit offset is honoured as written, and anything this
-    cannot parse is handed on untouched so `fleetcost` refuses it in its own words.
-    """
+    """A naive datetime-local string as the epoch it means IN `zone` (§11)"""
     try:
         when = datetime.fromisoformat(raw)
     except ValueError:
@@ -272,37 +195,23 @@ def _in_zone(raw: str, zone: str) -> float | str:
     return when.timestamp()
 
 
-#: Paths the access log ignores while they succeed. `/api/status` is the dashboard's own
-#: 15-second refresh poll — left in, it is ~95% of the lines and buries the thing the
-#: access log exists to show: which pages the *user* actually opened. Failures are logged
-#: whatever the path, so a broken poll still leaves a trace.
-#: `/healthz` is the daemon's liveness poll (spec §1) and is quiet for `/api/status`'
-#: reason: a 5-second poll would bury the user's navigation. A FAILING probe still logs,
-#: because `access_log` logs any status >= 400.
+#: Paths the access log ignores while they succeed
 QUIET_PATHS = ("/api/status", "/healthz")
 
-#: The same rule for polls whose path carries an id, so an exact match cannot express it:
-#: `/api/wo/{project}/{wo_id}/live` fires every two seconds while a debugging page is
-#: open (spec §7 of docs/superpowers/specs/2026-09-24-order-observability.md) and would bury the
-#: user's navigation exactly as `/api/status` did. Suffix, not prefix: the id sits in the
-#: middle.
+#: The same rule for polls whose path carries an id (docs/superpowers/specs/2026-09-24-order-observability.md)
 QUIET_SUFFIXES = ("/live",)
 
 
 def _quiet(path: str) -> bool:
-    """Is a SUCCESSFUL request on this path beneath the access log's notice? See above."""
+    """Is a SUCCESSFUL request on this path beneath the access log's notice?"""
     return path in QUIET_PATHS or path.endswith(QUIET_SUFFIXES)
 
 
 # -- the dashboard's own liveness (spec §1, §2, §3 of
-# docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md)
 
 
 def _routed(request) -> bool:
-    """Does this request match a route? The measured fault's own discriminator: unrouted
-    paths answered 404 in 1ms while every routed page hung, so counting them would make a
-    stream of 404s read as a wedge (spec §1). Starlette 1.3.1: `route.matches(scope)`
-    returns `(Match, scope)` and only `Match.FULL` is a hit."""
+    """Does this request match a route?"""
     from starlette.routing import Match
 
     try:
@@ -315,57 +224,29 @@ def _routed(request) -> bool:
 
 
 def _pool_ping() -> bool:
-    """The probe's whole job in the thread: return. No I/O, no lock, nothing that can
-    fail for a reason other than the pool itself."""
+    """The probe's whole job in the thread: return"""
     return True
 
 
 class PoolProbe:
-    """Is the one anyio threadpool every page handler runs in still serving?
-
-    The dashboard wedged for ~4 minutes with `systemctl` reporting `active (running)`,
-    the event loop healthy (unrouted paths answered 404 in 1ms) and every routed page
-    silent, because every page handler is a sync `def` and they all share this pool. No
-    error was raised, so every existing surface — `uilog.record_error`, the access log,
-    `Daemon.check_ui_log`, `invariants.check_ui_healthy` — stayed silent: the OS had a
-    negative liveness signal only, and it was never written. This is the positive one.
-
-    WHY THE PROBE CANNOT MAKE THINGS WORSE: a token is only taken once the limiter grants
-    it, so cancelling an acquire that is still *waiting* releases nothing, because nothing
-    was borrowed. The shielded hold at `anyio/_backends/_asyncio.py:2558-2559` applies to
-    a token already granted — to a job already running in a thread — and this probe's job
-    is a `return`, so it never sits there. Worst case under a wedge: one more waiter,
-    timed out and cancelled. A rig on anyio 4.14.1 measured `borrowed_tokens 0 /
-    available 40` after 120 cancellations of exactly this shape.
-
-    All state is in process memory. Nothing here writes to a database, and nothing on the
-    request path reads one.
-    """
+    """Is the one anyio threadpool every page handler runs in still serving?"""
 
     def __init__(self) -> None:
         from .. import bugreport
         from ..catalog import UiHealthConfig
 
         self.started_at = time.time()
-        # The settings the probe last resolved. `/healthz` reads THIS rather than the
-        # catalog: resolving one would be a filesystem read on the event loop, in the
-        # endpoint whose contract is that it touches nothing (spec §1).
+        # The settings the probe last resolved
         self.cfg = UiHealthConfig()
         self.last_ok: float | None = None
         self.consecutive_failures = 0
         self.wedged_since: float | None = None
         self.stack_dump: str | None = None
-        # Routed requests in flight, keyed by a counter: a monotonic start time and a
-        # label. Registered on the EVENT LOOP by `access_log`, where a wedged pool cannot
-        # hide them — the shipped probe saw a saturated limiter only, and production was
-        # never saturated (spec §1, kn-5b1be5c3).
+        # Routed requests in flight, keyed by a counter: a monotonic start time and a label
         self._inflight: dict[int, tuple[float, str]] = {}
         self._inflight_seq = 0
         self.probe_failure_reason = ""
-        # Resolved once, here: `jarvis_version` shells out to git on its first call, and
-        # `/healthz` must never be the request that pays for that. Swallowed, for the
-        # reason `instance_badge` swallows it: a version string must not be why the app
-        # fails to build.
+        # Resolved once, here: `jarvis_version` shells out to git on its first call
         try:
             self.version = bugreport.jarvis_version()
         except Exception:  # noqa: BLE001
@@ -373,9 +254,7 @@ class PoolProbe:
 
     @staticmethod
     def limiter_figures() -> dict[str, int]:
-        """The anyio capacity limiter every sync handler queues on. `available_tokens`
-        is on the limiter; `tasks_waiting` only on its statistics — checked against the
-        installed anyio 4.14.1 rather than taken from prose."""
+        """The anyio capacity limiter every sync handler queues on"""
         import anyio.to_thread
 
         try:
@@ -389,8 +268,7 @@ class PoolProbe:
             return {"borrowed": 0, "available": 0, "total": 0, "waiting": 0}
 
     def begin(self, method: str, path: str) -> int:
-        """Register one routed request. Dict writes only: this is on the request path and
-        may never raise (spec §1)."""
+        """Register one routed request"""
         self._inflight_seq += 1
         key = self._inflight_seq
         self._inflight[key] = (time.monotonic(), f"{method} {path}")
@@ -400,7 +278,7 @@ class PoolProbe:
         self._inflight.pop(key, None)
 
     def oldest_inflight(self) -> tuple[float, str] | None:
-        """Age in seconds and label of the longest-running routed request, or None."""
+        """Age in seconds and label of the longest-running routed request, or None"""
         entries = list(self._inflight.values())
         if not entries:
             return None
@@ -409,20 +287,17 @@ class PoolProbe:
 
     @property
     def pool_healthy(self) -> bool:
-        """The last probe ROUND passed — the pool round-trip AND the in-flight check,
-        whichever of the two would have failed. A probe that has never run reads as
-        healthy: silence from a probe that was never started is not evidence of a wedge."""
+        """The last probe ROUND passed — the pool round-trip AND the in-flight check"""
         return self.consecutive_failures == 0
 
     def wedged(self, trip_threshold: int) -> bool:
-        """Failed often enough to be a wedge rather than one slow moment. This, and not
-        the HTTP status, is what the daemon acts on."""
+        """Failed often enough to be a wedge rather than one slow moment"""
         return self.consecutive_failures >= trip_threshold
 
     def payload(self, cfg) -> dict:
         now = time.time()
         oldest = self.oldest_inflight()
-        # No `version` and no `stack_dump`: `/healthz` is unauthenticated (review round 1).
+        # No `version` and no `stack_dump`: `/healthz` is unauthenticated (review round 1)
         return {
             "pool_healthy": self.pool_healthy,
             "wedged": self.wedged(cfg.trip_threshold),
@@ -439,8 +314,7 @@ class PoolProbe:
         }
 
     async def step(self, cfg) -> bool:
-        """One round, two checks: the pool round-trip, and whether any routed request has
-        been in flight longer than the timeout (spec §1)."""
+        """One round, two checks: the pool round-trip"""
         import anyio
 
         try:
@@ -464,9 +338,7 @@ class PoolProbe:
         return False
 
     def _trip(self) -> None:
-        """Dump this process's stacks — the only way to get the frames at all, since
-        py-spy could not attach. Every trip dumps, so a wedge that stays wedged keeps
-        producing evidence; `uilog` rotates the file so it cannot fill the directory."""
+        """Dump this process's stacks — the only way to get the frames at all, since py-spy could not attach"""
         stamp = uilog.record_wedge(limiter=self.limiter_figures(),
                                    uptime_seconds=time.time() - self.started_at,
                                    version=self.version)
@@ -474,12 +346,11 @@ class PoolProbe:
         self.stack_dump = stamp.get("dump") or None
 
     async def run(self) -> None:
-        """The lifespan task: probe, sleep, repeat. Cancelled on shutdown."""
+        """The lifespan task: probe, sleep, repeat"""
         import anyio
 
         while True:
-            # Re-resolved every round, so `jarvis config set os.ui_health.…` is in force
-            # without restarting the dashboard (`ops.APPLY_RULES` calls these `hot`).
+            # Re-resolved every round, so `jarvis config set os.ui_health.…` is in force without restarting the...
             self.cfg = ops.ui_health_config()
             if self.cfg.enabled:
                 await self.step(self.cfg)
@@ -487,14 +358,7 @@ class PoolProbe:
 
 
 def _stale_link_hint(name: str, wo_id: str) -> str:
-    """Why a work-order deep link went bad, as the visitor should read it.
-
-    Almost every visitor who lands on one followed a deep link out of a notification, so
-    the useful answer is "your link is stale", not the lookup's own phrasing — and it says
-    which half of the link went bad. ONE helper because two routes render it (`/wo/…` and
-    `/wo/…/debug`): two copies would come to tell a visitor two different things about
-    one bad link.
-    """
+    """Why a work-order deep link went bad, as the visitor should read it"""
     known = sorted(ops.registered_project_paths())
     if name not in known:
         return (f"This link points at project {name!r}, which the OS does not "
@@ -507,18 +371,7 @@ def _stale_link_hint(name: str, wo_id: str) -> str:
 
 
 def _block(label: str, read, *args, **kwargs) -> dict:
-    """One of the debugging page's four readings, fetched so the other three survive it.
-
-    DEGRADATION IS A FEATURE, NOT AN ERROR PAGE (spec §7): the page is four independent
-    readings of one order, and a dashboard 500 costs more than a missing block — `uilog`
-    turns it into an inbox item and `INV-UI-HEALTHY` into a fleet alarm. So a failure here
-    becomes a note that names what failed, and the block renders it.
-
-    An `ops.OpsError` is an EXPECTED absence (no session, an expired transcript, an order
-    that predates a ledger) and is recorded nowhere; anything else is a defect in the
-    reader, so it still goes to `uilog` and reaches the user through the inbox. Same
-    reading the unhandled-exception handler takes, one block down.
-    """
+    """One of the debugging page's four readings, fetched so the other three survive it"""
     try:
         return {"payload": read(*args, **kwargs), "error": ""}
     except ops.OpsError as e:
@@ -532,14 +385,7 @@ def _block(label: str, read, *args, **kwargs) -> dict:
 
 
 def _fix_filed_notice(filed: str) -> str:
-    """What the fix POST just did, rebuilt from its `?filed=` — `ops` owns every word.
-
-    AN APPROVAL ID, A `pending-<id>`, OR A BOUNDED FLAG, and anything else renders NOTHING:
-    a note built from the query string reads as the OS speaking about what happened to an
-    order (spec §11, and `ops.fix_filed_notice`'s docstring for why that matters even when
-    autoescaped). The pending shape is parsed as the prefix plus an INTEGER — `isdigit`, so
-    `pending-abc` and `pending--1` are not ids and render nothing.
-    """
+    """What the fix POST just did, rebuilt from its `?filed=` — `ops` owns every word"""
     if filed.isdigit():
         return ops.fix_filed_notice(int(filed))
     if filed.startswith(ops.FIX_PENDING_PREFIX):
@@ -549,24 +395,13 @@ def _fix_filed_notice(filed: str) -> str:
 
 
 def _rel_url(request: Request) -> str:
-    """Path plus query — `?error=…` is often the whole story of a failed click."""
+    """Path plus query — `?error=…` is often the whole story of a failed click"""
     q = request.url.query
     return request.url.path + (f"?{q}" if q else "")
 
 
 def instance_badge() -> dict[str, str | bool]:
-    """Which Jarvis this dashboard is driving, for the header.
-
-    Production and development are the same code in two checkouts on one machine
-    (docs/DEPLOYMENT.md), and their dashboards are otherwise identical — so the badge
-    is the only thing stopping someone from acting on the live fleet while believing
-    they are in the dev sandbox. Both facts are read once per process: neither the
-    environment nor the installed version can change under a running server.
-
-    The version is the running one, never a constant in the source: on `main` the
-    version string deliberately lags the shipped tag (only release branches carry the
-    bump), so a literal would be wrong in exactly the place it matters most.
-    """
+    """Which Jarvis this dashboard is driving, for the header (docs/DEPLOYMENT.md)"""
     from ..bugreport import jarvis_version
     env, detail = deployment_env()
     try:
@@ -580,28 +415,14 @@ def instance_badge() -> dict[str, str | bool]:
 
 
 def _version_for_badge(version: str) -> str:
-    """`0.5.0` → `v0.5.0`; `dev-a1b2c3d` → `a1b2c3d`.
-
-    `bugreport.jarvis_version` reports a release as a bare number and everything else
-    as `dev-<sha>` (a dev build is not "0.5.0 plus a bit"). The badge already says
-    which instance this is, so pasting that in raw would read `dev · vdev-a1b2c3d` —
-    the word twice, and a `v` in front of a commit sha. Only a real version number
-    gets the `v`; the tooltip carries the string unaltered either way.
-    """
+    """`0.5.0` → `v0.5.0`; `dev-a1b2c3d` → `a1b2c3d`"""
     if version.startswith("dev-"):
         return version[len("dev-"):]
     return f"v{version}" if version[:1].isdigit() else version
 
 
 def _false_positive_rate(rows: list) -> str | None:
-    """"3 of 11 (27%)" — how often the gate fired on a command that ships nothing.
-
-    Measured over requests a reviewer actually ruled on, and the set is named
-    POSITIVELY: `status != "pending"` also swept in `awaiting_case` rows nobody has
-    seen and `expired` ones nobody decided, both of which dilute the rate by sitting
-    in the denominator as non-dismissals. A gate state enumerated by negation gets
-    every new state wrong (kn-8d77ab41).
-    """
+    """"3 of 11 (27%)" — how often the gate fired on a command that ships nothing"""
     ruled = [g for g in rows if g["status"] in ("approved", "denied", "dismissed")]
     if not ruled:
         return None
@@ -610,22 +431,12 @@ def _false_positive_rate(rows: list) -> str | None:
 
 
 def _abandoned(rows: list) -> int:
-    """Held requests whose worker never came back — no case, no contest.
-
-    Beside the rate, never inside it. Nobody reviewed one, so it is evidence about the
-    classifier rather than a verdict on it — and on the evidence so far, mostly false
-    positives a worker routed around. Spec 2026-09-12 §5.
-    """
+    """Held requests whose worker never came back — no case, no contest"""
     return sum(1 for g in rows if g["closed_as"] == "abandoned")
 
 
 def gate_badge() -> int | None:
-    """How many gates are waiting on the user, for the nav.
-
-    Only escalated ones count: a request Neo is still reviewing is deliberately
-    free of charge, and badging it would undo the point of having Neo. Never
-    raises — a badge must not be the reason a page 500s.
-    """
+    """How many gates are waiting on the user, for the nav"""
     try:
         return len([g for g in ops.list_gates(pending_only=True)
                     if g["escalated"]]) or None
@@ -634,15 +445,7 @@ def gate_badge() -> int | None:
 
 
 def alarm_badge() -> int | None:
-    """How many SUBJECTS are asking for the user because of an alarm.
-
-    Counted over subjects, not over events: several alarms on one thing are one ask and
-    one ack. Over `subject_id` rather than `wo_id` since §1 of
-    docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md — findings on two
-    features that share a carrier are two asks, and findings on one feature reached
-    through two carriers are one. Never raises: a badge must not be the reason a page
-    500s.
-    """
+    """How many SUBJECTS are asking for the user because of an alarm (docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md)"""
     try:
         return len({a["subject_id"] for a in ops.list_cost_alarms()
                     if a["live"]}) or None
@@ -651,10 +454,9 @@ def alarm_badge() -> int | None:
 
 
 def _order_href(order_id: str) -> str | None:
-    """Where an allow-listed order's page is, or None when it no longer resolves."""
+    """Where an allow-listed order's page is, or None when it no longer resolves"""
     try:
-        # Issue #997: `fo-` only, so an allow-listed `io-`/`inv-` id was looked up as a
-        # work order, resolved to None and lost its link.
+        # Issue #997: `fo-` only, so an allow-listed `io-`/`inv-` id was looked up as a work order
         if is_feature_order_id(order_id):
             pname, _, _ = ops.find_feature_order(order_id)
         else:
@@ -665,13 +467,7 @@ def _order_href(order_id: str) -> str | None:
 
 
 def brake_state() -> dict | None:
-    """The user's brake (`jarvis pause`) and the post-reopen ramp, for the banner every
-    page carries — or None when neither is in force.
-
-    `ops.fleet_summary`, the dict `jarvis status` prints its "⏸ FLEET PAUSED" line from,
-    so the page and the terminal read one record (issue #843). Never raises, like the nav
-    badges: a banner must not be the reason a page 500s.
-    """
+    """The user's brake (`jarvis pause`) and the post-reopen ramp, for the banner every page carries (#843)"""
     try:
         central = CentralStore()
         try:
@@ -691,41 +487,23 @@ def brake_state() -> dict | None:
 
 
 def _decorate_question(q: dict) -> dict:
-    """Add the two display-only fields the `/neo` question blocks render.
-
-    `digest_view` is the shortened rendering (`jarvis.digest`), or None when there
-    isn't one — never attempted, attempted and failed, or the row predates the feature.
-    The template shows the full question in every one of those cases, so a page with no
-    digests anywhere is the page as it was before this existed.
-
-    `full_context` is what the disclosure reveals: EXACTLY the question-specific prompt
-    Neo was sent, built by the same function that builds it for the call. Not the system
-    prompt — that is the persona plus every learning, identical on every question, and
-    putting it here would bury the one thing the user opened the disclosure to read.
-    Building it here rather than storing it means it cannot drift from what Neo gets.
-    """
+    """Add the two display-only fields the `/neo` question blocks render"""
     from .. import digest, issues, neo
     q["digest_view"] = digest.decode(q.get("digest"))
     q["full_context"] = neo.build_question_prompt(q)
-    # `triage` only, and empty everywhere else: the one kind whose subject is a tracker
-    # issue rather than a work order, so it is the one with nowhere else to send a reader.
+    # `triage` only, and empty everywhere else: the one kind whose subject is a tracker issue rather than...
     q["issue_url"] = (issues.triage_payload(q) or {}).get("issue_url") or ""
     return q
 
 
 def _digest_credit() -> str:
-    """Attribution for the vendored output style, shown once on the page."""
+    """Attribution for the vendored output style, shown once on the page"""
     from .. import digest
     return digest.skill_attribution()
 
 
 def fmt_tok(n: int | None) -> str:
-    """Token counts, at the magnitude a reader actually compares — 1.3M, 47k, 812.
-
-    Mirrors `cli._tok`, deliberately as a second small implementation rather than an
-    import: the CLI's is a private helper of a module the UI has no other reason to
-    load, and the shared thing here is a formatting convention, not behaviour.
-    """
+    """Token counts, at the magnitude a reader actually compares — 1.3M, 47k, 812"""
     if not n:
         return "0"
     if n >= 1_000_000:
@@ -736,11 +514,7 @@ def fmt_tok(n: int | None) -> str:
 
 
 def fmt_dur(seconds: float | None) -> str:
-    """Turn durations at a readable magnitude — 1.2h, 4m, 15s.
-
-    Mirrors `cli._dur` the same way `fmt_tok` mirrors `cli._tok`: the shared thing is
-    a formatting convention, not behaviour.
-    """
+    """Turn durations at a readable magnitude — 1.2h, 4m, 15s"""
     if seconds is None:
         return "—"
     if seconds >= 3600:
@@ -751,19 +525,7 @@ def fmt_dur(seconds: float | None) -> str:
 
 
 def wo_bill(wo_id: str, project: str) -> dict | None:
-    """One work order's itemised bill, or None if there is nothing measurable to show.
-
-    NEVER RAISES, and that is the whole contract. This is a read of Claude Code's
-    transcripts — files Jarvis does not own, that it prunes on its own schedule, and
-    whose format is not Jarvis's to guarantee. The work order page has to render when a
-    worker is blocked on a gate, and a page that 500s because a JSONL file moved would
-    take that decision surface down with it. None means "no figure to show" and the
-    template simply omits the line.
-
-    A bill with no tokens on it is None too: an order whose transcript has been pruned
-    and which cost the OS nothing has nothing to itemise, and a page of zeroes reads as
-    a claim that it was free.
-    """
+    """One work order's itemised bill, or None if there is nothing measurable to show"""
     try:
         bill = ops.bill(wo_id, project=project)
     except Exception:  # noqa: BLE001 — see docstring
@@ -772,14 +534,7 @@ def wo_bill(wo_id: str, project: str) -> dict | None:
 
 
 def turn_lines_by_message(bill: dict | None) -> dict[int, dict]:
-    """message id → the bill line for the turn that message set going.
-
-    So the conversation can carry its own cost: a message is the ASK, and what it cost
-    is the turn that answered it — the same line, the same numbers, shown where the
-    reader is already looking rather than only on a separate page. Never a second
-    accounting: it is a reference to a line that is already in the totals, which is why
-    the page says "the turn it started" rather than presenting it as the message's own.
-    """
+    """message id → the bill line for the turn that message set going"""
     if not bill:
         return {}
     out: dict[int, dict] = {}
@@ -791,12 +546,7 @@ def turn_lines_by_message(bill: dict | None) -> dict[int, dict]:
 
 
 def config_setters(history: list[dict]) -> dict[str, str]:
-    """path → the id of the most recent version that changed it.
-
-    Only half of a key's provenance: a version's change list says what was WRITTEN at
-    the time, and `ops.config_show`'s `written` says what the document still sets. A key
-    the file no longer sets is on a default however many versions once named it.
-    """
+    """path → the id of the most recent version that changed it"""
     setters: dict[str, str] = {}
     for row in reversed(history):  # oldest first, so the last writer wins
         for change in row["changes"]:
@@ -805,30 +555,20 @@ def config_setters(history: list[dict]) -> dict[str, str]:
 
 
 def config_scope_of(path: str) -> str:
-    """The catalog block a resolved path lives in: `os`, or one `projects.<name>`."""
+    """The catalog block a resolved path lives in: `os`, or one `projects.<name>`"""
     parts = path.split(".")
     return "os" if parts[0] == "os" else ".".join(parts[:2])
 
 
 def config_scopes(resolved: dict) -> list[dict]:
-    """Every block the page can be pointed at, for the picker at the top.
-
-    One scope is on screen at a time: the fleet's settings and forty projects' used
-    to be one column the reader scrolled through to reach the project they came for.
-    """
+    """Every block the page can be pointed at, for the picker at the top"""
     names = sorted({p.split(".")[1] for p in resolved if p.startswith("projects.")})
     return ([{"key": "os", "title": "os — the fleet"}]
             + [{"key": f"projects.{n}", "title": n} for n in names])
 
 
 def config_tree(labels: list[str], node: str = "") -> list[dict]:
-    """One scope's dotted labels as the nested nodes a tree renders.
-
-    Only an interior segment becomes a node: `neo.panel.fast_path` gives `neo` and
-    `neo.panel`, and the leaf is a setting the node's page shows. `open` is what keeps
-    the selected node's ancestors unfolded — the tree is plain HTML, so a node's state
-    has to be decided here rather than by a click nobody is listening for.
-    """
+    """One scope's dotted labels as the nested nodes a tree renders"""
     def build(prefix: str, entries: list[str]) -> list[dict]:
         groups: dict[str, list[str]] = {}
         for label in entries:
@@ -861,7 +601,7 @@ def config_type_name(value: object) -> str:
 
 
 def config_widget(value: object) -> str:
-    """Which input a setting is edited with — the whole of the page's type awareness."""
+    """Which input a setting is edited with — the whole of the page's type awareness"""
     if isinstance(value, bool):
         return "bool"
     if isinstance(value, (int, float)):
@@ -872,7 +612,7 @@ def config_widget(value: object) -> str:
 
 
 def config_input_text(value: object) -> str:
-    """The submitted-text form of a value, so an edit starts from what is already set."""
+    """The submitted-text form of a value, so an edit starts from what is already set"""
     if isinstance(value, str):
         return value
     if value is None:
@@ -881,12 +621,7 @@ def config_input_text(value: object) -> str:
 
 
 def config_value_of(current: object, text: str) -> object:
-    """What the page will write for `text`, given the value already there.
-
-    A text setting takes its text VERBATIM — `os.defaults.model` is the string `123` if
-    that is what the user typed — and everything else goes through the CLI's own parser,
-    so `true`, `3` and `["a"]` mean on this page what they mean in the terminal.
-    """
+    """What the page will write for `text`, given the value already there"""
     if isinstance(current, str):
         return text
     if current is None and not text.strip():
@@ -895,16 +630,7 @@ def config_value_of(current: object, text: str) -> object:
 
 
 def config_type_ok(current: object, new: object) -> bool:
-    """May `new` be written where `current` is? Neo, q193.
-
-    The page is where this lives because the page is what has an untyped text box:
-    `parse_catalog` takes `true` for `os.defaults.model` without a word, and answers a
-    bad whole number with a bare `ValueError` rather than the `CatalogError` `ops`
-    converts. Widening `ops.set_config`'s own contract is a different change.
-
-    An unset optional takes anything; nothing else takes `null`, because a key present
-    and null is not the same as absent and `jarvis config unset` is what clears one.
-    """
+    """May `new` be written where `current` is?"""
     if current is None:
         return True
     if new is None:
@@ -919,26 +645,20 @@ def config_type_ok(current: object, new: object) -> bool:
 
 
 def _config_nodes(label: str) -> list[str]:
-    """Every interior node a dotted label passes through: `a.b.c` → `a`, `a.b`."""
+    """Every interior node a dotted label passes through: `a.b.c` → `a`, `a.b`"""
     parts = label.split(".")
     return [".".join(parts[:i]) for i in range(1, len(parts))]
 
 
 def _config_url(scope: str, node: str = "", q: str = "") -> str:
-    """The page as it is being read right now, so a save comes back to it rather than
-    dropping the reader at the top of the fleet's settings."""
+    """The page as it is being read right now"""
     query = {k: v for k, v in (("scope", scope), ("node", node), ("q", q)) if v}
     return "/config" + (f"?{urlencode(query)}" if query else "")
 
 
 def config_rows(show: dict, setters: dict[str, str], scope: str,
                 node: str = "", query: str = "") -> list[dict]:
-    """The settings one scope shows, narrowed by the tree node or by the search box.
-
-    A SEARCH OVERRIDES THE NODE rather than narrowing it: someone typing `autocompact`
-    is searching precisely because they do not know which node it is under, and a search
-    inside the selected node answers nothing unless they had already guessed right.
-    """
+    """The settings one scope shows, narrowed by the tree node or by the search box"""
     resolved, written = show["resolved"], set(show["written"])
     needle = query.strip().lower()
     rows = []
@@ -953,9 +673,7 @@ def config_rows(show: dict, setters: dict[str, str], scope: str,
             continue
         value = resolved[path]
         rows.append({"path": path, "label": label, "value": value,
-                     # Which node the match came out of, so a search result set can be
-                     # grouped by it (Neo, q194) — the tree is not narrowed by a search,
-                     # so the row has to say where it lives.
+                     # Which node the match came out of, so a search result set can be grouped by it (Neo, q194)
                      "node": label.rpartition(".")[0],
                      "widget": config_widget(value), "text": config_input_text(value),
                      "written": path in written, "safety": ops.safety_key(path),
@@ -963,9 +681,7 @@ def config_rows(show: dict, setters: dict[str, str], scope: str,
     return rows
 
 
-#: Which of the user's own MCP servers, skills and plugins reach this scope's workers.
-#: The order is the page's: the servers first, because that is the one measured to move
-#: the prompt prefix (kn-809104fc) and therefore the one with a reason to be here.
+#: Which of the user's own MCP servers, skills and plugins reach this scope's workers
 WIRING_GROUPS = (
     ("mcp", "MCP servers",
      "Every server your Claude configuration has. Deselecting one keeps it out of the "
@@ -978,9 +694,7 @@ WIRING_GROUPS = (
      "agents. Deselecting it takes all three."),
 )
 
-#: The one row the page has evidence about, so it is the one row that carries any. Kept
-#: to a sentence: the finding's own headline warns against reading it as more than it is
-#: (docs/superpowers/findings/2026-09-14-which-mcp-server-moves-the-prefix.md, finding 1).
+#: The one row the page has evidence about, so it is the one row that carries any (docs/superpowers/findings/2026-09-14-which-mcp-server-moves-the-prefix.md)
 WIRING_EVIDENCE = {
     wiring.LEVER_CONNECTORS:
         "Measured: this block precedes a conversation-sized cache write 83.7% of the "
@@ -989,26 +703,19 @@ WIRING_EVIDENCE = {
 
 
 def wiring_project(scope: str) -> str | None:
-    """The project a /config scope names, or None for the fleet base."""
+    """The project a /config scope names, or None for the fleet base"""
     return None if scope == "os" else scope.split(".", 1)[1]
 
 
 def wiring_groups(scope: str, *, refresh: bool = False) -> dict[str, object]:
-    """The wiring section for one scope, or an `error` the page renders instead.
-
-    Total, like every other read this page makes: discovery shells out to the `claude`
-    CLI and reads the user's files, so a machine where that fails must still render the
-    settings table underneath. The failure becomes a line, never a 500.
-    """
+    """The wiring section for one scope, or an `error` the page renders instead"""
     try:
         data = ops.wiring_show(project=wiring_project(scope), refresh=refresh,
                                block=False)
     except (ops.OpsError, OSError, ValueError) as e:
         return {"error": str(e), "groups": [], "errors": [], "reading": False}
     groups = []
-    # ONCE PER LEVER, not once per row: nine claude.ai connectors share one switch, and
-    # the same sentence nine times down the column is how a measurement becomes
-    # wallpaper. It goes on the first row the lever appears on.
+    # ONCE PER LEVER, not once per row: nine claude.ai connectors share one switch
     said: set[str] = set()
     for kind, title, blurb in WIRING_GROUPS:
         rows = []
@@ -1029,15 +736,7 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        """Owns the liveness probe task (spec §2).
-
-        A lifespan rather than `cli.cmd_ui`, so it starts for ANY server of this app and
-        for `TestClient` used as a context manager, and is cancelled on shutdown instead
-        of outliving the server. A `TestClient` built WITHOUT the context manager runs no
-        lifespan, so the probe never starts and leaves no stray task — `/healthz` then
-        reports a pool it has no evidence against, which is what the 18 tests in
-        tests/test_ui.py see.
-        """
+        """Owns the liveness probe task (spec §2)"""
         import anyio
 
         async with anyio.create_task_group() as tg:
@@ -1052,115 +751,72 @@ def create_app() -> FastAPI:
 
     @app.get("/healthz")
     async def healthz() -> JSONResponse:
-        """Does the dashboard still serve? (spec §1)
-
-        `async def`, and that is the whole point: a sync `def` would be queued onto the
-        very pool it reports on and would hang exactly when it is needed. It touches no
-        store, no catalog read on the request path, no template and not `render()` (which
-        opens a `NeoStore` per request) — everything it reports is already in process
-        memory, written by the probe task.
-
-        503 when the last round-trip failed, for a human with `curl`. The daemon reads
-        the PAYLOAD and treats "times out" and "reports wedged" identically, so the
-        status code is never the only signal.
-        """
+        """Does the dashboard still serve? (spec §1)"""
         body = probe.payload(probe.cfg)
         return JSONResponse(body, status_code=200 if body["pool_healthy"] else 503)
 
     @app.middleware("http")
     async def no_store(request: Request, call_next):
-        # Every page reflects live OS state (inbox acks, work order status); a
-        # browser serving a stale copy from disk cache or history (bfcache) after
-        # the user navigates back would show notifications as still unacked.
+        # Every page reflects live OS state (inbox acks, work order status)
         response = await call_next(request)
         response.headers["Cache-Control"] = "no-store"
         return response
 
-    # Inside the factory, like every other same-tier import in this file: `cli` and `ui`
-    # are one tier and the layering runs downward only. The five buckets' wording is READ
-    # from where `jarvis inspect` prints it rather than re-worded here — a legend that says
-    # one thing in the terminal and another on the page is one the reader learns to ignore.
-    from ..cli import PART_LABELS, PART_SHORT, _held_phrase
+    # Inside the factory, like every other same-tier import in this file: `cli` and `ui` are one tier and...
+    from ..cli import (ATTENTION_LIST_NOTE, INBOX_LIST_NOTE, PART_LABELS, PART_SHORT,
+                       _held_phrase)
 
     templates = Jinja2Templates(directory=str(TEMPLATES))
     templates.env.globals.update(
         status_meta=STATUS_META, origin_meta=ORIGIN_META, gate_meta=GATE_META,
         gate_display=gate_display,
-        # Every link to an order's page goes through this — see `order_path` (#997).
+        # What each list is and which command clears it — the same words `jarvis status` prints (io-d2a5dd69)
+        attention_list_note=ATTENTION_LIST_NOTE, inbox_list_note=INBOX_LIST_NOTE,
+        # Every link to an order's page goes through this — see `order_path` (#997)
         order_path=order_path,
-        # A round's word, tone and icon — the same tuple `ops.round_line` and
-        # `automerge.decide` render from, so no surface can call a CI wait a failure on
-        # its own (GitHub issue #581).
+        # A round's word, tone and icon — the same tuple `ops.round_line` and `automerge.decide` render from (#581)
         validation_standing=validation_standing,
         fo_status_meta=FO_STATUS_META, level_tone=LEVEL_TONE, fmt_age=fmt_age,
         fmt_left=fmt_left,
-        # Shared with `jarvis alarms` rather than spelled inline, so neither surface can
-        # be the one that shows a subject-level finding as `turn -1`.
+        # Shared with `jarvis alarms` rather than spelled inline
         turn_label=ops.turn_label, no_turn=NO_TURN,
-        # "What is not on this bill", worded ONCE in `bill.ABSENT_NOTES` and read by this
-        # page and `jarvis cost` both — it was spelled out in each until §10 needed a
-        # fourth sentence, and a caveat worded two ways is one the reader stops trusting.
+        # "What is not on this bill", worded ONCE in `bill.ABSENT_NOTES` and read by this page and `jarvis...
         absent_notes=bill.absent_notes,
-        # Same reason one sentence along: the subagent side's STRUCTURAL zero is worded
-        # once, in `bill.SUBAGENT_REWRITE_ZERO`, and read by this page and `jarvis cost`.
+        # Same reason one sentence along: the subagent side's STRUCTURAL zero is worded once
         subagent_rewrite_zero=bill.SUBAGENT_REWRITE_ZERO,
-        # And one sentence further along: what a placeholder output figure means, worded
-        # once in `bill.PLACEHOLDER_NOTE` (spec 2026-10-08 §7).
+        # And one sentence further along: what a placeholder output figure means
         placeholder_note=bill.PLACEHOLDER_NOTE,
         placeholder_zero=bill.PLACEHOLDER_ZERO,
-        # The tool table's ROW ORDER, shared with `jarvis cost --fleet` for the reason
-        # the partial already gives about figures: an order computed in a renderer is
-        # one the other renderer disagrees with (§10.7).
+        # The tool table's ROW ORDER, shared with `jarvis cost --fleet` for the reason the partial already...
         tool_table=fleetcost.tool_table,
-        # Same reason, for the assumption badge: `jarvis wo show` and this page must
-        # not be able to disagree about whether the OS or the user decided one.
+        # Same reason, for the assumption badge: `jarvis wo show` and this page must not be able to disagree...
         assumption_decider=ops.assumption_decider,
-        # And the OS's RULING on one, same reason one authority along: the page and
-        # `jarvis wo show` must not be able to disagree about whether an assumption was
-        # escalated, held or never looked at (GitHub issue #712).
+        # And the OS's RULING on one, same reason one authority along: the page and `jarvis wo show` must not... (#712)
         assumption_ruling_line=ops.assumption_ruling_line,
-        # The early pass's three facts, same reason again (§8 of the early-review spec):
-        # Neo's provisional reading, the objection sent to the worker and what the worker
-        # did about it. The page renders what `jarvis wo show` prints, from these
-        # functions — a phrase spelled in the template would be a second renderer, and
-        # the one that drops "provisionally" is the one somebody reads.
+        # The early pass's three facts, same reason again (§8 of the early-review spec): Neo's provisional...
         provisional_line=ops.provisional_line,
         objection_line=ops.objection_line,
         objection_response_line=ops.objection_response_line,
-        # And what has already LANDED under a plan the user has not ratified — the fact
-        # a rejection's cost turns on, on both surfaces for the same reason (spec
-        # docs/superpowers/specs/2026-09-24-a-planner-assumption-holds-its-feature.md).
+        # And what has already LANDED under a plan the user has not ratified (docs/superpowers/specs/2026-09-24-a-planner-assumption-holds-its-feature.md)
         overtaken_line=ops.overtaken_line,
-        # "a worker turn may be in flight right now", so the page can withhold the
-        # `claude --resume` invitation rather than put a second driver on one session.
+        # "a worker turn may be in flight right now"
         active_statuses=ACTIVE_STATUSES,
-        # The statuses the user's brake can hold — where a "let this order through"
-        # button means something. The daemon's own list, not a page-local guess.
+        # The statuses the user's brake can hold — where a "let this order through" button means something
         fleet_held_statuses=invariants.FLEET_HELD_STATUSES,
         instance=instance_badge(),
         fmt_tok=fmt_tok, fmt_dur=fmt_dur, fmt_ts=fmt_ts,
-        # The bill's two explanations, taken from the module that computes the numbers
-        # rather than written into the template: a caveat that says one thing on the
-        # page and another in the terminal is one the reader learns to ignore.
+        # The bill's two explanations, taken from the module that computes the numbers rather than written...
         rate_note=bill.rate_note, tokens_mean=bill.TOKENS_MEAN,
         write_rate_of=bill.write_rate_of,
-        # The debugging page's legends, taken from the modules that MEASURE rather than
-        # spelled into the template — same rule as the bill's two notes above (spec §7).
-        # `PARTS` is the bucket order every renderer walks, `PART_LABELS`/`PART_SHORT` the
-        # wording `jarvis inspect` prints, and `PREFIX_AUTHORITY` the precedence the page
-        # must state beside a prefix break it did not measure (kn-fafe92b7).
+        # The debugging page's legends, taken from the modules that MEASURE rather than spelled into the...
         parts=PARTS, part_labels=PART_LABELS, part_short=PART_SHORT,
         prefix_authority=ops.PREFIX_AUTHORITY,
-        # The residual's own sentence, shared with `jarvis wo why` for the same reason:
-        # a residual described in two wordings is one the reader learns to ignore.
+        # The residual's own sentence, shared with `jarvis wo why` for the same reason: a residual described...
         unexplained_note=ops.UNEXPLAINED_NOTE,
-        # The status-span view's two sentences, from `ops` and not spelled here — the
-        # CLI prints the identical words (spec §6, §7).
+        # The status-span view's two sentences, from `ops` and not spelled here
         approximate_note=ops.FO_APPROXIMATE_NOTE,
         no_trigger_phrase=ops.NO_TRIGGER_PHRASE,
-        # "a fleet usage limit and 2 others" — the CLI's own sentence, imported rather
-        # than spelled in Jinja: the page and `jarvis wo show` must not be able to name
-        # a hold's cause two ways (spec §3).
+        # "a fleet usage limit and 2 others"
         held_phrase=_held_phrase,
     )
 
@@ -1184,9 +840,7 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(Exception)
     def unhandled(request: Request, exc: Exception) -> HTMLResponse:
-        """Last line of defence: a bare "Internal Server Error" tells the user
-        nothing, and a dead-end deep link out of a Telegram alert is exactly where
-        they land. Name the failure on the page and put the traceback on disk."""
+        """Last line of defence: a bare "Internal Server Error" tells the user nothing"""
         uilog.record_error(request.method, request.url.path, exc)
         message = (f"Something went wrong loading {request.url.path} — "
                    f"{type(exc).__name__}: {exc}. "
@@ -1200,25 +854,16 @@ def create_app() -> FastAPI:
 
     @app.middleware("http")
     async def access_log(request: Request, call_next):
-        """One line per request in `$JARVIS_HOME/logs/ui-access.log`.
-
-        Uvicorn runs at log_level='warning' and its access log would go to the journal
-        anyway. Without this there is no record of which deep links were followed or
-        which of them failed, which is what made "I clicked the link and got an internal
-        server error" impossible to place in time.
-        """
+        """One line per request in `$JARVIS_HOME/logs/ui-access.log`"""
         t0 = time.perf_counter()
-        # Runs on the event loop, before `call_next` queues a sync handler onto the pool:
-        # the one place a wedged request is still visible (spec §1).
+        # Runs on the event loop, before `call_next` queues a sync handler onto the pool: the one place a...
         key = (probe.begin(request.method, request.url.path)
                if request.url.path != "/healthz" and _routed(request) else None)
         try:
             try:
                 response = await call_next(request)
             except Exception:
-                # The handler above renders the page, but it runs *outside* this middleware
-                # (ServerErrorMiddleware is outermost), so this is the only place that sees
-                # both the failure and the elapsed time.
+                # The handler above renders the page
                 uilog.record_access(request.method, _rel_url(request), 500,
                                     (time.perf_counter() - t0) * 1000)
                 raise
@@ -1228,18 +873,15 @@ def create_app() -> FastAPI:
                                     (time.perf_counter() - t0) * 1000)
             return response
         finally:
-            # A 500 and a cancellation both clean up (spec §1).
+            # A 500 and a cancellation both clean up (spec §1)
             if key is not None:
                 probe.end(key)
 
-    # -- pages ------------------------------------------------------------------
+    # -- pages
 
     @app.get("/", response_class=HTMLResponse)
     def dashboard(request: Request, show: str = ""):
-        """The pulse. Open work orders are grouped so the ones the user can act on —
-        a decision they owe, running work, a PR waiting for them to merge it — are
-        rows, and the rest is a count line they can expand (`show` = a status name,
-        or "all")."""
+        """The pulse"""
         st = ops.os_status()
         rows = [{**wo, "project": p["name"]}
                 for p in st["projects"] for wo in p.get("open_work_orders", [])]
@@ -1254,14 +896,7 @@ def create_app() -> FastAPI:
 
     @app.get("/search", response_class=HTMLResponse)
     def search_page(request: Request, q: str = "", project: str = "", kind: str = ""):
-        """Find an artifact again — across the fleet, or inside one project.
-
-        The page the header box and the project page's box both submit to: a completed
-        work order was only reachable by expanding a project's settled count, which is
-        the UX this replaces (wo-edf5c425). `project` is carried on the form, so a
-        search started from a project page stays inside it and can be widened in one
-        click.
-        """
+        """Find an artifact again — across the fleet, or inside one project"""
         from .. import search as search_mod
 
         projects = sorted(ops.registered_project_paths())
@@ -1277,18 +912,7 @@ def create_app() -> FastAPI:
     @app.get("/project/{name}", response_class=HTMLResponse)
     def project(request: Request, name: str, hidden: str = "", show: str = "",
                 fo: str = ""):
-        """A project's work orders — the ones that want the user, by default.
-
-        Work orders owing the user a decision, running ones, and PRs waiting to be
-        merged get a row each. Everything else — work the OS has not started yet, and
-        the settled orders that are the bulk of any project with history — collapses
-        into per-status counts the user can expand. `show` is "" (featured only), any
-        status name (plus that group), or "all".
-
-        `fo` is the same reveal for the feature orders, on its own param rather than
-        sharing `show`: the two lifecycles spell three settled statuses the same way
-        (see FO_STATUS_META), so one param would expand both lists on every click.
-        """
+        """A project's work orders — the ones that want the user, by default"""
         paths = ops.registered_project_paths()
         if name not in paths:
             return render(request, "error.html", message=f"unknown project {name!r}")
@@ -1305,24 +929,16 @@ def create_app() -> FastAPI:
             fo_statuses = FO_OPEN_STATUSES + ((fo_revealed,) if fo_revealed else ())
         store = ProjectStore(paths[name])
         try:
-            # Open feature orders get their own short list above the work orders, and
-            # deliberately do NOT expand into their children here: the children are
-            # already in the listing below as ordinary work orders, and printing the
-            # tree twice on one page is how a page stops being read. The tree lives on
-            # the feature's own page.
+            # Open feature orders get their own short list above the work orders
             features = [{**row, "progress": ops.feature_progress(store, row)}
                         for row in store.list_feature_orders(statuses=fo_statuses)]
-            # Beside the features and never merged into them: `list_feature_orders`
-            # defaults to kind='feature', so the read above already excludes these, and
-            # the two lifecycles spell the same statuses differently (§6.1).
+            # Beside the features and never merged into them: `list_feature_orders` defaults to kind='feature'
             improvements = [
                 {**row,
                  "status_label": feature_status_label("improvement", row["status"])}
                 for row in store.list_feature_orders(statuses=FO_OPEN_STATUSES,
                                                      kind="improvement")]
-            # A third kind beside them, on the same rule and for the same reason (§2.9 of
-            # docs/superpowers/specs/2026-09-27-investigation-orders.md): `planning` here
-            # reads `investigating`, and only LIVE ones are worth a line.
+            # A third kind beside them, on the same rule and for the same reason (§2.9 of... (docs/superpowers/specs/2026-09-27-investigation-orders.md)
             investigations = [
                 {**row,
                  "status_label": feature_status_label("investigation", row["status"])}
@@ -1330,20 +946,18 @@ def create_app() -> FastAPI:
                                                      kind="investigation")]
             fo_counts = store.feature_status_counts()
             wos = store.list_work_orders(statuses=statuses, include_hidden=show_hidden)
-            # Inside the store's lifetime: the label reads the dependencies' own rows.
+            # Inside the store's lifetime: the label reads the dependencies' own rows
             blocked = {wo["id"]: ops.blocked_by(store, wo) for wo in wos}
             blocked = {k: v for k, v in blocked.items() if v}
-            # Same lifetime, same reason: the note reads this work order's last turn.
+            # Same lifetime, same reason: the note reads this work order's last turn
             pauses = {wo["id"]: invariants.pause_note(store, wo) for wo in wos}
-            # ...and the account-wide one, for the orders that own no refusal of their
-            # own. One fleet read for the page, below the per-order note (issue #714).
+            # ...and the account-wide one, for the orders that own no refusal of their own (#714)
             account = _fleet_if_held(wos)
             for wo in wos:
                 if not pauses.get(wo["id"]):
                     pauses[wo["id"]] = invariants.fleet_hold_note(wo, account)
             pauses = {k: v for k, v in pauses.items() if v}
-            # Inside the store's lifetime like every other read on this page. Empty,
-            # and therefore invisible, for a project that has never linked an issue.
+            # Inside the store's lifetime like every other read on this page
             issue_board = ops.issue_board(store)
             visible_counts = store.status_counts()
             all_counts = store.status_counts(include_hidden=True)
@@ -1358,8 +972,7 @@ def create_app() -> FastAPI:
             central.close()
         settled = [(s, counts[s]) for s in TERMINAL_STATUSES if counts.get(s)]
         featured, rest = group_open(wos, revealed)
-        # Counted in SQL rather than from `wos`, which is capped at a page: the same
-        # reason the settled line is. Terminal statuses have their own line below.
+        # Counted in SQL rather than from `wos`
         other_open = [s for s in OPEN_STATUSES if s not in FEATURED_STATUSES]
         open_counts = [(s, counts[s]) for s in other_open if counts.get(s)]
         fo_settled = [(s, fo_counts[s]) for s in FO_TERMINAL_STATUSES
@@ -1377,16 +990,8 @@ def create_app() -> FastAPI:
 
     @app.get("/fo/{name}/{fo_id}", response_class=HTMLResponse)
     def feature_order(request: Request, name: str, fo_id: str, error: str = ""):
-        """A feature order's page. Its main content is the dependency tree.
-
-        The one view where the whole plan is visible at once — the ask, the
-        decomposition as it was submitted, and each child's live status against it. It
-        is also where an escalated plan is decided, because deciding needs all three of
-        those on one screen and no other page has them.
-        """
-        # An id whose prefix names another kind gets its own page, so an old bookmark or
-        # a link built before #997 heals instead of erroring. The ops guard behind this
-        # covers the CLI and the JSON surface, where there is nowhere to redirect to.
+        """A feature order's page"""
+        # An id whose prefix names another kind gets its own page (#997)
         target = order_path(name, fo_id)
         if target != f"/fo/{name}/{fo_id}":
             return RedirectResponse(target, status_code=303)
@@ -1394,21 +999,15 @@ def create_app() -> FastAPI:
             detail = ops.show_feature_order(fo_id, name)
         except ops.OpsError as e:
             return render(request, "error.html", message=str(e))
-        # The deliberation, for the fold. `show_feature_order` deliberately does NOT
-        # carry it — that document is what `jarvis fo show` prints, and the seats'
-        # replies must not ride into it.
+        # The deliberation, for the fold
         store = ProjectStore(ops.registered_project_paths()[detail["project"]])
         try:
             validation = ops.validation_detail(store, fo_id=fo_id)
-            # Taken in the same block, for the same reason: one connection per page
-            # (spec §7).
+            # Taken in the same block, for the same reason: one connection per page (spec §7)
             states = ops.state_durations(store, fo_id=fo_id).as_dict()
         finally:
             store.close()
-        # EACH PLAN ROW'S FRAGMENT, RESOLVED SERVER-SIDE — §5(c). Jinja would need the
-        # number-or-substring matching rule spelled a second time in HTML, where it
-        # could be neither unit-tested nor reused by the CLI; `markdown.anchor_for` is
-        # the one resolver, here as on a child's own page.
+        # EACH PLAN ROW'S FRAGMENT, RESOLVED SERVER-SIDE — §5(c)
         doc = str((detail.get("plan") or {}).get("design_doc_content") or "")
         child_anchors = {
             c["key"]: markdown.anchor_for(doc, str(c.get("spec_section") or "")) or ""
@@ -1418,25 +1017,13 @@ def create_app() -> FastAPI:
         return render(request, "feature_order.html", fo=detail, project=detail["project"],
                       states=states, child_anchors=child_anchors,
                       cap=ops.feature_order_budget(fo_id, detail["project"]),
-                      # Already on `detail` for `jarvis fo show`; passed separately so
-                      # the template reads the same name on both pages.
+                      # Already on `detail` for `jarvis fo show`
                       issues=detail["issues"],
                       validation=validation, error=error)
 
     @app.get("/spec/{name}/{fo_id}", response_class=HTMLResponse)
     def spec_page(request: Request, name: str, fo_id: str):
-        """THE FEATURE'S SPEC, RENDERED — §1 of
-        docs/superpowers/specs/2026-09-28-a-feature-spec-you-can-open.md.
-
-        Keyed on the FEATURE, never on a work order: a planner, a manager and nine
-        children would otherwise give one document ten URLs, and an anchor is only
-        useful if everyone links to the same one. A child's page gets a FRAGMENT into
-        this page, resolved when the link is built.
-
-        Three outcomes, all 200 and none a 500 — the document, a plan stored before the
-        OS snapshotted spec text, or a feature with no plan at all. `specs.plan_of`
-        returns `{}` for the last two, which is `specs.py`'s stated degradation contract.
-        """
+        """THE FEATURE'S SPEC, RENDERED — §1 of... (docs/superpowers/specs/2026-09-28-a-feature-spec-you-can-open.md)"""
         paths = ops.registered_project_paths()
         if name not in paths:
             return render(request, "error.html",
@@ -1453,8 +1040,7 @@ def create_app() -> FastAPI:
         content = str(plan.get("design_doc_content") or "")
         repo_path = str(plan.get("design_doc") or "")
         source = str(plan.get("design_doc_source") or "")
-        # The blob link only once it can be DERIVED, and never from a branch: a 404 on
-        # GitHub from a URL the OS assembled reads as the spec having been deleted (§6).
+        # The blob link only once it can be DERIVED
         blob = (github.blob_url(paths[name], repo_path)
                 if content and repo_path and source and not source.startswith("branch ")
                 else None)
@@ -1466,14 +1052,7 @@ def create_app() -> FastAPI:
 
     @app.get("/io/{name}/{io_id}", response_class=HTMLResponse)
     def improvement_order(request: Request, name: str, io_id: str, error: str = ""):
-        """An improvement order's page — §6.1 of the improvement-orders spec.
-
-        Counts first, then the evidence, then one card per finding: a report is only
-        judgeable next to what it was quoted from, and the decision is taken on the page
-        it is read on. Everything the page renders, including each filed order's current
-        status, comes off `show_improvement_order` — a second resolution here would make
-        the page and `jarvis io show` two answers to one question.
-        """
+        """An improvement order's page — §6.1 of the improvement-orders spec"""
         try:
             detail = ops.show_improvement_order(io_id, name)
         except ops.OpsError as e:
@@ -1483,16 +1062,7 @@ def create_app() -> FastAPI:
 
     @app.get("/inv/{name}/{inv_id}", response_class=HTMLResponse)
     def investigation_order(request: Request, name: str, inv_id: str, error: str = ""):
-        """An investigation's page — §2.9 of
-        docs/superpowers/specs/2026-09-27-investigation-orders.md.
-
-        The classification and the subject first, then the root cause, the evidence and
-        what was filed: a diagnosis is only readable next to what it was quoted from.
-        Everything comes off `ops.show_investigation_order` — a second resolution here
-        would make the page and `jarvis investigate show` two answers to one question.
-        NO POST action: there is nothing to decide, which is the visible difference from
-        the improvement-order page above.
-        """
+        """An investigation's page — §2.9 of docs/superpowers/specs/2026-09-27-investigation-orders.md"""
         try:
             detail = ops.show_investigation_order(inv_id, name)
         except ops.OpsError as e:
@@ -1503,28 +1073,20 @@ def create_app() -> FastAPI:
     @app.post("/io/{name}/{io_id}/review")
     def review_findings(name: str, io_id: str, key: str = Form(...),
                         decision: str = Form(...), reason: str = Form("")):
-        """One finding, decided. Holds no logic of its own, exactly as `review_plan`
-        does not: `ops.review_findings` owns what a decision means."""
+        """One finding, decided"""
         try:
             ops.review_findings(
                 io_id, accept=(key,) if decision == "accept" else (),
                 reject={} if decision == "accept" else {key: reason},
                 decided_by="user", project_name=name)
         except ops.OpsError as e:
-            # A rejection with no reason is the refusal that actually happens here — the
-            # knowledge entry and the analyst read only that reason.
+            # A rejection with no reason is the refusal that actually happens here
             return RedirectResponse(f"/io/{name}/{io_id}?error={e}", status_code=303)
         return RedirectResponse(f"/io/{name}/{io_id}", status_code=303)
 
     @app.get("/project/{name}/sessions", response_class=HTMLResponse)
     def project_sessions(request: Request, name: str):
-        """The inject panel, as a fragment the project page pulls in after it renders.
-
-        Separate from the page on purpose: this is the one view that shells out to
-        `claude agents --json`, and a slow or missing CLI must cost the project page
-        nothing. `ops.injectable_sessions` never raises — it returns the error as text
-        for the fragment to show inline.
-        """
+        """The inject panel, as a fragment the project page pulls in after it renders"""
         found = ops.injectable_sessions(name)
         return templates.TemplateResponse(
             request, "_sessions.html",
@@ -1534,7 +1096,7 @@ def create_app() -> FastAPI:
 
     @app.get("/wo/{name}/{wo_id}", response_class=HTMLResponse)
     def work_order(request: Request, name: str, wo_id: str, debug: str = "",
-                   forced: str = "", retried: str = ""):
+                   forced: str = "", retried: str = "", events: str = ""):
         try:
             pname, path, wo = ops.find_work_order(wo_id, name)
         except ops.OpsError as e:
@@ -1542,104 +1104,67 @@ def create_app() -> FastAPI:
                           hint=_stale_link_hint(name, wo_id), status_code=404)
         store = ProjectStore(path)
         try:
-            events = store.list_events(wo_id)
+            # THE NEWEST PAGE, and how much is behind it — `jarvis wo show`'s rule (io-12b7d873)
+            every = events == "all"
+            events_page = store.list_events(wo_id, limit=None if every else 200,
+                                            newest=True)
+            events_hidden = store.count_events(wo_id) - len(events_page)
             messages = store.list_messages(wo_id)
-            # Both lists: `assumptions` is the record, `unreviewed` is the ask — §4.
+            # Both lists: `assumptions` is the record, `unreviewed` is the ask — §4
             assumptions = ops.assumptions_with_rulings(store, wo_id)
             unreviewed = store.pending_assumptions(wo_id)
-            # A worker held at a gate looks identical to an idle one from here, so
-            # the reason it stopped belongs on the page it stopped on.
+            # A worker held at a gate looks identical to an idle one from here
             store.expire_approvals()
             approvals = store.list_approvals(wo_id)
-            # Why a `running` work order has nothing running. Same idea as the gate
-            # line above: the reason it stopped belongs on the page it stopped on.
-            # ONE read for the page, and both readers below take it: the pause note and
-            # the status label must not disagree about the account (issue #714).
+            # Why a `running` work order has nothing running (#714)
             account = _fleet_if_held([wo])
             pause = (invariants.pause_note(store, wo)
                      or invariants.fleet_hold_note(wo, account))
-            # And why a `waiting_input` one is not in fact waiting on the reader. Both
-            # notes are display; `true_blockers` decides what actually costs attention.
+            # And why a `waiting_input` one is not in fact waiting on the reader
             waiting = ops.waiting_on(store, wo)
-            # ...and the blocker the flag could not carry. `attention_reason` is ONE
-            # column fed from `true_blockers[0]`, so an order that is parked AND owes a
-            # decision reports only the decision — which is how wo-a4bd6958 spent 7h13m
-            # under a four-hour-old assumptions line. Listings link; this page tells.
+            # ...and the blocker the flag could not carry
             parked = invariants.parked_reason(store, wo)
-            # How this status should READ — derived once, in the one function every
-            # other surface derives it from. The header used to build its own wording
-            # out of STATUS_META alone, which is how a listing and a header came to
-            # disagree about the same work order once before (PR 65).
+            # How this status should READ — derived once, in the one function every other surface derives it from
             label = invariants.status_label(store, wo, account)
             validation = ops.validation_detail(store, wo_id=wo_id)
-            # THE WHOLE ORDER'S LIST, not one round's. See `_issues.html`.
+            # THE WHOLE ORDER'S LIST, not one round's
             issue_index = ops.issue_index(store, wo_id)
-            # None for every order the automatic merge has never touched, which is what
-            # keeps the line off the page entirely rather than rendering "off" forever.
+            # None for every order the automatic merge has never touched
             auto_merge = ops.automerge_state(store, wo)
-            # Whether the pull request landed, from the timeline and never from
-            # `pr_state` — the same helper `jarvis wo show` reads (spec §7).
+            # Whether the pull request landed, from the timeline and never from `pr_state`
             merge_state = ops.merge_state(store, wo)
-            # The re-judge control and the diagnosis behind it, off the SAME hold the
-            # auto-merge line above renders — a parked order's page has to say why it is
-            # parked, and `automerge.decide` already worked that out on the tick that
-            # declined to merge it. None on a project with the panel off.
+            # The re-judge control and the diagnosis behind it
             force = ops.force_validation_state(store, wo, project=pname,
                                                held=auto_merge)
-            # What forcing a round just did, rebuilt from the record rather than carried
-            # in the query — the same two lines `jarvis validation force` prints.
+            # What forcing a round just did, rebuilt from the record rather than carried in the query
             forced_lines = ops.forced_round_notice(
                 store, wo, project=pname,
                 round_n=int(forced)) if forced.isdigit() else []
-            # The retry control, and the note a press just left — §7b of
-            # docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md. None on any
-            # order that is not `failed`, so no control renders there at all. The notice
-            # is REBUILT from an id this order's own record knows: a number the query
-            # string invented states no fact.
+            # The retry control, and the note a press just left (docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md)
             retry = ops.retry_state(store, wo)
-            # WHAT THE OS SAVED when the last turn died, rendered directly above that
-            # control: it is what the user reads before pressing the button. None keeps
-            # it off every page whose turn was never harvested — §5 of
-            # docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md.
+            # WHAT THE OS SAVED when the last turn died (docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md)
             harvest = ops.harvest_state(store, wo)
             retried_line = (ops.retry_queued_notice(int(retried))
                             if retried.isdigit()
                             and any(m["id"] == int(retried) for m in messages) else "")
-            # And the same for the assumption review, on the same rule — and for the
-            # same reason one authority along: None keeps the line off the page for
-            # every order the mechanism never looked at.
+            # And the same for the assumption review, on the same rule
             auto_review = ops.autoreview_state(store, wo)
-            # WHETHER THIS ORDER OWES THE USER A DECISION, and where the one form goes —
-            # spec 2026-09-27-a-review-control-for-an-escalated-round §2. None keeps every
-            # control off the page, as it keeps the line out of `jarvis wo show`.
+            # WHETHER THIS ORDER OWES THE USER A DECISION, and where the one form goes
             review = ops.review_state(store, wo)
-            # WHERE THE REST OF THIS ORDER IS. The brief is deliberately only the margin
-            # around a section of the feature's spec now, so a page that showed the brief
-            # alone would be a page missing most of the work. `section_text` is NOT passed
-            # to the template: pasting it here would re-create the duplication the whole
-            # change removed — the pointer is the point.
+            # WHERE THE REST OF THIS ORDER IS
             spec = specs.spec_of(store, wo)
-            # WHERE THAT SPEC CAN BE READ — §5(a). A second, narrow projection:
-            # `spec_of` answers None for a planner by design and keeps doing so,
-            # and a planner's page is the case that had nothing at all.
+            # WHERE THAT SPEC CAN BE READ — §5(a)
             spec_link = specs.spec_link(store, wo)
-            # How long it has been where it is — the same document `jarvis wo show`
-            # carries, rendered by `_states.html` (spec §7).
+            # How long it has been where it is
             states = ops.state_durations(store, wo_id=wo_id).as_dict()
         finally:
             store.close()
         show_debug = debug not in ("", "0", "false")
         bill = wo_bill(wo_id, pname)
-        # The ceiling, what has gone against it, and (for a child) what its feature still
-        # has to top it up with. Its own two indexed sums rather than a reading off
-        # `bill` above: `bill` is the transcript-walking view and can lag or fall back to
-        # an estimate, and the number beside a control that CHANGES the budget has to be
-        # the same number the enforcement uses.
+        # The ceiling, what has gone against it
         cap = ops.work_order_budget(wo_id, pname)
         return render(request, "work_order.html", project=pname, wo=wo, parked=parked,
-                      # What has already been dismissed here. The page's only durable
-                      # answer to "why is this in `needs_review`?" once the flag is
-                      # down — `attention_reason` does not survive an ack (issue 573).
+                      # What has already been dismissed here
                       seen=invariants.acknowledged(wo),
                       cap=cap,
                       pause=pause, waiting=waiting, status_label=label,
@@ -1649,30 +1174,19 @@ def create_app() -> FastAPI:
                       issues=issue_index,
                       auto_review=auto_review, force=force, forced_lines=forced_lines,
                       retry=retry, retried_line=retried_line, harvest=harvest,
-                      timeline=build_timeline(wo, events, messages,
+                      timeline=build_timeline(wo, events_page, messages,
                                               include_debug=show_debug),
-                      debug=show_debug, debug_count=count_debug(events),
-                      # What was said, and what happened — two readings of one record,
-                      # neither derivable from the other. See `timeline`'s docstring.
-                      conversation=build_conversation(events, messages),
+                      events_hidden=events_hidden, events_all=every,
+                      debug=show_debug, debug_count=count_debug(events_page),
+                      # What was said, and what happened — two readings of one record, neither derivable from the other
+                      conversation=build_conversation(events_page, messages),
                       assumptions=assumptions, unreviewed=unreviewed, review=review,
                       approvals=approvals, bill=bill, states=states,
                       turn_lines=turn_lines_by_message(bill))
 
     @app.get("/wo/{name}/{wo_id}/debug", response_class=HTMLResponse)
     def work_order_debug(request: Request, name: str, wo_id: str, filed: str = ""):
-        """"Show me all of the above on one page" — spec §7 of
-        docs/superpowers/specs/2026-09-24-order-observability.md.
-
-        DELIBERATELY NOT `?debug=1` on the page above, which means something else
-        entirely (show debug-level timeline events) and is left alone.
-
-        Four payloads from `ops`, VERBATIM, in the order §1 ranks the questions: the
-        diagnosis first and above the fold, because "why is nothing happening" is the
-        largest bug class; then the live frame, the full anatomy and the context ledger.
-        This route COMPUTES NOTHING — no sum, no percentage, no sentence about a number.
-        If a figure is wrong the fix is in `ops`, once, and both surfaces get it.
-        """
+        """"Show me all of the above on one page" (docs/superpowers/specs/2026-09-24-order-observability.md)"""
         try:
             pname, _path, wo = ops.find_work_order(wo_id, name)
         except ops.OpsError as e:
@@ -1681,9 +1195,7 @@ def create_app() -> FastAPI:
         return render(
             request, "debug.html", project=pname, wo=wo,
             diagnosis=_block("the diagnosis", ops.diagnose, wo_id, pname),
-            # §11, under the diagnosis it acts on. `confirm=False`: OPENING A PAGE MUST
-            # WRITE NOTHING — no grant, no Neo question, no event. Only the POST below
-            # confirms, and what it carries back is an id or a bounded flag, never text.
+            # §11, under the diagnosis it acts on
             fix=_block("the fix", ops.fix, wo_id, pname),
             fix_filed=_fix_filed_notice(filed),
             live=_block("the live snapshot", ops.live_report, wo_id, pname),
@@ -1692,12 +1204,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/wo/{name}/{wo_id}/live")
     def work_order_live(name: str, wo_id: str):
-        """`ops.live_report` as JSON, nothing reshaped — what the debugging page polls.
-
-        A poll and not SSE, no websocket and no JS build step (spec §7). Reshaping one key
-        here would be a second answer for the page to disagree with (PR 65), so the
-        payload goes out as it comes back.
-        """
+        """`ops.live_report` as JSON, nothing reshaped — what the debugging page polls"""
         try:
             return JSONResponse(ops.live_report(wo_id, name))
         except ops.OpsError as e:
@@ -1707,26 +1214,9 @@ def create_app() -> FastAPI:
     def cost_page(request: Request, project: str = "", window: str = "",
                   offset: str = "", since: str = "", until: str = "",
                   tz: str = ""):
-        """What the fleet's work cost, dearest first — the dashboard half of `jarvis cost`.
-
-        Its own page rather than a column on the dashboard: this reads and parses every
-        session transcript Claude Code still holds (~0.4s for a fleet of sixty), and the
-        dashboard re-reads itself every 15 seconds. Spend is a question someone asks
-        deliberately, not one worth paying for on every pulse.
-
-        THE WINDOW IS RESOLVED ONCE and handed to both payload builders, which is what
-        makes the two halves of the page incapable of disagreeing: resolution is a
-        function of `now`, so resolving twice can straddle a boundary (§6 of
-        docs/superpowers/specs/2026-10-07-cost-window-selector.md). Every parameter is
-        a string so that a bad one comes back as the OS's own sentence rather than a
-        framework 422 — and is a REFUSAL, never a silent fallback to the week.
-
-        `?tz=` picks the DISPLAY zone and moves no boundary; it is resolved FIRST because
-        the custom range is parsed in it (§11).
-        """
+        """What the fleet's work cost, dearest first — the dashboard half of `jarvis cost` (docs/superpowers/specs/2026-10-07-cost-window-selector.md)"""
         try:
-            # The zone FIRST: the custom form's naive datetimes are parsed in the same
-            # zone they are rendered in, so the page speaks one clock (§11).
+            # The zone FIRST: the custom form's naive datetimes are parsed in the same zone they are rendered in
             zone = ops.cost_zone(tz or None, project or None)
             picked = ops.cost_window(project=project or None, window=window or None,
                                      offset=_offset_param(offset), tz=tz or None,
@@ -1735,23 +1225,18 @@ def create_app() -> FastAPI:
             report = ops.cost_report(project=project or None, window=picked)
         except ops.OpsError as e:
             return render(request, "error.html", message=str(e))
-        # The distribution is a SECTION of this page, so a failure to build it must not
-        # take the listing down with it: the two read different databases and the
-        # listing is the older, load-bearing half.
+        # The distribution is a SECTION of this page
         try:
             fleet = ops.fleet_cost(project=project or None, resolved=picked)["fleet"]
         except Exception:                                   # noqa: BLE001
             fleet = None
-        # The meter is a THIRD payload from the same resolved window, in its own `try`
-        # for the same reason: it reads `usage_samples` and the transcript tree, and
-        # losing it must not take the listing down.
+        # The meter is a THIRD payload from the same resolved window
         try:
             meter = ops.cost_meter(resolved=picked, project=project or None)["meter"]
         except Exception as e:                              # noqa: BLE001
             uilog.record_error(request.method, "cost/meter", e)
             meter = None
-        # Its own variable and never read out of `fleet`: losing the section must not
-        # lose the window the reader picked.
+        # Its own variable and never read out of `fleet`: losing the section must not lose the window the...
         return render(request, "cost.html", active="cost", report=report,
                       units=report["units"], totals=report["totals"],
                       project=project, fleet=fleet, meter=meter, window=picked,
@@ -1760,21 +1245,13 @@ def create_app() -> FastAPI:
 
     @app.get("/cost/{name}/{order_id}", response_class=HTMLResponse)
     def bill_page(request: Request, name: str, order_id: str):
-        """One order's itemised bill — the page that answers "where did my tokens go".
-
-        Work orders and feature orders share it, because the question and the answer's
-        shape are the same and only the depth differs: a feature order's bill expands
-        into its orders, each order's into its turns, each turn's into the worker, the
-        OS calls it caused and the processes it spawned. `jarvis.bill` reconciles every
-        level before rendering, and the page states the result rather than assuming it.
-        """
+        """One order's itemised bill — the page that answers "where did my tokens go\""""
         try:
             bill = ops.bill(order_id, project=name)
         except ops.OpsError as e:
             return render(request, "error.html", message=str(e), status_code=404)
         turn_rows = bill.get("turn_rows") or []
-        # Bars are scaled to the context window when any turn reports one, else to the
-        # largest peak on the page — growth stays comparable either way.
+        # Bars are scaled to the context window when any turn reports one
         scale = max([t.get("context_window") or 0 for t in turn_rows]
                     + [t.get("context_peak") or 0 for t in turn_rows] + [1])
         return render(request, "bill.html", active="cost", bill=bill, project=name,
@@ -1804,13 +1281,7 @@ def create_app() -> FastAPI:
 
     @app.get("/knowledge", response_class=HTMLResponse)
     def knowledge(request: Request):
-        """The base, and what it costs against what it is used for.
-
-        Entries render as their INDEX LINE with the body behind a disclosure — the same
-        160 characters a worker decides from. A page that dumps every entry in full is
-        reading matter nobody has; the headline is the artefact that actually does the
-        work, and seeing it truncated mid-sentence is the point.
-        """
+        """The base, and what it costs against what it is used for"""
         from ..central_store import PINNED_TAG, has_tag, headline
         central = CentralStore()
         try:
@@ -1829,8 +1300,7 @@ def create_app() -> FastAPI:
 
     @app.post("/knowledge/pin")
     def knowledge_pin(kn_id: str = Form(...), pinned: str = Form("")):
-        """Pinned entries ride in every worker prompt verbatim; everything else is an
-        index line the worker looks up. This is the toggle between the two."""
+        """Pinned entries ride in every worker prompt verbatim"""
         central = CentralStore()
         try:
             central.pin_knowledge(kn_id, pinned=pinned == "1")
@@ -1843,8 +1313,7 @@ def create_app() -> FastAPI:
         from ..neo_store import NeoStore
         neo = NeoStore()
         try:
-            # Oldest first: that is the order Neo drains them, and the oldest is the
-            # one most likely to be stuck.
+            # Oldest first: that is the order Neo drains them, and the oldest is the one most likely to be stuck
             in_flight = list(reversed(
                 neo.list_questions(statuses=("queued", "answering"))))
             escalated = neo.list_questions(statuses=("escalated", "failed"))
@@ -1856,10 +1325,7 @@ def create_app() -> FastAPI:
                        and not (q["answered_by"] == "neo"
                                 and q["review_status"] == "unreviewed")]
             learnings = neo.all_learnings(limit=100)
-            # How the panel deliberated, for the questions this page already shows.
-            # Deliberation is inspectable on demand and never pushed at anyone, so it
-            # renders collapsed and a question with no opinions gets no block at all —
-            # which is also why this dict holds only the questions that HAVE them.
+            # How the panel deliberated, for the questions this page already shows
             opinions = {}
             for q in (*in_flight, *escalated, *unreviewed, *history):
                 rows = neo.opinions(q["id"])
@@ -1876,17 +1342,7 @@ def create_app() -> FastAPI:
 
     @app.get("/neo/stats", response_class=HTMLResponse)
     def neo_stats_page(request: Request, project: str = "", days: int | None = None):
-        """Neo's own report — §6 of docs/superpowers/specs/2026-10-01-neo-observability.md.
-
-        A PAGE AND NOT A SECTION OF `/neo`, per kn-a7e321bc / kn-c609211f: that page is an
-        action surface, and a block counting `approval` questions among review forms
-        implies a gate escalation can be decided there. A separate URL also keeps
-        `neo_page`'s per-question `opinions` lookup from growing a second pass.
-
-        `active="neo"` so the existing nav entry stays highlighted and no top-level entry
-        is added. The route does no arithmetic: `ops` holds the report and the template
-        holds the rendering, which is how `/cost` and `bill.html` are split.
-        """
+        """Neo's own report — §6 of docs/superpowers/specs/2026-10-01-neo-observability.md"""
         try:
             report = ops.neo_stats_report(project=project or None, days=days)
         except ops.OpsError as e:
@@ -1897,11 +1353,7 @@ def create_app() -> FastAPI:
 
     @app.get("/neo/question/{question_id}", response_class=HTMLResponse)
     def neo_question_page(request: Request, question_id: int):
-        """One question and its answer — where a work order's timeline sends the reader.
-
-        The `question_asked` entry points here rather than reprinting the question: §3 of
-        docs/superpowers/specs/2026-08-23-the-work-order-record.md.
-        """
+        """One question and its answer — where a work order's timeline sends the reader (docs/superpowers/specs/2026-08-23-the-work-order-record.md)"""
         from ..neo_store import NeoStore
         neo = NeoStore()
         try:
@@ -1918,18 +1370,7 @@ def create_app() -> FastAPI:
 
     @app.get("/gates", response_class=HTMLResponse)
     def gates_page(request: Request):
-        """Privileged-action approvals. Four states, four different asks of the
-        user: escalated ones need a decision, ones still with Neo need nothing (but
-        can be pre-empted), decided ones are the audit trail — and dismissed ones are
-        not an audit trail at all.
-
-        The dismissed ones are split out rather than listed with the verdicts because
-        they are a different measurement: they say nothing about what the fleet was
-        allowed to ship, and everything about how often the OS's own recogniser is
-        wrong. Mixed into the decided table they would read as approvals-by-another-name
-        and the false-positive rate would be invisible, which is the whole reason the
-        verdict is separate from `approved`.
-        """
+        """Privileged-action approvals"""
         rows = ops.list_gates(include_request=True)
         pending = [g for g in rows if g["status"] == "pending"]
         held = [g for g in rows if g["status"] == "awaiting_case"]
@@ -1946,17 +1387,7 @@ def create_app() -> FastAPI:
     @app.get("/config", response_class=HTMLResponse)
     def config_page(request: Request, a: str = "", b: str = "", scope: str = "",
                     node: str = "", q: str = "", refresh: str = ""):
-        """What the fleet is configured to run, who changed it, and what changed.
-
-        A form over `jarvis config` — see
-        docs/superpowers/specs/2026-08-27-the-config-console.md §8 for the ledger and
-        the provenance column; `jarvis wo show wo-516126ce` for the editor, the
-        scope picker and the tree that replaced the one long column.
-
-        Scope, node and search are URL state, not script: text a browser test cannot
-        see is text nothing proves, and this page's whole shape is chosen around that
-        (the same reason §8 forbids tabs here).
-        """
+        """What the fleet is configured to run, who changed it, and what changed (docs/superpowers/specs/2026-08-27-the-config-console.md §8)"""
         show = ops.config_show()
         history = ops.config_history(limit=50)
         scopes = config_scopes(show["resolved"])
@@ -1967,8 +1398,7 @@ def create_app() -> FastAPI:
                         if config_scope_of(p) == scope)
         if node not in {n for label in labels for n in _config_nodes(label)}:
             node = ""
-        # Default the diff to the change that landed: the head against the version
-        # before it, so the page answers "what changed last" unasked.
+        # Default the diff to the change that landed: the head against the version before it
         ids = [row["id"] for row in history]
         if not a and not b and len(ids) >= 2:
             a, b = ids[1], ids[0]
@@ -1982,8 +1412,7 @@ def create_app() -> FastAPI:
                       wiring=wiring_groups(scope, refresh=bool(refresh)),
                       scopes=scopes, scope=scope, node=node, q=q,
                       scope_title=next(s["title"] for s in scopes if s["key"] == scope),
-                      # The tree root wants the SHORT name: "os — the fleet" wrapped
-                      # to four lines in a 236px column and squashed the tree.
+                      # The tree root wants the SHORT name: "os
                       scope_short="os" if scope == "os" else scope.split(".", 1)[1],
                       tree=config_tree(labels, node),
                       rows=config_rows(show, config_setters(history), scope, node, q),
@@ -1992,30 +1421,7 @@ def create_app() -> FastAPI:
 
     @app.get("/alarms", response_class=HTMLResponse)
     def alarms_page(request: Request):
-        """Turns the OS raised WHILE they were still costing money.
-
-        Split by whether the work order is still ASKING, because the two halves are
-        different things and mixing them is how a cost alarm becomes wallpaper: the top
-        is a queue the user is meant to empty, the bottom is the record of what the
-        fleet has spent and is meant to be long.
-
-        Acking is per SUBJECT, not per alarm, and the page groups the live half that
-        way — one thing with three alarms is one decision. That is not a shortcut: the
-        attention flag carries one sentence, so there was never more than one ask. The
-        BUTTON still posts to the carrier work order, because that is where the ack has
-        an `acknowledged_blockers` column to stick in.
-
-        The middle half comes from its own read rather than being filtered out of
-        `rows`: the supervisor's reasoning and Neo's advice are not in the frozen
-        `list_cost_alarms` dict, and widening that dict is what four sibling surfaces
-        bind against. See `ops.alarm_review_queue`.
-
-        THREE HALVES AND NO FOURTH (§6 of the health spec). A proposed remedy is still
-        "asking for you" until it is decided and an applied one is "addressed by the
-        supervisor" like any ack, so both land in a queue that already exists. The rows
-        come from `alarm_feed` rather than `list_cost_alarms` because a remedy and a
-        probe's title are not on the frozen dict either.
-        """
+        """Turns the OS raised WHILE they were still costing money"""
         rows = ops.alarm_feed()
         live: dict[str, dict] = {}
         for a in (r for r in rows if r["live"]):
@@ -2029,12 +1435,7 @@ def create_app() -> FastAPI:
 
     @app.get("/stuck", response_class=HTMLResponse)
     def stuck_page(request: Request):
-        """Open orders judged on time in status — `alarms_page`'s split, for the same
-        reason: the top is the queue that is an ask, the bottom is the record.
-
-        Every number is `ops.stuck_report`'s; this route computes none of them (§7 of
-        docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md).
-        """
+        """Open orders judged on time in status (docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md)"""
         rows = ops.stuck_report()
         return render(request, "stuck.html", active="stuck",
                       over=[r for r in rows if r["stuck"]],
@@ -2042,29 +1443,13 @@ def create_app() -> FastAPI:
 
     @app.get("/evolution", response_class=HTMLResponse)
     def evolution_page(request: Request, days: int = 90):
-        """Is the OS getting better at running itself — and where is it still weak?
-
-        Every number is `ops.evolution_report`'s; this route computes none of them (§9 of
-        docs/superpowers/specs/2026-09-27-self-evolution.md). `jarvis rules summary`
-        renders the same dict, and two renderers each doing their own arithmetic is how
-        the two surfaces start disagreeing about one registry.
-
-        `days` widens the window the way `--days` does on the CLI. READ-ONLY: no POST
-        route and no form lives under this path — arming and retracting a rule are
-        `jarvis rules` commands by the work order's scope boundary.
-        """
+        """Is the OS getting better at running itself — and where is it still weak? (docs/superpowers/specs/2026-09-27-self-evolution.md)"""
         return render(request, "evolution.html", active="evolution",
                       report=ops.evolution_report(None, days=days))
 
     @app.get("/evolution/{project}", response_class=HTMLResponse)
     def evolution_project_page(request: Request, project: str, days: int = 90):
-        """The same report scoped to one project — where each project page links.
-
-        Every number is `ops.evolution_report`'s, as above. An unknown project is a 404
-        with the sentence `ops` raised, exactly as `alarm_page` does: a page that
-        rendered an empty report for a name that does not exist would read as a project
-        the OS has learned nothing about.
-        """
+        """The same report scoped to one project — where each project page links"""
         try:
             report = ops.evolution_report(project, days=days)
         except ops.OpsError as e:
@@ -2074,12 +1459,7 @@ def create_app() -> FastAPI:
 
     @app.get("/alarms/{project}/{alarm_id}", response_class=HTMLResponse)
     def alarm_page(request: Request, project: str, alarm_id: str):
-        """One alarm — where the work order's timeline and a Neo escalation both link.
-
-        `/alarms` is a list with no anchor, so pointing a "review it →" at it opens on
-        whichever row sorts first; that shipped once on `/neo` and came back as two bug
-        reports. §5 of docs/superpowers/specs/2026-08-31-the-supervisor.md.
-        """
+        """One alarm — where the work order's timeline and a Neo escalation both link (docs/superpowers/specs/2026-08-31-the-supervisor.md)"""
         try:
             alarm = ops.alarm_detail(alarm_id, project_name=project)
         except ops.OpsError as e:
@@ -2091,7 +1471,7 @@ def create_app() -> FastAPI:
     def api_status():
         return JSONResponse(ops.os_status())
 
-    # -- actions (same ops functions as the CLI) --------------------------------------
+    # -- actions (same ops functions as the CLI)
 
     @app.post("/wo/create")
     def create_wo(project: str = Form(...), title: str = Form(...),
@@ -2103,8 +1483,7 @@ def create_app() -> FastAPI:
             wo = ops.create_work_order(
                 project, title, description=description, model=model or None,
                 origin="ui",
-                # Empty means "whatever the project's default is", which is usually no
-                # ceiling — never zero. `parse_amount` refuses zero for the same reason.
+                # Empty means "whatever the project's default is", which is usually no ceiling — never zero
                 budget_usd=budget_mod.parse_amount(budget) if budget.strip() else None)
         except (ValueError, ops.OpsError) as e:
             return RedirectResponse(f"/?error={e}", status_code=303)
@@ -2112,8 +1491,7 @@ def create_app() -> FastAPI:
 
     @app.post("/project/{name}/inject")
     def inject(name: str, session_id: str = Form(...), title: str = Form("")):
-        """Hand one of the user's own Claude sessions to Jarvis. Creates the record and
-        nothing else — nothing is written into the session until they send it a message."""
+        """Hand one of the user's own Claude sessions to Jarvis"""
         try:
             res = ops.inject_session(session_id, project_name=name, title=title or None)
         except ops.OpsError as e:
@@ -2134,12 +1512,7 @@ def create_app() -> FastAPI:
     @app.post("/wo/{name}/{wo_id}/budget")
     def set_wo_budget(name: str, wo_id: str, amount: str = Form(""),
                       clear: str = Form("")):
-        """Set, raise or clear one work order's ceiling — and resume it if it stopped.
-
-        An EMPTY box is not a clear: a form submitted by accident would otherwise remove
-        a ceiling silently. Clearing takes its own named control (`clear`), which is the
-        same separation `jarvis wo budget --clear` makes.
-        """
+        """Set, raise or clear one work order's ceiling — and resume it if it stopped"""
         from .. import budget
 
         if not clear and not amount.strip():
@@ -2151,12 +1524,7 @@ def create_app() -> FastAPI:
             result = ops.set_work_order_budget(wo_id, parsed, project_name=name)
         except (ValueError, ops.OpsError) as e:
             return RedirectResponse(f"/wo/{name}/{wo_id}?error={e}", status_code=303)
-        # A RAISE THAT CHANGED NOTHING STILL OWES THE USER A SENTENCE, on the non-error
-        # channel (§7 of
-        # docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md): the
-        # budget WAS raised and written, and the cap that still binds is the family's.
-        # Dropping the note is what redirected the reporter to an unchanged page saying
-        # nothing. Never `?error=` — a refusal is not an error.
+        # A RAISE THAT CHANGED NOTHING STILL OWES THE USER A SENTENCE (docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md)
         if result.get("note") and not result.get("resumed"):
             return RedirectResponse(f"/wo/{name}/{wo_id}?note={quote(result['note'])}",
                                     status_code=303)
@@ -2165,7 +1533,7 @@ def create_app() -> FastAPI:
     @app.post("/fo/{name}/{fo_id}/budget")
     def set_fo_budget(name: str, fo_id: str, amount: str = Form(""),
                       clear: str = Form("")):
-        """The same, for a feature's whole family. See `set_wo_budget` on the empty box."""
+        """The same, for a feature's whole family"""
         from .. import budget
 
         if not clear and not amount.strip():
@@ -2177,15 +1545,11 @@ def create_app() -> FastAPI:
             result = ops.set_feature_budget(fo_id, parsed, project_name=name)
         except (ValueError, ops.OpsError) as e:
             return RedirectResponse(f"/fo/{name}/{fo_id}?error={e}", status_code=303)
-        # The same channel: `exhausted_children` is the WHOLE INSTRUCTION to the user —
-        # the family has money again and `jarvis wo budget <child> <amount>` is what
-        # spends it on the child they meant to rescue. Nothing here funds them, because
-        # doing it from this end would have to guess the split (`ops.set_feature_budget`).
+        # The same channel: `exhausted_children` is the WHOLE INSTRUCTION to the user
         stuck = result.get("exhausted_children") or []
         if stuck:
             one = len(stuck) == 1
-            # The WHOLE clause agrees, not only the noun: "1 work order ... their own
-            # ceiling" was half-pluralised.
+            # The WHOLE clause agrees, not only the noun: "1 work order ... their own ceiling" was half-pluralised
             note = (f"budget raised. {len(stuck)} work order{'' if one else 's'} still "
                     f"parked on {'its own ceiling' if one else 'their own ceilings'}: "
                     f"{', '.join(stuck)} — spend the new money on one with "
@@ -2204,24 +1568,19 @@ def create_app() -> FastAPI:
         try:
             ops.mark_done(wo_id, project_name=name)
         except ops.OpsError as e:
-            # Pending assumptions are the one refusal: they want a decision, not a
-            # close. The panel that takes it is on this same page.
+            # Pending assumptions are the one refusal: they want a decision, not a close
             return RedirectResponse(f"/wo/{name}/{wo_id}?error={e}", status_code=303)
         return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
 
     @app.post("/wo/{name}/{wo_id}/ack")
     def ack_wo(name: str, wo_id: str, back: str = Form("")):
-        # `back` is where the user pressed the button. Acking from a LIST is a different
-        # act from acking on the order's own page — the user is working through a queue
-        # and wants the next row, not a detail page they then have to leave. Restricted
-        # to a known path so a form cannot be used to bounce anyone off the dashboard.
+        # `back` is where the user pressed the button
         home = f"/wo/{name}/{wo_id}"
         landing = "/alarms" if back == "alarms" else home
         try:
             ops.ack_attention(wo_id, project_name=name)
         except ops.OpsError as e:
-            # The one case that refuses: pending assumptions want a decision, not a
-            # dismissal. Say so instead of silently doing nothing.
+            # The one case that refuses: pending assumptions want a decision, not a dismissal
             return RedirectResponse(f"{landing}?error={e}", status_code=303)
         return RedirectResponse(landing, status_code=303)
 
@@ -2247,22 +1606,7 @@ def create_app() -> FastAPI:
 
     @app.post("/wo/{name}/{wo_id}/fix")
     def fix_wo(name: str, wo_id: str):
-        """`jarvis wo fix --confirm` from the debugging page — the SAME `ops.fix`, so the
-        two surfaces cannot come to disagree about what is offered or what it touches.
-
-        IT FILES AND NOTHING MORE: `ops.fix` proposes a `self_heal` grant a reviewer
-        decides, and `Daemon.remedy_tick` applies an approved one. This route adds no
-        authority and AUTHORS NO TEXT — `?filed=` carries the gate request's NUMBER, the
-        way `validation/force` carries a round, and `ops.fix_filed_notice` rebuilds the
-        sentence on the page.
-
-        NOTHING FILED CARRIES NO ID: an unreachable Neo with no request redirects with the
-        bounded flag `unreachable`, and one that left a PENDING request carries its number
-        as `pending-<id>` — a request the user can answer themselves, which is the one thing
-        that gets them unstuck. A payload that proposed nothing redirects with no query at
-        all, so the page cannot claim a request exists. An `ops.OpsError` adds nothing
-        either — the GET re-reads `ops.fix` and `_block` renders that same refusal in place.
-        """
+        """`jarvis wo fix --confirm` from the debugging page"""
         back = f"/wo/{name}/{wo_id}/debug"
         try:
             out = ops.fix(wo_id, name, confirm=True)
@@ -2281,13 +1625,7 @@ def create_app() -> FastAPI:
 
     @app.post("/wo/{name}/{wo_id}/retry")
     def retry_wo(name: str, wo_id: str, message: str = Form("")):
-        """`jarvis wo retry` from the work-order page — the SAME `ops.retry`, so the two
-        surfaces cannot come to disagree about which orders may be relaunched.
-
-        `?retried=<msg_id>` carries a NUMBER and nothing else: `ops.retry_queued_notice`
-        rebuilds the sentence on the page, `fix_filed_notice`'s rule. §7b of
-        docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
-        """
+        """`jarvis wo retry` from the work-order page (docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md)"""
         back = f"/wo/{name}/{wo_id}"
         try:
             out = ops.retry(wo_id, message=message.strip() or None, project_name=name,
@@ -2300,16 +1638,7 @@ def create_app() -> FastAPI:
 
     @app.post("/wo/{name}/{wo_id}/validation/force")
     def force_validation(name: str, wo_id: str, reason: str = Form(...)):
-        """`jarvis validation force` from the dashboard — the SAME `ops` call, so the two
-        surfaces cannot come to disagree about which states may be re-judged.
-
-        The page renders the control disabled with its reason, so an error landing here is
-        the race rather than the ordinary refusal: a round the panel opened between the
-        render and the press. It is flashed all the same — the rule is the same rule.
-
-        `?forced=<round>` is what the page reads back to report the round it opened. It
-        carries a number and nothing else; the words come from the record.
-        """
+        """`jarvis validation force` from the dashboard"""
         back = f"/wo/{name}/{wo_id}"
         try:
             result = ops.force_validation(wo_id, reason=reason, project_name=name)
@@ -2328,8 +1657,7 @@ def create_app() -> FastAPI:
         try:
             fo = ops.create_feature_order(
                 project, title, description=description, origin="ui",
-                # A FAMILY budget: the whole rollup, not the planner alone. Empty means
-                # the project's default — see `create_wo` on why never zero.
+                # A FAMILY budget: the whole rollup, not the planner alone
                 budget_usd=budget_mod.parse_amount(budget) if budget.strip() else None)
         except (ValueError, ops.OpsError) as e:
             return RedirectResponse(f"/project/{project}?error={e}", status_code=303)
@@ -2342,8 +1670,7 @@ def create_app() -> FastAPI:
             ops.review_plan(fo_id, accept=(decision == "accept"), feedback=feedback,
                             decided_by="user", project_name=name)
         except ops.OpsError as e:
-            # A rejection with no reason is the refusal that actually happens here: the
-            # planner sees only the reason, so without it the revision is a guess.
+            # A rejection with no reason is the refusal that actually happens here: the planner sees only the...
             return RedirectResponse(f"/fo/{name}/{fo_id}?error={e}", status_code=303)
         return RedirectResponse(f"/fo/{name}/{fo_id}", status_code=303)
 
@@ -2364,15 +1691,7 @@ def create_app() -> FastAPI:
         return RedirectResponse(f"/fo/{name}/{fo_id}", status_code=303)
 
     def _same_site_back(next: str, fallback: str, error: str = "") -> str:
-        """Where a decision returns the reader — the page they decided from, or the
-        surface's own fallback. Same-site paths only, as in `decide_gate`: a form field
-        is attacker-settable and an open redirect is not worth the convenience. The
-        error flash rides in the query, which has to precede the tab fragment or the
-        browser reads it as part of the fragment.
-
-        Was `_neo_back`; the alarm review needs exactly this and a second copy of a
-        redirect guard is how one of the two comes to be the lax one.
-        """
+        """Where a decision returns the reader — the page they decided from, or the surface's own fallback"""
         back = next if next.startswith("/") and not next.startswith("//") else fallback
         if not error:
             return back
@@ -2402,8 +1721,7 @@ def create_app() -> FastAPI:
     @app.post("/alarms/{project}/{alarm_id}/review")
     def alarm_review(project: str, alarm_id: str, decision: str = Form(...),
                      feedback: str = Form(""), next: str = Form("")):
-        """The user's verdict on the supervisor's. Same shape as `neo_review` above,
-        and the same guard on `next`."""
+        """The user's verdict on the supervisor's"""
         fallback = f"/alarms/{project}/{alarm_id}"
         try:
             ops.review_alarm(alarm_id, approved=(decision == "approve"),
@@ -2427,20 +1745,9 @@ def create_app() -> FastAPI:
     def decide_gate(approval_id: int, decision: str = Form(...),
                     reason: str = Form(""), project: str = Form(""),
                     next: str = Form("")):
-        """Open or refuse a gate. Approval ids are per-project autoincrements, so the
-        form carries the project the row was rendered from — without it two projects
-        holding the same id make `ops.decide_gate` refuse to guess.
-
-        `next` returns the user to the page they decided from (the gates tab or a work
-        order). Only same-site paths are honoured: a form field is attacker-settable,
-        and an open redirect out of the dashboard is not worth the convenience.
-
-        `dismiss` is the third button: it clears a command the recogniser matched by
-        mistake without recording that any privileged action was authorised.
-        """
+        """Open or refuse a gate"""
         back = next if next.startswith("/") and not next.startswith("//") else "/gates"
-        # Unknown button values fall through to `denied`, which is the fail-closed
-        # reading: a mangled form must never be able to open a gate.
+        # Unknown button values fall through to `denied`
         verdict = {"approve": "approved", "deny": "denied",
                    "dismiss": "dismissed"}.get(decision, "denied")
         try:
@@ -2454,11 +1761,7 @@ def create_app() -> FastAPI:
     @app.post("/config/set")
     def config_set(path: str = Form(...), value: str = Form(""),
                    reason: str = Form(""), back: str = Form("/config")):
-        """The page's only write, and it is `jarvis config set` under another name.
-
-        Every setting is editable now, so the type check that boolean-only used
-        to give for free is explicit and lives here — Neo, q193.
-        """
+        """The page's only write, and it is `jarvis config set` under another name"""
         back = back if back.startswith("/config") else "/config"
         try:
             current = ops.config_get(path)["value"]
@@ -2468,12 +1771,10 @@ def create_app() -> FastAPI:
                     f"{path} takes {config_type_name(current)} — {value!r} is not. "
                     f"`jarvis config set {path} <value>` says the same thing.")
             ops.set_config(path, new, reason=reason)
-        # ValueError/TypeError: `parse_catalog` coerces with bare `int()`/`str()` and
-        # raises neither `CatalogError` nor anything `ops` converts (kn-650b6f24).
+        # ValueError/TypeError: `parse_catalog` coerces with bare `int()`/`str()` and raises neither...
         except (ops.OpsError, ValueError, TypeError) as e:
             sep = "&" if "?" in back else "?"
-            # `quote`, not the default `quote_plus`: the flash is read by a human
-            # off the address bar as often as by the page.
+            # `quote`, not the default `quote_plus`: the flash is read by a human off the address bar as often as...
             return RedirectResponse(
                 f"{back}{sep}{urlencode({'error': str(e)}, quote_via=quote)}",
                 status_code=303)
@@ -2482,15 +1783,7 @@ def create_app() -> FastAPI:
     @app.post("/config/wiring")
     def config_wiring(lever: str = Form(...), wired: str = Form(""),
                       scope: str = Form("os"), back: str = Form("/config")):
-        """Wire or unwire one thing for one scope — `ops.set_wiring` under another name.
-
-        No `reason` box, and that is a decision rather than an omission: a wiring key is
-        not a `SAFETY_KEYS` path. Unwiring only narrows what a worker can reach, and
-        wiring back only restores what the user's own Claude configuration already says
-        — neither widens what a worker is ALLOWED to do, which is what that demand is
-        for (kn-64f4922c: the reason exists to justify a change in permission, and a
-        write that moves none has nothing to put on the row).
-        """
+        """Wire or unwire one thing for one scope — `ops.set_wiring` under another name"""
         back = back if back.startswith("/config") else "/config"
         try:
             ops.set_wiring(lever, wired == "1", project=wiring_project(scope))
@@ -2501,13 +1794,11 @@ def create_app() -> FastAPI:
                 status_code=303)
         return RedirectResponse(back, status_code=303)
 
-    # -- the brake: `jarvis pause` / `jarvis resume` (issue #843) ------------------------
+    # -- the brake: `jarvis pause` / `jarvis resume` (issue #843)
 
     @app.post("/fleet/pause")
     def pause_fleet(reason: str = Form(""), next: str = Form("")):
-        """`jarvis pause`, from the dashboard. Refuses a second press while paused rather
-        than calling through: re-pausing REPLACES the allow-list, and a form on a page
-        rendered before someone else paused would silently throw it away."""
+        """`jarvis pause`, from the dashboard"""
         central = CentralStore()
         try:
             current = fleet.load_pause(central)
@@ -2522,13 +1813,13 @@ def create_app() -> FastAPI:
 
     @app.post("/fleet/resume")
     def resume_fleet(next: str = Form("")):
-        """`jarvis resume --all`: lift the pause for the whole fleet."""
+        """`jarvis resume --all`: lift the pause for the whole fleet"""
         ops.resume_fleet(everything=True)
         return RedirectResponse(_same_site_back(next, "/"), status_code=303)
 
     @app.post("/fleet/allow")
     def allow_through(order_id: str = Form(...), next: str = Form("")):
-        """`jarvis resume <wo-id>`: let one order through the pause."""
+        """`jarvis resume <wo-id>`: let one order through the pause"""
         try:
             ops.resume_fleet([order_id.strip()])
         except ops.OpsError as e:
@@ -2538,11 +1829,7 @@ def create_app() -> FastAPI:
 
     @app.post("/inbox/ack")
     def ack(inbox_id: str = Form("")):
-        central = CentralStore()
-        try:
-            central.ack_inbox(int(inbox_id) if inbox_id else None)
-        finally:
-            central.close()
+        ops.ack_inbox(int(inbox_id) if inbox_id else None)
         return RedirectResponse("/inbox", status_code=303)
 
     @app.post("/backlog/promote/{item_id}")

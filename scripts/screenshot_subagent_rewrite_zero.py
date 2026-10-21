@@ -1,18 +1,4 @@
-"""Screenshot the bill's re-write tax with the subagent side's STRUCTURAL zero named —
-the PR's UI evidence for spec 2026-10-02 §1.5.
-
-The unlabelled rollup read as "subagent cache spend is negligible". It is not negligible;
-it was unattributable from that number. So the order here has a main side that pays a real
-tax (three big writes against a smaller peak, one cache read going backwards) and a
-subagent side that CANNOT pay one: monotonic reads far above what it wrote, so its
-`rewrite_excess` and its `resume_boundaries` are 0 by arithmetic while its `cache_write`
-is 10,000.
-
-Everything lives in a temp `JARVIS_HOME` with its own transcript root, so it never touches
-the live OS:
-
-    uv run python scripts/screenshot_subagent_rewrite_zero.py
-"""
+"""Screenshot the bill's re-write tax with the subagent side's STRUCTURAL zero named"""
 
 from __future__ import annotations
 
@@ -38,14 +24,7 @@ SESSION = "sess-rewrite-zero"
 NOW = time.time()
 TURN = (NOW - 1800, NOW - 900)
 
-#: Asserted on the rendered page before anything is captured —
-#: `bill.SUBAGENT_REWRITE_ZERO` as the Jinja global `subagent_rewrite_zero` renders it,
-#: with this fixture's figures.
-#: A template that dropped the global would fail here rather than ship a picture of the
-#: paragraph it was meant to prove.
-#: The heading is checked apart from them: `h2` is rendered through a CSS
-#: `text-transform`, so what the reader sees is upper case and the source string would
-#: never match `inner_text`.
+#: Asserted on the rendered page before anything is captured
 EXPECTED_HEADING = "The re-write tax"
 EXPECTED = (
     "Not an extra charge — a part of the cache-write line, named.",
@@ -73,24 +52,21 @@ def assistant_row(at: float, mid: str, *, write: int = 0, read: int = 0,
 
 
 def main_rows() -> list[dict]:
-    """Three writes of 60,000 against a peak smaller than their sum, and one cache read
-    going backwards — one boundary, and a real tax on the main side."""
+    """Three writes of 60,000 against a peak smaller than their sum, and one cache read going backwards"""
     return [assistant_row(TURN[0] + 10, "m1", write=60_000, read=50_000),
             assistant_row(TURN[0] + 400, "m2", write=60_000, read=1_000),
             assistant_row(TURN[0] + 800, "m3", write=60_000, read=2_000)]
 
 
 def subagent_rows() -> list[dict]:
-    """Every real subagent: it writes a little and reads a lot, monotonically."""
+    """Every real subagent: it writes a little and reads a lot, monotonically"""
     return [assistant_row(TURN[0] + 100, "s1", write=5_000, read=100_000, out=5),
             assistant_row(TURN[0] + 160, "s2", write=5_000, read=120_000, out=5)]
 
 
 def envelope(cost: float) -> str:
     return json.dumps({
-        # The same tokens the main transcript holds, and a CONTEXT PEAK smaller than
-        # their sum: the peak is what the excess is measured against, so a peak above
-        # the written total is a session with no tax to show.
+        # The same tokens the main transcript holds
         "usage_v": 3, "total_cost_usd": cost, "input": 0, "cache_write": 180_000,
         "cache_read": 53_000, "cache_1h": 0, "cache_5m": 180_000, "output": 30,
         "context_peak": 110_000, "context_window": 1_000_000, "api_calls": 3,
@@ -108,8 +84,7 @@ def seed() -> tuple[str, str]:
     project = home / "jarvis_os"
     project.mkdir(parents=True, exist_ok=True)
     catalog = home / "catalog.json"
-    # `cold_prefix_floor` is not decoration: a bill classifies its cold boundaries
-    # against it and raises rather than guessing a threshold.
+    # `cold_prefix_floor` is not decoration: a bill classifies its cold boundaries against it and raises...
     catalog.write_text(json.dumps({
         "os": {"cold_prefix_floor": 5_000},
         "projects": [{"name": "jarvis_os", "path": str(project),
@@ -188,12 +163,10 @@ def shoot(project: str, wo_id: str) -> Path:
             if expected not in text:
                 raise SystemExit(f"not on the page: {expected!r} — nothing was "
                                  f"captured. The page read:\n{text[:3000]}")
-        # CLIPPED to the heading and the panel under it, at the rendered size: a
-        # full-page shot of a bill puts this paragraph in unreadable type.
+        # CLIPPED to the heading and the panel under it
         panel = page.locator("div.panel", has_text="Not an extra charge").first
         top, box = heading.bounding_box(), panel.bounding_box()
-        # `full_page` with the clip: the block sits well below the fold, and a clip
-        # outside the viewport is refused on a viewport-sized image.
+        # `full_page` with the clip: the block sits well below the fold
         page.screenshot(path=OUT, full_page=True, clip={"x": max(0.0, top["x"] - 16),
                                         "y": max(0.0, top["y"] - 16),
                                         "width": min(1100.0, box["width"] + 32),

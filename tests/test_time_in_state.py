@@ -1,12 +1,4 @@
-"""Time in each state: the spans the two chokepoints write, and the one reader over them.
-
-Built against a real `ProjectStore` in the style of `tests/test_active_time.py`'s
-`Record` — the store stamps `db.now()` and there is no back-dating API, so a fixture that
-needs a transition to have happened thirteen hours ago says so afterwards with SQL.
-`now` is passed explicitly everywhere; nothing sleeps.
-
-Spec: docs/superpowers/specs/2026-09-27-time-in-each-state.md.
-"""
+"""Time in each state: the spans the two chokepoints write, and the one reader over them (docs/superpowers/specs/2026-09-27-time-in-each-state.md)"""
 
 from __future__ import annotations
 
@@ -26,7 +18,7 @@ from jarvis.worker_session import PAUSE_USAGE_LIMIT
 
 MINUTE = 60.0
 HOUR = 3600.0
-#: An arbitrary epoch the fixtures hang off. Big enough that nothing reads as "unset".
+#: An arbitrary epoch the fixtures hang off
 T0 = 1_700_000_000.0
 NOW = T0 + 24 * HOUR
 
@@ -39,7 +31,7 @@ def store(tmp_path):
 
 
 def backdate(store: ProjectStore, order_id: str, *stamps: float) -> None:
-    """Put an order's spans, and its creation, on the clock — oldest first."""
+    """Put an order's spans, and its creation, on the clock — oldest first"""
     ids = [r["id"] for r in store.conn.execute(
         "SELECT id FROM wo_state_spans WHERE order_id=? ORDER BY id", (order_id,))]
     assert len(ids) == len(stamps), (ids, stamps)
@@ -73,7 +65,7 @@ def totals_by_status(payload: dict) -> dict[str, dict]:
     return {t["status"]: t for t in payload["totals"]}
 
 
-# 1 -------------------------------------------------------------------------
+# 1
 
 
 def test_spans_sum_to_lifetime(store):
@@ -105,7 +97,7 @@ def test_terminal_lifetime_stops_at_the_ending(store):
     assert later["lifetime_seconds"] == 5 * HOUR
 
 
-# 2 -------------------------------------------------------------------------
+# 2
 
 
 def test_re_entry_accumulates(store):
@@ -120,7 +112,7 @@ def test_re_entry_accumulates(store):
     assert entry["seconds"] == HOUR + (NOW - (T0 + 3 * HOUR))
 
 
-# 3 -------------------------------------------------------------------------
+# 3
 
 
 def test_current_status_age_and_observer_events(store):
@@ -143,7 +135,7 @@ def test_current_status_age_and_observer_events(store):
     assert payload["last_activity_kind"] == "landing_seen"
 
 
-# 4 -------------------------------------------------------------------------
+# 4
 
 
 def test_settled_order_has_no_current_span(store):
@@ -159,7 +151,7 @@ def test_settled_order_has_no_current_span(store):
     assert not [s for s in payload["spans"] if s["open"]]
 
 
-# 5 -------------------------------------------------------------------------
+# 5
 
 
 def test_brand_new_order(store):
@@ -174,7 +166,7 @@ def test_brand_new_order(store):
     assert ops.NO_ACTIVITY_NOTE in payload["notes"]
 
 
-# 6 -------------------------------------------------------------------------
+# 6
 
 
 def test_no_change_guard(store):
@@ -203,7 +195,7 @@ def test_park_unlanded_twice_writes_one_span(store):
     assert len(store.events_of_kind(wo["id"], "work_unlanded")) == 1
 
 
-# 7 -------------------------------------------------------------------------
+# 7
 
 
 def test_feature_order_spans_are_exact(store):
@@ -221,7 +213,7 @@ def test_feature_order_spans_are_exact(store):
     assert payload["current_status"] == ""
 
 
-# 8 -------------------------------------------------------------------------
+# 8
 
 
 def test_feature_activity_is_the_familys(store):
@@ -236,7 +228,7 @@ def test_feature_activity_is_the_familys(store):
     assert payload["last_activity_age"] == 5 * MINUTE
 
 
-# 9 -------------------------------------------------------------------------
+# 9
 
 
 def test_every_status_has_a_label():
@@ -248,7 +240,7 @@ def test_every_status_has_a_label():
             assert feature_status_label(kind, status), (kind, status)
 
 
-# the reader's own contract ------------------------------------------------
+# the reader's own contract
 
 
 def test_one_subject_only(store):
@@ -259,7 +251,7 @@ def test_one_subject_only(store):
         ops.state_durations(store, wo_id=wo["id"], fo_id="fo-1", now=NOW)
 
 
-# the CLI surfaces (spec §6) -----------------------------------------------
+# the CLI surfaces (spec §6)
 
 
 def _out(capsys, argv: list[str]) -> str:
@@ -267,8 +259,7 @@ def _out(capsys, argv: list[str]) -> str:
     return capsys.readouterr().out
 
 
-#: Every key `as_dict` promises. Spelled out because the `--json` shape is a contract
-#: other tooling reads (spec §4).
+#: Every key `as_dict` promises
 PAYLOAD_KEYS = (
     "order_id", "order_kind", "now", "approximate", "lifetime_seconds",
     "lifetime_human", "spans", "totals", "current_status", "current_status_since",
@@ -314,11 +305,7 @@ def test_wo_show_human_prints_the_status_a_duration_and_an_entry_count(
 
 def test_fo_show_carries_the_key_and_labels_a_coarse_span(
         jarvis_home, catalog_file, project, capsys):
-    """The point of the flag: an unlabelled coarse span is the defect Neo's ruling names.
-
-    A feature whose spans were never observed is every feature that predates the table,
-    reproduced here by dropping the rows and letting the next open backfill them.
-    """
+    """The point of the flag: an unlabelled coarse span is the defect Neo's ruling names"""
     ops.start_os(str(catalog_file), foreground=True)
     s = ProjectStore(project)
     try:
@@ -338,11 +325,7 @@ def test_fo_show_carries_the_key_and_labels_a_coarse_span(
     assert "a feature order keeps no event trail" in out
 
 
-# 10 ------------------------------------------------------------------------
-#
-# Spec: docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md, fix 4 — the
-# sixth activity source. A lead whose own transcript is quiet while its subagent's grows
-# is the incident; `stat()` mtime, and an absent transcript contributes NOTHING.
+# 10 (docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md)
 
 SECOND = 1.0
 
@@ -361,7 +344,7 @@ def _transcript(config_dir, cwd, session_id: str, *, subagent: str = "",
 
 
 def _quiet_wo(store, *, session_id: str = "sess-1"):
-    """An order whose every table went quiet 45 minutes ago."""
+    """An order whose every table went quiet 45 minutes ago"""
     wo = store.create_work_order("t")
     store.set_status(wo["id"], "running")
     backdate(store, wo["id"], NOW - 20 * HOUR, NOW - 14 * HOUR)
@@ -385,7 +368,7 @@ def test_a_live_subagent_transcript_counts_as_activity(store, tmp_path, monkeypa
 
 
 def test_a_transcript_in_the_worktree_counts(store, tmp_path, monkeypatch):
-    """The cwd is the worktree when the order has one — `worktree_path`'s computation."""
+    """The cwd is the worktree when the order has one — `worktree_path`'s computation"""
     config = tmp_path / "claude-config"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
     wo = _quiet_wo(store, session_id="sess-2")
@@ -399,7 +382,7 @@ def test_a_transcript_in_the_worktree_counts(store, tmp_path, monkeypatch):
 
 
 def test_a_missing_transcript_contributes_nothing(store, tmp_path, monkeypatch):
-    """Absent, not 1970: no tuple at all, so the note stands and the timestamp is None."""
+    """Absent, not 1970: no tuple at all, so the note stands and the timestamp is None"""
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
     wo = store.create_work_order("t")
     backdate(store, wo["id"], NOW - MINUTE)
@@ -414,7 +397,7 @@ def test_a_missing_transcript_contributes_nothing(store, tmp_path, monkeypatch):
 
 def test_an_unreadable_subagent_directory_is_absent_not_zero(
         store, tmp_path, monkeypatch):
-    """The glob yields nothing: no tuple, so the note stands. Not the raising path."""
+    """The glob yields nothing: no tuple, so the note stands"""
     import os as _os
     config = tmp_path / "claude-config"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
@@ -438,11 +421,7 @@ def test_an_unreadable_subagent_directory_is_absent_not_zero(
                     reason="root reads through a 0o000 directory, so nothing raises")
 def test_an_unreadable_transcript_parent_is_absent_not_zero(
         store, tmp_path, monkeypatch):
-    """The RAISING path: `stat()` on a file under a 0o000 parent is a PermissionError.
-
-    Swallowed, contributing no tuple — `Path.exists()` would have turned it into a
-    silent False, which is why the read stats directly.
-    """
+    """The RAISING path: `stat()` on a file under a 0o000 parent is a PermissionError"""
     config = tmp_path / "claude-config"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
     wo = store.create_work_order("t")
@@ -475,13 +454,11 @@ def test_a_feature_inherits_a_childs_transcript(store, tmp_path, monkeypatch):
     payload = ops.state_durations(store, fo_id=fo["id"], now=NOW).as_dict(NOW)
     assert payload["last_activity_age"] == 3 * MINUTE
     assert payload["last_activity_kind"] == "transcript"
-# 11 -- no status write without a span, and a reader that refuses to disagree ----------
-# Spec: docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md §2d2
+# 11 -- no status write without a span (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md §2d2)
 
 
 def test_the_atomic_claim_records_its_span(store):
-    """`claim_next_pending` is one conditional UPDATE and stays one — the span is written
-    beside it on a claim that won."""
+    """`claim_next_pending` is one conditional UPDATE and stays one"""
     wo = store.create_work_order("t")
 
     claimed = store.claim_next_pending()
@@ -502,8 +479,7 @@ def test_a_claim_that_found_nothing_writes_no_span(store):
 
 
 def test_a_dispatch_retry_records_the_way_back_to_pending(store):
-    """The three raw-SQL bypasses left neither a span nor a `status` event, so an order
-    that went round the retry loop read as still `dispatching` for ever."""
+    """The three raw-SQL bypasses left neither a span nor a `status` event"""
     wo = store.create_work_order("t")
     store.claim_next_pending()
 
@@ -528,15 +504,14 @@ def test_a_dispatch_that_spent_its_launches_records_the_failed_span(store):
 
 
 def test_the_backfill_fills_a_gap_instead_of_skipping_the_order(tmp_path):
-    """wo-3615faf7's durable half: `_backfill_wo_spans` was all-or-nothing per order, so
-    an order with a partial history could never be repaired by anything."""
+    """wo-3615faf7's durable half: `_backfill_wo_spans` was all-or-nothing per order"""
     path = tmp_path / "gapped"
     store = ProjectStore(path)
     try:
         wo = store.create_work_order("t")
         store.set_status(wo["id"], "running")
         store.set_status(wo["id"], "needs_review")
-        # The pre-upgrade daemon's shape: the `status` event with no span beside it.
+        # The pre-upgrade daemon's shape: the `status` event with no span beside it
         store.conn.execute(
             "DELETE FROM wo_state_spans WHERE order_id=? AND to_status='needs_review'",
             (wo["id"],))
@@ -555,10 +530,7 @@ def test_the_backfill_fills_a_gap_instead_of_skipping_the_order(tmp_path):
 
 
 def test_a_store_whose_spans_are_current_pays_two_scalar_reads(tmp_path):
-    """The gap-fill runs in `__init__`, so on every CLI invocation and every reconcile of
-    every project. Without the high-water guard the per-order GROUP BY ran EVERY time —
-    260ms on a 500-order project — because `set_status` stamped its event after its own
-    span. The two rows share a moment now, and this is the assertion that keeps it."""
+    """The gap-fill runs in `__init__`, so on every CLI invocation and every reconcile of every project"""
     path = tmp_path / "current"
     store = ProjectStore(path)
     try:
@@ -583,8 +555,7 @@ def test_a_store_whose_spans_are_current_pays_two_scalar_reads(tmp_path):
 
 
 def test_the_reader_reports_the_column_when_the_spans_disagree(store):
-    """The belt. A reader that silently believed the gap is why nobody noticed for 20.7h
-    — and the note carries no elapsed time, because it becomes an attention reason."""
+    """The belt"""
     wo = store.create_work_order("t")
     store.set_status(wo["id"], "waiting_input")
     store.conn.execute("UPDATE work_orders SET status='needs_review' WHERE id=?",
@@ -602,8 +573,7 @@ def test_the_reader_reports_the_column_when_the_spans_disagree(store):
 
 
 def test_an_agreeing_open_span_is_still_the_current_status(store):
-    """The other half: the belt only fires on a disagreement, and the ordinary reading
-    is unchanged."""
+    """The other half: the belt only fires on a disagreement, and the ordinary reading is unchanged"""
     wo = store.create_work_order("t")
     store.set_status(wo["id"], "running")
     backdate(store, wo["id"], T0, T0 + HOUR)
@@ -616,10 +586,7 @@ def test_an_agreeing_open_span_is_still_the_current_status(store):
 
 
 def test_the_invariant_repairs_a_tail_that_disagrees_with_the_column(store):
-    """The fix at the writer cannot heal a row a bypass already broke, and the backfill
-    structurally cannot either: a status written round `set_status` leaves no `status`
-    event to replay. So the disagreement itself is the repair trigger — an `approximate`
-    span at the order's `updated_at`, the only time the record holds for it."""
+    """The fix at the writer cannot heal a row a bypass already broke"""
     from jarvis import invariants
     from jarvis.invariants import check_project
 
@@ -631,9 +598,9 @@ def test_the_invariant_repairs_a_tail_that_disagrees_with_the_column(store):
         (T0 + HOUR, wo["id"]))
     store.conn.commit()
 
-    # Called directly for the stamp — a reconcile runs every other check too, and one of
-    # them touching `updated_at` would make the assertion below about that check instead.
-    found = list(invariants.check_spans_reach_the_status(store))
+    # Called directly for the stamp; `backdate` leaves events behind, which INV-RECORD-BEHIND flags
+    found = [v for v in invariants.check_spans_reach_the_status(store)
+             if v.invariant == "INV-SPAN-BEHIND"]
     assert invariants.check_spans_reach_the_status in invariants.INVARIANTS
 
     assert [v.wo_id for v in found] == [wo["id"]]
@@ -645,12 +612,12 @@ def test_the_invariant_repairs_a_tail_that_disagrees_with_the_column(store):
     reading = ops.state_durations(store, wo_id=wo["id"], now=NOW)
     assert reading.current_status == "needs_review"
     assert ops.SPANS_BEHIND_NOTE not in reading.notes
-    # Repaired once: the tail agrees now, so the next tick has nothing to say.
+    # Repaired once: the tail agrees now, so the next tick has nothing to say
     assert [v for v in check_project(store) if v.invariant == "INV-SPAN-BEHIND"] == []
 
 
 def test_a_doctor_run_without_repair_proposes_the_span_and_writes_none(store):
-    """`jarvis doctor` with no `--repair` writes nothing at all — and still says it."""
+    """`jarvis doctor` with no `--repair` writes nothing at all — and still says it"""
     from jarvis.invariants import check_project
 
     wo = store.create_work_order("t")
@@ -669,10 +636,7 @@ def test_a_doctor_run_without_repair_proposes_the_span_and_writes_none(store):
 
 
 def test_set_status_refuses_to_leave_a_transition_half_written(store, monkeypatch):
-    """`_record_span` is the enforced chokepoint, not merely the current habit: an edit
-    that writes the column and skips the span fails at the writer rather than three
-    surfaces downstream. Both directions — the ordinary transition writes both rows, and
-    a `_record_span` that records nothing is caught."""
+    """`_record_span` is the enforced chokepoint"""
     wo = store.create_work_order("t")
 
     store.set_status(wo["id"], "running")
@@ -685,12 +649,9 @@ def test_set_status_refuses_to_leave_a_transition_half_written(store, monkeypatc
         store.set_status(wo["id"], "needs_review")
 
 
-# a hold is not time in status (spec §5 of
-# docs/superpowers/specs/2026-09-30-time-in-state-counts-a-usage-limit-hold-as-running.md)
-# ---------------------------------------------------------------------------
+# a hold is not time in status (spec §5 of... (docs/superpowers/specs/2026-09-30-time-in-state-counts-a-usage-limit-hold-as-running.md)
 
-#: Issue 887's own numbers: `running` at T0, 45 minutes of turn, then the fleet usage
-#: window is spent until T0+5h24m.
+#: Issue 887's own numbers: `running` at T0
 WORKED = 45 * MINUTE
 WALL = 5 * HOUR + 24 * MINUTE
 HELD = WALL - WORKED
@@ -707,7 +668,7 @@ def resume_at(store: ProjectStore, wo_id: str, ts: float, seq: int = 1) -> None:
 
 
 def running_since_t0(store: ProjectStore) -> dict:
-    """A work order that entered `running` at T0 after an hour pending."""
+    """A work order that entered `running` at T0 after an hour pending"""
     wo = store.create_work_order("t")
     store.set_status(wo["id"], "running")
     backdate(store, wo["id"], T0 - HOUR, T0)
@@ -837,7 +798,7 @@ def test_planner_and_manager_count_as_family(store):
     assert payload["lifetime_held_seconds"] == 2 * HOUR
 
 
-# the three renderer lines (spec §3) ----------------------------------------
+# the three renderer lines (spec §3)
 
 
 def _line(store: ProjectStore, wo_id: str, status: str) -> str:
@@ -847,7 +808,7 @@ def _line(store: ProjectStore, wo_id: str, status: str) -> str:
 
 
 def test_never_held_line_is_byte_identical(store):
-    """The common case acquires no noise: the golden string is today's output."""
+    """The common case acquires no noise: the golden string is today's output"""
     wo = running_since_t0(store)
     turn_at(store, wo["id"], T0, T0 + WORKED)
 

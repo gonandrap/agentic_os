@@ -1,4 +1,4 @@
-"""SQLite helpers shared by the central and per-project stores."""
+"""SQLite helpers shared by the central and per-project stores"""
 
 from __future__ import annotations
 
@@ -24,17 +24,7 @@ def connect(path: Path) -> sqlite3.Connection:
 
 @contextmanager
 def write_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
-    """One all-or-nothing unit of work. THE ONLY WAY TO OPEN A TRANSACTION HERE.
-
-    `BEGIN IMMEDIATE`, never a bare `BEGIN`: a deferred transaction that reads before it
-    writes takes a WAL snapshot, and the upgrade to a write returns SQLITE_BUSY_SNAPSHOT
-    — reported as `database is locked` — the moment any other connection committed after
-    that snapshot. SQLite does not consult `busy_timeout` for that code, so the ten
-    seconds set in `connect` never applies and the caller fails instantly. Taking the
-    write lock up front turns that into an ordinary wait the busy handler can serve.
-    The daemon writes to one project database from several threads, so this is not
-    theoretical: tests/test_stores.py reproduces it.
-    """
+    """One all-or-nothing unit of work"""
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
@@ -42,6 +32,22 @@ def write_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     except BaseException:
         conn.execute("ROLLBACK")
         raise
+
+
+def add_missing_columns(conn: sqlite3.Connection,
+                        added: Mapping[str, Mapping[str, str]]) -> None:
+    """ALTER in each column a table lacks; a column a concurrent opener just added is not an error"""
+    for table, columns in added.items():
+        have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        for name, decl in columns.items():
+            if name in have:
+                continue
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+            except sqlite3.OperationalError as e:
+                # Two processes opening one fresh store both saw the column missing
+                if "duplicate column name" not in str(e):
+                    raise
 
 
 def now() -> float:
@@ -69,39 +75,27 @@ def rows_to_dicts(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
-# Substring matching makes a one- or two-letter word match almost every row ("in" is
-# inside "login"), so a query's short words are dropped — unless that is all it has, and
-# then they are all it can match on.
+# Substring matching makes a one- or two-letter word match almost every row ("in" is inside "login")
 MIN_SEARCH_WORD = 3
 
 
-#: At most this many distinct words reach SQL. Every word is one LIKE per column per row,
-#: unindexed, so a pasted work-order description (hundreds of words) made one search take
-#: over a minute and tied up a dashboard thread for all of it. The first words of a paste
-#: are its title, which is what the reader is looking for.
+#: At most this many distinct words reach SQL
 MAX_SEARCH_WORDS = 12
 
 
 def cap_words(words: Sequence[str]) -> list[str]:
-    """Distinct words, first occurrence kept, at most `MAX_SEARCH_WORDS`."""
+    """Distinct words, first occurrence kept, at most `MAX_SEARCH_WORDS`"""
     return list(dict.fromkeys(words))[:MAX_SEARCH_WORDS]
 
 
 def search_words(query: str) -> list[str]:
-    """The query as words. Empty means "no query" — a search verb, unlike a listing,
-    returns nothing for it rather than everything."""
+    """The query as words"""
     words = [w.lower() for w in (query or "").split() if w.strip()]
     return cap_words([w for w in words if len(w) >= MIN_SEARCH_WORD] or words)
 
 
 def score_sql(words: Sequence[str], weights: Mapping[str, int]) -> tuple[str, list[str]]:
-    """A relevance expression: per query word, the heaviest column containing it, summed.
-
-    Word-OR, not phrase: an agent and a user both type phrases, and a row matching three
-    of four words is the hit they wanted (kn-c6e8fbf0). Weights are what keep a hit in a
-    title above one buried in a description — the CASE tests columns heaviest-first, so
-    each word scores once.
-    """
+    """A relevance expression: per query word, the heaviest column containing it, summed"""
     if not words:
         return "0", []
     cols = sorted(weights.items(), key=lambda kv: -kv[1])

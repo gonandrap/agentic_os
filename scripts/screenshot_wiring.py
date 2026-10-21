@@ -1,14 +1,4 @@
-"""Screenshot /config's wiring section against a throwaway fleet, for a PR's UI evidence.
-
-Same shape as `screenshot_config_console.py`, with one difference that matters: the
-inventory is INSTALLED rather than discovered. `wiring.discover` reads the machine this
-runs on, so a real read would put whoever's Claude configuration into a committed PNG and
-would look different on every developer's box. The rows below are the shapes the page has
-to render — a block with a measurement, a plugin, a server that follows its plugin, a
-server with no lever at all, a user skill.
-
-    uv run python scripts/screenshot_wiring.py
-"""
+"""Screenshot /config's wiring section against a throwaway fleet, for a PR's UI evidence"""
 
 from __future__ import annotations
 
@@ -102,12 +92,12 @@ def shoot() -> None:
         browser = p.chromium.launch()
         page = browser.new_page(viewport={"width": 1280, "height": 1000})
 
-        # Everything wired, which is what every project looks like until someone acts.
+        # Everything wired, which is what every project looks like until someone acts
         page.goto(f"{base}/config?scope=projects.shared_schedule#wiring")
         page.wait_for_timeout(200)
         page.screenshot(path=SHOTS / "config-wiring-default.png")
 
-        # ...and the same page after two deselections, one of each kind.
+        # ...and the same page after two deselections, one of each kind
         page.click("#wiring form:has(input[value='connectors']) button")
         page.wait_for_load_state()
         page.goto(f"{base}/config?scope=projects.shared_schedule#wiring")
@@ -117,11 +107,7 @@ def shoot() -> None:
         page.wait_for_timeout(200)
         page.screenshot(path=SHOTS / "config-wiring-deselected.png")
 
-        # The history below it: a deselection is an ordinary config version, and the
-        # page says which project it moved and when. CLIPPED to the section rather
-        # than scrolled to it — a viewport shot of a page that happens to fit is
-        # byte-identical to the one above, which is how a screenshot ends up
-        # evidencing the wrong view.
+        # The history below it: a deselection is an ordinary config version
         page.evaluate("window.scrollTo(0, 0)")  # so a box is a document coordinate
         page.wait_for_timeout(100)
         head = page.locator("h2", has_text="History").first

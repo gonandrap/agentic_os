@@ -1,21 +1,4 @@
-"""`jarvis watch` — what a turn is doing RIGHT NOW, and what it refuses to claim.
-
-`tests/test_inspection.py` covers the post-mortem: a whole transcript, cut into turns,
-read once. This covers the opposite regime — the same file read every two seconds while
-it is still being appended to — and almost everything below is about the two ways that
-regime can lie.
-
-The first is the reader: a JSONL being written is read mid-line, so the cursor tests
-exist because dropping or double-counting the newest row drops exactly the row the user
-is waiting for. The second is the payload: a row lands when a MESSAGE completes, so an
-open tool span, a token count and a turn clock are all stale readings between messages,
-and the snapshot has to say which state it is in before any of them may be read as
-current. `state`, `now is None` and `note` carry that, and they are pinned here.
-
-The row builders are copied from `tests/test_inspection.py` rather than imported: they
-describe the shape Claude Code writes, and §4 of the feature order rewrites that module's
-walk. A shared fixture would make one child's edit the other's failure.
-"""
+"""`jarvis watch` — what a turn is doing RIGHT NOW, and what it refuses to claim"""
 
 from __future__ import annotations
 
@@ -64,7 +47,7 @@ def tool_rows(start: float, end: float, tool_id: str, name: str,
 
 def tool_use_row(at: float, tool_id: str, name: str,
                  payload: dict | None = None) -> dict:
-    """The half of `tool_rows` a LIVE turn has written: the ask, with no result yet."""
+    """The half of `tool_rows` a LIVE turn has written: the ask, with no result yet"""
     return {"type": "assistant", "timestamp": stamp(at),
             "message": {"id": f"m-{tool_id}", "model": "claude-opus-5",
                         "usage": {"input_tokens": 0, "cache_creation_input_tokens": 0,
@@ -75,12 +58,7 @@ def tool_use_row(at: float, tool_id: str, name: str,
 
 @pytest.fixture()
 def write_transcript(tmp_path, monkeypatch):
-    """A transcript under a fake `$JARVIS_TRANSCRIPT_ROOT`, writable a row at a time.
-
-    `append` and `append_raw` are the additions to `test_inspection.py`'s fixture and
-    they are the whole point of this file: a live transcript grows between two reads, and
-    `append_raw` can leave it without a trailing newline the way a half-written row does.
-    """
+    """A transcript under a fake `$JARVIS_TRANSCRIPT_ROOT`, writable a row at a time"""
     root = tmp_path / "projects"
     (root / "-proj").mkdir(parents=True)
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
@@ -119,7 +97,7 @@ def write_transcript(tmp_path, monkeypatch):
 
 
 def snap(session: str, **kwargs):
-    """One frame over a bound reader, with the record's two booleans defaulted off."""
+    """One frame over a bound reader, with the record's two booleans defaulted off"""
     reader = live.Reader()
     reader.bind(session)
     return reader, frame(reader, **kwargs)
@@ -136,19 +114,16 @@ def frame(reader, *, wo_id: str = "wo-1111", project: str = "proj_a",
 DISPATCH = "You are the worker agent for wo-1111"
 
 
-# -- the five states, and the reader that feeds them -----------------------------------
+# -- the five states, and the reader that feeds them
 
 
 def test_the_states_are_the_five_the_spec_names():
-    """Pinned because every renderer branches on this string and the dashboard's
-    template cannot be type-checked: a sixth state added without a word for it renders
-    as a blank panel, and a renamed one renders the wrong panel."""
+    """Pinned because every renderer branches on this string and the dashboard's template cannot be..."""
     assert live.STATES == ("working", "generating", "idle", "settled", "no-transcript")
 
 
 def test_a_second_poll_reads_only_the_bytes_that_arrived(write_transcript):
-    """The reason this module exists rather than a call to `usage.rows`: at a 2s refresh
-    a whole-file re-parse is paid for again on every frame, and the file only grows."""
+    """The reason this module exists rather than a call to `usage.rows`: at a 2s refresh a whole-file..."""
     session = write_transcript.write("grow", [prompt_row(1000, DISPATCH),
                                              assistant_row(1010, "m1")])
     size = write_transcript.path(session).stat().st_size
@@ -171,9 +146,7 @@ def test_a_second_poll_reads_only_the_bytes_that_arrived(write_transcript):
 
 
 def test_a_replaced_file_is_re_read_from_zero(write_transcript):
-    """`uilog._fingerprint`'s reasoning, and it is not theoretical here: Claude Code
-    rewrites a transcript on compaction. A bare byte offset would seek past the real
-    rows of the new file into whatever happened to be at that position."""
+    """`uilog._fingerprint`'s reasoning"""
     session = write_transcript.write("swap", [prompt_row(1000, DISPATCH),
                                              assistant_row(1010, "m1")])
     reader = live.Reader()
@@ -193,10 +166,7 @@ def test_a_replaced_file_is_re_read_from_zero(write_transcript):
 
 
 def test_a_half_written_row_is_not_parsed_until_its_newline_arrives(write_transcript):
-    """THE DEFECT THIS TEST EXISTS FOR: a transcript is appended to while it is read, so
-    the last line can be half there. Parsing it drops the row (invalid JSON) and
-    advancing past it drops it for ever — and it is the newest row, the one the user
-    opened `jarvis watch` to see."""
+    """THE DEFECT THIS TEST EXISTS FOR: a transcript is appended to while it is read"""
     session = write_transcript.write("partial", [prompt_row(1000, DISPATCH),
                                                 assistant_row(1010, "m1")])
     reader = live.Reader()
@@ -220,10 +190,7 @@ def test_a_half_written_row_is_not_parsed_until_its_newline_arrives(write_transc
 
 def test_a_transcript_with_only_a_half_written_line_has_no_stale_reading(
         write_transcript):
-    """`_last_ts` is 0.0 when nothing has parsed yet, and `now - 0.0` is 1.7 billion
-    seconds of silence — a number every layer above would render as an eternally stalled
-    turn. The file exists (`found` stays true) and the note says the honest thing: nothing
-    has been written to it at all, not "600 seconds ago"."""
+    """`_last_ts` is 0.0 when nothing has parsed yet, and `now - 0.0` is 1.7 billion seconds of silence"""
     session = write_transcript.write("half-only", [])
     half = json.dumps(prompt_row(1000, DISPATCH))
     write_transcript.append_raw(session, half[:len(half) // 2])
@@ -235,13 +202,11 @@ def test_a_transcript_with_only_a_half_written_line_has_no_stale_reading(
     assert "nothing has been written to this transcript at all" in payload["note"]
 
 
-# -- what the state means, and what may be read as current -----------------------------
+# -- what the state means, and what may be read as current
 
 
 def test_an_open_span_with_a_turn_in_flight_is_working(write_transcript):
-    """The only state in which `now` is a CURRENT reading, and both halves of the test
-    are load-bearing: the transcript says a tool was asked for and never came back, and
-    the OS's own record says a process is running to come back with it."""
+    """The only state in which `now` is a CURRENT reading"""
     session = write_transcript.write("busy", [
         prompt_row(1000, DISPATCH),
         assistant_row(1010, "m1"),
@@ -258,9 +223,7 @@ def test_an_open_span_with_a_turn_in_flight_is_working(write_transcript):
 
 
 def test_an_open_span_with_no_turn_in_flight_reports_nothing_current(write_transcript):
-    """Neo q678 (2): a killed turn leaves a `tool_use` with no `tool_result` in the file
-    FOR EVER. Reading the transcript alone, "Bash has been running for 3 days" is what
-    that looks like, and it is the exact shape of lie §3 forbids."""
+    """Neo q678 (2): a killed turn leaves a `tool_use` with no `tool_result` in the file FOR EVER"""
     session = write_transcript.write("crashed", [
         prompt_row(1000, DISPATCH),
         assistant_row(1010, "m1"),
@@ -275,10 +238,7 @@ def test_an_open_span_with_no_turn_in_flight_reports_nothing_current(write_trans
 
 def test_an_orphan_span_from_a_killed_turn_is_not_the_next_turn_s_activity(
         write_transcript):
-    """kn-73bcc2dd, the half `turn_in_flight` alone cannot cover: the turn that opened
-    `t1` was KILLED, a new turn started, and the record says a turn is in flight again —
-    for the new one. Deciding `working` off `_open` publishes the dead turn's span as
-    `now` with an elapsed measured from 1015, which is §3's stale-reading-as-current."""
+    """kn-73bcc2dd, the half `turn_in_flight` alone cannot cover: the turn that opened `t1` was KILLED"""
     session = write_transcript.write("orphan", [
         prompt_row(1000, DISPATCH),
         assistant_row(1010, "m1"),
@@ -296,8 +256,7 @@ def test_an_orphan_span_from_a_killed_turn_is_not_the_next_turn_s_activity(
 
 
 def test_a_late_tool_result_still_closes_its_span_into_recent(write_transcript):
-    """The filter scopes what may be READ as current; it must not stop a span closing.
-    `_open` keeps every span so a `tool_result` that lands a frame later still pairs."""
+    """The filter scopes what may be READ as current; it must not stop a span closing"""
     session = write_transcript.write("late", [
         prompt_row(1000, DISPATCH),
         assistant_row(1010, "m1"),
@@ -320,9 +279,7 @@ def test_a_late_tool_result_still_closes_its_span_into_recent(write_transcript):
 
 
 def test_generating_names_the_time_nothing_has_been_written_since(write_transcript):
-    """THE BLIND SPOT, in words. A row lands when a message completes, so a model that
-    has been generating for ten minutes has written nothing — and the honest report is
-    the silence and its length, never invented activity."""
+    """THE BLIND SPOT, in words"""
     session = write_transcript.write("thinking", [prompt_row(1000, DISPATCH),
                                                  assistant_row(1010, "m1")])
 
@@ -333,13 +290,12 @@ def test_generating_names_the_time_nothing_has_been_written_since(write_transcri
     assert payload["now"] is None
     assert "nothing has been written since" in payload["note"]
     assert live.clock(1010.0) in payload["note"]
-    # Spec §1: the silence is named, not merely reported.
+    # Spec §1: the silence is named, not merely reported
     assert payload["note"].startswith("awaiting the model")
 
 
 def test_no_transcript_is_absent_and_never_zero(write_transcript):
-    """Issue #227's rule at a second site: a reading that could not be taken is null, so
-    no layer above can average it, sum it or render it as a fast, cheap, idle turn."""
+    """Issue #227's rule at a second site: a reading that could not be taken is null"""
     _, payload = snap("never-ran")
 
     assert payload["state"] == "no-transcript" and payload["found"] is False
@@ -349,9 +305,7 @@ def test_no_transcript_is_absent_and_never_zero(write_transcript):
 
 
 def test_a_settled_order_reports_its_last_frame_and_nothing_current(write_transcript):
-    """§3: a user who runs this a minute late gets an answer rather than an error. The
-    last frame is still true about the past; `now` is not, which is why `settled` is
-    decided before `working` (Neo q678)."""
+    """§3: a user who runs this a minute late gets an answer rather than an error"""
     session = write_transcript.write("done", [
         prompt_row(1000, DISPATCH),
         assistant_row(1010, "m1"),
@@ -366,13 +320,11 @@ def test_a_settled_order_reports_its_last_frame_and_nothing_current(write_transc
     assert [s["tool"] for s in payload["recent"]] == ["Bash"]
 
 
-# -- the numbers, and whose vocabulary they are in -------------------------------------
+# -- the numbers, and whose vocabulary they are in
 
 
 def test_the_token_counters_are_this_turn_s_not_the_session_s(write_transcript):
-    """`jarvis cost` owns the session; the live view's subject is the turn in flight. A
-    session total would answer a question nobody watching a turn is asking, and would
-    make the counters climb while the current turn did nothing."""
+    """`jarvis cost` owns the session; the live view's subject is the turn in flight"""
     session = write_transcript.write("tokens", [
         prompt_row(1000, DISPATCH),
         assistant_row(1010, "m1", write=500_000, read=1_000, input=7, out=9),
@@ -388,10 +340,7 @@ def test_the_token_counters_are_this_turn_s_not_the_session_s(write_transcript):
 
 
 def test_last_write_carries_inspection_s_own_cause_and_raises_nothing(write_transcript):
-    """One vocabulary for one fact. `jarvis inspect` already names the four causes and
-    writes the sentence for each; a second wording here is the drift this repository has
-    shipped before. And it REPORTS: prefix stability's authority is
-    `invariants.check_prefix_stable`, so nothing in this payload is an alarm."""
+    """One vocabulary for one fact"""
     session = write_transcript.write("rewrite", [
         prompt_row(1000, DISPATCH),
         assistant_row(1010, "m1", write=300_000),
@@ -408,8 +357,7 @@ def test_last_write_carries_inspection_s_own_cause_and_raises_nothing(write_tran
 
 
 def test_subagents_are_named_from_the_meta_files_beside_the_transcript(write_transcript):
-    """The join that turns `a7b62083` into a sentence — and no subagent transcript is
-    opened: §8 owns those, and reading one per frame is the cost this module refuses."""
+    """The join that turns `a7b62083` into a sentence"""
     session = write_transcript.write("lead", [prompt_row(1000, DISPATCH),
                                              assistant_row(1010, "m1")])
     write_transcript.subagent_meta(session, "agent-a7b62083",
@@ -421,13 +369,11 @@ def test_subagents_are_named_from_the_meta_files_beside_the_transcript(write_tra
     assert payload["subagents"] == {"a7b62083": "Explore · find the dispatch path"}
 
 
-# -- the payload reaches a terminal, a web page and a --json consumer ------------------
+# -- the payload reaches a terminal, a web page and a --json consumer
 
 
 def test_a_long_parameter_is_capped_and_the_cap_is_stated(write_transcript):
-    """Tool inputs carry whole file contents. Capping is not cosmetic here: the
-    truncation has to be VISIBLE and the cap has to travel in the payload, or a reader
-    cannot tell a short command from a truncated one."""
+    """Tool inputs carry whole file contents"""
     session = write_transcript.write("big", [
         prompt_row(1000, DISPATCH),
         assistant_row(1010, "m1"),
@@ -442,9 +388,7 @@ def test_a_long_parameter_is_capped_and_the_cap_is_stated(write_transcript):
 
 
 def test_a_parameter_whose_name_says_secret_is_replaced_not_truncated():
-    """Truncation is no defence for a credential — the secret is at the FRONT of a
-    tokenised remote (`holds.Hold`'s note, kn-1791a5e6). The KEY survives, so the reader
-    still sees what the tool was called with."""
+    """Truncation is no defence for a credential"""
     out = live.redact_params({"command": "curl -H auth", "api_key": "sk-live-abcdef",
                               "env": {"GH_TOKEN": "ghp_abcdef"}})
 
@@ -455,9 +399,7 @@ def test_a_parameter_whose_name_says_secret_is_replaced_not_truncated():
 
 
 def test_a_tokenised_remote_is_scrubbed_before_anything_is_cut(write_transcript):
-    """THE LEAK A KEY TEST CANNOT SEE (kn-1791a5e6). `command` is not a secret-sounding
-    name and the credential is at the FRONT of the value, so the cap preserves it
-    perfectly: this is a `git push` as workers in this fleet actually write one."""
+    """THE LEAK A KEY TEST CANNOT SEE (kn-1791a5e6)"""
     session = write_transcript.write("push", [
         prompt_row(1000, DISPATCH),
         assistant_row(1010, "m1"),
@@ -476,10 +418,7 @@ def test_a_tokenised_remote_is_scrubbed_before_anything_is_cut(write_transcript)
 
 
 def test_an_env_prefixed_token_is_redacted_mid_command(write_transcript):
-    """THE SHAPE THE ROUND-1 REVIEW FAILED ON. `GH_TOKEN=ghp_…` is how a worker passes a
-    credential to one command, and it is neither a secret-NAMED key nor a URL's userinfo:
-    both of round 1's rules miss it. Asserted over the WHOLE payload (kn-637a7236), and
-    the command has to stay READABLE — a report that redacts the verb is useless."""
+    """THE SHAPE THE ROUND-1 REVIEW FAILED ON"""
     session = write_transcript.write("envtok", [
         prompt_row(1000, DISPATCH),
         assistant_row(1010, "m1"),
@@ -497,8 +436,7 @@ def test_an_env_prefixed_token_is_redacted_mid_command(write_transcript):
 
 def test_an_inline_assignment_is_caught_where_an_anchored_pattern_would_miss(
         write_transcript):
-    """A value with no recognisable prefix, mid-command: only the NAME=value rule can
-    see it, and only if it is not anchored to the start of a line."""
+    """A value with no recognisable prefix"""
     session = write_transcript.write("inline", [
         prompt_row(1000, DISPATCH),
         assistant_row(1010, "m1"),
@@ -513,9 +451,7 @@ def test_an_inline_assignment_is_caught_where_an_anchored_pattern_would_miss(
 
 
 def test_a_flag_form_credential_is_redacted(write_transcript):
-    """THE SAME LEAK ONE SYNTAX ALONG: on a command line a credential arrives as an env
-    prefix OR as a flag, and `--password=` escapes a name test anchored to a bare
-    identifier exactly as `GH_TOKEN=` escaped an anchored line pattern."""
+    """THE SAME LEAK ONE SYNTAX ALONG: on a command line a credential arrives as an env prefix OR as a..."""
     session = write_transcript.write("flag", [
         prompt_row(1000, DISPATCH),
         assistant_row(1010, "m1"),
@@ -531,8 +467,7 @@ def test_a_flag_form_credential_is_redacted(write_transcript):
 
 
 def test_a_bearer_header_inside_a_command_is_redacted(write_transcript):
-    """`curl -H 'Authorization: Bearer …'` — the header shape AND the `sk-` value shape,
-    either of which must fire before the string reaches params or detail."""
+    """`curl -H 'Authorization: Bearer …'`"""
     session = write_transcript.write("bearer", [
         prompt_row(1000, DISPATCH),
         assistant_row(1010, "m1"),
@@ -548,9 +483,7 @@ def test_a_bearer_header_inside_a_command_is_redacted(write_transcript):
 
 
 def test_a_placeholder_value_is_not_redacted_however_secret_its_name():
-    """THE NEGATIVE CONTROL, and the reason the name test alone is not enough: every
-    repo is full of `token=your-token-here` and `--key=none`, and redacting those makes
-    the frame useless for reading what the worker actually ran."""
+    """THE NEGATIVE CONTROL, and the reason the name test alone is not enough: every repo is full of..."""
     out = live.redact_params(
         {"command": "pytest --key=none && TOKEN=your-token-here ./run.sh"})
 
@@ -558,8 +491,7 @@ def test_a_placeholder_value_is_not_redacted_however_secret_its_name():
 
 
 def test_a_private_key_block_does_not_survive_under_its_marker():
-    """DOTALL or the base64 body sits in the payload underneath the marker
-    (kn-097c40ef's first trap)."""
+    """DOTALL or the base64 body sits in the payload underneath the marker (kn-097c40ef's first trap)"""
     body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQ"
     out = live.redact_params({"content": "-----BEGIN RSA PRIVATE KEY-----\n"
                                          + body + "\n-----END RSA PRIVATE KEY-----\n"})
@@ -569,21 +501,19 @@ def test_a_private_key_block_does_not_survive_under_its_marker():
 
 
 def test_a_nested_structure_is_bounded_like_everything_else():
-    """A dict of a thousand keys is as expensive to paint as a string of a million
-    characters, and a tool input can be either."""
+    """A dict of a thousand keys is as expensive to paint as a string of a million characters"""
     out = live.redact_params({"edits": [{"old": "y" * 900, "new": "z" * 900}] * 20})
 
     assert len(out["edits"]) <= live.PARAMS_CAP
     assert out["edits"].endswith(live.TRUNCATED)
 
 
-# -- the shipped entry point, and the one thing the CLI is allowed to do ----------------
+# -- the shipped entry point, and the one thing the CLI is allowed to do
 
 
 @pytest.fixture()
 def registered(jarvis_home, project, tmp_path):
-    """One registered project plus a registered catalog — `ops.live_report` resolves the
-    work order through the central store and reads the project's `inspect` block."""
+    """One registered project plus a registered catalog"""
     from jarvis.central_store import CentralStore
 
     catalog = tmp_path / "catalog.json"
@@ -608,9 +538,7 @@ PAYLOAD_KEYS = {"wo_id", "project", "session_id", "found", "state", "turn", "now
 
 def test_live_report_publishes_exactly_the_documented_keys(registered,
                                                           write_transcript):
-    """The key set is the contract §3 wrote down and both renderers consume unreshaped.
-    A key added here is a key the dashboard template may read; one removed is a
-    KeyError on a web request."""
+    """The key set is the contract §3 wrote down and both renderers consume unreshaped"""
     store = ProjectStore(registered)
     try:
         wo = store.create_work_order("watch me", "")
@@ -635,9 +563,7 @@ def test_live_report_publishes_exactly_the_documented_keys(registered,
 
 def test_jarvis_watch_once_json_prints_the_payload_unchanged(registered,
                                                              write_transcript, capsys):
-    """The renderer derives NOTHING — PR 65's rule. `--json` is the proof available to a
-    test: the bytes on stdout are `ops.live_report`'s dict, so a number on the human
-    frame can only come from the same place."""
+    """The renderer derives NOTHING — PR 65's rule"""
     store = ProjectStore(registered)
     try:
         wo = store.create_work_order("watch me", "")
@@ -660,9 +586,7 @@ def test_jarvis_watch_once_json_prints_the_payload_unchanged(registered,
 
 def test_the_human_frame_shows_the_payload_s_own_values(registered, write_transcript,
                                                         capsys):
-    """The non-json frame, which had no test at all. Every assertion is FORMATTED FROM
-    THE PAYLOAD rather than written out: the point is that the renderer derives nothing,
-    so a literal here would pass against a renderer that computed its own number."""
+    """The non-json frame, which had no test at all"""
     store = ProjectStore(registered)
     try:
         wo = store.create_work_order("watch me", "")

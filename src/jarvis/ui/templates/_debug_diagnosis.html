@@ -18,6 +18,16 @@
     <span class="kv" style="width: 120px;">waiting on</span>
     <span class="grow">{{ d.blocker.what }} — {{ d.blocker.detail }}</span>
   </div>
+  {# §8 of docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md. #}
+  <div class="row">
+    <span class="kv" style="width: 120px;">who will act</span>
+    {% if d.actor %}
+    <span class="grow">{{ d.actor.why }}</span>
+    <span class="kv mono">{{ d.actor.pass_name }} · {{ d.actor.predicate }}</span>
+    {% else %}
+    <span class="grow">no daemon pass will act on this order</span>
+    {% endif %}
+  </div>
   {% for blocker in d.needs_you %}
   <div class="row"><span class="kv" style="width: 120px;">needs you</span>
     <span class="grow st tone-warn wrap">{{ blocker }}</span></div>

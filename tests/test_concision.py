@@ -1,9 +1,4 @@
-"""The three things the OS ships so its sessions stop being verbose.
-
-Design: docs/superpowers/specs/2026-08-22-agent-concision.md. One test per surface —
-the output style (SS3), the worker skill (SS4), the brief (SS6) — because they reach
-sessions by three different transports and any one of them can break alone.
-"""
+"""The three things the OS ships so its sessions stop being verbose (docs/superpowers/specs/2026-08-22-agent-concision.md)"""
 
 import json
 
@@ -18,17 +13,10 @@ def _spec(project, **kw) -> ProjectSpec:
     return ProjectSpec(name="proj_a", path=project, description="", **kw)
 
 
-# -- the output style (SS3) -------------------------------------------------------------
+# -- the output style (SS3)
 
 def test_both_audiences_get_the_concise_output_style(project, jarvis_home):
-    """The point of putting it in `settings.base.json` rather than in either writer:
-    ONE line has to cover the sessions the user opens by hand AND the ones Jarvis
-    spawns, and those are two different files written by two different modules.
-
-    Asserting the literal string, not a constant. `Concise` is one of the four names
-    the CLI recognises (`Proactive`, `Explanatory`, `Learning` are the others); a typo
-    is silently ignored by Claude Code, so nothing else would catch it.
-    """
+    """The point of putting it in `settings.base.json` rather than in either writer: ONE line has to cover..."""
     bootstrap_project(_spec(project))
     user_session = json.loads((project / ".claude" / "settings.json").read_text())
     assert user_session["outputStyle"] == "Concise"
@@ -39,63 +27,45 @@ def test_both_audiences_get_the_concise_output_style(project, jarvis_home):
 
 
 def test_a_project_can_override_the_style():
-    """The escape hatch is the catalog, not an edit to the project — same rule as every
-    other baseline setting."""
+    """The escape hatch is the catalog, not an edit to the project"""
     assert build_settings({"outputStyle": "Explanatory"})["outputStyle"] == "Explanatory"
 
 
-# -- the worker skill (SS4) -------------------------------------------------------------
+# -- the worker skill (SS4)
 
 def test_the_skill_reaches_every_worker_and_can_be_model_invoked(project):
-    """Upstream ships this as an output style with `disable-model-invocation: true`,
-    reachable only by typing `/i-have-adhd`. A headless `-p` worker cannot type a slash
-    command, so a copy carrying that flag would be inert — the adaptation IS the flag's
-    absence, and that is what this pins.
-    """
+    """Upstream ships this as an output style with `disable-model-invocation: true`"""
     from jarvis import bootstrap
 
     roots = bootstrap.install_agent_assets(project, kind="worker")
-    delivered = [r / ".claude" / "skills" / "i-have-adhd" / "SKILL.md" for r in roots]
+    delivered = [r / ".claude" / "skills" / "ponytail" / "SKILL.md" for r in roots]
     hit = [p for p in delivered if p.is_file()]
     assert hit, f"skill not delivered to any --add-dir root: {roots}"
     text = hit[0].read_text()
     assert "disable-model-invocation" not in text
-    # The description is what decides whether the model ever loads it, so it has to
-    # name the surfaces this work order was filed about.
-    front = text.split("---")[1]
-    for surface in ("work-order message", "PR body", "code comment"):
-        assert surface in front, f"description does not mention {surface!r}"
+    assert "full (default)" in text
+    # Disabled by the user: neither delivered nor shipped
+    assert not any((r / ".claude" / "skills" / "i-have-adhd").exists() for r in roots)
 
 
 def test_caveman_is_adapted_and_says_so(project):
-    """It shipped verbatim until 2026-09-19 and no longer does.
-
-    The verbatim copy was invoked 0 times in 142 worker sessions and would have
-    compressed nothing if it had loaded, because its upstream `## Boundaries` section
-    excluded every surface a Jarvis worker writes (spec 2026-09-19 SS2). What this pins
-    is the two properties that made the old copy inert, so neither can come back: the
-    trigger must name Jarvis surfaces, and the self-exclusion must be gone.
-    """
+    """It shipped verbatim until 2026-09-19 and no longer does"""
     from jarvis import bootstrap
 
     vendored = (ASSETS / "skills" / "caveman" / "SKILL.md").read_text()
-    # Whitespace-collapsed: the description is a folded YAML scalar, so a phrase the
-    # reader sees as one line may be split across two in the file.
+    # Whitespace-collapsed: the description is a folded YAML scalar
     front = " ".join(vendored.split("---")[1].split())
     assert "disable-model-invocation" not in vendored
-    # The upstream trigger — "user says caveman mode" — describes a conversation a
-    # headless worker cannot have. The description has to name what it actually governs.
+    # The upstream trigger — "user says caveman mode"
     for surface in ("finish summary", "PR bodies", "code comments"):
         assert surface in front, f"description does not name {surface!r}"
 
-    # The self-exclusion. Upstream sends "code, comments, commits, docs, issue/PR/MR
-    # text" back to normal prose; under that rule the skill has no job here at all.
+    # The self-exclusion
     body = vendored[vendored.index("## Boundaries"):]
     assert "no persisted-outside-chat exemption" in body
     assert "commit messages and PR bodies" in body
 
-    # ...but the correctness rails are NOT collateral. SS4.2: these guard accuracy, not
-    # length, and a future trim for brevity must fail here rather than in production.
+    # ...but the correctness rails are NOT collateral
     for rail in ("exact error strings", "not / never / no / only / except",
                  "security warnings", "failing test output"):
         assert rail in body, f"correctness rail dropped from caveman: {rail!r}"
@@ -108,33 +78,28 @@ def test_caveman_is_adapted_and_says_so(project):
 
 
 def test_the_readme_does_not_still_promise_a_verbatim_copy(project):
-    """The README's whole value is that a reader can diff against upstream. It said
-    "verbatim" and "do not edit it in place"; once the file is adapted, leaving that
-    claim there is worse than having no README."""
+    """The README's whole value is that a reader can diff against upstream"""
     readme = (ASSETS / "skills" / "caveman" / "README.md").read_text()
     assert "no longer a verbatim copy" in readme
     assert "The diff against upstream" in readme
 
 
 def test_both_skills_ship_their_licences(project):
-    """Both copies are third-party MIT inside a GPL-3.0 repo; attribution travels with
-    them to every worker, not just to this checkout."""
+    """Both copies are third-party MIT inside a GPL-3.0 repo"""
     from jarvis import bootstrap
 
-    for name in ("i-have-adhd", "caveman"):
+    for name in ("ponytail", "caveman"):
         assert "MIT License" in (ASSETS / "skills" / name / "LICENSE").read_text()
     roots = bootstrap.install_agent_assets(project, kind="worker")
-    for name in ("i-have-adhd", "caveman"):
+    for name in ("ponytail", "caveman"):
         assert any((r / ".claude" / "skills" / name / "LICENSE").is_file()
                    for r in roots), f"{name} licence did not reach the worker tree"
 
 
-# -- the brief (SS6) --------------------------------------------------------------------
+# -- the brief (SS6)
 
 def test_the_core_carries_the_three_rules_without_a_fetch(project):
-    """A worker that never runs `jarvis brief concision` still has to obey them, so the
-    actionable form is in the opening prompt and only the reasoning is behind the fetch.
-    """
+    """A worker that never runs `jarvis brief concision` still has to obey them"""
     from jarvis.dispatch import build_worker_prompt
 
     p = build_worker_prompt({"id": "wo-conc01", "title": "t", "description": "d"},
@@ -147,26 +112,21 @@ def test_the_core_carries_the_three_rules_without_a_fetch(project):
 
 
 def test_the_section_names_the_knowledge_it_argues_from():
-    """kn-f861a2f6 is the review this rule came out of. Citing the id lets a worker
-    fetch the full story instead of the section restating it — which would be the
-    section breaking its own rule."""
+    """kn-f861a2f6 is the review this rule came out of"""
     from jarvis import worker_brief
 
     text = worker_brief.render_section("concision")
     assert "kn-f861a2f6" in text
     for heading in ("Code comments", "PR body", "once"):
         assert heading in text
-    # Concision is never an excuse to drop evidence.
+    # Concision is never an excuse to drop evidence
     assert "correctness" in text
 
 
-# -- the message cap's transport (§5 of the bounded-model-inputs spec) -------------------
+# -- the message cap's transport (§5 of the bounded-model-inputs spec)
 
 def test_the_message_cap_travels_to_the_worker_by_env(project, jarvis_home):
-    """Same transport as the summary cap and for the same reason: the hook runs on every
-    Bash call and must not parse a catalog to decide it has nothing to do. Asserted
-    against the file `_write_worker_settings` actually wrote, so a project's setting and
-    what the hook reads cannot drift."""
+    """Same transport as the summary cap and for the same reason: the hook runs on every Bash call and..."""
     from jarvis import concision
     from jarvis.catalog import ConcisionConfig
 
@@ -183,9 +143,7 @@ def test_the_message_cap_travels_to_the_worker_by_env(project, jarvis_home):
 
 
 def test_a_project_can_switch_the_message_cap_off_but_not_set_a_nonsense_one():
-    """`0` is off, which a project is entitled to. A positive value under 1000 leaves no
-    message that can pass, which is a typo rather than a policy — the same shape
-    `summary_max_words` refuses 1-19 in."""
+    """`0` is off, which a project is entitled to"""
     from jarvis.catalog import CatalogError, _parse_concision
 
     assert _parse_concision({"message_max_chars": 0}).message_max_chars == 0
@@ -195,18 +153,62 @@ def test_a_project_can_switch_the_message_cap_off_but_not_set_a_nonsense_one():
             _parse_concision({"message_max_chars": bad})
 
 
-# -- the subagent transport (SS5.1) -----------------------------------------------------
+# -- the assumption and question caps (docs/superpowers/specs/2026-10-21-questions-to-neo-are-atomic.md §1)
+
+def test_the_two_new_caps_default_to_one_thousand_and_two_thousand():
+    from jarvis import concision, sections
+    from jarvis.catalog import _parse_concision
+
+    assert concision.DEFAULT_ASSUME_MAX_CHARS == 1000
+    assert concision.DEFAULT_QUESTION_MAX_CHARS == 2000
+    # `concision` owns the number; `sections` re-exports it
+    assert sections.QUESTION_MAX_CHARS == concision.DEFAULT_QUESTION_MAX_CHARS
+    assert _parse_concision({}).assume_max_chars == 1000
+    assert _parse_concision({}).question_max_chars == 2000
+
+
+@pytest.mark.parametrize("key", ["assume_max_chars", "question_max_chars"])
+def test_a_project_can_tune_or_switch_each_new_cap_off_but_not_go_negative(key):
+    from jarvis.catalog import CatalogError, _parse_concision
+
+    assert getattr(_parse_concision({key: 0}), key) == 0
+    assert getattr(_parse_concision({key: 400}), key) == 400
+    with pytest.raises(CatalogError, match=f"{key} must be 0"):
+        _parse_concision({key: -1})
+
+
+def test_both_new_caps_travel_to_the_worker_by_env(project, jarvis_home):
+    """The hook refuses before the shell expands anything, so it carries them as env"""
+    from jarvis import concision
+    from jarvis.catalog import ConcisionConfig
+
+    written = json.loads(
+        _write_worker_settings(_spec(project), {"id": "wo-conc06"}).read_text())
+    assert written["env"][concision.ASSUME_CAP_ENV] == "1000"
+    assert written["env"][concision.QUESTION_CAP_ENV] == "2000"
+
+    tighter = json.loads(_write_worker_settings(
+        _spec(project, concision=ConcisionConfig(assume_max_chars=300,
+                                                 question_max_chars=700)),
+        {"id": "wo-conc07"}).read_text())
+    assert concision.assume_cap(tighter["env"]) == 300
+    assert concision.question_cap(tighter["env"]) == 700
+
+
+@pytest.mark.parametrize("raw", [None, "", "nonsense", "-5"])
+def test_an_unusable_env_value_falls_back_to_the_default(raw):
+    from jarvis import concision
+
+    env = {} if raw is None else {concision.ASSUME_CAP_ENV: raw,
+                                  concision.QUESTION_CAP_ENV: raw}
+    assert concision.assume_cap(env) == concision.DEFAULT_ASSUME_MAX_CHARS
+    assert concision.question_cap(env) == concision.DEFAULT_QUESTION_MAX_CHARS
+
+
+# -- the subagent transport (SS5.1)
 
 def test_the_standing_prompt_travels_to_the_worker_by_env(project, jarvis_home):
-    """The subagent injection's only moving part. A subagent inherits none of the
-    parent's `--append-system-prompt`, so the `SubagentStart` hook re-injects it — and
-    it has to read it from the environment, because `concision` may not import
-    `catalog`. The hook is asserted against the file `_write_worker_settings` actually
-    wrote, not against a hand-built env, so the two cannot drift.
-
-    The work order's own override wins over the catalog default, matching the
-    resolution `worker_session.briefing` uses for the flag itself.
-    """
+    """The subagent injection's only moving part"""
     from jarvis import concision, hooks
     from jarvis.catalog import WorkerDefaults
 
@@ -225,9 +227,7 @@ def test_the_standing_prompt_travels_to_the_worker_by_env(project, jarvis_home):
 
 
 def test_the_subagent_hook_is_wired_in_the_baseline_settings():
-    """It reaches a worker through the same file as every other hook, so a subagent in
-    ANY managed project gets it — including one the user opened themselves, where the
-    handler no-ops on the missing `JARVIS_WO_ID`."""
+    """It reaches a worker through the same file as every other hook"""
     entries = build_settings({})["hooks"]["SubagentStart"]
 
     assert len(entries) == 1

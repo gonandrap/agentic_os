@@ -13,6 +13,7 @@
 <div class="attention {{ 'hot' if st.attention else '' }}">
   {% if st.attention %}
     <div class="strip-head">NEEDS YOU — {{ st.attention | length }} item{{ 's' if st.attention | length != 1 }}</div>
+    <div class="sub">{{ attention_list_note }}</div>
     <ul>
       {% for a in st.attention %}
       <li>
@@ -53,6 +54,7 @@
     <span class="grow"></span>
     <a href="/inbox">open inbox →</a>
   </div>
+  <div class="sub">{{ inbox_list_note }}</div>
 </div>
 {% endif %}
 

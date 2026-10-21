@@ -1,17 +1,4 @@
-"""What the prefix fingerprint costs per session — the evidence behind finding 4's
-second con, which is that the hook runs on every session for a condition that changes
-rarely.
-
-Two halves, because they are paid differently:
-
-  BASELINE   one `jarvis _hook` process. Already spent on every SessionStart before any
-             of this existed (`assets/settings.base.json`), so it is the denominator and
-             not a cost this work added.
-  ADDED      what `hooks.prefix_fingerprint` does inside that process: four small reads
-             and a hash. The numerator.
-
-    uv run python scripts/bench_hook_cost.py [repeats]
-"""
+"""What the prefix fingerprint costs per session"""
 
 from __future__ import annotations
 
@@ -24,7 +11,7 @@ from pathlib import Path
 
 
 def baseline(repeats: int) -> list[float]:
-    """One `jarvis _hook` SessionStart, against a cwd that is not a managed project."""
+    """One `jarvis _hook` SessionStart, against a cwd that is not a managed project"""
     body = json.dumps({"hook_event_name": "SessionStart", "session_id": "bench",
                        "cwd": "/tmp", "source": "resume"})
     out = []

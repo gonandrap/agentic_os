@@ -1,14 +1,4 @@
-"""Screenshot the OS's ruling under each assumption, for a PR's UI evidence (issue 712).
-
-The claim a passing UI test cannot make: a reader can tell an assumption Neo escalated,
-one the keyword net held, one still out with Neo and one nobody has looked at APART —
-all four on one work order, which is the case that made the defect invisible.
-
-`scripts/screenshot_auto_review.py` is the shape this copies, including the temp
-`JARVIS_HOME` that keeps it off the live OS:
-
-    uv run python scripts/screenshot_assumption_rulings.py
-"""
+"""Screenshot the OS's ruling under each assumption, for a PR's UI evidence (issue 712)"""
 
 from __future__ import annotations
 
@@ -26,12 +16,7 @@ PORT = 8796
 
 
 def seed() -> None:
-    """One work order carrying all five outcomes at once.
-
-    Written through the stores rather than driven through a daemon, for
-    `screenshot_auto_review.py`'s reason: the picture is of a RENDERED record, and a
-    Neo drain would make it a picture of the fake model.
-    """
+    """One work order carrying all five outcomes at once"""
     from jarvis.central_store import CentralStore
     from jarvis.neo_store import NeoStore
     from jarvis.project_store import (
@@ -99,9 +84,7 @@ def seed() -> None:
     store.add_event(wo["id"], "autoreview_asked",
                     {"assumption_id": out, "n": 4, "neo_question_id": asked["id"]})
 
-    # The fifth says NOTHING, and that is the discriminating row: silence and a hold are
-    # different facts, and a renderer that labelled every pending assumption would pass
-    # every other assertion here.
+    # The fifth says NOTHING, and that is the discriminating row: silence and a hold are different facts
     store.add_assumption(wo["id"], "put the new test beside the module's other tests")
     store.flag_attention(wo["id"], "4 assumptions pending your review")
     store.close()

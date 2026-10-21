@@ -1,10 +1,4 @@
-"""Measure `ProjectStore._backfill_wo_spans` on a SYNTHETIC project. Never a live one.
-
-Builds a project of N work orders, each walked through a few statuses, then times the
-gap-fill alone — the thing every CLI invocation and every reconcile tick pays for.
-
-    uv run python scripts/bench_backfill_spans.py [orders] [repeats]
-"""
+"""Measure `ProjectStore._backfill_wo_spans` on a SYNTHETIC project"""
 
 from __future__ import annotations
 
@@ -43,8 +37,7 @@ def main() -> None:
         spans = store.conn.execute(
             "SELECT COUNT(*) c FROM wo_state_spans").fetchone()["c"]
         if "--gapped" in sys.argv:
-            # Push every span behind its own status event, which is the state the guard
-            # must NOT skip: the gap-fill runs in full.
+            # Push every span behind its own status event
             store.conn.execute("UPDATE wo_state_spans SET ts = ts - 1")
             store.conn.commit()
         samples = []

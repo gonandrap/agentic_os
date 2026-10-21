@@ -1,27 +1,4 @@
-"""An issue knows every work order that pointed at it, and the order knows its issues.
-
-The relation `tests/test_validation_follow_ups.py` left in prose. That file proved a
-follow-up gets FILED with a footer naming its origin; the origin lived only in that
-footer, so "which issues did this order raise" could be answered only by scraping GitHub
-and "how many orders have run into this issue" could not be answered at all. The second
-is the one the user asked for: the count is a priority signal.
-
-WHAT THIS FILE HOLDS, and each is a different failure:
-
-* THE COUNT IS OF DISTINCT WORK ORDERS. An order that both raised an issue and cites it
-  counts once, and the strongest link wins. A count that double-counts is not a weaker
-  signal, it is a misleading one.
-* THE ADMITTING SET IS NARROW (Neo, question 409). A bare `#N` for something the project
-  does not track is not a reference — `#N` is also how a pull request is written.
-* NOTHING IS WRITTEN TO AN ISSUE WHOSE STATE THE OS HAS NOT READ, and nothing at all to a
-  closed one. The OS does not argue with a person who closed something.
-* THE LIST IS PER ORDER, NOT PER ROUND. That is the whole of the UI change, and a test
-  that only asserts "the issue is on the page" is satisfied by the per-round fragment it
-  replaced — so the assertions count.
-
-The fleet fixture and the injected validator are `test_validation_follow_ups`'s, for its
-reasons: a test that reached this code through a real panel would be grading a model.
-"""
+"""An issue knows every work order that pointed at it, and the order knows its issues"""
 
 from __future__ import annotations
 
@@ -52,13 +29,11 @@ def board(fleet) -> list[dict]:  # noqa: F811
         store.close()
 
 
-# -- 1. the relation, recorded where the prose used to be -----------------------------
+# -- 1. the relation, recorded where the prose used to be
 
 
 def test_filing_a_follow_up_records_the_relation_as_well_as_the_footer(fleet, tracker):  # noqa: F811
-    """BOTH, and the pairing is the point. The footer is what a person with only GitHub
-    reads; the row is what makes the same fact answerable locally. A change that replaced
-    one with the other would pass half of this."""
+    """BOTH, and the pairing is the point"""
     wo = judged(fleet, "passed", "Fold the two parsers into one")
     url = filed(tracker)[0]["url"]
 
@@ -73,14 +48,13 @@ def test_filing_a_follow_up_records_the_relation_as_well_as_the_footer(fleet, tr
 
 
 def test_the_order_lists_every_follow_up_across_every_round(fleet, tracker):  # noqa: F811
-    """THE CONSOLIDATION. Two settles, two issues, ONE list with both — which is the thing
-    a per-round fragment cannot be however many rounds it renders."""
+    """THE CONSOLIDATION"""
     fleet.daemon.validator = Validator(verdict("passed", "Name the retry budget"))
     wo = fleet.dispatch()
     fleet.change(wo["id"], "print('one')\n")
     finish(fleet, wo["id"])
     fleet.drain()
-    # A SECOND SETTLE over the same order — what `jarvis validation force` produces.
+    # A SECOND SETTLE over the same order — what `jarvis validation force` produces
     settle_again(fleet, wo["id"], [follow_up("Fold the two parsers")])
 
     store = store_of(fleet)
@@ -94,13 +68,7 @@ def test_the_order_lists_every_follow_up_across_every_round(fleet, tracker):  # 
 
 
 def test_the_list_reads_the_finding_even_when_the_tracker_may_not(fleet, tracker):  # noqa: F811
-    """A PUBLIC TRACKER IS TOLD NOTHING, AND THE USER'S OWN LIST STILL READS.
-
-    wo-069d758e's rule was that the seat's words stay off a tracker the OS cannot
-    establish is private; wo-3619e6e4 took the issue with them, because `Validation
-    follow-up vf-…` over boilerplate is a row a reader can neither tell apart nor act on.
-    The finding is whole on the internal record and the order's own list still reads.
-    """
+    """A PUBLIC TRACKER IS TOLD NOTHING, AND THE USER'S OWN LIST STILL READS"""
     tracker.set_private(False)
     fleet.daemon.validator = Validator(verdict("passed", "Name the retry budget"))
     wo = fleet.dispatch()
@@ -117,16 +85,13 @@ def test_the_list_reads_the_finding_even_when_the_tracker_may_not(fleet, tracker
 
     assert index["raised"] == [], "an issue was opened on a tracker that may be public"
     assert [i["title"] for i in index["withheld"]] == ["Name the retry budget"]
-    # ...and nothing was written into the tracker cache, which is a cache of what is
-    # really on GitHub: the sweep re-reads it and would disagree with anything else.
+    # ...and nothing was written into the tracker cache
     assert rows == []
 
 
 def test_wo_show_lists_the_follow_ups_and_still_withholds_the_seat(fleet, tracker,  # noqa: F811
                                                                    capsys):
-    """The definition of done for the terminal half — and the rule it must not break on
-    the way. `jarvis validation show` is the deliberation surface; this is a default
-    document and the seat that raised a finding does not belong on it."""
+    """The definition of done for the terminal half — and the rule it must not break on the way"""
     wo = judged(fleet, "passed", "Fold the two parsers into one", seat="architect")
     capsys.readouterr()
 
@@ -139,12 +104,11 @@ def test_wo_show_lists_the_follow_ups_and_still_withholds_the_seat(fleet, tracke
     assert "architect" not in out, "a seat name reached a default surface"
 
 
-# -- 2. what counts as a reference ----------------------------------------------------
+# -- 2. what counts as a reference
 
 
 def test_a_brief_that_cites_an_issue_by_url_is_a_reference(fleet, tracker):  # noqa: F811
-    """The second admitting kind. A URL on the project's OWN repository is unambiguous —
-    `/issues/N` cannot be anything else — so it counts without the issue being known."""
+    """The second admitting kind"""
     url = f"{SERIES}/41"
     wo = ops.create_work_order("proj_a", "Do the thing",
                                description=f"Background: {url}")
@@ -154,10 +118,7 @@ def test_a_brief_that_cites_an_issue_by_url_is_a_reference(fleet, tracker):  # n
 
 
 def test_a_bare_hash_number_counts_only_for_an_issue_already_tracked(fleet, tracker):  # noqa: F811
-    """THE NARROWING THAT KEEPS THE SIGNAL HONEST. `#N` is how a pull request is written
-    too, and the OS cannot tell them apart without a network call it must not make at
-    creation — so an unknown number is left alone rather than becoming a link to an issue
-    that may not exist."""
+    """THE NARROWING THAT KEEPS THE SIGNAL HONEST"""
     unknown = ops.create_work_order("proj_a", "One", description="see #1234")
     assert links(fleet, unknown["id"]) == [], "a bare number became a phantom issue"
 
@@ -172,9 +133,7 @@ def test_a_bare_hash_number_counts_only_for_an_issue_already_tracked(fleet, trac
 
 
 def test_an_issue_on_another_repository_is_not_linked(fleet, tracker):  # noqa: F811
-    """One rule doing two jobs. The repository comes from the checkout's own `origin`,
-    which is what every write is later held to (`kn-2531869c`) — and it is also what keeps
-    the count a fact about this project's tracker."""
+    """One rule doing two jobs"""
     wo = ops.create_work_order(
         "proj_a", "Do the thing",
         description="see https://github.com/someone/else/issues/7")
@@ -183,18 +142,7 @@ def test_an_issue_on_another_repository_is_not_linked(fleet, tracker):  # noqa: 
 
 
 def test_the_same_owner_and_repository_on_another_host_is_not_linked(fleet, tracker):  # noqa: F811
-    """THE HOST IS PART OF THE IDENTITY, and this is the case that makes it a write path.
-
-    A brief is not always written by the user — the tracker is public and its text reaches
-    a work order. A URL carrying the project's REAL owner and repository under a host
-    nobody chose used to be admitted as the project's own, land in `tracked_issues` under
-    the real repository name, and be handed to the daemon's sweep, which points `gh` at
-    whatever it was given. Reading a URL field by field is what allows that; the whole
-    string is compared against `ops.issue_url_for`, which hardcodes github.com.
-
-    Both shapes that reach a tracker, because they were two separate holes: a citation
-    scanned out of PROSE, and the `issue_url` an order is ASSIGNED.
-    """
+    """THE HOST IS PART OF THE IDENTITY, and this is the case that makes it a write path"""
     evil = f"https://evil.example/{REPO}/issues/7"
 
     cited = ops.create_work_order("proj_a", "Do the thing", description=f"see {evil}")
@@ -207,9 +155,7 @@ def test_the_same_owner_and_repository_on_another_host_is_not_linked(fleet, trac
 
 
 def test_one_order_counts_once_and_the_strongest_link_wins(fleet, tracker):  # noqa: F811
-    """THE COUNT IS OF DISTINCT WORK ORDERS. An order that raised an issue and then cites
-    it — a later brief quoting its own finding — must not count twice, and re-recording
-    the weaker kind must not overwrite the stronger."""
+    """THE COUNT IS OF DISTINCT WORK ORDERS"""
     wo = judged(fleet, "passed", "Fold the two parsers into one")
     url = filed(tracker)[0]["url"]
 
@@ -223,15 +169,11 @@ def test_one_order_counts_once_and_the_strongest_link_wins(fleet, tracker):  # n
         store.close()
 
 
-# -- 3. what reaches the tracker ------------------------------------------------------
+# -- 3. what reaches the tracker
 
 
 def test_the_sweep_comments_the_reference_and_labels_the_count(fleet, tracker):  # noqa: F811
-    """The user's half: the count is on the issue, where they scan.
-
-    A COMMENT PER NEW REFERENCE and a label carrying the total. The issue body is never
-    edited — it may carry text a person wrote, and clobbering it is not the OS's to do.
-    """
+    """The user's half: the count is on the issue, where they scan"""
     raiser = judged(fleet, "passed", "Fold the two parsers into one")
     url = filed(tracker)[0]["url"]
     number = issues.issue_number(url)
@@ -250,9 +192,7 @@ def test_the_sweep_comments_the_reference_and_labels_the_count(fleet, tracker): 
 
 
 def test_the_label_replaces_the_stale_count_rather_than_accumulating(fleet, tracker):  # noqa: F811
-    """`set_priority_label`'s rule. GitHub keeps every label you add, so an issue that
-    went from one reference to two would carry both numbers and the scan the label exists
-    for would read the wrong one."""
+    """`set_priority_label`'s rule"""
     judged(fleet, "passed", "Fold the two parsers into one")
     url = filed(tracker)[0]["url"]
     fleet.tick()
@@ -266,16 +206,13 @@ def test_the_label_replaces_the_stale_count_rather_than_accumulating(fleet, trac
 
 
 def test_nothing_is_written_to_an_issue_a_person_closed(fleet, tracker):  # noqa: F811
-    """DO NOT RACE THE LIFECYCLE, and do not argue with a human. A closed issue is a
-    decision somebody made; a reference recorded afterwards stays in Jarvis and never
-    reaches the tracker."""
+    """DO NOT RACE THE LIFECYCLE, and do not argue with a human"""
     judged(fleet, "passed", "Fold the two parsers into one")
     url = filed(tracker)[0]["url"]
     fleet.tick()
     tracker.set_issue(url, state="CLOSED", labels=tracker.issue(url)["labels"])
     before = len(tracker.issue(url).get("comments") or [])
-    # The cached state is minutes old and good for an hour; a person closing an issue
-    # out from under the OS is exactly the case the TTL delays, so the test expires it.
+    # The cached state is minutes old and good for an hour
     fleet.daemon.ISSUE_STATE_TTL = 0
 
     ops.create_work_order("proj_a", "Two", description=f"same as {url}")
@@ -288,8 +225,7 @@ def test_nothing_is_written_to_an_issue_a_person_closed(fleet, tracker):  # noqa
 
 
 def test_a_closed_issue_leaves_the_ranking(fleet, tracker):  # noqa: F811
-    """The ranking is for choosing what to do next. A closed issue's count is history and
-    a list with one at the top is a list with nothing to act on."""
+    """The ranking is for choosing what to do next"""
     judged(fleet, "passed", "Fold the two parsers into one")
     url = filed(tracker)[0]["url"]
     fleet.tick()
@@ -303,10 +239,7 @@ def test_a_closed_issue_leaves_the_ranking(fleet, tracker):  # noqa: F811
 
 
 def test_the_state_ttl_is_what_keeps_the_sweep_cheap(fleet, tracker):  # noqa: F811
-    """THE CEILING ON WHAT THIS COSTS, and the reason the two tests above have to expire
-    it by hand. A tick every thirty seconds must not re-read every linked issue: nothing
-    the OS does with the state needs it fresher than an hour, and without the TTL this
-    sweep would be one subprocess per issue per tick for ever."""
+    """THE CEILING ON WHAT THIS COSTS, and the reason the two tests above have to expire it by hand"""
     judged(fleet, "passed", "Fold the two parsers into one")
     fleet.tick()
     before = len([c for c in tracker.calls if c["argv"][:2] == ["issue", "view"]])
@@ -319,9 +252,7 @@ def test_the_state_ttl_is_what_keeps_the_sweep_cheap(fleet, tracker):  # noqa: F
 
 
 def test_an_unreachable_tracker_costs_nothing_locally(fleet, tracker):  # noqa: F811
-    """Every Jarvis surface reads the RECORD. A sweep that cannot reach `gh` leaves the
-    relation intact and the listing working — the rule `filed_follow_ups` already holds,
-    one relation out."""
+    """Every Jarvis surface reads the RECORD"""
     wo = judged(fleet, "passed", "Fold the two parsers into one")
     tracker.fail("could not resolve host")
 
@@ -331,16 +262,11 @@ def test_an_unreachable_tracker_costs_nothing_locally(fleet, tracker):  # noqa: 
     assert len(board(fleet)) == 1
 
 
-# -- 4. the surfaces ------------------------------------------------------------------
+# -- 4. the surfaces
 
 
 def test_the_project_page_ranks_the_issues_by_how_many_orders_hit_them(fleet, tracker):  # noqa: F811
-    """WHERE THE USER PICKS THE NEXT THING TO WORK ON (Neo, question 410). A section on
-    the page they already read, not a page of its own.
-
-    TWO ISSUES, because "the most-referenced is first" is the claim and a page that
-    printed them in any order satisfies "both are present".
-    """
+    """WHERE THE USER PICKS THE NEXT THING TO WORK ON (Neo, question 410)"""
     from fastapi.testclient import TestClient
 
     from jarvis.ui.app import create_app
@@ -360,7 +286,7 @@ def test_the_project_page_ranks_the_issues_by_how_many_orders_hit_them(fleet, tr
 
 
 def test_jarvis_issues_prints_the_count_and_who_pointed_at_it(fleet, tracker, capsys):  # noqa: F811
-    """The terminal half of the same ranking — the CLI is the OS."""
+    """The terminal half of the same ranking — the CLI is the OS"""
     wo = judged(fleet, "passed", "Fold the two parsers into one")
     fleet.tick()
     capsys.readouterr()
@@ -374,7 +300,7 @@ def test_jarvis_issues_prints_the_count_and_who_pointed_at_it(fleet, tracker, ca
 
 
 def test_jarvis_issues_says_so_when_nothing_is_linked(fleet, capsys):  # noqa: F811
-    """The empty case is a sentence, not a blank screen — every other listing's rule."""
+    """The empty case is a sentence, not a blank screen — every other listing's rule"""
     capsys.readouterr()
 
     cli.main(["issues"])
@@ -382,13 +308,11 @@ def test_jarvis_issues_says_so_when_nothing_is_linked(fleet, capsys):  # noqa: F
     assert "no tracker issue is linked" in capsys.readouterr().out
 
 
-# -- 5. the per-round fragment kept what is genuinely per-round -----------------------
+# -- 5. the per-round fragment kept what is genuinely per-round
 
 
 def test_the_round_still_reports_what_never_became_an_issue(fleet, fake_gh):  # noqa: F811
-    """WHAT MOVED AND WHAT DID NOT. The issues moved to the consolidated list; a finding
-    that never BECAME an issue cannot appear there, so what the round did with it stays
-    on the round that tried. Deleting it along with the links would lose the fact."""
+    """WHAT MOVED AND WHAT DID NOT"""
     from fastapi.testclient import TestClient
 
     from jarvis.ui.app import create_app

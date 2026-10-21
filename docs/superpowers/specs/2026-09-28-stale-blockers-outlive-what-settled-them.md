@@ -341,6 +341,36 @@ it. A reader that silently believes a gap is why nobody noticed for 20.7h.
 Fix at the writer, belt at the reader: the writer is the one that makes the data right;
 the belt is what stops the next missed write becoming a false present-tense claim.
 
+### 2d3. The other direction: every span, and every settled round, is on the timeline
+
+Added by io-df4fa1e3 (`record-omits-the-transitions`). §2d2 pairs the status column with
+the spans; it says nothing about `wo_events`, which is what `jarvis wo show`, the
+dashboard and the alarm evidence packet read. A pairing run read-only over the live
+`jarvis_os` store on 2026-10-21 found:
+
+* **268 claim spans with no event.** `claim_next_pending` wrote its span and no `status`
+  event. It now writes both, stamped with ONE moment, as `set_status` does.
+* **One quiet round-closer in code.** INV-VALIDATION-STRANDED closed a round `failed` with
+  no `validation_failed` event. It now writes one (`cause: "stranded"`, not a holding
+  cause, so nothing waits on it). No live round lacked its event.
+* **The real blindness was the reader.** `ProjectStore.list_events` returned the OLDEST
+  200 events. wo-9f00e3b5 had 401, so every reader stopped at turn 10, and its passed
+  rounds 3 and 4 and its week in `validating` were in the store but never displayed.
+  `list_events` now returns the NEWEST `limit` events, still oldest first.
+
+**INV-RECORD-BEHIND** rides the same pass as INV-SPAN-BEHIND (`check_spans_reach_the_status`)
+and checks two things for each work order: its newest non-approximate span has a `status`
+event within `RECORD_PAIR_SECONDS` (`created` for the creation span), and its newest
+settled validation round has a `validation_<outcome>` event naming that round. It only
+REPORTS. Writing an event after the fact would invent its timestamp. It checks the newest
+span and round only, so the historic claim spans raise nothing. Approximate spans are
+INV-SPAN-BEHIND's own repairs; their events are already on the timeline, so they are skipped.
+
+**The packet reads the spans.** `supervisor.build_evidence` has a `# Where it has been`
+section built from `ops.state_durations`: how long the order has been in its current
+status, its recent spans and, for a work order, the outcome of the latest round. It
+comes before the session read, so a capped packet drops the transcript first.
+
 ## 3. Surfaces that render these blockers
 
 Change each derivation in its one home; these are the readers that must be checked, not

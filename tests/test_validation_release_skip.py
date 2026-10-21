@@ -1,16 +1,4 @@
-"""A release order is exempt from the panel ONLY when it delivered no pull request.
-
-docs/superpowers/specs/2026-10-01-a-release-that-authored-files-is-judged-like-any-other.md
-supersedes
-docs/superpowers/specs/2026-09-29-a-release-blocked-by-a-red-main-retries-itself.md §2.
-
-Defect (b) of the 2026-09-29 case: a blocked release authors no files and stages no tag,
-so `evidence.nothing_to_judge` hit row 2 of its table, the round escalated with "nothing
-to review", and `autoreview.HELD_PANEL_GAVE_UP` went on the assumption — so not even Neo
-could clear it. That exemption stays, and it is now conditional on the thing it claims:
-the ABSENT pull request. A release order that finished with `--pr` authored a diff and
-submits like any code-bearing order, at either submission site.
-"""
+"""A release order is exempt from the panel ONLY when it delivered no pull request (docs/superpowers/specs/2026-09-29-a-release-blocked-by-a-red-main-retries-itself.md §2.)"""
 
 from __future__ import annotations
 
@@ -29,8 +17,7 @@ ISSUE = "https://github.com/acme/proj/issues/826"
 
 @pytest.fixture(autouse=True)
 def no_real_systemd(monkeypatch):
-    """These stage a release, so a tick would reach `release.maybe_restart` and ask the
-    DEVELOPER's systemd to restart the fleet."""
+    """These stage a release, so a tick would reach `release.maybe_restart` and ask the DEVELOPER's..."""
     monkeypatch.setattr(release, "SystemdRunner", FakeRunner)
 
 
@@ -47,7 +34,7 @@ def release_order(fleet, *, status: str = "running", assume: str = "") -> str:
 
 
 def stage_release(wo_id: str, version: str = "0.10.26") -> None:
-    """The marker `scripts/shipit.sh --stage` writes: the release WAS delivered."""
+    """The marker `scripts/shipit.sh --stage` writes: the release WAS delivered"""
     path = release.marker_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({
@@ -81,10 +68,7 @@ def events(fleet, wo_id: str, kind: str) -> list[dict]:
 
 
 def test_release_order_opens_no_round_on_finish(fleet):
-    """§2 at `ops.finish`, and defect (b): validation is enabled and the release still
-    reaches no panel. `land_when_cleared` is TOLD (`panel_cleared`), so it does not
-    re-read a round that was never opened and park the release in `validating` for ever.
-    """
+    """§2 at `ops.finish`, and defect (b): validation is enabled and the release still reaches no panel"""
     rel = release_order(fleet)
     stage_release(rel)
 
@@ -102,9 +86,7 @@ def test_release_order_opens_no_round_on_finish(fleet):
 
 
 def test_release_order_opens_no_round_on_review(fleet):
-    """§2 at `_validates_on_review` — the catch-up path `review_work_order` reaches
-    through `_land_after_acceptance`. A release order parked before two-gates shipped
-    must not be sent to a panel now either."""
+    """§2 at `_validates_on_review` — the catch-up path `review_work_order` reaches through..."""
     rel = release_order(fleet, status="needs_review",
                         assume="shipped without the changelog entry")
     stage_release(rel)
@@ -117,8 +99,7 @@ def test_release_order_opens_no_round_on_review(fleet):
 
 
 def green_base() -> None:
-    """A fresh GREEN stored reading, so `defer_red_release` falls through and the
-    submission reaches the validation block this file is about."""
+    """A fresh GREEN stored reading, so `defer_red_release` falls through and the submission reaches the..."""
     from jarvis.central_store import CentralStore
 
     central = CentralStore()
@@ -130,10 +111,7 @@ def green_base() -> None:
 
 
 def test_a_release_that_delivered_nothing_reaches_no_panel(fleet, monkeypatch):
-    """Defect (b) EXACTLY: the blocked release — no staged tag, no attested effect, so
-    nothing voids the packet — with validation enabled. `evidence.nothing_to_judge` used
-    to escalate it with "nothing to review" and `autoreview.HELD_PANEL_GAVE_UP` put a
-    hold even Neo could not clear. No round opens, so that guard is never reached."""
+    """Defect (b) EXACTLY: the blocked release"""
     from jarvis import evidence as evidence_mod
 
     assert ops.validation_config("proj_a").enabled
@@ -152,13 +130,7 @@ def test_a_release_that_delivered_nothing_reaches_no_panel(fleet, monkeypatch):
 
 
 def test_release_order_with_pr_opens_a_round_at_finish(fleet):
-    """The predicate is now the ARTIFACT, not the order: a release that opened a PR
-    authored a diff, so a seat reads it. Staging a tag does not buy the exemption back —
-    this order staged `jarvis-0.10.26` AND authored a diff, and it still goes to the
-    panel. Fails before the fix: `fresh["pr_url"]` is empty at `ops.finish`'s submission
-    branch, so the predicate needs the overlay (§2 of this change's spec,
-    docs/superpowers/specs/2026-10-01-a-release-that-authored-files-is-judged-like-any-other.md).
-    """
+    """The predicate is now the ARTIFACT (docs/superpowers/specs/2026-10-01-a-release-that-authored-files-is-judged-like-any-other.md)"""
     rel = release_order(fleet)
     stage_release(rel)
     fleet.change(rel, "print('version bump')\n")
@@ -171,8 +143,7 @@ def test_release_order_with_pr_opens_a_round_at_finish(fleet):
 
 
 def test_release_order_with_pr_is_not_told_the_panel_is_cleared(fleet):
-    """§3: both `panel_cleared` sites move with the predicate. If one did not, the join
-    would land this order `completed`/`waiting_pr_merge` with a diff no seat read."""
+    """§3: both `panel_cleared` sites move with the predicate"""
     rel = release_order(fleet)
     stage_release(rel)
     fleet.change(rel, "print('version bump')\n")
@@ -186,9 +157,7 @@ def test_release_order_with_pr_is_not_told_the_panel_is_cleared(fleet):
 
 
 def test_release_order_with_pr_submits_on_review_acceptance(fleet):
-    """§3 at `_land_after_acceptance`: the predicate reads the UNBLANKED row, so a
-    release order parked `needs_review` with a stored pull request submits on acceptance
-    and `cleared` is false."""
+    """§3 at `_land_after_acceptance`: the predicate reads the UNBLANKED row"""
     rel = release_order(fleet, status="needs_review",
                         assume="shipped without the changelog entry")
     stage_release(rel)
@@ -207,9 +176,7 @@ def test_release_order_with_pr_submits_on_review_acceptance(fleet):
 
 
 def test_automerge_decide_unchanged(fleet):
-    """§4: a release order with a pull request and no passed round is still held — the
-    fix belongs where the wrong question is asked, not where the right answer is
-    enforced."""
+    """§4: a release order with a pull request and no passed round is still held"""
     from jarvis import automerge
     from tests.test_automerge import cfg, pr
 
@@ -225,9 +192,7 @@ def test_automerge_decide_unchanged(fleet):
 
 
 def test_the_predicate_is_the_batch_keys_presence(fleet):
-    """An EMPTY batch is still a release order — the key's presence is the whole test,
-    and a release whose fixes were all overtaken must not be sent to a panel. A missing
-    key, or one holding something that is not a list, is not a release order at all."""
+    """An EMPTY batch is still a release order"""
     assert release.is_release_order({"metadata": db.to_json({release.BATCH_KEY: []})})
     assert not release.is_release_order({"metadata": db.to_json({})})
     assert not release.is_release_order({"metadata": db.to_json({"other": [ISSUE]})})
@@ -237,7 +202,7 @@ def test_the_predicate_is_the_batch_keys_presence(fleet):
 
 
 def test_a_non_list_batch_key_still_opens_a_round(fleet):
-    """The other side of it, at the call site: only a real release order is exempt."""
+    """The other side of it, at the call site: only a real release order is exempt"""
     wo = fleet.dispatch()
     store = fleet.store()
     try:
@@ -254,8 +219,7 @@ def test_a_non_list_batch_key_still_opens_a_round(fleet):
 
 
 def test_an_ordinary_work_order_still_opens_one(fleet):
-    """The other side of the predicate: nothing about validation changed for the work
-    orders it was written for."""
+    """The other side of the predicate: nothing about validation changed for the work orders it was..."""
     wo = fleet.dispatch()
     fleet.change(wo["id"], "print('one')\n")
 

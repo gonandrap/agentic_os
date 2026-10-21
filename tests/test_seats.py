@@ -1,17 +1,4 @@
-"""The seat primitive, extracted from Neo's panel so two panels can share it.
-
-THE HIGHEST-VALUE TEST IN THIS FILE IS THE CACHE ONE. `chair.md` ships in
-`assets/neo-seats/` AND in `assets/validator-seats/`, and `definition` is cached. A
-name-only key would hand whichever roster asked second the OTHER panel's mandate —
-silently, with every other test in the suite green. So the test loads the Neo chair, the
-validator chair, and THEN THE NEO CHAIR AGAIN: a name-only key passes the first two
-assertions and fails only the third.
-
-The rest of the file pins the two properties that made the extraction worth doing at all:
-`run_blind` cannot reach a store (it is not in its signature, and it runs happily on a
-thread that has none), and it genuinely fans out — proved with a barrier, because a
-wall-clock comparison passes on a fast machine that ran the seats one after another.
-"""
+"""The seat primitive, extracted from Neo's panel so two panels can share it"""
 
 from __future__ import annotations
 
@@ -38,25 +25,17 @@ def reply(text: str = '{"verdict": "pass"}', usage=None):
 
 
 def as_os(fn, *args, **kwargs):
-    """Call a seats helper from a frame inside `jarvis`, the shape `panel` calls it in.
-
-    `run_blind` and `prime_cache` mint the attribution token on the CALLING thread, and
-    `jarvis.seats` is a forwarder that cannot authorise the `kind` it was handed — so this
-    test module's own frame is refused exactly like an eval's (spec §3 of
-    docs/superpowers/specs/2026-09-25-attribution-is-not-a-callers-choice.md).
-    """
+    """Call a seats helper from a frame inside `jarvis`, the shape `panel` calls it in (docs/superpowers/specs/2026-09-25-attribution-is-not-a-callers-choice.md)"""
     glb: dict = {"__name__": "jarvis.panel"}
     exec("def go(fn, a, kw):\n    return fn(*a, **kw)\n", glb)
     return glb["go"](fn, args, kwargs)
 
 
-# -- the cache trap -------------------------------------------------------------------
+# -- the cache trap
 
 
 def test_two_rosters_sharing_a_seat_name_do_not_share_a_cache_entry():
-    """The whole reason `definition` takes a roster. Load Neo's chair, load the
-    validator's, then LOAD NEO'S AGAIN — the third read is the one a name-only key gets
-    wrong, and it is the one that would ship a Neo mandate into a validation verdict."""
+    """The whole reason `definition` takes a roster"""
     seats.definition.cache_clear()
 
     neo_first = seats.definition(NEO, "chair")[1]
@@ -70,8 +49,7 @@ def test_two_rosters_sharing_a_seat_name_do_not_share_a_cache_entry():
 
 
 def test_the_two_shipped_rosters_disagree_about_every_shared_seat():
-    """`chair` is the only name the two vocabularies share today, and this is what keeps
-    the test above honest if that ever changes."""
+    """`chair` is the only name the two vocabularies share today"""
     shared = set(panel.neo_roster().vocabulary) & set(validation.roster().vocabulary)
     assert shared == {"chair"}
     for seat in shared:
@@ -80,14 +58,13 @@ def test_the_two_shipped_rosters_disagree_about_every_shared_seat():
 
 
 def test_a_roster_is_hashable_and_compares_by_value():
-    """Both are load-bearing: hashable so it can be a cache key at all, by value so a
-    caller that rebuilds its roster per call still hits the cache."""
+    """Both are load-bearing: hashable so it can be a cache key at all"""
     assert hash(NEO) == hash(seats.Roster(assets=NEO.assets, vocabulary=NEO.vocabulary,
                                           header=NEO.header))
     assert NEO != VALIDATOR
 
 
-# -- reading a definition ---------------------------------------------------------------
+# -- reading a definition
 
 
 def test_parse_definition_splits_frontmatter_from_the_mandate():
@@ -121,17 +98,11 @@ def test_shipped_reports_what_this_build_has_in_the_rosters_own_order(tmp_path):
         seats.definition(roster, "a")
 
 
-# -- run_blind: no store, and no way to reach one ----------------------------------------
+# -- run_blind: no store, and no way to reach one
 
 
 def test_run_blind_takes_no_store_and_runs_off_the_main_thread(monkeypatch, tmp_path):
-    """The thread-locality rule, expressed as a type. A sqlite connection belongs to the
-    thread that opened it, so a seat on a pool thread must not query one — and it cannot,
-    because there is no store in this signature to query.
-
-    Run from a thread with no store in scope as well as asserted on the signature: the
-    signature is the guarantee, the thread is the proof it is a real one.
-    """
+    """The thread-locality rule, expressed as a type"""
     params = inspect.signature(seats.run_blind).parameters
     assert "store" not in params
     assert not any("Store" in str(p.annotation) for p in params.values())
@@ -156,9 +127,7 @@ def test_run_blind_takes_no_store_and_runs_off_the_main_thread(monkeypatch, tmp_
 
 
 def test_run_blind_fans_out_concurrently(monkeypatch, tmp_path):
-    """A BARRIER, not a wall-clock comparison. Timing assertions pass on a machine that
-    ran the seats one after another and simply ran them fast; a barrier of three can only
-    be released if all three calls are in flight at once."""
+    """A BARRIER, not a wall-clock comparison"""
     barrier = threading.Barrier(3, timeout=10)
 
     def call(*a, **kw):
@@ -183,8 +152,7 @@ def test_the_prompts_and_model_each_seat_was_given_reach_the_call(monkeypatch, t
              **kw):
         seen.append({"prompt": prompt, "system": system_prompt, "model": model,
                      "timeout": timeout, "cwd": cwd, "tools": tools,
-                     # The token, not the string: minted by `run_blind` on the
-                     # calling thread (spec §3).
+                     # The token, not the string: minted by `run_blind` on the calling thread (spec §3)
                      "records_itself": kw["records_itself"].kind})
         return reply()
 
@@ -209,20 +177,12 @@ def test_no_prompts_makes_no_calls(monkeypatch, tmp_path):
                            kind="panel_seat") == []
 
 
-# -- silence is not the same as unusable output --------------------------------------------
+# -- silence is not the same as unusable output
 
 
 def test_a_seat_that_never_replied_is_distinguished_from_one_that_replied_unusably(
         monkeypatch, tmp_path):
-    """BOTH IN ONE TEST, because the distinction is the whole of what `replied` carries
-    and it is invisible in `status` alone: one is a call that never produced a reply, the
-    other is a reply a caller can still route on.
-
-    Neo's panel turns on exactly this — a premise seat that said nothing falls back to the
-    single agent, while one that said something unparseable has routed toward the full
-    panel — so a copy that dropped the field would change behaviour and pass every test
-    about statuses.
-    """
+    """BOTH IN ONE TEST, because the distinction is the whole of what `replied` carries and it is..."""
     def call(prompt, system_prompt=None, **kw):
         if "silent" in system_prompt:
             raise claude_cli.ClaudeCliError("the call timed out")
@@ -256,8 +216,7 @@ def test_a_seat_that_fails_does_not_take_the_round_down(monkeypatch, tmp_path):
 
 
 def test_the_opinion_carries_the_latency_and_the_usage_it_cost(monkeypatch, tmp_path):
-    """Recorded per seat rather than per round: whether a panel earns its price is exactly
-    the question of which seat is the expensive one, and an aggregate cannot answer it."""
+    """Recorded per seat rather than per round: whether a panel earns its price is exactly the question of..."""
     monkeypatch.setattr(claude_cli, "run_headless_result",
                         lambda *a, **kw: (time.sleep(0.01), reply(usage={"in": 1}))[1])
 
@@ -270,9 +229,7 @@ def test_the_opinion_carries_the_latency_and_the_usage_it_cost(monkeypatch, tmp_
 
 
 def test_the_summary_never_carries_the_raw_reply():
-    """Deliberation is stored and inspectable on demand; it is never pushed. A caller that
-    must persist the reply reads `raw` by name, which is a decision it makes rather than
-    one it inherits."""
+    """Deliberation is stored and inspectable on demand; it is never pushed"""
     op = seats.Opinion(seat="tester", raw=json.dumps({"reason": "a secret reading"}),
                        verdict="pass", model="haiku", latency_ms=3)
 
@@ -282,9 +239,7 @@ def test_the_summary_never_carries_the_raw_reply():
 
 
 def test_a_killed_seat_abstains_and_carries_the_kill(monkeypatch, tmp_path):
-    """Spec §2, GitHub issue #1039: carried, never raised — one seat whose process was
-    killed must not take down a panel the other three answered, and whether the round can
-    be judged without it is `validation.decide`'s call."""
+    """Spec §2, GitHub issue #1039: carried, never raised"""
     killed = claude_cli.KilledError(
         claude_cli.Killed(message="seat was killed by a signal (rc=143) and wrote "
                                   "nothing", rc=143))
@@ -306,12 +261,11 @@ def test_data_is_none_for_a_seat_that_is_not_ok():
     assert seats.Opinion(seat="t", raw='{"a": 1}', status="abstained").data is None
 
 
-# -- the layer this module sits at -----------------------------------------------------------
+# -- the layer this module sits at
 
 
 def test_seats_imports_only_the_two_modules_it_is_allowed_to():
-    """A near-leaf: an adapter dragged under it (`bootstrap`, a store, `neo`) is how the
-    asset directory would stop being a parameter and start being a global again."""
+    """A near-leaf: an adapter dragged under it (`bootstrap`"""
     import ast
 
     found: set[str] = set()

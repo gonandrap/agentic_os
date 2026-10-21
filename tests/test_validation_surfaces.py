@@ -1,15 +1,4 @@
-"""What the user is shown of a validation: rounds everywhere, seats only on demand.
-
-THE ONE RULE THIS FILE EXISTS TO PIN. A round — its number, its outcome, the reason the
-submitter was sent back — is a fact about the work and belongs on every surface anyone
-reads by default. What the SEATS said is deliberation: it is stored, it is inspectable,
-and it is never pushed. `jarvis validation show` is the only place in the CLI it appears.
-
-So most tests here are PAIRS, and the pairing is not decoration. "The seat's reply is
-absent from `wo show`" is indistinguishable from "no opinion was ever recorded" unless
-the same test also finds that reply somewhere — so every absence assertion is made
-against a fixture whose presence assertion runs beside it.
-"""
+"""What the user is shown of a validation: rounds everywhere, seats only on demand"""
 
 from __future__ import annotations
 
@@ -26,15 +15,11 @@ from jarvis.project_store import ProjectStore
 from jarvis.testing import make_git_project
 
 
-# -- fixtures: rounds and opinions, written straight into the store -------------------
-#
-# Validation ships DISABLED and its producers are other work orders' code. These are
-# rendering tests: they stage the rows the readers read, which is also the only way to
-# stage a round that has already been rejected without running a panel.
+# -- fixtures: rounds and opinions, written straight into the store
 
 
 def _rounds(store: ProjectStore, wo_id=None, fo_id=None) -> list[dict]:
-    """Two settled rounds on one unit: a rejection, then a pass. Oldest first."""
+    """Two settled rounds on one unit: a rejection, then a pass"""
     subject = {"wo_id": wo_id} if wo_id else {"fo_id": fo_id}
     first = store.open_validation_round(**subject, fingerprint="aaaa1111",
                                         summary="added the exporter",
@@ -82,7 +67,7 @@ def _out(capsys, argv: list[str]) -> str:
     return capsys.readouterr().out
 
 
-# -- rounds on the default documents ---------------------------------------------------
+# -- rounds on the default documents
 
 
 def test_wo_show_lists_its_rounds_oldest_first(jarvis_home, catalog_file, project,
@@ -120,12 +105,7 @@ def test_fo_show_lists_its_rounds_oldest_first_and_names_its_manager(
 
 def test_wo_show_json_adds_the_rounds_and_changes_nothing_else(
         jarvis_home, catalog_file, project, capsys):
-    """Additive means additive: other tooling reads this document.
-
-    The baseline is the same work order BEFORE it has any rounds, so the comparison is
-    against the real shape rather than a list of keys copied out of the source — a list
-    that would keep passing after the key it forgot to mention disappeared.
-    """
+    """Additive means additive: other tooling reads this document"""
     ops.start_os(str(catalog_file), foreground=True)
     store = ProjectStore(project)
     try:
@@ -145,8 +125,7 @@ def test_wo_show_json_adds_the_rounds_and_changes_nothing_else(
 
     assert set(after) == set(before)
     for key in before:
-        # `time_in_state` is a present-tense reading (`ops.state_durations`), so it moves
-        # between two calls by design — spec 2026-09-27-time-in-each-state §4.
+        # `time_in_state` is a present-tense reading (`ops.state_durations`)
         if key in ("validation_rounds", "time_in_state"):
             continue
         assert type(after[key]) is type(before[key]), key
@@ -160,9 +139,7 @@ def test_wo_show_json_adds_the_rounds_and_changes_nothing_else(
 
 def test_a_work_order_with_no_rounds_reads_exactly_as_it_did(
         jarvis_home, catalog_file, project, capsys):
-    """The control for every test above: validation ships disabled, so this is what
-    every unit in every fleet looks like until someone turns it on. A human reading
-    `wo show` must not be shown an empty structure for a thing that never happened."""
+    """The control for every test above: validation ships disabled"""
     ops.start_os(str(catalog_file), foreground=True)
     store = ProjectStore(project)
     try:
@@ -176,16 +153,12 @@ def test_a_work_order_with_no_rounds_reads_exactly_as_it_did(
     assert "round 1" not in out
 
 
-# -- the separation: deliberation is on demand and nowhere else -----------------------
+# -- the separation: deliberation is on demand and nowhere else
 
 
 def test_the_seats_are_absent_by_default_and_present_on_demand(
         jarvis_home, catalog_file, project, capsys):
-    """THE PAIRING THAT MAKES THE ABSENCE MEAN ANYTHING.
-
-    Without the second half, "the reply is not in `wo show`" passes just as well against
-    a store where no seat ever opined — which is to say against nothing at all.
-    """
+    """THE PAIRING THAT MAKES THE ABSENCE MEAN ANYTHING"""
     ops.start_os(str(catalog_file), foreground=True)
     wo_id = _validated_wo(project)
     fo_id = _validated_fo(project)
@@ -196,8 +169,7 @@ def test_the_seats_are_absent_by_default_and_present_on_demand(
         assert TESTER_REPLY not in doc
         assert "tester" not in doc
         assert "security" not in doc
-    # ...and the rounds themselves ARE there, which is what tells this apart from a
-    # surface that simply lost the whole validation.
+    # ...and the rounds themselves ARE there
     assert "rejected" in default_wo and "rejected" in default_fo
 
     for unit in (wo_id, fo_id):
@@ -210,9 +182,7 @@ def test_the_seats_are_absent_by_default_and_present_on_demand(
 
 def test_the_timeline_of_a_rejection_carries_no_seat(
         jarvis_home, catalog_file, project, capsys):
-    """A rejection reaches the timeline as an outcome and a reason — the ask the worker
-    has to answer. Which seat raised it is deliberation, and the timeline is read by
-    default."""
+    """A rejection reaches the timeline as an outcome and a reason — the ask the worker has to answer"""
     ops.start_os(str(catalog_file), foreground=True)
     store = ProjectStore(project)
     try:
@@ -235,8 +205,7 @@ def test_the_timeline_of_a_rejection_carries_no_seat(
 
 def test_validation_show_says_so_plainly_when_nothing_ever_ran(
         jarvis_home, catalog_file, project, capsys):
-    """`neo show --panel`'s behaviour, and for the same reason: a reader who asks this
-    of a fleet with validation switched off is owed a sentence, not an empty list."""
+    """`neo show --panel`'s behaviour"""
     ops.start_os(str(catalog_file), foreground=True)
     store = ProjectStore(project)
     try:
@@ -253,7 +222,7 @@ def test_validation_show_says_so_plainly_when_nothing_ever_ran(
 
 def test_validation_show_finds_a_feature_order_by_its_id_alone(
         jarvis_home, catalog_file, project, capsys):
-    """One command, both units: the id says which, so the caller never has to."""
+    """One command, both units: the id says which, so the caller never has to"""
     ops.start_os(str(catalog_file), foreground=True)
     fo_id = _validated_fo(project)
 
@@ -262,15 +231,12 @@ def test_validation_show_finds_a_feature_order_by_its_id_alone(
     assert "aaaa1111" in out
 
 
-# -- envelopes -------------------------------------------------------------------------
+# -- envelopes
 
 
 def test_doctor_reports_a_lost_envelope_and_ignores_a_delivered_one(
         jarvis_home, catalog_file, project, capsys):
-    """An undeliverable envelope is feedback that reached NOBODY, and from the outside
-    it looks exactly like feedback that landed. Paired with a delivered envelope on the
-    same project, because "doctor mentions one envelope" is only a finding if doctor
-    stays quiet about the other."""
+    """An undeliverable envelope is feedback that reached NOBODY"""
     ops.start_os(str(catalog_file), foreground=True)
     store = ProjectStore(project)
     try:
@@ -299,14 +265,7 @@ def test_doctor_reports_a_lost_envelope_and_ignores_a_delivered_one(
 
 def test_a_lost_envelope_goes_quiet_once_its_subject_is_settled(
         jarvis_home, catalog_file, project, capsys):
-    """The bound that keeps a clean bill of health meaningful.
-
-    `undeliverable` is terminal — nothing ever clears it — so reporting every one for
-    ever would mean this project's `jarvis doctor` never came back clean again, and a
-    check that can only ever say "something is wrong" is one an operator learns to skip.
-    Once the subject is settled the lost message can no longer cost anything; it stays
-    on the unit's page and in `jarvis validation show` for the record.
-    """
+    """The bound that keeps a clean bill of health meaningful"""
     ops.start_os(str(catalog_file), foreground=True)
     store = ProjectStore(project)
     try:
@@ -331,7 +290,7 @@ def test_a_lost_envelope_goes_quiet_once_its_subject_is_settled(
     assert "INV-ENVELOPE-LOST" not in out
     assert "all OS invariants hold" in out
 
-    # ...and it is still on the record, which is what makes going quiet acceptable.
+    # ...and it is still on the record, which is what makes going quiet acceptable
     deep = _out(capsys, ["validation", "show", wo["id"]])
     assert "undeliverable" in deep
     assert "nobody fills role implementor" in deep
@@ -339,9 +298,7 @@ def test_a_lost_envelope_goes_quiet_once_its_subject_is_settled(
 
 def test_validation_show_carries_the_delivered_envelopes_too(
         jarvis_home, catalog_file, project, capsys):
-    """Delivered envelopes are routine: they belong in the on-demand view and in no
-    default listing. This is the presence half of that rule — the absence half is
-    `wo show`, which never mentions an envelope at all."""
+    """Delivered envelopes are routine: they belong in the on-demand view and in no default listing"""
     ops.start_os(str(catalog_file), foreground=True)
     store = ProjectStore(project)
     try:
@@ -360,11 +317,7 @@ def test_validation_show_carries_the_delivered_envelopes_too(
 
 
 def _lost_manager_envelope(project) -> tuple[str, str, str]:
-    """fo-ac00376e's shape: a settled manager, a live child, and the child's deferral
-    request to role `manager` lost because nobody fills the role.
-
-    Returns (fo_id, manager wo id, subject wo id).
-    """
+    """fo-ac00376e's shape: a settled manager"""
     store = ProjectStore(project)
     try:
         fo = store.create_feature_order(title="CSV export", description="export things")
@@ -389,12 +342,7 @@ def _lost_manager_envelope(project) -> tuple[str, str, str]:
 
 def test_the_lost_manager_envelope_leads_with_the_settled_manager(jarvis_home,
                                                                   catalog_file, project):
-    """The user read wo-3db50904 as the completed order. The settled fact — its manager is
-    completed — is what makes the sentence make sense, and it arrived last or not at all.
-
-    Spec §(d), docs/superpowers/specs/2026-10-07-a-settled-features-live-children-must-
-    have-a-manager-or-a-hold.md.
-    """
+    """The user read wo-3db50904 as the completed order"""
     from jarvis import invariants
 
     ops.start_os(str(catalog_file), foreground=True)
@@ -419,7 +367,7 @@ def test_the_lost_manager_envelope_leads_with_the_settled_manager(jarvis_home,
 
 def test_a_lost_implementor_envelope_keeps_the_old_sentence(jarvis_home, catalog_file,
                                                             project):
-    """The control: only the manager case had a second order in it to confuse."""
+    """The control: only the manager case had a second order in it to confuse"""
     from jarvis import invariants
 
     ops.start_os(str(catalog_file), foreground=True)
@@ -445,18 +393,12 @@ def test_a_lost_implementor_envelope_keeps_the_old_sentence(jarvis_home, catalog
     assert found[0].context.get("manager_wo_id") is None
 
 
-# -- the review control an escalated round owes -----------------------------------------
-#
-# docs/superpowers/specs/2026-09-27-a-review-control-for-an-escalated-round.md §2, §4.
-# THE FIXTURE GOES THROUGH `ops.escalate_validation_round`, never `set_status` plus a
-# hand-written round: ruling kn-303839ee — `set_status` alone leaves no attention flag and
-# no closed round, so the test cannot tell a flagged order from an unflagged one.
+# -- the review control an escalated round owes
 
 
 def escalated(project, title: str = "the panel gave up on it",
               cause: str = ops.ESCALATION_ROUNDS_SPENT) -> dict:
-    """A work order in the live shape of wo-659be188: `needs_review`, latest round
-    `escalated`, and NO assumption rows at all."""
+    """A work order in the live shape of wo-659be188: `needs_review`"""
     store = ProjectStore(project)
     try:
         wo = store.create_work_order(title)
@@ -491,8 +433,7 @@ def test_review_state_owes_a_decision_on_an_escalated_round(jarvis_home, catalog
 
 def test_the_review_control_names_the_round_that_gave_up_not_the_row_after_it(
         jarvis_home, catalog_file, project):
-    """§A of docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md:
-    the boolean and the round number come from the same row."""
+    """§A of docs/superpowers/specs/2026-10-14-a-message-must-not-drop-an-owed-review.md: the boolean and..."""
     store = ProjectStore(project)
     try:
         wo = store.create_work_order("the panel gave up on round 4")
@@ -513,8 +454,7 @@ def test_the_review_control_names_the_round_that_gave_up_not_the_row_after_it(
 
     assert owed["escalated"] is True
     assert owed["round"] == 4
-    # `escalation_cause` is keyed on the round's id, so §A's row choice also decides
-    # whether the cause is found at all — row 5 carries no `validation_escalated` event.
+    # `escalation_cause` is keyed on the round's id
     assert owed["cause"] == ops.ESCALATION_ROUNDS_SPENT
     assert owed["family"] == "handover"
     assert "round 4 was its last" in owed["why"]
@@ -522,8 +462,7 @@ def test_the_review_control_names_the_round_that_gave_up_not_the_row_after_it(
 
 def test_review_state_places_the_one_control_in_the_assumptions_block(
         jarvis_home, catalog_file, project):
-    """Both true at once is reachable (issue 212). `placement` is the mutual exclusion,
-    computed once, so the page can never render two forms."""
+    """Both true at once is reachable (issue 212)"""
     ops.start_os(str(catalog_file), foreground=True)
     wo = escalated(project)
     ops.assume(wo["id"], "assumed the API is v2")
@@ -557,7 +496,7 @@ def test_wo_show_prints_the_owed_decision_and_json_keeps_the_counts(
 
 def test_no_decision_owed_means_no_key_at_all(jarvis_home, catalog_file, project,
                                               capsys):
-    """§4's never-always rule: `None` means the key is ABSENT, like `auto_merge`."""
+    """§4's never-always rule: `None` means the key is ABSENT, like `auto_merge`"""
     ops.start_os(str(catalog_file), foreground=True)
     store = ProjectStore(project)
     try:
@@ -570,13 +509,9 @@ def test_no_decision_owed_means_no_key_at_all(jarvis_home, catalog_file, project
     assert "review" not in doc
 
 
-# -- an escalated round says WHY, and what to run next ----------------------------------
-#
-# docs/superpowers/specs/2026-10-14-an-escalated-round-says-why-and-what-to-run-next.md,
-# GitHub issue #1040. Two facts per escalation: which condition fired, and the command
-# THIS order's shape accepts — a no-PR order is never pointed at `jarvis validation force`.
+# -- an escalated round says WHY, and what to run next
 
-#: Every cause a call site writes. `unrecorded` is a READ-time fallback and never written.
+#: Every cause a call site writes
 CAUSES = [c for c in ops.ESCALATION_FAMILY if c != ops.ESCALATION_CAUSE_UNRECORDED]
 
 
@@ -591,8 +526,7 @@ def _git(cwd: Path, *args: str) -> str:
 
 @pytest.fixture()
 def git_project(tmp_path, claude_json) -> Path:
-    """A real repository whose `origin` matches the pull request the harness opens —
-    the evidence collector reads both, so a packet off this one has a diff to judge."""
+    """A real repository whose `origin` matches the pull request the harness opens"""
     proj = make_git_project(tmp_path, "proj_a")
     _git(proj, "symbolic-ref", "HEAD", "refs/heads/main")
     _git(proj, "add", "-A")
@@ -611,23 +545,7 @@ def _payload(store, wo_id: str) -> dict:
 @pytest.mark.parametrize("cause", CAUSES)
 def test_escalation_records_its_cause_in_the_event_payload(jarvis_home, catalog_file,
                                                            project, cause):
-    """Spec §2: the one home writes the cause, and §1's one dict gives every cause a
-    family — a cause with none is a `KeyError` here rather than a blank sentence.
-
-    THE STAGED SHAPE, DELIBERATELY, and only for the mapping: every cause at once is what
-    makes a missing family a failure. WHICH CONDITION the real daemon picks is a separate
-    question and is driven at the real call site per cause — `rounds_spent`,
-    `user_rework_ceiling` and `rebinds_spent` by the three tests below,
-    `nothing_to_judge` by test_the_escalations_that_never_call_the_validator_notify_too
-    and `validator_unreachable` by test_three_outages_ping_the_user_once_not_once_per_attempt
-    (both tests/test_validation_loop.py), `bounce_exhausted` by
-    test_the_third_bounce_asks_the_user_and_the_flag_survives_a_reconcile
-    (tests/test_validation_bounce.py).
-    `prompt_refused`, `repeat_submission` and `no_verdict` have NO real site reachable
-    from here — one needs a seat prompt over the 400000-char ceiling, one needs a byte
-    identical resubmission that the fingerprint escalates before any validator runs, and
-    one needs a validator returning a non-verdict — so for those three this fixture is
-    the only coverage of the cause, and the mapping is all it claims."""
+    """Spec §2: the one home writes the cause, and §1's one dict gives every cause a family"""
     wo = escalated(project, cause=cause)
     store = ProjectStore(project)
     try:
@@ -643,30 +561,18 @@ def test_escalation_records_its_cause_in_the_event_payload(jarvis_home, catalog_
     assert state["why"] and state["next"]
 
 
-#: Phrases that DENY anyone judged the work. A verb claiming a rejection beside any of
-#: these is the contradiction kn-bec32368 forbids — one escalation worded two ways.
+#: Phrases that DENY anyone judged the work
 NOBODY_JUDGED = ("nobody judged", "no seat judged", "nothing new to judge",
                  "could not be reached", "reached no verdict")
 
-#: Phrases that ASSERT a panel opinion was given. Only a `handover` round has one, so on
-#: any other family these are false wherever they appear — `accept`, `reject` or `next`.
+#: Phrases that ASSERT a panel opinion was given
 PANEL_OPINION = ("the panel's asks", "the panel's objection", "the panel's verdict")
 
 
 @pytest.mark.parametrize("cause", CAUSES)
 def test_no_escalation_claims_a_rejection_while_denying_anyone_judged(
         jarvis_home, catalog_file, project, cause):
-    """THE ROUND-1 REJECTION. `bounce_exhausted`, `nothing_to_judge` and
-    `repeat_submission` were `handover` — verb "was rejected and handed to you" — while
-    their own `why` says no seat judged the submission. The page header, `review_lines`,
-    the timeline label and the notification title all read off the verb, so one
-    mismatched family words a NON-DECISION as a rejection on four surfaces at once.
-
-    Both directions, because either alone is satisfiable by deleting a sentence.
-
-    AND THE SAME BAN ON THE ACTIONS: `accept`, `reject` and every `next` line are read
-    beside the verb, so a neutral verb above "the panel's asks" is the same contradiction
-    one sentence further down (Neo 1723)."""
+    """THE ROUND-1 REJECTION"""
     wo = escalated(project, cause=cause)
     store = ProjectStore(project)
     try:
@@ -697,8 +603,7 @@ def test_no_escalation_claims_a_rejection_while_denying_anyone_judged(
 
 
 def test_an_unrecorded_escalation_cites_no_panel_opinion():
-    """`unrecorded` is a legacy event with no cause — it may have been an unjudged round,
-    so a panel clause could be false. Neutral like the other non-`handover` families."""
+    """`unrecorded` is a legacy event with no cause"""
     for line in ops.escalation_next({"id": "wo-x"}, "unrecorded"):
         low = line.lower()
         assert not [p for p in PANEL_OPINION if p in low], line
@@ -707,8 +612,7 @@ def test_an_unrecorded_escalation_cites_no_panel_opinion():
 
 
 def test_every_escalation_call_site_names_its_cause():
-    """Spec §2 and rejected alternative 6: KEYWORD-ONLY and NO DEFAULT, so the next call
-    site added cannot revert the surface to the vague sentence by forgetting it."""
+    """Spec §2 and rejected alternative 6: KEYWORD-ONLY and NO DEFAULT"""
     import inspect
 
     from jarvis import daemon as daemon_mod
@@ -732,9 +636,7 @@ def test_every_escalation_call_site_names_its_cause():
 
 def test_a_rejection_on_a_user_rework_round_at_the_ceiling_says_so(
         tmp_path, git_project, jarvis_home, fake_claude, fake_gh):
-    """THE #1040 SHAPE, through the real `Daemon._validate_work_order`: the round after
-    the user's own rejection, rejected with the counted budget spent. A decision with
-    concrete asks, which must not read as "the panel gave up"."""
+    """THE #1040 SHAPE, through the real `Daemon._validate_work_order`: the round after the user's own..."""
     from tests.test_rejudge_moved_head import (
         Panel, PUSHED, _cfg, _user_rejected, artifact, boot, judge, parked)
 
@@ -762,9 +664,7 @@ def test_a_rejection_on_a_user_rework_round_at_the_ceiling_says_so(
 
 def test_a_rejection_with_the_counted_budget_spent_says_rounds_spent(
         tmp_path, git_project, jarvis_home, fake_claude, fake_gh):
-    """The ordinary arm of the same three-way choice, through the real
-    `Daemon._validate_work_order`: no exemption on the round, so the cause is the round
-    budget and not the user's rework or a rebind."""
+    """The ordinary arm of the same three-way choice"""
     from tests.test_rejudge_moved_head import (
         Panel, PUSHED, _cfg, artifact, boot, judge, parked)
 
@@ -787,9 +687,7 @@ def test_a_rejection_with_the_counted_budget_spent_says_rounds_spent(
 
 def test_a_rejected_rebind_with_the_rebind_budget_spent_says_rebinds_spent(
         tmp_path, git_project, jarvis_home, fake_claude, fake_gh):
-    """The third arm, and the one the round NUMBER cannot name: a rebind sits past
-    `max_rounds` and is bounded by `ops.REBIND_MAX` instead, so the daemon has to pick
-    this cause off `as_rebind` rather than off the budget position."""
+    """The third arm, and the one the round NUMBER cannot name: a rebind sits past `max_rounds` and is..."""
     from tests.test_rejudge_moved_head import (
         AGAIN, Panel, PUSHED, _cfg, _moved, artifact, boot, judge, parked)
 
@@ -822,8 +720,7 @@ def test_a_rejected_rebind_with_the_rebind_budget_spent_says_rebinds_spent(
                                    ops.ESCALATION_NO_VERDICT])
 def test_a_no_pr_escalated_order_is_never_pointed_at_validation_force(
         jarvis_home, catalog_file, project, capsys, cause):
-    """THE REGRESSION. `ops.force_validation_refusal` refuses a no-PR force, so no
-    surface may recommend it — spec §4, both families."""
+    """THE REGRESSION"""
     ops.start_os(str(catalog_file), foreground=True)
     wo = escalated(project, cause=cause)
 
@@ -841,9 +738,7 @@ def test_a_no_pr_escalated_order_is_never_pointed_at_validation_force(
 @pytest.mark.parametrize("cause", CAUSES)
 def test_the_give_up_notification_names_the_family_and_never_gave_up(
         jarvis_home, catalog_file, project, cause):
-    """One vocabulary on every surface — `ops.ESCALATION_VERB` (spec §3). The title
-    `Daemon._escalate_feature` still uses is unchanged: a feature escalation records no
-    cause and has no family to name."""
+    """One vocabulary on every surface — `ops.ESCALATION_VERB` (spec §3)"""
     wo = escalated(project, cause=cause)
     store = ProjectStore(project)
     try:
@@ -859,8 +754,7 @@ def test_the_give_up_notification_names_the_family_and_never_gave_up(
 
 def test_a_legacy_escalated_event_with_no_cause_field_reads_as_unrecorded(
         jarvis_home, catalog_file, project):
-    """Spec §1: an event written before this change lacks the field, and guessing from
-    its `reason` prose would put a wrong sentence — and a wrong command — on it."""
+    """Spec §1: an event written before this change lacks the field"""
     wo = escalated(project)
     store = ProjectStore(project)
     try:
@@ -883,9 +777,7 @@ def test_a_legacy_escalated_event_with_no_cause_field_reads_as_unrecorded(
 @pytest.mark.parametrize("cause", CAUSES)
 def test_validation_stuck_blocker_is_unchanged_for_every_cause(jarvis_home, catalog_file,
                                                                project, cause):
-    """Spec §6: one attention sentence for every cause, byte for byte. A reason
-    `invariants.true_blockers` cannot re-derive is rewritten by INV-ATTENTION-REASON and
-    the flag stops acking."""
+    """Spec §6: one attention sentence for every cause, byte for byte"""
     ops.start_os(str(catalog_file), foreground=True)
     wo = escalated(project, cause=cause)
     store = ProjectStore(project)
@@ -908,8 +800,7 @@ def test_validation_stuck_blocker_is_unchanged_for_every_cause(jarvis_home, cata
 @pytest.mark.parametrize("pr_url", ["", "https://github.com/acme/proj/pull/7"])
 def test_validation_force_is_offered_only_when_the_refusal_would_allow_it(
         jarvis_home, catalog_file, project, cause, pr_url):
-    """Spec §4's one-direction pin: the two predicates may differ in strictness, and only
-    this way round — a command the next line of the OS refuses is issue #1040."""
+    """Spec §4's one-direction pin: the two predicates may differ in strictness, and only this way round (#1040)"""
     ops.start_os(str(catalog_file), foreground=True)
     wo = escalated(project, cause=cause)
     store = ProjectStore(project)
@@ -931,8 +822,7 @@ def test_validation_force_is_offered_only_when_the_refusal_would_allow_it(
 
 def test_validation_show_prints_the_owed_decision_once(jarvis_home, catalog_file,
                                                        project, capsys):
-    """Spec §5: after the rounds, not per round — `ops.review_lines` is the one builder
-    and this surface prints it where a reader has already read the deliberation."""
+    """Spec §5: after the rounds, not per round"""
     ops.start_os(str(catalog_file), foreground=True)
     wo = escalated(project)
 

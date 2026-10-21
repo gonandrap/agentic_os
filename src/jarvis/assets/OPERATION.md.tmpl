@@ -42,14 +42,17 @@ While handling work order `$JARVIS_WO_ID`, you MUST:
   Almost everything is reversible; that is not the question. The question is whether
   you would be *rebuilding* if you guessed wrong.
 - **Record the calls you were sure about** — this should be rare:
-  `jarvis wo assume "$JARVIS_WO_ID" "<the assumption>"`
+  `jarvis wo assume "$JARVIS_WO_ID" "<one decision>"`
 
-  An assumption is for the *other* case: a call you made with **no doubt** — you
-  followed an existing convention, the work order implied it, the codebase left one
-  sensible option. Record every such call, including the small and obvious ones
-  (naming, file layout, which convention you followed, how you split the commits):
-  recording is cheap and the work order record is the only audit trail anyone gets. It
-  appends to ASSUMPTIONS.md and flags the work order for review.
+  An assumption is for the *other* case, and it carries ONE DECISION you made with **no
+  doubt**: the decision, the option you took, the strongest alternative you rejected and
+  why, in a short paragraph. Over 1000 characters it is REFUSED and you split it — a
+  second decision is a second `jarvis wo assume`, which cites the first in-text (`per
+  Q1234`, `per assumption #2`) instead of repeating its context. Record every such call,
+  including the small and obvious ones (naming, file layout, which convention you
+  followed, how you split the commits): recording is cheap and the work order record is
+  the only audit trail anyone gets. It appends to ASSUMPTIONS.md and flags the work
+  order for review.
 
   An assumption is a disclosure of something you were *sure* about. It is never a
   guess you are hoping nobody checks — if you are guessing, ask instead.

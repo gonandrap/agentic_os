@@ -1,31 +1,13 @@
-"""Neo decides a work order's assumptions, and the record says it was Neo.
-
-docs/superpowers/specs/2026-09-15-neo-decides-an-assumption.md.
-
-Four properties are worth more than the rest, and each has its own section:
-
-* **`decide` is a table and is tested as one**, without a network and without a daemon.
-  The safety rule lives in that function, and a rule only exercised through the loop that
-  calls it is a rule tested once.
-* **ACCEPTING IS THE NARROW PATH.** Every shape of reply that is not an explicit,
-  routine-stakes approval must leave the assumption with the user — an escalation, a
-  denial, a high-stakes acceptance, unparseable output, a failed call. That is the
-  direction the whole feature has to fail in, so it is tested from every side rather than
-  once.
-* **THE RECORD NEVER CREDITS THE USER WITH A MACHINE DECISION.** The work order's own
-  brief calls this its single most important post-condition, and it gets its own test at
-  the surface a person actually reads.
-* **The two mechanisms together take the human out of the last step**, and the negative
-  half — auto-review OFF, everything else identical — still waits for a person.
-"""
+"""Neo decides a work order's assumptions, and the record says it was Neo (docs/superpowers/specs/2026-09-15-neo-decides-an-assumption.md)"""
 
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
-from jarvis import autoreview, neo, ops, stakes
+from jarvis import autoreview, neo, ops, plans, stakes
 from jarvis.catalog import ValidationConfig, load_catalog
 from jarvis.daemon import Daemon
 from jarvis.neo_store import NeoStore
@@ -55,7 +37,7 @@ def decide(**kw):
                              kw.pop("config", None) or cfg(), **kw)
 
 
-# -- `decide`: the condition table, both directions ------------------------------------
+# -- `decide`: the condition table, both directions
 
 
 def test_a_routine_assumption_on_a_parked_work_order_is_put_to_neo():
@@ -65,18 +47,14 @@ def test_a_routine_assumption_on_a_parked_work_order_is_put_to_neo():
 
 @pytest.mark.parametrize("kw", [{"enabled": False}, {"auto_review": False}])
 def test_neither_half_of_the_switch_arms_it_alone(kw):
-    """The panel's switch is read BESIDE the authority, never instead of it: what makes
-    an accepted assumption safe to land is that the panel judged the work it was part
-    of."""
+    """The panel's switch is read BESIDE the authority"""
     assert decide(config=cfg(**kw)).code == autoreview.HELD_DISABLED
 
 
 @pytest.mark.parametrize("status", ["running", "validating", "waiting_pr_merge",
                                     "completed", "waiting_input", "pending"])
 def test_only_a_work_order_actually_waiting_on_a_person_is_reviewed(status):
-    """`needs_review` is the analogue of auto-merge's `waiting_pr_merge`: the one status
-    that means the user owes a decision. An assumption recorded mid-run is a decision
-    about work that does not exist yet."""
+    """`needs_review` is the analogue of auto-merge's `waiting_pr_merge`: the one status that means the..."""
     assert decide(wo={**WO, "status": status}).code == autoreview.HELD_STATUS
 
 
@@ -86,33 +64,26 @@ def test_an_assumption_somebody_already_settled_is_not_reopened(status):
 
 
 def test_a_panel_that_gave_up_is_not_answered_for_the_user():
-    """`ops.land_when_cleared` LANDS an `escalated` round, and the only caller that can
-    reach it with one is the user saying ship it anyway. Clearing the assumptions under a
-    give-up would have the OS answer a different question from the one it was asked."""
+    """`ops.land_when_cleared` LANDS an `escalated` round"""
     assert decide(round_outcome="escalated").code == autoreview.HELD_PANEL_GAVE_UP
 
 
 @pytest.mark.parametrize("outcome", ["", "pending", "passed", "rejected"])
 def test_every_other_round_outcome_leaves_the_assumption_reviewable(outcome):
-    """The pair to the row above: `escalated` is the ONE outcome that holds, so a guard
-    written as "only review a passed work order" would fail here."""
+    """The pair to the row above: `escalated` is the ONE outcome that holds"""
     assert decide(round_outcome=outcome).armed
 
 
 @pytest.mark.parametrize("outcome", ["", "pending"])
 def test_an_open_round_does_not_hold_the_ask_pass(outcome):
-    """§5.2 of docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-hold-an-
-    assumption-for-ever.md, pinned so a later reader cannot "fix" the asymmetry by
-    symmetry: the ASK pass judges the assumption — a sentence the worker wrote — and a
-    panel verdict does not change it. Only the CONFIRMATION pass reads the diff."""
+    """§5.2 of docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-hold-an-..."""
     assert decide(round_n=1, round_outcome=outcome).armed
     assert autoreview.decide_early(assumption(), {**WO, "status": "running"}, cfg(),
                                    round_n=1, round_outcome=outcome).armed
 
 
 def test_the_open_round_hold_is_unreachable_from_either_ask_function():
-    """The pair: `round_open` is `decide_confirm`'s alone, so neither ask function can
-    produce it whatever the round says."""
+    """The pair: `round_open` is `decide_confirm`'s alone"""
     for outcome in ("", "pending", "passed", "rejected", "escalated"):
         for n in (0, 1, 3):
             assert decide(round_n=n,
@@ -123,27 +94,25 @@ def test_the_open_round_hold_is_unreachable_from_either_ask_function():
 
 
 def test_a_refusal_the_worker_has_not_answered_holds_everything_behind_it():
-    """A refused assumption is guidance the worker has not answered, and settling its
-    siblings would land the very decision the user turned down."""
+    """A refused assumption is guidance the worker has not answered"""
     assert decide(refusal_answered=False).code == autoreview.HELD_REFUSAL_UNANSWERED
 
 
 def test_the_hold_says_so_when_the_worker_pushed_without_declaring_it():
-    """Spec §2c. Today's sentence — "has not delivered again since" — is FALSE in
-    wo-dbea82cf's case: the worker HAS worked since, it just never declared it."""
+    """Spec §2c"""
     d = decide(refusal_answered=False, undeclared_delivery=True)
 
     assert d.code == autoreview.HELD_REFUSAL_UNANSWERED
     assert d.reason == autoreview.REFUSAL_UNDECLARED_REASON
     assert "pushed commits since without running `jarvis wo finish`" in d.reason
     assert "the OS has asked it to declare them" in d.reason
-    # Issue #975: a hold the user reads must end in something they can type.
+    # Issue #975: a hold the user reads must end in something they can type
     assert "jarvis validation force" in d.reason
     assert "send it a message asking it to finish" in d.reason
 
 
 def test_the_early_hold_carries_the_same_second_sentence():
-    """Both sites, per the spec: `decide` and `decide_early` render the same hold."""
+    """Both sites, per the spec: `decide` and `decide_early` render the same hold"""
     d = autoreview.decide_early(assumption(), {**WO, "status": "running"}, cfg(),
                                 refusal_answered=False, undeclared_delivery=True)
 
@@ -152,17 +121,14 @@ def test_the_early_hold_carries_the_same_second_sentence():
 
 
 def test_the_undeclared_sentence_is_free_of_a_count_a_sha_and_a_clock():
-    """It is stored verbatim by `ack_attention` and compared by INV-ATTENTION-REASON, so
-    anything in it that moves could never be acknowledged (kn-681db233 point 3)."""
+    """It is stored verbatim by `ack_attention` and compared by INV-ATTENTION-REASON"""
     text = autoreview.REFUSAL_UNDECLARED_REASON
 
     assert not any(ch.isdigit() for ch in text)
 
 
 def test_the_undeclared_finding_reaches_the_existing_nudge_remedy(project):
-    """Spec §2c's remedy half. The detector does not act: it raises a finding, and the
-    supervisor's judge path hands that to `remedies.propose` with the SHIPPED `nudge` —
-    a gate request plus a Neo question, and nothing said to the worker until a grant."""
+    """Spec §2c's remedy half"""
     from jarvis import invariants, remedies
     from jarvis.catalog import RemedyConfig
 
@@ -181,18 +147,17 @@ def test_the_undeclared_finding_reaches_the_existing_nudge_remedy(project):
     assert out["proposed"]
     assert out["approval"]["kind"] == "self_heal"
     assert out["question"]["kind"] == "approval"
-    # A proposal is not an act: nothing has reached the session.
+    # A proposal is not an act: nothing has reached the session
     assert store.queued_messages(wo["id"]) == []
 
 
 def test_an_assumption_is_asked_about_once_and_never_again():
-    """One question per assumption for its whole life — and an escalated one is held by
-    the user, so re-asking every reconcile tick would be the OS lobbying them."""
+    """One question per assumption for its whole life"""
     d = decide(assumption=assumption(neo_question_id=41))
     assert d.code == autoreview.HELD_ASKED and "41" in d.reason
 
 
-# -- the first net: high stakes, before any model call ---------------------------------
+# -- the first net: high stakes, before any model call
 
 
 @pytest.mark.parametrize("text", [
@@ -205,8 +170,7 @@ def test_an_assumption_is_asked_about_once_and_never_again():
     "the fixture holds personal data, so I left it in",
 ])
 def test_the_regex_net_holds_an_assumption_before_a_call_is_even_made(text):
-    """Every entry in `HIGH_STAKES` is the code form of a clause `neo.PERSONA` already
-    escalates on, applied one layer earlier — not a second vocabulary for it."""
+    """Every entry in `HIGH_STAKES` is the code form of a clause `neo.PERSONA` already escalates on"""
     d = decide(assumption=assumption(content=text))
     assert d.code == autoreview.HELD_HIGH_STAKES
     assert autoreview.high_stakes_marker(text) in d.reason
@@ -219,18 +183,17 @@ def test_the_regex_net_holds_an_assumption_before_a_call_is_even_made(text):
     "one-line docstrings, matching the module",
 ])
 def test_ordinary_mechanical_calls_pass_the_net(text):
-    """The pair, and it is what stops the net being vacuously wide: `monkey` must not
-    trip `\\bkey\\b`, and a feature that never fires is not a feature."""
+    """The pair, and it is what stops the net being vacuously wide: `monkey` must not trip `\\bkey\\b`"""
     assert autoreview.high_stakes_marker(text) == ""
     assert decide(assumption=assumption(content=text)).armed
 
 
 @pytest.mark.parametrize("text", [
-    # The three observed in production, issue #713.
+    # The three observed in production, issue #713
     "the lead-edit refusal is on for every project on the next release",
     "Query words under 3 characters are dropped",
     "not verified against the live CLI",
-    # The same defect in the rest of the repo's everyday vocabulary.
+    # The same defect in the rest of the repo's everyday vocabulary
     "migrate the call sites to the new helper",
     "the schema of the JSON reply is unchanged",
     "dropped from the record once the user acks it",
@@ -238,9 +201,7 @@ def test_ordinary_mechanical_calls_pass_the_net(text):
     "ship the fix in this PR",
 ])
 def test_engineering_prose_is_not_an_act(text):
-    """A WORD IS NOT AN ACT. `release`, `live`, `drop`, `migrate` and `schema` are this
-    repo's daily vocabulary, so bare word patterns held the routine assumptions the
-    feature exists to decide — which is indistinguishable from the net being off."""
+    """A WORD IS NOT AN ACT"""
     assert autoreview.high_stakes_marker(text) == ""
     assert decide(assumption=assumption(content=text)).armed
 
@@ -255,8 +216,7 @@ def test_engineering_prose_is_not_an_act(text):
     "migrate the database to the new schema in place",
 ])
 def test_the_act_is_still_held(text):
-    """The pair to the above, and the expensive direction: narrowing the patterns to the
-    ACT must not narrow them past the act."""
+    """The pair to the above, and the expensive direction: narrowing the patterns to the ACT must not..."""
     assert decide(assumption=assumption(content=text)).code == \
         autoreview.HELD_HIGH_STAKES
 
@@ -268,16 +228,11 @@ def test_the_act_is_still_held(text):
     ("I hard-coded the token in settings.json", True),
 ])
 def test_the_token_carve_out_is_a_sense_not_a_word(text, held):
-    """`token` stays bare — a hard-coded one is a credential — but this repo MEASURES
-    ITSELF IN TOKENS, so the economics sense is carved out (Neo, question 562)."""
+    """`token` stays bare — a hard-coded one is a credential"""
     assert bool(autoreview.high_stakes_marker(text)) is held
 
 
-# -- the classifier's verdict, passed in ------------------------------------------------
-#
-# docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md SS3.7. `decide`
-# stays PURE: the caller computes the verdict and passes it, so the whole condition table
-# is still unit-testable without a socket.
+# -- the classifier's verdict, passed in
 
 ACT = "cut the tag jarvis-0.6.2 and pushed it, skipping the dry-run preview"
 
@@ -296,9 +251,7 @@ def high_verdict(**over):
 
 @pytest.mark.parametrize("rule", [autoreview.decide, autoreview.decide_early])
 def test_a_verdict_of_none_leaves_every_existing_caller_byte_identical(rule):
-    """`stakes=None` is today's behaviour, and BYTE-IDENTICAL is the claim: the regex
-    mode ships as the default, so any drift in this line is a change to what every
-    project already running sees on its timeline."""
+    """`stakes=None` is today's behaviour"""
     text = "deleted the orphaned rows instead of backfilling them"
     wo = dict(WO, status="running" if rule is autoreview.decide_early else "needs_review")
     a = assumption(content=text)
@@ -313,8 +266,7 @@ def test_a_verdict_of_none_leaves_every_existing_caller_byte_identical(rule):
 
 @pytest.mark.parametrize("rule", [autoreview.decide, autoreview.decide_early])
 def test_a_high_verdict_holds_and_the_hold_says_what_the_worker_did(rule):
-    """SS3.2: `reason` REPLACES the matched phrase. The regex line tells the user a word
-    was present; this one tells them what the OS thinks the worker did."""
+    """SS3.2: `reason` REPLACES the matched phrase"""
     wo = dict(WO, status="running" if rule is autoreview.decide_early else "needs_review")
 
     d = rule(assumption(content=ACT), wo, cfg(), stakes=high_verdict())
@@ -326,8 +278,7 @@ def test_a_high_verdict_holds_and_the_hold_says_what_the_worker_did(rule):
 
 @pytest.mark.parametrize("rule", [autoreview.decide, autoreview.decide_early])
 def test_a_routine_verdict_arms_text_the_regex_would_have_held(rule):
-    """THE CASE THAT MATTERS MOST. `delet` is the regex's top marker at 21 of 91 hits and
-    almost none of them is a deletion; under a routine verdict the row arms."""
+    """THE CASE THAT MATTERS MOST"""
     text = ("this branch's own ops.objection_undeliverable was deleted upstream, so the "
             "conflict resolution keeps the other copy")
     wo = dict(WO, status="running" if rule is autoreview.decide_early else "needs_review")
@@ -339,7 +290,7 @@ def test_a_routine_verdict_arms_text_the_regex_would_have_held(rule):
 
 @pytest.mark.parametrize("rule", [autoreview.decide, autoreview.decide_early])
 def test_a_high_verdict_holds_text_the_regex_misses(rule):
-    """SS1.1, the half no narrowing reaches: a release the regex never saw."""
+    """SS1.1, the half no narrowing reaches: a release the regex never saw"""
     wo = dict(WO, status="running" if rule is autoreview.decide_early else "needs_review")
     assert autoreview.high_stakes_marker(ACT) == ""
 
@@ -349,8 +300,7 @@ def test_a_high_verdict_holds_text_the_regex_misses(rule):
 
 
 def test_an_unreachable_classifier_holds_and_the_hold_says_so():
-    """NEVER FABRICATE A DEFAULT FROM A FAILURE: the hold from a call that never
-    returned must say it never returned, not borrow a category."""
+    """NEVER FABRICATE A DEFAULT FROM A FAILURE: the hold from a call that never returned must say it..."""
     d = autoreview.decide(assumption(content=ACT), WO, cfg(),
                           stakes=stakes.unreachable("haiku"))
 
@@ -361,16 +311,14 @@ def test_an_unreachable_classifier_holds_and_the_hold_says_so():
 @pytest.mark.parametrize("verdict, armed", [(routine_verdict(), True),
                                             (high_verdict(), False)])
 def test_the_confirmation_pass_is_gated_by_the_same_verdict(verdict, armed):
-    """`decide_confirm` forwards it unchanged, so a provisional accept is no ticket past
-    the net the ask pass was gated by."""
+    """`decide_confirm` forwards it unchanged"""
     a = assumption(content=ACT, provisional_verdict="accept", neo_question_id=41)
 
     assert autoreview.decide_confirm(a, WO, cfg(), stakes=verdict).armed is armed
 
 
 def test_the_cheap_conditions_still_win_over_the_verdict():
-    """Order matters: a row that holds on a cheaper condition must not be reported as a
-    stakes hold, whatever the classifier said about it."""
+    """Order matters: a row that holds on a cheaper condition must not be reported as a stakes hold"""
     d = autoreview.decide(assumption(content=ACT, status="accepted"), WO, cfg(),
                           stakes=routine_verdict())
 
@@ -378,9 +326,7 @@ def test_the_cheap_conditions_still_win_over_the_verdict():
 
 
 def test_sibling_redaction_stays_on_the_regex_under_every_mode():
-    """SS3.6. `sibling_line` runs over a LIST — N model calls to render ONE prompt — and
-    being wrong there costs one sentence of context, not a decision in the user's name.
-    So the consequence is explicit: a row the classifier arms can still be withheld."""
+    """SS3.6"""
     text = "deleted the orphaned rows instead of backfilling them"
     line = autoreview.sibling_line({"n": 2, "status": "pending", "content": text})
 
@@ -392,35 +338,25 @@ SECRET = "reused the production api key rather than minting a second one"
 
 
 def test_a_held_assumption_is_not_quoted_as_some_other_assumptions_context():
-    """THE NET IS ABOUT TEXT REACHING A MODEL, NOT ABOUT WHOSE ROW IT IS.
-
-    Condition 7 stops a high-stakes assumption being RULED on. The question about the
-    routine assumption beside it lists the siblings for context, so without the same
-    filter there the feature ships the exact sentence it exists to withhold — and one
-    high-stakes row beside one routine row is the ORDINARY shape of a work order, so this
-    was the common path rather than a corner.
-    """
+    """THE NET IS ABOUT TEXT REACHING A MODEL, NOT ABOUT WHOSE ROW IT IS"""
     line = autoreview.sibling_line({"id": 9, "n": 3, "status": "pending",
                                     "content": SECRET})
 
     assert "production" not in line and "key" not in line
     assert SECRET not in line
-    # Withheld, not dropped: silence would tell the reviewer this work order had only
-    # routine assumptions. The number, the status and the withholding are a
-    # classification; the content is the secret.
+    # Withheld, not dropped: silence would tell the reviewer this work order had only routine assumptions
     assert "#3" in line and "[pending]" in line and "withheld" in line
 
 
 def test_a_routine_sibling_is_still_quoted_in_full():
-    """The control. A filter that withheld everything would pass the test above and make
-    the sibling list — the reason an assumption is sometimes defensible at all — empty."""
+    """The control"""
     line = autoreview.sibling_line({"id": 9, "n": 3, "status": "accepted",
                                     "content": ROUTINE})
 
     assert ROUTINE in line and "withheld" not in line
 
 
-# -- the second net: what a reply MEANS ------------------------------------------------
+# -- the second net: what a reply MEANS
 
 
 def accepted(**over) -> dict:
@@ -434,8 +370,7 @@ def test_an_explicit_routine_approval_is_the_one_shape_that_accepts():
 
 
 def test_neo_marking_its_own_acceptance_high_stakes_overrides_the_acceptance():
-    """A backstop a reviewer can wave through is not one — the argument that makes the
-    child cap outrank Neo on a plan."""
+    """A backstop a reviewer can wave through is not one"""
     r = autoreview.read_ruling(accepted(stakes="high"))
     assert not r.accept and r.overridden and "high-stakes" in r.reason
 
@@ -459,18 +394,7 @@ def test_neo_marking_its_own_acceptance_high_stakes_overrides_the_acceptance():
 ])
 def test_a_stakes_the_os_cannot_read_as_routine_escalates_rather_than_accepting(stakes,
                                                                                 why):
-    """THE SECOND NET MUST NOT FAIL OPEN, and written as `== "high"` it did.
-
-    An allowlist rather than a blocklist (kn-32434cef's shape): every row here is a reply
-    that parses cleanly, says `approve`, and carries a `stakes` the OS has no reason to
-    trust. Under the old compare each one read as ROUTINE and was accepted with the
-    backstop silently off — and the first row, the field simply missing, is the likeliest
-    malformed reply a model produces.
-
-    The cost of getting this wrong in this direction is one review action the user was
-    going to make anyway. The cost of the other direction is a decision made in their
-    name with no backstop at all.
-    """
+    """THE SECOND NET MUST NOT FAIL OPEN, and written as `== "high"` it did"""
     reply = accepted()
     if stakes is None:
         reply.pop("stakes")
@@ -485,9 +409,7 @@ def test_a_stakes_the_os_cannot_read_as_routine_escalates_rather_than_accepting(
 
 
 def test_an_unclassified_acceptance_is_not_recorded_as_routine():
-    """The absence of a warning is not a warning's absence. Writing `routine` into the
-    row would put a judgement in Neo's mouth that it never made, and that row is what
-    `jarvis wo show` and the escalation event carry."""
+    """The absence of a warning is not a warning's absence"""
     reply = accepted()
     reply.pop("stakes")
 
@@ -498,15 +420,13 @@ def test_an_unclassified_acceptance_is_not_recorded_as_routine():
 
 
 def test_the_allowlist_is_exactly_the_word_the_persona_asks_for():
-    """Pinned as a set rather than read off the implementation: every entry added here is
-    a value a future reader has to trust, and the persona names one."""
+    """Pinned as a set rather than read off the implementation: every entry added here is a value a future..."""
     assert autoreview.ROUTINE_STAKES == frozenset({"routine"})
     assert '"stakes": "routine"' in autoreview.ASSUMPTION_REVIEWER_PERSONA
 
 
 def test_neo_declining_the_assumption_escalates_and_carries_its_reading():
-    """There is no machine rejection (Neo, question 301), so a `deny` reaches the user —
-    WITH Neo's reason, which is strictly more than they get today."""
+    """There is no machine rejection (Neo, question 301), so a `deny` reaches the user"""
     r = autoreview.read_ruling(accepted(verdict="denied",
                                         reason="this changes the CLI's output"))
     assert not r.accept and not r.overridden
@@ -516,27 +436,22 @@ def test_neo_declining_the_assumption_escalates_and_carries_its_reading():
 
 @pytest.mark.parametrize("verdict", [
     {"escalate": True, "verdict": "denied", "reason": "your call"},
-    # Unparseable output, through the real parser rather than a hand-made dict.
+    # Unparseable output, through the real parser rather than a hand-made dict
     neo.parse_verdict("I think you should maybe do the thing?"),
-    # A well-formed reply that never says `approve`: absent must never mean yes.
+    # A well-formed reply that never says `approve`: absent must never mean yes
     {"escalate": False, "reason": "hmm"},
-    # ...nor must a truthy-looking string in the wrong field.
+    # ...nor must a truthy-looking string in the wrong field
     {"escalate": False, "verdict": "approve-ish", "reason": "hmm"},
-    # The transport failed; `drain_queue` synthesises this.
+    # The transport failed; `drain_queue` synthesises this
     {"escalate": True, "answer": "", "reason": "neo call failed: boom", "failed": True},
     {},
 ])
 def test_everything_that_is_not_an_explicit_approval_stays_with_the_user(verdict):
-    """THE DIRECTION THE FEATURE MUST FAIL IN, asserted over the whole shape space rather
-    than on the one reply somebody thought of."""
+    """THE DIRECTION THE FEATURE MUST FAIL IN"""
     assert not autoreview.read_ruling(verdict).accept
 
 
-# -- why the OS escalated, as one groupable label --------------------------------------
-#
-# docs/superpowers/specs/2026-10-01-neo-observability.md §1 plus Neo's ruling on question 1170: an
-# override is a THIRD answer to "who decided", so these five members are their own class
-# and every one is derived from facts the code already holds — never read off a reply.
+# -- why the OS escalated, as one groupable label
 
 
 def test_an_override_names_the_stakes_word_that_caused_it():
@@ -556,27 +471,24 @@ def test_neo_declining_with_no_machine_rejection_is_its_own_cause():
 
 
 def test_children_at_or_over_the_cap_is_the_plan_paths_cause():
-    """No `Ruling` on that path: the cap outranks whatever Neo said about the plan."""
+    """No `Ruling` on that path: the cap outranks whatever Neo said about the plan"""
     assert autoreview.escalation_cause(over_cap=True) == "scope-over-cap"
-    # Neo escalated on its own, so the cause is Neo's chosen label, not this one.
+    # Neo escalated on its own, so the cause is Neo's chosen label, not this one
     assert autoreview.escalation_cause(over_cap=True, escalate=True) == ""
 
 
 def test_a_fact_pattern_that_is_none_of_the_five_records_no_cause():
-    """A NULL is correct and a wrong label is not. An acceptance the OS dropped at settle
-    time for its own reasons is not one of these five."""
+    """A NULL is correct and a wrong label is not"""
     assert autoreview.escalation_cause(autoreview.read_ruling(accepted())) == ""
     assert autoreview.escalation_cause() == ""
-    # Neo escalated on its own: the cause is the CHOSEN label off its reply, which
-    # `drain_queue` already wrote, and this must not overwrite it.
+    # Neo escalated on its own: the cause is the CHOSEN label off its reply
     escalated = accepted(escalate=True, verdict="denied")
     assert autoreview.escalation_cause(autoreview.read_ruling(escalated),
                                        escalate=True) == ""
 
 
 def test_every_cause_this_helper_can_return_is_in_the_overridden_class():
-    """The helper lives in a PURE module and spells the members as literals, so the enum
-    is pinned from the test rather than by an import that would invert the layering."""
+    """The helper lives in a PURE module and spells the members as literals"""
     from jarvis.neo_store import (ESCALATION_CAUSES, ESCALATION_CAUSES_CHOSEN,
                                   ESCALATION_CAUSES_FAILED,
                                   ESCALATION_CAUSES_OVERRIDDEN)
@@ -597,24 +509,19 @@ def test_every_cause_this_helper_can_return_is_in_the_overridden_class():
 
 
 def test_the_members_nothing_can_write_are_no_longer_in_the_enum():
-    """`stakes.HIGH_UNREACHABLE` / `HIGH_UNPARSEABLE` reach `HELD_HIGH_STAKES`, which
-    holds the review BEFORE a question row exists — so nothing could ever write these.
-    Documented as an invisible class in the report instead (Neo, question 1170)."""
+    """`stakes.HIGH_UNREACHABLE` / `HIGH_UNPARSEABLE` reach `HELD_HIGH_STAKES`"""
     from jarvis.neo_store import ESCALATION_CAUSES
 
     assert "classifier-unreachable" not in ESCALATION_CAUSES
     assert "classifier-unparseable" not in ESCALATION_CAUSES
 
 
-# -- the daemon: asking ----------------------------------------------------------------
+# -- the daemon: asking
 
 
 @pytest.fixture()
 def started(jarvis_home, fake_claude, catalog_file, project, monkeypatch):
-    # The suite is routinely run BY a worker, which inherits `JARVIS_WO_ID`. Several
-    # tests here stand in for the USER at the console, and `ops._refuse_worker_write`
-    # refuses a worker on purpose — the same thing `tests/test_config_console.py` drops,
-    # for the same reason.
+    # The suite is routinely run BY a worker, which inherits `JARVIS_WO_ID`
     monkeypatch.delenv("JARVIS_WO_ID", raising=False)
     ops.start_os(str(catalog_file), foreground=True)
     return Daemon(load_catalog(catalog_file))
@@ -623,16 +530,7 @@ def started(jarvis_home, fake_claude, catalog_file, project, monkeypatch):
 def park(daemon, *, auto_review: bool, auto_merge: bool = False,
          assumptions: tuple[str, ...] = (ROUTINE,), description: str = "d",
          outcome: str = "passed", pr_url: str = PR):
-    """A work order finished behind a pull request, parked on its assumptions.
-
-    Everything the seven conditions need, so each test moves exactly one of them.
-
-    The round is opened and settled BY HAND, `tests/test_automerge.py`'s `arm`'s way and
-    for its reason: the panel does not run in a unit test, and a settled `passed` round
-    on the judged commit is what a green one leaves behind. Doing it here also keeps the
-    catalog FILE's `validation.enabled` false, so `ops.finish` does not try to collect an
-    evidence packet from a repository these tests never built.
-    """
+    """A work order finished behind a pull request, parked on its assumptions"""
     spec = daemon.catalog.project("proj_a")
     spec.validation.enabled = True
     spec.validation.auto_review = auto_review
@@ -678,9 +576,7 @@ def inbox(wo_id: str) -> list[dict]:
 
 
 def test_a_project_that_has_not_opted_in_is_never_decided_for(started):
-    """THE SWITCH IS REAL AND NOT DECORATIVE. Everything else lines up and the only
-    missing fact is the project's own permission: nothing is asked, nothing is held, and
-    the work order waits for the user exactly as it does today."""
+    """THE SWITCH IS REAL AND NOT DECORATIVE"""
     store, wo = park(started, auto_review=False)
 
     ask(started, store)
@@ -688,16 +584,14 @@ def test_a_project_that_has_not_opted_in_is_never_decided_for(started):
     assert questions() == []
     assert store.pending_assumptions(wo["id"])
     assert store.get_work_order(wo["id"])["status"] == "needs_review"
-    # ...and it did not even cost a line on the timeline: an opted-out project's record
-    # must not carry notes about a mechanism it does not have.
+    # ...and it did not even cost a line on the timeline: an opted-out project's record must not carry...
     assert events(store, wo["id"], "autoreview_held") == []
     assert ops.autoreview_state(store, wo) is None
 
 
 def test_neo_being_switched_off_files_no_question_nobody_will_drain(started,
                                                                    catalog_file):
-    """A question filed against a queue that does not run is worse than no question: the
-    assumption would be parked behind it for ever."""
+    """A question filed against a queue that does not run is worse than no question: the assumption would..."""
     started.catalog.os.neo.enabled = False
     store, wo = park(started, auto_review=True)
 
@@ -707,8 +601,7 @@ def test_neo_being_switched_off_files_no_question_nobody_will_drain(started,
 
 
 def test_each_assumption_gets_its_own_question_never_one_verdict_over_a_list(started):
-    """A list invites one judgement over its easiest member. Three assumptions, three
-    questions, three back-links."""
+    """A list invites one judgement over its easiest member"""
     store, wo = park(started, auto_review=True,
                      assumptions=("used tabs in the fixture",
                                   "put the helper at the bottom of the module",
@@ -721,8 +614,7 @@ def test_each_assumption_gets_its_own_question_never_one_verdict_over_a_list(sta
     assert len({q["id"] for q in asked}) == 3
     rows = store.all_assumptions(wo["id"])
     assert sorted(a["neo_question_id"] for a in rows) == sorted(q["id"] for q in asked)
-    # Each question quotes ONE assumption under the heading that is ruled on, and names
-    # the others only as context.
+    # Each question quotes ONE assumption under the heading that is ruled on
     for row in rows:
         q = next(x for x in asked if x["id"] == row["neo_question_id"])
         assert f"# The assumption\n{row['content']}" in q["question"]
@@ -730,32 +622,28 @@ def test_each_assumption_gets_its_own_question_never_one_verdict_over_a_list(sta
 
 
 def test_no_question_the_os_files_carries_a_high_stakes_assumptions_text(started):
-    """THE SAME GUARANTEE THROUGH THE DAEMON, asserted over EVERY question filed rather
-    than over the one the test happens to look at. The unit test pins `sibling_line`; this
-    pins that nothing routes around it — the question body, the `context` field the
-    dashboard renders, and any question of any kind this pass produces."""
+    """THE SAME GUARANTEE THROUGH THE DAEMON"""
     store, wo = park(started, auto_review=True,
                      assumptions=(ROUTINE, SECRET, "used tabs in the fixture"))
 
     ask(started, store)
 
     filed = questions()
-    # Two routine assumptions are asked about; the high-stakes one is not.
+    # Two routine assumptions are asked about; the high-stakes one is not
     assert len(filed) == 2
     for q in filed:
         assert SECRET not in q["question"]
         assert "production" not in q["question"] and "api key" not in q["question"]
         assert SECRET not in (q.get("context") or "")
-    # ...and it is named as withheld rather than silently absent, so the reviewer knows
-    # the order has an assumption it is not being shown.
+    # ...and it is named as withheld rather than silently absent
     assert all("withheld" in q["question"] for q in filed)
-    # The held one is on the record with its reason, exactly as before.
+    # The held one is on the record with its reason, exactly as before
     (held,) = events(store, wo["id"], "autoreview_held")
     assert held["code"] == autoreview.HELD_HIGH_STAKES
 
 
 def test_asking_twice_asks_once(started):
-    """`decide`'s condition 6 through the loop: the pass runs every reconcile tick."""
+    """`decide`'s condition 6 through the loop: the pass runs every reconcile tick"""
     store, wo = park(started, auto_review=True)
 
     ask(started, store)
@@ -765,9 +653,7 @@ def test_asking_twice_asks_once(started):
 
 
 def test_a_hold_is_recorded_once_per_reason_and_is_not_an_attention_item(started):
-    """`_note_autoreview_held`'s dedupe. A held assumption is one the user decides
-    themselves, which is what they did for every assumption before this existed — and the
-    work order is already on their list carrying `assumptions pending review`."""
+    """`_note_autoreview_held`'s dedupe"""
     store, wo = park(started, auto_review=True,
                      assumptions=("reused the production api key",))
 
@@ -783,18 +669,14 @@ def test_a_hold_is_recorded_once_per_reason_and_is_not_an_attention_item(started
 
 
 def settled_round(store, wo_id: str, outcome: str, reason: str = "") -> None:
-    """A fresh settled round on the judged commit, `park`'s way."""
+    """A fresh settled round on the judged commit, `park`'s way"""
     row = store.open_validation_round(wo_id=wo_id, fingerprint="fp1")
     store.set_validation_head(row["id"], JUDGED)
     store.close_validation_round(row["id"], outcome, reason)
 
 
 def test_a_hold_returning_to_an_earlier_reason_is_recorded_again(started):
-    """ISSUE #782, the real trace: held on stakes, then a transient panel give-up, then a
-    forced round that PASSED — and the third pass held on the stakes again and wrote
-    nothing, because the dedupe looked at EVERY past hold. `assumptions_with_rulings`
-    renders the newest, so every surface went on saying the panel gave up on an order
-    whose panel had passed."""
+    """ISSUE #782, the real trace: held on stakes"""
     store, wo = park(started, auto_review=True,
                      assumptions=("reused the production api key",))
 
@@ -812,11 +694,7 @@ def test_a_hold_returning_to_an_earlier_reason_is_recorded_again(started):
     assert "gave up" not in line
 
 
-# -- the panel's give-up: which round, what it said, and when it stops being true -------
-#
-# docs/superpowers/specs/2026-09-26-a-panel-gave-up-hold-says-which-round-and-stops-when-
-# it-passes.md. The hold is an append-only event read as a statement about NOW, so this
-# one — whose subject is a queryable row — is resolved against that row at the read side.
+# -- the panel's give-up: which round, what it said, and when it stops being true
 
 PANEL_REASON = ("the seats could not agree about whether the retry loop is safe under a\n"
                 "partial write, and the chair would not break the tie:   two read the lock\n"
@@ -827,9 +705,7 @@ PANEL_REASON = ("the seats could not agree about whether the retry loop is safe 
 
 
 def test_a_panel_hold_names_the_round_and_quotes_what_the_panel_said(started):
-    """A reader cannot tell a real disagreement from #778's OAuth outage from the static
-    sentence, and the round reason — the one text that distinguishes them — was read at
-    both daemon call sites and thrown away."""
+    """A reader cannot tell a real disagreement from #778's OAuth outage from the static sentence"""
     store, wo = park(started, auto_review=True, outcome="")
     row = store.latest_validation_round(wo_id=wo["id"])
     store.close_validation_round(row["id"], "escalated", PANEL_REASON)
@@ -840,37 +716,30 @@ def test_a_panel_hold_names_the_round_and_quotes_what_the_panel_said(started):
     assert held["code"] == autoreview.HELD_PANEL_GAVE_UP
     assert held["round"] == 1
     assert "gave up on round 1" in held["reason"]
-    # Whitespace-collapsed and clamped, `ops.objection_response_line`'s rule: one line
-    # inside a list of assumptions, with the full text one pointer away.
+    # Whitespace-collapsed and clamped
     assert len(PANEL_REASON) > 300
     assert " ".join(PANEL_REASON.split())[:117] + "…" in held["reason"]
     assert "\n" not in held["reason"] and "  " not in held["reason"]
 
 
 def test_a_panel_hold_stops_being_rendered_once_a_later_round_passes(started):
-    """#782's sibling, and the one only the freshness check can satisfy: ONE routine
-    assumption, so no second hold reason masks the stale line the way
-    `test_a_hold_returning_to_an_earlier_reason_is_recorded_again`'s stakes hold does.
-
-    Measured on wo-15f5d969: round 3 was forced and PASSED at the same commit, and both
-    the pending assumptions and the `auto_review:` line still said the panel gave up."""
+    """#782's sibling, and the one only the freshness check can satisfy: ONE routine assumption"""
     store, wo = park(started, auto_review=True, outcome="escalated")
     ask(started, store)
     assert "gave up" in rulings(store, wo["id"])[0]
 
     settled_round(store, wo["id"], "passed")
 
-    # Not-looked-at is an understatement; the stale sentence is a lie.
+    # Not-looked-at is an understatement; the stale sentence is a lie
     assert rulings(store, wo["id"]) == [""]
     assert ops.autoreview_state(store, store.get_work_order(wo["id"])) is None
-    # The history is KEPT — the hold did happen, and the timeline is append-only.
+    # The history is KEPT — the hold did happen, and the timeline is append-only
     (held,) = events(store, wo["id"], "autoreview_held")
     assert held["code"] == autoreview.HELD_PANEL_GAVE_UP
 
 
 def test_a_second_escalated_round_refreshes_the_hold_rather_than_voiding_it(started):
-    """The dedupe key carries the round, or round 2's give-up writes nothing, the payload
-    still says round 1, and the freshness check drops a hold that is TRUE."""
+    """The dedupe key carries the round"""
     store, wo = park(started, auto_review=True, outcome="escalated")
     ask(started, store)
     settled_round(store, wo["id"], "escalated")
@@ -889,11 +758,7 @@ def _refusal_hold(store, wo, reason: str) -> autoreview.Decision:
 
 
 def test_the_undeclared_refusal_sentence_is_not_deduped_away_by_the_first(started):
-    """ISSUE #975, measured on wo-2933fc24: both refusal sentences share the code
-    `HELD_REFUSAL_UNANSWERED`, and `undeclared_delivery` can only become true AFTER a hold
-    was written with the other one. Keyed on the code alone, the second write was dropped
-    and `assumptions_with_rulings` — newest hold wins — kept rendering 'has not delivered
-    again since' about a worker that had pushed commits."""
+    """ISSUE #975, measured on wo-2933fc24: both refusal sentences share the code..."""
     store, wo = park(started, auto_review=True, outcome="")
 
     started._note_autoreview_held(
@@ -908,7 +773,7 @@ def test_the_undeclared_refusal_sentence_is_not_deduped_away_by_the_first(starte
 
 
 def test_the_same_refusal_reason_twice_is_still_recorded_once(started):
-    """The dedupe the reason key must not weaken: the pass runs every reconcile tick."""
+    """The dedupe the reason key must not weaken: the pass runs every reconcile tick"""
     store, wo = park(started, auto_review=True, outcome="")
 
     for _ in range(3):
@@ -921,8 +786,7 @@ def test_the_same_refusal_reason_twice_is_still_recorded_once(started):
 
 
 def test_a_hold_written_before_the_round_was_recorded_is_read_honestly(started):
-    """A payload from before this shipped carries no round: KEPT while the newest round is
-    still escalated (the panel did give up), dropped once a later one passed."""
+    """A payload from before this shipped carries no round: KEPT while the newest round is still escalated..."""
     store, wo = park(started, auto_review=True, outcome="escalated")
     (row,) = store.all_assumptions(wo["id"])
     store.add_event(wo["id"], "autoreview_held",
@@ -939,11 +803,7 @@ def test_a_hold_written_before_the_round_was_recorded_is_read_honestly(started):
 
 
 def test_a_confirm_spent_hold_survives_the_panel_freshness_filter(started):
-    """§8 row 5 of docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-hold-
-    an-assumption-for-ever.md: the freshness filter is `panel_gave_up`'s alone. A
-    `HELD_CONFIRM_SPENT` hold is about a spent NEO QUESTION, not about a round, so a
-    later passed round says nothing about it — dropping it would put the stale settle-site
-    sentence back on every surface, which is the defect this spec fixes."""
+    """§8 row 5 of docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-hold-..."""
     store, wo = park(started, auto_review=True, outcome="passed")
     (row,) = store.all_assumptions(wo["id"])
     payload = {"code": autoreview.HELD_CONFIRM_SPENT,
@@ -956,7 +816,7 @@ def test_a_confirm_spent_hold_survives_the_panel_freshness_filter(started):
     assert not ops._panel_hold_is_stale(latest, payload)
     assert not ops._stale_panel_hold(store, wo["id"])("autoreview_held", payload)
 
-    # ...and the hold is what the readers render, on both surfaces.
+    # ...and the hold is what the readers render, on both surfaces
     (line,) = rulings(store, wo["id"])
     assert "question 920" in line and "no longer open" in line
     state = ops.autoreview_state(store, store.get_work_order(wo["id"]))
@@ -965,11 +825,7 @@ def test_a_confirm_spent_hold_survives_the_panel_freshness_filter(started):
 
 
 def test_a_status_hold_stops_being_shown_once_a_review_is_owed_again(started):
-    """A `status` hold claims the order is in no state this pass acts in, so it is stale
-    exactly when the order now IS in one (2026-09-27-a-stale-merge-hold-is-not-the-reason-
-    a-pr-is-not-merging.md §6). The live shape: an order cancelled mid-ruling, then
-    reopened — every surface went on saying the OS declined to look at the assumption.
-    """
+    """A `status` hold claims the order is in no state this pass acts in"""
     store, wo = park(started, auto_review=True)
     (row,) = store.all_assumptions(wo["id"])
     store.set_status(wo["id"], "cancelled")
@@ -986,16 +842,14 @@ def test_a_status_hold_stops_being_shown_once_a_review_is_owed_again(started):
     assert rulings(store, wo["id"]) == [""]
 
 
-# docs/superpowers/specs/2026-10-01-a-confirmation-is-not-re-run-on-a-settled-
-# assumption.md §3.3. Every per-assumption hold claims something about a row, and the
-# claim is untrue once that row is decided — whatever the code says.
+# docs/superpowers/specs/2026-10-01-a-confirmation-is-not-re-run-on-a-settled- assumption.md §3.3
 
 SETTLED_SPENT = ("assumption #1 is yours — the OS asked Neo to confirm its early reading "
                  "(question 920) and that question is no longer open")
 
 
 def settled_pair(started):
-    """A parked order with one row Neo ACCEPTED and one still pending — §1.1's shape."""
+    """A parked order with one row Neo ACCEPTED and one still pending — §1.1's shape"""
     store, wo = park(started, auto_review=True,
                      assumptions=(ROUTINE, "put the helper at the bottom"))
     first, second = store.all_assumptions(wo["id"])
@@ -1007,8 +861,7 @@ def settled_pair(started):
 
 
 def test_a_hold_about_a_row_that_has_since_settled_is_not_the_summary_line(started):
-    """§3.3: the three observed orders' stored state, which no write-side change reaches.
-    The claim is withdrawn; the event stays on the timeline."""
+    """§3.3: the three observed orders' stored state, which no write-side change reaches"""
     store, wo, first, second = settled_pair(started)
 
     assert ops.autoreview_state(store, store.get_work_order(wo["id"])) is None
@@ -1026,8 +879,7 @@ def test_a_hold_about_a_row_that_has_since_settled_is_not_the_summary_line(start
 
 
 def test_the_freshness_of_a_hold_is_answered_per_assumption_not_per_order(started):
-    """§3.3's cache: one `stale` closure runs over every row of the order, so a single
-    status slot would answer the pending row with the accepted row's status."""
+    """§3.3's cache: one `stale` closure runs over every row of the order"""
     store, wo, first, second = settled_pair(started)
     store.add_event(wo["id"], "autoreview_held",
                     {"code": autoreview.HELD_HIGH_STAKES,
@@ -1041,8 +893,7 @@ def test_the_freshness_of_a_hold_is_answered_per_assumption_not_per_order(starte
 
 
 def test_an_order_level_hold_names_no_row_and_is_never_dropped_by_one(started):
-    """§3.3's first bullet: a payload with no `assumption_id` makes no claim about a row,
-    so the clause cannot answer about it and must leave it alone."""
+    """§3.3's first bullet: a payload with no `assumption_id` makes no claim about a row"""
     store, wo = park(started, auto_review=True)
     (row,) = store.all_assumptions(wo["id"])
     store.review_assumption(row["id"], "accepted", decided_by="neo")
@@ -1056,7 +907,7 @@ def test_an_order_level_hold_names_no_row_and_is_never_dropped_by_one(started):
     assert state["code"] == autoreview.HELD_DISABLED
 
 
-# -- the daemon: ruling ----------------------------------------------------------------
+# -- the daemon: ruling
 
 
 def drain(daemon):
@@ -1065,13 +916,7 @@ def drain(daemon):
 
 def test_an_accepted_assumption_settles_and_the_record_says_the_os_did_it(
         started, catalog_file):
-    """THE POST-CONDITION THE WHOLE FEATURE RESTS ON, at the row level: who, why, which
-    model, under which configuration, and the question that ruled.
-
-    The config write is what puts a version in the ledger, so the stamp has something
-    real to be — asserting a truthy column against an empty ledger would pass on None
-    for ever (`ops.current_config_version` answers None honestly on a fleet that has
-    never written one)."""
+    """THE POST-CONDITION THE WHOLE FEATURE RESTS ON"""
     ops.set_config("validation.auto_review", True, project="proj_a",
                    reason="the panel has been right for a month",
                    catalog_path=str(catalog_file))
@@ -1091,16 +936,14 @@ def test_an_accepted_assumption_settles_and_the_record_says_the_os_did_it(
     assert row["neo_question_id"] == q["id"]
     (event,) = events(store, wo["id"], "autoreview_accepted")
     assert event["decided_by"] == "neo" and event["neo_question_id"] == q["id"]
-    # The worker finished long ago: nothing may start a turn on it.
+    # The worker finished long ago: nothing may start a turn on it
     assert store.list_messages(wo["id"]) == []
     assert events(store, wo["id"], "neo_answered") == []
 
 
 def test_jarvis_wo_show_never_presents_a_machine_decision_as_the_users(
         started, capsys):
-    """THE SURFACE TEST, and it is deliberately at the CLI rather than in `ops`: what
-    matters is what a person reads. Both routes are exercised in one work order, so the
-    test would fail just as loudly if the OS's verdict were rendered like the user's."""
+    """THE SURFACE TEST, and it is deliberately at the CLI rather than in `ops`: what matters is what a..."""
     from jarvis import cli
 
     store, wo = park(started, auto_review=True,
@@ -1108,7 +951,7 @@ def test_jarvis_wo_show_never_presents_a_machine_decision_as_the_users(
                                   "reused the production api key"))
     ask(started, store)
     drain(started)
-    # ...and the user rules on the one the OS would not touch.
+    # ...and the user rules on the one the OS would not touch
     ops.review_work_order(wo["id"], accept=True, feedback="fine, I minted a new one")
 
     capsys.readouterr()
@@ -1117,7 +960,7 @@ def test_jarvis_wo_show_never_presents_a_machine_decision_as_the_users(
 
     assert "accepted by the OS (neo" in out
     assert "accepted by you" in out
-    # The strong form: the machine's line must not be sayable as the user's.
+    # The strong form: the machine's line must not be sayable as the user's
     machine = [l for l in out.splitlines() if "FORCE_ACCEPT" in l]
     assert machine and all("by you" not in l for l in machine)
 
@@ -1134,9 +977,7 @@ def test_jarvis_wo_show_never_presents_a_machine_decision_as_the_users(
 ])
 def test_a_ruling_that_is_not_an_acceptance_leaves_the_assumption_exactly_where_it_was(
         started, token, overridden):
-    """No settling, no landing, and NO INBOX ROW: nothing changed for the user, and a
-    second announcement of an unchanged fact is the attention cost this feature exists to
-    reduce."""
+    """No settling, no landing, and NO INBOX ROW: nothing changed for the user"""
     store, wo = park(started, auto_review=True,
                      assumptions=(f"{token} — {ROUTINE}".strip(" —"),))
     ask(started, store)
@@ -1150,8 +991,7 @@ def test_a_ruling_that_is_not_an_acceptance_leaves_the_assumption_exactly_where_
     assert inbox(wo["id"]) == []
     (event,) = events(store, wo["id"], "autoreview_escalated")
     assert event["overridden"] is overridden
-    # However Neo phrased it, the question is the user's now — which is what
-    # `jarvis neo list` and `invariants.check_neo_escalations_are_live` both read.
+    # However Neo phrased it, the question is the user's now
     neo_store = NeoStore()
     try:
         assert neo_store.get(q["id"])["status"] == "escalated"
@@ -1160,8 +1000,7 @@ def test_a_ruling_that_is_not_an_acceptance_leaves_the_assumption_exactly_where_
 
 
 def test_the_user_is_told_once_when_the_last_assumption_leaves_their_list(started):
-    """One row, per work order, at the moment their review list changes — and it names
-    the correction path, which is the other half of making this reversible."""
+    """One row, per work order, at the moment their review list changes"""
     store, wo = park(started, auto_review=True,
                      assumptions=(f"FORCE_ACCEPT — {ROUTINE}",
                                   "FORCE_ACCEPT — put the helper at the bottom"))
@@ -1178,8 +1017,7 @@ def test_the_user_is_told_once_when_the_last_assumption_leaves_their_list(starte
 
 
 def test_the_users_own_verdict_wins_a_race_with_neos(started):
-    """They got there first through `jarvis wo review`. Their decision stands, and the
-    machine's is dropped rather than written over it."""
+    """They got there first through `jarvis wo review`"""
     store, wo = park(started, auto_review=True,
                      assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
     ask(started, store)
@@ -1192,30 +1030,16 @@ def test_the_users_own_verdict_wins_a_race_with_neos(started):
     assert events(store, wo["id"], "autoreview_accepted") == []
 
 
-# -- the settle site: everything that can change while Neo is thinking -----------------
-#
-# The ask FREEZES NOTHING. A model call is seconds to minutes wide, and `decide` runs
-# before it — so every condition it checked is a fact that can be false by the time the
-# ruling comes back. The settle is the step that cannot be taken back: it clears the
-# assumption and `ops.land_when_cleared` lands the order behind it. So the table is run
-# again against state read at that moment, and these are the rows that reach it.
+# -- the settle site: everything that can change while Neo is thinking
 
 
 def test_a_panel_that_gives_up_while_neo_is_thinking_stops_the_settle(started):
-    """THE ONE THAT MATTERS MOST, and it is reachable rather than theoretical: arming on
-    a `pending` round is explicitly allowed (`test_every_other_round_outcome_leaves_the
-    _assumption_reviewable`), so pending -> escalated is the ordinary way a panel gives
-    up on an order the OS has already asked about.
-
-    Without the re-check the OS clears the assumptions and lands — with auto-merge on,
-    merges — a work order the panel deliberately put in front of the user, silently and
-    with nothing on the record saying so (kn-fcbfd42b).
-    """
+    """THE ONE THAT MATTERS MOST, and it is reachable rather than theoretical: arming on a `pending` round..."""
     store, wo = park(started, auto_review=True, outcome="pending",
                      assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
     ask(started, store)
     (q,) = questions()
-    # The panel reaches its verdict while the question is in flight, and gives up.
+    # The panel reaches its verdict while the question is in flight, and gives up
     store.close_validation_round(
         store.latest_validation_round(wo_id=wo["id"])["id"], "escalated",
         "the seats could not agree")
@@ -1225,13 +1049,12 @@ def test_a_panel_that_gives_up_while_neo_is_thinking_stops_the_settle(started):
     (row,) = store.all_assumptions(wo["id"])
     assert row["status"] == "pending" and not row["decided_by"]
     assert events(store, wo["id"], "autoreview_accepted") == []
-    # The order did NOT land behind it — the thing the panel's give-up was protecting.
+    # The order did NOT land behind it — the thing the panel's give-up was protecting
     assert store.get_work_order(wo["id"])["status"] == "needs_review"
-    # ...and the OS said why, in both places: the work order's record and Neo's own list.
+    # ...and the OS said why, in both places: the work order's record and Neo's own list
     (held,) = events(store, wo["id"], "autoreview_held")
     assert held["code"] == autoreview.HELD_PANEL_GAVE_UP
-    # WHICH round and WHAT IT SAID, not merely that one gave up: this round closed with a
-    # real reason, and the hold is where the user meets it beside the assumption.
+    # WHICH round and WHAT IT SAID, not merely that one gave up: this round closed with a real reason
     assert held["round"] == 1
     assert "gave up on round 1" in held["reason"]
     assert "the seats could not agree" in held["reason"]
@@ -1239,18 +1062,14 @@ def test_a_panel_that_gives_up_while_neo_is_thinking_stops_the_settle(started):
     assert escalated["dropped"] == autoreview.HELD_PANEL_GAVE_UP
     assert questions()[0]["status"] == "escalated"
     assert q["id"] == questions()[0]["id"]
-    # The one line the user reads on `jarvis wo show` says it is theirs again.
+    # The one line the user reads on `jarvis wo show` says it is theirs again
     line = ops.autoreview_state(store, store.get_work_order(wo["id"]))["line"]
     assert "left with you" in line
-    # Still pending: no resolution clause (the spec's §Tests 3).
+    # Still pending: no resolution clause (the spec's §Tests 3)
     assert "since " not in line
 
 
-# -- WHO decided, on the row the report groups by --------------------------------------
-#
-# docs/superpowers/specs/2026-10-01-neo-observability.md §1 and Neo's ruling on question 1170. These
-# re-marks happen AFTER Neo answered, so without a cause every one of them renders "not
-# recorded" for ever — on `kind='assumption'`, the population the user complained about.
+# -- WHO decided, on the row the report groups by
 
 
 def _cause(question_id: int) -> str | None:
@@ -1277,9 +1096,7 @@ def test_an_override_at_the_settle_records_which_fact_caused_it(started, token, 
 
 
 def test_a_ruling_the_os_dropped_at_the_settle_records_no_cause(started):
-    """THE HONEST NULL. This escalation is caused by the condition table re-running, not
-    by anything in Neo's reply — the acceptance itself was routine. A label from the five
-    would say the OS overrode a stakes word or Neo denied it, and neither happened."""
+    """THE HONEST NULL"""
     store, wo = park(started, auto_review=True, outcome="pending",
                      assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
     ask(started, store)
@@ -1294,13 +1111,11 @@ def test_a_ruling_the_os_dropped_at_the_settle_records_no_cause(started):
     assert _cause(q["id"]) is None
 
 
-# -- the banner against the assumption's CURRENT row -----------------------------------
-#
-# docs/superpowers/specs/2026-09-25-a-decided-assumption-is-not-left-with-you.md.
+# -- the banner against the assumption's CURRENT row
 
 
 def _escalated(daemon):
-    """A work order parked on one assumption the OS left with the user."""
+    """A work order parked on one assumption the OS left with the user"""
     store, wo = park(daemon, auto_review=True)
     ask(daemon, store)
     drain(daemon)
@@ -1314,8 +1129,7 @@ def _line(store, wo_id: str) -> str:
 
 
 def test_an_accepted_assumption_is_no_longer_left_with_you(started):
-    """The escalation stays on the record — it happened — and the banner stops claiming
-    the user still owes the decision they already took."""
+    """The escalation stays on the record"""
     store, wo, aid = _escalated(started)
 
     store.review_assumption(aid, "accepted", reason="fine")
@@ -1326,7 +1140,7 @@ def test_an_accepted_assumption_is_no_longer_left_with_you(started):
 
 
 def test_a_rejected_assumption_says_rejected_and_not_accepted(started):
-    """The status column is interpolated, not hard-coded."""
+    """The status column is interpolated, not hard-coded"""
     store, wo, aid = _escalated(started)
 
     store.review_assumption(aid, "rejected", reason="no")
@@ -1337,14 +1151,14 @@ def test_a_rejected_assumption_says_rejected_and_not_accepted(started):
 
 
 def test_a_still_pending_escalation_reads_exactly_as_before(started):
-    """The common case: nothing read, nothing appended."""
+    """The common case: nothing read, nothing appended"""
     store, wo, _aid = _escalated(started)
 
     assert "since " not in _line(store, wo["id"])
 
 
 def test_a_decision_the_os_took_is_not_credited_to_the_user(started):
-    """One attribution renderer, asserted as one: `ops.assumption_decider`."""
+    """One attribution renderer, asserted as one: `ops.assumption_decider`"""
     from jarvis.project_store import ASSUMPTION_DECIDER_OS
 
     store, wo, aid = _escalated(started)
@@ -1359,7 +1173,7 @@ def test_a_decision_the_os_took_is_not_credited_to_the_user(started):
 
 
 def test_an_event_written_before_the_payload_carried_the_id_is_unchanged(started):
-    """Unresolvable, and a banner is not the place to guess."""
+    """Unresolvable, and a banner is not the place to guess"""
     wo = ops.create_work_order("proj_a", "older event")
     store = ProjectStore(started.catalog.project("proj_a").path)
     store.add_event(wo["id"], "autoreview_escalated",
@@ -1371,10 +1185,7 @@ def test_an_event_written_before_the_payload_carried_the_id_is_unchanged(started
 
 def test_a_work_order_cancelled_while_neo_is_thinking_is_not_settled_and_re_landed(
         started):
-    """The same gap by another door. `decide` condition 2 is checked against the work
-    order's status at ASK time; the order can be cancelled before the ruling lands, and
-    settling it would clear the assumptions of an order nobody is waiting on and push it
-    back through `ops.land_when_cleared`."""
+    """The same gap by another door"""
     store, wo = park(started, auto_review=True,
                      assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
     ask(started, store)
@@ -1386,17 +1197,13 @@ def test_a_work_order_cancelled_while_neo_is_thinking_is_not_settled_and_re_land
     assert row["status"] == "pending" and not row["decided_by"]
     assert store.get_work_order(wo["id"])["status"] == "cancelled"
     assert events(store, wo["id"], "autoreview_accepted") == []
-    # `_note_autoreview_held` drops `status` at the ASK site, where it is unreachable.
-    # Here it is the whole reason, and suppressing it would leave the OS's decision not
-    # to act as the one thing it never wrote down.
+    # `_note_autoreview_held` drops `status` at the ASK site, where it is unreachable
     (held,) = events(store, wo["id"], "autoreview_held")
     assert held["code"] == autoreview.HELD_STATUS and "cancelled" in held["reason"]
 
 
 def test_permission_revoked_while_neo_is_thinking_stops_the_settle(started):
-    """The switch is read at the settle as well as at the ask. A user who turns
-    `validation.auto_review` off has withdrawn the authority the ruling was spending, and
-    a ruling already paid for is not a reason to spend it anyway."""
+    """The switch is read at the settle as well as at the ask"""
     store, wo = park(started, auto_review=True,
                      assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
     ask(started, store)
@@ -1411,9 +1218,7 @@ def test_permission_revoked_while_neo_is_thinking_stops_the_settle(started):
 
 
 def test_nothing_having_changed_the_second_check_lets_the_ruling_through(started):
-    """The control. A guard that held everything would pass all four tests above and
-    break the feature, so the arming path is asserted from the same fixture — one
-    `park`, one `ask`, one `drain`, nothing touched in between."""
+    """The control"""
     store, wo = park(started, auto_review=True,
                      assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
     ask(started, store)
@@ -1426,11 +1231,7 @@ def test_nothing_having_changed_the_second_check_lets_the_ruling_through(started
 
 
 def test_the_question_being_delivered_does_not_block_its_own_settle():
-    """`asked_question_id` at the unit level, and it is the reason the second `decide`
-    call says anything at all. Condition 6 exists to stop a SECOND question being filed;
-    at the settle site the assumption is linked to the very question being delivered, so
-    that link must not read as "already with Neo" — while a link to a DIFFERENT question
-    still holds, because two rulings on one assumption is a state nobody designed."""
+    """`asked_question_id` at the unit level"""
     linked = assumption(neo_question_id=41)
 
     assert decide(assumption=linked).code == autoreview.HELD_ASKED
@@ -1438,14 +1239,12 @@ def test_the_question_being_delivered_does_not_block_its_own_settle():
     assert decide(assumption=linked, asked_question_id=42).code == autoreview.HELD_ASKED
 
 
-# -- the refusals that were already there, left honest ---------------------------------
+# -- the refusals that were already there, left honest
 
 
 def test_ack_and_done_refuse_while_an_assumption_is_pending_and_stop_once_it_is_not(
         started):
-    """CHECKED RATHER THAN ASSUMED, as the work order asked. Both refuse on PENDING
-    assumptions, so an auto-accepted one simply stops being pending and neither path
-    needs a special case — this is the test that says so, from both sides."""
+    """CHECKED RATHER THAN ASSUMED, as the work order asked"""
     store, wo = park(started, auto_review=True,
                      assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
 
@@ -1457,21 +1256,15 @@ def test_ack_and_done_refuse_while_an_assumption_is_pending_and_stop_once_it_is_
     ask(started, store)
     drain(started)
 
-    # Neither refusal was widened, narrowed or given a branch for this: the fact they
-    # guard is gone, so they let it through.
+    # Neither refusal was widened, narrowed or given a branch for this: the fact they guard is gone
     assert ops.mark_done(wo["id"])["status"] == "completed"
 
 
-# -- the two mechanisms together -------------------------------------------------------
+# -- the two mechanisms together
 
 
 def merge_gate(store, wo_id: str) -> None:
-    """Approve the `auto_merge` gate the poll files, the way Neo's drain would.
-
-    Done directly rather than through the fake's reviewer so that this test is about the
-    HANDOFF between the two mechanisms and not about the merge gate, which
-    `tests/test_automerge.py` covers in full.
-    """
+    """Approve the `auto_merge` gate the poll files, the way Neo's drain would"""
     from jarvis import gates
 
     (approval,) = [a for a in store.list_approvals(wo_id)
@@ -1481,9 +1274,7 @@ def merge_gate(store, wo_id: str) -> None:
 
 def test_an_order_with_an_assumption_reaches_merged_with_nobody_typing_anything(
         started, fake_gh, local_base):
-    """THE WHOLE POINT, end to end: assumption -> Neo -> settled -> parked -> gate ->
-    merged, and no `automerge` condition was weakened to get there. Condition 3 passes
-    because the assumption is genuinely no longer pending."""
+    """THE WHOLE POINT, end to end: assumption -> Neo -> settled -> parked -> gate -> merged"""
     from jarvis import automerge
 
     store, wo = park(started, auto_review=True, auto_merge=True,
@@ -1505,12 +1296,10 @@ def test_an_order_with_an_assumption_reaches_merged_with_nobody_typing_anything(
     assert [c for c in fake_gh.calls if c["argv"][:2] == ["pr", "merge"]]
     assert store.get_work_order(wo["id"])["status"] == "completed"
     assert events(store, wo["id"], "automerge_merged")
-    # The assumption did not go quiet — it was decided, by the OS, on the record.
+    # The assumption did not go quiet — it was decided, by the OS, on the record
     (row,) = store.all_assumptions(wo["id"])
     assert row["status"] == "accepted" and row["decided_by"] == autoreview.DECIDER
-    # And the merge decision still HOLDS on a pending assumption: nothing was
-    # special-cased away. Re-asserted here rather than only in the sibling file, because
-    # this is the test that would tempt somebody to weaken it.
+    # And the merge decision still HOLDS on a pending assumption: nothing was special-cased away
     held = automerge.decide({"id": 1, "round": 1, "outcome": "passed",
                              "head_sha": JUDGED},
                             {**store.get_work_order(wo["id"]),
@@ -1521,8 +1310,7 @@ def test_an_order_with_an_assumption_reaches_merged_with_nobody_typing_anything(
 
 
 def test_with_auto_review_off_the_same_order_still_waits_for_the_user(started, fake_gh):
-    """THE NEGATIVE HALF, identical in every other respect. Without this the test above
-    is green on a work order that never had a pending assumption at all."""
+    """THE NEGATIVE HALF, identical in every other respect"""
     store, wo = park(started, auto_review=False, auto_merge=True,
                      assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
     fake_gh.set_pr(PR, "OPEN", checks=[{"__typename": "CheckRun", "name": "unit",
@@ -1542,7 +1330,7 @@ def test_with_auto_review_off_the_same_order_still_waits_for_the_user(started, f
     assert store.get_work_order(wo["id"])["needs_attention"]
 
 
-# -- the switch ------------------------------------------------------------------------
+# -- the switch
 
 
 def test_the_fleet_default_ships_off_and_a_project_inherits_it(catalog_file):
@@ -1552,8 +1340,7 @@ def test_the_fleet_default_ships_off_and_a_project_inherits_it(catalog_file):
 
 
 def test_a_project_keeps_its_own_answer_over_the_fleets(tmp_path):
-    """Authority is granted one project at a time: a project that never opted in is
-    never decided for, however the fleet is configured."""
+    """Authority is granted one project at a time: a project that never opted in is never decided for"""
     path = tmp_path / "catalog.json"
     path.write_text(json.dumps({
         "os": {"validation": {"enabled": True, "auto_review": True}},
@@ -1569,9 +1356,7 @@ def test_a_project_keeps_its_own_answer_over_the_fleets(tmp_path):
 
 def test_a_project_opts_in_through_the_same_cli_as_every_other_safety_setting(
         started, catalog_file):
-    """Not a constant and not an environment variable: the ordinary config console, and
-    — because `*.validation.*` already covers it — with the mandatory `--reason` and a
-    recorded version that every safety key carries."""
+    """Not a constant and not an environment variable: the ordinary config console, and"""
     assert ops.safety_key("projects.proj_a.validation.auto_review")
     with pytest.raises(ops.OpsError):
         ops.set_config("validation.auto_review", True, project="proj_a",
@@ -1586,11 +1371,7 @@ def test_a_project_opts_in_through_the_same_cli_as_every_other_safety_setting(
 
 
 def test_correcting_the_ruling_teaches_neo_without_reopening_the_work_order(started):
-    """THE CORRECTION PATH, which is what makes a machine decision reversible — and it is
-    the command the OS's own inbox row tells the user to run, so its failure mode is not
-    a corner. `neo_review` forwards a correction to the worker whenever the work order is
-    not terminal, and an auto-reviewed one is typically `waiting_pr_merge`: without the
-    guard, teaching Neo would start a turn on an order nobody asked to reopen."""
+    """THE CORRECTION PATH, which is what makes a machine decision reversible"""
     store, wo = park(started, auto_review=True,
                      assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
     ask(started, store)
@@ -1611,11 +1392,7 @@ def test_correcting_the_ruling_teaches_neo_without_reopening_the_work_order(star
 
 
 def test_the_user_cannot_answer_an_escalated_assumption_into_a_finished_worker(started):
-    """The mirror of the alarm refusal. Nobody asked this question and the worker
-    finished long before it was filed, so `jarvis neo answer` would start a turn on a
-    work order nobody asked to reopen — and the verdict the user means has its own
-    command. The pair is the empty message queue: an error message alone is green on a
-    path that never delivered anything anyway."""
+    """The mirror of the alarm refusal"""
     store, wo = park(started, auto_review=True)
     ask(started, store)
     drain(started)                       # the fake escalates by default
@@ -1628,14 +1405,11 @@ def test_the_user_cannot_answer_an_escalated_assumption_into_a_finished_worker(s
     assert store.pending_assumptions(wo["id"])
 
 
-# -- the stale-escalation sweep --------------------------------------------------------
+# -- the stale-escalation sweep
 
 
 def test_a_question_the_user_answered_another_way_stops_asking_for_a_ruling(started):
-    """Adding a Neo question kind is seven edits (kn-4edb0eb7), and this is the fourth
-    (`invariants.check_neo_escalations_are_live`). The user answers an escalated
-    assumption question with `jarvis wo review`, which never touches the question — so
-    without this it goes on asking for a ruling that has already been given."""
+    """Adding a Neo question kind is seven edits (kn-4edb0eb7)"""
     from jarvis import invariants
 
     store, wo = park(started, auto_review=True)
@@ -1655,11 +1429,7 @@ def test_a_question_the_user_answered_another_way_stops_asking_for_a_ruling(star
 
 
 def test_an_assumption_still_waiting_on_the_user_is_not_swept(started):
-    """THE HALF THAT MATTERS MORE, and the one a sweep gets wrong in the dangerous
-    direction. `_stale_assumption_question` closes a question whose assumption has been
-    settled; a version that closed one whose assumption is STILL PENDING would silently
-    retire a live escalation — the user would never see the decision they are owed, and
-    nothing would say it had gone."""
+    """THE HALF THAT MATTERS MORE, and the one a sweep gets wrong in the dangerous direction"""
     from jarvis import invariants
 
     store, wo = park(started, auto_review=True)
@@ -1679,10 +1449,7 @@ def test_an_assumption_still_waiting_on_the_user_is_not_swept(started):
 
 
 def test_another_projects_assumption_question_is_left_alone(started):
-    """The rule all four siblings share, stated in `_stale_assumption_question`: the
-    checks run per project against an OS-WIDE `neo.db`, so "no such assumption here" is
-    how another project's rows are skipped — and it cannot be told apart from a subject
-    that has gone. A missing row must therefore be left alone, not swept."""
+    """The rule all four siblings share"""
     from jarvis import invariants
 
     store, _wo = park(started, auto_review=True)
@@ -1704,19 +1471,17 @@ def test_another_projects_assumption_question_is_left_alone(started):
         neo_store.close()
 
 
-# -- what the OS did with EACH assumption, on both surfaces (GitHub issue #712) --------
+# -- what the OS did with EACH assumption, on both surfaces (GitHub issue #712)
 
 
 def rulings(store, wo_id: str) -> list[str]:
-    """Every assumption's ruling line, in order, as a person reads it."""
+    """Every assumption's ruling line, in order, as a person reads it"""
     return [ops.assumption_ruling_line(a)
             for a in ops.assumptions_with_rulings(store, wo_id)]
 
 
 def test_a_held_assumption_says_what_held_it_and_an_asked_one_says_it_is_out(started):
-    """THE DEFECT: a pending assumption the OS had already ruled on read exactly like one
-    nobody had looked at. The hold reason is a timeline event and not a column, so this
-    is also the assertion that the derivation reaches the row."""
+    """THE DEFECT: a pending assumption the OS had already ruled on read exactly like one nobody had..."""
     store, wo = park(started, auto_review=True,
                      assumptions=("reused the production api key", ROUTINE))
 
@@ -1724,15 +1489,14 @@ def test_a_held_assumption_says_what_held_it_and_an_asked_one_says_it_is_out(sta
 
     held, asked = rulings(store, wo["id"])
     assert held.startswith("Held by the OS — mentions 'production'")
-    # The number is on the row already; repeating it inside the reason is not a ruling.
+    # The number is on the row already; repeating it inside the reason is not a ruling
     assert "assumption #1" not in held
     (q,) = questions()
     assert asked == f"Asked Neo (question {q['id']}), awaiting ruling"
 
 
 def test_an_escalation_carries_neos_reason_and_its_question(started):
-    """What the user has to decide, beside the assumption they have to decide it on —
-    instead of buried in the timeline."""
+    """What the user has to decide, beside the assumption they have to decide it on"""
     store, wo = park(started, auto_review=True)
     ask(started, store)
     (q,) = questions()
@@ -1745,8 +1509,7 @@ def test_an_escalation_carries_neos_reason_and_its_question(started):
 
 
 def test_an_assumption_nobody_has_looked_at_says_nothing_at_all(started):
-    """`''` IS A FACT, and a different one from a hold: an opted-out project's
-    assumptions must not grow a line about a mechanism it does not have."""
+    """`''` IS A FACT, and a different one from a hold: an opted-out project's assumptions must not grow a..."""
     store, wo = park(started, auto_review=False)
 
     ask(started, store)
@@ -1755,8 +1518,7 @@ def test_an_assumption_nobody_has_looked_at_says_nothing_at_all(started):
 
 
 def test_a_settled_assumption_carries_the_reason_it_was_settled(started):
-    """The acceptance reason is part of the ruling too — `jarvis wo show` had it and the
-    page hid it in a `title=`."""
+    """The acceptance reason is part of the ruling too"""
     store, wo = park(started, auto_review=True,
                      assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
     ask(started, store)
@@ -1767,8 +1529,7 @@ def test_a_settled_assumption_carries_the_reason_it_was_settled(started):
 
 
 def test_wo_show_carries_every_ruling_and_not_just_the_last_one(started, capsys):
-    """THE SURFACE, and the half the summary line cannot do: `auto_review:` says what the
-    mechanism did LAST, so on a three-assumption order two rulings were invisible."""
+    """THE SURFACE, and the half the summary line cannot do: `auto_review:` says what the mechanism did..."""
     from jarvis import cli
 
     store, wo = park(started, auto_review=True,
@@ -1788,18 +1549,12 @@ def test_wo_show_carries_every_ruling_and_not_just_the_last_one(started, capsys)
     capsys.readouterr()
     cli.main(["wo", "show", wo["id"], "--json"])
     rows = json.loads(capsys.readouterr().out)["assumptions"]
-    # `--json` keeps the payload, not the prose: whoever reads it reads the event.
+    # `--json` keeps the payload, not the prose: whoever reads it reads the event
     assert rows[0]["os_ruling"]["code"] == autoreview.HELD_HIGH_STAKES
 
 
 def test_the_cli_points_at_the_round_and_only_for_a_panel_hold(started, capsys):
-    """WHERE TO READ THE FULL PANEL REASON, on the surface that cannot carry a URL. The
-    pointer is per-surface by construction: `ops.assumption_ruling_line` is pure and
-    shared, so a `jarvis …` command in the reason would be printed inside an HTML page.
-
-    TWO ORDERS, because one cannot render both holds as its newest: `decide` checks the
-    panel before the stakes net, so under an escalated round every row holds on the panel.
-    """
+    """WHERE TO READ THE FULL PANEL REASON, on the surface that cannot carry a URL"""
     from jarvis import cli
 
     store, gave_up = park(started, auto_review=True, outcome="escalated")
@@ -1817,29 +1572,26 @@ def test_the_cli_points_at_the_round_and_only_for_a_panel_hold(started, capsys):
     (summary,) = [l for l in out.splitlines() if "auto_review" in l]
     assert summary.rstrip().endswith(pointer)
 
-    # ...and NOT on a hold whose subject is not a round.
+    # ...and NOT on a hold whose subject is not a round
     capsys.readouterr()
     cli.main(["wo", "show", stakes_hold["id"]])
     other = capsys.readouterr().out
     assert "mentions 'production'" in other and "jarvis validation show" not in other
 
-    # `--json` keeps the rows untouched, which is what that function promises.
+    # `--json` keeps the rows untouched, which is what that function promises
     capsys.readouterr()
     cli.main(["wo", "show", gave_up["id"], "--json"])
     assert "jarvis validation show" not in capsys.readouterr().out
 
 
-# -- a question Neo never answered is not a question in flight -------------------------
-#
-# docs/superpowers/specs/2026-09-26-an-unreachable-neo-question-is-not-a-question-in-
-# flight.md. GitHub issue #788.
+# -- a question Neo never answered is not a question in flight
 
 
 LAST_ERROR = "connection reset by peer"
 
 
 def _kill(question_id: int) -> None:
-    """Spend the ladder on one question: `failed`, stamped `UNREACHABLE_PREFIX`."""
+    """Spend the ladder on one question: `failed`, stamped `UNREACHABLE_PREFIX`"""
     neo_store = NeoStore()
     try:
         assert neo_store.release_claim(question_id, LAST_ERROR,
@@ -1849,7 +1601,7 @@ def _kill(question_id: int) -> None:
 
 
 def _unreachable_ask(daemon):
-    """A parked order whose assumption is linked to a question nobody will ever answer."""
+    """A parked order whose assumption is linked to a question nobody will ever answer"""
     store, wo = park(daemon, auto_review=True)
     ask(daemon, store)
     (q,) = questions()
@@ -1858,7 +1610,7 @@ def _unreachable_ask(daemon):
 
 
 def _unreachable_confirmation(daemon):
-    """The same on the `confirm: True` link, written by its real writer."""
+    """The same on the `confirm: True` link, written by its real writer"""
     store, wo = park(daemon, auto_review=True)
     rows = store.all_assumptions(wo["id"])
     neo_store = NeoStore()
@@ -1871,8 +1623,7 @@ def _unreachable_confirmation(daemon):
 
 
 def test_an_unreachable_ask_reads_as_the_users_and_not_as_awaiting_ruling(started):
-    """THE SYMPTOM: `autoreview_asked` is append-only, so the row claimed a ruling was on
-    its way for the life of the work order. The question is dead and the line says so."""
+    """THE SYMPTOM: `autoreview_asked` is append-only"""
     store, wo, q = _unreachable_ask(started)
 
     (line,) = rulings(store, wo["id"])
@@ -1884,12 +1635,12 @@ def test_an_unreachable_ask_reads_as_the_users_and_not_as_awaiting_ruling(starte
     assert f"jarvis wo review {wo['id']}" in line
     assert line.endswith(f"— last error: {LAST_ERROR} (after 0 retries — nobody has "
                          f"judged this)")
-    # A crash is not a decision: neither word may appear.
+    # A crash is not a decision: neither word may appear
     assert "escalated" not in line and "Neo decided" not in line
 
 
 def test_an_unreachable_confirmation_says_what_was_never_confirmed(started):
-    """Both links, one branch — `propose_confirmation` writes `autoreview_asked` too."""
+    """Both links, one branch — `propose_confirmation` writes `autoreview_asked` too"""
     store, wo, q = _unreachable_confirmation(started)
 
     (line,) = rulings(store, wo["id"])
@@ -1900,8 +1651,7 @@ def test_an_unreachable_confirmation_says_what_was_never_confirmed(started):
 
 
 def test_the_summary_line_puts_an_unreachable_ask_back_with_the_user(started):
-    """The same derivation on `jarvis wo show`'s one line, in `left with you`'s words so
-    it sorts with the other two claims of that shape."""
+    """The same derivation on `jarvis wo show`'s one line"""
     store, wo, q = _unreachable_ask(started)
 
     line = _line(store, wo["id"])
@@ -1909,13 +1659,12 @@ def test_the_summary_line_puts_an_unreachable_ask_back_with_the_user(started):
     assert line == (f"assumption #1 left with you — Neo could not be reached "
                     f"(question {q['id']}); nobody judged it")
     assert "is with Neo" not in line
-    # The row is still pending, so there is nothing to resolve it against.
+    # The row is still pending, so there is nothing to resolve it against
     assert "since " not in line
 
 
 def test_a_dead_question_re_arms_the_assumption_it_was_asked_on():
-    """Condition 6's mandate is unchanged — one question per assumption — because a
-    `failed` question is not a question any more."""
+    """Condition 6's mandate is unchanged"""
     a = assumption(neo_question_id=41)
 
     assert decide(assumption=a, unreachable_question_ids=(41,)).armed
@@ -1925,7 +1674,7 @@ def test_a_dead_question_re_arms_the_assumption_it_was_asked_on():
 
 
 def test_the_early_pass_re_arms_on_a_dead_link_too():
-    """`decide_early` reaches one on an order that is still `running`."""
+    """`decide_early` reaches one on an order that is still `running`"""
     a = assumption(neo_question_id=41)
     wo = {**WO, "status": "running"}
 
@@ -1936,8 +1685,7 @@ def test_the_early_pass_re_arms_on_a_dead_link_too():
 
 @pytest.mark.parametrize("status", ["queued", "answering", "answered", "escalated"])
 def test_a_question_that_is_genuinely_in_flight_is_never_in_the_set(started, status):
-    """Only `failed` means nobody judged it: `escalated` is Neo handing the question back
-    WITH a decision, and the other three are out or already delivered."""
+    """Only `failed` means nobody judged it: `escalated` is Neo handing the question back WITH a decision"""
     store, wo = park(started, auto_review=True)
     ask(started, store)
     (q,) = questions()
@@ -1954,7 +1702,7 @@ def test_a_question_that_is_genuinely_in_flight_is_never_in_the_set(started, sta
 
 
 def test_the_set_names_a_dead_link_of_either_kind(started):
-    """What the daemon supplies, read off both columns."""
+    """What the daemon supplies, read off both columns"""
     store, wo, q = _unreachable_ask(started)
     (row,) = store.all_assumptions(wo["id"])
     store.link_assumption_confirmation(row["id"], q["id"])
@@ -1969,8 +1717,7 @@ def test_the_set_names_a_dead_link_of_either_kind(started):
 
 
 def test_an_outage_that_ends_lets_the_assumption_be_asked_about_again(started):
-    """The whole point: the daemon asks again once the question is dead, on the pass that
-    would otherwise hold it for the life of the order."""
+    """The whole point: the daemon asks again once the question is dead"""
     store, wo, dead = _unreachable_ask(started)
 
     ask(started, store)
@@ -1982,14 +1729,7 @@ def test_an_outage_that_ends_lets_the_assumption_be_asked_about_again(started):
 
 
 def test_a_second_outage_on_the_re_asked_question_re_arms_it_again(started):
-    """THE LOOP #788 asked to be made safe: re-arming is not a one-shot. A dead question
-    is replaced by one that ALSO dies, and the assumption is asked about a third time
-    rather than being stuck behind the replacement for the life of the order — while the
-    ask still costs at most one question per tick, so an outage cannot become spam.
-
-    docs/superpowers/specs/2026-09-26-an-unreachable-neo-question-is-not-a-question-in-
-    flight.md §4.
-    """
+    """THE LOOP #788 asked to be made safe: re-arming is not a one-shot"""
     store, wo, first = _unreachable_ask(started)
 
     ask(started, store)
@@ -2004,21 +1744,15 @@ def test_a_second_outage_on_the_re_asked_question_re_arms_it_again(started):
     (row,) = store.all_assumptions(wo["id"])
     assert row["neo_question_id"] == third, "the link still points at a dead question"
 
-    # THE SAFETY: the live question holds the next pass, so the ask does not multiply.
+    # THE SAFETY: the live question holds the next pass, so the ask does not multiply
     ask(started, store)
     assert sorted(q["id"] for q in questions()) == ids
     assert len(events(store, wo["id"], "autoreview_asked")) == 3
-    # `HELD_ASKED` is suppressed (`_holds_not_recorded`): the question IS filed.
+    # `HELD_ASKED` is suppressed (`_holds_not_recorded`): the question IS filed
     assert events(store, wo["id"], "autoreview_held") == []
 
 
-# -- the decision record: the order's own rulings reach the packet ----------------------
-#
-# docs/superpowers/specs/2026-09-28-an-assumption-review-reads-the-orders-own-rulings.md.
-#
-# THE DEFECT: the reviewer escalated asking the user to re-decide something already
-# decided on the same work order, because no answered question, no user message and no
-# user ruling on a sibling was ever in the packet.
+# -- the decision record: the order's own rulings reach the packet
 
 
 def qrow(**over) -> dict:
@@ -2029,12 +1763,7 @@ def qrow(**over) -> dict:
 
 
 class FakeNeo:
-    """`answered_questions` and `get`, the two reads the record makes. Rows are given
-    newest-first, as the query returns them; `others` exist but are not answered here.
-
-    `window` is a HARD bound on the query independent of the `limit` the caller asks for:
-    whatever the caller's row bound, a cited ruling can fall outside the rows it got back,
-    and that case is the one that used to read as `not answered`."""
+    """`answered_questions` and `get`, the two reads the record makes"""
 
     def __init__(self, *rows: dict, others: tuple[dict, ...] = (),
                  window: int | None = None):
@@ -2084,10 +1813,7 @@ def record(*rows: dict, messages: tuple[dict, ...] = (), siblings=None,
 
 
 def test_an_answered_question_reaches_the_packet_with_its_id_and_who_answered():
-    """Test 1. Q900 escalated citing "a user correction I can't see" — the user's own
-    answer to a question on the SAME work order. Both facts have to be there: the id, so
-    the reviewer can cite it, and WHO answered, because the user and Neo are different
-    authority and Q879 turned on not knowing which."""
+    """Test 1"""
     out = record(qrow(answered_by="user", answer="build NO kill remedy"))
 
     assert "Q887" in out
@@ -2096,8 +1822,7 @@ def test_an_answered_question_reaches_the_packet_with_its_id_and_who_answered():
 
 
 def test_a_corrected_neo_answer_carries_the_correction_that_overrode_it():
-    """A corrected Neo answer is not authority on its own: `neo_store.review` leaves the
-    user's feedback as the only ruling that survived."""
+    """A corrected Neo answer is not authority on its own: `neo_store.review` leaves the user's feedback..."""
     out = record(qrow(review_status="corrected",
                       review_feedback="no — always ask first"))
 
@@ -2105,16 +1830,14 @@ def test_a_corrected_neo_answer_carries_the_correction_that_overrode_it():
 
 
 def test_an_empty_record_says_so_rather_than_going_silent():
-    """"No prior decisions" and "prior decisions I was not shown" must not read alike: a
-    reviewer that cannot tell them apart is right to escalate."""
+    """"No prior decisions" and "prior decisions I was not shown" must not read alike: a reviewer that..."""
     assert autoreview.decision_record(FakeStore(), FakeNeo(), "wo-1", []) == ""
     assert "(no prior decisions recorded)" in autoreview._ruling_question(   # noqa: SLF001
         "p", WO, assumption(), [])
 
 
 def test_the_record_is_capped_newest_first_and_says_what_it_dropped():
-    """Test 2. The omission is stated, and LAST (kn-1485b845). Going silent is the
-    failure this whole spec is about."""
+    """Test 2"""
     rows = [qrow(id=900 - i, ts=100.0 - i, answer=f"ruling {i} " + "x" * 800)
             for i in range(12)]
     out = record(*rows)
@@ -2126,8 +1849,7 @@ def test_the_record_is_capped_newest_first_and_says_what_it_dropped():
 
 
 def test_a_smaller_per_project_cap_evicts_more():
-    """The cap is a per-project catalog key (`validation.decision_record_chars`), so the
-    bound one project's reviewer reads is the bound that project set."""
+    """The cap is a per-project catalog key (`validation.decision_record_chars`)"""
     rows = [qrow(id=900 - i, ts=100.0 - i, answer=f"ruling {i} " + "x" * 800)
             for i in range(12)]
     tight = autoreview.decision_record(FakeStore(), FakeNeo(*rows), "wo-1", [],
@@ -2139,8 +1861,7 @@ def test_a_smaller_per_project_cap_evicts_more():
 
 
 def test_a_cited_question_is_placed_first_in_full_and_never_evicted():
-    """Test 3. Q900 escalated naming a question id it could not see. That row is the one
-    item most likely to be why the packet exists, so the cap does not reach it."""
+    """Test 3"""
     long_answer = "the user said: " + "y" * 3000
     cited = qrow(id=887, ts=1.0, answer=long_answer)
     fillers = [qrow(id=900 - i, ts=500.0 - i, answer="z" * 900) for i in range(10)]
@@ -2152,9 +1873,7 @@ def test_a_cited_question_is_placed_first_in_full_and_never_evicted():
 
 
 def test_a_cited_question_answered_outside_the_query_window_is_shown_in_full():
-    """§4. An ANSWERED ruling the row bound cut out of `answered_questions` used to be
-    rendered `not answered`, and the persona escalates on that line — #832 reproduced on
-    the exact path this feature exists for. The row's own `status` decides."""
+    """§4 (#832)"""
     cited = qrow(id=887, ts=1.0, answer="the user said: keep the shim")
     newer = [qrow(id=900 - i, ts=500.0 - i, answer=f"ruling {i}") for i in range(3)]
     cites = assumption(content="per Neo question 887, kept the shim")
@@ -2166,8 +1885,7 @@ def test_a_cited_question_answered_outside_the_query_window_is_shown_in_full():
 
 
 def test_short_items_the_cap_evicts_are_counted_exactly():
-    """The omission line names the count the CAP evicted, with no hedge: the cap is a
-    number this code knows."""
+    """The omission line names the count the CAP evicted"""
     rows = [qrow(id=900 - i, ts=100.0 - i, answer=f"ruling {i}") for i in range(5)]
     out = record(*rows, siblings=[], chars=200)
 
@@ -2179,9 +1897,7 @@ def test_short_items_the_cap_evicts_are_counted_exactly():
 
 
 def test_rows_the_row_bound_cut_are_counted_in_the_same_omission_line(monkeypatch):
-    """§3. Rows the query's LIMIT cut never enter `items`, so a record that FITS under the
-    character cap used to print no omission line at all — the "no prior decisions" versus
-    "decisions I was not shown" silence kn-1485b845 forbids. One line, every cause."""
+    """§3"""
     monkeypatch.setattr(autoreview, "_ANSWERED_ROWS", 3)
     rows = [qrow(id=900 - i, ts=100.0 - i, answer=f"ruling {i}") for i in range(6)]
     out = record(*rows, siblings=[])
@@ -2202,8 +1918,7 @@ def test_every_field_spelling_of_a_question_id_is_recognised(cite):
 
 
 def test_only_the_assumption_being_ruled_on_contributes_citations():
-    """The user's ruling on the recorded assumption: each order cites its OWN questions,
-    not its siblings'. A sibling naming an id is that sibling's business."""
+    """The user's ruling on the recorded assumption: each order cites its OWN questions, not its siblings'"""
     ruling_on = assumption(id=20, n=6, content="per Q906, kept the shim")
     siblings = [assumption(id=i, n=i, content=f"decided per Q{900 + i}")
                 for i in range(1, 6)] + [ruling_on]
@@ -2219,9 +1934,82 @@ def test_only_the_assumption_being_ruled_on_contributes_citations():
     assert "Q905" not in out
 
 
+#: Spec §4a: a sibling reference is keyword-anchored, and a bare `#n` matches nothing
+def test_a_cited_sibling_assumption_renders_with_its_ruling():
+    """Test 5"""
+    sibling = assumption(id=9, n=3, status="approved", decided_by="user",
+                         decided_reason="CSV is what the exporter already writes",
+                         content="wrote the header row")
+    cites = assumption(id=10, n=4, content="Per assumption #3, quoted every field")
+    out = record(siblings=[sibling, cites], ruling_on=cites)
+
+    assert "#3" in out
+    assert "wrote the header row" in out
+    assert "approved" in out
+    assert "by the user" in out
+    assert "CSV is what the exporter already writes" in out
+
+
+def test_several_siblings_cited_in_one_phrase_all_resolve():
+    first = assumption(id=9, n=2, content="wrote the header row")
+    second = assumption(id=11, n=3, content="quoted every field")
+    cites = assumption(id=10, n=4, content="Per assumptions 2 and 3, kept the shim")
+    out = record(siblings=[first, second, cites], ruling_on=cites)
+
+    assert "wrote the header row" in out and "quoted every field" in out
+
+
+def test_a_cited_high_stakes_sibling_is_still_withheld():
+    """Test 5's second half: citing a sibling does not lift the withholding net"""
+    sibling = assumption(id=9, n=3, status="pending",
+                         content="deleted the production database dump")
+    cites = assumption(id=10, n=4, content="Per assumption #3, kept the shim")
+    out = record(siblings=[sibling, cites], ruling_on=cites)
+
+    assert "production database dump" not in out
+    assert "withheld" in out
+
+
+def test_a_bare_number_in_the_text_cites_nothing():
+    """Test 7: `issue #832` and `PR #1090` are not references"""
+    sibling = assumption(id=9, n=2, content="wrote the header row")
+    cites = assumption(id=10, n=4, content="Followed issue #832 and PR #2, per #2")
+    out = record(siblings=[sibling, cites], ruling_on=cites)
+
+    assert "wrote the header row" not in out
+
+
+def test_the_scanner_is_keyword_anchored_for_both_kinds():
+    assert autoreview.cited_question_ids("per Q887 and neo question 888") == [887, 888]
+    assert autoreview.cited_question_ids("issue #832 and PR #1090") == []
+    assert autoreview.cited_sibling_ns("per assumption #2") == [2]
+    assert autoreview.cited_sibling_ns("per assumptions 2 and 3") == [2, 3]
+    assert autoreview.cited_sibling_ns("issue #832") == []
+
+
+def test_the_resolved_refs_on_the_ask_path_are_bounded_by_the_record_cap():
+    """Test 4's bound: `validation.decision_record_chars`, one resolver for both verbs"""
+    short = autoreview.cited_context(FakeNeo(qrow(id=887, answer="keep the shim")),
+                                     "wo-1", "Per Q887, and the footer?", [])
+    assert "Q887" in short and "keep the shim" in short
+
+    tight = autoreview.cited_context(
+        FakeNeo(qrow(id=887, answer="y" * 9000)), "wo-1", "Per Q887, and the footer?",
+        [], cfg=ValidationConfig(decision_record_chars=500))
+    assert "y" * 9000 not in tight
+    assert len(tight) < 1200
+
+
+def test_an_assumption_already_stored_over_the_cap_still_reviews():
+    """Test 9: the caps are write-time only — no length check in `autoreview`"""
+    stored = assumption(content="z" * 4000)
+    out = autoreview._ruling_question("p", WO, stored, [stored])   # noqa: SLF001
+
+    assert "z" * 4000 in out
+
+
 def test_a_cited_question_on_another_work_order_is_named_and_not_quoted():
-    """Content from a different order has not been through this order's evidence gates,
-    and a worker citing it does not make it this order's record."""
+    """Content from a different order has not been through this order's evidence gates"""
     cites = assumption(content="as Q887 decided")
     out = record(siblings=[cites], ruling_on=cites,
                  others=(qrow(id=887, wo_id="wo-9", answer="quoted elsewhere"),))
@@ -2232,8 +2020,7 @@ def test_a_cited_question_on_another_work_order_is_named_and_not_quoted():
 
 
 def test_a_cited_question_that_never_existed_is_stated_not_swallowed():
-    """A worker citing a question id that was never asked is a fact about the assumption
-    the reviewer is ruling on."""
+    """A worker citing a question id that was never asked is a fact about the assumption the reviewer is..."""
     cites = assumption(content="as Q887 decided")
     out = record(siblings=[cites], ruling_on=cites)
 
@@ -2241,9 +2028,7 @@ def test_a_cited_question_that_never_existed_is_stated_not_swallowed():
 
 
 def test_an_assumption_kind_row_is_a_one_liner_and_its_packet_is_never_requoted():
-    """Test 4. An `assumption` question row IS a review packet — description, diff and
-    sibling list. Quoting it is recursive and would spend the whole cap on one item. The
-    RULING is the payload (Q879's missing fact), so it is rendered, naming the sibling."""
+    """Test 4"""
     packet = "ASSUMPTION REVIEW — rule on assumption #4 " + "p" * 5000
     out = record(qrow(id=879, kind=autoreview.QUESTION_KIND, question=packet,
                       answer="approve — routine naming"),
@@ -2255,7 +2040,7 @@ def test_an_assumption_kind_row_is_a_one_liner_and_its_packet_is_never_requoted(
 
 
 def test_an_assumption_kind_row_whose_sibling_is_gone_still_reads_as_a_ruling():
-    """A ruling whose subject cannot be located is still a ruling."""
+    """A ruling whose subject cannot be located is still a ruling"""
     out = record(qrow(id=879, kind=autoreview.QUESTION_KIND, question="x" * 4000,
                       answer="approve"))
 
@@ -2263,8 +2048,7 @@ def test_an_assumption_kind_row_whose_sibling_is_gone_still_reads_as_a_ruling():
 
 
 def test_a_record_item_carrying_a_credential_is_withheld_not_dropped():
-    """Test 5. The secret net is the ONE net that runs here (§5). It names the SHAPE and
-    never the value, and withholds rather than dropping: silence is the bug."""
+    """Test 5"""
     out = record(qrow(answer='API_KEY = "sk-live-4a9f8c2b7d1e"'))
 
     assert "sk-live-4a9f8c2b7d1e" not in out
@@ -2272,10 +2056,7 @@ def test_a_record_item_carrying_a_credential_is_withheld_not_dropped():
 
 
 def test_an_answer_whose_credential_is_on_a_later_line_is_still_withheld():
-    """The net sees the field as the user typed it. `_ASSIGNMENT_RE` anchors at the start
-    of a LINE, so normalising the whitespace before the net runs makes an assignment on
-    every line but the first invisible — the payload-vs-rendered-line defect one step
-    earlier."""
+    """The net sees the field as the user typed it"""
     out = record(qrow(answer="Use this config:\npassword = hunter2-not-a-shape"))
 
     assert "hunter2-not-a-shape" not in out
@@ -2301,9 +2082,7 @@ def test_a_user_ruling_whose_credential_is_on_a_later_line_is_still_withheld():
 
 
 def test_a_high_stakes_wording_in_a_settled_ruling_is_shown_in_full():
-    """§5, on the user's own ruling on Neo question 943: the high-stakes net is NOT
-    applied here. Every item is settled by construction, so there is no decision left to
-    withhold — and hiding a ruling the user already gave is exactly the #832 bug."""
+    """§5, on the user's own ruling on Neo question 943: the high-stakes net is NOT applied here (#832)"""
     out = record(qrow(answered_by="user", answer="yes, delete the production rows"))
 
     assert "delete the production rows" in out
@@ -2317,9 +2096,7 @@ def test_a_user_message_on_the_order_reaches_the_record():
 
 
 def test_a_sibling_the_user_settled_carries_their_reason():
-    """Test 6. `jarvis wo review --feedback` writes the user's reasoning to
-    `decided_reason` — the `assumptions` table has no `review_feedback` column — with
-    `decided_by` naming who decided."""
+    """Test 6"""
     out = record(siblings=[
         assumption(),
         assumption(id=8, n=4, status="rejected", decided_by="",
@@ -2330,8 +2107,7 @@ def test_a_sibling_the_user_settled_carries_their_reason():
 
 
 def test_a_sibling_neo_settled_is_rendered_as_neos_not_the_users():
-    """Test 6's other half, and Q879's own case: Neo's verdict on a sibling reaches the
-    packet through its ANSWERED QUESTION row, never as a ruling of the user's."""
+    """Test 6's other half, and Q879's own case: Neo's verdict on a sibling reaches the packet through its..."""
     out = record(qrow(id=877, kind=autoreview.QUESTION_KIND, question="packet",
                       answer="approve — mechanical"),
                  siblings=[
@@ -2350,22 +2126,20 @@ RECORD_HEADER = "# What has already been decided on this work order"
 
 
 def test_propose_builds_the_section_with_no_daemon_and_no_model_call():
-    """Test 7. The record is built in `autoreview`, so the daemon changes not at all."""
+    """Test 7"""
     neo_ = FakeNeo(qrow(answered_by="user"))
 
     autoreview.propose(FakeStore(), neo_, "p", WO, assumption(), [assumption()])
 
     (packet,) = neo_.asked
     assert RECORD_HEADER in packet and "Q887" in packet
-    # After the sibling list, before the closing answer instructions.
+    # After the sibling list, before the closing answer instructions
     assert packet.index("do not rule on these") < packet.index(RECORD_HEADER)
     assert packet.index(RECORD_HEADER) < packet.index("Answer with `escalate`")
 
 
 def test_the_projects_own_cap_reaches_the_packet_both_passes_build():
-    """§3/§7. `cfg=cfg` is threaded from the daemon so the bound the reviewer reads is the
-    bound the PROJECT set; with only the `cfg=None` path covered, a per-project value could
-    stop arriving and every test still pass."""
+    """§3/§7"""
     rows = [qrow(id=900 - i, ts=100.0 - i, answer=f"ruling {i}") for i in range(5)]
     tight = ValidationConfig(decision_record_chars=200)
 
@@ -2384,7 +2158,7 @@ def test_the_projects_own_cap_reaches_the_packet_both_passes_build():
         assert "ruling 4" not in packet
 
 
-# -- the spec section the assumption cites (GitHub issue #1035) -------------------------
+# -- the spec section the assumption cites (GitHub issue #1035)
 
 
 SPEC_BODY = ("## 2. The remedy\n\nA worker that cannot reach the bus retries three "
@@ -2395,8 +2169,7 @@ CHILD = {"id": "wo-1", "status": "needs_review", "title": "t", "description": "d
 
 
 class SpecStore(FakeStore):
-    """`specs.spec_of`'s one read — the parent feature's stored plan. No database: the
-    packet builders must resolve the spec with the store they already hold."""
+    """`specs.spec_of`'s one read — the parent feature's stored plan"""
 
     def __init__(self, *messages: dict, doc: str = SPEC_DOC,
                  path: str = "docs/superpowers/specs/2026-10-13-bus.md"):
@@ -2411,7 +2184,7 @@ SPEC_HEADER = "# THE SPEC SECTION THIS WORK ORDER WAS BUILT TO"
 
 
 def builds(store, cfg=None):
-    """Both passes, each as a one-argument builder over a fresh `FakeNeo`."""
+    """Both passes, each as a one-argument builder over a fresh `FakeNeo`"""
     return (
         lambda neo_: autoreview.propose(store, neo_, "p", CHILD, assumption(),
                                         [assumption()], cfg=cfg),
@@ -2422,8 +2195,7 @@ def builds(store, cfg=None):
 
 
 def test_the_spec_section_reaches_both_packets_with_no_daemon_and_no_model_call():
-    """#1035: a reviewer asked to rule on an assumption that cites the spec was shown no
-    spec, and escalated with `evidence-insufficient`. Resolved inside `propose`."""
+    """#1035: a reviewer asked to rule on an assumption that cites the spec was shown no spec"""
     for build in builds(SpecStore()):
         neo_ = FakeNeo(qrow())
         build(neo_)
@@ -2431,14 +2203,13 @@ def test_the_spec_section_reaches_both_packets_with_no_daemon_and_no_model_call(
         assert SPEC_HEADER in packet
         assert "docs/superpowers/specs/2026-10-13-bus.md § 2. The remedy" in packet
         assert "retries three times and then parks" in packet
-        # The authority behind the brief: after it, before what was delivered.
+        # The authority behind the brief: after it, before what was delivered
         assert packet.index("# The work order it was recorded against") \
             < packet.index(SPEC_HEADER) < packet.index("# What the worker says it")
 
 
 def test_the_projects_own_spec_cap_binds_in_both_packets():
-    """`validation.assumption_spec_chars` is per project, so the bound the reviewer reads
-    is the bound that project set — never the module's."""
+    """`validation.assumption_spec_chars` is per project"""
     tight = ValidationConfig(assumption_spec_chars=40)
 
     for build in builds(SpecStore(), cfg=tight):
@@ -2452,8 +2223,7 @@ def test_the_projects_own_spec_cap_binds_in_both_packets():
 
 
 def test_a_section_over_the_budget_is_trimmed_with_a_marker_and_the_reference():
-    """Bounded-model-inputs §2: the reference rides whether or not anything was cut, and
-    what was cut says where the rest is."""
+    """Bounded-model-inputs §2: the reference rides whether or not anything was cut"""
     long_doc = f"# D\n\n## 2. The remedy\n\n{'x' * 9000}\n"
     neo_ = FakeNeo(qrow())
 
@@ -2467,9 +2237,8 @@ def test_a_section_over_the_budget_is_trimmed_with_a_marker_and_the_reference():
 
 
 def test_no_spec_section_says_so_explicitly_in_both_packets():
-    """An absent section must read as absent, not as silence: with nothing in the packet
-    a reviewer cannot tell a standalone order from a lost section."""
-    # `WO` has no `parent_id`, so `spec_of` returns None without touching the store.
+    """An absent section must read as absent"""
+    # `WO` has no `parent_id`, so `spec_of` returns None without touching the store
     for build in (
         lambda neo_: autoreview.propose(FakeStore(), neo_, "p", WO, assumption(),
                                         [assumption()]),
@@ -2483,8 +2252,7 @@ def test_no_spec_section_says_so_explicitly_in_both_packets():
 
 
 def test_a_spec_whose_named_section_does_not_resolve_is_not_the_same_as_none():
-    """Two different facts: this order was planned against a spec and its section could
-    not be found. Reading one as the other sends the reviewer to the wrong conclusion."""
+    """Two different facts: this order was planned against a spec and its section could not be found"""
     neo_ = FakeNeo(qrow())
 
     autoreview.propose(SpecStore(doc="# D\n\n## 9. Elsewhere\n\nno.\n"), neo_, "p",
@@ -2495,8 +2263,7 @@ def test_a_spec_whose_named_section_does_not_resolve_is_not_the_same_as_none():
 
 
 def test_the_instruction_tells_the_reviewer_to_cite_the_section_not_escalate():
-    """The whole point of #1035: a spec section that settles the assumption is a ruling,
-    not a reason to ask the user for the spec."""
+    """The whole point of #1035: a spec section that settles the assumption is a ruling"""
     for build in builds(SpecStore()):
         neo_ = FakeNeo(qrow())
         build(neo_)
@@ -2504,10 +2271,188 @@ def test_the_instruction_tells_the_reviewer_to_cite_the_section_not_escalate():
         assert "cite the section" in packet
 
 
+# -- the section the ASSUMPTION cites (user decision 2026-10-14, Neo learning #102)
+
+
+CITED_HEADER = "# THE SPEC SECTION THIS ASSUMPTION CITES"
+CITED_TEXT = "## 4. Retries\n\nThree attempts, then park and say so."
+
+
+def citing(**over) -> dict:
+    """An assumption whose own cited section was resolved and stored at assume time"""
+    return assumption(**{"spec_path": "docs/superpowers/specs/2026-10-14-retries.md",
+                         "spec_which": "4. Retries", "spec_text": CITED_TEXT, **over})
+
+
+def test_the_section_the_assumption_cites_rides_in_both_packets():
+    """It SUPPLEMENTS the work order's own spec block"""
+    for build in (
+        lambda neo_: autoreview.propose(SpecStore(), neo_, "p", CHILD, citing(),
+                                        [assumption()]),
+        lambda neo_: autoreview.propose_confirmation(SpecStore(), neo_, "p", CHILD,
+                                                     citing(), [assumption()]),
+    ):
+        neo_ = FakeNeo(qrow())
+        build(neo_)
+        (packet,) = neo_.asked
+        assert CITED_HEADER in packet
+        assert ("docs/superpowers/specs/2026-10-14-retries.md § 4. Retries") in packet
+        assert "Three attempts, then park and say so." in packet
+        # The work order's own section is still there, and first
+        assert SPEC_HEADER in packet and "retries three times and then parks" in packet
+        assert packet.index(SPEC_HEADER) < packet.index(CITED_HEADER)
+
+
+def test_an_assumption_that_cites_nothing_grows_no_second_block():
+    for build in builds(SpecStore()):
+        neo_ = FakeNeo(qrow())
+        build(neo_)
+        (packet,) = neo_.asked
+        assert CITED_HEADER not in packet
+
+
+TWO_CITED = ("docs/a.md § 3:\n## 3. Errors\n\nThey raise.\n\n"
+             "docs/b.md § Data model:\n## Data model\n\nDicts.")
+
+
+def test_the_reference_line_names_every_section_that_was_cited():
+    """User decision 2026-10-15: the pointer columns are parallel newline lists"""
+    neo_ = FakeNeo(qrow())
+
+    autoreview.propose(SpecStore(), neo_, "p", CHILD,
+                       citing(spec_path="docs/a.md\ndocs/b.md",
+                              spec_which="3\nData model", spec_text=TWO_CITED),
+                       [assumption()])
+
+    (packet,) = neo_.asked
+    assert "docs/a.md § 3; docs/b.md § Data model" in packet
+    assert "docs/a.md § 3:" in packet and "docs/b.md § Data model:" in packet
+    assert "They raise." in packet and "Dicts." in packet
+
+
+def test_lists_of_different_length_say_so_instead_of_dropping_a_reference():
+    neo_ = FakeNeo(qrow())
+
+    autoreview.propose(SpecStore(), neo_, "p", CHILD,
+                       citing(spec_path="docs/a.md\ndocs/b.md", spec_which="3",
+                              spec_text=TWO_CITED),
+                       [assumption()])
+
+    (packet,) = neo_.asked
+    assert "docs/a.md § 3; docs/b.md § (no section named)" in packet
+    assert "2 paths recorded against 1 section names" in packet
+
+
+def test_the_truncation_note_repeats_every_cited_reference():
+    neo_ = FakeNeo(qrow())
+
+    autoreview.propose(SpecStore(), neo_, "p", CHILD,
+                       citing(spec_path="docs/a.md\ndocs/b.md",
+                              spec_which="3\nData model",
+                              spec_text="y" * 9000),
+                       [assumption()], cfg=ValidationConfig(assumption_spec_chars=100))
+
+    (packet,) = neo_.asked
+    assert ("of 9,000 chars; full section: "
+            "docs/a.md § 3; docs/b.md § Data model]") in packet
+
+
+# -- one budget, need-based, half as a FLOOR (Neo ruling Q1884)
+
+
+def doc_with(remedy_chars: int) -> str:
+    """The fixture document with `2"""
+    head = "## 2. The remedy\n\n"
+    return (f"# Design\n\n## 1. Why\n\nBecause.\n\n{head}"
+            f"{'r' * (remedy_chars - len(head))}\n\n## 3. Later\n\nNo.\n")
+
+
+def cite_of(chars: int) -> str:
+    head = "## 4. Retries\n\n"
+    return head + "c" * (chars - len(head))
+
+
+def one_packet(doc: str, cited: str, chars: int) -> str:
+    neo_ = FakeNeo(qrow())
+    autoreview.propose(SpecStore(doc=doc), neo_, "p", CHILD,
+                       citing(spec_text=cited), [assumption()],
+                       cfg=ValidationConfig(assumption_spec_chars=chars))
+    (packet,) = neo_.asked
+    return packet
+
+
+def test_neither_block_is_trimmed_when_both_fit():
+    """Q1884: each block takes only what it NEEDS"""
+    packet = one_packet(doc_with(200), cite_of(3000), 4000)
+
+    assert "spec section truncated" not in packet
+    assert "r" * 182 in packet and "c" * 2985 in packet
+
+
+def test_half_is_a_floor_the_under_floor_block_donates_its_remainder_from():
+    """200 + 9000 over a 4000 budget: the 200 stays whole and only the oversized block is trimmed"""
+    packet = one_packet(doc_with(200), cite_of(9000), 4000)
+
+    assert packet.count("spec section truncated") == 1
+    assert "r" * 182 in packet
+    assert "[spec section truncated — 3,800 of 9,000 chars" in packet
+
+
+def test_two_oversized_blocks_each_get_the_floor_and_both_announce_the_cut():
+    packet = one_packet(doc_with(3000), cite_of(9000), 4000)
+
+    assert packet.count("spec section truncated") == 2
+    assert "[spec section truncated — 2,000 of 3,000 chars" in packet
+    assert "[spec section truncated — 2,000 of 9,000 chars" in packet
+
+
+def test_one_block_alone_gets_the_whole_budget():
+    neo_ = FakeNeo(qrow())
+    autoreview.propose(SpecStore(doc=doc_with(9000)), neo_, "p", CHILD, assumption(),
+                       [assumption()], cfg=ValidationConfig(assumption_spec_chars=4000))
+
+    (packet,) = neo_.asked
+    assert "[spec section truncated — 4,000 of 9,000 chars" in packet
+
+
+UNCITED = "THE-UNCITED-SENTENCE, which nobody asked about."
+
+
+def test_no_question_builder_can_emit_a_whole_spec_file():
+    """The regression the decision exists to prevent: a payload carrying a DOCUMENT"""
+    big = (f"# Design\n\n## 1. Why\n\n{UNCITED}\n" + "w" * 9000
+           + "\n\n## 2. The remedy\n\n" + "r" * 9000 + "\n\n## 3. Later\n\n"
+           + "l" * 9000 + "\n")
+    tight = ValidationConfig(assumption_spec_chars=200)
+
+    for build in (
+        lambda neo_: autoreview.propose(SpecStore(doc=big), neo_, "p", CHILD, citing(),
+                                        [assumption()], cfg=tight),
+        lambda neo_: autoreview.propose_confirmation(SpecStore(doc=big), neo_, "p",
+                                                     CHILD, citing(), [assumption()],
+                                                     cfg=tight),
+    ):
+        neo_ = FakeNeo(qrow())
+        build(neo_)
+        (packet,) = neo_.asked
+        assert big not in packet
+        assert UNCITED not in packet
+        assert "w" * 100 not in packet      # §1 is not this child's section
+        assert "l" * 100 not in packet      # nor is §3
+        # §2 IS this child's section, and arrives bounded by the budget
+        longest = max(len(run) for run in re.findall(r"r+", packet))
+        assert 0 < longest < 200
+
+    outline = plans.build_plan_context(
+        {"design_doc": "docs/superpowers/specs/x.md", "design_doc_content": big},
+        "main @ abc1234")
+    assert big not in outline and UNCITED not in outline
+    for run in ("w" * 100, "r" * 100, "l" * 100):
+        assert run not in outline
+
+
 def test_answered_questions_is_newest_first_and_keeps_every_kind(started):
-    """The query, §1. Newest first — unlike `open_questions` — because the caller caps and
-    the newest ruling is the one that supersedes. NO `kind` filter: an `approval` the user
-    answered is exactly the kind of ruling #832 is about."""
+    """The query, §1 (#832)"""
     neo_store = NeoStore()
     try:
         first = neo_store.ask("proj_a", "wo-rec", "one")
@@ -2524,3 +2469,77 @@ def test_answered_questions_is_newest_first_and_keeps_every_kind(started):
         assert neo_store.answered_questions("wo-rec", limit=1) == got[:1]
     finally:
         neo_store.close()
+
+
+# -- a transient drop on the ASK path is re-asked (io-51469add, finding `dropped-rulings`)
+
+
+def test_an_ask_dropped_because_the_status_flipped_is_asked_again(started):
+    """The confirmation path's #833 retry, one path along: wo-764454c5, wo-8fd40f1a"""
+    store, wo = park(started, auto_review=True,
+                     assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
+    ask(started, store)
+    (first,) = questions()
+    store.set_status(wo["id"], "running", trigger="test")
+
+    drain(started)
+
+    row = store.all_assumptions(wo["id"])[0]
+    assert row["status"] == "pending" and row["neo_question_id"] is None
+    spent = next(q for q in questions() if q["id"] == first["id"])
+    # Never `escalated`: after the link is cleared nobody could answer it
+    assert spent["status"] == "answered"
+    (escalated,) = events(store, wo["id"], "autoreview_escalated")
+    assert escalated["dropped"] == autoreview.HELD_STATUS
+    assert escalated["re_asked"] is True
+    line = ops.autoreview_state(store, store.get_work_order(wo["id"]))["line"]
+    assert "goes back to Neo" in line and "left with you" not in line
+
+    store.set_status(wo["id"], "needs_review", trigger="test")
+    ask(started, store)
+
+    (second,) = [q for q in questions() if q["id"] != first["id"]]
+    assert store.all_assumptions(wo["id"])[0]["neo_question_id"] == second["id"]
+
+    drain(started)
+
+    row = store.all_assumptions(wo["id"])[0]
+    assert row["status"] == "accepted" and row["decided_by"] == "neo"
+
+
+def test_a_high_stakes_drop_on_the_ask_path_keeps_its_link_and_is_the_users(started):
+    """Non-transient codes are NEVER re-asked: the row really is the user's"""
+    store, wo = park(started, auto_review=True,
+                     assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
+    ask(started, store)
+    (first,) = questions()
+    row = store.all_assumptions(wo["id"])[0]
+    store.conn.execute("UPDATE assumptions SET content=? WHERE id=?", (SECRET, row["id"]))
+
+    drain(started)
+
+    row = store.all_assumptions(wo["id"])[0]
+    assert row["neo_question_id"] == first["id"]
+    assert questions()[0]["status"] == "escalated"
+    (escalated,) = events(store, wo["id"], "autoreview_escalated")
+    assert escalated["dropped"] == autoreview.HELD_HIGH_STAKES
+    assert escalated["re_asked"] is False
+
+    ask(started, store)
+    assert [q["id"] for q in questions()] == [first["id"]]
+
+
+def test_an_ask_dropped_on_a_cancelled_order_is_not_re_armed(started):
+    """`status` is transient only while the order can come back to `needs_review`"""
+    store, wo = park(started, auto_review=True,
+                     assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
+    ask(started, store)
+    (first,) = questions()
+    ops.cancel(wo["id"])
+
+    drain(started)
+
+    assert store.all_assumptions(wo["id"])[0]["neo_question_id"] == first["id"]
+    assert questions()[0]["status"] == "escalated"
+    (escalated,) = events(store, wo["id"], "autoreview_escalated")
+    assert escalated["re_asked"] is False

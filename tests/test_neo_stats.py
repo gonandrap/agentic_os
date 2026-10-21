@@ -1,20 +1,4 @@
-"""`jarvis neo stats` — the report itself, against seeded stores.
-
-Spec: docs/superpowers/specs/2026-10-01-neo-observability.md §4. Neo was the only agent in the OS with
-no aggregate of any kind: `NeoStore.counts()` is a GROUP BY status over all time, built for
-a nav badge, so "is Neo escalating more than it used to, and what for" had no answer in the
-data.
-
-TWO RULES CARRY MOST OF THIS FILE, and they pull in opposite directions:
-
-* `questions` is a CENSUS — every question has a row, so a count of zero is MEASURED and
-  prints `0`. Only the ratios can be absent.
-* `escalation_rate`, `questions_per_wo`, `questions_per_fo` and `p50_ms` are `None` — never
-  `0.0` — when their denominator or sample is empty, and the renderers print "not
-  recorded". Zero settled questions and zero escalations are different answers.
-
-No model and no daemon: the report is arithmetic over two databases.
-"""
+"""`jarvis neo stats` — the report itself, against seeded stores (docs/superpowers/specs/2026-10-01-neo-observability.md §4.)"""
 
 from __future__ import annotations
 
@@ -28,7 +12,7 @@ from jarvis.project_store import ProjectStore
 
 @pytest.fixture()
 def fleet(jarvis_home, project):
-    """One registered project, so `per_order` has a denominator to find."""
+    """One registered project, so `per_order` has a denominator to find"""
     central = CentralStore()
     central.upsert_project("proj_a", str(project))
     yield central
@@ -39,7 +23,7 @@ def seed_question(neo: NeoStore, *, status: str = "escalated", kind: str = "ques
                   project: str = "proj_a", wo_id: str = "wo-1",
                   answered_by: str | None = None, cause: str = "",
                   age_days: float = 0.0) -> int:
-    """One question in whatever state the test needs, aged by hand."""
+    """One question in whatever state the test needs, aged by hand"""
     q = neo.ask(project, wo_id, f"question {db.now()} {wo_id} {status}", kind=kind)
     neo.conn.execute(
         "UPDATE questions SET status=?, answered_by=?, escalation_cause=?, ts=? "
@@ -61,7 +45,7 @@ def seed_call(central: CentralStore, *, kind: str = "neo_answer",
     return row
 
 
-# -- 1. counts and the splits ---------------------------------------------------------
+# -- 1. counts and the splits
 
 def test_the_counts_and_the_three_splits_over_a_known_fixture(fleet, project):
     neo = NeoStore()
@@ -71,8 +55,7 @@ def test_the_counts_and_the_three_splits_over_a_known_fixture(fleet, project):
         seed_question(neo, status="escalated", cause="high-stakes")
         seed_question(neo, status="failed", cause="transport-unreachable")
         seed_question(neo, status="queued")
-        # SUPERSEDED: decided somewhere else, so neither Neo answering nor Neo handing
-        # back — broken out and out of the rate's denominator.
+        # SUPERSEDED: decided somewhere else, so neither Neo answering nor Neo handing back
         seed_question(neo, status="answered", answered_by="os")
     finally:
         neo.close()
@@ -92,8 +75,7 @@ def test_the_counts_and_the_three_splits_over_a_known_fixture(fleet, project):
 
 
 def test_a_triage_question_is_out_of_per_order_and_still_in_the_counts(fleet, project):
-    """`kind='triage'` has no work order behind it and its `wo_id` is empty: dividing it
-    by an order count is arithmetic over two populations (spec §4)."""
+    """`kind='triage'` has no work order behind it and its `wo_id` is empty: dividing it by an order count..."""
     store = ProjectStore(project)
     try:
         store.create_work_order(wo_id="wo-real", title="the order", description="")
@@ -114,14 +96,14 @@ def test_a_triage_question_is_out_of_per_order_and_still_in_the_counts(fleet, pr
                                 "feature_orders": 0, "questions_per_fo": None}
 
 
-# -- 2. absent is never zero ----------------------------------------------------------
+# -- 2. absent is never zero
 
 def test_an_empty_fleet_reports_measured_zeroes_and_absent_ratios(fleet):
     res = ops.neo_stats_report()
     q = res["questions"]
-    # A question count of zero is a MEASURED zero: "0 escalated" is a fact.
+    # A question count of zero is a MEASURED zero: "0 escalated" is a fact
     assert (q["asked"], q["answered"], q["escalated"], q["failed"]) == (0, 0, 0, 0)
-    # The ratios are absent, and absent is None — never 0.0.
+    # The ratios are absent, and absent is None — never 0.0
     assert q["escalation_rate"] is None
     assert q["unreachable_rate"] is None
     assert res["per_order"]["questions_per_wo"] is None
@@ -132,8 +114,7 @@ def test_an_empty_fleet_reports_measured_zeroes_and_absent_ratios(fleet):
 
 
 def test_open_questions_alone_leave_the_rate_absent(fleet):
-    """Open ones have no outcome yet; including them would make the rate fall whenever
-    the queue is busy."""
+    """Open ones have no outcome yet; including them would make the rate fall whenever the queue is busy"""
     neo = NeoStore()
     try:
         seed_question(neo, status="queued")
@@ -148,7 +129,7 @@ def test_open_questions_alone_leave_the_rate_absent(fleet):
 
 
 def test_a_window_of_only_unreachable_questions_reports_no_escalation(fleet):
-    """Spec §4: a question Neo was never reached for is UNREACHABLE and never escalated."""
+    """Spec §4: a question Neo was never reached for is UNREACHABLE and never escalated"""
     neo = NeoStore()
     try:
         seed_question(neo, status="failed", cause="transport-unreachable")
@@ -182,11 +163,10 @@ def test_a_mixed_window_splits_the_two_rates(fleet):
         assert bucket["unreachable_rate"] == pytest.approx(0.25)
 
 
-# -- 3. the cause split ---------------------------------------------------------------
+# -- 3. the cause split
 
 def test_the_four_cause_buckets_never_add_into_each_other(fleet):
-    """THREE CLASSES, because "who decided" has three answers (Neo, question 1170): Neo
-    handed it back, Neo answered and the OS overrode it, or Neo never answered."""
+    """THREE CLASSES, because "who decided" has three answers (Neo"""
     neo = NeoStore()
     try:
         seed_question(neo, status="escalated", cause="high-stakes")
@@ -210,8 +190,7 @@ def test_the_four_cause_buckets_never_add_into_each_other(fleet):
 
 
 def test_a_member_a_release_dropped_lands_in_not_recorded(fleet):
-    """The two classifier members `stakes.HIGH_UNREACHABLE` / `HIGH_UNPARSEABLE` could
-    never be written and were dropped from the enum: a row carrying one is not a cause."""
+    """The two classifier members `stakes.HIGH_UNREACHABLE` / `HIGH_UNPARSEABLE` could never be written..."""
     neo = NeoStore()
     try:
         qid = seed_question(neo, status="failed")
@@ -226,8 +205,7 @@ def test_a_member_a_release_dropped_lands_in_not_recorded(fleet):
 
 
 def test_the_report_names_the_class_the_counts_cannot_show(fleet):
-    """Neo's ruling on 1170: a class nothing can ever write is better documented as
-    invisible than left in the enum — so the report has to SAY what is not in it."""
+    """Neo's ruling on 1170: a class nothing can ever write is better documented as invisible than left in..."""
     res = ops.neo_stats_report()
     note = res["causes_note"]
     assert note == ops.NEO_ESCALATION_INVISIBLE_NOTE
@@ -236,7 +214,7 @@ def test_the_report_names_the_class_the_counts_cannot_show(fleet):
 
 
 def test_a_cause_in_neither_tuple_is_counted_as_not_recorded(fleet):
-    """A release that removed a member must not invent a ninth bucket (spec §4)."""
+    """A release that removed a member must not invent a ninth bucket (spec §4)"""
     neo = NeoStore()
     try:
         qid = seed_question(neo, status="escalated")
@@ -250,7 +228,7 @@ def test_a_cause_in_neither_tuple_is_counted_as_not_recorded(fleet):
     assert causes["not_recorded"] == 1
 
 
-# -- 4. the window --------------------------------------------------------------------
+# -- 4. the window
 
 def test_days_excludes_older_rows_from_every_section_including_spend(fleet):
     neo = NeoStore()
@@ -275,7 +253,7 @@ def test_days_excludes_older_rows_from_every_section_including_spend(fleet):
     assert everything["since"] is None
 
 
-# -- 5. latency -----------------------------------------------------------------------
+# -- 5. latency
 
 def test_a_window_nobody_timed_reports_no_percentile_and_counts_the_blind_rows(fleet):
     seed_call(fleet, latency_ms=None)
@@ -303,11 +281,10 @@ def test_measured_latencies_give_percentiles_beside_the_unmeasured_count(fleet):
     assert lat["unmeasured"] == 1
 
 
-# -- scope, pricing and the floor -----------------------------------------------------
+# -- scope, pricing and the floor
 
 def test_only_neo_kinds_reach_the_spend_half(fleet):
-    """`agent_usage.NEO_KINDS`: the worker's own subprocesses and the user's looking are
-    other classes by that module's own definitions."""
+    """`agent_usage.NEO_KINDS`: the worker's own subprocesses and the user's looking are other classes by..."""
     seed_call(fleet, kind="neo_answer", latency_ms=10)
     seed_call(fleet, kind="worker_subprocess", latency_ms=10)
     seed_call(fleet, kind="observe_inspect", latency_ms=10)
@@ -316,8 +293,7 @@ def test_only_neo_kinds_reach_the_spend_half(fleet):
     assert set(spend["by_kind"]) == {"neo_answer"}
     assert spend["totals"]["calls"] == 1
     assert spend["totals"]["recorded_cost_usd"] == pytest.approx(0.01)
-    # Two currencies, never blended: the CLI's own figure and the same tokens at list
-    # prices (`ops._os_spend`'s rule).
+    # Two currencies, never blended: the CLI's own figure and the same tokens at list prices...
     assert spend["totals"]["list_cost_usd"] > 0
     assert spend["totals"]["output"] == 100
 
@@ -332,10 +308,7 @@ def test_the_report_says_it_is_a_floor(fleet):
     assert res["floor"] is True and res["floor_reason"] == ops.COST_FLOOR_NOTE
 
 
-# -- `jarvis neo stats` ---------------------------------------------------------------
-#
-# The CLI renders the SAME dict the dashboard does, so these assert the rendering and
-# nothing about the arithmetic.
+# -- `jarvis neo stats`
 
 def test_the_json_form_prints_the_ops_dict_unchanged(fleet, capsys):
     import json
@@ -369,8 +342,7 @@ def test_the_human_rendering_of_an_empty_fleet_prints_no_measured_zero_rate(flee
 
 
 def test_the_rendering_reads_the_causes_as_three_answers_to_who_decided(fleet, capsys):
-    """A flat list of labels is not the deliverable: each class carries the sentence that
-    says what it MEANS for who decided, and the invisible class is named."""
+    """A flat list of labels is not the deliverable: each class carries the sentence that says what it..."""
     from jarvis import cli
 
     neo = NeoStore()
@@ -398,7 +370,7 @@ def _trend_lines(out: str) -> list[str]:
 
 
 def test_the_trend_row_prints_the_unreachable_count_and_rate(fleet, capsys):
-    """Spec §4: a bar may never contradict the counts beside it."""
+    """Spec §4: a bar may never contradict the counts beside it"""
     from jarvis import cli
 
     neo = NeoStore()

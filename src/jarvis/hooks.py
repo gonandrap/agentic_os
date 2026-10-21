@@ -1,22 +1,4 @@
-"""Handler for `jarvis _hook` — invoked by the Claude Code hooks that the OS injects
-into every managed project's settings (SessionStart / SubagentStart / Stop /
-SessionEnd / Notification).
-
-Claude Code pipes a JSON payload on stdin (hook_event_name, session_id, cwd, ...).
-We map the session to a work order (JARVIS_WO_ID env var set at dispatch, falling back
-to a session_id lookup) and update the project DB. Sessions that aren't Jarvis workers
-are a silent no-op, so interactive sessions in managed projects are unaffected.
-
-This module also answers `PreToolUse`. A NAVIGATION decision function here
-(`py_nav_decision`, `doc_nav_decision`) NEVER allows: it denies or it returns None, so
-it can hand out nothing a gate would have caught — and its POSITION in
-`preflight_decision` is the enforcement, because a Bash arm after the
-`is_jarvis_command_chain` auto-allow is unreachable in production however green its unit
-test (§2.4 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md). Nothing in this module
-may import `catalog` or `spec_index`: it runs on EVERY tool call of every managed worker,
-where a catalog parse is ~60ms against a ~155ms process, so every setting it reads
-arrives as an environment variable `dispatch` resolved at spawn.
-"""
+"""Handler for `jarvis _hook` — invoked by the Claude Code hooks that the OS injects into every... (docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md)"""
 
 from __future__ import annotations
 
@@ -30,11 +12,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from . import concision
-# §3 of the 2026-10-02 navigation split: ONE masker in the tree, by identity.
-# `navigates_source` joins it for §6 of 2026-10-02-serena-the-cheap-path.md.
-# `dumps_doc` and `is_spec_path` join them for §5 of
-# docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md: ONE spelling of each predicate in
-# the tree, read by the counter and by the refusal, by identity and never re-spelled.
+# §3 of the 2026-10-02 navigation split: ONE masker in the tree, by identity (docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md)
 from .navigation import (
     DOC_SUFFIXES,
     SOURCE_SUFFIXES,
@@ -44,14 +22,12 @@ from .navigation import (
     is_spec_path,
     navigates_source,
 )
-from .project_store import ProjectStore
+from .project_store import WO_KIND_CONTRACTS, ProjectStore
 
-# A Bash command every worker must be able to run without a permission prompt:
-# a chain of `cd <dir>` / `jarvis …` segments joined by &&, nothing else.
+# A Bash command every worker must be able to run without a permission prompt: a chain of `cd <dir>`...
 _SHELL_DANGEROUS = re.compile(r"[|;`$<>]")
 
-#: The same characters split by quote kind for `jarvis_verbs`
-#: (docs/superpowers/specs/2026-10-01-investigator-writes-unreachable.md).
+#: The same characters split by quote kind for `jarvis_verbs`... (docs/superpowers/specs/2026-10-01-investigator-writes-unreachable.md)
 _SHELL_STRUCTURE = re.compile(r"[|;<>]")
 _SHELL_SUBSTITUTION = re.compile(r"\$\(|`")
 
@@ -75,41 +51,22 @@ def is_jarvis_command_chain(command: str) -> bool:
 
 
 def jarvis_verbs(command: str) -> tuple[tuple[str, str], ...]:
-    """Each `jarvis` segment of this command as its `(verb, subverb)` pair.
-
-    A SIBLING of `is_jarvis_command_chain`, which stays untouched: that one answers "is
-    this a chain of `cd`/`jarvis` segments", which for every other kind is the right
-    question, and narrowing it would change every kind's behaviour (§2.6 of
-    docs/superpowers/specs/2026-09-27-investigation-orders.md). Same `shlex` parse, so
-    the two cannot disagree about what a segment IS — only about which characters count
-    as structure: this one judges STRUCTURE, not raw text, because every write it must
-    clear carries prose in quotes (docs/superpowers/specs/2026-10-01-investigator-writes-
-    unreachable.md). Quotes do not make every expansion inert: `${` is refused wherever
-    the shell would expand it, double quotes included (DELTA 3 of that spec).
-
-    An empty tuple means "no `jarvis` verb this can vouch for": not a jarvis chain, a
-    command carrying shell metacharacters, or one shlex cannot parse. The caller decides
-    what that means — for the investigator it means the allowlist cannot clear it.
-    """
+    """Each `jarvis` segment of this command as its `(verb, subverb)` pair (docs/superpowers/specs/2026-09-27-investigation-orders.md)"""
     scan = _scan_shell_quotes(command)
-    # An unterminated quote has no knowable structure, so fail closed (spec DELTA 2).
+    # An unterminated quote has no knowable structure, so fail closed (spec DELTA 2)
     if not scan.terminated:
         return ()
     masked = scan.full
-    # Literal inside EITHER quote kind, so judged on fully masked text (spec §The
-    # mechanism, 1).
+    # Literal inside EITHER quote kind, so judged on fully masked text (spec §The mechanism, 1)
     if _SHELL_STRUCTURE.search(masked):
         return ()
-    # The shell INTERPOLATES inside double quotes, so these two are judged with only
-    # single quotes masked (spec §The mechanism, 2).
+    # The shell INTERPOLATES inside double quotes
     if _SHELL_SUBSTITUTION.search(scan.single_only):
         return ()
-    # `${...}` ASSIGNS, prompt-expands and evaluates arithmetic, so it is not a value
-    # even inside double quotes (spec DELTA 3).
+    # `${...}` ASSIGNS, prompt-expands and evaluates arithmetic
     if "${" in scan.single_only:
         return ()
-    # A bare `$NAME` yields a VALUE inside quotes; unquoted, `$` stays dangerous (spec
-    # DELTA 1, narrowed by DELTA 3).
+    # A bare `$NAME` yields a VALUE inside quotes
     if "$" in masked:
         return ()
     out: list[tuple[str, str]] = []
@@ -131,29 +88,18 @@ def jarvis_verbs(command: str) -> tuple[tuple[str, str], ...]:
 
 
 def wo_title_prefix(wo_id: str) -> str:
-    """The mandatory leading token of a pull request title: `[wo-1234abcd] `.
-
-    The work order id verbatim, so the string a reviewer sees on GitHub is the string
-    `jarvis wo show` accepts — no separate numbering scheme to translate.
-    """
+    """The mandatory leading token of a pull request title: `[wo-1234abcd] `"""
     return f"[{wo_id}] "
 
 
-#: `gh pr create` flags this module reads, mapped to the key it files them under.
+#: `gh pr create` flags this module reads, mapped to the key it files them under
 _PR_CREATE_FLAGS = {"--title": "title", "-t": "title",
                     "--body": "body", "-b": "body",
                     "--body-file": "body_file", "-F": "body_file"}
 
 
 def gh_pr_create_args(command: str) -> dict[str, str] | None:
-    """The flags of a `gh pr create` in this command, or None.
-
-    None means "not something these hooks have an opinion about": not a `gh pr create`,
-    or a command shlex cannot parse. An empty dict is a create carrying none of the
-    flags above — `--fill`, or an editor prompt. Deliberately narrow — a hook that fires
-    on commands it does not really understand costs more than the leak it prevents, and
-    the contract text covers the rest.
-    """
+    """The flags of a `gh pr create` in this command, or None"""
     try:
         words = shlex.split(command)
     except ValueError:
@@ -161,10 +107,7 @@ def gh_pr_create_args(command: str) -> dict[str, str] | None:
     for i, word in enumerate(words):
         if word in ("&&", "||", ";", "|"):
             continue
-        # `gh`, but also `/snap/bin/gh` — gh is commonly not on a worker's PATH (it is
-        # not on the production fleet's), so an absolute path is the normal way to
-        # reach it, and a matcher that only knew the bare name let the first real PR
-        # through untitled.
+        # `gh`, but also `/snap/bin/gh` — gh is commonly not on a worker's PATH (it is not on the production...
         if (word != "gh" and not word.endswith("/gh")) \
                 or words[i + 1:i + 3] != ["pr", "create"]:
             continue
@@ -185,17 +128,12 @@ def gh_pr_create_args(command: str) -> dict[str, str] | None:
 
 
 def gh_pr_create_title(command: str) -> str | None:
-    """The `--title` of a `gh pr create` in this command, or None."""
+    """The `--title` of a `gh pr create` in this command, or None"""
     return (gh_pr_create_args(command) or {}).get("title")
 
 
 def gh_pr_create_body(command: str, cwd: str = "") -> str | None:
-    """The body text a `gh pr create` would submit, or None when it cannot be read.
-
-    `--body-file -` reads stdin, which a PreToolUse hook cannot see, and a path that
-    does not resolve is the same situation. Both are None: a body the hook cannot read
-    is one it must not judge.
-    """
+    """The body text a `gh pr create` would submit, or None when it cannot be read"""
     args = gh_pr_create_args(command)
     if args is None:
         return None
@@ -211,17 +149,7 @@ def gh_pr_create_body(command: str, cwd: str = "") -> str | None:
 
 
 def pr_title_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:
-    """Hold `gh pr create` to the work order's title prefix.
-
-    A pull request is the one artifact of a work order that outlives the OS's own
-    records and is read by people who never see them, so it has to carry the id back.
-    Contract text alone leaves it to memory; this makes it an invariant on the one path
-    that opens PRs in practice.
-
-    Denies rather than rewrites: the title is the worker's to write, and a hook silently
-    editing the argument of a command it was asked to approve is a worse surprise than
-    being told what to fix.
-    """
+    """Hold `gh pr create` to the work order's title prefix"""
     wo_id = env.get("JARVIS_WO_ID")
     if not wo_id:
         return None
@@ -238,43 +166,34 @@ def pr_title_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str,
     )
 
 
-# -- the PR body: what a reviewer needs, and what GitHub must not mislink --------------
-# Design: docs/superpowers/specs/2026-08-24-a-pull-request-a-reviewer-can-read.md
+# -- the PR body: what a reviewer needs, and what GitHub must not mislink
 
-#: The `##` headings a PR body must carry. Single-sourced here; the shipped templates
-#: (`.github/pull_request_template.md` and the skill's bundled copy) are asserted
-#: against this tuple by tests/test_pr_body.py, so the three cannot drift.
+#: The `##` headings a PR body must carry
 PR_BODY_SECTIONS = ("Summary", "Implementation notes", "Questions asked to Neo",
                     "Alarms raised", "Learnings", "Test evidence", "Screenshots")
 
-# GitHub renders neither of these, so neither can mislink or count as content.
+# GitHub renders neither of these, so neither can mislink or count as content
 _HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
 _CODE_SPAN = re.compile(r"```.*?```|`[^`\n]*`", re.DOTALL)
 
 _HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", re.MULTILINE)
 _TABLE_SEP = re.compile(r"^\s*\|[\s|:-]+\|\s*$")
 
-#: A `#123` GitHub will autolink. The lookbehind drops the cases it would NOT: a
-#: `owner/repo#12` cross-reference, a URL fragment, a `##` heading.
+#: A `#123` GitHub will autolink
 _BARE_REF = re.compile(r"(?<![\w/#-])#\d+\b")
-#: ...and these words immediately before one mean the author really did mean issue N.
+#: ...and these words immediately before one mean the author really did mean issue N
 _REF_IS_DELIBERATE = re.compile(
     r"\b(?:issues?|prs?|pull requests?|close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*$",
     re.IGNORECASE)
 
 
 def _blank_out(pattern: re.Pattern[str], text: str) -> str:
-    """Erase every match, preserving length and line breaks so offsets stay usable."""
+    """Erase every match, preserving length and line breaks so offsets stay usable"""
     return pattern.sub(lambda m: re.sub(r"\S", " ", m.group(0)), text)
 
 
 def mislinking_ref(body: str) -> str | None:
-    """The first `#N` in `body` that GitHub would turn into a link to someone else's
-    issue or pull request, or None.
-
-    Work orders number their own items, so a description's "as in #2" becomes a link to
-    a stranger's PR the moment it is copied into a body — observed on PR 143.
-    """
+    """The first `#N` in `body` that GitHub would turn into a link to someone else's issue or pull..."""
     scannable = _blank_out(_CODE_SPAN, _blank_out(_HTML_COMMENT, body))
     for m in _BARE_REF.finditer(scannable):
         if not _REF_IS_DELIBERATE.search(scannable[:m.start()].rstrip()):
@@ -282,19 +201,13 @@ def mislinking_ref(body: str) -> str | None:
     return None
 
 
-#: A markdown image, and the only target form GitHub renders in a body. The target is
-#: the first thing after `(` — a `<…>` form or a bare path, before any title string.
+#: A markdown image, and the only target form GitHub renders in a body
 _MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*\]\(\s*(<[^>\n]+>|[^)\s]+)")
 _ABSOLUTE_URL = re.compile(r"https?://", re.IGNORECASE)
 
 
 def unrenderable_image(body: str) -> str | None:
-    """The first markdown image target in `body` that GitHub will not render, or None.
-
-    S5 of the design doc. kn-72cec521: GitHub resolves a repo-relative path for a link
-    and not for an image, so `![x](docs/screenshots/x.png)` looks right when written and
-    is a broken icon in review (PR 173).
-    """
+    """The first markdown image target in `body` that GitHub will not render, or None"""
     scannable = _blank_out(_CODE_SPAN, _blank_out(_HTML_COMMENT, body))
     for m in _MARKDOWN_IMAGE.finditer(scannable):
         target = m.group(1).strip("<>")
@@ -304,7 +217,7 @@ def unrenderable_image(body: str) -> str | None:
 
 
 def _section_is_empty(text: str) -> bool:
-    """Whether a section holds anything the template did not already put there."""
+    """Whether a section holds anything the template did not already put there"""
     lines = _HTML_COMMENT.sub("", text).splitlines()
     seps = {i for i, ln in enumerate(lines) if _TABLE_SEP.match(ln)}
     scaffolding = seps | {i - 1 for i in seps}  # a separator's header row
@@ -313,8 +226,7 @@ def _section_is_empty(text: str) -> bool:
         if i in scaffolding or not line or line in ("-", "*") or set(line) <= set("-="):
             continue
         if line.startswith("|"):
-            # The first column is the row's template-supplied label; the row says
-            # something only once a later column is filled in.
+            # The first column is the row's template-supplied label
             cells = [c.strip() for c in line.strip("|").split("|")]
             if not any(cells[1:]):
                 continue
@@ -323,11 +235,10 @@ def _section_is_empty(text: str) -> bool:
 
 
 def pr_body_problems(body: str) -> list[str]:
-    """Every reason this body is not ready, as phrases naming the fix."""
+    """Every reason this body is not ready, as phrases naming the fix"""
     heads = [(m.group(1).strip().lower(), m.start(), m.end())
              for m in _HEADING.finditer(body)]
-    # A section runs to the START of the next heading of any level, so the heading line
-    # itself is never mistaken for the previous section's content.
+    # A section runs to the START of the next heading of any level
     starts = [h[1] for h in heads] + [len(body)]
     spans = {name: body[end:starts[i + 1]] for i, (name, _, end) in enumerate(heads)}
     problems = []
@@ -353,17 +264,7 @@ def pr_body_problems(body: str) -> list[str]:
 
 
 def pr_body_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:
-    """Hold `gh pr create` to a body a reviewer can actually review.
-
-    Same reasoning as `pr_title_decision`, one field over: the body is the only place a
-    reviewer learns what the diff cannot tell them, and the contract's "a PR body hints,
-    it does not explain" was read as licence to ship a thin one (PR 143 — no test
-    evidence, no questions, no learnings). Prose alone does not fix that: kn-fe226ab1
-    measured a contract bullet changing worker behaviour 0/5.
-
-    Denies rather than rewrites, and never guesses — a body it cannot read (`--fill`,
-    an editor, stdin) is not its business.
-    """
+    """Hold `gh pr create` to a body a reviewer can actually review"""
     if not env.get("JARVIS_WO_ID"):
         return None
     command = (payload.get("tool_input") or {}).get("command", "")
@@ -384,21 +285,7 @@ def pr_body_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, 
 
 def finish_summary_decision(payload: dict[str, Any],
                             env: dict[str, str]) -> dict[str, Any] | None:
-    """Refuse a `jarvis wo finish --summary` longer than the cap.
-
-    The mechanism half of docs/superpowers/specs/2026-09-19-concision-enforced.md (SS5.2).
-    Prose could not do this job: kn-fe226ab1 measured a contract bullet changing worker
-    behaviour 0/5, twice, and named a refusing hook as what the class wants instead.
-    `pr_body_decision` above is the same shape for the same reason.
-
-    Denies rather than truncating. A hook that edited the summary would be putting words
-    the worker never wrote onto a record the user reads as the worker's, and the worker
-    is the only party that knows which sentence was load-bearing.
-
-    The denial names the skills on purpose. A worker has no reason to open `i-have-adhd`
-    until something tells it its output is wrong; this is the moment it is wrong, and
-    the moment it can still act.
-    """
+    """Refuse a `jarvis wo finish --summary` longer than the cap (docs/superpowers/specs/2026-09-19-concision-enforced.md)"""
     if not env.get("JARVIS_WO_ID"):
         return None
     cap = concision.summary_cap(env)
@@ -418,13 +305,12 @@ def finish_summary_decision(payload: dict[str, Any],
         f"is captured onto the work order verbatim and is what the user and Neo "
         f"actually read. Nothing is lost by moving it there.\n"
         f"  - Evidence goes in `--evidence`, not in the summary.\n"
-        f"Your `i-have-adhd` and `caveman` skills are how to shorten it without "
+        f"Your `caveman` skill is how to shorten it without "
         f"dropping anything that matters."
     )
 
 
-#: What to pass instead of the payload, spelled once: every refusal below has to leave the
-#: worker with a move, and "too long" leaves it splitting the paste in two.
+#: What to pass instead of the payload
 _INSTEAD = ("Pass a REFERENCE instead: a pull request URL, a commit SHA, a path with a "
             "line range (`src/jarvis/hooks.py:825-871`), or the command that reproduces "
             "it. Whoever reads this can run it; nobody needs it pasted.")
@@ -432,27 +318,11 @@ _INSTEAD = ("Pass a REFERENCE instead: a pull request URL, a commit SHA, a path 
 
 def payload_reference_decision(payload: dict[str, Any],
                                env: dict[str, str]) -> dict[str, Any] | None:
-    """Refuse a `jarvis` command carrying a PAYLOAD where a reference belongs.
-
-    §5 of docs/superpowers/specs/2026-09-26-bounded-model-inputs.md. Three refusals, one
-    rule: an oversized `wo send` / `wo assume` body (which goes whole into the target
-    worker's next turn), a question over `sections.QUESTION_MAX_CHARS`, and any capped
-    argument carrying a command substitution of an unbounded producer, however short.
-
-    The substitution half is the only half `ops` cannot do at all: by the time
-    `ops.ask_question` sees the text, the shell has expanded `$(git diff)` into this
-    worker's own argv and context, so the flood is already paid for. The length half is
-    the SAME rule `ops` enforces, one layer earlier — not a second number.
-
-    Denies rather than truncating or rewriting, for `finish_summary_decision`'s reason:
-    the worker is the only party that knows which sentence was load-bearing, and a hook
-    that edited the argument would put words the worker never wrote onto the record.
-    """
+    """Refuse a `jarvis` command carrying a PAYLOAD where a reference belongs (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)"""
     if not env.get("JARVIS_WO_ID"):
         return None  # interactive session — the user's own message is their business
     command = (payload.get("tool_input") or {}).get("command", "")
-    # kn-21d73ac2: a check that yields nothing on text it cannot parse fails OPEN.
-    # §5 of docs/superpowers/specs/2026-09-26-bounded-model-inputs.md, round-1 review.
+    # kn-21d73ac2: a check that yields nothing on text it cannot parse fails OPEN. §5 of... (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
     if concision.unparseable_jarvis_command(command):
         return _deny(
             "This `jarvis` command's quoting does not parse — an unbalanced quote. "
@@ -471,14 +341,25 @@ def payload_reference_decision(payload: dict[str, Any],
             f"saw it, so the flood is paid for whatever the cap downstream then says.\n"
             f"  - {_INSTEAD}"
         )
-    cap = concision.message_cap(env)
+    # One cap per kind (docs/superpowers/specs/2026-10-21-questions-to-neo-are-atomic.md §3)
+    caps = {"message": concision.message_cap(env),
+            "assume": concision.assume_cap(env),
+            "question": concision.question_cap(env)}
     for subcommand, kind, text in concision.jarvis_payload_args(command):
-        limit = cap if kind == "message" else concision.QUESTION_MAX_CHARS
+        limit = caps.get(kind, 0)
         if not limit or len(text) <= limit:
             continue
+        split = ("\n  - SPLIT it: ONE decision per `jarvis wo assume` — the option "
+                 "taken, the strongest alternative rejected and why. A second "
+                 "decision is a second `jarvis wo assume`; cite the first in it "
+                 "by its `#n`."
+                 if kind == "assume" else
+                 "\n  - SPLIT it: ONE question per `jarvis wo ask`, and cite the "
+                 "first in the second by its `Q<id>`."
+                 if kind == "question" else "")
         return _deny(
             f"This `{subcommand}` {kind} is {len(text)} characters; the cap is "
-            f"{limit}.\n"
+            f"{limit}.{split}\n"
             f"  - {_INSTEAD}\n"
             f"  - A diff, a log, a file or a JSON dump never belongs in a `jarvis` "
             f"argument: it is read once by a model and paid for in every turn "
@@ -487,54 +368,31 @@ def payload_reference_decision(payload: dict[str, Any],
     return None
 
 
-#: The transport declaration (`claude_cli.TURN_TRANSPORT_ENV` and its two values) and the
-#: crew keys, spelled rather than imported: `import jarvis.claude_cli` costs 56ms against
-#: this module's 27ms, and this hook runs on every Bash call and every file write.
-#: `tests/test_background_refusal.py` builds its env from the constants and asserts
-#: against these, so the two cannot drift silently.
+#: The transport declaration (`claude_cli.TURN_TRANSPORT_ENV` and its two values) and the crew keys
 TURN_TRANSPORT_ENV = "JARVIS_TURN_TRANSPORT"
 TRANSPORT_HEADLESS = "headless"
 REQUIRE_CREW_ENV = "JARVIS_REQUIRE_CREW"
 WO_KIND_ENV = "JARVIS_WO_KIND"
 
-#: JSON list of repo-relative paths an installed TOOL owns and rewrites, marked
-#: `skip-worktree` in the worker worktree's index by `mark_tool_managed_paths`. Defined in
-#: the READER, like `concision.STANDING_PROMPT_ENV`, and written by
-#: `dispatch._write_worker_settings` from `project.worktree.tool_managed_paths` — the hook
-#: must not import `jarvis.catalog` to learn a value fixed at spawn (~60ms against a 155ms
-#: hook process). Absent or unparseable: the mechanism is off for that worker, silently,
-#: which is what a work order dispatched before this landed carries.
+#: JSON list of repo-relative paths an installed TOOL owns and rewrites
 TOOL_MANAGED_PATHS_ENV = "JARVIS_TOOL_MANAGED_PATHS"
 
-#: Cap on how many of them one `SessionStart` will consider, so the hook's cost cannot
-#: grow without limit as the list does.
+#: Cap on how many of them one `SessionStart` will consider
 MAX_TOOL_MANAGED_PATHS = 32
 
-#: The longest a single foreground call may block. Under `inspection.TTL_5M` (300s) with
-#: room for the call itself, so a lead polling on this rhythm never loses the cache.
-#: §3 of docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md.
+#: The longest a single foreground call may block (docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md)
 MAX_FOREGROUND_SECONDS = 240
 
-#: The two crew seats whose median duration in the measured period exceeded the TTL. A
-#: short seat blocking for four minutes is cheap and refusing it would tax every
-#: delegation with a hook process.
+#: The two crew seats whose median duration in the measured period exceeded the TTL
 LONG_SEATS = ("jarvis-implementer", "jarvis-spec-writer")
 
-#: Everything the shell backgrounds a job with, other than a bare `&`. In COMMAND
-#: position only, so `grep -r nohup src/` is not a detached job.
+#: Everything the shell backgrounds a job with, other than a bare `&`
 _BACKGROUNDING_WORD = re.compile(
     r"(?:^|[;&|(\n])\s*(?:\w+=\S+\s+)*(nohup|setsid|disown)\b")
 
 
 class _QuoteMasks(NamedTuple):
-    """One escape-aware scan of a command, as the two masks `jarvis_verbs` judges on.
-
-    `full`: single- AND double-quoted content blanked. `single_only`: only single-quoted
-    content blanked, because the shell still interpolates inside double quotes. Escape
-    pairs (`\\;`, `\\"`, `\\$`) are blanked in BOTH: they are literal characters, not
-    structure. `terminated` is False when a quote never closed — the caller fails closed
-    (docs/superpowers/specs/2026-10-01-investigator-writes-unreachable.md, DELTA 2).
-    """
+    """One escape-aware scan of a command, as the two masks `jarvis_verbs` judges on (docs/superpowers/specs/2026-10-01-investigator-writes-unreachable.md)"""
 
     full: str
     single_only: str
@@ -542,11 +400,7 @@ class _QuoteMasks(NamedTuple):
 
 
 def _scan_shell_quotes(command: str) -> _QuoteMasks:
-    """Quote state of `command`, tracking backslash escapes, positions preserved.
-
-    A regex span cannot do this: it reads `\\"` as the start of a quoted span and masks
-    the real structure after it (spec DELTA 2, review round 1).
-    """
+    """Quote state of `command`, tracking backslash escapes, positions preserved"""
     full: list[str] = []
     single_only: list[str] = []
     state = ""  # "" = outside quotes, "'" = single, '"' = double
@@ -561,9 +415,7 @@ def _scan_shell_quotes(command: str) -> _QuoteMasks:
             i += 1
             continue
         if char == "\\" and state != "'":
-            # Outside quotes `\` escapes anything; inside double quotes only $ ` " \ and
-            # newline — every character special there — so blanking the pair cannot hide
-            # structure either way (spec DELTA 3).
+            # Outside quotes `\` escapes anything; inside double quotes only $ ` " \ and newline
             width = 2 if i + 1 < len(command) else 1
             full.append(" " * width)
             single_only.append(" " * width)
@@ -592,10 +444,7 @@ def _scan_shell_quotes(command: str) -> _QuoteMasks:
 
 
 def _and_segments(command: str, masked: str) -> list[str]:
-    """`command` split on its `&&` offsets taken from `masked`, so a quoted one is prose.
-
-    docs/superpowers/specs/2026-10-01-investigator-writes-unreachable.md.
-    """
+    """`command` split on its `&&` offsets taken from `masked`, so a quoted one is prose (docs/superpowers/specs/2026-10-01-investigator-writes-unreachable.md)"""
     out: list[str] = []
     start = 0
     for found in re.finditer(r"&&", masked):
@@ -606,11 +455,7 @@ def _and_segments(command: str, masked: str) -> list[str]:
 
 
 def backgrounds_through_shell(command: str) -> bool:
-    """Whether this command starts a job the shell detaches from the turn.
-
-    NOT matched, and each of these is an ordinary foreground command: `&&`, `&>`, `&>>`,
-    `2>&1`. `&` counts only as a statement terminator.
-    """
+    """Whether this command starts a job the shell detaches from the turn"""
     masked = _mask_shell_text(command)
     if _BACKGROUNDING_WORD.search(masked):
         return True
@@ -627,21 +472,7 @@ def backgrounds_through_shell(command: str) -> bool:
 
 def background_task_decision(payload: dict[str, Any],
                              env: dict[str, str]) -> dict[str, Any] | None:
-    """Refuse a job this turn cannot outlive, before it starts.
-
-    §4 of docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md. The contract
-    has forbidden backgrounding in prose since TEMPLATE_VERSION v10 and wo-d81fcc15 did
-    it anyway, on two consecutive turns, the second costing 62 hours of wall clock
-    (issue #575) — kn-6dcaf055 is the class, `finish_summary_decision` above is the same
-    shape for the same reason.
-
-    Conditional on the DECLARED transport, never on a hardcoded belief that a turn is
-    one-shot: `spawn_background` is supervisor-owned and the notifications DO arrive
-    there. Absent key = not a Jarvis worker = no-op.
-
-    A subagent's calls are covered without a second mechanism: PreToolUse fires on them
-    under the parent session.
-    """
+    """Refuse a job this turn cannot outlive, before it starts (docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md)"""
     if env.get(TURN_TRANSPORT_ENV) != TRANSPORT_HEADLESS:
         return None
     if payload.get("tool_name") != "Bash":
@@ -650,18 +481,12 @@ def background_task_decision(payload: dict[str, Any],
     if not (tool_input.get("run_in_background")
             or backgrounds_through_shell(tool_input.get("command", ""))):
         return None
-    # §4 of docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md:
-    # `long_foreground_decision` refuses this shape in the foreground, so backgrounding
-    # it IS the fix. Gated on the harness's own spelling, never on a shell `&`: a
-    # `&`-detached job has no id, so `BashOutput` cannot poll it and the Stop guard
-    # cannot see it — the orphan class §4 of the 2026-09-23 spec closed.
+    # §4 of docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md:...
     arm = long_shell_shape(tool_input.get("command", ""))
     if tool_input.get("run_in_background") and arm:
         return None
     if arm:
-        # The SHAPE may be backgrounded and the `&` may not, so the correction is the
-        # rhythm and not the foreground: sending this one back to the foreground would
-        # point it at the call `long_foreground_decision` refuses next.
+        # The SHAPE may be backgrounded and the `&` may not
         return _deny(
             f"`&` is not the way to background this: a `&`-detached job has no id, so "
             f"`BashOutput` cannot poll it and the Stop hook cannot see it. "
@@ -675,16 +500,14 @@ def background_task_decision(payload: dict[str, Any],
     )
 
 
-#: `pytest` flags that take a SEPARATE value, so the value is not a positional path.
-#: `pytest -k expr tests/test_hooks.py` is a targeted run, and reading `expr` as a path
-#: would deny it.
+#: `pytest` flags that take a SEPARATE value, so the value is not a positional path
 _PYTEST_VALUE_FLAGS = frozenset({
     "-k", "-m", "-p", "-n", "-o", "-c", "-W", "-r", "--maxfail", "--deselect",
     "--ignore", "--ignore-glob", "--rootdir", "--override-ini", "--durations",
     "--log-level", "--timeout",
 })
 
-#: …and the flags that make `pytest` return at once without running anything.
+#: …and the flags that make `pytest` return at once without running anything
 _PYTEST_NOT_A_RUN = frozenset({
     "--collect-only", "--co", "--version", "--help", "-h", "--fixtures",
     "--markers", "--collectonly",
@@ -702,11 +525,7 @@ def _seconds(word: str) -> float | None:
 
 
 def _is_whole_suite(words: list[str]) -> bool:
-    """A `pytest` word in command position with no targeted path after it.
-
-    The three spellings the fleet uses. A directory argument, or no path at all, is a
-    whole-suite run; `::` anywhere, or paths that all end in `.py`, is targeted.
-    """
+    """A `pytest` word in command position with no targeted path after it"""
     if words[:1] == ["pytest"]:
         args = words[1:]
     elif words[:3] == ["uv", "run", "pytest"]:
@@ -734,21 +553,10 @@ def _is_whole_suite(words: list[str]) -> bool:
 
 
 def long_shell_shape(command: str) -> str | None:
-    """Which long-running shape this command is, or None — `"suite"`, `"ci-watch"`,
-    `"sleep"`.
-
-    ONE MATCHER, TWO CALL SITES: `long_foreground_decision` refuses the shape in the
-    foreground and `background_task_decision` permits it backgrounded (§3a and §4 of
-    docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md). A second
-    spelling of "long" would let a shape be refused in both positions, leaving a lead no
-    legal way to run it at all — kn-d4d5a967's rule applied to a matcher.
-
-    Reads `_mask_shell_text`, so a shape inside a quoted string or a comment is prose.
-    """
+    """Which long-running shape this command is, or None — `"suite"`, `"ci-watch"`, `"sleep"` (docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md)"""
     masked = _mask_shell_text(command)
     statements = _statements(masked)
-    # A bound on a loop is not an unbounded wait, and refusing it would leave the lead no
-    # way to express "poll, but give up in time".
+    # A bound on a loop is not an unbounded wait
     if statements and statements[0][:1] == ["timeout"] and len(statements[0]) > 1:
         limit = _seconds(statements[0][1])
         if limit is not None and limit <= MAX_FOREGROUND_SECONDS:
@@ -772,7 +580,7 @@ def long_shell_shape(command: str) -> str | None:
 
 
 def long_seat_call(payload: dict[str, Any]) -> str | None:
-    """The seat this payload delegates to in the FOREGROUND, if it is a long one."""
+    """The seat this payload delegates to in the FOREGROUND, if it is a long one"""
     if payload.get("tool_name") not in ("Agent", "Task"):
         return None
     tool_input = payload.get("tool_input") or {}
@@ -782,10 +590,7 @@ def long_seat_call(payload: dict[str, Any]) -> str | None:
     return seat if seat in LONG_SEATS else None
 
 
-#: What each refused shape is told, keyed by the arm `long_shell_shape` returns. The
-#: suite text names the pinned rule FIRST and backgrounding second: kn-356c724b says a
-#: worker must not run the whole suite locally at all, and this must not read as
-#: permission to (§3a).
+#: What each refused shape is told, keyed by the arm `long_shell_shape` returns
 _LONG_SHELL_ADVICE = {
     "suite": (
         "Run your targeted tests instead: the tests for what you changed are the "
@@ -809,7 +614,7 @@ _LONG_SHELL_ADVICE = {
     ),
 }
 
-#: The reason every arm carries, because the correction is worthless without it.
+#: The reason every arm carries, because the correction is worthless without it
 _LONG_WHY = (
     "Your prompt cache lives 5 minutes: a call more than 300 seconds after the previous "
     "one re-sends this whole conversation at the 1.25x write rate, where a check-in "
@@ -820,17 +625,7 @@ _LONG_WHY = (
 
 def long_foreground_decision(payload: dict[str, Any],
                              env: dict[str, str]) -> dict[str, Any] | None:
-    """Refuse a foreground call whose wall clock is known to outlive the cache.
-
-    §3 of docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md,
-    issue 868: 85 mid-turn `ttl-expiry` re-writes over 25 work orders, 9.1M tokens, ~$52,
-    and the OS's own remedy (`worker_session.compact`) runs BETWEEN turns, where the gap
-    is not.
-
-    Conditional on the DECLARED transport for `background_task_decision`'s reason: under
-    `spawn_background` the notifications arrive, the gap is the supervisor's problem and
-    this rule has no subject.
-    """
+    """Refuse a foreground call whose wall clock is known to outlive the cache (docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md)"""
     if env.get(TURN_TRANSPORT_ENV) != TRANSPORT_HEADLESS:
         return None
     tool = payload.get("tool_name")
@@ -848,7 +643,7 @@ def long_foreground_decision(payload: dict[str, Any],
     if tool != "Bash":
         return None
     command = tool_input.get("command", "")
-    # Already backgrounded is what this rule ASKS for; §4 is where that is permitted.
+    # Already backgrounded is what this rule ASKS for; §4 is where that is permitted
     if tool_input.get("run_in_background") or backgrounds_through_shell(command):
         return None
     arm = long_shell_shape(command)
@@ -859,17 +654,7 @@ def long_foreground_decision(payload: dict[str, Any],
 
 def crew_edit_decision(payload: dict[str, Any],
                        env: dict[str, str]) -> dict[str, Any] | None:
-    """Refuse the LEAD's own file edits, so the delegation is a control and not prose.
-
-    §7 of docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md. The
-    discriminator is the ABSENCE of `agent_type` on the payload (see the comment at the
-    gate's `_open_request` call below): PreToolUse carries it for a seat's calls.
-
-    The hole, stated in the spec and worth restating here: Bash is not denied, so a
-    heredoc or `sed -i` writes a file anyway. A wall for the tool surface, a speed bump
-    for the shell — the lead needs the shell for git, pytest and every `jarvis …`
-    command, and a lead that routes around this has decided to rather than forgotten.
-    """
+    """Refuse the LEAD's own file edits, so the delegation is a control and not prose (docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md)"""
     if payload.get("agent_type"):
         return None  # a seat, which is exactly what this rule wants
     if not (env.get("JARVIS_WO_ID") and env.get(TURN_TRANSPORT_ENV)):
@@ -897,37 +682,24 @@ def crew_edit_decision(payload: dict[str, Any],
     )
 
 
-#: The one file an investigator may write, relative to its worktree. Named here and in
-#: `dispatch._investigator_prompt` with the same spelling, because the prompt tells the
-#: session the path this hook exempts (§2.3 item 4).
-VERDICT_FILE = "verdict.json"
+#: The one file an investigator may write, relative to its worktree — its row in the kind table
+VERDICT_FILE = WO_KIND_CONTRACTS["investigator"].artifact
 
-#: `(program, subcommand)` pairs an investigator may run. `gate_rules.reads_only` covers
-#: the general case and DELIBERATELY EXCLUDES `git` and `gh` — `gate_rules._READERS`'
-#: membership rule is "what a tool CAN do", and `git` pushes. So these are keyed on the
-#: PAIR, the concept `gate_rules._SUBCOMMAND_TOOLS` already names: `git` is not a thing
-#: you do, `git push` is. §2.6 of
-#: docs/superpowers/specs/2026-09-27-investigation-orders.md.
+#: `(program, subcommand)` pairs an investigator may run (docs/superpowers/specs/2026-09-27-investigation-orders.md)
 INVESTIGATOR_READS = frozenset({
     ("git", "log"), ("git", "show"), ("git", "diff"), ("git", "status"),
     ("git", "blame"), ("git", "rev-parse"), ("git", "rev-list"),
     ("gh", "pr"), ("gh", "issue"), ("gh", "run"),
 })
 
-#: …and which third word each `gh` subcommand may carry. `gh pr view` reads; `gh pr
-#: create` and `gh pr merge` are the two commands this whole kind exists not to run, and
-#: they share the `("gh", "pr")` pair.
+#: …and which third word each `gh` subcommand may carry
 INVESTIGATOR_GH_ACTIONS = {
     "pr": frozenset({"view", "diff", "checks", "list"}),
     "issue": frozenset({"view", "list"}),
     "run": frozenset({"view", "list"}),
 }
 
-#: Every `jarvis` verb an investigator may run: the read verbs, plus EXACTLY four
-#: mutations. `jarvis bug report` and `jarvis issues start` are absent on purpose (§3.1):
-#: `ops` files an expedited bug after its OWN duplicate search, so an investigator holding
-#: either has a route that bypasses that check — which is the #792 defect, re-introduced
-#: through the allowlist.
+#: Every `jarvis` verb an investigator may run: the read verbs, plus EXACTLY four mutations (#792)
 INVESTIGATOR_JARVIS_READS = frozenset({
     ("wo", "show"), ("wo", "list"), ("fo", "show"), ("fo", "list"),
     ("io", "show"), ("io", "list"), ("investigate", "show"), ("investigate", "list"),
@@ -941,32 +713,22 @@ INVESTIGATOR_JARVIS_MUTATIONS = frozenset({
     ("wo", "ask"), ("wo", "assume"), ("learn", "add"), ("investigate", "verdict"),
 })
 
-#: Read verbs whose SECOND word is an argument rather than a subverb — `jarvis inspect
-#: wo-1`, `jarvis issues proj_a`. Kept apart from the pairs above because the pair table
-#: cannot express "anything may follow": a `(verb, "")` entry with a blanket fallback
-#: would clear `jarvis issues start`, which DISPATCHES a work order.
+#: Read verbs whose SECOND word is an argument rather than a subverb
 INVESTIGATOR_JARVIS_ARG_VERBS = frozenset({
     "status", "inspect", "cost", "alarms", "doctor", "search", "brief", "inbox",
     "issues",
 })
 
-#: …and the one mutating subverb hiding under one of them. `jarvis issues start` opens a
-#: work order on a tracker issue, which is §3.1's second refusal.
+#: …and the one mutating subverb hiding under one of them
 INVESTIGATOR_JARVIS_DENIED = frozenset({("issues", "start")})
 
-#: Programs that run or write whatever they are told to, and that no evidence READ needs.
-#: `gate_rules.reads_only` clears a segment on the program's NAME, so `awk` — an
-#: interpreter with `system()` — reads there as a reader. Refused WHOLE rather than parsed
-#: (§2.6): deciding whether one `awk` program writes is not decidable, and this kind has
-#: `grep`, `cat`, `jq`, `git` and `gh` for everything it actually does.
+#: Programs that run or write whatever they are told to, and that no evidence READ needs
 INVESTIGATOR_REFUSED_PROGRAMS = frozenset({
     "awk", "gawk", "mawk", "perl", "python", "python3", "ruby", "node", "xargs",
     "tee", "dd", "truncate", "install", "patch", "ed", "ex", "vi", "vim",
 })
 
-#: `find` predicates that MATCH or PRINT to stdout and nothing else — an ALLOWLIST, so
-#: `-delete`, `-exec*`, `-ok*` and the `-fprint*`/`-fls` family are refused by being
-#: absent rather than by being named (§2.6).
+#: `find` predicates that MATCH or PRINT to stdout and nothing else
 INVESTIGATOR_FIND_READS = frozenset({
     "-name", "-iname", "-lname", "-ilname", "-path", "-ipath", "-regex", "-iregex",
     "-type", "-xtype", "-maxdepth", "-mindepth", "-depth", "-mount", "-xdev",
@@ -980,8 +742,7 @@ INVESTIGATOR_FIND_READS = frozenset({
     "-H", "-L", "-P", "-D", "-O",
 })
 
-#: `sort` long options that write nothing. `--output` and `--compress-program` are absent,
-#: and so is every abbreviation of them git-style parsing would accept (§2.6).
+#: `sort` long options that write nothing
 INVESTIGATOR_SORT_LONG = frozenset({
     "--ignore-leading-blanks", "--dictionary-order", "--ignore-case",
     "--general-numeric-sort", "--ignore-nonprinting", "--month-sort",
@@ -991,13 +752,11 @@ INVESTIGATOR_SORT_LONG = frozenset({
     "--parallel", "--debug", "--files0-from", "--help", "--version",
 })
 
-#: …and its short options, `o` absent. `k t S T` take the rest of the cluster as their
-#: ARGUMENT, so the walk stops there rather than reading `-k2,2` as the letters `2`, `,`.
+#: …and its short options, `o` absent
 INVESTIGATOR_SORT_SHORT = "bdfgiMhnRrsuVzcCktST"
 INVESTIGATOR_SORT_ARG_SHORT = "ktST"
 
-#: `sed` options that leave the stream alone. `--in-place`, `--file` and the short `i`
-#: and `f` are refused by absence (§2.6).
+#: `sed` options that leave the stream alone
 INVESTIGATOR_SED_LONG = frozenset({
     "--quiet", "--silent", "--regexp-extended", "--null-data", "--separate",
     "--unbuffered", "--posix", "--sandbox", "--debug", "--expression", "--help",
@@ -1005,9 +764,7 @@ INVESTIGATOR_SED_LONG = frozenset({
 })
 INVESTIGATOR_SED_SHORT = "nErsuze"
 
-#: A PLAIN `sed` script: addresses and at most one of `p P d = l q` per statement. `w`,
-#: `W`, `e`, `s`, `y`, `r`, `R`, `{` and the branch commands are refused by failing to
-#: match at all, so an unmodelled script is a refusal (§2.6).
+#: A PLAIN `sed` script: addresses and at most one of `p P d = l q` per statement
 _SED_ADDRESS = r"(?:\d+(?:~\d+)?|\$|/(?:\\.|[^/\\])*/[IM]*)"
 _SED_RANGE = rf"{_SED_ADDRESS}(?:,(?:{_SED_ADDRESS}|\+\d+|~\d+))?"
 _SED_STATEMENT = rf"\s*(?:{_SED_RANGE})?\s*!?\s*[pPd=lq]?\s*"
@@ -1015,25 +772,13 @@ _SED_PLAIN = re.compile(rf"\A{_SED_STATEMENT}(?:[;\n]{_SED_STATEMENT})*\Z")
 
 
 def _sed_script_is_plain(script: str) -> bool:
-    """Whether one `sed` SCRIPT is an address/print script and nothing else (§2.6)."""
+    """Whether one `sed` SCRIPT is an address/print script and nothing else (§2.6)"""
     return bool(_SED_PLAIN.match(script))
 
 
 def _investigator_writer(segment: str) -> bool:
-    """Whether one SEGMENT is a reader that writes a file anyway — §2.6's own test.
-
-    `gate_rules.reads_only` clears a segment on the PROGRAM NAME, and `sed`, `sort` and
-    `find` each write from their own arguments with no redirection to give them away.
-    That test is structural and shared by every gate; this one is scoped to the
-    investigator, whose guarantee is "changes no file" rather than "runs nothing
-    privileged", so it belongs here and never in `gate_rules`.
-
-    ALLOWLISTS, never denylists: each of the three is refused unless every option, and
-    for `sed` the script itself, is a form known to write nothing. A writing option
-    nobody thought to name — `--outp=f`, `-fprintf`, `W` — fails closed (§2.6).
-    """
-    # PARSED, for `_investigator_git_read`'s reason: the shell strips quotes before the
-    # program sees the argument. A parse this cannot do is a refusal, not a pass.
+    """Whether one SEGMENT is a reader that writes a file anyway — §2.6's own test"""
+    # PARSED, for `_investigator_git_read`'s reason: the shell strips quotes before the program sees the...
     try:
         words = shlex.split(segment)
     except ValueError:
@@ -1054,21 +799,14 @@ def _investigator_writer(segment: str) -> bool:
 
 
 def _short_cluster(arg: str) -> str:
-    """The bundled short-option LETTERS of `arg`, or `""` when it is not a cluster.
-
-    `-nro` is three options, not a prefix — the bug this exists to close.
-    """
+    """The bundled short-option LETTERS of `arg`, or `""` when it is not a cluster"""
     if not arg.startswith("-") or arg.startswith("--") or arg == "-":
         return ""
     return arg[1:]
 
 
 def _sort_writes(args: list[str]) -> bool:
-    """Whether a `sort` invocation writes a file: anything off the allowlist (§2.6).
-
-    THE LETTERS IN THE CLUSTER, never the argument's prefix: `sort -nro f` writes and
-    does not start with `-o`.
-    """
+    """Whether a `sort` invocation writes a file: anything off the allowlist (§2.6)"""
     for arg in args:
         if arg.startswith("--"):
             if arg.split("=", 1)[0] not in INVESTIGATOR_SORT_LONG:
@@ -1083,14 +821,7 @@ def _sort_writes(args: list[str]) -> bool:
 
 
 def _sed_writes(args: list[str]) -> bool:
-    """Whether a `sed` invocation leaves the stream: any option or script off the
-    allowlists (§2.6), so `-i`, `-f`, `--in-place=BAK`, `--file=` and `W` all refuse.
-
-    The cluster is read LEFT TO RIGHT because sed's own parse does: `-i` takes an
-    optional suffix glued to it and `-e`/`-f` take the rest of the cluster as their
-    argument, so `-ni` is in-place, `-nf` reads its script from a file this hook cannot
-    see, and `-ne` is an ordinary read whose script is the next word.
-    """
+    """Whether a `sed` invocation leaves the stream: any option or script off the allowlists (§2.6)"""
     scripts: list[str] = []
     expect, seen_script = "", False
     for arg in args:
@@ -1130,21 +861,16 @@ def _sed_writes(args: list[str]) -> bool:
     return not all(_sed_script_is_plain(s) for s in scripts)
 
 
-# The programs a heredoc body is HANDED TO as a program or a stream to edit — the set
-# fix 1 of docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md names. A
-# subset of `gate_rules._EXECUTORS` plus `cat` and `sed`: the routes a file edit actually
-# takes. `git commit -F - <<EOF` is not here, and that is the whole `data` versus
-# `program` distinction `gate_rules.program_spans` already draws.
+# The programs a heredoc body is HANDED TO as a program or a stream to edit (docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md)
 HEREDOC_INTERPRETERS = frozenset({
     "python", "python3", "perl", "ruby", "node", "sed", "gsed", "awk", "gawk", "cat",
 })
 
-# `> path`, `>> path`. A descriptor on either side is not a file: `2>` is preceded by a
-# digit, `>&2` and `>&1` name a descriptor, and `/dev/null` keeps nothing.
+# `> path`, `>> path`
 _HEREDOC_REDIRECT = re.compile(r"(?<![0-9<>&])>{1,2}\s*(?P<path>[^\s|;&<>()]+)")
 _HEREDOC_TEE = re.compile(r"\btee\b(?P<opts>(?:\s+-{1,2}[A-Za-z-]+)*)\s+(?P<path>[^\s|;&<>()]+)")
 
-# A Python write target INSIDE the body: the three spellings the spec names.
+# A Python write target INSIDE the body: the three spellings the spec names
 _PY_OPEN_WRITE = re.compile(
     r"""open\s*\(\s*(?P<target>[^,()]*?)\s*,\s*(?P<q>['"])(?P<mode>[rwxab+]{1,3})(?P=q)""")
 _PY_WRITE_TEXT = re.compile(r"""\.\s*write_text\s*\(|\.\s*open\s*\(\s*['"][wa]""")
@@ -1159,11 +885,7 @@ _HEREDOC_DENY = (
     "request was filed. Write the file with `Edit`/`Write` and carry on."
 )
 
-#: The same refusal for an INVESTIGATOR, which `_HEREDOC_DENY` misleads: `Edit` is refused
-#: on every path and `Write` on every path but one, so "use `Edit` or `Write`" sent four
-#: sessions on 2026-10-01 looking for a remedy they did not have. §2.6 of
-#: docs/superpowers/specs/2026-10-01-a-submitted-verdict-must-settle-its-investigator.md,
-#: and kn-832967f3's sibling fix: the enforcement was right, the message cost the turns.
+#: The same refusal for an INVESTIGATOR (docs/superpowers/specs/2026-10-01-a-submitted-verdict-must-settle-its-investigator.md)
 _HEREDOC_DENY_INVESTIGATOR = (
     "Refused: this command writes a file through a heredoc, which is refused for every "
     f"worker in the fleet — a heredoc's CONTENT reaches the command classifier. You are "
@@ -1177,11 +899,7 @@ _HEREDOC_DENY_INVESTIGATOR = (
 
 
 def _heredoc_owner_programs(command: str) -> tuple[list[str], list[tuple[int, int]]]:
-    """The program names in `command`, and the heredoc bodies it contains.
-
-    One parse, `gate_rules`', rather than a second spelling of "what is a heredoc" —
-    that module's `heredoc_spans` is the owner test the whole distinction rests on.
-    """
+    """The program names in `command`, and the heredoc bodies it contains"""
     from . import gate_rules
 
     bodies = [(s, e) for s, e, _, _ in gate_rules.heredoc_spans(command)]
@@ -1192,11 +910,7 @@ def _heredoc_owner_programs(command: str) -> tuple[list[str], list[tuple[int, in
 
 
 def _inside(path_text: str, cwd: Path) -> bool:
-    """Whether `path_text` names a file inside the worker's own worktree.
-
-    A path OUTSIDE it is left to the rules that already own it — the same boundary
-    `investigator_write_decision` draws below.
-    """
+    """Whether `path_text` names a file inside the worker's own worktree"""
     if not path_text or path_text.startswith(("&", "-", "$")):
         return False
     try:
@@ -1211,10 +925,7 @@ def _inside(path_text: str, cwd: Path) -> bool:
 
 def _heredoc_shell_writes(command: str, bodies: list[tuple[int, int]],
                           cwd: Path) -> bool:
-    """A redirect or a `tee` to a path inside the worktree, bodies blanked.
-
-    Blanked because a `>` in the BODY is the interpreter's text, not the shell's.
-    """
+    """A redirect or a `tee` to a path inside the worktree, bodies blanked"""
     chars = list(command)
     for start, end in bodies:
         for i in range(max(0, start), min(len(chars), end)):
@@ -1233,7 +944,7 @@ def _heredoc_shell_writes(command: str, bodies: list[tuple[int, int]],
 
 
 def _heredoc_sed_writes(command: str, cwd: Path) -> bool:
-    """`sed -i` on a file inside the worktree — `_sed_writes`' parse, not a second one."""
+    """`sed -i` on a file inside the worktree — `_sed_writes`' parse, not a second one"""
     from . import gate_rules
 
     for start, end, name in gate_rules.segments(command):
@@ -1254,7 +965,7 @@ def _heredoc_sed_writes(command: str, cwd: Path) -> bool:
 
 def _heredoc_python_writes(command: str, bodies: list[tuple[int, int]],
                            cwd: Path) -> bool:
-    """A write target named by a string literal in a heredoc body."""
+    """A write target named by a string literal in a heredoc body"""
     for start, end in bodies:
         body = command[start:end]
         for match in _PY_OPEN_WRITE.finditer(body):
@@ -1272,27 +983,7 @@ def _heredoc_python_writes(command: str, bodies: list[tuple[int, int]],
 
 def heredoc_write_decision(payload: dict[str, Any],
                            env: dict[str, str]) -> dict[str, Any] | None:
-    """Refuse a FILE EDIT written through a heredoc. It belongs in `Edit`/`Write`.
-
-    Fix 1 of docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md. The
-    classifier is right about what `python3 - <<PY` is — a program, not data — so the
-    fix is not to relax it (`gate_rules` is untouched, and kn-986fc008/kn-f5e46f07 rule
-    that relaxation out). The fix is that a file's CONTENT must never reach a command
-    classifier at all: `Edit`/`Write` are auto-allowed in the worktree below and cost
-    nothing, while the heredoc route is the only one that can trip a gate.
-
-    DENIES ONLY ON POSITIVE EVIDENCE OF A FILE WRITE inside the worker's own worktree —
-    a redirect or `tee` to a path, `sed -i`, or a Python write target in the body. Never
-    on "the gate matched" and never on "this is a heredoc": a body that computes and
-    prints goes through untouched, `git commit -F - <<EOF` is not an interpreter, and a
-    path outside the worktree is not this rule's business.
-
-    NO ALLOW BRANCH, EVER. It denies or it returns None, which is what makes it legal to
-    run BEFORE `gate_decision` — see `preflight_decision`'s docstring. An investigator's
-    `verdict.json` is no exception: the remedy is the `Write` tool, which the DENIAL now
-    names (`_HEREDOC_DENY_INVESTIGATOR`), and an allow branch here would move a
-    security-ordering argument to save one tool call.
-    """
+    """Refuse a FILE EDIT written through a heredoc (docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md)"""
     if payload.get("tool_name") != "Bash" or not env.get("JARVIS_WO_ID"):
         return None
     command = ((payload.get("tool_input") or {}).get("command") or "").strip()
@@ -1307,9 +998,7 @@ def heredoc_write_decision(payload: dict[str, Any],
             or _heredoc_sed_writes(command, cwd)
             or _heredoc_python_writes(command, bodies, cwd)):
         return None
-    # On the deny path ONLY, so the common case pays no I/O at all. The event is not in
-    # `timeline.DEBUG_KINDS` on purpose: a refused write is a fact about the work, and
-    # the record is the only place anyone will see it.
+    # On the deny path ONLY, so the common case pays no I/O at all
     ctx = _worker_context(env, Path(cwd_text))
     if ctx is not None:
         root, wo_id = ctx
@@ -1325,8 +1014,7 @@ def heredoc_write_decision(payload: dict[str, Any],
                 store.close()
         except Exception:  # noqa: BLE001 — the refusal stands whether or not it recorded
             pass
-    # The classifier, the parse and the event above are kind-blind; only the sentence the
-    # session reads is chosen here (§2.6 of the 2026-10-01 spec).
+    # The classifier, the parse and the event above are kind-blind
     if env.get(WO_KIND_ENV) == "investigator":
         return _deny(_HEREDOC_DENY_INVESTIGATOR)
     return _deny(_HEREDOC_DENY)
@@ -1334,26 +1022,11 @@ def heredoc_write_decision(payload: dict[str, Any],
 
 def investigator_write_decision(payload: dict[str, Any],
                                 env: dict[str, str]) -> dict[str, Any] | None:
-    """Refuse an INVESTIGATOR's file writes, so "it changes no code" is a control.
-
-    §2.6 of docs/superpowers/specs/2026-09-27-investigation-orders.md, and the hole
-    `crew_edit_decision` above records rather than fixes: a `permissions.deny` cannot
-    express "no writes except one file" (src/jarvis/dispatch.py:696-699), so this is a
-    hook.
-
-    ONE exempt path, and only for `Write`: the worktree's `verdict.json`. `Edit` on it is
-    refused too — a verdict is written whole, and allowing `Edit` would mean a hook that
-    has to reason about a fragment, which is `spec_shape_decision`'s argument below.
-
-    Unlike `crew_edit_decision` this does NOT exempt `.jarvis`: an investigator has no
-    generated state to own. A path outside the worktree is refused elsewhere and is not
-    this rule's business, exactly as there.
-    """
+    """Refuse an INVESTIGATOR's file writes, so "it changes no code" is a control (docs/superpowers/specs/2026-09-27-investigation-orders.md)"""
     if env.get(WO_KIND_ENV) != "investigator":
         return None
     tool = payload.get("tool_name") or ""
-    # FAIL CLOSED on every MCP tool but the read-only Serena ones: an MCP write reaches no
-    # `Edit`/`Write` branch, and `dispatch.serena_allow_rules()` denies nothing (§2.6).
+    # FAIL CLOSED on every MCP tool but the read-only Serena ones: an MCP write reaches no `Edit`/`Write`...
     if tool.startswith("mcp__"):
         from . import dispatch
 
@@ -1381,33 +1054,14 @@ def investigator_write_decision(payload: dict[str, Any],
 
 def investigator_bash_decision(payload: dict[str, Any],
                                env: dict[str, str]) -> dict[str, Any] | None:
-    """Refuse an INVESTIGATOR's mutating shell commands. The half `crew_edit_decision`
-    deliberately does not have, and the reason this is a hook and not a deny rule.
-
-    §2.6 of docs/superpowers/specs/2026-09-27-investigation-orders.md. For this kind the
-    shell is not an escape hatch, it is the primary tool — the investigator lives in `git
-    log`, `gh pr view` and `jarvis … show` — so a speed bump is not enough: without this,
-    `sed -i` on product code and `git commit` both go straight through.
-
-    Allowed only for a `jarvis` chain whose every verb is permitted, or a chain whose
-    EVERY segment clears `_investigator_writer` AND is either an `INVESTIGATOR_READS`
-    pair or passes `gate_rules.reads_only` (structural, already refusing command
-    substitution, shell invokers, unterminated heredocs and `sed -i`). `reads_only` keys
-    on the program name, so `_investigator_writer` is what stops `sed -n 'w f'`, `sort
-    -o f` and `awk` — readers that write from their own arguments — by ALLOWLISTING the
-    option and script forms that write nothing and refusing everything else.
-    """
+    """Refuse an INVESTIGATOR's mutating shell commands (docs/superpowers/specs/2026-09-27-investigation-orders.md)"""
     if env.get(WO_KIND_ENV) != "investigator" or payload.get("tool_name") != "Bash":
         return None
     command = ((payload.get("tool_input") or {}).get("command") or "").strip()
     if not command:
         return None
     if _investigator_may_run(command):
-        # An EXPLICIT allow, not `None`: `preflight_decision`'s docstring records that
-        # these auto-approvals exist because a background session otherwise stalls on a
-        # permission prompt, and this kind's core evidence reads (`git log`, `gh pr view`)
-        # must not be the calls that can stall it. Safe in this position and only here:
-        # `gate_decision` has already had its say above (§2.6).
+        # An EXPLICIT allow, not `None`: `preflight_decision`'s docstring records that these auto-approvals...
         return _allow("investigator read")
     return _deny(
         f"Refused: `{command[:160]}`. An investigation READS — it changes no file, "
@@ -1421,8 +1075,7 @@ def investigator_bash_decision(payload: dict[str, Any],
     )
 
 
-#: The refusal IS the mitigation, so it names the call to make instead and the
-#: activation fallback — both Serena spellings, as `serena_activation_context` does.
+#: The refusal IS the mitigation, so it names the call to make instead and the activation fallback
 _PY_NAV_DENY = (
     "Refused: read Python with SYMBOLS, not text. Call "
     "`mcp__plugin_serena_serena__find_symbol` — or `get_symbols_overview` for a file, "
@@ -1434,45 +1087,14 @@ _PY_NAV_DENY = (
 
 def py_nav_decision(payload: dict[str, Any],
                     env: dict[str, str]) -> dict[str, Any] | None:
-    """Refuse a source-navigating Bash call at a `.py` path, naming the symbol call.
-
-    §6 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md. Behind `worker.py_nav_hook`,
-    DEFAULT OFF: a hook nobody has enabled cannot strand a worker.
-
-    POSITION: in the Bash chain of `preflight_decision`, immediately after
-    `investigator_bash_decision` and BEFORE the `is_jarvis_command_chain` auto-allow.
-    That auto-allow returns an allow, so an arm placed after it is unreachable in
-    production however green its unit test.
-
-    NO `_allow` BRANCH, EVER. It denies or it returns None, so it can hand out nothing.
-
-    Gated on `JARVIS_WO_ID`, so an interactive session in a managed project is
-    untouched, and on `.serena/project.yml` existing at the project root: a repo with no
-    symbol index must keep grep or the worker cannot read code at all.
-
-    IT ALSO REFUSES A WHOLE-FILE `Read` of a `.py` — §5.1 of
-    docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md. Behind the SAME key, because one
-    flip must not change two policies whose blockers differ.
-
-    THE `.py` ARM HAS NO SIZE THRESHOLD AND MUST NOT GROW ONE. It denies a `Read` with
-    no `limit` key and nothing else; a `Read` carrying ANY `limit` passes, however
-    large. §1(a) is why: every expensive `.py` `Read` passed no `limit` (487,048 tok
-    over 133 calls) and every cheap one passed a small one (1,242,656 tok over 1,422
-    calls), so `limit is None` already separates the two populations. "Large" is a later
-    order's question and it must arrive as a catalog key under `worker.*`, never as a
-    module constant here.
-    """
+    """Refuse a source-navigating Bash call at a `.py` path, naming the symbol call (docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md)"""
     if payload.get("tool_name") not in ("Bash", "Read"):
         return None
     if env.get("JARVIS_PY_NAV_HOOK") != "on":
         return None
     if not env.get("JARVIS_WO_ID"):
         return None
-    # ONE gate for BOTH arms, resolved once before the split: §5.1 of
-    # docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md gives the `Read` arm the same
-    # `.serena/project.yml` precondition as the Bash arm, and a copied check is the drift
-    # this tree has paid for twice. Shared by construction, so a later reader cannot
-    # widen one arm and leave the other.
+    # ONE gate for BOTH arms, resolved once before the split: §5.1 of... (docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md)
     cwd = payload.get("cwd") or ""
     if not cwd:
         return None
@@ -1482,38 +1104,23 @@ def py_nav_decision(payload: dict[str, Any],
     tool_input = payload.get("tool_input") or {}
     if payload.get("tool_name") == "Read":
         file_path = tool_input.get("file_path") or ""
-        # NO threshold, by the ruling above: a missing `limit` is whole-file and is the
-        # only thing refused here.
-        # BOTH arms share the COUNTER's suffix set by identity — §5.5 of
-        # docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md. Two spellings of one
-        # predicate is the drift this tree has paid for twice, so the "this hook's OWN
-        # narrower set" ruling (§6 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md) is
-        # SUPERSEDED. A narrower enforcement set arrives as a `worker.*` catalog key,
-        # never as a second module constant.
+        # NO threshold, by the ruling above: a missing `limit` is whole-file and is the only thing refused... (docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md)
         if file_path.endswith(SOURCE_SUFFIXES) and "limit" not in tool_input:
             return _deny(_PY_NAV_DENY)
         return None
     command = (tool_input.get("command") or "").strip()
     if not command:  # Bash-only condition
         return None
-    # §6: a sweep counts only when its own scope names `.py` (issue 936).
+    # §6: a sweep counts only when its own scope names `.py` (issue 936)
     if not navigates_source(command, SOURCE_SUFFIXES, scoped_sweeps=True):
         return None
     return _deny(_PY_NAV_DENY)
 
 
-#: The FALLBACK bar, in lines, and 200 because §1's table prices a `head … .md` at 317
-#: tokens a call while the measured evasion is a `sed -n '1,2000p'` (§1(c): 1.25M tokens
-#: over 2,189 Bash calls). NOT the resolved number: `worker.doc_read_limit_lines` is the
-#: setting, `catalog.DEFAULT_WORKER_DOC_READ_LIMIT_LINES` is its fallback, and the hook
-#: reads the RESOLVED one out of the environment so a project that sets its own gets it.
-#: This literal exists only for the malformed-value case below.
+#: The FALLBACK bar, in lines, and 200 because §1's table prices a `head … .md` at 317 tokens a call...
 _DOC_READ_LIMIT_FALLBACK = 200
 
-#: The refusal IS the mitigation (§4.3), so it names those three commands and NOTHING
-#: else: a refusal that is not actionable alone buys a reworded retry. Repeated here as
-#: LITERALS rather than imported from `spec_index` — §2.1's rule: this module runs on
-#: every tool call of every managed worker, so an import is a fleet-wide per-command cost.
+#: The refusal IS the mitigation (§4.3)
 _DOC_NAV_DENY = (
     "Refused: read a spec by SECTION, not whole. Call `jarvis spec toc <path>` for the "
     "headings, `jarvis spec section <path> <n|name>` for the one you need, and "
@@ -1524,13 +1131,7 @@ _DOC_NAV_DENY = (
 
 
 def _doc_paths(command: str) -> list[str]:
-    """The `.md` paths this command NAMES.
-
-    A separate helper and not part of the decision below, which parses nothing: §5.5's
-    AST pin encloses that body. Masked first and split by `navigation._statements`, both
-    by identity — a `.md` inside a quoted string is prose, and a second masker is the
-    drift kn-7f5f2d0d records.
-    """
+    """The `.md` paths this command NAMES"""
     return [word
             for words in _statements(_mask_shell_text(command))
             for word in words
@@ -1539,33 +1140,7 @@ def _doc_paths(command: str) -> list[str]:
 
 def doc_nav_decision(payload: dict[str, Any],
                      env: dict[str, str]) -> dict[str, Any] | None:
-    """Refuse a WHOLE-FILE or oversized read of a spec, naming `jarvis spec`.
-
-    §5 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md. Behind
-    `worker.doc_nav_hook`, DEFAULT OFF: nothing here changes the behaviour of a running
-    worker until someone flips it.
-
-    POSITION: in the Bash chain of `preflight_decision`, immediately after
-    `py_nav_decision` and BEFORE the `is_jarvis_command_chain` auto-allow, which returns
-    an allow and would make this arm unreachable in production however green its unit
-    test; and in the new `Read` branch, where there is no auto-allow in front of it.
-
-    NO `_allow` BRANCH, EVER. It denies or it returns None, so it can hand out nothing a
-    gate would have caught.
-
-    Gated on `JARVIS_WO_ID`, so an interactive session in a managed project is
-    untouched. NOT gated on `.serena/project.yml`, unlike `py_nav_decision`: the
-    mitigation it names is a `jarvis` command, which every managed project has.
-
-    ONE BAR, SHARED BY BOTH ARMS, resolved from the environment. `dumps_doc` owns the
-    range extraction (`navigation._dump_span`) and this body parses nothing: a second
-    extractor would make the counter and the refusal disagree about what "40 lines"
-    means (§3.1).
-
-    A SMALL TARGETED DUMP IS NOT AN EVASION and refusing it is the brief's MUST NOT:
-    `head -40 docs/<spec>.md` is 317 tokens against a whole turn for a refusal, and a
-    `grep` over markdown is legal without exception, ever.
-    """
+    """Refuse a WHOLE-FILE or oversized read of a spec, naming `jarvis spec` (docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md)"""
     tool_name = payload.get("tool_name")
     if tool_name not in ("Read", "Bash"):
         return None
@@ -1577,20 +1152,14 @@ def doc_nav_decision(payload: dict[str, Any],
         limit_lines = int(env.get("JARVIS_DOC_READ_LIMIT_LINES", ""))
     except ValueError:
         limit_lines = _DOC_READ_LIMIT_FALLBACK
-    # ABSORBED QUIETLY, and a bad value is rejected LOUDLY by the catalog instead (§5.2):
-    # this runs on every PreToolUse, so a hook that raises on a malformed env var breaks
-    # every tool call in the session and not only the refused ones. A resolved 0 or a
-    # negative falls back too — as the bar it would refuse every targeted read in the
-    # fleet, which is §1.1's failure reached by accident.
+    # ABSORBED QUIETLY, and a bad value is rejected LOUDLY by the catalog instead (§5.2): this runs on...
     if limit_lines <= 0:
         limit_lines = _DOC_READ_LIMIT_FALLBACK
     tool_input = payload.get("tool_input") or {}
     if tool_name == "Read":
         if not is_spec_path(tool_input.get("file_path") or ""):
             return None
-        # A missing `limit` is whole-file (§1(a)), which is why this hook adds no disk
-        # access to any `Read`. A non-integer one reads as whole-file for the same
-        # reason the bar above is absorbed quietly: the hook must not raise.
+        # A missing `limit` is whole-file (§1(a)), which is why this hook adds no disk access to any `Read`
         limit = tool_input.get("limit")
         if not isinstance(limit, int) or limit > limit_lines:
             return _deny(_DOC_NAV_DENY)
@@ -1605,12 +1174,8 @@ def doc_nav_decision(payload: dict[str, Any],
 
 
 def _investigator_git_read(segment: str) -> bool:
-    """Whether one SEGMENT is an allowlisted `git`/`gh` read and nothing more.
-
-    §2.6 of docs/superpowers/specs/2026-09-27-investigation-orders.md.
-    """
-    # PARSED, never `segment.split()`: the shell strips quotes and backslashes before git
-    # sees the argument, so `"--output=x"` would otherwise pass the test below (§2.6).
+    """Whether one SEGMENT is an allowlisted `git`/`gh` read and nothing more (docs/superpowers/specs/2026-09-27-investigation-orders.md)"""
+    # PARSED, never `segment.split()`: the shell strips quotes and backslashes before git sees the...
     try:
         words = shlex.split(segment)
     except ValueError:
@@ -1619,12 +1184,7 @@ def _investigator_git_read(segment: str) -> bool:
     sub = words[1] if len(words) > 1 else ""
     if (program, sub) not in INVESTIGATOR_READS:
         return False
-    # `git diff --output=src/a.py` writes a file with no chaining at all, and this path
-    # never reaches `reads_only`. A global option before the subcommand needs no test:
-    # the pair check reads `-C` as the subcommand and fails already — leave it that way.
-    # git's parse-options takes any unambiguous prefix, so `--outp=x` writes too;
-    # `--output-indicator-new=` and friends are NOT prefixes of `--output`, write nothing,
-    # and must stay allowed — do not "tighten" this into a false refusal (§2.6).
+    # `git diff --output=src/a.py` writes a file with no chaining at all
     if program == "git":
         for word in words[2:]:
             name = word.split("=", 1)[0]
@@ -1637,31 +1197,26 @@ def _investigator_git_read(segment: str) -> bool:
 
 
 def _investigator_may_run(command: str) -> bool:
-    """The jarvis-chain test, else every segment a read. All-or-nothing either way."""
+    """The jarvis-chain test, else every segment a read"""
     from . import gate_rules
 
     verbs = jarvis_verbs(command)
     if verbs:
         permitted = INVESTIGATOR_JARVIS_READS | INVESTIGATOR_JARVIS_MUTATIONS
-        # EVERY segment, so `jarvis wo show … && jarvis wo finish …` loses the exemption
-        # on the second one rather than gaining it on the first.
+        # EVERY segment, so `jarvis wo show … && jarvis wo finish …` loses the exemption on the second one...
         return all(
             pair in permitted
             or (pair[0] in INVESTIGATOR_JARVIS_ARG_VERBS
                 and pair not in INVESTIGATOR_JARVIS_DENIED)
             for pair in verbs)
-    # A REDIRECTION IS A WRITE, and `gate_rules.reads_only` does not ask: `cat > file
-    # <<EOF` is every segment a reader and still writes the file. This is the hole
-    # `crew_edit_decision`'s docstring names, and the one command this kind must not have.
+    # A REDIRECTION IS A WRITE, and `gate_rules.reads_only` does not ask: `cat > file <<EOF` is every...
     masked = _mask_shell_text(command)
     if ">" in masked or "<" in masked:
         return False
-    # The git/gh path below bypasses `reads_only`, so its substitution test must exist
-    # here too (§2.6).
+    # The git/gh path below bypasses `reads_only`, so its substitution test must exist here too (§2.6)
     if "$(" in masked or "`" in masked:
         return False
-    # SEGMENT-WISE, on the inert form: a pair exemption clears the segment it is in and
-    # never the rest of the chain (§2.6).
+    # SEGMENT-WISE, on the inert form: a pair exemption clears the segment it is in and never the rest of...
     for start, end, _name in gate_rules.segments(command):
         segment = command[start:end].strip()
         if not segment:
@@ -1673,25 +1228,15 @@ def _investigator_may_run(command: str) -> bool:
     return True
 
 
-#: A spec's two load-bearing sections, matched on the HEADING alone.
+#: A spec's two load-bearing sections, matched on the HEADING alone
 _SPEC_PROBLEM = re.compile(r"problem|what is broken", re.IGNORECASE)
 _SPEC_FIX = re.compile(r"\bfix\b|solution", re.IGNORECASE)
 
 
 def spec_shape_decision(payload: dict[str, Any],
                         env: dict[str, str]) -> dict[str, Any] | None:
-    """Refuse a spec file that has no problem section and no fix section.
-
-    §8 of docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md. At `jarvis wo
-    finish` the spec is committed and in the pull request, so the correction costs a
-    validation round and a re-delivery; here it costs one retry inside the same turn.
-
-    `Write` only: an Edit payload carries a fragment, not the document, so the same test
-    there would refuse every legitimate incremental edit to a conforming spec.
-    """
-    # kind == worker, so a PLANNER's design doc is untouched: a feature spec is cut into
-    # sections a child work order each implements and is validated by `plans` on its own
-    # terms (§8 — the user's ruling that feature orders are a different shape).
+    """Refuse a spec file that has no problem section and no fix section (docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md)"""
+    # kind == worker, so a PLANNER's design doc is untouched: a feature spec is cut into sections a child...
     if (not env.get("JARVIS_WO_ID") or payload.get("tool_name") != "Write"
             or env.get(WO_KIND_ENV) != "worker"):
         return None
@@ -1713,12 +1258,7 @@ def spec_shape_decision(payload: dict[str, Any],
     )
 
 
-#: Unbounded quantifiers that can consume a NEWLINE. `.` crosses one only under DOTALL,
-#: which is why rule 1 below is gated on `multiline`; the character-class pairs cross one
-#: whatever the flags. Bounded forms (`.{0,200}`, `[\s\S]{0,500}`) are deliberately absent
-#: — a counted range cannot blow up — and so is `[^\n]*`, which is what the denial
-#: recommends. Issue #845, §4 of
-#: docs/superpowers/specs/2026-09-29-a-runaway-tool-call-is-not-a-slow-subagent.md.
+#: Unbounded quantifiers that can consume a NEWLINE (#845)
 _UNBOUNDED_WILDCARD = re.compile(
     r"\.[*+]|\[\\s\\S\][*+]|\[\\S\\s\][*+]|\[\\d\\D\][*+]|\[\\D\\d\][*+]"
     r"|\[\\w\\W\][*+]|\[\\W\\w\][*+]")
@@ -1736,9 +1276,7 @@ _BACKTRACKING_REFUSAL = (
 
 
 def _nests_an_unbounded_quantifier(pattern: str) -> bool:
-    """A group that CONTAINS an unbounded newline-crossing quantifier and is itself
-    quantified — `(.*\\n)*`, the classic exponential shape. Refused whatever `multiline`
-    says: this one does not need DOTALL to blow up."""
+    """A group that CONTAINS an unbounded newline-crossing quantifier and is itself quantified"""
     stack: list[int] = []
     for i, ch in enumerate(pattern):
         escaped = i > 0 and pattern[i - 1] == "\\"
@@ -1755,24 +1293,11 @@ def _nests_an_unbounded_quantifier(pattern: str) -> bool:
 
 def search_pattern_decision(payload: dict[str, Any],
                             env: dict[str, str]) -> dict[str, Any] | None:
-    """Refuse a `search_for_pattern` whose regex can hang the Serena server.
-
-    §4 of the spec above. TWO SHAPES AND NOTHING ELSE, because this hook sits in front of
-    every worker's primary search tool and a predicate that over-refuses costs a retry on
-    most searches the fleet makes: two or more unbounded newline-crossing quantifiers
-    when newlines ARE crossed, or a nested unbounded quantifier at any setting. A single
-    `.*` is the common case (`class .*Store`) and returns.
-
-    AN INPUT IT CANNOT READ IS ALLOWED. The tool's schema is not Jarvis's to own, and a
-    renamed parameter would otherwise take every worker's search tool offline. The cost
-    is that a schema change disarms this guard, which is why the spec's alarm (§2) and
-    `MCP_TOOL_TIMEOUT` (§3) sit behind it.
-    """
+    """Refuse a `search_for_pattern` whose regex can hang the Serena server"""
     from . import dispatch
 
     tool = payload.get("tool_name") or ""
-    # Both Serena prefixes, built from the one tuple that owns them: a plugin install
-    # produces the long one and `claude mcp add serena` the short one.
+    # Both Serena prefixes, built from the one tuple that owns them: a plugin install produces the long...
     if tool not in tuple(f"{p}{_SEARCH_PATTERN_TOOL}"
                          for p in dispatch.SERENA_TOOL_PREFIXES):
         return None
@@ -1782,7 +1307,7 @@ def search_pattern_decision(payload: dict[str, Any],
     pattern = tool_input.get("substring_pattern")
     if not isinstance(pattern, str) or not pattern:
         return None
-    # Serena defaults `multiline=True`, which is `re.DOTALL | re.MULTILINE`.
+    # Serena defaults `multiline=True`, which is `re.DOTALL | re.MULTILINE`
     crosses_newlines = bool(tool_input.get("multiline", True))
     if crosses_newlines and len(_UNBOUNDED_WILDCARD.findall(pattern)) >= 2:
         return _deny(_BACKTRACKING_REFUSAL)
@@ -1812,18 +1337,7 @@ def _deny(reason: str) -> dict[str, Any]:
 
 
 def gate_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:
-    """Mediate a privileged action: allow it if approved, otherwise get it reviewed.
-
-    Returns None when the command isn't gated — the caller then applies the ordinary
-    rules. Once a command IS recognised as privileged this never returns None: it either
-    allows (a live grant covers it) or denies. Including when the machinery itself
-    breaks — an unreadable DB must not become an open door, so errors deny.
-
-    The deny is not a refusal, it is a redirect. Approval cannot be resolved inline: the
-    hook has ~30 seconds and a Neo review takes minutes. So the first attempt files the
-    request and stops; the verdict arrives through the ordinary message channel and the
-    retry goes through.
-    """
+    """Mediate a privileged action: allow it if approved, otherwise get it reviewed"""
     from . import gates
 
     wo_id = env.get("JARVIS_WO_ID")
@@ -1848,18 +1362,7 @@ def gate_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any
 
 
 def _classify(command: str, config: Any) -> Any:
-    """Classify against the LIVE rule base, and count any exemption that fires.
-
-    The rules are in `os.db` because they change — a dismissal in another project may
-    already have settled this command's shape. Reading them here is what makes that
-    learning reach the one place it matters, the hook that would otherwise block a worker
-    mid-turn.
-
-    A database this cannot read falls back to the seeded recognisers, which is the safe
-    direction and not an obvious one: the fallback restores every recogniser and no
-    exemption, so a broken `os.db` makes the gate over-eager rather than absent. A worker
-    pays for a spurious review; nothing ships unreviewed.
-    """
+    """Classify against the LIVE rule base, and count any exemption that fires"""
     from . import gates
     from .central_store import CentralStore
     from .gate_rules import RuleSet
@@ -1878,10 +1381,7 @@ def _classify(command: str, config: Any) -> Any:
 
 
 def _case_deadline(config: Any) -> str:
-    """The sentence that turns the hold into a deadline the worker can see.
-
-    ABANDONED, not refused — spec 2026-09-12 §4.
-    """
+    """The sentence that turns the hold into a deadline the worker can see"""
     return (f"If you do neither within "
             f"{int(config.case_ttl_seconds // 60)} minutes the request is closed as "
             f"ABANDONED — nobody will have reviewed it, nothing will be decided, and the "
@@ -1910,10 +1410,7 @@ def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
                 gates.open_gate(store, grant, neo=neo)
             finally:
                 neo.close()
-            # Two things open a gate and only one of them is permission. Saying which is
-            # which here matters because this string is the audit record of why the
-            # command ran: "approved" against a command that was never privileged is the
-            # false entry the dismissed verdict exists to keep out of the log.
+            # Two things open a gate and only one of them is permission
             verb = ("dismissed as a classifier false positive (nothing was authorised) by"
                     if grant["status"] == "dismissed" else "approved by")
             return _allow(
@@ -1947,49 +1444,24 @@ def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
             )
 
         wo = store.get_work_order(wo_id)
-        # A request already on this work order for the same KIND, whatever string it was
-        # filed under — an approval is keyed to the exact command, so the case for this
-        # action is routinely on a row this one will not match (kn-237185ed). The
-        # placeholder says so instead of asserting the worker never made one (#233).
+        # A request already on this work order for the same KIND, whatever string it was filed under (#233)
         same_kind = next((a["id"] for a in store.list_approvals(wo_id)
                           if a["kind"] == action.kind), None)
         seat = payload.get("agent_type") or None
         neo = NeoStore()
         try:
-            # HELD, not queued. You ran the command instead of arguing for it, so there is
-            # no case to review yet — and handing a reviewer the placeholder now would get
-            # it decided before yours could arrive (GitHub issue 185).
-            #
-            # UNLESS A SUBAGENT RAN IT, and then there is no actor to hold it FOR. Issue
-            # 185's argument assumes somebody who will argue: the only mechanism that
-            # forces a held request to be argued is `held_request_turn_block`, which runs
-            # on the LEAD's `Stop`, and no `SubagentStop` hook is registered. So a held
-            # request raised in a seat is structurally guaranteed to reach
-            # `gates.sweep_unargued` — the choice is not "placeholder now versus case
-            # later", it is "placeholder now versus abandoned, every time". The lead can
-            # still attach a case afterwards: `ops.request_gate_approval` routes a pending
-            # row to `gates.amend_request`, which revises the reviewer's question in
-            # place. Fix 3 of
-            # docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md.
+            # HELD, not queued (docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md)
             approval, _ = gates.file_request(
                 store, neo, env.get("JARVIS_PROJECT", ""), wo, action,
                 justification=gates.no_case_justification(action.command, same_kind),
                 hold=seat is None,
-                # Which SEAT attempted it, if a subagent did. `JARVIS_WO_ID` is
-                # per-session, so the request is filed against the work order either way;
-                # this is the only thing that keeps the record from saying the lead ran a
-                # command its team ran. `PreToolUse` omits the key for the lead's own
-                # calls, so absence is the discriminator, not a sentinel value.
+                # Which SEAT attempted it, if a subagent did
                 agent_type=seat,
             )
         finally:
             neo.close()
         if seat is not None:
-            # A SEAT'S TEXT, not the lead's. The two exits name actions this actor
-            # cannot take — it has no turn boundary the OS can block and no channel to
-            # its lead — so printing `exits_advice` here would instruct it to do the one
-            # thing it cannot. Its request is already with a reviewer; what it owes is a
-            # report upward. Fix 3 of the spec above.
+            # A SEAT'S TEXT, not the lead's
             return _deny(
                 f"Gate `{action.kind}`: {action.summary} needs approval, so this attempt "
                 f"was blocked. Request {approval['id']} was filed AND IS ALREADY WITH A "
@@ -2006,7 +1478,7 @@ def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
                 f"command hands its own content to the classifier, which is how a test "
                 f"that merely mentions a privileged command ends up here."
             )
-        # Both exits, every time, with the diagnosis first — spec 2026-09-12 §3.
+        # Both exits, every time, with the diagnosis first — spec 2026-09-12 §3
         prior_abandoned = (prior is not None and prior["status"] == "expired"
                            and prior["closed_as"] == "abandoned")
         return _deny(
@@ -2033,25 +1505,7 @@ def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
 
 def under_review_decision(payload: dict[str, Any],
                           env: dict[str, str]) -> dict[str, Any] | None:
-    """Narrow the session to reading and `jarvis …` while a request is under review.
-
-    §2 of docs/superpowers/specs/2026-09-12-a-gate-that-holds.md: matching the exact
-    command string again is not a control, because the goal has other routes to it.
-
-    Only `pending`, never `awaiting_case` — a held request is one the worker still has
-    to argue, and the evidence a case is made of comes from running things.
-
-    Fails OPEN, unlike `gate_decision`. An unreadable database here would block every
-    tool call in every worker session; the privileged command itself stays blocked
-    regardless, because the gate that judges it fails closed.
-
-    It opens the store on every Bash call and every file write, and unlike
-    `_post_tool_compaction` there is no flag file to keep it to one `stat`: a request
-    goes pending in another process (Neo's drain, the user's `jarvis gate request`), so
-    anything cached in the worktree would be a stale copy of the fact that matters. The
-    cost is in line with the path it sits on — `gate_decision` above it already opens
-    `os.db` for the rule base on every Bash call.
-    """
+    """Narrow the session to reading and `jarvis …` while a request is under review (docs/superpowers/specs/2026-09-12-a-gate-that-holds.md)"""
     ctx = _worker_context(env, Path(payload.get("cwd") or "."))
     if ctx is None:
         return None
@@ -2085,27 +1539,14 @@ def under_review_decision(payload: dict[str, Any],
 
 def held_request_turn_block(store: ProjectStore, wo_id: str, payload: dict[str, Any],
                             env: dict[str, str]) -> dict[str, Any] | None:
-    """Stop: refuse to end a turn that would leave a gate request unargued.
-
-    §1 of the spec above. `awaiting_case` and NOT `pending`, and the asymmetry is the
-    whole design: a held request is cleared by one command in this turn, so the block
-    terminates, while a pending one is cleared only by a queued verdict that
-    `Daemon.deliver_messages` will not deliver into a turn still in flight.
-
-    One continuation, not a loop: `stop_hook_active` says Claude is already going again
-    because of this hook, and a worker that ignored the reason twice is better parked
-    than spun.
-    """
+    """Stop: refuse to end a turn that would leave a gate request unargued"""
     from . import gates
     from .invariants import TERMINAL_STATUSES
 
     if payload.get("stop_hook_active"):
         return None
     held = store.held_approvals(wo_id)
-    # The SAME set the sweeper reads (`check_no_orphan_gate_requests`), not a second
-    # spelling of it — kn-d4d5a967. A status that settles a work order there and not
-    # here would leave a dead one held at every turn boundary by a request already
-    # superseded.
+    # The SAME set the sweeper reads (`check_no_orphan_gate_requests`), not a second spelling of it
     if not held or store.get_work_order(wo_id)["status"] in TERMINAL_STATUSES:
         return None
 
@@ -2122,23 +1563,16 @@ def held_request_turn_block(store: ProjectStore, wo_id: str, payload: dict[str, 
             f"({request['kind']}) is recorded but NOT under review, and ending here "
             f"leaves it that way — no reviewer is shown it and nothing else can close "
             f"it. Take one of the two exits now, in this turn.\n\n"
-            # BOTH exits, from the same renderer as every other block (spec
-            # 2026-09-12-contesting-a-gate-match.md §3). A hold that named only the
-            # request would push a worker whose command performs no privileged action
-            # into writing a false case — which is the failure that spec exists to stop,
-            # and holding the turn would make it harder to walk away from.
+            # BOTH exits, from the same renderer as every other block (spec 2026-09-12-contesting-a-gate-match.md...
             f"{gates.exits_advice(wo_id, request['command'], request['kind'], request['id'])}"
-            # `from_json` always returns a config, falling back to the default TTL, so
-            # this reads the same clock `Daemon.refuse_unargued_gates` runs on.
+            # `from_json` always returns a config
             f"\n\n{_case_deadline(config)} "
             f"Then end the turn — the verdict arrives as your next user turn."
         ),
     }
 
 
-#: What a turn holding an uncollected background task is told. The correction first, the
-#: reason second, one exit — §5 of
-#: docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md.
+#: What a turn holding an uncollected background task is told (docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md)
 UNCOLLECTED_TASK_BLOCK = (
     "You may not end this turn: background task(s) {labels} were started in it and "
     "never collected, and ending here kills them — nothing wakes you and nobody reads "
@@ -2149,36 +1583,18 @@ UNCOLLECTED_TASK_BLOCK = (
     "so in your final message."
 )
 
-#: The timeline event the hold writes, so the record says why the turn was held.
+#: The timeline event the hold writes, so the record says why the turn was held
 UNCOLLECTED_TASK_EVENT = "background_task_uncollected"
 
 
 def uncollected_task_turn_block(store: ProjectStore, wo_id: str,
                                 payload: dict[str, Any],
                                 env: dict[str, str]) -> dict[str, Any] | None:
-    """Stop: refuse to end a turn that still has an uncollected background task.
-
-    §5 of docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md, and
-    it is what makes §4's carve-out safe: backgrounding the three long shapes is
-    permitted BECAUSE ending the turn on one is not. Shape copied from
-    `held_request_turn_block`, because the runtime offers exactly one mechanism for
-    holding a session at a turn boundary.
-
-    The evidence is the transcript and nothing else, through
-    `background.jobs_left_running` — one parser, two readers: `orphaned_in_turn` at reap
-    and this hook at Stop. Stop runs ONCE PER TURN, so importing `background` here is a
-    27ms-class cost on a boundary that already opens the store.
-
-    Where the transcript cannot answer — no session id, no file, an unreadable one — the
-    turn ends: a guard that blocked on missing evidence would trap a worker with no way
-    out. The reaper (`worker_session._reap`) is still the backstop for what a hook cannot
-    see.
-    """
+    """Stop: refuse to end a turn that still has an uncollected background task (docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md)"""
     from . import background
     from .invariants import TERMINAL_STATUSES
 
-    # One continuation, not a loop: a task that is genuinely hung must not make the turn
-    # unendable.
+    # One continuation, not a loop: a task that is genuinely hung must not make the turn unendable
     if payload.get("stop_hook_active"):
         return None
     if store.get_work_order(wo_id)["status"] in TERMINAL_STATUSES:
@@ -2204,39 +1620,12 @@ def uncollected_task_turn_block(store: ProjectStore, wo_id: str,
 
 
 def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:
-    """PreToolUse auto-approvals that keep autonomous workers unattended:
-
-    - `jarvis …` contract commands (also when prefixed with `cd <dir> &&`), which
-      otherwise stall background sessions on a permission prompt.
-    - File edits *inside the worker's own worktree* — the worktree exists solely for
-      this work order, so the worker owns it (verified live: acceptEdits alone still
-      prompted for Write in a background session). Only active for worker sessions
-      (JARVIS_WO_ID set), never for interactive sessions in managed projects.
-
-    Gated privileged actions are resolved FIRST, so no auto-approval below can hand out
-    a merge or a release by accident. The PR title and body rules are checked next, for
-    the same reason in reverse: they must not be reachable around by an auto-approval
-    below them.
-
-    ONE CHECK LEGALLY PRECEDES THE GATE, and only because it can never allow anything:
-    `heredoc_write_decision` has no `_allow` branch, so it cannot hand out a merge or a
-    release, and a command it refuses stays BLOCKED — strictly fewer commands run than
-    before. The ordering argument above is about auto-ALLOWS, and this is not one. It
-    must run first to do anything at all: `gate_decision` never returns None once a
-    command is recognised as privileged, so placed after it this check is unreachable for
-    exactly the commands it exists for — and running first means no approval row is filed
-    for this class, which is the point (fix 1 of
-    docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md).
-
-    `under_review_decision` sits between the two, and the position is deliberate on both
-    sides: after `gate_decision`, so a command a live grant covers still runs; before
-    everything else, so the narrowing is not reachable around either.
-    """
+    """PreToolUse auto-approvals that keep autonomous workers unattended (docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md)"""
     tool = payload.get("tool_name")
     tool_input = payload.get("tool_input") or {}
 
     if tool == "Bash":
-        # BEFORE the gate, and only because it never allows — see the docstring.
+        # BEFORE the gate, and only because it never allows — see the docstring
         heredoc = heredoc_write_decision(payload, env)
         if heredoc is not None:
             return heredoc
@@ -2252,42 +1641,31 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
         unreviewable = pr_body_decision(payload, env)
         if unreviewable is not None:
             return unreviewable
-        # BEFORE the auto-allow below, which would otherwise wave every `jarvis …`
-        # through and make the cap unreachable — the same ordering argument this
-        # docstring already makes for the two PR checks.
+        # BEFORE the auto-allow below, which would otherwise wave every `jarvis …` through and make the cap...
         overlong = finish_summary_decision(payload, env)
         if overlong is not None:
             return overlong
-        # Before the auto-allow for the ordering reason the comment above gives: it waves
-        # every `jarvis …` through and would make this check unreachable.
+        # Before the auto-allow for the ordering reason the comment above gives: it waves every `jarvis …`...
         pasted = payload_reference_decision(payload, env)
         if pasted is not None:
             return pasted
-        # Immediately before the refusal below, and before the auto-allow, for the same
-        # ordering reason as the cap above (§3 of
-        # docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md).
+        # Immediately before the refusal below (docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md)
         blocking = long_foreground_decision(payload, env)
         if blocking is not None:
             return blocking
-        # Before the auto-allow for the same reason as the cap above it (§4 of
-        # docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md).
+        # Before the auto-allow for the same reason as the cap above it (§4 of... (docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md)
         detached = background_task_decision(payload, env)
         if detached is not None:
             return detached
-        # BEFORE the auto-allow, and that ordering IS the enforcement: the auto-allow
-        # waves through every `jarvis` verb and, with it, every mutating one, so a denial
-        # placed after it passes a unit test and does nothing in production. §2.6 of
-        # docs/superpowers/specs/2026-09-27-investigation-orders.md.
+        # BEFORE the auto-allow, and that ordering IS the enforcement: the auto-allow waves through every... (docs/superpowers/specs/2026-09-27-investigation-orders.md)
         mutating = investigator_bash_decision(payload, env)
         if mutating is not None:
             return mutating
-        # Before the auto-allow for the ordering reason above (§6 of
-        # docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md).
+        # Before the auto-allow for the ordering reason above (§6 of... (docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md)
         text_read = py_nav_decision(payload, env)
         if text_read is not None:
             return text_read
-        # Immediately after it and BEFORE the auto-allow below, for that same ordering
-        # reason (§2.4 and §5.3 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md).
+        # Immediately after it and BEFORE the auto-allow below (docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md)
         dumped = doc_nav_decision(payload, env)
         if dumped is not None:
             return dumped
@@ -2295,31 +1673,20 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
             return _allow("jarvis contract command")
         return None
 
-    # Its own branch, and NOT folded into the `mcp__` one or the `Edit`/`Write` one
-    # below: a `Read` enters neither, so a refusal placed anywhere else is unreachable
-    # (§2.4 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md). THERE IS NO
-    # AUTO-ALLOW IN FRONT OF THIS BRANCH, so the ordering argument this docstring makes
-    # about arms after `is_jarvis_command_chain` does not apply here — the next reader
-    # will assume it does. No investigator arm either: a `Read` is read-only.
+    # Its own branch, and NOT folded into the `mcp__` one or the `Edit`/`Write` one below: a `Read`... (docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md)
     if tool == "Read":
         text_read = py_nav_decision(payload, env)
         if text_read is not None:
             return text_read
         return doc_nav_decision(payload, env)
 
-    # Its own branch for the same reason as `mcp__` below: a delegation enters no other
-    # block (§3 of
-    # docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md).
+    # Its own branch for the same reason as `mcp__` below: a delegation enters no other block (§3 of... (docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md)
     if tool in ("Agent", "Task"):
         return long_foreground_decision(payload, env)
 
-    # Its own branch: an `mcp__` tool name enters neither the Bash block above nor the
-    # `Edit`/`Write` one below, so the refusal is unreachable anywhere else (§2.6 of
-    # docs/superpowers/specs/2026-09-27-investigation-orders.md).
+    # Its own branch: an `mcp__` tool name enters neither the Bash block above nor the `Edit`/`Write` one... (docs/superpowers/specs/2026-09-27-investigation-orders.md)
     if isinstance(tool, str) and tool.startswith("mcp__"):
-        # FIRST: `investigator_write_decision` returns `None` for a read-only Serena
-        # tool, so a refusal placed after it would still be reached — but an investigator
-        # would fall through to nothing and get no useful message (spec §4).
+        # FIRST: `investigator_write_decision` returns `None` for a read-only Serena tool
         runaway = search_pattern_decision(payload, env)
         if runaway is not None:
             return runaway
@@ -2329,15 +1696,11 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
         narrowed = under_review_decision(payload, env)
         if narrowed is not None:
             return narrowed
-        # After the narrowing (a narrowed session is the stricter state) and before the
-        # worktree auto-allow, which would otherwise make both unreachable. §7 and §8 of
-        # docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md.
+        # After the narrowing (a narrowed session is the stricter state) and before the worktree auto-allow (docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md)
         undelegated = crew_edit_decision(payload, env)
         if undelegated is not None:
             return undelegated
-        # Beside it, for the same reason and in the same position: before the worktree
-        # auto-allow, which would otherwise make the refusal unreachable (§2.6 of
-        # docs/superpowers/specs/2026-09-27-investigation-orders.md).
+        # Beside it, for the same reason and in the same position: before the worktree auto-allow (docs/superpowers/specs/2026-09-27-investigation-orders.md)
         read_only = investigator_write_decision(payload, env)
         if read_only is not None:
             return read_only
@@ -2356,13 +1719,7 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
 
 
 def memory_topic(file_path: str) -> str | None:
-    """Topic name for a Claude Code memory file, or None if the path isn't one.
-
-    Claude Code keeps its own per-project file memory at
-    `<claude config dir>/projects/<slug>/memory/<name>.md` — a store Jarvis neither
-    writes nor reads, and which dies with the worker's worktree slug. `MEMORY.md` is
-    that store's index (pointers, not knowledge), so it is skipped.
-    """
+    """Topic name for a Claude Code memory file, or None if the path isn't one"""
     try:
         p = Path(file_path)
     except (TypeError, ValueError):
@@ -2376,13 +1733,7 @@ def memory_topic(file_path: str) -> str | None:
 
 
 def capture_memory_write(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:
-    """PostToolUse: mirror a worker's Claude-memory write into the knowledge base.
-
-    Workers are told to run `jarvis learn add`, but "remember this" is a reflex that
-    Claude Code's built-in memory answers first — and anything that lands there is
-    invisible to the user, to Neo, and to every future worker. Mirroring makes the
-    knowledge base the single memory regardless of which channel the worker reaches for.
-    """
+    """PostToolUse: mirror a worker's Claude-memory write into the knowledge base"""
     wo_id = env.get("JARVIS_WO_ID")
     if not wo_id:
         return None  # interactive session — its memory is its own business
@@ -2501,22 +1852,7 @@ def _digest(*chunks: bytes) -> str:
 
 
 def claude_cli_version(env: dict[str, str]) -> str:
-    """Which Claude Code built the prompt — the first suspect when the prefix moves.
-
-    Read off disk rather than from `claude --version`: a subprocess would cost more than
-    everything else in this hook put together, for a string that is already spelled out
-    in the install layout. The updater's own receipt is the fallback, and anything else
-    reports unknown rather than guessing.
-
-    TWO LAYOUTS, because getting this wrong is silent. The native installer symlinks
-    `claude` at a file whose NAME is the version — verified on this machine, where
-    `~/.local/share/claude/versions/2.1.272` is the 218MB executable itself and not a
-    directory holding one. The other plausible shape puts the binary INSIDE a
-    version-named directory (`…/versions/2.1.272/claude`), where the answer is the
-    parent's name. Reading only the first would leave the second at `?` for ever, which
-    `prefix_drift` skips on both sides — so the ingredient would be dead and every
-    fingerprint-to-fingerprint test would still pass (review round 2).
-    """
+    """Which Claude Code built the prompt — the first suspect when the prefix moves"""
     import shutil
 
     exe = shutil.which("claude", path=env.get("PATH") or os.defpath)
@@ -2537,17 +1873,7 @@ def claude_cli_version(env: dict[str, str]) -> str:
 
 
 def claude_md_excludes(root: Path, cwd: Path) -> list[Path]:
-    """The ancestor CLAUDE.md copies a worker must NOT be given, for `claudeMdExcludes`.
-
-    A worker's cwd is `<root>/.claude/worktrees/<id>`, inside the project, so the CLI
-    resolves the project's CLAUDE.md twice — the branch's copy and the main checkout's,
-    which can be a different revision. From `cwd.parent` up through `root`: the
-    worktree's own copy is the branch's, the one the worker must obey. Spec
-    docs/superpowers/specs/2026-09-29-one-copy-of-the-projects-claude-md.md §1.
-
-    Empty for a cwd at the root or outside it — such a turn has no ancestor copy to
-    drop, and that is the answer rather than an error.
-    """
+    """The ancestor CLAUDE.md copies a worker must NOT be given, for `claudeMdExcludes` (docs/superpowers/specs/2026-09-29-one-copy-of-the-projects-claude-md.md §1.)"""
     here = cwd.resolve() if cwd.exists() else cwd
     # Both sides resolved, for `memory_files`' reason below.
     stop = root.resolve() if root.exists() else root
@@ -2564,16 +1890,7 @@ def claude_md_excludes(root: Path, cwd: Path) -> list[Path]:
 
 
 def memory_files(root: Path, cwd: Path) -> list[Path]:
-    """The CLAUDE.md-shaped files Claude Code loads into the prompt, nearest first.
-
-    The worktree and the directories above it up to the project root, then the user's own
-    — which is the CLI's own resolution order, and the order that makes a truncated walk
-    truncate the least relevant end.
-
-    Minus what `claude_md_excludes` drops from the spawn: one definition, so the
-    fingerprint below and `context._memory_row` cannot disagree about the prompt (spec
-    2026-09-29-one-copy-of-the-projects-claude-md §2).
-    """
+    """The CLAUDE.md-shaped files Claude Code loads into the prompt, nearest first"""
     found: list[Path] = []
     seen: set[Path] = set()
     # BOTH SPELLINGS, because `add` compares resolved: a CLAUDE.md that is itself a
@@ -2628,18 +1945,7 @@ def _memory_digest(root: Path, cwd: Path) -> str:
 
 def prefix_fingerprint(root: Path, cwd: Path, wo: dict[str, Any],
                        env: dict[str, str]) -> dict[str, str]:
-    """One token per ingredient of this work order's prompt prefix.
-
-    A version is recorded VERBATIM and everything else as a digest, because the drift
-    report is read by a person: "2.1.271 -> 2.1.272" is the answer, and a pair of hashes
-    is only the question restated.
-
-    Compared within ONE work order and never across two. That is not a simplification —
-    it is the cache's own scope. A prefix that differs between two conversations costs
-    nothing, since each writes its own entry; a prefix that moves between turn 4 and
-    turn 5 of one conversation re-writes turns 1-4. Comparing across work orders would
-    report the per-work-order lines in the settings file as drift on every dispatch.
-    """
+    """One token per ingredient of this work order's prompt prefix"""
     from .worker_brief import git_briefing
 
     settings = (root / ".jarvis" / "worker-settings" / f"{wo['id']}.json")
@@ -2669,16 +1975,7 @@ PREFIX_BASELINE_SCAN_CAP = 50
 
 
 def unreadable_ingredients(root: Path) -> set[str]:
-    """Which ingredients this machine could not establish at all, over recent fingerprints.
-
-    THE FAILURE THIS EXISTS FOR IS SILENT, AND IT MISDIRECTS. `cli_version` is the only
-    ingredient parsed out of the environment rather than hashed from bytes, so on a
-    machine whose install layout this does not recognise it is `?` for ever — and `?` is
-    skipped on both sides of every comparison by design, so a CLI upgrade is simply never
-    reported. That is not silence: INV-PREFIX-DRIFT tells the reader that a crossing with
-    nothing named points at MCP, so a dead ingredient actively sends them to the wrong
-    suspect. Naming it is what turns that back into a known unknown (review round 1).
-    """
+    """Which ingredients this machine could not establish at all, over recent fingerprints"""
     found: set[str] = set()
     directory = root / ".jarvis" / "prefix"
     try:
@@ -2698,7 +1995,7 @@ def unreadable_ingredients(root: Path) -> set[str]:
 
 
 def prefix_drift(before: dict[str, str], after: dict[str, str]) -> tuple[str, ...]:
-    """Which ingredients moved. An ingredient unknown on either side is not one of them."""
+    """Which ingredients moved"""
     return tuple(
         name for name in PREFIX_INGREDIENTS
         if before.get(name, PREFIX_UNKNOWN) != after.get(name, PREFIX_UNKNOWN)
@@ -2750,15 +2047,7 @@ def note_prefix(payload: dict[str, Any], env: dict[str, str], root: Path,
     return changed
 
 
-# -- surviving compaction ---------------------------------------------------------------
-#
-# Design and the measurements behind it:
-# docs/superpowers/specs/2026-08-10-resume-cost-and-the-cache.md
-#
-# Two hooks, one flag file. `PreCompact` cannot inject anything and `PostCompact` cannot
-# either (`additionalContext` is not accepted on that event), so the re-assertion rides
-# the next `PostToolUse` — which is also what puts it INSIDE the turn that was compacted
-# rather than at the start of the next one.
+# -- surviving compaction
 
 
 def compaction_flag(root: Path, wo_id: str) -> Path:
@@ -2767,19 +2056,7 @@ def compaction_flag(root: Path, wo_id: str) -> Path:
 
 def note_compaction(payload: dict[str, Any], root: Path,
                     store: ProjectStore, wo_id: str) -> None:
-    """PreCompact: record that it happened and arm the re-assertion.
-
-    THE FLAG IS ARMED WHICHEVER WAY THE COMPACTION CAME, and that is the half that
-    matters: a worker resumed after the OS compacted for it (`worker_session.compact`)
-    needs its identifiers re-asserted exactly as much as one Claude Code compacted
-    mid-turn — more so, since a `/compact` turn does no tool call of its own and the
-    brief therefore lands at the start of the NEXT turn.
-
-    The EVENT is only written for a compaction the OS did not ask for. A headless
-    worker cannot type `/compact`, so `manual` here means Jarvis sent it, and
-    `worker_session._record_compaction` already writes that one — with what it achieved
-    and what it cost, which this side cannot see.
-    """
+    """PreCompact: record that it happened and arm the re-assertion"""
     if payload.get("trigger") != "manual":
         store.add_event(wo_id, "compacted", {
             "trigger": payload.get("trigger"),
@@ -2791,13 +2068,7 @@ def note_compaction(payload: dict[str, Any], root: Path,
 
 
 def compaction_brief(store: ProjectStore, wo: dict[str, Any], project: str) -> str:
-    """What a compacted worker must not have to rediscover.
-
-    Deliberately NOT a summary of the conversation — Claude Code already wrote one, and
-    a second model call would only add loss. This is the part a summary cannot be trusted
-    to carry: the identifiers and the contract, rendered from the record Jarvis already
-    holds, so it is exact by construction.
-    """
+    """What a compacted worker must not have to rediscover"""
     wo_id = wo["id"]
     lines = [
         "# Your context was just compacted — re-asserting the parts that must be exact",
@@ -2829,12 +2100,7 @@ def worker_brief_core(wo_id: str, title: str, project: str) -> list[str]:
 
 def resume_after_compaction(env: dict[str, str], root: Path, store: ProjectStore,
                             wo: dict[str, Any]) -> dict[str, Any] | None:
-    """PostToolUse: if a compaction was armed, spend the flag and re-assert the record.
-
-    Spent exactly once — the flag is unlinked before the brief is built, so a failure
-    while rendering costs the re-assertion rather than repeating it on every tool call
-    for the rest of the work order.
-    """
+    """PostToolUse: if a compaction was armed, spend the flag and re-assert the record"""
     flag = compaction_flag(root, wo["id"])
     try:
         flag.unlink()
@@ -2851,7 +2117,7 @@ def resume_after_compaction(env: dict[str, str], root: Path, store: ProjectStore
 
 
 def _worker_context(env: dict[str, str], cwd: Path) -> tuple[Path, str] | None:
-    """(project root, wo id) for a dispatched worker, or None for anything else."""
+    """(project root, wo id) for a dispatched worker, or None for anything else"""
     wo_id = env.get("JARVIS_WO_ID")
     if not wo_id:
         return None  # interactive session — Jarvis governs dispatched workers only
@@ -2880,8 +2146,7 @@ def _pre_compact(payload: dict[str, Any], env: dict[str, str],
 
 
 def _post_tool_compaction(env: dict[str, str], cwd: Path) -> dict[str, Any] | None:
-    """Hot path: this runs after EVERY tool call, so it costs one `stat` until a
-    compaction has actually armed it. The database is not opened otherwise."""
+    """Hot path: this runs after EVERY tool call"""
     ctx = _worker_context(env, cwd)
     if ctx is None:
         return None
@@ -2898,8 +2163,7 @@ def _post_tool_compaction(env: dict[str, str], cwd: Path) -> dict[str, Any] | No
 
 
 def find_project_root(cwd: Path) -> Path | None:
-    """Map a hook cwd (possibly a worktree under .claude/worktrees/) to the project
-    root that holds .jarvis/."""
+    """Map a hook cwd (possibly a worktree under .claude/worktrees/) to the project root that holds..."""
     cwd = cwd.resolve()
     for candidate in (cwd, *cwd.parents):
         if (candidate / ".jarvis").is_dir():
@@ -2913,40 +2177,15 @@ def find_project_root(cwd: Path) -> Path | None:
 
 
 def _is_current_session(store: ProjectStore, wo_id: str, session_id: str) -> bool:
-    """Is this hook coming from the session the work order is actually bound to?
-
-    A work order has exactly one session id for its whole life now, so this is close to
-    a formality — but it still earns its keep for work orders created under the old
-    background-session transport, whose spent sessions can be re-opened from the agents
-    view and fire hooks that must not steer anything. Unknown-session hooks count as
-    current only when there is nothing to compare against.
-    """
+    """Is this hook coming from the session the work order is actually bound to?"""
     bound = store.get_work_order(wo_id).get("session_id")
     return not bound or not session_id or bound == session_id
 
 
 def _parked_on_the_delegate(store: ProjectStore, wo_id: str) -> str:
-    """What this work order is parked on instead of the user — "" when nothing is.
-
-    Consulted for a `waiting_input` work order, which is the state every OUTWARD-FACING
-    wait puts it in: `ops.ask_question`, and the argued request `gates.file_request`
-    files. A `running` worker's Notification is a real mid-work block until proven
-    otherwise, and swallowing that would strand it.
-
-    THE HELD REQUEST IS THE ONE EXCEPTION, and it is asked BEFORE the status. Since fix
-    2 of docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md a held
-    request parks nothing — it is the worker's own move — so the order is `running` while
-    it holds one, and reading the status first would let exactly the case issue 197 added
-    this branch for through again. The proof is the request itself, not the status.
-
-    The returned reason is recorded verbatim on the `notification_ignored` event, so it
-    must name WHICH wait: "parked" and "parked on something a reviewer is holding" are
-    different facts to whoever reads that timeline afterwards.
-    """
+    """What this work order is parked on instead of the user — "" when nothing is (docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md)"""
     if store.held_approvals(wo_id):
-        # A fourth reader of the held state, beyond the three kn-30036661 lists as the
-        # complete set. Held is with the WORKER, not the user: nobody is reviewing it,
-        # and the OS refuses it on a timer if nobody ever argues it.
+        # A fourth reader of the held state, beyond the three kn-30036661 lists as the complete set
         return "a privileged-action gate awaiting the worker's case"
     if store.get_work_order(wo_id)["status"] != "waiting_input":
         return ""
@@ -2962,20 +2201,7 @@ def _parked_on_the_delegate(store: ProjectStore, wo_id: str) -> str:
 
 def _subagent_start(payload: dict[str, Any],
                     env: dict[str, str]) -> dict[str, Any] | None:
-    """Re-deliver to a Task subagent the instructions it does not inherit.
-
-    Measured on Claude Code 2.1.278: a subagent inherits CLAUDE.md, the skill listing,
-    the parent's `--settings` (so `permissions.allow`/`deny` still apply to its tool
-    calls) and the hooks; it does NOT inherit the parent's `--append-system-prompt`, its
-    `--agent` persona, or anything `SessionStart` injected -- `SessionStart` never fires
-    for a subagent at all. What is lost is instruction, not authorisation.
-
-    No database and no catalog, for `finish_summary_decision`'s reason: both halves of
-    the text are fixed at spawn, one static and one already in the environment, and a
-    hook that opened the project DB to serve them would pay for it on every Task call.
-    `JARVIS_WO_ID` is therefore the whole test of "is this a worker" -- a session the
-    user opened themselves gets nothing.
-    """
+    """Re-deliver to a Task subagent the instructions it does not inherit"""
     if not env.get("JARVIS_WO_ID"):
         return None
     return {"wo_id": env["JARVIS_WO_ID"], "event": "SubagentStart",
@@ -2987,18 +2213,7 @@ def _subagent_start(payload: dict[str, Any],
 
 
 def _git_index(tree: Path, *args: str) -> tuple[int, str] | None:
-    """One git command against a worktree's index: `(exit status, stdout)`, or `None`
-    when git could not be run at all.
-
-    `landing._git` is deliberately not reused: that helper's contract is "one READ-ONLY
-    git command" and this writes the index. `import subprocess` is lazy because
-    `hooks.py` does not import it at module level and this module's import cost is
-    measured (see `TOOL_MANAGED_PATHS_ENV`).
-
-    The exit status is returned rather than folded into `None` so the recorded event can
-    name it: a failure must land on the record, and "git failed" without the code is not
-    a fact anyone can act on.
-    """
+    """One git command against a worktree's index: `(exit status"""
     import subprocess
 
     try:
@@ -3011,21 +2226,7 @@ def _git_index(tree: Path, *args: str) -> tuple[int, str] | None:
 
 def mark_tool_managed_paths(env: dict[str, str], root: Path, store: ProjectStore,
                             wo: dict[str, Any], cwd: Path) -> None:
-    """Tell THIS work order's worktree that the tool-managed files are not its to report.
-
-    `git update-index --skip-worktree` means "the worktree copy of this path is not
-    mine": the tool keeps rewriting it, the worker keeps reading it, and `git status`,
-    `git add -A` and `git commit -a` all stop seeing it — so the churn can no longer be
-    staged into a pull request about something else. Spec docs/superpowers/specs/
-    2026-09-25-serena-config-churn-and-tool-managed-files.md.
-
-    Nothing happens on the shared checkout, by design: a schema upgrade there is the
-    user's to see and commit, and hiding it from `git status` would hide it from the only
-    person who can land it. Nothing happens for another work order's worktree either.
-
-    Idempotent — every turn's `SessionStart` re-runs the same steps, and a path already
-    carrying the flag is neither re-marked nor recorded.
-    """
+    """Tell THIS work order's worktree that the tool-managed files are not its to report"""
     raw = env.get(TOOL_MANAGED_PATHS_ENV)
     if not raw:
         return
@@ -3036,10 +2237,7 @@ def mark_tool_managed_paths(env: dict[str, str], root: Path, store: ProjectStore
     if not isinstance(configured, list):
         return
 
-    # Both conditions, in this order: the cheap text test first (hooks.py:441), then the
-    # identity of the worktree. Both sides resolved — a worker's cwd is a symlinked path
-    # on some checkouts and a plain one on others, which is why `find_project_root`
-    # resolves too.
+    # Both conditions, in this order: the cheap text test first (hooks.py:441)
     worktree = wo.get("worktree")
     if not worktree or "/.claude/worktrees/" not in str(cwd):
         return
@@ -3054,8 +2252,7 @@ def mark_tool_managed_paths(env: dict[str, str], root: Path, store: ProjectStore
     skipped: dict[str, str] = {}
     failed: dict[str, str] = {}
     for path in [str(p) for p in configured[:MAX_TOOL_MANAGED_PATHS]]:
-        # `-v` for the same call that answers "does git track it": the flag letter is what
-        # makes "already marked" a state this can pass over without recording it again.
+        # `-v` for the same call that answers "does git track it": the flag letter is what makes "already...
         listed = _git_index(cwd, "ls-files", "-v", "--", path)
         if listed is None or listed[0] != 0:
             failed[path] = "ls-files: git unavailable" if listed is None \
@@ -3068,8 +2265,7 @@ def mark_tool_managed_paths(env: dict[str, str], root: Path, store: ProjectStore
         if line.split(" ", 1)[0] == "S":
             continue                      # already marked: the first event said so
         if not (cwd / path).exists():
-            # `skip-worktree` on an absent path makes git present the index version as
-            # the truth — a confusing state to create for a file the tool has not written.
+            # `skip-worktree` on an absent path makes git present the index version as the truth
             skipped[path] = "absent"
             continue
         result = _git_index(cwd, "update-index", "--skip-worktree", "--", path)
@@ -3079,33 +2275,14 @@ def mark_tool_managed_paths(env: dict[str, str], root: Path, store: ProjectStore
             continue
         marked.append(path)
 
-    # Every DISTINCT reason lands once. The one case that records nothing is "every
-    # configured path is already marked", which is not a new reason — `SessionStart` fires
-    # once per TURN, and a row per turn would make the record a hook log (timeline.py:19).
+    # Every DISTINCT reason lands once
     if marked or skipped or failed:
         store.add_event(wo["id"], "tool_managed_paths",
                         {"marked": marked, "skipped": skipped, "failed": failed})
 
 
 def serena_activation_context(cwd: Path) -> str:
-    """The one call a worker must make before its first Serena call, path filled in.
-
-    The Claude Code plugin starts the Serena MCP server with fixed args carrying neither
-    `--project` nor `--project-from-cwd`, and no Serena env var selects a project, so a
-    dispatched worker's first `find_symbol` fails with `No active project` and it falls
-    back to a text search. Spec docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md §5.
-
-    BOTH SPELLINGS of the tool, for the reason `dispatch.SERENA_TOOL_PREFIXES` has two
-    entries: a plugin install produces the long prefix, `claude mcp add serena` the short
-    one, and Jarvis configures no MCP server itself so it cannot know which.
-
-    `session_id` is any string — verified live, `00000000` activated — so this needs no
-    `initial_instructions` round-trip first. The ABSOLUTE path is what makes it
-    unambiguous (108 registry entries share the name `jarvis-os`), and `activate_project`
-    writes the registry entry and `.serena/project.yml` itself when they are absent.
-
-    A few lines, because it rides every turn.
-    """
+    """The one call a worker must make before its first Serena call, path filled in (docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md §5.)"""
     return (
         "\n\nBefore your first code-navigation call, make exactly ONE call:\n"
         f"`mcp__plugin_serena_serena__activate_project` with `project` = `{cwd}` and any "
@@ -3125,8 +2302,7 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
         return preflight_decision(payload, env)
 
     if event == "PostToolUse":
-        # The memory mirror is a side effect and runs either way; only one of the two
-        # can own the hook's return value, and a pending compaction outranks it.
+        # The memory mirror is a side effect and runs either way
         captured = capture_memory_write(payload, env)
         return _post_tool_compaction(env, cwd) or captured
 
@@ -3160,56 +2336,26 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
             "session_id": session_id,
             "cwd": str(cwd),
             "message": payload.get("message"),
-            # Stop carries the turn's final assistant message. Kept as the backup reply
-            # source: the turn's own JSON result is primary, and `worker_session` reads
-            # this only when that comes back empty.
+            # Stop carries the turn's final assistant message
             **({"last_assistant_message": payload["last_assistant_message"]}
                if payload.get("last_assistant_message") else {}),
         })
 
         if event == "SessionStart":
-            # No binding to do: Jarvis mints the session id with `--session-id` before
-            # the process exists, and a headless `--resume` reuses it, so the work order
-            # already knows it and it never changes. This hook fires on every turn
-            # (`source: resume` from turn two on) and is now purely confirmation — the
-            # only state it touches is the dispatching->running correction, for the case
-            # where the worker starts talking before the daemon's next tick.
+            # No binding to do: Jarvis mints the session id with `--session-id` before the process exists
             if store.get_work_order(wo_id)["status"] == "dispatching":
                 store.set_status(wo_id, "running")
-            # ...and the prefix fingerprint, which wants exactly this moment: once per
-            # turn, before the turn's first API call. A failure here is never the
-            # session's problem — the signal is an early warning and the measurement is
-            # elsewhere, so a broken read costs a data point and nothing else.
+            # ...and the prefix fingerprint, which wants exactly this moment: once per turn
             try:
                 note_prefix(payload, env, root, store, wo)
             except Exception:  # noqa: BLE001
                 pass
-            # ...and the tool-managed files, marked `skip-worktree` in this worktree's
-            # index. AFTER the two above: the git calls cost tens of milliseconds and
-            # nothing already in this branch may be delayed by them. Never fatal, for
-            # `note_prefix`' reason and more sharply — a worker's session must not end
-            # because git is unhappy about a file it was not going to commit anyway.
+            # ...and the tool-managed files, marked `skip-worktree` in this worktree's index
             try:
                 mark_tool_managed_paths(env, root, store, wo, cwd)
             except Exception:  # noqa: BLE001
                 pass
-            # ...and the house style, which is the whole point of this event for
-            # concision (spec 2026-09-19 SS5.1). SessionStart fires once per turn,
-            # before the turn's first API call, which is the only place a rule can
-            # reach EVERY byte the turn generates without depending on the model
-            # electing to load a skill — the failure SS1 measured, 0 invocations in 142
-            # sessions. `additionalContext` is the same channel the compaction brief
-            # already rides on `PostToolUse`.
-            #
-            # It appends after the cached conversation rather than editing the system
-            # prompt, so it does not move the prefix `note_prefix` just fingerprinted.
-            #
-            # ...and the Serena activation call, appended AFTER the house style so the
-            # existing cached shape is unchanged. Gated on `JARVIS_SERENA` alone — the
-            # key `dispatch._write_worker_settings` already writes from
-            # `wiring.serena_wired` — and never on `.serena/project.yml` existing, which
-            # `activate_project` writes itself (Neo q1259).
-            # Spec docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md §5.
+            # ...and the house style, which is the whole point of this event for concision (spec 2026-09-19 SS5.1) (docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md §5.)
             context = concision.house_style()
             if env.get("JARVIS_SERENA") != "0":
                 context += serena_activation_context(cwd)
@@ -3220,9 +2366,7 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
                     }}
 
         elif not _is_current_session(store, wo_id, session_id):
-            # A superseded session reporting on itself. Its own end is not the work
-            # order's end, and its idle prompt is not the worker asking for input —
-            # the live fork is elsewhere. Recorded above, acted on never.
+            # A superseded session reporting on itself
             store.add_event(wo_id, "hook_ignored", {
                 "event": event, "session_id": session_id,
                 "reason": "not the session this work order is bound to",
@@ -3230,31 +2374,14 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
             return {"wo_id": wo_id, "event": event, "ignored": True}
 
         elif event == "Notification":
-            # Fired when the session needs attention — but for two very different
-            # reasons: a real mid-work block (permission request), or the idle prompt
-            # Claude Code raises ~1 min after a turn ends, which every finished worker
-            # triggers. The payload does not distinguish them.
-            #
-            # So the work order's own state decides. If it has already settled (the
-            # worker called `jarvis wo finish`, or the reconciler filed it for review),
-            # this is the idle prompt and there is nothing to report: acting on it
-            # overwrites the real reason ("2 assumptions pending your review") with a
-            # generic "Claude is waiting for your input" and sends the user hunting for
-            # a question that does not exist. Verified against two live work orders.
+            # Fired when the session needs attention
             if wo["status"] not in ("running", "dispatching", "waiting_input"):
                 store.add_event(wo_id, "notification_ignored", {
                     "message": payload.get("message"),
                     "reason": f"work order already {wo['status']}",
                 })
                 return {"wo_id": wo_id, "event": event, "ignored": True}
-            # The same reasoning one status further in. A worker that ended its turn on
-            # `jarvis wo ask` or on a gate request is SITTING in `waiting_input` with a
-            # live session, so the test above lets it through — and a minute later Claude
-            # Code's idle prompt stamps "Claude is waiting for your input" over a work
-            # order that is waiting on Neo. It is the delegate's whole purpose that this
-            # costs the user nothing (GitHub issue 100), and where Neo has already handed
-            # the question back the flag it overwrites is the better one: it names the
-            # question and the command that answers it.
+            # The same reasoning one status further in
             parked = _parked_on_the_delegate(store, wo_id)
             if parked:
                 store.add_event(wo_id, "notification_ignored", {
@@ -3275,27 +2402,17 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
             )
 
         elif event == "Stop":
-            # End of a turn. Recorded above (with the final assistant message); what it
-            # means for the work order is settled from the turn row, not from here — with
-            # one exception, which is the only mechanism the runtime offers for holding a
-            # session at a turn boundary.
+            # End of a turn
             blocked = held_request_turn_block(store, wo_id, payload, env)
             if blocked is not None:
                 return blocked
-            # AFTER it: a gate request unargued is the stricter finding and should be the
-            # one the worker reads (§5 of
-            # docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md).
+            # AFTER it: a gate request unargued is the stricter finding and should be the one the worker reads... (docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md)
             uncollected = uncollected_task_turn_block(store, wo_id, payload, env)
             if uncollected is not None:
                 return uncollected
 
         elif event == "SessionEnd":
-            # Deliberately inert. Under the headless-turn transport this fires at the
-            # end of EVERY turn, not at the end of the conversation — so the settlement
-            # this hook used to do ("session ended without `jarvis wo finish`") would
-            # file every work order for review after its first turn. Settling is the
-            # turn reconciler's job now (Daemon.settle_work_order), which can tell a
-            # turn ending from a conversation ending. Recorded on the timeline above.
+            # Deliberately inert
             pass
         return {"wo_id": wo_id, "event": event}
     finally:
@@ -3303,13 +2420,12 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
 
 
 def main_hook() -> int:
-    """Entry point for `jarvis _hook`. Never fails the session: always exit 0."""
+    """Entry point for `jarvis _hook`"""
     try:
         raw = sys.stdin.read()
         payload = json.loads(raw) if raw.strip() else {}
         result = handle_hook(payload, dict(os.environ))
-        # `decision` is the Stop hook's own shape — it has no `hookSpecificOutput`, and
-        # printing nothing is what makes a block advisory.
+        # `decision` is the Stop hook's own shape
         if result and ("hookSpecificOutput" in result or "decision" in result):
             print(json.dumps(result))
     except Exception as e:  # noqa: BLE001 — a broken hook must not break sessions

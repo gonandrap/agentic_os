@@ -1,15 +1,4 @@
-"""The supervisor: the agent that answers a cost alarm, and the tick that runs it.
-
-§2 of docs/superpowers/specs/2026-08-31-the-supervisor.md.
-
-WHAT THESE TESTS ARE BUILT TO AVOID. A test that reaches the daemon without explicitly
-enabling the supervisor exercises the disabled path and still gets a perfectly good
-result — nothing fails — so the assertions are on CALL COUNTS and ROWS, never on a
-verdict having come back. And `needs_attention == 0` grades nothing on its own:
-`ProjectStore.clear_attention` reaches it too, and that is the regression the ack path
-forbids. What discriminates is a re-derivable blocker landing in
-`acknowledged_blockers`, which only `ops.ack_attention` writes.
-"""
+"""The supervisor: the agent that answers a cost alarm, and the tick that runs it (docs/superpowers/specs/2026-08-31-the-supervisor.md)"""
 
 from __future__ import annotations
 
@@ -25,13 +14,12 @@ from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
 from jarvis.project_store import ProjectStore
 
-#: The shipped supervisor defaults. Named once so a test asserts against the CATALOG
-#: rather than against a literal it copied from it.
+#: The shipped supervisor defaults
 CFG = catalog.SupervisorConfig()
 
 
 def _reclaim(store):
-    """`reclaim_stale_alarms` at the shipped bounds — both now come from the catalog."""
+    """`reclaim_stale_alarms` at the shipped bounds — both now come from the catalog"""
     return store.reclaim_stale_alarms(CFG.stale_reviewing_seconds,
                                       CFG.max_review_attempts)
 
@@ -42,9 +30,7 @@ def _stamp(at: float) -> str:
 
 
 def _prompt_row(at: float, text: str) -> dict:
-    """A worker prompt in a Claude Code transcript. Duplicated from
-    `tests/test_inspection.py` rather than shared through a new module: that file is
-    being edited by three sibling work orders on this feature at the same time."""
+    """A worker prompt in a Claude Code transcript"""
     return {"type": "user", "timestamp": _stamp(at), "message": {"content": text},
             "promptSource": "sdk"}
 
@@ -58,16 +44,11 @@ def _assistant_row(at: float, mid: str, write: int = 0) -> dict:
                         "content": [{"type": "text", "text": "ok"}]}}
 
 
-# -- fixtures --------------------------------------------------------------------------
+# -- fixtures
 
 
 def _enable(catalog_file: Path, **overrides) -> None:
-    """Turn the supervisor on in the shipped test catalog.
-
-    EXPLICIT IN EVERY TEST THAT WANTS IT, never a fixture default: the whole point of the
-    disabled pin below is that reaching the daemon without this call must exercise
-    nothing, and a fixture that quietly enabled it would make that pin unfalsifiable.
-    """
+    """Turn the supervisor on in the shipped test catalog"""
     data = json.loads(catalog_file.read_text())
     data["os"]["supervisor"] = {"enabled": True, **overrides}
     catalog_file.write_text(json.dumps(data))
@@ -80,11 +61,7 @@ def started(jarvis_home, fake_claude, catalog_file, project):
 
 
 def _burning(daemon, monkeypatch, tmp_path, title="the long one", description=""):
-    """One work order with a live `long-turn` alarm raised against it the real way.
-
-    Through `Daemon.check_burning_turns` rather than a hand-written row, because the
-    contract under test is that the supervisor picks up what the raiser produces.
-    """
+    """One work order with a live `long-turn` alarm raised against it the real way"""
     root = tmp_path / "projects"
     (root / "-proj").mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
@@ -95,8 +72,7 @@ def _burning(daemon, monkeypatch, tmp_path, title="the long one", description=""
         at = turn["started_at"]
         (root / "-proj" / f"{wo['id']}.jsonl").write_text(
             "".join(json.dumps(r) + "\n" for r in [
-                # AFTER the turn row, as `claude` writes it: a transcript turn older
-                # than the dispatch is the PREVIOUS turn, which `alarms` will not judge.
+                # AFTER the turn row, as `claude` writes it: a transcript turn older than the dispatch is the...
                 _prompt_row(at + 1, "You are the worker agent for wo-1"),
                 _assistant_row(at + 5, "m1"),
             ]))
@@ -109,12 +85,7 @@ def _burning(daemon, monkeypatch, tmp_path, title="the long one", description=""
 
 
 def _drain(daemon, timeout: float = 20.0) -> None:
-    """Run one supervisor tick and wait for its thread to finish.
-
-    The drain runs on its own pool, so a test that asserted straight after the tick would
-    be racing it. Waiting on the daemon's OWN guard rather than on a sleep: the guard is
-    lowered by the future's done-callback, so this cannot pass early.
-    """
+    """Run one supervisor tick and wait for its thread to finish"""
     daemon.supervisor_tick()
     deadline = time.monotonic() + timeout
     while daemon.supervisor_draining and time.monotonic() < deadline:
@@ -132,8 +103,7 @@ def _alarm(wo_id: str) -> dict:
 
 
 def _supervisor_calls(fake_claude) -> list[dict]:
-    """Every `claude` invocation that was a supervisor review, identified the way the
-    fake identifies one: by the persona in its system prompt."""
+    """Every `claude` invocation that was a supervisor review"""
     return [call for call in fake_claude.calls
             if supervisor.SUPERVISOR_PERSONA.splitlines()[0]
             in (call.get("system_prompt_seen") or "")]
@@ -150,36 +120,19 @@ def _agent_calls(kind: str) -> list[dict]:
         store.close()
 
 
-# -- the ack, which is the whole point -------------------------------------------------
+# -- the ack, which is the whole point
 
 
 def test_an_explicable_alarm_is_acked_without_dismissing_the_users_blockers(
         started, catalog_file, monkeypatch, tmp_path, fake_claude):
-    """The done condition of §2, and the assertion that makes it mean something.
-
-    `needs_attention == 0` ALONE GRADES NOTHING, and issue 573 is why it is not even the
-    right target: the supervisor used `ops.ack_attention`, the USER's blanket dismissal,
-    which writes every live blocker into `acknowledged_blockers` and so buried blockers
-    the user had never been shown — for ever, since `true_blockers` filters them out
-    afterwards. `clear_attention` is forbidden for the opposite reason: it NULLs the
-    column and discards the user's own earlier dismissals.
-
-    So the order is given a blocker `invariants.true_blockers` genuinely re-derives, and
-    the discriminating assertions are that it is STILL FLAGGED, that the column is still
-    NULL, and that no `acknowledged` event claims the user dismissed it.
-
-    A live alarm cannot be that blocker: `true_blockers` has no branch for one (an alarm
-    fires on a `running` order and no branch matches that status), which is why the
-    supervisor's answer is recorded on the ALARM ROW and the row is the memory — and why
-    there is no narrow entry to acknowledge in its place.
-    """
+    """The done condition of §2, and the assertion that makes it mean something"""
     _enable(catalog_file)
     daemon = started()
     wo_id = _burning(daemon, monkeypatch, tmp_path)
 
     store = ProjectStore(ops.find_work_order(wo_id)[1])
     try:
-        # A blocker that survives a re-derivation, so the ack has something to remember.
+        # A blocker that survives a re-derivation, so the ack has something to remember
         store.update_work_order(wo_id, status="failed")
         store.flag_attention(wo_id, "worker failed — review and retry")
     finally:
@@ -195,8 +148,7 @@ def test_an_explicable_alarm_is_acked_without_dismissing_the_users_blockers(
     store = ProjectStore(ops.find_work_order(wo_id)[1])
     try:
         wo = store.get_work_order(wo_id)
-        # THE DISCRIMINATING ASSERTIONS. `ack_attention` would have lowered the flag and
-        # written the blocker into the column as if the user had seen it.
+        # THE DISCRIMINATING ASSERTIONS
         assert wo["needs_attention"] == 1
         assert wo["attention_reason"] == "worker failed — review and retry"
         assert wo["acknowledged_blockers"] is None
@@ -209,8 +161,7 @@ def test_an_explicable_alarm_is_acked_without_dismissing_the_users_blockers(
     finally:
         store.close()
 
-    # Exactly one, and of the right kind: `jarvis cost <wo-id>` is where the user finds
-    # out what answering their alarm cost.
+    # Exactly one, and of the right kind: `jarvis cost <wo-id>` is where the user finds out what...
     (row,) = _agent_calls("supervisor")
     assert row["wo_id"] == wo_id and row["project"] == "proj_a"
     assert len(_supervisor_calls(fake_claude)) == 1
@@ -218,9 +169,7 @@ def test_an_explicable_alarm_is_acked_without_dismissing_the_users_blockers(
 
 def test_the_ack_reaches_the_user_as_an_inbox_row_carrying_the_note(
         started, catalog_file, monkeypatch, tmp_path):
-    """The notification the user gets INSTEAD of an attention item. Inbox rows reach
-    every sink including Telegram, so the title is user-facing copy and is specified in
-    the design rather than left to the implementation."""
+    """The notification the user gets INSTEAD of an attention item"""
     from jarvis.central_store import CentralStore
 
     _enable(catalog_file)
@@ -242,14 +191,7 @@ def test_the_ack_reaches_the_user_as_an_inbox_row_carrying_the_note(
 
 def test_a_pending_assumption_leaves_the_flag_up_and_the_alarm_is_still_acked(
         started, catalog_file, monkeypatch, tmp_path):
-    """`ops.ack_attention` REFUSES an order with a decision waiting for the user, and
-    that refusal is the right one to inherit: the assumption is the louder ask and
-    burying it would drop work the user asked for.
-
-    The alarm is still recorded `acked` — it WAS judged — and the flag stays up. That
-    pair is the whole assertion: recording nothing would lose the verdict, and lowering
-    the flag would bury the assumption.
-    """
+    """`ops.ack_attention` REFUSES an order with a decision waiting for the user"""
     _enable(catalog_file)
     daemon = started()
     wo_id = _burning(daemon, monkeypatch, tmp_path)
@@ -273,12 +215,7 @@ def test_a_pending_assumption_leaves_the_flag_up_and_the_alarm_is_still_acked(
 
 def test_an_escalate_verdict_records_the_intent_and_leaves_the_flag_up(
         started, catalog_file, monkeypatch, tmp_path):
-    """The verdict half of §3's escalation, on the order that raised the alarm.
-
-    The Neo question it files, and everything that happens to the answer, is
-    `tests/test_alarm_escalation.py`. What stays true here: the flag is up and no message
-    is queued to the worker — the supervisor never speaks to one.
-    """
+    """The verdict half of §3's escalation, on the order that raised the alarm"""
     _enable(catalog_file)
     daemon = started()
     wo_id = _burning(daemon, monkeypatch, tmp_path,
@@ -298,7 +235,7 @@ def test_an_escalate_verdict_records_the_intent_and_leaves_the_flag_up(
         store.close()
 
 
-# -- the three failure shapes, and none of them is an ack ------------------------------
+# -- the three failure shapes, and none of them is an ack
 
 
 @pytest.mark.parametrize("token", [
@@ -307,13 +244,7 @@ def test_an_escalate_verdict_records_the_intent_and_leaves_the_flag_up(
 ])
 def test_an_unreadable_reply_leaves_the_alarm_unresolved_with_the_flag_up(
         started, catalog_file, monkeypatch, tmp_path, token):
-    """A MODEL THAT REPLIED, UNUSABLY. Both shapes come back through
-    `structured.request`'s `on_invalid` (kn-9b18a8eb).
-
-    An ack would be the worst possible default here: it makes a burning turn invisible.
-    The transport case is its own test below — it is NOT this, because the call never
-    happened, and `failed` would spend the alarm on a blip.
-    """
+    """A MODEL THAT REPLIED, UNUSABLY"""
     _enable(catalog_file)
     daemon = started()
     wo_id = _burning(daemon, monkeypatch, tmp_path, description=token)
@@ -335,14 +266,7 @@ def test_an_unreadable_reply_leaves_the_alarm_unresolved_with_the_flag_up(
 
 def test_an_unreachable_supervisor_requeues_the_alarm_rather_than_failing_it(
         started, catalog_file, monkeypatch, tmp_path):
-    """A CALL THAT NEVER HAPPENED. `ClaudeCliError` propagates untouched by design, and
-    what the rescue does with it is now the whole point: nobody judged the alarm, so it
-    goes back on the supervisor's queue with the attempt spent rather than out of it.
-
-    `failed` at attempts=0 — what this used to assert — left every alarm the transport
-    could not reach permanently unjudged. Spec
-    docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §4.
-    """
+    """A CALL THAT NEVER HAPPENED (docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §4.)"""
     _enable(catalog_file)
     daemon = started()
     wo_id = _burning(daemon, monkeypatch, tmp_path,
@@ -358,7 +282,7 @@ def test_an_unreachable_supervisor_requeues_the_alarm_rather_than_failing_it(
 
     store = ProjectStore(ops.find_work_order(wo_id)[1])
     try:
-        # The flag is still up — the RAISE put it there and nothing here takes it down.
+        # The flag is still up — the RAISE put it there and nothing here takes it down
         assert store.get_work_order(wo_id)["needs_attention"] == 1
         assert store.events_of_kind(wo_id, "alarm_reviewed") == []
     finally:
@@ -366,9 +290,7 @@ def test_an_unreachable_supervisor_requeues_the_alarm_rather_than_failing_it(
 
 
 def test_a_reply_with_no_decision_raises_rather_than_defaulting():
-    """`decision` is what says this is a supervisor verdict at all rather than some other
-    JSON the model happened to emit, so its absence is a bad shape and not a default —
-    `neo._validate_verdict` makes the identical call about `escalate`."""
+    """`decision` is what says this is a supervisor verdict at all rather than some other JSON the model..."""
     from jarvis import structured
 
     with pytest.raises(structured.InvalidOutput, match="decision"):
@@ -378,8 +300,7 @@ def test_a_reply_with_no_decision_raises_rather_than_defaulting():
 
 
 def test_the_fail_safe_escalates_and_marks_itself_failed():
-    """A failure must never become an ack, and it must not be mistaken for a judgement
-    either: `failed` is what puts the alarm at `failed` rather than at `escalated`."""
+    """A failure must never become an ack"""
     verdict = supervisor._failed_verdict("well, it depends", 200)
 
     assert verdict["decision"] == "escalate"
@@ -387,18 +308,12 @@ def test_the_fail_safe_escalates_and_marks_itself_failed():
     assert verdict["note"] == ""
 
 
-# -- disabled by default, and that is a behaviour rather than a schema -----------------
+# -- disabled by default, and that is a behaviour rather than a schema
 
 
 def test_with_the_catalog_untouched_nothing_is_judged_and_nothing_is_spent(
         started, monkeypatch, tmp_path, fake_claude):
-    """SHIPS OFF. The baseline is the tree §1 left — `wo_alarms` rows and the additive
-    `alarm_id` payload key land whether the supervisor is on or not — so this is asserted
-    as BEHAVIOUR: no calls, no spend rows, no verdict.
-
-    On CALL COUNTS specifically. A test that merely reached the daemon here would pass
-    having exercised the fallback and proved nothing.
-    """
+    """SHIPS OFF"""
     daemon = started()          # no `_enable`: the shipped catalog, verbatim
     wo_id = _burning(daemon, monkeypatch, tmp_path)
 
@@ -429,13 +344,7 @@ def test_with_the_catalog_untouched_nothing_is_judged_and_nothing_is_spent(
 
 
 def test_nothing_in_the_module_hard_codes_a_threshold():
-    """THE MAGIC-NUMBER GUARD, modelled on `test_inspection.py`'s. The supervisor JUDGES,
-    so every number it judges by is policy and belongs in `catalog.SupervisorConfig`
-    where `jarvis config set` can reach it per project (kn-67cdb54b).
-
-    Kept non-vacuous by asserting the allow-list is small — a growing exemption list is
-    how this test stops meaning anything.
-    """
+    """THE MAGIC-NUMBER GUARD, modelled on `test_inspection.py`'s"""
     tree = ast.parse(Path(supervisor.__file__).read_text())
     allowed = {0, 1, 60}  # list indices, and seconds-per-minute — a unit, not a setting
     literals = {node.value for node in ast.walk(tree)
@@ -449,15 +358,7 @@ def test_nothing_in_the_module_hard_codes_a_threshold():
 
 
 def test_every_supervisor_setting_reaches_the_config_console(tmp_path):
-    """`config_version.resolve` is reflective, so a field added to `SupervisorConfig`
-    becomes a `jarvis config set` key with no edit to the console — but only if it is on
-    the dataclass. This fails if a number goes back to being a module constant.
-
-    A field that is itself a dataclass (`remedies`) is FLATTENED by `_flatten`, so it
-    reaches the console as its leaves rather than under its own name. Both forms count,
-    and the prefix form still has to produce at least one key — otherwise a block that
-    resolved to nothing would pass on the strength of its own name.
-    """
+    """`config_version.resolve` is reflective"""
     from jarvis import config_version
 
     cat = catalog.parse_catalog({"os": {}, "projects": [{"name": "p",
@@ -472,10 +373,7 @@ def test_every_supervisor_setting_reaches_the_config_console(tmp_path):
 
 
 def test_the_off_switch_is_a_safety_key_and_inherits_field_by_field(tmp_path):
-    """Turning the supervisor off fleet-wide removes a reviewer, which is the same class
-    of act as `os.neo.enabled` — and a project may turn it on while the fleet is off,
-    which is the expected first configuration, so the tick may not short-circuit on the
-    OS block alone."""
+    """Turning the supervisor off fleet-wide removes a reviewer"""
     from jarvis import config_version
 
     assert "os.supervisor.enabled" in catalog.SAFETY_KEYS
@@ -495,13 +393,11 @@ def test_the_off_switch_is_a_safety_key_and_inherits_field_by_field(tmp_path):
         "projects.watched.supervisor.enabled"] is True
 
 
-# -- the claim machinery ---------------------------------------------------------------
+# -- the claim machinery
 
 
 def test_the_stale_cutoff_exceeds_the_call_timeout(tmp_path):
-    """A cutoff at or below the timeout re-claims an alarm out from under a call that is
-    still running: the same alarm is judged twice and the second verdict overwrites the
-    first. Refused in the parser, not left to a comment."""
+    """A cutoff at or below the timeout re-claims an alarm out from under a call that is still running:..."""
     shipped = catalog.SupervisorConfig()
     assert shipped.stale_reviewing_seconds > shipped.timeout
 
@@ -512,11 +408,7 @@ def test_the_stale_cutoff_exceeds_the_call_timeout(tmp_path):
 
 
 def _one_alarm(started) -> tuple[ProjectStore, dict]:
-    """A work order with one `raised` alarm, written straight to the store.
-
-    NOT through `_burning` here: that helper patches `time.time` for the rest of the
-    test, and these two tests are entirely about which clock a row was written on.
-    """
+    """A work order with one `raised` alarm, written straight to the store"""
     wo = ops.create_work_order("proj_a", "the long one")
     store = ProjectStore(ops.find_work_order(wo["id"])[1])
     return store, store.add_alarm(wo["id"], "long-turn", 1, "still being billed")
@@ -524,15 +416,7 @@ def _one_alarm(started) -> tuple[ProjectStore, dict]:
 
 def test_a_stranded_review_is_returned_to_the_queue_then_given_up_on(
         started, monkeypatch):
-    """`claim_next_alarm` sets `reviewing` and, without this, nothing ever sets it back:
-    a daemon restart mid-drain would park the alarm for ever behind an attention flag
-    with no explanation. `NeoStore.claim_next` shipped that way once (bl-3f5f1464).
-
-    THE CLOCK IS MOVED WHILE THE ROW IS CREATED, not while it is read. Asserting
-    `claim_next_alarm()` returns None twice would be vacuous, and `monkeypatch.undo()`
-    inside the body would revert the `jarvis_home` and `catalog_file` fixtures too — so
-    the patch is scoped and the reclaim then runs on the real clock (kn-2261aa98).
-    """
+    """`claim_next_alarm` sets `reviewing` and"""
     started()
     store, _ = _one_alarm(started)
     try:
@@ -551,7 +435,7 @@ def test_a_stranded_review_is_returned_to_the_queue_then_given_up_on(
                 m.setattr("jarvis.db.now", lambda: long_ago)
                 assert store.claim_next_alarm()["id"] == claimed["id"]
 
-        # ... and then given up on: out of the queue, never looping in it.
+        # ... and then given up on: out of the queue, never looping in it
         assert _reclaim(store) == {"requeued": [], "failed": [claimed["id"]]}
         row = store.get_alarm(claimed["id"])
         assert row["status"] == "failed"
@@ -563,16 +447,7 @@ def test_a_stranded_review_is_returned_to_the_queue_then_given_up_on(
 
 def test_the_tick_rescues_a_stranded_alarm_and_judges_it_in_the_same_pass(
         started, catalog_file, monkeypatch, tmp_path):
-    """THE RECLAIM IS WIRED INTO THE TICK, not merely available on the store.
-
-    Removing `reclaim_stale_alarms()` from `supervisor_tick` leaves every store-level
-    test green — the drain simply never sees the row again and the alarm sits in
-    `reviewing` behind an attention flag for ever, which is exactly how `NeoStore
-    .claim_next` parked a question permanently (bl-3f5f1464).
-
-    It also pins the ORDERING: the reclaim runs BEFORE the queued count is read, so an
-    alarm rescued on this tick is judged on this tick rather than on the next one.
-    """
+    """THE RECLAIM IS WIRED INTO THE TICK, not merely available on the store"""
     _enable(catalog_file)
     daemon = started()
     wo_id = _burning(daemon, monkeypatch, tmp_path)
@@ -582,10 +457,7 @@ def test_the_tick_rescues_a_stranded_alarm_and_judges_it_in_the_same_pass(
         (row,) = store.alarms_of(wo_id)
         long_ago = db.now() - CFG.stale_reviewing_seconds - 60
         with monkeypatch.context() as m:
-            # Patched while CREATING the claim, so `claimed_at` is genuinely in the past;
-            # the reclaim below then runs on the unpatched clock. `monkeypatch.undo()`
-            # would revert the `jarvis_home` and `catalog_file` fixtures too and every
-            # surface would render as an empty OS with no error anywhere (kn-2261aa98).
+            # Patched while CREATING the claim, so `claimed_at` is genuinely in the past
             m.setattr("jarvis.db.now", lambda: long_ago)
             assert store.claim_next_alarm()["id"] == row["id"]
     finally:
@@ -599,8 +471,7 @@ def test_the_tick_rescues_a_stranded_alarm_and_judges_it_in_the_same_pass(
 
 
 def test_a_fresh_claim_is_not_reclaimed(started):
-    """The other half of the cutoff, and the one that would let a live call be judged
-    twice if the comparison were inverted."""
+    """The other half of the cutoff, and the one that would let a live call be judged twice if the..."""
     started()
     store, _ = _one_alarm(started)
     try:
@@ -613,9 +484,7 @@ def test_a_fresh_claim_is_not_reclaimed(started):
 
 def test_an_alarm_past_the_review_window_is_skipped_rather_than_judged(
         started, catalog_file, monkeypatch, tmp_path, fake_claude):
-    """Spend the user can no longer prevent is the noise the mechanism was tuned to
-    avoid. Skipped OUT of the queue with a reason, never left in it — an alarm nothing
-    will look at again must not be re-claimed on every tick for ever."""
+    """Spend the user can no longer prevent is the noise the mechanism was tuned to avoid"""
     _enable(catalog_file, max_age_hours=1)
     daemon = started()
     wo_id = _burning(daemon, monkeypatch, tmp_path)
@@ -639,8 +508,7 @@ def test_an_alarm_past_the_review_window_is_skipped_rather_than_judged(
 
 def test_an_alarm_on_a_settled_order_is_still_judged(
         started, catalog_file, monkeypatch, tmp_path):
-    """The spend is a fact and the user still deserves the note. Only AGE excludes an
-    alarm; the work order's status never does."""
+    """The spend is a fact and the user still deserves the note"""
     _enable(catalog_file)
     daemon = started()
     wo_id = _burning(daemon, monkeypatch, tmp_path)
@@ -655,7 +523,7 @@ def test_an_alarm_on_a_settled_order_is_still_judged(
     assert _alarm(wo_id)["status"] == "acked"
 
 
-# -- the evidence packet ---------------------------------------------------------------
+# -- the evidence packet
 
 
 def _wo_subject(store, wo_id: str) -> dict:
@@ -667,10 +535,7 @@ def _fo_subject(store, fo_id: str) -> dict:
 
 
 def test_the_evidence_packet_is_capped_and_says_so(started, monkeypatch, tmp_path):
-    """A DELIBERATELY HUGE SESSION. The alarm is often ABOUT a 300k re-write, so an
-    instrument that pasted the conversation in would be one of the largest calls the OS
-    makes — measuring the fire by adding to it. `worker_brief.CORE_BUDGET_CHARS` is the
-    precedent for both the constant and this test."""
+    """A DELIBERATELY HUGE SESSION"""
     daemon = started()
     root = tmp_path / "projects"
     (root / "-proj").mkdir(parents=True, exist_ok=True)
@@ -699,18 +564,16 @@ def test_the_evidence_packet_is_capped_and_says_so(started, monkeypatch, tmp_pat
         store.close()
 
     assert len(packet) < CFG.evidence_budget_chars
-    # THE OMISSION IS STATED. A judge that cannot see it was shown a fraction weighs the
-    # fraction as the whole.
+    # THE OMISSION IS STATED
     assert "omitted" in packet
-    # The alarm and the order come first, so the two things the verdict is ABOUT are
-    # never the sections that fall off the end.
+    # The alarm and the order come first
     assert packet.startswith("# The alarm")
     assert "# The work order" in packet
 
 
 def test_the_packet_carries_the_alarm_the_order_and_what_the_worker_last_said(
         started, monkeypatch, tmp_path):
-    """The four sections the design names, and the transcript that is NOT among them."""
+    """The four sections the design names, and the transcript that is NOT among them"""
     daemon = started()
     wo_id = _burning(daemon, monkeypatch, tmp_path, title="write the design doc",
                      description="a long brief about the console")
@@ -731,8 +594,7 @@ def test_the_packet_carries_the_alarm_the_order_and_what_the_worker_last_said(
 
 
 def _synthetic_row(at: float, mid: str) -> dict:
-    """The zero-token assistant message Claude Code writes ITSELF. It ends a turn without
-    ever having been an API call, which is how a turn comes to have none."""
+    """The zero-token assistant message Claude Code writes ITSELF"""
     return {"type": "assistant", "timestamp": _stamp(at),
             "message": {"id": mid, "model": usage.SYNTHETIC_MODEL,
                         "usage": {"input_tokens": 0, "cache_creation_input_tokens": 0,
@@ -742,11 +604,7 @@ def _synthetic_row(at: float, mid: str) -> dict:
 
 def test_the_packet_says_a_turn_cost_nothing_rather_than_leaving_it_to_be_inferred(
         started, monkeypatch, tmp_path):
-    """ISSUE 227, THE LAYER THAT REACHED THE USER. wo-f1ce0f24 turn 3 made no API call in
-    65 minutes; the supervisor escalated it as "a silent hung turn BILLED IN FULL" in the
-    same sentence as "zero context peak", and the user got a Telegram saying an hour of
-    generation had been billed. The judge never read the per-turn cost, so the packet now
-    hands it over — and leads with the fact that there was none."""
+    """ISSUE 227, THE LAYER THAT REACHED THE USER. wo-f1ce0f24 turn 3 made no API call in 65 minutes"""
     daemon = started()
     root = tmp_path / "projects"
     (root / "-proj").mkdir(parents=True, exist_ok=True)
@@ -772,14 +630,13 @@ def test_the_packet_says_a_turn_cost_nothing_rather_than_leaving_it_to_be_inferr
     assert stalled.index("NO API CALL") < stalled.index("3900s wall")
     assert "0 API calls costing 0 tokens / $0.00" in stalled
     assert "3900s unaccounted" in stalled and "0s generating" in stalled
-    # The turn that answered the re-delivered message in 131 seconds is not swallowed.
+    # The turn that answered the re-delivered message in 131 seconds is not swallowed
     assert "1 API call costing" in packet
 
 
 def test_the_packet_never_calls_a_request_in_flight_a_stall(
         started, monkeypatch, tmp_path):
-    """Spec §1: this is the line that fed the judge, and a kill remedy acting on it
-    would have destroyed 19 minutes of live generation."""
+    """Spec §1: this is the line that fed the judge"""
     daemon = started()
     root = tmp_path / "projects"
     (root / "-proj").mkdir(parents=True, exist_ok=True)
@@ -787,7 +644,7 @@ def test_the_packet_never_calls_a_request_in_flight_a_stall(
     wo = ops.create_work_order("proj_a", "the slow turn")
     store = ProjectStore(ops.find_work_order(wo["id"])[1])
     try:
-        # A prompt and nothing after it: the request has completed no block yet.
+        # A prompt and nothing after it: the request has completed no block yet
         (root / "-proj" / f"{wo['id']}.jsonl").write_text(
             json.dumps(_prompt_row(FIXED_TURN_AT,
                                    "You are the worker agent for wo-1")) + "\n")
@@ -803,16 +660,13 @@ def test_the_packet_never_calls_a_request_in_flight_a_stall(
     assert "this is not a stall" in line
 
 
-#: A clock and a transcript that do not move, so the packet below is a literal rather
-#: than a description of one. `build_evidence`'s first section renders "N minute(s) ago"
-#: off `db.now`, which is why it is pinned rather than merely started from.
+#: A clock and a transcript that do not move
 FIXED_NOW = 1_780_000_000.0
 FIXED_TURN_AT = FIXED_NOW - 3600.0
 
 
 def _fixed_transcript(path: Path) -> None:
-    """Two turns, both settled, at absolute times — nothing here is relative to the real
-    clock, so every wall/generating/idle number in the packet is a constant."""
+    """Two turns, both settled, at absolute times"""
     path.write_text("".join(json.dumps(r) + "\n" for r in [
         _prompt_row(FIXED_TURN_AT, "You are the worker agent for wo-1"),
         _assistant_row(FIXED_TURN_AT + 30, "m1"),
@@ -821,12 +675,7 @@ def _fixed_transcript(path: Path) -> None:
     ]))
 
 
-#: THE WORK-ORDER PACKET, COMMITTED. It is the cached prompt prefix of every review the
-#: OS runs: a packet that changes shape reprices them all, silently. Only `{wo_id}` is
-#: substituted, because the id is generated — everything else is bytes.
-#:
-#: Moved once, deliberately, for issue 227: every turn now carries what it ACTUALLY cost,
-#: because the judge was asserting spend it had never read.
+#: THE WORK-ORDER PACKET, COMMITTED
 EXPECTED_WORK_ORDER_PACKET = """\
 # The alarm
 kind: long-turn
@@ -836,8 +685,14 @@ raised on turn 1, 0 minute(s) ago
 # The work order
 {wo_id} [running] on claude-opus-5
 this session is an ordinary work order
+scheduled_actor: Daemon.settle_turns - the settler sweeps this status and a turn is on record (or the claim is still inside its grace)
 title: write the design doc
 brief: a long brief about the console
+
+# Where it has been
+now: running (the recorded spans stop short of it)
+- pending for 0 minute(s)
+(it has never been through validation)
 
 # The session, turn by turn
 - turn 1: 120s wall (30s generating, 0s blocked, 0s tools, 90s idle, 0s unaccounted), 1 API call costing 1 tokens / $0.00, context peak 0
@@ -851,9 +706,7 @@ brief: a long brief about the console
 
 def test_the_work_order_packet_is_byte_for_byte_what_it_has_always_been(
         started, monkeypatch, tmp_path):
-    """Reshaping `build_evidence`'s arguments into a subject dict must not move one byte
-    of what it produced before (§3). 'Capture, refactor, compare' leaves nothing behind;
-    this literal outlives the commit that made it."""
+    """Reshaping `build_evidence`'s arguments into a subject dict must not move one byte of what it..."""
     daemon = started()
     root = tmp_path / "projects"
     (root / "-proj").mkdir(parents=True, exist_ok=True)
@@ -867,7 +720,7 @@ def test_the_work_order_packet_is_byte_for_byte_what_it_has_always_been(
         _fixed_transcript(root / "-proj" / f"{wo['id']}.jsonl")
         store.update_work_order(wo["id"], status="running", session_id=wo["id"],
                                 model="claude-opus-5")
-        store.queue_message(wo["id"], "still drafting section four")
+        store.queue_message(wo["id"], "still drafting section four", authored_by="user")
         alarm = store.add_alarm(wo["id"], "long-turn", 1, "turn 1 has run for 2 hours")
         packet = supervisor.build_evidence(store, _wo_subject(store, wo["id"]), alarm,
                                            CFG, daemon.catalog.projects[0].inspect)
@@ -879,12 +732,7 @@ def test_the_work_order_packet_is_byte_for_byte_what_it_has_always_been(
 
 def test_the_work_order_packet_names_a_blocker_and_stays_silent_without_one(
         started, monkeypatch, tmp_path):
-    """WHAT ALARM al-4bb82f7e ASKED FOR: an order correctly waiting on a dependency used
-    to read as unexplained, because the packet never stated a reason the OS already held.
-
-    The silent half is the pin: `blocker: none` would be a claim the judge weighs, and it
-    would reprice every cached review — so an unblocked order's packet keeps its bytes.
-    """
+    """WHAT ALARM al-4bb82f7e ASKED FOR: an order correctly waiting on a dependency used to read as..."""
     daemon = started()
     monkeypatch.setattr(db, "now", lambda: FIXED_NOW)
     inspect_cfg = daemon.catalog.projects[0].inspect
@@ -906,15 +754,98 @@ def test_the_work_order_packet_names_a_blocker_and_stays_silent_without_one(
     assert not [line for line in plain.splitlines() if line.startswith("blocked")]
     (line,) = [line for line in packet.splitlines() if line.startswith("blocked:")]
     assert line == f"blocked: {supervisor.BLOCKED_SENTENCES['dependency']}"
+    # `+ 2` since §7: this row also derives a scheduled actor, which sits at `+ 1`
+    assert packet.splitlines().index(line) == \
+           packet.splitlines().index(next(l for l in packet.splitlines()
+                                          if l.startswith("this session is"))) + 2
+
+
+def test_the_work_order_packet_names_the_scheduled_actor_and_stays_silent_without_one(
+        started, monkeypatch):
+    """§7 of docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md"""
+    from jarvis import health
+
+    daemon = started()
+    monkeypatch.setattr(db, "now", lambda: FIXED_NOW)
+    inspect_cfg = daemon.catalog.projects[0].inspect
+
+    wo = ops.create_work_order("proj_a", "write the design doc")
+    store = ProjectStore(ops.find_work_order(wo["id"])[1])
+    try:
+        actor = health.actor(store, _wo_subject(store, wo["id"]))
+        packet = supervisor.build_evidence(store, _wo_subject(store, wo["id"]), None,
+                                           CFG, inspect_cfg)
+        store.update_work_order(wo["id"], status="budget_exhausted")
+        spent = supervisor.build_evidence(store, _wo_subject(store, wo["id"]), None,
+                                          CFG, inspect_cfg)
+        # The `OPEN_STATUSES` gate is what makes a settled row safe here: without it `ops.SCHEDULED_ACTORS`...
+        store.update_work_order(wo["id"], status="completed")
+        settled = supervisor.build_evidence(store, _wo_subject(store, wo["id"]), None,
+                                            CFG, inspect_cfg)
+    finally:
+        store.close()
+
+    assert actor is not None
+    (line,) = [l for l in packet.splitlines() if l.startswith("scheduled_actor:")]
+    assert line == f"scheduled_actor: {actor.pass_name} - {actor.why}"
     assert packet.splitlines().index(line) == \
            packet.splitlines().index(next(l for l in packet.splitlines()
                                           if l.startswith("this session is"))) + 1
+    assert not [l for l in spent.splitlines() if l.startswith("scheduled_actor")]
+    assert settled.startswith("# The work order")
+    assert not [l for l in settled.splitlines() if l.startswith("scheduled_actor")]
+
+
+def test_the_actor_line_sits_above_the_blocker_line(started, monkeypatch):
+    """A parked pull request derives BOTH"""
+    from jarvis import health
+
+    daemon = started()
+    monkeypatch.setattr(db, "now", lambda: FIXED_NOW)
+    inspect_cfg = daemon.catalog.projects[0].inspect
+
+    wo = ops.create_work_order("proj_a", "write the design doc")
+    store = ProjectStore(ops.find_work_order(wo["id"])[1])
+    try:
+        store.update_work_order(wo["id"], status="waiting_pr_merge",
+                                pr_url="https://example.invalid/pr/1")
+        subject = _wo_subject(store, wo["id"])
+        actor = health.actor(store, subject)
+        blocked = health.blocker(store, subject, CFG)
+        packet = supervisor.build_evidence(store, subject, None, CFG, inspect_cfg)
+    finally:
+        store.close()
+
+    assert actor is not None and actor.pass_name == "Daemon.poll_pull_requests"
+    assert blocked == "pull-request"
+    lines = packet.splitlines()
+    at = lines.index(next(l for l in lines if l.startswith("this session is")))
+    assert lines[at + 1] == f"scheduled_actor: {actor.pass_name} - {actor.why}"
+    assert lines[at + 2] == f"blocked: {supervisor.BLOCKED_SENTENCES['pull-request']}"
+
+
+def test_the_actor_verdict_never_reaches_the_blocker(started, monkeypatch):
+    """`health.blocker` stays PURE (§7"""
+    from jarvis import health
+
+    started()
+    monkeypatch.setattr(db, "now", lambda: FIXED_NOW)
+
+    wo = ops.create_work_order("proj_a", "write the design doc")
+    store = ProjectStore(ops.find_work_order(wo["id"])[1])
+    try:
+        store.update_work_order(wo["id"], status="running", session_id=wo["id"])
+        subject = _wo_subject(store, wo["id"])
+        assert health.actor(store, subject) is not None
+        assert health.blocker(store, subject, CFG) is None
+        fo = store.create_feature_order("a feature", "do the thing")
+        assert health.actor(store, {"kind": "feature_order", "row": fo}) is None
+    finally:
+        store.close()
 
 
 def test_each_transport_blocker_reads_its_sentence_from_the_hold_cause():
-    """Three ids, three sentences, and the words come from `holds.HOLD_CAUSES` — the one
-    place the OS says what a hold IS. Re-typed here they would drift from the hold line
-    the same packet shows (Neo q1241)."""
+    """Three ids, three sentences, and the words come from `holds.HOLD_CAUSES`"""
     from jarvis import health, holds
 
     for blocker_id, cause in health.transport_blockers().items():
@@ -926,10 +857,7 @@ def test_each_transport_blocker_reads_its_sentence_from_the_hold_cause():
 
 def test_the_packet_says_when_it_was_read_from_a_seal_and_says_nothing_when_it_was_not(
         started, monkeypatch, tmp_path):
-    """§4 of docs/superpowers/specs/2026-09-27-order-autopsy-durability.md: every surface PRINTS which
-    reading answered — but ONLY the sealed case, because the derived one is the packet
-    above, byte for byte, and the judge reading it must not be told about a seal that was
-    never consulted (Neo q1080)."""
+    """§4 of docs/superpowers/specs/2026-09-27-order-autopsy-durability.md: every surface PRINTS which..."""
     from jarvis import autopsy
 
     daemon = started()
@@ -957,21 +885,16 @@ def test_the_packet_says_when_it_was_read_from_a_seal_and_says_nothing_when_it_w
 
     assert not any("SEALED" in line for line in derived)
     assert "SEALED autopsy" in sealed[0] and autopsy.NORMAL in sealed[0]
-    # The turns themselves are the same reading: the seal is a substitute, not a summary.
+    # The turns themselves are the same reading: the seal is a substitute, not a summary
     assert sealed[1:] == derived
 
 
-# -- the evidence packet for a FEATURE order -------------------------------------------
+# -- the evidence packet for a FEATURE order
 
 
 def _feature(store, *, children: list[dict], title="the console feature",
              status="executing", carrier=True) -> str:
-    """A feature and its child tree, written straight to the store.
-
-    Each `children` entry is `{status, title, spec_section?, depends_on?, pr_url?}`.
-    The carrier is the PLANNER rung of `carrier_for_feature`: a feature planned with
-    `os.validation.enabled` off has no manager, which is every feature on the fleet.
-    """
+    """A feature and its child tree, written straight to the store"""
     fo = store.create_feature_order(title, description="widen the console")
     plan_wo_id = None
     if carrier:
@@ -991,8 +914,7 @@ def _feature(store, *, children: list[dict], title="the console feature",
 
 def test_the_feature_packet_names_the_tree_the_rulings_and_the_verdicts(
         started, project):
-    """The four reads the feature page already makes, in the judge's own packet — and
-    NOT the work-order branch, which is what a fall-through would produce."""
+    """The four reads the feature page already makes, in the judge's own packet"""
     started()
     store = ProjectStore(project)
     try:
@@ -1019,15 +941,13 @@ def test_the_feature_packet_names_the_tree_the_rulings_and_the_verdicts(
     assert "2 — the parser" in packet
     assert "the parser was dropped on purpose" in packet
     assert "round 1: rejected — the plan skips the migration" in packet
-    # The catch for a fall-through into the work-order branch, which would otherwise
-    # produce a perfectly plausible packet about the carrier.
+    # The catch for a fall-through into the work-order branch
     assert "# The work order" not in packet
 
 
 def test_a_twelve_child_tree_is_clipped_to_the_worst_children_and_says_how_many(
         started, project):
-    """`worker_brief.CORE_BUDGET_CHARS`' pin, applied to the one section that scales with
-    the feature. Under the budget AND substantial: an empty stub is under it too."""
+    """`worker_brief.CORE_BUDGET_CHARS`' pin, applied to the one section that scales with the feature"""
     started()
     store = ProjectStore(project)
     try:
@@ -1054,8 +974,7 @@ def test_a_twelve_child_tree_is_clipped_to_the_worst_children_and_says_how_many(
     tree = packet.split("# The child tree\n", 1)[1].split("\n\n", 1)[0]
     assert tree.endswith("…and 7 further children, all completed")
     assert "and 7 further children" in packet
-    # Worst first is the whole point: the three failures survive the clip and a
-    # completed child does not.
+    # Worst first is the whole point: the three failures survive the clip and a completed child does not
     for failed in children[:3]:
         assert failed["id"] in packet
     assert children[-1]["id"] not in packet
@@ -1080,8 +999,7 @@ def test_a_feature_with_no_carrier_says_so_rather_than_raising(started, project)
 
 def test_the_transcript_is_read_for_a_work_order_and_never_for_a_feature(
         started, project, monkeypatch, tmp_path):
-    """A feature has no session. Asserted as a CALL COUNT with both arms in one test: a
-    zero on its own is green on a path that never ran."""
+    """A feature has no session"""
     from jarvis import inspection
 
     daemon = started()
@@ -1115,8 +1033,7 @@ def test_the_transcript_is_read_for_a_work_order_and_never_for_a_feature(
 
 
 def test_a_subject_level_finding_is_raised_on_no_particular_turn(started, project):
-    """`NO_TURN` is `-1` and reaches the supervisor's OWN prompt. Both arms in one test:
-    the prose for a finding, the number for a cost alarm."""
+    """`NO_TURN` is `-1` and reaches the supervisor's OWN prompt"""
     from jarvis.project_store import NO_TURN
 
     started()
@@ -1137,8 +1054,7 @@ def test_a_subject_level_finding_is_raised_on_no_particular_turn(started, projec
 
 
 def test_the_system_prompt_is_byte_stable_across_reviews(jarvis_home):
-    """Consecutive reviews share a cached prompt prefix — the property
-    `neo.build_system_prompt` is built for and the reason the drain is FIFO."""
+    """Consecutive reviews share a cached prompt prefix"""
     from jarvis.neo_store import NeoStore
 
     store = NeoStore()
@@ -1153,28 +1069,18 @@ def test_the_system_prompt_is_byte_stable_across_reviews(jarvis_home):
 
 
 def test_jarvis_cost_has_a_label_for_the_supervisor_kind():
-    """Without it `jarvis cost` prints the bare kind, which is a user-visible defect in a
-    surface nobody would think to check while writing an agent."""
+    """Without it `jarvis cost` prints the bare kind"""
     from jarvis import agent_usage
 
     assert "supervisor" in agent_usage.KIND_LABELS
     assert agent_usage.KIND_LABELS["supervisor"] != "supervisor"
 
 
-# -- what the supervisor may never do, pinned in code ----------------------------------
+# -- what the supervisor may never do, pinned in code
 
 
 def test_the_supervisor_never_names_a_command_that_acts_on_a_work_order():
-    """THE VERDICT VOCABULARY IS `{ack, escalate}`, AND THIS IS WHERE THAT LIVES.
-
-    NOT an import walk. `tests/test_neo_panel.py::test_neo_never_imports_the_panel` walks
-    `ast.Import`/`ast.ImportFrom`, which is decorative here: `supervisor.py` must
-    legitimately import `ops` for `ack_attention`, so `ops.cancel_work_order` would sail
-    straight through one. The attribute and name walk is what has teeth.
-
-    The tempting "helpful" move on a ninety-minute turn is to kill it, and killing a turn
-    destroys work with no other record.
-    """
+    """THE VERDICT VOCABULARY IS `{ack, escalate}`, AND THIS IS WHERE THAT LIVES"""
     tree = ast.parse(Path(supervisor.__file__).read_text())
 
     forbidden = {"cancel", "cancel_work_order", "set_status", "send_message",
@@ -1183,10 +1089,7 @@ def test_the_supervisor_never_names_a_command_that_acts_on_a_work_order():
     named |= {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
     assert not (named & forbidden), sorted(named & forbidden)
 
-    # `worker_session` is the machinery that LAUNCHES AND KILLS turns, and none of it
-    # belongs here. Its rate-limit fallback DELAY is the one exception: a number, no
-    # behaviour, and the same import `neo.drain_queue` takes for the same hold (spec
-    # docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §2).
+    # `worker_session` is the machinery that LAUNCHES AND KILLS turns, and none of it belongs here (docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §2)
     allowed = {"RATE_LIMIT_FALLBACK_DELAY"}
     for node in ast.walk(tree):
         names = ([a.name for a in node.names] if isinstance(node, ast.Import)
@@ -1198,8 +1101,7 @@ def test_the_supervisor_never_names_a_command_that_acts_on_a_work_order():
 
 
 def test_the_pin_would_catch_the_move_it_forbids():
-    """A guard nobody has ever seen fail is a guard nobody knows works. The same walk,
-    over source that does the forbidden thing."""
+    """A guard nobody has ever seen fail is a guard nobody knows works"""
     tree = ast.parse("from . import ops\ndef go(wo):\n    ops.cancel_work_order(wo)\n")
     named = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
 

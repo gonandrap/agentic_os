@@ -1,83 +1,4 @@
-"""Where a session's TIME went — the other half of `jarvis cost`.
-
-`usage` reads a transcript for TOKENS and answers "what did this cost". The same file
-also carries a clock: every row is timestamped, so a turn's wall clock can be split into
-the three things an agent does with it. That split is what this module produces, and it
-is the question `jarvis cost` cannot answer — "how is a design-only agent taking
-14-minute turns?" took a hand-written script over the raw JSONL, and found two defects
-that cost money on every work order in the fleet.
-
-Design and worked example: `docs/superpowers/specs/2026-08-30-the-anatomy-of-a-turn.md`.
-
-## The partition
-
-The method is `docs/findings/anatomy-of-an-expensive-turn.md` §1 step 4, with two
-buckets added:
-
-    executing tools   `tool_use` timestamp to the matching `tool_result` timestamp
-    blocked           the subset of those where the tool is a BLOCKING JOIN
-    idle              after the turn's last API call, before the next turn's prompt
-    generating        the wall clock left over, ON A TURN THAT MADE AN API CALL
-    unaccounted       the same remainder on a turn that made NONE
-
-UNACCOUNTED IS THE SECOND ADDITION TO THE METHOD, and it is there because `generating`
-is not measured — it is what nothing else explains, and on a turn with no API call and
-no tool there is nothing to subtract. wo-f1ce0f24 turn 3 therefore rendered as 65
-minutes of pure generation beside its own `0 calls` and `peak 0`, and four layers read
-that number as measurement (issue 227). A span with no API call in it was never OBSERVED
-generating; naming the gap is honest where charging it to the model is not. It is
-`unaccounted` rather than `stalled` because the name states the evidence and not a
-diagnosis: a transcript Claude Code has pruned produces the same silence as a turn that
-hung. The DIAGNOSIS is `STALL_ALARM` below, which is a judgement about how long the
-silence has run.
-
-Blocked is carved out of tool time rather than added beside it because the two are
-opposite facts about the same seconds: 45 seconds of `Bash` is work being done, and 450
-seconds of `TaskOutput` is the lead agent asleep with no API call in flight — and long
-enough to lose its prompt cache, which is why the same 450 seconds shows up again below
-as a `ttl-expiry` write.
-
-IDLE IS THE ONE ADDITION TO THE METHOD, and it is here because the method's subject
-session could not see it. A turn runs from its prompt to the NEXT turn's prompt, which is
-what makes the turns sum to the session with nothing dropped — but a worker turn is one
-`claude -p` process, and between it exiting and Jarvis sending the next prompt there is a
-stretch where nothing is generating because nothing is running. On the subject session
-that stretch is 5s and 41s and charging it to the model is invisible. Across the fleet's
-441 worker turns it reaches ELEVEN DAYS, on a turn with a successor — a work order parked
-in `waiting_input` until a `wo send` arrived. Reported separately, `generating + idle` is
-the method's original figure, and neither number is a lie on either session.
-
-## Three cache writes that look identical and are not
-
-A large `cache_creation_input_tokens` is the single most expensive event in a session,
-and until now nothing said WHY it happened. There are three causes and they have
-completely different fixes:
-
-    cold-start    the first call of the session. Unavoidable and not a defect.
-    ttl-expiry    the previous call is older than the cache TTL. The fix is to wait less
-                  — shorten the blocking join that caused the gap.
-    prefix-miss   the previous call is RECENT and the prefix was re-written anyway. A
-                  DEFECT: something changed the prompt prefix (kn-335170a1). The fix is
-                  upstream of the clock entirely.
-    compaction    the OS compacted here (`worker_session.compact`), so this write is a
-                  summary replacing a history. Not a defect and not free: it is the
-                  price of the ttl-expiry write that did NOT happen.
-
-THE THRESHOLD IS LOAD-BEARING, not cosmetic. Inside one turn every call after the first
-writes the delta it just added to the conversation while reading the rest — a few
-thousand tokens, seconds after the previous call, which by the gap test alone would read
-as a `prefix-miss`. It is not one; it is the cache working. Only a write large enough to
-be a re-send of the conversation is classified at all, which is why the floor is a
-setting rather than a literal (`catalog.InspectConfig`, per project) and why every report
-states the value it was taken at.
-
-## No paid call, and nothing persisted
-
-Everything here is arithmetic over files Claude Code already wrote. Like `usage`, this
-derives a fact about a work order from a file Jarvis does not own and cannot repair, so
-there is nothing to store and nothing to reconcile — and a transcript that has expired
-is reported as absent rather than guessed at.
-"""
+"""Where a session's TIME went — the other half of `jarvis cost` (docs/superpowers/specs/2026-08-30-the-anatomy-of-a-turn.md)"""
 
 from __future__ import annotations
 
@@ -94,53 +15,27 @@ from .catalog import (DEFAULT_INSPECT_REPORT_JOIN_FLOOR,
                       DEFAULT_INSPECT_REPORT_WRITE_FLOOR, InspectConfig)
 from .holds import HOLD_CAUSES, Hold, by_cause
 
-#: Cache TTLs in seconds. NOT CONFIGURABLE, and deliberately not: these are the two
-#: durations Anthropic's prompt cache actually offers (kn-f94abf34), not a policy Jarvis
-#: gets to hold an opinion about. Making them settable would let a catalog declare that
-#: the cache lives for an hour when it does not, and every `ttl-expiry` label downstream
-#: would then be wrong. The 5-minute one is what every Jarvis call buys since
-#: `claude_cli.PROMPT_CACHE_5M_ENV` shipped (kn-5dd784f5); the hour is what older
-#: transcripts were charged for, and a write's own `cache_1h` split is what says which
-#: of the two a LATER call had to beat.
+#: Cache TTLs in seconds
 TTL_5M = 300.0
 TTL_1H = 3600.0
 
-#: Tools whose span is the lead agent WAITING rather than working: it has dispatched
-#: something and is blocked on the result with no API call in flight. ALWAYS a wait,
-#: backgrounded or not — `TaskOutput` exists to collect a result.
+#: Tools whose span is the lead agent WAITING rather than working: it has dispatched something and is...
 JOIN_TOOLS = ("TaskOutput",)
 
-#: Tools whose span is the lead DELEGATING and then waiting for the result. A foreground
-#: call blocks the lead until the subagent returns; only `run_in_background: true` makes
-#: `Agent` return immediately, and that is what `TaskOutput` later collects. Counting a
-#: foreground delegation as a tool the lead RAN is what made `jarvis inspect` report
-#: "blocked on a subagent 0%" for every delegation the fleet has ever made (issue #845,
-#: docs/superpowers/specs/2026-09-29-a-runaway-tool-call-is-not-a-slow-subagent.md §1).
+#: Tools whose span is the lead DELEGATING and then waiting for the result (docs/superpowers/specs/2026-09-29-a-runaway-tool-call-is-not-a-slow-subagent.md §1)
 DELEGATION_TOOLS = ("Agent", "Task")
 
-#: Tools whose span NAMES a subagent, and the only evidence a subagent is attached on
-#: (spec §4b). `Agent` spawns it and `TaskOutput` collects it; a subagent no span names
-#: is reported `unattached` rather than given the turn its timestamps fall in — inventing
-#: a parent the record does not name is the issue-227 mistake.
+#: Tools whose span NAMES a subagent, and the only evidence a subagent is attached on (spec §4b)
 SPAWN_TOOLS = ("Agent", "TaskOutput")
 
-#: How many directory levels of subagent this module actually reads. `_subagent_labels`
-#: and `_subagent_transcripts` glob ONE, so a subagent spawned by a subagent is counted
-#: (`SubagentAnatomy.deeper`) and not read. Stated in every payload, because a depth the
-#: reader cannot see is a completeness claim this code cannot make (spec §4b).
+#: How many directory levels of subagent this module actually reads
 SUBAGENT_DEPTH_READ = 1
 
 COLD_START, TTL_EXPIRY, PREFIX_MISS = "cold-start", "ttl-expiry", "prefix-miss"
-#: The fourth, and the only one the OS chose. A compaction leaves a summary that the
-#: next call writes seconds later with the static head still served — the exact shape of
-#: a prefix miss, and the reason it is labelled before the gap is looked at. Without it
-#: `jarvis inspect` would report the remedy as the defect it was bought to avoid.
+#: The fourth, and the only one the OS chose
 COMPACTION = "compaction"
 
-#: The buckets a wall clock divides into, in the order they are rendered. Walked rather
-#: than spelled out at each site, so a bucket cannot exist in one renderer and not another
-#: — `cli.PART_LABELS` is keyed by these and `tests/test_inspection.py` pins the two equal,
-#: because a fifth bucket missing from one renderer is a table that no longer sums to 100.
+#: The buckets a wall clock divides into, in the order they are rendered
 PARTS = ("generating", "blocked", "tools", "idle", "unaccounted")
 
 WRITE_CAUSE_NOTES = {
@@ -151,9 +46,7 @@ WRITE_CAUSE_NOTES = {
                 "written, and it is the price of not re-sending the whole history",
 }
 
-#: How a turn's injected prompt is recognised, most specific first. The text is the
-#: prompt Jarvis itself wrote (`promptSource == "sdk"`), so these match Jarvis's own
-#: wording rather than anything Claude Code generates.
+#: How a turn's injected prompt is recognised, most specific first
 TRIGGERS: tuple[tuple[str, str], ...] = (
     ("<task-notification>", "a subagent finished"),
     ("[Neo, answering for the user]", "a Neo answer"),
@@ -169,92 +62,58 @@ def _first_line(text: str, limit: int) -> str:
     return line[:limit] + "…" if len(line) > limit else line
 
 
-# -- tool parameters: what may be reported, and how much of it -------------------------
+# -- tool parameters: what may be reported, and how much of it
 
-#: THE SHAPES, COPIED FROM `autoreview` AND NOT IMPORTED. `autoreview.SECRET_EVIDENCE`
-#: and its placeholder set are the reference for how carefully this is taken here
-#: (kn-32fa2a7d: bound every field you did not write), but `inspection` is a leaf —
-#: `usage`, `catalog`, `holds` and nothing else — and importing the review pipeline to
-#: read a transcript would put a model-calling module under `jarvis cost`. The price of
-#: the copy is that a shape added there must be added here; the price of the import is a
-#: cycle. Each entry is (pattern, what the marker CALLS it): the marker names the shape
-#: and never quotes the match, because a report that echoes the credential has only
-#: moved it one file along (kn-deef42ea).
+#: THE SHAPES, COPIED FROM `autoreview` AND NOT IMPORTED
 PARAM_SECRET_SHAPES: tuple[tuple[str, str], ...] = (
-    # The whole block, not the BEGIN line: substituting the header alone would leave the
-    # base64 body sitting in the payload underneath the marker.
+    # The whole block, not the BEGIN line: substituting the header alone would leave the base64 body...
     (r"-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----.*?"
      r"(?:-----END (?:[A-Z]+ )*PRIVATE KEY-----|\Z)", "a private key block"),
     (r"\bssh-(?:rsa|dss|ed25519)\s+AAAA[0-9A-Za-z+/=]+", "an ssh key line"),
     (r"\bAuthorization[\"\']?\s*:\s*[\"\']?(?:Bearer|Basic|Token)\s+\S+",
      "an Authorization header value"),
-    # FROM HERE DOWN, NOT IN `autoreview`. Its `SECRET_EVIDENCE` has exactly three
-    # shapes and all three are above; these were invented here and have no upstream to
-    # go looking for. The reason they are not shared: `autoreview` scans a DIFF, where a
-    # credential arrives as an added assignment line, and this scans a COMMAND LINE,
-    # where the common case is a bare token with nothing naming it — a `ghp_…` piped
-    # into `gh auth login`, a password inside a connection URL.
+    # FROM HERE DOWN, NOT IN `autoreview`
     (r"\bsk-ant-[A-Za-z0-9_-]{8,}", "an Anthropic API key"),
     (r"\bsk-(?:[A-Za-z0-9]+-)?[A-Za-z0-9_-]{16,}", "an sk- API key"),
     (r"\bgithub_pat_[A-Za-z0-9_]{8,}|\bgh[poshur]_[A-Za-z0-9]{8,}", "a GitHub token"),
     (r"\bAKIA[0-9A-Z]{16}\b", "an AWS access key id"),
     (r"\bxox[abpr]-[A-Za-z0-9-]{8,}", "a Slack token"),
-    # `keep` survives the substitution: the scheme, the user and the flag name are what
-    # make the redacted line still readable as the command that was run.
+    # `keep` survives the substitution: the scheme
     (r"(?P<keep>\b[a-zA-Z][a-zA-Z0-9+.-]*://[^\s:/@]+:)[^\s:/@]{3,}(?=@)",
      "a password in a URL"),
     (r"(?P<keep>\bcurl\b[^\n]*?\s-u[ =]+[^\s:@]+:)[^\s\"\']+",
      "a curl -u credential"),
-    # The VALUE shape is spelled into the pattern rather than tested afterwards, and it
-    # is `_looks_like_a_credential`'s test in regex: at least six characters from the
-    # credential charset, carrying both a digit and a letter. That is what keeps
-    # `--password changeme`, `--token ""` and `--token $GH_TOKEN` out (spec §4a).
+    # The VALUE shape is spelled into the pattern rather than tested afterwards
     (r"(?P<keep>--(?:password|token|api[-_]?key)[ =]+)"
      r"(?=[A-Za-z0-9+/=._~-]*[A-Za-z])(?=[A-Za-z0-9+/=._~-]*[0-9])"
      r"[A-Za-z0-9+/=._~-]{6,}",
      "a credential passed as a flag"),
 )
 
-#: An assignment whose left side NAMES a credential. Same two-part test as
-#: `autoreview._line_marker`: the name must name one and the value must look like one.
+#: An assignment whose left side NAMES a credential
 _PARAM_ASSIGNMENT_RE = re.compile(
     r"(?P<head>^[ \t]*(?:(?:export|set|const|let|var|readonly)[ \t]+)?"
     r"(?P<quote>[\"\']?)(?P<name>[A-Za-z_][A-Za-z0-9_.-]*)(?P=quote)"
     r"[ \t]*(?:=>|:=|=|:)[ \t]*)"
     r"(?P<value>[^\r\n]*?)(?P<tail>[ \t]*[,;]?[ \t]*)$")
 
-#: THE SAME ASSIGNMENT, ANYWHERE IN THE LINE — `NAME=value cmd`, `export NAME=value &&
-#: …`, `…; NAME=value …`, `env NAME=value …`. The whole-line form above cannot see any
-#: of those, and they are how a credential most often reaches `params["command"]`. The
-#: value runs to the next whitespace, `;`, `&` or `|`, which is where the shell ends it.
-#: The OPENING quote or bracket counts as a boundary too — `bash -c "export TOKEN=…"` and
-#: `ssh host 'API_KEY=… ./run'` are how a credential reaches a nested command line, and
-#: with only whitespace before the name neither was seen at all (review round 2).
+#: THE SAME ASSIGNMENT, ANYWHERE IN THE LINE
 _PARAM_INLINE_ASSIGNMENT_RE = re.compile(
     r"(?P<head>(?:^|[\s;&|(\"'\[{])(?:(?:export|env|set)[ \t]+)?"
     r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)=)"
     r"(?P<value>[^\s;&|]+)")
 
-#: Characters that CLOSE the context around a value instead of belonging to it: the
-#: closing quote of `bash -c "export TOKEN=…"`, the `)]}` of a subshell or a subscript.
-#: Captured INTO the value they made the credential test fail OPEN — `"` is not in the
-#: credential charset, so the value was judged not-a-secret and printed (review round 2,
-#: spec §4a). Trimmed before the two-part test and put back after it, so the marker
-#: replaces the value only and the line still reads as the command that was run.
+#: Characters that CLOSE the context around a value instead of belonging to it: the closing quote of...
 _PARAM_VALUE_CLOSERS = "\"')]}"
 
-#: Words that make a name a credential's name, matched against the identifier's PARTS:
-#: `monkey` is not a `key` and `AWS_SECRET_ACCESS_KEY` is.
+#: Words that make a name a credential's name
 _PARAM_SECRET_NAMES = frozenset({
     "key", "keys", "apikey", "accesskey", "privatekey", "secretkey",
     "token", "tokens", "authtoken", "secret", "secrets", "clientsecret",
     "password", "passwd", "passphrase", "pwd", "credential", "credentials",
 })
 
-#: A VALUE THAT IS NOT A SECRET, however secret its name — the negative control. Most
-#: `key=` lines in any repo carry an empty default, a placeholder or an expression, and
-#: redacting those would make the parameter report useless for the one thing it is for:
-#: reading what the worker actually ran.
+#: A VALUE THAT IS NOT A SECRET, however secret its name — the negative control
 _PARAM_PLACEHOLDER_RE = re.compile(
     r"none|null|nil|nan|true|false|x+|\.+|-+|_+|"
     r"todo|tbd|fixme|changeme|change[-_]me|placeholder|redacted|dummy|fake|sample|"
@@ -274,7 +133,7 @@ def _names_a_credential(identifier: str) -> bool:
 
 
 def _looks_like_a_credential(raw: str) -> bool:
-    """`autoreview._secret_value`'s test, same reasoning: an expression is not a value."""
+    """`autoreview._secret_value`'s test, same reasoning: an expression is not a value"""
     value = raw.strip()
     quoted = len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'"
     if quoted:
@@ -289,12 +148,7 @@ def _looks_like_a_credential(raw: str) -> bool:
 
 
 def _assigned_credential(raw: str) -> tuple[bool, str]:
-    """Is this assigned value a credential, and what CLOSERS trail it: `(yes, tail)`.
-
-    The value as matched is tested first: a value inside a BALANCED pair of quotes is a
-    value (`"token": "ghp_…"`), and trimming that pair would break the test instead of
-    fixing it. Only then is the unbalanced trailing quote or bracket trimmed off.
-    """
+    """Is this assigned value a credential, and what CLOSERS trail it: `(yes, tail)`"""
     if _looks_like_a_credential(raw):
         return True, ""
     trimmed = raw.rstrip(_PARAM_VALUE_CLOSERS)
@@ -302,7 +156,7 @@ def _assigned_credential(raw: str) -> tuple[bool, str]:
 
 
 def _redact_assignment(m: "re.Match[str]") -> str:
-    """One inline assignment, kept unless BOTH halves say credential."""
+    """One inline assignment, kept unless BOTH halves say credential"""
     is_credential, closers = _assigned_credential(m.group("value"))
     if _names_a_credential(m.group("name")) and is_credential:
         return m.group("head") + CREDENTIAL_VALUE_MARKER + closers
@@ -310,18 +164,10 @@ def _redact_assignment(m: "re.Match[str]") -> str:
 
 
 def redact_param(text: str) -> str:
-    """One tool-input value with its secret-shaped content NAMED, never quoted. Pure.
-
-    Applied before the value reaches any payload (spec §4a) — a tool input carries file
-    contents and anything a worker typed into a `Bash` command, and `jarvis inspect`
-    output is read, pasted and stored. Returns the text unchanged when nothing matches,
-    which is the overwhelmingly common case.
-    """
+    """One tool-input value with its secret-shaped content NAMED, never quoted"""
     if not text:
         return text
-    # ASSIGNMENTS BEFORE SHAPES, and the order is load-bearing: `API_KEY=sk-live-…`
-    # is one finding, not two, and the assignment marker is the more informative of the
-    # pair. Running the shapes first would name the value and leave the key beside it.
+    # ASSIGNMENTS BEFORE SHAPES, and the order is load-bearing: `API_KEY=sk-live-…` is one finding
     lines = []
     for line in text.split("\n"):
         line = _PARAM_INLINE_ASSIGNMENT_RE.sub(_redact_assignment, line)
@@ -340,41 +186,21 @@ def redact_param(text: str) -> str:
     return text
 
 
-#: How deep the leaf walk goes. 12 is far past any real tool input (`MultiEdit` is two),
-#: and a bound is needed because the input is a worker's JSON, not a schema we control.
-#: At the bound the subtree is NOT reported at all (review round 3): the only other
-#: option is to redact it as serialised text, which is exactly the bug the leaf walk
-#: exists to prevent.
+#: How deep the leaf walk goes. 12 is far past any real tool input (`MultiEdit` is two)
 _PARAM_WALK_MAX_DEPTH = 12
 
-#: What stands in for that subtree. States the bound in the payload, the rule `ParamCaps`
-#: follows: a report that drops something without saying so is not reproducible.
+#: What stands in for that subtree
 PARAM_DEPTH_MARKER = f"<not walked: nested past depth {_PARAM_WALK_MAX_DEPTH}>"
 
 
 def _credential_pair(key: Any, value: Any) -> bool:
-    """A credential-NAMED key holding a credential-SHAPED value — the two-part test on a
-    `dict` pair, which the leaf walk could not run while it redacted key and value as
-    separate strings (review round 3, spec §4a): `{"password": "hunter2000000"}` matches
-    no shape, and dumped it matches neither assignment regex (one is anchored at ^, the
-    other needs `=`), so it printed verbatim.
-    """
+    """A credential-NAMED key holding a credential-SHAPED value"""
     return (isinstance(key, str) and isinstance(value, str)
             and _names_a_credential(key) and _assigned_credential(value)[0])
 
 
 def _redact_leaves(value: Any, depth: int = 0) -> Any:
-    """Every STRING LEAF of a nested tool input redacted, structure untouched.
-
-    THE CLASS OF BUG THIS EXISTS FOR (spec §4a, reopened in review round 2): a value is
-    redacted at the LEAF, never after serialisation. `json.dumps` turns a credential into
-    one escaped line — `"DB_PASSWORD=hunter2000abc\\n"` — where no assignment regex can
-    see it, so `MultiEdit`'s `edits[].new_string` printed verbatim. Do not move redaction
-    back after the dump. Non-string scalars have no secret to carry and pass through.
-
-    At `_PARAM_WALK_MAX_DEPTH` the subtree is replaced by `PARAM_DEPTH_MARKER`, not
-    redacted as text, for that same reason.
-    """
+    """Every STRING LEAF of a nested tool input redacted, structure untouched"""
     if isinstance(value, str):
         return redact_param(value)
     if depth >= _PARAM_WALK_MAX_DEPTH:
@@ -383,9 +209,7 @@ def _redact_leaves(value: Any, depth: int = 0) -> Any:
         walked: dict[Any, Any] = {}
         for k, v in value.items():
             redacted_key = _redact_leaves(k, depth + 1)
-            # Two distinct keys can redact ALIKE, and a comprehension would drop the
-            # first silently — against `_params_of`'s promise that every key is
-            # accounted for (review round 3). Suffix the later one instead.
+            # Two distinct keys can redact ALIKE, and a comprehension would drop the first silently
             if isinstance(redacted_key, str) and redacted_key in walked:
                 nth = 2
                 while f"{redacted_key} #{nth}" in walked:
@@ -402,15 +226,7 @@ def _redact_leaves(value: Any, depth: int = 0) -> Any:
 
 @dataclass(frozen=True)
 class ParamCaps:
-    """How much of a tool's input may be reported, per value, per span and per turn.
-
-    NOT `catalog.InspectConfig` settings, unlike the write and join floors. Those are a
-    per-project JUDGEMENT about what counts as expensive; these are a STRUCTURAL bound
-    on how big one report may get — a single `Write` input can be a whole file, and no
-    project wants a different answer to "may `jarvis inspect` print a megabyte". Stated
-    in every payload (`Anatomy.as_dict`) because a report that truncates without saying
-    so is not reproducible.
-    """
+    """How much of a tool's input may be reported, per value, per span and per turn"""
 
     per_value: int = 500
     per_span: int = 2_000
@@ -427,13 +243,7 @@ PARAM_CAPS = ParamCaps()
 def _params_of(payload: Any, spent: int,
                caps: ParamCaps = PARAM_CAPS,
                ) -> tuple[dict[str, str], list[str], list[str], int]:
-    """One tool input, redacted and bounded: `(params, truncated, dropped, spent)`.
-
-    EVERY key of the input is accounted for — kept, listed as shortened, or listed as
-    dropped — so the reader can tell "the tool was not given that" from "the report
-    would not print it". `spent` is the turn's budget already used; the returned figure
-    is what it becomes.
-    """
+    """One tool input, redacted and bounded: `(params, truncated, dropped, spent)`"""
     if not isinstance(payload, dict):
         return {}, [], [], spent
     params: dict[str, str] = {}
@@ -442,12 +252,11 @@ def _params_of(payload: Any, spent: int,
     span_spent = 0
     for key, value in payload.items():
         if isinstance(value, str):
-            # Same pair test the leaf walk runs, at the top level it never reaches.
+            # Same pair test the leaf walk runs, at the top level it never reaches
             text = CREDENTIAL_VALUE_MARKER if _credential_pair(key, value) else value
         else:
             text = json.dumps(_redact_leaves(value), default=str)
-        # Belt and braces: the line pass also runs over the serialised form, which is the
-        # only place a secret spanning two leaves could show up.
+        # Belt and braces: the line pass also runs over the serialised form
         text = redact_param(text)
         if len(text) > caps.per_value:
             text = text[:caps.per_value] + "…"
@@ -466,35 +275,21 @@ def _params_of(payload: Any, spent: int,
 
 @dataclass
 class ToolSpan:
-    """One tool call, from the model asking for it to the result coming back.
-
-    `ended` is 0.0 when no matching `tool_result` was ever written — a turn killed
-    mid-call. Such a span has no duration to report, and reporting zero would quietly
-    subtract the very seconds the reader is looking for, so it is EXCLUDED from the
-    partition and counted separately as `unfinished`.
-    """
+    """One tool call, from the model asking for it to the result coming back"""
 
     name: str
     tool_id: str
     started: float
     ended: float = 0.0
     detail: str = ""
-    #: The tool's whole `input`, redacted and capped (`_params_of`). ADDITIVE: `detail`
-    #: above is unchanged and stays the one-line answer every renderer already prints —
-    #: spec §4a, `docs/superpowers/specs/2026-09-24-order-observability.md`.
+    #: The tool's whole `input`, redacted and capped (`_params_of`) (docs/superpowers/specs/2026-09-24-order-observability.md)
     params: dict[str, str] = field(default_factory=dict)
-    #: Keys shortened to `ParamCaps.per_value`, and keys left out because the span or
-    #: turn budget ran out. Separate lists: "cut short" and "not printed" are different
-    #: facts about the same key and a reader acts on them differently.
+    #: Keys shortened to `ParamCaps.per_value`, and keys left out because the span or turn budget ran out
     params_truncated: list[str] = field(default_factory=list)
     params_dropped: list[str] = field(default_factory=list)
-    #: `run_in_background: true` on the call that opened this span. Read from the RAW
-    #: `tool_use` input, never from `params`: those are redacted strings capped by
-    #: `ParamCaps`, so a dropped key would silently reclassify a join (spec §1).
+    #: `run_in_background: true` on the call that opened this span
     backgrounded: bool = False
-    #: Does this Bash call read or search SOURCE? TRI-STATE, and `None` is the reading
-    #: that could not be taken: no command text was available, so the call is
-    #: UNCLASSIFIED and never a measured False (§3, Neo q1237, kn-4d32fe12).
+    #: Does this Bash call read or search SOURCE?
     navigates_source: bool | None = None
 
     @property
@@ -522,15 +317,7 @@ class ToolSpan:
 
 @dataclass
 class Prompt:
-    """One prompt that landed in the session — the reason a turn happened.
-
-    `source` is `"sdk"` for a prompt JARVIS injected (dispatch, a `wo send`, a Neo
-    answer, a `<task-notification>`) and `"user"` for one a human typed into the same
-    session. Both start a turn and the distinction is not cosmetic: an injected session
-    (`jarvis wo inject`) or a worker a person later picked up by hand has turns Jarvis
-    never sent, and reading only the injected ones fuses them into one turn that appears
-    to have run for days.
-    """
+    """One prompt that landed in the session — the reason a turn happened"""
 
     ts: float
     kind: str
@@ -544,7 +331,7 @@ class Prompt:
 
 @dataclass
 class Write:
-    """One cache write big enough to classify, with the cause it is attributed to."""
+    """One cache write big enough to classify, with the cause it is attributed to"""
 
     ts: float
     written: int
@@ -566,46 +353,25 @@ class Write:
 
 @dataclass
 class Turn:
-    """One turn of the conversation, and the three ways its wall clock was spent.
-
-    `triggers` is a LIST because Jarvis coalesces everything queued for a work order
-    into one turn (`Daemon.deliver_messages`), so a turn can be started by a subagent
-    finishing and a Neo answer arriving twenty milliseconds apart. Both are the reason
-    it happened and showing one would misattribute it.
-    """
+    """One turn of the conversation, and the three ways its wall clock was spent"""
 
     seq: int
     started: float
     ended: float
-    #: Which transcript turn of that ONE OS turn this is, 1-based. Two transcript turns
-    #: on one `wo_turns.seq` is the normal compaction shape, not an error — spec
-    #: docs/superpowers/specs/2026-09-27-a-request-in-flight-is-not-a-stalled-turn.md §3.
+    #: Which transcript turn of that ONE OS turn this is, 1-based (docs/superpowers/specs/2026-09-27-a-request-in-flight-is-not-a-stalled-turn.md §3.)
     part: int = 1
-    #: The last thing the token accounting can see inside this turn — its last API call
-    #: or finished tool span. `ended` runs on to the NEXT turn's prompt; what lies
-    #: between the two is `idle`, and on a parked work order it is most of the turn.
+    #: The last thing the token accounting can see inside this turn
     active_ended: float = 0.0
-    #: When this turn's LAST INPUT ROW landed with no assistant row after it — a request
-    #: in flight whose first content block has not completed. Zero once one has. Spec
-    #: docs/superpowers/specs/2026-09-27-a-request-in-flight-is-not-a-stalled-turn.md §1:
-    #: Claude Code appends an assistant row only when a block COMPLETES, so the absence
-    #: of one is not evidence that nothing was bought.
+    #: When this turn's LAST INPUT ROW landed with no assistant row after it (docs/superpowers/specs/2026-09-27-a-request-in-flight-is-not-a-stalled-turn.md §1)
     awaiting_since: float = 0.0
     triggers: list[Prompt] = field(default_factory=list)
     spans: list[ToolSpan] = field(default_factory=list)
     calls: list[usage_mod.Call] = field(default_factory=list)
-    #: The cold boundaries that fell in THIS turn, classified once over the whole session
-    #: and attributed here (`_attach_boundaries`). Classifying per turn would open every
-    #: turn with a boundary it did not necessarily have — spec of 2026-09-29, Neo q1048.
+    #: The cold boundaries that fell in THIS turn
     boundaries: list[usage_mod.Boundary] = field(default_factory=list)
-    #: The intervals of THIS turn the OS's own record says it was held (`holds.held`),
-    #: already clipped to it. Empty when nothing held it, and empty for a reading taken
-    #: without a store — a report that cannot see the record must say a turn was held
-    #: for zero seconds, never guess.
+    #: The intervals of THIS turn the OS's own record says it was held (`holds.held`)
     holds: list[Hold] = field(default_factory=list)
-    #: The subagents this turn's own spans NAME (`_attach_subagents`). A PARTITION of the
-    #: turn, drawn out of it and never added to it (kn-7a2180ba, spec §4b): nothing below
-    #: reads this field, so attaching one moves no figure of the parent's.
+    #: The subagents this turn's own spans NAME (`_attach_subagents`)
     subagents: list[SubagentAnatomy] = field(default_factory=list)
 
     @property
@@ -614,27 +380,13 @@ class Turn:
 
     @property
     def held(self) -> float:
-        """Wall clock this turn was not permitted to run — see `holds`.
-
-        Clamped to the wall clock rather than trusted: the spans come from one table and
-        the clock from another file, and an `active` that went negative would be a
-        partition no reader could make sense of.
-        """
+        """Wall clock this turn was not permitted to run — see `holds`"""
         return min(self.wall, sum(h.overlap(self.started, self.ended)
                                   for h in self.holds))
 
     @property
     def active(self) -> float:
-        """THE CLOCK A THRESHOLD BELONGS ON: wall minus every recorded hold.
-
-        Equal to `wall` on a turn nothing held, which is most of them — so this is not a
-        second accounting to keep in step, it is the same one with the OS's own waiting
-        taken out of it.
-
-        NOT `active_ended`, which is a MOMENT and not a duration: that one is where the
-        token accounting stops being able to see inside the turn, and it is what `idle`
-        is measured from.
-        """
+        """THE CLOCK A THRESHOLD BELONGS ON: wall minus every recorded hold"""
         return max(0.0, self.wall - self.held)
 
     def held_by(self) -> dict[str, float]:
@@ -650,59 +402,39 @@ class Turn:
 
     @property
     def idle(self) -> float:
-        """After the worker's last API call, before the next turn's prompt.
-
-        Nothing is running here — the `claude -p` process has exited and Jarvis has not
-        sent the next prompt yet. See the module docstring for why it is not `generating`.
-        """
+        """After the worker's last API call, before the next turn's prompt"""
         if not self.active_ended:
             return 0.0
         return max(0.0, self.ended - self.active_ended)
 
     @property
     def _remainder(self) -> float:
-        """The wall clock nothing else accounts for — `generating` or `unaccounted`.
-
-        Clamped at zero rather than allowed to go negative: tool spans are read from a
-        file Jarvis does not write, and a clock skew or an overlapping pair of spans
-        must not produce a partition that reads as nonsense.
-        """
+        """The wall clock nothing else accounts for — `generating` or `unaccounted`"""
         return max(0.0, self.wall - self.blocked - self.tools - self.idle)
 
     @property
     def observed(self) -> bool:
-        """Did anything in this turn actually reach the API? See `unaccounted`."""
+        """Did anything in this turn actually reach the API?"""
         return bool(self.calls)
 
     @property
     def awaiting(self) -> bool:
-        """A request is in flight and no content block has completed — spec §1."""
+        """A request is in flight and no content block has completed — spec §1"""
         return bool(self.awaiting_since)
 
     @property
     def generating(self) -> float:
-        """The remainder, but only where an API call vouches for it.
-
-        A call's timestamp is when its response FINISHED, so every second up to it was
-        the model producing that response and the remainder before the last call is
-        honestly generating. A turn with no call at all has nothing for the clock to
-        lead up to, and charging it anyway is issue 227.
-        """
+        """The remainder, but only where an API call vouches for it"""
         return self._remainder if self.observed else 0.0
 
     @property
     def unaccounted(self) -> float:
-        """The remainder of a turn that never reached the API — see the module docstring."""
+        """The remainder of a turn that never reached the API — see the module docstring"""
         return 0.0 if self.observed else self._remainder
 
     @property
     def context_peak(self) -> int:
-        """The largest context any one call of this turn carried — §1 step 1.
-
-        Per TURN, which is the grain the method asks for and the grain `Usage` cannot
-        give: `usage.priced` deliberately leaves `context_peak` at zero because it is a
-        property of a conversation rather than of counts.
-        """
+        """The largest context any one call of this turn carried — §1 step 1"""
         return max((c.context for c in self.calls), default=0)
 
     @property
@@ -711,15 +443,7 @@ class Turn:
 
     @property
     def usage(self) -> usage_mod.Usage:
-        """This turn's tokens, priced — AND classified, which `priced` cannot do.
-
-        `usage.priced` deliberately classifies nothing (it prices counts a caller already
-        holds), so summing it left every boundary and context key of every turn at zero
-        while the turn's own `cache_write` ran to six figures (issue #867). The three
-        properties below are filled from what this turn actually has: its own boundaries,
-        its own calls, and `context_peak` — the SAME number `as_dict` emits at the top
-        level, which is the point of filling it here.
-        """
+        """This turn's tokens, priced — AND classified, which `priced` cannot do (#867)"""
         total = usage_mod.Usage()
         for call in self.calls:
             total = total + usage_mod.priced(
@@ -727,16 +451,14 @@ class Turn:
                 cache_write=call.cache_write, cache_read=call.cache_read,
                 output=call.output, cache_1h=call.cache_1h, cache_5m=call.cache_5m)
         total.context_peak = self.context_peak
-        # `usage`'s definition at this grain, the arithmetic `Anatomy.rewrite_excess`
-        # already does for the session: in a perfectly cached turn every token is written
-        # once, so what was written above the largest context reached was sent twice.
+        # `usage`'s definition at this grain
         total.rewrite_excess = max(
             0, sum(c.cache_write for c in self.calls) - self.context_peak)
         usage_mod.fold_boundaries(total, self.boundaries)
         return total
 
     def share(self) -> dict[str, float]:
-        """The partition as fractions of the wall clock, or all zero for an empty turn."""
+        """The partition as fractions of the wall clock, or all zero for an empty turn"""
         if self.wall <= 0:
             return {k: 0.0 for k in PARTS}
         return {k: getattr(self, k) / self.wall for k in PARTS}
@@ -746,47 +468,33 @@ class Turn:
             "seq": self.seq, "part": self.part,
             "started": self.started, "ended": self.ended,
             "wall": round(self.wall, 2),
-            # BOTH CLOCKS, ALWAYS, and the wall one first: it is the honest answer to
-            # "how long did this take in the real world" and deleting it was never on
-            # the table. `held` is the difference, `held_by` says who took it.
+            # BOTH CLOCKS, ALWAYS, and the wall one first: it is the honest answer to "how long did this take in...
             "active": round(self.active, 2), "held": round(self.held, 2),
             "held_by": {k: round(v, 2) for k, v in self.held_by().items()},
             "generating": round(self.generating, 2),
             "blocked": round(self.blocked, 2), "tools": round(self.tools, 2),
             "idle": round(self.idle, 2),
             "unaccounted": round(self.unaccounted, 2),
-            # THE HEADLINE FACT ABOUT A TURN, carried beside the clock rather than left
-            # to be inferred from `api_calls == 0`: every renderer has to say it first
-            # and loudest, and an inference is what four layers got wrong (issue 227).
+            # THE HEADLINE FACT ABOUT A TURN
             "observed": self.observed,
-            # ADDITIVE, and no key above reads them — spec §1, the rule `subagents` was
-            # added under. `observed is False` alone is what four surfaces misread.
+            # ADDITIVE, and no key above reads them — spec §1, the rule `subagents` was added under
             "awaiting": self.awaiting, "awaiting_since": self.awaiting_since,
             "share": {k: round(v, 4) for k, v in self.share().items()},
             "context_peak": self.context_peak,
             "api_calls": len(self.calls), "tool_calls": len(self.spans),
             "unfinished_tool_calls": self.unfinished,
             "triggers": [p.as_dict() for p in self.triggers],
-            # ADDITIVE, and carried because the renderer DERIVES NOTHING (spec §4c):
-            # `jarvis inspect --params` prints each span's parameters, and a CLI that
-            # re-read the transcript to get them is a second answer to the same
-            # question. The profile above stays the summary; this is the detail.
+            # ADDITIVE, and carried because the renderer DERIVES NOTHING (spec §4c): `jarvis inspect --params`...
             "spans": [s.as_dict() for s in self.spans],
             "usage": self.usage.as_dict(),
-            # ADDITIVE and empty on most turns: every key above is unchanged, and none
-            # of them reads this one (spec §4b's partition rule).
+            # ADDITIVE and empty on most turns: every key above is unchanged
             "subagents": [s.as_dict() for s in self.subagents],
         }
 
 
 def _rewrite_block(boundaries: Sequence[usage_mod.Boundary], *,
                    written: int, excess: int) -> dict[str, int | None]:
-    """A boundary census, keyed to `jarvis cost`'s own `rewrite` block.
-
-    ONE SPELLING of that dict, called by `Anatomy.rewrite` and `SubagentAnatomy.rewrite`
-    both (spec 2026-10-02 §1.1): two is how one key comes to mean two things on two
-    surfaces, the rule `usage.fold_boundaries` was factored out under.
-    """
+    """A boundary census, keyed to `jarvis cost`'s own `rewrite` block"""
     def count(cause: str) -> int:
         return sum(1 for b in boundaries if b.cause == cause)
 
@@ -808,47 +516,23 @@ def _rewrite_block(boundaries: Sequence[usage_mod.Boundary], *,
 
 @dataclass
 class SubagentAnatomy:
-    """One subagent's OWN anatomy: its turns, its cache writes, its context peak.
-
-    The same arithmetic as the parent, on its own transcript — `classify_writes` over
-    `usage.calls_of`, `Turn.context_peak` off its turns — because a subagent transcript
-    is a transcript and that is what answers "when is the user paying a write-cache" for
-    the half of the spend the lead agent's file does not hold.
-
-    ITS WRITES ARE ITS OWN AND ARE NEVER FOLDED INTO THE PARENT'S (spec §4b): a parent
-    turn that merely waited on a join did not pay that write, and attributing it upward
-    names the wrong turn as the prefix break.
-    """
+    """One subagent's OWN anatomy: its turns, its cache writes, its context peak"""
 
     task_id: str
     label: str = ""
     turns: list[Turn] = field(default_factory=list)
     writes: list[Write] = field(default_factory=list)
-    #: Subagents of THIS subagent, counted and not read — see `SUBAGENT_DEPTH_READ`.
+    #: Subagents of THIS subagent, counted and not read — see `SUBAGENT_DEPTH_READ`
     deeper: int = 0
-    #: THRESHOLD-FREE, and the reason this class needed more than `writes`: a subagent
-    #: that wrote 334,427 tokens in 115 writes none of which reached the floor had an
-    #: empty `writes` list and rendered as "no large writes" (wo-fb7c0fc2, a8e11a7e).
-    #:
-    #: `None` AND NEVER 0 WHEN IT WAS NOT MEASURED — `SideVolume.code_nav_share()`'s
-    #: rule: a zero share is a finding and an unmeasured one is not. Every order sealed
-    #: before these fields existed carries no key at all, and defaulting those to 0 made
-    #: the renderer say `wrote nothing to the cache` about that same 334,427.
+    #: THRESHOLD-FREE, and the reason this class needed more than `writes`: a subagent that wrote 334,427...
     total_written: int | None = None
-    #: The largest single write, floor-free — the number that EXPLAINS an empty `writes`
-    #: list, and the only one that distinguishes "under the floor" from "wrote nothing".
+    #: The largest single write, floor-free
     max_write: int | None = None
-    #: The floor `writes` was built at, carried so a renderer never has to consult the
-    #: config to word an absence (`Anatomy.write_floor`'s rule).
+    #: The floor `writes` was built at
     write_floor: int | None = None
-    #: `usage.classify_boundaries` over THIS subagent's calls — the threshold-free
-    #: census q1215 requires. One run of calls per transcript, which is the grain
-    #: `classify_boundaries` documents.
+    #: `usage.classify_boundaries` over THIS subagent's calls — the threshold-free census q1215 requires
     boundaries: list[usage_mod.Boundary] = field(default_factory=list)
-    #: Calls, carried as a count so `total_written` can be read as a rate. A FIELD and
-    #: not `api_calls`: a transcript with no prompt row has no turns at all
-    #: (`read_transcript` opens one only at a prompt), so the property counts 0 over the
-    #: calls that were made, and the two must not disagree. `None` is absent, as above.
+    #: Calls, carried as a count so `total_written` can be read as a rate
     api_call_count: int | None = None
 
     @property
@@ -864,22 +548,14 @@ class SubagentAnatomy:
         return max((t.context_peak for t in self.turns), default=0)
 
     def writes_by_cause(self) -> dict[str, int]:
-        """Tokens written, totalled per cause. Summed HERE and not in a renderer: the
-        CLI and the dashboard both read this dict verbatim (spec §4c)."""
+        """Tokens written, totalled per cause"""
         totals: dict[str, int] = {}
         for write in self.writes:
             totals[write.cause] = totals.get(write.cause, 0) + write.written
         return totals
 
     def rewrite(self) -> dict[str, int | None] | None:
-        """This subagent's own boundary census, same keys as `Anatomy.rewrite()`.
-
-        `None` WHEN THE FIGURES WERE NEVER MEASURED, because the census is derived from
-        them: `cache_write` is `total_written` and `tokens` is its excess over the peak,
-        so a block built over an absence would be a dict of zeros claiming "no re-write
-        tax" about a subagent nobody counted. An empty `boundaries` list cannot say
-        which, so the absence is carried on the scalar.
-        """
+        """This subagent's own boundary census, same keys as `Anatomy.rewrite()`"""
         if self.total_written is None:
             return None
         return _rewrite_block(self.boundaries, written=self.total_written,
@@ -894,32 +570,22 @@ class SubagentAnatomy:
             "context_peak": self.context_peak,
             "wall": round(self.wall, 2), "api_calls": self.api_calls,
             "deeper": self.deeper, "depth_read": SUBAGENT_DEPTH_READ,
-            # THRESHOLD-FREE, beside the floored list and never instead of it (spec
-            # 2026-10-02 §1.1): `writes_by_cause` empty means "nothing at that floor",
-            # and only these can say so.
+            # THRESHOLD-FREE, beside the floored list and never instead of it (spec 2026-10-02 §1.1):...
             "total_written": self.total_written, "max_write": self.max_write,
             "write_floor": self.write_floor,
             "api_call_count": self.api_call_count,
-            # The CENSUS, not the rows: the per-turn `boundaries` key already exists at
-            # the parent grain and a renderer needs the counts. `None` when unmeasured,
-            # and the key is still EMITTED: an omitted key is exactly what an old seal
-            # looks like, which is the bug, so absence is said rather than left out.
+            # The CENSUS, not the rows: the per-turn `boundaries` key already exists at the parent grain and a...
             "rewrite": self.rewrite(),
         }
 
 
-#: The navigation reading's WORDING, in ONE place: `jarvis inspect` and the debug page
-#: both render from here, so the two cannot disagree about one figure (kn-77a8431d).
+#: The navigation reading's WORDING
 NAV_LABELS = {"symbol_calls": "symbol", "source_nav_calls": "source nav",
               "unclassified": "unclassified"}
 
 
 def nav_line(nav: dict[str, int]) -> str:
-    """The three counts as three SEPARATE numbers — §3.
-
-    `unclassified` is printed only when there IS one: a `0 unclassified` would read as a
-    measured zero, which is the claim the tri-state exists to avoid (issue #227).
-    """
+    """The three counts as three SEPARATE numbers — §3 (#227)"""
     line = (f"navigation — {nav.get('symbol_calls', 0)} {NAV_LABELS['symbol_calls']}, "
             f"{nav.get('source_nav_calls', 0)} {NAV_LABELS['source_nav_calls']}")
     if nav.get("unclassified"):
@@ -929,44 +595,24 @@ def nav_line(nav: dict[str, int]) -> str:
 
 @dataclass
 class Anatomy:
-    """One session, taken apart. `found` is false when no transcript exists for it.
-
-    Absent rather than empty: `usage.read_session` reports a missing transcript the same
-    way and every surface that renders one has to say "no transcript" rather than
-    "0 seconds", which is a different and untrue claim.
-    """
+    """One session, taken apart"""
 
     session_id: str
     found: bool = False
     turns: list[Turn] = field(default_factory=list)
     writes: list[Write] = field(default_factory=list)
-    #: Every cold boundary in the session, classified ONCE (`usage.classify_boundaries`)
-    #: and also attributed to the turn each fell in. Not `writes`: that list answers
-    #: "which large writes should this report show, and why" and is cut by
-    #: `report_write_floor`, where a boundary census has no threshold at all.
+    #: Every cold boundary in the session
     boundaries: list[usage_mod.Boundary] = field(default_factory=list)
-    #: The thresholds this reading was taken at, carried so every rendering of it can
-    #: state them. A report that shows "3 large writes" without saying what large meant
-    #: is not reproducible, and these are per-project settings (`catalog.InspectConfig`).
+    #: The thresholds this reading was taken at, carried so every rendering of it can state them
     write_floor: int = DEFAULT_INSPECT_REPORT_WRITE_FLOOR
     join_floor: int = DEFAULT_INSPECT_REPORT_JOIN_FLOOR
-    #: Task id -> what it was, from the subagent `.meta.json` Claude Code writes beside
-    #: the transcript. This is what turns "blocked 450s on a7b62083" into a sentence.
-    #: NOT `Turn.subagents`, which is the list of `SubagentAnatomy` — hence the name.
+    #: Task id -> what it was, from the subagent `.meta.json` Claude Code writes beside the transcript
     subagent_labels: dict[str, str] = field(default_factory=dict)
-    #: Subagent transcripts no `Agent`/`TaskOutput` span of this session names. Reported
-    #: HERE rather than attached to the turn their timestamps fall in: a timestamp
-    #: fallback invents a parent the record does not name (issue 227), so an unattached
-    #: subagent says it is unattached (spec §4b, decided on wo-5f4d8611 q687).
+    #: Subagent transcripts no `Agent`/`TaskOutput` span of this session names
     unattached_subagents: list[SubagentAnatomy] = field(default_factory=list)
-    #: `wo_turns.seq` values the caller passed that no transcript turn bound to — the
-    #: `/compact` turn, whose prompt row compaction rewrites away. Reported rather than
-    #: dropped (spec 2026-09-27 §3), and empty for a caller that passed no `turn_starts`.
+    #: `wo_turns.seq` values the caller passed that no transcript turn bound to
     unmatched_os_turns: list[int] = field(default_factory=list)
-    #: Every hold on the WHOLE work order (`holds.held`), including any falling outside
-    #: the turns below. Kept whole rather than only as the per-turn slices, because a
-    #: hold still running past the last turn is the live one, and it is the answer to
-    #: "why has nothing happened since".
+    #: Every hold on the WHOLE work order (`holds.held`), including any falling outside the turns below
     holds: list[Hold] = field(default_factory=list)
 
     @property
@@ -986,7 +632,7 @@ class Anatomy:
         return sum(t.active for t in self.turns)
 
     def held_by(self) -> dict[str, float]:
-        """Seconds held per cause across the session, biggest first."""
+        """Seconds held per cause across the session, biggest first"""
         totals: dict[str, float] = {}
         for turn in self.turns:
             for cause, seconds in turn.held_by().items():
@@ -995,28 +641,17 @@ class Anatomy:
 
     @property
     def unexplained(self) -> float:
-        """Idle the record does NOT account for — the residual, and the honest one.
-
-        `held` is clipped to the gaps between turns (`holds`' module note), so it is a
-        subset of `idle` and this subtraction is exact rather than an estimate. It is the
-        number the question behind this module actually asked: once the holds come out,
-        is there a turn that sat open with no API call in flight and nothing holding it?
-        A large one here is a DIFFERENT defect from anything this file can fix.
-        """
+        """Idle the record does NOT account for — the residual, and the honest one"""
         return max(0.0, sum(t.idle for t in self.turns) - self.held)
 
     def joins(self, over: float | None = None) -> list[ToolSpan]:
-        """Blocking joins at or over `over` seconds — the report's floor by default."""
+        """Blocking joins at or over `over` seconds — the report's floor by default"""
         floor = self.join_floor if over is None else over
         return sorted((s for s in self.spans if s.is_join and s.seconds >= floor),
                       key=lambda s: s.seconds, reverse=True)
 
     def tool_profile(self) -> list[dict[str, Any]]:
-        """Count, total and mean seconds per tool name, dearest total first.
-
-        Unfinished spans are counted but contribute no seconds, and the count says so —
-        a mean over calls that never returned would be an average of a lie.
-        """
+        """Count, total and mean seconds per tool name, dearest total first"""
         by_name: dict[str, dict[str, Any]] = {}
         for span in self.spans:
             row = by_name.setdefault(span.name, {"name": span.name, "calls": 0,
@@ -1031,16 +666,7 @@ class Anatomy:
         return sorted(by_name.values(), key=lambda r: r["seconds"], reverse=True)
 
     def nav_profile(self) -> dict[str, int]:
-        """How this session navigated code: symbol calls, source-navigation Bash calls.
-
-        §3's CONTRACT — these three key names are read by other surfaces. A SIBLING of
-        `tool_profile()` and never a replacement for it. A span that is neither a symbol
-        call nor Bash (`Read`, `Write`, `Edit`, `Task`, `Grep`, `Glob`) is in none of the
-        three, and `search_for_pattern` is text search rather than a symbol call.
-
-        `unclassified` is Bash spans whose command text was not available, kept apart
-        from a measured zero: absent is not zero (issue #227, kn-4d32fe12).
-        """
+        """How this session navigated code: symbol calls, source-navigation Bash calls (#227)"""
         profile = {"symbol_calls": 0, "source_nav_calls": 0, "unclassified": 0}
         for span in self.spans:
             if navigation.is_symbol_call(span.name):
@@ -1052,25 +678,13 @@ class Anatomy:
         return profile
 
     def partition(self) -> dict[str, float]:
-        """The whole session's clock, summed over its turns.
-
-        `active`, `held` and `unexplained` are deliberately NOT in `PARTS`: those five
-        divide the wall clock between them and have to keep summing to it, while these
-        cut the same clock a second way. Folding them in would make every percentage the
-        renderers print stop meaning anything.
-        """
+        """The whole session's clock, summed over its turns"""
         return {"wall": self.wall, "active": self.active, "held": self.held,
                 "unexplained": self.unexplained,
                 **{k: sum(getattr(t, k) for t in self.turns) for k in PARTS}}
 
     def cache_ttl(self) -> dict[str, int]:
-        """Which TTL this session's cache writes were bought at — §1 step 5, §3.2.
-
-        The finding it exists to make visible is a ZERO: across 1.8M cache-write tokens
-        in the subject session the one-hour TTL was requested for none of them, and no
-        surface said so. `unknown` is writes whose record carries no split at all, kept
-        apart from a measured zero rather than folded into it.
-        """
+        """Which TTL this session's cache writes were bought at — §1 step 5, §3.2"""
         split = {"cache_1h": 0, "cache_5m": 0, "unknown": 0}
         for turn in self.turns:
             for call in turn.calls:
@@ -1081,36 +695,14 @@ class Anatomy:
         return split
 
     def rewrite_excess(self) -> int:
-        """Tokens this session paid to send twice — `usage`'s definition, not a second one.
-
-        In a perfectly cached session every token is written to the cache exactly once,
-        so the total written can never exceed the largest context reached. `usage` owns
-        this arithmetic and the comment that justifies it; this reads the same two
-        numbers off the calls already in hand rather than re-opening the file.
-        """
+        """Tokens this session paid to send twice — `usage`'s definition, not a second one"""
         written = sum(c.cache_write for t in self.turns for c in t.calls)
         peak = max((t.context_peak for t in self.turns), default=0)
         return max(0, written - peak)
 
     def rewrite(self) -> dict[str, int | None]:
-        """The session's re-write total, keyed to `jarvis cost`'s own `rewrite` block.
-
-        Same keys as `bill._worker_extras`' wherever the field means the same thing, so
-        the two payloads can be laid side by side — which is what #867's reporter could
-        not do. Summed from the boundaries `read_session` classified and the calls already
-        in hand: nothing is re-read and nothing is re-classified.
-
-        NO `list_usd` and no `ttl_share`. `jarvis cost` is the money surface; a second
-        dollar figure here invites two answers to one question, and the share is a ratio
-        of the numbers below.
-
-        `undecided_boundaries` is why this is safe to read with an unknown floor:
-        `ttl_write` and `prefix_write` at 0 beside a non-zero one of these is "not
-        measured", never "no TTL expiry".
-        """
-        # ONE spelling of the dict, shared with `SubagentAnatomy.rewrite` (§1.1). The
-        # excess is CALLED, not recomputed, so the top-level `rewrite_excess` key and
-        # this one cannot drift.
+        """The session's re-write total, keyed to `jarvis cost`'s own `rewrite` block (#867)"""
+        # ONE spelling of the dict, shared with `SubagentAnatomy.rewrite` (§1.1)
         return _rewrite_block(
             self.boundaries,
             written=sum(c.cache_write for t in self.turns for c in t.calls),
@@ -1125,51 +717,40 @@ class Anatomy:
             "found": self.found,
             "write_floor": self.write_floor,
             "join_floor": self.join_floor,
-            # Stated beside the floors for the same reason they are: a truncation the
-            # reader cannot size is not reproducible (spec §4a).
+            # Stated beside the floors for the same reason they are: a truncation the reader cannot size is not...
             "param_caps": PARAM_CAPS.as_dict(),
             "partition": {k: round(v, 2) for k, v in part.items()},
             "share": {k: round(part[k] / wall, 4) for k in PARTS},
             "held_by": {k: round(v, 2) for k, v in self.held_by().items()},
             "holds": [h.as_dict() for h in self.holds],
-            # The legend, carried WITH the reading rather than looked up beside it: a
-            # `--json` consumer and the dashboard both render a cause and neither should
-            # have to hold its own copy of the wording (`PART_LABELS`' rule).
+            # The legend, carried WITH the reading rather than looked up beside it: a `--json` consumer and the...
             "hold_causes": HOLD_CAUSES,
             "context_peak": max((t.context_peak for t in self.turns), default=0),
             "rewrite_excess": self.rewrite_excess(),
-            # ADDITIVE, and the session-level figure #846 needs: `rewrite_excess` above
-            # stays the same number, and `rewrite["tokens"]` IS it.
+            # ADDITIVE, and the session-level figure #846 needs: `rewrite_excess` above stays the same number
             "rewrite": self.rewrite(),
             "cache_ttl": self.cache_ttl(),
             "turns": [t.as_dict() for t in self.turns],
             "writes": [w.as_dict() for w in self.writes],
             "joins": [s.as_dict() for s in self.joins()],
             "tools": self.tool_profile(),
-            # ADDITIVE and a SIBLING of `tools` above: §3's three-key contract, and its
-            # one wording carried WITH the reading (`hold_causes`' rule, kn-77a8431d).
+            # ADDITIVE and a SIBLING of `tools` above: §3's three-key contract
             "nav": nav,
             "nav_line": nav_line(nav),
-            # ADDITIVE, and `subagent_depth_read` is stated for the reason the floors and
-            # the caps are: silence here would read as "there were none deeper".
+            # ADDITIVE, and `subagent_depth_read` is stated for the reason the floors and the caps are: silence...
             "unattached_subagents": [s.as_dict()
                                      for s in self.unattached_subagents],
-            # ADDITIVE, empty unless the caller bound the numbering (spec 2026-09-27 §3).
+            # ADDITIVE, empty unless the caller bound the numbering (spec 2026-09-27 §3)
             "unmatched_os_turns": list(self.unmatched_os_turns),
             "subagent_depth_read": SUBAGENT_DEPTH_READ,
         }
 
 
-# -- reading a transcript --------------------------------------------------------------
+# -- reading a transcript
 
 
 def _navigates(block: dict[str, Any]) -> bool | None:
-    """Does this `tool_use` block read or search source? None when it cannot be said.
-
-    §3: read from the RAW input, the same read `backgrounded` does. A non-`Bash` call is
-    None here and is classified by TOOL NAME in `Anatomy.nav_profile`; a `Bash` call with
-    no command text is UNCLASSIFIED rather than False (issue #227).
-    """
+    """Does this `tool_use` block read or search source? (#227)"""
     if str(block.get("name") or "") != "Bash":
         return None
     command = str((block.get("input") or {}).get("command") or "")
@@ -1179,21 +760,10 @@ def _navigates(block: dict[str, Any]) -> bool | None:
 
 
 def _detail_of(payload: Any, limit: int) -> str:
-    """A one-line answer to "doing what" for a tool call.
-
-    `description` first wherever it exists, because it is the agent's own words for what
-    it was doing and every long-running tool in the fleet carries one.
-
-    REDACTED BEFORE IT IS CUT, and in that order (spec §4a, wo-5f4d8611 q687): `command`
-    is second in the list, so an undescribed `Bash` call put the raw command line here
-    while `params` beside it was redacted. Truncating first would leave the head of a
-    credential printed; redacting first can only cost the tail of a marker.
-    """
+    """A one-line answer to "doing what" for a tool call"""
     if not isinstance(payload, dict):
         return ""
-    # `substring_pattern` is Serena `search_for_pattern`'s own parameter name, and the
-    # only field that says WHAT hung when that call runs away (issue #845, spec §2c —
-    # which assumed `pattern` covered it; the tool does not use that name).
+    # `substring_pattern` is Serena `search_for_pattern`'s own parameter name (#845)
     for key in ("description", "command", "task_id", "file_path", "pattern",
                 "substring_pattern", "skill"):
         value = payload.get(key)
@@ -1217,13 +787,7 @@ def _prompt_text(row: dict[str, Any]) -> str:
 
 
 def _prompt_of(row: dict[str, Any], ts: float, limit: int) -> Prompt | None:
-    """The prompt this row is, or None if it is not one.
-
-    THREE KINDS OF `user` ROW share the type and only one of them starts a turn. A tool
-    result is the agent's own loop, not an interruption. An `isMeta` row is Claude Code
-    talking to itself — a skill's base directory, a hook's output — and counting one as a
-    prompt would cut a turn in half at the moment a skill loaded.
-    """
+    """The prompt this row is, or None if it is not one"""
     if row.get("type") != "user":
         return None
     source = "sdk" if row.get("promptSource") == "sdk" else "user"
@@ -1233,19 +797,13 @@ def _prompt_of(row: dict[str, Any], ts: float, limit: int) -> Prompt | None:
     text = _prompt_text(row)
     if not text.strip():
         return None
-    # REDACTED BEFORE IT IS CUT, as `_detail_of` is: the quote is sealed, so an
-    # unredacted one outlives the transcript (autopsy durability spec §3).
+    # REDACTED BEFORE IT IS CUT, as `_detail_of` is: the quote is sealed
     return Prompt(ts=ts, kind=_trigger_kind(text),
                   quote=_first_line(redact_param(text), limit), source=source)
 
 
 def _subagent_labels(path: Path) -> dict[str, str]:
-    """Task id -> label, from the meta files beside a transcript.
-
-    The task id a `TaskOutput` blocks on IS the subagent's transcript stem minus its
-    `agent-` prefix, which is the only join between "what the lead agent waited on" and
-    "what that thing was".
-    """
+    """Task id -> label, from the meta files beside a transcript"""
     labels: dict[str, str] = {}
     directory = path.with_suffix("") / "subagents"
     if not directory.is_dir():
@@ -1264,47 +822,30 @@ def _subagent_labels(path: Path) -> dict[str, str]:
 def read_transcript(path: Path | str,
                     cfg: InspectConfig | None = None,
                     ) -> tuple[list[Turn], dict[str, str]]:
-    """One transcript file, cut into turns with their tool spans attached.
-
-    A single ordered walk, because the three things it collects are interleaved and
-    every one of them is defined by its position relative to the others: a turn starts
-    at an injected prompt, but only at one with an assistant message since the last turn
-    started — otherwise the two prompts Jarvis coalesces into one turn would read as two.
-    """
+    """One transcript file, cut into turns with their tool spans attached"""
     cfg = cfg or InspectConfig()
     turns: list[Turn] = []
     pending: dict[str, ToolSpan] = {}
     open_turn: Turn | None = None
     saw_assistant = False
-    # The per-turn parameter budget is spent HERE, in the one ordered walk, because this
-    # is the only place that knows which turn a span landed in. Reset with the turn: the
-    # cap bounds one turn's report, not the session's (spec §4a).
+    # The per-turn parameter budget is spent HERE
     param_spent = 0
 
     for row in usage_mod.rows(path):
         ts = usage_mod.parse_stamp(row.get("timestamp"))
-        # A TURN ENDS WHEN THE MODEL STOPS, NOT WHEN THE NEXT TURN STARTS. A worker turn
-        # is one `claude -p` process and the next one can be days later, so closing a
-        # turn at its successor's start charges it the whole idle gap: measured over the
-        # fleet's 441 worker turns that read the longest one as ELEVEN DAYS of wall
-        # clock, and every percentile above the median was the gap rather than the work.
-        # Only conversation rows count — the UI-state rows Claude Code appends
-        # (`custom-title`, `worktree-state`) are written outside the turn.
+        # A TURN ENDS WHEN THE MODEL STOPS, NOT WHEN THE NEXT TURN STARTS
         if ts and open_turn is not None and row.get("type") in ("assistant", "user"):
             open_turn.ended = max(open_turn.ended, ts)
         prompt = _prompt_of(row, ts, cfg.quote_chars)
         if prompt is not None:
-            # A new turn only if the model has spoken since the last one started:
-            # `Daemon.deliver_messages` coalesces everything queued for a work order
-            # into ONE turn, so a `<task-notification>` and the Neo answer twenty
-            # milliseconds behind it are two triggers of one turn, not two turns.
+            # A new turn only if the model has spoken since the last one started: `Daemon.deliver_messages`...
             if open_turn is None or saw_assistant:
                 open_turn = Turn(seq=len(turns) + 1, started=ts, ended=ts)
                 turns.append(open_turn)
                 saw_assistant = False
                 param_spent = 0
             open_turn.triggers.append(prompt)
-            # Spec §1: the input is in, the answer is not.
+            # Spec §1: the input is in, the answer is not
             open_turn.awaiting_since = ts
             continue
         if row.get("type") == "assistant":
@@ -1323,23 +864,20 @@ def read_transcript(path: Path | str,
                                               cfg.quote_chars),
                             params=params, params_truncated=truncated,
                             params_dropped=dropped,
-                            # The RAW block, the same read `background._scan_calls` does
-                            # and for the same reason (spec §1).
+                            # The RAW block, the same read `background._scan_calls` does and for the same reason (spec §1)
                             backgrounded=bool((block.get("input") or {}).get(
                                 "run_in_background")),
-                            # §3: the RAW command, never `detail` (prose) or `params`
-                            # (capped) — and None when there is no command to read.
+                            # §3: the RAW command, never `detail` (prose) or `params` (capped)
                             navigates_source=_navigates(block))
             pending[tool_id] = span
-            # Charged to the turn that ASKED for it. A span whose result lands after the
-            # next turn starts still belongs to the turn that spent the seconds.
+            # Charged to the turn that ASKED for it
             if open_turn is not None:
                 open_turn.spans.append(span)
         for block in usage_mod.blocks_of(row, "tool_result"):
             span = pending.pop(str(block.get("tool_use_id") or ""), None)
             if span is not None:
                 span.ended = ts
-            # Spec §1: a result is an input too — the model is answering again.
+            # Spec §1: a result is an input too — the model is answering again
             if open_turn is not None:
                 open_turn.awaiting_since = ts
 
@@ -1348,17 +886,7 @@ def read_transcript(path: Path | str,
 
 def classify_writes(calls: Sequence[usage_mod.Call], floor: int,
                     compactions: Sequence[float] = ()) -> list[Write]:
-    """Every cache write at or over `floor`, labelled with what caused it.
-
-    The gap is measured to the PREVIOUS API call in the session whatever its size, and
-    compared against the TTL that call bought — a 1-hour write (every Jarvis call before
-    kn-5dd784f5) survives a gap that would expire a 5-minute one, so testing both
-    against 300 seconds would call an honest expiry a defect.
-
-    `compactions` are the moments the conversation was replaced
-    (`usage.compactions_in`); a write across one is labelled `COMPACTION` before
-    anything else, because by gap and read alone it is indistinguishable from a miss.
-    """
+    """Every cache write at or over `floor`, labelled with what caused it"""
     writes: list[Write] = []
     previous: usage_mod.Call | None = None
     for call in calls:
@@ -1380,30 +908,18 @@ def classify_writes(calls: Sequence[usage_mod.Call], floor: int,
     return writes
 
 
-#: How far AFTER a transcript turn's first row an OS turn may have started and still be
-#: its turn. The turn file is written first — measured offset on wo-dbea82cf is 3-4s
-#: (07:36:18 vs 07:36:22) — so this covers the OPPOSITE skew only. A measurement of write
-#: ordering, not a project's judgement about what is expensive: it does not belong in the
-#: catalog (spec 2026-09-27 §3).
+#: How far AFTER a transcript turn's first row an OS turn may have started and still be its turn
 TURN_BIND_TOLERANCE_SECONDS = 5.0
 
 
 def turn_name(seq: int) -> str:
-    """"turn 7", or "an unrecorded turn" for the 0 of a turn the OS never minted.
-
-    ONE FORMATTER for every surface that prints a number this module bound. Never -1:
-    `project_store.NO_TURN` belongs to `wo_alarms` and this module imports no store.
-    """
+    """"turn 7", or "an unrecorded turn" for the 0 of a turn the OS never minted"""
     return f"turn {seq}" if seq else "an unrecorded turn"
 
 
 def _bind_turns(turns: Sequence[Turn],
                 turn_starts: Sequence[tuple[int, float]]) -> list[int]:
-    """Number the transcript's turns with the OS's own `wo_turns.seq` — spec §3.
-
-    Empty `turn_starts` is 1..N, byte for byte what every caller that cannot see the
-    record got before. Returns the OS turns nothing bound to.
-    """
+    """Number the transcript's turns with the OS's own `wo_turns.seq` — spec §3"""
     if not turn_starts:
         for seq, turn in enumerate(turns, start=1):
             turn.seq, turn.part = seq, 1
@@ -1427,30 +943,7 @@ def read_session(session_id: str, cfg: InspectConfig | None = None, *,
                  spans: Sequence[Hold] = (),
                  turn_starts: Sequence[tuple[int, float]] = (),
                  cold_prefix_floor: int | None = None) -> Anatomy:
-    """Take one session apart, across every segment file it left behind.
-
-    Segments are read in path order and their turns concatenated by start time, then
-    renumbered — a session resumed under a second cwd has a file under each slug
-    (`usage.index_sessions`), and numbering per file would produce two turn 1s.
-
-    `spans` is `holds.held` for the work order this session belongs to, and it is PASSED
-    IN rather than read here on purpose: this module walks files Claude Code wrote and
-    has never opened the OS's own database, which is what keeps it free to be called
-    from a test, a `--json` consumer and the daemon alike. Left empty the report is the
-    one it was before — every turn `active == wall`, which is the honest reading for a
-    caller that cannot see the record rather than a claim that nothing held it.
-
-    `turn_starts` is `(wo_turns.seq, wo_turns.started_at)` and is passed in for that same
-    reason. Left empty the turns are numbered 1..N as they always were; passed, they
-    carry the OS's own numbers, so an alarm and `jarvis inspect` stop naming one turn two
-    different ways (spec 2026-09-27 §3).
-
-    `cold_prefix_floor` is `os.cold_prefix_floor` and is passed in for the same reason,
-    best-effort: left out, boundaries are still counted and a compacted one still
-    labelled, and the TTL-vs-prefix split of the rest is reported as UNDECIDED rather
-    than guessed (`usage.classify_boundaries`). Required here would mean `jarvis inspect`
-    failing over a moved catalog, which is exactly when someone needs it.
-    """
+    """Take one session apart, across every segment file it left behind"""
     cfg = cfg or InspectConfig()
     anatomy = Anatomy(session_id=session_id, write_floor=cfg.report_write_floor,
                       join_floor=cfg.report_join_floor)
@@ -1474,81 +967,45 @@ def read_session(session_id: str, cfg: InspectConfig | None = None, *,
                    for c in usage_mod.compaction_stamps(path)]
     anatomy.writes = classify_writes(calls, cfg.report_write_floor,
                                      sorted(compactions))
-    # ONCE over the whole session, then attributed — Neo q1048. Classified per turn,
-    # every turn would open with a boundary it did not necessarily have and the per-turn
-    # counts would not sum to the session's.
+    # ONCE over the whole session, then attributed — Neo q1048
     anatomy.boundaries = usage_mod.classify_boundaries(
         calls, compactions=sorted(compactions), cold_prefix_floor=cold_prefix_floor)
     _attach_boundaries(turns, anatomy.boundaries)
     _attach_calls(turns, calls)
     _close_turns(turns)
     _name_joins(turns, anatomy.subagent_labels)
-    # AFTER `_name_joins`, which rewrites a join's `detail` from the bare task id to
-    # "label (id)": matching on the id as a SUBSTRING works either side of it, so the
-    # order of these two is not a trap for the next reader (spec §4b).
+    # AFTER `_name_joins`, which rewrites a join's `detail` from the bare task id to "label (id)":...
     anatomy.unattached_subagents = _attach_subagents(
         turns,
         [_read_subagent(sub, cfg, anatomy.subagent_labels, cold_prefix_floor)
          for path in sorted(paths) for sub in _subagent_transcripts(path)])
-    # AFTER `_close_turns`, which is the only thing that knows where a turn ends: a hold
-    # attached before it would be measured against a turn whose `ended` was still its
-    # own last row rather than its successor's prompt.
+    # AFTER `_close_turns`, which is the only thing that knows where a turn ends: a hold attached before...
     anatomy.holds = list(spans)
     _attach_holds(turns, anatomy.holds)
     return anatomy
 
 
 def _attach_holds(turns: Sequence[Turn], spans: Sequence[Hold]) -> None:
-    """Give every turn the holds that overlap it. One hold can reach two turns.
-
-    The whole span is attached to each rather than pre-cut, because `Turn.held` clips it
-    to its own clock anyway — and a pre-cut copy is a second version of the same fact to
-    keep in step.
-    """
+    """Give every turn the holds that overlap it"""
     for turn in turns:
         turn.holds = [h for h in spans if h.overlap(turn.started, turn.ended) > 0]
 
 
 def _close_turns(turns: Sequence[Turn]) -> None:
-    """Give every turn its two ends: when it stopped working, and when it stopped.
-
-    `active_ended` is the last thing the token accounting can SEE inside the turn — its
-    own API calls and finished tool spans. THE ROW CLOCK IS NOT ENOUGH FOR THIS. A
-    transcript can be appended to long after its last call (an old-transport session
-    resumed by hand under the same id writes conversation rows with no prompt row before
-    them), and one such file charged a 21-minute turn with TWELVE DAYS. Rows `usage`
-    cannot count must not move a clock `usage` is the denominator of.
-
-    `ended` runs on to the NEXT turn's prompt, which is the method's own rule
-    (`docs/findings/anatomy-of-an-expensive-turn.md` §2) and is what makes the turns
-    sum to the session with nothing between them dropped. The gap between the two is `idle`.
-
-    A turn with no calls and no finished spans keeps `active_ended` at zero, which reads
-    as "no idle known" rather than as an idle turn — there is nothing to measure from,
-    and zero would be a claim rather than a gap.
-    """
+    """Give every turn its two ends: when it stopped working, and when it stopped (docs/findings/anatomy-of-an-expensive-turn.md)"""
     for index, turn in enumerate(turns):
         seen = [call.ts for call in turn.calls]
         seen += [span.ended for span in turn.spans if span.finished]
         if seen:
             turn.active_ended = max(turn.started, max(seen))
         following = turns[index + 1] if index + 1 < len(turns) else None
-        # The LAST turn has no successor to run on to, so it ends where it stopped
-        # working — and that is exactly where the twelve-day transcript above lives.
+        # The LAST turn has no successor to run on to, so it ends where it stopped working
         turn.ended = following.started if following else (turn.active_ended
                                                           or turn.ended)
 
 
 def _turn_at(ordered: Sequence[Turn], ts: float) -> Turn | None:
-    """Which turn was running when something landed, or None if nothing had started.
-
-    The same last-turn-started-by-then rule the bill uses (`bill._turn_locator`), so the
-    two accountings cut the session at identical points and a reader can lay one beside
-    the other. ONE locator for the calls and the boundaries: two spellings of "which turn
-    was this in" is how two numbers on one payload come to disagree.
-
-    `ordered` must be sorted by `started` — the loop stops at the first turn that had not.
-    """
+    """Which turn was running when something landed, or None if nothing had started"""
     home: Turn | None = None
     for turn in ordered:
         if turn.started <= ts:
@@ -1559,7 +1016,7 @@ def _turn_at(ordered: Sequence[Turn], ts: float) -> Turn | None:
 
 
 def _attach_calls(turns: Sequence[Turn], calls: Iterable[usage_mod.Call]) -> None:
-    """Put each API call in the turn that was running when it landed."""
+    """Put each API call in the turn that was running when it landed"""
     ordered = sorted(turns, key=lambda t: t.started)
     for call in calls:
         home = _turn_at(ordered, call.ts)
@@ -1569,7 +1026,7 @@ def _attach_calls(turns: Sequence[Turn], calls: Iterable[usage_mod.Call]) -> Non
 
 def _attach_boundaries(turns: Sequence[Turn],
                        boundaries: Iterable[usage_mod.Boundary]) -> None:
-    """Put each classified boundary in the turn that was running when it was paid for."""
+    """Put each classified boundary in the turn that was running when it was paid for"""
     ordered = sorted(turns, key=lambda t: t.started)
     for boundary in boundaries:
         home = _turn_at(ordered, boundary.ts)
@@ -1580,13 +1037,7 @@ def _attach_boundaries(turns: Sequence[Turn],
 def _read_subagent(path: Path, cfg: InspectConfig,
                    labels: dict[str, str],
                    cold_prefix_floor: int | None = None) -> SubagentAnatomy:
-    """One subagent transcript, taken apart the way `read_session` takes the parent apart.
-
-    The task id is the stem minus its `agent-` prefix — the same join `_subagent_labels`
-    uses, and the only thing tying "what the lead waited on" to "what that thing was".
-    An unlabelled subagent keeps an empty label: no meta file was written, and there is
-    nothing else in the record to name it.
-    """
+    """One subagent transcript, taken apart the way `read_session` takes the parent apart"""
     stem = path.stem
     task_id = stem[len("agent-"):] if stem.startswith("agent-") else stem
     turns, _ = read_transcript(path, cfg)
@@ -1598,35 +1049,19 @@ def _read_subagent(path: Path, cfg: InspectConfig,
         task_id=task_id, label=labels.get(task_id, ""), turns=turns,
         writes=classify_writes(calls, cfg.report_write_floor, compactions),
         deeper=len(_subagent_transcripts(path)),
-        # THRESHOLD-FREE, from the calls already in hand (spec 2026-10-02 §1.2). THE ONE
-        # PLACE a subagent transcript is opened, so the one place these are filled.
+        # THRESHOLD-FREE, from the calls already in hand (spec 2026-10-02 §1.2)
         total_written=sum(c.cache_write for c in calls),
         max_write=max((c.cache_write for c in calls), default=0),
         write_floor=cfg.report_write_floor,
         api_call_count=len(calls),
-        # REUSED, never a second classifier: the OS has one judgement about a cache read
-        # that went backwards, and `cold_prefix_floor=None` leaves the split UNDECIDED
-        # rather than reporting 0 prefix misses.
+        # REUSED, never a second classifier: the OS has one judgement about a cache read that went backwards
         boundaries=usage_mod.classify_boundaries(
             calls, compactions=compactions, cold_prefix_floor=cold_prefix_floor))
 
 
 def hung_subagent_call(subs: Sequence[SubagentAnatomy], now: float, older_than: float,
                        *, since: float = 0.0) -> tuple[SubagentAnatomy, ToolSpan] | None:
-    """The first (subagent, span) whose LAST span is an unfinished tool call older than
-    `older_than` seconds. `None` when every subagent is working normally.
-
-    THIS NAMES THE SUBAGENT IT FOUND AND CLAIMS NO PARENTAGE. It scans the session's
-    anatomies and does not assert that the one it returns is the child of any particular
-    delegation span — an `Agent` span carries a `description` and no task id, so the
-    record does not say. `since` keeps a previous turn's leftovers out by requiring the
-    hung span to have started at or after that moment; it is a time WINDOW and not an
-    attribution, which is why `_attach_subagents` still refuses a timestamp fallback
-    (the issue-227 rule: a REPORT names a parent only where the record does — spec §2b).
-
-    "Last span" is the thing the subagent is doing right now. An unfinished span EARLIER
-    in its transcript is a killed call it already moved past, not a hang.
-    """
+    """The first (subagent, span) whose LAST span is an unfinished tool call older than `older_than`..."""
     for sub in subs:
         span = next((t.spans[-1] for t in reversed(sub.turns) if t.spans), None)
         if span is None or span.finished or span.started < since:
@@ -1637,28 +1072,14 @@ def hung_subagent_call(subs: Sequence[SubagentAnatomy], now: float, older_than: 
 
 
 def _names(span: ToolSpan, task_id: str) -> bool:
-    """Whether this span names that subagent — `detail` or any reported parameter.
-
-    Substring, not equality, and that is what `_name_joins` needs: it rewrites a join's
-    `detail` from the bare id to "label (id)", so equality would hold before it ran and
-    not after. The params are read too, because the `TaskOutput` span is the join in
-    practice — an `Agent` span's parameters are a `description` and carry no task id at
-    all (tests/data/transcripts/-wo-5a6b2d6d), so `task_id` on `TaskOutput` is the only
-    place the id appears as a parameter.
-    """
+    """Whether this span names that subagent — `detail` or any reported parameter"""
     return span.name in SPAWN_TOOLS and (
         task_id in span.detail or any(task_id in v for v in span.params.values()))
 
 
 def _attach_subagents(turns: Sequence[Turn],
                       subs: Sequence[SubagentAnatomy]) -> list[SubagentAnatomy]:
-    """Hang each subagent off the turn whose span NAMES it; return the rest.
-
-    No timestamp fallback, decided on this work order (q687, option 1): containment
-    would invent a parent the record does not name, which is issue 227's mistake. A
-    subagent nothing names is returned to `Anatomy.unattached_subagents` and reported as
-    unattached.
-    """
+    """Hang each subagent off the turn whose span NAMES it; return the rest"""
     unattached: list[SubagentAnatomy] = []
     for sub in subs:
         home = next((t for t in turns
@@ -1671,67 +1092,38 @@ def _attach_subagents(turns: Sequence[Turn],
 
 
 def _name_joins(turns: Sequence[Turn], labels: dict[str, str]) -> None:
-    """Replace a join's raw task id with what was actually being waited on."""
+    """Replace a join's raw task id with what was actually being waited on"""
     for turn in turns:
         for span in turn.spans:
             if span.is_join and span.detail in labels:
                 span.detail = f"{labels[span.detail]} ({span.detail})"
 
 
-# -- the live half: raising it while it is still burning -------------------------------
+# -- the live half: raising it while it is still burning
 
 
 TURN_ALARM, JOIN_ALARM, WRITE_ALARM = "long-turn", "long-join", "big-rewrite"
-#: The one alarm here whose finding is that NOTHING was spent — see `ALARM_KINDS`.
-#: NEVER RAISED LIVE since spec §2: its evidence was the absence of a transcript row, and
-#: the absence is what that spec proves unreliable. Kept so historical rows still render.
+#: The one alarm here whose finding is that NOTHING was spent — see `ALARM_KINDS`
 STALL_ALARM = "stalled-turn"
 
-#: A request in flight past `alarm_awaiting_minutes` with no completed content block.
+#: A request in flight past `alarm_awaiting_minutes` with no completed content block
 SLOW_RESPONSE_ALARM = "slow-model-response"
 
-#: Kinds that are a NOTE, not an interruption: recorded, rendered, never escalated.
+#: Kinds that are a NOTE, not an interruption: recorded, rendered, never escalated
 INFORMATIONAL_KINDS = frozenset({SLOW_RESPONSE_ALARM})
 
-#: THE AGGREGATE PAIR, and the only kinds in this module that are not about one turn:
-#: `alarms()` never raises them and cannot. They are a PROJECT's re-write tax over a
-#: cohort window of settled orders, computed by `bill.rewrite_tax` and raised by
-#: `Daemon.check_rewrite_tax` — the standing condition `WRITE_ALARM` cannot report,
-#: because that one judges a single call while the turn that made it is still running.
-#:
-#: They are declared HERE, beside the live four, because `ALARM_KINDS` is the one place a
-#: surface looks up what an alarm kind MEANS (`ui.app` passes it to /alarms) and a kind
-#: missing from it renders as a bare id. The raising lives where the arithmetic is.
-#:
-#: TWO KINDS RATHER THAN ONE WITH THE CAUSE IN ITS PROSE: the prefix moving is bought
-#: back by keeping the prefix still and the entry expiring by a longer TTL, so they are
-#: opposite cures (kn-1449447a), and one kind would make "which cure" a detail of a
-#: sentence instead of the identity a dedupe, a filter and a learning can key on.
+#: THE AGGREGATE PAIR, and the only kinds in this module that are not about one turn: `alarms()` never...
 REWRITE_PREFIX_ALARM = "rewrite-tax-prefix"
 REWRITE_TTL_ALARM = "rewrite-tax-ttl"
 
-#: THE OTHER AGGREGATE PAIR, and the only alarms in the OS about spend it did not make.
-#: A one-hour cache write costs 2.0x base input where a five-minute one costs 1.25x, and
-#: `claude_cli.cache_env` forces the cheap one on every process Jarvis starts — so a 1h
-#: write left in the fleet is one of two unrelated faults. `Daemon.check_cache_ttl` raises
-#: them off `one_hour_writes`; issue 164 item 3.
-#:
-#: TWO KINDS AND NEVER ONE, for the reason the pair above is two: `…-dispatched` is a
-#: BREACH of this OS's own transport guarantee and a defect to fix in this repository,
-#: while `…-foreign` is a person's own `claude` and can only be REPORTED — the setting is
-#: their personal config and Jarvis must not write it. Merging them would blame the OS for
-#: a human sitting next to it, which is the misreading finding 3 was written to prevent.
+#: THE OTHER AGGREGATE PAIR, and the only alarms in the OS about spend it did not make
 CACHE_1H_DISPATCHED_ALARM = "cache-1h-dispatched"
 CACHE_1H_FOREIGN_ALARM = "cache-1h-foreign"
 
-#: What each kind IS, for a surface listing alarms rather than raising one. An `Alarm`'s
-#: own `reason` is about one turn and carries its numbers; this is the standing meaning,
-#: and it lives beside the constants so a dashboard and the CLI cannot drift on it.
+#: What each kind IS, for a surface listing alarms rather than raising one
 ALARM_KINDS = {
     TURN_ALARM: "a turn still running, still being billed",
-    # THE ODD ONE OUT, deliberately: the other three say money is going out and this one
-    # says none is. It is the opposite finding to the `going-in-circles` health probe,
-    # which says effort is being RE-spent — here the work never started (issue 227).
+    # THE ODD ONE OUT, deliberately: the other three say money is going out and this one says none is
     STALL_ALARM: "a turn that was open with no API call ever made — nothing was being "
                  "billed (historical: nothing raises this now, spec of 2026-09-27)",
     SLOW_RESPONSE_ALARM: "a request has been in flight this long with no completed "
@@ -1739,29 +1131,27 @@ ALARM_KINDS = {
     JOIN_ALARM: "a wait that is costing more than it buys — a `TaskOutput` open past "
                 "the cache TTL, or a delegation whose subagent has a tool call hung",
     WRITE_ALARM: "the conversation sent again, at the cache-write rate",
-    # The two aggregate kinds. Worded as a share of a PROJECT rather than of a turn, so a
-    # reader of the legend cannot take them for another reading of `big-rewrite`.
+    # The two aggregate kinds
     REWRITE_PREFIX_ALARM: "a project's conversations re-sent because the prompt PREFIX "
                           "moved — the half no cache TTL can buy back",
     REWRITE_TTL_ALARM: "a project's conversations re-sent because the cache entry "
                        "EXPIRED — the half a longer TTL could buy back",
-    # The 1h pair. Worded as WHO BOUGHT IT rather than what it cost, because that is the
-    # whole distinction and the legend is where a reader meets these kinds first.
+    # The 1h pair
     CACHE_1H_DISPATCHED_ALARM: "Jarvis's own turns bought the one-hour cache write — a "
                                "breach of the transport's 5-minute guarantee",
     CACHE_1H_FOREIGN_ALARM: "sessions Jarvis never dispatched bought the one-hour cache "
                             "write — reportable, not fixable from inside the OS",
+    # The compaction post-conditions, raised by `invariants.check_compactions_hold`
+    "compaction-chained": "a compaction run on a conversation the previous turn had "
+                          "already compacted — it summarised the summary",
+    "compaction-unproven": "a compaction recorded as done with no boundary and no "
+                           "achieved size — nothing shows it shrank the conversation",
 }
 
 
 @dataclass
 class Alarm:
-    """A turn that is costing money NOW, in a sentence the attention list can carry.
-
-    `kind` is what tripped and `reason` is what the user reads. Both, because the reason
-    is prose that will be reworded and the kind is what a test and a timeline event
-    match on.
-    """
+    """A turn that is costing money NOW, in a sentence the attention list can carry"""
 
     kind: str
     reason: str
@@ -1771,23 +1161,7 @@ class Alarm:
 
 
 def _spend_so_far(turn: Turn, now: float | None) -> str:
-    """What the turn has actually bought, so "still being billed" can be checked.
-
-    THE COST IS READ, NEVER INFERRED FROM THE CLOCK (issue 227, and the standing rule
-    recorded against al-abf99387). `turn.usage` is the same per-turn accounting `jarvis
-    cost` prints, so an alarm that says a turn is expensive is quoting the record rather
-    than the duration — and a turn wedged on a permission prompt, which makes no API call
-    while its wall clock runs, cannot look like one that is generating.
-
-    Called only for a turn that HAS calls: the caller branches on `Turn.observed` first,
-    because a turn with none gets `STALL_ALARM` and no claim about money at all. THE
-    GUARD BELOW IS THAT PRECONDITION IN CODE, and it returns rather than raising: this
-    runs inside `Daemon.check_burning_turns`, where a `ValueError` out of `max()` would
-    take a whole project's reconcile tick with it. It is worded so that a caller which
-    lost the branch produces a sentence that is visibly self-contradicting — "still
-    being billed (NO API CALL …)" — rather than a plausible one, which is the whole
-    failure mode of issue 227.
-    """
+    """What the turn has actually bought, so "still being billed" can be checked"""
     if not turn.calls:
         return "NO API CALL — nothing has been billed"
     made = f"{len(turn.calls)} API call" + ("s" if len(turn.calls) > 1 else "")
@@ -1799,24 +1173,13 @@ def _spend_so_far(turn: Turn, now: float | None) -> str:
 
 
 def awaiting_note(turn: Turn) -> str:
-    """"awaiting the model since 21:32 (request in flight, no block completed)".
-
-    ONE FORMATTER FOR EVERY SURFACE — spec §1. Five layers each invented their own
-    sentence for the absence of an assistant row and all five said it meant a stall.
-    """
+    """"awaiting the model since 21:32 (request in flight, no block completed)\""""
     since = datetime.fromtimestamp(turn.awaiting_since).strftime("%H:%M")
     return f"awaiting the model since {since} (request in flight, no block completed)"
 
 
 def held_note(wall: float, holding: dict[str, float]) -> str:
-    """" (6.8h on the wall clock, 4.0h of it held by a fleet usage limit)", or "".
-
-    THE ONE PLACE THE DIFFERENCE BETWEEN THE TWO CLOCKS IS PUT INTO WORDS, shared by the
-    live alarm and the report so a user who meets it in an attention line and then runs
-    `jarvis inspect` reads the same sentence twice rather than two accounts of one fact.
-    Empty when nothing held the turn, which is most turns — the wall clock is then the
-    active one and a reader is owed no explanation of a difference that does not exist.
-    """
+    """" (6.8h on the wall clock, 4.0h of it held by a fleet usage limit)", or "\""""
     if not holding:
         return ""
     named = ", ".join(f"{_hours(seconds)} of it held by {HOLD_CAUSES.get(cause, cause)}"
@@ -1825,51 +1188,20 @@ def held_note(wall: float, holding: dict[str, float]) -> str:
 
 
 def _hours(seconds: float) -> str:
-    """Durations as a reader thinks of them — `cli._mins` for a sentence rather than a
-    column, so an alarm about four hours does not say `239.4m`."""
+    """Durations as a reader thinks of them"""
     return f"{seconds / 3600:.1f}h" if seconds >= 3600 else f"{int(seconds // 60)}m"
 
 
 def alarms(anatomy: Anatomy, cfg: InspectConfig, wo_id: str = "",
            now: float | None = None, *, dispatched: float) -> list[Alarm]:
-    """What is wrong with the turn that is running, most actionable first.
-
-    Judges THE LAST TURN ONLY. Everything before it is already paid for and belongs on
-    `jarvis inspect`, not in front of the user: an alarm the user can do nothing about
-    is the noise that gets a cost alarm ignored, and then it is worse than nothing.
-
-    `now` is what makes this a LIVE reading rather than a historical one. A turn that is
-    generating has written no row for minutes, so its clock has to be measured against
-    the wall and not against its own last line — measuring it against the transcript
-    would report an hour-long turn as however long ago it last spoke.
-
-    `dispatched` is the EVIDENCE that the last transcript turn is the one the caller
-    means, and it has no default because there is no honest fallback: measuring `now -
-    turn.started` against a turn the transcript has moved past charges the whole
-    inter-turn gap to a turn that has not started. Every `long-turn` alarm the fleet
-    raised before this was that race — three of them the 197 minutes from a session
-    limit to its reset, one the 16 hours a work order sat parked overnight. Pass the
-    turn RECORD's dispatch time; a transcript turn older than it is the previous turn,
-    and nothing is known about the new one yet.
-
-    THE TWO DURATION ALARMS ARE JUDGED ON ACTIVE TIME, NOT WALL CLOCK (the user's ruling
-    of 2026-09-18). Both say something about the WORK — that it has been running an hour,
-    that it has started and made no call — and neither claim is true of an order the OS
-    is holding: a turn that spans a spent usage window is not slow, it is obeying. The
-    `dispatched` guard above already kept the commonest shape of that out, but it is a
-    proxy for the right question and this is the right question. `long-join` deliberately
-    stays on the WALL clock: what it reports is a prompt cache going cold, and the cache
-    expires in real seconds whether or not anyone was allowed to work.
-    """
+    """What is wrong with the turn that is running, most actionable first"""
     if not anatomy.found or not anatomy.turns or not cfg.enabled:
         return []
     turn = anatomy.turns[-1]
     if turn.started < dispatched:
         return []
     wall = max(turn.wall, (now - turn.started) if now else 0.0)
-    # `anatomy.holds` and NOT `turn.holds`: the per-turn slices were attached against a
-    # turn that ends where the transcript stopped, and the hold this function exists to
-    # respect is the one still running past that — the live case is the only case here.
+    # `anatomy.holds` and NOT `turn.holds`: the per-turn slices were attached against a turn that ends...
     window = (turn.started, turn.started + wall)
     held = min(wall, sum(h.overlap(*window, now) for h in anatomy.holds))
     active = max(0.0, wall - held)
@@ -1877,20 +1209,13 @@ def alarms(anatomy: Anatomy, cfg: InspectConfig, wo_id: str = "",
     raised: list[Alarm] = []
     hint = f" — `jarvis inspect {wo_id}`" if wo_id else ""
 
-    # `stalled-turn` IS NEVER RAISED LIVE (spec §2 branch 2): its evidence was the
-    # absence of an assistant row, and that absence is what the spec proves unreliable —
-    # Claude Code appends one only when a content block COMPLETES. A genuinely hung turn
-    # is still caught by `worker_session.TURN_STALL_SECONDS`, which judges the PROCESS.
+    # `stalled-turn` IS NEVER RAISED LIVE (spec §2 branch 2): its evidence was the absence of an...
     if turn.observed and active >= cfg.alarm_turn_minutes * 60:
         raised.append(Alarm(TURN_ALARM, (
             f"this turn has been running {int(active // 60)} minutes"
             f"{held_note(wall, holding)} and is still being billed "
             f"({_spend_so_far(turn, now)}){hint}")))
-    # INDEPENDENT OF THE ONE ABOVE, not exclusive with it: `awaiting_since` is set on
-    # every `tool_result` row, so a healthy billed turn 27 calls deep is awaiting at the
-    # sampling moment and an `elif` here would make `long-turn` unraisable. The old
-    # exclusivity was between `stalled-turn` and `long-turn` — two claims about MONEY,
-    # only one of which can be true. This is a claim about a WAIT, and orthogonal.
+    # INDEPENDENT OF THE ONE ABOVE, not exclusive with it: `awaiting_since` is set on every `tool_result`...
     if turn.awaiting:
         wait = (now - turn.awaiting_since) if now else 0.0
         awaited = max(0.0, wait - min(wait, sum(
@@ -1904,10 +1229,7 @@ def alarms(anatomy: Anatomy, cfg: InspectConfig, wo_id: str = "",
     for span in turn.spans:
         if not span.is_join or span.finished or not now:
             continue
-        # A DELEGATION is judged on HANG EVIDENCE and never on elapsed wait (spec §2b):
-        # at `alarm_join_seconds` the literal reading fires on 43 of the fleet's 272
-        # foreground delegations, nearly all of them real subagent work, and an alarm
-        # that fires on normal work is trained away — the standing argument above.
+        # A DELEGATION is judged on HANG EVIDENCE and never on elapsed wait (spec §2b): at...
         if span.name in DELEGATION_TOOLS:
             found = hung_subagent_call(
                 [*turn.subagents, *anatomy.unattached_subagents], now,
@@ -1929,9 +1251,7 @@ def alarms(anatomy: Anatomy, cfg: InspectConfig, wo_id: str = "",
                 f"wait will be paid for twice{hint}")))
             break
     for write in anatomy.writes:
-        # A compaction is exempt for `COLD_START`'s reason and one more: the alarm's
-        # advice is "the conversation is being paid for again", and here it is being
-        # paid for ONCE, on purpose, instead of in full.
+        # A compaction is exempt for `COLD_START`'s reason and one more: the alarm's advice is "the...
         if write.ts >= turn.started and write.written >= cfg.alarm_write_tokens \
                 and write.cause not in (COLD_START, COMPACTION):
             raised.append(Alarm(WRITE_ALARM, (
@@ -1947,78 +1267,48 @@ def live_alarms(session_id: str, cfg: InspectConfig, *, wo_id: str = "",
                 index: dict[str, list[Path]] | None = None,
                 spans: Sequence[Hold] = (),
                 turn_starts: Sequence[tuple[int, float]] = ()) -> list[Alarm]:
-    """`alarms` for a session id — one transcript read, no paid call, nothing written.
-
-    The session is read at the ALARM's write threshold rather than the report's: the only
-    writes this needs to see are the ones big enough to raise one, and classifying the
-    small ones would be work whose answer is thrown away.
-
-    `spans` is the caller's `holds.held` for this work order. Passing none is the pre-hold
-    behaviour and alarms on the wall clock, which is why `Daemon.check_burning_turns`
-    always passes them: the default is what a caller without a store gets, not a policy.
-    `turn_starts` rides along the same way so an alarm names the OS's own turn number
-    (spec 2026-09-27 §3).
-    """
+    """`alarms` for a session id — one transcript read, no paid call, nothing written"""
     reading = replace(cfg, report_write_floor=cfg.alarm_write_tokens)
     anatomy = read_session(session_id, reading, root=root, index=index, spans=spans,
                            turn_starts=turn_starts)
     return alarms(anatomy, cfg, wo_id=wo_id, now=now, dispatched=dispatched)
 
 
-# -- the fleet's cache-TTL hygiene: who is still buying the one-hour write --------------
-#
-# Finding 3 of docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md. A 1h
-# cache write costs 2.0x base input where a 5m write costs 1.25x, and `claude_cli.
-# cache_env` forces the cheap one on every process Jarvis starts — so any 1h write left
-# in the fleet is either a BREACH of that guarantee or a `claude` a person typed, and
-# those are unrelated faults with unrelated fixes.
-#
-# THIS IS THE ONE COST READING THAT CANNOT COME OFF A BILL. `bill.rewrite_tax` reads
-# sealed bills precisely to avoid a transcript walk; the sessions this exists to find
-# were never dispatched, so they have no work order, no bill and no row anywhere in the
-# OS. The transcript is the only place they exist.
+# -- the fleet's cache-TTL hygiene: who is still buying the one-hour write
 
-#: The `cache_creation` key that says a write bought the hour. Also this module's cheap
-#: pre-filter: a file that never mentions it has nothing to say here, which is 98% of
-#: them, and skipping those is what makes the walk affordable at all.
+#: The `cache_creation` key that says a write bought the hour
 ONE_HOUR_KEY = '"ephemeral_1h_input_tokens"'
 
 
 @dataclass
 class HourWrites:
-    """One session's ONE-HOUR cache writes, split by who sent the prompt.
-
-    NEVER ADDED UP, and that is the whole design. `dispatched` means Jarvis's own
-    transport bought the expensive write, which is a defect in this OS; `foreign` means a
-    person's own session did, which the OS can only report. Finding 3 established that
-    an alarm merging the two blames the OS for a human sitting next to it.
-    """
+    """One session's ONE-HOUR cache writes, split by who sent the prompt"""
 
     session_id: str
-    #: The transcript directory: the slugified cwd the session was created in. Kept as
-    #: the raw slug rather than a path, because reconstructing one guesses at every `-`
-    #: that was once a `/` — it is an identifier here, not a location.
+    #: The transcript directory: the slugified cwd the session was created in
     directory: str = ""
     dispatched: int = 0
     foreign: int = 0
-    #: First and last 1h WRITE, not the session's lifetime. A session mostly paying the
-    #: correct rate must not report its whole span as the leak.
+    #: Jarvis's own transport buying the hour ON PURPOSE: a turn stamped with the `1h` or `cli` arm... (docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md)
+    deliberate: int = 0
+    #: First and last 1h WRITE, not the session's lifetime
     first_ts: float = 0.0
     last_ts: float = 0.0
 
     @property
     def total(self) -> int:
-        return self.dispatched + self.foreign
+        return self.dispatched + self.foreign + self.deliberate
 
     def as_dict(self) -> dict[str, Any]:
         return {"session_id": self.session_id, "directory": self.directory,
                 "dispatched": self.dispatched, "foreign": self.foreign,
+                "deliberate": self.deliberate,
                 "total": self.total, "first_ts": self.first_ts,
                 "last_ts": self.last_ts}
 
 
 def _mentions(path: Path, needle: str) -> bool:
-    """Whether a file contains `needle` at all, without parsing a line of it."""
+    """Whether a file contains `needle` at all, without parsing a line of it"""
     try:
         with path.open(errors="replace") as handle:
             return any(needle in line for line in handle)
@@ -2027,44 +1317,29 @@ def _mentions(path: Path, needle: str) -> bool:
 
 
 def _subagent_transcripts(path: Path) -> list[Path]:
-    """The subagent transcripts written beside one session file — `read_session`'s rule.
-
-    Their spend is charged to the session that SPAWNED them, here as there: a subagent
-    has no id anyone can resume, so it is not an answer to "which session do I go and
-    look at".
-    """
+    """The subagent transcripts written beside one session file — `read_session`'s rule"""
     directory = path.with_suffix("") / "subagents"
     return sorted(directory.glob("*.jsonl")) if directory.is_dir() else []
 
 
+#: The arms that BOUGHT the hour on purpose — `catalog.VALID_WORKER_CACHE_TTL` minus the control
+DELIBERATE_ARMS = ("1h", "cli")
+
+
+def _arm_of(arms: Mapping[str, Sequence[tuple[float, float, str]]] | None,
+            session_id: str, ts: float) -> str:
+    """Which cache-TTL arm was running in `session_id` at `ts`, or "" — spec §5"""
+    for started_at, ended_at, arm in (arms or {}).get(session_id, ()):
+        if started_at <= ts <= ended_at:
+            return arm
+    return ""
+
+
 def one_hour_writes(since: float, *, root: Path | None = None,
-                    cfg: InspectConfig | None = None) -> list[HourWrites]:
-    """Every session that bought the one-hour cache write since `since`, biggest first.
-
-    ATTRIBUTION IS `_prompt_of`'s, NOT A SECOND POLICY. A turn is Jarvis's when the
-    prompt that started it carries `promptSource: "sdk"` — the same discriminator
-    `Prompt.source` has always used and the one finding 3 established by hand. Keying on
-    `work_orders.session_id` instead gets it WRONG on the largest offender the fleet has:
-    wo-2df8828c's transcript is ONE file holding both a dispatched turn and the same
-    worktree reopened by hand afterwards, and all 2,512,088 of its 1h tokens are the
-    hand-opened half's.
-
-    A TURN IS JARVIS'S ONLY IF EVERY TRIGGER IS. `Daemon.deliver_messages` coalesces
-    what it queues, so a turn has several, and one prompt a person typed among them means
-    a person was at the keyboard — the claim `dispatched` makes is about the process, and
-    a wrong one there accuses the OS of a defect it does not have.
-
-    SUBAGENTS INHERIT THEIR PARENT'S CLASSIFICATION, because their transcripts carry no
-    `promptSource` at all (measured: 1,002 user rows, none with the field). Classified on
-    their own evidence every one of them would read as a person's, which would hide
-    exactly the breach this exists to catch. `_attach_calls` does the inheriting — their
-    calls land in the parent turn that was running, by the rule the bill already uses.
-
-    AN UNKNOWN TTL IS NOT A 1h TTL. Only `ephemeral_1h_input_tokens` itself counts, so a
-    row written before Claude Code reported the split contributes nothing — the floor
-    `usage`'s module note sets out. An alarm that read absence as the expensive write
-    would fire on every old transcript in the fleet.
-    """
+                    cfg: InspectConfig | None = None,
+                    arms: Mapping[str, Sequence[tuple[float, float, str]]] | None = None,
+                    ) -> list[HourWrites]:
+    """Every session that bought the one-hour cache write since `since`, biggest first (docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md)"""
     root = root or usage_mod.transcript_root()
     if not root.is_dir():
         return []
@@ -2090,50 +1365,39 @@ def one_hour_writes(since: float, *, root: Path | None = None,
                 if entry is None:
                     entry = found[path.stem] = HourWrites(session_id=path.stem,
                                                           directory=path.parent.name)
-                if dispatched:
-                    entry.dispatched += call.cache_1h
-                else:
+                if not dispatched:
                     entry.foreign += call.cache_1h
+                elif _arm_of(arms, path.stem, call.ts) in DELIBERATE_ARMS:
+                    entry.deliberate += call.cache_1h
+                else:
+                    entry.dispatched += call.cache_1h
                 entry.first_ts = min(entry.first_ts, call.ts) or call.ts
                 entry.last_ts = max(entry.last_ts, call.ts)
     return sorted(found.values(), key=lambda e: (-e.total, e.session_id))
 
 
-#: The one line that fixes the foreign half, quoted verbatim because the alarm's whole
-#: job is to make the work order behind it writable without a second investigation.
-#: `claude_cli.PROMPT_CACHE_5M_ENV` is the same flag, applied where Jarvis CAN apply it.
+#: The one line that fixes the foreign half
 REMEDY_LINE = '"env": {"FORCE_PROMPT_CACHING_5M": "1"}  in ~/.claude/settings.json'
 
-#: Said on the foreign alarm and on nothing else. THE HONEST CON, recorded in finding 3
-#: and not to be papered over: this reports a condition Jarvis cannot itself fix, because
-#: the file is the user's personal config. Naming the limit is what stops a supervisor
-#: proposing a remedy that would have Jarvis write there.
+#: Said on the foreign alarm and on nothing else
 NOT_OURS_TO_FIX = (
     "JARVIS CANNOT FIX THIS AND MUST NOT TRY: the file is the user's own Claude "
     "configuration, outside every project the OS manages. The deliverable is a work "
     "order that tells a PERSON to add the line above, and a check that it took."
 )
 
-#: How many offending sessions the reason names before it stops. Enough that a work order
-#: can be written off the alarm alone; bounded because the reason is read in an inbox row
-#: and a Telegram push, and the tail of a long list is tokens nobody acts on.
+#: How many offending sessions the reason names before it stops
 NAMED_SESSIONS = 3
 
 
 def _hour_premium_usd(tokens: int) -> float:
-    """What buying the hour COST above the five-minute write, at Opus list prices.
-
-    The premium and not the price: these tokens would have been written either way, so the
-    avoidable money is the rate difference alone (kn-f94abf34 (0)). Opus because
-    `HourWrites` counts tokens and not models — the alarm says "at Opus list" in as many
-    words rather than implying a precision it does not have.
-    """
+    """What buying the hour COST above the five-minute write, at Opus list prices"""
     premium = usage_mod.CACHE_WRITE_1H_RATE - usage_mod.CACHE_WRITE_RATE
     return premium * tokens * usage_mod.DEFAULT_PRICE[0] / 1e6
 
 
 def _name_sessions(found: Sequence[HourWrites], attr: str) -> str:
-    """The biggest offenders, named. WHICH SESSION is the fact finding 3 turns on."""
+    """The biggest offenders, named"""
     named = [e for e in found if getattr(e, attr)][:NAMED_SESSIONS]
     return "; ".join(
         f"{e.session_id} in {e.directory} ({getattr(e, attr):,} tokens, last written "
@@ -2143,27 +1407,25 @@ def _name_sessions(found: Sequence[HourWrites], attr: str) -> str:
 
 def hour_alarms(found: Sequence[HourWrites], cfg: InspectConfig, *,
                 days: int) -> list[Alarm]:
-    """What is standing-wrong with the fleet's cache TTL, one alarm per CAUSE.
-
-    The dispatched one first, because it is the more serious finding by far and `alarms`'
-    ordering contract is most-actionable-first: one is a defect in this repository and the
-    other is a note to a person about their own machine.
-    """
+    """What is standing-wrong with the fleet's cache TTL, one alarm per CAUSE"""
     dispatched = sum(e.dispatched for e in found)
     foreign = sum(e.foreign for e in found)
+    deliberate = sum(e.deliberate for e in found)
     window = f"in the last {days} days"
     raised: list[Alarm] = []
     if dispatched >= cfg.alarm_cache_1h_dispatched_tokens:
+        # Scoped to the 5m arm, and the deliberate total named beside it: an arm that bought the hour on...
         raised.append(Alarm(CACHE_1H_DISPATCHED_ALARM, (
             f"{dispatched:,} tokens were written at the ONE-HOUR cache TTL {window} by "
-            f"turns JARVIS ITSELF dispatched — about "
-            f"${_hour_premium_usd(dispatched):,.2f} at Opus list above what the "
-            f"five-minute write would have cost. `claude_cli.cache_env` forces "
-            f"FORCE_PROMPT_CACHING_5M on every process this OS starts, so this is a "
-            f"BREACH of that guarantee and a defect in the OS — not in anyone's personal "
-            f"configuration. Start at `claude_cli._run` and `spawn_turn`, the only two "
-            f"functions here that start a process, and at "
-            f"`dispatch._write_worker_settings`. Sessions: "
+            f"turns JARVIS ITSELF dispatched whose `wo_turns.cache_ttl` arm was 5m — "
+            f"about ${_hour_premium_usd(dispatched):,.2f} at Opus list above what the "
+            f"five-minute write would have cost. Those turns were launched to buy the "
+            f"FIVE-MINUTE write, so this is a BREACH of what they asked for and a defect "
+            f"in the OS — not in anyone's personal configuration. Start at "
+            f"`claude_cli.spawn_turn`'s `cache` argument, `dispatch.cache_ttl_env` and "
+            f"`dispatch._write_worker_settings`. A further {deliberate:,} tokens bought "
+            f"the hour ON PURPOSE on a 1h or cli arm {window}, which is not part of this "
+            f"figure and is not a fault. Sessions: "
             f"{_name_sessions(found, 'dispatched')}.")))
     if foreign >= cfg.alarm_cache_1h_tokens:
         raised.append(Alarm(CACHE_1H_FOREIGN_ALARM, (

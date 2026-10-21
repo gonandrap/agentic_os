@@ -1,15 +1,4 @@
-"""A heredoc that writes a file is a file edit, and belongs in `Edit`/`Write`.
-
-Fix 1 of docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md. The
-incident: a subagent appended tests to a file with `python3 - <<'PYEOF'`, the test TEXT
-contained `gh pr merge`, and the command classifier — which is right about what a
-heredoc handed to an interpreter is — filed a gate request nobody ever argued.
-
-Both directions are pinned here, and the negatives are the point: this rule denies ONLY
-on positive evidence of a file write inside the worker's own worktree. A heredoc that
-computes and prints, `git commit -F - <<EOF`, and a write outside the worktree are all
-somebody else's business.
-"""
+"""A heredoc that writes a file is a file edit, and belongs in `Edit`/`Write` (docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md)"""
 
 from __future__ import annotations
 
@@ -36,7 +25,7 @@ def _reason(result):
 
 @pytest.fixture()
 def worker(jarvis_home, project):
-    """A running work order whose worktree is `project`, with every gate live."""
+    """A running work order whose worktree is `project`, with every gate live"""
     store = ProjectStore(project)
     wo = store.create_work_order("write some tests", description="append to a test file")
     store.set_status(wo["id"], "running")
@@ -63,12 +52,11 @@ def worker(jarvis_home, project):
     store.close()
 
 
-# -- the deny -------------------------------------------------------------------------
+# -- the deny
 
 
 def test_a_heredoc_that_writes_a_worktree_file_is_denied_before_a_gate_is_filed(worker):
-    """The incident, in one call: a file edit routed through an interpreter, whose
-    CONTENT happens to name a privileged action. No approval row may exist."""
+    """The incident, in one call: a file edit routed through an interpreter"""
     target = worker.project / "tests" / "test_automerge.py"
     command = (
         f"python3 - <<'PYEOF'\n"
@@ -81,7 +69,7 @@ def test_a_heredoc_that_writes_a_worktree_file_is_denied_before_a_gate_is_filed(
 
     assert _decision(result) == "deny"
     assert "Edit" in _reason(result) and "Write" in _reason(result)
-    # The whole point of running before `gate_decision`: nothing is FILED for this class.
+    # The whole point of running before `gate_decision`: nothing is FILED for this class
     assert worker.store.list_approvals(worker.wo["id"]) == []
     refused = worker.events("heredoc_write_refused")
     assert len(refused) == 1
@@ -112,7 +100,7 @@ def test_write_text_in_a_heredoc_body_is_denied(worker):
     assert _decision(worker.attempt(command)) == "deny"
 
 
-# -- the negatives, which are the reason this rule is narrow ---------------------------
+# -- the negatives, which are the reason this rule is narrow
 
 
 def test_a_compute_and_print_heredoc_is_left_alone(worker):
@@ -123,7 +111,7 @@ def test_a_compute_and_print_heredoc_is_left_alone(worker):
 
 
 def test_git_commit_with_a_heredoc_is_untouched(worker):
-    """Data, not a program — the distinction `gate_rules.program_spans` already owns."""
+    """Data, not a program — the distinction `gate_rules.program_spans` already owns"""
     command = "git commit -F - <<'EOF'\nfix the thing\nEOF"
 
     assert _decision(worker.attempt(command)) != "deny"
@@ -148,12 +136,11 @@ def test_an_interactive_session_is_not_governed(project):
         {}) is None
 
 
-# -- what must stay true --------------------------------------------------------------
+# -- what must stay true
 
 
 def test_a_privileged_command_that_also_writes_a_file_stays_blocked(worker):
-    """Denied HERE instead of gated — still blocked, and a retry without the file write
-    reaches the gate normally."""
+    """Denied HERE instead of gated — still blocked"""
     command = ("python3 - <<'PY' > notes.txt\nprint('done')\nPY\n"
                "gh pr merge 31 --squash")
 

@@ -1,11 +1,4 @@
-"""An absurd OS-side prompt is refused out loud, and the refusal never quotes it.
-
-Spec §4: docs/superpowers/specs/2026-09-26-bounded-model-inputs.md (section
-.jarvis/features/fo-ac00376e/sections/wo-0cb6dc6b.md).
-
-Shaped like `tests/test_transport_resilience.py`'s crash-is-not-a-verdict set: a refused
-call decides nothing, spends nothing, and leaves no row claiming it happened.
-"""
+"""An absurd OS-side prompt is refused out loud, and the refusal never quotes it (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)"""
 
 from __future__ import annotations
 
@@ -21,7 +14,7 @@ MARKER = "SECRET-PAYLOAD-MARKER-9f3a"
 
 @pytest.fixture()
 def ceiling():
-    """A small ceiling, restored after the test — the seam is module-level state."""
+    """A small ceiling, restored after the test — the seam is module-level state"""
     before = claude_cli.MAX_OS_PROMPT_CHARS
     claude_cli.set_max_os_prompt_chars(5_000)
     try:
@@ -34,12 +27,11 @@ def _oversized(n: int = 6_000) -> str:
     return MARKER + "x" * n
 
 
-# -- the constants and the seam -----------------------------------------------------
+# -- the constants and the seam
 
 
 def test_the_shipped_ceiling_sits_above_the_measured_worst_case():
-    """285,929 chars is the largest legitimate OS call measured (a feature chair round).
-    A default under it would silently disable validation."""
+    """285,929 chars is the largest legitimate OS call measured (a feature chair round)"""
     assert claude_cli.MAX_OS_PROMPT_CHARS_MIN == 300_000 > 285_929
     assert claude_cli.DEFAULT_MAX_OS_PROMPT_CHARS == 400_000
     assert claude_cli.MAX_OS_PROMPT_CHARS >= claude_cli.MAX_OS_PROMPT_CHARS_MIN
@@ -55,7 +47,7 @@ def test_the_seam_overrides_the_default_once_at_startup():
     assert claude_cli.MAX_OS_PROMPT_CHARS == before
 
 
-# -- the transport refusal ----------------------------------------------------------
+# -- the transport refusal
 
 
 def test_an_oversized_call_is_refused_before_any_subprocess(ceiling, monkeypatch):
@@ -79,8 +71,7 @@ def test_the_refusal_is_a_transport_failure_every_consumer_already_catches(ceili
 
 def test_the_refusal_carries_no_int_where_a_usage_limit_is_expected(ceiling,
                                                                     monkeypatch):
-    """`seats._run_seat` does `refused=getattr(e, "limit", None)` and puts the result on
-    the Opinion as a `UsageLimit`. An int there would poison it."""
+    """`seats._run_seat` does `refused=getattr(e"""
     monkeypatch.setattr(claude_cli, "_run", lambda *a, **k: "unreachable")
     with pytest.raises(claude_cli.PromptTooLargeError) as caught:
         claude_cli.run_headless_result(_oversized(), system_prompt="s" * 100)
@@ -92,8 +83,7 @@ def test_the_refusal_carries_no_int_where_a_usage_limit_is_expected(ceiling,
 
 
 def test_the_refusal_names_numbers_and_never_quotes_the_prompt(ceiling, monkeypatch):
-    """A refusal that quotes the payload copies it into the inbox, which the user reads
-    and the digest then sends to a model."""
+    """A refusal that quotes the payload copies it into the inbox"""
     monkeypatch.setattr(claude_cli, "_run", lambda *a, **k: "unreachable")
     with pytest.raises(claude_cli.PromptTooLargeError) as caught:
         claude_cli.run_headless_result(_oversized(), system_prompt="s" * 100)
@@ -129,12 +119,11 @@ def test_a_call_under_the_ceiling_is_untouched(ceiling, monkeypatch):
     assert seen
 
 
-# -- neo_store.ask: refuse, never persist -------------------------------------------
+# -- neo_store.ask: refuse, never persist
 
 
 def test_an_oversized_question_is_never_persisted(jarvis_home, ceiling):
-    """Neo, q1078 option A: the store is the last place that can refuse a question, and
-    a trimmed one would be answered as if it were the question asked."""
+    """Neo, q1078 option A: the store is the last place that can refuse a question"""
     store = NeoStore()
     try:
         with pytest.raises(ValueError) as caught:
@@ -159,8 +148,7 @@ def test_a_normal_question_is_still_stored(jarvis_home, ceiling):
 
 
 def test_the_refusal_is_a_named_error_the_cli_can_render(jarvis_home, ceiling):
-    """A worker that asked too big a question must be told the size, the ceiling and the
-    setting, so it can shorten and retry — not handed a bare `ValueError`."""
+    """A worker that asked too big a question must be told the size"""
     from jarvis.neo_store import QuestionTooLargeError
 
     assert issubclass(QuestionTooLargeError, ValueError)
@@ -180,15 +168,15 @@ def test_the_refusal_is_a_named_error_the_cli_can_render(jarvis_home, ceiling):
 
 def test_jarvis_wo_ask_prints_one_line_and_exits_nonzero(jarvis_home, fake_claude,
                                                          catalog_file, project,
-                                                         capsys):
-    """The CLI path a worker actually uses. A traceback here is a worker that cannot
-    tell a refusal it can act on from a crash it cannot."""
+                                                         capsys, monkeypatch):
+    """The CLI path a worker actually uses"""
     from jarvis import cli, ops
 
     before = claude_cli.MAX_OS_PROMPT_CHARS
     ops.start_os(str(catalog_file), foreground=True)
     wo = ops.create_work_order("proj_a", "build the exporter")
-    # Under `sections.QUESTION_MAX_CHARS` (4,000), so it is the STORE that refuses this.
+    # The question cap is off, so it is the STORE that refuses this
+    monkeypatch.setattr(ops, "_concision_cap", lambda *_: 0)
     claude_cli.set_max_os_prompt_chars(3_000)
     try:
         rc = cli.main(["wo", "ask", wo["id"], MARKER + "x" * 3_400])
@@ -203,12 +191,11 @@ def test_jarvis_wo_ask_prints_one_line_and_exits_nonzero(jarvis_home, fake_claud
     assert MARKER not in err
 
 
-# -- the digest clip has a floor ----------------------------------------------------
+# -- the digest clip has a floor
 
 
 def test_the_digest_clip_may_not_be_set_below_the_threshold_that_earned_the_call():
-    """Under `digest.MIN_CHARS` every digested question is clipped to less than the
-    length that made it worth a digest call at all."""
+    """Under `digest.MIN_CHARS` every digested question is clipped to less than the length that made it..."""
     from jarvis import digest
     from jarvis.catalog import CatalogError, parse_catalog
 
@@ -223,12 +210,11 @@ def test_the_digest_clip_may_not_be_set_below_the_threshold_that_earned_the_call
          "projects": []}).os.neo.digest_max_question_chars == 800
 
 
-# -- the ceiling against the REAL maximal prompt ------------------------------------
+# -- the ceiling against the REAL maximal prompt
 
 
 def _maximal_brief():
-    """A knowledge brief the size the measurement was taken against — 592 entries,
-    built here rather than read out of a database."""
+    """A knowledge brief the size the measurement was taken against"""
     from jarvis.central_store import KnowledgeBrief
 
     return KnowledgeBrief(
@@ -245,7 +231,7 @@ def _maximal_brief():
 
 
 def _maximal_packet():
-    """The FEATURE packet behind the 285,929-char measurement."""
+    """The FEATURE packet behind the 285,929-char measurement"""
     from jarvis.catalog import DEFAULT_VALIDATION_DIFF_CHARS
     from jarvis.evidence import EvidencePacket
 
@@ -275,12 +261,7 @@ def _maximal_packet():
 
 
 def test_the_maximal_shipped_prompt_fits_under_the_default_ceiling(jarvis_home):
-    """THE TEST THAT FAILS WHEN THE PACKET GROWS PAST THE BACKSTOP.
-
-    Built through the SHIPPED builders, never against a constant: a constant asserted
-    against a constant proves only that two lines of Python agree
-    (`tests/test_validation_seats.py`'s module docstring).
-    """
+    """THE TEST THAT FAILS WHEN THE PACKET GROWS PAST THE BACKSTOP"""
     import json
 
     from jarvis import seats, validation
@@ -305,13 +286,11 @@ def test_the_maximal_shipped_prompt_fits_under_the_default_ceiling(jarvis_home):
         f"default or shrink what the packet carries")
 
 
-# ==================================================================================
 # The consumers: one inbox row, one derived blocker, no retry (spec §4)
-# ==================================================================================
 
 
 def _refusal(chars: int = 500_000) -> claude_cli.PromptTooLargeError:
-    """The transport's own refusal, as a consumer receives it."""
+    """The transport's own refusal, as a consumer receives it"""
     return claude_cli.PromptTooLargeError(
         f"refused a validation call: prompt {chars} chars + system prompt 0 chars "
         f"= {chars}, over the 400000-char ceiling (os.max_os_prompt_chars)",
@@ -327,12 +306,12 @@ def _inbox(level: str | None = None) -> list[dict]:
         central.close()
 
 
-# -- the neo drain -------------------------------------------------------------------
+# -- the neo drain
 
 
 @pytest.fixture()
 def neo_refused(jarvis_home, fake_claude, catalog_file, project):
-    """A dispatched work order whose queued Neo question is refused by the transport."""
+    """A dispatched work order whose queued Neo question is refused by the transport"""
     from jarvis import ops
     from jarvis.catalog import load_catalog
     from jarvis.daemon import Daemon
@@ -342,8 +321,7 @@ def neo_refused(jarvis_home, fake_claude, catalog_file, project):
     wo = ops.create_work_order("proj_a", "build the exporter")
     daemon.tick()
     ops.ask_question(wo["id"], "Should the export default to CSV or JSON?")
-    # The refusal is about the WHOLE prompt — Neo's persona and the learnings index are
-    # most of it — so the ceiling, not the question, is what makes this call absurd.
+    # The refusal is about the WHOLE prompt
     before = claude_cli.MAX_OS_PROMPT_CHARS
     claude_cli.set_max_os_prompt_chars(50)
     try:
@@ -353,8 +331,7 @@ def neo_refused(jarvis_home, fake_claude, catalog_file, project):
 
 
 def test_a_refused_question_decides_nothing_and_spends_no_attempt(neo_refused):
-    """`test_transport_resilience.py`'s six assertions, for the one failure that must
-    NOT be retried: the same call fails the same way for ever."""
+    """`test_transport_resilience.py`'s six assertions"""
     from jarvis import neo as neo_mod
     from jarvis import testing as T
 
@@ -405,8 +382,7 @@ def test_the_neo_refusal_reaches_the_inbox_exactly_once_and_quotes_nothing(neo_r
 
 def test_the_flag_survives_a_reconcile_tick_and_goes_down_after_the_clearing_event(
         neo_refused):
-    """A raw `flag_attention` would fail this: INV-ATTENTION-REASON rewrites any reason
-    `true_blockers` cannot re-derive."""
+    """A raw `flag_attention` would fail this: INV-ATTENTION-REASON rewrites any reason `true_blockers`..."""
     from jarvis import invariants
     from jarvis.project_store import ProjectStore
 
@@ -431,13 +407,11 @@ def test_the_flag_survives_a_reconcile_tick_and_goes_down_after_the_clearing_eve
     assert len(_inbox()) == 1, "the reconcile tick wrote a second inbox row"
 
 
-# -- the validation round --------------------------------------------------------------
+# -- the validation round
 
 
 def test_a_refused_round_does_not_burn_three_outage_retries(fleet):
-    """`_validation_outage` retries three times. A deterministic refusal must be
-    refused ONCE and escalated: nobody has judged the work, and retrying only delays
-    saying so."""
+    """`_validation_outage` retries three times"""
     from jarvis import db, invariants
     from tests.test_validation_loop import Validator, finish
 
@@ -474,23 +448,7 @@ def test_a_refused_round_does_not_burn_three_outage_retries(fleet):
 
 
 def test_the_refusal_is_handled_before_the_generic_clause_at_every_site():
-    """GETTING THIS ORDER WRONG IS SILENT. `PromptTooLargeError` is a
-    `ClaudeCliError` subclass, so a clause placed after the generic one is never
-    reached and the refusal is retried three times as an outage — with every test
-    about the generic path still green (daemon.py's precedent comment).
-
-    TWO SHAPES, so the table below names the right pair of markers per site rather
-    than hunting for whichever comes first. `neo.drain_queue` and
-    `Daemon._validate_feature` DISPATCH IN THE `try`: a chain of `except` clauses
-    whose generic end is `except claude_cli.ClaudeCliError`.
-    `Daemon._validate_work_order` CAPTURES and then dispatches: its
-    `except claude_cli.ClaudeCliError as e: failure = e` only names the error and
-    decides nothing, so it is not a handler and must be excluded; the handler is the
-    later `isinstance` ladder, whose generic end is `if failure is not None`.
-
-    Source-level, like `tests/test_remedies.py`'s AST pin, because the feature half has
-    no cheap runtime harness and the property is about the order of two lines.
-    """
+    """GETTING THIS ORDER WRONG IS SILENT"""
     import inspect
 
     from jarvis import neo as neo_mod
