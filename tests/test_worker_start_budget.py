@@ -1,8 +1,4 @@
-"""Jarvis's share of a worker's starting context stays within 10K tokens (chars/4).
-
-docs/os/architecture/worker-context.md. Composed from the real builders against this repo,
-a knowledge base the size of the live one, and a bug-issue-sized description.
-"""
+"""Jarvis's share of a worker's starting context stays within 10K tokens (chars/4) (docs/os/architecture/worker-context.md)"""
 
 from __future__ import annotations
 
@@ -28,8 +24,7 @@ def _spec() -> ProjectSpec:
 
 
 def _base(central: CentralStore) -> None:
-    """~130 topics and four long pinned rulings, like the live base; the index is capped,
-    so topic count, not entry count, is what sizes the block."""
+    """~130 topics and four long pinned rulings, like the live base"""
     for i in range(4):
         central.add_knowledge(f"USER RULING {i}: " + "rule text " * 120,
                               project="jarvis_os", topic="rulings", tags=PINNED_TAG)
@@ -44,7 +39,7 @@ def _listing(path: Path) -> int:
 
 
 def start_breakdown(central: CentralStore, wo: dict) -> dict[str, int]:
-    """Estimated tokens per Jarvis-controlled ingredient of a worker's first request."""
+    """Estimated tokens per Jarvis-controlled ingredient of a worker's first request"""
     cfg = OsConfig()
     spec = _spec()
     brief = central.knowledge_brief(

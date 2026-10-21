@@ -1,22 +1,4 @@
-"""Screenshot the budget box on the dashboard's two create forms, for a PR's UI evidence.
-
-`scripts/screenshot_budget.py` is the shape this copies — it shot the budget on the order
-pages, which is where a ceiling could be set before this change. Two shots:
-
-  budget-at-creation.png          both create forms as a user first meets them: the
-                                  budget box and whether its placeholder actually fits
-  budget-at-creation-filled.png   the same two, carrying the amounts they accept
-
-There is deliberately no shot of the browser REFUSING a malformed amount: Chromium's
-constraint bubble is a native popup and is not composited into a headless screenshot.
-`tests_browser/test_ui_browser.py::test_a_typo_in_the_budget_box_never_costs_the_description`
-is the evidence for that half.
-
-Writes PNGs to docs/screenshots/. Everything it touches lives in a temp `JARVIS_HOME` and
-a temp catalog, so it never reads or writes the live OS:
-
-    uv run python scripts/screenshot_budget_at_creation.py
-"""
+"""Screenshot the budget box on the dashboard's two create forms, for a PR's UI evidence"""
 
 from __future__ import annotations
 

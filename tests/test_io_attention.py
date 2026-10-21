@@ -1,14 +1,4 @@
-"""Attention for improvement orders — exactly one item, flag-once by construction.
-
-Section 6.2 of docs/superpowers/specs/2026-09-23-improvement-orders.md. There is NO ack
-verb for a feature-order-level flag, so flag-once is proven the way the section says:
-raise it, tick repeatedly, assert nothing re-raises or RE-WRITES it (kn-089de524), then
-decide the findings and assert it is down and stays down.
-
-Feature orders are pinned against improvement orders in this same file: the two kinds
-share one composition block in `ops.os_status`, and a change to one silently changing the
-other is what these paired assertions exist to catch.
-"""
+"""Attention for improvement orders — exactly one item, flag-once by construction (docs/superpowers/specs/2026-09-23-improvement-orders.md)"""
 
 from __future__ import annotations
 
@@ -38,7 +28,7 @@ def store(project):
 
 @pytest.fixture()
 def analysing(started, store, improvement_order):
-    """An improvement order in `planning` with its analyst wired to it as a child."""
+    """An improvement order in `planning` with its analyst wired to it as a child"""
     analyst = store.create_work_order("analyse it", description="the observation",
                                       kind="planner", status="running",
                                       parent_id=improvement_order["id"])
@@ -116,17 +106,14 @@ def test_the_item_names_jarvis_io_review_and_carries_no_progress_prefix(analysin
                                                                        store):
     io, analyst = analysing
     ops.submit_findings(io["id"], a_report())
-    # The analyst is settled by the submission; flagged here so the rollup has something
-    # to collapse — the property under test is that a child of an improvement order never
-    # gets its own line.
+    # The analyst is settled by the submission; flagged here so the rollup has something to collapse
     store.flag_attention(analyst["id"], "the analyst wants you")
 
     items = io_items(io["id"])
     assert len(items) == 1
     item = items[0]
     assert item["decide"] == f"jarvis io review {io['id']}"
-    # No progress prefix: the reason OPENS on the headline's counts. The rolled-up
-    # child's clause is appended after it, as it is for a feature order.
+    # No progress prefix: the reason OPENS on the headline's counts
     assert item["reason"].startswith(headline(store, io["id"]))
     assert item["reason"].startswith(f"{len(a_report()['findings'])} findings on")
     assert analyst["id"] in item["rolled_up"]

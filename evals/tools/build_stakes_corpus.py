@@ -45,7 +45,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-#: Where the real corpus lives, outside the repository. The eval reads the same name.
+#: Where the real corpus lives, outside the repository
 CORPUS_ENV = "JARVIS_STAKES_CORPUS"
 LABELS_FILE = "stakes_labels.json"
 HIGH_CATEGORIES = ("production-or-live-credentials", "spending-money",
@@ -62,7 +62,7 @@ def default_out() -> Path:
 
 
 def jarvis(*args: str) -> Any:
-    """One `jarvis … --json` call. Raises loudly: a half-read fleet is a wrong corpus."""
+    """One `jarvis … --json` call"""
     out = subprocess.run(["jarvis", *args], capture_output=True, text=True, check=True)
     return json.loads(out.stdout)
 

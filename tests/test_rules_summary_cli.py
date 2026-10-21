@@ -1,18 +1,4 @@
-"""`jarvis rules summary` — the terminal half of the evolution report (§9).
-
-`ops.evolution_report` computes every number ONCE. This file pins the other half of that
-contract: the RENDERER derives none of them. The spec-named test below hands
-`_print_rules_summary` a dict whose numbers deliberately do not agree with each other and
-asserts the printed line is the dict's, not the renderer's — `tests/test_bill.py::
-test_jarvis_cost_prints_the_residue_and_the_placeholder_sentence`'s pattern, and the one
-test that can catch a surface quietly doing its own arithmetic.
-
-The rest pin ABSENT IS NEVER ZERO at the terminal: every figure in the report is paired
-with a `*_note` sentence that is `None` when the figure is present and a SENTENCE when it
-is absent, and the renderer prints the sentence — never a digit, never a dash, never "0%".
-
-Spec: docs/superpowers/specs/2026-09-27-self-evolution.md §9.
-"""
+"""`jarvis rules summary` — the terminal half of the evolution report (§9) (docs/superpowers/specs/2026-09-27-self-evolution.md §9.)"""
 
 from __future__ import annotations
 
@@ -24,12 +10,7 @@ from jarvis import cli, ops
 
 
 def _report(**overrides) -> dict:
-    """An evolution report with every key `evolution_report` ships, all of it empty.
-
-    HAND-BUILT rather than taken from `ops`: the point of this file is that the renderer
-    prints what the dict says, so the dict has to be able to say things `ops` would never
-    compute — an inconsistent share above all.
-    """
+    """An evolution report with every key `evolution_report` ships, all of it empty"""
     data = {
         "window": {"days": 90, "since": 1_000_000.0, "until": 1_100_000.0,
                    "week_zone": "Europe/Madrid", "week_zone_note": None},
@@ -63,16 +44,11 @@ def _rule(**overrides) -> dict:
     return row
 
 
-# -- the renderer computes nothing ------------------------------------------------------
+# -- the renderer computes nothing
 
 
 def test_the_renderer_prints_what_the_dict_says_and_computes_nothing(capsys):
-    """THE SPEC-NAMED TEST. 7/100 is not 42%, and the dict says 42%.
-
-    If the renderer ever recomputes `numerator / denominator` this flips to 7%, which is
-    `_print_rules_list`'s reason for deriving nothing stated as a failing assertion: two
-    surfaces computing the same total is two surfaces that can disagree about it.
-    """
+    """THE SPEC-NAMED TEST. 7/100 is not 42%, and the dict says 42%"""
     data = _report(mechanical_share={
         "value": 0.42, "note": None, "numerator": 7, "denominator": 100,
         "series": [{"week": "2026-09-21", "numerator": 3, "denominator": 9,
@@ -84,7 +60,7 @@ def test_the_renderer_prints_what_the_dict_says_and_computes_nothing(capsys):
 
     assert "42" in out
     assert "7%" not in out and "7.0%" not in out
-    # The series point is the dict's too: 3/9 is not 91%.
+    # The series point is the dict's too: 3/9 is not 91%
     assert "91" in out and "33%" not in out
 
 
@@ -135,7 +111,7 @@ def test_a_stuck_resolution_note_replaces_both_medians(capsys):
     out = capsys.readouterr().out
 
     assert note in out
-    # Neither median, and no fabricated delta: "—" would read as a measured zero gap.
+    # Neither median, and no fabricated delta: "—" would read as a measured zero gap
     assert "0s" not in out and "0.0" not in out
 
 
@@ -152,15 +128,13 @@ def test_no_weaker_half_prints_the_note_and_names_neither_side(capsys):
     out = capsys.readouterr().out
 
     assert note in out
-    # The NOTE itself contains both words, so the assertion is about the verdict line the
-    # renderer would otherwise print: nothing outside the quoted sentence names a side.
+    # The NOTE itself contains both words
     rest = out.replace(note, "")
     assert "weaker half" not in rest
 
 
 def test_no_recurrence_prints_the_sentence_and_no_verdict_counts(capsys):
-    """ABSENT IS NEVER ZERO applies to the counts line too: with no recurrence row the
-    sentence is the whole section, and `missed 0` beside it reads as a measurement."""
+    """ABSENT IS NEVER ZERO applies to the counts line too: with no recurrence row the sentence is the..."""
     note = "no recurrence has been recorded in this window"
     data = _report(recurrences={
         "rows": [],
@@ -211,7 +185,7 @@ def test_a_timeline_entry_with_no_links_renders_without_raising(capsys):
 
 
 def test_the_empty_report_says_something_rather_than_printing_nothing(capsys):
-    """What every install starts with: an empty registry. Silence would read as a crash."""
+    """What every install starts with: an empty registry"""
     cli._print_rules_summary(_report())
     out = capsys.readouterr().out
 
@@ -220,11 +194,7 @@ def test_the_empty_report_says_something_rather_than_printing_nothing(capsys):
 
 def test_an_install_with_an_investigation_and_no_armed_rule_prints_no_percent(
         jarvis_home, tmp_path, capsys):
-    """END TO END against a real registry rather than a hand-built dict.
-
-    One investigation and no armed rule is what an ordinary install looks like, and the
-    denominator is 1 there. `0%` anywhere in this output is the one thing §9 forbids.
-    """
+    """END TO END against a real registry rather than a hand-built dict"""
     from jarvis.central_store import CentralStore
     from jarvis.project_store import ProjectStore
 
@@ -250,12 +220,11 @@ def test_an_install_with_an_investigation_and_no_armed_rule_prints_no_percent(
     assert "0%" not in out
 
 
-# -- the CLI ----------------------------------------------------------------------------
+# -- the CLI
 
 
 def test_json_emits_the_dict_and_the_plain_form_does_not(monkeypatch, capsys):
-    """The `jarvis cost` pairing, built through the REAL parser so the subparser wiring
-    is covered rather than assumed."""
+    """The `jarvis cost` pairing, built through the REAL parser so the subparser wiring is covered rather..."""
     report = _report()
     monkeypatch.setattr(ops, "evolution_report", lambda *a, **k: report)
     parser = cli.build_parser()
@@ -283,7 +252,7 @@ def test_days_and_the_project_reach_ops(monkeypatch, capsys):
     capsys.readouterr()
 
     assert seen == {"project": "proj_a", "days": 7}
-    # No project named is the FLEET, and `ops` is told so with None rather than "".
+    # No project named is the FLEET, and `ops` is told so with None rather than ""
     cli.cmd_rules(parser.parse_args(["rules", "summary"]))
     capsys.readouterr()
     assert seen["project"] is None and seen["days"] == 90

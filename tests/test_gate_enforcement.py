@@ -1,16 +1,4 @@
-"""A gate that holds the worker, not just one tool call.
-
-GitHub issue 44, design in `docs/superpowers/specs/2026-09-12-a-gate-that-holds.md`.
-`wo-6e7caf6c` filed two gate requests and reached `needs_review` without ever receiving
-either verdict: the deny was one tool error carrying English, and every other way out of
-the turn was open.
-
-There are three ways out — end the turn, take a different route, declare yourself done —
-and a gate closed on two of them is not closed, so each has its own section here. The
-fourth section pins the thing that makes the whole design terminate rather than deadlock:
-the Stop hold and the narrowed surface apply to OPPOSITE statuses, because the two are
-cleared by opposite things.
-"""
+"""A gate that holds the worker, not just one tool call (docs/superpowers/specs/2026-09-12-a-gate-that-holds.md)"""
 
 from __future__ import annotations
 
@@ -42,8 +30,7 @@ def _reason(result):
 
 @pytest.fixture()
 def worker(jarvis_home, fake_claude, catalog_file, project):
-    """A running work order in a project with every gate live, plus the two moves a
-    worker makes at one: attempting the command, and arguing for it."""
+    """A running work order in a project with every gate live"""
     ops.start_os(str(catalog_file), foreground=True)
     store = ProjectStore(project)
     wo = store.create_work_order("ship the thing", description="cut a release")
@@ -65,11 +52,7 @@ def worker(jarvis_home, fake_claude, catalog_file, project):
             return preflight_decision(payload, env)
 
         def argue(self, command):
-            """The compliant second move — what puts a request in front of a reviewer.
-
-            An attempt alone leaves it `awaiting_case` (`gates.AWAITING_CASE`), which is
-            precisely the distinction every test below turns on.
-            """
+            """The compliant second move — what puts a request in front of a reviewer"""
             action = gates.classify(command, ALL_GATES)
             approval = store.latest_approval_for(wo["id"], action.kind, action.command)
             neo = NeoStore()
@@ -92,13 +75,11 @@ def worker(jarvis_home, fake_claude, catalog_file, project):
     store.close()
 
 
-# -- 1. ending the turn ----------------------------------------------------------------
+# -- 1. ending the turn
 
 
 def test_the_turn_cannot_end_on_a_request_nobody_is_reviewing(worker):
-    """The whole issue in one assertion: the Stop hook was observational, so a worker
-    that ignored "END YOUR TURN NOW" and simply stopped left the request unargued and
-    unreviewable."""
+    """The whole issue in one assertion: the Stop hook was observational"""
     worker.attempt(MERGE)
 
     blocked = worker.stop()
@@ -106,12 +87,10 @@ def test_the_turn_cannot_end_on_a_request_nobody_is_reviewing(worker):
     assert blocked["decision"] == "block"
     approval = worker.store.held_approvals(worker.wo["id"])[0]
     assert f"request {approval['id']}" in blocked["reason"]
-    # Both ways out have to be in the reason: this is the only text the worker gets,
-    # and a hold that named only the request would push a false case (spec
-    # 2026-09-12-contesting-a-gate-match.md §3).
+    # Both ways out have to be in the reason: this is the only text the worker gets
     assert gates.exits_advice(worker.wo["id"], MERGE, "pr_merge",
                               approval["id"]) in blocked["reason"]
-    # And on the record, because nobody reads the worker's transcript.
+    # And on the record, because nobody reads the worker's transcript
     held = [e for e in worker.store.list_events(worker.wo["id"])
             if e["kind"] == "gate_turn_held"]
     assert len(held) == 1
@@ -119,10 +98,7 @@ def test_the_turn_cannot_end_on_a_request_nobody_is_reviewing(worker):
 
 
 def test_the_turn_ends_freely_once_the_case_is_made(worker):
-    """The half that keeps this from being a deadlock. A `pending` request is cleared
-    by a queued verdict, and `Daemon.deliver_messages` will not deliver one into a turn
-    still in flight — so blocking here would hold the turn against the only channel that
-    could ever free it."""
+    """The half that keeps this from being a deadlock"""
     worker.attempt(MERGE)
     worker.argue(MERGE)
 
@@ -131,8 +107,7 @@ def test_the_turn_ends_freely_once_the_case_is_made(worker):
 
 
 def test_the_turn_is_held_once_and_not_in_a_loop(worker):
-    """`stop_hook_active` means Claude is already going again because of this hook. A
-    worker that ignored the reason twice is better parked than spun."""
+    """`stop_hook_active` means Claude is already going again because of this hook"""
     worker.attempt(MERGE)
     assert worker.stop()["decision"] == "block"
 
@@ -145,11 +120,7 @@ def test_an_ordinary_turn_ends(worker):
 
 @pytest.mark.parametrize("status", TERMINAL_STATUSES)
 def test_a_settled_work_order_is_not_held(worker, status):
-    """Nothing left to argue for: the worker is being taken down, not walking away.
-
-    Parametrised over the sweeper's own set rather than a literal pair, so a status that
-    settles a work order for `check_no_orphan_gate_requests` and not for the hook fails
-    here instead of stranding a dead worker at every turn boundary."""
+    """Nothing left to argue for: the worker is being taken down, not walking away"""
     worker.attempt(MERGE)
     worker.store.set_status(worker.wo["id"], status)
 
@@ -157,8 +128,7 @@ def test_a_settled_work_order_is_not_held(worker, status):
 
 
 def test_the_block_is_actually_printed(worker, monkeypatch, capsys):
-    """A Stop block has no `hookSpecificOutput`, so the entry point's old print
-    condition would have swallowed it — and a decision nobody prints is advice."""
+    """A Stop block has no `hookSpecificOutput`"""
     worker.attempt(MERGE)
     for key, value in worker.env.items():
         monkeypatch.setenv(key, value)
@@ -170,12 +140,11 @@ def test_the_block_is_actually_printed(worker, monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out)["decision"] == "block"
 
 
-# -- 2. taking a different route -------------------------------------------------------
+# -- 2. taking a different route
 
 
 def test_a_request_under_review_narrows_the_session(worker):
-    """`latest_approval_for` matches the command string exactly, so the goal was always
-    reachable by another command. Under review, it is not."""
+    """`latest_approval_for` matches the command string exactly"""
     worker.attempt(MERGE)
     worker.argue(MERGE)
 
@@ -186,8 +155,7 @@ def test_a_request_under_review_narrows_the_session(worker):
 
 
 def test_the_narrowed_session_can_still_read_and_still_reach_the_os(worker):
-    """Reading is how a worker answers a question about its own state, and the contract
-    commands are the only channel it has to the OS — including `jarvis wo ask`."""
+    """Reading is how a worker answers a question about its own state"""
     worker.attempt(MERGE)
     worker.argue(MERGE)
 
@@ -209,8 +177,7 @@ def test_the_narrowed_session_cannot_write_files(worker):
 
 
 def test_a_live_grant_still_runs_while_another_request_is_under_review(worker):
-    """The narrowing sits AFTER `gate_decision` for this: a command somebody approved
-    must not be blocked by an unrelated request still waiting."""
+    """The narrowing sits AFTER `gate_decision` for this: a command somebody approved must not be blocked..."""
     worker.attempt(MERGE)
     approved = worker.argue(MERGE)
     gates.apply_decision(worker.store, approved["id"], "approved",
@@ -225,22 +192,19 @@ def test_a_live_grant_still_runs_while_another_request_is_under_review(worker):
 
 
 def test_a_held_request_leaves_the_session_open(worker):
-    """The mirror image of the Stop hold, and the reason the design terminates: a case
-    is made of test output and a branch, so the surface it comes from stays open for
-    exactly as long as the worker still owes one."""
+    """The mirror image of the Stop hold"""
     worker.attempt(MERGE)
 
     assert worker.attempt("git status") is None
     assert worker.store.held_approvals(worker.wo["id"])
 
 
-# -- 3. declaring yourself done --------------------------------------------------------
+# -- 3. declaring yourself done
 
 
 @pytest.mark.parametrize("argue", [False, True])
 def test_finish_refuses_while_a_request_is_open(worker, argue):
-    """The route neither of the others can close: `jarvis wo finish` is a contract
-    command, so the narrowed surface has to keep it allowed."""
+    """The route neither of the others can close: `jarvis wo finish` is a contract command"""
     worker.attempt(MERGE)
     if argue:
         worker.argue(MERGE)
@@ -248,11 +212,7 @@ def test_finish_refuses_while_a_request_is_open(worker, argue):
     with pytest.raises(ops.OpsError) as e:
         ops.finish(worker.wo["id"], "shipped it")
 
-    # Still blocked by the gate, and nothing of the submission was written. The STATUS
-    # differs by road since fix 2 of
-    # docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md: an argued
-    # request is with a reviewer and parks the order; a held one is the worker's own
-    # move and parks nothing. `finish` is refused either way, which is the claim here.
+    # Still blocked by the gate, and nothing of the submission was written (docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md)
     assert worker.store.get_work_order(worker.wo["id"])["status"] == (
         "waiting_input" if argue else "running")
     assert not worker.store.get_work_order(worker.wo["id"])["result_summary"]
@@ -266,9 +226,7 @@ def test_finish_refuses_while_a_request_is_open(worker, argue):
 
 
 def test_both_refusals_offer_the_same_two_exits(worker):
-    """`gates.exits_advice` renders them once for every surface that blocks a worker
-    (kn-467d1ecd). Pinned from the two this work order added, so a renamed flag or a
-    third exit cannot reach one of them and not the other."""
+    """`gates.exits_advice` renders them once for every surface that blocks a worker (kn-467d1ecd)"""
     worker.attempt(MERGE)
     with pytest.raises(ops.OpsError) as e:
         ops.finish(worker.wo["id"], "shipped it")
@@ -277,7 +235,7 @@ def test_both_refusals_offer_the_same_two_exits(worker):
 
     assert advice in worker.stop()["reason"]
     assert advice in str(e.value)
-    # Both exits, not just the one that argues for the action.
+    # Both exits, not just the one that argues for the action
     assert gates.request_command(worker.wo["id"], MERGE, "pr_merge",
                                  approval_id=approval["id"]) in advice
     assert gates.contest_command(worker.wo["id"], MERGE,
@@ -285,8 +243,7 @@ def test_both_refusals_offer_the_same_two_exits(worker):
 
 
 def test_a_held_request_leads_when_both_are_open(worker):
-    """The way on differs by status and only a held request can be acted on this turn,
-    so which one the refusal describes must not depend on list order."""
+    """The way on differs by status and only a held request can be acted on this turn"""
     worker.attempt(MERGE)
     worker.argue(MERGE)
     worker.attempt(RELEASE)  # held, filed after the pending one
@@ -310,12 +267,11 @@ def test_finish_works_once_the_gate_is_decided(worker):
     assert worker.store.get_work_order(worker.wo["id"])["status"] != "running"
 
 
-# -- 4. one name for "still on its way to a verdict" -----------------------------------
+# -- 4. one name for "still on its way to a verdict"
 
 
 def test_open_approvals_is_both_statuses(worker):
-    """`ops.finish` and `check_no_orphan_gate_requests` both mean the same thing by an
-    open request, so they read it from the same place."""
+    """`ops.finish` and `check_no_orphan_gate_requests` both mean the same thing by an open request"""
     worker.attempt(MERGE)
     assert [a["status"] for a in worker.store.open_approvals(worker.wo["id"])] \
         == [gates.AWAITING_CASE]
@@ -326,12 +282,11 @@ def test_open_approvals_is_both_statuses(worker):
         == ["pending"]
 
 
-# -- 5. the tripwire behind all three --------------------------------------------------
+# -- 5. the tripwire behind all three
 
 
 def test_a_held_request_on_a_settled_work_order_is_an_orphan_too(worker):
-    """INV-GATE-ORPHAN counted `pending` only. A held request is further from a verdict,
-    not closer: no question exists for Neo to answer."""
+    """INV-GATE-ORPHAN counted `pending` only"""
     worker.attempt(MERGE)
     worker.store.set_status(worker.wo["id"], "completed")
 

@@ -1,31 +1,4 @@
-"""Neo as a panel: the primitive, all five seats, the fast path and the veto arbitration.
-
-The arbitration's own table lives in `tests/test_panel_arbitrate.py`, which is pure — plain
-dicts in, a verdict out. What is here is everything that needs the mechanism around it: how
-many calls a decision costs, which seat was handed which prompt and which model, what got
-stored, and what reached the worker.
-
-Every test here is MODEL-FREE — the seats' judgment is measured by the opt-in evals under
-evals/llm/, never here. What is testable in-process is the MECHANISM: how many calls a
-decision costs, which prompt each seat was handed, what got stored, and what reached the
-worker.
-
-TWO ASSERT-NOTHING TRAPS SHAPE THIS FILE, and both are easy to fall into:
-
-* The panel ships DISABLED, so a test that reaches Neo through the daemon without
-  explicitly enabling it exercises the single agent and still gets a perfectly good
-  verdict. So the assertions are on CALL COUNTS and on `panel_opinions` rows — never on
-  "a verdict came back".
-* The fake `claude` returns a valid, non-escalating verdict for any prompt at all, and
-  its gate branch returns a well-formed gate verdict with NO `route` key. A lenient
-  `decide` would default that to `panel` and the test would pass having exercised
-  nothing. `test_a_premise_reply_with_no_route_runs_the_panel` is the assertion that
-  catches it.
-
-The seat definitions are asserted THROUGH THE SHIPPED MARKDOWN, never against a Python
-constant: the file the runtime reads is the enforcement, and a constant listing what the
-seats say would keep passing forever while the markdown said something else.
-"""
+"""Neo as a panel: the primitive, all five seats, the fast path and the veto arbitration"""
 
 from __future__ import annotations
 
@@ -52,15 +25,10 @@ from jarvis.project_store import ProjectStore
 
 SEAT_DIR = ASSETS / "neo-seats"
 
-# Every seat, read off the SHIPPED DIRECTORY rather than listed here. A Python list of
-# what is supposed to be on disk keeps passing forever while the disk says something else,
-# and the enforcement that matters is the file the runtime actually reads.
+# Every seat, read off the SHIPPED DIRECTORY rather than listed here
 SHIPPED = tuple(sorted(p.stem for p in SEAT_DIR.glob("*.md")))
 
-#: The full roster. Not `neo_store.SEATS` — that is the VOCABULARY, and the two are
-#: different things on purpose: a roster may name a seat whose markdown arrives in a later
-#: release. They coincide today, and `test_every_seat_in_the_vocabulary_now_ships` is where
-#: that is asserted rather than assumed.
+#: The full roster
 FULL_ROSTER = ("premise", "record", "blast", "taste", "chair")
 
 GATE_QUESTION = (
@@ -71,7 +39,7 @@ GATE_QUESTION = (
 )
 
 
-# -- fixtures ---------------------------------------------------------------------------
+# -- fixtures
 
 
 @pytest.fixture()
@@ -84,7 +52,7 @@ def store(jarvis_home):
 
 
 def cfg(**panel_kwargs) -> NeoConfig:
-    """A Neo config with the panel ON. Nothing in the OS does this by default."""
+    """A Neo config with the panel ON"""
     panel_kwargs.setdefault("enabled", True)
     return NeoConfig(panel=PanelConfig(**panel_kwargs))
 
@@ -97,8 +65,7 @@ def claim(store: NeoStore, question: str, kind: str = "question") -> dict:
 
 
 def headless(fake_claude) -> list[dict]:
-    """Every one-shot `claude -p` call: Neo's and the panel's. Worker turns carry a
-    session id and are excluded, exactly as `tests/test_neo.py` does it."""
+    """Every one-shot `claude -p` call: Neo's and the panel's"""
     return [c for c in fake_claude.calls
             if "-p" in c["argv"]
             and "--session-id" not in c["argv"] and "--resume" not in c["argv"]]
@@ -114,7 +81,7 @@ def seat_of(call: dict) -> str | None:
     return next((s for s in SEATS if f"# Neo panel seat: {s}" in system), None)
 
 
-# -- the seat definitions, as shipped ----------------------------------------------------
+# -- the seat definitions, as shipped
 
 
 @pytest.mark.parametrize("seat", SHIPPED)
@@ -128,38 +95,25 @@ def test_a_seat_ships_as_markdown_with_frontmatter(seat):
     )
     assert meta["description"], "a seat with no description is undocumented in the record"
     assert body.strip(), "a seat is its mandate; an empty body is an empty seat"
-    # A `tools:` key is meaningful for a subagent and meaningless for a headless call.
-    # Absent rather than empty: an empty allowlist would read as a deliberate lockdown.
+    # A `tools:` key is meaningful for a subagent and meaningless for a headless call
     assert "tools" not in meta
 
 
 def test_every_seat_in_the_vocabulary_now_ships():
-    """The vocabulary and the shipped set were deliberately allowed to differ while the
-    panel was being built in pieces. They no longer do, and saying so here is what stops
-    the parametrized test above from silently covering four seats if a file is lost."""
+    """The vocabulary and the shipped set were deliberately allowed to differ while the panel was being..."""
     assert set(SHIPPED) == set(SEATS) == set(FULL_ROSTER)
     assert panel.shipped_seats() == SEATS
 
 
 def test_the_seats_do_not_ship_in_the_planners_agents_directory():
-    """`bootstrap._rebuild` copytrees `assets/agents/` WHOLESALE into every feature-order
-    planner's `.claude/agents/`. A Neo seat dropped there — subdirectory or not — becomes
-    a bogus subagent that every planner session can invoke.
-
-    Checked over the WHOLE vocabulary, not over the two seats that shipped first: three
-    more arrived after this test was written, and a per-name list is exactly the thing
-    that does not notice a fourth.
-    """
+    """`bootstrap._rebuild` copytrees `assets/agents/` WHOLESALE into every feature-order planner's..."""
     assert SEAT_DIR.is_dir(), "the seats must ship somewhere"
     assert not [p for p in (ASSETS / "agents").rglob("*")
                 if any(s in p.name for s in SEATS)]
 
 
 def test_the_premise_seat_carries_the_hard_limit_verbatim():
-    """The one thing that keeps a mis-dismissal from being an open door. This wording
-    lives in `gates.REVIEWER_PERSONA` today, and the premise seat is where it moves — a
-    seat that owns proposing `dismiss` and does not carry the limit on dismissing is a
-    seat that dismisses real releases."""
+    """The one thing that keeps a mis-dismissal from being an open door"""
     body = " ".join((SEAT_DIR / "premise.md").read_text().split())
 
     assert "however routine or well-justified it looks" in body
@@ -167,41 +121,26 @@ def test_the_premise_seat_carries_the_hard_limit_verbatim():
 
 
 def test_the_premise_check_comes_before_the_first_approve_clause():
-    """Position is the fix, not the wording — this is the whole reason the seat exists.
-
-    The old single persona OPENED by asserting a worker had run a command that ships code
-    and then required of every approval that work "landed on a branch, in a pull request,
-    with checks passing", which a misclassified `grep` can never satisfy: the closest
-    fitting clause left was DENY. "Was this even the question that was asked" has to be
-    settled before any question about the worker.
-    """
+    """Position is the fix, not the wording — this is the whole reason the seat exists"""
     body = (SEAT_DIR / "premise.md").read_text()
 
     assert body.index("PREMISE CHECK") < body.index("APPROVE")
 
 
 def test_the_premise_seat_is_told_to_emit_a_route():
-    """On `route=fast` this seat's reply is the final verdict and the chair never runs.
-    A seat that does not know it routes costs four extra calls on every decision."""
+    """On `route=fast` this seat's reply is the final verdict and the chair never runs"""
     body = (SEAT_DIR / "premise.md").read_text()
 
     assert '"route"' in body and "fast" in body and "panel" in body
 
 
 def collapsed(seat: str) -> str:
-    """A seat's mandate as one lower-cased line. The mandates are hard-wrapped prose and
-    every sentence worth pinning straddles a line break."""
+    """A seat's mandate as one lower-cased line"""
     return " ".join((SEAT_DIR / f"{seat}.md").read_text().lower().split())
 
 
 def test_the_blast_seat_carries_the_hard_limit_and_the_evidence_check():
-    """`blast` is the seat that has to hold the hard limit AFTER the premise seat has
-    already proposed letting the command through — it is the only seat allowed to overrule
-    it, so a copy of the limit lives here as well as there.
-
-    The evidence check is asserted in the same test because there is deliberately no
-    evidence seat: if it is not in this mandate it is in nobody's.
-    """
+    """`blast` is the seat that has to hold the hard limit AFTER the premise seat has already proposed..."""
     body = collapsed("blast")
 
     assert "however routine or well-justified it looks" in body
@@ -210,9 +149,7 @@ def test_the_blast_seat_carries_the_hard_limit_and_the_evidence_check():
 
 
 def test_the_blast_seat_is_told_its_veto_is_one_way():
-    """The mandate has to agree with `arbitrate`, or the seat spends its replies reaching
-    for a power the code does not give it. Belt and braces: the code is the enforcement
-    (`test_nothing_can_force_an_approval`), and this is the seat being told so."""
+    """The mandate has to agree with `arbitrate`"""
     body = collapsed("blast")
 
     assert "you may never force an approval" in body
@@ -221,9 +158,7 @@ def test_the_blast_seat_is_told_its_veto_is_one_way():
 
 
 def test_the_taste_seat_is_told_it_has_no_veto_and_no_forcing_power():
-    """Its failure mode is an annoying answer, not a dangerous one. A seat that could block
-    on taste would spend exactly the attention it exists to protect — and a seat that
-    believes it can block will keep trying to, wasting a reply per decision."""
+    """Its failure mode is an annoying answer, not a dangerous one"""
     body = collapsed("taste")
 
     assert "you have no veto and no forcing power" in body
@@ -240,8 +175,7 @@ def test_the_taste_seat_owns_the_answer_budget_and_scope_discipline():
 
 
 def test_the_record_seat_names_the_contradiction_before_the_verdict():
-    """Position is the mandate. A contradiction found after a verdict has been reasoned out
-    becomes a caveat on an answer already decided; the same one found first changes it."""
+    """Position is the mandate"""
     body = (SEAT_DIR / "record.md").read_text()
 
     assert body.index("BEFORE THE VERDICT") < body.index("# OUTPUT")
@@ -249,9 +183,7 @@ def test_the_record_seat_names_the_contradiction_before_the_verdict():
 
 
 def test_the_record_seat_has_retraction_as_a_real_remedy():
-    """Retraction shipped after this seat was designed. Without it the seat could only
-    complain about a stale ruling; with it, naming the entry is a fix the chair can carry
-    to the user."""
+    """Retraction shipped after this seat was designed"""
     body = collapsed("record")
 
     assert "retract" in body
@@ -260,9 +192,7 @@ def test_the_record_seat_has_retraction_as_a_real_remedy():
 
 
 def test_the_record_seat_owns_the_verbatim_obligations():
-    """Compliance phrasing is precisely what a summariser drops — it reads like padding
-    right up to the moment it is missing. The budget is the chair's and the taste seat's;
-    the exemption has to be somebody's job to surface."""
+    """Compliance phrasing is precisely what a summariser drops"""
     body = collapsed("record")
 
     assert "verbatim" in body
@@ -271,42 +201,26 @@ def test_the_record_seat_owns_the_verbatim_obligations():
 
 @pytest.mark.parametrize("seat", ("record", "blast"))
 def test_a_forcing_seat_is_told_its_reason_may_be_what_the_user_reads(seat):
-    """Panel deliberation is stored and inspectable, and never pushed. On a forced
-    escalation the chair does not run and the forcing seat's own `reason` IS what the user
-    reads, so "name no seat" has to be in the mandate of the seats that can force it — not
-    only in the chair's.
-
-    `taste` is excluded rather than forgotten: it can force nothing, so its words never
-    reach a user except through the chair, which carries the instruction already.
-    """
+    """Panel deliberation is stored and inspectable, and never pushed"""
     body = collapsed(seat)
 
     assert "name no seat" in body or "do not name the seats" in body
 
 
 def test_the_chair_is_told_not_to_narrate_the_panel():
-    """Panel deliberation is stored and inspectable on demand, and NEVER pushed. The
-    chair's output is the whole of what a worker and a user receive, so the instruction
-    has to be in the mandate, not just in the code that does not forward it."""
-    # Collapsed, because the mandate is hard-wrapped prose and the sentences under test
-    # straddle line breaks.
+    """Panel deliberation is stored and inspectable on demand, and NEVER pushed"""
+    # Collapsed, because the mandate is hard-wrapped prose and the sentences under test straddle line...
     body = " ".join((SEAT_DIR / "chair.md").read_text().lower().split())
 
     assert "do not name the seats" in body
     assert "they are never pushed" in body
 
 
-# -- the seam: neo must never know panels exist -------------------------------------------
+# -- the seam: neo must never know panels exist
 
 
 def test_neo_never_imports_the_panel():
-    """Implemented as the design words it — `answer_question` becoming a caller of the
-    panel, with a fallback to the single agent — this is an import cycle, in a codebase
-    that has none. The seam is `drain_queue(answer=…)` instead.
-
-    Walked as an AST rather than checked in `sys.modules`: this codebase's style is lazy
-    imports inside function bodies, which a loaded-modules check cannot see.
-    """
+    """Implemented as the design words it"""
     tree = ast.parse(Path(neo_mod.__file__).read_text())
     imported: list[str] = []
     for node in ast.walk(tree):
@@ -319,8 +233,7 @@ def test_neo_never_imports_the_panel():
 
 
 def test_drain_queue_answers_through_the_injected_callable(store, fake_claude):
-    """The seam itself, with no panel involved: whatever the daemon passes is what
-    answers, and passing nothing is the single agent."""
+    """The seam itself, with no panel involved: whatever the daemon passes is what answers"""
     store.ask("proj_a", "wo-1", "which delimiter?")
     seen = []
 
@@ -335,12 +248,11 @@ def test_drain_queue_answers_through_the_injected_callable(store, fake_claude):
     assert not headless(fake_claude), "the injected answerer replaced the model call"
 
 
-# -- the contract at the boundary ----------------------------------------------------------
+# -- the contract at the boundary
 
 
 def test_decide_returns_the_verdict_shape_plus_exactly_one_key(store, fake_claude):
-    """Nothing downstream needs to know a panel ran. `deliver`, the gate path and the plan
-    path all read by key, so ADDING one is safe and changing the shape is not."""
+    """Nothing downstream needs to know a panel ran"""
     q = claim(store, "which delimiter?")
 
     result = panel.decide(store, q, cfg())
@@ -361,17 +273,11 @@ def test_every_seats_contribution_is_recorded(store, fake_claude):
     assert rows["premise"]["route"] == "panel"
 
 
-# -- blindness -----------------------------------------------------------------------------
+# -- blindness
 
 
 def test_the_seats_run_blind_and_only_the_chair_sees_them(store, fake_claude):
-    """R3, diffusion of responsibility: a panel that agrees with itself is an expensive
-    single agent. Agreement is only evidence if no seat could see another's answer.
-
-    The chair is the deliberate exception — synthesising is its entire job — and asserting
-    that in the same test is what stops the first half from passing for a run in which the
-    seats produced nothing to leak.
-    """
+    """R3, diffusion of responsibility: a panel that agrees with itself is an expensive single agent"""
     q = claim(store, "which delimiter?")
     panel.decide(store, q, cfg())
 
@@ -392,9 +298,7 @@ def test_the_seats_run_blind_and_only_the_chair_sees_them(store, fake_claude):
 
 def test_a_seats_system_prompt_is_its_own_mandate_and_its_own_learnings(store,
                                                                        fake_claude):
-    """Byte-stable PER SEAT — each seat keeps its own cached prompt prefix, which is what
-    makes running them in parallel free rather than a cache miss per seat. And the 50
-    learnings stop being one shared budget: each seat carries only what it needs."""
+    """Byte-stable PER SEAT — each seat keeps its own cached prompt prefix"""
     store.add_learning("Always default to CSV", project="proj_a")
     store.add_learning("A grep naming shipit ships nothing", project="proj_a",
                        seat="premise")
@@ -408,19 +312,16 @@ def test_a_seats_system_prompt_is_its_own_mandate_and_its_own_learnings(store,
     # The seat-scoped learning is the premise seat's alone...
     assert "A grep naming shipit ships nothing" not in systems["chair"]
     assert "Always default to CSV" in systems["chair"]
-    # ...and it never reaches the single agent, whose prefix has to stay byte-stable.
+    # ...and it never reaches the single agent, whose prefix has to stay byte-stable
     assert "A grep naming shipit ships nothing" not in neo_mod.build_system_prompt(
         store, "proj_a")
 
 
-# -- the fast path -------------------------------------------------------------------------
+# -- the fast path
 
 
 def test_a_dismissed_gate_costs_exactly_one_call(store, fake_claude):
-    """The arithmetic the whole design turns on. ~95% of gate reviews are classifier false
-    positives; if each cost a premise call AND a chair call, the panel would be a 2x cost
-    and latency regression on Neo's highest-volume channel. On `route=fast` the premise
-    seat's own reply IS the verdict."""
+    """The arithmetic the whole design turns on. ~95% of gate reviews are classifier false positives"""
     q = claim(store, GATE_QUESTION + "FORCE_ROUTE_FAST FORCE_PROPOSE_DISMISS",
               kind="approval")
 
@@ -436,12 +337,7 @@ def test_a_dismissed_gate_costs_exactly_one_call(store, fake_claude):
 
 
 def test_an_approval_can_never_be_approved_on_the_fast_route(store, fake_claude):
-    """The safety rule that pays for the fast path, and it is in CODE, not in a prompt.
-
-    A real privileged action always costs the full panel — the fast route skips the seat
-    that owns the blast radius, so the one verdict it must never be able to reach is the
-    one that opens a gate.
-    """
+    """The safety rule that pays for the fast path, and it is in CODE, not in a prompt"""
     q = claim(store, GATE_QUESTION + "FORCE_ROUTE_FAST FORCE_PROPOSE_APPROVE",
               kind="approval")
 
@@ -456,14 +352,12 @@ def test_an_approval_can_never_be_approved_on_the_fast_route(store, fake_claude)
 
 
 def test_the_rule_holds_however_the_premise_seat_routed():
-    """The rule as a rule, not as a consequence of the routing above it. Written out so
-    that relaxing the `dismiss`-only clause cannot silently open the gate as a side
-    effect."""
+    """The rule as a rule, not as a consequence of the routing above it"""
     assert panel.fast_is_permitted("approval", "approved") is False
     assert panel.fast_is_permitted("approval", "dismissed") is True
     assert panel.fast_is_permitted("approval", "denied") is False
     assert panel.fast_is_permitted("approval", "") is False
-    # An open question authorises nothing by construction, so it is always fast-eligible.
+    # An open question authorises nothing by construction, so it is always fast-eligible
     assert panel.fast_is_permitted("question", "") is True
     assert panel.fast_is_permitted("question", "denied") is True
 
@@ -494,14 +388,7 @@ def test_the_panel_route_calls_the_chair(store, fake_claude):
 
 
 def test_a_premise_reply_with_no_route_runs_the_panel(store, fake_claude):
-    """Fail toward the expensive-but-safe side.
-
-    This is also the assertion that catches a fake-`claude` collision: seat identity
-    travels in the system prompt, so a premise call on a gate question would
-    otherwise hit the fake's "PRIVILEGED ACTION REQUEST" branch and come back as a
-    well-formed gate verdict with no `route` key at all — after which a lenient `decide`
-    defaults the route and the whole fast-path suite passes having exercised nothing.
-    """
+    """Fail toward the expensive-but-safe side"""
     q = claim(store, GATE_QUESTION + "FORCE_NO_ROUTE FORCE_PROPOSE_DISMISS",
               kind="approval")
 
@@ -529,18 +416,11 @@ def test_the_fast_path_can_be_turned_off_entirely(store, fake_claude):
     assert result["panel"]["route"] == "panel"
 
 
-# -- degradation ------------------------------------------------------------------------
+# -- degradation
 
 
 def test_a_failed_premise_seat_falls_back_to_the_single_agent(store, fake_claude):
-    """A Neo outage must never become a fleet stall. The seat that routes could not
-    answer, so there is nothing to route on — and the single agent is a decision the OS
-    already trusts.
-
-    The system prompt is asserted BYTE-EQUAL to `neo.build_system_prompt`: the fallback
-    has to be today's path exactly, not a paraphrase of it, or the fallback quietly
-    becomes a third behaviour nobody measured.
-    """
+    """A Neo outage must never become a fleet stall"""
     fake_claude.fail_seat("premise")
     q = claim(store, "which delimiter?")
 
@@ -554,23 +434,13 @@ def test_a_failed_premise_seat_falls_back_to_the_single_agent(store, fake_claude
     assert not any(seat_of(c) == "chair" for c in calls)
     assert result["panel"]["route"] == "single"
     assert result["answer"].startswith("neo-decision")
-    # The abstention is still on the record: the seat ran and could not answer.
+    # The abstention is still on the record: the seat ran and could not answer
     assert [r["status"] for r in store.opinions(q["id"])] == ["abstained"]
 
 
 @pytest.fixture()
 def unship(monkeypatch, tmp_path):
-    """Make a seat's definition not ship, for this test only.
-
-    Every seat in the vocabulary now has a file, so the "a roster may name a seat this
-    build has no markdown for" path can no longer be reached from the roster alone — and
-    it is the path a catalog written ahead of a release actually takes. Rather than delete
-    the case, the seat directory is swapped for a copy with one file left out.
-
-    `definition` is `lru_cache`d, so the cache is cleared on the way in AND on the way out:
-    a cached read of the real file would defeat the swap, and leaving the swapped miss
-    cached would poison every later test in the session.
-    """
+    """Make a seat's definition not ship, for this test only"""
     def hide(*seats: str):
         d = tmp_path / "neo-seats"
         d.mkdir(exist_ok=True)
@@ -587,12 +457,7 @@ def unship(monkeypatch, tmp_path):
 
 def test_a_seat_with_no_definition_shipped_does_not_stall_the_drain(store, fake_claude,
                                                                     unship):
-    """A roster may name a seat whose markdown arrives in a later release — the catalog
-    validates against the VOCABULARY (`neo_store.SEATS`), not against this build.
-
-    Recorded `failed` rather than `abstained`, and that distinction is the point: a seat
-    that CANNOT run is not one that timed out, and only the second is degradation.
-    """
+    """A roster may name a seat whose markdown arrives in a later release"""
     unship("blast")
     q = claim(store, "which delimiter?")
 
@@ -606,9 +471,7 @@ def test_a_seat_with_no_definition_shipped_does_not_stall_the_drain(store, fake_
 
 
 def test_a_failed_chair_is_total_failure(store, fake_claude):
-    """`drain_queue` already rescues `ClaudeCliError` — it marks the question failed and
-    tells the worker — so the panel must raise it rather than invent a verdict. There is
-    no decision without the chair."""
+    """`drain_queue` already rescues `ClaudeCliError`"""
     from jarvis import claude_cli
 
     fake_claude.fail_seat("chair")
@@ -623,7 +486,7 @@ def test_a_failed_chair_is_total_failure(store, fake_claude):
     )
 
 
-# -- models and timeouts -------------------------------------------------------------------
+# -- models and timeouts
 
 
 def test_a_seat_runs_on_neos_model_unless_the_catalog_says_otherwise(store, fake_claude):
@@ -640,9 +503,7 @@ def test_a_seat_runs_on_neos_model_unless_the_catalog_says_otherwise(store, fake
 
 
 def test_the_per_seat_timeout_reaches_the_model_call(store, monkeypatch):
-    """`PanelConfig.timeout` is not decoration: without it every seat inherits the 300s
-    default and one wedged seat holds the whole FIFO drain, and every worker parked behind
-    it, for five minutes."""
+    """`PanelConfig.timeout` is not decoration: without it every seat inherits the 300s default and one..."""
     seen: list[int] = []
 
     def recorder(prompt, system_prompt=None, model=None, timeout=300, cwd=None,
@@ -660,13 +521,11 @@ def test_the_per_seat_timeout_reaches_the_model_call(store, monkeypatch):
 
 
 def test_the_default_seat_timeout_is_well_below_neos_own():
-    """Neo's call timeout is 300s and the seats run inside its single thread, so a
-    per-seat timeout at or near it buys nothing: the drain would still stall for the full
-    five minutes on one wedged seat."""
+    """Neo's call timeout is 300s and the seats run inside its single thread"""
     assert DEFAULT_PANEL_TIMEOUT < 300 / 2
 
 
-# -- the full roster -------------------------------------------------------------------------
+# -- the full roster
 
 
 def full(**panel_kwargs) -> NeoConfig:
@@ -676,15 +535,7 @@ def full(**panel_kwargs) -> NeoConfig:
 
 def test_the_full_roster_on_the_fast_route_still_costs_exactly_one_call(store,
                                                                        fake_claude):
-    """THE ARITHMETIC THE WHOLE DESIGN TURNS ON, and the reason `decide` runs the premise
-    seat FIRST AND ALONE rather than fanning the roster out in one blind round.
-
-    ~95% of gate reviews are classifier false positives. A single round over four seats
-    would decide the route only after paying for the three seats the route exists to skip
-    — turning the fast path from a 1-call answer into a 4-call one on the OS's
-    highest-volume channel, which is worse than the 2x regression the fast path was
-    introduced to prevent.
-    """
+    """THE ARITHMETIC THE WHOLE DESIGN TURNS ON"""
     q = claim(store, GATE_QUESTION + "FORCE_ROUTE_FAST FORCE_PROPOSE_DISMISS",
               kind="approval")
 
@@ -718,9 +569,7 @@ def test_the_full_panel_runs_every_seat_and_then_the_chair(store, fake_claude):
 
 def test_the_later_seats_are_blind_to_the_premise_seat_that_ran_before_them(store,
                                                                            fake_claude):
-    """Second in wall-clock order is not second in knowledge. The premise seat runs first
-    so that the route can be decided before the rest are paid for — that ordering must not
-    quietly turn the panel into a relay, where agreement is an echo rather than evidence."""
+    """Second in wall-clock order is not second in knowledge"""
     q = claim(store, "which delimiter?")
     panel.decide(store, q, full())
 
@@ -741,9 +590,7 @@ def test_the_later_seats_are_blind_to_the_premise_seat_that_ran_before_them(stor
 
 def test_each_seat_runs_on_its_own_model_and_the_rest_fall_back_to_the_fleet_default(
         store, fake_claude):
-    """Most specific wins: the per-seat map, then `chair_model` for the chair, then Neo's
-    model. The chair should be able to keep the expensive model when the seats do not — it
-    is the one writing what a human reads."""
+    """Most specific wins: the per-seat map, then `chair_model` for the chair, then Neo's model"""
     config = NeoConfig(model="opus", panel=PanelConfig(
         enabled=True, roster=FULL_ROSTER, seat_models={"premise": "haiku"},
         chair_model="sonnet"))
@@ -759,15 +606,7 @@ def test_each_seat_runs_on_its_own_model_and_the_rest_fall_back_to_the_fleet_def
 
 
 def test_a_failed_seat_abstains_and_the_panel_proceeds_without_it(store, fake_claude):
-    """A Neo outage must never become a fleet stall. Unlike the premise seat — which
-    ROUTES, so its silence leaves nothing to route on and falls back to the single agent —
-    a seat in the middle of the round is simply absent, and absence is not consent.
-
-    `taste`, and it has to be `taste`: it is the one seat in the roster that can force
-    nothing, so losing it costs the decision no authority. A seat that could have VETOED
-    is a different case and is no longer allowed to be absent — see the test below and
-    docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §3.
-    """
+    """A Neo outage must never become a fleet stall (docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §3.)"""
     fake_claude.fail_seat("taste")
     q = claim(store, "which delimiter?")
 
@@ -785,14 +624,7 @@ def test_a_failed_seat_abstains_and_the_panel_proceeds_without_it(store, fake_cl
 
 @pytest.mark.parametrize("seat", ["blast", "record"])
 def test_an_unreachable_veto_seat_takes_no_verdict_at_all(store, fake_claude, seat):
-    """The user's ruling via Neo, question 436: a silent veto seat is a shrunken quorum.
-
-    `blast` owns the blast radius and `record` owns the record. Unreached, neither can
-    exercise its veto, so the chair would synthesise a verdict the full panel might have
-    blocked. There is no verdict without them: `decide` raises, and `drain_queue`
-    re-queues the question rather than letting anything downstream act on a decision a
-    seat short.
-    """
+    """The user's ruling via Neo, question 436: a silent veto seat is a shrunken quorum"""
     fake_claude.fail_seat(seat)
     q = claim(store, "which delimiter?")
 
@@ -805,7 +637,7 @@ def test_an_unreachable_veto_seat_takes_no_verdict_at_all(store, fake_claude, se
 
 
 def test_an_approval_gate_is_never_settled_a_veto_seat_short(store, fake_claude):
-    """The case the rule exists for: the verdict here would CLOSE A GATE."""
+    """The case the rule exists for: the verdict here would CLOSE A GATE"""
     fake_claude.fail_seat("blast")
     q = claim(store, "may I merge this?", kind="approval")
 
@@ -813,18 +645,13 @@ def test_an_approval_gate_is_never_settled_a_veto_seat_short(store, fake_claude)
         panel.decide(store, q, full())
 
 
-# -- review round 2: a veto seat the WINDOW refused ------------------------------------
+# -- review round 2: a veto seat the WINDOW refused
 
 
 @pytest.mark.parametrize("seat", ["blast", "record"])
 def test_a_refused_veto_seat_raises_the_usage_limit_not_a_generic_outage(
         store, fake_claude, seat):
-    """REVIEW ROUND 2. A spent window is a THIRD answer to "was this seat reached".
-
-    Raised generically it lands in `drain_queue`'s transport branch and burns all three
-    retries in twenty minutes against a window measured in hours — issue #235, the shape
-    spec §1 says never to repeat. It must carry the refusal, and with it `reset_at`.
-    """
+    """REVIEW ROUND 2 (#235)"""
     fake_claude.refuse_seat(seat)
     q = claim(store, "which delimiter?")
 
@@ -842,9 +669,7 @@ def test_a_refused_veto_seat_raises_the_usage_limit_not_a_generic_outage(
 
 def test_a_refused_veto_seat_is_recorded_as_refused_by_the_real_seat_runner(
         store, fake_claude):
-    """The chain under the test above, driven rather than assumed: the fake emits the
-    real result JSON, `claude_cli.usage_limit` classifies it, `_run_seat` carries it on
-    `Opinion.refused`, and `refused_veto_seats` reads THAT — not a status string."""
+    """The chain under the test above"""
     fake_claude.refuse_seat("blast")
     q = claim(store, "which delimiter?")
 
@@ -875,9 +700,7 @@ def test_a_refused_veto_seat_is_recorded_as_refused_by_the_real_seat_runner(
 
 
 def test_a_refusal_at_a_seat_that_can_force_nothing_still_decides(store, fake_claude):
-    """The control. `taste` holds no veto, so losing it to the window costs the decision
-    no authority — and a rule that held the question for ANY refused seat would stall
-    the queue on the one seat whose silence is harmless."""
+    """The control"""
     fake_claude.refuse_seat("taste")
     q = claim(store, "which delimiter?")
 
@@ -890,15 +713,7 @@ def test_a_refusal_at_a_seat_that_can_force_nothing_still_decides(store, fake_cl
 
 def test_a_transport_fault_at_a_veto_seat_is_caught_however_it_is_recorded(
         store, fake_claude):
-    """REVIEW ROUND 1. The predicate must key on whether the seat was REACHED, not on
-    the word its status happens to carry.
-
-    This drives the REAL `seats._run_seat` construction site with an injected
-    `ClaudeCliError` and asserts the recorded Opinion carries `replied=False` and is NOT
-    marked `unavailable` — the two facts `unreachable_veto_seats` actually reads. A
-    version keyed on `status == "abstained"` passes today and silently stops working the
-    moment that `except` records any other word.
-    """
+    """REVIEW ROUND 1"""
     fake_claude.fail_seat("blast")
     q = claim(store, "which delimiter?")
 
@@ -929,13 +744,7 @@ def test_a_transport_fault_at_a_veto_seat_is_caught_however_it_is_recorded(
 
 def test_the_never_shipped_seat_is_exempt_by_its_marker_not_by_its_status(
         store, fake_claude, unship):
-    """The other half of round 1: the exemption must be driven by the real site too.
-
-    `_round`'s `SeatError` branch is the ONE place `unavailable` is set. A seat with no
-    markdown in this build was never reached either, but no retry will ever change that,
-    so it must NOT re-queue the question — while a seat that merely could not be called
-    must.
-    """
+    """The other half of round 1: the exemption must be driven by the real site too"""
     unship("blast")
     q = claim(store, "which delimiter?")
 
@@ -949,7 +758,7 @@ def test_the_never_shipped_seat_is_exempt_by_its_marker_not_by_its_status(
 
     monkeypatch_round(panel, spy)
     try:
-        # It does NOT raise: the round completes and the chair synthesises.
+        # It does NOT raise: the round completes and the chair synthesises
         result = panel.decide(store, q, cfg(roster=("premise", "blast", "chair")))
     finally:
         monkeypatch_round(panel, real_round)
@@ -961,18 +770,15 @@ def test_the_never_shipped_seat_is_exempt_by_its_marker_not_by_its_status(
 
 
 def monkeypatch_round(module, fn):
-    """Swap `panel._round`. A plain setattr, named so the two tests above read as one
-    intent rather than as two rebindings of a private."""
+    """Swap `panel._round`"""
     module._round = fn                                             # noqa: SLF001
 
 
-# -- arbitration, end to end through `decide` ----------------------------------------------
+# -- arbitration, end to end through `decide`
 
 
 def test_a_forced_escalation_skips_the_chair_entirely(store, fake_claude):
-    """The arbitration is not advice to the chair, it is the decision. Asserting the chair
-    NEVER RAN is what distinguishes "the code forced this" from "the chair happened to
-    agree" — and the second is the prompt luck this feature exists to remove."""
+    """The arbitration is not advice to the chair, it is the decision"""
     q = claim(store, "FORCE_RADIUS_ESCALATE which delimiter?")
 
     result = panel.decide(store, q, full())
@@ -989,12 +795,7 @@ def test_a_forced_escalation_skips_the_chair_entirely(store, fake_claude):
 
 
 def test_a_veto_turns_a_proposed_dismissal_into_an_escalation(store, fake_claude):
-    """The row that matters most in practice: the premise seat proposed clearing a gated
-    command, and the seat that owns the blast radius says it really does run the thing.
-
-    The proposal is DEMOTED — to the user, not to a denial that tells a worker it
-    misbehaved over an OS bug, and above all not to the approval it was raised against.
-    """
+    """The row that matters most in practice: the premise seat proposed clearing a gated command"""
     q = claim(store, GATE_QUESTION + "FORCE_PROPOSE_DISMISS FORCE_RADIUS_VETO",
               kind="approval")
 
@@ -1017,10 +818,7 @@ def test_an_unresolvable_contradiction_forces_the_escalation(store, fake_claude)
 
 
 def test_the_premise_seat_escalating_on_the_panel_route_forces_it_too(store, fake_claude):
-    """Ruled by Neo on question 59: the veto table enumerates forcing powers, not
-    prohibitions, and escalate is the fail-safe direction, so the design's own line that
-    "any seat that later returns escalate wins" governs. `taste` stays the exception, and
-    the test below is where that is pinned."""
+    """Ruled by Neo on question 59: the veto table enumerates forcing powers"""
     q = claim(store, "FORCE_FRAME_ESCALATE which delimiter?")
 
     result = panel.decide(store, q, full())
@@ -1030,12 +828,7 @@ def test_the_premise_seat_escalating_on_the_panel_route_forces_it_too(store, fak
 
 
 def test_the_taste_seat_objecting_does_not_stop_the_chair(store, fake_claude):
-    """THE NEGATIVE CONTROL, END TO END. The taste seat escalates AND vetoes, as loudly as
-    its reply shape allows, and the panel carries on to the chair regardless.
-
-    Its objection is stored in the same breath, which is what stops this passing for a run
-    in which the seat never opined: the seat spoke, it was recorded, and it forced nothing.
-    """
+    """THE NEGATIVE CONTROL, END TO END"""
     q = claim(store, "FORCE_INTENT_ESCALATE which delimiter?")
 
     result = panel.decide(store, q, full())
@@ -1047,13 +840,12 @@ def test_the_taste_seat_objecting_does_not_stop_the_chair(store, fake_claude):
     assert result["answer"] == json.loads(rows["chair"]["reply"])["answer"]
 
 
-# -- end to end, through the daemon, with the panel enabled ---------------------------------
+# -- end to end, through the daemon, with the panel enabled
 
 
 @pytest.fixture()
 def panel_daemon(jarvis_home, fake_claude, tmp_path, project, claude_json):
-    """The daemon with `os.neo.panel.enabled = true`. Nothing else in the suite does
-    this; the default catalog leaves the panel off."""
+    """The daemon with `os.neo.panel.enabled = true`"""
     path = tmp_path / "catalog-panel.json"
     path.write_text(json.dumps({
         "os": {"defaults": {"model": "sonnet"},
@@ -1068,12 +860,7 @@ def panel_daemon(jarvis_home, fake_claude, tmp_path, project, claude_json):
 
 def test_the_deliberation_never_reaches_the_worker_or_the_inbox(panel_daemon, project,
                                                                 fake_claude):
-    """The design's hard line, end to end, on a real panel run.
-
-    BOTH HALVES MATTER. Without the opinions assertion, "the message names no seat" passes
-    perfectly for a run in which nothing deliberated at all — which is exactly what a
-    default-configured OS does, since the panel ships disabled.
-    """
+    """The design's hard line, end to end, on a real panel run"""
     daemon = panel_daemon
     wo = ops.create_work_order("proj_a", "build the exporter")
     daemon.tick()
@@ -1111,9 +898,7 @@ def test_the_deliberation_never_reaches_the_worker_or_the_inbox(panel_daemon, pr
 
 @pytest.fixture()
 def full_panel_daemon(jarvis_home, fake_claude, tmp_path, project, claude_json):
-    """The daemon with the WHOLE roster rostered. The fixture above runs the shipped
-    default (`premise` + chair); this is the configuration the three new seats only ever
-    run under."""
+    """The daemon with the WHOLE roster rostered"""
     path = tmp_path / "catalog-full-panel.json"
     path.write_text(json.dumps({
         "os": {"defaults": {"model": "sonnet"},
@@ -1128,12 +913,7 @@ def full_panel_daemon(jarvis_home, fake_claude, tmp_path, project, claude_json):
 
 def test_a_full_panels_deliberation_never_reaches_the_worker(full_panel_daemon, project,
                                                              fake_claude):
-    """The design's hard line, on a run where all four seats really did deliberate.
-
-    BOTH HALVES MATTER, and here the first one is load-bearing in a way it was not with
-    two seats: without the opinions assertion, "the message names no seat" passes
-    perfectly for a run in which `record`, `blast` and `taste` never opened their mouths.
-    """
+    """The design's hard line, on a run where all four seats really did deliberate"""
     daemon = full_panel_daemon
     wo = ops.create_work_order("proj_a", "build the exporter")
     daemon.tick()
@@ -1163,13 +943,7 @@ def test_a_full_panels_deliberation_never_reaches_the_worker(full_panel_daemon, 
 
 def test_a_forced_escalation_reaches_the_inbox_naming_no_seat(full_panel_daemon, project,
                                                               fake_claude):
-    """The path a forced escalation actually travels, and the one where a leak would be
-    most likely: the chair does not run, so the line the user reads is a seat's own words,
-    quoted by code rather than rewritten by a model.
-
-    The control is the last assertion — the deliberation IS on file and readable — which
-    is what proves the seats were absent from the inbox rather than absent full stop.
-    """
+    """The path a forced escalation actually travels"""
     daemon = full_panel_daemon
     wo = ops.create_work_order("proj_a", "build the exporter")
     daemon.tick()
@@ -1203,13 +977,7 @@ def test_a_forced_escalation_reaches_the_inbox_naming_no_seat(full_panel_daemon,
 
 def test_a_dismissed_gate_reaches_the_worker_through_the_normal_path(
         jarvis_home, fake_claude, tmp_path, project, claude_json):
-    """The additive `panel` key, through the delivery path it will actually meet.
-
-    Gate reviews are Neo's highest-volume channel and ~95% of them are classifier false
-    positives, so this is the decision the fast path was built for. Every consumer of a
-    verdict reads it BY KEY, which is what makes adding one safe — and this is the test
-    that would notice if one of them started reading it by shape instead.
-    """
+    """The additive `panel` key, through the delivery path it will actually meet"""
     from jarvis import gates
 
     path = tmp_path / "catalog-panel-gates.json"
@@ -1243,9 +1011,7 @@ def test_a_dismissed_gate_reaches_the_worker_through_the_normal_path(
 
 def test_a_plan_review_is_not_routed_through_the_panel_by_default(panel_daemon, store,
                                                                   fake_claude):
-    """`kinds` defaults to question + approval. A feature order's plan review has its own
-    reviewed persona that the seats' mandates say nothing about, so enabling the panel
-    must not silently swap one for the other."""
+    """`kinds` defaults to question + approval"""
     answer = panel_daemon._panel_answer(panel_daemon.catalog.os.neo)
     q = claim(store, "Release this plan? FORCE_APPROVE", kind="plan")
 
@@ -1257,8 +1023,7 @@ def test_a_plan_review_is_not_routed_through_the_panel_by_default(panel_daemon, 
 
 
 def test_with_the_panel_disabled_the_daemon_injects_nothing(started_default_catalog):
-    """The seam's off switch, at the one place it is wired: `drain_queue` falls back to
-    its own default, so a disabled panel is not a code path at all."""
+    """The seam's off switch, at the one place it is wired: `drain_queue` falls back to its own default"""
     daemon = started_default_catalog
 
     assert daemon._panel_answer(daemon.catalog.os.neo) is None

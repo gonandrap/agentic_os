@@ -33,9 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from jarvis import usage  # noqa: E402
 
-#: Not re-derived here. `invariants.check_cache_ttl_trigger` takes the same decision on
-#: the same break-even, and two spellings of one ratio is how the two surfaces come to
-#: disagree about when to switch.
+#: Not re-derived here
 TRIGGER = usage.TTL_BREAK_EVEN
 
 
@@ -56,17 +54,14 @@ def main(argv: list[str] | None = None) -> int:
     since = args.since if args.since is not None else now - args.days * 86400
     until = args.until if args.until is not None else now
 
-    # Resolved once, and loudly: with no catalog registered this raises rather than
-    # classifying every boundary against a threshold nobody configured.
+    # Resolved once, and loudly: with no catalog registered this raises rather than classifying every...
     from jarvis.ops import resolve_catalog
     floor = resolve_catalog().os.cold_prefix_floor
 
     total = usage.Usage()
     sessions = 0
     for session_id, paths in usage.index_sessions().items():
-        # A session belongs to the cohort it STARTED in: its turns are one conversation
-        # and splitting them across windows would attribute a boundary to a window whose
-        # configuration did not produce it.
+        # A session belongs to the cohort it STARTED in: its turns are one conversation and splitting them...
         started, _ = usage._time_span(sorted(paths)[0])
         if not started or not (since <= started < until):
             continue
@@ -92,11 +87,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"    TTL expired      {total.rewrite_ttl_excess:>15,}  "
           f"{total.boundaries_ttl} boundaries — a longer TTL buys this back")
 
-    # THE TRIGGER'S DENOMINATOR IS EVERY WRITTEN TOKEN, NOT THE TAX. Switching pays the
-    # 1h premium on the whole cache-write line, so the share that decides it is
-    # W_ttl/cache_write. The share OF THE TAX is a much larger number about a much
-    # smaller base, and reading one against the other says "nearly worth switching" when
-    # the truth is "off by a factor of two" — which is how this script earned its place.
+    # THE TRIGGER'S DENOMINATOR IS EVERY WRITTEN TOKEN, NOT THE TAX
     ttl_write = total.rewrite_ttl_write
     decisive = ttl_write / total.cache_write if total.cache_write else 0.0
     saving = (usage.CACHE_WRITE_RATE - usage.CACHE_READ_RATE) * ttl_write

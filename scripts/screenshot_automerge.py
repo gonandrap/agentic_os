@@ -1,15 +1,4 @@
-"""Screenshot the work-order page's automatic-merge line, for a PR's UI evidence.
-
-Three states on one page, because the line is the whole of what the user sees of this
-feature and "the tests passed" says nothing about what it reads like: a merge the OS
-performed, a merge it is waiting for permission to perform, and one it is holding
-because the head moved after the panel accepted a commit.
-
-Writes PNGs to docs/screenshots/. Everything it touches lives in a temp `JARVIS_HOME`
-and a temp catalog, so it never reads or writes the live OS:
-
-    uv run python scripts/screenshot_automerge.py
-"""
+"""Screenshot the work-order page's automatic-merge line, for a PR's UI evidence"""
 
 from __future__ import annotations
 
@@ -31,7 +20,7 @@ PUSHED = "e4f5a6b7c8d90112233445566778899aabbccdde"
 
 
 def _repo(path: Path) -> None:
-    """An empty checkout, the shape `testing.make_git_project` builds for the suite."""
+    """An empty checkout, the shape `testing.make_git_project` builds for the suite"""
     import subprocess
 
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
@@ -39,7 +28,7 @@ def _repo(path: Path) -> None:
 
 
 def order(store, title: str, *, judged: str, events: list[tuple[str, dict]]) -> str:
-    """One finished work order parked behind a pull request, with a settled round."""
+    """One finished work order parked behind a pull request, with a settled round"""
     from jarvis import ops
 
     wo = ops.create_work_order("jarvis_os", title,
@@ -47,9 +36,7 @@ def order(store, title: str, *, judged: str, events: list[tuple[str, dict]]) -> 
                                "itself, but only once the validation panel has "
                                "accepted that exact diff.")
     ops.finish(wo["id"], "opened a pull request", pr_url=PR)
-    # The round `finish` already opened, settled — not a second one beside it: two rows
-    # would put a permanently `pending` round on the page and make the shot a picture of
-    # a bug rather than of the line being demonstrated.
+    # The round `finish` already opened, settled
     round_row = store.latest_validation_round(wo_id=wo["id"]) \
         or store.open_validation_round(wo_id=wo["id"], fingerprint="7c1f9a2e04b3")
     store.set_validation_head(round_row["id"], judged)
@@ -62,8 +49,7 @@ def order(store, title: str, *, judged: str, events: list[tuple[str, dict]]) -> 
                                     model="claude-opus-5", latency_ms=22100)
     for kind, payload in events:
         store.add_event(wo["id"], kind, payload)
-    # Where the poll finds it: parked behind the pull request, or completed once the OS
-    # has merged it. `ops.finish` left it `validating` while the round was open.
+    # Where the poll finds it: parked behind the pull request, or completed once the OS has merged it
     store.set_status(wo["id"],
                      "completed" if events[0][0] == "automerge_merged"
                      else "waiting_pr_merge")
@@ -78,8 +64,7 @@ def seed() -> tuple[Path, list[str]]:
     home = Path(tempfile.mkdtemp())
     project = home / "jarvis_os"
     project.mkdir(parents=True)
-    # A real repository, because `ops.start_os` registers a project by adopting its
-    # checkout — the same thing `testing.make_git_project` does for the suite.
+    # A real repository, because `ops.start_os` registers a project by adopting its checkout
     _repo(project)
     catalog = home / "catalog.json"
     catalog.write_text(json.dumps({
@@ -134,7 +119,7 @@ def shoot(ids: list[str]) -> None:
         for name, wo_id in zip(names, ids):
             page.goto(f"{base}/wo/jarvis_os/{wo_id}")
             page.screenshot(path=SHOTS / f"{name}.png")
-        # The commit on the round itself, which is the other surface this touches.
+        # The commit on the round itself, which is the other surface this touches
         page.goto(f"{base}/wo/jarvis_os/{ids[1]}")
         page.locator("h2", has_text="Validation").first.scroll_into_view_if_needed()
         page.wait_for_timeout(200)

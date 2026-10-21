@@ -1,39 +1,4 @@
-"""What a TYPICAL order costs — the distribution `jarvis cost` could never report.
-
-`ops.cost_report` is a LISTING: one row per order, dearest first, and a listing has no
-place to put a population statistic or a time window. So this adds a section rather than
-re-shaping rows, and it lives in its own module for one hard reason: every database here
-is opened `mode=ro` through `compaction_payoff.connect_ro`, and `ops` constructs
-`ProjectStore`, whose `__init__` runs `_migrate()` (project_store.py:118). A report must
-not migrate the thing it is measuring.
-
-Deterministic and read-only: no model call, no write, no `ProjectStore`.
-
-Spec §2-§5 of docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md.
-
-TWO RULES THAT OVERRIDE THE SPEC AS WRITTEN, decided after it was reviewed:
-
-  * MONEY OVER A MIXED POPULATION IS NEVER BLENDED (kn-e6bb1166 ruling 2).
-    `wo_turns.cost_source` splits the turns in two: the `envelope` turns (the `claude`
-    CLI's own `total_cost_usd`) are the headline figure, and the `transcript` turns — a
-    list-price FLOOR for a turn whose envelope never arrived, issue #471 — are a SECOND
-    figure with its own `n` and its own label. One average over both would be an average
-    of two currencies.
-  * `usage.BOUNDARY_UNDECIDED` is REPORTED, as its own count. All four causes
-    `usage.classify_boundaries` can return appear, so the boundary lines reconcile
-    against the transcript instead of quietly losing the ones no floor could decide.
-
-And three the spec states that are easy to lose in a refactor:
-
-  * IDLE IS EXCLUDED BY CONSTRUCTION. A turn's wall clock is its own
-    `ended_at - started_at`, so time between turns — waiting for a Neo answer, parked on
-    a usage limit, waiting for the user — is outside every interval. Nothing subtracts
-    idle because there is none to subtract.
-  * A RUNNING TURN (`ended_at IS NULL`) IS EXCLUDED and counted in `excluded.running`,
-    never counted as zero duration.
-  * `--since`/`--until` FILTER TURNS, not order creation. A long-running order is
-    TRUNCATED to its in-window turns, counted once, and marked.
-"""
+"""What a TYPICAL order costs — the distribution `jarvis cost` could never report (docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md)"""
 
 from __future__ import annotations
 
@@ -59,26 +24,23 @@ from jarvis.project_store import (
     TURN_KINDS,
 )
 
-#: Payload version. Bumped only when a key is REMOVED or re-meant; additive keys do not.
+#: Payload version
 PAYLOAD_VERSION = 1
 
-#: The kinds of `wo_turns` row that are a worker TURN. `compact` is a turn the OS paid
-#: for and the worker never saw, so it is counted on its own line and never here.
+#: The kinds of `wo_turns` row that are a worker TURN
 WORKER_TURN_KINDS = tuple(k for k in TURN_KINDS if k != COMPACT_TURN)
 
-#: Provenance labels — what KIND of number a metric is, in the payload and on screen.
+#: Provenance labels — what KIND of number a metric is, in the payload and on screen
 WO_TURNS, ENVELOPE, TRANSCRIPT, MIXED, RECORD = (
     "wo_turns", "envelope", "transcript", "mixed", "record")
 
-#: Units, so a renderer can format a figure without knowing which metric it is.
+#: Units, so a renderer can format a figure without knowing which metric it is
 USD, TOKENS, SECONDS, COUNT, SHARE = "usd", "tokens", "seconds", "count", "share"
 
-#: The four ways a value can be left OUT of a metric. Every metric carries all four, so
-#: a reader never has to wonder whether a missing key means zero or means unmeasured.
+#: The four ways a value can be left OUT of a metric
 EXCLUDED_KEYS = ("running", "unrecorded", "no_transcript", "os_unattributed_to_turn")
 
-#: Said in the payload rather than in a renderer, for `ops.COST_FLOOR_NOTE`'s reason: a
-#: caveat that appears in one surface and not another is one the reader learns to ignore.
+#: Said in the payload rather than in a renderer
 NOTES = (
     "idle is excluded by construction: a turn's wall clock is its own ended_at - "
     "started_at, so waiting between turns is outside every interval",
@@ -93,19 +55,14 @@ NOTES = (
 )
 
 
-# ---------------------------------------------------------------------------------------
 # The window
-# ---------------------------------------------------------------------------------------
 
-#: The windows a report can be asked for by NAME. §1 of
-#: docs/superpowers/specs/2026-10-07-cost-window-selector.md.
+#: The windows a report can be asked for by NAME. §1 of... (docs/superpowers/specs/2026-10-07-cost-window-selector.md)
 WEEK = "week"                       #: the Claude usage week
 SESSION = "5h"                      #: the 5-hour grid, anchored on the weekly reset
 WINDOW_NAMES = (WEEK, SESSION)
 
-#: Said in the payload rather than in a renderer, for `NOTES`' reason: nothing in the
-#: codebase or in the usage data records Claude's real 5h session boundary, so a 5h
-#: window here is a SLICE OF THE WEEK and not a claim about Anthropic's accounting (§2).
+#: Said in the payload rather than in a renderer
 SESSION_ANCHOR_NOTE = (
     "a 5h window is a 5h slice of the usage week, anchored on the weekly reset: no "
     "table and no transcript records Claude's own session boundary, so stepping back is "
@@ -115,21 +72,7 @@ SESSION_ANCHOR_NOTE = (
 
 
 def usage_week(now: float, cfg: CostConfig, offset: int = 0) -> tuple[float, float]:
-    """The Claude usage week containing `now`, as (since, until).
-
-    VERIFIED: the week resets Monday 21:00 America/Los_Angeles, so Mon 2026-09-28 21:00
-    PDT = 2026-09-29 04:00 UTC and the week of that date runs to 2026-10-06 04:00 UTC.
-    Day, hour and zone all come from `CostConfig` and never from a literal here: a DST
-    shift and an Anthropic policy change both move them.
-
-    The arithmetic is done on the LOCAL wall clock and converted once, so a week that
-    spans a DST change is still seven local days and still starts at the configured
-    hour — absolute arithmetic on an aware datetime would slide the reset by an hour.
-
-    `offset` steps back whole LOCAL weeks for the same reason, so a window spanning a
-    DST change is 167 or 169 absolute hours and still starts at the configured hour
-    (§4 of the window-selector spec).
-    """
+    """The Claude usage week containing `now`, as (since, until)"""
     zone = ZoneInfo(cfg.week_reset_zone)
     local = datetime.fromtimestamp(now, zone).replace(tzinfo=None)
     start = local.replace(hour=cfg.week_reset_hour, minute=0, second=0, microsecond=0)
@@ -143,7 +86,7 @@ def usage_week(now: float, cfg: CostConfig, offset: int = 0) -> tuple[float, flo
 
 def session_window(now: float, cfg: CostConfig,
                    offset: int = 0) -> tuple[float, float]:
-    """One 5h slice of the usage week — see `SESSION_ANCHOR_NOTE` for the anchor."""
+    """One 5h slice of the usage week — see `SESSION_ANCHOR_NOTE` for the anchor"""
     week_start, _ = usage_week(now, cfg)
     length = cfg.session_window_hours * 3600
     k = math.floor((now - week_start) / length)
@@ -153,15 +96,7 @@ def session_window(now: float, cfg: CostConfig,
 
 def meter_window(now: float, cfg: CostConfig,
                  offset: int = 0) -> tuple[float, float] | tuple[None, None]:
-    """The REAL 5h window, anchored on the account's own `five_hour_resets_at`.
-
-    `(None, None)` when no sample is fresh enough to anchor on — a fresh install has
-    none, and `session_window`'s week-anchored guess is the fallback (Neo q1501, answered
-    (a), §10). Measured 2026-10-08: the guess was 80 minutes out, and every per-window
-    figure was summed over the wrong span.
-
-    `offset < 0` steps back in whole 5h multiples FROM the real boundary.
-    """
+    """The REAL 5h window, anchored on the account's own `five_hour_resets_at`"""
     from . import usage_meter
 
     try:
@@ -176,13 +111,7 @@ def meter_window(now: float, cfg: CostConfig,
 
 
 def resolve_zone(tz: str | None, cfg: CostConfig) -> str:
-    """The IANA zone to DISPLAY a window in: `tz` when given and valid, else the catalog.
-
-    Its own function because the UI needs the zone BEFORE it can parse the custom form's
-    naive datetimes, so it cannot wait for `resolve_window` to return (§11 of
-    docs/superpowers/specs/2026-10-07-cost-window-selector.md). DISPLAY ONLY: the
-    boundaries stay anchored in `cfg.week_reset_zone` whatever this returns.
-    """
+    """The IANA zone to DISPLAY a window in: `tz` when given and valid, else the catalog (docs/superpowers/specs/2026-10-07-cost-window-selector.md)"""
     from jarvis.ops import OpsError
 
     if not tz:
@@ -190,7 +119,7 @@ def resolve_zone(tz: str | None, cfg: CostConfig) -> str:
     try:
         ZoneInfo(tz)
     except (ZoneInfoNotFoundError, ValueError):
-        # A refusal with a sentence, never a silent fallback to the default (§11).
+        # A refusal with a sentence, never a silent fallback to the default (§11)
         raise OpsError(f"tz must be an IANA time zone name — {tz!r} is not a zone this "
                        f"report knows") from None
     return tz
@@ -200,17 +129,7 @@ def resolve_window(*, window: str | None = None, offset: int = 0,
                    since: float | str | None = None,
                    until: float | str | None = None, tz: str | None = None,
                    cfg: CostConfig, now: float | None = None) -> dict[str, Any]:
-    """THE window resolver — one answer for the CLI, `--json` and the page.
-
-    Exactly one function interprets a window NAME (Neo q1420), and its eight keys are
-    the contract every surface reads. Resolved ONCE per surface and passed to both
-    payload builders: this is a function of `now`, so two calls a few milliseconds apart
-    can land either side of a boundary and the page would show two windows again.
-
-    A BAD PARAMETER IS A REFUSAL, never a silent fallback to the default week: a page
-    that ignored `?window=5x` would report the week while the reader believes they
-    picked 5h, which is the one failure mode a selector must not have (§3).
-    """
+    """THE window resolver — one answer for the CLI, `--json` and the page"""
     from jarvis.ops import OpsError
 
     zone = resolve_zone(tz, cfg)
@@ -239,19 +158,14 @@ def resolve_window(*, window: str | None = None, offset: int = 0,
             start, end = session_window(_now(now), cfg, offset)
     else:
         start, end = usage_week(_now(now), cfg, offset)
-        # The literal the existing template branch and CLI line already read, kept for
-        # the default so neither changes meaning (§1).
+        # The literal the existing template branch and CLI line already read
         source = "usage-week" if not offset else "week-offset"
     return _window(start, end, zone, source=source, window=window or WEEK, offset=offset)
 
 
 def window_of(since: float | str | None, until: float | str | None, cfg: CostConfig,
               *, now: float | None = None, tz: str | None = None) -> dict[str, Any]:
-    """The window to report over: the flags if given, else the current usage week.
-
-    A shim over `resolve_window`, kept because this signature is public: `report` calls
-    it and tests use it. One implementation, no broken caller.
-    """
+    """The window to report over: the flags if given, else the current usage week"""
     return resolve_window(
         since=since, until=until, tz=tz,
         window=None if (since is not None or until is not None) else WEEK,
@@ -286,12 +200,7 @@ def _stamp(when: float) -> str:
 
 
 def _local_label(since: float, until: float, zone: str) -> str:
-    """The same span in the DISPLAY zone — by default the clock the reset is specified in.
-
-    BOTH abbreviations when the ends differ: a single `%Z` across a DST transition is a
-    label that is wrong at one end (§4). Takes the zone NAME rather than the config
-    because the reader can pick a zone to read in (§11).
-    """
+    """The same span in the DISPLAY zone — by default the clock the reset is specified in"""
     tzinfo = ZoneInfo(zone)
     start = datetime.fromtimestamp(since, tzinfo)
     end = datetime.fromtimestamp(until, tzinfo)
@@ -302,13 +211,11 @@ def _local_label(since: float, until: float, zone: str) -> str:
     return f"{start.strftime(fmt)} to {end.strftime(fmt)} {end.tzname()}"
 
 
-# ---------------------------------------------------------------------------------------
 # Rows and populations
-# ---------------------------------------------------------------------------------------
 
 @dataclass
 class TurnRow:
-    """One `wo_turns` row inside the window, joined to its work order."""
+    """One `wo_turns` row inside the window, joined to its work order"""
 
     wo_id: str
     project: str
@@ -329,11 +236,7 @@ class TurnRow:
 
     @property
     def source(self) -> str | None:
-        """Which reading wrote `cost_usd`, or None for a turn with no cost on record.
-
-        NULL alongside a cost is a row written before the column existed and reads as
-        `envelope` — the only source there was (project_store.py:1002-1008).
-        """
+        """Which reading wrote `cost_usd`, or None for a turn with no cost on record"""
         if self.cost_usd is None:
             return None
         return self.cost_source or COST_FROM_ENVELOPE
@@ -341,7 +244,7 @@ class TurnRow:
 
 @dataclass
 class OrderStats:
-    """One order's in-window population: its turns, its compactions, its OS spend."""
+    """One order's in-window population: its turns, its compactions, its OS spend"""
 
     wo_id: str
     project: str
@@ -365,12 +268,7 @@ class OrderStats:
 
 def turn_rows(db_path: Path, since: float, until: float, *,
               project: str = "") -> list[TurnRow]:
-    """Every turn of every order whose `started_at` is in the window. Read-only.
-
-    EVERY kind, including `compact`: the caller splits them, because the two
-    denominators (per order, per worker turn) must never be mixed up by a filter that
-    happened earlier.
-    """
+    """Every turn of every order whose `started_at` is in the window"""
     conn = connect_ro(db_path)
     try:
         return [_row(r, project) for r in conn.execute(
@@ -405,11 +303,7 @@ def _json(raw: str | None) -> dict[str, Any] | None:
 
 
 def window_facts(db_path: Path, since: float, until: float) -> dict[str, Any]:
-    """What the window itself did to this project: how many orders, which were cut.
-
-    Separate from `turn_rows` because it asks about rows the window EXCLUDED, and a
-    loader that returned those would invite them into a metric.
-    """
+    """What the window itself did to this project: how many orders, which were cut"""
     conn = connect_ro(db_path)
     try:
         outside = {r["wo_id"] for r in conn.execute(
@@ -427,7 +321,7 @@ def window_facts(db_path: Path, since: float, until: float) -> dict[str, Any]:
 
 
 def per_order(rows: Iterable[TurnRow]) -> dict[str, OrderStats]:
-    """Group in-window turns by order. The PER-ORDER denominator."""
+    """Group in-window turns by order"""
     orders: dict[str, OrderStats] = {}
     for row in rows:
         stats = orders.get(row.wo_id)
@@ -443,17 +337,15 @@ def per_order(rows: Iterable[TurnRow]) -> dict[str, OrderStats]:
 
 
 def per_turn(rows: Iterable[TurnRow]) -> list[TurnRow]:
-    """The worker turns, compactions dropped. The PER-TURN denominator."""
+    """The worker turns, compactions dropped"""
     return [r for r in rows if r.kind in WORKER_TURN_KINDS]
 
 
-# ---------------------------------------------------------------------------------------
 # The one place n / avg / p90 / max are computed
-# ---------------------------------------------------------------------------------------
 
 @dataclass
 class Metric:
-    """A population statistic and everything needed to read it honestly."""
+    """A population statistic and everything needed to read it honestly"""
 
     n: int = 0
     avg: float | None = None
@@ -473,12 +365,7 @@ class Metric:
 
 def metric(values: Sequence[tuple[float, str]], *, percentile: float = 0.9,
            **detail: Any) -> Metric:
-    """n / avg / p90 / max over (value, wo_id) pairs. Empty is `n: 0`, never zeros.
-
-    p90 is NEAREST-RANK via `compaction_payoff.quantile` — one implementation of the
-    percentile in the OS, and one that always returns an observed value, so `max` and
-    `p90` can both name the order holding them.
-    """
+    """n / avg / p90 / max over (value, wo_id) pairs"""
     m = Metric(**detail)
     if not values:
         return m
@@ -491,19 +378,11 @@ def metric(values: Sequence[tuple[float, str]], *, percentile: float = 0.9,
     return m
 
 
-# ---------------------------------------------------------------------------------------
 # What only a transcript can say
-# ---------------------------------------------------------------------------------------
 
 def boundary_counts(session_id: str, floor: int | None,
                     index: dict[str, list[Path]] | None = None) -> dict[str, int]:
-    """The session's cold boundaries, split by CAUSE — all four of them.
-
-    `floor` is `os.cold_prefix_floor` and has no default anywhere (see `usage`'s note on
-    `TTL_BREAK_EVEN`): passing None is legal and means the TTL/prefix split is left OPEN,
-    which is what `undecided` counts. Dropping those would make the line unreconcilable
-    against the transcript, which is the whole point of reporting it.
-    """
+    """The session's cold boundaries, split by CAUSE — all four of them"""
     index = usage.index_sessions() if index is None else index
     files = sorted(index.get(session_id) or [])
     calls, compactions = [], []
@@ -523,11 +402,7 @@ def boundary_counts(session_id: str, floor: int | None,
 
 def subagent_share(session_id: str, floor: int, *,
                    index: dict[str, list[Path]] | None = None) -> float | None:
-    """What share of the session's own bill its Task-tool subagents were.
-
-    None, never 0.0, when there is no transcript left or nothing was spent: the question
-    is unanswerable there, and answering it with a zero is a claim.
-    """
+    """What share of the session's own bill its Task-tool subagents were"""
     session = usage.read_session(session_id, floor, index=index)
     if not session.found:
         return None
@@ -538,14 +413,7 @@ def subagent_share(session_id: str, floor: int, *,
 
 
 def rewrite_share(order: OrderStats) -> float | None:
-    """The re-write tax's share of one order's recorded spend, from the envelopes.
-
-    Every turn after the first re-sends the whole conversation at the cache-WRITE rate,
-    so the numerator is the cache-write tokens of the order's in-window turns after the
-    first, priced at the rate the envelope's own 1h/5m split says they paid
-    (`usage.priced`). The denominator is the order's recorded `envelope` spend. None when
-    either side is unknown — no envelope, or nothing recorded to be a share OF.
-    """
+    """The re-write tax's share of one order's recorded spend, from the envelopes"""
     turns = sorted(order.turns, key=lambda t: t.seq)[1:]
     spend = order.cost(COST_FROM_ENVELOPE)
     if not turns or spend <= 0:
@@ -565,29 +433,18 @@ def rewrite_share(order: OrderStats) -> float | None:
 
 
 def _model_of(envelope: dict[str, Any]) -> str:
-    """The turn's dominant model, or "" so `usage.price_for` uses its own default."""
+    """The turn's dominant model, or "" so `usage.price_for` uses its own default"""
     by_model = envelope.get("by_model") or []
     if isinstance(by_model, list) and by_model and isinstance(by_model[0], dict):
         return str(by_model[0].get("model") or "")
     return ""
 
 
-# ---------------------------------------------------------------------------------------
 # The OS's own spend
-# ---------------------------------------------------------------------------------------
 
 def os_by_kind(since: float, until: float,
                project: str | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Windowed `agent_calls`, by kind and dearest first, plus the unattributed line.
-
-    Through `CentralStore.agent_call_totals` (which gained `since=`/`until=` for this)
-    rather than a second query of my own: that method is where the OS's own spend is
-    summed, and two implementations of "what did Jarvis spend" would drift.
-
-    `observe_*` kinds appear with their real $0.00. A by-kind table that dropped its
-    zero-cost kinds could not be checked against `SELECT kind, count(*) FROM
-    agent_calls`, and reconciling is the point of the line.
-    """
+    """Windowed `agent_calls`, by kind and dearest first, plus the unattributed line"""
     from jarvis.central_store import CentralStore
 
     central = CentralStore()
@@ -613,14 +470,7 @@ def os_by_kind(since: float, until: float,
 
 def _os_calls(home: Path, since: float, until: float,
               project: str | None) -> list[dict[str, Any]]:
-    """Every attributable OS call in the window, with its `ts`. Read-only.
-
-    `agent_call_totals` is grouped and carries no timestamp, and attribution to a TURN is
-    by timestamp interval — `agent_calls` has no turn id (spec §9: the root cause is that
-    the OS does not stamp its own calls with the turn they were made during). So this
-    reads the rows themselves, and the payload discloses what could not be attributed
-    rather than hiding it.
-    """
+    """Every attributable OS call in the window, with its `ts`"""
     conn = connect_ro(home / "os.db")
     try:
         sql = ("SELECT wo_id, ts, cost_usd FROM agent_calls "
@@ -636,12 +486,7 @@ def _os_calls(home: Path, since: float, until: float,
 
 def _attribute(calls: Sequence[dict[str, Any]], orders: dict[str, OrderStats]
                ) -> tuple[dict[tuple[str, int], float], int]:
-    """OS spend per (wo_id, turn seq), and how many rows no turn contained.
-
-    A row belongs to the turn whose `[started_at, ended_at)` holds its `ts`. A row
-    between turns, or on an order with no in-window turn, is reported on the ORDER and
-    counted as unattributed-to-a-turn — hence "attributed to the turn where possible".
-    """
+    """OS spend per (wo_id, turn seq), and how many rows no turn contained"""
     by_turn: dict[tuple[str, int], float] = {}
     unattributed = 0
     for call in calls:
@@ -661,7 +506,7 @@ def _attribute(calls: Sequence[dict[str, Any]], orders: dict[str, OrderStats]
 
 
 def _neo_questions(since: float, until: float, project: str | None) -> dict[str, int]:
-    """Neo questions per work order, from `neo.db`, read-only."""
+    """Neo questions per work order, from `neo.db`, read-only"""
     path = paths.neo_db_path()
     if not path.exists():
         return {}
@@ -679,27 +524,9 @@ def _neo_questions(since: float, until: float, project: str | None) -> dict[str,
         conn.close()
 
 
-# ---------------------------------------------------------------------------------------
-# What a TOOL cost — §10
-#
-# The fleet's largest avoidable token line is tool output, and until this section no
-# surface in the OS could see it: the ledger above is keyed by API CALL, and a tool
-# result is not a call — it is a payload that rides along inside every SUBSEQUENT call's
-# prefix. That quantity is `carried cost`, and it is why counting result bytes
-# understates the problem: a 20k-token `sed -n` dump read 30 more times costs 600k
-# token-reads, not 20k.
-#
-# The WALK is `usage.tool_results` (a leaf: transcripts and prices, no store, no
-# catalog). Everything here is the aggregation: the command-shape classifier, the
-# carried-cost arithmetic and the fleet denominators.
-#
-# Spec §10 of docs/superpowers/specs/2026-10-06-fleet-cost-per-tool.md.
-# ---------------------------------------------------------------------------------------
+# What a TOOL cost — §10 (docs/superpowers/specs/2026-10-06-fleet-cost-per-tool.md)
 
-#: The Bash command SHAPES, in the order `classify_command` tests them. The axis is what
-#: PRODUCED the bytes, never what clipped them, so every producer is tested before
-#: `stream_head_tail` — which is the residual "output already clipped" bucket and the
-#: ~167 tok/call population the motivating measurement found was already fine.
+#: The Bash command SHAPES, in the order `classify_command` tests them
 SHAPE_PYTEST = "pytest"
 SHAPE_JARVIS = "jarvis"
 SHAPE_GIT_READ = "git_read"
@@ -711,15 +538,14 @@ SHAPE_OTHER = "other"
 SHAPES = (SHAPE_PYTEST, SHAPE_JARVIS, SHAPE_GIT_READ, SHAPE_SED_RANGE, SHAPE_CAT_FILE,
           SHAPE_SEARCH, SHAPE_STREAM, SHAPE_OTHER)
 
-#: Shell operators that CUT a command into segments, as standalone tokens.
+#: Shell operators that CUT a command into segments, as standalone tokens
 _OPERATORS = frozenset({"|", "||", "&&", ";", "|&", "&"})
 
-#: Stripped off the front of a segment before its head word is read. `uv` and `poetry`
-#: only with a following `run`: `uv sync` is not a wrapper around anything.
+#: Stripped off the front of a segment before its head word is read
 _WRAPPERS = frozenset({"sudo", "time", "env", "nohup", "xargs"})
 _RUNNERS = frozenset({"uv", "poetry"})
 
-#: `python -m pytest`, where the head word is the interpreter and `pytest` is a token.
+#: `python -m pytest`, where the head word is the interpreter and `pytest` is a token
 _INTERPRETERS = frozenset({"python", "python3", "uv", "poetry"})
 
 _GIT_READ_VERBS = frozenset({"diff", "show", "log", "blame"})
@@ -727,38 +553,25 @@ _CAT_HEADS = frozenset({"cat", "bat"})
 _SEARCH_HEADS = frozenset({"grep", "egrep", "fgrep", "rg", "ag", "find"})
 _CLIP_HEADS = frozenset({"head", "tail"})
 
-#: A `sed -n` ADDRESS: `50p`, `1,50p`, `1,$p`. Quotes are optional because the
-#: whitespace fallback (an unbalanced quote) does not strip them.
+#: A `sed -n` ADDRESS: `50p`, `1,50p`, `1,$p`
 _SED_ADDRESS = re.compile(r"""^['"]?\d+(,(\d+|\$))?p?['"]?$""")
 
 
 def classify_command(command: str) -> str:
-    """One Bash command's SHAPE: what produced its bytes. Pure, total, deterministic.
-
-    Never shells out and never touches the filesystem — no `os.path.exists`, no glob
-    expansion — because the path may be in a worktree that is gone (the reason
-    `usage.index_sessions` exists) and a classifier whose answer depends on the disk is
-    not reproducible. Never raises: an unbalanced quote falls back to whitespace
-    splitting, and anything unrecognised is `other`, the total last rule.
-
-    §10.5's ordered rule list, first match wins.
-    """
+    """One Bash command's SHAPE: what produced its bytes"""
     if not isinstance(command, str):
         return SHAPE_OTHER
     try:
         tokens = shlex.split(command, comments=False, posix=True)
     except ValueError:
-        # An unbalanced quote. The shape is still worth having, so the cheaper
-        # tokenizing is used rather than the call being dropped.
+        # An unbalanced quote
         tokens = command.split()
     segments = [s for s in _segments(tokens) if s]
     if not segments:
         return SHAPE_OTHER
     heads = [_head_word(s) for s in segments]
 
-    # 1-2: scanned over EVERY segment, so neither is ever hidden behind a pipe. A
-    # `jarvis` call is a thing the user asks about by name, and a test run is the one
-    # population already known to be cheap per call.
+    # 1-2: scanned over EVERY segment, so neither is ever hidden behind a pipe
     for segment, head in zip(segments, heads):
         if head == SHAPE_PYTEST or (head in _INTERPRETERS and SHAPE_PYTEST in segment):
             return SHAPE_PYTEST
@@ -775,14 +588,14 @@ def classify_command(command: str) -> str:
         return SHAPE_CAT_FILE
     if head in _SEARCH_HEADS:
         return SHAPE_SEARCH
-    # 7: the LAST segment, which covers both `cmd | head` and a bare `head -50 file`.
+    # 7: the LAST segment, which covers both `cmd | head` and a bare `head -50 file`
     if heads[-1] in _CLIP_HEADS:
         return SHAPE_STREAM
     return SHAPE_OTHER
 
 
 def _segments(tokens: Sequence[str]) -> list[list[str]]:
-    """Cut a token list on the shell operators found as standalone tokens."""
+    """Cut a token list on the shell operators found as standalone tokens"""
     out: list[list[str]] = [[]]
     for token in tokens:
         if token in _OPERATORS:
@@ -792,8 +605,7 @@ def _segments(tokens: Sequence[str]) -> list[list[str]]:
     return out
 
 
-#: Said in the payload rather than in a renderer, the same rule `NOTES` follows. The six
-#: KNOWN INACCURACIES of §10.4 plus the one thing a reader would otherwise add up wrong.
+#: Said in the payload rather than in a renderer, the same rule `NOTES` follows
 TOOL_NOTES = (
     "a tool result's size is DERIVED and never reported by the API: context-delta is "
     "exact to the token for a single result between two clean calls, a parallel batch "
@@ -821,7 +633,7 @@ TOOL_NOTES = (
 
 
 def _head_word(segment: Sequence[str]) -> str:
-    """A segment's first token, with `VAR=value` assignments and wrappers stripped."""
+    """A segment's first token, with `VAR=value` assignments and wrappers stripped"""
     i = 0
     while i < len(segment):
         token = segment[i]
@@ -836,48 +648,29 @@ def _head_word(segment: Sequence[str]) -> str:
     return ""
 
 
-#: The one tool whose NAME says nothing about what it read. Every other tool is keyed by
-#: `tool_use.name` verbatim — no normalization, no prefix stripping, because two
-#: spellings of one tool is how a reader loses a row. The render elides for display only.
+#: The one tool whose NAME says nothing about what it read
 BASH_TOOL = "Bash"
 
 
 @dataclass
 class _Chain:
-    """One conversation's calls, with the running price of carrying ONE token in them.
-
-    A result's carried cost is its size times what every LATER call in the SAME CHAIN
-    paid to carry a token — so the per-token price is accumulated once per chain and
-    read off by timestamp, rather than re-walked per result. The main chain is
-    `session_calls` (every segment of the session: a result keeps riding across a
-    segment boundary because the conversation did); a subagent file is its own chain,
-    and a lead call is never in a subagent's denominator nor the reverse.
-    """
+    """One conversation's calls, with the running price of carrying ONE token in them"""
 
     stamps: list[float] = field(default_factory=list)
-    #: Cumulative (all, read, ttl-rewrite, prefix-rewrite) dollars per carried token.
-    #: `len(stamps) + 1` entries, so a half-open range of calls is one subtraction.
+    #: Cumulative (all, read, ttl-rewrite, prefix-rewrite) dollars per carried token
     cumulative: list[tuple[float, float, float, float]] = field(
         default_factory=lambda: [(0.0, 0.0, 0.0, 0.0)])
     compactions: list[float] = field(default_factory=list)
-    #: Exclusive right edge of the report's window. Calls at or after it are not in the
-    #: window, so a result never rides on them. `_chain` always passes the real value;
-    #: `inf` is the identity for this bound (2026-10-08-cost-tool-section-window-clip §3).
+    #: Exclusive right edge of the report's window
     until: float = math.inf
 
     def carried(self, ts: float) -> tuple[int, tuple[float, float, float, float]]:
-        """(later calls, dollars per carried token) for a result that landed at `ts`.
-
-        The ride ENDS at whichever comes first: the first compaction after `ts` — a
-        compaction replaces the conversation, so the result stops being carried there —
-        or the window's `until`, since a call outside the window is not in the population
-        the report is about (2026-10-08-cost-tool-section-window-clip §2).
-        """
+        """(later calls, dollars per carried token) for a result that landed at `ts`"""
         start = bisect.bisect_right(self.stamps, ts)
         stop = next((c for c in self.compactions if c > ts), None)
         end = (len(self.stamps) if stop is None
                else bisect.bisect_left(self.stamps, stop))
-        # Half-open: a call exactly at `until` is out.
+        # Half-open: a call exactly at `until` is out
         end = min(end, bisect.bisect_left(self.stamps, self.until))
         if end <= start:
             return (0, (0.0, 0.0, 0.0, 0.0))
@@ -889,19 +682,7 @@ class _Chain:
 
 def _chain(calls: Sequence[usage.Call], compactions: Sequence[float],
            floor: int | None, *, until: float) -> _Chain:
-    """Price carrying one token in every call of a chain, split by what it was billed as.
-
-    `compaction_payoff.prefix_rate` is REUSED, not reimplemented: it returns the multiple
-    of base input price one call paid *for the prefix it carried*, which is precisely the
-    rate a result inside that prefix was billed at. The CAUSE of a write comes from
-    `usage.classify_boundaries`, joined to the call by `Boundary.ts` — TTL expiry and a
-    prefix miss cost the same and have completely different fixes.
-
-    The chain is BUILT over every call in the file, in or out of the window: `prefix_rate`
-    and `classify_boundaries` read each call against its PREDECESSOR, so dropping
-    out-of-window calls here would mis-price the first in-window call and lose the
-    left-edge boundary. `until` clips at READ time, inside `_Chain.carried`.
-    """
+    """Price carrying one token in every call of a chain, split by what it was billed as"""
     ordered = sorted(calls, key=lambda c: c.ts)
     stamps = sorted(compactions)
     causes = {b.ts: b.cause for b in usage.classify_boundaries(
@@ -912,9 +693,7 @@ def _chain(calls: Sequence[usage.Call], compactions: Sequence[float],
         kind, rate = compaction_payoff.prefix_rate(call, previous, i == 0)
         unit = compaction_payoff.per_token(call.model) * rate
         read = unit if kind == compaction_payoff.RATE_READ else 0.0
-        # Everything that is not a cache READ was re-written (or paid full input price,
-        # which is the same thing for a reader asking what the re-write tax cost). With
-        # no floor the boundary is UNDECIDED and lands in the prefix bucket, never TTL.
+        # Everything that is not a cache READ was re-written (or paid full input price
         ttl = unit if (not read and causes.get(call.ts) == usage.BOUNDARY_TTL) else 0.0
         running = chain.cumulative[-1]
         chain.cumulative.append((running[0] + unit, running[1] + read,
@@ -927,12 +706,7 @@ def _chain(calls: Sequence[usage.Call], compactions: Sequence[float],
 
 @dataclass
 class ToolCost:
-    """What one tool (or one Bash shape, or one caller of either) cost in a window.
-
-    ONE shape at every level of `fleet.tools`, and `by_caller` is a PARTITION of the
-    level above it rather than an addend (kn-7a2180ba): `main.calls + subagent.calls ==
-    calls`, and the same for every additive field.
-    """
+    """What one tool (or one Bash shape, or one caller of either) cost in a window"""
 
     calls: int = 0
     errors: int = 0
@@ -945,8 +719,7 @@ class ToolCost:
     carried_rewrite_prefix_usd: float = 0.0
     basis_context_delta: int = 0
     basis_chars: int = 0
-    #: Every result's size, for the p90 and the max. Nearest-rank, so both are figures
-    #: some call actually came back with.
+    #: Every result's size, for the p90 and the max
     sizes: list[int] = field(default_factory=list)
     by_caller: dict[str, ToolCost] = field(default_factory=dict)
     shapes: dict[str, ToolCost] = field(default_factory=dict)
@@ -983,8 +756,7 @@ class ToolCost:
             "carried_tokens": self.carried_tokens,
             "carried_usd": round(self.carried_usd, 6),
             "carried_read_usd": round(self.carried_read_usd, 6),
-            # Never 0.00 when no floor could decide: a renderer would print that as "no
-            # TTL expiry", which is a claim the configuration did not support.
+            # Never 0.00 when no floor could decide: a renderer would print that as "no TTL expiry"
             "carried_rewrite_ttl_usd": (round(self.carried_rewrite_ttl_usd, 6)
                                         if ttl_known else None),
             "carried_rewrite_prefix_usd": round(self.carried_rewrite_prefix_usd, 6),
@@ -1015,21 +787,7 @@ def tool_costs(orders: Iterable[OrderStats], *, cfg: CostConfig, floor: int | No
                since: float, until: float,
                index: dict[str, list[Path]] | None = None,
                orders_capped: int = 0) -> dict[str, Any]:
-    """`fleet.tools`: what every tool cost in the window, and what it CARRIED.
-
-    The window is `[since, until)` and it bounds BOTH ends of the question: a tool result
-    counts only if its own `ts` falls inside it, and the carried ride is clipped at
-    `until` as well as at the next compaction — so every figure here describes the same
-    population as the rest of the page (2026-10-08-cost-tool-section-window-clip.md).
-    Both are REQUIRED: an optional window defaulting to the whole chain is the silent
-    default that produced issue #990.
-
-    Bounded by `cost.max_orders` one level up — the orders `fleetcost` already selected
-    for the window are the sessions walked, and `excluded` publishes what the cap did.
-    No cache in this stage: `--fleet` is an on-demand report, not a 15s pulse (§10.9).
-
-    Read-only and deterministic: two passes per transcript, no store, no model call.
-    """
+    """`fleet.tools`: what every tool cost in the window, and what it CARRIED (#990)"""
     index = usage.index_sessions() if index is None else index
     totals = ToolCost()
     by_tool: dict[str, ToolCost] = {}
@@ -1037,7 +795,7 @@ def tool_costs(orders: Iterable[OrderStats], *, cfg: CostConfig, floor: int | No
     for order in orders:
         files = sorted(index.get(order.session_id) or []) if order.session_id else []
         if not files:
-            # Counted, never dropped: a share needs a denominator a reader can check.
+            # Counted, never dropped: a share needs a denominator a reader can check
             no_transcript += 1
             continue
         main = _chain(usage.session_calls(order.session_id, index=index),
@@ -1053,8 +811,7 @@ def tool_costs(orders: Iterable[OrderStats], *, cfg: CostConfig, floor: int | No
             if not sub_dir.is_dir():
                 continue
             for sub in sorted(sub_dir.glob("*.jsonl")):
-                # A subagent transcript is where the big dumps live: clipping only the
-                # main chain would leave most of the over-count in place (§5).
+                # A subagent transcript is where the big dumps live: clipping only the main chain would leave most of...
                 seen, late = _walk_tools(
                     sub, _chain(usage.calls_of(sub), usage.compaction_stamps(sub),
                                 floor, until=until),
@@ -1078,18 +835,7 @@ def tool_costs(orders: Iterable[OrderStats], *, cfg: CostConfig, floor: int | No
 
 
 def tool_table(tools: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
-    """The tool table's rows, in §10.7's total order: carried $, tokens, then name.
-
-    HERE rather than in either renderer, for the reason the partial already states: a
-    figure — or an order — computed in a renderer is one the other renderer disagrees
-    with. `jarvis cost --fleet` and the dashboard both call this.
-
-    Bash is one row PER SHAPE and never also a Bash total line: the total is recoverable
-    from the shapes, and two rows that sum to a third invite the reader to add the wrong
-    pair. Sorting on carried cost rather than calls is the whole point of §10.4 —
-    `pytest` at ~167 tok/call must not outrank a `sed -n` dump for being frequent. The
-    order is TOTAL, so the table is reproducible run to run.
-    """
+    """The tool table's rows, in §10.7's total order: carried $, tokens, then name"""
     rows: list[tuple[str, dict[str, Any]]] = []
     for name, cost in (tools.get("by_tool") or {}).items():
         if cost.get("shapes"):
@@ -1104,19 +850,7 @@ def tool_table(tools: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
 def _walk_tools(path: Path, chain: _Chain, cfg: CostConfig, totals: ToolCost,
                 by_tool: dict[str, ToolCost], *, since: float,
                 until: float) -> tuple[int, int]:
-    """Fold one transcript's tool calls in. Returns (unmatched, outside the window).
-
-    An UNMATCHED call — the turn was killed between the `tool_use` and its result —
-    contributes no tokens and no carried cost and is never zero-filled: a call that
-    produced nothing must not pull a tool's average down as though it had. That check
-    runs FIRST: an unmatched call has no `ts` to place, and its own counter is already
-    its disclosure (2026-10-08-cost-tool-section-window-clip.md §1).
-
-    A matched result counts only if `result.ts` is in `[since, until)` — the stamp of when
-    the result LANDED, since that is when it started riding in later prefixes. A result
-    whose stamp could not be parsed (`0.0`) is outside every real window by the same
-    arithmetic and needs no second rule.
-    """
+    """Fold one transcript's tool calls in"""
     unmatched = outside_window = 0
     for result in usage.tool_results(path, chars_per_token=cfg.chars_per_token):
         if not result.matched:
@@ -1138,12 +872,10 @@ def _walk_tools(path: Path, chain: _Chain, cfg: CostConfig, totals: ToolCost,
     return (unmatched, outside_window)
 
 
-# ---------------------------------------------------------------------------------------
 # The report
-# ---------------------------------------------------------------------------------------
 
 def registered_paths(home: Path) -> dict[str, Path]:
-    """The active projects, read out of `os.db` WITHOUT constructing a store."""
+    """The active projects, read out of `os.db` WITHOUT constructing a store"""
     conn = connect_ro(home / "os.db")
     try:
         return {r["name"]: Path(r["path"]) for r in conn.execute(
@@ -1153,11 +885,7 @@ def registered_paths(home: Path) -> dict[str, Path]:
 
 
 def cost_config(project: str | None = None) -> CostConfig:
-    """`cost.*` for the scope being reported, fleet-wide or per project.
-
-    Field-level inheritance is already done by `catalog._parse_cost`, so this consults
-    exactly one object and never two (the kn-6ca2bcd9 rule).
-    """
+    """`cost.*` for the scope being reported, fleet-wide or per project"""
     from jarvis.catalog import CatalogError
     from jarvis.ops import resolve_catalog
 
@@ -1176,12 +904,7 @@ def report(*, project: str | None = None, since: float | str | None = None,
            resolved: dict[str, Any] | None = None,
            now: float | None = None,
            home: Path | None = None) -> dict[str, Any]:
-    """The whole `fleet` payload. One computation for the CLI, `--json` and the page.
-
-    `resolved` is a window `resolve_window` already returned — the page resolves ONCE
-    and hands the same dict to both payload builders (§6). It wins, and is refused
-    beside any raw parameter so there is never a question of which one was used.
-    """
+    """The whole `fleet` payload"""
     from jarvis.bill import _cold_prefix_floor
     from jarvis.ops import COST_FLOOR_NOTE, OpsError
 
@@ -1204,8 +927,7 @@ def report(*, project: str | None = None, since: float | str | None = None,
     rounds: dict[str, int] = {}
     known = registered_paths(home)
     if project and project not in known:
-        # Refused rather than reported as an empty week: a typo in a project name must
-        # not come back as "nothing ran", which reads as a fact about the fleet.
+        # Refused rather than reported as an empty week: a typo in a project name must not come back as...
         from jarvis.ops import OpsError
 
         raise OpsError(f"project {project!r} not registered (known: {sorted(known)})")
@@ -1222,9 +944,7 @@ def report(*, project: str | None = None, since: float | str | None = None,
         rounds.update(facts["rounds"])
 
     orders = per_order(rows)
-    # The cap is on orders WALKED, so it is applied before anything reads a transcript,
-    # and it keeps the most recent: an old order's distribution is the one a reader is
-    # least likely to be asking about.
+    # The cap is on orders WALKED, so it is applied before anything reads a transcript
     capped = max(0, len(orders) - cfg.max_orders)
     if len(orders) > cfg.max_orders:
         keep = sorted(orders.values(),
@@ -1255,9 +975,7 @@ def report(*, project: str | None = None, since: float | str | None = None,
                             cfg=cfg, floor=floor, index=index),
         "os_cost_by_kind": kinds,
         "os_unattributed": unattributed,
-        # ADDITIVE, and `version` above stays 1: §10.6's rule, the one `cost_report`
-        # already applies. The subtree carries its own version so a later re-shaping of
-        # it is detectable without bumping the parent.
+        # ADDITIVE, and `version` above stays 1: §10.6's rule, the one `cost_report` already applies
         "tools": tool_costs(orders.values(), cfg=cfg, floor=floor,
                             since=start, until=end, index=index,
                             orders_capped=capped),
@@ -1266,8 +984,7 @@ def report(*, project: str | None = None, since: float | str | None = None,
                                      index=index))),
         "floor": True,
         "floor_reason": COST_FLOOR_NOTE,
-        # Said only where it applies (§2), and it describes a GUESS — so the fallback
-        # only: a meter-anchored window is not one (§10).
+        # Said only where it applies (§2), and it describes a GUESS
         "notes": list(NOTES) + ([SESSION_ANCHOR_NOTE]
                                 if picked.get("source") == "session-window" else []),
     }}
@@ -1276,7 +993,7 @@ def report(*, project: str | None = None, since: float | str | None = None,
 def _metrics(orders: dict[str, OrderStats], os_turn_cost: dict[tuple[str, int], float],
              os_unattributed_to_turn: int, *, cfg: CostConfig, floor: int,
              index: dict[str, list[Path]]) -> dict[str, Any]:
-    """Every metric, each over the population it is honestly about."""
+    """Every metric, each over the population it is honestly about"""
     q = cfg.percentile
     turns = [t for o in orders.values() for t in o.turns]
     basis = {
@@ -1292,12 +1009,7 @@ def _metrics(orders: dict[str, OrderStats], os_turn_cost: dict[tuple[str, int], 
                  t.wo_id) for t in turns if t.source == source]
 
     def order_money(source: str) -> list[tuple[float, str]]:
-        """Per order: its turns of this source, plus ALL the OS spend it caused.
-
-        The OS half rides with the envelope figure because that is where a reader looks
-        for "what did this order cost"; an order with no envelope turn still reports it,
-        which is why the population is every order and not only the ones with a cost.
-        """
+        """Per order: its turns of this source, plus ALL the OS spend it caused"""
         if source == COST_FROM_ENVELOPE:
             return [(round(o.cost(source) + o.os_cost_usd, 6), o.wo_id)
                     for o in orders.values()]
@@ -1367,9 +1079,7 @@ def _metrics(orders: dict[str, OrderStats], os_turn_cost: dict[tuple[str, int], 
         out[f"tokens_per_turn.{cls}"] = metric(
             tokens(cls), percentile=q, unit=TOKENS, provenance=ENVELOPE,
             excluded=dict.fromkeys(EXCLUDED_KEYS, 0) | {"unrecorded": no_usage})
-    # All FOUR causes `usage.classify_boundaries` can return, each its own count: TTL
-    # expiry and a prefix miss cost the same and have completely different fixes, and
-    # `undecided` is the honest answer where no floor could decide — never a silent drop.
+    # All FOUR causes `usage.classify_boundaries` can return
     for name, key in (("ttl", "ttl_expiry_per_order"),
                       ("prefix", "prefix_miss_per_order"),
                       ("compacted", "compacted_boundaries_per_order"),

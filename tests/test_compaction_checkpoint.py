@@ -1,17 +1,4 @@
-"""A compacted worker must not lose the parts of its brief that have to be exact.
-
-Auto-compaction summarizes the conversation and discards the rest. Claude Code's summary
-is a model's account of what happened; what it cannot be trusted to carry verbatim is the
-work order's identifiers and contract — the id, the branch, the PR, which assumptions are
-already recorded, the finishing protocol. Those Jarvis already holds as structured state,
-so the re-assertion is rendered from the record rather than summarized, and is exact by
-construction.
-
-The delivery is two hooks and a flag file, because neither compaction hook can inject:
-`PreCompact` arms, and the next `PostToolUse` spends the flag and returns the brief as
-`additionalContext`. Design and measurements:
-docs/superpowers/specs/2026-08-10-resume-cost-and-the-cache.md
-"""
+"""A compacted worker must not lose the parts of its brief that have to be exact (docs/superpowers/specs/2026-08-10-resume-cost-and-the-cache.md)"""
 
 from __future__ import annotations
 
@@ -50,7 +37,7 @@ def context_of(result):
     return (result or {}).get("hookSpecificOutput", {}).get("additionalContext")
 
 
-# -- arming -----------------------------------------------------------------------------
+# -- arming
 
 
 def test_precompact_arms_the_flag_and_records_that_it_happened(wo, project):
@@ -68,9 +55,7 @@ def test_precompact_arms_the_flag_and_records_that_it_happened(wo, project):
 
 
 def test_a_compaction_the_os_asked_for_is_not_written_down_twice(wo, project):
-    """`manual` in a headless worker means Jarvis sent `/compact`, and the reaper
-    already records that one with what it achieved — see `note_compaction`. The FLAG
-    is still armed, which is the half the worker depends on."""
+    """`manual` in a headless worker means Jarvis sent `/compact`"""
     handle_hook(pre_compact(trigger="manual"), env(project, wo["id"]))
 
     assert compaction_flag(project, wo["id"]).exists()
@@ -83,11 +68,11 @@ def test_a_compaction_the_os_asked_for_is_not_written_down_twice(wo, project):
 
 
 def test_an_interactive_session_is_not_managed(project):
-    """No JARVIS_WO_ID means a session the user started; Jarvis does not touch it."""
+    """No JARVIS_WO_ID means a session the user started; Jarvis does not touch it"""
     assert handle_hook(pre_compact(), {"JARVIS_PROJECT_PATH": str(project)}) is None
 
 
-# -- delivery ---------------------------------------------------------------------------
+# -- delivery
 
 
 def test_the_brief_arrives_on_the_next_tool_call(wo, project):
@@ -130,14 +115,13 @@ def test_already_recorded_assumptions_are_named_so_they_are_not_recorded_twice(w
 
 
 def test_delivery_is_not_gated_on_the_worker_editing_a_file(wo, project):
-    """The first call after a compaction is usually Bash. Waiting for Write/Edit would
-    leave the worker running blind until it happened to make one."""
+    """The first call after a compaction is usually Bash"""
     handle_hook(pre_compact(), env(project, wo["id"]))
 
     assert context_of(handle_hook(post_tool(tool="Bash"), env(project, wo["id"])))
 
 
-# -- exactly once -----------------------------------------------------------------------
+# -- exactly once
 
 
 def test_the_flag_is_spent_once(wo, project):
@@ -165,16 +149,11 @@ def test_a_second_compaction_re_arms(wo, project):
     assert context_of(handle_hook(post_tool(), env(project, wo["id"])))
 
 
-# -- wiring -----------------------------------------------------------------------------
+# -- wiring
 
 
 def test_the_hooks_are_actually_registered():
-    """The handler is only reachable if the injected settings ask for these events.
-
-    Both halves are load-bearing and neither fails loudly: an unregistered `PreCompact`
-    never arms, and a `PostToolUse` still matching only `Write|Edit|NotebookEdit` would
-    hold the brief until the worker happened to edit a file.
-    """
+    """The handler is only reachable if the injected settings ask for these events"""
     from jarvis.bootstrap import build_settings
 
     hooks = build_settings({})["hooks"]

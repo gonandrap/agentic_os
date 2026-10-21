@@ -1,4 +1,4 @@
-"""The shipped OS creates no work nobody typed: `os.autonomy.self_dispatch` ships off."""
+"""The shipped OS creates no work nobody typed: `os.autonomy.self_dispatch` ships off"""
 
 import pytest
 
@@ -53,5 +53,5 @@ def test_neo_files_no_cleanup_order(asked, project):
 
 
 def test_a_red_main_dispatches_no_fix(catalog_file):
-    # Returns before it reads the project, so no tracker or `gh` is touched.
+    # Returns before it reads the project, so no tracker or `gh` is touched
     assert Daemon(load_catalog(catalog_file)).dispatch_base_fix(None, None) is None

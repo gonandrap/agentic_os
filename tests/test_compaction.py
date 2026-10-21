@@ -1,20 +1,4 @@
-"""Compacting a conversation whose prompt cache has expired, before the next prompt.
-
-Three layers, and each has a different way of being wrong:
-
-* THE DECISION (`worker_session.compaction_due`) — every exclusion is a way this could
-  cost more than it saves, so each one is a test and each sits beside the case that
-  SHOULD fire. "Did not compact" is indistinguishable from "cannot compact" otherwise.
-* THE DELIVERY (`Daemon._compacted_first`) — the compaction goes out as a turn of its
-  own and the message stays queued behind it. What matters is that the message is not
-  lost and not double-sent.
-* THE ACCOUNTING (`usage`, `bill`, `inspection`, `agent_usage`) — a compaction is a
-  full-priced API call the transcript does not record, and the write it leaves behind
-  looks exactly like the prefix defect the fleet already watches for. Both of those
-  would turn a real saving into a reported one.
-
-Spec: docs/superpowers/specs/2026-09-18-compact-past-the-ttl.md
-"""
+"""Compacting a conversation whose prompt cache has expired, before the next prompt (docs/superpowers/specs/2026-09-18-compact-past-the-ttl.md)"""
 
 from __future__ import annotations
 
@@ -38,10 +22,7 @@ def fleet(jarvis_home, fake_claude, catalog_file, project):
     ops.start_os(str(catalog_file), foreground=True)
     catalog = load_catalog(catalog_file)
     daemon = Daemon(catalog)
-    # The fake CLI's turns report a 3,003-token context, and the real floor is 100,000
-    # (`catalog.DEFAULT_COMPACT_MIN_CONTEXT`) — a value no fixture can reach and no
-    # catalog may go below. Lowered on the loaded object rather than in the file, so
-    # the parser's own rule stays under test in `test_the_floor_has_a_floor`.
+    # The fake CLI's turns report a 3,003-token context
     daemon.catalog.os.compact_min_context = BIG
     return {"daemon": daemon, "project": catalog.projects[0],
             "store": ProjectStore(project), "catalog": catalog}
@@ -49,8 +30,7 @@ def fleet(jarvis_home, fake_claude, catalog_file, project):
 
 @pytest.fixture()
 def transcripts(tmp_path, monkeypatch):
-    """A fake `~/.claude/projects` tree — `tests/test_usage.py`'s fixture, which lives
-    there because that is where the format itself is under test."""
+    """A fake `~/.claude/projects` tree"""
     root = tmp_path / "projects"
     root.mkdir()
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
@@ -66,7 +46,7 @@ def transcripts(tmp_path, monkeypatch):
 
 
 def _running_wo(fleet, settle_turns) -> dict:
-    """A work order one turn in, with a session and a settled boundary behind it."""
+    """A work order one turn in, with a session and a settled boundary behind it"""
     wo = ops.create_work_order("proj_a", "task")
     store, project = fleet["store"], fleet["project"]
     wo = store.get_work_order(wo["id"])
@@ -76,17 +56,16 @@ def _running_wo(fleet, settle_turns) -> dict:
 
 
 def _age_last_turn(store: ProjectStore, wo_id: str, seconds: float) -> None:
-    """Move the last turn's end back, which is the only input the clock test has."""
+    """Move the last turn's end back, which is the only input the clock test has"""
     turn = store.latest_turn(wo_id)
     store.conn.execute("UPDATE wo_turns SET ended_at=? WHERE id=?",
                        (turn["ended_at"] - seconds, turn["id"]))
 
 
 def _big_context(store: ProjectStore, wo_id: str, tokens: int = BIG * 10) -> None:
-    """Put a context on the last turn, the only input the floor test has."""
+    """Put a context on the last turn, the only input the floor test has"""
     turn = store.latest_turn(wo_id)
-    # `usage_v` or `ops._turn_usage` repairs the envelope from the result file on the
-    # next cost read and the synthetic size is gone.
+    # `usage_v` or `ops._turn_usage` repairs the envelope from the result file on the next cost read and...
     store.conn.execute("UPDATE wo_turns SET usage_json=? WHERE id=?",
                        (json.dumps({"context_peak": tokens,
                                     "usage_v": claude_cli.USAGE_SCHEMA_VERSION}),
@@ -101,7 +80,7 @@ def _turns(store: ProjectStore, wo_id: str) -> list[tuple[str, str]]:
     return [(t["kind"], t["prompt"]) for t in store.list_turns(wo_id)]
 
 
-# -- the trigger -----------------------------------------------------------------------
+# -- the trigger
 
 
 def test_a_cold_boundary_with_a_large_conversation_compacts_before_the_prompt(
@@ -115,13 +94,12 @@ def test_a_cold_boundary_with_a_large_conversation_compacts_before_the_prompt(
 
     kinds = _turns(store, wo["id"])
     assert kinds[-1] == (COMPACT_TURN, claude_cli.COMPACT_PROMPT)
-    # THE MESSAGE IS NOT SPENT. Nothing about it has happened, so it must still be
-    # queued — marking it delivered here would lose it entirely.
+    # THE MESSAGE IS NOT SPENT
     assert [m["content"] for m in store.queued_messages(wo["id"])] == [
         "please also do the other thing"]
     assert settle_turns(store)
 
-    # …and the tick after the compaction settles delivers it, into the warm session.
+    # …and the tick after the compaction settles delivers it, into the warm session
     _deliver(fleet, wo["id"])
     assert _turns(store, wo["id"])[-1] == ("message", "please also do the other thing")
     assert not store.queued_messages(wo["id"])
@@ -129,11 +107,7 @@ def test_a_cold_boundary_with_a_large_conversation_compacts_before_the_prompt(
 
 def test_a_turn_that_died_without_a_result_does_not_hide_the_conversation(
         fleet, settle_turns):
-    """Issue #856: the last turn was killed (a fleet stop), so it measured no context.
-
-    Its 0 read as "small", and the next delivery re-sent a 126k conversation cold eight
-    hours later. The size is the newest turn that MEASURED one.
-    """
+    """Issue #856: the last turn was killed (a fleet stop), so it measured no context"""
     store = fleet["store"]
     wo = _running_wo(fleet, settle_turns)
     _big_context(store, wo["id"])
@@ -168,7 +142,7 @@ def test_a_boundary_inside_the_ttl_does_not_compact(fleet, settle_turns):
 
 
 def test_a_small_conversation_past_the_ttl_does_not_compact(fleet, settle_turns):
-    """The break-even floor: below it the summary costs more than the re-write."""
+    """The break-even floor: below it the summary costs more than the re-write"""
     store = fleet["store"]
     fleet["daemon"].catalog.os.compact_min_context = HUGE
     wo = _running_wo(fleet, settle_turns)
@@ -180,7 +154,7 @@ def test_a_small_conversation_past_the_ttl_does_not_compact(fleet, settle_turns)
     assert _turns(store, wo["id"])[-1] == ("message", "carry on")
 
 
-# -- the exclusions --------------------------------------------------------------------
+# -- the exclusions
 
 
 def test_the_off_switch_stops_it_and_nothing_else(fleet, settle_turns):
@@ -191,8 +165,7 @@ def test_the_off_switch_stops_it_and_nothing_else(fleet, settle_turns):
 
     assert worker_session.compaction_due(store, fresh, BIG) is not None
     assert worker_session.compaction_due(store, fresh, None) is None
-    # …and the three call sites go through one entry point, so one switch covers all of
-    # them: delivery (neither), dispatch-resume (`queue`) and a relaunch (`pause`).
+    # …and the three call sites go through one entry point
     pause = worker_session.TurnPause(
         reason=worker_session.PAUSE_BUDGET, turn=store.latest_turn(wo["id"]),
         retry_at=0.0, attempts=1, message="raised")
@@ -203,8 +176,7 @@ def test_the_off_switch_stops_it_and_nothing_else(fleet, settle_turns):
 
 
 def test_an_opening_turn_is_never_compacted_before(fleet):
-    """Nothing to summarise, and the first prompt writes the cache rather than
-    re-writing it."""
+    """Nothing to summarise, and the first prompt writes the cache rather than re-writing it"""
     store = fleet["store"]
     wo = store.get_work_order(ops.create_work_order("proj_a", "task")["id"])
 
@@ -212,7 +184,7 @@ def test_an_opening_turn_is_never_compacted_before(fleet):
 
 
 def test_a_turn_in_flight_is_never_compacted_under(fleet, fake_claude, settle_turns):
-    """Never mid-turn: what a compaction discards is what that turn is holding."""
+    """Never mid-turn: what a compaction discards is what that turn is holding"""
     store = fleet["store"]
     wo = _running_wo(fleet, settle_turns)
     _age_last_turn(store, wo["id"], usage.WRITE_TTL_SECONDS + 60)
@@ -226,8 +198,7 @@ def test_a_turn_in_flight_is_never_compacted_under(fleet, fake_claude, settle_tu
 
 
 def test_a_compaction_is_never_followed_by_another(fleet, settle_turns):
-    """Nothing was added in between, so the second one would summarise a summary — and
-    if the first FAILED, repeating it is the loop rather than the fix."""
+    """Nothing was added in between, so the second one would summarise a summary"""
     store = fleet["store"]
     wo = _running_wo(fleet, settle_turns)
     ops.send_message(wo["id"], "go on")
@@ -243,7 +214,7 @@ def test_a_compaction_is_never_followed_by_another(fleet, settle_turns):
 
 
 def _due_cold_pause(fleet, fake_claude, settle_turns, monkeypatch) -> dict:
-    """A work order whose last turn the usage window refused, now DUE and COLD."""
+    """A work order whose last turn the usage window refused, now DUE and COLD"""
     monkeypatch.setattr(worker_session, "RATE_LIMIT_MIN_DELAY", 0)
     store = fleet["store"]
     wo = _running_wo(fleet, settle_turns)
@@ -251,29 +222,21 @@ def _due_cold_pause(fleet, fake_claude, settle_turns, monkeypatch) -> dict:
     worker_session.send(store, fleet["project"], store.get_work_order(wo["id"]), "more")
     assert settle_turns(store)
     fake_claude.turns_recover()
-    # A reset long gone (`test_fleet_cap` uses the same form), and an end older than
-    # the cache TTL: exactly the state every paused turn is in when a window reopens.
+    # A reset long gone (`test_fleet_cap` uses the same form)
     turn = store.latest_turn(wo["id"])
     store.conn.execute("UPDATE wo_turns SET error=?, ended_at=? WHERE id=?",
                        ("Claude AI usage limit reached|1000000000",
                         turn["ended_at"] - 3 * usage.WRITE_TTL_SECONDS, turn["id"]))
     pause = worker_session.turn_pause(store, wo["id"])
     assert pause is not None and pause.due()
-    # Where a paused order really is: `running`, holding its slot (the retry sweep reads
-    # `RETRY_SWEEP_STATUSES`, which `_running_wo`'s bare `start` never reaches).
+    # Where a paused order really is: `running`
     store.set_status(wo["id"], "running")
     return store.get_work_order(wo["id"])
 
 
 def test_a_cold_relaunch_compacts_first_and_the_relaunch_survives(
         fleet, fake_claude, settle_turns, monkeypatch):
-    """ISSUE #843: a relaunch after a usage window is ALWAYS cold, and on 2026-09-28
-    eleven of them re-wrote 2.25M cache-write tokens in two minutes.
-
-    The two reasons this used to be refused are both answered, and this pins each: the
-    relaunch is QUEUED before the compaction starts, so a compact turn behind the paused
-    one cannot strand it; and it is delivered afterwards, into the compacted session.
-    """
+    """ISSUE #843: a relaunch after a usage window is ALWAYS cold"""
     store, daemon = fleet["store"], fleet["daemon"]
     wo = _due_cold_pause(fleet, fake_claude, settle_turns, monkeypatch)
     before = len(store.list_turns(wo["id"]))
@@ -292,8 +255,7 @@ def test_a_cold_relaunch_compacts_first_and_the_relaunch_survives(
 
 def test_a_warm_or_small_relaunch_is_not_compacted(fleet, fake_claude, settle_turns,
                                                    monkeypatch):
-    """The cost rule is `compaction_due`'s, unchanged: inside the TTL, or under the
-    floor, the plain relaunch is the cheaper one."""
+    """The cost rule is `compaction_due`'s"""
     store = fleet["store"]
     fresh = _due_cold_pause(fleet, fake_claude, settle_turns, monkeypatch)
     pause = worker_session.turn_pause(store, fresh["id"])
@@ -311,7 +273,7 @@ def test_a_warm_or_small_relaunch_is_not_compacted(fleet, fake_claude, settle_tu
 
 
 def test_a_relaunch_that_reached_the_model_is_told_it_was_compacted(fleet):
-    """`_nudge` says the conversation is intact; behind a compaction that is false."""
+    """`_nudge` says the conversation is intact; behind a compaction that is false"""
     pause = worker_session.TurnPause(
         reason=worker_session.PAUSE_USAGE_LIMIT, turn={}, retry_at=0.0, attempts=1,
         message="limit")
@@ -321,14 +283,7 @@ def test_a_relaunch_that_reached_the_model_is_told_it_was_compacted(fleet):
 
 def test_a_message_queued_behind_a_paused_turn_never_compacts(fleet, fake_claude,
                                                               settle_turns):
-    """The delivery path, not the retry path — and this is the stall that is permanent.
-
-    `turn_pause` is re-derived from the LATEST turn, so a compact turn inserted behind
-    a paused one erases the pause: nothing relaunches the lost turn and the message
-    waits for ever. Asserted through `Daemon.deliver_messages` because that is the
-    caller that can get here, and then asked of the decision directly, because
-    `delivery_hold` doing the right thing is not the same as the decision being safe.
-    """
+    """The delivery path, not the retry path — and this is the stall that is permanent"""
     store = fleet["store"]
     wo = _running_wo(fleet, settle_turns)
     fake_claude.turns_rate_limited()
@@ -354,14 +309,7 @@ def test_a_message_queued_behind_a_paused_turn_never_compacts(fleet, fake_claude
 
 def test_a_pause_nothing_will_relaunch_compacts_before_the_message(
         fleet, settle_turns):
-    """§1.3: the pause exclusion is narrowed to a RESUMABLE pause.
-
-    `delivery_hold` deliberately does NOT hold behind a non-resumable pause — the
-    message is the only thing left that can start the conversation again — so the
-    delivery pass arrives here past the TTL and over the floor. Neither reason for the
-    old blanket refusal applies: no relaunch is coming, so no nudge can lie about the
-    conversation, and there is no pause anyone is waiting on to erase.
-    """
+    """§1.3: the pause exclusion is narrowed to a RESUMABLE pause"""
     store = fleet["store"]
     wo = _running_wo(fleet, settle_turns)
     for _ in range(len(worker_session.TRANSIENT_BACKOFF) + 1):
@@ -389,9 +337,7 @@ def test_a_pause_nothing_will_relaunch_compacts_before_the_message(
 
 def test_a_compaction_the_transport_lost_is_re_sent_verbatim(fleet, fake_claude,
                                                              settle_turns):
-    """Never the nudge: `/compact` is a command, and prose addressed to a worker
-    mid-task would land in the transcript as a user message asking nobody to continue
-    nothing."""
+    """Never the nudge: `/compact` is a command"""
     store, daemon = fleet["store"], fleet["daemon"]
     wo = _running_wo(fleet, settle_turns)
     ops.send_message(wo["id"], "go on")
@@ -412,12 +358,7 @@ def test_a_compaction_the_transport_lost_is_re_sent_verbatim(fleet, fake_claude,
 
 def test_a_compaction_that_died_does_not_read_as_one_that_happened(fleet, fake_claude,
                                                                    settle_turns):
-    """The conversation is INTACT and the next prompt still pays the re-write, so a row
-    saying "Conversation compacted" would put a saving on the record that the bill will
-    never show — and the whole point of writing it down is that it is provable.
-
-    The cost stays, on both outcomes: the call was made and nothing else can see it.
-    """
+    """The conversation is INTACT and the next prompt still pays the re-write"""
     from jarvis import timeline
 
     store = fleet["store"]
@@ -436,7 +377,7 @@ def test_a_compaction_that_died_does_not_read_as_one_that_happened(fleet, fake_c
     label, detail = timeline._describe("compacted", payload)
     assert label == "Compaction failed" and "limit" in detail.lower()
 
-    # …and it is still on the bill, which is the half that must survive the failure.
+    # …and it is still on the bill, which is the half that must survive the failure
     from jarvis.central_store import CentralStore
 
     central = CentralStore()
@@ -449,30 +390,25 @@ def test_a_compaction_that_died_does_not_read_as_one_that_happened(fleet, fake_c
 
 
 def test_a_compaction_the_os_did_not_ask_for_still_reads_as_one(fleet, settle_turns):
-    """`hooks.note_compaction`'s own event carries no `ok` — it only ever fires for a
-    compaction that already happened, so its absence must not read as a failure."""
+    """`hooks.note_compaction`'s own event carries no `ok`"""
     from jarvis import timeline
 
     assert timeline._describe("compacted", {"trigger": "auto"}) == (
         "Conversation compacted", "")
 
 
-# -- the size when NO turn measured one (issue #885) -----------------------------------
-#
-# The fallback only ever runs when the turn record is silent, so every test here has to
-# silence it first. That silence is the state a work order whose ONLY turn died on the
-# usage limit is genuinely in.
+# -- the size when NO turn measured one (issue #885)
 
 
 def _forget_measured_contexts(store: ProjectStore, wo_id: str) -> None:
-    """No turn on record measured a size — wo-d5626c53's real state on 0.10.40."""
+    """No turn on record measured a size — wo-d5626c53's real state on 0.10.40"""
     store.conn.execute("UPDATE wo_turns SET usage_json=NULL WHERE wo_id=?", (wo_id,))
     assert worker_session.turn_context(store.latest_turn(wo_id)) == 0
 
 
 def _billed_row(context: int, *, at: str = "2026-09-29T10:00:00.000Z",
                 mid: str = "t", output: int = 10) -> dict:
-    """One API call carrying `context` tokens — `Call.context` is input + write + read."""
+    """One API call carrying `context` tokens — `Call.context` is input + write + read"""
     return {"type": "assistant", "timestamp": at,
             "message": {"id": mid, "model": "claude-opus-5",
                         "usage": {"input_tokens": 2,
@@ -483,17 +419,13 @@ def _billed_row(context: int, *, at: str = "2026-09-29T10:00:00.000Z",
 
 def test_the_transcript_says_how_big_a_conversation_no_turn_measured_is(
         fleet, fake_claude, settle_turns, monkeypatch, transcripts):
-    """ISSUE #885: wo-d5626c53's only turn died on the usage limit without a result.
-
-    No turn recorded a size, 0 read as "small", and the relaunch four hours later
-    re-wrote 181,342 tokens with cache_read 0 while three other orders compacted.
-    """
+    """ISSUE #885: wo-d5626c53's only turn died on the usage limit without a result"""
     store = fleet["store"]
     wo = _due_cold_pause(fleet, fake_claude, settle_turns, monkeypatch)
     _forget_measured_contexts(store, wo["id"])
     transcripts(wo["session_id"], [
         _billed_row(181_342, at="2026-09-29T10:00:00.000Z", mid="a"),
-        # …and the call after it read nothing at all: skipped, not read as the size.
+        # …and the call after it read nothing at all: skipped, not read as the size
         {"type": "assistant", "timestamp": "2026-09-29T10:01:00.000Z",
          "message": {"id": "b", "model": "claude-opus-5",
                      "usage": {"input_tokens": 0, "cache_creation_input_tokens": 0,
@@ -509,7 +441,7 @@ def test_the_transcript_says_how_big_a_conversation_no_turn_measured_is(
 
 
 def test_a_session_that_never_ran_a_turn_is_still_never_compacted(fleet, transcripts):
-    """The fallback must not turn "nothing has happened yet" into a compaction."""
+    """The fallback must not turn "nothing has happened yet" into a compaction"""
     store = fleet["store"]
     wo = store.get_work_order(ops.create_work_order("proj_a", "task")["id"])
 
@@ -518,7 +450,7 @@ def test_a_session_that_never_ran_a_turn_is_still_never_compacted(fleet, transcr
 
 def test_a_readable_transcript_with_nothing_billed_is_empty_not_unknown(
         fleet, fake_claude, settle_turns, monkeypatch, transcripts):
-    """Neo 1097: a transcript that reads and holds no API call is genuinely EMPTY."""
+    """Neo 1097: a transcript that reads and holds no API call is genuinely EMPTY"""
     store = fleet["store"]
     wo = _due_cold_pause(fleet, fake_claude, settle_turns, monkeypatch)
     _forget_measured_contexts(store, wo["id"])
@@ -534,8 +466,7 @@ def test_a_readable_transcript_with_nothing_billed_is_empty_not_unknown(
 
 def test_a_corrupt_transcript_is_empty_not_unknown(
         fleet, fake_claude, settle_turns, monkeypatch, transcripts):
-    """A file that exists and holds no parseable line is EMPTY, not UNKNOWN: `calls_of`
-    swallows the per-line ValueError, so it yields no call and the size reads 0."""
+    """A file that exists and holds no parseable line is EMPTY"""
     store = fleet["store"]
     wo = _due_cold_pause(fleet, fake_claude, settle_turns, monkeypatch)
     _forget_measured_contexts(store, wo["id"])
@@ -548,7 +479,7 @@ def test_a_corrupt_transcript_is_empty_not_unknown(
 
 def test_a_work_order_with_no_session_is_empty_not_unknown(
         fleet, fake_claude, settle_turns, monkeypatch, transcripts):
-    """No session id is no conversation to resume — there is nothing to summarise."""
+    """No session id is no conversation to resume — there is nothing to summarise"""
     store = fleet["store"]
     wo = _due_cold_pause(fleet, fake_claude, settle_turns, monkeypatch)
     _forget_measured_contexts(store, wo["id"])
@@ -562,8 +493,7 @@ def test_a_work_order_with_no_session_is_empty_not_unknown(
 
 def test_a_session_id_with_no_transcript_is_empty_not_unknown(
         fleet, fake_claude, settle_turns, monkeypatch, transcripts):
-    """Neo 1127: `--resume` reads the same file, so no file is no conversation to
-    compact — UNKNOWN there could only launch a compaction that must fail."""
+    """Neo 1127: `--resume` reads the same file, so no file is no conversation to compact"""
     store = fleet["store"]
     wo = _due_cold_pause(fleet, fake_claude, settle_turns, monkeypatch)
     _forget_measured_contexts(store, wo["id"])      # and no transcript for its session
@@ -575,8 +505,7 @@ def test_a_session_id_with_no_transcript_is_empty_not_unknown(
 
 def test_an_unreadable_transcript_compacts_and_records_no_size(
         fleet, fake_claude, settle_turns, monkeypatch, transcripts):
-    """UNKNOWN is the one case that compacts under the floor — and it must not write a
-    figure the OS never measured onto the record."""
+    """UNKNOWN is the one case that compacts under the floor"""
     store = fleet["store"]
     wo = _due_cold_pause(fleet, fake_claude, settle_turns, monkeypatch)
     _forget_measured_contexts(store, wo["id"])
@@ -601,7 +530,7 @@ def test_an_unreadable_transcript_compacts_and_records_no_size(
 
 def test_a_recorded_size_still_wins_over_the_transcript(
         fleet, fake_claude, settle_turns, monkeypatch, transcripts):
-    """The transcript is the FALLBACK: a turn that measured one is the better figure."""
+    """The transcript is the FALLBACK: a turn that measured one is the better figure"""
     store = fleet["store"]
     wo = _due_cold_pause(fleet, fake_claude, settle_turns, monkeypatch)
     _forget_measured_contexts(store, wo["id"])
@@ -611,12 +540,11 @@ def test_a_recorded_size_still_wins_over_the_transcript(
     assert worker_session.measured_context(store, wo["id"]) == 42_000
 
 
-# -- the paths that used to skip the decision (spec 2026-09-29, §1.2-§1.4) -------------
+# -- the paths that used to skip the decision (spec 2026-09-29, §1.2-§1.4)
 
 
 def _re_dispatch(fleet, wo_id: str) -> dict:
-    """The §1.4 shape: an order with a conversation behind it, dispatched a second time
-    (`ops.defer_red_release` re-parks a running release order to `pending`)."""
+    """The §1.4 shape: an order with a conversation behind it"""
     from jarvis import dispatch
     from jarvis.central_store import CentralStore
 
@@ -633,8 +561,7 @@ def _re_dispatch(fleet, wo_id: str) -> dict:
 
 
 def test_a_re_dispatched_order_compacts_before_its_prompt_goes_out(fleet, settle_turns):
-    """The dispatch-resume path: `worker_session.start` resumes an existing session, so
-    a second dispatch past the TTL re-writes the whole conversation."""
+    """The dispatch-resume path: `worker_session.start` resumes an existing session"""
     store = fleet["store"]
     wo = _running_wo(fleet, settle_turns)
     _age_last_turn(store, wo["id"], usage.WRITE_TTL_SECONDS + 60)
@@ -657,8 +584,7 @@ def test_a_re_dispatched_order_compacts_before_its_prompt_goes_out(fleet, settle
 
 
 def test_an_opening_dispatch_is_byte_identical(fleet):
-    """No turn on record, so the decision returns None and nothing about a first
-    dispatch changes."""
+    """No turn on record, so the decision returns None and nothing about a first dispatch changes"""
     store = fleet["store"]
     wo = ops.create_work_order("proj_a", "task")
 
@@ -692,14 +618,13 @@ def test_a_compaction_is_never_followed_by_another_on_the_new_paths(fleet,
 
 
 def _exhausted_cold(fleet, settle_turns) -> dict:
-    """An order parked in `budget_exhausted` over a cold, large conversation (§1.2)."""
+    """An order parked in `budget_exhausted` over a cold, large conversation (§1.2)"""
     from jarvis import budget as budget_mod
 
     store = fleet["store"]
     wo = _running_wo(fleet, settle_turns)
     _age_last_turn(store, wo["id"], usage.WRITE_TTL_SECONDS + 60)
-    # Over the REAL floor: `ops._resume_after_budget` resolves the catalog from the file,
-    # so the fleet fixture's lowered `compact_min_context` does not reach it.
+    # Over the REAL floor: `ops._resume_after_budget` resolves the catalog from the file
     _big_context(store, wo["id"], 150_000)
     store.set_status(wo["id"], budget_mod.EXHAUSTED)
     return store.get_work_order(wo["id"])
@@ -707,8 +632,7 @@ def _exhausted_cold(fleet, settle_turns) -> dict:
 
 def test_raising_the_budget_on_a_cold_order_compacts_before_the_relaunch(
         fleet, settle_turns):
-    """§1.2, observed on wo-35fc3de7: the budget-raise resume builds a synthetic pause
-    and relaunched cold, re-writing 115,829 tokens out of the money just added."""
+    """§1.2, observed on wo-35fc3de7: the budget-raise resume builds a synthetic pause and relaunched..."""
     store = fleet["store"]
     wo = _exhausted_cold(fleet, settle_turns)
 
@@ -721,8 +645,7 @@ def test_raising_the_budget_on_a_cold_order_compacts_before_the_relaunch(
     event = [e for e in store.list_events(wo["id"])
              if e["kind"] == "budget_resumed"][-1]
     payload = json.loads(event["payload"])
-    # Otherwise the timeline reads as if the worker resumed directly, on a seq that is
-    # the COMPACTION's.
+    # Otherwise the timeline reads as if the worker resumed directly, on a seq that is the COMPACTION's
     assert payload["compacted"] is True
     assert settle_turns(store)
 
@@ -732,7 +655,7 @@ def test_raising_the_budget_on_a_cold_order_compacts_before_the_relaunch(
 
 def test_a_second_top_up_does_not_re_send_a_relaunch_that_is_still_queued(
         fleet, settle_turns):
-    """The §2 double relaunch, from the other end: the queued relaunch IS the resume."""
+    """The §2 double relaunch, from the other end: the queued relaunch IS the resume"""
     from jarvis import budget as budget_mod
 
     store = fleet["store"]
@@ -749,8 +672,7 @@ def test_a_second_top_up_does_not_re_send_a_relaunch_that_is_still_queued(
 
 
 def test_an_ordinary_queued_message_does_not_look_like_a_relaunch(fleet, settle_turns):
-    """§3.5 step 1 distinguishes on the source, so `jarvis wo send`'s default must not
-    match it — a false positive skips the retry and the lost turn gets no nudge."""
+    """§3.5 step 1 distinguishes on the source, so `jarvis wo send`'s default must not match it"""
     store = fleet["store"]
     wo = _exhausted_cold(fleet, settle_turns)
     ops.send_message(wo["id"], "one more thing")
@@ -765,7 +687,7 @@ def test_an_ordinary_queued_message_does_not_look_like_a_relaunch(fleet, settle_
 
 
 def test_a_queued_relaunch_renders_as_jarvis_not_as_the_user():
-    """Nobody decided a relaunch, so it belongs in `timeline.UNAUTHORED_SOURCES`."""
+    """Nobody decided a relaunch, so it belongs in `timeline.UNAUTHORED_SOURCES`"""
     from jarvis import timeline
 
     assert worker_session.RESUME_SOURCE in timeline.UNAUTHORED_SOURCES
@@ -775,8 +697,7 @@ def test_a_queued_relaunch_renders_as_jarvis_not_as_the_user():
 
 
 def test_a_relaunch_after_a_budget_raise_is_not_told_the_transport_failed(fleet):
-    """`_nudge` has an honest budget branch; behind a compaction it needs the same one
-    — the budget-raise path is now a caller."""
+    """`_nudge` has an honest budget branch; behind a compaction it needs the same one"""
     pause = worker_session.TurnPause(
         reason=worker_session.PAUSE_BUDGET, turn={}, retry_at=0.0, attempts=1,
         message="its budget was raised")
@@ -788,8 +709,7 @@ def test_a_relaunch_after_a_budget_raise_is_not_told_the_transport_failed(fleet)
 
 def test_a_compaction_that_cannot_be_launched_withdraws_the_queued_relaunch(
         fleet, fake_claude, settle_turns, monkeypatch):
-    """§3.3: queue-first is what stops the pause being erased, so the failure path has
-    to take the queued relaunch back — otherwise it goes out behind a later retry."""
+    """§3.3: queue-first is what stops the pause being erased"""
     store, daemon = fleet["store"], fleet["daemon"]
     wo = _due_cold_pause(fleet, fake_claude, settle_turns, monkeypatch)
     monkeypatch.setattr(worker_session, "compact",
@@ -805,8 +725,7 @@ def test_a_compaction_that_cannot_be_launched_withdraws_the_queued_relaunch(
 
 def test_a_compaction_that_cannot_be_launched_never_costs_the_message(
         fleet, settle_turns, monkeypatch):
-    """The boundary was going to be paid for anyway; a work order that stops moving is
-    strictly worse than paying it."""
+    """The boundary was going to be paid for anyway"""
     store = fleet["store"]
     wo = _running_wo(fleet, settle_turns)
     ops.send_message(wo["id"], "go on")
@@ -819,7 +738,7 @@ def test_a_compaction_that_cannot_be_launched_never_costs_the_message(
     assert _turns(store, wo["id"])[-1] == ("message", "go on")
 
 
-# -- what the record and the bill say --------------------------------------------------
+# -- what the record and the bill say
 
 
 def test_the_summary_is_not_recorded_as_the_workers_reply(fleet, settle_turns):
@@ -837,8 +756,7 @@ def test_the_summary_is_not_recorded_as_the_workers_reply(fleet, settle_turns):
 
 
 def test_the_compactions_own_cost_lands_on_the_bill(fleet, settle_turns):
-    """It writes no assistant message, so `usage.read_session` cannot see it. If it is
-    not recorded here the saving is reported GROSS — the one thing this must not do."""
+    """It writes no assistant message, so `usage.read_session` cannot see it"""
     store = fleet["store"]
     wo = _running_wo(fleet, settle_turns)
     ops.send_message(wo["id"], "go on")
@@ -856,7 +774,7 @@ def test_the_compactions_own_cost_lands_on_the_bill(fleet, settle_turns):
     assert "compaction" in kinds
 
 
-# -- the accounting, which is where a relabelling would hide ---------------------------
+# -- the accounting, which is where a relabelling would hide
 
 
 def _rows(*, write: int, read: int, at: str, mid: str) -> dict:
@@ -878,18 +796,13 @@ COMPACTED = [
     _rows(write=200_000, read=0, at="2026-09-18T10:00:00.000Z", mid="a"),
     _rows(write=3_000, read=200_000, at="2026-09-18T10:01:00.000Z", mid="b"),
     _compact_row("2026-09-18T10:30:00.000Z"),
-    # The call after a compaction: seconds later, static head served, summary written.
+    # The call after a compaction: seconds later, static head served, summary written
     _rows(write=15_380, read=12_776, at="2026-09-18T10:30:20.000Z", mid="c"),
 ]
 
 
 def test_the_turn_after_a_compaction_is_not_a_prefix_miss(transcripts):
-    """By gap and read alone it is one — which is exactly why it is tested first.
-
-    Counting it as prefix invalidation would report the remedy as the defect, and
-    `invariants.check_prefix_stable` would read a fleet whose prefix had not moved as
-    drifting.
-    """
+    """By gap and read alone it is one — which is exactly why it is tested first"""
     transcripts("s-compact", COMPACTED)
     total = usage.read_session("s-compact", FLOOR).total
 
@@ -897,8 +810,7 @@ def test_the_turn_after_a_compaction_is_not_a_prefix_miss(transcripts):
     assert total.rewrite_prefix_write == 0
     assert total.rewrite_ttl_write == 0
 
-    # …and the same boundary WITHOUT the compaction row is a prefix miss, so the test
-    # above is about the marker and not about the numbers.
+    # …and the same boundary WITHOUT the compaction row is a prefix miss
     transcripts("s-plain", [r for r in COMPACTED if r.get("type") == "assistant"])
     plain = usage.read_session("s-plain", FLOOR).total
     assert plain.rewrite_prefix_write == 15_380 and plain.boundaries_compact == 0
@@ -913,17 +825,12 @@ def test_inspect_labels_the_write_a_compaction_and_raises_no_alarm_for_it(transc
     causes = [w.cause for w in inspection.classify_writes(calls, 10_000, stamps)]
 
     assert causes == [inspection.COLD_START, inspection.COMPACTION]
-    # Without the marker the same write is misread — as `ttl-expiry` here and as
-    # prefix invalidation in `usage`, because the compaction call writes no assistant
-    # message and so the gap the two measure spans the whole idle stretch. Two
-    # classifiers, two wrong answers, one marker: that is why it is read from the
-    # transcript rather than inferred from the numbers.
+    # Without the marker the same write is misread
     assert inspection.classify_writes(calls, 10_000)[1].cause == inspection.TTL_EXPIRY
 
 
 def test_a_compacted_boundary_is_not_counted_as_a_prefix_one_on_the_seal():
-    """`prefix_boundaries` is a subtraction, so a third cause has to be taken out of it
-    or every compaction reads as prefix drift."""
+    """`prefix_boundaries` is a subtraction"""
     writes = bill.CacheWrites(boundaries=10, ttl_boundaries=3, compact_boundaries=4)
 
     assert writes.prefix_boundaries == 3
@@ -946,13 +853,7 @@ def test_the_floor_has_a_floor_and_null_is_the_only_off_switch(tmp_path):
 
 
 def test_the_cohort_script_classifies_boundaries_exactly_as_the_bill_does(transcripts):
-    """Two spellings of one classification is how two surfaces come to disagree about
-    the same boundary — the rule `scripts/cache_ttl_cohort.py` already follows by
-    importing `usage.read_session` outright. This one cannot: it needs the boundaries
-    kept apart rather than totalled, and re-reading every transcript a second time to
-    get the aggregate costs five minutes (kn-4b2ef07f (3)). So it restates them, and
-    this is what holds the restatement to the original.
-    """
+    """Two spellings of one classification is how two surfaces come to disagree about the same boundary"""
     import importlib.util
 
     spec = importlib.util.spec_from_file_location(

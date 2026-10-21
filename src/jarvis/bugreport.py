@@ -1,21 +1,4 @@
-"""Bug reporting: one command turns a fleet agent's observation into a tracked issue.
-
-Any agent working under the OS — a worker in its worktree, Jarvis in the terminal —
-runs `jarvis bug report` when Jarvis OS itself misbehaves. That files a GitHub issue on
-the OS repo from a fixed template, hands it to `issues` to be picked up as work, and puts
-the link in front of the user through the normal notification pipeline. The first and the
-last are not optional; the middle one is a project's own choice
-(`catalog.BugsConfig`, and `issues` for the lifecycle that follows).
-
-The template is fixed on purpose. Bugs found by agents are read later by an agent
-fixing them, and "what I expected vs what I got" plus the exact running version is what
-makes a report actionable months later. Getting that version right is fiddly enough to
-have its own section below; the one rule it answers to is that a report must never carry
-a number that was never released.
-
-A filing that fails raises. Half-succeeding — pinging the user about an issue that
-does not exist — teaches them to distrust the pings.
-"""
+"""Bug reporting: one command turns a fleet agent's observation into a tracked issue"""
 
 from __future__ import annotations
 
@@ -28,46 +11,23 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-#: The OS's own issue tracker. Overridable so forks (and tests) target their own repo.
+#: The OS's own issue tracker
 DEFAULT_BUG_REPO = "gonandrap/agentic_os"
 BUG_REPO_ENV = "JARVIS_BUG_REPO"
 BUG_LABEL = "bug"
 
-#: The last line of every body this module files. Public text, so it proves nothing on
-#: its own — the red-base adoption filter pairs it with the AUTHOR login (spec
-#: docs/superpowers/specs/2026-10-14-a-red-main-dispatches-its-own-fix.md §4).
+#: The last line of every body this module files (docs/superpowers/specs/2026-10-14-a-red-main-dispatches-its-own-fix.md §4)
 FILED_MARKER = "<!-- Filed automatically by `jarvis bug report`. -->"
 
-#: `gh` location override, mirroring JARVIS_CLAUDE_BIN.
+#: `gh` location override, mirroring JARVIS_CLAUDE_BIN
 GH_BIN_ENV = "JARVIS_GH_BIN"
 
-#: Where to look for `gh` when PATH does not have it. A systemd --user service inherits
-#: none of a login shell's PATH, so a snap-installed `gh` (/snap/bin/gh — the default on
-#: Ubuntu) is invisible to the daemon and to every worker it spawns: PR-merge polling
-#: goes silently off and `jarvis bug report` fails fleet-wide (issues #41, #90).
-#:
-#: The service PATH is the real fix and `scripts/install_prod_service.sh` writes it —
-#: THIS LIST IS MIRRORED THERE, keep the two in step. This scan is the second half: it
-#: heals a daemon whose unit was rendered before that fix, without a re-install, for
-#: Python callers. Workers shell out to a bare `gh` from bash and are reached by
-#: neither — `heal_path` below is what covers them.
+#: Where to look for `gh` when PATH does not have it (#41)
 GH_SEARCH_DIRS = ("/snap/bin", "~/.local/bin", "/usr/local/bin", "/usr/bin", "/bin")
 
 
 def heal_path(environ: MutableMapping[str, str] | None = None) -> list[str]:
-    """Put the missing `GH_SEARCH_DIRS` back on PATH, so spawned children inherit them.
-
-    The third half of #41/#90, and the one the two existing halves say out loud they
-    cannot be: `install_prod_service.sh` writes the service PATH but only a re-run
-    applies it, and `gh_bin()`'s scan reaches Python callers only. A WORKER shells out
-    to a bare `gh` from bash, and nothing but the inherited PATH reaches that — which
-    is why the fix sat rendered-but-unapplied on this fleet for a release and a half
-    (the installed unit predated it; see `invariants.check_service_path`).
-
-    APPENDS rather than prepends, and only directories that exist and are not already
-    there: every entry keeps its current precedence, so a snap-installed `node` or
-    `python` can never shadow the venv's. Returns what it added, for the caller to log.
-    """
+    """Put the missing `GH_SEARCH_DIRS` back on PATH, so spawned children inherit them (#41)"""
     env = os.environ if environ is None else environ
     current = env.get("PATH", "")
     present = {p for p in current.split(os.pathsep) if p}
@@ -80,47 +40,22 @@ def heal_path(environ: MutableMapping[str, str] | None = None) -> list[str]:
 
 
 class BugReportError(RuntimeError):
-    """Filing the bug failed; nothing was reported to anyone."""
+    """Filing the bug failed; nothing was reported to anyone"""
 
 
-# -- which Jarvis is running ----------------------------------------------------
-#
-# Three surfaces show this string — the bug template below, `jarvis --version`, and the
-# dashboard's environment badge — and all three are read by someone trying to correlate
-# a symptom with a release. So the one hard requirement is: NEVER report a number that
-# was never released.
-#
-# Installed dist metadata alone cannot meet that. It is exactly right in production
-# (the deploy checks out the tag, whose pyproject carries the bump) and misleading in
-# the dev checkout, because the bump lives only on release branches — main's pyproject
-# sits on whatever number it was last left at, and reporting that invents a release.
-#
-# Git settles it, with one catch worth knowing before touching this code: the release
-# branch is cut FROM main and the bump commit + tag land on that branch, never merged
-# back. So a release tag is a DESCENDANT of main, not an ancestor, and plain
-# `git describe` from the dev checkout resolves nothing at all ("No tags can describe").
-# Asking whether HEAD *is* a release tag is the question that has an answer:
-#
-#   detached exactly at jarvis-X.Y.Z  -> a real release, report X.Y.Z
-#   a Jarvis checkout, but not at a tag -> a dev build, say so with the commit
-#   no checkout (wheel install)         -> dist metadata, which is right there anyway
+# -- which Jarvis is running
 
-#: Release tags are `jarvis-X.Y.Z`; the deploy leaves production detached at one.
+#: Release tags are `jarvis-X.Y.Z`; the deploy leaves production detached at one
 RELEASE_TAG_PREFIX = "jarvis-"
 
 
 def _source_dir() -> Path:
-    """The directory holding this module. Seam for tests."""
+    """The directory holding this module"""
     return Path(__file__).resolve().parent
 
 
 def _git(cwd: Path, *args: str) -> str | None:
-    """Run git in `cwd` and return stripped stdout, or None if it did not work out.
-
-    Never raises and never inspects the process cwd: `jarvis bug report` is routinely
-    run by a worker sitting in ITS OWN project's worktree, so asking git about the
-    working directory would report some unrelated project's version.
-    """
+    """Run git in `cwd` and return stripped stdout, or None if it did not work out"""
     try:
         proc = subprocess.run(["git", "-C", str(cwd), *args],
                               capture_output=True, text=True, timeout=5)
@@ -132,14 +67,7 @@ def _git(cwd: Path, *args: str) -> str | None:
 
 
 def _jarvis_checkout() -> Path | None:
-    """The Jarvis git checkout this code runs from, or None if it is not running from one.
-
-    The layout check is the point. Production and dev both install editable, so the
-    package sits at <checkout>/src/jarvis and git can be trusted. A wheel install puts
-    it in site-packages — which may itself sit inside some *unrelated* repo (a venv
-    under a user's own project), and git would happily describe that one. Requiring the
-    repo root to be the parent of our own src/jarvis keeps that mistake impossible.
-    """
+    """The Jarvis git checkout this code runs from, or None if it is not running from one"""
     src = _source_dir()
     top = _git(src, "rev-parse", "--show-toplevel")
     if not top:
@@ -149,18 +77,13 @@ def _jarvis_checkout() -> Path | None:
 
 
 def _dev_version(root: Path, suffix: str) -> str:
-    """How a build that is not a release identifies itself.
-
-    Deliberately carries no X.Y.Z: the dev checkout is not "0.2.1 plus a bit", it is a
-    commit that sits *behind* the latest tag (the release bump is not on main), so any
-    number here would be the invention this whole module is trying to avoid.
-    """
+    """How a build that is not a release identifies itself"""
     sha = _git(root, "rev-parse", "--short", "HEAD") or "unknown"
     return f"dev-{sha}{suffix}"
 
 
 def _installed_version() -> str:
-    """Dist metadata, then the in-tree constant. The no-git fallback."""
+    """Dist metadata, then the in-tree constant"""
     from importlib.metadata import PackageNotFoundError, version
     try:
         return version("jarvis-os")
@@ -171,16 +94,7 @@ def _installed_version() -> str:
 
 @lru_cache(maxsize=1)
 def jarvis_version() -> str:
-    """The version of Jarvis OS actually running.
-
-    A shipped release reports its bare number; anything else is self-evidently not one.
-    A tree with uncommitted changes to tracked files is marked `-dirty`, in the release
-    case too — a hand-edited production checkout is no longer the release it claims to
-    be, and that is worth seeing on a bug report.
-
-    Cached: the dashboard badge asks once per page render, and a deploy restarts the
-    process anyway. Never raises — a version string must not be why a page 500s.
-    """
+    """The version of Jarvis OS actually running"""
     try:
         root = _jarvis_checkout()
         if root is not None:
@@ -201,12 +115,7 @@ def bug_repo() -> str:
 
 
 def gh_bin() -> str:
-    """Where `gh` is: the override, then PATH, then the well-known locations.
-
-    Falls back to the bare name so callers still produce a recognisable command line in
-    an error; `gh_missing_message` is what explains it. Deliberately uncached — a
-    long-running daemon should pick up a `gh` that appeared after it started.
-    """
+    """Where `gh` is: the override, then PATH, then the well-known locations"""
     override = os.environ.get(GH_BIN_ENV)
     if override:
         return override
@@ -221,14 +130,7 @@ def gh_bin() -> str:
 
 
 def gh_missing_message(consequence: str) -> str:
-    """Why `gh` could not be run — written for someone who probably HAS it installed.
-
-    The old wording ("install the GitHub CLI") sent the user to reinstall software that
-    was already there and authenticated; on this fleet the cause has never once been a
-    missing CLI, it has been a PATH that a systemd unit never inherited (#41, #90). So
-    name what was searched, put the PATH fix first, and leave "install it" as the last
-    resort it actually is.
-    """
+    """Why `gh` could not be run — written for someone who probably HAS it installed (#41)"""
     searched = os.environ.get("PATH", "") or "(empty)"
     extra = ", ".join(GH_SEARCH_DIRS)
     return (
@@ -246,7 +148,7 @@ def gh_missing_message(consequence: str) -> str:
 def render_body(*, description: str, expected: str, actual: str, version: str,
                 project: str = "", wo_id: str = "", steps: str = "",
                 priority: str = "") -> str:
-    """The bug template. Every report on the tracker has this shape."""
+    """The bug template"""
     parts = [
         "### Description",
         "",
@@ -273,9 +175,7 @@ def render_body(*, description: str, expected: str, actual: str, version: str,
     parts += [
         "---",
         "",
-        # The CLAIM, permanently. The `priority:` LABEL carries what the bug is settled
-        # at and moves when Neo re-assesses it; this line does not move, so the two
-        # together are the disagreement the user reads the rubric off.
+        # The CLAIM, permanently
         *([f"- **Priority claimed by the reporter:** `{priority}`"] if priority else []),
         f"- **Jarvis OS version:** `{version}`",
         f"- **Reported by:** {reporter}",
@@ -287,11 +187,7 @@ def render_body(*, description: str, expected: str, actual: str, version: str,
 
 
 def create_issue(title: str, body: str, repo: str, label: str = BUG_LABEL) -> str:
-    """Create the GitHub issue and return its URL. Raises BugReportError on failure.
-
-    The body travels over stdin (`--body-file -`): reports carry logs and tracebacks,
-    and argv has a length limit that stdin does not.
-    """
+    """Create the GitHub issue and return its URL"""
     cmd = [gh_bin(), "issue", "create", "--repo", repo,
            "--title", title, "--label", label, "--body-file", "-"]
     try:
@@ -315,25 +211,14 @@ def create_issue(title: str, body: str, repo: str, label: str = BUG_LABEL) -> st
 
 
 def _rubric() -> str:
-    """`issues.PRIORITY_RUBRIC`, imported late.
-
-    `issues` imports this module (for `gh_bin` and `bug_repo`), so the dependency only
-    goes one way at import time. One text, one definition of the levels — see that
-    constant for why it must not be restated here.
-    """
+    """`issues.PRIORITY_RUBRIC`, imported late"""
     from .issues import PRIORITY_RUBRIC
     return PRIORITY_RUBRIC
 
 
 def _route(url: str, title: str, body: str, priority: str,
            expedite: bool = False) -> dict[str, Any]:
-    """Put the freshly filed issue on the OS's rails.
-
-    Deliberately cannot fail the filing. The issue exists by the time this runs, so an
-    exception here would report "the bug was not filed" about a bug that was — the
-    inverse of the half-success `report_bug` refuses to produce, and just as misleading.
-    Whatever went wrong comes back as `reason` and reaches the user with everything else.
-    """
+    """Put the freshly filed issue on the OS's rails"""
     from .issues import route_filing
     try:
         return route_filing(url, title, body, priority, expedite=expedite)
@@ -343,17 +228,10 @@ def _route(url: str, title: str, body: str, priority: str,
 
 
 def pickup_note(pickup: dict[str, Any]) -> str:
-    """The one line the user reads about what happened after the issue was created.
-
-    Says only what actually reached the tracker, and NEVER rounds a claim up to a
-    decision: a `critical` filing whose re-assessment is still queued says exactly that,
-    because between the filing and Neo's verdict the honest answer is "nothing has been
-    decided yet" (`report_bug`'s rule — never ping about a state that was not reached).
-    """
+    """The one line the user reads about what happened after the issue was created"""
     level = pickup.get("priority") or "?"
     if pickup.get("wo_id"):
-        # `expedited` and `confirmed` are different facts about the same work order: one
-        # says the user asked for it now, the other that Neo agreed with the rating.
+        # `expedited` and `confirmed` are different facts about the same work order: one says the user asked...
         verb = "expedited" if pickup.get("expedited") else "confirmed"
         head = (f"`{level}` {verb} — work order {pickup['wo_id']} in "
                 f"{pickup.get('project') or '?'}")
@@ -370,12 +248,7 @@ def pickup_note(pickup: dict[str, Any]) -> str:
 
 def _notify(project: str, title: str, url: str, version: str, wo_id: str,
             pickup: dict[str, Any] | None = None) -> None:
-    """Put the issue link in front of the user via the normal inbox -> sinks path.
-
-    The daemon routes the inbox on each tick; when it is not running (a bug reported
-    from an interactive Jarvis session on a stopped OS) we route inline so the ping is
-    never silently lost.
-    """
+    """Put the issue link in front of the user via the normal inbox -> sinks path"""
     from .central_store import CentralStore
     from .daemon import daemon_running
 
@@ -404,25 +277,7 @@ AGENT_EXPEDITE_NOTE = ("--expedite ignored: filed from a work-order session, so 
 def report_bug(*, title: str, description: str, expected: str, actual: str,
                priority: str = "", steps: str = "", project: str = "",
                wo_id: str = "", expedite: bool = False) -> dict[str, Any]:
-    """File a Jarvis OS bug, put it on the OS's rails, and tell the user about it.
-
-    **`priority` IS REQUIRED AND IS NEVER INFERRED** (the user's ruling of 2026-09-14).
-    It is the only thing that routes the report, so a default would be the OS deciding
-    how serious someone else's bug is — and the only defaults available are wrong in one
-    direction or the other: `critical` lets a typo commit the fleet to a release, and
-    `low` silently buries a report the filer knew was urgent. Refusing costs the caller
-    one word and `issues.PRIORITY_RUBRIC` tells them which.
-
-    `expedite` dispatches a work order on the issue immediately, at ANY priority, and
-    is the only thing that can. It is a scheduling decision and leaves the rating alone
-    — see `issues.route_filing`, which holds what it does and does not skip.
-
-    Raises BugReportError if the priority is missing or unknown, or if the ISSUE could
-    not be created — in which case nobody is notified. Nothing after that raises: by then
-    the issue exists, and failing the call would report "not filed" about a bug that was
-    filed. What did and did not happen to it comes back in `pickup` and goes out with the
-    notification (`pickup_note`).
-    """
+    """File a Jarvis OS bug, put it on the OS's rails, and tell the user about it"""
     from .issues import checked_priority
 
     if not title.strip():
@@ -448,8 +303,7 @@ def report_bug(*, title: str, description: str, expected: str, actual: str,
                        version=version, project=project, wo_id=wo_id, steps=steps,
                        priority=priority)
     url = create_issue(title, body, repo)
-    # Between creating the issue and telling anyone about it, so the ping says what the
-    # tracker actually shows rather than what it was about to show (issue #240).
+    # Between creating the issue and telling anyone about it (#240)
     pickup = _route(url, title, body, priority, expedite=expedite)
     _notify(project, title, url, version, wo_id, pickup)
     out = {"url": url, "title": title, "repo": repo, "version": version,

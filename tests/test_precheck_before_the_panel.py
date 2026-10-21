@@ -1,25 +1,4 @@
-"""A fix order whose rule is not proved never reaches the panel, and never costs a round.
-
-§7.2 and §7.3 of docs/superpowers/specs/2026-09-27-self-evolution.md. `rules.precheck`
-itself is unit-tested in `tests/test_rules_precheck.py`, where it is pure; this file is
-about the two SITES that call it and the checklist that goes with it:
-
-* `ops.submit_for_validation`, BEFORE the packet is collected and BEFORE the round is
-  opened — the round is what costs money, so a refusal that opened one has already
-  failed at its job;
-* `Daemon._validate_work_order`, for the routes that do not pass through `finish`, where
-  the round is already numbered and the refusal therefore spends it.
-
-EVERY CASE ASSERTS THE SPY, NOT JUST THE REASON. `Validator.calls` is the seat-call
-record, and `calls == []` is the only evidence that the panel was not paid — a precise
-refusal with a round judged behind it would read identically on every other surface.
-
-THE CROSS-CHILD TEST at the bottom stubs neither side: it drives a REAL seed rule out of
-`rules.seed_rows()` through the REAL `remedies.REMEDIES[...].can_apply`. kn-e3aa04c5
-records that those two children already disagreed about parameter names on three of the
-five seed rows, and the only place such a disagreement is visible is a test that imports
-both.
-"""
+"""A fix order whose rule is not proved never reaches the panel, and never costs a round (docs/superpowers/specs/2026-09-27-self-evolution.md)"""
 
 from __future__ import annotations
 
@@ -34,16 +13,12 @@ from tests.test_validation_loop import (  # noqa: F401
     Validator, fleet, finish, passed)
 
 
-# -- staging ---------------------------------------------------------------------------
+# -- staging
 
 
 def register(gap_class: str, condition: dict, *, primitive: str = "",
              params: dict | None = None) -> tuple[str, str]:
-    """A detector in the REAL central store, optionally with one remedy row.
-
-    Returns `(detector_id, remedy_rule_id)`; the remedy id is `""` when none was asked
-    for, which is case (b) below.
-    """
+    """A detector in the REAL central store, optionally with one remedy row"""
     central = CentralStore()
     try:
         det = central.add_detector(gap_class, condition, source="user",
@@ -59,7 +34,7 @@ def register(gap_class: str, condition: dict, *, primitive: str = "",
 
 def trigger_order(fleet, *, status: str = "needs_review", attention: str = "",
                   round_outcome: str = "", ack: tuple[str, ...] = ()) -> dict:
-    """An ordinary work order put into the recorded state a detector is proved against."""
+    """An ordinary work order put into the recorded state a detector is proved against"""
     wo = fleet.dispatch("the order the rule is proved against")
     store = fleet.store()
     try:
@@ -73,11 +48,7 @@ def trigger_order(fleet, *, status: str = "needs_review", attention: str = "",
                 pr_url="", round=1, config_version="t")
             store.close_validation_round(int(row["id"]), round_outcome, "judged")
         if ack:
-            # THE USER HAS ALREADY SEEN AND DISMISSED THAT LINE. `true_blockers` filters
-            # against this column, so a flag still up with every true blocker
-            # acknowledged is precisely the stale flag seed rule 1 is about (issue
-            # #786) — and the only state in which `lower_attention` can legitimately
-            # run on a `needs_review` order.
+            # THE USER HAS ALREADY SEEN AND DISMISSED THAT LINE (#786)
             store.update_work_order(wo["id"], acknowledged_blockers=json.dumps(list(ack)))
         return store.get_work_order(wo["id"])
     finally:
@@ -85,15 +56,7 @@ def trigger_order(fleet, *, status: str = "needs_review", attention: str = "",
 
 
 def age_status(fleet, wo_id: str, seconds: float) -> None:
-    """Backdate every recorded status span, so the order has been where it is for an
-    hour. A condition about `seconds_in_status` cannot otherwise be exercised, and the
-    rows this rewrites are exactly the ones `set_status` would have written then.
-
-    CALLED AFTER THE LAST TICK, never before one: the reconciler writes the order's
-    final span itself on the tick after it is staged, and a backdating done earlier is
-    simply overwritten — which reads, from the refusal, exactly like the detector
-    working. The staged value is asserted here for the same reason.
-    """
+    """Backdate every recorded status span, so the order has been where it is for an hour"""
     store = fleet.store()
     try:
         store.conn.execute("UPDATE wo_state_spans SET ts=? WHERE order_id=?",
@@ -108,14 +71,14 @@ def age_status(fleet, wo_id: str, seconds: float) -> None:
 
 
 def dispatch_fix_order(fleet, **columns) -> tuple[str, Validator]:
-    """A fix order carrying the four §7.1 columns, dispatched but not yet delivered."""
+    """A fix order carrying the four §7.1 columns, dispatched but not yet delivered"""
     v = fleet.daemon.validator = Validator(passed())
     wo = fleet.dispatch("close the gap", **columns)
     return wo["id"], v
 
 
 def deliver(fleet, wo_id: str) -> None:
-    """Finish it the way a worker that produced code does: behind a pull request."""
+    """Finish it the way a worker that produced code does: behind a pull request"""
     fleet.change(wo_id, "print('the fix')\n")
     finish(fleet, wo_id)
 
@@ -144,19 +107,12 @@ def refusal_event(fleet, wo_id: str) -> dict:
 
 
 def refusal_reason(fleet, wo_id: str) -> str:
-    """The refusal's words off the TIMELINE, which is where they stay.
-
-    The envelope carries the same sentence and is read once, below, before anything
-    ticks: `bus.post` queues it and the router deletes the row on delivery, so a test
-    that drained first would be asserting the router's work (test_validation_bounce).
-    """
+    """The refusal's words off the TIMELINE, which is where they stay"""
     return str(refusal_event(fleet, wo_id)["reason"])
 
 
 def why_refused(fleet, wo_id: str) -> str:
-    """The refusal if there was one, `""` if there was not — for the assertion MESSAGE
-    of the tests that expect to reach the panel. A bare "0 == 1" on those says the gate
-    refused and nothing about which of the four checks did."""
+    """The refusal if there was one, `""` if there was not"""
     store = fleet.store()
     try:
         events = store.events_of_kind(wo_id, "validation_refused")
@@ -167,8 +123,7 @@ def why_refused(fleet, wo_id: str) -> str:
 
 
 def envelope(fleet, wo_id: str) -> dict:
-    """The queued envelope, NOT a delivered message: `bus.post` never resolves, and a
-    test that ticked first would be asserting the router's work (test_validation_bounce)."""
+    """The queued envelope, NOT a delivered message: `bus.post` never resolves"""
     store = fleet.store()
     try:
         [env] = [e for e in store.queued_envelopes() if e["subject_wo_id"] == wo_id]
@@ -177,7 +132,7 @@ def envelope(fleet, wo_id: str) -> dict:
         store.close()
 
 
-# -- (a)-(d): the four refusals, none of which pays a seat ------------------------------
+# -- (a)-(d): the four refusals, none of which pays a seat
 
 
 def test_a_gap_class_with_no_registered_detector_never_reaches_the_panel(fleet):
@@ -206,7 +161,7 @@ def test_a_detector_with_no_remedy_referencing_it_never_reaches_the_panel(fleet)
 
 
 def test_a_detector_that_does_not_fire_on_the_triggering_order_is_refused(fleet):
-    """Check 3 is a REAL evaluation against the triggering order's recorded facts."""
+    """Check 3 is a REAL evaluation against the triggering order's recorded facts"""
     trigger = trigger_order(fleet, status="needs_review")
     det, rid = register("never-fires",
                         {"field": "status", "op": "eq", "value": "cancelled"},
@@ -222,7 +177,7 @@ def test_a_detector_that_does_not_fire_on_the_triggering_order_is_refused(fleet)
 
 
 def test_a_remedy_whose_preconditions_do_not_hold_is_refused_in_its_own_words(fleet):
-    """Check 4, through the REAL `lower_attention.can_apply`: the flag is already down."""
+    """Check 4, through the REAL `lower_attention.can_apply`: the flag is already down"""
     trigger = trigger_order(fleet, status="needs_review")
     det, rid = register("flag-already-down",
                         {"field": "needs_attention", "op": "eq", "value": False},
@@ -233,13 +188,12 @@ def test_a_remedy_whose_preconditions_do_not_hold_is_refused_in_its_own_words(fl
 
     assert v.calls == []
     reason = refusal_reason(fleet, wo_id)
-    # VERBATIM, the precondition's own sentence — `rules.precheck` does not re-word it.
+    # VERBATIM, the precondition's own sentence — `rules.precheck` does not re-word it
     assert f"the attention flag on {trigger['id']} is already down" in reason
 
 
 def test_a_fix_order_with_no_triggering_order_at_all_is_refused(fleet):
-    """`trigger_wo_id` empty and no improvement-order back-link: unproven, and the
-    refusal names the argument that would fix it (§7.2's weak link, kn-85265170)."""
+    """`trigger_wo_id` empty and no improvement-order back-link: unproven"""
     det, rid = register("unproven",
                         {"field": "status", "op": "eq", "value": "needs_review"},
                         primitive="nudge", params={"what": "say something"})
@@ -251,7 +205,7 @@ def test_a_fix_order_with_no_triggering_order_at_all_is_refused(fleet):
     assert "--trigger-wo-id" in refusal_reason(fleet, wo_id)
 
 
-# -- (e): a proved pair is judged like anything else ------------------------------------
+# -- (e): a proved pair is judged like anything else
 
 
 def test_a_passing_detector_and_remedy_reach_the_panel(fleet):
@@ -269,7 +223,7 @@ def test_a_passing_detector_and_remedy_reach_the_panel(fleet):
     assert [r["outcome"] for r in rounds(fleet, wo_id)] == ["passed"]
 
 
-# -- what a refusal leaves behind -------------------------------------------------------
+# -- what a refusal leaves behind
 
 
 def test_a_refusal_opens_no_round_and_records_the_four_ids(fleet):
@@ -278,8 +232,7 @@ def test_a_refusal_opens_no_round_and_records_the_four_ids(fleet):
                                 detector_id="dt-proposed",
                                 remedy_rule_id="rm-proposed",
                                 trigger_wo_id=trigger["id"])
-    # THE ENVELOPE IS READ BEFORE ANYTHING TICKS: `bus.post` queues it and the router
-    # deletes the row on delivery, so draining first would assert the router's work.
+    # THE ENVELOPE IS READ BEFORE ANYTHING TICKS: `bus.post` queues it and the router deletes the row on...
     env = envelope(fleet, wo_id)
     fleet.drain()
 
@@ -300,7 +253,7 @@ def test_a_refusal_opens_no_round_and_records_the_four_ids(fleet):
 
 
 def test_an_ordinary_order_is_not_pre_checked_and_is_judged(fleet):
-    """The pairing: without it, "it reached the panel" proves nothing about the gate."""
+    """The pairing: without it, "it reached the panel" proves nothing about the gate"""
     wo_id, v = submit_fix_order(fleet)
     fleet.drain()
 
@@ -312,13 +265,12 @@ def test_an_ordinary_order_is_not_pre_checked_and_is_judged(fleet):
         store.close()
 
 
-# -- §7.3: the checklist, in the packet and nowhere else --------------------------------
+# -- §7.3: the checklist, in the packet and nowhere else
 
 
 def test_the_checklist_is_in_a_fix_orders_packet_and_absent_from_an_ordinary_one(
         tmp_path):
-    """Both directions. The packet is collected with no store — `evidence` may not open
-    one — so the four ids and the rendered prose come off the `wo` row alone."""
+    """Both directions"""
     fix = {"id": "wo-fix", "title": "close the gap", "description": "d",
            "gap_class": "stale-panel-hold", "detector_id": "dt-1",
            "remedy_rule_id": "rm-1", "trigger_wo_id": "wo-trigger"}
@@ -341,13 +293,10 @@ def test_the_checklist_is_in_a_fix_orders_packet_and_absent_from_an_ordinary_one
     assert "self-evolution" not in validation.build_packet_prompt(ordinary).lower()
 
 
-# -- the fingerprint, which may not move for an ordinary order --------------------------
+# -- the fingerprint, which may not move for an ordinary order
 
 
-#: Computed on the code BEFORE the four ids joined the formula, and pasted here as a
-#: literal on purpose: a test that re-derived it would pass against any formula at all,
-#: and `Daemon._preceding_round`'s repeat guard is what a changed hash silently disables
-#: (§7.3, and `evidence.fingerprint`'s own docstring).
+#: Computed on the code BEFORE the four ids joined the formula
 ORDINARY_FINGERPRINT = "964357cd1385c72b"
 
 
@@ -361,8 +310,7 @@ def _ordinary_packet(**extra) -> EvidencePacket:
 
 def test_an_ordinary_packet_hashes_to_its_pre_change_value():
     assert evidence.fingerprint(_ordinary_packet()) == ORDINARY_FINGERPRINT
-    # And the four fields being PRESENT but empty changes nothing either: that is the
-    # row every pre-existing work order has.
+    # And the four fields being PRESENT but empty changes nothing either: that is the row every...
     assert evidence.fingerprint(_ordinary_packet(
         gap_class="", detector_id="", remedy_rule_id="", trigger_wo_id="",
         self_evolution="")) == ORDINARY_FINGERPRINT
@@ -372,11 +320,11 @@ def test_a_fix_orders_ids_join_the_hash_and_the_injected_prose_does_not():
     base = _ordinary_packet(gap_class="g", detector_id="dt-1", remedy_rule_id="rm-1",
                             trigger_wo_id="wo-t", self_evolution="rendered checklist")
     assert evidence.fingerprint(base) != ORDINARY_FINGERPRINT
-    # A DIFFERENT TRIGGERING ORDER IS NEW EVIDENCE, with the same diff (§7.3).
+    # A DIFFERENT TRIGGERING ORDER IS NEW EVIDENCE, with the same diff (§7.3)
     moved = _ordinary_packet(gap_class="g", detector_id="dt-1", remedy_rule_id="rm-1",
                              trigger_wo_id="wo-other", self_evolution="x")
     assert evidence.fingerprint(moved) != evidence.fingerprint(base)
-    # THE RENDERED PROSE IS THE OS'S, regenerated every round: it may not move the hash.
+    # THE RENDERED PROSE IS THE OS'S, regenerated every round: it may not move the hash
     reworded = _ordinary_packet(gap_class="g", detector_id="dt-1", remedy_rule_id="rm-1",
                                 trigger_wo_id="wo-t",
                                 self_evolution="a differently worded checklist")
@@ -384,8 +332,7 @@ def test_a_fix_orders_ids_join_the_hash_and_the_injected_prose_does_not():
 
 
 def test_the_unproven_notes_do_not_move_the_fingerprint():
-    """Same row of the exclusion table as `self_evolution`: the OS wrote the notes, the
-    submitter did not, and they are regenerated every round."""
+    """Same row of the exclusion table as `self_evolution`: the OS wrote the notes"""
     base = _ordinary_packet(gap_class="g", detector_id="dt-1", remedy_rule_id="rm-1",
                             trigger_wo_id="wo-t", self_evolution="rendered checklist")
     noted = _ordinary_packet(
@@ -395,12 +342,11 @@ def test_the_unproven_notes_do_not_move_the_fingerprint():
     assert evidence.fingerprint(noted) == evidence.fingerprint(base)
 
 
-# -- the daemon site: a forced round is NOT exempt, and it spends the round --------------
+# -- the daemon site: a forced round is NOT exempt, and it spends the round
 
 
 def test_a_forced_round_whose_precheck_fails_is_rejected_without_paying_a_seat(fleet):
-    """No exemption at the daemon site (Neo question 1681). The round was numbered before
-    the check ran, so it is spent — and the feedback has to say so."""
+    """No exemption at the daemon site (Neo question 1681)"""
     trigger = trigger_order(fleet)
     v = fleet.daemon.validator = Validator(passed())
     wo = fleet.dispatch("close the gap", gap_class="nothing-registered",
@@ -409,8 +355,7 @@ def test_a_forced_round_whose_precheck_fails_is_rejected_without_paying_a_seat(f
 
     store = fleet.store()
     try:
-        # Straight to the submission site in its FORCED form, which is exempt there and
-        # is the only way this round comes to exist (`jarvis validation force`'s route).
+        # Straight to the submission site in its FORCED form
         row = ops.submit_for_validation(
             store, fleet.project, store.get_work_order(wo["id"]),
             declared="", cfg=ops.validation_config("proj_a"),
@@ -429,13 +374,11 @@ def test_a_forced_round_whose_precheck_fails_is_rejected_without_paying_a_seat(f
     assert "HAS been spent" in reason
 
 
-# -- a named trigger the records do not have: INPUT, so it refuses ----------------------
+# -- a named trigger the records do not have: INPUT, so it refuses
 
 
 def test_a_trigger_wo_id_that_names_no_order_is_refused_before_the_panel(fleet):
-    """THE ROUND-2 DEFECT, end to end: a made-up `--trigger-wo-id` used to read as
-    UNREADABLE, which passes checks 3 and 4 unevaluated — so a fix order could skip the
-    dry run by naming an id that does not exist, with a detector that would never fire."""
+    """THE ROUND-2 DEFECT, end to end: a made-up `--trigger-wo-id` used to read as UNREADABLE"""
     det, rid = register("never-fires-either",
                         {"field": "status", "op": "eq", "value": "cancelled"},
                         primitive="nudge", params={"what": "say something"})
@@ -448,18 +391,16 @@ def test_a_trigger_wo_id_that_names_no_order_is_refused_before_the_panel(fleet):
     assert "wo-does-not-exist" in reason and "--trigger-wo-id" in reason
 
 
-# -- a check that passed UNEVALUATED is in the packet the seats read --------------------
+# -- a check that passed UNEVALUATED is in the packet the seats read
 
 
-#: The claim the checklist drops when a check went unevaluated. Matched
-#: WITHIN one line: the rendered paragraph wraps between "were" and "all".
+#: The claim the checklist drops when a check went unevaluated
 MECHANICAL = "all decided mechanically"
 
 
 def test_a_trigger_whose_facts_cannot_be_built_reaches_the_panel_saying_check_3_was_not_run(
         fleet, monkeypatch):
-    """A GENUINE read failure, which is the pass-through this feature keeps: the panel
-    judges, and the checklist says check 3 was never evaluated instead of claiming it."""
+    """A GENUINE read failure, which is the pass-through this feature keeps: the panel judges"""
     trigger = trigger_order(fleet, status="needs_review")
     det, rid = register("facts-unreadable",
                         {"field": "status", "op": "eq", "value": "needs_review"},
@@ -510,7 +451,7 @@ def test_a_can_apply_that_raises_reaches_the_panel_saying_check_4_was_not_run(
 
 
 def test_a_fully_decided_fix_order_still_claims_every_check_mechanically(fleet):
-    """The pairing: without it, "the claim is absent" proves nothing about the split."""
+    """The pairing: without it, "the claim is absent" proves nothing about the split"""
     trigger = trigger_order(fleet, status="needs_review",
                             attention="the review could not be satisfied",
                             ack=(IDLE_NO_FINISH_BLOCKER,))
@@ -527,11 +468,11 @@ def test_a_fully_decided_fix_order_still_claims_every_check_mechanically(fleet):
     assert "YOURS TO RAISE" not in checklist
 
 
-# -- the ops pass-through paths, each of which leaves a note ----------------------------
+# -- the ops pass-through paths, each of which leaves a note
 
 
 def proved_pair(fleet, gap: str) -> tuple[dict, dict]:
-    """A fix-order row whose checks 1-3 pass, and the trigger it is proved against."""
+    """A fix-order row whose checks 1-3 pass, and the trigger it is proved against"""
     trigger = trigger_order(fleet, status="needs_review")
     det, rid = register(gap, {"field": "status", "op": "eq", "value": "needs_review"},
                         primitive="nudge", params={"what": "say something"})
@@ -540,7 +481,7 @@ def proved_pair(fleet, gap: str) -> tuple[dict, dict]:
 
 
 def test_a_central_store_that_cannot_be_opened_lets_the_submission_through(fleet):
-    """The pinned ruling (kn-b7deec8f): an unreadable input may not produce a refusal."""
+    """The pinned ruling (kn-b7deec8f): an unreadable input may not produce a refusal"""
     row, _ = proved_pair(fleet, "store-unopenable")
 
     def boom():
@@ -600,20 +541,11 @@ def test_a_precondition_that_raises_leaves_a_check_4_note(fleet, monkeypatch):
     assert note.startswith("check 4") and "the predicate itself failed" in note
 
 
-# -- the seam between the registry and the primitives (kn-e3aa04c5) ---------------------
+# -- the seam between the registry and the primitives (kn-e3aa04c5)
 
 
 def test_a_real_seed_rule_drives_a_real_primitive_through_the_precheck(fleet):
-    """SEED RULE 1 `stale-panel-hold`, END TO END, stubbing neither side.
-
-    Its first remedy row is `lower_attention` with empty params, and
-    `remedies.REMEDIES["lower_attention"].params == ()` — the one pairing of the five
-    seed rules that actually fits. The other three collisions kn-e3aa04c5 records
-    (`retry_neo_question`, seed 1's `drop_hold` row, seed 5's `reason_key`) are asserted
-    in the registry child's own tests; what this one proves is that the pair that DOES
-    fit survives the whole pre-check — the registry's stored condition, evaluated against
-    a real order's recorded facts, and the primitive's real `can_apply`.
-    """
+    """SEED RULE 1 `stale-panel-hold`, END TO END, stubbing neither side"""
     seed = rules.seed_rows()[0]
     detector_id = seed["detector"]["id"]
     remedy = seed["remedies"][0]
@@ -622,7 +554,7 @@ def test_a_real_seed_rule_drives_a_real_primitive_through_the_precheck(fleet):
     assert remedies.REMEDIES["lower_attention"].params == ()
     assert json.loads(remedy["params"]) == {}
 
-    # The seeded rows are in the real store already; this only asserts that.
+    # The seeded rows are in the real store already; this only asserts that
     central = CentralStore()
     try:
         assert [d["id"] for d in central.detectors_for_gap("stale-panel-hold")] == [
@@ -631,8 +563,7 @@ def test_a_real_seed_rule_drives_a_real_primitive_through_the_precheck(fleet):
     finally:
         central.close()
 
-    # The recorded state seed rule 1 describes: a `needs_review` order still flagged
-    # unsatisfiable an hour on, whose newest round has since PASSED.
+    # The recorded state seed rule 1 describes: a `needs_review` order still flagged unsatisfiable an...
     trigger = trigger_order(
         fleet, status="needs_review",
         attention="the review could not be satisfied — the work needs your judgement",

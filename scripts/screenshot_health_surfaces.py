@@ -1,12 +1,4 @@
-"""Screenshot the three halves of `/alarms` and one health finding's own page.
-
-§6 of docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md.
-`scripts/screenshot_feature_finding.py` is the shape this copies, and NOTHING HERE TURNS
-THE SUPERVISOR ON: every column a sweep, a proposal or an applied remedy would fill is
-written directly, because a picture is not worth a real model call.
-
-    uv run python scripts/screenshot_health_surfaces.py
-"""
+"""Screenshot the three halves of `/alarms` and one health finding's own page (docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md)"""
 
 from __future__ import annotations
 
@@ -22,14 +14,12 @@ REPO = Path(__file__).resolve().parent.parent
 SHOTS = REPO / "docs" / "screenshots"
 PORT = 8801
 
-#: One picture per half, plus the anchor page. The halves are three different asks and
-#: the whole argument of §6.1 is that they stay three, so they are shot separately.
+#: One picture per half, plus the anchor page
 SHOWN = ("alarms-health-asking", "alarms-health-feedback", "alarms-health-record")
 
 
 def seed() -> tuple[str, str]:
-    """A proposal awaiting permission, an applied remedy awaiting feedback, and a
-    settled cost alarm on the record — the three halves, each with a row."""
+    """A proposal awaiting permission"""
     from jarvis import ops, remedies
     from jarvis.central_store import CentralStore
     from jarvis.project_store import NO_TURN, ProjectStore
@@ -56,7 +46,7 @@ def seed() -> tuple[str, str]:
     _, path, _ = ops.find_work_order(seeded["id"], "jarvis_os")
     pstore = ProjectStore(path)
 
-    # -- the top half: a feature finding whose remedy is waiting on the user ---------
+    # -- the top half: a feature finding whose remedy is waiting on the user
     fo = pstore.create_feature_order("Ship the reference importer",
                                      "OpenAlex, Crossref and a BibTeX fallback.")
     pstore.set_feature_status(fo["id"], "executing")
@@ -90,7 +80,7 @@ def seed() -> tuple[str, str]:
     pstore.flag_attention(manager["id"],
                           f"{fo['id']}: nothing has moved for nineteen hours")
 
-    # -- the middle half: a remedy that was granted, applied, and not yet reviewed ---
+    # -- the middle half: a remedy that was granted, applied, and not yet reviewed
     circling = pstore.add_finding(
         seeded["id"], kind="going-in-circles", seq=NO_TURN, source="health",
         probe="going-in-circles",
@@ -115,7 +105,7 @@ def seed() -> tuple[str, str]:
                       "result": f"queued one message on {seeded['id']} asking it to "
                                 f"say where it is (delivered on its next turn)"})
 
-    # -- the bottom half: the record, including an ordinary cost alarm ---------------
+    # -- the bottom half: the record, including an ordinary cost alarm
     old = pstore.add_alarm(seeded["id"], "big-rewrite", 4,
                            "turn 4 re-wrote 312k tokens of cache (prefix-miss)")
     pstore.update_alarm(old["id"], status="acked", verdict="ack",
@@ -143,12 +133,10 @@ def shoot(alarm_id: str) -> None:
         page = browser.new_page(viewport={"width": 1280, "height": 1000})
         page.goto(f"http://127.0.0.1:{PORT}/alarms")
         for index, name in enumerate(SHOWN):
-            # Heading AND panel: the heading is what says which of the three asks this
-            # is, and a panel on its own is unreadable out of context.
+            # Heading AND panel: the heading is what says which of the three asks this is
             head = page.locator("h2").nth(index).bounding_box()
             panel = page.locator("div.panel").nth(index).bounding_box()
-            # `full_page` even though this is a clip: without it the third half is
-            # below the fold and the clip comes back as a strip of heading.
+            # `full_page` even though this is a clip: without it the third half is below the fold and the clip...
             page.screenshot(path=SHOTS / f"{name}.png", full_page=True, clip={
                 "x": head["x"] - 8, "y": head["y"] - 8,
                 "width": max(head["width"], panel["width"]) + 16,

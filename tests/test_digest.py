@@ -1,13 +1,4 @@
-"""Shortening an over-long Neo question for the dashboard.
-
-Neo question #53 was ~7,000 characters of feature-order brief, rendered inline on the
-`/neo` page, and the user could not stay across it. This covers the four pieces of the
-answer: the vendored output style, the strict-JSON digest itself, the store query that
-decides which questions earn one, and the daemon batch that produces them.
-
-The `/neo` rendering — the digest on the page and the disclosure holding the verbatim
-text — is in `tests/test_ui.py`, with the browser.
-"""
+"""Shortening an over-long Neo question for the dashboard (#53)"""
 
 from __future__ import annotations
 
@@ -32,11 +23,7 @@ LONG = "Which serialisation format should the exporter emit? " * 40  # ~2,100 ch
 
 
 def canned(reply: dict | str):
-    """A `call` that returns one reply and records what it was asked.
-
-    Returns (call, calls) — `calls` accumulates the kwargs of each invocation, so a test
-    can assert the SYSTEM PROMPT and the number of round trips, not merely the result.
-    """
+    """A `call` that returns one reply and records what it was asked"""
     calls: list[dict] = []
 
     def call(prompt, **kwargs):
@@ -46,16 +33,14 @@ def canned(reply: dict | str):
     return call, calls
 
 
-# -- the vendored output style ----------------------------------------------------------
+# -- the vendored output style
 
 
 def test_the_output_style_ships_and_is_the_upstream_file():
-    """The digest is a prompt plus someone else's style guide; if the style guide is not
-    in the wheel the feature is a plain summariser wearing its name."""
+    """The digest is a prompt plus someone else's style guide"""
     text = digest.load_skill()
     assert "name: i-have-adhd" in text
-    # Three rules the digest's own field list is built on. Named individually rather
-    # than by a length check, because a truncated or half-copied file has a length too.
+    # Three rules the digest's own field list is built on
     assert "Lead with the next action" in text
     assert "Cap lists at 5 items" in text
     assert "No preamble, no recap, no closing pleasantries" in text
@@ -64,18 +49,7 @@ def test_the_output_style_ships_and_is_the_upstream_file():
 
 
 def test_the_vendored_bytes_are_not_shipped_into_projects(project):
-    """`bootstrap` copytrees `assets/skills/`, `assets/agents/` and
-    `assets/project-skills/` WHOLESALE, so this file's verbatim bytes must not sit in
-    any of them: it is one prompt for one internal call, and a worker loading it as a
-    skill would be reading a style guide addressed to nobody.
-
-    Pinned on BYTES, not on the filename. The worker skill that ships the same rules
-    adapted for agents is called `i-have-adhd` too (spec 2026-08-22-agent-concision SS5),
-    and a name test would fail on it for a reason that was never the invariant.
-
-    The negative half is paired with the positive one in the same test: "the file was
-    copied nowhere" passes just as well for a file that does not exist at all.
-    """
+    """`bootstrap` copytrees `assets/skills/`"""
     from jarvis import bootstrap
 
     bootstrap.install_agent_assets(project, kind="worker")
@@ -85,11 +59,10 @@ def test_the_vendored_bytes_are_not_shipped_into_projects(project):
     delivered = [p for p in project.rglob("*")
                  if p.is_file() and p.read_bytes() == verbatim]
     assert delivered == []
-    # ...and here is where it does live, reachable by the one module that reads it.
+    # ...and here is where it does live, reachable by the one module that reads it
     assert digest.SKILL_PATH.is_file()
     assert digest.SKILL_PATH.parent == bootstrap.ASSETS / "digest"
-    # The control: the adapted skill DID reach the worker tree, so "nothing was
-    # delivered" cannot be why the assertion above passed.
+    # The control: the adapted skill DID reach the worker tree
     shipped = [p for p in project.rglob("i-have-adhd/SKILL.md")]
     assert shipped, "the adapted worker skill did not reach the project at all"
     assert all(p.read_bytes() != verbatim for p in shipped)
@@ -104,13 +77,11 @@ def test_the_system_prompt_is_the_style_verbatim_behind_a_machine_readable_heade
 
 
 def test_the_fake_claude_recognises_the_digest_header():
-    """The test fake keys on the header string, and it is a separate script that cannot
-    import it. Rename `DIGEST_HEADER` without this and every digest test would still
-    pass — through the gate-review branch, asserting nothing."""
+    """The test fake keys on the header string, and it is a separate script that cannot import it"""
     assert digest.DIGEST_HEADER in testing.FAKE_CLAUDE
 
 
-# -- the digest itself --------------------------------------------------------------------
+# -- the digest itself
 
 
 def test_a_digest_is_the_four_fields_the_template_renders():
@@ -131,8 +102,7 @@ def test_a_digest_is_the_four_fields_the_template_renders():
 
 
 def test_lists_are_capped_at_five_by_the_validator_not_by_the_prompt():
-    """The style asks for at most five items. Asking is not enforcing, and twelve
-    bullets on the page is the exact problem this feature exists to remove."""
+    """The style asks for at most five items"""
     call, _ = canned({"headline": "h",
                       "bullets": [f"b{i}" for i in range(12)],
                       "options": [f"o{i}" for i in range(12)]})
@@ -143,8 +113,7 @@ def test_lists_are_capped_at_five_by_the_validator_not_by_the_prompt():
 
 
 def test_everything_but_the_headline_may_be_empty():
-    """A question that is not a choice has no options, and inventing some would be
-    worse than showing none."""
+    """A question that is not a choice has no options, and inventing some would be worse than showing none"""
     call, _ = canned({"headline": "Should the exporter keep emitting CSV?"})
     view = digest.summarise(LONG, model="haiku", call=call)
     assert view["headline"]
@@ -153,16 +122,13 @@ def test_everything_but_the_headline_may_be_empty():
 
 
 def test_a_headline_less_reply_is_retried_once_and_then_refused():
-    """A digest with no first line is a blank box where the question used to be, so it
-    is refused rather than rendered. Two attempts, then the failure reaches the caller —
-    which records it and falls back to the full question."""
+    """A digest with no first line is a blank box where the question used to be"""
     call, calls = canned({"bullets": ["nothing to head this with"]})
     with pytest.raises(Exception) as e:
         digest.summarise(LONG, model="haiku", call=call)
     assert "headline" in str(e.value)
     assert len(calls) == 2
-    # The retry appends the complaint to the USER prompt and leaves the system prompt
-    # byte-identical — that is what keeps the second call inside the prompt cache.
+    # The retry appends the complaint to the USER prompt and leaves the system prompt byte-identical
     assert calls[1]["prompt"].startswith(LONG)
     assert calls[0]["system_prompt"] == calls[1]["system_prompt"]
 
@@ -174,13 +140,7 @@ def test_unparseable_output_is_refused_rather_than_half_rendered():
 
 
 def test_the_call_strips_the_callees_tools():
-    """A tooled callee asked to shorten a question about `src/jarvis/panel.py` goes and
-    reads `src/jarvis/panel.py`, and the page then shows a description of the code
-    instead of a shortening of the question — a failure that looks like a good answer.
-
-    The declaration that the daemon records this call itself travels in `summarise`, not
-    here: `records_itself="digest"`, matching the kind `daemon._digest_batch` binds.
-    """
+    """A tooled callee asked to shorten a question about `src/jarvis/panel.py` goes and reads..."""
     assert digest.CALL.keywords == {"tools": ""}
 
 
@@ -192,17 +152,15 @@ def test_the_threshold_is_what_stops_a_one_line_question_costing_a_call():
     assert not digest.needs_digest("x" * (digest.MIN_CHARS - 1))
 
 
-# -- storage encoding ---------------------------------------------------------------------
+# -- storage encoding
 
 
 def test_a_recorded_failure_decodes_to_no_digest_but_keeps_its_reason():
-    """Both halves matter: the page must fall back to the full question (decode -> None)
-    AND the row must stop being NULL, or the daemon would spend a call on it every tick
-    for ever."""
+    """Both halves matter: the page must fall back to the full question (decode -> None) AND the row must..."""
     raw = digest.encode_failure("model said nothing useful, twice")
     assert digest.decode(raw) is None
     assert "twice" in digest.failure_reason(raw)
-    # ...and a real digest is the other way round.
+    # ...and a real digest is the other way round
     good = digest.encode({"headline": "h", "bullets": [], "options": [],
                           "recommendation": ""})
     assert digest.decode(good)["headline"] == "h"
@@ -210,8 +168,7 @@ def test_a_recorded_failure_decodes_to_no_digest_but_keeps_its_reason():
 
 
 def test_a_missing_or_corrupt_digest_is_simply_no_digest():
-    """Every one of these renders the full question, which is what the page did before
-    this feature existed. There is no state in which the user loses the question."""
+    """Every one of these renders the full question, which is what the page did before this feature existed"""
     assert digest.decode(None) is None            # never attempted
     assert digest.decode("") is None              # ditto
     assert digest.decode("not json at all") is None
@@ -219,13 +176,11 @@ def test_a_missing_or_corrupt_digest_is_simply_no_digest():
     assert digest.decode('["a", "b"]') is None    # valid JSON, wrong shape
 
 
-# -- which questions earn one -------------------------------------------------------------
+# -- which questions earn one
 
 
 def test_only_long_undigested_questions_the_user_will_read_are_picked_up(store):
-    """The status filter is the cost control, so every exclusion is asserted next to the
-    one row that must come back — a query returning `[]` would satisfy the exclusions
-    perfectly on its own."""
+    """The status filter is the cost control"""
     wanted = store.ask("proj_a", "wo-1", LONG)
     store.mark(wanted["id"], "escalated")
 
@@ -249,8 +204,7 @@ def test_only_long_undigested_questions_the_user_will_read_are_picked_up(store):
 
 
 def test_an_unreviewed_neo_answer_and_a_failed_call_both_earn_one(store):
-    """The other two statuses the user reads, alongside a control in each direction:
-    a user-answered question is not awaiting Neo's review, so it is not picked up."""
+    """The other two statuses the user reads"""
     unreviewed = store.ask("proj_a", "wo-1", LONG)
     store.record_answer(unreviewed["id"], "CSV", answered_by="neo")
     failed = store.ask("proj_a", "wo-1", LONG)
@@ -274,7 +228,7 @@ def test_the_digest_column_survives_a_reopen_and_starts_null(store, jarvis_home)
         reopened.close()
 
 
-# -- the daemon batch -----------------------------------------------------------------------
+# -- the daemon batch
 
 
 @pytest.fixture()
@@ -300,14 +254,12 @@ def test_the_daemon_digests_a_long_escalated_question(daemon, store):
     assert view["headline"].startswith("digest of:")
     assert len(view["bullets"]) == 5          # the fake offers seven; the cap holds
     assert view["options"] and view["recommendation"]
-    # The question itself is untouched: the digest is a display artefact laid beside it,
-    # never a replacement for it.
+    # The question itself is untouched: the digest is a display artefact laid beside it
     assert store.get(q["id"])["question"] == LONG
 
 
 def test_the_daemon_leaves_a_short_question_alone(daemon, store):
-    """No digest AND no call: the threshold is only a cost control if the call is the
-    thing it stops."""
+    """No digest AND no call: the threshold is only a cost control if the call is the thing it stops"""
     q = store.ask("proj_a", "wo-1", "CSV or JSON?")
     store.mark(q["id"], "escalated")
     before = len(list(_calls_dir().glob("*.json")))
@@ -318,8 +270,7 @@ def test_the_daemon_leaves_a_short_question_alone(daemon, store):
 
 
 def test_a_failed_digest_is_recorded_once_and_never_retried(daemon, store):
-    """Two ticks, one attempt. Without the recorded failure the column stays NULL, the
-    row stays in the query, and the daemon spends a call on it every five seconds."""
+    """Two ticks, one attempt"""
     q = escalated_long_question(store, LONG + " FORCE_DIGEST_FAIL")
     daemon.digest_tick()
     daemon.digest_pool.shutdown(wait=True)
@@ -337,7 +288,7 @@ def test_a_garbled_digest_is_recorded_as_a_failure_not_rendered(daemon, store):
 
 
 def test_digesting_is_off_when_no_digest_model_is_configured(daemon, store):
-    """The one knob that turns the extra calls off. Empty model, no call, page unchanged."""
+    """The one knob that turns the extra calls off"""
     daemon.catalog.os.neo.digest_model = ""
     q = escalated_long_question(store)
     daemon.digest_tick()
@@ -354,8 +305,7 @@ def test_digesting_is_off_when_neo_is_off(daemon, store):
 
 
 def test_one_batch_is_bounded_and_the_rest_wait_for_the_next_tick(daemon, store):
-    """An instance upgrading into this feature can have a backlog of long questions
-    already in `neo.db`. The first batch must not turn into an unbounded spend."""
+    """An instance upgrading into this feature can have a backlog of long questions already in `neo.db`"""
     from jarvis.daemon import DIGEST_BATCH
 
     ids = [escalated_long_question(store)["id"] for _ in range(DIGEST_BATCH + 2)]
@@ -367,11 +317,7 @@ def test_one_batch_is_bounded_and_the_rest_wait_for_the_next_tick(daemon, store)
 
 
 def test_a_digest_never_reaches_neo_or_the_worker(daemon, store, project):
-    """THE LINE THIS FEATURE MUST NOT CROSS. The digest is display; Neo answers from the
-    full text. So: digest a question, then let Neo answer a fresh copy of it, and assert
-    the prompt Neo received is the question in full and carries no digest — with the
-    control, in the same test, that a digest demonstrably existed at that moment.
-    """
+    """THE LINE THIS FEATURE MUST NOT CROSS"""
     digested = escalated_long_question(store)
     daemon.digest_tick()
     daemon.digest_pool.shutdown(wait=True)
@@ -391,14 +337,14 @@ def test_a_digest_never_reaches_neo_or_the_worker(daemon, store, project):
 
 
 def _calls_dir():
-    """Where the fake `claude` records one file per invocation."""
+    """Where the fake `claude` records one file per invocation"""
     import os
     from pathlib import Path
 
     return Path(os.environ["FAKE_CLAUDE_DIR"]) / "calls"
 
 
-# -- configuration ---------------------------------------------------------------------------
+# -- configuration
 
 
 def test_the_digest_model_is_catalog_configurable_and_cheap_by_default(tmp_path, project):
@@ -411,13 +357,11 @@ def test_the_digest_model_is_catalog_configurable_and_cheap_by_default(tmp_path,
     assert catalog.load_catalog(path).os.neo.digest_model == "sonnet"
 
 
-# -- the clipped input (spec §4,
-# docs/superpowers/specs/2026-09-26-bounded-model-inputs.md) --------------------------
+# -- the clipped input (spec §4
 
 
 def test_an_over_long_question_is_clipped_before_it_becomes_the_prompt():
-    """`MAX_FIELD_CHARS` bounds the model's REPLY only, so q722 bought two digest calls
-    at 151,700 chars each on top of the Neo call."""
+    """`MAX_FIELD_CHARS` bounds the model's REPLY only"""
     huge = "z" * 50_000
     call, calls = canned({"headline": "h"})
     digest.summarise(huge, model="haiku", call=call, max_chars=20_000)
@@ -428,8 +372,7 @@ def test_an_over_long_question_is_clipped_before_it_becomes_the_prompt():
 
 
 def test_the_clip_is_labelled_inside_the_prompt_the_model_reads():
-    """A silent clip makes the model write a confident headline about a question it only
-    half saw. The label says how much was cut and where the full text lives."""
+    """A silent clip makes the model write a confident headline about a question it only half saw"""
     call, calls = canned({"headline": "h"})
     digest.summarise("z" * 50_000, model="haiku", call=call, max_chars=20_000)
     label = calls[0]["prompt"][20_000:]
@@ -445,8 +388,7 @@ def test_a_question_under_the_clip_is_untouched():
 
 
 def test_the_clip_is_a_catalog_setting_with_the_measured_default(tmp_path, project):
-    """Measured off production's 991 questions over `MIN_CHARS`: median 3,110,
-    p90 12,098 — the default sits above the knee."""
+    """Measured off production's 991 questions over `MIN_CHARS`: median 3,110, p90 12,098"""
     assert catalog.NeoConfig().digest_max_question_chars == 20_000
     assert digest.MAX_QUESTION_CHARS == 20_000
     path = tmp_path / "catalog.json"
@@ -459,8 +401,7 @@ def test_the_clip_is_a_catalog_setting_with_the_measured_default(tmp_path, proje
 
 
 def test_neo_reads_the_question_in_full_and_the_disclosure_shows_that_prompt():
-    """The disclosure's contract: what it displays is what `answer_question` sends, built
-    by the same function, so the two cannot drift."""
+    """The disclosure's contract: what it displays is what `answer_question` sends"""
     q = {"project": "proj_a", "wo_id": "wo-1", "question": LONG,
          "context": "the exporter work order"}
     prompt = neo.build_question_prompt(q)

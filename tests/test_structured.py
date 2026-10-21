@@ -1,11 +1,4 @@
-"""The strict-structured-output helper: pull one JSON object out of chatty model
-output, validate it, and either fall back or retry.
-
-Two callers with opposite failure policies share this module — Neo's live answering path
-(`attempts=1` + a fallback, never a retry) and the panel chair (`attempts=2`, no
-fallback) — so the tests here are mostly about *how many calls happen* and *what the
-second one says*, not about the parsing alone.
-"""
+"""The strict-structured-output helper: pull one JSON object out of chatty model output"""
 
 from __future__ import annotations
 
@@ -17,24 +10,19 @@ from jarvis import claude_cli, structured
 
 
 def _needs_ok(data):
-    """A validator: `{"ok": …}` is the shape, anything else is not."""
+    """A validator: `{"ok": …}` is the shape, anything else is not"""
     if "ok" not in data:
         raise structured.InvalidOutput("no `ok` field")
     return data["ok"]
 
 
 def _headless_calls(fake_claude):
-    """Every one-shot `claude -p` invocation the fake recorded, oldest first.
-
-    `run_headless` is synchronous — the call file is written before the process exits and
-    `_run` waits for that — so an exact count here is deterministic, unlike the detached
-    worker turns that need `wait_calls`.
-    """
+    """Every one-shot `claude -p` invocation the fake recorded, oldest first"""
     return [c for c in fake_claude.calls
             if "-p" in c["argv"] and "--resume" not in c["argv"]]
 
 
-# --- parse_json_object: tolerance, pinned input by input --------------------------
+# --- parse_json_object: tolerance, pinned input by input
 
 def test_bare_json_parses():
     assert structured.parse_json_object('{"ok": 1}') == {"ok": 1}
@@ -51,8 +39,7 @@ def test_chatty_json_parses():
 
 
 def test_nested_objects_survive_the_greedy_match():
-    # The greedy `{.*}` is what makes this work: a lazy match would stop at the first
-    # closing brace and hand `json.loads` a truncated object.
+    # The greedy `{.*}` is what makes this work: a lazy match would stop at the first closing brace and...
     raw = 'prose {"ok": {"inner": [1, 2]}} more prose'
     assert structured.parse_json_object(raw) == {"ok": {"inner": [1, 2]}}
 
@@ -69,16 +56,12 @@ def test_garbage_returns_none(raw):
 
 
 def test_two_objects_in_one_reply_parse_as_nothing():
-    # PINNED, not described: the greedy expression spans from the FIRST `{` to the LAST
-    # `}`, so this whole string is the match and it is not valid JSON. A reply that said
-    # two things is refused rather than silently reduced to the first of them. Change the
-    # regex and this test tells you which inputs moved.
+    # PINNED, not described: the greedy expression spans from the FIRST `{` to the LAST `}`
     assert structured.parse_json_object('{"a": 1} and then {"b": 2}') is None
 
 
 def test_two_objects_on_separate_lines_parse_as_nothing_either():
-    # Same span rule, stated from the other side: text BEFORE the first `{` and AFTER the
-    # last `}` is dropped, but anything between two objects is not.
+    # Same span rule, stated from the other side: text BEFORE the first `{` and AFTER the last `}` is...
     assert structured.parse_json_object('{"a": 1}\n{"b": 2}') is None
 
 
@@ -87,15 +70,14 @@ def test_prose_after_the_only_object_is_dropped():
 
 
 def test_nothing_to_parse_and_an_empty_object_are_different_answers():
-    # The distinction the callers depend on: "nothing to parse" is None, never `{}`, or a
-    # validator sees an empty answer where there was in fact no answer at all.
+    # The distinction the callers depend on: "nothing to parse" is None
     assert structured.parse_json_object("nope") is None
     assert structured.parse_json_object("{}") == {}
 
 
-# --- parse_json_objects: the successive objects, no policy ------------------------
+# --- parse_json_objects: the successive objects, no policy
 
-#: Issue #1098, verbatim: a verdict object, a prose line, then a second object.
+#: Issue #1098, verbatim: a verdict object, a prose line, then a second object
 TWO_OBJECTS = ('{"escalate": false, "answer": "x", "reason": "y"}\n'
                'Dispatch filed alongside the answer:\n'
                '{"dispatch": {"title": "t", "description": "d"}}')
@@ -126,30 +108,21 @@ def test_arrays_and_scalars_are_not_objects():
 
 
 def test_parse_json_object_still_refuses_the_two_object_reply():
-    # The single-object refusal stays pinned: the fold lives in `neo`, not here.
+    # The single-object refusal stays pinned: the fold lives in `neo`, not here
     assert structured.parse_json_object(TWO_OBJECTS) is None
 
 
-# --- close_unterminated: the one repair, and everything it refuses to repair -------
-#
-# The boundary these tests exist to hold is a single sentence: CLOSERS ONLY. A reply
-# whose last value finished is repaired; a reply cut off mid-value is not, because a
-# caller cannot tell a half answer from a whole one once it parses. Pinned input by
-# input for the same reason the greedy regex is — a prose description tolerates a
-# one-input drift and a case list does not.
+# --- close_unterminated: the one repair, and everything it refuses to repair
 
 def test_the_regression_a_nested_object_missing_only_the_outer_brace():
-    # Neo's reply to question 145, in miniature: perfect JSON, one absent final `}`.
-    # The greedy span stopped at the NESTED object's brace, `json.loads` said
-    # "Expecting ',' delimiter", and a settled answer escalated to the user.
+    # Neo's reply to question 145, in miniature: perfect JSON, one absent final `}`
     raw = '{"escalate": false, "answer": "(b) is right", "dispatch": {"title": "t"}'
     assert structured.parse_json_object(raw) == {
         "escalate": False, "answer": "(b) is right", "dispatch": {"title": "t"}}
 
 
 def test_an_object_with_no_closing_brace_at_all_is_repaired():
-    # `_JSON_RE` never even matches here — there is no `}` for it to end on — so the
-    # repair has to work from the first `{` to the end of the text.
+    # `_JSON_RE` never even matches here
     assert structured.parse_json_object('{"ok": "yes"') == {"ok": "yes"}
 
 
@@ -160,14 +133,12 @@ def test_an_unclosed_array_is_closed_too_and_in_the_right_order():
 
 
 def test_a_fenced_reply_that_lost_its_closing_brace_is_repaired():
-    # The fence is trimmed off the right edge before the closers go on — the same thing
-    # the greedy expression does when there IS a last brace to end on.
+    # The fence is trimmed off the right edge before the closers go on
     assert structured.parse_json_object('```json\n{"ok": "yes"\n```') == {"ok": "yes"}
 
 
 def test_prose_after_an_unclosed_object_still_parses():
-    # Two spans are tried: the greedy match (which drops the trailing prose) before
-    # everything-from-the-first-brace. Only the first of them can win here.
+    # Two spans are tried: the greedy match (which drops the trailing prose) before...
     assert structured.parse_json_object('{"ok": {"n": 1}. Hope that helps.') == {
         "ok": {"n": 1}}
 
@@ -179,9 +150,7 @@ def test_prose_after_an_unclosed_object_still_parses():
     '{"answer": "a", "n": tru',             # mid-literal
 ])
 def test_a_reply_cut_off_mid_value_is_still_refused(raw):
-    # THE LINE THAT MATTERS. Appending `}` to any of these either fails to parse or
-    # would hand a caller a truncated value wearing a whole value's shape. For Neo they
-    # keep failing toward the user, which is the failure the OS can recover from.
+    # THE LINE THAT MATTERS
     assert structured.parse_json_object(raw) is None
 
 
@@ -191,31 +160,25 @@ def test_a_reply_cut_off_mid_value_is_still_refused(raw):
     '{"n": 1.5',
 ])
 def test_a_reply_ending_on_a_bare_number_is_refused_even_though_closers_would_parse(raw):
-    # The one case where appending nothing but `}` silently CHANGES a value instead of
-    # failing: a digit is the only JSON token whose prefix is itself a valid token. This
-    # costs an escalation when the model merely forgot the brace after a number, which
-    # is the direction this whole module is supposed to fail in.
+    # The one case where appending nothing but `}` silently CHANGES a value instead of failing: a digit...
     assert structured.close_unterminated(raw) is None
     assert structured.parse_json_object(raw) is None
 
 
 def test_a_literal_is_self_delimiting_so_it_does_not_need_the_number_rule():
-    # `true` cannot be the prefix of any other JSON token, so closing after it invents
-    # nothing. Stated as a test so the number rule is not later generalised to literals.
+    # `true` cannot be the prefix of any other JSON token, so closing after it invents nothing
     assert structured.parse_json_object('{"escalate": true') == {"escalate": True}
     assert structured.parse_json_object('{"dispatch": null') == {"dispatch": None}
 
 
 def test_the_repair_never_fires_on_two_objects_because_they_are_already_balanced():
-    # kn-755ff9f5's load-bearing case, restated against the repair: a reply that said
-    # two things stays refused. Nothing to append, so nothing changes.
+    # kn-755ff9f5's load-bearing case
     assert structured.close_unterminated('{"a": 1} and then {"b": 2}') is None
     assert structured.parse_json_object('{"a": 1} and then {"b": 2}') is None
 
 
 def test_brackets_inside_strings_do_not_count():
-    # A naive counter reads three openers and one closer here and "repairs" a valid
-    # object into a broken one.
+    # A naive counter reads three openers and one closer here and "repairs" a valid object into a broken...
     assert structured.parse_json_object('{"a": "{ [ not a bracket"}') == {
         "a": "{ [ not a bracket"}
     assert structured.close_unterminated('{"a": "}"}') is None
@@ -231,21 +194,19 @@ def test_a_bracket_closed_that_was_never_opened_is_not_a_truncation():
 
 
 def test_close_unterminated_returns_none_when_there_is_nothing_to_close():
-    # None means "this repair does not apply", not "the text is bad" — `{"a": 1}` is
-    # perfectly good JSON that simply needs no closers.
+    # None means "this repair does not apply", not "the text is bad"
     assert structured.close_unterminated('{"a": 1}') is None
 
 
 def test_close_unterminated_appends_only_and_never_rewrites():
-    # The safety property in one assertion: whatever comes back starts with exactly what
-    # went in. No comma trimmed, no quote inserted, no value invented.
+    # The safety property in one assertion: whatever comes back starts with exactly what went in
     raw = '{"a": [1, 2], "b": {"c": "x"'
     repaired = structured.close_unterminated(raw)
     assert repaired is not None and repaired.startswith(raw)
     assert set(repaired[len(raw):]) <= {"}", "]"}
 
 
-# --- coerce: the attempts=1 policy, on a reply already in hand ---------------------
+# --- coerce: the attempts=1 policy, on a reply already in hand
 
 def test_coerce_returns_the_validated_value():
     assert structured.coerce('{"ok": "yes"}', _needs_ok) == "yes"
@@ -263,7 +224,7 @@ def test_coerce_hands_the_raw_string_to_on_invalid_and_returns_its_result():
 
 
 def test_coerce_routes_a_validator_failure_to_on_invalid_too():
-    # Parsed fine, wrong shape: the same fallback, because the caller cannot use either.
+    # Parsed fine, wrong shape: the same fallback, because the caller cannot use either
     assert structured.coerce('{"nope": 1}', _needs_ok, on_invalid=lambda raw: raw[:4]) == '{"no'
 
 
@@ -274,7 +235,7 @@ def test_coerce_without_on_invalid_raises():
         structured.coerce('{"nope": 1}', _needs_ok)
 
 
-# --- request: how many calls, and what the second one says ------------------------
+# --- request: how many calls, and what the second one says
 
 def test_request_returns_the_validated_value():
     calls = []
@@ -289,8 +250,7 @@ def test_request_returns_the_validated_value():
 
 
 def test_attempts_one_makes_exactly_one_call_even_on_garbage(fake_claude, tmp_path):
-    # Through the REAL run_headless (default `call`), so a signature change to it breaks
-    # this test instead of quietly breaking the caller.
+    # Through the REAL run_headless (default `call`)
     out = structured.request(
         "FORCE_GARBAGE please decide", validate=_needs_ok,
         system_prompt="you are a test", model="sonnet", cwd=tmp_path,
@@ -324,13 +284,11 @@ def test_the_retry_appends_the_complaint_to_the_user_prompt_only(fake_claude, tm
     def opt(argv, name):
         return argv[argv.index(name) + 1]
 
-    # The system prompt is BYTE-identical across attempts. A retry that rewrote it would
-    # cost a full Anthropic prompt-cache miss, which is the whole reason Neo's prompt is
-    # built the way it is.
+    # The system prompt is BYTE-identical across attempts
     assert first["system_prompt_seen"] == system
     assert second["system_prompt_seen"] == system
 
-    # The complaint rides in the user prompt, after the original question.
+    # The complaint rides in the user prompt, after the original question
     assert opt(first["argv"], "-p") == "FORCE_GARBAGE decide this"
     assert opt(second["argv"], "-p").startswith("FORCE_GARBAGE decide this\n\n")
     assert structured.RETRY_NOTE in opt(second["argv"], "-p")
@@ -369,8 +327,7 @@ def test_request_passes_the_transport_arguments_through(tmp_path):
 
 
 def test_a_transport_failure_is_not_invalid_output():
-    # `on_invalid` is for a reply that arrived and could not be used. A call that never
-    # happened propagates, because the caller (see `neo.drain_queue`) tells them apart.
+    # `on_invalid` is for a reply that arrived and could not be used
     def call(prompt, **kw):
         raise claude_cli.ClaudeCliError("model call failed")
 
@@ -386,8 +343,7 @@ def test_zero_attempts_is_a_programming_error():
 
 
 def test_the_last_attempt_is_exactly_coerce():
-    # The property the module docstring claims, asserted rather than described: whatever
-    # `coerce` does with a reply in hand is what `request` does with its final one.
+    # The property the module docstring claims
     raw = '{"nope": 1}'
     fallback = object()
     assert (structured.request("q", validate=_needs_ok, attempts=1,
@@ -396,7 +352,7 @@ def test_the_last_attempt_is_exactly_coerce():
             is structured.coerce(raw, _needs_ok, on_invalid=lambda r: fallback))
 
 
-# --- the first real consumer: Neo's fail-safe, unchanged --------------------------
+# --- the first real consumer: Neo's fail-safe, unchanged
 
 def test_neo_parse_verdict_is_the_attempts_one_fallback_configuration():
     from jarvis import neo
@@ -408,5 +364,5 @@ def test_neo_parse_verdict_is_the_attempts_one_fallback_configuration():
 
 
 def test_default_call_is_the_transport_function_itself():
-    """No wrapper: `DEFAULT_CALL` binds nothing, so it must BE `run_headless_result`."""
+    """No wrapper: `DEFAULT_CALL` binds nothing, so it must BE `run_headless_result`"""
     assert structured.DEFAULT_CALL is claude_cli.run_headless_result

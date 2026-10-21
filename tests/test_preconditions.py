@@ -1,11 +1,4 @@
-"""A precondition is a row, not prose.
-
-docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md. wo-314221b5 was
-filed with `DO NOT START until …` as the first line of its brief, `depends_on = []` and
-nothing else holding it, and was claimed, dispatched and run for 0.93 USD. The fix is a
-row the claim SQL can evaluate (§2.1-§2.2), written only by an explicit flag (§2.3), with
-the prose variant DETECTED and never attached (§2.4-§2.5).
-"""
+"""A precondition is a row, not prose (docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md)"""
 
 from __future__ import annotations
 
@@ -43,7 +36,7 @@ def central(jarvis_home):
     c.close()
 
 
-# -- §2.1: the rows ------------------------------------------------------------------
+# -- §2.1: the rows
 
 def test_a_precondition_round_trips_and_a_repeat_is_idempotent(store):
     wo = store.create_work_order("the 5a predicate fix")
@@ -78,7 +71,7 @@ def test_deleting_the_work_order_cascades_the_rows(store):
     assert store.conn.execute("SELECT COUNT(*) c FROM preconditions").fetchone()["c"] == 0
 
 
-# -- §2.3: the only writer is the flag -----------------------------------------------
+# -- §2.3: the only writer is the flag
 
 def test_the_flag_writes_the_rows_and_repeats_cleanly(started, store):
     first = ops.create_work_order("proj_a", "the 5a predicate fix",
@@ -113,7 +106,7 @@ def test_a_brief_stating_a_hold_is_created_normally_with_the_flag(started, store
 
 
 def test_the_storage_layer_infers_nothing(store):
-    """`ProjectStore.create_work_order` takes no policy: the same brief, no row."""
+    """`ProjectStore.create_work_order` takes no policy: the same brief, no row"""
     wo = store.create_work_order("wire it", description=HOLD_BRIEF)
 
     assert store.open_preconditions(wo["id"]) == []
@@ -121,7 +114,7 @@ def test_the_storage_layer_infers_nothing(store):
         ProjectStore.create_work_order).parameters
 
 
-# -- §2.4: the refusal ---------------------------------------------------------------
+# -- §2.4: the refusal
 
 @pytest.mark.parametrize("phrase", preconditions.STOP_PHRASES)
 def test_an_unwired_hold_is_refused_and_leaves_no_row(started, store, phrase):
@@ -155,8 +148,7 @@ def test_a_dependency_edge_is_wiring_enough(started, store):
     "needs the predicate fix",
 ])
 def test_the_named_false_negatives_create_normally(started, text):
-    """§2.4: precision over recall. These read as sequencing as often as a stop
-    condition, and over-matching leaves an operator unable to file."""
+    """§2.4: precision over recall"""
     assert ops.create_work_order("proj_a", "wire it", description=text)
 
 
@@ -175,12 +167,11 @@ def test_an_empty_ref_is_refused(started):
         ops.create_work_order("proj_a", "wire it", blocked_by=["  "])
 
 
-# -- §2.4.1: a held backlog item holds its promotion -----------------------------------
+# -- §2.4.1: a held backlog item holds its promotion
 
 def test_a_promotion_of_a_held_item_is_held_even_when_its_own_brief_is_silent(
         started, store, central):
-    """THE REVIEW'S REPRO (issue 1089, clause 2; Neo 1914). The HOLD is in the item's
-    title; the order's own brief repeats nothing."""
+    """THE REVIEW'S REPRO (issue 1089, clause 2; Neo 1914)"""
     item = central.add_backlog("proj_a", HOLD_BRIEF)
 
     wo = ops.create_work_order("proj_a", "wire the actor", description="",
@@ -249,11 +240,10 @@ def test_a_dependency_edge_wins_too_and_nothing_extra_is_attached(started, store
     assert store.open_preconditions(wo["id"]) == []
 
 
-# -- §2.5: the detector --------------------------------------------------------------
+# -- §2.5: the detector
 
 def _unwired(store: ProjectStore) -> str:
-    """The shape the creation refusal cannot reach: a planner child, or an order that
-    predates the refusal — written through the store, as those are."""
+    """The shape the creation refusal cannot reach: a planner child"""
     return store.create_work_order("wire the actor", description=HOLD_BRIEF)["id"]
 
 
@@ -308,7 +298,7 @@ def test_the_violation_notifies_and_raises_no_attention_flag(project, catalog_fi
 
 
 def test_the_notification_does_not_quote_the_brief(project, catalog_file):
-    """§2.5: the matched sentence stays on the record, never in a notification."""
+    """§2.5: the matched sentence stays on the record, never in a notification"""
     store = ProjectStore(project)
     wo_id = _unwired(store)
     daemon = Daemon(load_catalog(catalog_file))
@@ -320,7 +310,7 @@ def test_the_notification_does_not_quote_the_brief(project, catalog_file):
             if invariants.INV_PRECONDITION_UNWIRED in n["title"]][0]
     assert HOLD_BRIEF.lower() not in note["body"].lower()
     assert wo_id in note["body"] and "unwired stop condition" in note["body"]
-    # ...and the sentence IS on the record `jarvis wo show` reads.
+    # ...and the sentence IS on the record `jarvis wo show` reads
     event = [e for e in store.list_events(wo_id) if e["kind"] == "invariant"][0]
     payload = json.loads(event["payload"])
     assert HOLD_BRIEF.lower() in payload["matched"].lower()
@@ -328,7 +318,7 @@ def test_the_notification_does_not_quote_the_brief(project, catalog_file):
     store.close()
 
 
-# -- §2.6: re-derivation -------------------------------------------------------------
+# -- §2.6: re-derivation
 
 @pytest.mark.parametrize("status", ["done", "dropped"])
 def test_a_settled_backlog_item_clears_the_row(started, store, central, status):
@@ -359,7 +349,7 @@ def test_an_open_backlog_item_does_not_clear_the_row(started, store, central):
 
 
 def test_a_promoted_backlog_item_does_not_clear_the_row(started, store, central):
-    """§2.6: `promoted` means the item became a work order, not that it was done."""
+    """§2.6: `promoted` means the item became a work order, not that it was done"""
     item = central.add_backlog("proj_a", "the 5a predicate fix")
     wo = ops.create_work_order("proj_a", "wire the actor", blocked_by=[item["id"]])
     central.mark_backlog(item["id"], "promoted")
@@ -372,7 +362,7 @@ def test_a_promoted_backlog_item_does_not_clear_the_row(started, store, central)
 
 
 def test_a_promoted_hold_is_live_not_stranding(started, store, central):
-    """§2.6: the daemon can still clear it, so `unblock` without `--all` must not."""
+    """§2.6: the daemon can still clear it, so `unblock` without `--all` must not"""
     item = central.add_backlog("proj_a", "the 5a predicate fix")
     wo = ops.create_work_order("proj_a", "wire the actor", blocked_by=[item["id"]])
     central.mark_backlog(item["id"], "promoted")
@@ -396,7 +386,7 @@ def test_a_ref_the_os_cannot_derive_stays_open(started, store, ref):
 
 
 def test_the_tick_clears_before_it_dispatches():
-    """§2.6: a hold cleared on this tick is claimed on this tick."""
+    """§2.6: a hold cleared on this tick is claimed on this tick"""
     src = inspect.getsource(Daemon.tick)
     assert (src.index("clear_settled_preconditions")
             < src.index("self.hold_red_release")
@@ -404,7 +394,7 @@ def test_the_tick_clears_before_it_dispatches():
 
 
 def test_a_real_tick_clears_before_it_dispatches(started, monkeypatch):
-    """The same order on a REAL tick, not read off the source (§2.6)."""
+    """The same order on a REAL tick, not read off the source (§2.6)"""
     order: list[str] = []
     monkeypatch.setattr(Daemon, "clear_settled_preconditions",
                         lambda self, p, s: order.append("clear"))
@@ -417,7 +407,7 @@ def test_a_real_tick_clears_before_it_dispatches(started, monkeypatch):
     assert order == ["clear", "dispatch"]
 
 
-# -- §2.6: `jarvis wo unblock` -------------------------------------------------------
+# -- §2.6: `jarvis wo unblock`
 
 def test_unblock_clears_the_rows_the_daemon_can_never_clear(started, store):
     wo = ops.create_work_order("proj_a", "wire the actor",
@@ -450,7 +440,7 @@ def test_unblock_on_an_order_with_neither_kind_of_hold_says_so(started):
         ops.unblock_work_order(wo["id"])
 
 
-# -- §2.6: the timeline --------------------------------------------------------------
+# -- §2.6: the timeline
 
 @pytest.mark.parametrize("kind", ["precondition_added", "precondition_cleared"])
 def test_both_events_describe_themselves_and_are_not_debug(kind):
@@ -460,7 +450,7 @@ def test_both_events_describe_themselves_and_are_not_debug(kind):
     assert kind not in timeline.DEBUG_KINDS
 
 
-# -- §2.7: surfacing -----------------------------------------------------------------
+# -- §2.7: surfacing
 
 def test_the_status_label_names_the_hold_and_the_way_out(store):
     wo = store.create_work_order("wire the actor")
@@ -488,7 +478,7 @@ def test_ops_open_preconditions_is_the_one_derivation(store):
     row = store.get_work_order(wo["id"])
 
     assert [p["ref"] for p in ops.open_preconditions(store, row)] == ["bl-d5baa28b"]
-    # NOT widened: its entries render as work order links (§2.7).
+    # NOT widened: its entries render as work order links (§2.7)
     assert ops.blocked_by(store, row) == []
 
 

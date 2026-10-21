@@ -1,11 +1,4 @@
-"""Shared test/eval fixtures: isolated JARVIS_HOME, fixture git projects, and a fake
-`claude` CLI that mimics the supervisor's observed behavior (bg roster, session ids,
-resume semantics, headless -p calls).
-
-Used by tests/, evals/, and tests_browser/ via their conftest re-exports, plus
-`gate_test_environment` — the isolation gate the repo-root conftest installs before
-collection. See that function for what a test run is not allowed to reach, and
-tests/test_isolation_gate.py for the proof that it can't."""
+"""Shared test/eval fixtures: isolated JARVIS_HOME"""
 
 from __future__ import annotations
 
@@ -27,17 +20,13 @@ from .bugreport import GH_BIN_ENV
 from .claude_cli import CLAUDE_BIN_ENV, CREDENTIALS_ENV
 from .notify import DISABLE_EXTERNAL_SINKS_ENV
 
-#: Sandbox root the gate installed, or None if `gate_test_environment` never ran.
-#: Tests assert against it; nothing in production reads it.
+#: Sandbox root the gate installed, or None if `gate_test_environment` never ran
 GATE_ROOT: Path | None = None
 
-#: The process-wide floor home the gate installed. The autouse `jarvis_home` fixture
-#: overrides `$JARVIS_HOME` per test, so this is what code running *outside* a test body
-#: (collection, module import, a subprocess spawned at import time) sees.
+#: The process-wide floor home the gate installed
 GATE_HOME: Path | None = None
 
-#: A `gh` that refuses to run. Points JARVIS_GH_BIN somewhere harmless so a test that
-#: forgets the `fake_gh` fixture cannot file a public issue on the OS's real tracker.
+#: A `gh` that refuses to run
 BLOCKED_GH = r'''#!/usr/bin/env python3
 import sys
 sys.stderr.write(
@@ -46,8 +35,7 @@ sys.stderr.write(
 sys.exit(1)
 '''
 
-#: Likewise for `claude`. A test that forgets the `fake_claude` fixture would otherwise
-#: spawn REAL background Claude Code agents against real projects and bill real tokens.
+#: Likewise for `claude`
 BLOCKED_CLAUDE = r'''#!/usr/bin/env python3
 import sys
 sys.stderr.write(
@@ -57,42 +45,12 @@ sys.stderr.write(
 sys.exit(1)
 '''
 
-#: Opt-in flag for the LLM-graded evals, which exist precisely to call the real model.
-#: When it is set, the gate leaves `claude` alone — the run has asked for the real thing.
+#: Opt-in flag for the LLM-graded evals, which exist precisely to call the real model
 LLM_EVALS_ENV = "JARVIS_EVALS_LLM"
 
 
 def gate_test_environment(root: Path | None = None) -> Path:
-    """Make this process incapable of reaching production. Returns the sandbox root.
-
-    Called from `pytest_configure` in the repo-root conftest — before collection, so it
-    covers module import time as well as test bodies, and it is inherited by every
-    subprocess a test spawns (workers, the daemon, a nested pytest).
-
-    Every escape route a test run has to the world outside its tmp dir:
-
-    * ``JARVIS_HOME`` — central `os.db`, `neo.db`, logs, the daemon pidfile. A worker
-      session inherits the PRODUCTION home, so without this the suite writes live state,
-      and the live daemon then routes whatever it finds in the central inbox to the real
-      sinks. That is not hypothetical: it Telegrammed the user twice on 2026-07-27.
-    * the Telegram and desktop sinks — see `notify.DISABLE_EXTERNAL_SINKS_ENV`.
-    * ``gh`` — `jarvis bug report` files a GitHub issue on a PUBLIC tracker.
-    * ``claude`` — a test that forgets `fake_claude` would spawn real background agents
-      against real projects and bill real tokens. Left alone when `JARVIS_EVALS_LLM` is
-      set, since the LLM-graded evals exist to call the real model.
-    * ``PRODUCTION_CODE`` — the live deployment `INV-PROD-CLEAN` reads. An invariant that
-      reaches outside the sandbox makes `jarvis doctor` tests pass or fail on the state of
-      the developer's machine; this one did, on the very drift it exists to report.
-    * ``JARVIS_SPEND_HOME`` — where `agent_usage` files token-accounting rows. Redirected
-      with the home in every ordinary run, so a suite against the fake `claude` cannot
-      write invented spend into live state. Lifted only when the run BOTH reaches the
-      real model and belongs to a work order — see `_bills_real_tokens`, and note it
-      opens the usage-row write path alone, not the store or the sinks.
-
-    The gate is a floor, not a substitute for per-test isolation: the autouse
-    `jarvis_home` fixture still gives each test its own home under its own tmp_path, so
-    two tests that never name the fixture cannot collide in a shared sandbox.
-    """
+    """Make this process incapable of reaching production"""
     global GATE_ROOT, GATE_HOME
     if root is None:
         root = Path(tempfile.mkdtemp(prefix="jarvis-test-gate-"))
@@ -105,81 +63,35 @@ def gate_test_environment(root: Path | None = None) -> Path:
 
 
 def gate_environment(root: Path) -> dict[str, str]:
-    """The environment that makes a process incapable of reaching production.
-
-    Split out from `gate_test_environment` so it can be asserted on without mutating
-    this process. Writes the stub binaries into `root`; touches nothing else.
-    """
+    """The environment that makes a process incapable of reaching production"""
     root.mkdir(parents=True, exist_ok=True)
     env = {
         "JARVIS_HOME": str(root / "jarvis-home"),
         DISABLE_EXTERNAL_SINKS_ENV: "1",
         GH_BIN_ENV: str(_blocked_bin(root, "gh", BLOCKED_GH)),
-        # Worker turns stay on the plain-`Popen` transport for the whole suite. Without
-        # this the auto-detection would be RIGHT and that is the problem: a suite run by
-        # a Jarvis worker inherits the daemon's `.service` cgroup, so every fake-`claude`
-        # turn would register a real transient unit on the developer's machine. The
-        # systemd path is exercised by pointing `JARVIS_SYSTEMD_RUN_BIN` at a fake, which
-        # is the same shape as the `claude` and `gh` stubs above.
+        # Worker turns stay on the plain-`Popen` transport for the whole suite
         systemd_units.TRANSPORT_ENV: systemd_units.DIRECT,
-        # The developer's own Claude Code sign-in, which `worker_session._auth_retry_at`
-        # reads to decide whether an auth-paused turn may go again. Left ambient, a suite
-        # run on a machine whose credentials were refreshed a second ago would resume
-        # every fixture's auth pause — passing or failing on the state of the human's
-        # login. Pointed at a path inside the sandbox that no test writes unless it means
-        # to, so the default answer is "cannot tell, do not resume".
+        # The developer's own Claude Code sign-in
         CREDENTIALS_ENV: str(root / "claude-credentials.json"),
-        # The developer's own installed `jarvis.service`, which `INV-SERVICE-PATH`
-        # reads. Left ambient, `jarvis doctor` in a test would pass or fail on whether
-        # the human last re-ran install_prod_service.sh — and it currently fails, which
-        # is the entire subject of that check. Pointed at an empty directory inside the
-        # sandbox: no units installed reads as nothing to be stale about.
+        # The developer's own installed `jarvis.service`, which `INV-SERVICE-PATH` reads
         release.UNIT_DIR_ENV: str(root / "systemd-units"),
-        # The developer's own production checkout, which `INV-PROD-CLEAN` reads. Exactly
-        # the same trap as the line above: left ambient, `jarvis doctor` in a test passes
-        # or fails on whether a stray `uv` has dirtied the live deployment — which is the
-        # entire subject of that check (issue #202). Pointed at a directory inside the
-        # sandbox holding no checkout: "no production deployment on this machine".
+        # The developer's own production checkout, which `INV-PROD-CLEAN` reads (#202)
         paths.PRODUCTION_ROOT_ENV: str(root / "production"),
-        # The developer's own ~/.local/bin, which `INV-PROD-CLI` reads. Same trap as the
-        # two entries above: left ambient, `jarvis doctor` in a test passes or fails on
-        # whether the human has run install_prod_cli.sh — and it fails, which is the
-        # subject of that check. Pointed at an empty directory inside the sandbox: no
-        # wrapper installed, and PRODUCTION_ROOT_ENV above already means "no production
-        # deployment", so the check is silent either way.
+        # The developer's own ~/.local/bin, which `INV-PROD-CLI` reads
         release.CLI_BIN_DIR_ENV: str(root / "cli-bin"),
-        # The production units export `JARVIS_ENV=production` and it OVERRIDES the
-        # location check above, so a suite run BY A JARVIS WORKER inherits it from the
-        # daemon and every test of the dev badge fails on a machine where the OS is
-        # deployed — `tests/test_ui.py::test_version_lookup_failure_does_not_break_the_
-        # header` did, for exactly that reason. Pinned rather than deleted: this dict is
-        # merged into `os.environ`, and "no override" is a value a test can still set.
+        # The production units export `JARVIS_ENV=production` and it OVERRIDES the location check above
         paths.ENV_OVERRIDE: paths.DEVELOPMENT,
     }
     if not os.environ.get(LLM_EVALS_ENV):
         env[CLAUDE_BIN_ENV] = str(_blocked_bin(root, "claude", BLOCKED_CLAUDE))
     if not _bills_real_tokens():
-        # Token accounting is redirected with everything else by default, so a suite
-        # running against the fake `claude` cannot write invented rows into live state.
+        # Token accounting is redirected with everything else by default
         env[agent_usage.SPEND_HOME_ENV] = str(root / "jarvis-home")
     return env
 
 
 def _bills_real_tokens() -> bool:
-    """Is this run spending real money that a real work order will be charged for?
-
-    The one carve-out in the gate's accounting redirect, and it needs BOTH halves.
-    `JARVIS_EVALS_LLM` says the run reaches the real model — the same signal that
-    already stops the gate replacing the `claude` binary, for the same reason: these
-    evals exist to call it. `JARVIS_WO_ID` says a work order is paying, which is who
-    the row would be filed against. An ad-hoc eval run by a human has no work order and
-    stays fully sandboxed; a worker's eval run has both and its spend reaches the ledger
-    that the `jarvis cost` for that work order reads (ruled on wo-76e021aa, issue #103).
-
-    Deliberately narrow: this opens the usage-row write path and nothing else. Every
-    other route out of the sandbox — the notification sinks, `gh`, the rest of the
-    central store — stays shut in both cases.
-    """
+    """Is this run spending real money that a real work order will be charged for? (#103)"""
     return bool(os.environ.get(LLM_EVALS_ENV) and os.environ.get("JARVIS_WO_ID"))
 
 
@@ -191,7 +103,7 @@ def _blocked_bin(root: Path, name: str, source: str) -> Path:
 
 
 def teardown_test_environment() -> None:
-    """Remove the gate's sandbox. Called from `pytest_unconfigure`."""
+    """Remove the gate's sandbox"""
     global GATE_ROOT, GATE_HOME
     if GATE_ROOT is not None:
         shutil.rmtree(GATE_ROOT, ignore_errors=True)
@@ -1630,13 +1542,7 @@ else:
 
 @pytest.fixture()
 def fake_systemd(tmp_path, monkeypatch):
-    """Put worker turns on the transient-unit transport, against a fake systemd.
-
-    The test-isolation gate pins every run to the direct transport (see
-    `gate_environment`), so a test that wants the systemd path has to say so — which is
-    this fixture. It flips `JARVIS_TURN_TRANSPORT` to `systemd`, so nothing here depends
-    on whether the machine running the suite happens to have a real one.
-    """
+    """Put worker turns on the transient-unit transport, against a fake systemd"""
     sdir = tmp_path / "fake-systemd"
     (sdir / "units").mkdir(parents=True)
     run_bin, ctl_bin = sdir / "systemd-run", sdir / "systemctl"
@@ -1663,43 +1569,35 @@ def fake_systemd(tmp_path, monkeypatch):
                     for p in (sdir / "units").glob("*.json")}
 
         def fail(self, message: str = "fake systemd-run: refused") -> None:
-            """Make every subsequent spawn fail, so the direct fallback is exercised."""
+            """Make every subsequent spawn fail, so the direct fallback is exercised"""
             monkeypatch.setenv("FAKE_SYSTEMD_FAIL", message)
 
     return Handle()
 
 
-#: The repository every fixture in this harness pretends is the OS's bug tracker. It is
-#: deliberately NOT `bugreport.DEFAULT_BUG_REPO`: see `fake_gh`.
+#: The repository every fixture in this harness pretends is the OS's bug tracker
 FIXTURE_BUG_REPO = "jarvis-fixture/no-such-tracker"
 FIXTURE_ISSUE_URL = f"https://github.com/{FIXTURE_BUG_REPO}/issues/7"
-#: The login the fake `gh` is authenticated as — the account the OS files issues under.
+#: The login the fake `gh` is authenticated as — the account the OS files issues under
 FIXTURE_GH_LOGIN = "jarvis-fixture-bot"
 
 
 @pytest.fixture()
 def fake_gh(tmp_path, monkeypatch):
-    """Install a fake `gh` binary; returns a handle to its recorded state."""
+    """Install a fake `gh` binary; returns a handle to its recorded state"""
     gdir = tmp_path / "fake-gh"
     gdir.mkdir()
     binpath = gdir / "gh"
     binpath.write_text(FAKE_GH)
     binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
-    # THE TRACKER THESE TESTS WRITE TO DOES NOT EXIST (review round 2). `issues.py`
-    # refuses to write anywhere but `bugreport.bug_repo()`, so a fixture issue on some
-    # other repository could only ever exercise the refusal — but pointing the fixture at
-    # the REAL tracker leaves `BLOCKED_GH` as the only thing between a test that escapes
-    # the fake and a live label, comment or close on a public issue. So the fixture moves
-    # the ANSWER instead of the URL: `bug_repo()` becomes a repository nobody owns, the
-    # URL check still has something to enforce, and an escaped write has nowhere to land.
+    # THE TRACKER THESE TESTS WRITE TO DOES NOT EXIST (review round 2)
     monkeypatch.setenv("JARVIS_BUG_REPO", FIXTURE_BUG_REPO)
     url = FIXTURE_ISSUE_URL
     monkeypatch.setenv("FAKE_GH_DIR", str(gdir))
     monkeypatch.setenv("FAKE_GH_ISSUE_URL", url)
     monkeypatch.setenv("FAKE_GH_LOGIN", FIXTURE_GH_LOGIN)
     monkeypatch.setenv("JARVIS_GH_BIN", str(binpath))
-    # `issues.gh_login` caches for the PROCESS, and a pytest process is many fleets: a
-    # login read under one fixture's `gh` must not answer under the next one's.
+    # `issues.gh_login` caches for the PROCESS
     from . import issues as _issues
     _issues.reset_gh_login()
 
@@ -1718,47 +1616,39 @@ def fake_gh(tmp_path, monkeypatch):
             return [json.loads(l) for l in path.read_text().splitlines()]
 
         def fail(self, message: str) -> None:
-            """Make every subsequent `gh` call fail with `message` on stderr."""
+            """Make every subsequent `gh` call fail with `message` on stderr"""
             monkeypatch.setenv("FAKE_GH_FAIL", message)
 
         def fail_merge(self, message: str) -> None:
-            """Fail `gh pr merge` and NOTHING else — reads keep working.
-
-            `fail()` is the wrong tool for testing a failed merge: it fails `pr view`
-            too, so the poll never gets as far as merging and every assertion about the
-            merge passes without the merge ever having been attempted. This is also the
-            shape of the likeliest real failure — credentials that can read and not
-            write.
-            """
+            """Fail `gh pr merge` and NOTHING else — reads keep working"""
             monkeypatch.setenv("FAKE_GH_FAIL_MERGE", message)
 
         def fail_pr_close(self, message: str) -> None:
-            """Fail `gh pr close` and NOTHING else — `fail_merge`'s rationale."""
+            """Fail `gh pr close` and NOTHING else — `fail_merge`'s rationale"""
             monkeypatch.setenv("FAKE_GH_FAIL_PR_CLOSE", message)
 
         def fail_pr_reopen(self, message: str) -> None:
-            """Fail `gh pr reopen` alone: the pull request really does end up CLOSED,
-            which is the stage whose failure leaves the OS holding its own closure."""
+            """Fail `gh pr reopen` alone: the pull request really does end up CLOSED"""
             monkeypatch.setenv("FAKE_GH_FAIL_PR_REOPEN", message)
 
         def works(self) -> None:
-            """Undo `fail` — a test that proves the lifecycle RETRIES has to."""
+            """Undo `fail` — a test that proves the lifecycle RETRIES has to"""
             monkeypatch.delenv("FAKE_GH_FAIL", raising=False)
 
         @property
         def issues(self) -> dict[str, dict]:
-            """The tracker as the fake holds it: `{url: {"state", "labels", ...}}`."""
+            """The tracker as the fake holds it: `{url: {"state", "labels", ...}}`"""
             path = gdir / "issues.json"
             return json.loads(path.read_text()) if path.exists() else {}
 
         def issue(self, issue_url: str | None = None) -> dict:
-            """One issue, defaulted OPEN and unlabelled like a freshly filed one."""
+            """One issue, defaulted OPEN and unlabelled like a freshly filed one"""
             return self.issues.get(issue_url or url,
                                    {"state": "OPEN", "labels": [], "comments": []})
 
         def set_issue(self, issue_url: str, state: str = "OPEN",
                       labels: list[str] | None = None) -> None:
-            """Put an issue where a test needs it — closed by a human, say."""
+            """Put an issue where a test needs it — closed by a human, say"""
             rows = self.issues
             rows[issue_url] = {**rows.get(issue_url, {"comments": []}),
                                "state": state.upper(),
@@ -1767,14 +1657,7 @@ def fake_gh(tmp_path, monkeypatch):
 
         def set_pr_state(self, pr_url: str, state: str,
                          merged_at: str | None = None) -> None:
-            """Move a pull request the fake's OWN writes have already patched.
-
-            `set_pr` cannot do it: `pr close`, `pr reopen` and `pr update-branch` record
-            what they did as an overlay ON TOP of the registered roster, so a re-register
-            is overwritten by the overlay. This is a human closing a pull request AFTER
-            the OS closed and reopened it — the case that proves the resync's suppression
-            of `record_pr_closed` RELEASES (wo-7ec57748).
-            """
+            """Move a pull request the fake's OWN writes have already patched"""
             path = gdir / "merged.json"
             landed = json.loads(path.read_text()) if path.exists() else {}
             patch = {**landed.get(pr_url, {}), "state": state.upper(),
@@ -1785,13 +1668,7 @@ def fake_gh(tmp_path, monkeypatch):
             path.write_text(json.dumps(landed))
 
         def pr_state(self, pr_url: str) -> str:
-            """What `gh pr view` would answer for this pull request's `state`.
-
-            The fake's own `roster()` resolution — the registered roster patched by
-            whatever its writes recorded. A test needs it to ask whether a `gh pr close`
-            that RAISED left GitHub alone (wo-7ec57748); no other reader here can say,
-            because a write that failed records no overlay at all.
-            """
+            """What `gh pr view` would answer for this pull request's `state`"""
             prs = json.loads(os.environ.get("FAKE_GH_PRS", "{}"))
             path = gdir / "merged.json"
             landed = json.loads(path.read_text()) if path.exists() else {}
@@ -1799,26 +1676,14 @@ def fake_gh(tmp_path, monkeypatch):
             return str(row.get("state") or "OPEN").upper()
 
         def issue_series(self, base: str) -> str:
-            """Make `gh issue create` mint `<base>/1`, `<base>/2`, … one per call.
-
-            What a test filing SEVERAL issues in one round needs. Without it the fake
-            answers one url every time, two follow-ups collapse onto one issue, and a
-            broken dedupe is indistinguishable from a working one.
-            """
+            """Make `gh issue create` mint `<base>/1`, `<base>/2`, … one per call"""
             monkeypatch.setenv("FAKE_GH_ISSUE_SERIES", base.rstrip("/"))
             return base
 
         def add_issue(self, issue_url: str, title: str, body: str = "",
                       state: str = "OPEN", labels: list[str] | None = None,
                       author: str | None = None) -> None:
-            """Put an issue on the tracker as `issue list` will see it — title and body
-            included, which `set_issue` does not carry because nothing read them before
-            the follow-up dedupe did.
-
-            `author` defaults to the login `gh` is authenticated as, so an issue a test
-            adds reads as the OS's own filing; pass a stranger's login for the one case
-            the red-base adoption filter exists for (spec 2026-10-14 §4).
-            """
+            """Put an issue on the tracker as `issue list` will see it"""
             rows = self.issues
             rows[issue_url] = {**rows.get(issue_url, {"comments": []}),
                                "state": state.upper(), "title": title, "body": body,
@@ -1827,60 +1692,32 @@ def fake_gh(tmp_path, monkeypatch):
             (gdir / "issues.json").write_text(json.dumps(rows))
 
         def next_issue(self, issue_url: str) -> str:
-            """Where the NEXT `gh issue create` lands. The fake files every issue at one
-            url, which is what a test wanting two distinct bugs on the rails has to
-            move."""
+            """Where the NEXT `gh issue create` lands"""
             monkeypatch.setenv("FAKE_GH_ISSUE_URL", issue_url)
             return issue_url
 
         def set_private(self, private: bool) -> None:
-            """What `gh repo view --json isPrivate` answers for every repository.
-
-            The fake defaults to PRIVATE so a test about the filing exercises the shape
-            that carries the finding's own words; `set_private(False)` is the production
-            truth for an open-source tracker, and the case the withholding exists for.
-            """
+            """What `gh repo view --json isPrivate` answers for every repository"""
             monkeypatch.setenv("FAKE_GH_PRIVATE", "1" if private else "0")
 
         def fail_privacy_read(self, message: str = "gh: HTTP 502") -> None:
-            """Fail `gh repo view` and NOTHING else — `fail_merge`'s rationale exactly.
-
-            `fail()` would break the dedupe read too, so the round files nothing and an
-            assertion about the WITHHELD shape passes on a machine that published nothing
-            at all. The fail-closed branch is only visible when the filing still runs.
-            """
+            """Fail `gh repo view` and NOTHING else — `fail_merge`'s rationale exactly"""
             monkeypatch.setenv("FAKE_GH_REPO_VIEW_FAIL", message)
 
         def garble_privacy_read(self, text: str = "not json at all") -> None:
-            """Answer the privacy read with something that will not parse — a `gh`
-            printing a warning, an API shape that moved. Exit 0, so it is a different
-            path from `fail_privacy_read` and needs its own test."""
+            """Answer the privacy read with something that will not parse"""
             monkeypatch.setenv("FAKE_GH_REPO_VIEW_GARBAGE", text)
 
         def set_labels(self, names: list[str]) -> None:
-            """Which labels the repository already has. `--add-label` refuses everything
-            else, exactly as real `gh` does."""
+            """Which labels the repository already has"""
             (gdir / "labels.json").write_text(json.dumps(sorted(set(names))))
 
         def fail_merge_cleanup(self, message: str) -> None:
-            """Land the merge, then fail — THE SEAM OF ISSUE #253.
-
-            Distinct from `fail_merge`, and the difference is the entire bug: there,
-            nothing merged; here, GitHub accepted the merge and the command still exits
-            non-zero, because the local tidy-up after it failed. Both live merges of
-            0.10.0 came out this way and were reported to the user as refused by GitHub.
-            A test that only drives `fail_merge` cannot see it.
-            """
+            """Land the merge, then fail — THE SEAM OF ISSUE #253"""
             monkeypatch.setenv("FAKE_GH_FAIL_MERGE_CLEANUP", message)
 
         def hang_merge_after_landing(self, timeout: float = 1.0) -> None:
-            """Land the merge, then never return — the caller's timeout ends it.
-
-            The second landed shape of issue #253, and NOT the same fact as
-            `fail_merge_cleanup`: this command attempted no branch deletion, so a record
-            that calls it a cleanup failure sends the reader hunting one. Shortens
-            `automerge.MERGE_TIMEOUT` so the test costs a second rather than a minute.
-            """
+            """Land the merge, then never return — the caller's timeout ends it (#253)"""
             from . import automerge
 
             monkeypatch.setattr(automerge, "MERGE_TIMEOUT", timeout)
@@ -1892,35 +1729,7 @@ def fake_gh(tmp_path, monkeypatch):
                    merge_state: str | None = None, head_oid: str = "",
                    base_oid: str = "", merge_commit: str = "",
                    head_ref: str = "") -> None:
-            """Register what `gh pr view <pr_url>` answers. Re-calling re-states it,
-            which is how a test walks a pull request from OPEN to MERGED — or from
-            MERGEABLE to CONFLICTING and back.
-
-            `mergeable` defaults to MERGEABLE for an open pull request and to null for
-            any other state, which is what GitHub itself answers.
-
-            `checks` is `statusCheckRollup`, shared with `set_pr_artifact`: the two
-            readers ask for different field sets but they are reading one pull request,
-            so a test that registers CI once has registered it for both.
-
-            `head_oid` is `headRefOid`, shared with `set_pr_artifact` for the same
-            reason and then some: it is the commit the panel judges, the commit the
-            auto-merge decision compares against, AND the sha the landing sweep measures
-            a Mode C tail against (issue #232). A test that set it on only one reader
-            would be testing two pull requests. Moving it — `set_pr(..., head_oid="new")`
-            — is how a test says "somebody pushed", which is the case the whole SHA
-            binding exists for.
-
-            `base_oid` is `baseRefOid`, the base branch's head as GitHub sees it, and it
-            is what says a branch is BEHIND on a repository whose strict status-check
-            policy is off — `mergeStateStatus` answers CLEAN there, so a fixture that
-            could not state this could only drive a catch-up that never fires in
-            production (spec 2026-09-27 §5.1).
-
-            `head_oid`, `base_oid` and `merge_commit` are all OMITTED rather than sent
-            empty when unset, because GitHub never answers an empty sha: a test that
-            wants the field absent must get it absent (`github.PR_FIELDS` asks for
-            `headRefOid` on every call), and one that wants it present says so."""
+            """Register what `gh pr view <pr_url>` answers (#232)"""
             if mergeable is None:
                 mergeable = "MERGEABLE" if state == "OPEN" else None
             row = {**self.prs.get(pr_url, {}),
@@ -1932,22 +1741,17 @@ def fake_gh(tmp_path, monkeypatch):
                 row["mergeStateStatus"] = merge_state
             if head_oid:
                 row["headRefOid"] = head_oid
-            # `headRefName`, shared with `set_pr_artifact`: the branch whose remote tip
-            # the merge poll looks up when mergeability is UNKNOWN (wo-d3a70c29).
+            # `headRefName`, shared with `set_pr_artifact`: the branch whose remote tip the merge poll looks up...
             if head_ref:
                 row["headRefName"] = head_ref
             if base_oid:
                 row["baseRefOid"] = base_oid
-            # `mergeCommit.oid`, the commit the merge put on the base — a NESTED object,
-            # which is the shape the extractor has to survive, and omitted rather than
-            # null when unset because GitHub answers null only on an unmerged PR.
+            # `mergeCommit.oid`, the commit the merge put on the base
             if merge_commit:
                 row["mergeCommit"] = {"oid": merge_commit}
             self.prs[pr_url] = row
             monkeypatch.setenv("FAKE_GH_PRS", json.dumps(self.prs))
-            # "Re-calling re-states it" includes un-doing a merge the fake performed:
-            # this is the authoritative statement of what the pull request is now, so
-            # it outranks the overlay rather than being silently overridden by it.
+            # "Re-calling re-states it" includes un-doing a merge the fake performed: this is the authoritative...
             landed = gdir / "merged.json"
             if landed.exists():
                 held = json.loads(landed.read_text())
@@ -1957,40 +1761,16 @@ def fake_gh(tmp_path, monkeypatch):
         runs: dict[str, list[dict]] = {}
 
         def set_runs(self, branch: str, rows: list[dict]) -> None:
-            """Register what `gh run list --branch <branch>` answers, NEWEST FIRST.
-
-            `rows` are `gh`'s own shape — `databaseId`, `headSha`, `conclusion`,
-            `status`, `startedAt`, `workflowName`. Lower-case conclusions, because that
-            is what the real CLI answers here and upper-case is what it answers on a
-            check run; a fixture that smoothed the two over would hide the normalisation
-            `ci.Run` exists to do.
-            """
+            """Register what `gh run list --branch <branch>` answers, NEWEST FIRST"""
             self.runs[branch] = list(rows)
             monkeypatch.setenv("FAKE_GH_RUNS", json.dumps(self.runs))
 
         def set_parents(self, sha: str, parents: list[str]) -> None:
-            """Say what `gh api …/commits/<sha>` answers for a commit's parents.
-
-            What a test needs to drive the race the parentage proof exists for: a
-            worker pushing between the head read and the update means the resulting
-            merge has THAT push as its first parent, not the judged commit, and no
-            fixture that only models `update-branch`'s happy path can express it.
-
-            Registered explicitly here, so it OVERRIDES what the fake would record for
-            itself when the update runs.
-            """
+            """Say what `gh api …/commits/<sha>` answers for a commit's parents"""
             self._commit(sha, parents=list(parents))
 
         def set_commit_subject(self, sha: str, subject: str) -> None:
-            """Say what `gh api …/commits/<sha> --jq .commit.message` answers.
-
-            The squash subject is the ONLY thing that attributes a red default branch to a
-            work order: `automerge_merged` records the pull request's head and the merge is
-            `--squash`, so the shas never compare equal (spec
-            docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §2).
-            A commit with no subject registered answers GitHub's 404, which is the
-            "unreadable, so attribute nothing" case.
-            """
+            """Say what `gh api …/commits/<sha> --jq .commit.message` answers (docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §2)"""
             self._commit(sha, subject=subject)
 
         def _commit(self, sha: str, **fields) -> None:
@@ -2000,12 +1780,7 @@ def fake_gh(tmp_path, monkeypatch):
             path.write_text(json.dumps(rows))
 
         def set_default_branch(self, repo: str, branch: str) -> None:
-            """Say what `gh api repos/<owner>/<repo> --jq .default_branch` answers.
-
-            `repo` is `owner/name`, as `github.origin_repo` resolves it. Unregistered
-            answers the 404 a repository nobody created really answers — the reading the
-            OS must treat as NOT KNOWN rather than as green.
-            """
+            """Say what `gh api repos/<owner>/<repo> --jq .default_branch` answers"""
             path = gdir / "default-branch.json"
             rows = json.loads(path.read_text()) if path.exists() else {}
             rows[repo] = branch
@@ -2014,65 +1789,42 @@ def fake_gh(tmp_path, monkeypatch):
         open_prs: dict[str, list[str]] = {}
 
         def set_open_pr(self, branch: str, *urls: str) -> None:
-            """What `gh pr list --head <branch> --state open` answers.
-
-            Keyed by branch and NOT taken from the `pr view` roster: that one carries no
-            `headRefName` for `set_pr`, so a fixture derived from it could not say "this
-            branch has an open pull request" without also registering a whole artifact.
-            """
+            """What `gh pr list --head <branch> --state open` answers"""
             self.open_prs[branch] = list(urls)
             monkeypatch.setenv("FAKE_GH_OPEN_PRS", json.dumps(self.open_prs))
 
         def set_protection(self, branch: str, checks: list[str]) -> None:
-            """Protect `branch`, requiring `checks`. Unregistered branches answer the
-            404 GitHub answers for a branch nobody protects — the default, because that
-            is the state of the repository the auto-merge request ships against."""
+            """Protect `branch`, requiring `checks`"""
             path = gdir / "protection.json"
             rules = json.loads(path.read_text()) if path.exists() else {}
             rules[branch] = list(checks)
             path.write_text(json.dumps(rules))
 
         def refuse_protection(self, message: str) -> None:
-            """Fail the protection read and NOTHING else — a 403, say. `fail()` is the
-            wrong tool: it fails `pr view` too, so the poll never reaches the read."""
+            """Fail the protection read and NOTHING else — a 403, say"""
             monkeypatch.setenv("FAKE_GH_FAIL_PROTECTION", message)
 
         def base_sha(self, sha: str) -> None:
-            """The base commit `gh pr update-branch` merges in — parent 1 of the result."""
+            """The base commit `gh pr update-branch` merges in — parent 1 of the result"""
             monkeypatch.setenv("FAKE_GH_BASE_SHA", sha)
 
         def refuse_update(self, message: str = "failed to update branch") -> None:
-            """Make `gh pr update-branch` fail and NOTHING else — reads keep working.
-
-            `fail()` is the wrong tool: it fails `pr view` too, so the poll never reaches
-            the update and every assertion about a refused one passes vacuously.
-            """
+            """Make `gh pr update-branch` fail and NOTHING else — reads keep working"""
             monkeypatch.setenv("FAKE_GH_REFUSE_UPDATE", message)
 
         def updated_head(self, sha: str) -> None:
-            """What the next `gh pr update-branch` moves `headRefOid` to.
-
-            Named rather than derived when a test needs to talk about the new commit —
-            the verdict carry-forward binds to it, so a test asserting the carry has to
-            be able to write the sha down.
-            """
+            """What the next `gh pr update-branch` moves `headRefOid` to"""
             monkeypatch.setenv("FAKE_GH_UPDATED_HEAD", sha)
 
         @property
         def updates(self) -> list[str]:
-            """Every pull request `gh pr update-branch` was called on, in order."""
+            """Every pull request `gh pr update-branch` was called on, in order"""
             return [c["argv"][2] for c in self.calls
                     if c["argv"][:2] == ["pr", "update-branch"] and len(c["argv"]) > 2]
 
         @property
         def reruns(self) -> list[str]:
-            """Every `gh run rerun` — which must always be EMPTY.
-
-            The plausible wrong implementation of the inherited-failure heal, and it
-            fails silently: a re-run replays the same merge commit, so it comes back red
-            having spent full CI. A test asserting the heal happened would pass on it;
-            only a test asserting this list is empty catches it.
-            """
+            """Every `gh run rerun` — which must always be EMPTY"""
             return [" ".join(c["argv"]) for c in self.calls
                     if c["argv"][:2] == ["run", "rerun"]]
 
@@ -2082,30 +1834,21 @@ def fake_gh(tmp_path, monkeypatch):
                     draft: bool = False, base_ref: str = "main",
                     head_ref: str = "feature", number: int = 1,
                     head_oid: str | None = None) -> None:
-            """Register what the PANEL sees of this pull request.
-
-            Separate from `set_pr` because the two readers ask for different
-            fields and a test must be able to register one without the other:
-            the poll loop asks four questions and the evidence collector asks
-            for the whole artifact. Both shapes live in one dict here, and the
-            fake returns only what each caller's `--json` asked for.
-            """
+            """Register what the PANEL sees of this pull request"""
             files = files if files is not None else []
             self.prs[pr_url] = {
                 **self.prs.get(pr_url, {}),
                 "number": number, "title": title, "body": body, "state": state,
                 "isDraft": draft, "baseRefName": base_ref,
                 "headRefName": head_ref, "url": pr_url,
-                # Kept when this is called after `set_pr` has already registered one:
-                # the two readers are reading ONE pull request, and a reset here would
-                # silently unbind a verdict from the commit a test just pinned.
+                # Kept when this is called after `set_pr` has already registered one: the two readers are reading ONE...
                 "headRefOid": (head_oid if head_oid is not None
                                else self.prs.get(pr_url, {}).get("headRefOid", "")),
                 "additions": sum(int(f.get("additions") or 0) for f in files),
                 "deletions": sum(int(f.get("deletions") or 0) for f in files),
                 "changedFiles": len(files), "files": files,
                 "statusCheckRollup": checks or [],
-                # Underscored: not a `gh` field, it is what `gh pr diff` prints.
+                # Underscored: not a `gh` field, it is what `gh pr diff` prints
                 "_diff": diff,
             }
             monkeypatch.setenv("FAKE_GH_PRS", json.dumps(self.prs))
@@ -2115,46 +1858,12 @@ def fake_gh(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def jarvis_home(tmp_path, monkeypatch):
-    """Per-test central state. Autouse: isolation is not something a test can forget.
-
-    Naming it as a parameter is still the way to get the path; the only thing autouse
-    changes is that a test which does NOT name it is isolated anyway, instead of writing
-    whatever `$JARVIS_HOME` the shell carried in (in a worker session: production).
-
-    This replaces the session-scoped `isolate_jarvis_home` fixture (#30), and keeps the
-    property that motivated it. Its concern was that function-scoped monkeypatching
-    restores the *pre-test* value at teardown, handing the real home back to anything
-    still running — a daemon thread that outlived its test, a subprocess mid-flight.
-    That still holds here, because the value restored is no longer the real home: the
-    root conftest's `gate_test_environment` has already overwritten `os.environ` (not
-    via monkeypatch, so nothing undoes it) before collection. Teardown falls back onto
-    the gate's sandbox, never onto production.
-
-    Per-test rather than per-session so two tests that both forget the fixture cannot
-    collide in one shared home.
-
-    Token accounting follows the home unless the run is genuinely billing a work order
-    for real tokens (`gate_environment._bills_real_tokens`), which no ordinary test is.
-    Without moving it, a test asserting on `agent_calls` would look in its own home while
-    the rows landed in the gate's shared one.
-    """
+    """Per-test central state (#30)"""
     home = tmp_path / "jarvis-home"
     monkeypatch.setenv("JARVIS_HOME", str(home))
     if not _bills_real_tokens():
         monkeypatch.setenv(agent_usage.SPEND_HOME_ENV, str(home))
-    # CLAUDE CODE'S TRANSCRIPTS FOLLOW THE HOME, for the same reason and one of their
-    # own. A test that does not point this somewhere reads the DEVELOPER'S real
-    # `~/.claude/projects` — every session on the machine, whatever they happen to have
-    # run — so its result depends on a tree no test wrote and CI does not have. It is
-    # also slow: `Daemon.check_cache_ttl` walks that tree, which took a ticking test file
-    # from 6s to 26s here before this line existed. A test that wants transcripts still
-    # sets the variable itself; setting it here only makes the DEFAULT empty rather than
-    # whatever the machine is carrying.
-    # `claude-projects` and not `transcripts`: four existing fixtures already build their
-    # own tree at `tmp_path / "transcripts"` with a bare `mkdir()`, and a default sharing
-    # that path turns every one of them into a FileExistsError. A test that wants
-    # transcripts still overrides the variable; this only decides where it points when
-    # nobody sets it.
+    # CLAUDE CODE'S TRANSCRIPTS FOLLOW THE HOME, for the same reason and one of their own
     transcripts = tmp_path / "claude-projects"
     transcripts.mkdir(exist_ok=True)
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(transcripts))
@@ -2163,18 +1872,13 @@ def jarvis_home(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def allow_external_sinks(monkeypatch):
-    """Lift the external-sink kill switch for a test that must exercise sink internals.
-
-    Only for tests that have already neutered the transport themselves — a stubbed
-    `urlopen`, a fake binary. Grep for this fixture name to audit every place the gate
-    is lifted; if the list ever grows past the sink-rendering tests, something is wrong.
-    """
+    """Lift the external-sink kill switch for a test that must exercise sink internals"""
     monkeypatch.delenv(DISABLE_EXTERNAL_SINKS_ENV, raising=False)
 
 
 @pytest.fixture()
 def fake_claude(tmp_path, monkeypatch):
-    """Install a fake `claude` binary; returns a handle to its recorded state."""
+    """Install a fake `claude` binary; returns a handle to its recorded state"""
     fdir = tmp_path / "fake-claude"
     fdir.mkdir()
     (fdir / "jobs").mkdir()
@@ -2190,15 +1894,7 @@ def fake_claude(tmp_path, monkeypatch):
 
         @property
         def calls(self) -> list[dict]:
-            """Every invocation, oldest first (one file each; the name is a timestamp).
-
-            `.json` ONLY, and it is load-bearing rather than tidy. Each record is
-            written twice to the same name (see `_write_call_record`), and the second
-            write lands as a COMPLETE `<name>.json.part<pid>` beside the first one's
-            already-renamed `<name>.json` for the instant before `os.replace` runs. A
-            directory listing taken in that instant parses both and reports one
-            invocation as two — which is what a poller does for a living.
-            """
+            """Every invocation, oldest first (one file each; the name is a timestamp)"""
             cdir = fdir / "calls"
             if not cdir.is_dir():
                 return []
@@ -2212,12 +1908,7 @@ def fake_claude(tmp_path, monkeypatch):
 
         def wait_calls(self, matching, count: int = 1, timeout: float = 15.0
                        ) -> list[dict]:
-            """Wait for `count` recorded calls satisfying `matching(call)`.
-
-            A worker turn is a detached process, so it records itself a moment AFTER the
-            call that launched it returns. Every argv assertion has to wait for that;
-            otherwise the test is racing the process it just started.
-            """
+            """Wait for `count` recorded calls satisfying `matching(call)`"""
             deadline = time.monotonic() + timeout
             found: list[dict] = []
             while time.monotonic() < deadline:
@@ -2234,11 +1925,7 @@ def fake_claude(tmp_path, monkeypatch):
 
         @property
         def turns(self) -> dict[str, list[str]]:
-            """Every headless worker turn, as {session id: [prompt, …]}.
-
-            The key assertion this enables: one session id accumulating many turns is
-            exactly what "the id does not move" looks like from outside.
-            """
+            """Every headless worker turn, as {session id: [prompt, …]}"""
             tdir = fdir / "turns"
             if not tdir.is_dir():
                 return {}
@@ -2249,76 +1936,38 @@ def fake_claude(tmp_path, monkeypatch):
             }
 
         def fail_seat(self, *seats: str, roster: str = "neo") -> None:
-            """Make the named panel seats' calls fail, and only those.
-
-            Per-seat rather than the shared `FORCE_FAIL`, which keys on the user prompt —
-            identical across every seat on one question — and so could only fail the whole
-            panel at once. Degradation is per seat: one seat abstains and the rest proceed.
-
-            `roster` picks WHICH panel, and it is not decoration: `chair` is a legal seat
-            name in Neo's roster and in the validator's, so one shared variable could not
-            take a validation chair down without taking Neo's down with it — and a test
-            that failed both would prove nothing about either.
-            """
+            """Make the named panel seats' calls fail, and only those"""
             env = "FAKE_SEAT_FAIL" if roster == "neo" else "FAKE_VALIDATION_SEAT_FAIL"
             monkeypatch.setenv(env, ",".join(seats))
 
         def refuse_seat(self, *seats: str,
                         reset: str = "11:50pm (America/Los_Angeles)") -> None:
-            """Refuse the named Neo panel seats for the USAGE LIMIT, resetting at `reset`.
-
-            `fail_seat`'s sibling, and the distinction is the one the whole retry ladder
-            turns on: a seat that FAILED is a fault to retry in seconds, a seat that was
-            REFUSED names the moment its window reopens and must be waited out instead
-            (GitHub issue #235). The fake emits the real result-JSON shape, so what the
-            test exercises is `claude_cli.usage_limit` and `Opinion.refused` rather than
-            a stand-in for them.
-            """
+            """Refuse the named Neo panel seats for the USAGE LIMIT, resetting at `reset` (#235)"""
             monkeypatch.setenv("FAKE_SEAT_REFUSE", ",".join(seats))
             monkeypatch.setenv("FAKE_CLAUDE_LIMIT_RESET", reset)
 
         def turns_fail(self, mode: str = "fail") -> None:
-            """Make subsequent turns fail. `fail` = non-zero exit, `silent` = exits
-            writing nothing at all (a crashed process), `error` = a well-formed result
-            with `is_error`, `rate_limit` = the CLI refusing the turn because the
-            account's usage window is spent (see `turns_rate_limited`), `api_error` =
-            the API failing mid-turn (see `turns_api_error`)."""
+            """Make subsequent turns fail"""
             monkeypatch.setenv("FAKE_CLAUDE_TURN", mode)
 
         def turns_rate_limited(self, reset: str = "11:50pm (America/Los_Angeles)"
                                ) -> None:
-            """Refuse every subsequent turn for the usage limit, resetting at `reset`.
-
-            Call `turns_recover()` to reopen the window — which is what the OS is
-            waiting for, so it is also how a test proves the retry works rather than
-            just that it happens.
-            """
+            """Refuse every subsequent turn for the usage limit, resetting at `reset`"""
             monkeypatch.setenv("FAKE_CLAUDE_LIMIT_RESET", reset)
             monkeypatch.setenv("FAKE_CLAUDE_TURN", "rate_limit")
 
         def health_rate_limited(self, reset: str = "11:50pm (America/Los_Angeles)"
                                 ) -> None:
-            """Refuse every subsequent HEALTH SWEEP for the usage limit.
-
-            `turns_rate_limited`'s sibling on the other call the OS makes: a sweep is a
-            `claude -p` with no session, so the turn path's refusal never reaches it.
-            Emits the same result-JSON shape, so the test drives the real classifier.
-            """
+            """Refuse every subsequent HEALTH SWEEP for the usage limit"""
             monkeypatch.setenv("FAKE_HEALTH_REFUSE", "1")
             monkeypatch.setenv("FAKE_CLAUDE_LIMIT_RESET", reset)
 
         def health_recover(self) -> None:
-            """Reopen the window — what the sweep is waiting for."""
+            """Reopen the window — what the sweep is waiting for"""
             monkeypatch.delenv("FAKE_HEALTH_REFUSE", raising=False)
 
         def turns_api_error(self, status: int = 500) -> None:
-            """Break every subsequent turn with an API error, AFTER it has run.
-
-            The mirror image of `turns_rate_limited`, and the difference is the point:
-            this one writes the transcript and reports API time first, so the turn it
-            kills is one that really happened. `status` picks the code — pass 429 to
-            check that the usage-limit path keeps its claim on that one.
-            """
+            """Break every subsequent turn with an API error, AFTER it has run"""
             monkeypatch.setenv("FAKE_CLAUDE_API_ERROR_STATUS", str(status))
             monkeypatch.setenv("FAKE_CLAUDE_TURN", "api_error")
 
@@ -2326,13 +1975,7 @@ def fake_claude(tmp_path, monkeypatch):
                 self, said: str = ("Failed to authenticate: OAuth session expired "
                                    "and could not be refreshed"),
                 root: Path | None = None) -> Path:
-            """Refuse every subsequent turn the way an expired login does — SILENTLY.
-
-            No result JSON, no stderr: the reason goes into the session transcript as a
-            `<synthetic>` message and nowhere else, which is the whole reason the OS
-            could not see it. Points `JARVIS_TRANSCRIPT_ROOT` at `root` (a temp dir by
-            default) and returns it, so a test can also read what was written.
-            """
+            """Refuse every subsequent turn the way an expired login does — SILENTLY"""
             root = root or (tmp_path / "auth-transcripts")
             root.mkdir(parents=True, exist_ok=True)
             monkeypatch.setenv("JARVIS_TRANSCRIPT_ROOT", str(root))
@@ -2341,24 +1984,18 @@ def fake_claude(tmp_path, monkeypatch):
             return root
 
         def turns_recover(self) -> None:
-            """Undo `turns_fail`/`turns_rate_limited`/`turns_api_error`/
-            `turns_auth_failed`: turns succeed again."""
+            """Undo `turns_fail`/`turns_rate_limited`/`turns_api_error`/ `turns_auth_failed`: turns succeed again"""
             monkeypatch.delenv("FAKE_CLAUDE_TURN", raising=False)
 
         def hold_turns(self) -> Path:
-            """Make subsequent turns block until the returned path is deleted, so a
-            test can observe a work order mid-turn."""
+            """Make subsequent turns block until the returned path is deleted"""
             gate = fdir / "turn-hold"
             gate.write_text("held")
             monkeypatch.setenv("FAKE_CLAUDE_TURN_HOLD", str(gate))
             return gate
 
         def set_session_state(self, session_id: str, state: str) -> None:
-            """Move a session's state, keeping its job result file in step.
-
-            The supervisor publishes the turn's final assistant message when the job
-            reaches `done`; the daemon reads it from there, so the fake must too.
-            """
+            """Move a session's state, keeping its job result file in step"""
             sessions = self.sessions
             for s in sessions:
                 if s["sessionId"] != session_id:
@@ -2376,12 +2013,7 @@ def fake_claude(tmp_path, monkeypatch):
 
 
 def _settle_turns(store: Any, timeout: float = 15.0) -> bool:
-    """Block until every in-flight turn in this project has been reaped.
-
-    Worker turns are detached processes, so a test that launched one has to wait for it
-    the way the daemon does — by polling. Returns False on timeout rather than raising,
-    so the caller's own assertion reports the failure.
-    """
+    """Block until every in-flight turn in this project has been reaped"""
     from . import worker_session
 
     deadline = time.monotonic() + timeout
@@ -2395,35 +2027,21 @@ def _settle_turns(store: Any, timeout: float = 15.0) -> bool:
 
 @pytest.fixture()
 def settle_turns():
-    """`settle_turns(store)` — block until every in-flight turn has been reaped."""
+    """`settle_turns(store)` — block until every in-flight turn has been reaped"""
     return _settle_turns
 
 
-#: Where every fixture project keeps a design document, and what a test plan names in its
-#: `design_doc`. Every plan must stand on one, so without a real file here each test that
-#: submits a plan would have to write one first. See §7 of
-#: docs/superpowers/specs/2026-08-23-the-work-order-record.md.
+#: Where every fixture project keeps a design document, and what a test plan names in its `design_doc` (docs/superpowers/specs/2026-08-23-the-work-order-record.md)
 FIXTURE_DESIGN_DOC = "docs/superpowers/specs/exporter.md"
 
-#: How many numbered sections the fixture document carries. A plan is refused unless every
-#: child names a section that resolves AND no two children name the same one, so a fixture
-#: with two sections would cap every fixture plan at two children. Generous rather than
-#: exact: the cost is a few lines of markdown, and running out is a confusing failure in
-#: a test that is about something else entirely.
-#: (Counted across the whole session, not per plan — `fixture_spec_section` remembers a
-#: key for ever, so this is the number of DISTINCT child keys the suite uses in total.)
+#: How many numbered sections the fixture document carries
 FIXTURE_SPEC_SECTIONS = 200
 
 _FIXTURE_SECTION_BY_KEY: dict[str, str] = {}
 
 
 def fixture_spec_section(key: str) -> str:
-    """A distinct, resolvable `spec_section` for a fixture child, from its plan key.
-
-    Assigned lazily and remembered, so the same key is always the same section and two
-    different keys are never the same one — which is exactly the uniqueness rule
-    `plans.spec_problems` enforces, expressed as the fixture's own invariant.
-    """
+    """A distinct, resolvable `spec_section` for a fixture child, from its plan key"""
     if key not in _FIXTURE_SECTION_BY_KEY:
         assert len(_FIXTURE_SECTION_BY_KEY) < FIXTURE_SPEC_SECTIONS, (
             f"the fixture design document has only {FIXTURE_SPEC_SECTIONS} sections; "
@@ -2433,9 +2051,7 @@ def fixture_spec_section(key: str) -> str:
     return _FIXTURE_SECTION_BY_KEY[key]
 
 
-#: Numbered sections plus the `Agent profile` appendix `plans.spec_problems` demands. The
-#: appendix has to clear `specs.MIN_PROFILE_CHARS`, which is why it is prose rather than a
-#: placeholder line.
+#: Numbered sections plus the `Agent profile` appendix `plans.spec_problems` demands
 FIXTURE_DESIGN_DOC_BODY = "\n".join([
     "# Exporter design",
     "",
@@ -2467,14 +2083,7 @@ FIXTURE_DESIGN_DOC_BODY = "\n".join([
 
 
 def with_origin(path: Path, repo: str = "acme/proj") -> Path:
-    """Give this fixture project an `origin`, so `github.origin_repo` resolves.
-
-    OPT-IN, and it must stay that way: `make_git_project` leaves every fixture repository
-    remote-less, and adding one for the whole suite would arm the origin check — and
-    `Daemon.poll_default_branch`, which is gated on exactly this — in tests that never
-    asked for it. The default matches the harness's `PR = ".../acme/proj/pull/7"`, so
-    `github.checked_pr_url` still passes.
-    """
+    """Give this fixture project an `origin`, so `github.origin_repo` resolves (#7)"""
     subprocess.run(["git", "-C", str(path), "remote", "add", "origin",
                     f"https://github.com/{repo}.git"], check=True)
     return path
@@ -2484,9 +2093,7 @@ def make_git_project(root: Path, name: str, readme: str | None = "# proj\n",
                      commit_spec: bool = True) -> Path:
     path = root / name
     path.mkdir(parents=True)
-    # `-b main`, not the machine's `init.defaultBranch`: `evidence.base_ref`'s last rung
-    # is the literal name `main`, so a fixture repo on `master` resolves no base and
-    # every diff collected from it is empty.
+    # `-b main`, not the machine's `init.defaultBranch`: `evidence.base_ref`'s last rung is the literal...
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=path, check=True)
     if readme is not None:
         (path / "README.md").write_text(readme)
@@ -2494,15 +2101,13 @@ def make_git_project(root: Path, name: str, readme: str | None = "# proj\n",
     doc.parent.mkdir(parents=True, exist_ok=True)
     doc.write_text(FIXTURE_DESIGN_DOC_BODY)
     if commit_spec:
-        # The SPEC ONLY, so the repository is otherwise as empty as every other suite
-        # expects. A plan is refused unless its design document has a committed copy
-        # (§11 of the plan-review spec), so without this commit no fixture plan submits.
+        # The SPEC ONLY, so the repository is otherwise as empty as every other suite expects
         commit(path, "fixture: the design document", FIXTURE_DESIGN_DOC)
     return path
 
 
 def commit(repo: Path, message: str, *paths: str) -> None:
-    """Commit named paths in a fixture repository, identity and all."""
+    """Commit named paths in a fixture repository, identity and all"""
     subprocess.run(["git", "-C", str(repo), "add", "--", *paths], check=True)
     subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
                     "commit", "-qm", message], check=True)
@@ -2510,7 +2115,7 @@ def commit(repo: Path, message: str, *paths: str) -> None:
 
 @pytest.fixture(autouse=True)
 def claude_json(tmp_path, monkeypatch):
-    """Point trust checks at a scratch claude.json; tests opt paths in as trusted."""
+    """Point trust checks at a scratch claude.json; tests opt paths in as trusted"""
     path = tmp_path / "claude.json"
     path.write_text(json.dumps({"projects": {}}))
     monkeypatch.setenv("JARVIS_CLAUDE_JSON", str(path))
@@ -2525,20 +2130,7 @@ def claude_json(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def signin(tmp_path, monkeypatch):
-    """Control what `claude_cli.signin_changed_at` sees — an auth pause's whole clock.
-
-    Calling the returned function is the user running `/login`: it writes a valid
-    credentials file, stamped now unless `at` back-dates it. Not autouse, because the
-    gate already points the path at a file that does not exist, and "cannot tell, do not
-    resume" is what every other test wants from this.
-
-    THE STAMP MUST NOT BE MOVED FORWARD to make "signed in after the failure" reliable,
-    however tempting that is when a test races. The mtime becomes the pause's `retry_at`
-    verbatim (`worker_session._auth_retry_at`) and `TurnPause.due()` is `now >=
-    retry_at` — so a sign-in stamped in the future is a pause that is not due yet, which
-    is the opposite of what such a test is asserting. Back-date the FAILURE instead; see
-    `test_auth_resume._auth_turn`.
-    """
+    """Control what `claude_cli.signin_changed_at` sees — an auth pause's whole clock"""
     path = tmp_path / "credentials.json"
     monkeypatch.setenv(CREDENTIALS_ENV, str(path))
 
@@ -2549,12 +2141,6 @@ def signin(tmp_path, monkeypatch):
             "refreshTokenExpiresAt": int((time.time() + refresh_expires_in) * 1000),
         }}))
         # ALWAYS stamped explicitly, including the `at=None` case, and from `time.time()`
-        # — the same clock `wo_turns.ended_at` is written from. A file's mtime otherwise
-        # comes from the kernel's COARSE clock, which lags `time.time()` by up to a timer
-        # tick, so a sign-in written microseconds after a turn failed can land BEFORE it
-        # and be read as the sign-in that failed (`worker_session._auth_retry_at` wants
-        # strictly greater). That is a real inversion, not a rounding artefact, and CI
-        # hit it on 3.13 while 3.11 and 3.12 passed on the same commit.
         stamp = time.time() if at is None else at
         os.utime(path, (stamp, stamp))
         return path
@@ -2562,25 +2148,13 @@ def signin(tmp_path, monkeypatch):
     return sign_in
 
 
-#: The commit `origin/<base>` is at, for every fixture that fakes the local checkout.
+#: The commit `origin/<base>` is at, for every fixture that fakes the local checkout
 FIXTURE_BASE_TIP = "ba5e11d000000000000000000000000000000f00"
 
 
 @pytest.fixture()
 def local_base(monkeypatch):
-    """What the local checkout answers about the base. Returns the state, to be changed.
-
-    Spec docs/superpowers/specs/2026-09-28-a-merge-checks-the-base-it-lands-on.md §3.1:
-    a merge re-reads `origin/<base>` and refuses if the judged head does not contain it.
-    The `project` fixture has no `origin`, so real git refuses and NOTHING would ever
-    merge in a test — this is the fresh, up-to-date base that used to be implied.
-
-    THE ONE FAKE OF `branchproof` FOR THE WHOLE SUITE — every test that needs the local
-    checkout's answers builds on this rather than re-patching the three functions.
-    `contains` is what the judged head carries: empty is a branch behind its base, which
-    is the incident's shape. `base_ancestors` is proof (a) item 6's other question — was
-    this a BASE merge — and None means yes to all of them.
-    """
+    """What the local checkout answers about the base (docs/superpowers/specs/2026-09-28-a-merge-checks-the-base-it-lands-on.md §3.1)"""
     from . import branchproof
 
     state = {"fetch": True, "tip": FIXTURE_BASE_TIP, "contains": {FIXTURE_BASE_TIP},
@@ -2599,11 +2173,7 @@ def local_base(monkeypatch):
 
 @pytest.fixture()
 def origins():
-    """Empty `schedule._ORIGIN_CACHE` around a test that creates or rewrites a remote.
-
-    The cache exists because `origin` does not move under a running daemon, which is the
-    one assumption a test adding a remote to a fresh repository breaks.
-    """
+    """Empty `schedule._ORIGIN_CACHE` around a test that creates or rewrites a remote"""
     from . import schedule
 
     schedule._ORIGIN_CACHE.clear()
@@ -2620,15 +2190,7 @@ def project(tmp_path, claude_json):
 
 @pytest.fixture()
 def improvement_order(project):
-    """A filed improvement order in the `project` fixture's project: evidence refs, no
-    analyst, no report.
-
-    Shared rather than re-filed per test file — §2.7 of
-    docs/superpowers/specs/2026-09-23-improvement-orders.md: every later piece of the
-    feature needs "an improvement order that exists", and divergent local copies are how
-    a suite starts disagreeing with itself. Written through the store rather than
-    `ops.create_improvement_order` so it costs no started OS.
-    """
+    """A filed improvement order in the `project` fixture's project: evidence refs, no analyst, no report (docs/superpowers/specs/2026-09-23-improvement-orders.md)"""
     from .ops import EVIDENCE_REFS_KEY
     from .project_store import ProjectStore
 
@@ -2647,12 +2209,7 @@ def improvement_order(project):
 
 
 def a_finding(key: str = "first-turn-reads", **overrides: Any) -> dict[str, Any]:
-    """One finding `findings.parse_report` accepts, every field overridable.
-
-    Prose is over `findings.MIN_FIELD_CHARS`, quotes over `findings.MIN_QUOTE_CHARS` and
-    every proposed description clears `plans._description_problems`, so a test that wants
-    a rejection breaks exactly one field and nothing else drags the report down with it.
-    """
+    """One finding `findings.parse_report` accepts, every field overridable"""
     finding = {
         "key": key,
         "symptom": ("Three work orders in a row opened with the same eight file reads "
@@ -2684,15 +2241,7 @@ def a_finding(key: str = "first-turn-reads", **overrides: Any) -> dict[str, Any]
 
 def a_verdict(classification: str = "GAP", subject: str = "wo-11111111",
               **overrides: Any) -> dict[str, Any]:
-    """One verdict `verdicts.parse_verdict` accepts, for any classification.
-
-    §2.4 of docs/superpowers/specs/2026-09-27-investigation-orders.md: the payload is
-    classification-dependent, so the helper carries EXACTLY the fields that
-    classification requires and none it forbids — a test that wants a rejection adds or
-    breaks one field and nothing else drags the document down with it.
-
-    Shared with the ops tests rather than re-declared per file, for `a_report`'s reason.
-    """
+    """One verdict `verdicts.parse_verdict` accepts, for any classification (docs/superpowers/specs/2026-09-27-investigation-orders.md)"""
     doc: dict[str, Any] = {
         "subject": subject,
         "classification": classification,
@@ -2732,15 +2281,7 @@ def a_verdict(classification: str = "GAP", subject: str = "wo-11111111",
 
 
 def a_report(**overrides: Any) -> dict[str, Any]:
-    """A findings report `findings.parse_report` accepts — the shared document.
-
-    §4.3 of docs/superpowers/specs/2026-09-23-improvement-orders.md: every later piece of
-    this feature needs "a stored report", and divergent local copies are how a suite
-    starts disagreeing with itself. Every field is overridable so one test can break
-    exactly one thing: `a_report()`, `a_report(summary="")`, `a_report(findings=[...])`.
-
-    Asserts nothing: it builds a document and hands it back.
-    """
+    """A findings report `findings.parse_report` accepts — the shared document (docs/superpowers/specs/2026-09-23-improvement-orders.md)"""
     report: dict[str, Any] = {
         "summary": "Workers pay for the same rediscovery on every first turn.",
         "findings": [
@@ -2769,11 +2310,7 @@ def a_report(**overrides: Any) -> dict[str, Any]:
 def catalog_file(tmp_path, project):
     data = {
         "os": {
-            # `max_in_flight` well out of the way: the shipped default (3) is TIGHTER
-            # than the project default (5), so leaving it alone would make the fleet cap
-            # the binding one in every test that is really about the project cap or a
-            # feature's `max_parallel` — those would pass or fail for the wrong reason.
-            # Tests of the fleet cap itself set their own (tests/test_fleet_cap.py).
+            # `max_in_flight` well out of the way: the shipped default (3) is TIGHTER than the project default...
             "defaults": {"model": "sonnet", "max_in_flight": 50},  # permission_mode: auto
             "notifications": {"sinks": ["log"]},
         },
@@ -2786,14 +2323,9 @@ def catalog_file(tmp_path, project):
     return path
 
 
-# -- the transport fault harness ---------------------------------------------------
-#
-# Spec docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §8. One named
-# fault per shape the transport is known to fail in, so every rescue path in the OS is
-# driven through the same list rather than each test inventing its own exception.
+# -- the transport fault harness
 
-#: The exact production shape behind Neo question 388: rc=1, zero tokens in and out,
-#: `duration_api_ms` 0, `total_cost_usd` 0 — a launch that never reached the API.
+#: The exact production shape behind Neo question 388: rc=1
 RC1_EMPTY = "rc1_empty"
 TIMEOUT = "timeout"
 EMPTY_STDOUT = "empty_stdout"
@@ -2801,16 +2333,10 @@ MALFORMED_JSON = "malformed_json"
 USAGE_LIMIT = "usage_limit"
 MID_STREAM_DISCONNECT = "mid_stream_disconnect"
 
-#: Faults where the model was NEVER REACHED. Every one of these must leave the unit of
-#: work pending and retryable, and must decide nothing.
+#: Faults where the model was NEVER REACHED
 TRANSPORT_FAULTS = (RC1_EMPTY, TIMEOUT, EMPTY_STDOUT, MID_STREAM_DISCONNECT)
 
-#: ...and the two kinds that are NOT transport faults, kept beside them because a rescue
-#: that cannot tell them apart is the defect this harness exists to catch.
-#:
-#: `MALFORMED_JSON` is a model that REPLIED, unusably: the OS's unparseable-output rules
-#: own it, not the retry ladder. `USAGE_LIMIT` is a refusal that states when it lifts, so
-#: it is waited out and spends no attempt (GitHub issue #235).
+#: ...and the two kinds that are NOT transport faults (#235)
 REPLY_FAULTS = (MALFORMED_JSON,)
 REFUSAL_FAULTS = (USAGE_LIMIT,)
 
@@ -2818,12 +2344,7 @@ ALL_FAULTS = TRANSPORT_FAULTS + REPLY_FAULTS + REFUSAL_FAULTS
 
 
 def raise_fault(fault: str, reset_at: float | None = None) -> None:
-    """Raise what `claude_cli` raises for `fault`; return for a fault that is a reply.
-
-    `MALFORMED_JSON` returns rather than raising: the call SUCCEEDED and the reply is
-    what is wrong with it, so a transport that raised there would model the wrong
-    failure. `fault_text` is what such a call returns instead.
-    """
+    """Raise what `claude_cli` raises for `fault`; return for a fault that is a reply"""
     from . import claude_cli
 
     if fault == RC1_EMPTY:
@@ -2845,19 +2366,14 @@ def raise_fault(fault: str, reset_at: float | None = None) -> None:
 
 
 def fault_text(fault: str) -> str:
-    """What a call returns for a fault that produced output rather than an exception."""
+    """What a call returns for a fault that produced output rather than an exception"""
     assert fault in REPLY_FAULTS, fault
     return '{"escalate": false, "answer": "trunc'
 
 
 def faulty_transport(fault: str, succeed_after: int | None = None,
                      reply: str = "", reset_at: float | None = None) -> Any:
-    """A `claude_cli.run_headless_result` stand-in that fails with `fault`.
-
-    `succeed_after` is what proves a retry is a retry: after that many calls the
-    transport recovers and returns `reply`, so a test can assert the eventual answer is
-    the REAL one rather than a fallback that happened to look plausible.
-    """
+    """A `claude_cli.run_headless_result` stand-in that fails with `fault`"""
     from . import claude_cli
 
     def call(*_args: Any, **_kwargs: Any) -> Any:
@@ -2872,8 +2388,7 @@ def faulty_transport(fault: str, succeed_after: int | None = None,
 
 
 class FaultyAnswerer:
-    """A `neo.drain_queue(answer=...)` stand-in — the seam the drain's rescue is reached
-    through. `succeed_after` recovers as `faulty_transport` does."""
+    """A `neo.drain_queue(answer=...)` stand-in — the seam the drain's rescue is reached through"""
 
     def __init__(self, fault: str, succeed_after: int | None = None,
                  verdict: dict[str, Any] | None = None,
@@ -2896,16 +2411,7 @@ class FaultyAnswerer:
 
 
 class FleetCostFixture:
-    """Synthetic fleet state for `jarvis.fleetcost` — chosen timestamps, no real agent.
-
-    Every writer goes through the real schema (`ProjectStore`, `CentralStore`,
-    `NeoStore`) and then rewrites the timestamp columns, because the stores stamp
-    `db.now()` and a distribution report is entirely about WHEN a turn ran. The report
-    itself never opens any of these stores: it reads the same files `mode=ro`, which is
-    what `test_read_only` asserts.
-
-    Spec §7 of docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md.
-    """
+    """Synthetic fleet state for `jarvis.fleetcost` — chosen timestamps, no real agent (docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md)"""
 
     def __init__(self, home: Path, project_path: Path, root: Path, catalog: Path,
                  name: str = "proj_a") -> None:
@@ -2917,7 +2423,7 @@ class FleetCostFixture:
         self.db = paths.project_db_path(project_path)
         self.os_db = paths.central_db_path()
 
-    # -- the project store ------------------------------------------------------
+    # -- the project store
 
     def _store(self) -> Any:
         from .project_store import ProjectStore
@@ -2944,7 +2450,7 @@ class FleetCostFixture:
              kind: str = "dispatch", cost_usd: float | None = None,
              cost_source: str | None = "envelope",
              usage: dict[str, Any] | None = None, state: str = "done") -> int:
-        """One settled (or still-running, with `ended_at=None`) turn at a chosen time."""
+        """One settled (or still-running, with `ended_at=None`) turn at a chosen time"""
         store = self._store()
         try:
             seq = store.conn.execute(
@@ -2972,7 +2478,7 @@ class FleetCostFixture:
         finally:
             store.close()
 
-    # -- the central and neo stores ---------------------------------------------
+    # -- the central and neo stores
 
     def os_call(self, kind: str, *, ts: float, wo_id: str = "", cost_usd: float = 0.0,
                 label: str = "", model: str = "claude-opus-5",
@@ -3005,31 +2511,18 @@ class FleetCostFixture:
             neo.close()
 
     def set_cost(self, **keys: Any) -> None:
-        """Override `os.cost.*` in the catalog this fixture registered.
-
-        The cap on orders walked and the row cap of the tool table are catalog settings
-        (Neo's rider: no module constant for anything tunable), so a test that wants to
-        see the cap BITE has to write one.
-        """
+        """Override `os.cost.*` in the catalog this fixture registered"""
         data = json.loads(self.catalog_path.read_text())
         data["os"].setdefault("cost", {}).update(keys)
         self.catalog_path.write_text(json.dumps(data))
 
-    # -- transcripts ------------------------------------------------------------
+    # -- transcripts
 
     def call_row(self, *, at: float, read: int = 0, write: int = 0, out: int = 0,
                  input: int = 0, mid: str = "", model: str = "claude-opus-5",
                  tools: Sequence[tuple[str, str, dict]] = (),
                  stop_reason: str | None = "end_turn") -> dict:
-        """One assistant message — `usage.calls_of` reads one API call per row.
-
-        `tools` is (tool_use_id, name, input) triples, and SEVERAL on one row is how
-        Claude Code writes a parallel tool call: that is the case the char-proportional
-        split of one exact context delta exists for (§10.2).
-
-        `stop_reason` defaults to a SEALED value; `placeholder_call_rows` stages the
-        other kind (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §1).
-        """
+        """One assistant message — `usage.calls_of` reads one API call per row (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §1)"""
         return {
             "type": "assistant",
             "timestamp": (datetime.fromtimestamp(at, tz=timezone.utc)
@@ -3048,12 +2541,7 @@ class FleetCostFixture:
     def placeholder_call_rows(self, *, at: float, read: int = 0, write: int = 0,
                               out: int = 5, mid: str = "",
                               model: str = "claude-opus-5") -> list[dict]:
-        """The TWO mid-stream rows Claude Code writes for one message, and no third.
-
-        Both carry `stop_reason: null` and the same streaming `output_tokens`, so the
-        message's true output is not in the file at all (spec §1). One text block, one
-        tool_use block — the shape measured on wo-be05ab99's subagents.
-        """
+        """The TWO mid-stream rows Claude Code writes for one message, and no third"""
         mid = mid or f"ph-{at}-{read}-{write}"
         return [
             self.call_row(at=at, read=read, write=write, out=out, mid=mid, model=model,
@@ -3064,11 +2552,7 @@ class FleetCostFixture:
 
     def result_row(self, *results: tuple[str, str], at: float,
                    is_error: bool = False) -> dict:
-        """One user row carrying `tool_result` blocks — (tool_use_id, text) pairs.
-
-        A `user` row, which is why `usage._assistant_messages` never saw one: it has no
-        `usage` object, so the ledger keyed by API call has no place to charge it.
-        """
+        """One user row carrying `tool_result` blocks — (tool_use_id, text) pairs"""
         return {
             "type": "user",
             "timestamp": (datetime.fromtimestamp(at, tz=timezone.utc)
@@ -3090,8 +2574,7 @@ class FleetCostFixture:
     def transcript(self, session_id: str, rows: Sequence[dict],
                    subagents: Sequence[Sequence[dict]] = (),
                    directory: str = "-proj") -> Path:
-        """`directory` is the slugified cwd — a non-default one is how a session OUTSIDE
-        every registered project is written (usage-meter spec §6)."""
+        """`directory` is the slugified cwd"""
         project_dir = self.transcript_root / directory
         project_dir.mkdir(parents=True, exist_ok=True)
         lead = project_dir / f"{session_id}.jsonl"
@@ -3106,12 +2589,7 @@ class FleetCostFixture:
 
 @pytest.fixture()
 def fleet_fixture(jarvis_home, tmp_path, monkeypatch, claude_json):
-    """A registered project, a catalog, an `os.db` and a transcript root — all empty.
-
-    In `jarvis.testing` rather than a conftest so the eval and browser suites can reuse
-    it (mem:testing). The catalog is not decoration: classifying a cold boundary needs
-    `os.cold_prefix_floor`, which has no default anywhere.
-    """
+    """A registered project, a catalog, an `os.db` and a transcript root — all empty"""
     from .central_store import CentralStore
 
     project_path = make_git_project(tmp_path, "proj_a")
@@ -3136,13 +2614,7 @@ def fleet_fixture(jarvis_home, tmp_path, monkeypatch, claude_json):
 
 
 class Recorder:
-    """A `deliver`/`unreachable` hook that records its calls. Empty IS the assertion.
-
-    ALWAYS TRUTHY, and that is not a detail: every call site guards with `if deliver:`,
-    so a recorder that went falsy when empty would silently disable the very hook the
-    test is asserting about — and the assertion would pass for the wrong reason.
-    Ask `len(recorder)` or `recorder.calls`, never `if recorder`.
-    """
+    """A `deliver`/`unreachable` hook that records its calls"""
 
     def __init__(self) -> None:
         self.calls: list[tuple[Any, ...]] = []
@@ -3159,7 +2631,7 @@ class Recorder:
 
 @pytest.fixture()
 def self_dispatch_on(monkeypatch):
-    """Opt every parsed catalog back in to `os.autonomy.self_dispatch` and the stuck sweep."""
+    """Opt every parsed catalog back in to `os.autonomy.self_dispatch` and the stuck sweep"""
     from . import catalog as catalog_mod
 
     autonomy, fleet_health = catalog_mod._parse_autonomy, catalog_mod._parse_fleet_health

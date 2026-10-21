@@ -1,16 +1,4 @@
-"""The scheduler: work orders the OS files without being asked.
-
-docs/superpowers/specs/2026-09-14-the-scheduler.md.
-
-WHAT THESE TESTS ARE BUILT TO AVOID. The scheduler ships DISABLED, so a test that reaches
-the daemon without turning it on exercises nothing and still passes — `_enable` is never
-a fixture default, and `test_disabled_fleet_files_nothing` is the pin that keeps it
-honest. And every property here is about a moment: "a restart does not fire", "one
-catch-up not seven", "held for three days". A test that did not MOVE THE CLOCK would take
-the same branch twice, get the same answer, and agree with itself on unfixed code
-(kn-e6373014) — so `clock` is compulsory in every cadence test below, and the assertions
-are on ROWS and ORDER COUNTS rather than on return values.
-"""
+"""The scheduler: work orders the OS files without being asked (docs/superpowers/specs/2026-09-14-the-scheduler.md)"""
 
 from __future__ import annotations
 
@@ -31,9 +19,7 @@ JOB = schedule.DOCTOR_JOB.id
 
 
 class _Clock:
-    """A hand-advanced `db.now`. See `test_health_sweep._Clock` for why not `freezegun`:
-    a bare `monkeypatch.undo()` would revert `jarvis_home` too and every surface would
-    then render as an empty OS with no error anywhere."""
+    """A hand-advanced `db.now`"""
 
     def __init__(self, at: float) -> None:
         self.at = at
@@ -54,8 +40,7 @@ def clock(monkeypatch):
 
 
 def _enable(catalog_file, **overrides) -> None:
-    """Turn the scheduler on. NEVER a fixture default — the disabled pin depends on
-    reaching the daemon without this call having been made."""
+    """Turn the scheduler on"""
     data = json.loads(catalog_file.read_text())
     data["os"]["schedule"] = {"enabled": True, **overrides}
     catalog_file.write_text(json.dumps(data))
@@ -77,12 +62,7 @@ def store(started):
 
 
 def _tick(daemon, store) -> None:
-    """One scheduler pass over proj_a, called directly.
-
-    Not through `Daemon.tick`: that pass also dispatches, and a worker launched here
-    would settle the order under the very assertions about its status. One test below
-    (`test_the_tick_actually_calls_it`) covers the wiring.
-    """
+    """One scheduler pass over proj_a, called directly"""
     daemon.schedule_tick(daemon.catalog.project("proj_a"), store)
 
 
@@ -91,10 +71,7 @@ def _scheduled(store) -> list[dict]:
             if wo["origin"] == schedule.ORIGIN]
 
 
-# -- the cadence, with no store, no catalog and no daemon --------------------------------
-#
-# `schedule.decide` is the one thing that must never be wrong — "may the OS spend money
-# right now" — so it is tested as the pure function it is.
+# -- the cadence, with no store, no catalog and no daemon
 
 
 def _state(last_fired_at: float, **over) -> dict:
@@ -123,41 +100,32 @@ def test_due_but_previous_order_unsettled_holds_and_says_which():
 
 def test_a_week_of_downtime_is_one_catch_up_not_seven(clock, started, store,
                                                      catalog_file):
-    """The property `last_fired_at = now` exists for, asserted end to end.
-
-    Advancing by whole intervals instead would look identical on the first tick and
-    differ only here — which is why this moves the clock a week rather than a day.
-    """
+    """The property `last_fired_at = now` exists for, asserted end to end"""
     _enable(catalog_file)
     _tick(started(), store)          # seed the clock without firing
     clock.advance(7 * DAY)
     daemon = started()
     _tick(daemon, store)
     assert len(_scheduled(store)) == 1
-    # ...and the backlog does not arrive on the next pass either: the clock was moved to
-    # NOW, so the six missed intervals are gone rather than queued. (The one order filed
-    # above is `pending`, so it also holds the job — settle it to prove the point is the
-    # CLOCK and not the hold.)
+    # ...and the backlog does not arrive on the next pass either: the clock was moved to NOW
     store.update_work_order(_scheduled(store)[0]["id"], status="completed")
     _tick(daemon, store)
     assert len(_scheduled(store)) == 1
 
 
-# -- seeding: neither enabling nor restarting may fire -----------------------------------
+# -- seeding: neither enabling nor restarting may fire
 
 
 def test_enabling_a_job_does_not_fire_it(clock, started, store, catalog_file):
     _enable(catalog_file)
     _tick(started(), store)
     assert _scheduled(store) == []
-    # ...but the clock now exists and is anchored to this moment.
+    # ...but the clock now exists and is anchored to this moment
     assert store.schedule_state(JOB)["last_fired_at"] == pytest.approx(clock.at)
 
 
 def test_a_restart_does_not_fire_it(clock, started, store, catalog_file):
-    """Four daemons in a row, an hour apart. A `last_fired_at` that lived in memory —
-    or was re-seeded on each boot — would fire on none of these and then on all of them
-    the moment somebody looked; one that is absent would fire on the first."""
+    """Four daemons in a row, an hour apart"""
     _enable(catalog_file)
     for _ in range(4):
         _tick(started(), store)
@@ -177,8 +145,7 @@ def test_it_fires_one_interval_after_being_enabled(clock, started, store, catalo
 
 
 def test_disabled_fleet_files_nothing(clock, started, store):
-    """The pin. No `_enable` call anywhere — if the switch stopped being consulted,
-    every other test in this file would still pass and only this one would fail."""
+    """The pin"""
     _tick(started(), store)
     clock.advance(30 * DAY)
     _tick(started(), store)
@@ -198,7 +165,7 @@ def test_a_project_can_run_the_sweep_the_fleet_has_off(clock, started, store,
     assert len(_scheduled(store)) == 1
 
 
-# -- holding: one order per job, ever ----------------------------------------------------
+# -- holding: one order per job, ever
 
 
 def _fire_once(started, store, clock, catalog_file, **overrides) -> dict:
@@ -220,8 +187,7 @@ def test_it_never_stacks_a_second_order_behind_an_open_one(clock, started, store
 
 def test_a_hold_is_recorded_and_keeps_its_first_moment(clock, started, store,
                                                         catalog_file):
-    """`held_since` is the number INV-SCHEDULE-HELD judges by, so a hold refreshed on
-    every tick would mean the check could never fire however long the job was stuck."""
+    """`held_since` is the number INV-SCHEDULE-HELD judges by"""
     _fire_once(started, store, clock, catalog_file)
     clock.advance(DAY)
     _tick(started(), store)
@@ -233,8 +199,7 @@ def test_a_hold_is_recorded_and_keeps_its_first_moment(clock, started, store,
 
 
 def test_holding_does_not_flag_anything(clock, started, store, catalog_file):
-    """Neo's ruling: hold SILENTLY. A stack of daily orders is the alarm nobody reads,
-    and so is an attention item that says 'still waiting'."""
+    """Neo's ruling: hold SILENTLY"""
     first = _fire_once(started, store, clock, catalog_file)
     clock.advance(DAY)
     _tick(started(), store)
@@ -251,8 +216,7 @@ def test_a_settled_order_releases_the_job(clock, started, store, catalog_file):
 
 def test_a_deleted_order_does_not_strand_the_job_for_ever(clock, started, store,
                                                            catalog_file):
-    """Housekeeping must not be able to kill a scheduler. The clock outlives the work
-    order it filed — `scheduled_jobs` carries no foreign key for exactly this."""
+    """Housekeeping must not be able to kill a scheduler"""
     first = _fire_once(started, store, clock, catalog_file)
     store.delete_work_order(first["id"])
     clock.advance(DAY)
@@ -260,7 +224,7 @@ def test_a_deleted_order_does_not_strand_the_job_for_ever(clock, started, store,
     assert len(_scheduled(store)) == 1
 
 
-# -- the attention budget: one visible receipt per job -----------------------------------
+# -- the attention budget: one visible receipt per job
 
 
 def test_yesterdays_receipt_is_hidden_as_todays_is_filed(clock, started, store,
@@ -275,8 +239,7 @@ def test_yesterdays_receipt_is_hidden_as_todays_is_filed(clock, started, store,
 
 
 def test_a_flagged_receipt_is_left_where_it_is(clock, started, store, catalog_file):
-    """Hiding is EARNED. A previous order still asking the user for something keeps its
-    place on the listing, whatever the cadence would prefer."""
+    """Hiding is EARNED"""
     first = _fire_once(started, store, clock, catalog_file)
     store.update_work_order(first["id"], status="completed", needs_attention=1,
                             attention_reason="the doctor found six things")
@@ -295,7 +258,7 @@ def test_a_receipt_holding_an_open_assumption_is_left_where_it_is(clock, started
     assert not store.get_work_order(first["id"])["hidden"]
 
 
-# -- labelling ---------------------------------------------------------------------------
+# -- labelling
 
 
 def test_a_scheduled_order_says_so_on_its_face(clock, started, store, catalog_file):
@@ -308,13 +271,12 @@ def test_a_scheduled_order_says_so_on_its_face(clock, started, store, catalog_fi
 
 
 def test_it_is_governed_like_any_other_work_order():
-    """NOT in UNGOVERNED_ORIGINS: the daemon dispatches it with a full briefing, so it
-    owes `jarvis wo finish` exactly as a typed order does."""
+    """NOT in UNGOVERNED_ORIGINS: the daemon dispatches it with a full briefing"""
     from jarvis.project_store import UNGOVERNED_ORIGINS
     assert schedule.ORIGIN not in UNGOVERNED_ORIGINS
 
 
-# -- INV-SCHEDULE-HELD -------------------------------------------------------------------
+# -- INV-SCHEDULE-HELD
 
 
 def _held_violations(store):
@@ -322,7 +284,7 @@ def _held_violations(store):
 
 
 def _status_held(store, project="proj_a"):
-    """What `jarvis status` says about this project's scheduler."""
+    """What `jarvis status` says about this project's scheduler"""
     st = ops.os_status()
     return next(p for p in st["projects"] if p["name"] == project)["schedule_held"]
 
@@ -357,15 +319,7 @@ def _switch_off(catalog_file, **block) -> None:
 
 def test_switching_the_scheduler_off_silences_BOTH_surfaces(clock, started, store,
                                                             catalog_file):
-    """A mechanism turned off, with rows still on disk, must not alarm for ever —
-    `check_health_sweep_produces_judgements`' lesson, one mechanism over.
-
-    BOTH surfaces, because a hold survives being switched off: `held_since` is cleared by
-    a firing and by nothing else, and a project told to stop scheduling will never reach
-    one. The invariant guarding it and `jarvis status` not guarding it is the OS
-    contradicting itself about a mechanism the user has already turned off — and the
-    status line is the one they would see every day.
-    """
+    """A mechanism turned off, with rows still on disk, must not alarm for ever"""
     _fire_once(started, store, clock, catalog_file)
     clock.advance(DAY)
     _tick(started(), store)
@@ -379,9 +333,7 @@ def test_switching_the_scheduler_off_silences_BOTH_surfaces(clock, started, stor
 
 def test_dropping_a_job_from_the_roster_silences_both_surfaces_too(clock, started, store,
                                                                    catalog_file):
-    """The other half of "still supposed to run": `enabled` may stay true while the job
-    itself leaves `jobs`. A filter that read only the switch would keep printing the held
-    line for a job the project no longer runs."""
+    """The other half of "still supposed to run": `enabled` may stay true while the job itself leaves..."""
     _fire_once(started, store, clock, catalog_file)
     clock.advance(DAY)
     _tick(started(), store)
@@ -397,8 +349,7 @@ def test_dropping_a_job_from_the_roster_silences_both_surfaces_too(clock, starte
 
 def test_status_surfaces_the_hold_before_the_invariant_does(clock, started, store,
                                                              catalog_file):
-    """Neo's condition on holding silently: a job parked behind an unsettled order must
-    not be an invisibly dead scheduler."""
+    """Neo's condition on holding silently: a job parked behind an unsettled order must not be an..."""
     _fire_once(started, store, clock, catalog_file)
     clock.advance(DAY)
     _tick(started(), store)
@@ -414,12 +365,7 @@ def test_status_says_nothing_about_a_job_that_is_ticking_along(clock, started, s
 
 
 def _drop_from_catalog(catalog_file, name="proj_a", **os_block) -> None:
-    """Leave the project REGISTERED in the central store but absent from the catalog.
-
-    The real shape: a project onboarded once and later removed from the catalog file.
-    `ops.registered_project_paths()` still knows it — `jarvis start` never unregisters —
-    so `os_status` still opens its store and reads its rows.
-    """
+    """Leave the project REGISTERED in the central store but absent from the catalog"""
     data = json.loads(catalog_file.read_text())
     data["os"]["schedule"] = {"enabled": True, **os_block}
     data["projects"] = [p for p in data["projects"] if p["name"] != name]
@@ -430,19 +376,7 @@ def _drop_from_catalog(catalog_file, name="proj_a", **os_block) -> None:
 def test_a_project_the_catalog_no_longer_lists_is_silent_on_BOTH_surfaces(clock, started,
                                                                           store,
                                                                           catalog_file):
-    """THE TWO SURFACES MUST RESOLVE CONFIG THE SAME WAY, OR THEY CONTRADICT EACH OTHER.
-
-    They used to resolve separately: `os_status` by project NAME with a disabled fallback,
-    `check_schedule_progresses` by resolved PATH with `catalog.os.schedule`'s. A project
-    in the central store but absent from the catalog therefore got OPPOSITE answers —
-    silent on one surface, and on the other a hold that can never clear, because
-    `Daemon.tick` iterates `catalog.projects` and will never fire this project's jobs
-    again.
-
-    `os.schedule.enabled` is left TRUE here on purpose: that is the only setting under
-    which the old inherit-the-fleet-default fallback speaks at all, so a test with it off
-    would pass on the unfixed code.
-    """
+    """THE TWO SURFACES MUST RESOLVE CONFIG THE SAME WAY, OR THEY CONTRADICT EACH OTHER"""
     _fire_once(started, store, clock, catalog_file)
     clock.advance(DAY)
     _tick(started(), store)
@@ -455,13 +389,7 @@ def test_a_project_the_catalog_no_longer_lists_is_silent_on_BOTH_surfaces(clock,
 
 
 def test_both_surfaces_go_through_one_resolver(clock, started, store, catalog_file):
-    """Structural, and it is the only assertion that survives someone re-splitting them.
-
-    The behaviour above can be made to pass twice over by writing the same rule in two
-    places — which is what the code did before, and it drifted. This pins that there is
-    ONE call: monkeypatching `ops.schedule_config_at` to claim the scheduler is off must
-    silence both surfaces, because neither has its own way of asking.
-    """
+    """Structural, and it is the only assertion that survives someone re-splitting them"""
     import jarvis.ops as ops_mod
 
     _fire_once(started, store, clock, catalog_file)
@@ -480,9 +408,7 @@ def test_both_surfaces_go_through_one_resolver(clock, started, store, catalog_fi
 
 
 def test_the_resolver_matches_by_path_not_by_name(clock, started, store, catalog_file):
-    """A project registered under one name and catalogued under another is the SAME
-    project — the store is opened by path and the invariant only ever holds a path, so
-    name is not a key both surfaces can use."""
+    """A project registered under one name and catalogued under another is the SAME project"""
     data = json.loads(catalog_file.read_text())
     data["os"]["schedule"] = {"enabled": True}
     data["projects"][0]["name"] = "renamed_in_the_catalog"
@@ -493,29 +419,11 @@ def test_the_resolver_matches_by_path_not_by_name(clock, started, store, catalog
     assert cfg.enabled, "matched by path, so the rename is invisible to the resolver"
 
 
-# -- the upgrade: a project database that predates `scheduled_jobs` -----------------------
+# -- the upgrade: a project database that predates `scheduled_jobs`
 
 
 def test_an_old_database_gets_the_table_back_on_open(clock, started, catalog_file):
-    """THE ONLY PATH HERE THAT REACHES EVERY EXISTING INSTALL ON DAY ONE.
-
-    Every other test in this file runs against a store the new code created, so all of
-    them would pass on a build that never shipped the `CREATE TABLE` at all. What a live
-    fleet does on upgrade is open a database written before `scheduled_jobs` existed —
-    and `os_status` reads that table for EVERY project unconditionally, with no `enabled`
-    guard, so a table that did not come back would take out `jarvis status` and the
-    dashboard for the whole fleet rather than only for a project running the scheduler.
-
-    Simulated by dropping the table rather than by checking in a fixture database: the
-    drop is verified to bite first (`no such table`), so the recreate is demonstrably
-    what saves it and not a swallowed exception somewhere downstream.
-
-    THE SCHEDULER IS ENABLED throughout. `check_schedule_progresses` returns before it
-    touches the table when it is off, so the disabled form of this test would assert
-    nothing at all about the table — exactly the empty-either-way reading that
-    `test_skip_os_drops_the_fleet_wide_checks_and_keeps_the_project_ones` was rewritten
-    to avoid.
-    """
+    """THE ONLY PATH HERE THAT REACHES EVERY EXISTING INSTALL ON DAY ONE"""
     import sqlite3
 
     _enable(catalog_file)
@@ -526,16 +434,13 @@ def test_an_old_database_gets_the_table_back_on_open(clock, started, catalog_fil
     try:
         with old.conn:
             old.conn.execute("DROP TABLE scheduled_jobs")
-        # The drop BITES: that is what makes the assertions below about the recreate.
+        # The drop BITES: that is what makes the assertions below about the recreate
         with pytest.raises(sqlite3.OperationalError, match="no such table"):
             old.list_schedule_states()
     finally:
         old.close()
 
-    # `os_status` FIRST, and deliberately: it is the fleet-wide blast radius. It opens
-    # its own store per project and has no `except` around the read, so a table that did
-    # not come back takes out `jarvis status` and the dashboard for every project, not
-    # only for one running the scheduler.
+    # `os_status` FIRST, and deliberately: it is the fleet-wide blast radius
     st = ops.os_status()
     proj = next(p for p in st["projects"] if p["name"] == "proj_a")
     assert proj["schedule_held"] == []
@@ -549,12 +454,7 @@ def test_an_old_database_gets_the_table_back_on_open(clock, started, catalog_fil
 
 
 def test_an_old_database_still_schedules_after_the_upgrade(clock, started, catalog_file):
-    """The other half: the recreated table is a working clock, not merely a quiet one.
-
-    A `CREATE TABLE` that ran but left the job unable to seed would look identical to a
-    healthy upgrade on the test above — nothing raises, `schedule_held` is empty — and
-    would only show up as a fleet that silently stopped scheduling after a release.
-    """
+    """The other half: the recreated table is a working clock, not merely a quiet one"""
     _enable(catalog_file)
     started()
     path = ops.registered_project_paths()["proj_a"]
@@ -576,7 +476,7 @@ def test_an_old_database_still_schedules_after_the_upgrade(clock, started, catal
         store.close()
 
 
-# -- the doctor rider --------------------------------------------------------------------
+# -- the doctor rider
 
 
 def test_the_owner_runs_the_os_checks_and_nobody_else_does():
@@ -604,7 +504,7 @@ def test_os_owner_falls_back_to_one_project_and_always_the_same_one(tmp_path):
 
 
 def test_fallback_false_never_picks_an_arbitrary_project(tmp_path):
-    """"Which project IS the OS" has no arbitrary answer: §4, §5."""
+    """"Which project IS the OS" has no arbitrary answer: §4, §5"""
     from pathlib import Path
     a, b = tmp_path / "a", tmp_path / "b"
     a.mkdir()
@@ -614,14 +514,9 @@ def test_fallback_false_never_picks_an_arbitrary_project(tmp_path):
     assert schedule.os_owner([("a", a), ("mine", pkg_root)], fallback=False) == "mine"
 
 
-# -- which project IS the OS -------------------------------------------------------------
-#
-# Issue 956: `os_owner` answers "who runs the fleet checks" and is allowed an arbitrary
-# answer; `os_project` answers "which project IS the OS" and must have none. Real
-# repositories with real remotes, because the whole point is that identity comes from
-# `origin` and a fake would let path containment pass.
+# -- which project IS the OS
 
-#: This repository, as both its checkouts spell it.
+#: This repository, as both its checkouts spell it
 OS_ORIGIN = "gonandrap/agentic_os"
 
 
@@ -630,13 +525,7 @@ def _checkout(root, name, origin=OS_ORIGIN):
 
 
 def test_os_project_resolves_the_production_two_checkout_layout(tmp_path, origins):
-    """THE DEFECT, six times over: in production the release guards were all inert.
-
-    The running package is in the deployed checkout while the catalog's `jarvis_os` path
-    is the dev checkout, so NO project contains the install and `os_owner` answers with
-    its first-in-catalog fallback — a project that is not the OS. Both checkouts share
-    one `origin`, because a release tag is a checkout of this repository.
-    """
+    """THE DEFECT, six times over: in production the release guards were all inert"""
     other = _checkout(tmp_path, "shared_schedule", "gonandrap/shared_schedule")
     dev = _checkout(tmp_path, "dev")
     install = _checkout(tmp_path / "production", "jarvis_os") / "src" / "jarvis"
@@ -650,8 +539,7 @@ def test_os_project_resolves_the_production_two_checkout_layout(tmp_path, origin
 
 
 def test_os_project_resolves_the_dev_checkout_too(tmp_path, origins):
-    """Same answer where the install IS inside the catalog's path, so dev and production
-    do not need two mechanisms."""
+    """Same answer where the install IS inside the catalog's path"""
     dev = _checkout(tmp_path, "dev")
     install = dev / "src" / "jarvis"
     install.mkdir(parents=True)
@@ -660,8 +548,7 @@ def test_os_project_resolves_the_dev_checkout_too(tmp_path, origins):
 
 
 def test_two_projects_sharing_an_origin_name_no_os(tmp_path, origins):
-    """A worktree listed beside its checkout: ambiguity grants the OS's authority over
-    its release path and its config to nothing at all."""
+    """A worktree listed beside its checkout: ambiguity grants the OS's authority over its release path..."""
     dev = _checkout(tmp_path, "dev")
     twin = _checkout(tmp_path, "worktree")
 
@@ -670,17 +557,7 @@ def test_two_projects_sharing_an_origin_name_no_os(tmp_path, origins):
 
 
 def test_os_project_is_none_with_no_match_and_with_no_origin(tmp_path, origins):
-    """None on every doubt: a catalog holding no checkout of this repository, and an
-    install under a repository whose origin names nothing (a pip-installed OS).
-
-    The install is a `git init` with NO remote, on purpose. A bare directory would not
-    do: `github.origin_repo` shells out to `git -C <dir> remote get-url origin`, and git
-    WALKS UP — so its answer is the ENCLOSING repository's, not the directory's, and a
-    plain `tmp_path/site-packages` inherits whatever repository pytest's basetemp sits
-    in. Under `--basetemp=.pytest-tmp` inside this very checkout that is the OS's own
-    origin, and resolving it is correct. An initialised repository with no remote is
-    where the walk STOPS and where the question genuinely has no answer.
-    """
+    """None on every doubt: a catalog holding no checkout of this repository"""
     other = _checkout(tmp_path, "other", "gonandrap/shared_schedule")
     dev = _checkout(tmp_path, "dev")
     nowhere = make_git_project(tmp_path, "site-packages") / "jarvis"
@@ -692,25 +569,20 @@ def test_os_project_is_none_with_no_match_and_with_no_origin(tmp_path, origins):
 
 
 def test_the_daily_run_repairs():
-    """Ruled on, not a default: the daemon already applies these repairs every reconcile
-    tick, so a daily run that repairs does nothing the OS would not have done anyway
-    (`ops.run_doctor`)."""
+    """Ruled on, not a default: the daemon already applies these repairs every reconcile tick"""
     body = schedule.DOCTOR_JOB.describe(schedule.JobContext(project="proj_a"))
     assert "--repair" in body
 
 
 def test_the_description_does_not_enumerate_the_checks():
-    """THE EXTENSIBILITY GUARD, and the reason this file exists at all: two sibling
-    orders on issue #164 are adding checks to what this run covers. A description that
-    listed the invariants would have to be rewritten by each of them, and would be
-    quietly wrong in between."""
+    """THE EXTENSIBILITY GUARD, and the reason this file exists at all: two sibling orders on issue #164..."""
     body = schedule.DOCTOR_JOB.describe(schedule.JobContext(project="proj_a"))
     named = [c.__name__ for c in (*invariants.INVARIANTS, *invariants.SLOW_INVARIANTS,
                                   *invariants.OS_INVARIANTS)]
     assert len(named) > 10, "the check registry moved; this guard is no longer reading it"
     leaked = [n for n in named if n in body]
     assert leaked == [], f"the daily run hard-codes what it checks: {leaked}"
-    # ...and the worker is told not to put them in the record either.
+    # ...and the worker is told not to put them in the record either
     assert "Do not list the checks that ran" in body
 
 
@@ -727,14 +599,7 @@ def test_only_the_owner_project_gets_a_run_that_carries_the_os_checks(clock, tmp
                                                                      fake_claude,
                                                                      claude_json,
                                                                      catalog_file):
-    """`owns_os=owner == project.name` NEEDS TWO PROJECTS TO MEAN ANYTHING.
-
-    Every other daemon test here runs the single-project fixture, where `proj_a` is the
-    owner by `os_owner`'s fallback — so `owns_os` is True on every firing and an inverted
-    flag would file `--skip-os` for the whole fleet with every one of them green. This is
-    the only test that can tell the two apart, and it asserts the TEXT the worker will
-    actually receive rather than the flag, because the text is all the worker sees.
-    """
+    """`owns_os=owner == project.name` NEEDS TWO PROJECTS TO MEAN ANYTHING"""
     from jarvis.testing import make_git_project
 
     second = make_git_project(tmp_path, "proj_b")
@@ -746,9 +611,7 @@ def test_only_the_owner_project_gets_a_run_that_carries_the_os_checks(clock, tmp
     catalog_file.write_text(json.dumps(data))
     ops.start_os(str(catalog_file), foreground=True)
 
-    # Pin WHO the owner is rather than relying on the fallback's ordering: this test is
-    # about the branch, and it must fail when the branch inverts, not when the fallback
-    # happens to pick differently.
+    # Pin WHO the owner is rather than relying on the fallback's ordering: this test is about the branch
     monkeypatched = "proj_b"
     original = Daemon._os_owner
     Daemon._os_owner = lambda self: monkeypatched
@@ -776,18 +639,12 @@ def test_only_the_owner_project_gets_a_run_that_carries_the_os_checks(clock, tmp
     assert "jarvis doctor proj_a --repair --skip-os" in other_body
 
 
-# -- run_doctor(include_os=...) -----------------------------------------------------------
+# -- run_doctor(include_os=...)
 
 
 def test_skip_os_drops_the_fleet_wide_checks_and_keeps_the_project_ones(started,
                                                                        monkeypatch):
-    """BOTH OS-level sources are faked into failing first.
-
-    A healthy fixture reports nothing at either level, so a test that merely asserted
-    `scoped["os"] == []` would pass on code that ignored the flag entirely — it would be
-    reading an empty list either way. The flag only has an observable effect when there
-    is something to drop.
-    """
+    """BOTH OS-level sources are faked into failing first"""
     marker = invariants.Violation(invariant="INV-FAKE-OS", detail="the dashboard is down")
     stranded = invariants.Violation(invariant="INV-FAKE-MARKER", detail="release stuck")
     monkeypatch.setattr(invariants, "check_os", lambda: [marker])
@@ -802,14 +659,13 @@ def test_skip_os_drops_the_fleet_wide_checks_and_keeps_the_project_ones(started,
     assert scoped["include_os"] is False
     assert scoped["os"] == []
     assert not any(p["project"] == "(os)" for p in scoped["projects"])
-    # ...and the project checks are untouched: this is a narrower sweep, not a quieter one.
+    # ...and the project checks are untouched: this is a narrower sweep, not a quieter one
     assert [p["project"] for p in scoped["projects"]] == ["proj_a"]
     assert everything["violations"] - scoped["violations"] == 2
 
 
 def test_the_cli_flag_reaches_it(started, monkeypatch):
-    """`--skip-os` is the only way the scheduled worker can ask for this, so a flag
-    parsed and dropped would leave the whole §6 decision unimplemented in practice."""
+    """`--skip-os` is the only way the scheduled worker can ask for this"""
     from jarvis import cli
 
     seen = {}
@@ -823,7 +679,7 @@ def test_the_cli_flag_reaches_it(started, monkeypatch):
     assert seen["include_os"] is True
 
 
-# -- configuration ------------------------------------------------------------------------
+# -- configuration
 
 
 def test_an_unknown_job_id_is_refused_at_boot():
@@ -843,8 +699,7 @@ def test_a_project_inherits_every_key_it_does_not_name():
 
 
 def test_jobs_replaces_rather_than_merges():
-    """One field, field-level inheritance — `seat_models`' rule (kn-6ca2bcd9). A project
-    naming `jobs` owns the whole roster."""
+    """One field, field-level inheritance — `seat_models`' rule (kn-6ca2bcd9)"""
     cat = parse_catalog({
         "os": {"schedule": {"jobs": [JOB]}},
         "projects": [{"name": "p", "path": ".", "schedule": {"jobs": []}}],
@@ -864,18 +719,16 @@ def test_it_ships_off():
 
 
 def test_the_whole_block_is_a_safety_key():
-    """Enabling the scheduler and shortening its interval are the same act at two
-    magnitudes, and both are invisible until the morning they start spending."""
+    """Enabling the scheduler and shortening its interval are the same act at two magnitudes"""
     assert ops.safety_key("os.schedule.enabled")
     assert ops.safety_key("projects.proj_a.schedule.interval_hours")
 
 
-# -- the wiring ---------------------------------------------------------------------------
+# -- the wiring
 
 
 def test_the_tick_actually_calls_it(clock, started, store, catalog_file, monkeypatch):
-    """Everything above calls `schedule_tick` directly. This is the one assertion that
-    it is reached at all — a pass wired to no cadence is dead code that tests green."""
+    """Everything above calls `schedule_tick` directly"""
     _enable(catalog_file)
     daemon = started()
     seen = []
@@ -888,14 +741,7 @@ def test_the_tick_actually_calls_it(clock, started, store, catalog_file, monkeyp
 
 def test_the_cadence_reaches_the_pass_once_per_window(clock, started, catalog_file,
                                                       monkeypatch):
-    """Driven through `Daemon.tick`, never recomputed here.
-
-    The version of this test that computed `n % SCHEDULE_EVERY_TICKS == 1` itself and
-    asserted the length of its own list passed with the gate deleted — it tested
-    arithmetic, not the daemon. This runs three whole windows of real ticks and counts
-    how many reach the pass, so deleting the gate (every tick) or breaking it (no tick)
-    both fail.
-    """
+    """Driven through `Daemon.tick`, never recomputed here"""
     from jarvis.daemon import SCHEDULE_EVERY_TICKS
 
     _enable(catalog_file)
@@ -907,11 +753,10 @@ def test_the_cadence_reaches_the_pass_once_per_window(clock, started, catalog_fi
     for _ in range(SCHEDULE_EVERY_TICKS * 3):
         daemon.tick()
     assert len(seen) == 3, f"reached the pass on ticks {seen}"
-    # ...and the spacing is the window, not three in a row at the start.
+    # ...and the spacing is the window, not three in a row at the start
     assert [b - a for a, b in zip(seen, seen[1:])] == [SCHEDULE_EVERY_TICKS] * 2
 
 
 def test_terminal_statuses_are_what_release_a_job():
-    """A blocker is "not settled". If a status left TERMINAL_STATUSES, a job would hold
-    behind it for ever without anything saying so."""
+    """A blocker is "not settled\""""
     assert set(TERMINAL_STATUSES) == {"completed", "cancelled", "failed"}
