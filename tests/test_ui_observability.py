@@ -449,7 +449,11 @@ def test_the_pool_can_be_saturated_deterministically(started, monkeypatch):
                 assert _wait_until(lambda: _limiter(client)["borrowed"] == total)
                 assert _limiter(client)["available"] == 0
             finally:
+                # Release the holders and drain the pool BEFORE the portal is joined:
+                # TestClient.__exit__ waits on the event loop thread, and a request
+                # still arriving there never lets it stop.
                 gate.set()
+                pool.shutdown(wait=True)
     finally:
         pool.shutdown(wait=False)
 
@@ -487,6 +491,7 @@ def test_healthz_answers_while_the_pool_is_wedged_and_a_sync_route_cannot(
                     control.result(timeout=3)
             finally:
                 gate.set()
+                pool.shutdown(wait=True)
     finally:
         pool.shutdown(wait=False)
 
@@ -506,6 +511,7 @@ def test_a_trip_dumps_every_threads_stack_and_stamps_the_wedge(started, monkeypa
                 assert _wait_until(lambda: uilog.read_wedge() is not None, timeout=30)
             finally:
                 gate.set()
+                pool.shutdown(wait=True)
     finally:
         pool.shutdown(wait=False)
 
