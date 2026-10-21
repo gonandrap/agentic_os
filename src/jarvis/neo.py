@@ -339,10 +339,35 @@ def learning_from_review(q: dict[str, Any], feedback: str) -> str:
             f"\"{(q.get('answer') or '')[:200]}\". The user corrected me: {feedback}")
 
 
-def learning_from_assumption_review(wo: dict[str, Any], assumptions: list[dict[str, Any]],
-                                    accepted: bool, feedback: str) -> str:
-    """Distill the user's verdict on a work order's assumptions into a learning"""
-    what = "; ".join(f"\"{a['content'][:200]}\"" for a in assumptions[:5]) or "(none recorded)"
-    verdict = "accepted" if accepted else "rejected"
-    return (f"On work order \"{wo.get('title', '')[:120]}\" a worker decided: {what}. "
-            f"The user {verdict} that: {feedback}")
+#: What a no-reason ruling says instead of a reason, and what makes it dedupable
+NO_REASON_RULING = "no reason given — the user decided it as the worker recorded it"
+
+
+def learnings_from_assumption_review(wo: dict[str, Any], assumptions: list[dict[str, Any]],
+                                     accepted: bool, feedback: str, *,
+                                     false_alarms: frozenset[int] = frozenset(),
+                                     tightened: bool = False) -> list[str]:
+    """The user's ruling as RULES Neo applies to the next assumption of the class (io-51469add)"""
+    from .autoreview import assumption_class
+
+    by_class: dict[str, list[dict[str, Any]]] = {}
+    for a in assumptions:
+        by_class.setdefault(assumption_class(str(a.get("content") or ""),
+                                             tightened=tightened), []).append(a)
+    feedback = (feedback or "").strip()
+    rules = []
+    for cls, rows in by_class.items():
+        if not feedback:
+            # Deterministic text, so the caller can dedupe it: one rule per class, not one per order
+            verdict = "accepted it unchanged" if accepted else "rejected it"
+            rules.append(f"RULE (from the user's assumption reviews): for {cls}, the user "
+                         f"{verdict} — {NO_REASON_RULING}.")
+            continue
+        verdict = "accepted" if accepted else "rejected"
+        alarm = (" The user called the high-stakes net's match on it a FALSE ALARM."
+                 if any(int(a.get("id") or 0) in false_alarms for a in rows) else "")
+        example = "; ".join(f"\"{str(a.get('content') or '')[:200]}\"" for a in rows[:3])
+        rules.append(f"RULE (from the user's review of {wo.get('id') or 'a work order'}): "
+                     f"for {cls}, the user {verdict} it. Reason: {feedback}.{alarm} "
+                     f"Example, on \"{str(wo.get('title') or '')[:120]}\": {example}")
+    return rules

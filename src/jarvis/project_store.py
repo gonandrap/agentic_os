@@ -190,6 +190,56 @@ UNGOVERNED_ORIGINS = ("adhoc", "injected")
 # What a work order IS to the OS, which is not the same question as what it is about (docs/superpowers/specs/2026-09-27-investigation-orders.md)
 WO_KINDS = ("worker", "planner", "manager", "analyst", "investigator")
 
+#: How a kind's work order settles: through `ops.finish`'s join (assumptions, panel, landing)
+SETTLE_BY_FINISH = "finish"
+#: …or by its submission alone, written in the session that submits it and never stopping it
+SETTLE_IN_SESSION = "in_session"
+#: …or never: it idles between messages until its feature settles (#264)
+SETTLE_IDLE = "idle"
+
+
+@dataclass(frozen=True)
+class KindContract:
+    """What one work-order kind hands back, and how that settles it (io-b521d17b)"""
+
+    route: str
+    #: The worktree file its contract command consumes — never stranded work
+    artifact: str = ""
+    #: That contract command, with `{fo_id}` for the order it reports on
+    submit: str = ""
+    #: May it commit, push and open a pull request?
+    lands_code: bool = True
+    #: Are its assumptions the user's to review?
+    assumptions_reviewed: bool = True
+
+
+#: ONE ROW PER KIND, read by every submit path, `landing.authored`'s dirty set and the refusals
+WO_KIND_CONTRACTS: dict[str, KindContract] = {
+    "worker": KindContract(SETTLE_BY_FINISH),
+    "planner": KindContract(SETTLE_BY_FINISH, artifact="plan.json",
+                            submit="jarvis fo plan {fo_id} --from-file plan.json"),
+    "manager": KindContract(SETTLE_IDLE),
+    # By FINISH, not in session: a refused assumption is answered from the same session
+    "analyst": KindContract(SETTLE_BY_FINISH, artifact="report.json",
+                            submit="jarvis io report {fo_id} --from-file report.json",
+                            lands_code=False),
+    "investigator": KindContract(
+        SETTLE_IN_SESSION, artifact="verdict.json",
+        submit="jarvis investigate verdict {fo_id} --from-file verdict.json",
+        lands_code=False, assumptions_reviewed=False),
+}
+
+
+def kind_contract(wo: Mapping[str, Any]) -> KindContract:
+    """The contract row for this work order's kind"""
+    return WO_KIND_CONTRACTS[str(wo.get("kind") or "worker")]
+
+
+def submission_artifacts(wo: Mapping[str, Any]) -> tuple[str, ...]:
+    """The file this kind's contract command consumes, as `landing.authored` excludes it"""
+    artifact = kind_contract(wo).artifact
+    return (artifact,) if artifact else ()
+
 # A work order with a LIVE SESSION: dispatched, running, or parked mid-conversation on somebody else (#134)
 ACTIVE_STATUSES = ("dispatching", "running", "waiting_input", "validating")
 
@@ -260,6 +310,30 @@ FO_STATUS_LABELS: dict[str, dict[str, str]] = {
 def feature_status_label(kind: str | None, status: str) -> str:
     """What to PRINT for a feature-order status, given the row's kind"""
     return FO_STATUS_LABELS.get(kind or "feature", {}).get(status, status)
+
+
+#: The command that shows the user a family's decision, per kind — the CLI refuses the others
+FO_DECIDE_COMMANDS = {
+    "feature": "jarvis fo show {fo_id}",
+    "improvement": "jarvis io review {fo_id}",
+    "investigation": "jarvis investigate show {fo_id}",
+}
+
+
+def decide_command(kind: str | None, fo_id: str) -> str:
+    """`FO_DECIDE_COMMANDS` for one row"""
+    return FO_DECIDE_COMMANDS[kind or "feature"].format(fo_id=fo_id)
+
+
+#: Which child kinds a family's progress counts: the work it exists to get done
+FAMILY_CHILD_KINDS: dict[str, tuple[str, ...]] = {
+    "feature": ("worker",),
+    "improvement": ("analyst",),
+    "investigation": ("investigator",),
+}
+
+#: `feature_children(kinds=…)` for the callers that mean a feature's planned work orders
+WORKER_CHILDREN: tuple[str, ...] = ("worker",)
 
 
 def is_feature_order_id(unit_id: str) -> bool:
@@ -897,6 +971,10 @@ CREATE INDEX IF NOT EXISTS idx_preconditions_open ON preconditions(wo_id, status
 
 # Columns added after the first release
 ADDED_COLUMNS = {
+    "notifications": {
+        # The attention reason raised WITH this notification, carried to the central inbox (io-d2a5dd69)
+        "paired_reason": "TEXT",
+    },
     "work_orders": {
         # How many times launching this order's first turn has failed on the transport (docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §5.)
         "dispatch_attempts": "INTEGER NOT NULL DEFAULT 0",
@@ -980,6 +1058,8 @@ ADDED_COLUMNS = {
         "context_json": "TEXT",
         # WHICH CACHE-TTL ARM this turn was launched on (catalog.VALID_WORKER_CACHE_TTL) (docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md)
         "cache_ttl": "TEXT NOT NULL DEFAULT ''",
+        # WHAT A COMPACTION TURN ACHIEVED: a boundary, `{}` for none, NULL never read
+        "compaction_json": "TEXT",
     },
     "validation_rounds": {
         # WHICH CONFIGURATION JUDGED THIS ROUND
@@ -1063,6 +1143,8 @@ ADDED_COLUMNS = {
         "objection_sent_ts": "REAL",
         "objection_delivered_ts": "REAL",
         "objection_withdrawn_ts": "REAL",
+        # The ordinary message that carried it LATE, when its own envelope never did (io-ce566253)
+        "objection_late_msg_id": "INTEGER",
         # THE SPEC SECTIONS THIS ASSUMPTION CITES (#102)
         "spec_path": "TEXT",
         "spec_which": "TEXT",
@@ -1831,7 +1913,11 @@ class ProjectStore:
         row = cur.fetchone()
         if row is not None and cur.rowcount == 1:
             # The claim stays ONE statement; the span is written beside it in the same transaction (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md)
-            self._record_span(row["id"], "wo", "pending", "dispatching", trigger="claim")
+            at = db.now()
+            self._record_span(row["id"], "wo", "pending", "dispatching", trigger="claim",
+                              ts=at)
+            # ...and its timeline line, at the same moment as `set_status` writes both
+            self.add_event(row["id"], "status", {"status": "dispatching"}, ts=at)
         return dict(row) if row else None
 
     def claim_refusal(self, wo: dict[str, Any]) -> _ClaimRule | None:
@@ -2193,9 +2279,12 @@ class ProjectStore:
         return {row["status"]: int(row["n"]) for row in rows}
 
     def flagged_feature_orders(self) -> list[dict[str, Any]]:
-        """Every feature order asking for the user, whatever its status OR KIND"""
+        """Every FAMILY asking for the user, by its own flag or a child's, whatever its KIND"""
         rows = self.conn.execute(
-            "SELECT * FROM feature_orders WHERE needs_attention=1 ORDER BY created_at DESC"
+            """SELECT * FROM feature_orders f WHERE f.needs_attention=1
+                   OR EXISTS (SELECT 1 FROM work_orders w WHERE w.parent_id=f.id
+                              AND w.needs_attention=1 AND w.hidden=0)
+               ORDER BY created_at DESC"""
         ).fetchall()
         return db.rows_to_dicts(rows)
 
@@ -2228,13 +2317,18 @@ class ProjectStore:
     def clear_feature_attention(self, fo_id: str) -> None:
         self.update_feature_order(fo_id, needs_attention=0, attention_reason=None)
 
-    def feature_children(self, fo_id: str) -> list[dict[str, Any]]:
-        """The feature order's child work orders, oldest first"""
-        rows = self.conn.execute(
-            "SELECT * FROM work_orders WHERE parent_id=? AND kind='worker' "
-            "ORDER BY created_at",
-            (fo_id,),
-        ).fetchall()
+    def feature_children(self, fo_id: str, *,
+                         kinds: tuple[str, ...] | None) -> list[dict[str, Any]]:
+        """The family's child work orders, oldest first: `kinds` REQUIRED, None for all"""
+        if kinds is None:
+            rows = self.conn.execute(
+                "SELECT * FROM work_orders WHERE parent_id=? ORDER BY created_at",
+                (fo_id,)).fetchall()
+        else:
+            marks = ",".join("?" * len(kinds))
+            rows = self.conn.execute(
+                f"SELECT * FROM work_orders WHERE parent_id=? AND kind IN ({marks}) "
+                "ORDER BY created_at", (fo_id, *kinds)).fetchall()
         answered = {s["wo_id"] for s in self.superseded_children(fo_id)}
         return [{**c, "superseded": c["id"] in answered}
                 for c in db.rows_to_dicts(rows)]
@@ -2750,9 +2844,16 @@ class ProjectStore:
             (wo_id,)).fetchall()
         return {str(r["kind"]): int(r["n"]) for r in rows}
 
-    def list_events(self, wo_id: str, limit: int = 200) -> list[dict[str, Any]]:
+    def list_events(self, wo_id: str, limit: int | None = 200, *,
+                    newest: bool = True) -> list[dict[str, Any]]:
+        """Events oldest first; `limit` keeps the NEWEST that many (io-df4fa1e3), None keeps all"""
+        if limit is None:
+            rows = self.conn.execute(
+                "SELECT * FROM wo_events WHERE wo_id=? ORDER BY ts, id", (wo_id,)).fetchall()
+            return db.rows_to_dicts(rows)
         rows = self.conn.execute(
-            "SELECT * FROM wo_events WHERE wo_id=? ORDER BY ts LIMIT ?", (wo_id, limit)
+            "SELECT * FROM (SELECT * FROM wo_events WHERE wo_id=? "
+            "ORDER BY ts DESC, id DESC LIMIT ?) ORDER BY ts, id", (wo_id, limit)
         ).fetchall()
         return db.rows_to_dicts(rows)
 
@@ -3013,6 +3114,30 @@ class ProjectStore:
             "cost_source=CASE WHEN ? IS NULL THEN cost_source ELSE ? END WHERE id=?",
             (usage_json, cost, cost, COST_FROM_ENVELOPE, turn_id))
 
+    def set_turn_compaction(self, turn_id: int, found: dict[str, Any] | None) -> None:
+        """Record what a compaction turn's transcript says it did — `found` None is NO boundary"""
+        record = ({"pre": int(found.get("pre") or 0), "post": int(found.get("post") or 0)}
+                  if found else {})
+        self.conn.execute("UPDATE wo_turns SET compaction_json=? WHERE id=?",
+                          (db.to_json(record), turn_id))
+
+    def settle_turn_landed(self, turn_id: int) -> None:
+        """A failed turn the record proves did what it was for: `done`, the error kept as history"""
+        self.conn.execute("UPDATE wo_turns SET state='done' WHERE id=? AND state='failed'",
+                          (turn_id,))
+
+    def compaction_turns_since(self, since: float) -> list[dict[str, Any]]:
+        """Every compaction turn started since `since`, with the turn before it, oldest first"""
+        rows = self.conn.execute(
+            """SELECT t.*, p.kind AS prev_kind, p.state AS prev_state,
+                      p.seq AS prev_seq, p.compaction_json AS prev_compaction_json
+                 FROM wo_turns t
+                 LEFT JOIN wo_turns p ON p.wo_id = t.wo_id AND p.seq = t.seq - 1
+                WHERE t.kind = ? AND t.started_at >= ?
+                ORDER BY t.started_at""",
+            (COMPACT_TURN, since)).fetchall()
+        return db.rows_to_dicts(rows)
+
     def latest_turn(self, wo_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(
             "SELECT * FROM wo_turns WHERE wo_id=? ORDER BY seq DESC LIMIT 1", (wo_id,)
@@ -3090,11 +3215,21 @@ class ProjectStore:
     # -- notifications outbox
 
     def add_notification(self, title: str, body: str = "", level: str = "info",
-                         wo_id: str | None = None, source: str = "") -> int:
+                         wo_id: str | None = None, source: str = "",
+                         paired: bool = False) -> int:
+        """`paired`: raised WITH the order's attention flag, so acking either settles both (io-d2a5dd69)"""
         assert level in ("info", "warning", "critical"), level
+        reason = None
+        if paired and wo_id:
+            row = self.conn.execute(
+                "SELECT needs_attention, attention_reason FROM work_orders WHERE id=?",
+                (wo_id,)).fetchone()
+            if row is not None and row["needs_attention"]:
+                reason = row["attention_reason"] or ""
         cur = self.conn.execute(
-            "INSERT INTO notifications (ts, level, title, body, wo_id, source) VALUES (?,?,?,?,?,?)",
-            (db.now(), level, title, body, wo_id, source),
+            "INSERT INTO notifications (ts, level, title, body, wo_id, source, paired_reason)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (db.now(), level, title, body, wo_id, source, reason),
         )
         return int(cur.lastrowid)
 
@@ -3223,6 +3358,11 @@ class ProjectStore:
         self.conn.execute("UPDATE assumptions SET neo_question_id=? WHERE id=?",
                           (question_id, assumption_id))
 
+    def clear_assumption_question(self, assumption_id: int) -> None:
+        """Forget an ask the OS itself threw the ruling away on, so the next pass re-asks"""
+        self.conn.execute("UPDATE assumptions SET neo_question_id=NULL WHERE id=?",
+                          (assumption_id,))
+
     def assumption_for_question(self, question_id: int) -> dict[str, Any] | None:
         """The assumption this Neo question is ruling on, if any"""
         row = self.conn.execute(
@@ -3272,12 +3412,19 @@ class ProjectStore:
             (envelope_id,)).fetchone()
         return dict(row) if row else None
 
-    def mark_objection_delivered(self, assumption_id: int,
-                                 ts: float | None = None) -> None:
+    def mark_objection_delivered(self, assumption_id: int, ts: float | None = None,
+                                 late_msg_id: int | None = None) -> None:
         """The worker ACTUALLY received it — not that the OS sent it"""
         self.conn.execute(
-            "UPDATE assumptions SET objection_delivered_ts=? WHERE id=?",
-            (db.now() if ts is None else ts, assumption_id))
+            "UPDATE assumptions SET objection_delivered_ts=?, objection_late_msg_id=? "
+            "WHERE id=?",
+            (db.now() if ts is None else ts, late_msg_id, assumption_id))
+
+    def undelivered_objections(self, wo_id: str) -> list[dict[str, Any]]:
+        """Objections never delivered, outstanding OR withdrawn — what a late message can carry"""
+        return [a for a in self.all_assumptions(wo_id)
+                if a.get("objection_envelope_id") is not None
+                and a.get("objection_delivered_ts") is None]
 
     def withdraw_objection(self, assumption_id: int, ts: float | None = None) -> None:
         """The order stopped before the objection could be delivered (§6.6)"""
@@ -3323,6 +3470,52 @@ class ProjectStore:
             by_reason[reason if reason in by_reason else "other"] += 1
         counts["by_reason"] = by_reason
         return counts
+
+    def assumption_review_facts(self, since: float | None = None) -> dict[str, Any]:
+        """Every assumption row since `since`, and what auto-review did to each (io-51469add)"""
+        from . import db as db_mod
+
+        bound = "" if since is None else " WHERE ts >= ?"
+        args: tuple[Any, ...] = () if since is None else (since,)
+        rows = db_mod.rows_to_dicts(self.conn.execute(
+            "SELECT id, wo_id, ts, status, decided_by, neo_question_id,"
+            f" confirm_question_id FROM assumptions{bound} ORDER BY ts, id",
+            args).fetchall())
+        asked: set[int] = set()
+        last_hold: dict[int, str] = {}
+        high_stakes: set[int] = set()
+        false_alarms: set[int] = set()
+        dropped = {"total": 0, "re_asked": 0}
+        for event in self.conn.execute(
+                "SELECT kind, payload FROM wo_events WHERE kind IN ('autoreview_asked',"
+                " 'autoreview_held', 'autoreview_escalated',"
+                " 'autoreview_stakes_false_alarm') ORDER BY ts").fetchall():
+            payload = db_mod.from_json(event["payload"], {})
+            aid = int(payload.get("assumption_id") or 0)
+            kind = event["kind"]
+            if kind == "autoreview_asked":
+                asked.add(aid)
+            elif kind == "autoreview_held":
+                code = str(payload.get("code") or "")
+                last_hold[aid] = code
+                if code == "high_stakes":
+                    high_stakes.add(aid)
+            elif kind == "autoreview_stakes_false_alarm":
+                false_alarms.add(aid)
+            elif payload.get("dropped"):
+                dropped["total"] += 1
+                dropped["re_asked"] += 1 if payload.get("re_asked") else 0
+        return {"rows": rows, "asked": asked, "last_hold": last_hold,
+                "high_stakes": high_stakes, "false_alarms": false_alarms,
+                "dropped": dropped}
+
+    def delivered_objections(self, since: float | None = None) -> list[dict[str, Any]]:
+        """Assumptions whose objection reached the worker, objection sent since `since`"""
+        bound = "" if since is None else " AND objection_sent_ts >= ?"
+        args: tuple[Any, ...] = () if since is None else (since,)
+        return db.rows_to_dicts(self.conn.execute(
+            "SELECT * FROM assumptions WHERE objection_envelope_id IS NOT NULL"
+            f" AND objection_delivered_ts IS NOT NULL{bound}", args).fetchall())
 
     def outstanding_objections(self, wo_id: str) -> list[dict[str, Any]]:
         """Objections that are neither delivered nor withdrawn — ONE query, two readers"""

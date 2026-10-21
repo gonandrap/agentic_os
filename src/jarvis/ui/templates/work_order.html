@@ -615,6 +615,11 @@
 <section class="tabpanel" id="tab-timeline" role="tabpanel">
 <h2>Timeline</h2>
 <div class="panel">
+  {# The cut, said out loud: the newest page renders, and what is behind it is counted #}
+  {% if events_hidden > 0 %}
+  <p class="sub">{{ events_hidden }} earlier event{{ 's' if events_hidden != 1 }} not shown —
+    <a href="/wo/{{ project }}/{{ wo.id }}?events=all{% if debug %}&debug=1{% endif %}">show them all</a></p>
+  {% endif %}
   <ul class="timeline">
     {% for e in timeline %}
     <li{% if e.level == 'debug' %} class="dbg"{% endif %}>

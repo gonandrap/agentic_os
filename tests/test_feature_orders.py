@@ -246,7 +246,7 @@ def test_neo_releasing_a_plan_creates_the_children_with_their_edges(planning, st
     fo = released(daemon, store, fo["id"])
 
     assert fo["status"] == "executing"
-    children = store.feature_children(fo["id"])
+    children = store.feature_children(fo["id"], kinds=("worker",))
     assert [c["title"] for c in children] == ["Build schema", "Build api"]
     assert all(c["parent_id"] == fo["id"] and c["kind"] == "worker" for c in children)
     # The plan's local keys became real work-order ids on a real Phase 1 edge
@@ -260,7 +260,7 @@ def test_the_children_are_dispatched_in_dependency_order(planning, store):
     ops.submit_plan(fo["id"], a_plan(child("schema", extra="FORCE_APPROVE"),
                                      child("api", needs=["schema"])))
     released(daemon, store, fo["id"])
-    schema, api = store.feature_children(fo["id"])
+    schema, api = store.feature_children(fo["id"], kinds=("worker",))
 
     assert store.claim_next_pending()["id"] == schema["id"]
     assert store.claim_next_pending() is None  # `api` is blocked, and stays pending
@@ -275,7 +275,7 @@ def test_neo_sending_a_plan_back_returns_it_to_planning_with_the_reason(planning
     fo = released(daemon, store, fo["id"])
 
     assert fo["status"] == "planning"
-    assert store.feature_children(fo["id"]) == []
+    assert store.feature_children(fo["id"], kinds=("worker",)) == []
     # The reason reaches the planner as a message
     queued = store.list_messages(fo["plan_wo_id"])
     assert any("sent back" in m["content"] and "child two needs more context"
@@ -303,7 +303,7 @@ def test_neo_escalating_puts_the_feature_order_in_front_of_the_user(planning, st
     assert fo["status"] == "plan_review"          # still undecided
     assert fo["needs_attention"] == 1
     assert "plan needs your review" in fo["attention_reason"]
-    assert store.feature_children(fo["id"]) == []
+    assert store.feature_children(fo["id"], kinds=("worker",)) == []
 
 
 def test_a_plan_at_the_cap_goes_to_the_user_even_when_neo_releases_it(planning, store):
@@ -320,7 +320,7 @@ def test_a_plan_at_the_cap_goes_to_the_user_even_when_neo_releases_it(planning, 
     assert fo["needs_attention"] == 1
     assert f"over the cap of {plans.CHILD_CAP}" in fo["attention_reason"]
     assert "approve" in fo["attention_reason"]  # Neo's reading, attached
-    assert store.feature_children(fo["id"]) == []
+    assert store.feature_children(fo["id"], kinds=("worker",)) == []
     # WHO decided, on the row `jarvis neo stats` groups by: the cap did, not Neo (docs/superpowers/specs/2026-10-01-neo-observability.md §1.)
     assert question(fo["plan_question_id"])["escalation_cause"] == "scope-over-cap"
 
@@ -351,7 +351,7 @@ def test_the_user_can_release_an_escalated_plan(planning, store):
 
     assert out["status"] == "executing"
     assert store.get_feature_order(fo["id"])["needs_attention"] == 0
-    assert len(store.feature_children(fo["id"])) == 2
+    assert len(store.feature_children(fo["id"], kinds=("worker",))) == 2
 
 
 def test_the_user_rejecting_needs_a_reason(planning, store):
@@ -372,7 +372,7 @@ def test_neos_verdict_is_dropped_if_the_user_got_there_first(planning, store):
     daemon._neo_drain()
 
     assert store.get_feature_order(fo["id"])["status"] == "planning"
-    assert store.feature_children(fo["id"]) == []
+    assert store.feature_children(fo["id"], kinds=("worker",)) == []
 
 
 # -- settling: how a feature order ends
@@ -385,7 +385,7 @@ def executing(planning, store):
     ops.submit_plan(fo["id"], a_plan(child("schema", extra="FORCE_APPROVE"),
                                      child("api", needs=["schema"])))
     released(daemon, store, fo["id"])
-    schema, api = store.feature_children(fo["id"])
+    schema, api = store.feature_children(fo["id"], kinds=("worker",))
     return daemon, store.get_feature_order(fo["id"]), schema, api
 
 
@@ -475,7 +475,7 @@ def test_a_completed_feature_closes_the_backlog_item_it_came_from(started, store
         daemon.tick()
         ops.submit_plan(out["fo_id"], a_plan(child("only", extra="FORCE_APPROVE")))
         released(daemon, store, out["fo_id"])
-        store.set_status(store.feature_children(out["fo_id"])[0]["id"], "completed")
+        store.set_status(store.feature_children(out["fo_id"], kinds=("worker",))[0]["id"], "completed")
 
         daemon.tick()
 
@@ -516,7 +516,7 @@ def test_cancelling_a_feature_order_stops_everything_it_owns(planning, store):
 
     assert store.get_feature_order(fo["id"])["status"] == "cancelled"
     # A feature order that stopped while its children kept running would be a label
-    assert {c["status"] for c in store.feature_children(fo["id"])} == {"cancelled"}
+    assert {c["status"] for c in store.feature_children(fo["id"], kinds=("worker",))} == {"cancelled"}
     assert fo["plan_wo_id"] not in out["cancelled_work_orders"]  # already settled
 
 
@@ -622,7 +622,7 @@ def test_a_planner_assumption_holds_its_features_children(started, store):
     store.add_assumption(fo["plan_wo_id"], "the export table gets a new column")
 
     assert store.claim_next_pending() is None
-    kid = store.feature_children(fo["id"])[0]
+    kid = store.feature_children(fo["id"], kinds=("worker",))[0]
     hold = store.plan_hold(store.get_work_order(kid["id"]))
     assert hold == {"fo_id": fo["id"], "planner_id": fo["plan_wo_id"], "n": 1}
 
@@ -636,10 +636,10 @@ def test_a_held_child_does_not_starve_the_queue(started, store):
 
     claimed = [store.claim_next_pending(), store.claim_next_pending()]
 
-    assert [c["id"] for c in claimed] == [store.feature_children(clear["id"])[0]["id"],
+    assert [c["id"] for c in claimed] == [store.feature_children(clear["id"], kinds=("worker",))[0]["id"],
                                           other["id"]]
     assert store.claim_next_pending() is None
-    assert store.feature_children(held["id"])[0]["status"] == "pending"
+    assert store.feature_children(held["id"], kinds=("worker",))[0]["status"] == "pending"
 
 
 def test_the_planner_itself_is_never_held_by_its_own_assumptions(started, store):
@@ -688,7 +688,7 @@ def test_a_planner_with_no_pending_assumptions_holds_nothing(started, store):
     store.add_assumption(fo["plan_wo_id"], "the export table gets a new column")
     ops.review_work_order(fo["plan_wo_id"])
 
-    kid = store.feature_children(fo["id"])[0]
+    kid = store.feature_children(fo["id"], kinds=("worker",))[0]
     assert store.plan_hold(store.get_work_order(kid["id"])) is None
     assert store.claim_next_pending()["id"] == kid["id"]
 
@@ -707,12 +707,12 @@ def test_ruling_the_last_assumption_dispatches_on_the_next_tick(started, store):
     fo = a_released_feature(started, store, "schema")
     store.add_assumption(fo["plan_wo_id"], "the export table gets a new column")
     started.tick()
-    assert store.feature_children(fo["id"])[0]["status"] == "pending"
+    assert store.feature_children(fo["id"], kinds=("worker",))[0]["status"] == "pending"
 
     ops.review_work_order(fo["plan_wo_id"])
     started.tick()
 
-    assert store.feature_children(fo["id"])[0]["status"] != "pending"
+    assert store.feature_children(fo["id"], kinds=("worker",))[0]["status"] != "pending"
 
 
 def test_a_held_child_raises_no_attention(started, store):
@@ -722,7 +722,7 @@ def test_a_held_child_raises_no_attention(started, store):
     fo = a_released_feature(started, store, "schema")
     store.add_assumption(fo["plan_wo_id"], "the export table gets a new column")
 
-    kid = store.get_work_order(store.feature_children(fo["id"])[0]["id"])
+    kid = store.get_work_order(store.feature_children(fo["id"], kinds=("worker",))[0]["id"])
     assert invariants.true_blockers(store, kid) == []
     assert [v for v in invariants.check_blocked_work_is_surfaced(store)
             if kid["id"] in str(v)] == []
@@ -737,7 +737,7 @@ def test_the_hold_reads_as_blocked_by_the_plan(started, store):
     store.add_assumption(fo["plan_wo_id"], "the export table gets a new column")
     store.add_assumption(fo["plan_wo_id"], "the command takes --format")
 
-    kid = store.get_work_order(store.feature_children(fo["id"])[0]["id"])
+    kid = store.get_work_order(store.feature_children(fo["id"], kinds=("worker",))[0]["id"])
     label = invariants.status_label(store, kid)
 
     assert label.startswith("pending — blocked by ")
@@ -753,7 +753,7 @@ def test_an_overtaken_assumption_says_children_already_merged(started, store):
     fo = a_released_feature(started, store, "schema", "api", "docs")
     planner_id = fo["plan_wo_id"]
     store.add_assumption(planner_id, "the export table gets a new column")
-    merged = store.feature_children(fo["id"])[0]
+    merged = store.feature_children(fo["id"], kinds=("worker",))[0]
     store.add_event(merged["id"], "pr_merged", {})
 
     row = ops.assumptions_with_rulings(store, planner_id)[0]
@@ -1038,7 +1038,7 @@ def test_a_refreshed_spec_reaches_the_children_and_the_feature_agent(planning, s
     assert ops.refresh_plan_spec(fo["id"])["refreshed"]
     daemon._neo_drain()    # and then the release
 
-    kid = store.feature_children(fo["id"])[0]
+    kid = store.feature_children(fo["id"], kinds=("worker",))[0]
     assert specs.spec_of(store, kid)["content"] == revised
     out = ops.rebuild_feature_agent(fo["id"])
     definition = Path(out["dir"]) / ".claude" / "agents" / f"{out['agent']}.md"
@@ -1157,7 +1157,7 @@ def test_spec_link_points_a_planner_and_a_child_at_the_same_document(planning, s
     released(daemon, store, fo["id"])
 
     planner = planner_of(store, fo["id"])
-    kid = store.feature_children(fo["id"])[0]
+    kid = store.feature_children(fo["id"], kinds=("worker",))[0]
 
     assert specs.spec_of(store, planner) is None  # deliberately untouched
     link = specs.spec_link(store, planner)

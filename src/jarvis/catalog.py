@@ -113,7 +113,15 @@ DEFAULT_BUDGET_USD: float | None = None
 DEFAULT_FEATURE_BUDGET_USD: float | None = None
 
 # THE ONE NON-None SHIPPED BUDGET (docs/superpowers/specs/2026-09-27-investigation-orders.md)
-DEFAULT_INVESTIGATION_BUDGET_USD: float | None = 2.00
+DEFAULT_INVESTIGATION_BUDGET_USD: float | None = 4.00
+# Where 4.00 came from — a string, not a comment, so it is read and tested and never trimmed away
+DEFAULT_INVESTIGATION_BUDGET_MEASUREMENT = (
+    "Measured 2026-10-21 over the 86 investigator work orders in jarvis_os's project db "
+    "(2026-10-01..2026-10-20): first pass (wo_turns.seq=1) min $0.55, median $1.08, "
+    "p90 $1.73, max $2.28, 4 truncated at the old $2.00 cap. The old $2.00 was one pass, "
+    "so 3 of 3 investigations in io-b521d17b stopped budget_exhausted. Sized at two p90 "
+    "passes ($3.46), rounded up. Re-run: per work_orders.kind='investigator', the "
+    "wo_turns.cost_usd of seq=1")
 
 # Cheap by default for the same reason: a diagnosis is reading and quoting, not design
 DEFAULT_INVESTIGATION_MODEL = "sonnet"
@@ -280,6 +288,9 @@ DEFAULT_VALIDATION_FOLLOW_UP_CAP = 5
 # How long the reconciler may wait for a merged child's commit to appear on the default branch before... (docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md)
 DEFAULT_VALIDATION_FEATURE_MERGE_WAIT_MINUTES = 15
 
+# Withdrawn share of early objections that reaches the inbox, 1 = off (io-ce566253)
+DEFAULT_VALIDATION_OBJECTION_WITHDRAWAL_ALARM_RATE = 0.5
+
 #: Which net answers "is this assumption high-stakes?" before any model call... (docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md)
 STAKES_CLASSIFIER_MODES = ("regex", "shadow", "classifier", "regex-tightened")
 
@@ -316,6 +327,8 @@ class ValidationConfig:
     max_follow_ups: int = DEFAULT_VALIDATION_FOLLOW_UP_CAP
     # WHICH NET DECIDES THAT AN ASSUMPTION IS HIGH-STAKES before any model call... (docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md)
     stakes_classifier: str = "regex"
+    # WHEN FAILING EARLY OBJECTIONS REACH THE INBOX: withdrawn over sent (io-ce566253)
+    objection_withdrawal_alarm_rate: float = DEFAULT_VALIDATION_OBJECTION_WITHDRAWAL_ALARM_RATE
 
 
 # -- the house style: how terse the OS holds its workers
@@ -361,6 +374,9 @@ DEFAULT_INSPECT_ALARM_WRITE_TOKENS = 300_000
 
 #: How long a work order may sit with its turn ended and nothing in flight before...
 DEFAULT_INSPECT_ALARM_PARKED_MINUTES = 60
+
+#: How far back the compaction post-conditions look for a chained or unproven compaction (io-12b7d873)
+DEFAULT_INSPECT_ALARM_COMPACTION_WINDOW_DAYS = 7
 
 # -- the AGGREGATE half of the re-write tax
 
@@ -412,6 +428,7 @@ class InspectConfig:
     alarm_subagent_tool_minutes: int = DEFAULT_INSPECT_ALARM_SUBAGENT_TOOL_MINUTES
     alarm_write_tokens: int = DEFAULT_INSPECT_ALARM_WRITE_TOKENS
     alarm_parked_minutes: int = DEFAULT_INSPECT_ALARM_PARKED_MINUTES
+    alarm_compaction_window_days: int = DEFAULT_INSPECT_ALARM_COMPACTION_WINDOW_DAYS
     alarm_rewrite_window_days: int = DEFAULT_INSPECT_ALARM_REWRITE_WINDOW_DAYS
     alarm_rewrite_prefix_share: float = DEFAULT_INSPECT_ALARM_REWRITE_PREFIX_SHARE
     alarm_rewrite_ttl_share: float = DEFAULT_INSPECT_ALARM_REWRITE_TTL_SHARE
@@ -1280,6 +1297,11 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
     if feature_merge_wait_minutes < 0:
         # 0 is legal and means "never defer": check once, flag immediately
         raise _err(f"{where}.feature_merge_wait_minutes must be >= 0")
+    withdrawal_rate = float(raw.get("objection_withdrawal_alarm_rate",
+                                    base.objection_withdrawal_alarm_rate))
+    if not 0.0 <= withdrawal_rate <= 1.0:
+        # A share: 1 means never raise it, 0 means raise it on any withdrawal at all
+        raise _err(f"{where}.objection_withdrawal_alarm_rate must be between 0 and 1")
     max_follow_ups = int(raw.get("max_follow_ups", base.max_follow_ups))
     if max_follow_ups < 0:
         # 0 is legal and is NOT the same setting as `follow_ups: false`: it files nothing while leaving every...
@@ -1307,6 +1329,7 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         auto_review=bool(raw.get("auto_review", base.auto_review)),
         # Same fallback again — see `ValidationConfig.stakes_classifier`
         stakes_classifier=stakes_classifier,
+        objection_withdrawal_alarm_rate=withdrawal_rate,
     )
 
 
@@ -1336,6 +1359,8 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
                                        base.alarm_write_tokens)),
         alarm_parked_minutes=int(raw.get("alarm_parked_minutes",
                                          base.alarm_parked_minutes)),
+        alarm_compaction_window_days=int(raw.get("alarm_compaction_window_days",
+                                                 base.alarm_compaction_window_days)),
         alarm_rewrite_window_days=int(raw.get("alarm_rewrite_window_days",
                                               base.alarm_rewrite_window_days)),
         alarm_rewrite_prefix_share=float(raw.get("alarm_rewrite_prefix_share",

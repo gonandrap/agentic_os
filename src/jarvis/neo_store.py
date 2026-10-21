@@ -546,6 +546,12 @@ class NeoStore:
         row = self.conn.execute("SELECT * FROM learnings WHERE id=?", (cur.lastrowid,)).fetchone()
         return dict(row)
 
+    def has_active_learning(self, content: str, project: str = "") -> bool:
+        """Is this exact sentence already an unretired learning of this project?"""
+        return self.conn.execute(
+            "SELECT 1 FROM learnings WHERE project=? AND content=? AND retired_at IS NULL",
+            (project, content)).fetchone() is not None
+
     def retract_learning(self, learning_id: int, reason: str) -> dict[str, Any]:
         """Retire a learning the user has superseded"""
         if not reason.strip():

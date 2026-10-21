@@ -97,8 +97,8 @@ def test_a_released_plan_creates_a_manager_only_when_validation_is_enabled(boot,
     managers = [w for w in store.list_work_orders(limit=500, include_hidden=True)
                 if w["kind"] == "manager"]
     assert len(managers) == 1, "exactly one manager, and only for the enabled feature"
-    assert ([(c["title"], c["depends_on"]) for c in store.feature_children(off)]
-            == [(c["title"], c["depends_on"]) for c in store.feature_children(on)])
+    assert ([(c["title"], c["depends_on"]) for c in store.feature_children(off, kinds=("worker",))]
+            == [(c["title"], c["depends_on"]) for c in store.feature_children(on, kinds=("worker",))])
 
 
 def test_the_manager_is_created_in_the_same_transaction_as_the_children(boot, store,
@@ -116,7 +116,7 @@ def test_the_manager_is_created_in_the_same_transaction_as_the_children(boot, st
     with pytest.raises(RuntimeError, match="the manager insert failed"):
         ops.review_plan(fo["id"], accept=True, decided_by="user")
 
-    assert store.feature_children(fo["id"]) == [], "the children rolled back with it"
+    assert store.feature_children(fo["id"], kinds=("worker",)) == [], "the children rolled back with it"
     assert store.manager_work_order(fo["id"]) is None
     assert store.get_feature_order(fo["id"])["status"] == "plan_review"
 
@@ -197,8 +197,8 @@ def test_a_feature_completes_while_its_manager_is_open(boot, store):
     fo_id = release(daemon, "CSV export", "one", "two")
     manager = store.manager_work_order(fo_id)
     assert manager is not None
-    assert manager["id"] not in [c["id"] for c in store.feature_children(fo_id)]
-    for c in store.feature_children(fo_id):
+    assert manager["id"] not in [c["id"] for c in store.feature_children(fo_id, kinds=("worker",))]
+    for c in store.feature_children(fo_id, kinds=("worker",)):
         store.set_status(c["id"], "completed")
     assert store.get_work_order(manager["id"])["status"] == "pending", "still open"
 
@@ -222,7 +222,7 @@ def test_cancelling_the_manager_does_not_fail_the_feature(boot, store):
 
     assert store.get_feature_order(fo_id)["status"] == "executing"
 
-    ops.cancel(store.feature_children(fo_id)[0]["id"])
+    ops.cancel(store.feature_children(fo_id, kinds=("worker",))[0]["id"])
     daemon.settle_features(spec, store)
 
     assert store.get_feature_order(fo_id)["status"] == "failed"
@@ -235,7 +235,7 @@ def test_a_failed_feature_closes_its_manager_too(boot, store):
     fo_id = release(daemon, "CSV export", "one", "two")
     manager = store.manager_work_order(fo_id)
     assert manager is not None
-    store.set_status(store.feature_children(fo_id)[0]["id"], "failed")
+    store.set_status(store.feature_children(fo_id, kinds=("worker",))[0]["id"], "failed")
 
     daemon.settle_features(spec, store)
 
@@ -267,7 +267,7 @@ def test_an_idle_manager_settles_to_idle_without_attention(boot, store,
     fo_id = release(daemon, "CSV export", "one")
     manager = store.manager_work_order(fo_id)
     assert manager is not None
-    child = store.feature_children(fo_id)[0]
+    child = store.feature_children(fo_id, kinds=("worker",))[0]
     daemon.tick()
     assert settle_turns(store), "the turns never ended"
 
@@ -332,7 +332,7 @@ def an_idle_manager(boot, store) -> tuple[str, dict, list[dict]]:
     manager = store.manager_work_order(fo_id)
     assert manager is not None
     store.set_status(manager["id"], "idle")
-    return fo_id, store.get_work_order(manager["id"]), store.feature_children(fo_id)
+    return fo_id, store.get_work_order(manager["id"]), store.feature_children(fo_id, kinds=("worker",))
 
 
 def test_an_idle_managers_label_names_the_children_it_waits_on(boot, store):
@@ -378,13 +378,13 @@ def test_a_manager_is_told_the_feature_and_not_the_worker_contract(boot, store):
     fo_id = release(daemon, "CSV export", "one", "two")
     manager = store.manager_work_order(fo_id)
     assert manager is not None
-    child = store.feature_children(fo_id)[0]
+    child = store.feature_children(fo_id, kinds=("worker",))[0]
 
     prompt = dispatch.build_worker_prompt(
         manager, spec, feature=dispatch.feature_context(store, manager))
 
     assert ASK in prompt, "the manager reasons about the feature, so it gets the ask"
-    for c in store.feature_children(fo_id):
+    for c in store.feature_children(fo_id, kinds=("worker",)):
         assert c["id"] in prompt
     assert "will not open a pull request" in prompt
     # `--pr `, not "open a PR": the commit/PR prose rides in `git_briefing`/--append-system-prompt...
@@ -423,7 +423,7 @@ def test_a_work_order_can_be_filed_under_an_open_feature(boot, store):
     daemon = boot(validation=True)
     spec = daemon.catalog.project("proj_a")
     fo_id = release(daemon, "CSV export", "one")
-    for c in store.feature_children(fo_id):
+    for c in store.feature_children(fo_id, kinds=("worker",)):
         store.set_status(c["id"], "completed")
 
     remediation = ops.create_work_order(
@@ -435,7 +435,7 @@ def test_a_work_order_can_be_filed_under_an_open_feature(boot, store):
     assert remediation["parent_id"] == fo_id
     assert remediation["kind"] == "worker"
     assert stray["parent_id"] is None
-    assert remediation["id"] in [c["id"] for c in store.feature_children(fo_id)]
+    assert remediation["id"] in [c["id"] for c in store.feature_children(fo_id, kinds=("worker",))]
 
     daemon.settle_features(spec, store)
 
@@ -448,7 +448,7 @@ def test_a_settled_feature_refuses_new_children(boot, store):
     daemon = boot(validation=True, feature_units=False)
     spec = daemon.catalog.project("proj_a")
     fo_id = release(daemon, "CSV export", "one")
-    for c in store.feature_children(fo_id):
+    for c in store.feature_children(fo_id, kinds=("worker",)):
         store.set_status(c["id"], "completed")
     daemon.settle_features(spec, store)
     assert store.get_feature_order(fo_id)["status"] == "completed"
@@ -468,7 +468,7 @@ def test_the_cli_carries_the_parent_flag_through(boot, store, capsys):
                      "-d", "the review asked for it", "--parent", fo_id]) == 0
 
     out = capsys.readouterr().out
-    filed = store.feature_children(fo_id)[-1]
+    filed = store.feature_children(fo_id, kinds=("worker",))[-1]
     assert filed["title"] == "cover the empty result set"
     assert filed["id"] in out and fo_id in out
 
@@ -491,7 +491,7 @@ def test_an_envelope_to_the_manager_role_is_delivered_to_the_manager(boot, store
     fo_id = release(daemon, "CSV export", "one", "two")
     manager = store.manager_work_order(fo_id)
     assert manager is not None
-    child = store.feature_children(fo_id)[0]
+    child = store.feature_children(fo_id, kinds=("worker",))[0]
 
     envelope_id = bus.post(
         store,
@@ -684,7 +684,7 @@ def test_an_envelope_wakes_an_idle_manager_and_it_settles_back_to_idle(boot, sto
     """THE BEHAVIOUR THE MANAGER EXISTS FOR, end to end through a real `daemon.tick`"""
     daemon, spec, manager = _settled_idle(boot, store, settle_turns)
     before = store.latest_turn(manager["id"])["seq"]
-    child = store.feature_children(manager["parent_id"])[0]
+    child = store.feature_children(manager["parent_id"], kinds=("worker",))[0]
 
     bus.post(
         store,
@@ -839,7 +839,7 @@ def _ready_for_handoff(boot, store, *, validation: bool = True) -> tuple:
     """An `executing` feature with a judged round and every live child `completed`"""
     daemon = boot(validation=validation)
     fo_id = release(daemon, "CSV export", "one")
-    for child in store.feature_children(fo_id):
+    for child in store.feature_children(fo_id, kinds=("worker",)):
         store.set_status(child["id"], "completed")
     _judged(store, fo_id)
     return daemon, daemon.catalog.project("proj_a"), fo_id

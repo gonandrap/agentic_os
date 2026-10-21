@@ -763,12 +763,15 @@ def create_app() -> FastAPI:
         return response
 
     # Inside the factory, like every other same-tier import in this file: `cli` and `ui` are one tier and...
-    from ..cli import PART_LABELS, PART_SHORT, _held_phrase
+    from ..cli import (ATTENTION_LIST_NOTE, INBOX_LIST_NOTE, PART_LABELS, PART_SHORT,
+                       _held_phrase)
 
     templates = Jinja2Templates(directory=str(TEMPLATES))
     templates.env.globals.update(
         status_meta=STATUS_META, origin_meta=ORIGIN_META, gate_meta=GATE_META,
         gate_display=gate_display,
+        # What each list is and which command clears it — the same words `jarvis status` prints (io-d2a5dd69)
+        attention_list_note=ATTENTION_LIST_NOTE, inbox_list_note=INBOX_LIST_NOTE,
         # Every link to an order's page goes through this — see `order_path` (#997)
         order_path=order_path,
         # A round's word, tone and icon — the same tuple `ops.round_line` and `automerge.decide` render from (#581)
@@ -1093,7 +1096,7 @@ def create_app() -> FastAPI:
 
     @app.get("/wo/{name}/{wo_id}", response_class=HTMLResponse)
     def work_order(request: Request, name: str, wo_id: str, debug: str = "",
-                   forced: str = "", retried: str = ""):
+                   forced: str = "", retried: str = "", events: str = ""):
         try:
             pname, path, wo = ops.find_work_order(wo_id, name)
         except ops.OpsError as e:
@@ -1101,7 +1104,11 @@ def create_app() -> FastAPI:
                           hint=_stale_link_hint(name, wo_id), status_code=404)
         store = ProjectStore(path)
         try:
-            events = store.list_events(wo_id)
+            # THE NEWEST PAGE, and how much is behind it — `jarvis wo show`'s rule (io-12b7d873)
+            every = events == "all"
+            events_page = store.list_events(wo_id, limit=None if every else 200,
+                                            newest=True)
+            events_hidden = store.count_events(wo_id) - len(events_page)
             messages = store.list_messages(wo_id)
             # Both lists: `assumptions` is the record, `unreviewed` is the ask — §4
             assumptions = ops.assumptions_with_rulings(store, wo_id)
@@ -1167,11 +1174,12 @@ def create_app() -> FastAPI:
                       issues=issue_index,
                       auto_review=auto_review, force=force, forced_lines=forced_lines,
                       retry=retry, retried_line=retried_line, harvest=harvest,
-                      timeline=build_timeline(wo, events, messages,
+                      timeline=build_timeline(wo, events_page, messages,
                                               include_debug=show_debug),
-                      debug=show_debug, debug_count=count_debug(events),
+                      events_hidden=events_hidden, events_all=every,
+                      debug=show_debug, debug_count=count_debug(events_page),
                       # What was said, and what happened — two readings of one record, neither derivable from the other
-                      conversation=build_conversation(events, messages),
+                      conversation=build_conversation(events_page, messages),
                       assumptions=assumptions, unreviewed=unreviewed, review=review,
                       approvals=approvals, bill=bill, states=states,
                       turn_lines=turn_lines_by_message(bill))
@@ -1821,11 +1829,7 @@ def create_app() -> FastAPI:
 
     @app.post("/inbox/ack")
     def ack(inbox_id: str = Form("")):
-        central = CentralStore()
-        try:
-            central.ack_inbox(int(inbox_id) if inbox_id else None)
-        finally:
-            central.close()
+        ops.ack_inbox(int(inbox_id) if inbox_id else None)
         return RedirectResponse("/inbox", status_code=303)
 
     @app.post("/backlog/promote/{item_id}")

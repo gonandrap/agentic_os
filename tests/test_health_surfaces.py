@@ -127,7 +127,7 @@ def test_the_five_new_event_kinds_read_as_five_different_things():
 
 
 def test_the_supervisors_nudge_is_the_supervisor_speaking_and_not_the_user():
-    """`_message_label` returns "you → worker" for any source it does not know"""
+    """`_message_label` names the supervisor, not the user, for its own source"""
     events = [ev("remedy_proposed", 1.0, alarm_id="al-1a2b", remedy="nudge",
                  argument=ARGUMENT)]
     messages = [{"id": 3, "ts": 2.0, "direction": "user_to_agent",

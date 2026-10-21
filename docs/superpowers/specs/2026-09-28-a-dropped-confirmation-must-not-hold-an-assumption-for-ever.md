@@ -539,3 +539,25 @@ go beside their existing siblings; the drop site is daemon-level.
 12. Unchanged, and asserted so: the early pass files no confirmation and leaves
     `confirm_question_id is None` (existing assertion at line 316) — the regression guard
     that §4 never runs on the early path.
+
+## Amendment (io-51469add, finding `dropped-rulings`): the ASK path retries too
+
+§4.3's last paragraph ("On a NON-confirmation drop nothing here runs") is superseded. The
+same transient fact (`HELD_STATUS` above all) dropped first-ask rulings for ever: wo-764454c5
+and wo-8fd40f1a each carried a ruling Neo paid for that then read "accepted by you".
+
+* The retry now runs on BOTH paths when `still.code in TRANSIENT_DROPS` — the allowlist is
+  unchanged — AND the work order is not in a terminal status: a cancelled order can never
+  return to `needs_review`, so its drop is final and stays `escalated`, link kept.
+* Same order of writes as §4.3: the drop's `autoreview_escalated` event first (now carrying
+  `re_asked: true|false`), then `supersede`, then the link is cleared —
+  `clear_assumption_confirmation` on the confirmation path, the new
+  `clear_assumption_question` (`neo_question_id=NULL`) on the ask path, so `decide`'s
+  condition 6 lets the next pass ask again.
+* The record says so: the timeline reads "the OS dropped its ruling … and will ask Neo
+  again", `wo show`'s auto-review line reads "goes back to Neo", never "left with you".
+* Counted: `jarvis neo stats` reports `dropped_rulings` (total, re-asked). The spent
+  question id survives on the `autoreview_asked` event, which is how the per-row rate still
+  counts the row as having reached Neo.
+* Not in scope, still open: WHY orders bounce from `needs_review` back to `running` in
+  bursts. That is a diagnosis, not this change.

@@ -33,9 +33,43 @@
   </span>
 </div>
 
+{# THE HEADLINE IS PER ASSUMPTION ROW (io-51469add): one row makes 0, 1 or 2 questions,
+   so the question rate below is plumbing and must never be the number quoted. #}
+{% set a = report.assumptions %}
 <div class="panel" style="margin-top: 14px; padding: 14px 16px;">
   <p style="margin: 0 0 6px; font-size: 22px;" class="mono">
-    {{ q.asked }} question{{ '' if q.asked == 1 else 's' }}</p>
+    {{ a.rows }} assumption{{ '' if a.rows == 1 else 's' }} ·
+    {{ pct(a.rates.neo_decided) }} decided by Neo</p>
+  <p class="kv mono" style="margin: 0;">
+    {{ a.neo_decided }} decided by Neo ({{ pct(a.rates.neo_decided) }}) ·
+    {{ a.neo_escalated }} escalated to you ({{ pct(a.rates.neo_escalated) }}) ·
+    {{ a.never_reached_neo }} never reached Neo ({{ pct(a.rates.never_reached_neo) }})
+  </p>
+  <p class="kv" style="margin: 6px 0 0;">
+    <span class="sub">over {{ a.settled }} settled rows; never reached = held before any
+      model call{% for code, n in a.never_reached_by_hold | dictsort(by='value', reverse=true) %}
+      {{ '— ' if loop.first else '· ' }}{{ code }} {{ n }}{% endfor %}</span>
+  </p>
+  <p class="kv mono" style="margin: 6px 0 0;">
+    {{ a.unsettled.count }} still unsettled
+    <span class="sub">— {{ a.unsettled.reached_neo }} reached Neo,
+      {{ a.unsettled.never_reached_neo }} never did{% if a.unsettled.median_age_days is not none %};
+      median age {{ a.unsettled.median_age_days }}d, oldest {{ a.unsettled.max_age_days }}d{% endif %};
+      out of the rates</span>
+  </p>
+  <p class="kv mono" style="margin: 6px 0 0;">
+    {{ a.dropped_rulings.total }} dropped rulings
+    <span class="sub">({{ a.dropped_rulings.re_asked }} re-asked)</span> ·
+    high-stakes net {{ a.stakes_net.held }} held, {{ a.stakes_net.false_alarms }} called a
+    false alarm ({{ pct(a.stakes_net.false_alarm_rate) }})
+  </p>
+</div>
+
+<div class="panel" style="margin-top: 14px; padding: 14px 16px;">
+  <p style="margin: 0 0 6px; font-size: 16px;" class="mono">
+    {{ q.asked }} question{{ '' if q.asked == 1 else 's' }}
+    <span class="sub">— plumbing telemetry</span></p>
+  <p class="sub" style="margin: 0 0 6px;">{{ report.questions_note }}</p>
   {# A count of zero is a MEASURED zero and prints 0; only the RATE can be absent. #}
   <p class="kv mono" style="margin: 0;">
     {{ q.answered }} answered by Neo · {{ q.escalated }} escalated ·
@@ -54,7 +88,9 @@
   <p class="kv mono" style="margin: 6px 0 0;">
     {{ report.objections.sent }} objections sent ·
     {{ report.objections.delivered }} delivered ·
+    {{ report.objections.acted_on }} acted on ·
     {{ report.objections.withdrawn }} withdrawn
+    ({{ pct(report.objections.withdrawal_rate) }})
     <span class="sub">— {{ report.objections.stopped }} the order stopped,
       {{ report.objections.handed_back }} handed to you,
       {{ report.objections.other }} other</span>

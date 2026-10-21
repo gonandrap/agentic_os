@@ -537,6 +537,10 @@ FTS_WEIGHTS = (1.0, 4.0, 2.0)
 
 # Columns added after the first release, exactly as in `neo_store` and `project_store`
 ADDED_COLUMNS = {
+    "inbox": {
+        # The attention reason raised WITH this notification, or NULL for a standalone one (io-d2a5dd69)
+        "paired_reason": "TEXT",
+    },
     "knowledge": {
         # Retraction
         "retired_at": "REAL",
@@ -682,12 +686,23 @@ class CentralStore:
         return float(row["c"] or 0.0)
 
     def add_inbox(self, project: str, title: str, body: str = "", level: str = "info",
-                  wo_id: str | None = None) -> int:
+                  wo_id: str | None = None, paired_reason: str | None = None) -> int:
         cur = self.conn.execute(
-            "INSERT INTO inbox (ts, project, level, title, body, wo_id) VALUES (?,?,?,?,?,?)",
-            (db.now(), project, level, title, body, wo_id),
+            "INSERT INTO inbox (ts, project, level, title, body, wo_id, paired_reason) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (db.now(), project, level, title, body, wo_id, paired_reason),
         )
         return int(cur.lastrowid)
+
+    def get_inbox(self, inbox_id: int) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM inbox WHERE id=?", (inbox_id,)).fetchone()
+        return dict(row) if row else None
+
+    def ack_paired_inbox(self, wo_id: str) -> int:
+        """Mark read every notification raised alongside this work order's attention flag"""
+        return self.conn.execute(
+            "UPDATE inbox SET status='acked' WHERE wo_id=? AND paired_reason IS NOT NULL "
+            "AND status != 'acked'", (wo_id,)).rowcount
 
     def purge_work_order(self, wo_id: str) -> dict[str, int]:
         """Drop every central trace of a deleted work order"""
@@ -703,6 +718,12 @@ class CentralStore:
         ).rowcount
         return {"inbox": inbox, "agent_calls": calls, "knowledge_reads": reads,
                 "backlog_reopened": backlog}
+
+    def inbox_titled_since(self, project: str, title: str, since: float) -> bool:
+        """Has this exact item been raised for this project since `since`, acked or not?"""
+        return self.conn.execute(
+            "SELECT 1 FROM inbox WHERE project=? AND title=? AND ts >= ? LIMIT 1",
+            (project, title, since)).fetchone() is not None
 
     def unacked_inbox(self, level: str | None = None) -> list[dict[str, Any]]:
         if level:

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import landing
+from jarvis import landing, project_store
 from jarvis.testing import make_git_project
 
 WO = "wo-abc12345"
@@ -96,6 +96,22 @@ def test_uncommitted_work_counts_as_produced_and_a_clean_tree_does_not(repo):
     assert produced.produced is True
     assert produced.commits == 0          # nothing was committed...
     assert "src/never_added.py" in produced.dirty   # ...and it still counts
+
+
+@pytest.mark.parametrize("kind", project_store.WO_KINDS)
+def test_a_kinds_own_artifact_is_never_stranded_work(repo, kind):
+    """io-b521d17b: each worktree built WITH the file its kind's contract command consumes"""
+    wo = {"id": f"wo-{kind}", "kind": kind}
+    artifacts = project_store.submission_artifacts(wo)
+    wt = repo.worktree(wo["id"])
+    for name in artifacts:
+        (wt / name).write_text("{}")
+        # The collision the table exists to close: unexcluded, the artifact reads as stranded code
+        assert landing.authored(wt).produced is True
+    assert landing.authored(wt, artifacts).produced is False, kind
+    # …and only the artifact: anything else it wrote still counts
+    (wt / "notes.txt").write_text("x")
+    assert landing.authored(wt, artifacts).dirty == ("notes.txt",), kind
 
 
 def test_a_missing_worktree_is_unreadable_not_produced(repo):

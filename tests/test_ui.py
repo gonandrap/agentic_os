@@ -1828,7 +1828,7 @@ def test_a_childs_link_carries_its_sections_anchor_and_that_id_exists(released_f
     client, fo = released_feature
     store = ProjectStore(project)
     try:
-        kid = store.feature_children(fo["id"])[0]
+        kid = store.feature_children(fo["id"], kinds=("worker",))[0]
         anchor = specs.spec_link(store, kid)["anchor"]
     finally:
         store.close()
@@ -2180,7 +2180,7 @@ def test_the_attention_strip_links_a_rolled_up_feature_to_its_page(client, daemo
     daemon._neo_drain()
     store = ProjectStore(project)
     try:
-        kid = store.feature_children(fo["id"])[0]
+        kid = store.feature_children(fo["id"], kinds=("worker",))[0]
         store.update_work_order(kid["id"], needs_attention=1,
                                 attention_reason="assumption needs a decision")
     finally:

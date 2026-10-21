@@ -101,8 +101,8 @@ A message entry becomes what happened, with `detail = ""` and a ref:
 | `source` / direction | label |
 |---|---|
 | `neo` | `Neo answered the worker` |
-| `pr-conflict`, `pr-checks` (`UNAUTHORED_SOURCES`) | `Jarvis messaged the worker` |
-| anything else inbound | `You messaged the worker` |
+| inbound with `authored_by = "user"` | `You messaged the worker` |
+| anything else inbound (2026-10-21, the-work-order-record §5) | `Jarvis messaged the worker` |
 | outbound | `Worker replied` |
 
 `_message_event_label` is a second function rather than a second use of `_message_label`,

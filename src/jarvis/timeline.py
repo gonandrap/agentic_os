@@ -235,7 +235,16 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "compacting":
         return "Compacting the conversation", p.get("reason") or ""
     if kind == "compacted":
-        # `ok` is absent on the hook's own event (`hooks.note_compaction`)
+        # NEVER A BARE "Conversation compacted" (io-12b7d873)
+        if "ok" not in p:
+            # The hook's own event (`hooks.note_compaction`), written BEFORE Claude Code compacts
+            trigger = p.get("trigger") or "auto"
+            return (f"Claude Code compacting the conversation ({trigger})",
+                    "its own decision, not the OS's — the size it leaves is not reported here")
+        if p.get("outcome") == "nothing_compacted":
+            return ("Compaction summarised nothing",
+                    "it returned success but left no boundary in the transcript — the "
+                    "conversation is intact and the compaction will be retried")
         if p.get("ok") is False:
             # The conversation is INTACT and the next prompt still pays the re-write
             return "Compaction failed", str(p.get("error") or "")
@@ -243,7 +252,19 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         if isinstance(before, int) and isinstance(after, int) and before:
             return ("Conversation compacted",
                     f"{before:,} tokens summarised to {after:,}")
-        return "Conversation compacted", ""
+        if p.get("outcome") == "unverified":
+            return ("Compaction unverified",
+                    "it returned success, but the transcript could not be read to "
+                    "confirm a boundary")
+        # Recorded before the outcome was: ok, and no boundary was found
+        return ("Compaction reported, no boundary found",
+                "it returned success but the transcript shows nothing was summarised")
+    if kind == "compaction_landed":
+        after = p.get("after")
+        return ("Compaction had landed — not re-sent",
+                f"turn {p.get('seq')} failed after compacting"
+                + (f" the conversation to {after:,} tokens" if isinstance(after, int)
+                   else "") + "; a second one would only summarise the summary")
     if kind == "attention":
         return "Needs you", p.get("reason") or ""
     if kind == "acknowledged":
@@ -342,6 +363,11 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         # `dropped` means the OS had a ruling and threw it away because the state moved under it (spec §5.1)
         why = " — the OS dropped its ruling when the work order changed" if p.get(
             "dropped") else ""
+        if p.get("re_asked"):
+            # A TRANSIENT drop is not the user's: the next pass puts it to Neo again (io-51469add)
+            return (f"Assumption #{p.get('n')}: the OS dropped its ruling when the work "
+                    f"order changed, and will ask Neo again",
+                    p.get("reason") or "no reason recorded")
         return (f"Assumption #{p.get('n')} left with you{why}",
                 p.get("reason") or "no reason recorded")
     if kind == "autoreview_held":
@@ -748,33 +774,41 @@ UNAUTHORED_SOURCES = frozenset({"pr-conflict", "pr-checks", "background-orphan",
 #: `remedies.MESSAGE_SOURCE`, spelled out here for the reason `ALARM_KINDS` is: this module is a leaf... (docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md)
 SUPERVISOR_SOURCE = "supervisor"
 
+#: `project_store.MESSAGE_AUTHOR_USER`, spelled out for the same leaf reason (docs/superpowers/specs/2026-08-23-the-work-order-record.md §5)
+AUTHOR_USER = "user"
+
+#: Named machine speakers, as (conversation tag, timeline sentence)
+_SOURCE_SPEAKERS: dict[str, tuple[str, str]] = {
+    # `source="neo"` is written in exactly one place (`daemon._neo_drain`)
+    "neo": ("neo → worker", "Neo answered the worker"),
+    SUPERVISOR_SOURCE: ("supervisor → worker", "The supervisor messaged the worker"),
+}
+_JARVIS_SPEAKER = ("jarvis → worker", "Jarvis messaged the worker")
+_USER_SPEAKER = ("you → worker", "You messaged the worker")
+
+
+def _speaker(m: dict[str, Any]) -> tuple[str, str]:
+    """The user only when `authored_by` proves it, else a named machine or Jarvis — §5"""
+    named = _SOURCE_SPEAKERS.get(m.get("source") or "")
+    if named:
+        return named
+    if m.get("source") in UNAUTHORED_SOURCES:
+        return _JARVIS_SPEAKER
+    return _USER_SPEAKER if m.get("authored_by") == AUTHOR_USER else _JARVIS_SPEAKER
+
 
 def _message_label(m: dict[str, Any]) -> str:
-    """Who is speaking, from the message's own `source` — §5"""
+    """Who is speaking, as a tag over the words — §5"""
     if m.get("direction") != "user_to_agent":
         return "worker → you"
-    if m.get("source") == "neo":
-        return "neo → worker"
-    if m.get("source") == SUPERVISOR_SOURCE:
-        return "supervisor → worker"
-    if m.get("source") in UNAUTHORED_SOURCES:
-        return "jarvis → worker"
-    return "you → worker"
+    return _speaker(m)[0]
 
 
 def _message_event_label(m: dict[str, Any]) -> str:
-    """What happened, for the timeline — the same `source` rule, worded as an event"""
+    """What happened, for the timeline — the same speaker, worded as an event"""
     if m.get("direction") != "user_to_agent":
         return "Worker replied"
-    if m.get("source") == "neo":
-        # `source="neo"` is written in exactly one place (`daemon._neo_drain`)
-        return "Neo answered the worker"
-    if m.get("source") == SUPERVISOR_SOURCE:
-        # The same arm as `_message_label`'s
-        return "The supervisor messaged the worker"
-    if m.get("source") in UNAUTHORED_SOURCES:
-        return "Jarvis messaged the worker"
-    return "You messaged the worker"
+    return _speaker(m)[1]
 
 
 def _message_ref(m: dict[str, Any]) -> dict[str, Any] | None:

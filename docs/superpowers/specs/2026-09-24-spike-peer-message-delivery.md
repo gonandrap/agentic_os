@@ -118,3 +118,76 @@ open question above.
 notice arrives as a later inbound message, and a one-shot `-p` sender has exited before it
 can see one. So confirm delivery from the receiver's side — the `absorbed_mid_turn`
 transcript row — and keep the queue path as the fallback. Record-then-send.
+
+## 2026-10-21: re-measured on 2.1.301, and a design that does not need the sender authenticated
+
+Recorded from improvement order io-ce566253 (`nudge-not-content`), whose analyst re-ran
+`scripts/spike_peer_message.py` against the CLI installed on 2026-10-21. Nothing below was
+re-run for this note; it records that run's figures and the design they lead to.
+
+**Re-measurement, Claude Code 2.1.301** (beside the 2.1.281 numbers above, which stand for
+that version):
+
+| measurement | 2.1.281 (2026-09-24) | 2.1.301 (2026-10-21) |
+|---|---|---|
+| plain delivery, mid-turn and in transcript | 5/5 | 2/2, verdict `works` |
+| forger with an allow-listed `from-name` | refused | refused, `receiver_received: false` |
+| `UserPromptSubmit` sees `verifiedPeerPid` | no | no (`hook_saw_verified_peer_pid: false`) |
+| disablers set / `crossSessionInbound` | none / unset | none / unset |
+
+Two things are new on 2.1.301, read off the registry rather than the binary:
+
+- a per-session key file `~/.claude/sessions/<pid>.<sha256>.key`, mode `0600`, holding
+  `{peerToken (32 chars), procStart, pidDomain}`;
+- the registry entry declares `peerProtocol: 1` and `peerFeatures: [notify_idle,
+  reply_across_default_dirs, artifact_yield]` — a versioned protocol, where 2.1.281 offered
+  only an undocumented surface.
+
+**The veto stands, and the key file does not lift it.** Every Jarvis worker runs as the
+same UID as jarvisd, so a `0600` file owned by that UID is readable by every worker, every
+subagent and any stray script on the machine. A bearer token the adversary can read is not
+an authenticator. Re-measuring does not change §3.2's answer: the receiver cannot tell who
+is talking.
+
+### The proposed design: the envelope carries no guidance
+
+The veto is about the PAYLOAD, not the transport. §6.4 of the parent spec put the
+objection's WORDS in the envelope, so the receiver had to trust the sender. It need not:
+§6.1 already records the objection in the project store BEFORE anything is sent ("Record,
+then send"), so the authoritative copy is on the record and the envelope can be empty.
+
+1. **A content-free nudge.** jarvisd sends a peer message carrying at most an assumption
+   number and one fixed line: re-read your record. No reason text, no instruction.
+2. **A read verb that is the receipt.** A narrow `jarvis` read command returns the
+   worker's own outstanding objections from the project store. That fetch, and only that
+   fetch, stamps `objection_delivered_ts`. This also answers §3.3 ("a send is not a
+   receipt"): the OS records a fact it actually has, on the receiver's side.
+3. **A rate limit per order.** The worst a forger can do is make a worker re-read its own
+   genuine record. Bounding nudges per order keeps that from being a context-exhaustion
+   attack.
+4. **The queue path stays as the fallback**, unchanged. A nudge that is never fetched
+   leaves the objection outstanding, and it rides the next turn boundary exactly as today.
+
+The nudge bypasses no hold: it is not a message on `wo_messages`, and
+`worker_session.delivery_hold` and `autoreview.decide_early` are untouched by it.
+
+### Open gate: can jarvisd send a peer message without a model call?
+
+**Not measured, and nothing ships until it is.** jarvisd is plain Python, not a Claude
+session. The 2026-09-24 sender was a `claude -p` process: about 10.6s and one model call
+per send. A nudge must not cost a model call. `peerProtocol: 1` makes speaking the uds
+socket directly more tractable than it was, but the 2026-09-24 spike failed to capture the
+wire format and nobody has tried since.
+
+That is a spike, with its kill criterion stated up front:
+
+- **Success:** jarvisd delivers a nudge to a running `claude -p` worker in under ~1s with
+  zero model tokens. Anything else is NO, and the spike prices the `claude -p` sender
+  instead.
+- **Also settle:** whether one worker can read another session's `0600` key file (the
+  threat model above assumes yes), and whether a `--resume` session absorbs mid-turn (this
+  spike covered fresh sessions only).
+- **Out of scope for the spike:** product code, or any change under `src/jarvis/`.
+
+The spike reads live session registries under `~/.claude/sessions`, so it waits for the
+user's go-ahead. It is the remaining step on this transport.

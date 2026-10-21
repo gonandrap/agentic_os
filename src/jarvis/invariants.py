@@ -30,6 +30,8 @@ from .project_store import (
     UNGOVERNED_ORIGINS,
     VALIDATION_AUTH_CAUSE,
     VALIDATION_HELD_CAUSE,
+    WORKER_CHILDREN,
+    kind_contract,
     validation_hold,
 )
 
@@ -69,7 +71,7 @@ def _billing_store() -> Iterator[Any]:
 def budget_blocker(store: ProjectStore, wo: dict[str, Any]) -> str:
     """The attention line for a work order parked in `budget_exhausted`"""
     with _billing_store() as central:
-        out = budget.exhaustion(store, central, wo)
+        out = budget.launch_refusal(store, central, wo)
     # None means the accounting no longer says it is spent: the user raised the budget and the tick that...
     return out.reason if out else BUDGET_SPENT_BLOCKER
 
@@ -321,7 +323,7 @@ def dead_feature_children(store: ProjectStore,
 def outstanding_feature_children(store: ProjectStore,
                                  fo_id: str) -> list[dict[str, Any]]:
     """The children this feature has not finished with: non-settled, non-superseded"""
-    return _outstanding(store.feature_children(fo_id))
+    return _outstanding(store.feature_children(fo_id, kinds=WORKER_CHILDREN))
 
 
 def _outstanding(children: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -341,7 +343,7 @@ def outstanding_children_note(store: ProjectStore, wo: dict[str, Any]) -> str:
     if wo.get("kind") != "manager" or wo["status"] != "idle" or not wo.get("parent_id"):
         return ""
     fo_id = str(wo["parent_id"])
-    children = store.feature_children(fo_id)
+    children = store.feature_children(fo_id, kinds=WORKER_CHILDREN)
     outstanding = _outstanding(children)
     if not outstanding:
         return ""
@@ -558,11 +560,19 @@ def _os_is_confirming(a: dict[str, Any]) -> bool:
     return verdict == "object" and bool(a.get("objection_delivered_ts"))
 
 
+def reviewable_assumptions(store: ProjectStore,
+                           wo: dict[str, Any]) -> list[dict[str, Any]]:
+    """The pending assumptions that are the USER's to review (io-d2a5dd69)"""
+    if not kind_contract(wo).assumptions_reviewed:
+        return []
+    return store.pending_assumptions(wo["id"])
+
+
 def true_blockers(store: ProjectStore, wo: dict[str, Any],
                   now: float | None = None) -> list[str]:
     """The reasons this work order genuinely needs the user, derived from state alone"""
     blockers: list[str] = []
-    pending = store.pending_assumptions(wo["id"])
+    pending = reviewable_assumptions(store, wo)
     # §9: FIRST, because it is the more specific fact about the same assumption
     if any(objection_undeliverable(store, a) for a in pending):
         blockers.append(OBJECTION_UNDELIVERABLE_BLOCKER)
@@ -822,12 +832,143 @@ def check_undeclared_delivery(store: ProjectStore) -> Iterator[Violation]:
         )
 
 
+#: A transition the spans recorded and the timeline did not (io-df4fa1e3)
+RECORD_BEHIND = "INV-RECORD-BEHIND"
+
+#: How far apart a span and its status event may be stamped and still be one transition
+RECORD_PAIR_SECONDS = 1.0
+
+#: The `validation_failed` cause INV-VALIDATION-STRANDED writes: not a hold, so nothing waits on it
+STRANDED_CAUSE = "stranded"
+
+
+def _span_on_record(store: ProjectStore, wo_id: str, span: dict[str, Any]) -> bool:
+    """Whether the timeline carries this span's transition"""
+    if not span["from_status"]:
+        # The creation span pairs with `created`, which `create_work_order` stamps separately
+        return bool(store.last_event_of_kind(wo_id, "created"))
+    ts = float(span["ts"])
+    return any(
+        (db.from_json(e["payload"], {}) or {}).get("status") == span["to_status"]
+        and abs(float(e["ts"]) - ts) <= RECORD_PAIR_SECONDS
+        for e in store.events_of_kind(wo_id, "status"))
+
+
+def _record_behind(store: ProjectStore, wo_id: str,
+                   spans: list[dict[str, Any]]) -> Iterator[Violation]:
+    """INV-RECORD-BEHIND — the newest span and the newest settled round, each with its event"""
+    # The NEWEST only: 268 historic claim spans predate the fix and are reported once, not every tick
+    tail = next((s for s in reversed(spans) if not s["approximate"]), None)
+    if tail is not None and not _span_on_record(store, wo_id, tail):
+        yield Violation(
+            invariant=RECORD_BEHIND, wo_id=wo_id,
+            detail=(f"the spans record a move to {tail['to_status']!r} (trigger "
+                    f"{tail['trigger'] or 'unnamed'}) and the timeline has no status "
+                    f"event for it, so `wo show` and Neo cannot see it"),
+            repair="none: the writer that skipped the event is the defect, and an "
+                   "event written now would invent its moment",
+            context={"span_id": tail["id"], "to_status": tail["to_status"],
+                     "ts": tail["ts"]})
+    settled = [r for r in store.validation_rounds(wo_id=wo_id) if r["outcome"] != "pending"]
+    if not settled:
+        return
+    last = settled[-1]
+    kind = f"validation_{last['outcome']}"
+    if not any((db.from_json(e["payload"], {}) or {}).get("round") == last["round"]
+               for e in store.events_of_kind(wo_id, kind)):
+        yield Violation(
+            invariant=RECORD_BEHIND, wo_id=wo_id,
+            detail=(f"validation round {last['round']} settled {last['outcome']!r} and "
+                    f"the timeline has no `{kind}` event for it"),
+            repair="none: the writer that skipped the event is the defect",
+            context={"round_id": last["id"], "round": last["round"],
+                     "outcome": last["outcome"]})
+
+
+#: `wo_alarms.kind` for the two compaction post-conditions (io-12b7d873)
+COMPACTION_CHAINED_ALARM = "compaction-chained"
+COMPACTION_UNPROVEN_ALARM = "compaction-unproven"
+
+
+def _compaction_window(store: ProjectStore) -> tuple[bool, int]:
+    """Whether the compaction checks are armed for THIS project, and how many days back they look"""
+    from .ops import inspect_config_at
+
+    cfg = inspect_config_at(store.project_path)
+    return bool(cfg.enabled), int(cfg.alarm_compaction_window_days)
+
+
+def _figures(record: dict[str, Any] | None) -> str:
+    if not record or not record.get("post"):
+        return ""
+    return f" ({int(record.get('pre') or 0):,} → {int(record['post']):,} tokens)"
+
+
+def compaction_findings(store: ProjectStore,
+                        since: float) -> list[tuple[str, dict[str, Any], str]]:
+    """`(alarm kind, turn, reason)` for every compaction since `since` that breaks a post-condition"""
+    found: list[tuple[str, dict[str, Any], str]] = []
+    for turn in store.compaction_turns_since(since):
+        record = worker_session.compaction_record(turn)
+        if turn.get("prev_kind") == worker_session.COMPACT_TURN:
+            prev = db.from_json(turn.get("prev_compaction_json"), None)
+            # A row from before the column existed is judged on its state alone
+            landed = (bool(prev.get("post")) if isinstance(prev, dict)
+                      else turn.get("prev_state") == "done")
+            if landed:
+                found.append((COMPACTION_CHAINED_ALARM, turn, (
+                    f"turn {turn['seq']} compacted the conversation turn "
+                    f"{turn['prev_seq']} had already compacted"
+                    f"{_figures(prev if isinstance(prev, dict) else None)}, with no "
+                    f"worker turn between — it summarised the summary"
+                    + (f"{_figures(record)}" if record else ""))))
+        if turn["state"] == "done" and record is not None and not record.get("post"):
+            found.append((COMPACTION_UNPROVEN_ALARM, turn, (
+                f"compaction turn {turn['seq']} settled ok with no compact boundary and "
+                f"no achieved size on record — nothing shows the conversation shrank")))
+    return found
+
+
+def check_compactions_hold(store: ProjectStore) -> Iterator[Violation]:
+    """INV-COMPACTION-CHAINED / INV-COMPACTION-UNPROVEN — what must be true after the OS pays to compact"""
+    enabled, days = _compaction_window(store)
+    if not enabled:
+        return
+    readonly = getattr(store, "readonly", False)
+    since = time.time() - days * 86400
+    for kind, turn, reason in compaction_findings(store, since):
+        wo_id = turn["wo_id"]
+        # ONE ALARM PER TURN, EVER: the row is the memory, so an ack holds across ticks
+        if any(a["kind"] == kind and a["seq"] == turn["seq"]
+               for a in store.alarms_of(wo_id)):
+            continue
+        if not readonly:
+            row = store.add_alarm(wo_id, kind, turn["seq"], reason)
+            store.add_event(wo_id, "cost_alarm", {"kind": kind, "seq": turn["seq"],
+                                                  "reason": reason,
+                                                  "alarm_id": row["id"]})
+            wo = store.get_work_order(wo_id)
+            if wo["status"] not in TERMINAL_STATUSES and not wo["needs_attention"]:
+                store.flag_attention(wo_id, reason)
+        yield Violation(
+            invariant=("INV-COMPACTION-CHAINED" if kind == COMPACTION_CHAINED_ALARM
+                       else "INV-COMPACTION-UNPROVEN"),
+            wo_id=wo_id,
+            detail=reason,
+            repaired=not readonly,
+            repair=("would raise " if readonly else "raised ") + f"a {kind} alarm",
+            context={"seq": turn["seq"]},
+        )
+
+
 def check_spans_reach_the_status(store: ProjectStore) -> Iterator[Violation]:
-    """INV-SPAN-BEHIND — a status write with no span is repaired where it is found (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md)"""
+    """INV-SPAN-BEHIND repairs a status with no span, INV-RECORD-BEHIND reports a span with no event (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md §2d3)"""
     readonly = getattr(store, "readonly", False)
     # Hidden too: hiding takes an order out of the listings
     for wo in store.list_work_orders(include_hidden=True):
         spans = store.state_spans(wo["id"])
+        # Before the repair below, whose approximate span this pairing skips anyway
+        yield from _record_behind(store, wo["id"], spans)
         tail = str(spans[-1]["to_status"]) if spans else ""
         status = str(wo["status"] or "")
         # No spans at all is `_backfill_wo_spans`' case, not this one
@@ -1062,6 +1203,8 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
             # The budget was cleared and the tick that moves the status has not run
             return "budget spent — cleared, resuming shortly"
         line = f"budget spent — ${cap.spent_usd:.2f} of ${cap.cap_usd:.2f}"
+        if 0 < cap.remaining_usd < budget.LAUNCH_FLOOR_USD:
+            line += " (under one call left)"
         if cap.source != "feature":
             return line
         # `source == 'feature'` is the ALLOCATOR's word for "the family's cap" and says nothing about the...
@@ -1927,10 +2070,14 @@ def check_validation_progresses(store: ProjectStore) -> Iterator[Violation]:
             if float(latest["ts"] or 0) > cutoff:
                 continue  # late, not abandoned
             age = int(now - float(latest["ts"] or 0))
-            store.close_validation_round(
-                int(latest["id"]), "failed",
-                f"the review was interrupted — round {latest['round']} was left open "
-                f"with nothing running it for {age}s")
+            reason = (f"the review was interrupted — round {latest['round']} was left "
+                      f"open with nothing running it for {age}s")
+            store.close_validation_round(int(latest["id"]), "failed", reason)
+            # The outcome on the timeline too, where `wo show` and Neo read it (INV-RECORD-BEHIND)
+            if id_col == "wo_id":
+                store.add_event(unit_id, "validation_failed",
+                                {"round": latest["round"], "round_id": latest["id"],
+                                 "cause": STRANDED_CAUSE, "reason": reason})
             yield Violation(
                 invariant="INV-VALIDATION-STRANDED",
                 wo_id=unit_id if id_col == "wo_id" else None,
@@ -2055,7 +2202,7 @@ def check_feature_failures_are_real(store: ProjectStore) -> Iterator[Violation]:
             "SELECT id, attention_reason FROM feature_orders WHERE status='failed'"
     ).fetchall():
         fo_id = row["id"]
-        children = store.feature_children(fo_id)
+        children = store.feature_children(fo_id, kinds=WORKER_CHILDREN)
         if not children or dead_feature_children(store, children):
             continue
         store.set_feature_status(fo_id, "executing")
@@ -2079,6 +2226,88 @@ def check_feature_failures_are_real(store: ProjectStore) -> Iterator[Violation]:
                      "stale_reason": row["attention_reason"],
                      "manager_revived": revived["id"] if revived else None},
         )
+
+
+INV_FEATURE_ORPHAN_CHILD = "INV-FEATURE-ORPHAN-CHILD"
+
+#: The marker that says a parent's flag was raised by INV-FEATURE-ORPHAN-CHILD
+ORPHAN_CHILD_MARK = " — nothing re-derives a settled order, so it is raised here: "
+
+#: What a SETTLED parent says when a child under it still needs the user
+ORPHAN_CHILD_BLOCKER = ("{wo_id} still needs you, and its {noun} {fo_id} is {status}"
+                        + ORPHAN_CHILD_MARK + "{reason}{more}")
+
+#: What each `feature_orders` kind is called on that line
+ORPHAN_PARENT_NOUN = {"feature": "feature order", "improvement": "improvement order",
+                      "investigation": "investigation"}
+
+
+def _orphaned_children(store: ProjectStore) -> dict[str, list[dict[str, Any]]]:
+    """Every settled parent's children that are live or flagged, unanswered for, by parent"""
+    from .project_store import TERMINAL_STATUSES as SETTLED_STATUSES
+
+    rows = db.rows_to_dicts(store.conn.execute(
+        "SELECT w.* FROM work_orders w JOIN feature_orders f ON w.parent_id=f.id "
+        f"WHERE f.status IN ({','.join('?' for _ in FO_TERMINAL_STATUSES)}) "
+        "AND w.kind != 'manager' AND w.hidden=0 ORDER BY w.created_at",
+        FO_TERMINAL_STATUSES).fetchall())
+    by_parent: dict[str, list[dict[str, Any]]] = {}
+    superseded: dict[str, set[str]] = {}
+    for wo in rows:
+        fo_id = str(wo["parent_id"])
+        live = wo["status"] not in SETTLED_STATUSES and not acknowledged(wo)
+        if not (wo["needs_attention"] or live):
+            continue
+        if fo_id not in superseded:
+            superseded[fo_id] = {s["wo_id"] for s in store.superseded_children(fo_id)}
+        if wo["id"] in superseded[fo_id]:
+            continue
+        by_parent.setdefault(fo_id, []).append(wo)
+    return by_parent
+
+
+def check_settled_parents_have_no_orphans(store: ProjectStore) -> Iterator[Violation]:
+    """INV-FEATURE-ORPHAN-CHILD — a settled feature"""
+    # Repaired on the tick, not behind --repair: a settled parent raises nothing ever again
+    readonly = getattr(store, "readonly", False)
+    orphans = _orphaned_children(store)
+    for fo_id, children in orphans.items():
+        fo = store.get_feature_order(fo_id)
+        first = children[0]
+        more = len(children) - 1
+        reason = ORPHAN_CHILD_BLOCKER.format(
+            wo_id=first["id"], noun=ORPHAN_PARENT_NOUN.get(fo.get("kind") or "feature",
+                                                          "order"),
+            fo_id=fo_id, status=fo["status"],
+            reason=(first.get("attention_reason") or "").strip()
+            or f"it is still `{first['status']}`",
+            more=f" (and {more} more child{'ren' if more != 1 else ''})" if more else "")
+        current = str(fo.get("attention_reason") or "")
+        if fo["needs_attention"] and ORPHAN_CHILD_MARK not in current:
+            continue  # it already asks for the user about something else: never overwrite that
+        if fo["needs_attention"] and current == reason:
+            continue  # raised on an earlier tick and still true
+        # The child's status and flag are left alone: settling it would discard whatever the flag was about
+        if not readonly:
+            store.flag_feature_attention(fo_id, reason)
+        yield Violation(
+            invariant=INV_FEATURE_ORPHAN_CHILD, subject_id=fo_id,
+            detail=(f"{fo_id} is `{fo['status']}` but {len(children)} child"
+                    f"{'ren' if len(children) != 1 else ''} under it "
+                    f"({', '.join(c['id'] for c in children)}) "
+                    f"{'are' if len(children) != 1 else 'is'} still live or flagged, "
+                    f"and nothing re-derives a settled order"),
+            repaired=True,
+            repair="raised on the parent with the child's reason; the child is untouched",
+            context={"fo_id": fo_id, "children": [c["id"] for c in children]},
+        )
+    # ...and the flag this check raised comes down once no child under that parent is owed
+    for fo in store.flagged_feature_orders():
+        if fo["id"] in orphans or ORPHAN_CHILD_MARK not in str(
+                fo.get("attention_reason") or ""):
+            continue
+        if not readonly:
+            store.clear_feature_attention(fo["id"])
 
 
 def _validation_timeout() -> int:
@@ -3323,12 +3552,16 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                    # and a `validating` row is invisible to all of them
     check_feature_failures_are_real,  # order-free: it reads and writes feature orders
                                    # only, which no work-order check looks at
+    check_settled_parents_have_no_orphans,  # after it: a reopened feature is no longer
+                                   # settled; it reads child flags and writes only the parent's
     check_neo_escalations_are_live,  # order-free: it writes to Neo's store only, and
                                    # touches no flag any other check reads
     check_proposed_remedies_are_live,  # after the flag checks: it RAISES a flag, and one
                                    # raised before them is read as phantom attention on an alarm `true_blockers` cannot re-derive
     check_undeclared_delivery,     # order-free: it raises a FINDING and touches no flag
                                    # and no status, so nothing else here reads its output
+    check_compactions_hold,        # after the flag checks: it RAISES a flag no blocker
+                                   # re-derives, like the cost alarms it shares a shape with
     check_spans_reach_the_status,  # order-free: it appends a span and changes no status
                                    # and nothing else here reads `wo_state_spans`
     check_envelopes_move,          # last: it delivers, and delivery changes work orders

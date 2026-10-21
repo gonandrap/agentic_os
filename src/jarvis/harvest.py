@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from . import background, branchproof, db, landing
+from .project_store import submission_artifacts
 
 log = logging.getLogger("jarvis.harvest")
 
@@ -43,7 +44,7 @@ def collect(store: Any, wo: dict[str, Any], turn: dict[str, Any], *,
     wo_id = str(wo["id"])
     seq = turn["seq"]
     worktree = landing.worktree_of(store.project_path, wo)
-    authored = landing.authored(worktree)
+    authored = landing.authored(worktree, submission_artifacts(wo))
     head = _head_at_launch(store, wo_id, seq)
     since, turn_commits = _turn_commits(worktree, head, authored)
     upstream, unpushed = _pushed(worktree)

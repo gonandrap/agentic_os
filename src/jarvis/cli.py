@@ -60,6 +60,22 @@ def _readable_conversation(detail: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+#: How many of a work order's newest events `jarvis wo show` renders by default
+WO_SHOW_EVENTS = 200
+
+
+def _readable_events(detail: dict[str, Any]) -> dict[str, Any]:
+    """The event counts as one sentence, and only when something was cut"""
+    row = dict(detail)
+    row.pop("events_shown", None)
+    hidden = row.pop("events_hidden", 0) or 0
+    if hidden:
+        row["events_hidden"] = (
+            f"{hidden} earlier event{'s' if hidden != 1 else ''} not shown — "
+            f"`jarvis wo show {row.get('id')} --events 0` renders them all")
+    return row
+
+
 def _readable_preconditions(detail: dict[str, Any]) -> dict[str, Any]:
     """The holds collapsed to one line each — §2.7"""
     row = dict(detail)
@@ -745,6 +761,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--project")
     s.add_argument("--debug", action="store_true",
                    help="include plumbing entries (message delivery, session hooks)")
+    s.add_argument("--events", type=int, default=WO_SHOW_EVENTS, metavar="N",
+                   help=f"how many of the NEWEST events the timeline renders (default "
+                        f"{WO_SHOW_EVENTS}); 0 renders every one")
 
     # §9.2 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md
     m = wo.add_parser("send", help="send feedback to the worker handling a work order — "
@@ -798,6 +817,10 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--feedback", default="",
                    help="your reasoning — teaches Neo, and on --reject is delivered "
                         "to the worker as guidance")
+    r.add_argument("--false-alarm", action="store_true",
+                   help="the high-stakes net was WRONG to hold these: record a defect "
+                        "in the net that fired (also read from 'false alarm' in "
+                        "--feedback)")
 
     x = wo.add_parser("cancel", help="cancel a work order")
     x.add_argument("wo_id")
@@ -1597,6 +1620,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                  "reopening)" if r.get("tripped") else ""))
     if st["attention"]:
         print(f"\n⚠ NEEDS YOUR ATTENTION ({len(st['attention'])}):")
+        print(f"   {ATTENTION_LIST_NOTE}")
         for a in st["attention"]:
             ident = a["wo_id"] or a.get("fo_id")
             print(f"  • [{a['project']}]{' ' + ident if ident else ''} {a['title']} "
@@ -1616,6 +1640,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     if st["inbox"]["unacked"]:
         print(f"\n📥 inbox: {st['inbox']['unacked']} unacked"
               f" ({st['inbox']['critical']} critical) — `jarvis inbox list`")
+        print(f"   {INBOX_LIST_NOTE}")
     neo = st.get("neo", {})
     if (neo.get("queued") or neo.get("unreviewed") or neo.get("escalated")
             or neo.get("failed")):
@@ -3268,7 +3293,10 @@ def cmd_wo(args: argparse.Namespace) -> int:
         name, path, wo = ops.find_work_order(args.wo_id, args.project)
         store = ProjectStore(path)
         try:
-            events = store.list_events(args.wo_id)
+            # THE NEWEST PAGE, and the cut said out loud (io-12b7d873)
+            events = store.list_events(args.wo_id, limit=args.events or None,
+                                       newest=True)
+            hidden = store.count_events(args.wo_id) - len(events)
             messages = store.list_messages(args.wo_id)
             detail = {
                 "project": name, **wo,
@@ -3279,6 +3307,9 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 "preconditions": ops.open_preconditions(store, wo),
                 # What has already been dismissed on this order, decoded
                 "seen_blockers": invariants.acknowledged(wo),
+                # Always present under `--json`: a quiet order and a cut one must read differently
+                "events_shown": len(events),
+                "events_hidden": hidden,
                 "timeline": build_timeline(wo, events, messages,
                                            include_debug=args.debug),
                 # What was said, in order, whoever spoke
@@ -3329,7 +3360,7 @@ def cmd_wo(args: argparse.Namespace) -> int:
             _readable_automerge(_readable_harvest(_readable_alarms(
                 _readable_time_in_state(_readable_rounds(_readable_issues(
                     _readable_self_evolution(_readable_preconditions(
-                        _readable_conversation(detail)))))))))))))
+                        _readable_events(_readable_conversation(detail))))))))))))))
                if not args.json else detail, args.json)
 
     elif args.wo_cmd == "send":
@@ -3351,7 +3382,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
                           evidence=args.evidence, abandon=args.abandon), args.json)
     elif args.wo_cmd == "review":
         _print(ops.review_work_order(args.wo_id, accept=not args.reject,
-                                     feedback=args.feedback), args.json)
+                                     feedback=args.feedback,
+                                     false_alarm=args.false_alarm), args.json)
     elif args.wo_cmd == "cancel":
         _print(ops.cancel(args.wo_id), args.json)
     elif args.wo_cmd == "done":
@@ -3797,6 +3829,10 @@ def cmd_investigate(args: argparse.Namespace) -> int:
                 print()
                 for line in verdicts.render_verdict(detail["verdict"]):
                     print(line)
+            if detail["assumptions"]:
+                print("\nthe investigator's calls (on record, for nobody's review):")
+                for a in detail["assumptions"]:
+                    print(f"  {a['n']}. {a['content']}")
 
     elif args.inv_cmd == "cancel":
         _print(ops.cancel_investigation_order(args.inv_id, args.project), args.json)
@@ -4562,8 +4598,34 @@ def _ms(value: int | None) -> str:
 def _objection_line(counts: dict[str, Any]) -> str:
     """What the OS's objections did, in one clause — `ops.neo_stats_report`'s figures"""
     return (f"{counts['sent']} sent · {counts['delivered']} delivered · "
+            f"{counts.get('acted_on', 0)} acted on · "
             f"{counts['withdrawn']} withdrawn ({counts['stopped']} the order stopped, "
-            f"{counts['handed_back']} handed to you, {counts['other']} other)")
+            f"{counts['handed_back']} handed to you, {counts['other']} other) · "
+            f"withdrawal rate {_pct(counts.get('withdrawal_rate'))}")
+
+
+def _print_assumption_rows(a: dict[str, Any]) -> None:
+    """THE HEADLINE: what happened to each assumption ROW (io-51469add)"""
+    rates = a["rates"]
+    print(f"ASSUMPTIONS — {a['rows']} row{'' if a['rows'] == 1 else 's'}, "
+          f"{a['settled']} settled; the rate your review list shows")
+    print(f"  decided by Neo      {a['neo_decided']:>4}  {_pct(rates['neo_decided'])}")
+    print(f"  escalated to you    {a['neo_escalated']:>4}  "
+          f"{_pct(rates['neo_escalated'])}  (Neo saw it and it came to you)")
+    print(f"  never reached Neo   {a['never_reached_neo']:>4}  "
+          f"{_pct(rates['never_reached_neo'])}  (held before any model call)")
+    for code, n in sorted(a["never_reached_by_hold"].items(), key=lambda kv: -kv[1]):
+        print(f"    {code:<22} {n:>4}")
+    u = a["unsettled"]
+    age = ("" if u["median_age_days"] is None else
+           f", median age {u['median_age_days']}d, oldest {u['max_age_days']}d")
+    print(f"  still unsettled     {u['count']:>4}  ({u['reached_neo']} reached Neo, "
+          f"{u['never_reached_neo']} never did{age}) — out of the rates")
+    d, net = a["dropped_rulings"], a["stakes_net"]
+    print(f"  dropped rulings     {d['total']:>4}  ({d['re_asked']} re-asked; the rest "
+          f"came to you)")
+    print(f"  high-stakes net     {net['held']:>4} held · {net['false_alarms']} you "
+          f"called a false alarm · {_pct(net['false_alarm_rate'])}")
 
 
 def _print_neo_stats(res: dict[str, Any], as_json: bool) -> None:
@@ -4573,10 +4635,14 @@ def _print_neo_stats(res: dict[str, Any], as_json: bool) -> None:
         return
     q = res["questions"]
     window = f", last {res['days']}d" if res["days"] else ", all time"
-    print(f"{res['scope']}{window} — {q['asked']} question"
+    print(f"{res['scope']}{window} — {res['assumptions']['rows']} assumption row"
+          f"{'' if res['assumptions']['rows'] == 1 else 's'}, {q['asked']} question"
           f"{'' if q['asked'] == 1 else 's'} asked\n")
+    _print_assumption_rows(res["assumptions"])
+    print(f"  objections          {_objection_line(res['objections'])}\n")
 
-    print("OUTCOMES")
+    print("QUESTIONS — plumbing telemetry")
+    print(f"  note: {res['questions_note']}")
     print(f"  answered by Neo   {q['answered']}")
     print(f"  escalated         {q['escalated']}")
     print(f"  unreachable       {q['failed']}  (Neo was never reached — NOT judged)")
@@ -4587,8 +4653,6 @@ def _print_neo_stats(res: dict[str, Any], as_json: bool) -> None:
     # Its own figure, never blended into the escalation rate: a crash is not a decision
     print(f"  unreachable rate  {_pct(q['unreachable_rate'])}  "
           f"(same denominator — NOT escalations)")
-    # ONE LINE, beside the rate — §5 of docs/superpowers/specs/2026-10-20-an-objection-is-...
-    print(f"  objections        {_objection_line(res['objections'])}")
 
     if res["by_day"]:
         print("\nTHE TREND — one line per day, newest last")
@@ -5060,13 +5124,20 @@ def cmd_bug(args: argparse.Namespace) -> int:
     return 0
 
 
+#: What each of the two lists IS and which command clears it
+ATTENTION_LIST_NOTE = ("derived from each order's state every tick; clears when the "
+                       "condition goes, or with `jarvis wo ack <id>`")
+INBOX_LIST_NOTE = ("a log of notifications; `jarvis inbox ack` marks them read — one "
+                   "raised with an attention flag lowers that flag too, unless a "
+                   "decision is pending")
+
+
 def cmd_inbox(args: argparse.Namespace) -> int:
     from .central_store import CentralStore
     central = CentralStore()
     try:
         if args.ib_cmd == "ack":
-            n = central.ack_inbox(args.inbox_id)
-            _print({"acked": n}, args.json)
+            _print(ops.ack_inbox(args.inbox_id), args.json)
         else:
             items = central.unacked_inbox()
             if args.json:

@@ -11,7 +11,7 @@ from typing import Any
 from . import claude_cli
 from .catalog import OsConfig, ProjectSpec
 from .central_store import CentralStore, KnowledgeBrief
-from .project_store import MAX_DISPATCH_ATTEMPTS, ProjectStore
+from .project_store import MAX_DISPATCH_ATTEMPTS, WORKER_CHILDREN, ProjectStore
 
 
 def _worker_path() -> str:
@@ -317,7 +317,7 @@ def feature_context(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] |
     if wo.get("kind") in ("analyst", "investigator"):
         # Neither has children: an improvement order and an investigation are one row plus one session
         return {"fo": fo, "children": []}
-    return {"fo": fo, "children": store.feature_children(fo["id"])}
+    return {"fo": fo, "children": store.feature_children(fo["id"], kinds=WORKER_CHILDREN)}
 
 
 def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
@@ -1225,6 +1225,7 @@ def dispatch_work_order(
                 level="warning",
                 wo_id=wo["id"],
                 source="jarvisd",
+                paired=True,
             )
         raise
 

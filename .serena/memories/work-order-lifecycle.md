@@ -314,3 +314,15 @@ requires anyway. `jarvis doctor` lists leftover `[WO …]` agents with no open w
 - `spawn_background()` / `list_background_sessions()` / `stop_session()` — injected-session
   tracking and the migration path only.
 - Deleted with the old transport: `job_result()`, `jobs_dir()`, `send_to_session()`.
+
+## How each kind settles — `project_store.WO_KIND_CONTRACTS`
+
+One row per `WO_KINDS` entry: `route` (`finish` = the join; `in_session` = its submission
+settles it via `ops.settle_in_session`, never stopping its own session; `idle` = manager),
+`artifact` (plan.json / report.json / verdict.json — excluded from `landing.authored`'s
+dirty set, so it is never "stranded work"), `submit` (its contract command), `lands_code`
+(drives `ops.unlanded_refusal`'s remedies) and `assumptions_reviewed` (False for the
+investigator: `invariants.reviewable_assumptions` keeps its calls out of `true_blockers`).
+`ops.close_out` REFUSES when `JARVIS_WO_ID` is its target — it kills the caller's session.
+`Daemon.settle_landed_investigators` retires flags/status on investigators whose verdict landed.
+`ProjectStore.feature_children(fo_id, kinds=…)` — `kinds` is required (`WORKER_CHILDREN` or None).

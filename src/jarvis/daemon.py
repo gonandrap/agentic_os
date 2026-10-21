@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import (background, bugreport, bus, claude_cli, db, fleet, holds, inspection,
-               notify, release, usage_meter, worker_session)
+               notify, release, usage_meter, verdicts, worker_session)
 from . import budget as budget_mod
 from . import steward
 from .catalog import Catalog, ProjectSpec, load_catalog
@@ -43,6 +43,7 @@ from .project_store import (
     VALIDATION_AUTH_CAUSE,
     VALIDATION_CI_CAUSE,
     VALIDATION_HELD_CAUSE,
+    WORKER_CHILDREN,
     ProjectStore,
     resume_spends_slot,
     validation_hold_until,
@@ -52,6 +53,10 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from .evidence import EvidencePacket
 
 log = logging.getLogger("jarvisd")
+
+#: The objection withdrawal rate's window, and the sample below which it is noise
+OBJECTION_ALARM_WINDOW_DAYS = 7
+OBJECTION_ALARM_MIN_SENT = 3
 
 #: Why an objection was taken back
 
@@ -861,6 +866,8 @@ class Daemon:
                 if reconcile:
                     # Immediately after the settlement above
                     self.clear_answered_investigations(project, store)
+                    # Beside it: the investigator's half of a settled investigation
+                    self.settle_landed_investigators(project, store)
                     # The agents roster holds ONLY the user's own sessions: workers are headless and never enter it
                     if sessions_by_project is not None:
                         self.track_injected_sessions(project, store, sessions_by_project)
@@ -878,6 +885,8 @@ class Daemon:
                     self.auto_review(project, store)
                     # Beside it, and AFTER it: the same tick that files an objection is the one that must take it back if...
                     self.withdraw_stale_objections(project, store)
+                    # After the withdrawals it counts, so a withdrawal this tick is in the rate
+                    self.check_objection_withdrawals(project, store)
                     # Immediately before the check that reads it
                     if sweep_landings:
                         self.refresh_landings(project, store)
@@ -1128,7 +1137,7 @@ class Daemon:
 
         # PASS TWO: THE CHILD SETTLEMENT, FEATURE-ONLY BY LIFECYCLE, `kind='feature'` WRITTEN OUT
         for fo in store.list_feature_orders(statuses=("executing",), kind="feature"):
-            children = store.feature_children(fo["id"])
+            children = store.feature_children(fo["id"], kinds=WORKER_CHILDREN)
             if not children:
                 continue  # released with nothing in it; nothing to settle against
             # A superseded child settles its feature NEITHER WAY
@@ -1343,7 +1352,8 @@ class Daemon:
                 if int(p.get("round") or 0) == n]
         covered = {wo_id for p in said if p.get("action") == "nudged"
                    for wo_id in (p.get("children") or ())}
-        landed = tuple(c["id"] for c in store.feature_children(fo_id)
+        landed = tuple(c["id"] for c in store.feature_children(fo_id,
+                                                               kinds=WORKER_CHILDREN)
                        if not c["superseded"] and float(c["created_at"]) > last["ts"])
         fresh = tuple(wo_id for wo_id in landed if wo_id not in covered)
         if fresh:
@@ -1542,6 +1552,7 @@ class Daemon:
                 body=n["body"],
                 level=n["level"],
                 wo_id=n["wo_id"],
+                paired_reason=n.get("paired_reason"),
             )
             store.mark_notification_routed(n["id"])
 
@@ -1598,6 +1609,11 @@ class Daemon:
                 continue
             except Exception:  # noqa: BLE001 — one work order must not stall the rest
                 log.exception("[%s] retry of %s failed", project.name, wo["id"])
+                continue
+            if turn is None:
+                # The paused compaction had landed: what is queued behind it goes out on delivery
+                log.info("[%s] %s: compaction turn %s had landed, nothing relaunched",
+                         project.name, wo["id"], pause.turn["seq"])
                 continue
             if state is not None:
                 state.launched()
@@ -4350,6 +4366,10 @@ class Daemon:
                 return
             if pause and not pause.exhausted:
                 return
+            if verdicts.verdict_landed(store, wo):
+                # ASKED OF THE WORK, NOT THE PROCESS: a turn that died after its verdict is no failure
+                self._settle_landed_investigator(store, wo, why="turn_ended_after_verdict")
+                return
             if wo["status"] != "failed":
                 # THE ORDER IS `failed` EITHER WAY
                 delivered = invariants_mod.has_delivered(store, wo)
@@ -4394,7 +4414,7 @@ class Daemon:
                              else f"{wo['id']} worker turn failed")
                     body = (turn.get("error") or "no error recorded")[:500]
                 store.add_notification(title=title, body=body[:500], level="warning",
-                                       wo_id=wo["id"], source="reconciler")
+                                       wo_id=wo["id"], source="reconciler", paired=True)
             return
 
         # The turn is done
@@ -4410,7 +4430,7 @@ class Daemon:
             store.add_event(wo["id"], VALIDATION_LANDED, {"round_id": deferred})
             return
         if fresh.get("result_summary"):
-            if store.pending_assumptions(wo["id"]):
+            if invariants_mod.reviewable_assumptions(store, fresh):
                 if fresh["status"] != "needs_review":
                     store.set_status(wo["id"], "needs_review")
                     store.flag_attention(wo["id"], "assumptions pending review")
@@ -4461,6 +4481,40 @@ class Daemon:
             store.set_status(wo["id"], "needs_review")
             store.flag_attention(wo["id"], IDLE_NO_FINISH_BLOCKER)
 
+    @staticmethod
+    def _settle_landed_investigator(store: ProjectStore, wo: dict[str, Any], *,
+                                    why: str) -> None:
+        """`completed`, flag down, no notification: what `submit_verdict` writes (io-d2a5dd69)"""
+        from . import ops as ops_mod
+
+        if wo["status"] in ("completed", "cancelled"):
+            # Settled already; `failed` is not, since a stored verdict means it did not fail
+            store.clear_attention(wo["id"])
+            return
+        ops_mod.settle_in_session(store, wo, "verdict_settled_by_reconciler",
+                                  payload={"why": why})
+
+    def settle_landed_investigators(self, project: ProjectSpec,
+                                    store: ProjectStore) -> None:
+        """Retire the status or flag a landed investigator still holds (io-d2a5dd69)"""
+        for fo in store.list_feature_orders(statuses=("completed",),
+                                            kind="investigation"):
+            if not fo.get("plan_wo_id"):
+                continue
+            try:
+                wo = store.get_work_order(fo["plan_wo_id"])
+            except KeyError:
+                continue
+            if wo["status"] == "completed" and not wo["needs_attention"]:
+                continue
+            if wo["status"] == "cancelled" and not wo["needs_attention"]:
+                continue
+            if not verdicts.verdict_landed(store, wo):
+                continue
+            self._settle_landed_investigator(store, wo, why="verdict_already_landed")
+            log.info("[%s] %s: investigator of %s settled on its stored verdict (was %s)",
+                     project.name, wo["id"], fo["id"], wo["status"])
+
     def _park_on_signin(self, store: ProjectStore, wo: dict[str, Any],
                         pause: worker_session.TurnPause,
                         turn: dict[str, Any]) -> None:
@@ -4475,7 +4529,7 @@ class Daemon:
             # The title names the failure rather than the fact that there was one: this is the line the user...
             title=f"{wo['id']} parked — Claude Code could not authenticate",
             body=(turn.get("error") or pause.message)[:500],
-            level="warning", wo_id=wo["id"], source="reconciler",
+            level="warning", wo_id=wo["id"], source="reconciler", paired=True,
         )
 
     # -- 6. pull requests parked on a human
@@ -5187,11 +5241,25 @@ class Daemon:
     def _stamp_objection_delivery(self, store: ProjectStore, msg_id: int) -> None:
         """An objection that actually went out is DELIVERED, stamped here and nowhere"""
         envelope = store.envelope_for_message(int(msg_id))
-        if not envelope or envelope["kind"] != "assumption_objection":
+        if envelope is None:
+            self._stamp_late_objection_delivery(store, msg_id)
+            return
+        if envelope["kind"] != "assumption_objection":
             return
         a = store.assumption_for_envelope(int(envelope["id"]))
         if a is not None and a.get("objection_delivered_ts") is None:
             store.mark_objection_delivered(int(a["id"]))
+
+    def _stamp_late_objection_delivery(self, store: ProjectStore, msg_id: int) -> None:
+        """An ordinary message that QUOTES an undelivered objection delivered it, late (io-ce566253)"""
+        from . import ops
+
+        msg = store.get_message(int(msg_id))
+        if not msg or msg.get("direction") != "user_to_agent":
+            return
+        for a in store.undelivered_objections(str(msg["wo_id"])):
+            if ops.objection_quoted_in(str(msg.get("content") or ""), a):
+                store.mark_objection_delivered(int(a["id"]), late_msg_id=int(msg_id))
 
     def withdraw_stale_objections(self, project: ProjectSpec,
                                   store: ProjectStore) -> None:
@@ -5209,6 +5277,29 @@ class Daemon:
             except Exception:  # noqa: BLE001 — one order must never stop the rest
                 log.exception("[%s] objections for %s could not be withdrawn",
                               project.name, wo_id)
+
+    def check_objection_withdrawals(self, project: ProjectSpec,
+                                    store: ProjectStore) -> None:
+        """Withdrawals past `objection_withdrawal_alarm_rate` are the feature failing: inbox, once a window"""
+        rate = float(getattr(project.validation, "objection_withdrawal_alarm_rate", 1.0))
+        if rate >= 1.0:
+            return
+        since = time.time() - OBJECTION_ALARM_WINDOW_DAYS * 86400
+        counts = store.objection_counts(since=since)
+        sent, withdrawn = int(counts["sent"]), int(counts["withdrawn"])
+        if sent < OBJECTION_ALARM_MIN_SENT or withdrawn / sent <= rate:
+            return
+        title = f"Most of the OS's early objections on {project.name} never reached a worker"
+        if self.central.inbox_titled_since(project.name, title, since):
+            return
+        self.central.add_inbox(
+            project=project.name, level="warning", title=title,
+            body=f"{withdrawn} of {sent} objections sent in the last "
+                 f"{OBJECTION_ALARM_WINDOW_DAYS} days were withdrawn undelivered — "
+                 f"above this project's validation.objection_withdrawal_alarm_rate "
+                 f"({rate:.0%}). Neo's early reading is not reaching the work.\n"
+                 f"Sent / delivered / acted on / withdrawn: jarvis neo stats --project "
+                 f"{project.name} --days {OBJECTION_ALARM_WINDOW_DAYS}")
 
     def _withdraw_objection(self, store: ProjectStore, wo_id: str, *,
                             assumption: dict[str, Any] | None = None,
@@ -5512,8 +5603,9 @@ class Daemon:
             # CONDITION 7 IS RE-RUN THE WAY THE ASK RAN IT
             stakes=self._settle_stakes(project, wo, numbered))
         if not still.armed:
-            # A CONFIRMATION DROPPED FOR A TRANSIENT REASON IS ASKED AGAIN (#833)
-            retry = confirming and still.code in autoreview.TRANSIENT_DROPS
+            # A RULING DROPPED FOR A TRANSIENT REASON IS ASKED AGAIN, on either pass (#833)
+            retry = (still.code in autoreview.TRANSIENT_DROPS
+                     and str(wo.get("status") or "") not in TERMINAL_STATUSES)
             if not retry:
                 # Escalated rather than left `answered`: the assumption is the user's again
                 neo_store.mark(q["id"], "escalated", reason=still.reason,
@@ -5524,15 +5616,18 @@ class Daemon:
                 "assumption_id": assumption["id"], "n": numbered.get("n"),
                 "reason": still.reason, "stakes": ruling.stakes,
                 "model": ruling.model, "neo_question_id": q["id"],
-                "overridden": False, "dropped": still.code})
+                "overridden": False, "dropped": still.code, "re_asked": retry})
             if retry:
                 # §4.3, IN THIS ORDER and after the record of the drop is complete
+                fresh = ("confirmation will be asked against the delivered result"
+                         if confirming else "ruling will be asked once it waits on a review")
                 neo_store.supersede(
-                    q["id"],
-                    f"SUPERSEDED — the OS dropped its own ruling: {still.reason}. A "
-                    f"fresh confirmation will be asked against the delivered result.",
-                    still.reason)
-                pstore.clear_assumption_confirmation(assumption["id"])
+                    q["id"], f"SUPERSEDED — the OS dropped its own ruling: "
+                             f"{still.reason}. A fresh {fresh}.", still.reason)
+                if confirming:
+                    pstore.clear_assumption_confirmation(assumption["id"])
+                else:
+                    pstore.clear_assumption_question(assumption["id"])
             log.info("auto-review dropped its ruling on assumption #%s of %s: %s",
                      numbered.get("n"), wo["id"], still.reason)
             return

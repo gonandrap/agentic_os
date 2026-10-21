@@ -393,8 +393,8 @@ def test_a_compaction_the_os_did_not_ask_for_still_reads_as_one(fleet, settle_tu
     """`hooks.note_compaction`'s own event carries no `ok`"""
     from jarvis import timeline
 
-    assert timeline._describe("compacted", {"trigger": "auto"}) == (
-        "Conversation compacted", "")
+    label, _ = timeline._describe("compacted", {"trigger": "auto"})
+    assert label == "Claude Code compacting the conversation (auto)"
 
 
 # -- the size when NO turn measured one (issue #885)
@@ -626,6 +626,10 @@ def _exhausted_cold(fleet, settle_turns) -> dict:
     _age_last_turn(store, wo["id"], usage.WRITE_TTL_SECONDS + 60)
     # Over the REAL floor: `ops._resume_after_budget` resolves the catalog from the file
     _big_context(store, wo["id"], 150_000)
+    # CUT SHORT by the ceiling: a budget top-up relaunches only a turn that FAILED (io-12b7d873)
+    store.conn.execute("UPDATE wo_turns SET state='failed', error=? WHERE id=?",
+                       ("Reached maximum budget ($1.0)",
+                        store.latest_turn(wo["id"])["id"]))
     store.set_status(wo["id"], budget_mod.EXHAUSTED)
     return store.get_work_order(wo["id"])
 

@@ -477,6 +477,24 @@ elif "-p" in argv and ("--session-id" in argv or "--resume" in argv):
     # is the delta — so a correct reader still sees 0.01 and 3,000 written tokens on
     # every turn of a ten-turn order, and a reader that sums the running total sees ten
     # different answers.
+    #
+    # A `/compact` LEAVES A BOUNDARY in the transcript, as the real CLI's does: the OS
+    # settles a compaction turn against it. FAKE_CLAUDE_COMPACT=noop is the turn that
+    # returned ok and summarised nothing (wo-299daf2e).
+    root = os.environ.get("JARVIS_TRANSCRIPT_ROOT")
+    if (prompt.strip() == "/compact" and root
+            and os.environ.get("FAKE_CLAUDE_COMPACT") != "noop"):
+        d = os.path.join(root, "-fake")
+        os.makedirs(d, exist_ok=True)
+        now = time.time()
+        stamp = (time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now))
+                 + f".{int(now % 1 * 1000):03d}Z")
+        with open(os.path.join(d, sid + ".jsonl"), "a") as f:
+            f.write(json.dumps({
+                "type": "system", "subtype": "compact_boundary", "timestamp": stamp,
+                "compactMetadata": {"trigger": "manual", "preTokens": 3003,
+                                    "postTokens": 900},
+            }) + "\n")
     print(json.dumps({
         "type": "result", "subtype": "success", "is_error": False,
         "session_id": sid, "result": f"final: {prompt[:60]}",
@@ -2021,6 +2039,13 @@ def fake_claude(tmp_path, monkeypatch):
         def turns_recover(self) -> None:
             """Undo `turns_fail`/`turns_rate_limited`/`turns_api_error`/ `turns_auth_failed`: turns succeed again"""
             monkeypatch.delenv("FAKE_CLAUDE_TURN", raising=False)
+
+        def compactions_summarise_nothing(self, on: bool = True) -> None:
+            """A `/compact` that returns ok and leaves no boundary — or, `on=False`, a real one again"""
+            if on:
+                monkeypatch.setenv("FAKE_CLAUDE_COMPACT", "noop")
+            else:
+                monkeypatch.delenv("FAKE_CLAUDE_COMPACT", raising=False)
 
         def hold_turns(self) -> Path:
             """Make subsequent turns block until the returned path is deleted"""

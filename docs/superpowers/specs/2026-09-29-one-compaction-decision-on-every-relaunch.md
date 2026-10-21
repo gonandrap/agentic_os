@@ -399,3 +399,31 @@ Plus `tests/test_relaunch_paths.py` per §3.7, and a `_nudge_after_compaction` c
 (src/jarvis/worker_session.py:1347-1349) while `_nudge` has an honest budget branch
 (src/jarvis/worker_session.py:1317). Add the matching branch — the budget-raise path is
 now a caller — and assert it does not tell the worker the transport failed.
+
+## 7. Amendment — the relaunch this spec exempted (io-12b7d873, 2026-10-21)
+
+Four production orders compacted twice with no worker turn between (wo-2d259874,
+wo-f302361d, wo-4beada49, wo-9f00e3b5), each second compaction summarising the first one's
+summary into something 2.4-2.9x larger. None came from a compaction DECISION: §3.7's
+discovery test exempted `worker_session.retry` as "the transport", and `retry` re-sent a
+COMPACT_TURN's `/compact` verbatim on the belief that summarising a summary is cheap and
+loses little. That belief is retracted here; it is the defect.
+
+* **`retry` is guarded, not exempt.** It re-sends `/compact` only when no compaction
+  boundary exists in the session after that turn's `started_at`
+  (`worker_session.compaction_landed`). When one does, the turn is settled `done`, a
+  `compaction_landed` event is written, and the message queued behind it is delivered on
+  the next tick. `tests/test_relaunch_paths.py` carries it in `GUARDED`, beside `EXEMPT`.
+* **A budget top-up decides from the latest turn's STATE (§3.5 amended).** Only a `failed`
+  turn is handed to `retry`; a `done` one has nothing to relaunch — the order goes back to
+  `running`, delivery sends whatever is queued and the settler settles the rest. A budget
+  refusal raised inside `_launch` writes no turn row, so `latest_turn` is the previous,
+  COMPLETED turn: relaunching it re-ran finished work of every kind.
+* **A compaction is settled against its post-condition.** `_record_compaction` stores what
+  the transcript says (`wo_turns.compaction_json`); ok with no boundary settles the turn
+  `failed` (`NOTHING_COMPACTED`, retried on the transient backoff), and `measured_context`
+  reads a compaction turn's achieved size, not its pre-compaction peak.
+* **Re-derived every tick.** `invariants.check_compactions_hold` raises one alarm per turn
+  for a compaction run on a conversation the previous turn had already compacted
+  (`compaction-chained`), and for a compaction settled `done` with no achieved size
+  (`compaction-unproven`), looking back `inspect.alarm_compaction_window_days`.

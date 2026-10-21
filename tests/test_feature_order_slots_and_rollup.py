@@ -103,7 +103,7 @@ def test_a_capped_feature_dispatches_only_that_many_children(started, store):
 
     started.tick()
 
-    running = [c for c in store.feature_children(fo["id"])
+    running = [c for c in store.feature_children(fo["id"], kinds=("worker",))
                if c["status"] in ("dispatching", "running")]
     assert len(running) == 2
     assert store.count_active_children(fo["id"]) == 2
@@ -112,7 +112,7 @@ def test_a_capped_feature_dispatches_only_that_many_children(started, store):
 def test_the_held_child_starts_when_a_sibling_finishes(started, store):
     """The cap holds a slot, it does not drop the work: nothing is written while a child waits"""
     fo = a_feature(started, store, "one", "two", "three", max_parallel=2)
-    one, two, three = store.feature_children(fo["id"])
+    one, two, three = store.feature_children(fo["id"], kinds=("worker",))
     store.set_status(one["id"], "running")
     store.set_status(two["id"], "running")
 
@@ -162,7 +162,7 @@ def test_a_capped_child_says_why_it_is_waiting(started, store):
     fo = a_feature(started, store, "one", "two", max_parallel=1)
     started.tick()
 
-    waiting = [c for c in store.feature_children(fo["id"]) if c["status"] == "pending"]
+    waiting = [c for c in store.feature_children(fo["id"], kinds=("worker",)) if c["status"] == "pending"]
     assert len(waiting) == 1
     label = invariants.status_label(store, waiting[0])
     assert label.startswith("pending — waiting for a slot in ")
@@ -183,7 +183,7 @@ def test_a_child_blocked_on_a_dependency_says_that_instead(started, store):
     started._neo_drain()
     started.tick()
 
-    api = store.feature_children(fo["id"])[1]
+    api = store.feature_children(fo["id"], kinds=("worker",))[1]
     assert invariants.status_label(store, api).startswith("pending — blocked by")
 
 
@@ -192,7 +192,7 @@ def test_a_capped_child_is_not_an_attention_item(started, store):
     fo = a_feature(started, store, "one", "two", max_parallel=1)
     started.tick()
 
-    waiting = [c for c in store.feature_children(fo["id"]) if c["status"] == "pending"]
+    waiting = [c for c in store.feature_children(fo["id"], kinds=("worker",)) if c["status"] == "pending"]
     assert waiting and not waiting[0]["needs_attention"]
 
 
@@ -217,7 +217,7 @@ def test_three_flagged_children_are_one_line(started, store):
     """The whole point"""
     fo = a_feature(started, store, "one", "two", "three")
     started.tick()
-    for c in store.feature_children(fo["id"]):
+    for c in store.feature_children(fo["id"], kinds=("worker",)):
         flag(store, c["id"], "assumption needs a decision")
 
     attention = ops.os_status()["attention"]
@@ -230,7 +230,7 @@ def test_the_line_says_how_many_and_which(started, store):
     """Collapsed, not hidden: the user has to be able to tell one flagged child from three without opening..."""
     fo = a_feature(started, store, "one", "two", "three")
     started.tick()
-    kids = store.feature_children(fo["id"])
+    kids = store.feature_children(fo["id"], kinds=("worker",))
     flag(store, kids[0]["id"], "assumption needs a decision")
 
     item = next(a for a in ops.os_status()["attention"] if a.get("fo_id") == fo["id"])
@@ -246,7 +246,7 @@ def test_the_line_carries_the_progress_count(started, store):
     """`3/6 done, 1 needs you` — the count is what tells the user whether this is a feature in trouble or..."""
     fo = a_feature(started, store, "one", "two", "three")
     started.tick()
-    kids = store.feature_children(fo["id"])
+    kids = store.feature_children(fo["id"], kinds=("worker",))
     store.set_status(kids[0]["id"], "completed")
     flag(store, kids[1]["id"], "assumption needs a decision")
 
@@ -269,7 +269,7 @@ def test_the_children_keep_their_own_flags(started, store):
     """Presentation only"""
     fo = a_feature(started, store, "one", "two")
     started.tick()
-    kids = store.feature_children(fo["id"])
+    kids = store.feature_children(fo["id"], kinds=("worker",))
     flag(store, kids[0]["id"], "assumption needs a decision")
 
     ops.os_status()
@@ -296,7 +296,7 @@ def test_a_failed_feature_reaches_the_strip_at_all(started, store):
     """`failed` is a SETTLED status, so a scan of the open statuses alone never sees it"""
     fo = a_feature(started, store, "one", "two")
     started.tick()
-    store.set_status(store.feature_children(fo["id"])[0]["id"], "failed")
+    store.set_status(store.feature_children(fo["id"], kinds=("worker",))[0]["id"], "failed")
     started.tick()  # settle_features marks the feature failed and flags it
 
     settled = store.get_feature_order(fo["id"])
@@ -309,7 +309,7 @@ def test_a_failed_feature_still_rolls_its_children_up(started, store):
     """A settled feature order has left the open statuses, but a `failed` one always has flagged children"""
     fo = a_feature(started, store, "one", "two")
     started.tick()
-    kids = store.feature_children(fo["id"])
+    kids = store.feature_children(fo["id"], kinds=("worker",))
     store.set_status(kids[0]["id"], "failed")
     flag(store, kids[0]["id"], "the worker died")  # what settle_work_order does
     started.tick()
@@ -327,7 +327,7 @@ def test_status_renders_a_feature_line_without_crashing(started, store, capsys):
 
     fo = a_feature(started, store, "one", "two")
     started.tick()
-    flag(store, store.feature_children(fo["id"])[0]["id"], "needs a decision")
+    flag(store, store.feature_children(fo["id"], kinds=("worker",))[0]["id"], "needs a decision")
 
     cli.main(["status"])
 
