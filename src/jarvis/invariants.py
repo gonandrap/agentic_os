@@ -73,7 +73,12 @@ def budget_blocker(store: ProjectStore, wo: dict[str, Any]) -> str:
     with _billing_store() as central:
         out = budget.launch_refusal(store, central, wo)
     # None means the accounting no longer says it is spent: the user raised the budget and the tick that...
-    return out.reason if out else BUDGET_SPENT_BLOCKER
+    if out is not None:
+        return out.reason
+    from .ops import budget_held_note, budget_resume_outstanding
+    if budget_resume_outstanding(store, wo["id"]):
+        return budget_held_note(wo["id"])
+    return BUDGET_SPENT_BLOCKER
 
 
 PR_CLOSED_BLOCKER = "pull request closed without merging — the work was not accepted"

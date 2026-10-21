@@ -864,6 +864,7 @@ class Daemon:
                 # Before delivery, not after: a work order whose window has just reopened must re-send the turn it...
                 if retry_paused:
                     self.retry_paused_turns(project, store, state)
+                self.resume_budget_held(project, store, state)
                 # Before delivery, not after: an envelope BECOMES a queued message
                 self.deliver_envelopes(project, store)
                 self.deliver_messages(project, store, state)
@@ -1677,6 +1678,28 @@ class Daemon:
                 # ONLY THE PAUSE'S OWN FLAG
                 if wo["attention_reason"] == invariants_mod.AUTH_BLOCKER:
                     store.clear_attention(wo["id"])
+
+    def resume_budget_held(self, project: ProjectSpec, store: ProjectStore,
+                           state: fleet.Fleet | None = None) -> None:
+        """Relaunch the raised-budget orders the user's pause held, once it lets them through (#1130)"""
+        from . import ops as ops_mod
+
+        for wo in store.list_work_orders(statuses=(budget_mod.EXHAUSTED,)):
+            if not ops_mod.budget_resume_outstanding(store, wo["id"]):
+                continue
+            pause = state.pause if state is not None else fleet.load_pause(self.central)
+            if pause is not None and not pause.allows(wo["id"]):
+                continue
+            try:
+                resumed, note = ops_mod.resume_raised_budget(
+                    store, self.central, project.name, wo, None)
+            except Exception:  # noqa: BLE001 — one work order must not stall the rest
+                log.exception("[%s] budget resume of %s failed", project.name, wo["id"])
+                continue
+            store.add_event(wo["id"], ops_mod.BUDGET_RESUME_RELEASED,
+                            {"resumed": resumed, "note": note})
+            log.info("[%s] %s: held budget resume released — %s",
+                     project.name, wo["id"], note)
 
     @staticmethod
     def _record_retry_held(store: ProjectStore, wo: dict, pause: Any, *,
