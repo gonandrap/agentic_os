@@ -120,6 +120,45 @@ def _held(code: str, reason: str, **fields: Any) -> Decision:
     return Decision(armed=False, code=code, reason=reason, **fields)
 
 
+def hold_payload(decision: Decision) -> dict[str, Any]:
+    """The `automerge_held` event payload, in ONE place.
+
+    `Daemon._note_automerge_held` writes through this and the tests build their rows
+    through it, so the payload's shape has a single definition: a hand-written key in a
+    test could otherwise go on passing after the writer renamed one. HERE rather than in
+    `daemon`, because every reader of these keys — `ops.automerge_state`,
+    `ops._automerge_hold_is_stale`, `ops.force_validation_state` — is reading this
+    module's `Decision` back out, and `daemon` is not importable from a pure test of it.
+    """
+    return {"code": decision.code, "reason": decision.reason,
+            "judged_sha": decision.judged_sha, "head_sha": decision.head_sha,
+            "round": decision.round_n}
+
+
+def hold_is_live(state: dict[str, Any] | None) -> bool:
+    """Is this `ops.automerge_state` row a hold the OS is making NOW, by the record?
+
+    The first two conditions of §3 of docs/superpowers/specs/2026-10-20-a-merge-held-for-
+    running-checks-is-not-stuck.md: the newest row is an `automerge_held` event and
+    `automerge_state` has not marked it stale. A STALE HOLD IS NO HOLD — the event is
+    immutable and `automerge_state` marks rather than drops it, so a marked one is history
+    (docs/superpowers/specs/2026-09-27-a-stale-merge-hold-is-not-the-reason-a-pr-is-not-
+    merging.md §2).
+
+    THE CODE IS DELIBERATELY NOT TESTED HERE. Its three callers each want a different
+    answer about it — `invariants.automerge_checks_note` admits `HELD_CHECKS_RUNNING`
+    alone, `ops.rule_facts` publishes whichever code it is, and `ops.force_validation_
+    state` diagnoses two of them — so folding a code test in would make this predicate
+    one caller's and the other two would keep their own copy.
+
+    HERE rather than in `ops` or `invariants`: `ops` imports `invariants`, so a home in
+    `ops` is unreachable from `invariants`, and the codes this row carries are this
+    module's vocabulary. `automerge` imports neither, so no cycle is created.
+    """
+    return bool(state) and state.get("kind") == "automerge_held" \
+        and not state.get("stale")
+
+
 def held_base_moved(catch_up: Any, pr: Any, base_oid: str = "") -> Decision:
     """The hold a refused catch-up produces"""
     from . import ops

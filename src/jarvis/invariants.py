@@ -1003,6 +1003,59 @@ def plan_hold_note(hold: dict[str, Any] | None) -> str:
             f"review — `jarvis wo review {hold['planner_id']}`)")
 
 
+#: §5 of docs/superpowers/specs/2026-10-20-a-merge-held-for-running-checks-is-not-stuck.md.
+#: NOT an attention reason and NOT a blocker, on `BASE_RED_NOTE`'s rule: nobody owes a
+#: decision while GitHub runs the checks.
+AUTOMERGE_CHECKS_NOTE = "waiting for GitHub's checks on {sha} — {reason}"
+
+#: The STORED reason, clamped to one line for the sweep's blocker column, which renders it
+#: verbatim. `ops.objection_response_line`'s bound and `autoreview._HINT_CHARS`, reused
+#: rather than chosen: those are the repo's precedent for exactly this problem, a
+#: model-written or GitHub-written sentence reaching a column. `automerge`'s reasons are
+#: built from a bounded vocabulary today, so this is a guard rather than a routine clip.
+AUTOMERGE_CHECKS_REASON_CHARS = 120
+
+
+def automerge_checks_note(state: dict[str, Any] | None) -> str:
+    """One sentence for a `checks_running` auto-merge hold, `""` for anything else.
+
+    ONE HOME, TWO READERS (kn-432d0f19), both in `ops.stuck_scan`: the blocker column and
+    the first conjunct of §2's exclusion predicate. Two functions over the same dict — one
+    deciding the exclusion, one wording the row — is how the sweep's blocker column came
+    to print "nothing the record can name" beside a `jarvis wo show` that named the hold.
+
+    §3's TRIPLE is performed here and its FOURTH condition is NOT: the hold is the newest
+    `ops.automerge_state` row, it is not marked stale (`automerge.hold_is_live`, shared
+    with the two other readers of the same dict), and its code is `HELD_CHECKS_RUNNING`
+    and nothing wider. The fourth condition — the project's base-health fact is fresh — is
+    `stuck_scan`'s, because the horizon is a project fact this helper may not reach and
+    because this sentence describes what the RECORD says rather than claiming the hold is
+    live now. So §5's inseparability is ONE-WAY: an exclusion always carries a named
+    blocker, a named blocker does not always exclude, and a held order whose fact has gone
+    stale is judged with its blocker column still saying what the record knows.
+
+    Takes the DICT rather than a store, on `plan_hold_note`'s shape: `ops` imports this
+    module. Derived, never fetched — `base_red_note`'s division, the poll wrote the hold
+    down and this reads it back.
+
+    NOT wired into `status_label`: that runs per row in every listing and pays ONE INDEXED
+    READ, while `automerge_state` costs up to six. The sweep is gated on
+    `waiting_pr_merge` and pays it once.
+    """
+    from .automerge import HELD_CHECKS_RUNNING, hold_is_live
+
+    if not hold_is_live(state) or state is None:
+        return ""
+    if str(state.get("code") or "") != HELD_CHECKS_RUNNING:
+        return ""
+    reason = " ".join(str(state.get("reason") or "").split())
+    if len(reason) > AUTOMERGE_CHECKS_REASON_CHARS:
+        reason = reason[:AUTOMERGE_CHECKS_REASON_CHARS - 1] + "…"
+    return AUTOMERGE_CHECKS_NOTE.format(
+        sha=str(state.get("head_sha") or "")[:10] or "the merge commit",
+        reason=reason or "no reason recorded")
+
+
 def status_label(store: ProjectStore, wo: dict[str, Any],
                  fleet: Fleet | None = None) -> str:
     """How this work order's status should read to a human"""

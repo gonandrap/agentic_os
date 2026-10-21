@@ -25,6 +25,9 @@ TURN_IN_FLIGHT_CAUSE = "a worker turn is in flight"
 #: §1 of docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md
 BASE_RED_CAUSE = "the default branch is red"
 
+#: §1 of docs/superpowers/specs/2026-10-20-a-merge-held-for-running-checks-is-not-stuck.md
+AUTOMERGE_CHECKS_CAUSE = "GitHub's checks on the merge commit"
+
 #: §2.1 of docs/superpowers/specs/2026-10-15-a-child-held-by-its-features-unratified-...
 PLAN_ASSUMPTION_CAUSE = "its feature's unratified plan"
 
@@ -46,6 +49,12 @@ EXCLUSION_REASON: Mapping[str, str] = {
                      "is broken and nothing merges onto a red base — it clears when the "
                      "base goes green, with no decision from you, so nothing is judged "
                      "while that is true"),
+    # §1: the default sentence is TRUE here and still says nothing a reader can act on
+    AUTOMERGE_CHECKS_CAUSE: ("the OS is holding this merge itself: GitHub has not finished "
+                             "running the checks on the commit the panel judged, and "
+                             "nothing merges a commit whose checks have not reported — it "
+                             "clears when they do, with no decision from you, so nothing "
+                             "is judged while that is true"),
     # §2.1: the shipped sentence is FALSE here
     PLAN_ASSUMPTION_CAUSE: ("this child is withheld from dispatch until its feature's "
                             "plan is ratified, and only you can ratify it — "

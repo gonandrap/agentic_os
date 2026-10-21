@@ -2768,6 +2768,29 @@ AUTOMERGE_EVENTS = ("automerge_merged", "automerge_decided", "automerge_proposed
 AUTOMERGE_TERMINAL = "automerge_merged"
 
 
+def automerge_checks_hold_spans(events: Iterable[Any], since: float, now: float,
+                                open_end: float) -> list[tuple[float, float]]:
+    """Every interval inside `[since, now]` the OS held a merge for GitHub's checks, each ending at the horizon a `gh` outage leaves (docs/superpowers/specs/2026-10-20-a-merge-held-for-running-checks-is-not-stuck.md §4)"""
+    from . import db
+    from .automerge import HELD_CHECKS_RUNNING
+
+    rows = sorted(events, key=lambda e: float(e["ts"]))
+    spans: list[tuple[float, float]] = []
+    for n, e in enumerate(rows):
+        if str(e["kind"]) != "automerge_held":
+            continue
+        payload = db.from_json(e["payload"], {}) or {}
+        if str(payload.get("code") or "") != HELD_CHECKS_RUNNING:
+            continue
+        nxt = next((r for r in rows[n + 1:] if str(r["kind"]) in AUTOMERGE_EVENTS), None)
+        # Nothing dates the end of an open hold but the horizon (§4)
+        ends = [open_end, now] + ([float(nxt["ts"])] if nxt is not None else [])
+        start, end = max(float(e["ts"]), since), min(ends)
+        if end > start:
+            spans.append((start, end))
+    return sorted(spans)
+
+
 def merge_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
     """What the surfaces say about this order's pull request landing, or None"""
     from . import db
@@ -4387,7 +4410,7 @@ def force_validation_state(store: ProjectStore, wo: dict[str, Any], *, project: 
     refusal = force_validation_refusal(store, wo, project=project, cfg=cfg)
     state: dict[str, Any] = dict(held or {})
     # A STALE HOLD IS TREATED AS NO HOLD (2026-09-27 spec §3): diagnosing from one would say the head...
-    if state.get("kind") != "automerge_held" or state.get("stale"):
+    if not automerge.hold_is_live(state):
         state = {}
     code = str(state.get("code") or "")
     judged = str(state.get("judged_sha") or "")
@@ -6455,6 +6478,16 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         # A MERGE THE OS IS ITSELF HOLDING ONTO A RED BASE IS NOT STUCK (§1 and §2 of... (docs/superpowers/specs/2026-10-15-a-merge-held-by-a-red-base-is-not-stuck.md)
         base_red_spans = (base_red_hold_spans(red_episodes, since, now, base_red_until)
                           if wo["status"] == "waiting_pr_merge" else [])
+        # A MERGE THE OS IS ITSELF HOLDING FOR GITHUB'S RUNNING CHECKS IS NOT STUCK (§2 and §3 of...
+        automerge_checks_held, automerge_spans, am_note = False, [], ""
+        if wo["status"] == "waiting_pr_merge":
+            am_note = invariants.automerge_checks_note(automerge_state(pstore, wo))
+            automerge_checks_held = bool(am_note) and base_red_until >= now
+            # `events_of_kind` takes ONE kind
+            automerge_spans = automerge_checks_hold_spans(
+                [e for k in AUTOMERGE_EVENTS
+                 for e in pstore.events_of_kind(wo["id"], k)],
+                since, now, base_red_until)
         # A CHILD HELD BY ITS FEATURE'S UNRATIFIED PLAN IS NOT STUCK (§2.3 and §2.4 of...
         plan_held, plan_spans = False, []
         if (wo["status"] == "pending" and wo.get("parent_id")
@@ -6474,7 +6507,7 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
         # The UNION and never the sum: a usage window can shut while CI runs (§4)
         discounted = holds.union_seconds(
             [(max(h.started, since), min(h.finish(now), now)) for h in usage]
-            + ci_spans + base_red_spans + plan_spans + budget_spans)
+            + ci_spans + base_red_spans + plan_spans + automerge_spans + budget_spans)
         # §2.2 of docs/superpowers/specs/2026-10-09-a-designed-wait-is-not-a-stall.md
         edges = (pstore.unfinished_dependencies(wo["id"])
                  if wo["status"] == "pending" else [])
@@ -6498,6 +6531,8 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                             else VALIDATION_CI_CAUSE if ci_held
                             else stuck.BASE_RED_CAUSE
                             if base_red and wo["status"] == "waiting_pr_merge"
+                            # AFTER the red base and BEFORE the dependency: both are `waiting_pr_merge`-only and CAN co-occur
+                            else stuck.AUTOMERGE_CHECKS_CAUSE if automerge_checks_held
                             # DOCUMENTARY, not load-bearing (§3 of the 2026-10-20 spec): a collision is impossible by...
                             else stuck.BUDGET_CAP_CAUSE
                             if wo["status"] == budget.EXHAUSTED
@@ -6518,6 +6553,8 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
                         else invariants.outstanding_children_note(pstore, wo)
                         or invariants.plan_hold_note(
                             pstore.plan_hold(wo) if plan_held else None)
+                        # §5 of the 2026-10-20 spec, after the plan hold, which is `pending`-only and cannot co-occur with it
+                        or am_note
                         or "nothing the record can name"),
             "status_label": invariants.status_label(pstore, wo),
             "since": since, "activity": durations.last_activity_ts or since,
@@ -8384,6 +8421,7 @@ def rule_facts(store: ProjectStore, wo: dict[str, Any], *, now: float,
                sources: frozenset[str] | set[str] | None = None,
                project: str = "", max_rounds: int | None = None) -> Any:
     """One work order's `rules.Facts`"""
+    from . import automerge
     from . import budget as budget_mod
     from . import holds as holds_mod
     from . import invariants as invariants_mod
@@ -8441,9 +8479,8 @@ def rule_facts(store: ProjectStore, wo: dict[str, Any], *, now: float,
     if need("automerge"):
         state = automerge_state(store, wo)
         # A STALE HOLD IS NOT A CLAIM ABOUT NOW
-        if (state and state.get("kind") == "automerge_held"
-                and not state.get("stale")):
-            put("automerge_code", str(state.get("code") or ""))
+        if automerge.hold_is_live(state):
+            put("automerge_code", str((state or {}).get("code") or ""))
 
     if need("waiting_on"):
         put("waiting_on", str(waiting_on(store, wo).get("what") or ""))
