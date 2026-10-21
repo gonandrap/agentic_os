@@ -2205,8 +2205,7 @@ def signin(tmp_path, monkeypatch):
             "expiresAt": int((time.time() + 3600) * 1000),
             "refreshTokenExpiresAt": int((time.time() + refresh_expires_in) * 1000),
         }}))
-        # ALWAYS stamped explicitly, including the `at=None` case, and from `time.time()`
-        # clock-exempt: class 4 — a real file mtime, coarse on 3.13 and not on 3.11/3.12
+        # clock-exempt: class 4 — a real file mtime, stamped explicitly including at=None
         stamp = time.time() if at is None else at
         os.utime(path, (stamp, stamp))
         return path
