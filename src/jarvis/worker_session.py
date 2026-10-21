@@ -405,7 +405,8 @@ def _launch(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any], promp
     # THE ONE POINT EVERY TURN PASSES THROUGH
     central = CentralStore()
     try:
-        out = budget.exhaustion(store, central, wo)
+        # The LAUNCH floor as well as the cap: a remainder under one call buys a turn that dies on its first...
+        out = budget.launch_refusal(store, central, wo)
         if out is not None:
             raise budget.BudgetExhausted(out)
         briefing = briefing_for(project, wo, store, central)

@@ -885,6 +885,10 @@ CREATE INDEX IF NOT EXISTS idx_preconditions_open ON preconditions(wo_id, status
 
 # Columns added after the first release
 ADDED_COLUMNS = {
+    "notifications": {
+        # The attention reason raised WITH this notification, carried to the central inbox (io-d2a5dd69)
+        "paired_reason": "TEXT",
+    },
     "work_orders": {
         # How many times launching this order's first turn has failed on the transport (docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §5.)
         "dispatch_attempts": "INTEGER NOT NULL DEFAULT 0",
@@ -3084,11 +3088,21 @@ class ProjectStore:
     # -- notifications outbox
 
     def add_notification(self, title: str, body: str = "", level: str = "info",
-                         wo_id: str | None = None, source: str = "") -> int:
+                         wo_id: str | None = None, source: str = "",
+                         paired: bool = False) -> int:
+        """`paired`: raised WITH the order's attention flag, so acking either settles both (io-d2a5dd69)"""
         assert level in ("info", "warning", "critical"), level
+        reason = None
+        if paired and wo_id:
+            row = self.conn.execute(
+                "SELECT needs_attention, attention_reason FROM work_orders WHERE id=?",
+                (wo_id,)).fetchone()
+            if row is not None and row["needs_attention"]:
+                reason = row["attention_reason"] or ""
         cur = self.conn.execute(
-            "INSERT INTO notifications (ts, level, title, body, wo_id, source) VALUES (?,?,?,?,?,?)",
-            (db.now(), level, title, body, wo_id, source),
+            "INSERT INTO notifications (ts, level, title, body, wo_id, source, paired_reason)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (db.now(), level, title, body, wo_id, source, reason),
         )
         return int(cur.lastrowid)
 

@@ -1523,6 +1523,7 @@ class Daemon:
                 body=n["body"],
                 level=n["level"],
                 wo_id=n["wo_id"],
+                paired_reason=n.get("paired_reason"),
             )
             store.mark_notification_routed(n["id"])
 
@@ -4359,7 +4360,7 @@ class Daemon:
                              else f"{wo['id']} worker turn failed")
                     body = (turn.get("error") or "no error recorded")[:500]
                 store.add_notification(title=title, body=body[:500], level="warning",
-                                       wo_id=wo["id"], source="reconciler")
+                                       wo_id=wo["id"], source="reconciler", paired=True)
             return
 
         # The turn is done
@@ -4440,7 +4441,7 @@ class Daemon:
             # The title names the failure rather than the fact that there was one: this is the line the user...
             title=f"{wo['id']} parked — Claude Code could not authenticate",
             body=(turn.get("error") or pause.message)[:500],
-            level="warning", wo_id=wo["id"], source="reconciler",
+            level="warning", wo_id=wo["id"], source="reconciler", paired=True,
         )
 
     # -- 6. pull requests parked on a human

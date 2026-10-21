@@ -1225,6 +1225,7 @@ def dispatch_work_order(
                 level="warning",
                 wo_id=wo["id"],
                 source="jarvisd",
+                paired=True,
             )
         raise
 

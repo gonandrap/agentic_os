@@ -671,7 +671,13 @@ UI smoke test that every route renders.
    and I had no measurement to pick the figure from. **Decided: ships at `2.00`, as
    `catalog.DEFAULT_INVESTIGATION_BUDGET_USD`, recorded as PENDING the user's answer on
    escalated Neo question 826.** It is one constant and one line to change when the
-   measurement arrives.
+   measurement arrives. **Superseded 2026-10-21 (io-b521d17b): the measurement arrived and
+   the default is `4.00`.** One investigator pass over 86 orders cost a median of $1.08
+   and a p90 of $1.73 on its first turn, so $2.00 was one pass and 3 of 3 investigations
+   it funded ended `budget_exhausted`. The default is now two p90 passes, rounded up, and
+   the measurement and its re-run query sit beside the constant. §2.8's cap stays. A
+   child that runs out on its first pass says so on its attention line, because that is
+   a sizing problem with the default, not an overrun.
 2. Whether `jarvis investigate verdict` should be spelled `jarvis investigate report` for
    symmetry with `jarvis io report`. **Decided in favour of `verdict`**, for the reason
    already given: the document is a verdict and not a report, and the two commands must

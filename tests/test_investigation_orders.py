@@ -12,7 +12,7 @@ from test_health_sweep import (HOUR, park_order, stuck_catalog,  # noqa: F401
                                stuck_os)
 
 from jarvis import claude_cli, cli, dispatch, hooks, ops, project_store, verdicts
-from jarvis.catalog import load_catalog
+from jarvis.catalog import DEFAULT_INVESTIGATION_BUDGET_USD, load_catalog
 from jarvis.daemon import Daemon
 from jarvis.project_store import ProjectStore
 from jarvis.testing import a_verdict
@@ -587,7 +587,7 @@ def test_an_investigation_is_an_inv_row_carrying_its_subject(started, store):
     assert json.loads(row["metadata"])[ops.SUBJECT_KEY] == subject
     assert row["status"] == "pending"
     # §2.8: the daemon is the caller, so an uncapped default would be an uncapped loop
-    assert row["budget_usd"] == pytest.approx(2.00)
+    assert row["budget_usd"] == pytest.approx(DEFAULT_INVESTIGATION_BUDGET_USD)
     shown = ops.show_investigation_order(inv["id"])
     assert shown["subject"] == subject
     assert shown["status_label"] == "pending"
@@ -823,7 +823,7 @@ def test_the_family_budget_works_on_an_inv_id_and_refuses_every_other(started, s
                                                                      improvement_order):
     """Obligation 5"""
     inv = ops.create_investigation_order("proj_a", _subject(store), WHY)
-    assert ops.investigation_order_budget(inv["id"])["budget_usd"] == pytest.approx(2.00)
+    assert ops.investigation_order_budget(inv["id"])["budget_usd"] == pytest.approx(DEFAULT_INVESTIGATION_BUDGET_USD)
     assert ops.set_investigation_budget(inv["id"], 9.0)["budget_usd"] == 9.0
     assert ops.investigation_order_budget(inv["id"])["budget_usd"] == 9.0
     assert ops.set_investigation_budget(inv["id"], None)["budget_usd"] is None
@@ -841,7 +841,7 @@ def test_the_cli_shows_and_sets_the_investigation_budget(started, store, capsys)
     """Obligation 5 through the surface the note names, word for word"""
     inv = ops.create_investigation_order("proj_a", _subject(store), WHY)
     assert cli.main(["investigate", "budget", inv["id"], "--json"]) == 0
-    assert json.loads(capsys.readouterr().out)["budget_usd"] == pytest.approx(2.00)
+    assert json.loads(capsys.readouterr().out)["budget_usd"] == pytest.approx(DEFAULT_INVESTIGATION_BUDGET_USD)
 
     assert cli.main(["investigate", "budget", inv["id"], "$12.50", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["budget_usd"] == 12.5
@@ -1333,9 +1333,10 @@ def test_the_burning_turn_judge_knows_what_an_investigator_is():
 def test_the_investigation_knobs_ship_cheap_and_are_one_edit():
     from jarvis import catalog
 
-    assert catalog.DEFAULT_INVESTIGATION_BUDGET_USD == 2.00
+    # Two measured passes (io-b521d17b): $2.00 equalled one, so it stopped every investigation it funded
+    assert catalog.DEFAULT_INVESTIGATION_BUDGET_USD == 4.00
     defaults = catalog.WorkerDefaults()
-    assert defaults.investigation_budget_usd == 2.00
+    assert defaults.investigation_budget_usd == 4.00
     assert defaults.investigation_model and defaults.investigation_effort
 
 
