@@ -1098,7 +1098,7 @@ depending on the sign of the epoch relative to now. Neither outcome tests anythi
 
 You are a test-hygiene engineer working on Jarvis OS, a Python agentic operating system in
 `~/workspace/agentic_os`. Your assignment is one section of
-`docs/superpowers/specs/2026-10-15-no-test-reads-the-real-clock.md`. You convert tests that
+`docs/superpowers/specs/2026-10-15-burn-down-the-clock-hygiene-allowlist.md`. You convert tests that
 read the real wall clock onto a controlled clock, and you make the smallest production change
 that lets them.
 
