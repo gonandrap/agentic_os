@@ -1,73 +1,4 @@
-"""Neo deciding a work order's pending assumptions, so the last human step can go.
-
-docs/superpowers/specs/2026-09-15-neo-decides-an-assumption.md. With `validation.enabled`
-and `validation.auto_merge` on, a work order already runs worker -> panel -> gate -> Neo ->
-merged with nobody typing anything. One stop is left: a PENDING ASSUMPTION. `jarvis wo
-review` is a decision the user owes, `wo ack` and `wo done` both refuse while one is
-outstanding, and `automerge.decide`'s condition 3 holds the merge on exactly that. So an
-order that recorded one assumption waits for a person however green everything else is.
-
-Built in the image of `automerge.py` deliberately, because it is the same class of thing —
-the OS taking an authority that was the user's — and a second vocabulary for it would be
-the defect: a per-project flag shipping false at both levels (`ValidationConfig.
-auto_review`), a PURE decision function with its conditions enumerated and unit-testable
-without a network, a thin daemon half that has the database and the model call, and a hold
-recorded once per (subject, reason) and rendered as one line the user can read.
-
-**AUTO-ACCEPTING EVERY ASSUMPTION IS NOT THE FEATURE; IT IS THE FAILURE MODE.** An
-assumption is a worker saying "I had to decide something you did not specify, and here is
-what I chose" — some are typography and some change the product. Four things hold that
-line, and each fails toward the user:
-
-* **THE VERDICT SPACE IS ACCEPT OR ESCALATE. There is no machine rejection** (Neo, question
-  301). Rejecting is not deciding an assumption, it is commissioning rework: it writes
-  guidance to a worker that finished long ago and restarts a turn on an order nobody asked
-  to reopen — the precise act `gates.apply_decision` fences `self_heal` and `auto_merge`
-  against. So "this assumption is wrong" is something the OS cannot defend accepting, and
-  it goes to the user WITH Neo's reading attached, which is strictly more than they get
-  today.
-* **TWO INDEPENDENT NETS CATCH A HIGH-STAKES ASSUMPTION**, and neither relies on the other.
-  `HIGH_STAKES` below is the code form of Neo's own escalation clause (`neo.PERSONA`:
-  production or live credentials, spending money, deleting or publishing, legal and people
-  matters), applied before a call is even made; `read_ruling` then force-escalates anything
-  Neo ITSELF did not classify as `stakes: routine`, whatever verdict it reached — an
-  ALLOWLIST (`ROUTINE_STAKES`), because a missing, empty or misspelled `stakes` read as a
-  blocklist means "no danger here" and switches the backstop off on the quietest possible
-  failure. A regex cannot read meaning and a model cannot be relied on to volunteer its own
-  doubt, or even to answer in the shape it was asked for. "Before any call" is
-  a claim about the TEXT, so `sibling_line` applies the same net to the context list: an
-  assumption held back for naming a credential must not arrive in the prompt for the
-  routine one beside it.
-* **ONE QUESTION PER ASSUMPTION**, never a batch verdict over a list. A list invites one
-  judgement over the easiest member of it.
-* **THE RECORD SAYS THE OS DECIDED IT**, with the reason, the model and the config version
-  in force (`assumptions.decided_by`, and §4). `jarvis wo show` must never present a
-  machine decision as the user's.
-
-**THE MID-RUN CASE IS JUDGED TOO, AND A MID-RUN VERDICT SETTLES NOTHING.**
-docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-runs.md
-reverses one ruling that used to be in print here: that an assumption recorded mid-run is
-not judged at all. The argument for it — a reviewer would be ruling on an INTENTION, with
-no result summary and no diff — is not overturned, it is answered. `decide_early` arms a
-SECOND pass over `running` orders whose verdict is written to the `provisional_*` columns
-and to nothing else: `assumptions.status` stays `pending`, `ops.accept_assumption` is not
-called, and every caller that reads a pending assumption reads one. What the early pass
-buys is the one thing a verdict on an intention is good for — the worker learns while it
-can still act on it. The settle is still `decide`'s, still at `needs_review`, and a
-provisional approval is re-asked against the diff before it settles (§7).
-
-So the two functions fail in opposite directions and that is why there are two: a wrong
-`decide_early` spends a model call and tells a worker something, a wrong `decide` settles a
-decision that was the user's. **`decide`'s condition 2 is therefore never relaxed** — it is
-the only guard on `ops.accept_assumption` -> `ops.land_when_cleared`, and a running work
-order that got past it would LAND.
-
-The interaction with auto-merge is the whole point and it needs no code: once the
-assumptions are settled they are not pending, so `automerge.decide`'s condition 3 passes on
-its own. That condition is NOT weakened — it still holds on a genuinely pending assumption,
-and the redundancy is the argument of
-docs/superpowers/specs/2026-09-13-two-gates-not-a-chain.md.
-"""
+"""Neo deciding a work order's pending assumptions, so the last human step can go (docs/superpowers/specs/2026-09-15-neo-decides-an-assumption.md)"""
 
 from __future__ import annotations
 
@@ -87,81 +18,41 @@ from .stakes import Stakes
 
 log = logging.getLogger(__name__)
 
-#: The Neo question kind. `neo_store.Q_KINDS` carries the full list — adding one is SEVEN
-#: edits, not one (kn-4edb0eb7, which corrects kn-9b18a8eb's four). The four everyone
-#: finds: this constant, a `deliver()` branch in `Daemon._neo_drain`,
-#: `ops._neo_attention`'s filter and `invariants.check_neo_escalations_are_live`'s. The
-#: three that bit this work order, all of them user-facing ANSWER paths that end in
-#: `queue_message` and so can reopen a finished work order: `ops.neo_answer_escalated`,
-#: `answer_form` in `ui/templates/_question.html`, and `ops.neo_review`'s `--correct`
-#: tail. All seven are done for this kind; see the comment at `Q_KINDS`.
+#: The Neo question kind
 QUESTION_KIND = "assumption"
 
-#: A question id the assumption's own text names — `Neo question 887`, `question 887`,
-#: `Q887`, `Neo 887`, every form seen in the field. Bounded to six digits so a commit-hash
-#: fragment or a line count cannot become an id.
+#: A question id the assumption's own text names
 _CITED_QUESTION_RE = re.compile(
     r"\b(?:neo\s+question|question|neo|q)\s*#?\s*(\d{1,6})\b", re.IGNORECASE)
 
-#: How many cited ids one packet quotes. A reviewer packet is not a bibliography, and
-#: `content` naming six question ids is a different problem.
+#: How many cited ids one packet quotes
 _CITED_LIMIT = 5
 
-#: How many answered rows the record PULLS (spec §3). Not a second policy: the character
-#: cap binds first at any sane `decision_record_chars`, and this only stops a very old
-#: order loading thousands of rows into memory. Rows it cuts are counted in the same
-#: omission line, so no ruling is ever withheld in silence.
+#: How many answered rows the record PULLS (spec §3)
 _ANSWERED_ROWS = 200
 
-#: `assumptions.decided_by` for a verdict this module reached. Spelled through
-#: `project_store.ASSUMPTION_DECIDER_OS` at its call sites; named here for
-#: `automerge.GATE_KIND`'s reason.
+#: `assumptions.decided_by` for a verdict this module reached
 DECIDER = "neo"
 
 STAKES_ROUTINE = "routine"
 STAKES_HIGH = "high"
-#: What the record calls a `stakes` the reviewer never gave. Not `routine`: the absence of
-#: a warning is not a warning's absence, and writing `routine` into the row would put a
-#: judgement in Neo's mouth that it did not make.
+#: What the record calls a `stakes` the reviewer never gave
 STAKES_UNCLASSIFIED = "unclassified"
 
-#: **AN ALLOWLIST, NOT A BLOCKLIST, AND THAT IS THE WHOLE POINT** (kn-32434cef's shape).
-#: The one `stakes` value that leaves an acceptance standing. Everything else — the field
-#: absent, empty, misspelled, truncated by `neo._validate_verdict`'s 20-char cap, or a
-#: word nobody anticipated — is treated as high and escalates.
-#:
-#: Written as a blocklist (`== "high"`) the second net FAILED OPEN: the single most likely
-#: malformed reply is one that simply omits the key, and that parsed cleanly, read as
-#: routine and was accepted with the backstop silently off. A net whose default is "no
-#: danger here" is not a net. The cost of the allowlist is an escalation the user was
-#: going to handle anyway; the cost of the blocklist is a decision made in their name with
-#: no backstop at all — the asymmetry the module docstring's "every row fails toward the
-#: user" rests on.
-#:
-#: Exactly one entry, deliberately: `routine` is the word `ASSUMPTION_REVIEWER_PERSONA`
-#: asks for. If a model spells it otherwise the escalation reason SAYS so, so the fix is a
-#: visible persona edit rather than a quiet widening of this set.
+#: **AN ALLOWLIST, NOT A BLOCKLIST, AND THAT IS THE WHOLE POINT** (kn-32434cef's shape)
 ROUTINE_STAKES = frozenset({STAKES_ROUTINE})
 
-#: WHY THE OS DID NOT DECIDE THIS ASSUMPTION, as a stable token. The dedupe in
-#: `Daemon.auto_review` keys on (assumption, this), so one work order records each
-#: distinct reason once instead of every reconcile tick — and a hold that CHANGES is still
-#: recorded, which keying on the assumption alone would lose.
+#: WHY THE OS DID NOT DECIDE THIS ASSUMPTION, as a stable token
 HELD_DISABLED = "disabled"
 HELD_STATUS = "status"
 HELD_SETTLED = "settled"
 HELD_PANEL_GAVE_UP = "panel_gave_up"
 HELD_REFUSAL_UNANSWERED = "refusal_unanswered"
 
-#: The two sentences that code renders, and which one depends on whether anything moved.
-#: Spec §2c of
-#: docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md: the
-#: first is FALSE on wo-dbea82cf, where the worker pushed three commits and never ran
-#: `jarvis wo finish`. Neither carries a count, a sha or an elapsed time — `ack_attention`
-#: stores this verbatim and INV-ATTENTION-REASON compares it (kn-681db233 point 3).
+#: The two sentences that code renders, and which one depends on whether anything moved (docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md)
 REFUSAL_UNANSWERED_REASON = ("you refused an assumption on this work order and the "
                              "worker has not delivered again since")
-#: Issue #975: the held reason a user reads must end in something they can type.
+#: Issue #975: the held reason a user reads must end in something they can type
 REFUSAL_UNDECLARED_REASON = ("you refused an assumption on this work order, and the "
                              "worker has pushed commits since without running `jarvis "
                              "wo finish` — the OS has asked it to declare them; you can "
@@ -169,118 +60,55 @@ REFUSAL_UNDECLARED_REASON = ("you refused an assumption on this work order, and 
                              "validation force` to judge the pull request as it stands")
 HELD_ASKED = "asked"
 HELD_HIGH_STAKES = "high_stakes"
-#: What the RUNNING pass needs and the parked one cannot reach: an assumption this pass
-#: has already formed a verdict on. Its own token rather than `HELD_SETTLED`, because
-#: `settled` is a fact about the user's decision and this one is explicitly not
-#: (`provisional_verdict` settles nothing — §4.1 of the 2026-09-23 spec).
+#: What the RUNNING pass needs and the parked one cannot reach: an assumption this pass has already...
 HELD_JUDGED = "judged_early"
 
-#: The confirmation pass's own five (spec §7), beside the seven `decide` already has.
-#: `unjudged` and `objected` mean there is nothing to confirm — an early `object`
-#: approved nothing, so no second call is spent on one and the user decides it;
-#: `confirming` is the question already filed; `objection_in_flight` means NOT YET and is
-#: retried next tick; `evidence_secret` is `decide_evidence`'s, over BOTH texts the
-#: question would carry — the result summary and the assumption's own sentence
-#: (docs/superpowers/specs/2026-10-14-neo-never-reads-a-diff.md).
-#:
-#: FOUR OF THE FIVE REACH THE RECORD, and which ones is not arbitrary (kn-22ba6087: a
-#: guard that returns early must still record why). `objected`, `unjudged`,
-#: `objection_in_flight` and `evidence_secret` are all facts about a row the OS LOOKED AT
-#: and did not act on, and `objection_in_flight` and `evidence_secret` most of all —
-#: without the line there is nothing on the record saying why an assumption the feature
-#: was switched on for is still sitting with the user. `confirming` is the only one
-#: suppressed, on `asked`'s list in `Daemon._note_autoreview_held` and for `asked`'s
-#: reason: the question IS filed, which is the pass working.
+#: The confirmation pass's own five (spec §7), beside the seven `decide` already has (docs/superpowers/specs/2026-10-14-neo-never-reads-a-diff.md)
 HELD_UNJUDGED = "unjudged"
 HELD_OBJECTED = "objected"
 HELD_CONFIRMING = "confirming"
 HELD_OBJECTION_IN_FLIGHT = "objection_in_flight"
 HELD_EVIDENCE_SECRET = "evidence_secret"
 
-#: docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-hold-an-assumption-
-#: for-ever.md §5 and §6. `round_open` is `decide_confirm`'s alone — the confirmation
-#: judges the DELIVERED RESULT, so a round the panel has not finished may be about to send
-#: that result back (§5.2, and the ASK pass keeps its licence to arm on a pending round).
-#: `confirm_spent` is `confirming` SPLIT: one code with a conditional suppression would
-#: make `daemon._holds_not_recorded`'s answer depend on state it cannot see. The live one
-#: stays suppressed, the spent one is VISIBLE — it is the user's, and nothing else on the
-#: record says so.
+#: docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-hold-an-assumption- for-ever.md...
 HELD_ROUND_OPEN = "round_open"
 HELD_CONFIRM_SPENT = "confirm_spent"
 
-#: WHICH DROPPED CONFIRMATION MAY BE ASKED AGAIN — the settle site's allowlist (§4.1). A
-#: code is here when the drop is a fact that can clear with the user doing nothing AND
-#: says nothing about whether the assumption is theirs to decide. An ALLOWLIST, not
-#: "everything but the three that stay": a blocklist admits a new code the day somebody
-#: writes a new hold, and this set governs whether the OS spends another model call.
-#: `settled` (no reader — the drop site returns earlier) and `evidence_secret` (a
-#: statement that the row is the user's, and a second chance to copy a secret into the
-#: question store) were examined and refused.
+#: WHICH DROPPED CONFIRMATION MAY BE ASKED AGAIN — the settle site's allowlist (§4.1)
 TRANSIENT_DROPS = frozenset({HELD_STATUS, HELD_REFUSAL_UNANSWERED,
                              HELD_OBJECTION_IN_FLIGHT})
 
-#: A round's outcome that means the panel has NOT finished with it. `pending` is the
-#: column's default on an open round and `''` is a row that never got one.
+#: A round's outcome that means the panel has NOT finished with it
 _UNRESOLVED_OUTCOMES = ("", "pending")
 
-#: THE STATUS EACH PASS ACTS IN, and the conditions below read these rather than a literal
-#: of their own (2026-09-27-a-stale-merge-hold-is-not-the-reason-a-pr-is-not-merging.md §6).
-#: `ops._panel_hold_is_stale` reads `REVIEW_PASS_STATUSES` to decide when a recorded
-#: `HELD_STATUS` has stopped being true — the order is now in a state a pass acts in — so
-#: the two surfaces share the pair structurally and no second list can drift from it.
+#: THE STATUS EACH PASS ACTS IN, and the conditions below read these rather than a literal of their...
 REVIEW_PASS_STATUS = "needs_review"
 EARLY_PASS_STATUS = "running"
 REVIEW_PASS_STATUSES = (REVIEW_PASS_STATUS, EARLY_PASS_STATUS)
 
-#: `provisional_verdict` values §5 writes and this module reads back. Spelled here so
-#: this module stays pure — `project_store.PROVISIONAL_VERDICTS` is the same two words
-#: and asserts them at the write.
+#: `provisional_verdict` values §5 writes and this module reads back
 PROVISIONAL_ACCEPT = "accept"
 PROVISIONAL_OBJECT = "object"
 
-#: THE FIRST NET, and it is deliberately not a taste filter. Every entry is the code form
-#: of a clause `neo.PERSONA` already tells Neo to escalate on — production or live
-#: credentials, spending money, deleting or publishing anything, legal and people matters —
-#: so this is that rule applied one layer earlier rather than a second vocabulary for it.
-#:
-#: It is matched against the assumption's own text, before any model call, and a match
-#: HOLDS: the assumption stays pending and the work order stays exactly where it is today.
-#: So a false positive costs the user precisely what every assumption costs them now, and a
-#: false negative is the only expensive direction — which is why the list errs wide and why
-#: `read_ruling` is a second net behind it rather than the same one again.
-#:
-#: **EVERY ENTRY MATCHES AN ACT, NOT A WORD** (issue #713). `release`, `live`, `drop`,
-#: `migrate` and `schema` are everyday vocabulary in a repo that builds a release tool, so
-#: bare word-boundary patterns held a large share of ROUTINE assumptions — "on the next
-#: release", "words under 3 characters are dropped", "not verified against the live CLI" —
-#: and a net that holds the routine ones defeats the feature it guards. Erring wide is
-#: still the rule; erring wide on VOCABULARY is not, because it is indistinguishable from
-#: the net being off.
-#:
-#: Word boundaries on both sides: `\bkey\b` must not fire on "monkey", and a substring
-#: match would make the list unreadable as the rule it is meant to be.
-#: The data objects a destructive verb needs before it is an act rather than a word. ONE
-#: list, shared by the wide net's `drop` row and by every tightened destructive verb.
+#: THE FIRST NET, and it is deliberately not a taste filter (#713)
 _DATA_OBJECTS = (r"tables?|columns?|databases?|db|indexe?s?|rows?|records?|data|"
                  r"collections?|buckets?|volumes?")
-#: Up to two words may sit between the verb and its object, but not a preposition or a
-#: conjunction: "dropped from the record" and "deleted when the row is stale" are not acts.
+#: Up to two words may sit between the verb and its object
 _NOT_A_PREPOSITION = (r"(?:(?!from\b|in\b|into\b|out\b|off\b|on\b|to\b|by\b|for\b|at\b|"
                       r"when\b|during\b|because\b|so\b)\w+\s+){0,2}")
 
 _HS_CREDENTIAL = r"credential|secret|password|\bapi[ -]?key\b|\btoken\b|\bauth\b"
-# `live` only as a live THING; `production`/`prod` name it on their own.
+# `live` only as a live THING; `production`/`prod` name it on their own
 _HS_PRODUCTION = (r"\bproduction\b|\bprod\b"
                   r"|\blive\s+(?:credential|key|secret|token|data|database|db|"
                   r"environment|env|traffic|system|server|fleet|user|account|customer|"
                   r"instance|deployment|service)"
                   r"|\bgo(?:es|ing|ne)?\s+live\b")
-# `drop` only with a data object AFTER it — "dropped from the record" is not one.
+# `drop` only with a data object AFTER it — "dropped from the record" is not one
 _HS_DESTRUCTIVE = (r"\bdelet|\bdestroy|\btruncat|\birreversib|\bpurge"
                    r"|\bdrop(?:s|ped|ping)?\s+(?:(?:the|a|an|all|this|these|its)\s+)?"
                    + _NOT_A_PREPOSITION + rf"(?:{_DATA_OBJECTS})\b")
-# The noun `migration` IS the act. The verb needs its object, and `schema` needs a
-# verb: "migrate to the new helper" and "the schema of the reply" are neither.
+# The noun `migration` IS the act
 _HS_SCHEMA = (r"|\bmigrat(?:e|es|ed|ing)\s+(?:(?:the|a|an|all)\s+)?(?:\w+\s+){0,2}"
               r"(?:database|db|schema|tables?|data|rows?|users?|production|prod)\b"
               r"|\bschema\s+(?:change|migration|edit|rewrite)|\bchange\s+the\s+schema\b"
@@ -289,7 +117,7 @@ _HS_SCHEMA = (r"|\bmigrat(?:e|es|ed|ing)\s+(?:(?:the|a|an|all)\s+)?(?:\w+\s+){0,
               r"(?:a|the)\s+column\b")
 _HS_MIGRATION = r"\bmigrations?\b|\bbackfill" + _HS_SCHEMA
 _HS_MONEY = r"\bbill(ed|ing|s)?\b|\bprice|\bpricing\b|\binvoice|\bcharge[ds]?\b|\bspend"
-# Shipping something somewhere — not the noun "the next release".
+# Shipping something somewhere — not the noun "the next release"
 _HS_SHIPPING_TAIL = (r"|\brelease\w*\s+(?:\S+\s+){0,3}?to\s+(?:prod|production|users?|"
                      r"customers?|the\s+fleet|pypi|npm)\b"
                      r"|\b(?:ship|ships|shipped|shipping|push|pushes|pushed|pushing)\s+"
@@ -314,12 +142,7 @@ HIGH_STAKES = (
     _HS_BREAKING,
 )
 
-#: THE ONE CARVE-OUT, and it is a sense of a word rather than a word (Neo, question 562).
-#: `token` stays bare — "I hard-coded the token in settings.json" must still be held — but
-#: this repo MEASURES ITSELF IN TOKENS, so every assumption about a cache write or a
-#: prompt's size tripped the credential row. A match that lies entirely inside one of
-#: these spans is not a match. Only `token` has this problem; do not grow the list into a
-#: general excuse register.
+#: THE ONE CARVE-OUT, and it is a sense of a word rather than a word (Neo, question 562)
 HIGH_STAKES_SENSE_CARVE_OUTS = (
     r"\b(?:input|output|cached?|cache[ -](?:read|write)|prompt|completion|re-?write|"
     r"total|context|thinking)\s+tokens?\b",
@@ -328,84 +151,49 @@ HIGH_STAKES_SENSE_CARVE_OUTS = (
     r"\b\d+[km]?\s+tokens?\b",
 )
 
-# -- the tightened net (`validation.stakes_classifier: regex-tightened`) ---------------
+# -- the tightened net (`validation.stakes_classifier: regex-tightened`)
 
-#: THE TIGHTENED NET, and every row of it was derived from a MEASURED false positive.
-#:
-#: The A/B of §3.9 ran on 485 hand-labelled production assumptions. No model arm cleared
-#: the bar (recall >= 0.667 at precision > 0.140) and haiku answered the same row two ways
-#: on 7.5% of a repeat run, so the recommendation became a tightened regex instead
-#: (docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md §6-§7).
-#:
-#: Each row below replaces a WIDE row and names the class of false positives it removes;
-#: `evals/tools/score_stakes_regex.py` re-scores both nets and is the only place the
-#: corpus is read. THE WIDE NET IS UNCHANGED and stays the default, so this is an opt-in
-#: mode rather than a narrowing of what ships.
-#:
-#: **`production`/`prod` IS DELIBERATELY NOT TIGHTENED — a knowing asymmetry.** It carries
-#: 7 of the false positives, and tightening it to acts would clear wo-1ee46481#1, which is
-#: the true positive the USER themselves named: its text mentions production rather than
-#: acting on it. A rule that loses the one case the user pointed at is not worth 7 rows of
-#: precision.
+#: THE TIGHTENED NET, and every row of it was derived from a MEASURED false positive (docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md §6-)
 _HST_DESTRUCTIVE_VERBS = (r"delet(?:e|es|ed|ing)|destroy(?:s|ed|ing)?|"
                           r"truncat(?:e|es|ed|ing)|drop(?:s|ped|ping)?|"
                           r"wip(?:e|es|ed|ing)")
-#: 19 false positives, every one deleting CODE or a record about code — a test, an
-#: assertion, a line of markup, a method, dead code. `truncat` adds 5 more, all clipping
-#: text for display. So every destructive verb needs what `drop` already needed: a DATA
-#: object, or a live subject. `irreversib` and `purge` stay bare (no false positives).
+#: 19 false positives, every one deleting CODE or a record about code
 _HST_DESTRUCTIVE = (rf"\b(?:{_HST_DESTRUCTIVE_VERBS})\s+"
                     r"(?:(?:the|a|an|all|this|these|its|four|every|six)\s+)?"
                     + _NOT_A_PREPOSITION
                     + rf"(?:{_DATA_OBJECTS}|(?:live|production|prod)\s+\w+)\b"
                     r"|\birreversib|\bpurge")
-#: A currency amount, or money named as money. 14 false positives spent a ROUND, a SLOT, a
-#: WRITER, a CAP, a BUDGET, a concurrency slot — this repo's own units, not the user's.
+#: A currency amount, or money named as money. 14 false positives spent a ROUND
 _HST_MONEY_OBJECT = (r"(?:\$\s?[\d,]+(?:\.\d+)?|\b\d+(?:\.\d+)?\s*(?:usd|dollars?|"
                      r"cents?|eur|gbp)\b|\bdollars?\b|\busd\b|\bmoney\b|"
                      r"\breal\s+api\s+calls?\b)")
-#: `bill` is DROPPED, not narrowed: 6 false positives and zero high rows. In this repo it
-#: is the name of the cost report and its module (`bill.PAYLOAD_VERSION`, "the window's
-#: bill", "still being billed"). `invoice`, `charge`, `price` stay.
+#: `bill` is DROPPED, not narrowed: 6 false positives and zero high rows
 _HST_MONEY = (r"\bprice|\bpricing\b|\binvoice|\bcharge[ds]?\b"
               rf"|\bspen(?:d|ds|t|ding)\b[^.;]{{0,40}}?{_HST_MONEY_OBJECT}")
-#: 4 false positives are the ADDED_COLUMNS mechanism or a gap left open on purpose ("no
-#: migration", "would buy a migration and five store verbs"). The bare NOUN is not the act
-#: here: it must be RUN or APPLIED. The verb forms of the wide row are unchanged.
+#: 4 false positives are the ADDED_COLUMNS mechanism or a gap left open on purpose ("no migration"
 _HST_MIGRATION = (r"\b(?:run|runs|ran|running|appl(?:y|ies|ied|ying)|"
                   r"execut(?:e|es|ed|ing))\s+(?:(?:the|a|an|another|its|one)\s+)?"
                   r"(?:\w+\s+){0,2}(?:migrations?|backfill\w*)\b"
                   r"|\b(?:migrations?|backfill\w*)(?:\s+\w+){0,3}?\s+(?:was|were|is|are|"
                   r"be|been|gets?|got)\s+(?:\w+\s+){0,2}?(?:run|ran|applied|executed)\b"
                   + _HS_SCHEMA)
-#: `make/makes/making a release` is 1 false positive ("what makes a release verifiable")
-#: and no high rows: `cut` and `ship` are the verbs that ship.
+#: `make/makes/making a release` is 1 false positive ("what makes a release verifiable") and no high...
 _HST_SHIPPING = (r"\bpublish\w*\s+(?:\S+\s+){0,3}?to\b"
                  r"|\bdeploy\w*\s+(?:\S+\s+){0,3}?to\b"
                  r"|\b(?:cut|cuts|cutting|ship|ships|shipped|shipping)\s+"
                  r"(?:a|the|another)\s+release\b" + _HS_SHIPPING_TAIL)
-#: ADDITION 1 of 3, for 4 of the 6 rows the wide net MISSES: settling which version ships.
-#: A BARE DOTTED VERSION MUST NOT MATCH — this repo quotes tool versions constantly ("gh
-#: 2.86", "CC 2.1.282") and a bare match would be a worse false-positive class than the
-#: ones being removed. So each alternative carries the act: a bump, the word `version`, or
-#: a tag or release branch naming the number.
+#: ADDITION 1 of 3, for 4 of the 6 rows the wide net MISSES: settling which version ships
 _HST_VERSION = (r"\b(?:patch|minor|major)[\s-]?bump\w*"
                 r"|\b(?:patch|minor|major)[\s-]?bumps?\s+the\b"
                 r"|\bbump(?:s|ed|ing)?\s+(?:\S+\s+){0,3}?v?\d+\.\d+(?:\.\d+)?\b"
                 r"|\b(?:release\s+)?version\s+v?\d+\.\d+\.\d+\b"
                 r"|\b(?:tag|tags|tagged|tagging)\s+[\w./-]*\d+\.\d+\.\d+"
                 r"|\brelease/[\w.-]*\d+\.\d+\.\d+")
-#: ADDITION 2: moving a remote ref (`wo-29d99c67#3`, a force-push with a lease).
-#: `non-fast-forward` was in the brief and is NOT here: measured, it named a push being
-#: REJECTED as one ("my push was rejected as non-fast-forward, and a rebase would have
-#: rewritten commits already on the public remote") — a failure being handled, the same
-#: shape as the auth carve-out, and it bought no true positive.
+#: ADDITION 2: moving a remote ref (`wo-29d99c67#3`, a force-push with a lease)
 _HST_REMOTE_REF = (r"\bforce[- ]?push\w*|--force-with-lease|\bforce[- ]updat\w+"
                    r"|\b(?:updat|mov|repoint|push|reset)\w*\s+(?:only\s+)?"
                    r"(?:(?:the|a|its)\s+)?remote\s+(?:branch|ref|tag|head)\b")
-#: ADDITION 3: arming or disarming a privileged-action control (`wo-551f5e8c#1`,
-#: four live gate exemptions retracted). `exemption` may NOT stand bare — "the manager
-#: exemption in count_active" is a code-level exemption and would be a new false positive.
+#: ADDITION 3: arming or disarming a privileged-action control (`wo-551f5e8c#1`
 _HST_GATE_CONTROL = (r"\brule-retract\b"
                      r"|\bretract\w*\s+(?:\S+\s+){0,3}?(?:rules?|exemptions?)\b"
                      r"|\b(?:live|learned|gate)\s+exemptions?\b"
@@ -426,14 +214,7 @@ HIGH_STAKES_TIGHTENED = (
     _HST_GATE_CONTROL,
 )
 
-#: The tightened net's extra senses. SAME KIND AS `HIGH_STAKES_SENSE_CARVE_OUTS` and its
-#: docstring's rule still holds — not a general excuse register: the five `token` spans
-#: below are the measurement-and-parsing sense that list already carves (a single-token
-#: insertion, a zero-token row, a `FORCE_` marker, a token-efficiency request, a JSON
-#: token), and none of them is a credential. The other three are a word quoted as a
-#: keyword or used in its permission sense: `ON DELETE CASCADE` is SQL in prose, an auth
-#: FAILURE is one being handled or rendered rather than a credential touched, and "licence
-#: to ship a thin body" is permission, not licensing.
+#: The tightened net's extra senses
 HIGH_STAKES_TIGHTENED_CARVE_OUTS = HIGH_STAKES_SENSE_CARVE_OUTS + (
     r"\b(?:single|zero|one|two|multi|per|no)[- ]token\b",
     r"\btoken[- ]efficien\w*",
@@ -453,17 +234,7 @@ _CARVE_OUT_TIGHTENED_RE = re.compile("|".join(HIGH_STAKES_TIGHTENED_CARVE_OUTS),
 
 
 def high_stakes_marker(text: str, *, tightened: bool = False) -> str:
-    """The high-stakes phrase this assumption contains, or `''`. Pure, no model.
-
-    Returns the matched text rather than a boolean so the hold can SAY what it matched:
-    "held — 'production' is a word the OS does not rule on" is actionable, and "high
-    stakes" is not.
-
-    `tightened=False` is the SHIPPED net and every existing caller: one matcher, two
-    pattern sets, so the two nets can never drift apart in how a match is read or how a
-    carve-out is applied. `tightened=True` is `HIGH_STAKES_TIGHTENED`, reached only by
-    `validation.stakes_classifier: regex-tightened`.
-    """
+    """The high-stakes phrase this assumption contains, or `''`"""
     text = text or ""
     net = _HIGH_STAKES_TIGHTENED_RE if tightened else _HIGH_STAKES_RE
     carve = _CARVE_OUT_TIGHTENED_RE if tightened else _CARVE_OUT_RE
@@ -477,17 +248,7 @@ def high_stakes_marker(text: str, *, tightened: bool = False) -> str:
 
 
 def tightened_verdict(text: str) -> Stakes:
-    """The tightened net's answer in the CLASSIFIER's verdict type. Pure, no model.
-
-    `decide`'s condition 7 takes either `stakes=None` (run the wide net here) or a
-    `Stakes`, so mode `regex-tightened` needs no third code path in the decision table:
-    the daemon hands the tightened net's answer over in the same shape a model's would
-    arrive in. `model` says which net ruled, so a hold is never read as a model's ruling —
-    `parsed` is True because something DID rule, unlike the two classifier failure paths.
-
-    `category` stays empty: a regex match is a phrase, not one of `stakes.STAKES_CATEGORIES`,
-    and inventing one would put a category on the record that nothing decided.
-    """
+    """The tightened net's answer in the CLASSIFIER's verdict type"""
     marker = high_stakes_marker(text, tightened=True)
     if not marker:
         return Stakes(high=False, category="none", reason="", model="regex-tightened")
@@ -495,56 +256,24 @@ def tightened_verdict(text: str) -> Stakes:
                   reason=f"its text says {marker!r}", model="regex-tightened")
 
 
-# -- the second net's second gate: a diff the OS will not copy into a question ---------
+# -- the second net's second gate: a diff the OS will not copy into a question
 
-#: SECRET-SHAPED EVIDENCE, and it is deliberately NOT part of `HIGH_STAKES`.
-#:
-#: WHY IT EXISTS: `_confirm_question` interpolates the diff, the diff stat and the result
-#: summary, and `neo.ask` PERSISTS that text as a question row `/neo` and `jarvis neo
-#: list` display. A diff that adds a credential therefore lands in a store and on a
-#: surface the ask pass never put diff content on. kn-deef42ea — a redaction decision is
-#: also a filing decision: if the text may not travel, the row must not either, so the
-#: hold is the whole answer here and there is no withhold-and-file.
-#:
-#: **WHY IT IS NARROW WHERE `HIGH_STAKES` IS WIDE, AND THE DIRECTIONS ARE OPPOSITE.**
-#: `HIGH_STAKES` reads ONE ASSUMPTION'S SENTENCE, where a false positive costs the user a
-#: review action they were making anyway — so it errs wide. This reads A WHOLE DIFF OF
-#: THIS REPO, where a false positive holds the confirmation and the wide net would hold
-#: nearly every one: "credential", "production" and "delete" are in almost every change
-#: this codebase makes. That is the feature switched off, silently, which is the
-#: expensive direction here — and it is Neo's own reason (question 593) for refusing to
-#: run `high_stakes_marker` over the diff and ruling for this shape instead. There is no
-#: redaction in `evidence.py`, `validation.py` or `panel.py` to reuse: the panel sends
-#: full diffs to its seat prompts, so this rule is invented here rather than borrowed.
-#:
-#: Three shapes, and each is a SHAPE rather than a word: a line assigning a real-looking
-#: value to a secret-named thing, a key or auth block, and a path that only secrets live
-#: at.
+#: SECRET-SHAPED EVIDENCE, and it is deliberately NOT part of `HIGH_STAKES`
 SECRET_EVIDENCE = (
     r"-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----",
     r"\bssh-(?:rsa|dss|ed25519)\s+AAAA[0-9A-Za-z+/=]+",
-    # `["\']?` on BOTH sides of the colon and nowhere else: `"Authorization": "Bearer
-    # …"` is the header written as a JSON or dict entry, and the quote before the colon
-    # is the only reason the bare pattern missed it. Widening past the quote would start
-    # matching prose that merely says the word.
+    # `["\']?` on BOTH sides of the colon and nowhere else: `"Authorization": "Bearer …"` is the header...
     r"\bAuthorization[\"\']?\s*:\s*[\"\']?(?:Bearer|Basic|Token)\s+\S+",
 )
 
-#: What each of `SECRET_EVIDENCE`'s shapes is CALLED on the record. The marker is
-#: rendered on the timeline and on `jarvis wo show`, so it names the shape and never
-#: quotes the match — see `secret_marker`. The names say no more than the shape because
-#: the same scanner reads a result summary and an assumption sentence; WHICH of the two
-#: carried it is the hold's to say, in `decide_evidence`.
+#: What each of `SECRET_EVIDENCE`'s shapes is CALLED on the record
 SECRET_EVIDENCE_NAMES = (
     "a private key block",
     "an ssh key line",
     "an Authorization header value",
 )
 
-#: A VALUE THAT IS NOT A SECRET, however secret its name. The commonest added line in
-#: any repo is the one that names a credential without carrying one — an empty default, a
-#: type annotation, a read from the environment, a `changeme` in an example config — and
-#: holding on those would be the wide net by another route.
+#: A VALUE THAT IS NOT A SECRET, however secret its name
 SECRET_PLACEHOLDERS = (
     r"none|null|nil|nan|true|false|str|int|bool|x+|\.+|-+|_+",
     r"todo|tbd|fixme|changeme|change[-_]me|placeholder|redacted|dummy|fake|sample",
@@ -552,9 +281,7 @@ SECRET_PLACEHOLDERS = (
     r"your[-_].*|my[-_].*|some[-_].*|the[-_].*",
 )
 
-#: PATHS ONLY SECRETS LIVE AT. Matched on the stat and the diff HEADERS, never on prose:
-#: the path is evidence on its own, and reading the file to find out whether this `.env`
-#: really holds anything would be the same mistake one layer down.
+#: PATHS ONLY SECRETS LIVE AT
 SECRET_PATHS = (
     r"(?:^|/)\.env(?:\.[\w.-]+)?$",
     r"\.(?:pem|key|p12|pfx|jks|keystore)$",
@@ -565,35 +292,21 @@ SECRET_PATHS = (
     r"service[-_]account[\w-]*\.json$",
 )
 
-#: The words that make an assignment's LEFT SIDE a secret's name, matched against the
-#: identifier's PARTS rather than as substrings: `monkey` and `keyword` must not be a
-#: `key`, and `AWS_SECRET_ACCESS_KEY` and `apiKey` must both be one.
+#: The words that make an assignment's LEFT SIDE a secret's name
 SECRET_NAME_PARTS = frozenset({
     "key", "keys", "apikey", "accesskey", "privatekey", "secretkey", "seckey",
     "token", "tokens", "authtoken", "secret", "secrets", "clientsecret",
     "password", "passwd", "passphrase", "pwd", "credential", "credentials",
 })
 
-#: One line assigning something. Read over a line the CALLER has already vouched for —
-#: an added diff line with its `+` stripped, or a line of the result summary — because a
-#: removed secret (`-`) is the change doing the right thing and `+++ b/path` is a header.
-#:
-#: The name may be QUOTED, and that is the whole widening: `"api_key": "sk-live-…"` is
-#: the JSON and Python-dict shape, which is how an added credential is most often
-#: spelled, and the bare pattern could not match it. A quoted name is still an
-#: IDENTIFIER — same charset, same closing quote as the opening one, still the whole
-#: name up to the separator — so a regex literal, a comment or a sentence still never
-#: parses as one, and the VALUE test below is untouched: `"api_key": ""` and
-#: `"api_key": "changeme"` do not fire.
+#: One line assigning something
 _ASSIGNMENT_RE = re.compile(
     r"^[ \t]*(?:(?:export|set|const|let|var|readonly)[ \t]+)?"
     r"(?P<quote>[\"\']?)(?P<name>[A-Za-z_][A-Za-z0-9_.-]*)(?P=quote)"
     r"[ \t]*(?:=>|:=|=|:)[ \t]*"
     r"(?P<value>[^\r\n]*?)[ \t]*[,;]?[ \t]*$")
 
-#: The charset a credential is spelled in. Anything else — a space, a bracket, a call, a
-#: `+` concatenation — means the right side is an EXPRESSION, and an expression is not a
-#: value: `os.environ["API_KEY"]` names a secret and contains none.
+#: The charset a credential is spelled in
 _SECRET_VALUE_CHARS = re.compile(r"[A-Za-z0-9+/=._~-]+")
 
 _SECRET_EVIDENCE_RE = [re.compile(p, re.IGNORECASE) for p in SECRET_EVIDENCE]
@@ -608,7 +321,7 @@ def _names_a_secret(identifier: str) -> bool:
 
 
 def _secret_value(raw: str) -> bool:
-    """Is this assignment's right side a REAL-LOOKING credential? See `secret_marker`."""
+    """Is this assignment's right side a REAL-LOOKING credential?"""
     value = raw.strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
         value = value[1:-1].strip()
@@ -618,13 +331,12 @@ def _secret_value(raw: str) -> bool:
         return False
     has_digit = any(c.isdigit() for c in value)
     has_alpha = any(c.isalpha() for c in value)
-    # A digit beside letters, or sheer length. Neither alone: `evidence_secret` is this
-    # module's own constant and `2026-09-23` is a date, and both are added every week.
+    # A digit beside letters, or sheer length
     return (has_digit and has_alpha) or len(value) >= 20
 
 
 def _paths(stat: str, diff: str) -> list[str]:
-    """Every path the stat and the diff HEADERS name. Prose is not read."""
+    """Every path the stat and the diff HEADERS name"""
     found = [line.split("|")[0].strip() for line in (stat or "").splitlines()]
     for line in (diff or "").splitlines():
         if line.startswith(("--- ", "+++ ", "diff --git ", "rename to ", "copy to ")):
@@ -634,24 +346,7 @@ def _paths(stat: str, diff: str) -> list[str]:
 
 
 def secret_marker(stat: str, diff: str) -> str:
-    """The secret-shaped thing this evidence carries, NAMED and never quoted. Pure.
-
-    **THE RETURN VALUE IS RENDERED** — on the timeline, in the hold's reason and on
-    `jarvis wo show` — so it must never contain the match. Returning the matched text,
-    the way `high_stakes_marker` does over one sentence, would move the credential out of
-    the question store and into the event store, which is the same defect one table
-    along. So: the offending PATH (safe — it is a filename, and the user needs it to know
-    which change is being held), or a fixed phrase naming the SHAPE.
-
-    Three nets, cheapest first, and all three read ADDED lines only. A removed secret is
-    the change doing the right thing and holding on it would punish the one diff that
-    fixes the problem.
-
-    NO PRODUCTION CALLER REMAINS: the confirmation question carries no diff
-    (docs/superpowers/specs/2026-10-14-neo-never-reads-a-diff.md). Kept because it is
-    pure, costs nothing uncalled, and is the only thing here that knows the secret shapes
-    of a DIFF — the panel path has no redaction gate and is the obvious next caller.
-    """
+    """The secret-shaped thing this evidence carries, NAMED and never quoted (docs/superpowers/specs/2026-10-14-neo-never-reads-a-diff.md)"""
     for path in _paths(stat, diff):
         for pattern in _SECRET_PATH_RE:
             if pattern.search(path):
@@ -666,16 +361,7 @@ def secret_marker(stat: str, diff: str) -> str:
 
 
 def secret_marker_text(text: str) -> str:
-    """The same nets over PLAIN TEXT — the result summary. Named, never quoted. Pure.
-
-    ONE scanner, two callers. The worker's summary is prose it typed, so there is no `+`
-    to require and no header to skip; `secret_marker` strips the `+` and everything after
-    is this function. Writing the rules twice is how the two copies drift.
-
-    The PATH net is deliberately NOT run here. A path is evidence in a diff — the change
-    touched `.env` — but in prose it is a mention, and a summary that says it edited
-    `.env.example` is the commonest sentence in this repo's records.
-    """
+    """The same nets over PLAIN TEXT — the result summary"""
     for line in (text or "").splitlines():
         marker = _line_marker(line)
         if marker:
@@ -684,7 +370,7 @@ def secret_marker_text(text: str) -> str:
 
 
 def _line_marker(line: str) -> str:
-    """One line, no diff marker. The shape it carries, or `""`."""
+    """One line, no diff marker"""
     for pattern, name in zip(_SECRET_EVIDENCE_RE, SECRET_EVIDENCE_NAMES):
         if pattern.search(line):
             return name
@@ -696,40 +382,27 @@ def _line_marker(line: str) -> str:
 
 @dataclass(frozen=True)
 class Decision:
-    """Armed to ask Neo, or held with a reason a person can read. Nothing else.
-
-    NOT "armed to accept". This module's `decide` never settles anything — it decides
-    whether the OS may put THIS assumption to Neo at all, and the ruling that comes back
-    is `read_ruling`'s. Two functions because the two fail in different directions: a
-    wrong `decide` spends a model call, a wrong `read_ruling` settles a decision that was
-    the user's.
-    """
+    """Armed to ask Neo, or held with a reason a person can read"""
 
     armed: bool
     code: str
     reason: str
     assumption_id: int = 0
-    #: The assumption's position in its work order's list, as `all_assumptions` numbers
-    #: it. What a person calls it; the id is what the database calls it.
+    #: The assumption's position in its work order's list, as `all_assumptions` numbers it
     n: int = 0
-    #: The escalated round this hold is about, 0 when no round was named. Carried onto the
-    #: `autoreview_held` payload, where it is both the dedupe key and what
-    #: `ops._panel_hold_is_stale` compares the CURRENT round against — a hold is a claim
-    #: about now, and this is the fact that says whether it still holds.
+    #: The escalated round this hold is about, 0 when no round was named
     round: int = 0
 
 
 @dataclass(frozen=True)
 class Ruling:
-    """What Neo's reply MEANS for one assumption, after the code has had its say."""
+    """What Neo's reply MEANS for one assumption, after the code has had its say"""
 
     accept: bool
     reason: str
     stakes: str
     model: str
-    #: True when Neo accepted and this module overrode it — the `stakes: high` net. Worth
-    #: its own field because "Neo declined" and "Neo agreed and the OS would not take it"
-    #: are different facts about the reviewer, and only one of them is a reason to teach.
+    #: True when Neo accepted and this module overrode it — the `stakes: high` net
     overridden: bool = False
 
 
@@ -737,9 +410,7 @@ def _held(code: str, reason: str, **fields: Any) -> Decision:
     return Decision(armed=False, code=code, reason=reason, **fields)
 
 
-#: The panel reason, clamped to one line beside an assumption. `ops.objection_response_
-#: line`'s rule, spelled again rather than imported: this module is PURE and pulling `ops`
-#: in for a three-line clamp would invert the layering for nothing.
+#: The panel reason, clamped to one line beside an assumption
 _HINT_CHARS = 120
 
 
@@ -750,22 +421,7 @@ def _round_hint(round_reason: str) -> str:
 
 def _panel_gave_up(round_n: int, round_reason: str, tail: str,
                    fields: dict[str, Any]) -> Decision:
-    """The `panel_gave_up` hold, built once for all three decision functions.
-
-    WHICH ROUND and WHAT IT SAID, because the static sentence cannot tell a real
-    disagreement from a reviewer outage whose round reads "nobody could be reached to
-    review this submission" (GitHub issue #778).
-
-    THE EXISTING SENTENCE SURVIVES rather than becoming "round N: hint": the prefix
-    `ops.assumption_ruling_line` adds is the generic `Held by the OS — `, so a reason
-    opening with the round would render a hold that never says WHO held it or why. Both
-    additions are omitted when there is nothing to say — `round_n == 0` is every caller
-    that names no round, and "round 0" is not a sentence.
-
-    NO COMMAND AND NO URL: this reason is rendered by a pure one-liner on both surfaces,
-    so each of them adds its own pointer to the round (`cli._readable_autoreview`, the
-    work-order page).
-    """
+    """The `panel_gave_up` hold, built once for all three decision functions (#778)"""
     on_round = f" on round {round_n}" if round_n else ""
     hint = _round_hint(round_reason)
     return _held(HELD_PANEL_GAVE_UP,
@@ -775,36 +431,13 @@ def _panel_gave_up(round_n: int, round_reason: str, tail: str,
 
 
 def decide_evidence(assumption: dict[str, Any], summary: str = "") -> Decision:
-    """May the OS put THESE TEXTS into a stored question? PURE — no store, no model.
-
-    **THE SECOND GATE, AND THERE ARE TWO BECAUSE THEY SEE DIFFERENT THINGS.**
-    `decide_confirm` is pure over a ROW — an assumption, a work order, a config — and is
-    called on BOTH passes; this is the gate over the texts the DELIVERY-time question
-    carries, and it runs before a single character of them reaches `neo.ask`. Folding it
-    into `decide_confirm` would hand the ask pass a result summary it has no use for.
-
-    HELD MEANS NO QUESTION IS FILED, and filing the row at all is the filing decision
-    kn-deef42ea says the redaction decision IS. The assumption stays pending and is the
-    user's — exactly what happens on a fleet that never switched this on.
-
-    BOTH TEXTS THE QUESTION CARRIES, and there are now exactly two — the confirmation
-    carries no diff (docs/superpowers/specs/2026-10-14-neo-never-reads-a-diff.md):
-    `wo["result_summary"]` and the ASSUMPTION's own sentence, both interpolated raw by
-    `_confirm_question`. A worker that quotes the credential it wired up puts it in the
-    question store by either route. The hold NAMES which of the two it was: the user has
-    to know which text to go and read.
-
-    Carries `assumption_id` and `n` like every other hold, so
-    `Daemon._note_autoreview_held` dedupes per assumption instead of writing a line every
-    reconcile tick.
-    """
+    """May the OS put THESE TEXTS into a stored question? (docs/superpowers/specs/2026-10-14-neo-never-reads-a-diff.md)"""
     aid = int(assumption.get("id") or 0)
     n = int(assumption.get("n") or 0)
     fields = {"assumption_id": aid, "n": n}
     marker = secret_marker_text(summary)
     if marker:
-        # WHICH TEXT, named: the user has to know where to go and look, and the summary
-        # and the assumption are two different places.
+        # WHICH TEXT, named: the user has to know where to go and look
         return _held(HELD_EVIDENCE_SECRET,
                      f"the work order's result summary carries {marker}, and the OS "
                      f"will not copy a secret into a stored question — assumption #{n} "
@@ -823,16 +456,7 @@ def decide_evidence(assumption: dict[str, Any], summary: str = "") -> Decision:
 
 
 def _stakes_hold(n: int, verdict: Stakes, fields: dict[str, Any]) -> Decision:
-    """The high-stakes hold as the CLASSIFIER states it.
-
-    `reason` REPLACES the matched phrase (2026-09-25 spec SS3.2). `high_stakes_marker`
-    returns matched text rather than a boolean so the hold can say why — "mentions
-    'production'" — and under the classifier there is no phrase to name: the line says
-    what the OS thinks the worker DID, and the category names which clause of
-    `neo.PERSONA` it falls under. On the two failure paths `reason` is
-    `stakes.HIGH_UNREACHABLE` or `stakes.HIGH_UNPARSEABLE` and `category` is empty, so a
-    hold nobody ruled on never reads like a ruling.
-    """
+    """The high-stakes hold as the CLASSIFIER states it"""
     category = f" ({verdict.category})" if verdict.category else ""
     return _held(HELD_HIGH_STAKES,
                  f"assumption #{n} commits to an act{category}: "
@@ -846,64 +470,7 @@ def decide(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
            asked_question_id: int = 0,
            unreachable_question_ids: Collection[int] = (),
            stakes: Stakes | None = None) -> Decision:
-    """May the OS decide this assumption right now? PURE — no store, no clock, no model.
-
-    Dicts in, armed-or-held-with-a-reason out, for `automerge.decide`'s reason: the whole
-    condition table is then unit-testable without a network, and the safety rule lives in
-    one function rather than in a sequence of `if`s spread through a daemon method.
-
-    The seven conditions, all of which must hold, cheapest and most specific first:
-
-    1. the project has opted in AND the panel is on (`cfg.auto_review and cfg.enabled`);
-    2. the work order is parked in `needs_review` — the one status that means the user
-       owes a decision, and the analogue of `automerge.decide`'s `waiting_pr_merge`. **A
-       mid-run assumption is not SETTLED here and this condition is never relaxed**: the
-       reviewer would be ruling on an intention, and this function is the only guard on
-       the settle path. It is judged PROVISIONALLY instead, by `decide_early`, which
-       writes a verdict that settles nothing;
-    3. the assumption is still pending — nobody has settled it;
-    4. the PANEL HAS NOT GIVEN UP on this work order. `ops.land_when_cleared` lands an
-       `escalated` round, and the only caller that could reach it with one is the user
-       saying ship it anyway. So clearing the assumptions under a give-up would have the
-       OS silently answer a question the panel put in front of the user — a different
-       question from the one it was asked;
-    5. no refusal of the user's is outstanding (`ops.refusal_answered`). A refused
-       assumption is guidance the worker has not answered, and settling its siblings
-       would land the very decision the user turned down;
-    6. it is not already with Neo on some OTHER question — one question per assumption,
-       ever (see `asked_question_id` below);
-    7. nothing in its text is high-stakes. WHICH NET ANSWERS THAT IS THE CALLER'S
-       CHOICE: with `stakes=None` — every existing caller, and the shipped `regex` mode
-       — this function runs `high_stakes_marker` itself, exactly as it always has. Given
-       a `stakes.Stakes`, the classifier's verdict decides instead and the hold carries
-       its reason and category (2026-09-25 spec SS3.7). THE FUNCTION STAYS PURE either
-       way: the model call is the caller's, in `Daemon._classify_stakes`.
-
-    Condition 1's redundancy with `Daemon.auto_review`'s own guard is deliberate and is
-    `two-gates-not-a-chain`'s shape: a project's permission is asserted at the site that
-    decides as well as the site that spends.
-
-    **ASKED AT THE ASK SITE, ASKED AGAIN AT THE SETTLE SITE.** Everything above is a fact
-    about state the ask does not freeze: a model call takes seconds to minutes, and in
-    that window the panel can escalate, the user can cancel the order or refuse a
-    sibling. Every one of those turns an armed assumption into one the OS must not touch,
-    and the SETTLE is the act that cannot be taken back — it clears the assumption and
-    `ops.land_when_cleared` lands the order behind it. So `Daemon._deliver_assumption_
-    verdict` re-runs this against freshly read state immediately before accepting, and
-    drops Neo's ruling when it no longer arms.
-
-    `asked_question_id` is what makes that second call meaningful. Condition 6 exists to
-    stop a SECOND question being filed; at the settle site the assumption is linked to
-    the very question being delivered, so passing its id excludes it — while a link to a
-    DIFFERENT question still holds, because two rulings on one assumption is a state
-    nobody designed and not one to settle under.
-
-    `unreachable_question_ids` — AN ID IN THIS SET IS A QUESTION NOBODY WILL EVER ANSWER:
-    its retry ladder is spent and `questions.status` is `failed`, so condition 6's mandate
-    of one question per assumption is untouched by excluding it
-    (2026-09-26-an-unreachable-neo-question-is-not-a-question-in-flight.md §4). The caller
-    derives it — `Daemon._unreachable_question_ids` — because this function is pure.
-    """
+    """May the OS decide this assumption right now?"""
     if not (getattr(cfg, "enabled", False) and getattr(cfg, "auto_review", False)):
         return _held(HELD_DISABLED,
                      "this project has not given the OS permission to decide its "
@@ -934,8 +501,7 @@ def decide(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
         return _held(HELD_ASKED,
                      f"assumption #{n} is already with Neo (question {asked})", **fields)
     if stakes is not None:
-        # The caller computed the verdict (`Daemon._classify_stakes`) and this function
-        # stays PURE. `stakes=None` is today's behaviour and the shipped `regex` mode.
+        # The caller computed the verdict (`Daemon._classify_stakes`) and this function stays PURE
         if stakes.high:
             return _stakes_hold(n, stakes, fields)
     else:
@@ -955,63 +521,12 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                    unreachable_question_ids: Collection[int] = (),
                    confirmation_open: bool = True,
                    stakes: Stakes | None = None) -> Decision:
-    """May the OS CONFIRM this early verdict now, at delivery? PURE, like `decide`.
-
-    docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-runs.md
-    §7. A provisional approval is an opinion about an intention; at `needs_review` the
-    intention has become a diff and a result summary, and only then may it settle.
-
-    A SETTLED ROW IS HELD BEFORE THE GATES, `decide`'s own clause byte for byte
-    (docs/superpowers/specs/2026-10-01-a-confirmation-is-not-re-run-on-a-settled-
-    assumption.md §3.2): the `confirm_question_id` gate short-circuits below it, so a
-    guard reached only at the tail call never runs on that path.
-
-    Four gates of its own, then **`decide` itself, unchanged and in full**. A provisional
-    verdict is not a ticket past any of its seven conditions: the early pass judged an
-    intention, so it cannot buy the order past a panel that gave up, a permission the
-    project revoked, or the high-stakes net.
-
-    * no `accept` to confirm — `unjudged` (nothing judged it) or `objected`. An early
-      `object` approved NOTHING, so there is nothing to confirm and no question is asked
-      on one: the user decides it, with the objection in front of them.
-    * `confirm_question_id` already set — the confirmation is out. **THIS, AND NOT
-      CONDITION 6, IS WHAT KEEPS ONE QUESTION PER ASSUMPTION PER PASS HERE.** It splits
-      in two on `confirmation_open` (2026-09-28 spec §6): a question Neo still holds is
-      `confirming`, the pass working and suppressed; one that is no longer open is
-      `confirm_spent`, the row the user owes a decision on with nothing else saying so.
-    * A VALIDATION ROUND THE PANEL HAS NOT FINISHED — `round_open`, this function's
-      alone. The ask pass may arm on a pending round (`decide`'s docstring) because it
-      judges a sentence the worker wrote; this one interpolates the DIFF, and a round
-      still open means that diff may be about to be sent back (2026-09-28 spec §5.2).
-      A `round_n` of 0 is no round at all and does NOT hold: a project with validation
-      off behaves exactly as it did.
-    * an objection still in flight on the work order — §6.6 has not withdrawn it yet.
-      Means NOT YET and costs nothing: retried next tick. Without it the two passes race
-      on one assumption, one settling it while the other has a message to the worker in
-      flight about it.
-
-    `unreachable_question_ids` covers `confirm_question_id` as well as condition 6, and it
-    means what it means in `decide`: the id is a question nobody will ever answer, so a
-    dead confirmation is re-asked rather than held for ever (2026-09-26 spec §4). It is
-    checked BEFORE `confirmation_open`, so a `failed` question is asked again rather than
-    reported as spent — an outage is not a decision.
-
-    `confirmation_open` is the caller's fact, derived the way `unreachable_question_ids`
-    is (`Daemon._question_liveness`) because this function is pure: open means the
-    question's status is one of `neo_store.NEO_HELD_Q_STATUSES`. `escalated` and
-    `answered` are NOT open — Neo is finished with it either way. The default is True, so
-    every existing caller keeps today's behaviour.
-
-    **`asked_question_id` IS PASSED ON PURPOSE**, and it is the escape hatch `decide`'s
-    own docstring documents for condition 6. `neo_question_id` points at the EARLY
-    question and always will, so without it every confirmation would hold as "already
-    with Neo" and this pass would never run once.
-    """
+    """May the OS CONFIRM this early verdict now, at delivery? (docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-runs.md §7.)"""
     verdict = str(assumption.get("provisional_verdict") or "")
     aid = int(assumption.get("id") or 0)
     n = int(assumption.get("n") or 0)
     fields = {"assumption_id": aid, "n": n}
-    # 2026-10-01-a-confirmation-is-not-re-run-on-a-settled-assumption.md §3.2.
+    # 2026-10-01-a-confirmation-is-not-re-run-on-a-settled-assumption.md §3.2
     if str(assumption.get("status") or "") != "pending":
         return _held(HELD_SETTLED,
                      f"assumption #{n} is already {assumption.get('status')}", **fields)
@@ -1027,8 +542,7 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
     confirming = int(assumption.get("confirm_question_id") or 0)
     if confirming and confirming not in unreachable_question_ids:
         if not confirmation_open:
-            # 2026-09-28 spec §6: the question id is in the PROSE because the dashboard's
-            # link is driven by `os_ruling.neo_question_id` and a hold payload has none.
+            # 2026-09-28 spec §6: the question id is in the PROSE because the dashboard's link is driven by...
             return _held(HELD_CONFIRM_SPENT,
                          f"assumption #{n} is yours — the OS asked Neo to confirm its "
                          f"early reading (question {confirming}) and that question is no "
@@ -1037,8 +551,7 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                      f"assumption #{n} is already with Neo to confirm "
                      f"(question {confirming})", **fields)
     if round_n > 0 and str(round_outcome or "").lower() in _UNRESOLVED_OUTCOMES:
-        # 2026-09-28 spec §5.1. The round rides on the decision: it is part of the
-        # dedupe key, so the NEXT round's hold is written too.
+        # 2026-09-28 spec §5.1
         return _held(HELD_ROUND_OPEN,
                      f"the validation panel has not finished round {round_n} — the "
                      f"result this confirms against may be about to be sent back",
@@ -1048,16 +561,13 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                      "an objection on this work order has not reached the worker or "
                      "been withdrawn yet — confirming is retried once it has", **fields)
     return decide(assumption, wo, cfg, round_outcome=round_outcome,
-                  # The round travels with its outcome: the hold it produces names which
-                  # round gave up and quotes what it said.
+                  # The round travels with its outcome: the hold it produces names which round gave up and quotes what...
                   round_n=round_n, round_reason=round_reason,
                   refusal_answered=refusal_answered,
                   asked_question_id=int(assumption.get("neo_question_id") or 0),
-                  # Forwarded, not consumed: both gates need it, and an id in it is a
-                  # question nobody will ever answer (2026-09-26 spec §4).
+                  # Forwarded, not consumed: both gates need it
                   unreachable_question_ids=unreachable_question_ids,
-                  # Forwarded unchanged (2026-09-25 spec SS3.7): the confirmation pass is
-                  # gated by the same verdict the ask pass was.
+                  # Forwarded unchanged (2026-09-25 spec SS3.7): the confirmation pass is gated by the same verdict the...
                   stakes=stakes)
 
 
@@ -1067,43 +577,7 @@ def decide_early(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                  asked_question_id: int | None = None,
                  unreachable_question_ids: Collection[int] = (),
                  stakes: Stakes | None = None) -> Decision:
-    """May the OS put this assumption to Neo WHILE THE WORKER IS STILL TYPING? PURE.
-
-    docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-runs.md
-    §5.1. `decide`'s shape, its nets and its vocabulary — and a separate function, because
-    the two guard opposite acts. What this one arms is an ASK whose verdict lands in the
-    `provisional_*` columns; what `decide` arms is the settle. Relaxing `decide`'s
-    condition 2 instead of writing this would have let a RUNNING work order reach
-    `ops.accept_assumption` and land behind it, which is the one failure this feature
-    cannot have.
-
-    The conditions, all of which must hold:
-
-    1. the project has opted in AND the panel is on — `decide`'s condition 1 verbatim,
-       asserted here as well as in `Daemon.auto_review` for `two-gates-not-a-chain`'s
-       reason;
-    2. the work order is `running`. Not "is not settled": an order that is `pending`,
-       `blocked` or `waiting_pr_merge` has no worker at a keyboard, so an objection to it
-       would start a turn nobody asked for — the precise act the parent spec refused;
-    3. the assumption is still pending, and
-    4. this pass has not already formed a verdict on it (`provisional_verdict`). One
-       early verdict per assumption: a second would overwrite what the OS thought first,
-       and it is what §7 confirms against;
-    5. the PANEL HAS NOT GIVEN UP, 6. no refusal of the user's is outstanding and 7. it is
-       not already with Neo, each for `decide`'s reason at the same number;
-    8. nothing in its text is high-stakes, by `decide`'s condition 7 and its `stakes`
-       argument. **Both nets stay armed in this pass** (§2): net 1 before any reviewer
-       call, `read_ruling`'s allowlist on the reply.
-
-    `asked_question_id` is here for `decide`'s reason and is unused by any caller today —
-    this pass has no settle site to re-check against, and a second call excluding its own
-    question is what §7 does with `confirm_question_id`. It stays in the signature so the
-    two functions are called the same way, and `None` and `0` mean the same thing.
-
-    `unreachable_question_ids` is `decide`'s, meaning the same thing — an id in it is a
-    question nobody will ever answer — and this pass can reach a dead early link on an
-    order that is still `running` (2026-09-26 spec §4).
-    """
+    """May the OS put this assumption to Neo WHILE THE WORKER IS STILL TYPING? (docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-runs.md §5.1.)"""
     if not (getattr(cfg, "enabled", False) and getattr(cfg, "auto_review", False)):
         return _held(HELD_DISABLED,
                      "this project has not given the OS permission to decide its "
@@ -1138,8 +612,7 @@ def decide_early(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
         return _held(HELD_ASKED,
                      f"assumption #{n} is already with Neo (question {asked})", **fields)
     if stakes is not None:
-        # The caller computed the verdict (`Daemon._classify_stakes`) and this function
-        # stays PURE. `stakes=None` is today's behaviour and the shipped `regex` mode.
+        # The caller computed the verdict (`Daemon._classify_stakes`) and this function stays PURE
         if stakes.high:
             return _stakes_hold(n, stakes, fields)
     else:
@@ -1154,45 +627,13 @@ def decide_early(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
 
 
 def read_ruling(verdict: dict[str, Any], default_model: str = "") -> Ruling:
-    """What Neo's reply means for one assumption. PURE — the second of the two nets.
-
-    ACCEPT IS THE NARROW PATH AND EVERYTHING ELSE IS AN ESCALATION, which is what makes
-    the fail-closed direction structural rather than remembered: acceptance needs two
-    positive facts (Neo did not escalate, AND it ruled `approve`), so an unparseable
-    reply, a transport failure, a missing field or a model that answered some other
-    question all land with the user.
-
-    `verdict: deny` — Neo thinking the assumption is WRONG — escalates too, carrying its
-    reason. There is no machine rejection (module docstring), and the user reading "Neo
-    would have turned this down: …" is strictly better informed than they are today.
-
-    **WHY THIS COMPARES `"approved"` WHEN THE PERSONA ASKS FOR `"approve"`.** It is not a
-    mismatch: `neo._validate_verdict` puts every reply through `neo._gate_verdict`, whose
-    `_VERDICT_ALIASES` maps the bare verb to the past participle before this function sees
-    it, and falls back to `denied` for anything it does not recognise. So the persona's
-    word and the database's word are the same fact and the normalisation is one layer
-    down. The direction of that fallback is what makes comparing the participle safe: if a
-    future persona edit taught Neo a word `_VERDICT_ALIASES` has never heard of, every
-    reply would read `denied` and this feature would stop accepting anything — dead rather
-    than dangerous, which is the one way round it is allowed to break.
-
-    `stakes` OVERRIDES AN ACCEPTANCE, AND IT IS READ AS AN ALLOWLIST. The reviewer is asked
-    to classify the stakes separately from ruling on them, and the classification wins, for
-    the reason the plan path's child cap wins over Neo (`Daemon._deliver_plan_verdict`): a
-    backstop a reviewer can wave through is not one. `ROUTINE_STAKES` holds the only value
-    that leaves an acceptance standing — so a missing, empty, misspelled or truncated
-    `stakes` escalates, instead of reading as "no danger here" and switching the second net
-    off on the quietest possible failure. Three positive facts are therefore needed to
-    accept, not two.
-    """
+    """What Neo's reply means for one assumption"""
     stakes = str(verdict.get("stakes") or "").strip().lower() or STAKES_UNCLASSIFIED
     reason = str(verdict.get("reason") or "").strip() or "no reason given"
     model = str(verdict.get("model") or default_model or "")
     accept = (not verdict.get("escalate")) and verdict.get("verdict") == "approved"
     if accept and stakes not in ROUTINE_STAKES:
-        # Two spellings of one override, because the user reads this line and the two
-        # facts are different: Neo warned and the OS obeyed, or Neo said nothing readable
-        # and the OS would not take the silence for an answer.
+        # Two spellings of one override, because the user reads this line and the two facts are different:...
         said = (f"marked it high-stakes, and those are yours"
                 if stakes == STAKES_HIGH else
                 "did not classify the stakes at all, and the OS does not read silence "
@@ -1210,29 +651,7 @@ def read_ruling(verdict: dict[str, Any], default_model: str = "") -> Ruling:
 
 def escalation_cause(ruling: Ruling | None = None, *, escalate: bool = False,
                      over_cap: bool = False) -> str:
-    """WHY THE OS ESCALATED A QUESTION NEO HAD ALREADY ANSWERED, as one groupable label.
-
-    `neo_store.ESCALATION_CAUSES_OVERRIDDEN` or `""`, and `""` means NOTHING IS WRITTEN:
-    a NULL reads "not recorded", and a label that does not match the fact that caused the
-    escalation is worse than none — it cannot be told apart from a measured one (Neo,
-    question 1161). So every branch here is a fact the caller already holds, and there is
-    no "closest member" fallback.
-
-    PURE and in this module because `Ruling` and the stakes vocabulary are, and because
-    ONE derivation is what keeps the four daemon call sites from drifting apart (§1 of
-    docs/superpowers/specs/2026-10-01-neo-observability.md, Neo's ruling on question 1170). The members
-    are spelled as literals rather than imported: this module depends on no store, and
-    `tests/test_autoreview.py` pins what it returns against the enum instead.
-
-    `escalate` is the model's own `escalate` flag: when Neo escalated of its own accord
-    the cause is the CHOSEN label off its reply, which `neo.drain_queue` has already
-    written, and nothing here may overwrite it. `over_cap` is the plan path, which has no
-    `Ruling` at all — the child cap outranks whatever Neo said.
-
-    A `ruling` that ACCEPTED is not an override, so it gets `""`: an escalation that
-    follows one (the settle-time re-run dropping the OS's own ruling) was caused by the
-    condition table, not by anything in Neo's reply.
-    """
+    """WHY THE OS ESCALATED A QUESTION NEO HAD ALREADY ANSWERED, as one groupable label (docs/superpowers/specs/2026-10-01-neo-observability.md)"""
     if over_cap:
         return "" if escalate else "scope-over-cap"
     if ruling is None or escalate:
@@ -1242,13 +661,13 @@ def escalation_cause(ruling: Ruling | None = None, *, escalate: bool = False,
             return "stakes-high"
         if ruling.stakes == STAKES_UNCLASSIFIED:
             return "stakes-unclassified"
-        # `read_ruling`'s third `said` branch: a word that is neither, and not routine.
+        # `read_ruling`'s third `said` branch: a word that is neither, and not routine
         return "" if ruling.stakes in ROUTINE_STAKES else "stakes-unreadable"
-    # `verdict: deny` with no machine rejection behind it (module docstring).
+    # `verdict: deny` with no machine rejection behind it (module docstring)
     return "" if ruling.accept else "neo-denied"
 
 
-# -- the reviewer ----------------------------------------------------------------------
+# -- the reviewer
 
 
 ASSUMPTION_REVIEWER_PERSONA = """You are Neo, the user's delegate inside the Jarvis \
@@ -1331,20 +750,7 @@ high-stakes | no-learning-applies | evidence-insufficient>"
 
 
 def sibling_line(s: dict[str, Any]) -> str:
-    """One sibling assumption as CONTEXT, with the high-stakes net applied to it too.
-
-    **THE NET IS ABOUT TEXT REACHING A MODEL, NOT ABOUT WHOSE ROW IT IS.** Condition 7
-    holds an assumption that names a credential, production, a deletion or a migration —
-    and the guarantee that buys (spec §2.2: caught "before any model call") is worth
-    nothing if the same sentence is then pasted into the prompt for the routine
-    assumption beside it. One high-stakes row and one routine row on one work order is
-    the ordinary case, not a corner, so the leak would have been the common path.
-
-    Withheld rather than DROPPED. Silence would tell the reviewer this work order had
-    only routine assumptions, and "is this one defensible on its own?" is a different
-    question when the answer is no because of a row it cannot see. The number, the status
-    and the fact that something is being withheld are a classification, not the secret.
-    """
+    """One sibling assumption as CONTEXT, with the high-stakes net applied to it too"""
     content = str(s.get("content") or "")
     if high_stakes_marker(content):
         return (f"  #{s['n']} [{s['status']}] (withheld — high-stakes, and the user's "
@@ -1355,35 +761,8 @@ def sibling_line(s: dict[str, Any]) -> str:
 def decision_record(store: Any, neo: Any, wo_id: str, siblings: list[dict[str, Any]],
                     assumption: dict[str, Any] | None = None, *,
                     chars: int = DEFAULT_VALIDATION_DECISION_RECORD_CHARS) -> str:
-    """What has ALREADY been decided on this work order, newest first. `''` when nothing.
-
-    `sibling_line`'s neighbour because it is the same kind of thing — context rows
-    rendered into one packet section with a redaction net over them — and the reason it
-    lives here rather than in `daemon.py` is that the daemon half of this module runs git
-    and calls models, so a string assembled there would be out of reach of the pure tests
-    that cover every other line of packet text (GitHub issue #832, §7).
-
-    Three groups, each newest-first: the order's answered Neo Q&A, the user's own
-    messages, then the user's rulings on sibling assumptions. Grouped rather than merged
-    because provenance differs per group and a merged stream would need a per-item source
-    label to stay readable.
-
-    **THE SECRET NET ONLY, NOT THE HIGH-STAKES NET** (§5, on the user's ruling on Neo
-    question 943). `sibling_line`'s argument does not transfer: every item here is SETTLED
-    BY CONSTRUCTION — an answered question, a message the user sent, an assumption already
-    decided — so there is no decision left to withhold, and withholding one reproduces
-    #832 one table along. The secret net stays because a credential reaching a model at
-    all is true whoever decided what.
-
-    `assumption` is the row being ruled on, and it is a parameter rather than a lookup in
-    `siblings` because it is the ONLY row whose citations are resolved
-    (`_cited_question_ids`). `None` therefore means no cited items at all.
-
-    `chars` is the project's `validation.decision_record_chars`;
-    `catalog.DEFAULT_VALIDATION_DECISION_RECORD_CHARS` is the fleet answer it falls back to
-    when the project names nothing.
-    """
-    # One row past the bound is how the overflow becomes VISIBLE rather than silent (§3).
+    """What has ALREADY been decided on this work order, newest first (#832)"""
+    # One row past the bound is how the overflow becomes VISIBLE rather than silent (§3)
     answered = list(neo.answered_questions(wo_id, limit=_ANSWERED_ROWS + 1) or [])
     cut_by_rows = max(0, len(answered) - _ANSWERED_ROWS)
     answered = answered[:_ANSWERED_ROWS]
@@ -1395,8 +774,7 @@ def decision_record(store: Any, neo: Any, wo_id: str, siblings: list[dict[str, A
 
     cited_ids = _cited_question_ids(assumption)
     by_id = {int(q["id"]): q for q in answered}
-    # Cited FIRST and exempt from the cap: it is the single item most likely to be why
-    # this packet exists — Q900 escalated naming a question id it could not see (§4).
+    # Cited FIRST and exempt from the cap: it is the single item most likely to be why this packet exists...
     head = [_cited_item(neo, wo_id, qid, by_id.get(qid), n_by_question)
             for qid in cited_ids]
 
@@ -1416,12 +794,7 @@ def decision_record(store: Any, neo: Any, wo_id: str, siblings: list[dict[str, A
     if not lines:
         return ""
     if dropped or cut_by_rows:
-        # An omission stated, and LAST (kn-1485b845). Going silent is the failure this
-        # whole spec is about: a reviewer that cannot tell "no prior decisions" from
-        # "decisions I was not shown" must escalate, and would be right to. ONE line
-        # whatever the cause — the character cap or the row bound — and "at least" only
-        # where it is true: the query returned one row past the bound, so how many older
-        # rulings it cut is not known here.
+        # An omission stated, and LAST (kn-1485b845)
         why = f"the record is capped at {chars} characters"
         if cut_by_rows:
             why += f" and {_ANSWERED_ROWS} answered questions"
@@ -1432,19 +805,7 @@ def decision_record(store: Any, neo: Any, wo_id: str, siblings: list[dict[str, A
 
 
 def _cited_question_ids(assumption: dict[str, Any] | None) -> list[int]:
-    """Question ids the ASSUMPTION BEING RULED ON names, deduplicated, capped.
-
-    **THE RULED ROW ONLY. SIBLINGS ARE NOT SCANNED** (the user's ruling on the recorded
-    assumption): a citation is authority the row under review named, and a sibling's
-    citation is that sibling's business. The siblings still reach the packet as context
-    through `sibling_line` and their user rulings through `_user_ruling_item`; what they do
-    not do is spend this budget or pull a question row in behind them.
-
-    `_CITED_QUESTION_RE` OVER-MATCHES ON PURPOSE. Prose like "question 3" becomes a
-    citation, and that costs a line saying `(no such question)` — stated rather than
-    silent, which is this spec's rule everywhere. `_CITED_LIMIT` bounds one row's prose:
-    `content` naming six ids is a different problem.
-    """
+    """Question ids the ASSUMPTION BEING RULED ON names, deduplicated, capped"""
     found: list[int] = []
     for match in _CITED_QUESTION_RE.finditer(str((assumption or {}).get("content") or "")):
         qid = int(match.group(1))
@@ -1455,22 +816,7 @@ def _cited_question_ids(assumption: dict[str, Any] | None) -> list[int]:
 
 def _cited_item(neo: Any, wo_id: str, qid: int, answered: dict[str, Any] | None,
                 n_by_question: dict[int, Any]) -> str:
-    """One cited id, resolved. An ANSWERED ruling goes in whole; otherwise it is NAMED.
-
-    `answered` is the row when the record's own fetch returned it, and it is NOT the only
-    way a row can be answered: the fetch is bounded (`_ANSWERED_ROWS`), so an older ruling
-    arrives here as `None` and its `status` is read off the single-row lookup instead. That
-    row is rendered in full exactly like one from the fetch — calling an answered ruling
-    "not answered" reproduces #832 on the path this feature exists for, because the persona
-    escalates on that line.
-
-    The three remaining unresolved cases are distinct facts and each is stated rather than
-    swallowed (§4). A pending question is not authority, and saying it is pending is what
-    stops the reviewer reading silence as a ruling. A question on ANOTHER work order is not
-    quoted at all: its text has not been through this order's evidence gates, and a worker
-    citing it does not make it this order's record. One that never existed is a fact about
-    the assumption being ruled on.
-    """
+    """One cited id, resolved (#832)"""
     cited = "(cited by the assumption"
     if answered is not None:
         return _question_item(answered, n_by_question, cited=True, truncate=False)
@@ -1486,17 +832,7 @@ def _cited_item(neo: Any, wo_id: str, qid: int, answered: dict[str, Any] | None,
 
 def _question_item(q: dict[str, Any], n_by_question: dict[int, Any], *,
                    cited: bool = False, truncate: bool = True) -> str:
-    """One answered question. `answered_by` is verbatim: "the user said" and "Neo said"
-    are different authority, and the Q879 escalation turned on not knowing which.
-
-    **AN `assumption`-KIND ROW'S QUESTION TEXT IS NEVER QUOTED.** That row IS a review
-    packet — several thousand characters carrying the work order description, the diff and
-    the sibling list — so quoting it is recursive and would spend the whole cap on one
-    item. It is rendered rather than EXCLUDED because the ruling itself is the payload:
-    Q879's missing fact was Neo's verdict on a sibling assumption. Its own question text
-    is therefore not the net's payload either: the synthesised headline is all there is to
-    classify, and the packet it replaces already passed this order's gates line by line.
-    """
+    """One answered question"""
     qid = int(q["id"])
     if str(q.get("kind") or "") == QUESTION_KIND:
         n = n_by_question.get(qid)
@@ -1512,7 +848,7 @@ def _question_item(q: dict[str, Any], n_by_question: dict[int, Any], *,
         answer = answer[:800]
     tail, raw_tail = "", ""
     if str(q.get("review_status") or "") == "corrected":
-        # `neo_store.review` leaves the user's correction as the only ruling that survived.
+        # `neo_store.review` leaves the user's correction as the only ruling that survived
         raw_tail = str(q.get("review_feedback") or "")
         tail = f" (the user corrected this: {' '.join(raw_tail.split())[:200]})"
     marker = " (cited by the assumption)" if cited else ""
@@ -1531,14 +867,7 @@ def _message_item(m: dict[str, Any]) -> str:
 
 
 def _user_ruling_item(s: dict[str, Any]) -> str:
-    """A sibling assumption the USER settled, with the reasoning they gave, or `''`.
-
-    `jarvis wo review --feedback` writes that reasoning to `decided_reason` — the
-    `assumptions` table has no `review_feedback` column — with `decided_by` naming who
-    decided; `ops.assumption_ruling_line` reads the same pair. A row `DECIDER` settled is
-    Neo's and reaches the packet through its answered question row instead, never as a
-    ruling of the user's.
-    """
+    """A sibling assumption the USER settled, with the reasoning they gave, or `''`"""
     status = str(s.get("status") or "")
     if status in ("", "pending") or str(s.get("decided_by") or "") == DECIDER:
         return ""
@@ -1550,34 +879,20 @@ def _user_ruling_item(s: dict[str, Any]) -> str:
 
 
 def _netted(label: str, rendered: str, payload: tuple[str, ...]) -> str:
-    """The secret net over ONE item. Named, never quoted, never dropped.
-
-    The net runs over the PAYLOAD fields rather than the rendered line, because
-    `_ASSIGNMENT_RE` anchors at the start of a line and every rendered item begins with
-    its own label. The classification is the shape and not the value, which is the
-    contract `secret_marker_text`'s docstring states; dropping instead would be the
-    silence #832 is about.
-
-    **THE PAYLOAD IS EACH FIELD AS THE USER TYPED IT — newlines included, untruncated.**
-    Callers normalise and truncate only the text they RENDER. The same anchor is why:
-    flattening the newlines first leaves every line but the first unanchored, so a
-    credential assignment on line two is invisible to the net and reaches both the model
-    and the question row; truncating first hides one past the limit.
-    """
+    """The secret net over ONE item (#832)"""
     marker = secret_marker_text("\n".join(payload))
     return rendered if not marker else f"  {label} (withheld — carries {marker})"
 
 
 def _stamp(ts: Any) -> str:
-    """A record timestamp as a date, for ordering the reviewer can read."""
+    """A record timestamp as a date, for ordering the reviewer can read"""
     try:
         return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts)))
     except (TypeError, ValueError):
         return "unknown time"
 
 
-#: The decision record's heading, and its empty case. Last of the context blocks on
-#: purpose: it is what the reviewer reads just before it answers.
+#: The decision record's heading, and its empty case
 RECORD_HEADING = "# What has already been decided on this work order — authority you may CITE"
 NO_RECORD = "  (no prior decisions recorded)"
 
@@ -1586,8 +901,7 @@ def _record_block(record: str) -> str:
     return f"{RECORD_HEADING}\n{record or NO_RECORD}"
 
 
-#: The spec block's heading and its two empty cases. GitHub issue #1035: the packet carried
-#: no spec at all, so an assumption that cited one was escalated `evidence-insufficient`.
+#: The spec block's heading and its two empty cases (#1035)
 SPEC_HEADING = "# THE SPEC SECTION THIS WORK ORDER WAS BUILT TO — authority you may CITE"
 NO_SPEC = "  (no spec section — this work order was not planned against one)"
 SPEC_INTRO = ("This section is what the work was supposed to be. Where it settles the "
@@ -1595,17 +909,7 @@ SPEC_INTRO = ("This section is what the work was supposed to be. Where it settle
 
 
 def _spec_block(spec: dict[str, str] | None, chars: int) -> str:
-    """The section `specs.spec_of` resolved, bounded — or that there is none, in words.
-
-    Three states and they are kept apart: no spec at all (a standalone order, or one
-    planned before specs existed), a spec whose NAMED SECTION did not resolve, and a
-    section. An absent section read as silence is what #1035 is about, and a lost section
-    read as "there was never one" would send the reviewer to the wrong conclusion.
-
-    THE REFERENCE RIDES WHETHER OR NOT ANYTHING WAS CUT
-    (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md §2): a bounded section the
-    reviewer cannot name is one it cannot cite.
-    """
+    """The section `specs.spec_of` resolved, bounded — or that there is none, in words (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md §2)"""
     if not spec:
         return f"{SPEC_HEADING}\n{NO_SPEC}"
     ref = (f"{spec.get('repo_path') or '(no path recorded)'} § "
@@ -1625,29 +929,11 @@ def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any
                      siblings: list[dict[str, Any]], *, early: bool = False,
                      record: str = "", spec: dict[str, str] | None = None,
                      spec_chars: int = DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS) -> str:
-    """What the reviewer reads. One assumption, quoted; the rest listed, not ruled on.
-
-    The siblings are here because an assumption is sometimes only defensible given
-    another one, and NOT as a list to rule over — the instruction says so twice, and the
-    code applies the ruling to exactly one row whatever comes back. Each one goes through
-    `sibling_line`, which applies the same high-stakes rule that decided whether it could
-    be ruled on at all.
-
-    `record` is what has already been decided on this order (`decision_record`), last of
-    the context blocks and the one whose absence produced the escalations in #832. It
-    defaults to `""` so a caller not yet teaching one is merely unaware, never wrong.
-
-    `spec` is `specs.spec_of`'s row, rendered by `_spec_block` under the work order it
-    qualifies: the authority an assumption means when it says "per the spec", whose
-    absence from this packet produced the `evidence-insufficient` escalations in #1035.
-    """
+    """What the reviewer reads (#832)"""
     n = assumption.get("n")
     others = "\n".join(sibling_line(s) for s in siblings
                        if s["id"] != assumption["id"]) or "  (none)"
-    # THE REVIEWER IS TOLD WHICH PASS THIS IS: it decides which answers are open to it
-    # (`ASSUMPTION_REVIEWER_PERSONA`) and who reads its `reason`. "(nothing recorded)"
-    # where the result belongs would read as a worker that delivered nothing, which is a
-    # different and much worse fact than a worker still typing.
+    # THE REVIEWER IS TOLD WHICH PASS THIS IS: it decides which answers are open to it...
     delivered = (
         "# THE WORK ORDER IS STILL RUNNING\nThe worker is mid-task: there is no diff and "
         "no result summary yet, and you are ruling on an intention. Your `reason` reaches "
@@ -1681,8 +967,7 @@ def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any
     ])
 
 
-#: The per-field cuts this question makes, named instead of spelled inline — the limit
-#: discipline of `gates.build_request_question` (spec § 2).
+#: The per-field cuts this question makes, named instead of spelled inline
 CONFIRM_DESCRIPTION_CHARS = 2000
 CONFIRM_SUMMARY_CHARS = 1500
 
@@ -1691,39 +976,7 @@ def _confirm_question(project: str, wo: dict[str, Any], assumption: dict[str, An
                       siblings: list[dict[str, Any]],
                       record: str = "", spec: dict[str, str] | None = None,
                       spec_chars: int = DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS) -> str:
-    """What the reviewer reads at DELIVERY. Everything the early pass could not have.
-
-    **NO DIFF.** The user reversed Neo's answer to question 549 (learning #102):
-    checking delivered code against a worker's claims is the VALIDATION PANEL's job, and
-    the panel already reads the diff. docs/superpowers/specs/2026-10-14-neo-never-reads-
-    a-diff.md.
-
-    Each block earns its place, and what this second call still has that the mid-turn
-    reading did not is two facts, not a diff:
-
-    * **the RESULT SUMMARY** — what the worker says it delivered. This did not exist when
-      the assumption was an intention, and it is the reason the second call exists.
-    * **the DECISION RECORD** — what has already been decided on this order
-      (`decision_record`), which the mid-turn reading was formed without.
-
-    The provisional verdict, its reason and its model are labelled as mid-turn: the
-    reviewer is being asked to confirm a READING, not to rule from scratch, and saying so
-    is what stops the earlier line being read as a decision already taken.
-
-    **`decide_evidence` HAS ALREADY PASSED BOTH TEXTS THAT CARRY WORKER PROSE** — the
-    result summary and the assumption's own sentence — because `neo.ask` persists
-    everything below as a question row.
-
-    The rest mirrors `_ruling_question` deliberately: the assumption quoted, the work
-    order's title and description, its `_spec_block` — the same authority, under the same
-    work order, because #1035 is about the reviewer and not about the pass asking — and
-    the siblings through `sibling_line` — the
-    high-stakes net applies to the context list here exactly as it does there, because
-    the net is about text reaching a model, not about which pass is asking.
-
-    The ANSWER SHAPE is `_ruling_question`'s, unchanged, so `read_ruling` reads this
-    reply with both nets armed and no second parser exists to disagree with it.
-    """
+    """What the reviewer reads at DELIVERY (#102)"""
     n = assumption.get("n")
     others = "\n".join(sibling_line(s) for s in siblings
                        if s["id"] != assumption["id"]) or "  (none)"
@@ -1759,15 +1012,13 @@ def _confirm_question(project: str, wo: dict[str, Any], assumption: dict[str, An
 
 
 def _record_chars(cfg: Any) -> int:
-    """This project's `validation.decision_record_chars`, or the fleet default with no
-    `cfg` — the pure tests and every other caller that has no catalog in hand."""
+    """This project's `validation.decision_record_chars`, or the fleet default with no `cfg`"""
     return int(getattr(cfg, "decision_record_chars",
                        DEFAULT_VALIDATION_DECISION_RECORD_CHARS))
 
 
 def _spec_chars(cfg: Any) -> int:
-    """This project's `validation.assumption_spec_chars`, or the fleet default with no
-    `cfg` — `_record_chars`'s mirror, for the same callers."""
+    """This project's `validation.assumption_spec_chars`, or the fleet default with no `cfg`"""
     return int(getattr(cfg, "assumption_spec_chars",
                        DEFAULT_VALIDATION_ASSUMPTION_SPEC_CHARS))
 
@@ -1775,28 +1026,13 @@ def _spec_chars(cfg: Any) -> int:
 def propose_confirmation(store: Any, neo: Any, project: str, wo: dict[str, Any],
                          assumption: dict[str, Any], siblings: list[dict[str, Any]],
                          *, cfg: Any = None) -> dict[str, Any]:
-    """Put ONE already-judged assumption back to Neo at delivery. Returns the question.
-
-    `propose`'s mirror, and the differences are the two that matter: the link is
-    `confirm_question_id` — `neo_question_id` already points at the early question and
-    overwriting it would lose which reading came from where — and the `autoreview_asked`
-    payload carries `confirm: True`.
-
-    **THE PASS IS WRITTEN DOWN AT ASK TIME** (kn-e29d10fe). Re-deriving later from the
-    row ("it has a provisional verdict, so this must have been the confirmation") reads a
-    column that keeps changing under it. §5 writes `early` into the same payload field
-    for the same reason.
-
-    Reuses `QUESTION_KIND` and `ASSUMPTION_REVIEWER_PERSONA`: the persona is per KIND
-    (`neo.py:180`), and a new kind is seven edits in other people's modules
-    (kn-4edb0eb7).
-    """
+    """Put ONE already-judged assumption back to Neo at delivery"""
     question = neo.ask(project, wo["id"],
                        _confirm_question(project, wo, assumption, siblings,
                                          decision_record(
                                              store, neo, wo["id"], siblings, assumption,
                                              chars=_record_chars(cfg)),
-                                         # GitHub issue #1035.
+                                         # GitHub issue #1035
                                          spec=specs.spec_of(store, wo),
                                          spec_chars=_spec_chars(cfg)),
                        context=f"{wo.get('title') or ''}\n"
@@ -1814,29 +1050,14 @@ def propose_confirmation(store: Any, neo: Any, project: str, wo: dict[str, Any],
 def propose(store: Any, neo: Any, project: str, wo: dict[str, Any],
             assumption: dict[str, Any], siblings: list[dict[str, Any]], *,
             early: bool = False, cfg: Any = None) -> dict[str, Any]:
-    """Put ONE assumption to Neo. Returns the question row.
-
-    Idempotency is `assumptions.neo_question_id` and it is checked in `decide` (condition
-    6), not here, so that "already asked" is a hold with a reason like every other rather
-    than a silent `None` — one question per assumption, for its whole life. A question
-    that Neo escalated is therefore never re-asked: the user holds it, and asking again
-    every reconcile tick would be the OS lobbying them.
-
-    **`early` IS WRITTEN ON THE EVENT, AND THAT IS HOW THE VERDICT IS ROUTED BACK.** The
-    ruling arrives minutes later through the Neo drain, by which time the work order may
-    already have left `running` — and the two passes mean opposite things: an early ruling
-    may only be recorded provisionally, a parked one settles. Live status cannot tell them
-    apart after that race, `kind` is shared deliberately (a new one is seven edits) and
-    neither pass may have a column of its own, so which pass asked is written down where
-    it is known for certain: here. `Daemon._asked_early` reads it back.
-    """
+    """Put ONE assumption to Neo"""
     question = neo.ask(project, wo["id"],
                        _ruling_question(
                            project, wo, assumption, siblings, early=early,
                            record=decision_record(store, neo, wo["id"], siblings,
                                                   assumption,
                                                   chars=_record_chars(cfg)),
-                           # GitHub issue #1035: resolved here, so no caller changes.
+                           # GitHub issue #1035: resolved here, so no caller changes
                            spec=specs.spec_of(store, wo),
                            spec_chars=_spec_chars(cfg)),
                        context=f"{wo.get('title') or ''}\n"

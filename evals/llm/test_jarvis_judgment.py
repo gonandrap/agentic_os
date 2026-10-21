@@ -1,8 +1,4 @@
-"""LLM-graded Jarvis persona evals: does a session wearing CLAUDE.md route work
-through the CLI instead of doing it, and pick the right command?
-
-Opt-in: JARVIS_EVALS_LLM=1 pytest evals/llm -q
-"""
+"""LLM-graded Jarvis persona evals: does a session wearing CLAUDE.md route work through the CLI..."""
 
 from __future__ import annotations
 
@@ -36,23 +32,12 @@ INSTRUCTION = (
 
 @pytest.fixture(scope="module")
 def neutral_cwd(tmp_path_factory) -> Path:
-    """Run the subject outside the repo.
-
-    `claude -p` inherits the working directory, and from inside this repo it loads
-    CLAUDE.md a second time as project instructions on top of the persona we are
-    actually testing. neo.answer_question does the same thing for the same reason.
-    """
+    """Run the subject outside the repo"""
     return tmp_path_factory.mktemp("jarvis-persona-eval")
 
 
 def ask(message: str, persona: str, cwd: Path) -> str:
-    """One hermetic persona call: no tools, no repo, prompt-only reasoning.
-
-    `tools=""` is the point. A tooled subject can run `jarvis status`, discover the
-    local OS is empty, and truthfully answer "no projects are registered yet" instead
-    of emitting the routing command — which is a real answer to a different question,
-    and made this suite flaky rather than wrong.
-    """
+    """One hermetic persona call: no tools, no repo, prompt-only reasoning"""
     return claude_cli.run_headless(message, system_prompt=persona, model=MODEL,
                                    cwd=cwd, tools="", timeout=180).strip()
 

@@ -1,12 +1,4 @@
-"""A config change reaching a RUNNING fleet: `Daemon.reload_catalog` and the drift check.
-
-docs/superpowers/specs/2026-08-27-the-config-console.md §4, §6.1, §10.3.
-
-The pairing that makes these falsifiable is "it reloaded" against "it did NOT reload":
-a daemon that rebuilt its catalog on every tick would pass every positive test here and
-silently undo the in-memory edits three existing suites depend on (§4). So every reload
-test has a twin that asserts an untouched — or merely touched — file replaces nothing.
-"""
+"""A config change reaching a RUNNING fleet: `Daemon.reload_catalog` and the drift check (docs/superpowers/specs/2026-08-27-the-config-console.md §4)"""
 
 from __future__ import annotations
 
@@ -28,8 +20,7 @@ from jarvis.testing import make_git_project
 
 @pytest.fixture(autouse=True)
 def not_a_worker(monkeypatch):
-    """`ops.set_config` refuses a worker session, and the suite is routinely run by one
-    (kn-650b6f24)."""
+    """`ops.set_config` refuses a worker session, and the suite is routinely run by one (kn-650b6f24)"""
     monkeypatch.delenv("JARVIS_WO_ID", raising=False)
 
 
@@ -60,11 +51,7 @@ def daemon(catalog_file, jarvis_home) -> Daemon:
 
 
 def edit(path: Path, **os_keys) -> None:
-    """Rewrite the catalog's `os` block, moving the mtime past the daemon's stamp.
-
-    The explicit sleep is the point: mtime is the cheap guard, and on a filesystem with
-    coarse timestamps two writes inside one tick of the clock are one mtime.
-    """
+    """Rewrite the catalog's `os` block, moving the mtime past the daemon's stamp"""
     document = json.loads(path.read_text())
     document["os"].update(os_keys)
     _rewrite(path, document)
@@ -84,13 +71,11 @@ def inbox() -> list[dict]:
         central.close()
 
 
-# -- the guard: an unchanged file replaces nothing -------------------------------------
+# -- the guard: an unchanged file replaces nothing
 
 
 def test_a_first_tick_over_an_untouched_file_reloads_nothing(daemon):
-    """The baseline is seeded in `__init__`, not on the first tick. Three existing tests
-    mutate `daemon.catalog` in memory and never touch the file (§4); a first tick that
-    reloaded would put every one of them back."""
+    """The baseline is seeded in `__init__`, not on the first tick"""
     daemon.catalog.os.neo.enabled = False
     daemon.catalog.os.default_model = "haiku"
 
@@ -102,8 +87,7 @@ def test_a_first_tick_over_an_untouched_file_reloads_nothing(daemon):
 
 
 def test_a_file_touched_but_not_changed_replaces_nothing(daemon, catalog_file):
-    """The hash is the second guard, and this is the case it exists for: an editor save,
-    or a `jarvis config set` writing back the value already there."""
+    """The hash is the second guard, and this is the case it exists for: an editor save"""
     daemon.catalog.os.neo.enabled = False
     _rewrite(catalog_file, json.loads(catalog_file.read_text()))
 
@@ -112,7 +96,7 @@ def test_a_file_touched_but_not_changed_replaces_nothing(daemon, catalog_file):
 
 
 def test_a_catalog_with_no_source_path_is_a_no_op(jarvis_home, tmp_path):
-    """A `Catalog` parsed in memory has no file to watch, and must not become one."""
+    """A `Catalog` parsed in memory has no file to watch, and must not become one"""
     project = tmp_path / "proj_a"
     project.mkdir()
     path = tmp_path / "catalog.json"
@@ -125,7 +109,7 @@ def test_a_catalog_with_no_source_path_is_a_no_op(jarvis_home, tmp_path):
     assert inbox() == []
 
 
-# -- the reload itself -----------------------------------------------------------------
+# -- the reload itself
 
 
 def test_a_settings_change_reaches_the_daemon_on_the_next_tick(daemon, catalog_file):
@@ -139,9 +123,7 @@ def test_a_settings_change_reaches_the_daemon_on_the_next_tick(daemon, catalog_f
 
 
 def test_the_catalog_is_stable_for_one_whole_tick(daemon, catalog_file):
-    """`self.catalog` is replaced at the top of the tick and nowhere else: a pool thread
-    holding a config for the length of a round cannot have it swapped under it (§4.1).
-    A file edited DURING the tick is the next tick's business."""
+    """`self.catalog` is replaced at the top of the tick and nowhere else: a pool thread holding a config..."""
     seen: list[str] = []
 
     def during_the_tick(project, store):
@@ -156,13 +138,12 @@ def test_the_catalog_is_stable_for_one_whole_tick(daemon, catalog_file):
     assert daemon.catalog.os.default_model == "opus"
 
 
-# -- what is refused, and how loudly ---------------------------------------------------
+# -- what is refused, and how loudly
 
 
 def test_a_broken_catalog_keeps_the_last_good_one_and_warns_exactly_once(
         daemon, catalog_file):
-    """One bad file must not take down every project in the fleet, and an inbox item
-    every five seconds is how an inbox stops being read."""
+    """One bad file must not take down every project in the fleet"""
     time.sleep(0.01)
     catalog_file.write_text("{ this is not json")
 
@@ -192,8 +173,7 @@ def test_a_repaired_catalog_reloads_and_re_arms_the_warning(daemon, catalog_file
 
 def test_an_added_project_is_refused_and_the_item_says_jarvis_start(
         daemon, catalog_file, tmp_path):
-    """Settings only. A project that never went through `bootstrap_project` is not a
-    setting, and neither is one whose store the daemon still holds open."""
+    """Settings only"""
     document = json.loads(catalog_file.read_text())
     document["projects"].append({"name": "proj_b", "path": str(tmp_path / "proj_a"),
                                  "description": "new"})
@@ -203,8 +183,7 @@ def test_an_added_project_is_refused_and_the_item_says_jarvis_start(
     daemon.tick()
 
     assert [p.name for p in daemon.catalog.projects] == ["proj_a"]
-    # The settings in the same file are refused with it: a half-applied catalog is a
-    # configuration nobody wrote.
+    # The settings in the same file are refused with it: a half-applied catalog is a configuration nobody...
     assert daemon.catalog.os.default_model == "sonnet"
     items = inbox()
     assert len(items) == 1
@@ -226,12 +205,12 @@ def test_a_removed_project_is_refused_too(jarvis_home, tmp_path):
     assert "jarvis start" in inbox()[0]["body"]
 
 
-# -- INV-CONFIG-DRIFT ------------------------------------------------------------------
+# -- INV-CONFIG-DRIFT
 
 
 @pytest.fixture()
 def registered(catalog_file) -> Path:
-    """A catalog registered and adopted, the way a started-and-configured OS leaves it."""
+    """A catalog registered and adopted, the way a started-and-configured OS leaves it"""
     central = CentralStore()
     central.set_state("catalog_path", str(catalog_file))
     central.close()
@@ -264,19 +243,19 @@ def test_a_hand_edit_behind_the_records_back_is_drift(registered):
     finally:
         central.close()
     assert head in v.detail
-    # ...and both remedies, which are opposites: keep the file, or keep the record.
+    # ...and both remedies, which are opposites: keep the file, or keep the record
     assert "jarvis config adopt" in v.detail
     assert f"jarvis config restore {head}" in v.detail
 
 
 def test_a_config_set_leaves_no_drift(registered):
-    """The write path records what it writes. Drift is what happens BESIDE it."""
+    """The write path records what it writes"""
     ops.set_config("os.defaults.model", "opus")
     assert drift() == []
 
 
 def test_drift_is_silent_with_no_ledger_and_with_no_catalog(catalog_file):
-    """A fleet that predates the console has nothing to be behind."""
+    """A fleet that predates the console has nothing to be behind"""
     assert drift() == []
     central = CentralStore()
     central.set_state("catalog_path", str(catalog_file))
@@ -285,9 +264,7 @@ def test_drift_is_silent_with_no_ledger_and_with_no_catalog(catalog_file):
 
 
 def test_drift_is_a_doctor_check_only(registered):
-    """`check_os()` has one caller, `ops.run_doctor`. Wiring it into the daemon's
-    reconcile tick would file an inbox item every time someone opened their editor —
-    and `reload_catalog` has already applied the edit by then."""
+    """`check_os()` has one caller, `ops.run_doctor`"""
     assert invariants.check_config_drift in invariants.OS_INVARIANTS
     assert invariants.check_config_drift not in invariants.INVARIANTS
 
@@ -305,16 +282,11 @@ def test_drift_is_a_doctor_check_only(registered):
     assert drift(), "the precondition: the file IS drifted"
 
 
-# -- §6.1: the release rebase ----------------------------------------------------------
+# -- §6.1: the release rebase
 
 
 def stale_head(catalog_file: Path, **resolved_overrides) -> dict:
-    """A head version written under an OLDER build, whose resolved map does not agree
-    with what this build resolves the same document to.
-
-    Writing the row directly is the only way to stage it: the resolution a release moved
-    is by definition one this build no longer produces.
-    """
+    """A head version written under an OLDER build"""
     document = json.loads(catalog_file.read_text())
     resolved = cv.resolve(load_catalog(catalog_file))
     resolved.update(resolved_overrides)
@@ -328,8 +300,7 @@ def stale_head(catalog_file: Path, **resolved_overrides) -> dict:
 
 
 def test_a_release_that_moves_a_default_writes_a_row_of_its_own(daemon, catalog_file):
-    """Without it an upgrade is a behaviour change with no row, and the ledger stops
-    being 'every change to what the fleet actually runs' (§6.1)."""
+    """Without it an upgrade is a behaviour change with no row"""
     from jarvis.bugreport import jarvis_version
 
     old = stale_head(catalog_file, **{"os.defaults.autocompact_window": 123456})
@@ -351,15 +322,14 @@ def test_a_release_that_moves_a_default_writes_a_row_of_its_own(daemon, catalog_
 
 def test_the_rebase_is_addressed_by_build_and_only_for_release_rows(daemon,
                                                                     catalog_file):
-    """The salt is scoped to `actor="release"`: an ordinary edit that lands back on an
-    old document must still land back on its old id (§2)."""
+    """The salt is scoped to `actor="release"`: an ordinary edit that lands back on an old document must..."""
     document = json.loads(catalog_file.read_text())
     stale_head(catalog_file, **{"os.defaults.autocompact_window": 123456})
     row = daemon.rebase_config_for_release()
 
     assert row["id"] == cv.version_id(document, build=row["schema_version"])
     assert cv.version_id(document) != row["id"]
-    # ...and re-running the same rebase is the same fact, so it writes nothing more.
+    # ...and re-running the same rebase is the same fact, so it writes nothing more
     assert daemon.rebase_config_for_release() is None
 
 
@@ -374,14 +344,7 @@ def test_an_upgrade_that_moves_nothing_writes_nothing(daemon, catalog_file):
 
 
 def test_a_rebased_head_is_neither_drift_nor_something_to_adopt(daemon, catalog_file):
-    """The trap in option (a): every reader compares DOCUMENTS. An id comparison would
-    report permanent drift, and re-adopt, on a file nobody has touched.
-
-    There are THREE of them, not the two this test was written with: `config_show` is
-    what the `/config` page and `jarvis config show` read `drift` off, and it was still
-    comparing ids — so an upgrade that moved a default opened the console on a warning
-    about a hand edit nobody had made.
-    """
+    """The trap in option (a): every reader compares DOCUMENTS"""
     central = CentralStore()
     central.set_state("catalog_path", str(catalog_file))
     central.close()
@@ -394,8 +357,7 @@ def test_a_rebased_head_is_neither_drift_nor_something_to_adopt(daemon, catalog_
 
 
 def test_a_head_this_build_cannot_parse_is_skipped(daemon, catalog_file):
-    """A historical document is evidence, not configuration (§6): refusing to boot over
-    one this build no longer accepts would be worse than a stale row."""
+    """A historical document is evidence"""
     central = CentralStore()
     try:
         central.add_config_version({"projects": [{"name": "x"}]}, {"os.x": 1},
@@ -406,7 +368,7 @@ def test_a_head_this_build_cannot_parse_is_skipped(daemon, catalog_file):
     assert daemon.rebase_config_for_release() is None
 
 
-# -- §10.3: the one end-to-end assertion -----------------------------------------------
+# -- §10.3: the one end-to-end assertion
 
 
 def _git(cwd: Path, *args: str) -> None:
@@ -420,7 +382,7 @@ def _git(cwd: Path, *args: str) -> None:
 
 @pytest.fixture()
 def started(tmp_path, jarvis_home, fake_claude, claude_json):
-    """A booted OS over a real repository, validation OFF, and ONE daemon."""
+    """A booted OS over a real repository, validation OFF, and ONE daemon"""
     project = make_git_project(tmp_path, "proj_a")
     _git(project, "symbolic-ref", "HEAD", "refs/heads/main")
     _git(project, "add", "-A")
@@ -433,7 +395,7 @@ def started(tmp_path, jarvis_home, fake_claude, claude_json):
 
 
 def _run_one(daemon: Daemon, project: Path, title: str) -> dict:
-    """Create, dispatch and commit a change — a work order ready to finish."""
+    """Create, dispatch and commit a change — a work order ready to finish"""
     from jarvis import worker_session
 
     wo = ops.create_work_order("proj_a", title)
@@ -460,17 +422,11 @@ def _run_one(daemon: Daemon, project: Path, title: str) -> dict:
 
 
 def test_turning_validation_on_reaches_a_running_fleet_without_a_restart(started):
-    """§10.3, and the before/after pairing is what makes it falsifiable: "it validated"
-    alone is satisfied by a fleet that was already validating.
-
-    This daemon is never reconstructed and `daemon.catalog` is never assigned to.
-    """
+    """§10.3, and the before/after pairing is what makes it falsifiable: "it validated" alone is satisfied..."""
     daemon, project, _ = started
 
     before = _run_one(daemon, project, "before")
-    # `_run_one` COMMITS to the work order's branch, so finishing over it needs a pull
-    # request or an explicit abandonment (GitHub issue #232). Neither is what this test
-    # is about; the pull request is the cheaper scenery.
+    # `_run_one` COMMITS to the work order's branch (#232)
     assert ops.finish(before["id"], "done", evidence="ran the tests",
                       pr_url="https://github.com/x/y/pull/1")["status"] \
         == "waiting_pr_merge"
@@ -483,7 +439,7 @@ def test_turning_validation_on_reaches_a_running_fleet_without_a_restart(started
     ops.set_config("validation.enabled", True, project="proj_a", reason="trying it")
     daemon.tick_count = 0
     daemon.tick()
-    # The reload is the thing under test, so assert the daemon's OWN copy moved.
+    # The reload is the thing under test, so assert the daemon's OWN copy moved
     assert daemon.catalog.project("proj_a").validation.enabled is True
 
     after = _run_one(daemon, project, "after")

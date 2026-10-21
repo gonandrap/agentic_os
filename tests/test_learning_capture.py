@@ -1,12 +1,4 @@
-"""Workers that write to Claude Code's own per-project memory dir must have that
-knowledge mirrored into the Jarvis knowledge base.
-
-Claude Code ships a built-in file memory (`<claude config>/projects/<slug>/memory/*.md`).
-A worker told to "remember this" reaches for it by reflex, and until this capture existed
-the knowledge vanished: the file lives outside the repo, outside the work order record,
-and outside `jarvis learn` — so the user saw "project memory updated" in a work order
-and nothing at all under Knowledge.
-"""
+"""Workers that write to Claude Code's own per-project memory dir must have that knowledge mirrored..."""
 
 from __future__ import annotations
 
@@ -22,7 +14,7 @@ from jarvis.project_store import ProjectStore
 
 @pytest.fixture()
 def memory_dir(tmp_path):
-    """A stand-in for ~/.claude/projects/<slug>/memory."""
+    """A stand-in for ~/.claude/projects/<slug>/memory"""
     d = tmp_path / ".claude" / "projects" / "-home-user-proj-a" / "memory"
     d.mkdir(parents=True)
     return d
@@ -52,7 +44,7 @@ def write_payload(path, tool="Write"):
     }
 
 
-# -- path recognition ---------------------------------------------------------------
+# -- path recognition
 
 
 def test_memory_topic_recognises_claude_memory_files(memory_dir):
@@ -65,7 +57,7 @@ def test_memory_topic_recognises_claude_memory_files(memory_dir):
     assert memory_topic(str(memory_dir / "notes.txt")) is None
 
 
-# -- capture ------------------------------------------------------------------------
+# -- capture
 
 
 def test_worker_memory_write_becomes_knowledge(wo, project, memory_dir):
@@ -146,7 +138,7 @@ def test_ordinary_worker_writes_are_ignored(wo, project, memory_dir):
 
 
 def test_non_worker_session_memory_write_is_ignored(wo, project, memory_dir):
-    """An interactive session in a managed project is not a worker — no capture."""
+    """An interactive session in a managed project is not a worker — no capture"""
     path = memory_dir / "project_tesis.md"
     path.write_text("interactive note\n")
     assert handle_hook(write_payload(path), {"JARVIS_PROJECT_PATH": str(project)}) is None
@@ -163,18 +155,11 @@ def test_missing_memory_file_does_not_raise(wo, project, memory_dir):
     assert handle_hook(write_payload(path), worker_env(project, wo["id"])) is None
 
 
-# -- wiring -------------------------------------------------------------------------
+# -- wiring
 
 
 def test_injected_settings_register_the_posttooluse_hook(jarvis_home):
-    """The capture is only reachable if the settings fire the hook on a memory write.
-
-    Asserted as coverage rather than as a literal matcher string: the entry used to
-    match `Write|Edit|NotebookEdit` and is now unmatched, because the same hook also
-    carries the post-compaction brief and that must not wait for a file edit
-    (tests/test_compaction_checkpoint.py). Either shape satisfies this capture — what
-    would break it is an entry that stops covering the write tools.
-    """
+    """The capture is only reachable if the settings fire the hook on a memory write"""
     from jarvis.bootstrap import build_settings
 
     hooks = build_settings({})["hooks"]
@@ -205,8 +190,7 @@ def test_captured_learning_is_offered_to_the_next_worker(wo, project, memory_dir
     central = CentralStore()
     try:
         rows = central.relevant_knowledge("proj_a", limit=8)
-        # a mirrored memory file is a whole document, so the next worker gets it as an
-        # indexed headline it can pull in full — not pasted into its prompt
+        # a mirrored memory file is a whole document
         brief = central.knowledge_brief("proj_a")
     finally:
         central.close()

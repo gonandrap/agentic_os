@@ -1,23 +1,4 @@
-"""Screenshot `/stuck` NOT judging a round that is waiting for GitHub's checks.
-
-§1 and §3 of
-docs/superpowers/specs/2026-10-12-a-validation-round-waiting-for-ci-is-not-stuck.md.
-`scripts/screenshot_health_surfaces.py` is the shape this copies, and
-`scripts/screenshot_ci_hold_badge.py` is where the hold event comes from: a
-`validation_failed` event carrying `round`, `cause=VALIDATION_CI_CAUSE` and `reopens_at`.
-`scripts/screenshot_held_time_in_state.py` is where the AGEING comes from — the span rows
-are back-dated, because 20 minutes of real waiting is not a thing a script can buy.
-
-ONE PICTURE, because the claim has one half on this page: 20 minutes in `validating`
-against a 15-minute threshold, and the order is on the record with `excluded` reading
-`ci_pending` instead of over its threshold. The prose above the table is in the clip on
-purpose — the sentence that enumerates the exclusions is the other half of the change.
-
-Writes to docs/screenshots/. Everything lives in a temp `JARVIS_HOME` and a temp catalog,
-so it never reads or writes the live OS:
-
-    uv run python scripts/screenshot_ci_hold_excluded.py
-"""
+"""Screenshot `/stuck` NOT judging a round that is waiting for GitHub's checks (docs/superpowers/specs/2026-10-12-a-validation-round-waiting-for-ci-is-not-stuck.md)"""
 
 from __future__ import annotations
 
@@ -34,17 +15,15 @@ SHOTS = REPO / "docs" / "screenshots"
 OUT = SHOTS / "ci-hold-excluded-stuck.png"
 PORT = 8812
 
-#: 20 minutes in `validating`, past the 15-minute default threshold
-#: (`catalog.DEFAULT_FLEET_HEALTH_THRESHOLDS`) — so the row is only off the stuck list
-#: because the hold excludes it, not because it is young.
+#: 20 minutes in `validating`, past the 15-minute default threshold...
 WAITED = 20 * 60
-#: The hold is LIVE: `validation_hold` excludes only while `reopens_at` is in the future.
+#: The hold is LIVE: `validation_hold` excludes only while `reopens_at` is in the future
 REOPENS_IN = 5 * 60
 CHECKS = "unit (3.13), evals"
 
 
 def order(store) -> str:
-    """One order in `validating` for 20 minutes with a live `ci_pending` hold."""
+    """One order in `validating` for 20 minutes with a live `ci_pending` hold"""
     from jarvis.project_store import VALIDATION_CI_CAUSE
 
     now = time.time()
@@ -53,8 +32,7 @@ def order(store) -> str:
         "Judge the panel's round only once the checks report",
         description="A round held for CI is the OS deliberately not acting.")
     store.set_status(wo["id"], "validating")
-    # The span rows carry the age: `ops.state_durations` reads `wo_state_spans`, and the
-    # whole figure the sweep judges is the open span's entry moment.
+    # The span rows carry the age: `ops.state_durations` reads `wo_state_spans`
     spans = [r["id"] for r in store.conn.execute(
         "SELECT id FROM wo_state_spans WHERE order_id=? ORDER BY id", (wo["id"],))]
     for span_id, ts in zip(spans, (since - 60, since)):
@@ -100,7 +78,7 @@ def seed() -> str:
 
 
 def check(wo_id: str) -> None:
-    """The picture is only evidence if the reader agrees — so read it before shooting."""
+    """The picture is only evidence if the reader agrees — so read it before shooting"""
     from jarvis import ops
     from jarvis.project_store import VALIDATION_CI_CAUSE
 

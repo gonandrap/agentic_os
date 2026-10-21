@@ -1,19 +1,4 @@
-"""A live child under a settled feature says so — a HOLD, never a reopen.
-
-fo-ac00376e settled `failed`, which closed its manager, and siblings wo-3db50904 and
-wo-0cb6dc6b kept running with no addressee for the `manager` role. Nothing on either child
-said anything: `true_blockers` had no line about a parent feature, so INV-ATTENTION-MISSING
-had nothing to flag, and the one envelope that went `undeliverable` was reported by a
-report-only invariant and left there.
-
-Neo question 1393 ruled out reopening the feature at the fork: `Daemon.settle_features`
-re-fails it on the next tick off the same dead child, through the predicate the settler and
-INV-FEATURE-FALSE-FAILURE deliberately share, and the user watches it flap. The hold is
-derived, so it clears itself.
-
-Design: docs/superpowers/specs/2026-10-07-a-settled-features-live-children-must-have-a-
-manager-or-a-hold.md §(b).
-"""
+"""A live child under a settled feature says so — a HOLD, never a reopen"""
 
 from __future__ import annotations
 
@@ -39,8 +24,7 @@ def store(project):
 
 
 def hold(fo_id: str, status: str, wo_id: str) -> str:
-    """The sentence the child is expected to carry, built from the constants themselves —
-    a second copy of the template here would pass while the user read something else."""
+    """The sentence the child is expected to carry, built from the constants themselves"""
     remedy = invariants.SETTLED_FEATURE_REMEDY[status].format(fo_id=fo_id, wo_id=wo_id)
     return invariants.SETTLED_FEATURE_BLOCKER.format(fo_id=fo_id, status=status,
                                                      remedy=remedy)
@@ -48,7 +32,7 @@ def hold(fo_id: str, status: str, wo_id: str) -> str:
 
 def a_feature_with_a_live_child(store: ProjectStore, status: str = "failed",
                                 dead: bool = True) -> tuple[dict, dict]:
-    """A settled feature, one dead child that settled it, and one still running."""
+    """A settled feature, one dead child that settled it, and one still running"""
     fo = store.create_feature_order(title="CSV export", description="export things")
     store.set_feature_status(fo["id"], "executing")
     killer = store.create_work_order(title="the dead one", description="do it",
@@ -66,12 +50,11 @@ def a_feature_with_a_live_child(store: ProjectStore, status: str = "failed",
     return store.get_feature_order(fo["id"]), store.get_work_order(live["id"])
 
 
-# -- the hold ----------------------------------------------------------------------------
+# -- the hold
 
 
 def test_a_live_child_under_a_failed_feature_leads_with_the_hold(started, store):
-    """THE MISSING LINE. Nothing will coordinate this work order until the feature is
-    live again, and the way out under `failed` is `jarvis fo resume`."""
+    """THE MISSING LINE"""
     fo, live = a_feature_with_a_live_child(store)
 
     blockers = invariants.true_blockers(store, live)
@@ -81,8 +64,7 @@ def test_a_live_child_under_a_failed_feature_leads_with_the_hold(started, store)
 
 
 def test_one_reconcile_tick_raises_the_flag_with_that_string(started, store):
-    """It reaches the user with NO new writer: INV-ATTENTION-MISSING runs over every open
-    status plus `failed` and raises `blockers[0]`."""
+    """It reaches the user with NO new writer: INV-ATTENTION-MISSING runs over every open status plus..."""
     fo, live = a_feature_with_a_live_child(store)
 
     found = invariants.check_project(store)
@@ -95,8 +77,7 @@ def test_one_reconcile_tick_raises_the_flag_with_that_string(started, store):
 
 
 def test_reopening_the_feature_clears_the_hold_with_no_extra_command(started, store):
-    """DERIVED, so self-clearing: nothing was stored at the settle site that survives the
-    feature going back to work (kn-089de524)."""
+    """DERIVED, so self-clearing: nothing was stored at the settle site that survives the feature going..."""
     fo, live = a_feature_with_a_live_child(store)
     invariants.check_project(store)
     assert store.get_work_order(live["id"])["needs_attention"]
@@ -109,8 +90,7 @@ def test_reopening_the_feature_clears_the_hold_with_no_extra_command(started, st
 
 
 def test_the_flag_is_not_re_raised_once_the_feature_is_live(started, store):
-    """The other half of kn-089de524: a tick must not write a flag the next tick cannot
-    re-derive, and it must not put back one the reopening took down."""
+    """The other half of kn-089de524: a tick must not write a flag the next tick cannot re-derive"""
     fo, live = a_feature_with_a_live_child(store)
     invariants.check_project(store)
     ops.resume_feature_order(fo["id"])
@@ -122,9 +102,7 @@ def test_the_flag_is_not_re_raised_once_the_feature_is_live(started, store):
 
 
 def test_the_false_failure_repair_lowers_the_holds_as_well(started, store):
-    """The OTHER path that reopens a feature. INV-FEATURE-FALSE-FAILURE reopens it with
-    nobody typing, so a hold left standing there is a sentence that is false and that
-    nothing re-derives — the defect class this work order exists to fix."""
+    """The OTHER path that reopens a feature"""
     fo, live = a_feature_with_a_live_child(store)
     killer = [c for c in store.feature_children(fo["id"])
               if c["id"] != live["id"]][0]
@@ -143,9 +121,7 @@ def test_the_false_failure_repair_lowers_the_holds_as_well(started, store):
 
 
 def test_a_child_flagged_for_something_else_keeps_its_own_flag(started, store):
-    """The control, and the rule the clear is written under: lowered only when
-    `true_blockers` is EMPTY, so another blocker is somebody else's reason and is left
-    exactly as it was."""
+    """The control, and the rule the clear is written under: lowered only when `true_blockers` is EMPTY"""
     fo, live = a_feature_with_a_live_child(store)
     killer = [c for c in store.feature_children(fo["id"])
               if c["id"] != live["id"]][0]
@@ -161,20 +137,18 @@ def test_a_child_flagged_for_something_else_keeps_its_own_flag(started, store):
     assert after["attention_reason"] == "1 assumption pending your review"
 
 
-# -- the controls ------------------------------------------------------------------------
+# -- the controls
 
 
 def test_a_child_under_an_executing_feature_carries_nothing(started, store):
-    """The control for every assertion above: the hold is about the FEATURE's status, and
-    an ordinary live child under a live feature is asked for nothing."""
+    """The control for every assertion above: the hold is about the FEATURE's status"""
     _fo, live = a_feature_with_a_live_child(store, status="executing", dead=False)
 
     assert invariants.true_blockers(store, live) == []
 
 
 def test_the_manager_order_itself_carries_nothing(started, store):
-    """A manager has `parent_id` set to its feature, and `_close_feature_manager`
-    settling it when the feature settles is correct rather than a hold."""
+    """A manager has `parent_id` set to its feature"""
     fo, _live = a_feature_with_a_live_child(store)
     manager = store.create_manager_order(fo["id"])
     store.set_status(manager["id"], "idle")
@@ -183,8 +157,7 @@ def test_the_manager_order_itself_carries_nothing(started, store):
 
 
 def test_a_cancelled_feature_names_the_cancel_remedy_and_not_fo_resume(started, store):
-    """`jarvis fo resume` refuses anything but `failed`, so naming it under a cancelled
-    feature would send the user at a command that errors."""
+    """`jarvis fo resume` refuses anything but `failed`"""
     fo, live = a_feature_with_a_live_child(store, status="cancelled")
 
     blocker = invariants.true_blockers(store, live)[0]
@@ -195,8 +168,7 @@ def test_a_cancelled_feature_names_the_cancel_remedy_and_not_fo_resume(started, 
 
 
 def test_a_completed_feature_names_both_ways_out(started, store):
-    """The third settled status: the feature delivered and this child did not finish, so
-    the question is whether it is still wanted."""
+    """The third settled status: the feature delivered and this child did not finish"""
     fo, live = a_feature_with_a_live_child(store, status="completed", dead=False)
 
     blocker = invariants.true_blockers(store, live)[0]
@@ -206,11 +178,7 @@ def test_a_completed_feature_names_both_ways_out(started, store):
 
 
 def test_a_child_in_validating_now_carries_the_hold_too(started, store):
-    """It used to be silent, and only because the old status gate left `validating` out —
-    `true_blockers` derived the hold all along (it gates on OPEN_STATUSES, which has
-    `validating`). INV-ATTENTION-MISSING derives its statuses now, so the derived hold
-    reaches the user in every open status: spec
-    docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md §5c."""
+    """It used to be silent, and only because the old status gate left `validating` out (docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md §5c.)"""
     fo, live = a_feature_with_a_live_child(store)
     store.set_status(live["id"], "validating")
 
@@ -222,8 +190,7 @@ def test_a_child_in_validating_now_carries_the_hold_too(started, store):
 
 
 def test_an_assumption_the_user_owes_still_comes_first(started, store):
-    """The hold is a fact about the work order's CONTEXT, not about its delivery, and it
-    must not displace a decision the user owes."""
+    """The hold is a fact about the work order's CONTEXT"""
     _fo, live = a_feature_with_a_live_child(store)
     store.set_status(live["id"], "needs_review")
     store.add_assumption(live["id"], "assumed the schema is stable")
@@ -235,7 +202,7 @@ def test_an_assumption_the_user_owes_still_comes_first(started, store):
 
 
 def test_a_standalone_work_order_pays_for_no_parent_read(started, store):
-    """No `parent_id`, no hold and no query: the arm is gated on the column."""
+    """No `parent_id`, no hold and no query: the arm is gated on the column"""
     wo = ops.create_work_order("proj_a", "ship the thing", description="do it")
     store.set_status(wo["id"], "running")
 

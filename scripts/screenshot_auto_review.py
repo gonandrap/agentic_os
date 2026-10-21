@@ -1,15 +1,4 @@
-"""Screenshot the surfaces auto-review changed, for a PR's UI evidence.
-
-The claim under test is one a passing UI test cannot make: that a person reading a work
-order can tell an assumption the OS decided from one they decided themselves. So the
-seeded order carries one of each, plus one the OS declined to touch.
-
-Writes PNGs to docs/screenshots/. Everything it touches lives in a temp `JARVIS_HOME`
-and a temp catalog, so it never reads or writes the live OS
-(`scripts/screenshot_config_console.py` is the shape this copies):
-
-    uv run python scripts/screenshot_auto_review.py
-"""
+"""Screenshot the surfaces auto-review changed, for a PR's UI evidence"""
 
 from __future__ import annotations
 
@@ -27,12 +16,7 @@ PORT = 8798
 
 
 def seed() -> None:
-    """One work order with all three outcomes on its record at once.
-
-    Written through the stores rather than driven through a daemon: the point of the
-    picture is the RENDERING of a settled record, and standing a Neo drain up to reach
-    the same rows would make the screenshot a test of the fake model instead.
-    """
+    """One work order with all three outcomes on its record at once"""
     from jarvis.central_store import CentralStore
     from jarvis.project_store import (
         ASSUMPTION_DECIDER_OS,
@@ -82,8 +66,7 @@ def seed() -> None:
                      "reason": "assumption #3 mentions 'production API key' — the OS "
                                "does not decide those for you, whatever it thinks of "
                                "them"})
-    # ...and a FOURTH: one Neo escalated rather than accepted, so `/neo` has the branch
-    # that stops the user typing a reply into a worker that finished long ago.
+    # ...and a FOURTH: one Neo escalated rather than accepted
     a4 = store.add_assumption(wo["id"], "dropped the `--since` flag from the exporter — "
                                         "the spec did not mention it")
     from jarvis.neo_store import NeoStore
@@ -137,8 +120,7 @@ def shoot() -> None:
         page = browser.new_page(viewport={"width": 1280, "height": 1100})
         page.goto(f"{base}/wo/jarvis_os/{wo_id}")
         page.screenshot(path=SHOTS / "auto-review-work-order.png")
-        # The other changed surface: an escalated assumption on Neo's own page, where
-        # the reply box would otherwise invite the user to message a finished worker.
+        # The other changed surface: an escalated assumption on Neo's own page
         page.goto(f"{base}/neo")
         page.screenshot(path=SHOTS / "auto-review-neo-escalated.png")
         browser.close()

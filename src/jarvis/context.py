@@ -1,27 +1,4 @@
-"""What Jarvis put in the worker's context window, per turn, and what changed.
-
-§5 of docs/superpowers/specs/2026-09-24-order-observability.md. Nothing on disk answers "how much of
-this context is system prompt, how much is skills, how much is the knowledge block", so
-this module measures the ingredients JARVIS ITSELF supplies at the moment a turn is
-launched, and `record` stores one payload per turn on `wo_turns.context_json`.
-
-THREE PROPERTIES THIS FILE IS BUILT AROUND, all three of them corrections to defects the
-knowledge base already names:
-
-* EVERY TOKEN FIGURE IS AN ESTIMATE (bytes / `TOKEN_BYTES`) and every row says so. There
-  is no byte-exact figure for the rendered system prompt — it does not exist, and
-  claiming one is the defect kn-0cb81cec warns about. So bytes are measured, tokens are
-  derived, and `estimated` is on the row rather than in a docstring.
-* ABSENT IS NEVER ZERO (issue #227). An ingredient that is not in this turn's window, or
-  that could not be read, carries `bytes`/`tokens` of None and a sentence saying which.
-  A 0 would read as "it was there and it was empty".
-* CLAUDE CODE'S HALF IS NOT OURS TO MEASURE. The base system prompt and the tool schemas
-  render at position 0 inside the CLI; `residual` INFERS them from the observed cold-start
-  cache write and is labelled `measured: False`. A remainder is not a measurement.
-
-Leaf-ish by construction: `dispatch` and `worker_session` are imported lazily inside
-functions only (they import this module's callers — a module-level import is a cycle).
-"""
+"""What Jarvis put in the worker's context window, per turn, and what changed (docs/superpowers/specs/2026-09-24-order-observability.md)"""
 
 from __future__ import annotations
 
@@ -29,38 +6,33 @@ import logging
 from pathlib import Path
 from typing import Any
 
-# The ONE module-level jarvis import, and it is here because a DECORATOR cannot be lazy:
-# §10's meter wraps `record` at its definition. `observability` is a leaf and imports
-# nothing that reaches back here, so this is not the cycle the docstring warns about.
+# The ONE module-level jarvis import
 from . import observability
 from .agent_usage import OBSERVE_CONTEXT_WRITE
 
 log = logging.getLogger("jarvis.context")
 
-#: Bytes per token, the estimator's whole model. Four is the usual English-prose figure;
-#: it is deliberately crude and deliberately published on every payload (`token_bytes`),
-#: because a reader who knows the divisor can redo the arithmetic and a reader handed an
-#: unexplained token count cannot (kn-0cb81cec).
+#: Bytes per token, the estimator's whole model
 TOKEN_BYTES = 4
 
-#: The payload's shape version, so a later reader can tell a v1 row from its successor
-#: without guessing from the keys present.
+#: The payload's shape version, so a later reader can tell a v1 row from its successor without...
 SCHEMA = 1
 
-#: Walk ceilings. A measurement must cost less than the thing it measures: `add_dirs`
-#: points at the skills tree, which is hundreds of files, and `memory_files` at a walk
-#: that can climb out of a shallow checkout. Both caps are reported in the payload
-#: (`caps`) with their VALUES, so a truncated count is legible as truncated rather than
-#: as a smaller prompt.
+#: Walk ceilings
 MAX_FILES = 400
 MAX_BYTES = 4_000_000
 
-#: The inferred row's name, fixed so a reader can find it across turns.
+#: The inferred row's name, fixed so a reader can find it across turns
 RESIDUAL = "claude_code_base"
+
+#: What Jarvis may put in a worker's window before it does any work... (docs/os/architecture/worker-context.md)
+START_BUDGET_TOKENS = 10_000
+START_INGREDIENTS = ("append_system_prompt", "worker_prompt", "knowledge_index",
+                     "memory_files", "session_start_context")
 
 
 def caps() -> dict[str, int]:
-    """The ceilings this measurement ran under — on the payload, not only in the code."""
+    """The ceilings this measurement ran under — on the payload, not only in the code"""
     return {"max_files": MAX_FILES, "max_bytes": MAX_BYTES}
 
 
@@ -70,7 +42,7 @@ def _tokens(nbytes: int | None) -> int | None:
 
 def _row(name: str, nbytes: int | None, *, detail: dict[str, Any] | None = None,
          note: str = "", measured: bool = True) -> dict[str, Any]:
-    """One ingredient row. `bytes is None` is the absent/unreadable case, never 0."""
+    """One ingredient row"""
     return {"name": name, "bytes": nbytes, "tokens": _tokens(nbytes),
             "estimated": True, "measured": measured, "absent": nbytes is None,
             "detail": detail or {}, "note": note}
@@ -78,8 +50,7 @@ def _row(name: str, nbytes: int | None, *, detail: dict[str, Any] | None = None,
 
 def _absent(name: str, note: str, detail: dict[str, Any] | None = None
             ) -> dict[str, Any]:
-    """An ingredient that is NOT in this turn's window. A row, so the reader sees the
-    sentence; never a 0, which would claim it was there and empty (issue #227)."""
+    """An ingredient that is NOT in this turn's window (#227)"""
     return _row(name, None, detail=detail, note=note)
 
 
@@ -95,17 +66,7 @@ def _file_bytes(path: Path) -> tuple[int | None, str]:
 
 
 def _worktree_cwd(project: Any, wo: dict[str, Any], turn: dict[str, Any]) -> Path:
-    """The directory the turn runs in — where Claude Code resolves CLAUDE.md from.
-
-    Derived here rather than from `worker_session.worktree_path` to keep this module off
-    that import (cycle); the fallback to the project root is the same one `send` makes.
-
-    PREDICTED on the seq-1 dispatch turn, which runs before the `--worktree` flag has
-    created the tree — measured there, the walk was a directory too high. Later turns
-    keep the check, because `send` really does fall back to the root when the worktree
-    is gone. Spec docs/superpowers/specs/2026-09-29-one-copy-of-the-projects-claude-md.md
-    §4.
-    """
+    """The directory the turn runs in — where Claude Code resolves CLAUDE.md from (docs/superpowers/specs/2026-09-29-one-copy-of-the-projects-claude-md.md §4.)"""
     name = wo.get("worktree")
     if name:
         path = Path(project.path) / ".claude" / "worktrees" / str(name)
@@ -115,18 +76,14 @@ def _worktree_cwd(project: Any, wo: dict[str, Any], turn: dict[str, Any]) -> Pat
 
 
 def _knowledge_block(knowledge: Any, project_name: str) -> str:
-    """The rendered block, re-rendered from the brief dispatch already has.
-
-    Re-rendered rather than sliced out of the prompt by guesswork: `render_knowledge_block`
-    is the only thing that knows what the block is, so measuring its own output is exact.
-    """
+    """The rendered block, re-rendered from the brief dispatch already has"""
     from .dispatch import render_knowledge_block  # lazy: dispatch imports this module
 
     return "\n".join(render_knowledge_block(knowledge, project_name))
 
 
 def _walk(dirs: list[Path]) -> tuple[int, dict[str, Any]]:
-    """Bytes under `dirs`, under both caps. Returns the total and what it covered."""
+    """Bytes under `dirs`, under both caps"""
     total = files = 0
     truncated = False
     for d in dirs:
@@ -146,17 +103,7 @@ def _walk(dirs: list[Path]) -> tuple[int, dict[str, Any]]:
 
 
 def _mcp_row(project: Any) -> dict[str, Any]:
-    """The MCP server SET — names and a count, and NO byte figure.
-
-    Tool schemas render at position 0 of the context window and Claude Code composes
-    them; Jarvis supplies the server list and nothing else, so a size here would be
-    invented. kn-2c41d4cc's blind spot: name what you cannot measure instead of
-    reporting a zero for it.
-
-    Read from the wiring inventory's CACHE only (`wiring.peek`). Triggering a discovery
-    would run `claude mcp list` inside the dispatch path, which is a subprocess spawned
-    by a measurement.
-    """
+    """The MCP server SET — names and a count, and NO byte figure"""
     from . import wiring
 
     note = ("the SET only — tool schemas render at position 0 and are Claude Code's to "
@@ -175,15 +122,7 @@ def _mcp_row(project: Any) -> dict[str, Any]:
 
 def measure(project: Any, wo: dict[str, Any], turn: dict[str, Any],
             briefing: dict[str, Any], knowledge: Any = None) -> list[dict[str, Any]]:
-    """Every ingredient of this turn's window that Jarvis itself supplied.
-
-    `briefing` is `worker_session.briefing_for`'s dict, passed IN rather than rebuilt:
-    rebuilding it rewrites the worker settings file, which is a side effect a measurement
-    must not have.
-
-    `knowledge` is the `KnowledgeBrief` only on the dispatch turn — later turns carry no
-    knowledge block at all, and that ingredient is then absent-with-a-note rather than 0.
-    """
+    """Every ingredient of this turn's window that Jarvis itself supplied"""
     rows: list[dict[str, Any]] = []
     append = str(briefing.get("append_system_prompt") or "")
     rows.append(_row("append_system_prompt", _text_bytes(append),
@@ -192,10 +131,7 @@ def measure(project: Any, wo: dict[str, Any], turn: dict[str, Any],
                           "--append-system-prompt"))
 
     prompt = str(turn.get("prompt") or "")
-    # `if knowledge` and not `is not None`: a `KnowledgeBrief` is falsy when the base has
-    # nothing visible to the project, and `build_worker_prompt` appends no block for a
-    # falsy one — measuring the render anyway would charge the prompt for text that was
-    # never in it.
+    # `if knowledge` and not `is not None`: a `KnowledgeBrief` is falsy when the base has nothing visible...
     if knowledge:
         block = _knowledge_block(knowledge, project.name)
         if prompt.endswith(block):
@@ -232,6 +168,7 @@ def measure(project: Any, wo: dict[str, Any], turn: dict[str, Any],
                      note=why or "the --settings file: hooks, permissions, env"))
 
     rows.append(_memory_row(project, wo, turn))
+    rows.append(_session_start_row(project, wo, turn))
     rows.append(_agent_row(briefing))
     rows.append(_add_dirs_row(briefing))
     rows.append(_mcp_row(project))
@@ -256,9 +193,7 @@ def _memory_row(project: Any, wo: dict[str, Any],
             continue
         total += min(size, max(0, MAX_BYTES - total))
         counted.append(str(path))
-    # `excluded` names the dropped ancestor copies: absent and zero are different (module
-    # docstring), so a reader can see the duplicate was DROPPED and not never found. Spec
-    # docs/superpowers/specs/2026-09-29-one-copy-of-the-projects-claude-md.md §5.
+    # `excluded` names the dropped ancestor copies: absent and zero are different (module docstring) (docs/superpowers/specs/2026-09-29-one-copy-of-the-projects-claude-md.md §5.)
     return _row("memory_files", total,
                 detail={"paths": counted, "count": len(counted), "cwd": str(cwd),
                         "excluded": excluded},
@@ -267,6 +202,33 @@ def _memory_row(project: Any, wo: dict[str, Any],
                      "from cache when warm), unlike `knowledge_index` and "
                      "`worker_prompt`, which are listed on the turn that introduced "
                      "them")
+
+
+def session_start_text(serena: bool, cwd: Path) -> str:
+    """The `additionalContext` Jarvis's SessionStart hook injects, composed as the hook does"""
+    from . import concision, hooks
+
+    text = concision.house_style()
+    return text + hooks.serena_activation_context(cwd) if serena else text
+
+
+def _session_start_row(project: Any, wo: dict[str, Any],
+                       turn: dict[str, Any]) -> dict[str, Any]:
+    from . import wiring
+
+    text = session_start_text(wiring.serena_wired(project.wiring),
+                              _worktree_cwd(project, wo, turn))
+    return _row("session_start_context", _text_bytes(text),
+                note="the house style and Serena activation the SessionStart hook "
+                     "injects on every turn")
+
+
+def start_budget(ingredients: list[dict[str, Any]]) -> dict[str, Any]:
+    """Jarvis's share of a worker's starting window against START_BUDGET_TOKENS"""
+    tokens = sum(int(r["tokens"]) for r in ingredients
+                 if r.get("name") in START_INGREDIENTS and r.get("tokens") is not None)
+    return {"tokens": tokens, "budget": START_BUDGET_TOKENS,
+            "over": tokens > START_BUDGET_TOKENS}
 
 
 def _agent_row(briefing: dict[str, Any]) -> dict[str, Any]:
@@ -301,33 +263,18 @@ def _add_dirs_row(briefing: dict[str, Any]) -> dict[str, Any]:
 
 def payload(project: Any, wo: dict[str, Any], turn: dict[str, Any],
             briefing: dict[str, Any], knowledge: Any = None) -> dict[str, Any]:
-    """What `record` stores: the measurement plus everything needed to read it back."""
+    """What `record` stores: the measurement plus everything needed to read it back"""
+    ingredients = measure(project, wo, turn, briefing, knowledge)
     return {"schema": SCHEMA, "caps": caps(), "token_bytes": TOKEN_BYTES,
-            "ingredients": measure(project, wo, turn, briefing, knowledge)}
+            "ingredients": ingredients, "start_budget": start_budget(ingredients)}
 
 
-# The meter wraps the WHOLE function, gate guard included: an order running at `off` still
-# records a near-zero row, so the meter has no hole. A meter with a hole reports a number
-# lower than the truth, which is worse than no number (§10 of
-# docs/superpowers/specs/2026-09-24-order-observability.md). The gate below is never its switch.
+# The meter wraps the WHOLE function (docs/superpowers/specs/2026-09-24-order-observability.md)
 @observability.metered(OBSERVE_CONTEXT_WRITE, target="wo", project="project")
 def record(store: Any, project: Any, wo: dict[str, Any], turn: dict[str, Any],
            briefing: dict[str, Any], knowledge: Any = None) -> None:
-    """The ONE writer of `wo_turns.context_json`. Never raises into the dispatch path.
-
-    Neo's ruling on question 681 partitions the two call sites so this runs EXACTLY ONCE
-    per turn: `worker_session._launch` records every turn except the seq-1 dispatch turn,
-    and `dispatch.dispatch_work_order` records that one (it is the only place holding the
-    `KnowledgeBrief`). A retried dispatch turn takes a fresh seq, so it falls to
-    `_launch` and is still recorded once.
-
-    A failed measurement writes NOTHING and the column stays NULL — "not recorded", which
-    the read path already renders as a sentence. A measurement that could stop a turn
-    from running would be worth strictly less than the turn.
-    """
-    # §10's gate has exactly ONE consumer and this is it. Before measuring anything: at
-    # `off` the column stays NULL, which `ops.context_report` already renders as "not
-    # recorded" — its existing forward-only wording, now for a second reason.
+    """The ONE writer of `wo_turns.context_json`"""
+    # §10's gate has exactly ONE consumer and this is it
     if not observability.records_context(wo, getattr(project, "observability", None)):
         return
     try:
@@ -343,14 +290,13 @@ def record(store: Any, project: Any, wo: dict[str, Any], turn: dict[str, Any],
 
 
 def measured_tokens(ingredients: list[dict[str, Any]]) -> int:
-    """The sum of the estimated token counts actually measured. Absent rows contribute
-    nothing — not 0 as a value, but no term at all."""
+    """The sum of the estimated token counts actually measured"""
     return sum(int(row["tokens"]) for row in ingredients
                if row.get("measured") and row.get("tokens") is not None)
 
 
 def _written(write: Any) -> int | None:
-    """`inspection.Write.written`, from the object or from its `as_dict`."""
+    """`inspection.Write.written`, from the object or from its `as_dict`"""
     if write is None:
         return None
     if isinstance(write, dict):
@@ -361,13 +307,7 @@ def _written(write: Any) -> int | None:
 
 
 def residual(measured: int, cold_start_write: Any) -> dict[str, Any]:
-    """Claude Code's own base prompt and tool schemas, INFERRED — `measured: False`.
-
-    Observed cold-start prefix minus the sum of what Jarvis measured. The label is the
-    point: a remainder is not a measurement, and this row is the only thing in the
-    payload that is not one (§5, "The residual is inferred and must be labelled as
-    such").
-    """
+    """Claude Code's own base prompt and tool schemas, INFERRED — `measured: False`"""
     written = _written(cold_start_write)
     if written is None:
         return {"name": RESIDUAL, "bytes": None, "tokens": None, "estimated": True,
@@ -394,13 +334,7 @@ def residual(measured: int, cold_start_write: Any) -> dict[str, Any]:
 
 def delta(current: list[dict[str, Any]], previous: list[dict[str, Any]],
           against_seq: int | None = None) -> dict[str, Any]:
-    """Per-ingredient change against the PREVIOUS RECORDED turn.
-
-    An ingredient present on one side only is `appeared`/`disappeared` and never a change
-    from 0 — the knowledge block leaving the window between turn 1 and turn 2 is the
-    normal case, and reporting it as "-4.2k" would say the prompt shrank by a block that
-    was never in it.
-    """
+    """Per-ingredient change against the PREVIOUS RECORDED turn"""
     before = {row["name"]: row for row in previous}
     after = {row["name"]: row for row in current}
     rows: list[dict[str, Any]] = []
@@ -419,8 +353,7 @@ def delta(current: list[dict[str, Any]], previous: list[dict[str, Any]],
                          "bytes_after": None,
                          "note": "recorded on the previous turn and not on this one"})
         elif old_bytes is None and new_bytes is None:
-            # Absent on BOTH turns — no persona, no MCP inventory read. Neither an
-            # appearance nor a change; saying "appeared" here would invent an event.
+            # Absent on BOTH turns — no persona, no MCP inventory read
             rows.append({"name": name, "kind": "absent", "bytes_delta": None,
                          "tokens_delta": None, "bytes_before": None,
                          "bytes_after": None,

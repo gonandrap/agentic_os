@@ -1,12 +1,4 @@
-"""Screenshot /gates with a contested match and an abandoned request, for PR evidence.
-
-Writes PNGs to docs/screenshots/. Everything it touches lives in a temp `JARVIS_HOME`
-and a temp project, so it never reads or writes the live OS:
-
-    uv run python scripts/screenshot_contested_gate.py
-
-See docs/superpowers/specs/2026-09-12-contesting-a-gate-match.md.
-"""
+"""Screenshot /gates with a contested match and an abandoned request, for PR evidence (docs/superpowers/specs/2026-09-12-contesting-a-gate-match.md)"""
 
 from __future__ import annotations
 
@@ -22,16 +14,14 @@ REPO = Path(__file__).resolve().parent.parent
 SHOTS = REPO / "docs" / "screenshots"
 PORT = 8801
 
-#: A heredoc whose body quotes the release script — wo-5efc2de6's gate 97. Nothing here
-#: ships: the literal is prose in a commit message.
+#: A heredoc whose body quotes the release script — wo-5efc2de6's gate 97
 PROSE = ("git commit -F - <<'MSG'\n"
          "Stop the release script ./scripts/shipit.sh clobbering the tag\n"
          "MSG")
 
 
 def seed() -> None:
-    """One project with the four gate outcomes the page has to tell apart: a contested
-    match waiting on the user, an abandoned request, a dismissal and a real approval."""
+    """One project with the four gate outcomes the page has to tell apart: a contested match waiting on..."""
     from jarvis import gates
     from jarvis.central_store import CentralStore
     from jarvis.project_store import ProjectStore
@@ -50,8 +40,7 @@ def seed() -> None:
     catalog.write_text(json.dumps(document, indent=2))
     central = CentralStore()
     central.set_state("catalog_path", str(catalog))
-    # `ops.list_gates` walks the REGISTERED projects, not the catalog file — a fleet the
-    # page can read is one `jarvis start` has bootstrapped.
+    # `ops.list_gates` walks the REGISTERED projects, not the catalog file
     central.upsert_project(name="jarvis_os", path=str(project),
                            description="the OS itself",
                            catalog_json=json.dumps(document["projects"][0]))
@@ -79,8 +68,7 @@ def seed() -> None:
                          "heredoc is never piped to a shell")
 
     abandoned = filed("Ship 0.5.4", "./scripts/shipit.sh --stage 0.5.4")
-    # From the sweep's own renderer, so the published PNG cannot outlive the window it
-    # names (the default moved 600s → 240s; spec §7).
+    # From the sweep's own renderer, so the published PNG cannot outlive the window it names (the default...
     store.abandon_approval(
         abandoned["id"], gates.abandoned_reason(gates.DEFAULT_CASE_TTL_SECONDS))
 
@@ -113,13 +101,11 @@ def shoot() -> None:
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page(viewport={"width": 1280, "height": 1100})
-        # The escalated contest: the reviewer is told what is being claimed, and the
-        # Approve button is gone — an approval is the one verdict a contest cannot take.
+        # The escalated contest: the reviewer is told what is being claimed, and the Approve button is gone
         page.goto(f"{base}/gates")
         page.screenshot(path=SHOTS / "gates-contested.png")
 
-        # The abandoned row and the count beside the rate are the LAST things on the
-        # page, so `scroll_into_view_if_needed` stops with them at the bottom edge.
+        # The abandoned row and the count beside the rate are the LAST things on the page
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(200)
         page.screenshot(path=SHOTS / "gates-abandoned.png")

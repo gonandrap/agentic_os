@@ -1,18 +1,4 @@
-"""Staged releases: the daemon performs the restarts a self-ship must not.
-
-Background (docs/superpowers/specs/2026-08-10-why-a-self-ship-reports-failure.md):
-worker `claude` processes live inside jarvis.service's cgroup, so a deploy script that
-restarts the daemon kills the shipping worker mid-final-turn and the work order settles
-`failed` even though the release fully applied. The fix under test:
-
-* the deploy script gains `--stage <version> --wo <wo-id>` — every step except the
-  service restarts and the notify, then a JSON marker in $JARVIS_HOME/run/;
-* the daemon (`jarvis.release`) restarts the services once the shipping worker's turn
-  has settled, and verifies the release on its next boot.
-
-Every systemd interaction goes through an injectable runner; nothing here touches real
-systemctl/systemd-run or live state (see `jarvis.testing.gate_test_environment`).
-"""
+"""Staged releases: the daemon performs the restarts a self-ship must not (docs/superpowers/specs/2026-08-10-why-a-self-ship-reports-failure.md)"""
 
 from __future__ import annotations
 
@@ -29,13 +15,12 @@ import pytest
 from jarvis import release
 from jarvis.project_store import ProjectStore
 
-# The deploy script under test. Copied into throwaway repos under a neutral name; the
-# script locates its repo via `git rev-parse`, not via its own filename.
+# The deploy script under test
 DEPLOY_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / ("ship" + "it.sh")
 
 
 class FakeRunner:
-    """Records the systemd calls the release path asks for; answers unit start times."""
+    """Records the systemd calls the release path asks for; answers unit start times"""
 
     def __init__(self, start_times: dict[str, float | None] | None = None):
         self.calls: list[tuple] = []
@@ -67,7 +52,7 @@ def store_for(store):
 
 @pytest.fixture()
 def prod_checkout(tmp_path, monkeypatch):
-    """A production checkout whose pyproject.toml the verifier reads from disk."""
+    """A production checkout whose pyproject.toml the verifier reads from disk"""
     root = tmp_path / "production"
     (root / "jarvis_os").mkdir(parents=True)
     monkeypatch.setenv("PRODUCTION_CODE", str(root))
@@ -92,13 +77,13 @@ def _stage(wo_id: str, version: str = "0.6.0", staged_at: float | None = None) -
 
 
 def _good_runner(reference: float | None = None) -> FakeRunner:
-    """Both units restarted after `reference` (default: now-ish)."""
+    """Both units restarted after `reference` (default: now-ish)"""
     now = time.time()
     base = (reference if reference is not None else now) + 5
     return FakeRunner({release.DAEMON_UNIT: base, release.UI_UNIT: base + 1})
 
 
-# -- maybe_restart: the reconcile-tick hook -------------------------------------------
+# -- maybe_restart: the reconcile-tick hook
 
 
 def test_no_marker_is_a_no_op(store_for):
@@ -108,7 +93,7 @@ def test_no_marker_is_a_no_op(store_for):
 
 
 def test_a_running_turn_defers_the_restart(store, store_for):
-    """The whole point: the restart must never kill the shipping worker mid-turn."""
+    """The whole point: the restart must never kill the shipping worker mid-turn"""
     wo = store.create_work_order("ship 0.6.0")
     store.create_turn(wo["id"], "dispatch", "ship it")
     _stage(wo["id"])
@@ -129,7 +114,7 @@ def test_restarts_once_the_shipping_turn_has_settled(store, store_for):
 
     assert release.maybe_restart(store_for, runner=runner) == "restarting"
 
-    # UI inline first, then the daemon detached (it would kill this very process).
+    # UI inline first, then the daemon detached (it would kill this very process)
     assert runner.calls == [
         ("restart", release.UI_UNIT),
         ("restart_detached", release.DAEMON_UNIT, "jarvis-0.6.0"),
@@ -144,7 +129,7 @@ def test_restarts_once_the_shipping_turn_has_settled(store, store_for):
 
 
 def test_a_work_order_with_no_turns_at_all_restarts(store, store_for):
-    """Staged by hand (no worker session): nothing to wait for."""
+    """Staged by hand (no worker session): nothing to wait for"""
     wo = store.create_work_order("ship 0.6.0")
     _stage(wo["id"])
     runner = FakeRunner()
@@ -164,7 +149,7 @@ def test_marker_already_restarting_is_left_alone(store, store_for):
 
 
 def test_unknown_project_never_restarts(store):
-    """No store means no running-turn guard, so restarting would be a guess."""
+    """No store means no running-turn guard, so restarting would be a guess"""
     _stage("wo-nowhere")
     runner = FakeRunner()
     assert release.maybe_restart(lambda name: None, runner=runner) is None
@@ -172,7 +157,7 @@ def test_unknown_project_never_restarts(store):
     assert release.read_marker()["state"] == "staged"
 
 
-# -- verify_on_boot: the startup hook -------------------------------------------------
+# -- verify_on_boot: the startup hook
 
 
 def _restarting(wo_id: str, version: str = "0.6.0",
@@ -190,7 +175,7 @@ def test_boot_with_no_marker_is_a_no_op(store_for, prod_checkout):
 
 def test_boot_leaves_a_fresh_staged_marker_for_the_reconcile_hook(
         store, store_for, prod_checkout):
-    """A young `staged` marker means the worker may still be finishing its turn."""
+    """A young `staged` marker means the worker may still be finishing its turn"""
     wo = store.create_work_order("ship 0.6.0")
     store.create_turn(wo["id"], "dispatch", "ship it")
     _stage(wo["id"])
@@ -201,8 +186,7 @@ def test_boot_leaves_a_fresh_staged_marker_for_the_reconcile_hook(
 
 def test_boot_verifies_and_settles_the_failed_work_order(store, store_for,
                                                          prod_checkout):
-    """The wo-2fa7c0e9 shape: turn died in the restart, WO settled `failed` —
-    verification proves the release applied and completes it."""
+    """The wo-2fa7c0e9 shape: turn died in the restart, WO settled `failed`"""
     wo = store.create_work_order("ship 0.6.0")
     store.set_status(wo["id"], "failed")
     store.flag_attention(wo["id"], "worker turn failed — review and retry")
@@ -222,12 +206,7 @@ def test_boot_verifies_and_settles_the_failed_work_order(store, store_for,
 
 
 def test_the_verify_on_boot_wording_is_unchanged_and_a_caller_may_say_otherwise(store):
-    """`settle` gained `why` and did not gain a sibling — issue #784's spec §5.
-
-    The default is this path's own sentence, byte for byte, so a release the OS shipped
-    still reads the same; the overtaken-release caller passes its own, which is the whole
-    difference between "we shipped it" and "somebody else did and the fleet is on it".
-    """
+    """`settle` gained `why` and did not gain a sibling — issue #784's spec §5"""
     mine = store.create_work_order("ship 0.6.0")
     theirs = store.create_work_order("ship the fix")
 
@@ -258,8 +237,7 @@ def test_boot_verification_leaves_a_completed_work_order_completed(
 
 def test_pending_assumptions_are_not_accepted_by_the_back_door(
         store, store_for, prod_checkout):
-    """Same rule as `wo ack`/`wo done`: completing over a pending assumption would
-    silently accept it. The release is verified; the review is still owed."""
+    """Same rule as `wo ack`/`wo done`: completing over a pending assumption would silently accept it"""
     wo = store.create_work_order("ship 0.6.0")
     store.add_assumption(wo["id"], "assumed the minor bump")
     store.set_status(wo["id"], "needs_review")
@@ -275,8 +253,7 @@ def test_pending_assumptions_are_not_accepted_by_the_back_door(
 
 def test_a_work_order_behind_a_pr_stays_parked_on_its_merge(
         store, store_for, prod_checkout):
-    """`waiting_pr_merge` ends with the merge (kn-99d3f1d4): the verifier must not
-    pull it off the merge queue."""
+    """`waiting_pr_merge` ends with the merge (kn-99d3f1d4): the verifier must not pull it off the merge..."""
     wo = store.create_work_order("ship 0.6.0")
     store.update_work_order(wo["id"], result_summary="shipped",
                             pr_url="https://github.com/x/y/pull/1")
@@ -311,8 +288,7 @@ def test_version_mismatch_fails_verification(store, store_for, prod_checkout):
 
 def test_a_unit_that_never_restarted_fails_verification(store, store_for,
                                                         prod_checkout):
-    """The kn-58429229 half-apply: prod's code moved but a unit still runs the old
-    process. Judged by ExecMainStartTimestamp on BOTH units, never `is-active`."""
+    """The kn-58429229 half-apply: prod's code moved but a unit still runs the old process"""
     wo = store.create_work_order("ship 0.6.0")
     marker = _restarting(wo["id"])
     runner = FakeRunner({
@@ -339,9 +315,7 @@ def test_a_unit_with_no_start_time_fails_verification(store, store_for, prod_che
 
 def test_a_staged_marker_past_the_grace_period_is_verified_at_boot(
         store, store_for, prod_checkout):
-    """The daemon never got to the restart (down, crashed mid-flight): after a
-    generous timeout the boot check judges it against `staged_at` instead of
-    waiting forever."""
+    """The daemon never got to the restart (down"""
     wo = store.create_work_order("ship 0.6.0")
     store.set_status(wo["id"], "failed")
     staged_at = time.time() - release.STAGED_BOOT_GRACE - 60
@@ -366,7 +340,7 @@ def test_a_failed_verification_marker_is_never_touched_again(store, store_for,
     assert runner.calls == []
 
 
-# -- the daemon hooks -----------------------------------------------------------------
+# -- the daemon hooks
 
 
 def test_the_tick_runs_the_restart_hook(catalog_file, monkeypatch):
@@ -392,7 +366,7 @@ def test_run_forever_verifies_before_the_first_tick(catalog_file, monkeypatch):
 
 
 def test_the_daemon_resolves_the_markers_project_to_its_store(catalog_file, project):
-    """End to end through the daemon's own store lookup, with the fake runner."""
+    """End to end through the daemon's own store lookup, with the fake runner"""
     from jarvis.catalog import load_catalog
     from jarvis.daemon import Daemon
 
@@ -411,7 +385,7 @@ def test_the_daemon_resolves_the_markers_project_to_its_store(catalog_file, proj
     store.close()
 
 
-# -- the doctor invariant -------------------------------------------------------------
+# -- the doctor invariant
 
 
 def test_invariant_quiet_with_no_marker():
@@ -447,8 +421,7 @@ def test_invariant_flags_a_stuck_restarting_marker(store):
 
 
 def test_invariant_ignores_a_failed_verification_marker(store):
-    """That one already raised attention on the work order; flagging it hourly too
-    would say the same thing twice."""
+    """That one already raised attention on the work order"""
     from jarvis.invariants import check_release_marker
     wo = store.create_work_order("ship 0.6.0")
     marker = _stage(wo["id"], staged_at=time.time() - 3 * 3600)
@@ -475,7 +448,7 @@ def test_doctor_reports_the_stale_marker(store):
     assert out["violations"] >= 1
 
 
-# -- the deploy script's --stage mode -------------------------------------------------
+# -- the deploy script's --stage mode
 
 
 def _git(repo: Path, *args: str) -> None:
@@ -484,15 +457,14 @@ def _git(repo: Path, *args: str) -> None:
 
 
 def _make_repo(tmp_path: Path) -> Path:
-    """A dev clone whose `origin` is a bare remote (same shape the release tests use)."""
+    """A dev clone whose `origin` is a bare remote (same shape the release tests use)"""
     repo = tmp_path / "dev"
     (repo / "scripts").mkdir(parents=True)
     shutil.copy(DEPLOY_SCRIPT, repo / "scripts" / "deploy.sh")
     os.chmod(repo / "scripts" / "deploy.sh", 0o755)
     (repo / "pyproject.toml").write_text(
         '[project]\nname = "jarvis-os"\nversion = "0.1.1"\n')
-    # The release commit carries the relocked file too (issue #202), and shipit aborts
-    # if the two disagree — so the fixture has to look like a project that has a lock.
+    # The release commit carries the relocked file too (issue #202)
     (repo / "uv.lock").write_text(
         'version = 1\nrequires-python = ">=3.13"\n\n'
         '[[package]]\nname = "jarvis-os"\nversion = "0.1.1"\n'
@@ -511,11 +483,7 @@ def _make_repo(tmp_path: Path) -> Path:
     return repo
 
 
-#: `uv sync` is a no-op here, but `uv lock` must not be: the release commit carries the
-#: relocked file and shipit aborts unless it matches the bumped pyproject. This does the
-#: one thing a real relock does to a project with no dependencies — move the root
-#: package's version — so the real (non-dry) staged run exercises that whole path
-#: without a resolver or a network.
+#: `uv sync` is a no-op here, but `uv lock` must not be: the release commit carries the relocked file...
 _STUB_UV = """#!/bin/sh
 if [ "$1" = "lock" ]; then
   v=$(grep -m1 -E '^version *= *"' pyproject.toml | sed -E 's/.*"([^"]+)".*/\\1/')
@@ -526,7 +494,7 @@ exit 0
 
 
 def _stub_bin(tmp_path: Path, name: str) -> Path:
-    """A stand-in placed first on PATH (`uv` in a throwaway repo)."""
+    """A stand-in placed first on PATH (`uv` in a throwaway repo)"""
     d = tmp_path / "stub-bin"
     d.mkdir(exist_ok=True)
     p = d / name
@@ -536,8 +504,7 @@ def _stub_bin(tmp_path: Path, name: str) -> Path:
 
 
 def _head_sha(repo: Path) -> str:
-    """The commit a staged run ships. Required since the 2026-10-01 spec §1: a release
-    approval is scoped to the command string, so the sha has to be in it."""
+    """The commit a staged run ships"""
     return subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
                           check=True, capture_output=True, text=True).stdout.strip()
 
@@ -568,7 +535,7 @@ def test_stage_skips_restarts_and_notify(tmp_path):
 
 
 def test_stage_still_deploys_the_tag(tmp_path):
-    """Every existing step short of the restarts: push, prod checkout, uv sync."""
+    """Every existing step short of the restarts: push, prod checkout, uv sync"""
     repo = _make_repo(tmp_path)
     r = _run_script(repo, tmp_path, "--stage", "0.2.0", "--wo", "wo-abc123",
                     "--base", _head_sha(repo))
@@ -587,8 +554,7 @@ def test_stage_requires_a_work_order_id(tmp_path):
 
 
 def test_stage_writes_the_marker_for_real(tmp_path):
-    """A real (non-dry) staged run against throwaway git remotes: the marker must be
-    exactly what `jarvis.release` reads."""
+    """A real (non-dry) staged run against throwaway git remotes: the marker must be exactly what..."""
     repo = _make_repo(tmp_path)
     before = int(time.time())
     r = _run_script(repo, tmp_path, "--stage", "0.2.0", "--wo", "wo-abc123",
@@ -604,20 +570,13 @@ def test_stage_writes_the_marker_for_real(tmp_path):
         "staged_at": marker["staged_at"], "state": "staged",
     }
     assert before <= marker["staged_at"] <= time.time() + 1
-    # This tag carries no scripts/install_prod_service.sh, so step 5a cannot re-render
-    # the units — and the returncode above is the assertion that matters: a release must
-    # not abort over that. What it PRINTS is not asserted here, because whether step 5a
-    # is reached at all depends on the host having jarvis units installed, and a test
-    # that passes on a developer's machine and fails on CI is worse than no test.
-    # tests/test_shipit.py drives both branches deterministically in --dry-run.
-    # the release itself really happened: tag on origin, prod checkout on the tag
+    # This tag carries no scripts/install_prod_service.sh, so step 5a cannot re-render the units
     tags = subprocess.run(["git", "-C", str(tmp_path / "origin.git"), "tag"],
                           capture_output=True, text=True, check=True).stdout
     assert "jarvis-0.2.0" in tags
     prod_py = tmp_path / "prod" / "jarvis_os" / "pyproject.toml"
     assert 'version = "0.2.0"' in prod_py.read_text()
-    # …and the tag is SELF-CONSISTENT: for nine releases the lock beside that pyproject
-    # said 0.1.1, so every bare `uv` command in prod re-resolved and rewrote it (#202).
+    # …and the tag is SELF-CONSISTENT: for nine releases the lock beside that pyproject said 0.1.1 (#202)
     prod_lock = (tmp_path / "prod" / "jarvis_os" / "uv.lock").read_text()
     assert 'name = "jarvis-os"\nversion = "0.2.0"' in prod_lock
     # and the operator was told what happens next
@@ -625,7 +584,7 @@ def test_stage_writes_the_marker_for_real(tmp_path):
 
 
 def test_without_stage_the_script_behaves_as_before(tmp_path):
-    """Backward compatible: restarts + telegram + detached daemon restart intact."""
+    """Backward compatible: restarts + telegram + detached daemon restart intact"""
     repo = _make_repo(tmp_path)
     r = _run_script(repo, tmp_path, "0.2.0")
     assert r.returncode == 0, r.stdout + r.stderr

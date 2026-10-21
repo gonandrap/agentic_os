@@ -1,23 +1,4 @@
-"""The sealed autopsy: does a rehydrated reading say exactly what the live one said.
-
-The seal exists because every source an autopsy is read from expires — Claude Code prunes
-session transcripts and the subagent files beside them — so an order inspected six months
-after it settled would otherwise report a clock that got shorter as the evidence aged.
-
-Two claims are tested here and nothing else, because nothing else reads a seal yet (§3
-ships dark). First, the FUNCTION-LEVEL ROUND TRIP: `from_seal(to_seal(a))` renders the
-same `as_dict` the live `Anatomy` renders, which is what makes a seal a substitute for the
-transcript rather than a summary of it. At `full` that holds with NOTHING excluded, tool
-`params` included, which is §6; at `normal` the params are the one thing the payload does
-not carry at all. Second, THE CAPS: a seal is bounded, and every fold carries numbers that
-reconcile against the uncapped reading — announcing a key is not proving a cap.
-
-The round trip is pinned on the committed fixture session (`tests/test_inspection.py`'s
-`real_session`) because its three cache writes and two joins were measured from the
-unredacted transcript; the caps are pinned on synthetic transcripts under `tmp_path`,
-because a committed fixture with 505 spans in one turn would be a file written to agree
-with the answer.
-"""
+"""The sealed autopsy: does a rehydrated reading say exactly what the live one said"""
 
 from __future__ import annotations
 
@@ -49,12 +30,7 @@ PARAM_KEYS = ("params", "params_truncated", "params_dropped")
 
 
 def without_params(value):
-    """The same payload with every parameter key gone, at any depth.
-
-    §6: tool parameters are sealed at `full` and at NO other level, so a `normal` round
-    trip is asserted over everything EXCEPT them — the live reading always has them. The
-    `full` round trip strips nothing: that is section 6's acceptance criterion.
-    """
+    """The same payload with every parameter key gone, at any depth"""
     if isinstance(value, dict):
         return {k: without_params(v) for k, v in value.items() if k not in PARAM_KEYS}
     if isinstance(value, list):
@@ -63,7 +39,7 @@ def without_params(value):
 
 
 def keys_of(value) -> set[str]:
-    """Every dict key anywhere in a payload."""
+    """Every dict key anywhere in a payload"""
     if isinstance(value, dict):
         found = set(value)
         for item in value.values():
@@ -78,7 +54,7 @@ def keys_of(value) -> set[str]:
 
 
 def usage_of_fold(fold: dict) -> usage.Usage:
-    """The folded calls' spend, rebuilt from the numbers the fold carries."""
+    """The folded calls' spend, rebuilt from the numbers the fold carries"""
     total = usage.Usage()
     for model, row in fold["by_model"].items():
         total = total + usage.priced(
@@ -88,16 +64,11 @@ def usage_of_fold(fold: dict) -> usage.Usage:
     return total
 
 
-# -- the round trip --------------------------------------------------------------------
+# -- the round trip
 
 
 def test_a_sealed_reading_renders_exactly_what_the_live_one_rendered(real_session):
-    """The acceptance criterion of §3: `as_dict` stays the SINGLE render contract and is
-    computed FROM the rehydrated object, so no surface can tell a seal from a reading.
-
-    With no hold on the order `spans` changes nothing, which is the shape that must hold
-    with no exclusions at all beyond the params section 6 owns.
-    """
+    """The acceptance criterion of §3: `as_dict` stays the SINGLE render contract and is computed FROM the..."""
     assert real_session.holds == []
 
     sealed = autopsy.to_seal(real_session, level="normal")
@@ -105,28 +76,24 @@ def test_a_sealed_reading_renders_exactly_what_the_live_one_rendered(real_sessio
 
     assert without_params(back.as_dict()) == without_params(real_session.as_dict())
     assert back.found is True
-    # §6: a `normal` seal carries no parameters, so they are the round trip's exclusion.
+    # §6: a `normal` seal carries no parameters, so they are the round trip's exclusion
     assert "params" not in keys_of(sealed)
 
 
 def test_a_sealed_reading_at_full_renders_exactly_what_the_live_one_rendered(
         real_session):
-    """§6's acceptance criterion: at `full` the round trip strips NOTHING — the tool
-    parameters are in the payload and come back byte for byte, so `as_dict` is identical
-    with no `without_params` anywhere.
-    """
+    """§6's acceptance criterion: at `full` the round trip strips NOTHING"""
     sealed = autopsy.to_seal(real_session, level="full")
 
     assert autopsy.from_seal(sealed, spans=[]).as_dict() == real_session.as_dict()
-    # Not vacuous: the parameters really are populated in the SEALED payload.
+    # Not vacuous: the parameters really are populated in the SEALED payload
     first = sealed["turns"][0]["spans"][0]
     assert first["detail"] == "List repo structure"
     assert first["params"] == {"description": "List repo structure"}
 
 
 def test_a_normal_seal_carries_no_parameter_key_at_all(real_session):
-    """§6: at `normal` the payload holds NO `params` key rather than an empty one, which
-    is what makes the level's own sentence the answer to an empty reading."""
+    """§6: at `normal` the payload holds NO `params` key rather than an empty one"""
     at_normal = keys_of(autopsy.to_seal(real_session, level="normal"))
     at_full = keys_of(autopsy.to_seal(real_session, level="full"))
 
@@ -136,8 +103,7 @@ def test_a_normal_seal_carries_no_parameter_key_at_all(real_session):
 
 def test_sealing_the_committed_session_at_full_changes_none_of_its_pinned_numbers(
         real_session):
-    """§6: `full` adds retained content and moves no measurement. The ten numbers are
-    the committed session's, asserted against the REHYDRATED anatomy."""
+    """§6: `full` adds retained content and moves no measurement"""
     back = autopsy.from_seal(autopsy.to_seal(real_session, level="full"), spans=[])
     part = back.partition()
 
@@ -154,10 +120,7 @@ def test_sealing_the_committed_session_at_full_changes_none_of_its_pinned_number
 
 
 def test_the_holds_are_not_sealed_and_have_to_be_handed_back_in(monkeypatch):
-    """Holds come from the OS's own database, which never expires — sealing one would
-    freeze an episode that was OPEN at seal time. So `from_seal` takes `spans=` exactly as
-    `read_session` does, and the wrong form is FALSE the moment a hold exists.
-    """
+    """Holds come from the OS's own database, which never expires"""
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(FIXTURE_ROOT))
     plain = inspection.read_session(FIXTURE_SESSION)
     first = plain.turns[0]
@@ -177,25 +140,19 @@ def test_the_holds_are_not_sealed_and_have_to_be_handed_back_in(monkeypatch):
 
 def test_a_rehydration_must_be_handed_the_holds_and_cannot_silently_default_to_none(
         real_session):
-    """A forgotten `spans=` used to default to no holds, so a held order rehydrated with
-    `held` 0 and the wrong held/active partition and said nothing about it (§3). The
-    argument is required, so the omission is a `TypeError` at the call, not a false number.
-    """
+    """A forgotten `spans=` used to default to no holds"""
     with pytest.raises(TypeError):
         autopsy.from_seal(autopsy.to_seal(real_session, level="normal"))
 
 
 def test_every_api_call_of_every_turn_survives_the_seal(real_session):
-    """`Turn.as_dict` emits `api_calls: len(self.calls)` and a folded `usage`, and carries
-    no calls — rehydrate from THAT and `observed` goes False on a turn that made 32 calls
-    (issue #227, recreated inside the persistence). The calls themselves are sealed.
-    """
+    """`Turn.as_dict` emits `api_calls: len(self.calls)` and a folded `usage`, and carries no calls (#227)"""
     back = autopsy.from_seal(autopsy.to_seal(real_session, level="normal"), spans=[])
 
     assert [len(t.calls) for t in back.turns] == [len(t.calls)
                                                  for t in real_session.turns]
     assert sum(len(t.calls) for t in back.turns) == 68
-    # Per turn, not only the total: a fold that lost a model would still sum right.
+    # Per turn, not only the total: a fold that lost a model would still sum right
     assert [t.usage.as_dict() for t in back.turns] == [t.usage.as_dict()
                                                        for t in real_session.turns]
     assert back.cache_ttl() == real_session.cache_ttl()
@@ -203,10 +160,7 @@ def test_every_api_call_of_every_turn_survives_the_seal(real_session):
 
 
 def test_the_boundary_census_is_sealed_and_attributed_back_to_its_turns(real_session):
-    """The census expires with the transcript, so it is SEALED — the opposite treatment to
-    `holds`, which live in the OS's own database and are re-attached live. Unsealed, every
-    boundary, context and rewrite figure of a rehydrated reading reads zero.
-    """
+    """The census expires with the transcript, so it is SEALED"""
     assert len(real_session.boundaries) >= 1
 
     sealed = autopsy.to_seal(real_session, level="normal")
@@ -216,7 +170,7 @@ def test_the_boundary_census_is_sealed_and_attributed_back_to_its_turns(real_ses
         return [(b.ts, b.cause, b.cache_write, b.cache_read, b.gap) for b in a.boundaries]
 
     assert rows(back) == rows(real_session)
-    # Attributed to the SAME turns, not merely carried at the session level.
+    # Attributed to the SAME turns, not merely carried at the session level
     assert [len(t.boundaries) for t in back.turns] == \
         [len(t.boundaries) for t in real_session.turns]
     assert [[b.cause for b in t.boundaries] for t in back.turns] == \
@@ -227,9 +181,7 @@ def test_the_boundary_census_is_sealed_and_attributed_back_to_its_turns(real_ses
 
 
 def test_a_payload_with_no_census_rehydrates_to_an_empty_one(real_session):
-    """The ROUND TRIP is what carries the census: a payload sealed before this key existed
-    must read as "not measured" rather than raise. No seal exists in the wild (§3 ships
-    dark), which is why `PAYLOAD_VERSION` stays 1."""
+    """The ROUND TRIP is what carries the census: a payload sealed before this key existed must read as..."""
     sealed = autopsy.to_seal(real_session, level="normal")
     assert sealed["boundaries"]
     sealed.pop("boundaries")
@@ -243,8 +195,7 @@ def test_a_payload_with_no_census_rehydrates_to_an_empty_one(real_session):
 
 def test_a_seal_reads_at_the_same_cold_prefix_floor_as_every_other_reader(
         store, spec, write_transcript, monkeypatch):
-    """Read at a lower floor than `jarvis inspect` reads at and a sealed boundary says
-    `undecided` where the live reading decided it — the same floor `supervisor` passes."""
+    """Read at a lower floor than `jarvis inspect` reads at and a sealed boundary says `undecided` where..."""
     from jarvis import ops
 
     wo = settled_with_a_session(store, write_transcript, "sess-floor")
@@ -261,8 +212,7 @@ def test_a_seal_reads_at_the_same_cold_prefix_floor_as_every_other_reader(
 
 
 def test_the_three_measured_writes_survive_the_seal_by_cause(real_session):
-    """`tests/test_inspection.py:82`'s three, and the causes are the whole point: two of
-    them are ~180k tokens each, look identical on a bill and have different fixes."""
+    """`tests/test_inspection.py:82`'s three"""
     back = autopsy.from_seal(autopsy.to_seal(real_session, level="normal"), spans=[])
 
     assert [(w.written, w.read, w.cause) for w in back.writes] == [
@@ -273,7 +223,7 @@ def test_the_three_measured_writes_survive_the_seal_by_cause(real_session):
 
 
 def test_the_seal_is_not_the_rendered_payload(real_session):
-    """§3's trap, pinned so a later refactor cannot collapse the two."""
+    """§3's trap, pinned so a later refactor cannot collapse the two"""
     sealed = autopsy.to_seal(real_session, level="normal")
 
     assert sealed != real_session.as_dict()
@@ -281,9 +231,7 @@ def test_the_seal_is_not_the_rendered_payload(real_session):
 
 
 def test_the_payload_states_the_floors_and_the_level_it_was_taken_at(real_session):
-    """A seal taken at 20000 holds no write below 20000, ever — so it says so. And the
-    level is recorded from day one: without it "no params" is ambiguous between "sealed at
-    `normal`" and "this order ran no tools"."""
+    """A seal taken at 20000 holds no write below 20000, ever — so it says so"""
     sealed = autopsy.to_seal(real_session, level="normal")
 
     assert sealed["write_floor"] == catalog.DEFAULT_INSPECT_REPORT_WRITE_FLOOR == 20_000
@@ -293,8 +241,7 @@ def test_the_payload_states_the_floors_and_the_level_it_was_taken_at(real_sessio
 
 
 def test_a_seal_written_before_the_level_existed_reads_as_unknown():
-    """A third state, distinct from `normal` and `full`: the ambiguity §3 exists to close
-    must not come back as a default."""
+    """A third state, distinct from `normal` and `full`: the ambiguity §3 exists to close must not come..."""
     older = {"payload_v": 1, "session_id": "s", "found": True, "turns": []}
 
     assert autopsy.level_of(older) == autopsy.UNKNOWN
@@ -303,7 +250,7 @@ def test_a_seal_written_before_the_level_existed_reads_as_unknown():
                            "autopsy_sealed_at": 5.0})["autopsy_level"] == autopsy.UNKNOWN
 
 
-# -- the caps, proven by reconciling the folded numbers ---------------------------------
+# -- the caps, proven by reconciling the folded numbers
 
 
 def big_span_session(write_transcript, count: int) -> str:
@@ -317,9 +264,7 @@ def big_span_session(write_transcript, count: int) -> str:
 
 
 def test_the_span_cap_keeps_the_dearest_and_the_fold_reconciles(write_transcript):
-    """500 per turn, keeping the dearest by seconds — and the folded seconds are carried
-    per tool NAME, so they reconcile against BOTH `Turn.tools` and `Turn.blocked`
-    (join-ness is derivable from the name through `inspection.JOIN_TOOLS`)."""
+    """500 per turn, keeping the dearest by seconds"""
     session = big_span_session(write_transcript, autopsy.TURN_SPAN_LIMIT + 5)
     a = inspection.read_session(session)
     (turn,) = a.turns
@@ -329,7 +274,7 @@ def test_the_span_cap_keeps_the_dearest_and_the_fold_reconciles(write_transcript
 
     assert autopsy.TURN_SPAN_LIMIT == 500
     assert len(sealed["spans"]) == 500 and fold["count"] == 5
-    # The dearest were kept: the five folded are the five shortest.
+    # The dearest were kept: the five folded are the five shortest
     assert max(s["ended"] - s["started"] for s in sealed["spans"]) == \
         max(s.seconds for s in turn.spans)
     kept_join = sum(s["ended"] - s["started"] for s in sealed["spans"]
@@ -347,10 +292,7 @@ def test_the_span_cap_keeps_the_dearest_and_the_fold_reconciles(write_transcript
 
 
 def test_the_call_cap_carries_the_folded_remainder_as_numbers(write_transcript):
-    """Folding calls changes `usage`, `context_peak`, `cache_ttl()` and
-    `rewrite_excess()`, so the remainder is carried as numbers or all four become lies.
-    No synthetic call stands in for a folded one — a fabricated row would be read as an
-    API call that happened."""
+    """Folding calls changes `usage`, `context_peak`"""
     count = autopsy.TURN_CALL_LIMIT + 5
     rows = [prompt_row(0, "You are the worker agent for wo-1")]
     rows += [assistant_row(10 + i, f"m{i}", write=100 + i, read=50 * i,
@@ -368,9 +310,7 @@ def test_the_call_cap_carries_the_folded_remainder_as_numbers(write_transcript):
     assert autopsy.TURN_CALL_LIMIT == 200
     assert len(sealed["calls"]) == 200 and fold["count"] == 5
     assert len(back.turns[0].calls) == 200, "nothing invented to stand in for a fold"
-    # All four of the figures a fold would otherwise falsify, reconciled. The ADDITIVE
-    # token keys by sum; `rewrite_excess` is max(0, sum(cache_write) - context_peak) and
-    # is NOT additive, so it reconciles by its own definition from the fold's numbers.
+    # All four of the figures a fold would otherwise falsify, reconciled
     combined = back.turns[0].usage + usage_of_fold(fold)
     live = turn.usage.as_dict()
     additive = ("messages", "input", "cache_write", "cache_read", "output",
@@ -382,7 +322,7 @@ def test_the_call_cap_carries_the_folded_remainder_as_numbers(write_transcript):
     written = sum(c.cache_write for c in back.turns[0].calls) + fold["cache_write"]
     assert max(0, written - turn.context_peak) == a.rewrite_excess()
     assert written - turn.context_peak == live["rewrite_excess"] > 0
-    # And therefore the dollar figure derived from it, which the fold's numbers restate.
+    # And therefore the dollar figure derived from it, which the fold's numbers restate
     restated = usage.Usage(
         messages=combined.messages, input=combined.input,
         cache_write=combined.cache_write, cache_read=combined.cache_read,
@@ -394,7 +334,7 @@ def test_the_call_cap_carries_the_folded_remainder_as_numbers(write_transcript):
 
 
 def test_the_subagent_cap_says_how_many_were_not_sealed(write_transcript):
-    """Depth was already bounded by `SUBAGENT_DEPTH_READ`; breadth was not."""
+    """Depth was already bounded by `SUBAGENT_DEPTH_READ`; breadth was not"""
     count = autopsy.SUBAGENT_LIMIT + 1
     rows = [prompt_row(0, "You are the worker agent for wo-1")]
     for i in range(count):
@@ -419,10 +359,7 @@ def test_the_subagent_cap_says_how_many_were_not_sealed(write_transcript):
 
 def test_the_payload_ceiling_drops_in_the_order_the_spec_states(write_transcript,
                                                                 monkeypatch):
-    """params, then subagent params, then subagent spans, then spans past the per-turn
-    limit — each drop ANNOUNCED. The ceiling is lowered for the test rather than a
-    megabyte of synthetic transcript written: the rungs are what is under test, and the
-    shipped ceiling is asserted separately."""
+    """params, then subagent params, then subagent spans, then spans past the per-turn limit"""
     assert autopsy.PAYLOAD_CEILING == 1_000_000
 
     rows = [prompt_row(0, "You are the worker agent for wo-1")]
@@ -444,14 +381,13 @@ def test_the_payload_ceiling_drops_in_the_order_the_spec_states(write_transcript
     whole = len(json.dumps(autopsy.to_seal(a, level="normal")))
     assert "dropped_for_size" not in autopsy.to_seal(a, level="normal")
 
-    # One byte under: the FIRST rung with anything to give up runs, and only it — params
-    # are never sealed at `normal`, so rungs 1 and 2 have nothing to drop.
+    # One byte under: the FIRST rung with anything to give up runs, and only it
     monkeypatch.setattr(autopsy, "PAYLOAD_CEILING", whole - 1)
     once = autopsy.to_seal(a, level="normal")
 
     assert once["dropped_for_size"] == ["subagent_spans"]
     assert once["turns"][0]["spans"], "the lead agent's own spans were not touched yet"
-    # Announced with NUMBERS, so the seconds still reconcile after the drop.
+    # Announced with NUMBERS, so the seconds still reconcile after the drop
     sub_fold = once["turns"][0]["subagents"][0]["turns"][0]["spans_folded"]
     assert sub_fold["count"] == 20
     assert sub_fold["seconds"] == pytest.approx(sub_seconds)
@@ -468,14 +404,7 @@ def test_the_payload_ceiling_drops_in_the_order_the_spec_states(write_transcript
                                                            + a.turns[0].blocked)
 
 
-# -- the redaction battery, over a seal at EITHER level (§3, §6's cases) ---------------
-#
-# Triggers (`Prompt.quote`) and span detail are user-authored text and both ARE sealed at
-# either level, so §6's battery runs over both. `params` are sealed at `full`, so the pair
-# shape `_credential_pair` catches — a credential-NAMED dict key holding a credential-
-# SHAPED value — is reachable from a seal now and IS asserted, below, along with the
-# nested-leaf case. Its ASSIGNMENT form, the same named key inside a sealed string, is
-# what the `normal` half of the battery can reach.
+# -- the redaction battery, over a seal at EITHER level (§3, §6's cases)
 
 
 def leaky_session(write_transcript, name: str, secret: str, *,
@@ -493,9 +422,7 @@ LEVELS = ("normal", "full")
 @pytest.mark.parametrize("level", LEVELS)
 def test_a_secret_in_a_bash_command_never_reaches_a_seal_at_either_level(
         write_transcript, level):
-    """§6's case over the seal: an undescribed `Bash` call puts the command line in
-    `ToolSpan.detail`, which IS sealed, so a token there is sealed too unless redaction
-    ran before the value was stored."""
+    """§6's case over the seal: an undescribed `Bash` call puts the command line in `ToolSpan.detail`"""
     secret = "sk-live-0ff1ce9a7b3c2d"
     a = inspection.read_session(leaky_session(
         write_transcript, "seal-leaky-bash", secret,
@@ -514,8 +441,7 @@ def test_a_secret_in_a_bash_command_never_reaches_a_seal_at_either_level(
 @pytest.mark.parametrize("level", LEVELS)
 def test_a_credential_named_key_in_a_command_never_reaches_a_seal_at_either_level(
         write_transcript, level):
-    """The named-key case in both forms a seal can carry it: an assignment inside a sealed
-    string at either level, and the `params` pair itself once `full` seals them."""
+    """The named-key case in both forms a seal can carry it: an assignment inside a sealed string at..."""
     secret = "hunter2000abc"
     a = inspection.read_session(leaky_session(
         write_transcript, "seal-leaky-key", secret,
@@ -541,9 +467,7 @@ def test_a_credential_named_key_in_a_command_never_reaches_a_seal_at_either_leve
 ])
 def test_a_secret_a_user_typed_never_reaches_a_seal_at_either_level(
         write_transcript, secret, prompt, level):
-    """A trigger quote is whatever the user or Jarvis typed, so it carries both of §6's
-    cases — and a seal outlives the transcript it was read from, so an unredacted quote is
-    a credential the OS keeps for ever in its own database."""
+    """A trigger quote is whatever the user or Jarvis typed, so it carries both of §6's cases"""
     a = inspection.read_session(leaky_session(
         write_transcript, f"seal-leaky-trigger-{secret[:4]}", secret,
         command="gh pr list", prompt=prompt))
@@ -556,11 +480,7 @@ def test_a_secret_a_user_typed_never_reaches_a_seal_at_either_level(
         sealed["turns"][0]["triggers"][0]["quote"]
 
 
-#: A value the credential test accepts whole and REJECTS once it is cut to five
-#: characters: the shape is "six or more with a digit and a letter". Cutting first
-#: therefore seals the head of a credential the redaction would have replaced entirely —
-#: which is exactly what the ORDER claim is about, and a longer cut proves nothing because
-#: the pattern still matches what survives it.
+#: A value the credential test accepts whole and REJECTS once it is cut to five characters: the shape...
 CUTTABLE_SECRET = "a1b2c3d4e5f6g7h8i9j0"
 CUT_HEAD = CUTTABLE_SECRET[:5]
 
@@ -568,8 +488,7 @@ CUT_HEAD = CUTTABLE_SECRET[:5]
 @pytest.mark.parametrize("level", LEVELS)
 def test_a_sealed_detail_is_redacted_before_it_is_truncated_at_either_level(
         write_transcript, level):
-    """Order, in the seal: truncating first would cut the assignment short and seal the
-    HEAD of the credential. A cut marker is a cosmetic loss; half a secret is not."""
+    """Order, in the seal: truncating first would cut the assignment short and seal the HEAD of the..."""
     command = f"DB_PASSWORD={CUTTABLE_SECRET} ./deploy.sh"
     a = inspection.read_session(
         leaky_session(write_transcript, "seal-cut-detail", CUTTABLE_SECRET,
@@ -580,7 +499,7 @@ def test_a_sealed_detail_is_redacted_before_it_is_truncated_at_either_level(
     span = sealed["turns"][0]["spans"][0]
 
     assert CUT_HEAD not in json.dumps(sealed)
-    # The marker's own head is what the cut lands in, which is the cosmetic loss.
+    # The marker's own head is what the cut lands in, which is the cosmetic loss
     assert span["detail"].startswith("DB_PASSWORD=<red")
     if level == "full":
         assert inspection.CREDENTIAL_VALUE_MARKER in span["params"]["command"]
@@ -589,8 +508,7 @@ def test_a_sealed_detail_is_redacted_before_it_is_truncated_at_either_level(
 @pytest.mark.parametrize("level", LEVELS)
 def test_a_sealed_trigger_quote_is_redacted_before_it_is_capped_at_either_level(
         write_transcript, level):
-    """The same order on the other sealed string: the quote cap must never leave the head
-    of a credential standing where the whole value would have been replaced."""
+    """The same order on the other sealed string: the quote cap must never leave the head of a credential..."""
     prompt = f"DB_PASSWORD={CUTTABLE_SECRET} is what staging takes"
     a = inspection.read_session(
         leaky_session(write_transcript, "seal-cut-trigger", CUTTABLE_SECRET,
@@ -603,13 +521,11 @@ def test_a_sealed_trigger_quote_is_redacted_before_it_is_capped_at_either_level(
     assert sealed["turns"][0]["triggers"][0]["quote"].startswith("DB_PASSWORD=<red")
 
 
-# -- the two cases only `params` can carry, reachable from a seal at `full` (§6) --------
+# -- the two cases only `params` can carry, reachable from a seal at `full` (§6)
 
 
 def test_a_credential_named_param_key_is_replaced_whole_in_a_full_seal(write_transcript):
-    """The pair shape `inspection._credential_pair` catches: a credential-NAMED dict key
-    holding a credential-SHAPED value. No sealed string carries it — only `params` do — so
-    this case was unreachable from a seal until `full` sealed them."""
+    """The pair shape `inspection._credential_pair` catches: a credential-NAMED dict key holding a..."""
     session = write_transcript("seal-pair", [
         prompt_row(0, "You are the worker agent for wo-1"),
         *tool_rows(1, 2, "t1", "Bash",
@@ -625,9 +541,7 @@ def test_a_credential_named_param_key_is_replaced_whole_in_a_full_seal(write_tra
 
 
 def test_a_secret_in_a_nested_edit_never_reaches_a_full_seal(write_transcript):
-    """`test_a_secret_in_a_nested_edit_never_reaches_the_payload`'s case over the seal: a
-    `MultiEdit` input is a list of dicts, so the credential is a LEAF that neither
-    assignment regex sees after `json.dumps`."""
+    """`test_a_secret_in_a_nested_edit_never_reaches_the_payload`'s case over the seal: a `MultiEdit`..."""
     token = "ghp_A1b2C3d4E5f6G7h8I9j0"
     session = write_transcript("seal-nested-edit", [
         prompt_row(0, "You are the worker agent for wo-1"),
@@ -645,10 +559,7 @@ def test_a_secret_in_a_nested_edit_never_reaches_a_full_seal(write_transcript):
 
 
 def test_a_sealed_param_value_is_redacted_before_it_is_truncated(write_transcript):
-    """The order claim on a sealed PARAM, where `ParamCaps.per_value` is 500 and is not
-    configurable: the cut is built to land FIVE characters into the secret, so cutting
-    first would seal `CUT_HEAD` — which the credential SHAPE no longer matches, making a
-    later redaction incapable of removing it."""
+    """The order claim on a sealed PARAM"""
     caps = inspection.PARAM_CAPS
     head, assign, tail = "echo ", " DB_PASSWORD=", " ./deploy.sh"
     filler = "x" * (caps.per_value - len(head) - len(assign) - len(CUT_HEAD))
@@ -670,9 +581,7 @@ def test_a_sealed_param_value_is_redacted_before_it_is_truncated(write_transcrip
 
 def test_a_sealed_param_dropped_for_the_turn_budget_is_announced_and_leaks_nothing(
         write_transcript):
-    """The other order claim: redact BEFORE cap. Once a turn has spent `per_turn` the
-    later span's keys are DROPPED, and the seal must say which — a payload that drops
-    silently is not reproducible, and the value must never have carried the secret."""
+    """The other order claim: redact BEFORE cap"""
     caps = inspection.PARAM_CAPS
     rows = [prompt_row(0, "You are the worker agent for wo-1")]
     for i in range(caps.per_turn // caps.per_span):
@@ -691,13 +600,12 @@ def test_a_sealed_param_dropped_for_the_turn_budget_is_announced_and_leaks_nothi
     assert last["params_dropped"] == ["description", "command"]
 
 
-# -- nested subagents at `full`, and the field a rehydration must not lose (§6) ---------
+# -- nested subagents at `full`, and the field a rehydration must not lose (§6)
 
 
 def test_a_nested_subagent_s_params_survive_the_round_trip_at_full(write_transcript,
                                                                   tmp_path):
-    """§6's other half: nested subagent anatomies WITH their params. The nesting is
-    recursive, so the level has to reach a subagent's own spans and not only the lead's."""
+    """§6's other half: nested subagent anatomies WITH their params"""
     session = write_transcript("nested-full", parent_rows(),
                               subagents={f"agent-{TASK}": sub_rows(1100, write=25_000)})
     write_meta(tmp_path, session, TASK, "explorer")
@@ -711,11 +619,9 @@ def test_a_nested_subagent_s_params_survive_the_round_trip_at_full(write_transcr
 
 
 def test_a_subagent_s_threshold_free_figures_survive_the_seal(write_transcript):
-    """Spec 2026-10-02 §1.3: a sealed order is the only reading left once the transcript
-    expires, so a field the seal drops becomes a silent zero on every settled order —
-    the exact failure mode this spec fixes."""
+    """Spec 2026-10-02 §1.3: a sealed order is the only reading left once the transcript expires"""
     rows = under_floor_rows(1100) + [
-        # One cache read going BACKWARDS, so there is a boundary to round-trip too.
+        # One cache read going BACKWARDS, so there is a boundary to round-trip too
         assistant_row(1200, "s-back", write=5_000, read=1_000)]
     session = write_transcript("sealed-floor", parent_rows(),
                                subagents={f"agent-{TASK}": rows})
@@ -737,8 +643,7 @@ def test_a_subagent_s_threshold_free_figures_survive_the_seal(write_transcript):
 
 def test_a_secret_in_a_nested_subagent_s_params_never_reaches_a_full_seal(
         write_transcript, tmp_path):
-    """The nesting is REDACTED and not copied: the secret lives only in the subagent's own
-    span params, which is a place the lead's sealed strings can never speak for."""
+    """The nesting is REDACTED and not copied: the secret lives only in the subagent's own span params"""
     secret = "sk-live-0ff1ce9a7b3c2d"
     session = write_transcript("nested-leak", parent_rows(), subagents={
         f"agent-{TASK}": [
@@ -761,9 +666,7 @@ def test_a_secret_in_a_nested_subagent_s_params_never_reaches_a_full_seal(
 
 def test_a_backgrounded_delegation_span_is_still_backgrounded_after_the_seal(
         write_transcript):
-    """Neo 1124: `backgrounded` is sealed at EVERY level because `ToolSpan.is_join`
-    derives from it. Without the field a backgrounded `Agent` rehydrates as a join and
-    `Turn.blocked` counts seconds the live reading never did."""
+    """Neo 1124: `backgrounded` is sealed at EVERY level because `ToolSpan.is_join` derives from it"""
     a = inspection.read_session(write_transcript("backgrounded", [
         prompt_row(0, "You are the worker agent for wo-1"),
         *tool_rows(1, 100, "bg", "Agent",
@@ -784,8 +687,7 @@ def test_a_backgrounded_delegation_span_is_still_backgrounded_after_the_seal(
 
 
 def fat_full_session(write_transcript, name: str):
-    """A session with params on the lead's spans AND a nested subagent's, fat enough that
-    the ceiling bites — the two params rungs and the sentence they force share it."""
+    """A session with params on the lead's spans AND a nested subagent's"""
     rows = [prompt_row(0, "You are the worker agent for wo-1")]
     rows += tool_rows(10, 20, "tool0", "Agent", {"task_id": "sub0"})
     rows += [r for i in range(30)
@@ -802,11 +704,7 @@ def fat_full_session(write_transcript, name: str):
 
 
 def params_dropped_seal(a, monkeypatch, *, rungs: int) -> dict:
-    """The same `full` seal after `rungs` of the ceiling's params rungs have bitten.
-
-    `_fit` measures with `db.to_json`, so the ceiling is set in THOSE bytes, and the
-    second step measures the payload WITHOUT its own announcement.
-    """
+    """The same `full` seal after `rungs` of the ceiling's params rungs have bitten"""
     whole = len(db.to_json(autopsy.to_seal(a, level="full")))
     monkeypatch.setattr(autopsy, "PAYLOAD_CEILING", whole - 1)
     payload = autopsy.to_seal(a, level="full")
@@ -820,11 +718,10 @@ def params_dropped_seal(a, monkeypatch, *, rungs: int) -> dict:
 
 def test_the_payload_ceiling_drops_the_two_params_rungs_first_at_full(write_transcript,
                                                                      monkeypatch):
-    """§6 activates rungs 1 and 2 of section 3's ceiling: at `full` the parameters are the
-    FIRST thing given up, the lead's before the subagents'."""
+    """§6 activates rungs 1 and 2 of section 3's ceiling: at `full` the parameters are the FIRST thing..."""
     a = fat_full_session(write_transcript, "fat-full")
 
-    # `_fit` measures with `db.to_json`, so the ceiling is set in THOSE bytes.
+    # `_fit` measures with `db.to_json`, so the ceiling is set in THOSE bytes
     whole = len(db.to_json(autopsy.to_seal(a, level="full")))
     monkeypatch.setattr(autopsy, "PAYLOAD_CEILING", whole - 1)
     once = autopsy.to_seal(a, level="full")
@@ -833,8 +730,7 @@ def test_the_payload_ceiling_drops_the_two_params_rungs_first_at_full(write_tran
     assert not (keys_of(once["turns"][0]["spans"][0]) & set(PARAM_KEYS))
     assert once["turns"][0]["subagents"][0]["turns"][0]["spans"][0]["params"]
 
-    # The ceiling is checked BEFORE `dropped_for_size` is added, so the announcement's own
-    # bytes are not part of what the next rung is measured against.
+    # The ceiling is checked BEFORE `dropped_for_size` is added
     unannounced = {k: v for k, v in once.items() if k != "dropped_for_size"}
     monkeypatch.setattr(autopsy, "PAYLOAD_CEILING", len(db.to_json(unannounced)) - 1)
     twice = autopsy.to_seal(a, level="full")
@@ -843,7 +739,7 @@ def test_the_payload_ceiling_drops_the_two_params_rungs_first_at_full(write_tran
     assert not (keys_of(twice["turns"][0]["subagents"][0]) & set(PARAM_KEYS))
 
 
-# -- the empty-params sentence, three states and one renderer (§6) ----------------------
+# -- the empty-params sentence, three states and one renderer (§6)
 
 
 def test_an_empty_params_at_normal_says_the_level_did_not_record_them():
@@ -859,8 +755,7 @@ def test_an_empty_params_at_full_says_the_order_ran_no_tools():
 
 
 def test_an_empty_params_on_a_seal_predating_the_level_is_a_third_state():
-    """The ambiguity §6 exists to close must not come back as a default: three levels,
-    three DIFFERENT claims, and nothing to say when there ARE parameters."""
+    """The ambiguity §6 exists to close must not come back as a default: three levels"""
     notes = [autopsy.params_note(level, False)
              for level in (autopsy.NORMAL, autopsy.FULL, autopsy.UNKNOWN)]
 
@@ -873,8 +768,7 @@ def test_an_empty_params_on_a_seal_predating_the_level_is_a_third_state():
 
 def test_a_full_seal_whose_params_the_ceiling_dropped_does_not_claim_it_ran_no_tools(
         write_transcript, monkeypatch):
-    """The sentence would LIE: both params rungs went to fit the ceiling, so the payload
-    holds no `params` key anywhere about an order that ran tools by the dozen."""
+    """The sentence would LIE: both params rungs went to fit the ceiling"""
     a = fat_full_session(write_transcript, "fat-note")
     twice = params_dropped_seal(a, monkeypatch, rungs=2)
     assert twice["dropped_for_size"][:2] == ["params", "subagent_params"]
@@ -889,9 +783,7 @@ def test_a_full_seal_whose_params_the_ceiling_dropped_does_not_claim_it_ran_no_t
 
 def test_only_the_lead_s_params_dropped_is_still_explained_though_some_remain(
         write_transcript, monkeypatch):
-    """Rung 1 alone: the nested subagents keep theirs, so `any_params` is True and the
-    short-circuit would leave the lead's absence unexplained. The dropped case is decided
-    FIRST for exactly this."""
+    """Rung 1 alone: the nested subagents keep theirs"""
     a = fat_full_session(write_transcript, "fat-note-one")
     once = params_dropped_seal(a, monkeypatch, rungs=1)
     assert once["dropped_for_size"] == ["params"]
@@ -907,8 +799,7 @@ def test_only_the_lead_s_params_dropped_is_still_explained_though_some_remain(
 
 def test_the_renderer_prints_the_dropped_for_size_sentence_too(write_transcript,
                                                                monkeypatch, capsys):
-    """The case a wrong sentence damages most: the renderer composes none of this one
-    either."""
+    """The case a wrong sentence damages most: the renderer composes none of this one either"""
     a = fat_full_session(write_transcript, "fat-render")
     twice = params_dropped_seal(a, monkeypatch, rungs=2)
     provenance = autopsy._provenance(autopsy.SEALED, anatomy=a, sealed=twice)
@@ -922,7 +813,7 @@ def test_the_renderer_prints_the_dropped_for_size_sentence_too(write_transcript,
 
 def test_the_provenance_carries_the_sentence_and_the_renderer_prints_it(real_session,
                                                                        capsys):
-    """The renderer composes NOTHING: the sentence it prints is the payload's own."""
+    """The renderer composes NOTHING: the sentence it prints is the payload's own"""
     sealed = autopsy.to_seal(real_session, level="normal")
     sealed["sealed_at"] = 5.0
     provenance = autopsy._provenance(autopsy.SEALED, anatomy=real_session, sealed=sealed)
@@ -934,7 +825,7 @@ def test_the_provenance_carries_the_sentence_and_the_renderer_prints_it(real_ses
     assert provenance["params_note"] in capsys.readouterr().out
 
 
-# -- the daemon step, and the level that gates it ---------------------------------------
+# -- the daemon step, and the level that gates it
 
 
 @pytest.fixture()
@@ -942,22 +833,19 @@ def spec(registered):
     return catalog.ProjectSpec(name="proj_a", path=registered)
 
 
-#: The lead's verbatim parameters on the daemon's session — §6's pass-through is only
-#: observable if there IS a parameter to find in `autopsy_json`.
+#: The lead's verbatim parameters on the daemon's session
 DAEMON_PARAMS = {"description": "list the tree", "command": "ls -la /tmp/proj"}
 
 
 def at_level(spec, level: str):
-    """The same project at one observability level — §5's gate is a REAL level, never a
-    patched predicate."""
+    """The same project at one observability level — §5's gate is a REAL level, never a patched predicate"""
     return dataclasses.replace(
         spec, observability=catalog.ObservabilityConfig(level=level))
 
 
 def settled_with_a_session(store, write_transcript, session: str,
                            tools: bool = False) -> dict:
-    """One settled order with a transcript. `tools=True` adds a span carrying
-    `DAEMON_PARAMS`: the call counts other daemon tests pin stay at one without it."""
+    """One settled order with a transcript"""
     wo = store.create_work_order("an order that finished", "")
     store.conn.execute("UPDATE work_orders SET session_id=? WHERE id=?",
                        (session, wo["id"]))
@@ -973,9 +861,7 @@ def settled_with_a_session(store, write_transcript, session: str,
 def test_the_daemon_seals_every_settled_order_and_only_once(store, spec,
                                                             write_transcript,
                                                             monkeypatch):
-    """One place to get it right, and it catches the orders that settled before this
-    existed while their evidence is still on disk. The project names no level, so §5's
-    fleet default `normal` seals it."""
+    """One place to get it right, and it catches the orders that settled before this existed while their..."""
     wo = settled_with_a_session(store, write_transcript, "sess-tick")
     open_wo = store.create_work_order("still running", "")
     store.set_status(open_wo["id"], "running")
@@ -990,7 +876,7 @@ def test_the_daemon_seals_every_settled_order_and_only_once(store, spec,
     sealed = store.get_work_order(wo["id"])
     assert sealed["autopsy_json"] and sealed["autopsy_sealed_at"]
     assert len(walks) == 1, "one index of the transcript tree for the whole batch"
-    # An open order is not sealed: it has not finished spending.
+    # An open order is not sealed: it has not finished spending
     assert store.get_work_order(open_wo["id"])["autopsy_json"] is None
     assert store.unsealed_autopsy_orders() == []
     was = sealed["autopsy_sealed_at"]
@@ -1000,8 +886,7 @@ def test_the_daemon_seals_every_settled_order_and_only_once(store, spec,
 
 def test_an_order_whose_autopsy_raises_leaves_the_queue_with_an_error_payload(
         store, spec, write_transcript, monkeypatch):
-    """Sealed EMPTY rather than left pending: one order that cannot be read must not park
-    itself at the head of the queue and block every order behind it for ever."""
+    """Sealed EMPTY rather than left pending: one order that cannot be read must not park itself at the..."""
     monkeypatch.setattr(autopsy, "seal", lambda *a, **k: 1 / 0)
     wo = settled_with_a_session(store, write_transcript, "sess-broken")
 
@@ -1014,8 +899,7 @@ def test_an_order_whose_autopsy_raises_leaves_the_queue_with_an_error_payload(
 
 def test_a_project_at_level_off_has_no_autopsy_sealed_at_all(store, spec,
                                                              write_transcript):
-    """§5: the gate is `level_for(...) != OFF`, so `off` is how a project declines and
-    nothing is frozen onto its orders."""
+    """§5: the gate is `level_for(...) != OFF`"""
     off = at_level(spec, "off")
     wo = settled_with_a_session(store, write_transcript, "sess-off")
 
@@ -1029,8 +913,7 @@ def test_a_project_at_level_off_has_no_autopsy_sealed_at_all(store, spec,
 
 def test_a_project_at_level_normal_seals_and_the_payload_says_normal(store, spec,
                                                                     write_transcript):
-    """§5: `normal` covers the autopsy, and the level the gate resolved is recorded as
-    `autopsy_level`."""
+    """§5: `normal` covers the autopsy, and the level the gate resolved is recorded as `autopsy_level`"""
     wo = settled_with_a_session(store, write_transcript, "sess-normal")
 
     Daemon.seal_autopsies(Daemon.__new__(Daemon), at_level(spec, "normal"), store)
@@ -1041,8 +924,7 @@ def test_a_project_at_level_normal_seals_and_the_payload_says_normal(store, spec
 
 def test_a_project_at_level_full_seals_with_full_through_the_daemon(store, spec,
                                                                    write_transcript):
-    """§5's pass-through, end to end: the resolved level is used TWICE, as the gate and as
-    `seal(level=...)`. Without the second use `full` ships dark while every test passes."""
+    """§5's pass-through, end to end: the resolved level is used TWICE"""
     wo = settled_with_a_session(store, write_transcript, "sess-full")
 
     Daemon.seal_autopsies(Daemon.__new__(Daemon), at_level(spec, "full"), store)
@@ -1054,8 +936,7 @@ def test_a_project_at_level_full_seals_with_full_through_the_daemon(store, spec,
 
 def test_the_daemon_at_level_full_writes_the_verbatim_params_into_autopsy_json(
         store, spec, write_transcript):
-    """§6 through §5's pass-through: the STORED payload is what a reader gets, so the
-    parameters have to survive the daemon step and not only `to_seal`."""
+    """§6 through §5's pass-through: the STORED payload is what a reader gets"""
     wo = settled_with_a_session(store, write_transcript, "sess-full-params",
                                 tools=True)
 
@@ -1068,8 +949,7 @@ def test_the_daemon_at_level_full_writes_the_verbatim_params_into_autopsy_json(
 
 def test_the_daemon_at_level_normal_writes_no_params_key_into_autopsy_json_at_all(
         store, spec, write_transcript):
-    """The other half of the same seam, over the same session with the same tool: at
-    `normal` there is no `params` key ANYWHERE, not an empty one."""
+    """The other half of the same seam"""
     wo = settled_with_a_session(store, write_transcript, "sess-normal-params",
                                 tools=True)
 
@@ -1081,8 +961,7 @@ def test_the_daemon_at_level_normal_writes_no_params_key_into_autopsy_json_at_al
 
 def test_a_project_with_no_observability_block_is_still_sealed(store, spec,
                                                                write_transcript):
-    """§5: where "opt in per project" and "the default is `normal`" collide, the DEFAULT
-    wins — a project never has to name a level before its orders are sealed."""
+    """§5: where "opt in per project" and "the default is `normal`" collide, the DEFAULT wins"""
     parsed = catalog.parse_catalog({"projects": [{"name": "proj_a", "path": "/tmp/a"}]})
     silent = dataclasses.replace(spec, observability=parsed.projects[0].observability)
     wo = settled_with_a_session(store, write_transcript, "sess-no-block")
@@ -1098,8 +977,7 @@ def test_a_project_with_no_observability_block_is_still_sealed(store, spec,
 def test_an_autopsy_still_answers_once_the_transcript_is_gone(store, spec,
                                                              write_transcript,
                                                              tmp_path):
-    """The whole reason to seal: Claude Code prunes transcripts on its own schedule, and
-    an order read afterwards must not report a shorter clock than it ran."""
+    """The whole reason to seal: Claude Code prunes transcripts on its own schedule"""
     wo = settled_with_a_session(store, write_transcript, "sess-pruned")
     Daemon.seal_autopsies(Daemon.__new__(Daemon), spec, store)
     before = autopsy.unseal(store.get_work_order(wo["id"]))
@@ -1115,15 +993,12 @@ def test_an_autopsy_still_answers_once_the_transcript_is_gone(store, spec,
     assert [w.written for w in back.writes] == [30_000]
 
 
-# -- the versioned re-seal -------------------------------------------------------------
+# -- the versioned re-seal
 
 
 def test_an_old_payload_is_upgraded_from_itself_and_never_from_the_transcript(
         store, spec, write_transcript, monkeypatch, tmp_path):
-    """The one place a naive copy of the bill is wrong. Re-reading an EXPIRED transcript
-    would overwrite good data with nothing, so an upgrade reads the stored payload ONLY.
-    `autopsy_sealed_at` is preserved — when the order settled is not changed by
-    re-deriving its payload — and `resealed_at` says the re-derivation happened."""
+    """The one place a naive copy of the bill is wrong"""
     wo = settled_with_a_session(store, write_transcript, "sess-old")
     Daemon.seal_autopsies(Daemon.__new__(Daemon), spec, store)
     row = store.get_work_order(wo["id"])
@@ -1146,8 +1021,7 @@ NAV_COMMAND = "grep -rn total_for src/pricing.py"
 
 
 def sealed_at_v1(store, spec, write_transcript, session: str, level: str) -> dict:
-    """One settled order, sealed at `level` and then aged back to a v1 payload — the
-    shape §3's upgrade exists for: a seal written before `navigates_source` was sealed."""
+    """One settled order, sealed at `level` and then aged back to a v1 payload"""
     wo = store.create_work_order("an order that navigated", "")
     store.conn.execute("UPDATE work_orders SET session_id=? WHERE id=?",
                        (session, wo["id"]))
@@ -1169,8 +1043,7 @@ def sealed_at_v1(store, spec, write_transcript, session: str, level: str) -> dic
 
 def test_an_upgraded_seal_re_derives_nav_from_the_stored_command(store, spec,
                                                                  write_transcript):
-    """§3: at `full` the command is in the stored `params`, so the upgrade re-derives the
-    classification from the payload alone."""
+    """§3: at `full` the command is in the stored `params`"""
     row = sealed_at_v1(store, spec, write_transcript, "sess-nav-full", "full")
 
     fresh = autopsy._upgrade_seal("proj_a", store.project_path, row,
@@ -1184,9 +1057,7 @@ def test_an_upgraded_seal_re_derives_nav_from_the_stored_command(store, spec,
 
 def test_an_upgraded_seal_reports_unclassified_rather_than_zero(store, spec,
                                                                 write_transcript):
-    """The other half, and the lossy one: at `normal` no params were ever sealed, so the
-    command cannot be recovered and the span reports UNCLASSIFIED — absent is not zero
-    (issue #227)."""
+    """The other half, and the lossy one: at `normal` no params were ever sealed (#227)"""
     row = sealed_at_v1(store, spec, write_transcript, "sess-nav-normal", "normal")
 
     fresh = autopsy._upgrade_seal("proj_a", store.project_path, row,
@@ -1207,9 +1078,7 @@ def test_nothing_to_upgrade_leaves_the_seal_alone(store, spec, write_transcript)
 
 
 def test_a_fresh_reading_at_a_higher_floor_showing_fewer_writes_is_refused(monkeypatch):
-    """An autopsy has NO monotone quantity: a parser fix can yield fewer spans and a
-    raised floor fewer writes. So the counts are compared AT THE SAME FLOORS, and a floor
-    artefact is never adopted as a correction."""
+    """An autopsy has NO monotone quantity: a parser fix can yield fewer spans and a raised floor fewer..."""
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(FIXTURE_ROOT))
     a = inspection.read_session(FIXTURE_SESSION)
     sealed = autopsy.to_seal(a, level="normal")
@@ -1222,7 +1091,7 @@ def test_a_fresh_reading_at_a_higher_floor_showing_fewer_writes_is_refused(monke
 
 
 def test_a_reading_that_lost_the_transcript_is_refused(monkeypatch, tmp_path):
-    """`found` is false, so there is nothing to adopt and the old seal stands."""
+    """`found` is false, so there is nothing to adopt and the old seal stands"""
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(FIXTURE_ROOT))
     sealed = autopsy.to_seal(inspection.read_session(FIXTURE_SESSION), level="normal")
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(tmp_path / "gone"))
@@ -1235,9 +1104,7 @@ def test_a_reading_that_lost_the_transcript_is_refused(monkeypatch, tmp_path):
 
 def test_a_tick_re_seals_a_settled_order_whose_payload_predates_the_current_version(
         store, spec, write_transcript, monkeypatch, tmp_path):
-    """The WRITER owns the re-seal end to end, on a second bounded queue in the same tick
-    step, so a stale seal repairs itself instead of waiting for a reader. The transcript
-    is DELETED before the tick: the upgrade reads the stored payload only."""
+    """The WRITER owns the re-seal end to end"""
     wo = settled_with_a_session(store, write_transcript, "sess-stale-tick")
     Daemon.seal_autopsies(Daemon.__new__(Daemon), spec, store)
     was = store.get_work_order(wo["id"])["autopsy_sealed_at"]
@@ -1260,9 +1127,7 @@ def test_a_tick_re_seals_a_settled_order_whose_payload_predates_the_current_vers
 
 def test_a_tick_re_seals_a_payload_written_before_the_version_field_existed(
         store, spec, write_transcript, monkeypatch):
-    """The reason the query COALESCEs: a payload frozen before `payload_v` was sealed has
-    no such key, `json_extract` gives NULL, and NULL compares to nothing — so without it
-    the oldest seals in the fleet are the ones that never repair."""
+    """The reason the query COALESCEs: a payload frozen before `payload_v` was sealed has no such key"""
     wo = settled_with_a_session(store, write_transcript, "sess-no-version")
     Daemon.seal_autopsies(Daemon.__new__(Daemon), spec, store)
     payload = json.loads(store.get_work_order(wo["id"])["autopsy_json"])
@@ -1281,8 +1146,7 @@ def test_a_tick_re_seals_a_payload_written_before_the_version_field_existed(
 
 def test_a_tick_writes_nothing_over_a_seal_that_is_already_current(store, spec,
                                                                   write_transcript):
-    """An upgrade that returns None leaves the seal alone — not retried into a loop and
-    not logged as a failure."""
+    """An upgrade that returns None leaves the seal alone"""
     wo = settled_with_a_session(store, write_transcript, "sess-current-tick")
     Daemon.seal_autopsies(Daemon.__new__(Daemon), spec, store)
     before = store.get_work_order(wo["id"])
@@ -1297,7 +1161,7 @@ def test_a_tick_writes_nothing_over_a_seal_that_is_already_current(store, spec,
 def test_a_project_at_level_off_leaves_a_stale_seal_unupgraded_too(store, spec,
                                                                    write_transcript,
                                                                    monkeypatch):
-    """§5's gate covers BOTH queues: at `off` a stale seal is not upgraded either."""
+    """§5's gate covers BOTH queues: at `off` a stale seal is not upgraded either"""
     wo = settled_with_a_session(store, write_transcript, "sess-off-stale")
     Daemon.seal_autopsies(Daemon.__new__(Daemon), spec, store)
     before = store.get_work_order(wo["id"])["autopsy_json"]
@@ -1310,9 +1174,7 @@ def test_a_project_at_level_off_leaves_a_stale_seal_unupgraded_too(store, spec,
 
 def test_an_order_whose_sealed_payload_is_not_json_does_not_stop_the_stale_queue(
         store, spec, write_transcript, monkeypatch):
-    """`json_extract` RAISES on malformed JSON, so one unparseable payload made the query
-    throw and stalled the whole project's autopsy tick. It is simply not on the queue: the
-    other stale order still comes back and the tick still upgrades it."""
+    """`json_extract` RAISES on malformed JSON"""
     bad = settled_with_a_session(store, write_transcript, "sess-bad-json")
     good = settled_with_a_session(store, write_transcript, "sess-good-json")
     Daemon.seal_autopsies(Daemon.__new__(Daemon), spec, store)
@@ -1332,10 +1194,7 @@ def test_an_order_whose_sealed_payload_is_not_json_does_not_stop_the_stale_queue
 
 def test_a_seal_predating_the_threshold_free_keys_rehydrates_absent_and_not_zero(
         write_transcript):
-    """Spec 2026-10-02 §1.3 applied to seals written BEFORE the fields existed: every
-    settled order on this box is one. `row.get("total_written", 0)` turned an ABSENT
-    figure into a measured zero, and the renderer then printed `wrote nothing to the
-    cache` over a subagent that wrote 334,427 tokens (wo-fb7c0fc2, a8e11a7e)."""
+    """Spec 2026-10-02 §1.3 applied to seals written BEFORE the fields existed: every settled order on..."""
     session = write_transcript("old-seal", parent_rows(),
                                subagents={f"agent-{TASK}": under_floor_rows(1100)})
     sealed = autopsy.to_seal(inspection.read_session(session), level="normal")
@@ -1356,8 +1215,7 @@ def test_a_seal_predating_the_threshold_free_keys_rehydrates_absent_and_not_zero
 
 def test_a_seal_from_the_current_code_round_trips_a_real_measured_zero(
         write_transcript):
-    """The other half: a genuine `total_written == 0` is a MEASUREMENT and must survive
-    the seal as 0, never as `None`."""
+    """The other half: a genuine `total_written == 0` is a MEASUREMENT and must survive the seal as 0"""
     session = write_transcript("zero-seal", parent_rows(),
                                subagents={f"agent-{TASK}": sub_rows(1100)})
     a = inspection.read_session(session)

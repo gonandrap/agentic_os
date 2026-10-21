@@ -1,11 +1,4 @@
-"""Marking a work order done — the user closing it themselves.
-
-The dashboard used to offer only Cancel, Hide and Delete, none of which says "the work
-is finished": cancel records that it should not have happened, hide only stops showing
-it, delete destroys the record. `ops.mark_done` is the missing verb, and it borrows two
-behaviours on purpose — it stops the worker like `cancel`, and it refuses over pending
-assumptions like `ack_attention`.
-"""
+"""Marking a work order done — the user closing it themselves"""
 
 from __future__ import annotations
 
@@ -39,7 +32,7 @@ def test_mark_done_completes_the_work_order(started, project):
 
 
 def test_mark_done_kills_a_running_worker_turn(started, fake_claude, project):
-    """The same hazard `cancel` guards: nobody reads the output, the process runs on."""
+    """The same hazard `cancel` guards: nobody reads the output, the process runs on"""
     fake_claude.hold_turns()
     wo = ops.create_work_order("proj_a", "worker still going")
     started.tick()
@@ -67,7 +60,7 @@ def test_mark_done_clears_the_attention_flag(started, project):
 
 
 def test_mark_done_refuses_while_assumptions_are_pending(started, project):
-    """Closing over a pending decision would accept it on the user's behalf."""
+    """Closing over a pending decision would accept it on the user's behalf"""
     wo = ops.create_work_order("proj_a", "has an open question")
     ops.assume(wo["id"], "went with the sqlite backend")
 

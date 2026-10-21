@@ -1,28 +1,4 @@
-"""Screenshot a round's FILED FOLLOW-UPS on the work-order page, for a PR's UI evidence.
-
-`scripts/screenshot_forced_round.py` is the shape this copies. Two rounds again, and the
-pair is the whole claim: round 1 rejected over a blocker and filed two follow-ups, round 2
-passed and filed none. A shot of the filing round alone would not show that an ordinary
-round renders nothing here — which is every round on a fleet that has the panel off.
-
-**THE ISSUES AND THE EVENT ARE FILED BY `ops.file_validation_follow_ups` ITSELF**, not
-seeded by hand. The picture is then evidence of the path the daemon takes: the issue
-links, the cap, the dedupe and the failure counting are whatever that function really
-produces. Only the panel's VERDICT is faked, because a real one would need five model
-calls.
-
-**`gh` IS THE SHIPPED FAKE (`testing.FAKE_GH`), TWO WAYS.** Follow-ups are filed on the
-project under review's own tracker, and this script's project claims `gonandrap/agentic_os`
-as its `origin` so the shot shows plausible issue numbers — which is a PUBLIC tracker, so
-a real `gh` here would open real issues. `JARVIS_GH_BIN` points at the fake and the fake's
-directory goes on `PATH` as well: the belt is the env var `issues.py` reads, the braces
-are for anything that ever shells out to a bare `gh`.
-
-Writes PNGs to docs/screenshots/. Everything it touches lives in a temp `JARVIS_HOME`
-and a temp catalog, so it never reads or writes the live OS:
-
-    uv run python scripts/screenshot_follow_ups.py
-"""
+"""Screenshot a round's FILED FOLLOW-UPS on the work-order page, for a PR's UI evidence"""
 
 from __future__ import annotations
 
@@ -41,9 +17,7 @@ PORT = 8803
 PR = "https://github.com/gonandrap/agentic_os/pull/263"
 JUDGED = "9b2c1d4e5f60718293a4b5c6d7e8f90123456789"
 
-#: EVERY ONE ADMISSIBLE — `file` and `failure` are what `ops.follow_up_admissible`
-#: requires before a finding may become a ticket (spec §10.5), and a script seeded with
-#: pre-§10 findings would photograph an empty section.
+#: EVERY ONE ADMISSIBLE — `file` and `failure` are what `ops.follow_up_admissible` requires before a...
 FINDINGS = [
     {"seat": "maintainer", "round": 1,
      "title": "`_repair` retries a conflict against the check budget",
@@ -59,7 +33,7 @@ FINDINGS = [
 ]
 
 
-#: The finding the second order raises, on a tracker that may be public.
+#: The finding the second order raises, on a tracker that may be public
 WITHHELD = [
     {"seat": "security", "round": 1,
      "title": "`_refund` credits a budget the gate never debited",
@@ -75,13 +49,7 @@ ISSUES = "https://github.com/gonandrap/agentic_os/issues"
 
 
 def _repo(path: Path) -> None:
-    """An empty checkout, the shape `testing.make_git_project` builds for the suite.
-
-    WITH AN `origin`, unlike that helper: `ops.follow_up_repo` reads the remote to decide
-    where the issues go, and a checkout without one exercises the failure path instead —
-    which is a different picture (and one this script's sibling assertion in
-    `tests/test_validation_follow_ups.py` already covers).
-    """
+    """An empty checkout, the shape `testing.make_git_project` builds for the suite"""
     import subprocess
 
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
@@ -90,7 +58,7 @@ def _repo(path: Path) -> None:
 
 
 def _fake_gh(home: Path) -> None:
-    """Install the suite's own fake `gh`, so nothing here can reach a public tracker."""
+    """Install the suite's own fake `gh`, so nothing here can reach a public tracker"""
     import stat
 
     from jarvis.testing import FAKE_GH
@@ -109,7 +77,7 @@ def _fake_gh(home: Path) -> None:
 
 
 def order(store, catalog) -> str:
-    """One work order with a round that filed, and a round that did not."""
+    """One work order with a round that filed, and a round that did not"""
     from jarvis import ops
 
     wo = ops.create_work_order(
@@ -166,12 +134,7 @@ def order(store, catalog) -> str:
 
 
 def withheld_order(store, catalog) -> str:
-    """One work order whose follow-up may NOT be published, so none was filed.
-
-    `FAKE_GH_PRIVATE=0` is the whole difference: the privacy read answers PUBLIC, the
-    seat's words stay off the tracker, and — since spec §10 — the issue stays off it too.
-    The finding is kept whole on the internal record and the page says so.
-    """
+    """One work order whose follow-up may NOT be published, so none was filed"""
     from jarvis import ops
 
     wo = ops.create_work_order(
@@ -248,17 +211,14 @@ def shoot(wo_id: str, kept_id: str) -> None:
         page.locator("h2", has_text="Tracker issues").first.scroll_into_view_if_needed()
         page.wait_for_timeout(200)
         page.screenshot(path=SHOTS / "validation-follow-ups.png")
-        # THE OTHER HALF OF THE SAME DECISION (spec §10.1): on a repository the OS
-        # cannot establish is private, no issue is opened at all and the finding is on
-        # the internal record. A shot of the filing case alone would not show it.
+        # THE OTHER HALF OF THE SAME DECISION (spec §10.1): on a repository the OS cannot establish is...
         page.goto(f"http://127.0.0.1:{PORT}/wo/jarvis_os/{kept_id}")
         page.locator("h2", has_text="Tracker issues").first.scroll_into_view_if_needed()
         page.wait_for_timeout(200)
         page.screenshot(path=SHOTS / "validation-follow-ups-kept.png")
         page.goto(f"http://127.0.0.1:{PORT}/wo/jarvis_os/{wo_id}")
         page.wait_for_timeout(200)
-        # The TIMELINE is the other rendered surface: an unlabelled event kind renders
-        # as the bare kind beside a JSON blob, which is what the new branch prevents.
+        # The TIMELINE is the other rendered surface: an unlabelled event kind renders as the bare kind...
         page.get_by_role("tab", name="Timeline").click()
         page.wait_for_timeout(200)
         page.locator("#tab-timeline").scroll_into_view_if_needed()
