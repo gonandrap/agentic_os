@@ -720,7 +720,7 @@ def test_the_work_order_packet_is_byte_for_byte_what_it_has_always_been(
         _fixed_transcript(root / "-proj" / f"{wo['id']}.jsonl")
         store.update_work_order(wo["id"], status="running", session_id=wo["id"],
                                 model="claude-opus-5")
-        store.queue_message(wo["id"], "still drafting section four")
+        store.queue_message(wo["id"], "still drafting section four", authored_by="user")
         alarm = store.add_alarm(wo["id"], "long-turn", 1, "turn 1 has run for 2 hours")
         packet = supervisor.build_evidence(store, _wo_subject(store, wo["id"]), alarm,
                                            CFG, daemon.catalog.projects[0].inspect)
