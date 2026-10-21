@@ -646,6 +646,10 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         for repair, blocker in PR_REPAIR_BLOCKERS:
             if store.pr_repair_attempts(wo["id"], repair) >= PR_REPAIR_MAX_ATTEMPTS:
                 blockers.append(blocker)
+    # CANCELLED CI THE OS'S ONE RE-RUN DID NOT CLEAR — the column keeps the green path free of reads (#1123)
+    ci_stuck = ci_checks_stuck(store, wo)
+    if ci_stuck:
+        blockers.append(ci_stuck)
     # A PULL REQUEST THE OS CANNOT RE-JUDGE
     if wo["status"] == "waiting_pr_merge" and rejudge_exhausted(store, wo):
         blockers.append(SHA_MOVED_BLOCKER)
@@ -702,6 +706,18 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
             blockers.append(parked)
     # What the user has already looked at and dismissed stops being a blocker — but only exactly that
     return [b for b in blockers if b not in acknowledged(wo)]
+
+
+def ci_checks_stuck(store: ProjectStore, wo: dict[str, Any]) -> str:
+    """The give-up line for cancelled CI on the head the poll last saw, or "" (#1123)"""
+    from . import ci_rerun
+
+    stuck = str(wo.get("pr_checks_stuck_head") or "")
+    if (not stuck or wo["status"] not in ci_rerun.CI_WAIT_STATUSES
+            or stuck != str(wo.get("pr_head_oid") or "")):
+        return ""
+    found = ci_rerun.episode(store, wo["id"], stuck).stuck
+    return str((found or {}).get("blocker") or "")
 
 
 def acknowledged(wo: dict[str, Any]) -> list[str]:

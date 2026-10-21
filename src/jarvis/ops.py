@@ -11970,6 +11970,41 @@ def _pending_why(store: ProjectStore, wo: dict[str, Any],
     return f"`Daemon.dispatch_pending` owns this row and its turn is later: {delay}"
 
 
+#: `waiting_pr_merge`'s sentence when nothing more specific is on record
+PR_POLL_WHY = ("`daemon.polls_and_can_act_on_pull_request` says yes: the row carries a "
+               "routing pull request and GitHub has not stopped recomputing it, so the "
+               "poll asks what became of it and some branch of it can move the row")
+
+
+def _pr_poll_why(store: ProjectStore, wo: dict[str, Any],
+                 now: float | None = None) -> str:
+    """`waiting_pr_merge`'s sentence, naming cancelled CI as cancelled (#1123)"""
+    from . import automerge, ci_rerun
+
+    head = str(wo.get("pr_head_oid") or "")
+    if not head:
+        return PR_POLL_WHY
+    ep = ci_rerun.episode(store, wo["id"], head)
+    if ep.stuck is not None and str(wo.get("pr_checks_stuck_head") or "") == head:
+        return (f"the poll still reads the pull request, but CI on {head[:10]} was "
+                f"cancelled and the OS has stopped re-running it — "
+                f"{ep.stuck.get('blocker') or ''}")
+    if ep.reruns:
+        last = ep.reruns[-1]
+        runs = ", ".join(str(i) for i in last.get("run_ids") or []) or "unrecorded"
+        return (f"CI on {head[:10]} was cancelled ({last.get('checks') or 'a check'}), "
+                f"not failed; the OS re-ran it once (run {runs}) and the poll waits for "
+                f"that run")
+    held = store.events_of_kind(wo["id"], "automerge_held")
+    payload = db.from_json(held[-1]["payload"], {}) if held else {}
+    if (str(payload.get("code") or "") == automerge.HELD_CHECKS_CANCELLED
+            and str(payload.get("head_sha") or "") == head):
+        return (f"CI on {head[:10]} was cancelled, not failed — "
+                f"{payload.get('reason') or ''}; the poll re-runs it once on its next "
+                f"tick")
+    return PR_POLL_WHY
+
+
 #: ONE expression of one rule, registered under EVERY open status: `gates.sweep_unargued` has no status filter and filing an `awaiting_case` request does not park the row, so a held request outlives it (wo-715db5af, Neo 1987)
 REVIEWS_GATE = _Pass(
     "Daemon._neo_drain",
@@ -12048,10 +12083,7 @@ SCHEDULED_ACTORS: dict[str, ActorPasses] = {
         "`invariants.true_blockers` is what puts it in front of them")),
     "waiting_pr_merge": ActorPasses((
         # wo-d3a70c29: the poll still SELECTS a stalled row (`polls_pull_request` is untouched)
-        _Pass("Daemon.poll_pull_requests",
-              "`daemon.polls_and_can_act_on_pull_request` says yes: the row carries a "
-              "routing pull request and GitHub is still recomputing it, so the poll "
-              "asks what became of it and some branch of it can move the row",
+        _Pass("Daemon.poll_pull_requests", _pr_poll_why,
               "daemon.polls_and_can_act_on_pull_request",
               polls_and_can_act_on_pull_request),
         REVIEWS_GATE,

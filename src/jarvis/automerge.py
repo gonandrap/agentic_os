@@ -51,6 +51,8 @@ HELD_CHECKS_FAILED = "checks_failed"
 HELD_CHECKS_RUNNING = "checks_running"
 HELD_CHECKS_NONE = "checks_none"
 HELD_MERGE_STATE_UNCLEAN = "merge_state_unclean"
+#: A check was cancelled, not failed, and GitHub blocks on it (#1123)
+HELD_CHECKS_CANCELLED = "checks_cancelled"
 #: The default branch is broken
 HELD_BASE_RED = "base_red"
 #: The base moved and this head does not contain it
@@ -284,6 +286,12 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
                          f"CI has not finished on this commit — "
                          f"{len(pr.unfinished)} check(s) still running", **fields)
         return _held(HELD_CHECKS_NONE, "no check has reported on this commit", **fields)
+    aborted = tuple(getattr(pr, "aborted", ()) or ())
+    if aborted and str(getattr(pr, "merge_state", "") or "").upper() == "BLOCKED":
+        return _held(HELD_CHECKS_CANCELLED,
+                     f"CI was cancelled on this commit, not failed — "
+                     f"{checks_evidence(aborted)} — and GitHub blocks the merge until "
+                     f"it is re-run", **fields)
     if str(getattr(pr, "merge_state", "") or "").upper() != "CLEAN":
         return _held(HELD_MERGE_STATE_UNCLEAN,
                      f"GitHub reports the merge state as "
