@@ -2634,6 +2634,265 @@ def test_both_callers_derive_the_same_bool(jarvis_home, project, tmp_path, auto_
         store.close()
 
 
+# -- a merge held for running checks is not stuck
+
+JUDGED_SHA = "7662d08b70aa0000000000000000000000000000"
+RUNNING_REASON = "CI has not finished on this commit — 1 check(s) still running"
+
+
+def am_event(store, wo_id: str, kind: str, at: float, **payload) -> None:
+    """One `ops.AUTOMERGE_EVENTS` row at `at`"""
+    store.add_event(wo_id, kind, payload)
+    store.conn.execute(
+        "UPDATE wo_events SET ts=? WHERE id=(SELECT MAX(id) FROM wo_events)", (at,))
+    store.conn.commit()
+
+
+def checks_hold(daemon, store, wo_id: str, at: float, *, code: str = "checks_running",
+                round_n: int = 1, reason: str = RUNNING_REASON) -> None:
+    """One `automerge_held` event, written by THE DAEMON'S OWN WRITER"""
+    from jarvis import automerge
+
+    daemon._note_automerge_held(store, wo_id, automerge.Decision(
+        armed=False, code=code, reason=reason, judged_sha=JUDGED_SHA,
+        head_sha=JUDGED_SHA, round_n=round_n))
+    store.conn.execute(
+        "UPDATE wo_events SET ts=? WHERE id=(SELECT MAX(id) FROM wo_events)", (at,))
+    store.conn.commit()
+
+
+def base_health_without_checked_at(project: str = "proj_a") -> None:
+    """A stored fact carrying NO `checked_at`"""
+    from jarvis.central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        central.set_base_health(project, {"red": False, "base": "main", "workflow": "ci",
+                                          "run_url": "https://x/1", "head_sha": "abc",
+                                          "wo_id": ""})
+        central.conn.commit()
+    finally:
+        central.close()
+
+
+def _held_for_checks(os_, hours: float = 61 / 60, status: str = "waiting_pr_merge",
+                     fact_age: float = 0.0) -> tuple[dict, float]:
+    """A parked order held for the checks, beside a base-health fact `fact_age` old"""
+    wo, at = _parked(os_["store"], hours=hours, status=status,
+                     title="parked while GitHub runs the checks")
+    checks_hold(os_["daemon"], os_["store"], wo["id"], at + 60.0)
+    base_fact(red=False, age=fact_age)
+    return wo, at
+
+
+def test_a_merge_held_for_running_checks_is_excluded_with_its_own_sentence(red_base_os):
+    """§7(1), wo-afcea414's own number"""
+    from jarvis import stuck
+
+    now = time.time()
+    wo, _at = _held_for_checks(red_base_os)
+
+    row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+    assert row["stuck"] is False, row["reason"]
+    assert row["excluded"] == stuck.AUTOMERGE_CHECKS_CAUSE
+    assert row["reason"] == stuck.EXCLUSION_REASON[stuck.AUTOMERGE_CHECKS_CAUSE]
+    assert row["reason"] != stuck.DEFAULT_EXCLUSION_REASON.format(
+        cause=stuck.AUTOMERGE_CHECKS_CAUSE)
+
+
+def test_the_blocker_column_names_the_hold_the_record_already_carries(red_base_os):
+    """§7(2), the §5 regression guard asserted THROUGH the sweep: this column read "nothing the record can..."""
+    from jarvis import invariants
+
+    now = time.time()
+    wo, _at = _held_for_checks(red_base_os)
+
+    row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+    assert row["blocker"] == invariants.AUTOMERGE_CHECKS_NOTE.format(
+        sha=JUDGED_SHA[:10], reason=RUNNING_REASON)
+    assert row["blocker"] != "nothing the record can name"
+
+
+@pytest.mark.parametrize("code", ["checks_none", "checks_failed",
+                                  "merge_state_unclean", "sha_moved"])
+def test_every_other_hold_code_is_still_judged(red_base_os, code):
+    """§7(3) and §3's boundary — the part a later change will widen by accident"""
+    store = red_base_os["store"]
+    now = time.time()
+    wo, at = _parked(store, hours=61 / 60, title="held on something somebody owes")
+    checks_hold(red_base_os["daemon"], store, wo["id"], at + 60.0, code=code)
+    base_fact(red=False)
+
+    row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+    assert row["excluded"] == ""
+    assert row["stuck"] is True, row["reason"]
+
+
+def test_a_stale_hold_is_no_hold(red_base_os):
+    """§7(4): `ops.automerge_state` marks a hold from an overtaken round stale"""
+    store = red_base_os["store"]
+    now = time.time()
+    wo, at = _parked(store, hours=4.9, title="a hold its own round overtook")
+    checks_hold(red_base_os["daemon"], store, wo["id"], at + 4.8 * 3600)
+    base_fact(red=False)
+    for _ in range(2):
+        row = store.open_validation_round(wo_id=wo["id"], fingerprint="fp")
+        store.close_validation_round(row["id"], "passed", "")
+
+    judged = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+    assert judged["excluded"] == ""
+    assert judged["stuck"] is True, judged["reason"]
+
+
+def test_needs_review_beside_the_same_pull_request_is_still_judged(red_base_os):
+    """§7(5), kn-6e836793's scoping: a `needs_review` order is a wait the USER owes"""
+    now = time.time()
+    wo, _at = _held_for_checks(red_base_os, hours=4.9, status="needs_review")
+
+    row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+    assert row["excluded"] == ""
+    assert row["stuck"] is True, row["reason"]
+
+
+def test_a_red_base_outranks_the_running_checks(red_base_os):
+    """§7(6) and §2: the two CAN co-occur, and a fleet fact outranks a fact about one order"""
+    from jarvis import stuck
+
+    now = time.time()
+    wo, _at = _held_for_checks(red_base_os)
+    base_fact(red=True)
+
+    row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+    assert row["excluded"] == stuck.BASE_RED_CAUSE
+    assert row["stuck"] is False, row["reason"]
+
+
+def test_the_checks_reporting_leaves_the_closed_span_discounted(red_base_os):
+    """§7(7), kn-6e30d561 and the whole reason for §4: THE DISCOUNT MUST OUTLIVE THE EXCLUSION BY ONE..."""
+    store = red_base_os["store"]
+    now = time.time()
+    wo, at = _parked(store, hours=70 / 60, title="the checks have since reported")
+    checks_hold(red_base_os["daemon"], store, wo["id"], at + 2 * 60.0)
+    am_event(store, wo["id"], "automerge_proposed", at + 65 * 60.0, approval_id=1)
+    base_fact(red=False)
+
+    row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+    assert row["excluded"] == ""
+    assert abs(row["discounted_seconds"] - 63 * 60.0) < 5, row["discounted_seconds"]
+    assert abs(row["active_seconds"] - 7 * 60.0) < 5, row["active_seconds"]
+    assert row["stuck"] is False, row["reason"]
+
+
+@pytest.mark.parametrize("fact_age, label", [
+    (90 * 60.0, "a gh outage that began before the hold"),
+    (None, "no checked_at at all, or a project not opted into auto-merge"),
+])
+def test_a_stale_base_health_fact_un_excludes_and_stops_discounting(red_base_os,
+                                                                   fact_age, label):
+    """§7(8), and the test review round 1 asked for BY NAME. kn-2579843f's one rule has two halves"""
+    from jarvis import invariants
+
+    store = red_base_os["store"]
+    now = time.time()
+    wo, _at = _held_for_checks(red_base_os, fact_age=fact_age or 0.0)
+    if fact_age is None:
+        base_health_without_checked_at()
+
+    row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+    assert row["excluded"] == "", label
+    assert row["stuck"] is True, row["reason"]
+    assert row["discounted_seconds"] == 0.0, row["discounted_seconds"]
+    assert row["blocker"] == invariants.AUTOMERGE_CHECKS_NOTE.format(
+        sha=JUDGED_SHA[:10], reason=RUNNING_REASON)
+
+
+def test_an_open_hold_is_discounted_only_as_far_as_the_horizon(red_base_os):
+    """§7(9) and §4's outage sentence: the fact was last confirmed 20m ago"""
+    store = red_base_os["store"]
+    now = time.time()
+    wo, _at = _held_for_checks(red_base_os, fact_age=20 * 60.0)
+
+    row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+    assert abs(row["discounted_seconds"] - 55 * 60.0) < 30, row["discounted_seconds"]
+    assert abs(row["active_seconds"] - 6 * 60.0) < 30, row["active_seconds"]
+
+
+def test_a_usage_hold_inside_the_checks_span_is_discounted_once(red_base_os):
+    """§7(10): the UNION and never the sum"""
+    store = red_base_os["store"]
+    now = time.time()
+    wo, at = _parked(store, hours=70 / 60, title="a window shut while the checks ran")
+    checks_hold(red_base_os["daemon"], store, wo["id"], at + 2 * 60.0)
+    am_event(store, wo["id"], "automerge_proposed", at + 65 * 60.0, approval_id=1)
+    usage_hold(store, wo["id"], started=at + 10 * 60.0, ended=at + 20 * 60.0)
+    base_fact(red=False)
+
+    row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+    assert abs(row["discounted_seconds"] - 63 * 60.0) < 5, row["discounted_seconds"]
+    assert row["discounted_seconds"] < 73 * 60.0, "the overlap was counted twice"
+
+
+def test_the_checks_held_order_is_a_visible_row_and_never_a_continue(red_base_os):
+    """§7(11), kn-143a46df and kn-e91ff3a5: a `continue` has no unit test over the pure predicate and..."""
+    from jarvis import stuck
+
+    store = red_base_os["store"]
+    now = time.time()
+    wo, _at = _held_for_checks(red_base_os)
+
+    scanned, rows = ops.stuck_scan(store, "proj_a", catalog.FleetHealthConfig(), now,
+                                   base_red_until=now, stuck_only=False)
+    held = [r for r in rows if r["wo"]["id"] == wo["id"]]
+
+    assert scanned == 1 and len(held) == 1, "the held row left the sweep's output"
+    assert held[0]["verdict"].excluded == stuck.AUTOMERGE_CHECKS_CAUSE
+    assert next(r for r in ops.stuck_report("proj_a", now)
+                if r["id"] == wo["id"])["excluded"] == stuck.AUTOMERGE_CHECKS_CAUSE
+
+
+@pytest.mark.parametrize("code, fact_age, excluded", [
+    ("checks_running", 0.0, True),
+    ("checks_failed", 0.0, False),
+    # Case 8 is here because the horizon is hoisted SEPARATELY in each caller
+    ("checks_running", 90 * 60.0, False),
+])
+def test_both_callers_agree_about_the_running_checks(jarvis_home, project, tmp_path,
+                                                     code, fact_age, excluded):
+    """§7(12), the 2026-09-30 spec's ONE derivation: `Daemon._stuck_candidates` and `ops.stuck_report`..."""
+    from jarvis import stuck
+
+    cat = red_base_catalog(tmp_path, project_path=str(project))
+    store = ProjectStore(project)
+    try:
+        now = time.time()
+        daemon = Daemon(load_catalog(cat))
+        wo, at = _parked(store, hours=61 / 60, title="both callers read this one")
+        checks_hold(daemon, store, wo["id"], at + 60.0, code=code)
+        base_fact(red=False, age=fact_age)
+        spec = load_catalog(cat).projects[0]
+        run: dict = {"scanned": 0}
+
+        candidates = [c["wo"]["id"] for c in
+                      Daemon(load_catalog(cat))._stuck_candidates(spec, None, now, run)]
+        row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
+
+        assert (wo["id"] not in candidates) is excluded, candidates
+        assert (row["excluded"] == stuck.AUTOMERGE_CHECKS_CAUSE) is excluded
+        assert row["stuck"] is not excluded
+    finally:
+        store.close()
+
+
 # -- a work order at its budget cap
 
 
