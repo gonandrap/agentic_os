@@ -129,7 +129,8 @@ CREATE TABLE IF NOT EXISTS inbox (
     body TEXT NOT NULL DEFAULT '',
     wo_id TEXT,
     status TEXT NOT NULL DEFAULT 'new',     -- new | notified | acked
-    sink_results TEXT
+    sink_results TEXT,
+    paired_reason TEXT                      -- also in ADDED_COLUMNS
 );
 CREATE TABLE IF NOT EXISTS backlog (
     id TEXT PRIMARY KEY,
@@ -579,14 +580,7 @@ class CentralStore:
         self._seed_detectors()
 
     def _migrate(self) -> None:
-        for table, columns in ADDED_COLUMNS.items():
-            have = {
-                r["name"]
-                for r in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
-            }
-            for name, decl in columns.items():
-                if name not in have:
-                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+        db.add_missing_columns(self.conn, ADDED_COLUMNS)
 
     def _ensure_fts(self) -> bool:
         """Create the search index and backfill it once (docs/superpowers/specs/2026-08-24-ranked-knowledge-search.md §4)"""
