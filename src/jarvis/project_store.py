@@ -913,6 +913,8 @@ ADDED_COLUMNS = {
         # THE SAME CACHE FOR THE TWO FACTS THAT SAY GITHUB HAS STOPPED RECOMPUTING THIS PULL REQUEST (#995)
         "pr_ref_oid": "TEXT",
         "pr_mergeable_unknown_since": "REAL",
+        # The head whose cancelled CI the OS gave up re-running, so the green path reads no event (#1123)
+        "pr_checks_stuck_head": "TEXT",
         # Work orders that must finish before this one may be claimed (JSON list of work-order ids)
         "depends_on": "TEXT NOT NULL DEFAULT '[]'",
         # The feature order this work order belongs to — its planner or one of its children

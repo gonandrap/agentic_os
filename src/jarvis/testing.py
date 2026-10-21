@@ -1187,9 +1187,19 @@ elif argv[:2] == ["run", "list"]:
     # on "was main red when this check ran", and a fake that answered one list for every
     # branch could not express a red base and a green one in the same test.
     branch = argv[argv.index("--branch") + 1] if "--branch" in argv else ""
+    # ...or keyed by COMMIT, for the head's own runs (#1123)
+    if "--commit" in argv:
+        branch = argv[argv.index("--commit") + 1]
     limit = int(argv[argv.index("--limit") + 1]) if "--limit" in argv else 30
     rows = json.loads(os.environ.get("FAKE_GH_RUNS", "{}")).get(branch, [])
     print(json.dumps(rows[:limit]))
+elif argv[:2] == ["run", "rerun"]:
+    # Recorded, and turns nothing green: only a test that registers the new run's outcome gets one (#1123)
+    refuse = os.environ.get("FAKE_GH_REFUSE_RERUN")
+    if refuse:
+        sys.stderr.write(refuse + "\n")
+        sys.exit(1)
+    print(f"Requested rerun of run {argv[2] if len(argv) > 2 else ''}")
 elif argv[:2] == ["pr", "update-branch"]:
     # THE WRITE, AND IT MODELS THE MERGE REF RATHER THAN MOCKING THE OUTCOME. This is
     # where a test of this feature is easiest to get vacuously right: a fake that simply
@@ -1822,9 +1832,13 @@ def fake_gh(tmp_path, monkeypatch):
             return [c["argv"][2] for c in self.calls
                     if c["argv"][:2] == ["pr", "update-branch"] and len(c["argv"]) > 2]
 
+        def refuse_rerun(self, message: str = "run cannot be rerun") -> None:
+            """Make `gh run rerun` fail and NOTHING else (#1123)"""
+            monkeypatch.setenv("FAKE_GH_REFUSE_RERUN", message)
+
         @property
         def reruns(self) -> list[str]:
-            """Every `gh run rerun` — which must always be EMPTY"""
+            """Every `gh run rerun` — EMPTY for anything but a cancelled check (#1123)"""
             return [" ".join(c["argv"]) for c in self.calls
                     if c["argv"][:2] == ["run", "rerun"]]
 

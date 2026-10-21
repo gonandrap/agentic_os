@@ -4757,6 +4757,12 @@ class Daemon:
                 if wo["status"] in PR_REPAIR_STATUSES and pr_resync_owed(store, wo):
                     self.resync_pull_request(project, store, stalling, pr)
                     resynced = True
+            # A CANCELLED CHECK IS RE-RUN ONCE PER HEAD, then handed to the user (#1123)
+            try:
+                self.rerun_aborted_checks(project, store, stalling, pr)
+            except Exception:  # noqa: BLE001 — a re-run must never stall the poll
+                log.exception("[%s] re-running cancelled CI for %s failed", project.name,
+                              wo["id"])
             try:
                 if pr.merged:
                     # THE ROUND FIRST, if one is open: the pull request has landed
@@ -5886,6 +5892,111 @@ class Daemon:
         log.info("[%s] closed and reopened %s to make GitHub recompute %s",
                  project.name, url, wo["id"])
         return True
+
+    def rerun_aborted_checks(self, project: ProjectSpec, store: ProjectStore,
+                             wo: dict, pr: Any) -> None:
+        """Re-run a check GitHub cancelled, ONCE per head, then hand it to the user (#1123)"""
+        from . import ci_rerun, github
+
+        wo_id = wo["id"]
+        head = str(pr.head_oid or "")
+        waiting = bool(pr.state == "OPEN" and head
+                       and wo["status"] in ci_rerun.CI_WAIT_STATUSES
+                       and str(pr.merge_state or "").upper() == "BLOCKED"
+                       and not pr.failing)
+        running = [c for c in pr.checks
+                   if c["status"].upper() in github.UNFINISHED_STATUSES - {"EXPECTED"}]
+        aborted = pr.aborted if waiting and not running else ()
+        stuck = str(wo.get("pr_checks_stuck_head") or "")
+        if stuck:
+            cause = str((ci_rerun.episode(store, wo_id, stuck).stuck or {}).get("cause")
+                        or "")
+            if (stuck == head and waiting and not running
+                    and (aborted or cause == ci_rerun.CAUSE_NEVER_RAN)):
+                return      # still stuck, and already said so
+            store.update_work_order(wo_id, pr_checks_stuck_head=None)
+            store.add_event(wo_id, ci_rerun.RECOVERED_EVENT,
+                            {"head_sha": stuck, "now_head": head,
+                             "pr_url": wo.get("pr_url")})
+        if not waiting or running:
+            return
+        if aborted:
+            ep = ci_rerun.episode(store, wo_id, head)
+            if ep.stuck is not None:
+                return
+            checks = ", ".join(f"{c['name'] or '(unnamed check)'}: {c['conclusion']}"
+                               for c in aborted)
+            update = ci_rerun.update_branch_command(str(wo.get("pr_url") or ""))
+            if ep.reruns:
+                ids = [int(i) for i in ep.reruns[-1].get("run_ids") or []]
+                self._ci_rerun_gave_up(store, wo, head, ci_rerun.CAUSE_CANCELLED_AGAIN,
+                                       checks, (*map(ci_rerun.rerun_command, ids),
+                                                update))
+                return
+            try:
+                runs = ci_rerun.head_runs(head, cwd=project.path)
+            except github.GitHubError as e:
+                # Unread is not unrecoverable: no attempt is spent, next tick asks again
+                log.info("[%s] could not list the runs of %s for %s: %s", project.name,
+                         head[:10], wo_id, e)
+                return
+            targets = ci_rerun.runs_to_rerun(aborted, runs)
+            if not targets:
+                self._ci_rerun_gave_up(store, wo, head, ci_rerun.CAUSE_NO_RUN, checks,
+                                       (update,))
+                return
+            for run in targets:
+                try:
+                    ci_rerun.rerun(run.run_id, cwd=project.path)
+                except github.GitHubError as e:
+                    self._ci_rerun_gave_up(store, wo, head, ci_rerun.CAUSE_REFUSED,
+                                           checks, (ci_rerun.rerun_command(run.run_id),
+                                                    update), error=str(e)[:300])
+                    return
+            store.add_event(wo_id, ci_rerun.RERUN_EVENT, {
+                "head_sha": head, "pr_url": wo.get("pr_url"), "checks": checks,
+                "run_ids": [r.run_id for r in targets],
+                "workflows": [r.workflow for r in targets]})
+            log.info("[%s] re-ran cancelled CI on %s for %s (runs %s)", project.name,
+                     head[:10], wo_id, ", ".join(str(r.run_id) for r in targets))
+            return
+        # A REQUIRED CHECK THAT NEVER REPORTED: one protection read per head per process
+        seen = self.__dict__.setdefault("_ci_required_read", set())
+        if wo["status"] != "waiting_pr_merge" or (wo_id, head) in seen:
+            return
+        seen.add((wo_id, head))
+        owner_repo = github.origin_repo(project.path)
+        if owner_repo is None or not pr.base_ref:
+            return
+        try:
+            protection = github.branch_protection(owner_repo, pr.base_ref,
+                                                  cwd=project.path)
+        except github.GitHubError as e:
+            log.info("[%s] branch protection on %s unreadable: %s", project.name,
+                     pr.base_ref, e)
+            return
+        reported = {c["name"] for c in pr.checks if c["status"].upper() != "EXPECTED"}
+        missing = [n for n in (protection.required_checks if protection else ())
+                   if n not in reported]
+        if missing:
+            self._ci_rerun_gave_up(
+                store, wo, head, ci_rerun.CAUSE_NEVER_RAN, ", ".join(missing),
+                (ci_rerun.update_branch_command(str(wo.get("pr_url") or "")),))
+
+    def _ci_rerun_gave_up(self, store: ProjectStore, wo: dict, head: str, cause: str,
+                          checks: str, commands: tuple[str, ...], **extra: Any) -> None:
+        """Record the ONE give-up for this head; `invariants.true_blockers` raises it (#1123)"""
+        from . import ci_rerun
+
+        pr_url = str(wo.get("pr_url") or "")
+        store.add_event(wo["id"], ci_rerun.STUCK_EVENT, {
+            "head_sha": head, "pr_url": pr_url, "cause": cause, "checks": checks,
+            "commands": list(commands),
+            "blocker": ci_rerun.stuck_blocker(pr_url, head, cause, checks, commands),
+            **extra})
+        store.update_work_order(wo["id"], pr_checks_stuck_head=head)
+        log.info("%s: cancelled CI on %s needs the user (%s)", wo["id"], head[:10],
+                 cause)
 
     def _note_reopened(self, project: ProjectSpec, store: ProjectStore,
                        wo: dict) -> bool:
