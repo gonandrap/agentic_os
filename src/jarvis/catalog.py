@@ -321,7 +321,7 @@ class ConcisionConfig:
     """The one number the concision machinery needs per project (docs/superpowers/specs/2026-09-19-concision-enforced.md)"""
 
     summary_max_words: int = concision.DEFAULT_SUMMARY_MAX_WORDS
-    #: The same bargain one surface over: `message_max_chars` = 0 turns the `jarvis wo send` / `wo assume`... (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
+    #: The same bargain one surface over: `message_max_chars` = 0 turns the `jarvis wo send`... (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
     message_max_chars: int = concision.DEFAULT_MESSAGE_MAX_CHARS
     #: ONE DECISION per assumption, ONE question per ask: both 0 switch their check off (docs/superpowers/specs/2026-10-21-questions-to-neo-are-atomic.md §1)
     assume_max_chars: int = concision.DEFAULT_ASSUME_MAX_CHARS

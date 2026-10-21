@@ -298,7 +298,7 @@ def _doc(project):
 def _nothing_recorded(project, wo_id):
     neo = NeoStore()
     try:
-        assert neo.get(1) is None
+        assert [q for q in neo.list_questions() if q["wo_id"] == wo_id] == []
     finally:
         neo.close()
     store = ProjectStore(project)
@@ -420,7 +420,7 @@ def test_an_over_cap_assumption_is_refused_and_told_to_split(dispatched, project
     """Test 1: nothing recorded — no row, no ASSUMPTIONS.md append"""
     daemon, wo = dispatched
 
-    with pytest.raises(ops.OpsError, match="split") as caught:
+    with pytest.raises(ops.OpsError, match="(?i)split") as caught:
         ops.assume(wo["id"], "z" * 1200)
 
     msg = str(caught.value)
@@ -434,7 +434,7 @@ def test_an_over_cap_question_is_refused_with_the_split_and_reference_hint(dispa
     """Test 2"""
     daemon, wo = dispatched
 
-    with pytest.raises(ops.OpsError, match="split") as caught:
+    with pytest.raises(ops.OpsError, match="(?i)split") as caught:
         ops.ask_question(wo["id"], "z" * 2500)
 
     msg = str(caught.value)

@@ -14,12 +14,10 @@ SECTION_FORM = 'from section 3 of design doc "docs/superpowers/specs/feature.md"
 def assume_shape(wo_id: str, *, tail: str = "", cite_spec: bool = True) -> str:
     """The `wo assume` bullet every brief carries: ONE decision, the cap, the in-text reference form (docs/superpowers/specs/2026-10-21-questions-to-neo-are-atomic.md §5)"""
     return (
-        f"- `jarvis wo assume {wo_id} \"...\"` records ONE DECISION you made with NO "
-        f"doubt: the option you took, the strongest alternative you rejected and why, "
-        f"in a short paragraph. Over {DEFAULT_ASSUME_MAX_CHARS} characters it is "
-        f"refused, and a second decision is a second `jarvis wo assume`, citing the "
-        f"first in-text (`per Q1234`, `per assumption #2`) rather than repeating its "
-        f"context."
+        f"- `jarvis wo assume {wo_id} \"...\"`: ONE DECISION you made with NO doubt "
+        f"— choice, rejected alternative, why; ≤{DEFAULT_ASSUME_MAX_CHARS} "
+        f"chars; a second decision is a second `jarvis wo assume` citing the "
+        f"first (`per Q1234`, `per assumption #2`)."
         # Dropped in the CORE only: `CORE_BUDGET_CHARS` leaves no room for it there
         + (f" Cite a spec BY SECTION the same way (e.g. `{SECTION_FORM}`), never by "
            f"pasting it and never by naming a whole document." if cite_spec else "")
@@ -152,12 +150,12 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
         f"- **Neo is your first responder. Any doubt goes to it.** "
         f"`jarvis wo ask {wo_id} \"<your question>\"`, then END YOUR TURN; the "
         f"answer arrives as your next user turn, usually within a minute. This is "
-        f"the normal, expected way to work: it is not an escalation and it does not "
+        f"normal: it is not an escalation and it does not "
         f"interrupt the user. The trigger is DOUBT, not importance — if you catch "
         f"yourself weighing options or thinking \"either would work\", you are in "
         f"doubt: Ask BEFORE you build on it, not after. A question is one "
-        f"paragraph: the decision, the options, your recommendation — do not paste "
-        f"context. Over {QUESTION_MAX_CHARS} characters it is refused.",
+        f"paragraph: the decision, the options, your recommendation — no pasted "
+        f"context; ≤{QUESTION_MAX_CHARS} chars.",
         "  - Do not talk yourself out of asking: \"It's reversible\", \"it's only "
         "an implementation detail\", \"I'll note it as an assumption\" are "
         "rationalisations for guessing.",
@@ -166,11 +164,8 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
             "below names the area you are unsure about — a lookup is not a doubt.",
         ] if has_knowledge else []),
         assume_shape(wo_id, cite_spec=False,
-                     tail=" It is the OTHER case and should be RARE. Record "
-                          "EVERY such call, including the small and obvious "
-                          "ones — the work order record is the only audit "
-                          "trail anyone gets. Never a guess: if you are "
-                          "guessing, ask."),
+                     tail=" It should be RARE. Record EVERY such call, including "
+                          "the small and obvious ones: the only audit trail."),
         *([
             f"- READ the OS knowledge base before you touch an area it covers — it "
             f"is INDEXED at the end of this prompt, not pasted into it: "
