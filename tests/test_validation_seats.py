@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import claude_cli, ops, paths, seats, validation
+from jarvis import claude_cli, concision, ops, paths, seats, validation
 from jarvis.bootstrap import ASSETS
 from jarvis.catalog import ValidationConfig
 from jarvis.evidence import EvidencePacket
@@ -469,7 +469,8 @@ def test_a_neo_learning_taught_to_the_chair_never_reaches_the_validators_chair(
     assert "a learning every Neo seat sees" not in prompt, (
         "the unscoped ones are the ones a shared ledger would leak first")
     assert validation.build_seat_prompt("chair") == "\n".join(
-        ["# Jarvis validation seat: chair", "", validation.definition("chair")[1]])
+        ["# Jarvis validation seat: chair", "", validation.definition("chair")[1], "",
+         concision.REVIEW_SCOPE])
 
 
 def test_the_seat_prompt_carries_the_projects_knowledge_and_not_neos_learnings(

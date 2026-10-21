@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
-from . import claude_cli, seats, structured
+from . import claude_cli, concision, seats, structured
 from .bootstrap import ASSETS
 from .project_store import VALIDATOR_SEATS
 
@@ -145,7 +145,7 @@ def build_shared_prefix(packet: EvidencePacket, project: str,
 def build_seat_prompt(seat: str) -> str:
     """One seat's own half of its prompt: who it is and what its mandate is"""
     _, mandate = definition(seat)
-    return "\n".join([SEAT_HEADER.format(seat=seat), "", mandate])
+    return "\n".join([SEAT_HEADER.format(seat=seat), "", mandate, "", concision.REVIEW_SCOPE])
 
 
 def build_packet_prompt(packet: EvidencePacket) -> str:

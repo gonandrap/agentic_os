@@ -16,8 +16,7 @@ REF_RE = re.compile(
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
 
-#: A markdown path named in free text. Markdown only: a design artifact is a `.md`
-#: document, and a source file named in the same sentence is not a spec citation.
+#: A markdown path named in free text
 DOC_RE = re.compile(r"[\w./-]*[\w-]\.md\b")
 
 
@@ -32,15 +31,7 @@ def find_refs(text: str) -> list[tuple[str, str]]:
 
 
 def unreferenced_docs(text: str) -> list[str]:
-    """Markdown paths in the text that NO `find_refs` reference covers, in reading order.
-
-    The other half of the in-text form. A sentence that names a design document without
-    naming a section of it is the shape the user decision of 2026-10-14 (Neo learning
-    #102) refuses: Neo is handed cited SECTIONS — N under one labelled snapshot, bounded by
-    one total (`ops.SECTION_SNAPSHOT_CHARS`) — so "the spec says so" with a whole document
-    beside it has nothing to resolve. `ops` turns each of these into a refusal that shows
-    the asker the form above.
-    """
+    """Markdown paths in the text that NO `find_refs` reference covers, in reading order (#102)"""
     covered = {path for path, _which in find_refs(text)}
     out: list[str] = []
     for m in DOC_RE.finditer(text):
@@ -64,15 +55,11 @@ def find_heading(markdown: str, which: str) -> int | None:
 
 
 def heading_outline(markdown: str) -> list[str]:
-    """Every heading line, in order, level included — and NO body text. THE ONE MATCHER.
-
-    Neo ruling Q1880: a plan review reads the spec's STRUCTURE, never the document.
-    """
+    """Every heading line, in order, level included — and NO body text"""
     return [f"{m.group(1)} {m.group(2)}" for m in HEADING_RE.finditer(markdown)]
 
 
-#: One labelled snapshot of N resolved sections, and the label's own shape. Neo ruling
-#: Q1883: a payload may carry several sections, so each body names the section it is.
+#: One labelled snapshot of N resolved sections, and the label's own shape
 SECTION_LABEL_RE = re.compile(r"^(\S+\.md) § (.+):$", re.MULTILINE)
 
 
@@ -81,7 +68,7 @@ def label_sections(blocks: list[tuple[str, str, str]]) -> str:
 
 
 def labelled_sections(text: str) -> list[tuple[str, str]]:
-    """The `(path, which)` of every label `label_sections` wrote."""
+    """The `(path, which)` of every label `label_sections` wrote"""
     return [(m.group(1), m.group(2)) for m in SECTION_LABEL_RE.finditer(text)]
 
 

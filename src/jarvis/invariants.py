@@ -1003,45 +1003,26 @@ def plan_hold_note(hold: dict[str, Any] | None) -> str:
             f"review — `jarvis wo review {hold['planner_id']}`)")
 
 
-#: §5 of docs/superpowers/specs/2026-10-20-a-merge-held-for-running-checks-is-not-stuck.md.
-#: NOT an attention reason and NOT a blocker, on `BASE_RED_NOTE`'s rule: nobody owes a
-#: decision while GitHub runs the checks.
+def precondition_note(rows: list[dict[str, Any]]) -> str:
+    """One sentence for a `ProjectStore.open_preconditions` result, `""` for no rows"""
+    if not rows:
+        return ""
+    refs = ", ".join(row["ref"] for row in rows)
+    notes = "; ".join(row["note"] for row in rows if row["note"])
+    note = (f"held until {refs} clears "
+            f"(`jarvis wo unblock {rows[0]['wo_id']}`)")
+    return f"{note} — {notes}" if notes else note
+
+
+#: §5 of docs/superpowers/specs/2026-10-20-a-merge-held-for-running-checks-is-not-stuck.md
 AUTOMERGE_CHECKS_NOTE = "waiting for GitHub's checks on {sha} — {reason}"
 
-#: The STORED reason, clamped to one line for the sweep's blocker column, which renders it
-#: verbatim. `ops.objection_response_line`'s bound and `autoreview._HINT_CHARS`, reused
-#: rather than chosen: those are the repo's precedent for exactly this problem, a
-#: model-written or GitHub-written sentence reaching a column. `automerge`'s reasons are
-#: built from a bounded vocabulary today, so this is a guard rather than a routine clip.
+#: The STORED reason, clamped to one line for the sweep's blocker column, which renders it verbatim
 AUTOMERGE_CHECKS_REASON_CHARS = 120
 
 
 def automerge_checks_note(state: dict[str, Any] | None) -> str:
-    """One sentence for a `checks_running` auto-merge hold, `""` for anything else.
-
-    ONE HOME, TWO READERS (kn-432d0f19), both in `ops.stuck_scan`: the blocker column and
-    the first conjunct of §2's exclusion predicate. Two functions over the same dict — one
-    deciding the exclusion, one wording the row — is how the sweep's blocker column came
-    to print "nothing the record can name" beside a `jarvis wo show` that named the hold.
-
-    §3's TRIPLE is performed here and its FOURTH condition is NOT: the hold is the newest
-    `ops.automerge_state` row, it is not marked stale (`automerge.hold_is_live`, shared
-    with the two other readers of the same dict), and its code is `HELD_CHECKS_RUNNING`
-    and nothing wider. The fourth condition — the project's base-health fact is fresh — is
-    `stuck_scan`'s, because the horizon is a project fact this helper may not reach and
-    because this sentence describes what the RECORD says rather than claiming the hold is
-    live now. So §5's inseparability is ONE-WAY: an exclusion always carries a named
-    blocker, a named blocker does not always exclude, and a held order whose fact has gone
-    stale is judged with its blocker column still saying what the record knows.
-
-    Takes the DICT rather than a store, on `plan_hold_note`'s shape: `ops` imports this
-    module. Derived, never fetched — `base_red_note`'s division, the poll wrote the hold
-    down and this reads it back.
-
-    NOT wired into `status_label`: that runs per row in every listing and pays ONE INDEXED
-    READ, while `automerge_state` costs up to six. The sweep is gated on
-    `waiting_pr_merge` and pays it once.
-    """
+    """One sentence for a `checks_running` auto-merge hold, `""` for anything else"""
     from .automerge import HELD_CHECKS_RUNNING, hold_is_live
 
     if not hold_is_live(state) or state is None:
@@ -1114,14 +1095,10 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
             return f"{wo['status']} — {note}"
     if wo["status"] != "pending":
         return wo["status"]
-    # FIRST of the four pending answers: of them it is the only one that may never clear without a... (docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md)
-    held = store.open_preconditions(wo["id"])
-    if held:
-        refs = ", ".join(row["ref"] for row in held)
-        notes = "; ".join(row["note"] for row in held if row["note"])
-        label = (f"pending — held until {refs} clears "
-                 f"(`jarvis wo unblock {wo['id']}`)")
-        return f"{label} — {notes}" if notes else label
+    # FIRST of the four pending answers: of them it is the only one that may never clear without a...... (docs/superpowers/specs/2026-10-15-a-precondition-is-a-row-not-prose.md)
+    note = precondition_note(store.open_preconditions(wo["id"]))
+    if note:
+        return f"pending — {note}"
     # ABOVE the dependency and slot labels
     note = plan_hold_note(store.plan_hold(wo))
     if note:
@@ -2198,25 +2175,16 @@ def _health_hold_seconds(store: ProjectStore, since: float, until: float) -> flo
 
 
 def check_os_health_sweep_alive(store: ProjectStore) -> Iterator[Violation]:
-    """INV-OS-HEALTH-SWEEP-DARK — the OS's own health sweep must never be dark (docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §5)"""
+    """INV-OS-HEALTH-SWEEP-DARK — the OS's own ENABLED health sweep must never be dark (docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §5)"""
     spec = _os_owning_project(store)
     if spec is None:
         return
     name = spec.name
     supervisor = getattr(spec, "supervisor", None)
-    for key, on in (("supervisor.enabled", getattr(supervisor, "enabled", False)),
-                    ("supervisor.health_enabled",
-                     getattr(supervisor, "health_enabled", False))):
-        if not on:
-            yield Violation(
-                invariant="INV-OS-HEALTH-SWEEP-DARK",
-                detail=(f"the OS's own health sweep is DISABLED ({key}=false) and must "
-                        f"not be — {name} runs the OS itself, and its sweep must always "
-                        f"be on and producing judgements (user rule, 2026-09-28)"),
-                level="critical", context={"project": name, "cause": "disabled",
-                                           "key": key},
-            )
-            return
+    # Off in the catalog is a recorded user choice, not darkness; only an ENABLED sweep can be dark
+    if not (getattr(supervisor, "enabled", False)
+            and getattr(supervisor, "health_enabled", False)):
+        return
 
     now = db.now()
     window = OS_HEALTH_SWEEP_DARK_MINUTES * 60

@@ -31,6 +31,9 @@ AUTOMERGE_CHECKS_CAUSE = "GitHub's checks on the merge commit"
 #: §2.1 of docs/superpowers/specs/2026-10-15-a-child-held-by-its-features-unratified-...
 PLAN_ASSUMPTION_CAUSE = "its feature's unratified plan"
 
+#: §2.1 of docs/superpowers/specs/2026-10-19-an-order-held-by-an-open-precondition-is-not-stuck.md
+PRECONDITION_CAUSE = "an open precondition"
+
 #: §1 of docs/superpowers/specs/2026-10-20-a-work-order-at-its-budget-cap-is-not-stuck.md
 BUDGET_CAP_CAUSE = "its budget cap"
 
@@ -60,6 +63,11 @@ EXCLUSION_REASON: Mapping[str, str] = {
                             "plan is ratified, and only you can ratify it — "
                             "`jarvis wo review <planner-id>` on the feature's planner "
                             "is what clears it, so nothing is judged while it stands"),
+    # §2.1: the shipped sentence is FALSE here too; both parties clear it
+    PRECONDITION_CAUSE: ("this order was created held until its precondition clears and "
+                         "the row is still open — the OS clears it when it resolves the "
+                         "ref, and `jarvis wo unblock <id>` is how you clear it yourself, "
+                         "so nothing is judged while it stands"),
     # §1 of the 2026-10-20 spec: the shipped sentence is FALSE here too
     BUDGET_CAP_CAUSE: ("the OS launches no turn it cannot pay for, and only you can "
                        "fund another — `jarvis wo budget <id> <amount>` is what clears "

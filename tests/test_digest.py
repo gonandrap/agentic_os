@@ -62,10 +62,9 @@ def test_the_vendored_bytes_are_not_shipped_into_projects(project):
     # ...and here is where it does live, reachable by the one module that reads it
     assert digest.SKILL_PATH.is_file()
     assert digest.SKILL_PATH.parent == bootstrap.ASSETS / "digest"
-    # The control: the adapted skill DID reach the worker tree
-    shipped = [p for p in project.rglob("i-have-adhd/SKILL.md")]
-    assert shipped, "the adapted worker skill did not reach the project at all"
-    assert all(p.read_bytes() != verbatim for p in shipped)
+    # The control: worker skills DID reach the tree, and i-have-adhd is not among them
+    assert list(project.rglob("ponytail/SKILL.md")), "worker skills did not reach the project"
+    assert not list(project.rglob("i-have-adhd/SKILL.md"))
 
 
 def test_the_system_prompt_is_the_style_verbatim_behind_a_machine_readable_header():
