@@ -1721,6 +1721,11 @@ class Daemon:
         except Exception:  # noqa: BLE001 — a broken marker must not stop the daemon
             log.exception("release boot verification failed")
 
+    @property
+    def self_dispatch(self) -> bool:
+        # os.autonomy.self_dispatch: may the OS create orders nobody typed? Ships off.
+        return bool(self.catalog.os.autonomy.self_dispatch)
+
     def release_tick(self) -> None:
         from . import release
 
@@ -3788,7 +3793,8 @@ class Daemon:
             1 for e in store.events_of_kind(wo_id, "validation_failed")
             if db.from_json(e["payload"], {}).get("round") == n
             and db.from_json(e["payload"], {}).get("cause") == VALIDATION_KILLED_CAUSE)
-        inv_id = self._killed_investigation(store, project, wo_id, round_id, n, killed)
+        inv_id = (self._killed_investigation(store, project, wo_id, round_id, n, killed)
+                  if self.self_dispatch else "")
         store.close_validation_round(
             round_id, "failed",
             f"every validation seat was killed by a signal (rc={killed.rc}) before it "
@@ -4904,6 +4910,10 @@ class Daemon:
         dispatch = verdict.get("dispatch")
         if not dispatch:
             return
+        if not self.self_dispatch:
+            log.info("neo cleanup dispatch from %s not filed: os.autonomy.self_dispatch "
+                     "is off", q["wo_id"])
+            return
         try:
             origin_wo = pstore.get_work_order(q["wo_id"])
         except KeyError:
@@ -5592,7 +5602,8 @@ class Daemon:
                                "skipped": {}, "excluded": "", "error": ""}
         errors: list[str] = []
         try:
-            run["excluded"] = self._stuck_exclusion(state)
+            run["excluded"] = (self._stuck_exclusion(state)
+                               or ("" if self.self_dispatch else "self_dispatch_off"))
             # COUNTED OVER EVERY ENABLED PROJECT, not over `projects` — the cap is
             # fleet-wide while the scan is per-project (Neo 1086's `sweep_every_ticks`),
             # so a tick sweeping one project must still see what the others filed today.
@@ -7248,6 +7259,8 @@ class Daemon:
         """
         from . import bugreport, github, issues
 
+        if not self.self_dispatch:
+            return
         origin = github.origin_repo(project.path)
         repo = bugreport.bug_repo()
         if origin is None or f"{origin[0]}/{origin[1]}".lower() != repo.lower():
@@ -10299,6 +10312,8 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
         from . import db, issues
         from .project_store import OPEN_STATUSES
 
+        if not self.self_dispatch:
+            return ""  # releases only via the user's shipit unless os.autonomy is on
         if self._already_live(project, store, wo):
             return ""
         url = wo.get("issue_url") or ""
@@ -10749,7 +10764,7 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
         """
         # §2.1: it reads `jarvis-*` tags and `paths.production_code_dir()`, facts about
         # this repository and not about a project.
-        if project.name != self._os_owner():
+        if project.name != self._os_owner() or not self.self_dispatch:
             return
         # §2.2: the window is this project's claim about its release cadence.
         since = db.now() - int(project.release.refile_window_days) * 86400

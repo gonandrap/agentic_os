@@ -1023,6 +1023,21 @@ the work is yours to do now."""
 #: naming a command that does not exist is exactly what this replaced.
 START_COMMAND = "jarvis issues start {url}"
 
+def self_dispatch(catalog: Any) -> bool:
+    """`os.autonomy.self_dispatch`: may a confirmed claim dispatch work nobody typed?"""
+    autonomy = getattr(getattr(catalog, "os", None), "autonomy", None)
+    return bool(getattr(autonomy, "self_dispatch", False))
+
+
+def self_dispatch_configured() -> bool:
+    """`self_dispatch` of the resolved fleet catalog; an unreadable catalog reads as off."""
+    from .ops import resolve_catalog
+    try:
+        return self_dispatch(resolve_catalog())
+    except Exception:  # noqa: BLE001 — fail closed: no catalog, no self-dispatch
+        return False
+
+
 def route_filing(issue_url: str, title: str, body: str, priority: str,
                  repo: str | None = None, expedite: bool = False) -> dict[str, Any]:
     """Everything that happens to a freshly filed bug, before anyone is told about it.
@@ -1064,7 +1079,8 @@ def route_filing(issue_url: str, title: str, body: str, priority: str,
     out: dict[str, Any] = {"priority": priority, "wo_id": "", "backlog_id": "",
                            "project": "", "neo_question_id": 0, "reason": ""}
     try:
-        spec = tracker_project(resolve_catalog(), repo)
+        catalog = resolve_catalog()
+        spec = tracker_project(catalog, repo)
     except (CatalogError, OpsError, FileNotFoundError, OSError) as e:
         out["reason"] = f"the fleet catalog could not be read ({e})"
         return out
@@ -1124,6 +1140,10 @@ def route_filing(issue_url: str, title: str, body: str, priority: str,
         if expedite:
             out["reason"] += (f"; Neo is re-assessing the `{priority}` claim in "
                               f"parallel and can still move the rating, not the work")
+        elif not self_dispatch(catalog):
+            out["reason"] = (f"`{priority}` claimed — Neo is re-assessing the rating; "
+                             f"nothing is dispatched either way, start it yourself with "
+                             f"`{START_COMMAND.format(url=issue_url)}`")
         else:
             out["reason"] = (f"`{priority}` claimed — Neo is re-assessing it against the "
                              f"rubric; a work order is created only if Neo confirms")
@@ -1376,7 +1396,7 @@ def settle_triage(catalog: Any, q: dict[str, Any], verdict: dict[str, Any]
         out["reason"] = f"project {q.get('project')!r} is no longer in the catalog"
         return out
 
-    if out["outcome"] == "confirmed":
+    if out["outcome"] == "confirmed" and self_dispatch(catalog):
         out["wo_id"] = promote_confirmed(spec, payload)
         if out["backlog_id"]:
             # Only a question asked BEFORE the backlog item stopped being created can

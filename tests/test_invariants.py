@@ -2723,3 +2723,7 @@ def test_the_pointer_check_runs_on_the_slow_cadence_only():
     lists the whole repository. `INVARIANTS` runs twice a minute per project."""
     assert invariants.check_spec_pointer_resolves in invariants.SLOW_INVARIANTS
     assert invariants.check_spec_pointer_resolves not in invariants.INVARIANTS
+
+
+# Written for the opt-in OS (os.autonomy.self_dispatch on, stuck sweep on).
+pytestmark = pytest.mark.usefixtures("self_dispatch_on")

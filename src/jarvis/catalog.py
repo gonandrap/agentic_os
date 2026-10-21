@@ -54,6 +54,8 @@ SAFETY_KEYS = (
     # the same act at two magnitudes — and a change here is invisible until the morning
     # it starts spending. docs/superpowers/specs/2026-09-14-the-scheduler.md §2.
     "*.schedule.*",
+    # Files work nobody typed: same class of act as the scheduler.
+    "os.autonomy.*",
     # What the OS is permitted to WATCH — and, once §6 of
     # docs/superpowers/specs/2026-09-27-self-evolution.md lands, the switch everything
     # it is permitted to DO about what it watched hangs off. It is here at the WATCHING stage
@@ -1061,10 +1063,8 @@ class UiHealthConfig:
 # -- `fleet_health`: when an order that has stopped moving gets investigated. §4 of
 # docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md.
 
-#: Ships ON. The sweep makes no model call — its whole cost is indexed reads — and the
-#: spend it can authorise is rationed twice over, by `max_per_day` and by
-#: `worker.investigation_budget_usd`.
-DEFAULT_FLEET_HEALTH_ENABLED = True
+#: Ships OFF: every investigation it opens is spend nobody typed (os.autonomy).
+DEFAULT_FLEET_HEALTH_ENABLED = False
 
 #: Minutes in status before one open status is over threshold. THE FIGURE IS THE USER'S,
 #: 2026-10-01: five minutes of idle — no tool call, no script running, no usage-limit hold
@@ -1419,12 +1419,7 @@ DEFAULT_BUGS_LABEL = "in progress"
 class BugsConfig:
     """How the tracker is labelled while the OS works on a bug it filed.
 
-    WHAT IS NOT HERE IS THE POINT. There is no `auto_work_order` switch: routing is by
-    priority and only by priority (the user's ruling of 2026-09-14 settling issue #240's
-    decision A), and what stops a filing committing the fleet to work is the rubric
-    (`issues.PRIORITY_RUBRIC`) plus Neo re-assessing every `critical`/`blocker` claim —
-    not a catalog key. A key that shipped off would have made that ruling's own
-    "critical and blocker automatically get a work order" unreachable.
+    Whether a confirmed claim dispatches at all is `os.autonomy.self_dispatch` (ships off).
 
     `label` is the whole of the in-progress signal: nothing derives it, and an issue
     carries it exactly while a live work order is on it (`issues.desired_state`). The
@@ -1451,6 +1446,22 @@ class ReleaseConfig:
     """
 
     refile_window_days: int = DEFAULT_RELEASE_REFILE_WINDOW_DAYS
+
+
+@dataclass
+class AutonomyConfig:
+    """Whether the OS may create orders nobody typed (bug pickups, riders, red-main fixes, releases)."""
+
+    self_dispatch: bool = False
+
+
+def _parse_autonomy(raw: Any) -> AutonomyConfig:
+    if not isinstance(raw, dict):
+        raise _err('"os.autonomy" must be an object')
+    value = raw.get("self_dispatch", False)
+    if not isinstance(value, bool):
+        raise _err(f"os.autonomy.self_dispatch must be true or false, got {value!r}")
+    return AutonomyConfig(self_dispatch=value)
 
 
 @dataclass
@@ -1954,6 +1965,7 @@ class OsConfig:
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     wiring: WiringConfig = field(default_factory=WiringConfig)
     worktree: WorktreeConfig = field(default_factory=WorktreeConfig)
+    autonomy: AutonomyConfig = field(default_factory=AutonomyConfig)
 
 
 @dataclass
@@ -3148,6 +3160,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         schedule=_parse_schedule(os_raw.get("schedule", {})),
         wiring=_parse_wiring(os_raw.get("wiring", {})),
         worktree=_parse_worktree(os_raw.get("worktree", {})),
+        autonomy=_parse_autonomy(os_raw.get("autonomy", {})),
     )
     if os_cfg.default_permission_mode not in VALID_PERMISSION_MODES:
         raise _err(f"os.defaults.permission_mode {os_cfg.default_permission_mode!r} not in {sorted(VALID_PERMISSION_MODES)}")

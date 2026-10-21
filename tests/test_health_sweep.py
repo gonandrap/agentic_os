@@ -2728,3 +2728,7 @@ def test_both_callers_derive_the_same_bool(jarvis_home, project, tmp_path, auto_
         assert row["stuck"] is not excluded
     finally:
         store.close()
+
+
+# Written for the opt-in OS (os.autonomy.self_dispatch on, stuck sweep on).
+pytestmark = pytest.mark.usefixtures("self_dispatch_on")
