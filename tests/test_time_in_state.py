@@ -599,7 +599,9 @@ def test_the_invariant_repairs_a_tail_that_disagrees_with_the_column(store):
     store.conn.commit()
 
     # Called directly for the stamp — a reconcile runs every other check too
-    found = list(invariants.check_spans_reach_the_status(store))
+    # `backdate` moves spans and not their events, which INV-RECORD-BEHIND reports beside
+    found = [v for v in invariants.check_spans_reach_the_status(store)
+             if v.invariant == "INV-SPAN-BEHIND"]
     assert invariants.check_spans_reach_the_status in invariants.INVARIANTS
 
     assert [v.wo_id for v in found] == [wo["id"]]

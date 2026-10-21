@@ -439,6 +439,11 @@ def _validation_lines(pstore: Any, fo_id: str, cfg: Any) -> list[str]:
     return lines
 
 
+#: What a work-order packet still has to fit after `_history_lines`, for its equal share
+WO_SECTIONS_AFTER_HISTORY = ("# The session, turn by turn",
+                             "# What was last said about this order")
+
+
 def _for(seconds: float) -> str:
     hours = seconds / SECONDS_PER_HOUR
     return f"{hours:.1f} hour(s)" if hours >= 1 else f"{seconds / SECONDS_PER_MINUTE:.0f} minute(s)"
@@ -554,12 +559,10 @@ def build_evidence(pstore: Any, subject: dict[str, Any],
                 _validation_lines(pstore, fo_id, cfg),
                 _said_lines(pstore, carrier["id"] if carrier else None, cfg)]
         # An equal share of the budget, so the tree's bound moves with the setting and this module goes on...
+        share = cfg.evidence_budget_chars // (len(sections) + len(rest) + 1)
         tree = ["# The child tree",
-                *_child_lines(pstore.feature_children(fo_id),
-                              cfg.evidence_budget_chars
-                              // (len(sections) + len(rest) + 1))]
-        history = _history_lines(pstore, "fo", fo_id, cfg.evidence_budget_chars
-                                 // (len(sections) + len(rest) + 2))
+                *_child_lines(pstore.feature_children(fo_id), share)]
+        history = _history_lines(pstore, "fo", fo_id, share)
         sections += [rest[0], history, tree, *rest[1:]]
     else:
         from . import health
@@ -579,8 +582,9 @@ def build_evidence(pstore: Any, subject: dict[str, Any],
             f"brief: {_clip(str(row.get('description') or ''), cfg.description_chars)}",
         ])
         # Ahead of the transcript: a capped packet drops the session read before the status history
-        sections.append(_history_lines(pstore, "wo", row["id"],
-                                       cfg.evidence_budget_chars // (len(sections) + 3)))
+        sections.append(_history_lines(
+            pstore, "wo", row["id"], cfg.evidence_budget_chars
+            // (len(sections) + 1 + len(WO_SECTIONS_AFTER_HISTORY))))
         sections.append(["# The session, turn by turn",
                          *_session_lines(row, inspect_cfg, pstore)])
         sections.append(_said_lines(pstore, row["id"], cfg))
