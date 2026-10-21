@@ -18,12 +18,17 @@ from jarvis.daemon import (
     Daemon,
     answers_question,
     reviews_gate,
+    runnable_round,
+    settles_turn,
 )
 from jarvis.neo_store import NEO_HELD_Q_STATUSES, NeoStore
+from jarvis.invariants import user_facing_wait
 from jarvis.project_store import (
     CLAIM_RULES,
+    FO_TERMINAL_STATUSES,
     OPEN_STATUSES,
     UNGOVERNED_ORIGINS,
+    VALIDATION_HELD_CAUSE,
     ProjectStore,
 )
 from test_claim_rules import HOLDS  # the four delayed rules, built once
@@ -373,6 +378,193 @@ def test_a_row_the_claims_selection_rejects_derives_no_actor(jarvis_home, projec
                        (value, wo["id"]))
     row = {**store.get_work_order(wo["id"]), "status": "pending"}
     assert ops.scheduled_actor(store, row) is None
+
+
+# -- `validating`: a HELD round names the panel, because the hold LIFTS
+
+def _held_round(store: ProjectStore, wo_id: str) -> dict:
+    """Round one closed `failed` with the hold ahead of it"""
+    rnd = store.open_validation_round(wo_id=wo_id, fingerprint="fp-1")
+    store.close_validation_round(int(rnd["id"]), "failed", "the usage window is spent",
+                                 VALIDATION_HELD_CAUSE)
+    store.add_event(wo_id, "validation_failed",
+                    {"round": int(rnd["round"]), "cause": VALIDATION_HELD_CAUSE,
+                     "reopens_at": time.time() + 3600})
+    return store.get_work_order(wo_id)
+
+
+def test_a_round_inside_its_hold_still_names_the_panel(jarvis_home, project):
+    store = ProjectStore(project)
+    wo = store.create_work_order("add feature X", status="validating")
+    row = _held_round(store, wo["id"])
+
+    actor = ops.scheduled_actor(store, row)
+
+    assert actor is not None and actor.pass_name == "Daemon.validation_tick"
+
+
+def test_the_passs_own_hold_gate_is_unchanged(jarvis_home, project):
+    """`runnable_round` is `validation_tick`'s selection AND its hold test: weakening it walks the pass..."""
+    store = ProjectStore(project)
+    wo = store.create_work_order("add feature X", status="validating")
+    row = _held_round(store, wo["id"])
+
+    assert runnable_round(store, row) is None
+
+
+# -- `running`: a DONE turn names the settler only where the settler WRITES
+
+def _done_turn(store: ProjectStore, wo_id: str, result: str | None = None) -> None:
+    t = store.create_turn(wo_id, "dispatch", "go")
+    store.finish_turn(int(t["id"]), "done", result=result)
+
+
+def _held_gate(store: ProjectStore, wo_id: str) -> None:
+    store.add_approval(wo_id, "pr_merge", GATED, status="awaiting_case")
+
+
+def _pending_gate(store: ProjectStore, wo_id: str) -> None:
+    store.add_approval(wo_id, "pr_merge", GATED)
+
+
+def test_a_done_turn_the_settler_will_not_move_does_not_name_the_settler(
+        jarvis_home, project, settler):
+    """The defect's own row: a worker holding a HELD gate, its turn done hours ago"""
+    store = ProjectStore(project)
+    wo = store.create_work_order("add feature X", status="running")
+    _done_turn(store, wo["id"])
+    _held_gate(store, wo["id"])
+    row = _age_past_grace(store, wo["id"])
+
+    actor = ops.scheduled_actor(store, row)
+
+    assert actor is not None and actor.predicate == "daemon.reviews_gate"  # #1109, not the settler
+    settler(store)
+    moved = store.get_work_order(wo["id"])
+    assert (moved["status"], bool(moved["needs_attention"])) == ("running", False)
+
+
+#: (what makes the shape, the status it must still be in)
+WAIT_SHAPES = [
+    pytest.param("running", _held_gate, "running", id="held-gate"),
+    pytest.param("waiting_input", _pending_gate, "waiting_input", id="already-parked"),
+    pytest.param("idle", lambda store, wo_id: None, "idle", id="manager-idle"),
+    pytest.param("waiting_input", _pending_gate, "waiting_input", id="manager-asked"),
+]
+
+
+@pytest.mark.parametrize(("status", "make", "after"), WAIT_SHAPES)
+def test_each_wait_shape_behaves_as_the_pass_behaves(jarvis_home, project, settler,
+                                                     status, make, after, request):
+    manager = "manager" in request.node.callspec.id
+    store = ProjectStore(project)
+    kw: dict = {"status": status}
+    if manager or status == "idle":
+        kw["kind"] = "manager"
+        kw["parent_id"] = store.create_feature_order("a feature")["id"]
+    wo = store.create_work_order("add feature X", **kw)
+    _done_turn(store, wo["id"])
+    make(store, wo["id"])
+    row = _age_past_grace(store, wo["id"])
+
+    assert settles_turn(store, row) is False
+
+    settler(store)
+    assert store.get_work_order(wo["id"])["status"] == after
+
+
+#: (status, kind, what makes the shape, the status the settler leaves)
+SUMMARY_SHAPES = [
+    pytest.param("running", None, _held_gate, "completed", id="summary-held-gate"),
+    pytest.param("waiting_input", "manager", _pending_gate, "completed",
+                 id="summary-manager-asked"),
+]
+
+
+@pytest.mark.parametrize(("status", "kind", "make", "after"), SUMMARY_SHAPES)
+def test_a_summary_outranks_the_wait_shape_in_both_readers(jarvis_home, project,
+                                                           settler, status, kind, make,
+                                                           after):
+    """A `result_summary` is the FIRST question both readers ask (#264)"""
+    store = ProjectStore(project)
+    kw: dict = {"status": status}
+    if kind == "manager":
+        kw["kind"] = kind
+        kw["parent_id"] = store.create_feature_order("a feature")["id"]
+    wo = store.create_work_order("add feature X", **kw)
+    if kind == "manager":
+        feature = store.get_feature_order(kw["parent_id"])
+        assert feature["status"] not in FO_TERMINAL_STATUSES, \
+            "the premise: the feature is LIVE, so nothing closes the manager"
+    _done_turn(store, wo["id"])
+    make(store, wo["id"])
+    assert user_facing_wait(store, wo["id"]) is (kind == "manager"), \
+        ("the premise: a PENDING gate is a user-facing wait and a HELD one is not — "
+         "the manager arm's hold, and the `waiting_input` write's chooser")
+    store.update_work_order(wo["id"], result_summary="shipped the export")
+    row = _age_past_grace(store, wo["id"])
+
+    assert settles_turn(store, row) is True
+
+    settler(store)
+    assert store.get_work_order(wo["id"])["status"] == after
+
+
+#: (status, kind, what makes the shape, the status the settler leaves)
+WRITE_SHAPES = [
+    pytest.param("running", None, _pending_gate, "waiting_input", id="arm-parks-it"),
+    pytest.param("waiting_input", "manager", lambda store, wo_id: None, "idle",
+                 id="arm-idles-the-manager"),
+]
+
+
+@pytest.mark.parametrize(("status", "kind", "make", "after"), WRITE_SHAPES)
+def test_each_arm_that_writes_is_reached_on_its_own_row(jarvis_home, project, settler,
+                                                        status, kind, make, after):
+    """`settles_turn` True and the arm's write, for a row with NO `result_summary` (#264)"""
+    store = ProjectStore(project)
+    kw: dict = {"status": status}
+    if kind == "manager":
+        kw["kind"] = kind
+        kw["parent_id"] = store.create_feature_order("a feature")["id"]
+    wo = store.create_work_order("add feature X", **kw)
+    _done_turn(store, wo["id"])
+    make(store, wo["id"])
+    row = _age_past_grace(store, wo["id"])
+
+    assert settles_turn(store, row) is True
+
+    settler(store)
+    assert store.get_work_order(wo["id"])["status"] == after
+
+
+def test_a_done_turn_the_settler_does_move_still_names_it(jarvis_home, project,
+                                                          settler):
+    store = ProjectStore(project)
+    wo = store.create_work_order("add feature X", status="running")
+    _done_turn(store, wo["id"])
+    row = _age_past_grace(store, wo["id"])
+
+    assert settles_turn(store, row) is True
+
+    settler(store)
+    assert store.get_work_order(wo["id"])["status"] == "needs_review"
+
+
+def test_a_queued_message_is_the_delivery_passs_row_not_the_settlers(jarvis_home,
+                                                                     project, settler):
+    """The fourth branch that writes nothing for a done turn"""
+    store = ProjectStore(project)
+    wo = store.create_work_order("add feature X", status="running")
+    _done_turn(store, wo["id"])
+    # A session of its own, which `worker_session.delivery_hold` requires: nothing carries a queued...
+    store.update_work_order(wo["id"], session_id="sess-1")
+    store.queue_message(wo["id"], "carry on")
+    row = _age_past_grace(store, wo["id"])
+
+    assert settles_turn(store, row) is False
+    actor = ops.scheduled_actor(store, row)
+    assert actor is not None and actor.pass_name == "Daemon.deliver_messages"
 
 
 @pytest.mark.parametrize("status", ["needs_review", "budget_exhausted"])

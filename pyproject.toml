@@ -34,3 +34,5 @@ packages = ["src/jarvis"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+# hung test dumps all thread tracebacks and dies; -q buffers, so CI otherwise burns whole job with no log
+faulthandler_timeout = 120

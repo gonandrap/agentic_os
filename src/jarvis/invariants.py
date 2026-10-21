@@ -248,8 +248,13 @@ STALE_FINISH_BLOCKER = ("the worker went back to work after finishing and stoppe
                         "without finishing — its recorded summary is older than its last "
                         "turn; read that turn, then `jarvis wo send`")
 
-#: Where "nothing is in flight" is worth saying
+#: NO LONGER CONSULTED BY `parked_reason` (docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md)
 PARKABLE_STATUSES = ("dispatching", "running", "waiting_input", "needs_review")
+
+#: What an OPEN work order says when `ops.scheduled_actor` names nobody and no other blocker says what... (docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md)
+NO_ACTOR_BLOCKER = ("nothing is going to act on this: no daemon pass selects a "
+                    "`{status}` work order in this state — read its record, then "
+                    "`jarvis wo send`, `jarvis wo retry` or `jarvis wo done`")
 
 #: What a work order says when something the user sent it is still sitting in the queue and the worker...
 MESSAGE_STUCK_BLOCKER = ("a message you sent is still queued and the worker has not seen "
@@ -265,6 +270,9 @@ IN_FLIGHT_WAITS = ("turn_running", "queued_message", "neo_question", "gate_with_
 
 #: What `parked_reason` stays silent about
 SPOKEN_FOR_WAITS = IN_FLIGHT_WAITS + ("message_stuck",)
+
+#: `parked_reason`'s `actor` default: NOBODY HAS DERIVED A VERDICT YET, so derive one
+ACTOR_NOT_DERIVED = object()
 
 
 @dataclass
@@ -711,9 +719,18 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # LAST, and never INSTEAD of anything: a work order can be parked and also owe the user a decision (docs/superpowers/specs/2026-10-14-an-unanswered-refusal-must-name-itself.md)
     if all(_mentions_assumptions(b) and b not in REFUSAL_HELD_BLOCKERS
            for b in blockers):
-        parked = parked_reason(store, wo, now=now)
+        # ONE VERDICT PER ORDER PER DERIVATION (§5d's cost clause): derived here
+        actor: Any = ACTOR_NOT_DERIVED
+        if wo["status"] in OPEN_STATUSES:
+            from .ops import scheduled_actor
+
+            actor = scheduled_actor(store, wo, now=now)
+        parked = parked_reason(store, wo, now=now, actor=actor)
         if parked:
             blockers.append(parked)
+        # NOBODY OWNS IT, AND NOTHING IS OWED
+        elif governed and actor is None and not blockers:
+            blockers.append(NO_ACTOR_BLOCKER.format(status=wo["status"]))
     # What the user has already looked at and dismissed stops being a blocker — but only exactly that
     return [b for b in blockers if b not in acknowledged(wo)]
 
@@ -992,12 +1009,14 @@ def check_spans_reach_the_status(store: ProjectStore) -> Iterator[Violation]:
 
 
 def parked_reason(store: ProjectStore, wo: dict[str, Any],
-                  now: float | None = None) -> str | None:
-    """Why nothing is going to happen to this work order — or None if something is"""
+                  now: float | None = None,
+                  actor: Any = ACTOR_NOT_DERIVED) -> str | None:
+    """Why nothing is going to happen to this work order — or None if something is (docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md)"""
     if wo.get("origin") in UNGOVERNED_ORIGINS:
         # An injected session was never briefed on `jarvis wo finish` (#264)
         return None
-    if wo["status"] not in PARKABLE_STATUSES:
+    # OPEN, and that is the whole gate: `PARKABLE_STATUSES` stops being consulted (§5a)
+    if wo["status"] not in OPEN_STATUSES:
         return None
     turn = store.latest_turn(wo["id"])
     if turn is None or turn["state"] != "done" or not turn["ended_at"]:
@@ -1016,9 +1035,12 @@ def parked_reason(store: ProjectStore, wo: dict[str, Any],
     if (now - ended) - sum(h.overlap(ended, now, now) for h in spans) \
             < minutes * SECONDS_PER_MINUTE:
         return None
-    from .ops import waiting_on
+    # SOMEBODY IS GOING TO ACT ON IT, and that is the one thing that makes a silence not a parking
+    if actor is ACTOR_NOT_DERIVED:
+        from .ops import scheduled_actor
 
-    if waiting_on(store, wo)["what"] in SPOKEN_FOR_WAITS:
+        actor = scheduled_actor(store, wo, now=now)
+    if actor is not None:
         return None
     finished = store.events_of_kind(wo["id"], "finished")
     if (finished and float(finished[-1]["ts"]) < float(turn["started_at"])

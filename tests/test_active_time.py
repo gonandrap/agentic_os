@@ -420,7 +420,7 @@ PARKED_RESIDUAL = 300.0
 def parked_shape(rec: Record, store: ProjectStore, wo: str) -> float:
     """An order whose worker settled a turn, and which was then held for four hours"""
     seq = rec.turn(T0, T0 + 60)
-    store.set_status(wo, "running")
+    store.set_status(wo, "waiting_pr_merge")
     rec.event("turn_paused", T0 + 60,
               {"seq": seq, "reason": "usage_limit",
                "error": "You've hit your session limit · resets 2:10pm"})

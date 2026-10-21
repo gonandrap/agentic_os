@@ -116,17 +116,18 @@ def test_resume_auto_says_what_is_holding_it_and_does_not_send_another(project):
 
 
 def test_a_stuck_message_speaks_instead_of_the_parked_line(project):
-    """One stopped worker, one sentence: PARKED_BLOCKER would only say it went quiet"""
+    """One stopped worker, one sentence: PARKED_BLOCKER would only say it went quiet (docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md)"""
     store = ProjectStore(project)
-    wo = _sent_and_never_delivered(store)
+    wo = _sent_and_never_delivered(store, status="waiting_pr_merge")
     _age_the_message(store, wo["id"])
     _age_the_turn(store, wo["id"])
 
     assert ops.waiting_on(store, wo)["what"] == "message_stuck"
-    assert parked_reason(store, wo) is None
+    assert true_blockers(store, wo) == [MESSAGE_STUCK_BLOCKER]
 
     store.mark_message(store.queued_messages(wo["id"])[0]["id"], "delivered")
 
+    assert true_blockers(store, wo) == [PARKED_BLOCKER]
     assert parked_reason(store, wo) == PARKED_BLOCKER
 
 

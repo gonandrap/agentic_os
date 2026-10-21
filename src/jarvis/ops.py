@@ -55,8 +55,8 @@ from .daemon import (
     polls_pull_request,
     retries_turn,
     reviews_gate,
-    runnable_round,
     settles_turn,
+    validation_round,
 )
 from .github import GitHubError
 from .invariants import PR_CLOSED_BLOCKER, UNLANDED_BLOCKER, true_blockers
@@ -12542,9 +12542,10 @@ SCHEDULED_ACTORS: dict[str, ActorPasses] = {
     )),
     "validating": ActorPasses((
         _Pass("Daemon.validation_tick",
-              "a runnable round is on record and its hold has lifted, so the panel "
-              "judges it",
-              "daemon.runnable_round", runnable_round),
+              "the panel owns a round on this row, so it judges it — a validation "
+              "hold only DELAYS that turn (`daemon.runnable_round` is the pass's own "
+              "now-or-not test; §2: None means nobody will act, never not yet)",
+              "daemon.validation_round", validation_round),
         _Pass("Daemon.poll_pull_requests",
               "the row carries a routing pull request, so the poll asks GitHub what "
               "became of it",

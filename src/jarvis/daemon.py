@@ -142,7 +142,40 @@ def settles_turn(store: ProjectStore, wo: dict[str, Any],
         return False
     if wo["origin"] in UNGOVERNED_ORIGINS:
         return False
-    return settle_grace_holds(wo, now) or store.latest_turn(wo["id"]) is not None
+    if settle_grace_holds(wo, now):
+        return True
+    turn = store.latest_turn(wo["id"])
+    if turn is None:
+        return False  # the claim-with-no-launch hole; see the docstring above
+    if turn["state"] != "done":
+        return True   # running or paused: the settler re-derives the row from the turn
+    return settles_done_turn(store, wo)
+
+
+def settles_done_turn(store: ProjectStore, wo: dict[str, Any], *,
+                      queued: list[dict[str, Any]] | None = None) -> bool:
+    """Does a DONE turn move this row — `Daemon.settle_work_order`'s own rule (docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md)"""
+    from .invariants import something_is_out, user_facing_wait
+
+    msgs = queued if queued is not None else store.queued_messages(wo["id"])
+    if msgs:
+        return False
+    if wo.get("result_summary"):
+        return True
+    manager = wo.get("kind") == "manager"
+    if not manager and something_is_out(store, wo["id"]):
+        return (user_facing_wait(store, wo["id"])
+                and wo["status"] != "waiting_input")
+    if manager:
+        # Its feature being over is the one thing that still moves it (`_close_feature_manager`)
+        parent = wo.get("parent_id")
+        feature = store.get_feature_order(parent) if parent else None
+        if feature and feature["status"] in FO_TERMINAL_STATUSES:
+            return True
+        if user_facing_wait(store, wo["id"]):
+            return False
+        return wo["status"] != "idle"
+    return True
 
 
 def retries_turn(store: ProjectStore, wo: dict[str, Any],
@@ -168,13 +201,22 @@ def delivers_message(store: ProjectStore, wo: dict[str, Any],
     return any(worker_session.message_hold(store, wo, m, now=now) is None for m in msgs)
 
 
-def runnable_round(store: ProjectStore, wo: dict[str, Any],
-                   now: float | None = None) -> dict[str, Any] | None:
-    """The round `Daemon.validation_tick` will judge, or None — 2026-10-09 §3"""
+def validation_round(store: ProjectStore, wo: dict[str, Any],
+                     now: float | None = None) -> dict[str, Any] | None:
+    """The round THE PANEL OWNS on this row, held or not — 2026-10-09 §2"""
     if wo["status"] not in OPEN_STATUSES:
         return None
     row = store.latest_validation_round(wo_id=wo["id"])
     if not row or row.get("outcome") not in RUNNABLE_VALIDATION_OUTCOMES:
+        return None
+    return row
+
+
+def runnable_round(store: ProjectStore, wo: dict[str, Any],
+                   now: float | None = None) -> dict[str, Any] | None:
+    """The round `Daemon.validation_tick` will judge NOW, or None — 2026-10-09 §3"""
+    row = validation_round(store, wo, now)
+    if row is None:
         return None
     if validation_hold_until(store.events_of_kind(wo["id"], "validation_failed"),
                              int(row["round"])) > (now or time.time()):
@@ -4297,7 +4339,8 @@ class Daemon:
 
     def settle_work_order(self, project: ProjectSpec, store: ProjectStore,
                           wo: dict) -> None:
-        from .invariants import something_is_out, true_blockers, user_facing_wait
+        # `user_facing_wait` is NOT read here any more: it decides eligibility
+        from .invariants import something_is_out, true_blockers
 
         # OUT OF MONEY, asked before the turn is looked at but AFTER the round machine's claim below
         latest_round = store.latest_validation_round(wo_id=wo["id"]) or {}
@@ -4418,9 +4461,9 @@ class Daemon:
             return
 
         # The turn is done
-        if store.queued_messages(wo["id"]):
-            return  # the next turn goes out this tick; nothing has settled yet
         fresh = store.get_work_order(wo["id"])
+        if not settles_done_turn(store, fresh):
+            return
         from . import ops as ops_mod
 
         # THE LANDING THE ROUND MACHINE DEFERRED (docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md)
@@ -4453,19 +4496,14 @@ class Daemon:
                 ops_mod.land_finished(store, fresh)
         elif wo.get("kind") != "manager" and something_is_out(store, wo["id"]):
             # Parked on the delegate — a privileged-action gate awaiting a verdict (docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md)
-            if (user_facing_wait(store, wo["id"])
-                    and fresh["status"] != "waiting_input"):
-                store.set_status(wo["id"], "waiting_input")
+            store.set_status(wo["id"], "waiting_input")
         elif wo.get("kind") == "manager":
             # A project manager order is idle BY DESIGN: it acts on a message and ends its turn (#264)
             parent = wo.get("parent_id")
             feature = store.get_feature_order(parent) if parent else None
             if feature and feature["status"] in FO_TERMINAL_STATUSES:
                 self._close_feature_manager(store, str(parent))
-            elif user_facing_wait(store, wo["id"]):
-                # HOLD IT WHERE IT IS (docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md)
-                pass
-            elif fresh["status"] != "idle":
+            else:
                 store.set_status(wo["id"], "idle")
                 # The one write the re-status cannot do on its own: a manager carried over from before issue #264 may...
                 moved = store.get_work_order(wo["id"])

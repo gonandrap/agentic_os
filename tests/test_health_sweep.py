@@ -2231,7 +2231,8 @@ def test_each_blocker_id_comes_from_its_canonical_source(store, monkeypatch):
     store.update_work_order(parked, pr_url="https://example.invalid/pr/1")
     assert health.blocker(store, subject(parked), cfg) == "pull-request"
     store.update_work_order(parked, pr_url="")
-    assert health.blocker(store, subject(parked), cfg) is None
+    # Emptying the column no longer leaves the row unexplained: §5b of...
+    assert health.blocker(store, subject(parked), cfg) == "user"
 
     # 4
     from jarvis import holds
@@ -2668,6 +2669,7 @@ def _held_for_checks(os_, hours: float = 61 / 60, status: str = "waiting_pr_merg
     """A parked order held for the checks, beside a base-health fact `fact_age` old"""
     wo, at = _parked(os_["store"], hours=hours, status=status,
                      title="parked while GitHub runs the checks")
+    os_["store"].update_work_order(wo["id"], pr_url="https://github.com/o/r/pull/1")  # the poll's row
     checks_hold(os_["daemon"], os_["store"], wo["id"], at + 60.0)
     base_fact(red=False, age=fact_age)
     return wo, at
