@@ -2770,7 +2770,7 @@ AUTOMERGE_TERMINAL = "automerge_merged"
 
 def automerge_checks_hold_spans(events: Iterable[Any], since: float, now: float,
                                 open_end: float) -> list[tuple[float, float]]:
-    """Every interval inside `[since, now]` the OS held a merge for GitHub's checks, each ending at the horizon a `gh` outage leaves (docs/superpowers/specs/2026-10-20-a-merge-held-for-running-checks-is-not-stuck.md §4)"""
+    """Every interval inside `[since, now]` the OS held a merge for GitHub's checks (docs/superpowers/specs/2026-10-20-a-merge-held-for-running-checks-is-not-stuck.md §4)"""
     from . import db
     from .automerge import HELD_CHECKS_RUNNING
 
