@@ -421,6 +421,13 @@ come back from within the same tick. The test that matters is the pair: an order
 stops with an objection still queued ends `withdrawn` and the worker is never sent a turn;
 an order still running keeps it outstanding, however long it has been queued.
 
+> Amended 2026-10-20 (Neo, question 2008): the trigger above is TERMINAL statuses only,
+> never "no longer `running`" — `needs_review`, `validating`, `waiting_pr_merge` and
+> `budget_exhausted` are states an order comes back from, and withdrawing there is GitHub
+> issue 1112. A `needs_review` order disarms under its own reason; every other open status
+> HOLDS. A reader who implements the sentence above re-introduces the defect —
+> 2026-10-20-an-objection-is-withdrawn-before-the-order-stops.md.
+
 ## 7. Confirmation at delivery, before anything settles
 
 A provisional approval is an opinion about an intention. At `needs_review` the intention
@@ -473,6 +480,11 @@ approved. It is the user's, three ways:
   stopped.
 * **undeliverable (§9).** The same, and it additionally raises attention, because a
   transport that failed is a fact about the OS rather than about the assumption.
+
+> Amended 2026-10-20 (Neo, question 2008): the withdrawal this section is ordered after now
+> runs on TERMINAL statuses only, and a `needs_review` order disarms a queued objection
+> under its own reason and re-surfaces it to the user —
+> 2026-10-20-an-objection-is-withdrawn-before-the-order-stops.md.
 
 ## 8. The assumptions view
 

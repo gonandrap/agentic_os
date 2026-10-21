@@ -69,6 +69,19 @@ OPEN_STATUSES = ("pending", "dispatching", "running", "idle", "waiting_input",
 # project's history, so listings collapse them behind a count rather than printing them.
 TERMINAL_STATUSES = ("completed", "cancelled", "failed")
 
+#: Why an objection was taken back — ONE STRING PER OUTCOME, and these are the two. They
+#: live HERE, in the lowest module that reads them, because `objection_counts` buckets on
+#: exact match and `daemon` writes them: a second spelling in either place would silently
+#: turn every count into `other`. `daemon` re-exports them under the names its callers
+#: already use (`daemon.OBJECTION_WITHDRAWN_REASON`, `OBJECTION_HANDED_BACK_REASON`).
+#:
+#: The two are different facts about the worker: the order STOPPED before it could be
+#: told, or it DELIVERED and the decision is now the user's. §6.6 of docs/superpowers/
+#: specs/2026-09-23-an-assumption-judged-while-the-worker-still-runs.md and §1-§3 of
+#: docs/superpowers/specs/2026-10-20-an-objection-is-withdrawn-before-the-order-stops.md.
+OBJECTION_WITHDRAWN_REASON = "the order stopped before it could be delivered"
+OBJECTION_HANDED_BACK_REASON = "the order delivered its result and the decision is yours"
+
 #: An OS-built prompt for this work order was past `claude_cli.MAX_OS_PROMPT_CHARS`, so
 #: the call was never made and nothing judged the work. The payload carries NUMBERS AND
 #: IDENTIFIERS ONLY. Spec §4:
@@ -5229,6 +5242,52 @@ class ProjectStore:
             "SELECT DISTINCT wo_id FROM assumptions "
             "WHERE objection_envelope_id IS NOT NULL").fetchall()
         return [str(r["wo_id"]) for r in rows]
+
+    def objection_counts(self, since: float | None = None) -> dict[str, Any]:
+        """What this project's objections DID: sent, delivered, withdrawn, split by why.
+
+        §5 of docs/superpowers/specs/2026-10-20-an-objection-is-withdrawn-before-the-
+        order-stops.md, Neo question 2009: A DERIVED READ, no table and no new write path.
+        Two scans — the three `objection_*_ts` columns, and the withdrawal EVENTS, which
+        are where the reason lives (§3: the envelope note is written only from `queued`).
+
+        `by_reason` buckets on EXACT match against this module's two reason constants
+        (`OBJECTION_WITHDRAWN_REASON`, `OBJECTION_HANDED_BACK_REASON`) and counts
+        anything else as `other`, so a third reason added later shows up as a figure
+        nobody can read as one of these two instead of being absorbed into them.
+
+        `since` filters on the SENT stamp, so an objection and its withdrawal are never
+        counted in different windows.
+        """
+        from . import db as db_mod
+
+        bound = "" if since is None else " AND objection_sent_ts >= ?"
+        args: tuple[Any, ...] = () if since is None else (since,)
+        row = self.conn.execute(
+            "SELECT "
+            " SUM(objection_sent_ts IS NOT NULL) AS sent,"
+            " SUM(objection_delivered_ts IS NOT NULL) AS delivered,"
+            " SUM(objection_withdrawn_ts IS NOT NULL) AS withdrawn"
+            f" FROM assumptions WHERE objection_envelope_id IS NOT NULL{bound}",
+            args).fetchone()
+        counts = {"sent": int(row["sent"] or 0),
+                  "delivered": int(row["delivered"] or 0),
+                  "withdrawn": int(row["withdrawn"] or 0)}
+        by_reason = {OBJECTION_WITHDRAWN_REASON: 0, OBJECTION_HANDED_BACK_REASON: 0,
+                     "other": 0}
+        ids = {int(r["id"]) for r in self.conn.execute(
+            "SELECT id FROM assumptions WHERE objection_withdrawn_ts IS NOT NULL"
+            f"{bound}", args).fetchall()}
+        for event in self.conn.execute(
+                "SELECT payload FROM wo_events "
+                "WHERE kind='autoreview_objection_withdrawn' ORDER BY ts").fetchall():
+            payload = db_mod.from_json(event["payload"], {})
+            if int(payload.get("assumption_id") or 0) not in ids:
+                continue
+            reason = str(payload.get("reason") or "")
+            by_reason[reason if reason in by_reason else "other"] += 1
+        counts["by_reason"] = by_reason
+        return counts
 
     def outstanding_objections(self, wo_id: str) -> list[dict[str, Any]]:
         """Objections that are neither delivered nor withdrawn — ONE query, two readers.

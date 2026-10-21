@@ -5171,6 +5171,18 @@ def _ms(value: int | None) -> str:
     return NOT_RECORDED if value is None else f"{value}ms"
 
 
+def _objection_line(counts: dict[str, Any]) -> str:
+    """What the OS's objections did, in one clause — `ops.neo_stats_report`'s figures.
+
+    The withdrawals are split by WHICH reason, because the two mean opposite things about
+    the worker: one order stopped before it could be told, the other delivered and handed
+    the decision to the user (§5 of the 2026-10-20 objection spec).
+    """
+    return (f"{counts['sent']} sent · {counts['delivered']} delivered · "
+            f"{counts['withdrawn']} withdrawn ({counts['stopped']} the order stopped, "
+            f"{counts['handed_back']} handed to you, {counts['other']} other)")
+
+
 def _print_neo_stats(res: dict[str, Any], as_json: bool) -> None:
     """`jarvis neo stats` for a person, in the order the user asked the questions:
     volume and outcomes, the trend, the causes, the kinds, per-order averages, then spend
@@ -5198,6 +5210,9 @@ def _print_neo_stats(res: dict[str, Any], as_json: bool) -> None:
     # Its own figure, never blended into the escalation rate: a crash is not a decision.
     print(f"  unreachable rate  {_pct(q['unreachable_rate'])}  "
           f"(same denominator — NOT escalations)")
+    # ONE LINE, beside the rate — §5 of docs/superpowers/specs/2026-10-20-an-objection-is-
+    # withdrawn-before-the-order-stops.md. A census: zeros print.
+    print(f"  objections        {_objection_line(res['objections'])}")
 
     if res["by_day"]:
         print("\nTHE TREND — one line per day, newest last")
