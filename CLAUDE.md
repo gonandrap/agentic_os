@@ -60,7 +60,7 @@ jarvis io create <project> "title" -d "<what you saw>" --ref <id|#n|url> ...  # 
 jarvis io list [project] [--all] / show <id>    # counts first, then each finding
 jarvis io review <id> [--accept <key>] [--reject <key>] [--feedback "why"] [--accept-all]
 jarvis io cancel <id>                      # filed orders from accepted findings stay
-jarvis investigate <wo-id|fo-id|io-id> --why "what you saw"   # read-only; settles itself with a verdict
+jarvis investigate <wo-id|fo-id|io-id> --why "what you saw"   # read-only; settles itself; a GAP files an issue, dispatches nothing
 jarvis investigate list / show <inv-id> / cancel <inv-id>
 jarvis backlog promote <id> --as feature   # intake -> feature order
 jarvis backlog list / add <project> "title" [--depends-on id] / promote <id> [--force]
@@ -105,9 +105,12 @@ Rules that cost the user if forgotten:
 
 - A `waiting_pr_merge` order closes itself once its PR merges, and the OS resolves merge
   conflicts with the worker by itself. Never tell a parked order to fix conflicts.
-- Bugs in the OS go through `jarvis bug report` (the `report-jarvis-bug` skill). Priority
-  describes the defect; `--expedite` is the only way to jump the queue and it ships a
-  release when the fix lands. Never close a picked-up issue or cut a release by hand.
+- Bugs in the OS go through `jarvis bug report` (the `report-jarvis-bug` skill). Filing is
+  all it does: at any priority the issue waits for `jarvis issues start`; Neo only settles
+  a critical/blocker claim's label. `--expedite` is the user's: from an interactive session
+  it files and dispatches at once (ignored from a work-order session). The OS creates
+  orders nobody typed only with `os.autonomy.self_dispatch: true` (ships off); releases go
+  out via the user's shipit. Never close a picked-up issue by hand.
 - When the user reverses an earlier ruling, retract the old one (`neo retract` /
   `learn retract`) so both do not stay in every prompt.
 

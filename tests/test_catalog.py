@@ -737,7 +737,7 @@ def test_every_open_status_has_a_threshold():
     spot: seven are named and the rest ride the fallback."""
     cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
     cfg = cat.projects[0].fleet_health
-    assert cfg.enabled
+    assert not cfg.enabled  # ships off: os.autonomy
     for status in OPEN_STATUSES:
         assert cfg.threshold_seconds(status) > 0
 

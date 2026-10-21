@@ -807,3 +807,7 @@ def test_a_ship_order_that_cannot_be_filed_is_reported_not_raised(started, store
     assert "the project went away" in result
     assert "--depends-on" in result
     assert len([w for w in store.list_work_orders() if w["id"] != subject["id"]]) == 1
+
+
+# Written for the opt-in OS (os.autonomy.self_dispatch on, stuck sweep on).
+pytestmark = pytest.mark.usefixtures("self_dispatch_on")

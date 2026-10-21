@@ -10190,12 +10190,10 @@ def submit_verdict(inv_id: str, doc: Any,
     * **The duplicate check happens HERE**, before anything is filed. A prompt
       instruction cannot be verified and a search in `ops` can be tested; #792
       duplicating #790 is the standing proof that the diligent version fails.
-    * **A GAP files an EXPEDITED bug** — `bugreport.report_bug(..., expedite=True)`,
+    * **A GAP files a bug, NOT expedited** — `bugreport.report_bug(..., expedite=False)`,
       called as a Python function and not by an agent shelling out, so the route cannot
-      skip the check above. THE CASCADE IS INTENDED and is the highest-consequence thing
-      in this feature: per kn-efaad866 and kn-ffb94e3a that files the issue, dispatches a
-      work order on it and ships a release when the fix lands. A fix that lands without
-      shipping leaves production broken, which is what every issue in §1.1 was.
+      skip the check above. It files the issue ONLY: the user picks it up with
+      `jarvis issues start` (os.autonomy.self_dispatch).
     * **Attention for `WAITING_ON_USER` only**, raised HERE at the transition and never
       re-derived on a tick (kn-089de524). A FILING FAILURE also raises it, and is not a
       classification: `gh` unreachable keeps the order `planning` so the verdict can be
@@ -10262,14 +10260,14 @@ def submit_verdict(inv_id: str, doc: Any,
                     actual=verdict["proposed_fix"]["actual"],
                     priority=verdict["proposed_fix"]["priority"],
                     project=name, wo_id=fo.get("plan_wo_id") or "",
-                    expedite=True)
+                    expedite=False)  # file only: the user picks it up (os.autonomy)
             except Exception as e:  # noqa: BLE001 — same case, one step later
                 filing_error = f"the bug could not be filed: {e}"
             else:
                 verdict["filed"] = {
                     "issue_url": filed.get("url"),
                     "wo_id": (filed.get("pickup") or {}).get("wo_id"),
-                    "expedited": True,
+                    "expedited": False,
                 }
 
     if filing_error:
