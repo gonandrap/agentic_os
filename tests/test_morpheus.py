@@ -542,14 +542,63 @@ def test_a_turn_killed_before_it_answered_costs_no_offer(central, tmp_path):
                          call=turn) == "scripts"
 
 
-def test_the_report_says_a_queued_item_is_waiting_out_its_re_offer_window(central, tmp_path):
-    turn = FakeTurn()
-    item = queued(central, 2)
+# -- 6b. the surfaces say what the session is DOING, not only what it is allowed to do (#1162)
+
+
+def test_a_turn_in_flight_is_visible_while_it_runs_and_gone_after(central, tmp_path):
+    seen = {}
+
+    def turn(prompt, session_id, **kw):
+        seen["activity"] = morpheus.activity(central, now=TEST_EPOCH + 5)
+        return claude_cli.HeadlessResult(text="ok", usage={}, session_id=session_id,
+                                         model="sonnet")
+
+    queued(central, 2)
     morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH, call=turn)
-    rep = morpheus.report(central, catalog(), now=TEST_EPOCH + 3600)
-    [row] = [i for i in rep["items"] if i["id"] == item["id"]]
-    assert row["offers"] == 1 and row["offer_wait"] == morpheus.REOFFER_SECONDS - 3600
-    assert rep["max_offers"] == morpheus.MAX_OFFERS and "offers" not in rep["session"]
+    assert seen["activity"]["turn_in_flight"] is True
+    assert seen["activity"]["turn_started_ts"] == TEST_EPOCH
+    after = morpheus.activity(central, now=TEST_EPOCH + 10)
+    assert after["turn_in_flight"] is False and after["abandoned_turn_ts"] is None
+
+
+def test_a_turn_marker_older_than_the_timeout_is_a_crash_not_work_in_flight(central, tmp_path):
+    queued(central, 2)
+    morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH, call=FakeTurn(fail=True))
+    central.set_state(morpheus.SESSION_KEY, json.dumps(
+        {**morpheus.session_state(central), "turn_started_ts": TEST_EPOCH}))
+    act = morpheus.activity(central, timeout=900, now=TEST_EPOCH + 901)
+    assert act["turn_in_flight"] is False and act["abandoned_turn_ts"] == TEST_EPOCH
+
+
+def test_a_queued_item_in_the_reoffer_backoff_says_when_and_why(central, tmp_path):
+    item = queued(central, 2)
+    morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH, call=FakeTurn(fail=True))
+    act = morpheus.activity(central, now=TEST_EPOCH + 60)
+    assert act["due"] == 0 and act["turn_in_flight"] is False
+    assert act["held"] == [{"id": item["id"], "offers": 1, "exhausted": False,
+                            "after_error": True,
+                            "next_offer_ts": TEST_EPOCH + morpheus.REOFFER_SECONDS}]
+    for n in range(1, morpheus.MAX_OFFERS):
+        morpheus.wake(central, catalog(), tmp_path, call=FakeTurn(fail=True),
+                      now=TEST_EPOCH + n * morpheus.REOFFER_SECONDS + 1)
+    spent = morpheus.activity(central, now=TEST_EPOCH + 10 * DAY)["held"]
+    assert spent == [{"id": item["id"], "offers": morpheus.MAX_OFFERS, "exhausted": True,
+                      "after_error": True, "next_offer_ts": None}]
+
+
+def test_the_status_line_separates_the_pause_mode_from_the_activity(central, tmp_path, capsys,
+                                                                    clock):
+    from jarvis.cli import main
+
+    item = queued(central, 2)
+    assert main(["morpheus", "status"]) == 0
+    out = capsys.readouterr().out
+    assert "unpaused (follows the fleet) · idle · 1 queued due now" in out
+    assert "running (follows the fleet" not in out
+    morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH, call=FakeTurn(fail=True))
+    assert main(["morpheus", "status"]) == 0
+    assert f"{item['id']} offered 1 of 3: held back after a failed turn until" \
+        in capsys.readouterr().out
 
 
 # -- 7. enforcing the section, in every project

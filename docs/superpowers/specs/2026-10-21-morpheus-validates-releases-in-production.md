@@ -55,9 +55,7 @@ Each item has a state:
    * Each item is offered at most 3 times, at least 6 h apart, so an unregistered check
      cannot loop. A turn the model never answered — killed by a signal, wrote nothing,
      which is what a release restart does to the turn it just enqueued work for — costs
-     no offer: the next pass re-offers the batch at once (#1161). `jarvis morpheus
-     status` and the dashboard name the offer an item is on and when the next one is due,
-     so a waiting item is never silent.
+     no offer: the next pass re-offers the batch at once (#1161).
    * After a turn, if the session's context exceeds `compact_at` (default 30%) of its
      window, the next turn is `/compact`.
    * Its turns respect `jarvis pause`; the mechanical halves spend nothing and do not.

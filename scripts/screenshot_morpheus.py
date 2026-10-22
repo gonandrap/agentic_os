@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 import tempfile
@@ -35,21 +34,6 @@ def seed() -> None:
         store.update_morpheus_item(item["id"], script=SCRIPT, script_source="agent",
                                    state="monitoring", checks=3, last_exit=75,
                                    last_output="\n".join(f"line {k}: not yet" for k in range(40)))
-    # Two script-less items: one mid-backoff, one Morpheus gave up on (#1161)
-    now = time.time()
-    queued = []
-    for n in (9, 10):
-        pr = morpheus.PullRequestBody(number=n, url=f"https://github.com/o/r/pull/{n}",
-                                      title=f"[wo-1234abc{n}] thing {n}",
-                                      body="## How to validate in production\nlook\n")
-        queued.append(morpheus.enqueue(store, MorpheusConfig(), pr,
-                                       project="jarvis_os", repo="o/r")["id"])
-    store.set_state(morpheus.SESSION_KEY, json.dumps({
-        "session_id": "4f1c9a2e-7b3d-4e8f-9a1b-2c3d4e5f6a7b", "turns": 7, "compactions": 1,
-        "context_share": 0.18, "context_peak": 36000, "context_window": 200000,
-        "last_turn_ts": now - 900, "last_turn_kind": "scripts", "compact_due": False,
-        "offers": {queued[0]: {"n": 1, "ts": now - 900},
-                   queued[1]: {"n": morpheus.MAX_OFFERS, "ts": now - 3 * 6 * 3600}}}))
     store.close()
 
 
