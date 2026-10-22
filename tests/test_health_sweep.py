@@ -19,9 +19,8 @@ CFG = catalog.SupervisorConfig()
 CHECKLIST = probes_mod.render_checklist(probes_mod.DEFAULT_PROBES).splitlines()[0]
 
 
-#: The floors, shrunk to their legal minimum
+#: The floor, shrunk to its legal minimum
 FLOOR_MINUTES = 1
-STEP_MINUTES = 2 * FLOOR_MINUTES
 
 
 def _enable(catalog_file, **overrides) -> None:
@@ -31,27 +30,6 @@ def _enable(catalog_file, **overrides) -> None:
                                 "health_min_interval_minutes": FLOOR_MINUTES,
                                 "health_stale_minutes": FLOOR_MINUTES, **overrides}
     catalog_file.write_text(json.dumps(data))
-
-
-class _Clock:
-    """A hand-advanced `db.now`, installed for the whole test"""
-
-    def __init__(self, at: float) -> None:
-        self.at = at
-
-    def __call__(self) -> float:
-        return self.at
-
-    def advance(self, minutes: float = STEP_MINUTES) -> float:
-        self.at += minutes * 60.0
-        return self.at
-
-
-@pytest.fixture()
-def clock(monkeypatch):
-    c = _Clock(time.time())
-    monkeypatch.setattr("jarvis.db.now", c)
-    return c
 
 
 @pytest.fixture()
@@ -87,7 +65,8 @@ def _agent_calls(kind: str) -> list[dict]:
 
 def _sweep(daemon, clock, timeout: float = 20.0) -> None:
     """One sweep tick, waited out on the daemon's OWN guard rather than on a sleep"""
-    clock.advance()
+    # clock-exempt: class 3 — the sweep runs on a real daemon thread and this spins on its guard
+    clock.advance(2 * FLOOR_MINUTES * 60)       # twice the floor: every tick is due
     daemon.tick_count = 1
     daemon.health_tick()
     deadline = time.monotonic() + timeout
@@ -514,6 +493,7 @@ def test_the_cadence_is_a_setting_and_a_tick_off_it_sweeps_nothing(
     _wo(store, status="running")
     daemon = started()
 
+    # clock-exempt: class 3 — an off-cadence tick spawns a thread that must be joined before asserting
     daemon.tick_count = 2
     daemon.health_tick()
     while daemon.health_sweeping:
@@ -725,7 +705,7 @@ def test_a_run_of_failures_costs_the_floor_and_not_the_tick(
     _enable(catalog_file, health_min_interval_minutes=60)
     wo_id = _wo(store, status="running", description="FORCE_HEALTH_NO_FINDINGS")
     daemon = started()
-    clock.advance(minutes=61)
+    clock.advance(61 * 60)                     # past the 60-minute floor this test set
 
     for _ in range(6):
         _sweep(daemon, clock)
@@ -734,7 +714,7 @@ def test_a_run_of_failures_costs_the_floor_and_not_the_tick(
         "a failed sweep must wait out the floor before it is retried")
     assert [r["outcome"] for r in _reviews(store, subject_id=wo_id)] == ["failed"]
 
-    clock.advance(minutes=61)
+    clock.advance(61 * 60)                     # and again, so the floor has elapsed
     _sweep(daemon, clock)
 
     assert len(_health_calls(fake_claude)) == 2, (
@@ -834,7 +814,7 @@ def test_the_canary_ages_out_a_run_of_failures_that_is_over(store, clock):
     assert list(check_health_sweep_produces_judgements(store)), "live: it must report"
 
     # The same rows, a day later, with nothing since
-    clock.advance(minutes=60 * 24)
+    clock.advance(24 * 60 * 60)
     assert list(check_health_sweep_produces_judgements(store)) == [], (
         "a run of failures that stopped is history, not an alarm")
 
@@ -847,7 +827,7 @@ def test_a_sweep_still_failing_now_is_reported_however_old_the_run_started(store
     )
 
     _force_failures(store, HEALTH_SWEEP_FAILURE_RUN)
-    clock.advance(minutes=60 * 24)
+    clock.advance(24 * 60 * 60)
     _force_failures(store, 1)          # and it failed again just now
 
     assert list(check_health_sweep_produces_judgements(store)), (
@@ -855,24 +835,6 @@ def test_a_sweep_still_failing_now_is_reported_however_old_the_run_started(store
 
 
 # -- a usage limit is not a failed sweep
-
-
-class _MovedNow:
-    """`db.now` moved for the body of a `with`, and nothing else touched"""
-
-    def __init__(self, at: float) -> None:
-        self.at, self.was = at, db.now
-
-    def __enter__(self):
-        import jarvis.db
-
-        jarvis.db.now = lambda: self.at
-        return self
-
-    def __exit__(self, *exc):
-        import jarvis.db
-
-        jarvis.db.now = self.was
 
 
 def _held(store) -> list[dict]:
@@ -919,7 +881,8 @@ def test_a_live_hold_buys_no_second_refusal_and_expires_by_the_clock(
 
     # The first tick after the window reopens sweeps again
     fake_claude.health_recover()
-    clock.advance(minutes=60 * 25)
+    # `reopens_at` was parsed off the CLI's own wall clock (claude_cli.usage_limit), so cross the row
+    clock.advance(store.health_sweep_hold()[0] - db.now() + 60)
     _sweep(daemon, clock)
     assert len(_health_calls(fake_claude)) == refused + 1
     assert store.recent_health_reviews(1)[0]["outcome"] == "clear"
@@ -945,7 +908,7 @@ def test_a_held_row_is_not_an_attempt_and_does_not_floor_the_next_look(store):
     assert store.last_health_attempt_ts("work_order", wo_id) is not None
 
 
-def test_the_hold_is_project_wide_and_only_while_it_lasts(store):
+def test_the_hold_is_project_wide_and_only_while_it_lasts(store, clock):
     """The account's window is not a property of a work order"""
     assert store.health_sweep_hold() is None
     store.record_health_review("work_order", "wo-1", fingerprint="fp",
@@ -961,7 +924,7 @@ def test_the_hold_is_project_wide_and_only_while_it_lasts(store):
                                trigger="stale", outcome="clear")
     assert store.health_sweep_hold() is not None
 
-    with _MovedNow(db.now() + 601):
+    with clock.moved(601):
         assert store.health_sweep_hold() is None
 
 
@@ -1013,9 +976,11 @@ def test_a_shut_account_records_one_hold_per_window_and_sweeps_nothing(
     _enable(catalog_file)
     _wo(store, status="running", description="FORCE_HEALTH_CLEAR")
     daemon = started()
+    # `at=` explicitly: `Fleet` defaults it to the real clock, which no test may read
     shut = fleet.Fleet(3, 0, fleet.Outage(project="proj_a", wo_id="wo-1",
                                           reopens_at=db.now() + 3600,
-                                          message="You've hit your session limit"))
+                                          message="You've hit your session limit"),
+                       at=db.now())
 
     for _ in range(20):
         daemon.tick_count = 1
@@ -1029,7 +994,8 @@ def test_a_shut_account_records_one_hold_per_window_and_sweeps_nothing(
 
     later = fleet.Fleet(3, 0, fleet.Outage(project="proj_a", wo_id="wo-1",
                                            reopens_at=shut.outage.reopens_at + 3600,
-                                           message="still spent"))
+                                           message="still spent"),
+                        at=db.now())
     daemon.tick_count = 1
     daemon._health_sweep(daemon._health_projects(), later)
     assert len([r for r in _held(store) if r["subject_kind"] == "account"]) == 2
@@ -1047,6 +1013,7 @@ def test_the_tick_hands_the_health_sweep_the_reading_it_already_took(
     shut = fleet.Fleet(3, 0, fleet.Outage(project="proj_a", wo_id="wo-1",
                                           reopens_at=db.now() + 3600, message="spent"))
 
+    # clock-exempt: class 3 — the threaded tick must hand the fleet reading over before it is read back
     daemon.tick_count = 1
     daemon.health_tick(shut)
     deadline = time.monotonic() + 10
@@ -1096,7 +1063,7 @@ def stuck_os(jarvis_home, project, tmp_path):
 def park_order(store, wo_id: str, status: str, hours: float) -> float:
     """Back-date one order into `status` `hours` ago, on every clock the sweep reads"""
     store.set_status(wo_id, status)
-    at = time.time() - hours * HOUR
+    at = db.now() - hours * HOUR
     rows = store.conn.execute("SELECT id FROM wo_state_spans WHERE order_id=? "
                               "ORDER BY id", (wo_id,)).fetchall()
     for n, row in enumerate(reversed(rows)):
@@ -1211,7 +1178,7 @@ def test_a_round_waiting_for_ci_is_excluded_and_still_a_visible_row(stuck_os):
     from jarvis.project_store import VALIDATION_CI_CAUSE
 
     store = stuck_os["store"]
-    now = time.time()
+    now = db.now()
     wo, at = _validating(store, "waiting for github", minutes=20)
     ci_hold(store, wo["id"], 1, started=at, reopens=now + 60)
 
@@ -1225,7 +1192,7 @@ def test_a_round_waiting_for_ci_is_excluded_and_still_a_visible_row(stuck_os):
 def test_a_validating_order_with_no_ci_hold_is_still_judged(stuck_os):
     """§7(2): the exclusion must not generalise to every `validating` order"""
     store = stuck_os["store"]
-    now = time.time()
+    now = db.now()
     wo, _at = _validating(store, "nothing is holding this round", minutes=20)
 
     row = [r for r in _judged(store, now) if r["wo"]["id"] == wo["id"]][0]
@@ -1237,7 +1204,7 @@ def test_a_validating_order_with_no_ci_hold_is_still_judged(stuck_os):
 def test_overlapping_usage_and_ci_holds_are_discounted_once(stuck_os):
     """§4: the UNION of the two interval sets, never the sum"""
     store = stuck_os["store"]
-    now = time.time()
+    now = db.now()
     wo, at = _validating(store, "held by both", minutes=60)
     usage_hold(store, wo["id"], started=at, ended=at + 30 * 60)
     ci_hold(store, wo["id"], 1, started=at + 20 * 60, reopens=at + 40 * 60)
@@ -1254,7 +1221,7 @@ def test_with_no_ci_hold_the_usage_figure_is_unchanged(stuck_os):
     from jarvis.worker_session import PAUSE_USAGE_LIMIT
 
     store = stuck_os["store"]
-    now = time.time()
+    now = db.now()
     wo, at = _validating(store, "held by the account only", minutes=60)
     usage_hold(store, wo["id"], started=at, ended=at + 30 * 60)
 
@@ -1292,7 +1259,7 @@ def _judge(stuck_os, wo_id: str):
     """One order's `stuck.Verdict`, through the sweep's own reader"""
     spec = load_catalog(stuck_os["path"]).projects[0]
     _scanned, judged = ops.stuck_scan(stuck_os["store"], "proj_a", spec.fleet_health,
-                                      time.time(), stuck_only=False)
+                                      db.now(), stuck_only=False)
     return next(r["verdict"] for r in judged if r["wo"]["id"] == wo_id)
 
 
@@ -1412,7 +1379,7 @@ def test_a_child_held_by_an_unratified_plan_is_not_stuck(stuck_os):
 def test_a_lifted_plan_hold_is_judged_and_its_held_seconds_still_discounted(stuck_os):
     """§2.3 and §3(2): EXCLUSION ALONE IS NOT THE FIX"""
     store = stuck_os["store"]
-    now = time.time()
+    now = db.now()
     _fo, planner, kid, _at = _held_child(store, hours=2)
     settle_plan(store, planner["id"], now - 60)
 
@@ -1450,7 +1417,7 @@ def test_plan_hold_spans_walk_the_pending_count_over_the_planners_timeline():
 def test_overlapping_usage_and_plan_holds_are_discounted_once(stuck_os):
     """§3(4): the UNION of the interval sets, never the sum"""
     store = stuck_os["store"]
-    now = time.time()
+    now = db.now()
     _fo, planner, kid, at = _held_child(store, hours=1)
     settle_plan(store, planner["id"], at + 40 * 60)
     usage_hold(store, kid["id"], started=at + 20 * 60, ended=at + 50 * 60)
@@ -1487,7 +1454,7 @@ def test_a_usage_window_outranks_a_plan_hold(stuck_os):
 def test_the_held_child_stays_a_visible_row_and_its_two_readers_agree(stuck_os):
     """§3(6) and §4's rejection of a `continue`: kn-143a46df"""
     store = stuck_os["store"]
-    now = time.time()
+    now = db.now()
     _fo, planner, kid, _at = _held_child(store)
 
     rows = [r for r in _judged(store, now) if r["wo"]["id"] == kid["id"]]
@@ -1550,7 +1517,7 @@ def test_an_order_held_by_an_open_precondition_is_not_stuck(stuck_os):
 def test_a_cleared_precondition_is_judged_and_its_held_seconds_still_discounted(stuck_os):
     """§3.1 and §7(5): EXCLUSION ALONE IS NOT THE FIX"""
     store = stuck_os["store"]
-    now = time.time()
+    now = db.now()
     wo, _at = _precondition_held(store, hours=2)
     clear_hold(store, wo["id"], "bl-d5baa28b", now - 60)
 
@@ -1582,7 +1549,7 @@ def test_precondition_hold_spans_are_row_shaped_and_clipped_to_the_status_span()
 def test_overlapping_usage_and_precondition_holds_are_discounted_once(stuck_os):
     """§3.2: the UNION of the interval sets, never the sum"""
     store = stuck_os["store"]
-    now = time.time()
+    now = db.now()
     wo, at = _precondition_held(store, hours=1)
     clear_hold(store, wo["id"], "bl-d5baa28b", at + 40 * 60)
     usage_hold(store, wo["id"], started=at + 20 * 60, ended=at + 50 * 60)
@@ -1659,7 +1626,7 @@ def test_a_precondition_outranks_a_plan_hold(stuck_os):
 def test_the_held_order_stays_a_visible_row_and_its_two_readers_agree(stuck_os):
     """§2.2's rejection of a `continue` (kn-143a46df) and §4 and §7(7): the blocker column and..."""
     store = stuck_os["store"]
-    now = time.time()
+    now = db.now()
     wo, _at = _precondition_held(store)
 
     rows = [r for r in _judged(store, now) if r["wo"]["id"] == wo["id"]]
@@ -1892,7 +1859,7 @@ def test_an_exempt_kind_is_an_excluded_row_not_an_absence(stuck_os, jarvis_home,
     def swept(catalog) -> list[str]:
         run: dict = {"scanned": 0}
         return [c["wo"]["id"] for c in Daemon(catalog)._stuck_candidates(
-            catalog.projects[0], None, time.time(), run)]
+            catalog.projects[0], None, db.now(), run)]
 
     assert swept(load_catalog(stuck_os["path"])) == [], "exempt: never a candidate"
 
@@ -1970,7 +1937,7 @@ def test_a_live_turn_buys_no_investigation(stuck_os):
     from jarvis import stuck
 
     store = stuck_os["store"]
-    now = time.time()
+    now = db.now()
     wo = ops.create_work_order("proj_a", "116 bash calls deep")
     at = park_order(store, wo["id"], "running", hours=0.2)
     running_turn(store, wo["id"], started=at)
@@ -1992,7 +1959,7 @@ def test_a_live_turn_buys_no_investigation(stuck_os):
 def test_a_live_turn_outside_running_is_still_judged(stuck_os):
     """§6: a `needs_review` wait is owed by the USER"""
     store = stuck_os["store"]
-    now = time.time()
+    now = db.now()
     for status in ("needs_review", "idle"):
         wo = ops.create_work_order("proj_a", f"a turn row while {status}")
         at = park_order(store, wo["id"], status, hours=5)
@@ -2009,7 +1976,7 @@ def test_a_live_turn_outside_running_is_still_judged(stuck_os):
 
 def _scan(store, *, stuck_only: bool = False) -> tuple[int, list[dict]]:
     """`ops.stuck_scan` over proj_a at the shipped `fleet_health` numbers"""
-    return ops.stuck_scan(store, "proj_a", catalog.FleetHealthConfig(), time.time(),
+    return ops.stuck_scan(store, "proj_a", catalog.FleetHealthConfig(), db.now(),
                           stuck_only=stuck_only)
 
 
@@ -2200,9 +2167,9 @@ def test_a_re_assertion_raises_no_alarm_and_puts_no_flag_back(
     assert store.probes_reported_at("work_order", wo_id, fp) == reported_before
 
 
-def test_each_blocker_id_comes_from_its_canonical_source(store, monkeypatch):
+def test_each_blocker_id_comes_from_its_canonical_source(store, monkeypatch, clock):
     """EVERY ID IS REUSED, NOT RE-DERIVED — which is how two surfaces come to disagree about one order"""
-    from jarvis import db as db_mod, health, invariants, ops as ops_mod, worker_session
+    from jarvis import health, invariants, ops as ops_mod, worker_session
 
     cfg = catalog.SupervisorConfig()
 
@@ -2243,8 +2210,7 @@ def test_each_blocker_id_comes_from_its_canonical_source(store, monkeypatch):
                             (worker_session.PAUSE_TRANSIENT, "api-outage"),
                             (worker_session.PAUSE_AUTH, "expired-login")):
         held = _wo(store, f"held by {cause}", status="running")
-        with monkeypatch.context() as m:
-            m.setattr(db_mod, "now", lambda: time.time() - 600)
+        with clock.moved(-600):
             store.add_event(held, "turn_paused", {"seq": 1, "reason": cause})
         assert health.blocker(store, subject(held), cfg) == expected
         narrowed = catalog.SupervisorConfig(health_reassert_blockers=("usage-limit",))
@@ -2285,7 +2251,7 @@ def test_narrowing_to_the_usage_limit_still_pays_for_an_expired_login(
 
     _enable(catalog_file, health_reassert_blockers=["usage-limit"])
     wo_id = _wo(store, "signed out", status="running")
-    with _MovedNow(db.now() - 600):
+    with clock.moved(-600):
         store.add_event(wo_id, "turn_paused",
                         {"seq": 1, "reason": worker_session.PAUSE_AUTH})
     daemon = started()
@@ -2299,7 +2265,7 @@ def test_narrowing_to_the_usage_limit_still_pays_for_an_expired_login(
 
     # The other half of the narrowing: the cause the catalog DID name goes free
     spent = _wo(store, "window spent", status="running")
-    with _MovedNow(db.now() - 600):
+    with clock.moved(-600):
         store.add_event(spent, "turn_paused",
                         {"seq": 1, "reason": worker_session.PAUSE_USAGE_LIMIT})
     _sweep(daemon, clock)
@@ -2406,7 +2372,7 @@ def test_an_all_parked_project_keeps_the_os_sweep_invariant_green(
                         str(Path(store.project_path) / "src" / "jarvis" / "schedule.py"))
 
     _sweep(daemon, clock)
-    clock.advance(invariants.OS_HEALTH_SWEEP_DARK_MINUTES + STEP_MINUTES)
+    clock.advance((invariants.OS_HEALTH_SWEEP_DARK_MINUTES + 2 * FLOOR_MINUTES) * 60)
     _sweep(daemon, clock)
 
     assert [r["trigger"] for r in store.recent_health_reviews(1)] == ["re-assert"]
@@ -2446,7 +2412,7 @@ def base_fact(red: bool = True, age: float = 0.0, project: str = "proj_a") -> fl
     from jarvis.central_store import CentralStore
 
     central = CentralStore()
-    checked_at = time.time() - age
+    checked_at = db.now() - age
     try:
         central.set_base_health(project, {"red": red, "base": "main", "workflow": "ci",
                                           "run_url": "https://x/1", "head_sha": "abc",
@@ -2479,7 +2445,7 @@ def test_a_merge_held_by_a_red_base_is_excluded_with_its_own_sentence(red_base_o
     from jarvis import stuck
 
     store = red_base_os["store"]
-    now = time.time()
+    now = db.now()
     wo, _at = _parked(store)
     base_fact(red=True)
 
@@ -2495,7 +2461,7 @@ def test_a_merge_held_by_a_red_base_is_excluded_with_its_own_sentence(red_base_o
 def test_needs_review_beside_the_same_red_base_is_still_judged(red_base_os):
     """§5(2), kn-6e836793's scoping: the OS is not holding this one, the reviewer is"""
     store = red_base_os["store"]
-    now = time.time()
+    now = db.now()
     wo, _at = _parked(store, status="needs_review", title="the user owes this review")
     base_fact(red=True)
 
@@ -2512,7 +2478,7 @@ def test_with_auto_merge_off_the_parked_order_stays_judged(jarvis_home, project,
     red_base_catalog(tmp_path, project_path=str(project), **off)
     store = ProjectStore(project)
     try:
-        now = time.time()
+        now = db.now()
         wo, at = _parked(store)
         base_fact(red=True)
         red_episodes([[at, None]])
@@ -2529,7 +2495,7 @@ def test_with_auto_merge_off_the_parked_order_stays_judged(jarvis_home, project,
 def test_the_base_going_green_leaves_the_closed_episode_discounted(red_base_os):
     """§5(4), kn-6e30d561 and the whole reason for §2: THE DISCOUNT MUST OUTLIVE THE EXCLUSION BY ONE..."""
     store = red_base_os["store"]
-    now = time.time()
+    now = db.now()
     wo, at = _parked(store)
     base_fact(red=False)
     red_episodes([[at, at + 4.5 * HOUR]])
@@ -2547,7 +2513,7 @@ def test_a_stale_fact_excludes_nothing_and_stops_discounting_at_the_horizon(red_
     from jarvis.central_store import BASE_HEALTH_FRESH_SECONDS
 
     store = red_base_os["store"]
-    now = time.time()
+    now = db.now()
     wo, _at = _parked(store)
     checked_at = base_fact(red=True, age=BASE_HEALTH_FRESH_SECONDS + 1)
     opened = now - 20 * 60
@@ -2566,7 +2532,7 @@ def test_a_stale_fact_excludes_nothing_and_stops_discounting_at_the_horizon(red_
 def test_a_usage_hold_inside_the_red_episode_is_discounted_once(red_base_os):
     """§5(6): the UNION and never the sum"""
     store = red_base_os["store"]
-    now = time.time()
+    now = db.now()
     wo, at = _parked(store)
     base_fact(red=False)
     red_episodes([[at, at + 2 * HOUR]])
@@ -2583,7 +2549,7 @@ def test_the_held_order_is_a_visible_row_and_never_a_continue(red_base_os):
     from jarvis import stuck
 
     store = red_base_os["store"]
-    now = time.time()
+    now = db.now()
     wo, _at = _parked(store)
     base_fact(red=True)
 
@@ -2606,7 +2572,7 @@ def test_both_callers_derive_the_same_bool(jarvis_home, project, tmp_path, auto_
     cat = red_base_catalog(tmp_path, project_path=str(project), auto_merge=auto_merge)
     store = ProjectStore(project)
     try:
-        now = time.time()
+        now = db.now()
         wo, _at = _parked(store)
         base_fact(red=True)
         spec = load_catalog(cat).projects[0]
@@ -2679,7 +2645,7 @@ def test_a_merge_held_for_running_checks_is_excluded_with_its_own_sentence(red_b
     """§7(1), wo-afcea414's own number"""
     from jarvis import stuck
 
-    now = time.time()
+    now = db.now()
     wo, _at = _held_for_checks(red_base_os)
 
     row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
@@ -2695,7 +2661,7 @@ def test_the_blocker_column_names_the_hold_the_record_already_carries(red_base_o
     """§7(2), the §5 regression guard asserted THROUGH the sweep: this column read "nothing the record can..."""
     from jarvis import invariants
 
-    now = time.time()
+    now = db.now()
     wo, _at = _held_for_checks(red_base_os)
 
     row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
@@ -2710,7 +2676,7 @@ def test_the_blocker_column_names_the_hold_the_record_already_carries(red_base_o
 def test_every_other_hold_code_is_still_judged(red_base_os, code):
     """§7(3) and §3's boundary — the part a later change will widen by accident"""
     store = red_base_os["store"]
-    now = time.time()
+    now = db.now()
     wo, at = _parked(store, hours=61 / 60, title="held on something somebody owes")
     checks_hold(red_base_os["daemon"], store, wo["id"], at + 60.0, code=code)
     base_fact(red=False)
@@ -2724,7 +2690,7 @@ def test_every_other_hold_code_is_still_judged(red_base_os, code):
 def test_a_stale_hold_is_no_hold(red_base_os):
     """§7(4): `ops.automerge_state` marks a hold from an overtaken round stale"""
     store = red_base_os["store"]
-    now = time.time()
+    now = db.now()
     wo, at = _parked(store, hours=4.9, title="a hold its own round overtook")
     checks_hold(red_base_os["daemon"], store, wo["id"], at + 4.8 * 3600)
     base_fact(red=False)
@@ -2740,7 +2706,7 @@ def test_a_stale_hold_is_no_hold(red_base_os):
 
 def test_needs_review_beside_the_same_pull_request_is_still_judged(red_base_os):
     """§7(5), kn-6e836793's scoping: a `needs_review` order is a wait the USER owes"""
-    now = time.time()
+    now = db.now()
     wo, _at = _held_for_checks(red_base_os, hours=4.9, status="needs_review")
 
     row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
@@ -2753,7 +2719,7 @@ def test_a_red_base_outranks_the_running_checks(red_base_os):
     """§7(6) and §2: the two CAN co-occur, and a fleet fact outranks a fact about one order"""
     from jarvis import stuck
 
-    now = time.time()
+    now = db.now()
     wo, _at = _held_for_checks(red_base_os)
     base_fact(red=True)
 
@@ -2766,7 +2732,7 @@ def test_a_red_base_outranks_the_running_checks(red_base_os):
 def test_the_checks_reporting_leaves_the_closed_span_discounted(red_base_os):
     """§7(7), kn-6e30d561 and the whole reason for §4: THE DISCOUNT MUST OUTLIVE THE EXCLUSION BY ONE..."""
     store = red_base_os["store"]
-    now = time.time()
+    now = db.now()
     wo, at = _parked(store, hours=70 / 60, title="the checks have since reported")
     checks_hold(red_base_os["daemon"], store, wo["id"], at + 2 * 60.0)
     am_event(store, wo["id"], "automerge_proposed", at + 65 * 60.0, approval_id=1)
@@ -2790,7 +2756,7 @@ def test_a_stale_base_health_fact_un_excludes_and_stops_discounting(red_base_os,
     from jarvis import invariants
 
     store = red_base_os["store"]
-    now = time.time()
+    now = db.now()
     wo, _at = _held_for_checks(red_base_os, fact_age=fact_age or 0.0)
     if fact_age is None:
         base_health_without_checked_at()
@@ -2807,7 +2773,7 @@ def test_a_stale_base_health_fact_un_excludes_and_stops_discounting(red_base_os,
 def test_an_open_hold_is_discounted_only_as_far_as_the_horizon(red_base_os):
     """§7(9) and §4's outage sentence: the fact was last confirmed 20m ago"""
     store = red_base_os["store"]
-    now = time.time()
+    now = db.now()
     wo, _at = _held_for_checks(red_base_os, fact_age=20 * 60.0)
 
     row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
@@ -2819,7 +2785,7 @@ def test_an_open_hold_is_discounted_only_as_far_as_the_horizon(red_base_os):
 def test_a_usage_hold_inside_the_checks_span_is_discounted_once(red_base_os):
     """§7(10): the UNION and never the sum"""
     store = red_base_os["store"]
-    now = time.time()
+    now = db.now()
     wo, at = _parked(store, hours=70 / 60, title="a window shut while the checks ran")
     checks_hold(red_base_os["daemon"], store, wo["id"], at + 2 * 60.0)
     am_event(store, wo["id"], "automerge_proposed", at + 65 * 60.0, approval_id=1)
@@ -2837,7 +2803,7 @@ def test_the_checks_held_order_is_a_visible_row_and_never_a_continue(red_base_os
     from jarvis import stuck
 
     store = red_base_os["store"]
-    now = time.time()
+    now = db.now()
     wo, _at = _held_for_checks(red_base_os)
 
     scanned, rows = ops.stuck_scan(store, "proj_a", catalog.FleetHealthConfig(), now,
@@ -2864,7 +2830,7 @@ def test_both_callers_agree_about_the_running_checks(jarvis_home, project, tmp_p
     cat = red_base_catalog(tmp_path, project_path=str(project))
     store = ProjectStore(project)
     try:
-        now = time.time()
+        now = db.now()
         daemon = Daemon(load_catalog(cat))
         wo, at = _parked(store, hours=61 / 60, title="both callers read this one")
         checks_hold(daemon, store, wo["id"], at + 60.0, code=code)
@@ -2904,7 +2870,7 @@ def _spent(store, hours: float = 2.0, status: str | None = None,
                         ts=at + resumed_after)
     if status is not None:
         store.set_status(wo["id"], status)
-        moved = time.time() - status_ago
+        moved = db.now() - status_ago
         store.conn.execute(
             "UPDATE wo_state_spans SET ts=? WHERE id="
             "(SELECT id FROM wo_state_spans WHERE order_id=? AND order_kind='wo' "
@@ -2940,7 +2906,7 @@ def test_a_parked_order_is_excluded_with_the_named_cause(stuck_os):
     from jarvis import stuck
 
     store = stuck_os["store"]
-    now = time.time()
+    now = db.now()
     wo, _at = _spent(store)
 
     row = next(r for r in ops.stuck_report("proj_a", now) if r["id"] == wo["id"])
@@ -2960,7 +2926,7 @@ def test_the_status_is_the_key_and_never_the_pending_assumptions(stuck_os):
     from jarvis import stuck
 
     store = stuck_os["store"]
-    now = time.time()
+    now = db.now()
     bare, _at = _spent(store, title="parked, nothing owed")
     owed, _ = _spent(store, status="needs_review", status_ago=2 * HOUR, assumptions=2,
                      title="reviewed, not parked")
@@ -2975,7 +2941,7 @@ def test_the_status_is_the_key_and_never_the_pending_assumptions(stuck_os):
 def test_the_discount_stops_when_the_status_moves_on(stuck_os):
     """§7(3): no `budget_resumed`, so the `holds.BUDGET` episode is still OPEN"""
     store = stuck_os["store"]
-    now = time.time()
+    now = db.now()
     wo, _at = _spent(store, hours=5.0, status="pending", status_ago=4 * HOUR,
                      title="raised, never resumed")
 
@@ -2989,7 +2955,7 @@ def test_the_discount_stops_when_the_status_moves_on(stuck_os):
 def test_a_usage_window_inside_the_park_is_discounted_once(stuck_os):
     """§7(4): the UNION and never the sum (`holds.union_seconds`' own docstring)"""
     store = stuck_os["store"]
-    now = time.time()
+    now = db.now()
     wo, at = _spent(store, hours=2.0)
     usage_hold(store, wo["id"], started=at + 0.5 * HOUR, ended=at + 1 * HOUR)
 
@@ -3005,7 +2971,7 @@ def test_a_fleet_usage_window_outranks_the_budget_cap(stuck_os):
     from jarvis.worker_session import PAUSE_USAGE_LIMIT
 
     store = stuck_os["store"]
-    now = time.time()
+    now = db.now()
     wo, at = _spent(store, hours=2.0)
     usage_hold(store, wo["id"], started=at)
 
@@ -3021,7 +2987,7 @@ def test_the_parked_order_is_a_visible_row_and_never_a_continue(stuck_os):
     from jarvis import stuck
 
     store = stuck_os["store"]
-    now = time.time()
+    now = db.now()
     wo, _at = _spent(store)
 
     scanned, rows = ops.stuck_scan(store, "proj_a", catalog.FleetHealthConfig(), now,

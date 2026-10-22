@@ -1512,3 +1512,147 @@ def test_a_round_that_never_passed_is_still_never_re_judged(fleet, project, fake
     assert not store.events_of_kind(wo["id"], "validation_forced")
     held = store.events_of_kind(wo["id"], "automerge_held")
     assert db.from_json(held[-1]["payload"], {})["code"] == automerge.HELD_NOT_PASSED
+
+
+# -- #1141: a head moved by merges alone gets the rebind with the counted rounds spent
+
+
+def _commit(repo: Path, name: str, text: str) -> str:
+    (repo / name).write_text(text)
+    _git(repo, "add", name)
+    _git(repo, "commit", "-qm", name)
+    return _git(repo, "rev-parse", "HEAD").strip()
+
+
+def _double_merge(project: Path) -> tuple[str, str]:
+    """wo-87c1f30b's shape: main merged into a stale local branch, then the judged catch-up merged on top"""
+    _git(project, "checkout", "-qb", "feature")
+    worked = _commit(project, "app.py", "feature\n")
+    _git(project, "checkout", "-q", "main")
+    _commit(project, "base1.py", "one\n")
+    _git(project, "checkout", "-q", "feature")
+    _git(project, "merge", "-q", "--no-edit", "main")
+    judged = _git(project, "rev-parse", "HEAD").strip()
+    _git(project, "checkout", "-q", "main")
+    _commit(project, "base2.py", "two\n")
+    _git(project, "update-ref", "refs/remotes/origin/main", "main")
+    _git(project, "checkout", "-qb", "local", worked)
+    _git(project, "merge", "-q", "--no-edit", "main")
+    _git(project, "merge", "-q", "--no-edit", judged)
+    return judged, _git(project, "rev-parse", "HEAD").strip()
+
+
+def test_merges_only_follows_every_parent_not_just_the_first(project):
+    from jarvis import branchproof
+
+    judged, head = _double_merge(project)
+
+    assert branchproof.merges_only(project, judged, head, "main")
+
+
+def test_a_commit_the_worker_authored_is_not_merges_only(project):
+    from jarvis import branchproof
+
+    judged, _head = _double_merge(project)
+    edited = _commit(project, "app.py", "feature, changed\n")
+
+    assert not branchproof.merges_only(project, judged, edited, "main")
+
+
+@pytest.fixture()
+def merges(monkeypatch):
+    """`branchproof.merges_only`'s answer, set by the test"""
+    from jarvis import branchproof
+
+    state = {"only": True}
+    monkeypatch.setattr(branchproof, "merges_only",
+                        lambda repo, judged, head, base_ref: state["only"])
+    return state
+
+
+@pytest.mark.parametrize("patch", ["0ther00patch", None])
+def test_rounds_spent_and_merges_only_rebinds_without_asking(
+        tmp_path, project, jarvis_home, fake_claude, fake_gh, local_proof, merges,
+        patch):
+    """Content resolved or not: a merge-only head the first-parent walk cannot read is a rebind"""
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = parked(project, rounds=2)
+    if patch:
+        local_proof["ids"][CAUGHT_UP] = patch
+    artifact(fake_gh, head_oid=CAUGHT_UP)          # no parents: the walk fails
+
+    poll(fleet, store)
+
+    assert store.events_of_kind(wo["id"], invariants.REJUDGE_DECLINED_EVENT) == []
+    assert rounds_of(store, wo) == [1, 2, 3]
+    assert int(store.latest_validation_round(wo_id=wo["id"])["uncounted"]) == 1
+    payload = db.from_json(
+        store.events_of_kind(wo["id"], "validation_forced")[-1]["payload"], {})
+    assert payload["rebind"] is True
+
+
+def test_rounds_spent_and_a_worker_commit_still_asks_the_user(
+        tmp_path, project, jarvis_home, fake_claude, fake_gh, local_proof, merges):
+    merges["only"] = False
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = parked(project, rounds=2)
+    local_proof["ids"][PUSHED] = "0ther00patch"
+    artifact(fake_gh, head_oid=PUSHED)
+
+    poll(fleet, store)
+
+    assert rounds_of(store, wo) == [1, 2]
+    declined = store.events_of_kind(wo["id"], invariants.REJUDGE_DECLINED_EVENT)
+    assert db.from_json(declined[-1]["payload"], {})["cause"] == ops.REJUDGE_BUDGET_SPENT
+    assert invariants.true_blockers(
+        store, store.get_work_order(wo["id"]))[0] == invariants.SHA_MOVED_BLOCKER
+
+
+def test_rounds_spent_and_rebinds_spent_asks_the_user(
+        tmp_path, project, jarvis_home, fake_claude, fake_gh, local_proof, merges):
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = parked(project, rounds=2)
+    for n in range(3, 3 + ops.REBIND_MAX):
+        row = store.open_validation_round(wo_id=wo["id"], fingerprint=f"fp{n}",
+                                          round=n, uncounted=True,
+                                          uncounted_cause=ops.REBIND_CAUSE)
+        store.set_validation_head(row["id"], JUDGED)
+        store.close_validation_round(row["id"], "passed", "")
+    local_proof["ids"][CAUGHT_UP] = "0ther00patch"
+    artifact(fake_gh, head_oid=CAUGHT_UP)
+
+    poll(fleet, store)
+
+    assert rounds_of(store, wo) == list(range(1, 3 + ops.REBIND_MAX))
+    assert store.events_of_kind(wo["id"], invariants.REJUDGE_DECLINED_EVENT)
+    assert invariants.true_blockers(
+        store, store.get_work_order(wo["id"]))[0] == invariants.SHA_MOVED_BLOCKER
+
+
+def test_a_stale_behind_reading_does_not_skip_the_carry(
+        tmp_path, project, jarvis_home, fake_claude, fake_gh, local_proof, monkeypatch):
+    """wo-3511ecc4: the poll read the base as unreached, the fetch said otherwise, and the carry never ran"""
+    from jarvis import branchproof
+
+    fetched = {"yet": False}
+
+    def fetch(repo, *refs):
+        fetched["yet"] = True
+        return True
+
+    monkeypatch.setattr(branchproof, "fetch", fetch)
+    monkeypatch.setattr(branchproof, "is_ancestor",
+                        lambda repo, ancestor, descendant: fetched["yet"])
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = parked(project, rounds=2)
+    fake_gh.set_parents(CAUGHT_UP, [JUDGED, BASE])
+    artifact(fake_gh, head_oid=CAUGHT_UP)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=CAUGHT_UP,
+                   base_oid=BASE)
+
+    poll(fleet, store)
+
+    assert store.events_of_kind(wo["id"], invariants.REJUDGE_DECLINED_EVENT) == []
+    assert rounds_of(store, wo) == [1, 2]
+    assert ProjectStore.validated_head(
+        store.latest_validation_round(wo_id=wo["id"])) == CAUGHT_UP

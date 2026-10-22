@@ -133,3 +133,28 @@ def tip(repo: Path, ref: str) -> str:
         return ""
     out = _git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}")
     return (out or "").strip()
+
+
+#: How many commits `merges_only` reads before it stops vouching for the range
+MERGES_ONLY_LIMIT = 20
+
+
+def merges_only(repo: Path, judged: str, head: str, base_ref: str) -> bool:
+    """Is every commit `head` adds on top of `judged` a MERGE whose parents are base or judged history? (#1141)"""
+    branch = base_ref.split("/", 1)[1] if base_ref.startswith("origin/") else base_ref
+    if not REF_RE.match(branch or "") or not SHA_RE.match(judged or "") \
+            or not SHA_RE.match(head or "") or not is_ancestor(repo, judged, head):
+        return False
+    out = _git(repo, "rev-list", "--parents", head, f"^{judged}", f"^origin/{branch}")
+    rows = [line.split() for line in (out or "").splitlines() if line.strip()]
+    if not rows or len(rows) > MERGES_ONLY_LIMIT:
+        return False
+    added = {row[0] for row in rows}
+    for _sha, *parents in rows:
+        if len(parents) < 2:
+            return False        # a commit the worker authored, not a merge
+        for parent in parents:
+            if parent not in added and not is_ancestor(repo, parent, judged) \
+                    and not is_ancestor(repo, parent, f"origin/{branch}"):
+                return False
+    return True

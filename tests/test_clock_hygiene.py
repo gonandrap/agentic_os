@@ -29,7 +29,6 @@ ALLOWED: dict[str, str] = {
     "tests/test_base_red.py": _BACKDATED,
     "tests/test_budget.py": _SPIN,
     "tests/test_feature_validation.py": _BOTH,
-    "tests/test_health_sweep.py": _BOTH,
     "tests/test_nav_volume.py": _BACKDATED,
     "tests/test_precheck_before_the_panel.py": _BACKDATED,
     "tests/test_release_red_defer.py": _BACKDATED,
