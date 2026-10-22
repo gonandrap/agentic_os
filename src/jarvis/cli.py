@@ -5355,6 +5355,7 @@ INBOX_LIST_NOTE = ("a log of notifications; `jarvis inbox ack` marks them read â
 
 
 def cmd_inbox(args: argparse.Namespace) -> int:
+    from . import ops
     from .central_store import CentralStore
     central = CentralStore()
     try:
