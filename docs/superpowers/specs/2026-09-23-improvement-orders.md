@@ -377,6 +377,13 @@ revision fixes all of them.
   not an argument;
 * `evidence` empty, an entry with no `source` or no `quote`, or a `quote` under
   `MIN_QUOTE_CHARS = 20`;
+* a prose field over its `MAX_FIELD_CHARS` cap (symptom 300, root_cause 600,
+  why_insufficient 300, recommendation 400), a `summary` over `MAX_SUMMARY_CHARS = 160`,
+  more than `MAX_EVIDENCE = 4` quotes, or a quote over `MAX_QUOTE_CHARS = 300`. Added
+  2026-10-22 after io-c74f22c3 shipped ~20 KB of findings: the floor stops a label, the
+  cap stops a lab notebook, and the user decides only what they can read. Detail a worker
+  needs belongs in the proposed order's `description`. The evidence caps are passed by
+  `parse_report` only; `verdicts` shares `parse_evidence` without them;
 * a proposed order with no `title`, a `type` outside `("work", "feature")`, a non-string
   `project`, or a `description` failing `plans._description_problems` — reused rather than
   reimplemented, because that description becomes a real brief read cold by a stranger and
@@ -390,6 +397,9 @@ revision fixes all of them.
 `render_finding(finding)` and `render_report(report)` return line lists and are shared by
 `jarvis io show` and the dashboard page, so the two cannot drift.
 `review_headline(io, report)` returns the counts-first line the attention reason uses.
+`render_digest(report)` is `jarvis io show`'s default: one line of root cause, one of
+recommendation, and the order titles per finding; `--finding <key>` prints one finding in
+full and `--full` all of them.
 
 This section also lands `a_report(**overrides)` in `src/jarvis/testing.py` beside the
 `improvement_order` fixture: a document `parse_report` accepts, every field overridable so a
