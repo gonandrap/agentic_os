@@ -91,7 +91,7 @@
 {% if topics %}
 <details class="panel disclosure" {{ 'open' if not topic }}>
   <summary><b>topics</b> <span class="sub">({{ topics|length }}, biggest first — click one to filter)</span></summary>
-  <span class="sub">{% for t, n in topics %}{% set name = t or '(none)' %}<a href="/knowledge?topic={{ name|urlencode }}"{% if name == topic %} class="here"{% endif %}>{{ name }}</a> ({{ n }}){% if not loop.last %} · {% endif %}{% endfor %}</span>
+  <div class="sub" style="padding: 6px 16px 10px; line-height: 1.8">{% for t, n in topics %}{% set name = t or '(none)' %}<a href="/knowledge?topic={{ name|urlencode }}"{% if name == topic %} class="here"{% endif %}>{{ name }}</a> ({{ n }}){% if not loop.last %} · {% endif %}{% endfor %}</div>
 </details>
 {% endif %}
 
