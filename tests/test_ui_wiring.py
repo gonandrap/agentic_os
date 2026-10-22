@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import time
-
 import pytest
 
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
-from jarvis import ops, wiring  # noqa: E402
+from jarvis import db, ops, wiring  # noqa: E402
 from jarvis.ui.app import create_app  # noqa: E402
 
 
@@ -29,7 +27,7 @@ def client(jarvis_home, fake_claude, catalog_file):
 def inventory(monkeypatch):
     """A fixed inventory in the cache, so the page never shells out to `claude`"""
     def install(items):
-        inv = wiring.Inventory(items=list(items), ts=time.time())
+        inv = wiring.Inventory(items=list(items), ts=db.now())
         monkeypatch.setattr(wiring, "_STATE", {"inventory": inv, "thread": None})
         return inv
 
@@ -118,7 +116,7 @@ def test_a_machine_whose_claude_cli_cannot_be_read_still_renders_the_settings(
         client, monkeypatch):
     monkeypatch.setattr(wiring, "_STATE",
                         {"inventory": wiring.Inventory(errors=["claude: not found"],
-                                                       ts=time.time()),
+                                                       ts=db.now()),
                          "thread": None})
     page = client.get("/config").text
     assert "claude: not found" in page

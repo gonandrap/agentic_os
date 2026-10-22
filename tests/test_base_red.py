@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import subprocess
-import time
 
 import pytest
 
@@ -104,8 +103,8 @@ def test_a_renamed_default_branch_is_re_read_rather_than_reported_green(
     """REVIEW FINDING 1"""
     central = CentralStore()
     central.set_base_health("proj_a", {"red": False, "base": "main",
-                                       "base_read_at": time.time(),
-                                       "checked_at": time.time()})
+                                       "base_read_at": db.now(),
+                                       "checked_at": db.now()})
     fake_gh.set_default_branch(REPO, "trunk")
     fake_gh.set_runs("trunk", [MAIN_RED])
     store = ProjectStore(project)
@@ -479,12 +478,30 @@ def test_a_stale_reading_never_pauses_a_merge(started, spec, project, fake_gh, l
     poll(started, store)
     central = CentralStore()
     stale = {**fact(central),
-             "checked_at": time.time() - BASE_HEALTH_FRESH_SECONDS - 1}
+             "checked_at": db.now() - BASE_HEALTH_FRESH_SECONDS - 1}
     central.set_state("base_health:proj_a", json.dumps(stale))
 
     started.poll_pull_requests(spec, store)
 
     assert len(store.list_approvals(wo["id"])) == 1
+
+
+@pytest.mark.parametrize("age,approvals", [(BASE_HEALTH_FRESH_SECONDS - 1, 0),
+                                           (BASE_HEALTH_FRESH_SECONDS + 1, 1)])
+def test_the_base_health_freshness_boundary_is_decided_on_one_clock(
+        started, spec, project, fake_gh, local_base, clock, age, approvals):
+    """Writer and reader decide base-health freshness on one clock (fo-2891ead5 §7.1)"""
+    opt_in(started)
+    store, wo = parked(project)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
+    red_fleet(fake_gh)
+    with clock.moved(-age):
+        poll(started, store)
+
+    started.poll_pull_requests(spec, store)
+
+    assert fact()["checked_at"] == clock.at - age
+    assert len(store.list_approvals(wo["id"])) == approvals
 
 
 def test_the_stored_fact_is_read_once_per_project_per_poll(started, spec, project,
@@ -646,7 +663,7 @@ def test_an_episode_outside_the_retention_window_under_discounts(
     from jarvis.central_store import base_red_hold_spans
     from tests.test_health_sweep import park_order
 
-    now = time.time()
+    now = db.now()
     spec_a = started.catalog.project("proj_a")
     spec_a.fleet_health.red_episode_retention_hours = 1
     central = CentralStore()
@@ -1074,7 +1091,7 @@ def test_a_stale_fact_dispatches_nothing(tracker, project, fake_gh):
     poll(tracker, store)
     central = CentralStore()
     central.set_state("base_health:proj_a", json.dumps(
-        {**fact(central), "checked_at": time.time() - BASE_HEALTH_FRESH_SECONDS - 1}))
+        {**fact(central), "checked_at": db.now() - BASE_HEALTH_FRESH_SECONDS - 1}))
     before = len(fake_gh.calls)
 
     sweep(tracker, store)

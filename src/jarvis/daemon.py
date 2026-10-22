@@ -3563,7 +3563,7 @@ class Daemon:
             alarm = pstore.claim_next_alarm()
             if alarm is None:
                 return
-            age = time.time() - float(alarm["ts"] or 0.0)
+            age = db.now() - float(alarm["ts"] or 0.0)
             if age > max_age:
                 pstore.update_alarm(
                     alarm["id"], status="skipped", decided_at=db.now(),
@@ -4744,7 +4744,7 @@ class Daemon:
             "issue_url": issue_url,
             "fix_wo_id": fix_wo_id,
             "issue_os_filed": issue_os_filed,
-            "checked_at": time.time(),
+            "checked_at": db.now(),
         }
         self.central.set_base_health(project.name, fact)
         if was_red and worst is None:
@@ -4927,7 +4927,7 @@ class Daemon:
         checked_at = fact.get("checked_at")
         if not isinstance(checked_at, (int, float)):
             return None
-        if time.time() - float(checked_at) > BASE_HEALTH_FRESH_SECONDS:
+        if db.now() - float(checked_at) > BASE_HEALTH_FRESH_SECONDS:
             return None
         return automerge.BaseRed(
             base=str(fact.get("base") or ""), workflow=str(fact.get("workflow") or ""),
