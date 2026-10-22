@@ -21,7 +21,7 @@ def main() -> int:
         return 1
     section = morpheus.parse_section(morpheus.find_section(body) or "")
     kind = ("waived: " + section.waived if section.waived
-            else "script" if section.script else "hints (Morpheus will write the script)")
+            else "hints (a Morpheus subagent writes the check)")
     print(f"ok — {morpheus.SECTION}: {kind}")
     return 0
 

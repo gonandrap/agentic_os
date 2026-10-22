@@ -24,31 +24,28 @@ def seed() -> None:
     central = CentralStore()
     now = time.time()
     rows = [
-        (1130, "[wo-1a2b3c4d] Neo answers alarms in one call",
-         "Watch Neo answer an alarm.\n\n```bash\njarvis neo stats --json | jq -e '.alarm.calls_per_answer <= 1' || exit 75\n```",
-         0, "validated"),
-        (1131, "[wo-5e6f7a8b] The stuck sweep skips budget-capped orders",
-         "```bash\njarvis stuck --json | jq -e 'all(.[]; .excluded != null)' && exit 0 || exit 1\n```",
-         1, "failed"),
-        (1132, "[wo-9c0d1e2f] Release notes list every PR",
-         "A release page lists one line per PR — check the next `gh release view`.", None,
-         "queued"),
-        (1133, "Trim comments main gained since the last merge",
-         "None — comments only, production has nothing to show", None, "validated"),
-        (1134, "[wo-3a4b5c6d] Gate classifier stops flagging `git status`",
-         "```bash\ngrep -c 'git status' \"$JARVIS_HOME/logs/gates.log\" | grep -q '^0$' || exit 75\n```",
-         75, "monitoring"),
+        ("jarvis_os", 1130, "[wo-1a2b3c4d] Neo answers alarms in one call",
+         "jarvis neo stats --json | jq -e '.alarm.calls_per_answer <= 1' || exit 75", 0),
+        ("jarvis_os", 1131, "[wo-5e6f7a8b] The stuck sweep skips budget-capped orders",
+         "jarvis stuck --json | jq -e 'all(.[]; .excluded != null)' && exit 0 || exit 1", 1),
+        ("jarvis_os", 1132, "[wo-9c0d1e2f] Release notes list every PR", "", None),
+        ("jarvis_os", 1133, "Trim comments main gained since the last merge", None, None),
+        ("shared_schedule", 88, "[wo-3a4b5c6d] Login keeps the session across restarts",
+         "curl -fsS localhost:8000/healthz | grep -q sessions_restored || exit 75", 75),
     ]
-    for n, title, section, code, _state in rows:
-        body = f"## Summary\nx\n\n## {morpheus.SECTION}\n\n{section}\n"
+    for project, n, title, script, code in rows:
+        hint = "None — comments only" if script is None else "Watch it in production."
+        body = f"## Summary\nx\n\n## {morpheus.SECTION}\n\n{hint}\n"
         item = morpheus.enqueue(central, cfg, morpheus.PullRequestBody(
-            n, f"https://github.com/gonandrap/agentic_os/pull/{n}", title, body),
-            repo="gonandrap/agentic_os", release_tag="jarvis-0.9.4", now=now - 3600)
-        if code is not None and item["state"] == "monitoring":
+            n, f"https://github.com/gonandrap/{project}/pull/{n}", title, body),
+            project=project, repo=f"gonandrap/{project}",
+            release_tag="jarvis-0.9.4" if project == "jarvis_os" else "", now=now - 3600)
+        if script:
+            item = morpheus.set_script(central, item["id"], script, "agent")
             morpheus.check(central, cfg, item, Path.cwd(), now=now,
                            run=lambda s, c, t, code=code: morpheus.CheckResult(
                                code, {0: "1 call per answer", 1: "wo-77aa…: excluded=null",
-                                      75: "3"}[code]))
+                                      75: "not exercised yet"}[code]))
     failed = [i for i in central.morpheus_items(("failed",))][0]
     central.claim_morpheus_action(failed["id"], "investigation:fo-81c2d3e4")
     central.set_state(morpheus.RELEASE_KEY, "jarvis-0.9.4")

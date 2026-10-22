@@ -48,6 +48,15 @@
 | Eval | | |
 | A/B | | |
 
+## How to validate in production
+
+<!-- REQUIRED — Morpheus watches every shipped PR in production until it validates.
+     Give HINTS: what production activity shows this change working, and where to look
+     (a command, a log line, a page, a count that should move). A Morpheus subagent turns
+     them into a read-only check that runs on a schedule; commands here are hints, never
+     run as written.
+     Or `None — <reason>` when production has nothing to show (docs, tests, comments). -->
+
 ## Screenshots
 
 <!-- One image per thing the change claims to do, for any PR that touches a rendered

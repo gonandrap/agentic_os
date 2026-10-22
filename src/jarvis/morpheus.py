@@ -10,13 +10,14 @@ import subprocess
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Union
 
 from . import db
 
 if TYPE_CHECKING:  # pragma: no cover
     from .catalog import Catalog, MorpheusConfig
     from .central_store import CentralStore
+    from .project_store import ProjectStore
 
 log = logging.getLogger("jarvisd.morpheus")
 
@@ -26,10 +27,10 @@ TERMINAL_STATES = ("validated", "failed", "timedout")
 #: The terminal states that must cause something
 ACTION_STATES = ("failed", "timedout")
 
-#: The PR body heading every change must carry
+#: The PR body heading every change in every onboarded project must carry
 SECTION = "How to validate in production"
 
-#: The script contract
+#: The script contract — Morpheus knows the exit code and nothing else
 EXIT_VALIDATED = 0
 EXIT_FAILED = 1
 
@@ -37,6 +38,8 @@ EXIT_FAILED = 1
 SESSION_KEY = "morpheus.session"
 #: The os_state key naming the last release whose PRs were queued
 RELEASE_KEY = "morpheus.last_release"
+#: Per project: the last `pr_merged` event already queued
+MERGE_CURSOR_KEY = "morpheus.merge_cursor.{project}"
 
 #: How long an item offered to Morpheus waits before it is offered again
 REOFFER_SECONDS = 6 * 3600
@@ -47,13 +50,15 @@ OUTPUT_TAIL = 2000
 
 SECONDS_PER_DAY = 86400
 
+#: Where an item's script runs: one directory, or a function of the item
+CwdFor = Union[Path, Callable[[dict], Path]]
 
-# -- the PR section
+
+# -- the PR section: hints, never a script
 
 _FENCE = re.compile(r"^\s{0,3}(```|~~~)\s*([\w+-]*)")
 _HEADING = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
 _HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
-_SCRIPT_LANGS = ("bash", "sh", "shell")
 #: `None — <reason>` (or `None.`), and not prose that merely starts with the word
 _WAIVED = re.compile(r"^\s*[-*]?\s*none\s*(?:[—–:.-]+\s*(.*))?\Z", re.IGNORECASE | re.DOTALL)
 
@@ -62,21 +67,14 @@ _WAIVED = re.compile(r"^\s*[-*]?\s*none\s*(?:[—–:.-]+\s*(.*))?\Z", re.IGNORE
 class Section:
     """What a PR said about validating it"""
 
-    #: The section's text, comments stripped
+    #: The hints, comments stripped — commands in them are hints too, never run as given
     text: str
-    #: The first fenced bash/sh block, or ""
-    script: str = ""
     #: The reason, when the PR says `None — <reason>`; "" otherwise
     waived: str = ""
 
     @property
     def empty(self) -> bool:
-        return not _meaningful(self.text)
-
-
-def _meaningful(text: str) -> bool:
-    """Whether anything is left once template scaffolding is gone"""
-    return any(ln.strip() not in ("", "-", "*") for ln in text.splitlines())
+        return not any(ln.strip() not in ("", "-", "*") for ln in self.text.splitlines())
 
 
 def find_section(body: str) -> str | None:
@@ -108,45 +106,31 @@ def find_section(body: str) -> str | None:
 
 
 def parse_section(raw: str) -> Section:
-    """Split a section into prose, the script, and a waiver"""
+    """The hints, and a waiver if the PR declared one"""
     text = _HTML_COMMENT.sub("", raw or "").strip()
-    script, block, lang, fence = "", [], "", ""
-    for line in text.splitlines():
-        m = _FENCE.match(line)
-        if not fence and m:
-            fence, lang, block = m.group(1), m.group(2).lower(), []
-            continue
-        if fence and line.strip().startswith(fence):
-            if lang in _SCRIPT_LANGS and not script:
-                script = "\n".join(block).strip()
-            fence = ""
-            continue
-        if fence:
-            block.append(line)
-    waived = ""
     w = _WAIVED.match(text)
-    if w and not script:
-        waived = ((w.group(1) or "").strip() or "no reason given").splitlines()[0][:500]
-    return Section(text=text, script=script, waived=waived)
+    waived = ((w.group(1) or "").strip() or "no reason given").splitlines()[0][:500] if w else ""
+    return Section(text=text, waived=waived)
 
 
 def section_problem(body: str) -> str | None:
     """Why this PR body fails the rule, or None"""
     raw = find_section(body)
     if raw is None:
-        return (f"no `## {SECTION}` section — say how production proves this change "
-                f"works: hints, a ```bash script (exit 0 validated, 1 failed, anything "
-                f"else not yet), or `None — <reason>`")
+        return (f"no `## {SECTION}` section — give hints: what production activity shows "
+                f"this change working (Morpheus writes the check from them), or "
+                f"`None — <reason>`")
     if parse_section(raw).empty:
         return f"`## {SECTION}` is still the empty template"
     return None
 
 
-# -- the release: which PRs it carries
+# -- which PRs reached production
 
 _MERGE_SUBJECT = re.compile(r"^Merge pull request #(\d+)\b")
 _SQUASH_SUBJECT = re.compile(r"\(#(\d+)\)\s*$")
 _WO_PREFIX = re.compile(r"^\[(wo-[0-9a-f]{8})\]")
+_PR_URL = re.compile(r"github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)")
 
 
 def pr_numbers(subjects: Iterable[str]) -> list[int]:
@@ -163,6 +147,12 @@ def wo_of_title(title: str) -> str:
     """The work order a PR title names (`[wo-1234abcd] …`), or ''"""
     m = _WO_PREFIX.match(title or "")
     return m.group(1) if m else ""
+
+
+def parse_pr_url(url: str) -> tuple[str, int] | None:
+    """(owner/name, number) of a GitHub PR URL"""
+    m = _PR_URL.search(url or "")
+    return (m.group(1), int(m.group(2))) if m else None
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -224,31 +214,24 @@ def repo_slug(repo: Path) -> str:
 # -- the queue
 
 def enqueue(central: CentralStore, cfg: MorpheusConfig, pr: PullRequestBody, *,
-            repo: str, release_tag: str = "", now: float | None = None
+            project: str, repo: str, release_tag: str = "", now: float | None = None
             ) -> dict[str, Any] | None:
-    """Queue one PR in the state its section earns; None when it was already queued"""
+    """Queue one PR; None when it was already queued (one item per PR, ever)"""
     now = db.now() if now is None else now
     raw = find_section(pr.body)
     section = parse_section(raw or "")
-    if raw is None or section.empty:
-        state, script, source, resolution = "queued", "", "", ""
-    elif section.waived:
-        state, script, source = "validated", "", ""
-        resolution = f"waived by the PR: {section.waived}"
-    elif section.script:
-        state, script, source, resolution = "monitoring", section.script, "pr", ""
-    else:
-        state, script, source, resolution = "queued", "", "", ""
+    waived = raw is not None and bool(section.waived)
     return central.add_morpheus_item(
-        repo=repo, pr_number=pr.number, pr_url=pr.url, pr_title=pr.title[:300],
-        wo_id=wo_of_title(pr.title), release_tag=release_tag,
-        hints=(raw or "").strip()[:8000], script=script, script_source=source,
-        state=state, deadline_ts=now + cfg.timeout_days * SECONDS_PER_DAY,
-        resolution=resolution, now=now)
+        project=project, repo=repo, pr_number=pr.number, pr_url=pr.url,
+        pr_title=pr.title[:300], wo_id=wo_of_title(pr.title), release_tag=release_tag,
+        hints=section.text[:8000], script="", script_source="",
+        state="validated" if waived else "queued",
+        deadline_ts=now + cfg.timeout_days * SECONDS_PER_DAY,
+        resolution=f"waived by the PR: {section.waived}" if waived else "", now=now)
 
 
 def enqueue_release(central: CentralStore, cfg: MorpheusConfig, repo: Path, tag: str, *,
-                    from_ref: str | None = None, to_ref: str | None = None,
+                    project: str, from_ref: str | None = None, to_ref: str | None = None,
                     fetch: Callable[[str, int], PullRequestBody] | None = None,
                     slug: str | None = None) -> dict[str, Any]:
     """Queue every PR a release carries — idempotent, so shipit and the daemon may both call it"""
@@ -264,7 +247,7 @@ def enqueue_release(central: CentralStore, cfg: MorpheusConfig, repo: Path, tag:
         except Exception as e:  # noqa: BLE001 — one unreadable PR must not drop the rest
             errors.append(f"#{n}: {e}")
             continue
-        item = enqueue(central, cfg, pr, repo=slug, release_tag=tag)
+        item = enqueue(central, cfg, pr, project=project, repo=slug, release_tag=tag)
         (queued if item else skipped).append(item["id"] if item else n)
     central.set_state(RELEASE_KEY, tag)
     log.info("morpheus: release %s (%s..%s) — %d queued, %d already known, %d unreadable",
@@ -282,13 +265,41 @@ def running_release(repo: Path) -> str:
         return ""
 
 
-def ensure_release_queued(central: CentralStore, cfg: MorpheusConfig, repo: Path,
-                          **kwargs: Any) -> dict[str, Any] | None:
-    """The daemon's backstop: queue the running release once, if shipit did not"""
+def ensure_release_queued(central: CentralStore, cfg: MorpheusConfig, repo: Path, *,
+                          project: str, **kwargs: Any) -> dict[str, Any] | None:
+    """The daemon's backstop for the OS itself: queue the running release once, if shipit did not"""
     tag = running_release(repo)
     if not tag or central.get_state(RELEASE_KEY) == tag:
         return None
-    return enqueue_release(central, cfg, repo, tag, **kwargs)
+    return enqueue_release(central, cfg, repo, tag, project=project, **kwargs)
+
+
+def queue_merges(central: CentralStore, cfg: MorpheusConfig, project: str,
+                 store: ProjectStore, *,
+                 fetch: Callable[[str, int], PullRequestBody] | None = None) -> list[str]:
+    """Every other project ships on merge: queue each PR the OS saw merge since the cursor"""
+    key = MERGE_CURSOR_KEY.format(project=project)
+    raw = central.get_state(key)
+    if raw is None:
+        # First sight of this project: start from now, never backfill its history
+        central.set_state(key, str(db.now()))
+        return []
+    fetch = fetch or (lambda s, n: fetch_pr(s, n))
+    cursor, queued = float(raw or 0), []
+    for merged in store.merged_prs_since(cursor):
+        parsed = parse_pr_url(merged["pr_url"])
+        if parsed:
+            try:
+                item = enqueue(central, cfg, fetch(*parsed), project=project,
+                               repo=parsed[0])
+            except Exception as e:  # noqa: BLE001 — retried next pass: the cursor stays put
+                log.warning("morpheus: could not queue %s: %s", merged["pr_url"], e)
+                break
+            if item:
+                queued.append(item["id"])
+        cursor = float(merged["ts"])
+        central.set_state(key, str(cursor))
+    return queued
 
 
 def set_script(central: CentralStore, item_id: str, script: str, source: str) -> dict:
@@ -357,21 +368,23 @@ def run_script(script: str, cwd: Path, timeout: int) -> CheckResult:
     return CheckResult(proc.returncode, out[-OUTPUT_TAIL:])
 
 
-def check(central: CentralStore, cfg: MorpheusConfig, item: dict[str, Any], cwd: Path,
+def _cwd(cwd: CwdFor, item: dict[str, Any]) -> Path:
+    return cwd(item) if callable(cwd) else cwd
+
+
+def check(central: CentralStore, cfg: MorpheusConfig, item: dict[str, Any], cwd: CwdFor,
           *, now: float | None = None,
           run: Callable[[str, Path, int], CheckResult] = run_script) -> str:
-    """Run an item's script once and move it; returns its state afterwards"""
+    """Run an item's script once and move it by the exit code alone; returns its state"""
     now = db.now() if now is None else now
-    result = run(item["script"], cwd, cfg.script_timeout_seconds)
+    result = run(item["script"], _cwd(cwd, item), cfg.script_timeout_seconds)
     fields: dict[str, Any] = {"last_check_ts": now, "checks": int(item["checks"]) + 1,
                               "last_exit": result.exit, "last_output": result.output,
                               "next_check_ts": now + cfg.check_every_minutes * 60}
     if result.exit == EXIT_VALIDATED:
-        fields.update(state="validated", next_check_ts=None,
-                      resolution="the validation script passed in production")
+        fields.update(state="validated", next_check_ts=None, resolution="script exited 0")
     elif result.exit == EXIT_FAILED:
-        fields.update(state="failed", next_check_ts=None,
-                      resolution="the validation script reported the change broken")
+        fields.update(state="failed", next_check_ts=None, resolution="script exited 1")
     elif now >= float(item["deadline_ts"]):
         fields.update(state="timedout", next_check_ts=None,
                       resolution=_timeout_reason(item, cfg))
@@ -381,13 +394,12 @@ def check(central: CentralStore, cfg: MorpheusConfig, item: dict[str, Any], cwd:
 
 def _timeout_reason(item: dict[str, Any], cfg: MorpheusConfig) -> str:
     if not item.get("script"):
-        return (f"no validation script existed within {cfg.timeout_days:g} day(s) "
-                f"— nothing ever checked this change")
-    return (f"{cfg.timeout_days:g} day(s) passed and the script never reached a verdict "
+        return f"no script was registered within {cfg.timeout_days:g} day(s)"
+    return (f"no exit 0 or 1 within {cfg.timeout_days:g} day(s) "
             f"(last exit {item.get('last_exit')})")
 
 
-def sweep(central: CentralStore, cfg: MorpheusConfig, cwd: Path, *,
+def sweep(central: CentralStore, cfg: MorpheusConfig, cwd: CwdFor, *,
           now: float | None = None,
           run: Callable[[str, Path, int], CheckResult] = run_script) -> dict[str, int]:
     """Run every due script and expire every overdue item — no model, ever"""
@@ -405,17 +417,17 @@ def sweep(central: CentralStore, cfg: MorpheusConfig, cwd: Path, *,
     return moved
 
 
-# -- failed and timed out must act
+# -- failed and timed out hand off: Morpheus never diagnoses
 
 def owed_actions(central: CentralStore) -> list[dict[str, Any]]:
-    """Terminal items that still owe their action"""
+    """Terminal items that still owe their hand-off"""
     return [i for i in central.morpheus_items(ACTION_STATES) if not i["action"]]
 
 
 def act(central: CentralStore, catalog: Catalog, item: dict[str, Any], *,
         investigate: Callable[..., tuple[str, str]] | None = None,
         ask_neo: Callable[..., int] | None = None) -> str:
-    """Take an item's action exactly once; returns what was recorded"""
+    """Hand the item off exactly once; returns what was recorded"""
     cfg = catalog.os.morpheus
     route = cfg.on_failed if item["state"] == "failed" else cfg.on_timeout
     investigate = investigate or _investigate
@@ -427,10 +439,10 @@ def act(central: CentralStore, catalog: Catalog, item: dict[str, Any], *,
             action = f"investigation:{inv_id}"
             if central.claim_morpheus_action(item["id"], action):
                 central.add_inbox(
-                    project=_project_of(catalog), level="warning",
-                    title=f"PR #{item['pr_number']} {item['state']} production validation",
-                    body=f"{item['pr_url']}\n{item['resolution']}\n"
-                         f"{inv_id} is investigating {item['wo_id']}.")
+                    project=item.get("project") or _os_project(catalog), level="warning",
+                    title=f"PR #{item['pr_number']} {item['state']} production validation "
+                          f"({item['resolution']})",
+                    body=f"{item['pr_url']}\n{inv_id} is finding out why.")
             return action
     qid = ask_neo(catalog, item, note)
     action = f"neo:{qid}"
@@ -438,7 +450,7 @@ def act(central: CentralStore, catalog: Catalog, item: dict[str, Any], *,
     return action
 
 
-def _project_of(catalog: Catalog) -> str:
+def _os_project(catalog: Catalog) -> str:
     from . import schedule
 
     return schedule.os_project((p.name, p.path) for p in catalog.projects) or "os"
@@ -452,7 +464,7 @@ def _investigate(catalog: Catalog, item: dict[str, Any]) -> tuple[str, str]:
     if not wo_id:
         return "", "the PR names no work order to investigate"
     try:
-        project, _path, _wo = ops.find_work_order(wo_id, None)
+        project, _path, _wo = ops.find_work_order(wo_id, item.get("project") or None)
     except Exception as e:  # noqa: BLE001
         return "", f"its work order {wo_id} could not be found ({e})"
     decision = steward.gate(
@@ -471,23 +483,24 @@ def _investigate(catalog: Catalog, item: dict[str, Any]) -> tuple[str, str]:
 
 
 def _why(item: dict[str, Any]) -> str:
-    return (f"Morpheus: PR #{item['pr_number']} ({item['pr_url']}), shipped in "
-            f"{item['release_tag'] or 'a release'}, {item['state']} its production "
-            f"validation. {item['resolution']}.\n\n"
-            f"The PR said, under `## {SECTION}`:\n{item['hints'][:3000]}\n\n"
-            f"The script ({item['script_source'] or 'none'}):\n{item['script'][:3000]}\n\n"
+    """The facts Morpheus has, and nothing it does not: it ran a script and read an exit code"""
+    return (f"Morpheus: PR #{item['pr_number']} ({item['pr_url']}) of project "
+            f"{item.get('project') or '?'} {item['state']} its production validation: "
+            f"{item['resolution']}. Morpheus only runs the validation script and reads its "
+            f"exit code — it has NOT diagnosed anything, and the script itself may be wrong.\n\n"
+            f"The PR's hints, under `## {SECTION}`:\n{item['hints'][:3000]}\n\n"
+            f"The script (written by {item['script_source'] or 'nobody yet'}):\n"
+            f"{item['script'][:3000] or '(none)'}\n\n"
             f"Last exit {item['last_exit']}, output tail:\n{item['last_output'][-1500:]}")
 
 
-VALIDATION_QUESTION = """MORPHEUS — a shipped change did not validate in production.
+VALIDATION_QUESTION = """MORPHEUS — a shipped change has no passing production validation.
 
 {why}
 
-Decide for the user. If this needs them (the change is likely broken in production, or
-nothing can tell), ESCALATE and say what they should look at. If it does not (the script
-was wrong, the code path is rare and nothing suggests harm), answer with your reading in
-two sentences; that answer is recorded on the item and the item stays {state}. They can
-re-watch it with `jarvis morpheus requeue {id}` or rule it fine with
+Decide whether the user needs to look. If they do, ESCALATE and say what to look at. If
+not, answer in two sentences; the answer is recorded on the item and it stays {state}.
+They can re-watch it with `jarvis morpheus requeue {id}` or rule it fine with
 `jarvis morpheus waive {id} --reason "…"`."""
 
 
@@ -497,9 +510,9 @@ def _ask_neo(catalog: Catalog, item: dict[str, Any], note: str = "") -> int:
     why = _why(item) + (f"\n\nNo investigation was filed: {note}." if note else "")
     neo = NeoStore()
     try:
-        q = neo.ask(_project_of(catalog), "", VALIDATION_QUESTION.format(
-            why=why, state=item["state"], id=item["id"]),
-            context=json.dumps({"morpheus_item": item["id"]}), kind="validation")
+        q = neo.ask(item.get("project") or _os_project(catalog), "",
+                    VALIDATION_QUESTION.format(why=why, state=item["state"], id=item["id"]),
+                    context=json.dumps({"morpheus_item": item["id"]}), kind="validation")
     finally:
         neo.close()
     return int(q["id"])
@@ -534,21 +547,24 @@ def record_neo_verdict(central: CentralStore, q: dict[str, Any],
              + f"jarvis morpheus show {item_id}")
 
 
-# -- the only LLM: Morpheus's session writes scripts
+# -- the only LLM: Morpheus's session turns hints into scripts
 
 MORPHEUS_PERSONA = """You are MORPHEUS, the production validator of the Jarvis agentic OS.
 
-The OS ships pull requests to production. Each one says, under `## How to validate in
-production`, how production activity proves it works. When a PR gave only HINTS, your job
-is to turn them into a SCRIPT the OS runs mechanically on a schedule. You never run the
-validation yourself, and you never judge the result — the OS does, from the exit code.
+The OS ships pull requests to production, for every project it runs. Each PR says, under
+`## How to validate in production`, HINTS about what production activity shows it working.
+Your only job is to turn those hints into a SCRIPT the OS then runs mechanically on a
+schedule. You never run the validation, never judge a result and never diagnose a failure:
+the OS reads the exit code, and finding out why something failed is someone else's job.
 
 For each item you are given, spawn ONE subagent (Task tool), in parallel. Each subagent:
-  1. reads the PR's hints (and the PR or the code if it must: `gh pr view <url>`);
+  1. reads the item's hints (and the PR or the project's code if it must:
+     `gh pr view <url>`, the project path given with the item);
   2. writes a bash script to /tmp/morpheus-<item id>.sh that:
-     - is READ-ONLY: it inspects production (the `jarvis` CLI with --json, logs under
-       $JARVIS_HOME, `systemctl --user status`, `gh` reads) and never changes anything;
-     - exits 0 when production shows the change working, 1 when it shows it broken,
+     - runs from the project's production directory, the one given with the item;
+     - is READ-ONLY: it inspects production (CLIs with --json, logs, `systemctl --user
+       status`, `gh` reads, HTTP GETs) and never changes anything;
+     - exits 0 when production shows the change working, 1 when it shows it not working,
        and any other code (use 75) when production has not exercised it yet;
      - finishes in well under a minute;
   3. registers it: `jarvis morpheus script <item id> --file /tmp/morpheus-<item id>.sh`.
@@ -593,8 +609,10 @@ def wanting_scripts(central: CentralStore, *, now: float | None = None) -> list[
     return out
 
 
-def build_prompt(items: list[dict[str, Any]]) -> str:
-    blocks = [f"### {i['id']} — PR #{i['pr_number']}: {i['pr_title']}\n{i['pr_url']}\n\n"
+def build_prompt(items: list[dict[str, Any]], dirs: dict[str, Path]) -> str:
+    blocks = [f"### {i['id']} — {i.get('project') or '?'} PR #{i['pr_number']}: "
+              f"{i['pr_title']}\n{i['pr_url']}\nproduction directory: "
+              f"{dirs.get(i.get('project') or '', '(unknown)')}\n\n"
               f"{(i['hints'] or '(the PR gave no hints at all: read the PR)')[:4000]}"
               for i in items]
     return (f"{len(items)} shipped PR(s) need a validation script.\n\n"
@@ -610,7 +628,8 @@ def context_share(usage: dict[str, Any] | None) -> float | None:
 
 
 def wake(central: CentralStore, catalog: Catalog, cwd: Path, *, paused: bool = False,
-         now: float | None = None, call: Callable[..., Any] | None = None) -> str:
+         dirs: dict[str, Path] | None = None, now: float | None = None,
+         call: Callable[..., Any] | None = None) -> str:
     """One pass of Morpheus's session: compact if due, else write scripts if any are wanted"""
     from . import agent_usage, claude_cli
 
@@ -619,6 +638,7 @@ def wake(central: CentralStore, catalog: Catalog, cwd: Path, *, paused: bool = F
     if paused:
         return "paused"
     call = call or claude_cli.run_session_turn
+    dirs = dirs or {}
     state = session_state(central)
     items = wanting_scripts(central, now=now)
     if not state.get("compact_due") and not items:
@@ -626,23 +646,23 @@ def wake(central: CentralStore, catalog: Catalog, cwd: Path, *, paused: bool = F
     session_id = state.get("session_id") or str(uuid.uuid4())
     resume = bool(state.get("turns"))
     if state.get("compact_due") and resume:
-        prompt, kind = claude_cli.COMPACT_PROMPT, "compact"
+        prompt, kind, batch = claude_cli.COMPACT_PROMPT, "compact", []
     else:
-        prompt, kind = build_prompt(items), "scripts"
+        prompt, kind, batch = build_prompt(items, dirs), "scripts", items
+    add_dirs = sorted({dirs[i["project"]] for i in batch if i.get("project") in dirs})
     state.update(session_id=session_id, last_turn_ts=now, last_turn_kind=kind)
     try:
         result = call(prompt, session_id, resume=resume, cwd=cwd, model=cfg.model,
                       append_system_prompt=MORPHEUS_PERSONA,
                       permission_mode=catalog.os.default_permission_mode,
-                      timeout=cfg.turn_timeout_seconds)
+                      add_dirs=add_dirs, timeout=cfg.turn_timeout_seconds)
     except claude_cli.ClaudeCliError as e:
         state["last_error"] = str(e)[:500]
         state["errors"] = int(state.get("errors") or 0) + 1
         if not resume:
             # The CLI may have half-created the session: the next first turn mints a fresh id
             state.pop("session_id", None)
-        if kind == "scripts":
-            _mark_offered(state, items, now)
+        _mark_offered(state, batch, now)
         _save_session(central, state)
         log.warning("morpheus turn failed: %s", e)
         return "error"
@@ -655,7 +675,7 @@ def wake(central: CentralStore, catalog: Catalog, cwd: Path, *, paused: bool = F
         state["compactions"] = int(state.get("compactions") or 0) + 1
         state["compact_due"] = False
     else:
-        _mark_offered(state, items, now)
+        _mark_offered(state, batch, now)
         state["last_reply"] = (result.text or "")[:2000]
         state["compact_due"] = share is not None and share >= cfg.compact_at
     if share is not None:

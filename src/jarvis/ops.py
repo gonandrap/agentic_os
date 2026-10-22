@@ -12711,6 +12711,35 @@ def _morpheus_repo(repo: str | None) -> Path:
     return prod if (prod / ".git").exists() else Path.cwd()
 
 
+def _morpheus_project(catalog: Catalog, project: str | None, slug: str = "") -> str:
+    """The project a PR belongs to: named, else the one whose origin is `slug`, else the OS"""
+    from . import morpheus, schedule
+
+    if project:
+        if catalog.projects and project not in {p.name for p in catalog.projects}:
+            raise OpsError(f"project {project!r} is not in the catalog")
+        return project
+    for p in catalog.projects:
+        if slug and p.path.is_dir() and morpheus.repo_slug(p.path) == slug:
+            return p.name
+    return schedule.os_project((p.name, p.path) for p in catalog.projects) or ""
+
+
+def _morpheus_cwd(catalog: Catalog, item: dict[str, Any]) -> Path:
+    """Where an item's script runs: its project's production directory"""
+    from . import schedule
+    from .paths import production_code_dir
+
+    os_name = schedule.os_project((p.name, p.path) for p in catalog.projects)
+    prod = production_code_dir()
+    if item.get("project") == os_name and prod.is_dir():
+        return prod
+    for p in catalog.projects:
+        if p.name == item.get("project") and p.path.is_dir():
+            return p.path
+    return prod if prod.is_dir() else Path.cwd()
+
+
 def morpheus_report() -> dict[str, Any]:
     from . import morpheus
 
@@ -12734,16 +12763,19 @@ def morpheus_item(item_id: str) -> dict[str, Any]:
 
 def morpheus_enqueue_release(tag: str, from_ref: str | None = None,
                              to_ref: str | None = None,
-                             repo: str | None = None) -> dict[str, Any]:
+                             repo: str | None = None,
+                             project: str | None = None) -> dict[str, Any]:
     import subprocess
 
     from . import morpheus
 
+    catalog = _morpheus_catalog()
+    where = _morpheus_repo(repo)
     central = CentralStore()
     try:
-        return morpheus.enqueue_release(central, _morpheus_catalog().os.morpheus,
-                                        _morpheus_repo(repo), tag, from_ref=from_ref,
-                                        to_ref=to_ref)
+        return morpheus.enqueue_release(
+            central, catalog.os.morpheus, where, tag, from_ref=from_ref, to_ref=to_ref,
+            project=_morpheus_project(catalog, project, morpheus.repo_slug(where)))
     except subprocess.CalledProcessError as e:
         raise OpsError(f"git could not read the release range: "
                        f"{(e.stderr or '').strip()[:300]}") from e
@@ -12751,7 +12783,8 @@ def morpheus_enqueue_release(tag: str, from_ref: str | None = None,
         central.close()
 
 
-def morpheus_add(pr: str, repo: str | None = None, release: str = "") -> dict[str, Any]:
+def morpheus_add(pr: str, repo: str | None = None, release: str = "",
+                 project: str | None = None) -> dict[str, Any]:
     """Queue one PR by number or URL, outside any release"""
     from . import morpheus
 
@@ -12765,9 +12798,11 @@ def morpheus_add(pr: str, repo: str | None = None, release: str = "") -> dict[st
         body = morpheus.fetch_pr(slug, int(m.group(2)), _morpheus_repo(repo))
     except Exception as e:  # noqa: BLE001
         raise OpsError(str(e)) from e
+    catalog = _morpheus_catalog()
     central = CentralStore()
     try:
-        item = morpheus.enqueue(central, _morpheus_catalog().os.morpheus, body,
+        item = morpheus.enqueue(central, catalog.os.morpheus, body,
+                                project=_morpheus_project(catalog, project, slug),
                                 repo=slug, release_tag=release)
     finally:
         central.close()
@@ -12791,17 +12826,16 @@ def morpheus_set_script(item_id: str, script: str, source: str = "agent") -> dic
 def morpheus_check(item_id: str) -> dict[str, Any]:
     """Run an item's script now, the way the daemon would"""
     from . import morpheus
-    from .paths import production_code_dir
 
     item = morpheus_item(item_id)
     if not item["script"]:
         raise OpsError(f"{item_id} has no script yet — "
                        f"`jarvis morpheus script {item_id} --file <path>`")
-    prod = production_code_dir()
-    cwd = prod if prod.is_dir() else Path.cwd()
+    catalog = _morpheus_catalog()
+    cwd = _morpheus_cwd(catalog, item)
     central = CentralStore()
     try:
-        cfg = _morpheus_catalog().os.morpheus
+        cfg = catalog.os.morpheus
         if item["state"] in morpheus.OPEN_STATES:
             morpheus.check(central, cfg, item, cwd)
             return central.morpheus_item(item_id) or {}

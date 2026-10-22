@@ -2433,6 +2433,15 @@ class ProjectStore:
             (wo_id, kind)).fetchall()
         return db.rows_to_dicts(rows)
 
+    def merged_prs_since(self, ts: float) -> list[dict[str, Any]]:
+        """`pr_merged` events after `ts`, oldest first: {wo_id, ts, pr_url} (Morpheus's merge trigger)"""
+        rows = db.rows_to_dicts(self.conn.execute(
+            "SELECT wo_id, ts, payload FROM wo_events WHERE kind='pr_merged' AND ts > ? "
+            "ORDER BY ts", (ts,)).fetchall())
+        return [{"wo_id": r["wo_id"], "ts": r["ts"],
+                 "pr_url": str((db.from_json(r["payload"], {}) or {}).get("pr_url") or "")}
+                for r in rows]
+
     def work_orders_with_event(self, kind: str, wo_ids: Sequence[str]) -> set[str]:
         """Which of `wo_ids` carry an event of `kind`"""
         ids = list(wo_ids)

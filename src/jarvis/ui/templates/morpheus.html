@@ -7,10 +7,9 @@
                "failed": "tone-bad", "timedout": "tone-warn"} %}
 
 <p class="kv" style="margin-top:18px">
-  Every shipped PR, watched in production until its script says it works. Scripts run
-  on a schedule with no model call; Morpheus's session only wakes to write a script for
-  a PR that gave hints instead of one. A failed or timed-out PR files an investigation
-  or asks Neo, once.
+  Every PR that reached production, in every project, watched until its check exits 0.
+  Morpheus only runs the check and reads the exit code; a PR that fails or times out is
+  handed to an investigation or to Neo, once.
   <span class="counts">({% for s, n in report.counts.items() %}{{ n }} {{ s }}{{ " · " if not loop.last }}{% endfor %})</span>
 </p>
 
@@ -20,7 +19,7 @@
   <table>
     <tr><th>state</th><td class="mono">
       {% if report.enabled == false %}<span class="tone-warn">disabled (os.morpheus.enabled)</span>
-      {% elif report.paused %}<span class="tone-warn">paused — scripts still run, no session turns</span>
+      {% elif report.paused %}<span class="tone-warn">paused — checks still run, no session turns</span>
       {% else %}<span class="tone-ok">running</span>{% endif %}</td></tr>
     <tr><th>session</th><td class="mono">{{ sess.get('session_id') or "not started" }}</td></tr>
     <tr><th>turns</th><td class="mono">{{ sess.get('turns') or 0 }} · {{ sess.get('compactions') or 0 }} compaction(s)
@@ -38,25 +37,21 @@
 <h2>Pull requests</h2>
 <div class="panel">
   <table>
-    <tr><th>PR</th><th>state</th><th>release</th><th>script</th><th>checks</th>
-      <th>deadline</th><th>last output</th><th>action</th></tr>
+    <tr><th>project</th><th>PR</th><th>state</th><th>check</th><th>runs</th>
+      <th>deadline</th><th>output</th><th>handed to</th></tr>
     {% for i in report["items"] %}
     <tr id="{{ i.id }}">
-      <td class="mono"><a href="{{ i.pr_url }}">#{{ i.pr_number }}</a>
-        <span class="sub">{{ i.id }}</span>
-        <div class="sub">{{ i.pr_title }}</div>
-        {% if i.resolution %}<div class="sub {{ tone[i.state] }}">{{ i.resolution }}</div>{% endif %}</td>
+      <td class="mono">{{ i.project or "—" }}</td>
+      <td class="mono" style="white-space:nowrap"><a href="{{ i.pr_url }}" title="{{ i.pr_title }}">#{{ i.pr_number }}</a></td>
       <td class="mono {{ tone[i.state] }}">{{ i.state }}</td>
-      <td class="mono" style="white-space:nowrap">{{ i.release_tag or "—" }}</td>
-      <td class="mono">{{ i.script_source or "—" }}
-        {% if i.script %}<details><summary>show</summary><pre>{{ i.script }}</pre></details>{% endif %}</td>
+      <td class="mono">{% if i.script %}<details><summary>{{ i.script_source }}</summary><pre>{{ i.script }}</pre></details>{% else %}—{% endif %}</td>
       <td class="mono">{{ i.checks }}{% if i.last_exit is not none %} · exit {{ i.last_exit }}{% endif %}</td>
       <td class="mono" style="white-space:nowrap">{{ fmt_ts(i.deadline_ts) }}</td>
       <td class="mono">{% if i.last_output %}<details><summary>tail</summary><pre>{{ i.last_output }}</pre></details>{% else %}—{% endif %}</td>
       <td class="mono" style="word-break:break-all">{{ i.action or "—" }}</td>
     </tr>
     {% else %}
-    <tr><td colspan="8" class="empty">nothing queued — a release fills this (`jarvis morpheus enqueue-release`)</td></tr>
+    <tr><td colspan="8" class="empty">nothing queued — a release or a merge fills this</td></tr>
     {% endfor %}
   </table>
 </div>

@@ -2801,7 +2801,7 @@ class Daemon:
         future.add_done_callback(lambda f: setattr(self, "morpheus_busy", False))
 
     def _morpheus_pass(self) -> None:
-        """Queue the running release, run due scripts, act on verdicts, then wake the session"""
+        """Queue what reached production, run due scripts, hand off verdicts, then wake the session"""
         from . import fleet, morpheus
         from .paths import production_code_dir
 
@@ -2810,15 +2810,29 @@ class Daemon:
             cfg = self.catalog.os.morpheus
             prod = production_code_dir()
             os_name = self._os_project()
-            os_path = next((p.path for p in self.catalog.projects if p.name == os_name), None)
-            # Scripts judge PRODUCTION, so they run from its checkout when there is one
-            cwd = prod if prod.is_dir() else (os_path or Path.cwd())
-            if (prod / ".git").exists():
+            # Where each project's production lives: the OS runs from its deployed checkout
+            dirs = {p.name: p.path for p in self.catalog.projects if p.path.is_dir()}
+            if os_name and prod.is_dir():
+                dirs[os_name] = prod
+            # The OS ships by release; every other project ships when its PR merges
+            if os_name and (prod / ".git").exists():
                 try:
-                    morpheus.ensure_release_queued(central, cfg, prod)
+                    morpheus.ensure_release_queued(central, cfg, prod, project=os_name)
                 except Exception:  # noqa: BLE001 — the rest of the pass still runs
                     log.exception("morpheus: could not queue the running release")
-            moved = morpheus.sweep(central, cfg, cwd)
+            for project in self.catalog.projects:
+                if project.name == os_name or not project.path.is_dir():
+                    continue
+                store = ProjectStore(project.path)  # thread-local
+                try:
+                    morpheus.queue_merges(central, cfg, project.name, store)
+                except Exception:  # noqa: BLE001
+                    log.exception("[%s] morpheus: could not queue merged PRs", project.name)
+                finally:
+                    store.close()
+            fallback = next(iter(dirs.values()), Path.cwd())
+            moved = morpheus.sweep(central, cfg,
+                                   lambda item: dirs.get(item.get("project") or "", fallback))
             if any(moved.values()):
                 log.info("morpheus sweep: %s", {k: v for k, v in moved.items() if v})
             for item in morpheus.owed_actions(central):
@@ -2827,9 +2841,10 @@ class Daemon:
                              item["state"], morpheus.act(central, self.catalog, item))
                 except Exception:  # noqa: BLE001 — one item must not starve the others
                     log.exception("morpheus: action for %s failed", item["id"])
-            if os_path is not None:
-                morpheus.wake(central, self.catalog, os_path,
-                              paused=fleet.load_pause(central) is not None)
+            # The session lives in the OS project's checkout; each batch adds the projects it touches
+            home = next((p.path for p in self.catalog.projects if p.name == os_name), fallback)
+            morpheus.wake(central, self.catalog, home, dirs=dirs,
+                          paused=fleet.load_pause(central) is not None)
         except Exception:  # noqa: BLE001 — the loop must survive anything
             log.exception("morpheus pass failed")
         finally:

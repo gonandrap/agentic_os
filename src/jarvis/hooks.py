@@ -170,7 +170,9 @@ def pr_title_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str,
 
 #: The `##` headings a PR body must carry
 PR_BODY_SECTIONS = ("Summary", "Implementation notes", "Questions asked to Neo",
-                    "Alarms raised", "Learnings", "Test evidence", "Screenshots")
+                    "Alarms raised", "Learnings", "Test evidence",
+                    # `morpheus.SECTION`: production validation is an OS function, for every project
+                    "How to validate in production", "Screenshots")
 
 # GitHub renders neither of these, so neither can mislink or count as content
 _HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
@@ -234,36 +236,7 @@ def _section_is_empty(text: str) -> bool:
     return True
 
 
-#: Where a repository keeps its PR template, in the order `gh` looks
-_TEMPLATE_PATHS = (".github/pull_request_template.md", ".github/PULL_REQUEST_TEMPLATE.md",
-                   "docs/pull_request_template.md")
-
-
-def repo_pr_template(cwd: str | Path) -> str:
-    """The PR template of the repository holding `cwd`, or ''"""
-    if not cwd:
-        return ""
-    here = Path(cwd).resolve()
-    for d in (here, *here.parents):
-        for rel in _TEMPLATE_PATHS:
-            try:
-                return (d / rel).read_text()
-            except OSError:
-                continue
-        if (d / ".git").exists():
-            return ""
-    return ""
-
-
-def validation_required(cwd: str | Path) -> bool:
-    """Whether this repository's template asks how to validate a change in production (Morpheus)"""
-    from . import morpheus
-
-    template = repo_pr_template(cwd)
-    return bool(template) and morpheus.find_section(template) is not None
-
-
-def pr_body_problems(body: str, *, validation: bool = False) -> list[str]:
+def pr_body_problems(body: str) -> list[str]:
     """Every reason this body is not ready, as phrases naming the fix"""
     heads = [(m.group(1).strip().lower(), m.start(), m.end())
              for m in _HEADING.finditer(body)]
@@ -276,12 +249,6 @@ def pr_body_problems(body: str, *, validation: bool = False) -> list[str]:
             problems.append(f"no `## {name}` section")
         elif _section_is_empty(spans[name.lower()]):
             problems.append(f"`## {name}` is still the empty template")
-    if validation:
-        from . import morpheus
-
-        problem = morpheus.section_problem(body)
-        if problem:
-            problems.append(problem)
     ref = mislinking_ref(body)
     if ref is not None:
         problems.append(
@@ -303,11 +270,10 @@ def pr_body_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, 
     if not env.get("JARVIS_WO_ID"):
         return None
     command = (payload.get("tool_input") or {}).get("command", "")
-    cwd = payload.get("cwd") or ""
-    body = gh_pr_create_body(command, cwd)
+    body = gh_pr_create_body(command, payload.get("cwd") or "")
     if body is None:
         return None
-    problems = pr_body_problems(body, validation=validation_required(cwd))
+    problems = pr_body_problems(body)
     if not problems:
         return None
     return _deny(

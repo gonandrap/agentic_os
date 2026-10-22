@@ -661,10 +661,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="the previous release's ref (default: the tag before TAG)")
     m.add_argument("--to", dest="to_ref", help="the shipped commit (default: TAG)")
     m.add_argument("--repo", help="the git checkout to read (default: production's)")
+    m.add_argument("--project", help="the onboarded project the release is of (default: "
+                                     "the one whose origin is --repo, else the OS)")
     m = mo.add_parser("add", help="queue one PR by number or URL, outside a release")
     m.add_argument("pr")
     m.add_argument("--repo", help="the git checkout whose origin owns a bare PR number")
     m.add_argument("--release", default="", help="the release to file it under")
+    m.add_argument("--project", help="the onboarded project the PR is of (default: "
+                                     "matched by the PR's repository)")
     m = mo.add_parser("script", help="(Morpheus's subagents) give a PR its validation "
                                      "script; a queued PR starts being monitored")
     m.add_argument("item_id")
@@ -3816,7 +3820,8 @@ MORPHEUS_ICON = {"queued": "…", "monitoring": "◉", "validated": "✓", "fail
 
 def _morpheus_line(item: dict) -> str:
     action = f" → {item['action']}" if item.get("action") else ""
-    return (f"{MORPHEUS_ICON.get(item['state'], '•')} {item['id']} PR #{item['pr_number']} "
+    return (f"{MORPHEUS_ICON.get(item['state'], '•')} {item['id']} "
+            f"[{item.get('project') or '?'}] PR #{item['pr_number']} "
             f"{item['state']}{action} — {item['pr_title'][:70]}")
 
 
@@ -3866,10 +3871,10 @@ def cmd_morpheus(args: argparse.Namespace) -> int:
         return 0
     if args.morpheus_cmd == "enqueue-release":
         _print(ops.morpheus_enqueue_release(args.tag, args.from_ref, args.to_ref,
-                                            args.repo), args.json)
+                                            args.repo, args.project), args.json)
         return 0
     if args.morpheus_cmd == "add":
-        item = ops.morpheus_add(args.pr, args.repo, args.release)
+        item = ops.morpheus_add(args.pr, args.repo, args.release, args.project)
         _print(item if args.json else {"queued": item["id"], "state": item["state"]},
                args.json)
         return 0

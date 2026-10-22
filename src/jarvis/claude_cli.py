@@ -1235,11 +1235,12 @@ def run_headless(prompt: str, system_prompt: str | None = None,
 def run_session_turn(prompt: str, session_id: str, *, resume: bool, cwd: Path,
                      model: str | None = None, append_system_prompt: str | None = None,
                      permission_mode: str | None = None,
+                     add_dirs: list[Path] | None = None,
                      timeout: int = 900) -> HeadlessResult:
     """One waited-for turn of a LONG-LIVED OS session (Morpheus): `--session-id` first, `--resume` after"""
     args = turn_args(prompt, session_id, resume, model=model,
                      permission_mode=permission_mode,
-                     append_system_prompt=append_system_prompt)
+                     append_system_prompt=append_system_prompt, add_dirs=add_dirs or None)
     started = time.monotonic()
     out = _run(args, cwd=cwd, timeout=timeout)
     latency_ms = int((time.monotonic() - started) * 1000)

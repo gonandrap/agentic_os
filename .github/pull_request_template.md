@@ -50,14 +50,12 @@
 
 ## How to validate in production
 
-<!-- REQUIRED — Morpheus watches every shipped PR in production until this says it works.
-     Give ONE of:
-       * a ```bash block: a READ-ONLY script run on a schedule from the production
-         checkout. Exit 0 = validated, 1 = broken, anything else (75) = not exercised yet.
-       * prose hints: what production activity proves it works. Morpheus turns them into
-         a script (that costs tokens; a script you write here does not).
-       * `None — <reason>` when production has nothing to show (docs, tests, comments).
-     Checked by CI and by the `gh pr create` hook. -->
+<!-- REQUIRED — Morpheus watches every shipped PR in production until it validates.
+     Give HINTS: what production activity shows this change working, and where to look
+     (a command, a log line, a page, a count that should move). A Morpheus subagent turns
+     them into a read-only check that runs on a schedule; commands here are hints, never
+     run as written.
+     Or `None — <reason>` when production has nothing to show (docs, tests, comments). -->
 
 ## Screenshots
 

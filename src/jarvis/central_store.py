@@ -498,6 +498,7 @@ CREATE TABLE IF NOT EXISTS steward_decisions (
 -- Morpheus's queue: one shipped PR being validated in production (docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md)
 CREATE TABLE IF NOT EXISTS morpheus_items (
     id TEXT PRIMARY KEY,                    -- mv-xxxxxxxx
+    project TEXT NOT NULL DEFAULT '',       -- the onboarded project the PR belongs to
     repo TEXT NOT NULL DEFAULT '',          -- owner/name
     pr_number INTEGER NOT NULL,
     pr_url TEXT NOT NULL DEFAULT '',
@@ -506,7 +507,7 @@ CREATE TABLE IF NOT EXISTS morpheus_items (
     release_tag TEXT NOT NULL DEFAULT '',
     hints TEXT NOT NULL DEFAULT '',         -- the PR's validation section, verbatim
     script TEXT NOT NULL DEFAULT '',
-    script_source TEXT NOT NULL DEFAULT '', -- pr | agent | user
+    script_source TEXT NOT NULL DEFAULT '', -- agent | user
     state TEXT NOT NULL,                    -- queued | monitoring | validated | failed | timedout
     created_ts REAL NOT NULL,
     updated_ts REAL NOT NULL,
@@ -565,6 +566,8 @@ FTS_WEIGHTS = (1.0, 4.0, 2.0)
 
 # Columns added after the first release, exactly as in `neo_store` and `project_store`
 ADDED_COLUMNS = {
+    # A home that ran this table before items were per project
+    "morpheus_items": {"project": "TEXT NOT NULL DEFAULT ''"},
     "inbox": {
         # The attention reason raised WITH this notification, or NULL for a standalone one (io-d2a5dd69)
         "paired_reason": "TEXT",
@@ -1875,7 +1878,7 @@ class CentralStore:
 
     # -- morpheus: production validation of shipped PRs
 
-    def add_morpheus_item(self, *, repo: str, pr_number: int, pr_url: str, pr_title: str,
+    def add_morpheus_item(self, *, project: str, repo: str, pr_number: int, pr_url: str, pr_title: str,
                           wo_id: str, release_tag: str, hints: str, script: str,
                           script_source: str, state: str, deadline_ts: float,
                           resolution: str = "", now: float | None = None
@@ -1885,11 +1888,11 @@ class CentralStore:
         item_id = db.new_id("mv")
         cur = self.conn.execute(
             """INSERT OR IGNORE INTO morpheus_items
-               (id, repo, pr_number, pr_url, pr_title, wo_id, release_tag, hints, script,
-                script_source, state, created_ts, updated_ts, deadline_ts, next_check_ts,
-                resolution)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (item_id, repo, pr_number, pr_url, pr_title, wo_id, release_tag, hints,
+               (id, project, repo, pr_number, pr_url, pr_title, wo_id, release_tag, hints,
+                script, script_source, state, created_ts, updated_ts, deadline_ts,
+                next_check_ts, resolution)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (item_id, project, repo, pr_number, pr_url, pr_title, wo_id, release_tag, hints,
              script, script_source, state, ts, ts, deadline_ts,
              ts if state == "monitoring" else None, resolution))
         return self.morpheus_item(item_id) if cur.rowcount else None

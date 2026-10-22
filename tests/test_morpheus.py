@@ -17,12 +17,12 @@ from jarvis.testing import TEST_EPOCH
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DAY = 86400
 
-SCRIPT_BODY = """## Summary
+HINTS_BODY = """## Summary
 x
 
 ## How to validate in production
 
-Watch the dashboard.
+Watch the dashboard after the next release.
 
 ```bash
 # exit 0 = validated
@@ -38,7 +38,7 @@ def body(section: str) -> str:
     return f"## Summary\nx\n\n## How to validate in production\n\n{section}\n\n## Screenshots\n-\n"
 
 
-def pr(n: int = 7, text: str = SCRIPT_BODY, title: str = "[wo-1234abcd] thing") -> morpheus.PullRequestBody:
+def pr(n: int = 7, text: str = HINTS_BODY, title: str = "[wo-1234abcd] thing") -> morpheus.PullRequestBody:
     return morpheus.PullRequestBody(number=n, url=f"https://github.com/o/r/pull/{n}",
                                     title=title, body=text)
 
@@ -59,26 +59,29 @@ def catalog(**morpheus_cfg) -> Catalog:
     return Catalog(os=OsConfig(morpheus=MorpheusConfig(**morpheus_cfg)), projects=[])
 
 
-# -- 1. the PR section
+def queued(central, n: int = 7, text: str = HINTS_BODY, project: str = "proj_a",
+           now: float | None = TEST_EPOCH, **kw) -> dict:
+    return morpheus.enqueue(central, MorpheusConfig(), pr(n, text, **kw), project=project,
+                            repo="o/r", now=now)
 
 
-def test_a_bash_block_is_the_script_and_comments_inside_it_are_not_headings():
-    raw = morpheus.find_section(SCRIPT_BODY)
+def monitoring(central, script: str = "exit 75", **kw) -> dict:
+    item = queued(central, **kw)
+    central.update_morpheus_item(item["id"], script=script, script_source="agent",
+                                 state="monitoring", next_check_ts=TEST_EPOCH)
+    return central.morpheus_item(item["id"])
+
+
+# -- 1. the PR section: hints, never a script
+
+
+def test_a_code_block_is_a_hint_and_its_comments_are_not_headings():
+    raw = morpheus.find_section(HINTS_BODY)
     assert raw is not None and "Screenshots" not in raw
     section = morpheus.parse_section(raw)
-    assert section.script.startswith("# exit 0 = validated")
-    assert "grep -q morpheus" in section.script
+    assert "grep -q morpheus" in section.text and "Watch the dashboard" in section.text
     assert not section.waived and not section.empty
-
-
-def test_prose_alone_is_hints_without_a_script():
-    section = morpheus.parse_section(morpheus.find_section(body("Watch the inbox.")) or "")
-    assert section.text == "Watch the inbox." and section.script == "" and not section.waived
-
-
-def test_a_non_shell_fence_is_not_run():
-    section = morpheus.parse_section("```json\n{\"a\": 1}\n```")
-    assert section.script == ""
+    assert not hasattr(section, "script")
 
 
 @pytest.mark.parametrize("text,reason", [("None — docs only", "docs only"),
@@ -92,7 +95,7 @@ def test_prose_starting_with_none_is_not_a_waiver():
     assert morpheus.parse_section("None of the old paths change; watch the inbox.").waived == ""
 
 
-def test_the_shipped_template_is_empty_and_its_comment_fence_does_not_swallow_the_body():
+def test_the_shipped_template_is_empty_and_its_comment_does_not_swallow_the_body():
     template = (REPO_ROOT / ".github/pull_request_template.md").read_text()
     raw = morpheus.find_section(template)
     assert raw is not None and "Screenshots" not in raw
@@ -104,10 +107,10 @@ def test_the_shipped_template_is_empty_and_its_comment_fence_does_not_swallow_th
 def test_a_body_without_the_section_names_the_fix():
     assert "no `## How to validate in production` section" in \
         morpheus.section_problem("## Summary\nx\n")
-    assert morpheus.section_problem(SCRIPT_BODY) is None
+    assert morpheus.section_problem(HINTS_BODY) is None
 
 
-# -- 2. which PRs a release carries
+# -- 2. which PRs reached production
 
 
 def test_pr_numbers_from_merge_and_squash_subjects():
@@ -119,6 +122,7 @@ def test_pr_numbers_from_merge_and_squash_subjects():
 def test_the_work_order_comes_from_the_title_prefix():
     assert morpheus.wo_of_title("[wo-1234abcd] thing") == "wo-1234abcd"
     assert morpheus.wo_of_title("thing [wo-1234abcd]") == ""
+    assert morpheus.parse_pr_url("https://github.com/o/r/pull/9") == ("o/r", 9)
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -147,19 +151,18 @@ def test_a_release_queues_only_what_it_added(central, cfg, release_repo):
 
     def fetch(slug, n):
         fetched.append(n)
-        return pr(n, body("Watch it.") if n == 2 else SCRIPT_BODY, title=f"PR {n}")
+        return pr(n, body("None — docs") if n == 2 else HINTS_BODY, title=f"PR {n}")
 
     out = morpheus.enqueue_release(central, cfg, release_repo, "jarvis-0.1.1",
-                                   fetch=fetch, slug="o/r")
+                                   project="jarvis_os", fetch=fetch, slug="o/r")
     assert out["from"] == "jarvis-0.1.0" and out["prs"] == [2, 3] and fetched == [2, 3]
-    states = {i["pr_number"]: i["state"] for i in central.morpheus_items()}
-    assert states == {2: "queued", 3: "monitoring"}
+    states = {i["pr_number"]: (i["state"], i["project"]) for i in central.morpheus_items()}
+    assert states == {2: ("validated", "jarvis_os"), 3: ("queued", "jarvis_os")}
     assert central.get_state(morpheus.RELEASE_KEY) == "jarvis-0.1.1"
     # Idempotent: shipit and the daemon may both queue the same release
     again = morpheus.enqueue_release(central, cfg, release_repo, "jarvis-0.1.1",
-                                     fetch=fetch, slug="o/r")
+                                     project="jarvis_os", fetch=fetch, slug="o/r")
     assert again["queued"] == [] and again["already_queued"] == [2, 3]
-    assert len(central.morpheus_items()) == 2
 
 
 def test_one_unreadable_pr_does_not_drop_the_rest(central, cfg, release_repo):
@@ -169,7 +172,7 @@ def test_one_unreadable_pr_does_not_drop_the_rest(central, cfg, release_repo):
         return pr(n)
 
     out = morpheus.enqueue_release(central, cfg, release_repo, "jarvis-0.1.1",
-                                   fetch=fetch, slug="o/r")
+                                   project="jarvis_os", fetch=fetch, slug="o/r")
     assert out["errors"] == ["#2: gh broke"] and len(out["queued"]) == 1
 
 
@@ -177,38 +180,76 @@ def test_the_daemon_backstop_queues_the_running_release_once(central, cfg, relea
     _git(release_repo, "checkout", "-q", "jarvis-0.1.1")
     calls = []
     fetch = lambda s, n: calls.append(n) or pr(n)  # noqa: E731
-    assert morpheus.ensure_release_queued(central, cfg, release_repo, fetch=fetch,
-                                          slug="o/r")["release"] == "jarvis-0.1.1"
-    assert morpheus.ensure_release_queued(central, cfg, release_repo, fetch=fetch,
-                                          slug="o/r") is None
+    kw = {"project": "jarvis_os", "fetch": fetch, "slug": "o/r"}
+    assert morpheus.ensure_release_queued(central, cfg, release_repo,
+                                          **kw)["release"] == "jarvis-0.1.1"
+    assert morpheus.ensure_release_queued(central, cfg, release_repo, **kw) is None
     assert calls == [2, 3]
 
 
 def test_a_dev_checkout_on_a_branch_queues_nothing(central, cfg, release_repo):
     _git(release_repo, "commit", "-q", "--allow-empty", "-m", "after the tag")
-    assert morpheus.ensure_release_queued(central, cfg, release_repo,
+    assert morpheus.ensure_release_queued(central, cfg, release_repo, project="jarvis_os",
                                           fetch=lambda s, n: pr(n), slug="o/r") is None
+
+
+def test_every_other_project_queues_on_merge_from_first_sight(central, cfg, project, clock):
+    from jarvis.project_store import ProjectStore
+
+    store = ProjectStore(project)
+    try:
+        old = store.create_work_order(title="before", description="d")
+        store.add_event(old["id"], "pr_merged", {"pr_url": "https://github.com/o/r/pull/1"})
+        fetch = lambda s, n: pr(n, title=f"[{old['id']}] x")  # noqa: E731
+        # First sight starts from now: history is never backfilled
+        assert morpheus.queue_merges(central, cfg, "proj_a", store, fetch=fetch) == []
+        clock.advance(10)
+        new = store.create_work_order(title="after", description="d")
+        store.add_event(new["id"], "pr_merged", {"pr_url": "https://github.com/o/r/pull/2"})
+        [item_id] = morpheus.queue_merges(central, cfg, "proj_a", store, fetch=fetch)
+        item = central.morpheus_item(item_id)
+        assert (item["pr_number"], item["project"], item["state"]) == (2, "proj_a", "queued")
+        assert morpheus.queue_merges(central, cfg, "proj_a", store, fetch=fetch) == []
+    finally:
+        store.close()
+
+
+def test_a_merge_that_cannot_be_read_is_retried_next_pass(central, cfg, project, clock):
+    from jarvis.project_store import ProjectStore
+
+    store = ProjectStore(project)
+    try:
+        morpheus.queue_merges(central, cfg, "proj_a", store)
+        clock.advance(10)
+        wo = store.create_work_order(title="x", description="d")
+        store.add_event(wo["id"], "pr_merged", {"pr_url": "https://github.com/o/r/pull/5"})
+
+        def broken(s, n):
+            raise RuntimeError("gh down")
+
+        assert morpheus.queue_merges(central, cfg, "proj_a", store, fetch=broken) == []
+        assert len(morpheus.queue_merges(central, cfg, "proj_a", store,
+                                         fetch=lambda s, n: pr(n))) == 1
+    finally:
+        store.close()
 
 
 # -- 3. the queue
 
 
-def test_the_section_decides_the_starting_state(central, cfg, clock):
-    script = morpheus.enqueue(central, cfg, pr(1), repo="o/r")
-    hints = morpheus.enqueue(central, cfg, pr(2, body("Watch the inbox.")), repo="o/r")
-    waived = morpheus.enqueue(central, cfg, pr(3, body("None — docs only")), repo="o/r")
-    missing = morpheus.enqueue(central, cfg, pr(4, "## Summary\nx"), repo="o/r")
-    assert (script["state"], script["script_source"], script["wo_id"]) == \
-        ("monitoring", "pr", "wo-1234abcd")
-    assert script["deadline_ts"] == TEST_EPOCH + 3 * DAY
-    assert hints["state"] == "queued" and hints["hints"] == "Watch the inbox."
+def test_only_a_waiver_skips_the_queue(central, cfg, clock):
+    hinted = queued(central, 1, now=None)
+    waived = queued(central, 3, body("None — docs only"))
+    missing = queued(central, 4, "## Summary\nx")
+    assert (hinted["state"], hinted["script"], hinted["wo_id"]) == ("queued", "", "wo-1234abcd")
+    assert hinted["deadline_ts"] == TEST_EPOCH + 3 * DAY
     assert waived["state"] == "validated" and "docs only" in waived["resolution"]
-    assert missing["state"] == "queued"
-    assert morpheus.enqueue(central, cfg, pr(1), repo="o/r") is None
+    assert missing["state"] == "queued" and missing["hints"] == ""
+    assert queued(central, 1) is None
 
 
-def test_a_registered_script_starts_monitoring(central, cfg, clock):
-    item = morpheus.enqueue(central, cfg, pr(2, body("Watch.")), repo="o/r")
+def test_a_registered_script_starts_monitoring(central, clock):
+    item = queued(central, 2)
     moved = morpheus.set_script(central, item["id"], "exit 0", "agent")
     assert (moved["state"], moved["script_source"], moved["next_check_ts"]) == \
         ("monitoring", "agent", TEST_EPOCH)
@@ -217,7 +258,7 @@ def test_a_registered_script_starts_monitoring(central, cfg, clock):
 
 
 def test_waive_and_requeue(central, cfg, clock):
-    item = morpheus.enqueue(central, cfg, pr(), repo="o/r")
+    item = monitoring(central)
     central.update_morpheus_item(item["id"], state="failed", action="neo:4")
     assert morpheus.waive(central, item["id"], "fine")["state"] == "validated"
     clock.advance(DAY)
@@ -226,27 +267,41 @@ def test_waive_and_requeue(central, cfg, clock):
         ("monitoring", "", TEST_EPOCH + DAY + 3 * DAY)
 
 
-# -- 4. the mechanical half
+# -- 4. the mechanical half: the exit code and nothing else
 
 
-def _run(exit_code):
-    return lambda script, cwd, timeout: morpheus.CheckResult(exit_code, f"said {exit_code}")
+def _run(exit_code, seen=None):
+    def run(script, cwd, timeout):
+        if seen is not None:
+            seen.append(cwd)
+        return morpheus.CheckResult(exit_code, f"said {exit_code}")
+    return run
 
 
-@pytest.mark.parametrize("code,state", [(0, "validated"), (1, "failed"), (75, "monitoring"),
-                                        (None, "monitoring")])
-def test_the_exit_code_is_the_verdict(central, cfg, tmp_path, code, state):
-    item = morpheus.enqueue(central, cfg, pr(), repo="o/r", now=TEST_EPOCH)
+@pytest.mark.parametrize("code,state,resolution", [
+    (0, "validated", "script exited 0"), (1, "failed", "script exited 1"),
+    (75, "monitoring", ""), (None, "monitoring", "")])
+def test_the_exit_code_is_the_verdict(central, cfg, tmp_path, code, state, resolution):
+    item = monitoring(central)
     moved = morpheus.sweep(central, cfg, tmp_path, now=TEST_EPOCH, run=_run(code))
     after = central.morpheus_item(item["id"])
-    assert after["state"] == state and moved[state] == 1
+    assert (after["state"], after["resolution"]) == (state, resolution) and moved[state] == 1
     assert after["checks"] == 1 and after["last_output"] == f"said {code}"
     if state == "monitoring":
         assert after["next_check_ts"] == TEST_EPOCH + cfg.check_every_minutes * 60
 
 
+def test_each_script_runs_in_its_own_project(central, cfg, tmp_path):
+    monitoring(central, n=1, project="a")
+    monitoring(central, n=2, project="b")
+    seen: list[Path] = []
+    morpheus.sweep(central, cfg, lambda item: tmp_path / item["project"], now=TEST_EPOCH,
+                   run=_run(75, seen))
+    assert sorted(seen) == [tmp_path / "a", tmp_path / "b"]
+
+
 def test_a_script_is_not_run_before_it_is_due(central, cfg, tmp_path):
-    morpheus.enqueue(central, cfg, pr(), repo="o/r", now=TEST_EPOCH)
+    monitoring(central)
     morpheus.sweep(central, cfg, tmp_path, now=TEST_EPOCH, run=_run(75))
     ran = []
     morpheus.sweep(central, cfg, tmp_path, now=TEST_EPOCH + 60,
@@ -255,17 +310,19 @@ def test_a_script_is_not_run_before_it_is_due(central, cfg, tmp_path):
 
 
 def test_not_yet_past_the_deadline_is_timedout(central, cfg, tmp_path):
-    item = morpheus.enqueue(central, cfg, pr(), repo="o/r", now=TEST_EPOCH)
+    item = monitoring(central)
     morpheus.sweep(central, cfg, tmp_path, now=TEST_EPOCH + 3 * DAY + 1, run=_run(75))
     after = central.morpheus_item(item["id"])
-    assert after["state"] == "timedout" and "never reached a verdict" in after["resolution"]
+    assert after["state"] == "timedout"
+    assert after["resolution"] == "no exit 0 or 1 within 3 day(s) (last exit None)"
 
 
 def test_a_queued_pr_that_never_got_a_script_times_out_too(central, cfg, tmp_path):
-    item = morpheus.enqueue(central, cfg, pr(2, body("Watch.")), repo="o/r", now=TEST_EPOCH)
+    item = queued(central, 2)
     morpheus.sweep(central, cfg, tmp_path, now=TEST_EPOCH + 3 * DAY + 1, run=_run(0))
     after = central.morpheus_item(item["id"])
-    assert after["state"] == "timedout" and "no validation script" in after["resolution"]
+    assert (after["state"], after["resolution"]) == \
+        ("timedout", "no script was registered within 3 day(s)")
 
 
 def test_run_script_reads_the_real_exit_code_and_output(tmp_path):
@@ -275,35 +332,47 @@ def test_run_script_reads_the_real_exit_code_and_output(tmp_path):
     assert timed.exit is None and "timed out" in timed.output
 
 
-# -- 5. failed and timed out must act
+# -- 5. failed and timed out hand off: Morpheus never diagnoses
 
 
-def test_failed_with_a_work_order_files_an_investigation_once(central, tmp_path):
-    item = morpheus.enqueue(central, MorpheusConfig(), pr(), repo="o/r", now=TEST_EPOCH)
-    central.update_morpheus_item(item["id"], state="failed", resolution="broken")
+def _failed(central) -> dict:
+    item = monitoring(central)
+    central.update_morpheus_item(item["id"], state="failed", resolution="script exited 1",
+                                 last_exit=1)
+    return central.morpheus_item(item["id"])
+
+
+def test_failed_with_a_work_order_files_an_investigation_once(central):
+    item = _failed(central)
     asked = []
-    action = morpheus.act(central, catalog(), central.morpheus_item(item["id"]),
+    action = morpheus.act(central, catalog(), item,
                           investigate=lambda c, i: ("fo-inv00001", ""),
                           ask_neo=lambda *a: asked.append(1) or 9)
     assert action == "investigation:fo-inv00001" and asked == []
     assert central.morpheus_item(item["id"])["action"] == action
     assert morpheus.owed_actions(central) == []
-    titles = [r["title"] for r in central.conn.execute("SELECT title FROM inbox")]
-    assert titles == ["PR #7 failed production validation"]
+    [row] = central.conn.execute("SELECT project, title, body FROM inbox").fetchall()
+    assert row["project"] == "proj_a"
+    assert row["title"] == "PR #7 failed production validation (script exited 1)"
+    assert "fo-inv00001 is finding out why" in row["body"]
+
+
+def test_the_hand_off_states_only_facts(central):
+    why = morpheus._why(_failed(central))
+    assert "has NOT diagnosed anything" in why and "script exited 1" in why
+    assert "broken" not in why.lower()
 
 
 def test_an_investigation_that_cannot_be_filed_asks_neo_instead(central):
-    item = morpheus.enqueue(central, MorpheusConfig(), pr(), repo="o/r", now=TEST_EPOCH)
-    central.update_morpheus_item(item["id"], state="failed")
     notes = []
-    action = morpheus.act(central, catalog(), central.morpheus_item(item["id"]),
+    action = morpheus.act(central, catalog(), _failed(central),
                           investigate=lambda c, i: ("", "the steward said no"),
                           ask_neo=lambda c, i, note: notes.append(note) or 9)
     assert action == "neo:9" and notes == ["the steward said no"]
 
 
 def test_timedout_asks_neo_by_default_and_the_route_is_configurable(central):
-    item = morpheus.enqueue(central, MorpheusConfig(), pr(), repo="o/r", now=TEST_EPOCH)
+    item = queued(central)
     central.update_morpheus_item(item["id"], state="timedout")
     filed = []
     assert morpheus.act(central, catalog(), central.morpheus_item(item["id"]),
@@ -318,7 +387,7 @@ def test_timedout_asks_neo_by_default_and_the_route_is_configurable(central):
 
 
 def test_no_work_order_means_no_investigation(central):
-    item = morpheus.enqueue(central, MorpheusConfig(), pr(title="untitled"), repo="o/r")
+    item = queued(central, title="untitled")
     assert morpheus._investigate(catalog(), item) == \
         ("", "the PR names no work order to investigate")
 
@@ -326,7 +395,7 @@ def test_no_work_order_means_no_investigation(central):
 def test_the_neo_question_is_a_validation_question_naming_the_item(central):
     from jarvis.neo_store import NeoStore
 
-    item = morpheus.enqueue(central, MorpheusConfig(), pr(), repo="o/r")
+    item = queued(central)
     central.update_morpheus_item(item["id"], state="timedout", resolution="no verdict")
     qid = morpheus._ask_neo(catalog(), central.morpheus_item(item["id"]), "")
     neo = NeoStore()
@@ -334,16 +403,16 @@ def test_the_neo_question_is_a_validation_question_naming_the_item(central):
         q = neo.get(qid)
     finally:
         neo.close()
-    assert q["kind"] == "validation" and q["wo_id"] == ""
+    assert (q["kind"], q["wo_id"], q["project"]) == ("validation", "", "proj_a")
     assert morpheus.item_of_question(q) == item["id"]
     assert f"jarvis morpheus requeue {item['id']}" in q["question"]
 
 
 @pytest.mark.parametrize("escalate,level", [(True, "warning"), (False, "info")])
 def test_neo_s_verdict_is_recorded_and_reaches_the_inbox(central, escalate, level):
-    item = morpheus.enqueue(central, MorpheusConfig(), pr(), repo="o/r")
+    item = queued(central)
     central.update_morpheus_item(item["id"], state="timedout", resolution="no verdict")
-    q = {"id": 5, "project": "jarvis_os", "context": json.dumps({"morpheus_item": item["id"]})}
+    q = {"id": 5, "project": "proj_a", "context": json.dumps({"morpheus_item": item["id"]})}
     morpheus.record_neo_verdict(central, q, {"escalate": escalate, "answer": "rare path",
                                              "reason": ""}, "http://x/neo/question/5")
     after = central.morpheus_item(item["id"])
@@ -352,7 +421,16 @@ def test_neo_s_verdict_is_recorded_and_reaches_the_inbox(central, escalate, leve
     assert [(r["level"], "PR #7" in r["title"]) for r in rows] == [(level, True)]
 
 
-# -- 6. the only LLM: Morpheus's session
+def test_a_validation_question_cannot_be_answered_like_a_worker_question(central):
+    from jarvis import ops
+
+    item = queued(central)
+    qid = morpheus._ask_neo(catalog(), item, "")
+    with pytest.raises(ops.OpsError, match=f"jarvis morpheus waive {item['id']}"):
+        ops.neo_answer_escalated(qid, "looks fine")
+
+
+# -- 6. the only LLM: Morpheus's session turns hints into scripts
 
 
 class FakeTurn:
@@ -372,20 +450,24 @@ class FakeTurn:
 
 def test_no_queued_pr_means_no_turn(central, tmp_path):
     turn = FakeTurn()
-    morpheus.enqueue(central, MorpheusConfig(), pr(), repo="o/r")  # has its own script
+    monitoring(central)
     assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH, call=turn) == "idle"
     assert turn.calls == []
 
 
 def test_a_queued_pr_wakes_one_turn_that_spawns_subagents(central, tmp_path):
     turn = FakeTurn()
-    item = morpheus.enqueue(central, MorpheusConfig(), pr(2, body("Watch the inbox.")),
-                            repo="o/r")
-    assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH, call=turn) == "scripts"
+    item = queued(central, 2, body("Watch the inbox."))
+    dirs = {"proj_a": tmp_path / "proj_a"}
+    assert morpheus.wake(central, catalog(), tmp_path, dirs=dirs, now=TEST_EPOCH,
+                         call=turn) == "scripts"
     [call] = turn.calls
     assert call["resume"] is False and item["id"] in call["prompt"]
     assert "Watch the inbox." in call["prompt"]
+    assert f"production directory: {tmp_path / 'proj_a'}" in call["prompt"]
+    assert call["add_dirs"] == [tmp_path / "proj_a"]
     assert "spawn ONE subagent" in call["append_system_prompt"]
+    assert "never diagnose a failure" in call["append_system_prompt"]
     assert "jarvis morpheus script" in call["append_system_prompt"]
     assert call["model"] == "sonnet"
     rows = central.conn.execute("SELECT kind, label FROM agent_calls").fetchall()
@@ -404,7 +486,7 @@ def test_a_queued_pr_wakes_one_turn_that_spawns_subagents(central, tmp_path):
 
 def test_past_the_compact_share_the_next_turn_is_a_compaction(central, tmp_path):
     turn = FakeTurn(share=0.31)
-    morpheus.enqueue(central, MorpheusConfig(), pr(2, body("Watch.")), repo="o/r")
+    queued(central, 2)
     morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH, call=turn)
     assert morpheus.session_state(central)["compact_due"] is True
     assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH + 60,
@@ -416,14 +498,14 @@ def test_past_the_compact_share_the_next_turn_is_a_compaction(central, tmp_path)
 
 def test_under_the_share_nothing_compacts(central, tmp_path):
     turn = FakeTurn(share=0.29)
-    morpheus.enqueue(central, MorpheusConfig(), pr(2, body("Watch.")), repo="o/r")
+    queued(central, 2)
     morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH, call=turn)
     assert morpheus.session_state(central)["compact_due"] is False
 
 
 def test_a_pause_stops_the_session_and_nothing_else(central, tmp_path):
     turn = FakeTurn()
-    morpheus.enqueue(central, MorpheusConfig(), pr(2, body("Watch.")), repo="o/r")
+    queued(central, 2)
     assert morpheus.wake(central, catalog(), tmp_path, paused=True, now=TEST_EPOCH,
                          call=turn) == "paused"
     assert turn.calls == []
@@ -431,53 +513,37 @@ def test_a_pause_stops_the_session_and_nothing_else(central, tmp_path):
 
 def test_a_failed_turn_is_recorded_and_still_counts_as_an_offer(central, tmp_path):
     turn = FakeTurn(fail=True)
-    morpheus.enqueue(central, MorpheusConfig(), pr(2, body("Watch.")), repo="o/r")
+    queued(central, 2)
     assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH, call=turn) == "error"
     state = morpheus.session_state(central)
     assert state["last_error"] == "boom" and state["errors"] == 1
+    # The CLI may have half-created the session: the next first turn mints a fresh id
+    assert "session_id" not in state
     assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH + 60, call=turn) == "idle"
 
 
-# -- 7. enforcing the section
+# -- 7. enforcing the section, in every project
 
 
-def _repo_with_template(tmp_path: Path, template: str) -> Path:
-    repo = tmp_path / "proj"
-    (repo / ".github").mkdir(parents=True)
-    (repo / ".git").mkdir()
-    (repo / ".github/pull_request_template.md").write_text(template)
-    (repo / "sub").mkdir()
-    return repo
-
-
-def test_the_section_is_required_only_where_the_template_asks_for_it(tmp_path):
-    with_it = _repo_with_template(tmp_path / "a", f"## Summary\n\n## {morpheus.SECTION}\n")
-    without = _repo_with_template(tmp_path / "b", "## Summary\n")
-    assert hooks.validation_required(with_it / "sub") is True
-    assert hooks.validation_required(without) is False
-    assert hooks.validation_required(tmp_path) is False
+def test_the_section_is_a_required_section_for_every_project():
+    assert morpheus.SECTION in hooks.PR_BODY_SECTIONS
+    bundled = REPO_ROOT / "src/jarvis/assets/skills/open-a-pull-request/pull_request_template.md"
+    assert f"## {morpheus.SECTION}" in bundled.read_text()
 
 
 def test_the_hook_denies_a_body_without_it(tmp_path):
-    repo = _repo_with_template(tmp_path, (REPO_ROOT / ".github/pull_request_template.md")
-                               .read_text())
-    good = "\n\n".join(f"## {s}\nfilled" for s in hooks.PR_BODY_SECTIONS)
-    (repo / "good.md").write_text(good + f"\n\n## {morpheus.SECTION}\nNone — docs only\n")
-    (repo / "bad.md").write_text(good)
-    payload = {"cwd": str(repo), "tool_input": {
-        "command": "gh pr create --title '[wo-1234abcd] x' --body-file bad.md"}}
-    env = {"JARVIS_WO_ID": "wo-1234abcd"}
-    denied = hooks.pr_body_decision(payload, env)
-    assert denied is not None and morpheus.SECTION in json.dumps(denied)
-    payload["tool_input"]["command"] = payload["tool_input"]["command"].replace("bad", "good")
-    assert hooks.pr_body_decision(payload, env) is None
+    full = "\n\n".join(f"## {s}\nfilled" for s in hooks.PR_BODY_SECTIONS)
+    without = "\n\n".join(f"## {s}\nfilled" for s in hooks.PR_BODY_SECTIONS
+                          if s != morpheus.SECTION)
+    assert hooks.pr_body_problems(full) == []
+    assert hooks.pr_body_problems(without) == [f"no `## {morpheus.SECTION}` section"]
 
 
-def test_ci_check_script(tmp_path):
+def test_ci_check_script():
     script = REPO_ROOT / "scripts/check_pr_validation.py"
-    ok = subprocess.run([sys.executable, str(script)], input=SCRIPT_BODY, text=True,
+    ok = subprocess.run([sys.executable, str(script)], input=HINTS_BODY, text=True,
                         capture_output=True, env={"PATH": "/usr/bin:/bin"})
-    assert ok.returncode == 0 and "script" in ok.stdout
+    assert ok.returncode == 0 and "hints" in ok.stdout
     bad = subprocess.run([sys.executable, str(script)], text=True, capture_output=True,
                          env={"PATH": "/usr/bin:/bin", "PR_BODY": "## Summary\nx"})
     assert bad.returncode == 1 and "::error::" in bad.stdout
@@ -488,9 +554,9 @@ def test_the_workflow_reruns_on_an_edited_body():
     assert "edited" in wf and "scripts/check_pr_validation.py" in wf
 
 
-def test_the_skill_documents_the_section():
+def test_the_skill_asks_for_hints_in_every_project():
     skill = (REPO_ROOT / "src/jarvis/assets/skills/open-a-pull-request/SKILL.md").read_text()
-    assert morpheus.SECTION in skill and "exit 1" in skill.lower()
+    assert morpheus.SECTION in skill and "every project" in skill and "hints" in skill
 
 
 def test_shipit_queues_the_release_before_anything_restarts():
@@ -519,22 +585,22 @@ def test_bad_values_refuse_to_boot(raw):
 # -- 9. the invariant
 
 
-def test_an_overdue_item_is_a_violation(central, cfg, monkeypatch):
+def test_an_overdue_item_is_a_violation(central, monkeypatch):
     from jarvis import invariants
 
     monkeypatch.setattr(invariants, "_live_catalog", lambda: None)
-    item = morpheus.enqueue(central, cfg, pr(), repo="o/r", now=TEST_EPOCH)
+    item = queued(central)
     monkeypatch.setattr("jarvis.db.now", lambda: TEST_EPOCH + 3 * DAY + 2 * 3600)
     [v] = list(invariants.check_morpheus_moves())
     assert v.invariant == "INV-MORPHEUS-OVERDUE" and v.subject_id == item["id"]
     assert invariants.check_morpheus_moves in invariants.OS_INVARIANTS
 
 
-def test_an_owed_action_is_a_violation_and_a_taken_one_is_not(central, cfg, monkeypatch):
+def test_an_owed_action_is_a_violation_and_a_taken_one_is_not(central, monkeypatch):
     from jarvis import invariants
 
     monkeypatch.setattr(invariants, "_live_catalog", lambda: None)
-    item = morpheus.enqueue(central, cfg, pr(), repo="o/r", now=TEST_EPOCH)
+    item = queued(central)
     monkeypatch.setattr("jarvis.db.now", lambda: TEST_EPOCH)
     central.update_morpheus_item(item["id"], state="failed")
     monkeypatch.setattr("jarvis.db.now", lambda: TEST_EPOCH + 2 * 3600)
@@ -546,27 +612,26 @@ def test_an_owed_action_is_a_violation_and_a_taken_one_is_not(central, cfg, monk
 # -- 10. the daemon, the CLI and the dashboard
 
 
-def test_the_daemon_pass_runs_due_scripts_and_acts(central, catalog_file, monkeypatch,
-                                                   tmp_path):
+def test_the_daemon_pass_runs_each_check_in_its_project_and_hands_off(
+        central, catalog_file, project, monkeypatch):
     from jarvis.catalog import load_catalog
     from jarvis.daemon import Daemon
 
     daemon = Daemon(load_catalog(catalog_file))
-    good = morpheus.enqueue(central, MorpheusConfig(), pr(1, body("```bash\nexit 0\n```")),
-                            repo="o/r")
-    bad = morpheus.enqueue(central, MorpheusConfig(), pr(2, body("```sh\nexit 1\n```"),
-                                                         title="no wo"), repo="o/r")
+    good = monitoring(central, n=1, script="pwd > ran-here; exit 0")
+    bad = monitoring(central, n=2, script="exit 1", title="no wo")
     monkeypatch.setattr(morpheus, "_ask_neo", lambda c, i, note="": 42)
     daemon._morpheus_pass()
     assert central.morpheus_item(good["id"])["state"] == "validated"
+    assert (project / "ran-here").read_text().strip() == str(project)
     after = central.morpheus_item(bad["id"])
     assert after["state"] == "failed" and after["action"] == "neo:42"
 
 
-def test_cli_status_and_script(central, cfg, tmp_path, capsys):
+def test_cli_status_and_script(central, tmp_path, capsys):
     from jarvis.cli import main
 
-    item = morpheus.enqueue(central, cfg, pr(2, body("Watch.")), repo="o/r")
+    item = queued(central, 2)
     (tmp_path / "s.sh").write_text("exit 75\n")
     assert main(["morpheus", "script", item["id"], "--file", str(tmp_path / "s.sh")]) == 0
     capsys.readouterr()
@@ -576,28 +641,15 @@ def test_cli_status_and_script(central, cfg, tmp_path, capsys):
     assert main(["morpheus", "show", "mv-nope"]) == 1
 
 
-def test_the_dashboard_page(central, cfg):
+def test_the_dashboard_shows_a_link_not_the_pr_s_text(central):
     from fastapi.testclient import TestClient
 
     from jarvis.ui.app import create_app
 
-    morpheus.enqueue(central, cfg, pr(), repo="o/r")
+    item = _failed(central)
     page = TestClient(create_app()).get("/morpheus")
     assert page.status_code == 200
-    assert "#7" in page.text and "monitoring" in page.text and 'href="/morpheus"' in page.text
-
-
-def test_a_failed_first_turn_mints_a_fresh_session_next_time(central, tmp_path):
-    turn = FakeTurn(fail=True)
-    morpheus.enqueue(central, MorpheusConfig(), pr(2, body("Watch.")), repo="o/r")
-    morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH, call=turn)
-    assert "session_id" not in morpheus.session_state(central)
-
-
-def test_a_validation_question_cannot_be_answered_like_a_worker_question(central):
-    from jarvis import ops
-
-    item = morpheus.enqueue(central, MorpheusConfig(), pr(), repo="o/r")
-    qid = morpheus._ask_neo(catalog(), item, "")
-    with pytest.raises(ops.OpsError, match=f"jarvis morpheus waive {item['id']}"):
-        ops.neo_answer_escalated(qid, "looks fine")
+    assert '<a href="https://github.com/o/r/pull/7" title="[wo-1234abcd] thing">#7</a>' \
+        in page.text
+    assert "proj_a" in page.text and "failed" in page.text
+    assert item["resolution"] not in page.text and "Watch the dashboard" not in page.text
