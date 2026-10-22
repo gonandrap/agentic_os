@@ -211,6 +211,25 @@ def test_a_worker_filed_improvement_order_needs_self_dispatch_on(started, monkey
     assert _decisions()[0]["origin_kind"] == "worker_io"
 
 
+def test_a_worker_filed_improvement_order_fails_closed_on_an_unreadable_catalog(
+        started, monkeypatch, store):
+    """Decisions #60/#62 of 2026-10-22: an unreadable catalog let a worker's io through"""
+    def unreadable():
+        raise ops.OpsError("catalog unreadable")
+    monkeypatch.setattr(ops, "resolve_catalog", unreadable)
+    monkeypatch.setenv("JARVIS_WO_ID", "wo-3b5590a0")
+    with pytest.raises(ops.OpsError) as e:
+        ops.create_improvement_order("proj_a", "slow first turns",
+                                     description=OBSERVATION, refs=REFS)
+    msg = str(e.value)
+    assert "could not read the catalog" in msg and "catalog unreadable" in msg
+    assert store.list_feature_orders(kind="improvement", statuses=None) == []
+    # The user's own io does not depend on the steward, so it still files
+    monkeypatch.delenv("JARVIS_WO_ID")
+    assert ops.create_improvement_order("proj_a", "slow first turns",
+                                        description=OBSERVATION, refs=REFS)["id"]
+
+
 def test_the_users_own_improvement_order_is_not_decided_by_the_steward(enforcing,
                                                                       monkeypatch, store):
     enforcing(weekly_usd=0.0)

@@ -6368,6 +6368,12 @@ IO_STEWARD_REFUSED = (
     "(decision #{decision_id}). Nothing was created and nothing is spending. It is on "
     "the record: `jarvis steward decisions`"
 )
+#: Said to a WORKER whose io could not be decided at all: no decision is not a yes (#60)
+IO_STEWARD_UNREADABLE = (
+    "the steward could not read the catalog, so it cannot decide this improvement order "
+    "({error}). Nothing was created. A worker's io waits for a readable catalog; ask the "
+    "user to run `jarvis doctor`, or put the observation in your summary instead"
+)
 #: `decide` said dispatch and the master switch said no (`os.autonomy.self_dispatch`)
 IO_SELF_DISPATCH_OFF = ("`os.autonomy.self_dispatch` is off, so the OS files nothing "
                         "nobody typed")
@@ -6383,10 +6389,10 @@ def _gate_improvement_order(project_name: str, title: str, refs: Sequence[str],
         return None  # spec §3.2 decision 1 rule 1: the user typed it
     try:
         catalog = resolve_catalog()
-    except (OpsError, CatalogError, OSError, ValueError):
-        # A FAILURE IS NEVER A VERDICT (kn-40db1828): an unreadable catalog decides nothing
-        log.warning("steward: catalog unreadable; %s io create not decided", project_name)
-        return None
+    except (OpsError, CatalogError, OSError, ValueError) as e:
+        # A FAILURE IS NEVER A VERDICT (kn-40db1828), and work nobody typed needs a yes (#60)
+        log.warning("steward: catalog unreadable; %s io create refused", project_name)
+        raise OpsError(IO_STEWARD_UNREADABLE.format(error=str(e)[:200])) from e
     decision = steward.gate(
         steward.Candidate("worker_io", "major", project_name, title,
                           evidence=tuple(refs), parent_wo_id=parent_wo_id,
