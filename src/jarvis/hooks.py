@@ -22,7 +22,7 @@ from .navigation import (
     is_spec_path,
     navigates_source,
 )
-from .project_store import WO_KIND_CONTRACTS, ProjectStore
+from .project_store import WO_KIND_CONTRACTS, ProjectStore, inbox_flag
 
 # A Bash command every worker must be able to run without a permission prompt: a chain of `cd <dir>`...
 _SHELL_DANGEROUS = re.compile(r"[|;`$<>]")
@@ -1596,6 +1596,9 @@ def uncollected_task_turn_block(store: ProjectStore, wo_id: str,
     from . import background
     from .invariants import TERMINAL_STATUSES
 
+    # A background session outlives its turn and is woken by the task (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)
+    if env.get(TURN_TRANSPORT_ENV) != TRANSPORT_HEADLESS:
+        return None
     # One continuation, not a loop: a task that is genuinely hung must not make the turn unendable
     if payload.get("stop_hook_active"):
         return None
@@ -2091,13 +2094,19 @@ def compaction_brief(store: ProjectStore, wo: dict[str, Any], project: str) -> s
     if wo.get("description"):
         lines += ["", "## The original ask, verbatim", "", wo["description"]]
 
-    lines += ["", *worker_brief_core(wo_id, wo["title"], project)]
+    lines += ["", *worker_brief_core(wo_id, wo["title"], project,
+                                     transport=wo.get("transport"))]
     return "\n".join(lines)
 
 
-def worker_brief_core(wo_id: str, title: str, project: str) -> list[str]:
+def worker_brief_core(wo_id: str, title: str, project: str,
+                      transport: str | None = None) -> list[str]:
     from .worker_brief import core_contract
-    return core_contract(wo_id, title, project, has_knowledge=True)
+    # The worker's own env is the declaration when the row predates the column
+    return core_contract(
+        wo_id, title, project, has_knowledge=True,
+        transport=transport or os.environ.get(TURN_TRANSPORT_ENV) or TRANSPORT_HEADLESS,
+        require_crew=os.environ.get(REQUIRE_CREW_ENV) == "1")
 
 
 def resume_after_compaction(env: dict[str, str], root: Path, store: ProjectStore,
@@ -2162,6 +2171,66 @@ def _post_tool_compaction(env: dict[str, str], cwd: Path) -> dict[str, Any] | No
         return None
     finally:
         store.close()
+
+
+#: Queued rows that are a whole TURN's prompt, not words for a worker mid-turn: the daemon sends them
+NOT_MID_TURN_SOURCES = frozenset({"relaunch", "background-orphan"})
+
+MID_TURN_HEADER = (
+    "MESSAGE FOR YOU, delivered mid-turn by Jarvis OS (it would otherwise have waited for "
+    "your turn to end). Read it now and adjust what you are doing; where it conflicts "
+    "with your plan, it wins. Do not stop to acknowledge it, act on it.")
+
+
+def _post_tool_delivery(payload: dict[str, Any], env: dict[str, str],
+                        cwd: Path) -> dict[str, Any] | None:
+    """Hot path: one `stat` unless a message waits (docs/superpowers/specs/2026-10-22-messages-delivered-mid-turn.md)"""
+    if payload.get("agent_type"):
+        return None  # a subagent's context is not the lead's; the lead's next call takes it
+    ctx = _worker_context(env, cwd)
+    if ctx is None:
+        return None
+    root, wo_id = ctx
+    flag = inbox_flag(root, wo_id)
+    if not flag.exists():
+        return None
+    store = ProjectStore(root)
+    try:
+        return deliver_mid_turn(store, wo_id, str(payload.get("session_id") or ""),
+                                flag=flag)
+    except KeyError:
+        return None
+    finally:
+        store.close()
+
+
+def deliver_mid_turn(store: ProjectStore, wo_id: str, session_id: str,
+                     flag: Path | None = None) -> dict[str, Any] | None:
+    """PostToolUse: hand the running lead every message queued for it, as context"""
+    from .ops import stamp_objection_delivery
+
+    wo = store.get_work_order(wo_id)
+    turn = store.latest_turn(wo_id)
+    if (wo["status"] != "running" or turn is None or turn["state"] != "running"
+            or turn["kind"] == "compact"
+            or (session_id and wo.get("session_id") and session_id != wo["session_id"])):
+        return None  # the flag stays: the daemon's delivery is the one that spends these
+    # Spent BEFORE reading: a message queued after this point re-arms it
+    if flag is not None:
+        flag.unlink(missing_ok=True)
+    claimed = [m for m in store.deliverable_messages(wo_id)
+               if m.get("source") not in NOT_MID_TURN_SOURCES
+               and store.claim_message(int(m["id"]))]
+    if not claimed:
+        return None
+    ids = [int(m["id"]) for m in claimed]
+    for msg_id in ids:
+        stamp_objection_delivery(store, msg_id)
+    store.add_event(wo_id, "message_delivered",
+                    {"msg_ids": ids, "turn": turn["seq"], "mid_turn": True})
+    text = "\n\n".join(m["content"] for m in claimed)
+    return {"hookSpecificOutput": {"hookEventName": "PostToolUse",
+                                   "additionalContext": f"{MID_TURN_HEADER}\n\n{text}"}}
 
 
 def find_project_root(cwd: Path) -> Path | None:
@@ -2306,7 +2375,8 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
     if event == "PostToolUse":
         # The memory mirror is a side effect and runs either way
         captured = capture_memory_write(payload, env)
-        return _post_tool_compaction(env, cwd) or captured
+        return (_post_tool_compaction(env, cwd) or _post_tool_delivery(payload, env, cwd)
+                or captured)
 
     if event == "PreCompact":
         return _pre_compact(payload, env, cwd)

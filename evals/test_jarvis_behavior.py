@@ -31,7 +31,8 @@ def make_two_projects(jarvis_home, fake_claude, tmp_path, claude_json):
     claude_json(pa), claude_json(pb)
     catalog = tmp_path / "catalog.json"
     catalog.write_text(json.dumps({
-        "os": {"defaults": {"model": "sonnet"}},
+        # These scenarios read the one-shot argv; the background transport is tests/test_bg_transport.py
+        "os": {"defaults": {"model": "sonnet", "transport": "headless"}},
         "projects": [
             {"name": "proj_a", "path": str(pa)},
             {"name": "proj_b", "path": str(pb), "max_concurrent": 1,

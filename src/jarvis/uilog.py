@@ -239,17 +239,43 @@ def _resume_at(cursor: str, st: os.stat_result, head: bytes) -> int:
     return offset
 
 
-def recent_errors(within_seconds: float = ERROR_WINDOW_SECONDS,
-                  limit: int = 5) -> tuple[list[UiError], int]:
-    """The `limit` newest errors inside the window, and how many the window holds"""
-    p = ui_log_path()
+_ACCESS = re.compile(
+    r"^(?P<when>\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) \[(?P<status>\d{3})\] "
+    r"(?P<method>\S+) (?P<path>\S+) \d+ms$"
+)
+
+
+def _tail(p: Path) -> str:
     if not p.exists():
-        return [], 0
+        return ""
     with p.open("rb") as f:
         size = f.seek(0, 2)
         f.seek(max(0, size - TAIL_BYTES))
-        raw = f.read()
+        return f.read().decode("utf-8", errors="replace")
+
+
+def _last_success() -> dict[tuple[str, str], float]:
+    """Newest non-error response per (method, path) in the access log's tail"""
+    last: dict[tuple[str, str], float] = {}
+    for line in _tail(access_log_path()).splitlines():
+        m = _ACCESS.match(line)
+        if not m or int(m["status"]) >= 400:
+            continue
+        try:
+            ts = time.mktime(time.strptime(m["when"], _STAMP))
+        except ValueError:
+            continue
+        key = (m["method"], m["path"].split("?", 1)[0])
+        last[key] = max(ts, last.get(key, 0.0))
+    return last
+
+
+def recent_errors(within_seconds: float = ERROR_WINDOW_SECONDS,
+                  limit: int = 5) -> tuple[list[UiError], int]:
+    """The `limit` newest errors inside the window, and how many the window holds"""
     cutoff = db.now() - within_seconds
-    found = [e for e in _parse(raw.decode("utf-8", errors="replace"))
-             if e.ts >= cutoff]
+    found = [e for e in _parse(_tail(ui_log_path())) if e.ts >= cutoff]
+    # An error whose route has since served a success is fixed, not standing
+    healed = _last_success() if found else {}
+    found = [e for e in found if healed.get((e.method, e.path), 0.0) <= e.ts]
     return found[-limit:][::-1], len(found)

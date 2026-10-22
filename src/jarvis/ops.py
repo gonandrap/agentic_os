@@ -62,6 +62,7 @@ from .daemon import (
 from .github import GitHubError
 from .invariants import PR_CLOSED_BLOCKER, UNLANDED_BLOCKER, true_blockers
 from .paths import daemon_pidfile, ensure_home, logs_dir
+from .worker_brief import MODEL_ATTRIBUTION_NAMES
 # `ops.IDLE_MANAGER_CAUSE` is an ALIAS: `stuck.IDLE_MANAGER_CAUSE` is the one definition of the cause... (#1008)
 from .stuck import IDLE_MANAGER_CAUSE  # noqa: F401
 from .project_store import (
@@ -374,6 +375,14 @@ def orphaned_worker_sessions() -> list[dict[str, Any]]:
     named = [s for s in sessions if s.name.startswith("[WO ")]
     if not named:
         return []
+    # A STOPPED worker session holds nothing: every closed background-transport order leaves one (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)
+    try:
+        roster = claude_cli.bg_roster()
+    except claude_cli.ClaudeCliError:
+        roster = {}
+    named = [s for s in named
+             if not (s.session_id in roster and not roster[s.session_id].alive
+                     and roster[s.session_id].state in claude_cli.FINISHED_STATES)]
 
     live_sessions: set[str] = set()
     for name, path in registered_project_paths().items():  # noqa: B007
@@ -761,6 +770,35 @@ def registered_project_paths() -> dict[str, Path]:
         central.close()
 
 
+MODEL_ALIASES = ("opus", "sonnet", "haiku", "fable")
+_MODEL_ID_RE = re.compile(r"(?:opus|sonnet|haiku|fable"
+                          r"|claude-(?:opus|sonnet|haiku|fable)-\d+(?:-\d+)*(?:-\d{8})?)"
+                          r"(?:\[1m\])?")
+
+
+def suggested_model_ids() -> list[str]:
+    """What the create forms offer: the aliases, then every id the OS knows by name"""
+    return [*MODEL_ALIASES, *MODEL_ATTRIBUTION_NAMES]
+
+
+def _model_shaped(model: str) -> bool:
+    return bool(_MODEL_ID_RE.fullmatch(model)) or model in MODEL_ATTRIBUTION_NAMES
+
+
+def check_model_id(model: str | None) -> None:
+    """Refuse a model id claude would reject, before anything is filed or relaunched"""
+    import difflib
+
+    if not model or _model_shaped(model):
+        return
+    dashed = model.replace(".", "-")
+    hint = ([dashed] if _model_shaped(dashed)
+            else difflib.get_close_matches(model, suggested_model_ids(), n=1))
+    raise OpsError(f"unknown model id {model!r}"
+                   + (f" — did you mean {hint[0]!r}?" if hint
+                      else f" — use one of {', '.join(MODEL_ALIASES)} or a full claude-… id"))
+
+
 def create_work_order(project_name: str, title: str, description: str = "",
                       origin: str = "jarvis", model: str | None = None,
                       effort: str | None = None, permission_mode: str | None = None,
@@ -781,6 +819,7 @@ def create_work_order(project_name: str, title: str, description: str = "",
     """File a work order (docs/superpowers/specs/2026-09-27-self-evolution.md)"""
     from . import preconditions
 
+    check_model_id(model)
     paths = registered_project_paths()
     if project_name not in paths:
         raise OpsError(f"project {project_name!r} not registered "
@@ -1069,7 +1108,8 @@ def send_message(wo_id: str, content: str, source: str = "jarvis",
     finally:
         store.close()
     return {"project": name, "wo_id": wo_id, "msg_id": msg_id, "note": note,
-            "delivery": "jarvisd delivers when the worker is idle"}
+            "delivery": ("delivered at the worker's next tool call if it is mid-turn, "
+                         "otherwise as its next turn")}
 
 
 #: What a message-less `jarvis wo retry` puts on the queue. §3 of... (docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md)
@@ -1162,8 +1202,9 @@ def harvest_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | N
 
 
 def retry(wo_id: str, message: str | None = None, project_name: str | None = None,
-          relay: bool = False) -> dict[str, Any]:
+          relay: bool = False, model: str | None = None) -> dict[str, Any]:
     """`jarvis wo retry` — relaunch a `failed` work order in its own session (docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md)"""
+    check_model_id(model)
     name, path, wo = find_work_order(wo_id, project_name)
     refusal = retry_refusal(wo)
     if refusal is not None:
@@ -1171,6 +1212,9 @@ def retry(wo_id: str, message: str | None = None, project_name: str | None = Non
     # §6 of docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md: what the OS read off disk beats...
     brief_store = ProjectStore(path)
     try:
+        if model:
+            # Before the send: the relaunch reads `model` off the row
+            brief_store.update_work_order(wo_id, model=model)
         text = (message if message is not None
                 else (harvest.retry_brief(brief_store, wo) or RETRY_NOTE))
     finally:
@@ -3423,6 +3467,29 @@ def objection_response(store: ProjectStore, a: dict[str, Any], *,
 OBJECTION_QUOTE_MIN_CHARS = 40
 
 
+def stamp_objection_delivery(store: ProjectStore, msg_id: int) -> None:
+    """An objection that actually went out is DELIVERED, stamped here and nowhere"""
+    envelope = store.envelope_for_message(int(msg_id))
+    if envelope is None:
+        _stamp_late_objection_delivery(store, msg_id)
+        return
+    if envelope["kind"] != "assumption_objection":
+        return
+    a = store.assumption_for_envelope(int(envelope["id"]))
+    if a is not None and a.get("objection_delivered_ts") is None:
+        store.mark_objection_delivered(int(a["id"]))
+
+
+def _stamp_late_objection_delivery(store: ProjectStore, msg_id: int) -> None:
+    """An ordinary message that QUOTES an undelivered objection delivered it, late (io-ce566253)"""
+    msg = store.get_message(int(msg_id))
+    if not msg or msg.get("direction") != "user_to_agent":
+        return
+    for a in store.undelivered_objections(str(msg["wo_id"])):
+        if objection_quoted_in(str(msg.get("content") or ""), a):
+            store.mark_objection_delivered(int(a["id"]), late_msg_id=int(msg_id))
+
+
 def objection_quoted_in(content: str, a: dict[str, Any]) -> bool:
     """Does `content` carry this objection — half its reason verbatim, case and spacing aside?"""
     import difflib
@@ -5605,6 +5672,30 @@ def stop_worker_session(wo: dict[str, Any], store: ProjectStore) -> dict[str, An
     return {"stopped": False, "bg_id": bg_id, "reason": "`claude stop` failed"}
 
 
+def respawn_worker(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
+    """Restart an order's background session process under the same id, sending nothing (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)"""
+    from . import claude_cli, worker_session
+
+    _name, path, wo = find_work_order(wo_id, project_name)
+    if not worker_session.is_background(wo) or not wo.get("bg_id"):
+        raise OpsError(f"{wo_id} does not run on a background session — nothing to respawn")
+    store = ProjectStore(path)
+    try:
+        if worker_session.busy(store, wo_id):
+            # A restart under a running turn would end it wherever it had got to
+            raise OpsError(f"{wo_id} has a turn in flight; respawn it once that settles")
+        ok = claude_cli.respawn_bg(str(wo["bg_id"]))
+        if ok:
+            store.add_event(wo_id, "session_respawned", {"bg_id": wo["bg_id"],
+                                                         "session_id": wo["session_id"]})
+    finally:
+        store.close()
+    if not ok:
+        raise OpsError(f"`claude respawn {wo['bg_id']}` failed")
+    return {"wo_id": wo_id, "bg_id": wo["bg_id"], "session_id": wo["session_id"],
+            "respawned": True}
+
+
 def cancel(wo_id: str) -> dict[str, Any]:
     name, path, wo = find_work_order(wo_id)
     store = ProjectStore(path)
@@ -5818,6 +5909,11 @@ def delete_work_order(wo_id: str, project_name: str | None = None) -> dict[str, 
         deleted = store.delete_work_order(wo_id)
     finally:
         store.close()
+    if wo.get("transport") == "background" and wo.get("bg_id"):
+        # The order's ONE session goes with it (`claude rm` keeps a worktree holding unpushed work)
+        from . import claude_cli
+        deleted["background_session"] = int(
+            claude_cli.remove_bg(str(wo["bg_id"])) is not None)
     central = CentralStore()
     try:
         deleted.update(central.purge_work_order(wo_id))

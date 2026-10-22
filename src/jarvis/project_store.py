@@ -35,6 +35,11 @@ OPEN_STATUSES = ("pending", "dispatching", "running", "idle", "waiting_input",
 # Settled: nothing more will happen to these on their own
 TERMINAL_STATUSES = ("completed", "cancelled", "failed")
 
+
+def inbox_flag(project_path: Path, wo_id: str) -> Path:
+    """Exists while a message MAY wait for this order (docs/superpowers/specs/2026-10-22-messages-delivered-mid-turn.md)"""
+    return Path(project_path) / ".jarvis" / "inbox" / f"{wo_id}.pending"
+
 #: Why an objection was taken back — ONE STRING PER OUTCOME, and these are the two (docs/superpowers/specs/2026-10-20-an-objection-is-withdrawn-before-the-order-stops.md)
 OBJECTION_WITHDRAWN_REASON = "the order stopped before it could be delivered"
 OBJECTION_HANDED_BACK_REASON = "the order delivered its result and the decision is yours"
@@ -976,6 +981,8 @@ ADDED_COLUMNS = {
         "paired_reason": "TEXT",
     },
     "work_orders": {
+        # The turn transport this order's session was born on, fixed at its first launch (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)
+        "transport": "TEXT",
         # How many times launching this order's first turn has failed on the transport (docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §5.)
         "dispatch_attempts": "INTEGER NOT NULL DEFAULT 0",
         "retry_after": "REAL",
@@ -2870,7 +2877,21 @@ class ProjectStore:
             "authored_by) VALUES (?,?,?,?,?,?,?)",
             (wo_id, db.now(), direction, content, source, status, authored_by),
         )
+        if direction == "user_to_agent" and status == "queued":
+            flag = inbox_flag(self.project_path, wo_id)
+            try:
+                flag.parent.mkdir(parents=True, exist_ok=True)
+                flag.touch()
+            except OSError:
+                pass  # the flag only speeds the mid-turn path; the daemon delivers regardless
         return int(cur.lastrowid)
+
+    def claim_message(self, msg_id: int) -> bool:
+        """Mark one QUEUED message delivered; False when someone else already took it"""
+        cur = self.conn.execute(
+            "UPDATE wo_messages SET status='delivered', delivered_at=? "
+            "WHERE id=? AND status='queued'", (db.now(), msg_id))
+        return cur.rowcount == 1
 
     def record_agent_reply(self, wo_id: str, content: str, source: str = "worker") -> int:
         """Persist a worker's final assistant message into the work order record"""
@@ -3168,6 +3189,19 @@ class ProjectStore:
             "SELECT * FROM wo_turns WHERE state='running' ORDER BY started_at"
         ).fetchall()
         return db.rows_to_dicts(rows)
+
+    def closed_background_sessions(self) -> list[dict[str, Any]]:
+        """Completed or cancelled orders whose background session has not been removed yet"""
+        rows = self.conn.execute(
+            "SELECT * FROM work_orders WHERE transport='background' AND bg_id IS NOT NULL "
+            "AND status IN ('completed','cancelled') AND id NOT IN "
+            "(SELECT wo_id FROM wo_turns WHERE state='running')"
+        ).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def forget_background_session(self, wo_id: str) -> None:
+        """The order's session was removed; `updated_at` stays, a closed order has not moved"""
+        self.conn.execute("UPDATE work_orders SET bg_id=NULL WHERE id=?", (wo_id,))
 
     def count_running_turns(self) -> int:
         """How many of this project's turns are in flight — see src/jarvis/fleet.py"""

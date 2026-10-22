@@ -595,10 +595,23 @@ def test_the_guard_rail_on_the_floor_is_itself_configurable():
         parse_catalog({"os": {"cold_prefix_floor_max": 0}, "projects": []})
 
 
-def test_worker_require_crew_defaults_true():
-    """§7 of docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md: the crew is the default"""
+def test_worker_require_crew_defaults_false():
+    """docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md: the lead does the work"""
     cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
-    assert cat.projects[0].worker.require_crew is True
+    assert cat.projects[0].worker.require_crew is False
+
+
+def test_worker_transport_defaults_and_validates():
+    cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
+    assert cat.projects[0].worker.transport == "background"
+    cat = parse_catalog({"os": {"defaults": {"transport": "headless"}},
+                         "projects": [{"name": "a", "path": "/tmp/a"},
+                                      {"name": "b", "path": "/tmp/b",
+                                       "worker": {"transport": "background"}}]})
+    assert [p.worker.transport for p in cat.projects] == ["headless", "background"]
+    with pytest.raises(CatalogError, match="worker.transport"):
+        parse_catalog({"projects": [{"name": "a", "path": "/tmp/a",
+                                     "worker": {"transport": "bg"}}]})
 
 
 def test_worker_require_crew_parsed():

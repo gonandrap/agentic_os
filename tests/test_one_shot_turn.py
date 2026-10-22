@@ -29,7 +29,8 @@ def _worker_prompt(path) -> str:
         wo = store.create_work_order("ship the thing")
     finally:
         store.close()
-    return build_worker_prompt(wo, spec(path))
+    # The one-shot rule is the HEADLESS transport's; background orders get tests/test_bg_transport.py
+    return build_worker_prompt({**wo, "transport": "headless"}, spec(path))
 
 
 # -- 1. the contract
@@ -60,7 +61,8 @@ def test_the_record_section_says_what_to_do_instead(project):
     """A prohibition with no alternative is advice a worker cannot follow"""
     from jarvis import worker_brief
 
-    section = worker_brief.render_section("record", wo_id="wo-abc123", project="p1")
+    section = worker_brief.render_section("record", wo_id="wo-abc123", project="p1",
+                                          transport="headless")
 
     assert "one-shot" in section
     assert "claude -p" in section
@@ -131,7 +133,8 @@ def test_the_ab_markers_still_match_the_shipped_prose(project):
     from jarvis import worker_brief
 
     prompt = _worker_prompt(project)
-    record = worker_brief.render_section("record", wo_id="wo-abc123", project="p1")
+    record = worker_brief.render_section("record", wo_id="wo-abc123", project="p1",
+                                         transport="headless")
 
     assert any(ln.startswith(mod.CORE_BULLET_MARKER) for ln in prompt.split("\n")), (
         "the eval's core marker no longer matches a line of the shipped prompt")

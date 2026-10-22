@@ -151,6 +151,21 @@ def test_errors_age_out_of_the_reporting_window(jarvis_home):
     assert uilog.recent_errors(within_seconds=-1) == ([], 0)
 
 
+def test_an_error_clears_once_its_route_serves_a_success_again(jarvis_home):
+    """wo-c93acc14: a fixed 'disk is full' kept NEEDS YOU lit for the whole 24h window"""
+    uilog.ui_log_path().parent.mkdir(parents=True, exist_ok=True)
+    _write_entry(_stamp(120), "/")
+    _write_entry(_stamp(120), "/wo/p/wo-1")
+    with uilog.access_log_path().open("a") as f:
+        f.write(f"{_stamp(180)} [200] GET /wo/p/wo-1 5ms\n")  # before the error: not a recovery
+        f.write(f"{_stamp(60)} [500] GET /wo/p/wo-1 5ms\n")
+        f.write(f"{_stamp(60)} [200] GET /?tab=x 5ms\n")
+
+    recent, total = uilog.recent_errors()
+    assert total == 1
+    assert [e.path for e in recent] == ["/wo/p/wo-1"]
+
+
 def test_access_lines_record_path_query_and_status(jarvis_home):
     uilog.record_access("GET", "/wo/proj_a/wo-1?error=nope", 404, 12.4)
     line = uilog.access_log_path().read_text()

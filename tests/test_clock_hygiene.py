@@ -26,6 +26,7 @@ _KERNEL = (
 )
 
 ALLOWED: dict[str, str] = {
+    "tests/test_bg_transport.py": _SPIN,
     "tests/test_budget.py": _SPIN,
     "tests/test_feature_validation.py": _BOTH,
     "tests/test_usage_window_is_account_wide.py": _SPIN,
