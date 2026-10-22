@@ -2088,8 +2088,7 @@ def jarvis_home(tmp_path, monkeypatch):
     monkeypatch.setenv("JARVIS_HOME", str(home))
     if not _bills_real_tokens():
         monkeypatch.setenv(agent_usage.SPEND_HOME_ENV, str(home))
-        # A suite run INSIDE a worker session inherits its `JARVIS_WO_ID`, and the OS
-        # reads that to tell self-work from the user's own (`ops._gate_improvement_order`)
+        # A suite run INSIDE a worker session inherits its `JARVIS_WO_ID`
         monkeypatch.delenv("JARVIS_WO_ID", raising=False)
     # CLAUDE CODE'S TRANSCRIPTS FOLLOW THE HOME, for the same reason and one of their own
     transcripts = tmp_path / "claude-projects"
