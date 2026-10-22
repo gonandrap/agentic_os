@@ -51,6 +51,13 @@ session. On Claude Code 2.1.308 it no longer has to. Measured live (haiku spike,
 | 11 | `claude respawn <id>` restarts the process under the SAME id (crashed or live), sends no prompt |
 | 12 | `--bg --worktree <name>` creates and runs in the worktree; trust is per exact path and a project path is trusted by `bootstrap.ensure_trust` |
 | 13 | `--max-budget-usd` is `--print`-only |
+| 14 | `claude rm <id>` deletes the session but keeps its transcript: a bare `--bg --resume <sid>` afterwards brings back THE SAME id, conversation intact |
+
+Re-measure before trusting this on a newer CLI. The script is hand-run against the real
+`claude` (it cannot run under pytest, whose conftest stubs the binary), in a trusted
+directory, because `--bg` refuses an untrusted workspace and trust is per exact path:
+
+    SPIKE_CWD=<a trusted directory> uv run python scripts/spike_bg_transport.py
 
 So a worker conversation is ONE background session for its whole life:
 
@@ -97,10 +104,18 @@ the OS sent, until the worker settles". Only two seams change:
   sending it anything. Refused while a turn is in flight.
 * **Settled means stopped** — once a turn settles, the idle session is `claude stop`ped:
   its process holds nothing, the conversation is kept, and the next prompt would stop it
-  anyway. One stopped `[WO …]` entry per order stays in `claude agents`;
+  anyway. One stopped `[WO …]` entry per open order stays in `claude agents`;
   `ops.orphaned_worker_sessions` (doctor) now reports only `[WO …]` sessions that still
-  hold a process. `jarvis wo delete` runs `claude rm` (which keeps a worktree holding
-  unpushed work).
+  hold a process.
+* **Closed means removed** — every poll `claude rm`s the session of a `completed` or
+  `cancelled` order once its turn has settled (`worker_session.remove_closed_sessions`),
+  clears `bg_id` and writes `background_session_removed`. `failed` keeps its session for
+  `wo retry`. `claude rm` keeps a worktree holding unpushed commits or uncommitted changes,
+  and keeps the transcript: measured on 2.1.308, a bare `--resume` of a removed id brings
+  the SAME session back, so a revived order (`revive_feature_manager`) resumes it and
+  `bg_id` is restored. `jarvis wo delete` runs `claude rm` too.
+* **Prompts over 1 KB go by file** (`BG_PROMPT_ARGV_LIMIT`): `--bg` reads no stdin, so the
+  prompt is written next to the turn and the worker is told to read it.
 
 ### What goes
 

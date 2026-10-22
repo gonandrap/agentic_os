@@ -5853,7 +5853,8 @@ def delete_work_order(wo_id: str, project_name: str | None = None) -> dict[str, 
     if wo.get("transport") == "background" and wo.get("bg_id"):
         # The order's ONE session goes with it (`claude rm` keeps a worktree holding unpushed work)
         from . import claude_cli
-        deleted["background_session"] = int(claude_cli.remove_bg(str(wo["bg_id"])))
+        deleted["background_session"] = int(
+            claude_cli.remove_bg(str(wo["bg_id"])) is not None)
     central = CentralStore()
     try:
         deleted.update(central.purge_work_order(wo_id))

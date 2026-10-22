@@ -65,7 +65,7 @@ the idle session after settling. A synthetic assistant message is the error text
 pause machinery reads; a dead session with no Stop since the prompt is
 `claude_cli.SESSION_LOST` → transient pause. `--max-budget-usd` is print-only, so poll
 enforces the cap (`_bg_over_budget`, every `BG_BUDGET_EVERY`). `jarvis wo respawn` =
-`claude respawn` (same id, sends nothing); `wo delete` = `claude rm`. The one-shot hooks
+`claude respawn` (same id, sends nothing); `wo delete` = `claude rm`, and every poll `claude rm`s the session of a completed/cancelled order (`remove_closed_sessions`; a removed id still resumes as the same session). Prompts over 1 KB go by file. The one-shot hooks
 (background refusal, long-foreground refusal, Stop uncollected-task block) key on
 `JARVIS_TURN_TRANSPORT=headless` and are silent here. Tests: `tests/test_bg_transport.py`
 (the shared `catalog_file` fixture PINS headless; the fake models `--bg` only for `-n`,

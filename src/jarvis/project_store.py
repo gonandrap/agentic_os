@@ -3171,6 +3171,19 @@ class ProjectStore:
         ).fetchall()
         return db.rows_to_dicts(rows)
 
+    def closed_background_sessions(self) -> list[dict[str, Any]]:
+        """Completed or cancelled orders whose background session has not been removed yet"""
+        rows = self.conn.execute(
+            "SELECT * FROM work_orders WHERE transport='background' AND bg_id IS NOT NULL "
+            "AND status IN ('completed','cancelled') AND id NOT IN "
+            "(SELECT wo_id FROM wo_turns WHERE state='running')"
+        ).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def forget_background_session(self, wo_id: str) -> None:
+        """The order's session was removed; `updated_at` stays, a closed order has not moved"""
+        self.conn.execute("UPDATE work_orders SET bg_id=NULL WHERE id=?", (wo_id,))
+
     def count_running_turns(self) -> int:
         """How many of this project's turns are in flight — see src/jarvis/fleet.py"""
         return int(self.conn.execute(

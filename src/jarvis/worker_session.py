@@ -546,7 +546,12 @@ def _launch_bg(store: ProjectStore, wo: dict[str, Any], prompt: str, cwd: Path,
     """One prompt into the order's background session — the first opens it (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)"""
     if resume:
         # The briefing rides on the session's saved options and the settings file `briefing_for` rewrote
-        claude_cli.resume_bg_turn(wo["session_id"], prompt, cwd, promptfile=promptfile)
+        entry = claude_cli.resume_bg_turn(wo["session_id"], prompt, cwd,
+                                          promptfile=promptfile)
+        if wo.get("bg_id") != entry.id:
+            # A revived order: its session was removed when it closed, and the resume restored it
+            store.update_work_order(wo["id"], bg_id=entry.id)
+            wo = {**wo, "bg_id": entry.id}
         return wo
     if wo.get("bg_id"):
         # A session that never wrote a word: retire it rather than leave two
@@ -622,7 +627,39 @@ def poll(store: ProjectStore, project_name: str = "") -> list[dict[str, Any]]:
         if _unit_still_running(turn):
             continue
         settled.append(_reap(store, turn, project_name))
+    remove_closed_sessions(store)
     return settled
+
+
+def remove_closed_sessions(store: ProjectStore) -> list[str]:
+    """`claude rm` the session of every completed or cancelled order, once (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)"""
+    removed: list[str] = []
+    closed = store.closed_background_sessions()
+    if not closed:
+        return removed
+    try:
+        roster = {e.id: e for e in claude_cli.bg_roster().values()}
+    except claude_cli.ClaudeCliError as e:
+        log.warning("could not read `claude agents` (%s); closed sessions wait", e)
+        return removed
+    for wo in closed:
+        short = str(wo["bg_id"])
+        entry = roster.get(short)
+        report: str | None = ""
+        if entry is not None:
+            if entry.alive and not claude_cli.stop_bg(short):
+                continue  # the next poll tries again
+            report = claude_cli.remove_bg(short)
+            if report is None:
+                continue
+        # Gone from the roster already counts: someone ran `claude rm` by hand
+        store.forget_background_session(wo["id"])
+        store.add_event(wo["id"], "background_session_removed", {
+            "bg_id": short, "session_id": wo.get("session_id"), "status": wo["status"],
+            "report": (report or "")[:500] or None,
+        })
+        removed.append(wo["id"])
+    return removed
 
 
 def _unit_still_running(turn: dict[str, Any]) -> bool:

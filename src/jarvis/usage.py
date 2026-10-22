@@ -549,7 +549,7 @@ def cost_between(session_id: str, since: float, until: float,
 def window_envelope(session_id: str, since: float, until: float, *, schema: int,
                     root: Path | None = None,
                     index: dict[str, list[Path]] | None = None) -> dict[str, Any] | None:
-    """A turn's usage envelope rebuilt from the transcript, subagents included, when no result JSON reported it (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)"""
+    """A turn's usage envelope rebuilt from the transcript (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)"""
     if index is None:
         index = index_sessions(root)
     lead: list[Call] = []

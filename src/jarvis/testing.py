@@ -2608,7 +2608,6 @@ def catalog_file(tmp_path, project):
     data = {
         "os": {
             # `max_in_flight` well out of the way: the shipped default (3) is TIGHTER than the project default...
-            # `transport` pinned: the suite asserts headless argv; tests/test_bg_transport.py owns the default
             "defaults": {"model": "sonnet", "max_in_flight": 50,  # permission_mode: auto
                          "transport": "headless"},
             "notifications": {"sinks": ["log"]},

@@ -88,7 +88,7 @@ def test_remove_deletes_the_session(fake_claude, tmp_path):
 
 
 def test_an_oversized_prompt_goes_by_file(fake_claude, tmp_path):
-    big = "x" * (claude_cli.PROMPT_ARGV_LIMIT + 1)
+    big = "x" * (claude_cli.BG_PROMPT_ARGV_LIMIT + 1)
     promptfile = tmp_path / "turn.prompt"
     claude_cli.spawn_bg_turn(big, tmp_path, "n", promptfile=promptfile)
     assert promptfile.read_text() == big
@@ -330,6 +330,97 @@ def test_deleting_the_order_removes_its_session(bg_fleet, fake_claude, settle_tu
 
     assert out["deleted"]["background_session"] == 1
     assert sid not in claude_cli.bg_roster()
+
+
+def test_a_prompt_at_the_limit_stays_in_argv(fake_claude, tmp_path):
+    fits = "x" * claude_cli.BG_PROMPT_ARGV_LIMIT
+    promptfile = tmp_path / "turn.prompt"
+    claude_cli.spawn_bg_turn(fits, tmp_path, "n", promptfile=promptfile)
+    assert not promptfile.exists()
+    assert fake_claude.wait_calls(lambda c: "--bg" in c["argv"])[0]["argv"][-1] == fits
+
+
+def _settled_bg_wo(bg_fleet, settle_turns):
+    store, project = bg_fleet["store"], bg_fleet["project"]
+    wo = _bg_wo(bg_fleet)
+    worker_session.start(store, project, wo, "go")
+    assert settle_turns(store)
+    return store.get_work_order(wo["id"])
+
+
+@pytest.mark.parametrize("status", ["completed", "cancelled"])
+def test_a_closed_order_loses_its_session_once(bg_fleet, fake_claude, settle_turns,
+                                               status):
+    store = bg_fleet["store"]
+    wo = _settled_bg_wo(bg_fleet, settle_turns)
+    store.set_status(wo["id"], status)
+
+    assert worker_session.poll(store) == []
+
+    assert wo["session_id"] not in claude_cli.bg_roster()
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["bg_id"] is None and fresh["session_id"] == wo["session_id"]
+    [event] = [e for e in store.list_events(wo["id"])
+               if e["kind"] == "background_session_removed"]
+    assert json.loads(event["payload"])["bg_id"] == wo["bg_id"]
+    # Once: nothing left to remove, so the next poll asks the CLI nothing
+    calls = len(fake_claude.calls)
+    worker_session.poll(store)
+    assert len(fake_claude.calls) == calls
+
+
+def test_a_failed_order_keeps_its_session(bg_fleet, fake_claude, settle_turns):
+    """`wo retry` relaunches a failed order in its own session"""
+    store = bg_fleet["store"]
+    wo = _settled_bg_wo(bg_fleet, settle_turns)
+    store.set_status(wo["id"], "failed")
+
+    worker_session.poll(store)
+
+    assert wo["session_id"] in claude_cli.bg_roster()
+    assert store.get_work_order(wo["id"])["bg_id"] == wo["bg_id"]
+
+
+def test_cancelling_a_running_order_removes_its_session(bg_fleet, fake_claude):
+    store, project = bg_fleet["store"], bg_fleet["project"]
+    gate = fake_claude.hold_turns()
+    wo = _bg_wo(bg_fleet)
+    worker_session.start(store, project, wo, "go")
+    sid = store.get_work_order(wo["id"])["session_id"]
+
+    ops.cancel(wo["id"])
+    gate.unlink()
+    worker_session.poll(store)
+
+    assert sid not in claude_cli.bg_roster()
+    assert store.get_work_order(wo["id"])["bg_id"] is None
+
+
+def test_a_session_removed_by_hand_is_forgotten(bg_fleet, fake_claude, settle_turns):
+    store = bg_fleet["store"]
+    wo = _settled_bg_wo(bg_fleet, settle_turns)
+    assert claude_cli.remove_bg(wo["bg_id"]) is not None
+    store.set_status(wo["id"], "completed")
+
+    worker_session.poll(store)
+
+    assert store.get_work_order(wo["id"])["bg_id"] is None
+
+
+def test_a_revived_order_resumes_its_removed_session(bg_fleet, fake_claude, settle_turns):
+    """`claude rm` keeps the transcript: a bare resume brings the SAME id back (measured on 2.1.308)"""
+    store, project = bg_fleet["store"], bg_fleet["project"]
+    wo = _settled_bg_wo(bg_fleet, settle_turns)
+    store.set_status(wo["id"], "completed")
+    worker_session.poll(store)
+    store.set_status(wo["id"], "idle")  # `revive_feature_manager`
+
+    worker_session.send(store, project, store.get_work_order(wo["id"]), "one more")
+    assert settle_turns(store)
+
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["session_id"] == wo["session_id"] and fresh["bg_id"] == wo["bg_id"]
+    assert fake_claude.turns[wo["session_id"]] == ["go", "one more"]
 
 
 def test_a_running_turn_past_its_budget_is_stopped(bg_fleet, fake_claude, monkeypatch):

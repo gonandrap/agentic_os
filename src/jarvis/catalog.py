@@ -72,7 +72,7 @@ DEFAULT_WORKER_TOOL_SEARCH = "on"
 # WHICH PROMPT-CACHE TTL a worker TURN's writes are billed at. §1 of... (docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md)
 VALID_WORKER_CACHE_TTL = ("5m", "1h", "cli")
 DEFAULT_WORKER_CACHE_TTL = "5m"
-#: What a worker turn runs on: one `claude --bg` session for the conversation, or a `claude -p` per turn (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)
+#: What a worker turn runs on: one `claude --bg` session for the conversation (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)
 VALID_WORKER_TRANSPORT = ("background", "headless")
 DEFAULT_WORKER_TRANSPORT = "background"
 
@@ -256,7 +256,7 @@ class WorkerDefaults:
     investigation_budget_usd: float | None = DEFAULT_INVESTIGATION_BUDGET_USD
     investigation_model: str | None = DEFAULT_INVESTIGATION_MODEL
     investigation_effort: str | None = DEFAULT_INVESTIGATION_EFFORT
-    # Whether the lead must delegate file edits to its crew; off since docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md
+    # Whether the lead must delegate file edits to its crew (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)
     require_crew: bool = False
     # What one MCP tool call may take, in milliseconds (#845)
     mcp_tool_timeout_ms: int = DEFAULT_WORKER_MCP_TOOL_TIMEOUT_MS

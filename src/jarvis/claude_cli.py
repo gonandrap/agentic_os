@@ -53,6 +53,9 @@ def cache_env(explicit: dict[str, str] | None = None) -> dict[str, str]:
 #: Above this many BYTES a system prompt goes to the CLI in a file rather than in argv (docs/superpowers/specs/2026-09-13-a-round-the-panel-can-afford.md)
 SYSTEM_PROMPT_ARGV_LIMIT = 64 * 1024
 
+#: Above this many BYTES a background turn's prompt goes by FILE: `--bg` reads no stdin (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)
+BG_PROMPT_ARGV_LIMIT = 1024
+
 #: Above this many BYTES the USER prompt goes to the CLI on STDIN rather than in argv (docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md)
 PROMPT_ARGV_LIMIT = 64 * 1024
 
@@ -425,7 +428,7 @@ def bg_roster(timeout: int = 60) -> dict[str, BgEntry]:
 
 def _bg_prompt(prompt: str, promptfile: Path | None) -> str:
     """The prompt as argv carries it: `--bg` reads no stdin, so an oversized one goes by file"""
-    if len(prompt.encode()) <= PROMPT_ARGV_LIMIT or promptfile is None:
+    if len(prompt.encode()) <= BG_PROMPT_ARGV_LIMIT or promptfile is None:
         return prompt
     promptfile.parent.mkdir(parents=True, exist_ok=True)
     promptfile.write_text(prompt, encoding="utf-8")
@@ -523,13 +526,12 @@ def respawn_bg(short: str) -> bool:
         return False
 
 
-def remove_bg(short: str) -> bool:
-    """`claude rm`: the session, and its worktree when that is safe"""
+def remove_bg(short: str) -> str | None:
+    """`claude rm`: the session, and its worktree when that is safe; its report, or None on failure"""
     try:
-        _run(["rm", short], timeout=60)
-        return True
+        return (_run(["rm", short], timeout=60) or "").strip()
     except ClaudeCliError:
-        return False
+        return None
 
 
 # -- worker turns (the transport every worker conversation runs on)

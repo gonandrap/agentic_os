@@ -1,14 +1,4 @@
-"""Re-measure the facts the background worker transport stands on (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)
-
-Hand-run against the REAL `claude` (cheap: haiku, one-word prompts). It cannot run under
-pytest — the root conftest points `JARVIS_CLAUDE_BIN` at a stub. A measurement of an
-external tool expires when that tool ships a version, so run it before trusting the spec
-on a newer CLI.
-
-    SPIKE_CWD=<a trusted directory> uv run python scripts/spike_bg_transport.py
-
-`--bg` refuses an untrusted workspace, and trust is per exact path.
-"""
+"""Re-measure the facts the background worker transport stands on (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)"""
 
 from __future__ import annotations
 
@@ -107,7 +97,13 @@ def main() -> None:
     back = wait(short, lambda e: e.get("status") == "idle")
     check("11 respawn keeps the id", back.get("sessionId") == sid)
 
-    claude("stop", short)
+    stop(short)
+    claude("rm", short)
+    after = claude("--bg", "--resume", sid, "--", "Reply with exactly: BACK. No tools.")
+    check("14 a removed session resumes under the same id", short_of(after.stdout) == short,
+          after.stdout + after.stderr)
+    wait(short, lambda e: e.get("status") == "idle")
+    stop(short)
     claude("rm", short)
     print("all facts hold on", claude("--version").stdout.strip())
 
