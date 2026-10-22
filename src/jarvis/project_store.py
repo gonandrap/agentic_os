@@ -976,6 +976,8 @@ ADDED_COLUMNS = {
         "paired_reason": "TEXT",
     },
     "work_orders": {
+        # The turn transport this order's session was born on, fixed at its first launch (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)
+        "transport": "TEXT",
         # How many times launching this order's first turn has failed on the transport (docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §5.)
         "dispatch_attempts": "INTEGER NOT NULL DEFAULT 0",
         "retry_after": "REAL",
@@ -3168,6 +3170,19 @@ class ProjectStore:
             "SELECT * FROM wo_turns WHERE state='running' ORDER BY started_at"
         ).fetchall()
         return db.rows_to_dicts(rows)
+
+    def closed_background_sessions(self) -> list[dict[str, Any]]:
+        """Completed or cancelled orders whose background session has not been removed yet"""
+        rows = self.conn.execute(
+            "SELECT * FROM work_orders WHERE transport='background' AND bg_id IS NOT NULL "
+            "AND status IN ('completed','cancelled') AND id NOT IN "
+            "(SELECT wo_id FROM wo_turns WHERE state='running')"
+        ).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def forget_background_session(self, wo_id: str) -> None:
+        """The order's session was removed; `updated_at` stays, a closed order has not moved"""
+        self.conn.execute("UPDATE work_orders SET bg_id=NULL WHERE id=?", (wo_id,))
 
     def count_running_turns(self) -> int:
         """How many of this project's turns are in flight — see src/jarvis/fleet.py"""

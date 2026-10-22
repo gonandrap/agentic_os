@@ -81,7 +81,7 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
     """Merge the project's injected settings with per-work-order env and persist them for --settings"""
     import json as _json
 
-    from . import agent_usage, concision, hooks, wiring
+    from . import agent_usage, concision, hooks, wiring, worker_session
     from .bootstrap import build_settings, deep_merge
     from .paths import jarvis_home
 
@@ -162,7 +162,7 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         # WHICH PROMPT-CACHE TTL THIS WORKER'S WRITES ARE BILLED AT (docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md)
         **cache_ttl_env(project.worker.cache_ttl),
         # WHAT A TURN IS, for every hook that would otherwise assume it
-        claude_cli.TURN_TRANSPORT_ENV: claude_cli.TRANSPORT_HEADLESS,
+        claude_cli.TURN_TRANSPORT_ENV: worker_session.transport_of(project, wo),
         # WHAT ONE MCP TOOL CALL MAY TAKE (#845)
         "MCP_TOOL_TIMEOUT": str(project.worker.mcp_tool_timeout_ms),
         # WHETHER `auto` MODE'S BASH-FIRST STEER REACHES THIS WORKER (spec §2, same file)
@@ -337,7 +337,7 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         return _analyst_prompt(wo, project, knowledge, feature)
     if wo.get("kind") == "investigator":
         return _investigator_prompt(wo, project, knowledge, feature)
-    from . import os_map, wiring, worker_brief
+    from . import os_map, wiring, worker_brief, worker_session
     from .gates import KINDS
 
     live_gates = tuple(k.name for k in KINDS
@@ -371,7 +371,9 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         "",
         *worker_brief.core_contract(wo["id"], wo["title"], project.name,
                                     bool(knowledge), live_gates,
-                                    kind=str(wo.get("kind") or "worker")),
+                                    kind=str(wo.get("kind") or "worker"),
+                                    transport=worker_session.transport_of(project, wo),
+                                    require_crew=project.worker.require_crew),
         "",
         *worker_brief.section_index(wo["id"], gated=bool(project.gates),
                                     serena=wiring.serena_wired(project.wiring)),

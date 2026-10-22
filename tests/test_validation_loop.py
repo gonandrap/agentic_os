@@ -627,8 +627,10 @@ def test_a_prior_blocker_reaches_round_two_and_a_prior_follow_up_reaches_nobody(
     finally:
         store.close()
 
+    # Seats are `-p` calls; a background worker's `--bg`/`agents`/`stop` calls are not
     seat_calls = [c for c in fake_claude.calls[judged_round_one:]
-                  if "# Jarvis validation seat: " in c["argv"][c["argv"].index("-p") + 1]]
+                  if "-p" in c["argv"]
+                  and "# Jarvis validation seat: " in c["argv"][c["argv"].index("-p") + 1]]
     chair = [c for c in seat_calls
              if "# Jarvis validation seat: chair" in c["argv"][c["argv"].index("-p") + 1]]
     assert len(chair) == 1, "no chair call, so the assertions below are about nothing"

@@ -375,8 +375,15 @@ def _worker_env(project, *, wo: dict | None = None, **worker) -> dict:
     return json.loads(out.read_text())["env"]
 
 
-def test_worker_settings_declare_headless_transport(project, jarvis_home) -> None:
+def test_worker_settings_declare_the_order_s_transport(project, jarvis_home) -> None:
+    """The ORDER's transport, which the one-shot hooks key on (spec 2026-10-22)"""
     assert _worker_env(project)[claude_cli.TURN_TRANSPORT_ENV] \
+        == claude_cli.TRANSPORT_BACKGROUND
+    assert _worker_env(project, transport="headless")[claude_cli.TURN_TRANSPORT_ENV] \
+        == claude_cli.TRANSPORT_HEADLESS
+    # An order keeps the transport its session was born on, whatever the catalog says now
+    born = {"id": "wo-tt02", "title": "t", "transport": "headless"}
+    assert _worker_env(project, wo=born)[claude_cli.TURN_TRANSPORT_ENV] \
         == claude_cli.TRANSPORT_HEADLESS
 
 
@@ -407,9 +414,9 @@ def test_background_spawn_declares_background_transport(project, monkeypatch) ->
 
 
 def test_worker_settings_carry_the_require_crew_switch(project, jarvis_home) -> None:
-    """The off switch the default-true refusal is defended by"""
-    assert _worker_env(project)["JARVIS_REQUIRE_CREW"] == "1"
-    assert _worker_env(project, require_crew=False)["JARVIS_REQUIRE_CREW"] == "0"
+    """The switch the crew refusal reads; off by default since spec 2026-10-22"""
+    assert _worker_env(project)["JARVIS_REQUIRE_CREW"] == "0"
+    assert _worker_env(project, require_crew=True)["JARVIS_REQUIRE_CREW"] == "1"
 
 
 def test_worker_settings_carry_the_work_orders_kind(project, jarvis_home) -> None:
