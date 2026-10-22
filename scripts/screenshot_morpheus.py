@@ -29,6 +29,8 @@ def seed() -> None:
         ("jarvis_os", 1131, "[wo-5e6f7a8b] The stuck sweep skips budget-capped orders",
          "jarvis stuck --json | jq -e 'all(.[]; .excluded != null)' && exit 0 || exit 1", 1),
         ("jarvis_os", 1132, "[wo-9c0d1e2f] Release notes list every PR", "", None),
+        ("jarvis_os", 1134, "[wo-7d8e9f0a] The cost page precomputes its two windows",
+         "", None),
         ("jarvis_os", 1133, "Trim comments main gained since the last merge", None, None),
         ("shared_schedule", 88, "[wo-3a4b5c6d] Login keeps the session across restarts",
          "curl -fsS localhost:8000/healthz | grep -q sessions_restored || exit 75", 75),
@@ -49,10 +51,14 @@ def seed() -> None:
     failed = [i for i in central.morpheus_items(("failed",))][0]
     central.claim_morpheus_action(failed["id"], "investigation:fo-81c2d3e4")
     central.set_state(morpheus.RELEASE_KEY, "jarvis-0.9.4")
+    # One queued item mid-backoff, one Morpheus gave up on (#1161)
+    waiting, spent = [i["id"] for i in central.morpheus_items(("queued",))][:2]
     central.set_state(morpheus.SESSION_KEY, json.dumps({
         "session_id": "4f1c9a2e-7b3d-4e8f-9a1b-2c3d4e5f6a7b", "turns": 7, "compactions": 1,
         "context_share": 0.18, "context_peak": 36000, "context_window": 200000,
-        "last_turn_ts": now - 900, "last_turn_kind": "scripts", "compact_due": False}))
+        "last_turn_ts": now - 900, "last_turn_kind": "scripts", "compact_due": False,
+        "offers": {waiting: {"n": 1, "ts": now - 900},
+                   spent: {"n": morpheus.MAX_OFFERS, "ts": now - 3 * 6 * 3600}}}))
     central.close()
 
 
