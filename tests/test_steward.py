@@ -296,6 +296,75 @@ def test_a_dropped_wording_does_not_swallow_a_severer_one(fleet):
     assert (high.outcome, high.rule, high.duplicate_of) == ("dispatch", "urgent", 0)
 
 
+def test_a_severer_wording_re_decides_the_one_decision_at_its_severity(fleet):
+    """Decisions #37-#39 of 2026-10-22: the critical wording was dropped as a duplicate"""
+    make, store = fleet
+    cat = make(mode="enforce")
+    parent = store.create_work_order("medium first, critical after")
+    where = dict(origin_kind="panel", parent_wo_id=parent["id"],
+                 file="src/jarvis/uilog.py")
+    first = steward.gate(cand(severity="medium", subject="an edge case", **where),
+                         catalog=cat, store=store)
+    second = steward.gate(cand(severity="critical", subject="data loss", **where),
+                          catalog=cat, store=store)
+    assert (first.outcome, first.rule, first.allowed) == ("queue", "recurrence", False)
+    assert (second.outcome, second.rule, second.allowed) == ("dispatch", "urgent", True)
+    # ONE decision per defect, now at the max severity
+    assert (second.decision_id, second.duplicate_of) == (first.decision_id, 0)
+    central = CentralStore()
+    try:
+        [row] = central.steward_decisions()
+    finally:
+        central.close()
+    assert (row["severity"], row["outcome"], row["rule"]) == ("critical", "dispatch",
+                                                              "urgent")
+    assert "escalated from `medium`" in row["reason"] and row["applied"] == 1
+
+
+def test_a_lower_wording_after_a_severer_one_stays_a_duplicate(fleet):
+    make, store = fleet
+    cat = make(mode="enforce")
+    parent = store.create_work_order("critical first, medium after")
+    where = dict(origin_kind="panel", parent_wo_id=parent["id"],
+                 file="src/jarvis/uilog.py")
+    first = steward.gate(cand(severity="critical", subject="data loss", **where),
+                         catalog=cat, store=store)
+    second = steward.gate(cand(severity="medium", subject="an edge case", **where),
+                          catalog=cat, store=store)
+    assert (first.outcome, first.rule) == ("dispatch", "urgent")
+    assert (second.outcome, second.rule, second.duplicate_of) == (
+        "drop", "duplicate", first.decision_id)
+
+
+def test_a_severer_wording_of_a_dispatched_defect_tells_that_order(fleet):
+    make, store = fleet
+    cat = make(mode="enforce")
+    parent = store.create_work_order("the order the panel reviewed")
+    where = dict(origin_kind="panel", parent_wo_id=parent["id"],
+                 file="src/jarvis/uilog.py")
+    first = steward.gate(cand(severity="critical", subject="data loss", **where),
+                         catalog=cat, store=store)
+    fix = store.create_work_order("fix the data loss")
+    steward.linked(first, fix["id"])
+    second = steward.gate(cand(severity="blocker", subject="data loss, every run",
+                               **where), catalog=cat, store=store)
+    # No second order for a defect already being worked, and the severity is not lost
+    assert (second.outcome, second.rule, second.allowed) == (
+        "drop", "duplicate-of-dispatched", False)
+    assert second.duplicate_of == first.decision_id
+    central = CentralStore()
+    try:
+        [raised] = [r for r in central.steward_decisions()
+                    if r["id"] == first.decision_id]
+    finally:
+        central.close()
+    assert raised["severity"] == "blocker"
+    [event] = [e for e in store.conn.execute(
+        "SELECT * FROM wo_events WHERE wo_id=? AND kind='steward_severity_raised'",
+        (fix["id"],)).fetchall()]
+    assert json.loads(event["payload"])["severity"] == "blocker"
+
+
 def test_a_candidate_that_names_no_code_is_never_deduped(fleet):
     """A red `main` keeps its own rule — the hourly repeat check, not the dedupe bucket"""
     make, store = fleet
@@ -344,3 +413,27 @@ def test_the_cli_shows_each_decision_with_its_rule(fleet, capsys):
     assert cli.main(["steward", "decisions"]) == 0
     out = capsys.readouterr().out
     assert "[drop/shadow]" in out and "low-severity" in out and "rename it" in out
+
+
+def test_the_cli_says_which_decision_was_escalated_and_which_was_held(fleet, capsys):
+    from jarvis import cli
+
+    make, store = fleet
+    cat = make(mode="enforce")
+    parent = store.create_work_order("medium first, critical after")
+    where = dict(origin_kind="panel", parent_wo_id=parent["id"],
+                 file="src/jarvis/uilog.py")
+    steward.gate(cand(severity="medium", subject="an edge case", **where),
+                 catalog=cat, store=store)
+    first = steward.gate(cand(severity="critical", subject="data loss", **where),
+                         catalog=cat, store=store)
+    fix = store.create_work_order("fix the data loss")
+    steward.linked(first, fix["id"])
+    steward.gate(cand(severity="blocker", subject="data loss, every run", **where),
+                 catalog=cat, store=store)
+    assert cli.main(["steward", "decisions"]) == 0
+    out = capsys.readouterr().out
+    assert "escalated from `medium`" in out
+    assert "duplicate-of-dispatched" in out and "to `blocker`" in out
+    assert cli.main(["steward", "why", fix["id"]]) == 0
+    assert "blocker" in capsys.readouterr().out

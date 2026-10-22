@@ -157,6 +157,16 @@ restates, and in `enforce` the caller may not dispatch it; the panel carries the
 seats' wordings into the brief of what IS filed. A `drop` is never collapsed onto: it
 decided nothing, and a severer wording must still reach the rules below.
 
+A duplicate never LOWERS the severity (decisions #37-#39 of 2026-10-22, Q2133). When the
+restatement's evidence-adjusted severity outranks the decision it duplicates, that one
+decision is re-decided in place at the higher severity — same row, new `outcome`, `rule`
+and `budget_usd`, its `reason` saying what it was escalated from — so a critical wording
+of a queued medium dispatches through the urgent path. The exception is a decision that
+already produced an order (`wo_id`, or `applied`): the defect is being worked, so no
+second order is dispatched. The higher severity is still written to that row, the
+restatement is recorded with `rule='duplicate-of-dispatched'`, and the order it restates
+gets a `steward_severity_raised` event — the worker on it must see that it got worse.
+
 #### Decision 1: per item (technical)
 
 Applied in order. The first matching rule wins.
