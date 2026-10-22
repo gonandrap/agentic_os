@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import time
 
 import pytest
 
@@ -16,27 +15,6 @@ from jarvis.testing import make_git_project, with_origin
 HOUR = 3600.0
 DAY = 24 * HOUR
 JOB = schedule.DOCTOR_JOB.id
-
-
-class _Clock:
-    """A hand-advanced `db.now`"""
-
-    def __init__(self, at: float) -> None:
-        self.at = at
-
-    def __call__(self) -> float:
-        return self.at
-
-    def advance(self, seconds: float) -> float:
-        self.at += seconds
-        return self.at
-
-
-@pytest.fixture()
-def clock(monkeypatch):
-    c = _Clock(time.time())
-    monkeypatch.setattr("jarvis.db.now", c)
-    return c
 
 
 def _enable(catalog_file, **overrides) -> None:
