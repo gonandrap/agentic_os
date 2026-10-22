@@ -1307,8 +1307,13 @@ class ProjectStore:
         self._backfill_abandoned_gates()
         self._backfill_spent_gates()
         self._backfill_pending_at()
-        self._backfill_wo_spans()
-        self._backfill_fo_spans()
+        self._backfill_spans()
+
+    def _backfill_spans(self) -> None:
+        """Both backfills in one write transaction: two openers must not each insert one span (kn-c23b0ce6)"""
+        with db.write_transaction(self.conn):
+            self._backfill_wo_spans()
+            self._backfill_fo_spans()
 
     def _backfill_wo_spans(self) -> None:
         """Rebuild every historical work order's spans from its `kind='status'` events (docs/superpowers/specs/2026-09-27-time-in-each-state.md)"""
@@ -1362,7 +1367,6 @@ class ProjectStore:
                     continue
                 self._record_span(wo["id"], "wo", previous, status, ts=event["ts"])
                 previous = status
-        self.conn.commit()
 
     def _backfill_fo_spans(self) -> None:
         """One APPROXIMATE span per historical feature order: creation to now, as it is"""
@@ -1380,7 +1384,6 @@ class ProjectStore:
                 continue
             self._record_span(fo["id"], "fo", "", str(fo["status"] or "pending"),
                               ts=fo["created_at"], approximate=True)
-        self.conn.commit()
 
     def _backfill_pending_at(self) -> None:
         """Give historical rows the best `pending_at` the record can support"""
