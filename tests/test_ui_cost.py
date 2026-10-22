@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -12,6 +11,7 @@ import pytest
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
+from jarvis import db  # noqa: E402
 from jarvis import ops, usage  # noqa: E402
 from jarvis.project_store import ProjectStore  # noqa: E402
 from jarvis.ui.app import create_app  # noqa: E402
@@ -334,7 +334,7 @@ def test_the_bill_names_every_actor_and_the_tokens_each_spent(client, project,
 def test_the_bill_page_names_the_residue_and_what_it_could_not_measure(
         client, project, transcript):
     """§7 and §9: the residue row, the placeholder sentence"""
-    now = time.time()
+    now = db.now()
     wo = ops.create_work_order("proj_a", "with a placeholder subagent")
     transcript("sess-residue", write_tok=1_000, read=5_000, out=6_000, at=now + 5,
                subagents=[{"write_tok": 1_000, "read": 2_000, "out": 5,

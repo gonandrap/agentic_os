@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import json
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
+from jarvis import db
 from jarvis import background, ops, timeline, usage, worker_session
 from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
@@ -70,7 +70,7 @@ def root(tmp_path, monkeypatch) -> Path:
 
 def test_a_job_the_turn_never_collected_is_orphaned(root):
     """The reproduction case, row for row: launched, id recorded, turn over"""
-    now = time.time()
+    now = db.now()
     _transcript(root, "sess-1", _launch(now))
 
     jobs = background.jobs_left_running("sess-1", since=now - 1, until=now + 60)
@@ -82,7 +82,7 @@ def test_a_job_the_turn_never_collected_is_orphaned(root):
 
 def test_a_notification_that_the_job_ended_clears_it(root):
     """What an INTERACTIVE session gets and a `claude -p` worker never does"""
-    now = time.time()
+    now = db.now()
     _transcript(root, "sess-1", [*_launch(now), _notification(now + 1)])
 
     assert background.jobs_left_running("sess-1", since=now - 1,
@@ -90,7 +90,7 @@ def test_a_notification_that_the_job_ended_clears_it(root):
 
 
 def test_a_notification_that_it_is_still_running_does_not(root):
-    now = time.time()
+    now = db.now()
     _transcript(root, "sess-1",
                 [*_launch(now), _notification(now + 1, status="running")])
 
@@ -100,7 +100,7 @@ def test_a_notification_that_it_is_still_running_does_not(root):
 
 def test_a_worker_cannot_clear_its_own_finding_by_saying_so(root):
     """THE KILL-SWITCH IS NOT WRITABLE BY THE THING IT POLICES"""
-    now = time.time()
+    now = db.now()
     forged = {"type": "assistant", "timestamp": _stamp(now + 1),
               "message": {"role": "assistant", "content": [
                   {"type": "text", "text": _notification(now + 1)["content"]}]}}
@@ -115,7 +115,7 @@ def test_a_worker_cannot_clear_its_own_finding_by_saying_so(root):
 
 def test_the_harness_copy_of_the_notification_still_clears_it(root):
     """The narrowing keeps every shape the harness itself writes: the `queue-operation` above"""
-    now = time.time()
+    now = db.now()
     text = _notification(now + 1)["content"]
     attached = {"type": "user", "timestamp": _stamp(now + 1),
                 "attachment": {"prompt": text}}
@@ -130,7 +130,7 @@ def test_the_harness_copy_of_the_notification_still_clears_it(root):
 
 def test_killing_the_job_is_collecting_it(root):
     """The worker knew the job was there and dealt with it"""
-    now = time.time()
+    now = db.now()
     kill = {"type": "assistant", "timestamp": _stamp(now + 1),
             "message": {"role": "assistant", "content": [
                 {"type": "tool_use", "id": "toolu_k", "name": "KillShell",
@@ -143,7 +143,7 @@ def test_killing_the_job_is_collecting_it(root):
 
 def test_a_poll_reporting_the_job_finished_clears_it(root):
     """`BashOutput` said the job was over before the turn was"""
-    now = time.time()
+    now = db.now()
     poll = [
         {"type": "assistant", "timestamp": _stamp(now + 1),
          "message": {"role": "assistant", "content": [
@@ -161,7 +161,7 @@ def test_a_poll_reporting_the_job_finished_clears_it(root):
 
 
 def test_a_poll_that_finds_it_still_running_does_not_clear_it(root):
-    now = time.time()
+    now = db.now()
     poll = [
         {"type": "assistant", "timestamp": _stamp(now + 1),
          "message": {"role": "assistant", "content": [
@@ -180,7 +180,7 @@ def test_a_poll_that_finds_it_still_running_does_not_clear_it(root):
 
 def test_task_output_poll_collects_a_background_agent(root):
     """§5 of docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md: a backgrounded..."""
-    now = time.time()
+    now = db.now()
     launch = [
         {"type": "assistant", "timestamp": _stamp(now),
          "message": {"role": "assistant", "content": [
@@ -214,7 +214,7 @@ def test_task_output_poll_collects_a_background_agent(root):
 
 def test_launch_without_a_reported_task_id_is_still_tracked(root):
     """A background `Agent` may report its id under another key or none"""
-    now = time.time()
+    now = db.now()
     _transcript(root, "sess-1", [
         {"type": "assistant", "timestamp": _stamp(now),
          "message": {"role": "assistant", "content": [
@@ -247,7 +247,7 @@ def test_resume_note_no_longer_prescribes_the_foreground(fleet):
 
 def test_a_previous_turns_job_belongs_to_that_turn(root):
     """`said_in_session`'s rule one reader along: a session outlives the turn that stalled in it"""
-    now = time.time()
+    now = db.now()
     _transcript(root, "sess-1", _launch(now - 3600))
 
     assert background.jobs_left_running("sess-1", since=now - 1,
@@ -256,7 +256,7 @@ def test_a_previous_turns_job_belongs_to_that_turn(root):
 
 def test_a_foreground_command_is_not_a_job(root):
     """The ordinary case, and the one that must never raise a flag: everything the fleet runs is in the..."""
-    now = time.time()
+    now = db.now()
     _transcript(root, "sess-1", [
         {"type": "assistant", "timestamp": _stamp(now),
          "message": {"role": "assistant", "content": [
@@ -268,7 +268,7 @@ def test_a_foreground_command_is_not_a_job(root):
 
 
 def test_no_transcript_is_not_a_finding(root):
-    assert background.jobs_left_running("nobody", since=0, until=time.time()) == []
+    assert background.jobs_left_running("nobody", since=0, until=db.now()) == []
 
 
 # -- 2. the detector against a work order
@@ -295,7 +295,7 @@ def test_the_reaper_files_the_finding_against_the_reply(fleet, root):
     store = fleet["store"]
     wo = ops.create_work_order("proj_a", "task")
     store.update_work_order(wo["id"], session_id="sess-1")
-    started = time.time() - 10
+    started = db.now() - 10
     _transcript(root, "sess-1", _launch(started + 1))
     turn = _turn_that_ended(store, wo["id"], started)
     msg_id = store.record_agent_reply(wo["id"], "Suite is running in the background.")
@@ -337,7 +337,7 @@ def test_a_turn_that_finished_is_not_judged(fleet, root):
     store = fleet["store"]
     wo = ops.create_work_order("proj_a", "task")
     store.update_work_order(wo["id"], session_id="sess-1")
-    started = time.time() - 10
+    started = db.now() - 10
     _transcript(root, "sess-1", _launch(started + 1))
     turn = _turn_that_ended(store, wo["id"], started)
     store.add_event(wo["id"], "finished", {"summary": "done"})
@@ -348,7 +348,7 @@ def test_a_turn_that_finished_is_not_judged(fleet, root):
 def test_a_work_order_with_no_session_is_not_judged(fleet):
     store = fleet["store"]
     wo = ops.create_work_order("proj_a", "task")
-    turn = _turn_that_ended(store, wo["id"], time.time() - 10)
+    turn = _turn_that_ended(store, wo["id"], db.now() - 10)
 
     assert background.orphaned_in_turn(store, wo["id"], turn) == []
 
@@ -366,7 +366,7 @@ def test_the_promise_is_marked_void_in_the_conversation(fleet, root):
     store = fleet["store"]
     wo = ops.create_work_order("proj_a", "task")
     store.update_work_order(wo["id"], session_id="sess-1")
-    started = time.time() - 10
+    started = db.now() - 10
     _transcript(root, "sess-1", _launch(started + 1))
     turn = _turn_that_ended(store, wo["id"], started)
     msg_id = store.record_agent_reply(
@@ -632,7 +632,7 @@ def _refused_launch(when: float, call_id: str = "toolu_denied",
 
 def test_a_refused_launch_is_not_a_job(root):
     """§5 of docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md:..."""
-    now = time.time()
+    now = db.now()
     _transcript(root, "sess-1", _refused_launch(now))
 
     assert background.jobs_left_running("sess-1", since=now - 1, until=now + 60) == []
@@ -640,7 +640,7 @@ def test_a_refused_launch_is_not_a_job(root):
 
 def test_a_refused_launch_beside_a_real_one_leaves_the_real_one(root):
     """The refusal must not swallow the finding next to it"""
-    now = time.time()
+    now = db.now()
     _transcript(root, "sess-1", [*_refused_launch(now), *_launch(now + 1)])
 
     jobs = background.jobs_left_running("sess-1", since=now - 1, until=now + 60)

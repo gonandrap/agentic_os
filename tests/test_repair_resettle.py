@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import json
 import string
-import time
 
 import pytest
 
+from jarvis import db
 from jarvis import invariants, ops
 from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
@@ -304,7 +304,7 @@ def test_the_user_is_asked_for_nothing_at_all(started, project, fake_gh, repaire
     assert [v.invariant for v in check_project(store)] == []
 
     row = store.get_work_order(repaired["id"])
-    long_after = time.time() + 365 * 24 * 3600
+    long_after = db.now() + 365 * 24 * 3600
 
     assert row["status"] == "waiting_pr_merge"
     assert not row["needs_attention"]

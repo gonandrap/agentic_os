@@ -5,11 +5,11 @@ from __future__ import annotations
 import ast
 import importlib
 import json
-import time
 from pathlib import Path
 
 import pytest
 
+from jarvis import db
 from jarvis import gates, invariants, ops
 from jarvis.catalog import DEFAULT_PULL_REQUESTS_RECOMPUTE_STALL_MINUTES, load_catalog
 from jarvis.daemon import (
@@ -195,7 +195,7 @@ def test_no_fallthrough(jarvis_home, project):
 def _age_past_grace(store: ProjectStore, wo_id: str) -> dict:
     """Backdate the claim past `TURN_CLAIM_GRACE_SECONDS` and re-read the row"""
     store.conn.execute("UPDATE work_orders SET updated_at=? WHERE id=?",
-                       (time.time() - TURN_CLAIM_GRACE_SECONDS - 60, wo_id))
+                       (db.now() - TURN_CLAIM_GRACE_SECONDS - 60, wo_id))
     return store.get_work_order(wo_id)
 
 
@@ -239,7 +239,7 @@ def test_a_pull_request_github_stopped_recomputing_derives_no_actor(jarvis_home,
     """#995's own row"""
     store = ProjectStore(project)
     wo = _parked_on_a_pr(store, pr_head_oid=STALLED_HEAD, pr_ref_oid=STALLED_TIP,
-                         pr_mergeable_unknown_since=time.time())
+                         pr_mergeable_unknown_since=db.now())
 
     assert ops.scheduled_actor(store, wo) is None
 
@@ -248,7 +248,7 @@ def test_a_fresh_unknown_is_an_ordinary_push_and_keeps_its_actor(jarvis_home, pr
     """kn-5e93939e: UNKNOWN right after a push is NORMAL"""
     store = ProjectStore(project)
     wo = _parked_on_a_pr(store, pr_head_oid=STALLED_HEAD, pr_ref_oid=STALLED_HEAD,
-                         pr_mergeable_unknown_since=time.time())
+                         pr_mergeable_unknown_since=db.now())
 
     actor = ops.scheduled_actor(store, wo)
 
@@ -258,7 +258,7 @@ def test_a_fresh_unknown_is_an_ordinary_push_and_keeps_its_actor(jarvis_home, pr
 def test_an_unknown_past_the_threshold_derives_no_actor(jarvis_home, project):
     """Condition (b) alone: head and tip agree"""
     store = ProjectStore(project)
-    stale = time.time() - (DEFAULT_PULL_REQUESTS_RECOMPUTE_STALL_MINUTES + 1) * 60
+    stale = db.now() - (DEFAULT_PULL_REQUESTS_RECOMPUTE_STALL_MINUTES + 1) * 60
     wo = _parked_on_a_pr(store, pr_head_oid=STALLED_HEAD, pr_ref_oid=STALLED_HEAD,
                          pr_mergeable_unknown_since=stale)
 
@@ -389,7 +389,7 @@ def _held_round(store: ProjectStore, wo_id: str) -> dict:
                                  VALIDATION_HELD_CAUSE)
     store.add_event(wo_id, "validation_failed",
                     {"round": int(rnd["round"]), "cause": VALIDATION_HELD_CAUSE,
-                     "reopens_at": time.time() + 3600})
+                     "reopens_at": db.now() + 3600})
     return store.get_work_order(wo_id)
 
 
