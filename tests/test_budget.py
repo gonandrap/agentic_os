@@ -1270,6 +1270,34 @@ def test_a_settled_investigator_is_never_parked_on_its_budget(started, store):
         central.close()
 
 
+def test_a_message_to_a_settled_overspent_order_is_settled_once(started, store,
+                                                                fake_claude):
+    """Issue #1195: `escalate` declines a settled order, so no hold ever forms for its messages"""
+    from jarvis.central_store import CentralStore
+
+    wo = store.create_work_order("done and overspent", description="the ask")
+    store.update_work_order(wo["id"], session_id="sess-1")
+    store.set_status(wo["id"], "completed")
+    over_its_cap(started, store, wo["id"])
+    msg_id = store.queue_message(wo["id"], "one more thing")
+
+    started.tick()
+    started.tick()
+
+    msg = store.list_messages(wo["id"])[0]
+    assert msg["id"] == msg_id and msg["status"] == "failed"
+    assert "budget spent" in msg["last_error"]
+    assert worker_calls(fake_claude) == []
+    # One attempt, not one per tick
+    assert len(store.events_of_kind(wo["id"], "delivering")) == 1
+    central = CentralStore()
+    try:
+        told = [i for i in central.unacked_inbox() if i["wo_id"] == wo["id"]]
+    finally:
+        central.close()
+    assert len(told) == 1 and "never received 1 message" in told[0]["title"]
+
+
 def test_a_live_investigator_with_no_verdict_still_parks(started, store):
     """The control for the guard above"""
     investigator = _investigator(store, verdict=False)
