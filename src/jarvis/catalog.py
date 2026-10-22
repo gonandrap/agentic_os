@@ -1000,6 +1000,66 @@ class NeoConfig:
     panel: PanelConfig = field(default_factory=PanelConfig)
 
 
+#: The answers `os.morpheus.on_failed` / `on_timeout` may give
+MORPHEUS_ACTIONS = ("investigate", "neo")
+
+
+@dataclass
+class MorpheusConfig:
+    """Morpheus, the production validator (docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md)"""
+
+    enabled: bool = True
+    model: str = "sonnet"
+    timeout_days: float = 3.0
+    check_every_minutes: int = 15
+    script_timeout_seconds: int = 60
+    #: Compact Morpheus's session once its context passes this share of the window
+    compact_at: float = 0.30
+    on_failed: str = "investigate"
+    on_timeout: str = "neo"
+    turn_timeout_seconds: int = 900
+
+
+def _parse_morpheus(raw: Any, where: str = "os.morpheus") -> MorpheusConfig:
+    """`os.morpheus`, field-level over the defaults"""
+    base = MorpheusConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    enabled = raw.get("enabled", base.enabled)
+    if not isinstance(enabled, bool):
+        raise _err(f"{where}.enabled must be true or false, got {enabled!r}")
+    try:
+        cfg = MorpheusConfig(
+            enabled=enabled,
+            model=str(raw.get("model", base.model) or base.model),
+            timeout_days=float(raw.get("timeout_days", base.timeout_days)),
+            check_every_minutes=int(raw.get("check_every_minutes",
+                                            base.check_every_minutes)),
+            script_timeout_seconds=int(raw.get("script_timeout_seconds",
+                                               base.script_timeout_seconds)),
+            compact_at=float(raw.get("compact_at", base.compact_at)),
+            on_failed=str(raw.get("on_failed", base.on_failed)),
+            on_timeout=str(raw.get("on_timeout", base.on_timeout)),
+            turn_timeout_seconds=int(raw.get("turn_timeout_seconds",
+                                             base.turn_timeout_seconds)),
+        )
+    except (TypeError, ValueError) as e:
+        raise _err(f"{where}: {e}") from e
+    if cfg.timeout_days <= 0:
+        raise _err(f"{where}.timeout_days must be > 0")
+    for name in ("check_every_minutes", "script_timeout_seconds", "turn_timeout_seconds"):
+        if getattr(cfg, name) < 1:
+            raise _err(f"{where}.{name} must be >= 1")
+    if not 0.0 < cfg.compact_at < 1.0:
+        raise _err(f"{where}.compact_at must be a share of the window between 0 and 1, "
+                   f"got {cfg.compact_at}")
+    for name in ("on_failed", "on_timeout"):
+        if getattr(cfg, name) not in MORPHEUS_ACTIONS:
+            raise _err(f"{where}.{name} must be one of {list(MORPHEUS_ACTIONS)}, "
+                       f"got {getattr(cfg, name)!r}")
+    return cfg
+
+
 @dataclass
 class OsConfig:
     default_model: str = DEFAULT_MODEL
@@ -1069,6 +1129,7 @@ class OsConfig:
     wiring: WiringConfig = field(default_factory=WiringConfig)
     worktree: WorktreeConfig = field(default_factory=WorktreeConfig)
     autonomy: AutonomyConfig = field(default_factory=AutonomyConfig)
+    morpheus: MorpheusConfig = field(default_factory=MorpheusConfig)
 
 
 @dataclass
@@ -2060,6 +2121,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         wiring=_parse_wiring(os_raw.get("wiring", {})),
         worktree=_parse_worktree(os_raw.get("worktree", {})),
         autonomy=_parse_autonomy(os_raw.get("autonomy", {})),
+        morpheus=_parse_morpheus(os_raw.get("morpheus", {})),
     )
     if os_cfg.default_permission_mode not in VALID_PERMISSION_MODES:
         raise _err(f"os.defaults.permission_mode {os_cfg.default_permission_mode!r} not in {sorted(VALID_PERMISSION_MODES)}")

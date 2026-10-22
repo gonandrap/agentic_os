@@ -32,6 +32,7 @@ def _body(**sections: str) -> str:
             "| UI | n/a | no UI change |\n"
             "| Eval | n/a | no prompt change |\n"
             "| A/B | n/a | no contract change |\n"),
+        "How to validate in production": "None — a hook change; production shows nothing.",
         "Screenshots": "None — no rendered surface changed.",
     }
     filled.update(sections)
