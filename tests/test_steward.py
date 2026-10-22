@@ -183,6 +183,21 @@ def test_the_ledger_counts_stamped_spend_and_what_is_still_reserved(fleet):
     assert book.fleet_usd == pytest.approx(50.0)
 
 
+def test_the_ledger_counts_a_stamped_improvement_order_and_its_analyst(fleet):
+    """Decision #59 of 2026-10-22: an allowed worker io never drew the ledger down"""
+    make, store = fleet
+    cat = make(mode="enforce", weekly_usd=100)
+    d = steward.gate(cand(origin_kind="worker_io"), catalog=cat, store=store)
+    io = store.create_feature_order("slow first turns", kind="improvement",
+                                    metadata=steward.stamped({}, d), budget_usd=20.0)
+    analyst = store.create_work_order("analyse it", parent_id=io["id"], kind="analyst")
+    store.update_feature_order(io["id"], plan_wo_id=analyst["id"])
+    _spend(store, analyst["id"], 5.0)
+    book = steward.ledger(cat)
+    # 5 spent by the analyst + 15 still reserved on the open io
+    assert book.evolution_usd == pytest.approx(20.0)
+
+
 def test_a_child_of_steward_work_is_one_generation_deeper(fleet):
     make, store = fleet
     cat = make(mode="enforce")

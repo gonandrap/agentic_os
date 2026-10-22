@@ -199,6 +199,28 @@ def stamped_orders(store: ProjectStore, since: float) -> list[dict[str, Any]]:
     return [dict(r) for r in rows if stamp_of(dict(r))]
 
 
+def stamped_features(store: ProjectStore, since: float) -> list[dict[str, Any]]:
+    """Every feature order (a worker's io) the steward dispatched since `since` (#59)"""
+    rows = store.conn.execute(
+        "SELECT * FROM feature_orders WHERE created_at>=? AND metadata LIKE ?",
+        (since, f'%"{STAMP_KEY}"%')).fetchall()
+    return [dict(r) for r in rows if stamp_of(dict(r))]
+
+
+def _features_spend(store: ProjectStore, central: CentralStore | None, since: float,
+                    counted: set[str]) -> Iterable[tuple[dict[str, Any], float]]:
+    """(feature order, spend + what its budget still reserves) — orders in `counted` once only"""
+    from . import budget
+
+    for fo in stamped_features(store, since):
+        cost = sum(budget.spent(store, central, child["id"]).total_usd
+                   for child in budget.family(store, fo) if child["id"] not in counted)
+        reserved = 0.0
+        if not budget.is_settled_feature(fo) and fo.get("budget_usd"):
+            reserved = max(0.0, float(fo["budget_usd"]) - cost)
+        yield fo, cost + reserved
+
+
 def ledger(catalog: Catalog, central: CentralStore | None = None, *,
            now: float | None = None) -> Ledger:
     """The rolling-7-day ledger, fleet-wide"""
@@ -214,7 +236,13 @@ def ledger(catalog: Catalog, central: CentralStore | None = None, *,
                 "SELECT COALESCE(SUM(cost_usd), 0) AS c FROM wo_turns WHERE started_at>=?",
                 (since,)).fetchone()
             out.fleet_usd += float(row["c"] or 0.0)
-            for wo in stamped_orders(store, since):
+            orders = stamped_orders(store, since)
+            for fo, usd in _features_spend(store, central, since,
+                                           {wo["id"] for wo in orders}):
+                out.evolution_usd += usd
+                if stamp_of(fo).get("severity") in URGENT:
+                    out.critical_usd += usd
+            for wo in orders:
                 cost = budget.spent(store, central, wo["id"]).total_usd
                 reserved = 0.0
                 if wo.get("status") in OPEN_STATUSES and wo.get("budget_usd"):
