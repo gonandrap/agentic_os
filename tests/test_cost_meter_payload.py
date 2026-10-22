@@ -345,7 +345,9 @@ def test_a_gap_longer_than_the_window_derives_nothing(fleet_fixture):
 def _windowed_orders(f):
     now = db.now()
     recent = f.order("an order inside the 5h window")
-    f.turn(recent, started_at=now - 120, ended_at=now - 60, cost_usd=1.0)
+    #: `now - 120` sits in the PREVIOUS 5h block for 2 minutes after every boundary
+    since, _ = fleetcost.session_window(now, CostConfig())
+    f.turn(recent, started_at=max(now - 120, since), ended_at=now, cost_usd=1.0)
     old = f.order("an order from last week")
     f.turn(old, started_at=now - 10 * 86_400, ended_at=now - 10 * 86_400 + 60,
            cost_usd=1.0)

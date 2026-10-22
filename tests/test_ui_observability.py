@@ -623,9 +623,11 @@ HEALTHY = {
 @pytest.fixture()
 def ui_unit(monkeypatch):
     """`jarvis-ui.service` as systemd sees it — `active`, uptime unknown, unless a test says otherwise"""
-    state = {"active": True, "uptime": None}
+    state = {"active": True, "uptime": None, "transitioning": False}
     monkeypatch.setattr(systemd_units, "unit_active", lambda unit: state["active"])
     monkeypatch.setattr(systemd_units, "uptime_seconds", lambda unit: state["uptime"])
+    monkeypatch.setattr(systemd_units, "unit_transitioning",
+                        lambda unit: state["transitioning"])
     return state
 
 
@@ -707,6 +709,23 @@ def test_a_release_restart_of_the_dashboard_is_not_a_wedge(wedged, ui_unit):
     ui_unit["uptime"] = 61.0
     assert d.check_ui_health(now=1100.0) == "restarted"
     assert runner.calls == [("restart_unit", release.UI_UNIT)]
+
+
+def test_the_stop_phase_of_a_restart_is_not_a_wedge(wedged, ui_unit):
+    """While the unit is `deactivating`, uptime still holds the PREVIOUS start (issue #1194)"""
+    d, runner, answers = wedged
+    answers[0] = None                     # the port is already refusing
+    ui_unit["transitioning"] = True
+    ui_unit["uptime"] = 180.0             # the start 3 minutes ago, not the new one
+
+    # The cap is spent, so without the state check this is the false CRITICAL
+    d.central.set_state(daemon_mod.UI_WEDGE_RESTARTS,
+                        db.to_json([995.0, 996.0, 997.0]))
+
+    assert d.check_ui_health(now=1000.0) == "restarting"
+    assert runner.calls == []
+    assert _inbox() == []
+    assert d._ui_restarts() == [995.0, 996.0, 997.0]   # nothing counted
 
 
 def test_a_dashboard_that_answers_wedged_while_booting_is_still_a_wedge(wedged, ui_unit):
