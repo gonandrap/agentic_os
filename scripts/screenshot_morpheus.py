@@ -34,6 +34,15 @@ def seed() -> None:
         store.update_morpheus_item(item["id"], script=SCRIPT, script_source="agent",
                                    state="monitoring", checks=3, last_exit=75,
                                    last_output="\n".join(f"line {k}: not yet" for k in range(40)))
+    # A usage-window hold, and an offer entry written before the cause was recorded (#1171)
+    pr = morpheus.PullRequestBody(number=9, url="https://github.com/o/r/pull/9",
+                                  title="[wo-1234abc9] thing 9",
+                                  body="## How to validate in production\nlook\n")
+    waiting = morpheus.enqueue(store, MorpheusConfig(), pr, project="jarvis_os", repo="o/r")
+    morpheus._save_session(store, {"last_turn_kind": "scripts", "turns": 4,
+                                   "usage_hold_until": time.time() + 3600,
+                                   "last_error": "You've hit your session limit · resets 6:20am",
+                                   "offers": {waiting["id"]: {"n": 1, "ts": time.time()}}})
     store.close()
 
 
@@ -54,6 +63,7 @@ def shoot() -> None:
         page = browser.new_page(viewport={"width": 1280, "height": 900})
         page.goto(f"http://127.0.0.1:{PORT}/morpheus")
         page.screenshot(path=SHOTS / "morpheus-table.png", full_page=True)
+        page.locator("div.panel").first.screenshot(path=SHOTS / "morpheus-session-hold.png")
         page.locator("button.peek", has_text="agent").first.click()
         page.wait_for_timeout(200)
         page.screenshot(path=SHOTS / "morpheus-check-modal.png")

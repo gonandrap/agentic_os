@@ -643,6 +643,12 @@ def wake(central: CentralStore, catalog: Catalog, cwd: Path, *, paused: bool = F
     call = call or claude_cli.run_session_turn
     dirs = dirs or {}
     state = session_state(central)
+    hold = float(state.get("usage_hold_until") or 0)
+    if now < hold:
+        # The account's window is spent: any turn would be refused, so none is attempted (#1171)
+        return "usage_held"
+    if hold:
+        state.pop("usage_hold_until", None)
     items = wanting_scripts(central, now=now)
     if not state.get("compact_due") and not items:
         return "idle"
@@ -662,8 +668,23 @@ def wake(central: CentralStore, catalog: Catalog, cwd: Path, *, paused: bool = F
                       append_system_prompt=MORPHEUS_PERSONA,
                       permission_mode=catalog.os.default_permission_mode,
                       add_dirs=add_dirs, timeout=cfg.turn_timeout_seconds)
+    except claude_cli.UsageLimitError as e:
+        # BEFORE ClaudeCliError, its base: the window refused the call, so it costs no offer (#1171)
+        from .worker_session import RATE_LIMIT_FALLBACK_DELAY
+
+        state.pop("turn_started_ts", None)
+        state["last_error"] = str(e)[:500]
+        state["usage_limits"] = int(state.get("usage_limits") or 0) + 1
+        state["usage_hold_until"] = e.limit.reset_at or now + RATE_LIMIT_FALLBACK_DELAY
+        if not resume:
+            state.pop("session_id", None)
+        _save_session(central, state)
+        log.warning("morpheus turn refused by the usage window, held until %s: %s",
+                    state["usage_hold_until"], e)
+        return "usage_limit"
     except claude_cli.KilledError as e:
         # BEFORE ClaudeCliError, its base: a kill is not an answer, so it costs no offer (#1161)
+        state.pop("turn_started_ts", None)
         state["last_error"] = str(e)[:500]
         state["kills"] = int(state.get("kills") or 0) + 1
         if not resume:
@@ -737,7 +758,17 @@ def _mark_offered(state: dict[str, Any], items: list[dict], now: float,
     offers = state.setdefault("offers", {})
     for item in items:
         seen = offers.get(item["id"]) or {}
-        offers[item["id"]] = {"n": int(seen.get("n") or 0) + 1, "ts": now, "error": error}
+        offers[item["id"]] = {"n": int(seen.get("n") or 0) + 1, "ts": now,
+                              "cause": "error" if error else "offer"}
+
+
+def _offer_cause(seen: dict[str, Any]) -> str | None:
+    """None for an entry written before the cause was recorded — unknown, not "an offer" (#1171)"""
+    if seen.get("cause"):
+        return str(seen["cause"])
+    if "error" in seen:
+        return "error" if seen["error"] else "offer"
+    return None
 
 
 def activity(central: CentralStore, *, timeout: float | None = None,
@@ -758,11 +789,13 @@ def activity(central: CentralStore, *, timeout: float | None = None,
         n, ts = int(seen.get("n") or 0), float(seen.get("ts") or 0)
         if n >= MAX_OFFERS:
             held.append({"id": item["id"], "offers": n, "next_offer_ts": None,
-                         "exhausted": True, "after_error": bool(seen.get("error"))})
+                         "exhausted": True, "cause": _offer_cause(seen)})
         elif now - ts < REOFFER_SECONDS:
             held.append({"id": item["id"], "offers": n, "next_offer_ts": ts + REOFFER_SECONDS,
-                         "exhausted": False, "after_error": bool(seen.get("error"))})
-    return {"turn_in_flight": in_flight, "turn_kind": state.get("last_turn_kind") or "",
+                         "exhausted": False, "cause": _offer_cause(seen)})
+    usage_hold = float(state.get("usage_hold_until") or 0)
+    return {"usage_hold_until": usage_hold if now < usage_hold else None,
+            "turn_in_flight": in_flight, "turn_kind": state.get("last_turn_kind") or "",
             "turn_started_ts": started if in_flight else None,
             "abandoned_turn_ts": started if started and not in_flight else None,
             "due": len(wanting_scripts(central, now=now)),
