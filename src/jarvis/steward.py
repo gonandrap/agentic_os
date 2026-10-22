@@ -41,7 +41,9 @@ PRECISION_WINDOW_SECONDS = 28 * 86400
 PRECISION_MIN_SAMPLES = 5
 
 #: Events on a work order that mean the USER engaged with it (§3.2 decision 2)
-USER_TOUCH_EVENTS = ("reviewed", "retry_requested", "budget_set", "budget_resumed")
+USER_TOUCH_EVENTS = ("reviewed", "retry_requested", "budget_set", "budget_resumed",
+                     # `jarvis io review`, on the analyst: only the user reviews findings
+                     "findings_reviewed")
 
 
 def severity_rank(level: str) -> int:
@@ -277,7 +279,8 @@ def touched(store: ProjectStore, wo_id: str) -> bool:
 
 
 def precision(catalog: Catalog, *, now: float | None = None) -> dict[str, tuple[int, int]]:
-    """{origin_kind: (touched, dispatched)} over the last 28 days of stamped orders"""
+    """{origin_kind: (touched, dispatched)} over the last 28 days of stamped orders and ios"""
+    from . import budget
     from .project_store import ProjectStore
 
     since = (now if now is not None else db.now()) - PRECISION_WINDOW_SECONDS
@@ -285,13 +288,27 @@ def precision(catalog: Catalog, *, now: float | None = None) -> dict[str, tuple[
     for _name, path in _project_stores(catalog):
         store = ProjectStore(path)
         try:
-            for wo in stamped_orders(store, since):
-                kind = str(stamp_of(wo).get("origin_kind") or "")
-                hit, total = out.get(kind, (0, 0))
-                out[kind] = (hit + int(touched(store, wo["id"])), total + 1)
+            units = [(wo, touched(store, wo["id"])) for wo in stamped_orders(store, since)
+                     if not wo.get("parent_id") or not _stamped_parent(store, wo)]
+            # An io is touched when the user engaged with any order in its family (#59)
+            units += [(fo, any(touched(store, child["id"])
+                               for child in budget.family(store, fo)))
+                      for fo in stamped_features(store, since)]
+            for unit, hit in units:
+                kind = str(stamp_of(unit).get("origin_kind") or "")
+                hits, total = out.get(kind, (0, 0))
+                out[kind] = (hits + int(hit), total + 1)
         finally:
             store.close()
     return out
+
+
+def _stamped_parent(store: ProjectStore, wo: Mapping[str, Any]) -> bool:
+    """Is this order part of a stamped io's family, so the io is the one sample?"""
+    try:
+        return bool(stamp_of(store.get_feature_order(str(wo["parent_id"]))))
+    except KeyError:
+        return False
 
 
 def throttled(cfg: EvolutionConfig, counts: Mapping[str, tuple[int, int]]) -> set[str]:
@@ -614,7 +631,7 @@ def _store_for(central: CentralStore, project: str) -> ProjectStore | None:
 # ---------------------------------------------------------------- the queue (#1181)
 
 #: Origin kinds whose `queue` the OS dispatches later on its own; the rest re-ask by themselves
-DRAINABLE = ("panel", "worker_io")
+DRAINABLE = ("panel", "worker_io", "remedy", "neo_rider")
 #: Origin kinds whose candidate is about the PARENT unit's code: moot once that is cancelled
 PARENT_BOUND = ("panel",)
 #: A queued decision older than this is not re-offered: the code it named has moved on
@@ -665,6 +682,14 @@ def _stale(central: CentralStore, row: Mapping[str, Any], store: ProjectStore | 
         if unit.get("status") == "cancelled":
             return f"{parent} was cancelled, so its code never landed"
     held, key = _candidate_of(row), str(row["dedupe_key"] or "")
+    alarm_id = str((held.get("payload") or {}).get("alarm_id") or "")
+    if row["origin_kind"] == "remedy" and alarm_id:
+        try:
+            status = store.get_alarm(alarm_id)["status"]
+        except KeyError:
+            return f"alarm {alarm_id} no longer exists"
+        if status != "proposed":
+            return f"alarm {alarm_id} was already answered (`{status}`)"
     for other in central.steward_dedupe_bucket(key) if key else ():
         if (int(other["id"]) != int(row["id"]) and (other["wo_id"] or other["applied"])
                 and same_defect(str(row["subject"]), str(other["subject"] or ""),
@@ -673,13 +698,34 @@ def _stale(central: CentralStore, row: Mapping[str, Any], store: ProjectStore | 
     return ""
 
 
+#: Why an enforced `queue` with nothing kept to dispatch it from is settled as expired
+UNRECOVERABLE_NOTE = ("queued before the OS kept what it needs to re-offer it "
+                      "(no candidate stored); cannot be re-offered")
+
+
+def settle_unrecoverable(central: CentralStore, *, now: float | None = None) -> int:
+    """Expire the enforced queues of drainable kinds that kept no payload: they can never move"""
+    rows = central.conn.execute(
+        "SELECT id, candidate_json FROM steward_decisions WHERE outcome='queue' "
+        "AND queue_state='' AND mode='enforce' AND applied=0 AND duplicate_of=0 "
+        f"AND wo_id='' AND origin_kind IN ({','.join('?' * len(DRAINABLE))})",
+        DRAINABLE).fetchall()
+    stuck = [int(r["id"]) for r in rows if not _candidate_of(dict(r)).get("payload")]
+    for decision_id in stuck:
+        central.update_steward_decision(decision_id, {
+            "queue_state": "expired", "queue_note": UNRECOVERABLE_NOTE,
+            "queue_ts": now if now is not None else db.now()})
+    return len(stuck)
+
+
 def drain(catalog: Catalog, central: CentralStore, *, now: float | None = None,
           dispatchers: Mapping[str, Dispatcher] | None = None,
           limit: int = DRAIN_PER_PASS) -> dict[str, int]:
     """Re-offer the queued decisions the ledger now has room for, severest then oldest first"""
     now = now if now is not None else db.now()
     cfg = catalog.os.evolution
-    out = {"waiting": 0, "dispatched": 0, "expired": 0, "failed": 0}
+    out = {"waiting": 0, "dispatched": 0, "expired": settle_unrecoverable(central, now=now),
+           "failed": 0}
     rows = central.steward_queue()
     if not rows:
         return out

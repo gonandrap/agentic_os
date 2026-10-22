@@ -35,7 +35,6 @@ from .project_store import (
     OBJECTION_HANDED_BACK_REASON,
     OBJECTION_WITHDRAWN_REASON,
     OPEN_STATUSES,
-    PRE_APPROVED_KEY,
     RETRY_SWEEP_STATUSES,
     RUNNABLE_VALIDATION_OUTCOMES,
     TERMINAL_STATUSES,
@@ -652,7 +651,12 @@ class Daemon:
     def steward_drain(self) -> None:
         """Queued self-work is deferred, not dropped: re-offer it when there is room (#1181)"""
         if fleet.load_pause(self.central) is not None:
-            return  # THE BRAKE holds new self-work too
+            # THE BRAKE holds new self-work too; settling a queue that can never move is not
+            try:
+                steward.settle_unrecoverable(self.central)
+            except Exception:  # noqa: BLE001
+                log.exception("steward: settling unrecoverable queues failed")
+            return
         try:
             out = steward.drain(self.catalog, self.central)
         except Exception:  # noqa: BLE001
@@ -3183,39 +3187,23 @@ class Daemon:
             log.info("neo cleanup dispatch from %s ignored: already a cleanup work order",
                      q["wo_id"])
             return
+        from . import ops
+
+        rider = {"question_id": q["id"], "wo_id": str(q["wo_id"]),
+                 "title": str(dispatch.get("title") or ""),
+                 "description": str(dispatch.get("description") or "")}
         # A ledger cleanup is `medium`: real
         decision = steward.gate(
             steward.Candidate("neo_rider", "medium", str(q.get("project") or ""),
-                              str(dispatch.get("title") or ""),
-                              evidence=(f"neo question {q['id']}",),
-                              parent_wo_id=str(q["wo_id"])),
+                              rider["title"], evidence=(f"neo question {q['id']}",),
+                              parent_wo_id=rider["wo_id"], payload=rider),
             catalog=self.catalog, store=pstore,
             self_dispatch=self.self_dispatch)
         if not decision.allowed:
             log.info("neo cleanup dispatch from %s not filed: steward %s (%s)",
                      q["wo_id"], decision.outcome, decision.reason)
             return
-        description = "\n\n".join(filter(None, [
-            dispatch["description"],
-            f"Neo filed this while answering question {q['id']} on {q['wo_id']}. "
-            f"The correction is ALREADY APPROVED — make it. The stores are append-only, "
-            f"so the remedy is to APPEND an entry that supersedes the wrong one "
-            f"(`jarvis learn add` for the knowledge base, `jarvis neo learn` for Neo's "
-            f"own learnings), naming what it replaces and why.",
-        ]))
-        wo = pstore.create_work_order(
-            title=dispatch["title"], description=description, origin="neo",
-            metadata=steward.stamped({PRE_APPROVED_KEY: {
-                "by": "neo",
-                "scope": "correcting the recorded ledger entries this work order names",
-                "neo_question_id": q["id"],
-                "from_wo": q["wo_id"],
-            }}, decision), budget_usd=decision.budget_usd,
-        )
-        steward.linked(decision, wo["id"])
-        pstore.add_event(q["wo_id"], "neo_dispatched",
-                         {"neo_question_id": q["id"], "cleanup_wo_id": wo["id"]})
-        log.info("neo dispatched pre-approved cleanup %s from %s", wo["id"], q["wo_id"])
+        ops.file_neo_cleanup(pstore, rider, decision)
 
     def _deliver_plan_verdict(self, central: CentralStore, neo_store: Any,
                               pstore: ProjectStore | None, q: dict,

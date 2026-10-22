@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Steward — Jarvis{% endblock %}
+{% block content %}
+
+{# docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md, "The queue drains".
+   Read-only: the counts and rows are `ops.steward_queue_report`'s, the same the CLI prints. #}
+{% set tone = {"waiting": "tone-active", "reoffered": "tone-ok", "expired": "tone-warn"} %}
+
+<p class="kv" style="margin-top:18px">
+  Self-work the steward queued rather than dispatched. A waiting decision is re-offered
+  against the current ledger by the daemon; it is never forced through.
+  <span class="counts">({{ report.counts.waiting }} waiting ·
+    {{ report.counts.reoffered }} re-offered · {{ report.counts.expired }} expired)</span>
+</p>
+<p class="sub">{{ report.line }}</p>
+
+<h2>Queue</h2>
+<div class="panel" id="steward-queue">
+  <table>
+    <tr><th>decision</th><th>state</th><th>severity</th><th>origin</th><th>project</th>
+      <th>subject</th><th>age</th><th>note</th></tr>
+    {% for i in report["items"] %}
+    <tr>
+      <td class="mono" style="white-space:nowrap;user-select:all">#{{ i.id }}</td>
+      <td class="mono {{ tone.get(i.queue_state, '') }}">{{ i.queue_state }}</td>
+      <td class="mono">{{ i.severity }}</td>
+      <td class="mono">{{ i.origin_kind }}</td>
+      <td class="mono">{{ i.project or "—" }}</td>
+      <td title="{{ i.rule }}: {{ i.reason }}">{{ i.subject }}{% if i.wo_id %} <span class="mono">→ {{ i.wo_id }}</span>{% endif %}</td>
+      <td class="mono" style="white-space:nowrap" title="{{ fmt_ts(i.ts) }}">{{ fmt_age(i.ts) }}</td>
+      <td class="mono">{{ i.queue_note or "—" }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="8" class="empty">nothing queued — the steward has held no self-work back</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+<p class="sub">from a terminal: <span class="mono">jarvis steward decisions</span> ·
+  <span class="mono">jarvis steward digest</span> ·
+  <span class="mono">jarvis steward ledger</span></p>
+
+{% endblock %}

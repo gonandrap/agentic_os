@@ -1507,6 +1507,12 @@ def create_app() -> FastAPI:
         return render(request, "morpheus.html", active="morpheus",
                       report=ops.morpheus_report())
 
+    @app.get("/steward", response_class=HTMLResponse)
+    def steward_page(request: Request):
+        """Self-work the steward queued: what still waits, what was re-offered, what expired (docs/superpowers/specs/2026-10-21-a-steward-decides-what-the-os-may-spend-on-itself.md)"""
+        return render(request, "steward.html", active="steward",
+                      report=ops.steward_queue_report())
+
     @app.get("/evolution", response_class=HTMLResponse)
     def evolution_page(request: Request, days: int = 90):
         """Is the OS getting better at running itself — and where is it still weak? (docs/superpowers/specs/2026-09-27-self-evolution.md)"""

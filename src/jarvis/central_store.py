@@ -757,6 +757,14 @@ class CentralStore:
             "SELECT * FROM steward_decisions WHERE queue_state=? ORDER BY ts, id", (state,))
         return [dict(r) for r in rows.fetchall()]
 
+    def steward_queue_rows(self, limit: int = 200) -> list[dict[str, Any]]:
+        """Every decision ever queued for a re-offer: waiting first, then the latest change"""
+        rows = self.conn.execute(
+            "SELECT * FROM steward_decisions WHERE queue_state<>'' "
+            "ORDER BY queue_state<>'waiting', COALESCE(queue_ts, ts) DESC, id DESC LIMIT ?",
+            (limit,))
+        return [dict(r) for r in rows.fetchall()]
+
     def steward_queue_counts(self) -> dict[str, int]:
         """{queue_state: n} over every decision that was ever queued for a re-offer"""
         rows = self.conn.execute(
