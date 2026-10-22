@@ -43,7 +43,7 @@ SAFETY_KEYS = (
     "os.evolution.weekly_usd", "os.evolution.critical_weekly_usd",
     "os.evolution.yield_above_usd", "os.evolution.order_budget_usd",
     "os.evolution.max_depth", "os.evolution.*_min_refs", "os.evolution.min_refs_by_kind",
-    "os.evolution.min_refs_by_kind.*", "os.evolution.min_precision",
+    "os.evolution.min_precision",
     "os.evolution.mode",
     # What the OS is permitted to WATCH (docs/superpowers/specs/2026-09-27-self-evolution.md)
     "*.rules.*",
