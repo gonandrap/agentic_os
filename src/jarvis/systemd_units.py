@@ -139,6 +139,18 @@ def unit_active(unit: str) -> bool:
     return state in ("active", "activating", "reloading", "deactivating")
 
 
+def uptime_seconds(unit: str) -> float | None:
+    """How long since the unit last left `inactive` — `None` when systemd will not say"""
+    raw = _show(unit, "InactiveExitTimestampMonotonic")
+    try:
+        started = int(raw) / 1_000_000          # systemd reports CLOCK_MONOTONIC µs
+    except ValueError:
+        return None
+    if started <= 0:
+        return None
+    return max(0.0, time.monotonic() - started)
+
+
 def stop_unit(unit: str) -> bool:
     """Stop a turn's unit, taking its whole cgroup — MCP servers included — with it"""
     if not unit_active(unit):

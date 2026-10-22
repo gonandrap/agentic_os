@@ -80,6 +80,20 @@ def test_the_cgroup_probe_reads_the_real_thing() -> None:
     assert isinstance(systemd_units.in_service_cgroup(), bool)
 
 
+def test_a_units_uptime_is_read_off_the_same_monotonic_clock(monkeypatch) -> None:
+    """systemd reports CLOCK_MONOTONIC µs, which is what `time.monotonic()` reads (issue #1189)"""
+    monkeypatch.setattr(systemd_units.time, "monotonic", lambda: 1_000.0)
+    monkeypatch.setattr(systemd_units, "_show",
+                        lambda unit, prop: str(int(987.5 * 1_000_000)))
+    assert systemd_units.uptime_seconds("jarvis-ui.service") == 12.5
+
+
+@pytest.mark.parametrize("answer", ["", "0", "not-a-number"])
+def test_an_unknown_uptime_is_none_rather_than_a_guess(monkeypatch, answer) -> None:
+    monkeypatch.setattr(systemd_units, "_show", lambda unit, prop: answer)
+    assert systemd_units.uptime_seconds("jarvis-ui.service") is None
+
+
 # -- what the unit is told
 
 

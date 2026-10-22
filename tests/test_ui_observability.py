@@ -622,9 +622,10 @@ HEALTHY = {
 
 @pytest.fixture()
 def ui_unit(monkeypatch):
-    """`jarvis-ui.service` as systemd sees it — `active` unless a test says otherwise"""
-    state = {"active": True}
+    """`jarvis-ui.service` as systemd sees it — `active`, uptime unknown, unless a test says otherwise"""
+    state = {"active": True, "uptime": None}
     monkeypatch.setattr(systemd_units, "unit_active", lambda unit: state["active"])
+    monkeypatch.setattr(systemd_units, "uptime_seconds", lambda unit: state["uptime"])
     return state
 
 
@@ -688,6 +689,46 @@ def test_a_timeout_and_a_wedged_answer_are_the_same_verdict(wedged, monkeypatch)
 
     assert d.check_ui_health(now=1000.0) == "restarted"
     assert runner.calls == [("restart_unit", release.UI_UNIT)]
+
+
+def test_a_release_restart_of_the_dashboard_is_not_a_wedge(wedged, ui_unit):
+    """Every release restarts `jarvis-ui`; the next tick probes before uvicorn binds (issue #1189)"""
+    d, runner, answers = wedged
+    answers[0] = None                     # the port is not open yet
+    ui_unit["uptime"] = 0.07              # systemd restarted it 70ms ago
+
+    assert d.check_ui_health(now=1000.0) == "booting"
+    assert runner.calls == []
+    assert _inbox() == []
+    # Nothing was counted, so the restart cap is intact for a real wedge
+    assert d._ui_restarts() == []
+
+    # Past the grace period an unreachable dashboard IS the wedge it always was
+    ui_unit["uptime"] = 61.0
+    assert d.check_ui_health(now=1100.0) == "restarted"
+    assert runner.calls == [("restart_unit", release.UI_UNIT)]
+
+
+def test_a_dashboard_that_answers_wedged_while_booting_is_still_a_wedge(wedged, ui_unit):
+    """The grace period covers silence, not the dashboard's own `wedged: true`"""
+    d, runner, _ = wedged
+    ui_unit["uptime"] = 0.07
+
+    assert d.check_ui_health(now=1000.0) == "restarted"
+    assert runner.calls == [("restart_unit", release.UI_UNIT)]
+
+
+def test_the_item_claims_no_stack_dump_when_none_was_written(wedged, monkeypatch):
+    """`uilog.stack_dump_path()` is a path, not evidence that the dashboard dumped (issue #1189)"""
+    d, _, answers = wedged
+    answers[0] = None                     # no payload, so no `stack_dump` either
+
+    assert d.check_ui_health(now=1000.0) == "restarted"
+    body = _inbox()[0]["body"]
+    assert str(uilog.stack_dump_path()) not in body
+    assert "Stacks: none — no stack dump was written" in body
+    assert "wrote NO stack dump" in body
+    assert "Stamp:" not in body           # the dashboard never stamped either
 
 
 def test_the_daily_cap_stops_restarting_and_still_reaches_the_user(wedged):
