@@ -449,6 +449,51 @@ def test_clearing_the_budget_resumes_it_too(started, store, fake_claude, monkeyp
     assert sent, "the clear never launched an uncapped turn"
 
 
+def _parked(started, store, fake_claude, monkeypatch) -> dict:
+    monkeypatch.setenv("FAKE_CLAUDE_TURN", "budget")
+    wo = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=0.50)
+    started.tick()
+    fake_claude.wait_calls(lambda c: budget_flag(c) is not None)
+    assert tick_until_parked(started, store, wo["id"]) == "budget_exhausted"
+    monkeypatch.delenv("FAKE_CLAUDE_TURN")
+    return store.get_work_order(wo["id"])
+
+
+@pytest.mark.parametrize("let_through", ["allow", "lift"])
+def test_a_raise_under_the_pause_is_held_until_the_pause_lets_it_through(
+        started, store, fake_claude, monkeypatch, let_through):
+    """Issue #1130: the pause is THE BRAKE, and a budget raise is not a way round it"""
+    wo = _parked(started, store, fake_claude, monkeypatch)
+    ops.pause_fleet(reason="spend")
+    before = len(worker_calls(fake_claude))
+
+    out = ops.set_work_order_budget(wo["id"], 20.0)
+    assert not out["resumed"]
+    assert f"jarvis resume {wo['id']}" in out["note"]
+    assert store.get_work_order(wo["id"])["budget_usd"] == 20.0
+    started.tick()
+    row = store.get_work_order(wo["id"])
+    assert row["status"] == "budget_exhausted"
+    assert f"jarvis resume {wo['id']}" in row["attention_reason"]
+    assert len(worker_calls(fake_claude)) == before
+
+    ops.resume_fleet([wo["id"]]) if let_through == "allow" else ops.resume_fleet(everything=True)
+    started.tick()
+    assert store.get_work_order(wo["id"])["status"] != "budget_exhausted"
+    assert fake_claude.wait_calls(
+        lambda c: wo["session_id"] in c["argv"] and len(worker_calls(fake_claude)) > before)
+
+
+def test_a_raise_on_an_allow_listed_order_resumes_at_once(
+        started, store, fake_claude, monkeypatch):
+    wo = _parked(started, store, fake_claude, monkeypatch)
+    ops.pause_fleet(reason="spend", allow=[wo["id"]])
+
+    out = ops.set_work_order_budget(wo["id"], 20.0)
+    assert out["resumed"], out
+    assert store.get_work_order(wo["id"])["status"] != "budget_exhausted"
+
+
 # -- the family budget
 
 

@@ -12330,26 +12330,60 @@ def set_work_order_budget(wo_id: str, amount: float | None,
         if fresh["status"] == budget.EXHAUSTED and fresh.get("budget_reserved_usd"):
             budget.reserve(store, central, fresh)
             fresh = store.get_work_order(wo_id)
-        cap = budget.ceiling(store, central, fresh)
         spend = budget.spent(store, central, wo_id)
         if fresh["status"] == budget.EXHAUSTED:
-            refused = budget.launch_refusal(store, central, fresh)
-            if cap is not None and cap.exhausted:
-                note = _still_capped_note(
-                    cap, spend.total_usd, _parent_of(store, fresh),
-                    _feature_unreserved(store, central, fresh))
-            elif refused is not None:
-                # Raised, but by less than one call: the next turn would be refused, so it stays parked and says why
-                store.flag_attention(wo_id, refused.reason)
-                note = refused.reason
-            else:
-                resumed, note = _resume_after_budget(store, name, fresh)
+            resumed, note = resume_raised_budget(store, central, name, fresh,
+                                                 fleet.load_pause(central))
     finally:
         central.close()
         store.close()
     return {"project": name, "wo_id": wo_id, "title": wo["title"],
             "budget_usd": amount, "previous_usd": wo.get("budget_usd"),
             "spent_usd": spend.total_usd, "resumed": resumed, "note": note}
+
+
+#: A raised budget's relaunch the user's pause held back (#1130)
+BUDGET_RESUME_HELD = "budget_resume_held"
+#: That held relaunch has been let go: the pause lifted or the order was allow-listed
+BUDGET_RESUME_RELEASED = "budget_resume_released"
+
+
+def budget_resume_outstanding(store: ProjectStore, wo_id: str) -> bool:
+    """Is a raised budget's relaunch still waiting on the pause"""
+    held = store.last_event_of_kind(wo_id, BUDGET_RESUME_HELD)
+    if held is None:
+        return False
+    later = (store.last_event_of_kind(wo_id, k)
+             for k in ("budget_exhausted", BUDGET_RESUME_RELEASED))
+    return not any(e is not None and e["ts"] >= held["ts"] for e in later)
+
+
+def budget_held_note(wo_id: str) -> str:
+    """Why a raised budget did not relaunch: the fleet is paused (#1130)"""
+    return (f"budget raised, but held by the fleet pause — `jarvis resume {wo_id}` "
+            "lets it through, and it resumes on its own once the pause lifts")
+
+
+def resume_raised_budget(store: ProjectStore, central: CentralStore, project_name: str,
+                         wo: dict[str, Any],
+                         pause: fleet.FleetPause | None) -> tuple[bool, str]:
+    """Relaunch a parked order whose budget now has room — unless the user's pause holds it (#1130)"""
+    cap = budget.ceiling(store, central, wo)
+    if cap is not None and cap.exhausted:
+        return False, _still_capped_note(
+            cap, budget.spent(store, central, wo["id"]).total_usd, _parent_of(store, wo),
+            _feature_unreserved(store, central, wo))
+    refused = budget.launch_refusal(store, central, wo)
+    if refused is not None:
+        # Raised, but by less than one call: the next turn would be refused, so it stays parked and says why
+        store.flag_attention(wo["id"], refused.reason)
+        return False, refused.reason
+    if pause is not None and not pause.allows(wo["id"]):
+        note = budget_held_note(wo["id"])
+        store.flag_attention(wo["id"], note)
+        store.add_event(wo["id"], BUDGET_RESUME_HELD, {"cause": "fleet_paused"})
+        return False, note
+    return _resume_after_budget(store, project_name, wo)
 
 
 def _still_capped_note(cap: budget.Ceiling, spent_usd: float,
