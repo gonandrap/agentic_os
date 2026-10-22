@@ -18,6 +18,7 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
+from urllib.parse import quote
 
 log = logging.getLogger("jarvis.ops")
 
@@ -88,6 +89,7 @@ from .project_store import (
     feature_status_label,
     is_feature_order_id,
     kind_contract,
+    order_path,
     submission_artifacts,
     validation_standing,
 )
@@ -1879,7 +1881,9 @@ def _diagnose_holds(store: ProjectStore, wo: dict[str, Any],
         unexplained = {"seconds": None, "seconds_human": None, "residual": True,
                        "note": NO_TRANSCRIPT_NOTE}
     # `as_dict` verbatim plus the FORMATTED duration
-    rows = [{**h.as_dict(now), "seconds_human": ago_phrase(h.as_dict(now)["seconds"])}
+    rows = [{**h.as_dict(now), "seconds_human": ago_phrase(h.as_dict(now)["seconds"]),
+             # What held it, so a surface can link there — `None` when the record names nothing
+             "key": h.key}
             for h in episodes]
     return {"episodes": rows, "by_cause": by_cause,
             "open": next((r for r in reversed(rows) if r["open"]), None),
@@ -6313,6 +6317,82 @@ def find_feature_order(fo_id: str, project_name: str | None = None
         finally:
             store.close()
     raise OpsError(f"feature order {fo_id!r} not found in any registered project")
+
+
+#: Every id the OS mints that has a page, and the shapes a reader types for the rest
+_REF_ID = re.compile(r"^(wo|fo|io|inv|kn|al|mv|bl)-[0-9a-f]{8}$")
+_REF_NUMBERED = re.compile(r"^(q|gate-|issue-|#)?(\d+)$")
+
+
+def resolve_ref(ref: str) -> str:
+    """The dashboard page that shows this id — `/go/<id>` (docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md §1)"""
+    ref = ref.strip()
+    search = "/search?q=" + quote(ref)
+    numbered = _REF_NUMBERED.match(ref.lower())
+    if numbered:
+        kind, n = numbered.groups()
+        if kind == "gate-":
+            return f"/gates#gate-{n}"
+        if kind in ("issue-", "#"):
+            return "/search?q=" + quote(f"#{n}")
+        # a bare number is the one id a reader is shown without a prefix: a Neo question's
+        return f"/neo/question/{n}"
+    found = _REF_ID.match(ref.lower())
+    if not found:
+        return search
+    rid, prefix = found.group(0), found.group(1)
+    try:
+        if prefix == "wo":
+            name, _, _ = find_work_order(rid)
+            return order_path(name, rid)
+        if prefix in ("fo", "io", "inv"):
+            name, _, _ = find_feature_order(rid)
+            return order_path(name, rid)
+        if prefix == "al":
+            name, _, _ = _find_alarm(rid)
+            return f"/alarms/{name}/{rid}"
+    except OpsError:
+        return search
+    # Listed on one fleet-wide page each, and addressed there by their own id
+    return {"kn": "/knowledge", "mv": "/morpheus", "bl": "/backlog"}[prefix] + f"#{rid}"
+
+
+def worker_prompts(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
+    """Every prompt the OS sent this order's conversation, turn by turn — `wo_turns.prompt` verbatim"""
+    name, path, wo = find_work_order(wo_id, project_name)
+    store = ProjectStore(path)
+    try:
+        turns = store.list_turns(wo_id, limit=10_000)
+    finally:
+        store.close()
+    return {"project": name, "wo": wo,
+            "turns": [{"seq": t["seq"], "kind": t["kind"], "state": t["state"],
+                       "started_at": t["started_at"], "msg_id": t["msg_id"],
+                       "prompt": t["prompt"], "chars": len(t["prompt"] or "")}
+                      for t in turns]}
+
+
+#: The placeholder a prompt preview is composed for
+PREVIEW_WO = {"id": "wo-00000000", "title": "(the title of a new work order)",
+              "description": "(its description — the brief the user or Jarvis wrote)"}
+
+
+def project_prompt_preview(name: str) -> dict[str, Any]:
+    """What a NEW work order on this project would be told today, and the OPERATION.md beside it"""
+    from .dispatch import build_worker_prompt, knowledge_for
+
+    catalog = resolve_catalog()
+    spec = project_spec(catalog, name)
+    central = CentralStore()
+    try:
+        knowledge = knowledge_for(central, spec, PREVIEW_WO, catalog.os)
+    finally:
+        central.close()
+    operation = spec.path / "OPERATION.md"
+    return {"project": name, "path": str(spec.path), "wo": PREVIEW_WO,
+            "prompt": build_worker_prompt(dict(PREVIEW_WO), spec, knowledge),
+            "operation_path": str(operation),
+            "operation": operation.read_text() if operation.is_file() else None}
 
 
 def feature_progress(store: ProjectStore, fo: dict[str, Any]) -> dict[str, Any]:

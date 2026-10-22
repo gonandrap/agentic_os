@@ -10,7 +10,23 @@
    answer, who gave it, what the panel did — and the decision itself, in one place. #}
 
 <h2><a href="/neo">neo</a> / <span class="mono">question #{{ q.id }}</span></h2>
+{# Where it came from, one click each — §5 of
+   docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md. #}
+{% if origin %}
+{% set wo_base = order_path(q.project, origin.id) %}
+<div class="jumps">
+  <a href="{{ wo_base }}#q-{{ q.id }}">in {{ origin.id }}'s conversation</a>
+  <a href="{{ wo_base }}">the work order</a>
+  {% if origin.pr_url %}<a href="{{ origin.pr_url }}" rel="noopener">its pull request ↗</a>{% endif %}
+  {% if wo_base.startswith('/wo/') %}<a href="{{ wo_base }}/debug#dbg-held">how long it held the order</a>
+  <a href="{{ wo_base }}/debug">debug</a>{% endif %}
+  <a href="/project/{{ q.project }}">{{ q.project }}</a>
+</div>
+{% endif %}
 
+<div class="grid" style="--col: 640px;">
+<div class="sec">
+<h2 id="question">Question</h2>
 <div class="panel" style="padding: 14px 16px;">
   <div class="who">
     {{ q.project }} ·
@@ -23,8 +39,10 @@
   </div>
   {{ question_body(q) }}
 </div>
+</div>
 
-<h2>Answer</h2>
+<div class="sec">
+<h2 id="answer">Answer</h2>
 <div class="panel" style="padding: 14px 16px;">
   {% if q.answer %}
   <div style="white-space: pre-wrap;">{{ q.answer }}</div>
@@ -58,8 +76,10 @@
 </div>
 
 {% if opinions %}
-<h2>How it was decided</h2>
+<h2 id="deliberation">How it was decided</h2>
 <div class="panel" style="padding: 14px 16px;">{{ deliberation(opinions) }}</div>
 {% endif %}
+</div>
+</div>
 
 {% endblock %}

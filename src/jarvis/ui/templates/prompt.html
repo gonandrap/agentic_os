@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% import "_order_nav.html" as nav %}
+{% block title %}prompts — {{ wo.id }} — Jarvis{% endblock %}
+{% block content %}
+
+{# EVERY PROMPT THIS ORDER'S CONVERSATION WAS SENT — §4 of
+   docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md. `wo_turns.prompt`
+   verbatim, one address per turn (`#turn-<seq>`), the same seq the debugging page's
+   turns and context ledger use, so the three link to each other. #}
+<h2><a href="/project/{{ project }}">{{ project }}</a> /
+  <a href="/wo/{{ project }}/{{ wo.id }}" class="mono">{{ wo.id }}</a> / prompts</h2>
+{{ nav.order_nav(project, wo, 'prompt') }}
+
+{% if turns %}
+<div class="jumps" aria-label="jump to a turn">
+  {% for t in turns %}<a href="#turn-{{ t.seq }}">{{ turn_label(t.seq) }} · {{ t.kind }}</a>{% endfor %}
+</div>
+{% for t in turns %}
+<details class="turn panel" id="turn-{{ t.seq }}" style="margin-top: 12px;"{% if loop.first or loop.last %} open{% endif %}>
+  <summary>
+  <div class="row">
+    <span class="mono" style="width: 70px;">{{ turn_label(t.seq) }}</span>
+    <span class="grow mono">{{ t.kind }}{% if t.msg_id %} · message #{{ t.msg_id }}{% endif %} · {{ t.state }}</span>
+    <span class="kv mono">{{ '{:,}'.format(t.chars) }} chars · {{ fmt_ts(t.started_at) }}</span>
+    <span class="kv"><a href="/wo/{{ project }}/{{ wo.id }}/debug#turn-{{ t.seq }}">time</a> ·
+      <a href="/wo/{{ project }}/{{ wo.id }}/debug#ctx-{{ t.seq }}">context</a>{% if t.msg_id %} ·
+      <a href="/wo/{{ project }}/{{ wo.id }}#msg-{{ t.msg_id }}">message</a>{% endif %}</span>
+  </div>
+  </summary>
+  <pre class="request-text measure" style="max-height: none; margin: 0 16px 14px;">{{ t.prompt }}</pre>
+</details>
+{% endfor %}
+{% else %}
+<div class="panel"><div class="empty">no turn has run yet — nothing has been sent to a
+  worker. What a new order on this project is told:
+  <a href="/project/{{ project }}/prompt">its worker prompt</a>.</div></div>
+{% endif %}
+
+{% endblock %}

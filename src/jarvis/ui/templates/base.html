@@ -27,19 +27,153 @@
      whole of it, and it wraps rather than being clipped by a narrow column. */
   .sid { user-select: all; word-break: break-all; }
 
-  .shell { max-width: 1080px; margin: 0 auto; padding: 0 20px 80px; }
-
-  /* header: wordmark speaks CLI */
-  header {
-    display: flex; align-items: baseline; gap: 18px;
-    padding: 18px 0 14px; border-bottom: 1px solid var(--line);
-  }
+  /* THE SHELL — docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md §1.
+     Fluid: the page takes the screen it is given. A sidebar holds the way around, the
+     top bar holds search, and the content area is a grid of the page's own content and
+     an "on this page" rail. No max width: on a 34" ultrawide a 1080px column left two
+     thirds of the screen empty and turned every page into one long scroll. */
+  :root { --side: 212px; --rail: 232px; --gutter: 24px; }
+  .app { display: grid; grid-template-columns: var(--side) minmax(0, 1fr); min-height: 100vh; }
+  .sidebar { position: sticky; top: 0; height: 100vh; overflow-y: auto;
+             background: color-mix(in srgb, var(--surface) 70%, var(--bg));
+             border-right: 1px solid var(--line); padding: 16px 0 24px;
+             display: flex; flex-direction: column; gap: 4px; }
+  .sidebar .brand { padding: 0 16px 10px; display: flex; flex-direction: column; gap: 6px; }
   .wordmark { font-family: var(--mono); font-size: 18px; font-weight: 700;
               letter-spacing: 0.18em; color: var(--ink); }
   .wordmark .caret { color: var(--amber); }
-  nav { display: flex; gap: 14px; margin-left: auto; }
-  nav a { color: var(--ink-2); font-size: 13.5px; }
-  nav a.here { color: var(--ink); border-bottom: 2px solid var(--amber); padding-bottom: 2px; }
+  .sidebar .chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  nav.side { display: flex; flex-direction: column; }
+  .side-group { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.16em;
+                text-transform: uppercase; color: var(--ink-3); padding: 12px 16px 4px; }
+  nav.side a, .side-list a { display: flex; align-items: center; gap: 8px;
+                             padding: 4px 16px 4px 14px; color: var(--ink-2); font-size: 13.5px;
+                             border-left: 2px solid transparent; }
+  nav.side a:hover, .side-list a:hover { background: var(--raised); text-decoration: none; color: var(--ink); }
+  nav.side a.here { color: var(--ink); border-left-color: var(--amber);
+                    background: color-mix(in srgb, var(--amber) 8%, transparent); }
+  nav.side .nav-badge { margin-left: auto; }
+  .side-list { display: flex; flex-direction: column; }
+  .side-list a { font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; }
+  .side-list a.here { color: var(--ink); border-left-color: var(--cyan); }
+  .side-list .mono { font-size: 11.5px; }
+  .side-foot { margin-top: auto; padding: 14px 16px 0; font-size: 11.5px; color: var(--ink-3); }
+  .side-foot kbd, .kbd { font-family: var(--mono); font-size: 10.5px; padding: 0 5px;
+                         border: 1px solid var(--line); border-radius: 4px; color: var(--ink-2); }
+
+  .main { min-width: 0; display: flex; flex-direction: column; }
+  .topbar { position: sticky; top: 0; z-index: 20; display: flex; align-items: center; gap: 12px;
+            padding: 9px var(--gutter); border-bottom: 1px solid var(--line);
+            background: color-mix(in srgb, var(--bg) 92%, transparent); backdrop-filter: blur(6px); }
+  .topbar .crumbs { font-family: var(--mono); font-size: 12.5px; color: var(--ink-3);
+                    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .topbar .crumbs a { color: var(--ink-2); }
+  .topbar .grow { flex: 1; }
+  .topbar .palette-btn { font-family: var(--mono); font-size: 12px; color: var(--ink-3); padding: 4px 10px; }
+  .page { display: grid; grid-template-columns: minmax(0, 1fr); gap: 28px;
+          padding: 0 var(--gutter) 80px; }
+  .page.has-rail { grid-template-columns: minmax(0, 1fr) var(--rail); }
+  .content { min-width: 0; }
+  /* kept for any page or test that still looks for it */
+  .shell { min-width: 0; }
+
+  /* ON THIS PAGE — every h2 becomes a link target and a rail entry (§1) */
+  .rail { position: sticky; top: 56px; align-self: start; max-height: calc(100vh - 70px);
+          overflow-y: auto; padding: 22px 0 0; font-size: 12.5px; }
+  .rail .rail-head { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.16em;
+                     text-transform: uppercase; color: var(--ink-3); margin-bottom: 6px; }
+  .rail a { display: block; padding: 3px 10px; color: var(--ink-3); border-left: 2px solid var(--line);
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .rail a.sub2 { padding-left: 22px; font-size: 11.5px; }
+  .rail a:hover { color: var(--ink); text-decoration: none; }
+  .rail a.on { color: var(--ink); border-left-color: var(--amber); }
+  .rail-mini { display: none; }
+  h2 .anchor, h3 .anchor { visibility: hidden; margin-left: 6px; color: var(--ink-3); font-weight: 400; }
+  h2:hover .anchor, h3:hover .anchor { visibility: visible; }
+  :target, .flash-target { scroll-margin-top: 64px; }
+  .flash-target { animation: flash 1.6s ease-out 1; }
+  @keyframes flash { 0% { box-shadow: 0 0 0 2px var(--amber); } 100% { box-shadow: 0 0 0 0 transparent; } }
+
+  /* LAYOUT UTILITIES — a page opts its sections into columns */
+  .grid { display: grid; gap: 4px 28px; align-items: start;
+          grid-template-columns: repeat(auto-fit, minmax(min(100%, var(--col, 560px)), 1fr)); }
+  .grid > * { min-width: 0; }
+  .grid.dense { grid-auto-flow: dense; }
+  /* a main column and a context column beside it, from wide screens up */
+  @media (min-width: 1500px) {
+    .io-layout, .main-side { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); }
+    .main-side:not(:has(> .proj-side > *)) { grid-template-columns: minmax(0, 1fr); }
+  }
+  .clamp1 { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  /* the work order's card and its asks: one column when it asks nothing */
+  .wo-top:not(:has(> .asks > *)) { grid-template-columns: minmax(0, 1fr); }
+  .wo-top:not(:has(> .asks > *)) > .asks { display: none; }
+  .wo-top > .asks > h2:first-child { margin-top: 18px; }
+  .grid.tight { --col: 420px; }
+  .grid.wide { --col: 760px; }
+  .grid .span-all { grid-column: 1 / -1; }
+  .sec > h2:first-child { margin-top: 34px; }
+  .measure { max-width: 130ch; }
+  .sticky-col { position: sticky; top: 64px; align-self: start; }
+  .fold-head { cursor: pointer; }
+  details.turn > summary { list-style: none; }
+  details.turn > summary::-webkit-details-marker { display: none; }
+  details.turn > summary .row::before { content: "▸"; color: var(--ink-3); width: 10px; flex: none; }
+  details.turn[open] > summary .row::before { content: "▾"; }
+
+  /* AN ORDER'S OWN NAVIGATION — the same strip on every page about one order (§2) */
+  .order-nav { display: flex; flex-wrap: wrap; gap: 2px; align-items: center; margin: 16px 0 0;
+               border-bottom: 1px solid var(--line); }
+  .order-nav a, .order-nav span.here { padding: 7px 12px; font: 600 12px var(--mono); letter-spacing: 0.08em;
+                 color: var(--ink-3); border-bottom: 2px solid transparent; text-transform: uppercase; }
+  .order-nav a:hover { color: var(--ink); text-decoration: none; }
+  .order-nav .here { color: var(--ink); border-bottom-color: var(--amber); }
+  .order-nav .sep { color: var(--line); padding: 0 4px; }
+  .order-nav .ext { text-transform: none; letter-spacing: 0; font-weight: 400; }
+  .order-nav .title { margin-left: auto; font: 13px var(--sans); color: var(--ink-2); padding: 7px 4px;
+                      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 50%; }
+  .jumps { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 0; }
+  .jumps a { font-family: var(--mono); font-size: 12px; padding: 2px 9px; border: 1px solid var(--line);
+             border-radius: 99px; color: var(--ink-2); }
+  .jumps a:hover { border-color: var(--cyan); color: var(--ink); text-decoration: none; }
+
+  /* COMMAND PALETTE (Ctrl/⌘-K) and the shortcut sheet (?) */
+  .palette { position: fixed; inset: 0; z-index: 100; display: none;
+             background: color-mix(in srgb, #000 55%, transparent); }
+  .palette.on { display: block; }
+  .palette .box { width: min(720px, calc(100vw - 32px)); margin: 12vh auto 0; background: var(--surface);
+                  border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
+                  box-shadow: 0 20px 60px rgba(0,0,0,.5); }
+  .palette input[type=text] { border: 0; border-bottom: 1px solid var(--line); border-radius: 0;
+                              padding: 14px 16px; font-size: 16px; background: var(--surface); }
+  .palette ul { list-style: none; margin: 0; padding: 6px 0; max-height: 56vh; overflow-y: auto; }
+  .palette li a { display: flex; gap: 10px; padding: 7px 16px; color: var(--ink-2); }
+  .palette li a .k { font-family: var(--mono); font-size: 11px; color: var(--ink-3); width: 70px; flex: none; }
+  .palette li.on a { background: var(--raised); color: var(--ink); text-decoration: none; }
+  .palette .help { padding: 10px 16px; font-size: 12.5px; color: var(--ink-3); border-top: 1px solid var(--line); }
+  .palette table td { padding: 4px 16px; }
+
+  /* Narrow screens: the sidebar becomes a strip, the rail a picker */
+  @media (max-width: 1399px) {
+    .page.has-rail { grid-template-columns: minmax(0, 1fr); }
+    .rail { display: none; }
+    .rail-mini { display: block; margin: 12px 0 0; }
+    .rail-mini select { width: auto; max-width: 100%; font-size: 12.5px; padding: 4px 8px; }
+  }
+  @media (max-width: 1099px) {
+    :root { --gutter: 16px; }
+    .app { grid-template-columns: minmax(0, 1fr); }
+    .sidebar { position: static; height: auto; flex-direction: row; flex-wrap: wrap;
+               align-items: center; padding: 10px 12px; gap: 8px; border-right: 0;
+               border-bottom: 1px solid var(--line); }
+    .sidebar .brand { flex-direction: row; align-items: center; padding: 0 8px 0 0; }
+    nav.side { flex-direction: row; flex-wrap: wrap; gap: 2px; }
+    nav.side a { border-left: 0; padding: 3px 8px; }
+    nav.side a.here { border-bottom: 2px solid var(--amber); }
+    .side-group, .side-list, .side-foot, .side-projects { display: none; }
+    .topbar { position: static; }
+  }
+
   .daemon { font-family: var(--mono); font-size: 12.5px; }
   .daemon.up { color: var(--green); } .daemon.down { color: var(--red); }
 
@@ -125,8 +259,9 @@
 
   /* Search lives in the chrome, not on a page of its own the user has to find: the
      artifact they want back is usually one they are looking at another page to reach. */
-  .search-box { display: flex; gap: 6px; margin-left: 14px; }
-  .search-box input[type=text] { width: 190px; padding: 4px 9px; font-size: 13px; }
+  .search-box { display: flex; gap: 6px; flex: 0 1 420px; min-width: 180px; }
+  .search-box input[type=text] { width: 100%; padding: 5px 10px; font-size: 13px; }
+  .search-box button { padding: 4px 12px; }
   .search-form { display: flex; gap: 8px; align-items: center; padding: 12px 16px; }
   .search-form input[type=text] { flex: 1; }
   .search-form select { width: auto; }
@@ -228,39 +363,77 @@
 </style>
 </head>
 <body>
-<div class="shell">
-  <header id="live-chrome">
-    <span class="wordmark"><span class="caret">&gt;</span> JARVIS</span>
-    <span class="instance{{ ' prod' if instance.prod }}" title="{{ instance.detail }}"
-      >{{ instance.label }} · {{ instance.shown }}</span>
-    <span class="daemon {{ 'up' if daemon_up else 'down' }}">
-      {{ '● daemon up' if daemon_up else '○ daemon down' }}
-    </span>
-    <nav>
+<div class="app">
+<aside class="sidebar" aria-label="navigation">
+  {# `live-chrome` is a region the dashboard's poll swaps whole (issue #843), so it holds
+     ONLY server-rendered state: the chips and the badged links. The viewer's recent
+     pages are written by script and live outside it, or every poll would wipe them. #}
+  <div id="live-chrome">
+    <div class="brand">
+      <a href="/" class="wordmark" style="text-decoration:none"><span class="caret">&gt;</span> JARVIS</a>
+      <div class="chips">
+        <span class="instance{{ ' prod' if instance.prod }}" title="{{ instance.detail }}"
+          >{{ instance.label }} · {{ instance.shown }}</span>
+        <span class="daemon {{ 'up' if daemon_up else 'down' }}">
+          {{ '● daemon up' if daemon_up else '○ daemon down' }}
+        </span>
+      </div>
+    </div>
+    <nav class="side">
+      <div class="side-group">operate</div>
       <a href="/" class="{{ 'here' if active == 'dashboard' }}">dashboard</a>
+      <a href="/inbox" class="{{ 'here' if active == 'inbox' }}">inbox</a>
       <a href="/neo" class="{{ 'here' if active == 'neo' }}">neo{% if neo_badge %} <span class="nav-badge">{{ neo_badge }}</span>{% endif %}</a>
       <a href="/gates" class="{{ 'here' if active == 'gates' }}">gates{% if gate_badge %} <span class="nav-badge">{{ gate_badge }}</span>{% endif %}</a>
       <a href="/alarms" class="{{ 'here' if active == 'alarms' }}">alarms{% if alarm_badge %} <span class="nav-badge">{{ alarm_badge }}</span>{% endif %}</a>
       <a href="/stuck" class="{{ 'here' if active == 'stuck' }}">stuck</a>
       <a href="/morpheus" class="{{ 'here' if active == 'morpheus' }}">morpheus</a>
-      <a href="/inbox" class="{{ 'here' if active == 'inbox' }}">inbox</a>
+      <div class="side-group">work</div>
       <a href="/backlog" class="{{ 'here' if active == 'backlog' }}">backlog</a>
       <a href="/knowledge" class="{{ 'here' if active == 'knowledge' }}">knowledge</a>
       <a href="/search" class="{{ 'here' if active == 'search' }}">search</a>
+      <div class="side-group">system</div>
       <a href="/config" class="{{ 'here' if active == 'config' }}">config</a>
       <a href="/cost" class="{{ 'here' if active == 'cost' }}">cost</a>
       <a href="/evolution" class="{{ 'here' if active == 'evolution' }}">evolution</a>
     </nav>
-  </header>
-  {# Not on /search itself: that page's own form is the same control, with the scope
-     and kind pickers attached. #}
-  {% if active != 'search' %}
-  <form class="search-box" method="get" action="/search" role="search">
-    <input type="text" name="q" placeholder="search everything"
-           aria-label="search every artifact">
-    <button>Search</button>
-  </form>
+  </div>
+  {% if nav_projects %}
+  <div class="side-projects">
+    <div class="side-group">projects</div>
+    <div class="side-list">
+      {% for name in nav_projects %}
+      <a href="/project/{{ name }}" class="{{ 'here' if project_here == name }}">{{ name }}</a>
+      {% endfor %}
+    </div>
+  </div>
   {% endif %}
+  <div class="side-recent" hidden>
+    <div class="side-group">recent</div>
+    <div class="side-list" id="recent-list"></div>
+  </div>
+  <div class="side-foot">
+    <kbd>Ctrl</kbd> <kbd>K</kbd> go anywhere · <kbd>?</kbd> keys
+  </div>
+</aside>
+<div class="main">
+  <div class="topbar">
+    <div class="crumbs" id="crumbs"></div>
+    <span class="grow"></span>
+    {# Not on /search itself: that page's own form is the same control, with the scope
+       and kind pickers attached. #}
+    {% if active != 'search' %}
+    <form class="search-box" method="get" action="/search" role="search">
+      <input type="text" name="q" placeholder="search everything — or paste an id"
+             aria-label="search every artifact">
+      <button>Search</button>
+    </form>
+    {% endif %}
+    <button type="button" class="palette-btn" data-palette title="Go anywhere — Ctrl/⌘-K">⌘K</button>
+  </div>
+  <div class="page">
+  <div class="content shell">
+  <div class="rail-mini" id="rail-mini" hidden></div>
   {# The fleet brake and the post-reopen ramp, worded as `jarvis status` prints them.
      Its own live region: the dashboard's poll swaps it with the rest (issue #843). #}
   <div id="live-brake">
@@ -299,7 +472,372 @@
     <div class="note-flash" role="status">{{ request.query_params.get('note') }}</div>
   {% endif %}
   {% block content %}{% endblock %}
+  </div>
+  {# Filled by script from this page's own headings — §1 of
+     docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md. #}
+  <aside class="rail" id="rail" aria-label="on this page" hidden></aside>
+  </div>
 </div>
+</div>
+
+<div class="palette" id="palette" role="dialog" aria-label="go anywhere">
+  <div class="box">
+    <input type="text" id="palette-q" placeholder="a page, a project, a section on this page, or an id (wo-…, fo-…, kn-…, q123)"
+           autocomplete="off" aria-label="go to">
+    <ul id="palette-list"></ul>
+    <div class="help" id="palette-help">
+      <span class="kbd">↑</span><span class="kbd">↓</span> choose · <span class="kbd">Enter</span> go ·
+      <span class="kbd">Esc</span> close · <span class="kbd">/</span> search ·
+      <span class="kbd">g</span> then <span class="kbd">d</span> dashboard, <span class="kbd">i</span> inbox,
+      <span class="kbd">n</span> neo, <span class="kbd">g</span> gates, <span class="kbd">a</span> alarms,
+      <span class="kbd">s</span> stuck, <span class="kbd">m</span> morpheus, <span class="kbd">b</span> backlog,
+      <span class="kbd">k</span> knowledge, <span class="kbd">c</span> config, <span class="kbd">$</span> cost,
+      <span class="kbd">e</span> evolution · <span class="kbd">[</span> <span class="kbd">]</span> previous / next section
+    </div>
+  </div>
+</div>
+
+<script>
+// NAVIGABILITY — §1 of docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md.
+// Everything here is presentation: it re-words nothing the server rendered. It gives
+// every heading an address, lists them in a rail, turns every bare OS id into a link to
+// `/go/<id>`, remembers the viewer's recent pages, and adds a palette and shortcuts.
+(function () {
+  var content = document.querySelector('.content');
+  if (!content) return;
+
+  // The ids `/go/` resolves. Anything else stays text.
+  var ID_RE = /\b(?:wo|fo|io|inv|kn|al|mv|bl)-[0-9a-f]{8}\b/g;
+  var ID_EXACT = /^(?:(?:wo|fo|io|inv|kn|al|mv|bl)-[0-9a-f]{8}|q\d+|gate-\d+|#\d+)$/i;
+  var SKIP = { A: 1, TEXTAREA: 1, INPUT: 1, SCRIPT: 1, STYLE: 1, BUTTON: 1, SELECT: 1,
+               OPTION: 1, PRE: 1, LABEL: 1 };
+
+  function slug(text) {
+    return 'sec-' + text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 48);
+  }
+
+  function headingText(h) {
+    var c = h.cloneNode(true);
+    c.querySelectorAll('.anchor').forEach(function (a) { a.remove(); });
+    return c.textContent.replace(/\s+/g, ' ').trim();
+  }
+
+  // 1. Every h2 (and every h3 inside a section) gets an id and a `#` to copy.
+  function anchorHeadings(root) {
+    var seen = {};
+    root.querySelectorAll('h2, h3').forEach(function (h) {
+      if (!h.id) {
+        // a heading that is the first child of an addressed section borrows its id
+        var parent = h.parentElement;
+        if (parent && parent.id && parent.firstElementChild === h && parent.tagName !== 'DIV'
+            && !parent.classList.contains('tabpanel')) {
+          h.dataset.target = parent.id;
+        } else {
+          var base = slug(headingText(h) || 'section'), id = base, n = 2;
+          while (document.getElementById(id) || seen[id]) { id = base + '-' + n++; }
+          seen[id] = 1;
+          h.id = id;
+        }
+      }
+      if (!h.querySelector('.anchor')) {
+        var a = document.createElement('a');
+        a.className = 'anchor';
+        a.href = '#' + (h.dataset.target || h.id);
+        a.textContent = '#';
+        a.title = 'link to this section';
+        h.appendChild(a);
+      }
+    });
+  }
+
+  // 2. Bare ids in text become links. The page's OWN id is left alone.
+  function autolink(root) {
+    var here = location.pathname;
+    var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode: function (node) {
+        if (!node.nodeValue || node.nodeValue.search(ID_RE) < 0) return NodeFilter.FILTER_REJECT;
+        for (var el = node.parentElement; el && el !== root; el = el.parentElement) {
+          if (SKIP[el.tagName] || el.classList.contains('sid') || el.hasAttribute('data-nolink')) {
+            return NodeFilter.FILTER_REJECT;
+          }
+        }
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    var nodes = [];
+    while (walker.nextNode()) nodes.push(walker.currentNode);
+    nodes.forEach(function (node) {
+      var text = node.nodeValue, frag = document.createDocumentFragment(), last = 0, m;
+      ID_RE.lastIndex = 0;
+      while ((m = ID_RE.exec(text))) {
+        if (here.indexOf(m[0]) >= 0) continue;
+        frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+        var a = document.createElement('a');
+        a.href = '/go/' + m[0];
+        a.className = 'mono idlink';
+        a.textContent = m[0];
+        frag.appendChild(a);
+        last = m.index + m[0].length;
+      }
+      if (last === 0) return;
+      frag.appendChild(document.createTextNode(text.slice(last)));
+      node.parentNode.replaceChild(frag, node);
+    });
+  }
+
+  // 3. The rail: this page's sections, with the one in view lit.
+  var rail = document.getElementById('rail'), mini = document.getElementById('rail-mini');
+  var sections = [];
+  function buildRail() {
+    sections = [];
+    content.querySelectorAll('h2, h3').forEach(function (h) {
+      if (h.closest('.palette')) return;
+      var target = h.dataset.target || h.id;
+      var text = headingText(h);
+      if (!target || !text) return;
+      // an h3 is listed only under a section that is itself listed
+      if (h.tagName === 'H3' && !h.closest('section[id], .sec')) return;
+      sections.push({ el: h, id: target, text: text, sub: h.tagName === 'H3' });
+    });
+    if (sections.length < 3) { rail.hidden = true; mini.hidden = true;
+      document.querySelector('.page').classList.remove('has-rail'); return; }
+    var title = (document.title || '').replace(/\s+[—-]\s+Jarvis$/, '');
+    rail.innerHTML = '<div class="rail-head">on this page</div>';
+    var select = document.createElement('select');
+    select.setAttribute('aria-label', 'jump to a section');
+    select.innerHTML = '<option value="">sections — ' + sections.length + '</option>';
+    sections.forEach(function (s) {
+      var a = document.createElement('a');
+      a.href = '#' + s.id;
+      a.textContent = s.text;
+      a.title = s.text;
+      if (s.sub) a.className = 'sub2';
+      s.link = a;
+      rail.appendChild(a);
+      var o = document.createElement('option');
+      o.value = s.id;
+      o.textContent = (s.sub ? '  · ' : '') + s.text;
+      select.appendChild(o);
+    });
+    select.addEventListener('change', function () { if (select.value) location.hash = select.value; });
+    mini.innerHTML = '';
+    mini.appendChild(select);
+    rail.hidden = false;
+    mini.hidden = false;
+    document.querySelector('.page').classList.add('has-rail');
+    spy();
+    document.getElementById('crumbs').dataset.title = title;
+  }
+
+  var current = null;
+  function spy() {
+    var y = 90, best = null;
+    sections.forEach(function (s) {
+      if (!s.el.offsetParent) return;  // inside a closed tab or fold
+      if (s.el.getBoundingClientRect().top <= y) best = s;
+    });
+    if (!best) best = sections.filter(function (s) { return s.el.offsetParent; })[0] || null;
+    if (best === current) return;
+    if (current && current.link) current.link.classList.remove('on');
+    current = best;
+    var crumbs = document.getElementById('crumbs');
+    if (current) {
+      if (current.link) current.link.classList.add('on');
+      crumbs.textContent = (crumbs.dataset.title || '') + '  ›  ' + current.text;
+    }
+  }
+  var ticking = false;
+  window.addEventListener('scroll', function () {
+    if (ticking) return;
+    ticking = true;
+    requestAnimationFrame(function () { ticking = false; spy(); });
+  }, { passive: true });
+
+  // 4. A hash opens whatever fold holds it (a folded turn) and flashes it.
+  function reveal() {
+    var id = decodeURIComponent(location.hash.slice(1));
+    if (!id) return;
+    var target = document.getElementById(id);
+    if (!target) return;
+    for (var el = target; el; el = el.parentElement) {
+      if (el.tagName === 'DETAILS') el.open = true;
+    }
+    target.classList.remove('flash-target');
+    void target.offsetWidth;
+    target.classList.add('flash-target');
+    setTimeout(function () { target.scrollIntoView({ block: 'start' }); }, 0);
+  }
+  window.addEventListener('hashchange', reveal);
+
+  // 5. Recent pages — a per-browser convenience, never OS state (assumption 3).
+  var RECENT_KEY = 'jarvis.recent';
+  function readRecent() {
+    try { return JSON.parse(localStorage.getItem(RECENT_KEY) || '[]') || []; } catch (e) { return []; }
+  }
+  function remember() {
+    var url = location.pathname + location.search;
+    var title = (document.title || url).replace(/\s+[—-]\s+Jarvis$/, '');
+    var list = readRecent().filter(function (r) { return r.url !== url; });
+    list.unshift({ url: url, title: title });
+    try { localStorage.setItem(RECENT_KEY, JSON.stringify(list.slice(0, 15))); } catch (e) {}
+    var box = document.getElementById('recent-list');
+    if (!box) return;
+    var shown = list.slice(1, 9);
+    box.innerHTML = '';
+    shown.forEach(function (r) {
+      var a = document.createElement('a');
+      a.href = r.url;
+      a.textContent = r.title;
+      a.title = r.url;
+      box.appendChild(a);
+    });
+    box.parentElement.hidden = !shown.length;
+  }
+
+  // 6. The palette.
+  var palette = document.getElementById('palette'), pq = document.getElementById('palette-q'),
+      plist = document.getElementById('palette-list'), picked = 0, items = [];
+  function candidates(q) {
+    var out = [];
+    if (ID_EXACT.test(q.trim())) out.push({ k: 'go to', label: q.trim(), href: '/go/' + encodeURIComponent(q.trim().replace(/^#/, 'issue-')) });
+    document.querySelectorAll('nav.side a').forEach(function (a) {
+      out.push({ k: 'page', label: a.firstChild.textContent.trim(), href: a.getAttribute('href') });
+    });
+    document.querySelectorAll('.side-projects a').forEach(function (a) {
+      var name = a.textContent.trim();
+      out.push({ k: 'project', label: name, href: a.getAttribute('href') });
+      out.push({ k: 'config', label: name + ' config', href: '/config?scope=projects.' + encodeURIComponent(name) });
+      out.push({ k: 'prompt', label: name + ' worker prompt', href: '/project/' + encodeURIComponent(name) + '/prompt' });
+    });
+    document.querySelectorAll('.order-nav a').forEach(function (a) {
+      out.push({ k: 'this order', label: a.textContent.trim(), href: a.getAttribute('href') });
+    });
+    sections.forEach(function (s) { out.push({ k: 'section', label: s.text, href: '#' + s.id }); });
+    readRecent().slice(1).forEach(function (r) { out.push({ k: 'recent', label: r.title, href: r.url }); });
+    if (q.trim()) out.push({ k: 'search', label: 'search for “' + q.trim() + '”', href: '/search?q=' + encodeURIComponent(q.trim()) });
+    return out;
+  }
+  function score(label, q) {
+    // every query character in order; a tighter, earlier match scores higher
+    label = label.toLowerCase(); q = q.toLowerCase().trim();
+    if (!q) return 1;
+    var at = label.indexOf(q);
+    if (at >= 0) return 1000 - at;
+    var i = 0, gaps = 0, last = -1;
+    for (var c = 0; c < label.length && i < q.length; c++) {
+      if (label[c] === q[i]) { if (last >= 0) gaps += c - last - 1; last = c; i++; }
+    }
+    return i === q.length ? 500 - gaps : 0;
+  }
+  function draw() {
+    var q = pq.value;
+    items = candidates(q).map(function (it) {
+      return { it: it, s: it.k === 'go to' || it.k === 'search' ? 2000 - (it.k === 'search' ? 1999 : 0) : score(it.label, q) };
+    }).filter(function (x) { return x.s > 0; })
+      .sort(function (a, b) { return b.s - a.s; }).slice(0, 40).map(function (x) { return x.it; });
+    picked = Math.min(picked, Math.max(items.length - 1, 0));
+    plist.innerHTML = '';
+    items.forEach(function (it, i) {
+      var li = document.createElement('li');
+      if (i === picked) li.className = 'on';
+      var a = document.createElement('a');
+      a.href = it.href;
+      var k = document.createElement('span');
+      k.className = 'k';
+      k.textContent = it.k;
+      a.appendChild(k);
+      a.appendChild(document.createTextNode(it.label));
+      a.addEventListener('click', close);
+      li.appendChild(a);
+      plist.appendChild(li);
+    });
+    var on = plist.querySelector('li.on');
+    if (on) on.scrollIntoView({ block: 'nearest' });
+  }
+  function open() { palette.classList.add('on'); pq.value = ''; picked = 0; draw(); pq.focus(); }
+  function close() { palette.classList.remove('on'); }
+  function go(href) { close(); if (href.charAt(0) === '#') { location.hash = href.slice(1); } else { location.href = href; } }
+  pq.addEventListener('input', function () { picked = 0; draw(); });
+  pq.addEventListener('keydown', function (e) {
+    if (e.key === 'ArrowDown') { picked = Math.min(picked + 1, items.length - 1); draw(); e.preventDefault(); }
+    else if (e.key === 'ArrowUp') { picked = Math.max(picked - 1, 0); draw(); e.preventDefault(); }
+    else if (e.key === 'Enter' && items[picked]) { go(items[picked].href); e.preventDefault(); }
+    else if (e.key === 'Escape') { close(); }
+  });
+  palette.addEventListener('click', function (e) { if (e.target === palette) close(); });
+  document.querySelectorAll('[data-palette]').forEach(function (b) { b.addEventListener('click', open); });
+
+  // 7. Shortcuts — never while typing (assumption 8).
+  var G = { d: '/', i: '/inbox', n: '/neo', g: '/gates', a: '/alarms', s: '/stuck', m: '/morpheus',
+            b: '/backlog', k: '/knowledge', c: '/config', $: '/cost', e: '/evolution' };
+  var pendingG = 0;
+  function typing(el) {
+    return el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable);
+  }
+  function step(dir) {
+    var visible = sections.filter(function (s) { return s.el.offsetParent; });
+    var i = visible.indexOf(current) + dir;
+    if (visible[i]) location.hash = visible[i].id;
+  }
+  document.addEventListener('keydown', function (e) {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); palette.classList.contains('on') ? close() : open(); return; }
+    if (e.key === 'Escape' && palette.classList.contains('on')) { close(); return; }
+    if (typing(document.activeElement) || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (pendingG && Date.now() - pendingG < 1200 && G[e.key]) { pendingG = 0; location.href = G[e.key]; return; }
+    pendingG = 0;
+    if (e.key === 'g') { pendingG = Date.now(); return; }
+    if (e.key === '/') { var s = document.querySelector('.search-box input, .search-form input[type=text]'); if (s) { e.preventDefault(); s.focus(); } return; }
+    if (e.key === '?') { open(); return; }
+    if (e.key === ']') { step(1); return; }
+    if (e.key === '[') { step(-1); }
+  });
+
+  // 8. An id typed into search goes straight to it.
+  document.querySelectorAll('.search-box').forEach(function (f) {
+    f.addEventListener('submit', function (e) {
+      var v = (f.querySelector('input[name=q]').value || '').trim();
+      if (ID_EXACT.test(v)) { e.preventDefault(); location.href = '/go/' + encodeURIComponent(v.replace(/^#/, 'issue-')); }
+    });
+  });
+
+  // 0. FLOW — a page that wraps its sections in `.flow` gets them as grid cells: each h2
+  // and everything up to the next one becomes a `.sec` cell. What comes before the first
+  // h2, and the first section itself when nothing precedes it (the page's own heading
+  // and intro), stays ABOVE the grid at full width: nothing may span an auto-fit grid,
+  // because a spanning item keeps every empty track alive and the cells stop stretching.
+  // Without script the page is the stack it was.
+  function flow(root) {
+    root.querySelectorAll('.flow').forEach(function (f) {
+      if (f.dataset.flowed) return;
+      f.dataset.flowed = '1';
+      var lead = document.createElement('div'), grid = document.createElement('div'),
+          sec = null, first = true;
+      grid.className = 'grid';
+      Array.prototype.slice.call(f.childNodes).forEach(function (n) {
+        if (n.nodeType === 1 && n.tagName === 'H2') {
+          var top = first && !lead.childElementCount && f.dataset.first !== 'cell';
+          first = false;
+          sec = document.createElement('div');
+          sec.className = 'sec';
+          (top ? lead : grid).appendChild(sec);
+        }
+        (sec || lead).appendChild(n);
+      });
+      f.appendChild(lead);
+      if (grid.childElementCount) f.appendChild(grid);
+    });
+  }
+
+  // The dashboard's poll swaps regions wholesale; it calls this on what it swapped in.
+  window.jarvisEnhance = function (root) { anchorHeadings(root); autolink(root); buildRail(); };
+  flow(content);
+  anchorHeadings(content);
+  autolink(content);
+  buildRail();
+  remember();
+  reveal();
+})();
+</script>
 <script>
 // Tabs, for every `.tabbed` container on the page. Nothing is hidden until `.js` is on
 // the container — §6 of docs/superpowers/specs/2026-08-23-the-work-order-record.md.

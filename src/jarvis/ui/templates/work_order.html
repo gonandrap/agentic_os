@@ -5,6 +5,7 @@
 {% import "_states.html" as states_ui %}
 {% import "_review.html" as review_ui %}
 {% import "_brake.html" as brake_ui %}
+{% import "_order_nav.html" as nav %}
 {% block title %}{{ wo.id }} — Jarvis{% endblock %}
 {% block content %}
 
@@ -17,7 +18,15 @@
 {% set pending = review.placement if review else ('attention' if wo.needs_attention else 'reply') %}
 
 <h2><a href="/project/{{ project }}">{{ project }}</a> / <span class="mono">{{ wo.id }}</span></h2>
-<div class="panel" style="padding: 14px 16px;">
+{{ nav.order_nav(project, wo, 'record') }}
+{{ nav.debug_jumps('/wo/' ~ project ~ '/' ~ wo.id ~ '/debug') }}
+
+{# AT WIDTH — §5 of docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md:
+   the order's card on the left, everything it asks of the reader on the right, the tabs
+   full width under both. One column when nothing is asked. #}
+<div class="grid wo-top" style="--col: 680px;">
+<div class="wo-card">
+<div class="panel" style="padding: 14px 16px; margin-top: 18px;">
   <div style="display:flex; gap: 12px; align-items: baseline; flex-wrap: wrap;">
     <strong style="font-size: 17px;">{{ wo.title }}</strong>
     <span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span>
@@ -269,6 +278,8 @@
     {% endif %}
   </form>
 </div>
+</div>
+<div class="asks">
 
 {# The one command that moves a dead order, and it is ABOVE THE TABS: an ask hidden
    behind a tab is an ask that does not happen (§6 of the work-order-record spec).
@@ -518,6 +529,9 @@
 {# Below the rounds, because it is what came OUT of them — and once for the whole order
    rather than once per round, which is the thing the per-round fragment could not be. #}
 {{ issues_ui.unit(issues) }}
+
+</div>
+</div>
 
 {# The three readings of one work order. Everything above stays outside the tabs — an
    ask hidden behind a tab is an ask that does not happen. §6 of

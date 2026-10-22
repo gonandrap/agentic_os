@@ -323,6 +323,21 @@ def feature_context(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] |
     return {"fo": fo, "children": store.feature_children(fo["id"], kinds=WORKER_CHILDREN)}
 
 
+def knowledge_for(central: CentralStore, project: ProjectSpec, wo: dict[str, Any],
+                  cfg: OsConfig) -> KnowledgeBrief:
+    """The knowledge brief a dispatch of `wo` carries — shared with the dashboard's prompt preview"""
+    return central.knowledge_brief(
+        project.name,
+        pinned_limit=cfg.knowledge_inject_limit,
+        digest_limit=cfg.knowledge_digest_limit,
+        digest_chars=cfg.knowledge_digest_chars,
+        title=wo["title"],
+        hint_limit=cfg.knowledge_hint_limit,
+        hint_chars=cfg.knowledge_hint_chars,
+        pinned_chars=cfg.knowledge_pinned_chars,
+    )
+
+
 def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
                         knowledge: KnowledgeBrief | None = None,
                         design_doc: dict[str, str] | None = None,
@@ -1166,16 +1181,7 @@ def dispatch_work_order(
     from . import budget, context, worker_session
 
     cfg = os_config or OsConfig()
-    knowledge = central.knowledge_brief(
-        project.name,
-        pinned_limit=cfg.knowledge_inject_limit,
-        digest_limit=cfg.knowledge_digest_limit,
-        digest_chars=cfg.knowledge_digest_chars,
-        title=wo["title"],
-        hint_limit=cfg.knowledge_hint_limit,
-        hint_chars=cfg.knowledge_hint_chars,
-        pinned_chars=cfg.knowledge_pinned_chars,
-    )
+    knowledge = knowledge_for(central, project, wo, cfg)
     prompt = build_worker_prompt(wo, project, knowledge,
                                  design_doc=materialize_design_doc(store, project, wo),
                                  feature=feature_context(store, wo),

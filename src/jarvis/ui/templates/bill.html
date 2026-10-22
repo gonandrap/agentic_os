@@ -1,7 +1,11 @@
 {% extends "base.html" %}
 {% import "_bill.html" as bill_ui %}
+{% import "_order_nav.html" as nav %}
 {% block title %}bill — {{ bill.id }} — Jarvis{% endblock %}
 {% block content %}
+{# Sections reflow into columns at width — `.flow` in base.html, §5 of
+   docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md. #}
+<div class="flow" style="--col: 760px;">
 
 <h2>What {{ bill.id }} cost</h2>
 
@@ -21,6 +25,9 @@
     {{ bill.title }}
   </span>
 </div>
+{% if bill.kind != 'feature_order' %}
+{{ nav.order_nav(bill.project, {'id': bill.id, 'title': bill.title}, 'cost') }}
+{% endif %}
 
 {{ bill_ui.headline(bill) }}
 
@@ -282,4 +289,5 @@
   Every figure on this page is {{ bill.floor_reason }}.
 </p>
 
+</div>
 {% endblock %}
