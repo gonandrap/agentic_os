@@ -15,7 +15,7 @@ MIN_FIELD_CHARS = 40
 #: Shortest quote that can still be found again in the thing it was quoted from
 MIN_QUOTE_CHARS = 20
 
-#: Longest each prose field may be: the user reads every finding, and a wall of text is skimmed, not decided
+#: Longest each prose field may be: the user reads every finding
 MAX_FIELD_CHARS = {
     "symptom": 300,
     "root_cause": 600,
@@ -313,7 +313,7 @@ def clip(text: str, limit: int) -> str:
 def render_digest(report: dict[str, Any],
                   filed_orders: dict[str, list[dict[str, Any]]] | None = None,
                   limit: int = 200) -> list[str]:
-    """The report one line per finding plus its work — what a reader decides from before opening any finding"""
+    """The report one line per finding plus its work"""
     lines: list[str] = []
     if report.get("summary"):
         lines += [report["summary"], ""]
