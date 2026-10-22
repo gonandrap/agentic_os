@@ -78,6 +78,8 @@
   <p class="kv mono" style="margin: 8px 0 0;">
     {{ window.label }} · {{ window.local_label }}
   </p>
+  {# docs/superpowers/specs/2026-10-22-cost-tab-precompute.md §Staleness display #}
+  {% if cached_at %}<p class="kv sub" style="margin: 2px 0 0;">computed {{ (now - cached_at)|int }}s ago</p>{% endif %}
 </div>
 
 <div class="panel" style="margin-top: 14px; padding: 14px 16px;">
