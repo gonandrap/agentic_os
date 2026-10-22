@@ -12958,9 +12958,7 @@ REVIEWS_GATE = _Pass(
     "whatever status it was filed under",
     "daemon.reviews_gate", reviews_gate)
 
-#: The SECOND shared rule, for the same reason: `project_store.work_orders_awaiting_validation`
-#: filters on `OPEN_STATUSES` alone, so a round the panel owns outlives whatever status the row
-#: sits in (issue #1199, kn-4b2304ef)
+#: Shared for REVIEWS_GATE's reason: the panel's sweep filters on `OPEN_STATUSES` (issue #1199)
 JUDGES_ROUND = _Pass(
     "Daemon.validation_tick",
     "the panel owns a round on this row, so it judges it — a validation "

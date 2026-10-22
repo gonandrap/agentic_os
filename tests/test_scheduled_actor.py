@@ -414,7 +414,7 @@ def test_the_passs_own_hold_gate_is_unchanged(jarvis_home, project):
     assert runnable_round(store, row) is None
 
 
-# -- issue #1199: the panel's selection is `OPEN_STATUSES`, so the pass is registered under all of them
+# -- issue #1199: the panel's selection is `OPEN_STATUSES`, so every open status carries the pass
 
 def _ci_held_round(store: ProjectStore, wo_id: str) -> dict:
     """Round one closed `failed` on `VALIDATION_CI_CAUSE`: the panel re-runs it when CI finishes"""
