@@ -350,12 +350,7 @@ REPEAT_SECONDS = 3600
 
 
 def dedupe_key(c: Candidate) -> str:
-    """One defect's bucket: the origin unit and the file, or '' when no code is named
-
-    Per Q2109: the seats of one panel word one mechanism as several findings naming
-    DIFFERENT symbols in one file (decisions #23-#25, #14/#16/#18), so a symbol-level
-    key leaves the leak open. One patch covers the file, so the file is the bucket.
-    """
+    """One defect's bucket: origin unit + file, '' when no code is named (spec §3.2, Q2109)"""
     path = c.file.strip().lower()
     if not path or not c.parent_wo_id:
         return ""

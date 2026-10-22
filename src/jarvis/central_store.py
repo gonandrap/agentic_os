@@ -606,8 +606,7 @@ ADDED_COLUMNS = {
     },
 }
 
-# Indexes over columns ADDED_COLUMNS backfills: on an older home they do not exist yet
-# when SCHEMA runs, so these wait until after the migration.
+# Indexes over columns ADDED_COLUMNS backfills, which SCHEMA runs too early to see
 POST_MIGRATION_SCHEMA = """
 CREATE INDEX IF NOT EXISTS idx_steward_decisions_dedupe
     ON steward_decisions(dedupe_key, duplicate_of);
@@ -704,11 +703,7 @@ class CentralStore:
 
     def steward_dedupe_bucket(self, dedupe_key: str,
                               limit: int = 1) -> list[dict[str, Any]]:
-        """One dedupe bucket's own decisions, newest first: never a duplicate, never a drop
-
-        A dropped candidate decided nothing to collapse onto, and a severer wording of
-        the same defect must still reach the steward's rules.
-        """
+        """One dedupe bucket's own decisions, newest first: never a duplicate, never a drop"""
         rows = self.conn.execute(
             "SELECT id FROM steward_decisions WHERE dedupe_key=? "
             "AND duplicate_of=0 AND outcome<>'drop' ORDER BY id DESC LIMIT ?",
