@@ -166,6 +166,7 @@ class SystemdRunner:
             return None
         if usec <= 0:
             return None
+        # Class 4: converts between two real clocks, CLOCK_BOOTTIME and the epoch (docs/superpowers/specs/2026-10-15-burn-down-the-clock-hygiene-allowlist.md §0.9)
         boot_epoch = time.time() - time.clock_gettime(time.CLOCK_BOOTTIME)
         return boot_epoch + usec / 1e6
 

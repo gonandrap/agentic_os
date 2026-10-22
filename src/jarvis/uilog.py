@@ -11,6 +11,7 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import db
 from .paths import logs_dir
 
 #: Rotate at 512 KiB, keeping one previous file
@@ -91,7 +92,7 @@ def _append(path: Path, text: str) -> None:
 
 def record_error(method: str, path: str, exc: BaseException) -> None:
     """Write one `[ERROR]` entry, header line plus indented traceback"""
-    stamp = time.strftime(_STAMP, time.localtime())
+    stamp = time.strftime(_STAMP, time.localtime(db.now()))
     tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     body = "".join(f"    {line}\n" for line in tb.rstrip("\n").splitlines())
     # Newlines in the exception message would forge a second entry; flatten them
@@ -102,7 +103,7 @@ def record_error(method: str, path: str, exc: BaseException) -> None:
 
 def record_access(method: str, path: str, status: int, duration_ms: float) -> None:
     """Write one access line"""
-    stamp = time.strftime(_STAMP, time.localtime())
+    stamp = time.strftime(_STAMP, time.localtime(db.now()))
     _append(access_log_path(),
             f"{stamp} [{status}] {method} {path} {duration_ms:.0f}ms\n")
 
@@ -114,7 +115,7 @@ def dump_stacks(note: str = "") -> Path | None:
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists() and path.stat().st_size >= MAX_BYTES:
             path.replace(path.with_name(path.name + ".1"))
-        stamp = time.strftime(_STAMP, time.localtime())
+        stamp = time.strftime(_STAMP, time.localtime(db.now()))
         with path.open("a") as f:
             f.write(f"\n{stamp} [WEDGE] {note}\n")
             f.flush()
@@ -206,7 +207,7 @@ def read_errors(cursor: str = "",
         offset = _resume_at(cursor, st, head)
         f.seek(offset)
         raw = f.read()
-    cutoff = time.time() - within_seconds
+    cutoff = db.now() - within_seconds
     errors = [e for e in _parse(raw.decode("utf-8", errors="replace"))
               if e.ts >= cutoff]
     # The cursor advances past the entries the filter dropped: they have been read and dismissed
@@ -248,7 +249,7 @@ def recent_errors(within_seconds: float = ERROR_WINDOW_SECONDS,
         size = f.seek(0, 2)
         f.seek(max(0, size - TAIL_BYTES))
         raw = f.read()
-    cutoff = time.time() - within_seconds
+    cutoff = db.now() - within_seconds
     found = [e for e in _parse(raw.decode("utf-8", errors="replace"))
              if e.ts >= cutoff]
     return found[-limit:][::-1], len(found)

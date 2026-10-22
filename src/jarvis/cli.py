@@ -339,9 +339,11 @@ def _pretty(data: Any, indent: int = 0) -> None:
 
 
 def _age(ts: float | None) -> str:
+    from . import db  # lazily, like every other sibling this module reaches for
+
     if not ts:
         return "-"
-    delta = time.time() - ts
+    delta = db.now() - ts
     if delta < 90:
         return f"{int(delta)}s"
     if delta < 5400:

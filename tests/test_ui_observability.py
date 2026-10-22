@@ -13,7 +13,7 @@ pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from jarvis import daemon as daemon_mod  # noqa: E402
-from jarvis import invariants, ops, release, systemd_units, uilog  # noqa: E402
+from jarvis import db, invariants, ops, release, systemd_units, uilog  # noqa: E402
 from jarvis.catalog import UiHealthConfig  # noqa: E402
 from jarvis.catalog import load_catalog  # noqa: E402
 from jarvis.central_store import CentralStore  # noqa: E402
@@ -97,7 +97,7 @@ def test_the_first_tick_ever_does_not_alert_on_a_log_full_of_history(started,
                                                                     catalog_file):
     """What 0.5.5 actually did to production"""
     uilog.ui_log_path().parent.mkdir(parents=True, exist_ok=True)
-    old = time.strftime(uilog._STAMP, time.localtime(time.time() - 7 * 24 * 3600))
+    old = time.strftime(uilog._STAMP, time.localtime(db.now() - 7 * 24 * 3600))
     with uilog.ui_log_path().open("a") as f:
         for i in range(4):
             f.write(f"{old} [ERROR] GET /neo — UndefinedError: 'opinions{i}' undefined\n"
@@ -277,7 +277,7 @@ def _held_order(project, *, resumed: bool):
     """Issue 887 on the page: 45m worked of 5h24m in `running`, the rest held"""
     from jarvis.worker_session import PAUSE_USAGE_LIMIT
 
-    now = time.time()
+    now = db.now()
     t0 = now - HELD_WALL
     store = ProjectStore(project)
     try:
@@ -395,6 +395,7 @@ def _limiter(client) -> dict:
 
 
 def _wait_until(predicate, timeout: float = 20.0) -> bool:
+    # clock-exempt: class 3 — spin-waits on the wedged anyio thread pool's own limiter figures, which only real threads release
     deadline = time.time() + timeout
     while time.time() < deadline:
         if predicate():
@@ -438,6 +439,7 @@ def test_healthz_answers_while_the_pool_is_wedged_and_a_sync_route_cannot(
                 assert _wait_until(
                     lambda: client.get("/healthz").json()["pool_healthy"] is False)
 
+                # clock-exempt: class 4 — the instant compared against is real elapsed wall time proving /healthz answers while the pool is wedged, which no patched jarvis.db.now produces
                 t0 = time.time()
                 r = client.get("/healthz")
                 assert time.time() - t0 < 5          # answers, while wedged
@@ -777,7 +779,7 @@ def test_doctor_reports_the_wedge_and_the_self_restarts(wedged):
     d, _, _ = wedged
     uilog.record_wedge(limiter=WEDGED["limiter"], uptime_seconds=14400.0,
                        version="0.10.0")
-    assert d.check_ui_health(now=time.time()) == "restarted"
+    assert d.check_ui_health(now=db.now()) == "restarted"
 
     found = [v for v in invariants.check_os() if v.invariant == "INV-UI-WEDGED"]
     assert len(found) == 1
@@ -792,7 +794,7 @@ def test_doctor_stops_reporting_a_wedge_a_day_old(started):
     """The restarted dashboard is a NEW process and never comes back to delete the stamp"""
     uilog.record_wedge(limiter=WEDGED["limiter"], uptime_seconds=1.0, version="0.10.0")
     stamp = uilog.read_wedge()
-    old = time.time() - uilog.ERROR_WINDOW_SECONDS - 60
+    old = db.now() - uilog.ERROR_WINDOW_SECONDS - 60
     uilog.wedge_stamp_path().write_text(
         json.dumps({**stamp, "since": old, "at": old}))
 

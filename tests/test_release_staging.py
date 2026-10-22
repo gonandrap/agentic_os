@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import release
+from jarvis import db, release
 from jarvis.project_store import ProjectStore
 
 # The deploy script under test
@@ -69,7 +69,7 @@ def _stage(wo_id: str, version: str = "0.6.0", staged_at: float | None = None) -
     marker = {
         "wo_id": wo_id, "project": "jarvis_os", "version": version,
         "tag": f"jarvis-{version}",
-        "staged_at": time.time() if staged_at is None else staged_at,
+        "staged_at": db.now() if staged_at is None else staged_at,
         "state": "staged",
     }
     release.write_marker(marker)
@@ -78,7 +78,7 @@ def _stage(wo_id: str, version: str = "0.6.0", staged_at: float | None = None) -
 
 def _good_runner(reference: float | None = None) -> FakeRunner:
     """Both units restarted after `reference` (default: now-ish)"""
-    now = time.time()
+    now = db.now()
     base = (reference if reference is not None else now) + 5
     return FakeRunner({release.DAEMON_UNIT: base, release.UI_UNIT: base + 1})
 
@@ -140,7 +140,7 @@ def test_marker_already_restarting_is_left_alone(store, store_for):
     wo = store.create_work_order("ship 0.6.0")
     marker = _stage(wo["id"])
     marker["state"] = "restarting"
-    marker["restart_at"] = time.time()
+    marker["restart_at"] = db.now()
     release.write_marker(marker)
     runner = FakeRunner()
 
@@ -164,7 +164,7 @@ def _restarting(wo_id: str, version: str = "0.6.0",
                 restart_at: float | None = None) -> dict:
     marker = _stage(wo_id, version=version)
     marker["state"] = "restarting"
-    marker["restart_at"] = time.time() if restart_at is None else restart_at
+    marker["restart_at"] = db.now() if restart_at is None else restart_at
     release.write_marker(marker)
     return marker
 
@@ -318,7 +318,7 @@ def test_a_staged_marker_past_the_grace_period_is_verified_at_boot(
     """The daemon never got to the restart (down"""
     wo = store.create_work_order("ship 0.6.0")
     store.set_status(wo["id"], "failed")
-    staged_at = time.time() - release.STAGED_BOOT_GRACE - 60
+    staged_at = db.now() - release.STAGED_BOOT_GRACE - 60
     _stage(wo["id"], staged_at=staged_at)
 
     out = release.verify_on_boot(store_for, runner=_good_runner())
@@ -331,7 +331,7 @@ def test_a_failed_verification_marker_is_never_touched_again(store, store_for,
                                                              prod_checkout):
     wo = store.create_work_order("ship 0.6.0")
     marker = _restarting(wo["id"])
-    marker.update(state="failed_verification", reason="test", failed_at=time.time())
+    marker.update(state="failed_verification", reason="test", failed_at=db.now())
     release.write_marker(marker)
     runner = FakeRunner()
 
@@ -373,7 +373,7 @@ def test_the_daemon_resolves_the_markers_project_to_its_store(catalog_file, proj
     store = ProjectStore(project)
     wo = store.create_work_order("ship 0.6.0")
     marker = {"wo_id": wo["id"], "project": "proj_a", "version": "0.6.0",
-              "tag": "jarvis-0.6.0", "staged_at": time.time(), "state": "staged"}
+              "tag": "jarvis-0.6.0", "staged_at": db.now(), "state": "staged"}
     release.write_marker(marker)
 
     daemon = Daemon(load_catalog(catalog_file))
@@ -403,7 +403,7 @@ def test_invariant_quiet_while_the_release_is_in_flight(store):
 def test_invariant_flags_a_marker_stuck_for_over_an_hour(store):
     from jarvis.invariants import check_release_marker
     wo = store.create_work_order("ship 0.6.0")
-    _stage(wo["id"], staged_at=time.time() - 2 * 3600)
+    _stage(wo["id"], staged_at=db.now() - 2 * 3600)
     found = check_release_marker()
     assert [v.invariant for v in found] == ["INV-RELEASE-MARKER-STALE"]
     assert found[0].wo_id == wo["id"]
@@ -413,9 +413,9 @@ def test_invariant_flags_a_marker_stuck_for_over_an_hour(store):
 def test_invariant_flags_a_stuck_restarting_marker(store):
     from jarvis.invariants import check_release_marker
     wo = store.create_work_order("ship 0.6.0")
-    marker = _stage(wo["id"], staged_at=time.time() - 3 * 3600)
+    marker = _stage(wo["id"], staged_at=db.now() - 3 * 3600)
     marker["state"] = "restarting"
-    marker["restart_at"] = time.time() - 2 * 3600
+    marker["restart_at"] = db.now() - 2 * 3600
     release.write_marker(marker)
     assert [v.invariant for v in check_release_marker()] == ["INV-RELEASE-MARKER-STALE"]
 
@@ -424,8 +424,8 @@ def test_invariant_ignores_a_failed_verification_marker(store):
     """That one already raised attention on the work order"""
     from jarvis.invariants import check_release_marker
     wo = store.create_work_order("ship 0.6.0")
-    marker = _stage(wo["id"], staged_at=time.time() - 3 * 3600)
-    marker.update(state="failed_verification", reason="x", failed_at=time.time() - 7200)
+    marker = _stage(wo["id"], staged_at=db.now() - 3 * 3600)
+    marker.update(state="failed_verification", reason="x", failed_at=db.now() - 7200)
     release.write_marker(marker)
     assert check_release_marker() == []
 
@@ -441,7 +441,7 @@ def test_invariant_flags_an_unreadable_marker():
 def test_doctor_reports_the_stale_marker(store):
     from jarvis import ops
     wo = store.create_work_order("ship 0.6.0")
-    _stage(wo["id"], staged_at=time.time() - 2 * 3600)
+    _stage(wo["id"], staged_at=db.now() - 2 * 3600)
     out = ops.run_doctor()
     names = [v["invariant"] for p in out["projects"] for v in p["violations"]]
     assert "INV-RELEASE-MARKER-STALE" in names
@@ -556,6 +556,7 @@ def test_stage_requires_a_work_order_id(tmp_path):
 def test_stage_writes_the_marker_for_real(tmp_path):
     """A real (non-dry) staged run against throwaway git remotes: the marker must be exactly what..."""
     repo = _make_repo(tmp_path)
+    # clock-exempt: class 4 — the instant compared against is `staged_at`, stamped by scripts/shipit.sh:485 with $(date +%s) in a shell subprocess, which no patched jarvis.db.now reaches
     before = int(time.time())
     r = _run_script(repo, tmp_path, "--stage", "0.2.0", "--wo", "wo-abc123",
                     "--base", _head_sha(repo), dry_run=False)

@@ -15,7 +15,7 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from .. import bill, fleet, fleetcost, github, invariants, ops, specs, uilog, wiring
+from .. import bill, db, fleet, fleetcost, github, invariants, ops, specs, uilog, wiring
 from ..bill import OWN_LABEL
 from ..central_store import CentralStore
 from ..daemon import daemon_running
@@ -137,7 +137,7 @@ def _counts_by_status(statuses) -> list[tuple[str, int]]:
 def fmt_age(ts: float | None) -> str:
     if not ts:
         return "–"
-    d = time.time() - ts
+    d = db.now() - ts
     for limit, unit, div in ((90, "s", 1), (5400, "m", 60), (129600, "h", 3600)):
         if d < limit:
             return f"{int(d / div)}{unit}"
@@ -148,7 +148,7 @@ def fmt_left(ts: float | None) -> str:
     """How long until a deadline — the mirror of `fmt_age`"""
     if not ts:
         return "–"
-    d = ts - time.time()
+    d = ts - db.now()
     if d <= 0:
         return "any moment now"
     return f"{int(d / 60)}m" if d >= 60 else f"{int(d)}s"
@@ -235,6 +235,7 @@ class PoolProbe:
         from .. import bugreport
         from ..catalog import UiHealthConfig
 
+        # Real clock: one half of the self-consistent uptime pair (docs/superpowers/specs/2026-10-15-burn-down-the-clock-hygiene-allowlist.md §0.9)
         self.started_at = time.time()
         # The settings the probe last resolved
         self.cfg = UiHealthConfig()
@@ -339,6 +340,7 @@ class PoolProbe:
 
     def _trip(self) -> None:
         """Dump this process's stacks — the only way to get the frames at all, since py-spy could not attach"""
+        # Pairs with `started_at` on the same clock (docs/superpowers/specs/2026-10-15-burn-down-the-clock-hygiene-allowlist.md §0.9)
         stamp = uilog.record_wedge(limiter=self.limiter_figures(),
                                    uptime_seconds=time.time() - self.started_at,
                                    version=self.version)
