@@ -662,6 +662,15 @@ def wake(central: CentralStore, catalog: Catalog, cwd: Path, *, paused: bool = F
                       append_system_prompt=MORPHEUS_PERSONA,
                       permission_mode=catalog.os.default_permission_mode,
                       add_dirs=add_dirs, timeout=cfg.turn_timeout_seconds)
+    except claude_cli.KilledError as e:
+        # BEFORE ClaudeCliError, its base: a kill is not an answer, so it costs no offer (#1161)
+        state["last_error"] = str(e)[:500]
+        state["kills"] = int(state.get("kills") or 0) + 1
+        if not resume:
+            state.pop("session_id", None)
+        _save_session(central, state)
+        log.warning("morpheus turn killed before it answered: %s", e)
+        return "killed"
     except claude_cli.ClaudeCliError as e:
         state.pop("turn_started_ts", None)
         state["last_error"] = str(e)[:500]

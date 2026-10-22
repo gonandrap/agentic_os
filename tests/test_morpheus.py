@@ -434,12 +434,15 @@ def test_a_validation_question_cannot_be_answered_like_a_worker_question(central
 
 
 class FakeTurn:
-    def __init__(self, share: float = 0.1, fail: bool = False):
+    def __init__(self, share: float = 0.1, fail: bool = False,
+                 error: BaseException | None = None):
         self.calls: list[dict] = []
-        self.share, self.fail = share, fail
+        self.share, self.fail, self.error = share, fail, error
 
     def __call__(self, prompt, session_id, **kw):
         self.calls.append({"prompt": prompt, "session_id": session_id, **kw})
+        if self.error is not None:
+            raise self.error
         if self.fail:
             raise claude_cli.ClaudeCliError("boom")
         usage = {"context_peak": int(self.share * 200_000), "context_window": 200_000,
@@ -520,6 +523,23 @@ def test_a_failed_turn_is_recorded_and_still_counts_as_an_offer(central, tmp_pat
     # The CLI may have half-created the session: the next first turn mints a fresh id
     assert "session_id" not in state
     assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH + 60, call=turn) == "idle"
+
+
+def test_a_turn_killed_before_it_answered_costs_no_offer(central, tmp_path):
+    """The release restart SIGTERMs the turn it just enqueued work for (#1161)"""
+    killed = claude_cli.KilledError(claude_cli.Killed(
+        message="claude -p --output-format json... was killed by a signal (rc=143) "
+                "and wrote nothing", rc=143))
+    turn = FakeTurn(error=killed)
+    queued(central, 2)
+    assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH, call=turn) == "killed"
+    state = morpheus.session_state(central)
+    assert state["kills"] == 1 and "rc=143" in state["last_error"]
+    assert not state.get("offers") and not state.get("errors")
+    # The next pass after the restart offers it again at once, not in REOFFER_SECONDS
+    turn.error = None
+    assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH + 10,
+                         call=turn) == "scripts"
 
 
 # -- 6b. the surfaces say what the session is DOING, not only what it is allowed to do (#1162)
