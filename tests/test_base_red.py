@@ -486,6 +486,24 @@ def test_a_stale_reading_never_pauses_a_merge(started, spec, project, fake_gh, l
     assert len(store.list_approvals(wo["id"])) == 1
 
 
+@pytest.mark.parametrize("age,approvals", [(BASE_HEALTH_FRESH_SECONDS - 1, 0),
+                                           (BASE_HEALTH_FRESH_SECONDS + 1, 1)])
+def test_the_base_health_freshness_boundary_is_decided_on_one_clock(
+        started, spec, project, fake_gh, local_base, clock, age, approvals):
+    """Writer and reader decide base-health freshness on one clock (fo-2891ead5 §7.1)"""
+    opt_in(started)
+    store, wo = parked(project)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
+    red_fleet(fake_gh)
+    with clock.moved(-age):
+        poll(started, store)
+
+    started.poll_pull_requests(spec, store)
+
+    assert fact()["checked_at"] == clock.at - age
+    assert len(store.list_approvals(wo["id"])) == approvals
+
+
 def test_the_stored_fact_is_read_once_per_project_per_poll(started, spec, project,
                                                            fake_gh, monkeypatch):
     """REVIEW FINDING 3"""
