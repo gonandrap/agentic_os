@@ -950,7 +950,7 @@ def create_app() -> FastAPI:
             wo["status"] for wo in rows if wo["status"] not in FEATURED_STATUSES)
         return render(request, "dashboard.html", st=st, refresh=REFRESH_SECONDS,
                       featured=featured, rest=rest, rest_counts=rest_counts,
-                      revealed=revealed)
+                      revealed=revealed, model_ids=ops.suggested_model_ids())
 
     @app.get("/search", response_class=HTMLResponse)
     def search_page(request: Request, q: str = "", project: str = "", kind: str = ""):
