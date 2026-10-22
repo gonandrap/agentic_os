@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import claude_cli, hooks, morpheus
+from jarvis import claude_cli, db, hooks, morpheus
 from jarvis.catalog import Catalog, CatalogError, MorpheusConfig, OsConfig, parse_catalog
 from jarvis.central_store import CentralStore
 from jarvis.testing import TEST_EPOCH
@@ -542,6 +542,56 @@ def test_a_turn_killed_before_it_answered_costs_no_offer(central, tmp_path):
                          call=turn) == "scripts"
 
 
+def refused(reset_at: float | None) -> "claude_cli.UsageLimitError":
+    return claude_cli.UsageLimitError(claude_cli.UsageLimit(
+        message="You've hit your session limit · resets 6:20am (America/Los_Angeles)",
+        reset_at=reset_at))
+
+
+def test_a_turn_refused_by_the_usage_window_costs_no_offer_and_waits_for_the_reset(central,
+                                                                                   tmp_path):
+    """The model never answered: the same class as a kill (#1171)"""
+    reset_at = TEST_EPOCH + 4000
+    turn = FakeTurn(error=refused(reset_at))
+    queued(central, 2)
+    assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH,
+                         call=turn) == "usage_limit"
+    state = morpheus.session_state(central)
+    assert state["usage_limits"] == 1 and state["usage_hold_until"] == reset_at
+    assert not state.get("offers") and not state.get("errors")
+    assert morpheus.activity(central, now=TEST_EPOCH + 60)["usage_hold_until"] == reset_at
+    # Not one turn is attempted while the window is spent, whatever is queued
+    turn.error = None
+    assert morpheus.wake(central, catalog(), tmp_path, now=reset_at - 1,
+                         call=turn) == "usage_held"
+    assert len(turn.calls) == 1
+    # The first pass after the reset offers the same batch again
+    assert morpheus.wake(central, catalog(), tmp_path, now=reset_at, call=turn) == "scripts"
+    assert len(turn.calls) == 2
+    assert morpheus.activity(central, now=reset_at)["usage_hold_until"] is None
+
+
+def test_a_refusal_that_named_no_reset_holds_for_the_fallback_delay(central, tmp_path):
+    from jarvis.worker_session import RATE_LIMIT_FALLBACK_DELAY
+
+    queued(central, 2)
+    morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH, call=FakeTurn(error=refused(None)))
+    state = morpheus.session_state(central)
+    assert state["usage_hold_until"] == TEST_EPOCH + RATE_LIMIT_FALLBACK_DELAY
+
+
+def test_the_status_line_says_the_session_is_held_by_the_usage_window(central, tmp_path, capsys,
+                                                                     clock):
+    from jarvis.cli import main
+
+    queued(central, 2)
+    morpheus.wake(central, catalog(), tmp_path, now=db.now(),
+                  call=FakeTurn(error=refused(db.now() + 4000)))
+    assert main(["morpheus", "status"]) == 0
+    out = capsys.readouterr().out
+    assert "(usage limit)" in out and "held until" in out
+
+
 # -- 6b. the surfaces say what the session is DOING, not only what it is allowed to do (#1162)
 
 
@@ -576,14 +626,28 @@ def test_a_queued_item_in_the_reoffer_backoff_says_when_and_why(central, tmp_pat
     act = morpheus.activity(central, now=TEST_EPOCH + 60)
     assert act["due"] == 0 and act["turn_in_flight"] is False
     assert act["held"] == [{"id": item["id"], "offers": 1, "exhausted": False,
-                            "after_error": True,
+                            "cause": "error",
                             "next_offer_ts": TEST_EPOCH + morpheus.REOFFER_SECONDS}]
     for n in range(1, morpheus.MAX_OFFERS):
         morpheus.wake(central, catalog(), tmp_path, call=FakeTurn(fail=True),
                       now=TEST_EPOCH + n * morpheus.REOFFER_SECONDS + 1)
     spent = morpheus.activity(central, now=TEST_EPOCH + 10 * DAY)["held"]
     assert spent == [{"id": item["id"], "offers": morpheus.MAX_OFFERS, "exhausted": True,
-                      "after_error": True, "next_offer_ts": None}]
+                      "cause": "error", "next_offer_ts": None}]
+
+
+def test_an_offer_entry_written_before_the_cause_was_recorded_claims_no_cause(central, capsys,
+                                                                             clock):
+    """Pre-#1161 entries were killed turns rendered as "after an offer" (#1171)"""
+    from jarvis.cli import main
+
+    item = queued(central, 2)
+    central.set_state(morpheus.SESSION_KEY, json.dumps(
+        {"offers": {item["id"]: {"n": 1, "ts": db.now()}}}))
+    assert morpheus.activity(central, now=db.now() + 60)["held"][0]["cause"] is None
+    assert main(["morpheus", "status"]) == 0
+    out = capsys.readouterr().out
+    assert "held back until" in out and "after an offer" not in out
 
 
 def test_the_status_line_separates_the_pause_mode_from_the_activity(central, tmp_path, capsys,
@@ -782,6 +846,22 @@ def test_the_dashboard_shows_each_item_s_id_to_copy(central):
     page = TestClient(create_app()).get("/morpheus")
     assert f'title="click to select, then copy">{item["id"]}</td>' in page.text
     assert "jarvis morpheus unpause" in page.text and "validate the release" in page.text
+
+
+def test_the_dashboard_shows_the_activity_and_its_backoff_not_only_the_pause_mode(central,
+                                                                                  tmp_path):
+    """#1171: the pause mode read healthy while the usage window held every turn"""
+    from fastapi.testclient import TestClient
+
+    from jarvis.ui.app import create_app
+
+    item = queued(central, 2)
+    morpheus.wake(central, catalog(), tmp_path, now=db.now(),
+                  call=FakeTurn(error=refused(db.now() + 4000)))
+    page = TestClient(create_app()).get("/morpheus").text
+    assert "unpaused (follows the fleet)" in page and "(usage limit)" in page
+    # Nothing was offered, so the item is not held back on its own account
+    assert f"{item['id']} offered" not in page
 
 
 def test_the_dashboard_opens_check_and_output_in_a_modal_not_in_the_table(central):

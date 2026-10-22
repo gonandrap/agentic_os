@@ -52,9 +52,11 @@
       {% if act.turn_in_flight %}<span class="tone-active">{{ act.turn_kind or "turn" }} in flight since {{ fmt_ts(act.turn_started_ts) }}</span>
       {% elif act.abandoned_turn_ts %}<span class="tone-warn">idle — the {{ act.turn_kind or "turn" }} started {{ fmt_ts(act.abandoned_turn_ts) }} never finished</span>
       {% else %}idle{% if act.due %} · {{ act.due }} queued due now{% endif %}{% endif %}
+      {% if act.usage_hold_until %}<br><span class="tone-warn">held until {{ fmt_ts(act.usage_hold_until) }} (usage limit)</span>{% endif %}
+      {% set why = {"error": " after a failed turn", "offer": " after an offer"} %}
       {% for h in act.held %}<br>{{ h.id }} offered {{ h.offers }} of {{ act.max_offers }}:
         {% if h.exhausted %}no offer left, it will time out
-        {% else %}held back after {{ "a failed turn" if h.after_error else "an offer" }} until {{ fmt_ts(h.next_offer_ts) }}{% endif %}
+        {% else %}held back{{ why.get(h.cause, "") }} until {{ fmt_ts(h.next_offer_ts) }}{% endif %}
       {% endfor %}</td></tr>
     <tr><th>session</th><td class="mono">{{ sess.get('session_id') or "not started" }}</td></tr>
     <tr><th>turns</th><td class="mono">{{ sess.get('turns') or 0 }} · {{ sess.get('compactions') or 0 }} compaction(s)
