@@ -70,6 +70,17 @@ def test_inbox_ack_lowers_the_paired_flag(started, store):
     assert not store.get_work_order(wo["id"])["needs_attention"]
 
 
+def test_the_cli_inbox_ack_reaches_ops(started, store):
+    wo = flagged(store)
+    item = route(started, store)[0]
+
+    assert cli.main(["inbox", "ack", str(item["id"])]) == 0
+    assert cli.main(["inbox", "ack"]) == 0
+
+    assert route(started, store) == []
+    assert not store.get_work_order(wo["id"])["needs_attention"]
+
+
 def test_inbox_ack_all_lowers_every_paired_flag(started, store):
     a, b = flagged(store), flagged(store)
     route(started, store)

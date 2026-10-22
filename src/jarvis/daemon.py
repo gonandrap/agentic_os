@@ -2805,7 +2805,9 @@ class Daemon:
             turn = worker_session.send(store, project, wo, text, msg_id=anchor)
         except budget_mod.BudgetExhausted as e:
             # The messages stay QUEUED, not `failed`: nothing is wrong with them and the user raising the budget...
-            budget_mod.escalate(store, wo, e.exhausted)
+            if not budget_mod.escalate(store, wo, e.exhausted):
+                # ...but only PARKING forms that hold, so an order it declines retries for ever (kn-1e43fe1a)
+                self._unaffordable(project, store, wo, ids, e.exhausted)
             return False
         except claude_cli.ClaudeCliError as e:
             # THE USER'S WORDS ARE NOT THE OS'S TO DROP (docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §6.)
@@ -2833,6 +2835,28 @@ class Daemon:
             store.set_status(wo["id"], "running")
             store.clear_attention(wo["id"])
         return True
+
+    def _unaffordable(self, project: ProjectSpec, store: ProjectStore, wo: dict,
+                      ids: list[Any], out: budget_mod.Exhaustion) -> None:
+        """Settle messages the budget refuses on an order `budget.escalate` will not park (issue #1195)"""
+        for msg_id in ids:
+            store.record_delivery_failure(msg_id, out.reason, max_attempts=1)
+        log.warning("[%s] message(s) %s to %s are unfunded and nothing parked it: %s",
+                    project.name, ids, wo["id"], out.reason)
+        store.add_event(wo["id"], "delivery_failed",
+                        {"msg_ids": ids, "error": out.reason[:500], "outcome": "failed"})
+        # Not `out.reason`, which offers a raise: `ops.set_work_order_budget` refuses a settled order
+        advice = ("a settled order has nothing left to spend, so file a new work order if "
+                  "the feedback still matters"
+                  if str(wo["status"] or "") in TERMINAL_STATUSES
+                  else "raise its budget with `jarvis wo budget` and send the feedback again")
+        c = out.ceiling
+        store.add_notification(
+            title=f"{wo['id']} never received {len(ids)} message(s)",
+            body=(f"{wo['id']} is {wo['status']} and has spent ${c.spent_usd:.2f} of its "
+                  f"${c.cap_usd:.2f} budget, so the turn that would have carried them was "
+                  f"refused — {advice}."),
+            level="warning", wo_id=wo["id"], source="reconciler")
 
     # -- 5
 
