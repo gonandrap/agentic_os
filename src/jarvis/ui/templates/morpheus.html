@@ -1,6 +1,9 @@
 {% extends "base.html" %}
 {% block title %}Morpheus — Jarvis{% endblock %}
 {% block content %}
+{# Sections reflow into columns at width — `.flow` in base.html, §5 of
+   docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md. #}
+<div class="flow" style="--col: 600px;">
 
 {# docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md #}
 {% set tone = {"queued": "tone-active", "monitoring": "tone-active", "validated": "tone-ok",
@@ -112,4 +115,5 @@ document.querySelectorAll('.peek-modal').forEach(function (d) {
 });
 </script>
 
+</div>
 {% endblock %}

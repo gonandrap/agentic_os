@@ -5,6 +5,16 @@
 {% block content %}
 
 <h2>{{ project_name }} <span class="kv mono">{{ path }}</span></h2>
+{# Everything about this project that lives on another page, one click each —
+   docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md §1. #}
+<div class="jumps" style="margin-bottom: 10px;">
+  <a href="#proj-orders">work orders</a>
+  <a href="/config?scope={{ ('projects.' ~ project_name)|urlencode }}">its config</a>
+  <a href="/project/{{ project_name }}/prompt">its worker prompt</a>
+  <a href="/cost?project={{ project_name|urlencode }}">its cost</a>
+  <a href="/evolution/{{ project_name }}">its evolution</a>
+  <a href="/neo/stats?project={{ project_name|urlencode }}">Neo on it</a>
+</div>
 {# The header box searches the fleet; this one stays inside the project the user is
    already looking at. Widening it again is one click, on the results page. #}
 <form class="panel search-form" method="get" action="/search">
@@ -63,6 +73,11 @@
    trees" rule (§6.1 of the improvement-orders spec) — the findings are what the order's
    own page is for, and the label is kind-aware because `plan_review` here means a
    decision is owed, not a plan awaiting release. #}
+{# AT WIDTH (§5): the work orders are the main column, the planned units above them —
+   improvements, investigations, features — sit beside it. `order` puts the work orders
+   first on screen without moving them in the document. #}
+<div class="grid main-side" style="--col: 560px;">
+<div class="proj-side">
 {% if improvements %}
 <h3>Improvement orders</h3>
 <div class="panel">
@@ -133,7 +148,10 @@
   {% endfor %}
 </div>
 {% endif %}
+</div>
 
+<div class="proj-main" style="order: -1;">
+<h3 id="proj-orders">Work orders</h3>
 <div class="panel">
   {% for wo in featured + rest %}
     {% set m = status_meta.get(wo.status, {'word': wo.status, 'icon': '•', 'tone': 'muted'}) %}
@@ -169,6 +187,8 @@
       {% else %}no work orders yet{% endif %}
     </div>
   {% endfor %}
+</div>
+</div>
 </div>
 
 {# Your own Claude sessions, fetched after this page has rendered: listing them shells

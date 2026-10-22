@@ -137,6 +137,15 @@ def test_at_most_six_findings(analyst_prompt):
     assert "6 findings" in analyst_prompt
 
 
+def test_the_analyst_is_told_the_length_caps_the_validator_enforces(analyst_prompt):
+    """A cap the analyst only learns from a refusal costs a whole rewrite"""
+    from jarvis import findings
+
+    assert f"`root_cause` {findings.MAX_FIELD_CHARS['root_cause']}" in analyst_prompt
+    assert f"`summary` {findings.MAX_SUMMARY_CHARS}" in analyst_prompt
+    assert f"{findings.MAX_QUOTE_CHARS} characters" in analyst_prompt
+
+
 def test_every_ref_shape_in_the_table_gets_its_command():
     """The §3.3 mapping is the deliverable, and the fixture reaches only three of its rows"""
     from jarvis.dispatch import _evidence_checklist

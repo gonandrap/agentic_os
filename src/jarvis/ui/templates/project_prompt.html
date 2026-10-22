@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}worker prompt — {{ project }} — Jarvis{% endblock %}
+{% block content %}
+
+{# WHAT A NEW WORK ORDER ON THIS PROJECT IS TOLD — §4 of
+   docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md. Composed by
+   `dispatch.build_worker_prompt`, the function dispatch calls, for a placeholder order and
+   today's knowledge brief: a PREVIEW, and it says so. What an actual order was sent is on
+   that order's own prompts page. #}
+<h2><a href="/project/{{ project }}">{{ project }}</a> / worker prompt</h2>
+<div class="jumps">
+  <a href="/project/{{ project }}">the project</a>
+  <a href="/config?scope={{ ('projects.' ~ project)|urlencode }}">its config</a>
+  <a href="#prompt">the dispatch prompt</a>
+  <a href="#operation">OPERATION.md</a>
+  <a href="/knowledge">the knowledge base</a>
+</div>
+<p class="sub">A preview: composed today by the same function dispatch calls, for a
+  placeholder order (<span class="mono">{{ preview.wo.id }}</span>) with no feature, spec
+  section or dependencies. Each real order's prompts are on its own page, under
+  <em>prompts</em>.</p>
+
+<div class="grid wide">
+<div class="sec">
+<h2 id="prompt">The dispatch prompt</h2>
+<pre class="request-text" style="max-height: none;">{{ preview.prompt }}</pre>
+</div>
+<div class="sec">
+<h2 id="operation">OPERATION.md</h2>
+<p class="kv mono">{{ preview.operation_path }}</p>
+{% if preview.operation is not none %}
+<pre class="request-text" style="max-height: none;">{{ preview.operation }}</pre>
+{% else %}
+<div class="panel"><div class="empty">no OPERATION.md in this project yet —
+  <code>jarvis adopt</code> writes it.</div></div>
+{% endif %}
+</div>
+</div>
+
+{% endblock %}

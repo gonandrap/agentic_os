@@ -1,6 +1,9 @@
 {% extends "base.html" %}
 {% block title %}{{ inv.id }} — Jarvis{% endblock %}
 {% block content %}
+{# Sections reflow into columns at width — `.flow` in base.html, §5 of
+   docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md. #}
+<div class="flow" style="--col: 600px;">
 {# §2.9 of docs/superpowers/specs/2026-09-27-investigation-orders.md. The CLASSIFICATION
    and the SUBJECT first, then the root cause, then the evidence, then what was filed or
    the duplicate it matched. NO POST action anywhere on this page: there is nothing to
@@ -105,4 +108,5 @@
 </div></div>
 {% endif %}
 
+</div>
 {% endblock %}

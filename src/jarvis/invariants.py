@@ -201,6 +201,13 @@ CATCH_UP_EXHAUSTED_BLOCKER = ("the base moved under the commit the panel accepte
                               "nothing will land this pull request by itself — merge it "
                               "by hand, or `jarvis wo send` the worker to rebase")
 
+#: THE HEAD MOVED OFF THE JUDGED COMMIT AND NO CARRY COULD BE PROVEN ONTO IT (#1188)
+CARRY_UNPROVEN_BLOCKER = ("the head of this pull request is not the commit the panel "
+                          "accepted and the OS could not prove it is that commit plus "
+                          "merges of the base, so nothing will land it by itself — merge "
+                          "it by hand, re-judge it (`jarvis validation force`), or "
+                          "`jarvis wo send` the worker to rebase")
+
 #: What a work order says when the validation panel gave up on it: it kept resubmitting and the panel...
 VALIDATION_STUCK_BLOCKER = ("the review could not be satisfied — the work needs your "
                             "judgement")
@@ -483,6 +490,22 @@ def catch_up_exhausted_hold(store: ProjectStore, wo_id: str) -> dict[str, Any] |
     return newest
 
 
+def carry_unproven_hold(store: ProjectStore, wo_id: str) -> dict[str, Any] | None:
+    """The newest hold, when the OS deferred on a head it could not carry the verdict onto (#1188)"""
+    from . import ops as ops_mod
+
+    held = store.events_of_kind(wo_id, "automerge_held")
+    if not held:
+        return None
+    newest = db.from_json(held[-1]["payload"], {})
+    if (str(newest.get("code") or "") != HELD_BASE_MOVED
+            or str(newest.get("catch_up") or "") != ops_mod.CATCH_UP_DEFERRED
+            or str(newest.get("catch_up_cause") or "")
+            != ops_mod.CATCH_UP_DEFER_CARRY_UNPROVEN):
+        return None
+    return newest
+
+
 def sha_unrecorded_rejudge_spent(store: ProjectStore, wo: dict[str, Any]) -> bool:
     """The stall with no commit bound AND NO DECLINE: the OS spent its one round on this very head and..."""
     from . import ops as ops_mod
@@ -727,6 +750,10 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     if (wo["status"] == "waiting_pr_merge"
             and catch_up_exhausted_hold(store, wo["id"]) is not None):
         blockers.append(CATCH_UP_EXHAUSTED_BLOCKER)
+    # A HEAD THE OS MOVED AND CANNOT PROVE (#1188)
+    if (wo["status"] == "waiting_pr_merge"
+            and carry_unproven_hold(store, wo["id"]) is not None):
+        blockers.append(CARRY_UNPROVEN_BLOCKER)
     # A MERGE THE REVIEWER REFUSED
     if wo["status"] == "waiting_pr_merge" and automerge_denied(store, wo):
         blockers.append(AUTOMERGE_DENIED_BLOCKER)

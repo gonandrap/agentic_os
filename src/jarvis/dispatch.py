@@ -323,6 +323,21 @@ def feature_context(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] |
     return {"fo": fo, "children": store.feature_children(fo["id"], kinds=WORKER_CHILDREN)}
 
 
+def knowledge_for(central: CentralStore, project: ProjectSpec, wo: dict[str, Any],
+                  cfg: OsConfig) -> KnowledgeBrief:
+    """The knowledge brief a dispatch of `wo` carries — shared with the dashboard's prompt preview"""
+    return central.knowledge_brief(
+        project.name,
+        pinned_limit=cfg.knowledge_inject_limit,
+        digest_limit=cfg.knowledge_digest_limit,
+        digest_chars=cfg.knowledge_digest_chars,
+        title=wo["title"],
+        hint_limit=cfg.knowledge_hint_limit,
+        hint_chars=cfg.knowledge_hint_chars,
+        pinned_chars=cfg.knowledge_pinned_chars,
+    )
+
+
 def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
                         knowledge: KnowledgeBrief | None = None,
                         design_doc: dict[str, str] | None = None,
@@ -672,7 +687,7 @@ def _analyst_prompt(wo: dict[str, Any], project: ProjectSpec,
                     knowledge: KnowledgeBrief | None = None,
                     feature: dict[str, Any] | None = None) -> str:
     """The briefing for an improvement order's analyst (docs/superpowers/specs/2026-09-23-improvement-orders.md)"""
-    from . import db, worker_brief
+    from . import db, findings, worker_brief
     from .ops import EVIDENCE_REFS_KEY  # lazy: ops imports dispatch
 
     io_id = wo.get("parent_id") or "?"
@@ -767,6 +782,24 @@ def _analyst_prompt(wo: dict[str, Any], project: ProjectSpec,
         "recommendation, and inventing work to fill the list is worse than an empty one.",
         "",
         "The validator names every problem at once, so one revision fixes all of them.",
+        "",
+        "# Write it short",
+        # findings.MAX_FIELD_CHARS owns these numbers; the validator refuses a longer report
+        f"The user decides every finding by reading it, so a finding is dense, not long. "
+        f"Hard caps, enforced: `summary` {findings.MAX_SUMMARY_CHARS} characters, "
+        f"`symptom` {findings.MAX_FIELD_CHARS['symptom']}, `root_cause` "
+        f"{findings.MAX_FIELD_CHARS['root_cause']}, `why_insufficient` "
+        f"{findings.MAX_FIELD_CHARS['why_insufficient']}, `recommendation` "
+        f"{findings.MAX_FIELD_CHARS['recommendation']}; at most "
+        f"{findings.MAX_EVIDENCE} quotes per finding, each at most "
+        f"{findings.MAX_QUOTE_CHARS} characters.",
+        "- Rich means specific: the mechanism, the file:line, the measured number. "
+        "Not the story of how you found it, not what you ruled out, not the brief "
+        "restated back.",
+        "- One quote per claim, the single line that proves it. Long logs stay in "
+        "their source; name the command that prints them.",
+        "- Detail a worker needs goes in the proposed order's `description`, not in "
+        "the finding.",
         "",
         "# Scope",
         # §4.3 of the improvement-orders spec owns this cap
@@ -1166,16 +1199,7 @@ def dispatch_work_order(
     from . import budget, context, worker_session
 
     cfg = os_config or OsConfig()
-    knowledge = central.knowledge_brief(
-        project.name,
-        pinned_limit=cfg.knowledge_inject_limit,
-        digest_limit=cfg.knowledge_digest_limit,
-        digest_chars=cfg.knowledge_digest_chars,
-        title=wo["title"],
-        hint_limit=cfg.knowledge_hint_limit,
-        hint_chars=cfg.knowledge_hint_chars,
-        pinned_chars=cfg.knowledge_pinned_chars,
-    )
+    knowledge = knowledge_for(central, project, wo, cfg)
     prompt = build_worker_prompt(wo, project, knowledge,
                                  design_doc=materialize_design_doc(store, project, wo),
                                  feature=feature_context(store, wo),

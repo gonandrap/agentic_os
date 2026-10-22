@@ -273,6 +273,8 @@ Steps:
    limiter figures and `oldest_inflight_seconds`. Every restart raises one — no silent
    restarts, ever. The reason is on the item because "the pool is full" and "one request has
    been stuck for 20s with 29 free tokens" are different findings and want different reading.
+   Amended by issue #1189: that path is cited only when the file EXISTS. An item naming a dump
+   nobody wrote sends the reader to a missing file and claims evidence the OS does not have.
 4. Restart `release.UI_UNIT` (`"jarvis-ui.service"`, `src/jarvis/release.py:71`) via
    `release.SystemdRunner.restart_unit` (`release.py:230`). **Inline is correct here**:
    that method's own docstring restricts it to units that cannot host this process, and
@@ -346,6 +348,7 @@ Keys, defaults and the reasoning for each default:
 | `ui_health.healthz_timeout_seconds` | `5` | the DAEMON's own deadline on `/healthz`. Small, because the endpoint touches nothing: anything slower than a few seconds is itself the finding, and the daemon must not spend a reconcile tick waiting |
 | `ui_health.restart_cooldown_seconds` | `300` | one restart per 5 minutes. Longer than the whole measured outage, so the real case needs exactly one restart; short enough that a second genuine wedge the same hour is still healed |
 | `ui_health.max_restarts_per_day` | `3` | a wedge took ~4 hours of uptime to appear, so three in 24h is well above the observed rate and the fourth is evidence of a different, worse fault that wants the user rather than another restart |
+| `ui_health.boot_grace_seconds` | `60` | added by issue #1189. An unreachable `/healthz` within this long of the unit leaving `inactive` is a UI that has not bound the port yet, not a wedge — every release restarts `jarvis-ui.service` and the daemon's next tick probed 70ms later. Read from systemd's own `InactiveExitTimestampMonotonic`, so it holds for a restart by a release, by `shipit` or by hand alike; well above the measured boot and far inside `restart_cooldown_seconds`, so a dashboard that genuinely wedges on boot is still healed one tick later |
 
 ## Test strategy
 

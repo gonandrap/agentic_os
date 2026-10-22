@@ -19,6 +19,9 @@
 </div>
 
 {% for u in a.units %}
+{# Addresses for this unit's sections: the first unit owns the short ones the jump row
+   links to, a second session (a relaunch) gets a suffix so no id repeats. #}
+{% set sfx = '' if loop.first else '-u' ~ loop.index %}
 {# ABOVE the `found` short-circuit, `cli._print_anatomy`'s rule: which reading answered is
    exactly what a reader needs when nothing was found. #}
 {{ ui.provenance(u.provenance) }}
@@ -28,6 +31,11 @@
    one (issue #227). #}
 {{ ui.note("no transcript — nothing to measure. Session: " ~ (u.session_id or "none recorded")) }}
 {% else %}
+{# `dense`: the short tables (tools, joins, writes) pack in beside the summary, and the
+   long turn list takes the full width under them — 2026-10-22 spec §3. #}
+<div class="grid" style="--col: 520px;">
+<div class="sec">
+<h3 id="dbg-session{{ sfx }}" style="margin: 18px 0 8px; font: 600 12px var(--mono); color: var(--ink-3); letter-spacing: .14em; text-transform: uppercase;">The session</h3>
 <div class="panel">
   <div class="row">
     <span class="kv" style="width: 120px;">session</span>
@@ -67,17 +75,79 @@
     <span class="kv mono">{{ fmt_dur(seconds) }}</span></div>
   {% endfor %}
 </div>
+</div>
+{% if u.tools %}
+<div class="sec">
+<h2 id="dbg-tools{{ sfx }}">Tool profile</h2>
+{% if u.nav_line %}
+{# §3: the sentence travels WITH the reading, so `jarvis inspect` prints these words too. #}
+<div class="panel"><span class="mono">{{ u.nav_line }}</span></div>
+{% endif %}
+<div class="panel"><table>
+  <tr><th>tool</th><th>calls</th><th>total</th><th>mean</th><th>never returned</th></tr>
+  {% for row in u.tools %}
+  <tr><td class="mono">{{ row.name }}</td><td>{{ row.calls }}</td>
+      <td>{{ fmt_dur(row.seconds) }}</td><td>{{ fmt_dur(row.mean) }}</td>
+      <td>{{ row.unfinished or '–' }}</td></tr>
+  {% endfor %}
+</table></div>
+</div>
+{% endif %}
 
-<h2>Turn by turn</h2>
+{% if u.joins %}
+<div class="sec">
+<h2 id="dbg-joins{{ sfx }}">Blocking joins at or over {{ u.join_floor }}s</h2>
+<div class="panel">
+  {% for span in u.joins %}
+  <div class="row"><span class="mono" style="width: 110px;">{{ span.name }}</span>
+    <span class="grow">{{ span.detail }}</span>
+    <span class="kv mono">{{ fmt_dur(span.seconds) }}</span></div>
+  {% endfor %}
+</div>
+</div>
+{% endif %}
+
+<div class="sec">
+<h2 id="dbg-writes{{ sfx }}">Cache writes, classified</h2>
+<div class="panel">
+  {% if u.writes %}
+  {% for w in u.writes %}
+  <div class="row">
+    <span class="mono" style="width: 110px;">{{ w.cause }}</span>
+    <span class="grow sub">{{ w.note }}</span>
+    <span class="kv mono">{{ fmt_tok(w.written) }} · {{ fmt_ts(w.ts) }}</span>
+  </div>
+  {% endfor %}
+  {% else %}
+  {{ ui.note("no cache write in this session reached the write floor above — a
+              `ttl-expiry` and a `prefix-miss` look identical on a bill and have
+              completely different fixes, so only writes big enough to classify are
+              reported.") }}
+  {% endif %}
+</div>
+</div>
+
+</div>
+
+
+<div class="span-all">
+<h2 id="dbg-turns{{ sfx }}">Turn by turn</h2>
 {{ ui.bar_legend() }}
+{# FOLDED: each turn is its own address (`#turn-<seq>`) and opens on arrival; the last
+   three are open by default, so the page lands on what is happening now. #}
 <div class="panel">
   {% for turn in u.turns %}
+  <details class="turn" id="{{ 'turn-' if not sfx else 'u' ~ sfx[2:] ~ '-turn-' }}{{ turn.seq }}"{% if loop.revindex <= 3 %} open{% endif %}>
+  <summary>
   <div class="row">
     <span class="mono" style="width: 70px;">{{ turn_label(turn.seq) }}</span>
     {{ ui.bar(turn.share) }}
     <span class="grow sub">{% for t in turn.triggers %}{{ t.kind }}{{ ", " if not loop.last }}{% else %}no prompt recorded{% endfor %}</span>
     <span class="kv mono">{{ fmt_dur(turn.wall) }}{% if turn.held %} · held {{ fmt_dur(turn.held) }}{% endif %}</span>
+    <span class="kv"><a href="#ctx-{{ turn.seq }}">context</a> ·
+      <a href="/wo/{{ project }}/{{ wo.id }}/prompt#turn-{{ turn.seq }}">prompt</a></span>
   </div>
+  </summary>
   {# `observed` is the headline fact about a turn and is carried rather than inferred
      from `api_calls == 0` — the inference is what four layers got wrong (issue #227). #}
   {% if not turn.observed %}
@@ -96,11 +166,14 @@
   </div>
   {% endfor %}
   {% for s in turn.subagents %}{{ ui.subagent(s) }}{% endfor %}
+  </details>
   {% endfor %}
+</div>
 </div>
 
 {% if u.unattached_subagents %}
-<h2>Subagents that could not be attached</h2>
+<div class="span-all">
+<h2 id="dbg-unattached{{ sfx }}">Subagents that could not be attached</h2>
 <div class="panel">
   {# Reported HERE rather than under a turn: a timestamp fallback invents a parent the
      record does not name (issue #227, spec §4b). #}
@@ -108,52 +181,8 @@
               say which turn they ran in.") }}
   {% for s in u.unattached_subagents %}{{ ui.subagent(s) }}{% endfor %}
 </div>
-{% endif %}
-
-{% if u.tools %}
-<h2>Tool profile</h2>
-{% if u.nav_line %}
-{# §3: the sentence travels WITH the reading, so `jarvis inspect` prints these words too. #}
-<div class="panel"><span class="mono">{{ u.nav_line }}</span></div>
-{% endif %}
-<div class="panel"><table>
-  <tr><th>tool</th><th>calls</th><th>total</th><th>mean</th><th>never returned</th></tr>
-  {% for row in u.tools %}
-  <tr><td class="mono">{{ row.name }}</td><td>{{ row.calls }}</td>
-      <td>{{ fmt_dur(row.seconds) }}</td><td>{{ fmt_dur(row.mean) }}</td>
-      <td>{{ row.unfinished or '–' }}</td></tr>
-  {% endfor %}
-</table></div>
-{% endif %}
-
-{% if u.joins %}
-<h2>Blocking joins at or over {{ u.join_floor }}s</h2>
-<div class="panel">
-  {% for span in u.joins %}
-  <div class="row"><span class="mono" style="width: 110px;">{{ span.name }}</span>
-    <span class="grow">{{ span.detail }}</span>
-    <span class="kv mono">{{ fmt_dur(span.seconds) }}</span></div>
-  {% endfor %}
 </div>
 {% endif %}
-
-<h2>Cache writes, classified</h2>
-<div class="panel">
-  {% if u.writes %}
-  {% for w in u.writes %}
-  <div class="row">
-    <span class="mono" style="width: 110px;">{{ w.cause }}</span>
-    <span class="grow sub">{{ w.note }}</span>
-    <span class="kv mono">{{ fmt_tok(w.written) }} · {{ fmt_ts(w.ts) }}</span>
-  </div>
-  {% endfor %}
-  {% else %}
-  {{ ui.note("no cache write in this session reached the write floor above — a
-              `ttl-expiry` and a `prefix-miss` look identical on a bill and have
-              completely different fixes, so only writes big enough to classify are
-              reported.") }}
-  {% endif %}
-</div>
 
 <div class="panel" style="margin-top: 10px;">
   {# The caps, stated for the same reason the floors are (spec §4a). #}

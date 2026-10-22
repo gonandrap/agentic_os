@@ -527,6 +527,68 @@ def test_a_base_that_outran_the_cached_reading_holds_at_the_cap(started, project
     assert fresh["attention_reason"] == invariants.CATCH_UP_EXHAUSTED_BLOCKER
 
 
+def lagging(monkeypatch) -> dict:
+    """GitHub publishing the merge commit AFTER the OS re-reads the head (#1188)"""
+    real = github.pr_view
+    lag = {"on": True}
+
+    def view(url, cwd=None):
+        pr = real(url, cwd=cwd)
+        return dataclasses.replace(pr, head_oid=JUDGED) if lag["on"] else pr
+
+    monkeypatch.setattr(github, "pr_view", view)
+    return lag
+
+
+def test_a_merge_commit_published_late_is_carried_and_not_deferred_for_ever(
+        started, project, fake_gh, local_proof, monkeypatch):
+    """#1188: the head the OS'S OWN catch-up produced held the order for 2.5h"""
+    opt_in(started)
+    store, wo = parked(project)
+    behind_pr(fake_gh)
+    lag = lagging(monkeypatch)
+
+    poll(started, store)                      # the update lands; the re-read lags it
+    [row] = updates(store, wo)
+    assert row["head_before"] == JUDGED and row["head_after"] == JUDGED
+
+    # GitHub publishes the merge commit, and `main` moves on again
+    lag["on"] = False
+    local_proof["tip"] = BASE_OID2
+    poll(started, store)
+
+    carried = [db.from_json(e["payload"], {})
+               for e in store.events_of_kind(wo["id"], ops.HEAD_CARRIED_EVENT)]
+    assert [c["carried_head_sha"] for c in carried] == [UPDATED]
+    assert invariants.CARRY_UNPROVEN_BLOCKER not in invariants.true_blockers(
+        store, store.get_work_order(wo["id"]))
+
+
+def test_a_head_the_os_cannot_prove_asks_the_user_instead_of_deferring(
+        started, project, fake_gh, local_proof, monkeypatch):
+    """#1188's other arm, Neo question 2153: a hold nothing can prove must be VISIBLE"""
+    opt_in(started)
+    store, wo = parked(project)
+    behind_pr(fake_gh, head=PUSHED)           # somebody else's commit at the head
+    local_proof["tip"] = BASE_OID2
+    monkeypatch.setattr(branchproof, "diff_fingerprint",
+                        lambda repo, base_ref, sha: "fp-" + sha)
+
+    poll(started, store)
+
+    [row] = held(store, wo)
+    assert row["code"] == "base_moved" and row["catch_up"] == ops.CATCH_UP_DEFERRED
+    assert row["catch_up_cause"] == ops.CATCH_UP_DEFER_CARRY_UNPROVEN
+    assert "will NOT" in row["reason"] and "retries every tick" not in row["reason"]
+    assert fake_gh.updates == []
+    assert invariants.CARRY_UNPROVEN_BLOCKER in invariants.true_blockers(
+        store, store.get_work_order(wo["id"]))
+    list(invariants.check_blocked_work_is_surfaced(store))
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["needs_attention"] == 1
+    assert fresh["attention_reason"] == invariants.CARRY_UNPROVEN_BLOCKER
+
+
 def test_the_exhausted_hold_is_not_overwritten_by_a_lesser_reading(started, project,
                                                                    fake_gh, local_proof):
     """§3.1's rule, one hold later: `mergeable` going UNKNOWN must not retire the ask (#1173)"""
