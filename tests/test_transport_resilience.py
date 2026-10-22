@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import time
-
 import pytest
 
-from jarvis import claude_cli, invariants
+from jarvis import claude_cli, db, invariants
 from jarvis import neo as neo_mod
 from jarvis import ops, panel, supervisor
 from jarvis import testing as T
+from jarvis import worker_session
 from jarvis.catalog import load_catalog
 from jarvis.central_store import CentralStore
 from jarvis.daemon import Daemon
@@ -150,7 +149,7 @@ def test_the_user_is_only_asked_once_the_retries_are_spent(asked):
 
 def test_a_usage_limit_waits_out_the_window_and_spends_no_attempt(asked):
     """A refusal that states when it lifts is not a fault to ration (issue #235)"""
-    reopens = time.time() + 3600
+    reopens = db.now() + 3600
     deliver, unreachable = T.Recorder(), T.Recorder()
     store = NeoStore()
     try:
@@ -165,7 +164,23 @@ def test_a_usage_limit_waits_out_the_window_and_spends_no_attempt(asked):
     q = _q()
     assert q["status"] == "queued"
     assert q["attempts"] == 0, "a spent window burned one of the transport's retries"
-    assert q["retry_after"] == pytest.approx(reopens)
+    assert q["retry_after"] == pytest.approx(reopens, abs=1)
+
+
+def test_a_refusal_with_no_reset_holds_for_exactly_the_fallback_delay(asked, clock):
+    """The fallback moment is COMPUTED, not merely somewhere in the future"""
+    store = NeoStore()
+    try:
+        results = neo_mod.drain_queue(store, model="sonnet",
+                                      answer=T.FaultyAnswerer(T.USAGE_LIMIT))
+    finally:
+        store.close()
+
+    assert results[0]["outcome"] == "held"
+    q = _q()
+    assert q["status"] == "queued" and q["attempts"] == 0
+    assert q["retry_after"] == pytest.approx(
+        T.TEST_EPOCH + worker_session.RATE_LIMIT_FALLBACK_DELAY, abs=1)
 
 
 def test_a_held_question_is_not_claimed_before_it_is_due(asked):
@@ -240,7 +255,7 @@ def test_a_question_stranded_in_answering_is_surfaced_too(asked, project):
         q = store.claim_next()
         store.conn.execute("UPDATE questions SET attempts=?, claimed_at=? WHERE id=?",
                            (MAX_ANSWER_ATTEMPTS,
-                            time.time() - STALE_ANSWERING_SECONDS - 60, q["id"]))
+                            db.now() - STALE_ANSWERING_SECONDS - 60, q["id"]))
     finally:
         store.close()
 
@@ -278,7 +293,7 @@ def test_one_unsurfaceable_stranded_question_does_not_silence_the_rest(asked, pr
         assert first and second
         store.conn.execute(
             "UPDATE questions SET attempts=?, claimed_at=? WHERE id IN (?, ?)",
-            (MAX_ANSWER_ATTEMPTS, time.time() - STALE_ANSWERING_SECONDS - 60,
+            (MAX_ANSWER_ATTEMPTS, db.now() - STALE_ANSWERING_SECONDS - 60,
              first["id"], second["id"]))
     finally:
         store.close()
@@ -383,7 +398,8 @@ def test_a_refused_veto_seat_holds_the_question_and_spends_no_attempt(asked,
     """REVIEW ROUND 2, END TO END — the property the whole ladder turns on (#235)"""
     from jarvis.catalog import NeoConfig, PanelConfig
 
-    fake_claude.refuse_seat("blast")
+    # A duration, never a time of day: tests/test_clock_hygiene.py
+    fake_claude.refuse_seat("blast", reset="in 5h")
     cfg = NeoConfig(panel=PanelConfig(
         enabled=True, roster=("premise", "record", "blast", "taste", "chair")))
     deliver, unreachable = T.Recorder(), T.Recorder()
@@ -405,8 +421,8 @@ def test_a_refused_veto_seat_holds_the_question_and_spends_no_attempt(asked,
     assert q["attempts"] == 0, (
         "a spent window burned a transport retry — the issue #235 shape"
     )
-    assert q["retry_after"] > time.time() + 60, (
-        "the question was not parked until the window reopens"
+    assert q["retry_after"] == pytest.approx(db.now() + 5 * 3600, abs=120), (
+        "the question was not parked until the window the refusal named reopens"
     )
 
 

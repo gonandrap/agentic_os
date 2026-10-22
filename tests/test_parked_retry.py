@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import time
-
 import pytest
 
-from jarvis import fleet, invariants, worker_session
+from jarvis import db, fleet, invariants, worker_session
 from jarvis.catalog import load_catalog
 from jarvis.daemon import PR_POLL_STATUSES, Daemon
 from jarvis.invariants import MESSAGE_STUCK_STATUSES, stuck_message
@@ -59,7 +57,7 @@ def _refused(store: ProjectStore, status: str, *, times: int = 1,
 
 def _window_shut(hours: float = 1) -> str:
     """A refusal whose window has NOT reopened yet — the retry is booked, not due"""
-    return f"Claude AI usage limit reached|{int(time.time() + hours * 3600)}"
+    return f"Claude AI usage limit reached|{int(db.now() + hours * 3600)}"
 
 
 # -- the sweep
@@ -274,7 +272,7 @@ def test_a_work_order_already_in_this_state_is_rescued_rather_than_abandoned(swe
     store.update_work_order(wo["id"], pr_url="https://github.com/x/y/pull/243")
     for text in ("one", "two", "three"):
         store.queue_message(wo["id"], text)
-    stale = time.time() + 24 * 3600  # older than any `messaging.stuck_minutes`
+    stale = db.now() + 24 * 3600  # older than any `messaging.stuck_minutes`
     assert stuck_message(store, store.get_work_order(wo["id"]), now=stale) is not None
 
     run()
