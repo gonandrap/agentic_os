@@ -35,6 +35,11 @@ OPEN_STATUSES = ("pending", "dispatching", "running", "idle", "waiting_input",
 # Settled: nothing more will happen to these on their own
 TERMINAL_STATUSES = ("completed", "cancelled", "failed")
 
+
+def inbox_flag(project_path: Path, wo_id: str) -> Path:
+    """Exists while a message MAY wait for this order (docs/superpowers/specs/2026-10-22-messages-delivered-mid-turn.md)"""
+    return Path(project_path) / ".jarvis" / "inbox" / f"{wo_id}.pending"
+
 #: Why an objection was taken back — ONE STRING PER OUTCOME, and these are the two (docs/superpowers/specs/2026-10-20-an-objection-is-withdrawn-before-the-order-stops.md)
 OBJECTION_WITHDRAWN_REASON = "the order stopped before it could be delivered"
 OBJECTION_HANDED_BACK_REASON = "the order delivered its result and the decision is yours"
@@ -2872,7 +2877,21 @@ class ProjectStore:
             "authored_by) VALUES (?,?,?,?,?,?,?)",
             (wo_id, db.now(), direction, content, source, status, authored_by),
         )
+        if direction == "user_to_agent" and status == "queued":
+            flag = inbox_flag(self.project_path, wo_id)
+            try:
+                flag.parent.mkdir(parents=True, exist_ok=True)
+                flag.touch()
+            except OSError:
+                pass  # the flag only speeds the mid-turn path; the daemon delivers regardless
         return int(cur.lastrowid)
+
+    def claim_message(self, msg_id: int) -> bool:
+        """Mark one QUEUED message delivered; False when someone else already took it"""
+        cur = self.conn.execute(
+            "UPDATE wo_messages SET status='delivered', delivered_at=? "
+            "WHERE id=? AND status='queued'", (db.now(), msg_id))
+        return cur.rowcount == 1
 
     def record_agent_reply(self, wo_id: str, content: str, source: str = "worker") -> int:
         """Persist a worker's final assistant message into the work order record"""
