@@ -541,6 +541,14 @@ def brake_state() -> dict | None:
     return fl
 
 
+def nav_projects() -> list[str]:
+    """Every registered project, for the sidebar — an empty list rather than a broken page"""
+    try:
+        return sorted(ops.registered_project_paths())
+    except Exception:  # noqa: BLE001 — chrome must never be what fails a page
+        return []
+
+
 def _decorate_question(q: dict) -> dict:
     """Add the two display-only fields the `/neo` question blocks render"""
     from .. import digest, issues, neo
@@ -893,6 +901,10 @@ def create_app() -> FastAPI:
         ctx["gate_badge"] = gate_badge()
         ctx["alarm_badge"] = alarm_badge()
         ctx["brake"] = brake_state()
+        # The sidebar's project list, and which of them this page is about (2026-10-22 spec §1)
+        ctx["nav_projects"] = nav_projects()
+        here = ctx.get("project") or ctx.get("project_name")
+        ctx["project_here"] = here if isinstance(here, str) else ""
         return templates.TemplateResponse(request, template, ctx,
                                           status_code=status_code)
 
@@ -1260,6 +1272,31 @@ def create_app() -> FastAPI:
             anatomy=_block("the anatomy", ops.inspect_report, wo_id, pname),
             context=_block("the context ledger", ops.context_report, wo_id, pname))
 
+    @app.get("/wo/{name}/{wo_id}/prompt", response_class=HTMLResponse)
+    def work_order_prompt(request: Request, name: str, wo_id: str):
+        """Every prompt this order's conversation was sent, turn by turn (2026-10-22 spec §4)"""
+        try:
+            got = ops.worker_prompts(wo_id, name)
+        except ops.OpsError as e:
+            return render(request, "error.html", message=str(e),
+                          hint=_stale_link_hint(name, wo_id), status_code=404)
+        return render(request, "prompt.html", project=got["project"], wo=got["wo"],
+                      turns=got["turns"])
+
+    @app.get("/project/{name}/prompt", response_class=HTMLResponse)
+    def project_prompt(request: Request, name: str):
+        """What a new work order on this project would be told today (2026-10-22 spec §4)"""
+        try:
+            preview = ops.project_prompt_preview(name)
+        except ops.OpsError as e:
+            return render(request, "error.html", message=str(e), status_code=404)
+        return render(request, "project_prompt.html", project=name, preview=preview)
+
+    @app.get("/go/{ref:path}")
+    def go(ref: str):
+        """Any id the OS mints, to the page that shows it (2026-10-22 spec §1)"""
+        return RedirectResponse(ops.resolve_ref(ref), status_code=303)
+
     @app.get("/api/wo/{name}/{wo_id}/live")
     def work_order_live(name: str, wo_id: str):
         """`ops.live_report` as JSON, nothing reshaped — what the debugging page polls"""
@@ -1423,8 +1460,16 @@ def create_app() -> FastAPI:
             return render(request, "error.html", active="neo",
                           message=f"neo question {question_id} not found",
                           status_code=404)
+        # The order it came from, for the links back to it, its PR and its debugging page
+        origin = None
+        if q.get("wo_id"):
+            try:
+                _, _, origin = ops.find_work_order(q["wo_id"], q.get("project"))
+            except ops.OpsError:
+                pass
         return render(request, "neo_question.html", active="neo",
-                      q=_decorate_question(q), opinions=opinions)
+                      q=_decorate_question(q), opinions=opinions, origin=origin,
+                      project_name=q.get("project"))
 
     @app.get("/gates", response_class=HTMLResponse)
     def gates_page(request: Request):

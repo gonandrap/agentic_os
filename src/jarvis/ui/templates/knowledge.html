@@ -56,7 +56,7 @@
     <table>
       {% for m in usage.could_have_read %}
       <tr>
-        <td class="mono"><a href="/wo/{{ m.wo_id }}">{{ m.wo_id }}</a></td>
+        <td class="mono"><a href="/go/{{ m.wo_id }}">{{ m.wo_id }}</a></td>
         <td>{{ m.title }}</td>
         <td class="mono sub">{% for e in m.entries %}{{ e.id }} {% endfor %}</td>
       </tr>
@@ -88,7 +88,7 @@
   <table>
     <tr><th>scope</th><th>topic</th><th>index line</th><th>reads</th><th>age</th><th></th></tr>
     {% for k in rows %}
-    <tr>
+    <tr id="{{ k.id }}">
       <td class="mono">{{ k.project or 'global' }}</td>
       <td class="mono">{{ k.topic or '–' }}</td>
       <td>

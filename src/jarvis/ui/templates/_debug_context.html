@@ -13,13 +13,20 @@
 {% set c = context.payload %}
 {{ ui.provenance(c.provenance) }}
 {% if not c.recorded %}{{ ui.note(c.note) }}{% endif %}
+{# FOLDED like the turns above (2026-10-22 spec §3): `#ctx-<seq>` opens one, the last three
+   are open, and two turns sit side by side at width so a delta can be read across. #}
+<div class="grid" style="--col: 860px; gap: 0 18px;">
 {% for turn in c.turns %}
-<div class="panel" style="margin-bottom: 10px;">
+<details class="turn panel" id="ctx-{{ turn.seq }}" style="margin-bottom: 10px;"{% if loop.revindex <= 3 %} open{% endif %}>
+  <summary>
   <div class="row">
     <span class="mono" style="width: 70px;">{{ turn_label(turn.seq) }}</span>
     <span class="grow mono">{{ turn.kind }}</span>
     <span class="kv">{{ fmt_ts(turn.started_at) }}</span>
+    <span class="kv"><a href="#turn-{{ turn.seq }}">time</a> ·
+      <a href="/wo/{{ project }}/{{ wo.id }}/prompt#turn-{{ turn.seq }}">prompt</a></span>
   </div>
+  </summary>
   {% if not turn.recorded %}
   {{ ui.note(turn.note) }}
   {% else %}
@@ -88,7 +95,8 @@
     tokens estimated at {{ turn.token_bytes }} bytes each{% endif %}.</div>
   {% endif %}
   {% endif %}
-</div>
+</details>
 {% endfor %}
+</div>
 {% endif %}
 </section>

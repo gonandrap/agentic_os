@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% import "_debug.html" as ui %}
+{% import "_order_nav.html" as nav %}
 {% block title %}debug — {{ wo.id }} — Jarvis{% endblock %}
 {% block content %}
 
@@ -9,17 +10,19 @@
    and never an error page. #}
 <h2><a href="/project/{{ project }}">{{ project }}</a> /
   <a href="/wo/{{ project }}/{{ wo.id }}" class="mono">{{ wo.id }}</a> / debug</h2>
-<div class="panel" style="padding: 10px 16px;">
-  <span class="kv">
-    <a href="/wo/{{ project }}/{{ wo.id }}">← the work order</a> ·
-    <a href="/cost/{{ project }}/{{ wo.id }}">what it cost</a> ·
-    {{ wo.title }}
-  </span>
-</div>
+{{ nav.order_nav(project, wo, 'debug') }}
+{{ nav.debug_jumps('') }}
 
+{# AT WIDTH — §3 of docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md.
+   Same blocks, same order in the document (the ranking above, which the tests read),
+   laid out side by side: the diagnosis spans the top band in its own columns, clearing
+   it and the live frame share the next one, and the two long readings — the anatomy and
+   the context ledger — take the full width with their turns folded. #}
 {% include "_debug_diagnosis.html" %}
-{% include "_debug_fix.html" %}
-{% include "_debug_live.html" %}
+<div class="grid" style="--col: 640px;">
+<div>{% include "_debug_fix.html" %}</div>
+<div>{% include "_debug_live.html" %}</div>
+</div>
 {% include "_debug_anatomy.html" %}
 {% include "_debug_context.html" %}
 

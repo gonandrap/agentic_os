@@ -42,7 +42,11 @@
   {% endfor %}
 </div>
 
-<h2>The OS's record</h2>
+{# At width the readings below the headline sit side by side (2026-10-22 spec §3). Nothing
+   in an auto-fit grid may span it: a spanning item keeps every empty track alive. #}
+<div class="grid" style="--col: 460px;">
+<div class="sec">
+<h2 id="dbg-record">The OS's record</h2>
 <div class="panel">
   {% if d.clock.last_status %}
   <div class="row"><span class="kv" style="width: 120px;">last status</span>
@@ -62,13 +66,26 @@
   {{ ui.note(d.clock.note) }}
   {{ ui.note(d.clock.live_note) }}
 </div>
+</div>
 
 {% if d.holds.episodes or d.holds.unexplained.note %}
-<h2>Held by the OS</h2>
+<div class="sec">
+<h2 id="dbg-held">Held by the OS</h2>
 <div class="panel">
+  {# Each hold links to WHAT held it, off the key the timeline paired it on — §3 of
+     docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md. #}
+  {% set wo_base = '/wo/' ~ project ~ '/' ~ wo.id %}
   {% for episode in d.holds.episodes %}
+  {% set k = episode.key %}
+  {% set held_href = ('/neo/question/' ~ k) if episode.cause == 'neo_question'
+     else ('/gates#gate-' ~ k) if episode.cause == 'gate'
+     else (wo_base ~ '#round-' ~ k) if episode.cause == 'validation'
+     else (wo_base ~ '#msg-' ~ k) if episode.cause == 'message'
+     else '' %}
   <div class="row">
-    <span class="grow">{{ episode.phrase }}</span>
+    <span class="grow">{{ episode.phrase }}{% if k is not none and held_href %}
+      · <a href="{{ held_href }}">{{ {'neo_question': 'question #', 'gate': 'gate #',
+         'validation': 'round ', 'message': 'message #'}[episode.cause] }}{{ k }} →</a>{% endif %}</span>
     <span class="kv mono">{{ episode.seconds_human }}{{ ' · still held' if episode.open }}</span>
   </div>
   {% endfor %}
@@ -82,10 +99,12 @@
   </div>
 </div>
 {{ ui.provenance(d.holds.provenance) }}
+</div>
 {% endif %}
 
 {% if d.os_calls.calls %}
-<h2>The OS's own calls for this order</h2>
+<div class="sec">
+<h2 id="dbg-calls">The OS's own calls for this order</h2>
 <div class="panel">
   <div class="row"><span class="grow">{{ d.os_calls.calls }} call(s),
     {{ d.os_calls.failed }} unreachable</span></div>
@@ -99,9 +118,11 @@
   {% endif %}
   {% if d.os_calls.failed or d.os_calls.capped %}{{ ui.note(d.os_calls.note) }}{% endif %}
 </div>
+</div>
 {% endif %}
 
-<h2>The way through</h2>
+<div class="sec">
+<h2 id="dbg-way">The way through</h2>
 <div class="panel">
   {{ ui.note(d.way_through.note) }}
   {% for command in d.commands %}
@@ -114,6 +135,8 @@
   <div class="row"><span class="kv" style="width: 110px;">not offered</span>
     <span class="grow sub">{{ refusal }}</span></div>
   {% endfor %}
+</div>
+</div>
 </div>
 {% endif %}
 </section>

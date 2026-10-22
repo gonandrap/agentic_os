@@ -5,7 +5,7 @@
 <h2>Backlog</h2>
 <div class="panel">
   {% for it in items %}
-  <div class="row">
+  <div class="row" id="{{ it.id }}">
     <span class="st tone-{{ 'muted' if it.status != 'open' else 'active' }}">
       <span class="i">{{ '◌' if it.status == 'open' else '✓' if it.status == 'done' else '→' }}</span>{{ it.status }}</span>
     <div class="grow">

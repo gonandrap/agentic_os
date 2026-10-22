@@ -2,6 +2,9 @@
 {% from "_alarm.html" import verdict_body, review_form, review_standing %}
 {% block title %}{{ a.id }} — Jarvis{% endblock %}
 {% block content %}
+{# Sections reflow into columns at width — `.flow` in base.html, §5 of
+   docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md. #}
+<div class="flow" style="--col: 600px;">
 
 {# ONE alarm, in full — the anchor `/alarms` cannot be. A list has no per-row identity,
    so a "review it →" link into one opens on whichever row happens to be first; `/neo`
@@ -53,4 +56,5 @@
   {% endif %}
 </div>
 
+</div>
 {% endblock %}
