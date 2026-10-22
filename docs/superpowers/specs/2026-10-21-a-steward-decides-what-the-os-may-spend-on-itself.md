@@ -145,6 +145,18 @@ The steward returns one of four outcomes:
 Every outcome is written with the rule that produced it, so `jarvis steward why <id>`
 can answer.
 
+#### One defect, one decision
+
+Before any rule runs, a candidate that names code is collapsed onto the decision it
+restates. The bucket is mechanical — origin unit plus file (`steward.dedupe_key`), no
+model call — because the seats of one panel word one mechanism as several findings
+naming different symbols in one file, and one patch covers the file (decisions #23-#25
+and #14/#16/#18 of 2026-10-22, Q2109). A collapsed candidate is recorded as its own
+`steward_decisions` row, `rule='duplicate'` and `duplicate_of` naming the decision it
+restates, and in `enforce` the caller may not dispatch it; the panel carries the other
+seats' wordings into the brief of what IS filed. A `drop` is never collapsed onto: it
+decided nothing, and a severer wording must still reach the rules below.
+
 #### Decision 1: per item (technical)
 
 Applied in order. The first matching rule wins.
