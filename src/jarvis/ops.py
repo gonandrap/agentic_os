@@ -5398,6 +5398,12 @@ CATCH_UP_DEFERRED = "deferred"
 CATCH_UP_EXHAUSTED = "exhausted"
 CATCH_UP_FAILED = "failed"
 
+#: `CatchUp.cause` on a DEFERRED outcome: the three waits are not one wait (#1188)
+CATCH_UP_DEFER_IN_FLIGHT = "in_flight"
+CATCH_UP_DEFER_HEAD_MOVED = "head_moved"
+#: The head moved off the judged commit AND no carry could be proven onto it
+CATCH_UP_DEFER_CARRY_UNPROVEN = "carry_unproven"
+
 
 @dataclass(frozen=True)
 class CatchUp:
@@ -5407,6 +5413,8 @@ class CatchUp:
     outcome: str
     reason: str = ""
     base_tip: str = ""
+    #: `CATCH_UP_DEFER_*` on a DEFERRED outcome: WHICH wait, so a caller can answer it
+    cause: str = ""
 
 
 #: How many times the OS may RE-JUDGE a merge it asked for itself, outside the round budget (docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.6)

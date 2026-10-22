@@ -763,8 +763,7 @@ def test_a_changed_diff_on_a_proved_chain_reports_a_rebind(started, project, fak
     out = started._carry_catch_up(
         started.catalog.project("proj_a"), store, store.get_work_order(wo["id"]),
         SimpleNamespace(base_ref="main"),
-        automerge._held(automerge.HELD_SHA_MOVED, "the head moved", judged_sha=JUDGED,
-                        head_sha=CAUGHT_UP, round_n=1))
+        judged=JUDGED, head=CAUGHT_UP, round_n=1)
 
     assert out.carried is False and out.rebind is True
     assert refusals(store, wo) == ["patch_id"]
