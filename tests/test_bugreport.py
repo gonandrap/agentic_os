@@ -241,6 +241,135 @@ def test_report_notifies_the_user_with_the_issue_link(reporting):
     assert any("wo send is lost" in i["title"] for i in items)
 
 
+# -- one issue per break (issue 1212)
+
+
+RUN_ID = "39853986273"
+RUN_URL = f"https://github.com/owner/repo/actions/runs/{RUN_ID}"
+
+
+def _already_open(fake_gh, number: int = 1204, **kw) -> str:
+    """The issue the OS itself filed for this run, as `jarvis bug report` wrote it"""
+    url = f"https://github.com/{fake_gh.repo}/issues/{number}"
+    fake_gh.add_issue(url, "`main` is red",
+                      body=f"run {RUN_URL} failed\n\n{bugreport.FILED_MARKER}", **kw)
+    return url
+
+
+def _filings(fake_gh) -> int:
+    return sum(1 for c in fake_gh.calls if c["argv"][:2] == ["issue", "create"])
+
+
+def test_a_report_citing_an_already_filed_run_comments_instead_of_filing(reporting):
+    existing = _already_open(reporting)
+    before = _filings(reporting)
+
+    result = bugreport.report_bug(title="main is red", description="d", expected="e",
+                                  actual=f"ci fails on {RUN_URL}", priority="high")
+
+    assert result["duplicate_of"] == existing and result["url"] == existing
+    assert _filings(reporting) == before, "a second issue was opened for the same run"
+    assert any(bugreport.DUPLICATE_NOTE in c
+               for c in reporting.issue(existing)["comments"])
+
+
+def test_the_evidence_of_the_deduped_report_lands_on_the_existing_issue(reporting):
+    """#1205 carried the real diagnosis; it must not be the thing that is dropped"""
+    existing = _already_open(reporting)
+
+    bugreport.report_bug(title="main is red", description=f"run id {RUN_ID} is red",
+                         expected="e", actual="test_validation_void.py fails sharded",
+                         priority="high")
+
+    comments = "\n".join(reporting.issue(existing)["comments"])
+    assert "test_validation_void.py fails sharded" in comments
+
+
+def test_the_run_id_alone_matches_the_run_url_on_the_open_issue(reporting):
+    """The daemon's brief writes `run id <n>`; its own issue body carries the url"""
+    existing = _already_open(reporting)
+
+    result = bugreport.report_bug(title="t", description=f"(run id {RUN_ID})",
+                                  expected="e", actual="a", priority="high")
+
+    assert result["duplicate_of"] == existing
+
+
+def test_a_strangers_issue_citing_the_run_does_not_suppress_the_filing(reporting):
+    """The adoption key's author test, so a stranger cannot swallow the OS's reports"""
+    _already_open(reporting, author="a-stranger")
+    before = _filings(reporting)
+
+    result = bugreport.report_bug(title="t", description="d", expected="e",
+                                  actual=f"ci fails on {RUN_URL}", priority="high")
+
+    assert not result.get("duplicate_of")
+    assert _filings(reporting) == before + 1
+
+
+def test_a_closed_issue_citing_the_run_does_not_suppress_the_filing(reporting):
+    """A closed issue is a fix that was tried and did not hold — this break is new"""
+    _already_open(reporting, state="CLOSED")
+    before = _filings(reporting)
+
+    bugreport.report_bug(title="t", description="d", expected="e",
+                         actual=f"ci fails on {RUN_URL}", priority="high")
+
+    assert _filings(reporting) == before + 1
+
+
+def test_a_report_citing_no_run_never_reads_the_tracker(reporting):
+    """No dedupe key, no extra `gh` call on every bug report in the fleet"""
+    before = len(reporting.calls)
+
+    bugreport.report_bug(title="t", description="d", expected="e", actual="a",
+                         priority="low")
+
+    assert not [c for c in reporting.calls[before:] if c["argv"][:2] == ["issue", "list"]]
+
+
+def test_a_deduped_report_notifies_once_pointing_at_the_existing_issue(reporting):
+    """Two 'Bug filed' pings for one break is what the user actually complained about"""
+    from jarvis.central_store import CentralStore
+    existing = _already_open(reporting)
+
+    bugreport.report_bug(title="main is red", description="d", expected="e",
+                         actual=f"ci fails on {RUN_URL}", priority="high",
+                         project="proj_a")
+
+    central = CentralStore()
+    try:
+        items = central.unacked_inbox()
+    finally:
+        central.close()
+    assert len(items) == 1
+    assert existing in (items[0]["body"] or "")
+    assert not items[0]["title"].startswith("Bug filed")
+
+
+def test_a_comment_that_fails_raises_rather_than_filing_a_second_issue(reporting,
+                                                                       monkeypatch):
+    from jarvis import issues
+    existing = _already_open(reporting)
+    before = _filings(reporting)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("gh: HTTP 502")
+    monkeypatch.setattr(issues, "comment", boom)
+
+    with pytest.raises(bugreport.BugReportError) as e:
+        bugreport.report_bug(title="t", description="d", expected="e",
+                             actual=f"ci fails on {RUN_URL}", priority="high")
+
+    assert existing in str(e.value)
+    assert _filings(reporting) == before
+
+
+def test_run_ids_are_read_first_mention_first():
+    assert bugreport.run_ids_in(f"see {RUN_URL} and run id 5") == [RUN_ID, "5"]
+    assert bugreport.run_ids_in("nothing here") == []
+
+
 # -- failing loudly
 
 

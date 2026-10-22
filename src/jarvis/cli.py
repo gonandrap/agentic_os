@@ -5415,7 +5415,11 @@ def cmd_bug(args: argparse.Namespace) -> int:
     else:
         # The nested `pickup` flattened to the one line a reporting agent needs: whether anything is going to...
         _print({k: v for k, v in result.items() if k != "pickup"}, False)
-        print(pickup_note(result["pickup"]))
+        if result.get("duplicate_of"):
+            print(f"already filed as {result['duplicate_of']} — your evidence is a "
+                  f"comment there, and no second issue was opened")
+        else:
+            print(pickup_note(result["pickup"]))
     return 0
 
 
