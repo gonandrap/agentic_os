@@ -15,6 +15,23 @@ MIN_FIELD_CHARS = 40
 #: Shortest quote that can still be found again in the thing it was quoted from
 MIN_QUOTE_CHARS = 20
 
+#: Longest each prose field may be: the user reads every finding, and a wall of text is skimmed, not decided
+MAX_FIELD_CHARS = {
+    "symptom": 300,
+    "root_cause": 600,
+    "why_insufficient": 300,
+    "recommendation": 400,
+}
+
+#: Longest the report's one-line summary may be
+MAX_SUMMARY_CHARS = 160
+
+#: How many quotes one finding may carry; the strongest ones, not the whole session log
+MAX_EVIDENCE = 4
+
+#: Longest one quote may be: the line that proves the point, not the screen around it
+MAX_QUOTE_CHARS = 300
+
 #: Finding keys
 KEY_RE = plans.KEY_RE
 
@@ -47,6 +64,11 @@ def parse_report(raw: Any) -> dict[str, Any]:
             "`summary` is required — one line saying what is going wrong across all "
             "findings. It is what the attention item and the dashboard page open on."
         )
+    elif len(summary) > MAX_SUMMARY_CHARS:
+        problems.append(
+            f"`summary` is {len(summary)} characters, over the {MAX_SUMMARY_CHARS} of "
+            f"one line — say what is going wrong, and leave the why to the findings"
+        )
 
     findings: list[dict[str, Any]] = []
     seen_keys: set[str] = set()
@@ -76,7 +98,9 @@ def parse_report(raw: Any) -> dict[str, Any]:
         findings.append({
             "key": key,
             **fields,
-            "evidence": parse_evidence(key, entry.get("evidence"), problems),
+            "evidence": parse_evidence(key, entry.get("evidence"), problems,
+                                       max_items=MAX_EVIDENCE,
+                                       max_quote=MAX_QUOTE_CHARS),
             "proposed_orders": _parse_orders(key, entry.get("proposed_orders"),
                                              problems),
         })
@@ -104,10 +128,19 @@ def _field_problems(key: str, name: str, value: str) -> list[str]:
             f"{MIN_FIELD_CHARS} it takes to make an argument rather than restate the "
             f"heading"
         ]
+    cap = MAX_FIELD_CHARS[name]
+    if len(value) > cap:
+        return [
+            f"finding {key!r}: `{name}` is {len(value)} characters, over the {cap} the "
+            f"user will read — keep the mechanism, the file:line and the number that "
+            f"prove it, and cut the narrative of how you found it"
+        ]
     return []
 
 
-def parse_evidence(key: str, raw: Any, problems: list[str]) -> list[dict[str, str]]:
+def parse_evidence(key: str, raw: Any, problems: list[str], *,
+                   max_items: int | None = None,
+                   max_quote: int | None = None) -> list[dict[str, str]]:
     """The quoted record behind a finding (docs/superpowers/specs/2026-09-27-investigation-orders.md)"""
     if not isinstance(raw, list) or not raw:
         problems.append(
@@ -115,6 +148,11 @@ def parse_evidence(key: str, raw: Any, problems: list[str]) -> list[dict[str, st
             f"nothing quoted asks the user to trust a session nobody reads"
         )
         return []
+    if max_items is not None and len(raw) > max_items:
+        problems.append(
+            f"finding {key!r}: {len(raw)} evidence quotes, over the {max_items} a "
+            f"finding may carry — keep the ones that prove the root cause"
+        )
     out: list[dict[str, str]] = []
     for n, item in enumerate(raw, start=1):
         if not isinstance(item, dict):
@@ -135,6 +173,12 @@ def parse_evidence(key: str, raw: Any, problems: list[str]) -> list[dict[str, st
                 f"finding {key!r}, evidence {n}: `quote` is {len(quote)} characters, "
                 f"under the {MIN_QUOTE_CHARS} it takes to find the line again in its "
                 f"source"
+            )
+        elif max_quote is not None and len(quote) > max_quote:
+            problems.append(
+                f"finding {key!r}, evidence {n}: `quote` is {len(quote)} characters, "
+                f"over the {max_quote} a quote may be — quote the one line that proves "
+                f"it, not the screen around it"
             )
         out.append({"source": source, "quote": quote})
     return out
@@ -255,6 +299,38 @@ def render_report(report: dict[str, Any],
         lines.append(f"- [{finding.get('key', '')}] {status}")
         lines += render_finding(finding,
                                 (filed_orders or {}).get(finding.get("key", "")))
+    return lines
+
+
+def clip(text: str, limit: int) -> str:
+    """One line of at most `limit` characters, cut at a word"""
+    flat = " ".join(str(text or "").split())
+    if len(flat) <= limit:
+        return flat
+    return flat[:limit].rsplit(" ", 1)[0] + "…"
+
+
+def render_digest(report: dict[str, Any],
+                  filed_orders: dict[str, list[dict[str, Any]]] | None = None,
+                  limit: int = 200) -> list[str]:
+    """The report one line per finding plus its work — what a reader decides from before opening any finding"""
+    lines: list[str] = []
+    if report.get("summary"):
+        lines += [report["summary"], ""]
+    for finding in report.get("findings") or []:
+        key = finding.get("key", "")
+        lines.append(f"- [{key}] {finding.get('status') or 'pending'}: "
+                     f"{clip(finding.get('root_cause', ''), limit)}")
+        lines.append(f"    do: {clip(finding.get('recommendation', ''), limit)}")
+        filed = (filed_orders or {}).get(key) or []
+        if filed:
+            for order in filed:
+                lines.append(f"    filed: {order.get('id', '')} "
+                             f"{order.get('title', '')} — {order.get('status', '')}")
+        else:
+            for order in finding.get("proposed_orders") or []:
+                lines.append(f"    order ({order.get('type', '')}): "
+                             f"{order.get('title', '')}")
     return lines
 
 

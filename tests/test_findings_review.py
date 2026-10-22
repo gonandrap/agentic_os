@@ -516,3 +516,29 @@ def test_cli_io_show_lists_each_accepted_findings_filed_orders(reviewable, capsy
     assert out["created"][0]["id"] in printed
     assert "pending" in printed
     assert "[stale-code-map] pending" in printed
+
+
+def test_cli_io_show_is_a_digest_unless_asked_for_the_whole_report(reviewable, capsys):
+    io, _ = reviewable
+
+    assert cli.main(["io", "show", io["id"]]) == 0
+    digest = capsys.readouterr().out
+    assert "  symptom:" not in digest
+    assert "--finding <key>" in digest
+
+    assert cli.main(["io", "show", io["id"], "--full"]) == 0
+    full = capsys.readouterr().out
+    assert "  symptom:" in full and len(full) > len(digest)
+
+    assert cli.main(["io", "show", io["id"], "--finding", "stale-code-map"]) == 0
+    one = capsys.readouterr().out
+    assert "[stale-code-map]" in one and "[first-turn-reads]" not in one
+    assert "  symptom:" in one
+
+
+def test_cli_io_show_names_the_keys_when_the_finding_is_unknown(reviewable, capsys):
+    io, _ = reviewable
+
+    assert cli.main(["io", "show", io["id"], "--finding", "nope"]) == 1
+
+    assert "stale-code-map" in capsys.readouterr().err

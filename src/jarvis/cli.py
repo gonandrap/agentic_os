@@ -1092,6 +1092,11 @@ def build_parser() -> argparse.ArgumentParser:
                                    "and the evidence it was filed with")
     i.add_argument("io_id")
     i.add_argument("--project")
+    i.add_argument("--full", action="store_true",
+                   help="every finding in full, and the whole brief (default: one line "
+                        "per finding)")
+    i.add_argument("--finding", metavar="KEY",
+                   help="only this finding, in full")
 
     i = io.add_parser("report", help="(analysts) submit the findings report — the "
                                      "analyst's terminal action, and what settles its "
@@ -3778,7 +3783,11 @@ def cmd_io(args: argparse.Namespace) -> int:
                   f"[{detail['project']}] {detail['title']} ({detail['status_label']})")
             print(f"\n{detail['findings']} findings: {d['accepted']} accepted, "
                   f"{d['rejected']} rejected, {d['pending']} awaiting you")
-            print(f"\n{detail['observation']}\n")
+            observation = detail["observation"]
+            if not (args.full or args.finding):
+                # The brief is the filer's; the findings are what the reader acts on
+                observation = findings.clip(observation, 300)
+            print(f"\n{observation}\n")
             if detail["attention_reason"]:
                 print(f"⚠ {detail['attention_reason']}\n")
             if detail["evidence_refs"]:
@@ -3793,12 +3802,25 @@ def cmd_io(args: argparse.Namespace) -> int:
                 print(f"\nanalyst: {a['id']} ({a['status']})")
             if detail["alarms"]:
                 print(f"\nalarms: {ops.alarm_standing_line(detail['alarms'])}")
-            if detail["report"].get("findings"):
+            report = detail["report"]
+            if args.finding:
+                keep = [f for f in report.get("findings") or []
+                        if f.get("key") == args.finding]
+                if not keep:
+                    raise ops.OpsError(
+                        f"no finding {args.finding!r} on {detail['id']}; it has: "
+                        f"{', '.join(f.get('key', '') for f in report.get('findings') or [])}")
+                report = {"findings": keep}
+            if report.get("findings"):
                 # §4.4's renderer, with each accepted finding's filed orders and their LIVE status resolved once by...
                 print()
-                for line in findings.render_report(detail["report"],
-                                                   detail["filed_orders"]):
+                render = (findings.render_report if args.full or args.finding
+                          else findings.render_digest)
+                for line in render(report, detail["filed_orders"]):
                     print(line)
+                if not (args.full or args.finding):
+                    print(f"\none finding in full: jarvis io show {detail['id']} "
+                          f"--finding <key>   (all: --full)")
 
     elif args.io_cmd == "review":
         _print(ops.review_findings(args.io_id, accept=args.accept,
