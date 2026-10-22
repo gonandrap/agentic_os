@@ -3953,6 +3953,9 @@ def _morpheus_activity_text(act: dict) -> str:
         parts = [f"idle · {act['due']} queued due now" if act["due"] else "idle"]
     if act.get("usage_hold_until"):
         parts.append(f"held until {_stamp(act['usage_hold_until'])} (usage limit)")
+    if act.get("kill_hold_until"):
+        parts.append(f"held until {_stamp(act['kill_hold_until'])} or the next release "
+                     f"({act['kills']} killed turns in a row)")
     for h in act["held"]:
         why = {"error": " after a failed turn", "offer": " after an offer"}.get(h["cause"], "")
         parts.append(f"{h['id']} offered {h['offers']} of {act['max_offers']}: "

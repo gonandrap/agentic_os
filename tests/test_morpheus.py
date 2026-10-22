@@ -542,6 +542,89 @@ def test_a_turn_killed_before_it_answered_costs_no_offer(central, tmp_path):
                          call=turn) == "scripts"
 
 
+def sigkilled(rc: int = 143) -> "claude_cli.KilledError":
+    return claude_cli.KilledError(claude_cli.Killed(
+        message=f"claude -p --output-format json... was killed by a signal (rc={rc}) "
+                "and wrote nothing", rc=rc))
+
+
+def kill_until_held(central, tmp_path, *, now: float = TEST_EPOCH) -> str:
+    """MAX_KILLS kills in a row, each its own pass; returns the last pass's verdict"""
+    turn = FakeTurn(error=sigkilled())
+    verdict = ""
+    for n in range(morpheus.MAX_KILLS):
+        verdict = morpheus.wake(central, catalog(), tmp_path, now=now + n, call=turn)
+    return verdict
+
+
+def test_consecutive_kills_hold_the_session_instead_of_retrying_every_wake(central, tmp_path):
+    queued(central, 2)
+    assert kill_until_held(central, tmp_path) == "killed"
+    state = morpheus.session_state(central)
+    assert state["kills"] == morpheus.MAX_KILLS
+    assert state["kill_hold_until"] == TEST_EPOCH + 2 + morpheus.KILL_HOLD_SECONDS
+    assert f"held after {morpheus.MAX_KILLS} killed turns in a row" in state["last_error"]
+    # Not one further turn is attempted while the hold stands
+    turn = FakeTurn()
+    assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH + 60,
+                         call=turn) == "kill_held"
+    assert turn.calls == []
+    act = morpheus.activity(central, now=TEST_EPOCH + 60)
+    assert act["kill_hold_until"] == state["kill_hold_until"]
+    assert act["kills"] == morpheus.MAX_KILLS and act["max_kills"] == morpheus.MAX_KILLS
+    # And the user is told, not left with nothing happening
+    titles = [i["title"] for i in central.unacked_inbox("warning")]
+    assert f"Morpheus held after {morpheus.MAX_KILLS} killed turns in a row" in titles
+    # The hold expires: one retry, and it holds again if that one dies too
+    assert morpheus.wake(central, catalog(), tmp_path,
+                         now=TEST_EPOCH + morpheus.KILL_HOLD_SECONDS + 3,
+                         call=turn) == "scripts"
+
+
+def test_an_answered_turn_resets_the_kill_counter(central, tmp_path):
+    queued(central, 2)
+    killer = FakeTurn(error=sigkilled())
+    for n in range(morpheus.MAX_KILLS - 1):
+        assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH + n,
+                             call=killer) == "killed"
+    assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH + 10,
+                         call=FakeTurn()) == "scripts"
+    assert morpheus.session_state(central)["kills"] == 0
+    # So the next kill starts counting from one again: no hold
+    queued(central, 3)
+    assert morpheus.wake(central, catalog(), tmp_path,
+                         now=TEST_EPOCH + morpheus.REOFFER_SECONDS, call=killer) == "killed"
+    state = morpheus.session_state(central)
+    assert state["kills"] == 1 and "kill_hold_until" not in state
+
+
+def test_a_new_release_lifts_the_kill_hold(central, tmp_path):
+    """A release restart is both the usual cause of the kills and the usual fix (#1161)"""
+    central.set_state(morpheus.RELEASE_KEY, "jarvis-0.1.1")
+    queued(central, 2)
+    kill_until_held(central, tmp_path)
+    assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH + 60,
+                         call=FakeTurn()) == "kill_held"
+    central.set_state(morpheus.RELEASE_KEY, "jarvis-0.1.2")
+    turn = FakeTurn()
+    assert morpheus.wake(central, catalog(), tmp_path, now=TEST_EPOCH + 120,
+                         call=turn) == "scripts"
+    assert len(turn.calls) == 1
+    assert morpheus.activity(central, now=TEST_EPOCH + 120)["kill_hold_until"] is None
+
+
+def test_the_status_line_says_the_session_is_held_after_the_kills(central, tmp_path, capsys,
+                                                                  clock):
+    from jarvis.cli import main
+
+    queued(central, 2)
+    kill_until_held(central, tmp_path, now=db.now())
+    assert main(["morpheus", "status"]) == 0
+    out = capsys.readouterr().out
+    assert "held until" in out and f"({morpheus.MAX_KILLS} killed turns in a row)" in out
+    assert "or the next release" in out
+
+
 def refused(reset_at: float | None) -> "claude_cli.UsageLimitError":
     return claude_cli.UsageLimitError(claude_cli.UsageLimit(
         message="You've hit your session limit · resets 6:20am (America/Los_Angeles)",
