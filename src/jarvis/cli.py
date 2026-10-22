@@ -933,6 +933,8 @@ def build_parser() -> argparse.ArgumentParser:
     rt.add_argument("wo_id")
     rt.add_argument("--message", help="what to tell the worker; omitted sends the OS's "
                                       "own relaunch note, unattributed")
+    rt.add_argument("--model", help="relaunch on this model id instead (e.g. after "
+                                    "claude rejected the order's own)")
     rt.add_argument("--project")
 
     # docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md
@@ -3469,7 +3471,7 @@ def cmd_wo(args: argparse.Namespace) -> int:
                                   force=args.force), args.json)
     elif args.wo_cmd == "retry":
         # `relay=True` as `send` does: `ops.user_authorship` decides whether this process is a surface the...
-        _print(ops.retry(args.wo_id, message=args.message,
+        _print(ops.retry(args.wo_id, message=args.message, model=args.model,
                          project_name=args.project, relay=True), args.json)
     elif args.wo_cmd == "respawn":
         _print(ops.respawn_worker(args.wo_id, project_name=args.project), args.json)

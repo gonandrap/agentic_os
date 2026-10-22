@@ -1,4 +1,4 @@
-"""Screenshot `/morpheus` with a release's PRs in every state, for a PR's UI evidence (docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md)"""
+"""Screenshot the /morpheus tab and its check modal against a throwaway store, for a PR's UI evidence"""
 
 from __future__ import annotations
 
@@ -12,7 +12,13 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SHOTS = REPO / "docs" / "screenshots"
-PORT = 8805
+PORT = 8798
+
+SCRIPT = "\n".join(
+    ["#!/usr/bin/env bash", "set -euo pipefail", "# exit 0 = validated, 75 = not yet"]
+    + [f"jarvis status --json | jq -e '.morpheus.items[{n}].state == \"validated\"' >/dev/null"
+       for n in range(30)]
+    + ["exit 0"])
 
 
 def seed() -> None:
@@ -20,46 +26,31 @@ def seed() -> None:
     from jarvis.catalog import MorpheusConfig
     from jarvis.central_store import CentralStore
 
-    cfg = MorpheusConfig()
-    central = CentralStore()
+    store = CentralStore()
+    for n in (7, 8):
+        pr = morpheus.PullRequestBody(number=n, url=f"https://github.com/o/r/pull/{n}",
+                                      title=f"[wo-1234abc{n}] thing {n}",
+                                      body="## How to validate in production\nlook\n")
+        item = morpheus.enqueue(store, MorpheusConfig(), pr, project="jarvis_os", repo="o/r")
+        store.update_morpheus_item(item["id"], script=SCRIPT, script_source="agent",
+                                   state="monitoring", checks=3, last_exit=75,
+                                   last_output="\n".join(f"line {k}: not yet" for k in range(40)))
+    # Two script-less items: one mid-backoff, one Morpheus gave up on (#1161)
     now = time.time()
-    rows = [
-        ("jarvis_os", 1130, "[wo-1a2b3c4d] Neo answers alarms in one call",
-         "jarvis neo stats --json | jq -e '.alarm.calls_per_answer <= 1' || exit 75", 0),
-        ("jarvis_os", 1131, "[wo-5e6f7a8b] The stuck sweep skips budget-capped orders",
-         "jarvis stuck --json | jq -e 'all(.[]; .excluded != null)' && exit 0 || exit 1", 1),
-        ("jarvis_os", 1132, "[wo-9c0d1e2f] Release notes list every PR", "", None),
-        ("jarvis_os", 1134, "[wo-7d8e9f0a] The cost page precomputes its two windows",
-         "", None),
-        ("jarvis_os", 1133, "Trim comments main gained since the last merge", None, None),
-        ("shared_schedule", 88, "[wo-3a4b5c6d] Login keeps the session across restarts",
-         "curl -fsS localhost:8000/healthz | grep -q sessions_restored || exit 75", 75),
-    ]
-    for project, n, title, script, code in rows:
-        hint = "None — comments only" if script is None else "Watch it in production."
-        body = f"## Summary\nx\n\n## {morpheus.SECTION}\n\n{hint}\n"
-        item = morpheus.enqueue(central, cfg, morpheus.PullRequestBody(
-            n, f"https://github.com/gonandrap/{project}/pull/{n}", title, body),
-            project=project, repo=f"gonandrap/{project}",
-            release_tag="jarvis-0.9.4" if project == "jarvis_os" else "", now=now - 3600)
-        if script:
-            item = morpheus.set_script(central, item["id"], script, "agent")
-            morpheus.check(central, cfg, item, Path.cwd(), now=now,
-                           run=lambda s, c, t, code=code: morpheus.CheckResult(
-                               code, {0: "1 call per answer", 1: "wo-77aa…: excluded=null",
-                                      75: "not exercised yet"}[code]))
-    failed = [i for i in central.morpheus_items(("failed",))][0]
-    central.claim_morpheus_action(failed["id"], "investigation:fo-81c2d3e4")
-    central.set_state(morpheus.RELEASE_KEY, "jarvis-0.9.4")
-    # One queued item mid-backoff, one Morpheus gave up on (#1161)
-    waiting, spent = [i["id"] for i in central.morpheus_items(("queued",))][:2]
-    central.set_state(morpheus.SESSION_KEY, json.dumps({
+    queued = []
+    for n in (9, 10):
+        pr = morpheus.PullRequestBody(number=n, url=f"https://github.com/o/r/pull/{n}",
+                                      title=f"[wo-1234abc{n}] thing {n}",
+                                      body="## How to validate in production\nlook\n")
+        queued.append(morpheus.enqueue(store, MorpheusConfig(), pr,
+                                       project="jarvis_os", repo="o/r")["id"])
+    store.set_state(morpheus.SESSION_KEY, json.dumps({
         "session_id": "4f1c9a2e-7b3d-4e8f-9a1b-2c3d4e5f6a7b", "turns": 7, "compactions": 1,
         "context_share": 0.18, "context_peak": 36000, "context_window": 200000,
         "last_turn_ts": now - 900, "last_turn_kind": "scripts", "compact_due": False,
-        "offers": {waiting: {"n": 1, "ts": now - 900},
-                   spent: {"n": morpheus.MAX_OFFERS, "ts": now - 3 * 6 * 3600}}}))
-    central.close()
+        "offers": {queued[0]: {"n": 1, "ts": now - 900},
+                   queued[1]: {"n": morpheus.MAX_OFFERS, "ts": now - 3 * 6 * 3600}}}))
+    store.close()
 
 
 def serve() -> None:
@@ -76,21 +67,23 @@ def shoot() -> None:
     SHOTS.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        page = browser.new_page(viewport={"width": 1440, "height": 1000})
+        page = browser.new_page(viewport={"width": 1280, "height": 900})
         page.goto(f"http://127.0.0.1:{PORT}/morpheus")
-        page.screenshot(path=SHOTS / "morpheus.png", full_page=True)
+        page.screenshot(path=SHOTS / "morpheus-table.png", full_page=True)
+        page.locator("button.peek", has_text="agent").first.click()
+        page.wait_for_timeout(200)
+        page.screenshot(path=SHOTS / "morpheus-check-modal.png")
         browser.close()
 
 
 def main() -> int:
     os.environ["JARVIS_HOME"] = tempfile.mkdtemp()
-    os.environ.pop("JARVIS_WO_ID", None)
     sys.path.insert(0, str(REPO / "src"))
     seed()
     threading.Thread(target=serve, daemon=True).start()
     time.sleep(2)
     shoot()
-    print(SHOTS / "morpheus.png")
+    print("\n".join(str(p) for p in sorted(SHOTS.glob("morpheus-*.png"))))
     return 0
 
 
