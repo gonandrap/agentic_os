@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import time
-
 import pytest
 
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
-from jarvis import fleet, ops  # noqa: E402
+from jarvis import db, fleet, ops  # noqa: E402
 from jarvis.central_store import CentralStore  # noqa: E402
 from jarvis.project_store import ProjectStore  # noqa: E402
 from jarvis.ui.app import create_app  # noqa: E402
@@ -73,8 +71,8 @@ def test_an_empty_allow_list_says_nothing_is_let_through(client):
 def test_the_ramp_is_shown_when_one_is_in_force(client):
     central = CentralStore()
     try:
-        central.set_state(fleet.REOPENED_KEY, str(time.time() - 60))
-        central.set_state(fleet.BREAKER_KEY, str(time.time() - 60))
+        central.set_state(fleet.REOPENED_KEY, str(db.now() - 60))
+        central.set_state(fleet.BREAKER_KEY, str(db.now() - 60))
     finally:
         central.close()
     page = _text(client.get("/"))

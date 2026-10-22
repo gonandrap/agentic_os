@@ -128,6 +128,6 @@ def test_each_narrowing_removes_a_hold_the_wide_net_makes():
         assert autoreview.high_stakes_marker(text), rule
 
 
-def test_mode_is_a_catalog_mode_and_not_the_default():
+def test_mode_is_a_catalog_mode_and_the_default():
     assert "regex-tightened" in catalog.STAKES_CLASSIFIER_MODES
-    assert catalog.ValidationConfig().stakes_classifier == "regex"
+    assert catalog.ValidationConfig().stakes_classifier == "regex-tightened"

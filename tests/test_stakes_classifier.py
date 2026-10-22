@@ -118,8 +118,8 @@ def test_the_regex_mode_makes_no_call_and_writes_no_row(started, monkeypatch):
     assert [h["code"] for h in held] == [autoreview.HELD_HIGH_STAKES]
 
 
-def test_the_default_mode_is_the_regex(started):
-    assert started.catalog.project("proj_a").validation.stakes_classifier == "regex"
+def test_the_default_mode_is_the_tightened_regex(started):
+    assert started.catalog.project("proj_a").validation.stakes_classifier == "regex-tightened"
 
 
 # -- `shadow`: the regex still decides

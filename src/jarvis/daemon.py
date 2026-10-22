@@ -18,7 +18,7 @@ from . import (background, bugreport, bus, claude_cli, db, fleet, holds, inspect
                notify, release, usage_meter, verdicts, worker_session)
 from . import budget as budget_mod
 from . import steward
-from .catalog import Catalog, ProjectSpec, load_catalog
+from .catalog import DEFAULT_STAKES_CLASSIFIER, Catalog, ProjectSpec, load_catalog
 from .central_store import SETTLED_BACKLOG_STATUSES, CentralStore
 from .dispatch import dispatch_work_order
 from . import invariants as invariants_mod
@@ -2153,7 +2153,7 @@ class Daemon:
         """The account's window is spent (#235)"""
         from .invariants import usage_hold_note
 
-        reopens = limit.reset_at or (time.time()
+        reopens = limit.reset_at or (db.now()
                                      + worker_session.RATE_LIMIT_FALLBACK_DELAY)
         store.close_validation_round(round_id, "failed", usage_hold_note(reopens),
                                      hold_cause=VALIDATION_HELD_CAUSE)
@@ -2604,7 +2604,7 @@ class Daemon:
         from .invariants import usage_hold_note
 
         fo_id = fo["id"]
-        reopens = limit.reset_at or (time.time()
+        reopens = limit.reset_at or (db.now()
                                      + worker_session.RATE_LIMIT_FALLBACK_DELAY)
         store.close_validation_round(round_id, "failed", usage_hold_note(reopens),
                                      hold_cause=VALIDATION_HELD_CAUSE)
@@ -5474,7 +5474,7 @@ class Daemon:
         """Apply this project's `validation.stakes_classifier` to ONE row's decision (docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md)"""
         from . import autoreview
 
-        mode = str(getattr(cfg, "stakes_classifier", "regex") or "regex")
+        mode = str(getattr(cfg, "stakes_classifier", "") or DEFAULT_STAKES_CLASSIFIER)
         if mode == "regex":
             return decision
         if not (decision.armed or decision.code == autoreview.HELD_HIGH_STAKES):
@@ -5489,7 +5489,8 @@ class Daemon:
 
     def _settle_stakes(self, project: ProjectSpec, wo: dict, a: dict) -> Any:
         """The verdict the SETTLE site re-checks condition 7 against, or None"""
-        mode = str(getattr(project.validation, "stakes_classifier", "regex") or "regex")
+        mode = str(getattr(project.validation, "stakes_classifier", "")
+                   or DEFAULT_STAKES_CLASSIFIER)
         if mode == "regex-tightened":
             from . import autoreview
             return autoreview.tightened_verdict(str(a.get("content") or ""))
