@@ -112,7 +112,8 @@ def render_section(name: str, *, wo_id: str | None = None,
                    project: str | None = None,
                    gates_enabled: tuple[str, ...] | None = None,
                    serena: bool = True,
-                   tool_search: str = "cli") -> str:
+                   tool_search: str = "cli",
+                   transport: str = "background") -> str:
     """One full section, rendered with real ids when the caller has them"""
     wo = wo_id or WO_PLACEHOLDER
     proj = project or PROJECT_PLACEHOLDER
@@ -121,7 +122,7 @@ def render_section(name: str, *, wo_id: str | None = None,
     if name == "gates":
         return gates_section(wo, enabled=gates_enabled)
     if name == "record":
-        return record_section(wo)
+        return record_section(wo, transport)
     if name == "navigation":
         return navigation_section(serena, tool_search=tool_search)
     if name == "concision":
@@ -133,9 +134,66 @@ def render_section(name: str, *, wo_id: str | None = None,
 
 # -- the core
 
+#: The two turn transports (`claude_cli.TRANSPORT_*`), spelled here so this module stays a leaf
+TRANSPORT_BACKGROUND = "background"
+TRANSPORT_HEADLESS = "headless"
+
+
+def long_work_bullet(transport: str) -> str:
+    """How a worker runs work that outlasts one command, which depends on what a turn IS (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)"""
+    if transport == TRANSPORT_HEADLESS:
+        return (
+            "- **A turn is one-shot and NOTHING wakes you when a background job "
+            "ends.** Long work — a whole-suite run, a CI watcher, a "
+            "`jarvis-implementer` or `jarvis-spec-writer` seat — runs in the BACKGROUND "
+            "(`run_in_background: true`); the FOREGROUND call is REFUSED. Collect it "
+            "with `BashOutput`/`TaskOutput` every 3-4 minutes, never one call past 240 "
+            "seconds: your prompt cache lives 5 minutes and a call after it re-sends "
+            "this whole conversation. Nothing else may be backgrounded, and never END a "
+            "turn with a task uncollected — the Stop hook refuses it — or claim you "
+            "will be re-invoked.")
+    return (
+        "- **Long work runs in the background, and it wakes you.** A whole-suite run, "
+        "a CI watcher, a subagent: `run_in_background: true`, then keep working or "
+        "end your turn — its result arrives as a notification. NEVER poll it: no "
+        "`sleep` loops, no `TaskOutput`/`BashOutput` check-ins, no `git diff` to see "
+        "how far a subagent got. Each of those re-reads this whole conversation.")
+
+
+def crew_block(require_crew: bool) -> list[str]:
+    """What an ordinary worker is told about its two subagent seats (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)"""
+    if require_crew:
+        # spec 2026-09-23-the-crew-a-worker-must-use.md SS6
+        return [
+            "",
+            "# Your crew",
+            "You are a LEAD with two subagents, and delegating is the job, not a "
+            "courtesy: spec writing goes to `jarvis-spec-writer`, code and tests go to "
+            "`jarvis-implementer` (TDD, failing test first).",
+            "- YOURS, and neither of theirs: git, the PR, every `jarvis` command, the "
+            "work-order record (messages, assumptions, the finish summary), and REVIEW "
+            "of what they hand back — it is a draft until you have read it.",
+            "- Your OWN `Edit`/`Write` inside the worktree is refused by a hook, so "
+            "route it through `jarvis-implementer`.",
+        ]
+    return [
+        "",
+        "# Subagents",
+        "DO THE WORK YOURSELF: read, edit, test, commit. A subagent re-reads the code "
+        "you already read and you then re-read what it wrote, so delegating a change "
+        "you could make yourself costs it twice. `jarvis-implementer` and "
+        "`jarvis-spec-writer` exist for a LARGE, self-contained chunk you can specify "
+        "completely, or independent work you want done in parallel.",
+        "- A seat inherits none of your context: brief it fully. Its hand-back is its "
+        "report — read the final diff ONCE before you commit; do not watch its progress.",
+    ]
+
+
 def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
                   gate_names: tuple[str, ...] = (),
-                  kind: str = "worker") -> list[str]:
+                  kind: str = "worker",
+                  transport: str = TRANSPORT_BACKGROUND,
+                  require_crew: bool = False) -> list[str]:
     """The compressed operating contract: only the invariants a worker cannot be allowed to discover by..."""
     from .sections import QUESTION_MAX_CHARS
 
@@ -189,15 +247,7 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
             f"action>\"`, by the NUMBER the block printed, never by re-typing the "
             f"command (full protocol: `jarvis brief gates --wo {wo_id}`).",
         ] if gate_names else []),
-        f"- **A turn is one-shot and NOTHING wakes you when a background job "
-        f"ends.** Long work — a whole-suite run, a CI watcher, a "
-        f"`jarvis-implementer` or `jarvis-spec-writer` seat — runs in the BACKGROUND "
-        f"(`run_in_background: true`); the FOREGROUND call is REFUSED. Collect it "
-        f"with `BashOutput`/`TaskOutput` every 3-4 minutes, never one call past 240 "
-        f"seconds: your prompt cache lives 5 minutes and a call after it re-sends "
-        f"this whole conversation. Nothing else may be backgrounded, and never END a "
-        f"turn with a task uncollected — the Stop hook refuses it — or claim you "
-        f"will be re-invoked.",
+        long_work_bullet(transport),
         f"- **Point, do not explain; say each thing ONCE.** A code comment is one "
         f"line citing the spec that explains it (`docs/superpowers/specs/`), not "
         f"the explanation. A PR body hints; the diff explains. Never restate what "
@@ -218,19 +268,7 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
         f"SHA, path with a line range, or the command that reproduces it. An "
         f"oversized argument and a `$(git diff …)` are refused before the command "
         f"runs.",
-        # spec 2026-09-23-the-crew-a-worker-must-use.md SS6
-        *([
-            "",
-            "# Your crew",
-            "You are a LEAD with two subagents, and delegating is the job, not a "
-            "courtesy: spec writing goes to `jarvis-spec-writer`, code and tests go to "
-            "`jarvis-implementer` (TDD, failing test first).",
-            "- YOURS, and neither of theirs: git, the PR, every `jarvis` command, the "
-            "work-order record (messages, assumptions, the finish summary), and REVIEW "
-            "of what they hand back — it is a draft until you have read it.",
-            "- Your OWN `Edit`/`Write` inside the worktree is refused by a hook, so "
-            "route it through `jarvis-implementer`.",
-        ] if kind == "worker" else []),
+        *(crew_block(require_crew) if kind == "worker" else []),
     ]
     return lines
 
@@ -368,7 +406,55 @@ def contract_section(wo_id: str = WO_PLACEHOLDER,
     return "\n".join(lines)
 
 
-def record_section(wo_id: str = WO_PLACEHOLDER) -> str:
+def turn_section(transport: str) -> list[str]:
+    """What a turn IS, in full — `long_work_bullet`'s long form (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)"""
+    if transport == TRANSPORT_HEADLESS:
+        return [
+            "# A turn is one-shot",
+            "Your session is a single `claude -p --resume` process, and ending a turn "
+            "exits it. Everything you started inside it goes too: a backgrounded "
+            "command is killed or orphaned, and either way nobody reads its output, "
+            "because no event re-invokes a worker when a job it launched finishes. "
+            "Exactly three things start your next turn — an answer to `jarvis wo ask`, "
+            "a verdict on a gate you requested, a message the user sends you.",
+            "",
+            "So work that outlasts one command runs in the BACKGROUND and you POLL it: "
+            "`run_in_background: true`, then `BashOutput` / `TaskOutput` every 3-4 "
+            "minutes until it reports finished, and no single call blocking longer than "
+            "240 seconds. The reason is the clock, not taste — your prompt cache lives "
+            "5 minutes, so a call more than 300 seconds after the previous one re-sends "
+            "this whole conversation at the 1.25x write rate, where a check-in inside "
+            "the window is a 0.1x read. This is the ONLY work that may be backgrounded: "
+            "a whole-suite test run, a CI watcher, a `jarvis-implementer` or "
+            "`jarvis-spec-writer` seat, a long wait. The FOREGROUND call is refused for "
+            "those and backgrounding anything else still is. You may also split it "
+            "into pieces that each fit inside a turn. If it fits in neither, say so and "
+            "ask — a turn that ends on a question is a turn the "
+            "OS understands. NEVER end a turn with a task uncollected: the Stop hook "
+            "refuses it, and ending kills the task. A turn that ends on \"I'll pick this "
+            "up when the "
+            "background run finishes\" is the work order abandoned mid-task, and the "
+            "user is flagged for it.",
+        ]
+    return [
+        "# Your session stays up between turns",
+        "Your session is a Claude Code background session that lives for the whole "
+        "work order. A turn ends when you stop talking, but the session does not: "
+        "anything you started with `run_in_background: true` keeps running, and when "
+        "it finishes its result arrives as a notification that starts your next turn "
+        "by itself. A subagent works the same way.",
+        "",
+        "So work that outlasts one command runs in the BACKGROUND and you do NOT "
+        "watch it: no `sleep` loops, no `TaskOutput` / `BashOutput` check-ins, no "
+        "`git diff` to see how far a subagent got. Each of those calls re-reads this "
+        "whole conversation; waiting for the notification costs nothing. Keep "
+        "working on something else, or end the turn. Messages from Neo and the user "
+        "wait until the session is idle, so they never cut a background job short.",
+    ]
+
+
+def record_section(wo_id: str = WO_PLACEHOLDER,
+                   transport: str = TRANSPORT_BACKGROUND) -> str:
     """What the outside world sees, plus the finishing protocol in full"""
     lines = [
         "# What the outside world sees",
@@ -445,31 +531,7 @@ def record_section(wo_id: str = WO_PLACEHOLDER) -> str:
         "Do not stop without finishing: a session that ends with neither "
         f"`jarvis wo finish` nor an open question is invisible work.",
         "",
-        "# A turn is one-shot",
-        "Your session is a single `claude -p --resume` process, and ending a turn "
-        "exits it. Everything you started inside it goes too: a backgrounded "
-        "command is killed or orphaned, and either way nobody reads its output, "
-        "because no event re-invokes a worker when a job it launched finishes. "
-        "Exactly three things start your next turn — an answer to `jarvis wo ask`, "
-        "a verdict on a gate you requested, a message the user sends you.",
-        "",
-        "So work that outlasts one command runs in the BACKGROUND and you POLL it: "
-        "`run_in_background: true`, then `BashOutput` / `TaskOutput` every 3-4 "
-        "minutes until it reports finished, and no single call blocking longer than "
-        "240 seconds. The reason is the clock, not taste — your prompt cache lives "
-        "5 minutes, so a call more than 300 seconds after the previous one re-sends "
-        "this whole conversation at the 1.25x write rate, where a check-in inside "
-        "the window is a 0.1x read. This is the ONLY work that may be backgrounded: "
-        "a whole-suite test run, a CI watcher, a `jarvis-implementer` or "
-        "`jarvis-spec-writer` seat, a long wait. The FOREGROUND call is refused for "
-        "those and backgrounding anything else still is. You may also split it "
-        "into pieces that each fit inside a turn. If it fits in neither, say so and "
-        "ask — a turn that ends on a question is a turn the "
-        "OS understands. NEVER end a turn with a task uncollected: the Stop hook "
-        "refuses it, and ending kills the task. A turn that ends on \"I'll pick this "
-        "up when the "
-        "background run finishes\" is the work order abandoned mid-task, and the "
-        "user is flagged for it.",
+        *turn_section(transport),
     ]
     return "\n".join(lines)
 

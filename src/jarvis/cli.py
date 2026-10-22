@@ -4877,7 +4877,9 @@ def cmd_brief(args: argparse.Namespace) -> int:
                                       gates_enabled=gates_enabled,
                                       serena=os.environ.get("JARVIS_SERENA") != "0",
                                       tool_search=os.environ.get(
-                                          "JARVIS_TOOL_SEARCH", "cli")))
+                                          "JARVIS_TOOL_SEARCH", "cli"),
+                                      transport=os.environ.get(
+                                          "JARVIS_TURN_TRANSPORT", "background")))
     return 0
 
 

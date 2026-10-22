@@ -976,6 +976,8 @@ ADDED_COLUMNS = {
         "paired_reason": "TEXT",
     },
     "work_orders": {
+        # The turn transport this order's session was born on, fixed at its first launch (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)
+        "transport": "TEXT",
         # How many times launching this order's first turn has failed on the transport (docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §5.)
         "dispatch_attempts": "INTEGER NOT NULL DEFAULT 0",
         "retry_after": "REAL",

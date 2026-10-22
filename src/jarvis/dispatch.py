@@ -337,7 +337,7 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         return _analyst_prompt(wo, project, knowledge, feature)
     if wo.get("kind") == "investigator":
         return _investigator_prompt(wo, project, knowledge, feature)
-    from . import os_map, wiring, worker_brief
+    from . import os_map, wiring, worker_brief, worker_session
     from .gates import KINDS
 
     live_gates = tuple(k.name for k in KINDS
@@ -371,7 +371,9 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         "",
         *worker_brief.core_contract(wo["id"], wo["title"], project.name,
                                     bool(knowledge), live_gates,
-                                    kind=str(wo.get("kind") or "worker")),
+                                    kind=str(wo.get("kind") or "worker"),
+                                    transport=worker_session.transport_of(project, wo),
+                                    require_crew=project.worker.require_crew),
         "",
         *worker_brief.section_index(wo["id"], gated=bool(project.gates),
                                     serena=wiring.serena_wired(project.wiring)),

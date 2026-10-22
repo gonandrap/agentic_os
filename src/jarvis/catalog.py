@@ -72,6 +72,9 @@ DEFAULT_WORKER_TOOL_SEARCH = "on"
 # WHICH PROMPT-CACHE TTL a worker TURN's writes are billed at. §1 of... (docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md)
 VALID_WORKER_CACHE_TTL = ("5m", "1h", "cli")
 DEFAULT_WORKER_CACHE_TTL = "5m"
+#: What a worker turn runs on: one `claude --bg` session for the conversation, or a `claude -p` per turn (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)
+VALID_WORKER_TRANSPORT = ("background", "headless")
+DEFAULT_WORKER_TRANSPORT = "headless"
 
 # Whether `hooks.py_nav_decision` refuses a worker's source-navigating Bash call at a `.py` path. §6... (docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md)
 VALID_PY_NAV_HOOK = ("off", "on")
@@ -235,6 +238,8 @@ class WorkerDefaults:
     tool_search: str = DEFAULT_WORKER_TOOL_SEARCH
     # Spec 2026-10-15-the-hour-on-worker-turns-only.md §1 — see VALID_WORKER_CACHE_TTL
     cache_ttl: str = DEFAULT_WORKER_CACHE_TTL
+    # Spec 2026-10-22-workers-on-background-sessions.md — see VALID_WORKER_TRANSPORT
+    transport: str = DEFAULT_WORKER_TRANSPORT
     # Spec 2026-10-02-serena-the-cheap-path.md §6 — see VALID_PY_NAV_HOOK
     py_nav_hook: str = DEFAULT_WORKER_PY_NAV_HOOK
     # Spec 2026-10-06-navigate-specs-like-code.md §5 — see VALID_DOC_NAV_HOOK
@@ -251,8 +256,8 @@ class WorkerDefaults:
     investigation_budget_usd: float | None = DEFAULT_INVESTIGATION_BUDGET_USD
     investigation_model: str | None = DEFAULT_INVESTIGATION_MODEL
     investigation_effort: str | None = DEFAULT_INVESTIGATION_EFFORT
-    # Whether the lead must delegate file edits to its crew. §7 of... (docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md)
-    require_crew: bool = True
+    # Whether the lead must delegate file edits to its crew; off since docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md
+    require_crew: bool = False
     # What one MCP tool call may take, in milliseconds (#845)
     mcp_tool_timeout_ms: int = DEFAULT_WORKER_MCP_TOOL_TIMEOUT_MS
     denied_tools: tuple[str, ...] = DEFAULT_WORKER_DENIED_TOOLS
@@ -1011,6 +1016,8 @@ class OsConfig:
     default_tool_search: str = DEFAULT_WORKER_TOOL_SEARCH
     # Spec 2026-10-15-the-hour-on-worker-turns-only.md §1 — see VALID_WORKER_CACHE_TTL
     default_cache_ttl: str = DEFAULT_WORKER_CACHE_TTL
+    # Spec 2026-10-22-workers-on-background-sessions.md — see VALID_WORKER_TRANSPORT
+    default_transport: str = DEFAULT_WORKER_TRANSPORT
     # Spec 2026-10-02-serena-the-cheap-path.md §6 — see VALID_PY_NAV_HOOK
     default_py_nav_hook: str = DEFAULT_WORKER_PY_NAV_HOOK
     # Spec 2026-10-06-navigate-specs-like-code.md §5 — see VALID_DOC_NAV_HOOK
@@ -2004,6 +2011,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         default_tool_search=defaults.get("tool_search", DEFAULT_WORKER_TOOL_SEARCH),
         # Spec 2026-10-15-the-hour-on-worker-turns-only.md §1
         default_cache_ttl=defaults.get("cache_ttl", DEFAULT_WORKER_CACHE_TTL),
+        default_transport=defaults.get("transport", DEFAULT_WORKER_TRANSPORT),
         # Spec 2026-10-02-serena-the-cheap-path.md §6
         default_py_nav_hook=defaults.get("py_nav_hook", DEFAULT_WORKER_PY_NAV_HOOK),
         # Spec 2026-10-06-navigate-specs-like-code.md §5
@@ -2075,6 +2083,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
     if os_cfg.default_cache_ttl not in VALID_WORKER_CACHE_TTL:
         raise _err(f"os.defaults.cache_ttl {os_cfg.default_cache_ttl!r} not in "
                    f"{sorted(VALID_WORKER_CACHE_TTL)}")
+    if os_cfg.default_transport not in VALID_WORKER_TRANSPORT:
+        raise _err(f"os.defaults.transport {os_cfg.default_transport!r} not in "
+                   f"{sorted(VALID_WORKER_TRANSPORT)}")
     # Spec 2026-10-02-serena-the-cheap-path.md §6
     if os_cfg.default_py_nav_hook not in VALID_PY_NAV_HOOK:
         raise _err(f"os.defaults.py_nav_hook {os_cfg.default_py_nav_hook!r} not in "
@@ -2132,6 +2143,10 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         if cache_ttl not in VALID_WORKER_CACHE_TTL:
             raise _err(f"project {name}: worker.cache_ttl {cache_ttl!r} not in "
                        f"{sorted(VALID_WORKER_CACHE_TTL)}")
+        transport = w.get("transport", os_cfg.default_transport)
+        if transport not in VALID_WORKER_TRANSPORT:
+            raise _err(f"project {name}: worker.transport {transport!r} not in "
+                       f"{sorted(VALID_WORKER_TRANSPORT)}")
         # Spec 2026-10-02-serena-the-cheap-path.md §6
         py_nav_hook = w.get("py_nav_hook", os_cfg.default_py_nav_hook)
         if py_nav_hook not in VALID_PY_NAV_HOOK:
@@ -2148,7 +2163,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         max_conc = int(p.get("max_concurrent", os_cfg.default_max_concurrent))
         if max_conc < 1:
             raise _err(f"project {name}: max_concurrent must be >= 1")
-        require_crew = w.get("require_crew", True)
+        require_crew = w.get("require_crew", False)
         if not isinstance(require_crew, bool):
             raise _err(f"project {name}: worker.require_crew must be true or false, "
                        f"got {require_crew!r}")
@@ -2170,6 +2185,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
             bash_first=bash_first,
             tool_search=tool_search,
             cache_ttl=cache_ttl,
+            transport=transport,
             py_nav_hook=py_nav_hook,
             doc_nav_hook=doc_nav_hook,
             doc_read_limit_lines=doc_read_limit_lines,

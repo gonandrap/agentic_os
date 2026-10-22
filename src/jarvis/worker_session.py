@@ -38,6 +38,16 @@ def new_session_id() -> str:
     return str(uuid.uuid4())
 
 
+def transport_of(project: ProjectSpec, wo: dict[str, Any]) -> str:
+    """The transport this order's turns run on: the one its session was born on, else the catalog's"""
+    if wo.get("transport"):
+        return str(wo["transport"])
+    # A session that predates the column was born headless
+    if wo.get("session_id"):
+        return claude_cli.TRANSPORT_HEADLESS
+    return project.worker.transport
+
+
 def turns_dir(project: ProjectSpec, wo_id: str) -> Path:
     return project.path / ".jarvis" / "turns" / wo_id
 

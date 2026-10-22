@@ -404,9 +404,9 @@ def test_background_spawn_declares_background_transport(project, monkeypatch) ->
 
 
 def test_worker_settings_carry_the_require_crew_switch(project, jarvis_home) -> None:
-    """The off switch the default-true refusal is defended by"""
-    assert _worker_env(project)["JARVIS_REQUIRE_CREW"] == "1"
-    assert _worker_env(project, require_crew=False)["JARVIS_REQUIRE_CREW"] == "0"
+    """The switch the crew refusal reads; off by default since spec 2026-10-22"""
+    assert _worker_env(project)["JARVIS_REQUIRE_CREW"] == "0"
+    assert _worker_env(project, require_crew=True)["JARVIS_REQUIRE_CREW"] == "1"
 
 
 def test_worker_settings_carry_the_work_orders_kind(project, jarvis_home) -> None:
