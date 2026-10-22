@@ -309,11 +309,34 @@ def gate(c: Candidate, *, catalog: Catalog, store: ProjectStore | None = None,
         decision.stamp = {"origin_kind": c.origin_kind, "generation": generation,
                           "severity": severity, "mode": mode}
         key = dedupe_key(c)
-        duplicate = _duplicate_of(central, key)
-        if duplicate:
+        prior = _duplicate_of(central, key)
+        duplicate = int(prior["id"]) if prior else 0
+        if prior:
             # One defect worded by several seats, or re-raised in a later round
+            severer = severity_rank(severity) > severity_rank(str(prior["severity"]))
+            dispatched = bool(prior["wo_id"]) or bool(prior["applied"])
+            if severer and not dispatched:
+                # One decision per defect, re-decided at the max severity (Q2133)
+                reason = f"{reason}; escalated from `{prior['severity']}` (#{duplicate})"
+                decision.reason = reason
+                decision.decision_id = duplicate
+                central.update_steward_decision(duplicate, {
+                    "severity": severity, "claimed_severity": claimed, "outcome": outcome,
+                    "rule": rule, "reason": reason, "budget_usd": budget_usd,
+                    "applied": int(allowed and outcome == "dispatch")})
+                decision.stamp["decision_id"] = duplicate
+                log.info("steward[%s] escalated decision #%s to %s -> %s (%s)",
+                         mode, duplicate, severity, outcome, rule)
+                return decision
             outcome, rule = "drop", "duplicate"
             reason = f"the same defect as steward decision #{duplicate}"
+            if severer:
+                # The order fixing it is already running: no second order, but say it got worse
+                rule = "duplicate-of-dispatched"
+                reason = (f"steward decision #{duplicate} already dispatched this defect; "
+                          f"raised there from `{prior['severity']}` to `{severity}`")
+                central.update_steward_decision(duplicate, {"severity": severity})
+                _worsened(store, str(prior["wo_id"] or ""), severity, c, duplicate)
             decision.outcome, decision.rule, decision.reason = outcome, rule, reason
             decision.duplicate_of = duplicate
             if mode == "enforce":
@@ -357,12 +380,25 @@ def dedupe_key(c: Candidate) -> str:
     return f"{c.project}|{c.origin_kind}|{c.parent_wo_id}|{path}"
 
 
-def _duplicate_of(central: CentralStore, key: str) -> int:
-    """The decision in `key`'s bucket this candidate restates, or 0 (spec §3.2)"""
+def _duplicate_of(central: CentralStore, key: str) -> dict[str, Any] | None:
+    """The decision in `key`'s bucket this candidate restates, or None (spec §3.2)"""
     if not key:
-        return 0
+        return None
     rows = central.steward_dedupe_bucket(key)
-    return int(rows[0]["id"]) if rows else 0
+    return rows[0] if rows else None
+
+
+def _worsened(store: ProjectStore | None, wo_id: str, severity: str, c: Candidate,
+              decision_id: int) -> None:
+    """Tell the order already fixing this defect that a seat now rates it worse (Q2133)"""
+    if store is None or not wo_id:
+        return
+    try:
+        store.add_event(wo_id, "steward_severity_raised",
+                        {"severity": severity, "subject": c.subject[:200],
+                         "origin_kind": c.origin_kind, "decision_id": decision_id})
+    except Exception:  # noqa: BLE001 — the decision is recorded either way
+        log.exception("steward: could not record the raised severity on %s", wo_id)
 
 
 def _repeat_of(central: CentralStore, c: Candidate, outcome: str,

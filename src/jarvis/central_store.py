@@ -6,7 +6,7 @@ import json
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from . import db
 from .paths import central_db_path, ensure_home
@@ -705,10 +705,25 @@ class CentralStore:
                               limit: int = 1) -> list[dict[str, Any]]:
         """One dedupe bucket's own decisions, newest first: never a duplicate, never a drop"""
         rows = self.conn.execute(
-            "SELECT id FROM steward_decisions WHERE dedupe_key=? "
-            "AND duplicate_of=0 AND outcome<>'drop' ORDER BY id DESC LIMIT ?",
+            "SELECT id, severity, outcome, applied, wo_id FROM steward_decisions "
+            "WHERE dedupe_key=? AND duplicate_of=0 AND outcome<>'drop' "
+            "ORDER BY id DESC LIMIT ?",
             (dedupe_key, limit))
         return [dict(r) for r in rows.fetchall()]
+
+    #: What `update_steward_decision` may re-decide on a recorded row
+    STEWARD_REDECIDE = ("severity", "claimed_severity", "outcome", "rule", "reason",
+                        "applied", "budget_usd")
+
+    def update_steward_decision(self, decision_id: int,
+                                fields: Mapping[str, Any]) -> None:
+        """Re-decide a recorded decision in place: a severer wording of its defect (Q2133)"""
+        cols = [c for c in self.STEWARD_REDECIDE if c in fields]
+        if not cols:
+            return
+        self.conn.execute(
+            f"UPDATE steward_decisions SET {', '.join(f'{c}=?' for c in cols)} WHERE id=?",
+            (*(fields[c] for c in cols), decision_id))
 
     def link_steward_decision(self, decision_id: int, wo_id: str) -> None:
         """Name the order a decision led to, once the caller has created it"""
