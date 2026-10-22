@@ -365,6 +365,161 @@ def stop_session(bg_id: str) -> bool:
         return False
 
 
+# -- worker turns on a background session (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)
+
+#: `agents --json` `status` of a session with nothing left to do; anything else is `busy`
+BG_IDLE = "idle"
+
+#: How long `stop_bg` waits for the process to leave the roster before giving up
+BG_STOP_WAIT_SECONDS = 15.0
+
+#: How long `spawn_bg_turn` waits for a just-backgrounded session to be listed
+BG_LIST_WAIT_SECONDS = 15.0
+
+_BACKGROUNDED_RE = re.compile(r"backgrounded\s+·\s+([0-9a-f]{6,})")
+
+
+@dataclass(frozen=True)
+class BgEntry:
+    """One session of `claude agents --json --all`, with what liveness needs"""
+
+    id: str
+    session_id: str
+    #: None when the session has no process: stopped, crashed, or never started
+    pid: int | None
+    #: `busy` / `idle`, present only while there is a process
+    status: str
+    state: str
+    cwd: str = ""
+
+    @property
+    def alive(self) -> bool:
+        return self.pid is not None
+
+    @property
+    def idle(self) -> bool:
+        """Settled: no turn running and no background task of its own in flight (fact 10)"""
+        return self.alive and self.status == BG_IDLE
+
+
+def bg_roster(timeout: int = 60) -> dict[str, BgEntry]:
+    """Every background session, keyed by its full session id"""
+    out = _run(["agents", "--json", "--all"], timeout=timeout)
+    try:
+        data = json.loads(out or "[]")
+    except json.JSONDecodeError as e:
+        raise ClaudeCliError(f"unparseable `claude agents --json` output: {out[:200]}") from e
+    roster: dict[str, BgEntry] = {}
+    for item in data if isinstance(data, list) else []:
+        sid = str(item.get("sessionId") or "")
+        if not sid or item.get("kind", "background") != "background":
+            continue
+        pid = item.get("pid")
+        roster[sid] = BgEntry(id=str(item.get("id") or sid[:8]), session_id=sid,
+                              pid=int(pid) if isinstance(pid, int) else None,
+                              status=str(item.get("status") or ""),
+                              state=str(item.get("state") or ""),
+                              cwd=str(item.get("cwd") or ""))
+    return roster
+
+
+def _bg_prompt(prompt: str, promptfile: Path | None) -> str:
+    """The prompt as argv carries it: `--bg` reads no stdin, so an oversized one goes by file"""
+    if len(prompt.encode()) <= PROMPT_ARGV_LIMIT or promptfile is None:
+        return prompt
+    promptfile.parent.mkdir(parents=True, exist_ok=True)
+    promptfile.write_text(prompt, encoding="utf-8")
+    return (f"Your full instructions for this turn are in {promptfile} — read that "
+            f"whole file first and follow it exactly as if it were this message.")
+
+
+def _short_id(out: str) -> str:
+    m = _BACKGROUNDED_RE.search(out or "") or _JOB_ID_RE.search(out or "")
+    if not m:
+        raise ClaudeCliError(f"`claude --bg` reported no session id: {(out or '')[:300]}")
+    return m.group(1)
+
+
+def spawn_bg_turn(prompt: str, cwd: Path, name: str, worktree: str | None = None,
+                  promptfile: Path | None = None, **briefing: Any) -> BgEntry:
+    """Open a worker's background session with its first prompt; returns its roster entry"""
+    args = ["--bg", "-n", name]
+    if worktree:
+        args += ["--worktree", worktree]
+    # `max_budget_usd` is `--print`-only: `worker_session.poll` enforces the cap instead
+    briefing.pop("max_budget_usd", None)
+    args += _briefing_args(**briefing)
+    args += ["--", _bg_prompt(prompt, promptfile)]
+    short = _short_id(_run(args, cwd=cwd, timeout=120))
+    # `--bg` mints the id (fact 1); the roster is where the full one is read
+    deadline = time.monotonic() + BG_LIST_WAIT_SECONDS
+    while True:
+        for entry in bg_roster().values():
+            if entry.id == short:
+                return entry
+        if time.monotonic() >= deadline:
+            raise ClaudeCliError(f"background session {short} never appeared in "
+                                 f"`claude agents`")
+        time.sleep(0.25)
+
+
+def stop_bg(short: str, wait: float = BG_STOP_WAIT_SECONDS) -> bool:
+    """`claude stop`, then wait until the process is really gone (fact 8)"""
+    try:
+        _run(["stop", short], timeout=30)
+    except ClaudeCliError:
+        pass  # already stopped is as good; the roster below is the verdict
+    deadline = time.monotonic() + wait
+    while True:
+        entry = next((e for e in bg_roster().values() if e.id == short), None)
+        if entry is None or not entry.alive:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
+
+
+def resume_bg_turn(session_id: str, prompt: str, cwd: Path,
+                   promptfile: Path | None = None) -> BgEntry:
+    """Send the next prompt to a worker's own session: stopped first, resumed BARE (facts 5-8)"""
+    short = session_id[:8]
+    entry = bg_roster().get(session_id)
+    if entry is not None and entry.alive and not stop_bg(entry.id):
+        raise ClaudeCliError(f"background session {entry.id} would not stop; not "
+                             f"resuming it, which would fork a copy")
+    # NO flags: any flag, or a live original, starts a copy under a new id
+    out = _run(["--bg", "--resume", session_id, "--", _bg_prompt(prompt, promptfile)],
+               cwd=cwd, timeout=120)
+    got = _short_id(out)
+    if got != short:
+        # A copy is a second conversation: take it down and refuse rather than drift onto it
+        stop_session(got)
+        remove_bg(got)
+        raise ClaudeCliError(f"resuming {short} started a copy ({got}) instead: "
+                             f"{out.strip()[:300]}")
+    resumed = bg_roster().get(session_id)
+    return resumed or BgEntry(id=short, session_id=session_id, pid=None, status="",
+                              state="")
+
+
+def respawn_bg(short: str) -> bool:
+    """Restart a session's process under the same id, sending nothing (fact 11)"""
+    try:
+        _run(["respawn", short], timeout=60)
+        return True
+    except ClaudeCliError:
+        return False
+
+
+def remove_bg(short: str) -> bool:
+    """`claude rm`: the session, and its worktree when that is safe"""
+    try:
+        _run(["rm", short], timeout=60)
+        return True
+    except ClaudeCliError:
+        return False
+
+
 # -- worker turns (the transport every worker conversation runs on)
 
 
