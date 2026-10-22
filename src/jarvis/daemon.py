@@ -92,6 +92,8 @@ RECONCILE_TICK_KEY = "reconcile_tick"
 SECONDS_PER_HOUR = 3600    # a unit, not a setting
 #: Ask GitHub about parked pull requests every N ticks — ~2 minutes at the default 5s interval
 PR_POLL_EVERY_TICKS = 24
+#: One Morpheus pass every N ticks (~1 minute at the default 5s poll)
+MORPHEUS_EVERY_TICKS = 12
 
 #: Read the account's usage meter every N ticks — one minute at the default 5s interval (docs/superpowers/specs/2026-10-08-usage-meter-samples-and-outside-spend.md)
 USAGE_SAMPLE_EVERY_TICKS = 12
@@ -593,6 +595,9 @@ class Daemon:
         # Dashboard digests run on their OWN thread, not Neo's
         self.digest_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="digest")
         self.digesting = False
+        # Morpheus gets its OWN thread: its scripts and its session turns block for up to minutes
+        self.morpheus_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="morpheus")
+        self.morpheus_busy = False
         # The supervisor gets its OWN thread, and NOT Neo's
         self.supervisor_pool = ThreadPoolExecutor(max_workers=1,
                                                   thread_name_prefix="supervisor")
@@ -798,6 +803,7 @@ class Daemon:
         finally:
             self.neo_pool.shutdown(wait=False)
             self.digest_pool.shutdown(wait=False)
+            self.morpheus_pool.shutdown(wait=False)
             self._remove_pidfile()
             log.info("jarvisd stopped")
 
@@ -947,6 +953,8 @@ class Daemon:
         self.neo_tick()
         # After the drain is kicked, never before: a question digested this tick is one whose answer has...
         self.digest_tick()
+        # Off its own pool, on its own cadence: production validation (docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md)
+        self.morpheus_tick()
         # After the project loop, so an alarm `check_burning_turns` raised on this tick is judged on this...
         self.supervisor_tick()
         # AFTER the supervisor's kick, never before: both run off their own pools
@@ -2783,6 +2791,50 @@ class Daemon:
 
     # -- 5
 
+    def morpheus_tick(self) -> None:
+        """Kick one Morpheus pass when none is running"""
+        if (not self.catalog.os.morpheus.enabled or self.morpheus_busy
+                or self.tick_count % MORPHEUS_EVERY_TICKS != 1):
+            return
+        self.morpheus_busy = True
+        future = self.morpheus_pool.submit(self._morpheus_pass)
+        future.add_done_callback(lambda f: setattr(self, "morpheus_busy", False))
+
+    def _morpheus_pass(self) -> None:
+        """Queue the running release, run due scripts, act on verdicts, then wake the session"""
+        from . import fleet, morpheus
+        from .paths import production_code_dir
+
+        central = CentralStore()  # thread-local
+        try:
+            cfg = self.catalog.os.morpheus
+            prod = production_code_dir()
+            os_name = self._os_project()
+            os_path = next((p.path for p in self.catalog.projects if p.name == os_name), None)
+            # Scripts judge PRODUCTION, so they run from its checkout when there is one
+            cwd = prod if prod.is_dir() else (os_path or Path.cwd())
+            if (prod / ".git").exists():
+                try:
+                    morpheus.ensure_release_queued(central, cfg, prod)
+                except Exception:  # noqa: BLE001 — the rest of the pass still runs
+                    log.exception("morpheus: could not queue the running release")
+            moved = morpheus.sweep(central, cfg, cwd)
+            if any(moved.values()):
+                log.info("morpheus sweep: %s", {k: v for k, v in moved.items() if v})
+            for item in morpheus.owed_actions(central):
+                try:
+                    log.info("morpheus %s (PR #%s) %s -> %s", item["id"], item["pr_number"],
+                             item["state"], morpheus.act(central, self.catalog, item))
+                except Exception:  # noqa: BLE001 — one item must not starve the others
+                    log.exception("morpheus: action for %s failed", item["id"])
+            if os_path is not None:
+                morpheus.wake(central, self.catalog, os_path,
+                              paused=fleet.load_pause(central) is not None)
+        except Exception:  # noqa: BLE001 — the loop must survive anything
+            log.exception("morpheus pass failed")
+        finally:
+            central.close()
+
     def neo_tick(self) -> None:
         """Kick a queue drain when questions are waiting and none is running"""
         if not self.catalog.os.neo.enabled or self.neo_draining:
@@ -2927,6 +2979,12 @@ class Daemon:
                 if q.get("kind") == "triage":
                     # FIRST, and it returns: this is the one kind with no work order behind it, so every branch below (#240)
                     self._deliver_triage_verdict(central, q, verdict)
+                    return
+                if q.get("kind") == "validation":
+                    # Triage's twin: Morpheus asked, and no work order stands behind it
+                    from . import morpheus
+                    morpheus.record_neo_verdict(
+                        central, q, verdict, notify.neo_question_url(self.catalog, q["id"]))
                     return
                 if q.get("kind") == "approval":
                     self._deliver_gate_verdict(central, pstore, q, verdict)

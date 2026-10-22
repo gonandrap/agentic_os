@@ -1232,6 +1232,36 @@ def run_headless(prompt: str, system_prompt: str | None = None,
                                keep_default_context=keep_default_context).text
 
 
+def run_session_turn(prompt: str, session_id: str, *, resume: bool, cwd: Path,
+                     model: str | None = None, append_system_prompt: str | None = None,
+                     permission_mode: str | None = None,
+                     timeout: int = 900) -> HeadlessResult:
+    """One waited-for turn of a LONG-LIVED OS session (Morpheus): `--session-id` first, `--resume` after"""
+    args = turn_args(prompt, session_id, resume, model=model,
+                     permission_mode=permission_mode,
+                     append_system_prompt=append_system_prompt)
+    started = time.monotonic()
+    out = _run(args, cwd=cwd, timeout=timeout)
+    latency_ms = int((time.monotonic() - started) * 1000)
+    try:
+        data: Any = json.loads(out)
+    except json.JSONDecodeError:
+        data = None
+    if not isinstance(data, dict):
+        return HeadlessResult(text=out, model=model or "", prompt_chars=len(prompt),
+                              latency_ms=latency_ms, session_id=session_id)
+    served = list(data.get("modelUsage") or {})
+    usage = derive_turn_usage(data)
+    if usage is not None:
+        usage["prompt_chars"] = len(prompt)
+        usage["latency_ms"] = latency_ms
+    return HeadlessResult(
+        text=str(data.get("result") or ""), usage=usage,
+        session_id=str(data.get("session_id") or session_id),
+        model=(served[0] if len(served) == 1 else "") or model or "",
+        prompt_chars=len(prompt), latency_ms=latency_ms)
+
+
 def unpack_headless(value: HeadlessResult | str) -> tuple[str, dict[str, Any] | None]:
     """(text, usage) from whichever of the two a transport seam returned"""
     if isinstance(value, HeadlessResult):

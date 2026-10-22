@@ -115,6 +115,22 @@ layout — 13 of them passed on the page that wrapped every table row onto three
 `scripts/screenshot_config_console.py` is the shape to copy; playwright and chromium are
 already installed. Write `None — no rendered surface changed.` when none applies.
 
+**How to validate in production** — required wherever the repository's template carries
+this heading (Jarvis OS's does; the bundled copy beside this skill does not). After a
+release ships, Morpheus watches every PR in it in production until this section says the
+change works. Then it marks the PR validated, or files an investigation or asks Neo when
+the change fails or its deadline passes. Give one of the following, most useful first:
+
+* A ```bash block. Morpheus runs it from the production checkout on a schedule and spends
+  no tokens. **Read-only**, under a minute. **Exit 0** = production shows it working,
+  **exit 1** = production shows it broken, anything else (use **75**) = not exercised
+  yet. Example: `jarvis status --json | jq -e '.morpheus' >/dev/null || exit 75`.
+* Prose hints: what production activity proves it. Morpheus turns them into a script,
+  which costs tokens, so prefer the script when you can write one.
+* `None — <reason>` when production has nothing to show (docs, tests, comments only).
+
+The hook and CI both deny a body without the section or with only the template comment.
+
 ## 3. Link every image by raw URL at the commit SHA
 
 `gh` cannot upload an image, so the PNGs are committed (`docs/screenshots/`) and linked.

@@ -8100,6 +8100,15 @@ def neo_answer_escalated(question_id: int, answer: str) -> dict[str, Any]:
             raise OpsError(f"neo question {question_id} is a bug-priority "
                            f"re-assessment, and no work order is waiting on it — "
                            f"{_triage_promote_hint(q)}")
+        # Nor a Morpheus one: the PR is decided on its item, not by messaging anyone
+        if q.get("kind") == "validation":
+            from . import morpheus
+
+            item = morpheus.item_of_question(q) or "<mv-id>"
+            raise OpsError(f"neo question {question_id} is about a shipped PR's production "
+                           f"validation, and no work order is waiting on it — decide it "
+                           f"on the item: jarvis morpheus waive {item} --reason \"...\" "
+                           f"or jarvis morpheus requeue {item}")
         neo.record_answer(question_id, answer, answered_by="user")
         neo.review(question_id, approved=True)  # user-authored ⇒ nothing to review
     finally:
@@ -12678,3 +12687,150 @@ def scheduled_actor(store: ProjectStore, wo: dict[str, Any],
                          why=p.why(store, wo, now=now) if callable(p.why) else p.why,
                          predicate=p.predicate)
     return None
+
+
+# -- morpheus: production validation of shipped PRs (docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md)
+
+def _morpheus_catalog() -> Catalog:
+    """The registered catalog, or the defaults when none is (a fresh home still has a queue)"""
+    from .catalog import OsConfig
+
+    try:
+        return load_catalog(_catalog_file())
+    except (OpsError, CatalogError):
+        return Catalog(os=OsConfig(), projects=[])
+
+
+def _morpheus_repo(repo: str | None) -> Path:
+    """Where the release's git history lives: given, else production's checkout, else here"""
+    from .paths import production_code_dir
+
+    if repo:
+        return Path(repo).expanduser().resolve()
+    prod = production_code_dir()
+    return prod if (prod / ".git").exists() else Path.cwd()
+
+
+def morpheus_report() -> dict[str, Any]:
+    from . import morpheus
+
+    central = CentralStore()
+    try:
+        return morpheus.report(central, _morpheus_catalog())
+    finally:
+        central.close()
+
+
+def morpheus_item(item_id: str) -> dict[str, Any]:
+    central = CentralStore()
+    try:
+        item = central.morpheus_item(item_id)
+    finally:
+        central.close()
+    if not item:
+        raise OpsError(f"no morpheus item {item_id!r} — `jarvis morpheus status` lists them")
+    return item
+
+
+def morpheus_enqueue_release(tag: str, from_ref: str | None = None,
+                             to_ref: str | None = None,
+                             repo: str | None = None) -> dict[str, Any]:
+    import subprocess
+
+    from . import morpheus
+
+    central = CentralStore()
+    try:
+        return morpheus.enqueue_release(central, _morpheus_catalog().os.morpheus,
+                                        _morpheus_repo(repo), tag, from_ref=from_ref,
+                                        to_ref=to_ref)
+    except subprocess.CalledProcessError as e:
+        raise OpsError(f"git could not read the release range: "
+                       f"{(e.stderr or '').strip()[:300]}") from e
+    finally:
+        central.close()
+
+
+def morpheus_add(pr: str, repo: str | None = None, release: str = "") -> dict[str, Any]:
+    """Queue one PR by number or URL, outside any release"""
+    from . import morpheus
+
+    m = re.search(r"(?:github\.com/([^/]+/[^/]+)/pull/)?#?(\d+)\s*$", pr.strip())
+    if not m:
+        raise OpsError(f"{pr!r} is not a PR number or URL")
+    slug = m.group(1) or morpheus.repo_slug(_morpheus_repo(repo))
+    if not slug:
+        raise OpsError("cannot tell which repository — pass the PR's full URL")
+    try:
+        body = morpheus.fetch_pr(slug, int(m.group(2)), _morpheus_repo(repo))
+    except Exception as e:  # noqa: BLE001
+        raise OpsError(str(e)) from e
+    central = CentralStore()
+    try:
+        item = morpheus.enqueue(central, _morpheus_catalog().os.morpheus, body,
+                                repo=slug, release_tag=release)
+    finally:
+        central.close()
+    if item is None:
+        raise OpsError(f"PR #{body.number} is already queued — `jarvis morpheus status`")
+    return item
+
+
+def morpheus_set_script(item_id: str, script: str, source: str = "agent") -> dict[str, Any]:
+    from . import morpheus
+
+    central = CentralStore()
+    try:
+        return morpheus.set_script(central, item_id, script, source)
+    except (KeyError, ValueError) as e:
+        raise OpsError(str(e).strip("'\"")) from e
+    finally:
+        central.close()
+
+
+def morpheus_check(item_id: str) -> dict[str, Any]:
+    """Run an item's script now, the way the daemon would"""
+    from . import morpheus
+    from .paths import production_code_dir
+
+    item = morpheus_item(item_id)
+    if not item["script"]:
+        raise OpsError(f"{item_id} has no script yet — "
+                       f"`jarvis morpheus script {item_id} --file <path>`")
+    prod = production_code_dir()
+    cwd = prod if prod.is_dir() else Path.cwd()
+    central = CentralStore()
+    try:
+        cfg = _morpheus_catalog().os.morpheus
+        if item["state"] in morpheus.OPEN_STATES:
+            morpheus.check(central, cfg, item, cwd)
+            return central.morpheus_item(item_id) or {}
+        # A settled item is only probed: its state is the record and stays put
+        result = morpheus.run_script(item["script"], cwd, cfg.script_timeout_seconds)
+        return {**item, "probe_exit": result.exit, "probe_output": result.output}
+    finally:
+        central.close()
+
+
+def morpheus_waive(item_id: str, reason: str) -> dict[str, Any]:
+    from . import morpheus
+
+    central = CentralStore()
+    try:
+        return morpheus.waive(central, item_id, reason)
+    except (KeyError, ValueError) as e:
+        raise OpsError(str(e).strip("'\"")) from e
+    finally:
+        central.close()
+
+
+def morpheus_requeue(item_id: str) -> dict[str, Any]:
+    from . import morpheus
+
+    central = CentralStore()
+    try:
+        return morpheus.requeue(central, _morpheus_catalog().os.morpheus, item_id)
+    except KeyError as e:
+        raise OpsError(str(e).strip("'\"")) from e
+    finally:
+        central.close()

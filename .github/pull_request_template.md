@@ -48,6 +48,17 @@
 | Eval | | |
 | A/B | | |
 
+## How to validate in production
+
+<!-- REQUIRED — Morpheus watches every shipped PR in production until this says it works.
+     Give ONE of:
+       * a ```bash block: a READ-ONLY script run on a schedule from the production
+         checkout. Exit 0 = validated, 1 = broken, anything else (75) = not exercised yet.
+       * prose hints: what production activity proves it works. Morpheus turns them into
+         a script (that costs tokens; a script you write here does not).
+       * `None — <reason>` when production has nothing to show (docs, tests, comments).
+     Checked by CI and by the `gh pr create` hook. -->
+
 ## Screenshots
 
 <!-- One image per thing the change claims to do, for any PR that touches a rendered

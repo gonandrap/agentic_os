@@ -1,0 +1,20 @@
+name: pr-body
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+# A workflow of its own so that editing the PR body re-runs only this check, never the suite.
+# Make it blocking by adding the `validation-section` context to the "protect-main" ruleset.
+jobs:
+  validation-section:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: The PR says how to validate it in production
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: python scripts/check_pr_validation.py

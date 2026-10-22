@@ -17,6 +17,16 @@ SKILL_TEMPLATE = SKILL / "pull_request_template.md"
 WO = {"JARVIS_WO_ID": "wo-1234abcd"}
 
 
+def _without_validation(text: str) -> str:
+    """The repo template minus the one section only Jarvis OS asks for (Morpheus)"""
+    from jarvis import morpheus
+
+    head = f"## {morpheus.SECTION}\n"
+    start = text.index(head)
+    end = text.index("\n## ", start + len(head)) + 1
+    return text[:start] + text[end:]
+
+
 def _body(**sections: str) -> str:
     """A body with every required section, overriding the ones named"""
     filled = {
@@ -47,14 +57,21 @@ def _decide(command: str, cwd: str = "", env: dict[str, str] | None = None):
 
 
 def test_both_templates_are_byte_identical():
-    """The skill ships the template to projects that have none of their own"""
-    assert SKILL_TEMPLATE.read_bytes() == REPO_TEMPLATE.read_bytes()
+    """The skill ships the template to projects that have none of their own; this repo adds ONE section"""
+    assert SKILL_TEMPLATE.read_text() == _without_validation(REPO_TEMPLATE.read_text())
 
 
 def test_the_template_carries_exactly_the_sections_the_hook_requires():
-    headings = [ln[3:].strip() for ln in REPO_TEMPLATE.read_text().splitlines()
+    from jarvis import morpheus
+
+    def headings(path: Path) -> list[str]:
+        return [ln[3:].strip() for ln in path.read_text().splitlines()
                 if ln.startswith("## ")]
-    assert headings == list(hooks.PR_BODY_SECTIONS)
+
+    assert headings(SKILL_TEMPLATE) == list(hooks.PR_BODY_SECTIONS)
+    assert sorted(headings(REPO_TEMPLATE)) == sorted([*hooks.PR_BODY_SECTIONS,
+                                                      morpheus.SECTION])
+    assert hooks.validation_required(REPO) is True
 
 
 def test_the_skill_names_the_hook_and_the_bare_ref_rule():
@@ -78,7 +95,7 @@ def test_the_skill_and_its_template_reach_a_worker(tmp_path):
 
     assert (root / "SKILL.md").exists()
     assert (root / "pull_request_template.md").read_bytes() \
-        == REPO_TEMPLATE.read_bytes()
+        == SKILL_TEMPLATE.read_bytes()
 
 
 def test_the_worker_brief_stops_the_reading_that_produced_pr_143():
