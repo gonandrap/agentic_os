@@ -6699,12 +6699,13 @@ def steward_queue_report(limit: int = 200) -> dict[str, Any]:
         rows = central.steward_queue_rows(limit)
     finally:
         central.close()
+    items = [{k: r[k] for k in ("id", "ts", "project", "origin_kind", "severity",
+                                "subject", "rule", "reason", "wo_id",
+                                "queue_state", "queue_note", "queue_ts")} for r in rows]
     return {"counts": {s: counts.get(s, 0) for s in ("waiting", "reoffered", "expired")},
             "line": steward.queue_line(counts),
-            "items": [{k: r[k] for k in ("id", "ts", "project", "origin_kind", "severity",
-                                         "subject", "rule", "reason", "wo_id",
-                                         "queue_state", "queue_note", "queue_ts")}
-                      for r in rows]}
+            "waiting": [i for i in items if i["queue_state"] == "waiting"],
+            "settled": [i for i in items if i["queue_state"] != "waiting"]}
 
 
 def steward_dispatchers() -> dict[str, Any]:

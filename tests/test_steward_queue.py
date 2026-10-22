@@ -241,12 +241,15 @@ def test_the_steward_page_shows_counts_then_each_queued_decision(enforcing, stor
     steward.settle_unrecoverable(central)
     html = TestClient(create_app()).get("/steward").text
     assert "1 waiting" in html and "1 expired" in html and "0 re-offered" in html
-    body = html.split('id="steward-queue"', 1)[1]
-    assert body.index(f"#{row['id']}") < body.index(f"#{old}")
-    assert "Find what moves the prompt prefix between calls." in body
-    assert "a finding from before 0.12.15" in body
-    assert steward.UNRECOVERABLE_NOTE in body
-    assert 'href="/steward"' in html
+    waiting, settled = html.split('id="steward-waiting"', 1)[1].split(
+        'id="steward-settled"', 1)
+    assert f"#{row['id']}" in waiting and f"#{old}" not in waiting
+    assert "Find what moves the prompt prefix between calls." in waiting
+    assert "a finding from before 0.12.15" in settled
+    assert steward.UNRECOVERABLE_NOTE in settled
+    # #1185's console: the sidebar link, a `g w` jump, and sections that reflow at width
+    assert 'href="/steward"' in html and "w: '/steward'" in html
+    assert 'class="flow"' in html
 
 
 def test_the_steward_page_renders_with_nothing_queued(jarvis_home, catalog_file):
