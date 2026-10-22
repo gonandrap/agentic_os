@@ -1492,13 +1492,13 @@ class Daemon:
 
     def check_ui_health(self, now: float | None = None) -> str:
         """Is the dashboard still serving, and restart it if it is not (docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md)"""
-        from . import release, systemd_units, uilog
+        from . import db, release, systemd_units, uilog
         from .notify import ui_base_url
 
         cfg = self.catalog.os.ui_health
         if not cfg.enabled:
             return "off"
-        now = time.time() if now is None else now
+        now = db.now() if now is None else now
         try:
             body = fetch_healthz(f"{ui_base_url(self.catalog)}/healthz",
                                  cfg.healthz_timeout_seconds)

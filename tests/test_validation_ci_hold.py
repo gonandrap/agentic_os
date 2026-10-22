@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import json
-import time
 
+from jarvis import db
 from jarvis import evidence as evidence_mod
 from jarvis.daemon import CI_HOLD_DEADLINE_SECONDS
 from jarvis.project_store import (VALIDATION_CI_CAUSE, VALIDATION_HELD_CAUSE,
@@ -76,7 +76,7 @@ def test_the_round_is_held_while_ci_is_still_running_and_no_seat_is_reached(
         assert "unit (3.11)" in rounds[0]["reason"]
         held = validation_hold_until(
             store.events_of_kind(wo["id"], "validation_failed"), 1)
-        assert held > time.time(), "nothing would stop the next tick re-asking at once"
+        assert held > db.now(), "nothing would stop the next tick re-asking at once"
     finally:
         store.close()
 
@@ -152,7 +152,7 @@ def test_a_lapsed_ci_hold_is_judged_and_its_held_seconds_still_discounted(
     store = ProjectStore(fleet.project)
     try:
         assert store.get_work_order(wo["id"])["status"] == "validating"
-        now = time.time()
+        now = db.now()
         # Twenty minutes in `validating`
         at = park_order(store, wo["id"], "validating", hours=20 / 60.0)
         for row in store.events_of_kind(wo["id"], "validation_failed"):

@@ -1191,7 +1191,8 @@ def retry(wo_id: str, message: str | None = None, project_name: str | None = Non
             "note": retry_queued_notice(sent["msg_id"]), "assumptions": len(pending)}
 
 
-def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
+def waiting_on(store: ProjectStore, wo: dict[str, Any], *,
+               now: float | None = None) -> dict[str, Any]:
     """What this work order is actually waiting for, and whether a nudge could help"""
     from . import worker_session
     from .invariants import awaiting_neo, neo_question_blocker
@@ -1243,7 +1244,7 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
         # ...unless the delivery this promises has stopped happening
         from .invariants import stuck_message
 
-        found = stuck_message(store, wo)
+        found = stuck_message(store, wo, now=now)
         if found is not None:
             msg, why = found
             return {"what": "message_stuck", "stalled": False,
@@ -1711,9 +1712,9 @@ def state_durations(store: ProjectStore, *, wo_id: str = "", fo_id: str = "",
     """How long this order has been in its status, and how long it spent in each before"""
     if bool(wo_id) == bool(fo_id):
         raise OpsError("state_durations takes exactly one of wo_id= or fo_id=")
-    from . import holds as holds_mod
+    from . import db, holds as holds_mod
 
-    now = time.time() if now is None else now
+    now = db.now() if now is None else now
     kind = "wo" if wo_id else "fo"
     order_id = wo_id or fo_id
     # THE READER SUBTRACTS, not its five callers: an optional `spans=` would reproduce issue 887 for...
@@ -1943,7 +1944,7 @@ def diagnose(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
     try:
         # One read for one row, the way `os_status` takes one for a whole listing: the account's state can... (#714)
         held_by_fleet = fleet_if_held([wo])
-        blocker = waiting_on(store, wo)
+        blocker = waiting_on(store, wo, now=now)
         needs_you = invariants.true_blockers(store, wo, now)
         # §8 of docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md
         actor = (scheduled_actor(store, wo, now)
@@ -6883,9 +6884,9 @@ def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
 def stuck_report(project_name: str | None = None,
                  now: float | None = None) -> list[dict[str, Any]]:
     """Every open order and how the sweep judges it. §7: ONE reader, two renderers"""
-    from . import stuck
+    from . import db, stuck
 
-    now = time.time() if now is None else now
+    now = db.now() if now is None else now
     catalog = resolve_catalog()
     paths = registered_project_paths()
     rows: list[dict[str, Any]] = []
@@ -8853,7 +8854,7 @@ def rule_facts(store: ProjectStore, wo: dict[str, Any], *, now: float,
             put("automerge_code", str((state or {}).get("code") or ""))
 
     if need("waiting_on"):
-        put("waiting_on", str(waiting_on(store, wo).get("what") or ""))
+        put("waiting_on", str(waiting_on(store, wo, now=now).get("what") or ""))
 
     if need("validation_round"):
         latest = store.latest_validation_round(wo_id=wo_id)
@@ -11117,7 +11118,7 @@ def inspect_report(target: str, project: str | None = None, *,
 def live_report(target: str, project: str | None = None, *,
                 reader: Any = None, now: float | None = None) -> dict[str, Any]:
     """What this work order's turn is doing RIGHT NOW — `jarvis watch`'s one entry point"""
-    from . import holds, live
+    from . import db, holds, live
     from . import worker_session as ws
 
     name, path, wo = find_work_order(target, project)
@@ -11130,7 +11131,7 @@ def live_report(target: str, project: str | None = None, *,
             wo_id=wo["id"], project=name,
             turn_in_flight=ws.busy(store, wo["id"]) is not None,
             settled=wo["status"] not in OPEN_STATUSES,
-            now=time.time() if now is None else now,
+            now=db.now() if now is None else now,
             holds=holds.held(store, wo["id"]),
             write_floor=inspect_config(name).report_write_floor,
         ).as_dict()

@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import json
-import time
 from dataclasses import replace
 
 import pytest
 
-from jarvis import evidence, ops, release
+from jarvis import db, evidence, ops, release
 from jarvis.evidence import EvidencePacket
 from jarvis.invariants import VALIDATION_STUCK_BLOCKER, true_blockers
 from tests.test_release_staging import FakeRunner
@@ -335,7 +334,7 @@ def test_production_on_a_DIFFERENT_version_is_not_attested(fleet, deploy):
 
 def test_REPLAYING_the_release_that_is_already_live_is_not_attested(fleet, deploy):
     """ROUND 2's HOLE, and it cost an attacker nothing: production stays on the last release until the..."""
-    deploy("0.10.5", when=time.time() - 7 * 86400)  # a real release, by somebody else
+    deploy("0.10.5", when=db.now() - 7 * 86400)  # a real release, by somebody else
     wo = fleet.dispatch("delivered nothing, claims the live version")
     stage_release(wo["id"], version="0.10.5")  # no authorise(): none was ever granted
 
@@ -350,7 +349,7 @@ def test_REPLAYING_the_release_that_is_already_live_is_not_attested(fleet, deplo
 
 def test_replaying_it_ON_THE_TIMELINE_is_not_attested_either(fleet, deploy):
     """The same replay through the other source"""
-    deploy("0.10.5", when=time.time() - 7 * 86400)
+    deploy("0.10.5", when=db.now() - 7 * 86400)
     wo = fleet.dispatch("delivered nothing")
     store = fleet.store()
     try:
@@ -366,7 +365,7 @@ def test_replaying_it_ON_THE_TIMELINE_is_not_attested_either(fleet, deploy):
 def test_a_TAG_THAT_PREDATES_THE_AUTHORISATION_is_not_this_orders_release(fleet, deploy):
     """The case an approved gate alone would still let through: an order genuinely authorised to ship"""
     # The tag was cut BEFORE anyone authorised this order
-    deploy("0.10.5", when=time.time() - 3600)
+    deploy("0.10.5", when=db.now() - 3600)
     wo = fleet.dispatch("authorised, but shipped nothing")
     authorise(fleet, wo["id"])
     stage_release(wo["id"], version="0.10.5")

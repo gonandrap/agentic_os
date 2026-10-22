@@ -30,18 +30,13 @@ ALLOWED: dict[str, str] = {
     "tests/test_budget.py": _SPIN,
     "tests/test_feature_validation.py": _BOTH,
     "tests/test_nav_volume.py": _BACKDATED,
-    "tests/test_precheck_before_the_panel.py": _BACKDATED,
     "tests/test_release_red_defer.py": _BACKDATED,
     "tests/test_release_staging.py": _BACKDATED,
     "tests/test_ui_observability.py": _BOTH,
     "tests/test_ui_wiring.py": _BACKDATED,
     "tests/test_uilog.py": _BACKDATED,
     "tests/test_usage_window_is_account_wide.py": _SPIN,
-    "tests/test_validation_auth_hold.py": _BACKDATED,
-    "tests/test_validation_ci_hold.py": _BACKDATED,
-    "tests/test_validation_release_skip.py": _BACKDATED,
     "tests/test_validation_usage_limit.py": _SPIN,
-    "tests/test_validation_void.py": _BACKDATED,
 }
 
 # The calls that read the real clock, as dotted names after import resolution
