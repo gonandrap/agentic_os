@@ -2,11 +2,10 @@
 
 import json
 import os
-import time
 
 import pytest
 
-from jarvis import nav_volume, usage
+from jarvis import db, nav_volume, usage
 from jarvis.catalog import NavigationConfig
 
 CFG = NavigationConfig()
@@ -194,7 +193,7 @@ def test_days_excludes_a_file_by_mtime_before_opening_it(tree):
                            tool_result_row("t1", "x" * 10)])
     stale = tree("stale", [tool_use_row("t2", "Bash", command="cat src/b.py"),
                            tool_result_row("t2", "x" * 9999)])
-    old = time.time() - 30 * 86400
+    old = db.now() - 30 * 86400
     os.utime(stale, (old, old))
 
     windowed = nav_volume.read_tree(cfg=CFG, days=7)
@@ -373,7 +372,8 @@ def test_nav_volume_imports_usage_catalog_and_the_leaf_and_nothing_else_of_jarvi
             local.update(a.name.split(".")[0] for a in node.names
                          if a.name.startswith("jarvis"))
 
-    assert local == {"catalog", "usage", "navigation"}
+    # `db` is the clock seam and opens no database: stdlib-only helpers (spec §7)
+    assert local == {"catalog", "db", "usage", "navigation"}
 
 
 # -- ops and the CLI

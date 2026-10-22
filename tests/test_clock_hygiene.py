@@ -27,15 +27,8 @@ _KERNEL = (
 
 ALLOWED: dict[str, str] = {
     "tests/test_bg_transport.py": _SPIN,
-    "tests/test_base_red.py": _BACKDATED,
     "tests/test_budget.py": _SPIN,
     "tests/test_feature_validation.py": _BOTH,
-    "tests/test_nav_volume.py": _BACKDATED,
-    "tests/test_release_red_defer.py": _BACKDATED,
-    "tests/test_release_staging.py": _BACKDATED,
-    "tests/test_ui_observability.py": _BOTH,
-    "tests/test_ui_wiring.py": _BACKDATED,
-    "tests/test_uilog.py": _BACKDATED,
     "tests/test_usage_window_is_account_wide.py": _SPIN,
     "tests/test_validation_usage_limit.py": _SPIN,
 }

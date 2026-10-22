@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import time
 
 import pytest
 
@@ -58,7 +57,7 @@ def base_health(*, red: bool = True, checked_at: float | None = -1.0,
     fact = {"red": red, "base": "main", "workflow": "ci", "run_id": 36273250195,
             "run_url": RUN_URL, "head_sha": head_sha if red else "", "wo_id": ""}
     if checked_at is not None:
-        fact["checked_at"] = time.time() if checked_at == -1.0 else checked_at
+        fact["checked_at"] = db.now() if checked_at == -1.0 else checked_at
     central = CentralStore()
     try:
         central.set_base_health("proj_a", fact)
@@ -133,7 +132,7 @@ def test_unusable_reading_reparks_like_red(started, store, reading):
         base_health(red=False, checked_at=None)
     elif reading == "stale":
         base_health(red=False,
-                    checked_at=time.time() - BASE_HEALTH_FRESH_SECONDS - 1)
+                    checked_at=db.now() - BASE_HEALTH_FRESH_SECONDS - 1)
 
     out = ops.finish(rel, "Release BLOCKED on a red main")
 
