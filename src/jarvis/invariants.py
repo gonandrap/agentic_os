@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
 
-from . import budget, db, worker_session
+from . import budget, claude_cli, db, worker_session
 # A leaf module (logging, subprocess, dataclasses): the import cannot cycle back here
 from .automerge import HELD_NOT_PASSED, HELD_SHA_MOVED, HELD_SHA_UNRECORDED
 # Same leaf argument: `autoreview` imports only `navigation`
@@ -240,6 +240,21 @@ TURN_DIED_AFTER_DELIVERY_BLOCKER = (
 
 #: `kind` of the event the settler writes on that path, so the record never reads as a clean delivery
 TURN_DIED_AFTER_DELIVERY_EVENT = "turn_died_after_delivery"
+
+
+def model_rejected_blocker(wo_id: str, model: str) -> str:
+    """What a `failed` work order says when claude refused its model id"""
+    return (f"worker failed — model '{model}' rejected by claude; "
+            f"`jarvis wo retry {wo_id} --model <valid>`")
+
+
+def failed_blocker(store: ProjectStore, wo: Mapping[str, Any]) -> str:
+    """The ONE reason a `failed` order carries, shared by the settler and `true_blockers`"""
+    if store.events_of_kind(wo["id"], TURN_DIED_AFTER_DELIVERY_EVENT):
+        return TURN_DIED_AFTER_DELIVERY_BLOCKER
+    turn = store.latest_turn(wo["id"]) or {}
+    model = claude_cli.model_rejected(turn.get("error"))
+    return model_rejected_blocker(wo["id"], model) if model else WORKER_FAILED_BLOCKER
 
 SECONDS_PER_MINUTE = 60  # a unit, not a setting
 SECONDS_PER_HOUR = 3600  # ditto
@@ -616,9 +631,7 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         blockers.append(budget_blocker(store, wo))
     if governed and wo["status"] == "failed":
         # TWO SENTENCES, and the second is the one the generic line got wrong: a session that died AFTER the...
-        died = store.events_of_kind(wo["id"], TURN_DIED_AFTER_DELIVERY_EVENT)
-        blockers.append(TURN_DIED_AFTER_DELIVERY_BLOCKER if died
-                        else WORKER_FAILED_BLOCKER)
+        blockers.append(failed_blocker(store, wo))
     # AN INVARIANT THE OS CANNOT REPAIR, WHICH OWES THE USER A DECISION (docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md §3)
     for report in store.owed_violations(wo["id"]):
         blockers.append(report["owed"])
