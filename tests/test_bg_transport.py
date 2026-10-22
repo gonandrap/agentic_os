@@ -167,6 +167,7 @@ def test_a_background_order_learns_its_session_and_settles_from_the_transcript(
     assert done["state"] == "done"
     assert done["result"] == "final: go"
     assert done["cost_usd"] and done["cost_usd"] > 0
+    assert done["cost_source"] == "transcript"
     envelope = json.loads(done["usage_json"])
     assert envelope["api_calls"] == 1 and envelope["context_peak"] == 3003
     # Settled and idle: the process is let go, the conversation kept

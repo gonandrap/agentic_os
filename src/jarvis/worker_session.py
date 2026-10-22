@@ -675,6 +675,10 @@ def _settle_result(store: ProjectStore, turn: dict[str, Any],
     wo_id = turn["wo_id"]
     # Recorded on BOTH outcomes: a failed turn's tokens were spent just the same
     usage_json = json.dumps(result.usage) if result.usage else None
+    # A background turn has no envelope: its dollars were read off the transcript
+    source = (COST_FROM_TRANSCRIPT
+              if ((result.usage or {}).get("reported") or {}).get("source") == "transcript"
+              else None)
     if not result.ok:
         # A turn lost to the usage window or to a broken API is not a failure of the work
         overspent = claude_cli.stopped_for_budget(result)
@@ -692,6 +696,7 @@ def _settle_result(store: ProjectStore, turn: dict[str, Any],
                                      cost_usd=result.cost_usd,
                                      num_turns=result.num_turns,
                                      usage_json=usage_json,
+            cost_source=source,
                                      terminal_reason=result.terminal_reason,
                                      api_error_status=result.api_error_status)
         payload = {"seq": turn["seq"], "error": result.error[:500]}
@@ -711,6 +716,7 @@ def _settle_result(store: ProjectStore, turn: dict[str, Any],
                                  result=result.result or None,
                                  cost_usd=result.cost_usd, num_turns=result.num_turns,
                                  usage_json=usage_json,
+            cost_source=source,
                                  terminal_reason=result.terminal_reason,
                                  api_error_status=result.api_error_status)
 
@@ -722,7 +728,8 @@ def _settle_result(store: ProjectStore, turn: dict[str, Any],
         return store.finish_turn(turn["id"], "failed" if failed else "done", result="",
                                  error=NOTHING_COMPACTED if failed else None,
                                  cost_usd=result.cost_usd,
-                                 num_turns=result.num_turns, usage_json=usage_json)
+                                 num_turns=result.num_turns, usage_json=usage_json,
+            cost_source=source)
 
     reply = result.result or _last_assistant_message(store, wo_id, turn)
     msg_id = store.record_agent_reply(wo_id, reply) if reply else None
@@ -736,7 +743,8 @@ def _settle_result(store: ProjectStore, turn: dict[str, Any],
     })
     return store.finish_turn(turn["id"], "done", result=reply or "",
                              cost_usd=result.cost_usd, num_turns=result.num_turns,
-                             usage_json=usage_json)
+                             usage_json=usage_json,
+            cost_source=source)
 
 
 # -- a turn in a background session (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)
