@@ -181,6 +181,13 @@ read). Only `track_injected_sessions` + `check_invariants` stay on the
 `RECONCILE_EVERY_TICKS` cadence, and only the first needs `claude agents --json` — which
 it skips entirely on ticks where no project has a live `injected` row.
 
+**Mid-turn delivery** (docs/superpowers/specs/2026-10-22-messages-delivered-mid-turn.md): while
+a turn runs, the worker's own `PostToolUse` hook (`hooks.deliver_mid_turn`) claims queued
+messages and returns them as `additionalContext` at the lead's next tool call. It is gated
+by `.jarvis/inbox/<wo>.pending` (touched by `queue_message`), which costs one `stat` per
+tool call. Subagent calls, compaction turns, and `relaunch`/`background-orphan` rows are
+skipped. `deliver_messages` handles whatever is still queued when the turn ends.
+
 ## Self-healing when the transport fails (usage limit: wo-996c7344, PR 89;
 ## API errors: wo-50958234)
 
