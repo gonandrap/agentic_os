@@ -722,6 +722,19 @@ def test_a_dirty_os_managed_path_still_does_not_block_a_pinned_release(tmp_path)
     assert "ASSUMPTIONS.md" in r.stdout
 
 
+def test_the_staged_marker_goes_to_the_production_state_home(tmp_path, monkeypatch):
+    """#1206: the PRODUCTION daemon reads it, so an ambient JARVIS_HOME must not place it"""
+    repo = _make_repo(tmp_path)
+    prod = _deployed(tmp_path)
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "elsewhere"))
+    r = _dry_run(repo, prod, "--stage", "--wo", "wo-1234abcd",
+                 "--base", _sha(repo, "HEAD"), "0.2.0")
+
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert f"marker {prod}/state/run/pending_release.json" in r.stdout
+    assert "elsewhere" not in r.stdout
+
+
 def test_the_staged_marker_records_the_base(tmp_path):
     """§6: an extra key in pending_release.json, as audit record"""
     repo = _make_repo(tmp_path)

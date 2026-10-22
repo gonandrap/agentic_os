@@ -4057,6 +4057,18 @@ def first_red_hold(store: ProjectStore, wo_id: str) -> float | None:
     return min(stamps) if stamps else None
 
 
+def park_unshipped_release(store: ProjectStore, wo: dict[str, Any]) -> str | None:
+    """A release order that cut NO release asks the user instead of completing (issue #1206)"""
+    wo_id = str(wo["id"])
+    if not release.is_release_order(wo) or _release_effects(store, wo_id):
+        return None
+    store.add_event(wo_id, release.NOTHING_SHIPPED_EVENT, {"was": wo["status"]})
+    store.set_status(wo_id, "needs_review", trigger="release_shipped_nothing")
+    store.flag_attention(
+        wo_id, invariants.RELEASE_NOTHING_SHIPPED_BLOCKER.format(wo_id=wo_id))
+    return "needs_review"
+
+
 def park_red_release(store: ProjectStore, wo_id: str, fact: dict[str, Any]) -> str:
     """Past the threshold the release stops waiting and asks the user (§3)"""
     if store.release_red_park_open(wo_id):
@@ -5021,6 +5033,11 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
         deferred = defer_red_release(store, name, fresh)
         if deferred is not None:
             return {"project": name, "wo_id": wo_id, "status": deferred,
+                    **({"pr_url": pr_url} if pr_url else {})}
+        # The red base is one reason a release cuts nothing; `completed` is wrong for every other
+        unshipped = park_unshipped_release(store, fresh)
+        if unshipped is not None:
+            return {"project": name, "wo_id": wo_id, "status": unshipped,
                     **({"pr_url": pr_url} if pr_url else {})}
         opened = bounced = None
         # The overlay: `pr_url` is not written until `land_when_cleared` below (2026-10-01 spec §2

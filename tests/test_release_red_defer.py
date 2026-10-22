@@ -277,6 +277,59 @@ def test_an_ordinary_work_order_is_untouched(started, store):
     assert events(store, wo["id"], ops.RED_DEFER_EVENT) == []
 
 
+# -- a green base, and STILL no release: issue #1206
+
+
+def test_a_release_that_cut_nothing_on_a_green_base_never_completes(started, store):
+    """#1206: the red base is one reason a release cuts nothing; `completed` is wrong for all of them"""
+    rel = release_order(store)
+    base_health(red=False)
+
+    out = ops.finish(rel, "the shipit call was denied — nothing tagged, nothing deployed")
+
+    assert out["status"] == "needs_review"
+    wo = store.get_work_order(rel)
+    assert wo["status"] == "needs_review"
+    assert wo["needs_attention"]
+    assert "without cutting a release" in wo["attention_reason"]
+    assert rel in wo["attention_reason"]
+    assert len(events(store, rel, release.NOTHING_SHIPPED_EVENT)) == 1
+
+
+def test_an_abandoned_release_is_parked_too(started, store):
+    """Saying why it was not shipped does not ship it"""
+    rel = release_order(store)
+    base_health(red=False)
+
+    out = ops.finish(rel, "not shipping", abandon="the base moved under the approval")
+
+    assert out["status"] == "needs_review"
+    assert len(events(store, rel, release.NOTHING_SHIPPED_EVENT)) == 1
+
+
+def test_a_staged_release_still_settles_normally(started, store):
+    """The guard reads the same release effects `defer_red_release` does"""
+    rel = release_order(store)
+    base_health(red=False)
+    release.write_marker({"wo_id": rel, "project": "proj_a", "version": "0.10.26",
+                          "tag": "jarvis-0.10.26", "staged_at": 1_758_000_000,
+                          "state": "staged"})
+
+    out = ops.finish(rel, "shipped jarvis-0.10.26")
+
+    assert out["status"] != "needs_review"
+    assert events(store, rel, release.NOTHING_SHIPPED_EVENT) == []
+
+
+def test_an_ordinary_work_order_cuts_no_release_and_completes(started, store):
+    """Only a release order owes a release"""
+    wo = ops.create_work_order("proj_a", "fix the bug")
+    base_health(red=False)
+
+    assert ops.finish(wo["id"], "done")["status"] == "completed"
+    assert events(store, wo["id"], release.NOTHING_SHIPPED_EVENT) == []
+
+
 # -- 6: the tick that is the only step touching a held release
 
 

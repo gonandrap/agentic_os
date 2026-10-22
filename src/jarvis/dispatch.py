@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from . import claude_cli
+from . import claude_cli, release
 from .catalog import OsConfig, ProjectSpec
 from .central_store import CentralStore, KnowledgeBrief
 from .project_store import MAX_DISPATCH_ATTEMPTS, WORKER_CHILDREN, ProjectStore
@@ -33,6 +33,11 @@ SERENA_READ_TOOLS = (
 
 # A plugin install produces the long prefix, `claude mcp add serena` the short one
 SERENA_TOOL_PREFIXES = ("mcp__serena__", "mcp__plugin_serena_serena__")
+
+
+#: The ONE command a release order may run that `auto` mode would otherwise veto — the
+#: release script by its exact path, as the `shipit` skill invokes it, and nothing wider
+RELEASE_ALLOW_RULES = ("Bash(scripts/shipit.sh:*)",)
 
 
 # The two undocumented keys in the 2.1.284 binary that decide `auto` mode's bash-first steer:... (docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md)
@@ -103,6 +108,11 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         f"Read(//{proj_abs}/**)",
         # Read-only code navigation
         *(serena_allow_rules() if serena else ()),
+        # Release orders only: `auto` mode's classifier denies this one as a "Production
+        # Deploy", a second permission layer that duplicates the OS's own release gate and
+        # that no gate request reaches, so a gate-approved release could never run (#1206).
+        # The PreToolUse gate still mediates it: an approved release gate stays mandatory.
+        *(RELEASE_ALLOW_RULES if release.is_release_order(wo) else ()),
     ):
         if rule not in allow:
             allow.append(rule)

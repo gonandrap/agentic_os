@@ -425,6 +425,14 @@ RELEASE_BASE_RED_BLOCKER = ("`{base}` has been red for {hours}h — `{workflow}`
                             "not on anything about the release.")
 
 
+#: What a release order says when it finished having cut NO release (issue #1206)
+RELEASE_NOTHING_SHIPPED_BLOCKER = (
+    "this release order finished without cutting a release — nothing was tagged and "
+    "production was not deployed, so every fix it was filed to ship is still only on "
+    "main. Read its summary for what stopped it, clear that, then `jarvis wo retry "
+    "{wo_id}`; `jarvis wo done {wo_id}` if the release is no longer wanted.")
+
+
 #: What a work order says when an OS-built prompt for it was past the ceiling (docs/superpowers/specs/2026-09-26-bounded-model-inputs.md)
 OS_PROMPT_REFUSED_BLOCKER = (
     "the OS built a {call} prompt of {total} chars for this work order ({prompt} + "
