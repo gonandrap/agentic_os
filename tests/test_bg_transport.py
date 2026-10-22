@@ -121,7 +121,230 @@ def test_the_fake_writes_a_transcript_jarvis_can_price(fake_claude, tmp_path):
 
     first = claude_cli.spawn_bg_turn("one", tmp_path, "n")
     _wait_idle(first.session_id)
-    assert usage.cost_between(first.session_id, 0, time.time() + 60) > 0
+    assert usage.cost_between(first.session_id, 0, float("inf")) > 0
     said = usage.said_in_session(first.session_id)
     assert said and said[-1][1] == "final: one"
     json.dumps(said)
+
+
+# -- a work order's conversation, end to end on the background transport
+
+from jarvis import ops, worker_session  # noqa: E402
+from jarvis.catalog import load_catalog  # noqa: E402
+from jarvis.project_store import ProjectStore  # noqa: E402
+
+
+@pytest.fixture()
+def bg_fleet(jarvis_home, fake_claude, catalog_file, project, monkeypatch):
+    data = json.loads(catalog_file.read_text())
+    data["os"]["defaults"]["transport"] = "background"
+    catalog_file.write_text(json.dumps(data))
+    # A process the fake kills is gone at once; nothing to wait out
+    monkeypatch.setattr(worker_session, "BG_DEAD_GRACE", 0.0)
+    ops.start_os(str(catalog_file), foreground=True)
+    catalog = load_catalog(catalog_file)
+    return {"project": catalog.projects[0], "store": ProjectStore(project)}
+
+
+def _bg_wo(bg_fleet, title="task"):
+    wo = ops.create_work_order("proj_a", title)
+    return bg_fleet["store"].get_work_order(wo["id"])
+
+
+def test_a_background_order_learns_its_session_and_settles_from_the_transcript(
+        bg_fleet, fake_claude, settle_turns):
+    store, project = bg_fleet["store"], bg_fleet["project"]
+    wo = _bg_wo(bg_fleet)
+
+    turn, _ = worker_session.start(store, project, wo, "go")
+
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["transport"] == "background"
+    assert fresh["session_id"] and fresh["bg_id"] == fresh["session_id"][:8]
+    assert turn["pid"] is None
+    assert settle_turns(store)
+    done = store.get_turn(turn["id"])
+    assert done["state"] == "done"
+    assert done["result"] == "final: go"
+    assert done["cost_usd"] and done["cost_usd"] > 0
+    envelope = json.loads(done["usage_json"])
+    assert envelope["api_calls"] == 1 and envelope["context_peak"] == 3003
+    # Settled and idle: the process is let go, the conversation kept
+    entry = claude_cli.bg_roster()[fresh["session_id"]]
+    assert not entry.alive
+
+
+def test_every_later_turn_resumes_the_same_session(bg_fleet, fake_claude, settle_turns):
+    store, project = bg_fleet["store"], bg_fleet["project"]
+    wo = _bg_wo(bg_fleet)
+    worker_session.start(store, project, wo, "go")
+    assert settle_turns(store)
+    sid = store.get_work_order(wo["id"])["session_id"]
+
+    for text in ("second", "third"):
+        worker_session.send(store, project, store.get_work_order(wo["id"]), text)
+        assert settle_turns(store)
+
+    assert store.get_work_order(wo["id"])["session_id"] == sid
+    assert fake_claude.turns[sid] == ["go", "second", "third"]
+    assert [s["sessionId"] for s in fake_claude.sessions if s.get("worker")] == [sid]
+    assert [t["result"] for t in store.list_turns(wo["id"])] == [
+        "final: go", "final: second", "final: third"]
+
+
+def test_a_busy_session_holds_the_turn_open(bg_fleet, fake_claude, settle_turns):
+    """`busy` covers the worker's own background tasks: the OS never reads it as over (fact 10)"""
+    store, project = bg_fleet["store"], bg_fleet["project"]
+    gate = fake_claude.hold_turns()
+    wo = _bg_wo(bg_fleet)
+    worker_session.start(store, project, wo, "go")
+
+    worker_session.poll(store)
+    assert worker_session.busy(store, wo["id"])["seq"] == 1
+    gate.unlink()
+    assert settle_turns(store)
+    assert worker_session.busy(store, wo["id"]) is None
+
+
+def test_a_session_that_dies_mid_turn_is_a_transport_pause(bg_fleet, fake_claude,
+                                                           settle_turns):
+    store, project = bg_fleet["store"], bg_fleet["project"]
+    fake_claude.turns_fail("silent")
+    wo = _bg_wo(bg_fleet)
+    worker_session.start(store, project, wo, "go")
+    assert settle_turns(store)
+
+    pause = worker_session.turn_pause(store, wo["id"])
+    assert pause is not None and pause.reason == worker_session.PAUSE_TRANSIENT
+    assert worker_session.SESSION_LOST_ERROR in pause.message
+
+    # …and the retry wakes the SAME session; it died before any API call, so the prompt goes again
+    fake_claude.turns_recover()
+    worker_session.retry(store, project, store.get_work_order(wo["id"]), pause)
+    assert settle_turns(store)
+    sid = store.get_work_order(wo["id"])["session_id"]
+    assert fake_claude.turns[sid] == ["go", "go"]
+    assert store.latest_turn(wo["id"])["state"] == "done"
+
+
+def test_the_usage_limit_is_read_off_the_transcript(bg_fleet, fake_claude, settle_turns):
+    store, project = bg_fleet["store"], bg_fleet["project"]
+    fake_claude.turns_rate_limited()
+    wo = _bg_wo(bg_fleet)
+    worker_session.start(store, project, wo, "go")
+    assert settle_turns(store)
+
+    pause = worker_session.turn_pause(store, wo["id"])
+    assert pause is not None and pause.reason == worker_session.PAUSE_USAGE_LIMIT
+
+
+def test_an_api_error_is_a_transient_pause_that_nudges(bg_fleet, fake_claude,
+                                                       settle_turns):
+    store, project = bg_fleet["store"], bg_fleet["project"]
+    fake_claude.turns_api_error(529)
+    wo = _bg_wo(bg_fleet)
+    worker_session.start(store, project, wo, "go")
+    assert settle_turns(store)
+
+    pause = worker_session.turn_pause(store, wo["id"])
+    assert pause is not None and pause.reason == worker_session.PAUSE_TRANSIENT
+    assert pause.status == 529
+    assert worker_session._reached_model(pause.turn)
+
+
+def test_cancel_stops_the_session_and_keeps_the_conversation(bg_fleet, fake_claude):
+    store, project = bg_fleet["store"], bg_fleet["project"]
+    gate = fake_claude.hold_turns()
+    wo = _bg_wo(bg_fleet)
+    worker_session.start(store, project, wo, "go")
+
+    out = worker_session.cancel(store, wo["id"])
+
+    gate.unlink()
+    assert out["stopped"] is True
+    assert store.latest_turn(wo["id"])["state"] == "failed"
+    sid = store.get_work_order(wo["id"])["session_id"]
+    assert not claude_cli.bg_roster()[sid].alive
+
+
+def test_the_daemon_drives_a_background_order_end_to_end(bg_fleet, fake_claude,
+                                                         settle_turns, catalog_file):
+    """Dispatch, settle, a user message, settle — one session the whole way"""
+    from jarvis.daemon import Daemon
+
+    store = bg_fleet["store"]
+    daemon = Daemon(load_catalog(catalog_file))
+    wo = ops.create_work_order("proj_a", "summarise the repo")
+    daemon.tick()
+    assert settle_turns(store)
+    daemon.tick()
+    sid = store.get_work_order(wo["id"])["session_id"]
+    assert sid and store.get_work_order(wo["id"])["transport"] == "background"
+
+    ops.send_message(wo["id"], "and the tests too", source="ui")
+    daemon.tick()
+    assert settle_turns(store)
+    daemon.tick()
+
+    assert store.get_work_order(wo["id"])["session_id"] == sid
+    assert len(fake_claude.turns[sid]) == 2
+    assert fake_claude.turns[sid][1].endswith("and the tests too")
+    assert [s["sessionId"] for s in fake_claude.sessions if s.get("worker")] == [sid]
+    settings = json.loads(next(
+        (bg_fleet["project"].path / ".jarvis" / "worker-settings").glob("*.json")
+    ).read_text())
+    # The hooks key their one-shot rules on this: they must fall silent here
+    assert settings["env"]["JARVIS_TURN_TRANSPORT"] == "background"
+
+
+def test_wo_respawn_restarts_the_same_session(bg_fleet, fake_claude, settle_turns):
+    store, project = bg_fleet["store"], bg_fleet["project"]
+    wo = _bg_wo(bg_fleet)
+    worker_session.start(store, project, wo, "go")
+    assert settle_turns(store)
+    sid = store.get_work_order(wo["id"])["session_id"]
+
+    out = ops.respawn_worker(wo["id"])
+
+    assert out["respawned"] and out["session_id"] == sid
+    assert claude_cli.bg_roster()[sid].idle
+    assert fake_claude.turns[sid] == ["go"]  # nothing sent
+
+
+def test_wo_respawn_refuses_a_headless_order(jarvis_home, fake_claude, catalog_file):
+    ops.start_os(str(catalog_file), foreground=True)
+    wo = ops.create_work_order("proj_a", "t")
+    with pytest.raises(ops.OpsError, match="background session"):
+        ops.respawn_worker(wo["id"])
+
+
+def test_deleting_the_order_removes_its_session(bg_fleet, fake_claude, settle_turns):
+    store, project = bg_fleet["store"], bg_fleet["project"]
+    wo = _bg_wo(bg_fleet)
+    worker_session.start(store, project, wo, "go")
+    assert settle_turns(store)
+    sid = store.get_work_order(wo["id"])["session_id"]
+
+    out = ops.delete_work_order(wo["id"])
+
+    assert out["deleted"]["background_session"] == 1
+    assert sid not in claude_cli.bg_roster()
+
+
+def test_a_running_turn_past_its_budget_is_stopped(bg_fleet, fake_claude, monkeypatch):
+    """`--max-budget-usd` is print-only (fact 13): the poll enforces the cap"""
+    from jarvis import budget
+
+    store, project = bg_fleet["store"], bg_fleet["project"]
+    gate = fake_claude.hold_turns()
+    wo = _bg_wo(bg_fleet)
+    store.update_work_order(wo["id"], budget_usd=1.0)
+    worker_session.start(store, project, store.get_work_order(wo["id"]), "go")
+    monkeypatch.setattr(budget, "in_flight", lambda store, wo_id: 5.0)
+
+    settled = worker_session.poll(store)
+
+    gate.unlink()
+    assert [t["state"] for t in settled] == ["failed"]
+    assert any(e["kind"] == "turn_budget_exhausted"
+               for e in store.list_events(wo["id"], limit=50))

@@ -74,7 +74,7 @@ VALID_WORKER_CACHE_TTL = ("5m", "1h", "cli")
 DEFAULT_WORKER_CACHE_TTL = "5m"
 #: What a worker turn runs on: one `claude --bg` session for the conversation, or a `claude -p` per turn (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)
 VALID_WORKER_TRANSPORT = ("background", "headless")
-DEFAULT_WORKER_TRANSPORT = "headless"
+DEFAULT_WORKER_TRANSPORT = "background"
 
 # Whether `hooks.py_nav_decision` refuses a worker's source-navigating Bash call at a `.py` path. §6... (docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md)
 VALID_PY_NAV_HOOK = ("off", "on")

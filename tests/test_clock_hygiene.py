@@ -19,6 +19,7 @@ _BOTH = (
 
 ALLOWED: dict[str, str] = {
     "tests/test_alarm_escalation.py": _SPIN,
+    "tests/test_bg_transport.py": _SPIN,
     "tests/test_auth_resume.py": _BACKDATED,
     "tests/test_base_red.py": _BACKDATED,
     "tests/test_budget.py": _SPIN,

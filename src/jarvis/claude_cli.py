@@ -463,8 +463,19 @@ def spawn_bg_turn(prompt: str, cwd: Path, name: str, worktree: str | None = None
         time.sleep(0.25)
 
 
+def _pid_running(pid: int | None) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
 def stop_bg(short: str, wait: float = BG_STOP_WAIT_SECONDS) -> bool:
-    """`claude stop`, then wait until the process is really gone (fact 8)"""
+    """`claude stop`, then wait until the PROCESS is gone — the roster drops its pid ~0.6s earlier (fact 8)"""
+    before = next((e for e in bg_roster().values() if e.id == short), None)
     try:
         _run(["stop", short], timeout=30)
     except ClaudeCliError:
@@ -472,7 +483,8 @@ def stop_bg(short: str, wait: float = BG_STOP_WAIT_SECONDS) -> bool:
     deadline = time.monotonic() + wait
     while True:
         entry = next((e for e in bg_roster().values() if e.id == short), None)
-        if entry is None or not entry.alive:
+        if ((entry is None or not entry.alive)
+                and not _pid_running(before.pid if before else None)):
             return True
         if time.monotonic() >= deadline:
             return False
@@ -1045,6 +1057,9 @@ _TRANSIENT_TEXT_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+#: `terminal_reason` of a background turn whose session process died before it settled (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)
+SESSION_LOST = "session_lost"
+
 #: The status the CLI names in the message body when the envelope's own field is missing
 _TRANSIENT_STATUS_RE = re.compile(r"API Error:\s*(5\d\d)\b", re.IGNORECASE)
 
@@ -1064,6 +1079,9 @@ def transient_failure(text: str | None, *, terminal_reason: str | None = None,
         return None
     if usage_limit(text) is not None:
         return None  # the window, not the transport — the branch above owns it
+    if terminal_reason == SESSION_LOST:
+        # The process died under the turn: the transport, whatever the work had reached
+        return TransientFailure(message=_summarise(text), status=None)
     if api_error_status is not None:
         # The CLI said what happened
         if api_error_status < 500:

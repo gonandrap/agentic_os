@@ -603,12 +603,12 @@ def test_worker_require_crew_defaults_false():
 
 def test_worker_transport_defaults_and_validates():
     cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
-    assert cat.projects[0].worker.transport == "headless"
-    cat = parse_catalog({"os": {"defaults": {"transport": "background"}},
+    assert cat.projects[0].worker.transport == "background"
+    cat = parse_catalog({"os": {"defaults": {"transport": "headless"}},
                          "projects": [{"name": "a", "path": "/tmp/a"},
                                       {"name": "b", "path": "/tmp/b",
-                                       "worker": {"transport": "headless"}}]})
-    assert [p.worker.transport for p in cat.projects] == ["background", "headless"]
+                                       "worker": {"transport": "background"}}]})
+    assert [p.worker.transport for p in cat.projects] == ["headless", "background"]
     with pytest.raises(CatalogError, match="worker.transport"):
         parse_catalog({"projects": [{"name": "a", "path": "/tmp/a",
                                      "worker": {"transport": "bg"}}]})

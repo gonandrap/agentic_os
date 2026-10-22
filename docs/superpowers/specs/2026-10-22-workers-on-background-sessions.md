@@ -45,7 +45,7 @@ session. On Claude Code 2.1.308 it no longer has to. Measured live (haiku spike,
 | 5 | `--bg --resume <sid>` on a session that is STILL ALIVE (even idle) starts a copy under a new id |
 | 6 | `--bg --resume <sid> <any flag>` on a stopped session also starts a copy ("keeps its own saved options") |
 | 7 | **`--bg --resume <sid> -- "<msg>"` with NO flags on a stopped session wakes THE SAME session** with its saved options, conversation intact, `SessionStart source=resume` |
-| 8 | `claude stop` returns before the process is gone: resuming at once forks, and the copy runs in the CALLER's cwd. Wait until `agents` shows no `pid` |
+| 8 | `claude stop` returns before the process is gone: resuming at once forks, and the copy runs in the CALLER's cwd. The roster drops the `pid` ~0.6s BEFORE the process exits, so wait for the PROCESS (the pid read before stopping) to die, not for the roster |
 | 9 | **a background task outlives the turn and wakes the session itself**: `Stop` fires with the interim reply, then again with the final one; no poll, no hook |
 | 10 | while that task is in flight `agents` reports `status: busy, state: working` even though `Stop` fired; it flips to `idle/done` only when the session has settled |
 | 11 | `claude respawn <id>` restarts the process under the SAME id (crashed or live), sends no prompt |
@@ -85,15 +85,22 @@ the OS sent, until the worker settles". Only two seams change:
   is unchanged; mid-turn, `poll` compares `budget.in_flight` against the remaining cap and
   stops the session, settling the turn as `turn_budget_exhausted` exactly as the CLI's own
   refusal did.
-* **A dead session** (roster lists it with no pid while its turn runs): reaped from the
-  transcript. If the transcript ends on the worker's reply the turn is `done`; otherwise
-  it is lost to the transport — `PAUSE_TRANSIENT` with "the worker's session process
-  died", retried on the transient backoff with the existing nudge. Waking it is the same
-  bare resume (fact 7); `claude respawn` (fact 11) is used where the OS must bring a
-  session back with NOTHING to say — `jarvis wo respawn <id>` and the doctor repair for an
-  idle-dead session that still has background tasks recorded.
-* **Close-out** — `claude stop` when the order leaves the active statuses; `claude rm`
-  only on `jarvis wo delete` (it removes the worktree, and refuses on unpushed work).
+* **A dead session** (roster lists it with no pid while its turn runs): if a `Stop` hook
+  fired since the prompt went in, the turn is `done` on that reply; otherwise it is lost to
+  the transport — `terminal_reason = claude_cli.SESSION_LOST`, a `PAUSE_TRANSIENT`
+  retried on the transient backoff (the nudge if any API call was made, the prompt again
+  if none). Waking it is the same bare resume (fact 7).
+* **Respawn** (fact 11) restarts the process and sends nothing, so it is not a delivery
+  path: the bare resume already continues the same session WITH the message. It is
+  exposed as `jarvis wo respawn <id>` for the case it is for — bringing an order's own
+  session back on the current binary (a Claude Code upgrade, a hung process) without
+  sending it anything. Refused while a turn is in flight.
+* **Settled means stopped** — once a turn settles, the idle session is `claude stop`ped:
+  its process holds nothing, the conversation is kept, and the next prompt would stop it
+  anyway. One stopped `[WO …]` entry per order stays in `claude agents`;
+  `ops.orphaned_worker_sessions` (doctor) now reports only `[WO …]` sessions that still
+  hold a process. `jarvis wo delete` runs `claude rm` (which keeps a worktree holding
+  unpushed work).
 
 ### What goes
 
@@ -121,6 +128,10 @@ fallback.
 * Load every deferred tool you will need in ONE `ToolSearch` (`select:a,b,c`).
 
 ## Not done, and why
+
+* **Changing compaction** — measured with `scripts/compaction_payoff.py` on production
+  since 2026-10-01: 150 compactions, $151 spent, ~$489 saved, net +$338, 90.5% of the
+  closed ones paid off (median break-even: the first turn after). It stays as it is.
 
 * **Batching assumptions into one Neo question** — reverses the 2026-10-21 ruling that a
   question to Neo is atomic. Left alone.

@@ -546,6 +546,59 @@ def cost_between(session_id: str, since: float, until: float,
     )
 
 
+def window_envelope(session_id: str, since: float, until: float, *, schema: int,
+                    root: Path | None = None,
+                    index: dict[str, list[Path]] | None = None) -> dict[str, Any] | None:
+    """A turn's usage envelope rebuilt from the transcript, subagents included, when no result JSON reported it (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)"""
+    if index is None:
+        index = index_sessions(root)
+    lead: list[Call] = []
+    subs: list[Call] = []
+    for path in sorted(index.get(session_id) or []):
+        lead += [c for c in calls_of(path) if since <= c.ts <= until]
+        subagent_dir = path.with_suffix("") / "subagents"
+        if subagent_dir.is_dir():
+            for sub in sorted(subagent_dir.glob("*.jsonl")):
+                subs += [c for c in calls_of(sub) if since <= c.ts <= until]
+    calls = lead + subs
+    if not calls:
+        return None
+    by_model: dict[str, dict[str, Any]] = {}
+    for call in calls:
+        row = by_model.setdefault(call.model, {"model": call.model, "cost_usd": 0.0,
+                                               "context_window": None,
+                                               **{c: 0 for c in TOKEN_CLASSES}})
+        for cls in TOKEN_CLASSES:
+            row[cls] += getattr(call, cls)
+        row["cost_usd"] += priced(call.model, input=call.input,
+                                  cache_write=call.cache_write,
+                                  cache_read=call.cache_read, output=call.output,
+                                  cache_1h=call.cache_1h,
+                                  cache_5m=call.cache_5m).list_cost_usd
+    models = list(by_model.values())
+    for row in models:
+        row["cost_usd"] = round(row["cost_usd"], 6)
+    return {
+        "usage_v": schema,
+        "total_cost_usd": round(sum(m["cost_usd"] for m in models), 6),
+        **{cls: sum(m[cls] for m in models) for cls in TOKEN_CLASSES},
+        # No envelope was written: what it would have said is these calls
+        "reported": {"session_id": session_id, "source": "transcript"},
+        "continues": False,
+        "cache_1h": sum(c.cache_1h for c in calls),
+        "cache_5m": sum(c.cache_5m for c in calls),
+        # Counted here, unlike the envelope's: one per API call in the window
+        "api_calls": len(calls),
+        "iterations_sampled": len(lead),
+        "num_turns": None,
+        "context_peak": max((c.context for c in lead), default=0),
+        "context_window": None,
+        "duration_api_ms": None,
+        "cost_by_model": {m["model"]: m["cost_usd"] for m in models},
+        "by_model": models,
+    }
+
+
 def compactions_in(path: Path | str) -> list[dict[str, Any]]:
     """Every compaction in one transcript, oldest first, with what it did"""
     found = []

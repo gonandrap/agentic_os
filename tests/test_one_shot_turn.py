@@ -29,7 +29,8 @@ def _worker_prompt(path) -> str:
         wo = store.create_work_order("ship the thing")
     finally:
         store.close()
-    return build_worker_prompt(wo, spec(path))
+    # The one-shot rule is the HEADLESS transport's; background orders get tests/test_bg_transport.py
+    return build_worker_prompt({**wo, "transport": "headless"}, spec(path))
 
 
 # -- 1. the contract

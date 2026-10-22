@@ -190,9 +190,13 @@ def start(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
           prompt: str) -> tuple[dict[str, Any], dict[str, Any]]:
     """Open the conversation: turn 1, in a fresh worktree, under a minted session id (docs/superpowers/specs/2026-09-24-order-observability.md §5)"""
     wo_id = wo["id"]
-    session_id = wo.get("session_id") or new_session_id()
-    store.update_work_order(wo_id, session_id=session_id, worktree=wo_id)
-    row = {**wo, "session_id": session_id, "worktree": wo_id}
+    transport = transport_of(project, wo)
+    # A background session's id is minted by the CLI and learned at launch (fact 1)
+    session_id = wo.get("session_id") or (
+        None if transport == claude_cli.TRANSPORT_BACKGROUND else new_session_id())
+    store.update_work_order(wo_id, session_id=session_id, worktree=wo_id,
+                            transport=transport)
+    row = {**wo, "session_id": session_id, "worktree": wo_id, "transport": transport}
     # RE-DECIDED FROM THE FILESYSTEM
     started = _conversation_started(project, row)
     tree = worktree_path(project, row)
@@ -487,20 +491,25 @@ def _launch(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any], promp
     store.conn.execute("UPDATE wo_turns SET outfile=?, errfile=? WHERE id=?",
                        (str(outfile), str(errfile), turn["id"]))
     try:
-        spawned = claude_cli.spawn_turn(
-            prompt=prompt,
-            cwd=cwd,
-            session_id=wo["session_id"],
-            outfile=outfile,
-            errfile=errfile,
-            resume=resume,
-            # Named from the row that already exists
-            unit=systemd_units.unit_name(wo_id, turn["seq"]),
-            cache=cache_ttl_env(arm),
-            name=worker_name(wo),
-            worktree=worktree,
-            **briefing,
-        )
+        if is_background(wo):
+            wo = _launch_bg(store, wo, prompt, cwd, resume, worktree,
+                            outfile.with_suffix(".prompt"), briefing)
+            spawned = claude_cli.SpawnedTurn(pid=None)
+        else:
+            spawned = claude_cli.spawn_turn(
+                prompt=prompt,
+                cwd=cwd,
+                session_id=wo["session_id"],
+                outfile=outfile,
+                errfile=errfile,
+                resume=resume,
+                # Named from the row that already exists
+                unit=systemd_units.unit_name(wo_id, turn["seq"]),
+                cache=cache_ttl_env(arm),
+                name=worker_name(wo),
+                worktree=worktree,
+                **briefing,
+            )
     except claude_cli.ClaudeCliError as e:
         store.finish_turn(turn["id"], "failed", error=str(e))
         store.add_event(wo_id, "turn_failed", {"seq": turn["seq"], "error": str(e)})
@@ -524,6 +533,33 @@ def _launch(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any], promp
     if kind != "dispatch" or turn["seq"] > 1:
         context.record(store, project, wo, fresh, briefing)
     return fresh  # type: ignore[return-value]
+
+
+def is_background(wo: dict[str, Any]) -> bool:
+    """Does this order's conversation live in a background session? (recorded at its first launch)"""
+    return wo.get("transport") == claude_cli.TRANSPORT_BACKGROUND
+
+
+def _launch_bg(store: ProjectStore, wo: dict[str, Any], prompt: str, cwd: Path,
+               resume: bool, worktree: str | None, promptfile: Path,
+               briefing: dict[str, Any]) -> dict[str, Any]:
+    """One prompt into the order's background session — the first opens it (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)"""
+    if resume:
+        # The briefing rides on the session's saved options and the settings file `briefing_for` rewrote
+        claude_cli.resume_bg_turn(wo["session_id"], prompt, cwd, promptfile=promptfile)
+        return wo
+    if wo.get("bg_id"):
+        # A session that never wrote a word: retire it rather than leave two
+        claude_cli.stop_session(wo["bg_id"])
+    entry = claude_cli.spawn_bg_turn(prompt, cwd, _worker_name(wo), worktree=worktree,
+                                     promptfile=promptfile, **briefing)
+    store.update_work_order(wo["id"], session_id=entry.session_id, bg_id=entry.id)
+    return {**wo, "session_id": entry.session_id, "bg_id": entry.id}
+
+
+def _worker_name(wo: dict[str, Any]) -> str:
+    from .dispatch import worker_name
+    return worker_name(wo)
 
 
 def _head_sha(cwd: Path | None) -> str:
@@ -557,7 +593,28 @@ def _release_background_owner(store: ProjectStore, wo: dict[str, Any]) -> None:
 def poll(store: ProjectStore, project_name: str = "") -> list[dict[str, Any]]:
     """Reap every turn whose process has ended"""
     settled: list[dict[str, Any]] = []
+    roster: dict[str, claude_cli.BgEntry] | None = None
+    roster_failed = False
     for turn in store.running_turns():
+        try:
+            wo = store.get_work_order(turn["wo_id"])
+        except KeyError:
+            wo = {}
+        if is_background(wo):
+            if roster is None and not roster_failed:
+                try:
+                    roster = claude_cli.bg_roster()
+                except claude_cli.ClaudeCliError as e:
+                    # No roster is no verdict: an empty one would read every session as dead
+                    log.warning("could not read `claude agents` (%s); background turns "
+                                "wait for the next poll", e)
+                    roster_failed = True
+            if roster is None:
+                continue
+            done = _poll_bg(store, wo, turn, roster, project_name)
+            if done is not None:
+                settled.append(done)
+            continue
         if claude_cli.process_alive(turn["pid"]):
             continue
         if turn["pid"] is None and time.time() - turn["started_at"] < 30:
@@ -608,6 +665,14 @@ def _reap(store: ProjectStore, turn: dict[str, Any],
                 log.warning("could not harvest turn %s of %s: %s", turn["seq"], wo_id,
                             exc)
         return settled
+    return _settle_result(store, turn, result, project_name)
+
+
+def _settle_result(store: ProjectStore, turn: dict[str, Any],
+                   result: claude_cli.TurnResult,
+                   project_name: str = "") -> dict[str, Any]:
+    """Settle a turn against what it returned, whichever transport it came back on"""
+    wo_id = turn["wo_id"]
     # Recorded on BOTH outcomes: a failed turn's tokens were spent just the same
     usage_json = json.dumps(result.usage) if result.usage else None
     if not result.ok:
@@ -672,6 +737,123 @@ def _reap(store: ProjectStore, turn: dict[str, Any],
     return store.finish_turn(turn["id"], "done", result=reply or "",
                              cost_usd=result.cost_usd, num_turns=result.num_turns,
                              usage_json=usage_json)
+
+
+# -- a turn in a background session (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)
+
+#: How long an idle session that has not answered yet is given to pick its prompt up
+BG_IDLE_GRACE = 60.0
+
+#: How long a session missing its process is given to register one before the turn is lost
+BG_DEAD_GRACE = 10.0
+
+#: How often a running background turn's spend is read against its cap
+BG_BUDGET_EVERY = 60.0
+
+#: What a background turn lost with its process is recorded as
+SESSION_LOST_ERROR = ("the worker's background session process ended before the turn "
+                      "settled")
+
+_budget_checked: dict[int, float] = {}
+
+
+def _poll_bg(store: ProjectStore, wo: dict[str, Any], turn: dict[str, Any],
+             roster: dict[str, claude_cli.BgEntry],
+             project_name: str = "") -> dict[str, Any] | None:
+    """Reap a background turn once its session has SETTLED, or None while it works"""
+    entry = roster.get(str(wo.get("session_id") or ""))
+    age = time.time() - turn["started_at"]
+    if entry is not None and entry.alive and not entry.idle:
+        # Busy covers the worker's own background tasks too (fact 10): never cut one short
+        cap = _bg_over_budget(store, wo, turn)
+        if cap is None:
+            return None
+        claude_cli.stop_bg(entry.id)
+        return _reap_bg(store, wo, turn, entry, project_name, budget_cap=cap)
+    answered = _bg_answered(wo, turn)
+    if entry is not None and entry.idle and not answered and age < BG_IDLE_GRACE:
+        return None  # the resumed process has not taken its prompt yet
+    if (entry is None or not entry.alive) and not answered and age < BG_DEAD_GRACE:
+        return None
+    return _reap_bg(store, wo, turn, entry, project_name)
+
+
+def _bg_answered(wo: dict[str, Any], turn: dict[str, Any]) -> bool:
+    """Has the session said anything, or compacted, since this turn's prompt went in?"""
+    sid = str(wo.get("session_id") or "")
+    if not sid:
+        return False
+    try:
+        if usage.said_in_session(sid, since=turn["started_at"]):
+            return True
+        return (turn["kind"] == COMPACT_TURN
+                and usage.last_compaction(sid, since=turn["started_at"]) is not None)
+    except OSError:
+        return False
+
+
+def _bg_over_budget(store: ProjectStore, wo: dict[str, Any],
+                    turn: dict[str, Any]) -> float | None:
+    """The cap this running turn has spent through, or None — `--max-budget-usd` is print-only (fact 13)"""
+    from .central_store import CentralStore
+
+    now = time.time()
+    if now - _budget_checked.get(turn["id"], 0.0) < BG_BUDGET_EVERY:
+        return None
+    _budget_checked[turn["id"]] = now
+    central = CentralStore()
+    try:
+        cap = budget.ceiling(store, central, wo)
+    finally:
+        central.close()
+    if cap is None:
+        return None
+    remaining = max(0.0, cap.remaining_usd)
+    return remaining if budget.in_flight(store, wo["id"]) >= remaining else None
+
+
+def _reap_bg(store: ProjectStore, wo: dict[str, Any], turn: dict[str, Any],
+             entry: claude_cli.BgEntry | None, project_name: str = "",
+             budget_cap: float | None = None) -> dict[str, Any]:
+    """Settle a background turn from what the session left: the transcript and the Stop hook"""
+    _budget_checked.pop(turn["id"], None)
+    sid = str(wo.get("session_id") or "")
+    until = time.time()
+    try:
+        envelope = usage.window_envelope(sid, turn["started_at"], until,
+                                         schema=claude_cli.USAGE_SCHEMA_VERSION)
+        said = usage.said_in_session(sid, since=turn["started_at"])
+    except OSError:
+        envelope, said = None, []
+    cost = envelope["total_cost_usd"] if envelope else None
+    if budget_cap is not None:
+        result = claude_cli.TurnResult(
+            ok=False, error=f"Reached maximum budget (${budget_cap:.2f})",
+            subtype=claude_cli.BUDGET_SUBTYPE,
+            terminal_reason=claude_cli.BUDGET_TERMINAL_REASON,
+            cost_usd=cost, usage=envelope)
+    elif said and said[-1][0] == usage.SYNTHETIC_MODEL:
+        # The CLI's own words for a refused or broken call: what `_diagnose` reads
+        result = claude_cli.TurnResult(ok=False, error=said[-1][1], cost_usd=cost,
+                                       usage=envelope)
+    elif ((entry is None or not entry.alive) and turn["kind"] != COMPACT_TURN
+          and not _last_assistant_message(store, wo["id"], turn)):
+        # Gone with no `Stop` since the prompt: whatever it said was mid-turn
+        result = claude_cli.TurnResult(ok=False, error=SESSION_LOST_ERROR,
+                                       terminal_reason=claude_cli.SESSION_LOST,
+                                       cost_usd=cost, usage=envelope)
+    else:
+        reply = (_last_assistant_message(store, wo["id"], turn)
+                 or next((text for model, text in reversed(said)
+                          if model != usage.SYNTHETIC_MODEL), ""))
+        result = claude_cli.TurnResult(ok=True, result=reply, session_id=sid,
+                                       cost_usd=cost,
+                                       num_turns=(envelope or {}).get("api_calls"),
+                                       usage=envelope)
+    if entry is not None and entry.alive and budget_cap is None:
+        # Settled and idle: its process holds nothing, and the next prompt restarts it anyway
+        claude_cli.stop_session(entry.id)
+    return _settle_result(store, turn, result, project_name)
 
 
 def _last_assistant_message(store: ProjectStore, wo_id: str,
@@ -916,7 +1098,8 @@ def _reached_model(turn: dict[str, Any]) -> bool:
     usage = db.from_json(turn.get("usage_json"), None)
     if not isinstance(usage, dict):
         return False
-    return (usage.get("duration_api_ms") or 0) > 0
+    # `api_calls` is what a transcript-built envelope counts instead (`usage.window_envelope`)
+    return (usage.get("duration_api_ms") or 0) > 0 or (usage.get("api_calls") or 0) > 0
 
 
 def _nudge(pause: TurnPause) -> str:
@@ -978,6 +1161,12 @@ def _conversation_started(project: ProjectSpec, wo: dict[str, Any]) -> bool:
     session_id = wo.get("session_id")
     if not session_id:
         return False
+    if is_background(wo):
+        # The CLI chose the cwd the transcript is filed under: look it up by id
+        try:
+            return session_id in usage.index_sessions()
+        except OSError:
+            return True  # an id the CLI handed back names a session that exists
     cwd = worktree_path(project, wo) or project.path
     return claude_cli.session_transcript_path(cwd, session_id).exists()
 
@@ -987,10 +1176,15 @@ def cancel(store: ProjectStore, wo_id: str) -> dict[str, Any]:
     turn = busy(store, wo_id)
     if turn is None:
         return {"stopped": False, "reason": "no turn in flight"}
-    # The unit first, and then the process group anyway
+    wo = store.get_work_order(wo_id)
     unit = turn.get("unit")
-    stopped_unit = systemd_units.stop_unit(unit) if unit else False
-    killed = claude_cli.kill_process_group(turn["pid"]) or stopped_unit
+    if is_background(wo):
+        # `claude stop` keeps the conversation; the next prompt resumes it
+        killed = bool(wo.get("bg_id")) and claude_cli.stop_bg(str(wo["bg_id"]))
+    else:
+        # The unit first, and then the process group anyway
+        stopped_unit = systemd_units.stop_unit(unit) if unit else False
+        killed = claude_cli.kill_process_group(turn["pid"]) or stopped_unit
     # A cancelled turn wrote no envelope and spent what it spent
     store.finish_turn(turn["id"], "failed",
                       error="cancelled" if killed else "cancelled (process already gone)",

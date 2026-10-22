@@ -374,6 +374,14 @@ def orphaned_worker_sessions() -> list[dict[str, Any]]:
     named = [s for s in sessions if s.name.startswith("[WO ")]
     if not named:
         return []
+    # A STOPPED worker session holds nothing: every closed background-transport order leaves one (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)
+    try:
+        roster = claude_cli.bg_roster()
+    except claude_cli.ClaudeCliError:
+        roster = {}
+    named = [s for s in named
+             if not (s.session_id in roster and not roster[s.session_id].alive
+                     and roster[s.session_id].state in claude_cli.FINISHED_STATES)]
 
     live_sessions: set[str] = set()
     for name, path in registered_project_paths().items():  # noqa: B007
@@ -5604,6 +5612,30 @@ def stop_worker_session(wo: dict[str, Any], store: ProjectStore) -> dict[str, An
     return {"stopped": False, "bg_id": bg_id, "reason": "`claude stop` failed"}
 
 
+def respawn_worker(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
+    """Restart an order's background session process under the same id, sending nothing (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)"""
+    from . import claude_cli, worker_session
+
+    _name, path, wo = find_work_order(wo_id, project_name)
+    if not worker_session.is_background(wo) or not wo.get("bg_id"):
+        raise OpsError(f"{wo_id} does not run on a background session — nothing to respawn")
+    store = ProjectStore(path)
+    try:
+        if worker_session.busy(store, wo_id):
+            # A restart under a running turn would end it wherever it had got to
+            raise OpsError(f"{wo_id} has a turn in flight; respawn it once that settles")
+        ok = claude_cli.respawn_bg(str(wo["bg_id"]))
+        if ok:
+            store.add_event(wo_id, "session_respawned", {"bg_id": wo["bg_id"],
+                                                         "session_id": wo["session_id"]})
+    finally:
+        store.close()
+    if not ok:
+        raise OpsError(f"`claude respawn {wo['bg_id']}` failed")
+    return {"wo_id": wo_id, "bg_id": wo["bg_id"], "session_id": wo["session_id"],
+            "respawned": True}
+
+
 def cancel(wo_id: str) -> dict[str, Any]:
     name, path, wo = find_work_order(wo_id)
     store = ProjectStore(path)
@@ -5817,6 +5849,10 @@ def delete_work_order(wo_id: str, project_name: str | None = None) -> dict[str, 
         deleted = store.delete_work_order(wo_id)
     finally:
         store.close()
+    if wo.get("transport") == "background" and wo.get("bg_id"):
+        # The order's ONE session goes with it (`claude rm` keeps a worktree holding unpushed work)
+        from . import claude_cli
+        deleted["background_session"] = int(claude_cli.remove_bg(str(wo["bg_id"])))
     central = CentralStore()
     try:
         deleted.update(central.purge_work_order(wo_id))

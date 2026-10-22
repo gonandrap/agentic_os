@@ -184,7 +184,7 @@ def crew_block(require_crew: bool) -> list[str]:
         "you could make yourself costs it twice. `jarvis-implementer` and "
         "`jarvis-spec-writer` exist for a LARGE, self-contained chunk you can specify "
         "completely, or independent work you want done in parallel.",
-        "- A seat inherits none of your context: brief it fully. Its hand-back is its "
+        "- A subagent inherits none of your context: brief it fully. Its hand-back is its "
         "report — read the final diff ONCE before you commit; do not watch its progress.",
     ]
 

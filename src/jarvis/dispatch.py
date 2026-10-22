@@ -81,7 +81,7 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
     """Merge the project's injected settings with per-work-order env and persist them for --settings"""
     import json as _json
 
-    from . import agent_usage, concision, hooks, wiring
+    from . import agent_usage, concision, hooks, wiring, worker_session
     from .bootstrap import build_settings, deep_merge
     from .paths import jarvis_home
 
@@ -162,7 +162,7 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         # WHICH PROMPT-CACHE TTL THIS WORKER'S WRITES ARE BILLED AT (docs/superpowers/specs/2026-10-15-the-hour-on-worker-turns-only.md)
         **cache_ttl_env(project.worker.cache_ttl),
         # WHAT A TURN IS, for every hook that would otherwise assume it
-        claude_cli.TURN_TRANSPORT_ENV: claude_cli.TRANSPORT_HEADLESS,
+        claude_cli.TURN_TRANSPORT_ENV: worker_session.transport_of(project, wo),
         # WHAT ONE MCP TOOL CALL MAY TAKE (#845)
         "MCP_TOOL_TIMEOUT": str(project.worker.mcp_tool_timeout_ms),
         # WHETHER `auto` MODE'S BASH-FIRST STEER REACHES THIS WORKER (spec §2, same file)

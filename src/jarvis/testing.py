@@ -132,8 +132,11 @@ def load_sessions():
         return []
 
 def save_sessions(s):
-    with open(sessions_path, "w") as f:
+    # Renamed into place: a background session's child writes this while `agents` reads it
+    tmp = f"{sessions_path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
         json.dump(s, f)
+    os.replace(tmp, sessions_path)
 
 argv = sys.argv[1:]
 # One file per invocation, never a shared append target: worker turns are concurrent
@@ -377,7 +380,9 @@ def _launch_bg_session(sid, prompt):
         f.write(prompt)
     child = subprocess.Popen([sys.executable, os.path.abspath(__file__),
                               "__bg_session__", sid],
-                             stdin=subprocess.DEVNULL, start_new_session=True)
+                             # Never the parent's pipes: its caller waits for their EOF
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
     return child.pid
 
 def _bg_worker():
@@ -2603,7 +2608,9 @@ def catalog_file(tmp_path, project):
     data = {
         "os": {
             # `max_in_flight` well out of the way: the shipped default (3) is TIGHTER than the project default...
-            "defaults": {"model": "sonnet", "max_in_flight": 50},  # permission_mode: auto
+            # `transport` pinned: the suite asserts headless argv; tests/test_bg_transport.py owns the default
+            "defaults": {"model": "sonnet", "max_in_flight": 50,  # permission_mode: auto
+                         "transport": "headless"},
             "notifications": {"sinks": ["log"]},
         },
         "projects": [

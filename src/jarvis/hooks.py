@@ -1594,6 +1594,9 @@ def uncollected_task_turn_block(store: ProjectStore, wo_id: str,
     from . import background
     from .invariants import TERMINAL_STATUSES
 
+    # A background session outlives its turn and is woken by the task (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)
+    if env.get(TURN_TRANSPORT_ENV) != TRANSPORT_HEADLESS:
+        return None
     # One continuation, not a loop: a task that is genuinely hung must not make the turn unendable
     if payload.get("stop_hook_active"):
         return None
