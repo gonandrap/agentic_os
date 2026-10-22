@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import json
-import time
 
 import pytest
 
+from jarvis import db
 from jarvis import claude_cli, worker_session
 from jarvis.project_store import ProjectStore
 
@@ -213,7 +213,7 @@ def settled_process(store, tmp_path, data: dict) -> dict:
     outfile.write_text(json.dumps(data))
     # pid NULL + old enough that poll() stops treating it as mid-launch
     store.conn.execute("UPDATE wo_turns SET outfile=?, started_at=? WHERE id=?",
-                       (str(outfile), time.time() - 60, turn["id"]))
+                       (str(outfile), db.now() - 60, turn["id"]))
     return store.get_turn(turn["id"])
 
 
@@ -399,7 +399,7 @@ def test_reaping_a_conversation_records_each_turn_and_not_the_session(store, tmp
         turn = store.create_turn(wo["id"], kind="dispatch", prompt="go")
         out = turn_file(tmp_path, i, own=own, cumulative=cum, cost=cost)
         store.conn.execute("UPDATE wo_turns SET outfile=?, started_at=? WHERE id=?",
-                           (str(out), time.time() - 60, turn["id"]))
+                           (str(out), db.now() - 60, turn["id"]))
         worker_session.poll(store)
 
     rows = store.list_turns(wo["id"])
