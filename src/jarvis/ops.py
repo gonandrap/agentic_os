@@ -12859,6 +12859,17 @@ def morpheus_waive(item_id: str, reason: str) -> dict[str, Any]:
         central.close()
 
 
+def morpheus_pause(mode: str | None, reason: str = "") -> dict[str, Any]:
+    """Pin Morpheus's session paused or running whatever the fleet does; None follows the fleet"""
+    from . import morpheus
+
+    central = CentralStore()
+    try:
+        return morpheus.set_pause(central, mode, reason)
+    finally:
+        central.close()
+
+
 def morpheus_requeue(item_id: str) -> dict[str, Any]:
     from . import morpheus
 

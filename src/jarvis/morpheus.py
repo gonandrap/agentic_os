@@ -40,6 +40,9 @@ SESSION_KEY = "morpheus.session"
 RELEASE_KEY = "morpheus.last_release"
 #: Per project: the last `pr_merged` event already queued
 MERGE_CURSOR_KEY = "morpheus.merge_cursor.{project}"
+# Morpheus's own brake, over the fleet's: "paused" holds it, "running" lets it through a fleet pause
+PAUSE_KEY = "morpheus.pause"
+PAUSE_MODES = ("paused", "running")
 
 #: How long an item offered to Morpheus waits before it is offered again
 REOFFER_SECONDS = 6 * 3600
@@ -686,6 +689,35 @@ def wake(central: CentralStore, catalog: Catalog, cwd: Path, *, paused: bool = F
     return kind
 
 
+def set_pause(central: CentralStore, mode: str | None, reason: str = "",
+              now: float | None = None) -> dict[str, Any]:
+    """Pin Morpheus paused or running whatever the fleet does; None follows the fleet again"""
+    if mode is None:
+        central.set_state(PAUSE_KEY, "")
+    elif mode in PAUSE_MODES:
+        central.set_state(PAUSE_KEY, json.dumps({
+            "mode": mode, "reason": reason, "since": db.now() if now is None else now}))
+    else:
+        raise ValueError(f"pause mode must be one of {PAUSE_MODES}, not {mode!r}")
+    return pause_state(central)
+
+
+def pause_state(central: CentralStore) -> dict[str, Any]:
+    """Morpheus's override, the fleet's pause, and whether session turns are held"""
+    from . import fleet
+
+    try:
+        pin = json.loads(central.get_state(PAUSE_KEY) or "{}")
+    except ValueError:
+        # A brake that cannot be read is still a brake
+        pin = {"mode": "paused", "reason": "(unreadable morpheus pause record)"}
+    mode = pin.get("mode") if pin.get("mode") in PAUSE_MODES else ""
+    fleet_paused = fleet.load_pause(central) is not None
+    paused = mode == "paused" or (mode != "running" and fleet_paused)
+    return {"paused": paused, "override": mode, "reason": str(pin.get("reason") or ""),
+            "since": pin.get("since"), "fleet_paused": fleet_paused}
+
+
 def _mark_offered(state: dict[str, Any], items: list[dict], now: float) -> None:
     offers = state.setdefault("offers", {})
     for item in items:
@@ -697,13 +729,11 @@ def _mark_offered(state: dict[str, Any], items: list[dict], now: float) -> None:
 
 def report(central: CentralStore, catalog: Catalog | None = None) -> dict[str, Any]:
     """Counts first, then the session, then every item"""
-    from . import fleet
-
     state = session_state(central)
     state.pop("offers", None)
-    paused = fleet.load_pause(central) is not None
+    pause = pause_state(central)
     return {"enabled": bool(catalog.os.morpheus.enabled) if catalog else None,
             "counts": {s: central.morpheus_counts().get(s, 0) for s in STATES},
-            "session": state, "paused": paused,
+            "session": state, "paused": pause["paused"], "pause": pause,
             "last_release": central.get_state(RELEASE_KEY) or "",
             "items": central.morpheus_items()}

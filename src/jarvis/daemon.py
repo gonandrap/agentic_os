@@ -2802,7 +2802,7 @@ class Daemon:
 
     def _morpheus_pass(self) -> None:
         """Queue what reached production, run due scripts, hand off verdicts, then wake the session"""
-        from . import fleet, morpheus
+        from . import morpheus
         from .paths import production_code_dir
 
         central = CentralStore()  # thread-local
@@ -2844,7 +2844,7 @@ class Daemon:
             # The session lives in the OS project's checkout; each batch adds the projects it touches
             home = next((p.path for p in self.catalog.projects if p.name == os_name), fallback)
             morpheus.wake(central, self.catalog, home, dirs=dirs,
-                          paused=fleet.load_pause(central) is not None)
+                          paused=morpheus.pause_state(central)["paused"])
         except Exception:  # noqa: BLE001 — the loop must survive anything
             log.exception("morpheus pass failed")
         finally:

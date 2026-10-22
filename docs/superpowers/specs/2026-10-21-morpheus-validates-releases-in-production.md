@@ -57,6 +57,9 @@ Each item has a state:
    * After a turn, if the session's context exceeds `compact_at` (default 30%) of its
      window, the next turn is `/compact`.
    * Its turns respect `jarvis pause`; the mechanical halves spend nothing and do not.
+     Morpheus has its own pin over that (`os_state['morpheus.pause']`): `jarvis morpheus
+     pause` holds it while the fleet runs, `jarvis morpheus unpause` runs it through a
+     fleet pause, and `jarvis morpheus follow-fleet` drops the pin.
 
 The daemon has no conversation context, so monitoring does not grow anything. It is
 Python running the checks and reading rows. The session only ever sees "write checks for
@@ -96,9 +99,9 @@ nothing.
 
 ## Surfaces
 
-* `jarvis morpheus status|show|add|enqueue-release|script|check|waive|requeue`
+* `jarvis morpheus status|show|add|enqueue-release|script|check|waive|requeue|pause|unpause|follow-fleet`
 * `/morpheus`: the session (id, context %, turns, compactions, paused) and every item.
-  Each item shows its project, the PR as a link, its state, the check, the exit code,
+  Each item shows its id (one click selects it for the CLI), its project, the PR as a link, its state, the check, the exit code,
   the output tail and who it was handed to.
 * `INV-MORPHEUS-OVERDUE` (OS invariant). It fires when an item is open past its
   deadline, or when a failed/timed-out item has no hand-off.

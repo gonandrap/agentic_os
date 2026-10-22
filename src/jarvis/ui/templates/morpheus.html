@@ -19,7 +19,9 @@
   <table>
     <tr><th>state</th><td class="mono">
       {% if report.enabled == false %}<span class="tone-warn">disabled (os.morpheus.enabled)</span>
-      {% elif report.paused %}<span class="tone-warn">paused — checks still run, no session turns</span>
+      {% elif report.pause.override == "paused" %}<span class="tone-warn">paused by <span class="mono">jarvis morpheus pause</span> — checks still run, no session turns</span>{% if report.pause.reason %} · {{ report.pause.reason }}{% endif %}
+      {% elif report.pause.override == "running" %}<span class="tone-ok">running by <span class="mono">jarvis morpheus unpause</span>{% if report.pause.fleet_paused %}, through the fleet pause{% endif %}</span>{% if report.pause.reason %} · {{ report.pause.reason }}{% endif %}
+      {% elif report.paused %}<span class="tone-warn">paused with the fleet — checks still run, no session turns</span>
       {% else %}<span class="tone-ok">running</span>{% endif %}</td></tr>
     <tr><th>session</th><td class="mono">{{ sess.get('session_id') or "not started" }}</td></tr>
     <tr><th>turns</th><td class="mono">{{ sess.get('turns') or 0 }} · {{ sess.get('compactions') or 0 }} compaction(s)
@@ -37,10 +39,11 @@
 <h2>Pull requests</h2>
 <div class="panel">
   <table>
-    <tr><th>project</th><th>PR</th><th>state</th><th>check</th><th>runs</th>
+    <tr><th>id</th><th>project</th><th>PR</th><th>state</th><th>check</th><th>runs</th>
       <th>deadline</th><th>output</th><th>handed to</th></tr>
     {% for i in report["items"] %}
     <tr id="{{ i.id }}">
+      <td class="mono" style="white-space:nowrap;user-select:all" title="click to select, then copy">{{ i.id }}</td>
       <td class="mono">{{ i.project or "—" }}</td>
       <td class="mono" style="white-space:nowrap"><a href="{{ i.pr_url }}" title="{{ i.pr_title }}">#{{ i.pr_number }}</a></td>
       <td class="mono {{ tone[i.state] }}">{{ i.state }}</td>
@@ -51,7 +54,7 @@
       <td class="mono" style="word-break:break-all">{{ i.action or "—" }}</td>
     </tr>
     {% else %}
-    <tr><td colspan="8" class="empty">nothing queued — a release or a merge fills this</td></tr>
+    <tr><td colspan="9" class="empty">nothing queued — a release or a merge fills this</td></tr>
     {% endfor %}
   </table>
 </div>
@@ -59,6 +62,8 @@
 <p class="sub">from a terminal: <span class="mono">jarvis morpheus status</span> ·
   <span class="mono">jarvis morpheus show &lt;id&gt;</span> ·
   <span class="mono">jarvis morpheus waive &lt;id&gt; --reason "…"</span> ·
-  <span class="mono">jarvis morpheus requeue &lt;id&gt;</span></p>
+  <span class="mono">jarvis morpheus requeue &lt;id&gt;</span> ·
+  <span class="mono">jarvis morpheus pause|unpause --reason "…"</span> ·
+  <span class="mono">jarvis morpheus follow-fleet</span></p>
 
 {% endblock %}

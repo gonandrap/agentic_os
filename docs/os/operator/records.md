@@ -71,6 +71,10 @@ Morpheus validates every PR that reaches production, in every project.
   investigation (or to Neo), and `timedout` (3 days by default) to Neo.
 * **The two commands.** `waive` is the user ruling a PR fine. `requeue` watches it again
   with a fresh deadline.
+* **Its own brake.** By default Morpheus's session pauses with the fleet's `jarvis pause`.
+  `jarvis morpheus pause --reason "…"` holds it while the fleet runs. `jarvis morpheus
+  unpause --reason "…"` lets it run even through a fleet pause. `jarvis morpheus
+  follow-fleet` drops either pin. Checks run either way; they spend nothing.
 
 Dashboard: `/morpheus`. Spec:
 docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md.
