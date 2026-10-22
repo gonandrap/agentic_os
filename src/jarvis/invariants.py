@@ -1519,6 +1519,33 @@ def neo_question_blocker(question: dict[str, Any]) -> str:
 # -- invariants
 
 
+def check_a_working_worker_is_not_waiting(store: ProjectStore) -> Iterator[Violation]:
+    """INV-WAIT-WORKING — a worker with a turn in flight is not waiting for you (issue 1166)"""
+    from . import hooks
+
+    readonly = getattr(store, "readonly", False)
+    for wo in store.list_work_orders(statuses=("waiting_input",), include_hidden=True):
+        # The exact literal the hook stamps, never a substring: a permission prompt keeps its flag
+        if (wo.get("attention_reason") or "") != hooks.IDLE_PROMPT:
+            continue
+        turn = worker_session.busy(store, wo["id"])
+        if turn is None:
+            continue
+        if not end_wait_if_nothing_is_out(store, wo["id"]):
+            continue
+        store.clear_attention(wo["id"])
+        yield Violation(
+            invariant="INV-WAIT-WORKING",
+            wo_id=wo["id"],
+            detail=f"parked on you by the idle prompt while turn {turn['seq']} is "
+                   f"still in flight",
+            repaired=not readonly,
+            repair=("would take " if readonly else "took ")
+                   + "the order back to running and clear the flag",
+            context={"turn": turn["seq"]},
+        )
+
+
 def check_attention_reason_is_true(store: ProjectStore) -> Iterator[Violation]:
     """INV-ATTENTION-REASON — a flagged work order's reason must name the real blocker"""
     for wo in store.list_work_orders(include_hidden=True):
@@ -3629,6 +3656,8 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                     # request is a blocker they would otherwise believe
     check_repaired_work_rejoins_the_merge_queue,  # BEFORE the reason checks: it moves
                                    # the status they derive a reason from
+    check_a_working_worker_is_not_waiting,  # BEFORE the reason checks: it moves the status
+                                   # they derive from, and INV-ATTENTION-MISSING would re-flag what it clears
     check_attention_reason_is_true,
     check_adhoc_not_governed,      # retire before the flag checks judge the leftovers
     check_legacy_adhoc_retired,    # ...and before them, let go of what nothing tracks
