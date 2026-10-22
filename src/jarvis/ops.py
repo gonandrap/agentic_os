@@ -6657,9 +6657,81 @@ def reoffer_improvement_order(row: Mapping[str, Any], candidate: Any,
     return str(io["id"])
 
 
+def file_neo_cleanup(store: ProjectStore, rider: Mapping[str, Any],
+                     decision: Any) -> dict[str, Any]:
+    """The pre-approved ledger cleanup Neo asked for — now, or when the steward re-offers it"""
+    from . import steward
+    from .project_store import PRE_APPROVED_KEY
+
+    question_id, from_wo = rider["question_id"], rider["wo_id"]
+    description = "\n\n".join(filter(None, [
+        rider.get("description") or "",
+        f"Neo filed this while answering question {question_id} on {from_wo}. "
+        f"The correction is ALREADY APPROVED — make it. The stores are append-only, "
+        f"so the remedy is to APPEND an entry that supersedes the wrong one "
+        f"(`jarvis learn add` for the knowledge base, `jarvis neo learn` for Neo's "
+        f"own learnings), naming what it replaces and why.",
+    ]))
+    wo = store.create_work_order(
+        title=rider["title"], description=description, origin="neo",
+        metadata=steward.stamped({PRE_APPROVED_KEY: {
+            "by": "neo",
+            "scope": "correcting the recorded ledger entries this work order names",
+            "neo_question_id": question_id,
+            "from_wo": from_wo,
+        }}, decision), budget_usd=decision.budget_usd,
+    )
+    steward.linked(decision, wo["id"], store=store)
+    try:
+        store.add_event(from_wo, "neo_dispatched",
+                        {"neo_question_id": question_id, "cleanup_wo_id": wo["id"]})
+    except Exception:  # noqa: BLE001 — the order it came from may be gone by a re-offer
+        log.warning("neo cleanup %s filed; %s is gone, so no event there", wo["id"],
+                    from_wo)
+    log.info("neo dispatched pre-approved cleanup %s from %s", wo["id"], from_wo)
+    return wo
+
+
+def reoffer_neo_cleanup(row: Mapping[str, Any], candidate: Any, decision: Any) -> str:
+    """File a queued Neo cleanup the steward now has room for (`steward.drain`)"""
+    rider = candidate.payload or {}
+    if not rider.get("title"):
+        raise OpsError(f"steward decision #{row['id']} kept no cleanup to file")
+    paths = registered_project_paths()
+    if candidate.project not in paths:
+        raise OpsError(f"project {candidate.project!r} is not registered")
+    store = ProjectStore(paths[candidate.project])
+    try:
+        return str(file_neo_cleanup(store, rider, decision)["id"])
+    finally:
+        store.close()
+
+
+def steward_queue_report(limit: int = 200) -> dict[str, Any]:
+    """The dashboard's `/steward`: queue counts first, then each queued decision"""
+    from . import steward
+
+    central = CentralStore()
+    try:
+        counts = central.steward_queue_counts()
+        rows = central.steward_queue_rows(limit)
+    finally:
+        central.close()
+    items = [{k: r[k] for k in ("id", "ts", "project", "origin_kind", "severity",
+                                "subject", "rule", "reason", "wo_id",
+                                "queue_state", "queue_note", "queue_ts")} for r in rows]
+    return {"counts": {s: counts.get(s, 0) for s in ("waiting", "reoffered", "expired")},
+            "line": steward.queue_line(counts),
+            "waiting": [i for i in items if i["queue_state"] == "waiting"],
+            "settled": [i for i in items if i["queue_state"] != "waiting"]}
+
+
 def steward_dispatchers() -> dict[str, Any]:
     """How `steward.drain` dispatches a queued decision, per origin kind (#1181)"""
-    return {"panel": reoffer_panel_follow_up, "worker_io": reoffer_improvement_order}
+    from . import remedies
+
+    return {"panel": reoffer_panel_follow_up, "worker_io": reoffer_improvement_order,
+            "remedy": remedies.reoffer_file_work_order, "neo_rider": reoffer_neo_cleanup}
 
 
 def list_improvement_orders(project_name: str | None = None,
