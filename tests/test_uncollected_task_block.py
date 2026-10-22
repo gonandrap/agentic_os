@@ -90,7 +90,9 @@ def worker(jarvis_home, fake_claude, catalog_file, project, tmp_path):
                        (db.now() - BACK_DATED, turn["id"]))
     store.conn.commit()
     env = {"JARVIS_WO_ID": wo["id"], "JARVIS_PROJECT": "proj_a",
-           "JARVIS_PROJECT_PATH": str(project), "JARVIS_GATES": ALL_GATES.to_json()}
+           "JARVIS_PROJECT_PATH": str(project), "JARVIS_GATES": ALL_GATES.to_json(),
+           # The block is the one-shot turn's; a background session is woken instead
+           "JARVIS_TURN_TRANSPORT": "headless"}
 
     class Handle:
         def __init__(self):
@@ -130,6 +132,14 @@ def test_fixture_turn_is_back_dated(worker):
 
     assert time.time() - started >= BACK_DATED - 1
     assert started + 0.001 < started + 0.002 < time.time()
+
+
+def test_a_background_session_is_never_held_open(worker):
+    """It outlives the turn and the task wakes it (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md)"""
+    env = {**worker.env, "JARVIS_TURN_TRANSPORT": "background"}
+    assert hooks.uncollected_task_turn_block(
+        worker.store, worker.wo_id,
+        worker.payload(_launch(worker.started() + 0.001)), env) is None
 
 
 def test_turn_with_uncollected_bash_task_blocked(worker):

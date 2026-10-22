@@ -45,7 +45,33 @@ Skipped entirely when no work order is parked, so an idle fleet spawns no subpro
 A `gh` that cannot answer warns ONCE per project per daemon run (`pr_poll_warned`) and
 leaves the work order parked; `jarvis wo done` is still the manual way out.
 
-## The transport: headless turns (replaced background sessions, 2026-08-01)
+## The transport is per order: `background` (default since 2026-10-22) or `headless`
+
+`worker.transport` (catalog) is read at the FIRST launch and recorded on
+`work_orders.transport`; `worker_session.transport_of()` / `is_background()` decide every
+later turn. Rows from before the column with a session are headless.
+
+**Background** (spec `docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md`,
+facts measured on CLI 2.1.308, spike `scripts/spike_bg_transport.py`): ONE `claude --bg`
+session per order. Turn 1 = `claude_cli.spawn_bg_turn` (`--bg -n … --worktree …
+[briefing] -- prompt`; the CLI MINTS the id, read off `claude agents --json --all` and
+stored as `session_id` + `bg_id`). Turn n = `resume_bg_turn`: `claude stop`, wait until
+the roster shows no pid, then `claude --bg --resume <sid> -- <msg>` with NO flags — a
+live original or any flag forks a copy (it is detected and removed). `worker_session.poll`
+reads liveness from the roster (`BgEntry.idle` = settled; `busy` covers the worker's own
+background tasks, so a turn spans them), builds the `TurnResult` from the transcript
+(`usage.window_envelope`, subagents included) + the Stop hook's last message, and stops
+the idle session after settling. A synthetic assistant message is the error text the
+pause machinery reads; a dead session with no Stop since the prompt is
+`claude_cli.SESSION_LOST` → transient pause. `--max-budget-usd` is print-only, so poll
+enforces the cap (`_bg_over_budget`, every `BG_BUDGET_EVERY`). `jarvis wo respawn` =
+`claude respawn` (same id, sends nothing); `wo delete` = `claude rm`, and every poll `claude rm`s the session of a completed/cancelled order (`remove_closed_sessions`; a removed id still resumes as the same session). Prompts over 1 KB go by file. The one-shot hooks
+(background refusal, long-foreground refusal, Stop uncollected-task block) key on
+`JARVIS_TURN_TRANSPORT=headless` and are silent here. Tests: `tests/test_bg_transport.py`
+(the shared `catalog_file` fixture PINS headless; the fake models `--bg` only for `-n`,
+never for the legacy `--name` path).
+
+## The headless transport (replaced background sessions 2026-08-01; the fallback since 2026-10-22)
 
 **Read `src/jarvis/worker_session.py`'s module docstring first — it is the layer, and it
 explains the why.** Design doc:

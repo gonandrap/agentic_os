@@ -132,8 +132,11 @@ def load_sessions():
         return []
 
 def save_sessions(s):
-    with open(sessions_path, "w") as f:
+    # Renamed into place: a background session's child writes this while `agents` reads it
+    tmp = f"{sessions_path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
         json.dump(s, f)
+    os.replace(tmp, sessions_path)
 
 argv = sys.argv[1:]
 # One file per invocation, never a shared append target: worker turns are concurrent
@@ -228,9 +231,11 @@ def _write_call_record(finished=None):
     # running, and a half-written record it cannot parse is a call it silently drops.
     os.replace(tmp, _record_path)
 
-_write_call_record()
-# clock-exempt: class 4 — a separate process, which cannot see the in-test patch of db.now
-atexit.register(lambda: _write_call_record(time.time()))
+# The detached child that PLAYS a background session is not an invocation anyone made
+if argv[:1] != ["__bg_session__"]:
+    _write_call_record()
+    # clock-exempt: class 4 — a separate process, which cannot see the in-test patch of db.now
+    atexit.register(lambda: _write_call_record(time.time()))
 
 def opt(name, default=None):
     return argv[argv.index(name) + 1] if name in argv else default
@@ -263,8 +268,191 @@ def emit_headless(result_text):
             "contextWindow": 200000, "maxOutputTokens": 32000}},
     }))
 
+
+# -- A WORKER'S BACKGROUND SESSION (docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md).
+# Told apart from the legacy `spawn_background` path by `-n` vs `--name`. Mirrors the facts
+# measured on 2.1.308: `--bg` mints the id and prints `backgrounded · <short>`; the roster
+# carries `pid` + `status` (busy/idle); `--resume` FORKS when the original is still alive or
+# when any flag is passed, and continues the SAME session only bare and stopped; `stop` keeps
+# the entry with no pid; `respawn` brings the process back under the same id; `rm` deletes.
+import fcntl
+
+def _locked_sessions(mutate):
+    with open(sessions_path + ".lock", "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        sessions = load_sessions()
+        out = mutate(sessions)
+        save_sessions(sessions)
+        return out
+
+def _stamp():
+    # clock-exempt: class 4 — a separate process, which cannot see the in-test patch of db.now
+    now = time.time()
+    return (time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now))
+            + f".{int(now % 1 * 1000):03d}Z")
+
+def _transcript(sid):
+    root = os.environ.get("JARVIS_TRANSCRIPT_ROOT") or os.path.join(state_dir, "transcripts")
+    d = os.path.join(root, "-fake")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, sid + ".jsonl")
+
+def _say(sid, rows):
+    with open(_transcript(sid), "a") as f:
+        for row in rows:
+            f.write(json.dumps({"timestamp": _stamp(), "sessionId": sid, **row}) + "\n")
+
+def _assistant(sid, n, text, model="claude-fake-1", spent=True):
+    usage = ({"input_tokens": 3, "cache_creation_input_tokens": 1000,
+              "cache_read_input_tokens": 2000, "output_tokens": 100,
+              "cache_creation": {"ephemeral_5m_input_tokens": 1000,
+                                 "ephemeral_1h_input_tokens": 0}}
+             if spent else {"input_tokens": 0, "output_tokens": 0})
+    return {"type": "assistant", "message": {
+        "id": f"msg-{sid[:8]}-{n}-{time.time_ns()}", "model": model, "role": "assistant",
+        "content": [{"type": "text", "text": text}], "stop_reason": "end_turn",
+        "usage": usage}}
+
+def _set(sid, **fields):
+    def go(sessions):
+        for e in sessions:
+            if e.get("sessionId") == sid:
+                for k, v in fields.items():
+                    if v is None:
+                        e.pop(k, None)
+                    else:
+                        e[k] = v
+    _locked_sessions(go)
+
+def _run_bg_session(sid):
+    """The session's one turn: what the real CLI leaves in the transcript and the roster"""
+    with open(os.path.join(state_dir, "bgprompts", sid)) as f:
+        prompt = f.read()
+    os.makedirs(turns_dir, exist_ok=True)
+    with open(os.path.join(turns_dir, sid + ".jsonl"), "a") as f:
+        f.write(json.dumps(prompt) + "\n")
+    seq = sum(1 for _ in open(os.path.join(turns_dir, sid + ".jsonl")))
+    mode = os.environ.get("FAKE_CLAUDE_TURN", "")
+    _say(sid, [{"type": "user", "message": {"role": "user", "content": prompt}}])
+    hold = os.environ.get("FAKE_CLAUDE_TURN_HOLD")
+    if hold:
+        while os.path.exists(hold):
+            time.sleep(0.02)
+    if mode in ("fail", "silent"):
+        # The process dies mid-turn: no reply, no process
+        _set(sid, pid=None, status=None)
+        return
+    if mode == "rate_limit":
+        reset = os.environ.get("FAKE_CLAUDE_LIMIT_RESET", "11:50pm (America/Los_Angeles)")
+        _say(sid, [_assistant(sid, seq, "You've hit your session limit · resets " + reset,
+                              model="<synthetic>", spent=False)])
+    elif mode == "auth":
+        _say(sid, [_assistant(sid, seq, os.environ.get(
+            "FAKE_CLAUDE_AUTH_MESSAGE",
+            "Failed to authenticate: OAuth session expired and could not be refreshed"),
+            model="<synthetic>", spent=False)])
+    elif mode == "api_error":
+        status = os.environ.get("FAKE_CLAUDE_API_ERROR_STATUS", "500")
+        _say(sid, [_assistant(sid, seq, "working on it"),
+                   _assistant(sid, seq, f"API Error: {status} Internal server error. This "
+                              "is a server-side issue, usually temporary — try again in a "
+                              "moment.", model="<synthetic>", spent=False)])
+    elif mode == "error":
+        _say(sid, [_assistant(sid, seq, "API Error: model call failed",
+                              model="<synthetic>", spent=False)])
+    elif prompt.strip() == "/compact":
+        if os.environ.get("FAKE_CLAUDE_COMPACT") != "noop":
+            _say(sid, [{"type": "system", "subtype": "compact_boundary",
+                        "compactMetadata": {"trigger": "manual", "preTokens": 3003,
+                                            "postTokens": 900}}])
+    else:
+        _say(sid, [_assistant(sid, seq, f"final: {prompt[:60]}")])
+    _set(sid, status="idle", state="done")
+
+if argv[:1] == ["__bg_session__"]:
+    _run_bg_session(argv[1])
+    sys.exit(0)
+
+def _launch_bg_session(sid, prompt):
+    import subprocess
+    os.makedirs(os.path.join(state_dir, "bgprompts"), exist_ok=True)
+    with open(os.path.join(state_dir, "bgprompts", sid), "w") as f:
+        f.write(prompt)
+    child = subprocess.Popen([sys.executable, os.path.abspath(__file__),
+                              "__bg_session__", sid],
+                             # Never the parent's pipes: its caller waits for their EOF
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+    return child.pid
+
+def _bg_worker():
+    import uuid
+    prompt = argv[-1] if "--" in argv else ""
+    resumed = opt("--resume")
+    bare = resumed is not None and argv[:4] == ["--bg", "--resume", resumed, "--"]
+    if os.environ.get("FAKE_CLAUDE_BG_FAIL"):
+        sys.stderr.write("bg launch failed (test-forced)\n"); sys.exit(1)
+    sessions = load_sessions()
+    orig = next((e for e in sessions if e.get("sessionId") == resumed), None) if resumed else None
+    if resumed and orig is None and not os.path.exists(os.path.join(turns_dir, resumed + ".jsonl")):
+        sys.stderr.write(f"No conversation found with session ID: {resumed}\n"); sys.exit(1)
+    if resumed and orig is not None and not orig.get("pid") and bare:
+        sid, note = resumed, f"note: woke session {resumed[:8]} with its saved options"
+    elif resumed and orig is None and bare:
+        sid, note = resumed, ""  # a conversation no background agent held yet
+    elif resumed:
+        sid = str(uuid.uuid4())
+        note = (f"note: session {resumed[:8]} is already running in the background, so "
+                f"this started a copy as {sid[:8]}" if orig and orig.get("pid") else
+                f"note: background session {resumed[:8]} keeps its own saved options, so "
+                f"the flags you passed started a copy as {sid[:8]}")
+    else:
+        sid, note = str(uuid.uuid4()), ""
+    wt = opt("--worktree")
+    cwd = os.path.join(os.getcwd(), ".claude", "worktrees", wt) if wt else os.getcwd()
+    name = opt("-n") or (orig or {}).get("name", "")
+    def add(sessions):
+        sessions[:] = [e for e in sessions if e.get("sessionId") != sid]
+        sessions.append({"id": sid[:8], "sessionId": sid, "cwd": (orig or {}).get("cwd", cwd)
+                         if sid == resumed else cwd,
+                         "kind": "background", "name": name, "status": "busy",
+                         "state": "working", "startedAt": 0, "worker": True,
+                         "argv": argv[:-1], "prompt": prompt[:40]})
+    _locked_sessions(add)
+    _set(sid, pid=_launch_bg_session(sid, prompt))
+    if note:
+        sys.stderr.write(note + "\n")
+    print(f"backgrounded · {sid[:8]} · {name}\n  claude stop {sid[:8]}      stop this session")
+
+def _bg_find(short):
+    return next((e for e in load_sessions() if e.get("id") == short), None)
+
 if "--version" in argv:
     print("9.9.9 (fake claude)")
+elif "--bg" in argv and "--name" not in argv:
+    _bg_worker()
+elif argv[:1] in (["stop"], ["kill"]) and (_bg_find(argv[1]) or {}).get("worker"):
+    entry = _bg_find(argv[1])
+    if entry.get("pid"):
+        import signal
+        try:
+            os.killpg(entry["pid"], signal.SIGTERM)
+        except OSError:
+            pass
+    _set(entry["sessionId"], pid=None, status=None)
+    print(f"stopped {argv[1]}")
+elif argv[:1] == ["respawn"]:
+    entry = _bg_find(argv[1])
+    if entry is None:
+        sys.stderr.write(f"no such session {argv[1]}\n"); sys.exit(1)
+    # A respawned session has nothing to do: it comes back idle, under the same id
+    _set(entry["sessionId"], pid=900000 + len(load_sessions()), status="idle")
+    print(f"respawned {argv[1]}")
+elif argv[:1] == ["rm"]:
+    if _bg_find(argv[1]) is None:
+        sys.stderr.write(f"no such session {argv[1]}\n"); sys.exit(1)
+    _locked_sessions(lambda ss: ss.__setitem__(slice(None), [e for e in ss if e.get("id") != argv[1]]))
+    print(f"removed {argv[1]}")
 elif argv[:1] == ["agents"]:
     print(json.dumps(load_sessions()))
 elif "--bg" in argv:
@@ -2420,7 +2608,8 @@ def catalog_file(tmp_path, project):
     data = {
         "os": {
             # `max_in_flight` well out of the way: the shipped default (3) is TIGHTER than the project default...
-            "defaults": {"model": "sonnet", "max_in_flight": 50},  # permission_mode: auto
+            "defaults": {"model": "sonnet", "max_in_flight": 50,  # permission_mode: auto
+                         "transport": "headless"},
             "notifications": {"sinks": ["log"]},
         },
         "projects": [

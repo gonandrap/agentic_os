@@ -937,6 +937,13 @@ def build_parser() -> argparse.ArgumentParser:
                                     "claude rejected the order's own)")
     rt.add_argument("--project")
 
+    # docs/superpowers/specs/2026-10-22-workers-on-background-sessions.md
+    rs = wo.add_parser("respawn", help="restart a background-transport order's own session "
+                                       "process under the SAME id (`claude respawn`), e.g. "
+                                       "after a Claude Code upgrade; sends nothing")
+    rs.add_argument("wo_id")
+    rs.add_argument("--project")
+
     wy = wo.add_parser("why", help="why is this order not moving: what it waits for, "
                                    "what has held it, what the OS spent on it, and the "
                                    "commands that would be accepted right now")
@@ -3466,6 +3473,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
         # `relay=True` as `send` does: `ops.user_authorship` decides whether this process is a surface the...
         _print(ops.retry(args.wo_id, message=args.message, model=args.model,
                          project_name=args.project, relay=True), args.json)
+    elif args.wo_cmd == "respawn":
+        _print(ops.respawn_worker(args.wo_id, project_name=args.project), args.json)
     elif args.wo_cmd == "why":
         diagnosis = ops.diagnose(args.wo_id, project_name=args.project)
         if args.json:
@@ -5032,7 +5041,9 @@ def cmd_brief(args: argparse.Namespace) -> int:
                                       gates_enabled=gates_enabled,
                                       serena=os.environ.get("JARVIS_SERENA") != "0",
                                       tool_search=os.environ.get(
-                                          "JARVIS_TOOL_SEARCH", "cli")))
+                                          "JARVIS_TOOL_SEARCH", "cli"),
+                                      transport=os.environ.get(
+                                          "JARVIS_TURN_TRANSPORT", "background")))
     return 0
 
 
