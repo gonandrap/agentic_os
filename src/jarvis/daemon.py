@@ -4526,7 +4526,7 @@ class Daemon:
                         store.flag_attention(wo["id"], blockers[0])
                 else:
                     store.flag_attention(wo["id"],
-                                         invariants_mod.WORKER_FAILED_BLOCKER)
+                                         invariants_mod.failed_blocker(store, wo))
                 if pause:
                     # Retried until the OS ran out of patience
                     store.add_event(wo["id"], "turn_retries_exhausted",

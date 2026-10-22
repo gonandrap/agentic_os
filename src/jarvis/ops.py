@@ -62,6 +62,7 @@ from .daemon import (
 from .github import GitHubError
 from .invariants import PR_CLOSED_BLOCKER, UNLANDED_BLOCKER, true_blockers
 from .paths import daemon_pidfile, ensure_home, logs_dir
+from .worker_brief import MODEL_ATTRIBUTION_NAMES
 # `ops.IDLE_MANAGER_CAUSE` is an ALIAS: `stuck.IDLE_MANAGER_CAUSE` is the one definition of the cause... (#1008)
 from .stuck import IDLE_MANAGER_CAUSE  # noqa: F401
 from .project_store import (
@@ -761,6 +762,35 @@ def registered_project_paths() -> dict[str, Path]:
         central.close()
 
 
+MODEL_ALIASES = ("opus", "sonnet", "haiku", "fable")
+_MODEL_ID_RE = re.compile(r"(?:opus|sonnet|haiku|fable"
+                          r"|claude-(?:opus|sonnet|haiku|fable)-\d+(?:-\d+)*(?:-\d{8})?)"
+                          r"(?:\[1m\])?")
+
+
+def suggested_model_ids() -> list[str]:
+    """What the create forms offer: the aliases, then every id the OS knows by name"""
+    return [*MODEL_ALIASES, *MODEL_ATTRIBUTION_NAMES]
+
+
+def _model_shaped(model: str) -> bool:
+    return bool(_MODEL_ID_RE.fullmatch(model)) or model in MODEL_ATTRIBUTION_NAMES
+
+
+def check_model_id(model: str | None) -> None:
+    """Refuse a model id claude would reject, before anything is filed or relaunched"""
+    import difflib
+
+    if not model or _model_shaped(model):
+        return
+    dashed = model.replace(".", "-")
+    hint = ([dashed] if _model_shaped(dashed)
+            else difflib.get_close_matches(model, suggested_model_ids(), n=1))
+    raise OpsError(f"unknown model id {model!r}"
+                   + (f" — did you mean {hint[0]!r}?" if hint
+                      else f" — use one of {', '.join(MODEL_ALIASES)} or a full claude-… id"))
+
+
 def create_work_order(project_name: str, title: str, description: str = "",
                       origin: str = "jarvis", model: str | None = None,
                       effort: str | None = None, permission_mode: str | None = None,
@@ -781,6 +811,7 @@ def create_work_order(project_name: str, title: str, description: str = "",
     """File a work order (docs/superpowers/specs/2026-09-27-self-evolution.md)"""
     from . import preconditions
 
+    check_model_id(model)
     paths = registered_project_paths()
     if project_name not in paths:
         raise OpsError(f"project {project_name!r} not registered "
@@ -1162,8 +1193,9 @@ def harvest_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | N
 
 
 def retry(wo_id: str, message: str | None = None, project_name: str | None = None,
-          relay: bool = False) -> dict[str, Any]:
+          relay: bool = False, model: str | None = None) -> dict[str, Any]:
     """`jarvis wo retry` — relaunch a `failed` work order in its own session (docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md)"""
+    check_model_id(model)
     name, path, wo = find_work_order(wo_id, project_name)
     refusal = retry_refusal(wo)
     if refusal is not None:
@@ -1171,6 +1203,9 @@ def retry(wo_id: str, message: str | None = None, project_name: str | None = Non
     # §6 of docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md: what the OS read off disk beats...
     brief_store = ProjectStore(path)
     try:
+        if model:
+            # Before the send: the relaunch reads `model` off the row
+            brief_store.update_work_order(wo_id, model=model)
         text = (message if message is not None
                 else (harvest.retry_brief(brief_store, wo) or RETRY_NOTE))
     finally:
