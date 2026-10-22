@@ -470,6 +470,9 @@ DEFAULT_UI_HEALTH_RESTART_COOLDOWN_SECONDS = 300
 #: Self-restarts allowed in a rolling 24h
 DEFAULT_UI_HEALTH_MAX_RESTARTS_PER_DAY = 3
 
+#: An unreachable dashboard this recently (re)started is still booting, not wedged
+DEFAULT_UI_HEALTH_BOOT_GRACE_SECONDS = 60
+
 
 @dataclass
 class UiHealthConfig:
@@ -482,6 +485,7 @@ class UiHealthConfig:
     healthz_timeout_seconds: int = DEFAULT_UI_HEALTH_HEALTHZ_TIMEOUT_SECONDS
     restart_cooldown_seconds: int = DEFAULT_UI_HEALTH_RESTART_COOLDOWN_SECONDS
     max_restarts_per_day: int = DEFAULT_UI_HEALTH_MAX_RESTARTS_PER_DAY
+    boot_grace_seconds: int = DEFAULT_UI_HEALTH_BOOT_GRACE_SECONDS
 
 
 # -- `fleet_health`: when an order that has stopped moving gets investigated. §4 of
@@ -1485,6 +1489,8 @@ def _parse_ui_health(raw: Any, base: UiHealthConfig | None = None,
                                              base.restart_cooldown_seconds)),
         max_restarts_per_day=int(raw.get("max_restarts_per_day",
                                          base.max_restarts_per_day)),
+        boot_grace_seconds=int(raw.get("boot_grace_seconds",
+                                       base.boot_grace_seconds)),
     )
     for name, value in vars(cfg).items():
         if name != "enabled" and value < 1:

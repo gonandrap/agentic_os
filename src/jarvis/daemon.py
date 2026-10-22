@@ -85,6 +85,26 @@ def _limiter_line(figures: dict[str, Any]) -> str:
             f"{figures.get('waiting', '?')} waiting")
 
 
+def _existing(path: Path) -> str:
+    """A file the OS can cite, or `""` — a path is not evidence that it was written"""
+    try:
+        return str(path) if path.exists() else ""
+    except OSError:
+        return ""
+
+
+def _wedge_evidence(figures: dict[str, Any], dump: str) -> str:
+    """What the inbox item may claim: only a dump and stamp that EXIST (issue #1189)"""
+    from . import uilog
+
+    lines = [f"Limiter: {_limiter_line(figures)}",
+             f"Stacks: {dump or 'none — no stack dump was written'}"]
+    stamp = _existing(uilog.wedge_stamp_path())
+    if stamp:
+        lines.append(f"Stamp: {stamp}")
+    return "\n".join(lines)
+
+
 RECONCILE_EVERY_TICKS = 6  # refresh `claude agents --json` every N ticks (injected only)
 
 #: Reconcile stamp an outside reader judges liveness by; spec 2026-10-16 §2a
@@ -1530,11 +1550,19 @@ class Daemon:
         # Deliberately stopped, not wedged
         if not systemd_units.unit_active(release.UI_UNIT):
             return "down"
+        # Still booting after a release restart, not wedged (issue #1189)
+        if body is None:
+            age = systemd_units.uptime_seconds(release.UI_UNIT)
+            if age is not None and age < cfg.boot_grace_seconds:
+                log.info("dashboard not answering %.1fs after %s started — booting, "
+                         "not wedged", age, release.UI_UNIT)
+                return "booting"
         if not (self.central.get_state(UI_HEALTHZ_OK_AT) or "").strip():
             return "unseen"
 
         figures = (body or {}).get("limiter") or {}
-        dump = (body or {}).get("stack_dump") or str(uilog.stack_dump_path())
+        dump = (body or {}).get("stack_dump") or _existing(uilog.stack_dump_path())
+        evidence = _wedge_evidence(figures, dump)
         restarts = [t for t in self._ui_restarts() if now - t < 24 * 3600]
         if restarts and now - max(restarts) < cfg.restart_cooldown_seconds:
             # Stops a restart loop against a dashboard that wedges on boot
@@ -1552,9 +1580,7 @@ class Daemon:
                           f"{cfg.max_restarts_per_day}). It will NOT be restarted again "
                           f"until that window rolls — a fourth wedge in a day is a "
                           f"different, worse fault than the one a restart fixes.\n"
-                          f"Limiter: {_limiter_line(figures)}\n"
-                          f"Stacks: {dump}\n"
-                          f"Stamp: {uilog.wedge_stamp_path()}"),
+                          f"{evidence}"),
                 )
             return "capped"
 
@@ -1569,9 +1595,6 @@ class Daemon:
         self.central.set_state(UI_WEDGE_RESTARTS,
                                db.to_json([round(t, 3) for t in restarts]))
         self.central.set_state(UI_WEDGE_CAPPED_AT, "")
-        evidence = (f"Limiter: {_limiter_line(figures)}\n"
-                    f"Stacks: {dump}\n"
-                    f"Stamp: {uilog.wedge_stamp_path()}")
         if error:
             self.central.add_inbox(
                 project="os", level="critical",
@@ -1591,10 +1614,13 @@ class Daemon:
             project="os", level="warning",
             title=f"the dashboard was wedged — restarted {release.UI_UNIT}",
             body=(f"Every routed page had stopped answering while the process stayed "
-                  f"`active (running)`. The dashboard dumped every thread's Python "
-                  f"stack before the restart; that dump is the only evidence of what "
-                  f"held the threadpool.\n"
-                  f"{evidence}"),
+                  f"`active (running)`.\n"
+                  + ("The dashboard dumped every thread's Python stack before the "
+                     "restart; that dump is the only evidence of what held the "
+                     "threadpool.\n" if dump else
+                     "The dashboard wrote NO stack dump, so nothing says what held "
+                     "it — it never answered at all.\n")
+                  + evidence),
         )
         log.warning("dashboard wedged: restarted %s (%d in 24h)",
                     release.UI_UNIT, len(restarts))
