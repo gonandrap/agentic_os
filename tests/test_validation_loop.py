@@ -1,5 +1,6 @@
 """The work-order round machine: `finish` opens a round"""
 
+# clock-exempt: class 3 — spin-waits on the validation daemon thread, and real elapsed to bound one round
 from __future__ import annotations
 
 import json

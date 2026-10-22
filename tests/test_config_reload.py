@@ -58,6 +58,7 @@ def edit(path: Path, **os_keys) -> None:
 
 
 def _rewrite(path: Path, document: dict) -> None:
+    # clock-exempt: class 4 — forges a future mtime for the real stat() the daemon's catalog reload makes
     time.sleep(0.01)
     path.write_text(json.dumps(document, indent=2))
     os.utime(path, (time.time() + 1, time.time() + 1))
@@ -144,6 +145,7 @@ def test_the_catalog_is_stable_for_one_whole_tick(daemon, catalog_file):
 def test_a_broken_catalog_keeps_the_last_good_one_and_warns_exactly_once(
         daemon, catalog_file):
     """One bad file must not take down every project in the fleet"""
+    # clock-exempt: class 4 — the kernel's own mtime on the broken catalog must outrun the daemon's stamp
     time.sleep(0.01)
     catalog_file.write_text("{ this is not json")
 
@@ -158,6 +160,7 @@ def test_a_broken_catalog_keeps_the_last_good_one_and_warns_exactly_once(
 
 
 def test_a_repaired_catalog_reloads_and_re_arms_the_warning(daemon, catalog_file):
+    # clock-exempt: class 4 — os.utime forges the repaired catalog's mtime for a real stat()
     time.sleep(0.01)
     catalog_file.write_text("{ this is not json")
     daemon.tick()
@@ -198,6 +201,7 @@ def test_a_removed_project_is_refused_too(jarvis_home, tmp_path):
     daemon = Daemon(load_catalog(path))
 
     write_catalog(path, project, projects=["proj_a"])
+    # clock-exempt: class 4 — os.utime forges the mtime that makes the removed-project catalog look newer
     os.utime(path, (time.time() + 1, time.time() + 1))
     daemon.tick()
 
@@ -403,6 +407,7 @@ def _run_one(daemon: Daemon, project: Path, title: str) -> dict:
     daemon.tick()
     store = ProjectStore(project)
     try:
+        # clock-exempt: class 3 — spin-waits for a real worker subprocess's turn to leave running
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             list(worker_session.poll(store))
