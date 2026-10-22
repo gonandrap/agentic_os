@@ -36,7 +36,6 @@ ALLOWED: dict[str, str] = {
     "tests/test_release_staging.py": _BACKDATED,
     "tests/test_remedies.py": _SPIN,
     "tests/test_rules_tick.py": _SPIN,
-    "tests/test_scheduler.py": _BACKDATED,
     "tests/test_seats.py": _SPIN,
     "tests/test_supervisor.py": _SPIN,
     "tests/test_transport_resilience.py": _BACKDATED,

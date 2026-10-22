@@ -27,6 +27,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 from .bootstrap import BootstrapReport, bootstrap_project, settings_drift
 from .catalog import (
+    DEFAULT_STAKES_CLASSIFIER,
     DEFAULT_VALIDATION_FOLLOW_UP_CAP,
     SAFETY_KEYS,
     Catalog,
@@ -6003,7 +6004,7 @@ def review_work_order(wo_id: str, accept: bool = True, feedback: str = "",
     """Accept (or reject) all pending assumptions and settle the work order"""
     name, path, wo = find_work_order(wo_id)
     cfg = validation_config(name)
-    net = str(getattr(cfg, "stakes_classifier", "regex") or "regex")
+    net = str(getattr(cfg, "stakes_classifier", "") or DEFAULT_STAKES_CLASSIFIER)
     store = ProjectStore(path)
     try:
         pending = [a for a in store.all_assumptions(wo_id) if a["status"] == "pending"]

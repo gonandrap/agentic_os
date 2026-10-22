@@ -612,3 +612,13 @@ that let a prompt and a model be scored against the shipped net on real rows, an
 would let a BETTER prompt or a better model be scored later without repeating this
 archaeology. It costs nothing while nobody opts in (`regex` makes no call and writes no row),
 and §6.1's poisoning defences are the part of it that took the longest to get right.
+
+## 8. Amendment 2026-10-21: `regex-tightened` is the default
+
+The user decided io-51469add/wide-stakes-net-off: the measured winner of §7 becomes the
+fleet default (`catalog.DEFAULT_STAKES_CLASSIFIER`), so a project adopted later inherits
+it instead of the net measured at precision 0.140. `regex` stays selectable per project;
+`classifier` stays shipped-but-off. The `production`/`prod` row is unchanged. The cited
+numbers are §6-§7's (2026-09-25): the labelled production corpus was a temp file and
+never in this public repo, so it was not re-scored today. Tests that pin the wide net's
+wording or its 'migration' class now name `regex` explicitly rather than lean on the default.
