@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import logging
-import time
 from typing import Any
 
-from . import claude_cli, health, holds, structured
+from . import claude_cli, db, health, holds, structured
 from .project_store import WORKER_CHILDREN
 
 log = logging.getLogger("supervisor")
@@ -804,7 +803,7 @@ def review_health(pstore: Any, neo_store: Any, project: str, subject: dict[str, 
         # BEFORE the generic outage below (#235)
         from .worker_session import RATE_LIMIT_FALLBACK_DELAY
 
-        reopens = exc.limit.reset_at or (time.time() + RATE_LIMIT_FALLBACK_DELAY)
+        reopens = exc.limit.reset_at or (db.now() + RATE_LIMIT_FALLBACK_DELAY)
         pstore.record_health_review(kind, subject_id, fingerprint=fingerprint,
                                     trigger=trigger, outcome="held",
                                     detail=_clip(exc.limit.message, cfg.reason_chars),

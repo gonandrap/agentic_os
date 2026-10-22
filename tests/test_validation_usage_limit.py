@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from jarvis import claude_cli, fleet as fleet_mod, ops, seats, validation
+from jarvis import claude_cli, db, fleet as fleet_mod, ops, seats, validation
 from jarvis.claude_cli import UsageLimit, UsageLimitError
 from jarvis.invariants import status_label, true_blockers
 from jarvis.project_store import validation_hold_until
@@ -20,7 +20,7 @@ REFUSAL = "You've hit your session limit · resets 11:50pm (America/Los_Angeles)
 
 def refused(in_seconds: float) -> UsageLimitError:
     return UsageLimitError(UsageLimit(message=REFUSAL,
-                                      reset_at=time.time() + in_seconds))
+                                      reset_at=db.now() + in_seconds))
 
 
 def _rounds(store, wo_id):
@@ -237,7 +237,7 @@ def test_a_shut_window_stops_the_tick_before_the_first_seat_is_called(fleet):
     finish(fleet, wo["id"])
 
     outage = fleet_mod.Outage(project="proj_a", wo_id=wo["id"],
-                              reopens_at=time.time() + 3600, message=REFUSAL)
+                              reopens_at=db.now() + 3600, message=REFUSAL)
     store = fleet.store()
     try:
         fleet.daemon.validation_tick(
@@ -324,7 +324,7 @@ def test_decide_raises_rather_than_escalating_when_the_window_refused_every_seat
     """The seam between the panel and the round machine: `decide` has to hand it an exception it can... (#235)"""
     monkeypatch.setattr(seats, "run_blind", lambda prompts, **kw: [
         seats.Opinion(seat=s, raw=REFUSAL, status="abstained", replied=False,
-                      refused=UsageLimit(message=REFUSAL, reset_at=time.time() + 60))
+                      refused=UsageLimit(message=REFUSAL, reset_at=db.now() + 60))
         for s in prompts])
     monkeypatch.setattr(seats, "prime_cache", lambda *a, **k: None)
     monkeypatch.setattr(validation, "build_shared_prefix", lambda *a, **k: "prefix")

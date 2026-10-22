@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from jarvis import db, ops, rules
+from jarvis import ops, rules
 from jarvis.catalog import (
     DEFAULT_EVOLUTION_MIN_SAMPLES,
     Catalog,
@@ -13,12 +13,13 @@ from jarvis.catalog import (
     ProjectSpec,
 )
 from jarvis.central_store import CentralStore
+from jarvis.testing import TEST_EPOCH
 
 COND = {"all": [{"field": "status", "op": "eq", "value": "needs_review"},
                 {"field": "seconds_in_status", "op": "gte", "value": 3600}]}
 
 #: A Thursday, so the ISO-week Monday the bucketer resolves is unambiguous and a test that walks back...
-NOW = 1_760_000_000.0            # 2025-10-09T07:33:20Z
+NOW = TEST_EPOCH                 # 2025-10-09T07:33:20Z
 DAY = 86400.0
 WEEK = 7 * DAY
 
@@ -34,25 +35,16 @@ def store(jarvis_home):
     s.close()
 
 
-@pytest.fixture()
-def clock(monkeypatch):
-    """A movable `db.now`, which is the ONLY sanctioned way to backdate a fire"""
-    holder = {"t": NOW}
-    monkeypatch.setattr(db, "now", lambda: holder["t"])
-    return holder
-
-
 def _fire(store, clock, detector_id, *, order_id, outcome=rules.APPLIED,
           mode=rules.ARMED, at=NOW, cleared_after=None, project="proj_a"):
-    """One fire, backdated through the clock"""
-    clock["t"] = at
-    row = store.record_rule_fire(detector_id=detector_id, project=project,
-                                 order_id=order_id, order_kind="work_order",
-                                 fingerprint=f"fp-{order_id}", mode=mode,
-                                 outcome=outcome)
-    if cleared_after is not None:
-        row = store.close_rule_fire(row["id"], now=float(row["ts"]) + cleared_after)
-    clock["t"] = NOW
+    """One fire, backdated through the shared clock, which restores the instant on a raise"""
+    with clock.moved(at - NOW):
+        row = store.record_rule_fire(detector_id=detector_id, project=project,
+                                     order_id=order_id, order_kind="work_order",
+                                     fingerprint=f"fp-{order_id}", mode=mode,
+                                     outcome=outcome)
+        if cleared_after is not None:
+            row = store.close_rule_fire(row["id"], now=float(row["ts"]) + cleared_after)
     return row
 
 
