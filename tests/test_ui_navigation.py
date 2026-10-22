@@ -1,4 +1,4 @@
-"""Moving through the console — `/go/<id>`, an order's own nav, its prompts, and holds that link to what held them (docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md)"""
+"""Moving through the console — `/go/<id>` (docs/superpowers/specs/2026-10-22-a-console-you-can-move-through.md)"""
 
 from __future__ import annotations
 
