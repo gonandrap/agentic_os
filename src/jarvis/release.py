@@ -29,6 +29,9 @@ BATCH_KEY = "release_for_issues"
 #: Said once per BROKEN COMMIT when a release that delivered no release is re-parked to wait for the...
 RED_DEFER_EVENT = "release_deferred_red_base"
 
+#: Said when a release order finished having cut NO release, on any base (issue #1206)
+NOTHING_SHIPPED_EVENT = "release_shipped_nothing"
+
 #: Said ONCE PER EPISODE when that wait runs past `Daemon.RED_PARK_AFTER_SECONDS` and the release asks...
 RED_PARK_EVENT = "release_park_red_base"
 

@@ -118,7 +118,9 @@ so and stop. Dropping or changing `--base` after approval invalidates the grant:
 approved string names the commit.
 
 `--stage` performs every step **except** the service restarts and the Telegram notify,
-then writes `$JARVIS_HOME/run/pending_release.json`. From there the OS finishes the
+then writes `$PRODUCTION_CODE/state/run/pending_release.json` — the production daemon's
+own `JARVIS_HOME`, so run the command bare: an env prefix would void the gate's grant and
+is not needed (issue #1206). From there the OS finishes the
 job itself: the daemon restarts the services only after your work order's turn has
 settled (so finish the work order promptly after staging), verifies the release on its
 next boot (version on disk + fresh start timestamps on both units), settles the work
