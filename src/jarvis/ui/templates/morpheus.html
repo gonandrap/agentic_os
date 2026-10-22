@@ -6,6 +6,29 @@
 {% set tone = {"queued": "tone-active", "monitoring": "tone-active", "validated": "tone-ok",
                "failed": "tone-bad", "timedout": "tone-warn"} %}
 
+{# A long script or output opens in a modal: expanded in its cell it stretched the table. #}
+{% macro peek(id, label, heading, text) -%}
+<button type="button" class="peek" data-peek="{{ id }}">{{ label }}</button>
+<dialog id="{{ id }}" class="peek-modal" aria-label="{{ heading }}">
+  <div class="peek-head"><span class="mono">{{ heading }}</span>
+    <form method="dialog"><button aria-label="close">✕</button></form></div>
+  <pre class="request-text">{{ text }}</pre>
+</dialog>
+{%- endmacro %}
+<style>
+  .peek { background: var(--raised); color: var(--ink-2); border: 1px solid var(--line);
+          border-radius: 6px; padding: 2px 9px; font: 12px var(--mono); cursor: pointer; }
+  .peek:hover { color: var(--ink); border-color: var(--ink-3); }
+  .peek-modal { width: min(900px, calc(100vw - 32px)); max-height: calc(100vh - 64px);
+                background: var(--surface); color: var(--ink); border: 1px solid var(--line);
+                border-radius: 8px; padding: 14px 16px; }
+  .peek-modal::backdrop { background: rgb(0 0 0 / 0.6); }
+  .peek-modal .request-text { max-height: calc(100vh - 160px); margin: 0; }
+  .peek-head { display: flex; justify-content: space-between; align-items: center;
+               gap: 12px; margin-bottom: 10px; color: var(--ink-2); font-size: 13px; }
+  .peek-head form { margin: 0; }
+</style>
+
 <p class="kv" style="margin-top:18px">
   Every PR that reached production, in every project, watched until its check exits 0.
   Morpheus only runs the check and reads the exit code; a PR that fails or times out is
@@ -47,10 +70,10 @@
       <td class="mono">{{ i.project or "—" }}</td>
       <td class="mono" style="white-space:nowrap"><a href="{{ i.pr_url }}" title="{{ i.pr_title }}">#{{ i.pr_number }}</a></td>
       <td class="mono {{ tone[i.state] }}">{{ i.state }}</td>
-      <td class="mono">{% if i.script %}<details><summary>{{ i.script_source }}</summary><pre>{{ i.script }}</pre></details>{% else %}—{% endif %}</td>
+      <td class="mono">{% if i.script %}{{ peek(i.id ~ "-check", i.script_source, "check · " ~ i.id ~ " · #" ~ i.pr_number, i.script) }}{% else %}—{% endif %}</td>
       <td class="mono">{{ i.checks }}{% if i.last_exit is not none %} · exit {{ i.last_exit }}{% endif %}</td>
       <td class="mono" style="white-space:nowrap">{{ fmt_ts(i.deadline_ts) }}</td>
-      <td class="mono">{% if i.last_output %}<details><summary>tail</summary><pre>{{ i.last_output }}</pre></details>{% else %}—{% endif %}</td>
+      <td class="mono">{% if i.last_output %}{{ peek(i.id ~ "-tail", "tail", "output · " ~ i.id ~ " · #" ~ i.pr_number, i.last_output) }}{% else %}—{% endif %}</td>
       <td class="mono" style="word-break:break-all">{{ i.action or "—" }}</td>
     </tr>
     {% else %}
@@ -65,5 +88,15 @@
   <span class="mono">jarvis morpheus requeue &lt;id&gt;</span> ·
   <span class="mono">jarvis morpheus pause|unpause --reason "…"</span> ·
   <span class="mono">jarvis morpheus follow-fleet</span></p>
+
+<script>
+document.querySelectorAll('[data-peek]').forEach(function (b) {
+  b.addEventListener('click', function () { document.getElementById(b.dataset.peek).showModal(); });
+});
+// A click on the backdrop lands on the dialog itself, never on its content.
+document.querySelectorAll('.peek-modal').forEach(function (d) {
+  d.addEventListener('click', function (e) { if (e.target === d) d.close(); });
+});
+</script>
 
 {% endblock %}
