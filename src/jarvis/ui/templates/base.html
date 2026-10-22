@@ -396,6 +396,7 @@
       <a href="/config" class="{{ 'here' if active == 'config' }}">config</a>
       <a href="/cost" class="{{ 'here' if active == 'cost' }}">cost</a>
       <a href="/evolution" class="{{ 'here' if active == 'evolution' }}">evolution</a>
+      <a href="/steward" class="{{ 'here' if active == 'steward' }}">steward</a>
     </nav>
   </div>
   {% if nav_projects %}
@@ -492,7 +493,7 @@
       <span class="kbd">n</span> neo, <span class="kbd">g</span> gates, <span class="kbd">a</span> alarms,
       <span class="kbd">s</span> stuck, <span class="kbd">m</span> morpheus, <span class="kbd">b</span> backlog,
       <span class="kbd">k</span> knowledge, <span class="kbd">c</span> config, <span class="kbd">$</span> cost,
-      <span class="kbd">e</span> evolution · <span class="kbd">[</span> <span class="kbd">]</span> previous / next section
+      <span class="kbd">e</span> evolution, <span class="kbd">w</span> steward · <span class="kbd">[</span> <span class="kbd">]</span> previous / next section
     </div>
   </div>
 </div>
@@ -769,7 +770,8 @@
 
   // 7. Shortcuts — never while typing (assumption 8).
   var G = { d: '/', i: '/inbox', n: '/neo', g: '/gates', a: '/alarms', s: '/stuck', m: '/morpheus',
-            b: '/backlog', k: '/knowledge', c: '/config', $: '/cost', e: '/evolution' };
+            b: '/backlog', k: '/knowledge', c: '/config', $: '/cost', e: '/evolution',
+            w: '/steward' };
   var pendingG = 0;
   function typing(el) {
     return el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable);

@@ -36,7 +36,7 @@
 #   scripts/shipit.sh --stage <ver> --wo <wo-id> --base <sha>
 #                                     # SELF-SHIP mode: everything above EXCEPT the
 #                                     # service restarts and the Telegram notify.
-#                                     # Writes $JARVIS_HOME/run/pending_release.json;
+#                                     # Writes $PRODUCTION_CODE/state/run/pending_release.json;
 #                                     # the daemon performs the restarts once the
 #                                     # shipping worker's turn has settled, and
 #                                     # verifies the release on its next boot
@@ -48,7 +48,9 @@
 #
 # Env:
 #   PRODUCTION_CODE   production root (default: ~/workspace/production)
-#   JARVIS_HOME       state root for the --stage marker (default: ~/.jarvis)
+#                     the --stage marker goes under its `state/`, the production
+#                     daemon's JARVIS_HOME (deploy/jarvis.service.template), NOT under
+#                     whatever JARVIS_HOME this shell happens to carry (issue #1206)
 set -euo pipefail
 
 DRY_RUN=0
@@ -472,7 +474,11 @@ run "JARVIS_HOME='$PROD_ROOT/state' '$PROD_DIR/.venv/bin/jarvis' morpheus enqueu
 # settled, verifies the release on its next boot (pyproject version on disk +
 # ExecMainStartTimestamp on BOTH units), settles the work order, and notifies.
 if [ "$STAGE" = 1 ]; then
-  JARVIS_HOME_DIR="${JARVIS_HOME:-$HOME/.jarvis}"
+  # The PRODUCTION daemon reads this marker from its own JARVIS_HOME, which the units pin
+  # to $PROD_ROOT/state — so the marker is written there and never to the ambient
+  # JARVIS_HOME: a worker shell without it staged into ~/.jarvis and nothing ever
+  # restarted, while adding an env prefix voids the release gate's grant (issue #1206).
+  JARVIS_HOME_DIR="$PROD_ROOT/state"
   MARKER="$JARVIS_HOME_DIR/run/pending_release.json"
   say "staging: writing release marker $MARKER"
   if [ "$DRY_RUN" = 1 ]; then

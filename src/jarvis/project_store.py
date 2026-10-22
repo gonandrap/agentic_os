@@ -2112,6 +2112,18 @@ class ProjectStore:
         self.update_work_order(wo_id, needs_attention=1, attention_reason=reason)
         self.add_event(wo_id, "attention", {"reason": reason})
 
+    def flag_attention_while(self, wo_id: str, reason: str, status: str) -> bool:
+        """Flag only while the order is STILL in the status the caller derived from (#1205)"""
+        with db.write_transaction(self.conn):
+            cur = self.conn.execute(
+                "UPDATE work_orders SET needs_attention=1, attention_reason=?, "
+                "updated_at=? WHERE id=? AND status=?",
+                (reason, db.now(), wo_id, status))
+            if not cur.rowcount:
+                return False
+            self.add_event(wo_id, "attention", {"reason": reason})
+        return True
+
     def clear_attention(self, wo_id: str) -> None:
         # The blocker is gone, so any ack against it is spent: if the same reason comes back later it is a...
         self.update_work_order(wo_id, needs_attention=0, attention_reason=None,
@@ -3666,6 +3678,22 @@ class ProjectStore:
             "UPDATE validation_rounds SET outcome=?, reason=?, hold_cause=? WHERE id=?",
             (outcome, reason, hold_cause, round_id),
         )
+
+    def settle_validation_round(self, round_id: int, outcome: str,
+                                payload: dict[str, Any] | None = None, *,
+                                wo_id: str = "", fo_id: str = "", reason: str = "",
+                                hold_cause: str | None = None,
+                                kind: str = "") -> bool:
+        """Settle a round: the outcome and its timeline event in ONE commit (#1203)"""
+        unit = wo_id
+        if fo_id:
+            manager = self.manager_work_order(fo_id)
+            unit = str(manager["id"]) if manager else ""
+        with db.write_transaction(self.conn):
+            self.close_validation_round(round_id, outcome, reason, hold_cause)
+            if unit:
+                self.add_event(unit, kind or f"validation_{outcome}", payload or {})
+        return bool(unit)
 
     def set_validation_head(self, round_id: int, head_sha: str) -> None:
         """Record which commit this round is judging"""

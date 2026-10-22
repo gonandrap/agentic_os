@@ -105,7 +105,8 @@ invalidates the grant: the approved string names the commit.
 This performs every release step — preconditions, release branch, bump + tag, push,
 deploy of the tag to `$PRODUCTION_CODE/jarvis_os`, `uv sync` — **except** the service
 restarts and the Telegram notify, then writes a marker file
-`$JARVIS_HOME/run/pending_release.json`:
+`$PRODUCTION_CODE/state/run/pending_release.json` — the production daemon's own
+`JARVIS_HOME`, never the shell's, which a worker may not carry (issue #1206):
 
 ```json
 {"wo_id": "wo-abc12345", "project": "jarvis_os", "version": "1.4.0",

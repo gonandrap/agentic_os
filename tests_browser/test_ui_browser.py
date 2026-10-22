@@ -21,7 +21,8 @@ def test_nav_walk_all_tabs(page, server):
     page.goto(server)
     for label, path in [("neo", "/neo"), ("gates", "/gates"), ("alarms", "/alarms"),
                         ("inbox", "/inbox"), ("backlog", "/backlog"),
-                        ("knowledge", "/knowledge"), ("dashboard", "/")]:
+                        ("knowledge", "/knowledge"), ("steward", "/steward"),
+                        ("dashboard", "/")]:
         page.click(f"nav >> text={label}")
         assert page.url.rstrip("/").endswith(path.rstrip("/")) or path == "/"
         assert page.locator("nav a.here").inner_text().startswith(label)

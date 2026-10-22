@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from functools import lru_cache
 from typing import Any, Callable, Mapping
@@ -402,7 +402,8 @@ def _title_from(argument: str) -> str:
 
 def _apply_file_work_order(pstore: Any, central: Any, project: str,
                            subject: dict[str, Any], intent: Intent, *,
-                           params: dict[str, Any] | None = None) -> str:
+                           params: dict[str, Any] | None = None,
+                           decided: Any = None) -> str:
     """File the fix, then the order that ships it, joined by a dependency edge"""
     from . import ops
 
@@ -413,15 +414,18 @@ def _apply_file_work_order(pstore: Any, central: Any, project: str,
     origin = intent.alarm_id or intent.subject_id
     if not argument:
         raise RemedyRefused(NO_ARGUMENT.format(origin=origin))
-    decision = None
-    if intent.alarm_id is not None:
+    # `decided`: a queued remedy the steward has since re-offered (`reoffer_file_work_order`)
+    decision = decided
+    if intent.alarm_id is not None and decision is None:
         # An alarm-born fix is work nobody typed: the steward's call (spec 2026-10-21 §3.2)
         from .ops import resolve_catalog
 
         switch = self_dispatch_configured()
+        # The grant's one use is spent by now, so nothing re-asks: a `queue` waits for `drain`
         decision = steward.gate(
             steward.Candidate("remedy", "major", project, _title_from(argument),
-                              evidence=(f"alarm {intent.alarm_id}",)),
+                              evidence=(f"alarm {intent.alarm_id}",),
+                              payload=asdict(intent)),
             catalog=resolve_catalog(), self_dispatch=switch)
         if not switch:
             raise RemedyRefused(SELF_DISPATCH_OFF.format(origin=origin))
@@ -460,6 +464,36 @@ def _apply_file_work_order(pstore: Any, central: Any, project: str,
                 f"\"…\" --depends-on {fix['id']}`")
     return (f"filed {fix['id']} to fix the root cause, and {ship['id']} to ship it "
             f"(blocked until {fix['id']} completes; the release itself is still gated)")
+
+
+def reoffer_file_work_order(row: Mapping[str, Any], candidate: Any,
+                            decision: Any) -> str:
+    """File a queued alarm-born fix the steward now has room for (`steward.drain`)"""
+    from . import db, ops
+    from .project_store import ProjectStore
+
+    held = candidate.payload or {}
+    intent = Intent(**{k: held[k] for k in Intent.__dataclass_fields__ if k in held})
+    if not intent.argument:
+        raise RemedyRefused(NO_ARGUMENT.format(origin=intent.alarm_id or row["id"]))
+    paths = ops.registered_project_paths()
+    if candidate.project not in paths:
+        raise RemedyRefused(f"project {candidate.project!r} is not registered")
+    pstore = ProjectStore(paths[candidate.project])
+    try:
+        # The handler acts, as for an approved grant; the steward has already decided
+        result = _apply_file_work_order(pstore, None, candidate.project, {}, intent,
+                                        decided=decision)
+        if intent.alarm_id:
+            # What `apply` does on success; the spent grant stops being re-collected too
+            pstore.update_alarm(intent.alarm_id, status="acked", decided_at=db.now())
+            pstore.add_event(intent.carrier_id or intent.subject_id, "remedy_applied", {
+                "alarm_id": intent.alarm_id, "remedy": intent.remedy,
+                "steward_decision_id": int(row["id"]), "result": result})
+    finally:
+        pstore.close()
+    fix = re.search(r"\bwo-[0-9a-f]+", result)
+    return fix.group(0) if fix else ""
 
 
 # -- §4's six: the acts a rule may name, each WRAPPING an existing call
