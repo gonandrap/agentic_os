@@ -254,6 +254,12 @@ PANEL_DUPES = [
 ]
 
 
+#: One defect in three wordings, least to most severe: each is a restatement of the first
+EDGE = "a healed error comes back once its success scrolls out of the access tail"
+LOSS = "a healed error comes back and the access tail loses the success"
+EVERY_RUN = "a healed error comes back on every run: the access tail loses each success"
+
+
 def test_the_bucket_is_the_origin_unit_and_the_file(fleet):
     assert steward.dedupe_key(cand(parent_wo_id="wo-1", file="SRC/Jarvis/UiLog.py")) == (
         "proj_a|bug_agent|wo-1|src/jarvis/uilog.py")
@@ -305,7 +311,7 @@ def test_a_dropped_wording_does_not_swallow_a_severer_one(fleet):
                  file="src/jarvis/uilog.py")
     low = steward.gate(cand(severity="minor", subject="a nit", **where),
                        catalog=cat, store=store)
-    high = steward.gate(cand(severity="critical", subject="data loss", **where),
+    high = steward.gate(cand(severity="critical", subject=LOSS, **where),
                         catalog=cat, store=store)
     assert (low.outcome, low.rule) == ("drop", "low-severity")
     assert (high.outcome, high.rule, high.duplicate_of) == ("dispatch", "urgent", 0)
@@ -318,9 +324,9 @@ def test_a_severer_wording_re_decides_the_one_decision_at_its_severity(fleet):
     parent = store.create_work_order("medium first, critical after")
     where = dict(origin_kind="panel", parent_wo_id=parent["id"],
                  file="src/jarvis/uilog.py")
-    first = steward.gate(cand(severity="medium", subject="an edge case", **where),
+    first = steward.gate(cand(severity="medium", subject=EDGE, **where),
                          catalog=cat, store=store)
-    second = steward.gate(cand(severity="critical", subject="data loss", **where),
+    second = steward.gate(cand(severity="critical", subject=LOSS, **where),
                           catalog=cat, store=store)
     assert (first.outcome, first.rule, first.allowed) == ("queue", "recurrence", False)
     assert (second.outcome, second.rule, second.allowed) == ("dispatch", "urgent", True)
@@ -342,9 +348,9 @@ def test_a_lower_wording_after_a_severer_one_stays_a_duplicate(fleet):
     parent = store.create_work_order("critical first, medium after")
     where = dict(origin_kind="panel", parent_wo_id=parent["id"],
                  file="src/jarvis/uilog.py")
-    first = steward.gate(cand(severity="critical", subject="data loss", **where),
+    first = steward.gate(cand(severity="critical", subject=LOSS, **where),
                          catalog=cat, store=store)
-    second = steward.gate(cand(severity="medium", subject="an edge case", **where),
+    second = steward.gate(cand(severity="medium", subject=EDGE, **where),
                           catalog=cat, store=store)
     assert (first.outcome, first.rule) == ("dispatch", "urgent")
     assert (second.outcome, second.rule, second.duplicate_of) == (
@@ -357,11 +363,11 @@ def test_a_severer_wording_of_a_dispatched_defect_tells_that_order(fleet):
     parent = store.create_work_order("the order the panel reviewed")
     where = dict(origin_kind="panel", parent_wo_id=parent["id"],
                  file="src/jarvis/uilog.py")
-    first = steward.gate(cand(severity="critical", subject="data loss", **where),
+    first = steward.gate(cand(severity="critical", subject=LOSS, **where),
                          catalog=cat, store=store)
     fix = store.create_work_order("fix the data loss")
     steward.linked(first, fix["id"])
-    second = steward.gate(cand(severity="blocker", subject="data loss, every run",
+    second = steward.gate(cand(severity="blocker", subject=EVERY_RUN,
                                **where), catalog=cat, store=store)
     # No second order for a defect already being worked, and the severity is not lost
     assert (second.outcome, second.rule, second.allowed) == (
@@ -380,6 +386,102 @@ def test_a_severer_wording_of_a_dispatched_defect_tells_that_order(fleet):
     assert json.loads(event["payload"])["severity"] == "blocker"
 
 
+def _row(decision_id):
+    central = CentralStore()
+    try:
+        return central.steward_decision(decision_id)
+    finally:
+        central.close()
+
+
+#: Decisions #54 and #55 of 2026-10-22: two DIFFERENT defects one panel found in one file
+UNLINKED = ("steward.gate: the severity_raised event is lost when the prior decision is "
+            "applied but not yet linked")
+OVERWRITE = ("steward.gate: escalation overwrites a different defect's queued decision "
+             "in the same file")
+
+
+def test_same_defect_tells_rewordings_from_a_different_defect():
+    reworded = ("_worsened silently skips the steward_severity_raised event while the "
+                "decision is applied but unlinked")
+    file = "src/jarvis/steward.py"
+    assert steward.same_defect(UNLINKED, reworded, file=file)
+    assert not steward.same_defect(UNLINKED, OVERWRITE, file=file)
+    # Decisions #23-#25's three seats, naming different symbols, are still one defect
+    assert steward.same_defect(PANEL_DUPES[0], PANEL_DUPES[2], file="src/jarvis/uilog.py")
+    assert steward.same_defect(EDGE, EVERY_RUN, file="src/jarvis/uilog.py")
+
+
+def test_a_different_defect_in_the_same_file_is_its_own_decision(fleet):
+    """Decision #55 of 2026-10-22: an escalation rewrote the wrong defect's decision"""
+    make, store = fleet
+    cat = make(mode="enforce")
+    parent = store.create_work_order("the order the panel reviewed")
+    where = dict(origin_kind="panel", parent_wo_id=parent["id"],
+                 file="src/jarvis/steward.py")
+    first = steward.gate(cand(severity="medium", subject=UNLINKED, **where),
+                         catalog=cat, store=store)
+    second = steward.gate(cand(severity="medium", subject=OVERWRITE, **where),
+                          catalog=cat, store=store)
+    assert second.duplicate_of == 0 and second.decision_id != first.decision_id
+    # A severer wording of the SECOND defect re-decides the second, never the first
+    worse = steward.gate(cand(severity="critical", subject=OVERWRITE + ", every time",
+                              **where), catalog=cat, store=store)
+    assert worse.decision_id == second.decision_id and worse.outcome == "dispatch"
+    kept = _row(first.decision_id)
+    assert (kept["severity"], kept["outcome"], kept["subject"]) == ("medium", "queue",
+                                                                    UNLINKED)
+
+
+def test_an_escalated_decision_carries_the_severer_wording(fleet):
+    """Decision #57 of 2026-10-22: the escalated row kept the first wording's subject"""
+    make, store = fleet
+    cat = make(mode="enforce")
+    parent = store.create_work_order("medium first, critical after")
+    where = dict(origin_kind="panel", parent_wo_id=parent["id"],
+                 file="src/jarvis/uilog.py")
+    first = steward.gate(cand(severity="medium", subject=EDGE, **where),
+                         catalog=cat, store=store)
+    steward.gate(cand(severity="critical", subject=LOSS, **where), catalog=cat,
+                 store=store)
+    row = _row(first.decision_id)
+    assert (row["subject"], row["severity"]) == (LOSS, "critical")
+    candidate = json.loads(row["candidate_json"])
+    assert candidate["subject"] == LOSS and candidate["also_worded"] == [EDGE]
+
+
+def test_a_severer_wording_reaches_an_applied_order_once_it_is_linked(fleet):
+    """Decisions #54/#56/#58 of 2026-10-22: dispatched, not yet linked, and the raise was lost"""
+    make, store = fleet
+    cat = make(mode="enforce")
+    central = CentralStore()
+    try:
+        central.upsert_project("proj_a", str(store.project_path))
+    finally:
+        central.close()
+    parent = store.create_work_order("the order the panel reviewed")
+    where = dict(origin_kind="panel", parent_wo_id=parent["id"],
+                 file="src/jarvis/uilog.py")
+    first = steward.gate(cand(severity="critical", subject=LOSS, **where),
+                         catalog=cat, store=store)
+    assert first.allowed
+    # The caller has not created (or linked) its order yet when the severer wording lands
+    second = steward.gate(cand(severity="blocker", subject=EVERY_RUN, **where),
+                          catalog=cat, store=store)
+    assert second.rule == "duplicate-of-dispatched"
+    fix = store.create_work_order("fix the data loss")
+    steward.linked(first, fix["id"])
+    [event] = store.conn.execute(
+        "SELECT * FROM wo_events WHERE wo_id=? AND kind='steward_severity_raised'",
+        (fix["id"],)).fetchall()
+    assert json.loads(event["payload"])["severity"] == "blocker"
+    # Delivered once: a second link does not say it again
+    steward.linked(first, fix["id"])
+    assert len(store.conn.execute(
+        "SELECT * FROM wo_events WHERE wo_id=? AND kind='steward_severity_raised'",
+        (fix["id"],)).fetchall()) == 1
+
+
 def test_a_candidate_that_names_no_code_is_never_deduped(fleet):
     """A red `main` keeps its own rule — the hourly repeat check, not the dedupe bucket"""
     make, store = fleet
@@ -388,6 +490,121 @@ def test_a_candidate_that_names_no_code_is_never_deduped(fleet):
     first = steward.gate(cand(origin_kind="red_main", severity="critical",
                               parent_wo_id=parent["id"]), catalog=cat, store=store)
     assert first.duplicate_of == 0 and first.allowed is True
+
+
+# ---------------------------------------------------------------- the queue (#1181)
+
+
+@pytest.fixture()
+def queue(fleet):
+    """`fleet`, registered (the drain finds stores by the registry), plus a recording dispatcher"""
+    make, store = fleet
+    central = CentralStore()
+    central.upsert_project("proj_a", str(store.project_path))
+    calls = []
+
+    def dispatch(row, c, decision):
+        calls.append((row["id"], c.subject, decision.budget_usd))
+        return ""
+    yield make, store, central, calls, {"worker_io": dispatch, "panel": dispatch}
+    central.close()
+
+
+def _queued(store, cat, subject, severity="major", **kw):
+    parent = store.create_work_order(f"the order behind {subject}")
+    return steward.gate(cand(origin_kind="worker_io", severity=severity, subject=subject,
+                             parent_wo_id=parent["id"], payload={"title": subject}, **kw),
+                        catalog=cat, store=store)
+
+
+def test_a_queue_without_a_way_to_dispatch_it_later_does_not_wait(queue):
+    make, store, central, _calls, _d = queue
+    d = steward.gate(cand(severity="major", refs=0), catalog=make(mode="enforce"),
+                     store=store)
+    assert d.outcome == "queue"
+    assert central.steward_decision(d.decision_id)["queue_state"] == ""
+
+
+def test_the_drain_offers_the_severest_then_the_oldest_up_to_its_limit(queue):
+    make, store, central, calls, dispatchers = queue
+    held = make(mode="enforce", weekly_usd=0)
+    medium = _queued(store, held, "a medium", severity="medium", refs=5)
+    old = _queued(store, held, "an old major")
+    new = _queued(store, held, "a new major")
+    assert {medium.outcome, old.outcome, new.outcome} == {"queue"}
+    roomy = make(mode="enforce", weekly_usd=100, order_budget_usd=10)
+    out = steward.drain(roomy, central, dispatchers=dispatchers, limit=2)
+    assert out == {"waiting": 1, "dispatched": 2, "expired": 0, "failed": 0}
+    assert [c[1] for c in calls] == ["an old major", "a new major"]
+    assert calls[0][2] == 10.0
+    row = central.steward_decision(old.decision_id)
+    assert (row["queue_state"], row["outcome"], row["applied"]) == ("reoffered",
+                                                                    "dispatch", 1)
+    assert central.steward_decision(medium.decision_id)["queue_state"] == "waiting"
+
+
+def test_a_failed_re_offer_stays_queued_for_the_next_pass(queue):
+    make, store, central, _calls, _d = queue
+    d = _queued(store, make(mode="enforce", weekly_usd=0), "a major")
+
+    def boom(row, c, decision):
+        raise RuntimeError("tracker down")
+    out = steward.drain(make(mode="enforce"), central, dispatchers={"worker_io": boom})
+    assert out["failed"] == 1
+    row = central.steward_decision(d.decision_id)
+    assert row["queue_state"] == "waiting" and "tracker down" in row["queue_note"]
+
+
+def test_shadow_and_self_dispatch_off_re_offer_nothing(queue):
+    make, store, central, calls, dispatchers = queue
+    _queued(store, make(mode="enforce", weekly_usd=0), "a major")
+    assert steward.drain(make(), central, dispatchers=dispatchers)["waiting"] == 1
+    off = make(mode="enforce")
+    off.os.autonomy.self_dispatch = False
+    assert steward.drain(off, central, dispatchers=dispatchers)["waiting"] == 1
+    assert calls == []
+
+
+def test_a_queued_defect_dispatched_by_another_decision_expires(queue):
+    make, store, central, calls, dispatchers = queue
+    cat = make(mode="enforce")
+    parent = store.create_work_order("the order the panel reviewed")
+    where = dict(origin_kind="panel", parent_wo_id=parent["id"],
+                 file="src/jarvis/uilog.py")
+    queued = steward.gate(cand(severity="medium", subject=EDGE, payload={"x": 1}, **where),
+                          catalog=cat, store=store)
+    assert central.steward_decision(queued.decision_id)["queue_state"] == "waiting"
+    # Another head for the same defect (as an older bucket could hold) is already dispatched
+    other = central.record_steward_decision({
+        "project": "proj_a", "origin_kind": "panel", "subject": LOSS,
+        "severity": "critical", "outcome": "dispatch", "rule": "urgent", "mode": "enforce",
+        "applied": 1, "dedupe_key": steward.dedupe_key(cand(**where))})
+    assert steward.drain(cat, central, dispatchers=dispatchers)["expired"] == 1
+    assert f"#{other}" in central.steward_decision(queued.decision_id)["queue_note"]
+    assert calls == []
+
+
+def test_decisions_and_the_digest_say_how_many_are_waiting(queue, capsys):
+    from jarvis import cli
+
+    make, store, central, _calls, _d = queue
+    cat = make(mode="enforce", weekly_usd=0)
+    _queued(store, cat, "a major")
+    assert "queued: 1 waiting for room" in steward.render_digest(steward.digest(cat, central))
+    assert cli.main(["steward", "decisions"]) == 0
+    out = capsys.readouterr().out
+    assert "queued: 1 waiting for room" in out and "queue waiting" in out
+
+
+def test_the_daemon_drains_nothing_while_the_fleet_is_paused(monkeypatch):
+    from jarvis import daemon, fleet as fleet_mod
+
+    seen = []
+    monkeypatch.setattr(steward, "drain", lambda *a, **k: seen.append(1) or {})
+    monkeypatch.setattr(fleet_mod, "load_pause", lambda central: object())
+    stub = type("D", (), {"central": None, "catalog": None})()
+    daemon.Daemon.steward_drain(stub)
+    assert seen == []
 
 
 # ---------------------------------------------------------------- the weekly digest
@@ -438,13 +655,13 @@ def test_the_cli_says_which_decision_was_escalated_and_which_was_held(fleet, cap
     parent = store.create_work_order("medium first, critical after")
     where = dict(origin_kind="panel", parent_wo_id=parent["id"],
                  file="src/jarvis/uilog.py")
-    steward.gate(cand(severity="medium", subject="an edge case", **where),
+    steward.gate(cand(severity="medium", subject=EDGE, **where),
                  catalog=cat, store=store)
-    first = steward.gate(cand(severity="critical", subject="data loss", **where),
+    first = steward.gate(cand(severity="critical", subject=LOSS, **where),
                          catalog=cat, store=store)
     fix = store.create_work_order("fix the data loss")
     steward.linked(first, fix["id"])
-    steward.gate(cand(severity="blocker", subject="data loss, every run", **where),
+    steward.gate(cand(severity="blocker", subject=EVERY_RUN, **where),
                  catalog=cat, store=store)
     assert cli.main(["steward", "decisions"]) == 0
     out = capsys.readouterr().out

@@ -497,7 +497,14 @@ CREATE TABLE IF NOT EXISTS steward_decisions (
     -- The mechanical dedupe bucket (`steward.dedupe_key`): origin unit + file, '' for a
     -- candidate that names no code; `duplicate_of` names the decision this one restates.
     dedupe_key TEXT NOT NULL DEFAULT '',
-    duplicate_of INTEGER NOT NULL DEFAULT 0
+    duplicate_of INTEGER NOT NULL DEFAULT 0,
+    -- The whole candidate (`steward.Candidate` plus the wordings folded onto it), so a
+    -- `queue` can be re-offered later (#1181); `queue_state` is '' | waiting | reoffered |
+    -- expired, `queue_note` says why, `queue_ts` when it last changed.
+    candidate_json TEXT NOT NULL DEFAULT '{}',
+    queue_state TEXT NOT NULL DEFAULT '',
+    queue_note TEXT NOT NULL DEFAULT '',
+    queue_ts REAL
 );
 -- Morpheus's queue: one shipped PR being validated in production (docs/superpowers/specs/2026-10-21-morpheus-validates-releases-in-production.md)
 CREATE TABLE IF NOT EXISTS morpheus_items (
@@ -603,6 +610,11 @@ ADDED_COLUMNS = {
         # Dedupe before queue/dispatch (spec §3.2, `steward.dedupe_key`)
         "dedupe_key": "TEXT NOT NULL DEFAULT ''",
         "duplicate_of": "INTEGER NOT NULL DEFAULT 0",
+        # Queued means deferred, not dropped (#1181, `steward.drain`)
+        "candidate_json": "TEXT NOT NULL DEFAULT '{}'",
+        "queue_state": "TEXT NOT NULL DEFAULT ''",
+        "queue_note": "TEXT NOT NULL DEFAULT ''",
+        "queue_ts": "REAL",
     },
 }
 
@@ -610,6 +622,7 @@ ADDED_COLUMNS = {
 POST_MIGRATION_SCHEMA = """
 CREATE INDEX IF NOT EXISTS idx_steward_decisions_dedupe
     ON steward_decisions(dedupe_key, duplicate_of);
+CREATE INDEX IF NOT EXISTS idx_steward_decisions_queue ON steward_decisions(queue_state);
 """
 
 
@@ -691,9 +704,10 @@ class CentralStore:
         """One steward decision (`steward.gate`)"""
         cols = ("project", "origin_kind", "subject", "severity", "claimed_severity",
                 "outcome", "rule", "reason", "mode", "applied", "generation",
-                "parent_wo_id", "wo_id", "budget_usd", "dedupe_key", "duplicate_of")
+                "parent_wo_id", "wo_id", "budget_usd", "dedupe_key", "duplicate_of",
+                "candidate_json", "queue_state")
         blank: dict[str, Any] = {"applied": 0, "generation": 0, "budget_usd": None,
-                                 "duplicate_of": 0}
+                                 "duplicate_of": 0, "candidate_json": "{}"}
         cur = self.conn.execute(
             f"INSERT INTO steward_decisions (ts, {', '.join(cols)}) "
             f"VALUES (?{', ?' * len(cols)})",
@@ -702,10 +716,11 @@ class CentralStore:
         return int(cur.lastrowid)
 
     def steward_dedupe_bucket(self, dedupe_key: str,
-                              limit: int = 1) -> list[dict[str, Any]]:
+                              limit: int = 50) -> list[dict[str, Any]]:
         """One dedupe bucket's own decisions, newest first: never a duplicate, never a drop"""
         rows = self.conn.execute(
-            "SELECT id, severity, outcome, applied, wo_id FROM steward_decisions "
+            "SELECT id, ts, severity, outcome, rule, applied, wo_id, subject, candidate_json, "
+            "queue_state FROM steward_decisions "
             "WHERE dedupe_key=? AND duplicate_of=0 AND outcome<>'drop' "
             "ORDER BY id DESC LIMIT ?",
             (dedupe_key, limit))
@@ -713,7 +728,8 @@ class CentralStore:
 
     #: What `update_steward_decision` may re-decide on a recorded row
     STEWARD_REDECIDE = ("severity", "claimed_severity", "outcome", "rule", "reason",
-                        "applied", "budget_usd")
+                        "applied", "budget_usd", "subject", "candidate_json",
+                        "queue_state", "queue_note", "queue_ts")
 
     def update_steward_decision(self, decision_id: int,
                                 fields: Mapping[str, Any]) -> None:
@@ -729,6 +745,24 @@ class CentralStore:
         """Name the order a decision led to, once the caller has created it"""
         self.conn.execute("UPDATE steward_decisions SET wo_id=? WHERE id=?",
                           (wo_id, decision_id))
+
+    def steward_decision(self, decision_id: int) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM steward_decisions WHERE id=?",
+                                (decision_id,)).fetchone()
+        return dict(row) if row else None
+
+    def steward_queue(self, state: str = "waiting") -> list[dict[str, Any]]:
+        """The decisions in one queue state, oldest first (`steward.drain`)"""
+        rows = self.conn.execute(
+            "SELECT * FROM steward_decisions WHERE queue_state=? ORDER BY ts, id", (state,))
+        return [dict(r) for r in rows.fetchall()]
+
+    def steward_queue_counts(self) -> dict[str, int]:
+        """{queue_state: n} over every decision that was ever queued for a re-offer"""
+        rows = self.conn.execute(
+            "SELECT queue_state, COUNT(*) AS n FROM steward_decisions WHERE queue_state<>'' "
+            "GROUP BY queue_state")
+        return {r["queue_state"]: int(r["n"]) for r in rows.fetchall()}
 
     def steward_decisions(self, since: float = 0.0, *, wo_id: str = "",
                           limit: int = 500) -> list[dict[str, Any]]:

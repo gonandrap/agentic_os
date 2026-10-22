@@ -2690,6 +2690,9 @@ def cmd_steward(args: argparse.Namespace) -> int:
             print("no steward decisions" + (f" about {args.wo_id}"
                                             if args.steward_cmd == "why" else ""))
             return 0
+        queue = central.steward_queue_counts()
+        if args.steward_cmd == "decisions" and any(queue.values()):
+            print(steward.queue_line(queue))
         for r in rows:
             applied = "applied" if r["applied"] else r["mode"]
             to = f" -> {r['wo_id']}" if r["wo_id"] else ""
@@ -2700,6 +2703,10 @@ def cmd_steward(args: argparse.Namespace) -> int:
                      else "")
                   + f" gen {r['generation']}: {r['subject'][:80]}{to}")
             print(f"    {r['rule']}: {r['reason']}")
+            if r.get("queue_state"):
+                # Queued means deferred: say whether it still waits, and what happened last
+                note = f": {r['queue_note']}" if r.get("queue_note") else ""
+                print(f"    queue {r['queue_state']}{note}")
         return 0
     finally:
         central.close()

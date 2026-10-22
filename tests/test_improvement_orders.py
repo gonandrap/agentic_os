@@ -211,6 +211,37 @@ def test_a_worker_filed_improvement_order_needs_self_dispatch_on(started, monkey
     assert _decisions()[0]["origin_kind"] == "worker_io"
 
 
+def test_a_queued_worker_improvement_order_is_kept_and_filed_once_there_is_room(
+        enforcing, monkeypatch, store, catalog_file):
+    """Decision #61 of 2026-10-22: a `queue` left nothing queued"""
+    enforcing(weekly_usd=0.0)
+    monkeypatch.setenv("JARVIS_WO_ID", "wo-3b5590a0")
+    with pytest.raises(ops.OpsError) as e:
+        ops.create_improvement_order("proj_a", "slow first turns",
+                                     description=OBSERVATION, refs=REFS)
+    assert "kept whole" in str(e.value) and "Do not file it again" in str(e.value)
+    [row] = _decisions()
+    assert row["queue_state"] == "waiting"
+    assert json.loads(row["candidate_json"])["payload"]["description"] == OBSERVATION
+    central = CentralStore()
+    try:
+        assert steward.drain(ops.resolve_catalog(), central)["waiting"] == 1
+        assert store.list_feature_orders(kind="improvement", statuses=None) == []
+        enforcing(weekly_usd=30.0, order_budget_usd=25.0)
+        assert steward.drain(ops.resolve_catalog(), central)["dispatched"] == 1
+    finally:
+        central.close()
+    [io] = store.list_feature_orders(kind="improvement", statuses=None)
+    assert (io["title"], io["description"], io["budget_usd"]) == (
+        "slow first turns", OBSERVATION, 25.0)
+    meta = json.loads(io["metadata"])
+    assert meta[ops.EVIDENCE_REFS_KEY] == list(REFS)
+    assert meta[steward.STAMP_KEY]["decision_id"] == row["id"]
+    [row] = _decisions()
+    assert (row["queue_state"], row["wo_id"], row["outcome"]) == ("reoffered", io["id"],
+                                                                 "dispatch")
+
+
 def test_a_worker_filed_improvement_order_fails_closed_on_an_unreadable_catalog(
         started, monkeypatch, store):
     """Decisions #60/#62 of 2026-10-22: an unreadable catalog let a worker's io through"""

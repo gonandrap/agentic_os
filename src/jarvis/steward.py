@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
-from dataclasses import dataclass, field
+import re
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Sequence
 
 from . import db
 
@@ -79,6 +81,8 @@ class Candidate:
     refs: int = 0
     #: The file the candidate's defect is in — what it is deduped by (`dedupe_key`)
     file: str = ""
+    #: What the caller needs to dispatch it LATER, should it queue (`drain`, #1181)
+    payload: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         assert self.origin_kind in ORIGIN_KINDS, self.origin_kind
@@ -337,34 +341,50 @@ def gate(c: Candidate, *, catalog: Catalog, store: ProjectStore | None = None,
         decision.stamp = {"origin_kind": c.origin_kind, "generation": generation,
                           "severity": severity, "mode": mode}
         key = dedupe_key(c)
-        prior = _duplicate_of(central, key)
+        prior = _duplicate_of(central, key, c)
         duplicate = int(prior["id"]) if prior else 0
         if prior:
             # One defect worded by several seats, or re-raised in a later round
             severer = severity_rank(severity) > severity_rank(str(prior["severity"]))
             dispatched = bool(prior["wo_id"]) or bool(prior["applied"])
+            held = _candidate_of(prior)
             if severer and not dispatched:
                 # One decision per defect, re-decided at the max severity (Q2133)
                 reason = f"{reason}; escalated from `{prior['severity']}` (#{duplicate})"
                 decision.reason = reason
                 decision.decision_id = duplicate
+                # The severer wording is the one acted on; the earlier one is kept (#57)
+                worded = _also_worded(held, str(prior["subject"] or ""), c.subject)
                 central.update_steward_decision(duplicate, {
                     "severity": severity, "claimed_severity": claimed, "outcome": outcome,
                     "rule": rule, "reason": reason, "budget_usd": budget_usd,
-                    "applied": int(allowed and outcome == "dispatch")})
+                    "applied": int(allowed and outcome == "dispatch"),
+                    "subject": c.subject[:500],
+                    "candidate_json": _candidate_json(
+                        c, also_worded=worded, raised=held.get("raised_pending") or []),
+                    **_queue_fields(c, outcome, allowed, now)})
                 decision.stamp["decision_id"] = duplicate
                 log.info("steward[%s] escalated decision #%s to %s -> %s (%s)",
                          mode, duplicate, severity, outcome, rule)
                 return decision
             outcome, rule = "drop", "duplicate"
             reason = f"the same defect as steward decision #{duplicate}"
+            # Every seat's wording travels with the one decision, whatever it became (#1181)
+            held["also_worded"] = _also_worded(held, c.subject, str(prior["subject"] or ""))
             if severer:
                 # The order fixing it is already running: no second order, but say it got worse
                 rule = "duplicate-of-dispatched"
                 reason = (f"steward decision #{duplicate} already dispatched this defect; "
                           f"raised there from `{prior['severity']}` to `{severity}`")
-                central.update_steward_decision(duplicate, {"severity": severity})
-                _worsened(store, str(prior["wo_id"] or ""), severity, c, duplicate)
+                raised = _raise(severity, c, duplicate)
+                if not _worsened(store, str(prior["wo_id"] or ""), raised):
+                    # Applied but not linked yet: `linked` delivers it (#54)
+                    held.setdefault("raised_pending", []).append(raised)
+                central.update_steward_decision(duplicate, {
+                    "severity": severity, "candidate_json": json.dumps(held, default=str)})
+            else:
+                central.update_steward_decision(
+                    duplicate, {"candidate_json": json.dumps(held, default=str)})
             decision.outcome, decision.rule, decision.reason = outcome, rule, reason
             decision.duplicate_of = duplicate
             if mode == "enforce":
@@ -382,7 +402,9 @@ def gate(c: Candidate, *, catalog: Catalog, store: ProjectStore | None = None,
             "outcome": outcome, "rule": rule, "reason": reason, "mode": mode,
             "applied": int(allowed and outcome == "dispatch"), "generation": generation,
             "parent_wo_id": c.parent_wo_id, "budget_usd": budget_usd,
-            "dedupe_key": key, "duplicate_of": duplicate})
+            "dedupe_key": key, "duplicate_of": duplicate,
+            "candidate_json": _candidate_json(c),
+            **({} if duplicate else _queue_fields(c, outcome, allowed, now))})
         decision.stamp["decision_id"] = decision.decision_id
         if outcome == "ask" and mode == "enforce" and self_dispatch:
             central.add_inbox(c.project, f"steward: {c.subject[:120]}",
@@ -401,32 +423,126 @@ REPEAT_SECONDS = 3600
 
 
 def dedupe_key(c: Candidate) -> str:
-    """One defect's bucket: origin unit + file, '' when no code is named (spec §3.2, Q2109)"""
+    """One FILE's bucket: origin unit + file, '' when no code is named (spec §3.2, Q2109)"""
     path = c.file.strip().lower()
     if not path or not c.parent_wo_id:
         return ""
     return f"{c.project}|{c.origin_kind}|{c.parent_wo_id}|{path}"
 
 
-def _duplicate_of(central: CentralStore, key: str) -> dict[str, Any] | None:
-    """The decision in `key`'s bucket this candidate restates, or None (spec §3.2)"""
+#: Words that say nothing about WHICH defect a wording is about
+_STOPWORDS = frozenset("""
+    the and for when that this with but not yet its are was were from into than then once
+    only one has have had been out off all any can does did never still also which while
+    what who why how per via every each same now
+""".split())
+_WORD_RE = re.compile(r"[a-z0-9]+")
+#: Shared words over the SHORTER wording's words at which two wordings are one defect (#55)
+SAME_DEFECT_OVERLAP = 0.4
+
+
+def _defect_words(text: str, ignore: frozenset[str] = frozenset()) -> set[str]:
+    words = set()
+    for w in _WORD_RE.findall((text or "").lower()):
+        if len(w) < 3 or w in _STOPWORDS or w in ignore:
+            continue
+        words.add(w[:-1] if len(w) > 4 and w.endswith("s") else w)
+    return words
+
+
+def same_defect(a: str, b: str, *, file: str = "") -> bool:
+    """Do two wordings in one file's bucket name the same defect? (#55, spec §3.2)"""
+    # The file's own name is in most wordings of every defect in it, so it tells none apart
+    ignore = frozenset(_WORD_RE.findall(file.lower()))
+    left, right = _defect_words(a, ignore), _defect_words(b, ignore)
+    if not left or not right:
+        return True  # a wording with nothing to tell it apart cannot be told apart
+    return len(left & right) / min(len(left), len(right)) >= SAME_DEFECT_OVERLAP
+
+
+def _candidate_of(row: Mapping[str, Any]) -> dict[str, Any]:
+    held = db.from_json(row.get("candidate_json"), {}) or {}
+    return dict(held) if isinstance(held, dict) else {}
+
+
+def _candidate_json(c: Candidate, *, also_worded: Sequence[str] = (),
+                    raised: Sequence[Mapping[str, Any]] = ()) -> str:
+    """The whole candidate, as `steward_decisions.candidate_json` keeps it"""
+    return json.dumps({**asdict(c), "also_worded": list(also_worded),
+                       "raised_pending": list(raised)}, default=str)
+
+
+def _also_worded(held: Mapping[str, Any], *wordings: str) -> list[str]:
+    """`held`'s other wordings plus all of `wordings` but the last, the one acted on"""
+    *extra, acting = wordings
+    out: list[str] = []
+    for w in [*(held.get("also_worded") or ()), *extra]:
+        w = str(w)[:500]
+        if w.strip() and w != acting[:500] and w not in out:
+            out.append(w)
+    return out
+
+
+def _duplicate_of(central: CentralStore, key: str, c: Candidate) -> dict[str, Any] | None:
+    """The decision in `key`'s bucket this candidate restates, or None (spec §3.2, #55)"""
     if not key:
         return None
-    rows = central.steward_dedupe_bucket(key)
-    return rows[0] if rows else None
+    best, score = None, 0
+    for row in central.steward_dedupe_bucket(key):
+        wordings = [str(row.get("subject") or ""),
+                    *(_candidate_of(row).get("also_worded") or ())]
+        # Newest first, so a tie goes to the most recent decision about the defect
+        hits = sum(same_defect(c.subject, str(w), file=c.file) for w in wordings)
+        if hits > score:
+            best, score = row, hits
+    return best
 
 
-def _worsened(store: ProjectStore | None, wo_id: str, severity: str, c: Candidate,
-              decision_id: int) -> None:
+def _raise(severity: str, c: Candidate, decision_id: int) -> dict[str, Any]:
+    return {"severity": severity, "subject": c.subject[:200],
+            "origin_kind": c.origin_kind, "decision_id": decision_id}
+
+
+def _event_target(store: ProjectStore, order_id: str) -> str:
+    """The work order whose timeline carries an event about `order_id`, or '' for none yet"""
+    try:
+        store.get_work_order(order_id)
+        return order_id
+    except KeyError:
+        pass
+    try:
+        fo = store.get_feature_order(order_id)
+    except KeyError:
+        return ""
+    # A feature order's events live on its planner's (an io's analyst's) or manager's timeline
+    if fo.get("plan_wo_id"):
+        return str(fo["plan_wo_id"])
+    manager = store.manager_work_order(order_id)
+    return str(manager["id"]) if manager else ""
+
+
+def _worsened(store: ProjectStore | None, wo_id: str, raised: Mapping[str, Any]) -> bool:
     """Tell the order already fixing this defect that a seat now rates it worse (Q2133)"""
     if store is None or not wo_id:
-        return
+        return False
     try:
-        store.add_event(wo_id, "steward_severity_raised",
-                        {"severity": severity, "subject": c.subject[:200],
-                         "origin_kind": c.origin_kind, "decision_id": decision_id})
+        target = _event_target(store, wo_id)
+        if not target:
+            return False
+        store.add_event(target, "steward_severity_raised", dict(raised))
+        return True
     except Exception:  # noqa: BLE001 — the decision is recorded either way
         log.exception("steward: could not record the raised severity on %s", wo_id)
+        return False
+
+
+def _queue_fields(c: Candidate, outcome: str, allowed: bool,
+                  now: float | None) -> dict[str, Any]:
+    """A held `queue` the OS can dispatch later waits for `drain`; anything else does not"""
+    waits = (outcome == "queue" and not allowed and c.origin_kind in DRAINABLE
+             and bool(c.payload))
+    return {"queue_state": "waiting" if waits else "", "queue_note": "",
+            "queue_ts": (now if now is not None else db.now()) if waits else None}
 
 
 def _repeat_of(central: CentralStore, c: Candidate, outcome: str,
@@ -445,8 +561,9 @@ def stamped(metadata: Mapping[str, Any] | None, decision: Decision) -> dict[str,
     return {**(metadata or {}), STAMP_KEY: decision.stamp}
 
 
-def linked(decision: Decision, wo_id: str, central: CentralStore | None = None) -> None:
-    """Record which order a decision led to"""
+def linked(decision: Decision, wo_id: str, central: CentralStore | None = None, *,
+           store: ProjectStore | None = None) -> None:
+    """Record which order a decision led to, and hand it any raise that waited for it (#54)"""
     if not decision.decision_id or not wo_id:
         return
     from .central_store import CentralStore
@@ -455,12 +572,203 @@ def linked(decision: Decision, wo_id: str, central: CentralStore | None = None) 
     central = central or CentralStore()
     try:
         central.link_steward_decision(decision.decision_id, wo_id)
+        _deliver_raised(central, decision.decision_id, wo_id, store)
     except Exception:  # noqa: BLE001
         log.exception("steward: could not link decision %s to %s",
                       decision.decision_id, wo_id)
     finally:
         if own:
             central.close()
+
+
+def _deliver_raised(central: CentralStore, decision_id: int, wo_id: str,
+                    store: ProjectStore | None) -> None:
+    """The severer wordings that landed between the decision and its order's creation"""
+    row = central.steward_decision(decision_id)
+    held = _candidate_of(row or {})
+    pending = held.get("raised_pending") or []
+    if not row or not pending:
+        return
+    own = store is None
+    store = store or _store_for(central, str(row["project"]))
+    try:
+        # One that still has nowhere to go (an io with no analyst yet) stays on the row
+        held["raised_pending"] = [r for r in pending if not _worsened(store, wo_id, r)]
+    finally:
+        if own and store is not None:
+            store.close()
+    central.update_steward_decision(decision_id,
+                                    {"candidate_json": json.dumps(held, default=str)})
+
+
+def _store_for(central: CentralStore, project: str) -> ProjectStore | None:
+    """The registered project's store, or None when it is gone"""
+    from .project_store import ProjectStore
+
+    spec = central.get_project(project) if project else None
+    if not spec or not (Path(spec["path"]) / ".jarvis" / "jarvis.db").exists():
+        return None
+    return ProjectStore(Path(spec["path"]))
+
+
+# ---------------------------------------------------------------- the queue (#1181)
+
+#: Origin kinds whose `queue` the OS dispatches later on its own; the rest re-ask by themselves
+DRAINABLE = ("panel", "worker_io")
+#: Origin kinds whose candidate is about the PARENT unit's code: moot once that is cancelled
+PARENT_BOUND = ("panel",)
+#: A queued decision older than this is not re-offered: the code it named has moved on
+QUEUE_TTL_SECONDS = 14 * 86400
+#: How often the daemon runs `drain` — `daemon.STEWARD_DRAIN_EVERY_TICKS` at the default poll
+DRAIN_EVERY_MINUTES = 10
+#: At most this many queued decisions dispatched per pass, the ledger re-read after each
+DRAIN_PER_PASS = 3
+#: A panel follow-up files an issue, not an order, whatever `self_dispatch` says (ops)
+SELF_DISPATCH_EXEMPT = ("panel",)
+
+#: `(decision row, candidate, decision) -> the order it created, or ''`; raising keeps it waiting
+Dispatcher = Callable[[Mapping[str, Any], Candidate, Decision], str]
+
+
+def candidate_wordings(row: Mapping[str, Any]) -> list[str]:
+    """The other wordings folded onto a decision (spec §3.2: one patch covers them all)"""
+    return [str(w) for w in _candidate_of(row).get("also_worded") or () if str(w).strip()]
+
+
+def candidate_from(row: Mapping[str, Any]) -> Candidate:
+    """The candidate a decision row kept, with every folded wording counted as a sighting"""
+    held = _candidate_of(row)
+    fields = {k: held[k] for k in ("origin_kind", "severity", "project", "subject",
+                                   "parent_wo_id", "refs", "file", "payload") if k in held}
+    c = Candidate(**{"origin_kind": row["origin_kind"], "severity": row["severity"],
+                     "project": row["project"], "subject": row["subject"], **fields,
+                     "evidence": tuple(held.get("evidence") or ())})
+    # Each seat that worded the defect independently is one more sighting of it
+    c.refs = max(int(c.refs or 0), 1 + len(held.get("also_worded") or ()))
+    return c
+
+
+def _stale(central: CentralStore, row: Mapping[str, Any], store: ProjectStore | None,
+           now: float) -> str:
+    """Why a queued decision may no longer be re-offered, or ''"""
+    if now - float(row["ts"]) > QUEUE_TTL_SECONDS:
+        return f"waited more than {QUEUE_TTL_SECONDS // 86400} days for room"
+    if store is None:
+        return f"project {row['project']!r} is no longer registered"
+    parent = str(row["parent_wo_id"] or "")
+    if row["origin_kind"] in PARENT_BOUND and parent:
+        try:
+            unit = (store.get_work_order(parent) if parent.startswith("wo-")
+                    else store.get_feature_order(parent))
+        except KeyError:
+            return f"{parent} no longer exists"
+        if unit.get("status") == "cancelled":
+            return f"{parent} was cancelled, so its code never landed"
+    held, key = _candidate_of(row), str(row["dedupe_key"] or "")
+    for other in central.steward_dedupe_bucket(key) if key else ():
+        if (int(other["id"]) != int(row["id"]) and (other["wo_id"] or other["applied"])
+                and same_defect(str(row["subject"]), str(other["subject"] or ""),
+                                file=str(held.get("file") or ""))):
+            return f"superseded by steward decision #{other['id']}, already dispatched"
+    return ""
+
+
+def drain(catalog: Catalog, central: CentralStore, *, now: float | None = None,
+          dispatchers: Mapping[str, Dispatcher] | None = None,
+          limit: int = DRAIN_PER_PASS) -> dict[str, int]:
+    """Re-offer the queued decisions the ledger now has room for, severest then oldest first"""
+    now = now if now is not None else db.now()
+    cfg = catalog.os.evolution
+    out = {"waiting": 0, "dispatched": 0, "expired": 0, "failed": 0}
+    rows = central.steward_queue()
+    if not rows:
+        return out
+    if cfg.mode != "enforce":
+        # Shadow dispatches by today's rules, which never held these back
+        out["waiting"] = len(rows)
+        return out
+    self_dispatch = bool(catalog.os.autonomy.self_dispatch)
+    if dispatchers is None:
+        from . import ops
+
+        dispatchers = ops.steward_dispatchers()
+    book: Ledger | None = None
+    slow: set[str] = set()
+    for row in sorted(rows, key=lambda r: (-severity_rank(r["severity"]), r["ts"], r["id"])):
+        store = _store_for(central, str(row["project"]))
+        try:
+            why = _stale(central, row, store, now)
+            if why:
+                central.update_steward_decision(int(row["id"]), {
+                    "queue_state": "expired", "queue_note": why, "queue_ts": now})
+                out["expired"] += 1
+                continue
+            dispatch = dispatchers.get(str(row["origin_kind"]))
+            if not self_dispatch and row["origin_kind"] not in SELF_DISPATCH_EXEMPT:
+                dispatch = None  # the master switch: the OS files nothing nobody typed
+            if out["dispatched"] >= limit or dispatch is None:
+                out["waiting"] += 1
+                continue
+            if book is None:
+                try:
+                    book = ledger(catalog, central, now=now)
+                    slow = throttled(cfg, precision(catalog, now=now))
+                except Exception:  # noqa: BLE001 — a failure is never a verdict
+                    log.exception("steward: ledger unreadable; nothing re-offered")
+                    out["waiting"] = (len(rows) - out["expired"] - out["dispatched"]
+                                      - out["failed"])
+                    return out
+            landed = _reoffer(central, cfg, book, slow, row, store, dispatch, now)
+            out[landed] += 1
+            if landed == "dispatched":
+                book = None  # it spent or reserved some of the week: read the ledger again
+        finally:
+            if store is not None:
+                store.close()
+    return out
+
+
+def _reoffer(central: CentralStore, cfg: EvolutionConfig, book: Ledger, slow: set[str],
+             row: Mapping[str, Any], store: ProjectStore | None, dispatch: Dispatcher,
+             now: float) -> str:
+    """One queued decision re-decided against today's ledger: the `drain` count it lands in"""
+    c = candidate_from(row)
+    generation, parent_kind = lineage(store, c.parent_wo_id)
+    outcome, rule, reason, severity = decide(c, cfg, book, generation=generation,
+                                             parent_kind=parent_kind,
+                                             throttled=c.origin_kind in slow)
+    if outcome != "dispatch":
+        central.update_steward_decision(int(row["id"]), {
+            "queue_note": f"re-offered, still `{outcome}` ({rule}): {reason}",
+            "queue_ts": now})
+        return "waiting"
+    budget_usd = round(max(0.0, min(cfg.order_budget_usd,
+                                    cfg.weekly_usd - book.evolution_usd)), 2)
+    decision = Decision(
+        outcome="dispatch", rule=rule, severity=severity, generation=generation,
+        reason=f"{reason}; re-offered from the queue (was `{row['rule']}`)",
+        claimed_severity=str(row["claimed_severity"] or severity), mode=cfg.mode,
+        allowed=True, budget_usd=budget_usd, decision_id=int(row["id"]))
+    decision.stamp = {"origin_kind": c.origin_kind, "generation": generation,
+                      "severity": severity, "mode": cfg.mode,
+                      "decision_id": decision.decision_id}
+    try:
+        made = dispatch(row, c, decision)
+    except Exception as e:  # noqa: BLE001 — it stays queued and is offered again next pass
+        log.exception("steward: re-offering decision #%s failed", row["id"])
+        central.update_steward_decision(int(row["id"]), {
+            "queue_note": f"re-offer failed: {e}"[:300], "queue_ts": now})
+        return "failed"
+    central.update_steward_decision(int(row["id"]), {
+        "outcome": "dispatch", "rule": rule, "reason": decision.reason,
+        "severity": severity, "applied": 1, "budget_usd": budget_usd,
+        "queue_state": "reoffered", "queue_ts": now,
+        "queue_note": f"re-offered: {made}" if made else "re-offered"})
+    if made.startswith(("wo-", "io-", "fo-")):
+        linked(decision, made, central, store=store)
+    log.info("steward re-offered queued decision #%s -> %s (%s)", row["id"],
+             made or "filed", rule)
+    return "dispatched"
 
 
 # ---------------------------------------------------------------- the weekly digest
@@ -482,6 +790,7 @@ def digest(catalog: Catalog, central: CentralStore, *, now: float | None = None
             "critical_weekly_usd": cfg.critical_weekly_usd,
             "yield_above_usd": cfg.yield_above_usd, "by_kind": by_kind,
             "held": [r for r in rows if r["outcome"] in ("queue", "ask")][:10],
+            "queue": central.steward_queue_counts(),
             "precision": counts, "throttled": sorted(throttled(cfg, counts))}
 
 
@@ -499,11 +808,21 @@ def render_digest(d: Mapping[str, Any]) -> str:
         for kind, (hit, total) in sorted(d["precision"].items()):
             mark = "  THROTTLED" if kind in d["throttled"] else ""
             lines.append(f"  {kind:<14} {hit}/{total}{mark}")
+    if any((d.get("queue") or {}).values()):
+        lines.append(queue_line(d["queue"]))
     if d["held"]:
         lines.append("held back:")
         lines += [f"  [{r['outcome']}] {r['origin_kind']} {r['severity']}: "
                   f"{r['subject'][:70]} — {r['rule']}" for r in d["held"]]
     return "\n".join(lines)
+
+
+def queue_line(counts: Mapping[str, int]) -> str:
+    """How much queued self-work is waiting, in one line (`digest`, `jarvis steward decisions`)"""
+    return (f"queued: {counts.get('waiting', 0)} waiting for room (re-offered every "
+            f"~{DRAIN_EVERY_MINUTES} min, severest then oldest, once the ledger and the "
+            f"yield line allow; dropped after {QUEUE_TTL_SECONDS // 86400} days), "
+            f"{counts.get('reoffered', 0)} re-offered, {counts.get('expired', 0)} expired")
 
 
 #: os_state key holding when the weekly digest last went to the inbox
