@@ -45,7 +45,17 @@
       {% elif report.pause.override == "paused" %}<span class="tone-warn">paused by <span class="mono">jarvis morpheus pause</span> — checks still run, no session turns</span>{% if report.pause.reason %} · {{ report.pause.reason }}{% endif %}
       {% elif report.pause.override == "running" %}<span class="tone-ok">running by <span class="mono">jarvis morpheus unpause</span>{% if report.pause.fleet_paused %}, through the fleet pause{% endif %}</span>{% if report.pause.reason %} · {{ report.pause.reason }}{% endif %}
       {% elif report.paused %}<span class="tone-warn">paused with the fleet — checks still run, no session turns</span>
-      {% else %}<span class="tone-ok">running</span>{% endif %}</td></tr>
+      {% else %}<span class="tone-ok">unpaused (follows the fleet)</span>{% endif %}</td></tr>
+    {# the state row above is the pause MODE; this one is what the session is doing (issue #1162) #}
+    {% set act = report.activity %}
+    <tr><th>activity</th><td class="mono">
+      {% if act.turn_in_flight %}<span class="tone-active">{{ act.turn_kind or "turn" }} in flight since {{ fmt_ts(act.turn_started_ts) }}</span>
+      {% elif act.abandoned_turn_ts %}<span class="tone-warn">idle — the {{ act.turn_kind or "turn" }} started {{ fmt_ts(act.abandoned_turn_ts) }} never finished</span>
+      {% else %}idle{% if act.due %} · {{ act.due }} queued due now{% endif %}{% endif %}
+      {% for h in act.held %}<br>{{ h.id }} offered {{ h.offers }} of {{ act.max_offers }}:
+        {% if h.exhausted %}no offer left, it will time out
+        {% else %}held back after {{ "a failed turn" if h.after_error else "an offer" }} until {{ fmt_ts(h.next_offer_ts) }}{% endif %}
+      {% endfor %}</td></tr>
     <tr><th>session</th><td class="mono">{{ sess.get('session_id') or "not started" }}</td></tr>
     <tr><th>turns</th><td class="mono">{{ sess.get('turns') or 0 }} · {{ sess.get('compactions') or 0 }} compaction(s)
       {% if sess.get('compact_due') %}· <span class="tone-warn">compaction due</span>{% endif %}</td></tr>
