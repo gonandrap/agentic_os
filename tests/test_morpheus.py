@@ -638,7 +638,7 @@ def test_a_queued_item_in_the_reoffer_backoff_says_when_and_why(central, tmp_pat
 
 def test_an_offer_entry_written_before_the_cause_was_recorded_claims_no_cause(central, capsys,
                                                                              clock):
-    """Pre-#1161 entries were killed turns rendered as "after an offer" (#1171)"""
+    """Pre-#1161 entries were killed turns rendered as 'after an offer'"""
     from jarvis.cli import main
 
     item = queued(central, 2)
