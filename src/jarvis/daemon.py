@@ -1553,6 +1553,11 @@ class Daemon:
             return "down"
         # Still booting after a release restart, not wedged (issue #1189)
         if body is None:
+            # The STOP phase of that restart: uptime still holds the OLD start (issue #1194)
+            if systemd_units.unit_transitioning(release.UI_UNIT):
+                log.info("dashboard not answering while %s is mid-restart — "
+                         "not wedged", release.UI_UNIT)
+                return "restarting"
             age = systemd_units.uptime_seconds(release.UI_UNIT)
             if age is not None and age < cfg.boot_grace_seconds:
                 log.info("dashboard not answering %.1fs after %s started — booting, "
