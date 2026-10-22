@@ -346,7 +346,7 @@ def test_the_idle_prompt_still_parks_a_worker_whose_turn_has_ended(project):
     assert fresh["attention_reason"] == IDLE_NOTIFICATION
 
 
-# -- 3c. INV-WAIT-WORKING: the state the live bug left behind heals itself
+# -- 3c. the state the live bug left heals itself
 
 
 def parked_by_the_idle_prompt(store: ProjectStore) -> dict:

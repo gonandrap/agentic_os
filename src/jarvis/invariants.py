@@ -3627,8 +3627,8 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                     # request is a blocker they would otherwise believe
     check_repaired_work_rejoins_the_merge_queue,  # BEFORE the reason checks: it moves
                                    # the status they derive a reason from
-    check_a_working_worker_is_not_waiting,  # ...and BEFORE the reason checks for the
-                                   # same reason: it moves the status they derive from, and INV-ATTENTION-MISSING would re-flag what it clears
+    check_a_working_worker_is_not_waiting,  # BEFORE the reason checks: it moves the status
+                                   # they derive from, and INV-ATTENTION-MISSING would re-flag what it clears
     check_attention_reason_is_true,
     check_adhoc_not_governed,      # retire before the flag checks judge the leftovers
     check_legacy_adhoc_retired,    # ...and before them, let go of what nothing tracks

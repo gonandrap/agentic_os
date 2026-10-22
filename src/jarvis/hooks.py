@@ -2253,8 +2253,7 @@ def _is_current_session(store: ProjectStore, wo_id: str, session_id: str) -> boo
     return not bound or not session_id or bound == session_id
 
 
-#: Claude Code's idle-timer `Notification`, verbatim — matched exactly, never as a
-#: substring: a real permission prompt carries its own message and keeps its flag
+#: Claude Code's idle-timer `Notification`, verbatim: matched with == and never a substring
 IDLE_PROMPT = "Claude is waiting for your input"
 
 #: The `notification_ignored` reason, shared with INV-WAIT-WORKING's repair note
